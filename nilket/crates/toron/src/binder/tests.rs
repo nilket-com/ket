@@ -13833,6 +13833,52 @@ async fn safe_side_left_outer_star_preserves_rows_and_schema() {
 }
 
 #[tokio::test]
+async fn safe_side_right_outer_star_preserves_rows_and_schema() {
+	let (catalog, storage) = outer_star_order_execution_fixture().await;
+	let declared_config = auto_broadcast_config(64 * 1024 * 1024);
+	let armed_config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+	let logical = preserved_outer_right_star_project_plan();
+
+	let (declared_schema, declared_rows) =
+		execute_star_order_plan(&catalog, storage.clone(), &logical, &declared_config).await;
+	let (armed_schema, armed_rows) =
+		execute_star_order_plan(&catalog, storage, &logical, &armed_config).await;
+
+	assert_eq!(
+		schema_signature(&armed_schema),
+		schema_signature(&declared_schema)
+	);
+	assert_eq!(armed_rows, declared_rows);
+	assert!(
+		armed_rows.iter().any(|row| row.iter().any(Option::is_none)),
+		"right-outer fixture must include null-supplied dimension misses: {armed_rows:?}"
+	);
+}
+
+#[tokio::test]
+async fn safe_side_left_outer_snowflake_preserves_rows_and_schema() {
+	let (catalog, storage) = snowflake_order_execution_fixture().await;
+	let declared_config = auto_broadcast_config(64 * 1024 * 1024);
+	let armed_config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+	let logical = preserved_outer_snowflake_project_plan();
+
+	let (declared_schema, declared_rows) =
+		execute_star_order_plan(&catalog, storage.clone(), &logical, &declared_config).await;
+	let (armed_schema, armed_rows) =
+		execute_star_order_plan(&catalog, storage, &logical, &armed_config).await;
+
+	assert_eq!(
+		schema_signature(&armed_schema),
+		schema_signature(&declared_schema)
+	);
+	assert_eq!(armed_rows, declared_rows);
+	assert!(
+		armed_rows.iter().any(|row| row.iter().any(Option::is_none)),
+		"snowflake fixture must include null-supplied misses: {armed_rows:?}"
+	);
+}
+
+#[tokio::test]
 async fn safe_side_left_outer_star_reorders_when_gate_actionable() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -13856,6 +13902,64 @@ async fn safe_side_left_outer_star_reorders_when_gate_actionable() {
 		"outer actuation must build real left-outer edges: {:?}",
 		render.join_order_edges
 	);
+}
+
+#[tokio::test]
+async fn right_outer_and_snowflake_reorder_only_when_gate_actionable() {
+	let baseline = auto_broadcast_config(64 * 1024 * 1024);
+	let armed = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let right_catalog = star_join_order_catalog();
+	let right = preserved_outer_right_star_plan();
+	let (right_baseline_plan, right_baseline_trace, right_baseline_render) =
+		bind_with_explain_trace(&right, &right_catalog, &baseline)
+			.await
+			.expect("bind cold right outer star");
+	let (right_armed_plan, _right_armed_trace, right_armed_render) =
+		bind_with_explain_trace(&right, &right_catalog, &armed)
+			.await
+			.expect("bind actionable right outer star");
+	assert_eq!(
+		join_order_edge_dimensions(&right_baseline_render),
+		vec!["o".to_string(), "o".to_string(), "o".to_string()]
+	);
+	assert_eq!(
+		join_order_edge_dimensions(&right_armed_render),
+		vec!["s".to_string(), "p".to_string(), "c".to_string()]
+	);
+	assert_ne!(
+		format!("{right_baseline_plan:?}"),
+		format!("{right_armed_plan:?}"),
+		"actionable gate must change only the armed right-outer bind"
+	);
+	assert!(!right_baseline_trace.join_decisions.is_empty());
+
+	let snowflake_catalog = hash_snowflake_join_order_catalog();
+	let snowflake = preserved_outer_snowflake_plan();
+	let (snowflake_baseline_plan, snowflake_baseline_trace, snowflake_baseline_render) =
+		bind_with_explain_trace(&snowflake, &snowflake_catalog, &baseline)
+			.await
+			.expect("bind cold left outer snowflake");
+	let (snowflake_armed_plan, _snowflake_armed_trace, snowflake_armed_render) =
+		bind_with_explain_trace(&snowflake, &snowflake_catalog, &armed)
+			.await
+			.expect("bind actionable left outer snowflake");
+	let baseline_dimensions = join_order_edge_dimensions(&snowflake_baseline_render);
+	let armed_dimensions = join_order_edge_dimensions(&snowflake_armed_render);
+	assert!(
+		baseline_dimensions.ends_with(&["c".to_string(), "s".to_string()]),
+		"cold snowflake keeps declared top-level order after internal edges: {baseline_dimensions:?}"
+	);
+	assert!(
+		armed_dimensions.ends_with(&["s".to_string(), "c".to_string()]),
+		"actionable snowflake reorders top-level dimensions after internal edges: {armed_dimensions:?}"
+	);
+	assert_ne!(
+		format!("{snowflake_baseline_plan:?}"),
+		format!("{snowflake_armed_plan:?}"),
+		"actionable gate must change only the armed snowflake bind"
+	);
+	assert!(!snowflake_baseline_trace.join_decisions.is_empty());
 }
 
 #[tokio::test]
@@ -13922,6 +14026,48 @@ async fn preserved_outer_ordering_inert_until_gate_actionable() {
 }
 
 #[tokio::test]
+async fn manual_ignores_preserved_outer_ordering_for_new_shapes() {
+	let cases = [
+		(star_join_order_catalog(), preserved_outer_right_star_plan()),
+		(
+			hash_snowflake_join_order_catalog(),
+			preserved_outer_snowflake_plan(),
+		),
+	];
+
+	for (catalog, logical) in cases {
+		let manual = PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		};
+		record_verdicts(
+			manual.runtime_evidence.as_ref(),
+			OptimizerDecisionKind::PreservedOuterOrder,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		);
+		let baseline = auto_broadcast_config(64 * 1024 * 1024);
+
+		let (manual_plan, manual_trace, manual_render) =
+			bind_with_explain_trace(&logical, &catalog, &manual)
+				.await
+				.expect("bind manual new outer shape");
+		let (baseline_plan, baseline_trace, baseline_render) =
+			bind_with_explain_trace(&logical, &catalog, &baseline)
+				.await
+				.expect("bind baseline new outer shape");
+
+		assert_eq!(format!("{manual_plan:?}"), format!("{baseline_plan:?}"));
+		assert_eq!(manual_trace.join_decisions, baseline_trace.join_decisions);
+		assert_eq!(
+			join_order_edge_dimensions(&manual_render),
+			join_order_edge_dimensions(&baseline_render)
+		);
+	}
+}
+
+#[tokio::test]
 async fn manual_ignores_preserved_outer_ordering_gate() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -13958,7 +14104,7 @@ async fn manual_ignores_preserved_outer_ordering_gate() {
 }
 
 #[tokio::test]
-async fn selected_order_uses_left_outer_preflight_not_inner_receipt_targets() {
+async fn selected_order_uses_outer_preflight_not_inner_receipt_targets() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(preserved_outer_star_sql())
@@ -13990,14 +14136,77 @@ async fn selected_order_uses_left_outer_preflight_not_inner_receipt_targets() {
 }
 
 #[tokio::test]
-async fn preserved_outer_full_right_cross_and_residual_shapes_stay_fenced() {
+async fn existing_left_outer_base_leaf_stars_bind_byte_identical() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (plan, _trace, render) = bind_with_explain_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind existing preserved outer star");
+
+	assert_eq!(
+		join_order_edge_dimensions(&render),
+		vec!["s".to_string(), "p".to_string(), "c".to_string()]
+	);
+	let join_kinds = execution_join_kinds(&plan);
+	assert_eq!(join_kinds.len(), 3);
+	assert!(
+		join_kinds
+			.iter()
+			.all(|kind| matches!(kind, JoinKind::LeftOuter | JoinKind::RightOuter)),
+		"existing preserved-outer star must stay on outer physical joins: {join_kinds:?}"
+	);
+	assert_eq!(
+		root_project_column_ordinals(&plan),
+		vec![
+			ColumnOrdinal(0),
+			ColumnOrdinal(1),
+			ColumnOrdinal(2),
+			ColumnOrdinal(3),
+			ColumnOrdinal(6),
+			ColumnOrdinal(5),
+			ColumnOrdinal(4)
+		]
+	);
+}
+
+#[tokio::test]
+async fn within_subtree_reorder_stays_fenced() {
+	let catalog = hash_snowflake_join_order_catalog();
+	let logical = preserved_outer_deep_snowflake_plan();
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (_plan, _trace, render) = bind_with_explain_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind deep preserved outer snowflake");
+	let dimensions = join_order_edge_dimensions(&render);
+	let region_pos = dimensions
+		.iter()
+		.position(|dimension| dimension == "r")
+		.expect("region edge rendered");
+	let segment_pos = dimensions
+		.iter()
+		.position(|dimension| dimension == "g")
+		.expect("segment edge rendered");
+	assert!(
+		region_pos < segment_pos,
+		"opaque dimension subtree must keep declared internal order: {dimensions:?}"
+	);
+	assert!(
+		dimensions.ends_with(&["s".to_string(), "c".to_string()]),
+		"top-level dimensions may reorder, but subtree internals stay opaque: {dimensions:?}"
+	);
+}
+
+#[tokio::test]
+async fn full_outer_and_cross_into_subtree_predicate_shapes_stay_fenced() {
 	let catalog = star_join_order_catalog();
 	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
 	let baseline = auto_broadcast_config(64 * 1024 * 1024);
 	for sql in [
-		"SELECT * FROM orders o \
-		 RIGHT JOIN customers c ON o.customer_id = c.id \
-		 RIGHT JOIN products p ON o.product_id = p.id",
 		"SELECT * FROM orders o \
 		 FULL OUTER JOIN customers c ON o.customer_id = c.id \
 		 FULL OUTER JOIN products p ON o.product_id = p.id",
@@ -14016,6 +14225,29 @@ async fn preserved_outer_full_right_cross_and_residual_shapes_stay_fenced() {
 		assert_eq!(trace.join_decisions, baseline_trace.join_decisions, "{sql}");
 	}
 
+	let snowflake_catalog = hash_snowflake_join_order_catalog();
+	for logical in [
+		preserved_outer_cross_into_subtree_plan(),
+		right_outer_opaque_snowflake_plan(),
+	] {
+		let (plan, trace) = bind_with_trace(&logical, &snowflake_catalog, &config)
+			.await
+			.expect("bind armed fenced snowflake SQL");
+		let (baseline_plan, baseline_trace) =
+			bind_with_trace(&logical, &snowflake_catalog, &baseline)
+				.await
+				.expect("bind baseline fenced snowflake SQL");
+		assert_eq!(
+			format!("{plan:?}"),
+			format!("{baseline_plan:?}"),
+			"{logical:?}"
+		);
+		assert_eq!(
+			trace.join_decisions, baseline_trace.join_decisions,
+			"{logical:?}"
+		);
+	}
+
 	let residual = projected_dimension_preserved_outer_plan();
 	let (plan, trace) = bind_with_trace(&residual, &catalog, &config)
 		.await
@@ -14025,6 +14257,38 @@ async fn preserved_outer_full_right_cross_and_residual_shapes_stay_fenced() {
 		.expect("bind baseline projected-dimension outer plan");
 	assert_eq!(format!("{plan:?}"), format!("{baseline_plan:?}"));
 	assert_eq!(trace.join_decisions, baseline_trace.join_decisions);
+}
+
+#[tokio::test]
+async fn rune_safe_side_outer_surface_matches_sql() {
+	let catalog = star_join_order_catalog();
+	let sql = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan SQL preserved outer star");
+	let rune = rune_plan(&format!(
+		r#"
+        pub fn main(ctx) {{
+            ctx.sql({:?})
+        }}
+    "#,
+		preserved_outer_star_sql()
+	))
+	.await;
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (sql_bound, sql_trace, sql_render) = bind_with_explain_trace(&sql, &catalog, &config)
+		.await
+		.expect("bind SQL outer surface");
+	let (rune_bound, rune_trace, rune_render) = bind_with_explain_trace(&rune, &catalog, &config)
+		.await
+		.expect("bind Rune outer surface");
+
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(sql_trace.join_decisions, rune_trace.join_decisions);
+	assert_eq!(
+		join_order_edge_dimensions(&sql_render),
+		join_order_edge_dimensions(&rune_render)
+	);
 }
 
 #[tokio::test]
@@ -20373,7 +20637,11 @@ fn snowflake_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, Rec
 			orders.clone(),
 			record_batch_i64(
 				orders.arrow_schema().expect("orders schema").into(),
-				vec![vec![1, 2, 3], vec![10, 20, 10], vec![1000, 2000, 1000]],
+				vec![
+					vec![1, 2, 3, 4],
+					vec![10, 20, 10, 30],
+					vec![1000, 2000, 1000, 1000],
+				],
 			),
 		),
 		(
@@ -20381,7 +20649,11 @@ fn snowflake_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, Rec
 			customers.clone(),
 			record_batch_i64(
 				customers.arrow_schema().expect("customers schema").into(),
-				vec![vec![10, 20], vec![100, 200], vec![10_000, 20_000]],
+				vec![
+					vec![10, 20, 30],
+					vec![100, 200, 999],
+					vec![10_000, 20_000, 30_000],
+				],
 			),
 		),
 		(
@@ -20459,6 +20731,27 @@ async fn execute_star_order_query(
 		.execute_bound(&bound.plan, None)
 		.await
 		.expect("execute star order SQL");
+	let schema = batches
+		.first()
+		.map(RecordBatch::schema)
+		.unwrap_or_else(|| bound.plan.schema());
+	(schema, normalized_i64_rows(&batches))
+}
+
+async fn execute_star_order_plan(
+	catalog: &MockCatalog,
+	storage: Arc<InMemoryTableStorage>,
+	logical: &LogicalPlan,
+	config: &PlannerConfig,
+) -> (SchemaRef, Vec<Vec<Option<i64>>>) {
+	let bound = Binder::new(catalog, config)
+		.bind_plan(logical)
+		.await
+		.expect("bind star order plan");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound.plan, None)
+		.await
+		.expect("execute star order plan");
 	let schema = batches
 		.first()
 		.map(RecordBatch::schema)
@@ -20629,6 +20922,149 @@ fn preserved_outer_two_dim_sql() -> &'static str {
 	"SELECT * FROM orders o \
 	 LEFT JOIN customers c ON o.customer_id = c.id \
 	 LEFT JOIN products p ON o.product_id = p.id"
+}
+
+fn preserved_outer_right_star_plan() -> LogicalPlan {
+	let stores_orders = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("stores", "s")),
+		right: Box::new(aliased_named_scan("orders", "o")),
+		kind: JoinKind::RightOuter,
+		on: vec![(qcol("s", "id"), qcol("o", "store_id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let products_stores_orders = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("products", "p")),
+		right: Box::new(stores_orders),
+		kind: JoinKind::RightOuter,
+		on: vec![(qcol("p", "id"), qcol("o", "product_id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("customers", "c")),
+		right: Box::new(products_stores_orders),
+		kind: JoinKind::RightOuter,
+		on: vec![(qcol("c", "id"), qcol("o", "customer_id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn preserved_outer_right_star_project_plan() -> LogicalPlan {
+	project_ids(preserved_outer_right_star_plan(), &["c", "p", "s", "o"])
+}
+
+fn preserved_outer_snowflake_plan() -> LogicalPlan {
+	let customers_regions = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("customers", "c")),
+		right: Box::new(aliased_named_scan("regions", "r")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let orders_customers = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("orders", "o")),
+		right: Box::new(customers_regions),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "customer_id"), qcol("c", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(orders_customers),
+		right: Box::new(aliased_named_scan("stores", "s")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn preserved_outer_snowflake_project_plan() -> LogicalPlan {
+	project_ids(preserved_outer_snowflake_plan(), &["o", "c", "r", "s"])
+}
+
+fn preserved_outer_deep_snowflake_plan() -> LogicalPlan {
+	let customers_regions = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("customers", "c")),
+		right: Box::new(aliased_named_scan("regions", "r")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let customers_regions_segments = LogicalPlan::Join {
+		left: Box::new(customers_regions),
+		right: Box::new(aliased_named_scan("segments", "g")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("c", "segment_id"), qcol("g", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let orders_customers = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("orders", "o")),
+		right: Box::new(customers_regions_segments),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "customer_id"), qcol("c", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(orders_customers),
+		right: Box::new(aliased_named_scan("stores", "s")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn preserved_outer_cross_into_subtree_plan() -> LogicalPlan {
+	let customers_regions = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("customers", "c")),
+		right: Box::new(aliased_named_scan("regions", "r")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let orders_customers = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("orders", "o")),
+		right: Box::new(customers_regions),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "customer_id"), qcol("r", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(orders_customers),
+		right: Box::new(aliased_named_scan("stores", "s")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn right_outer_opaque_snowflake_plan() -> LogicalPlan {
+	let customers_regions = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("customers", "c")),
+		right: Box::new(aliased_named_scan("regions", "r")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let stores_orders = LogicalPlan::Join {
+		left: Box::new(aliased_named_scan("stores", "s")),
+		right: Box::new(aliased_named_scan("orders", "o")),
+		kind: JoinKind::RightOuter,
+		on: vec![(qcol("s", "id"), qcol("o", "store_id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(customers_regions),
+		right: Box::new(stores_orders),
+		kind: JoinKind::RightOuter,
+		on: vec![(qcol("c", "id"), qcol("o", "customer_id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn project_ids(input: LogicalPlan, aliases: &[&str]) -> LogicalPlan {
+	LogicalPlan::Project {
+		input: Box::new(input),
+		exprs: aliases.iter().map(|alias| qcol(alias, "id")).collect(),
+		output_names: vec![None; aliases.len()],
+	}
 }
 
 fn projected_dimension_preserved_outer_plan() -> LogicalPlan {

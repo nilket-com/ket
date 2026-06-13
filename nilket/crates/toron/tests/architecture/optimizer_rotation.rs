@@ -211,9 +211,17 @@ pub(crate) fn adr218_graph_kind_domain_is_galaxy_bridge_bridgechain_only() {
 }
 
 #[test]
-pub(crate) fn adr219_outer_actuation_is_left_outer_star_only() {
+pub(crate) fn adr219_outer_actuation_surface_is_retargeted_by_adr221() {
 	let join_order = source("src/binder/join_order.rs");
 	let extractor = first_block(&join_order, "fn extract_left_outer_star_join_candidate");
+	let left = first_block(
+		&join_order,
+		"fn extract_left_preserved_outer_star_join_candidate",
+	);
+	let right = first_block(
+		&join_order,
+		"fn extract_right_preserved_outer_star_join_candidate",
+	);
 	let leaf = first_block(&join_order, "fn left_outer_star_base_leaf_label");
 	let actuation = first_block(
 		&join_order,
@@ -221,17 +229,23 @@ pub(crate) fn adr219_outer_actuation_is_left_outer_star_only() {
 	);
 	let tests = source("src/binder/tests.rs");
 
-	assert!(extractor.contains("*kind == JoinKind::LeftOuter"));
-	assert!(extractor.contains("*strategy_intent == JoinStrategyIntent::Auto"));
-	assert!(extractor.contains("left_outer_star_base_leaf_label(right).is_some()"));
-	assert!(extractor.contains("dimensions.len() < 2"));
-	assert!(extractor.contains("left_outer_star_base_leaf_label(current).is_none()"));
+	assert!(extractor.contains("extract_left_preserved_outer_star_join_candidate(plan)"));
+	assert!(extractor.contains("extract_right_preserved_outer_star_join_candidate(plan)"));
+	assert!(left.contains("*kind == JoinKind::LeftOuter"));
+	assert!(left.contains("*strategy_intent == JoinStrategyIntent::Auto"));
+	assert!(left.contains("left_outer_star_dimension_label(right).is_some()"));
+	assert!(left.contains("dimensions.len() < 2"));
+	assert!(left.contains("left_outer_star_base_leaf_label(current).is_none()"));
+	assert!(right.contains("*kind == JoinKind::RightOuter"));
+	assert!(right.contains("*strategy_intent == JoinStrategyIntent::Auto"));
+	assert!(right.contains("left_outer_star_base_leaf_label(left).is_some()"));
+	assert!(right.contains("left_outer_star_base_leaf_label(current).is_none()"));
 	assert!(leaf.contains("LogicalPlan::ScanNamed"));
 	assert!(leaf.contains("LogicalPlan::Alias"));
 	assert!(!leaf.contains("LogicalPlan::Filter"));
 	assert!(!leaf.contains("LogicalPlan::Project"));
 	assert!(actuation.contains("gate.status != OptimizerReceiptGateStatus::Actionable"));
-	assert!(tests.contains("preserved_outer_full_right_cross_and_residual_shapes_stay_fenced"));
+	assert!(tests.contains("full_outer_and_cross_into_subtree_predicate_shapes_stay_fenced"));
 }
 
 #[test]
@@ -241,19 +255,145 @@ pub(crate) fn adr219_outer_actuation_uses_left_outer_sequence_not_inner_targets(
 		&join_order,
 		"pub(super) async fn try_bind_preserved_outer_star_actuation",
 	);
-	let sequence = first_block(&join_order, "fn bind_left_outer_star_order_sequence");
-	let preflight = first_block(&join_order, "fn preflight_left_outer_star_order_strategy");
+	let sequence = first_block(&join_order, "fn bind_preserved_outer_star_order_sequence");
+	let preflight = first_block(
+		&join_order,
+		"fn preflight_preserved_outer_star_order_strategy",
+	);
 	let inner_sequence = first_block(&join_order, "fn bind_star_order_sequence");
 
-	assert!(actuation.contains("bind_left_outer_star_order_sequence"));
-	assert!(actuation.contains("bound_left_outer_star_dimension"));
+	assert!(actuation.contains("bind_preserved_outer_star_order_sequence"));
+	assert!(actuation.contains("bound_preserved_outer_star_dimension"));
 	assert!(actuation.contains("restore_declared_star_order_project"));
 	assert!(sequence.contains("JoinKind::LeftOuter"));
-	assert!(preflight.contains("bind_left_outer_star_order_sequence"));
+	assert!(preflight.contains("bind_preserved_outer_star_order_sequence"));
 	assert!(inner_sequence.contains("JoinKind::Inner"));
 	assert!(!actuation.contains("preserved_outer_order_receipt"));
 	assert!(!actuation.contains("edge_targets"));
 	assert!(!actuation.contains("inner_equi"));
+}
+
+#[test]
+pub(crate) fn adr221_safe_side_outer_subset_is_left_right_star_and_left_outer_snowflake_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let left = first_block(
+		&join_order,
+		"fn extract_left_preserved_outer_star_join_candidate",
+	);
+	let right = first_block(
+		&join_order,
+		"fn extract_right_preserved_outer_star_join_candidate",
+	);
+	let dimension = first_block(&join_order, "fn left_outer_star_dimension_label");
+	let opaque = first_block(&join_order, "fn left_outer_star_opaque_subtree_root_label");
+	let tests = source("src/binder/tests.rs");
+
+	assert!(left.contains("*kind == JoinKind::LeftOuter"));
+	assert!(left.contains("left_outer_star_dimension_label(right).is_some()"));
+	assert!(dimension.contains("left_outer_star_base_leaf_label(plan)"));
+	assert!(dimension.contains("left_outer_star_opaque_subtree_root_label(plan)"));
+	assert!(opaque.contains("*kind == JoinKind::LeftOuter"));
+	assert!(opaque.contains("left_outer_star_subtree_nullable_side_leaf(right)"));
+	assert!(right.contains("*kind == JoinKind::RightOuter"));
+	assert!(right.contains("left_outer_star_base_leaf_label(left).is_some()"));
+	assert!(!right.contains("left_outer_star_dimension_label(left)"));
+	assert!(tests.contains("safe_side_right_outer_star_preserves_rows_and_schema"));
+	assert!(tests.contains("safe_side_left_outer_snowflake_preserves_rows_and_schema"));
+	assert!(tests.contains("right_outer_and_snowflake_reorder_only_when_gate_actionable"));
+}
+
+#[test]
+pub(crate) fn adr221_snowflake_subtree_is_opaque_no_internal_reorder() {
+	let join_order = source("src/binder/join_order.rs");
+	let actuation = first_block(
+		&join_order,
+		"pub(super) async fn try_bind_preserved_outer_star_actuation",
+	);
+	let disable = first_block(&join_order, "fn without_preserved_outer_actuation");
+	let tests = source("src/binder/tests.rs");
+
+	assert!(actuation.contains("dimension.composite_build"));
+	assert!(actuation.contains("without_preserved_outer_actuation()"));
+	assert!(disable.contains("preserved_outer_gate.status"));
+	assert!(disable.contains("OptimizerReceiptGateStatus::InsufficientEvidence"));
+	assert!(tests.contains("within_subtree_reorder_stays_fenced"));
+}
+
+#[test]
+pub(crate) fn adr221_full_outer_and_cross_into_subtree_predicates_stay_fenced() {
+	let tests = source("src/binder/tests.rs");
+
+	assert!(tests.contains("full_outer_and_cross_into_subtree_predicate_shapes_stay_fenced"));
+	assert!(tests.contains("preserved_outer_cross_into_subtree_plan"));
+	assert!(tests.contains("right_outer_opaque_snowflake_plan"));
+	assert!(tests.contains("qcol(\"r\", \"id\")"));
+	assert!(tests.contains("JoinKind::FullOuter"));
+}
+
+#[test]
+pub(crate) fn adr221_outer_surface_uses_shared_gate_and_single_snapshot() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let resolver = first_block(&join_order, "pub(crate) fn effective_join_order_policy");
+	let actuation = first_block(
+		&join_order,
+		"pub(super) async fn try_bind_preserved_outer_star_actuation",
+	);
+	let tests = source("src/binder/tests.rs");
+
+	assert_eq!(
+		binder
+			.matches("effective_join_order_policy(config)")
+			.count(),
+		1
+	);
+	assert_eq!(resolver.matches("receipt_gate_snapshot()").count(), 1);
+	assert!(actuation.contains("let gate = self.join_order_policy.preserved_outer_gate"));
+	assert!(actuation.contains("gate.status != OptimizerReceiptGateStatus::Actionable"));
+	assert!(actuation.contains("gate.advisory.recommended_step.margin()"));
+	assert!(!actuation.contains("receipt_gate_snapshot"));
+	assert!(tests.contains("manual_ignores_preserved_outer_ordering_for_new_shapes"));
+}
+
+#[test]
+pub(crate) fn adr221_no_new_durable_surface() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let accrual = source("tests/architecture/optimizer_accrual.rs");
+	let system_table_kind = first_block(&execution, "pub enum SystemTableKind");
+	let recording = first_block(&decision_log, "pub(crate) fn decision_recording_kinds");
+
+	assert!(!recording.contains("SafeSideOuter"));
+	assert!(!recording.contains("OuterOrderingSurface"));
+	assert!(!runtime_evidence.contains("safe_side_outer"));
+	assert!(!runtime_evidence.contains("outer_ordering_surface"));
+	assert!(!binder.contains("INFORMATION_SCHEMA_OPTIMIZER_SAFE_SIDE_OUTER"));
+	assert_eq!(
+		system_table_kind
+			.matches("InformationSchemaOptimizerReceiptGates")
+			.count(),
+		1
+	);
+	assert!(accrual.contains("decision_keys.len(), 140"));
+	assert!(accrual.contains("decision_keys.len() + verdict_keys.len(), 220"));
+}
+
+#[test]
+pub(crate) fn adr221_no_memo_fences_unchanged() {
+	let join_order = source("src/binder/join_order.rs");
+	let actuation = first_block(
+		&join_order,
+		"pub(super) async fn try_bind_preserved_outer_star_actuation",
+	);
+
+	assert!(!join_order.contains("Cascades"));
+	assert!(!join_order.contains("fn memo"));
+	assert!(!join_order.contains("Memo"));
+	assert!(!actuation.contains("memo"));
+	assert!(actuation.contains("sorted_preserved_outer_star_order_indices"));
+	assert!(actuation.contains("dimensions.len()"));
 }
 
 #[test]

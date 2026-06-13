@@ -1316,6 +1316,27 @@ pub(super) struct StarJoinDimension<'a> {
 	pub(super) declared_position: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreservedOuterStarShape {
+	LeftOuter,
+	RightOuter,
+}
+
+struct PreservedOuterStarCandidate<'a> {
+	probe: &'a LogicalPlan,
+	dimensions: Vec<PreservedOuterStarDimension<'a>>,
+	shape: PreservedOuterStarShape,
+}
+
+struct PreservedOuterStarDimension<'a> {
+	input: &'a LogicalPlan,
+	on: Vec<(Expr, Expr)>,
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	declared_position: usize,
+	composite_build: bool,
+}
+
 pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoinCandidate<'_>> {
 	let mut current = plan;
 	let mut dimensions = Vec::new();
@@ -1355,7 +1376,16 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 	})
 }
 
-fn extract_left_outer_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoinCandidate<'_>> {
+fn extract_left_outer_star_join_candidate(
+	plan: &LogicalPlan,
+) -> Option<PreservedOuterStarCandidate<'_>> {
+	extract_left_preserved_outer_star_join_candidate(plan)
+		.or_else(|| extract_right_preserved_outer_star_join_candidate(plan))
+}
+
+fn extract_left_preserved_outer_star_join_candidate(
+	plan: &LogicalPlan,
+) -> Option<PreservedOuterStarCandidate<'_>> {
 	let mut current = plan;
 	let mut dimensions = Vec::new();
 	loop {
@@ -1368,13 +1398,17 @@ fn extract_left_outer_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 				strategy_intent,
 			} if *kind == JoinKind::LeftOuter
 				&& *strategy_intent == JoinStrategyIntent::Auto
-				&& left_outer_star_base_leaf_label(right).is_some() =>
+				&& left_outer_star_dimension_label(right).is_some() =>
 			{
-				dimensions.push(StarJoinDimension {
+				let (label, composite_build) =
+					left_outer_star_dimension_label(right).expect("checked above");
+				dimensions.push(PreservedOuterStarDimension {
 					input: right,
-					on,
+					on: on.clone(),
 					strategy_intent: *strategy_intent,
+					label,
 					declared_position: 0,
+					composite_build,
 				});
 				current = left;
 			}
@@ -1388,9 +1422,57 @@ fn extract_left_outer_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 	for (declared_position, dimension) in dimensions.iter_mut().enumerate() {
 		dimension.declared_position = declared_position;
 	}
-	Some(StarJoinCandidate {
+	Some(PreservedOuterStarCandidate {
 		probe: current,
 		dimensions,
+		shape: PreservedOuterStarShape::LeftOuter,
+	})
+}
+
+fn extract_right_preserved_outer_star_join_candidate(
+	plan: &LogicalPlan,
+) -> Option<PreservedOuterStarCandidate<'_>> {
+	let mut current = plan;
+	let mut dimensions = Vec::new();
+	loop {
+		match current {
+			LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				on,
+				strategy_intent,
+			} if *kind == JoinKind::RightOuter
+				&& *strategy_intent == JoinStrategyIntent::Auto
+				&& left_outer_star_base_leaf_label(left).is_some() =>
+			{
+				let label = left_outer_star_base_leaf_label(left).expect("checked above");
+				dimensions.push(PreservedOuterStarDimension {
+					input: left,
+					on: on
+						.iter()
+						.map(|(left_expr, right_expr)| (right_expr.clone(), left_expr.clone()))
+						.collect(),
+					strategy_intent: *strategy_intent,
+					label,
+					declared_position: 0,
+					composite_build: false,
+				});
+				current = right;
+			}
+			_ => break,
+		}
+	}
+	if dimensions.len() < 2 || left_outer_star_base_leaf_label(current).is_none() {
+		return None;
+	}
+	for (declared_position, dimension) in dimensions.iter_mut().enumerate() {
+		dimension.declared_position = declared_position;
+	}
+	Some(PreservedOuterStarCandidate {
+		probe: current,
+		dimensions,
+		shape: PreservedOuterStarShape::RightOuter,
 	})
 }
 
@@ -1404,6 +1486,56 @@ fn left_outer_star_base_leaf_label(plan: &LogicalPlan) -> Option<String> {
 		}
 		_ => None,
 	}
+}
+
+fn left_outer_star_dimension_label(plan: &LogicalPlan) -> Option<(String, bool)> {
+	if let Some(label) = left_outer_star_base_leaf_label(plan) {
+		return Some((label, false));
+	}
+	left_outer_star_opaque_subtree_root_label(plan).map(|label| (label, true))
+}
+
+fn left_outer_star_opaque_subtree_root_label(plan: &LogicalPlan) -> Option<String> {
+	match plan {
+		LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			strategy_intent,
+			..
+		} if *kind == JoinKind::LeftOuter
+			&& *strategy_intent == JoinStrategyIntent::Auto
+			&& left_outer_star_subtree_nullable_side_leaf(right) =>
+		{
+			left_outer_star_subtree_root_label(left)
+		}
+		_ => None,
+	}
+}
+
+fn left_outer_star_subtree_root_label(plan: &LogicalPlan) -> Option<String> {
+	if let Some(label) = left_outer_star_base_leaf_label(plan) {
+		return Some(label);
+	}
+	match plan {
+		LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			strategy_intent,
+			..
+		} if *kind == JoinKind::LeftOuter
+			&& *strategy_intent == JoinStrategyIntent::Auto
+			&& left_outer_star_subtree_nullable_side_leaf(right) =>
+		{
+			left_outer_star_subtree_root_label(left)
+		}
+		_ => None,
+	}
+}
+
+fn left_outer_star_subtree_nullable_side_leaf(plan: &LogicalPlan) -> bool {
+	left_outer_star_base_leaf_label(plan).is_some()
 }
 
 // The relation label of a galaxy leaf (a `FROM`-clause scan, possibly aliased, and possibly wrapped in a
@@ -3022,6 +3154,31 @@ fn order_strategy_fingerprint(
 	Some(fingerprint)
 }
 
+fn preserved_outer_order_strategy_fingerprint(
+	decisions: &[DecisionReceipt],
+	order: &[usize],
+	dimensions: &[BoundPreservedOuterDimension],
+	composite_build_positions: &BTreeSet<usize>,
+) -> Option<StrategyFingerprint> {
+	let mut fingerprint = StrategyFingerprint::new();
+	for (position, decision) in decisions.iter().enumerate() {
+		let valid = match (decision.strategy, decision.placement) {
+			(JoinStrategy::Broadcast, JoinPhysicalPlacement::SwappedRightBuild) => true,
+			(JoinStrategy::Broadcast, JoinPhysicalPlacement::Natural) => {
+				composite_build_positions.contains(&position)
+			}
+			(JoinStrategy::HashPartitioned, JoinPhysicalPlacement::Natural) => true,
+			_ => false,
+		};
+		if !valid {
+			return None;
+		}
+		let label = dimensions[order[position]].label.clone();
+		fingerprint.insert(label, (decision.strategy, decision.placement));
+	}
+	Some(fingerprint)
+}
+
 pub(super) fn classify_star_order_action(
 	declared_cost: u128,
 	preferred_cost: u128,
@@ -3073,6 +3230,26 @@ struct StarChildDimension<'a> {
 struct BoundStarDimension<'a> {
 	plan: ScopedExecutionPlan,
 	on: &'a [(Expr, Expr)],
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	composite_build: bool,
+	evidence: JoinOrderDimEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct PreservedOuterChildDimension {
+	plan: ScopedExecutionPlan,
+	on: Vec<(Expr, Expr)>,
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	declared_position: usize,
+	composite_build: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BoundPreservedOuterDimension {
+	plan: ScopedExecutionPlan,
+	on: Vec<(Expr, Expr)>,
 	strategy_intent: JoinStrategyIntent,
 	label: String,
 	composite_build: bool,
@@ -3215,6 +3392,25 @@ fn sorted_star_order_indices(dimensions: &[BoundStarDimension<'_>]) -> Vec<usize
 	preferred_indices
 }
 
+fn sorted_preserved_outer_star_order_indices(
+	dimensions: &[BoundPreservedOuterDimension],
+) -> Vec<usize> {
+	let mut preferred_indices = (0..dimensions.len()).collect::<Vec<_>>();
+	preferred_indices.sort_by(|left, right| {
+		dimensions[*left]
+			.evidence
+			.estimated_rows
+			.cmp(&dimensions[*right].evidence.estimated_rows)
+			.then(
+				dimensions[*left]
+					.evidence
+					.declared_position
+					.cmp(&dimensions[*right].evidence.declared_position),
+			)
+	});
+	preferred_indices
+}
+
 #[derive(Debug, Clone)]
 enum LocalStarActuationAttempt {
 	Actuated(LocalStarActuation),
@@ -3267,7 +3463,109 @@ fn star_output_segments_for_order(
 	segments
 }
 
+fn preserved_outer_declared_segments(
+	shape: PreservedOuterStarShape,
+	probe_label: &str,
+	probe_plan: &ScopedExecutionPlan,
+	dimensions: &[BoundPreservedOuterDimension],
+) -> Vec<StarOutputSegment> {
+	let probe = StarOutputSegment {
+		label: probe_label.to_string(),
+		width: probe_plan.schema().fields().len(),
+	};
+	match shape {
+		PreservedOuterStarShape::LeftOuter => {
+			let mut segments = Vec::with_capacity(dimensions.len() + 1);
+			segments.push(probe);
+			segments.extend(dimensions.iter().map(|dimension| StarOutputSegment {
+				label: dimension.label.clone(),
+				width: dimension.plan.schema().fields().len(),
+			}));
+			segments
+		}
+		PreservedOuterStarShape::RightOuter => {
+			let mut segments = Vec::with_capacity(dimensions.len() + 1);
+			segments.extend(dimensions.iter().map(|dimension| StarOutputSegment {
+				label: dimension.label.clone(),
+				width: dimension.plan.schema().fields().len(),
+			}));
+			segments.push(probe);
+			segments
+		}
+	}
+}
+
+fn preserved_outer_physical_segments(
+	probe_label: &str,
+	probe_plan: &ScopedExecutionPlan,
+	dimensions: &[BoundPreservedOuterDimension],
+	order: &[usize],
+) -> Vec<StarOutputSegment> {
+	let mut segments = Vec::with_capacity(order.len() + 1);
+	segments.push(StarOutputSegment {
+		label: probe_label.to_string(),
+		width: probe_plan.schema().fields().len(),
+	});
+	segments.extend(order.iter().map(|idx| {
+		let dimension = &dimensions[*idx];
+		StarOutputSegment {
+			label: dimension.label.clone(),
+			width: dimension.plan.schema().fields().len(),
+		}
+	}));
+	segments
+}
+
+fn preserved_outer_declared_output(
+	shape: PreservedOuterStarShape,
+	probe_plan: &ScopedExecutionPlan,
+	dimensions: &[BoundPreservedOuterDimension],
+) -> (SchemaRef, RelationScope) {
+	match shape {
+		PreservedOuterStarShape::LeftOuter => {
+			let mut schema = probe_plan.schema();
+			let mut scope = probe_plan.scope.clone();
+			for dimension in dimensions {
+				schema = join_schema(JoinKind::LeftOuter, &schema, &dimension.plan.schema());
+				scope = RelationScope::join(
+					JoinKind::LeftOuter,
+					&scope,
+					&dimension.plan.scope,
+					&schema,
+				);
+			}
+			(schema, scope)
+		}
+		PreservedOuterStarShape::RightOuter => {
+			let mut schema = probe_plan.schema();
+			let mut scope = probe_plan.scope.clone();
+			for dimension in dimensions.iter().rev() {
+				schema = join_schema(JoinKind::RightOuter, &dimension.plan.schema(), &schema);
+				scope = RelationScope::join(
+					JoinKind::RightOuter,
+					&dimension.plan.scope,
+					&scope,
+					&schema,
+				);
+			}
+			(schema, scope)
+		}
+	}
+}
+
 impl<'a> Binder<'a> {
+	fn without_preserved_outer_actuation(&self) -> Binder<'a> {
+		let mut join_order_policy = self.join_order_policy;
+		join_order_policy.preserved_outer_gate.status =
+			OptimizerReceiptGateStatus::InsufficientEvidence;
+		Binder {
+			catalog: self.catalog,
+			config: self.config,
+			join_order_policy,
+			decision_recorder: Arc::clone(&self.decision_recorder),
+		}
+	}
+
 	pub(super) async fn try_bind_preserved_outer_star_actuation(
 		&self,
 		plan: &LogicalPlan,
@@ -3299,27 +3597,36 @@ impl<'a> Binder<'a> {
 
 		let mut scratch_dimensions = Vec::with_capacity(candidate.dimensions.len());
 		for dimension in &candidate.dimensions {
-			let dimension_plan = scratch_binder
-				.bind_plan_with_trace(
-					dimension.input,
-					&mut scratch_trace,
-					&mut scratch_render_trace,
-					JoinOrderSourceCapture::On,
-				)
-				.await?;
-			let Some(label) = dimension_plan.scope.unique_source_label() else {
-				return Ok(StarOrderActuationResult::NotCandidate);
+			let dimension_plan = if dimension.composite_build {
+				scratch_binder
+					.without_preserved_outer_actuation()
+					.bind_plan_with_trace(
+						dimension.input,
+						&mut scratch_trace,
+						&mut scratch_render_trace,
+						JoinOrderSourceCapture::On,
+					)
+					.await?
+			} else {
+				scratch_binder
+					.bind_plan_with_trace(
+						dimension.input,
+						&mut scratch_trace,
+						&mut scratch_render_trace,
+						JoinOrderSourceCapture::On,
+					)
+					.await?
 			};
-			let child = StarChildDimension {
+			let child = PreservedOuterChildDimension {
 				plan: dimension_plan,
-				on: dimension.on,
+				on: dimension.on.clone(),
 				strategy_intent: dimension.strategy_intent,
-				label,
+				label: dimension.label.clone(),
 				declared_position: dimension.declared_position,
-				composite_build: false,
+				composite_build: dimension.composite_build,
 			};
 			let Some(bound) =
-				self.bound_left_outer_star_dimension(&probe_plan, &probe_label, &child)?
+				self.bound_preserved_outer_star_dimension(&probe_plan, &probe_label, &child)?
 			else {
 				return Ok(StarOrderActuationResult::NotCandidate);
 			};
@@ -3348,14 +3655,14 @@ impl<'a> Binder<'a> {
 		}
 
 		let declared_indices = (0..scratch_dimensions.len()).collect::<Vec<_>>();
-		let selected_indices = sorted_star_order_indices(&scratch_dimensions);
-		let declared = self.preflight_left_outer_star_order_strategy(
+		let selected_indices = sorted_preserved_outer_star_order_indices(&scratch_dimensions);
+		let declared = self.preflight_preserved_outer_star_order_strategy(
 			probe_plan.clone(),
 			&scratch_dimensions,
 			&declared_indices,
 			&scratch_trace,
 		)?;
-		let Some(selected) = self.preflight_left_outer_star_order_strategy(
+		let Some(selected) = self.preflight_preserved_outer_star_order_strategy(
 			probe_plan,
 			&scratch_dimensions,
 			&selected_indices,
@@ -3383,57 +3690,58 @@ impl<'a> Binder<'a> {
 		};
 		let mut real_dimensions = Vec::with_capacity(candidate.dimensions.len());
 		for dimension in &candidate.dimensions {
-			let dimension_plan = self
-				.bind_plan_with_trace(
+			let dimension_plan = if dimension.composite_build {
+				self.without_preserved_outer_actuation()
+					.bind_plan_with_trace(
+						dimension.input,
+						trace,
+						render_trace,
+						JoinOrderSourceCapture::On,
+					)
+					.await?
+			} else {
+				self.bind_plan_with_trace(
 					dimension.input,
 					trace,
 					render_trace,
 					JoinOrderSourceCapture::On,
 				)
-				.await?;
-			let Some(label) = dimension_plan.scope.unique_source_label() else {
-				return Ok(StarOrderActuationResult::NotCandidate);
+				.await?
 			};
-			let child = StarChildDimension {
+			let child = PreservedOuterChildDimension {
 				plan: dimension_plan,
-				on: dimension.on,
+				on: dimension.on.clone(),
 				strategy_intent: dimension.strategy_intent,
-				label,
+				label: dimension.label.clone(),
 				declared_position: dimension.declared_position,
-				composite_build: false,
+				composite_build: dimension.composite_build,
 			};
-			let Some(bound) =
-				self.bound_left_outer_star_dimension(&real_probe_plan, &real_probe_label, &child)?
+			let Some(bound) = self.bound_preserved_outer_star_dimension(
+				&real_probe_plan,
+				&real_probe_label,
+				&child,
+			)?
 			else {
 				return Ok(StarOrderActuationResult::NotCandidate);
 			};
 			real_dimensions.push(bound);
 		}
 
-		let declared_segments =
-			star_output_segments(&real_probe_label, &real_probe_plan, &real_dimensions);
-		let mut declared_output_schema = real_probe_plan.schema();
-		let mut declared_scope = real_probe_plan.scope.clone();
-		for dimension in &real_dimensions {
-			declared_output_schema = join_schema(
-				JoinKind::LeftOuter,
-				&declared_output_schema,
-				&dimension.plan.schema(),
-			);
-			declared_scope = RelationScope::join(
-				JoinKind::LeftOuter,
-				&declared_scope,
-				&dimension.plan.scope,
-				&declared_output_schema,
-			);
-		}
-		let physical_segments = star_output_segments_for_order(
+		let declared_segments = preserved_outer_declared_segments(
+			candidate.shape,
+			&real_probe_label,
+			&real_probe_plan,
+			&real_dimensions,
+		);
+		let (declared_output_schema, declared_scope) =
+			preserved_outer_declared_output(candidate.shape, &real_probe_plan, &real_dimensions);
+		let physical_segments = preserved_outer_physical_segments(
 			&real_probe_label,
 			&real_probe_plan,
 			&real_dimensions,
 			&selected_indices,
 		);
-		let mut output = self.bind_left_outer_star_order_sequence(
+		let mut output = self.bind_preserved_outer_star_order_sequence(
 			real_probe_plan,
 			&real_dimensions,
 			&selected_indices,
@@ -4080,17 +4388,14 @@ impl<'a> Binder<'a> {
 		}))
 	}
 
-	fn bound_left_outer_star_dimension<'b>(
+	fn bound_preserved_outer_star_dimension(
 		&self,
 		probe_plan: &ScopedExecutionPlan,
 		probe_label: &str,
-		dimension: &StarChildDimension<'b>,
-	) -> Result<Option<BoundStarDimension<'b>>, BindingError> {
-		if dimension.composite_build {
-			return Ok(None);
-		}
+		dimension: &PreservedOuterChildDimension,
+	) -> Result<Option<BoundPreservedOuterDimension>, BindingError> {
 		let Some(edge) =
-			self.try_resolve_star_dimension_edge(probe_plan, &dimension.plan, dimension.on)?
+			self.try_resolve_star_dimension_edge(probe_plan, &dimension.plan, &dimension.on)?
 		else {
 			return Ok(None);
 		};
@@ -4126,12 +4431,12 @@ impl<'a> Binder<'a> {
 			&edge.left_resolved_keys,
 			&edge.right_resolved_keys,
 		);
-		Ok(Some(BoundStarDimension {
+		Ok(Some(BoundPreservedOuterDimension {
 			plan: dimension.plan.clone(),
-			on: dimension.on,
+			on: dimension.on.clone(),
 			strategy_intent: dimension.strategy_intent,
 			label: dimension.label.clone(),
-			composite_build: false,
+			composite_build: dimension.composite_build,
 			evidence: JoinOrderDimEvidence {
 				dimension: dimension.label.clone(),
 				declared_position: dimension.declared_position,
@@ -4418,17 +4723,17 @@ impl<'a> Binder<'a> {
 		}))
 	}
 
-	fn preflight_left_outer_star_order_strategy<'b>(
+	fn preflight_preserved_outer_star_order_strategy(
 		&self,
 		probe_plan: ScopedExecutionPlan,
-		dimensions: &[BoundStarDimension<'b>],
+		dimensions: &[BoundPreservedOuterDimension],
 		order: &[usize],
 		base_trace: &OptimizerTrace,
 	) -> Result<Option<PreflightStrategy>, BindingError> {
 		let mut preflight_trace = base_trace.clone();
 		let preflight_join_start = preflight_trace.join_decisions.len();
 		let mut no_render_trace = None;
-		let _ = self.bind_left_outer_star_order_sequence(
+		let _ = self.bind_preserved_outer_star_order_sequence(
 			probe_plan,
 			dimensions,
 			order,
@@ -4439,13 +4744,25 @@ impl<'a> Binder<'a> {
 		if preflight_decisions.len() != order.len() {
 			return Ok(None);
 		}
-		let Some(fingerprint) =
-			order_strategy_fingerprint(preflight_decisions, order, dimensions, &BTreeSet::new())
-		else {
+		let composite_build_positions = order
+			.iter()
+			.enumerate()
+			.filter_map(|(position, idx)| dimensions[*idx].composite_build.then_some(position))
+			.collect::<BTreeSet<_>>();
+		let Some(fingerprint) = preserved_outer_order_strategy_fingerprint(
+			preflight_decisions,
+			order,
+			dimensions,
+			&composite_build_positions,
+		) else {
 			return Ok(None);
 		};
-		let summary =
-			uniform_star_order_strategy(preflight_decisions).unwrap_or(StarOrderStrategy::Mixed);
+		let summary = if composite_build_positions.is_empty() {
+			uniform_star_order_strategy(preflight_decisions)
+		} else {
+			uniform_snowflake_order_strategy(preflight_decisions, &composite_build_positions)
+		}
+		.unwrap_or(StarOrderStrategy::Mixed);
 		Ok(Some(PreflightStrategy {
 			summary,
 			fingerprint,
@@ -4477,10 +4794,10 @@ impl<'a> Binder<'a> {
 		Ok(current)
 	}
 
-	fn bind_left_outer_star_order_sequence<'b>(
+	fn bind_preserved_outer_star_order_sequence(
 		&self,
 		probe_plan: ScopedExecutionPlan,
-		dimensions: &[BoundStarDimension<'b>],
+		dimensions: &[BoundPreservedOuterDimension],
 		order: &[usize],
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
@@ -4492,7 +4809,7 @@ impl<'a> Binder<'a> {
 				current,
 				dimension.plan.clone(),
 				JoinKind::LeftOuter,
-				dimension.on,
+				&dimension.on,
 				dimension.strategy_intent,
 				trace,
 				render_trace,
