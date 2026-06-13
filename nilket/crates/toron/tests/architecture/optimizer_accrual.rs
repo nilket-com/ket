@@ -522,7 +522,8 @@ pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
-	assert_eq!(resolver.matches("verdict_snapshot()").count(), 1);
+	assert_eq!(resolver.matches("receipt_gate_snapshot()").count(), 1);
+	assert!(!resolver.contains("verdict_snapshot()"));
 	assert!(report.contains("verdict_snapshot()"));
 	assert!(report_rows.contains("verdict_snapshot()"));
 	let join_order_planning = join_order
@@ -1155,7 +1156,10 @@ pub(crate) fn adr208_tree_and_graph_margin_steps_are_separate() {
 	let no_recording = first_block(&binder, "fn without_decision_recording");
 
 	assert!(binder_struct.contains("tree_join_order_soft_margin_step: SoftMarginLadderStep"));
-	assert!(binder_struct.contains("graph_join_order_soft_margin_step: SoftMarginLadderStep"));
+	assert!(
+		binder_struct
+			.contains("graph_join_order_soft_margin_steps: EffectiveGraphJoinOrderSoftMarginSteps")
+	);
 	assert!(binder_new.contains("effective_join_order_soft_margin_steps(config)"));
 	assert!(binder_new.contains("join_order_soft_margin_steps.tree"));
 	assert!(binder_new.contains("join_order_soft_margin_steps.graph"));
@@ -1164,8 +1168,9 @@ pub(crate) fn adr208_tree_and_graph_margin_steps_are_separate() {
 			.contains("tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step")
 	);
 	assert!(
-		no_recording
-			.contains("graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step")
+		no_recording.contains(
+			"graph_join_order_soft_margin_steps: self.graph_join_order_soft_margin_steps"
+		)
 	);
 }
 
@@ -1180,7 +1185,9 @@ pub(crate) fn adr208_graph_margin_gate_reads_separate_graph_step_under_apply_adv
 
 	assert!(resolver.contains("graph:"));
 	assert!(resolver.contains("graph_margin_advisory_input"));
-	assert!(actuation.contains("self.graph_join_order_soft_margin_step.margin()"));
+	assert!(resolver.contains("graph_kind_steps_from_gate"));
+	assert!(actuation.contains("graph_join_order_soft_margin_steps"));
+	assert!(actuation.contains("step_for(shape.decision_kind())"));
 	assert!(!actuation.contains("self.tree_join_order_soft_margin_step.margin()"));
 	assert!(actuation.contains("GraphActuationResult::KeptThinMargin"));
 }
@@ -1267,8 +1274,9 @@ pub(crate) fn adr208_apply_advisory_remains_resolve_once_no_storage_await() {
 			.count(),
 		1
 	);
+	assert!(resolver.contains("runtime_evidence.receipt_gate_snapshot()"));
+	assert!(report.contains("runtime_evidence.verdict_snapshot()"));
 	for block in [&resolver, &report] {
-		assert!(block.contains("runtime_evidence.verdict_snapshot()"));
 		assert!(!block.contains(".await"));
 		assert!(!block.contains("counter_read"));
 		assert!(!block.contains("counter_fetch_add"));
@@ -1419,10 +1427,12 @@ pub(crate) fn adr213_graph_readout_drives_graph_gate_only_through_apply_advisory
 
 	assert!(resolver.contains("JoinOrderSoftMarginApplication::Manual"));
 	assert!(resolver.contains("JoinOrderSoftMarginApplication::ApplyAdvisory"));
-	assert!(resolver.contains("let snapshot = config.runtime_evidence.verdict_snapshot();"));
-	assert!(resolver.contains("graph_margin_advisory_input(&snapshot)"));
-	assert!(resolver.contains("recommend_soft_margin(&graph_input.rows"));
-	assert!(actuation.contains("self.graph_join_order_soft_margin_step.margin()"));
+	assert!(resolver.contains("let snapshot = config.runtime_evidence.receipt_gate_snapshot();"));
+	assert!(resolver.contains("graph_margin_advisory_input(&snapshot.verdicts)"));
+	assert!(resolver.contains("recommend_soft_margin("));
+	assert!(resolver.contains("&graph_input.rows"));
+	assert!(actuation.contains("graph_join_order_soft_margin_steps"));
+	assert!(actuation.contains("step_for(shape.decision_kind())"));
 	assert!(!actuation.contains("recommend_soft_margin"));
 	assert!(!actuation.contains("margin_advisory"));
 	assert!(row_helper.contains("scope.is_actionable_knob()"));
@@ -1667,10 +1677,13 @@ pub(crate) fn adr215_bind_margin_steps_share_one_snapshot() {
 	);
 	assert!(!binder_new.contains("effective_tree_join_order_soft_margin_step(config)"));
 	assert!(!binder_new.contains("effective_graph_join_order_soft_margin_step(config)"));
-	assert_eq!(resolver.matches("verdict_snapshot()").count(), 1);
-	assert!(resolver.contains("let snapshot = config.runtime_evidence.verdict_snapshot();"));
-	assert!(resolver.contains("let tree_input = tree_margin_advisory_input(&snapshot);"));
-	assert!(resolver.contains("let graph_input = graph_margin_advisory_input(&snapshot);"));
+	assert_eq!(resolver.matches("receipt_gate_snapshot()").count(), 1);
+	assert!(!resolver.contains("verdict_snapshot()"));
+	assert!(resolver.contains("let snapshot = config.runtime_evidence.receipt_gate_snapshot();"));
+	assert!(resolver.contains("let tree_input = tree_margin_advisory_input(&snapshot.verdicts);"));
+	assert!(
+		resolver.contains("let graph_input = graph_margin_advisory_input(&snapshot.verdicts);")
+	);
 }
 
 #[test]
@@ -1684,8 +1697,9 @@ pub(crate) fn adr215_graph_resolver_is_scope_pure() {
 	);
 
 	assert!(graph_input.contains("MarginAdvisoryScope::GraphFamily"));
-	assert!(resolver.contains("graph_margin_advisory_input(&snapshot)"));
-	assert!(resolver.contains("recommend_soft_margin(&graph_input.rows"));
+	assert!(resolver.contains("graph_margin_advisory_input(&snapshot.verdicts)"));
+	assert!(resolver.contains("recommend_soft_margin("));
+	assert!(resolver.contains("&graph_input.rows"));
 	for kind in ["GalaxyRoot", "BridgeRoot", "BridgeChainRoot"] {
 		assert!(
 			graph_predicate.contains(kind),
@@ -2084,7 +2098,7 @@ pub(crate) fn adr217_receipt_gates_are_explicit_five_row_system_table() {
 		assert!(schema.contains(column), "schema is missing {column}");
 		assert!(rows.contains(column), "row projection is missing {column}");
 	}
-	assert!(report.contains("graph_margin_divergence_gate(&snapshot, config)"));
+	assert!(report.contains("graph_margin_divergence_gate_row(&snapshot, config)"));
 	assert!(report.contains("preserved_outer_ordering_gate(&snapshot, config)"));
 	assert!(report.contains("decision_conflict_pressure_gate(&snapshot)"));
 	assert!(report.contains("windowing_decay_pressure_gate(&snapshot)"));
@@ -2149,13 +2163,15 @@ pub(crate) fn adr217_receipt_gate_snapshot_is_single_locked_snapshot() {
 pub(crate) fn adr217_graph_gate_uses_ready_kind_divergence_not_family_rollup() {
 	let join_order = source("src/binder/join_order.rs");
 	let graph = first_block(&join_order, "fn graph_margin_divergence_gate");
+	let row = first_block(&join_order, "fn graph_margin_divergence_gate_row");
 	let signals = first_block(&join_order, "fn graph_kind_gate_signals");
 
+	assert!(join_order.contains("pub(crate) struct GraphMarginDivergenceGate"));
 	assert!(graph.contains("ready.len() < 2"));
 	assert!(graph.contains("left.recommendation != right.recommendation"));
 	assert!(graph.contains("left.recommended_step != right.recommended_step"));
 	assert!(graph.contains("OptimizerReceiptGateStatus::Actionable"));
-	assert!(graph.contains("graph_kind_recommendations_diverge"));
+	assert!(row.contains("graph_kind_recommendations_diverge"));
 	assert!(signals.contains("MarginAdvisoryScope::GraphKind(kind)"));
 	assert!(signals.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
 	for kind in ["GalaxyRoot", "BridgeRoot", "BridgeChainRoot"] {

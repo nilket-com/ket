@@ -454,7 +454,7 @@ struct Binder<'a> {
 	// ADR 215: family soft-margin steps resolved once at bind entry from one evidence snapshot.
 	// Tree and graph paths read these fields rather than re-snapshotting runtime evidence mid-bind.
 	tree_join_order_soft_margin_step: SoftMarginLadderStep,
-	graph_join_order_soft_margin_step: SoftMarginLadderStep,
+	graph_join_order_soft_margin_steps: EffectiveGraphJoinOrderSoftMarginSteps,
 	// The sink for optimizer decisions. Normally a runtime-evidence recorder; a scratch recognition
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
 	// pollute the shared log — a structural fact, not a runtime flag.
@@ -480,7 +480,7 @@ impl<'a> Binder<'a> {
 			catalog,
 			config,
 			tree_join_order_soft_margin_step: join_order_soft_margin_steps.tree,
-			graph_join_order_soft_margin_step: join_order_soft_margin_steps.graph,
+			graph_join_order_soft_margin_steps: join_order_soft_margin_steps.graph,
 			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
 				Arc::clone(&config.runtime_evidence),
 				decision_provenance,
@@ -496,7 +496,7 @@ impl<'a> Binder<'a> {
 			catalog: self.catalog,
 			config: self.config,
 			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
-			graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step,
+			graph_join_order_soft_margin_steps: self.graph_join_order_soft_margin_steps,
 			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
 				Arc::clone(&self.config.runtime_evidence),
 				decision_provenance,
@@ -511,7 +511,7 @@ impl<'a> Binder<'a> {
 			catalog: self.catalog,
 			config: self.config,
 			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
-			graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step,
+			graph_join_order_soft_margin_steps: self.graph_join_order_soft_margin_steps,
 			decision_recorder: Arc::new(NoOpDecisionRecorder),
 		}
 	}

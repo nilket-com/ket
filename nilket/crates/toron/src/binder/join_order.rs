@@ -292,30 +292,69 @@ fn graph_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> Margi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffectiveJoinOrderSoftMarginSteps {
 	pub(crate) tree: SoftMarginLadderStep,
-	pub(crate) graph: SoftMarginLadderStep,
+	pub(crate) graph: EffectiveGraphJoinOrderSoftMarginSteps,
 }
 
-// ADR 215: the opt-in derivation of both family soft-margin steps. `Manual` returns the ADR 190
-// configured base unchanged for both families. `ApplyAdvisory` reads one snapshot, then derives the
-// tree and graph recommendations from their own scoped evidence. Binder construction calls this once;
-// low-level star/snowflake/graph helpers read the resolved fields and never re-snapshot evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectiveGraphJoinOrderSoftMarginSteps {
+	pub(crate) family: SoftMarginLadderStep,
+	pub(crate) galaxy: SoftMarginLadderStep,
+	pub(crate) bridge: SoftMarginLadderStep,
+	pub(crate) bridge_chain: SoftMarginLadderStep,
+}
+
+impl EffectiveGraphJoinOrderSoftMarginSteps {
+	fn uniform(step: SoftMarginLadderStep) -> Self {
+		Self {
+			family: step,
+			galaxy: step,
+			bridge: step,
+			bridge_chain: step,
+		}
+	}
+
+	pub(crate) fn step_for(self, kind: OptimizerDecisionKind) -> SoftMarginLadderStep {
+		match kind {
+			OptimizerDecisionKind::GalaxyRoot => self.galaxy,
+			OptimizerDecisionKind::BridgeRoot => self.bridge,
+			OptimizerDecisionKind::BridgeChainRoot => self.bridge_chain,
+			OptimizerDecisionKind::StarCandidate
+			| OptimizerDecisionKind::FlatStar
+			| OptimizerDecisionKind::SnowflakeRoot
+			| OptimizerDecisionKind::SnowflakeBranch
+			| OptimizerDecisionKind::PreservedOuterOrder => {
+				unreachable!("graph margin requested for non-graph kind {kind:?}")
+			}
+		}
+	}
+}
+
+// ADRs 215/218: the opt-in derivation of tree and graph soft-margin steps. `Manual` returns
+// the ADR 190 configured base unchanged. `ApplyAdvisory` reads one snapshot, derives the tree
+// family and graph family recommendations, then arms graph-kind steps only when the ADR 217
+// graph divergence gate is actionable.
 pub(crate) fn effective_join_order_soft_margin_steps(
 	config: &PlannerConfig,
 ) -> EffectiveJoinOrderSoftMarginSteps {
 	match config.join_order_soft_margin_application {
 		JoinOrderSoftMarginApplication::Manual => EffectiveJoinOrderSoftMarginSteps {
 			tree: config.join_order_soft_margin_step,
-			graph: config.join_order_soft_margin_step,
+			graph: EffectiveGraphJoinOrderSoftMarginSteps::uniform(
+				config.join_order_soft_margin_step,
+			),
 		},
 		JoinOrderSoftMarginApplication::ApplyAdvisory => {
-			let snapshot = config.runtime_evidence.verdict_snapshot();
-			let tree_input = tree_margin_advisory_input(&snapshot);
-			let graph_input = graph_margin_advisory_input(&snapshot);
+			let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+			let tree_input = tree_margin_advisory_input(&snapshot.verdicts);
+			let graph_input = graph_margin_advisory_input(&snapshot.verdicts);
+			let graph_family =
+				recommend_soft_margin(&graph_input.rows, config.join_order_soft_margin_step)
+					.recommended_step;
+			let graph_gate = graph_margin_divergence_gate(&snapshot, config);
 			EffectiveJoinOrderSoftMarginSteps {
 				tree: recommend_soft_margin(&tree_input.rows, config.join_order_soft_margin_step)
 					.recommended_step,
-				graph: recommend_soft_margin(&graph_input.rows, config.join_order_soft_margin_step)
-					.recommended_step,
+				graph: graph_kind_steps_from_gate(graph_family, &graph_gate),
 			}
 		}
 	}
@@ -332,7 +371,17 @@ pub(crate) fn effective_tree_join_order_soft_margin_step(
 pub(crate) fn effective_graph_join_order_soft_margin_step(
 	config: &PlannerConfig,
 ) -> SoftMarginLadderStep {
-	effective_join_order_soft_margin_steps(config).graph
+	effective_join_order_soft_margin_steps(config).graph.family
+}
+
+#[cfg(test)]
+pub(crate) fn effective_graph_kind_join_order_soft_margin_step(
+	config: &PlannerConfig,
+	kind: OptimizerDecisionKind,
+) -> SoftMarginLadderStep {
+	effective_join_order_soft_margin_steps(config)
+		.graph
+		.step_for(kind)
 }
 
 // ADRs 208/213/215: report rows keep the configured base, scoped recommendation, application
@@ -426,11 +475,25 @@ pub(crate) struct OptimizerReceiptGateRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GraphKindGateSignal {
+pub(crate) struct GraphKindGateSignal {
 	kind: OptimizerDecisionKind,
 	recommendation: MarginRecommendation,
 	recommended_step: SoftMarginLadderStep,
 	sample_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphMarginDivergenceGate {
+	pub(crate) status: OptimizerReceiptGateStatus,
+	pub(crate) ready: Vec<GraphKindGateSignal>,
+}
+
+impl GraphMarginDivergenceGate {
+	fn sample_count(&self) -> u64 {
+		self.ready
+			.iter()
+			.fold(0_u64, |acc, signal| acc.saturating_add(signal.sample_size))
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +517,7 @@ impl DecisionConflictGateSignal {
 pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<OptimizerReceiptGateRow> {
 	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
 	vec![
-		graph_margin_divergence_gate(&snapshot, config),
+		graph_margin_divergence_gate_row(&snapshot, config),
 		preserved_outer_ordering_gate(&snapshot, config),
 		decision_conflict_pressure_gate(&snapshot),
 		windowing_decay_pressure_gate(&snapshot),
@@ -462,14 +525,11 @@ pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<Optimiz
 	]
 }
 
-fn graph_margin_divergence_gate(
+pub(crate) fn graph_margin_divergence_gate(
 	snapshot: &OptimizerReceiptGateSnapshot,
 	config: &PlannerConfig,
-) -> OptimizerReceiptGateRow {
+) -> GraphMarginDivergenceGate {
 	let ready = graph_kind_gate_signals(&snapshot.verdicts, config);
-	let sample_count = ready
-		.iter()
-		.fold(0_u64, |acc, signal| acc.saturating_add(signal.sample_size));
 	let has_divergence = ready.iter().any(|left| {
 		ready.iter().any(|right| {
 			left.kind != right.kind
@@ -484,7 +544,16 @@ fn graph_margin_divergence_gate(
 	} else {
 		OptimizerReceiptGateStatus::Inactive
 	};
-	let reason = match status {
+	GraphMarginDivergenceGate { status, ready }
+}
+
+fn graph_margin_divergence_gate_row(
+	snapshot: &OptimizerReceiptGateSnapshot,
+	config: &PlannerConfig,
+) -> OptimizerReceiptGateRow {
+	let gate = graph_margin_divergence_gate(snapshot, config);
+	let sample_count = gate.sample_count();
+	let reason = match gate.status {
 		OptimizerReceiptGateStatus::InsufficientEvidence => "requires_two_ready_graph_kind_rows",
 		OptimizerReceiptGateStatus::Actionable => "graph_kind_recommendations_diverge",
 		OptimizerReceiptGateStatus::Inactive => "graph_kind_recommendations_converge",
@@ -493,13 +562,38 @@ fn graph_margin_divergence_gate(
 	OptimizerReceiptGateRow {
 		gate_name: "graph_margin_divergence",
 		gate_family: "graph_join_order",
-		status,
+		status: gate.status,
 		sample_count,
-		primary_signal: format!("ready_kind_count={}", ready.len()),
-		secondary_signal: graph_kind_signal_label(&ready, &snapshot.health),
+		primary_signal: format!("ready_kind_count={}", gate.ready.len()),
+		secondary_signal: graph_kind_signal_label(&gate.ready, &snapshot.health),
 		reason: reason.to_string(),
 		next_cut: "per_kind_graph_margin",
 	}
+}
+
+fn graph_kind_steps_from_gate(
+	family: SoftMarginLadderStep,
+	gate: &GraphMarginDivergenceGate,
+) -> EffectiveGraphJoinOrderSoftMarginSteps {
+	if gate.status != OptimizerReceiptGateStatus::Actionable {
+		return EffectiveGraphJoinOrderSoftMarginSteps::uniform(family);
+	}
+	let mut steps = EffectiveGraphJoinOrderSoftMarginSteps::uniform(family);
+	for signal in &gate.ready {
+		match signal.kind {
+			OptimizerDecisionKind::GalaxyRoot => steps.galaxy = signal.recommended_step,
+			OptimizerDecisionKind::BridgeRoot => steps.bridge = signal.recommended_step,
+			OptimizerDecisionKind::BridgeChainRoot => steps.bridge_chain = signal.recommended_step,
+			OptimizerDecisionKind::StarCandidate
+			| OptimizerDecisionKind::FlatStar
+			| OptimizerDecisionKind::SnowflakeRoot
+			| OptimizerDecisionKind::SnowflakeBranch
+			| OptimizerDecisionKind::PreservedOuterOrder => {
+				unreachable!("graph gate signal carried non-graph kind {:?}", signal.kind)
+			}
+		}
+	}
+	steps
 }
 
 fn graph_kind_gate_signals(
@@ -3014,7 +3108,10 @@ impl<'a> Binder<'a> {
 				OptimizerDecisionDeclineReason::MissingEstimate,
 			));
 		};
-		let margin = self.graph_join_order_soft_margin_step.margin();
+		let margin = self
+			.graph_join_order_soft_margin_steps
+			.step_for(shape.decision_kind())
+			.margin();
 		if preferred_cost.saturating_mul(margin.denominator)
 			> declared_cost.saturating_mul(margin.numerator)
 		{

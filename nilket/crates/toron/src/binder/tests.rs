@@ -12003,6 +12003,19 @@ const GRAPH_LOOSEN_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictCl
 	JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
 )];
 
+const GRAPH_DIVERGENT_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u64)] = &[
+	(
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	),
+	(
+		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	),
+];
+
 #[tokio::test]
 async fn auto_applied_margin_uses_advisory_recommendation() {
 	// Base Baseline (4/5) + a loosen signal: the ADR 189 advisory recommends 9/10, and under
@@ -12393,6 +12406,159 @@ fn tree_and_graph_evidence_do_not_cross_steer() {
 }
 
 #[test]
+fn per_kind_graph_margin_inert_until_gate_actionable() {
+	let cold = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	for kind in [
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	] {
+		assert_eq!(
+			effective_graph_kind_join_order_soft_margin_step(&cold, kind),
+			SoftMarginLadderStep::Baseline
+		);
+	}
+
+	let one_ready =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_LOOSEN_VERDICTS);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&one_ready),
+		SoftMarginLadderStep::Loose
+	);
+	for kind in [
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	] {
+		assert_eq!(
+			effective_graph_kind_join_order_soft_margin_step(&one_ready, kind),
+			SoftMarginLadderStep::Loose,
+			"a non-actionable graph gate must keep every graph kind on the family step"
+		);
+	}
+
+	let converged = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+			(
+				OptimizerDecisionKind::BridgeChainRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+		],
+	);
+	for kind in [
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	] {
+		assert_eq!(
+			effective_graph_kind_join_order_soft_margin_step(&converged, kind),
+			SoftMarginLadderStep::Loose,
+			"converged ready kinds must not arm per-kind divergence"
+		);
+	}
+}
+
+#[test]
+fn actionable_graph_divergence_resolves_kind_specific_steps() {
+	let config =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_DIVERGENT_VERDICTS);
+	let gate =
+		graph_margin_divergence_gate(&config.runtime_evidence.receipt_gate_snapshot(), &config);
+
+	assert_eq!(gate.status, OptimizerReceiptGateStatus::Actionable);
+	assert_eq!(gate.ready.len(), 2);
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_kind_join_order_soft_margin_step(
+			&config,
+			OptimizerDecisionKind::GalaxyRoot
+		),
+		SoftMarginLadderStep::Loose
+	);
+	assert_eq!(
+		effective_graph_kind_join_order_soft_margin_step(
+			&config,
+			OptimizerDecisionKind::BridgeRoot
+		),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_kind_join_order_soft_margin_step(
+			&config,
+			OptimizerDecisionKind::BridgeChainRoot,
+		),
+		SoftMarginLadderStep::Tight
+	);
+}
+
+#[test]
+fn graph_kind_without_ready_evidence_uses_family_step() {
+	let config =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_DIVERGENT_VERDICTS);
+
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_kind_join_order_soft_margin_step(
+			&config,
+			OptimizerDecisionKind::BridgeRoot
+		),
+		SoftMarginLadderStep::Baseline
+	);
+}
+
+#[test]
+fn manual_ignores_graph_kind_divergence() {
+	let manual = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	for (kind, class, count) in GRAPH_DIVERGENT_VERDICTS {
+		record_verdicts(manual.runtime_evidence.as_ref(), *kind, *class, *count);
+	}
+
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&manual),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&manual),
+		SoftMarginLadderStep::Baseline
+	);
+	for kind in [
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	] {
+		assert_eq!(
+			effective_graph_kind_join_order_soft_margin_step(&manual, kind),
+			SoftMarginLadderStep::Baseline
+		);
+	}
+}
+
+#[test]
 fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
 	let config = auto_applied_margin_config(
 		SoftMarginLadderStep::Baseline,
@@ -12676,6 +12842,83 @@ async fn graph_evidence_changes_near_margin_graph_decision_while_tree_evidence_d
 }
 
 #[tokio::test]
+async fn graph_kind_margin_reaches_graph_actuation_decision() {
+	let catalog = margin_boundary_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
+		.expect("plan margin-boundary galaxy EXPLAIN");
+	let family_only = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	let armed =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_DIVERGENT_VERDICTS);
+
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&armed),
+		SoftMarginLadderStep::Baseline,
+		"family graph step must stay baseline so this test proves the kind-specific seam"
+	);
+	assert_eq!(
+		effective_graph_kind_join_order_soft_margin_step(&armed, OptimizerDecisionKind::GalaxyRoot),
+		SoftMarginLadderStep::Loose
+	);
+
+	let (_schema, family_rows) = bind_explain_rows(&logical, &catalog, &family_only).await;
+	let family_galaxy = family_rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("family galaxy row");
+	assert_eq!(
+		family_galaxy[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+
+	let (_schema, armed_rows) = bind_explain_rows(&logical, &catalog, &armed).await;
+	let armed_galaxy = armed_rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("armed galaxy row");
+	assert_eq!(
+		armed_galaxy[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
+	assert_utf8_contains(&armed_galaxy[3], "action=reordered");
+	assert_utf8_contains(&armed_galaxy[3], "applied_root=returns");
+}
+
+#[tokio::test]
+async fn tree_margin_application_byte_identical_under_graph_kind_divergence() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_000, 850);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o \
+			 INNER JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id",
+		)
+		.expect("plan star");
+	let baseline = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	let graph_divergent =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_DIVERGENT_VERDICTS);
+
+	let (baseline_plan, baseline_trace) = bind_with_trace(&logical, &catalog, &baseline)
+		.await
+		.expect("bind baseline star");
+	let (graph_plan, graph_trace) = bind_with_trace(&logical, &catalog, &graph_divergent)
+		.await
+		.expect("bind graph-divergent star");
+
+	assert_eq!(format!("{baseline_plan:?}"), format!("{graph_plan:?}"));
+	assert_eq!(baseline_trace.join_decisions, graph_trace.join_decisions);
+}
+
+#[tokio::test]
 async fn apply_advisory_with_insufficient_graph_evidence_binds_byte_identical() {
 	let catalog = margin_boundary_galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -12760,6 +13003,12 @@ async fn manual_mode_byte_identical_for_both_families() {
 		OptimizerRuntimeVerdictClass::MissedWin,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
 	);
+	record_verdicts(
+		manual.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
 	let baseline = margin_config(SoftMarginLadderStep::Baseline);
 
 	let (manual_plan, manual_trace) = bind_with_trace(&logical, &catalog, &manual)
@@ -12835,6 +13084,40 @@ async fn rune_respects_auto_applied_margin() {
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
 	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
 	assert_utf8_contains(&join_order_row(&rows)[3], "soft_margin=9/10");
+}
+
+#[tokio::test]
+async fn rune_graph_kind_margin_matches_sql() {
+	let catalog = margin_boundary_galaxy_join_order_catalog();
+	let config =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_DIVERGENT_VERDICTS);
+	let sql_logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
+		.expect("plan SQL graph-kind margin EXPLAIN");
+	let rune_source = format!(
+		r#"
+        pub fn main(ctx) {{
+            ctx.sql("EXPLAIN {}")
+        }}
+    "#,
+		galaxy_conformed_order_sql()
+	);
+	let rune_logical = rune_plan(&rune_source).await;
+
+	let (_schema, sql_rows) = bind_explain_rows(&sql_logical, &catalog, &config).await;
+	let (_schema, rune_rows) = bind_explain_rows(&rune_logical, &catalog, &config).await;
+	let sql_galaxy = sql_rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("SQL galaxy row");
+	let rune_galaxy = rune_rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("Rune galaxy row");
+
+	assert_eq!(sql_galaxy[2], rune_galaxy[2]);
+	assert_eq!(sql_galaxy[3], rune_galaxy[3]);
+	assert_utf8_contains(&rune_galaxy[3], "applied_root=returns");
 }
 
 #[test]
