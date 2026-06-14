@@ -953,22 +953,36 @@ fn compare_decision_conflict_report(
 fn windowing_decay_pressure_gate(
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> OptimizerReceiptGateRow {
+	let window = &snapshot.window;
+	let status = if window.lifetime_count < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE {
+		OptimizerReceiptGateStatus::InsufficientEvidence
+	} else if window.stale_lifetime_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+		&& window.stale_lifetime_count > window.recent_count
+	{
+		OptimizerReceiptGateStatus::Actionable
+	} else {
+		OptimizerReceiptGateStatus::Inactive
+	};
+	let reason = match status {
+		OptimizerReceiptGateStatus::InsufficientEvidence => "requires_lifetime_evidence_floor",
+		OptimizerReceiptGateStatus::Actionable => "stale_window_evidence_dominates",
+		OptimizerReceiptGateStatus::Inactive => "recent_window_matches_lifetime",
+		OptimizerReceiptGateStatus::BlockedExternalSignal => unreachable!(),
+	};
 	OptimizerReceiptGateRow {
 		gate_name: "windowing_decay_pressure",
 		gate_family: "evidence_windowing",
-		status: OptimizerReceiptGateStatus::Inactive,
-		sample_count: snapshot
-			.verdicts
-			.iter()
-			.map(|row| row.count)
-			.chain(snapshot.decisions.iter().map(|row| row.count))
-			.fold(0_u64, |acc, count| acc.saturating_add(count)),
-		primary_signal: "windowing_substrate=unbuilt".to_string(),
+		status,
+		sample_count: window.lifetime_count,
+		primary_signal: format!(
+			"recent_window={},stale_lifetime={},lifetime_total={}",
+			window.recent_count, window.stale_lifetime_count, window.lifetime_count
+		),
 		secondary_signal: format!(
 			"evidence_health={}",
 			evidence_health_label(&snapshot.health)
 		),
-		reason: "windowing_decay_substrate_unbuilt".to_string(),
+		reason: reason.to_string(),
 		next_cut: "windowing_decay_substrate",
 	}
 }

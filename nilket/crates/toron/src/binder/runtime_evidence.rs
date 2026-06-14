@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wendelon::schema::{TenantId, WriteStatus};
 use wendelon_client::{Client, ClientError, WriteOptions};
@@ -17,7 +19,9 @@ use super::decision_log::{
 
 pub const OPTIMIZER_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/verdict/";
 pub const OPTIMIZER_DECISION_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/decision/";
+pub const OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX: &str = "optimizer_evidence/window/";
 const UNAVAILABLE_CIRCUIT_BREAKER_FAILURES: u64 = 3;
+const OPTIMIZER_EVIDENCE_WINDOW_BUCKET: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptimizerEvidenceMode {
@@ -71,6 +75,37 @@ pub(crate) struct OptimizerReceiptGateSnapshot {
 	pub(crate) verdicts: Vec<OptimizerRuntimeVerdictRow>,
 	pub(crate) decisions: Vec<OptimizerDecisionRow>,
 	pub(crate) health: OptimizerEvidenceStatusSnapshot,
+	pub(crate) window: OptimizerEvidenceWindowSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OptimizerEvidenceWindowId(pub(crate) u64);
+
+impl OptimizerEvidenceWindowId {
+	fn previous(self) -> Self {
+		Self(self.0.saturating_sub(1))
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OptimizerEvidenceWindowCounterKey {
+	Verdict {
+		window: OptimizerEvidenceWindowId,
+		key: OptimizerRuntimeVerdictKey,
+	},
+	Decision {
+		window: OptimizerEvidenceWindowId,
+		key: OptimizerRuntimeDecisionKey,
+	},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimizerEvidenceWindowSnapshot {
+	pub(crate) current_window: OptimizerEvidenceWindowId,
+	pub(crate) previous_window: OptimizerEvidenceWindowId,
+	pub(crate) recent_count: u64,
+	pub(crate) stale_lifetime_count: u64,
+	pub(crate) lifetime_count: u64,
 }
 
 #[derive(Clone)]
@@ -99,6 +134,7 @@ pub struct OptimizerEvidenceRefreshReport {
 pub struct OptimizerRuntimeEvidence {
 	state: Mutex<RuntimeEvidenceState>,
 	binding: Option<DurableEvidenceBinding>,
+	window_id_source: OptimizerEvidenceWindowIdSource,
 }
 
 impl fmt::Debug for OptimizerRuntimeEvidence {
@@ -118,6 +154,9 @@ struct RuntimeEvidenceState {
 	decision_pending: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
 	decision_in_flight: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
 	decision_durable_cache: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
+	window_pending: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
+	window_in_flight: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
+	window_durable_cache: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
 	mode: OptimizerEvidenceMode,
 	state: OptimizerEvidenceState,
 	dropped_deltas: u64,
@@ -138,6 +177,9 @@ impl Default for RuntimeEvidenceState {
 			decision_pending: BTreeMap::new(),
 			decision_in_flight: BTreeMap::new(),
 			decision_durable_cache: BTreeMap::new(),
+			window_pending: BTreeMap::new(),
+			window_in_flight: BTreeMap::new(),
+			window_durable_cache: BTreeMap::new(),
 			mode: OptimizerEvidenceMode::LocalOnly,
 			state: OptimizerEvidenceState::Ok,
 			dropped_deltas: 0,
@@ -151,11 +193,55 @@ impl Default for RuntimeEvidenceState {
 	}
 }
 
+#[derive(Debug, Clone)]
+enum OptimizerEvidenceWindowIdSource {
+	System {
+		bucket: Duration,
+	},
+	#[cfg(test)]
+	Manual(Arc<AtomicU64>),
+}
+
+impl OptimizerEvidenceWindowIdSource {
+	fn system() -> Self {
+		Self::System {
+			bucket: OPTIMIZER_EVIDENCE_WINDOW_BUCKET,
+		}
+	}
+
+	fn current(&self) -> OptimizerEvidenceWindowId {
+		match self {
+			Self::System { bucket } => {
+				let bucket_secs = bucket.as_secs().max(1);
+				let now_secs = SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.unwrap_or(Duration::ZERO)
+					.as_secs();
+				OptimizerEvidenceWindowId(now_secs / bucket_secs)
+			}
+			#[cfg(test)]
+			Self::Manual(value) => OptimizerEvidenceWindowId(value.load(AtomicOrdering::SeqCst)),
+		}
+	}
+}
+
 impl OptimizerRuntimeEvidence {
 	pub fn local_only() -> Self {
 		Self {
 			state: Mutex::new(RuntimeEvidenceState::default()),
 			binding: None,
+			window_id_source: OptimizerEvidenceWindowIdSource::system(),
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn local_only_with_window_id(window_id: u64) -> Self {
+		Self {
+			state: Mutex::new(RuntimeEvidenceState::default()),
+			binding: None,
+			window_id_source: OptimizerEvidenceWindowIdSource::Manual(Arc::new(AtomicU64::new(
+				window_id,
+			))),
 		}
 	}
 
@@ -166,7 +252,16 @@ impl OptimizerRuntimeEvidence {
 				..RuntimeEvidenceState::default()
 			}),
 			binding: Some(binding),
+			window_id_source: OptimizerEvidenceWindowIdSource::system(),
 		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn set_window_id_for_test(&self, window_id: u64) {
+		let OptimizerEvidenceWindowIdSource::Manual(value) = &self.window_id_source else {
+			panic!("test window id setter requires a manual window id source");
+		};
+		value.store(window_id, AtomicOrdering::SeqCst);
 	}
 
 	pub(crate) fn record_verdict(
@@ -176,6 +271,7 @@ impl OptimizerRuntimeEvidence {
 		provenance: OptimizerRuntimeVerdictProvenance,
 	) -> Vec<OptimizerRuntimeVerdictKey> {
 		let mut keys = Vec::with_capacity(2);
+		let window = self.window_id_source.current();
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		let total = OptimizerRuntimeVerdictKey {
 			kind,
@@ -183,6 +279,10 @@ impl OptimizerRuntimeEvidence {
 			lane: OptimizerRuntimeEvidenceLane::Total,
 		};
 		increment_count(&mut state.pending, total);
+		increment_count(
+			&mut state.window_pending,
+			OptimizerEvidenceWindowCounterKey::Verdict { window, key: total },
+		);
 		keys.push(total);
 		if provenance == OptimizerRuntimeVerdictProvenance::Demoted {
 			let demoted = OptimizerRuntimeVerdictKey {
@@ -191,6 +291,13 @@ impl OptimizerRuntimeEvidence {
 				lane: OptimizerRuntimeEvidenceLane::Demoted,
 			};
 			increment_count(&mut state.pending, demoted);
+			increment_count(
+				&mut state.window_pending,
+				OptimizerEvidenceWindowCounterKey::Verdict {
+					window,
+					key: demoted,
+				},
+			);
 			keys.push(demoted);
 		}
 		keys
@@ -206,6 +313,7 @@ impl OptimizerRuntimeEvidence {
 			return Vec::new();
 		}
 		let mut keys = Vec::with_capacity(2);
+		let window = self.window_id_source.current();
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		let total = OptimizerRuntimeDecisionKey {
 			kind,
@@ -213,6 +321,10 @@ impl OptimizerRuntimeEvidence {
 			lane: OptimizerRuntimeEvidenceLane::Total,
 		};
 		increment_count(&mut state.decision_pending, total);
+		increment_count(
+			&mut state.window_pending,
+			OptimizerEvidenceWindowCounterKey::Decision { window, key: total },
+		);
 		keys.push(total);
 		if provenance == OptimizerRuntimeVerdictProvenance::Demoted {
 			let demoted = OptimizerRuntimeDecisionKey {
@@ -221,6 +333,13 @@ impl OptimizerRuntimeEvidence {
 				lane: OptimizerRuntimeEvidenceLane::Demoted,
 			};
 			increment_count(&mut state.decision_pending, demoted);
+			increment_count(
+				&mut state.window_pending,
+				OptimizerEvidenceWindowCounterKey::Decision {
+					window,
+					key: demoted,
+				},
+			);
 			keys.push(demoted);
 		}
 		keys
@@ -242,11 +361,17 @@ impl OptimizerRuntimeEvidence {
 	}
 
 	pub(crate) fn receipt_gate_snapshot(&self) -> OptimizerReceiptGateSnapshot {
+		let current_window = self.window_id_source.current();
 		let state = self.state.lock().expect("optimizer runtime evidence");
+		let verdicts = verdict_rows_from_state(&state);
+		let decisions = decision_rows_from_state(&state);
+		let health = status_snapshot_from_state(&state);
+		let window = window_snapshot_from_state(&state, current_window);
 		OptimizerReceiptGateSnapshot {
-			verdicts: verdict_rows_from_state(&state),
-			decisions: decision_rows_from_state(&state),
-			health: status_snapshot_from_state(&state),
+			verdicts,
+			decisions,
+			health,
+			window,
 		}
 	}
 
@@ -285,6 +410,49 @@ impl OptimizerRuntimeEvidence {
 					self.drop_ambiguous_decision_in_flight(key, delta, error.to_string())
 				}
 				Err(_) => self.drop_ambiguous_decision_in_flight(
+					key,
+					delta,
+					"counter fetch-add timed out".to_string(),
+				),
+			}
+		}
+	}
+
+	pub async fn flush_window_deltas(&self) {
+		let Some(binding) = self.binding.clone() else {
+			return;
+		};
+		let keys = self.pending_window_keys();
+		for key in keys {
+			let Some(delta) = self.take_pending_window_for_flush(key) else {
+				continue;
+			};
+			let key_bytes = window_counter_key(key);
+			let result = tokio::time::timeout(
+				binding.flush_timeout,
+				binding.client.counter_fetch_add(
+					binding.tenant_id,
+					&key_bytes,
+					delta,
+					WriteOptions::default(),
+				),
+			)
+			.await;
+			match result {
+				Ok(Ok(receipt)) => self.ack_window_flush(key, receipt.current_value),
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::COUNTER_REPLICATION_UNSUPPORTED =>
+				{
+					self.latch_window_replication_unsupported(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(error)) => {
+					self.drop_ambiguous_window_in_flight(key, delta, error.to_string())
+				}
+				Err(_) => self.drop_ambiguous_window_in_flight(
 					key,
 					delta,
 					"counter fetch-add timed out".to_string(),
@@ -388,8 +556,35 @@ impl OptimizerRuntimeEvidence {
 				}
 			}
 		}
-		let refreshed_keys = refreshed.len().saturating_add(refreshed_decisions.len());
-		self.merge_refresh(refreshed, refreshed_decisions);
+		let current_window = self.window_id_source.current();
+		let previous_window = current_window.previous();
+		let mut refreshed_windows = BTreeMap::new();
+		for (key, key_bytes) in all_window_counter_keys(current_window, previous_window) {
+			match binding
+				.client
+				.counter_read(binding.tenant_id, &key_bytes)
+				.await
+			{
+				Ok(value) => {
+					refreshed_windows.insert(key, value.unwrap_or(0));
+				}
+				Err(error) => {
+					self.mark_refresh_failed(error.to_string());
+					return OptimizerEvidenceRefreshReport {
+						refreshed_keys: refreshed
+							.len()
+							.saturating_add(refreshed_decisions.len())
+							.saturating_add(refreshed_windows.len()),
+						failed: true,
+					};
+				}
+			}
+		}
+		let refreshed_keys = refreshed
+			.len()
+			.saturating_add(refreshed_decisions.len())
+			.saturating_add(refreshed_windows.len());
+		self.merge_refresh(refreshed, refreshed_decisions, refreshed_windows);
 		OptimizerEvidenceRefreshReport {
 			refreshed_keys,
 			failed: false,
@@ -399,6 +594,11 @@ impl OptimizerRuntimeEvidence {
 	fn pending_decision_keys(&self) -> Vec<OptimizerRuntimeDecisionKey> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		state.decision_pending.keys().copied().collect()
+	}
+
+	fn pending_window_keys(&self) -> Vec<OptimizerEvidenceWindowCounterKey> {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_pending.keys().copied().collect()
 	}
 
 	fn take_pending_for_flush(&self, key: OptimizerRuntimeVerdictKey) -> Option<u64> {
@@ -435,6 +635,23 @@ impl OptimizerRuntimeEvidence {
 		Some(delta)
 	}
 
+	fn take_pending_window_for_flush(&self, key: OptimizerEvidenceWindowCounterKey) -> Option<u64> {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		if self.binding.is_none()
+			|| state.replication_unsupported
+			|| state.circuit_open
+			|| state.window_in_flight.get(&key).copied().unwrap_or(0) > 0
+		{
+			return None;
+		}
+		let delta = state.window_pending.remove(&key).unwrap_or(0);
+		if delta == 0 {
+			return None;
+		}
+		state.window_in_flight.insert(key, delta);
+		Some(delta)
+	}
+
 	fn ack_flush(&self, key: OptimizerRuntimeVerdictKey, current_value: u64) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		state.in_flight.remove(&key);
@@ -453,6 +670,20 @@ impl OptimizerRuntimeEvidence {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		state.decision_in_flight.remove(&key);
 		let cached = state.decision_durable_cache.entry(key).or_insert(0);
+		*cached = (*cached).max(current_value);
+		if !state.replication_unsupported {
+			state.consecutive_unavailable_failures = 0;
+			state.circuit_open = false;
+			state.mode = OptimizerEvidenceMode::Durable;
+			state.state = OptimizerEvidenceState::Ok;
+			state.last_error = None;
+		}
+	}
+
+	fn ack_window_flush(&self, key: OptimizerEvidenceWindowCounterKey, current_value: u64) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_in_flight.remove(&key);
+		let cached = state.window_durable_cache.entry(key).or_insert(0);
 		*cached = (*cached).max(current_value);
 		if !state.replication_unsupported {
 			state.consecutive_unavailable_failures = 0;
@@ -486,6 +717,26 @@ impl OptimizerRuntimeEvidence {
 	) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		state.decision_in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.consecutive_unavailable_failures =
+			state.consecutive_unavailable_failures.saturating_add(1);
+		if state.consecutive_unavailable_failures >= UNAVAILABLE_CIRCUIT_BREAKER_FAILURES {
+			state.circuit_open = true;
+			state.mode = OptimizerEvidenceMode::Degraded;
+		}
+		state.state = OptimizerEvidenceState::Unavailable;
+		state.last_error = Some(error);
+	}
+
+	fn drop_ambiguous_window_in_flight(
+		&self,
+		key: OptimizerEvidenceWindowCounterKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_in_flight.remove(&key);
 		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
 		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
 		state.consecutive_unavailable_failures =
@@ -532,6 +783,23 @@ impl OptimizerRuntimeEvidence {
 		state.last_error = Some(error);
 	}
 
+	fn latch_window_replication_unsupported(
+		&self,
+		key: OptimizerEvidenceWindowCounterKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.replication_unsupported = true;
+		state.circuit_open = true;
+		state.mode = OptimizerEvidenceMode::Degraded;
+		state.state = OptimizerEvidenceState::ReplicationUnsupported;
+		state.last_error = Some(error);
+	}
+
 	fn is_replication_unsupported(&self) -> bool {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		state.replication_unsupported
@@ -550,6 +818,7 @@ impl OptimizerRuntimeEvidence {
 		&self,
 		refreshed: BTreeMap<OptimizerRuntimeVerdictKey, u64>,
 		refreshed_decisions: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
+		refreshed_windows: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
 	) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		for (key, value) in refreshed {
@@ -558,6 +827,10 @@ impl OptimizerRuntimeEvidence {
 		}
 		for (key, value) in refreshed_decisions {
 			let cached = state.decision_durable_cache.entry(key).or_insert(0);
+			*cached = (*cached).max(value);
+		}
+		for (key, value) in refreshed_windows {
+			let cached = state.window_durable_cache.entry(key).or_insert(0);
 			*cached = (*cached).max(value);
 		}
 		if !state.replication_unsupported {
@@ -596,23 +869,55 @@ impl OptimizerDecisionRecorder for OptimizerRuntimeDecisionRecorder {
 }
 
 pub(crate) fn verdict_counter_key(key: OptimizerRuntimeVerdictKey) -> Vec<u8> {
-	let suffix = match key.lane {
-		OptimizerRuntimeEvidenceLane::Total => format!(
-			"{}/{}",
-			optimizer_decision_kind_label(key.kind),
-			optimizer_runtime_verdict_label(key.verdict)
-		),
-		OptimizerRuntimeEvidenceLane::Demoted => format!(
-			"{}/demoted/{}",
-			optimizer_decision_kind_label(key.kind),
-			optimizer_runtime_verdict_label(key.verdict)
-		),
-	};
-	format!("{OPTIMIZER_EVIDENCE_KEY_PREFIX}{suffix}").into_bytes()
+	format!(
+		"{OPTIMIZER_EVIDENCE_KEY_PREFIX}{}",
+		verdict_counter_suffix(key)
+	)
+	.into_bytes()
 }
 
 pub(crate) fn decision_counter_key(key: OptimizerRuntimeDecisionKey) -> Vec<u8> {
-	let suffix = match key.lane {
+	format!(
+		"{OPTIMIZER_DECISION_EVIDENCE_KEY_PREFIX}{}",
+		decision_counter_suffix(key)
+	)
+	.into_bytes()
+}
+
+pub(crate) fn window_counter_key(key: OptimizerEvidenceWindowCounterKey) -> Vec<u8> {
+	match key {
+		OptimizerEvidenceWindowCounterKey::Verdict { window, key } => format!(
+			"{OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX}{}/verdict/{}",
+			window.0,
+			verdict_counter_suffix(key)
+		)
+		.into_bytes(),
+		OptimizerEvidenceWindowCounterKey::Decision { window, key } => format!(
+			"{OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX}{}/decision/{}",
+			window.0,
+			decision_counter_suffix(key)
+		)
+		.into_bytes(),
+	}
+}
+
+fn verdict_counter_suffix(key: OptimizerRuntimeVerdictKey) -> String {
+	match key.lane {
+		OptimizerRuntimeEvidenceLane::Total => format!(
+			"{}/{}",
+			optimizer_decision_kind_label(key.kind),
+			optimizer_runtime_verdict_label(key.verdict)
+		),
+		OptimizerRuntimeEvidenceLane::Demoted => format!(
+			"{}/demoted/{}",
+			optimizer_decision_kind_label(key.kind),
+			optimizer_runtime_verdict_label(key.verdict)
+		),
+	}
+}
+
+fn decision_counter_suffix(key: OptimizerRuntimeDecisionKey) -> String {
+	match key.lane {
 		OptimizerRuntimeEvidenceLane::Total => format!(
 			"{}/{}",
 			optimizer_decision_kind_label(key.kind),
@@ -623,8 +928,7 @@ pub(crate) fn decision_counter_key(key: OptimizerRuntimeDecisionKey) -> Vec<u8> 
 			optimizer_decision_kind_label(key.kind),
 			decision_outcome_key_label(key.outcome)
 		),
-	};
-	format!("{OPTIMIZER_DECISION_EVIDENCE_KEY_PREFIX}{suffix}").into_bytes()
+	}
 }
 
 pub(crate) fn all_verdict_counter_keys() -> Vec<(OptimizerRuntimeVerdictKey, Vec<u8>)> {
@@ -664,6 +968,26 @@ pub(crate) fn all_decision_counter_keys() -> Vec<(OptimizerRuntimeDecisionKey, V
 				};
 				keys.push((key, decision_counter_key(key)));
 			}
+		}
+	}
+	keys
+}
+
+pub(crate) fn all_window_counter_keys(
+	current_window: OptimizerEvidenceWindowId,
+	previous_window: OptimizerEvidenceWindowId,
+) -> Vec<(OptimizerEvidenceWindowCounterKey, Vec<u8>)> {
+	let mut keys = Vec::with_capacity(
+		2 * (all_verdict_counter_keys().len() + all_decision_counter_keys().len()),
+	);
+	for window in [current_window, previous_window] {
+		for (key, _) in all_verdict_counter_keys() {
+			let window_key = OptimizerEvidenceWindowCounterKey::Verdict { window, key };
+			keys.push((window_key, window_counter_key(window_key)));
+		}
+		for (key, _) in all_decision_counter_keys() {
+			let window_key = OptimizerEvidenceWindowCounterKey::Decision { window, key };
+			keys.push((window_key, window_counter_key(window_key)));
 		}
 	}
 	keys
@@ -774,12 +1098,83 @@ fn status_snapshot_from_state(state: &RuntimeEvidenceState) -> OptimizerEvidence
 		pending_deltas: sum_counts(&state.pending)
 			.saturating_add(sum_counts(&state.in_flight))
 			.saturating_add(sum_counts(&state.decision_pending))
-			.saturating_add(sum_counts(&state.decision_in_flight)),
+			.saturating_add(sum_counts(&state.decision_in_flight))
+			.saturating_add(sum_counts(&state.window_pending))
+			.saturating_add(sum_counts(&state.window_in_flight)),
 		dropped_deltas: state.dropped_deltas,
 		ambiguous_deltas: state.ambiguous_deltas,
 		refresh_failures: state.refresh_failures,
 		last_error: state.last_error.clone(),
 	}
+}
+
+fn window_snapshot_from_state(
+	state: &RuntimeEvidenceState,
+	current_window: OptimizerEvidenceWindowId,
+) -> OptimizerEvidenceWindowSnapshot {
+	let previous_window = current_window.previous();
+	let lifetime_count = lifetime_total_count_from_state(state);
+	let recent_count = window_total_count_from_state(state, current_window)
+		.saturating_add(window_total_count_from_state(state, previous_window));
+	OptimizerEvidenceWindowSnapshot {
+		current_window,
+		previous_window,
+		recent_count,
+		stale_lifetime_count: lifetime_count.saturating_sub(recent_count),
+		lifetime_count,
+	}
+}
+
+fn lifetime_total_count_from_state(state: &RuntimeEvidenceState) -> u64 {
+	let mut total = 0u64;
+	for counts in [&state.durable_cache, &state.pending, &state.in_flight] {
+		for (key, count) in counts {
+			if key.lane == OptimizerRuntimeEvidenceLane::Total {
+				total = total.saturating_add(*count);
+			}
+		}
+	}
+	for counts in [
+		&state.decision_durable_cache,
+		&state.decision_pending,
+		&state.decision_in_flight,
+	] {
+		for (key, count) in counts {
+			if key.lane == OptimizerRuntimeEvidenceLane::Total {
+				total = total.saturating_add(*count);
+			}
+		}
+	}
+	total
+}
+
+fn window_total_count_from_state(
+	state: &RuntimeEvidenceState,
+	window: OptimizerEvidenceWindowId,
+) -> u64 {
+	let mut total = 0u64;
+	for counts in [
+		&state.window_durable_cache,
+		&state.window_pending,
+		&state.window_in_flight,
+	] {
+		for (key, count) in counts {
+			let total_lane = match key {
+				OptimizerEvidenceWindowCounterKey::Verdict {
+					window: key_window,
+					key,
+				} => *key_window == window && key.lane == OptimizerRuntimeEvidenceLane::Total,
+				OptimizerEvidenceWindowCounterKey::Decision {
+					window: key_window,
+					key,
+				} => *key_window == window && key.lane == OptimizerRuntimeEvidenceLane::Total,
+			};
+			if total_lane {
+				total = total.saturating_add(*count);
+			}
+		}
+	}
+	total
 }
 
 fn decision_outcome_key_label(outcome: OptimizerDecisionOutcome) -> String {
@@ -918,6 +1313,55 @@ mod tests {
 	}
 
 	#[test]
+	fn adr222_window_keys_are_separate_namespace_not_in_220_matrix() {
+		let window_keys =
+			all_window_counter_keys(OptimizerEvidenceWindowId(9), OptimizerEvidenceWindowId(8));
+		assert_eq!(window_keys.len(), 440);
+		let unique = window_keys
+			.iter()
+			.map(|(_, key)| key.clone())
+			.collect::<BTreeSet<_>>();
+		assert_eq!(unique.len(), 440);
+		assert!(
+			window_keys
+				.iter()
+				.all(|(_, key)| key.starts_with(OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX.as_bytes()))
+		);
+		assert!(window_keys.iter().any(
+			|(_, key)| key == b"optimizer_evidence/window/9/verdict/star_candidate/missed_win"
+		));
+		assert!(window_keys.iter().any(|(_, key)| {
+			key
+			== b"optimizer_evidence/window/8/decision/flat_star/demoted/declined/non_inner_equi_join"
+		}));
+		assert_eq!(all_verdict_counter_keys().len(), 80);
+		assert_eq!(all_decision_counter_keys().len(), 140);
+	}
+
+	#[test]
+	fn lifetime_matrix_counts_unchanged_by_windowing() {
+		let verdict_keys = all_verdict_counter_keys();
+		let decision_keys = all_decision_counter_keys();
+		let window_keys =
+			all_window_counter_keys(OptimizerEvidenceWindowId(3), OptimizerEvidenceWindowId(2));
+
+		assert_eq!(verdict_keys.len(), 80);
+		assert_eq!(decision_keys.len(), 140);
+		assert_eq!(verdict_keys.len() + decision_keys.len(), 220);
+		assert_eq!(window_keys.len(), 440);
+		assert!(
+			verdict_keys
+				.iter()
+				.all(|(_, key)| !key.starts_with(OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX.as_bytes()))
+		);
+		assert!(
+			decision_keys
+				.iter()
+				.all(|(_, key)| !key.starts_with(OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX.as_bytes()))
+		);
+	}
+
+	#[test]
 	fn runtime_evidence_local_only_snapshot_unchanged() {
 		let evidence = OptimizerRuntimeEvidence::local_only();
 		evidence.record_verdict(
@@ -1041,7 +1485,69 @@ mod tests {
 				count: 1,
 			}]
 		);
-		assert_eq!(snapshot.health.pending_deltas, 2);
+		assert_eq!(snapshot.health.pending_deltas, 4);
+		assert_eq!(snapshot.window.lifetime_count, 2);
+		assert_eq!(snapshot.window.recent_count, 2);
+		assert_eq!(snapshot.window.stale_lifetime_count, 0);
+	}
+
+	#[test]
+	fn receipt_gate_snapshot_reads_windows_under_same_lock() {
+		let evidence = OptimizerRuntimeEvidence::local_only_with_window_id(10);
+		evidence.record_verdict(
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+		evidence.record_decision(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerDecisionOutcome::Reordered,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+
+		let snapshot = evidence.receipt_gate_snapshot();
+
+		assert_eq!(
+			snapshot.window.current_window,
+			OptimizerEvidenceWindowId(10)
+		);
+		assert_eq!(
+			snapshot.window.previous_window,
+			OptimizerEvidenceWindowId(9)
+		);
+		assert_eq!(snapshot.window.lifetime_count, 2);
+		assert_eq!(snapshot.window.recent_count, 2);
+		assert_eq!(snapshot.window.stale_lifetime_count, 0);
+	}
+
+	#[test]
+	fn window_read_is_bounded_current_previous_manifest() {
+		let evidence = OptimizerRuntimeEvidence::local_only_with_window_id(10);
+		evidence.record_verdict(
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+		evidence.record_decision(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerDecisionOutcome::Reordered,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+		evidence.set_window_id_for_test(12);
+
+		let snapshot = evidence.receipt_gate_snapshot();
+
+		assert_eq!(
+			snapshot.window.current_window,
+			OptimizerEvidenceWindowId(12)
+		);
+		assert_eq!(
+			snapshot.window.previous_window,
+			OptimizerEvidenceWindowId(11)
+		);
+		assert_eq!(snapshot.window.lifetime_count, 2);
+		assert_eq!(snapshot.window.recent_count, 0);
+		assert_eq!(snapshot.window.stale_lifetime_count, 2);
 	}
 
 	#[test]

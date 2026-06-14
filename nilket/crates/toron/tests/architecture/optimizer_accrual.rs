@@ -251,6 +251,7 @@ pub(crate) fn adr216_decision_keys_are_structured_not_strings() {
 	);
 	let state = first_block(&runtime_evidence, "struct RuntimeEvidenceState");
 	let counter_key = first_block(&runtime_evidence, "pub(crate) fn decision_counter_key");
+	let suffix = first_block(&runtime_evidence, "fn decision_counter_suffix");
 
 	assert!(key.contains("kind: OptimizerDecisionKind"));
 	assert!(key.contains("outcome: OptimizerDecisionOutcome"));
@@ -258,8 +259,9 @@ pub(crate) fn adr216_decision_keys_are_structured_not_strings() {
 	assert!(state.contains("decision_pending: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
 	assert!(state.contains("decision_in_flight: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
 	assert!(state.contains("decision_durable_cache: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
-	assert!(counter_key.contains("optimizer_decision_kind_label(key.kind)"));
-	assert!(counter_key.contains("decision_outcome_key_label(key.outcome)"));
+	assert!(counter_key.contains("decision_counter_suffix(key)"));
+	assert!(suffix.contains("optimizer_decision_kind_label(key.kind)"));
+	assert!(suffix.contains("decision_outcome_key_label(key.outcome)"));
 	assert!(!state.contains("BTreeMap<String, u64>"));
 }
 
@@ -1487,6 +1489,7 @@ pub(crate) fn adr214_provenance_is_dual_write_totals_unchanged() {
 	);
 	let record = first_block(&runtime_evidence, "pub(crate) fn record_verdict");
 	let codec = first_block(&runtime_evidence, "pub(crate) fn verdict_counter_key");
+	let codec_suffix = first_block(&runtime_evidence, "fn verdict_counter_suffix");
 	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
 	let snapshot_rows = first_block(&runtime_evidence, "fn verdict_rows_from_state");
 	let schema = first_block(
@@ -1501,10 +1504,11 @@ pub(crate) fn adr214_provenance_is_dual_write_totals_unchanged() {
 	assert!(record.contains("lane: OptimizerRuntimeEvidenceLane::Total"));
 	assert!(record.contains("if provenance == OptimizerRuntimeVerdictProvenance::Demoted"));
 	assert!(record.contains("lane: OptimizerRuntimeEvidenceLane::Demoted"));
-	assert!(codec.contains("OptimizerRuntimeEvidenceLane::Total"));
-	assert!(codec.contains("\"{}/{}\""));
-	assert!(codec.contains("OptimizerRuntimeEvidenceLane::Demoted"));
-	assert!(codec.contains("\"{}/demoted/{}\""));
+	assert!(codec.contains("verdict_counter_suffix(key)"));
+	assert!(codec_suffix.contains("OptimizerRuntimeEvidenceLane::Total"));
+	assert!(codec_suffix.contains("\"{}/{}\""));
+	assert!(codec_suffix.contains("OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(codec_suffix.contains("\"{}/demoted/{}\""));
 	assert!(snapshot.contains("verdict_rows_from_state(&state)"));
 	assert!(snapshot_rows.contains("let native = total.saturating_sub(demoted)"));
 	assert!(snapshot_rows.contains("OptimizerRuntimeVerdictProvenance::Native"));
@@ -2116,6 +2120,7 @@ pub(crate) fn adr217_receipt_gate_snapshot_is_single_locked_snapshot() {
 	assert!(snapshot.contains("verdict_rows_from_state(&state)"));
 	assert!(snapshot.contains("decision_rows_from_state(&state)"));
 	assert!(snapshot.contains("status_snapshot_from_state(&state)"));
+	assert!(snapshot.contains("window_snapshot_from_state(&state, current_window)"));
 	assert!(report.contains("receipt_gate_snapshot()"));
 	assert!(!report.contains("verdict_snapshot()"));
 	assert!(!report.contains("decision_snapshot()"));
@@ -2182,14 +2187,17 @@ pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
 }
 
 #[test]
-pub(crate) fn adr217_blocked_placeholders_cannot_render_actionable() {
+pub(crate) fn adr217_windowing_placeholder_retargeted_by_adr222_counter_handoff_stays_blocked() {
 	let join_order = source("src/binder/join_order.rs");
 	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
 	let counter = first_block(&join_order, "fn counter_handoff_readiness_gate");
 
+	assert!(windowing.contains("snapshot.window"));
+	assert!(windowing.contains("OptimizerReceiptGateStatus::Actionable"));
+	assert!(windowing.contains("stale_window_evidence_dominates"));
+	assert!(windowing.contains("recent_window_matches_lifetime"));
+	assert!(!windowing.contains("windowing_decay_substrate_unbuilt"));
 	assert!(windowing.contains("OptimizerReceiptGateStatus::Inactive"));
-	assert!(!windowing.contains("OptimizerReceiptGateStatus::Actionable"));
-	assert!(windowing.contains("windowing_decay_substrate_unbuilt"));
 	assert!(counter.contains("OptimizerReceiptGateStatus::BlockedExternalSignal"));
 	assert!(!counter.contains("OptimizerReceiptGateStatus::Actionable"));
 	assert!(counter.contains("elasticity_signal_unbuilt"));
@@ -2238,12 +2246,13 @@ pub(crate) fn adr217_readout_has_no_policy_consumers_or_storage_surface() {
 }
 
 #[test]
-pub(crate) fn adr217_no_new_durable_counter_keys_or_flush_path() {
+pub(crate) fn adr217_no_receipt_gate_durable_surface_retargeted_by_adr222_window_namespace() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
 	let decision_keys = first_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
 	let flush = first_block(&runtime_evidence, "pub(crate) async fn flush_keys");
 	let decision_flush = first_block(&runtime_evidence, "pub async fn flush_decision_deltas");
+	let window_flush = first_block(&runtime_evidence, "pub async fn flush_window_deltas");
 
 	assert!(!runtime_evidence.contains("optimizer_evidence/receipt"));
 	assert!(!runtime_evidence.contains("optimizer_receipt_gates"));
@@ -2251,6 +2260,8 @@ pub(crate) fn adr217_no_new_durable_counter_keys_or_flush_path() {
 	assert!(!decision_keys.contains("receipt"));
 	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
 	assert_eq!(decision_flush.matches("counter_fetch_add").count(), 1);
+	assert_eq!(window_flush.matches("counter_fetch_add").count(), 1);
+	assert!(runtime_evidence.contains("OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX"));
 }
 
 #[test]

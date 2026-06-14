@@ -120,30 +120,33 @@ pub(crate) fn adr220_conflict_detail_uses_decision_rows_not_verdicts() {
 }
 
 #[test]
-pub(crate) fn adr220_no_new_durable_key_counter_flush_or_evidence_matrix() {
+pub(crate) fn adr220_no_decision_conflict_durable_key_counter_flush_or_evidence_matrix() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let decision_keys = first_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
 	let verdict_keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
 	let flush = first_block(&runtime_evidence, "pub async fn flush_decision_deltas");
+	let window_keys = first_block(&runtime_evidence, "pub(crate) fn all_window_counter_keys");
 	let tests = source("src/binder/runtime_evidence.rs");
 
 	assert!(!runtime_evidence.contains("optimizer_decision_conflicts"));
 	assert!(!runtime_evidence.contains("decision_conflict/"));
 	assert!(!decision_keys.contains("conflict"));
 	assert!(!verdict_keys.contains("conflict"));
+	assert!(!window_keys.contains("conflict"));
 	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
 	assert!(tests.contains("assert_eq!(decision_keys.len(), 140)"));
 	assert!(tests.contains("assert_eq!(decision_keys.len() + verdict_keys.len(), 220)"));
 }
 
 #[test]
-pub(crate) fn adr220_windowing_and_counter_handoff_stay_substrate_blocked() {
-	super::optimizer_accrual::adr217_blocked_placeholders_cannot_render_actionable();
+pub(crate) fn adr220_windowing_retargeted_by_adr222_counter_handoff_stays_blocked() {
+	super::optimizer_accrual::adr217_windowing_placeholder_retargeted_by_adr222_counter_handoff_stays_blocked();
 	let join_order = source("src/binder/join_order.rs");
 	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
 	let counter = first_block(&join_order, "fn counter_handoff_readiness_gate");
 	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
 
+	assert!(windowing.contains("stale_window_evidence_dominates"));
 	assert!(!windowing.contains("DecisionConflictReport"));
 	assert!(!counter.contains("DecisionConflictReport"));
 	assert!(!reports.contains("windowing_decay_pressure"));

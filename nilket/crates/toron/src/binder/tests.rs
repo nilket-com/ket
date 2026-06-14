@@ -14647,7 +14647,7 @@ async fn optimizer_evidence_status_reports_local_pending() {
 		ScalarValue::Utf8(Some("local_only".to_string()))
 	);
 	assert_eq!(rows[0][1], ScalarValue::Utf8(Some("ok".to_string())));
-	assert_eq!(rows[0][2], ScalarValue::Int64(Some(1)));
+	assert_eq!(rows[0][2], ScalarValue::Int64(Some(2)));
 	assert_eq!(rows[0][3], ScalarValue::Int64(Some(0)));
 	assert_eq!(rows[0][4], ScalarValue::Int64(Some(0)));
 	assert_eq!(rows[0][5], ScalarValue::Int64(Some(0)));
@@ -15058,7 +15058,14 @@ async fn receipt_gates_render_insufficient_evidence_on_cold_ledger() {
 			receipt_gate_row_by_name(&rows, "windowing_decay_pressure"),
 			2
 		),
-		"inactive"
+		"insufficient_evidence"
+	);
+	assert_eq!(
+		receipt_gate_utf8(
+			receipt_gate_row_by_name(&rows, "windowing_decay_pressure"),
+			6
+		),
+		"requires_lifetime_evidence_floor"
 	);
 	assert_eq!(
 		receipt_gate_utf8(
@@ -15568,7 +15575,7 @@ async fn rune_queries_optimizer_decision_conflicts() {
 }
 
 #[tokio::test]
-async fn windowing_and_counter_handoff_never_actionable() {
+async fn windowing_gate_inactive_when_recent_window_matches_lifetime() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
 	record_verdicts(
@@ -15587,21 +15594,104 @@ async fn windowing_and_counter_handoff_never_actionable() {
 
 	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
 	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+
 	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
+	assert_eq!(receipt_gate_i64(windowing, 3), 40);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 4),
+		"recent_window=40,stale_lifetime=0,lifetime_total=40"
+	);
 	assert_eq!(
 		receipt_gate_utf8(windowing, 6),
-		"windowing_decay_substrate_unbuilt"
+		"recent_window_matches_lifetime"
 	);
-	assert_eq!(receipt_gate_i64(windowing, 3), 40);
+}
 
+#[tokio::test]
+async fn windowing_gate_actionable_when_lifetime_dominated_by_stale_windows() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+
+	assert_eq!(receipt_gate_utf8(windowing, 2), "actionable");
+	assert_eq!(receipt_gate_i64(windowing, 3), 40);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 4),
+		"recent_window=0,stale_lifetime=40,lifetime_total=40"
+	);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 6),
+		"stale_window_evidence_dominates"
+	);
+}
+
+#[tokio::test]
+async fn windowing_gate_insufficient_on_cold_ledger() {
+	let rows =
+		optimizer_receipt_gate_table_rows(&MockCatalog::new(), &PlannerConfig::default()).await;
+	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+
+	assert_eq!(receipt_gate_utf8(windowing, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(windowing, 3), 0);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 4),
+		"recent_window=0,stale_lifetime=0,lifetime_total=0"
+	);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 6),
+		"requires_lifetime_evidence_floor"
+	);
+}
+
+#[tokio::test]
+async fn counter_handoff_readiness_stays_blocked_external_signal() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
 	let counter = receipt_gate_row_by_name(&rows, "counter_handoff_readiness");
+
 	assert_eq!(receipt_gate_utf8(counter, 2), "blocked_external_signal");
 	assert_eq!(receipt_gate_i64(counter, 3), 0);
 	assert_eq!(receipt_gate_utf8(counter, 6), "elasticity_signal_unbuilt");
 }
 
 #[tokio::test]
-async fn receipt_gate_readout_is_read_only_no_plan_change() {
+async fn windowing_readout_is_read_only_no_plan_change() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&non_optimal_star_order_sql())
@@ -15642,7 +15732,7 @@ async fn receipt_gate_readout_is_read_only_no_plan_change() {
 }
 
 #[tokio::test]
-async fn rune_queries_optimizer_receipt_gates() {
+async fn rune_queries_optimizer_receipt_gates_with_windowing() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
 	record_verdicts(
@@ -15684,6 +15774,12 @@ async fn rune_queries_optimizer_receipt_gates() {
 			2
 		),
 		"actionable"
+	);
+	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
+	assert_eq!(
+		receipt_gate_utf8(windowing, 6),
+		"recent_window_matches_lifetime"
 	);
 }
 
