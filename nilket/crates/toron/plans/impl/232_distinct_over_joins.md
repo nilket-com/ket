@@ -2,8 +2,9 @@
 
 Pairs with `plans/adr/232_distinct_over_joins.md`. Lift the two conservative DISTINCT-over-joins
 fences (SQL classifier + binder) so the existing 231 marker dedups join output. The marker's
-unconditional all-columns `Exchange` makes cross-partition dedup correct **by construction** — no
-fragmenter, executor, IR, or Rune change. Outer joins are in scope as the altitude proof.
+unconditional all-columns `Exchange` is the dedup boundary; when that boundary sits above a join
+the fragmenter must split it into an existing shuffle producer/consumer stage. No new executor
+kernel, IR, or Rune change. Outer joins are in scope as the altitude proof.
 
 Touch surface:
 - `sql_planner.rs` — remove the `"DISTINCT over joins is not supported"` classifier reject
@@ -15,9 +16,11 @@ Touch surface:
   cross-partition, Rune parity, retained fences).
 - `tests/architecture/select_distinct.rs` — retarget the 231 join-fence guard; add `adr232_*`.
 - a distributed-execution fixture (existing distributed test file) — cross-partition dedup.
+- `distributed/fragment.rs` — split an existing `Exchange` above a join into its own shuffle
+  stage so post-join DISTINCT dedups across worker partitions.
 
-No `ir.rs` (Distinct exists), `rune_engine.rs` (distinct() wraps any frame), `exec.rs`,
-`distributed/*` source, or Wendelon change.
+No `ir.rs` (Distinct exists), `rune_engine.rs` (distinct() wraps any frame), `exec.rs`, or
+Wendelon change.
 
 ## Anchors (re-ground at implementation)
 
@@ -27,6 +30,7 @@ No `ir.rs` (Distinct exists), `rune_engine.rs` (distinct() wraps any frame), `ex
 | Binder fence to lift | `distinct_input_unsupported_message`, `Join { left, right, .. } => distinct_input_unsupported_message(left).or_else(|| distinct_input_unsupported_message(right))` |
 | Aggregate-input fence to KEEP | same fn, `Aggregate { .. } => Some("DISTINCT over aggregate inputs…")` |
 | Marker all-cols re-exchange | binder.rs:1144 `all_output_columns_program`; 1153 `key: group_expr`; `bind_bound_aggregate(.., Vec::new())` |
+| Post-join exchange split | `fragment_execution_plan` detects `leading_exchange_before_join` and emits `fragment_post_join_exchange_plan` using `FragmentTerminalOutput::ShuffleProducer` |
 | Existing CTAS coverage is insufficient | `query_coordinator_executes_aggregate_and_join_ctas` proves aggregate CTAS and join CTAS separately, not aggregate-over-join as one query |
 | Marker transparent in join walkers | `plan_contains_join` / `logical_plan_contains_join` recurse `Distinct` |
 | 231 fence guard to retarget | `adr231_distinct_first_cut_fences_joins_subqueries_and_aggregates` |
@@ -49,7 +53,9 @@ LogicalPlan::Join { left, right, .. } => distinct_input_unsupported_message(left
 ```
 
 Keep `Aggregate { .. } => Some(...)` and the Scan/ScanNamed `None` base. The marker lowering
-(binder.rs:1144) is unchanged.
+(binder.rs:1144) is unchanged. Add a fragmenter split for an existing `Exchange` encountered on
+the root path above a join so the dedup exchange becomes a real shuffle boundary before final
+aggregation.
 
 ## Phase 2 — Behavior coverage
 
@@ -62,7 +68,9 @@ Two tables with duplicate join-matched rows:
 - **Distributed cross-partition:** duplicates whose join-key partitions differ still collapse
   (proves the all-cols `Exchange` re-partitions). Distributed fixture, not single-node only.
 - WHERE before dedup; ORDER BY / LIMIT after dedup.
-- Rune `ctx.table("a").join(b,…).project([…]).distinct()` == SQL twin (bound plan + rows).
+- Rune `ctx.table("a").join(b,…).project([…]).distinct()` shares the SQL twin's
+  DISTINCT-over-join execution shape and row digest. Frontend-specific join replay metadata may
+  differ.
 - Retained fences: DISTINCT over aggregate inputs / derived / EXISTS still reject; public GROUP
   BY no-aggregate still rejects.
 - Add a Rune or direct logical-plan fixture for `distinct()` over a join whose child is an
@@ -100,7 +108,8 @@ git diff --check
 4. Accidentally lifting the Aggregate-input fence, including under a joined child:
    `distinct_over_aggregate_inputs_still_rejects` or
    `distinct_over_joined_aggregate_input_still_rejects` fails.
-5. A new `ExecutionPlan` op / fragmenter case: the no-physical-surface guard fails.
+5. A new `ExecutionPlan` op or DISTINCT-specific runtime surface: the no-physical-surface guard
+   fails.
 6. Name-based join-output grouping: the ordinal-safe joined test fails.
 
 ## Hygiene

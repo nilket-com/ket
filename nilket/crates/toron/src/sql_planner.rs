@@ -3445,9 +3445,6 @@ impl SqlPlanner {
 		}
 
 		let table_with_joins = &from[0];
-		if distinct_requested && !table_with_joins.joins.is_empty() {
-			return Err(unsupported("DISTINCT over joins is not supported"));
-		}
 		if distinct_requested && table_factor_is_derived(&table_with_joins.relation) {
 			return Err(unsupported("DISTINCT over derived tables is not supported"));
 		}

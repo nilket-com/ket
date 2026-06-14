@@ -2,8 +2,8 @@
 
 **Status:** Promoted. **Migration:** `plans/impl/232_distinct_over_joins.md`.
 **Category:** Toron core query surface — widen ADR 231 `SELECT DISTINCT` to join inputs by
-lifting two conservative fences. **No new execution operator, fragmenter case, IR variant,
-Rune code, Wendelon pushdown, durable key, system table, or optimizer-evidence surface.**
+lifting two conservative fences. **No new execution operator, IR variant, Rune code, Wendelon
+pushdown, durable key, system table, or optimizer-evidence surface.**
 
 ## Why this cut exists
 
@@ -19,19 +19,22 @@ altitude over joins.
   rejects with `"DISTINCT over joins is not supported"` (sql_planner.rs:3449), and the binder
   repeats it in `distinct_input_unsupported_message` (binder.rs:2562:
   `LogicalPlan::Join { .. } => Some("DISTINCT over joins is not supported")`).
-- **Correct cross-partition dedup is by construction.** The 231 marker lowering (binder.rs:1144)
-  builds `group_expr = all_output_columns_program(input.schema())` then
+- **Correct cross-partition dedup requires the existing post-join exchange to become a real
+  shuffle boundary.** The 231 marker lowering (binder.rs:1144) builds
+  `group_expr = all_output_columns_program(input.schema())` then
   `Exchange { key = group_expr }` (binder.rs:1153) → empty-aggregate. Over a join the physical
   shape is `Join (partitioned by join key) → Exchange(key = all output columns) → Aggregate`; the
   all-columns `Exchange` **re-partitions the join output by the full dedup key**, so duplicates
-  in different post-join partitions collapse — regardless of the join's own partitioning. No
-  fragmenter change.
-- The fragmenter has the structural traversal needed for aggregate above joined input:
-  `replace_exchange_with_scan` and `replace_first_join` recurse through
-  `ExecutionPlan::Aggregate`. The existing `query_coordinator_executes_aggregate_and_join_ctas`
-  fixture proves aggregate CTAS and join CTAS separately, **not** aggregate-over-join as one
-  query; therefore the distributed cross-partition DISTINCT-over-join gate below is required, not
-  optional. The `Distinct` marker is already transparent in the join walkers
+  in different post-join partitions collapse — regardless of the join's own partitioning.
+- The original no-fragmenter-change grounding was too strong. The existing
+  `replace_exchange_with_scan` and `replace_first_join` traversal can express this, but the
+  fragmenter must split an `Exchange` that sits above a join into its own shuffle
+  producer/consumer stage before final aggregation. This is a use of the existing
+  `ExecutionPlan::Exchange`, not a new physical operator. The existing
+  `query_coordinator_executes_aggregate_and_join_ctas` fixture proves aggregate CTAS and join
+  CTAS separately, **not** aggregate-over-join as one query; therefore the distributed
+  cross-partition DISTINCT-over-join gate below is required, not optional. The `Distinct` marker
+  is already transparent in the join walkers
   (`plan_contains_join` / `logical_plan_contains_join` recurse it), so a joined input needs no
   new logical altitude.
 - Rune needs no code change: `RuneDataFrame::distinct()` already wraps any frame (incl. a join);
@@ -47,10 +50,11 @@ joined aggregate inputs remain rejected. **Keep** the `LogicalPlan::Aggregate { 
 (derived/EXISTS, GROUP BY/HAVING, window, set operations, `DISTINCT ON`). Lifting only the SQL
 fence is insufficient — Rune and hand-authored logical plans hit the binder fence.
 
-**D2 — Correct cross-partition dedup by construction; no physical change.** The marker's
-unconditional all-columns `Exchange` re-partitions the join output by the full dedup key. No new
-`ExecutionPlan` op, no fragmenter case, no exchange-placement special-casing. The distributed
-cross-partition gate proves this composition in the real fragmenter/coordinator path.
+**D2 — Correct cross-partition dedup by existing exchange, with a fragmenter split.** The
+marker's unconditional all-columns `Exchange` re-partitions the join output by the full dedup key.
+No new `ExecutionPlan` op and no DISTINCT-specific execution kernel; the fragmenter must
+recognize an existing `Exchange` above a join and split it into a real shuffle stage. The
+distributed cross-partition gate proves this composition in the real fragmenter/coordinator path.
 
 **D3 — DISTINCT stays post-join, post-projection.** SQL lowers the join tree, then the normal
 projection, then wraps the projected plan in `LogicalPlan::Distinct`. `SELECT DISTINCT *` over a
@@ -65,12 +69,14 @@ joins add no DISTINCT complexity beyond 231's NULL-equal dedup.)
 `a.id` and `b.id`) dedups by position, extending 231's ordinal-safe group keys to joined output.
 
 **D6 — Frontend-neutral parity over joins.** `ctx.table("a").join(b, …).project([…]).distinct()`
-binds through the same marker and produces the **identical bound plan and rows** as the SQL twin
-(the 231 cardinal, extended; no Rune code change).
+binds through the same marker and produces the same DISTINCT-over-join execution shape and rows
+as the SQL twin. Frontend-specific join replay metadata may differ; the parity pin is the shared
+marker lowering, output schema, and row digest (the 231 cardinal, extended; no Rune code change).
 
-**D7 — No physical / evidence / optimizer surface change.** No `ExecutionPlan::Distinct`,
-fragmenter case, Wendelon pushdown, wire tag, system table, durable key, receipt gate, or
-optimizer-policy consumer. A core query-surface widening, not an optimizer cut.
+**D7 — No new physical op / evidence / optimizer surface change.** No
+`ExecutionPlan::Distinct`, Wendelon pushdown, wire tag, system table, durable key, receipt gate,
+or optimizer-policy consumer. The fragmenter uses the existing `Exchange` boundary. A core
+query-surface widening, not an optimizer cut.
 
 ## Semantics
 
@@ -87,7 +93,9 @@ SELECT region FROM a JOIN b ON a.k=b.k GROUP BY region    -- public GROUP BY ove
 ## Honesty gates (discriminating)
 
 - `select_distinct_inner_join_dedups_projected_join_rows`.
-- `select_distinct_left_outer_join_dedups_after_null_padding` — altitude proof (fails if dedup is
+- `select_distinct_left_outer_join_dedups_after_null_padding` /
+  `select_distinct_right_outer_join_dedups_after_null_padding` /
+  `select_distinct_full_outer_join_dedups_after_null_padding` — altitude proof (fails if dedup is
   pushed below the join).
 - `select_distinct_join_star_dedups_full_join_output`.
 - `select_distinct_join_duplicate_output_names_group_by_position` (D5).
@@ -95,7 +103,7 @@ SELECT region FROM a JOIN b ON a.k=b.k GROUP BY region    -- public GROUP BY ove
   join-key partitions differ still collapse (proves the all-cols re-exchange, D2). Single-node
   tests alone would pass even if the re-exchange were wrong.
 - `select_distinct_join_order_by_limit_runs_after_dedup`.
-- `rune_distinct_over_join_matches_sql_plan_and_rows` (D6).
+- `rune_distinct_over_join_matches_sql_plan_and_rows` (D6: shared shape and row digest).
 - `distinct_over_aggregate_inputs_still_rejects` / `distinct_in_derived_table_and_exists_still_reject`
   / `public_group_by_without_aggregate_still_rejects` (retained fences).
 - `distinct_over_joined_aggregate_input_still_rejects` — proves the binder join lift still
@@ -123,11 +131,11 @@ SELECT region FROM a JOIN b ON a.k=b.k GROUP BY region    -- public GROUP BY ove
 3-of-3. Claude iter-0 proposed DISTINCT-over-joins (Option A) and flagged the fragmentation
 question; Codex caught the **second (binder) fence** and argued **outer joins as the altitude
 proof**; Gemini concurred on lifting both fences + composability + outer-join dedup. Claude iter-1
-contributed the decisive grounding — the marker's unconditional all-columns `Exchange` makes
-cross-partition dedup correct **by construction** if the existing aggregate-above-join traversal
-holds — and the distributed cross-partition cardinal gate that proves that composition directly.
-Claude conceded its iter-0 "inner-only first" to Codex's outer-joins-as-proof. No residual
-divergence.
+contributed the decisive grounding — the marker's unconditional all-columns `Exchange` is the
+right dedup boundary — and the distributed cross-partition cardinal gate that proves that
+composition directly. Implementation corrected one overstatement in that grounding: the boundary
+must be split by the fragmenter when it sits above a join. Claude conceded its iter-0
+"inner-only first" to Codex's outer-joins-as-proof. No residual divergence.
 
 ## Forward arc
 

@@ -325,6 +325,31 @@ async fn correlated_exists_decorrelation_matches_explicit_left_semi_join_digest(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn select_distinct_join_dedups_across_partitions() {
+	let run = run_hash_join_logical_process_query(
+		1_320,
+		0,
+		SqlPlanner::new()
+			.plan(
+				"SELECT DISTINCT 1 AS one \
+				 FROM orders JOIN customers ON orders.customer_id = customers.id",
+			)
+			.expect("plan distinct over distributed join"),
+	)
+	.await;
+
+	assert_eq!(
+		run.row_count, 1,
+		"post-join DISTINCT must collapse rows across hash partitions"
+	);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grouped_aggregate_sql_matches_hand_built_aggregate_over_processes() {
 	let sql = SqlPlanner::new()
 		.plan("SELECT val, COUNT(*) FROM fixture GROUP BY val")

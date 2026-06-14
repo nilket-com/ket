@@ -261,8 +261,78 @@ fn fragment_execution_plan(
 		)?);
 		return Ok((stages, sort_stage_id));
 	}
+	if let Some(boundary) = leading_exchange_before_join(&plan) {
+		return fragment_post_join_exchange_plan(
+			plan,
+			boundary,
+			terminal_output,
+			allocator,
+			config,
+		);
+	}
 
 	fragment_base_plan(plan, terminal_output, allocator, config)
+}
+
+fn fragment_post_join_exchange_plan(
+	plan: ExecutionPlan,
+	boundary: ExchangeBoundary,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
+	config: FragmentPlanConfig,
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
+	if boundary.partition_count == 0 {
+		return Err(FragmentError::ZeroPartitionCount);
+	}
+
+	let exchange_id = allocator.alloc_exchange();
+	let (mut stages, input_terminal_stage) = fragment_execution_plan(
+		boundary.input.clone(),
+		FragmentTerminalOutput::ShuffleProducer {
+			exchange_id,
+			partition_count: boundary.partition_count,
+			partition_key: boundary.key.clone(),
+		},
+		allocator,
+		config.clone(),
+	)?;
+	let consumer_stage_id = allocator.alloc_stage();
+	let scan_metadata =
+		first_scan_metadata(&boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
+	let consumer_scan = shuffle_input_scan(scan_metadata, boundary.input.schema(), exchange_id);
+	let consumer_plan = terminal_output.wrap_plan(replace_exchange_with_scan(plan, &consumer_scan));
+	let consumer_tasks = (0..boundary.partition_count)
+		.map(|partition| {
+			let partition_id = PartitionId::new(partition);
+			TaskPlan::new(TaskSpec {
+				identity: TaskIdentity::new(
+					config.query_id,
+					consumer_stage_id,
+					TaskId::new(partition),
+					AttemptId::first(),
+				),
+				partition: Some(partition_id),
+				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
+				plan: consumer_plan.clone(),
+				inputs: vec![TaskInputBinding::ShuffleConsumer {
+					exchange_id,
+					producer_stage_id: input_terminal_stage,
+					partition_id,
+					producer_partitions: Vec::new(),
+				}],
+				output: terminal_output.task_output(),
+				budget: config.task_budget,
+				trace: None,
+			})
+		})
+		.collect();
+	stages.push(StagePlan {
+		stage_id: consumer_stage_id,
+		upstream_stages: vec![input_terminal_stage],
+		tasks: consumer_tasks,
+	});
+	Ok((stages, consumer_stage_id))
 }
 
 fn fragment_base_plan(
@@ -1006,6 +1076,38 @@ fn supported_join_key(
 
 fn contains_join(plan: &ExecutionPlan) -> bool {
 	first_join(plan).is_some()
+}
+
+fn leading_exchange_before_join(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
+	match plan {
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} if contains_join(input) => Some(ExchangeBoundary {
+			input: input.as_ref().clone(),
+			partition_count: *partition_count,
+			key: key.clone(),
+		}),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => leading_exchange_before_join(input),
+		ExecutionPlan::Exchange { .. }
+		| ExecutionPlan::Join { .. }
+		| ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => None,
+	}
 }
 
 fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {

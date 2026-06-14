@@ -15,7 +15,8 @@ use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, ColumnOrdinal,
-	ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, SortExpr, TableId,
+	ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategyIntent, LogicalPlan, ScalarValue,
+	SortExpr, TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -1223,6 +1224,212 @@ async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 }
 
 #[tokio::test]
+async fn select_distinct_inner_join_dedups_projected_join_rows() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_pair_rows(&results, 0, 1),
+		vec![
+			(Some("A".to_string()), Some("gold".to_string())),
+			(Some("B".to_string()), Some("silver".to_string())),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_left_outer_join_dedups_after_null_padding() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups LEFT JOIN right_dups ON left_dups.k = right_dups.k",
+	))
+	.await;
+	let rows = sorted_utf8_pair_rows(&results, 0, 1);
+	assert!(
+		rows.iter().any(|row| row.1.is_none()),
+		"left outer fixture must include null-padded misses: {rows:?}"
+	);
+	assert_eq!(
+		rows,
+		vec![
+			(Some("A".to_string()), Some("gold".to_string())),
+			(Some("B".to_string()), Some("silver".to_string())),
+			(Some("missing".to_string()), None),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_right_outer_join_dedups_after_null_padding() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups RIGHT JOIN right_dups ON left_dups.k = right_dups.k",
+	))
+	.await;
+	let rows = sorted_utf8_pair_rows(&results, 0, 1);
+	assert!(
+		rows.iter().any(|row| row.0.is_none()),
+		"right outer fixture must include null-padded misses: {rows:?}"
+	);
+	assert_eq!(
+		rows,
+		vec![
+			(None, Some("orphan".to_string())),
+			(Some("A".to_string()), Some("gold".to_string())),
+			(Some("B".to_string()), Some("silver".to_string())),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_full_outer_join_dedups_after_null_padding() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups FULL JOIN right_dups ON left_dups.k = right_dups.k",
+	))
+	.await;
+	let rows = sorted_utf8_pair_rows(&results, 0, 1);
+	assert!(
+		rows.iter().any(|row| row.0.is_none()) && rows.iter().any(|row| row.1.is_none()),
+		"full outer fixture must include null-padded misses from both sides: {rows:?}"
+	);
+	assert_eq!(
+		rows,
+		vec![
+			(None, Some("orphan".to_string())),
+			(Some("A".to_string()), Some("gold".to_string())),
+			(Some("B".to_string()), Some("silver".to_string())),
+			(Some("missing".to_string()), None),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_join_star_dedups_full_join_output() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql(
+		"SELECT DISTINCT * \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	);
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind DISTINCT join star");
+	assert_eq!(
+		field_names(&bound.schema()),
+		vec!["k", "label", "k", "tier"]
+	);
+
+	let results = run_logical(&logical).await;
+	assert_eq!(
+		row_count(&results),
+		2,
+		"duplicate full join rows must collapse"
+	);
+	assert_eq!(
+		sorted_int64_pair_rows(&results, 0, 2),
+		vec![(Some(1), Some(1)), (Some(2), Some(2))]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_join_duplicate_output_names_group_by_position() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql(
+		"SELECT DISTINCT left_dups.k AS x, right_dups.k AS x \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	);
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind duplicate-name DISTINCT join");
+	assert_eq!(field_names(&bound.schema()), vec!["x", "x"]);
+
+	let ExecutionPlan::Aggregate {
+		group_expr,
+		aggr_expr,
+		..
+	} = &bound
+	else {
+		panic!("expected DISTINCT join to bind to aggregate, got {bound:?}");
+	};
+	assert!(aggr_expr.is_empty());
+	assert_column_node(
+		group_expr,
+		group_expr.roots[0],
+		"x",
+		Some(ColumnOrdinal(0)),
+		Some(&DataType::Int64),
+	);
+	assert_column_node(
+		group_expr,
+		group_expr.roots[1],
+		"x",
+		Some(ColumnOrdinal(1)),
+		Some(&DataType::Int64),
+	);
+
+	let results = run_logical(&logical).await;
+	assert_eq!(
+		sorted_int64_pair_rows(&results, 0, 1),
+		vec![(Some(1), Some(1)), (Some(2), Some(2))]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_join_order_by_limit_runs_after_dedup() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT left_dups.label \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 ORDER BY left_dups.label DESC LIMIT 1",
+	))
+	.await;
+	assert_eq!(utf8_column_rows(&results, 0), vec![Some("B".to_string())]);
+}
+
+#[tokio::test]
+async fn rune_distinct_over_join_matches_sql_plan_and_rows() {
+	let sql_logical = plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	);
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("left_dups")
+               .join(
+                   ctx.table("right_dups"),
+                   qcol("left_dups", "k").eq(qcol("right_dups", "k"))
+               )
+               .project([qcol("left_dups", "label"), qcol("right_dups", "tier")])
+               .distinct()
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL DISTINCT join");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune DISTINCT join");
+	assert_eq!(
+		field_names(&sql_bound.schema()),
+		field_names(&rune_bound.schema())
+	);
+	assert_distinct_join_execution_shape(&sql_bound);
+	assert_distinct_join_execution_shape(&rune_bound);
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("sql digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("rune digest")
+	);
+}
+
+#[tokio::test]
 async fn distinct_lowers_to_empty_aggregate_marker_no_new_execution_op() {
 	let logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let LogicalPlan::Distinct { input } = &logical else {
@@ -1272,6 +1479,49 @@ async fn distinct_lowers_to_empty_aggregate_marker_no_new_execution_op() {
 	assert!(matches!(input.as_ref(), ExecutionPlan::Project { .. }));
 }
 
+#[tokio::test]
+async fn distinct_join_lowers_to_existing_empty_aggregate_no_new_execution_op() {
+	let logical = plan_sql(
+		"SELECT DISTINCT left_dups.label, right_dups.tier \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	);
+	let LogicalPlan::Distinct { input } = &logical else {
+		panic!("expected logical DISTINCT marker, got {logical:?}");
+	};
+	assert!(matches!(input.as_ref(), LogicalPlan::Project { .. }));
+
+	let (catalog, _) = fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind DISTINCT join");
+	let ExecutionPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+		..
+	} = &bound
+	else {
+		panic!("expected DISTINCT join to lower to aggregate, got {bound:?}");
+	};
+	assert!(aggr_expr.is_empty());
+	assert_eq!(group_expr.root_count(), 2);
+	let ExecutionPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		panic!("expected keyed exchange under DISTINCT join aggregate");
+	};
+	assert_eq!(*partition_count, 4);
+	assert_eq!(key, group_expr);
+	assert!(matches!(input.as_ref(), ExecutionPlan::Project { .. }));
+	assert!(
+		contains_execution_join(input),
+		"DISTINCT dedup exchange must run above the joined rows"
+	);
+}
+
 #[test]
 fn public_group_by_without_aggregate_still_rejects() {
 	assert_unsupported_message(
@@ -1281,10 +1531,12 @@ fn public_group_by_without_aggregate_still_rejects() {
 }
 
 #[test]
-fn distinct_over_join_is_explicit_unsupported() {
+fn group_by_over_join_still_rejects() {
 	assert_unsupported_message(
-		"SELECT DISTINCT sales.region FROM sales JOIN regions ON sales.region = regions.region",
-		"DISTINCT over joins is not supported",
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label",
+		"GROUP BY over joins is not supported",
 	);
 }
 
@@ -1299,26 +1551,7 @@ fn distinct_in_subquery_is_explicit_unsupported() {
 }
 
 #[tokio::test]
-async fn distinct_over_rune_join_or_aggregate_is_explicit_unsupported() {
-	let join = rune_plan(
-		r#"
-        pub fn main(ctx) {
-            ctx.table("sales")
-               .join(ctx.table("regions"), col("region").eq(col("region")))
-               .distinct()
-        }
-    "#,
-	)
-	.await;
-	let (catalog, _) = fixture();
-	let err = bind(&join, &catalog, &PlannerConfig::default())
-		.await
-		.expect_err("Rune DISTINCT over join should fail");
-	assert!(
-		matches!(err, BindingError::UnsupportedExpression { ref message } if message == "DISTINCT over joins is not supported"),
-		"expected Rune join DISTINCT fence, got {err:?}"
-	);
-
+async fn distinct_over_aggregate_inputs_still_rejects() {
 	let aggregate = rune_plan(
 		r#"
         pub fn main(ctx) {
@@ -1329,12 +1562,45 @@ async fn distinct_over_rune_join_or_aggregate_is_explicit_unsupported() {
     "#,
 	)
 	.await;
+	let (catalog, _) = fixture();
 	let err = bind(&aggregate, &catalog, &PlannerConfig::default())
 		.await
 		.expect_err("Rune DISTINCT over aggregate should fail");
 	assert!(
 		matches!(err, BindingError::UnsupportedExpression { ref message } if message == "DISTINCT over aggregate inputs is not supported"),
 		"expected Rune aggregate DISTINCT fence, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn distinct_over_joined_aggregate_input_still_rejects() {
+	let aggregate = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: vec![Expr::column("region")],
+		aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+	};
+	let logical = LogicalPlan::Distinct {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(aggregate),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("regions"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(Expr::column("region"), Expr::column("region"))],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+	};
+	let (catalog, _) = fixture();
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("DISTINCT over joined aggregate input should fail");
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message == "DISTINCT over aggregate inputs is not supported"),
+		"expected nested aggregate DISTINCT fence, got {err:?}"
 	);
 }
 
@@ -3315,6 +3581,10 @@ async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {
 		.expect("execute")
 }
 
+fn row_count(results: &[RecordBatch]) -> usize {
+	results.iter().map(RecordBatch::num_rows).sum()
+}
+
 async fn execute_sql_err(sql: &str) -> ExecutionError {
 	let (catalog, storage) = fixture();
 	let bound = bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
@@ -3762,7 +4032,7 @@ fn sorted_int32_optional_rows(results: &[RecordBatch], column_idx: usize) -> Vec
 	rows
 }
 
-fn sorted_utf8_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<String>> {
+fn utf8_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<String>> {
 	let mut rows = Vec::new();
 	for batch in results {
 		let values = batch
@@ -3778,6 +4048,11 @@ fn sorted_utf8_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Op
 			});
 		}
 	}
+	rows
+}
+
+fn sorted_utf8_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<String>> {
+	let mut rows = utf8_column_rows(results, column_idx);
 	rows.sort();
 	rows
 }
@@ -3815,6 +4090,81 @@ fn sorted_utf8_pair_rows(
 	}
 	rows.sort();
 	rows
+}
+
+fn sorted_int64_pair_rows(
+	results: &[RecordBatch],
+	left_idx: usize,
+	right_idx: usize,
+) -> Vec<(Option<i64>, Option<i64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let left = batch
+			.column(left_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left Int64 column");
+		let right = batch
+			.column(right_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right Int64 column");
+		for row in 0..batch.num_rows() {
+			let left = if left.is_null(row) {
+				None
+			} else {
+				Some(left.value(row))
+			};
+			let right = if right.is_null(row) {
+				None
+			} else {
+				Some(right.value(row))
+			};
+			rows.push((left, right));
+		}
+	}
+	rows.sort();
+	rows
+}
+
+fn assert_distinct_join_execution_shape(plan: &ExecutionPlan) {
+	let ExecutionPlan::Aggregate {
+		input, aggr_expr, ..
+	} = plan
+	else {
+		panic!("expected DISTINCT join aggregate, got {plan:?}");
+	};
+	assert!(aggr_expr.is_empty());
+	let ExecutionPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected DISTINCT join exchange, got {input:?}");
+	};
+	let ExecutionPlan::Project { input, .. } = input.as_ref() else {
+		panic!("expected DISTINCT join project, got {input:?}");
+	};
+	assert!(matches!(input.as_ref(), ExecutionPlan::Join { .. }));
+}
+
+fn contains_execution_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => contains_execution_join(input),
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
@@ -4433,6 +4783,8 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	let sales_schema = sales_schema();
 	let empty_sales_schema = sales_schema.clone();
 	let regions_schema = regions_schema();
+	let left_dups_schema = left_dups_schema();
+	let right_dups_schema = right_dups_schema();
 	let mut catalog = MockCatalog::new();
 	catalog
 		.register_descriptor(
@@ -4452,11 +4804,25 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 			descriptor(3, "empty_sales", empty_sales_schema.as_ref(), "id"),
 		)
 		.expect("register empty sales");
+	catalog
+		.register_descriptor(
+			TableId(4),
+			descriptor(4, "left_dups", left_dups_schema.as_ref(), "k"),
+		)
+		.expect("register left_dups");
+	catalog
+		.register_descriptor(
+			TableId(5),
+			descriptor(5, "right_dups", right_dups_schema.as_ref(), "k"),
+		)
+		.expect("register right_dups");
 	let storage = Arc::new(FixtureScan {
 		batches: HashMap::from([
 			(TableId(1), sales_batch(sales_schema)),
 			(TableId(2), regions_batch(regions_schema)),
 			(TableId(3), empty_sales_batch(empty_sales_schema)),
+			(TableId(4), left_dups_batch(left_dups_schema)),
+			(TableId(5), right_dups_batch(right_dups_schema)),
 		]),
 	});
 	(catalog, storage)
@@ -4480,6 +4846,20 @@ fn regions_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("region", DataType::Utf8, false),
 		Field::new("active", DataType::Int32, false),
+	]))
+}
+
+fn left_dups_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("k", DataType::Int64, false),
+		Field::new("label", DataType::Utf8, true),
+	]))
+}
+
+fn right_dups_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("k", DataType::Int64, false),
+		Field::new("tier", DataType::Utf8, true),
 	]))
 }
 
@@ -4577,6 +4957,40 @@ fn regions_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("regions batch")
+}
+
+fn left_dups_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 1, 2, 3, 3])),
+			Arc::new(StringArray::from(vec![
+				Some("A"),
+				Some("A"),
+				Some("B"),
+				Some("missing"),
+				Some("missing"),
+			])),
+		],
+	)
+	.expect("left_dups batch")
+}
+
+fn right_dups_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 1, 2, 4, 4])),
+			Arc::new(StringArray::from(vec![
+				Some("gold"),
+				Some("gold"),
+				Some("silver"),
+				Some("orphan"),
+				Some("orphan"),
+			])),
+		],
+	)
+	.expect("right_dups batch")
 }
 
 fn descriptor(

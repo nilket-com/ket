@@ -2559,7 +2559,8 @@ fn all_output_columns_program(schema: &SchemaRef) -> Result<BoundExprProgram, Bi
 
 fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&'static str> {
 	match plan {
-		LogicalPlan::Join { .. } => Some("DISTINCT over joins is not supported"),
+		LogicalPlan::Join { left, right, .. } => distinct_input_unsupported_message(left)
+			.or_else(|| distinct_input_unsupported_message(right)),
 		LogicalPlan::Aggregate { .. } => Some("DISTINCT over aggregate inputs is not supported"),
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
