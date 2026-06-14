@@ -17019,6 +17019,281 @@ async fn rune_queries_optimizer_memo_admission_with_blocker_class() {
 }
 
 #[tokio::test]
+async fn optimizer_probe_linearity_fences_projects_static_14_rows() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+
+	assert_probe_linearity_fence_order(&rows);
+	assert_eq!(rows.len(), 14);
+	assert!(rows.iter().all(|row| {
+		(2..=6).all(|index| probe_linearity_fence_i64(row, index) == 0)
+			&& probe_linearity_fence_utf8(row, 7) == "absent"
+			&& probe_linearity_fence_utf8(row, 8) == "no_recent_evidence"
+			&& probe_linearity_fence_utf8(row, 9) == "await_dominant_probe_linearity_fence"
+	}));
+
+	let projected = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_probe_linearity_fences"),
+		projection: Some(vec![
+			"consumer".to_string(),
+			"fence".to_string(),
+			"status".to_string(),
+			"next_cut".to_string(),
+		]),
+	};
+	let plan = bind(&projected, &catalog, &config)
+		.await
+		.expect("bind projected optimizer probe-linearity fences");
+	let ExecutionPlan::SystemTable { kind, schema, rows } = plan else {
+		panic!("expected projected optimizer probe-linearity system table");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerProbeLinearityFences
+	);
+	assert_eq!(
+		field_names(&schema),
+		vec!["consumer", "fence", "status", "next_cut"]
+	);
+	assert_eq!(rows.len(), 14);
+}
+
+#[tokio::test]
+async fn hash_fallback_probe_linearity_fence_rows_are_production_fed() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let config = auto_broadcast_config(4_096);
+	let logical = nested_hash_probe_with_tiny_right();
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind nested hash probe");
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+	let row = probe_linearity_fence_row(&rows, "hash_fallback", "non_broadcast_join");
+
+	assert_eq!(probe_linearity_fence_i64(row, 2), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 3), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 4), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 5), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 6), 1000);
+	assert_eq!(probe_linearity_fence_utf8(row, 7), "insufficient_evidence");
+	assert_eq!(
+		probe_linearity_fence_utf8(row, 8),
+		"consumer_recent_total_below_floor"
+	);
+	assert_eq!(
+		probe_linearity_fence_i64(
+			probe_linearity_fence_row(&rows, "star_decline", "non_broadcast_join"),
+			2,
+		),
+		0
+	);
+}
+
+#[tokio::test]
+async fn star_decline_probe_linearity_fence_rows_are_production_fed() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o").sort([qcol("o", "id").asc()])
+               .auto_join(
+                   ctx.table("customers").alias("c"),
+                   qcol("o", "customer_id").eq(qcol("c", "id"))
+               )
+               .auto_join(
+                   ctx.table("products").alias("p"),
+                   qcol("o", "product_id").eq(qcol("p", "id"))
+               )
+               .auto_join(
+                   ctx.table("stores").alias("s"),
+                   qcol("o", "store_id").eq(qcol("s", "id"))
+               )
+        }
+    "#,
+	)
+	.await;
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind sorted-probe star");
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+	let row = probe_linearity_fence_row(&rows, "star_decline", "sort");
+
+	assert_eq!(probe_linearity_fence_i64(row, 2), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 3), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 4), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 5), 1);
+	assert_eq!(probe_linearity_fence_i64(row, 6), 1000);
+	assert_eq!(probe_linearity_fence_utf8(row, 7), "insufficient_evidence");
+
+	let decision_rows = optimizer_decision_rows(&catalog, &config).await;
+	assert_eq!(
+		optimizer_decision_count(
+			&decision_rows,
+			"star_candidate",
+			"declined",
+			Some("probe_not_scan_linear")
+		),
+		1
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_fence_statuses_use_consumer_window_share() {
+	let catalog = MockCatalog::new();
+	let insufficient = PlannerConfig::default();
+	for _ in 0..19 {
+		insufficient.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+	}
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &insufficient).await;
+	let sort = probe_linearity_fence_row(&rows, "hash_fallback", "sort");
+	assert_eq!(probe_linearity_fence_i64(sort, 2), 19);
+	assert_eq!(probe_linearity_fence_i64(sort, 4), 19);
+	assert_eq!(probe_linearity_fence_utf8(sort, 7), "insufficient_evidence");
+
+	let dominant = PlannerConfig::default();
+	for _ in 0..20 {
+		dominant.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+	}
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &dominant).await;
+	let sort = probe_linearity_fence_row(&rows, "hash_fallback", "sort");
+	assert_eq!(probe_linearity_fence_i64(sort, 2), 20);
+	assert_eq!(probe_linearity_fence_i64(sort, 4), 20);
+	assert_eq!(probe_linearity_fence_i64(sort, 6), 1000);
+	assert_eq!(probe_linearity_fence_utf8(sort, 7), "dominant");
+	assert_eq!(
+		probe_linearity_fence_utf8(sort, 9),
+		"targeted_probe_linearity_relaxation"
+	);
+
+	let split = PlannerConfig::default();
+	for _ in 0..20 {
+		split.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+		split.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Take,
+		);
+	}
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &split).await;
+	let sort = probe_linearity_fence_row(&rows, "hash_fallback", "sort");
+	let take = probe_linearity_fence_row(&rows, "hash_fallback", "take");
+	assert_eq!(probe_linearity_fence_i64(sort, 4), 40);
+	assert_eq!(probe_linearity_fence_i64(sort, 6), 500);
+	assert_eq!(probe_linearity_fence_utf8(sort, 7), "observed");
+	assert_eq!(probe_linearity_fence_utf8(take, 7), "observed");
+}
+
+#[tokio::test]
+async fn probe_linearity_fence_readout_uses_recent_window_but_preserves_lifetime() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	for _ in 0..20 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::StarDecline,
+			ProbeLinearityFence::Sort,
+		);
+	}
+	runtime_evidence.set_window_id_for_test(12);
+	let rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+	let row = probe_linearity_fence_row(&rows, "star_decline", "sort");
+
+	assert_eq!(probe_linearity_fence_i64(row, 2), 0);
+	assert_eq!(probe_linearity_fence_i64(row, 3), 20);
+	assert_eq!(probe_linearity_fence_i64(row, 4), 0);
+	assert_eq!(probe_linearity_fence_i64(row, 5), 20);
+	assert_eq!(probe_linearity_fence_utf8(row, 7), "absent");
+	assert_eq!(probe_linearity_fence_utf8(row, 8), "no_recent_evidence");
+}
+
+#[tokio::test]
+async fn probe_linearity_fence_readout_is_read_only_no_plan_change() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_config = auto_broadcast_config(64 * 1024 * 1024);
+	for _ in 0..20 {
+		noisy_config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::NonBroadcastJoin,
+		);
+	}
+	let before = noisy_config
+		.runtime_evidence
+		.probe_linearity_fence_snapshot();
+	let _ = optimizer_probe_linearity_fence_table_rows(&catalog, &noisy_config).await;
+	let after = noisy_config
+		.runtime_evidence
+		.probe_linearity_fence_snapshot();
+	assert_eq!(before, after);
+
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+	assert_eq!(
+		quiet_trace.scan_filter_decisions,
+		noisy_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_probe_linearity_fences() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	config.runtime_evidence.record_probe_linearity_fence(
+		OptimizerProbeLinearityConsumer::HashFallback,
+		ProbeLinearityFence::NonBroadcastJoin,
+	);
+	let sql_rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.optimizer_probe_linearity_fences()
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer probe-linearity fence report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer probe-linearity system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerProbeLinearityFences
+	);
+	assert_eq!(rows, sql_rows);
+}
+
+#[tokio::test]
 async fn windowing_gate_inactive_when_recent_window_matches_lifetime() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
@@ -17360,7 +17635,7 @@ async fn rune_optimizer_readout_handles_are_lazy_logical_plans() {
 }
 
 #[test]
-fn rune_optimizer_readout_handles_cover_exactly_the_seven_readout_tables() {
+fn rune_optimizer_readout_handles_cover_exactly_the_eight_readout_tables() {
 	let actual = RUNE_OPTIMIZER_READOUT_HANDLES
 		.iter()
 		.map(|(handle, table, _)| (*handle, *table))
@@ -17379,6 +17654,10 @@ fn rune_optimizer_readout_handles_cover_exactly_the_seven_readout_tables() {
 				"optimizer_decision_conflicts"
 			),
 			("optimizer_memo_admission", "optimizer_memo_admission"),
+			(
+				"optimizer_probe_linearity_fences",
+				"optimizer_probe_linearity_fences"
+			),
 		]
 	);
 }
@@ -19572,7 +19851,7 @@ async fn rune_plan(script: &str) -> LogicalPlan {
 		.expect("Rune-authored plan")
 }
 
-const RUNE_OPTIMIZER_READOUT_HANDLES: [(&str, &str, SystemTableKind); 7] = [
+const RUNE_OPTIMIZER_READOUT_HANDLES: [(&str, &str, SystemTableKind); 8] = [
 	(
 		"optimizer_decisions",
 		"optimizer_decisions",
@@ -19607,6 +19886,11 @@ const RUNE_OPTIMIZER_READOUT_HANDLES: [(&str, &str, SystemTableKind); 7] = [
 		"optimizer_memo_admission",
 		"optimizer_memo_admission",
 		SystemTableKind::InformationSchemaOptimizerMemoAdmission,
+	),
+	(
+		"optimizer_probe_linearity_fences",
+		"optimizer_probe_linearity_fences",
+		SystemTableKind::InformationSchemaOptimizerProbeLinearityFences,
 	),
 ];
 
@@ -19886,6 +20170,26 @@ async fn optimizer_memo_admission_table_rows(
 	assert_eq!(
 		kind,
 		SystemTableKind::InformationSchemaOptimizerMemoAdmission
+	);
+	rows
+}
+
+async fn optimizer_probe_linearity_fence_table_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_probe_linearity_fences")
+		.expect("plan optimizer probe-linearity fence report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer probe-linearity fence report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer probe-linearity fence system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerProbeLinearityFences
 	);
 	rows
 }
@@ -20202,6 +20506,50 @@ fn assert_memo_admission_order(rows: &[Vec<ScalarValue>]) {
 	assert_eq!(actual, expected);
 }
 
+fn probe_linearity_fence_row<'a>(
+	rows: &'a [Vec<ScalarValue>],
+	consumer: &str,
+	fence: &str,
+) -> &'a [ScalarValue] {
+	rows.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some(consumer.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(fence.to_string()))
+		})
+		.unwrap_or_else(|| {
+			panic!("missing optimizer probe-linearity row {consumer}/{fence}: {rows:?}")
+		})
+}
+
+fn assert_probe_linearity_fence_order(rows: &[Vec<ScalarValue>]) {
+	let expected = ["hash_fallback", "star_decline"]
+		.into_iter()
+		.flat_map(|consumer| {
+			[
+				"scan_row_limit",
+				"take",
+				"sort",
+				"aggregate",
+				"exchange",
+				"non_broadcast_join",
+				"non_scan_leaf",
+			]
+			.into_iter()
+			.map(move |fence| (consumer.to_string(), fence.to_string()))
+		})
+		.collect::<Vec<_>>();
+	let actual = rows
+		.iter()
+		.map(|row| {
+			(
+				probe_linearity_fence_utf8(row, 0).to_string(),
+				probe_linearity_fence_utf8(row, 1).to_string(),
+			)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
+}
+
 fn margin_advisory_utf8(row: &[ScalarValue], index: usize) -> &str {
 	let ScalarValue::Utf8(Some(value)) = &row[index] else {
 		panic!(
@@ -20286,6 +20634,26 @@ fn memo_admission_i64(row: &[ScalarValue], index: usize) -> i64 {
 	let ScalarValue::Int64(Some(value)) = row[index] else {
 		panic!(
 			"expected optimizer memo admission Int64 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value
+}
+
+fn probe_linearity_fence_utf8(row: &[ScalarValue], index: usize) -> &str {
+	let ScalarValue::Utf8(Some(value)) = &row[index] else {
+		panic!(
+			"expected optimizer probe-linearity Utf8 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value.as_str()
+}
+
+fn probe_linearity_fence_i64(row: &[ScalarValue], index: usize) -> i64 {
+	let ScalarValue::Int64(Some(value)) = row[index] else {
+		panic!(
+			"expected optimizer probe-linearity Int64 at {index}, got {:?}",
 			row[index]
 		);
 	};

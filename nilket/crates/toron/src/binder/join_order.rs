@@ -5149,6 +5149,10 @@ impl<'a> Binder<'a> {
 		kind: OptimizerDecisionKind,
 		reason: StarOrderDeclineReason,
 	) {
+		if let StarOrderDeclineReason::ProbeNotScanLinear(fence) = reason {
+			self.decision_recorder
+				.record_probe_linearity_fence(OptimizerProbeLinearityConsumer::StarDecline, fence);
+		}
 		self.decision_recorder.record(
 			kind,
 			OptimizerDecisionOutcome::Declined(optimizer_decision_decline_reason(reason)),

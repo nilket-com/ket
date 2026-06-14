@@ -472,6 +472,61 @@ pub(super) fn information_schema_optimizer_memo_admission_rows(
 	Ok(rendered)
 }
 
+pub(super) fn information_schema_optimizer_probe_linearity_fences_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("consumer", DataType::Utf8, false),
+		Field::new("fence", DataType::Utf8, false),
+		Field::new("recent_count", DataType::Int64, false),
+		Field::new("lifetime_count", DataType::Int64, false),
+		Field::new("consumer_recent_total", DataType::Int64, false),
+		Field::new("consumer_lifetime_total", DataType::Int64, false),
+		Field::new("recent_share_per_mille", DataType::Int64, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_probe_linearity_fence_rows(
+	rows: &[OptimizerProbeLinearityFenceRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rendered = Vec::with_capacity(rows.len());
+	for row in rows {
+		rendered.push(vec![
+			ScalarValue::Utf8(Some(
+				optimizer_probe_linearity_consumer_label(row.consumer).to_string(),
+			)),
+			ScalarValue::Utf8(Some(row.fence.label().to_string())),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_count,
+				"optimizer probe linearity recent_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.lifetime_count,
+				"optimizer probe linearity lifetime_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.consumer_recent_total,
+				"optimizer probe linearity consumer_recent_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.consumer_lifetime_total,
+				"optimizer probe linearity consumer_lifetime_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_share_per_mille,
+				"optimizer probe linearity recent_share_per_mille",
+			)?)),
+			ScalarValue::Utf8(Some(
+				optimizer_probe_linearity_fence_status_label(row.status).to_string(),
+			)),
+			ScalarValue::Utf8(Some(row.reason.clone())),
+			ScalarValue::Utf8(Some(row.next_cut.to_string())),
+		]);
+	}
+	Ok(rendered)
+}
+
 pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),

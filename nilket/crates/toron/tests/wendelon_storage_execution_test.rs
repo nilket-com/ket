@@ -19,7 +19,8 @@ use toron::distributed::task::RowCount;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategyIntent, LogicalPlan, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
+	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, QueryId,
+	QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 use toron::storage::{
 	HlcBound, InMemoryStorageScan, InMemoryTableStorage, StorageWrite, TenantId as ToronTenantId,
@@ -844,6 +845,88 @@ async fn decision_telemetry_survives_durable_refresh() {
 }
 
 #[tokio::test]
+async fn durable_probe_linearity_fence_counters_survive_coordinator_restart() {
+	let fixture = LiveWendelonFixture::start(130).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		0,
+	);
+
+	let batch = execute_single_coordinator_batch(
+		&coordinator,
+		&durable_probe_linearity_hash_fallback_plan(),
+	)
+	.await;
+	assert!(batch.num_rows() > 0, "probe-linearity fixture should run");
+	runtime_evidence.flush_probe_linearity_deltas().await;
+	runtime_evidence.flush_window_deltas().await;
+	assert_eq!(
+		optimizer_probe_linearity_fence_counts(&coordinator, "hash_fallback", "non_broadcast_join")
+			.await,
+		(1, 1),
+		"recording coordinator should see the flushed durable fence evidence"
+	);
+
+	drop(coordinator);
+	drop(runtime_evidence);
+	let restarted_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let restarted_coordinator =
+		durable_star_coordinator(catalog, storage, Arc::clone(&restarted_runtime_evidence), 0);
+
+	assert_eq!(
+		optimizer_probe_linearity_fence_counts(
+			&restarted_coordinator,
+			"hash_fallback",
+			"non_broadcast_join"
+		)
+		.await,
+		(1, 1),
+		"fresh coordinator/evidence handle should read the prior durable fence evidence"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn cross_coordinator_probe_linearity_fences_are_shared_after_refresh() {
+	let fixture = LiveWendelonFixture::start(131).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let writer_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let writer = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&writer_runtime_evidence),
+		0,
+	);
+	let reader_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let reader =
+		durable_star_coordinator(catalog, storage, Arc::clone(&reader_runtime_evidence), 0);
+
+	let batch =
+		execute_single_coordinator_batch(&writer, &durable_probe_linearity_hash_fallback_plan())
+			.await;
+	assert!(batch.num_rows() > 0, "probe-linearity fixture should run");
+	writer_runtime_evidence.flush_probe_linearity_deltas().await;
+	writer_runtime_evidence.flush_window_deltas().await;
+	reader_runtime_evidence.refresh_durable_cache().await;
+
+	assert_eq!(
+		optimizer_probe_linearity_fence_counts(&reader, "hash_fallback", "non_broadcast_join")
+			.await,
+		(1, 1),
+		"second coordinator should see probe-linearity evidence it did not record"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
 async fn demoted_join_verdict_reaches_durable_lane() {
 	let fixture = LiveWendelonFixture::start(124).await;
 	let (catalog, storage) = durable_star_fixture().await;
@@ -1098,6 +1181,67 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 	}
 }
 
+fn durable_probe_linearity_hash_fallback_plan() -> LogicalPlan {
+	let orders = TableRef::new("orders");
+	let customers = TableRef::new("customers");
+	let products = TableRef::new("products");
+	let pinned_inner = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: orders.clone(),
+				projection: None,
+			}),
+			partition_count: 2,
+			key: vec![Expr::qualified_column(orders.clone(), "customer_id")],
+		}),
+		right: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: customers.clone(),
+				projection: None,
+			}),
+			partition_count: 2,
+			key: vec![Expr::qualified_column(customers.clone(), "id")],
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(orders.clone(), "customer_id"),
+			Expr::qualified_column(customers.clone(), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Direct,
+			build_side: None,
+		},
+	};
+	let outer = LogicalPlan::Join {
+		left: Box::new(pinned_inner),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: products.clone(),
+			projection: None,
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(orders.clone(), "product_id"),
+			Expr::qualified_column(products.clone(), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	LogicalPlan::Project {
+		input: Box::new(outer),
+		exprs: vec![
+			Expr::qualified_column(orders, "id"),
+			Expr::qualified_column(customers, "id"),
+			Expr::qualified_column(products, "id"),
+		],
+		output_names: vec![
+			Some("order_id".to_string()),
+			Some("customer_id".to_string()),
+			Some("product_id".to_string()),
+		],
+	}
+}
+
 async fn optimizer_runtime_verdict_count(coordinator: &QueryCoordinator) -> i64 {
 	let plan = toron::sql_planner::SqlPlanner::new()
 		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
@@ -1170,6 +1314,30 @@ async fn optimizer_decision_count(coordinator: &QueryCoordinator) -> i64 {
 				.then_some(*count)
 		})
 		.unwrap_or(0)
+}
+
+async fn optimizer_probe_linearity_fence_counts(
+	coordinator: &QueryCoordinator,
+	consumer: &str,
+	fence: &str,
+) -> (i64, i64) {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_probe_linearity_fences")
+		.expect("plan optimizer probe-linearity fences query");
+	let batch = execute_single_coordinator_batch(coordinator, &plan).await;
+	let consumers = string_column_values(&batch, 0);
+	let fences = string_column_values(&batch, 1);
+	let recent_counts = int64_column_values(&batch, 2);
+	let lifetime_counts = int64_column_values(&batch, 3);
+	consumers
+		.iter()
+		.zip(fences.iter())
+		.zip(recent_counts.iter())
+		.zip(lifetime_counts.iter())
+		.find_map(|(((row_consumer, row_fence), recent), lifetime)| {
+			(row_consumer == consumer && row_fence == fence).then_some((*recent, *lifetime))
+		})
+		.unwrap_or((0, 0))
 }
 
 async fn execute_single_coordinator_batch(

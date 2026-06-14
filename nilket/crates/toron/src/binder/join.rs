@@ -77,7 +77,7 @@ impl ProbeLinearity {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ProbeLinearityFence {
 	ScanRowLimit,
 	Take,
@@ -89,7 +89,7 @@ pub(crate) enum ProbeLinearityFence {
 }
 
 impl ProbeLinearityFence {
-	pub(super) fn label(self) -> &'static str {
+	pub(crate) fn label(self) -> &'static str {
 		match self {
 			Self::ScanRowLimit => "scan_row_limit",
 			Self::Take => "take",
@@ -100,6 +100,18 @@ impl ProbeLinearityFence {
 			Self::NonScanLeaf => "non_scan_leaf",
 		}
 	}
+}
+
+pub(crate) fn probe_linearity_fences() -> [ProbeLinearityFence; 7] {
+	[
+		ProbeLinearityFence::ScanRowLimit,
+		ProbeLinearityFence::Take,
+		ProbeLinearityFence::Sort,
+		ProbeLinearityFence::Aggregate,
+		ProbeLinearityFence::Exchange,
+		ProbeLinearityFence::NonBroadcastJoin,
+		ProbeLinearityFence::NonScanLeaf,
+	]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

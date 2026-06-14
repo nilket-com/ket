@@ -218,6 +218,7 @@ pub enum SystemTableKind {
 	InformationSchemaOptimizerDecisions,
 	InformationSchemaOptimizerDecisionConflicts,
 	InformationSchemaOptimizerMemoAdmission,
+	InformationSchemaOptimizerProbeLinearityFences,
 	InformationSchemaOptimizerRuntimeVerdicts,
 	InformationSchemaOptimizerMarginAdvisory,
 	InformationSchemaOptimizerReceiptGates,

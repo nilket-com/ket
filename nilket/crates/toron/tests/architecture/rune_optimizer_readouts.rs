@@ -1,6 +1,6 @@
 use super::support::*;
 
-const ADR228_OPTIMIZER_READOUTS: [(&str, &str); 7] = [
+const ADR228_OPTIMIZER_READOUTS: [(&str, &str); 8] = [
 	("optimizer_decisions", "optimizer_decisions"),
 	("optimizer_runtime_verdicts", "optimizer_runtime_verdicts"),
 	("optimizer_evidence_status", "optimizer_evidence_status"),
@@ -11,6 +11,10 @@ const ADR228_OPTIMIZER_READOUTS: [(&str, &str); 7] = [
 		"optimizer_decision_conflicts",
 	),
 	("optimizer_memo_admission", "optimizer_memo_admission"),
+	(
+		"optimizer_probe_linearity_fences",
+		"optimizer_probe_linearity_fences",
+	),
 ];
 
 fn source(relative: &str) -> String {
@@ -36,14 +40,24 @@ fn quoted_const_value(line: &str) -> Option<String> {
 		.map(ToOwned::to_owned)
 }
 
+fn quoted_literal(line: &str) -> Option<String> {
+	line.split('"').nth(1).map(ToOwned::to_owned)
+}
+
 fn binder_optimizer_readout_table_constants() -> Vec<String> {
-	let mut tables = binder_root_source()
-		.lines()
-		.filter(|line| {
-			line.contains("const INFORMATION_SCHEMA_OPTIMIZER_") && line.contains("_TABLE: &str")
-		})
-		.filter_map(quoted_const_value)
-		.collect::<Vec<_>>();
+	let source = binder_root_source();
+	let lines = source.lines().collect::<Vec<_>>();
+	let mut tables = Vec::new();
+	for (index, line) in lines.iter().enumerate() {
+		if !line.contains("const INFORMATION_SCHEMA_OPTIMIZER_") || !line.contains("_TABLE: &str") {
+			continue;
+		}
+		if let Some(value) = quoted_const_value(line) {
+			tables.push(value);
+		} else if let Some(next_line) = lines.get(index + 1).and_then(|line| quoted_literal(line)) {
+			tables.push(next_line);
+		}
+	}
 	tables.sort();
 	tables
 }
@@ -59,13 +73,13 @@ fn rune_optimizer_readout_table_constants() -> Vec<String> {
 }
 
 #[test]
-pub(crate) fn adr228_rune_optimizer_readout_handles_are_finite_seven() {
+pub(crate) fn adr228_rune_optimizer_readout_handles_are_finite_eight_after_adr229() {
 	let rune = rune_engine_source();
 	let context = source_block(&rune, "impl ToronContext");
 	let module = source_block(&rune, "pub fn create_toron_module");
 
-	assert_eq!(context.matches("pub fn optimizer_").count(), 7);
-	assert_eq!(module.matches("\"optimizer_").count(), 7);
+	assert_eq!(context.matches("pub fn optimizer_").count(), 8);
+	assert_eq!(module.matches("\"optimizer_").count(), 8);
 	for (handle, _) in ADR228_OPTIMIZER_READOUTS {
 		assert!(
 			context.contains(&format!("pub fn {handle}(&self) -> RuneDataFrame")),
@@ -174,8 +188,8 @@ pub(crate) fn adr228_no_new_information_schema_table_or_system_table_kind() {
 	let system_kind = source_block(&execution, "pub enum SystemTableKind");
 	let binder_tables = binder_optimizer_readout_table_constants();
 
-	assert_eq!(enum_variant_count(&system_kind), 12);
-	assert_eq!(binder_tables.len(), 7);
+	assert_eq!(enum_variant_count(&system_kind), 13);
+	assert_eq!(binder_tables.len(), 8);
 	for (_, table) in ADR228_OPTIMIZER_READOUTS {
 		assert!(
 			binder_tables.iter().any(|actual| actual == table),
@@ -205,10 +219,8 @@ pub(crate) fn adr228_no_runtime_evidence_or_policy_surface_change() {
 		);
 	}
 	for source_file in [
-		"src/binder/runtime_evidence.rs",
 		"src/network/observability.rs",
 		"src/coordinator.rs",
-		"src/daemon.rs",
 		"src/distributed/fragment.rs",
 		"src/distributed/scheduler.rs",
 		"src/exec.rs",
@@ -221,6 +233,22 @@ pub(crate) fn adr228_no_runtime_evidence_or_policy_surface_change() {
 			"ADR228 readout handle leaked into {source_file}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr229_probe_linearity_rune_handle_present_and_aliased() {
+	let rune = rune_engine_source();
+	let context = source_block(&rune, "impl ToronContext");
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	assert!(context.contains("pub fn optimizer_probe_linearity_fences(&self) -> RuneDataFrame"));
+	assert!(context.contains("RUNE_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE"));
+	assert!(module.contains(
+		"\"optimizer_probe_linearity_fences\",\n\t\tToronContext::optimizer_probe_linearity_fences,"
+	));
+	assert!(rune.contains(
+		"const RUNE_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE: &str = \"optimizer_probe_linearity_fences\""
+	));
 }
 
 #[test]

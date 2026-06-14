@@ -102,6 +102,8 @@ const INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS: &str =
 	"information_schema.optimizer_decision_conflicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION: &str =
 	"information_schema.optimizer_memo_admission";
+const INFORMATION_SCHEMA_OPTIMIZER_PROBE_LINEARITY_FENCES: &str =
+	"information_schema.optimizer_probe_linearity_fences";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS: &str =
 	"information_schema.optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY: &str =
@@ -117,6 +119,8 @@ const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS_TABLE: &str = "optimizer_decision_conflicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION_TABLE: &str = "optimizer_memo_admission";
+const INFORMATION_SCHEMA_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE: &str =
+	"optimizer_probe_linearity_fences";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
 const INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE: &str = "optimizer_receipt_gates";
@@ -2030,6 +2034,22 @@ impl<'a> Binder<'a> {
 		}
 		if table
 			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE)
+		{
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerProbeLinearityFences,
+				information_schema_optimizer_probe_linearity_fences_schema(),
+				information_schema_optimizer_probe_linearity_fence_rows(
+					&self
+						.config
+						.runtime_evidence
+						.probe_linearity_fence_snapshot(),
+				)?,
+				projection,
+			);
+		}
+		if table
+			.table
 			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE)
 		{
 			return system_table_plan(
@@ -2080,7 +2100,7 @@ impl<'a> Binder<'a> {
 		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}, {INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES}, {INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION}, {INFORMATION_SCHEMA_OPTIMIZER_PROBE_LINEARITY_FENCES}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}, {INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES}, {INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS}",
 				table_name(table)
 			),
 		})
@@ -2251,6 +2271,13 @@ impl<'a> Binder<'a> {
 			placement: decision.placement,
 			reason: decision.reason,
 		});
+		if let JoinStrategyDecisionReason::HashByDefault {
+			reason: HashByDefaultReason::ProbeNotScanLinear(fence),
+		} = decision.reason
+		{
+			self.decision_recorder
+				.record_probe_linearity_fence(OptimizerProbeLinearityConsumer::HashFallback, fence);
+		}
 		let binder_physicalizes_join = matches!(strategy_intent, JoinStrategyIntent::Auto)
 			|| matches!(
 				strategy_intent,

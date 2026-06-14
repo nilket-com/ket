@@ -10,18 +10,25 @@ use wendelon_client::{Client, ClientError, WriteOptions};
 
 use super::decision_log::{
 	OptimizerDecisionKind, OptimizerDecisionOutcome, OptimizerDecisionRecorder,
-	OptimizerDecisionRow, OptimizerRuntimeDecisionKey, OptimizerRuntimeEvidenceLane,
-	OptimizerRuntimeVerdictClass, OptimizerRuntimeVerdictKey, OptimizerRuntimeVerdictProvenance,
-	OptimizerRuntimeVerdictRow, decision_recording_kinds, optimizer_decision_decline_reason_label,
+	OptimizerDecisionRow, OptimizerProbeLinearityConsumer, OptimizerProbeLinearityFenceKey,
+	OptimizerProbeLinearityFenceRow, OptimizerProbeLinearityFenceStatus,
+	OptimizerRuntimeDecisionKey, OptimizerRuntimeEvidenceLane, OptimizerRuntimeVerdictClass,
+	OptimizerRuntimeVerdictKey, OptimizerRuntimeVerdictProvenance, OptimizerRuntimeVerdictRow,
+	decision_recording_kinds, optimizer_decision_decline_reason_label,
 	optimizer_decision_kind_label, optimizer_decision_outcome_label, optimizer_decision_outcomes,
+	optimizer_probe_linearity_consumer_label, optimizer_probe_linearity_consumers,
 	optimizer_runtime_verdict_label,
 };
+use super::join::{ProbeLinearityFence, probe_linearity_fences};
 
 pub const OPTIMIZER_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/verdict/";
 pub const OPTIMIZER_DECISION_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/decision/";
 pub const OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX: &str = "optimizer_evidence/window/";
+pub const OPTIMIZER_PROBE_LINEARITY_EVIDENCE_KEY_PREFIX: &str =
+	"optimizer_evidence/probe_linearity/";
 const UNAVAILABLE_CIRCUIT_BREAKER_FAILURES: u64 = 3;
 const OPTIMIZER_EVIDENCE_WINDOW_BUCKET: Duration = Duration::from_secs(60);
+const PROBE_LINEARITY_FENCE_MIN_SAMPLE: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptimizerEvidenceMode {
@@ -98,6 +105,10 @@ pub(crate) enum OptimizerEvidenceWindowCounterKey {
 		window: OptimizerEvidenceWindowId,
 		key: OptimizerRuntimeDecisionKey,
 	},
+	ProbeLinearityFence {
+		window: OptimizerEvidenceWindowId,
+		key: OptimizerProbeLinearityFenceKey,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +166,9 @@ struct RuntimeEvidenceState {
 	decision_pending: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
 	decision_in_flight: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
 	decision_durable_cache: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
+	probe_linearity_pending: BTreeMap<OptimizerProbeLinearityFenceKey, u64>,
+	probe_linearity_in_flight: BTreeMap<OptimizerProbeLinearityFenceKey, u64>,
+	probe_linearity_durable_cache: BTreeMap<OptimizerProbeLinearityFenceKey, u64>,
 	window_pending: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
 	window_in_flight: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
 	window_durable_cache: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
@@ -178,6 +192,9 @@ impl Default for RuntimeEvidenceState {
 			decision_pending: BTreeMap::new(),
 			decision_in_flight: BTreeMap::new(),
 			decision_durable_cache: BTreeMap::new(),
+			probe_linearity_pending: BTreeMap::new(),
+			probe_linearity_in_flight: BTreeMap::new(),
+			probe_linearity_durable_cache: BTreeMap::new(),
 			window_pending: BTreeMap::new(),
 			window_in_flight: BTreeMap::new(),
 			window_durable_cache: BTreeMap::new(),
@@ -346,6 +363,22 @@ impl OptimizerRuntimeEvidence {
 		keys
 	}
 
+	pub(crate) fn record_probe_linearity_fence(
+		&self,
+		consumer: OptimizerProbeLinearityConsumer,
+		fence: ProbeLinearityFence,
+	) -> OptimizerProbeLinearityFenceKey {
+		let window = self.window_id_source.current();
+		let key = OptimizerProbeLinearityFenceKey { consumer, fence };
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		increment_count(&mut state.probe_linearity_pending, key);
+		increment_count(
+			&mut state.window_pending,
+			OptimizerEvidenceWindowCounterKey::ProbeLinearityFence { window, key },
+		);
+		key
+	}
+
 	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		verdict_rows_from_state(&state)
@@ -354,6 +387,12 @@ impl OptimizerRuntimeEvidence {
 	pub(crate) fn decision_snapshot(&self) -> Vec<OptimizerDecisionRow> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		decision_rows_from_state(&state)
+	}
+
+	pub(crate) fn probe_linearity_fence_snapshot(&self) -> Vec<OptimizerProbeLinearityFenceRow> {
+		let current_window = self.window_id_source.current();
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		probe_linearity_fence_rows_from_state(&state, current_window)
 	}
 
 	pub(crate) fn status_snapshot(&self) -> OptimizerEvidenceStatusSnapshot {
@@ -413,6 +452,49 @@ impl OptimizerRuntimeEvidence {
 					self.drop_ambiguous_decision_in_flight(key, delta, error.to_string())
 				}
 				Err(_) => self.drop_ambiguous_decision_in_flight(
+					key,
+					delta,
+					"counter fetch-add timed out".to_string(),
+				),
+			}
+		}
+	}
+
+	pub async fn flush_probe_linearity_deltas(&self) {
+		let Some(binding) = self.binding.clone() else {
+			return;
+		};
+		let keys = self.pending_probe_linearity_keys();
+		for key in keys {
+			let Some(delta) = self.take_pending_probe_linearity_for_flush(key) else {
+				continue;
+			};
+			let key_bytes = probe_linearity_counter_key(key);
+			let result = tokio::time::timeout(
+				binding.flush_timeout,
+				binding.client.counter_fetch_add(
+					binding.tenant_id,
+					&key_bytes,
+					delta,
+					WriteOptions::default(),
+				),
+			)
+			.await;
+			match result {
+				Ok(Ok(receipt)) => self.ack_probe_linearity_flush(key, receipt.current_value),
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::COUNTER_REPLICATION_UNSUPPORTED =>
+				{
+					self.latch_probe_linearity_replication_unsupported(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(error)) => {
+					self.drop_ambiguous_probe_linearity_in_flight(key, delta, error.to_string())
+				}
+				Err(_) => self.drop_ambiguous_probe_linearity_in_flight(
 					key,
 					delta,
 					"counter fetch-add timed out".to_string(),
@@ -559,6 +641,28 @@ impl OptimizerRuntimeEvidence {
 				}
 			}
 		}
+		let mut refreshed_probe_linearity = BTreeMap::new();
+		for (key, key_bytes) in all_probe_linearity_counter_keys() {
+			match binding
+				.client
+				.counter_read(binding.tenant_id, &key_bytes)
+				.await
+			{
+				Ok(value) => {
+					refreshed_probe_linearity.insert(key, value.unwrap_or(0));
+				}
+				Err(error) => {
+					self.mark_refresh_failed(error.to_string());
+					return OptimizerEvidenceRefreshReport {
+						refreshed_keys: refreshed
+							.len()
+							.saturating_add(refreshed_decisions.len())
+							.saturating_add(refreshed_probe_linearity.len()),
+						failed: true,
+					};
+				}
+			}
+		}
 		let current_window = self.window_id_source.current();
 		let previous_window = current_window.previous();
 		let mut refreshed_windows = BTreeMap::new();
@@ -577,6 +681,7 @@ impl OptimizerRuntimeEvidence {
 						refreshed_keys: refreshed
 							.len()
 							.saturating_add(refreshed_decisions.len())
+							.saturating_add(refreshed_probe_linearity.len())
 							.saturating_add(refreshed_windows.len()),
 						failed: true,
 					};
@@ -586,8 +691,14 @@ impl OptimizerRuntimeEvidence {
 		let refreshed_keys = refreshed
 			.len()
 			.saturating_add(refreshed_decisions.len())
+			.saturating_add(refreshed_probe_linearity.len())
 			.saturating_add(refreshed_windows.len());
-		self.merge_refresh(refreshed, refreshed_decisions, refreshed_windows);
+		self.merge_refresh(
+			refreshed,
+			refreshed_decisions,
+			refreshed_probe_linearity,
+			refreshed_windows,
+		);
 		OptimizerEvidenceRefreshReport {
 			refreshed_keys,
 			failed: false,
@@ -597,6 +708,11 @@ impl OptimizerRuntimeEvidence {
 	fn pending_decision_keys(&self) -> Vec<OptimizerRuntimeDecisionKey> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		state.decision_pending.keys().copied().collect()
+	}
+
+	fn pending_probe_linearity_keys(&self) -> Vec<OptimizerProbeLinearityFenceKey> {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_pending.keys().copied().collect()
 	}
 
 	fn pending_window_keys(&self) -> Vec<OptimizerEvidenceWindowCounterKey> {
@@ -635,6 +751,31 @@ impl OptimizerRuntimeEvidence {
 			return None;
 		}
 		state.decision_in_flight.insert(key, delta);
+		Some(delta)
+	}
+
+	fn take_pending_probe_linearity_for_flush(
+		&self,
+		key: OptimizerProbeLinearityFenceKey,
+	) -> Option<u64> {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		if self.binding.is_none()
+			|| state.replication_unsupported
+			|| state.circuit_open
+			|| state
+				.probe_linearity_in_flight
+				.get(&key)
+				.copied()
+				.unwrap_or(0)
+				> 0
+		{
+			return None;
+		}
+		let delta = state.probe_linearity_pending.remove(&key).unwrap_or(0);
+		if delta == 0 {
+			return None;
+		}
+		state.probe_linearity_in_flight.insert(key, delta);
 		Some(delta)
 	}
 
@@ -683,6 +824,20 @@ impl OptimizerRuntimeEvidence {
 		}
 	}
 
+	fn ack_probe_linearity_flush(&self, key: OptimizerProbeLinearityFenceKey, current_value: u64) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_in_flight.remove(&key);
+		let cached = state.probe_linearity_durable_cache.entry(key).or_insert(0);
+		*cached = (*cached).max(current_value);
+		if !state.replication_unsupported {
+			state.consecutive_unavailable_failures = 0;
+			state.circuit_open = false;
+			state.mode = OptimizerEvidenceMode::Durable;
+			state.state = OptimizerEvidenceState::Ok;
+			state.last_error = None;
+		}
+	}
+
 	fn ack_window_flush(&self, key: OptimizerEvidenceWindowCounterKey, current_value: u64) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		state.window_in_flight.remove(&key);
@@ -720,6 +875,26 @@ impl OptimizerRuntimeEvidence {
 	) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
 		state.decision_in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.consecutive_unavailable_failures =
+			state.consecutive_unavailable_failures.saturating_add(1);
+		if state.consecutive_unavailable_failures >= UNAVAILABLE_CIRCUIT_BREAKER_FAILURES {
+			state.circuit_open = true;
+			state.mode = OptimizerEvidenceMode::Degraded;
+		}
+		state.state = OptimizerEvidenceState::Unavailable;
+		state.last_error = Some(error);
+	}
+
+	fn drop_ambiguous_probe_linearity_in_flight(
+		&self,
+		key: OptimizerProbeLinearityFenceKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_in_flight.remove(&key);
 		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
 		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
 		state.consecutive_unavailable_failures =
@@ -786,6 +961,23 @@ impl OptimizerRuntimeEvidence {
 		state.last_error = Some(error);
 	}
 
+	fn latch_probe_linearity_replication_unsupported(
+		&self,
+		key: OptimizerProbeLinearityFenceKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.replication_unsupported = true;
+		state.circuit_open = true;
+		state.mode = OptimizerEvidenceMode::Degraded;
+		state.state = OptimizerEvidenceState::ReplicationUnsupported;
+		state.last_error = Some(error);
+	}
+
 	fn latch_window_replication_unsupported(
 		&self,
 		key: OptimizerEvidenceWindowCounterKey,
@@ -821,6 +1013,7 @@ impl OptimizerRuntimeEvidence {
 		&self,
 		refreshed: BTreeMap<OptimizerRuntimeVerdictKey, u64>,
 		refreshed_decisions: BTreeMap<OptimizerRuntimeDecisionKey, u64>,
+		refreshed_probe_linearity: BTreeMap<OptimizerProbeLinearityFenceKey, u64>,
 		refreshed_windows: BTreeMap<OptimizerEvidenceWindowCounterKey, u64>,
 	) {
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
@@ -830,6 +1023,10 @@ impl OptimizerRuntimeEvidence {
 		}
 		for (key, value) in refreshed_decisions {
 			let cached = state.decision_durable_cache.entry(key).or_insert(0);
+			*cached = (*cached).max(value);
+		}
+		for (key, value) in refreshed_probe_linearity {
+			let cached = state.probe_linearity_durable_cache.entry(key).or_insert(0);
 			*cached = (*cached).max(value);
 		}
 		for (key, value) in refreshed_windows {
@@ -869,6 +1066,14 @@ impl OptimizerDecisionRecorder for OptimizerRuntimeDecisionRecorder {
 		self.evidence
 			.record_decision(kind, outcome, self.provenance);
 	}
+
+	fn record_probe_linearity_fence(
+		&self,
+		consumer: OptimizerProbeLinearityConsumer,
+		fence: ProbeLinearityFence,
+	) {
+		self.evidence.record_probe_linearity_fence(consumer, fence);
+	}
 }
 
 pub(crate) fn verdict_counter_key(key: OptimizerRuntimeVerdictKey) -> Vec<u8> {
@@ -887,6 +1092,14 @@ pub(crate) fn decision_counter_key(key: OptimizerRuntimeDecisionKey) -> Vec<u8> 
 	.into_bytes()
 }
 
+pub(crate) fn probe_linearity_counter_key(key: OptimizerProbeLinearityFenceKey) -> Vec<u8> {
+	format!(
+		"{OPTIMIZER_PROBE_LINEARITY_EVIDENCE_KEY_PREFIX}{}",
+		probe_linearity_counter_suffix(key)
+	)
+	.into_bytes()
+}
+
 pub(crate) fn window_counter_key(key: OptimizerEvidenceWindowCounterKey) -> Vec<u8> {
 	match key {
 		OptimizerEvidenceWindowCounterKey::Verdict { window, key } => format!(
@@ -899,6 +1112,12 @@ pub(crate) fn window_counter_key(key: OptimizerEvidenceWindowCounterKey) -> Vec<
 			"{OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX}{}/decision/{}",
 			window.0,
 			decision_counter_suffix(key)
+		)
+		.into_bytes(),
+		OptimizerEvidenceWindowCounterKey::ProbeLinearityFence { window, key } => format!(
+			"{OPTIMIZER_EVIDENCE_WINDOW_KEY_PREFIX}{}/probe_linearity/{}",
+			window.0,
+			probe_linearity_counter_suffix(key)
 		)
 		.into_bytes(),
 	}
@@ -932,6 +1151,14 @@ fn decision_counter_suffix(key: OptimizerRuntimeDecisionKey) -> String {
 			decision_outcome_key_label(key.outcome)
 		),
 	}
+}
+
+fn probe_linearity_counter_suffix(key: OptimizerProbeLinearityFenceKey) -> String {
+	format!(
+		"{}/{}",
+		optimizer_probe_linearity_consumer_label(key.consumer),
+		key.fence.label()
+	)
 }
 
 pub(crate) fn all_verdict_counter_keys() -> Vec<(OptimizerRuntimeVerdictKey, Vec<u8>)> {
@@ -976,12 +1203,28 @@ pub(crate) fn all_decision_counter_keys() -> Vec<(OptimizerRuntimeDecisionKey, V
 	keys
 }
 
+pub(crate) fn all_probe_linearity_counter_keys() -> Vec<(OptimizerProbeLinearityFenceKey, Vec<u8>)>
+{
+	let mut keys = Vec::with_capacity(
+		optimizer_probe_linearity_consumers().len() * probe_linearity_fences().len(),
+	);
+	for consumer in optimizer_probe_linearity_consumers() {
+		for fence in probe_linearity_fences() {
+			let key = OptimizerProbeLinearityFenceKey { consumer, fence };
+			keys.push((key, probe_linearity_counter_key(key)));
+		}
+	}
+	keys
+}
+
 pub(crate) fn all_window_counter_keys(
 	current_window: OptimizerEvidenceWindowId,
 	previous_window: OptimizerEvidenceWindowId,
 ) -> Vec<(OptimizerEvidenceWindowCounterKey, Vec<u8>)> {
 	let mut keys = Vec::with_capacity(
-		2 * (all_verdict_counter_keys().len() + all_decision_counter_keys().len()),
+		2 * (all_verdict_counter_keys().len()
+			+ all_decision_counter_keys().len()
+			+ all_probe_linearity_counter_keys().len()),
 	);
 	for window in [current_window, previous_window] {
 		for (key, _) in all_verdict_counter_keys() {
@@ -990,6 +1233,10 @@ pub(crate) fn all_window_counter_keys(
 		}
 		for (key, _) in all_decision_counter_keys() {
 			let window_key = OptimizerEvidenceWindowCounterKey::Decision { window, key };
+			keys.push((window_key, window_counter_key(window_key)));
+		}
+		for (key, _) in all_probe_linearity_counter_keys() {
+			let window_key = OptimizerEvidenceWindowCounterKey::ProbeLinearityFence { window, key };
 			keys.push((window_key, window_counter_key(window_key)));
 		}
 	}
@@ -1081,6 +1328,140 @@ fn recent_decision_rows_from_state(
 	decision_rows_from_counts(&counts)
 }
 
+fn probe_linearity_fence_rows_from_state(
+	state: &RuntimeEvidenceState,
+	current_window: OptimizerEvidenceWindowId,
+) -> Vec<OptimizerProbeLinearityFenceRow> {
+	let lifetime_counts = probe_linearity_lifetime_counts_from_state(state);
+	let recent_counts = recent_probe_linearity_counts_from_state(state, current_window);
+	let mut consumer_lifetime_totals: BTreeMap<OptimizerProbeLinearityConsumer, u64> =
+		BTreeMap::new();
+	let mut consumer_recent_totals: BTreeMap<OptimizerProbeLinearityConsumer, u64> =
+		BTreeMap::new();
+	for (key, count) in &lifetime_counts {
+		let total = consumer_lifetime_totals.entry(key.consumer).or_insert(0);
+		*total = total.saturating_add(*count);
+	}
+	for (key, count) in &recent_counts {
+		let total = consumer_recent_totals.entry(key.consumer).or_insert(0);
+		*total = total.saturating_add(*count);
+	}
+
+	let mut rows = Vec::new();
+	for consumer in optimizer_probe_linearity_consumers() {
+		let consumer_lifetime_total = consumer_lifetime_totals
+			.get(&consumer)
+			.copied()
+			.unwrap_or(0);
+		let consumer_recent_total = consumer_recent_totals.get(&consumer).copied().unwrap_or(0);
+		for fence in probe_linearity_fences() {
+			let key = OptimizerProbeLinearityFenceKey { consumer, fence };
+			let lifetime_count = lifetime_counts.get(&key).copied().unwrap_or(0);
+			let recent_count = recent_counts.get(&key).copied().unwrap_or(0);
+			let recent_share_per_mille = if consumer_recent_total == 0 {
+				0
+			} else {
+				recent_count.saturating_mul(1000) / consumer_recent_total
+			};
+			let (status, reason) =
+				probe_linearity_status_and_reason(recent_count, consumer_recent_total);
+			rows.push(OptimizerProbeLinearityFenceRow {
+				consumer,
+				fence,
+				recent_count,
+				lifetime_count,
+				consumer_recent_total,
+				consumer_lifetime_total,
+				recent_share_per_mille,
+				status,
+				reason: reason.to_string(),
+				next_cut: probe_linearity_next_cut(status),
+			});
+		}
+	}
+	rows
+}
+
+fn probe_linearity_lifetime_counts_from_state(
+	state: &RuntimeEvidenceState,
+) -> BTreeMap<OptimizerProbeLinearityFenceKey, u64> {
+	let mut counts = state.probe_linearity_durable_cache.clone();
+	for (key, count) in state
+		.probe_linearity_pending
+		.iter()
+		.chain(state.probe_linearity_in_flight.iter())
+	{
+		let entry = counts.entry(*key).or_insert(0);
+		*entry = entry.saturating_add(*count);
+	}
+	counts
+}
+
+fn recent_probe_linearity_counts_from_state(
+	state: &RuntimeEvidenceState,
+	current_window: OptimizerEvidenceWindowId,
+) -> BTreeMap<OptimizerProbeLinearityFenceKey, u64> {
+	let previous_window = current_window.previous();
+	let mut counts: BTreeMap<OptimizerProbeLinearityFenceKey, u64> = BTreeMap::new();
+	for window_counts in [
+		&state.window_durable_cache,
+		&state.window_pending,
+		&state.window_in_flight,
+	] {
+		for (counter_key, count) in window_counts {
+			let OptimizerEvidenceWindowCounterKey::ProbeLinearityFence { window, key } =
+				counter_key
+			else {
+				continue;
+			};
+			if *window != current_window && *window != previous_window {
+				continue;
+			}
+			let entry = counts.entry(*key).or_insert(0);
+			*entry = (*entry).saturating_add(*count);
+		}
+	}
+	counts
+}
+
+fn probe_linearity_status_and_reason(
+	recent_count: u64,
+	consumer_recent_total: u64,
+) -> (OptimizerProbeLinearityFenceStatus, &'static str) {
+	if recent_count == 0 {
+		(
+			OptimizerProbeLinearityFenceStatus::Absent,
+			"no_recent_evidence",
+		)
+	} else if consumer_recent_total < PROBE_LINEARITY_FENCE_MIN_SAMPLE {
+		(
+			OptimizerProbeLinearityFenceStatus::InsufficientEvidence,
+			"consumer_recent_total_below_floor",
+		)
+	} else if recent_count >= PROBE_LINEARITY_FENCE_MIN_SAMPLE
+		&& recent_count.saturating_mul(2) > consumer_recent_total
+	{
+		(
+			OptimizerProbeLinearityFenceStatus::Dominant,
+			"recent_strict_majority",
+		)
+	} else {
+		(
+			OptimizerProbeLinearityFenceStatus::Observed,
+			"recent_not_strict_majority",
+		)
+	}
+}
+
+fn probe_linearity_next_cut(status: OptimizerProbeLinearityFenceStatus) -> &'static str {
+	match status {
+		OptimizerProbeLinearityFenceStatus::Dominant => "targeted_probe_linearity_relaxation",
+		OptimizerProbeLinearityFenceStatus::Absent
+		| OptimizerProbeLinearityFenceStatus::InsufficientEvidence
+		| OptimizerProbeLinearityFenceStatus::Observed => "await_dominant_probe_linearity_fence",
+	}
+}
+
 fn decision_rows_from_counts(
 	counts: &BTreeMap<OptimizerRuntimeDecisionKey, u64>,
 ) -> Vec<OptimizerDecisionRow> {
@@ -1133,6 +1514,8 @@ fn status_snapshot_from_state(state: &RuntimeEvidenceState) -> OptimizerEvidence
 			.saturating_add(sum_counts(&state.in_flight))
 			.saturating_add(sum_counts(&state.decision_pending))
 			.saturating_add(sum_counts(&state.decision_in_flight))
+			.saturating_add(sum_counts(&state.probe_linearity_pending))
+			.saturating_add(sum_counts(&state.probe_linearity_in_flight))
 			.saturating_add(sum_counts(&state.window_pending))
 			.saturating_add(sum_counts(&state.window_in_flight)),
 		dropped_deltas: state.dropped_deltas,
@@ -1179,6 +1562,15 @@ fn lifetime_total_count_from_state(state: &RuntimeEvidenceState) -> u64 {
 			}
 		}
 	}
+	for counts in [
+		&state.probe_linearity_durable_cache,
+		&state.probe_linearity_pending,
+		&state.probe_linearity_in_flight,
+	] {
+		for count in counts.values() {
+			total = total.saturating_add(*count);
+		}
+	}
 	total
 }
 
@@ -1202,6 +1594,10 @@ fn window_total_count_from_state(
 					window: key_window,
 					key,
 				} => *key_window == window && key.lane == OptimizerRuntimeEvidenceLane::Total,
+				OptimizerEvidenceWindowCounterKey::ProbeLinearityFence {
+					window: key_window,
+					..
+				} => *key_window == window,
 			};
 			if total_lane {
 				total = total.saturating_add(*count);
@@ -1350,12 +1746,12 @@ mod tests {
 	fn adr222_window_keys_are_separate_namespace_not_in_220_matrix() {
 		let window_keys =
 			all_window_counter_keys(OptimizerEvidenceWindowId(9), OptimizerEvidenceWindowId(8));
-		assert_eq!(window_keys.len(), 440);
+		assert_eq!(window_keys.len(), 468);
 		let unique = window_keys
 			.iter()
 			.map(|(_, key)| key.clone())
 			.collect::<BTreeSet<_>>();
-		assert_eq!(unique.len(), 440);
+		assert_eq!(unique.len(), 468);
 		assert!(
 			window_keys
 				.iter()
@@ -1368,8 +1764,36 @@ mod tests {
 			key
 			== b"optimizer_evidence/window/8/decision/flat_star/demoted/declined/non_inner_equi_join"
 		}));
+		assert!(window_keys.iter().any(|(_, key)| {
+			key == b"optimizer_evidence/window/9/probe_linearity/hash_fallback/non_broadcast_join"
+		}));
+		assert!(window_keys.iter().any(|(_, key)| {
+			key == b"optimizer_evidence/window/8/probe_linearity/star_decline/sort"
+		}));
 		assert_eq!(all_verdict_counter_keys().len(), 80);
 		assert_eq!(all_decision_counter_keys().len(), 140);
+		assert_eq!(all_probe_linearity_counter_keys().len(), 14);
+	}
+
+	#[test]
+	fn adr229_probe_linearity_keys_are_fixed_14_key_detail_matrix() {
+		let keys = all_probe_linearity_counter_keys();
+		assert_eq!(keys.len(), 14);
+		let unique = keys
+			.iter()
+			.map(|(_, key)| key.clone())
+			.collect::<BTreeSet<_>>();
+		assert_eq!(unique.len(), 14);
+		assert!(keys.iter().all(|(_, key)| {
+			key.starts_with(OPTIMIZER_PROBE_LINEARITY_EVIDENCE_KEY_PREFIX.as_bytes())
+		}));
+		assert!(keys.iter().any(|(_, key)| {
+			key == b"optimizer_evidence/probe_linearity/hash_fallback/non_broadcast_join"
+		}));
+		assert!(
+			keys.iter()
+				.any(|(_, key)| key == b"optimizer_evidence/probe_linearity/star_decline/sort")
+		);
 	}
 
 	#[test]
@@ -1382,7 +1806,8 @@ mod tests {
 		assert_eq!(verdict_keys.len(), 80);
 		assert_eq!(decision_keys.len(), 140);
 		assert_eq!(verdict_keys.len() + decision_keys.len(), 220);
-		assert_eq!(window_keys.len(), 440);
+		assert_eq!(all_probe_linearity_counter_keys().len(), 14);
+		assert_eq!(window_keys.len(), 468);
 		assert!(
 			verdict_keys
 				.iter()

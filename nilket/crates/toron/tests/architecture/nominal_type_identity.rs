@@ -2102,7 +2102,7 @@ pub(crate) fn adr102_system_table_kind_has_finite_introspection_family() {
 	let execution = execution_source();
 	let system_kind = source_block(&execution, "pub enum SystemTableKind");
 
-	assert_eq!(enum_variant_count(&system_kind), 12);
+	assert_eq!(enum_variant_count(&system_kind), 13);
 	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
 	assert!(system_kind.contains("InformationSchemaTables"));
 	assert!(system_kind.contains("InformationSchemaColumns"));
@@ -2110,6 +2110,7 @@ pub(crate) fn adr102_system_table_kind_has_finite_introspection_family() {
 	assert!(system_kind.contains("InformationSchemaOptimizerDecisions"));
 	assert!(system_kind.contains("InformationSchemaOptimizerDecisionConflicts"));
 	assert!(system_kind.contains("InformationSchemaOptimizerMemoAdmission"));
+	assert!(system_kind.contains("InformationSchemaOptimizerProbeLinearityFences"));
 	assert!(system_kind.contains("InformationSchemaOptimizerRuntimeVerdicts"));
 	assert!(system_kind.contains("InformationSchemaOptimizerMarginAdvisory"));
 	assert!(system_kind.contains("InformationSchemaOptimizerReceiptGates"));

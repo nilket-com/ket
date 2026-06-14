@@ -23,7 +23,8 @@ const RUNE_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
 const RUNE_OPTIMIZER_RECEIPT_GATES_TABLE: &str = "optimizer_receipt_gates";
 const RUNE_OPTIMIZER_DECISION_CONFLICTS_TABLE: &str = "optimizer_decision_conflicts";
 const RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE: &str = "optimizer_memo_admission";
-const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 7] = [
+const RUNE_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE: &str = "optimizer_probe_linearity_fences";
+const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 8] = [
 	RUNE_OPTIMIZER_DECISIONS_TABLE,
 	RUNE_OPTIMIZER_RUNTIME_VERDICTS_TABLE,
 	RUNE_OPTIMIZER_EVIDENCE_STATUS_TABLE,
@@ -31,6 +32,7 @@ const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 7] = [
 	RUNE_OPTIMIZER_RECEIPT_GATES_TABLE,
 	RUNE_OPTIMIZER_DECISION_CONFLICTS_TABLE,
 	RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE,
+	RUNE_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE,
 ];
 
 fn rune_compile_error(error: impl std::fmt::Display) -> FrontendError {
@@ -625,6 +627,10 @@ impl ToronContext {
 
 	pub fn optimizer_memo_admission(&self) -> RuneDataFrame {
 		Self::optimizer_readout(RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE)
+	}
+
+	pub fn optimizer_probe_linearity_fences(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE)
 	}
 
 	pub fn sql(&self, query: String) -> VmResult<RuneDataFrame> {
@@ -1259,6 +1265,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function(
 		"optimizer_memo_admission",
 		ToronContext::optimizer_memo_admission,
+	)?;
+	m.associated_function(
+		"optimizer_probe_linearity_fences",
+		ToronContext::optimizer_probe_linearity_fences,
 	)?;
 	m.associated_function("sql", ToronContext::sql)?;
 	m.associated_function("alias", RuneDataFrame::alias)?;

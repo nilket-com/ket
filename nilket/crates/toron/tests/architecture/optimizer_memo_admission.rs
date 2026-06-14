@@ -237,7 +237,8 @@ pub(crate) fn adr223_no_receipt_gate_manifest_change() {
 		assert_eq!(rows.matches(gate).count(), 1, "receipt gate {gate}");
 	}
 	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION_TABLE"));
-	assert_eq!(enum_variant_count(&system_table_kind), 12);
+	assert_eq!(enum_variant_count(&system_table_kind), 13);
+	assert!(system_table_kind.contains("InformationSchemaOptimizerProbeLinearityFences"));
 }
 
 #[test]
@@ -411,7 +412,8 @@ pub(crate) fn adr224_no_new_window_key_counter_flush_or_wendelon_surface() {
 
 	assert!(window_keys.contains("all_verdict_counter_keys"));
 	assert!(window_keys.contains("all_decision_counter_keys"));
-	assert!(tests.contains("assert_eq!(window_keys.len(), 440)"));
+	assert!(window_keys.contains("all_probe_linearity_counter_keys"));
+	assert!(tests.contains("assert_eq!(window_keys.len(), 468)"));
 	assert!(!window_keys.contains("group"));
 	assert!(!window_keys.contains("recency"));
 	assert!(!window_keys.contains("admission"));
@@ -657,7 +659,8 @@ pub(crate) fn adr225_no_new_system_table_kind_receipt_gate_or_220_schema_change(
 		"pub(super) fn information_schema_optimizer_decision_conflict_rows",
 	);
 
-	assert_eq!(enum_variant_count(&system_table_kind), 12);
+	assert_eq!(enum_variant_count(&system_table_kind), 13);
+	assert!(system_table_kind.contains("InformationSchemaOptimizerProbeLinearityFences"));
 	assert!(decision_conflicts_schema.contains("blocked_or_near_miss_count"));
 	assert!(!decision_conflicts_schema.contains("blocker_class"));
 	assert!(!decision_conflicts_schema.contains("margin_blocked_count"));

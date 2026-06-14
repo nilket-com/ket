@@ -97,22 +97,22 @@ pub(crate) fn adr227_both_consumers_share_single_linearity_classifier() {
 }
 
 #[test]
-pub(crate) fn adr227_no_plan_fragmenter_or_durable_change() {
+pub(crate) fn adr227_plan_fragmenter_stays_probe_linearity_free_after_adr229_readout() {
 	let manifest = manifest_dir();
 	for relative in [
 		"src/distributed/fragment.rs",
-		"src/binder/runtime_evidence.rs",
-		"src/binder/decision_log.rs",
-		"src/ir/execution.rs",
+		"src/distributed/scheduler.rs",
+		"src/exec.rs",
+		"src/wire.rs",
 	] {
 		let source = std::fs::read_to_string(manifest.join(relative)).expect("read source");
 		assert!(
 			!source.contains("ProbeLinearity") && !source.contains("ProbeLinearityFence"),
-			"ADR227 probe-linearity cause leaked into {relative}"
+			"ADR227/229 probe-linearity cause leaked into execution surface {relative}"
 		);
 		assert!(
 			!source.contains("probe_not_scan_linear:"),
-			"ADR227 rendered receipt detail leaked into durable/runtime surface {relative}"
+			"ADR227 rendered receipt detail leaked into execution surface {relative}"
 		);
 	}
 }
@@ -136,6 +136,142 @@ pub(crate) fn adr227_no_new_decision_reason_matrix_stays_140_220() {
 			"ADR227 fence {fence} must not become a durable decision reason"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr229_probe_linearity_fences_are_explicit_information_schema_surface() {
+	let binder = binder_root_source();
+	let execution = execution_source();
+	let explain = std::fs::read_to_string(manifest_dir().join("src/binder/explain.rs"))
+		.expect("read explain source");
+	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
+	let schema = source_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_probe_linearity_fences_schema",
+	);
+	let rows = source_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_probe_linearity_fence_rows",
+	);
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_PROBE_LINEARITY_FENCES_TABLE"));
+	assert!(binder.contains("information_schema.optimizer_probe_linearity_fences"));
+	assert!(execution.contains("InformationSchemaOptimizerProbeLinearityFences"));
+	assert!(
+		bind_relation.contains("SystemTableKind::InformationSchemaOptimizerProbeLinearityFences")
+	);
+	assert!(bind_relation.contains("runtime_evidence"));
+	assert!(bind_relation.contains("probe_linearity_fence_snapshot()"));
+	assert!(bind_relation.contains("information_schema_optimizer_probe_linearity_fences_schema"));
+	assert!(bind_relation.contains("information_schema_optimizer_probe_linearity_fence_rows"));
+	for column in [
+		"consumer",
+		"fence",
+		"recent_count",
+		"lifetime_count",
+		"consumer_recent_total",
+		"consumer_lifetime_total",
+		"recent_share_per_mille",
+		"status",
+		"reason",
+		"next_cut",
+	] {
+		assert!(schema.contains(column), "schema is missing {column}");
+		assert!(rows.contains(column), "row projection is missing {column}");
+	}
+}
+
+#[test]
+pub(crate) fn adr229_probe_linearity_fence_manifest_is_fixed_two_by_seven() {
+	let binder = binder_source();
+	let decision_log = std::fs::read_to_string(manifest_dir().join("src/binder/decision_log.rs"))
+		.expect("read decision log");
+	let runtime_evidence =
+		std::fs::read_to_string(manifest_dir().join("src/binder/runtime_evidence.rs"))
+			.expect("read runtime evidence");
+	let consumers = source_block(
+		&decision_log,
+		"pub(crate) fn optimizer_probe_linearity_consumers",
+	);
+	let fences = source_block(&binder, "pub(crate) fn probe_linearity_fences");
+	let all_keys = source_block(
+		&runtime_evidence,
+		"pub(crate) fn all_probe_linearity_counter_keys",
+	);
+	let tests = source_block(
+		&runtime_evidence,
+		"fn adr229_probe_linearity_keys_are_fixed_14_key_detail_matrix",
+	);
+
+	assert_eq!(
+		consumers
+			.matches("OptimizerProbeLinearityConsumer::")
+			.count(),
+		2
+	);
+	assert_eq!(fences.matches("ProbeLinearityFence::").count(), 7);
+	assert!(all_keys.contains("optimizer_probe_linearity_consumers()"));
+	assert!(all_keys.contains("probe_linearity_fences()"));
+	assert!(tests.contains("assert_eq!(keys.len(), 14)"));
+	assert!(tests.contains("hash_fallback/non_broadcast_join"));
+	assert!(tests.contains("star_decline/sort"));
+}
+
+#[test]
+pub(crate) fn adr229_probe_linearity_durable_namespace_is_separate_from_220_matrix() {
+	super::optimizer_accrual::adr216_decision_matrix_is_140_keys_and_evidence_matrix_220();
+	let runtime_evidence =
+		std::fs::read_to_string(manifest_dir().join("src/binder/runtime_evidence.rs"))
+			.expect("read runtime evidence");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let decision_keys = source_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
+	let verdict_keys = source_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+	let probe_keys = source_block(
+		&runtime_evidence,
+		"pub(crate) fn all_probe_linearity_counter_keys",
+	);
+	let window_keys = source_block(&runtime_evidence, "pub(crate) fn all_window_counter_keys");
+	let flush = source_block(
+		&runtime_evidence,
+		"pub async fn flush_probe_linearity_deltas",
+	);
+
+	assert!(runtime_evidence.contains("OPTIMIZER_PROBE_LINEARITY_EVIDENCE_KEY_PREFIX"));
+	assert!(runtime_evidence.contains("optimizer_evidence/probe_linearity/"));
+	assert!(!decision_keys.contains("probe_linearity"));
+	assert!(!verdict_keys.contains("probe_linearity"));
+	assert!(probe_keys.contains("probe_linearity_counter_key"));
+	assert!(window_keys.contains("OptimizerEvidenceWindowCounterKey::ProbeLinearityFence"));
+	assert!(window_keys.contains("all_probe_linearity_counter_keys"));
+	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
+	assert!(daemon.contains("flush_probe_linearity_deltas().await"));
+}
+
+#[test]
+pub(crate) fn adr229_probe_linearity_recording_is_committed_consumer_side_only() {
+	let binder = binder_root_source();
+	let join = binder_source();
+	let join_order = std::fs::read_to_string(manifest_dir().join("src/binder/join_order.rs"))
+		.expect("read join_order");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
+	let choose_auto = source_block(&join, "fn choose_auto_join_strategy");
+	let star_decline = source_block(&join_order, "fn accrue_star_order_decline");
+	let analyze = source_block(&join_order, "pub(super) fn analyze");
+
+	let receipt_pos = bind_scoped_join
+		.find("trace.join_decisions.push(DecisionReceipt")
+		.expect("bind_scoped_join should commit the join receipt");
+	let detail_pos = bind_scoped_join
+		.find("OptimizerProbeLinearityConsumer::HashFallback")
+		.expect("bind_scoped_join should record hash-fallback detail");
+	assert!(receipt_pos < detail_pos);
+	assert!(bind_scoped_join.contains("OptimizerProbeLinearityConsumer::HashFallback"));
+	assert!(bind_scoped_join.contains("record_probe_linearity_fence"));
+	assert!(!choose_auto.contains("record_probe_linearity_fence"));
+	assert!(star_decline.contains("OptimizerProbeLinearityConsumer::StarDecline"));
+	assert!(star_decline.contains("record_probe_linearity_fence"));
+	assert!(!analyze.contains("record_probe_linearity_fence"));
 }
 
 #[test]

@@ -34,7 +34,9 @@ pub(crate) fn adr222_window_keys_are_separate_namespace_not_in_220_matrix() {
 	assert!(window_key.contains("decision_counter_suffix"));
 	assert!(window_keys.contains("all_verdict_counter_keys"));
 	assert!(window_keys.contains("all_decision_counter_keys"));
-	assert!(tests.contains("assert_eq!(window_keys.len(), 440)"));
+	assert!(window_keys.contains("all_probe_linearity_counter_keys"));
+	assert!(tests.contains("assert_eq!(window_keys.len(), 468)"));
+	assert!(tests.contains("assert_eq!(all_probe_linearity_counter_keys().len(), 14)"));
 	assert!(tests.contains("assert_eq!(all_verdict_counter_keys().len(), 80)"));
 	assert!(tests.contains("assert_eq!(all_decision_counter_keys().len(), 140)"));
 }
@@ -163,6 +165,7 @@ pub(crate) fn adr222_no_new_information_schema_or_system_table_kind() {
 	assert!(!binder.contains("optimizer_evidence_windows"));
 	assert!(!execution.contains("OptimizerEvidenceWindow"));
 	assert!(!explain.contains("optimizer_evidence_window"));
-	assert_eq!(enum_variant_count(&system_table_kind), 12);
+	assert_eq!(enum_variant_count(&system_table_kind), 13);
 	assert!(system_table_kind.contains("InformationSchemaOptimizerMemoAdmission"));
+	assert!(system_table_kind.contains("InformationSchemaOptimizerProbeLinearityFences"));
 }

@@ -310,6 +310,7 @@ impl ToronDaemon {
 					_ = &mut evidence_refresh_shutdown_rx => break,
 					_ = refresh_interval.tick() => {
 						refresh_runtime_evidence.flush_decision_deltas().await;
+						refresh_runtime_evidence.flush_probe_linearity_deltas().await;
 						refresh_runtime_evidence.flush_window_deltas().await;
 						let _ = refresh_runtime_evidence.refresh_durable_cache().await;
 					}
