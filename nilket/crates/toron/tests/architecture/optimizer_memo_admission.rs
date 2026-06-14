@@ -423,6 +423,250 @@ pub(crate) fn adr224_no_memo_engine_or_policy_consumer() {
 }
 
 #[test]
+pub(crate) fn adr225_memo_admission_adds_blocker_class_columns_after_existing_schema() {
+	let explain = source("src/binder/explain.rs");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_memo_admission_schema",
+	);
+	let rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_memo_admission_rows",
+	);
+
+	let expected_order = [
+		"decision_kind",
+		"provenance",
+		"admission_status",
+		"conflict_strength",
+		"recent_window",
+		"stale_lifetime",
+		"lifetime_total",
+		"bounded_candidate_count",
+		"evidence_health",
+		"reason",
+		"next_cut",
+		"blocker_class",
+		"margin_blocked_count",
+		"hard_decline_count",
+		"capability_decline_count",
+		"top_decline_reason",
+		"top_decline_count",
+	];
+	let mut previous = 0;
+	for column in expected_order {
+		let position = schema
+			.find(column)
+			.unwrap_or_else(|| panic!("schema missing {column}"));
+		assert!(
+			position >= previous,
+			"schema column {column} moved before prior column"
+		);
+		previous = position;
+		assert!(rows.contains(column), "row projection missing {column}");
+	}
+	assert!(rows.contains("admission_blocker_class_label(row.blocker_class)"));
+	assert!(rows.contains("row.top_decline_reason"));
+}
+
+#[test]
+pub(crate) fn adr225_conflict_report_preserves_blocked_or_near_miss_aggregate() {
+	let join_order = source("src/binder/join_order.rs");
+	let report = first_block(&join_order, "pub(crate) struct DecisionConflictReport");
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
+	let relevant = first_block(&join_order, "fn conflict_relevant_decision_count");
+	let decision_conflicts = source("src/binder/explain.rs");
+	let schema = first_block(
+		&decision_conflicts,
+		"pub(super) fn information_schema_optimizer_decision_conflicts_schema",
+	);
+
+	assert!(report.contains("blocked_or_near_miss_count"));
+	assert!(report.contains("margin_blocked_count"));
+	assert!(report.contains("hard_decline_count"));
+	assert!(report.contains("capability_decline_count"));
+	assert!(shared.contains("let blocked_or_near_miss_count = accumulator"));
+	assert!(shared.contains(".saturating_add(declined_count)"));
+	assert!(shared.contains(
+		"let conflict_strength = accumulator.reordered_count.min(blocked_or_near_miss_count)"
+	));
+	assert!(relevant.contains("report.blocked_or_near_miss_count"));
+	assert!(schema.contains("blocked_or_near_miss_count"));
+	assert!(!schema.contains("margin_blocked_count"));
+	assert!(!schema.contains("hard_decline_count"));
+	assert!(!schema.contains("capability_decline_count"));
+}
+
+#[test]
+pub(crate) fn adr225_blocker_class_reuses_existing_decision_rows_not_new_evidence() {
+	let join_order = source("src/binder/join_order.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let from_rows = first_block(&join_order, "fn decision_conflict_reports_from_rows");
+	let classifier = first_block(&join_order, "fn admission_blocker_class(");
+
+	assert!(from_rows.contains("OptimizerDecisionOutcome::KeptThinMargin"));
+	assert!(from_rows.contains("OptimizerDecisionOutcome::Declined(reason)"));
+	assert!(from_rows.contains("decline_counts"));
+	assert!(classifier.contains("report.margin_blocked_count"));
+	assert!(classifier.contains("report.hard_decline_count"));
+	assert!(classifier.contains("report.capability_decline_count"));
+	assert!(!runtime_evidence.contains("blocker_class"));
+	assert!(!runtime_evidence.contains("margin_blocked_count"));
+	assert!(!runtime_evidence.contains("hard_decline_count"));
+	assert!(!runtime_evidence.contains("capability_decline_count"));
+}
+
+#[test]
+pub(crate) fn adr225_blocker_class_splits_margin_hard_and_capability() {
+	let join_order = source("src/binder/join_order.rs");
+	let split = first_block(&join_order, "fn decline_blocker_class");
+	let classifier = first_block(&join_order, "fn admission_blocker_class(");
+	let label = first_block(&join_order, "pub(crate) fn admission_blocker_class_label");
+
+	assert!(split.contains("NonInnerEquiJoin"));
+	assert!(split.contains("MissingRelationLabel"));
+	assert!(split.contains("DuplicateDimension"));
+	assert!(split.contains("MissingEstimate"));
+	assert!(split.contains("MixedStrategyStar"));
+	assert!(split.contains("MultipleProbeRelations"));
+	assert!(split.contains("ProbeNotScanLinear"));
+	assert!(!split.contains("_ =>"));
+	assert!(classifier.contains("margin_ready"));
+	assert!(classifier.contains("hard_ready"));
+	assert!(classifier.contains("capability_ready"));
+	assert!(classifier.contains("ready_count != 1"));
+	for token in [
+		"not_conflicted",
+		"margin_limited",
+		"hard_limited",
+		"capability_limited",
+		"mixed_blocker",
+	] {
+		assert!(label.contains(token), "missing blocker label {token}");
+	}
+}
+
+#[test]
+pub(crate) fn adr225_star_family_conflicts_are_never_margin_limited() {
+	let join_order = source("src/binder/join_order.rs");
+	let classifier = first_block(&join_order, "fn admission_blocker_class(");
+	let graph_family = first_block(&join_order, "fn graph_family_decision_kind");
+
+	assert!(classifier.contains("graph_family_decision_kind(report.kind)"));
+	assert!(graph_family.contains("OptimizerDecisionKind::GalaxyRoot"));
+	assert!(graph_family.contains("OptimizerDecisionKind::BridgeRoot"));
+	assert!(graph_family.contains("OptimizerDecisionKind::BridgeChainRoot"));
+	for kind in [
+		"StarCandidate",
+		"FlatStar",
+		"SnowflakeRoot",
+		"SnowflakeBranch",
+	] {
+		assert!(
+			!graph_family.contains(kind),
+			"star family kind {kind} must not be margin-limited"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr225_capability_class_does_not_create_admissible_without_contract() {
+	adr224_no_admissible_rows_without_bounded_candidate_contract();
+	let join_order = source("src/binder/join_order.rs");
+	let row = first_block(&join_order, "fn optimizer_memo_admission_row(");
+	let contract = first_block(&join_order, "fn bounded_admission_candidate_contract");
+	let reasons = first_block(&join_order, "fn blocked_shape_reason_next_cut");
+
+	assert!(row.contains("contract.bounded_candidate_count >= 2"));
+	assert!(row.contains("OptimizerAdmissionStatus::Admissible"));
+	assert!(row.contains("blocked_shape_reason_next_cut(blocker_class)"));
+	assert!(reasons.contains("AdmissionBlockerClass::CapabilityLimited"));
+	assert!(reasons.contains("bounded_candidate_contract_investigation"));
+	assert!(contract.contains("bounded_candidate_count: 0"));
+	assert!(!contract.contains("capability_limited"));
+}
+
+#[test]
+pub(crate) fn adr225_decline_next_cut_is_investigation_not_generation() {
+	let join_order = source("src/binder/join_order.rs");
+	let reasons = first_block(&join_order, "fn blocked_shape_reason_next_cut");
+
+	assert!(reasons.contains("bounded_candidate_contract_investigation"));
+	assert!(reasons.contains("margin_policy_tuning"));
+	assert!(reasons.contains("hard_blocker_resolution"));
+	assert!(reasons.contains("blocker_class_detail"));
+	assert!(!reasons.contains("candidate_generation"));
+	assert!(!reasons.contains("bounded_candidate_generation"));
+}
+
+#[test]
+pub(crate) fn adr225_blocker_class_does_not_change_status_precedence() {
+	let join_order = source("src/binder/join_order.rs");
+	let row = first_block(&join_order, "fn optimizer_memo_admission_row(");
+
+	let conflict = row
+		.find("report.status != DecisionConflictStatus::Conflicted")
+		.expect("conflict status branch");
+	let recent = row
+		.find("recent_report.status != DecisionConflictStatus::Conflicted")
+		.expect("recent status branch");
+	let health = row
+		.find("snapshot.health.state != OptimizerEvidenceState::Ok")
+		.expect("health branch");
+	let contract = row
+		.find("contract.bounded_candidate_count >= 2")
+		.expect("contract branch");
+	let blocked = row
+		.find("blocked_shape_reason_next_cut(blocker_class)")
+		.expect("blocked class reason branch");
+
+	assert!(conflict < recent);
+	assert!(recent < health);
+	assert!(health < contract);
+	assert!(contract < blocked);
+	assert!(row.contains("let blocker_class = admission_blocker_class(report)"));
+}
+
+#[test]
+pub(crate) fn adr225_no_generic_memo_engine_or_cascades_surface() {
+	adr223_no_memo_engine_or_policy_consumer();
+}
+
+#[test]
+pub(crate) fn adr225_no_policy_consumer_or_actuation_reader() {
+	adr223_no_memo_engine_or_policy_consumer();
+}
+
+#[test]
+pub(crate) fn adr225_no_new_durable_key_counter_flush_or_wendelon_surface() {
+	adr223_no_new_durable_key_counter_flush_or_wendelon_surface();
+}
+
+#[test]
+pub(crate) fn adr225_no_new_system_table_kind_receipt_gate_or_220_schema_change() {
+	adr223_no_receipt_gate_manifest_change();
+	let execution = source("src/ir/execution.rs");
+	let system_table_kind = first_block(&execution, "pub enum SystemTableKind");
+	let explain = source("src/binder/explain.rs");
+	let decision_conflicts_schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_decision_conflicts_schema",
+	);
+	let decision_conflicts_rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_decision_conflict_rows",
+	);
+
+	assert_eq!(enum_variant_count(&system_table_kind), 12);
+	assert!(decision_conflicts_schema.contains("blocked_or_near_miss_count"));
+	assert!(!decision_conflicts_schema.contains("blocker_class"));
+	assert!(!decision_conflicts_schema.contains("margin_blocked_count"));
+	assert!(!decision_conflicts_schema.contains("hard_decline_count"));
+	assert!(!decision_conflicts_schema.contains("capability_decline_count"));
+	assert!(!decision_conflicts_rows.contains("admission_blocker_class"));
+}
+
+#[test]
 pub(crate) fn memo_admission_adds_no_durable_key_counter_or_flush() {
 	adr223_no_new_durable_key_counter_flush_or_wendelon_surface();
 }

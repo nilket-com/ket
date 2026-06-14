@@ -395,6 +395,12 @@ pub(super) fn information_schema_optimizer_memo_admission_schema() -> SchemaRef 
 		Field::new("evidence_health", DataType::Utf8, false),
 		Field::new("reason", DataType::Utf8, false),
 		Field::new("next_cut", DataType::Utf8, false),
+		Field::new("blocker_class", DataType::Utf8, false),
+		Field::new("margin_blocked_count", DataType::Int64, false),
+		Field::new("hard_decline_count", DataType::Int64, false),
+		Field::new("capability_decline_count", DataType::Int64, false),
+		Field::new("top_decline_reason", DataType::Utf8, false),
+		Field::new("top_decline_count", DataType::Int64, false),
 	]))
 }
 
@@ -436,6 +442,31 @@ pub(super) fn information_schema_optimizer_memo_admission_rows(
 			ScalarValue::Utf8(Some(row.evidence_health.clone())),
 			ScalarValue::Utf8(Some(row.reason.clone())),
 			ScalarValue::Utf8(Some(row.next_cut.to_string())),
+			ScalarValue::Utf8(Some(
+				admission_blocker_class_label(row.blocker_class).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.margin_blocked_count,
+				"optimizer memo admission margin_blocked_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.hard_decline_count,
+				"optimizer memo admission hard_decline_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.capability_decline_count,
+				"optimizer memo admission capability_decline_count",
+			)?)),
+			ScalarValue::Utf8(Some(
+				row.top_decline_reason
+					.map(optimizer_decision_decline_reason_label)
+					.unwrap_or("")
+					.to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.top_decline_count,
+				"optimizer memo admission top_decline_count",
+			)?)),
 		]);
 	}
 	Ok(rendered)

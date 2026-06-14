@@ -15591,6 +15591,19 @@ async fn optimizer_memo_admission_projects_static_14_rows() {
 	assert!(rows.iter().all(|row| memo_admission_i64(row, 7) == 0));
 	assert!(
 		rows.iter()
+			.all(|row| memo_admission_utf8(row, 11) == "not_conflicted")
+	);
+	assert!(rows.iter().all(|row| {
+		[12, 13, 14, 16]
+			.into_iter()
+			.all(|index| memo_admission_i64(row, index) == 0)
+	}));
+	assert!(
+		rows.iter()
+			.all(|row| memo_admission_utf8(row, 15).is_empty())
+	);
+	assert!(
+		rows.iter()
 			.all(|row| memo_admission_utf8(row, 10) == "decision_conflict_pressure")
 	);
 
@@ -15975,14 +15988,12 @@ async fn memo_admission_blocked_shape_when_conflicted_recent_and_healthy() {
 	assert_eq!(memo_admission_i64(row, 6), 40);
 	assert_eq!(memo_admission_i64(row, 7), 0);
 	assert_eq!(memo_admission_utf8(row, 8), "local_only/ok");
-	assert_eq!(
-		memo_admission_utf8(row, 9),
-		"bounded_candidate_contract_unbuilt"
-	);
-	assert_eq!(
-		memo_admission_utf8(row, 10),
-		"bounded_conflict_candidate_contract"
-	);
+	assert_eq!(memo_admission_utf8(row, 9), "mixed_blocker_class");
+	assert_eq!(memo_admission_utf8(row, 10), "blocker_class_detail");
+	assert_eq!(memo_admission_utf8(row, 11), "mixed_blocker");
+	assert_eq!(memo_admission_i64(row, 12), 20);
+	assert_eq!(memo_admission_i64(row, 13), 0);
+	assert_eq!(memo_admission_i64(row, 14), 0);
 	assert!(
 		rows.iter()
 			.all(|row| memo_admission_utf8(row, 2) != "admissible")
@@ -16008,6 +16019,321 @@ async fn memo_admission_blocked_shape_when_same_group_conflict_is_recent() {
 	assert_eq!(memo_admission_i64(row, 5), 0);
 	assert_eq!(memo_admission_i64(row, 6), 40);
 	assert_eq!(memo_admission_i64(row, 7), 0);
+	assert_eq!(memo_admission_utf8(row, 11), "mixed_blocker");
+}
+
+#[tokio::test]
+async fn memo_admission_margin_limited_conflict_points_to_margin_tuning() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "galaxy_root", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(row, 7), 0);
+	assert_eq!(memo_admission_utf8(row, 9), "margin_limited_blocker");
+	assert_eq!(memo_admission_utf8(row, 10), "margin_policy_tuning");
+	assert_eq!(memo_admission_utf8(row, 11), "margin_limited");
+	assert_eq!(memo_admission_i64(row, 12), 20);
+	assert_eq!(memo_admission_i64(row, 13), 0);
+	assert_eq!(memo_admission_i64(row, 14), 0);
+	assert_eq!(memo_admission_utf8(row, 15), "");
+	assert_eq!(memo_admission_i64(row, 16), 0);
+}
+
+#[tokio::test]
+async fn memo_admission_hard_limited_conflict_points_to_hard_blocker_resolution() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_declined_conflict_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionDeclineReason::MissingEstimate,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "flat_star", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_utf8(row, 9), "hard_limited_blocker");
+	assert_eq!(memo_admission_utf8(row, 10), "hard_blocker_resolution");
+	assert_eq!(memo_admission_utf8(row, 11), "hard_limited");
+	assert_eq!(memo_admission_i64(row, 12), 0);
+	assert_eq!(memo_admission_i64(row, 13), 20);
+	assert_eq!(memo_admission_i64(row, 14), 0);
+	assert_eq!(memo_admission_utf8(row, 15), "missing_estimate");
+	assert_eq!(memo_admission_i64(row, 16), 20);
+}
+
+#[tokio::test]
+async fn memo_admission_capability_limited_conflict_points_to_contract_investigation() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_declined_conflict_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionDeclineReason::MultipleProbeRelations,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "flat_star", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(row, 7), 0);
+	assert_eq!(memo_admission_utf8(row, 9), "capability_limited_blocker");
+	assert_eq!(
+		memo_admission_utf8(row, 10),
+		"bounded_candidate_contract_investigation"
+	);
+	assert_eq!(memo_admission_utf8(row, 11), "capability_limited");
+	assert_eq!(memo_admission_i64(row, 12), 0);
+	assert_eq!(memo_admission_i64(row, 13), 0);
+	assert_eq!(memo_admission_i64(row, 14), 20);
+	assert_eq!(memo_admission_utf8(row, 15), "multiple_probe_relations");
+	assert_eq!(memo_admission_i64(row, 16), 20);
+}
+
+#[tokio::test]
+async fn memo_admission_mixed_blocker_does_not_overclaim_capability() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MultipleProbeRelations),
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "galaxy_root", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_utf8(row, 9), "mixed_blocker_class");
+	assert_eq!(memo_admission_utf8(row, 10), "blocker_class_detail");
+	assert_eq!(memo_admission_utf8(row, 11), "mixed_blocker");
+	assert_eq!(memo_admission_i64(row, 12), 20);
+	assert_eq!(memo_admission_i64(row, 13), 0);
+	assert_eq!(memo_admission_i64(row, 14), 20);
+}
+
+#[tokio::test]
+async fn memo_admission_star_family_is_never_margin_limited() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "flat_star", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_utf8(row, 11), "mixed_blocker");
+	assert_ne!(memo_admission_utf8(row, 11), "margin_limited");
+	assert_eq!(memo_admission_i64(row, 12), 20);
+}
+
+#[tokio::test]
+async fn memo_admission_blocker_class_does_not_bypass_stale_recency() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_declined_conflict_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionDeclineReason::MultipleProbeRelations,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "flat_star", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "stale_evidence");
+	assert_eq!(memo_admission_utf8(row, 10), "per_group_window_recency");
+	assert_eq!(memo_admission_utf8(row, 11), "capability_limited");
+	assert_eq!(memo_admission_i64(row, 14), 20);
+}
+
+#[test]
+fn memo_admission_blocker_class_does_not_bypass_degraded_health() {
+	use super::runtime_evidence::{
+		OptimizerEvidenceMode, OptimizerEvidenceState, OptimizerEvidenceWindowId,
+		OptimizerEvidenceWindowSnapshot, OptimizerReceiptGateSnapshot,
+	};
+
+	let decisions = vec![
+		OptimizerDecisionRow {
+			kind: OptimizerDecisionKind::FlatStar,
+			outcome: OptimizerDecisionOutcome::Reordered,
+			provenance: OptimizerRuntimeVerdictProvenance::Native,
+			count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		},
+		OptimizerDecisionRow {
+			kind: OptimizerDecisionKind::FlatStar,
+			outcome: OptimizerDecisionOutcome::Declined(
+				OptimizerDecisionDeclineReason::MultipleProbeRelations,
+			),
+			provenance: OptimizerRuntimeVerdictProvenance::Native,
+			count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		},
+	];
+	let snapshot = OptimizerReceiptGateSnapshot {
+		verdicts: Vec::new(),
+		decisions: decisions.clone(),
+		recent_decisions: decisions,
+		health: OptimizerEvidenceStatusSnapshot {
+			mode: OptimizerEvidenceMode::Degraded,
+			state: OptimizerEvidenceState::Stale,
+			pending_deltas: 0,
+			dropped_deltas: 0,
+			ambiguous_deltas: 0,
+			refresh_failures: 1,
+			last_error: Some("fixture".to_string()),
+		},
+		window: OptimizerEvidenceWindowSnapshot {
+			current_window: OptimizerEvidenceWindowId(10),
+			previous_window: OptimizerEvidenceWindowId(9),
+			recent_count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2,
+			stale_lifetime_count: 0,
+			lifetime_count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2,
+		},
+	};
+
+	let rows = information_schema_optimizer_memo_admission_rows(
+		&optimizer_memo_admission_rows_from_snapshot(&snapshot),
+	)
+	.expect("render optimizer memo admission rows");
+	let row = memo_admission_row(&rows, "flat_star", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "degraded_evidence");
+	assert_eq!(
+		memo_admission_utf8(row, 10),
+		"durable_optimizer_evidence_health"
+	);
+	assert_eq!(memo_admission_utf8(row, 11), "capability_limited");
+	assert_eq!(memo_admission_i64(row, 14), 20);
+}
+
+#[tokio::test]
+async fn memo_admission_blocker_columns_are_additive_to_existing_schema() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_memo_admission")
+		.expect("plan optimizer memo admission");
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind optimizer memo admission");
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		panic!("expected optimizer memo admission system table");
+	};
+	assert_eq!(
+		field_names(&schema),
+		vec![
+			"decision_kind",
+			"provenance",
+			"admission_status",
+			"conflict_strength",
+			"recent_window",
+			"stale_lifetime",
+			"lifetime_total",
+			"bounded_candidate_count",
+			"evidence_health",
+			"reason",
+			"next_cut",
+			"blocker_class",
+			"margin_blocked_count",
+			"hard_decline_count",
+			"capability_decline_count",
+			"top_decline_reason",
+			"top_decline_count",
+		]
+	);
+	assert_eq!(rows[0].len(), 17);
+}
+
+#[tokio::test]
+async fn optimizer_decision_conflicts_220_schema_unchanged() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_decision_conflicts")
+		.expect("plan optimizer decision conflicts");
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind optimizer decision conflicts");
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		panic!("expected optimizer decision conflicts system table");
+	};
+	assert_eq!(
+		field_names(&schema),
+		vec![
+			"decision_kind",
+			"provenance",
+			"status",
+			"reordered_count",
+			"kept_optimal_count",
+			"kept_thin_margin_count",
+			"declined_count",
+			"blocked_or_near_miss_count",
+			"total_count",
+			"conflict_strength",
+			"top_decline_reason",
+			"top_decline_count",
+			"evidence_health",
+			"reason",
+			"next_cut",
+		]
+	);
+	assert_eq!(rows[0].len(), 15);
 }
 
 #[test]
@@ -16238,6 +16564,42 @@ async fn rune_queries_optimizer_memo_admission_with_group_recency() {
 	let plan = bind(&logical, &catalog, &config)
 		.await
 		.expect("bind Rune optimizer memo admission group recency report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer memo admission system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerMemoAdmission
+	);
+	assert_eq!(rows, sql_rows);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_memo_admission_with_blocker_class() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	record_declined_conflict_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionDeclineReason::MultipleProbeRelations,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	let sql_rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&sql_rows, "flat_star", "native");
+	assert_eq!(memo_admission_utf8(row, 11), "capability_limited");
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_memo_admission")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer memo admission blocker class report");
 	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
 		panic!("expected Rune optimizer memo admission system table");
 	};
@@ -18996,6 +19358,28 @@ fn record_conflicted_decisions(
 		evidence,
 		kind,
 		OptimizerDecisionOutcome::KeptThinMargin,
+		provenance,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+}
+
+fn record_declined_conflict_decisions(
+	evidence: &OptimizerRuntimeEvidence,
+	kind: OptimizerDecisionKind,
+	reason: OptimizerDecisionDeclineReason,
+	provenance: OptimizerRuntimeVerdictProvenance,
+) {
+	record_decisions(
+		evidence,
+		kind,
+		OptimizerDecisionOutcome::Reordered,
+		provenance,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		evidence,
+		kind,
+		OptimizerDecisionOutcome::Declined(reason),
 		provenance,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
 	);

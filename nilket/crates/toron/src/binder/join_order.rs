@@ -539,6 +539,9 @@ pub(crate) struct DecisionConflictReport {
 	pub(crate) kept_optimal_count: u64,
 	pub(crate) kept_thin_margin_count: u64,
 	pub(crate) declined_count: u64,
+	pub(crate) margin_blocked_count: u64,
+	pub(crate) hard_decline_count: u64,
+	pub(crate) capability_decline_count: u64,
 	pub(crate) blocked_or_near_miss_count: u64,
 	pub(crate) total_count: u64,
 	pub(crate) conflict_strength: u64,
@@ -547,6 +550,25 @@ pub(crate) struct DecisionConflictReport {
 	pub(crate) evidence_health: String,
 	pub(crate) reason: String,
 	pub(crate) next_cut: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionBlockerClass {
+	NotConflicted,
+	MarginLimited,
+	HardLimited,
+	CapabilityLimited,
+	MixedBlocker,
+}
+
+pub(crate) fn admission_blocker_class_label(class: AdmissionBlockerClass) -> &'static str {
+	match class {
+		AdmissionBlockerClass::NotConflicted => "not_conflicted",
+		AdmissionBlockerClass::MarginLimited => "margin_limited",
+		AdmissionBlockerClass::HardLimited => "hard_limited",
+		AdmissionBlockerClass::CapabilityLimited => "capability_limited",
+		AdmissionBlockerClass::MixedBlocker => "mixed_blocker",
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +605,12 @@ pub(crate) struct OptimizerAdmissionRow {
 	pub(crate) evidence_health: String,
 	pub(crate) reason: String,
 	pub(crate) next_cut: &'static str,
+	pub(crate) blocker_class: AdmissionBlockerClass,
+	pub(crate) margin_blocked_count: u64,
+	pub(crate) hard_decline_count: u64,
+	pub(crate) capability_decline_count: u64,
+	pub(crate) top_decline_reason: Option<OptimizerDecisionDeclineReason>,
+	pub(crate) top_decline_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,6 +962,19 @@ fn decision_conflict_reports_from_rows(
 				.fold(0_u64, |acc, count| acc.saturating_add(*count));
 			let (top_decline_reason, top_decline_count) =
 				top_decision_conflict_decline(&accumulator.decline_counts);
+			let mut hard_decline_count = 0_u64;
+			let mut capability_decline_count = 0_u64;
+			for (reason, count) in &accumulator.decline_counts {
+				match decline_blocker_class(*reason) {
+					DeclineBlockerClass::Hard => {
+						hard_decline_count = hard_decline_count.saturating_add(*count);
+					}
+					DeclineBlockerClass::Capability => {
+						capability_decline_count = capability_decline_count.saturating_add(*count);
+					}
+				}
+			}
+			let margin_blocked_count = accumulator.kept_thin_margin_count;
 			let blocked_or_near_miss_count = accumulator
 				.kept_thin_margin_count
 				.saturating_add(declined_count);
@@ -956,6 +997,9 @@ fn decision_conflict_reports_from_rows(
 				kept_optimal_count: accumulator.kept_optimal_count,
 				kept_thin_margin_count: accumulator.kept_thin_margin_count,
 				declined_count,
+				margin_blocked_count,
+				hard_decline_count,
+				capability_decline_count,
 				blocked_or_near_miss_count,
 				total_count,
 				conflict_strength,
@@ -967,6 +1011,24 @@ fn decision_conflict_reports_from_rows(
 			}
 		})
 		.collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclineBlockerClass {
+	Hard,
+	Capability,
+}
+
+fn decline_blocker_class(reason: OptimizerDecisionDeclineReason) -> DeclineBlockerClass {
+	match reason {
+		OptimizerDecisionDeclineReason::NonInnerEquiJoin
+		| OptimizerDecisionDeclineReason::MissingRelationLabel
+		| OptimizerDecisionDeclineReason::DuplicateDimension
+		| OptimizerDecisionDeclineReason::MissingEstimate => DeclineBlockerClass::Hard,
+		OptimizerDecisionDeclineReason::MixedStrategyStar
+		| OptimizerDecisionDeclineReason::MultipleProbeRelations
+		| OptimizerDecisionDeclineReason::ProbeNotScanLinear => DeclineBlockerClass::Capability,
+	}
 }
 
 fn top_decision_conflict_decline(
@@ -1039,6 +1101,7 @@ fn optimizer_memo_admission_row(
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> OptimizerAdmissionRow {
 	let contract = bounded_admission_candidate_contract(report.kind, report.provenance);
+	let blocker_class = admission_blocker_class(report);
 	let recent_window = conflict_relevant_decision_count(recent_report);
 	let lifetime_total = conflict_relevant_decision_count(report);
 	let (admission_status, reason, next_cut) =
@@ -1067,11 +1130,8 @@ fn optimizer_memo_admission_row(
 				contract.next_cut,
 			)
 		} else {
-			(
-				OptimizerAdmissionStatus::BlockedShape,
-				contract.reason,
-				contract.next_cut,
-			)
+			let (reason, next_cut) = blocked_shape_reason_next_cut(blocker_class);
+			(OptimizerAdmissionStatus::BlockedShape, reason, next_cut)
 		};
 
 	OptimizerAdmissionRow {
@@ -1086,6 +1146,60 @@ fn optimizer_memo_admission_row(
 		evidence_health: evidence_health_label(&snapshot.health),
 		reason: reason.to_string(),
 		next_cut,
+		blocker_class,
+		margin_blocked_count: report.margin_blocked_count,
+		hard_decline_count: report.hard_decline_count,
+		capability_decline_count: report.capability_decline_count,
+		top_decline_reason: report.top_decline_reason,
+		top_decline_count: report.top_decline_count,
+	}
+}
+
+fn admission_blocker_class(report: &DecisionConflictReport) -> AdmissionBlockerClass {
+	if report.status != DecisionConflictStatus::Conflicted {
+		return AdmissionBlockerClass::NotConflicted;
+	}
+	let margin_ready = graph_family_decision_kind(report.kind)
+		&& report.margin_blocked_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE;
+	let hard_ready = report.hard_decline_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE;
+	let capability_ready = report.capability_decline_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE;
+	let ready_count = u8::from(margin_ready) + u8::from(hard_ready) + u8::from(capability_ready);
+	if ready_count != 1 {
+		return AdmissionBlockerClass::MixedBlocker;
+	}
+	if margin_ready {
+		AdmissionBlockerClass::MarginLimited
+	} else if hard_ready {
+		AdmissionBlockerClass::HardLimited
+	} else {
+		AdmissionBlockerClass::CapabilityLimited
+	}
+}
+
+fn graph_family_decision_kind(kind: OptimizerDecisionKind) -> bool {
+	matches!(
+		kind,
+		OptimizerDecisionKind::GalaxyRoot
+			| OptimizerDecisionKind::BridgeRoot
+			| OptimizerDecisionKind::BridgeChainRoot
+	)
+}
+
+fn blocked_shape_reason_next_cut(
+	blocker_class: AdmissionBlockerClass,
+) -> (&'static str, &'static str) {
+	match blocker_class {
+		AdmissionBlockerClass::MarginLimited => ("margin_limited_blocker", "margin_policy_tuning"),
+		AdmissionBlockerClass::HardLimited => ("hard_limited_blocker", "hard_blocker_resolution"),
+		AdmissionBlockerClass::CapabilityLimited => (
+			"capability_limited_blocker",
+			"bounded_candidate_contract_investigation",
+		),
+		AdmissionBlockerClass::MixedBlocker => ("mixed_blocker_class", "blocker_class_detail"),
+		AdmissionBlockerClass::NotConflicted => (
+			"requires_conflicted_decision_row",
+			"decision_conflict_pressure",
+		),
 	}
 }
 
