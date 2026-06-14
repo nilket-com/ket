@@ -17273,6 +17273,184 @@ async fn rune_queries_graph_margin_advisory() {
 }
 
 #[tokio::test]
+async fn rune_optimizer_readout_handles_match_ctx_sql_plan() {
+	for (handle, table, _) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let rune_logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+		let sql_logical = SqlPlanner::new()
+			.plan(&optimizer_readout_sql(table))
+			.unwrap_or_else(|error| panic!("plan SQL optimizer readout {table}: {error:?}"));
+
+		assert_optimizer_readout_scan_plan(&rune_logical, table);
+		assert_optimizer_readout_scan_plan(&sql_logical, table);
+		assert_eq!(format!("{rune_logical:?}"), format!("{sql_logical:?}"));
+	}
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_match_ctx_sql_rows() {
+	let catalog = star_join_order_catalog();
+	let config = optimizer_readout_seeded_config();
+
+	for (handle, table, expected_kind) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let rune_logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+		let sql_logical = SqlPlanner::new()
+			.plan(&optimizer_readout_sql(table))
+			.unwrap_or_else(|error| panic!("plan SQL optimizer readout {table}: {error:?}"));
+		let (rune_kind, rune_rows) = bind_optimizer_readout(&rune_logical, &catalog, &config).await;
+		let (sql_kind, sql_rows) = bind_optimizer_readout(&sql_logical, &catalog, &config).await;
+
+		assert_eq!(rune_kind, expected_kind);
+		assert_eq!(sql_kind, expected_kind);
+		assert_eq!(rune_rows, sql_rows, "row parity failed for {handle}");
+	}
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_bind_to_existing_system_tables() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+
+	for (handle, table, expected_kind) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+		let (kind, _) = bind_optimizer_readout(&logical, &catalog, &config).await;
+
+		assert_eq!(kind, expected_kind, "wrong system table kind for {table}");
+	}
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_are_composable() {
+	let catalog = MockCatalog::new();
+	let config = optimizer_readout_seeded_config();
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.optimizer_receipt_gates()
+               .filter(col("status").eq(lit_str("actionable")))
+               .project([col("gate_name"), col("status")])
+        }
+    "#,
+	)
+	.await;
+	let sql_logical = SqlPlanner::new()
+		.plan(
+			"SELECT gate_name, status \
+			 FROM information_schema.optimizer_receipt_gates \
+			 WHERE status = 'actionable'",
+		)
+		.expect("plan composable SQL optimizer receipt gates");
+
+	let rune_plan = bind(&rune_logical, &catalog, &config)
+		.await
+		.expect("bind composable Rune optimizer receipt gates");
+	let sql_plan = bind(&sql_logical, &catalog, &config)
+		.await
+		.expect("bind composable SQL optimizer receipt gates");
+
+	assert_eq!(format!("{rune_plan:?}"), format!("{sql_plan:?}"));
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_are_lazy_logical_plans() {
+	for (handle, table, _) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+
+		assert_optimizer_readout_scan_plan(&logical, table);
+	}
+}
+
+#[test]
+fn rune_optimizer_readout_handles_cover_exactly_the_seven_readout_tables() {
+	let actual = RUNE_OPTIMIZER_READOUT_HANDLES
+		.iter()
+		.map(|(handle, table, _)| (*handle, *table))
+		.collect::<Vec<_>>();
+
+	assert_eq!(
+		actual,
+		vec![
+			("optimizer_decisions", "optimizer_decisions"),
+			("optimizer_runtime_verdicts", "optimizer_runtime_verdicts"),
+			("optimizer_evidence_status", "optimizer_evidence_status"),
+			("optimizer_margin_advisory", "optimizer_margin_advisory"),
+			("optimizer_receipt_gates", "optimizer_receipt_gates"),
+			(
+				"optimizer_decision_conflicts",
+				"optimizer_decision_conflicts"
+			),
+			("optimizer_memo_admission", "optimizer_memo_admission"),
+		]
+	);
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_are_read_only() {
+	let catalog = MockCatalog::new();
+	let config = optimizer_readout_seeded_config();
+	let before = config.runtime_evidence.receipt_gate_snapshot();
+
+	for (handle, _, _) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+		let _ = bind_optimizer_readout(&logical, &catalog, &config).await;
+	}
+
+	assert_eq!(before, config.runtime_evidence.receipt_gate_snapshot());
+}
+
+#[tokio::test]
+async fn rune_optimizer_readout_handles_do_not_change_user_query_plans() {
+	let catalog = star_join_order_catalog();
+	let config = optimizer_readout_seeded_config();
+	let user_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders")
+               .filter(col("id").gt(lit_i64(10)))
+               .project([col("id"), col("customer_id")])
+        }
+    "#,
+	)
+	.await;
+	let (before_plan, before_trace) = bind_with_trace(&user_logical, &catalog, &config)
+		.await
+		.expect("bind user Rune query before readouts");
+
+	for (handle, _, _) in RUNE_OPTIMIZER_READOUT_HANDLES {
+		let logical = rune_plan(&optimizer_readout_handle_script(handle)).await;
+		let _ = bind_optimizer_readout(&logical, &catalog, &config).await;
+	}
+
+	let (after_plan, after_trace) = bind_with_trace(&user_logical, &catalog, &config)
+		.await
+		.expect("bind user Rune query after readouts");
+	assert_eq!(format!("{before_plan:?}"), format!("{after_plan:?}"));
+	assert_eq!(before_trace.join_decisions, after_trace.join_decisions);
+	assert_eq!(
+		before_trace.scan_filter_decisions,
+		after_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
+async fn ctx_table_remains_one_part_user_table_handle() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("information_schema.optimizer_decisions")
+        }
+    "#,
+	)
+	.await;
+	let LogicalPlan::ScanNamed { table, projection } = logical else {
+		panic!("expected one-part ctx.table ScanNamed");
+	};
+
+	assert_eq!(table.schema, None);
+	assert_eq!(table.table, "information_schema.optimizer_decisions");
+	assert_eq!(projection, None);
+}
+
+#[tokio::test]
 async fn rune_respects_operator_margin() {
 	let mut catalog = star_join_order_catalog();
 	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
@@ -19392,6 +19570,106 @@ async fn rune_plan(script: &str) -> LogicalPlan {
 		.execute_script(script, &config)
 		.await
 		.expect("Rune-authored plan")
+}
+
+const RUNE_OPTIMIZER_READOUT_HANDLES: [(&str, &str, SystemTableKind); 7] = [
+	(
+		"optimizer_decisions",
+		"optimizer_decisions",
+		SystemTableKind::InformationSchemaOptimizerDecisions,
+	),
+	(
+		"optimizer_runtime_verdicts",
+		"optimizer_runtime_verdicts",
+		SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts,
+	),
+	(
+		"optimizer_evidence_status",
+		"optimizer_evidence_status",
+		SystemTableKind::InformationSchemaOptimizerEvidenceStatus,
+	),
+	(
+		"optimizer_margin_advisory",
+		"optimizer_margin_advisory",
+		SystemTableKind::InformationSchemaOptimizerMarginAdvisory,
+	),
+	(
+		"optimizer_receipt_gates",
+		"optimizer_receipt_gates",
+		SystemTableKind::InformationSchemaOptimizerReceiptGates,
+	),
+	(
+		"optimizer_decision_conflicts",
+		"optimizer_decision_conflicts",
+		SystemTableKind::InformationSchemaOptimizerDecisionConflicts,
+	),
+	(
+		"optimizer_memo_admission",
+		"optimizer_memo_admission",
+		SystemTableKind::InformationSchemaOptimizerMemoAdmission,
+	),
+];
+
+fn optimizer_readout_handle_script(handle: &str) -> String {
+	format!("pub fn main(ctx) {{ ctx.{handle}() }}")
+}
+
+fn optimizer_readout_sql(table: &str) -> String {
+	format!("SELECT * FROM information_schema.{table}")
+}
+
+fn assert_optimizer_readout_scan_plan(logical: &LogicalPlan, table: &str) {
+	let LogicalPlan::ScanNamed {
+		table: actual,
+		projection,
+	} = logical
+	else {
+		panic!("expected optimizer readout ScanNamed, got {logical:?}");
+	};
+
+	assert_eq!(actual, &TableRef::with_schema("information_schema", table));
+	assert_eq!(projection, &None);
+}
+
+async fn bind_optimizer_readout(
+	logical: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> (SystemTableKind, Vec<Vec<ScalarValue>>) {
+	let plan = bind(logical, catalog, config)
+		.await
+		.expect("bind optimizer readout");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer readout system table, got {plan:?}");
+	};
+	(kind, rows)
+}
+
+fn optimizer_readout_seeded_config() -> PlannerConfig {
+	let config = PlannerConfig::default();
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerRuntimeVerdictClass::Vindicated,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	config
 }
 
 fn representative_estimate_batches(rows: usize) -> Vec<RecordBatch> {

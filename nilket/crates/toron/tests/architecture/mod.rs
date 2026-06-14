@@ -25,6 +25,7 @@ pub(crate) mod range_distribution;
 pub(crate) mod range_skew;
 pub(crate) mod ring_placement;
 pub(crate) mod rune_frontend;
+pub(crate) mod rune_optimizer_readouts;
 pub(crate) mod sql_planner_surface;
 pub(crate) mod storage_wendelon_boundary;
 pub(crate) mod support;

@@ -15,6 +15,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const RUNE_MAX_IN_LIST_ITEMS: usize = 32;
+const RUNE_INFORMATION_SCHEMA_NAMESPACE: &str = "information_schema";
+const RUNE_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
+const RUNE_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
+const RUNE_OPTIMIZER_EVIDENCE_STATUS_TABLE: &str = "optimizer_evidence_status";
+const RUNE_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
+const RUNE_OPTIMIZER_RECEIPT_GATES_TABLE: &str = "optimizer_receipt_gates";
+const RUNE_OPTIMIZER_DECISION_CONFLICTS_TABLE: &str = "optimizer_decision_conflicts";
+const RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE: &str = "optimizer_memo_admission";
+const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 7] = [
+	RUNE_OPTIMIZER_DECISIONS_TABLE,
+	RUNE_OPTIMIZER_RUNTIME_VERDICTS_TABLE,
+	RUNE_OPTIMIZER_EVIDENCE_STATUS_TABLE,
+	RUNE_OPTIMIZER_MARGIN_ADVISORY_TABLE,
+	RUNE_OPTIMIZER_RECEIPT_GATES_TABLE,
+	RUNE_OPTIMIZER_DECISION_CONFLICTS_TABLE,
+	RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE,
+];
 
 fn rune_compile_error(error: impl std::fmt::Display) -> FrontendError {
 	FrontendError::RuneCompile {
@@ -582,10 +599,48 @@ impl ToronContext {
 		RuneDataFrame::new(name)
 	}
 
+	pub fn optimizer_decisions(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_DECISIONS_TABLE)
+	}
+
+	pub fn optimizer_runtime_verdicts(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_RUNTIME_VERDICTS_TABLE)
+	}
+
+	pub fn optimizer_evidence_status(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_EVIDENCE_STATUS_TABLE)
+	}
+
+	pub fn optimizer_margin_advisory(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_MARGIN_ADVISORY_TABLE)
+	}
+
+	pub fn optimizer_receipt_gates(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_RECEIPT_GATES_TABLE)
+	}
+
+	pub fn optimizer_decision_conflicts(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_DECISION_CONFLICTS_TABLE)
+	}
+
+	pub fn optimizer_memo_admission(&self) -> RuneDataFrame {
+		Self::optimizer_readout(RUNE_OPTIMIZER_MEMO_ADMISSION_TABLE)
+	}
+
 	pub fn sql(&self, query: String) -> VmResult<RuneDataFrame> {
 		match SqlPlanner::new().plan_relation(&query) {
 			Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
 			Err(error) => VmResult::panic(error.to_string()),
+		}
+	}
+
+	fn optimizer_readout(table: &'static str) -> RuneDataFrame {
+		debug_assert!(RUNE_OPTIMIZER_READOUT_TABLES.contains(&table));
+		RuneDataFrame {
+			plan: LogicalPlan::ScanNamed {
+				table: TableRef::with_schema(RUNE_INFORMATION_SCHEMA_NAMESPACE, table),
+				projection: None,
+			},
 		}
 	}
 }
@@ -1180,6 +1235,31 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["sandbox_sleep_ms"], sandbox_sleep_ms).build()?;
 
 	m.associated_function("table", ToronContext::table)?;
+	m.associated_function("optimizer_decisions", ToronContext::optimizer_decisions)?;
+	m.associated_function(
+		"optimizer_runtime_verdicts",
+		ToronContext::optimizer_runtime_verdicts,
+	)?;
+	m.associated_function(
+		"optimizer_evidence_status",
+		ToronContext::optimizer_evidence_status,
+	)?;
+	m.associated_function(
+		"optimizer_margin_advisory",
+		ToronContext::optimizer_margin_advisory,
+	)?;
+	m.associated_function(
+		"optimizer_receipt_gates",
+		ToronContext::optimizer_receipt_gates,
+	)?;
+	m.associated_function(
+		"optimizer_decision_conflicts",
+		ToronContext::optimizer_decision_conflicts,
+	)?;
+	m.associated_function(
+		"optimizer_memo_admission",
+		ToronContext::optimizer_memo_admission,
+	)?;
 	m.associated_function("sql", ToronContext::sql)?;
 	m.associated_function("alias", RuneDataFrame::alias)?;
 	m.associated_function("join", RuneDataFrame::join)?;

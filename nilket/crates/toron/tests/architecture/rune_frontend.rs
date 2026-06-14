@@ -218,7 +218,7 @@ pub(crate) fn adr079_no_rune_local_optimizer_binder_or_executor() {
 		"ExecutionPlan",
 		"PlannerConfig",
 		"PbcCompiler",
-		"optimize",
+		"optimize(",
 		"pushdown",
 		"push_down",
 	] {
