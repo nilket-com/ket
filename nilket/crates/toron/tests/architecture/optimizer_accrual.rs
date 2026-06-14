@@ -2029,7 +2029,7 @@ pub(crate) fn adr207_no_wendelon_production_or_optimizer_shell_change() {
 }
 
 #[test]
-pub(crate) fn adr217_receipt_gates_are_explicit_five_row_system_table() {
+pub(crate) fn adr217_receipt_gates_are_explicit_six_row_system_table() {
 	let binder = binder_root_source();
 	let execution = source("src/ir/execution.rs");
 	let explain = source("src/binder/explain.rs");
@@ -2070,12 +2070,14 @@ pub(crate) fn adr217_receipt_gates_are_explicit_five_row_system_table() {
 	assert!(report.contains("decision_conflict_pressure_gate(&snapshot)"));
 	assert!(report.contains("windowing_decay_pressure_gate(&snapshot)"));
 	assert!(report.contains("counter_handoff_readiness_gate(&snapshot)"));
+	assert!(report.contains("probe_linearity_fence_dominance_gate(&snapshot)"));
 	for gate in [
 		"graph_margin_divergence",
 		"preserved_outer_ordering",
 		"decision_conflict_pressure",
 		"windowing_decay_pressure",
 		"counter_handoff_readiness",
+		"probe_linearity_fence_dominance",
 	] {
 		assert!(join_order.contains(gate), "missing receipt gate {gate}");
 	}
@@ -2121,10 +2123,15 @@ pub(crate) fn adr217_receipt_gate_snapshot_is_single_locked_snapshot() {
 	assert!(snapshot.contains("decision_rows_from_state(&state)"));
 	assert!(snapshot.contains("status_snapshot_from_state(&state)"));
 	assert!(snapshot.contains("window_snapshot_from_state(&state, current_window)"));
+	assert!(snapshot.contains("probe_linearity_fence_rows_from_state(&state, current_window)"));
+	assert!(
+		runtime_evidence.contains("probe_linearity_fences: Vec<OptimizerProbeLinearityFenceRow>")
+	);
 	assert!(report.contains("receipt_gate_snapshot()"));
 	assert!(!report.contains("verdict_snapshot()"));
 	assert!(!report.contains("decision_snapshot()"));
 	assert!(!report.contains("status_snapshot()"));
+	assert!(!report.contains("probe_linearity_fence_snapshot()"));
 }
 
 #[test]

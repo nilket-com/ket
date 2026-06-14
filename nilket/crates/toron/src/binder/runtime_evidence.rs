@@ -82,6 +82,7 @@ pub(crate) struct OptimizerReceiptGateSnapshot {
 	pub(crate) verdicts: Vec<OptimizerRuntimeVerdictRow>,
 	pub(crate) decisions: Vec<OptimizerDecisionRow>,
 	pub(crate) recent_decisions: Vec<OptimizerDecisionRow>,
+	pub(crate) probe_linearity_fences: Vec<OptimizerProbeLinearityFenceRow>,
 	pub(crate) health: OptimizerEvidenceStatusSnapshot,
 	pub(crate) window: OptimizerEvidenceWindowSnapshot,
 }
@@ -406,12 +407,14 @@ impl OptimizerRuntimeEvidence {
 		let verdicts = verdict_rows_from_state(&state);
 		let decisions = decision_rows_from_state(&state);
 		let recent_decisions = recent_decision_rows_from_state(&state, current_window);
+		let probe_linearity_fences = probe_linearity_fence_rows_from_state(&state, current_window);
 		let health = status_snapshot_from_state(&state);
 		let window = window_snapshot_from_state(&state, current_window);
 		OptimizerReceiptGateSnapshot {
 			verdicts,
 			decisions,
 			recent_decisions,
+			probe_linearity_fences,
 			health,
 			window,
 		}
@@ -1945,10 +1948,47 @@ mod tests {
 			}]
 		);
 		assert_eq!(snapshot.recent_decisions, snapshot.decisions);
+		assert_eq!(snapshot.probe_linearity_fences.len(), 14);
+		assert!(snapshot.probe_linearity_fences.iter().all(|row| {
+			row.status == OptimizerProbeLinearityFenceStatus::Absent
+				&& row.recent_count == 0
+				&& row.lifetime_count == 0
+		}));
 		assert_eq!(snapshot.health.pending_deltas, 4);
 		assert_eq!(snapshot.window.lifetime_count, 2);
 		assert_eq!(snapshot.window.recent_count, 2);
 		assert_eq!(snapshot.window.stale_lifetime_count, 0);
+	}
+
+	#[test]
+	fn receipt_gate_snapshot_reads_probe_linearity_under_same_lock() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+
+		let snapshot = evidence.receipt_gate_snapshot();
+		let sort = snapshot
+			.probe_linearity_fences
+			.iter()
+			.find(|row| {
+				row.consumer == OptimizerProbeLinearityConsumer::HashFallback
+					&& row.fence == ProbeLinearityFence::Sort
+			})
+			.expect("hash fallback sort row");
+
+		assert_eq!(snapshot.probe_linearity_fences.len(), 14);
+		assert_eq!(sort.recent_count, 1);
+		assert_eq!(sort.lifetime_count, 1);
+		assert_eq!(sort.consumer_recent_total, 1);
+		assert_eq!(sort.consumer_lifetime_total, 1);
+		assert_eq!(sort.recent_share_per_mille, 1000);
+		assert_eq!(
+			sort.status,
+			OptimizerProbeLinearityFenceStatus::InsufficientEvidence
+		);
+		assert_eq!(sort.reason, "consumer_recent_total_below_floor");
 	}
 
 	#[test]

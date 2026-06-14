@@ -15283,13 +15283,13 @@ async fn optimizer_margin_advisory_reports_scope_and_exclusions() {
 }
 
 #[tokio::test]
-async fn optimizer_receipt_gates_projects_five_static_rows() {
+async fn optimizer_receipt_gates_projects_six_static_rows() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
 	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
 
 	assert_receipt_gate_order(&rows);
-	assert_eq!(rows.len(), 5);
+	assert_eq!(rows.len(), 6);
 
 	let projected = LogicalPlan::ScanNamed {
 		table: TableRef::with_schema("information_schema", "optimizer_receipt_gates"),
@@ -15313,7 +15313,7 @@ async fn optimizer_receipt_gates_projects_five_static_rows() {
 		field_names(&schema),
 		vec!["gate_name", "status", "next_cut"]
 	);
-	assert_eq!(rows.len(), 5);
+	assert_eq!(rows.len(), 6);
 }
 
 #[tokio::test]
@@ -15357,6 +15357,23 @@ async fn receipt_gates_render_insufficient_evidence_on_cold_ledger() {
 			2
 		),
 		"blocked_external_signal"
+	);
+
+	let probe = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+	assert_eq!(receipt_gate_utf8(probe, 1), "probe_linearity");
+	assert_eq!(receipt_gate_utf8(probe, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(probe, 3), 0);
+	assert_eq!(
+		receipt_gate_utf8(probe, 4),
+		"no_dominant_probe_linearity_fence"
+	);
+	assert_eq!(
+		receipt_gate_utf8(probe, 5),
+		"strongest_consumer_recent_total=0,evidence_health=local_only/ok"
+	);
+	assert_eq!(
+		receipt_gate_utf8(probe, 6),
+		"requires_recent_probe_linearity_floor"
 	);
 }
 
@@ -16218,6 +16235,7 @@ fn memo_admission_degraded_when_evidence_health_not_ok() {
 				count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
 			},
 		],
+		probe_linearity_fences: Vec::new(),
 		health: OptimizerEvidenceStatusSnapshot {
 			mode: OptimizerEvidenceMode::Degraded,
 			state: OptimizerEvidenceState::Stale,
@@ -16513,6 +16531,7 @@ fn memo_admission_blocker_class_does_not_bypass_degraded_health() {
 		verdicts: Vec::new(),
 		decisions: decisions.clone(),
 		recent_decisions: decisions,
+		probe_linearity_fences: Vec::new(),
 		health: OptimizerEvidenceStatusSnapshot {
 			mode: OptimizerEvidenceMode::Degraded,
 			state: OptimizerEvidenceState::Stale,
@@ -16835,7 +16854,7 @@ async fn memo_audit_probe_not_scan_linear_is_physical_fence_not_missing_candidat
 }
 
 #[tokio::test]
-async fn optimizer_receipt_gates_windowing_manifest_stays_global_five_rows() {
+async fn optimizer_receipt_gates_windowing_manifest_stays_global_six_rows() {
 	let catalog = MockCatalog::new();
 	let runtime_evidence =
 		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
@@ -16857,7 +16876,7 @@ async fn optimizer_receipt_gates_windowing_manifest_stays_global_five_rows() {
 
 	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
 	assert_receipt_gate_order(&rows);
-	assert_eq!(rows.len(), 5);
+	assert_eq!(rows.len(), 6);
 	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
 	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
 	assert_eq!(receipt_gate_i64(windowing, 3), 80);
@@ -17197,6 +17216,221 @@ async fn probe_linearity_fence_statuses_use_consumer_window_share() {
 }
 
 #[tokio::test]
+async fn probe_linearity_gate_requires_dominant_real_lane() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	for _ in 0..19 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+	}
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let gate = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+
+	assert_eq!(receipt_gate_utf8(gate, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(gate, 3), 19);
+	assert_eq!(
+		receipt_gate_utf8(gate, 4),
+		"no_dominant_probe_linearity_fence"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 5),
+		"strongest_consumer_recent_total=19,evidence_health=local_only/ok"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 6),
+		"requires_recent_probe_linearity_floor"
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_gate_is_cold_without_evidence() {
+	let rows =
+		optimizer_receipt_gate_table_rows(&MockCatalog::new(), &PlannerConfig::default()).await;
+	let gate = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+
+	assert_eq!(receipt_gate_utf8(gate, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(gate, 3), 0);
+	assert_eq!(
+		receipt_gate_utf8(gate, 4),
+		"no_dominant_probe_linearity_fence"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 6),
+		"requires_recent_probe_linearity_floor"
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_gate_selects_strongest_dominant_fence() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	for _ in 0..20 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+	}
+	for _ in 0..25 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::StarDecline,
+			ProbeLinearityFence::Exchange,
+		);
+	}
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let gate = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+
+	assert_eq!(receipt_gate_utf8(gate, 2), "actionable");
+	assert_eq!(receipt_gate_i64(gate, 3), 25);
+	assert_eq!(
+		receipt_gate_utf8(gate, 4),
+		"consumer=star_decline,fence=exchange"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 5),
+		"recent_count=25,consumer_recent_total=25,recent_share_per_mille=1000,evidence_health=local_only/ok"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 6),
+		"dominant_probe_linearity_fence_ready"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 7),
+		"targeted_probe_linearity_fence_relaxation"
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_gate_uses_same_locked_snapshot_as_229_detail() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	for _ in 0..20 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::StarDecline,
+			ProbeLinearityFence::Sort,
+		);
+	}
+
+	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+	let detail = snapshot
+		.probe_linearity_fences
+		.iter()
+		.find(|row| {
+			row.consumer == OptimizerProbeLinearityConsumer::StarDecline
+				&& row.fence == ProbeLinearityFence::Sort
+		})
+		.expect("star decline sort detail row");
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let gate = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+
+	assert_eq!(detail.status, OptimizerProbeLinearityFenceStatus::Dominant);
+	assert_eq!(
+		receipt_gate_utf8(gate, 4),
+		"consumer=star_decline,fence=sort"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 5),
+		format!(
+			"recent_count={},consumer_recent_total={},recent_share_per_mille={},evidence_health=local_only/ok",
+			detail.recent_count, detail.consumer_recent_total, detail.recent_share_per_mille
+		)
+	);
+	assert_eq!(snapshot, config.runtime_evidence.receipt_gate_snapshot());
+}
+
+#[tokio::test]
+async fn probe_linearity_gate_rejects_split_pressure() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	for _ in 0..20 {
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Sort,
+		);
+		config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::Take,
+		);
+	}
+
+	let detail_rows = optimizer_probe_linearity_fence_table_rows(&catalog, &config).await;
+	assert_eq!(
+		probe_linearity_fence_utf8(
+			probe_linearity_fence_row(&detail_rows, "hash_fallback", "sort"),
+			7
+		),
+		"observed"
+	);
+	assert_eq!(
+		probe_linearity_fence_utf8(
+			probe_linearity_fence_row(&detail_rows, "hash_fallback", "take"),
+			7
+		),
+		"observed"
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let gate = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+
+	assert_eq!(receipt_gate_utf8(gate, 2), "inactive");
+	assert_eq!(receipt_gate_i64(gate, 3), 40);
+	assert_eq!(
+		receipt_gate_utf8(gate, 4),
+		"no_dominant_probe_linearity_fence"
+	);
+	assert_eq!(
+		receipt_gate_utf8(gate, 5),
+		"strongest_consumer_recent_total=40,evidence_health=local_only/ok"
+	);
+	assert_eq!(receipt_gate_utf8(gate, 6), "probe_linearity_pressure_split");
+}
+
+#[tokio::test]
+async fn probe_linearity_gate_is_read_only_no_plan_change() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_config = auto_broadcast_config(64 * 1024 * 1024);
+	for _ in 0..20 {
+		noisy_config.runtime_evidence.record_probe_linearity_fence(
+			OptimizerProbeLinearityConsumer::HashFallback,
+			ProbeLinearityFence::NonBroadcastJoin,
+		);
+	}
+
+	let before = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &noisy_config).await;
+	let after = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	assert_eq!(before, after);
+	assert_eq!(
+		receipt_gate_utf8(
+			receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance"),
+			2
+		),
+		"actionable"
+	);
+
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+	assert_eq!(
+		quiet_trace.scan_filter_decisions,
+		noisy_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
 async fn probe_linearity_fence_readout_uses_recent_window_but_preserves_lifetime() {
 	let catalog = MockCatalog::new();
 	let runtime_evidence =
@@ -17500,6 +17734,8 @@ async fn rune_queries_optimizer_receipt_gates_with_windowing() {
 		receipt_gate_utf8(windowing, 6),
 		"recent_window_matches_lifetime"
 	);
+	let probe = receipt_gate_row_by_name(&rows, "probe_linearity_fence_dominance");
+	assert_eq!(receipt_gate_utf8(probe, 2), "insufficient_evidence");
 }
 
 #[tokio::test]
@@ -20422,6 +20658,7 @@ fn assert_receipt_gate_order(rows: &[Vec<ScalarValue>]) {
 			"decision_conflict_pressure",
 			"windowing_decay_pressure",
 			"counter_handoff_readiness",
+			"probe_linearity_fence_dominance",
 		]
 	);
 }

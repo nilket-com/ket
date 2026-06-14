@@ -90,6 +90,7 @@ pub(crate) fn adr218_graph_actuation_armed_only_by_graph_margin_divergence() {
 		"decision_conflict_pressure_gate",
 		"windowing_decay_pressure_gate",
 		"counter_handoff_readiness_gate",
+		"probe_linearity_fence_dominance_gate",
 	] {
 		assert!(
 			!resolver.contains(forbidden),
@@ -169,9 +170,11 @@ pub(crate) fn adr218_other_four_receipt_gates_stay_non_consumers() {
 		"decision_conflict_pressure_gate",
 		"windowing_decay_pressure_gate",
 		"counter_handoff_readiness_gate",
+		"probe_linearity_fence_dominance_gate",
 		"decision_conflict_pressure",
 		"windowing_decay_pressure",
 		"counter_handoff_readiness",
+		"probe_linearity_fence_dominance",
 	] {
 		assert!(
 			!resolver.contains(forbidden),

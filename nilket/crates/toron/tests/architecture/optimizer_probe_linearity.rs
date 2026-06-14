@@ -8,9 +8,24 @@ fn source_block(source: &str, marker: &str) -> String {
 		.1
 }
 
+fn source(relative: &str) -> String {
+	std::fs::read_to_string(manifest_dir().join(relative)).expect("read Toron source")
+}
+
 fn execution_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
-		.expect("read execution IR source")
+	source("src/ir/execution.rs")
+}
+
+fn source_lines_for_path(path: &Path) -> Vec<(PathBuf, usize, String)> {
+	if path.is_dir() {
+		return source_lines(path);
+	}
+	std::fs::read_to_string(path)
+		.expect("read source")
+		.lines()
+		.enumerate()
+		.map(|(idx, line)| (path.to_path_buf(), idx + 1, line.to_string()))
+		.collect()
 }
 
 #[test]
@@ -252,8 +267,7 @@ pub(crate) fn adr229_probe_linearity_durable_namespace_is_separate_from_220_matr
 pub(crate) fn adr229_probe_linearity_recording_is_committed_consumer_side_only() {
 	let binder = binder_root_source();
 	let join = binder_source();
-	let join_order = std::fs::read_to_string(manifest_dir().join("src/binder/join_order.rs"))
-		.expect("read join_order");
+	let join_order = source("src/binder/join_order.rs");
 	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let choose_auto = source_block(&join, "fn choose_auto_join_strategy");
 	let star_decline = source_block(&join_order, "fn accrue_star_order_decline");
@@ -272,6 +286,149 @@ pub(crate) fn adr229_probe_linearity_recording_is_committed_consumer_side_only()
 	assert!(star_decline.contains("OptimizerProbeLinearityConsumer::StarDecline"));
 	assert!(star_decline.contains("record_probe_linearity_fence"));
 	assert!(!analyze.contains("record_probe_linearity_fence"));
+}
+
+#[test]
+pub(crate) fn adr230_dominance_gate_is_sixth_receipt_gate_row_reusing_cockpit() {
+	let join_order = source("src/binder/join_order.rs");
+	let rows = source_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+	let gate = source_block(&join_order, "fn probe_linearity_fence_dominance_gate");
+
+	for row in [
+		"graph_margin_divergence_gate_row(&snapshot, config)",
+		"preserved_outer_ordering_gate_row(&snapshot, config)",
+		"decision_conflict_pressure_gate(&snapshot)",
+		"windowing_decay_pressure_gate(&snapshot)",
+		"counter_handoff_readiness_gate(&snapshot)",
+		"probe_linearity_fence_dominance_gate(&snapshot)",
+	] {
+		assert_eq!(rows.matches(row).count(), 1, "receipt gate row {row}");
+	}
+	let counter = rows
+		.find("counter_handoff_readiness_gate(&snapshot)")
+		.expect("counter handoff row");
+	let dominance = rows
+		.find("probe_linearity_fence_dominance_gate(&snapshot)")
+		.expect("probe-linearity dominance row");
+	assert!(counter < dominance);
+	assert!(gate.contains("gate_name: \"probe_linearity_fence_dominance\""));
+	assert!(gate.contains("gate_family: \"probe_linearity\""));
+	assert!(gate.contains("targeted_probe_linearity_fence_relaxation"));
+}
+
+#[test]
+pub(crate) fn adr230_dominance_gate_status_from_real_229_evidence_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let dominance = source_block(&join_order, "fn probe_linearity_fence_dominance");
+	let gate = source_block(&join_order, "fn probe_linearity_fence_dominance_gate");
+
+	assert!(dominance.contains("snapshot.probe_linearity_fences"));
+	assert!(dominance.contains("OptimizerProbeLinearityFenceStatus::Dominant"));
+	assert!(dominance.contains("OptimizerProbeLinearityFenceStatus::Observed"));
+	assert!(dominance.contains("row.consumer_recent_total"));
+	assert!(dominance.contains("selected.recent_count"));
+	assert!(!dominance.contains("PROBE_LINEARITY_FENCE_MIN_SAMPLE"));
+	assert!(!dominance.contains("OptimizerProbeLinearityConsumer::HashFallback"));
+	assert!(!dominance.contains("OptimizerProbeLinearityConsumer::StarDecline"));
+	assert!(dominance.contains("dominant_probe_linearity_fence_ready"));
+	assert!(dominance.contains("probe_linearity_pressure_split"));
+	assert!(dominance.contains("requires_recent_probe_linearity_floor"));
+	assert!(gate.contains("optimizer_probe_linearity_consumer_label(row.consumer)"));
+	assert!(gate.contains("row.fence.label()"));
+}
+
+#[test]
+pub(crate) fn adr230_dominance_gate_uses_single_locked_receipt_snapshot() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let snapshot_struct = source_block(
+		&runtime_evidence,
+		"pub(crate) struct OptimizerReceiptGateSnapshot",
+	);
+	let snapshot = source_block(&runtime_evidence, "pub(crate) fn receipt_gate_snapshot");
+	let rows = source_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+
+	assert!(
+		snapshot_struct.contains("probe_linearity_fences: Vec<OptimizerProbeLinearityFenceRow>")
+	);
+	assert_eq!(snapshot.matches("self.state.lock()").count(), 1);
+	assert!(snapshot.contains("let current_window = self.window_id_source.current()"));
+	assert!(snapshot.contains("probe_linearity_fence_rows_from_state(&state, current_window)"));
+	assert!(snapshot.contains("probe_linearity_fences,"));
+	assert_eq!(rows.matches("receipt_gate_snapshot()").count(), 1);
+	assert!(rows.contains("probe_linearity_fence_dominance_gate(&snapshot)"));
+	assert!(!rows.contains("probe_linearity_fence_snapshot()"));
+}
+
+#[test]
+pub(crate) fn adr230_dominance_gate_has_no_policy_consumer() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let resolver = source_block(&join_order, "pub(crate) fn effective_join_order_policy");
+	let graph = source_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
+	let outer = source_block(
+		&join_order,
+		"pub(super) async fn try_bind_preserved_outer_star_actuation",
+	);
+	let star = source_block(&join_order, "async fn try_bind_star_order_actuation");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
+
+	for policy in [resolver, graph, outer, star, bind_scoped_join] {
+		assert!(!policy.contains("probe_linearity_fence_dominance"));
+		assert!(!policy.contains("targeted_probe_linearity_fence_relaxation"));
+		assert!(!policy.contains("OptimizerProbeLinearityFenceStatus::Dominant"));
+	}
+}
+
+#[test]
+pub(crate) fn adr230_no_optimizer_actuation_without_actionable_dominance_gate() {
+	adr230_dominance_gate_has_no_policy_consumer();
+}
+
+#[test]
+pub(crate) fn adr230_no_new_system_table_rune_handle_durable_key_or_wendelon_surface() {
+	super::rune_optimizer_readouts::adr228_no_new_information_schema_table_or_system_table_kind();
+	let manifest = manifest_dir();
+	let execution = execution_source();
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let rune = source("src/rune_engine.rs");
+	let daemon = source("src/daemon.rs");
+	let system_kind = source_block(&execution, "pub enum SystemTableKind");
+
+	assert_eq!(enum_variant_count(&system_kind), 13);
+	assert!(!system_kind.contains("InformationSchemaOptimizerProbeLinearityDominance"));
+	assert!(rune.contains("const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 8]"));
+	assert!(!rune.contains("optimizer_probe_linearity_dominance"));
+	assert!(!rune.contains("RUNE_OPTIMIZER_PROBE_LINEARITY_DOMINANCE"));
+	assert!(!runtime_evidence.contains("optimizer_evidence/probe_linearity_dominance"));
+	assert!(!runtime_evidence.contains("all_probe_linearity_dominance_counter_keys"));
+	assert!(!daemon.contains("flush_probe_linearity_dominance"));
+
+	let markers = [
+		"probe_linearity_fence_dominance",
+		"targeted_probe_linearity_fence_relaxation",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/network/observability.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("src/exec.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR230 dominance gate leaked into policy/execution/Wendelon surfaces:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
 }
 
 #[test]

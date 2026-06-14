@@ -623,6 +623,14 @@ struct WindowingDecayPressure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeLinearityFenceDominance<'a> {
+	status: OptimizerReceiptGateStatus,
+	row: Option<&'a OptimizerProbeLinearityFenceRow>,
+	sample_count: u64,
+	reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BoundedAdmissionCandidateContract {
 	bounded_candidate_count: u64,
 	reason: &'static str,
@@ -637,6 +645,7 @@ pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<Optimiz
 		decision_conflict_pressure_gate(&snapshot),
 		windowing_decay_pressure_gate(&snapshot),
 		counter_handoff_readiness_gate(&snapshot),
+		probe_linearity_fence_dominance_gate(&snapshot),
 	]
 }
 
@@ -1283,6 +1292,96 @@ fn counter_handoff_readiness_gate(
 		),
 		reason: "elasticity_signal_unbuilt".to_string(),
 		next_cut: "counter_handoff_elasticity_signal",
+	}
+}
+
+fn probe_linearity_fence_dominance<'a>(
+	snapshot: &'a OptimizerReceiptGateSnapshot,
+) -> ProbeLinearityFenceDominance<'a> {
+	let mut strongest_dominant = None;
+	let mut strongest_sample_count = 0_u64;
+	let mut saw_observed = false;
+	for row in &snapshot.probe_linearity_fences {
+		strongest_sample_count = strongest_sample_count.max(row.consumer_recent_total);
+		match row.status {
+			OptimizerProbeLinearityFenceStatus::Dominant => {
+				let replace = strongest_dominant
+					.map(|selected: &OptimizerProbeLinearityFenceRow| {
+						row.recent_count > selected.recent_count
+					})
+					.unwrap_or(true);
+				if replace {
+					strongest_dominant = Some(row);
+				}
+			}
+			OptimizerProbeLinearityFenceStatus::Observed => saw_observed = true,
+			OptimizerProbeLinearityFenceStatus::Absent
+			| OptimizerProbeLinearityFenceStatus::InsufficientEvidence => {}
+		}
+	}
+
+	if let Some(row) = strongest_dominant {
+		ProbeLinearityFenceDominance {
+			status: OptimizerReceiptGateStatus::Actionable,
+			row: Some(row),
+			sample_count: row.consumer_recent_total,
+			reason: "dominant_probe_linearity_fence_ready",
+		}
+	} else if saw_observed {
+		ProbeLinearityFenceDominance {
+			status: OptimizerReceiptGateStatus::Inactive,
+			row: None,
+			sample_count: strongest_sample_count,
+			reason: "probe_linearity_pressure_split",
+		}
+	} else {
+		ProbeLinearityFenceDominance {
+			status: OptimizerReceiptGateStatus::InsufficientEvidence,
+			row: None,
+			sample_count: strongest_sample_count,
+			reason: "requires_recent_probe_linearity_floor",
+		}
+	}
+}
+
+fn probe_linearity_fence_dominance_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> OptimizerReceiptGateRow {
+	let gate = probe_linearity_fence_dominance(snapshot);
+	let (primary_signal, secondary_signal) = if let Some(row) = gate.row {
+		(
+			format!(
+				"consumer={},fence={}",
+				optimizer_probe_linearity_consumer_label(row.consumer),
+				row.fence.label()
+			),
+			format!(
+				"recent_count={},consumer_recent_total={},recent_share_per_mille={},evidence_health={}",
+				row.recent_count,
+				row.consumer_recent_total,
+				row.recent_share_per_mille,
+				evidence_health_label(&snapshot.health)
+			),
+		)
+	} else {
+		(
+			"no_dominant_probe_linearity_fence".to_string(),
+			format!(
+				"strongest_consumer_recent_total={},evidence_health={}",
+				gate.sample_count,
+				evidence_health_label(&snapshot.health)
+			),
+		)
+	};
+	OptimizerReceiptGateRow {
+		gate_name: "probe_linearity_fence_dominance",
+		gate_family: "probe_linearity",
+		status: gate.status,
+		sample_count: gate.sample_count,
+		primary_signal,
+		secondary_signal,
+		reason: gate.reason.to_string(),
+		next_cut: "targeted_probe_linearity_fence_relaxation",
 	}
 }
 

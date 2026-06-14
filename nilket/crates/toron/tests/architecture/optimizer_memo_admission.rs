@@ -227,12 +227,14 @@ pub(crate) fn adr223_no_receipt_gate_manifest_change() {
 	assert!(rows.contains("decision_conflict_pressure_gate(&snapshot)"));
 	assert!(rows.contains("windowing_decay_pressure_gate(&snapshot)"));
 	assert!(rows.contains("counter_handoff_readiness_gate(&snapshot)"));
+	assert!(rows.contains("probe_linearity_fence_dominance_gate(&snapshot)"));
 	for gate in [
 		"graph_margin_divergence_gate_row(&snapshot, config)",
 		"preserved_outer_ordering_gate_row(&snapshot, config)",
 		"decision_conflict_pressure_gate(&snapshot)",
 		"windowing_decay_pressure_gate(&snapshot)",
 		"counter_handoff_readiness_gate(&snapshot)",
+		"probe_linearity_fence_dominance_gate(&snapshot)",
 	] {
 		assert_eq!(rows.matches(gate).count(), 1, "receipt gate {gate}");
 	}
