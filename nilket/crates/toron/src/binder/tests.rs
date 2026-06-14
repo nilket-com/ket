@@ -2591,6 +2591,44 @@ fn both_sides_eligible_near_tie_keeps_left_build() {
 	);
 }
 
+#[test]
+fn hash_join_probe_not_scan_linear_uses_carried_input_cause() {
+	let config = auto_broadcast_config(4_096);
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input_with_linearity(
+			PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(64 * 1024 * 1024)),
+				estimated_byte_size: None,
+				estimated_row_count: None,
+				row_upper_bound: None,
+			},
+			ProbeLinearity::Blocked(ProbeLinearityFence::Sort),
+		),
+		join_input(PlanOptimizerFacts {
+			origin: PlanOrigin::SingleBaseRelation,
+			byte_upper_bound: Some(ByteCount::new(1_024)),
+			estimated_byte_size: None,
+			estimated_row_count: None,
+			row_upper_bound: None,
+		}),
+		&config,
+	)
+	.expect("choose join strategy");
+
+	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+	assert_eq!(
+		decision.reason,
+		JoinStrategyDecisionReason::HashByDefault {
+			reason: HashByDefaultReason::ProbeNotScanLinear(ProbeLinearityFence::Sort),
+		}
+	);
+}
+
 #[tokio::test]
 async fn right_tiny_left_deep_join_infers_broadcast_star() {
 	let mut catalog = join_catalog();
@@ -9024,9 +9062,252 @@ async fn trace_records_hash_reason_for_non_scan_linear_probe() {
 	assert_eq!(
 		receipt.reason,
 		JoinStrategyDecisionReason::HashByDefault {
-			reason: HashByDefaultReason::ProbeNotScanLinear,
+			reason: HashByDefaultReason::ProbeNotScanLinear(ProbeLinearityFence::NonBroadcastJoin),
 		}
 	);
+}
+
+#[tokio::test]
+async fn probe_linearity_project_and_filter_are_transparent() {
+	let logical = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(
+					TableRef::new("orders"),
+					"customer_id",
+				)),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+			),
+		}),
+		exprs: vec![Expr::qualified_column(
+			TableRef::new("orders"),
+			"customer_id",
+		)],
+		output_names: vec![Some("customer_id".to_string())],
+	};
+	let plan = bind(&logical, &join_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind transparent probe");
+
+	assert_eq!(broadcast_probe_linearity(&plan), ProbeLinearity::Linear);
+}
+
+#[tokio::test]
+async fn probe_linearity_limit_sort_aggregate_exchange_are_distinct_causes() {
+	let catalog = join_catalog();
+	let scan = bind(
+		&LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind scan");
+	let mut limited_scan = scan.clone();
+	let ExecutionPlan::Scan { row_limit, .. } = &mut limited_scan else {
+		panic!("expected scan, got {limited_scan:?}");
+	};
+	*row_limit = Some(1);
+
+	let take = bind(
+		&LogicalPlan::Take {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			limit: 1,
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind take");
+	let sort = bind(
+		&LogicalPlan::Sort {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			order_by: vec![SortExpr {
+				expr: Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				descending: false,
+				nulls_first: false,
+			}],
+			limit: None,
+			offset: 0,
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind sort");
+	let aggregate = bind(
+		&LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			group_expr: vec![Expr::qualified_column(
+				TableRef::new("orders"),
+				"customer_id",
+			)],
+			aggr_expr: Vec::new(),
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind aggregate");
+	let exchange = bind(
+		&LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			partition_count: 2,
+			key: vec![Expr::qualified_column(
+				TableRef::new("orders"),
+				"customer_id",
+			)],
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind exchange");
+
+	assert_eq!(
+		broadcast_probe_linearity(&limited_scan).blocked_fence(),
+		Some(ProbeLinearityFence::ScanRowLimit)
+	);
+	assert_eq!(
+		broadcast_probe_linearity(&take).blocked_fence(),
+		Some(ProbeLinearityFence::Take)
+	);
+	assert_eq!(
+		broadcast_probe_linearity(&sort).blocked_fence(),
+		Some(ProbeLinearityFence::Sort)
+	);
+	assert_eq!(
+		broadcast_probe_linearity(&aggregate).blocked_fence(),
+		Some(ProbeLinearityFence::Aggregate)
+	);
+	assert_eq!(
+		broadcast_probe_linearity(&exchange).blocked_fence(),
+		Some(ProbeLinearityFence::Exchange)
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_nested_broadcast_propagates_inner_cause() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	let broadcast = bind(
+		&LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		},
+		&catalog,
+		&auto_broadcast_config(4_096),
+	)
+	.await
+	.expect("bind broadcast join");
+	let sorted_probe = bind(
+		&LogicalPlan::Sort {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			order_by: vec![SortExpr {
+				expr: Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				descending: false,
+				nulls_first: false,
+			}],
+			limit: None,
+			offset: 0,
+		},
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind sorted probe");
+	let ExecutionPlan::Join {
+		replay_id,
+		replay_eligibility,
+		left,
+		kind,
+		left_keys,
+		right_keys,
+		strategy,
+		output_schema,
+		..
+	} = broadcast
+	else {
+		panic!("expected broadcast join");
+	};
+	let nested = ExecutionPlan::Join {
+		replay_id,
+		replay_eligibility,
+		left,
+		right: Box::new(sorted_probe),
+		kind,
+		left_keys,
+		right_keys,
+		strategy,
+		output_schema,
+	};
+
+	assert_eq!(
+		broadcast_probe_linearity(&nested).blocked_fence(),
+		Some(ProbeLinearityFence::Sort)
+	);
+}
+
+#[tokio::test]
+async fn probe_linearity_receipts_do_not_change_bound_plan() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let logical = nested_hash_probe_with_tiny_right();
+	let config = auto_broadcast_config(4_096);
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind without trace");
+	let (traced_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind with trace");
+
+	assert!(trace.join_decisions.iter().any(|receipt| {
+		matches!(
+			receipt.reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::ProbeNotScanLinear(
+					ProbeLinearityFence::NonBroadcastJoin
+				),
+			}
+		)
+	}));
+	assert_eq!(format!("{plan:?}"), format!("{traced_plan:?}"));
 }
 
 #[tokio::test]
@@ -9721,7 +10002,7 @@ async fn join_rows_keep_scan_readability_columns_null() {
 }
 
 #[tokio::test]
-async fn explain_probe_not_scan_linear_reports_hash_reason_detail() {
+async fn hash_join_probe_not_scan_linear_renders_typed_cause() {
 	let mut catalog = join_catalog();
 	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
@@ -9748,7 +10029,7 @@ async fn explain_probe_not_scan_linear_reports_hash_reason_detail() {
 	assert_eq!(
 		join_rows[1][3],
 		ScalarValue::Utf8(Some(
-			"natural:hash_by_default:probe_not_scan_linear".to_string()
+			"natural:hash_by_default:probe_not_scan_linear:non_broadcast_join".to_string()
 		))
 	);
 }
@@ -10192,7 +10473,7 @@ async fn broadcast_star_order_unchanged_from_178() {
 }
 
 #[tokio::test]
-async fn non_star_join_declines_with_reason() {
+async fn star_probe_not_scan_linear_renders_same_cause_via_shared_helper() {
 	let mut catalog = star_join_order_catalog();
 	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
 	let logical = LogicalPlan::Explain {
@@ -10207,7 +10488,7 @@ async fn non_star_join_declines_with_reason() {
 		row[2],
 		ScalarValue::Utf8(Some("declined_probe_not_scan_linear".to_string()))
 	);
-	assert_utf8_contains(&row[3], "reason=probe_not_scan_linear");
+	assert_utf8_contains(&row[3], "reason=probe_not_scan_linear:exchange");
 }
 
 #[tokio::test]
@@ -13252,7 +13533,10 @@ async fn star_recognition_respects_scan_linear_probe_fence() {
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 
-	assert_utf8_contains(&join_order_row(&rows)[3], "reason=probe_not_scan_linear");
+	assert_utf8_contains(
+		&join_order_row(&rows)[3],
+		"reason=probe_not_scan_linear:exchange",
+	);
 }
 
 #[tokio::test]
@@ -19817,9 +20101,16 @@ fn root_project_column_ordinals(plan: &ExecutionPlan) -> Vec<ColumnOrdinal> {
 }
 
 fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {
+	join_input_with_linearity(facts, ProbeLinearity::Linear)
+}
+
+fn join_input_with_linearity(
+	facts: PlanOptimizerFacts,
+	probe_linearity: ProbeLinearity,
+) -> JoinInputOptimization {
 	JoinInputOptimization {
 		facts,
-		probe_scan_linear: true,
+		probe_linearity,
 	}
 }
 
@@ -22563,7 +22854,11 @@ fn snowflake_test_edge(
 		estimated_rows: Some(RowCount::new(estimated_rows)),
 		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
 		inner_equi: true,
-		probe_scan_linear,
+		probe_linearity: if probe_scan_linear {
+			ProbeLinearity::Linear
+		} else {
+			ProbeLinearity::Blocked(ProbeLinearityFence::NonBroadcastJoin)
+		},
 		left_key_signature: vec![format!("{probe}.k")],
 		right_key_signature: vec![format!("{dimension}.id")],
 		left_endpoint_rows: None,
@@ -22592,7 +22887,7 @@ fn bridge_test_edge(
 		estimated_rows: Some(RowCount::new(right_rows)),
 		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
 		inner_equi: true,
-		probe_scan_linear: true,
+		probe_linearity: ProbeLinearity::Linear,
 		left_key_signature: vec![left_signature.to_string()],
 		right_key_signature: vec![right_signature.to_string()],
 		left_endpoint_rows: Some(RowCount::new(left_rows)),
@@ -22669,7 +22964,7 @@ fn snowflake_verdict_strategy(dimension: &str) -> SnowflakeEdgeStrategy {
 		dimension: dimension.to_string(),
 		strategy: JoinStrategy::HashPartitioned,
 		placement: JoinPhysicalPlacement::Natural,
-		probe_scan_linear: true,
+		probe_linearity: ProbeLinearity::Linear,
 	}
 }
 

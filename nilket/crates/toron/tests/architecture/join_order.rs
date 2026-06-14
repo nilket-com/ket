@@ -90,16 +90,15 @@ pub(crate) fn adr178_broadcast_star_only_respects_scan_linear_probe_fence() {
 	let join_order = source("src/binder/join_order.rs");
 
 	assert!(
-		bind_scoped_join.contains(
-			"let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);"
-		)
+		bind_scoped_join
+			.contains("let left_probe_linearity = broadcast_probe_linearity(&left_plan.plan);")
 	);
-	assert!(bind_scoped_join.contains("probe_scan_linear: left_probe_scan_linear"));
-	assert!(actuator.contains("broadcast_probe_is_scan_linear(&probe_plan.plan)"));
+	assert!(bind_scoped_join.contains("probe_linearity: left_probe_linearity"));
+	assert!(actuator.contains("broadcast_probe_linearity(&probe_plan.plan)"));
 	assert!(join_order.contains("JoinPhysicalPlacement::SwappedRightBuild"));
 	assert!(join_order.contains("MixedStrategyStar"));
-	assert!(join_order.contains("edge.probe_scan_linear"));
-	assert!(join_order.contains("StarOrderDeclineReason::ProbeNotScanLinear"));
+	assert!(join_order.contains("edge.probe_linearity"));
+	assert!(join_order.contains("StarOrderDeclineReason::ProbeNotScanLinear(fence)"));
 }
 
 #[test]
@@ -824,7 +823,7 @@ pub(crate) fn adr182_snowflake_reconstructs_from_existing_edges() {
 		"estimated_rows: Option<RowCount>",
 		"estimate_source: JoinOrderEstimateSource",
 		"inner_equi: bool",
-		"probe_scan_linear: bool",
+		"probe_linearity: ProbeLinearity",
 	] {
 		assert!(edge.contains(field));
 	}
@@ -865,12 +864,12 @@ pub(crate) fn adr182_snowflake_records_strategy_as_evidence_not_gate() {
 
 	assert!(edge_strategy.contains("strategy: JoinStrategy"));
 	assert!(edge_strategy.contains("placement: JoinPhysicalPlacement"));
-	assert!(edge_strategy.contains("probe_scan_linear: bool"));
+	assert!(edge_strategy.contains("probe_linearity: ProbeLinearity"));
 	assert!(analyzer.contains("decisions.get(edge.target.join_index)?"));
 	assert!(level.contains("decisions.get(edge.target.join_index)?"));
 	assert!(level.contains("strategy: decision.strategy"));
 	assert!(level.contains("placement: decision.placement"));
-	assert!(level.contains("probe_scan_linear: edge.probe_scan_linear"));
+	assert!(level.contains("probe_linearity: edge.probe_linearity"));
 	assert!(!analyzer.contains("uniform_star_order_strategy"));
 	assert!(!level.contains("uniform_star_order_strategy"));
 	assert!(!analyzer.contains("MixedStrategyStar"));

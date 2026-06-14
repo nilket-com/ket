@@ -1320,7 +1320,7 @@ pub(super) struct JoinOrderEdgeEvidence {
 	pub(super) estimated_rows: Option<RowCount>,
 	pub(super) estimate_source: JoinOrderEstimateSource,
 	pub(super) inner_equi: bool,
-	pub(super) probe_scan_linear: bool,
+	pub(super) probe_linearity: ProbeLinearity,
 	// ADR 194: role-neutral graph endpoints. `probe`/`dimension` above are the left/right key-source
 	// labels (the relation that owns the resolved join key on each side) — they are the directed trace
 	// role. The key signatures below identify *which column* of each key-source relation the edge
@@ -1418,7 +1418,7 @@ pub(super) enum StarOrderDeclineReason {
 	MultipleProbeRelations,
 	DuplicateDimension,
 	MissingEstimate,
-	ProbeNotScanLinear,
+	ProbeNotScanLinear(ProbeLinearityFence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1451,7 +1451,7 @@ pub(super) struct SnowflakeEdgeStrategy {
 	pub(super) dimension: String,
 	pub(super) strategy: JoinStrategy,
 	pub(super) placement: JoinPhysicalPlacement,
-	pub(super) probe_scan_linear: bool,
+	pub(super) probe_linearity: ProbeLinearity,
 }
 
 // ADR 194: galaxy graph evidence is a sibling of `SnowflakeOrderEvidence`, not an extension — a
@@ -2384,9 +2384,12 @@ pub(super) fn analyze(
 			edge_count: edges.len(),
 		}));
 	}
-	if edges.iter().any(|edge| !edge.probe_scan_linear) {
+	if let Some(fence) = edges
+		.iter()
+		.find_map(|edge| edge.probe_linearity.blocked_fence())
+	{
 		return Some(StarOrderOutcome::Declined(StarOrderDecline {
-			reason: StarOrderDeclineReason::ProbeNotScanLinear,
+			reason: StarOrderDeclineReason::ProbeNotScanLinear(fence),
 			edge_count: edges.len(),
 		}));
 	}
@@ -3031,7 +3034,7 @@ fn snowflake_order_level(
 			dimension: dimension.clone(),
 			strategy: decision.strategy,
 			placement: decision.placement,
-			probe_scan_linear: edge.probe_scan_linear,
+			probe_linearity: edge.probe_linearity,
 		});
 	}
 
@@ -4213,14 +4216,14 @@ impl<'a> Binder<'a> {
 			);
 			return Ok(StarOrderActuationResult::Declined);
 		};
-		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
+		if let Some(fence) = broadcast_probe_linearity(&probe_plan.plan).blocked_fence() {
 			self.accrue_star_order_decline(
 				OptimizerDecisionKind::StarCandidate,
-				StarOrderDeclineReason::ProbeNotScanLinear,
+				StarOrderDeclineReason::ProbeNotScanLinear(fence),
 			);
 			self.render_star_order_decline(
 				render_trace,
-				StarOrderDeclineReason::ProbeNotScanLinear,
+				StarOrderDeclineReason::ProbeNotScanLinear(fence),
 				candidate.dimensions.len(),
 			);
 			return Ok(StarOrderActuationResult::Declined);
@@ -5202,7 +5205,7 @@ fn optimizer_decision_decline_reason(
 			OptimizerDecisionDeclineReason::DuplicateDimension
 		}
 		StarOrderDeclineReason::MissingEstimate => OptimizerDecisionDeclineReason::MissingEstimate,
-		StarOrderDeclineReason::ProbeNotScanLinear => {
+		StarOrderDeclineReason::ProbeNotScanLinear(_) => {
 			OptimizerDecisionDeclineReason::ProbeNotScanLinear
 		}
 	}

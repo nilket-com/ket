@@ -2195,8 +2195,8 @@ pub(crate) fn adr130_decision_helper_single_seam() {
 	assert!(choose_join_strategy.contains("kind,"));
 	assert!(choose_auto.contains("let left_build_candidate"));
 	assert!(choose_auto.contains("let right_build_candidate"));
-	assert!(choose_auto.contains("right_input.probe_scan_linear"));
-	assert!(choose_auto.contains("left_input.probe_scan_linear"));
+	assert!(choose_auto.contains("right_input.probe_linearity.is_linear()"));
+	assert!(choose_auto.contains("left_input.probe_linearity.is_linear()"));
 	assert!(
 		choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation")
 			&& choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation")
@@ -2210,17 +2210,21 @@ pub(crate) fn adr130_decision_helper_single_seam() {
 #[test]
 pub(crate) fn adr131_probe_eligibility_is_scan_linear_execution_plan_walk() {
 	let binder = binder_source();
-	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+	let helper = source_block(&binder, "fn broadcast_probe_linearity");
+	let wrapper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
 
 	assert_eq!(
 		binder.matches("fn broadcast_probe_is_scan_linear(").count(),
 		1
 	);
+	assert_eq!(binder.matches("fn broadcast_probe_linearity(").count(), 1);
 	assert!(helper.contains("match plan"));
-	assert!(helper.contains("ExecutionPlan::Scan { row_limit, .. } => row_limit.is_none()"));
+	assert!(helper.contains("ExecutionPlan::Scan { row_limit, .. }"));
+	assert!(helper.contains("ProbeLinearityFence::ScanRowLimit"));
 	assert!(helper.contains("ExecutionPlan::Filter { input, .. }"));
 	assert!(helper.contains("ExecutionPlan::Project { input, .. }"));
-	assert!(helper.contains("broadcast_probe_is_scan_linear(input)"));
+	assert!(helper.contains("broadcast_probe_linearity(input)"));
+	assert!(wrapper.contains("broadcast_probe_linearity(plan).is_linear()"));
 	assert!(!helper.contains("_ =>"));
 	assert!(!helper.contains("ExecutionPlan::Alias"));
 }
@@ -2228,13 +2232,13 @@ pub(crate) fn adr131_probe_eligibility_is_scan_linear_execution_plan_walk() {
 #[test]
 pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes() {
 	let binder = binder_source();
-	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+	let helper = source_block(&binder, "fn broadcast_probe_linearity");
 
 	for rejected in [
-		"ExecutionPlan::Aggregate",
-		"ExecutionPlan::Sort",
-		"ExecutionPlan::Take",
-		"ExecutionPlan::Exchange",
+		"ProbeLinearityFence::Aggregate",
+		"ProbeLinearityFence::Sort",
+		"ProbeLinearityFence::Take",
+		"ProbeLinearityFence::Exchange",
 		"ExecutionPlan::SystemTable",
 		"ExecutionPlan::EmptyRelation",
 		"ExecutionPlan::CreateTable",
@@ -2251,8 +2255,9 @@ pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes
 			"scan-linear helper missing rejected variant {rejected}"
 		);
 	}
-	assert!(helper.contains("| ExecutionPlan::Join { .. }"));
-	assert!(helper.contains("=> false"));
+	assert!(helper.contains("ExecutionPlan::Join { .. }"));
+	assert!(helper.contains("ProbeLinearityFence::NonBroadcastJoin"));
+	assert!(helper.contains("ProbeLinearityFence::NonScanLeaf"));
 }
 
 #[test]
@@ -2265,15 +2270,15 @@ pub(crate) fn adr131_strategy_decision_remains_single_helper() {
 	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
 	assert!(bind_scoped_join.contains("JoinInputOptimization"));
 	assert!(
-		bind_scoped_join.contains(
-			"let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);"
-		)
+		bind_scoped_join
+			.contains("let left_probe_linearity = broadcast_probe_linearity(&left_plan.plan);")
 	);
-	assert!(bind_scoped_join.contains(
-		"let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);"
-	));
-	assert!(bind_scoped_join.contains("probe_scan_linear: left_probe_scan_linear"));
-	assert!(bind_scoped_join.contains("probe_scan_linear: right_probe_scan_linear"));
+	assert!(
+		bind_scoped_join
+			.contains("let right_probe_linearity = broadcast_probe_linearity(&right_plan.plan);")
+	);
+	assert!(bind_scoped_join.contains("probe_linearity: left_probe_linearity"));
+	assert!(bind_scoped_join.contains("probe_linearity: right_probe_linearity"));
 	assert!(bind_scoped_join.contains("choose_join_strategy("));
 	assert!(!bind_scoped_join.contains("byte_upper_bound"));
 	assert!(!bind_scoped_join.contains("auto_broadcast_max_build_bytes"));

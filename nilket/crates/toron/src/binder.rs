@@ -425,7 +425,7 @@ fn preserved_outer_order_receipt(
 			edge.inner_equi = true;
 		}
 		if edge.inner_equi {
-			edge.probe_scan_linear = true;
+			edge.probe_linearity = ProbeLinearity::Linear;
 		}
 	}
 	let outcome = analyze(&counterfactual_edges, margin_step)?;
@@ -2187,8 +2187,8 @@ impl<'a> Binder<'a> {
 
 		let join_index = trace.join_decisions.len();
 		let replay_id = JoinReplayId(join_index as u32);
-		let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);
-		let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);
+		let left_probe_linearity = broadcast_probe_linearity(&left_plan.plan);
+		let right_probe_linearity = broadcast_probe_linearity(&right_plan.plan);
 		if let Some(render_trace) = render_trace.as_mut() {
 			let probe = relation_label_for_join_keys(&left_plan.scope, &left_resolved_keys);
 			let dimension = relation_label_for_join_keys(&right_plan.scope, &right_resolved_keys);
@@ -2224,7 +2224,7 @@ impl<'a> Binder<'a> {
 				estimated_rows,
 				estimate_source,
 				inner_equi: kind == JoinKind::Inner && !left_resolved_keys.is_empty(),
-				probe_scan_linear: left_probe_scan_linear,
+				probe_linearity: left_probe_linearity,
 				left_key_signature,
 				right_key_signature,
 				left_endpoint_rows,
@@ -2237,11 +2237,11 @@ impl<'a> Binder<'a> {
 			kind,
 			JoinInputOptimization {
 				facts: left_plan.facts,
-				probe_scan_linear: left_probe_scan_linear,
+				probe_linearity: left_probe_linearity,
 			},
 			JoinInputOptimization {
 				facts: right_plan.facts,
-				probe_scan_linear: right_probe_scan_linear,
+				probe_linearity: right_probe_linearity,
 			},
 			self.config,
 		)?;

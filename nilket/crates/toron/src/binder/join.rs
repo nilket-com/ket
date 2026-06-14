@@ -46,7 +46,7 @@ pub(crate) enum HashByDefaultReason {
 	NonInnerJoin,
 	LeftInputNotSingleBaseRelation,
 	RightInputNotSingleBaseRelation,
-	ProbeNotScanLinear,
+	ProbeNotScanLinear(ProbeLinearityFence),
 	MissingBuildByteUpperBound,
 	BuildByteUpperBoundAboveThreshold,
 	HashAfterBroadcastCap,
@@ -55,7 +55,51 @@ pub(crate) enum HashByDefaultReason {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct JoinInputOptimization {
 	pub(super) facts: PlanOptimizerFacts,
-	pub(super) probe_scan_linear: bool,
+	pub(super) probe_linearity: ProbeLinearity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeLinearity {
+	Linear,
+	Blocked(ProbeLinearityFence),
+}
+
+impl ProbeLinearity {
+	pub(super) fn is_linear(self) -> bool {
+		matches!(self, Self::Linear)
+	}
+
+	pub(super) fn blocked_fence(self) -> Option<ProbeLinearityFence> {
+		match self {
+			Self::Linear => None,
+			Self::Blocked(fence) => Some(fence),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeLinearityFence {
+	ScanRowLimit,
+	Take,
+	Sort,
+	Aggregate,
+	Exchange,
+	NonBroadcastJoin,
+	NonScanLeaf,
+}
+
+impl ProbeLinearityFence {
+	pub(super) fn label(self) -> &'static str {
+		match self {
+			Self::ScanRowLimit => "scan_row_limit",
+			Self::Take => "take",
+			Self::Sort => "sort",
+			Self::Aggregate => "aggregate",
+			Self::Exchange => "exchange",
+			Self::NonBroadcastJoin => "non_broadcast_join",
+			Self::NonScanLeaf => "non_scan_leaf",
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,8 +579,8 @@ pub(super) fn choose_auto_join_strategy(
 	let left_build_candidate = build_byte_candidate(left_input.facts, threshold);
 	let right_build_candidate = build_byte_candidate(right_input.facts, threshold);
 
-	let left_viable = left_build_candidate.filter(|_| right_input.probe_scan_linear);
-	let right_viable = right_build_candidate.filter(|_| left_input.probe_scan_linear);
+	let left_viable = left_build_candidate.filter(|_| right_input.probe_linearity.is_linear());
+	let right_viable = right_build_candidate.filter(|_| left_input.probe_linearity.is_linear());
 	let chosen = match placement_rule {
 		BroadcastPlacementRule::SmallerBuild => match (left_viable, right_viable) {
 			(Some(left), Some(right))
@@ -608,8 +652,14 @@ pub(super) fn choose_auto_join_strategy(
 			reason,
 		};
 	}
-	if left_build_candidate.is_some() || right_build_candidate.is_some() {
-		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear);
+	if let Some(fence) = probe_not_scan_linear_fence(
+		placement_rule,
+		left_build_candidate,
+		right_build_candidate,
+		left_input.probe_linearity,
+		right_input.probe_linearity,
+	) {
+		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear(fence));
 	}
 	if left_input.facts.origin != PlanOrigin::SingleBaseRelation {
 		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
@@ -700,11 +750,36 @@ pub(super) fn right_build_materially_smaller(
 		<= u128::from(left_bytes.get())
 }
 
-pub(super) fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
+fn probe_not_scan_linear_fence(
+	placement_rule: BroadcastPlacementRule,
+	left_build_candidate: Option<BuildByteCandidate>,
+	right_build_candidate: Option<BuildByteCandidate>,
+	left_probe_linearity: ProbeLinearity,
+	right_probe_linearity: ProbeLinearity,
+) -> Option<ProbeLinearityFence> {
+	let left_probe_fence = left_probe_linearity.blocked_fence();
+	let right_probe_fence = right_probe_linearity.blocked_fence();
+	match placement_rule {
+		BroadcastPlacementRule::SmallerBuild => left_build_candidate
+			.and(right_probe_fence)
+			.or_else(|| right_build_candidate.and(left_probe_fence)),
+		BroadcastPlacementRule::NaturalLeftBuild => left_build_candidate.and(right_probe_fence),
+		BroadcastPlacementRule::SwappedRightBuild => right_build_candidate.and(left_probe_fence),
+		BroadcastPlacementRule::Never => None,
+	}
+}
+
+pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity {
 	match plan {
-		ExecutionPlan::Scan { row_limit, .. } => row_limit.is_none(),
+		ExecutionPlan::Scan { row_limit, .. } => {
+			if row_limit.is_none() {
+				ProbeLinearity::Linear
+			} else {
+				ProbeLinearity::Blocked(ProbeLinearityFence::ScanRowLimit)
+			}
+		}
 		ExecutionPlan::Filter { input, .. } | ExecutionPlan::Project { input, .. } => {
-			broadcast_probe_is_scan_linear(input)
+			broadcast_probe_linearity(input)
 		}
 		ExecutionPlan::Join {
 			replay_id,
@@ -718,15 +793,17 @@ pub(super) fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
 			&& *strategy == JoinStrategy::Broadcast
 			&& matches!(terminal_exchange(left), Some((1, _))) =>
 		{
-			broadcast_probe_is_scan_linear(right)
+			broadcast_probe_linearity(right)
+		}
+		ExecutionPlan::Aggregate { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Aggregate),
+		ExecutionPlan::Exchange { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Exchange),
+		ExecutionPlan::Sort { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Sort),
+		ExecutionPlan::Take { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Take),
+		ExecutionPlan::Join { .. } => {
+			ProbeLinearity::Blocked(ProbeLinearityFence::NonBroadcastJoin)
 		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
-		| ExecutionPlan::Aggregate { .. }
-		| ExecutionPlan::Exchange { .. }
-		| ExecutionPlan::Sort { .. }
-		| ExecutionPlan::Take { .. }
-		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -734,8 +811,12 @@ pub(super) fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf),
 	}
+}
+
+pub(super) fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
+	broadcast_probe_linearity(plan).is_linear()
 }
 
 pub(super) fn hash_join_decision(reason: HashByDefaultReason) -> JoinStrategyDecision {

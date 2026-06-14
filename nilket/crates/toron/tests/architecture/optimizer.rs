@@ -360,15 +360,16 @@ pub(crate) fn adr133_no_public_explain_surface() {
 pub(crate) fn adr135_probe_eligibility_and_behavior_gates_cover_broadcast_star() {
 	let binder = binder_source();
 	let lib = lib_source();
-	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+	let helper = source_block(&binder, "fn broadcast_probe_linearity");
+	let wrapper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
 
 	for marker in [
 		"ExecutionPlan::Join {",
 		"*kind == JoinKind::Inner",
 		"*strategy == JoinStrategy::Broadcast",
 		"matches!(terminal_exchange(left), Some((1, _)))",
-		"broadcast_probe_is_scan_linear(right)",
-		"| ExecutionPlan::Join { .. }",
+		"broadcast_probe_linearity(right)",
+		"ExecutionPlan::Join { .. }",
 	] {
 		assert!(
 			helper.contains(marker),
@@ -379,10 +380,11 @@ pub(crate) fn adr135_probe_eligibility_and_behavior_gates_cover_broadcast_star()
 		"right_tiny_left_deep_join_infers_broadcast_star",
 		"nested_hash_probe_still_stays_hash",
 		"explain_broadcast_star_emits_one_receipt_per_link",
-		"explain_probe_not_scan_linear_reports_hash_reason_detail",
+		"hash_join_probe_not_scan_linear_renders_typed_cause",
 	] {
 		assert!(binder.contains(gate), "missing ADR135 binder gate {gate}");
 	}
+	assert!(wrapper.contains("broadcast_probe_linearity(plan).is_linear()"));
 	assert!(lib.contains("three_way_broadcast_star_digest_matches_hash_over_tcp"));
 }
 

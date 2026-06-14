@@ -2350,7 +2350,7 @@ pub(super) fn join_strategy_decision_reason_label(
 
 pub(super) fn join_strategy_decision_reason_detail(
 	reason: &JoinStrategyDecisionReason,
-) -> Option<&'static str> {
+) -> Option<String> {
 	match reason {
 		JoinStrategyDecisionReason::HashByDefault { reason } => {
 			Some(hash_by_default_reason_label(*reason))
@@ -2370,22 +2370,26 @@ pub(super) fn join_strategy_decision_detail_label(receipt: &DecisionReceipt) -> 
 	}
 }
 
-pub(super) fn hash_by_default_reason_label(reason: HashByDefaultReason) -> &'static str {
+pub(super) fn hash_by_default_reason_label(reason: HashByDefaultReason) -> String {
 	match reason {
-		HashByDefaultReason::AutoBroadcastDisabled => "auto_broadcast_disabled",
-		HashByDefaultReason::NonInnerJoin => "non_inner_join",
+		HashByDefaultReason::AutoBroadcastDisabled => "auto_broadcast_disabled".to_string(),
+		HashByDefaultReason::NonInnerJoin => "non_inner_join".to_string(),
 		HashByDefaultReason::LeftInputNotSingleBaseRelation => {
-			"left_input_not_single_base_relation"
+			"left_input_not_single_base_relation".to_string()
 		}
 		HashByDefaultReason::RightInputNotSingleBaseRelation => {
-			"right_input_not_single_base_relation"
+			"right_input_not_single_base_relation".to_string()
 		}
-		HashByDefaultReason::ProbeNotScanLinear => "probe_not_scan_linear",
-		HashByDefaultReason::MissingBuildByteUpperBound => "missing_build_byte_upper_bound",
+		HashByDefaultReason::ProbeNotScanLinear(fence) => {
+			format!("probe_not_scan_linear:{}", fence.label())
+		}
+		HashByDefaultReason::MissingBuildByteUpperBound => {
+			"missing_build_byte_upper_bound".to_string()
+		}
 		HashByDefaultReason::BuildByteUpperBoundAboveThreshold => {
-			"build_byte_upper_bound_above_threshold"
+			"build_byte_upper_bound_above_threshold".to_string()
 		}
-		HashByDefaultReason::HashAfterBroadcastCap => "hash_after_broadcast_cap",
+		HashByDefaultReason::HashAfterBroadcastCap => "hash_after_broadcast_cap".to_string(),
 	}
 }
 
@@ -2536,7 +2540,7 @@ fn snowflake_edge_strategy_label(strategy: &SnowflakeEdgeStrategy) -> String {
 		strategy.dimension,
 		join_strategy_label(strategy.strategy),
 		join_physical_placement_label(strategy.placement),
-		strategy.probe_scan_linear
+		strategy.probe_linearity.is_linear()
 	)
 }
 
@@ -2739,7 +2743,7 @@ pub(super) fn star_order_decline_outcome_label(reason: StarOrderDeclineReason) -
 		StarOrderDeclineReason::MultipleProbeRelations => "declined_multiple_probe_relations",
 		StarOrderDeclineReason::DuplicateDimension => "declined_duplicate_dimension",
 		StarOrderDeclineReason::MissingEstimate => "declined_missing_estimate",
-		StarOrderDeclineReason::ProbeNotScanLinear => "declined_probe_not_scan_linear",
+		StarOrderDeclineReason::ProbeNotScanLinear(_) => "declined_probe_not_scan_linear",
 	}
 }
 
@@ -2760,15 +2764,17 @@ pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) 
 	}
 }
 
-pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> &'static str {
+pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> String {
 	match reason {
-		StarOrderDeclineReason::MixedStrategyStar => "mixed_strategy_star",
-		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join",
-		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label",
-		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations",
-		StarOrderDeclineReason::DuplicateDimension => "duplicate_dimension",
-		StarOrderDeclineReason::MissingEstimate => "missing_estimate",
-		StarOrderDeclineReason::ProbeNotScanLinear => "probe_not_scan_linear",
+		StarOrderDeclineReason::MixedStrategyStar => "mixed_strategy_star".to_string(),
+		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join".to_string(),
+		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label".to_string(),
+		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations".to_string(),
+		StarOrderDeclineReason::DuplicateDimension => "duplicate_dimension".to_string(),
+		StarOrderDeclineReason::MissingEstimate => "missing_estimate".to_string(),
+		StarOrderDeclineReason::ProbeNotScanLinear(fence) => {
+			format!("probe_not_scan_linear:{}", fence.label())
+		}
 	}
 }
 

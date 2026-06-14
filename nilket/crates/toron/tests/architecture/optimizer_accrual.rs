@@ -1530,7 +1530,7 @@ pub(crate) fn adr214_counterfactual_uses_noop_recorder_scratch_bind() {
 	assert!(helper.contains("let mut counterfactual_edges = edges.to_vec()"));
 	assert!(helper.contains("is_preserved_outer_equi_edge"));
 	assert!(helper.contains("edge.inner_equi = true"));
-	assert!(helper.contains("edge.probe_scan_linear = true"));
+	assert!(helper.contains("edge.probe_linearity = ProbeLinearity::Linear"));
 	assert!(helper.contains("analyze(&counterfactual_edges"));
 	assert!(!helper.contains(".record("));
 	assert!(!helper.contains("decision_recorder"));
