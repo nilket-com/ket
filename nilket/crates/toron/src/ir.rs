@@ -959,6 +959,9 @@ pub enum LogicalPlan {
 		exprs: Vec<Expr>,
 		output_names: Vec<Option<String>>,
 	},
+	Distinct {
+		input: Box<LogicalPlan>,
+	},
 	Aggregate {
 		input: Box<LogicalPlan>,
 		group_expr: Vec<Expr>,

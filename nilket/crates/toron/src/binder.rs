@@ -85,6 +85,7 @@ pub(crate) use self::runtime_evidence::{
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 const DEFAULT_AUTO_JOIN_PARTITION_COUNT: u32 = 4;
+const DEFAULT_DISTINCT_PARTITION_COUNT: u32 = DEFAULT_AUTO_JOIN_PARTITION_COUNT;
 const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 	STORAGE_ROW_HLC_COLUMN,
 	STORAGE_ROW_KEY_ID_COLUMN,
@@ -1131,6 +1132,32 @@ impl<'a> Binder<'a> {
 						join_order_sources,
 					))
 				}
+				LogicalPlan::Distinct { input } => {
+					if let Some(message) = distinct_input_unsupported_message(input) {
+						return Err(BindingError::UnsupportedExpression {
+							message: message.to_string(),
+						});
+					}
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.await?;
+					let group_expr = all_output_columns_program(&input.schema())?;
+					let output_schema = input.schema();
+					let exchange_facts = input.facts.exchange();
+					let exchange_scope = input.scope.with_schema(output_schema);
+					let join_order_sources = input.join_order_sources.clone();
+					let exchange = ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						ExecutionPlan::Exchange {
+							input: Box::new(input.plan),
+							partition_count: DEFAULT_DISTINCT_PARTITION_COUNT,
+							key: group_expr.clone(),
+						},
+						exchange_scope,
+						exchange_facts,
+						join_order_sources,
+					);
+					self.bind_bound_aggregate(exchange, group_expr, Vec::new())
+				}
 				LogicalPlan::Aggregate {
 					input,
 					group_expr,
@@ -1155,21 +1182,7 @@ impl<'a> Binder<'a> {
 							.await?,
 						);
 					}
-					let logical_types = self.catalog.logical_type_registry();
-					let output_schema =
-						aggregate_schema(&group_expr, &bound_aggr_expr, &logical_types)?;
-					let scope = input.scope.aggregate(&group_expr, &output_schema);
-
-					Ok(ScopedExecutionPlan::new_with_facts(
-						ExecutionPlan::Aggregate {
-							input: Box::new(input.plan),
-							group_expr,
-							aggr_expr: bound_aggr_expr,
-							output_schema,
-						},
-						scope,
-						PlanOptimizerFacts::composite_unknown(),
-					))
+					self.bind_bound_aggregate(input, group_expr, bound_aggr_expr)
 				}
 				LogicalPlan::Exchange {
 					input,
@@ -1591,6 +1604,28 @@ impl<'a> Binder<'a> {
 			relation_scope,
 		};
 		bind_aggregate_call(function, args, input_schema, &ctx)
+	}
+
+	fn bind_bound_aggregate(
+		&self,
+		input: ScopedExecutionPlan,
+		group_expr: BoundExprProgram,
+		aggr_expr: Vec<BoundAggregateCall>,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let logical_types = self.catalog.logical_type_registry();
+		let output_schema = aggregate_schema(&group_expr, &aggr_expr, &logical_types)?;
+		let scope = input.scope.aggregate(&group_expr, &output_schema);
+
+		Ok(ScopedExecutionPlan::new_with_facts(
+			ExecutionPlan::Aggregate {
+				input: Box::new(input.plan),
+				group_expr,
+				aggr_expr,
+				output_schema,
+			},
+			scope,
+			PlanOptimizerFacts::composite_unknown(),
+		))
 	}
 
 	async fn resolve_logical_casts(
@@ -2488,6 +2523,63 @@ fn bind_alias_column_rename(
 		exprs,
 		output_schema,
 	})
+}
+
+fn all_output_columns_program(schema: &SchemaRef) -> Result<BoundExprProgram, BindingError> {
+	let mut builder = BoundExprProgramBuilder::new();
+	for (idx, field) in schema.fields().iter().enumerate() {
+		let logical_type = decode_column_logical_type(field).map_err(|error| {
+			BindingError::UnsupportedExpression {
+				message: error.to_string(),
+			}
+		})?;
+		let ordinal = ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow"));
+		let node = builder.append_column(ResolvedColumn {
+			name: ColumnName(field.name().clone()),
+			ordinal,
+			data_type: field.data_type().clone(),
+			nullable: field.is_nullable(),
+			pbc_eligible: is_pbc_eligible_type(field.data_type()),
+		});
+		if !builder.set_node_logical_type(node, logical_type) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "distinct column target is malformed".to_string(),
+			});
+		}
+		builder.push_root(node);
+	}
+	let program = builder.build();
+	program
+		.validate()
+		.map_err(|error| BindingError::UnsupportedExpression {
+			message: format!("distinct group-key program is malformed: {error:?}"),
+		})?;
+	Ok(program)
+}
+
+fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&'static str> {
+	match plan {
+		LogicalPlan::Join { .. } => Some("DISTINCT over joins is not supported"),
+		LogicalPlan::Aggregate { .. } => Some("DISTINCT over aggregate inputs is not supported"),
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. } => distinct_input_unsupported_message(input),
+		LogicalPlan::Scan { .. } | LogicalPlan::ScanNamed { .. } => None,
+		LogicalPlan::Explain { .. }
+		| LogicalPlan::ExplainAnalyze { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => Some("DISTINCT over this plan shape is not supported"),
+	}
 }
 
 fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {

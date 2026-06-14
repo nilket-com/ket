@@ -13,12 +13,12 @@ use arrow::datatypes::{DataType, TimeUnit};
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, DateTimeField,
-	Delete, DescribeAlias, ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg,
-	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
-	Ident, Insert, Interval as SqlInterval, JoinConstraint, JoinOperator, LimitClause, ObjectName,
-	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
-	Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject,
-	TimezoneInfo, TypedString, UnaryOperator, Value,
+	Delete, DescribeAlias, Distinct, ExactNumberInfo, Expr as SqlExpr, FromTable, Function,
+	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
+	HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint, JoinOperator,
+	LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle,
+	OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+	TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -36,6 +36,16 @@ use wendelon_client::{
 fn unsupported(message: impl Into<String>) -> FrontendError {
 	FrontendError::Unsupported {
 		message: message.into(),
+	}
+}
+
+fn wrap_distinct_if_needed(plan: LogicalPlan, distinct: bool) -> LogicalPlan {
+	if distinct {
+		LogicalPlan::Distinct {
+			input: Box::new(plan),
+		}
+	} else {
+		plan
 	}
 }
 
@@ -3347,9 +3357,12 @@ impl SqlPlanner {
 		let _parser_metadata_only = (select_token, top_before_distinct, window_before_qualify);
 
 		let mut broadcast_hint = parse_broadcast_join_hint(optimizer_hints)?;
-		if distinct.is_some() {
-			return Err(unsupported("DISTINCT is not supported"));
-		}
+		let distinct_requested = match distinct {
+			None => false,
+			Some(Distinct::Distinct) => true,
+			Some(Distinct::On(_)) => return Err(unsupported("DISTINCT ON is not supported")),
+			Some(Distinct::All) => return Err(unsupported("SELECT ALL is not supported")),
+		};
 		if select_modifiers.is_some() {
 			return Err(unsupported("SELECT modifiers are not supported"));
 		}
@@ -3397,6 +3410,22 @@ impl SqlPlanner {
 		} else {
 			Some(lower_group_by_keys(group_by)?)
 		};
+		if distinct_requested && group_keys.is_some() {
+			return Err(unsupported("DISTINCT with GROUP BY is not supported"));
+		}
+		if distinct_requested && having.is_some() {
+			return Err(unsupported("DISTINCT with HAVING is not supported"));
+		}
+		if distinct_requested && projection_contains_aggregate_call(projection) {
+			return Err(unsupported(
+				"DISTINCT with aggregate projections is not supported",
+			));
+		}
+		if distinct_requested && projection_contains_window_function(projection) {
+			return Err(unsupported(
+				"DISTINCT with window functions is not supported",
+			));
+		}
 		if having.is_some()
 			&& group_keys.is_none()
 			&& !projection_contains_aggregate_call(projection)
@@ -3416,6 +3445,12 @@ impl SqlPlanner {
 		}
 
 		let table_with_joins = &from[0];
+		if distinct_requested && !table_with_joins.joins.is_empty() {
+			return Err(unsupported("DISTINCT over joins is not supported"));
+		}
+		if distinct_requested && table_factor_is_derived(&table_with_joins.relation) {
+			return Err(unsupported("DISTINCT over derived tables is not supported"));
+		}
 		if group_keys.is_some() && !table_with_joins.joins.is_empty() {
 			return Err(unsupported("GROUP BY over joins is not supported"));
 		}
@@ -3592,7 +3627,7 @@ impl SqlPlanner {
 
 		if matches!(projection.as_slice(), [SelectItem::Wildcard(_)]) {
 			return Ok(LoweredSelect {
-				plan,
+				plan: wrap_distinct_if_needed(plan, distinct_requested),
 				aggregate_output_catalog: None,
 			});
 		}
@@ -3624,12 +3659,13 @@ impl SqlPlanner {
 			}
 		}
 
+		let plan = LogicalPlan::Project {
+			input: Box::new(plan),
+			exprs,
+			output_names,
+		};
 		Ok(LoweredSelect {
-			plan: LogicalPlan::Project {
-				input: Box::new(plan),
-				exprs,
-				output_names,
-			},
+			plan: wrap_distinct_if_needed(plan, distinct_requested),
 			aggregate_output_catalog: None,
 		})
 	}
@@ -6913,6 +6949,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			predicate: _,
 		}
 		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Aggregate {
 			input,
 			group_expr: _,
@@ -7381,6 +7418,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		LogicalPlan::Alias { alias, .. } => vec![alias.clone()],
 		LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
@@ -8292,6 +8330,7 @@ mod tests {
 			LogicalPlan::Filter { input, .. } => 1 + filter_count(input),
 			LogicalPlan::Alias { input, .. }
 			| LogicalPlan::Project { input, .. }
+			| LogicalPlan::Distinct { input }
 			| LogicalPlan::Aggregate { input, .. }
 			| LogicalPlan::Exchange { input, .. }
 			| LogicalPlan::Sort { input, .. }

@@ -376,6 +376,14 @@ impl RuneDataFrame {
 		}
 	}
 
+	pub fn distinct(self) -> Self {
+		Self {
+			plan: LogicalPlan::Distinct {
+				input: Box::new(self.plan),
+			},
+		}
+	}
+
 	pub fn aggregate(self, group_expr: Vec<RuneExpr>, aggr_expr: Vec<RuneAggr>) -> Self {
 		Self {
 			plan: LogicalPlan::Aggregate {
@@ -1289,6 +1297,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("filter", RuneDataFrame::filter)?;
 	m.associated_function("project", RuneDataFrame::project)?;
 	m.associated_function("project_named", RuneDataFrame::project_named)?;
+	m.associated_function("distinct", RuneDataFrame::distinct)?;
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;
 	m.associated_function("sort", RuneDataFrame::sort)?;
 	m.associated_function("limit", RuneDataFrame::limit)?;

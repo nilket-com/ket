@@ -352,6 +352,9 @@ impl Executor {
 					}
 					Ok(output)
 				}
+				LogicalPlan::Distinct { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical DISTINCT execution",
+				}),
 				LogicalPlan::Aggregate {
 					input,
 					group_expr,
@@ -4035,6 +4038,8 @@ enum GroupValue {
 	Boolean(bool),
 	Int32(i32),
 	Int64(i64),
+	Float32(u32),
+	Float64(u64),
 	Date32(i32),
 	Timestamp(TimeUnit, i64),
 	Utf8(String),
@@ -4180,6 +4185,16 @@ fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionErro
 	if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
 		return Ok(GroupValue::Int64(array.value(row)));
 	}
+	if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
+		return Ok(GroupValue::Float32(canonical_group_f32_bits(
+			array.value(row),
+		)));
+	}
+	if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
+		return Ok(GroupValue::Float64(canonical_group_f64_bits(
+			array.value(row),
+		)));
+	}
 	if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
 		return Ok(GroupValue::Date32(array.value(row)));
 	}
@@ -4207,6 +4222,26 @@ fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionErro
 	Err(ExecutionError::InvalidExpression {
 		message: format!("unsupported GROUP BY type: {:?}", array.data_type()),
 	})
+}
+
+fn canonical_group_f32_bits(value: f32) -> u32 {
+	if value == 0.0 {
+		0.0f32.to_bits()
+	} else if value.is_nan() {
+		f32::NAN.to_bits()
+	} else {
+		value.to_bits()
+	}
+}
+
+fn canonical_group_f64_bits(value: f64) -> u64 {
+	if value == 0.0 {
+		0.0f64.to_bits()
+	} else if value.is_nan() {
+		f64::NAN.to_bits()
+	} else {
+		value.to_bits()
+	}
 }
 
 fn sum_state_for_data_type(data_type: &DataType) -> AggState {
@@ -4810,6 +4845,24 @@ fn group_column(
 				.map(|key| match &key[idx] {
 					GroupValue::Null => Ok(None),
 					GroupValue::Int64(value) => Ok(Some(*value)),
+					other => Err(group_type_error(data_type, other)),
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+		))),
+		arrow::datatypes::DataType::Float32 => Ok(Arc::new(Float32Array::from(
+			keys.iter()
+				.map(|key| match &key[idx] {
+					GroupValue::Null => Ok(None),
+					GroupValue::Float32(value) => Ok(Some(f32::from_bits(*value))),
+					other => Err(group_type_error(data_type, other)),
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+		))),
+		arrow::datatypes::DataType::Float64 => Ok(Arc::new(Float64Array::from(
+			keys.iter()
+				.map(|key| match &key[idx] {
+					GroupValue::Null => Ok(None),
+					GroupValue::Float64(value) => Ok(Some(f64::from_bits(*value))),
 					other => Err(group_type_error(data_type, other)),
 				})
 				.collect::<Result<Vec<_>, _>>()?,

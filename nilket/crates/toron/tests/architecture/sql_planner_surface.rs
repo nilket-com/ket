@@ -103,7 +103,7 @@ pub(crate) fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
 pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	assert!(!planner.contains("HAVING is not supported"));
+	assert!(!planner.contains("unsupported(\"HAVING is not supported\")"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
 	assert!(planner.contains("unsupported aggregate function"));

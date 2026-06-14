@@ -21182,6 +21182,7 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }

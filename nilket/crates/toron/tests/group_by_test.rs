@@ -17,6 +17,7 @@ use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, ColumnOrdinal,
 	ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, SortExpr, TableId,
 };
+use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -1032,9 +1033,329 @@ fn having_preserves_inherited_group_by_rejects() {
 	assert_unsupported("SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n > 0");
 }
 
+#[tokio::test]
+async fn select_distinct_single_and_multi_column_dedups_rows() {
+	let single = run_logical(&plan_sql("SELECT DISTINCT region FROM sales")).await;
+	assert_eq!(
+		sorted_utf8_column_rows(&single, 0),
+		vec![None, Some("east".to_string()), Some("west".to_string())]
+	);
+
+	let multi = run_logical(&plan_sql("SELECT DISTINCT region, status FROM sales")).await;
+	assert_eq!(
+		sorted_utf8_pair_rows(&multi, 0, 1),
+		vec![
+			(None, Some("open".to_string())),
+			(Some("east".to_string()), Some("closed".to_string())),
+			(Some("east".to_string()), Some("open".to_string())),
+			(Some("west".to_string()), Some("open".to_string())),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_nulls_collapse_to_one() {
+	let results = run_logical(&plan_sql("SELECT DISTINCT all_null_amount FROM sales")).await;
+	assert_eq!(scalar_int32_column_rows(&results, 0), vec![None]);
+}
+
+#[tokio::test]
+async fn select_distinct_star_groups_all_visible_columns() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT DISTINCT * FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SELECT DISTINCT *");
+	assert_eq!(
+		field_names(&bound.schema()),
+		vec![
+			"id",
+			"region",
+			"amount",
+			"status",
+			"price",
+			"all_null_amount",
+			"score",
+			"rating32",
+			"zero64",
+		]
+	);
+
+	let results = run_logical(&logical).await;
+	let row_count = results.iter().map(RecordBatch::num_rows).sum::<usize>();
+	assert_eq!(row_count, 6, "id must stay part of DISTINCT * grouping");
+}
+
+#[tokio::test]
+async fn select_distinct_alias_and_expression_preserve_output_schema() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT DISTINCT amount + 1 AS adjusted FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind aliased DISTINCT expression");
+	assert_eq!(field_names(&bound.schema()), vec!["adjusted"]);
+
+	let results = run_logical(&logical).await;
+	assert_eq!(
+		sorted_int32_optional_rows(&results, 0),
+		vec![None, Some(8), Some(11), Some(21), Some(31)]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_duplicate_output_names_group_by_position() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT DISTINCT region AS x, status AS x FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind duplicate-name DISTINCT");
+	assert_eq!(field_names(&bound.schema()), vec!["x", "x"]);
+
+	let ExecutionPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+		..
+	} = &bound
+	else {
+		panic!("expected DISTINCT to bind to aggregate, got {bound:?}");
+	};
+	assert!(matches!(input.as_ref(), ExecutionPlan::Exchange { .. }));
+	assert!(aggr_expr.is_empty());
+	assert_column_node(
+		group_expr,
+		group_expr.roots[0],
+		"x",
+		Some(ColumnOrdinal(0)),
+		Some(&DataType::Utf8),
+	);
+	assert_column_node(
+		group_expr,
+		group_expr.roots[1],
+		"x",
+		Some(ColumnOrdinal(1)),
+		Some(&DataType::Utf8),
+	);
+
+	let results = run_logical(&logical).await;
+	assert_eq!(
+		sorted_utf8_pair_rows(&results, 0, 1),
+		vec![
+			(None, Some("open".to_string())),
+			(Some("east".to_string()), Some("closed".to_string())),
+			(Some("east".to_string()), Some("open".to_string())),
+			(Some("west".to_string()), Some("open".to_string())),
+		]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_where_order_by_limit_compose_in_existing_tail_order() {
+	let results = run_logical(&plan_sql(
+		"SELECT DISTINCT region FROM sales WHERE region IS NOT NULL ORDER BY region LIMIT 1",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_column_rows(&results, 0),
+		vec![Some("east".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn select_distinct_order_by_non_projected_column_rejects() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT DISTINCT region FROM sales ORDER BY amount");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("hidden ORDER BY source column should fail after DISTINCT");
+	assert!(
+		matches!(err, BindingError::UnknownColumn { ref column } if column == "amount"),
+		"expected unknown amount column, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
+	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project([col("region"), col("status")])
+               .distinct()
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL DISTINCT");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune DISTINCT");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("sql digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("rune digest")
+	);
+
+	let rune_star = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").distinct()
+        }
+    "#,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(
+			&run_logical(&plan_sql("SELECT DISTINCT * FROM sales")).await,
+			SortPolicy::FullRowLex
+		)
+		.expect("sql star digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_star).await, SortPolicy::FullRowLex)
+			.expect("rune star digest")
+	);
+}
+
+#[tokio::test]
+async fn distinct_lowers_to_empty_aggregate_marker_no_new_execution_op() {
+	let logical = plan_sql("SELECT DISTINCT region, status FROM sales");
+	let LogicalPlan::Distinct { input } = &logical else {
+		panic!("expected logical DISTINCT marker, got {logical:?}");
+	};
+	assert!(matches!(input.as_ref(), LogicalPlan::Project { .. }));
+
+	let (catalog, _) = fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind DISTINCT");
+	let ExecutionPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+		..
+	} = &bound
+	else {
+		panic!("expected DISTINCT to lower to aggregate, got {bound:?}");
+	};
+	assert!(aggr_expr.is_empty());
+	assert_eq!(group_expr.root_count(), 2);
+	assert_column_node(
+		group_expr,
+		group_expr.roots[0],
+		"region",
+		Some(ColumnOrdinal(0)),
+		Some(&DataType::Utf8),
+	);
+	assert_column_node(
+		group_expr,
+		group_expr.roots[1],
+		"status",
+		Some(ColumnOrdinal(1)),
+		Some(&DataType::Utf8),
+	);
+	let ExecutionPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		panic!("expected keyed exchange under DISTINCT aggregate");
+	};
+	assert_eq!(*partition_count, 4);
+	assert_eq!(key, group_expr);
+	assert!(matches!(input.as_ref(), ExecutionPlan::Project { .. }));
+}
+
 #[test]
-fn distinct_is_unsupported_not_dropped() {
-	assert_unsupported("SELECT DISTINCT region, COUNT(*) FROM sales GROUP BY region");
+fn public_group_by_without_aggregate_still_rejects() {
+	assert_unsupported_message(
+		"SELECT region FROM sales GROUP BY region",
+		"GROUP BY requires at least one aggregate call",
+	);
+}
+
+#[test]
+fn distinct_over_join_is_explicit_unsupported() {
+	assert_unsupported_message(
+		"SELECT DISTINCT sales.region FROM sales JOIN regions ON sales.region = regions.region",
+		"DISTINCT over joins is not supported",
+	);
+}
+
+#[test]
+fn distinct_in_subquery_is_explicit_unsupported() {
+	assert_unsupported("SELECT region FROM (SELECT DISTINCT region FROM sales) s");
+	assert_unsupported("SELECT * FROM sales WHERE EXISTS (SELECT DISTINCT region FROM regions)");
+	assert_unsupported_message(
+		"SELECT DISTINCT region FROM (SELECT region FROM sales) s",
+		"DISTINCT over derived tables is not supported",
+	);
+}
+
+#[tokio::test]
+async fn distinct_over_rune_join_or_aggregate_is_explicit_unsupported() {
+	let join = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .join(ctx.table("regions"), col("region").eq(col("region")))
+               .distinct()
+        }
+    "#,
+	)
+	.await;
+	let (catalog, _) = fixture();
+	let err = bind(&join, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("Rune DISTINCT over join should fail");
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message == "DISTINCT over joins is not supported"),
+		"expected Rune join DISTINCT fence, got {err:?}"
+	);
+
+	let aggregate = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([col("region")], [count_all()])
+               .distinct()
+        }
+    "#,
+	)
+	.await;
+	let err = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("Rune DISTINCT over aggregate should fail");
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message == "DISTINCT over aggregate inputs is not supported"),
+		"expected Rune aggregate DISTINCT fence, got {err:?}"
+	);
+}
+
+#[test]
+fn distinct_with_aggregate_group_by_or_having_is_explicit_unsupported() {
+	assert_unsupported_message(
+		"SELECT DISTINCT COUNT(*) FROM sales",
+		"DISTINCT with aggregate projections is not supported",
+	);
+	assert_unsupported_message(
+		"SELECT DISTINCT region FROM sales GROUP BY region",
+		"DISTINCT with GROUP BY is not supported",
+	);
+	assert_unsupported_message(
+		"SELECT DISTINCT region FROM sales HAVING region IS NOT NULL",
+		"DISTINCT with HAVING is not supported",
+	);
+	assert_unsupported_message(
+		"SELECT DISTINCT ON (region) region FROM sales",
+		"DISTINCT ON is not supported",
+	);
 }
 
 #[tokio::test]
@@ -3435,6 +3756,67 @@ fn scalar_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<O
 	rows
 }
 
+fn sorted_int32_optional_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i32>> {
+	let mut rows = scalar_int32_column_rows(results, column_idx);
+	rows.sort();
+	rows
+}
+
+fn sorted_utf8_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<String>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Utf8 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row).to_string())
+			});
+		}
+	}
+	rows.sort();
+	rows
+}
+
+fn sorted_utf8_pair_rows(
+	results: &[RecordBatch],
+	left_idx: usize,
+	right_idx: usize,
+) -> Vec<(Option<String>, Option<String>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let left = batch
+			.column(left_idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("left Utf8 column");
+		let right = batch
+			.column(right_idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("right Utf8 column");
+		for row in 0..batch.num_rows() {
+			let left = if left.is_null(row) {
+				None
+			} else {
+				Some(left.value(row).to_string())
+			};
+			let right = if right.is_null(row) {
+				None
+			} else {
+				Some(right.value(row).to_string())
+			};
+			rows.push((left, right));
+		}
+	}
+	rows.sort();
+	rows
+}
+
 fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 	match plan {
 		ExecutionPlan::Sort { .. } => true,
@@ -3863,6 +4245,15 @@ fn plan_sql(sql: &str) -> LogicalPlan {
 	SqlPlanner::new().plan(sql).expect("plan sql")
 }
 
+async fn rune_plan(script: &str) -> LogicalPlan {
+	let config = RuneSandboxConfig::v1_default();
+	let engine = RuneEngine::with_config(config).expect("Rune engine");
+	engine
+		.execute_script(script, &config)
+		.await
+		.expect("Rune-authored plan")
+}
+
 fn assert_unsupported(sql: &str) {
 	let err = SqlPlanner::new()
 		.plan(sql)
@@ -3881,6 +4272,14 @@ fn assert_unsupported_message(sql: &str, expected: &str) {
 		matches!(&err, FrontendError::Unsupported { message } if message == expected),
 		"{sql}: expected unsupported message {expected:?}, got {err}"
 	);
+}
+
+fn field_names(schema: &SchemaRef) -> Vec<&str> {
+	schema
+		.fields()
+		.iter()
+		.map(|field| field.name().as_str())
+		.collect()
 }
 
 fn assert_column(expr: &Expr, expected: &str) {

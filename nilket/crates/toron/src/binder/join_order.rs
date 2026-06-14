@@ -2173,6 +2173,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }

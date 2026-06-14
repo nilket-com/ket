@@ -185,6 +185,12 @@ impl<'a> Binder<'a> {
 					exprs: exprs.clone(),
 					output_names: output_names.clone(),
 				}),
+				LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
+					input: Box::new(
+						self.demote_null_rejected_outer_joins_inner(input, receipts)
+							.await?,
+					),
+				}),
 				LogicalPlan::Aggregate {
 					input,
 					group_expr,
@@ -324,6 +330,7 @@ impl<'a> Binder<'a> {
 					Ok(Some(RelationScope::alias(alias.clone(), &schema)))
 				}
 				LogicalPlan::Filter { input, .. }
+				| LogicalPlan::Distinct { input }
 				| LogicalPlan::Exchange { input, .. }
 				| LogicalPlan::Sort { input, .. }
 				| LogicalPlan::Take { input, .. } => self.logical_scope_for_outer_demotion(input).await,
@@ -668,6 +675,18 @@ impl<'a> Binder<'a> {
 							output_names,
 						},
 						residual,
+						receipts: routed.receipts,
+					})
+				}
+				LogicalPlan::Distinct { input } => {
+					let routed = self
+						.route_filter_routed_conjuncts(*input, conjuncts, path)
+						.await?;
+					Ok(RoutedConjuncts {
+						input: LogicalPlan::Distinct {
+							input: Box::new(routed.input),
+						},
+						residual: routed.residual,
 						receipts: routed.receipts,
 					})
 				}
