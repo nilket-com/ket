@@ -16428,6 +16428,129 @@ async fn memo_admission_still_renders_zero_admissible() {
 }
 
 #[tokio::test]
+async fn bounded_admission_candidate_contract_returns_zero_for_all_inputs() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+
+	for kind in decision_recording_kinds() {
+		for provenance in [
+			OptimizerRuntimeVerdictProvenance::Native,
+			OptimizerRuntimeVerdictProvenance::Demoted,
+		] {
+			let row = memo_admission_row(
+				&rows,
+				optimizer_decision_kind_label(kind),
+				optimizer_runtime_verdict_provenance_label(provenance),
+			);
+			assert_eq!(
+				memo_admission_i64(row, 7),
+				0,
+				"bounded candidate contract must stay unbuilt for {kind:?}/{provenance:?}"
+			);
+			assert_ne!(memo_admission_utf8(row, 2), "admissible");
+		}
+	}
+}
+
+#[tokio::test]
+async fn memo_audit_multiple_probe_relations_commits_graph_decision_not_star_decline() {
+	let catalog = three_fact_galaxy_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let logical = SqlPlanner::new()
+		.plan(three_fact_galaxy_conformed_order_sql())
+		.expect("plan conformed galaxy");
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind conformed galaxy through production path");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "galaxy_root", "reordered", None),
+		1
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[2] == ScalarValue::Utf8(Some("multiple_probe_relations".to_string()))),
+		"real conformed galaxy must not commit a star multiple-probe decline: {rows:?}"
+	);
+}
+
+#[tokio::test]
+async fn memo_audit_mixed_strategy_star_is_authorization_fence_not_missing_candidate() {
+	let catalog = mixed_strategy_star_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan mixed-strategy star");
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("mixed-strategy star decline must still bind a valid fallback plan");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "declined", Some("mixed_strategy_star")),
+		1
+	);
+
+	let legal_catalog = mixed_strategy_snowflake_join_order_catalog();
+	let legal_config = auto_broadcast_config(4_096);
+	let legal = SqlPlanner::new()
+		.plan(mixed_strategy_snowflake_order_sql())
+		.expect("plan legal mixed-strategy snowflake");
+	let _legal_plan = bind(&legal, &legal_catalog, &legal_config)
+		.await
+		.expect("authorized mixed-strategy snowflake binds");
+	let legal_rows = optimizer_decision_rows(&legal_catalog, &legal_config).await;
+	assert_eq!(
+		optimizer_decision_count(&legal_rows, "snowflake_root", "kept_optimal", None),
+		1
+	);
+	assert!(
+		!legal_rows.iter().any(|row| {
+			row[1] == ScalarValue::Utf8(Some("declined".to_string()))
+				&& row[2] == ScalarValue::Utf8(Some("mixed_strategy_star".to_string()))
+		}),
+		"authorized mixed strategy must actuate instead of committing a missing-candidate decline: {legal_rows:?}"
+	);
+}
+
+#[tokio::test]
+async fn memo_audit_probe_not_scan_linear_is_physical_fence_not_missing_candidate() {
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let logical = SqlPlanner::new()
+		.plan(observed_snowflake_order_sql())
+		.expect("plan non-scan-linear snowflake");
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("non-scan-linear probe decline must still bind a valid fallback plan");
+	assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 4);
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(
+			&rows,
+			"star_candidate",
+			"declined",
+			Some("probe_not_scan_linear")
+		),
+		1
+	);
+	assert!(
+		!rows.iter().any(|row| {
+			row[0] == ScalarValue::Utf8(Some("snowflake_root".to_string()))
+				&& row[1] == ScalarValue::Utf8(Some("reordered".to_string()))
+		}),
+		"physical-fence fallback must not claim a generated snowflake candidate: {rows:?}"
+	);
+}
+
+#[tokio::test]
 async fn optimizer_receipt_gates_windowing_manifest_stays_global_five_rows() {
 	let catalog = MockCatalog::new();
 	let runtime_evidence =

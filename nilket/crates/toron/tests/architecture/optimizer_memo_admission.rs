@@ -667,6 +667,114 @@ pub(crate) fn adr225_no_new_system_table_kind_receipt_gate_or_220_schema_change(
 }
 
 #[test]
+pub(crate) fn adr226_no_capability_decline_is_currently_contractable() {
+	let join_order = source("src/binder/join_order.rs");
+	let contract = first_block(&join_order, "fn bounded_admission_candidate_contract");
+
+	assert!(contract.contains("_kind: OptimizerDecisionKind"));
+	assert!(contract.contains("_provenance: OptimizerRuntimeVerdictProvenance"));
+	assert!(contract.contains("bounded_candidate_count: 0"));
+	assert!(contract.contains("bounded_candidate_contract_unbuilt"));
+	assert!(contract.contains("bounded_conflict_candidate_contract"));
+	assert!(!contract.contains("match "));
+	assert!(!contract.contains("if "));
+	assert!(!contract.contains("OptimizerDecisionKind::"));
+	assert!(!contract.contains("bounded_candidate_count: 1"));
+	assert!(!contract.contains("bounded_candidate_count: 2"));
+}
+
+#[test]
+pub(crate) fn adr226_memo_admission_still_renders_zero_admissible() {
+	adr224_no_admissible_rows_without_bounded_candidate_contract();
+	let tests = source("src/binder/tests.rs");
+	let rendered = first_block(
+		&tests,
+		"async fn memo_admission_still_renders_zero_admissible",
+	);
+	let direct = first_block(
+		&tests,
+		"fn bounded_admission_candidate_contract_returns_zero_for_all_inputs",
+	);
+
+	assert!(rendered.contains("memo_admission_utf8(row, 2) != \"admissible\""));
+	assert!(rendered.contains("memo_admission_i64(row, 7) == 0"));
+	assert!(direct.contains("decision_recording_kinds()"));
+	assert!(direct.contains("OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(direct.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(direct.contains("optimizer_memo_admission_table_rows(&catalog, &config).await"));
+	assert!(direct.contains("optimizer_decision_kind_label(kind)"));
+	assert!(direct.contains("optimizer_runtime_verdict_provenance_label(provenance)"));
+	assert!(direct.contains("memo_admission_i64(row, 7)"));
+}
+
+#[test]
+pub(crate) fn adr226_future_admissible_row_requires_production_home_proof() {
+	let tests = source("src/binder/tests.rs");
+	for name in [
+		"memo_audit_multiple_probe_relations_commits_graph_decision_not_star_decline",
+		"memo_audit_mixed_strategy_star_is_authorization_fence_not_missing_candidate",
+		"memo_audit_probe_not_scan_linear_is_physical_fence_not_missing_candidate",
+	] {
+		let block = first_block(&tests, &format!("async fn {name}"));
+		assert!(block.contains("bind(&logical"));
+		assert!(block.contains("optimizer_decision_rows(&catalog, &config).await"));
+		assert!(!block.contains("record_decisions("));
+		assert!(!block.contains("record_declined_conflict_decisions("));
+		assert!(!block.contains("record_conflicted_decisions("));
+		assert!(!block.contains("OptimizerDecisionOutcome::"));
+	}
+
+	let galaxy = first_block(
+		&tests,
+		"async fn memo_audit_multiple_probe_relations_commits_graph_decision_not_star_decline",
+	);
+	assert!(galaxy.contains("three_fact_galaxy_conformed_order_sql()"));
+	assert!(galaxy.contains("\"galaxy_root\""));
+	assert!(galaxy.contains("\"reordered\""));
+	assert!(galaxy.contains("\"multiple_probe_relations\""));
+
+	let mixed = first_block(
+		&tests,
+		"async fn memo_audit_mixed_strategy_star_is_authorization_fence_not_missing_candidate",
+	);
+	assert!(mixed.contains("mixed_strategy_star_join_order_catalog()"));
+	assert!(mixed.contains("\"flat_star\""));
+	assert!(mixed.contains("\"mixed_strategy_star\""));
+	assert!(mixed.contains("mixed_strategy_snowflake_order_sql()"));
+	assert!(mixed.contains("\"snowflake_root\""));
+	assert!(mixed.contains("\"kept_optimal\""));
+
+	let scan = first_block(
+		&tests,
+		"async fn memo_audit_probe_not_scan_linear_is_physical_fence_not_missing_candidate",
+	);
+	assert!(scan.contains("observed_snowflake_order_sql()"));
+	assert!(scan.contains("assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 4)"));
+	assert!(scan.contains("\"star_candidate\""));
+	assert!(scan.contains("\"probe_not_scan_linear\""));
+}
+
+#[test]
+pub(crate) fn adr226_capability_audit_makes_no_source_logic_or_matrix_change() {
+	adr225_no_new_system_table_kind_receipt_gate_or_220_schema_change();
+	super::optimizer_accrual::adr216_decision_matrix_is_140_keys_and_evidence_matrix_220();
+
+	let join_order = source("src/binder/join_order.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+	let contract = first_block(&join_order, "fn bounded_admission_candidate_contract");
+	let outcomes = first_block(&decision_log, "pub(crate) fn optimizer_decision_outcomes");
+	let recording = first_block(&decision_log, "pub(crate) fn decision_recording_kinds");
+
+	assert!(!join_order.contains("TwoProbeRelations"));
+	assert!(!decision_log.contains("TwoProbeRelations"));
+	assert!(join_order.contains("MultipleProbeRelations"));
+	assert_eq!(recording.matches("OptimizerDecisionKind::").count(), 7);
+	assert_eq!(outcomes.matches("OptimizerDecisionOutcome::").count(), 10);
+	assert!(contract.contains("bounded_candidate_count: 0"));
+	assert!(!contract.contains("OptimizerDecisionKind::"));
+}
+
+#[test]
 pub(crate) fn memo_admission_adds_no_durable_key_counter_or_flush() {
 	adr223_no_new_durable_key_counter_flush_or_wendelon_surface();
 }
