@@ -142,7 +142,7 @@ pub(crate) fn adr220_no_decision_conflict_durable_key_counter_flush_or_evidence_
 pub(crate) fn adr220_windowing_retargeted_by_adr222_counter_handoff_stays_blocked() {
 	super::optimizer_accrual::adr217_windowing_placeholder_retargeted_by_adr222_counter_handoff_stays_blocked();
 	let join_order = source("src/binder/join_order.rs");
-	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let windowing = first_block(&join_order, "fn windowing_decay_pressure");
 	let counter = first_block(&join_order, "fn counter_handoff_readiness_gate");
 	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
 

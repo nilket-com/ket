@@ -2102,13 +2102,14 @@ pub(crate) fn adr102_system_table_kind_has_finite_introspection_family() {
 	let execution = execution_source();
 	let system_kind = source_block(&execution, "pub enum SystemTableKind");
 
-	assert_eq!(enum_variant_count(&system_kind), 11);
+	assert_eq!(enum_variant_count(&system_kind), 12);
 	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
 	assert!(system_kind.contains("InformationSchemaTables"));
 	assert!(system_kind.contains("InformationSchemaColumns"));
 	assert!(system_kind.contains("InformationSchemaSchemata"));
 	assert!(system_kind.contains("InformationSchemaOptimizerDecisions"));
 	assert!(system_kind.contains("InformationSchemaOptimizerDecisionConflicts"));
+	assert!(system_kind.contains("InformationSchemaOptimizerMemoAdmission"));
 	assert!(system_kind.contains("InformationSchemaOptimizerRuntimeVerdicts"));
 	assert!(system_kind.contains("InformationSchemaOptimizerMarginAdvisory"));
 	assert!(system_kind.contains("InformationSchemaOptimizerReceiptGates"));
@@ -2133,6 +2134,7 @@ pub(crate) fn adr102_information_schema_dispatch_is_explicit() {
 		"const INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE: &str = \"optimizer_receipt_gates\""
 	));
 	assert!(binder.contains("const INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS_TABLE: &str ="));
+	assert!(binder.contains("const INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION_TABLE: &str ="));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE)"));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_TABLES_TABLE)"));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_COLUMNS_TABLE)"));
@@ -2146,7 +2148,12 @@ pub(crate) fn adr102_information_schema_dispatch_is_explicit() {
 		bind_relation
 			.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE)")
 	);
+	assert!(
+		bind_relation
+			.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_MEMO_ADMISSION_TABLE)")
+	);
 	assert!(bind_relation.contains("InformationSchemaOptimizerDecisionConflicts"));
+	assert!(bind_relation.contains("InformationSchemaOptimizerMemoAdmission"));
 	assert!(bind_relation.contains("InformationSchemaOptimizerReceiptGates"));
 	assert!(bind_relation.contains("unknown information_schema relation"));
 	assert!(!bind_relation.contains("HashMap"));

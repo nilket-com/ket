@@ -1,3 +1,4 @@
+use super::runtime_evidence::OptimizerEvidenceState;
 use super::*;
 
 pub(super) type JoinOrderSourceMap = BTreeMap<String, JoinOrderRelationFacts>;
@@ -548,6 +549,58 @@ pub(crate) struct DecisionConflictReport {
 	pub(crate) next_cut: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptimizerAdmissionStatus {
+	Cold,
+	StaleEvidence,
+	DegradedEvidence,
+	BlockedShape,
+	Admissible,
+}
+
+pub(crate) fn optimizer_memo_admission_status_label(
+	status: OptimizerAdmissionStatus,
+) -> &'static str {
+	match status {
+		OptimizerAdmissionStatus::Cold => "cold",
+		OptimizerAdmissionStatus::StaleEvidence => "stale_evidence",
+		OptimizerAdmissionStatus::DegradedEvidence => "degraded_evidence",
+		OptimizerAdmissionStatus::BlockedShape => "blocked_shape",
+		OptimizerAdmissionStatus::Admissible => "admissible",
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimizerAdmissionRow {
+	pub(crate) decision_kind: OptimizerDecisionKind,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
+	pub(crate) admission_status: OptimizerAdmissionStatus,
+	pub(crate) conflict_strength: u64,
+	pub(crate) recent_window: u64,
+	pub(crate) stale_lifetime: u64,
+	pub(crate) lifetime_total: u64,
+	pub(crate) bounded_candidate_count: u64,
+	pub(crate) evidence_health: String,
+	pub(crate) reason: String,
+	pub(crate) next_cut: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowingDecayPressure {
+	status: OptimizerReceiptGateStatus,
+	recent_window: u64,
+	stale_lifetime: u64,
+	lifetime_total: u64,
+	reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedAdmissionCandidateContract {
+	bounded_candidate_count: u64,
+	reason: &'static str,
+	next_cut: &'static str,
+}
+
 pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<OptimizerReceiptGateRow> {
 	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
 	vec![
@@ -793,6 +846,22 @@ pub(crate) fn optimizer_decision_conflict_rows(
 	decision_conflict_reports(&snapshot)
 }
 
+pub(crate) fn optimizer_memo_admission_rows(config: &PlannerConfig) -> Vec<OptimizerAdmissionRow> {
+	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+	optimizer_memo_admission_rows_from_snapshot(&snapshot)
+}
+
+pub(crate) fn optimizer_memo_admission_rows_from_snapshot(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> Vec<OptimizerAdmissionRow> {
+	let reports = decision_conflict_reports(snapshot);
+	let window = windowing_decay_pressure(snapshot);
+	reports
+		.iter()
+		.map(|report| optimizer_memo_admission_row(report, &window, snapshot))
+		.collect()
+}
+
 pub(crate) fn decision_conflict_reports(
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> Vec<DecisionConflictReport> {
@@ -950,9 +1019,74 @@ fn compare_decision_conflict_report(
 		.then_with(|| right.provenance.cmp(&left.provenance))
 }
 
-fn windowing_decay_pressure_gate(
+fn optimizer_memo_admission_row(
+	report: &DecisionConflictReport,
+	window: &WindowingDecayPressure,
 	snapshot: &OptimizerReceiptGateSnapshot,
-) -> OptimizerReceiptGateRow {
+) -> OptimizerAdmissionRow {
+	let contract = bounded_admission_candidate_contract(report.kind, report.provenance);
+	let (admission_status, reason, next_cut) =
+		if report.status != DecisionConflictStatus::Conflicted {
+			(
+				OptimizerAdmissionStatus::Cold,
+				"requires_conflicted_decision_row",
+				"decision_conflict_pressure",
+			)
+		} else if window.status != OptimizerReceiptGateStatus::Inactive
+			|| window.reason != "recent_window_matches_lifetime"
+		{
+			(
+				OptimizerAdmissionStatus::StaleEvidence,
+				"requires_recent_window_evidence",
+				"per_group_window_recency",
+			)
+		} else if snapshot.health.state != OptimizerEvidenceState::Ok {
+			(
+				OptimizerAdmissionStatus::DegradedEvidence,
+				"requires_ok_evidence_health",
+				"durable_optimizer_evidence_health",
+			)
+		} else if contract.bounded_candidate_count >= 2 {
+			(
+				OptimizerAdmissionStatus::Admissible,
+				"bounded_candidate_contract_ready",
+				contract.next_cut,
+			)
+		} else {
+			(
+				OptimizerAdmissionStatus::BlockedShape,
+				contract.reason,
+				contract.next_cut,
+			)
+		};
+
+	OptimizerAdmissionRow {
+		decision_kind: report.kind,
+		provenance: report.provenance,
+		admission_status,
+		conflict_strength: report.conflict_strength,
+		recent_window: window.recent_window,
+		stale_lifetime: window.stale_lifetime,
+		lifetime_total: window.lifetime_total,
+		bounded_candidate_count: contract.bounded_candidate_count,
+		evidence_health: evidence_health_label(&snapshot.health),
+		reason: reason.to_string(),
+		next_cut,
+	}
+}
+
+fn bounded_admission_candidate_contract(
+	_kind: OptimizerDecisionKind,
+	_provenance: OptimizerRuntimeVerdictProvenance,
+) -> BoundedAdmissionCandidateContract {
+	BoundedAdmissionCandidateContract {
+		bounded_candidate_count: 0,
+		reason: "bounded_candidate_contract_unbuilt",
+		next_cut: "bounded_conflict_candidate_contract",
+	}
+}
+
+fn windowing_decay_pressure(snapshot: &OptimizerReceiptGateSnapshot) -> WindowingDecayPressure {
 	let window = &snapshot.window;
 	let status = if window.lifetime_count < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE {
 		OptimizerReceiptGateStatus::InsufficientEvidence
@@ -969,20 +1103,33 @@ fn windowing_decay_pressure_gate(
 		OptimizerReceiptGateStatus::Inactive => "recent_window_matches_lifetime",
 		OptimizerReceiptGateStatus::BlockedExternalSignal => unreachable!(),
 	};
+	WindowingDecayPressure {
+		status,
+		recent_window: window.recent_count,
+		stale_lifetime: window.stale_lifetime_count,
+		lifetime_total: window.lifetime_count,
+		reason,
+	}
+}
+
+fn windowing_decay_pressure_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> OptimizerReceiptGateRow {
+	let pressure = windowing_decay_pressure(snapshot);
 	OptimizerReceiptGateRow {
 		gate_name: "windowing_decay_pressure",
 		gate_family: "evidence_windowing",
-		status,
-		sample_count: window.lifetime_count,
+		status: pressure.status,
+		sample_count: pressure.lifetime_total,
 		primary_signal: format!(
 			"recent_window={},stale_lifetime={},lifetime_total={}",
-			window.recent_count, window.stale_lifetime_count, window.lifetime_count
+			pressure.recent_window, pressure.stale_lifetime, pressure.lifetime_total
 		),
 		secondary_signal: format!(
 			"evidence_health={}",
 			evidence_health_label(&snapshot.health)
 		),
-		reason: reason.to_string(),
+		reason: pressure.reason.to_string(),
 		next_cut: "windowing_decay_substrate",
 	}
 }

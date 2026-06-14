@@ -2189,7 +2189,7 @@ pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
 #[test]
 pub(crate) fn adr217_windowing_placeholder_retargeted_by_adr222_counter_handoff_stays_blocked() {
 	let join_order = source("src/binder/join_order.rs");
-	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let windowing = first_block(&join_order, "fn windowing_decay_pressure");
 	let counter = first_block(&join_order, "fn counter_handoff_readiness_gate");
 
 	assert!(windowing.contains("snapshot.window"));

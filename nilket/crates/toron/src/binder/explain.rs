@@ -382,6 +382,65 @@ pub(super) fn information_schema_optimizer_decision_conflict_rows(
 	Ok(rows)
 }
 
+pub(super) fn information_schema_optimizer_memo_admission_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("provenance", DataType::Utf8, false),
+		Field::new("admission_status", DataType::Utf8, false),
+		Field::new("conflict_strength", DataType::Int64, false),
+		Field::new("recent_window", DataType::Int64, false),
+		Field::new("stale_lifetime", DataType::Int64, false),
+		Field::new("lifetime_total", DataType::Int64, false),
+		Field::new("bounded_candidate_count", DataType::Int64, false),
+		Field::new("evidence_health", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_memo_admission_rows(
+	rows: &[OptimizerAdmissionRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rendered = Vec::with_capacity(rows.len());
+	for row in rows {
+		rendered.push(vec![
+			ScalarValue::Utf8(Some(
+				optimizer_decision_kind_label(row.decision_kind).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				optimizer_runtime_verdict_provenance_label(row.provenance).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				optimizer_memo_admission_status_label(row.admission_status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.conflict_strength,
+				"optimizer memo admission conflict_strength",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_window,
+				"optimizer memo admission recent_window",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.stale_lifetime,
+				"optimizer memo admission stale_lifetime",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.lifetime_total,
+				"optimizer memo admission lifetime_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.bounded_candidate_count,
+				"optimizer memo admission bounded_candidate_count",
+			)?)),
+			ScalarValue::Utf8(Some(row.evidence_health.clone())),
+			ScalarValue::Utf8(Some(row.reason.clone())),
+			ScalarValue::Utf8(Some(row.next_cut.to_string())),
+		]);
+	}
+	Ok(rendered)
+}
+
 pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),

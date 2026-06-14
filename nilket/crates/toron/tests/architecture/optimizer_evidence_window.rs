@@ -42,7 +42,7 @@ pub(crate) fn adr222_window_keys_are_separate_namespace_not_in_220_matrix() {
 #[test]
 pub(crate) fn adr222_windowing_gate_is_computed_not_placeholder() {
 	let join_order = source("src/binder/join_order.rs");
-	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let windowing = first_block(&join_order, "fn windowing_decay_pressure");
 
 	assert!(windowing.contains("let window = &snapshot.window"));
 	assert!(windowing.contains("window.lifetime_count < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
@@ -60,12 +60,15 @@ pub(crate) fn adr222_windowing_gate_is_computed_not_placeholder() {
 #[test]
 pub(crate) fn adr222_windowing_gate_uses_window_split_not_lifetime_totals() {
 	let join_order = source("src/binder/join_order.rs");
-	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let windowing = first_block(&join_order, "fn windowing_decay_pressure");
+	let gate = first_block(&join_order, "fn windowing_decay_pressure_gate");
 
-	assert!(windowing.contains("sample_count: window.lifetime_count"));
-	assert!(windowing.contains("recent_window={}"));
-	assert!(windowing.contains("stale_lifetime={}"));
-	assert!(windowing.contains("lifetime_total={}"));
+	assert!(windowing.contains("lifetime_total: window.lifetime_count"));
+	assert!(windowing.contains("recent_window: window.recent_count"));
+	assert!(windowing.contains("stale_lifetime: window.stale_lifetime_count"));
+	assert!(gate.contains("recent_window={}"));
+	assert!(gate.contains("stale_lifetime={}"));
+	assert!(gate.contains("lifetime_total={}"));
 	assert!(windowing.contains("requires_lifetime_evidence_floor"));
 	assert!(windowing.contains("recent_window_matches_lifetime"));
 	assert!(windowing.contains("stale_window_evidence_dominates"));
@@ -158,5 +161,6 @@ pub(crate) fn adr222_no_new_information_schema_or_system_table_kind() {
 	assert!(!binder.contains("optimizer_evidence_windows"));
 	assert!(!execution.contains("OptimizerEvidenceWindow"));
 	assert!(!explain.contains("optimizer_evidence_window"));
-	assert_eq!(enum_variant_count(&system_table_kind), 11);
+	assert_eq!(enum_variant_count(&system_table_kind), 12);
+	assert!(system_table_kind.contains("InformationSchemaOptimizerMemoAdmission"));
 }

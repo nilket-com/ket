@@ -15,6 +15,7 @@ pub(crate) mod optimizer;
 pub(crate) mod optimizer_accrual;
 pub(crate) mod optimizer_decision_conflicts;
 pub(crate) mod optimizer_evidence_window;
+pub(crate) mod optimizer_memo_admission;
 pub(crate) mod optimizer_rotation;
 pub(crate) mod outer_join_completion;
 pub(crate) mod predicate_pushdown;
