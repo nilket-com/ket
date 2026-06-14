@@ -854,16 +854,30 @@ pub(crate) fn optimizer_memo_admission_rows(config: &PlannerConfig) -> Vec<Optim
 pub(crate) fn optimizer_memo_admission_rows_from_snapshot(
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> Vec<OptimizerAdmissionRow> {
-	let reports = decision_conflict_reports(snapshot);
-	let window = windowing_decay_pressure(snapshot);
+	let reports = decision_conflict_reports_from_rows(&snapshot.decisions, &snapshot.health);
+	let recent_reports =
+		decision_conflict_reports_from_rows(&snapshot.recent_decisions, &snapshot.health);
+	debug_assert_eq!(reports.len(), recent_reports.len());
 	reports
 		.iter()
-		.map(|report| optimizer_memo_admission_row(report, &window, snapshot))
+		.zip(recent_reports.iter())
+		.map(|(report, recent_report)| {
+			debug_assert_eq!(report.kind, recent_report.kind);
+			debug_assert_eq!(report.provenance, recent_report.provenance);
+			optimizer_memo_admission_row(report, recent_report, snapshot)
+		})
 		.collect()
 }
 
 pub(crate) fn decision_conflict_reports(
 	snapshot: &OptimizerReceiptGateSnapshot,
+) -> Vec<DecisionConflictReport> {
+	decision_conflict_reports_from_rows(&snapshot.decisions, &snapshot.health)
+}
+
+fn decision_conflict_reports_from_rows(
+	rows: &[OptimizerDecisionRow],
+	health: &OptimizerEvidenceStatusSnapshot,
 ) -> Vec<DecisionConflictReport> {
 	#[derive(Default)]
 	struct DecisionConflictAccumulator {
@@ -887,7 +901,7 @@ pub(crate) fn decision_conflict_reports(
 	}
 	debug_assert_eq!(grouped.len(), 14);
 
-	for row in &snapshot.decisions {
+	for row in rows {
 		if !decision_recording_kinds().contains(&row.kind) {
 			continue;
 		}
@@ -947,7 +961,7 @@ pub(crate) fn decision_conflict_reports(
 				conflict_strength,
 				top_decline_reason,
 				top_decline_count,
-				evidence_health: evidence_health_label(&snapshot.health),
+				evidence_health: evidence_health_label(health),
 				reason: decision_conflict_reason(status).to_string(),
 				next_cut: "memo",
 			}
@@ -1021,10 +1035,12 @@ fn compare_decision_conflict_report(
 
 fn optimizer_memo_admission_row(
 	report: &DecisionConflictReport,
-	window: &WindowingDecayPressure,
+	recent_report: &DecisionConflictReport,
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> OptimizerAdmissionRow {
 	let contract = bounded_admission_candidate_contract(report.kind, report.provenance);
+	let recent_window = conflict_relevant_decision_count(recent_report);
+	let lifetime_total = conflict_relevant_decision_count(report);
 	let (admission_status, reason, next_cut) =
 		if report.status != DecisionConflictStatus::Conflicted {
 			(
@@ -1032,12 +1048,10 @@ fn optimizer_memo_admission_row(
 				"requires_conflicted_decision_row",
 				"decision_conflict_pressure",
 			)
-		} else if window.status != OptimizerReceiptGateStatus::Inactive
-			|| window.reason != "recent_window_matches_lifetime"
-		{
+		} else if recent_report.status != DecisionConflictStatus::Conflicted {
 			(
 				OptimizerAdmissionStatus::StaleEvidence,
-				"requires_recent_window_evidence",
+				"requires_recent_conflicted_decision_row",
 				"per_group_window_recency",
 			)
 		} else if snapshot.health.state != OptimizerEvidenceState::Ok {
@@ -1065,14 +1079,20 @@ fn optimizer_memo_admission_row(
 		provenance: report.provenance,
 		admission_status,
 		conflict_strength: report.conflict_strength,
-		recent_window: window.recent_window,
-		stale_lifetime: window.stale_lifetime,
-		lifetime_total: window.lifetime_total,
+		recent_window,
+		stale_lifetime: lifetime_total.saturating_sub(recent_window),
+		lifetime_total,
 		bounded_candidate_count: contract.bounded_candidate_count,
 		evidence_health: evidence_health_label(&snapshot.health),
 		reason: reason.to_string(),
 		next_cut,
 	}
+}
+
+fn conflict_relevant_decision_count(report: &DecisionConflictReport) -> u64 {
+	report
+		.reordered_count
+		.saturating_add(report.blocked_or_near_miss_count)
 }
 
 fn bounded_admission_candidate_contract(

@@ -74,6 +74,7 @@ pub struct OptimizerEvidenceStatusSnapshot {
 pub(crate) struct OptimizerReceiptGateSnapshot {
 	pub(crate) verdicts: Vec<OptimizerRuntimeVerdictRow>,
 	pub(crate) decisions: Vec<OptimizerDecisionRow>,
+	pub(crate) recent_decisions: Vec<OptimizerDecisionRow>,
 	pub(crate) health: OptimizerEvidenceStatusSnapshot,
 	pub(crate) window: OptimizerEvidenceWindowSnapshot,
 }
@@ -365,11 +366,13 @@ impl OptimizerRuntimeEvidence {
 		let state = self.state.lock().expect("optimizer runtime evidence");
 		let verdicts = verdict_rows_from_state(&state);
 		let decisions = decision_rows_from_state(&state);
+		let recent_decisions = recent_decision_rows_from_state(&state, current_window);
 		let health = status_snapshot_from_state(&state);
 		let window = window_snapshot_from_state(&state, current_window);
 		OptimizerReceiptGateSnapshot {
 			verdicts,
 			decisions,
+			recent_decisions,
 			health,
 			window,
 		}
@@ -1050,6 +1053,37 @@ fn decision_rows_from_state(state: &RuntimeEvidenceState) -> Vec<OptimizerDecisi
 		let entry = counts.entry(*key).or_insert(0);
 		*entry = entry.saturating_add(*count);
 	}
+	decision_rows_from_counts(&counts)
+}
+
+fn recent_decision_rows_from_state(
+	state: &RuntimeEvidenceState,
+	current_window: OptimizerEvidenceWindowId,
+) -> Vec<OptimizerDecisionRow> {
+	let previous_window = current_window.previous();
+	let mut counts: BTreeMap<OptimizerRuntimeDecisionKey, u64> = BTreeMap::new();
+	for window_counts in [
+		&state.window_durable_cache,
+		&state.window_pending,
+		&state.window_in_flight,
+	] {
+		for (counter_key, count) in window_counts {
+			let OptimizerEvidenceWindowCounterKey::Decision { window, key } = counter_key else {
+				continue;
+			};
+			if *window != current_window && *window != previous_window {
+				continue;
+			}
+			let entry = counts.entry(*key).or_insert(0);
+			*entry = (*entry).saturating_add(*count);
+		}
+	}
+	decision_rows_from_counts(&counts)
+}
+
+fn decision_rows_from_counts(
+	counts: &BTreeMap<OptimizerRuntimeDecisionKey, u64>,
+) -> Vec<OptimizerDecisionRow> {
 	let mut rows = Vec::new();
 	for kind in decision_recording_kinds() {
 		for outcome in optimizer_decision_outcomes() {
@@ -1485,6 +1519,7 @@ mod tests {
 				count: 1,
 			}]
 		);
+		assert_eq!(snapshot.recent_decisions, snapshot.decisions);
 		assert_eq!(snapshot.health.pending_deltas, 4);
 		assert_eq!(snapshot.window.lifetime_count, 2);
 		assert_eq!(snapshot.window.recent_count, 2);
@@ -1518,6 +1553,15 @@ mod tests {
 		assert_eq!(snapshot.window.lifetime_count, 2);
 		assert_eq!(snapshot.window.recent_count, 2);
 		assert_eq!(snapshot.window.stale_lifetime_count, 0);
+		assert_eq!(
+			snapshot.recent_decisions,
+			vec![OptimizerDecisionRow {
+				kind: OptimizerDecisionKind::FlatStar,
+				outcome: OptimizerDecisionOutcome::Reordered,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
+				count: 1,
+			}]
+		);
 	}
 
 	#[test]
@@ -1548,6 +1592,7 @@ mod tests {
 		assert_eq!(snapshot.window.lifetime_count, 2);
 		assert_eq!(snapshot.window.recent_count, 0);
 		assert_eq!(snapshot.window.stale_lifetime_count, 2);
+		assert!(snapshot.recent_decisions.is_empty());
 	}
 
 	#[test]

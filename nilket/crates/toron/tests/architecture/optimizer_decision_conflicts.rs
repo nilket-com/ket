@@ -61,7 +61,7 @@ pub(crate) fn adr220_decision_conflict_rows_are_static_14_row_manifest() {
 	let decision_log = source("src/binder/decision_log.rs");
 	let join_order = source("src/binder/join_order.rs");
 	let recording = first_block(&decision_log, "pub(crate) fn decision_recording_kinds");
-	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let reports = first_block(&join_order, "fn decision_conflict_reports_from_rows");
 
 	assert_eq!(recording.matches("OptimizerDecisionKind::").count(), 7);
 	assert!(!recording.contains("PreservedOuterOrder"));
@@ -74,7 +74,7 @@ pub(crate) fn adr220_decision_conflict_rows_are_static_14_row_manifest() {
 #[test]
 pub(crate) fn adr220_conflict_model_matches_217_gate() {
 	let join_order = source("src/binder/join_order.rs");
-	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let reports = first_block(&join_order, "fn decision_conflict_reports_from_rows");
 
 	assert!(reports.contains("OptimizerDecisionOutcome::Reordered"));
 	assert!(reports.contains("OptimizerDecisionOutcome::KeptThinMargin"));
@@ -95,10 +95,12 @@ pub(crate) fn adr220_conflict_gate_and_detail_share_one_aggregation() {
 	let join_order = source("src/binder/join_order.rs");
 	let gate = first_block(&join_order, "fn decision_conflict_pressure_gate");
 	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
 
 	assert!(gate.contains("decision_conflict_reports(snapshot)"));
 	assert!(gate.contains("strongest_decision_conflict_report(&reports)"));
-	assert!(reports.contains("DecisionConflictReport"));
+	assert!(reports.contains("decision_conflict_reports_from_rows"));
+	assert!(shared.contains("DecisionConflictReport"));
 	assert!(!join_order.contains("fn strongest_decision_conflict_signal"));
 	assert!(!join_order.contains("fn compare_decision_conflict_signal"));
 }
@@ -111,10 +113,12 @@ pub(crate) fn adr220_conflict_detail_uses_decision_rows_not_verdicts() {
 		"pub(crate) fn optimizer_decision_conflict_rows",
 	);
 	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
 
 	assert!(rows.contains("receipt_gate_snapshot()"));
-	assert!(reports.contains("for row in &snapshot.decisions"));
-	assert!(!reports.contains("snapshot.verdicts"));
+	assert!(reports.contains("&snapshot.decisions"));
+	assert!(shared.contains("for row in rows"));
+	assert!(!shared.contains("snapshot.verdicts"));
 	assert!(!reports.contains("verdict_snapshot()"));
 	assert!(!reports.contains("decision_snapshot()"));
 }

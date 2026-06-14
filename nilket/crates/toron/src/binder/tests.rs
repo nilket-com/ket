@@ -15674,9 +15674,214 @@ async fn memo_admission_stale_when_conflict_recent_window_missing() {
 	assert_eq!(memo_admission_i64(row, 6), 40);
 	assert_eq!(
 		memo_admission_utf8(row, 9),
-		"requires_recent_window_evidence"
+		"requires_recent_conflicted_decision_row"
 	);
 	assert_eq!(memo_admission_utf8(row, 10), "per_group_window_recency");
+}
+
+#[tokio::test]
+async fn memo_admission_stale_when_group_conflict_is_outside_recent_window() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let gate_rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let windowing = receipt_gate_row_by_name(&gate_rows, "windowing_decay_pressure");
+	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
+	assert_eq!(
+		receipt_gate_utf8(windowing, 4),
+		"recent_window=40,stale_lifetime=40,lifetime_total=80"
+	);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 6),
+		"recent_window_matches_lifetime"
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let stale = memo_admission_row(&rows, "flat_star", "native");
+	assert_eq!(memo_admission_utf8(stale, 2), "stale_evidence");
+	assert_eq!(memo_admission_i64(stale, 4), 0);
+	assert_eq!(memo_admission_i64(stale, 5), 40);
+	assert_eq!(memo_admission_i64(stale, 6), 40);
+
+	let fresh = memo_admission_row(&rows, "bridge_root", "native");
+	assert_eq!(memo_admission_utf8(fresh, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(fresh, 4), 40);
+	assert_eq!(memo_admission_i64(fresh, 5), 0);
+	assert_eq!(memo_admission_i64(fresh, 6), 40);
+}
+
+#[tokio::test]
+async fn memo_admission_group_recency_requires_recent_conflict_not_one_sided_activity() {
+	let catalog = MockCatalog::new();
+	for (outcome, expected_recent, expected_lifetime) in [
+		(
+			OptimizerDecisionOutcome::Reordered,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 3,
+		),
+		(
+			OptimizerDecisionOutcome::KeptThinMargin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 3,
+		),
+		(
+			OptimizerDecisionOutcome::KeptOptimal,
+			0,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2,
+		),
+	] {
+		let runtime_evidence =
+			std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+		let config = PlannerConfig {
+			runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+			..PlannerConfig::default()
+		};
+		record_conflicted_decisions(
+			config.runtime_evidence.as_ref(),
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+		runtime_evidence.set_window_id_for_test(12);
+		record_decisions(
+			config.runtime_evidence.as_ref(),
+			OptimizerDecisionKind::FlatStar,
+			outcome,
+			OptimizerRuntimeVerdictProvenance::Native,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		);
+
+		let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+		let row = memo_admission_row(&rows, "flat_star", "native");
+		assert_eq!(memo_admission_utf8(row, 2), "stale_evidence");
+		assert_eq!(
+			memo_admission_utf8(row, 9),
+			"requires_recent_conflicted_decision_row"
+		);
+		assert_eq!(
+			memo_admission_i64(row, 4),
+			i64::try_from(expected_recent).unwrap()
+		);
+		assert_eq!(
+			memo_admission_i64(row, 5),
+			i64::try_from(expected_lifetime.saturating_sub(expected_recent)).unwrap()
+		);
+		assert_eq!(
+			memo_admission_i64(row, 6),
+			i64::try_from(expected_lifetime).unwrap()
+		);
+	}
+}
+
+#[tokio::test]
+async fn memo_admission_group_recency_is_lane_scoped() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let demoted = memo_admission_row(&rows, "flat_star", "demoted");
+	assert_eq!(memo_admission_utf8(demoted, 2), "stale_evidence");
+	assert_eq!(memo_admission_i64(demoted, 4), 0);
+	assert_eq!(memo_admission_i64(demoted, 5), 40);
+	assert_eq!(memo_admission_i64(demoted, 6), 40);
+	let native = memo_admission_row(&rows, "flat_star", "native");
+	assert_eq!(memo_admission_utf8(native, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(native, 4), 40);
+	assert_eq!(memo_admission_i64(native, 5), 0);
+	assert_eq!(memo_admission_i64(native, 6), 40);
+
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let native = memo_admission_row(&rows, "bridge_root", "native");
+	assert_eq!(memo_admission_utf8(native, 2), "stale_evidence");
+	assert_eq!(memo_admission_i64(native, 4), 0);
+	assert_eq!(memo_admission_i64(native, 5), 40);
+	assert_eq!(memo_admission_i64(native, 6), 40);
+	let demoted = memo_admission_row(&rows, "bridge_root", "demoted");
+	assert_eq!(memo_admission_utf8(demoted, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(demoted, 4), 40);
+	assert_eq!(memo_admission_i64(demoted, 5), 0);
+	assert_eq!(memo_admission_i64(demoted, 6), 40);
+}
+
+#[tokio::test]
+async fn memo_admission_window_columns_are_group_local_conflict_samples() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let flat = memo_admission_row(&rows, "flat_star", "native");
+	assert_eq!(memo_admission_i64(flat, 4), 0);
+	assert_eq!(memo_admission_i64(flat, 5), 40);
+	assert_eq!(memo_admission_i64(flat, 6), 40);
+	let bridge = memo_admission_row(&rows, "bridge_root", "native");
+	assert_eq!(memo_admission_i64(bridge, 4), 40);
+	assert_eq!(memo_admission_i64(bridge, 5), 0);
+	assert_eq!(memo_admission_i64(bridge, 6), 40);
 }
 
 #[test]
@@ -15689,6 +15894,20 @@ fn memo_admission_degraded_when_evidence_health_not_ok() {
 	let snapshot = OptimizerReceiptGateSnapshot {
 		verdicts: Vec::new(),
 		decisions: vec![
+			OptimizerDecisionRow {
+				kind: OptimizerDecisionKind::FlatStar,
+				outcome: OptimizerDecisionOutcome::Reordered,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
+				count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			},
+			OptimizerDecisionRow {
+				kind: OptimizerDecisionKind::FlatStar,
+				outcome: OptimizerDecisionOutcome::KeptThinMargin,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
+				count: JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			},
+		],
+		recent_decisions: vec![
 			OptimizerDecisionRow {
 				kind: OptimizerDecisionKind::FlatStar,
 				outcome: OptimizerDecisionOutcome::Reordered,
@@ -15770,6 +15989,27 @@ async fn memo_admission_blocked_shape_when_conflicted_recent_and_healthy() {
 	);
 }
 
+#[tokio::test]
+async fn memo_admission_blocked_shape_when_same_group_conflict_is_recent() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let row = memo_admission_row(&rows, "snowflake_root", "native");
+
+	assert_eq!(memo_admission_utf8(row, 2), "blocked_shape");
+	assert_eq!(memo_admission_i64(row, 3), 20);
+	assert_eq!(memo_admission_i64(row, 4), 40);
+	assert_eq!(memo_admission_i64(row, 5), 0);
+	assert_eq!(memo_admission_i64(row, 6), 40);
+	assert_eq!(memo_admission_i64(row, 7), 0);
+}
+
 #[test]
 fn memo_admission_uses_same_snapshot_as_conflict_and_window_health() {
 	let runtime_evidence = OptimizerRuntimeEvidence::local_only_with_window_id(10);
@@ -15795,13 +16035,103 @@ fn memo_admission_uses_same_snapshot_as_conflict_and_window_health() {
 		.expect("bridge demoted admission row");
 
 	assert_eq!(admission.conflict_strength, conflict.conflict_strength);
-	assert_eq!(admission.recent_window, snapshot.window.recent_count);
-	assert_eq!(
-		admission.stale_lifetime,
-		snapshot.window.stale_lifetime_count
-	);
-	assert_eq!(admission.lifetime_total, snapshot.window.lifetime_count);
+	assert_eq!(admission.recent_window, 40);
+	assert_eq!(admission.stale_lifetime, 0);
+	assert_eq!(admission.lifetime_total, 40);
 	assert_eq!(admission.evidence_health, conflict.evidence_health);
+}
+
+#[test]
+fn memo_admission_group_recency_uses_same_receipt_snapshot() {
+	let runtime_evidence = OptimizerRuntimeEvidence::local_only_with_window_id(10);
+	record_conflicted_decisions(
+		&runtime_evidence,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let snapshot = runtime_evidence.receipt_gate_snapshot();
+	let rows = optimizer_memo_admission_rows_from_snapshot(&snapshot);
+	let row = rows
+		.iter()
+		.find(|row| {
+			row.decision_kind == OptimizerDecisionKind::BridgeRoot
+				&& row.provenance == OptimizerRuntimeVerdictProvenance::Native
+		})
+		.expect("bridge native admission row");
+	let recent_conflict_relevant = snapshot
+		.recent_decisions
+		.iter()
+		.filter(|row| {
+			row.kind == OptimizerDecisionKind::BridgeRoot
+				&& row.provenance == OptimizerRuntimeVerdictProvenance::Native
+				&& matches!(
+					row.outcome,
+					OptimizerDecisionOutcome::Reordered | OptimizerDecisionOutcome::KeptThinMargin
+				)
+		})
+		.fold(0_u64, |sum, row| sum.saturating_add(row.count));
+
+	assert_eq!(row.recent_window, recent_conflict_relevant);
+	assert_eq!(row.lifetime_total, 40);
+	assert_eq!(row.stale_lifetime, 0);
+	assert_eq!(snapshot, runtime_evidence.receipt_gate_snapshot());
+}
+
+#[tokio::test]
+async fn memo_admission_still_renders_zero_admissible() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+	);
+
+	let rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	assert!(
+		rows.iter()
+			.all(|row| memo_admission_utf8(row, 2) != "admissible")
+	);
+	assert!(rows.iter().all(|row| memo_admission_i64(row, 7) == 0));
+}
+
+#[tokio::test]
+async fn optimizer_receipt_gates_windowing_manifest_stays_global_five_rows() {
+	let catalog = MockCatalog::new();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	assert_receipt_gate_order(&rows);
+	assert_eq!(rows.len(), 5);
+	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
+	assert_eq!(receipt_gate_i64(windowing, 3), 80);
+	assert_eq!(
+		receipt_gate_utf8(windowing, 4),
+		"recent_window=40,stale_lifetime=40,lifetime_total=80"
+	);
 }
 
 #[tokio::test]
@@ -15862,6 +16192,52 @@ async fn rune_queries_optimizer_memo_admission() {
 	let plan = bind(&logical, &catalog, &config)
 		.await
 		.expect("bind Rune optimizer memo admission report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer memo admission system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerMemoAdmission
+	);
+	assert_eq!(rows, sql_rows);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_memo_admission_with_group_recency() {
+	let catalog = star_join_order_catalog();
+	let runtime_evidence =
+		std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(10));
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::clone(&runtime_evidence),
+		..PlannerConfig::default()
+	};
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	runtime_evidence.set_window_id_for_test(12);
+	record_conflicted_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	let sql_rows = optimizer_memo_admission_table_rows(&catalog, &config).await;
+	let stale = memo_admission_row(&sql_rows, "flat_star", "native");
+	assert_eq!(memo_admission_utf8(stale, 2), "stale_evidence");
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_memo_admission")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer memo admission group recency report");
 	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
 		panic!("expected Rune optimizer memo admission system table");
 	};

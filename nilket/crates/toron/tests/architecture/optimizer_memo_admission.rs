@@ -69,8 +69,13 @@ pub(crate) fn adr223_memo_admission_rows_are_static_14_group_manifest() {
 
 	assert_eq!(recording.matches("OptimizerDecisionKind::").count(), 7);
 	assert!(!recording.contains("PreservedOuterOrder"));
-	assert!(from_snapshot.contains("decision_conflict_reports(snapshot)"));
-	assert!(from_snapshot.contains("windowing_decay_pressure(snapshot)"));
+	assert!(
+		from_snapshot
+			.contains("decision_conflict_reports_from_rows(&snapshot.decisions, &snapshot.health)")
+	);
+	assert!(from_snapshot.contains(
+		"decision_conflict_reports_from_rows(&snapshot.recent_decisions, &snapshot.health)"
+	));
 	assert!(from_snapshot.contains(".iter()"));
 	assert_eq!(enum_variant_count(&status), 5);
 	for token in [
@@ -108,12 +113,18 @@ pub(crate) fn adr223_admission_uses_decision_conflict_reports_and_window_snapsho
 	assert!(!rows.contains("status_snapshot()"));
 	assert!(rows.contains("optimizer_memo_admission_rows_from_snapshot(&snapshot)"));
 	assert!(!from_snapshot.contains("receipt_gate_snapshot()"));
-	assert!(from_snapshot.contains("decision_conflict_reports(snapshot)"));
-	assert!(from_snapshot.contains("windowing_decay_pressure(snapshot)"));
+	assert!(
+		from_snapshot
+			.contains("decision_conflict_reports_from_rows(&snapshot.decisions, &snapshot.health)")
+	);
+	assert!(from_snapshot.contains(
+		"decision_conflict_reports_from_rows(&snapshot.recent_decisions, &snapshot.health)"
+	));
+	assert!(from_snapshot.contains(".zip(recent_reports.iter())"));
 	assert!(row.contains("report.conflict_strength"));
-	assert!(row.contains("window.recent_window"));
-	assert!(row.contains("window.stale_lifetime"));
-	assert!(row.contains("window.lifetime_total"));
+	assert!(row.contains("recent_report.status != DecisionConflictStatus::Conflicted"));
+	assert!(row.contains("conflict_relevant_decision_count(recent_report)"));
+	assert!(row.contains("conflict_relevant_decision_count(report)"));
 	assert!(row.contains("evidence_health_label(&snapshot.health)"));
 }
 
@@ -124,9 +135,11 @@ pub(crate) fn adr223_recent_evidence_requires_222_window_inactive_recent_reason(
 	let window = first_block(&join_order, "fn windowing_decay_pressure");
 
 	assert!(row.contains("report.status != DecisionConflictStatus::Conflicted"));
-	assert!(row.contains("window.status != OptimizerReceiptGateStatus::Inactive"));
-	assert!(row.contains("window.reason != \"recent_window_matches_lifetime\""));
+	assert!(row.contains("recent_report.status != DecisionConflictStatus::Conflicted"));
+	assert!(!row.contains("window.status"));
+	assert!(!row.contains("window.reason"));
 	assert!(row.contains("OptimizerAdmissionStatus::StaleEvidence"));
+	assert!(row.contains("requires_recent_conflicted_decision_row"));
 	assert!(row.contains("per_group_window_recency"));
 	assert!(window.contains("recent_window_matches_lifetime"));
 	assert!(window.contains("stale_window_evidence_dominates"));
@@ -228,6 +241,193 @@ pub(crate) fn adr223_no_receipt_gate_manifest_change() {
 }
 
 #[test]
+pub(crate) fn adr224_receipt_snapshot_carries_group_window_decision_rows() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let snapshot_struct = first_block(
+		&runtime_evidence,
+		"pub(crate) struct OptimizerReceiptGateSnapshot",
+	);
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn receipt_gate_snapshot");
+	let recent = first_block(&runtime_evidence, "fn recent_decision_rows_from_state");
+
+	assert!(snapshot_struct.contains("recent_decisions: Vec<OptimizerDecisionRow>"));
+	assert_eq!(snapshot.matches("self.state.lock()").count(), 1);
+	assert!(snapshot.contains("let current_window = self.window_id_source.current()"));
+	assert!(snapshot.contains("recent_decision_rows_from_state(&state, current_window)"));
+	assert!(snapshot.contains("recent_decisions,"));
+	assert!(recent.contains("let previous_window = current_window.previous()"));
+	assert!(recent.contains("&state.window_durable_cache"));
+	assert!(recent.contains("&state.window_pending"));
+	assert!(recent.contains("&state.window_in_flight"));
+	assert!(recent.contains("OptimizerEvidenceWindowCounterKey::Decision"));
+	assert!(recent.contains("*window != current_window && *window != previous_window"));
+	assert!(!recent.contains("OptimizerEvidenceWindowCounterKey::Verdict"));
+}
+
+#[test]
+pub(crate) fn adr224_group_window_rows_mirror_lifetime_native_demoted_projection() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let lifetime = first_block(&runtime_evidence, "fn decision_rows_from_state");
+	let recent = first_block(&runtime_evidence, "fn recent_decision_rows_from_state");
+	let projection = first_block(&runtime_evidence, "fn decision_rows_from_counts");
+
+	assert!(lifetime.contains("decision_rows_from_counts(&counts)"));
+	assert!(recent.contains("decision_rows_from_counts(&counts)"));
+	assert!(projection.contains("OptimizerRuntimeEvidenceLane::Total"));
+	assert!(projection.contains("OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(projection.contains("let native = total.saturating_sub(demoted)"));
+	assert!(projection.contains("provenance: OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(projection.contains("provenance: OptimizerRuntimeVerdictProvenance::Demoted"));
+}
+
+#[test]
+pub(crate) fn adr224_group_recency_reuses_220_conflict_manifest() {
+	let join_order = source("src/binder/join_order.rs");
+	let wrapper = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let from_snapshot = first_block(
+		&join_order,
+		"pub(crate) fn optimizer_memo_admission_rows_from_snapshot",
+	);
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
+
+	assert!(wrapper.contains("decision_conflict_reports_from_rows(&snapshot.decisions"));
+	assert!(
+		from_snapshot
+			.contains("decision_conflict_reports_from_rows(&snapshot.decisions, &snapshot.health)")
+	);
+	assert!(from_snapshot.contains(
+		"decision_conflict_reports_from_rows(&snapshot.recent_decisions, &snapshot.health)"
+	));
+	assert!(shared.contains("for kind in decision_recording_kinds()"));
+	assert!(shared.contains("OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(shared.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(shared.contains("debug_assert_eq!(grouped.len(), 14)"));
+	assert!(shared.contains("OptimizerDecisionOutcome::Reordered"));
+	assert!(shared.contains("OptimizerDecisionOutcome::KeptThinMargin"));
+	assert!(shared.contains("OptimizerDecisionOutcome::Declined(reason)"));
+	assert!(shared.contains("OptimizerDecisionOutcome::KeptOptimal"));
+	assert!(shared.contains("decision_conflict_status("));
+}
+
+#[test]
+pub(crate) fn adr224_memo_admission_uses_group_recency_not_global_window_for_rows() {
+	let join_order = source("src/binder/join_order.rs");
+	let from_snapshot = first_block(
+		&join_order,
+		"pub(crate) fn optimizer_memo_admission_rows_from_snapshot",
+	);
+	let row = first_block(&join_order, "fn optimizer_memo_admission_row(");
+
+	assert!(!from_snapshot.contains("windowing_decay_pressure(snapshot)"));
+	assert!(from_snapshot.contains("recent_reports"));
+	assert!(from_snapshot.contains(".zip(recent_reports.iter())"));
+	assert!(row.contains("recent_report.status != DecisionConflictStatus::Conflicted"));
+	assert!(row.contains("OptimizerAdmissionStatus::StaleEvidence"));
+	assert!(row.contains("requires_recent_conflicted_decision_row"));
+	assert!(row.contains("let recent_window = conflict_relevant_decision_count(recent_report)"));
+	assert!(row.contains("let lifetime_total = conflict_relevant_decision_count(report)"));
+	assert!(row.contains("stale_lifetime: lifetime_total.saturating_sub(recent_window)"));
+	assert!(!row.contains("OptimizerReceiptGateStatus"));
+	assert!(!row.contains("recent_window_matches_lifetime"));
+}
+
+#[test]
+pub(crate) fn adr224_group_recency_requires_recent_conflict_not_activity() {
+	let join_order = source("src/binder/join_order.rs");
+	let row = first_block(&join_order, "fn optimizer_memo_admission_row(");
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
+	let status = first_block(&join_order, "fn decision_conflict_status(");
+
+	assert!(row.contains("recent_report.status != DecisionConflictStatus::Conflicted"));
+	assert!(status.contains("reordered_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(status.contains("blocked_or_near_miss_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(status.contains("DecisionConflictStatus::OneSidedReordered"));
+	assert!(status.contains("DecisionConflictStatus::OneSidedBlocked"));
+	assert!(shared.contains("OptimizerDecisionOutcome::KeptOptimal"));
+	assert!(shared.contains("kept_optimal_count"));
+	assert!(shared.contains("blocked_or_near_miss_count = accumulator"));
+	assert!(!status.contains("total_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+}
+
+#[test]
+pub(crate) fn adr224_group_recency_is_lane_scoped() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let record_decision = first_block(&runtime_evidence, "pub(crate) fn record_decision");
+	let recent = first_block(&runtime_evidence, "fn recent_decision_rows_from_state");
+	let projection = first_block(&runtime_evidence, "fn decision_rows_from_counts");
+
+	assert!(record_decision.contains("OptimizerRuntimeEvidenceLane::Total"));
+	assert!(record_decision.contains("OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(record_decision.contains("provenance == OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(recent.contains("OptimizerEvidenceWindowCounterKey::Decision"));
+	assert!(recent.contains("decision_rows_from_counts(&counts)"));
+	assert!(projection.contains("let native = total.saturating_sub(demoted)"));
+	assert!(projection.contains("provenance: OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(projection.contains("provenance: OptimizerRuntimeVerdictProvenance::Demoted"));
+}
+
+#[test]
+pub(crate) fn adr224_global_windowing_receipt_gate_manifest_unchanged() {
+	adr223_no_receipt_gate_manifest_change();
+	let join_order = source("src/binder/join_order.rs");
+	let rows = first_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+	let gate = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let admission = first_block(
+		&join_order,
+		"pub(crate) fn optimizer_memo_admission_rows_from_snapshot",
+	);
+
+	assert_eq!(
+		rows.matches("windowing_decay_pressure_gate(&snapshot)")
+			.count(),
+		1
+	);
+	assert!(gate.contains("windowing_decay_pressure(snapshot)"));
+	assert!(gate.contains("gate_name: \"windowing_decay_pressure\""));
+	assert!(gate.contains("gate_family: \"evidence_windowing\""));
+	assert!(!admission.contains("windowing_decay_pressure(snapshot)"));
+}
+
+#[test]
+pub(crate) fn adr224_no_admissible_rows_without_bounded_candidate_contract() {
+	adr223_blocked_shape_is_not_admissible_without_bounded_contract();
+	let join_order = source("src/binder/join_order.rs");
+	let row = first_block(&join_order, "fn optimizer_memo_admission_row(");
+	let contract = first_block(&join_order, "fn bounded_admission_candidate_contract");
+
+	assert!(row.contains("contract.bounded_candidate_count >= 2"));
+	assert!(row.contains("OptimizerAdmissionStatus::Admissible"));
+	assert!(row.contains("OptimizerAdmissionStatus::BlockedShape"));
+	assert!(contract.contains("bounded_candidate_count: 0"));
+}
+
+#[test]
+pub(crate) fn adr224_no_new_window_key_counter_flush_or_wendelon_surface() {
+	adr223_no_new_durable_key_counter_flush_or_wendelon_surface();
+	super::optimizer_evidence_window::adr222_window_keys_are_separate_namespace_not_in_220_matrix();
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let window_keys = first_block(&runtime_evidence, "pub(crate) fn all_window_counter_keys");
+	let tests = source("src/binder/runtime_evidence.rs");
+
+	assert!(window_keys.contains("all_verdict_counter_keys"));
+	assert!(window_keys.contains("all_decision_counter_keys"));
+	assert!(tests.contains("assert_eq!(window_keys.len(), 440)"));
+	assert!(!window_keys.contains("group"));
+	assert!(!window_keys.contains("recency"));
+	assert!(!window_keys.contains("admission"));
+}
+
+#[test]
+pub(crate) fn adr224_no_memo_engine_or_policy_consumer() {
+	adr223_no_memo_engine_or_policy_consumer();
+}
+
+#[test]
 pub(crate) fn memo_admission_adds_no_durable_key_counter_or_flush() {
 	adr223_no_new_durable_key_counter_flush_or_wendelon_surface();
+}
+
+#[test]
+pub(crate) fn memo_admission_group_recency_adds_no_durable_key_counter_or_flush() {
+	adr224_no_new_window_key_counter_flush_or_wendelon_surface();
 }

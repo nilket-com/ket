@@ -107,9 +107,11 @@ pub(crate) fn adr222_window_snapshot_is_single_locked_snapshot() {
 
 	assert_eq!(snapshot.matches("self.state.lock()").count(), 1);
 	assert!(snapshot.contains("let current_window = self.window_id_source.current()"));
+	assert!(snapshot.contains("recent_decision_rows_from_state(&state, current_window)"));
 	assert!(snapshot.contains("window_snapshot_from_state(&state, current_window)"));
 	assert!(snapshot.contains("OptimizerReceiptGateSnapshot"));
 	assert!(runtime_evidence.contains("window: OptimizerEvidenceWindowSnapshot"));
+	assert!(runtime_evidence.contains("recent_decisions: Vec<OptimizerDecisionRow>"));
 	assert!(window_snapshot.contains("lifetime_total_count_from_state(state)"));
 	assert!(window_snapshot.contains("window_total_count_from_state(state, current_window)"));
 	assert!(window_snapshot.contains("window_total_count_from_state(state, previous_window)"));

@@ -2166,6 +2166,7 @@ pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
 	let join_order = source("src/binder/join_order.rs");
 	let gate = first_block(&join_order, "fn decision_conflict_pressure_gate");
 	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let shared = first_block(&join_order, "fn decision_conflict_reports_from_rows");
 	let strongest = first_block(&join_order, "fn strongest_decision_conflict_report");
 	let compare = first_block(&join_order, "fn compare_decision_conflict_report");
 
@@ -2176,11 +2177,12 @@ pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
 	assert!(join_order.contains("fn decision_conflict_status("));
 	assert!(join_order.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
 	assert!(reports.contains("snapshot.decisions"));
-	assert!(reports.contains("OptimizerDecisionOutcome::Reordered"));
-	assert!(reports.contains("OptimizerDecisionOutcome::KeptThinMargin"));
-	assert!(reports.contains("OptimizerDecisionOutcome::Declined(reason)"));
-	assert!(reports.contains("OptimizerDecisionOutcome::KeptOptimal"));
-	assert!(reports.contains("row.provenance"));
+	assert!(reports.contains("decision_conflict_reports_from_rows"));
+	assert!(shared.contains("OptimizerDecisionOutcome::Reordered"));
+	assert!(shared.contains("OptimizerDecisionOutcome::KeptThinMargin"));
+	assert!(shared.contains("OptimizerDecisionOutcome::Declined(reason)"));
+	assert!(shared.contains("OptimizerDecisionOutcome::KeptOptimal"));
+	assert!(shared.contains("row.provenance"));
 	assert!(strongest.contains("report.total_count > 0"));
 	assert!(compare.contains("conflict_strength"));
 	assert!(compare.contains("total_count"));
