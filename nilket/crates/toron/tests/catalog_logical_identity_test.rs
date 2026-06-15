@@ -835,6 +835,7 @@ fn join_plan(left_key: Expr, right_key: Expr) -> LogicalPlan {
 		}),
 		kind: JoinKind::Inner,
 		on: vec![(left_key, right_key)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,

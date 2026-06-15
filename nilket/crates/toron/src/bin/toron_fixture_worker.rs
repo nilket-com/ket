@@ -63,6 +63,14 @@ impl FixtureStorageScan {
 			Field::new("id", DataType::Int64, false),
 			Field::new("region", DataType::Utf8, true),
 		]));
+		let set_left_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("set_key", DataType::Int64, true),
+		]));
+		let set_right_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("set_key", DataType::Int64, true),
+		]));
 		let vals = RecordBatch::try_new(
 			vals_schema,
 			vec![
@@ -91,12 +99,28 @@ impl FixtureStorageScan {
 				Arc::new(StringArray::from(vec![Some("west"), Some("west")])),
 			],
 		)?;
+		let set_left = RecordBatch::try_new(
+			set_left_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+				Arc::new(Int64Array::from(vec![Some(7), None, Some(9), None])),
+			],
+		)?;
+		let set_right = RecordBatch::try_new(
+			set_right_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10, 11, 12])),
+				Arc::new(Int64Array::from(vec![None, Some(9), Some(10)])),
+			],
+		)?;
 
 		Ok(Self {
 			tables: HashMap::from([
 				(TableId(1), vals),
 				(TableId(2), orders),
 				(TableId(3), customers),
+				(TableId(4), set_left),
+				(TableId(5), set_right),
 			]),
 		})
 	}
@@ -112,6 +136,13 @@ impl StorageScan for FixtureStorageScan {
 				.ok_or(StorageError::TableNotFound {
 					table: request.table_id,
 				})?;
+		if let Some(columns) = request.projected_columns {
+			let indices = columns
+				.into_iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			batch = batch.project(&indices)?;
+		}
 		if let Some((morsel_id, total_morsels)) = request.morsel {
 			let total_rows = batch.num_rows();
 			let rows_per_morsel =

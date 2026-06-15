@@ -279,6 +279,7 @@ async fn run_join(
 		kind: JoinKind::Inner,
 		left_keys,
 		right_keys,
+		null_safe_keys: false,
 		strategy: JoinStrategy::HashPartitioned,
 		output_schema,
 	};

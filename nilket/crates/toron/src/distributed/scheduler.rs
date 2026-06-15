@@ -1126,6 +1126,9 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_broadcast_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			contains_broadcast_join(left) || contains_broadcast_join(right)
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1160,6 +1163,9 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_scan_fingerprint(input),
 		ExecutionPlan::Join { left, right, .. } => {
+			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
+		}
+		ExecutionPlan::Union { left, right, .. } => {
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
 		}
 		ExecutionPlan::EmptyRelation { .. }
@@ -1697,6 +1703,7 @@ mod tests {
 			kind,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: crate::binder::join_schema(kind, &left_schema, &right_schema),
 		};

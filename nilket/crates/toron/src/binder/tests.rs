@@ -527,6 +527,7 @@ async fn bind_hash_join_resolves_qualified_keys_and_duplicate_output_names() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -566,6 +567,7 @@ async fn bind_hash_join_auto_swaps_reversed_on_pair() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -598,6 +600,7 @@ async fn bind_join_rejects_ambiguous_unqualified_column() {
 		right: Box::new(exchanged_named_scan("customers", "id", 2)),
 		kind: JoinKind::Inner,
 		on: vec![(Expr::column("id"), Expr::column("id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -623,6 +626,7 @@ async fn bind_join_rejects_unknown_qualifier() {
 			Expr::qualified_column(TableRef::new("missing"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -657,6 +661,7 @@ async fn bind_join_rejects_non_equi_and_computed_keys() {
 			),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -671,6 +676,7 @@ async fn bind_join_rejects_non_equi_and_computed_keys() {
 			Expr::Literal(ScalarValue::Int64(Some(7))),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -703,6 +709,7 @@ async fn bind_join_rejects_key_type_mismatch_and_float_keys() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "region"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -726,6 +733,7 @@ async fn bind_join_rejects_key_type_mismatch_and_float_keys() {
 			Expr::qualified_column(TableRef::new("left_floats"), "f"),
 			Expr::qualified_column(TableRef::new("right_floats"), "f"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -752,6 +760,7 @@ async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -766,6 +775,7 @@ async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -804,6 +814,7 @@ async fn bind_pinned_broadcast_physicalizes_left_build() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -842,6 +853,7 @@ async fn bind_pinned_broadcast_rejects_preshaped_probe_exchange() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -867,6 +879,7 @@ async fn auto_broadcast_sql_unhinted_tiny_left_join_infers_broadcast() {
 	assert!(matches!(
 		logical,
 		LogicalPlan::Join {
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 			..
 		}
@@ -1133,6 +1146,7 @@ async fn positive_in_demotes_negated_in_does_not() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let positive = LogicalPlan::Filter {
@@ -1348,6 +1362,7 @@ async fn predicate_does_not_cross_outer_boundary_to_reach_deeper_edge() {
 			right: Box::new(named_scan("products")),
 			kind: JoinKind::LeftOuter,
 			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 		predicate: customers_region_is_north(),
@@ -1540,6 +1555,7 @@ async fn full_outer_stepwise_demotes_via_propagation() {
 			right: Box::new(named_scan("products")),
 			kind: JoinKind::Inner,
 			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 		predicate: Expr::IsNotNull(Box::new(qcol("orders", "id"))),
@@ -1566,6 +1582,7 @@ async fn multi_conjuncts_can_demote_two_edges_in_one_pass() {
 			right: Box::new(products_stores_left_join()),
 			kind: JoinKind::Inner,
 			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 		predicate: Expr::And(
@@ -2095,6 +2112,7 @@ async fn left_outer_right_build_auto_broadcast_executes_as_physical_right_outer(
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -2132,6 +2150,7 @@ async fn right_outer_natural_left_build_auto_broadcast_keeps_physical_right_oute
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -2173,6 +2192,7 @@ async fn left_semi_and_left_anti_auto_broadcast_build_right_without_restore_proj
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		};
 
@@ -2211,6 +2231,7 @@ async fn direct_non_inner_preserved_side_broadcast_pin_stays_rejected() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -2833,6 +2854,7 @@ async fn pk_filtered_string_dim_broadcasts_by_estimate() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -2895,6 +2917,7 @@ async fn direct_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -3946,6 +3969,7 @@ async fn missing_ndv_keeps_137_138_behavior() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8342,6 +8366,7 @@ async fn join_output_containment_skips_non_inner_join() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8442,6 +8467,7 @@ async fn take_limited_composite_still_does_not_broadcast_without_join_estimated_
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8626,6 +8652,7 @@ async fn filtered_tiny_dim_infers_broadcast() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8668,6 +8695,7 @@ async fn narrowing_project_tiny_dim_infers_broadcast() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8714,6 +8742,7 @@ async fn expression_project_drops_byte_bound_and_hashes() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8785,6 +8814,7 @@ async fn pk_filtered_large_table_caps_rows_but_still_hashes() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8901,6 +8931,7 @@ async fn filtered_dim_without_facts_still_hashes() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8940,6 +8971,7 @@ async fn left_tiny_with_filtered_probe_infers_broadcast() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -8988,6 +9020,7 @@ async fn right_tiny_with_projected_probe_infers_broadcast() {
 			Expr::column("customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -9224,6 +9257,7 @@ async fn probe_linearity_nested_broadcast_propagates_inner_cause() {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		},
 		&catalog,
@@ -9272,6 +9306,7 @@ async fn probe_linearity_nested_broadcast_propagates_inner_cause() {
 		kind,
 		left_keys,
 		right_keys,
+		null_safe_keys: false,
 		strategy,
 		output_schema,
 	};
@@ -9336,6 +9371,7 @@ async fn probe_with_aggregate_stays_hash() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::column("customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -9368,6 +9404,7 @@ async fn probe_with_take_or_limited_scan_stays_hash() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -9392,6 +9429,7 @@ async fn sql_broadcast_hint_binds_pinned_by_author() {
 	assert!(matches!(
 		logical,
 		LogicalPlan::Join {
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
 				source: JoinStrategyPinSource::SqlHint,
@@ -9537,6 +9575,7 @@ fn direct_left_outer_broadcast_pin(build_side: BroadcastBuildSide) -> LogicalPla
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -9709,6 +9748,7 @@ async fn force_hash_join_ids_demotes_auto_and_sql_broadcast_only() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -9751,6 +9791,7 @@ async fn mixed_sql_and_rune_broadcast_plan_replays_sql_preserves_rune() {
 			Expr::qualified_column(TableRef::new("c2"), "id"),
 			Expr::qualified_column(TableRef::new("c"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Rune,
@@ -9798,6 +9839,7 @@ async fn pinned_author_choice_not_downgraded_or_upgraded_by_inference() {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -13562,6 +13604,7 @@ async fn optimizer_decisions_records_unclassified_candidate_declines() {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 		right: Box::new(LogicalPlan::ScanNamed {
@@ -13573,6 +13616,7 @@ async fn optimizer_decisions_records_unclassified_candidate_declines() {
 			Expr::qualified_column(TableRef::new("orders"), "product_id"),
 			Expr::qualified_column(TableRef::new("products"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -19054,6 +19098,7 @@ async fn take_limited_dim_still_hashes() {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -21034,6 +21079,10 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_join_strategies(input, strategies),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_join_strategies(left, strategies);
+			collect_join_strategies(right, strategies);
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -21069,6 +21118,10 @@ fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>)
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_execution_join_kinds(input, kinds),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_execution_join_kinds(left, kinds);
+			collect_execution_join_kinds(right, kinds);
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -21101,6 +21154,10 @@ fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_join_replay_ids(input, ids),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_join_replay_ids(left, ids);
+			collect_join_replay_ids(right, ids);
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -21138,6 +21195,10 @@ fn collect_join_replay_metadata(
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_join_replay_metadata(input, metadata),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_join_replay_metadata(left, metadata);
+			collect_join_replay_metadata(right, metadata);
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -21160,6 +21221,14 @@ fn first_join_plan(plan: &ExecutionPlan) -> &ExecutionPlan {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_join_plan(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			let left = first_join_plan(left);
+			if matches!(left, ExecutionPlan::Join { .. }) {
+				left
+			} else {
+				first_join_plan(right)
+			}
+		}
 		other => other,
 	}
 }
@@ -21191,6 +21260,10 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		| LogicalPlan::ExplainAnalyze { input } => collect_logical_join_kinds(input, kinds),
 		LogicalPlan::CreateTableAsSelect { source, .. }
 		| LogicalPlan::InsertSelect { source, .. } => collect_logical_join_kinds(source, kinds),
+		LogicalPlan::Union { left, right } => {
+			collect_logical_join_kinds(left, kinds);
+			collect_logical_join_kinds(right, kinds);
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }
@@ -21343,6 +21416,7 @@ fn orders_customers_left_join() -> LogicalPlan {
 		right: Box::new(named_scan("customers")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -21353,6 +21427,7 @@ fn orders_customers_full_join() -> LogicalPlan {
 		right: Box::new(named_scan("customers")),
 		kind: JoinKind::FullOuter,
 		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -21363,6 +21438,7 @@ fn products_stores_left_join() -> LogicalPlan {
 		right: Box::new(named_scan("stores")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("products", "id"), qcol("stores", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -21373,6 +21449,7 @@ fn mixed_chain_one_inner_hop() -> LogicalPlan {
 		right: Box::new(named_scan("products")),
 		kind: JoinKind::Inner,
 		on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -21724,6 +21801,7 @@ fn n_fact_galaxy_reroot_carries_strategy_intent_by_fact() {
 			Expr::qualified_column(TableRef::new("sales"), "product_id"),
 			Expr::qualified_column(TableRef::new("product"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let with_returns = LogicalPlan::Join {
@@ -21734,6 +21812,7 @@ fn n_fact_galaxy_reroot_carries_strategy_intent_by_fact() {
 			Expr::qualified_column(TableRef::new("product"), "id"),
 			Expr::qualified_column(TableRef::new("returns"), "product_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: pinned.clone(),
 	};
 	let galaxy = LogicalPlan::Join {
@@ -21744,6 +21823,7 @@ fn n_fact_galaxy_reroot_carries_strategy_intent_by_fact() {
 			Expr::qualified_column(TableRef::new("product"), "id"),
 			Expr::qualified_column(TableRef::new("shipments"), "product_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -23483,6 +23563,7 @@ fn preserved_outer_right_star_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("orders", "o")),
 		kind: JoinKind::RightOuter,
 		on: vec![(qcol("s", "id"), qcol("o", "store_id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let products_stores_orders = LogicalPlan::Join {
@@ -23490,6 +23571,7 @@ fn preserved_outer_right_star_plan() -> LogicalPlan {
 		right: Box::new(stores_orders),
 		kind: JoinKind::RightOuter,
 		on: vec![(qcol("p", "id"), qcol("o", "product_id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23497,6 +23579,7 @@ fn preserved_outer_right_star_plan() -> LogicalPlan {
 		right: Box::new(products_stores_orders),
 		kind: JoinKind::RightOuter,
 		on: vec![(qcol("c", "id"), qcol("o", "customer_id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23511,6 +23594,7 @@ fn preserved_outer_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("regions", "r")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let orders_customers = LogicalPlan::Join {
@@ -23518,6 +23602,7 @@ fn preserved_outer_snowflake_plan() -> LogicalPlan {
 		right: Box::new(customers_regions),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "customer_id"), qcol("c", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23525,6 +23610,7 @@ fn preserved_outer_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("stores", "s")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23539,6 +23625,7 @@ fn preserved_outer_deep_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("regions", "r")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let customers_regions_segments = LogicalPlan::Join {
@@ -23546,6 +23633,7 @@ fn preserved_outer_deep_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("segments", "g")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("c", "segment_id"), qcol("g", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let orders_customers = LogicalPlan::Join {
@@ -23553,6 +23641,7 @@ fn preserved_outer_deep_snowflake_plan() -> LogicalPlan {
 		right: Box::new(customers_regions_segments),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "customer_id"), qcol("c", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23560,6 +23649,7 @@ fn preserved_outer_deep_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("stores", "s")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23570,6 +23660,7 @@ fn preserved_outer_cross_into_subtree_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("regions", "r")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let orders_customers = LogicalPlan::Join {
@@ -23577,6 +23668,7 @@ fn preserved_outer_cross_into_subtree_plan() -> LogicalPlan {
 		right: Box::new(customers_regions),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "customer_id"), qcol("r", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23584,6 +23676,7 @@ fn preserved_outer_cross_into_subtree_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("stores", "s")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("o", "store_id"), qcol("s", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23594,6 +23687,7 @@ fn right_outer_opaque_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("regions", "r")),
 		kind: JoinKind::LeftOuter,
 		on: vec![(qcol("c", "region_id"), qcol("r", "id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let stores_orders = LogicalPlan::Join {
@@ -23601,6 +23695,7 @@ fn right_outer_opaque_snowflake_plan() -> LogicalPlan {
 		right: Box::new(aliased_named_scan("orders", "o")),
 		kind: JoinKind::RightOuter,
 		on: vec![(qcol("s", "id"), qcol("o", "store_id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23608,6 +23703,7 @@ fn right_outer_opaque_snowflake_plan() -> LogicalPlan {
 		right: Box::new(stores_orders),
 		kind: JoinKind::RightOuter,
 		on: vec![(qcol("c", "id"), qcol("o", "customer_id"))],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23645,6 +23741,7 @@ fn projected_dimension_preserved_outer_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	LogicalPlan::Join {
@@ -23655,6 +23752,7 @@ fn projected_dimension_preserved_outer_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("orders"), "product_id"),
 			Expr::qualified_column(TableRef::new("products"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23968,6 +24066,7 @@ fn multi_key_join_logical(keys: &[&str]) -> LogicalPlan {
 				)
 			})
 			.collect(),
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -23984,6 +24083,7 @@ fn multi_key_parent_join_logical() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("line_prices"), "region_id"),
 			Expr::qualified_column(TableRef::new("regions"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -24106,6 +24206,7 @@ fn nested_hash_probe_with_tiny_right() -> LogicalPlan {
 				Expr::qualified_column(TableRef::new("o"), "customer_id"),
 				Expr::qualified_column(TableRef::new("c1"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
@@ -24118,6 +24219,7 @@ fn nested_hash_probe_with_tiny_right() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("o"), "customer_id"),
 			Expr::qualified_column(TableRef::new("c2"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }

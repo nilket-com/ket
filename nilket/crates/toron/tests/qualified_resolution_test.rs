@@ -265,6 +265,7 @@ fn duplicate_alias_join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("x"), "id"),
 			Expr::qualified_column(TableRef::new("x"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,

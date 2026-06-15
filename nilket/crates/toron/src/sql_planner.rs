@@ -17,9 +17,9 @@ use sqlparser::ast::{
 	FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
 	GroupByExpr, HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint,
 	JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint,
-	OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-	TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString,
-	UnaryOperator, Value,
+	OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator,
+	SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo,
+	TypedString, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3255,10 +3255,7 @@ impl SqlPlanner {
 		let LoweredSelect {
 			plan,
 			aggregate_output_catalog,
-		} = match &**body {
-			SetExpr::Select(select) => self.lower_select(select)?,
-			_ => return Err(unsupported("unsupported query body")),
-		};
+		} = self.lower_query_body(body)?;
 
 		self.apply_order_by_limit_tail(
 			plan,
@@ -3266,6 +3263,97 @@ impl SqlPlanner {
 			order_by.as_ref(),
 			limit_clause.as_ref(),
 		)
+	}
+
+	fn lower_query_body(&self, body: &SetExpr) -> Result<LoweredSelect, FrontendError> {
+		match body {
+			SetExpr::Select(select) => self.lower_select(select),
+			SetExpr::SetOperation {
+				left,
+				op,
+				set_quantifier,
+				right,
+			} => {
+				let left = self.lower_query_body(left)?.plan;
+				let right = self.lower_query_body(right)?.plan;
+				let plan = self.lower_set_operation(left, right, op, set_quantifier)?;
+				Ok(LoweredSelect {
+					plan,
+					aggregate_output_catalog: None,
+				})
+			}
+			SetExpr::Query(_) => Err(unsupported(
+				"parenthesized set-operation arms with ORDER BY/LIMIT are not supported",
+			)),
+			_ => Err(unsupported("unsupported query body")),
+		}
+	}
+
+	fn lower_set_operation(
+		&self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		op: &SetOperator,
+		quantifier: &SetQuantifier,
+	) -> Result<LogicalPlan, FrontendError> {
+		if matches!(
+			quantifier,
+			SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+		) {
+			return Err(unsupported("set operations BY NAME are not supported"));
+		}
+		match op {
+			SetOperator::Union => match quantifier {
+				SetQuantifier::All => Ok(LogicalPlan::Union {
+					left: Box::new(left),
+					right: Box::new(right),
+				}),
+				SetQuantifier::None | SetQuantifier::Distinct => Ok(LogicalPlan::Distinct {
+					input: Box::new(LogicalPlan::Union {
+						left: Box::new(left),
+						right: Box::new(right),
+					}),
+				}),
+				SetQuantifier::ByName
+				| SetQuantifier::AllByName
+				| SetQuantifier::DistinctByName => unreachable!("BY NAME rejected above"),
+			},
+			SetOperator::Intersect => {
+				if *quantifier == SetQuantifier::All {
+					return Err(unsupported("INTERSECT ALL is not supported"));
+				}
+				self.lower_distinct_membership_set_op(left, right, JoinKind::LeftSemi)
+			}
+			SetOperator::Except | SetOperator::Minus => {
+				if *quantifier == SetQuantifier::All {
+					let op_name = if matches!(op, SetOperator::Minus) {
+						"MINUS ALL"
+					} else {
+						"EXCEPT ALL"
+					};
+					return Err(unsupported(format!("{op_name} is not supported")));
+				}
+				self.lower_distinct_membership_set_op(left, right, JoinKind::LeftAnti)
+			}
+		}
+	}
+
+	fn lower_distinct_membership_set_op(
+		&self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		kind: JoinKind,
+	) -> Result<LogicalPlan, FrontendError> {
+		Ok(LogicalPlan::Distinct {
+			input: Box::new(LogicalPlan::Join {
+				left: Box::new(left),
+				right: Box::new(right),
+				kind,
+				on: Vec::new(),
+				null_safe_keys: true,
+				strategy_intent: JoinStrategyIntent::Auto,
+			}),
+		})
 	}
 
 	fn apply_order_by_limit_tail(
@@ -5139,6 +5227,7 @@ pub(crate) fn build_join_plan(
 			}),
 			kind,
 			on,
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy,
 				source,
@@ -5156,6 +5245,7 @@ pub(crate) fn build_join_plan(
 				right: Box::new(right),
 				kind,
 				on,
+				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Pinned {
 					strategy,
 					source,
@@ -5177,6 +5267,7 @@ pub(crate) fn build_auto_join_plan(
 		right: Box::new(right),
 		kind,
 		on,
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
 }
@@ -7543,6 +7634,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 				qualifiers
 			}
 		},
+		LogicalPlan::Union { .. } => Vec::new(),
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
@@ -7796,6 +7888,7 @@ mod tests {
 				kind,
 				strategy_intent,
 				on,
+				..
 			} => {
 				assert_eq!(kind, JoinKind::Inner);
 				assert_eq!(strategy_intent, JoinStrategyIntent::Auto);
@@ -7919,6 +8012,7 @@ mod tests {
 					Expr::qualified_column(TableRef::new("o"), "customer_id"),
 					Expr::qualified_column(TableRef::new("c"), "id"),
 				)],
+				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
 			exprs: vec![
@@ -8089,6 +8183,7 @@ mod tests {
 				kind,
 				strategy_intent,
 				on,
+				..
 			} => {
 				assert_eq!(kind, JoinKind::Inner);
 				assert_eq!(
@@ -8245,6 +8340,7 @@ mod tests {
 			}),
 			kind: JoinKind::Inner,
 			on: vec![],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
@@ -8447,6 +8543,7 @@ mod tests {
 			| LogicalPlan::Explain { input }
 			| LogicalPlan::ExplainAnalyze { input } => filter_count(input),
 			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),
+			LogicalPlan::Union { left, right } => filter_count(left) + filter_count(right),
 			LogicalPlan::CreateTableAsSelect { source, .. } => filter_count(source),
 			LogicalPlan::Scan { .. }
 			| LogicalPlan::ScanNamed { .. }

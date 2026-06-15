@@ -1145,6 +1145,69 @@ async fn select_distinct_nulls_collapse_to_one() {
 }
 
 #[tokio::test]
+async fn sql_union_all_preserves_duplicates_and_left_schema() {
+	let results = run_logical(&plan_sql(
+		"SELECT k AS value FROM left_dups UNION ALL SELECT k FROM right_dups",
+	))
+	.await;
+
+	assert_eq!(
+		sorted_int64_column_rows(&results, 0),
+		vec![1, 1, 1, 1, 2, 2, 3, 3, 4, 4]
+	);
+	assert_eq!(results[0].schema().field(0).name(), "value");
+}
+
+#[tokio::test]
+async fn sql_union_distinct_deduplicates_union_all_output() {
+	let results = run_logical(&plan_sql(
+		"SELECT k FROM left_dups UNION SELECT k FROM right_dups",
+	))
+	.await;
+
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn sql_intersect_and_except_use_null_equal_set_membership() {
+	let intersect = run_logical(&plan_sql(
+		"SELECT amount FROM sales INTERSECT SELECT all_null_amount FROM sales",
+	))
+	.await;
+	let except = run_logical(&plan_sql(
+		"SELECT all_null_amount FROM sales EXCEPT SELECT amount FROM sales",
+	))
+	.await;
+	let minus = run_logical(&plan_sql(
+		"SELECT all_null_amount FROM sales MINUS SELECT amount FROM sales",
+	))
+	.await;
+
+	assert_eq!(scalar_int32_column_rows(&intersect, 0), vec![None]);
+	assert_eq!(row_count(&except), 0);
+	assert_eq!(row_count(&minus), 0);
+}
+
+#[tokio::test]
+async fn ordinary_join_stays_null_unequal() {
+	let results = run_logical(&plan_sql(
+		"SELECT sales.id \
+		 FROM sales JOIN sales AS other ON sales.amount = other.all_null_amount",
+	))
+	.await;
+
+	assert_eq!(row_count(&results), 0);
+}
+
+#[test]
+fn sql_rejects_deferred_set_operation_forms() {
+	assert_unsupported("SELECT k FROM left_dups INTERSECT ALL SELECT k FROM right_dups");
+	assert_unsupported("SELECT k FROM left_dups EXCEPT ALL SELECT k FROM right_dups");
+	assert_unsupported("SELECT k FROM left_dups MINUS ALL SELECT k FROM right_dups");
+	assert_unsupported("SELECT k FROM left_dups UNION BY NAME SELECT k FROM right_dups");
+}
+
+#[tokio::test]
 async fn select_distinct_star_groups_all_visible_columns() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql("SELECT DISTINCT * FROM sales");
@@ -1932,6 +1995,7 @@ async fn distinct_over_joined_aggregate_input_still_rejects() {
 			}),
 			kind: JoinKind::Inner,
 			on: vec![(Expr::column("region"), Expr::column("region"))],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 	};
@@ -4517,6 +4581,9 @@ fn assert_distinct_join_execution_shape(plan: &ExecutionPlan) {
 fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 	match plan {
 		ExecutionPlan::Join { .. } => true,
+		ExecutionPlan::Union { left, right, .. } => {
+			contains_execution_join(left) || contains_execution_join(right)
+		}
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
@@ -4540,6 +4607,9 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 fn contains_logical_join(plan: &LogicalPlan) -> bool {
 	match plan {
 		LogicalPlan::Join { .. } => true,
+		LogicalPlan::Union { left, right, .. } => {
+			contains_logical_join(left) || contains_logical_join(right)
+		}
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
@@ -4576,6 +4646,9 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		LogicalPlan::Join { left, right, .. } => {
 			contains_logical_distinct(left) || contains_logical_distinct(right)
 		}
+		LogicalPlan::Union { left, right, .. } => {
+			contains_logical_distinct(left) || contains_logical_distinct(right)
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::Explain { .. }
@@ -4600,6 +4673,9 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_execution_sort(input),
 		ExecutionPlan::Join { left, right, .. } => {
+			contains_execution_sort(left) || contains_execution_sort(right)
+		}
+		ExecutionPlan::Union { left, right, .. } => {
 			contains_execution_sort(left) || contains_execution_sort(right)
 		}
 		ExecutionPlan::EmptyRelation { .. }

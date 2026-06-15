@@ -191,6 +191,16 @@ impl<'a> Binder<'a> {
 							.await?,
 					),
 				}),
+				LogicalPlan::Union { left, right } => Ok(LogicalPlan::Union {
+					left: Box::new(
+						self.demote_null_rejected_outer_joins_inner(left, receipts)
+							.await?,
+					),
+					right: Box::new(
+						self.demote_null_rejected_outer_joins_inner(right, receipts)
+							.await?,
+					),
+				}),
 				LogicalPlan::Aggregate {
 					input,
 					group_expr,
@@ -241,6 +251,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					null_safe_keys,
 					strategy_intent,
 				} => Ok(LogicalPlan::Join {
 					left: Box::new(
@@ -253,6 +264,7 @@ impl<'a> Binder<'a> {
 					),
 					kind: *kind,
 					on: on.clone(),
+					null_safe_keys: *null_safe_keys,
 					strategy_intent: *strategy_intent,
 				}),
 				LogicalPlan::CreateTableAsSelect {
@@ -334,6 +346,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Exchange { input, .. }
 				| LogicalPlan::Sort { input, .. }
 				| LogicalPlan::Take { input, .. } => self.logical_scope_for_outer_demotion(input).await,
+				LogicalPlan::Union { .. } => Ok(None),
 				LogicalPlan::Join {
 					left, right, kind, ..
 				} => {
@@ -405,6 +418,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind: JoinKind::Inner,
 					on,
+					null_safe_keys,
 					strategy_intent,
 				} => {
 					let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await?
@@ -415,6 +429,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind: JoinKind::Inner,
 								on,
+								null_safe_keys,
 								strategy_intent,
 							},
 							residual: routed_originals(conjuncts),
@@ -429,6 +444,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind: JoinKind::Inner,
 								on,
+								null_safe_keys,
 								strategy_intent,
 							},
 							residual: routed_originals(conjuncts),
@@ -469,6 +485,7 @@ impl<'a> Binder<'a> {
 							right: Box::new(right.input),
 							kind: JoinKind::Inner,
 							on,
+							null_safe_keys,
 							strategy_intent,
 						},
 						residual,
@@ -480,6 +497,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					null_safe_keys,
 					strategy_intent,
 				} => {
 					let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await?
@@ -490,6 +508,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								null_safe_keys,
 								strategy_intent,
 							},
 							residual: routed_originals(conjuncts),
@@ -504,6 +523,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								null_safe_keys,
 								strategy_intent,
 							},
 							residual: routed_originals(conjuncts),
@@ -531,6 +551,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								null_safe_keys,
 								strategy_intent,
 							},
 							residual: routed_originals(conjuncts),
@@ -570,6 +591,7 @@ impl<'a> Binder<'a> {
 							right: Box::new(right),
 							kind: to_kind,
 							on,
+							null_safe_keys,
 							strategy_intent,
 						},
 						residual,
@@ -731,6 +753,7 @@ impl<'a> Binder<'a> {
 				stopped @ (LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Filter { .. }
+				| LogicalPlan::Union { .. }
 				| LogicalPlan::Aggregate { .. }
 				| LogicalPlan::Sort { .. }
 				| LogicalPlan::Take { .. }

@@ -14,8 +14,9 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	BoundExprProgram, BroadcastReplayEligibility, ColumnOrdinal, ExecutionPlan, ExecutionSortKey,
-	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, QueryProfileHint,
+	BoundExprProgram, BoundExprProgramBuilder, BroadcastReplayEligibility, ColumnName,
+	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind, JoinReplayId,
+	JoinStrategy, QueryProfileHint, ResolvedColumn,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +345,9 @@ fn fragment_base_plan(
 	if contains_join(&plan) {
 		return fragment_join_plan(plan, terminal_output, allocator, config);
 	}
+	if let ExecutionPlan::Union { .. } = plan {
+		return fragment_union_plan(plan, terminal_output, allocator, config);
+	}
 
 	let exchange_count = count_exchanges(&plan);
 	if exchange_count == 0 {
@@ -441,6 +445,188 @@ fn fragment_base_plan(
 	Ok((stages, consumer_stage_id))
 }
 
+fn fragment_union_plan(
+	plan: ExecutionPlan,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
+	config: FragmentPlanConfig,
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
+	let ExecutionPlan::Union {
+		left,
+		right,
+		output_schema,
+	} = plan
+	else {
+		unreachable!("fragment_union_plan called with non-union plan");
+	};
+	let exchange_count = count_exchanges(&left) + count_exchanges(&right);
+	if exchange_count != 0 {
+		return Err(FragmentError::MultipleExchangeBoundaries {
+			count: exchange_count,
+		});
+	}
+
+	let partition_count = config.worker_count.max(1);
+	let left_exchange_id = allocator.alloc_exchange();
+	let right_exchange_id = allocator.alloc_exchange();
+	let left_stage_id = allocator.alloc_stage();
+	let right_stage_id = allocator.alloc_stage();
+	let union_stage_id = allocator.alloc_stage();
+	let left_schema = left.schema();
+	let right_schema = right.schema();
+	let left_scan_metadata =
+		first_scan_metadata(&left).ok_or(FragmentError::MissingScanMetadata)?;
+	let right_scan_metadata =
+		first_scan_metadata(&right).ok_or(FragmentError::MissingScanMetadata)?;
+	let left_key = all_output_partition_key(&left_schema);
+	let right_key = all_output_partition_key(&right_schema);
+
+	let left_tasks = union_producer_tasks(
+		config.clone(),
+		left_stage_id,
+		left_exchange_id,
+		*left,
+		partition_count,
+		left_key.clone(),
+	);
+	let right_tasks = union_producer_tasks(
+		config.clone(),
+		right_stage_id,
+		right_exchange_id,
+		*right,
+		partition_count,
+		right_key.clone(),
+	);
+	let consumer_plan = terminal_output.wrap_plan(ExecutionPlan::Union {
+		left: Box::new(shuffle_input_scan(
+			left_scan_metadata,
+			left_schema,
+			left_exchange_id,
+		)),
+		right: Box::new(shuffle_input_scan(
+			right_scan_metadata,
+			right_schema,
+			right_exchange_id,
+		)),
+		output_schema,
+	});
+	let consumer_output = terminal_output.task_output();
+	let consumer_tasks = (0..partition_count)
+		.map(|partition| {
+			let partition_id = PartitionId::new(partition);
+			TaskPlan::new(TaskSpec {
+				identity: TaskIdentity::new(
+					config.query_id,
+					union_stage_id,
+					TaskId::new(partition),
+					AttemptId::first(),
+				),
+				partition: Some(partition_id),
+				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
+				plan: consumer_plan.clone(),
+				inputs: vec![
+					TaskInputBinding::ShuffleConsumer {
+						exchange_id: left_exchange_id,
+						producer_stage_id: left_stage_id,
+						partition_id,
+						producer_partitions: Vec::new(),
+					},
+					TaskInputBinding::ShuffleConsumer {
+						exchange_id: right_exchange_id,
+						producer_stage_id: right_stage_id,
+						partition_id,
+						producer_partitions: Vec::new(),
+					},
+				],
+				output: consumer_output.clone(),
+				budget: config.task_budget,
+				trace: None,
+			})
+		})
+		.collect();
+
+	Ok((
+		vec![
+			StagePlan {
+				stage_id: left_stage_id,
+				upstream_stages: vec![],
+				tasks: left_tasks,
+			},
+			StagePlan {
+				stage_id: right_stage_id,
+				upstream_stages: vec![],
+				tasks: right_tasks,
+			},
+			StagePlan {
+				stage_id: union_stage_id,
+				upstream_stages: vec![left_stage_id, right_stage_id],
+				tasks: consumer_tasks,
+			},
+		],
+		union_stage_id,
+	))
+}
+
+fn union_producer_tasks(
+	config: FragmentPlanConfig,
+	stage_id: StageId,
+	exchange_id: ExchangeId,
+	input: ExecutionPlan,
+	partition_count: u32,
+	key: BoundExprProgram,
+) -> Vec<TaskPlan> {
+	(0..partition_count)
+		.map(|worker_index| {
+			TaskPlan::new(TaskSpec {
+				identity: TaskIdentity::new(
+					config.query_id,
+					stage_id,
+					TaskId::new(worker_index),
+					AttemptId::first(),
+				),
+				partition: None,
+				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
+				plan: ExecutionPlan::Exchange {
+					input: Box::new(input.clone()),
+					partition_count,
+					key: key.clone(),
+				},
+				inputs: vec![TaskInputBinding::Scan {
+					share: Some(ScanShare {
+						worker_index,
+						worker_count: partition_count,
+					}),
+					runtime_filter: None,
+				}],
+				output: TaskOutputBinding::ShuffleProducer {
+					exchange_id,
+					partition_count: PartitionCount::new(partition_count),
+					partition_key: key.clone(),
+				},
+				budget: config.task_budget,
+				trace: None,
+			})
+		})
+		.collect()
+}
+
+fn all_output_partition_key(schema: &SchemaRef) -> BoundExprProgram {
+	let mut builder = BoundExprProgramBuilder::new();
+	for (idx, field) in schema.fields().iter().enumerate() {
+		let column = builder.append_column(ResolvedColumn {
+			name: ColumnName(field.name().clone()),
+			ordinal: ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow")),
+			data_type: field.data_type().clone(),
+			nullable: field.is_nullable(),
+			pbc_eligible: false,
+		});
+		builder.push_root(column);
+	}
+	builder.build()
+}
+
 fn fragment_join_plan(
 	plan: ExecutionPlan,
 	terminal_output: FragmentTerminalOutput,
@@ -502,6 +688,7 @@ fn fragment_hash_join_plan(
 		kind: join.kind,
 		left_keys: join.left_keys,
 		right_keys: join.right_keys,
+		null_safe_keys: join.null_safe_keys,
 		strategy: join.strategy,
 		output_schema: join.output_schema,
 	};
@@ -693,6 +880,7 @@ fn rewrite_broadcast_star_probe_inner(
 			kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy,
 			output_schema,
 		} => {
@@ -734,6 +922,7 @@ fn rewrite_broadcast_star_probe_inner(
 				kind,
 				left_keys,
 				right_keys,
+				null_safe_keys,
 				strategy,
 				output_schema,
 			})
@@ -764,6 +953,7 @@ fn rewrite_broadcast_star_probe_inner(
 			row_limit: None, ..
 		} => Ok(leaf),
 		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::Union { .. }
 		| ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Aggregate { .. }
@@ -871,6 +1061,7 @@ struct JoinBoundary {
 	kind: JoinKind,
 	left_keys: Vec<ColumnOrdinal>,
 	right_keys: Vec<ColumnOrdinal>,
+	null_safe_keys: bool,
 	strategy: JoinStrategy,
 	output_schema: SchemaRef,
 }
@@ -1094,6 +1285,9 @@ fn leading_exchange_before_join(plan: &ExecutionPlan) -> Option<ExchangeBoundary
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => leading_exchange_before_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			leading_exchange_before_join(left).or_else(|| leading_exchange_before_join(right))
+		}
 		ExecutionPlan::Exchange { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::EmptyRelation { .. }
@@ -1120,6 +1314,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 			kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy,
 			output_schema,
 		} => Some(JoinBoundary {
@@ -1130,6 +1325,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 			kind: *kind,
 			left_keys: left_keys.clone(),
 			right_keys: right_keys.clone(),
+			null_safe_keys: *null_safe_keys,
 			strategy: *strategy,
 			output_schema: output_schema.clone(),
 		}),
@@ -1139,6 +1335,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_join(input),
+		ExecutionPlan::Union { left, right, .. } => first_join(left).or_else(|| first_join(right)),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1187,6 +1384,9 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
+		ExecutionPlan::Union { left, right, .. } => {
+			find_exchange(left).or_else(|| find_exchange(right))
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1210,6 +1410,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
+		ExecutionPlan::Union { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1243,6 +1444,9 @@ fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Take { input, .. } => global_sort_barrier_count(input),
 		ExecutionPlan::Join { left, right, .. } => {
+			global_sort_barrier_count(left) + global_sort_barrier_count(right)
+		}
+		ExecutionPlan::Union { left, right, .. } => {
 			global_sort_barrier_count(left) + global_sort_barrier_count(right)
 		}
 		ExecutionPlan::EmptyRelation { .. }
@@ -1280,6 +1484,9 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_scan_metadata(input),
 		ExecutionPlan::Join { left, right, .. } => {
+			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
+		}
+		ExecutionPlan::Union { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
 		ExecutionPlan::EmptyRelation { .. }
@@ -1382,6 +1589,7 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy,
 			output_schema,
 		} => ExecutionPlan::Join {
@@ -1392,7 +1600,17 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy,
+			output_schema,
+		},
+		ExecutionPlan::Union {
+			left,
+			right,
+			output_schema,
+		} => ExecutionPlan::Union {
+			left: Box::new(replace_exchange_with_scan(*left, scan)),
+			right: Box::new(replace_exchange_with_scan(*right, scan)),
 			output_schema,
 		},
 		ExecutionPlan::EmptyRelation { .. }
@@ -1470,6 +1688,15 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 		} => ExecutionPlan::Take {
 			input: Box::new(replace_first_join(*input, replacement)),
 			limit,
+			output_schema,
+		},
+		ExecutionPlan::Union {
+			left,
+			right,
+			output_schema,
+		} => ExecutionPlan::Union {
+			left: Box::new(replace_first_join(*left, replacement.clone())),
+			right: Box::new(replace_first_join(*right, replacement)),
 			output_schema,
 		},
 		ExecutionPlan::EmptyRelation { .. }
@@ -1738,6 +1965,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(0), ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0), ColumnOrdinal(0)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: Arc::new(Schema::new(vec![
 				Field::new("key", DataType::Int32, false),
@@ -2104,6 +2332,7 @@ mod tests {
 			kind,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
+			null_safe_keys: false,
 			strategy,
 			output_schema: Arc::new(Schema::new(vec![
 				Field::new("key", DataType::Int32, false),

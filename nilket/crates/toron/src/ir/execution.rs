@@ -264,6 +264,11 @@ pub enum ExecutionPlan {
 		exprs: BoundExprProgram,
 		output_schema: SchemaRef,
 	},
+	Union {
+		left: Box<ExecutionPlan>,
+		right: Box<ExecutionPlan>,
+		output_schema: SchemaRef,
+	},
 	Aggregate {
 		input: Box<ExecutionPlan>,
 		group_expr: BoundExprProgram,
@@ -295,6 +300,7 @@ pub enum ExecutionPlan {
 		kind: JoinKind,
 		left_keys: Vec<ColumnOrdinal>,
 		right_keys: Vec<ColumnOrdinal>,
+		null_safe_keys: bool,
 		strategy: JoinStrategy,
 		output_schema: SchemaRef,
 	},
@@ -372,6 +378,7 @@ impl ExecutionPlan {
 			} => scan_output_schema(schema, *row_identity),
 			Self::Filter { input, .. } => input.schema(),
 			Self::Project { output_schema, .. } => output_schema.clone(),
+			Self::Union { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),

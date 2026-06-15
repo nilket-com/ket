@@ -267,7 +267,8 @@ pub(crate) fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 21);
+	assert_eq!(enum_variant_count(logical_plan), 22);
+	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("Explain {"));
@@ -290,7 +291,8 @@ pub(crate) fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 18);
+	assert_eq!(enum_variant_count(execution_plan), 19);
+	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
@@ -832,7 +834,8 @@ pub(crate) fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 21);
+	assert_eq!(enum_variant_count(logical_plan), 22);
+	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("Explain {"));
@@ -853,7 +856,8 @@ pub(crate) fn adr034_execution_variant_count_is_12() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 18);
+	assert_eq!(enum_variant_count(execution_plan), 19);
+	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
 	assert!(execution_plan.contains("CreateLogicalType {"));

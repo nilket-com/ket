@@ -761,6 +761,7 @@ fn join_plan(left: ExecutionPlan, right: ExecutionPlan, strategy: JoinStrategy) 
 		left_keys: vec![ColumnOrdinal(0)],
 		right_keys: vec![ColumnOrdinal(0)],
 		strategy,
+		null_safe_keys: false,
 		output_schema: join_output_schema(),
 	}
 }

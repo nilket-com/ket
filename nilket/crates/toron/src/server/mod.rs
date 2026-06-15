@@ -1168,6 +1168,9 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => join_strategy_label(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			join_strategy_label(left).or_else(|| join_strategy_label(right))
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1191,6 +1194,7 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_join(input),
+		ExecutionPlan::Union { left, right, .. } => contains_join(left) || contains_join(right),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1213,6 +1217,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Exchange { .. } => "exchange",
 			ExecutionPlan::Filter { .. } => "filter",
 			ExecutionPlan::Project { .. } => "project",
+			ExecutionPlan::Union { .. } => "union",
 			ExecutionPlan::Aggregate { .. } => "aggregate",
 			ExecutionPlan::Sort { .. } => "sort",
 			ExecutionPlan::Take { .. } => "take",
@@ -1386,6 +1391,9 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_broadcast_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			contains_broadcast_join(left) || contains_broadcast_join(right)
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1533,6 +1541,7 @@ mod tests {
 				kind: JoinKind::Inner,
 				left_keys: vec![ColumnOrdinal(0)],
 				right_keys: vec![ColumnOrdinal(0)],
+				null_safe_keys: false,
 				strategy: JoinStrategy::Broadcast,
 				output_schema: Arc::new(Schema::new(vec![
 					Field::new("id", DataType::Int64, false),
@@ -3052,6 +3061,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: crate::binder::join_schema(
 				JoinKind::Inner,
@@ -3155,6 +3165,7 @@ mod tests {
 				kind,
 				left_keys: vec![ColumnOrdinal(0)],
 				right_keys: vec![ColumnOrdinal(0)],
+				null_safe_keys: false,
 				strategy: JoinStrategy::HashPartitioned,
 				output_schema: crate::binder::join_schema(kind, &left.schema(), &right.schema()),
 			},
@@ -3786,6 +3797,7 @@ fn drive_streamable_plan<'a>(
 				drive_streamable_plan(input, executor, morsel, &mut take_batch).await
 			}
 			ExecutionPlan::Exchange { .. }
+			| ExecutionPlan::Union { .. }
 			| ExecutionPlan::Sort { .. }
 			| ExecutionPlan::Aggregate { .. }
 			| ExecutionPlan::Join { .. }
@@ -4016,6 +4028,8 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => scan_schema_for_table_id(input, table_id),
 		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
+			.or_else(|| scan_schema_for_table_id(right, table_id)),
+		ExecutionPlan::Union { left, right, .. } => scan_schema_for_table_id(left, table_id)
 			.or_else(|| scan_schema_for_table_id(right, table_id)),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }

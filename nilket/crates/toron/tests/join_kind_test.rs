@@ -287,6 +287,7 @@ fn nominal_join_plan(left_logical: LogicalTypeId, right_logical: LogicalTypeId) 
 			logical_key("left_t", left_logical),
 			logical_key("right_t", right_logical),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -318,6 +319,7 @@ fn hash_join_plan(kind: JoinKind) -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("left_t"), "id"),
 			Expr::qualified_column(TableRef::new("right_t"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -341,6 +343,7 @@ fn broadcast_join_plan(kind: JoinKind, build_side: BroadcastBuildSide) -> Logica
 			Expr::qualified_column(TableRef::new("left_t"), "id"),
 			Expr::qualified_column(TableRef::new("right_t"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,

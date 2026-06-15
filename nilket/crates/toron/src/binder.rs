@@ -63,6 +63,7 @@ mod outer_join_demotion;
 mod pushdown;
 mod runtime_evidence;
 mod selectivity;
+mod set_ops;
 
 use self::aggregate::*;
 use self::arithmetic::*;
@@ -73,6 +74,7 @@ use self::join_order::*;
 use self::outer_join_demotion::*;
 use self::pushdown::*;
 use self::selectivity::*;
+use self::set_ops::{bind_union, normalize_set_op_arm, set_op_output_schema};
 
 pub use self::decision_log::OptimizerDecisionLog;
 pub(crate) use self::join::JoinStrategyDecisionReason;
@@ -1132,6 +1134,15 @@ impl<'a> Binder<'a> {
 						join_order_sources,
 					))
 				}
+				LogicalPlan::Union { left, right } => {
+					let left = self
+						.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture)
+						.await?;
+					let right = self
+						.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
+						.await?;
+					bind_union(left, right)
+				}
 				LogicalPlan::Distinct { input } => {
 					if let Some(message) = distinct_input_unsupported_message(input) {
 						return Err(BindingError::UnsupportedExpression {
@@ -1263,6 +1274,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					null_safe_keys,
 					strategy_intent,
 				} => {
 					// ADR 200: the unified bounded graph root-swap, galaxy then bridge. A query is a
@@ -1326,6 +1338,7 @@ impl<'a> Binder<'a> {
 									right,
 									*kind,
 									on,
+									*null_safe_keys,
 									*strategy_intent,
 									trace,
 									render_trace,
@@ -1339,6 +1352,7 @@ impl<'a> Binder<'a> {
 						right,
 						*kind,
 						on,
+						*null_safe_keys,
 						*strategy_intent,
 						trace,
 						render_trace,
@@ -2173,6 +2187,7 @@ impl<'a> Binder<'a> {
 		right: &LogicalPlan,
 		kind: JoinKind,
 		on: &[(Expr, Expr)],
+		null_safe_keys: bool,
 		strategy_intent: JoinStrategyIntent,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
@@ -2190,6 +2205,7 @@ impl<'a> Binder<'a> {
 			right_plan,
 			kind,
 			on,
+			null_safe_keys,
 			strategy_intent,
 			trace,
 			render_trace,
@@ -2203,6 +2219,7 @@ impl<'a> Binder<'a> {
 		mut right_plan: ScopedExecutionPlan,
 		kind: JoinKind,
 		on: &[(Expr, Expr)],
+		null_safe_keys: bool,
 		strategy_intent: JoinStrategyIntent,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
@@ -2213,14 +2230,40 @@ impl<'a> Binder<'a> {
 		let mut left_resolved_keys = Vec::new();
 		let mut right_resolved_keys = Vec::new();
 
-		for (left_expr, right_expr) in on {
-			let (left_key, right_key) =
-				bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)?;
-			validate_join_key_types(&left_key, &right_key)?;
-			left_keys.push(left_key.column.ordinal);
-			right_keys.push(right_key.column.ordinal);
-			left_resolved_keys.push(left_key);
-			right_resolved_keys.push(right_key);
+		if null_safe_keys && on.is_empty() {
+			let output_schema = set_op_output_schema(&left_plan.schema(), &right_plan.schema())?;
+			left_plan.plan = normalize_set_op_arm(left_plan.plan, &output_schema)?;
+			right_plan.plan = normalize_set_op_arm(right_plan.plan, &output_schema)?;
+			left_plan.scope = left_plan.scope.with_schema(output_schema.clone());
+			right_plan.scope = right_plan.scope.with_schema(output_schema.clone());
+			for (idx, field) in output_schema.fields().iter().enumerate() {
+				let ordinal = ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow"));
+				let left_key = ResolvedJoinKey {
+					column: ResolvedColumn {
+						name: ColumnName(field.name().clone()),
+						ordinal,
+						data_type: field.data_type().clone(),
+						nullable: field.is_nullable(),
+						pbc_eligible: is_pbc_eligible_type(field.data_type()),
+					},
+					logical_type: LogicalTypeId::NAKED,
+				};
+				let right_key = left_key.clone();
+				left_keys.push(ordinal);
+				right_keys.push(ordinal);
+				left_resolved_keys.push(left_key);
+				right_resolved_keys.push(right_key);
+			}
+		} else {
+			for (left_expr, right_expr) in on {
+				let (left_key, right_key) =
+					bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)?;
+				validate_join_key_types(&left_key, &right_key)?;
+				left_keys.push(left_key.column.ordinal);
+				right_keys.push(right_key.column.ordinal);
+				left_resolved_keys.push(left_key);
+				right_resolved_keys.push(right_key);
+			}
 		}
 
 		let declared_left_width = left_plan.schema().fields().len();
@@ -2370,6 +2413,7 @@ impl<'a> Binder<'a> {
 			kind: physical_kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy: decision.strategy,
 			output_schema: physical_output_schema.clone(),
 		};
@@ -2560,6 +2604,8 @@ fn all_output_columns_program(schema: &SchemaRef) -> Result<BoundExprProgram, Bi
 fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&'static str> {
 	match plan {
 		LogicalPlan::Join { left, right, .. } => distinct_input_unsupported_message(left)
+			.or_else(|| distinct_input_unsupported_message(right)),
+		LogicalPlan::Union { left, right } => distinct_input_unsupported_message(left)
 			.or_else(|| distinct_input_unsupported_message(right)),
 		LogicalPlan::Aggregate { .. } => Some("DISTINCT over aggregate inputs is not supported"),
 		LogicalPlan::Alias { input, .. }
@@ -3289,6 +3335,28 @@ fn optimize_for_required(
 				output_remap,
 			))
 		}
+		ExecutionPlan::Union {
+			left,
+			right,
+			output_schema,
+		} => {
+			let requested_outputs = required_output.unwrap_or_else(|| all_columns(&output_schema));
+			let requested_outputs_vec = requested_outputs.iter().copied().collect::<Vec<_>>();
+			let (left, _) =
+				optimize_for_required(*left, Some(requested_outputs.clone()), logical_types)?;
+			let (right, _) =
+				optimize_for_required(*right, Some(requested_outputs.clone()), logical_types)?;
+			let output_schema = project_schema(&output_schema, &requested_outputs_vec)?;
+			let output_remap = ordinal_remap(&requested_outputs_vec);
+			Ok((
+				ExecutionPlan::Union {
+					left: Box::new(left),
+					right: Box::new(right),
+					output_schema,
+				},
+				output_remap,
+			))
+		}
 		ExecutionPlan::Aggregate {
 			input,
 			group_expr,
@@ -3409,6 +3477,7 @@ fn optimize_for_required(
 			kind,
 			left_keys,
 			right_keys,
+			null_safe_keys,
 			strategy,
 			output_schema,
 		} => {
@@ -3430,6 +3499,7 @@ fn optimize_for_required(
 					kind,
 					left_keys,
 					right_keys,
+					null_safe_keys,
 					strategy,
 					output_schema,
 				},

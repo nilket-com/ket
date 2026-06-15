@@ -303,6 +303,7 @@ impl StatementClass {
 			| LogicalPlan::Filter { .. }
 			| LogicalPlan::Project { .. }
 			| LogicalPlan::Distinct { .. }
+			| LogicalPlan::Union { .. }
 			| LogicalPlan::Aggregate { .. }
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }

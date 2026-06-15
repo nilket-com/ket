@@ -584,6 +584,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
@@ -997,6 +998,7 @@ mod tests {
 					Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 					Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				)],
+				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
 			predicate: Expr::Eq(
@@ -4609,6 +4611,7 @@ mod tests {
 						),
 					),
 				],
+				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
 			right: Box::new(LogicalPlan::ScanNamed {
@@ -4620,6 +4623,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("line_prices"), "region_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("regions"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
 	}
@@ -5042,6 +5046,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
 				source: JoinStrategyPinSource::Direct,
@@ -5079,6 +5084,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
@@ -5114,6 +5120,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
 	}
@@ -5142,6 +5149,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
 	}
@@ -5170,6 +5178,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent,
 		}
 	}
@@ -5188,6 +5197,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent,
 		}
 	}
@@ -5253,6 +5263,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
 	}
@@ -5898,6 +5909,7 @@ mod tests {
 	fn assert_broadcast_pin_source(plan: &LogicalPlan, expected: JoinStrategyPinSource) {
 		match plan {
 			LogicalPlan::Join {
+				null_safe_keys: false,
 				strategy_intent:
 					JoinStrategyIntent::Pinned {
 						strategy: JoinStrategy::Broadcast,

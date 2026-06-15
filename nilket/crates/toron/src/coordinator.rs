@@ -1582,6 +1582,10 @@ fn collect_replayable_broadcast_join_ids(plan: &ExecutionPlan, ids: &mut BTreeSe
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_replayable_broadcast_join_ids(input, ids),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_replayable_broadcast_join_ids(left, ids);
+			collect_replayable_broadcast_join_ids(right, ids);
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }

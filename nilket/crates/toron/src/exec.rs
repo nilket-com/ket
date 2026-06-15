@@ -352,6 +352,11 @@ impl Executor {
 					}
 					Ok(output)
 				}
+				LogicalPlan::Union { left, right } => {
+					let mut output = self.execute(left, morsel).await?;
+					output.extend(self.execute(right, morsel).await?);
+					Ok(output)
+				}
 				LogicalPlan::Distinct { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical DISTINCT execution",
 				}),
@@ -759,6 +764,18 @@ impl Executor {
 					}
 					Ok(output)
 				}
+				ExecutionPlan::Union {
+					left,
+					right,
+					output_schema,
+				} => {
+					let mut output = self.execute_bound(left, morsel).await?;
+					output.extend(self.execute_bound(right, morsel).await?);
+					if output.is_empty() {
+						return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+					}
+					Ok(output)
+				}
 				ExecutionPlan::Aggregate {
 					input,
 					group_expr,
@@ -821,6 +838,7 @@ impl Executor {
 					kind,
 					left_keys,
 					right_keys,
+					null_safe_keys,
 					strategy,
 					output_schema,
 					..
@@ -835,6 +853,7 @@ impl Executor {
 						*kind,
 						left_keys,
 						right_keys,
+						*null_safe_keys,
 						*replay_id,
 						*strategy,
 						output_schema,
@@ -2473,6 +2492,7 @@ async fn execute_hash_join(
 	kind: JoinKind,
 	left_keys: &[crate::ir::ColumnOrdinal],
 	right_keys: &[crate::ir::ColumnOrdinal],
+	null_safe_keys: bool,
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
 	output_schema: &arrow::datatypes::SchemaRef,
@@ -2513,6 +2533,7 @@ async fn execute_hash_join(
 			&left_key_arrays,
 			&right_key_arrays,
 			output_schema,
+			null_safe_keys,
 			task_budget,
 			telemetry.clone(),
 			spill_file_ops,
@@ -2535,7 +2556,8 @@ async fn execute_hash_join(
 		return result;
 	}
 
-	let join_key_plan = JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays);
+	let join_key_plan =
+		JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, null_safe_keys);
 
 	let build_started = Instant::now();
 	let Some(build_rows) = build_in_memory_join_rows(
@@ -2543,6 +2565,7 @@ async fn execute_hash_join(
 		&left_key_arrays,
 		left_batch.num_rows(),
 		task_budget.memory.get(),
+		null_safe_keys,
 	)?
 	else {
 		let result = execute_spilled_hash_join(
@@ -2552,6 +2575,7 @@ async fn execute_hash_join(
 			&left_key_arrays,
 			&right_key_arrays,
 			output_schema,
+			null_safe_keys,
 			task_budget,
 			telemetry.clone(),
 			spill_file_ops,
@@ -2588,6 +2612,7 @@ async fn execute_hash_join(
 		left_batch.num_rows(),
 		&right_key_arrays,
 		right_batch.num_rows(),
+		null_safe_keys,
 	)?;
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.probe_micros = task
@@ -2760,7 +2785,14 @@ enum JoinKeyPlan {
 }
 
 impl JoinKeyPlan {
-	fn from_key_arrays(left_key_arrays: &[ArrayRef], right_key_arrays: &[ArrayRef]) -> Self {
+	fn from_key_arrays(
+		left_key_arrays: &[ArrayRef],
+		right_key_arrays: &[ArrayRef],
+		null_safe_keys: bool,
+	) -> Self {
+		if null_safe_keys {
+			return Self::Generic;
+		}
 		if left_key_arrays.len() != 1 || right_key_arrays.len() != 1 {
 			return Self::Generic;
 		}
@@ -2780,6 +2812,7 @@ fn build_in_memory_join_rows(
 	left_key_arrays: &[ArrayRef],
 	rows: usize,
 	memory_cap: u64,
+	null_safe_keys: bool,
 ) -> Result<Option<HashMap<JoinKey, BuildRowList>>, ExecutionError> {
 	let mut build_rows = HashMap::with_capacity(rows);
 	let mut inserted_rows = 0usize;
@@ -2829,8 +2862,13 @@ fn build_in_memory_join_rows(
 		}
 		JoinKeyPlan::Generic => {
 			for row in 0..rows {
-				let Some(key) = join_key_bytes(left_key_arrays, row)? else {
-					continue;
+				let key = if null_safe_keys {
+					join_key_bytes_null_safe(left_key_arrays, row)?
+				} else {
+					let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+						continue;
+					};
+					key
 				};
 				if !join_build_memory_fits(
 					left_key_arrays,
@@ -2859,6 +2897,7 @@ fn probe_in_memory_join_rows(
 	left_rows: usize,
 	right_key_arrays: &[ArrayRef],
 	rows: usize,
+	null_safe_keys: bool,
 ) -> Result<Vec<JoinOutputRow>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_rows);
@@ -2914,9 +2953,14 @@ fn probe_in_memory_join_rows(
 		}
 		JoinKeyPlan::Generic => {
 			for row in 0..rows {
-				let Some(key) = join_key_bytes(right_key_arrays, row)? else {
-					append_unmatched_probe_row(kind, row, &mut selection)?;
-					continue;
+				let key = if null_safe_keys {
+					join_key_bytes_null_safe(right_key_arrays, row)?
+				} else {
+					let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+						append_unmatched_probe_row(kind, row, &mut selection)?;
+						continue;
+					};
+					key
 				};
 				let key = JoinKey::Generic(key);
 				let matched = if let Some(matches) = build_rows.get(&key) {
@@ -3104,6 +3148,7 @@ async fn execute_spilled_hash_join(
 	left_key_arrays: &[ArrayRef],
 	right_key_arrays: &[ArrayRef],
 	output_schema: &arrow::datatypes::SchemaRef,
+	null_safe_keys: bool,
 	task_budget: TaskBudget,
 	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
 	spill_file_ops: Arc<dyn AsyncFileOps>,
@@ -3112,8 +3157,13 @@ async fn execute_spilled_hash_join(
 	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
 	let build_started = Instant::now();
 	for row in 0..left_batch.num_rows() {
-		let Some(key) = join_key_bytes(left_key_arrays, row)? else {
-			continue;
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(left_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+				continue;
+			};
+			key
 		};
 		build_rows
 			.entry(key)
@@ -3169,6 +3219,7 @@ async fn execute_spilled_hash_join(
 		right_key_arrays,
 		left_batch,
 		output_schema,
+		null_safe_keys,
 	)
 	.await;
 	record_task_telemetry(&telemetry, |task| {
@@ -3195,13 +3246,19 @@ async fn probe_spilled_hash_join(
 	right_key_arrays: &[ArrayRef],
 	left_batch: &RecordBatch,
 	output_schema: &arrow::datatypes::SchemaRef,
+	null_safe_keys: bool,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
 	for row in 0..right_batch.num_rows() {
-		let Some(key) = join_key_bytes(right_key_arrays, row)? else {
-			append_unmatched_probe_row(kind, row, &mut selection)?;
-			continue;
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(right_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+				append_unmatched_probe_row(kind, row, &mut selection)?;
+				continue;
+			};
+			key
 		};
 		let matches = spilled.lookup(&key).await?;
 		let matched = append_join_matches_for_kind(
@@ -3345,6 +3402,17 @@ fn join_key_bytes(key_arrays: &[ArrayRef], row: usize) -> Result<Option<Vec<u8>>
 		encode_partition_key_value(array.as_ref(), row, &mut encoded)?;
 	}
 	Ok(Some(encoded))
+}
+
+fn join_key_bytes_null_safe(
+	key_arrays: &[ArrayRef],
+	row: usize,
+) -> Result<Vec<u8>, ExecutionError> {
+	let mut encoded = Vec::new();
+	for array in key_arrays {
+		encode_partition_key_value(array.as_ref(), row, &mut encoded)?;
+	}
+	Ok(encoded)
 }
 
 fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
@@ -6970,6 +7038,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1)],
 			right_keys: vec![ColumnOrdinal(1)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema,
 		};
@@ -7023,6 +7092,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
 			right_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema,
 		};
@@ -7257,7 +7327,7 @@ mod tests {
 		let key_arrays =
 			vec![Arc::new(Int64Array::from((0_i64..32).collect::<Vec<_>>())) as ArrayRef];
 
-		let rows = build_in_memory_join_rows(JoinKeyPlan::Int64, &key_arrays, 32, u64::MAX)
+		let rows = build_in_memory_join_rows(JoinKeyPlan::Int64, &key_arrays, 32, u64::MAX, false)
 			.expect("build rows")
 			.expect("in memory rows");
 
@@ -7271,7 +7341,7 @@ mod tests {
 		let right = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef];
 
 		assert_eq!(
-			JoinKeyPlan::from_key_arrays(&left, &right),
+			JoinKeyPlan::from_key_arrays(&left, &right, false),
 			JoinKeyPlan::Int64
 		);
 	}
@@ -7569,6 +7639,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1)],
 			right_keys: vec![ColumnOrdinal(1)],
+			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: Arc::new(Schema::new(vec![
 				Field::new("pk", DataType::Int64, false),

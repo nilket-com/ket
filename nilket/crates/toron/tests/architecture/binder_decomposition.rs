@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 10] = [
+const BINDER_MODULES: [&str; 11] = [
 	"aggregate",
 	"arithmetic",
 	"decision_log",
@@ -11,6 +11,7 @@ const BINDER_MODULES: [&str; 10] = [
 	"pushdown",
 	"runtime_evidence",
 	"selectivity",
+	"set_ops",
 ];
 
 #[test]
@@ -28,6 +29,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/pushdown.rs",
 		"src/binder/runtime_evidence.rs",
 		"src/binder/selectivity.rs",
+		"src/binder/set_ops.rs",
 		"src/binder/tests.rs",
 	];
 	let actual = binder_source_files()
@@ -172,7 +174,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 		.filter(|path| {
 			let later_adr_test_and_runtime_surfaces = [
 				"crates/toron/benches/distributed_inner_equi_join.rs",
+				"crates/toron/benches/storage_execution.rs",
 				"crates/toron/src/audit.rs",
+				"crates/toron/src/bin/toron_fixture_worker.rs",
 				"crates/toron/src/coordinator.rs",
 				"crates/toron/src/daemon.rs",
 				"crates/toron/src/distributed/fragment.rs",
@@ -190,12 +194,14 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/group_by_test.rs",
+				"crates/toron/tests/hash_join_fast_path_parity_test.rs",
 				"crates/toron/tests/hash_join_kinds_test.rs",
 				"crates/toron/tests/join_kind_test.rs",
 				"crates/toron/tests/observability_listener_test.rs",
 				"crates/toron/tests/qualified_resolution_test.rs",
 				"crates/toron/tests/rune_relation_handles_test.rs",
 				"crates/toron/tests/runtime_filter_pushdown_test.rs",
+				"crates/toron/tests/sort_ordering_test.rs",
 				"crates/toron/tests/wendelon_storage_execution_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"

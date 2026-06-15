@@ -262,6 +262,7 @@ fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Take { input, .. } => streamable_unary_plan(input),
 		ExecutionPlan::Exchange { .. }
+		| ExecutionPlan::Union { .. }
 		| ExecutionPlan::Sort { .. }
 		| ExecutionPlan::Aggregate { .. }
 		| ExecutionPlan::Join { .. }

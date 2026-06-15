@@ -1741,8 +1741,10 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 				right,
 				kind,
 				on,
+				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::Inner
+				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& !logical_plan_contains_join(right) =>
 			{
@@ -1789,8 +1791,10 @@ fn extract_left_preserved_outer_star_join_candidate(
 				right,
 				kind,
 				on,
+				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::LeftOuter
+				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& left_outer_star_dimension_label(right).is_some() =>
 			{
@@ -1835,8 +1839,10 @@ fn extract_right_preserved_outer_star_join_candidate(
 				right,
 				kind,
 				on,
+				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::RightOuter
+				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& left_outer_star_base_leaf_label(left).is_some() =>
 			{
@@ -1974,12 +1980,13 @@ pub(super) fn reroot_galaxy_join_tree(
 			right,
 			kind,
 			on,
+			null_safe_keys,
 			strategy_intent,
 		} = node
 		else {
 			return None;
 		};
-		if *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+		if *null_safe_keys || *kind != JoinKind::Inner || logical_plan_contains_join(right) {
 			return None;
 		}
 		join_meta.push((*kind, *strategy_intent));
@@ -2030,6 +2037,7 @@ pub(super) fn reroot_galaxy_join_tree(
 		right: Box::new(dim_leaf.clone()),
 		kind: base_kind,
 		on: fact_on[base_idx].clone(),
+		null_safe_keys: false,
 		strategy_intent: base_intent,
 	};
 	for &idx in order.iter().skip(1) {
@@ -2043,6 +2051,7 @@ pub(super) fn reroot_galaxy_join_tree(
 				.iter()
 				.map(|(fact, dim)| (dim.clone(), fact.clone()))
 				.collect(),
+			null_safe_keys: false,
 			strategy_intent: intent,
 		};
 	}
@@ -2071,12 +2080,13 @@ pub(super) fn reverse_bridge_chain_join_tree(
 			right,
 			kind,
 			on,
+			null_safe_keys,
 			strategy_intent,
 		} = node
 		else {
 			return None;
 		};
-		if *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+		if *null_safe_keys || *kind != JoinKind::Inner || logical_plan_contains_join(right) {
 			return None;
 		}
 		join_meta.push((*kind, *strategy_intent));
@@ -2110,6 +2120,7 @@ pub(super) fn reverse_bridge_chain_join_tree(
 			right: Box::new(leaves[i].clone()),
 			kind,
 			on: swap(&conds[i - 1]),
+			null_safe_keys: false,
 			strategy_intent: intent,
 		};
 	}
@@ -2119,6 +2130,7 @@ pub(super) fn reverse_bridge_chain_join_tree(
 		right: Box::new(base_leaf),
 		kind,
 		on: swap(conds.last()?),
+		null_safe_keys: false,
 		strategy_intent: intent,
 	})
 }
@@ -2182,6 +2194,9 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::ExplainAnalyze { input }
 		| LogicalPlan::CreateTableAsSelect { source: input, .. }
 		| LogicalPlan::InsertSelect { source: input, .. } => logical_plan_contains_join(input),
+		LogicalPlan::Union { left, right } => {
+			logical_plan_contains_join(left) || logical_plan_contains_join(right)
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }
@@ -4178,6 +4193,7 @@ impl<'a> Binder<'a> {
 			right,
 			kind,
 			on,
+			null_safe_keys,
 			strategy_intent,
 		} = plan
 		else {
@@ -4193,6 +4209,7 @@ impl<'a> Binder<'a> {
 				right,
 				*kind,
 				on,
+				*null_safe_keys,
 				*strategy_intent,
 				&mut scratch_trace,
 				&mut scratch_render,
@@ -4718,6 +4735,7 @@ impl<'a> Binder<'a> {
 				dimension.plan.clone(),
 				JoinKind::Inner,
 				dimension.on,
+				false,
 				dimension.strategy_intent,
 				trace,
 				render_trace,
@@ -5183,6 +5201,7 @@ impl<'a> Binder<'a> {
 				dimension.plan.clone(),
 				JoinKind::Inner,
 				dimension.on,
+				false,
 				dimension.strategy_intent,
 				trace,
 				render_trace,
@@ -5208,6 +5227,7 @@ impl<'a> Binder<'a> {
 				dimension.plan.clone(),
 				JoinKind::LeftOuter,
 				&dimension.on,
+				false,
 				dimension.strategy_intent,
 				trace,
 				render_trace,

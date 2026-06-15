@@ -1130,6 +1130,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 				Expr::qualified_column(orders.clone(), "customer_id"),
 				Expr::qualified_column(customers.clone(), "id"),
 			)],
+			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
 		predicate: Expr::Gt(
@@ -1148,6 +1149,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "product_id"),
 			Expr::qualified_column(products.clone(), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 	let with_stores = LogicalPlan::Join {
@@ -1161,6 +1163,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "store_id"),
 			Expr::qualified_column(stores.clone(), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -1207,6 +1210,7 @@ fn durable_probe_linearity_hash_fallback_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "customer_id"),
 			Expr::qualified_column(customers.clone(), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -1224,6 +1228,7 @@ fn durable_probe_linearity_hash_fallback_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "product_id"),
 			Expr::qualified_column(products.clone(), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
@@ -1736,6 +1741,10 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => assert_scan_has_no_pbc(input),
 		ExecutionPlan::Join { left, right, .. } => {
+			assert_scan_has_no_pbc(left);
+			assert_scan_has_no_pbc(right);
+		}
+		ExecutionPlan::Union { left, right, .. } => {
 			assert_scan_has_no_pbc(left);
 			assert_scan_has_no_pbc(right);
 		}

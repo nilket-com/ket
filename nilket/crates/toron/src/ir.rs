@@ -962,6 +962,10 @@ pub enum LogicalPlan {
 	Distinct {
 		input: Box<LogicalPlan>,
 	},
+	Union {
+		left: Box<LogicalPlan>,
+		right: Box<LogicalPlan>,
+	},
 	Aggregate {
 		input: Box<LogicalPlan>,
 		group_expr: Vec<Expr>,
@@ -987,6 +991,7 @@ pub enum LogicalPlan {
 		right: Box<LogicalPlan>,
 		kind: JoinKind,
 		on: Vec<(Expr, Expr)>,
+		null_safe_keys: bool,
 		strategy_intent: JoinStrategyIntent,
 	},
 	Explain {

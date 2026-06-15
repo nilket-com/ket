@@ -474,6 +474,7 @@ fn join_plan(
 		kind,
 		left_keys,
 		right_keys,
+		null_safe_keys: false,
 		strategy: JoinStrategy::HashPartitioned,
 		output_schema: join_schema(kind, &left_schema, &right_schema),
 	}

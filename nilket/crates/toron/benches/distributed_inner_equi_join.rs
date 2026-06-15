@@ -956,6 +956,7 @@ fn join_plan(
 		right: Box::new(right),
 		kind,
 		on: join_on(key_shape),
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: strategy.join_strategy(),
 			source: JoinStrategyPinSource::Direct,

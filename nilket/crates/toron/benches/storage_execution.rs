@@ -355,6 +355,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			left_keys,
 			right_keys,
 			strategy,
+			null_safe_keys,
 			output_schema,
 		} => ExecutionPlan::Join {
 			replay_id,
@@ -365,6 +366,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			left_keys,
 			right_keys,
 			strategy,
+			null_safe_keys,
 			output_schema,
 		},
 		other => other,

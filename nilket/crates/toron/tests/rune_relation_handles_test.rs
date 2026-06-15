@@ -383,6 +383,7 @@ async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
 		kind,
 		on,
 		strategy_intent,
+		..
 	} = logical
 	else {
 		panic!("expected Rune join, got {logical:?}");
@@ -431,6 +432,7 @@ async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
 		kind,
 		on,
 		strategy_intent,
+		..
 	} = logical
 	else {
 		panic!("expected Rune broadcast join, got {logical:?}");
@@ -646,6 +648,7 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 		left: hash_left,
 		right: hash_right,
 		on: hash_on,
+		null_safe_keys: false,
 		strategy_intent: hash_strategy,
 		..
 	} = hash
@@ -655,6 +658,7 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 	let LogicalPlan::Join {
 		left: broadcast_left,
 		on: broadcast_on,
+		null_safe_keys: false,
 		strategy_intent: broadcast_strategy,
 		..
 	} = broadcast

@@ -218,6 +218,12 @@ struct JoinDistinctAggregateProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+#[derive(Debug)]
+struct SetOpProcessRun {
+	rows: Vec<Option<i64>>,
+	selected_workers: Vec<WorkerId>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_process_distributed_query_digest_is_canonical() {
 	let first = run_process_query(100, 0).await;
@@ -392,6 +398,60 @@ async fn count_distinct_over_join_merges_across_partitions() {
 		unique_selected_worker_count(&run.selected_workers),
 		2,
 		"fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_all_scans_both_arms_across_workers() {
+	let run = run_set_op_process_query(
+		1_380,
+		0,
+		"SELECT set_left.set_key FROM set_left UNION ALL SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![None, None, None, Some(7), Some(9), Some(9), Some(10)]
+	);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"UNION ALL must not collapse to a single scan worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn union_distinct_dedups_across_partitions() {
+	let run = run_set_op_process_query(
+		1_390,
+		0,
+		"SELECT set_left.set_key FROM set_left UNION SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(run.rows, vec![None, Some(7), Some(9), Some(10)]);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"UNION DISTINCT fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intersect_null_safe_matching_across_partitions() {
+	let run = run_set_op_process_query(
+		1_392,
+		0,
+		"SELECT set_left.set_key FROM set_left INTERSECT SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(run.rows, vec![None, Some(9)]);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"INTERSECT fixture must exercise more than one worker"
 	);
 }
 
@@ -1312,6 +1372,45 @@ async fn run_hash_join_logical_process_query(
 	run
 }
 
+async fn run_set_op_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+	sql: &str,
+) -> SetOpProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new().plan(sql).expect("plan set operation");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("set operation query");
+	let rows = sorted_optional_i64_column_rows(&results, 0);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	SetOpProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_group_by_join_real_aggregate_process_query(
 	worker_id_base: u128,
 	start_offset: usize,
@@ -1754,6 +1853,7 @@ fn hash_join_plan_with_partitions_and_kind(partition_count: u32, kind: JoinKind)
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
@@ -1781,6 +1881,7 @@ fn broadcast_join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
@@ -1920,6 +2021,26 @@ fn grouped_join_count_rows(results: &[RecordBatch]) -> HashMap<Option<String>, i
 	rows
 }
 
+fn sorted_optional_i64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i64>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 set-op column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows.sort();
+	rows
+}
+
 fn unique_selected_worker_count(workers: &[WorkerId]) -> usize {
 	workers.iter().copied().collect::<HashSet<_>>().len()
 }
@@ -1985,6 +2106,32 @@ fn join_process_catalog() -> Arc<MockCatalog> {
 			),
 		)
 		.expect("register customers");
+	catalog
+		.register_descriptor(
+			TableId(4),
+			named_descriptor(
+				4,
+				"set_left",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("set_key", DataType::Int64, true),
+				]),
+			),
+		)
+		.expect("register set_left");
+	catalog
+		.register_descriptor(
+			TableId(5),
+			named_descriptor(
+				5,
+				"set_right",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("set_key", DataType::Int64, true),
+				]),
+			),
+		)
+		.expect("register set_right");
 	Arc::new(catalog)
 }
 
