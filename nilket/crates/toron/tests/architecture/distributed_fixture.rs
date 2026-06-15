@@ -74,18 +74,13 @@ pub(crate) fn adr236_cross_producer_cardinal_rule_documented() {
 }
 
 #[test]
-pub(crate) fn adr236_no_new_sql_ir_or_operator_surface() {
-	let ir = source("src/ir.rs");
-	let execution = source("src/ir/execution.rs");
-	let exec = source("src/exec.rs");
-	let planner = source("src/sql_planner.rs");
-	let lower_set_operation = source_block(&planner, "fn lower_set_operation");
+pub(crate) fn adr236_projection_fidelity_substrate_stays_behavior_only() {
+	let distributed = source("tests/distributed_process_test.rs");
+	let worker = source("src/bin/toron_fixture_worker.rs");
+	let scan = source_block(&worker, "async fn scan(&self, request: ScanRequest)");
 
-	assert!(!ir.contains("Repeat {"));
-	assert!(!execution.contains("Repeat {"));
-	assert!(!exec.contains("ExecutionPlan::Repeat"));
-	assert!(lower_set_operation.contains("INTERSECT ALL is not supported"));
-	assert!(lower_set_operation.contains("EXCEPT ALL"));
-	assert!(lower_set_operation.contains("MINUS ALL"));
-	assert!(!lower_set_operation.contains("Repeat"));
+	assert!(scan.contains("request.projected_columns"));
+	assert!(scan.contains(".project("));
+	assert!(distributed.contains("distributed_projection_fidelity_selects_nonzero_column"));
+	assert!(distributed.contains("distributed_projection_fidelity_preserves_nullable_column"));
 }

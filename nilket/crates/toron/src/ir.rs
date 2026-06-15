@@ -879,6 +879,12 @@ pub enum JoinKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetOpAllKind {
+	Intersect,
+	Except,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinStrategy {
 	HashPartitioned,
 	Broadcast,
@@ -965,6 +971,15 @@ pub enum LogicalPlan {
 	Union {
 		left: Box<LogicalPlan>,
 		right: Box<LogicalPlan>,
+	},
+	SetOpAll {
+		left: Box<LogicalPlan>,
+		right: Box<LogicalPlan>,
+		kind: SetOpAllKind,
+	},
+	Repeat {
+		input: Box<LogicalPlan>,
+		count: Expr,
 	},
 	Aggregate {
 		input: Box<LogicalPlan>,

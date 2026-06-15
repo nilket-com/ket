@@ -2186,6 +2186,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Distinct { input }
+		| LogicalPlan::Repeat { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
@@ -2195,6 +2196,9 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::CreateTableAsSelect { source: input, .. }
 		| LogicalPlan::InsertSelect { source: input, .. } => logical_plan_contains_join(input),
 		LogicalPlan::Union { left, right } => {
+			logical_plan_contains_join(left) || logical_plan_contains_join(right)
+		}
+		LogicalPlan::SetOpAll { left, right, .. } => {
 			logical_plan_contains_join(left) || logical_plan_contains_join(right)
 		}
 		LogicalPlan::Scan { .. }

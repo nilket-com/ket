@@ -304,6 +304,8 @@ impl StatementClass {
 			| LogicalPlan::Project { .. }
 			| LogicalPlan::Distinct { .. }
 			| LogicalPlan::Union { .. }
+			| LogicalPlan::SetOpAll { .. }
+			| LogicalPlan::Repeat { .. }
 			| LogicalPlan::Aggregate { .. }
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }

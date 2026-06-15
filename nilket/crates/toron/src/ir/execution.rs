@@ -269,6 +269,11 @@ pub enum ExecutionPlan {
 		right: Box<ExecutionPlan>,
 		output_schema: SchemaRef,
 	},
+	Repeat {
+		input: Box<ExecutionPlan>,
+		count_column: ColumnOrdinal,
+		output_schema: SchemaRef,
+	},
 	Aggregate {
 		input: Box<ExecutionPlan>,
 		group_expr: BoundExprProgram,
@@ -379,6 +384,7 @@ impl ExecutionPlan {
 			Self::Filter { input, .. } => input.schema(),
 			Self::Project { output_schema, .. } => output_schema.clone(),
 			Self::Union { output_schema, .. } => output_schema.clone(),
+			Self::Repeat { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),

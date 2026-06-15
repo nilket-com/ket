@@ -2,10 +2,11 @@
 
 **Status:** Promoted. **Migration:** `plans/impl/237_set_operation_multiplicity.md`.
 **Category:** Toron core query surface — completes the set-op family 235 opened by adding the `ALL`
-multiplicity variants. **One new primitive (row-multiplicity `Repeat`); everything else desugars onto
-the arc:** 233 grouped `Aggregate` (count over all-column groups) + 235 null-safe `Join` +
-`set_op_output_schema` + existing `CASE`/`IS NULL`/arithmetic. No new optimizer-evidence surface,
-durable key, system table, Rune-only surface, or Wendelon change.
+multiplicity variants. **One new physical primitive (row-multiplicity `Repeat`); one binder-only
+logical marker (`SetOpAll`) preserves the pre-bind SQL surface until schemas are known.** Everything
+else desugars onto the arc: 233 grouped `Aggregate` (count over all-column groups) + 235 null-safe
+`Join` + `set_op_output_schema` + existing `CASE`/`IS NULL`/arithmetic. No new optimizer-evidence
+surface, durable key, system table, Rune-only surface, or Wendelon change.
 
 ## Why this cut exists
 
@@ -27,13 +28,16 @@ with row multiplicity preserved.
 
 ## Decisions (promotion-locked)
 
-**D1 — One new primitive: `Repeat`, which consumes its count column and fails closed on invalid
-counts.**
+**D1 — One new physical primitive: `Repeat`, which consumes its count column and fails closed on
+invalid counts.**
 ```text
+LogicalPlan::SetOpAll { left, right, kind }   -- binder-only SQL marker
 LogicalPlan::Repeat   { input, count: Expr }
 ExecutionPlan::Repeat { input, count_column, output_schema }
 ```
-The logical node carries a count expression because logical plans are pre-bind and expression-oriented.
+`SetOpAll` is not an execution primitive; it exists so the planner can mark `INTERSECT/EXCEPT/MINUS
+ALL` and let the binder perform schema-aware reconciliation and count-arm construction. The logical
+`Repeat` node carries a count expression because logical plans are pre-bind and expression-oriented.
 The binder resolves that expression to an **integer (Int64) input ordinal** for the physical node.
 Physical `Repeat` **consumes** the resolved count column — `output_schema` = the input schema with
 that ordinal removed (no trailing projection to hide an internal count).
@@ -45,8 +49,9 @@ Per-row contract:
 - non-integer count column → **bind error**.
 `Repeat` is pure row-multiplicity: partition-local, no shuffle.
 
-**D2 — `ALL` membership desugars to count → null-safe join → CASE → Repeat.** For reconciled output
-columns `k…` (235's `set_op_output_schema` + arm normalization):
+**D2 — `ALL` membership desugars in the binder to count → null-safe join → CASE → Repeat.** The SQL
+planner lifts the old fences by emitting `LogicalPlan::SetOpAll`; the binder binds both arms, applies
+235's `set_op_output_schema` + arm normalization, and for reconciled output columns `k…`:
 - `Lc = Aggregate(L, group = k…, [count(*) AS lc])`; `Rc` likewise.
 - `INTERSECT ALL` → `Inner` null-safe `Join(Lc, Rc, on = k…)`, then `Project(k…, repeat_count = CASE
   WHEN lc < rc THEN lc ELSE rc END)`, then `Repeat`.
@@ -74,8 +79,9 @@ cross-producer rule**: a row whose copies are split across >1 producer must stil
 (+ `Repeat`). Deferred (unchanged): `BY NAME`; per-arm `ORDER BY`/`LIMIT`; set-op derived/EXISTS
 bodies; a general SQL-visible repeat / generate-series.
 
-**D7 — No new optimizer / durable / Wendelon surface beyond `Repeat`.** The desugar reuses
-aggregate/join/exchange/project; `Repeat` adds no optimizer-evidence. Physical `Repeat` builds a
+**D7 — No new optimizer / durable / Wendelon surface beyond physical `Repeat`.** The desugar reuses
+aggregate/join/exchange/project; `SetOpAll` is a binder marker only; `Repeat` adds no
+optimizer-evidence. Physical `Repeat` builds a
 `UInt32` take-index and uses `arrow::compute::take`, estimating output rows against the task memory
 budget (no unbounded index allocation).
 
@@ -107,7 +113,7 @@ SELECT a FROM t INTERSECT ALL BY NAME SELECT a FROM u
 ## Architecture guards (promotion-locked)
 
 - `adr237_set_op_all_desugars_to_count_join_repeat` (no set-op-ALL-specific physical operator)
-- `adr237_repeat_is_the_only_new_multiplicity_primitive`
+- `adr237_repeat_is_the_only_new_physical_multiplicity_primitive`
 - `adr237_repeat_consumes_integer_count_column`
 - `adr237_repeat_rejects_invalid_counts` (NULL/negative → error)
 - `adr237_all_membership_uses_null_safe_join`

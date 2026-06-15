@@ -16,7 +16,7 @@ use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, ColumnOrdinal,
 	ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategyIntent, LogicalPlan, ScalarValue,
-	SortExpr, TableId,
+	SortExpr, SystemTableKind, TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -1189,6 +1189,112 @@ async fn sql_intersect_and_except_use_null_equal_set_membership() {
 }
 
 #[tokio::test]
+async fn intersect_all_is_min_not_distinct() {
+	let results = run_logical(&plan_sql(
+		"SELECT k FROM left_dups INTERSECT ALL SELECT k FROM right_dups",
+	))
+	.await;
+
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![1, 1, 2]);
+}
+
+#[tokio::test]
+async fn except_all_subtracts_exactly() {
+	let results = run_logical(&plan_sql(
+		"SELECT k FROM left_dups EXCEPT ALL SELECT k FROM right_dups",
+	))
+	.await;
+
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![3, 3]);
+}
+
+#[tokio::test]
+async fn minus_all_aliases_except_all() {
+	let except = run_logical(&plan_sql(
+		"SELECT k FROM left_dups EXCEPT ALL SELECT k FROM right_dups",
+	))
+	.await;
+	let minus = run_logical(&plan_sql(
+		"SELECT k FROM left_dups MINUS ALL SELECT k FROM right_dups",
+	))
+	.await;
+
+	assert_eq!(
+		sorted_int64_column_rows(&minus, 0),
+		sorted_int64_column_rows(&except, 0)
+	);
+}
+
+#[tokio::test]
+async fn intersect_except_all_are_null_equal() {
+	let intersect = run_logical(&plan_sql(
+		"SELECT all_null_amount FROM sales INTERSECT ALL SELECT amount FROM sales",
+	))
+	.await;
+	let except = run_logical(&plan_sql(
+		"SELECT all_null_amount FROM sales EXCEPT ALL SELECT amount FROM sales",
+	))
+	.await;
+
+	assert_eq!(sorted_int32_optional_rows(&intersect, 0), vec![None, None]);
+	assert_eq!(
+		sorted_int32_optional_rows(&except, 0),
+		vec![None, None, None, None]
+	);
+}
+
+#[tokio::test]
+async fn except_all_zero_count_emits_no_row() {
+	let results = run_logical(&plan_sql(
+		"SELECT k FROM left_dups EXCEPT ALL SELECT k FROM left_dups",
+	))
+	.await;
+
+	assert_eq!(row_count(&results), 0);
+}
+
+#[tokio::test]
+async fn repeat_zero_count_emits_no_row() {
+	let (_, storage) = fixture();
+	let plan = repeat_test_plan(vec![
+		(10, ScalarValue::Int64(Some(0))),
+		(20, ScalarValue::Int64(Some(0))),
+	]);
+	let results = Executor::new(storage)
+		.execute_bound(&plan, None)
+		.await
+		.expect("execute repeat");
+
+	assert_eq!(row_count(&results), 0);
+	assert_eq!(results[0].schema().field(0).name(), "value");
+}
+
+#[tokio::test]
+async fn repeat_rejects_null_and_negative_counts() {
+	for (count, expected) in [
+		(ScalarValue::Int64(None), "REPEAT count must not be NULL"),
+		(
+			ScalarValue::Int64(Some(-1)),
+			"REPEAT count must not be negative",
+		),
+	] {
+		let (_, storage) = fixture();
+		let plan = repeat_test_plan(vec![(10, count)]);
+		let err = Executor::new(storage)
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("invalid repeat count should fail");
+		match err {
+			ExecutionError::InvalidExpression { message } => assert!(
+				message.contains(expected),
+				"expected {expected:?}, got {message:?}"
+			),
+			other => panic!("expected invalid expression, got {other:?}"),
+		}
+	}
+}
+
+#[tokio::test]
 async fn ordinary_join_stays_null_unequal() {
 	let results = run_logical(&plan_sql(
 		"SELECT sales.id \
@@ -1201,10 +1307,8 @@ async fn ordinary_join_stays_null_unequal() {
 
 #[test]
 fn sql_rejects_deferred_set_operation_forms() {
-	assert_unsupported("SELECT k FROM left_dups INTERSECT ALL SELECT k FROM right_dups");
-	assert_unsupported("SELECT k FROM left_dups EXCEPT ALL SELECT k FROM right_dups");
-	assert_unsupported("SELECT k FROM left_dups MINUS ALL SELECT k FROM right_dups");
 	assert_unsupported("SELECT k FROM left_dups UNION BY NAME SELECT k FROM right_dups");
+	assert_unsupported("SELECT k FROM left_dups INTERSECT ALL BY NAME SELECT k FROM right_dups");
 }
 
 #[tokio::test]
@@ -3989,6 +4093,30 @@ fn row_count(results: &[RecordBatch]) -> usize {
 	results.iter().map(RecordBatch::num_rows).sum()
 }
 
+fn repeat_test_plan(rows: Vec<(i64, ScalarValue)>) -> ExecutionPlan {
+	let input_schema = Arc::new(Schema::new(vec![
+		Field::new("value", DataType::Int64, false),
+		Field::new("repeat_count", DataType::Int64, true),
+	]));
+	let output_schema = Arc::new(Schema::new(vec![Field::new(
+		"value",
+		DataType::Int64,
+		false,
+	)]));
+	ExecutionPlan::Repeat {
+		input: Box::new(ExecutionPlan::SystemTable {
+			kind: SystemTableKind::OptimizerExplain,
+			schema: input_schema,
+			rows: rows
+				.into_iter()
+				.map(|(value, count)| vec![ScalarValue::Int64(Some(value)), count])
+				.collect(),
+		}),
+		count_column: ColumnOrdinal(1),
+		output_schema,
+	}
+}
+
 async fn execute_sql_err(sql: &str) -> ExecutionError {
 	let (catalog, storage) = fixture();
 	let bound = bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
@@ -4589,7 +4717,8 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
-		| ExecutionPlan::Take { input, .. } => contains_execution_join(input),
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => contains_execution_join(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -4617,7 +4746,11 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. } => contains_logical_join(input),
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Repeat { input, .. } => contains_logical_join(input),
+		LogicalPlan::SetOpAll { left, right, .. } => {
+			contains_logical_join(left) || contains_logical_join(right)
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::Explain { .. }
@@ -4642,11 +4775,15 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. } => contains_logical_distinct(input),
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Repeat { input, .. } => contains_logical_distinct(input),
 		LogicalPlan::Join { left, right, .. } => {
 			contains_logical_distinct(left) || contains_logical_distinct(right)
 		}
 		LogicalPlan::Union { left, right, .. } => {
+			contains_logical_distinct(left) || contains_logical_distinct(right)
+		}
+		LogicalPlan::SetOpAll { left, right, .. } => {
 			contains_logical_distinct(left) || contains_logical_distinct(right)
 		}
 		LogicalPlan::Scan { .. }
@@ -4671,7 +4808,8 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Take { input, .. } => contains_execution_sort(input),
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => contains_execution_sort(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			contains_execution_sort(left) || contains_execution_sort(right)
 		}

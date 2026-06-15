@@ -76,7 +76,7 @@ pub(crate) fn g17_join_ir_surface_has_single_join_variant_and_two_strategies() {
 	let join_kind = logical_source
 		.split("pub enum JoinKind")
 		.nth(1)
-		.and_then(|rest| rest.split("pub enum JoinStrategy").next())
+		.and_then(|rest| rest.split("pub enum SetOpAllKind").next())
 		.expect("JoinKind block");
 	let join_strategy = logical_source
 		.split("pub enum JoinStrategy")

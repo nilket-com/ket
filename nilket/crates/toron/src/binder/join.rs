@@ -793,6 +793,7 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 		ExecutionPlan::Filter { input, .. } | ExecutionPlan::Project { input, .. } => {
 			broadcast_probe_linearity(input)
 		}
+		ExecutionPlan::Repeat { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf),
 		ExecutionPlan::Union { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf),
 		ExecutionPlan::Join {
 			replay_id,
@@ -1185,6 +1186,7 @@ pub(super) fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExpr
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => terminal_exchange(input),
 		ExecutionPlan::EmptyRelation { .. }

@@ -949,6 +949,17 @@ fn rewrite_broadcast_star_probe_inner(
 			exprs,
 			output_schema,
 		}),
+		ExecutionPlan::Repeat {
+			input,
+			count_column,
+			output_schema,
+		} => Ok(ExecutionPlan::Repeat {
+			input: Box::new(rewrite_broadcast_star_probe_inner(
+				*input, allocator, builds, root,
+			)?),
+			count_column,
+			output_schema,
+		}),
 		leaf @ ExecutionPlan::Scan {
 			row_limit: None, ..
 		} => Ok(leaf),
@@ -1283,6 +1294,7 @@ fn leading_exchange_before_join(plan: &ExecutionPlan) -> Option<ExchangeBoundary
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => leading_exchange_before_join(input),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -1333,6 +1345,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_join(input),
 		ExecutionPlan::Union { left, right, .. } => first_join(left).or_else(|| first_join(right)),
@@ -1379,6 +1392,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => find_exchange(input),
 		ExecutionPlan::Join { left, right, .. } => {
@@ -1407,6 +1421,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
@@ -1442,6 +1457,7 @@ fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Take { input, .. } => global_sort_barrier_count(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			global_sort_barrier_count(left) + global_sort_barrier_count(right)
@@ -1481,6 +1497,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_scan_metadata(input),
 		ExecutionPlan::Join { left, right, .. } => {
@@ -1546,6 +1563,15 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 		} => ExecutionPlan::Project {
 			input: Box::new(replace_exchange_with_scan(*input, scan)),
 			exprs,
+			output_schema,
+		},
+		ExecutionPlan::Repeat {
+			input,
+			count_column,
+			output_schema,
+		} => ExecutionPlan::Repeat {
+			input: Box::new(replace_exchange_with_scan(*input, scan)),
+			count_column,
 			output_schema,
 		},
 		ExecutionPlan::Aggregate {
@@ -1646,6 +1672,15 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 		} => ExecutionPlan::Project {
 			input: Box::new(replace_first_join(*input, replacement)),
 			exprs,
+			output_schema,
+		},
+		ExecutionPlan::Repeat {
+			input,
+			count_column,
+			output_schema,
+		} => ExecutionPlan::Repeat {
+			input: Box::new(replace_first_join(*input, replacement)),
+			count_column,
 			output_schema,
 		},
 		ExecutionPlan::Aggregate {

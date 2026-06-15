@@ -650,6 +650,12 @@ impl Executor {
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
+				LogicalPlan::SetOpAll { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical set-op ALL execution",
+				}),
+				LogicalPlan::Repeat { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical repeat execution",
+				}),
 				LogicalPlan::Explain { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound EXPLAIN execution",
 				}),
@@ -775,6 +781,19 @@ impl Executor {
 						return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
 					}
 					Ok(output)
+				}
+				ExecutionPlan::Repeat {
+					input,
+					count_column,
+					output_schema,
+				} => {
+					let input_batches = self.execute_bound(input, morsel).await?;
+					execute_repeat(
+						&input_batches,
+						*count_column,
+						output_schema,
+						self.context.task_budget,
+					)
 				}
 				ExecutionPlan::Aggregate {
 					input,
@@ -3297,6 +3316,103 @@ fn concat_or_empty(
 	} else {
 		Ok(concat_batches(&schema, batches)?)
 	}
+}
+
+fn execute_repeat(
+	input_batches: &[RecordBatch],
+	count_column: crate::ir::ColumnOrdinal,
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let count_idx = usize::try_from(count_column.0).expect("column ordinal fits usize");
+	let mut output = Vec::new();
+	for batch in input_batches {
+		let count_values = batch
+			.column(count_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: format!("REPEAT count column {count_idx} must be Int64"),
+			})?;
+		let mut output_rows = 0usize;
+		for row in 0..batch.num_rows() {
+			if count_values.is_null(row) {
+				return Err(ExecutionError::InvalidExpression {
+					message: "REPEAT count must not be NULL".to_string(),
+				});
+			}
+			let count = count_values.value(row);
+			if count < 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("REPEAT count must not be negative, got {count}"),
+				});
+			}
+			let count = usize::try_from(count).map_err(|_| ExecutionError::InvalidExpression {
+				message: format!("REPEAT count {count} does not fit usize"),
+			})?;
+			output_rows =
+				output_rows
+					.checked_add(count)
+					.ok_or_else(|| ExecutionError::BudgetExhausted {
+						dimension: BudgetDimension::Memory,
+						requested: ByteCount::new(u64::MAX),
+						available: task_budget.memory,
+					})?;
+		}
+
+		let input_rows = batch.num_rows().max(1);
+		let payload_bytes = batch
+			.columns()
+			.iter()
+			.enumerate()
+			.filter(|(idx, _)| *idx != count_idx)
+			.map(|(_, column)| column.get_array_memory_size())
+			.sum::<usize>();
+		let estimated_payload = payload_bytes
+			.saturating_mul(output_rows)
+			.saturating_div(input_rows);
+		let estimated_index = output_rows.saturating_mul(std::mem::size_of::<u32>());
+		let estimate =
+			u64::try_from(estimated_payload.saturating_add(estimated_index)).unwrap_or(u64::MAX);
+		if estimate > task_budget.memory.get() {
+			return Err(ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount::new(estimate),
+				available: task_budget.memory,
+			});
+		}
+
+		if output_rows == 0 {
+			output.push(RecordBatch::new_empty(output_schema.clone()));
+			continue;
+		}
+
+		let mut indices = Vec::with_capacity(output_rows);
+		for row in 0..batch.num_rows() {
+			let count = usize::try_from(count_values.value(row)).map_err(|_| {
+				ExecutionError::InvalidExpression {
+					message: "REPEAT count does not fit usize".to_string(),
+				}
+			})?;
+			let row_idx = u32::try_from(row).map_err(|_| ExecutionError::InvalidExpression {
+				message: "REPEAT input row index exceeds UInt32 take index".to_string(),
+			})?;
+			indices.extend(std::iter::repeat_n(row_idx, count));
+		}
+		let indices = UInt32Array::from(indices);
+		let columns = batch
+			.columns()
+			.iter()
+			.enumerate()
+			.filter(|(idx, _)| *idx != count_idx)
+			.map(|(_, column)| take(column, &indices, None))
+			.collect::<Result<Vec<_>, _>>()?;
+		output.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+	}
+	if output.is_empty() {
+		output.push(RecordBatch::new_empty(output_schema.clone()));
+	}
+	Ok(output)
 }
 
 fn execute_sort(

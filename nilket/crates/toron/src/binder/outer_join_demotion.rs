@@ -201,6 +201,24 @@ impl<'a> Binder<'a> {
 							.await?,
 					),
 				}),
+				LogicalPlan::SetOpAll { left, right, kind } => Ok(LogicalPlan::SetOpAll {
+					left: Box::new(
+						self.demote_null_rejected_outer_joins_inner(left, receipts)
+							.await?,
+					),
+					right: Box::new(
+						self.demote_null_rejected_outer_joins_inner(right, receipts)
+							.await?,
+					),
+					kind: *kind,
+				}),
+				LogicalPlan::Repeat { input, count } => Ok(LogicalPlan::Repeat {
+					input: Box::new(
+						self.demote_null_rejected_outer_joins_inner(input, receipts)
+							.await?,
+					),
+					count: count.clone(),
+				}),
 				LogicalPlan::Aggregate {
 					input,
 					group_expr,
@@ -343,10 +361,11 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Filter { input, .. }
 				| LogicalPlan::Distinct { input }
+				| LogicalPlan::Repeat { input, .. }
 				| LogicalPlan::Exchange { input, .. }
 				| LogicalPlan::Sort { input, .. }
 				| LogicalPlan::Take { input, .. } => self.logical_scope_for_outer_demotion(input).await,
-				LogicalPlan::Union { .. } => Ok(None),
+				LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Ok(None),
 				LogicalPlan::Join {
 					left, right, kind, ..
 				} => {
@@ -754,6 +773,8 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Filter { .. }
 				| LogicalPlan::Union { .. }
+				| LogicalPlan::SetOpAll { .. }
+				| LogicalPlan::Repeat { .. }
 				| LogicalPlan::Aggregate { .. }
 				| LogicalPlan::Sort { .. }
 				| LogicalPlan::Take { .. }

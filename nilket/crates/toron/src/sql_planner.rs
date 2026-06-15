@@ -6,7 +6,8 @@ use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CreateTableColumn, CreateTableColumnType,
 	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
-	SortExpr, TemporalExtractField, TemporalTruncField, data_type_to_logical_type_physical,
+	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField,
+	data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -3320,18 +3321,21 @@ impl SqlPlanner {
 			},
 			SetOperator::Intersect => {
 				if *quantifier == SetQuantifier::All {
-					return Err(unsupported("INTERSECT ALL is not supported"));
+					return Ok(LogicalPlan::SetOpAll {
+						left: Box::new(left),
+						right: Box::new(right),
+						kind: SetOpAllKind::Intersect,
+					});
 				}
 				self.lower_distinct_membership_set_op(left, right, JoinKind::LeftSemi)
 			}
 			SetOperator::Except | SetOperator::Minus => {
 				if *quantifier == SetQuantifier::All {
-					let op_name = if matches!(op, SetOperator::Minus) {
-						"MINUS ALL"
-					} else {
-						"EXCEPT ALL"
-					};
-					return Err(unsupported(format!("{op_name} is not supported")));
+					return Ok(LogicalPlan::SetOpAll {
+						left: Box::new(left),
+						right: Box::new(right),
+						kind: SetOpAllKind::Except,
+					});
 				}
 				self.lower_distinct_membership_set_op(left, right, JoinKind::LeftAnti)
 			}
@@ -7622,7 +7626,8 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. } => plan_qualifiers(input),
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Repeat { input, .. } => plan_qualifiers(input),
 		LogicalPlan::Join {
 			left, right, kind, ..
 		} => match kind {
@@ -7634,7 +7639,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 				qualifiers
 			}
 		},
-		LogicalPlan::Union { .. } => Vec::new(),
+		LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Vec::new(),
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
@@ -8540,10 +8545,13 @@ mod tests {
 			| LogicalPlan::Exchange { input, .. }
 			| LogicalPlan::Sort { input, .. }
 			| LogicalPlan::Take { input, .. }
+			| LogicalPlan::Repeat { input, .. }
 			| LogicalPlan::Explain { input }
 			| LogicalPlan::ExplainAnalyze { input } => filter_count(input),
 			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),
-			LogicalPlan::Union { left, right } => filter_count(left) + filter_count(right),
+			LogicalPlan::Union { left, right } | LogicalPlan::SetOpAll { left, right, .. } => {
+				filter_count(left) + filter_count(right)
+			}
 			LogicalPlan::CreateTableAsSelect { source, .. } => filter_count(source),
 			LogicalPlan::Scan { .. }
 			| LogicalPlan::ScanNamed { .. }

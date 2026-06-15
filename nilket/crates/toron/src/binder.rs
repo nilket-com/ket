@@ -30,8 +30,8 @@ use crate::ir::{
 	FilterDisposition, InsertLiteral, JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
 	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
-	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind,
-	TableId, TemporalExtractField, TemporalTruncField, arithmetic_output_type,
+	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SetOpAllKind, SortExpr,
+	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, arithmetic_output_type,
 	calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
@@ -74,7 +74,10 @@ use self::join_order::*;
 use self::outer_join_demotion::*;
 use self::pushdown::*;
 use self::selectivity::*;
-use self::set_ops::{bind_union, normalize_set_op_arm, set_op_output_schema};
+use self::set_ops::{
+	all_output_columns_program, bind_union, distinct_input_unsupported_message,
+	normalize_set_op_arm, repeat_count_column, repeat_output_schema, set_op_output_schema,
+};
 
 pub use self::decision_log::OptimizerDecisionLog;
 pub(crate) use self::join::JoinStrategyDecisionReason;
@@ -1142,6 +1145,49 @@ impl<'a> Binder<'a> {
 						.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
 						.await?;
 					bind_union(left, right)
+				}
+				LogicalPlan::SetOpAll { left, right, kind } => {
+					let left = self
+						.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture)
+						.await?;
+					let right = self
+						.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
+						.await?;
+					self.bind_set_op_all(
+						left,
+						right,
+						*kind,
+						trace,
+						render_trace,
+						trace.join_decisions.len(),
+					)
+					.await
+				}
+				LogicalPlan::Repeat { input, count } => {
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.await?;
+					let count_expr = self
+						.bind_projection_expr_program_scoped(
+							std::slice::from_ref(count),
+							&input.schema(),
+							&input.scope,
+						)
+						.await?;
+					let count_column = repeat_count_column(&count_expr)?;
+					let output_schema = repeat_output_schema(&input.schema(), count_column)?;
+					let scope = input.scope.with_schema(output_schema.clone());
+					let join_order_sources = input.join_order_sources.clone();
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						ExecutionPlan::Repeat {
+							input: Box::new(input.plan),
+							count_column,
+							output_schema,
+						},
+						scope,
+						PlanOptimizerFacts::composite_unknown(),
+						join_order_sources,
+					))
 				}
 				LogicalPlan::Distinct { input } => {
 					if let Some(message) = distinct_input_unsupported_message(input) {
@@ -2569,66 +2615,6 @@ fn bind_alias_column_rename(
 	})
 }
 
-fn all_output_columns_program(schema: &SchemaRef) -> Result<BoundExprProgram, BindingError> {
-	let mut builder = BoundExprProgramBuilder::new();
-	for (idx, field) in schema.fields().iter().enumerate() {
-		let logical_type = decode_column_logical_type(field).map_err(|error| {
-			BindingError::UnsupportedExpression {
-				message: error.to_string(),
-			}
-		})?;
-		let ordinal = ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow"));
-		let node = builder.append_column(ResolvedColumn {
-			name: ColumnName(field.name().clone()),
-			ordinal,
-			data_type: field.data_type().clone(),
-			nullable: field.is_nullable(),
-			pbc_eligible: is_pbc_eligible_type(field.data_type()),
-		});
-		if !builder.set_node_logical_type(node, logical_type) {
-			return Err(BindingError::UnsupportedExpression {
-				message: "distinct column target is malformed".to_string(),
-			});
-		}
-		builder.push_root(node);
-	}
-	let program = builder.build();
-	program
-		.validate()
-		.map_err(|error| BindingError::UnsupportedExpression {
-			message: format!("distinct group-key program is malformed: {error:?}"),
-		})?;
-	Ok(program)
-}
-
-fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&'static str> {
-	match plan {
-		LogicalPlan::Join { left, right, .. } => distinct_input_unsupported_message(left)
-			.or_else(|| distinct_input_unsupported_message(right)),
-		LogicalPlan::Union { left, right } => distinct_input_unsupported_message(left)
-			.or_else(|| distinct_input_unsupported_message(right)),
-		LogicalPlan::Aggregate { .. } => Some("DISTINCT over aggregate inputs is not supported"),
-		LogicalPlan::Alias { input, .. }
-		| LogicalPlan::Filter { input, .. }
-		| LogicalPlan::Project { input, .. }
-		| LogicalPlan::Distinct { input }
-		| LogicalPlan::Exchange { input, .. }
-		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. } => distinct_input_unsupported_message(input),
-		LogicalPlan::Scan { .. } | LogicalPlan::ScanNamed { .. } => None,
-		LogicalPlan::Explain { .. }
-		| LogicalPlan::ExplainAnalyze { .. }
-		| LogicalPlan::CreateTable { .. }
-		| LogicalPlan::CreateLogicalType { .. }
-		| LogicalPlan::CreateTableAsSelect { .. }
-		| LogicalPlan::DropTable { .. }
-		| LogicalPlan::Delete { .. }
-		| LogicalPlan::Update { .. }
-		| LogicalPlan::Insert { .. }
-		| LogicalPlan::InsertSelect { .. } => Some("DISTINCT over this plan shape is not supported"),
-	}
-}
-
 fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {
 	(scan, QueryProfileHint::Scan)
 }
@@ -3352,6 +3338,28 @@ fn optimize_for_required(
 				ExecutionPlan::Union {
 					left: Box::new(left),
 					right: Box::new(right),
+					output_schema,
+				},
+				output_remap,
+			))
+		}
+		ExecutionPlan::Repeat {
+			input,
+			count_column,
+			output_schema,
+		} => {
+			let output_len = output_schema.fields().len();
+			let (input, _) = optimize_for_required(*input, None, logical_types)?;
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::Repeat {
+					input: Box::new(input),
+					count_column,
 					output_schema,
 				},
 				output_remap,

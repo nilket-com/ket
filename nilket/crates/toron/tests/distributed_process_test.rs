@@ -547,6 +547,23 @@ async fn intersect_null_safe_matching_across_partitions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_op_all_distributed_multiplicity_across_producers() {
+	let run = run_set_op_process_query(
+		1_394,
+		0,
+		"SELECT set_left.set_key FROM set_left EXCEPT ALL SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(run.rows, vec![None, Some(7)]);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"EXCEPT ALL result [NULL, 7] requires the two set_left NULL copies, split across fixture \
+		 producers, to merge into a left count before subtracting the one right-side NULL and repeating",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grouped_aggregate_sql_matches_hand_built_aggregate_over_processes() {
 	let sql = SqlPlanner::new()
 		.plan("SELECT val, COUNT(*) FROM fixture GROUP BY val")
