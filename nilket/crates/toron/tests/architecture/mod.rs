@@ -35,3 +35,4 @@ pub(crate) mod sql_planner_surface;
 pub(crate) mod storage_wendelon_boundary;
 pub(crate) mod support;
 pub(crate) mod temporal;
+pub(crate) mod window_functions;

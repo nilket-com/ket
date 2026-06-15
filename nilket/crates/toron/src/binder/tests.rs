@@ -19338,6 +19338,7 @@ fn first_filter_scan_state(plan: &ExecutionPlan) -> Option<(FilterDisposition, b
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_filter_scan_state(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_filter_scan_state(left).or_else(|| first_filter_scan_state(right))
@@ -19357,6 +19358,7 @@ fn scan_has_pbc(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => scan_has_pbc(input),
 		ExecutionPlan::Join { left, right, .. } => scan_has_pbc(left) || scan_has_pbc(right),
 		ExecutionPlan::CreateTableAsSelect { source, .. }
@@ -21080,6 +21082,7 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => collect_join_strategies(input, strategies),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -21120,6 +21123,7 @@ fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>)
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => collect_execution_join_kinds(input, kinds),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -21157,6 +21161,7 @@ fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => collect_join_replay_ids(input, ids),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -21199,6 +21204,7 @@ fn collect_join_replay_metadata(
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => collect_join_replay_metadata(input, metadata),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -21226,6 +21232,7 @@ fn first_join_plan(plan: &ExecutionPlan) -> &ExecutionPlan {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_join_plan(input),
 		ExecutionPlan::Union { left, right, .. } => {
 			let left = first_join_plan(left);
@@ -21261,6 +21268,7 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Repeat { input, .. }
 		| LogicalPlan::Explain { input }

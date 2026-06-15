@@ -6,8 +6,8 @@ use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CreateTableColumn, CreateTableColumnType,
 	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
-	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField,
-	data_type_to_logical_type_physical,
+	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, WindowFunction,
+	WindowFunctionCall, data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -20,7 +20,7 @@ use sqlparser::ast::{
 	JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint,
 	OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator,
 	SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo,
-	TypedString, UnaryOperator, Value,
+	TypedString, UnaryOperator, Value, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3748,6 +3748,12 @@ impl SqlPlanner {
 			});
 		}
 
+		// ADR 241: extract SELECT-projection ranking window functions into a `Window` node beneath the
+		// projection (evaluated post-HAVING/pre-projection). Returns the rewritten projection where each
+		// window call is replaced by a reference to its appended rank column.
+		let (plan, window_projection) = self.lower_select_window(plan, projection)?;
+		let projection = window_projection.as_slice();
+
 		let mut exprs = Vec::new();
 		let mut output_names = Vec::new();
 		for item in projection {
@@ -3784,6 +3790,157 @@ impl SqlPlanner {
 			plan: wrap_distinct_if_needed(plan, distinct_requested),
 			aggregate_output_catalog: None,
 		})
+	}
+
+	/// ADR 241: lower SELECT-projection ranking window functions into a single `Window` node over an
+	/// `Exchange` on the partition key. All window calls in the projection must share one `OVER` spec
+	/// (multiple distinct specs are deferred — the seed fragmenter allows one exchange boundary). The
+	/// returned projection replaces each window call with a reference to its appended rank column.
+	fn lower_select_window(
+		&self,
+		plan: LogicalPlan,
+		projection: &[SelectItem],
+	) -> Result<(LogicalPlan, Vec<SelectItem>), FrontendError> {
+		if !projection_contains_window_function(projection) {
+			return Ok((plan, projection.to_vec()));
+		}
+
+		let mut spec: Option<(Vec<Expr>, Vec<SortExpr>)> = None;
+		let mut functions: Vec<WindowFunctionCall> = Vec::new();
+		let mut rewritten: Vec<SelectItem> = Vec::with_capacity(projection.len());
+
+		for item in projection {
+			let (expr, alias) = match item {
+				SelectItem::UnnamedExpr(expr) => (expr, None),
+				SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+				_ => {
+					return Err(unsupported("window functions require simple SELECT items"));
+				}
+			};
+
+			match self.extract_window_call(expr, alias.clone())? {
+				Some(window) => {
+					let internal_name = window_internal_output_name(functions.len());
+					match &spec {
+						Some((partition_by, order_by)) => {
+							if !window_specs_match(
+								partition_by,
+								order_by,
+								&window.partition_by,
+								&window.order_by,
+							) {
+								return Err(unsupported(
+									"multiple distinct OVER specifications in one query are not supported",
+								));
+							}
+						}
+						None => spec = Some((window.partition_by.clone(), window.order_by.clone())),
+					}
+					rewritten.push(SelectItem::ExprWithAlias {
+						expr: SqlExpr::Identifier(Ident::new(internal_name.clone())),
+						alias: Ident::new(window.output_name.clone()),
+					});
+					functions.push(WindowFunctionCall {
+						function: window.function,
+						output_name: internal_name,
+					});
+				}
+				None => {
+					if expr_contains_window_function(expr) {
+						return Err(unsupported(
+							"window functions inside compound expressions are not supported",
+						));
+					}
+					rewritten.push(item.clone());
+				}
+			}
+		}
+
+		let (partition_by, order_by) = spec.expect("projection contained a window function");
+		let exchange = LogicalPlan::Exchange {
+			input: Box::new(plan),
+			partition_count: if partition_by.is_empty() {
+				1
+			} else {
+				DEFAULT_AGGREGATE_PARTITION_COUNT
+			},
+			key: partition_by.clone(),
+		};
+		let window = LogicalPlan::Window {
+			input: Box::new(exchange),
+			partition_by,
+			order_by,
+			functions,
+		};
+		Ok((window, rewritten))
+	}
+
+	/// Extract a ranking window function from a SELECT expression, or `None` if `expr` is not itself a
+	/// window call. Frames, named windows, aggregate-window, and non-ranking functions are rejected.
+	fn extract_window_call(
+		&self,
+		expr: &SqlExpr,
+		alias: Option<String>,
+	) -> Result<Option<ExtractedWindow>, FrontendError> {
+		let SqlExpr::Function(function) = expr else {
+			return Ok(None);
+		};
+		let Some(over) = &function.over else {
+			return Ok(None);
+		};
+		let function_name = if function_name_eq(&function.name, "ROW_NUMBER") {
+			WindowFunction::RowNumber
+		} else if function_name_eq(&function.name, "RANK") {
+			WindowFunction::Rank
+		} else if function_name_eq(&function.name, "DENSE_RANK") {
+			WindowFunction::DenseRank
+		} else {
+			return Err(unsupported(
+				"only ROW_NUMBER, RANK, and DENSE_RANK window functions are supported",
+			));
+		};
+		let spec = match over {
+			WindowType::WindowSpec(spec) => spec,
+			WindowType::NamedWindow(_) => {
+				return Err(unsupported("named WINDOW references are not supported"));
+			}
+		};
+		if spec.window_frame.is_some() {
+			return Err(unsupported("explicit window frames are not supported"));
+		}
+		if spec.window_name.is_some() {
+			return Err(unsupported("named windows are not supported"));
+		}
+		if !window_function_args_are_empty(&function.args) {
+			return Err(unsupported("ranking window functions take no arguments"));
+		}
+		let partition_by = spec
+			.partition_by
+			.iter()
+			.map(|expr| self.lower_expr(expr))
+			.collect::<Result<Vec<_>, _>>()?;
+		let order_by = spec
+			.order_by
+			.iter()
+			.map(|order| {
+				if order.with_fill.is_some() {
+					return Err(unsupported("ORDER BY WITH FILL is not supported"));
+				}
+				Ok(SortExpr {
+					expr: self.lower_expr(&order.expr)?,
+					descending: order.options.asc == Some(false),
+					nulls_first: order.options.nulls_first.unwrap_or(false),
+				})
+			})
+			.collect::<Result<Vec<_>, FrontendError>>()?;
+		let output_name =
+			alias.unwrap_or_else(|| window_function_default_name(function_name).to_string());
+		Ok(Some(ExtractedWindow {
+			function: function_name,
+			output_name,
+			partition_by,
+			order_by,
+		}))
 	}
 
 	fn lower_order_by(
@@ -6727,6 +6884,56 @@ fn projection_contains_aggregate_call(projection: &[SelectItem]) -> bool {
 	projection.iter().any(select_item_contains_aggregate_call)
 }
 
+/// ADR 241: a ranking window function extracted from a SELECT item (its function, the output column
+/// name it appends, and its lowered partition/order spec).
+struct ExtractedWindow {
+	function: WindowFunction,
+	output_name: String,
+	partition_by: Vec<Expr>,
+	order_by: Vec<SortExpr>,
+}
+
+fn window_function_default_name(function: WindowFunction) -> &'static str {
+	match function {
+		WindowFunction::RowNumber => "row_number",
+		WindowFunction::Rank => "rank",
+		WindowFunction::DenseRank => "dense_rank",
+	}
+}
+
+fn window_internal_output_name(index: usize) -> String {
+	format!("__toron_window_{index}")
+}
+
+fn window_function_args_are_empty(args: &FunctionArguments) -> bool {
+	match args {
+		FunctionArguments::None => true,
+		FunctionArguments::List(list) => list.args.is_empty(),
+		_ => false,
+	}
+}
+
+/// Two `OVER` specs match when their partition keys and order keys are structurally identical — used to
+/// require a single distinct `OVER` spec per query (ADR 241 D6).
+fn window_specs_match(
+	left_partition: &[Expr],
+	left_order: &[SortExpr],
+	right_partition: &[Expr],
+	right_order: &[SortExpr],
+) -> bool {
+	left_partition.len() == right_partition.len()
+		&& left_order.len() == right_order.len()
+		&& left_partition
+			.iter()
+			.zip(right_partition)
+			.all(|(left, right)| expr_structural_eq(left, right))
+		&& left_order.iter().zip(right_order).all(|(left, right)| {
+			left.descending == right.descending
+				&& left.nulls_first == right.nulls_first
+				&& expr_structural_eq(&left.expr, &right.expr)
+		})
+}
+
 fn projection_contains_window_function(projection: &[SelectItem]) -> bool {
 	projection.iter().any(select_item_contains_window_function)
 }
@@ -7816,6 +8023,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Repeat { input, .. } => plan_qualifiers(input),
 		LogicalPlan::Join {
@@ -8738,6 +8946,7 @@ mod tests {
 			| LogicalPlan::Aggregate { input, .. }
 			| LogicalPlan::Exchange { input, .. }
 			| LogicalPlan::Sort { input, .. }
+			| LogicalPlan::Window { input, .. }
 			| LogicalPlan::Take { input, .. }
 			| LogicalPlan::Repeat { input, .. }
 			| LogicalPlan::Explain { input }

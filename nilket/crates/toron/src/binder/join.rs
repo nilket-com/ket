@@ -922,6 +922,7 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Window { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf),
 	}
@@ -1286,6 +1287,7 @@ pub(super) fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExpr
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => terminal_exchange(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }

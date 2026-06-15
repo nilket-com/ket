@@ -191,6 +191,7 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. } => distinct_input_unsupported_message(input),
 		LogicalPlan::Scan { .. } | LogicalPlan::ScanNamed { .. } => None,
 		LogicalPlan::Explain { .. }

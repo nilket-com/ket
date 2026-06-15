@@ -257,6 +257,20 @@ impl<'a> Binder<'a> {
 					limit: *limit,
 					offset: *offset,
 				}),
+				LogicalPlan::Window {
+					input,
+					partition_by,
+					order_by,
+					functions,
+				} => Ok(LogicalPlan::Window {
+					input: Box::new(
+						self.demote_null_rejected_outer_joins_inner(input, receipts)
+							.await?,
+					),
+					partition_by: partition_by.clone(),
+					order_by: order_by.clone(),
+					functions: functions.clone(),
+				}),
 				LogicalPlan::Take { input, limit } => Ok(LogicalPlan::Take {
 					input: Box::new(
 						self.demote_null_rejected_outer_joins_inner(input, receipts)
@@ -364,6 +378,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Repeat { input, .. }
 				| LogicalPlan::Exchange { input, .. }
 				| LogicalPlan::Sort { input, .. }
+				| LogicalPlan::Window { input, .. }
 				| LogicalPlan::Take { input, .. } => self.logical_scope_for_outer_demotion(input).await,
 				LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Ok(None),
 				LogicalPlan::Join {
@@ -777,6 +792,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Repeat { .. }
 				| LogicalPlan::Aggregate { .. }
 				| LogicalPlan::Sort { .. }
+				| LogicalPlan::Window { .. }
 				| LogicalPlan::Take { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }

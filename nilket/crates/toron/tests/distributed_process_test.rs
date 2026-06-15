@@ -230,6 +230,13 @@ struct CrossJoinProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+#[derive(Debug)]
+struct WindowProcessRun {
+	/// `(partition key value, rank)` rows, sorted.
+	rows: Vec<(Option<i64>, i64)>,
+	selected_workers: Vec<WorkerId>,
+}
+
 /// ADR 236 cross-producer cardinal rule:
 /// - the expected value must be unreachable from a single producer / non-merging consumer;
 /// - `unique_selected_worker_count > 1` is supporting evidence, not the proof;
@@ -688,6 +695,33 @@ async fn multi_dedup_distinct_aggregate_distributed_merges_across_producers() {
 		"west's COUNT(DISTINCT orders.customer_id)=2 (over {2,3}) and COUNT(*)=3 require merging the \
 		 distinct dedup AND the plain count across both join producers (cust 2 and cust 3 land on \
 		 different workers); a single producer reaches neither value",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_window_rank_is_value_discriminating() {
+	// ADR 241 distributed gate (236/238 discipline). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL].
+	// The NULL partition holds ids 2 and 4, which scan-share to different workers; ROW_NUMBER within the
+	// NULL partition is correct only once the partition exchange co-locates and orders those rows. A
+	// single producer sees one of them -> it could only reach rn=1.
+	let run = run_window_process_query(
+		1_430,
+		0,
+		"SELECT set_left.set_key, \
+		        ROW_NUMBER() OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS rn \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 1), (None, 2), (Some(7), 1), (Some(9), 1)],
+		"the NULL partition (ids 2,4) ranks 1,2 by id; singletons 7 and 9 rank 1"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the NULL partition's ROW_NUMBER 1,2 over ids {2,4} requires the partition exchange to \
+		 co-locate rows scan-shared across both workers; a single producer reaches only rn=1",
 	);
 }
 
@@ -1659,6 +1693,45 @@ async fn run_hash_join_logical_process_query(
 	run
 }
 
+async fn run_window_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+	sql: &str,
+) -> WindowProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new().plan(sql).expect("plan window query");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("window query");
+	let rows = window_set_key_rank_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	WindowProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_set_op_process_query(
 	worker_id_base: u128,
 	start_offset: usize,
@@ -2431,6 +2504,32 @@ fn sorted_i64_optional_i64_pair_rows(results: &[RecordBatch]) -> Vec<(i64, Optio
 				Some(right.value(row))
 			};
 			rows.push((left.value(row), right_value));
+		}
+	}
+	rows.sort();
+	rows
+}
+
+fn window_set_key_rank_rows(results: &[RecordBatch]) -> Vec<(Option<i64>, i64)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let key = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 partition key column");
+		let rank = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 rank column");
+		for row in 0..batch.num_rows() {
+			let key = if key.is_null(row) {
+				None
+			} else {
+				Some(key.value(row))
+			};
+			rows.push((key, rank.value(row)));
 		}
 	}
 	rows.sort();

@@ -10,7 +10,7 @@ use crate::catalog::{
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
-	TemporalExtractField, TemporalTruncField, field_with_logical_type_metadata,
+	TemporalExtractField, TemporalTruncField, WindowFunction, field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -292,6 +292,16 @@ pub enum ExecutionPlan {
 		offset: usize,
 		output_schema: SchemaRef,
 	},
+	/// ADR 241: ranking window functions. Row-preserving — `output_schema` is the input schema plus
+	/// one column per `functions` entry (in order). The operator orders each co-located partition by
+	/// `order_by` internally and streams ranks, resetting on each `partition_by` change.
+	Window {
+		input: Box<ExecutionPlan>,
+		partition_by: BoundExprProgram,
+		order_by: Vec<ExecutionSortKey>,
+		functions: Vec<WindowFunction>,
+		output_schema: SchemaRef,
+	},
 	Take {
 		input: Box<ExecutionPlan>,
 		limit: usize,
@@ -388,6 +398,7 @@ impl ExecutionPlan {
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),
+			Self::Window { output_schema, .. } => output_schema.clone(),
 			Self::Take { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),

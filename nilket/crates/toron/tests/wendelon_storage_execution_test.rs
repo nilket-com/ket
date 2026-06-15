@@ -1739,6 +1739,7 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => assert_scan_has_no_pbc(input),
 		ExecutionPlan::Join { left, right, .. } => {

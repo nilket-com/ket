@@ -309,6 +309,7 @@ impl StatementClass {
 			| LogicalPlan::Aggregate { .. }
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }
+			| LogicalPlan::Window { .. }
 			| LogicalPlan::Take { .. }
 			| LogicalPlan::Join { .. }
 			| LogicalPlan::Explain { .. }

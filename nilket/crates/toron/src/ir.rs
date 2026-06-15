@@ -866,6 +866,24 @@ pub enum AggregateFunction {
 	ApproxQuantile(f64),
 }
 
+/// ADR 241: ranking window functions. They take no arguments and are defined by the partition +
+/// order of the enclosing `OVER (...)` spec alone (no frame). Aggregate-window functions, frames,
+/// and LAG/LEAD/NTILE are deferred follow-ons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFunction {
+	RowNumber,
+	Rank,
+	DenseRank,
+}
+
+/// A single window function call in a `Window` node's projection: the function and the output column
+/// name it appends (the SELECT alias or a derived name).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowFunctionCall {
+	pub function: WindowFunction,
+	pub output_name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKind {
 	Inner,
@@ -1000,6 +1018,15 @@ pub enum LogicalPlan {
 		order_by: Vec<SortExpr>,
 		limit: Option<usize>,
 		offset: usize,
+	},
+	/// ADR 241: ranking window functions over one `OVER (PARTITION BY ... ORDER BY ...)` spec.
+	/// Row-preserving — appends one column per `functions` entry. The planner places an `Exchange`
+	/// on `partition_by` beneath this node; the operator orders each co-located partition internally.
+	Window {
+		input: Box<LogicalPlan>,
+		partition_by: Vec<Expr>,
+		order_by: Vec<SortExpr>,
+		functions: Vec<WindowFunctionCall>,
 	},
 	Take {
 		input: Box<LogicalPlan>,

@@ -265,6 +265,7 @@ fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Union { .. }
 		| ExecutionPlan::Repeat { .. }
 		| ExecutionPlan::Sort { .. }
+		| ExecutionPlan::Window { .. }
 		| ExecutionPlan::Aggregate { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::EmptyRelation { .. }

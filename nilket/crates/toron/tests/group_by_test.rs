@@ -4893,6 +4893,7 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => contains_execution_join(input),
 		ExecutionPlan::EmptyRelation { .. }
@@ -4922,6 +4923,7 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Repeat { input, .. } => contains_logical_join(input),
 		LogicalPlan::SetOpAll { left, right, .. } => {
@@ -4951,6 +4953,7 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Repeat { input, .. } => contains_logical_distinct(input),
 		LogicalPlan::Join { left, right, .. } => {
@@ -4984,6 +4987,7 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => contains_execution_sort(input),
 		ExecutionPlan::Join { left, right, .. } => {

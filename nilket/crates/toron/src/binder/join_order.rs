@@ -2190,6 +2190,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Explain { input }
 		| LogicalPlan::ExplainAnalyze { input }

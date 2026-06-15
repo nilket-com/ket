@@ -1296,6 +1296,64 @@ impl<'a> Binder<'a> {
 						join_order_sources,
 					))
 				}
+				LogicalPlan::Window {
+					input,
+					partition_by,
+					order_by,
+					functions,
+				} => {
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.await?;
+					let input_schema = input.schema();
+					let partition_by = self
+						.bind_expr_program_scoped(partition_by, &input_schema, &input.scope)
+						.await?;
+					// Bind only the user's ORDER BY keys (no total-order tiebreaker expansion): these are
+					// the *peer* keys for RANK/DENSE_RANK ties. The executor totalizes the sort itself for
+					// deterministic ROW_NUMBER among peers.
+					let order_by = order_by
+						.iter()
+						.map(|key| {
+							Ok(ExecutionSortKey {
+								ordinal: bind_sort_key_ordinal(
+									&key.expr,
+									&input_schema,
+									&input.scope,
+								)?,
+								descending: key.descending,
+								nulls_first: key.nulls_first,
+							})
+						})
+						.collect::<Result<Vec<_>, BindingError>>()?;
+					// Row-preserving: keep every input column, append one non-null Int64 rank column
+					// per window function (named by its SELECT alias / derived name).
+					let mut fields = input_schema
+						.fields()
+						.iter()
+						.map(|field| field.as_ref().clone())
+						.collect::<Vec<_>>();
+					for call in functions {
+						fields.push(Field::new(&call.output_name, DataType::Int64, false));
+					}
+					let output_schema = Arc::new(Schema::new(fields));
+					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
+					let scope = input.scope.with_schema(output_schema.clone());
+					let join_order_sources = input.join_order_sources.clone();
+
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						ExecutionPlan::Window {
+							input: Box::new(input.plan),
+							partition_by,
+							order_by,
+							functions: functions.iter().map(|call| call.function).collect(),
+							output_schema,
+						},
+						scope,
+						facts,
+						join_order_sources,
+					))
+				}
 				LogicalPlan::Take { input, limit } => {
 					let input = self
 						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
@@ -3476,6 +3534,34 @@ fn optimize_for_required(
 					order_by,
 					limit,
 					offset,
+					output_schema,
+				},
+				output_remap,
+			))
+		}
+		ExecutionPlan::Window {
+			input,
+			partition_by,
+			order_by,
+			functions,
+			output_schema,
+		} => {
+			// A window is a pruning barrier: it reads its partition/order columns and appends rank
+			// columns, so the input keeps all columns and the output is identity-remapped.
+			let output_len = output_schema.fields().len();
+			let (input, _) = optimize_for_required(*input, None, logical_types)?;
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::Window {
+					input: Box::new(input),
+					partition_by,
+					order_by,
+					functions,
 					output_schema,
 				},
 				output_remap,

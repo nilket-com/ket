@@ -15,7 +15,7 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
 	JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId,
-	TableId, TemporalExtractField, TemporalTruncField, nanos_per_timestamp_unit,
+	TableId, TemporalExtractField, TemporalTruncField, WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -632,6 +632,9 @@ impl Executor {
 					}
 					Ok(partitioned_output)
 				}
+				LogicalPlan::Window { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical window execution",
+				}),
 				LogicalPlan::Sort { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical sort execution",
 				}),
@@ -835,6 +838,24 @@ impl Executor {
 						order_by,
 						*limit,
 						*offset,
+						output_schema,
+						self.context.task_budget,
+					)
+				}
+				ExecutionPlan::Window {
+					input,
+					partition_by,
+					order_by,
+					functions,
+					output_schema,
+				} => {
+					let input_batches = self.execute_bound(input, morsel).await?;
+					execute_window(
+						input.schema(),
+						&input_batches,
+						partition_by,
+						order_by,
+						functions,
 						output_schema,
 						self.context.task_budget,
 					)
@@ -3594,6 +3615,163 @@ fn execute_sort(
 		.collect::<Result<Vec<_>, _>>()?;
 
 	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
+}
+
+/// ADR 241: ranking window functions. The input arrives co-located by `partition_by` (the planner put
+/// an `Exchange` beneath the `Window` node). We order each partition internally by `[partition_by...,
+/// order_by...]`, then stream ranks resetting on each partition-key change. Row-preserving: the output
+/// is the input columns (in the new order) plus one Int64 rank column per function.
+fn execute_window(
+	input_schema: arrow::datatypes::SchemaRef,
+	input_batches: &[RecordBatch],
+	partition_by: &BoundExprProgram,
+	order_by: &[ExecutionSortKey],
+	functions: &[WindowFunction],
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let batch = concat_or_empty(input_schema, input_batches)?;
+	let rows = batch.num_rows();
+	if rows == 0 {
+		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+	}
+
+	let estimate = batch.get_array_memory_size().saturating_add(
+		rows.saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<i64>()),
+	);
+	let estimate = u64::try_from(estimate).unwrap_or(u64::MAX);
+	if estimate > task_budget.memory.get() {
+		return Err(ExecutionError::BudgetExhausted {
+			dimension: BudgetDimension::Memory,
+			requested: ByteCount::new(estimate),
+			available: task_budget.memory,
+		});
+	}
+
+	let partition_arrays = Executor::evaluate_bound_program_without_storage(partition_by, &batch)?;
+	let order_arrays =
+		order_by
+			.iter()
+			.map(|key| {
+				let ordinal = key.ordinal.0 as usize;
+				batch.columns().get(ordinal).cloned().ok_or_else(|| {
+					ExecutionError::InvalidExpression {
+						message: format!("window order key ordinal {ordinal} out of bounds"),
+					}
+				})
+			})
+			.collect::<Result<Vec<_>, ExecutionError>>()?;
+
+	// Order each partition contiguously, ordered within: sort by partition keys (ascending) then the
+	// declared ORDER BY keys.
+	let mut sort_columns = partition_arrays
+		.iter()
+		.map(|values| SortColumn {
+			values: values.clone(),
+			options: Some(SortOptions {
+				descending: false,
+				nulls_first: true,
+			}),
+		})
+		.collect::<Vec<_>>();
+	for (key, values) in order_by.iter().zip(&order_arrays) {
+		sort_columns.push(SortColumn {
+			values: values.clone(),
+			options: Some(SortOptions {
+				descending: key.descending,
+				nulls_first: key.nulls_first,
+			}),
+		});
+	}
+	// Totalize the sort with every column as an ascending tiebreaker so ROW_NUMBER among peers is
+	// deterministic. Peer detection below still uses only `order_by`, so RANK/DENSE_RANK ties are
+	// unaffected by the tiebreakers.
+	for column in batch.columns() {
+		sort_columns.push(SortColumn {
+			values: column.clone(),
+			options: Some(SortOptions {
+				descending: false,
+				nulls_first: false,
+			}),
+		});
+	}
+	let sorted_indices = if sort_columns.is_empty() {
+		(0..u32::try_from(rows).unwrap_or(u32::MAX)).collect::<Vec<u32>>()
+	} else {
+		lexsort_to_indices(&sort_columns, None)?.values().to_vec()
+	};
+	let indices = UInt32Array::from(sorted_indices);
+
+	let mut columns = batch
+		.columns()
+		.iter()
+		.map(|column| take(column, &indices, None))
+		.collect::<Result<Vec<_>, _>>()?;
+	let sorted_partition = take_all(&partition_arrays, &indices)?;
+	let sorted_order = take_all(&order_arrays, &indices)?;
+	let partition_rows = window_comparison_rows(&sorted_partition)?;
+	let order_rows = window_comparison_rows(&sorted_order)?;
+
+	let mut row_number = vec![0_i64; rows];
+	let mut rank = vec![0_i64; rows];
+	let mut dense_rank = vec![0_i64; rows];
+	let (mut rn, mut rk, mut dr) = (0_i64, 0_i64, 0_i64);
+	for row in 0..rows {
+		let new_partition = row == 0 || !window_rows_equal(&partition_rows, row, row - 1);
+		if new_partition {
+			rn = 0;
+			rk = 0;
+			dr = 0;
+		}
+		rn += 1;
+		// A new peer group starts at a partition boundary or when the ORDER BY value changes.
+		if new_partition || !window_rows_equal(&order_rows, row, row - 1) {
+			rk = rn;
+			dr += 1;
+		}
+		row_number[row] = rn;
+		rank[row] = rk;
+		dense_rank[row] = dr;
+	}
+
+	for function in functions {
+		let values = match function {
+			WindowFunction::RowNumber => &row_number,
+			WindowFunction::Rank => &rank,
+			WindowFunction::DenseRank => &dense_rank,
+		};
+		columns.push(Arc::new(Int64Array::from(values.clone())) as ArrayRef);
+	}
+
+	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
+}
+
+fn take_all(arrays: &[ArrayRef], indices: &UInt32Array) -> Result<Vec<ArrayRef>, ExecutionError> {
+	arrays
+		.iter()
+		.map(|array| take(array, indices, None).map_err(ExecutionError::from))
+		.collect()
+}
+
+/// Build a total-order row encoding of `arrays` so adjacent rows can be compared for equality across
+/// any column types (including NULLs). Returns `None` when there are no columns (every row is equal).
+fn window_comparison_rows(arrays: &[ArrayRef]) -> Result<Option<arrow::row::Rows>, ExecutionError> {
+	if arrays.is_empty() {
+		return Ok(None);
+	}
+	let fields = arrays
+		.iter()
+		.map(|array| arrow::row::SortField::new(array.data_type().clone()))
+		.collect::<Vec<_>>();
+	let converter = arrow::row::RowConverter::new(fields)?;
+	Ok(Some(converter.convert_columns(arrays)?))
+}
+
+fn window_rows_equal(rows: &Option<arrow::row::Rows>, a: usize, b: usize) -> bool {
+	match rows {
+		Some(rows) => rows.row(a) == rows.row(b),
+		None => true,
+	}
 }
 
 fn key_arrays(

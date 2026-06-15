@@ -1126,6 +1126,7 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_broadcast_join(input),
 		ExecutionPlan::Union { left, right, .. } => {
 			contains_broadcast_join(left) || contains_broadcast_join(right)
@@ -1163,6 +1164,7 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => first_scan_fingerprint(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))

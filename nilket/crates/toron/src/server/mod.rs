@@ -1168,6 +1168,7 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => join_strategy_label(input),
 		ExecutionPlan::Union { left, right, .. } => {
 			join_strategy_label(left).or_else(|| join_strategy_label(right))
@@ -1195,6 +1196,7 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => contains_join(input),
 		ExecutionPlan::Union { left, right, .. } => contains_join(left) || contains_join(right),
 		ExecutionPlan::EmptyRelation { .. }
@@ -1223,6 +1225,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Repeat { .. } => "repeat",
 			ExecutionPlan::Aggregate { .. } => "aggregate",
 			ExecutionPlan::Sort { .. } => "sort",
+			ExecutionPlan::Window { .. } => "window",
 			ExecutionPlan::Take { .. } => "take",
 			ExecutionPlan::EmptyRelation { .. } => "empty_relation",
 			ExecutionPlan::SystemTable { .. } => "system_table",
@@ -1393,6 +1396,7 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => contains_broadcast_join(input),
 		ExecutionPlan::Union { left, right, .. } => {
@@ -3808,6 +3812,7 @@ fn drive_streamable_plan<'a>(
 			ExecutionPlan::Exchange { .. }
 			| ExecutionPlan::Union { .. }
 			| ExecutionPlan::Sort { .. }
+			| ExecutionPlan::Window { .. }
 			| ExecutionPlan::Aggregate { .. }
 			| ExecutionPlan::Join { .. }
 			| ExecutionPlan::Repeat { .. }
@@ -4036,6 +4041,7 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
 		| ExecutionPlan::Repeat { input, .. } => scan_schema_for_table_id(input, table_id),
 		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
