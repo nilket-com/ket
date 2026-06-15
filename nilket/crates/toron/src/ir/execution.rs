@@ -149,6 +149,15 @@ pub struct BoundAggregateCall {
 	pub args: BoundExprProgram,
 }
 
+/// ADR 242: a bound window function call in an `ExecutionPlan::Window`. `function` is the ranking or
+/// `Aggregate` kind; `arg` is the bound aggregate argument (`Some` for `COUNT(x)/SUM/MIN/MAX/AVG`,
+/// `None` for ranking and `COUNT(*)`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundWindowCall {
+	pub function: WindowFunction,
+	pub arg: Option<BoundExprProgram>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundExprProgramError {
 	NodeTypeArityMismatch {
@@ -292,14 +301,15 @@ pub enum ExecutionPlan {
 		offset: usize,
 		output_schema: SchemaRef,
 	},
-	/// ADR 241: ranking window functions. Row-preserving — `output_schema` is the input schema plus
-	/// one column per `functions` entry (in order). The operator orders each co-located partition by
-	/// `order_by` internally and streams ranks, resetting on each `partition_by` change.
+	/// ADR 241/242: window functions. Row-preserving — `output_schema` is the input schema plus one
+	/// column per `functions` entry (in order). The operator orders each co-located partition by
+	/// `order_by` internally; ranking functions stream ranks resetting on each `partition_by` change,
+	/// and `Aggregate` calls maintain a peer-aware running accumulator over the SQL default frame.
 	Window {
 		input: Box<ExecutionPlan>,
 		partition_by: BoundExprProgram,
 		order_by: Vec<ExecutionSortKey>,
-		functions: Vec<WindowFunction>,
+		functions: Vec<BoundWindowCall>,
 		output_schema: SchemaRef,
 	},
 	Take {

@@ -866,22 +866,27 @@ pub enum AggregateFunction {
 	ApproxQuantile(f64),
 }
 
-/// ADR 241: ranking window functions. They take no arguments and are defined by the partition +
-/// order of the enclosing `OVER (...)` spec alone (no frame). Aggregate-window functions, frames,
-/// and LAG/LEAD/NTILE are deferred follow-ons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Window functions over one `OVER (...)` spec. Ranking functions (ADR 241) take no arguments and
+/// depend only on the partition + order. `Aggregate` (ADR 242) carries an `AggregateFunction` evaluated
+/// over the SQL default frame (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW`): with `ORDER BY`, a
+/// peer-aware running aggregate; without, the whole-partition aggregate. Explicit `ROWS`/`RANGE BETWEEN`
+/// frames and LAG/LEAD/NTILE are deferred follow-ons.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFunction {
 	RowNumber,
 	Rank,
 	DenseRank,
+	Aggregate(AggregateFunction),
 }
 
-/// A single window function call in a `Window` node's projection: the function and the output column
-/// name it appends (the SELECT alias or a derived name).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A single window function call in a `Window` node's projection: the function, the output column name
+/// it appends (the SELECT alias or a derived name), and its arguments (ranking + `COUNT(*)`: none;
+/// other aggregate windows: exactly one).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowFunctionCall {
 	pub function: WindowFunction,
 	pub output_name: String,
+	pub args: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

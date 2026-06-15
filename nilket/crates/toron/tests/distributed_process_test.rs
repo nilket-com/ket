@@ -726,6 +726,33 @@ async fn distributed_window_rank_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_window_aggregate_is_value_discriminating() {
+	// ADR 242 distributed gate (236/238 discipline). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL].
+	// The NULL partition holds ids 2 and 4, which scan-share to different workers; a running SUM(id) over
+	// the NULL partition is the cumulative 2 then 6 only once the partition exchange co-locates and
+	// orders those rows. A single producer sees one of them -> it could only reach SUM 2 or 4.
+	let run = run_window_process_query(
+		1_432,
+		0,
+		"SELECT set_left.set_key, \
+		        SUM(set_left.id) OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS s \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 2), (None, 6), (Some(7), 1), (Some(9), 3)],
+		"the NULL partition (ids 2,4) running SUM is 2 then 6; singletons 7 and 9 sum to their own id"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the NULL partition's running SUM 2,6 over ids {2,4} requires the partition exchange to \
+		 co-locate rows scan-shared across both workers; a single producer reaches only 2 or 4",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

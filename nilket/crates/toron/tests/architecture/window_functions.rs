@@ -1,10 +1,11 @@
 //! ADR 241 — Window Functions Substrate architecture guards.
 //!
 //! Load-bearing proofs are the behavior gates (`window_test.rs`) and the distributed cardinal
-//! (`distributed_process_test.rs`). These guards pin the structural facts: a new `Window` node (logical
-//! + physical), a ranking-only `WindowFunction` enum, `OVER`-lowers-to-`Window`-over-`Exchange`,
-//! row-preservation, the node-agnostic fragmentation reuse, the single-`OVER`-spec bound, the deferred
-//! fences, and the absence of any optimizer/Wendelon surface.
+//! (`distributed_process_test.rs`). These guards pin the structural facts: a `Window` node (logical +
+//! physical), the `WindowFunction` enum (ranking + ADR 242 aggregate windows; offset/value deferred),
+//! `OVER`-lowers-to-`Window`-over-`Exchange`, row-preservation, the node-agnostic fragmentation reuse,
+//! the single-`OVER`-spec bound, the deferred fences (explicit frames → ADR 243), and the absence of any
+//! optimizer/Wendelon surface.
 
 use super::support::*;
 
@@ -40,20 +41,21 @@ pub(crate) fn adr241_adds_window_logical_and_physical_node() {
 }
 
 #[test]
-pub(crate) fn adr241_window_function_enum_is_ranking_only() {
+pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
+	// Reconciled for ADR 242: ranking variants stay, aggregate windows are now a variant, and the
+	// offset/value window families remain deferred.
 	let ir = source("src/ir.rs");
 	let window_function = source_block(&ir, "pub enum WindowFunction");
 	for variant in ["RowNumber", "Rank", "DenseRank"] {
 		assert!(
 			window_function.contains(variant),
-			"WindowFunction must include {variant}"
+			"WindowFunction must retain ranking variant {variant}"
 		);
 	}
-	// Ranking-only: no aggregate-window variants in this cut.
-	for deferred in ["Sum", "Avg", "Lag", "Lead", "Ntile", "FirstValue"] {
+	for deferred in ["Lag", "Lead", "Ntile", "FirstValue", "LastValue"] {
 		assert!(
 			!window_function.contains(deferred),
-			"aggregate/offset window functions are deferred: {deferred}"
+			"offset/value window functions are deferred: {deferred}"
 		);
 	}
 }
@@ -119,15 +121,13 @@ pub(crate) fn adr241_single_over_spec_per_query_multiple_specs_deferred() {
 }
 
 #[test]
-pub(crate) fn adr241_frames_and_aggregate_window_stay_rejected() {
+pub(crate) fn adr241_frames_and_named_windows_stay_rejected() {
+	// Reconciled for ADR 242: aggregate windows now plan, but explicit frames and named windows stay
+	// rejected (the explicit-frame deferral is the boundary toward ADR 243 rows window frames).
 	let planner = source("src/sql_planner.rs");
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(extract.contains("explicit window frames are not supported"));
 	assert!(extract.contains("WindowType::NamedWindow"));
-	assert!(
-		extract.contains("ROW_NUMBER") && extract.contains("DENSE_RANK"),
-		"only ranking functions are accepted; others (aggregate-window) rejected"
-	);
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("deferred_window_forms_stay_rejected"));
 }
@@ -159,5 +159,138 @@ pub(crate) fn adr241_window_node_is_frontend_agnostic_no_optimizer_or_wendelon_s
 	assert!(
 		wendelon_offenders.is_empty(),
 		"window functions must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 242 — aggregate window functions (default frame)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr242_window_call_carries_ranking_or_aggregate_function() {
+	let ir = source("src/ir.rs");
+	let execution = source("src/ir/execution.rs");
+	let window_function = source_block(&ir, "pub enum WindowFunction");
+	assert!(
+		window_function.contains("Aggregate(AggregateFunction)"),
+		"WindowFunction carries an aggregate kind"
+	);
+	let call = source_block(&ir, "pub struct WindowFunctionCall");
+	assert!(
+		call.contains("args: Vec<Expr>"),
+		"window call carries arguments"
+	);
+	let bound = source_block(&execution, "pub struct BoundWindowCall");
+	assert!(
+		bound.contains("function: WindowFunction")
+			&& bound.contains("arg: Option<BoundExprProgram>"),
+		"bound window call carries the function and the optional bound aggregate argument"
+	);
+}
+
+#[test]
+pub(crate) fn adr242_aggregate_window_lowers_to_window_node_reusing_kernels() {
+	let planner = source("src/sql_planner.rs");
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("lower_aggregate_function"),
+		"aggregate windows reuse the ordinary aggregate lowering (kernels)"
+	);
+	assert!(
+		extract.contains("WindowFunction::Aggregate"),
+		"aggregate windows map to a Window-node aggregate call"
+	);
+	assert!(
+		extract.contains("AggregateFunction::CountAll"),
+		"COUNT(*) (arg-less) is a supported window aggregate"
+	);
+}
+
+#[test]
+pub(crate) fn adr242_default_frame_is_range_unbounded_preceding() {
+	// The executor finalizes the running accumulator per peer group (the RANGE default-frame unit), so
+	// tied ORDER BY rows share the cumulative value. The discriminating behavior gate proves it.
+	let exec = source("src/exec.rs");
+	let aggregate = source_block(&exec, "fn execute_window_aggregate");
+	assert!(
+		aggregate.contains("is_peer_group_end"),
+		"the window aggregate finalizes per peer group (RANGE), not row-by-row (ROWS)"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("running_window_range_ties_share_value"));
+}
+
+#[test]
+pub(crate) fn adr242_window_aggregate_is_row_preserving() {
+	let binder = binder_source();
+	assert!(
+		binder.contains("aggregate_field(&bound_agg"),
+		"aggregate-window output column takes the aggregate result type/nullability"
+	);
+	assert!(
+		binder.contains("PlanOptimizerFacts::composite_with_row"),
+		"window facts stay row-preserving (carry the input row bound)"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("window_aggregate_preserves_row_count"));
+}
+
+#[test]
+pub(crate) fn adr242_explicit_frames_and_distinct_window_aggregate_stay_rejected() {
+	let planner = source("src/sql_planner.rs");
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(extract.contains("explicit window frames are not supported"));
+	assert!(extract.contains("DISTINCT window aggregates are not supported"));
+	assert!(
+		extract.contains("only COUNT, SUM, MIN, MAX, and AVG"),
+		"experimental window aggregates (LINEAR_REGRESS/APPROX_QUANTILE) stay rejected"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr242_window_aggregate_reuses_partition_exchange_fragmentation() {
+	// No dedicated window fragmenter and no Window arm in the join fragmenter — aggregate windows ride
+	// the same node-agnostic exchange-boundary path ADR 241 introduced.
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"no dedicated window fragmenter"
+	);
+	let dispatch = source_block(&fragment, "fn fragment_join_plan");
+	assert!(
+		!dispatch.contains("Window"),
+		"no Window arm in the join fragmenter dispatch"
+	);
+}
+
+#[test]
+pub(crate) fn adr242_distributed_window_aggregate_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("distributed_window_aggregate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn distributed_window_aggregate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed aggregate-window gate must use the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+#[test]
+pub(crate) fn adr242_no_new_physical_optimizer_durable_wendelon_or_rune_surface() {
+	// Aggregate windows reuse the existing Window node + aggregate kernels: no new bound window surface
+	// crosses into Wendelon.
+	let wendelon_offenders: Vec<_> = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("BoundWindowCall") || line.contains("WindowFunction::Aggregate")
+		})
+		.collect();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"aggregate windows must not cross into Wendelon: {wendelon_offenders:?}"
 	);
 }

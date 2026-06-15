@@ -13,9 +13,10 @@ use crate::ir::BroadcastReplayEligibility;
 use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
-	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
-	JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId,
-	TableId, TemporalExtractField, TemporalTruncField, WindowFunction, nanos_per_timestamp_unit,
+	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
+	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
+	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, WindowFunction,
+	nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -3626,7 +3627,7 @@ fn execute_window(
 	input_batches: &[RecordBatch],
 	partition_by: &BoundExprProgram,
 	order_by: &[ExecutionSortKey],
-	functions: &[WindowFunction],
+	functions: &[BoundWindowCall],
 	output_schema: &arrow::datatypes::SchemaRef,
 	task_budget: TaskBudget,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
@@ -3712,20 +3713,35 @@ fn execute_window(
 	let partition_rows = window_comparison_rows(&sorted_partition)?;
 	let order_rows = window_comparison_rows(&sorted_order)?;
 
+	// Partition + peer-group boundaries (peers detected on the user ORDER BY keys only). These drive
+	// both the ranking functions and the aggregate windows' RANGE default frame (a peer group is the
+	// RANGE unit: ties through the end of the group share one cumulative value).
+	let mut is_new_partition = vec![false; rows];
+	let mut is_new_peer_group = vec![false; rows];
+	for row in 0..rows {
+		let new_partition = row == 0 || !window_rows_equal(&partition_rows, row, row - 1);
+		// A new peer group starts at a partition boundary or when the ORDER BY value changes.
+		let new_peer_group = new_partition || !window_rows_equal(&order_rows, row, row - 1);
+		is_new_partition[row] = new_partition;
+		is_new_peer_group[row] = new_peer_group;
+	}
+	let mut is_peer_group_end = vec![false; rows];
+	for row in 0..rows {
+		is_peer_group_end[row] = row + 1 == rows || is_new_peer_group[row + 1];
+	}
+
 	let mut row_number = vec![0_i64; rows];
 	let mut rank = vec![0_i64; rows];
 	let mut dense_rank = vec![0_i64; rows];
 	let (mut rn, mut rk, mut dr) = (0_i64, 0_i64, 0_i64);
 	for row in 0..rows {
-		let new_partition = row == 0 || !window_rows_equal(&partition_rows, row, row - 1);
-		if new_partition {
+		if is_new_partition[row] {
 			rn = 0;
 			rk = 0;
 			dr = 0;
 		}
 		rn += 1;
-		// A new peer group starts at a partition boundary or when the ORDER BY value changes.
-		if new_partition || !window_rows_equal(&order_rows, row, row - 1) {
+		if is_new_peer_group[row] {
 			rk = rn;
 			dr += 1;
 		}
@@ -3734,16 +3750,161 @@ fn execute_window(
 		dense_rank[row] = dr;
 	}
 
-	for function in functions {
-		let values = match function {
-			WindowFunction::RowNumber => &row_number,
-			WindowFunction::Rank => &rank,
-			WindowFunction::DenseRank => &dense_rank,
-		};
-		columns.push(Arc::new(Int64Array::from(values.clone())) as ArrayRef);
+	let input_columns = batch.num_columns();
+	for (call_idx, call) in functions.iter().enumerate() {
+		match &call.function {
+			WindowFunction::RowNumber => {
+				columns.push(Arc::new(Int64Array::from(row_number.clone())) as ArrayRef);
+			}
+			WindowFunction::Rank => {
+				columns.push(Arc::new(Int64Array::from(rank.clone())) as ArrayRef);
+			}
+			WindowFunction::DenseRank => {
+				columns.push(Arc::new(Int64Array::from(dense_rank.clone())) as ArrayRef);
+			}
+			WindowFunction::Aggregate(function) => {
+				// Evaluate the argument over the sorted partition layout (ranking has no arg, and
+				// COUNT(*) carries none).
+				let sorted_arg = match &call.arg {
+					Some(program) => {
+						let evaluated =
+							Executor::evaluate_bound_program_without_storage(program, &batch)?;
+						let arg = evaluated.into_iter().next().ok_or_else(|| {
+							ExecutionError::InvalidExpression {
+								message: "window aggregate argument produced no column".to_string(),
+							}
+						})?;
+						Some(take(&arg, &indices, None)?)
+					}
+					None => None,
+				};
+				let output_type = output_schema.field(input_columns + call_idx).data_type();
+				let column = execute_window_aggregate(
+					function,
+					sorted_arg.as_ref(),
+					&is_new_partition,
+					&is_peer_group_end,
+					rows,
+					output_type,
+				)?;
+				columns.push(column);
+			}
+		}
 	}
 
 	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
+}
+
+/// Compute one aggregate-window column over the SQL default frame (`RANGE UNBOUNDED PRECEDING AND
+/// CURRENT ROW`). Maintains a running accumulator over the sorted partition, finalizing a snapshot at
+/// each peer-group boundary and assigning it to every row of that peer group, so tied `ORDER BY` rows
+/// share the cumulative-through-peer-group value. Whole-partition (no `ORDER BY`) is the single
+/// peer-group case. Reuses the scalar-aggregate state helpers.
+fn execute_window_aggregate(
+	function: &AggregateFunction,
+	sorted_arg: Option<&ArrayRef>,
+	is_new_partition: &[bool],
+	is_peer_group_end: &[bool],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+	let mut count: i64 = 0;
+	let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+	let mut group_arrays: Vec<ArrayRef> = Vec::new();
+	let mut group_len: usize = 0;
+	for row in 0..rows {
+		if is_new_partition[row] {
+			count = 0;
+			state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		}
+		match function {
+			AggregateFunction::CountAll => {
+				count += 1;
+			}
+			AggregateFunction::Count => {
+				if let Some(arg) = sorted_arg
+					&& !arg.is_null(row)
+				{
+					count += 1;
+				}
+			}
+			AggregateFunction::Sum => {
+				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
+					&& let Some(value) = numeric_value(arg, row)?
+				{
+					add_sum_value(state, value)?;
+				}
+			}
+			AggregateFunction::Avg => {
+				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
+					&& let Some(value) = numeric_value(arg, row)?
+				{
+					add_avg_value(state, value)?;
+				}
+			}
+			AggregateFunction::Min => {
+				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
+					update_min_state(state, arg, row)?;
+				}
+			}
+			AggregateFunction::Max => {
+				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
+					update_max_state(state, arg, row)?;
+				}
+			}
+			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				return Err(ExecutionError::NotImplemented {
+					feature: "window experimental aggregate execution",
+				});
+			}
+		}
+		group_len += 1;
+		if is_peer_group_end[row] {
+			let value: ArrayRef = match function {
+				AggregateFunction::CountAll | AggregateFunction::Count => {
+					Arc::new(Int64Array::from(vec![count])) as ArrayRef
+				}
+				AggregateFunction::Sum => {
+					sum_state_array(state.as_ref().expect("sum window state"), output_type)?
+				}
+				AggregateFunction::Avg => {
+					avg_state_array(state.as_ref().expect("avg window state"))?
+				}
+				AggregateFunction::Min | AggregateFunction::Max => {
+					min_max_state_array(state.as_ref().expect("min/max window state"))?
+				}
+				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+					return Err(ExecutionError::NotImplemented {
+						feature: "window experimental aggregate execution",
+					});
+				}
+			};
+			let repeat = UInt32Array::from(vec![0_u32; group_len]);
+			group_arrays.push(take(&value, &repeat, None)?);
+			group_len = 0;
+		}
+	}
+	let refs: Vec<&dyn arrow::array::Array> =
+		group_arrays.iter().map(|array| array.as_ref()).collect();
+	Ok(arrow::compute::concat(&refs)?)
+}
+
+fn fresh_window_agg_state(
+	function: &AggregateFunction,
+	arg_type: Option<&arrow::datatypes::DataType>,
+) -> Result<Option<AggState>, ExecutionError> {
+	let require_arg = || ExecutionError::InvalidExpression {
+		message: "window aggregate requires an argument type".to_string(),
+	};
+	Ok(match function {
+		AggregateFunction::CountAll | AggregateFunction::Count => None,
+		AggregateFunction::Sum => Some(sum_state_for_data_type(arg_type.ok_or_else(require_arg)?)),
+		AggregateFunction::Avg => Some(avg_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
+		AggregateFunction::Min => Some(min_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
+		AggregateFunction::Max => Some(max_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,
+	})
 }
 
 fn take_all(arrays: &[ArrayRef], indices: &UInt32Array) -> Result<Vec<ArrayRef>, ExecutionError> {

@@ -25,14 +25,14 @@ use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp,
-	BroadcastBuildSide, BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ColumnRef,
-	CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
+	BoundWindowCall, BroadcastBuildSide, BroadcastReplayEligibility, ColumnName, ColumnOrdinal,
+	ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
 	FilterDisposition, InsertLiteral, JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
 	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
 	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SetOpAllKind, SortExpr,
-	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, arithmetic_output_type,
-	calendar_month_interval_data_type, decode_column_logical_type,
+	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, WindowFunction,
+	arithmetic_output_type, calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
 	schema_for_exprs,
@@ -1326,15 +1326,53 @@ impl<'a> Binder<'a> {
 							})
 						})
 						.collect::<Result<Vec<_>, BindingError>>()?;
-					// Row-preserving: keep every input column, append one non-null Int64 rank column
-					// per window function (named by its SELECT alias / derived name).
+					// Row-preserving: keep every input column, append one result column per window call.
+					// Ranking + COUNT(*) → non-null Int64; other aggregate windows take the aggregate's
+					// result type/nullability (e.g. AVG → nullable Float64), bound over the SQL default
+					// frame. The argument program (if any) is bound here for the executor.
+					let logical_types = self.catalog.logical_type_registry();
 					let mut fields = input_schema
 						.fields()
 						.iter()
 						.map(|field| field.as_ref().clone())
 						.collect::<Vec<_>>();
+					let mut bound_calls: Vec<BoundWindowCall> = Vec::with_capacity(functions.len());
 					for call in functions {
-						fields.push(Field::new(&call.output_name, DataType::Int64, false));
+						let arg = match &call.function {
+							WindowFunction::RowNumber
+							| WindowFunction::Rank
+							| WindowFunction::DenseRank => {
+								fields.push(Field::new(&call.output_name, DataType::Int64, false));
+								None
+							}
+							WindowFunction::Aggregate(function) if call.args.is_empty() => {
+								// COUNT(*): no argument; non-null Int64 row count over the frame.
+								let _ = function;
+								fields.push(Field::new(&call.output_name, DataType::Int64, false));
+								None
+							}
+							WindowFunction::Aggregate(function) => {
+								let arg = self
+									.bind_expr_program_scoped(
+										&call.args,
+										&input_schema,
+										&input.scope,
+									)
+									.await?;
+								let bound_agg = BoundAggregateCall {
+									function: function.clone(),
+									args: arg.clone(),
+								};
+								let field = aggregate_field(&bound_agg, &logical_types)?
+									.with_name(call.output_name.clone());
+								fields.push(field);
+								Some(arg)
+							}
+						};
+						bound_calls.push(BoundWindowCall {
+							function: call.function.clone(),
+							arg,
+						});
 					}
 					let output_schema = Arc::new(Schema::new(fields));
 					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
@@ -1346,7 +1384,7 @@ impl<'a> Binder<'a> {
 							input: Box::new(input.plan),
 							partition_by,
 							order_by,
-							functions: functions.iter().map(|call| call.function).collect(),
+							functions: bound_calls,
 							output_schema,
 						},
 						scope,

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
@@ -140,11 +140,19 @@ async fn window_alias_can_shadow_input_column_name() {
 
 #[tokio::test]
 async fn deferred_window_forms_stay_rejected() {
+	// ADR 242 retargets the 241 ranking-only fence: aggregate windows on the default frame now plan,
+	// but explicit frame syntax (incl. bounded ROWS on an aggregate — the next mechanism), DISTINCT
+	// window aggregates, experimental window aggregates, multiple distinct specs, and the still-fenced
+	// window placements stay rejected.
 	for sql in [
-		// explicit frame
+		// explicit frame on a ranking function
 		"SELECT ROW_NUMBER() OVER (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wins",
-		// aggregate-window
-		"SELECT SUM(score) OVER (PARTITION BY grp) FROM wins",
+		// explicit bounded ROWS frame on an aggregate (243 rows window frames)
+		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// DISTINCT window aggregate
+		"SELECT SUM(DISTINCT score) OVER (PARTITION BY grp) FROM wins",
+		// experimental window aggregate
+		"SELECT APPROX_QUANTILE(score, 0.5) OVER (PARTITION BY grp) FROM wins",
 		// multiple distinct OVER specs
 		"SELECT ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score), \
 		        ROW_NUMBER() OVER (PARTITION BY score ORDER BY grp) FROM wins",
@@ -158,6 +166,139 @@ async fn deferred_window_forms_stay_rejected() {
 			"must stay rejected: {sql}"
 		);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ADR 242 — aggregate window functions (default frame)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn whole_partition_aggregate_window() {
+	// No ORDER BY -> one peer group = the whole partition; every row gets the partition total
+	// (percent-of-total shape). grp a = SUM(10,10,20) = 40; grp b = SUM(5,5) = 10.
+	let rows =
+		run_window("SELECT grp, SUM(score) OVER (PARTITION BY grp) AS total FROM wins").await;
+	assert_eq!(group_values(&rows, "a"), vec![40, 40, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![10, 10]);
+}
+
+#[tokio::test]
+async fn running_sum_window_is_cumulative() {
+	// ORDER BY -> running aggregate, restarting per partition. grp a ordered [10,10,20]; grp b [5,5].
+	let rows =
+		run_window("SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	// grp a: peers at 10 share SUM-through-peer-group = 20, then +20 -> 40.
+	assert_eq!(group_values(&rows, "a"), vec![20, 20, 40]);
+	// grp b: both rows are peers at 5 -> share 10 (restarted from grp a).
+	assert_eq!(group_values(&rows, "b"), vec![10, 10]);
+}
+
+#[tokio::test]
+async fn running_window_range_ties_share_value() {
+	// The RANGE-vs-ROWS discriminator: the two tied score=10 rows in grp a share the value cumulative
+	// through the *whole* peer group (20, 20). A naive row-by-row ROWS fold would give 10, 20.
+	let rows =
+		run_window("SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	let a = group_values(&rows, "a");
+	assert_eq!(
+		a[0], a[1],
+		"tied ORDER BY rows must share the cumulative value (RANGE)"
+	);
+	assert_eq!(
+		a[0], 20,
+		"RANGE default frame, not a ROWS running fold (which would be 10)"
+	);
+}
+
+#[tokio::test]
+async fn count_star_window_counts_frame_rows() {
+	// COUNT(*) counts rows in the frame: running under ORDER BY (through the peer group), so grp a's
+	// two tied rows both see 2, then 3; grp b sees 2, 2.
+	let rows =
+		run_window("SELECT grp, COUNT(*) OVER (PARTITION BY grp ORDER BY score) AS c FROM wins")
+			.await;
+	assert_eq!(group_values(&rows, "a"), vec![2, 2, 3]);
+	assert_eq!(group_values(&rows, "b"), vec![2, 2]);
+}
+
+#[tokio::test]
+async fn min_max_window_over_partition() {
+	let mins = run_window("SELECT grp, MIN(score) OVER (PARTITION BY grp) AS m FROM wins").await;
+	assert_eq!(group_values(&mins, "a"), vec![10, 10, 10]);
+	assert_eq!(group_values(&mins, "b"), vec![5, 5]);
+	let maxes = run_window("SELECT grp, MAX(score) OVER (PARTITION BY grp) AS m FROM wins").await;
+	assert_eq!(group_values(&maxes, "a"), vec![20, 20, 20]);
+	assert_eq!(group_values(&maxes, "b"), vec![5, 5]);
+}
+
+#[tokio::test]
+async fn window_aggregate_preserves_row_count() {
+	// 5 input rows -> 5 output rows (anti-Aggregate).
+	let rows =
+		run_window("SELECT grp, SUM(score) OVER (PARTITION BY grp) AS total FROM wins").await;
+	assert_eq!(rows.len(), 5);
+}
+
+#[tokio::test]
+async fn aggregate_window_multiple_functions_share_one_window_node() {
+	// Multiple aggregate calls over one OVER spec -> a single Window node computing both.
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(score) OVER (PARTITION BY grp) AS s, \
+			        COUNT(*) OVER (PARTITION BY grp) AS c FROM wins",
+		)
+		.expect("plan shared-spec aggregate windows");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"shared OVER spec -> one Window node"
+	);
+	assert_eq!(
+		first_window_functions(&plan),
+		Some(2),
+		"the single Window node computes both aggregate functions"
+	);
+}
+
+#[tokio::test]
+async fn running_avg_window_null_and_empty_semantics() {
+	// obs(grp, v): grp a has v = [NULL, 5]; grp b has v = [NULL, NULL] (an all-NULL frame).
+	// SUM/AVG over no non-null values -> NULL; COUNT(v) -> 0; COUNT(*) -> the row count.
+	let sums = run_obs_window_i64("SELECT grp, SUM(v) OVER (PARTITION BY grp) AS s FROM obs").await;
+	assert_eq!(obs_values(&sums, "a"), vec![Some(5), Some(5)]);
+	assert_eq!(
+		obs_values(&sums, "b"),
+		vec![None, None],
+		"all-NULL frame SUM -> NULL"
+	);
+
+	let avgs = run_obs_window_f64("SELECT grp, AVG(v) OVER (PARTITION BY grp) AS a FROM obs").await;
+	assert_eq!(obs_values(&avgs, "a"), vec![Some(5.0), Some(5.0)]);
+	assert_eq!(
+		obs_values(&avgs, "b"),
+		vec![None, None],
+		"all-NULL frame AVG -> NULL"
+	);
+
+	let counts =
+		run_obs_window_i64("SELECT grp, COUNT(v) OVER (PARTITION BY grp) AS c FROM obs").await;
+	assert_eq!(obs_values(&counts, "a"), vec![Some(1), Some(1)]);
+	assert_eq!(
+		obs_values(&counts, "b"),
+		vec![Some(0), Some(0)],
+		"COUNT(x) over NULLs -> 0"
+	);
+
+	let count_star =
+		run_obs_window_i64("SELECT grp, COUNT(*) OVER (PARTITION BY grp) AS c FROM obs").await;
+	assert_eq!(obs_values(&count_star, "a"), vec![Some(2), Some(2)]);
+	assert_eq!(
+		obs_values(&count_star, "b"),
+		vec![Some(2), Some(2)],
+		"COUNT(*) counts rows"
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +429,115 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 			batches: HashMap::from([(TableId(1), batch)]),
 		}),
 	)
+}
+
+/// obs(id, grp, v) with NULLs so aggregate-window NULL/empty semantics are discriminating:
+/// grp "a" has v = [NULL, 5]; grp "b" has v = [NULL, NULL] (an all-NULL frame).
+fn obs_fixture() -> (MockCatalog, Arc<FixtureScan>) {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("grp", DataType::Utf8, true),
+		Field::new("v", DataType::Int64, true),
+	]));
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(1),
+			TableSchemaDescriptor::new(
+				TableObjectId::new([2; 16]),
+				1,
+				"default",
+				"obs",
+				schema.as_ref(),
+				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+				LocalityPolicy::default_table_spread(),
+				SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.expect("descriptor"),
+		)
+		.expect("register obs");
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+			Arc::new(StringArray::from(vec![
+				Some("a"),
+				Some("a"),
+				Some("b"),
+				Some("b"),
+			])),
+			Arc::new(Int64Array::from(vec![None, Some(5), None, None])),
+		],
+	)
+	.expect("obs batch");
+	(
+		catalog,
+		Arc::new(FixtureScan {
+			batches: HashMap::from([(TableId(1), batch)]),
+		}),
+	)
+}
+
+async fn run_obs_window_i64(sql: &str) -> Vec<(Option<String>, Option<i64>)> {
+	let batch = run_obs_window(sql).await;
+	read_obs_values(&batch, |column, row| {
+		let array = column
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("int64 window value column");
+		(!array.is_null(row)).then(|| array.value(row))
+	})
+}
+
+async fn run_obs_window_f64(sql: &str) -> Vec<(Option<String>, Option<f64>)> {
+	let batch = run_obs_window(sql).await;
+	read_obs_values(&batch, |column, row| {
+		let array = column
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("float64 window value column");
+		(!array.is_null(row)).then(|| array.value(row))
+	})
+}
+
+async fn run_obs_window(sql: &str) -> Vec<RecordBatch> {
+	let logical = SqlPlanner::new().plan(sql).expect("plan obs window query");
+	let (catalog, storage) = obs_fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind obs window query");
+	Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute obs window query")
+}
+
+fn read_obs_values<T>(
+	batches: &[RecordBatch],
+	read: impl Fn(&arrow::array::ArrayRef, usize) -> Option<T>,
+) -> Vec<(Option<String>, Option<T>)> {
+	let mut rows = Vec::new();
+	for batch in batches {
+		let grp = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("grp utf8 column");
+		let values = batch.column(1);
+		for row in 0..batch.num_rows() {
+			let grp = (!grp.is_null(row)).then(|| grp.value(row).to_string());
+			rows.push((grp, read(values, row)));
+		}
+	}
+	rows
+}
+
+/// Window values for one obs group, in output (sorted-within-partition) order.
+fn obs_values<T: Copy>(rows: &[(Option<String>, Option<T>)], grp: &str) -> Vec<Option<T>> {
+	rows.iter()
+		.filter(|(g, _)| g.as_deref() == Some(grp))
+		.map(|(_, value)| *value)
+		.collect()
 }
 
 struct FixtureScan {

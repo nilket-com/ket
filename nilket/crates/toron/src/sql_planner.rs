@@ -3843,6 +3843,7 @@ impl SqlPlanner {
 					functions.push(WindowFunctionCall {
 						function: window.function,
 						output_name: internal_name,
+						args: window.args,
 					});
 				}
 				None => {
@@ -3888,17 +3889,6 @@ impl SqlPlanner {
 		let Some(over) = &function.over else {
 			return Ok(None);
 		};
-		let function_name = if function_name_eq(&function.name, "ROW_NUMBER") {
-			WindowFunction::RowNumber
-		} else if function_name_eq(&function.name, "RANK") {
-			WindowFunction::Rank
-		} else if function_name_eq(&function.name, "DENSE_RANK") {
-			WindowFunction::DenseRank
-		} else {
-			return Err(unsupported(
-				"only ROW_NUMBER, RANK, and DENSE_RANK window functions are supported",
-			));
-		};
 		let spec = match over {
 			WindowType::WindowSpec(spec) => spec,
 			WindowType::NamedWindow(_) => {
@@ -3911,9 +3901,54 @@ impl SqlPlanner {
 		if spec.window_name.is_some() {
 			return Err(unsupported("named windows are not supported"));
 		}
-		if !window_function_args_are_empty(&function.args) {
-			return Err(unsupported("ranking window functions take no arguments"));
-		}
+		// ADR 241 ranking + ADR 242 aggregate windows. Ranking takes no arguments; aggregate windows
+		// reuse the ordinary aggregate lowering (COUNT(*)/COUNT(x)/SUM/MIN/MAX/AVG) over the SQL default
+		// frame. Explicit frames, DISTINCT, and experimental aggregates stay rejected.
+		let ranking = if function_name_eq(&function.name, "ROW_NUMBER") {
+			Some(WindowFunction::RowNumber)
+		} else if function_name_eq(&function.name, "RANK") {
+			Some(WindowFunction::Rank)
+		} else if function_name_eq(&function.name, "DENSE_RANK") {
+			Some(WindowFunction::DenseRank)
+		} else {
+			None
+		};
+		let (window_function, window_args) = if let Some(ranking) = ranking {
+			if !window_function_args_are_empty(&function.args) {
+				return Err(unsupported("ranking window functions take no arguments"));
+			}
+			(ranking, Vec::new())
+		} else if aggregate_function_name(&function.name).is_some() {
+			// Reuse the ordinary aggregate lowering with the window modifier stripped — the OVER spec is
+			// extracted separately below. FILTER / non-DISTINCT modifiers stay rejected by that path;
+			// DISTINCT is detected and rejected here.
+			let mut bare = function.clone();
+			bare.over = None;
+			let lowered = self.lower_aggregate_function(&bare, AggregateSqlMode::Global)?;
+			if lowered.distinct {
+				return Err(unsupported("DISTINCT window aggregates are not supported"));
+			}
+			match lowered.function {
+				AggregateFunction::CountAll => (
+					WindowFunction::Aggregate(AggregateFunction::CountAll),
+					Vec::new(),
+				),
+				AggregateFunction::Count
+				| AggregateFunction::Sum
+				| AggregateFunction::Min
+				| AggregateFunction::Max
+				| AggregateFunction::Avg => (WindowFunction::Aggregate(lowered.function), lowered.args),
+				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+					return Err(unsupported(
+						"only COUNT, SUM, MIN, MAX, and AVG window aggregate functions are supported",
+					));
+				}
+			}
+		} else {
+			return Err(unsupported(
+				"only ROW_NUMBER, RANK, DENSE_RANK, and COUNT/SUM/MIN/MAX/AVG window functions are supported",
+			));
+		};
 		let partition_by = spec
 			.partition_by
 			.iter()
@@ -3934,12 +3969,13 @@ impl SqlPlanner {
 			})
 			.collect::<Result<Vec<_>, FrontendError>>()?;
 		let output_name =
-			alias.unwrap_or_else(|| window_function_default_name(function_name).to_string());
+			alias.unwrap_or_else(|| window_function_default_name(&window_function).to_string());
 		Ok(Some(ExtractedWindow {
-			function: function_name,
+			function: window_function,
 			output_name,
 			partition_by,
 			order_by,
+			args: window_args,
 		}))
 	}
 
@@ -6891,13 +6927,17 @@ struct ExtractedWindow {
 	output_name: String,
 	partition_by: Vec<Expr>,
 	order_by: Vec<SortExpr>,
+	args: Vec<Expr>,
 }
 
-fn window_function_default_name(function: WindowFunction) -> &'static str {
+fn window_function_default_name(function: &WindowFunction) -> &'static str {
 	match function {
 		WindowFunction::RowNumber => "row_number",
 		WindowFunction::Rank => "rank",
 		WindowFunction::DenseRank => "dense_rank",
+		WindowFunction::Aggregate(function) => aggregate_kernel::stable_spec_for_function(function)
+			.map(|spec| spec.output_name)
+			.unwrap_or("window"),
 	}
 }
 
@@ -6958,7 +6998,11 @@ fn select_item_contains_window_function(item: &SelectItem) -> bool {
 
 fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 	match strip_nested_sql_expr(expr) {
-		SqlExpr::Function(function) => aggregate_function_name(&function.name).is_some(),
+		// A windowed aggregate (`SUM(x) OVER (...)`, ADR 242) is a window call, not a GROUP BY
+		// aggregate — the window-lowering path handles it.
+		SqlExpr::Function(function) => {
+			function.over.is_none() && aggregate_function_name(&function.name).is_some()
+		}
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_aggregate_call(left) || expr_contains_aggregate_call(right)
 		}
