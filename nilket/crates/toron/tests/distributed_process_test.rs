@@ -23,8 +23,8 @@ use toron::distributed::worker_registry::{
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
 use toron::ir::{
-	AggregateFunction, BroadcastBuildSide, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
+	AggregateFunction, BroadcastBuildSide, ExecutionPlan, Expr, FilterDisposition, JoinKind,
+	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
 };
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
@@ -437,6 +437,125 @@ async fn union_all_scans_both_arms_across_workers() {
 		unique_selected_worker_count(&run.selected_workers),
 		2,
 		"UNION ALL must not collapse to a single scan worker"
+	);
+}
+
+// ADR 238: a predicate-fidelity gate is only value-discriminating if the predicate is *fully pushed*
+// to the scan (no residual Toron Filter) — otherwise the Filter node does the work regardless of
+// whether the fixture worker honors pbc_predicate. These helpers assert the pushdown, so the
+// filtered distributed result genuinely proves the worker applied the pushed predicate.
+fn collect_scan_pbc_states(plan: &ExecutionPlan, states: &mut Vec<bool>) {
+	match plan {
+		ExecutionPlan::Scan { pbc_program, .. } => states.push(pbc_program.is_some()),
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => collect_scan_pbc_states(input, states),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			collect_scan_pbc_states(left, states);
+			collect_scan_pbc_states(right, states);
+		}
+		_ => {}
+	}
+}
+
+// A `Filter` with `FullyPushed` disposition is a no-op tag — the scan does the filtering. Only a
+// residual (non-`FullyPushed`) Filter re-checks in Toron and would mask whether the scan honored PBC.
+fn plan_has_residual_recheck(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Filter {
+			input, disposition, ..
+		} => {
+			!matches!(disposition, FilterDisposition::FullyPushed)
+				|| plan_has_residual_recheck(input)
+		}
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => plan_has_residual_recheck(input),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			plan_has_residual_recheck(left) || plan_has_residual_recheck(right)
+		}
+		_ => false,
+	}
+}
+
+async fn assert_predicate_fully_pushes(sql: &str) {
+	let logical = SqlPlanner::new().plan(sql).expect("plan predicate query");
+	let bound = bind(
+		&logical,
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind predicate query");
+	let mut scan_pbc_states = Vec::new();
+	collect_scan_pbc_states(&bound, &mut scan_pbc_states);
+	assert_eq!(
+		scan_pbc_states,
+		vec![true; scan_pbc_states.len()],
+		"every scan in the predicate-fidelity gate must carry pbc_program, else the gate is hollow: {sql}"
+	);
+	assert!(
+		!scan_pbc_states.is_empty(),
+		"predicate-fidelity gate must contain at least one scan: {sql}"
+	);
+	assert!(
+		!plan_has_residual_recheck(&bound),
+		"predicate must be FullyPushed (no residual Toron re-check), so the scan must honor it for a \
+		 correct result: {sql}"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_predicate_fidelity_does_not_ignore_pbc_predicate() {
+	let sql = "SELECT set_left.set_key FROM set_left WHERE set_left.set_key IN (7, 9)";
+	assert_predicate_fully_pushes(sql).await;
+	let run = run_set_op_process_query(1_440, 0, sql).await;
+	// Ignoring pbc_predicate would return the unfiltered set_key column [NULL, NULL, 7, 9].
+	assert_eq!(run.rows, vec![Some(7), Some(9)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_predicate_fidelity_filters_before_projection() {
+	// Predicate is on `id` (source ordinal 0); projection keeps only `set_key` (ordinal 1). A worker
+	// that projected before filtering could not evaluate `id` at all, and one that ignores the
+	// predicate returns the unfiltered set_key column.
+	let sql = "SELECT set_left.set_key FROM set_left WHERE set_left.id IN (2, 3, 4)";
+	assert_predicate_fully_pushes(sql).await;
+	let run = run_set_op_process_query(1_450, 0, sql).await;
+	assert_eq!(run.rows, vec![None, None, Some(9)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_predicate_fidelity_preserves_null_semantics() {
+	// `set_key IN (9)` is unknown for NULL set_key rows (ids 2, 4), so they must be dropped — only
+	// id 3 (set_key = 9) survives. Collapsing NULL to a match would wrongly include ids 2 and 4.
+	let sql = "SELECT set_left.id FROM set_left WHERE set_left.set_key IN (9)";
+	assert_predicate_fully_pushes(sql).await;
+	let run = run_set_op_process_query(1_460, 0, sql).await;
+	assert_eq!(run.rows, vec![Some(3)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_predicate_fidelity_composes_with_scan_share() {
+	// Both UNION ALL arms push a predicate and scan-share across workers (the 236 union fragment
+	// path). The result requires filtered rows from both producers.
+	let sql = "SELECT set_left.set_key FROM set_left WHERE set_left.id IN (2, 3, 4) \
+	           UNION ALL SELECT set_right.set_key FROM set_right WHERE set_right.id IN (12)";
+	assert_predicate_fully_pushes(sql).await;
+	let run = run_set_op_process_query(1_470, 0, sql).await;
+	assert_eq!(run.rows, vec![None, None, Some(9), Some(10)]);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"filtered set_key rows come from both UNION ALL arms (set_left id>1 and set_right id>11), \
+		 split across fixture producers; an unfiltered or single-producer scan cannot produce \
+		 [NULL, NULL, 9, 10]",
 	);
 }
 

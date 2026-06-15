@@ -136,6 +136,17 @@ impl StorageScan for FixtureStorageScan {
 				.ok_or(StorageError::TableNotFound {
 					table: request.table_id,
 				})?;
+		// ADR 238: honor a pushed predicate in the source-column domain (before projection),
+		// reusing the production PBC evaluator — the same `wendelon::schema::pbc::execute` the real
+		// in-memory scan uses (storage.rs). Fail loud on an unevaluable program; never return
+		// silently-unfiltered rows.
+		if let Some(pbc) = &request.pbc_predicate {
+			batch = wendelon::schema::pbc::execute(pbc, &batch).map_err(|error| {
+				StorageError::InvalidPbcProgram {
+					message: format!("{error:?}"),
+				}
+			})?;
+		}
 		if let Some(columns) = request.projected_columns {
 			let indices = columns
 				.into_iter()
