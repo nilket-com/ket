@@ -66,9 +66,11 @@ equality, the existing `canonical_aggregate_signature_expr`) gets its own branch
 branch and recombine references use generated ordinals/names, never user-visible aliases (ordinal-drift
 discipline).
 
-**D4 — Mixed distinct + non-distinct in scope.** Non-distinct aggregates form one plain branch
-(`Aggregate(group=keys, non_distinct_aggs)`) over the base input; it recombines with the distinct
-branches.
+**D4 — Mixed distinct + non-distinct in scope.** Non-distinct aggregates form the plain recombine side:
+normally one `Aggregate(group=keys, non_distinct_aggs)` over the base input. If multiple plain
+aggregates would produce duplicate function-level output names inside that branch (for example
+`SUM(id), SUM(amount)` both named `sum`), the planner may shard them into additional plain branches so
+branch-normalization remains ordinal-safe; those shards still recombine like the distinct branches.
 
 **D5 — `AVG(DISTINCT x)` = ordinary `AVG(x)` over the dedup set.** It shares the `x` dedup branch with
 `SUM/COUNT(DISTINCT x)` and emits existing `AggregateFunction::Avg` in that branch. Existing `AVG`
@@ -84,10 +86,13 @@ group-domain branch (which would require the forbidden internal empty-agg `Aggre
 forms one group; the recombine joins are private and null-safe, while ordinary user joins stay
 NULL-unequal.
 
-**D7 — Global recombine uses ADR 239 `Cross`.** With no group key, every branch is a scalar aggregate
-producing exactly one row; recombine is `Cross(branch_0, branch_1, …)` (left-deep), `1 × 1 × … = 1` row.
-A branch that produced more than one row would multiply the result, so global branch single-row-ness is
-pinned (D10).
+**D7 — Global recombine uses ADR 239 `Cross` (via the scalar-local refinement).** With no group key,
+every branch is a scalar aggregate producing exactly one row; recombine is `Cross(branch_0, branch_1, …)`
+(left-deep), `1 × 1 × … = 1` row. This depends on the **ADR 239 scalar-local Cross refinement** (landed
+first): because each global aggregate branch is recorded as a hard 1-row fact (`row_upper_bound <= 1`),
+the `Cross` binds as a single-partition *local* cartesian rather than a broadcast — so the global
+recombine uses a real keyless `Cross`, not a synthetic constant key. A branch that produced more than one
+row would multiply the result, so global branch single-row-ness is pinned (D10).
 
 **D8 — Join base inputs are in scope; no fence.** The rewrite re-derives each branch by cloning the
 already-lowered base `plan`, so a join base composes identically to a scan base (qualifiers resolved
@@ -95,8 +100,11 @@ pre-rewrite). Fencing joins would be *more* code for a *smaller* feature. **Defe
 *sharing* of the duplicated base — each branch re-executes the base scan/join in this cut; a later
 cut can common-subexpression the shared input. Correctness does not depend on sharing.
 
-**D9 — No new physical / optimizer / durable / Wendelon / Rune surface.** Reuse `Aggregate`, `Distinct`,
-null-safe `Join`, and `Cross`. Multi-dedup adds no optimizer-evidence and no cross-ring change.
+**D9 — No new physical / optimizer / durable / Wendelon / Rune surface *in this ADR*.** The multi-dedup
+rewrite itself is frontend-only — it reuses `Aggregate`, `Distinct`, null-safe `Join`, and `Cross`. The
+one binder-side enabler (global aggregate → 1-row fact + the scalar-local `Cross` strategy) is **not part
+of this ADR**: it landed first as the narrow ADR 239 scalar-local refinement, so ADR 240 composes over
+existing primitives. Multi-dedup adds no optimizer-evidence and no cross-ring change.
 
 **D10 — Recombine cardinality is explicit, not incidental.** Global branches are pinned single-row
 (so `Cross` cannot become a row multiplier); grouped branch group-sets are pinned complete (so a group
@@ -120,6 +128,8 @@ SELECT COUNT(DISTINCT x) FILTER (WHERE y > 0) FROM t                      -- agg
 
 - **`mixed_distinct_and_plain_aggregate_executes`** — `COUNT(DISTINCT amount), SUM(id)`: distinct and
   plain branches recombine (fails if mixed stays rejected or the plain branch is dropped).
+- **`mixed_plain_branch_duplicate_output_names_stay_ordinal_safe`** — `SUM(id), SUM(amount)` alongside a
+  distinct aggregate returns both sums correctly, not two reads of the first `sum` output.
 - **`multiple_distinct_arguments_execute`** — `COUNT(DISTINCT amount), COUNT(DISTINCT region)`: two
   dedup branches with distinct values per branch.
 - **`same_distinct_argument_shares_one_branch`** — plan-shape guard: `COUNT/SUM/MAX(DISTINCT amount)`

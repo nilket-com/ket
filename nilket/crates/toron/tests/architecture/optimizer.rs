@@ -365,7 +365,8 @@ pub(crate) fn adr135_probe_eligibility_and_behavior_gates_cover_broadcast_star()
 
 	for marker in [
 		"ExecutionPlan::Join {",
-		"*kind == JoinKind::Inner",
+		// ADR 239: a left-deep broadcast star may chain broadcast Cross like broadcast Inner.
+		"matches!(kind, JoinKind::Inner | JoinKind::Cross)",
 		"*strategy == JoinStrategy::Broadcast",
 		"matches!(terminal_exchange(left), Some((1, _)))",
 		"broadcast_probe_linearity(right)",

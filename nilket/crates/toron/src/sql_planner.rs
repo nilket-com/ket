@@ -3655,23 +3655,20 @@ impl SqlPlanner {
 			if aggr_expr.is_empty() {
 				return Err(unsupported("GROUP BY requires at least one aggregate call"));
 			}
-			let (plan, group_expr, aggr_expr) = if let Some(rewrite) = distinct_rewrite {
-				(
-					rewrite.wrap_input(plan),
-					rewrite.group_expr,
-					rewrite.aggr_expr,
-				)
+			let aggregate = if let Some(rewrite) = distinct_rewrite {
+				// ADR 240: the rewrite fans out + recombines into a plan whose schema matches a single
+				// grouped Aggregate, so the having/final-projection tail below is reused unchanged.
+				rewrite.into_aggregated_plan(plan)
 			} else {
-				(plan, group_expr, aggr_expr)
-			};
-			let aggregate = LogicalPlan::Aggregate {
-				input: Box::new(LogicalPlan::Exchange {
-					input: Box::new(plan),
-					partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
-					key: group_expr.clone(),
-				}),
-				group_expr,
-				aggr_expr,
+				LogicalPlan::Aggregate {
+					input: Box::new(LogicalPlan::Exchange {
+						input: Box::new(plan),
+						partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+						key: group_expr.clone(),
+					}),
+					group_expr,
+					aggr_expr,
+				}
 			};
 			let plan = if let Some(predicate) = having_predicate {
 				LogicalPlan::Filter {
@@ -3710,15 +3707,15 @@ impl SqlPlanner {
 				&[],
 				AggregateSqlMode::Global,
 			)?;
-			let (plan, aggr_expr) = if let Some(rewrite) = distinct_rewrite {
-				(rewrite.wrap_input(plan), rewrite.aggr_expr)
+			let aggregate = if let Some(rewrite) = distinct_rewrite {
+				// ADR 240: global recombine fans out + Cross-joins one-row branches (scalar-local).
+				rewrite.into_aggregated_plan(plan)
 			} else {
-				(plan, aggr_expr)
-			};
-			let aggregate = LogicalPlan::Aggregate {
-				input: Box::new(plan),
-				group_expr: vec![],
-				aggr_expr,
+				LogicalPlan::Aggregate {
+					input: Box::new(plan),
+					group_expr: vec![],
+					aggr_expr,
+				}
 			};
 			let plan = if let Some(having) = having.as_ref() {
 				let predicate = self.lower_having_predicate(having, &catalog)?;
@@ -3903,10 +3900,9 @@ impl SqlPlanner {
 
 		let final_projection = self.lower_final_aggregate_projection(projection, mode, &catalog)?;
 		let project_required = final_projection.required;
-		let aggr_expr = distinct_rewrite
-			.as_ref()
-			.map(|rewrite| rewrite.aggr_expr.clone())
-			.unwrap_or_else(|| catalog.aggr_expr());
+		// ADR 240: when a distinct rewrite is present it builds its own fan-out plan, so this flat
+		// `aggr_expr` is consumed only on the non-rewrite path (and the `aggr_expr.is_empty()` guard).
+		let aggr_expr = catalog.aggr_expr();
 		let final_output_names = if project_required {
 			final_projection.derived_output_names()
 		} else {
@@ -5573,24 +5569,201 @@ struct FinalProjection {
 	output_names: Vec<Option<String>>,
 }
 
+/// ADR 240 multi-dedup fan-out + recombine. The single-dedup case (ADR 234) is subsumed as one
+/// dedup branch with no plain branch (a recombine of one = the branch itself). The builder emits a
+/// plan whose output schema is exactly `[group keys..., catalog entries in order]` — identical to
+/// what a single `Aggregate` would produce — so all downstream final-projection/having logic is
+/// reused unchanged.
 #[derive(Debug, Clone)]
 struct DistinctAggregateRewrite {
-	dedup_exprs: Vec<Expr>,
-	dedup_output_names: Vec<Option<String>>,
-	group_expr: Vec<Expr>,
-	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
+	group_keys: Vec<GroupKey>,
+	branches: Vec<RecombineBranch>,
+	/// For each catalog entry (in catalog order): `(branch index, agg position within that branch)`.
+	entry_slots: Vec<(usize, usize)>,
+	/// `[group key names..., entry natural names...]` — the normalized output schema (catalog order).
+	output_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RecombineBranch {
+	/// `Some(arg)` => a dedup branch over that distinct argument; `None` => the plain (non-distinct)
+	/// branch aggregated directly over the base input.
+	dedup_arg: Option<Expr>,
+	/// The aggregate calls computed by this branch, in slot order. A dedup branch applies each
+	/// function to the deduped argument column; the plain branch applies each entry's own args.
+	aggs: Vec<(AggregateFunction, Vec<Expr>)>,
 }
 
 impl DistinctAggregateRewrite {
-	fn wrap_input(&self, input: LogicalPlan) -> LogicalPlan {
-		LogicalPlan::Distinct {
-			input: Box::new(LogicalPlan::Project {
-				input: Box::new(input),
-				exprs: self.dedup_exprs.clone(),
-				output_names: self.dedup_output_names.clone(),
-			}),
+	fn is_global(&self) -> bool {
+		self.group_keys.is_empty()
+	}
+
+	/// Build the full fan-out + recombine plan from the already-lowered base input.
+	fn into_aggregated_plan(&self, base: LogicalPlan) -> LogicalPlan {
+		let branch_plans: Vec<LogicalPlan> = self
+			.branches
+			.iter()
+			.enumerate()
+			.map(|(index, branch)| self.build_branch(base.clone(), index, branch))
+			.collect();
+
+		let mut recombined = branch_plans
+			.into_iter()
+			.enumerate()
+			.reduce(|(_, left), (right_index, right)| {
+				(right_index, self.recombine(left, right, right_index))
+			})
+			.map(|(_, plan)| plan)
+			.expect("a distinct-aggregate rewrite has at least one branch");
+
+		// Normalize to `[group keys..., entries in catalog order]` so downstream logic is unchanged.
+		let mut exprs = Vec::with_capacity(self.group_keys.len() + self.entry_slots.len());
+		for key in 0..self.group_keys.len() {
+			exprs.push(Expr::column(branch_group_key_name(0, key)));
+		}
+		for (branch, slot) in &self.entry_slots {
+			exprs.push(Expr::column(branch_agg_name(*branch, *slot)));
+		}
+		recombined = LogicalPlan::Project {
+			input: Box::new(recombined),
+			exprs,
+			output_names: self.output_names.iter().cloned().map(Some).collect(),
+		};
+		recombined
+	}
+
+	fn build_branch(
+		&self,
+		base: LogicalPlan,
+		index: usize,
+		branch: &RecombineBranch,
+	) -> LogicalPlan {
+		let global = self.is_global();
+		// 1. Aggregate input + the (group key exprs, arg refs) the branch's aggregate references.
+		let (agg_input, group_expr, arg_refs) = match &branch.dedup_arg {
+			Some(arg) => {
+				// Dedup branch: project `[group keys (named) + arg]`, then DISTINCT.
+				let arg_name = branch_dedup_arg_name(index);
+				let mut exprs: Vec<Expr> =
+					self.group_keys.iter().map(|key| key.expr.clone()).collect();
+				let mut names: Vec<Option<String>> = self
+					.group_keys
+					.iter()
+					.map(|key| Some(key.name.clone()))
+					.collect();
+				exprs.push(arg.clone());
+				names.push(Some(arg_name.clone()));
+				let deduped = LogicalPlan::Distinct {
+					input: Box::new(LogicalPlan::Project {
+						input: Box::new(base),
+						exprs,
+						output_names: names,
+					}),
+				};
+				let group_expr = self
+					.group_keys
+					.iter()
+					.map(|key| Expr::column(key.name.clone()))
+					.collect::<Vec<_>>();
+				(deduped, group_expr, ArgRefs::Shared(arg_name))
+			}
+			None => {
+				// Plain branch: aggregate directly over the base; group by the declared key exprs.
+				let group_expr = self
+					.group_keys
+					.iter()
+					.map(|key| key.expr.clone())
+					.collect::<Vec<_>>();
+				(base, group_expr, ArgRefs::PerEntry)
+			}
+		};
+
+		let aggr_expr = branch
+			.aggs
+			.iter()
+			.map(|(function, args)| match &arg_refs {
+				ArgRefs::Shared(name) => (function.clone(), vec![Expr::column(name.clone())]),
+				ArgRefs::PerEntry => (function.clone(), args.clone()),
+			})
+			.collect::<Vec<_>>();
+
+		// 2. Aggregate (grouped queries exchange on the group key first; global is single-stage).
+		let aggregate_input = if global {
+			agg_input
+		} else {
+			LogicalPlan::Exchange {
+				input: Box::new(agg_input),
+				partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+				key: group_expr.clone(),
+			}
+		};
+		let aggregate = LogicalPlan::Aggregate {
+			input: Box::new(aggregate_input),
+			group_expr,
+			aggr_expr,
+		};
+
+		// 3. Rename to branch-unique columns so the recombine join/cross is unambiguous.
+		let mut exprs = Vec::with_capacity(self.group_keys.len() + branch.aggs.len());
+		let mut names = Vec::with_capacity(self.group_keys.len() + branch.aggs.len());
+		for (key_index, key) in self.group_keys.iter().enumerate() {
+			exprs.push(Expr::column(key.name.clone()));
+			names.push(Some(branch_group_key_name(index, key_index)));
+		}
+		for (slot, (function, _)) in branch.aggs.iter().enumerate() {
+			exprs.push(Expr::column(aggregate_output_name(function).to_string()));
+			names.push(Some(branch_agg_name(index, slot)));
+		}
+		LogicalPlan::Project {
+			input: Box::new(aggregate),
+			exprs,
+			output_names: names,
 		}
 	}
+
+	fn recombine(&self, left: LogicalPlan, right: LogicalPlan, right_index: usize) -> LogicalPlan {
+		if self.is_global() {
+			// Each global branch is one row; ADR 239 scalar-local Cross binds this as a local cartesian.
+			return build_auto_join_plan(left, right, JoinKind::Cross, Vec::new());
+		}
+		// Grouped: null-safe equi-join on the group keys (ADR 235), so `GROUP BY NULL` recombines.
+		let on = (0..self.group_keys.len())
+			.map(|key| {
+				(
+					Expr::column(branch_group_key_name(0, key)),
+					Expr::column(branch_group_key_name(right_index, key)),
+				)
+			})
+			.collect::<Vec<_>>();
+		LogicalPlan::Join {
+			left: Box::new(left),
+			right: Box::new(right),
+			kind: JoinKind::Inner,
+			on,
+			null_safe_keys: true,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
+	}
+}
+
+enum ArgRefs {
+	/// Dedup branch: every aggregate applies to the single deduped argument column.
+	Shared(String),
+	/// Plain branch: each entry keeps its own argument expressions.
+	PerEntry,
+}
+
+fn branch_group_key_name(branch: usize, key: usize) -> String {
+	format!("__md_b{branch}_g{key}")
+}
+
+fn branch_agg_name(branch: usize, slot: usize) -> String {
+	format!("__md_b{branch}_a{slot}")
+}
+
+fn branch_dedup_arg_name(branch: usize) -> String {
+	format!("__md_b{branch}_arg")
 }
 
 #[derive(Debug)]
@@ -5791,98 +5964,86 @@ fn build_distinct_aggregate_rewrite(
 	if catalog.entries.iter().all(|entry| !entry.distinct) {
 		return Ok(None);
 	}
-	if catalog.entries.iter().any(|entry| !entry.distinct) {
-		return Err(unsupported(
-			"mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out",
-		));
-	}
 
-	let first_arg = distinct_aggregate_plain_column_arg(&catalog.entries[0])?;
+	// ADR 240: fan out one dedup branch per structural distinct-argument identity, plus plain
+	// branch(es) for non-distinct aggregates. Plain branches shard only when duplicate aggregate
+	// output names would make normalization ambiguous. Record each catalog entry's (branch, slot)
+	// so recombine can be normalized back to `[group keys..., entries in catalog order]`.
+	let mut branches: Vec<RecombineBranch> = Vec::new();
+	let mut dedup_identities: Vec<(Expr, usize)> = Vec::new();
+	let mut plain_branches: Vec<usize> = Vec::new();
+	let mut entry_slots = Vec::with_capacity(catalog.entries.len());
+
 	for entry in &catalog.entries {
-		let arg = distinct_aggregate_plain_column_arg(entry)?;
-		if !expr_structural_eq(
-			&canonical_aggregate_signature_expr(&arg),
-			&canonical_aggregate_signature_expr(&first_arg),
-		) {
-			return Err(unsupported(
-				"multiple DISTINCT aggregate arguments require multi-dedup fan-out",
-			));
-		}
-	}
-
-	let mut dedup_exprs = Vec::with_capacity(catalog.group_keys.len() + 1);
-	let mut dedup_output_names = Vec::with_capacity(catalog.group_keys.len() + 1);
-	let mut group_expr = Vec::with_capacity(catalog.group_keys.len());
-	for key in &catalog.group_keys {
-		dedup_exprs.push(key.expr.clone());
-		dedup_output_names.push(Some(key.name.clone()));
-		group_expr.push(Expr::column(key.name.clone()));
-	}
-
-	let distinct_arg_output = catalog
-		.group_keys
-		.iter()
-		.find(|key| {
-			expr_structural_eq(
-				&canonical_aggregate_signature_expr(&key.expr),
-				&canonical_aggregate_signature_expr(&first_arg),
-			)
-		})
-		.map(|key| key.name.clone())
-		.unwrap_or_else(|| {
-			let mut name = logical_expr_output_name(&first_arg, catalog.group_keys.len());
-			if catalog.group_keys.iter().any(|key| key.name == name) {
-				name = "__toron_distinct_arg".to_string();
+		let branch_index = if entry.distinct {
+			let arg = distinct_aggregate_arg(entry)?;
+			let identity = canonical_aggregate_signature_expr(&arg);
+			match dedup_identities
+				.iter()
+				.find(|(existing, _)| expr_structural_eq(existing, &identity))
+			{
+				Some((_, index)) => *index,
+				None => {
+					let index = branches.len();
+					branches.push(RecombineBranch {
+						dedup_arg: Some(arg),
+						aggs: Vec::new(),
+					});
+					dedup_identities.push((identity, index));
+					index
+				}
 			}
-			dedup_exprs.push(first_arg.clone());
-			dedup_output_names.push(Some(name.clone()));
-			name
-		});
-
-	let aggr_expr = catalog
-		.entries
-		.iter()
-		.map(|entry| {
-			(
-				entry.function.clone(),
-				vec![Expr::column(distinct_arg_output.clone())],
-			)
-		})
-		.collect();
+		} else {
+			let output_name = aggregate_output_name(&entry.function);
+			match plain_branches.iter().copied().find(|index| {
+				branches[*index]
+					.aggs
+					.iter()
+					.all(|(function, _)| aggregate_output_name(function) != output_name)
+			}) {
+				Some(index) => index,
+				None => {
+					let index = branches.len();
+					branches.push(RecombineBranch {
+						dedup_arg: None,
+						aggs: Vec::new(),
+					});
+					plain_branches.push(index);
+					index
+				}
+			}
+		};
+		let slot = branches[branch_index].aggs.len();
+		branches[branch_index]
+			.aggs
+			.push((entry.function.clone(), entry.args.clone()));
+		entry_slots.push((branch_index, slot));
+	}
 
 	Ok(Some(DistinctAggregateRewrite {
-		dedup_exprs,
-		dedup_output_names,
-		group_expr,
-		aggr_expr,
+		group_keys: catalog.group_keys.clone(),
+		branches,
+		entry_slots,
+		output_names: catalog.natural_output_names(),
 	}))
 }
 
-fn distinct_aggregate_plain_column_arg(
-	entry: &AggregateOutputEntry,
-) -> Result<Expr, FrontendError> {
+fn distinct_aggregate_arg(entry: &AggregateOutputEntry) -> Result<Expr, FrontendError> {
 	match entry.function {
 		AggregateFunction::Count
 		| AggregateFunction::Sum
 		| AggregateFunction::Min
-		| AggregateFunction::Max => {}
-		AggregateFunction::Avg => {
-			return Err(unsupported("AVG(DISTINCT) requires multi-dedup fan-out"));
-		}
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => {}
 		_ => {
 			return Err(unsupported("unsupported DISTINCT aggregate function"));
 		}
 	}
+	// ADR 240 D3: computed distinct arguments are projected before dedup, so any single argument
+	// expression is accepted (the dedup branch projects it to a generated column).
 	let [arg] = entry.args.as_slice() else {
-		return Err(unsupported(
-			"DISTINCT aggregate arguments require one plain column",
-		));
+		return Err(unsupported("DISTINCT aggregate requires a single argument"));
 	};
-	if !matches!(arg, Expr::Column(_)) {
-		return Err(unsupported(
-			"computed DISTINCT aggregate arguments require multi-dedup fan-out",
-		));
-	}
 	Ok(arg.clone())
 }
 

@@ -1776,23 +1776,13 @@ async fn distinct_join_lowers_to_existing_empty_aggregate_no_new_execution_op() 
 #[tokio::test]
 async fn count_distinct_ignores_null_and_rewrites_to_count_arg() {
 	let logical = plan_sql("SELECT COUNT(DISTINCT amount) FROM sales");
-	let LogicalPlan::Aggregate {
-		input,
-		group_expr,
-		aggr_expr,
-	} = &logical
-	else {
-		panic!("expected aggregate over distinct input, got {logical:?}");
-	};
+	let (group_expr, aggr_expr) = find_aggregate_over_distinct(&logical);
 	assert!(group_expr.is_empty());
 	assert_eq!(aggr_expr.len(), 1);
 	assert!(matches!(aggr_expr[0].0, AggregateFunction::Count));
-	assert_column(&aggr_expr[0].1[0], "amount");
-	let LogicalPlan::Distinct { input } = input.as_ref() else {
-		panic!("expected pre-aggregate distinct, got {input:?}");
-	};
-	assert!(matches!(input.as_ref(), LogicalPlan::Project { .. }));
 
+	// The discriminating proof: COUNT(DISTINCT amount) dedups and ignores NULL -> 4 (a raw COUNT or a
+	// non-deduped count would differ).
 	let results = run_logical(&logical).await;
 	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
 }
@@ -1863,18 +1853,13 @@ async fn count_distinct_over_join_uses_distinct_below_group_exchange() {
 		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
 		 GROUP BY left_dups.label",
 	);
-	let LogicalPlan::Aggregate { input, .. } = &logical else {
-		panic!("expected aggregate, got {logical:?}");
-	};
-	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
-		panic!("expected group exchange below aggregate, got {input:?}");
-	};
-	let LogicalPlan::Distinct { input } = input.as_ref() else {
-		panic!("expected distinct below group exchange, got {input:?}");
-	};
+	let (group_expr, aggr_expr) = find_aggregate_over_distinct(&logical);
+	assert_eq!(group_expr.len(), 1, "grouped by label");
+	assert_eq!(aggr_expr.len(), 1);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Count));
 	assert!(
-		contains_logical_join(input),
-		"distinct aggregate dedup must run after join output is projected"
+		contains_logical_join(&logical),
+		"distinct aggregate dedup must run after the join output"
 	);
 
 	let results = run_logical(&logical).await;
@@ -1885,23 +1870,214 @@ async fn count_distinct_over_join_uses_distinct_below_group_exchange() {
 }
 
 #[test]
-fn distinct_aggregate_retains_multi_dedup_fanout_fences() {
-	assert_unsupported_message(
+fn distinct_aggregate_multi_dedup_forms_now_plan() {
+	// ADR 240 lifted the four ADR-234 single-dedup fences; each now lowers to a fan-out + recombine.
+	for sql in [
 		"SELECT COUNT(DISTINCT amount), SUM(price) FROM sales",
-		"mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out",
-	);
-	assert_unsupported_message(
 		"SELECT COUNT(DISTINCT amount), COUNT(DISTINCT id) FROM sales",
-		"multiple DISTINCT aggregate arguments require multi-dedup fan-out",
-	);
-	assert_unsupported_message(
 		"SELECT AVG(DISTINCT amount) FROM sales",
-		"AVG(DISTINCT) requires multi-dedup fan-out",
-	);
-	assert_unsupported_message(
 		"SELECT COUNT(DISTINCT amount + 1) FROM sales",
-		"computed DISTINCT aggregate arguments require multi-dedup fan-out",
+	] {
+		assert!(
+			SqlPlanner::new().plan(sql).is_ok(),
+			"ADR 240 multi-dedup form must now lower: {sql}"
+		);
+	}
+}
+
+// ----- ADR 240 multi-dedup behavior gates -----
+// sales.amount = [10, 20, NULL, 30, NULL, 7]; region = [east, west, east, east, west, NULL].
+
+#[tokio::test]
+async fn mixed_distinct_and_plain_aggregate_executes() {
+	// D4: a plain branch (SUM(id)) recombines with a distinct branch (COUNT(DISTINCT amount)).
+	let results = run_logical(&plan_sql(
+		"SELECT COUNT(DISTINCT amount), SUM(id) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0),
+		vec![Some(4)],
+		"distinct amounts {{10,20,30,7}}"
 	);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 1),
+		vec![Some(21)],
+		"SUM(id) = 1+2+3+4+5+6"
+	);
+}
+
+#[tokio::test]
+async fn mixed_plain_branch_duplicate_output_names_stay_ordinal_safe() {
+	// The logical Aggregate output names are function-level (`sum`, `sum`). ADR 240 branch
+	// normalization must not resolve both plain aggregates through the first `sum` column.
+	let results = run_logical(&plan_sql(
+		"SELECT COUNT(DISTINCT amount), SUM(id), SUM(amount) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 1),
+		vec![Some(21)],
+		"SUM(id) = 1+2+3+4+5+6"
+	);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 2),
+		vec![Some(67)],
+		"SUM(amount) ignores NULLs: 10+20+30+7"
+	);
+}
+
+#[tokio::test]
+async fn multiple_distinct_arguments_execute() {
+	// D2: two dedup branches over different arguments recombine.
+	let results = run_logical(&plan_sql(
+		"SELECT COUNT(DISTINCT amount), COUNT(DISTINCT region) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 1),
+		vec![Some(2)],
+		"distinct regions {{east, west}} — NULL ignored by COUNT"
+	);
+}
+
+#[tokio::test]
+async fn same_distinct_argument_shares_one_dedup_branch() {
+	// D2: COUNT/MIN/MAX over the same distinct argument share ONE dedup branch (one Distinct node).
+	let logical = plan_sql(
+		"SELECT COUNT(DISTINCT amount), MIN(DISTINCT amount), MAX(DISTINCT amount) FROM sales",
+	);
+	assert_eq!(
+		count_distinct_nodes(&logical),
+		1,
+		"aggregates over the same distinct argument must share one dedup branch"
+	);
+	let results = run_logical(&logical).await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
+	assert_eq!(scalar_int32_column_rows(&results, 1), vec![Some(7)]);
+	assert_eq!(scalar_int32_column_rows(&results, 2), vec![Some(30)]);
+}
+
+#[tokio::test]
+async fn avg_distinct_uses_avg_over_dedup_and_null_semantics() {
+	// D5: AVG(DISTINCT) is ordinary AVG over the deduped rows; an all-NULL distinct set returns NULL
+	// (not 0 / divide-by-zero).
+	let avg = run_logical(&plan_sql("SELECT AVG(DISTINCT amount) FROM sales")).await;
+	assert_eq!(
+		scalar_float64_column_rows(&avg, 0),
+		vec![Some(16.75)],
+		"avg of distinct {{10,20,30,7}} = 67/4"
+	);
+	let empty = run_logical(&plan_sql("SELECT AVG(DISTINCT all_null_amount) FROM sales")).await;
+	assert_eq!(
+		scalar_float64_column_rows(&empty, 0),
+		vec![None],
+		"AVG over an all-NULL distinct set is NULL"
+	);
+}
+
+#[tokio::test]
+async fn computed_distinct_argument_executes() {
+	// D3: a computed distinct argument is projected before dedup.
+	let results = run_logical(&plan_sql("SELECT COUNT(DISTINCT amount + 1) FROM sales")).await;
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0),
+		vec![Some(4)],
+		"distinct {{11,21,31,8}}"
+	);
+}
+
+#[tokio::test]
+async fn grouped_multi_dedup_all_null_distinct_column_keeps_group() {
+	// D6: every group survives even when its distinct column is entirely NULL (COUNT = 0); the
+	// recombine needs no dedicated group-domain branch. Locks the no-groups-branch decision.
+	let results = run_logical(&plan_sql(
+		"SELECT region, COUNT(DISTINCT all_null_amount), COUNT(DISTINCT amount) \
+		 FROM sales GROUP BY region",
+	))
+	.await;
+	let all_null = region_int64_rows(&results, 1);
+	let amount = region_int64_rows(&results, 2);
+	assert_eq!(
+		all_null.len(),
+		3,
+		"all three groups (incl the NULL group) survive"
+	);
+	for region in [None, Some("east".to_string()), Some("west".to_string())] {
+		assert_eq!(
+			all_null.get(&region),
+			Some(&Some(0)),
+			"all-NULL distinct column yields count 0, not a dropped group: {region:?}"
+		);
+	}
+	assert_eq!(amount.get(&None), Some(&Some(1))); // {7}
+	assert_eq!(amount.get(&Some("east".to_string())), Some(&Some(2))); // {10, 30}
+	assert_eq!(amount.get(&Some("west".to_string())), Some(&Some(1))); // {20}
+}
+
+#[tokio::test]
+async fn global_multi_dedup_recombines_with_cross_join() {
+	// D7: the global recombine uses a keyless Cross (the ADR 239 scalar-local path), not a synthetic key.
+	let logical = plan_sql("SELECT COUNT(DISTINCT amount), COUNT(DISTINCT region) FROM sales");
+	assert!(
+		plan_contains_cross_join(&logical),
+		"global multi-dedup recombine must use a keyless Cross join"
+	);
+	let results = run_logical(&logical).await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
+	assert_eq!(scalar_int64_column_rows(&results, 1), vec![Some(2)]);
+}
+
+#[tokio::test]
+async fn multi_dedup_over_join_executes() {
+	// D8: a mixed distinct + plain aggregate over a JOIN base. Each branch clones the already-lowered
+	// join. left.k=1 -> A x gold (2x2=4 rows); k=2 -> B x silver (1 row).
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(DISTINCT right_dups.tier), COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label",
+	))
+	.await;
+	let distinct_tier = region_int64_rows(&results, 1);
+	let total = region_int64_rows(&results, 2);
+	assert_eq!(distinct_tier.get(&Some("A".to_string())), Some(&Some(1))); // {gold}
+	assert_eq!(distinct_tier.get(&Some("B".to_string())), Some(&Some(1))); // {silver}
+	assert_eq!(total.get(&Some("A".to_string())), Some(&Some(4)));
+	assert_eq!(total.get(&Some("B".to_string())), Some(&Some(1)));
+}
+
+fn count_distinct_nodes(plan: &LogicalPlan) -> usize {
+	match plan {
+		LogicalPlan::Distinct { input } => 1 + count_distinct_nodes(input),
+		LogicalPlan::Project { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Aggregate { input, .. } => count_distinct_nodes(input),
+		LogicalPlan::Join { left, right, .. } => {
+			count_distinct_nodes(left) + count_distinct_nodes(right)
+		}
+		_ => 0,
+	}
+}
+
+fn plan_contains_cross_join(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Join {
+			left, right, kind, ..
+		} => {
+			matches!(kind, JoinKind::Cross)
+				|| plan_contains_cross_join(left)
+				|| plan_contains_cross_join(right)
+		}
+		LogicalPlan::Project { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Distinct { input } => plan_contains_cross_join(input),
+		_ => false,
+	}
 }
 
 #[test]
@@ -2324,7 +2500,7 @@ fn min_max_aggregate_rejects_invalid_and_unselected_references() {
 fn avg_aggregate_rejects_invalid_and_unselected_references() {
 	assert_unsupported_message("SELECT AVG() FROM sales", "AVG requires one argument");
 	assert_unsupported("SELECT AVG(*) FROM sales");
-	assert_unsupported("SELECT AVG(DISTINCT amount) FROM sales");
+	// AVG(DISTINCT amount) is now supported (ADR 240) — covered by the multi-dedup behavior gates.
 	assert_project_over_aggregate(&plan_sql(
 		"SELECT AVG(amount), AVG(amount) FROM sales HAVING AVG(amount) > 0",
 	));
@@ -5274,6 +5450,39 @@ fn assert_scalar_sum_aggregate(plan: &LogicalPlan) {
 
 fn plan_sql(sql: &str) -> LogicalPlan {
 	SqlPlanner::new().plan(sql).expect("plan sql")
+}
+
+/// ADR 240: a distinct aggregate now lowers to a fan-out + recombine wrapped in normalizing/branch
+/// Projects. Walk through those wrappers to the dedup branch's `Aggregate` over a `Distinct` input
+/// (its argument is a generated dedup column), returning its `(group_expr, aggr_expr)`.
+fn find_aggregate_over_distinct(
+	plan: &LogicalPlan,
+) -> (&[Expr], &[(AggregateFunction, Vec<Expr>)]) {
+	fn search(plan: &LogicalPlan) -> Option<(&[Expr], &[(AggregateFunction, Vec<Expr>)])> {
+		match plan {
+			LogicalPlan::Aggregate {
+				input,
+				group_expr,
+				aggr_expr,
+			} => {
+				let mut inner = input.as_ref();
+				if let LogicalPlan::Exchange { input, .. } = inner {
+					inner = input.as_ref();
+				}
+				if matches!(inner, LogicalPlan::Distinct { .. }) {
+					return Some((group_expr.as_slice(), aggr_expr.as_slice()));
+				}
+				search(input)
+			}
+			LogicalPlan::Project { input, .. }
+			| LogicalPlan::Filter { input, .. }
+			| LogicalPlan::Exchange { input, .. }
+			| LogicalPlan::Distinct { input } => search(input),
+			LogicalPlan::Join { left, right, .. } => search(left).or_else(|| search(right)),
+			_ => None,
+		}
+	}
+	search(plan).expect("plan must contain an aggregate over a distinct input")
 }
 
 async fn rune_plan(script: &str) -> LogicalPlan {

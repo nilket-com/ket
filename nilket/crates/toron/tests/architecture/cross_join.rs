@@ -131,6 +131,51 @@ pub(crate) fn adr239_cross_join_does_not_hash_partition_empty_keys() {
 }
 
 #[test]
+pub(crate) fn adr239_scalar_local_cross_is_bounded_single_partition_gather() {
+	// D4 scalar-local refinement: a Cross may bind locally ONLY when both sides are provably scalar
+	// (row_upper_bound <= 1); it gathers to a single partition (count = 1), never an N-way empty-key
+	// hash repartition. Base-table Cross stays broadcast-only.
+	let join = source("src/binder/join.rs");
+	let cross = source_block(&join, "fn choose_cross_join_strategy");
+	assert!(
+		cross.contains("cross_inputs_are_scalar"),
+		"scalar-local Cross must gate on a scalar-inputs check before the broadcast-or-fail path"
+	);
+	let scalar = source_block(&join, "fn plan_is_scalar");
+	assert!(
+		scalar.contains("row_upper_bound") && scalar.contains("RowCount::new(1)"),
+		"scalar means provably at most one row (row_upper_bound <= 1)"
+	);
+
+	// The binder physicalizes the scalar-local Cross as a single-partition gather, not DEFAULT hash.
+	let binder = binder_source();
+	assert!(
+		binder.contains("JoinStrategyDecisionReason::ScalarLocalCross"),
+		"the binder must special-case ScalarLocalCross when physicalizing the join"
+	);
+
+	// A global aggregate is recorded as a hard one-row fact (the scalar source ADR 240 relies on).
+	let bind_bound_aggregate = source_block(&binder, "fn bind_bound_aggregate");
+	assert!(
+		bind_bound_aggregate.contains("group_expr.is_empty_roots()")
+			&& bind_bound_aggregate.contains("composite_with_row"),
+		"a global aggregate must carry row_upper_bound = 1 so a scalar Cross recombine can bind locally"
+	);
+
+	// Discriminating behavior gates: scalar binds local; base-table without broadcast eligibility fails.
+	let behavior = source("tests/cross_join_test.rs");
+	for marker in [
+		"scalar_cross_join_binds_as_local_cartesian",
+		"cross_join_oversized_build_fails_loud",
+	] {
+		assert!(
+			behavior.contains(marker),
+			"missing discriminating gate {marker}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr239_cross_join_executor_match_all_path_is_explicit() {
 	let exec = source("src/exec.rs");
 

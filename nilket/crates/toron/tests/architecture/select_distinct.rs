@@ -267,14 +267,15 @@ pub(crate) fn adr234_distinct_aggregate_rewrites_to_project_distinct_then_existi
 	let wrapper = source_block(&planner, "impl DistinctAggregateRewrite");
 	let tests = source("tests/group_by_test.rs");
 
+	// ADR 240 generalized the single-dedup rewrite into a fan-out builder; the single-distinct case
+	// is subsumed as one dedup branch, still Project -> Distinct -> Aggregate.
 	assert!(planner.contains("struct DistinctAggregateRewrite"));
 	assert!(lower_select.contains("distinct_rewrite"));
-	assert!(lower_select.contains("rewrite.wrap_input(plan)"));
+	assert!(lower_select.contains("into_aggregated_plan"));
 	assert!(wrapper.contains("LogicalPlan::Distinct"));
 	assert!(wrapper.contains("LogicalPlan::Project"));
-	assert!(rewrite.contains("dedup_exprs.push(key.expr.clone())"));
-	assert!(rewrite.contains("dedup_exprs.push(first_arg.clone())"));
-	assert!(rewrite.contains("group_expr.push(Expr::column(key.name.clone()))"));
+	assert!(wrapper.contains("LogicalPlan::Aggregate"));
+	assert!(rewrite.contains("RecombineBranch"));
 	assert!(tests.contains("count_distinct_ignores_null_and_rewrites_to_count_arg"));
 	assert!(tests.contains("count_distinct_over_join_uses_distinct_below_group_exchange"));
 }
@@ -299,7 +300,7 @@ pub(crate) fn adr234_distinct_aggregate_keeps_aggregate_function_enum_flagless()
 pub(crate) fn adr234_count_distinct_rewrites_to_count_arg_not_count_all() {
 	let planner = source("src/sql_planner.rs");
 	let tests = source("tests/group_by_test.rs");
-	let distinct_arg = source_block(&planner, "fn distinct_aggregate_plain_column_arg");
+	let distinct_arg = source_block(&planner, "fn distinct_aggregate_arg");
 
 	assert!(distinct_arg.contains("AggregateFunction::Count"));
 	assert!(!distinct_arg.contains("AggregateFunction::CountAll"));
@@ -308,21 +309,23 @@ pub(crate) fn adr234_count_distinct_rewrites_to_count_arg_not_count_all() {
 }
 
 #[test]
-pub(crate) fn adr234_distinct_aggregate_retains_multi_dedup_fanout_fences() {
+pub(crate) fn adr234_distinct_aggregate_multi_dedup_fences_lifted_by_adr240() {
+	// ADR 240 lifted the four ADR-234 single-dedup fences; the rewrite no longer rejects these forms.
 	let planner = source("src/sql_planner.rs");
-	let rewrite = source_block(&planner, "fn build_distinct_aggregate_rewrite");
-	let plain_arg = source_block(&planner, "fn distinct_aggregate_plain_column_arg");
 	let tests = source("tests/group_by_test.rs");
 
-	assert!(
-		rewrite.contains("mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out")
-	);
-	assert!(rewrite.contains("multiple DISTINCT aggregate arguments require multi-dedup fan-out"));
-	assert!(plain_arg.contains("AVG(DISTINCT) requires multi-dedup fan-out"));
-	assert!(
-		plain_arg.contains("computed DISTINCT aggregate arguments require multi-dedup fan-out")
-	);
-	assert!(tests.contains("distinct_aggregate_retains_multi_dedup_fanout_fences"));
+	for lifted in [
+		"mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out",
+		"multiple DISTINCT aggregate arguments require multi-dedup fan-out",
+		"AVG(DISTINCT) requires multi-dedup fan-out",
+		"computed DISTINCT aggregate arguments require multi-dedup fan-out",
+	] {
+		assert!(
+			!planner.contains(lifted),
+			"ADR 240 must lift the fence: {lifted}"
+		);
+	}
+	assert!(tests.contains("distinct_aggregate_multi_dedup_forms_now_plan"));
 }
 
 #[test]

@@ -11,7 +11,8 @@ physical operator, optimizer, durable, Wendelon, or Rune surface.**
   - **`build_distinct_aggregate_rewrite`** (5788): stop returning a single inline-wrapped rewrite; build
     the full fan-out + recombine `LogicalPlan` plus the final SELECT projection. Group `catalog.entries`
     into dedup branches by structural distinct-arg identity (reuse `canonical_aggregate_signature_expr` +
-    `expr_structural_eq`, already used at :5803); collect non-distinct entries into one plain branch.
+    `expr_structural_eq`, already used at :5803); collect non-distinct entries into plain branch(es),
+    sharding only when duplicate aggregate output names would make branch-normalization ambiguous.
   - **`distinct_aggregate_plain_column_arg`** (5861): extend to accept `AVG` (D5) and computed
     single-expression args (D3) instead of rejecting them; computed args lower via an injected
     `Project(keys, __distinct_arg_k = expr)` ahead of `Distinct`.
@@ -58,7 +59,8 @@ Red on `main` (the four rejects fire / the result is single-producer-unreachable
 ## Phase 1 — Branch fan-out
 
 Group `catalog.entries` by structural distinct-arg identity → one dedup branch each; collect
-non-distinct entries → one plain branch. Build each branch:
+non-distinct entries → one plain branch unless duplicate aggregate output names (`sum`, `sum`, etc.)
+require extra plain shards for ordinal-safety. Build each branch:
 `Project(keys [+ __distinct_arg_k]) → Distinct → Aggregate(group=keys, branch_aggs)` (distinct) and
 `Aggregate(group=keys, non_distinct_aggs)` (plain), each cloning the lowered base `plan` (D8 — join base
 falls out for free). Single-branch / no-plain reduces to ADR 234's shape (subsumption).
@@ -110,7 +112,9 @@ git diff --check
 
 ## Named falsifications (for the review)
 
-1. Mixed stays rejected / plain branch dropped — `mixed_distinct_and_plain_aggregate_executes` fails.
+1. Mixed stays rejected / plain branch dropped — `mixed_distinct_and_plain_aggregate_executes` fails;
+   duplicate plain aggregate output names bind ambiguously or read the wrong slot —
+   `mixed_plain_branch_duplicate_output_names_stay_ordinal_safe` fails.
 2. Second distinct identity collapses into one branch — `multiple_distinct_arguments_execute` /
    `same_distinct_argument_shares_one_dedup_branch` fail.
 3. All-NULL distinct group dropped (D6 wrong; a groups-domain branch was actually needed) —

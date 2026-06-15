@@ -1676,6 +1676,15 @@ impl<'a> Binder<'a> {
 		let output_schema = aggregate_schema(&group_expr, &aggr_expr, &logical_types)?;
 		let scope = input.scope.aggregate(&group_expr, &output_schema);
 
+		// ADR 239 (scalar-local Cross refinement): a global aggregate (no group keys) produces exactly
+		// one row. Record that as a hard `row_upper_bound = 1` fact so a CROSS recombine of global
+		// aggregate branches can bind as a local cartesian rather than a (rejected) broadcast.
+		let facts = if group_expr.is_empty_roots() {
+			PlanOptimizerFacts::composite_with_row(Some(RowCount::new(1)))
+		} else {
+			PlanOptimizerFacts::composite_unknown()
+		};
+
 		Ok(ScopedExecutionPlan::new_with_facts(
 			ExecutionPlan::Aggregate {
 				input: Box::new(input.plan),
@@ -1684,7 +1693,7 @@ impl<'a> Binder<'a> {
 				output_schema,
 			},
 			scope,
-			PlanOptimizerFacts::composite_unknown(),
+			facts,
 		))
 	}
 
@@ -2413,15 +2422,26 @@ impl<'a> Binder<'a> {
 		if binder_physicalizes_join {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
+					// ADR 239 (scalar-local Cross): gather both provably-scalar sides to a single
+					// partition and join locally — a partition_count=1 gather, NOT an N-way empty-key
+					// hash repartition (which stays forbidden for partitioned/unbounded Cross inputs).
+					let partition_count = if matches!(
+						decision.reason,
+						JoinStrategyDecisionReason::ScalarLocalCross
+					) {
+						1
+					} else {
+						DEFAULT_AUTO_JOIN_PARTITION_COUNT
+					};
 					left_plan.plan = exchange_for_join_keys(
 						left_plan.plan,
 						&left_resolved_keys,
-						DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+						partition_count,
 					)?;
 					right_plan.plan = exchange_for_join_keys(
 						right_plan.plan,
 						&right_resolved_keys,
-						DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+						partition_count,
 					)?;
 				}
 				JoinStrategy::Broadcast => match decision.placement {
@@ -2463,10 +2483,17 @@ impl<'a> Binder<'a> {
 			strategy: decision.strategy,
 			output_schema: physical_output_schema.clone(),
 		};
-		let output_facts = PlanOptimizerFacts::composite_with_join_estimate(
-			join_estimated_row_count,
-			declared_output_schema.as_ref(),
-		);
+		let output_facts = if matches!(
+			decision.reason,
+			JoinStrategyDecisionReason::ScalarLocalCross
+		) {
+			PlanOptimizerFacts::composite_with_row(Some(RowCount::new(1)))
+		} else {
+			PlanOptimizerFacts::composite_with_join_estimate(
+				join_estimated_row_count,
+				declared_output_schema.as_ref(),
+			)
+		};
 		let join_order_sources = merge_join_order_sources(
 			left_plan.join_order_sources.clone(),
 			right_plan.join_order_sources.clone(),

@@ -671,6 +671,27 @@ async fn distributed_cross_join_cartesian_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_dedup_distinct_aggregate_distributed_merges_across_producers() {
+	// ADR 240 distributed gate (236/238 discipline). `orders JOIN customers` matches customer 2
+	// (orders 101, 102) and customer 3 (order 103), both region "west". customer 2 and 3 hash to
+	// different join workers, so the result requires merging BOTH the distinct dedup and the plain
+	// count across the two producers: a single producer sees only one customer id.
+	let run = run_multi_dedup_distinct_join_process_query(1_420, 0).await;
+
+	assert_eq!(
+		run.rows.get(&Some("west".to_string())),
+		Some(&(2, Some(3))),
+		"COUNT(DISTINCT customer_id) over {{2,3}} = 2; COUNT(*) over the 3 matched rows = 3"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"west's COUNT(DISTINCT orders.customer_id)=2 (over {2,3}) and COUNT(*)=3 require merging the \
+		 distinct dedup AND the plain count across both join producers (cust 2 and cust 3 land on \
+		 different workers); a single producer reaches neither value",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,
@@ -1711,6 +1732,50 @@ async fn run_cross_join_process_query(
 	}
 
 	CrossJoinProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
+async fn run_multi_dedup_distinct_join_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+) -> JoinAggregateProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT customers.region, COUNT(DISTINCT orders.customer_id), COUNT(*) \
+			 FROM orders JOIN customers ON orders.customer_id = customers.id \
+			 GROUP BY customers.region",
+		)
+		.expect("plan multi-dedup over distributed join");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("multi-dedup distinct join query");
+	let rows = grouped_join_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	JoinAggregateProcessRun {
 		rows,
 		selected_workers,
 	}

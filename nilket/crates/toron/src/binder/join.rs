@@ -38,6 +38,10 @@ pub(crate) enum JoinStrategyDecisionReason {
 	HashByDefault {
 		reason: HashByDefaultReason,
 	},
+	/// ADR 239 (scalar-local Cross refinement): a CROSS whose inputs are both provably scalar
+	/// (`row_upper_bound <= 1`) binds as a local cartesian gathered to a single partition — never a
+	/// broadcast and never an empty-key hash *repartition* (the single bucket here holds one row).
+	ScalarLocalCross,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +552,17 @@ fn choose_cross_join_strategy(
 	config: &PlannerConfig,
 	force_hash: bool,
 ) -> Result<JoinStrategyDecision, BindingError> {
+	// ADR 239 (scalar-local Cross refinement): when both sides are provably scalar (row_upper_bound
+	// <= 1, e.g. global aggregate branches), the cartesian is a single 1x1 row — gather both to one
+	// partition and join locally. The empty-key single-bucket trap only bites *partitioned/unbounded*
+	// inputs; one row per side cannot become a partition-pair multiplier. This is broadcast-exempt.
+	if cross_inputs_are_scalar(&left_input, &right_input) {
+		return Ok(JoinStrategyDecision {
+			strategy: JoinStrategy::HashPartitioned,
+			placement: JoinPhysicalPlacement::Natural,
+			reason: JoinStrategyDecisionReason::ScalarLocalCross,
+		});
+	}
 	if force_hash {
 		return Err(cross_requires_broadcast_error());
 	}
@@ -578,6 +593,19 @@ fn choose_cross_join_strategy(
 			}
 		}
 	}
+}
+
+fn cross_inputs_are_scalar(
+	left_input: &JoinInputOptimization,
+	right_input: &JoinInputOptimization,
+) -> bool {
+	plan_is_scalar(&left_input.facts) && plan_is_scalar(&right_input.facts)
+}
+
+/// A plan is scalar when it is provably at most one row (`row_upper_bound <= 1`), e.g. a global
+/// aggregate branch. A scalar CROSS recombine cannot multiply partitions, so it is broadcast-exempt.
+fn plan_is_scalar(facts: &PlanOptimizerFacts) -> bool {
+	matches!(facts.row_upper_bound, Some(rows) if rows <= RowCount::new(1))
 }
 
 fn cross_requires_broadcast_error() -> BindingError {

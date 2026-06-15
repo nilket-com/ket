@@ -8,6 +8,7 @@ pub(crate) mod distributed_fixture;
 pub(crate) mod heavy_hitter;
 pub(crate) mod join_cardinality;
 pub(crate) mod join_order;
+pub(crate) mod multi_dedup;
 pub(crate) mod network_tls;
 pub(crate) mod nominal_type_identity;
 pub(crate) mod null_semantics;

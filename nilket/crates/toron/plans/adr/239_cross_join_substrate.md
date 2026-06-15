@@ -48,11 +48,27 @@ APPLY`, `OUTER APPLY`, array/as-of/straight joins, and non-equi `ON` stay reject
 equi-join predicate pushdown. `FROM a, b WHERE a.k = b.k` stays cartesian + filter — no theta/equi
 extraction smuggled into this cut.
 
-**D4 — Broadcast-only distributed; fail loud otherwise.** Auto strategy for `Cross` forces
-`JoinStrategy::Broadcast` (a `HashPartitioned` cross join is invalid; empty-key hash-partition is
-forbidden). The binder + fragmenter broadcast guards accept `Cross`. If no broadcast-eligible side
-exists under the cap, **fail with an explicit error** — never a hidden single-task or empty-key-hash
-fallback (the 236/238 D8 discipline).
+**D4 — Broadcast-only distributed *except provably scalar/local Cross*; fail loud otherwise.** Auto
+strategy for `Cross` over partitioned or unbounded inputs forces `JoinStrategy::Broadcast`; if no
+broadcast-eligible side exists under the cap, **fail with an explicit error** — never a hidden
+single-task or empty-key-hash *repartition* fallback (the 236/238 D8 discipline). The empty-key
+single-bucket trap is specific to partitioned/unbounded inputs.
+
+**Scalar-local refinement (added post-promotion to unblock ADR 240 global recombine).** A `Cross`
+whose *both* sides are provably scalar (`row_upper_bound <= 1`, e.g. global aggregate branches, which
+the binder now records as a hard 1-row fact) binds as a **local cartesian gathered to a single
+partition** — strategy `HashPartitioned` with a `partition_count == 1` gather. This is broadcast-exempt
+because one row per side cannot become a partition-pair multiplier; it is **not** an empty-key hash
+*repartition* (which is `partition_count > 1` over a constant key). A base-table `CROSS JOIN` is not
+scalar and still requires a broadcast-eligible build (or fails loud) — the safety rule is unchanged for
+arbitrary cross joins. This honestly lets ADR 240 recombine global aggregate branches with real `Cross`
+instead of a synthetic constant key.
+
+**D5 — Explicit match-all execution; in-memory and spilled agree.** Add `JoinKeyPlan::Cross` (or a
+`JoinKind::Cross` branch before key extraction) so Cross emits every build×probe pair deliberately —
+not via `join_key_bytes([])`. In-memory and spilled paths must produce the same cartesian rows (or
+Cross routes through one bounded match-all path); never one explicit and the other accidentally
+empty-key-hashing.
 
 **D5 — Explicit match-all execution; in-memory and spilled agree.** Add `JoinKeyPlan::Cross` (or a
 `JoinKind::Cross` branch before key extraction) so Cross emits every build×probe pair deliberately —

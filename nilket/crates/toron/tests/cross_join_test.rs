@@ -10,7 +10,10 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::ByteCount;
 use toron::error::BindingError;
-use toron::ir::{ExecutionPlan, JoinKind, JoinStrategy, LogicalPlan, TableId};
+use toron::ir::{
+	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
+	LogicalPlan, TableId,
+};
 use toron::sql_planner::SqlPlanner;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
@@ -197,6 +200,58 @@ async fn n_ary_comma_join_binds_left_deep_broadcast_cross_chain() {
 		!has_multi_partition_empty_key_exchange(&bound),
 		"nested comma Cross joins must not introduce empty-key hash exchanges"
 	);
+}
+
+#[tokio::test]
+async fn scalar_cross_join_binds_as_local_cartesian() {
+	// ADR 239 scalar-local Cross refinement: a CROSS recombine of two global-aggregate branches (each
+	// provably one row) must bind as a local cartesian — NOT broadcast (the prior behavior failed loud
+	// because aggregate branches carry no broadcast-eligible build) and NOT an empty-key hash
+	// repartition (a single-partition gather only). This is the path ADR 240 global multi-dedup needs.
+	let catalog = cross_catalog(None);
+	let plan = LogicalPlan::Join {
+		left: Box::new(global_count_distinct_branch("left_t", "left_value")),
+		right: Box::new(global_count_distinct_branch("right_t", "right_value")),
+		kind: JoinKind::Cross,
+		on: vec![],
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let bound = bind(&plan, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("scalar CROSS recombine of global aggregates must bind locally");
+
+	assert_eq!(
+		find_join_strategy(&bound),
+		Some(JoinStrategy::HashPartitioned),
+		"a scalar CROSS binds as a single-partition local cartesian, not broadcast"
+	);
+	assert!(
+		!has_multi_partition_empty_key_exchange(&bound),
+		"scalar-local Cross must gather to a single partition, never an empty-key hash repartition"
+	);
+}
+
+/// A global `COUNT(DISTINCT col)` branch: `Aggregate(group=[], Distinct(Project(scan, [col])))` — a
+/// provably single-row plan (`row_upper_bound = 1`), the shape ADR 240 global recombine fans out.
+fn global_count_distinct_branch(table: &str, col: &str) -> LogicalPlan {
+	LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Distinct {
+			input: Box::new(LogicalPlan::Project {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new(table),
+					projection: None,
+				}),
+				exprs: vec![Expr::qualified_column(TableRef::new(table), col)],
+				output_names: vec![Some(col.to_string())],
+			}),
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![(
+			AggregateFunction::Count,
+			vec![Expr::column(col.to_string())],
+		)],
+	}
 }
 
 // ---------------------------------------------------------------------------
