@@ -144,6 +144,9 @@ SELECT DISTINCT region, count(*) FROM sales GROUP BY region  -- top-level DISTIN
   aggregate-dedup and derived/EXISTS paths).
 - ADR 233 aggregate-over-join / post-join exchange guards → reused (count(DISTINCT) over join rides
   them).
+- ADR 115's `adr115_derived_query_tail_fence_lifted_only` (sql_planner_surface.rs) → inverted: it
+  pinned `validate_derived_select_shape` *rejecting* `select.distinct.is_some()`; D6 lifts that
+  derived-DISTINCT fence, so the guard now asserts the reject's absence.
 - Optimizer arc (216→230) → untouched.
 
 ## Consensus (transparent)

@@ -89,7 +89,9 @@ Retarget the aggregate `duplicate_treatment` reject guard (one-dedup accepted, f
 preserve the scalar helper modifier guard. Add the seven `adr234_*` guards (esp.
 `adr234_distinct_aggregate_keeps_aggregate_function_enum_flagless` and
 `adr234_count_distinct_rewrites_to_count_arg_not_count_all`). Assert 231/232 marker + ordinal-safe
-guards reused, 233 aggregate/exchange guards reused, optimizer arc (216→230) unchanged.
+guards reused, 233 aggregate/exchange guards reused, optimizer arc (216→230) unchanged. Invert ADR
+115's `adr115_derived_query_tail_fence_lifted_only` (it pinned the now-lifted derived
+`select.distinct.is_some()` reject).
 
 ## Verification gate
 

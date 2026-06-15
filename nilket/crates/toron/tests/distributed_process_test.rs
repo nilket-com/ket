@@ -212,6 +212,12 @@ struct JoinAggregateProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+#[derive(Debug)]
+struct JoinDistinctAggregateProcessRun {
+	rows: HashMap<Option<String>, i64>,
+	selected_workers: Vec<WorkerId>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_process_distributed_query_digest_is_canonical() {
 	let first = run_process_query(100, 0).await;
@@ -367,6 +373,21 @@ async fn group_by_join_real_aggregate_merges_across_partitions() {
 		run.rows,
 		HashMap::from([(Some("west".to_string()), (3, Some(306)))])
 	);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn count_distinct_over_join_merges_across_partitions() {
+	let run = run_count_distinct_join_process_query(1_360, 0).await;
+
+	// The west group has orders for distinct customers 2 and 3. Customer 2 has duplicate
+	// orders, and customers 2/3 are produced by different join workers, so this proves
+	// cross-producer dedup before Count(customer_id).
+	assert_eq!(run.rows, HashMap::from([(Some("west".to_string()), 2)]));
 	assert_eq!(
 		unique_selected_worker_count(&run.selected_workers),
 		2,
@@ -1335,6 +1356,50 @@ async fn run_group_by_join_real_aggregate_process_query(
 	}
 }
 
+async fn run_count_distinct_join_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+) -> JoinDistinctAggregateProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT customers.region, COUNT(DISTINCT orders.customer_id) \
+			 FROM orders JOIN customers ON orders.customer_id = customers.id \
+			 GROUP BY customers.region",
+		)
+		.expect("plan count-distinct over distributed join");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("count-distinct join aggregate query");
+	let rows = grouped_join_count_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	JoinDistinctAggregateProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_hash_join_producer_kill_query(
 	worker_id_base: u128,
 	killed_stage_index: usize,
@@ -1825,6 +1890,31 @@ fn grouped_join_rows(results: &[RecordBatch]) -> HashMap<Option<String>, (i64, O
 				Some(sums.value(row))
 			};
 			rows.insert(region, (counts.value(row), sum));
+		}
+	}
+	rows
+}
+
+fn grouped_join_count_rows(results: &[RecordBatch]) -> HashMap<Option<String>, i64> {
+	let mut rows = HashMap::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("count column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			rows.insert(region, counts.value(row));
 		}
 	}
 	rows

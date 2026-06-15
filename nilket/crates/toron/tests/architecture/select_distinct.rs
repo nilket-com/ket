@@ -73,12 +73,10 @@ pub(crate) fn adr231_distinct_adds_no_new_execution_plan_or_executor_op() {
 }
 
 #[test]
-pub(crate) fn adr231_distinct_first_cut_fences_subqueries_and_aggregates() {
+pub(crate) fn adr231_distinct_first_cut_retains_top_level_aggregate_fences() {
 	let planner = source("src/sql_planner.rs");
 	let binder = binder_source();
 	let lower_select = source_block(&planner, "fn lower_select");
-	let derived_select = source_block(&planner, "fn validate_derived_select_shape");
-	let exists_select = source_block(&planner, "fn validate_exists_select_shape");
 	let distinct_fence = source_block(&binder, "fn distinct_input_unsupported_message");
 
 	for required in [
@@ -88,15 +86,12 @@ pub(crate) fn adr231_distinct_first_cut_fences_subqueries_and_aggregates() {
 		"unsupported(\"DISTINCT with HAVING is not supported\")",
 		"\"DISTINCT with aggregate projections is not supported\"",
 		"\"DISTINCT with window functions is not supported\"",
-		"unsupported(\"DISTINCT over derived tables is not supported\")",
 	] {
 		assert!(
 			lower_select.contains(required),
 			"lower_select lost {required}"
 		);
 	}
-	assert!(derived_select.contains("select.distinct.is_some()"));
-	assert!(exists_select.contains("select.distinct.is_some()"));
 	assert!(distinct_fence.contains("LogicalPlan::Aggregate { .. }"));
 	assert!(distinct_fence.contains("DISTINCT over aggregate inputs is not supported"));
 }
@@ -222,29 +217,23 @@ pub(crate) fn adr232_distinct_join_ordinal_safe() {
 }
 
 #[test]
-pub(crate) fn adr232_distinct_retains_aggregate_derived_exists_fences() {
+pub(crate) fn adr232_distinct_retains_top_level_aggregate_fences() {
 	let planner = source("src/sql_planner.rs");
 	let tests = source("tests/group_by_test.rs");
 	let lower_select = source_block(&planner, "fn lower_select");
-	let derived_select = source_block(&planner, "fn validate_derived_select_shape");
-	let exists_select = source_block(&planner, "fn validate_exists_select_shape");
 
 	for required in [
 		"unsupported(\"DISTINCT with GROUP BY is not supported\")",
 		"unsupported(\"DISTINCT with HAVING is not supported\")",
 		"\"DISTINCT with aggregate projections is not supported\"",
 		"\"DISTINCT with window functions is not supported\"",
-		"unsupported(\"DISTINCT over derived tables is not supported\")",
 	] {
 		assert!(
 			lower_select.contains(required),
 			"lower_select lost {required}"
 		);
 	}
-	assert!(derived_select.contains("select.distinct.is_some()"));
-	assert!(exists_select.contains("select.distinct.is_some()"));
 	assert!(tests.contains("distinct_over_aggregate_inputs_still_rejects"));
-	assert!(tests.contains("distinct_in_subquery_is_explicit_unsupported"));
 	assert!(tests.contains("public_group_by_without_aggregate_still_rejects"));
 }
 
@@ -268,6 +257,127 @@ pub(crate) fn adr232_distinct_join_adds_no_physical_or_optimizer_surface() {
 			"{relative} must not grow a join-DISTINCT runtime surface"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr234_distinct_aggregate_rewrites_to_project_distinct_then_existing_aggregate() {
+	let planner = source("src/sql_planner.rs");
+	let lower_select = source_block(&planner, "fn lower_select");
+	let rewrite = source_block(&planner, "fn build_distinct_aggregate_rewrite");
+	let wrapper = source_block(&planner, "impl DistinctAggregateRewrite");
+	let tests = source("tests/group_by_test.rs");
+
+	assert!(planner.contains("struct DistinctAggregateRewrite"));
+	assert!(lower_select.contains("distinct_rewrite"));
+	assert!(lower_select.contains("rewrite.wrap_input(plan)"));
+	assert!(wrapper.contains("LogicalPlan::Distinct"));
+	assert!(wrapper.contains("LogicalPlan::Project"));
+	assert!(rewrite.contains("dedup_exprs.push(key.expr.clone())"));
+	assert!(rewrite.contains("dedup_exprs.push(first_arg.clone())"));
+	assert!(rewrite.contains("group_expr.push(Expr::column(key.name.clone()))"));
+	assert!(tests.contains("count_distinct_ignores_null_and_rewrites_to_count_arg"));
+	assert!(tests.contains("count_distinct_over_join_uses_distinct_below_group_exchange"));
+}
+
+#[test]
+pub(crate) fn adr234_distinct_aggregate_keeps_aggregate_function_enum_flagless() {
+	let ir = source("src/ir.rs");
+	let aggregate_function = ir
+		.split("pub enum AggregateFunction")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("AggregateFunction enum");
+	let aggregate_plan = source_block(&ir, "Aggregate {");
+
+	assert!(!aggregate_function.contains("Distinct"));
+	assert!(!aggregate_function.contains("distinct"));
+	assert!(aggregate_plan.contains("aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>"));
+	assert!(!aggregate_plan.contains("distinct"));
+}
+
+#[test]
+pub(crate) fn adr234_count_distinct_rewrites_to_count_arg_not_count_all() {
+	let planner = source("src/sql_planner.rs");
+	let tests = source("tests/group_by_test.rs");
+	let distinct_arg = source_block(&planner, "fn distinct_aggregate_plain_column_arg");
+
+	assert!(distinct_arg.contains("AggregateFunction::Count"));
+	assert!(!distinct_arg.contains("AggregateFunction::CountAll"));
+	assert!(tests.contains("assert!(matches!(aggr_expr[0].0, AggregateFunction::Count));"));
+	assert!(tests.contains("assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)])"));
+}
+
+#[test]
+pub(crate) fn adr234_distinct_aggregate_retains_multi_dedup_fanout_fences() {
+	let planner = source("src/sql_planner.rs");
+	let rewrite = source_block(&planner, "fn build_distinct_aggregate_rewrite");
+	let plain_arg = source_block(&planner, "fn distinct_aggregate_plain_column_arg");
+	let tests = source("tests/group_by_test.rs");
+
+	assert!(
+		rewrite.contains("mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out")
+	);
+	assert!(rewrite.contains("multiple DISTINCT aggregate arguments require multi-dedup fan-out"));
+	assert!(plain_arg.contains("AVG(DISTINCT) requires multi-dedup fan-out"));
+	assert!(
+		plain_arg.contains("computed DISTINCT aggregate arguments require multi-dedup fan-out")
+	);
+	assert!(tests.contains("distinct_aggregate_retains_multi_dedup_fanout_fences"));
+}
+
+#[test]
+pub(crate) fn adr234_derived_distinct_reuses_232_ordinal_safe_binder() {
+	let planner = source("src/sql_planner.rs");
+	let binder = binder_source();
+	let lower_select = source_block(&planner, "fn lower_select");
+	let derived_select = source_block(&planner, "fn validate_derived_select_shape");
+	let all_columns = source_block(&binder, "fn all_output_columns_program");
+	let tests = source("tests/group_by_test.rs");
+
+	assert!(!lower_select.contains("DISTINCT over derived tables is not supported"));
+	assert!(!derived_select.contains("select.distinct.is_some()"));
+	assert!(lower_select.contains("wrap_distinct_if_needed(plan, distinct_requested)"));
+	assert!(all_columns.contains("ColumnOrdinal(u32::try_from(idx)"));
+	assert!(!all_columns.contains("resolve_column("));
+	assert!(tests.contains("distinct_over_and_inside_derived_tables_is_supported"));
+}
+
+#[test]
+pub(crate) fn adr234_exists_distinct_is_inert_and_decorrelates_without_distinct_plan() {
+	let planner = source("src/sql_planner.rs");
+	let exists_select = source_block(&planner, "fn validate_exists_select_shape");
+	let exists_join = source_block(&planner, "fn lower_exists_join");
+	let tests = source("tests/group_by_test.rs");
+
+	assert!(!exists_select.contains("select.distinct.is_some()"));
+	assert!(exists_join.contains("validate_exists_select_shape(select)?"));
+	assert!(!exists_join.contains("LogicalPlan::Distinct"));
+	assert!(exists_join.contains("JoinKind::LeftSemi"));
+	assert!(tests.contains("distinct_inside_exists_is_accepted_and_stripped"));
+}
+
+#[test]
+pub(crate) fn adr234_adds_no_physical_fragmenter_optimizer_or_wendelon_surface() {
+	let execution_plan = source_block(&source("src/ir/execution.rs"), "pub enum ExecutionPlan");
+	let fragment = source("src/distributed/fragment.rs");
+
+	assert!(!execution_plan.contains("\n\tDistinct {"));
+	assert!(!fragment.contains("ExecutionPlan::Distinct"));
+	for relative in [
+		"src/binder/runtime_evidence.rs",
+		"src/binder/decision_log.rs",
+		"src/daemon.rs",
+		"src/wire.rs",
+	] {
+		let source = source(relative);
+		assert!(!source.contains("DistinctAggregateRewrite"));
+	}
+	let wendelon = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<String>();
+	assert!(!wendelon.contains("DistinctAggregateRewrite"));
+	assert!(!wendelon.contains("ExecutionPlan::Distinct"));
 }
 
 #[test]
@@ -323,7 +433,7 @@ pub(crate) fn adr233_group_by_join_lowers_through_existing_aggregate_no_new_op()
 }
 
 #[test]
-pub(crate) fn adr233_group_by_join_retains_no_aggregate_distinct_and_derived_fences() {
+pub(crate) fn adr233_group_by_join_retains_top_level_distinct_and_derived_shape_fences() {
 	let planner = source("src/sql_planner.rs");
 	let tests = source("tests/group_by_test.rs");
 	let lower_select = source_block(&planner, "fn lower_select");
@@ -334,7 +444,6 @@ pub(crate) fn adr233_group_by_join_retains_no_aggregate_distinct_and_derived_fen
 		"unsupported(\"DISTINCT with GROUP BY is not supported\")",
 		"unsupported(\"DISTINCT with HAVING is not supported\")",
 		"\"DISTINCT with aggregate projections is not supported\"",
-		"unsupported(\"DISTINCT over derived tables is not supported\")",
 		"GROUP BY requires at least one aggregate call",
 	] {
 		assert!(

@@ -2182,7 +2182,7 @@ pub(crate) fn adr115_derived_query_tail_fence_lifted_only() {
 	}
 	assert!(exists.contains("query.order_by.is_some()"));
 	assert!(exists.contains("query_has_limit_or_offset"));
-	assert!(derived_select.contains("select.distinct.is_some()"));
+	assert!(!derived_select.contains("select.distinct.is_some()"));
 	assert!(derived_select.contains("!select.sort_by.is_empty()"));
 }
 

@@ -1606,6 +1606,137 @@ async fn distinct_join_lowers_to_existing_empty_aggregate_no_new_execution_op() 
 	);
 }
 
+#[tokio::test]
+async fn count_distinct_ignores_null_and_rewrites_to_count_arg() {
+	let logical = plan_sql("SELECT COUNT(DISTINCT amount) FROM sales");
+	let LogicalPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+	} = &logical
+	else {
+		panic!("expected aggregate over distinct input, got {logical:?}");
+	};
+	assert!(group_expr.is_empty());
+	assert_eq!(aggr_expr.len(), 1);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Count));
+	assert_column(&aggr_expr[0].1[0], "amount");
+	let LogicalPlan::Distinct { input } = input.as_ref() else {
+		panic!("expected pre-aggregate distinct, got {input:?}");
+	};
+	assert!(matches!(input.as_ref(), LogicalPlan::Project { .. }));
+
+	let results = run_logical(&logical).await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(4)]);
+}
+
+#[tokio::test]
+async fn count_distinct_grouped_dedups_per_group() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, COUNT(DISTINCT amount) FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_count_rows(&results),
+		vec![
+			(None, 1),
+			(Some("east".to_string()), 2),
+			(Some("west".to_string()), 1),
+		]
+	);
+}
+
+#[tokio::test]
+async fn distinct_aggregate_having_rewrites_same_distinct_call() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, COUNT(DISTINCT amount) FROM sales \
+		 GROUP BY region HAVING COUNT(DISTINCT amount) > 1",
+	))
+	.await;
+	assert_eq!(
+		region_count_rows(&results),
+		vec![(Some("east".to_string()), 2)]
+	);
+}
+
+#[tokio::test]
+async fn sum_min_max_distinct_grouped_share_existing_dedup() {
+	let sum = run_logical(&plan_sql(
+		"SELECT region, SUM(DISTINCT amount) FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&sum),
+		vec![
+			(None, Some(7)),
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+		]
+	);
+
+	let min_max = run_logical(&plan_sql(
+		"SELECT region, MIN(DISTINCT amount), MAX(DISTINCT amount) \
+		 FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_min_amount_max_amount_rows(&min_max),
+		vec![
+			(None, Some(7), Some(7)),
+			(Some("east".to_string()), Some(10), Some(30)),
+			(Some("west".to_string()), Some(20), Some(20)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn count_distinct_over_join_uses_distinct_below_group_exchange() {
+	let logical = plan_sql(
+		"SELECT left_dups.label, COUNT(DISTINCT right_dups.tier) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label",
+	);
+	let LogicalPlan::Aggregate { input, .. } = &logical else {
+		panic!("expected aggregate, got {logical:?}");
+	};
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected group exchange below aggregate, got {input:?}");
+	};
+	let LogicalPlan::Distinct { input } = input.as_ref() else {
+		panic!("expected distinct below group exchange, got {input:?}");
+	};
+	assert!(
+		contains_logical_join(input),
+		"distinct aggregate dedup must run after join output is projected"
+	);
+
+	let results = run_logical(&logical).await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 1), (Some("B".to_string()), 1)]
+	);
+}
+
+#[test]
+fn distinct_aggregate_retains_multi_dedup_fanout_fences() {
+	assert_unsupported_message(
+		"SELECT COUNT(DISTINCT amount), SUM(price) FROM sales",
+		"mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out",
+	);
+	assert_unsupported_message(
+		"SELECT COUNT(DISTINCT amount), COUNT(DISTINCT id) FROM sales",
+		"multiple DISTINCT aggregate arguments require multi-dedup fan-out",
+	);
+	assert_unsupported_message(
+		"SELECT AVG(DISTINCT amount) FROM sales",
+		"AVG(DISTINCT) requires multi-dedup fan-out",
+	);
+	assert_unsupported_message(
+		"SELECT COUNT(DISTINCT amount + 1) FROM sales",
+		"computed DISTINCT aggregate arguments require multi-dedup fan-out",
+	);
+}
+
 #[test]
 fn public_group_by_without_aggregate_still_rejects() {
 	assert_unsupported_message(
@@ -1693,13 +1824,49 @@ async fn rune_group_by_over_join_matches_sql_plan_and_rows() {
 	);
 }
 
-#[test]
-fn distinct_in_subquery_is_explicit_unsupported() {
-	assert_unsupported("SELECT region FROM (SELECT DISTINCT region FROM sales) s");
-	assert_unsupported("SELECT * FROM sales WHERE EXISTS (SELECT DISTINCT region FROM regions)");
-	assert_unsupported_message(
-		"SELECT DISTINCT region FROM (SELECT region FROM sales) s",
-		"DISTINCT over derived tables is not supported",
+#[tokio::test]
+async fn distinct_over_and_inside_derived_tables_is_supported() {
+	let outer = plan_sql("SELECT DISTINCT region FROM (SELECT region FROM sales) s");
+	assert!(matches!(outer, LogicalPlan::Distinct { .. }));
+	assert_eq!(
+		sorted_utf8_column_rows(&run_logical(&outer).await, 0),
+		vec![None, Some("east".to_string()), Some("west".to_string())]
+	);
+
+	let inner = plan_sql("SELECT region FROM (SELECT DISTINCT region FROM sales) s");
+	assert!(
+		contains_logical_distinct(&inner),
+		"DISTINCT inside derived table should lower to the existing marker"
+	);
+	assert_eq!(
+		sorted_utf8_column_rows(&run_logical(&inner).await, 0),
+		vec![None, Some("east".to_string()), Some("west".to_string())]
+	);
+
+	let duplicate_names =
+		plan_sql("SELECT DISTINCT * FROM (SELECT region AS x, status AS x FROM sales) s");
+	assert_eq!(row_count(&run_logical(&duplicate_names).await), 4);
+}
+
+#[tokio::test]
+async fn distinct_inside_exists_is_accepted_and_stripped() {
+	let logical = plan_sql(
+		"SELECT region FROM sales \
+		 WHERE EXISTS (SELECT DISTINCT region FROM regions WHERE regions.region = sales.region)",
+	);
+	assert!(
+		!contains_logical_distinct(&logical),
+		"EXISTS-internal DISTINCT should be existence-inert and not build a Distinct plan"
+	);
+	assert_eq!(
+		sorted_utf8_column_rows(&run_logical(&logical).await, 0),
+		vec![
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("west".to_string()),
+			Some("west".to_string()),
+		]
 	);
 }
 
@@ -1976,7 +2143,6 @@ async fn avg_bind_with_float64_output_and_numeric_domain() {
 fn min_max_aggregate_rejects_invalid_and_unselected_references() {
 	assert_unsupported_message("SELECT MIN() FROM sales", "MIN requires one argument");
 	assert_unsupported("SELECT MIN(*) FROM sales");
-	assert_unsupported("SELECT MIN(DISTINCT amount) FROM sales");
 	assert_project_over_aggregate(&plan_sql(
 		"SELECT MIN(amount), MIN(amount) FROM sales HAVING MIN(amount) > 0",
 	));
@@ -4371,6 +4537,60 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 	}
 }
 
+fn contains_logical_join(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Join { .. } => true,
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Distinct { input }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. } => contains_logical_join(input),
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::Explain { .. }
+		| LogicalPlan::ExplainAnalyze { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => false,
+	}
+}
+
+fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Distinct { .. } => true,
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. } => contains_logical_distinct(input),
+		LogicalPlan::Join { left, right, .. } => {
+			contains_logical_distinct(left) || contains_logical_distinct(right)
+		}
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::Explain { .. }
+		| LogicalPlan::ExplainAnalyze { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => false,
+	}
+}
+
 fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 	match plan {
 		ExecutionPlan::Sort { .. } => true,
@@ -4683,6 +4903,49 @@ fn region_min_amount_max_id_rows(
 			rows.push((region, min, max));
 		}
 	}
+	rows
+}
+
+fn region_min_amount_max_amount_rows(
+	results: &[RecordBatch],
+) -> Vec<(Option<String>, Option<i32>, Option<i32>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let mins = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("min amount column");
+		let maxes = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("max amount column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let min = if mins.is_null(row) {
+				None
+			} else {
+				Some(mins.value(row))
+			};
+			let max = if maxes.is_null(row) {
+				None
+			} else {
+				Some(maxes.value(row))
+			};
+			rows.push((region, min, max));
+		}
+	}
+	rows.sort_by(|left, right| left.0.cmp(&right.0));
 	rows
 }
 

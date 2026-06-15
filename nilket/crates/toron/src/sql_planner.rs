@@ -13,12 +13,13 @@ use arrow::datatypes::{DataType, TimeUnit};
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, DateTimeField,
-	Delete, DescribeAlias, Distinct, ExactNumberInfo, Expr as SqlExpr, FromTable, Function,
-	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
-	HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint, JoinOperator,
-	LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle,
-	OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-	TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString, UnaryOperator, Value,
+	Delete, DescribeAlias, Distinct, DuplicateTreatment, ExactNumberInfo, Expr as SqlExpr,
+	FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+	GroupByExpr, HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint,
+	JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint,
+	OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+	TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString,
+	UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3445,9 +3446,6 @@ impl SqlPlanner {
 		}
 
 		let table_with_joins = &from[0];
-		if distinct_requested && table_factor_is_derived(&table_with_joins.relation) {
-			return Err(unsupported("DISTINCT over derived tables is not supported"));
-		}
 		let all_inner_join_chain = table_with_joins.joins.iter().all(|join| {
 			join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
 		});
@@ -3528,6 +3526,7 @@ impl SqlPlanner {
 				aggr_expr,
 				catalog,
 				final_projection,
+				distinct_rewrite,
 			} = self.lower_aggregate_projection(
 				projection,
 				having.as_ref(),
@@ -3541,6 +3540,15 @@ impl SqlPlanner {
 			if aggr_expr.is_empty() {
 				return Err(unsupported("GROUP BY requires at least one aggregate call"));
 			}
+			let (plan, group_expr, aggr_expr) = if let Some(rewrite) = distinct_rewrite {
+				(
+					rewrite.wrap_input(plan),
+					rewrite.group_expr,
+					rewrite.aggr_expr,
+				)
+			} else {
+				(plan, group_expr, aggr_expr)
+			};
 			let aggregate = LogicalPlan::Aggregate {
 				input: Box::new(LogicalPlan::Exchange {
 					input: Box::new(plan),
@@ -3580,12 +3588,18 @@ impl SqlPlanner {
 				aggr_expr,
 				catalog,
 				final_projection,
+				distinct_rewrite,
 			} = self.lower_aggregate_projection(
 				projection,
 				having.as_ref(),
 				&[],
 				AggregateSqlMode::Global,
 			)?;
+			let (plan, aggr_expr) = if let Some(rewrite) = distinct_rewrite {
+				(rewrite.wrap_input(plan), rewrite.aggr_expr)
+			} else {
+				(plan, aggr_expr)
+			};
 			let aggregate = LogicalPlan::Aggregate {
 				input: Box::new(plan),
 				group_expr: vec![],
@@ -3764,10 +3778,14 @@ impl SqlPlanner {
 			self.discover_aggregate_calls(having, mode, AggregateSource::Having, &mut catalog)?;
 		}
 		catalog.reject_having_alias_references(having)?;
+		let distinct_rewrite = build_distinct_aggregate_rewrite(&catalog)?;
 
 		let final_projection = self.lower_final_aggregate_projection(projection, mode, &catalog)?;
 		let project_required = final_projection.required;
-		let aggr_expr = catalog.aggr_expr();
+		let aggr_expr = distinct_rewrite
+			.as_ref()
+			.map(|rewrite| rewrite.aggr_expr.clone())
+			.unwrap_or_else(|| catalog.aggr_expr());
 		let final_output_names = if project_required {
 			final_projection.derived_output_names()
 		} else {
@@ -3782,6 +3800,7 @@ impl SqlPlanner {
 				exprs: final_projection.exprs,
 				output_names: final_projection.output_names,
 			}),
+			distinct_rewrite,
 		})
 	}
 
@@ -3894,9 +3913,8 @@ impl SqlPlanner {
 		scope: &AggregateOutputCatalog,
 		clause: &'static str,
 	) -> Result<String, FrontendError> {
-		let (function, args) =
-			self.lower_aggregate_function(function, AggregateSqlMode::Grouped)?;
-		let signature = grouped_aggregate_signature(&function, &args)
+		let call = self.lower_aggregate_function(function, AggregateSqlMode::Grouped)?;
+		let signature = grouped_aggregate_signature(&call.function, &call.args, call.distinct)
 			.ok_or_else(|| unsupported(aggregate_call_not_in_select_message(clause)))?;
 		let outcome = match clause {
 			"HAVING" => scope.resolve_for_having(&signature),
@@ -3925,11 +3943,11 @@ impl SqlPlanner {
 		if let SqlExpr::Function(function) = strip_nested_sql_expr(expr)
 			&& aggregate_function_name(&function.name).is_some()
 		{
-			let (function, args) = self.lower_aggregate_function(function, mode)?;
+			let call = self.lower_aggregate_function(function, mode)?;
 			let visible_name = alias
 				.map(|alias| alias.value.clone())
-				.unwrap_or_else(|| aggregate_output_name(&function).to_string());
-			let index = catalog.add_requirement(function, args, AggregateSource::Select);
+				.unwrap_or_else(|| aggregate_output_name(&call.function).to_string());
+			let index = catalog.add_requirement(call, AggregateSource::Select);
 			catalog.mark_order_by_visible(index, visible_name);
 			return Ok(());
 		}
@@ -3945,8 +3963,8 @@ impl SqlPlanner {
 	) -> Result<(), FrontendError> {
 		match strip_nested_sql_expr(expr) {
 			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
-				let (function, args) = self.lower_aggregate_function(function, mode)?;
-				catalog.add_requirement(function, args, source);
+				let call = self.lower_aggregate_function(function, mode)?;
+				catalog.add_requirement(call, source);
 				Ok(())
 			}
 			SqlExpr::Function(function) => {
@@ -4070,9 +4088,10 @@ impl SqlPlanner {
 	) -> Result<SqlExpr, FrontendError> {
 		match expr {
 			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
-				let (function, args) = self.lower_aggregate_function(function, mode)?;
-				let signature = grouped_aggregate_signature(&function, &args)
-					.ok_or_else(|| unsupported("unsupported aggregate projection item"))?;
+				let call = self.lower_aggregate_function(function, mode)?;
+				let signature =
+					grouped_aggregate_signature(&call.function, &call.args, call.distinct)
+						.ok_or_else(|| unsupported("unsupported aggregate projection item"))?;
 				match catalog.resolve_for_projection(&signature) {
 					ResolveOutcome::Found(output_name) => {
 						Ok(SqlExpr::Identifier(Ident::new(output_name)))
@@ -4196,12 +4215,12 @@ impl SqlPlanner {
 		&self,
 		function: &Function,
 		mode: AggregateSqlMode,
-	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+	) -> Result<LoweredAggregateCall, FrontendError> {
 		let name = aggregate_function_name(&function.name)
 			.ok_or_else(|| unsupported("unsupported aggregate function"))?;
-		let args = aggregate_function_args(function)?;
+		let AggregateFunctionArgs { args, distinct } = aggregate_function_args(function)?;
 
-		match name {
+		let (function, args) = match name {
 			"COUNT" => self.lower_count_aggregate(args),
 			"SUM" => self.lower_sum_aggregate(args),
 			"MIN" => self.lower_min_aggregate(args),
@@ -4224,7 +4243,12 @@ impl SqlPlanner {
 				self.lower_approx_quantile_aggregate(args)
 			}
 			_ => Err(unsupported("unsupported aggregate function")),
-		}
+		}?;
+		Ok(LoweredAggregateCall {
+			function,
+			args,
+			distinct,
+		})
 	}
 
 	fn lower_count_aggregate(
@@ -5416,12 +5440,33 @@ struct AggregateProjection {
 	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
 	catalog: AggregateOutputCatalog,
 	final_projection: Option<FinalProjection>,
+	distinct_rewrite: Option<DistinctAggregateRewrite>,
 }
 
 #[derive(Debug)]
 struct FinalProjection {
 	exprs: Vec<Expr>,
 	output_names: Vec<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct DistinctAggregateRewrite {
+	dedup_exprs: Vec<Expr>,
+	dedup_output_names: Vec<Option<String>>,
+	group_expr: Vec<Expr>,
+	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
+}
+
+impl DistinctAggregateRewrite {
+	fn wrap_input(&self, input: LogicalPlan) -> LogicalPlan {
+		LogicalPlan::Distinct {
+			input: Box::new(LogicalPlan::Project {
+				input: Box::new(input),
+				exprs: self.dedup_exprs.clone(),
+				output_names: self.dedup_output_names.clone(),
+			}),
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -5443,6 +5488,13 @@ impl LoweredAggregateProjection {
 			})
 			.collect()
 	}
+}
+
+#[derive(Debug, Clone)]
+struct LoweredAggregateCall {
+	function: AggregateFunction,
+	args: Vec<Expr>,
+	distinct: bool,
 }
 
 #[derive(Debug)]
@@ -5472,13 +5524,13 @@ impl AggregateOutputCatalog {
 		}
 	}
 
-	fn add_requirement(
-		&mut self,
-		function: AggregateFunction,
-		args: Vec<Expr>,
-		source: AggregateSource,
-	) -> usize {
-		let signature = grouped_aggregate_signature(&function, &args);
+	fn add_requirement(&mut self, call: LoweredAggregateCall, source: AggregateSource) -> usize {
+		let LoweredAggregateCall {
+			function,
+			args,
+			distinct,
+		} = call;
+		let signature = grouped_aggregate_signature(&function, &args, distinct);
 		if let Some(signature) = signature.as_ref()
 			&& let Some(index) = self
 				.entries
@@ -5498,6 +5550,7 @@ impl AggregateOutputCatalog {
 		self.entries.push(AggregateOutputEntry {
 			function,
 			args,
+			distinct,
 			signature,
 			natural_name,
 			in_select: matches!(source, AggregateSource::Select),
@@ -5608,10 +5661,112 @@ impl AggregateOutputCatalog {
 	}
 }
 
+fn build_distinct_aggregate_rewrite(
+	catalog: &AggregateOutputCatalog,
+) -> Result<Option<DistinctAggregateRewrite>, FrontendError> {
+	if catalog.entries.iter().all(|entry| !entry.distinct) {
+		return Ok(None);
+	}
+	if catalog.entries.iter().any(|entry| !entry.distinct) {
+		return Err(unsupported(
+			"mixed DISTINCT and non-DISTINCT aggregates require multi-dedup fan-out",
+		));
+	}
+
+	let first_arg = distinct_aggregate_plain_column_arg(&catalog.entries[0])?;
+	for entry in &catalog.entries {
+		let arg = distinct_aggregate_plain_column_arg(entry)?;
+		if !expr_structural_eq(
+			&canonical_aggregate_signature_expr(&arg),
+			&canonical_aggregate_signature_expr(&first_arg),
+		) {
+			return Err(unsupported(
+				"multiple DISTINCT aggregate arguments require multi-dedup fan-out",
+			));
+		}
+	}
+
+	let mut dedup_exprs = Vec::with_capacity(catalog.group_keys.len() + 1);
+	let mut dedup_output_names = Vec::with_capacity(catalog.group_keys.len() + 1);
+	let mut group_expr = Vec::with_capacity(catalog.group_keys.len());
+	for key in &catalog.group_keys {
+		dedup_exprs.push(key.expr.clone());
+		dedup_output_names.push(Some(key.name.clone()));
+		group_expr.push(Expr::column(key.name.clone()));
+	}
+
+	let distinct_arg_output = catalog
+		.group_keys
+		.iter()
+		.find(|key| {
+			expr_structural_eq(
+				&canonical_aggregate_signature_expr(&key.expr),
+				&canonical_aggregate_signature_expr(&first_arg),
+			)
+		})
+		.map(|key| key.name.clone())
+		.unwrap_or_else(|| {
+			let mut name = logical_expr_output_name(&first_arg, catalog.group_keys.len());
+			if catalog.group_keys.iter().any(|key| key.name == name) {
+				name = "__toron_distinct_arg".to_string();
+			}
+			dedup_exprs.push(first_arg.clone());
+			dedup_output_names.push(Some(name.clone()));
+			name
+		});
+
+	let aggr_expr = catalog
+		.entries
+		.iter()
+		.map(|entry| {
+			(
+				entry.function.clone(),
+				vec![Expr::column(distinct_arg_output.clone())],
+			)
+		})
+		.collect();
+
+	Ok(Some(DistinctAggregateRewrite {
+		dedup_exprs,
+		dedup_output_names,
+		group_expr,
+		aggr_expr,
+	}))
+}
+
+fn distinct_aggregate_plain_column_arg(
+	entry: &AggregateOutputEntry,
+) -> Result<Expr, FrontendError> {
+	match entry.function {
+		AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max => {}
+		AggregateFunction::Avg => {
+			return Err(unsupported("AVG(DISTINCT) requires multi-dedup fan-out"));
+		}
+		_ => {
+			return Err(unsupported("unsupported DISTINCT aggregate function"));
+		}
+	}
+	let [arg] = entry.args.as_slice() else {
+		return Err(unsupported(
+			"DISTINCT aggregate arguments require one plain column",
+		));
+	};
+	if !matches!(arg, Expr::Column(_)) {
+		return Err(unsupported(
+			"computed DISTINCT aggregate arguments require multi-dedup fan-out",
+		));
+	}
+	Ok(arg.clone())
+}
+
 #[derive(Debug)]
 struct AggregateOutputEntry {
 	function: AggregateFunction,
 	args: Vec<Expr>,
+	distinct: bool,
 	signature: Option<GroupedAggregateSignature>,
 	natural_name: String,
 	in_select: bool,
@@ -5632,11 +5787,13 @@ impl AggregateOutputEntry {
 struct GroupedAggregateSignature {
 	kernel: aggregate_kernel::StableAggregateKernel,
 	args: Vec<Expr>,
+	distinct: bool,
 }
 
 impl PartialEq for GroupedAggregateSignature {
 	fn eq(&self, other: &Self) -> bool {
 		self.kernel == other.kernel
+			&& self.distinct == other.distinct
 			&& self.args.len() == other.args.len()
 			&& self
 				.args
@@ -5651,6 +5808,7 @@ impl Eq for GroupedAggregateSignature {}
 impl Hash for GroupedAggregateSignature {
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.kernel.hash(state);
+		self.distinct.hash(state);
 		self.args.len().hash(state);
 		for arg in &self.args {
 			hash_expr_structural(arg, state);
@@ -6594,8 +6752,8 @@ fn aggregate_projection_matches_natural(
 		if aggregate_function_name(&function.name).is_none() {
 			return Ok(false);
 		}
-		let (function, args) = planner.lower_aggregate_function(function, mode)?;
-		let signature = grouped_aggregate_signature(&function, &args);
+		let call = planner.lower_aggregate_function(function, mode)?;
+		let signature = grouped_aggregate_signature(&call.function, &call.args, call.distinct);
 		if entry.signature.is_some() && signature != entry.signature {
 			return Ok(false);
 		}
@@ -6752,6 +6910,7 @@ fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
 fn grouped_aggregate_signature(
 	function: &AggregateFunction,
 	args: &[Expr],
+	distinct: bool,
 ) -> Option<GroupedAggregateSignature> {
 	let kernel = aggregate_kernel::stable_kernel_for_function(function)?;
 	let spec = aggregate_kernel::stable_spec(kernel);
@@ -6762,11 +6921,13 @@ fn grouped_aggregate_signature(
 		aggregate_kernel::AggregateArity::Zero => Some(GroupedAggregateSignature {
 			kernel,
 			args: Vec::new(),
+			distinct,
 		}),
 		aggregate_kernel::AggregateArity::One if args.len() == 1 => {
 			Some(GroupedAggregateSignature {
 				kernel,
 				args: vec![canonical_aggregate_signature_expr(&args[0])],
+				distinct,
 			})
 		}
 		_ => None,
@@ -6890,7 +7051,14 @@ fn canonical_binary_signature_expr(
 	)
 }
 
-fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], FrontendError> {
+struct AggregateFunctionArgs<'a> {
+	args: &'a [FunctionArg],
+	distinct: bool,
+}
+
+fn aggregate_function_args(
+	function: &Function,
+) -> Result<AggregateFunctionArgs<'_>, FrontendError> {
 	// P0.4: global experimental aggregate calls still lower to the existing IR; the binder's
 	// allow_experimental_kernels gate remains the authority for executing those kernels.
 	if function.uses_odbc_syntax
@@ -6913,12 +7081,21 @@ fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], Fronte
 	else {
 		return Err(unsupported("aggregate function requires arguments"));
 	};
-	if duplicate_treatment.is_some() || !clauses.is_empty() {
+	let distinct = match duplicate_treatment {
+		None => false,
+		Some(DuplicateTreatment::Distinct) => true,
+		Some(DuplicateTreatment::All) => {
+			return Err(unsupported(
+				"aggregate function modifiers are not supported",
+			));
+		}
+	};
+	if !clauses.is_empty() {
 		return Err(unsupported(
 			"aggregate function modifiers are not supported",
 		));
 	}
-	Ok(args)
+	Ok(AggregateFunctionArgs { args, distinct })
 }
 
 fn table_factor_is_derived(factor: &TableFactor) -> bool {
@@ -7042,8 +7219,7 @@ fn validate_derived_query_shape(query: &Query) -> Result<&Select, FrontendError>
 }
 
 fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
-	if select.distinct.is_some()
-		|| select.top.is_some()
+	if select.top.is_some()
 		|| select.into.is_some()
 		|| !select.lateral_views.is_empty()
 		|| select.prewhere.is_some()
@@ -7081,8 +7257,7 @@ fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
 }
 
 fn validate_exists_select_shape(select: &Select) -> Result<(), FrontendError> {
-	if select.distinct.is_some()
-		|| select.top.is_some()
+	if select.top.is_some()
 		|| select.into.is_some()
 		|| select.from.len() != 1
 		|| !select.from[0].joins.is_empty()
