@@ -224,6 +224,25 @@ struct SetOpProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+/// ADR 236 cross-producer cardinal rule:
+/// - the expected value must be unreachable from a single producer / non-merging consumer;
+/// - `unique_selected_worker_count > 1` is supporting evidence, not the proof;
+/// - the fixture must place a discriminating key or row group on more than one producer.
+fn assert_cross_producer_cardinal_is_value_discriminating(
+	selected_workers: &[WorkerId],
+	discriminator: &str,
+) {
+	assert!(
+		!discriminator.trim().is_empty(),
+		"cross-producer cardinal must document why the expected value is the discriminator"
+	);
+	assert_eq!(
+		unique_selected_worker_count(selected_workers),
+		2,
+		"fixture must exercise more than one worker; value discriminator: {discriminator}"
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_process_distributed_query_digest_is_canonical() {
 	let first = run_process_query(100, 0).await;
@@ -422,6 +441,78 @@ async fn union_all_scans_both_arms_across_workers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_projection_fidelity_selects_nonzero_column() {
+	let run = run_set_op_process_query(
+		1_386,
+		0,
+		"SELECT set_left.set_key FROM set_left UNION ALL SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![None, None, None, Some(7), Some(9), Some(9), Some(10)],
+		"projecting ordinal 1 must return set_key values, not id values"
+	);
+	assert_ne!(
+		run.rows,
+		vec![
+			Some(1),
+			Some(2),
+			Some(3),
+			Some(4),
+			Some(10),
+			Some(11),
+			Some(12)
+		],
+		"ignoring projected_columns would expose the ordinal-0 id values"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"UNION ALL over set_left/set_right uses ScanShare producers; ordinal-1 NULL and 7/9/10 \
+		 values cannot be produced by returning ordinal-0 ids",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_projection_fidelity_preserves_nullable_column() {
+	let run = run_set_op_process_query(
+		1_388,
+		0,
+		"SELECT set_left.set_key FROM set_left UNION SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(run.rows, vec![None, Some(7), Some(9), Some(10)]);
+	assert!(
+		run.rows.iter().any(Option::is_none),
+		"projecting nullable set_key must preserve NULLs"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"UNION DISTINCT shuffles projected nullable set_key values from both fixture producers; \
+		 the NULL row is lost if projection nullability is not preserved",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_cross_producer_cardinal_is_value_discriminating() {
+	let run = run_set_op_process_query(
+		1_389,
+		0,
+		"SELECT set_left.set_key FROM set_left INTERSECT SELECT set_right.set_key FROM set_right",
+	)
+	.await;
+
+	assert_eq!(run.rows, vec![None, Some(9)]);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"INTERSECT result [NULL, 9] requires null-safe set membership over projected set_key values \
+		 contributed by set_left and set_right fixture producers; worker count alone is not the proof",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,
@@ -448,10 +539,10 @@ async fn intersect_null_safe_matching_across_partitions() {
 	.await;
 
 	assert_eq!(run.rows, vec![None, Some(9)]);
-	assert_eq!(
-		unique_selected_worker_count(&run.selected_workers),
-		2,
-		"INTERSECT fixture must exercise more than one worker"
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"INTERSECT result [NULL, 9] requires null-safe set membership over projected set_key values \
+		 contributed by set_left and set_right fixture producers",
 	);
 }
 
