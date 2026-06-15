@@ -251,6 +251,7 @@ fn join_kind_as_str(kind: JoinKind) -> &'static str {
 		JoinKind::RightSemi => "right_semi",
 		JoinKind::LeftAnti => "left_anti",
 		JoinKind::RightAnti => "right_anti",
+		JoinKind::Cross => "cross",
 	}
 }
 

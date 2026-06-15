@@ -254,7 +254,11 @@ impl RelationScope {
 		match kind {
 			JoinKind::LeftSemi | JoinKind::LeftAnti => left.with_schema(output_schema.clone()),
 			JoinKind::RightSemi | JoinKind::RightAnti => right.with_schema(output_schema.clone()),
-			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+			JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::LeftOuter
+			| JoinKind::RightOuter
+			| JoinKind::FullOuter => {
 				let mut entries = left.entries.clone();
 				let right_offset = ColumnOrdinal(
 					u32::try_from(left.schema.fields().len()).expect("column ordinal overflow"),
@@ -484,6 +488,9 @@ pub(super) fn choose_join_strategy(
 	config: &PlannerConfig,
 ) -> Result<JoinStrategyDecision, BindingError> {
 	let force_hash = config.force_hash_join_ids.contains(&replay_id);
+	if matches!(kind, JoinKind::Cross) {
+		return choose_cross_join_strategy(intent, left_input, right_input, config, force_hash);
+	}
 	match intent {
 		JoinStrategyIntent::Auto if force_hash => Ok(hash_join_decision(
 			HashByDefaultReason::HashAfterBroadcastCap,
@@ -526,6 +533,59 @@ pub(super) fn choose_join_strategy(
 			right_input,
 			config,
 		)),
+	}
+}
+
+/// ADR 239 D4: CROSS is broadcast-only. A hash-partition on the empty join key collapses every row
+/// to a single bucket, so a CROSS join must never fall back to — or be replayed as — a hash join.
+/// If no broadcast build side fits under the cap (a too-large build, a missing size fact, a pinned
+/// hash strategy, or a broadcast-cap replay forcing hash), fail loud rather than silently
+/// single-tasking on the empty-key hash.
+fn choose_cross_join_strategy(
+	intent: JoinStrategyIntent,
+	left_input: JoinInputOptimization,
+	right_input: JoinInputOptimization,
+	config: &PlannerConfig,
+	force_hash: bool,
+) -> Result<JoinStrategyDecision, BindingError> {
+	if force_hash {
+		return Err(cross_requires_broadcast_error());
+	}
+	match intent {
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			build_side,
+			..
+		} => {
+			let build_side = build_side.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: "pinned broadcast join requires an explicit build side".to_string(),
+			})?;
+			let placement = pinned_broadcast_placement(JoinKind::Cross, build_side)?;
+			Ok(JoinStrategyDecision {
+				strategy: JoinStrategy::Broadcast,
+				placement,
+				reason: JoinStrategyDecisionReason::PinnedByAuthor,
+			})
+		}
+		JoinStrategyIntent::Pinned { .. } => Err(cross_requires_broadcast_error()),
+		JoinStrategyIntent::Auto => {
+			let decision =
+				choose_auto_join_strategy(JoinKind::Cross, left_input, right_input, config);
+			if matches!(decision.strategy, JoinStrategy::Broadcast) {
+				Ok(decision)
+			} else {
+				Err(cross_requires_broadcast_error())
+			}
+		}
+	}
+}
+
+fn cross_requires_broadcast_error() -> BindingError {
+	BindingError::UnsupportedExpression {
+		message: "CROSS JOIN requires a broadcast-eligible build side under the broadcast cap; no \
+		          eligible side fits and a keyless hash-partition would collapse the cartesian to a \
+		          single bucket"
+			.to_string(),
 	}
 }
 
@@ -694,14 +754,24 @@ pub(super) fn broadcast_physical_placement(kind: JoinKind) -> BroadcastPlacement
 		JoinKind::LeftOuter | JoinKind::LeftSemi | JoinKind::LeftAnti => {
 			BroadcastPlacementRule::SwappedRightBuild
 		}
+		// ADR 239: CROSS is broadcast-only with a deterministic SQL right-build. Toron broadcast
+		// builds the physical left, so right-build is SwappedRightBuild; restore_declared_join_order_project
+		// then restores SQL-visible left-then-right column order.
+		JoinKind::Cross => BroadcastPlacementRule::SwappedRightBuild,
 		JoinKind::FullOuter => BroadcastPlacementRule::Never,
 	}
 }
 
 pub(super) fn safe_broadcast_physical_kind(kind: JoinKind) -> bool {
+	// ADR 239: CROSS is broadcast-only (keyless cartesian), so the binder-side broadcast shape guard
+	// accepts it alongside Inner and the right-build kinds.
 	matches!(
 		kind,
-		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
+		JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::RightOuter
+			| JoinKind::RightSemi
+			| JoinKind::RightAnti
 	)
 }
 
@@ -803,7 +873,7 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 			kind,
 			strategy,
 			..
-		} if *kind == JoinKind::Inner
+		} if matches!(kind, JoinKind::Inner | JoinKind::Cross)
 			&& *strategy == JoinStrategy::Broadcast
 			&& matches!(terminal_exchange(left), Some((1, _))) =>
 		{
@@ -1215,7 +1285,7 @@ pub(super) fn exchange_key_ordinals(key: &BoundExprProgram) -> Vec<ColumnOrdinal
 
 pub fn join_schema(kind: JoinKind, left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
 	let fields = match kind {
-		JoinKind::Inner => join_fields(left, right),
+		JoinKind::Inner | JoinKind::Cross => join_fields(left, right),
 		JoinKind::LeftOuter => left_fields(left)
 			.into_iter()
 			.chain(nullable_fields(right))

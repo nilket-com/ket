@@ -2395,10 +2395,12 @@ pub(crate) fn adr122_join_ir_and_strategy_surface_unchanged() {
 		"RightSemi",
 		"LeftAnti",
 		"RightAnti",
+		// ADR 239: keyless cartesian join kind on the existing Join node (no new operator).
+		"Cross",
 	] {
 		assert!(join_kind.contains(variant), "JoinKind missing {variant}");
 	}
-	assert_eq!(enum_variant_count(&join_kind), 8);
+	assert_eq!(enum_variant_count(&join_kind), 9);
 	assert!(join_strategy.contains("HashPartitioned"));
 	assert!(join_strategy.contains("Broadcast"));
 	assert_eq!(enum_variant_count(&join_strategy), 2);

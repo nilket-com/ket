@@ -2529,6 +2529,23 @@ async fn execute_hash_join(
 
 	let left_batch = concat_or_empty(left_schema, left_batches)?;
 	let right_batch = concat_or_empty(right_schema, right_batches)?;
+
+	// ADR 239: CROSS is keyless — route through the explicit match-all path instead of the hash
+	// build/probe. The hash path would bucket every row under `join_key_bytes([])`, which is the
+	// single-bucket distributed trap; the explicit path emits every build×probe pair deliberately.
+	// One bounded path serves both the in-memory and would-be-spilled cases, so they cannot diverge.
+	if matches!(kind, JoinKind::Cross) {
+		return execute_cross_join_match_all(
+			&left_batch,
+			&right_batch,
+			output_schema,
+			replay_id,
+			strategy,
+			&telemetry,
+			&join_runtime_observation_mode,
+		);
+	}
+
 	let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 	let right_key_arrays = key_arrays(&right_batch, right_keys)?;
 	record_task_telemetry(&telemetry, |task| {
@@ -2665,6 +2682,83 @@ async fn execute_hash_join(
 	Ok(output)
 }
 
+/// Maximum output rows accumulated before a CROSS-join batch is flushed — bounds the match-all
+/// selection allocation so a large cartesian streams out in chunks (ADR 239 D5).
+const CROSS_JOIN_OUTPUT_CHUNK_ROWS: usize = 8192;
+
+/// Explicit keyless match-all for `JoinKind::Cross` (ADR 239 D5): emit every build×probe pair.
+/// Unlike the hash path this never keys on `join_key_bytes([])`, so a CROSS join cannot be mistaken
+/// for — or silently degrade into — a single-bucket empty-key hash join. The output is chunked to
+/// bound allocation; because there is exactly one match-all path, in-memory and would-be-spilled
+/// execution produce identical cartesian rows.
+fn execute_cross_join_match_all(
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	output_schema: &arrow::datatypes::SchemaRef,
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	join_runtime_observation_mode: &JoinRuntimeObservationMode,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let left_rows = left_batch.num_rows();
+	let right_rows = right_batch.num_rows();
+	record_task_telemetry(telemetry, |task| {
+		task.counters.build_rows = task.counters.build_rows.saturating_add(left_rows as u64);
+		task.counters.probe_rows = task.counters.probe_rows.saturating_add(right_rows as u64);
+	});
+
+	let mut output = Vec::new();
+	if left_rows > 0 && right_rows > 0 {
+		let mut selection: Vec<JoinOutputRow> = Vec::new();
+		for left in 0..left_rows {
+			let left = join_build_row_index(left)?;
+			for right in 0..right_rows {
+				let right = join_probe_row_index(right)?;
+				selection.push(JoinOutputRow::Paired { left, right });
+				if selection.len() >= CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+					output.push(materialize_join_selection(
+						JoinKind::Cross,
+						left_batch,
+						right_batch,
+						&selection,
+						output_schema,
+					)?);
+					selection.clear();
+				}
+			}
+		}
+		if !selection.is_empty() {
+			output.push(materialize_join_selection(
+				JoinKind::Cross,
+				left_batch,
+				right_batch,
+				&selection,
+				output_schema,
+			)?);
+		}
+	}
+	if output.is_empty() {
+		output.push(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let output_rows = record_batch_row_count(&output);
+	record_task_telemetry(telemetry, |task| {
+		task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+	});
+	record_join_runtime_observation(
+		telemetry,
+		join_runtime_observation_mode,
+		JoinRuntimeObservation {
+			replay_id,
+			strategy,
+			build_rows: RowCount::new(left_rows as u64),
+			probe_rows: RowCount::new(right_rows as u64),
+			output_rows: RowCount::new(output_rows),
+		},
+	);
+	Ok(output)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinOutputRow {
 	Paired { left: u32, right: u32 },
@@ -2686,7 +2780,11 @@ fn materialize_join_selection(
 	}
 
 	let output_columns = match kind {
-		JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::LeftOuter
+		| JoinKind::RightOuter
+		| JoinKind::FullOuter => {
 			let mut left_indices = Vec::with_capacity(selection.len());
 			let mut right_indices = Vec::with_capacity(selection.len());
 			for row in selection {
@@ -3046,12 +3144,14 @@ fn append_join_matches_for_kind(
 			set_build_row_matched(bitmap, left_index);
 		}
 		match kind {
-			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
-				selection.push(JoinOutputRow::Paired {
-					left: left_index,
-					right: right_index,
-				})
-			}
+			JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::LeftOuter
+			| JoinKind::RightOuter
+			| JoinKind::FullOuter => selection.push(JoinOutputRow::Paired {
+				left: left_index,
+				right: right_index,
+			}),
 			JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti => {
 			}
 		}
@@ -3076,6 +3176,7 @@ fn append_unmatched_probe_row(
 			selection.push(JoinOutputRow::RightPreserved { right: right_index });
 		}
 		JoinKind::Inner
+		| JoinKind::Cross
 		| JoinKind::LeftOuter
 		| JoinKind::LeftSemi
 		| JoinKind::RightSemi
@@ -3122,7 +3223,11 @@ fn build_match_bitmap(kind: JoinKind, rows: usize) -> Option<Vec<u64>> {
 		JoinKind::LeftOuter | JoinKind::FullOuter | JoinKind::LeftSemi | JoinKind::LeftAnti => {
 			Some(vec![0; rows.div_ceil(64)])
 		}
-		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => None,
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::RightOuter
+		| JoinKind::RightSemi
+		| JoinKind::RightAnti => None,
 	}
 }
 

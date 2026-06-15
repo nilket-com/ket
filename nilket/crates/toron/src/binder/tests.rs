@@ -11500,16 +11500,18 @@ async fn role_neutral_substrate_recognizes_reachable_galaxy_not_synthetic() {
 	);
 	assert!(analyze_galaxy(&synthetic, &decisions).is_none());
 
-	// (b) The frontend cannot emit a multi-root stream: cross and comma joins are rejected at planning.
+	// (b) ADR 239: the frontend now emits a multi-root cartesian via CROSS JOIN / comma joins —
+	//     both lower to a keyless `JoinKind::Cross` (broadcast-only), which is a cartesian, not a
+	//     conformed galaxy; the role-neutral recognizers still decline it (covered in (a)).
 	assert!(
 		SqlPlanner::new()
 			.plan("SELECT * FROM sales s CROSS JOIN returns r")
-			.is_err()
+			.is_ok()
 	);
 	assert!(
 		SqlPlanner::new()
 			.plan("SELECT * FROM sales s, returns r")
-			.is_err()
+			.is_ok()
 	);
 
 	// (c) The reachable conformed two-fact query binds and the role-neutral substrate recognizes

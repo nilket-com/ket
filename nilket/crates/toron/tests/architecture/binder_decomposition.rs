@@ -191,6 +191,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/server/mod.rs",
 				"crates/toron/src/sql_planner.rs",
 				"crates/toron/tests/catalog_logical_identity_test.rs",
+				"crates/toron/tests/cross_join_test.rs",
 				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/group_by_test.rs",

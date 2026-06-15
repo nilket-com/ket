@@ -876,6 +876,10 @@ pub enum JoinKind {
 	RightSemi,
 	LeftAnti,
 	RightAnti,
+	/// Keyless cartesian product (ADR 239). Lowered from SQL `CROSS JOIN` and comma joins with no
+	/// `ON`; output schema is the inner-join concatenation (left columns then right). Distributed
+	/// execution is broadcast-only (never an empty-key hash partition).
+	Cross,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

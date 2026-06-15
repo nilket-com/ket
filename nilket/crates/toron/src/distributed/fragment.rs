@@ -888,7 +888,10 @@ fn rewrite_broadcast_star_probe_inner(
 				if !safe_broadcast_physical_join_kind(kind) {
 					return Err(FragmentError::BroadcastNonInner { kind });
 				}
-			} else if kind != JoinKind::Inner {
+			} else if !matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+				// ADR 239: a left-deep comma fold (`Cross(Cross(a, b), c)`) nests CROSS inside the
+				// broadcast star. CROSS composes like INNER here — each level match-alls the broadcast
+				// build against the continuing probe with no null-fill — so it is a valid non-root kind.
 				return Err(FragmentError::BroadcastNonInner { kind });
 			}
 			if strategy != JoinStrategy::Broadcast {
@@ -983,9 +986,15 @@ fn rewrite_broadcast_star_probe_inner(
 }
 
 fn safe_broadcast_physical_join_kind(kind: JoinKind) -> bool {
+	// ADR 239: CROSS is broadcast-only (a keyless cartesian; a hash-partition on `[]` collapses to a
+	// single bucket), so it joins Inner and the right-build kinds as a broadcast-safe physical kind.
 	matches!(
 		kind,
-		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
+		JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::RightOuter
+			| JoinKind::RightSemi
+			| JoinKind::RightAnti
 	)
 }
 

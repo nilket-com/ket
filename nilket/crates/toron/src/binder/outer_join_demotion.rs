@@ -1074,6 +1074,7 @@ fn demoted_join_kind(kind: JoinKind, rejected: NullRejectedSides) -> Option<Join
 		JoinKind::FullOuter if rejected.left => Some(JoinKind::LeftOuter),
 		JoinKind::FullOuter if rejected.right => Some(JoinKind::RightOuter),
 		JoinKind::Inner
+		| JoinKind::Cross
 		| JoinKind::LeftOuter
 		| JoinKind::RightOuter
 		| JoinKind::FullOuter

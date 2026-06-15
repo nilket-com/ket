@@ -1927,6 +1927,7 @@ pub(super) fn join_kind_label(kind: JoinKind) -> &'static str {
 		JoinKind::RightSemi => "right_semi",
 		JoinKind::LeftAnti => "left_anti",
 		JoinKind::RightAnti => "right_anti",
+		JoinKind::Cross => "cross",
 	}
 }
 

@@ -42,6 +42,88 @@ async fn inner_join_preserves_duplicate_multiplicity_and_drops_null_keys() {
 }
 
 #[tokio::test]
+async fn cross_join_produces_cartesian_product() {
+	// ADR 239 D5: CROSS rides the explicit keyless match-all path (no `on`, no hashing). Duplicate
+	// values on both sides prove the result is a row multiset (cartesian), not set membership.
+	let left_schema = Arc::new(Schema::new(vec![
+		Field::new("pk", DataType::Int64, false),
+		Field::new("left_value", DataType::Utf8, false),
+	]));
+	let right_schema = Arc::new(Schema::new(vec![
+		Field::new("pk", DataType::Int64, false),
+		Field::new("right_value", DataType::Int32, false),
+	]));
+	let left = RecordBatch::try_new(
+		left_schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3])),
+			Arc::new(StringArray::from(vec!["x", "x", "y"])),
+		],
+	)
+	.expect("left cross batch");
+	let right = RecordBatch::try_new(
+		right_schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![10, 11, 12, 13])),
+			Arc::new(Int32Array::from(vec![7, 8, 8, 9])),
+		],
+	)
+	.expect("right cross batch");
+
+	let plan = ExecutionPlan::Join {
+		replay_id: JoinReplayId::SYNTHETIC,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
+		left: Box::new(scan_plan(TableId(1), left_schema.clone(), 1)),
+		right: Box::new(scan_plan(TableId(2), right_schema.clone(), 2)),
+		kind: JoinKind::Cross,
+		left_keys: vec![],
+		right_keys: vec![],
+		null_safe_keys: false,
+		strategy: JoinStrategy::Broadcast,
+		output_schema: join_schema(JoinKind::Cross, &left_schema, &right_schema),
+	};
+	let executor = Executor::with_context(
+		Arc::new(MultiTableScan {
+			batches: HashMap::from([(TableId(1), left), (TableId(2), right)]),
+		}),
+		ExecutionContext::local_test()
+			.with_task_budget(TaskBudget::from_query_budget(QueryBudget::test_default())),
+	);
+	let results = executor
+		.execute_bound(&plan, None)
+		.await
+		.expect("cross join executes");
+
+	let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+	assert_eq!(total_rows, 12, "3 x 4 cartesian must yield 12 rows");
+
+	// Output schema is left-then-right: [pk, left_value, pk, right_value]. The pair ("x", 8) must
+	// appear left-"x" (2 rows) x right-8 (2 rows) = 4 times — a multiset, not a set.
+	let mut x_with_8 = 0usize;
+	for batch in &results {
+		let left_value = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("left_value utf8");
+		let right_value = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("right_value int32");
+		for row in 0..batch.num_rows() {
+			if left_value.value(row) == "x" && right_value.value(row) == 8 {
+				x_with_8 += 1;
+			}
+		}
+	}
+	assert_eq!(
+		x_with_8, 4,
+		"duplicate left 'x' (x2) crossed with duplicate right 8 (x2) proves row multiplicity"
+	);
+}
+
+#[tokio::test]
 async fn left_outer_emits_null_filled_unmatched_left() {
 	let batch = run_join(
 		JoinKind::LeftOuter,

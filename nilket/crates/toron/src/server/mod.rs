@@ -3260,6 +3260,11 @@ mod tests {
 			JoinKind::RightSemi => 1,
 			JoinKind::LeftAnti => 1,
 			JoinKind::RightAnti => 1,
+			JoinKind::Cross => {
+				unreachable!(
+					"CROSS is broadcast-only; not exercised by the live hash-join-kinds test"
+				)
+			}
 		}
 	}
 

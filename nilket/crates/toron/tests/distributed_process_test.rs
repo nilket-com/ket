@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{MockCatalog, TableRef};
+use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::coordinator::DistributedQueryCoordinator;
 use toron::distributed::budget::{ByteCount, DurationMillis, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -221,6 +221,12 @@ struct JoinDistinctAggregateProcessRun {
 #[derive(Debug)]
 struct SetOpProcessRun {
 	rows: Vec<Option<i64>>,
+	selected_workers: Vec<WorkerId>,
+}
+
+#[derive(Debug)]
+struct CrossJoinProcessRun {
+	rows: Vec<(i64, Option<i64>)>,
 	selected_workers: Vec<WorkerId>,
 }
 
@@ -628,6 +634,39 @@ async fn distributed_cross_producer_cardinal_is_value_discriminating() {
 		&run.selected_workers,
 		"INTERSECT result [NULL, 9] requires null-safe set membership over projected set_key values \
 		 contributed by set_left and set_right fixture producers; worker count alone is not the proof",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_cross_join_cartesian_is_value_discriminating() {
+	// ADR 239 D4/D5: `customers CROSS JOIN set_right` is broadcast-only — `set_right` (3 rows) is the
+	// broadcast build replicated to every worker, while `customers` (ids 2 and 3) is the scan-shared
+	// probe whose two rows land on different workers. The full cartesian therefore requires the
+	// broadcast build AND both probe-worker shards; a single producer could only emit one customer id.
+	let run = run_cross_join_process_query(
+		1_410,
+		0,
+		"SELECT customers.id, set_right.set_key FROM customers CROSS JOIN set_right",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![
+			(2, None),
+			(2, Some(9)),
+			(2, Some(10)),
+			(3, None),
+			(3, Some(9)),
+			(3, Some(10)),
+		],
+		"cartesian customers.id {{2,3}} x set_right.set_key {{NULL,9,10}}"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the cartesian customers.id {2,3} x set_right.set_key {NULL,9,10} requires the broadcast \
+		 set_right build AND both customers probe-worker shards (id 2 and id 3 scan-share to different \
+		 workers); worker count alone is not the proof",
 	);
 }
 
@@ -1638,6 +1677,45 @@ async fn run_set_op_process_query(
 	}
 }
 
+async fn run_cross_join_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+	sql: &str,
+) -> CrossJoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		cross_join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		auto_broadcast_config(1024 * 1024),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new().plan(sql).expect("plan cross join");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("cross join query");
+	let rows = sorted_i64_optional_i64_pair_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	CrossJoinProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_group_by_join_real_aggregate_process_query(
 	worker_id_base: u128,
 	start_offset: usize,
@@ -2268,6 +2346,32 @@ fn sorted_optional_i64_column_rows(results: &[RecordBatch], column_idx: usize) -
 	rows
 }
 
+fn sorted_i64_optional_i64_pair_rows(results: &[RecordBatch]) -> Vec<(i64, Option<i64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let left = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 left column");
+		let right = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 right column");
+		for row in 0..batch.num_rows() {
+			let right_value = if right.is_null(row) {
+				None
+			} else {
+				Some(right.value(row))
+			};
+			rows.push((left.value(row), right_value));
+		}
+	}
+	rows.sort();
+	rows
+}
+
 fn unique_selected_worker_count(workers: &[WorkerId]) -> usize {
 	workers.iter().copied().collect::<HashSet<_>>().len()
 }
@@ -2306,6 +2410,39 @@ fn test_catalog() -> Arc<MockCatalog> {
 }
 
 fn join_process_catalog() -> Arc<MockCatalog> {
+	Arc::new(join_process_catalog_owned())
+}
+
+// ADR 239: a CROSS join is broadcast-only, so the distributed gate needs a broadcast-eligible build
+// side and an auto-broadcast config. `set_right` (the deterministic SQL right-build) is seeded small;
+// `customers` (the scan-shared probe) is seeded large so it never becomes the build.
+fn cross_join_process_catalog() -> Arc<MockCatalog> {
+	let mut catalog = join_process_catalog_owned();
+	seed_byte_upper_bound(&mut catalog, "set_right", 1_024);
+	seed_byte_upper_bound(&mut catalog, "customers", 64 * 1024 * 1024);
+	Arc::new(catalog)
+}
+
+fn seed_byte_upper_bound(catalog: &mut MockCatalog, table: &str, bytes: u64) {
+	catalog
+		.seed_optimizer_facts(
+			&TableRef::new(table),
+			TableOptimizerFacts {
+				byte_upper_bound: Some(ByteCount::new(bytes)),
+				..TableOptimizerFacts::default()
+			},
+		)
+		.expect("seed optimizer facts");
+}
+
+fn auto_broadcast_config(max_build_bytes: u64) -> PlannerConfig {
+	PlannerConfig {
+		auto_broadcast_max_build_bytes: Some(ByteCount::new(max_build_bytes)),
+		..PlannerConfig::default()
+	}
+}
+
+fn join_process_catalog_owned() -> MockCatalog {
 	let mut catalog = MockCatalog::new();
 	catalog
 		.register_descriptor(
@@ -2359,7 +2496,7 @@ fn join_process_catalog() -> Arc<MockCatalog> {
 			),
 		)
 		.expect("register set_right");
-	Arc::new(catalog)
+	catalog
 }
 
 fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {

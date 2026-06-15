@@ -3533,14 +3533,15 @@ impl SqlPlanner {
 			return Err(unsupported("SELECT without FROM is not supported"));
 		}
 
-		if from.len() > 1 {
-			return Err(unsupported("comma joins are not supported"));
-		}
-
+		// ADR 239: comma joins lower to a left-deep keyless `Cross` fold over the FROM list.
+		// The inner-join WHERE pushdown only applies to a single FROM entry's join chain; with a
+		// comma list the WHERE filters the full cartesian (no equi-extraction across the comma).
+		let is_comma_join = from.len() > 1;
 		let table_with_joins = &from[0];
-		let all_inner_join_chain = table_with_joins.joins.iter().all(|join| {
-			join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
-		});
+		let all_inner_join_chain = !is_comma_join
+			&& table_with_joins.joins.iter().all(|join| {
+				join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
+			});
 		let contains_derived_join_factor = table_factor_is_derived(&table_with_joins.relation)
 			|| table_with_joins
 				.joins
@@ -3595,6 +3596,28 @@ impl SqlPlanner {
 					build_side,
 				} => build_join_plan(plan, right, kind, on, strategy, source, build_side)?,
 			};
+		}
+		// ADR 239: fold any comma-separated FROM entries left-deep as keyless `Cross` joins. Each
+		// entry's own explicit join chain is lowered first (honoring broadcast hints); the entry is
+		// then cross-joined onto the running plan with `on: []`, leaving the binder to force the
+		// broadcast-only strategy for `Cross`.
+		for table_with_joins in from.iter().skip(1) {
+			let mut right = self.lower_table_factor(&table_with_joins.relation)?;
+			for join in &table_with_joins.joins {
+				let inner = self.lower_table_factor(&join.relation)?;
+				let (kind, on) = self.lower_join_operator(&join.join_operator)?;
+				let strategy_intent =
+					join_strategy_intent_for_hint(&mut broadcast_hint, &right, &inner)?;
+				right = match strategy_intent {
+					JoinStrategyIntent::Auto => build_auto_join_plan(right, inner, kind, on),
+					JoinStrategyIntent::Pinned {
+						strategy,
+						source,
+						build_side,
+					} => build_join_plan(right, inner, kind, on, strategy, source, build_side)?,
+				};
+			}
+			plan = build_auto_join_plan(plan, right, JoinKind::Cross, Vec::new());
 		}
 		reject_unused_broadcast_hint(&broadcast_hint)?;
 
@@ -3825,6 +3848,12 @@ impl SqlPlanner {
 				(JoinKind::LeftAnti, constraint)
 			}
 			JoinOperator::RightAnti(constraint) => (JoinKind::RightAnti, constraint),
+			// CROSS JOIN lowers to a keyless cartesian (ADR 239). A bare `CROSS JOIN`
+			// carries `JoinConstraint::None`; `ON`/`USING`/`NATURAL` on a cross join is
+			// not valid and falls through to the reject arm below.
+			JoinOperator::CrossJoin(JoinConstraint::None) => {
+				return Ok((JoinKind::Cross, Vec::new()));
+			}
 			JoinOperator::CrossJoin(_)
 			| JoinOperator::CrossApply
 			| JoinOperator::OuterApply
@@ -3834,7 +3863,7 @@ impl SqlPlanner {
 			| JoinOperator::LeftArrayJoin
 			| JoinOperator::InnerArrayJoin => {
 				return Err(unsupported(
-					"only INNER/OUTER/SEMI/ANTI JOIN ... ON is supported",
+					"only INNER/OUTER/SEMI/ANTI JOIN ... ON and CROSS JOIN are supported",
 				));
 			}
 		};
@@ -7633,7 +7662,11 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		} => match kind {
 			JoinKind::LeftSemi | JoinKind::LeftAnti => plan_qualifiers(left),
 			JoinKind::RightSemi | JoinKind::RightAnti => plan_qualifiers(right),
-			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+			JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::LeftOuter
+			| JoinKind::RightOuter
+			| JoinKind::FullOuter => {
 				let mut qualifiers = plan_qualifiers(left);
 				qualifiers.extend(plan_qualifiers(right));
 				qualifiers

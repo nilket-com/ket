@@ -15,7 +15,7 @@ use wendelon::schema::{
 };
 
 #[test]
-fn join_kind_serde_round_trips_all_eight_variants() {
+fn join_kind_serde_round_trips_all_variants() {
 	for kind in all_join_kinds() {
 		let encoded = postcard::to_allocvec(&kind).expect("encode kind");
 		let decoded: JoinKind = postcard::from_bytes(&encoded).expect("decode kind");
@@ -37,6 +37,12 @@ fn output_schema_nullability_table_for_each_kind() {
 
 	assert_schema(
 		&join_schema(JoinKind::Inner, &left, &right),
+		4,
+		&[false, true, false, false],
+	);
+	// ADR 239: Cross output schema is the inner concatenation (left columns then right).
+	assert_schema(
+		&join_schema(JoinKind::Cross, &left, &right),
 		4,
 		&[false, true, false, false],
 	);
@@ -374,6 +380,7 @@ fn all_join_kinds() -> Vec<JoinKind> {
 		JoinKind::RightSemi,
 		JoinKind::LeftAnti,
 		JoinKind::RightAnti,
+		JoinKind::Cross,
 	]
 }
 

@@ -266,10 +266,21 @@ pub(crate) fn adr209_fragmenter_accepts_only_safe_non_inner_broadcast_shapes() {
 	assert!(rewrite.contains("root: bool"));
 	assert!(rewrite.contains("if root"));
 	assert!(rewrite.contains("safe_broadcast_physical_join_kind(kind)"));
-	assert!(rewrite.contains("} else if kind != JoinKind::Inner"));
-	assert!(safe.contains(
-		"JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti"
-	));
+	// ADR 239: a left-deep comma fold nests CROSS in the broadcast star, so the non-root star kind is
+	// now "inner or cross" (CROSS composes like INNER — match-all of build x probe, no null-fill).
+	assert!(rewrite.contains("} else if !matches!(kind, JoinKind::Inner | JoinKind::Cross)"));
+	for kind in [
+		"JoinKind::Inner",
+		"JoinKind::Cross",
+		"JoinKind::RightOuter",
+		"JoinKind::RightSemi",
+		"JoinKind::RightAnti",
+	] {
+		assert!(
+			safe.contains(kind),
+			"safe_broadcast_physical_join_kind must accept {kind}"
+		);
+	}
 	assert!(fragment.contains("broadcast_safe_non_inner_physical_roots_fragment"));
 	assert!(fragment.contains("broadcast_non_inner_star_child_remains_rejected_by_fragmenter"));
 	assert!(fragment.contains("broadcast_non_inner_join_is_rejected_by_fragmenter"));

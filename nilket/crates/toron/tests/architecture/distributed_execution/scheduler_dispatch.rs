@@ -110,9 +110,11 @@ pub(crate) fn g17_join_ir_surface_has_single_join_variant_and_two_strategies() {
 			"RightSemi",
 			"LeftAnti",
 			"RightAnti",
+			// ADR 239: a new keyless cartesian join *kind* on the existing Join node.
+			"Cross",
 		]
 	);
-	assert_eq!(enum_variant_count(join_kind), 8);
+	assert_eq!(enum_variant_count(join_kind), 9);
 	assert_eq!(enum_variant_count(join_strategy), 2);
 	assert!(join_strategy.contains("HashPartitioned"));
 	assert!(join_strategy.contains("Broadcast"));

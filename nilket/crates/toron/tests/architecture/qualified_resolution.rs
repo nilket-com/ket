@@ -85,7 +85,7 @@ pub(crate) fn adr121_join_key_qualifier_resolution_preserved() {
 	assert!(binder.contains("validate_join_key_types("));
 	let join_tests = std::fs::read_to_string(manifest_dir().join("tests/join_kind_test.rs"))
 		.expect("read join kind tests");
-	assert!(join_tests.contains("join_kind_serde_round_trips_all_eight_variants"));
+	assert!(join_tests.contains("join_kind_serde_round_trips_all_variants"));
 	assert!(join_tests.contains("bind_join_promotes_outer_and_semi_anti_schemas"));
 }
 
