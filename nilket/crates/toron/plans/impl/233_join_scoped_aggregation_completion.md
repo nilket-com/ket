@@ -15,9 +15,15 @@ Touch surface:
 - `tests/distributed_process_test.rs` — the cardinal real-aggregate cross-partition co-location
   proof.
 - `tests/architecture/*` — retarget the GROUP-BY-over-join guard; add `adr233_*`.
+- `crates/wendelon/tests/architecture_test.rs` — retarget the ADR 076 cross-ring guard
+  (`adr076_no_toron_production_change`) to a `toron/src` symbol scan, since this cut's
+  `sql_planner.rs` edit trips its old "`toron/src` clean" assertion; and retire the sibling
+  `adr077_*` / `adr078_*` git-status tripwires that shared the color-fragile pattern (their move-only
+  invariant is covered by structural siblings). Wendelon *test-guard* only.
 
 No `ir.rs`, `binder.rs` (grouped aggregate lowering unchanged), `exec.rs`,
-`distributed/fragment.rs` (232's split reused as-is), `rune_engine.rs`, or Wendelon change.
+`distributed/fragment.rs` (232's split reused as-is), `rune_engine.rs`, or Wendelon *production*
+change.
 
 ## Anchors (re-ground at implementation)
 
@@ -68,7 +74,11 @@ Two tables with multiple rows per group across the join key:
 
 Retarget the existing GROUP-BY-over-join guard by name (grouped fences lifted, others intact).
 Add the five `adr233_*` guards. Assert 232's split guard reused, the 231 marker/no-aggregate
-guards, and the optimizer arc (216→230) unchanged.
+guards, and the optimizer arc (216→230) unchanged. Cross-ring: retarget Wendelon's
+`adr076_no_toron_production_change` to a `toron/src` symbol scan (the `sql_planner.rs` edit trips its
+old "`toron/src` clean" form), and retire the sibling `adr077_*` / `adr078_*` git-status tripwires
+(color-fragile, and harmful if working since they fire on any unrelated dirty production file;
+covered by structural siblings).
 
 ## Verification gate
 

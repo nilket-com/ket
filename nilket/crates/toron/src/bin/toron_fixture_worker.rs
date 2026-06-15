@@ -81,11 +81,14 @@ impl FixtureStorageScan {
 				Arc::new(Int64Array::from(vec![1, 2, 2, 3])),
 			],
 		)?;
+		// ADR 233 cardinal: both matched customers sit in "west", but their ids hash to different
+		// join partitions (cust 2 -> p0, cust 3 -> p3 under XxHash3_64 % 4), so "west"'s rows are
+		// produced by two join workers; its SUM/COUNT must merge partials across producers at the shuffle.
 		let customers = RecordBatch::try_new(
 			customers_schema,
 			vec![
 				Arc::new(Int64Array::from(vec![2, 3])),
-				Arc::new(StringArray::from(vec![Some("west"), Some("east")])),
+				Arc::new(StringArray::from(vec![Some("west"), Some("west")])),
 			],
 		)?;
 

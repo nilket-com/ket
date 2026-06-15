@@ -119,6 +119,18 @@ SELECT DISTINCT a.region, count(*) FROM … GROUP BY …                    -- D
 - ADR 232 post-join exchange split guard → reused unchanged (now serves grouped aggregates too).
 - ADR 231 marker / ordinal-safe / no-aggregate-GROUP-BY-rejected guards → unchanged.
 - Optimizer arc (ADR 216→230) → untouched.
+- Wendelon ADR 076 cross-ring guard (`adr076_no_toron_production_change`) → retargeted. The old form
+  asserted `crates/toron/src` was clean via `git status --short`, which any Toron-production edit
+  trips (and which silently no-ops under `color.ui=always`, the ANSI codes defeating its path parse);
+  it is rewritten to scan `toron/src` for ADR 076's counter-finalization symbols
+  (`CounterFinalizationWitness` / `CounterParticipantResolver` / `CounterParticipantPlan`) — the real
+  cross-ring invariant (those types never leak into Toron), independent of git state. The two sibling
+  tripwires `adr077_no_wire_or_runtime_surface_change` /
+  `adr078_no_storage_wire_or_runtime_surface_change` shared the color-fragile git-status pattern and
+  are **retired** in the same edit: a working git-status form would false-positive on any unrelated
+  dirty production file (including this cut's own `sql_planner.rs`), and their move-only invariant is
+  already enforced by git-independent structural siblings. All Wendelon edits here are
+  test-guard-only (no production/pushdown change).
 
 ## Consensus (transparent)
 

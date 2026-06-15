@@ -415,21 +415,110 @@ fn qualified_group_by_keys_and_projections_lower() {
 	plan_sql("SELECT sales.region, COUNT(*) FROM sales GROUP BY region");
 }
 
-#[test]
-fn group_by_over_explicit_join_rejects() {
-	assert_unsupported(
+#[tokio::test]
+async fn group_by_inner_join_counts_matched_rows() {
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4), (Some("B".to_string()), 1)]
+	);
+}
+
+#[tokio::test]
+async fn group_by_left_outer_join_counts_null_padded_bucket() {
+	let results = run_logical(&plan_sql(
+		"SELECT right_dups.tier, COUNT(*) \
+		 FROM left_dups LEFT JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY right_dups.tier",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(None, 2),
+			(Some("gold".to_string()), 4),
+			(Some("silver".to_string()), 1),
+		]
+	);
+}
+
+#[tokio::test]
+async fn group_by_right_outer_join_counts_null_padded_bucket() {
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups RIGHT JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(None, 2),
+			(Some("A".to_string()), 4),
+			(Some("B".to_string()), 1),
+		]
+	);
+}
+
+#[tokio::test]
+async fn group_by_full_outer_join_counts_null_padded_buckets() {
+	let results = run_logical(&plan_sql(
+		"SELECT right_dups.tier, COUNT(*) \
+		 FROM left_dups FULL JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY right_dups.tier",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(None, 2),
+			(Some("gold".to_string()), 4),
+			(Some("orphan".to_string()), 2),
+			(Some("silver".to_string()), 1),
+		]
+	);
+}
+
+#[tokio::test]
+async fn group_by_decorrelated_exists_aggregates_after_semi_join() {
+	let results = run_logical(&plan_sql(
 		"SELECT region, COUNT(*) FROM sales \
-		 INNER JOIN regions ON sales.region = regions.region \
+		 WHERE EXISTS (SELECT 1 FROM regions WHERE regions.region = sales.region) \
 		 GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_count_rows(&results),
+		vec![(Some("east".to_string()), 3), (Some("west".to_string()), 2)]
 	);
 }
 
 #[test]
-fn group_by_over_decorrelated_exists_rejects() {
-	assert_unsupported(
-		"SELECT region, COUNT(*) FROM sales \
-		 WHERE EXISTS (SELECT 1 FROM regions WHERE regions.region = sales.region) \
-		 GROUP BY region",
+fn group_by_join_composes_with_existing_filter_pushdown() {
+	let plan = plan_sql(
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 WHERE right_dups.tier = 'gold' \
+		 GROUP BY left_dups.label",
+	);
+
+	let LogicalPlan::Aggregate { input, .. } = plan else {
+		panic!("expected aggregate over join");
+	};
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected group-key exchange below aggregate");
+	};
+	let LogicalPlan::Join { right, .. } = input.as_ref() else {
+		panic!("expected join below group-key exchange");
+	};
+	assert!(
+		matches!(right.as_ref(), LogicalPlan::Filter { .. }),
+		"right-local WHERE predicate should stay pushed into join input"
 	);
 }
 
@@ -1021,11 +1110,6 @@ fn having_generated_name_form_resolves_without_rewrite() {
 #[test]
 fn having_preserves_inherited_group_by_rejects() {
 	assert_unsupported(
-		"SELECT region, COUNT(*) FROM sales \
-		 INNER JOIN regions ON sales.region = regions.region \
-		 GROUP BY region HAVING COUNT(*) > 1",
-	);
-	assert_unsupported(
 		"SELECT DISTINCT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1",
 	);
 	assert_unsupported(
@@ -1530,13 +1614,82 @@ fn public_group_by_without_aggregate_still_rejects() {
 	);
 }
 
-#[test]
-fn group_by_over_join_still_rejects() {
-	assert_unsupported_message(
+#[tokio::test]
+async fn group_by_join_having_filters_after_aggregate() {
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label HAVING COUNT(*) > 1",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4)]
+	);
+}
+
+#[tokio::test]
+async fn group_by_join_order_by_limit_runs_after_aggregate() {
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) \
+		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
+		 GROUP BY left_dups.label ORDER BY COUNT(*) DESC LIMIT 1",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4)]
+	);
+}
+
+#[tokio::test]
+async fn global_aggregate_over_join_still_works() {
+	let results = run_logical(&plan_sql(
+		"SELECT COUNT(*) FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k",
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&results, 0), vec![Some(5)]);
+}
+
+#[tokio::test]
+async fn rune_group_by_over_join_matches_sql_plan_and_rows() {
+	let sql_logical = plan_sql(
 		"SELECT left_dups.label, COUNT(*) \
 		 FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k \
 		 GROUP BY left_dups.label",
-		"GROUP BY over joins is not supported",
+	);
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("left_dups")
+               .join(
+                   ctx.table("right_dups"),
+                   qcol("left_dups", "k").eq(qcol("right_dups", "k"))
+               )
+               .aggregate([qcol("left_dups", "label")], [count_all()])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL group-by join");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune group-by join");
+	assert_eq!(
+		field_names(&sql_bound.schema()),
+		field_names(&rune_bound.schema())
+	);
+	assert!(contains_execution_join(&sql_bound));
+	assert!(contains_execution_join(&rune_bound));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("sql digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("rune digest")
 	);
 }
 
@@ -1547,6 +1700,27 @@ fn distinct_in_subquery_is_explicit_unsupported() {
 	assert_unsupported_message(
 		"SELECT DISTINCT region FROM (SELECT region FROM sales) s",
 		"DISTINCT over derived tables is not supported",
+	);
+}
+
+#[test]
+fn joins_inside_derived_tables_still_reject() {
+	assert_unsupported_message(
+		"SELECT bucket, COUNT(*) \
+		 FROM (SELECT left_dups.label AS bucket \
+		       FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k) d \
+		 GROUP BY bucket",
+		"joins inside derived tables are not supported",
+	);
+}
+
+#[test]
+fn group_by_inside_exists_subquery_still_rejects() {
+	assert_unsupported(
+		"SELECT region, COUNT(*) FROM sales \
+		 WHERE EXISTS (SELECT region, COUNT(*) FROM regions \
+		               WHERE regions.region = sales.region GROUP BY region) \
+		 GROUP BY region",
 	);
 }
 
@@ -4086,6 +4260,36 @@ fn sorted_utf8_pair_rows(
 				Some(right.value(row).to_string())
 			};
 			rows.push((left, right));
+		}
+	}
+	rows.sort();
+	rows
+}
+
+fn sorted_utf8_int64_rows(
+	results: &[RecordBatch],
+	utf8_idx: usize,
+	int64_idx: usize,
+) -> Vec<(Option<String>, i64)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let labels = batch
+			.column(utf8_idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Utf8 column");
+		let values = batch
+			.column(int64_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 column");
+		for row in 0..batch.num_rows() {
+			let label = if labels.is_null(row) {
+				None
+			} else {
+				Some(labels.value(row).to_string())
+			};
+			rows.push((label, values.value(row)));
 		}
 	}
 	rows.sort();

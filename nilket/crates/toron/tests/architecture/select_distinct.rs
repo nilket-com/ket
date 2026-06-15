@@ -222,7 +222,7 @@ pub(crate) fn adr232_distinct_join_ordinal_safe() {
 }
 
 #[test]
-pub(crate) fn adr232_distinct_retains_aggregate_derived_exists_and_groupby_fences() {
+pub(crate) fn adr232_distinct_retains_aggregate_derived_exists_fences() {
 	let planner = source("src/sql_planner.rs");
 	let tests = source("tests/group_by_test.rs");
 	let lower_select = source_block(&planner, "fn lower_select");
@@ -235,7 +235,6 @@ pub(crate) fn adr232_distinct_retains_aggregate_derived_exists_and_groupby_fence
 		"\"DISTINCT with aggregate projections is not supported\"",
 		"\"DISTINCT with window functions is not supported\"",
 		"unsupported(\"DISTINCT over derived tables is not supported\")",
-		"unsupported(\"GROUP BY over joins is not supported\")",
 	] {
 		assert!(
 			lower_select.contains(required),
@@ -247,7 +246,6 @@ pub(crate) fn adr232_distinct_retains_aggregate_derived_exists_and_groupby_fence
 	assert!(tests.contains("distinct_over_aggregate_inputs_still_rejects"));
 	assert!(tests.contains("distinct_in_subquery_is_explicit_unsupported"));
 	assert!(tests.contains("public_group_by_without_aggregate_still_rejects"));
-	assert!(tests.contains("group_by_over_join_still_rejects"));
 }
 
 #[test]
@@ -268,6 +266,107 @@ pub(crate) fn adr232_distinct_join_adds_no_physical_or_optimizer_surface() {
 				&& !source.contains("select_distinct_join")
 				&& !source.contains("ExecutionPlan::Distinct"),
 			"{relative} must not grow a join-DISTINCT runtime surface"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr233_group_by_over_joins_lifts_both_grouped_fences() {
+	let planner = source("src/sql_planner.rs");
+	let tests = source("tests/group_by_test.rs");
+	let lower_select = source_block(&planner, "fn lower_select");
+
+	assert!(!lower_select.contains("GROUP BY over joins is not supported"));
+	assert!(!planner.contains("GROUP BY over joins is not supported"));
+	assert!(!planner.contains("fn plan_contains_join"));
+	assert!(lower_select.contains("LogicalPlan::Aggregate"));
+	assert!(lower_select.contains("AggregateSqlMode::Grouped"));
+	assert!(tests.contains("group_by_inner_join_counts_matched_rows"));
+	assert!(tests.contains("group_by_decorrelated_exists_aggregates_after_semi_join"));
+}
+
+#[test]
+pub(crate) fn adr233_group_by_join_reuses_232_post_join_exchange_split() {
+	let planner = source("src/sql_planner.rs");
+	let fragment = source("src/distributed/fragment.rs");
+	let tests = source("tests/group_by_test.rs");
+	let distributed = source("tests/distributed_process_test.rs");
+	let lower_select = source_block(&planner, "fn lower_select");
+	let leading_exchange = source_block(&fragment, "fn leading_exchange_before_join");
+
+	assert!(lower_select.contains("LogicalPlan::Exchange"));
+	assert!(lower_select.contains("key: group_expr.clone()"));
+	assert!(lower_select.contains("partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT"));
+	assert!(fragment.contains("fn fragment_post_join_exchange_plan"));
+	assert!(leading_exchange.contains("ExecutionPlan::Aggregate { input, .. }"));
+	assert!(leading_exchange.contains("ExecutionPlan::Join { .. }"));
+	assert!(tests.contains("group_by_join_composes_with_existing_filter_pushdown"));
+	assert!(tests.contains("group_by_join_having_filters_after_aggregate"));
+	assert!(distributed.contains("group_by_join_real_aggregate_merges_across_partitions"));
+}
+
+#[test]
+pub(crate) fn adr233_group_by_join_lowers_through_existing_aggregate_no_new_op() {
+	let ir_execution = source("src/ir/execution.rs");
+	let exec = source("src/exec.rs");
+	let fragment = source("src/distributed/fragment.rs");
+	let tests = source("tests/group_by_test.rs");
+	let execution_plan = source_block(&ir_execution, "pub enum ExecutionPlan");
+
+	assert!(execution_plan.contains("Aggregate {"));
+	assert!(!execution_plan.contains("GroupByJoin"));
+	assert!(!ir_execution.contains("ExecutionPlan::GroupByJoin"));
+	assert!(!exec.contains("execute_group_by_join"));
+	assert!(!fragment.contains("GroupByJoin"));
+	assert!(tests.contains("global_aggregate_over_join_still_works"));
+	assert!(tests.contains("rune_group_by_over_join_matches_sql_plan_and_rows"));
+}
+
+#[test]
+pub(crate) fn adr233_group_by_join_retains_no_aggregate_distinct_and_derived_fences() {
+	let planner = source("src/sql_planner.rs");
+	let tests = source("tests/group_by_test.rs");
+	let lower_select = source_block(&planner, "fn lower_select");
+	let derived_select = source_block(&planner, "fn validate_derived_select_shape");
+	let exists_select = source_block(&planner, "fn validate_exists_select_shape");
+
+	for required in [
+		"unsupported(\"DISTINCT with GROUP BY is not supported\")",
+		"unsupported(\"DISTINCT with HAVING is not supported\")",
+		"\"DISTINCT with aggregate projections is not supported\"",
+		"unsupported(\"DISTINCT over derived tables is not supported\")",
+		"GROUP BY requires at least one aggregate call",
+	] {
+		assert!(
+			lower_select.contains(required),
+			"lower_select lost {required}"
+		);
+	}
+	assert!(derived_select.contains("joins inside derived tables are not supported"));
+	assert!(exists_select.contains("!group_by_is_empty(&select.group_by)"));
+	assert!(tests.contains("public_group_by_without_aggregate_still_rejects"));
+	assert!(tests.contains("distinct_with_aggregate_group_by_or_having_is_explicit_unsupported"));
+	assert!(tests.contains("joins_inside_derived_tables_still_reject"));
+	assert!(tests.contains("group_by_inside_exists_subquery_still_rejects"));
+}
+
+#[test]
+pub(crate) fn adr233_join_scoped_aggregation_adds_no_optimizer_surface() {
+	adr231_distinct_leaves_optimizer_evidence_surfaces_unchanged();
+
+	for relative in [
+		"src/binder/runtime_evidence.rs",
+		"src/binder/decision_log.rs",
+		"src/daemon.rs",
+		"src/distributed/fragment.rs",
+		"src/wire.rs",
+	] {
+		let source = source(relative);
+		assert!(
+			!source.contains("join_scoped_aggregation")
+				&& !source.contains("GroupByJoin")
+				&& !source.contains("GROUP BY over joins"),
+			"{relative} must not grow an ADR 233 optimizer/runtime surface"
 		);
 	}
 }

@@ -3448,9 +3448,6 @@ impl SqlPlanner {
 		if distinct_requested && table_factor_is_derived(&table_with_joins.relation) {
 			return Err(unsupported("DISTINCT over derived tables is not supported"));
 		}
-		if group_keys.is_some() && !table_with_joins.joins.is_empty() {
-			return Err(unsupported("GROUP BY over joins is not supported"));
-		}
 		let all_inner_join_chain = table_with_joins.joins.iter().all(|join| {
 			join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
 		});
@@ -3521,10 +3518,6 @@ impl SqlPlanner {
 				plan = self.lower_where(plan, selection)?;
 			}
 		}
-		if group_keys.is_some() && plan_contains_join(&plan) {
-			return Err(unsupported("GROUP BY over joins is not supported"));
-		}
-
 		// 3. Handle SELECT list (Project or Aggregate)
 		if let Some(group_keys) = group_keys {
 			let group_expr = group_keys
@@ -6926,62 +6919,6 @@ fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], Fronte
 		));
 	}
 	Ok(args)
-}
-
-fn plan_contains_join(plan: &LogicalPlan) -> bool {
-	// P0.6: a recursive logical-plan walk is sufficient because ADR 009 decorrelation is
-	// the only path that can add a Join under syntactically single-table grouped SQL.
-	match plan {
-		LogicalPlan::Scan {
-			table: _,
-			projection: _,
-		}
-		| LogicalPlan::ScanNamed {
-			table: _,
-			projection: _,
-		} => false,
-		LogicalPlan::Alias { input, .. }
-		| LogicalPlan::Filter {
-			input,
-			predicate: _,
-		}
-		| LogicalPlan::Project { input, .. }
-		| LogicalPlan::Distinct { input }
-		| LogicalPlan::Aggregate {
-			input,
-			group_expr: _,
-			aggr_expr: _,
-		}
-		| LogicalPlan::Exchange {
-			input,
-			partition_count: _,
-			key: _,
-		}
-		| LogicalPlan::Sort {
-			input,
-			order_by: _,
-			limit: _,
-			offset: _,
-		}
-		| LogicalPlan::Take { input, .. } => plan_contains_join(input),
-		LogicalPlan::Join {
-			left: _,
-			right: _,
-			kind: _,
-			on: _,
-			strategy_intent: _,
-		} => true,
-		LogicalPlan::CreateTable { .. }
-		| LogicalPlan::Explain { .. }
-		| LogicalPlan::ExplainAnalyze { .. }
-		| LogicalPlan::CreateLogicalType { .. }
-		| LogicalPlan::CreateTableAsSelect { .. }
-		| LogicalPlan::DropTable { .. }
-		| LogicalPlan::Delete { .. }
-		| LogicalPlan::Update { .. }
-		| LogicalPlan::Insert { .. }
-		| LogicalPlan::InsertSelect { .. } => false,
-	}
 }
 
 fn table_factor_is_derived(factor: &TableFactor) -> bool {

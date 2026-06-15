@@ -1,4 +1,4 @@
-use arrow::array::{Int32Array, Int64Array};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
@@ -206,6 +206,12 @@ struct JoinProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+#[derive(Debug)]
+struct JoinAggregateProcessRun {
+	rows: HashMap<Option<String>, (i64, Option<i64>)>,
+	selected_workers: Vec<WorkerId>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_process_distributed_query_digest_is_canonical() {
 	let first = run_process_query(100, 0).await;
@@ -341,6 +347,25 @@ async fn select_distinct_join_dedups_across_partitions() {
 	assert_eq!(
 		run.row_count, 1,
 		"post-join DISTINCT must collapse rows across hash partitions"
+	);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_by_join_real_aggregate_merges_across_partitions() {
+	let run = run_group_by_join_real_aggregate_process_query(1_340, 0).await;
+
+	// "west" spans customers 2 (partition 0) and 3 (partition 3): its three matched orders
+	// (101,102 from cust 2; 103 from cust 3) are produced by two different join workers, so a
+	// correct group-key shuffle co-locates them at one consumer -> COUNT=3, SUM(orders.id)=306.
+	// A broken cross-producer merge would emit two partial "west" rows (collapsing wrong here).
+	assert_eq!(
+		run.rows,
+		HashMap::from([(Some("west".to_string()), (3, Some(306)))])
 	);
 	assert_eq!(
 		unique_selected_worker_count(&run.selected_workers),
@@ -1266,6 +1291,50 @@ async fn run_hash_join_logical_process_query(
 	run
 }
 
+async fn run_group_by_join_real_aggregate_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+) -> JoinAggregateProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT customers.region, COUNT(*), SUM(orders.id) \
+			 FROM orders JOIN customers ON orders.customer_id = customers.id \
+			 GROUP BY customers.region",
+		)
+		.expect("plan group-by over distributed join");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("group-by join aggregate query");
+	let rows = grouped_join_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	JoinAggregateProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_hash_join_producer_kill_query(
 	worker_id_base: u128,
 	killed_stage_index: usize,
@@ -1724,6 +1793,41 @@ fn sum_counts(results: &[arrow::record_batch::RecordBatch]) -> i64 {
 			(0..counts.len()).map(|row| counts.value(row)).sum::<i64>()
 		})
 		.sum()
+}
+
+fn grouped_join_rows(results: &[RecordBatch]) -> HashMap<Option<String>, (i64, Option<i64>)> {
+	let mut rows = HashMap::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("count column");
+		let sums = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("sum column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let sum = if sums.is_null(row) {
+				None
+			} else {
+				Some(sums.value(row))
+			};
+			rows.insert(region, (counts.value(row), sum));
+		}
+	}
+	rows
 }
 
 fn unique_selected_worker_count(workers: &[WorkerId]) -> usize {

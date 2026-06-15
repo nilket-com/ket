@@ -8194,16 +8194,26 @@ fn adr076_no_new_wire_operations() {
 
 #[test]
 fn adr076_no_toron_production_change() {
-	let output = std::process::Command::new("git")
-		.args(["status", "--short", "--", "crates/toron/src"])
-		.current_dir(workspace_root())
-		.output()
-		.expect("git status should run");
-	assert!(output.status.success(), "git status failed");
-	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
+	let toron_src = workspace_root().join("crates/toron/src");
+	let mut offenders = Vec::new();
+	walk_dir(&toron_src, &mut |path| {
+		if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+			let body = fs::read_to_string(path).unwrap_or_default();
+			if body.contains("CounterFinalizationWitness")
+				|| body.contains("CounterParticipantResolver")
+				|| body.contains("CounterParticipantPlan")
+			{
+				let rel = path
+					.strip_prefix(workspace_root())
+					.unwrap_or(path)
+					.to_string_lossy();
+				offenders.push(rel.to_string());
+			}
+		}
+	});
 	assert!(
-		stdout.trim().is_empty(),
-		"ADR 076 is Wendelon-only; Toron production files are staged/dirty:\n{stdout}"
+		offenders.is_empty(),
+		"ADR 076 is Wendelon-only; Toron production files contain ADR 076 symbols:\n{offenders:?}"
 	);
 }
 
@@ -8367,36 +8377,16 @@ fn adr077_tests_extracted() {
 	);
 }
 
-/// Cardinal-risk guard: this is a move-only decomposition. While the cut is in
-/// flight, no production source file *outside* `network/data_server/**` may be
-/// dirty — no wire type, `MsgType`, protocol schema, or other production edit
-/// rides this cut. (Clean tree after commit: passes, as with the ADR 076
-/// precedent — a development-time tripwire.)
-#[test]
-fn adr077_no_wire_or_runtime_surface_change() {
-	let output = std::process::Command::new("git")
-		.args(["status", "--short"])
-		.current_dir(workspace_root())
-		.output()
-		.expect("git status should run");
-	assert!(output.status.success(), "git status failed");
-	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
-	for line in stdout.lines() {
-		if line.len() < 4 {
-			continue;
-		}
-		let path = line[3..].rsplit(" -> ").next().unwrap_or(&line[3..]).trim();
-		let is_production_source =
-			path.starts_with("crates/") && path.contains("/src/") && path.ends_with(".rs");
-		if is_production_source {
-			assert!(
-				path.starts_with("crates/wendelon/src/network/data_server"),
-				"ADR 077 is move-only; a production source file outside \
-				 network/data_server/** is dirty: {path}"
-			);
-		}
-	}
-}
+// ADR 077 `adr077_no_wire_or_runtime_surface_change` — RETIRED in the ADR 233 cross-ring
+// reconciliation. It was a development-time `git status --short` tripwire (no production source
+// outside `network/data_server/**` dirty while the cut was in flight). It could not simply be
+// color-hardened: (1) under `color.ui=always` the ANSI codes shift `line[3..]`, so
+// `starts_with("crates/")` was always false and the guard asserted nothing; (2) a *working*
+// git-status form false-positives on any unrelated dirty production file — it would fail this suite
+// whenever a Toron cut like ADR 233 stages an edit under `crates/toron/src`. The move-only invariant
+// it proxied is enforced, git-independently, by the structural siblings
+// `adr077_dispatch_and_struct_stay_in_root`, `adr077_root_is_bounded`,
+// `adr077_semantic_modules_exist`, and `adr077_data_server_source_concatenates_submodules`.
 
 /// The de-versioned doc heading stays renamed (doc-prose variant of the
 /// repo-wide no-V1 discipline): no `## V1 scope` heading, no `V1 fallback` prose.
@@ -8579,38 +8569,14 @@ fn adr078_tests_extracted() {
 	);
 }
 
-/// Cardinal-risk guard: this is a move-only decomposition. While the cut is in
-/// flight, no production source file *outside* `storage/manager/**` may be dirty
-/// — no on-disk slab/manifest format, encoding, crypto, wire, or other
-/// production edit rides this cut. (Clean tree after commit: passes, as with the
-/// ADR 076/077 precedent — a development-time tripwire.)
-#[test]
-fn adr078_no_storage_wire_or_runtime_surface_change() {
-	let output = std::process::Command::new("git")
-		.args(["status", "--short"])
-		.current_dir(workspace_root())
-		.output()
-		.expect("git status should run");
-	assert!(output.status.success(), "git status failed");
-	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
-	for line in stdout.lines() {
-		if line.len() < 4 {
-			continue;
-		}
-		let path = line[3..].rsplit(" -> ").next().unwrap_or(&line[3..]).trim();
-		let is_production_source =
-			path.starts_with("crates/") && path.contains("/src/") && path.ends_with(".rs");
-		let is_manager_decomposition_source = path == "crates/wendelon/src/storage/manager.rs"
-			|| path.starts_with("crates/wendelon/src/storage/manager/");
-		if is_production_source {
-			assert!(
-				is_manager_decomposition_source,
-				"ADR 078 is move-only; a production source file outside \
-				 storage/manager/** is dirty: {path}"
-			);
-		}
-	}
-}
+// ADR 078 `adr078_no_storage_wire_or_runtime_surface_change` — RETIRED in the ADR 233 cross-ring
+// reconciliation, for the same reasons as the ADR 077 tripwire above: the `git status --short` form
+// was vacuous under `color.ui=always` (ANSI codes defeat the `line[3..]` path parse), and a working
+// version would false-positive on any unrelated dirty production file. The move-only invariant is
+// enforced, git-independently, by the structural siblings
+// `adr078_slab_manager_public_surface_stays_in_root`, `adr078_no_mod_rs_root`,
+// `adr078_root_is_bounded`, `adr078_semantic_modules_exist`, and
+// `adr078_manager_source_concatenates_submodules`.
 
 /// The module root is a sibling file `storage/manager.rs`, never
 /// `storage/manager/mod.rs` (mod.rs is manifests-only in this crate).
