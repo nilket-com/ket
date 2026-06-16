@@ -171,6 +171,10 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT rn FROM (SELECT ROW_NUMBER() OVER (ORDER BY score) AS rn FROM wins) d",
 		// window in WHERE
 		"SELECT grp FROM wins WHERE ROW_NUMBER() OVER (ORDER BY score) > 1",
+		// ADR 250: window inheritance (WINDOW w2 AS w1) is a spec-merge mechanism, deferred
+		"SELECT RANK() OVER w2 FROM wins WINDOW w1 AS (ORDER BY score), w2 AS w1",
+		// ADR 250: window extension (OVER (w ...) merging a named base with added clauses), deferred
+		"SELECT RANK() OVER (w ORDER BY id) FROM wins WINDOW w AS (PARTITION BY grp)",
 	] {
 		assert!(
 			SqlPlanner::new().plan(sql).is_err(),
@@ -1158,6 +1162,83 @@ async fn ntile_without_order_by_is_accepted() {
 	let rows = run_window("SELECT grp, NTILE(2) OVER (PARTITION BY grp) AS b FROM wins").await;
 	assert_eq!(group_values(&rows, "a"), vec![1, 1, 2]);
 	assert_eq!(group_values(&rows, "b"), vec![1, 2]);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 250 — named windows
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn named_window_resolves_like_inline_spec() {
+	// `OVER w` resolves to the WINDOW-clause definition; identical to the inline spelling.
+	let named = run_window(
+		"SELECT grp, RANK() OVER w AS r FROM wins WINDOW w AS (PARTITION BY grp ORDER BY score)",
+	)
+	.await;
+	let inline =
+		run_window("SELECT grp, RANK() OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	assert_eq!(named, inline, "OVER w resolves to the inline spec");
+	assert_eq!(group_values(&named, "a"), vec![1, 1, 3]);
+}
+
+#[tokio::test]
+async fn named_window_carries_frame() {
+	// A named definition carrying a ROWS frame (243) is inherited by `OVER w` unchanged.
+	let named = run_window(
+		"SELECT grp, SUM(score) OVER w AS s FROM wins \
+		 WINDOW w AS (PARTITION BY grp ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+	)
+	.await;
+	let inline = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wins",
+	)
+	.await;
+	assert_eq!(named, inline, "a named window inherits its frame");
+}
+
+#[tokio::test]
+async fn named_window_shared_across_calls_is_one_node() {
+	// Two calls referencing the same `w` collapse to one Window node (composes with ADR 248 grouping).
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT RANK() OVER w, ROW_NUMBER() OVER w FROM wins \
+			 WINDOW w AS (PARTITION BY grp ORDER BY score)",
+		)
+		.expect("plan shared named window");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"two calls sharing OVER w -> one Window node"
+	);
+	assert_eq!(first_window_functions(&plan), Some(2));
+}
+
+#[tokio::test]
+async fn distinct_named_windows_stack() {
+	// Distinct named windows stack into two nodes (composes with ADR 248 stacking).
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT RANK() OVER w1, ROW_NUMBER() OVER w2 FROM wins \
+			 WINDOW w1 AS (PARTITION BY grp ORDER BY score), w2 AS (ORDER BY id)",
+		)
+		.expect("plan distinct named windows");
+	assert_eq!(
+		count_window_nodes(&plan),
+		2,
+		"two distinct named windows -> two stacked nodes"
+	);
+}
+
+#[tokio::test]
+async fn unknown_named_window_rejects() {
+	assert!(
+		SqlPlanner::new()
+			.plan("SELECT RANK() OVER w FROM wins")
+			.is_err(),
+		"OVER w with no WINDOW clause rejects"
+	);
 }
 
 // ---------------------------------------------------------------------------

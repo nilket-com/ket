@@ -135,15 +135,26 @@ pub(crate) fn adr248_lowering_stacks_one_window_per_distinct_spec() {
 }
 
 #[test]
-pub(crate) fn adr241_named_windows_stay_rejected() {
-	// Reconciled for ADR 243: explicit ROWS frames now plan (RANGE/GROUPS stay deferred — see
-	// adr243_range_groups_and_ranking_frames_stay_rejected); named WINDOW references stay rejected.
+pub(crate) fn adr250_named_window_resolves_in_lowering() {
+	// Reconciled from the ADR 241 named-windows-deferred guard: `OVER w` now RESOLVES to the
+	// WINDOW-clause definition in the lowering (the desugar lives in sql_planner.rs; no IR change).
 	let planner = source("src/sql_planner.rs");
+	let lower = source_block(&planner, "fn lower_select");
+	assert!(
+		lower.contains("NamedWindowMap") && lower.contains("NamedWindowExpr::WindowSpec"),
+		"lower_select builds the name->spec map from the WINDOW clause"
+	);
+	assert!(
+		!lower.contains("WINDOW is not supported"),
+		"the WINDOW-clause reject is gone"
+	);
 	let extract = source_block(&planner, "fn extract_window_call");
-	assert!(extract.contains("WindowType::NamedWindow"));
-	assert!(extract.contains("named windows are not supported"));
+	assert!(
+		extract.contains("WindowType::NamedWindow(name) => named_windows"),
+		"OVER w resolves against the map, not a reject"
+	);
 	let tests = source("tests/window_test.rs");
-	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+	assert!(tests.contains("named_window_resolves_like_inline_spec"));
 }
 
 #[test]
@@ -911,4 +922,47 @@ pub(crate) fn adr249_ntile_distributed_gate_is_value_discriminating() {
 		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
 		"the NTILE distributed gate uses the 236/238 cross-producer cardinal discipline"
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 250 — named windows
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr250_named_windows_are_frontend_only() {
+	// The desugar lives entirely in lowering: no IR / binder / executor / fragmenter surface carries
+	// the named-window resolution.
+	assert!(
+		source("src/sql_planner.rs").contains("type NamedWindowMap"),
+		"the named-window map type lives in the planner"
+	);
+	for path in [
+		"src/ir.rs",
+		"src/binder.rs",
+		"src/exec.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let src = source(path);
+		assert!(
+			!src.contains("NamedWindowMap") && !src.contains("named_windows"),
+			"named-window resolution must stay in lowering: {path}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr250_window_inheritance_and_extension_stay_rejected() {
+	let planner = source("src/sql_planner.rs");
+	let lower = source_block(&planner, "fn lower_select");
+	assert!(
+		lower.contains("window inheritance"),
+		"WINDOW w AS other_window (inheritance) rejects at map build"
+	);
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("window reference inside OVER (...) is not supported"),
+		"OVER (w ...) extension rejects"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("deferred_window_forms_stay_rejected"));
 }

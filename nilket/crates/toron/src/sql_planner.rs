@@ -18,10 +18,10 @@ use sqlparser::ast::{
 	Delete, DescribeAlias, Distinct, DuplicateTreatment, ExactNumberInfo, Expr as SqlExpr,
 	FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
 	GroupByExpr, HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint,
-	JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OptimizerHint,
-	OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator,
-	SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo,
-	TypedString, UnaryOperator, Value, WindowType,
+	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
+	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
+	SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor,
+	TableObject, TimezoneInfo, TypedString, UnaryOperator, Value, WindowSpec, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3484,8 +3484,25 @@ impl SqlPlanner {
 		if !sort_by.is_empty() {
 			return Err(unsupported("SORT BY is not supported"));
 		}
-		if !named_window.is_empty() {
-			return Err(unsupported("WINDOW is not supported"));
+		// ADR 250: collect the WINDOW clause definitions into a name -> spec map for `OVER w` resolution
+		// in lower_select_window. A definition that is itself a reference (`WINDOW w2 AS w1`) is window
+		// inheritance — a spec-merge mechanism, deferred.
+		let mut named_windows: NamedWindowMap = HashMap::new();
+		for NamedWindowDefinition(name, expr) in named_window {
+			let spec = match expr {
+				NamedWindowExpr::WindowSpec(spec) => spec,
+				NamedWindowExpr::NamedWindow(_) => {
+					return Err(unsupported(
+						"window inheritance (WINDOW w AS other_window) is not supported",
+					));
+				}
+			};
+			if named_windows.insert(name.value.clone(), spec).is_some() {
+				return Err(unsupported(format!(
+					"duplicate WINDOW definition '{}'",
+					name.value
+				)));
+			}
 		}
 		if qualify.is_some() {
 			return Err(unsupported("QUALIFY is not supported"));
@@ -3752,7 +3769,8 @@ impl SqlPlanner {
 		// ADR 241: extract SELECT-projection ranking window functions into a `Window` node beneath the
 		// projection (evaluated post-HAVING/pre-projection). Returns the rewritten projection where each
 		// window call is replaced by a reference to its appended rank column.
-		let (plan, window_projection) = self.lower_select_window(plan, projection)?;
+		let (plan, window_projection) =
+			self.lower_select_window(plan, projection, &named_windows)?;
 		let projection = window_projection.as_slice();
 
 		let mut exprs = Vec::new();
@@ -3801,6 +3819,7 @@ impl SqlPlanner {
 		&self,
 		plan: LogicalPlan,
 		projection: &[SelectItem],
+		named_windows: &NamedWindowMap<'_>,
 	) -> Result<(LogicalPlan, Vec<SelectItem>), FrontendError> {
 		if !projection_contains_window_function(projection) {
 			return Ok((plan, projection.to_vec()));
@@ -3824,7 +3843,7 @@ impl SqlPlanner {
 				}
 			};
 
-			match self.extract_window_call(expr, alias.clone())? {
+			match self.extract_window_call(expr, alias.clone(), named_windows)? {
 				Some(window) => {
 					let internal_name = window_internal_output_name(window_index);
 					window_index += 1;
@@ -3897,6 +3916,7 @@ impl SqlPlanner {
 		&self,
 		expr: &SqlExpr,
 		alias: Option<String>,
+		named_windows: &NamedWindowMap<'_>,
 	) -> Result<Option<ExtractedWindow>, FrontendError> {
 		let SqlExpr::Function(function) = expr else {
 			return Ok(None);
@@ -3904,14 +3924,21 @@ impl SqlPlanner {
 		let Some(over) = &function.over else {
 			return Ok(None);
 		};
+		// ADR 250: `OVER w` resolves to the `WINDOW w AS (...)` definition; a resolved spec is then
+		// processed exactly like an inline one (it carries no further name).
 		let spec = match over {
 			WindowType::WindowSpec(spec) => spec,
-			WindowType::NamedWindow(_) => {
-				return Err(unsupported("named WINDOW references are not supported"));
-			}
+			WindowType::NamedWindow(name) => named_windows
+				.get(name.value.as_str())
+				.copied()
+				.ok_or_else(|| unsupported(format!("unknown named window '{}'", name.value)))?,
 		};
+		// The `OVER (w ...)` extension form (a named base merged with added clauses) is a spec-merge
+		// mechanism, deferred — only the bare `OVER w` reference resolves.
 		if spec.window_name.is_some() {
-			return Err(unsupported("named windows are not supported"));
+			return Err(unsupported(
+				"window reference inside OVER (...) is not supported; use OVER <name>",
+			));
 		}
 		// ADR 241 ranking + ADR 242 aggregate windows. Ranking takes no arguments; aggregate windows
 		// reuse the ordinary aggregate lowering (COUNT(*)/COUNT(x)/SUM/MIN/MAX/AVG) over the SQL default
@@ -7207,6 +7234,10 @@ struct WindowSpecGroup {
 	order_by: Vec<SortExpr>,
 	functions: Vec<WindowFunctionCall>,
 }
+
+/// ADR 250: `WINDOW w AS (...)` definitions in scope for a SELECT, keyed by window name, for
+/// resolving `OVER w` references. Window inheritance/extension is a spec-merge mechanism, deferred.
+type NamedWindowMap<'a> = HashMap<String, &'a WindowSpec>;
 
 /// ADR 243: lower a sqlparser `ROWS BETWEEN …` frame to the IR `WindowFrame`. `RANGE`/`GROUPS` units stay
 /// rejected (→ ADR 244); the `end_bound = None` shorthand (`ROWS n PRECEDING`) means `… AND CURRENT ROW`.
