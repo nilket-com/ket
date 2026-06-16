@@ -140,15 +140,19 @@ async fn window_alias_can_shadow_input_column_name() {
 
 #[tokio::test]
 async fn deferred_window_forms_stay_rejected() {
-	// ADR 242 retargets the 241 ranking-only fence: aggregate windows on the default frame now plan,
-	// but explicit frame syntax (incl. bounded ROWS on an aggregate — the next mechanism), DISTINCT
+	// ADR 243 retargets the 242 explicit-frame fence: explicit ROWS frames on aggregate windows now
+	// plan, but RANGE/GROUPS units, frames on ranking functions, invalid bound ordering, DISTINCT
 	// window aggregates, experimental window aggregates, multiple distinct specs, and the still-fenced
 	// window placements stay rejected.
 	for sql in [
-		// explicit frame on a ranking function
+		// explicit frame on a ranking function (frame-independent)
 		"SELECT ROW_NUMBER() OVER (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wins",
-		// explicit bounded ROWS frame on an aggregate (243 rows window frames)
-		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// RANGE explicit frame on an aggregate (→ 244 range window frames)
+		"SELECT SUM(score) OVER (ORDER BY score RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM wins",
+		// GROUPS explicit frame on an aggregate (→ 244)
+		"SELECT SUM(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// invalid bound ordering (start after end)
+		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM wins",
 		// DISTINCT window aggregate
 		"SELECT SUM(DISTINCT score) OVER (PARTITION BY grp) FROM wins",
 		// experimental window aggregate
@@ -302,8 +306,166 @@ async fn running_avg_window_null_and_empty_semantics() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR 243 — rows window frames (explicit ROWS BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rows_frame_running_does_not_share_ties() {
+	// The ROWS-vs-RANGE discriminator. ORDER BY score has a tie at 10 in grp a; the totalized sort puts
+	// those two rows at adjacent positions. A `ROWS UNBOUNDED PRECEDING AND CURRENT ROW` cumulative gives
+	// each its own frame end -> 10, 20 (distinct on this fixture), where the 242 RANGE default shares 20.
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![10, 20, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![5, 10]);
+}
+
+#[tokio::test]
+async fn default_frame_aggregate_window_unchanged() {
+	// Regression: an absent frame still computes the 242 RANGE default (tied score=10 rows in grp a share
+	// the cumulative-through-peer-group value 20). Contrast with rows_frame_running_does_not_share_ties.
+	let rows =
+		run_window("SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	assert_eq!(group_values(&rows, "a"), vec![20, 20, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![10, 10]);
+}
+
+#[tokio::test]
+async fn rows_frame_moving_window_edges_respect_offsets() {
+	// ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING is a 3-row centered window, clamped at the edges. grp a
+	// ordered by id has scores [10,10,20]: row0 sees [10,10]=20, row1 sees [10,10,20]=40, row2 sees
+	// [10,20]=30. grp b [5,5]: both see the 2-row partition = 10.
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY id \
+		 ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![20, 40, 30]);
+	assert_eq!(group_values(&rows, "b"), vec![10, 10]);
+}
+
+#[tokio::test]
+async fn rows_frame_current_row_and_following() {
+	// Look-ahead frame: CURRENT ROW AND 1 FOLLOWING. grp a scores [10,10,20] by id: row0 [10,10]=20,
+	// row1 [10,20]=30, row2 [20]=20 (clamped at the last row).
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY id \
+		 ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![20, 30, 20]);
+	assert_eq!(group_values(&rows, "b"), vec![10, 5]);
+}
+
+#[tokio::test]
+async fn rows_frame_empty_window_is_null() {
+	// A frame entirely past the partition end yields the empty aggregate: COUNT -> 0, SUM -> NULL.
+	// grp a by id (positions 0,1,2): ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING -> row0 sees position 2
+	// (count 1), rows 1 and 2 see nothing (count 0 / SUM NULL).
+	let counts = run_window(
+		"SELECT grp, COUNT(*) OVER (PARTITION BY grp ORDER BY id \
+		 ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) AS c FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&counts, "a"), vec![1, 0, 0]);
+
+	let sums = run_wins_window_opt_i64(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY id \
+		 ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) AS s FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&sums, "a"), vec![Some(20), None, None]);
+}
+
+#[tokio::test]
+async fn rows_frame_multiple_functions_can_differ_in_frame() {
+	// The per-call-frame discriminator (fails under a node-level frame): two aggregate windows over ONE
+	// OVER spec (same PARTITION/ORDER) with DIFFERENT frames compute in one Window node. A 1-PRECEDING
+	// trailing sum differs from the default running sum at the last row of grp a (30 vs 40).
+	let sql = "SELECT grp, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS trailing, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY id) AS running FROM wins";
+	let plan = SqlPlanner::new().plan(sql).expect("plan two-frame window");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"one Window node for one OVER spec"
+	);
+	assert_eq!(
+		first_window_functions(&plan),
+		Some(2),
+		"both differently-framed functions live in the single Window node"
+	);
+
+	let (catalog, storage) = fixture();
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind two-frame window");
+	let results = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute two-frame window");
+	// Collect (grp, trailing, running) and check grp a's last row: trailing 30 != running 40.
+	let mut a_trailing = Vec::new();
+	let mut a_running = Vec::new();
+	for batch in &results {
+		let grp = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		let trailing = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let running = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			if grp.value(row) == "a" {
+				a_trailing.push(trailing.value(row));
+				a_running.push(running.value(row));
+			}
+		}
+	}
+	assert_eq!(a_trailing, vec![10, 20, 30], "trailing 1-PRECEDING frame");
+	assert_eq!(a_running, vec![10, 20, 40], "default running frame");
+	assert_ne!(
+		a_trailing, a_running,
+		"the two frames compute different values"
+	);
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
+
+/// Run a wins-fixture window query reading a nullable Int64 window column (for empty-frame NULL checks).
+async fn run_wins_window_opt_i64(sql: &str) -> Vec<(Option<String>, Option<i64>)> {
+	let logical = SqlPlanner::new().plan(sql).expect("plan wins window query");
+	let (catalog, storage) = fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind wins window query");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute wins window query");
+	read_obs_values(&batches, |column, row| {
+		let array = column
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("int64 window value column");
+		(!array.is_null(row)).then(|| array.value(row))
+	})
+}
 
 /// Run a window query and return `(grp, window_value)` rows (grp = column 0, window value = column 1).
 async fn run_window(sql: &str) -> Vec<(Option<String>, i64)> {

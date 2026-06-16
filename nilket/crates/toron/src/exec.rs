@@ -15,8 +15,8 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
 	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
-	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, WindowFunction,
-	nanos_per_timestamp_unit,
+	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
+	WindowFrameBound, WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -3730,6 +3730,24 @@ fn execute_window(
 		is_peer_group_end[row] = row + 1 == rows || is_new_peer_group[row + 1];
 	}
 
+	// ADR 243: per-row partition bounds (inclusive) for ROWS-frame slicing.
+	let mut partition_start = vec![0_usize; rows];
+	let mut current_start = 0_usize;
+	for row in 0..rows {
+		if is_new_partition[row] {
+			current_start = row;
+		}
+		partition_start[row] = current_start;
+	}
+	let mut partition_end = vec![rows - 1; rows];
+	let mut current_end = rows - 1;
+	for row in (0..rows).rev() {
+		if row + 1 == rows || is_new_partition[row + 1] {
+			current_end = row;
+		}
+		partition_end[row] = current_end;
+	}
+
 	let mut row_number = vec![0_i64; rows];
 	let mut rank = vec![0_i64; rows];
 	let mut dense_rank = vec![0_i64; rows];
@@ -3782,8 +3800,11 @@ fn execute_window(
 				let column = execute_window_aggregate(
 					function,
 					sorted_arg.as_ref(),
+					call.frame,
 					&is_new_partition,
 					&is_peer_group_end,
+					&partition_start,
+					&partition_end,
 					rows,
 					output_type,
 				)?;
@@ -3795,12 +3816,44 @@ fn execute_window(
 	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
 }
 
-/// Compute one aggregate-window column over the SQL default frame (`RANGE UNBOUNDED PRECEDING AND
-/// CURRENT ROW`). Maintains a running accumulator over the sorted partition, finalizing a snapshot at
-/// each peer-group boundary and assigning it to every row of that peer group, so tied `ORDER BY` rows
-/// share the cumulative-through-peer-group value. Whole-partition (no `ORDER BY`) is the single
-/// peer-group case. Reuses the scalar-aggregate state helpers.
+/// Compute one aggregate-window column. With no explicit frame (`None`), the 242 default frame
+/// (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW` — peer-aware cumulative); with an explicit `ROWS` frame
+/// (ADR 243), a per-row sliding slice clamped to the partition.
 fn execute_window_aggregate(
+	function: &AggregateFunction,
+	sorted_arg: Option<&ArrayRef>,
+	frame: Option<WindowFrame>,
+	is_new_partition: &[bool],
+	is_peer_group_end: &[bool],
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	match frame {
+		None => execute_window_aggregate_default(
+			function,
+			sorted_arg,
+			is_new_partition,
+			is_peer_group_end,
+			rows,
+			output_type,
+		),
+		Some(frame) => execute_window_aggregate_rows(
+			function,
+			sorted_arg,
+			frame,
+			partition_start,
+			partition_end,
+			rows,
+			output_type,
+		),
+	}
+}
+
+/// ADR 242 default frame: a running accumulator over the sorted partition, finalized at each peer-group
+/// boundary and assigned to every row of that peer group (tied `ORDER BY` rows share the value).
+fn execute_window_aggregate_default(
 	function: &AggregateFunction,
 	sorted_arg: Option<&ArrayRef>,
 	is_new_partition: &[bool],
@@ -3818,76 +3871,153 @@ fn execute_window_aggregate(
 			count = 0;
 			state = fresh_window_agg_state(function, arg_type.as_ref())?;
 		}
-		match function {
-			AggregateFunction::CountAll => {
-				count += 1;
-			}
-			AggregateFunction::Count => {
-				if let Some(arg) = sorted_arg
-					&& !arg.is_null(row)
-				{
-					count += 1;
-				}
-			}
-			AggregateFunction::Sum => {
-				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
-					&& let Some(value) = numeric_value(arg, row)?
-				{
-					add_sum_value(state, value)?;
-				}
-			}
-			AggregateFunction::Avg => {
-				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
-					&& let Some(value) = numeric_value(arg, row)?
-				{
-					add_avg_value(state, value)?;
-				}
-			}
-			AggregateFunction::Min => {
-				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
-					update_min_state(state, arg, row)?;
-				}
-			}
-			AggregateFunction::Max => {
-				if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
-					update_max_state(state, arg, row)?;
-				}
-			}
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-				return Err(ExecutionError::NotImplemented {
-					feature: "window experimental aggregate execution",
-				});
-			}
-		}
+		window_agg_add(function, &mut state, &mut count, sorted_arg, row)?;
 		group_len += 1;
 		if is_peer_group_end[row] {
-			let value: ArrayRef = match function {
-				AggregateFunction::CountAll | AggregateFunction::Count => {
-					Arc::new(Int64Array::from(vec![count])) as ArrayRef
-				}
-				AggregateFunction::Sum => {
-					sum_state_array(state.as_ref().expect("sum window state"), output_type)?
-				}
-				AggregateFunction::Avg => {
-					avg_state_array(state.as_ref().expect("avg window state"))?
-				}
-				AggregateFunction::Min | AggregateFunction::Max => {
-					min_max_state_array(state.as_ref().expect("min/max window state"))?
-				}
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-					return Err(ExecutionError::NotImplemented {
-						feature: "window experimental aggregate execution",
-					});
-				}
-			};
+			let value = window_agg_finalize(function, &state, count, output_type)?;
 			let repeat = UInt32Array::from(vec![0_u32; group_len]);
 			group_arrays.push(take(&value, &repeat, None)?);
 			group_len = 0;
 		}
 	}
-	let refs: Vec<&dyn arrow::array::Array> =
-		group_arrays.iter().map(|array| array.as_ref()).collect();
+	concat_window_columns(&group_arrays)
+}
+
+/// ADR 243 explicit `ROWS` frame: for each row, re-aggregate a fresh accumulator over the physical
+/// frame slice `[lo, hi]` (clamped to the partition); an empty frame yields the empty aggregate.
+fn execute_window_aggregate_rows(
+	function: &AggregateFunction,
+	sorted_arg: Option<&ArrayRef>,
+	frame: WindowFrame,
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	for row in 0..rows {
+		let mut count: i64 = 0;
+		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		if let Some((lo, hi)) =
+			window_frame_slice(frame, row, partition_start[row], partition_end[row])
+		{
+			for slot in lo..=hi {
+				window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
+			}
+		}
+		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+	}
+	concat_window_columns(&row_arrays)
+}
+
+fn concat_window_columns(columns: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+	let refs: Vec<&dyn arrow::array::Array> = columns.iter().map(|array| array.as_ref()).collect();
 	Ok(arrow::compute::concat(&refs)?)
+}
+
+/// Fold one row's contribution into the window accumulator (counts via `count`, the rest via `state`).
+fn window_agg_add(
+	function: &AggregateFunction,
+	state: &mut Option<AggState>,
+	count: &mut i64,
+	sorted_arg: Option<&ArrayRef>,
+	row: usize,
+) -> Result<(), ExecutionError> {
+	match function {
+		AggregateFunction::CountAll => *count += 1,
+		AggregateFunction::Count => {
+			if let Some(arg) = sorted_arg
+				&& !arg.is_null(row)
+			{
+				*count += 1;
+			}
+		}
+		AggregateFunction::Sum => {
+			if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
+				&& let Some(value) = numeric_value(arg, row)?
+			{
+				add_sum_value(state, value)?;
+			}
+		}
+		AggregateFunction::Avg => {
+			if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut())
+				&& let Some(value) = numeric_value(arg, row)?
+			{
+				add_avg_value(state, value)?;
+			}
+		}
+		AggregateFunction::Min => {
+			if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
+				update_min_state(state, arg, row)?;
+			}
+		}
+		AggregateFunction::Max => {
+			if let (Some(arg), Some(state)) = (sorted_arg, state.as_mut()) {
+				update_max_state(state, arg, row)?;
+			}
+		}
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			return Err(ExecutionError::NotImplemented {
+				feature: "window experimental aggregate execution",
+			});
+		}
+	}
+	Ok(())
+}
+
+/// Finalize a window accumulator into a one-element array (NULL/0 for an empty frame).
+fn window_agg_finalize(
+	function: &AggregateFunction,
+	state: &Option<AggState>,
+	count: i64,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	Ok(match function {
+		AggregateFunction::CountAll | AggregateFunction::Count => {
+			Arc::new(Int64Array::from(vec![count])) as ArrayRef
+		}
+		AggregateFunction::Sum => {
+			sum_state_array(state.as_ref().expect("sum window state"), output_type)?
+		}
+		AggregateFunction::Avg => avg_state_array(state.as_ref().expect("avg window state"))?,
+		AggregateFunction::Min | AggregateFunction::Max => {
+			min_max_state_array(state.as_ref().expect("min/max window state"))?
+		}
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			return Err(ExecutionError::NotImplemented {
+				feature: "window experimental aggregate execution",
+			});
+		}
+	})
+}
+
+/// ADR 243: the physical `[lo, hi]` (inclusive) slice of a `ROWS` frame for `row`, clamped to the
+/// partition `[partition_start, partition_end]`. `None` when the frame is empty (lands outside).
+fn window_frame_slice(
+	frame: WindowFrame,
+	row: usize,
+	partition_start: usize,
+	partition_end: usize,
+) -> Option<(usize, usize)> {
+	let lo = frame_bound_position(frame.start, row).max(partition_start as i64);
+	let hi = frame_bound_position(frame.end, row).min(partition_end as i64);
+	if lo > hi {
+		None
+	} else {
+		Some((lo as usize, hi as usize))
+	}
+}
+
+fn frame_bound_position(bound: WindowFrameBound, row: usize) -> i64 {
+	let row = row as i64;
+	match bound {
+		WindowFrameBound::UnboundedPreceding => i64::MIN,
+		WindowFrameBound::Preceding(n) => row.saturating_sub(i64::try_from(n).unwrap_or(i64::MAX)),
+		WindowFrameBound::CurrentRow => row,
+		WindowFrameBound::Following(n) => row.saturating_add(i64::try_from(n).unwrap_or(i64::MAX)),
+		WindowFrameBound::UnboundedFollowing => i64::MAX,
+	}
 }
 
 fn fresh_window_agg_state(

@@ -6,8 +6,8 @@ use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CreateTableColumn, CreateTableColumnType,
 	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
-	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, WindowFunction,
-	WindowFunctionCall, data_type_to_logical_type_physical,
+	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, WindowFrame,
+	WindowFrameBound, WindowFunction, WindowFunctionCall, data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -3844,6 +3844,7 @@ impl SqlPlanner {
 						function: window.function,
 						output_name: internal_name,
 						args: window.args,
+						frame: window.frame,
 					});
 				}
 				None => {
@@ -3877,7 +3878,8 @@ impl SqlPlanner {
 	}
 
 	/// Extract a ranking window function from a SELECT expression, or `None` if `expr` is not itself a
-	/// window call. Frames, named windows, aggregate-window, and non-ranking functions are rejected.
+	/// window call. Named windows and non-ranking/non-aggregate functions are rejected; explicit `ROWS`
+	/// frames (ADR 243) lower on aggregate calls, `RANGE`/`GROUPS` stay rejected.
 	fn extract_window_call(
 		&self,
 		expr: &SqlExpr,
@@ -3895,9 +3897,6 @@ impl SqlPlanner {
 				return Err(unsupported("named WINDOW references are not supported"));
 			}
 		};
-		if spec.window_frame.is_some() {
-			return Err(unsupported("explicit window frames are not supported"));
-		}
 		if spec.window_name.is_some() {
 			return Err(unsupported("named windows are not supported"));
 		}
@@ -3968,6 +3967,19 @@ impl SqlPlanner {
 				})
 			})
 			.collect::<Result<Vec<_>, FrontendError>>()?;
+		// ADR 243: lower an explicit `ROWS BETWEEN …` frame on an aggregate window. Frames on ranking
+		// functions are rejected; `RANGE`/`GROUPS` units stay rejected (→ ADR 244).
+		let frame = match &spec.window_frame {
+			Some(frame) => {
+				if !matches!(window_function, WindowFunction::Aggregate(_)) {
+					return Err(unsupported(
+						"window frames are not supported on ranking functions",
+					));
+				}
+				Some(lower_rows_window_frame(frame)?)
+			}
+			None => None,
+		};
 		let output_name =
 			alias.unwrap_or_else(|| window_function_default_name(&window_function).to_string());
 		Ok(Some(ExtractedWindow {
@@ -3976,6 +3988,7 @@ impl SqlPlanner {
 			partition_by,
 			order_by,
 			args: window_args,
+			frame,
 		}))
 	}
 
@@ -6928,6 +6941,87 @@ struct ExtractedWindow {
 	partition_by: Vec<Expr>,
 	order_by: Vec<SortExpr>,
 	args: Vec<Expr>,
+	frame: Option<WindowFrame>,
+}
+
+/// ADR 243: lower a sqlparser `ROWS BETWEEN …` frame to the IR `WindowFrame`. `RANGE`/`GROUPS` units stay
+/// rejected (→ ADR 244); the `end_bound = None` shorthand (`ROWS n PRECEDING`) means `… AND CURRENT ROW`.
+fn lower_rows_window_frame(
+	frame: &sqlparser::ast::WindowFrame,
+) -> Result<WindowFrame, FrontendError> {
+	match frame.units {
+		sqlparser::ast::WindowFrameUnits::Rows => {}
+		sqlparser::ast::WindowFrameUnits::Range => {
+			return Err(unsupported("RANGE window frames are not supported"));
+		}
+		sqlparser::ast::WindowFrameUnits::Groups => {
+			return Err(unsupported("GROUPS window frames are not supported"));
+		}
+	}
+	let start = lower_window_frame_bound(&frame.start_bound)?;
+	let end = match &frame.end_bound {
+		Some(bound) => lower_window_frame_bound(bound)?,
+		None => WindowFrameBound::CurrentRow,
+	};
+	if matches!(start, WindowFrameBound::UnboundedFollowing) {
+		return Err(unsupported(
+			"window frame start cannot be UNBOUNDED FOLLOWING",
+		));
+	}
+	if matches!(end, WindowFrameBound::UnboundedPreceding) {
+		return Err(unsupported(
+			"window frame end cannot be UNBOUNDED PRECEDING",
+		));
+	}
+	if window_frame_bound_rank(start) > window_frame_bound_rank(end) {
+		return Err(unsupported(
+			"window frame start must not come after frame end",
+		));
+	}
+	Ok(WindowFrame { start, end })
+}
+
+fn lower_window_frame_bound(
+	bound: &sqlparser::ast::WindowFrameBound,
+) -> Result<WindowFrameBound, FrontendError> {
+	Ok(match bound {
+		sqlparser::ast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+		sqlparser::ast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
+		sqlparser::ast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
+		sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+			WindowFrameBound::Preceding(window_frame_offset(expr)?)
+		}
+		sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+			WindowFrameBound::Following(window_frame_offset(expr)?)
+		}
+	})
+}
+
+fn window_frame_offset(expr: &SqlExpr) -> Result<u64, FrontendError> {
+	let invalid = || unsupported("ROWS frame offset must be a non-negative integer");
+	match stripped_sql_value(expr) {
+		Some(Value::Number(number, _))
+			if !number.starts_with('-')
+				&& !number.contains('.')
+				&& !number.contains('e')
+				&& !number.contains('E') =>
+		{
+			number.parse::<u64>().map_err(|_| invalid())
+		}
+		_ => Err(invalid()),
+	}
+}
+
+/// Total order over frame bounds for the start ≤ end validation: `UNBOUNDED PRECEDING < n PRECEDING <
+/// CURRENT ROW < n FOLLOWING < UNBOUNDED FOLLOWING`.
+fn window_frame_bound_rank(bound: WindowFrameBound) -> i128 {
+	match bound {
+		WindowFrameBound::UnboundedPreceding => i128::MIN,
+		WindowFrameBound::Preceding(n) => -(i128::from(n)),
+		WindowFrameBound::CurrentRow => 0,
+		WindowFrameBound::Following(n) => i128::from(n),
+		WindowFrameBound::UnboundedFollowing => i128::MAX,
+	}
 }
 
 fn window_function_default_name(function: &WindowFunction) -> &'static str {

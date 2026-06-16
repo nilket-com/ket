@@ -868,9 +868,9 @@ pub enum AggregateFunction {
 
 /// Window functions over one `OVER (...)` spec. Ranking functions (ADR 241) take no arguments and
 /// depend only on the partition + order. `Aggregate` (ADR 242) carries an `AggregateFunction` evaluated
-/// over the SQL default frame (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW`): with `ORDER BY`, a
-/// peer-aware running aggregate; without, the whole-partition aggregate. Explicit `ROWS`/`RANGE BETWEEN`
-/// frames and LAG/LEAD/NTILE are deferred follow-ons.
+/// over a frame: the SQL default (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW` — peer-aware cumulative, or
+/// whole-partition with no `ORDER BY`) when the call carries no explicit frame, or an explicit `ROWS`
+/// frame (ADR 243). `RANGE`/`GROUPS` explicit units and LAG/LEAD/NTILE are deferred follow-ons.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFunction {
 	RowNumber,
@@ -879,14 +879,36 @@ pub enum WindowFunction {
 	Aggregate(AggregateFunction),
 }
 
+/// ADR 243: an explicit `ROWS` window-frame bound. `Preceding(n)`/`Following(n)` are physical row offsets
+/// from the current row; `Unbounded*` reach the partition edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+	UnboundedPreceding,
+	Preceding(u64),
+	CurrentRow,
+	Following(u64),
+	UnboundedFollowing,
+}
+
+/// ADR 243: an explicit `ROWS BETWEEN <start> AND <end>` physical row-offset frame on an aggregate window
+/// call. The unit is implicitly `ROWS` in this cut (`RANGE`/`GROUPS` units are deferred to ADR 244); the
+/// executor slides the `[start, end]` slice per row, clamped to the partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowFrame {
+	pub start: WindowFrameBound,
+	pub end: WindowFrameBound,
+}
+
 /// A single window function call in a `Window` node's projection: the function, the output column name
-/// it appends (the SELECT alias or a derived name), and its arguments (ranking + `COUNT(*)`: none;
-/// other aggregate windows: exactly one).
+/// it appends (the SELECT alias or a derived name), its arguments (ranking + `COUNT(*)`: none; other
+/// aggregate windows: exactly one), and an optional explicit `ROWS` frame (ADR 243; `None` = the 242
+/// default frame).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowFunctionCall {
 	pub function: WindowFunction,
 	pub output_name: String,
 	pub args: Vec<Expr>,
+	pub frame: Option<WindowFrame>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

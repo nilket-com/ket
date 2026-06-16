@@ -121,13 +121,13 @@ pub(crate) fn adr241_single_over_spec_per_query_multiple_specs_deferred() {
 }
 
 #[test]
-pub(crate) fn adr241_frames_and_named_windows_stay_rejected() {
-	// Reconciled for ADR 242: aggregate windows now plan, but explicit frames and named windows stay
-	// rejected (the explicit-frame deferral is the boundary toward ADR 243 rows window frames).
+pub(crate) fn adr241_named_windows_stay_rejected() {
+	// Reconciled for ADR 243: explicit ROWS frames now plan (RANGE/GROUPS stay deferred — see
+	// adr243_range_groups_and_ranking_frames_stay_rejected); named WINDOW references stay rejected.
 	let planner = source("src/sql_planner.rs");
 	let extract = source_block(&planner, "fn extract_window_call");
-	assert!(extract.contains("explicit window frames are not supported"));
 	assert!(extract.contains("WindowType::NamedWindow"));
+	assert!(extract.contains("named windows are not supported"));
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("deferred_window_forms_stay_rejected"));
 }
@@ -208,16 +208,18 @@ pub(crate) fn adr242_aggregate_window_lowers_to_window_node_reusing_kernels() {
 
 #[test]
 pub(crate) fn adr242_default_frame_is_range_unbounded_preceding() {
-	// The executor finalizes the running accumulator per peer group (the RANGE default-frame unit), so
-	// tied ORDER BY rows share the cumulative value. The discriminating behavior gate proves it.
+	// The default-frame path finalizes the running accumulator per peer group (the RANGE default-frame
+	// unit), so tied ORDER BY rows share the cumulative value. (Reconciled for ADR 243: the peer logic
+	// now lives in `execute_window_aggregate_default`; `execute_window_aggregate` dispatches on frame.)
 	let exec = source("src/exec.rs");
-	let aggregate = source_block(&exec, "fn execute_window_aggregate");
+	let aggregate = source_block(&exec, "fn execute_window_aggregate_default");
 	assert!(
 		aggregate.contains("is_peer_group_end"),
-		"the window aggregate finalizes per peer group (RANGE), not row-by-row (ROWS)"
+		"the default window aggregate finalizes per peer group (RANGE), not row-by-row (ROWS)"
 	);
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("running_window_range_ties_share_value"));
+	assert!(tests.contains("default_frame_aggregate_window_unchanged"));
 }
 
 #[test]
@@ -236,10 +238,11 @@ pub(crate) fn adr242_window_aggregate_is_row_preserving() {
 }
 
 #[test]
-pub(crate) fn adr242_explicit_frames_and_distinct_window_aggregate_stay_rejected() {
+pub(crate) fn adr242_distinct_and_experimental_window_aggregates_stay_rejected() {
+	// Reconciled for ADR 243: explicit ROWS frames now lower (the blanket frame reject is gone), but
+	// DISTINCT and experimental window aggregates stay rejected.
 	let planner = source("src/sql_planner.rs");
 	let extract = source_block(&planner, "fn extract_window_call");
-	assert!(extract.contains("explicit window frames are not supported"));
 	assert!(extract.contains("DISTINCT window aggregates are not supported"));
 	assert!(
 		extract.contains("only COUNT, SUM, MIN, MAX, and AVG"),
@@ -292,5 +295,132 @@ pub(crate) fn adr242_no_new_physical_optimizer_durable_wendelon_or_rune_surface(
 	assert!(
 		wendelon_offenders.is_empty(),
 		"aggregate windows must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 243 — rows window frames (explicit ROWS BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr243_window_call_carries_optional_rows_frame() {
+	let ir = source("src/ir.rs");
+	let execution = source("src/ir/execution.rs");
+	assert!(ir.contains("pub enum WindowFrameBound"));
+	assert!(ir.contains("pub struct WindowFrame"));
+	let call = source_block(&ir, "pub struct WindowFunctionCall");
+	assert!(
+		call.contains("frame: Option<WindowFrame>"),
+		"the logical window call carries an optional frame"
+	);
+	let bound = source_block(&execution, "pub struct BoundWindowCall");
+	assert!(
+		bound.contains("frame: Option<WindowFrame>"),
+		"the bound window call carries the frame per-call (not on the Window node)"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("rows_frame_multiple_functions_can_differ_in_frame"));
+}
+
+#[test]
+pub(crate) fn adr243_rows_frame_lowers_with_bounds_reusing_window_node() {
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("fn lower_rows_window_frame"));
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("lower_rows_window_frame"),
+		"an explicit ROWS frame lowers to the per-call frame payload"
+	);
+	assert!(
+		planner.contains("WindowFrameBound::Preceding")
+			&& planner.contains("WindowFrameBound::Following"),
+		"the frame bounds map to the IR WindowFrameBound"
+	);
+}
+
+#[test]
+pub(crate) fn adr243_rows_frame_executor_is_sliding_not_peer_default() {
+	let exec = source("src/exec.rs");
+	assert!(exec.contains("fn execute_window_aggregate_rows"));
+	let dispatch = source_block(&exec, "fn execute_window_aggregate(");
+	assert!(
+		dispatch.contains("execute_window_aggregate_rows")
+			&& dispatch.contains("execute_window_aggregate_default"),
+		"the window aggregate dispatches on the frame (default peer path vs. ROWS sliding path)"
+	);
+	let rows = source_block(&exec, "fn execute_window_aggregate_rows");
+	assert!(
+		rows.contains("window_frame_slice"),
+		"the ROWS path re-aggregates a per-row physical slice, not the peer accumulator"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("rows_frame_running_does_not_share_ties"));
+}
+
+#[test]
+pub(crate) fn adr243_rows_frame_window_is_row_preserving() {
+	let binder = binder_source();
+	assert!(
+		binder.contains("frame: call.frame"),
+		"the per-call frame threads into the bound window call"
+	);
+	assert!(binder.contains("PlanOptimizerFacts::composite_with_row"));
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("rows_frame_moving_window_edges_respect_offsets"));
+}
+
+#[test]
+pub(crate) fn adr243_range_groups_and_ranking_frames_stay_rejected() {
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("RANGE window frames are not supported"));
+	assert!(planner.contains("GROUPS window frames are not supported"));
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("window frames are not supported on ranking functions"),
+		"frames on ranking functions stay rejected"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr243_rows_frame_reuses_partition_exchange_fragmentation() {
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"no dedicated window fragmenter"
+	);
+	let dispatch = source_block(&fragment, "fn fragment_join_plan");
+	assert!(
+		!dispatch.contains("Window"),
+		"no Window arm in the join fragmenter dispatch"
+	);
+}
+
+#[test]
+pub(crate) fn adr243_rows_frame_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("rows_frame_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn rows_frame_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed ROWS-frame gate must use the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+#[test]
+pub(crate) fn adr243_no_new_physical_optimizer_durable_wendelon_or_rune_surface() {
+	// ROWS frames reuse the existing Window node + aggregate kernels: the frame payload does not cross
+	// into Wendelon.
+	let wendelon_offenders: Vec<_> = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("WindowFrame") || line.contains("WindowFrameBound"))
+		.collect();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"window frames must not cross into Wendelon: {wendelon_offenders:?}"
 	);
 }

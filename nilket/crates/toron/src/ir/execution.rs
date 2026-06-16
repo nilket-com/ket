@@ -10,7 +10,8 @@ use crate::catalog::{
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
-	TemporalExtractField, TemporalTruncField, WindowFunction, field_with_logical_type_metadata,
+	TemporalExtractField, TemporalTruncField, WindowFrame, WindowFunction,
+	field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -149,13 +150,15 @@ pub struct BoundAggregateCall {
 	pub args: BoundExprProgram,
 }
 
-/// ADR 242: a bound window function call in an `ExecutionPlan::Window`. `function` is the ranking or
+/// ADR 242/243: a bound window function call in an `ExecutionPlan::Window`. `function` is the ranking or
 /// `Aggregate` kind; `arg` is the bound aggregate argument (`Some` for `COUNT(x)/SUM/MIN/MAX/AVG`,
-/// `None` for ranking and `COUNT(*)`).
+/// `None` for ranking and `COUNT(*)`); `frame` is the explicit `ROWS` frame (ADR 243; `None` = the 242
+/// default frame).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoundWindowCall {
 	pub function: WindowFunction,
 	pub arg: Option<BoundExprProgram>,
+	pub frame: Option<WindowFrame>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

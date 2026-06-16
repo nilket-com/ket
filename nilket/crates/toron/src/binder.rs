@@ -1372,6 +1372,7 @@ impl<'a> Binder<'a> {
 						bound_calls.push(BoundWindowCall {
 							function: call.function.clone(),
 							arg,
+							frame: call.frame,
 						});
 					}
 					let output_schema = Arc::new(Schema::new(fields));
