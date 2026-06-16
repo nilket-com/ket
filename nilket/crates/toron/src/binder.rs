@@ -1342,7 +1342,8 @@ impl<'a> Binder<'a> {
 						let arg = match &call.function {
 							WindowFunction::RowNumber
 							| WindowFunction::Rank
-							| WindowFunction::DenseRank => {
+							| WindowFunction::DenseRank
+							| WindowFunction::Ntile { .. } => {
 								fields.push(Field::new(&call.output_name, DataType::Int64, false));
 								None
 							}

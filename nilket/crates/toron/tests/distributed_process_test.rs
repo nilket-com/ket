@@ -897,6 +897,33 @@ async fn multiple_specs_distributed_gate_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ntile_distributed_gate_is_value_discriminating() {
+	// ADR 249 distributed gate (236/238). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL]. The NULL
+	// partition holds ids 2,4 (scan-shared across workers); ordered by id, NTILE(2) gives id 2 -> bucket
+	// 1 and id 4 -> bucket 2, which holds only once the exchange co-locates and orders both rows. A single
+	// producer sees one row (a 1-row partition -> bucket 1) and never reaches bucket 2.
+	let run = run_window_process_query(
+		1_444,
+		0,
+		"SELECT set_left.set_key, \
+		        NTILE(2) OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS bucket \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 1), (None, 2), (Some(7), 1), (Some(9), 1)],
+		"the NULL partition (ids 2,4) buckets to 1 then 2; the singleton partitions are bucket 1"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"id 4's NTILE bucket 2 requires the partition exchange to co-locate id 2 (scan-shared on the \
+		 other worker) and order it first; a single producer sees a 1-row partition and reaches only bucket 1",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

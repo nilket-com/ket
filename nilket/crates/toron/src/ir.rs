@@ -870,12 +870,18 @@ pub enum AggregateFunction {
 /// + order. `Aggregate` (ADR 242) folds a frame (default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`, or
 /// an explicit `ROWS`/`RANGE`/`GROUPS` frame, ADR 243–245). `Value` (ADR 246) returns an expression's
 /// value at another row of the ordered partition — positional for `LAG`/`LEAD`, frame-boundary for
-/// `FirstValue`/`LastValue`/`NthValue`. `NTILE` is a deferred follow-on.
+/// `FirstValue`/`LastValue`/`NthValue`. `Ntile` (ADR 249) divides the ordered partition into a fixed
+/// number of near-equal buckets, like the ranking functions depending only on partition geometry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFunction {
 	RowNumber,
 	Rank,
 	DenseRank,
+	/// ADR 249: divide the ordered partition into `buckets` near-equal groups (the first `len % buckets`
+	/// hold one extra row) and emit the 1-based bucket index per row. Frame-independent.
+	Ntile {
+		buckets: u64,
+	},
 	Aggregate(AggregateFunction),
 	Value(ValueFunction),
 }

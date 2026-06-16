@@ -3958,9 +3958,38 @@ impl SqlPlanner {
 			}
 		} else if let Some((value_fn, value_args)) = self.extract_value_function(function)? {
 			(WindowFunction::Value(value_fn), value_args)
+		} else if function_name_eq(&function.name, "NTILE") {
+			// ADR 249: NTILE(n) — n a strictly positive integer literal. Frame-independent, no bound
+			// argument (the bucket count rides in the variant, like ranking).
+			if function.null_treatment.is_some() {
+				return Err(unsupported(
+					"IGNORE/RESPECT NULLS is not supported for window functions",
+				));
+			}
+			if function.filter.is_some() {
+				return Err(unsupported("FILTER is not supported for window functions"));
+			}
+			let buckets = match &function.args {
+				FunctionArguments::List(list) if list.args.len() == 1 => match list.args.first() {
+					Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => {
+						ntile_bucket_count(expr)?
+					}
+					_ => {
+						return Err(unsupported(
+							"NTILE requires a positive integer bucket count",
+						));
+					}
+				},
+				_ => {
+					return Err(unsupported(
+						"NTILE requires exactly one positive integer bucket count",
+					));
+				}
+			};
+			(WindowFunction::Ntile { buckets }, Vec::new())
 		} else {
 			return Err(unsupported(
-				"only ROW_NUMBER, RANK, DENSE_RANK, COUNT/SUM/MIN/MAX/AVG, and LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE window functions are supported",
+				"only ROW_NUMBER, RANK, DENSE_RANK, NTILE, COUNT/SUM/MIN/MAX/AVG, and LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE window functions are supported",
 			));
 		};
 		// LAG/LEAD are positional navigation — meaningless without an order.
@@ -3997,10 +4026,13 @@ impl SqlPlanner {
 			Some(frame) => {
 				if matches!(
 					window_function,
-					WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank
+					WindowFunction::RowNumber
+						| WindowFunction::Rank
+						| WindowFunction::DenseRank
+						| WindowFunction::Ntile { .. }
 				) {
 					return Err(unsupported(
-						"window frames are not supported on ranking functions",
+						"window frames are not supported on ranking or NTILE functions",
 					));
 				}
 				let lowered = self.lower_window_frame(frame)?;
@@ -7238,6 +7270,26 @@ fn window_frame_offset(expr: &SqlExpr) -> Result<u64, FrontendError> {
 	}
 }
 
+/// ADR 249: parse an `NTILE(n)` bucket count — a strictly positive integer literal.
+fn ntile_bucket_count(expr: &SqlExpr) -> Result<u64, FrontendError> {
+	let invalid = || unsupported("NTILE requires a positive integer bucket count");
+	let count = match stripped_sql_value(expr) {
+		Some(Value::Number(number, _))
+			if !number.starts_with('-')
+				&& !number.contains('.')
+				&& !number.contains('e')
+				&& !number.contains('E') =>
+		{
+			number.parse::<u64>().map_err(|_| invalid())?
+		}
+		_ => return Err(invalid()),
+	};
+	if count == 0 {
+		return Err(invalid());
+	}
+	Ok(count)
+}
+
 /// Whether a frame carries an explicit offset bound (a `Preceding`/`Following` with a magnitude) — a RANGE
 /// value distance or a GROUPS peer-group count; `UNBOUNDED`/`CURRENT ROW` bounds carry none.
 fn frame_has_offset_bound(frame: &WindowFrame) -> bool {
@@ -7281,6 +7333,7 @@ fn window_function_default_name(function: &WindowFunction) -> &'static str {
 		WindowFunction::RowNumber => "row_number",
 		WindowFunction::Rank => "rank",
 		WindowFunction::DenseRank => "dense_rank",
+		WindowFunction::Ntile { .. } => "ntile",
 		WindowFunction::Aggregate(function) => aggregate_kernel::stable_spec_for_function(function)
 			.map(|spec| spec.output_name)
 			.unwrap_or("window"),

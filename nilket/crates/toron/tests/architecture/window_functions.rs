@@ -42,8 +42,8 @@ pub(crate) fn adr241_adds_window_logical_and_physical_node() {
 
 #[test]
 pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
-	// Reconciled for ADR 246: ranking variants stay; aggregate (242) and value (246) functions are
-	// `WindowFunction` variants; NTILE stays deferred.
+	// Reconciled for ADR 249: ranking variants stay; aggregate (242), value (246), and NTILE (249) are
+	// `WindowFunction` variants.
 	let ir = source("src/ir.rs");
 	let window_function = source_block(&ir, "pub enum WindowFunction");
 	for variant in ["RowNumber", "Rank", "DenseRank"] {
@@ -52,10 +52,12 @@ pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
 			"WindowFunction must retain ranking variant {variant}"
 		);
 	}
+	// Reconciled for ADR 249: NTILE landed as a `WindowFunction` variant (bucketing on partition
+	// geometry), and stays out of `ValueFunction` (it is not a value lookup).
 	let value = source_block(&ir, "pub enum ValueFunction");
 	assert!(
-		!value.contains("Ntile") && !window_function.contains("Ntile"),
-		"NTILE stays deferred (bucketing, not a value lookup)"
+		window_function.contains("Ntile") && !value.contains("Ntile"),
+		"NTILE is a WindowFunction variant, not a ValueFunction"
 	);
 }
 
@@ -389,8 +391,8 @@ pub(crate) fn adr243_ranking_frames_stay_rejected() {
 	let planner = source("src/sql_planner.rs");
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
-		extract.contains("window frames are not supported on ranking functions"),
-		"frames on ranking functions stay rejected"
+		extract.contains("window frames are not supported on ranking or NTILE functions"),
+		"frames on ranking and NTILE functions stay rejected"
 	);
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("deferred_window_forms_stay_rejected"));
@@ -618,8 +620,8 @@ pub(crate) fn adr245_exclude_no_order_by_and_ranking_frames_stay_rejected() {
 	assert!(planner.contains("GROUPS count offsets require an ORDER BY"));
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
-		extract.contains("window frames are not supported on ranking functions"),
-		"frames on ranking functions stay rejected"
+		extract.contains("window frames are not supported on ranking or NTILE functions"),
+		"frames on ranking and NTILE functions stay rejected"
 	);
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("deferred_window_forms_stay_rejected"));
@@ -848,5 +850,65 @@ pub(crate) fn adr248_multiple_specs_distributed_gate_is_value_discriminating() {
 	assert!(
 		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
 		"the distributed multi-spec gate uses the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 249 — NTILE window bucketing
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr249_window_function_has_ntile_variant() {
+	let ir = source("src/ir.rs");
+	let window_function = source_block(&ir, "pub enum WindowFunction");
+	assert!(
+		window_function.contains("Ntile {") && window_function.contains("buckets: u64"),
+		"WindowFunction carries an Ntile variant with a u64 bucket count"
+	);
+}
+
+#[test]
+pub(crate) fn adr249_ntile_is_partition_geometry_not_frame() {
+	let exec = source("src/exec.rs");
+	let ntile = source_block(&exec, "fn ntile_buckets");
+	assert!(
+		ntile.contains("partition_start") && ntile.contains("partition_end"),
+		"NTILE buckets from partition geometry, not a frame"
+	);
+	let planner = source("src/sql_planner.rs");
+	assert!(
+		planner.contains("window frames are not supported on ranking or NTILE"),
+		"an explicit frame on NTILE rejects, like the ranking functions"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("ntile_restarts_per_partition"));
+}
+
+#[test]
+pub(crate) fn adr249_ntile_bucket_count_is_positive_integer_literal() {
+	let planner = source("src/sql_planner.rs");
+	let helper = source_block(&planner, "fn ntile_bucket_count");
+	assert!(
+		helper.contains("count == 0") && helper.contains("starts_with('-')"),
+		"the bucket count rejects zero, negative, and non-integer literals"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(
+		tests.contains("NTILE(0)") && tests.contains("NTILE(score)"),
+		"deferred_window_forms_stay_rejected pins the zero / non-literal rejects"
+	);
+}
+
+#[test]
+pub(crate) fn adr249_ntile_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("ntile_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn ntile_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the NTILE distributed gate uses the 236/238 cross-producer cardinal discipline"
 	);
 }

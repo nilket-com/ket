@@ -156,8 +156,9 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT SUM(score) OVER (ORDER BY grp, score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
 		// invalid bound ordering (start after end)
 		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM wins",
-		// NTILE (bucketing — deferred follow-on, not a value function)
-		"SELECT NTILE(2) OVER (ORDER BY score) FROM wins",
+		// NTILE with a zero / non-literal bucket count (ADR 249 lands NTILE(n); n must be a positive literal)
+		"SELECT NTILE(0) OVER (ORDER BY score) FROM wins",
+		"SELECT NTILE(score) OVER (ORDER BY score) FROM wins",
 		// LAG without ORDER BY (positional navigation needs an order)
 		"SELECT LAG(score) OVER (PARTITION BY grp) FROM wins",
 		// IGNORE NULLS on a value function (deferred)
@@ -1092,6 +1093,71 @@ async fn stacked_window_output_order_preserved() {
 			);
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ADR 249 — NTILE window bucketing
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ntile_buckets_rows_uniformly() {
+	// A true 4-row partition (ids 1-4, ordered by id), 2 buckets, splits evenly: [1,1,2,2].
+	let rows =
+		run_window("SELECT grp, NTILE(2) OVER (ORDER BY id) AS b FROM wins WHERE id <= 4").await;
+	let buckets: Vec<i64> = rows.iter().map(|(_, b)| *b).collect();
+	assert_eq!(buckets, vec![1, 1, 2, 2], "4 rows, 2 buckets -> even split");
+}
+
+#[tokio::test]
+async fn ntile_distributes_remainder_to_first_buckets() {
+	// NTILE(3) over 4 rows -> the first bucket gets the remainder row: [1,1,2,3]. A naive
+	// `i / (len / k)` bucketing gives [1,1,3,4] and fails here.
+	let rows =
+		run_window("SELECT grp, NTILE(3) OVER (ORDER BY id) AS b FROM wins WHERE id <= 4").await;
+	let buckets: Vec<i64> = rows.iter().map(|(_, b)| *b).collect();
+	assert_eq!(
+		buckets,
+		vec![1, 1, 2, 3],
+		"remainder goes to the first bucket"
+	);
+}
+
+#[tokio::test]
+async fn ntile_restarts_per_partition() {
+	// Buckets reset per partition: grp a (3 rows) -> [1,1,2] (first bucket gets the remainder),
+	// grp b (2 rows) -> [1,2].
+	let rows =
+		run_window("SELECT grp, NTILE(2) OVER (PARTITION BY grp ORDER BY score) AS b FROM wins")
+			.await;
+	assert_eq!(group_values(&rows, "a"), vec![1, 1, 2]);
+	assert_eq!(group_values(&rows, "b"), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn ntile_more_buckets_than_rows() {
+	// More buckets than rows -> each row its own bucket (no division by zero).
+	let rows =
+		run_window("SELECT grp, NTILE(10) OVER (PARTITION BY grp ORDER BY score) AS b FROM wins")
+			.await;
+	assert_eq!(
+		group_values(&rows, "a"),
+		vec![1, 2, 3],
+		"3 rows, 10 buckets -> [1,2,3]"
+	);
+	assert_eq!(
+		group_values(&rows, "b"),
+		vec![1, 2],
+		"2 rows, 10 buckets -> [1,2]"
+	);
+}
+
+#[tokio::test]
+async fn ntile_without_order_by_is_accepted() {
+	// No ORDER BY: NTILE buckets in the executor's totalized order (deterministic), like ROW_NUMBER —
+	// not rejected. grp a (3 rows, totalized by id) -> [1,1,2], grp b (2 rows) -> [1,2].
+	let rows = run_window("SELECT grp, NTILE(2) OVER (PARTITION BY grp) AS b FROM wins").await;
+	assert_eq!(group_values(&rows, "a"), vec![1, 1, 2]);
+	assert_eq!(group_values(&rows, "b"), vec![1, 2]);
 }
 
 // ---------------------------------------------------------------------------

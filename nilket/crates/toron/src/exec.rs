@@ -3618,6 +3618,34 @@ fn execute_sort(
 	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
 }
 
+/// ADR 249: per-row NTILE bucket index (1-based). Each partition is split into `buckets` near-equal
+/// groups; the first `len % buckets` hold one extra row. `buckets >= 1` is lowering-enforced, so when
+/// `base == 0` (fewer rows than buckets) `boundary == len` and every row takes the first arm — the
+/// `else` divisor is never zero.
+fn ntile_buckets(
+	buckets: u64,
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+) -> Vec<i64> {
+	let k = buckets.max(1);
+	(0..rows)
+		.map(|row| {
+			let i = (row - partition_start[row]) as u64;
+			let len = (partition_end[row] - partition_start[row] + 1) as u64;
+			let base = len / k;
+			let rem = len % k;
+			let boundary = rem * (base + 1);
+			let bucket = if i < boundary {
+				i / (base + 1) + 1
+			} else {
+				rem + (i - boundary) / base + 1
+			};
+			bucket as i64
+		})
+		.collect()
+}
+
 /// ADR 241: ranking window functions. The input arrives co-located by `partition_by` (the planner put
 /// an `Exchange` beneath the `Window` node). We order each partition internally by `[partition_by...,
 /// order_by...]`, then stream ranks resetting on each partition-key change. Row-preserving: the output
@@ -3809,6 +3837,15 @@ fn execute_window(
 			}
 			WindowFunction::DenseRank => {
 				columns.push(Arc::new(Int64Array::from(dense_rank.clone())) as ArrayRef);
+			}
+			WindowFunction::Ntile { buckets } => {
+				// ADR 249: divide each partition into `buckets` near-equal groups from partition geometry.
+				columns.push(Arc::new(Int64Array::from(ntile_buckets(
+					*buckets,
+					&partition_start,
+					&partition_end,
+					rows,
+				))) as ArrayRef);
 			}
 			WindowFunction::Aggregate(function) => {
 				// Evaluate the argument over the sorted partition layout (ranking has no arg, and
