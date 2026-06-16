@@ -3806,9 +3806,14 @@ impl SqlPlanner {
 			return Ok((plan, projection.to_vec()));
 		}
 
-		let mut spec: Option<(Vec<Expr>, Vec<SortExpr>)> = None;
-		let mut functions: Vec<WindowFunctionCall> = Vec::new();
+		// ADR 248: group window calls by their (PARTITION BY, ORDER BY) spec — the frame is NOT part of
+		// the key (it rides each call, ADR 246), so calls that share partition+order but differ in frame
+		// share one node. Each distinct spec lowers to its own `Window`-over-`Exchange`; groups are kept
+		// in first-seen order. Internal output names are assigned from a global counter so columns from
+		// different specs never collide in the final schema.
+		let mut groups: Vec<WindowSpecGroup> = Vec::new();
 		let mut rewritten: Vec<SelectItem> = Vec::with_capacity(projection.len());
+		let mut window_index = 0_usize;
 
 		for item in projection {
 			let (expr, alias) = match item {
@@ -3821,32 +3826,33 @@ impl SqlPlanner {
 
 			match self.extract_window_call(expr, alias.clone())? {
 				Some(window) => {
-					let internal_name = window_internal_output_name(functions.len());
-					match &spec {
-						Some((partition_by, order_by)) => {
-							if !window_specs_match(
-								partition_by,
-								order_by,
-								&window.partition_by,
-								&window.order_by,
-							) {
-								return Err(unsupported(
-									"multiple distinct OVER specifications in one query are not supported",
-								));
-							}
-						}
-						None => spec = Some((window.partition_by.clone(), window.order_by.clone())),
-					}
+					let internal_name = window_internal_output_name(window_index);
+					window_index += 1;
 					rewritten.push(SelectItem::ExprWithAlias {
 						expr: SqlExpr::Identifier(Ident::new(internal_name.clone())),
 						alias: Ident::new(window.output_name.clone()),
 					});
-					functions.push(WindowFunctionCall {
+					let call = WindowFunctionCall {
 						function: window.function,
 						output_name: internal_name,
 						args: window.args,
 						frame: window.frame,
-					});
+					};
+					match groups.iter_mut().find(|group| {
+						window_specs_match(
+							&group.partition_by,
+							&group.order_by,
+							&window.partition_by,
+							&window.order_by,
+						)
+					}) {
+						Some(group) => group.functions.push(call),
+						None => groups.push(WindowSpecGroup {
+							partition_by: window.partition_by,
+							order_by: window.order_by,
+							functions: vec![call],
+						}),
+					}
 				}
 				None => {
 					if expr_contains_window_function(expr) {
@@ -3859,23 +3865,29 @@ impl SqlPlanner {
 			}
 		}
 
-		let (partition_by, order_by) = spec.expect("projection contained a window function");
-		let exchange = LogicalPlan::Exchange {
-			input: Box::new(plan),
-			partition_count: if partition_by.is_empty() {
-				1
-			} else {
-				DEFAULT_AGGREGATE_PARTITION_COUNT
-			},
-			key: partition_by.clone(),
-		};
-		let window = LogicalPlan::Window {
-			input: Box::new(exchange),
-			partition_by,
-			order_by,
-			functions,
-		};
-		Ok((window, rewritten))
+		// Stack the groups first-seen-innermost: the first distinct spec wraps the input plan, later
+		// specs wrap outward. Each spec re-partitions on its own key (empty PARTITION BY gathers to one
+		// partition); every `Window` node is row-preserving, so the final schema carries the input
+		// columns plus every spec's window columns regardless of stack order.
+		let mut node = plan;
+		for group in groups {
+			let exchange = LogicalPlan::Exchange {
+				input: Box::new(node),
+				partition_count: if group.partition_by.is_empty() {
+					1
+				} else {
+					DEFAULT_AGGREGATE_PARTITION_COUNT
+				},
+				key: group.partition_by.clone(),
+			};
+			node = LogicalPlan::Window {
+				input: Box::new(exchange),
+				partition_by: group.partition_by,
+				order_by: group.order_by,
+				functions: group.functions,
+			};
+		}
+		Ok((node, rewritten))
 	}
 
 	/// Extract a ranking window function from a SELECT expression, or `None` if `expr` is not itself a
@@ -7153,6 +7165,15 @@ struct ExtractedWindow {
 	order_by: Vec<SortExpr>,
 	args: Vec<Expr>,
 	frame: Option<WindowFrame>,
+}
+
+/// ADR 248: window calls sharing one `(PARTITION BY, ORDER BY)` spec, collected into a single
+/// `Window` node. Distinct specs each get their own group (and node); the frame is per-call, so it
+/// is not part of the grouping key.
+struct WindowSpecGroup {
+	partition_by: Vec<Expr>,
+	order_by: Vec<SortExpr>,
+	functions: Vec<WindowFunctionCall>,
 }
 
 /// ADR 243: lower a sqlparser `ROWS BETWEEN …` frame to the IR `WindowFrame`. `RANGE`/`GROUPS` units stay

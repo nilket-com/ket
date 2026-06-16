@@ -140,10 +140,11 @@ async fn window_alias_can_shadow_input_column_name() {
 
 #[tokio::test]
 async fn deferred_window_forms_stay_rejected() {
-	// ADR 245 retargets the 244 fence: explicit ROWS, RANGE, and GROUPS frames now plan, but a GROUPS
-	// count offset without ORDER BY, multi-key RANGE value offsets, RANGE value offsets on non-arithmetic
-	// keys, frames on ranking functions, invalid bound ordering, DISTINCT window aggregates, experimental
-	// window aggregates, multiple distinct specs, and the still-fenced window placements stay rejected.
+	// ADR 247 retargets the 245 fence: multiple distinct OVER specs now plan (each gets its own Window
+	// node — see multiple_specs_plan_to_distinct_window_nodes). A GROUPS count offset without ORDER BY,
+	// multi-key RANGE value offsets, RANGE value offsets on non-arithmetic keys, frames on ranking
+	// functions, invalid bound ordering, DISTINCT window aggregates, experimental window aggregates, and
+	// the still-fenced window placements stay rejected.
 	for sql in [
 		// explicit frame on a ranking function (frame-independent)
 		"SELECT ROW_NUMBER() OVER (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wins",
@@ -165,9 +166,6 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT SUM(DISTINCT score) OVER (PARTITION BY grp) FROM wins",
 		// experimental window aggregate
 		"SELECT APPROX_QUANTILE(score, 0.5) OVER (PARTITION BY grp) FROM wins",
-		// multiple distinct OVER specs
-		"SELECT ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score), \
-		        ROW_NUMBER() OVER (PARTITION BY score ORDER BY grp) FROM wins",
 		// window inside a derived table
 		"SELECT rn FROM (SELECT ROW_NUMBER() OVER (ORDER BY score) AS rn FROM wins) d",
 		// window in WHERE
@@ -959,8 +957,159 @@ async fn value_functions_share_one_window_node() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR 247 — multiple window specifications per query
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multiple_specs_plan_to_distinct_window_nodes() {
+	// Two distinct specs (PARTITION BY grp vs no partition) stack into two Window nodes. This rejected
+	// on main ("multiple distinct OVER specifications ... not supported").
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT grp, SUM(score) OVER (PARTITION BY grp) AS by_grp, \
+			        SUM(score) OVER () AS total FROM wins",
+		)
+		.expect("plan two distinct window specs");
+	assert_eq!(
+		count_window_nodes(&plan),
+		2,
+		"two distinct specs -> two stacked Window nodes"
+	);
+}
+
+#[tokio::test]
+async fn same_spec_calls_share_one_window_node() {
+	// Two calls that share the exact spec collapse into one Window node (not one node per call).
+	let plan = SqlPlanner::new()
+		.plan("SELECT RANK() OVER (ORDER BY score), ROW_NUMBER() OVER (ORDER BY score) FROM wins")
+		.expect("plan two calls sharing one spec");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"one shared spec -> one Window node"
+	);
+	assert_eq!(
+		first_window_functions(&plan),
+		Some(2),
+		"both calls live in the single node"
+	);
+}
+
+#[tokio::test]
+async fn same_partition_order_different_frames_share_one_node() {
+	// The grouping key is (PARTITION BY, ORDER BY) — NOT the frame. Two calls with the same
+	// partition+order but different per-call ROWS frames share one node (the frame rides the call).
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+			        SUM(score) OVER (ORDER BY score ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM wins",
+		)
+		.expect("plan two frames sharing partition+order");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"same partition+order, frame is per-call -> one node"
+	);
+	assert_eq!(first_window_functions(&plan), Some(2));
+}
+
+#[tokio::test]
+async fn multiple_specs_compute_independent_values() {
+	// by_grp partitions by grp (a -> 40, b -> 10); total has no partition (grand total -> 50). Each
+	// column is correct only under its own spec; a single-spec funnel could not produce both. scores =
+	// [10,10,20,5,5] = 50 total.
+	let batches = run_window_batches(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp) AS by_grp, \
+		        SUM(score) OVER () AS total FROM wins",
+	)
+	.await;
+	let mut saw_difference = false;
+	for batch in &batches {
+		let grp = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("col0 grp utf8");
+		let by_grp = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("col1 by_grp int64");
+		let total = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("col2 total int64");
+		for row in 0..batch.num_rows() {
+			assert_eq!(total.value(row), 50, "grand total over every row");
+			match grp.value(row) {
+				"a" => assert_eq!(by_grp.value(row), 40, "group a per-group sum"),
+				"b" => assert_eq!(by_grp.value(row), 10, "group b per-group sum"),
+				other => panic!("unexpected group {other}"),
+			}
+			saw_difference |= by_grp.value(row) != total.value(row);
+		}
+	}
+	assert!(
+		saw_difference,
+		"the per-group and grand-total columns must differ -> the two specs are independent"
+	);
+}
+
+#[tokio::test]
+async fn stacked_window_output_order_preserved() {
+	// Columns come out in user SELECT order even though the two window columns are computed at different
+	// stack depths and interleave with a passthrough column: total (empty spec), grp (passthrough),
+	// by_grp (grp spec). The Projection above the stack restores SELECT order; appending window columns
+	// at the end would flip the col0/col1 types and fail the downcasts.
+	let batches = run_window_batches(
+		"SELECT SUM(score) OVER () AS total, grp, \
+		        SUM(score) OVER (PARTITION BY grp) AS by_grp FROM wins",
+	)
+	.await;
+	for batch in &batches {
+		assert_eq!(batch.num_columns(), 3, "total, grp, by_grp");
+		let total = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("col0 total int64 (SELECT order)");
+		batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("col1 grp utf8 (SELECT order)");
+		let by_grp = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("col2 by_grp int64 (SELECT order)");
+		for row in 0..batch.num_rows() {
+			assert_eq!(total.value(row), 50);
+			assert!(
+				matches!(by_grp.value(row), 40 | 10),
+				"by_grp is a per-group total"
+			);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
+
+/// Run a window query and return the raw projected batches (for multi-column / multi-spec assertions).
+async fn run_window_batches(sql: &str) -> Vec<RecordBatch> {
+	let logical = SqlPlanner::new().plan(sql).expect("plan window query");
+	let (catalog, storage) = fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind window query");
+	Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute window query")
+}
 
 /// Run a wins-fixture window query reading a nullable Int64 window column (for empty-frame NULL checks).
 async fn run_wins_window_opt_i64(sql: &str) -> Vec<(Option<String>, Option<i64>)> {

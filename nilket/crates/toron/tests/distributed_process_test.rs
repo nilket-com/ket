@@ -865,6 +865,38 @@ async fn value_functions_distributed_gate_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_specs_distributed_gate_is_value_discriminating() {
+	// ADR 248 distributed gate (236/238), riding on the ADR 247 stacked-exchange substrate. set_left:
+	// id=[1,2,3,4], set_key=[7,NULL,9,NULL], spread across both workers. Two distinct OVER specs stack
+	// into two Window-over-Exchange nodes: a global `OVER ()` total and a per-set_key sequence. The
+	// total column (col1) is SUM(id) over every row = 1+2+3+4 = 10, which holds only once the empty-spec
+	// exchange gathers all four rows to one partition across both producers; a single producer reaching
+	// only its shard sums to less than 10. The per-set_key ROW_NUMBER (col2, unread) forces the second
+	// distinct spec so the query exercises the multi-spec lowering rather than a single funnel.
+	let run = run_window_process_query(
+		1_442,
+		0,
+		"SELECT set_left.set_key, \
+		        SUM(set_left.id) OVER () AS total, \
+		        ROW_NUMBER() OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS seq \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 10), (None, 10), (Some(7), 10), (Some(9), 10)],
+		"the global OVER () total is 10 on every row only if all four rows gather cross-producer"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the global OVER () total 10 requires the empty-spec exchange to gather every row across both \
+		 workers; alongside a distinct per-set_key spec this proves both specs fragment independently \
+		 over the ADR 247 stacked-exchange substrate",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

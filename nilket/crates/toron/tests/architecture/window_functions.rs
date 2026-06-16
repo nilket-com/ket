@@ -4,7 +4,7 @@
 //! (`distributed_process_test.rs`). These guards pin the structural facts: a `Window` node (logical +
 //! physical), the `WindowFunction` enum (ranking + ADR 242 aggregate windows; offset/value deferred),
 //! `OVER`-lowers-to-`Window`-over-`Exchange`, row-preservation, the node-agnostic fragmentation reuse,
-//! the single-`OVER`-spec bound, the deferred fences (explicit frames → ADR 243), and the absence of any
+//! multiple OVER specs grouped + stacked (ADR 248), the deferred fences (explicit frames → ADR 243), and the absence of any
 //! optimizer/Wendelon surface.
 
 use super::support::*;
@@ -64,9 +64,11 @@ pub(crate) fn adr241_over_spec_lowers_to_window_over_partition_exchange() {
 	let planner = source("src/sql_planner.rs");
 	let lower = source_block(&planner, "fn lower_select_window");
 	assert!(lower.contains("LogicalPlan::Window"));
+	// Reconciled for ADR 248: each spec group lowers to a Window over an Exchange keyed on that group's
+	// partition (`group.partition_by`), not a single per-query `partition_by`.
 	assert!(
-		lower.contains("LogicalPlan::Exchange") && lower.contains("key: partition_by"),
-		"window lowers to a Window over an Exchange on the partition key"
+		lower.contains("LogicalPlan::Exchange") && lower.contains("key: group.partition_by"),
+		"window lowers to a Window over an Exchange on the group's partition key"
 	);
 	// Empty PARTITION BY gathers to a single partition.
 	assert!(
@@ -110,12 +112,23 @@ pub(crate) fn adr241_window_reuses_generic_exchange_boundary_fragmentation() {
 }
 
 #[test]
-pub(crate) fn adr241_single_over_spec_per_query_multiple_specs_deferred() {
+pub(crate) fn adr248_lowering_stacks_one_window_per_distinct_spec() {
+	// Reconciled from the ADR 241 single-spec guard: multiple distinct OVER specs now lower, each into
+	// its own Window-over-Exchange node (the single-spec reject is lifted; `window_specs_match` is now
+	// the grouping predicate, not a reject gate).
 	let planner = source("src/sql_planner.rs");
 	let lower = source_block(&planner, "fn lower_select_window");
 	assert!(
-		lower.contains("window_specs_match") && lower.contains("multiple distinct OVER"),
-		"window calls must share one OVER spec; multiple distinct specs are rejected"
+		lower.contains("window_specs_match"),
+		"specs are grouped by window_specs_match"
+	);
+	assert!(
+		!lower.contains("multiple distinct OVER"),
+		"the single-spec reject string is gone"
+	);
+	assert!(
+		lower.contains("WindowSpecGroup") && lower.contains("LogicalPlan::Window"),
+		"calls are bucketed into per-spec groups, each lowered to a Window-over-Exchange"
 	);
 }
 
@@ -769,5 +782,71 @@ pub(crate) fn adr246_no_new_physical_optimizer_durable_wendelon_or_rune_surface(
 	assert!(
 		wendelon_offenders.is_empty(),
 		"value window functions must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 248 — multiple window specifications per query (rides on ADR 247)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr248_spec_grouping_key_is_partition_and_order_not_frame() {
+	let planner = source("src/sql_planner.rs");
+	let lower = source_block(&planner, "fn lower_select_window");
+	assert!(
+		lower.contains("window_specs_match"),
+		"grouping is by partition+order"
+	);
+	let group = source_block(&planner, "struct WindowSpecGroup");
+	assert!(
+		group.contains("partition_by") && group.contains("order_by"),
+		"the group key carries partition and order"
+	);
+	assert!(
+		!group.contains("frame"),
+		"the frame is per-call (ADR 246), not part of the grouping key"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("same_partition_order_different_frames_share_one_node"));
+}
+
+#[test]
+pub(crate) fn adr248_multiple_specs_add_no_new_node_or_executor_surface() {
+	// Multiple specs reuse the one Window node + the ADR 247 stacked-exchange fragmentation: no new
+	// logical/physical variant and no window-specific fragmenter.
+	let ir = source("src/ir.rs");
+	let execution = source("src/ir/execution.rs");
+	assert_eq!(
+		source_block(&ir, "pub enum LogicalPlan")
+			.matches("Window {")
+			.count(),
+		1,
+		"one Window logical variant"
+	);
+	assert_eq!(
+		source_block(&execution, "pub enum ExecutionPlan")
+			.matches("Window {")
+			.count(),
+		1,
+		"one Window physical variant"
+	);
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"stacked specs ride the ADR 247 stacked-exchange path, not a window fragmenter"
+	);
+}
+
+#[test]
+pub(crate) fn adr248_multiple_specs_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("multiple_specs_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn multiple_specs_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed multi-spec gate uses the 236/238 cross-producer cardinal discipline"
 	);
 }
