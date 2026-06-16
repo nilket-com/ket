@@ -1088,3 +1088,102 @@ pub(crate) fn broadcast_join_fragmenter_input_shape_is_architecture_guarded() {
 	assert!(!broadcast.contains("contains_join(&build_boundary.input)"));
 	assert!(!broadcast.contains("share: None"));
 }
+
+#[test]
+pub(crate) fn adr247_seed_fragmenter_recurses_on_stacked_exchanges() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let base = source
+		.split("fn fragment_base_plan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn fragment_union_plan").next())
+		.expect("fragment_base_plan block");
+
+	// ADR 247: a linear stack (exchange_count > 1, non-join/union) recurses through the shared peel
+	// instead of erroring.
+	assert!(base.contains("if exchange_count > 1"));
+	assert!(base.contains(
+		"return fragment_leading_exchange_plan(plan, boundary, terminal_output, allocator, config)"
+	));
+	assert!(
+		!base.contains("MultipleExchangeBoundaries"),
+		"stacked plans no longer error in fragment_base_plan"
+	);
+}
+
+#[test]
+pub(crate) fn adr247_one_shared_leading_exchange_peel() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+
+	// One shared peel routine, reached by both the post-join leading-exchange dispatch and the
+	// stacked-exchange path; the old join-specific name is gone.
+	assert!(source.contains("fn fragment_leading_exchange_plan"));
+	assert!(!source.contains("fragment_post_join_exchange_plan"));
+	assert_eq!(
+		source
+			.matches(
+				"fragment_leading_exchange_plan(plan, boundary, terminal_output, allocator, config)"
+			)
+			.count(),
+		2,
+		"called from exactly the join dispatch and the stacked-exchange path"
+	);
+
+	let peel = source
+		.split("fn fragment_leading_exchange_plan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn fragment_base_plan").next())
+		.expect("fragment_leading_exchange_plan block");
+	// The shared routine peels the outermost exchange and recurses on its input as a producer.
+	assert!(peel.contains("replace_exchange_with_scan"));
+	assert!(peel.contains("FragmentTerminalOutput::ShuffleProducer"));
+	assert!(peel.contains("shuffle_input_scan(scan_metadata, boundary.input.schema()"));
+}
+
+#[test]
+pub(crate) fn adr247_multiple_exchange_error_retained_for_unhandled_shapes() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+
+	// The error variant still exists and is still raised — a union with an exchanged input is a shape
+	// the dedicated path does not fragment.
+	assert!(source.contains("MultipleExchangeBoundaries"));
+	let union = source
+		.split("fn fragment_union_plan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn union_producer_tasks").next())
+		.expect("fragment_union_plan block");
+	assert!(union.contains("FragmentError::MultipleExchangeBoundaries"));
+}
+
+#[test]
+pub(crate) fn adr247_no_new_ir_or_frontend_surface() {
+	let manifest_dir = manifest_dir();
+	// Fragmenter-only: the stacked-exchange routine does not leak into IR, binder, lowering, or Rune.
+	for path in [
+		"src/ir.rs",
+		"src/ir/execution.rs",
+		"src/binder.rs",
+		"src/sql_planner.rs",
+		"src/rune_engine.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir.join(path)).expect("read source");
+		assert!(
+			!source.contains("fragment_leading_exchange_plan"),
+			"fragmenter symbol leaked into {path}"
+		);
+	}
+	let offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("fragment_leading_exchange_plan")
+				|| line.contains("MultipleExchangeBoundaries")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR 247 fragmenter work must not cross into Wendelon:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}

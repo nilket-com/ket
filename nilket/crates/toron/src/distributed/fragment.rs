@@ -263,19 +263,18 @@ fn fragment_execution_plan(
 		return Ok((stages, sort_stage_id));
 	}
 	if let Some(boundary) = leading_exchange_before_join(&plan) {
-		return fragment_post_join_exchange_plan(
-			plan,
-			boundary,
-			terminal_output,
-			allocator,
-			config,
-		);
+		return fragment_leading_exchange_plan(plan, boundary, terminal_output, allocator, config);
 	}
 
 	fragment_base_plan(plan, terminal_output, allocator, config)
 }
 
-fn fragment_post_join_exchange_plan(
+/// Fragment a plan at its outermost exchange `boundary`: peel that exchange, recursively fragment
+/// its input as a `ShuffleProducer` (so any inner exchange fragments too), then build a consumer
+/// stage that reads the shuffle and runs the operators above the boundary. Shared by the post-join
+/// leading-exchange path and the stacked-exchange path (ADR 247) — both peel the *outermost*
+/// exchange, so the recursion fragments an arbitrary linear stack one boundary at a time.
+fn fragment_leading_exchange_plan(
 	plan: ExecutionPlan,
 	boundary: ExchangeBoundary,
 	terminal_output: FragmentTerminalOutput,
@@ -358,9 +357,11 @@ fn fragment_base_plan(
 		));
 	}
 	if exchange_count > 1 {
-		return Err(FragmentError::MultipleExchangeBoundaries {
-			count: exchange_count,
-		});
+		// ADR 247: a linear stack of exchanges (non-join, non-union — those keep their own paths)
+		// fragments by peeling the outermost exchange and recursing on its input. Each peel drops the
+		// count by one until the single-exchange base case below applies.
+		let boundary = find_exchange(&plan).expect("exchange count > 1 has an exchange");
+		return fragment_leading_exchange_plan(plan, boundary, terminal_output, allocator, config);
 	}
 
 	let boundary = find_exchange(&plan).expect("exchange count was non-zero");
@@ -1913,22 +1914,89 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn multiple_exchange_boundaries_are_rejected_for_seed_fragmenter() {
-		let plan = ExecutionPlan::Exchange {
-			input: Box::new(ExecutionPlan::Exchange {
-				input: Box::new(scan_plan()),
+	/// A linear stack of `depth` exchanges over a scan.
+	fn stacked_exchanges(depth: usize) -> ExecutionPlan {
+		let mut plan = scan_plan();
+		for _ in 0..depth {
+			plan = ExecutionPlan::Exchange {
+				input: Box::new(plan),
 				partition_count: 2,
 				key: key_expr(),
-			}),
-			partition_count: 2,
-			key: key_expr(),
-		};
+			};
+		}
+		plan
+	}
 
-		assert_eq!(
-			fragment_plan(plan, config()).expect_err("multiple exchanges"),
-			FragmentError::MultipleExchangeBoundaries { count: 2 }
+	fn produced_exchange(stage: &StagePlan) -> ExchangeId {
+		match &stage.tasks[0].spec.output {
+			TaskOutputBinding::ShuffleProducer { exchange_id, .. } => *exchange_id,
+			other => panic!("expected a ShuffleProducer output, got {other:?}"),
+		}
+	}
+
+	fn consumed_exchange(stage: &StagePlan) -> ExchangeId {
+		match &stage.tasks[0].spec.inputs[0] {
+			TaskInputBinding::ShuffleConsumer { exchange_id, .. } => *exchange_id,
+			other => panic!("expected a ShuffleConsumer input, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn stacked_exchanges_fragment_into_n_plus_one_stages() {
+		// ADR 247: two stacked exchanges fragment into three chained stages — reconciles the former
+		// `multiple_exchange_boundaries_are_rejected_for_seed_fragmenter`, which asserted a reject.
+		let stages =
+			fragment_plan(stacked_exchanges(2), config()).expect("fragment two stacked exchanges");
+		assert_eq!(stages.len(), 3, "two exchanges -> three stages");
+		assert_eq!(stages[0].upstream_stages, Vec::<StageId>::new());
+		assert_eq!(stages[1].upstream_stages, vec![stages[0].stage_id]);
+		assert_eq!(stages[2].upstream_stages, vec![stages[1].stage_id]);
+		assert!(
+			matches!(
+				stages[2].tasks[0].spec.output,
+				TaskOutputBinding::FinalResult
+			),
+			"the outermost stage emits the final result"
 		);
+	}
+
+	#[test]
+	fn three_stacked_exchanges_fragment_into_four_stages() {
+		// Depth generalizes — the recursion is not hard-capped at two.
+		let stages = fragment_plan(stacked_exchanges(3), config())
+			.expect("fragment three stacked exchanges");
+		assert_eq!(stages.len(), 4, "three exchanges -> four stages");
+		assert!(matches!(
+			stages.last().unwrap().tasks[0].spec.output,
+			TaskOutputBinding::FinalResult
+		));
+	}
+
+	#[test]
+	fn stacked_exchange_stage_wiring_is_chained() {
+		// The middle stage consumes the inner exchange and produces the outer one; the final stage
+		// consumes the middle exchange. The exchange ids chain producer -> consumer through the stack.
+		let stages =
+			fragment_plan(stacked_exchanges(2), config()).expect("fragment stacked exchanges");
+		assert_eq!(
+			consumed_exchange(&stages[1]),
+			produced_exchange(&stages[0]),
+			"middle stage consumes the inner stage's exchange"
+		);
+		assert_eq!(
+			consumed_exchange(&stages[2]),
+			produced_exchange(&stages[1]),
+			"final stage consumes the middle stage's exchange"
+		);
+	}
+
+	#[test]
+	fn single_exchange_plan_still_fragments_to_two_stages() {
+		// Regression guard: the unchanged one-exchange path still produces a producer + consumer pair.
+		let stages = fragment_plan(exchanged_scan(TableId(1), 2), config())
+			.expect("fragment single exchange");
+		assert_eq!(stages.len(), 2, "one exchange -> producer + consumer");
+		assert_eq!(stages[1].upstream_stages, vec![stages[0].stage_id]);
 	}
 
 	#[test]

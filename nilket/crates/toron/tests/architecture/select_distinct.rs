@@ -189,7 +189,9 @@ pub(crate) fn adr232_distinct_join_dedup_is_post_join_via_all_column_exchange() 
 	assert!(binder.contains("input: Box::new(input.plan)"));
 	assert!(binder.contains("key: group_expr.clone()"));
 	assert!(fragment.contains("fn leading_exchange_before_join"));
-	assert!(fragment.contains("fn fragment_post_join_exchange_plan"));
+	// ADR 247 renamed fragment_post_join_exchange_plan -> fragment_leading_exchange_plan (the shared
+	// outermost-exchange peel, now reused for stacked exchanges); the post-join split is unchanged.
+	assert!(fragment.contains("fn fragment_leading_exchange_plan"));
 	assert!(fragment.contains("FragmentTerminalOutput::ShuffleProducer"));
 	assert!(tests.contains("select_distinct_left_outer_join_dedups_after_null_padding"));
 	assert!(tests.contains("select_distinct_right_outer_join_dedups_after_null_padding"));
@@ -410,7 +412,9 @@ pub(crate) fn adr233_group_by_join_reuses_232_post_join_exchange_split() {
 	assert!(lower_select.contains("LogicalPlan::Exchange"));
 	assert!(lower_select.contains("key: group_expr.clone()"));
 	assert!(lower_select.contains("partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT"));
-	assert!(fragment.contains("fn fragment_post_join_exchange_plan"));
+	// ADR 247 renamed fragment_post_join_exchange_plan -> fragment_leading_exchange_plan (the shared
+	// outermost-exchange peel, now reused for stacked exchanges); the post-join split is unchanged.
+	assert!(fragment.contains("fn fragment_leading_exchange_plan"));
 	assert!(leading_exchange.contains("ExecutionPlan::Aggregate { input, .. }"));
 	assert!(leading_exchange.contains("ExecutionPlan::Join { .. }"));
 	assert!(tests.contains("group_by_join_composes_with_existing_filter_pushdown"));
