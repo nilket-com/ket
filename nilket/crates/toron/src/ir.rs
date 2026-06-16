@@ -881,20 +881,39 @@ pub enum WindowFunction {
 
 /// ADR 243: an explicit `ROWS` window-frame bound. `Preceding(n)`/`Following(n)` are physical row offsets
 /// from the current row; `Unbounded*` reach the partition edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFrameBound {
 	UnboundedPreceding,
-	Preceding(u64),
+	Preceding(WindowFrameDelta),
 	CurrentRow,
-	Following(u64),
+	Following(WindowFrameDelta),
 	UnboundedFollowing,
 }
 
-/// ADR 243: an explicit `ROWS BETWEEN <start> AND <end>` physical row-offset frame on an aggregate window
-/// call. The unit is implicitly `ROWS` in this cut (`RANGE`/`GROUPS` units are deferred to ADR 244); the
-/// executor slides the `[start, end]` slice per row, clamped to the partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// ADR 243/244: the offset carried by a `Preceding`/`Following` frame bound. `Rows` is a physical row
+/// count (ADR 243 `ROWS` frames); `Range` is a value distance in the ORDER BY key domain (ADR 244 `RANGE`
+/// frames) — a numeric `ScalarValue` for a numeric key or an `Interval`/`CalendarMonthInterval` for a
+/// temporal key. The unit on the enclosing `WindowFrame` selects which the bounds carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WindowFrameDelta {
+	Rows(u64),
+	Range(ScalarValue),
+}
+
+/// ADR 243/244: the frame unit. `Rows` = physical row offsets (243); `Range` = value-distance offsets in
+/// the ORDER BY key domain (244). `Groups` (peer-count) is deferred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WindowFrameUnit {
+	Rows,
+	Range,
+}
+
+/// ADR 243/244: an explicit `<unit> BETWEEN <start> AND <end>` frame on an aggregate window call. `ROWS`
+/// slides a physical `[start, end]` slice clamped to the partition; `RANGE` selects the contiguous run of
+/// rows whose ORDER BY value lies in the value interval `[key − start, key + end]`. `GROUPS` is deferred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowFrame {
+	pub unit: WindowFrameUnit,
 	pub start: WindowFrameBound,
 	pub end: WindowFrameBound,
 }

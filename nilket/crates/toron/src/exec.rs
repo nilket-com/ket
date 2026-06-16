@@ -9,14 +9,13 @@ use crate::distributed::task::{
 use crate::error::ExecutionError;
 #[cfg(test)]
 use crate::ir::BroadcastReplayEligibility;
-#[cfg(test)]
 use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
 	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
 	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
-	WindowFrameBound, WindowFunction, nanos_per_timestamp_unit,
+	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -3748,6 +3747,36 @@ fn execute_window(
 		partition_end[row] = current_end;
 	}
 
+	// ADR 244: per-row peer-group bounds (inclusive) for RANGE `CURRENT ROW` resolution (value-peers).
+	let mut peer_start = vec![0_usize; rows];
+	let mut current_peer_start = 0_usize;
+	for row in 0..rows {
+		if is_new_peer_group[row] {
+			current_peer_start = row;
+		}
+		peer_start[row] = current_peer_start;
+	}
+	let mut peer_end = vec![rows - 1; rows];
+	let mut current_peer_end = rows - 1;
+	for row in (0..rows).rev() {
+		if row + 1 == rows || is_new_peer_group[row + 1] {
+			current_peer_end = row;
+		}
+		peer_end[row] = current_peer_end;
+	}
+	// ADR 244: value-offset RANGE needs exactly one ORDER BY key; peer/UNBOUNDED RANGE works without it.
+	let range_inputs = RangeWindowInputs {
+		sorted_key: if order_by.len() == 1 {
+			sorted_order.first()
+		} else {
+			None
+		},
+		descending: order_by.first().is_some_and(|key| key.descending),
+		nulls_first: order_by.first().is_none_or(|key| key.nulls_first),
+		peer_start: &peer_start,
+		peer_end: &peer_end,
+	};
+
 	let mut row_number = vec![0_i64; rows];
 	let mut rank = vec![0_i64; rows];
 	let mut dense_rank = vec![0_i64; rows];
@@ -3800,7 +3829,8 @@ fn execute_window(
 				let column = execute_window_aggregate(
 					function,
 					sorted_arg.as_ref(),
-					call.frame,
+					call.frame.as_ref(),
+					Some(&range_inputs),
 					&is_new_partition,
 					&is_peer_group_end,
 					&partition_start,
@@ -3822,7 +3852,8 @@ fn execute_window(
 fn execute_window_aggregate(
 	function: &AggregateFunction,
 	sorted_arg: Option<&ArrayRef>,
-	frame: Option<WindowFrame>,
+	frame: Option<&WindowFrame>,
+	range: Option<&RangeWindowInputs<'_>>,
 	is_new_partition: &[bool],
 	is_peer_group_end: &[bool],
 	partition_start: &[usize],
@@ -3839,15 +3870,32 @@ fn execute_window_aggregate(
 			rows,
 			output_type,
 		),
-		Some(frame) => execute_window_aggregate_rows(
-			function,
-			sorted_arg,
-			frame,
-			partition_start,
-			partition_end,
-			rows,
-			output_type,
-		),
+		Some(frame) => match frame.unit {
+			WindowFrameUnit::Rows => execute_window_aggregate_rows(
+				function,
+				sorted_arg,
+				frame,
+				partition_start,
+				partition_end,
+				rows,
+				output_type,
+			),
+			WindowFrameUnit::Range => {
+				let range = range.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "RANGE window frame requires a single ORDER BY key".to_string(),
+				})?;
+				execute_window_aggregate_range(
+					function,
+					sorted_arg,
+					frame,
+					range,
+					partition_start,
+					partition_end,
+					rows,
+					output_type,
+				)
+			}
+		},
 	}
 }
 
@@ -3888,7 +3936,7 @@ fn execute_window_aggregate_default(
 fn execute_window_aggregate_rows(
 	function: &AggregateFunction,
 	sorted_arg: Option<&ArrayRef>,
-	frame: WindowFrame,
+	frame: &WindowFrame,
 	partition_start: &[usize],
 	partition_end: &[usize],
 	rows: usize,
@@ -3914,6 +3962,178 @@ fn execute_window_aggregate_rows(
 fn concat_window_columns(columns: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 	let refs: Vec<&dyn arrow::array::Array> = columns.iter().map(|array| array.as_ref()).collect();
 	Ok(arrow::compute::concat(&refs)?)
+}
+
+/// ADR 244: the sorted single ORDER BY key + its direction/nulls placement + peer-group bounds that a
+/// `RANGE` frame needs (peer bounds resolve `CURRENT ROW`; the key + arithmetic resolve value offsets).
+struct RangeWindowInputs<'a> {
+	sorted_key: Option<&'a ArrayRef>,
+	descending: bool,
+	nulls_first: bool,
+	peer_start: &'a [usize],
+	peer_end: &'a [usize],
+}
+
+/// ADR 244: a `RANGE` frame. Each bound resolves to a row index — partition/peer edge for `UNBOUNDED`/
+/// `CURRENT ROW` (any key), or a value search over `key ± offset` (numeric/temporal key, reusing Toron's
+/// typed arithmetic). The contiguous `[lo, hi]` slice is aggregated with the existing kernels.
+fn execute_window_aggregate_range(
+	function: &AggregateFunction,
+	sorted_arg: Option<&ArrayRef>,
+	frame: &WindowFrame,
+	range: &RangeWindowInputs<'_>,
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+
+	// Value-offset bounds need the sorted key + arithmetic; peer/`UNBOUNDED` bounds never touch the key
+	// (so peer/whole-partition RANGE binds on any single key, even multi-key or `Utf8`). One RowConverter
+	// (direction + nulls matching the partition sort) encodes both the key and the computed bound values,
+	// so comparisons reduce to byte-ordered row comparisons and the encoded key is non-decreasing with row
+	// position inside a partition.
+	let key_encoding = if bound_is_value_offset(&frame.start) || bound_is_value_offset(&frame.end) {
+		let key = range
+			.sorted_key
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "RANGE value offsets require exactly one ORDER BY key".to_string(),
+			})?;
+		let converter =
+			arrow::row::RowConverter::new(vec![arrow::row::SortField::new_with_options(
+				key.data_type().clone(),
+				SortOptions {
+					descending: range.descending,
+					nulls_first: range.nulls_first,
+				},
+			)])?;
+		let key_rows = converter.convert_columns(std::slice::from_ref(key))?;
+		let start_rows = range_bound_value_rows(&frame.start, key, range.descending, &converter)?;
+		let end_rows = range_bound_value_rows(&frame.end, key, range.descending, &converter)?;
+		Some((key, key_rows, start_rows, end_rows))
+	} else {
+		None
+	};
+
+	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	for row in 0..rows {
+		let p_start = partition_start[row];
+		let p_end = partition_end[row];
+		// A NULL ORDER BY value has no value distance: its frame is just its NULL peer group, so value
+		// offsets collapse to the peer boundary (UNBOUNDED bounds still reach the partition edge).
+		let key_is_null = key_encoding
+			.as_ref()
+			.is_some_and(|(key, ..)| key.is_null(row));
+
+		let lo = match &frame.start {
+			WindowFrameBound::UnboundedPreceding | WindowFrameBound::UnboundedFollowing => {
+				Some(p_start)
+			}
+			WindowFrameBound::CurrentRow => Some(range.peer_start[row]),
+			WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_) => {
+				if key_is_null {
+					Some(range.peer_start[row])
+				} else {
+					let (_, key_rows, start_rows, _) =
+						key_encoding.as_ref().expect("value offset needs key");
+					range_lower_index(key_rows, start_rows.as_ref(), row, p_start, p_end)
+				}
+			}
+		};
+		let hi = match &frame.end {
+			WindowFrameBound::UnboundedFollowing | WindowFrameBound::UnboundedPreceding => {
+				Some(p_end)
+			}
+			WindowFrameBound::CurrentRow => Some(range.peer_end[row]),
+			WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_) => {
+				if key_is_null {
+					Some(range.peer_end[row])
+				} else {
+					let (_, key_rows, _, end_rows) =
+						key_encoding.as_ref().expect("value offset needs key");
+					range_upper_index(key_rows, end_rows.as_ref(), row, p_start, p_end)
+				}
+			}
+		};
+
+		let mut count: i64 = 0;
+		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		if let (Some(lo), Some(hi)) = (lo, hi)
+			&& lo <= hi
+		{
+			for slot in lo..=hi {
+				window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
+			}
+		}
+		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+	}
+	concat_window_columns(&row_arrays)
+}
+
+/// Whether a frame bound carries a `RANGE` value offset (vs `UNBOUNDED`/`CURRENT ROW`, which are
+/// peer/partition based and need no key arithmetic).
+fn bound_is_value_offset(bound: &WindowFrameBound) -> bool {
+	matches!(
+		bound,
+		WindowFrameBound::Preceding(WindowFrameDelta::Range(_))
+			| WindowFrameBound::Following(WindowFrameDelta::Range(_))
+	)
+}
+
+/// Encode the per-row bound value `key ± offset` for a value-offset RANGE bound (`None` for
+/// `UNBOUNDED`/`CURRENT ROW`). The op is direction-aware: `PRECEDING` moves toward the sort start
+/// (`Sub` ascending, `Add` descending), `FOLLOWING` toward the sort end — so the encoded bound stays
+/// ordered with the encoded key.
+fn range_bound_value_rows(
+	bound: &WindowFrameBound,
+	key: &ArrayRef,
+	descending: bool,
+	converter: &arrow::row::RowConverter,
+) -> Result<Option<arrow::row::Rows>, ExecutionError> {
+	let (offset, is_following) = match bound {
+		WindowFrameBound::Preceding(WindowFrameDelta::Range(offset)) => (offset, false),
+		WindowFrameBound::Following(WindowFrameDelta::Range(offset)) => (offset, true),
+		_ => return Ok(None),
+	};
+	let op = if is_following ^ descending {
+		ArithmeticOp::Add
+	} else {
+		ArithmeticOp::Sub
+	};
+	let offset_array = literal_array(offset, key.len());
+	let bound_values = evaluate_unbound_arithmetic(op, key.clone(), offset_array)?;
+	Ok(Some(
+		converter.convert_columns(std::slice::from_ref(&bound_values))?,
+	))
+}
+
+/// First row index in `[p_start, p_end]` whose encoded key ≥ the row's encoded lower bound (the contiguous
+/// interval's start), or `None` when no row reaches the bound (empty frame).
+fn range_lower_index(
+	key_rows: &arrow::row::Rows,
+	bound_rows: Option<&arrow::row::Rows>,
+	row: usize,
+	p_start: usize,
+	p_end: usize,
+) -> Option<usize> {
+	let bound_rows = bound_rows?;
+	let target = bound_rows.row(row);
+	(p_start..=p_end).find(|&j| key_rows.row(j) >= target)
+}
+
+/// Last row index in `[p_start, p_end]` whose encoded key ≤ the row's encoded upper bound (the contiguous
+/// interval's end), or `None` when no row is within the bound (empty frame).
+fn range_upper_index(
+	key_rows: &arrow::row::Rows,
+	bound_rows: Option<&arrow::row::Rows>,
+	row: usize,
+	p_start: usize,
+	p_end: usize,
+) -> Option<usize> {
+	let bound_rows = bound_rows?;
+	let target = bound_rows.row(row);
+	(p_start..=p_end).rev().find(|&j| key_rows.row(j) <= target)
 }
 
 /// Fold one row's contribution into the window accumulator (counts via `count`, the rest via `state`).
@@ -3995,13 +4215,13 @@ fn window_agg_finalize(
 /// ADR 243: the physical `[lo, hi]` (inclusive) slice of a `ROWS` frame for `row`, clamped to the
 /// partition `[partition_start, partition_end]`. `None` when the frame is empty (lands outside).
 fn window_frame_slice(
-	frame: WindowFrame,
+	frame: &WindowFrame,
 	row: usize,
 	partition_start: usize,
 	partition_end: usize,
 ) -> Option<(usize, usize)> {
-	let lo = frame_bound_position(frame.start, row).max(partition_start as i64);
-	let hi = frame_bound_position(frame.end, row).min(partition_end as i64);
+	let lo = frame_bound_position(&frame.start, row).max(partition_start as i64);
+	let hi = frame_bound_position(&frame.end, row).min(partition_end as i64);
 	if lo > hi {
 		None
 	} else {
@@ -4009,14 +4229,22 @@ fn window_frame_slice(
 	}
 }
 
-fn frame_bound_position(bound: WindowFrameBound, row: usize) -> i64 {
+fn frame_bound_position(bound: &WindowFrameBound, row: usize) -> i64 {
 	let row = row as i64;
 	match bound {
 		WindowFrameBound::UnboundedPreceding => i64::MIN,
-		WindowFrameBound::Preceding(n) => row.saturating_sub(i64::try_from(n).unwrap_or(i64::MAX)),
+		WindowFrameBound::Preceding(delta) => row.saturating_sub(rows_delta(delta)),
 		WindowFrameBound::CurrentRow => row,
-		WindowFrameBound::Following(n) => row.saturating_add(i64::try_from(n).unwrap_or(i64::MAX)),
+		WindowFrameBound::Following(delta) => row.saturating_add(rows_delta(delta)),
 		WindowFrameBound::UnboundedFollowing => i64::MAX,
+	}
+}
+
+/// The physical row count carried by a `ROWS`-frame delta (the only delta kind a `ROWS` frame carries).
+fn rows_delta(delta: &WindowFrameDelta) -> i64 {
+	match delta {
+		WindowFrameDelta::Rows(n) => i64::try_from(*n).unwrap_or(i64::MAX),
+		WindowFrameDelta::Range(_) => i64::MAX,
 	}
 }
 
@@ -5728,7 +5956,6 @@ fn local_scan_table_pin(table: TableId) -> ScanTablePin {
 	}
 }
 
-#[cfg(test)]
 fn evaluate_unbound_arithmetic(
 	op: ArithmeticOp,
 	left: ArrayRef,

@@ -781,6 +781,34 @@ async fn rows_frame_distributed_gate_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_frame_distributed_gate_is_value_discriminating() {
+	// ADR 244 distributed gate (236/238). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL]. The NULL
+	// partition holds ids 2 and 4 (scan-shared across workers). A RANGE BETWEEN 5 PRECEDING AND CURRENT
+	// ROW sum over id is the value window [id-5, id]: id 2 sees {2} = 2, id 4 sees {2,4} = 6 — only once
+	// the exchange co-locates and orders both rows; a single producer sees one and reaches only 2 or 4.
+	let run = run_window_process_query(
+		1_436,
+		0,
+		"SELECT set_left.set_key, \
+		        SUM(set_left.id) OVER (PARTITION BY set_left.set_key ORDER BY set_left.id \
+		        RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 2), (None, 6), (Some(7), 1), (Some(9), 3)],
+		"the NULL partition (ids 2,4) RANGE-window sum is 2 then 6; singletons sum to their own id"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the NULL partition's RANGE-frame sum 2,6 over ids {2,4} requires the partition exchange to \
+		 co-locate rows scan-shared across both workers; a single producer reaches only 2 or 4",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

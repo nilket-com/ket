@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::MockCatalog;
@@ -140,17 +140,17 @@ async fn window_alias_can_shadow_input_column_name() {
 
 #[tokio::test]
 async fn deferred_window_forms_stay_rejected() {
-	// ADR 243 retargets the 242 explicit-frame fence: explicit ROWS frames on aggregate windows now
-	// plan, but RANGE/GROUPS units, frames on ranking functions, invalid bound ordering, DISTINCT
-	// window aggregates, experimental window aggregates, multiple distinct specs, and the still-fenced
-	// window placements stay rejected.
+	// ADR 244 retargets the 243 fence: explicit ROWS and RANGE frames now plan, but GROUPS units,
+	// multi-key RANGE value offsets, RANGE value offsets on non-arithmetic keys, frames on ranking
+	// functions, invalid bound ordering, DISTINCT window aggregates, experimental window aggregates,
+	// multiple distinct specs, and the still-fenced window placements stay rejected.
 	for sql in [
 		// explicit frame on a ranking function (frame-independent)
 		"SELECT ROW_NUMBER() OVER (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wins",
-		// RANGE explicit frame on an aggregate (→ 244 range window frames)
-		"SELECT SUM(score) OVER (ORDER BY score RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM wins",
-		// GROUPS explicit frame on an aggregate (→ 244)
+		// GROUPS explicit frame on an aggregate (deferred peer-count mechanism)
 		"SELECT SUM(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// multi-key RANGE value offset (value distance over a tuple is undefined)
+		"SELECT SUM(score) OVER (ORDER BY grp, score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
 		// invalid bound ordering (start after end)
 		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM wins",
 		// DISTINCT window aggregate
@@ -440,6 +440,241 @@ async fn rows_frame_multiple_functions_can_differ_in_frame() {
 	assert_ne!(
 		a_trailing, a_running,
 		"the two frames compute different values"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 244 — range window frames (explicit RANGE BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn range_offset_differs_from_rows_offset() {
+	// RANGE follows value distance; ROWS follows row count. grp a scores [10,10,20] ordered by score.
+	// RANGE 1 PRECEDING: the two 10-peers share their value window [9,10] = {10,10} = 20; the 20 sees
+	// only [19,20] = {20} = 20. ROWS 1 PRECEDING: position-based 10, 20, 30.
+	let range = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&range, "a"), vec![20, 20, 20]);
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![10, 20, 30]);
+	assert_ne!(
+		group_values(&range, "a"),
+		group_values(&rows, "a"),
+		"RANGE value distance differs from ROWS row count"
+	);
+}
+
+#[tokio::test]
+async fn range_offset_extends_across_peer_groups() {
+	// A wide value bound pulls neighbouring peer groups into the frame: the score=20 row's RANGE 10
+	// PRECEDING window [10,20] includes the two score=10 rows -> SUM 10+10+20 = 40.
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![20, 20, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![10, 10]);
+}
+
+#[tokio::test]
+async fn range_frame_peer_bounds_bind_on_any_key() {
+	// RANGE UNBOUNDED/CURRENT ROW bounds carry no value offset, so they bind on ANY single ORDER BY key
+	// (here Utf8 `grp`). RANGE UNBOUNDED PRECEDING AND CURRENT ROW ordered by grp is cumulative through
+	// the value-peer group: every 'a' row sees the whole 'a' group (40); 'b' sees 'a' + 'b' (40+10 = 50).
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (ORDER BY grp RANGE UNBOUNDED PRECEDING) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![40, 40, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![50, 50]);
+}
+
+#[tokio::test]
+async fn range_frame_empty_window_is_null() {
+	// A value interval past every row: COUNT -> 0, SUM -> NULL.
+	let counts = run_window(
+		"SELECT grp, COUNT(*) OVER (PARTITION BY grp ORDER BY score \
+		 RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS c FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&counts, "a"), vec![0, 0, 0]);
+	let sums = run_wins_window_opt_i64(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 RANGE BETWEEN 100 FOLLOWING AND 200 FOLLOWING) AS s FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&sums, "a"), vec![None, None, None]);
+}
+
+#[tokio::test]
+async fn temporal_range_interval_offset_windows_by_value() {
+	// The reframe's headline: a RANGE INTERVAL offset over a Timestamp key reuses the existing
+	// `Timestamp - Interval` arithmetic. tseries ts = days [0, 0, 1, 3], v = [10, 20, 30, 40].
+	// RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW: the two day-0 rows share [day-1, day0] =
+	// {10,20} = 30; day1 sees [day0, day1] = {10,20,30} = 60; day3 sees [day2, day3] = {40} = 40.
+	let day = 86_400_000_000_000_i64;
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new(
+			"ts",
+			DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+			true,
+		),
+		Field::new("v", DataType::Int64, true),
+	]));
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(1),
+			TableSchemaDescriptor::new(
+				TableObjectId::new([3; 16]),
+				1,
+				"default",
+				"tseries",
+				schema.as_ref(),
+				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+				LocalityPolicy::default_table_spread(),
+				SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.expect("tseries descriptor"),
+		)
+		.expect("register tseries");
+	let batch = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+			Arc::new(TimestampNanosecondArray::from(vec![0, 0, day, 3 * day]).with_timezone("UTC")),
+			Arc::new(Int64Array::from(vec![
+				Some(10),
+				Some(20),
+				Some(30),
+				Some(40),
+			])),
+		],
+	)
+	.expect("tseries batch");
+	let storage = Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(1), batch)]),
+	});
+
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(v) OVER (ORDER BY ts \
+			 RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) AS s FROM tseries",
+		)
+		.expect("plan temporal RANGE");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind temporal RANGE");
+	let results = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute temporal RANGE");
+	let mut values = Vec::new();
+	for batch in &results {
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("sum column");
+		for row in 0..batch.num_rows() {
+			values.push(column.value(row));
+		}
+	}
+	assert_eq!(values, vec![30, 30, 60, 40]);
+}
+
+#[tokio::test]
+async fn range_value_offset_on_non_arithmetic_key_rejected() {
+	// A RANGE value offset needs `key - offset` arithmetic. On a Utf8 ORDER BY key that has none, the
+	// frame lowers (no types yet) but is rejected at bind. (Peer/UNBOUNDED RANGE on Utf8 still binds —
+	// see range_frame_peer_bounds_bind_on_any_key.)
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(score) OVER (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		)
+		.expect("a RANGE value offset lowers; the key-type check is at bind");
+	let (catalog, _storage) = fixture();
+	let bound = bind(&plan, &catalog, &PlannerConfig::default()).await;
+	assert!(
+		bound.is_err(),
+		"RANGE value offset on a non-arithmetic (Utf8) key must be rejected at bind"
+	);
+}
+
+#[tokio::test]
+async fn range_negative_value_offset_is_rejected() {
+	// Negative RANGE offsets invert the frame direction instead of acting as a bound magnitude. They must
+	// be rejected at lowering, just like ROWS offsets.
+	let plan = SqlPlanner::new().plan(
+		"SELECT SUM(score) OVER (ORDER BY score RANGE BETWEEN INTERVAL '-1' DAY PRECEDING AND CURRENT ROW) FROM wins",
+	);
+	assert!(
+		plan.is_err(),
+		"negative RANGE value offsets must be rejected"
+	);
+}
+
+#[tokio::test]
+async fn range_frame_multiple_functions_can_differ_in_frame() {
+	// A ROWS frame and a RANGE frame over one OVER spec compute in one Window node (per-call frame).
+	let sql = "SELECT grp, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS by_rows, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS by_range \
+	           FROM wins";
+	let plan = SqlPlanner::new().plan(sql).expect("plan ROWS+RANGE window");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"one Window node for one OVER spec"
+	);
+	assert_eq!(first_window_functions(&plan), Some(2));
+	let (catalog, storage) = fixture();
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind ROWS+RANGE window");
+	let results = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute ROWS+RANGE window");
+	let mut by_rows = Vec::new();
+	let mut by_range = Vec::new();
+	for batch in &results {
+		let grp = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		let r = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let g = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			if grp.value(row) == "a" {
+				by_rows.push(r.value(row));
+				by_range.push(g.value(row));
+			}
+		}
+	}
+	assert_eq!(by_rows, vec![10, 20, 30], "ROWS 1 PRECEDING frame");
+	assert_eq!(by_range, vec![20, 20, 20], "RANGE 1 PRECEDING frame");
+	assert_ne!(
+		by_rows, by_range,
+		"ROWS and RANGE frames differ in one node"
 	);
 }
 

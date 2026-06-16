@@ -7,7 +7,8 @@ use crate::ir::{
 	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
 	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, WindowFrame,
-	WindowFrameBound, WindowFunction, WindowFunctionCall, data_type_to_logical_type_physical,
+	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, WindowFunctionCall,
+	data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -3967,8 +3968,8 @@ impl SqlPlanner {
 				})
 			})
 			.collect::<Result<Vec<_>, FrontendError>>()?;
-		// ADR 243: lower an explicit `ROWS BETWEEN …` frame on an aggregate window. Frames on ranking
-		// functions are rejected; `RANGE`/`GROUPS` units stay rejected (→ ADR 244).
+		// ADR 243/244: lower an explicit `ROWS`/`RANGE BETWEEN …` frame on an aggregate window. Frames on
+		// ranking functions are rejected; `GROUPS` stays rejected; RANGE value offsets need one ORDER BY.
 		let frame = match &spec.window_frame {
 			Some(frame) => {
 				if !matches!(window_function, WindowFunction::Aggregate(_)) {
@@ -3976,7 +3977,16 @@ impl SqlPlanner {
 						"window frames are not supported on ranking functions",
 					));
 				}
-				Some(lower_rows_window_frame(frame)?)
+				let lowered = self.lower_window_frame(frame)?;
+				if lowered.unit == WindowFrameUnit::Range
+					&& frame_has_value_offset(&lowered)
+					&& spec.order_by.len() != 1
+				{
+					return Err(unsupported(
+						"RANGE value offsets require exactly one ORDER BY column",
+					));
+				}
+				Some(lowered)
 			}
 			None => None,
 		};
@@ -3990,6 +4000,87 @@ impl SqlPlanner {
 			args: window_args,
 			frame,
 		}))
+	}
+
+	/// ADR 243/244: lower a sqlparser `<unit> BETWEEN …` frame to the IR `WindowFrame`. `GROUPS` stays
+	/// rejected (→ a follow-on); the `end_bound = None` shorthand means `… AND CURRENT ROW`.
+	fn lower_window_frame(
+		&self,
+		frame: &sqlparser::ast::WindowFrame,
+	) -> Result<WindowFrame, FrontendError> {
+		let unit = match frame.units {
+			sqlparser::ast::WindowFrameUnits::Rows => WindowFrameUnit::Rows,
+			sqlparser::ast::WindowFrameUnits::Range => WindowFrameUnit::Range,
+			sqlparser::ast::WindowFrameUnits::Groups => {
+				return Err(unsupported("GROUPS window frames are not supported"));
+			}
+		};
+		let start = self.lower_window_frame_bound(&frame.start_bound, &unit)?;
+		let end = match &frame.end_bound {
+			Some(bound) => self.lower_window_frame_bound(bound, &unit)?,
+			None => WindowFrameBound::CurrentRow,
+		};
+		if matches!(start, WindowFrameBound::UnboundedFollowing) {
+			return Err(unsupported(
+				"window frame start cannot be UNBOUNDED FOLLOWING",
+			));
+		}
+		if matches!(end, WindowFrameBound::UnboundedPreceding) {
+			return Err(unsupported(
+				"window frame end cannot be UNBOUNDED PRECEDING",
+			));
+		}
+		if window_frame_bound_rank(&start) > window_frame_bound_rank(&end) {
+			return Err(unsupported(
+				"window frame start must not come after frame end",
+			));
+		}
+		Ok(WindowFrame { unit, start, end })
+	}
+
+	fn lower_window_frame_bound(
+		&self,
+		bound: &sqlparser::ast::WindowFrameBound,
+		unit: &WindowFrameUnit,
+	) -> Result<WindowFrameBound, FrontendError> {
+		Ok(match bound {
+			sqlparser::ast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+			sqlparser::ast::WindowFrameBound::Preceding(None) => {
+				WindowFrameBound::UnboundedPreceding
+			}
+			sqlparser::ast::WindowFrameBound::Following(None) => {
+				WindowFrameBound::UnboundedFollowing
+			}
+			sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+				WindowFrameBound::Preceding(self.lower_frame_delta(expr, unit)?)
+			}
+			sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+				WindowFrameBound::Following(self.lower_frame_delta(expr, unit)?)
+			}
+		})
+	}
+
+	/// A `ROWS` offset is a non-negative integer row count; a `RANGE` offset is a typed value literal
+	/// (a number or an `INTERVAL …`) whose type the binder checks against the ORDER BY key.
+	fn lower_frame_delta(
+		&self,
+		expr: &SqlExpr,
+		unit: &WindowFrameUnit,
+	) -> Result<WindowFrameDelta, FrontendError> {
+		match unit {
+			WindowFrameUnit::Rows => Ok(WindowFrameDelta::Rows(window_frame_offset(expr)?)),
+			WindowFrameUnit::Range => match self.lower_expr(expr)? {
+				Expr::Literal(value) => {
+					if !range_offset_is_non_negative(&value) {
+						return Err(unsupported(
+							"RANGE frame offset must be a non-negative value literal",
+						));
+					}
+					Ok(WindowFrameDelta::Range(value))
+				}
+				_ => Err(unsupported("RANGE frame offset must be a literal value")),
+			},
+		}
 	}
 
 	fn lower_order_by(
@@ -6946,55 +7037,49 @@ struct ExtractedWindow {
 
 /// ADR 243: lower a sqlparser `ROWS BETWEEN …` frame to the IR `WindowFrame`. `RANGE`/`GROUPS` units stay
 /// rejected (→ ADR 244); the `end_bound = None` shorthand (`ROWS n PRECEDING`) means `… AND CURRENT ROW`.
-fn lower_rows_window_frame(
-	frame: &sqlparser::ast::WindowFrame,
-) -> Result<WindowFrame, FrontendError> {
-	match frame.units {
-		sqlparser::ast::WindowFrameUnits::Rows => {}
-		sqlparser::ast::WindowFrameUnits::Range => {
-			return Err(unsupported("RANGE window frames are not supported"));
-		}
-		sqlparser::ast::WindowFrameUnits::Groups => {
-			return Err(unsupported("GROUPS window frames are not supported"));
-		}
+/// Total order over frame bounds for the start ≤ end validation, by signed offset magnitude:
+/// `UNBOUNDED PRECEDING < n PRECEDING < CURRENT ROW < n FOLLOWING < UNBOUNDED FOLLOWING`.
+fn window_frame_bound_rank(bound: &WindowFrameBound) -> f64 {
+	match bound {
+		WindowFrameBound::UnboundedPreceding => f64::NEG_INFINITY,
+		WindowFrameBound::Preceding(delta) => -frame_delta_magnitude(delta),
+		WindowFrameBound::CurrentRow => 0.0,
+		WindowFrameBound::Following(delta) => frame_delta_magnitude(delta),
+		WindowFrameBound::UnboundedFollowing => f64::INFINITY,
 	}
-	let start = lower_window_frame_bound(&frame.start_bound)?;
-	let end = match &frame.end_bound {
-		Some(bound) => lower_window_frame_bound(bound)?,
-		None => WindowFrameBound::CurrentRow,
-	};
-	if matches!(start, WindowFrameBound::UnboundedFollowing) {
-		return Err(unsupported(
-			"window frame start cannot be UNBOUNDED FOLLOWING",
-		));
-	}
-	if matches!(end, WindowFrameBound::UnboundedPreceding) {
-		return Err(unsupported(
-			"window frame end cannot be UNBOUNDED PRECEDING",
-		));
-	}
-	if window_frame_bound_rank(start) > window_frame_bound_rank(end) {
-		return Err(unsupported(
-			"window frame start must not come after frame end",
-		));
-	}
-	Ok(WindowFrame { start, end })
 }
 
-fn lower_window_frame_bound(
-	bound: &sqlparser::ast::WindowFrameBound,
-) -> Result<WindowFrameBound, FrontendError> {
-	Ok(match bound {
-		sqlparser::ast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
-		sqlparser::ast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
-		sqlparser::ast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
-		sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
-			WindowFrameBound::Preceding(window_frame_offset(expr)?)
-		}
-		sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
-			WindowFrameBound::Following(window_frame_offset(expr)?)
-		}
-	})
+fn frame_delta_magnitude(delta: &WindowFrameDelta) -> f64 {
+	match delta {
+		WindowFrameDelta::Rows(n) => *n as f64,
+		WindowFrameDelta::Range(value) => scalar_offset_magnitude(value),
+	}
+}
+
+/// A coarse non-negative magnitude of a RANGE offset literal for the start ≤ end ordering check (the
+/// binder validates the offset's type against the key; this only orders bounds within one frame).
+fn scalar_offset_magnitude(value: &ScalarValue) -> f64 {
+	match value {
+		ScalarValue::Int32(Some(v)) => f64::from(*v),
+		ScalarValue::Int64(Some(v)) => *v as f64,
+		ScalarValue::Float32(Some(v)) => f64::from(*v),
+		ScalarValue::Float64(Some(v)) => *v,
+		ScalarValue::Interval(Some(v)) => *v as f64,
+		ScalarValue::CalendarMonthInterval(Some(v)) => f64::from(*v),
+		_ => 0.0,
+	}
+}
+
+fn range_offset_is_non_negative(value: &ScalarValue) -> bool {
+	match value {
+		ScalarValue::Int32(Some(v)) => *v >= 0,
+		ScalarValue::Int64(Some(v)) => *v >= 0,
+		ScalarValue::Float32(Some(v)) => *v >= 0.0,
+		ScalarValue::Float64(Some(v)) => *v >= 0.0,
+		ScalarValue::Interval(Some(v)) => *v >= 0,
+		ScalarValue::CalendarMonthInterval(Some(v)) => *v >= 0,
+		_ => false,
+	}
 }
 
 fn window_frame_offset(expr: &SqlExpr) -> Result<u64, FrontendError> {
@@ -7012,16 +7097,16 @@ fn window_frame_offset(expr: &SqlExpr) -> Result<u64, FrontendError> {
 	}
 }
 
-/// Total order over frame bounds for the start ≤ end validation: `UNBOUNDED PRECEDING < n PRECEDING <
-/// CURRENT ROW < n FOLLOWING < UNBOUNDED FOLLOWING`.
-fn window_frame_bound_rank(bound: WindowFrameBound) -> i128 {
-	match bound {
-		WindowFrameBound::UnboundedPreceding => i128::MIN,
-		WindowFrameBound::Preceding(n) => -(i128::from(n)),
-		WindowFrameBound::CurrentRow => 0,
-		WindowFrameBound::Following(n) => i128::from(n),
-		WindowFrameBound::UnboundedFollowing => i128::MAX,
-	}
+/// Whether a frame carries a value offset (a `Preceding`/`Following` bound with a magnitude) — for RANGE
+/// this is what requires a single ORDER BY key; `UNBOUNDED`/`CURRENT ROW` bounds carry none.
+fn frame_has_value_offset(frame: &WindowFrame) -> bool {
+	matches!(
+		frame.start,
+		WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
+	) || matches!(
+		frame.end,
+		WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
+	)
 }
 
 fn window_function_default_name(function: &WindowFunction) -> &'static str {

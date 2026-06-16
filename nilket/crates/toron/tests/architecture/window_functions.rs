@@ -324,12 +324,13 @@ pub(crate) fn adr243_window_call_carries_optional_rows_frame() {
 
 #[test]
 pub(crate) fn adr243_rows_frame_lowers_with_bounds_reusing_window_node() {
+	// Reconciled for ADR 244: `lower_rows_window_frame` generalized to `lower_window_frame` (ROWS + RANGE).
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("fn lower_rows_window_frame"));
+	assert!(planner.contains("fn lower_window_frame"));
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
-		extract.contains("lower_rows_window_frame"),
-		"an explicit ROWS frame lowers to the per-call frame payload"
+		extract.contains("self.lower_window_frame"),
+		"an explicit frame lowers to the per-call frame payload"
 	);
 	assert!(
 		planner.contains("WindowFrameBound::Preceding")
@@ -370,9 +371,10 @@ pub(crate) fn adr243_rows_frame_window_is_row_preserving() {
 }
 
 #[test]
-pub(crate) fn adr243_range_groups_and_ranking_frames_stay_rejected() {
+pub(crate) fn adr243_groups_and_ranking_frames_stay_rejected() {
+	// Reconciled for ADR 244: explicit RANGE now plans (see adr244_*); GROUPS and ranking-function
+	// frames stay rejected.
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("RANGE window frames are not supported"));
 	assert!(planner.contains("GROUPS window frames are not supported"));
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
@@ -422,5 +424,119 @@ pub(crate) fn adr243_no_new_physical_optimizer_durable_wendelon_or_rune_surface(
 	assert!(
 		wendelon_offenders.is_empty(),
 		"window frames must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 244 — range window frames (explicit RANGE BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr244_frame_unit_is_first_class_with_typed_value_delta() {
+	let ir = source("src/ir.rs");
+	assert!(ir.contains("pub enum WindowFrameUnit"));
+	let delta = source_block(&ir, "pub enum WindowFrameDelta");
+	assert!(
+		delta.contains("Rows(u64)") && delta.contains("Range(ScalarValue)"),
+		"a bound delta is a ROWS row count or a typed RANGE value"
+	);
+	let frame = source_block(&ir, "pub struct WindowFrame");
+	assert!(
+		frame.contains("unit: WindowFrameUnit"),
+		"the frame carries a first-class unit"
+	);
+}
+
+#[test]
+pub(crate) fn adr244_range_frame_lowers_with_typed_offsets_matched_to_key() {
+	let planner = source("src/sql_planner.rs");
+	let delta = source_block(&planner, "fn lower_frame_delta");
+	assert!(
+		delta.contains("WindowFrameUnit::Range") && delta.contains("self.lower_expr"),
+		"a RANGE offset lowers a typed value literal (number or INTERVAL)"
+	);
+	let binder = binder_source();
+	assert!(
+		binder.contains("fn range_offset_compatible"),
+		"the binder checks the RANGE offset type against the ORDER BY key"
+	);
+}
+
+#[test]
+pub(crate) fn adr244_range_frame_bound_reuses_existing_typed_arithmetic() {
+	let exec = source("src/exec.rs");
+	let bound = source_block(&exec, "fn range_bound_value_rows");
+	assert!(
+		bound.contains("evaluate_unbound_arithmetic"),
+		"the RANGE bound `key ± offset` reuses the existing typed arithmetic (numeric + temporal)"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("temporal_range_interval_offset_windows_by_value"));
+}
+
+#[test]
+pub(crate) fn adr244_range_frame_window_is_row_preserving() {
+	let exec = source("src/exec.rs");
+	assert!(exec.contains("fn execute_window_aggregate_range"));
+	let binder = binder_source();
+	assert!(binder.contains("PlanOptimizerFacts::composite_with_row"));
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("range_offset_extends_across_peer_groups"));
+}
+
+#[test]
+pub(crate) fn adr244_non_arithmetic_value_offset_keys_groups_multikey_and_ranking_frames_stay_rejected()
+ {
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("GROUPS window frames are not supported"));
+	assert!(planner.contains("RANGE value offsets require exactly one ORDER BY column"));
+	let binder = binder_source();
+	assert!(
+		binder.contains("is not compatible with ORDER BY key"),
+		"a RANGE value offset on a non-arithmetic key is rejected at bind"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("range_value_offset_on_non_arithmetic_key_rejected"));
+}
+
+#[test]
+pub(crate) fn adr244_range_frame_reuses_partition_exchange_fragmentation() {
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"no dedicated window fragmenter"
+	);
+	let dispatch = source_block(&fragment, "fn fragment_join_plan");
+	assert!(
+		!dispatch.contains("Window"),
+		"no Window arm in the join fragmenter dispatch"
+	);
+}
+
+#[test]
+pub(crate) fn adr244_range_frame_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("range_frame_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn range_frame_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed RANGE gate must use the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+#[test]
+pub(crate) fn adr244_no_new_physical_optimizer_durable_wendelon_or_rune_surface() {
+	let wendelon_offenders: Vec<_> = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("WindowFrameUnit") || line.contains("WindowFrameDelta")
+		})
+		.collect();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"range frames must not cross into Wendelon: {wendelon_offenders:?}"
 	);
 }

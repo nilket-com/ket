@@ -31,8 +31,9 @@ use crate::ir::{
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
 	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
 	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SetOpAllKind, SortExpr,
-	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, WindowFunction,
-	arithmetic_output_type, calendar_month_interval_data_type, decode_column_logical_type,
+	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
+	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, arithmetic_output_type,
+	calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
 	schema_for_exprs,
@@ -1369,10 +1370,13 @@ impl<'a> Binder<'a> {
 								Some(arg)
 							}
 						};
+						if let Some(frame) = &call.frame {
+							validate_range_frame_offsets(frame, &order_by, &input_schema)?;
+						}
 						bound_calls.push(BoundWindowCall {
 							function: call.function.clone(),
 							arg,
-							frame: call.frame,
+							frame: call.frame.clone(),
 						});
 					}
 					let output_schema = Arc::new(Schema::new(fields));
@@ -3072,6 +3076,59 @@ fn bind_sort_keys(
 	}
 
 	Ok(keys)
+}
+
+/// ADR 244: a RANGE frame's value offsets must be arithmetic-compatible with the single ORDER BY key
+/// (numeric key ↔ numeric offset; temporal key ↔ interval offset). Peer/`UNBOUNDED` bounds carry no
+/// offset and bind on any key, so only `Preceding`/`Following` value deltas are checked here.
+fn validate_range_frame_offsets(
+	frame: &WindowFrame,
+	order_by: &[ExecutionSortKey],
+	input_schema: &SchemaRef,
+) -> Result<(), BindingError> {
+	if frame.unit != WindowFrameUnit::Range {
+		return Ok(());
+	}
+	for bound in [&frame.start, &frame.end] {
+		let offset = match bound {
+			WindowFrameBound::Preceding(WindowFrameDelta::Range(offset))
+			| WindowFrameBound::Following(WindowFrameDelta::Range(offset)) => offset,
+			_ => continue,
+		};
+		if order_by.len() != 1 {
+			return Err(BindingError::UnsupportedExpression {
+				message: "RANGE value offsets require exactly one ORDER BY column".to_string(),
+			});
+		}
+		let key_type = input_schema
+			.field(order_by[0].ordinal.0 as usize)
+			.data_type();
+		if !range_offset_compatible(key_type, offset) {
+			return Err(BindingError::UnsupportedExpression {
+				message: format!(
+					"RANGE offset of type {:?} is not compatible with ORDER BY key of type {key_type:?}",
+					offset.data_type()
+				),
+			});
+		}
+	}
+	Ok(())
+}
+
+fn range_offset_compatible(key_type: &DataType, offset: &ScalarValue) -> bool {
+	let offset_type = offset.data_type();
+	let is_numeric = |data_type: &DataType| {
+		matches!(
+			data_type,
+			DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+		)
+	};
+	if is_numeric(key_type) && is_numeric(&offset_type) {
+		return true;
+	}
+	let temporal_key = matches!(key_type, DataType::Timestamp(_, _) | DataType::Date32);
+	let interval_offset = matches!(offset_type, DataType::Duration(_) | DataType::Interval(_));
+	temporal_key && interval_offset
 }
 
 fn bind_sort_key_ordinal(
