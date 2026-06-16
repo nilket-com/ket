@@ -3890,21 +3890,7 @@ impl SqlPlanner {
 		// columns plus every spec's window columns regardless of stack order.
 		let mut node = plan;
 		for group in groups {
-			let exchange = LogicalPlan::Exchange {
-				input: Box::new(node),
-				partition_count: if group.partition_by.is_empty() {
-					1
-				} else {
-					DEFAULT_AGGREGATE_PARTITION_COUNT
-				},
-				key: group.partition_by.clone(),
-			};
-			node = LogicalPlan::Window {
-				input: Box::new(exchange),
-				partition_by: group.partition_by,
-				order_by: group.order_by,
-				functions: group.functions,
-			};
+			node = window_over_exchange(node, group.partition_by, group.order_by, group.functions);
 		}
 		Ok((node, rewritten))
 	}
@@ -7359,7 +7345,7 @@ fn value_function_arg_expr(arg: Option<&FunctionArg>) -> Result<&SqlExpr, Fronte
 	}
 }
 
-fn window_function_default_name(function: &WindowFunction) -> &'static str {
+pub(crate) fn window_function_default_name(function: &WindowFunction) -> &'static str {
 	match function {
 		WindowFunction::RowNumber => "row_number",
 		WindowFunction::Rank => "rank",
@@ -7380,6 +7366,32 @@ fn window_function_default_name(function: &WindowFunction) -> &'static str {
 
 fn window_internal_output_name(index: usize) -> String {
 	format!("__toron_window_{index}")
+}
+
+/// ADR 251: build one `Window`-over-`Exchange` node for a single OVER spec. Shared by SQL
+/// (`lower_select_window`, once per spec group) and the Rune `window` verb (once), so both frontends
+/// construct the window node one way. Empty PARTITION BY gathers to a single partition.
+pub(crate) fn window_over_exchange(
+	input: LogicalPlan,
+	partition_by: Vec<Expr>,
+	order_by: Vec<SortExpr>,
+	functions: Vec<WindowFunctionCall>,
+) -> LogicalPlan {
+	let partition_count = if partition_by.is_empty() {
+		1
+	} else {
+		DEFAULT_AGGREGATE_PARTITION_COUNT
+	};
+	LogicalPlan::Window {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(input),
+			partition_count,
+			key: partition_by.clone(),
+		}),
+		partition_by,
+		order_by,
+		functions,
+	}
 }
 
 fn window_function_args_are_empty(args: &FunctionArguments) -> bool {

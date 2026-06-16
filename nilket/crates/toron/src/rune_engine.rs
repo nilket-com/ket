@@ -4,9 +4,13 @@ use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE,
-	ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField,
+	ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField, ValueFunction, WindowFrame,
+	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, WindowFunctionCall,
 };
-use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
+use crate::sql_planner::{
+	SqlPlanner, build_join_plan, expr_to_join_keys, window_function_default_name,
+	window_over_exchange,
+};
 use arrow::datatypes::{DataType, TimeUnit};
 use rune::alloc::limit;
 use rune::runtime::{TypeHash, VmResult, budget};
@@ -485,6 +489,33 @@ impl RuneDataFrame {
 				aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("count")])],
 			},
 		}
+	}
+
+	/// ADR 251: append a window node computing `calls` over `PARTITION BY partition_by ORDER BY
+	/// order_by`. Routes through `window_over_exchange` so the Rune-built plan is byte-identical to the
+	/// SQL one. Empty PARTITION BY / empty ORDER BY are both valid (a single-partition / unordered
+	/// window); only an empty `calls` list is rejected.
+	pub fn window(
+		self,
+		partition_by: Vec<RuneExpr>,
+		order_by: Vec<RuneSortKey>,
+		calls: Vec<WindowFunctionCall>,
+	) -> VmResult<Self> {
+		if calls.is_empty() {
+			return VmResult::panic("window requires at least one window function");
+		}
+		let partition_exprs = partition_by.into_iter().map(|e| e.expr).collect::<Vec<_>>();
+		let order_keys = order_by
+			.into_iter()
+			.map(|key| SortExpr {
+				expr: key.expr,
+				descending: key.descending,
+				nulls_first: key.nulls_first,
+			})
+			.collect::<Vec<_>>();
+		VmResult::Ok(Self {
+			plan: window_over_exchange(self.plan, partition_exprs, order_keys, calls),
+		})
 	}
 }
 
@@ -974,6 +1005,224 @@ pub fn max(expr: RuneExpr) -> RuneAggr {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ADR 251: window-call constructors. Each returns a `WindowFunctionCall` with the default frame
+// (`None`) and the derived default output name; `.named(..)` / `.frame(..)` refine it.
+// ---------------------------------------------------------------------------
+
+fn window_call(function: WindowFunction, args: Vec<Expr>) -> WindowFunctionCall {
+	let output_name = window_function_default_name(&function).to_string();
+	WindowFunctionCall {
+		function,
+		output_name,
+		args,
+		frame: None,
+	}
+}
+
+pub fn rank() -> WindowFunctionCall {
+	window_call(WindowFunction::Rank, Vec::new())
+}
+
+pub fn row_number() -> WindowFunctionCall {
+	window_call(WindowFunction::RowNumber, Vec::new())
+}
+
+pub fn dense_rank() -> WindowFunctionCall {
+	window_call(WindowFunction::DenseRank, Vec::new())
+}
+
+pub fn ntile(n: i64) -> VmResult<WindowFunctionCall> {
+	if n <= 0 {
+		return VmResult::panic("ntile requires a positive bucket count");
+	}
+	VmResult::Ok(window_call(
+		WindowFunction::Ntile { buckets: n as u64 },
+		Vec::new(),
+	))
+}
+
+pub fn lag(expr: RuneExpr, offset: i64) -> WindowFunctionCall {
+	value_window_call(
+		ValueFunction::Lag {
+			offset: offset as u64,
+			default: None,
+		},
+		expr,
+	)
+}
+
+pub fn lead(expr: RuneExpr, offset: i64) -> WindowFunctionCall {
+	value_window_call(
+		ValueFunction::Lead {
+			offset: offset as u64,
+			default: None,
+		},
+		expr,
+	)
+}
+
+pub fn first_value(expr: RuneExpr) -> WindowFunctionCall {
+	value_window_call(ValueFunction::FirstValue, expr)
+}
+
+pub fn last_value(expr: RuneExpr) -> WindowFunctionCall {
+	value_window_call(ValueFunction::LastValue, expr)
+}
+
+pub fn nth_value(expr: RuneExpr, n: i64) -> WindowFunctionCall {
+	value_window_call(ValueFunction::NthValue { n: n as u64 }, expr)
+}
+
+fn value_window_call(value: ValueFunction, expr: RuneExpr) -> WindowFunctionCall {
+	window_call(WindowFunction::Value(value), vec![expr.expr])
+}
+
+// ---------------------------------------------------------------------------
+// ADR 251: frame bound / frame builders. The Rune surface mirrors the SQL `<unit> BETWEEN .. AND ..`
+// syntax: each bound is constructed neutrally as a Rows delta, then `rows`/`groups`/`range` coerce the
+// carried delta to match the chosen unit.
+// ---------------------------------------------------------------------------
+
+pub fn unbounded_preceding() -> WindowFrameBound {
+	WindowFrameBound::UnboundedPreceding
+}
+
+pub fn current_row() -> WindowFrameBound {
+	WindowFrameBound::CurrentRow
+}
+
+pub fn unbounded_following() -> WindowFrameBound {
+	WindowFrameBound::UnboundedFollowing
+}
+
+pub fn preceding(n: i64) -> WindowFrameBound {
+	WindowFrameBound::Preceding(WindowFrameDelta::Rows(n as u64))
+}
+
+pub fn following(n: i64) -> WindowFrameBound {
+	WindowFrameBound::Following(WindowFrameDelta::Rows(n as u64))
+}
+
+/// ADR 251 (Rune-finish): extract a `ScalarValue` from a literal Rune expression (`lit(..)`,
+/// `lit_i64(..)`, `days(..)`, …). Non-literal expressions are rejected — defaults and value offsets
+/// must be literals.
+fn scalar_from_literal(expr: RuneExpr) -> Result<ScalarValue, &'static str> {
+	match expr.expr {
+		Expr::Literal(value) => Ok(value),
+		_ => Err("expected a literal value (lit(..), lit_i64(..), days(..), …)"),
+	}
+}
+
+/// ADR 251 (Rune-finish): a value-distance RANGE bound `<offset> PRECEDING` where the offset is a
+/// literal value — `preceding_value(lit_i64(1))` (numeric key) or `preceding_value(days(1))`
+/// (Timestamp key, INTERVAL distance). Use only with `range`.
+pub fn preceding_value(offset: RuneExpr) -> VmResult<WindowFrameBound> {
+	match scalar_from_literal(offset) {
+		Ok(value) => VmResult::Ok(WindowFrameBound::Preceding(WindowFrameDelta::Range(value))),
+		Err(message) => VmResult::panic(message),
+	}
+}
+
+pub fn following_value(offset: RuneExpr) -> VmResult<WindowFrameBound> {
+	match scalar_from_literal(offset) {
+		Ok(value) => VmResult::Ok(WindowFrameBound::Following(WindowFrameDelta::Range(value))),
+		Err(message) => VmResult::panic(message),
+	}
+}
+
+pub fn rows(start: WindowFrameBound, end: WindowFrameBound) -> WindowFrame {
+	WindowFrame {
+		unit: WindowFrameUnit::Rows,
+		start,
+		end,
+	}
+}
+
+pub fn groups(start: WindowFrameBound, end: WindowFrameBound) -> WindowFrame {
+	WindowFrame {
+		unit: WindowFrameUnit::Groups,
+		start: coerce_bound_to_groups(start),
+		end: coerce_bound_to_groups(end),
+	}
+}
+
+pub fn range(start: WindowFrameBound, end: WindowFrameBound) -> WindowFrame {
+	WindowFrame {
+		unit: WindowFrameUnit::Range,
+		start: coerce_bound_to_range(start),
+		end: coerce_bound_to_range(end),
+	}
+}
+
+/// Coerce a neutrally-built `Rows(n)` bound delta to a `Groups(n)` peer-group count for a GROUPS frame.
+fn coerce_bound_to_groups(bound: WindowFrameBound) -> WindowFrameBound {
+	match bound {
+		WindowFrameBound::Preceding(WindowFrameDelta::Rows(n)) => {
+			WindowFrameBound::Preceding(WindowFrameDelta::Groups(n))
+		}
+		WindowFrameBound::Following(WindowFrameDelta::Rows(n)) => {
+			WindowFrameBound::Following(WindowFrameDelta::Groups(n))
+		}
+		other => other,
+	}
+}
+
+/// Coerce a neutrally-built `Rows(n)` bound delta to a numeric `Range(Int64(n))` value distance for a
+/// RANGE frame. Bounds already carrying a value offset (`preceding_value(..)` / `following_value(..)`,
+/// including INTERVAL distances over a Timestamp key) pass through unchanged via the `other` arm.
+fn coerce_bound_to_range(bound: WindowFrameBound) -> WindowFrameBound {
+	match bound {
+		WindowFrameBound::Preceding(WindowFrameDelta::Rows(n)) => {
+			WindowFrameBound::Preceding(WindowFrameDelta::Range(ScalarValue::Int64(Some(n as i64))))
+		}
+		WindowFrameBound::Following(WindowFrameDelta::Rows(n)) => {
+			WindowFrameBound::Following(WindowFrameDelta::Range(ScalarValue::Int64(Some(n as i64))))
+		}
+		other => other,
+	}
+}
+
+impl RuneAggr {
+	/// ADR 251: turn an aggregate constructor (`sum(col)`, `count_all()`, …) into an aggregate window
+	/// call, reusing the same `(func, args)`. Pairs with `.frame(..)` for an explicit frame.
+	pub fn over(self) -> WindowFunctionCall {
+		window_call(WindowFunction::Aggregate(self.func), self.args)
+	}
+}
+
+impl WindowFunctionCall {
+	/// ADR 251: attach an explicit frame (from `rows`/`groups`/`range`) to this window call.
+	pub fn frame(mut self, frame: WindowFrame) -> WindowFunctionCall {
+		self.frame = Some(frame);
+		self
+	}
+
+	/// ADR 251: set the output column name appended by this window call.
+	pub fn named(mut self, name: String) -> WindowFunctionCall {
+		self.output_name = name;
+		self
+	}
+
+	/// ADR 251 (Rune-finish): set the partition-edge default for a `lag`/`lead` call from a literal —
+	/// `lag(col, 2).with_default(lit_i64(-1))`. Errors on a non-LAG/LEAD call or a non-literal default.
+	/// (Named `with_default` because `default` is a Rune reserved word.)
+	pub fn with_default(mut self, default: RuneExpr) -> VmResult<WindowFunctionCall> {
+		let value = match scalar_from_literal(default) {
+			Ok(value) => value,
+			Err(message) => return VmResult::panic(message),
+		};
+		match &mut self.function {
+			WindowFunction::Value(ValueFunction::Lag { default: slot, .. })
+			| WindowFunction::Value(ValueFunction::Lead { default: slot, .. }) => {
+				*slot = Some(value);
+			}
+			_ => return VmResult::panic("default(..) applies only to lag/lead window calls"),
+		}
+		VmResult::Ok(self)
+	}
+}
+
 #[cfg(test)]
 pub async fn sandbox_sleep_ms(ms: i64) {
 	let ms = u64::try_from(ms).unwrap_or(0);
@@ -1207,6 +1456,9 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<ProductId>()?;
 	m.ty::<RuneAggr>()?;
 	m.ty::<ToronContext>()?;
+	m.ty::<WindowFunctionCall>()?;
+	m.ty::<WindowFrame>()?;
+	m.ty::<WindowFrameBound>()?;
 
 	m.function(["col"], col).build()?;
 	m.function(["qcol"], qcol).build()?;
@@ -1249,6 +1501,27 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["avg"], avg).build()?;
 	m.function(["min"], min).build()?;
 	m.function(["max"], max).build()?;
+	m.function(["rank"], rank).build()?;
+	m.function(["row_number"], row_number).build()?;
+	m.function(["dense_rank"], dense_rank).build()?;
+	m.function(["ntile"], ntile).build()?;
+	m.function(["lag"], lag).build()?;
+	m.function(["lead"], lead).build()?;
+	m.function(["first_value"], first_value).build()?;
+	m.function(["last_value"], last_value).build()?;
+	m.function(["nth_value"], nth_value).build()?;
+	m.function(["unbounded_preceding"], unbounded_preceding)
+		.build()?;
+	m.function(["current_row"], current_row).build()?;
+	m.function(["unbounded_following"], unbounded_following)
+		.build()?;
+	m.function(["preceding"], preceding).build()?;
+	m.function(["following"], following).build()?;
+	m.function(["preceding_value"], preceding_value).build()?;
+	m.function(["following_value"], following_value).build()?;
+	m.function(["rows"], rows).build()?;
+	m.function(["groups"], groups).build()?;
+	m.function(["range"], range).build()?;
 	#[cfg(test)]
 	m.function(["sandbox_sleep_ms"], sandbox_sleep_ms).build()?;
 
@@ -1308,6 +1581,13 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("take", RuneDataFrame::take)?;
 	m.associated_function("offset", RuneDataFrame::offset)?;
 	m.associated_function("count", RuneDataFrame::count)?;
+	m.associated_function("window", RuneDataFrame::window)?;
+
+	// Window-call methods (ADR 251)
+	m.associated_function("over", RuneAggr::over)?;
+	m.associated_function("frame", WindowFunctionCall::frame)?;
+	m.associated_function("named", WindowFunctionCall::named)?;
+	m.associated_function("with_default", WindowFunctionCall::with_default)?;
 
 	// Expression methods
 	m.associated_function("asc", RuneExpr::asc)?;

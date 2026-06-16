@@ -909,7 +909,7 @@ pub enum ValueFunction {
 
 /// ADR 243: an explicit `ROWS` window-frame bound. `Preceding(n)`/`Following(n)` are physical row offsets
 /// from the current row; `Unbounded*` reach the partition edge.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, rune::Any)]
 pub enum WindowFrameBound {
 	UnboundedPreceding,
 	Preceding(WindowFrameDelta),
@@ -944,7 +944,7 @@ pub enum WindowFrameUnit {
 /// `ROWS` slides a physical `[start, end]` slice clamped to the partition; `RANGE` selects the contiguous
 /// run of rows whose ORDER BY value lies in the value interval `[key − start, key + end]`; `GROUPS`
 /// selects the contiguous rows spanning peer groups `[group − start, group + end]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, rune::Any)]
 pub struct WindowFrame {
 	pub unit: WindowFrameUnit,
 	pub start: WindowFrameBound,
@@ -955,7 +955,7 @@ pub struct WindowFrame {
 /// it appends (the SELECT alias or a derived name), its arguments (ranking + `COUNT(*)`: none; other
 /// aggregate windows: exactly one), and an optional explicit `ROWS` frame (ADR 243; `None` = the 242
 /// default frame).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, rune::Any)]
 pub struct WindowFunctionCall {
 	pub function: WindowFunction,
 	pub output_name: String,

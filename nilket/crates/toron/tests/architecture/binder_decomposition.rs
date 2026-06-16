@@ -203,6 +203,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/observability_listener_test.rs",
 				"crates/toron/tests/qualified_resolution_test.rs",
 				"crates/toron/tests/rune_relation_handles_test.rs",
+				"crates/toron/tests/rune_window_test.rs",
 				"crates/toron/tests/runtime_filter_pushdown_test.rs",
 				"crates/toron/tests/sort_ordering_test.rs",
 				"crates/toron/tests/wendelon_storage_execution_test.rs",

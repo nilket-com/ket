@@ -64,18 +64,23 @@ pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
 #[test]
 pub(crate) fn adr241_over_spec_lowers_to_window_over_partition_exchange() {
 	let planner = source("src/sql_planner.rs");
-	let lower = source_block(&planner, "fn lower_select_window");
-	assert!(lower.contains("LogicalPlan::Window"));
-	// Reconciled for ADR 248: each spec group lowers to a Window over an Exchange keyed on that group's
-	// partition (`group.partition_by`), not a single per-query `partition_by`.
+	// Reconciled for ADR 251: the single-spec node build moved into the shared `window_over_exchange`
+	// helper (reused by SQL and the Rune verb); `lower_select_window` calls it per spec group.
+	let build = source_block(&planner, "fn window_over_exchange");
+	assert!(build.contains("LogicalPlan::Window"));
 	assert!(
-		lower.contains("LogicalPlan::Exchange") && lower.contains("key: group.partition_by"),
-		"window lowers to a Window over an Exchange on the group's partition key"
+		build.contains("LogicalPlan::Exchange") && build.contains("key: partition_by"),
+		"the shared helper builds a Window over an Exchange on the partition key"
 	);
 	// Empty PARTITION BY gathers to a single partition.
 	assert!(
-		lower.contains("partition_by.is_empty()")
-			&& lower.contains("DEFAULT_AGGREGATE_PARTITION_COUNT")
+		build.contains("partition_by.is_empty()")
+			&& build.contains("DEFAULT_AGGREGATE_PARTITION_COUNT")
+	);
+	let lower = source_block(&planner, "fn lower_select_window");
+	assert!(
+		lower.contains("window_over_exchange("),
+		"lower_select_window builds each spec group via the shared helper"
 	);
 }
 
@@ -129,8 +134,8 @@ pub(crate) fn adr248_lowering_stacks_one_window_per_distinct_spec() {
 		"the single-spec reject string is gone"
 	);
 	assert!(
-		lower.contains("WindowSpecGroup") && lower.contains("LogicalPlan::Window"),
-		"calls are bucketed into per-spec groups, each lowered to a Window-over-Exchange"
+		lower.contains("WindowSpecGroup") && lower.contains("window_over_exchange("),
+		"calls are bucketed into per-spec groups, each stacked via the shared node-build helper"
 	);
 }
 
@@ -965,4 +970,86 @@ pub(crate) fn adr250_window_inheritance_and_extension_stay_rejected() {
 	);
 	let tests = source("tests/window_test.rs");
 	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+}
+
+// ---------------------------------------------------------------------------
+// ADR 251 — Rune window builder
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr251_rune_has_window_verb() {
+	let rune = source("src/rune_engine.rs");
+	assert!(
+		rune.contains("pub fn window("),
+		"RuneDataFrame has a window verb"
+	);
+	assert!(
+		rune.contains("m.associated_function(\"window\", RuneDataFrame::window)"),
+		"the window verb is registered in the Rune module"
+	);
+	// The call + frame vocabulary is registered, including the finish constructors (ADR 251 sibling):
+	// `with_default` (LAG/LEAD literal default) and `preceding_value` (value-offset / temporal RANGE).
+	for marker in [
+		"[\"rank\"]",
+		"[\"ntile\"]",
+		"[\"rows\"]",
+		"[\"preceding_value\"]",
+		"\"over\"",
+		"\"frame\"",
+		"\"with_default\"",
+	] {
+		assert!(
+			rune.contains(marker),
+			"missing Rune window-builder registration: {marker}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr251_window_node_build_is_frontend_agnostic() {
+	let planner = source("src/sql_planner.rs");
+	let rune = source("src/rune_engine.rs");
+	assert!(
+		planner.contains("pub(crate) fn window_over_exchange"),
+		"the single window node-build helper exists and is shared"
+	);
+	let lower = source_block(&planner, "fn lower_select_window");
+	assert!(
+		lower.contains("window_over_exchange("),
+		"SQL builds the window node via the shared helper"
+	);
+	assert!(
+		rune.contains("window_over_exchange("),
+		"Rune builds the window node via the shared helper"
+	);
+	assert!(
+		!rune.contains("LogicalPlan::Window"),
+		"the Rune frontend has no parallel Window node build"
+	);
+}
+
+#[test]
+pub(crate) fn adr251_rune_window_reuses_ir_types_no_new_surface() {
+	let ir = source("src/ir.rs");
+	// The IR window types are reused (Rune-exposable via Any), not mirrored by a parallel vocabulary.
+	assert!(
+		ir.matches("rune::Any").count() >= 3,
+		"WindowFunctionCall / WindowFrame / WindowFrameBound derive rune::Any"
+	);
+	assert!(
+		!source("src/rune_engine.rs").contains("RuneWindowCall"),
+		"no parallel Rune window-call wrapper type"
+	);
+	// The Rune window builder touches no binder / executor / fragmenter surface.
+	for path in [
+		"src/binder.rs",
+		"src/exec.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let src = source(path);
+		assert!(
+			!src.contains("window_over_exchange") && !src.contains("RuneDataFrame"),
+			"the Rune window builder must not touch {path}"
+		);
+	}
 }
