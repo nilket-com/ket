@@ -371,11 +371,10 @@ pub(crate) fn adr243_rows_frame_window_is_row_preserving() {
 }
 
 #[test]
-pub(crate) fn adr243_groups_and_ranking_frames_stay_rejected() {
-	// Reconciled for ADR 244: explicit RANGE now plans (see adr244_*); GROUPS and ranking-function
-	// frames stay rejected.
+pub(crate) fn adr243_ranking_frames_stay_rejected() {
+	// Reconciled for ADR 245: explicit RANGE (244) and GROUPS (245) now plan; frames on ranking
+	// functions stay rejected (ranking is frame-independent).
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("GROUPS window frames are not supported"));
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
 		extract.contains("window frames are not supported on ranking functions"),
@@ -485,10 +484,10 @@ pub(crate) fn adr244_range_frame_window_is_row_preserving() {
 }
 
 #[test]
-pub(crate) fn adr244_non_arithmetic_value_offset_keys_groups_multikey_and_ranking_frames_stay_rejected()
- {
+pub(crate) fn adr244_non_arithmetic_value_offset_keys_and_multikey_range_stay_rejected() {
+	// Reconciled for ADR 245: GROUPS now plans; multi-key RANGE value offsets and non-arithmetic-key
+	// RANGE value offsets stay rejected.
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("GROUPS window frames are not supported"));
 	assert!(planner.contains("RANGE value offsets require exactly one ORDER BY column"));
 	let binder = binder_source();
 	assert!(
@@ -538,5 +537,113 @@ pub(crate) fn adr244_no_new_physical_optimizer_durable_wendelon_or_rune_surface(
 	assert!(
 		wendelon_offenders.is_empty(),
 		"range frames must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 245 — groups window frames (explicit GROUPS BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr245_frame_unit_enum_completes_with_groups() {
+	let ir = source("src/ir.rs");
+	let unit = source_block(&ir, "pub enum WindowFrameUnit");
+	assert!(
+		unit.contains("Rows") && unit.contains("Range") && unit.contains("Groups"),
+		"the explicit frame-unit family is complete (Rows/Range/Groups)"
+	);
+	let delta = source_block(&ir, "pub enum WindowFrameDelta");
+	assert!(
+		delta.contains("Groups(u64)"),
+		"GROUPS carries a peer-group count delta"
+	);
+}
+
+#[test]
+pub(crate) fn adr245_groups_frame_lowers_with_peer_group_count_offset() {
+	let planner = source("src/sql_planner.rs");
+	let delta = source_block(&planner, "fn lower_frame_delta");
+	assert!(
+		delta.contains("WindowFrameUnit::Groups")
+			&& delta.contains("WindowFrameDelta::Groups(window_frame_offset"),
+		"a GROUPS offset lowers to a non-negative integer peer-group count"
+	);
+}
+
+#[test]
+pub(crate) fn adr245_groups_frame_executor_is_peer_group_count_not_row_or_value() {
+	let exec = source("src/exec.rs");
+	assert!(exec.contains("fn execute_window_aggregate_groups"));
+	let groups = source_block(&exec, "fn execute_window_aggregate_groups");
+	assert!(
+		groups.contains("group_id") && groups.contains("group_start_row"),
+		"GROUPS slices by peer-group ordinal, not physical row or value distance"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("groups_offset_differs_from_rows_and_range"));
+}
+
+#[test]
+pub(crate) fn adr245_groups_frame_window_is_row_preserving() {
+	let exec = source("src/exec.rs");
+	assert!(exec.contains("fn execute_window_aggregate_groups"));
+	let binder = binder_source();
+	assert!(binder.contains("PlanOptimizerFacts::composite_with_row"));
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("groups_frame_includes_whole_peer_group_and_tied_rows_share"));
+}
+
+#[test]
+pub(crate) fn adr245_exclude_no_order_by_and_ranking_frames_stay_rejected() {
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("GROUPS count offsets require an ORDER BY"));
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("window frames are not supported on ranking functions"),
+		"frames on ranking functions stay rejected"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr245_groups_frame_reuses_partition_exchange_fragmentation() {
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"no dedicated window fragmenter"
+	);
+	let dispatch = source_block(&fragment, "fn fragment_join_plan");
+	assert!(
+		!dispatch.contains("Window"),
+		"no Window arm in the join fragmenter dispatch"
+	);
+}
+
+#[test]
+pub(crate) fn adr245_groups_frame_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("groups_frame_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn groups_frame_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed GROUPS gate must use the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+#[test]
+pub(crate) fn adr245_no_new_physical_optimizer_durable_wendelon_or_rune_surface() {
+	let wendelon_offenders: Vec<_> = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("WindowFrameUnit::Groups") || line.contains("WindowFrameDelta::Groups")
+		})
+		.collect();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"group frames must not cross into Wendelon: {wendelon_offenders:?}"
 	);
 }

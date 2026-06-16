@@ -890,27 +890,32 @@ pub enum WindowFrameBound {
 	UnboundedFollowing,
 }
 
-/// ADR 243/244: the offset carried by a `Preceding`/`Following` frame bound. `Rows` is a physical row
+/// ADR 243/244/245: the offset carried by a `Preceding`/`Following` frame bound. `Rows` is a physical row
 /// count (ADR 243 `ROWS` frames); `Range` is a value distance in the ORDER BY key domain (ADR 244 `RANGE`
 /// frames) — a numeric `ScalarValue` for a numeric key or an `Interval`/`CalendarMonthInterval` for a
-/// temporal key. The unit on the enclosing `WindowFrame` selects which the bounds carry.
+/// temporal key; `Groups` is a peer-group count (ADR 245 `GROUPS` frames). The unit on the enclosing
+/// `WindowFrame` selects which the bounds carry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFrameDelta {
 	Rows(u64),
 	Range(ScalarValue),
+	Groups(u64),
 }
 
-/// ADR 243/244: the frame unit. `Rows` = physical row offsets (243); `Range` = value-distance offsets in
-/// the ORDER BY key domain (244). `Groups` (peer-count) is deferred.
+/// ADR 243/244/245: the frame unit. `Rows` = physical row offsets (243); `Range` = value-distance offsets
+/// in the ORDER BY key domain (244); `Groups` = peer-group-count offsets (245). This completes the
+/// explicit frame family.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFrameUnit {
 	Rows,
 	Range,
+	Groups,
 }
 
-/// ADR 243/244: an explicit `<unit> BETWEEN <start> AND <end>` frame on an aggregate window call. `ROWS`
-/// slides a physical `[start, end]` slice clamped to the partition; `RANGE` selects the contiguous run of
-/// rows whose ORDER BY value lies in the value interval `[key − start, key + end]`. `GROUPS` is deferred.
+/// ADR 243/244/245: an explicit `<unit> BETWEEN <start> AND <end>` frame on an aggregate window call.
+/// `ROWS` slides a physical `[start, end]` slice clamped to the partition; `RANGE` selects the contiguous
+/// run of rows whose ORDER BY value lies in the value interval `[key − start, key + end]`; `GROUPS`
+/// selects the contiguous rows spanning peer groups `[group − start, group + end]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowFrame {
 	pub unit: WindowFrameUnit,

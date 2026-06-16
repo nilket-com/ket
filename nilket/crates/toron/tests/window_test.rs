@@ -140,15 +140,17 @@ async fn window_alias_can_shadow_input_column_name() {
 
 #[tokio::test]
 async fn deferred_window_forms_stay_rejected() {
-	// ADR 244 retargets the 243 fence: explicit ROWS and RANGE frames now plan, but GROUPS units,
-	// multi-key RANGE value offsets, RANGE value offsets on non-arithmetic keys, frames on ranking
-	// functions, invalid bound ordering, DISTINCT window aggregates, experimental window aggregates,
-	// multiple distinct specs, and the still-fenced window placements stay rejected.
+	// ADR 245 retargets the 244 fence: explicit ROWS, RANGE, and GROUPS frames now plan, but a GROUPS
+	// count offset without ORDER BY, multi-key RANGE value offsets, RANGE value offsets on non-arithmetic
+	// keys, frames on ranking functions, invalid bound ordering, DISTINCT window aggregates, experimental
+	// window aggregates, multiple distinct specs, and the still-fenced window placements stay rejected.
 	for sql in [
 		// explicit frame on a ranking function (frame-independent)
 		"SELECT ROW_NUMBER() OVER (ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wins",
-		// GROUPS explicit frame on an aggregate (deferred peer-count mechanism)
-		"SELECT SUM(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// GROUPS count offset without ORDER BY (peer groups need an order)
+		"SELECT SUM(score) OVER (PARTITION BY grp GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
+		// frame EXCLUDE clause (deferred)
+		"SELECT SUM(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM wins",
 		// multi-key RANGE value offset (value distance over a tuple is undefined)
 		"SELECT SUM(score) OVER (ORDER BY grp, score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
 		// invalid bound ordering (start after end)
@@ -675,6 +677,155 @@ async fn range_frame_multiple_functions_can_differ_in_frame() {
 	assert_ne!(
 		by_rows, by_range,
 		"ROWS and RANGE frames differ in one node"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 245 — groups window frames (explicit GROUPS BETWEEN)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn groups_offset_differs_from_rows_and_range() {
+	// The three-way discriminator on grp a (scores [10,10,20] = peer groups {10,10},{20}). For the same
+	// `1 PRECEDING AND CURRENT ROW` bound, the score=20 row gets: GROUPS 40 (whole prior group {10,10}
+	// + {20}), ROWS 30 (one prior row + itself), RANGE 20 (value window [19,20] = {20}).
+	let groups = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS g FROM wins",
+	)
+	.await;
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	let range = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM wins",
+	)
+	.await;
+	assert_eq!(
+		group_values(&groups, "a"),
+		vec![20, 20, 40],
+		"GROUPS: whole prior peer group"
+	);
+	assert_eq!(
+		group_values(&rows, "a"),
+		vec![10, 20, 30],
+		"ROWS: one prior physical row"
+	);
+	assert_eq!(
+		group_values(&range, "a"),
+		vec![20, 20, 20],
+		"RANGE: value distance"
+	);
+	assert_ne!(group_values(&groups, "a"), group_values(&rows, "a"));
+	assert_ne!(group_values(&groups, "a"), group_values(&range, "a"));
+	assert_ne!(group_values(&rows, "a"), group_values(&range, "a"));
+}
+
+#[tokio::test]
+async fn groups_frame_includes_whole_peer_group_and_tied_rows_share() {
+	// The score=20 row's GROUPS 1 PRECEDING frame pulls the *entire* prior peer group (both score=10
+	// rows) -> SUM 40; and the two tied score=10 rows share one value (20).
+	let g = run_window(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS g FROM wins",
+	)
+	.await;
+	let a = group_values(&g, "a");
+	assert_eq!(a[0], a[1], "tied score=10 rows share one frame value");
+	assert_eq!(
+		a[2], 40,
+		"the whole prior peer group (both 10s) enters the frame, not one row"
+	);
+}
+
+#[tokio::test]
+async fn groups_frame_binds_on_utf8_key() {
+	// GROUPS needs only peer-group definition, not value arithmetic, so it binds on a Utf8 ORDER BY key
+	// (where a value-offset RANGE rejects). ORDER BY grp -> peer groups {a,a,a},{b,b}. GROUPS UNBOUNDED
+	// PRECEDING AND CURRENT ROW: 'a' rows see group {a} (40); 'b' rows see {a}+{b} (40 + 10 = 50).
+	let rows = run_window(
+		"SELECT grp, SUM(score) OVER (ORDER BY grp GROUPS UNBOUNDED PRECEDING) AS g FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![40, 40, 40]);
+	assert_eq!(group_values(&rows, "b"), vec![50, 50]);
+}
+
+#[tokio::test]
+async fn groups_frame_empty_window_is_null() {
+	// A group offset past the last group: COUNT -> 0, SUM -> NULL. grp a has 2 groups ({10,10},{20});
+	// GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING lands entirely past the partition's groups.
+	let counts = run_window(
+		"SELECT grp, COUNT(*) OVER (PARTITION BY grp ORDER BY score \
+		 GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) AS c FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&counts, "a"), vec![0, 0, 0]);
+	let sums = run_wins_window_opt_i64(
+		"SELECT grp, SUM(score) OVER (PARTITION BY grp ORDER BY score \
+		 GROUPS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) AS s FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&sums, "a"), vec![None, None, None]);
+}
+
+#[tokio::test]
+async fn groups_frame_multiple_functions_can_differ_in_frame() {
+	// A ROWS frame and a GROUPS frame over one OVER spec compute in one Window node (per-call frame).
+	let sql = "SELECT grp, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS by_rows, \
+	           SUM(score) OVER (PARTITION BY grp ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS by_groups \
+	           FROM wins";
+	let plan = SqlPlanner::new()
+		.plan(sql)
+		.expect("plan ROWS+GROUPS window");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"one Window node for one OVER spec"
+	);
+	assert_eq!(first_window_functions(&plan), Some(2));
+	let (catalog, storage) = fixture();
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind ROWS+GROUPS window");
+	let results = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute ROWS+GROUPS window");
+	let mut by_rows = Vec::new();
+	let mut by_groups = Vec::new();
+	for batch in &results {
+		let grp = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		let r = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let g = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			if grp.value(row) == "a" {
+				by_rows.push(r.value(row));
+				by_groups.push(g.value(row));
+			}
+		}
+	}
+	assert_eq!(by_rows, vec![10, 20, 30], "ROWS 1 PRECEDING frame");
+	assert_eq!(by_groups, vec![20, 20, 40], "GROUPS 1 PRECEDING frame");
+	assert_ne!(
+		by_rows, by_groups,
+		"ROWS and GROUPS frames differ in one node"
 	);
 }
 

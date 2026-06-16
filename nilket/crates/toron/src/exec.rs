@@ -3895,6 +3895,16 @@ fn execute_window_aggregate(
 					output_type,
 				)
 			}
+			WindowFrameUnit::Groups => execute_window_aggregate_groups(
+				function,
+				sorted_arg,
+				frame,
+				is_peer_group_end,
+				partition_start,
+				partition_end,
+				rows,
+				output_type,
+			),
 		},
 	}
 }
@@ -4244,7 +4254,85 @@ fn frame_bound_position(bound: &WindowFrameBound, row: usize) -> i64 {
 fn rows_delta(delta: &WindowFrameDelta) -> i64 {
 	match delta {
 		WindowFrameDelta::Rows(n) => i64::try_from(*n).unwrap_or(i64::MAX),
-		WindowFrameDelta::Range(_) => i64::MAX,
+		WindowFrameDelta::Range(_) | WindowFrameDelta::Groups(_) => i64::MAX,
+	}
+}
+
+/// ADR 245: a `GROUPS` frame. Each bound resolves to a peer-group ordinal — partition edge for
+/// `UNBOUNDED`, the current group for `CURRENT ROW`, or `g ∓ n` for an `n PRECEDING`/`FOLLOWING` count —
+/// clamped to the partition's group range; the `[lo_group, hi_group]` span maps back to a contiguous row
+/// slice. No value arithmetic and direction-agnostic (offsets are positional in group space).
+fn execute_window_aggregate_groups(
+	function: &AggregateFunction,
+	sorted_arg: Option<&ArrayRef>,
+	frame: &WindowFrame,
+	is_peer_group_end: &[bool],
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+
+	// Peer-group structure (partition-aligned): each row's group ordinal + each group's row span. A new
+	// group starts at row 0 or right after a peer-group end (so a partition boundary, which is also a
+	// peer-group end, starts a fresh group).
+	let mut group_id = vec![0_usize; rows];
+	let mut group_start_row: Vec<usize> = Vec::new();
+	let mut group_end_row: Vec<usize> = Vec::new();
+	for row in 0..rows {
+		if row == 0 || is_peer_group_end[row - 1] {
+			group_start_row.push(row);
+			group_end_row.push(row);
+		}
+		let current = group_start_row.len() - 1;
+		group_id[row] = current;
+		group_end_row[current] = row;
+	}
+
+	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	for row in 0..rows {
+		let g = group_id[row] as i64;
+		// The partition's group-id range (partition boundaries are group boundaries).
+		let first_group = group_id[partition_start[row]] as i64;
+		let last_group = group_id[partition_end[row]] as i64;
+		let start_group = groups_bound_group(&frame.start, g, first_group, last_group);
+		let end_group = groups_bound_group(&frame.end, g, first_group, last_group);
+
+		let mut count: i64 = 0;
+		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		// Empty when the span lands entirely outside the partition's groups; otherwise clamp.
+		if start_group <= last_group && end_group >= first_group {
+			let lo_group = start_group.max(first_group) as usize;
+			let hi_group = end_group.min(last_group) as usize;
+			if lo_group <= hi_group {
+				for slot in group_start_row[lo_group]..=group_end_row[hi_group] {
+					window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
+				}
+			}
+		}
+		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+	}
+	concat_window_columns(&row_arrays)
+}
+
+/// Resolve a `GROUPS` frame bound to a peer-group ordinal, relative to the current group `g` and the
+/// partition's `[first_group, last_group]` range. `PRECEDING`/`FOLLOWING` shift by the group count.
+fn groups_bound_group(bound: &WindowFrameBound, g: i64, first_group: i64, last_group: i64) -> i64 {
+	match bound {
+		WindowFrameBound::UnboundedPreceding => first_group,
+		WindowFrameBound::UnboundedFollowing => last_group,
+		WindowFrameBound::CurrentRow => g,
+		WindowFrameBound::Preceding(delta) => g.saturating_sub(groups_count(delta)),
+		WindowFrameBound::Following(delta) => g.saturating_add(groups_count(delta)),
+	}
+}
+
+/// The peer-group count carried by a `GROUPS`-frame delta (the only delta kind a `GROUPS` frame carries).
+fn groups_count(delta: &WindowFrameDelta) -> i64 {
+	match delta {
+		WindowFrameDelta::Groups(n) => i64::try_from(*n).unwrap_or(i64::MAX),
+		WindowFrameDelta::Rows(_) | WindowFrameDelta::Range(_) => i64::MAX,
 	}
 }
 

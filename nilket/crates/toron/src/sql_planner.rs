@@ -3968,8 +3968,9 @@ impl SqlPlanner {
 				})
 			})
 			.collect::<Result<Vec<_>, FrontendError>>()?;
-		// ADR 243/244: lower an explicit `ROWS`/`RANGE BETWEEN …` frame on an aggregate window. Frames on
-		// ranking functions are rejected; `GROUPS` stays rejected; RANGE value offsets need one ORDER BY.
+		// ADR 243/244/245: lower an explicit `ROWS`/`RANGE`/`GROUPS BETWEEN …` frame on an aggregate
+		// window. Frames on ranking functions are rejected. RANGE value offsets need exactly one ORDER BY
+		// column; GROUPS count offsets need an ORDER BY (to define peer groups), but any key/count.
 		let frame = match &spec.window_frame {
 			Some(frame) => {
 				if !matches!(window_function, WindowFunction::Aggregate(_)) {
@@ -3978,13 +3979,15 @@ impl SqlPlanner {
 					));
 				}
 				let lowered = self.lower_window_frame(frame)?;
-				if lowered.unit == WindowFrameUnit::Range
-					&& frame_has_value_offset(&lowered)
-					&& spec.order_by.len() != 1
-				{
-					return Err(unsupported(
-						"RANGE value offsets require exactly one ORDER BY column",
-					));
+				if frame_has_offset_bound(&lowered) {
+					if lowered.unit == WindowFrameUnit::Range && spec.order_by.len() != 1 {
+						return Err(unsupported(
+							"RANGE value offsets require exactly one ORDER BY column",
+						));
+					}
+					if lowered.unit == WindowFrameUnit::Groups && spec.order_by.is_empty() {
+						return Err(unsupported("GROUPS count offsets require an ORDER BY"));
+					}
 				}
 				Some(lowered)
 			}
@@ -4011,9 +4014,7 @@ impl SqlPlanner {
 		let unit = match frame.units {
 			sqlparser::ast::WindowFrameUnits::Rows => WindowFrameUnit::Rows,
 			sqlparser::ast::WindowFrameUnits::Range => WindowFrameUnit::Range,
-			sqlparser::ast::WindowFrameUnits::Groups => {
-				return Err(unsupported("GROUPS window frames are not supported"));
-			}
+			sqlparser::ast::WindowFrameUnits::Groups => WindowFrameUnit::Groups,
 		};
 		let start = self.lower_window_frame_bound(&frame.start_bound, &unit)?;
 		let end = match &frame.end_bound {
@@ -4069,6 +4070,7 @@ impl SqlPlanner {
 	) -> Result<WindowFrameDelta, FrontendError> {
 		match unit {
 			WindowFrameUnit::Rows => Ok(WindowFrameDelta::Rows(window_frame_offset(expr)?)),
+			WindowFrameUnit::Groups => Ok(WindowFrameDelta::Groups(window_frame_offset(expr)?)),
 			WindowFrameUnit::Range => match self.lower_expr(expr)? {
 				Expr::Literal(value) => {
 					if !range_offset_is_non_negative(&value) {
@@ -7051,7 +7053,7 @@ fn window_frame_bound_rank(bound: &WindowFrameBound) -> f64 {
 
 fn frame_delta_magnitude(delta: &WindowFrameDelta) -> f64 {
 	match delta {
-		WindowFrameDelta::Rows(n) => *n as f64,
+		WindowFrameDelta::Rows(n) | WindowFrameDelta::Groups(n) => *n as f64,
 		WindowFrameDelta::Range(value) => scalar_offset_magnitude(value),
 	}
 }
@@ -7097,9 +7099,9 @@ fn window_frame_offset(expr: &SqlExpr) -> Result<u64, FrontendError> {
 	}
 }
 
-/// Whether a frame carries a value offset (a `Preceding`/`Following` bound with a magnitude) — for RANGE
-/// this is what requires a single ORDER BY key; `UNBOUNDED`/`CURRENT ROW` bounds carry none.
-fn frame_has_value_offset(frame: &WindowFrame) -> bool {
+/// Whether a frame carries an explicit offset bound (a `Preceding`/`Following` with a magnitude) — a RANGE
+/// value distance or a GROUPS peer-group count; `UNBOUNDED`/`CURRENT ROW` bounds carry none.
+fn frame_has_offset_bound(frame: &WindowFrame) -> bool {
 	matches!(
 		frame.start,
 		WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
