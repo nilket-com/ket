@@ -374,13 +374,13 @@ async fn mock_catalog_create_table_resolves_binding() {
 		.await
 		.expect("resolve unqualified alias");
 
-	assert_eq!(binding.legacy_table_id, TableId(1));
-	assert_eq!(resolved.legacy_table_id, binding.legacy_table_id);
-	assert_eq!(unqualified.legacy_table_id, binding.legacy_table_id);
+	assert_eq!(binding.local_table_id, TableId(1));
+	assert_eq!(resolved.local_table_id, binding.local_table_id);
+	assert_eq!(unqualified.local_table_id, binding.local_table_id);
 	assert_eq!(resolved.schema.as_ref(), schema.as_ref());
 	assert_eq!(
 		&binding.table.as_bytes()[8..],
-		&binding.legacy_table_id.0.to_be_bytes()
+		&binding.local_table_id.0.to_be_bytes()
 	);
 	assert_eq!(
 		binding.fingerprint,
@@ -443,7 +443,7 @@ async fn mock_catalog_create_table_if_not_exists_semantics() {
 		.create_table(&name, initial_schema, true)
 		.await
 		.expect("idempotent create table");
-	assert_eq!(first.legacy_table_id, second.legacy_table_id);
+	assert_eq!(first.local_table_id, second.local_table_id);
 
 	let mismatch = expect_catalog_err(catalog.create_table(&name, different, true).await);
 	assert!(matches!(
@@ -490,8 +490,8 @@ async fn if_not_exists_same_schema_same_identity_skips() {
 	assert!(created.created);
 	assert!(!existing.created);
 	assert_eq!(
-		created.binding.legacy_table_id,
-		existing.binding.legacy_table_id
+		created.binding.local_table_id,
+		existing.binding.local_table_id
 	);
 }
 
@@ -562,8 +562,8 @@ async fn mock_catalog_schema_qualified_alias_does_not_overwrite() {
 		.resolve_table(&TableRef::new("sales"))
 		.await
 		.expect("resolve unqualified alias");
-	assert_eq!(unqualified.legacy_table_id, app.legacy_table_id);
-	assert_ne!(other.legacy_table_id, app.legacy_table_id);
+	assert_eq!(unqualified.local_table_id, app.local_table_id);
+	assert_ne!(other.local_table_id, app.local_table_id);
 }
 
 #[tokio::test]
@@ -724,7 +724,7 @@ async fn create_or_replace_table_produces_fresh_object_id() {
 		.await
 		.expect("resolve after replace");
 
-	assert_ne!(before.legacy_table_id, after.legacy_table_id);
+	assert_ne!(before.local_table_id, after.local_table_id);
 	assert_ne!(before.table, after.table);
 	assert_ne!(before.fingerprint, after.fingerprint);
 }

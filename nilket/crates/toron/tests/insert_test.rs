@@ -947,14 +947,14 @@ async fn in_memory_table_storage_seeds_appends_and_rejects_invalid_writes() {
 	let storage = Arc::new(InMemoryTableStorage::new());
 
 	let mut missing_scan = scan_request(&binding);
-	missing_scan.table_id = TableId(binding.legacy_table_id.0 + 1000);
+	missing_scan.table_id = TableId(binding.local_table_id.0 + 1000);
 	let missing_err = match storage.scan(missing_scan).await {
 		Ok(_) => panic!("missing table scan should reject"),
 		Err(err) => err,
 	};
 	assert!(matches!(
 		missing_err,
-		StorageError::TableNotFound { table } if table == TableId(binding.legacy_table_id.0 + 1000)
+		StorageError::TableNotFound { table } if table == TableId(binding.local_table_id.0 + 1000)
 	));
 
 	let first = storage
@@ -1118,7 +1118,7 @@ async fn executor_rejects_direct_insert_execution() {
 		.await
 		.expect("resolve people");
 	let plan = ExecutionPlan::Insert {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema,
@@ -1185,7 +1185,7 @@ async fn fragmenter_rejects_direct_insert_fragmentation() {
 		.await
 		.expect("resolve people");
 	let plan = ExecutionPlan::Insert {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema,
@@ -1313,7 +1313,7 @@ fn write_request(binding: &TableBinding, payload: RecordBatch) -> WriteRequest {
 		session_id: SessionId(1),
 		query_id: QueryId::from_u128(1),
 		tenant_id: TenantId(1),
-		table_id: binding.legacy_table_id,
+		table_id: binding.local_table_id,
 		table_object_id: binding.table,
 		physical_descriptor_fingerprint: binding.fingerprint,
 		payload,
@@ -1327,7 +1327,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 		session_id: SessionId(1),
 		query_id: QueryId::from_u128(1),
 		tenant_id: TenantId(1),
-		table_id: binding.legacy_table_id,
+		table_id: binding.local_table_id,
 		table_object_id: binding.table,
 		physical_descriptor_fingerprint: binding.fingerprint,
 		read_bound: HlcBound(1),
@@ -1345,7 +1345,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 
 fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 	ExecutionPlan::Scan {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema.clone(),
@@ -1366,7 +1366,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 
 fn insert_select_plan(binding: &TableBinding, source: ExecutionPlan) -> ExecutionPlan {
 	ExecutionPlan::InsertSelect {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema.clone(),

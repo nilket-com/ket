@@ -256,7 +256,7 @@ rg -n "ScanRequest \{|ExecutionContext" crates/toron/src/exec.rs | head -30
 
 # Confirm ExecutionPlan::Scan current shape
 rg -n "ExecutionPlan::Scan|Scan \{" crates/toron/src/ir/execution.rs | head -10
-# Expected: 8-field Scan variant (legacy_table_id, table, fingerprint, schema, projection, pbc_program, profile_hint, primary_key_columns); no row_identity yet
+# Expected: 8-field Scan variant (local_table_id, table, fingerprint, schema, projection, pbc_program, profile_hint, primary_key_columns); no row_identity yet
 
 # Confirm DistributedQueryCoordinator construction shape
 rg -n "DistributedQueryCoordinator" crates/toron/src/coordinator.rs | head -20
@@ -610,7 +610,7 @@ Preserve verbatim:
 
    ```rust
    ExecutionPlan::Scan {
-       legacy_table_id: TableId,
+       local_table_id: TableId,
        table: TableObjectId,
        fingerprint: PhysicalDescriptorFingerprint,
        schema: SchemaRef,

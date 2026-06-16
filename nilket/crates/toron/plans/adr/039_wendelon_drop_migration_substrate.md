@@ -270,10 +270,10 @@ In scope (Plan A):
           ),
       };
       self.registry.consume_finalized_drop(
-          binding.legacy_table_id,
+          binding.local_table_id,
           operation_id,
       )?;
-      self.registry.remove_table(binding.legacy_table_id)?;
+      self.registry.remove_table(binding.local_table_id)?;
       Ok(Some(binding))
   }
   ```
@@ -597,7 +597,7 @@ Add `schema_generation: u64` to `TableBinding` and
 
 ```rust
 pub struct TableBinding {
-    pub legacy_table_id: TableId,
+    pub local_table_id: TableId,
     pub table: TableObjectId,
     pub schema_generation: u64,
     pub fingerprint: PhysicalDescriptorFingerprint,

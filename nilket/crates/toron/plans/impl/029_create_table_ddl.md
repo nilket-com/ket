@@ -280,15 +280,15 @@ helper for deterministic-real fingerprint; implement
    /// `PhysicalDescriptorFingerprint::from_bytes` is crate-private
    /// to Wendelon, so the only public path is via descriptor
    /// construction. Determinism is provided by stamping
-   /// `legacy_table_id.0` into the `TableObjectId` payload and
+   /// `local_table_id.0` into the `TableObjectId` payload and
    /// using fixed policy choices.
    fn mock_table_identity(
        name: &TableRef,
        schema: &Schema,
-       legacy_table_id: TableId,
+       local_table_id: TableId,
    ) -> Result<(TableObjectId, PhysicalDescriptorFingerprint), CatalogError> {
        let mut object_id = [0_u8; 16];
-       object_id[8..].copy_from_slice(&legacy_table_id.0.to_be_bytes());
+       object_id[8..].copy_from_slice(&local_table_id.0.to_be_bytes());
        let table_object_id = TableObjectId::new(object_id);
 
        let descriptor = TableSchemaDescriptor::new_with_layout(
@@ -357,30 +357,30 @@ helper for deterministic-real fingerprint; implement
                .checked_add(1)
                .expect("TableId overflow");
        }
-       let legacy_table_id = TableId(inner.next_table_id);
+       let local_table_id = TableId(inner.next_table_id);
        inner.next_table_id = inner
            .next_table_id
            .checked_add(1)
            .expect("TableId overflow");
 
        let (table_object_id, fingerprint) =
-           mock_table_identity(name, schema.as_ref(), legacy_table_id)?;
+           mock_table_identity(name, schema.as_ref(), local_table_id)?;
        let binding = TableBinding::new(
-           legacy_table_id,
+           local_table_id,
            table_object_id,
            fingerprint,
            schema.clone(),
        );
 
        // D10: exact ref always; unqualified alias only if vacant.
-       inner.by_ref.insert(name.clone(), legacy_table_id);
+       inner.by_ref.insert(name.clone(), local_table_id);
        if name.schema.is_some() {
            inner
                .by_ref
                .entry(TableRef::new(name.table.clone()))
-               .or_insert(legacy_table_id);
+               .or_insert(local_table_id);
        }
-       inner.by_id.insert(legacy_table_id, binding.clone());
+       inner.by_id.insert(local_table_id, binding.clone());
 
        Ok(binding)
    }
@@ -1158,7 +1158,7 @@ NO SELECT-after-CREATE test.**
      `AdminUnavailable`.
    - **D7:** binding from `create_table` carries
      `TableObjectId` whose last 8 bytes equal
-     `legacy_table_id.0.to_be_bytes()` and a
+     `local_table_id.0.to_be_bytes()` and a
      `PhysicalDescriptorFingerprint` consistent with
      `TableSchemaDescriptor::new_with_layout` (NOT
      a synthesized zero-fingerprint placeholder).
@@ -1279,7 +1279,7 @@ If formatting diff: `cargo fmt && cargo fmt --check`.
       `PhysicalDescriptorFingerprint` via
       `TableSchemaDescriptor::new_with_layout`;
       `TableObjectId` deterministic from
-      `legacy_table_id.0` 8-byte suffix.
+      `local_table_id.0` 8-byte suffix.
 - [ ] `MockCatalog::create_table` allocates fresh
       `TableId(value)` via tuple-struct construction
       (NOT `TableId::new`); skips existing keys; bumps

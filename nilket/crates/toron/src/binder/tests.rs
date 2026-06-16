@@ -3480,7 +3480,7 @@ fn heavy_hitter_fact_projection_remaps_with_scan_projection() {
 	]));
 	let descriptor = named_descriptor(41, "customers", schema.as_ref().clone());
 	let plan = ExecutionPlan::Scan {
-		legacy_table_id: TableId(41),
+		local_table_id: TableId(41),
 		table: descriptor.table_object_id,
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -3542,7 +3542,7 @@ fn range_distribution_fact_projection_remaps_with_scan_projection() {
 	]));
 	let descriptor = named_descriptor(42, "customers", schema.as_ref().clone());
 	let plan = ExecutionPlan::Scan {
-		legacy_table_id: TableId(42),
+		local_table_id: TableId(42),
 		table: descriptor.table_object_id,
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -6557,7 +6557,7 @@ fn join_output_containment_maps_scan_projection_ndv() {
 	]));
 	let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
 	let scan = ExecutionPlan::Scan {
-		legacy_table_id: TableId(43),
+		local_table_id: TableId(43),
 		table: descriptor.table_object_id,
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -6591,7 +6591,7 @@ fn clean_base_join_range_maps_scan_projection() {
 	let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
 	let range = range_fact_i64(10, 20, 11);
 	let scan = ExecutionPlan::Scan {
-		legacy_table_id: TableId(43),
+		local_table_id: TableId(43),
 		table: descriptor.table_object_id,
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -6625,7 +6625,7 @@ fn clean_base_join_heavy_hitter_maps_scan_projection() {
 	let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
 	let fact = int64_heavy_hitter_fact(&[(7, 500)]);
 	let scan = ExecutionPlan::Scan {
-		legacy_table_id: TableId(43),
+		local_table_id: TableId(43),
 		table: descriptor.table_object_id,
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -21008,9 +21008,7 @@ fn collect_broadcast_build_scan_ids_top_down(plan: &ExecutionPlan, build_ids: &m
 
 fn single_scan_table_id(plan: &ExecutionPlan) -> Option<TableId> {
 	match plan {
-		ExecutionPlan::Scan {
-			legacy_table_id, ..
-		} => Some(*legacy_table_id),
+		ExecutionPlan::Scan { local_table_id, .. } => Some(*local_table_id),
 		ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. } => single_scan_table_id(input),

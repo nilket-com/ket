@@ -80,7 +80,7 @@ In scope:
 - New `LogicalPlan::InsertSelect { table: TableRef,
   columns: Option<Vec<String>>, source: Box<LogicalPlan> }`
   variant.
-- New `ExecutionPlan::InsertSelect { legacy_table_id:
+- New `ExecutionPlan::InsertSelect { local_table_id:
   TableId, table: TableObjectId, fingerprint:
   PhysicalDescriptorFingerprint, schema: SchemaRef,
   target_columns: Vec<ColumnOrdinal>, source:
@@ -274,7 +274,7 @@ LogicalPlan::InsertSelect {
 }
 
 ExecutionPlan::InsertSelect {
-    legacy_table_id: TableId,
+    local_table_id: TableId,
     table: TableObjectId,
     fingerprint: PhysicalDescriptorFingerprint,
     schema: SchemaRef,
@@ -960,7 +960,7 @@ arc:
 
 - [ ] `LogicalPlan::InsertSelect { table, columns,
       source: Box<LogicalPlan> }` defined.
-- [ ] `ExecutionPlan::InsertSelect { legacy_table_id,
+- [ ] `ExecutionPlan::InsertSelect { local_table_id,
       table, fingerprint, schema, target_columns:
       Vec<ColumnOrdinal>, source: Box<ExecutionPlan> }`
       defined.

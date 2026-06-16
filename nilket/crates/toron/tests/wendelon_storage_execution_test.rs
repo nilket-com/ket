@@ -122,8 +122,8 @@ async fn wendelon_catalog_create_table_submits_schema_update_request() {
 			.resolve_table(&table)
 			.await
 			.expect("registry updated after create")
-			.legacy_table_id,
-		binding.legacy_table_id
+			.local_table_id,
+		binding.local_table_id
 	);
 
 	fixture.node.handles.abort();
@@ -166,7 +166,7 @@ async fn sql_created_pk_table_insert_supersedes_visible_row() {
 		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
 		.await;
 
-	let descriptors = HashMap::from([(binding.legacy_table_id, descriptor)]);
+	let descriptors = HashMap::from([(binding.local_table_id, descriptor)]);
 	let registry = Arc::new(
 		WendelonDescriptorRegistry::from_descriptors(descriptors)
 			.expect("registry from SQL-created descriptor"),
@@ -254,7 +254,7 @@ async fn live_wendelon_sql_pk_update_supersedes_visible_row() {
 		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
 		.await;
 
-	let descriptors = HashMap::from([(binding.legacy_table_id, descriptor)]);
+	let descriptors = HashMap::from([(binding.local_table_id, descriptor)]);
 	let registry = Arc::new(
 		WendelonDescriptorRegistry::from_descriptors(descriptors)
 			.expect("registry from SQL-created descriptor"),

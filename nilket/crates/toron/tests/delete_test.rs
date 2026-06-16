@@ -92,7 +92,7 @@ async fn binder_resolves_delete_shape_a_identity() {
 		.await
 		.expect("bind delete");
 	let ExecutionPlan::Delete {
-		legacy_table_id,
+		local_table_id,
 		table,
 		fingerprint,
 		schema,
@@ -108,7 +108,7 @@ async fn binder_resolves_delete_shape_a_identity() {
 		.resolve_table(&TableRef::new("people"))
 		.await
 		.expect("resolve people");
-	assert_eq!(legacy_table_id, binding.legacy_table_id);
+	assert_eq!(local_table_id, binding.local_table_id);
 	assert_eq!(table, binding.table);
 	assert_eq!(fingerprint, binding.fingerprint);
 	assert_eq!(schema.field(0).name(), "id");
@@ -424,7 +424,7 @@ async fn fragmenter_rejects_delete_defensively() {
 		.await
 		.expect("resolve people");
 	let plan = ExecutionPlan::Delete {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema,
@@ -453,7 +453,7 @@ async fn executor_rejects_direct_delete_execution() {
 		.await
 		.expect("resolve people");
 	let plan = ExecutionPlan::Delete {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema,

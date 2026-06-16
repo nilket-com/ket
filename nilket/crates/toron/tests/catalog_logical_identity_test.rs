@@ -810,7 +810,7 @@ async fn seed_sales_storage(catalog: &MockCatalog, storage: &InMemoryTableStorag
 			session_id: SessionId(1),
 			query_id: QueryId::from_u128(1),
 			tenant_id: TenantId(0),
-			table_id: binding.legacy_table_id,
+			table_id: binding.local_table_id,
 			table_object_id: binding.table,
 			physical_descriptor_fingerprint: binding.fingerprint,
 			payload: sales_batch(),

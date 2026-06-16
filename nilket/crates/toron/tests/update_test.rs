@@ -810,7 +810,7 @@ async fn update_descriptor_evolved_invalidates_without_retry() {
 		.await
 		.expect("seed table");
 	let catalog = Arc::new(catalog);
-	let writer = Arc::new(CapturingWrite::descriptor_evolved(binding.legacy_table_id));
+	let writer = Arc::new(CapturingWrite::descriptor_evolved(binding.local_table_id));
 	let executor = Executor::with_context(
 		storage,
 		ExecutionContext::new(
@@ -833,7 +833,7 @@ async fn update_descriptor_evolved_invalidates_without_retry() {
 
 	assert!(matches!(
 		err,
-		QueryError::Storage(StorageError::DescriptorEvolved { table_id }) if table_id == binding.legacy_table_id
+		QueryError::Storage(StorageError::DescriptorEvolved { table_id }) if table_id == binding.local_table_id
 	));
 	assert!(
 		catalog
@@ -1053,7 +1053,7 @@ fn write_request(binding: &TableBinding, payload: RecordBatch) -> WriteRequest {
 		session_id: SessionId(1),
 		query_id: QueryId::from_u128(1),
 		tenant_id: TenantId(1),
-		table_id: binding.legacy_table_id,
+		table_id: binding.local_table_id,
 		table_object_id: binding.table,
 		physical_descriptor_fingerprint: binding.fingerprint,
 		payload,

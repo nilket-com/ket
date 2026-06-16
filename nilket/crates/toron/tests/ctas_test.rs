@@ -388,7 +388,7 @@ async fn ctas_or_replace_source_failure_preserves_existing_table() {
 		.resolve_table(&TableRef::new("target"))
 		.await
 		.expect("target remains after source failure");
-	assert_eq!(before.legacy_table_id, after.legacy_table_id);
+	assert_eq!(before.local_table_id, after.local_table_id);
 	assert_eq!(before.table, after.table);
 	assert_eq!(before.fingerprint, after.fingerprint);
 
@@ -1024,8 +1024,8 @@ async fn catalog_create_outcome_reports_created_true_and_false() {
 		.expect("compatible existing");
 	assert!(!existing.created);
 	assert_eq!(
-		created.binding.legacy_table_id,
-		existing.binding.legacy_table_id
+		created.binding.local_table_id,
+		existing.binding.local_table_id
 	);
 }
 
@@ -1104,7 +1104,7 @@ fn empty_storage() -> Arc<InMemoryStorageScan> {
 
 fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 	ExecutionPlan::Scan {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema.clone(),

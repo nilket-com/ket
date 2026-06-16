@@ -170,7 +170,7 @@ Preserve verbatim:
 
    ```rust
    InsertSelect {
-       legacy_table_id: TableId,
+       local_table_id: TableId,
        table: TableObjectId,
        fingerprint: PhysicalDescriptorFingerprint,
        schema: SchemaRef,
@@ -333,7 +333,7 @@ shared target-list resolution helper.
      target_ty)` helper (numeric admissibility from
      ADR 025 strict cast lattice plus identity for
      Boolean / Utf8);
-   - emit `ExecutionPlan::InsertSelect { legacy_table_id,
+   - emit `ExecutionPlan::InsertSelect { local_table_id,
      table, fingerprint, schema, target_columns,
      source: Box::new(source_plan) }`.
 
@@ -774,7 +774,7 @@ time, not inside the implementation PR.
 
 - [ ] `LogicalPlan::InsertSelect { table, columns,
       source: Box<LogicalPlan> }` defined.
-- [ ] `ExecutionPlan::InsertSelect { legacy_table_id,
+- [ ] `ExecutionPlan::InsertSelect { local_table_id,
       table, fingerprint, schema, target_columns:
       Vec<ColumnOrdinal>, source: Box<ExecutionPlan> }`
       defined.

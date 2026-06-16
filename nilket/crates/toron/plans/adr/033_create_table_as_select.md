@@ -424,7 +424,7 @@ Coordinator sequence:
 2. Call `catalog.create_table(table, schema.clone(),
    false)` — `if_not_exists = false` always; CTAS
    never inherits the ADR 029 D14 surface.
-3. Receive `TableBinding` (with `legacy_table_id`,
+3. Receive `TableBinding` (with `local_table_id`,
    `table`, `fingerprint`).
 4. Execute the bound source via
    `Executor::execute_bound(source, None)` (mirrors
@@ -438,7 +438,7 @@ Coordinator sequence:
    produce a zero-row payload (Claude iter-1 C1 +
    Codex iter-0 R6).
 7. Call `self.writer.write(WriteRequest { ...
-   binding.legacy_table_id, binding.table,
+   binding.local_table_id, binding.table,
    binding.fingerprint, payload ... })` once.
 8. Return `Ok(Vec::new())` (no row count, no
    RETURNING).

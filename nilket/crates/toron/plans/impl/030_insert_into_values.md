@@ -52,7 +52,7 @@ final verification.
 | File | Anchor | Phase |
 |---|---|---|
 | `crates/toron/src/ir.rs` | `pub enum InsertLiteral`; `LogicalPlan::Insert { table: TableRef, columns: Option<Vec<String>>, rows: Vec<Vec<InsertLiteral>> }` leaf variant | 1 |
-| `crates/toron/src/ir/execution.rs` | `ExecutionPlan::Insert { legacy_table_id: TableId, table: TableObjectId, fingerprint: PhysicalDescriptorFingerprint, schema: SchemaRef, rows: Vec<Vec<ScalarValue>> }`; `schema()` returns `Arc::new(Schema::empty())` | 1 |
+| `crates/toron/src/ir/execution.rs` | `ExecutionPlan::Insert { local_table_id: TableId, table: TableObjectId, fingerprint: PhysicalDescriptorFingerprint, schema: SchemaRef, rows: Vec<Vec<ScalarValue>> }`; `schema()` returns `Arc::new(Schema::empty())` | 1 |
 | `crates/toron/src/sql_planner.rs::plan` | `Statement::Insert` arm; widened catch-all diagnostic | 2 |
 | `crates/toron/src/sql_planner.rs::lower_insert` | NEW; exhaustive `sqlparser::ast::Insert` destructure (19 fields) without `..` | 2 |
 | `crates/toron/src/sql_planner.rs::lower_insert_target_name` | NEW; 1- or 2-part names; rejects 3-part + table functions | 2 |
@@ -182,7 +182,7 @@ Verify `blake3` is **not** declared in
 
    ```rust
    ExecutionPlan::Insert {
-       legacy_table_id: TableId,
+       local_table_id: TableId,
        table: TableObjectId,
        fingerprint: PhysicalDescriptorFingerprint,
        schema: SchemaRef,
@@ -508,8 +508,8 @@ fill, target-type coercion, and row cap enforcement.
       typed `ScalarValue::<Field::data_type>(None)`;
       reject unmentioned NOT NULL fields with
       `BindingError::TypeMismatch { message: format!("INSERT omits non-nullable column: {column}") }`.
-   8. Return `ExecutionPlan::Insert { legacy_table_id:
-      binding.legacy_table_id, table: binding.table,
+   8. Return `ExecutionPlan::Insert { local_table_id:
+      binding.local_table_id, table: binding.table,
       fingerprint: binding.fingerprint, schema:
       binding.schema.clone(), rows: bound_rows }`.
 
@@ -903,7 +903,7 @@ retry semantics for SELECT (ADR 029 D15).
    ) -> Result<Vec<RecordBatch>, QueryError> {
        match bound {
            ExecutionPlan::Insert {
-               legacy_table_id,
+               local_table_id,
                table,
                fingerprint,
                schema,
@@ -916,7 +916,7 @@ retry semantics for SELECT (ADR 029 D15).
                    session_id: context.session_id,
                    query_id: context.query_id,
                    tenant_id: context.tenant_id,
-                   table_id: *legacy_table_id,
+                   table_id: *local_table_id,
                    table_object_id: *table,
                    physical_descriptor_fingerprint: *fingerprint,
                    payload,
@@ -1056,7 +1056,7 @@ cargo test -p toron --lib fragment
    - `adr030_logical_plan_insert_uses_insert_literal`
    - `adr030_execution_plan_insert_has_no_record_batch`
      (pins field shape:
-     `Insert {\n\t\tlegacy_table_id: TableId,\n\t\ttable: TableObjectId,\n\t\tfingerprint: PhysicalDescriptorFingerprint,\n\t\tschema: SchemaRef,\n\t\trows: Vec<Vec<ScalarValue>>,`)
+     `Insert {\n\t\tlocal_table_id: TableId,\n\t\ttable: TableObjectId,\n\t\tfingerprint: PhysicalDescriptorFingerprint,\n\t\tschema: SchemaRef,\n\t\trows: Vec<Vec<ScalarValue>>,`)
    - `adr030_catalog_has_no_insert_method`
    - `adr030_no_storage_synthetic_column_construction_in_toron`
      (source-reads `coordinator/write.rs`)

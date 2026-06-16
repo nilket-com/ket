@@ -99,7 +99,7 @@ async fn mock_catalog_drop_table_semantics() {
 		.await
 		.expect("drop table")
 		.expect("existing table returns binding");
-	assert_eq!(dropped.legacy_table_id, created.legacy_table_id);
+	assert_eq!(dropped.local_table_id, created.local_table_id);
 	assert!(catalog.resolve_table(&name).await.is_err());
 
 	let missing = expect_drop_catalog_err(catalog.drop_table(&name, false).await);
@@ -134,7 +134,7 @@ async fn mock_catalog_drop_table_schema_alias_cleanup_is_exact() {
 		.resolve_table(&TableRef::new("sales"))
 		.await
 		.expect("resolve unqualified alias");
-	assert_eq!(unqualified.legacy_table_id, app.legacy_table_id);
+	assert_eq!(unqualified.local_table_id, app.local_table_id);
 
 	catalog
 		.drop_table(&app_name, false)
@@ -152,7 +152,7 @@ async fn mock_catalog_drop_table_schema_alias_cleanup_is_exact() {
 		.resolve_table(&other_name)
 		.await
 		.expect("other.sales remains");
-	assert_eq!(still_other.legacy_table_id, other.legacy_table_id);
+	assert_eq!(still_other.local_table_id, other.local_table_id);
 }
 
 #[tokio::test]
@@ -660,7 +660,7 @@ async fn wendelon_catalog_drop_table_semantics() {
 		.await
 		.expect("guarded local descriptor drop")
 		.expect("dropped binding");
-	assert_eq!(dropped.legacy_table_id, TableId(7));
+	assert_eq!(dropped.local_table_id, TableId(7));
 	assert!(
 		catalog
 			.resolve_table(&TableRef::with_schema("bench", "orders"))

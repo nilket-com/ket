@@ -249,7 +249,7 @@ pub enum ExecutionPlan {
 		rows: Vec<Vec<ScalarValue>>,
 	},
 	Scan {
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
@@ -357,7 +357,7 @@ pub enum ExecutionPlan {
 		if_exists: bool,
 	},
 	Delete {
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
@@ -367,7 +367,7 @@ pub enum ExecutionPlan {
 		returning: Option<BoundReturningProjection>,
 	},
 	Update {
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
@@ -376,7 +376,7 @@ pub enum ExecutionPlan {
 		returning: Option<BoundReturningProjection>,
 	},
 	Insert {
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
@@ -384,7 +384,7 @@ pub enum ExecutionPlan {
 		returning: Option<BoundReturningProjection>,
 	},
 	InsertSelect {
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,

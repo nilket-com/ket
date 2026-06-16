@@ -58,7 +58,7 @@ the round shipped a red suite by skipping this).
 
 `create_table_with_outcome` rebinds the new descriptor via seed-only `from_descriptor`
 (`catalog.rs:636`, Mock; Wendelon analogously). Switch to
-`from_descriptor_with_logical_types(legacy_table_id, &descriptor, with_registry(tenant registry))`
+`from_descriptor_with_logical_types(local_table_id, &descriptor, with_registry(tenant registry))`
 so a create that wrote a durable id doesn't reject its own output (the sync paths
 `:458/:953/:1058` already do this — only the create rebind is stale).
 

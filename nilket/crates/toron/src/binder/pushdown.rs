@@ -203,9 +203,7 @@ pub(super) fn plan_filter_with_predicate_pushdown_evidence(
 
 pub(super) fn scan_table_id(input: &ExecutionPlan) -> Option<TableId> {
 	match input {
-		ExecutionPlan::Scan {
-			legacy_table_id, ..
-		} => Some(*legacy_table_id),
+		ExecutionPlan::Scan { local_table_id, .. } => Some(*local_table_id),
 		ExecutionPlan::Filter { input, .. } => scan_table_id(input),
 		_ => None,
 	}

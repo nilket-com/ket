@@ -12,7 +12,7 @@ facts; multi-column/join selectivity; 141-W (Wendelon producer — named); choos
 | Concern | Anchor |
 |---|---|
 | catalog fact home | `TableOptimizerFacts { byte_upper_bound, row_upper_bound }` `catalog.rs:79` (derives `Copy,Eq` today); `DescriptorOptimizerFacts` `:85`; `for_descriptor` `:94` |
-| Scan carries plan metadata (137) | `ExecutionPlan::Scan { legacy_table_id, table, .., primary_key_columns: Vec<ColumnOrdinal> }` `ir/execution.rs` |
+| Scan carries plan metadata (137) | `ExecutionPlan::Scan { local_table_id, table, .., primary_key_columns: Vec<ColumnOrdinal> }` `ir/execution.rs` |
 | scan builder (projection-map NDV like PK) | `scan_plan(binding, projection)` `binder.rs:3619` |
 | 137 recognizer to generalize | `filter_includes_primary_key_row_cap` `binder.rs:3706` (reads `Scan.primary_key_columns`); Eq + top-level-AND walk `:3719` |
 | facts type (keep Copy) | `PlanOptimizerFacts { origin, byte_upper_bound, estimated_byte_size, row_upper_bound }` `binder.rs:165` |

@@ -680,7 +680,7 @@ fn scan_plan(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Execution
 	.expect("descriptor");
 
 	ExecutionPlan::Scan {
-		legacy_table_id: table_id,
+		local_table_id: table_id,
 		table: TableObjectId::new([object_byte; 16]),
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,

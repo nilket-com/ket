@@ -312,10 +312,10 @@ PhysicalDescriptorFingerprint)` pairs:
 fn mock_table_identity(
     name: &TableRef,
     schema: &Schema,
-    legacy_table_id: TableId,
+    local_table_id: TableId,
 ) -> Result<(TableObjectId, PhysicalDescriptorFingerprint), CatalogError> {
     let mut object_id = [0_u8; 16];
-    object_id[8..].copy_from_slice(&legacy_table_id.0.to_be_bytes());
+    object_id[8..].copy_from_slice(&local_table_id.0.to_be_bytes());
     let table_object_id = TableObjectId::new(object_id);
 
     let descriptor = TableSchemaDescriptor::new_with_layout(
@@ -338,7 +338,7 @@ fn mock_table_identity(
 ```
 
 `TableObjectId` is deterministic via
-`legacy_table_id.0.to_be_bytes()` stamped into the
+`local_table_id.0.to_be_bytes()` stamped into the
 trailing 8 bytes. This is catalog identity bookkeeping
 for test paths only — no Wendelon persistence implied.
 
@@ -396,12 +396,12 @@ binding:
   side effect of creating another table.
 
 ```rust
-inner.by_ref.insert(name.clone(), legacy_table_id);
+inner.by_ref.insert(name.clone(), local_table_id);
 if name.schema.is_some() {
     inner
         .by_ref
         .entry(TableRef::new(name.table.clone()))
-        .or_insert(legacy_table_id);
+        .or_insert(local_table_id);
 }
 ```
 
@@ -876,7 +876,7 @@ ADR 030+ candidates:
       `PhysicalDescriptorFingerprint` via
       `TableSchemaDescriptor::new_with_layout`;
       `TableObjectId` deterministic from
-      `legacy_table_id.0` 8-byte suffix.
+      `local_table_id.0` 8-byte suffix.
 - [ ] `MockCatalog::create_table` allocates fresh
       `TableId(value)` (tuple-struct construction, NOT
       `TableId::new`); skips existing keys; bumps

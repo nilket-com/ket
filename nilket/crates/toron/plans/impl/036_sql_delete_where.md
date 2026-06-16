@@ -273,7 +273,7 @@ Preserve verbatim:
 
    ```rust
    Delete {
-       legacy_table_id: TableId,
+       local_table_id: TableId,
        table: TableObjectId,
        fingerprint: PhysicalDescriptorFingerprint,
        schema: SchemaRef,
@@ -554,7 +554,7 @@ tests remain green.
        };
 
        Ok(ExecutionPlan::Delete {
-           legacy_table_id: binding.legacy_table_id,
+           local_table_id: binding.local_table_id,
            table: binding.table,
            fingerprint: binding.fingerprint,
            schema: binding.schema.clone(),
@@ -818,7 +818,7 @@ investigate before proceeding to Phase 5.
        plan: &ExecutionPlan,
    ) -> Result<Vec<RecordBatch>, QueryError> {
        let ExecutionPlan::Delete {
-           legacy_table_id,
+           local_table_id,
            table,
            fingerprint,
            schema,
@@ -834,7 +834,7 @@ investigate before proceeding to Phase 5.
            session_id: context.session_id,
            query_id: context.query_id,
            tenant_id: context.tenant_id,
-           table_id: *legacy_table_id,
+           table_id: *local_table_id,
            table_object_id: *table,
            physical_descriptor_fingerprint: *fingerprint,
            read_bound: context.read_bound,
@@ -869,7 +869,7 @@ investigate before proceeding to Phase 5.
                session_id: context.session_id,
                query_id: context.query_id,
                tenant_id: context.tenant_id,
-               table_id: *legacy_table_id,
+               table_id: *local_table_id,
                table_object_id: *table,
                physical_descriptor_fingerprint: *fingerprint,
                row_key_ids,
@@ -1040,11 +1040,11 @@ async fn binder_resolves_delete_shape_a_identity() {
     // setup MockCatalog with table "t" + schema
     // bind LogicalPlan::Delete { table: TableRef("t"), predicate: Some(...) }
     // assert ExecutionPlan::Delete {
-    //   legacy_table_id, table (TableObjectId), fingerprint, schema,
+    //   local_table_id, table (TableObjectId), fingerprint, schema,
     //   predicate: Some(_), pbc_program: Some(_),
     //   profile_hint: ...
     // }
-    // assert legacy_table_id matches MockCatalog binding
+    // assert local_table_id matches MockCatalog binding
 }
 ```
 

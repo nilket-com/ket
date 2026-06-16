@@ -591,7 +591,7 @@ Architecture guards 8, 9, 10.
 
 ```rust
 pub struct TableBinding {
-    pub legacy_table_id: TableId,
+    pub local_table_id: TableId,
     pub table: TableObjectId,
     pub schema_generation: u64,                  // NEW
     pub fingerprint: PhysicalDescriptorFingerprint,
@@ -600,11 +600,11 @@ pub struct TableBinding {
 
 impl TableBinding {
     pub fn from_descriptor(
-        legacy_table_id: TableId,
+        local_table_id: TableId,
         descriptor: &wendelon_client::TableSchemaDescriptor,
     ) -> Result<Self, CatalogError> {
         Ok(Self {
-            legacy_table_id,
+            local_table_id,
             table: descriptor.table_object_id,
             schema_generation: descriptor.schema_generation,  // NEW
             fingerprint: descriptor.physical_descriptor_fingerprint,
@@ -733,8 +733,8 @@ async fn drop_table(
         schema_generation: SchemaGeneration::new(binding.schema_generation),
     };
     self.registry
-        .consume_finalized_drop(binding.legacy_table_id, operation_id)?;
-    self.registry.remove_table(binding.legacy_table_id)?;
+        .consume_finalized_drop(binding.local_table_id, operation_id)?;
+    self.registry.remove_table(binding.local_table_id)?;
     Ok(Some(binding))
 }
 ```
@@ -794,7 +794,7 @@ ExecutionPlan::DropTable { name, if_exists } => {
             session_id: context.session_id,
             query_id: context.query_id,
             tenant_id: context.tenant_id,
-            table_id: binding.legacy_table_id,
+            table_id: binding.local_table_id,
             table_object_id: binding.table,
             schema_generation: binding.schema_generation,  // NEW field
             physical_descriptor_fingerprint: binding.fingerprint,

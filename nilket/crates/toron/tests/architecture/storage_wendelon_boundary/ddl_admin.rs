@@ -325,7 +325,7 @@ pub(crate) fn adr033_execution_ctas_has_no_precreate_identity() {
 		assert!(ctas.contains(required), "CTAS body missing {required}");
 	}
 	for forbidden in [
-		"legacy_table_id",
+		"local_table_id",
 		"TableId",
 		"TableObjectId",
 		"fingerprint",
@@ -538,7 +538,7 @@ pub(crate) fn adr033_coordinator_uses_create_table_binding_for_write() {
 
 	assert!(ctas_arm.contains("let outcome = catalog"));
 	assert!(ctas_arm.contains("let binding = outcome.binding"));
-	assert!(ctas_arm.contains("table_id: binding.legacy_table_id"));
+	assert!(ctas_arm.contains("table_id: binding.local_table_id"));
 	assert!(ctas_arm.contains("table_object_id: binding.table"));
 	assert!(ctas_arm.contains("physical_descriptor_fingerprint: binding.fingerprint"));
 }

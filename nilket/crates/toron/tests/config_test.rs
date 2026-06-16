@@ -1177,7 +1177,7 @@ fn descriptor_bootstrap_preserves_physical_fingerprint() {
 		.resolve_table(TenantId(7), &TableRef::with_schema("config_test", "sales"))
 		.expect("resolve descriptor");
 
-	assert_eq!(binding.legacy_table_id, TableId(9));
+	assert_eq!(binding.local_table_id, TableId(9));
 	assert_eq!(binding.table, descriptor.table_object_id);
 	assert_eq!(
 		binding.fingerprint,

@@ -90,7 +90,7 @@ In scope:
   predicate: Option<Expr> }` variant.
 - New `ExecutionPlan::Delete` variant carrying
   Shape A pre-resolved identity:
-  - `legacy_table_id: TableId`;
+  - `local_table_id: TableId`;
   - `table: TableObjectId`;
   - `fingerprint: PhysicalDescriptorFingerprint`;
   - `schema: SchemaRef`;
@@ -455,7 +455,7 @@ LogicalPlan::Delete {
 }
 
 ExecutionPlan::Delete {
-    legacy_table_id: TableId,
+    local_table_id: TableId,
     table: TableObjectId,
     fingerprint: PhysicalDescriptorFingerprint,
     schema: SchemaRef,
@@ -882,7 +882,7 @@ the explicit lift.
 | 5 | `adr036_logical_variant_count_is_15` | `LogicalPlan` 14 → 15 growth | `ir.rs` |
 | 6 | `adr036_execution_variant_count_is_13` | `ExecutionPlan` 12 → 13 growth | `ir/execution.rs` |
 | 7 | `adr036_ir_delete_variants_are_leafs` | Both variants exist; `ExecutionPlan::Delete` contains no `Box<`, `input`, or `source` | `ir.rs`, `ir/execution.rs` |
-| 8 | `adr036_execution_delete_carries_shape_a_identity` | `ExecutionPlan::Delete` body contains `legacy_table_id`, `table`, `fingerprint`, `schema` | `ir/execution.rs` |
+| 8 | `adr036_execution_delete_carries_shape_a_identity` | `ExecutionPlan::Delete` body contains `local_table_id`, `table`, `fingerprint`, `schema` | `ir/execution.rs` |
 | 9 | `adr036_delete_has_no_filter_disposition_field` | `ExecutionPlan::Delete` body contains no `FilterDisposition` literal | `ir/execution.rs` |
 | 10 | `adr036_binder_delete_uses_boolean_root_validator` | `bind_delete` body calls `require_single_boolean_root` or equivalent shared helper; no inline `DataType::Boolean` literal | `binder.rs` |
 | 11 | `adr036_binder_delete_allows_residual_predicates` | `bind_delete` does NOT reject `compile_pbc(_) -> None`; residual path is preserved | `binder.rs` |
@@ -931,7 +931,7 @@ form, one test file).
    produces a stable diagnostic.
 4. `binder_resolves_delete_shape_a_identity` —
    bind `DELETE FROM t WHERE col > 0`; assert
-   `ExecutionPlan::Delete { legacy_table_id,
+   `ExecutionPlan::Delete { local_table_id,
    table, fingerprint, schema, predicate: Some(_),
    pbc_program: Some(_), profile_hint }` with
    Shape A identity.

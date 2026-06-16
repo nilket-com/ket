@@ -33,7 +33,7 @@ pub(crate) fn adr029_mock_catalog_is_interior_mutable() {
 	assert!(catalog.contains("inner: Arc<RwLock<MockCatalogInner>>"));
 	assert!(catalog.contains("next_table_id: u64"));
 	assert!(catalog.contains("self.inner.write()"));
-	assert!(catalog.contains("bump_next_table_id(&mut inner, legacy_table_id)"));
+	assert!(catalog.contains("bump_next_table_id(&mut inner, local_table_id)"));
 }
 
 #[test]
@@ -68,12 +68,12 @@ pub(crate) fn adr029_mock_catalog_reference_insertion_does_not_overwrite() {
 		.expect("MockCatalog::create_table body")
 		.1;
 
-	assert!(create_body.contains("insert((self.tenant_id, name.clone()), legacy_table_id)"));
+	assert!(create_body.contains("insert((self.tenant_id, name.clone()), local_table_id)"));
 	assert!(create_body.contains(".entry((self.tenant_id, TableRef::new(name.table.clone())))"));
-	assert!(create_body.contains(".or_insert(legacy_table_id)"));
+	assert!(create_body.contains(".or_insert(local_table_id)"));
 	assert_eq!(
 		create_body
-			.matches(".insert((self.tenant_id, name.clone()), legacy_table_id)")
+			.matches(".insert((self.tenant_id, name.clone()), local_table_id)")
 			.count(),
 		1
 	);

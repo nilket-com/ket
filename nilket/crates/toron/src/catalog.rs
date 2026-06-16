@@ -852,7 +852,7 @@ fn descriptor_column_group_ndv(
 
 #[derive(Clone)]
 pub struct TableBinding {
-	pub legacy_table_id: TableId,
+	pub local_table_id: TableId,
 	pub table: TableObjectId,
 	pub schema_generation: u64,
 	pub fingerprint: PhysicalDescriptorFingerprint,
@@ -865,19 +865,19 @@ pub struct TableBinding {
 
 impl TableBinding {
 	pub fn from_descriptor(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 	) -> Result<Self, CatalogError> {
-		Self::from_descriptor_with_optimizer_facts(legacy_table_id, descriptor, None)
+		Self::from_descriptor_with_optimizer_facts(local_table_id, descriptor, None)
 	}
 
 	pub fn from_descriptor_with_optimizer_facts(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 		optimizer_facts: Option<DescriptorOptimizerFacts>,
 	) -> Result<Self, CatalogError> {
 		Self::from_descriptor_with_logical_types_and_optimizer_facts(
-			legacy_table_id,
+			local_table_id,
 			descriptor,
 			LogicalTypeResolver::seed_only(),
 			optimizer_facts,
@@ -885,12 +885,12 @@ impl TableBinding {
 	}
 
 	pub fn from_descriptor_with_logical_types(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 		logical_types: LogicalTypeResolver<'_>,
 	) -> Result<Self, CatalogError> {
 		Self::from_descriptor_with_logical_types_and_optimizer_facts(
-			legacy_table_id,
+			local_table_id,
 			descriptor,
 			logical_types,
 			None,
@@ -898,7 +898,7 @@ impl TableBinding {
 	}
 
 	pub fn from_descriptor_with_logical_types_and_optimizer_facts(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 		logical_types: LogicalTypeResolver<'_>,
 		optimizer_facts: Option<DescriptorOptimizerFacts>,
@@ -914,7 +914,7 @@ impl TableBinding {
 		let primary_key_columns = primary_key_columns(&schema, descriptor)?;
 
 		let mut binding = Self::new_with_row_identity(
-			legacy_table_id,
+			local_table_id,
 			descriptor.table_object_id,
 			descriptor.schema_generation,
 			descriptor.physical_descriptor_fingerprint,
@@ -929,23 +929,23 @@ impl TableBinding {
 	}
 
 	pub fn new(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
 	) -> Self {
-		Self::new_with_schema_generation(legacy_table_id, table, 0, fingerprint, schema)
+		Self::new_with_schema_generation(local_table_id, table, 0, fingerprint, schema)
 	}
 
 	pub fn new_with_schema_generation(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		schema_generation: u64,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
 	) -> Self {
 		Self::new_with_primary_key_columns(
-			legacy_table_id,
+			local_table_id,
 			table,
 			schema_generation,
 			fingerprint,
@@ -955,7 +955,7 @@ impl TableBinding {
 	}
 
 	pub fn new_with_primary_key_columns(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		schema_generation: u64,
 		fingerprint: PhysicalDescriptorFingerprint,
@@ -968,7 +968,7 @@ impl TableBinding {
 			TableRowIdentity::Unsupported
 		};
 		Self::new_with_row_identity(
-			legacy_table_id,
+			local_table_id,
 			table,
 			schema_generation,
 			fingerprint,
@@ -979,7 +979,7 @@ impl TableBinding {
 	}
 
 	pub fn new_with_row_identity(
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		table: TableObjectId,
 		schema_generation: u64,
 		fingerprint: PhysicalDescriptorFingerprint,
@@ -989,7 +989,7 @@ impl TableBinding {
 	) -> Self {
 		let pbc_eligible_columns = pbc_eligible_columns(&schema);
 		Self {
-			legacy_table_id,
+			local_table_id,
 			table,
 			schema_generation,
 			fingerprint,
@@ -1293,16 +1293,16 @@ impl MockCatalog {
 
 	pub fn register_descriptor(
 		&mut self,
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: wendelon_client::TableSchemaDescriptor,
 	) -> Result<(), CatalogError> {
-		self.register_descriptor_for_tenant(self.tenant_id, legacy_table_id, descriptor)
+		self.register_descriptor_for_tenant(self.tenant_id, local_table_id, descriptor)
 	}
 
 	pub fn register_descriptor_for_tenant(
 		&mut self,
 		tenant_id: TenantId,
-		legacy_table_id: TableId,
+		local_table_id: TableId,
 		descriptor: wendelon_client::TableSchemaDescriptor,
 	) -> Result<(), CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
@@ -1314,20 +1314,20 @@ impl MockCatalog {
 			.map(LogicalTypeResolver::with_registry)
 			.unwrap_or_else(LogicalTypeResolver::seed_only);
 		let binding = TableBinding::from_descriptor_with_logical_types(
-			legacy_table_id,
+			local_table_id,
 			&descriptor,
 			resolver,
 		)?;
 
-		inner.by_ref.insert((tenant_id, table_ref), legacy_table_id);
+		inner.by_ref.insert((tenant_id, table_ref), local_table_id);
 		inner
 			.by_ref
-			.insert((tenant_id, unqualified_ref), legacy_table_id);
-		inner.by_id.insert((tenant_id, legacy_table_id), binding);
+			.insert((tenant_id, unqualified_ref), local_table_id);
+		inner.by_id.insert((tenant_id, local_table_id), binding);
 		inner
 			.descriptors
-			.insert((tenant_id, legacy_table_id), descriptor);
-		bump_next_table_id(&mut inner, legacy_table_id);
+			.insert((tenant_id, local_table_id), descriptor);
+		bump_next_table_id(&mut inner, local_table_id);
 		Ok(())
 	}
 
@@ -1345,12 +1345,12 @@ impl MockCatalog {
 		table_ref: TableRef,
 		binding: TableBinding,
 	) -> Result<(), CatalogError> {
-		let legacy_table_id = binding.legacy_table_id;
+		let local_table_id = binding.local_table_id;
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
 
-		inner.by_ref.insert((tenant_id, table_ref), legacy_table_id);
-		inner.by_id.insert((tenant_id, legacy_table_id), binding);
-		bump_next_table_id(&mut inner, legacy_table_id);
+		inner.by_ref.insert((tenant_id, table_ref), local_table_id);
+		inner.by_id.insert((tenant_id, local_table_id), binding);
+		bump_next_table_id(&mut inner, local_table_id);
 		Ok(())
 	}
 
@@ -1564,14 +1564,14 @@ impl Catalog for MockCatalog {
 				.checked_add(1)
 				.expect("TableId overflow");
 		}
-		let legacy_table_id = TableId(inner.next_table_id);
+		let local_table_id = TableId(inner.next_table_id);
 		inner.next_table_id = inner
 			.next_table_id
 			.checked_add(1)
 			.expect("TableId overflow");
 
 		let (table_object_id, fingerprint) =
-			mock_table_identity(name, schema.as_ref(), &row_identity, legacy_table_id)?;
+			mock_table_identity(name, schema.as_ref(), &row_identity, local_table_id)?;
 		let descriptor =
 			create_table_descriptor(name, schema.as_ref(), &row_identity, table_object_id)?;
 		let logical_types = inner
@@ -1580,7 +1580,7 @@ impl Catalog for MockCatalog {
 			.cloned()
 			.unwrap_or_default();
 		let mut binding = TableBinding::from_descriptor_with_logical_types(
-			legacy_table_id,
+			local_table_id,
 			&descriptor,
 			LogicalTypeResolver::with_registry(&logical_types),
 		)?;
@@ -1588,19 +1588,19 @@ impl Catalog for MockCatalog {
 
 		inner
 			.by_ref
-			.insert((self.tenant_id, name.clone()), legacy_table_id);
+			.insert((self.tenant_id, name.clone()), local_table_id);
 		if name.schema.is_some() {
 			inner
 				.by_ref
 				.entry((self.tenant_id, TableRef::new(name.table.clone())))
-				.or_insert(legacy_table_id);
+				.or_insert(local_table_id);
 		}
 		inner
 			.by_id
-			.insert((self.tenant_id, legacy_table_id), binding.clone());
+			.insert((self.tenant_id, local_table_id), binding.clone());
 		inner
 			.descriptors
-			.insert((self.tenant_id, legacy_table_id), descriptor);
+			.insert((self.tenant_id, local_table_id), descriptor);
 
 		Ok(CreateTableOutcome {
 			binding,
@@ -2391,7 +2391,7 @@ impl WendelonDescriptorRegistry {
 			tenant_id,
 			name,
 			unqualified_ref,
-			binding.legacy_table_id,
+			binding.local_table_id,
 			binding,
 			descriptor,
 		)
@@ -2948,7 +2948,7 @@ impl Catalog for WendelonCatalog {
 				message: "CREATE TABLE requires a configured Wendelon catalog admin client"
 					.to_string(),
 			})?;
-		let legacy_table_id = self.registry.allocate_table_id();
+		let local_table_id = self.registry.allocate_table_id();
 		let table_object_id = TableObjectId::new(*Uuid::new_v4().as_bytes());
 		let row_identity_policy =
 			create_table_row_identity_policy(name, schema.as_ref(), &row_identity)?;
@@ -2997,7 +2997,7 @@ impl Catalog for WendelonCatalog {
 
 		let logical_types = self.registry.logical_type_registry(self.tenant_id);
 		let binding = TableBinding::from_descriptor_with_logical_types(
-			legacy_table_id,
+			local_table_id,
 			&descriptor,
 			LogicalTypeResolver::with_registry(&logical_types),
 		)?;
@@ -3034,11 +3034,11 @@ impl Catalog for WendelonCatalog {
 		};
 		self.registry.consume_finalized_drop(
 			self.tenant_id,
-			binding.legacy_table_id,
+			binding.local_table_id,
 			operation_id,
 		)?;
 		self.registry
-			.remove_table_for_tenant(self.tenant_id, binding.legacy_table_id)?;
+			.remove_table_for_tenant(self.tenant_id, binding.local_table_id)?;
 		Ok(Some(binding))
 	}
 }
@@ -3152,10 +3152,10 @@ fn mock_table_identity(
 	name: &TableRef,
 	schema: &Schema,
 	row_identity: &CreateTableRowIdentity,
-	legacy_table_id: TableId,
+	local_table_id: TableId,
 ) -> Result<(TableObjectId, PhysicalDescriptorFingerprint), CatalogError> {
 	let mut object_id = [0_u8; 16];
-	object_id[8..].copy_from_slice(&legacy_table_id.0.to_be_bytes());
+	object_id[8..].copy_from_slice(&local_table_id.0.to_be_bytes());
 	let table_object_id = TableObjectId::new(object_id);
 
 	let descriptor = create_table_descriptor(name, schema, row_identity, table_object_id)?;
@@ -3596,7 +3596,7 @@ mod tests {
 			.await
 			.expect("resolve table");
 
-		assert_eq!(resolved.legacy_table_id, TableId(9));
+		assert_eq!(resolved.local_table_id, TableId(9));
 		assert_eq!(resolved.table, descriptor.table_object_id);
 		assert_eq!(
 			resolved.fingerprint,
@@ -4695,7 +4695,7 @@ mod tests {
 
 		assert_eq!(client.call_count(), 1);
 		assert_eq!(client.max_active(), 1);
-		assert_eq!(owner.legacy_table_id, waiter.legacy_table_id);
+		assert_eq!(owner.local_table_id, waiter.local_table_id);
 		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 1);
 	}
 
@@ -4762,8 +4762,8 @@ mod tests {
 		let owner = owner.await.expect("owner task").expect("owner result");
 		let waiter = waiter.await.expect("waiter task").expect("waiter result");
 
-		assert_eq!(owner.legacy_table_id, waiter.legacy_table_id);
-		assert_eq!(owner.legacy_table_id, TableId(1));
+		assert_eq!(owner.local_table_id, waiter.local_table_id);
+		assert_eq!(owner.local_table_id, TableId(1));
 	}
 
 	#[tokio::test]
@@ -4893,7 +4893,7 @@ mod tests {
 			.await
 			.expect("resolve synced");
 		let stored = registry
-			.descriptor(TenantId(7), binding.legacy_table_id)
+			.descriptor(TenantId(7), binding.local_table_id)
 			.expect("storage-visible descriptor");
 
 		assert_eq!(stored.table_object_id, descriptor.table_object_id);
@@ -5049,8 +5049,8 @@ mod tests {
 			)
 			.expect("sync descriptor");
 
-		assert_ne!(resolved.legacy_table_id, TableId(7));
-		assert_eq!(resolved.legacy_table_id, TableId(8));
+		assert_ne!(resolved.local_table_id, TableId(7));
+		assert_eq!(resolved.local_table_id, TableId(8));
 		assert_eq!(resolved.table, descriptor.table_object_id);
 	}
 
@@ -5091,7 +5091,7 @@ mod tests {
 			)
 			.expect("same identity");
 
-		assert_eq!(resolved.legacy_table_id, TableId(9));
+		assert_eq!(resolved.local_table_id, TableId(9));
 	}
 
 	#[tokio::test]
@@ -5124,7 +5124,7 @@ mod tests {
 			)
 			.expect("refresh facts");
 
-		assert_eq!(refreshed.legacy_table_id, TableId(9));
+		assert_eq!(refreshed.local_table_id, TableId(9));
 		assert_eq!(
 			refreshed.optimizer_facts.byte_upper_bound,
 			Some(ByteCount::new(1_024))

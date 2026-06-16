@@ -2438,7 +2438,7 @@ async fn ctas_try_cast_materializes_nullable_logical_identity_and_survives_resyn
 	resynced
 		.register_descriptor_for_tenant(
 			TenantId(1),
-			binding.legacy_table_id,
+			binding.local_table_id,
 			descriptor_from_schema("typed_orders", binding.schema.as_ref()),
 		)
 		.expect("resynced descriptor resolves logical id");

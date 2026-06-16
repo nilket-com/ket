@@ -81,7 +81,7 @@ row_identity=None)`. PK + unassigned columns pass through; UPDATE does not
 request appended row identity.
 
 **D12 Execution IR (dedicated, source-bearing).** `ExecutionPlan::Update {
-legacy_table_id, table, fingerprint, schema, source: Box<ExecutionPlan>,
+local_table_id, table, fingerprint, schema, source: Box<ExecutionPlan>,
 profile_hint }`. The coordinator consumes `source`; it does not reconstruct
 assignment semantics. Not an `InsertSelect` variant.
 

@@ -781,7 +781,7 @@ fn scan_plan(table_id: TableId, object_byte: u8) -> ExecutionPlan {
 fn scan_with_schema(table_id: TableId, schema: SchemaRef, object_byte: u8) -> ExecutionPlan {
 	let descriptor = descriptor(object_byte, "fragment_test", schema.as_ref());
 	ExecutionPlan::Scan {
-		legacy_table_id: table_id,
+		local_table_id: table_id,
 		table: TableObjectId::new([object_byte; 16]),
 		fingerprint: descriptor.physical_descriptor_fingerprint,
 		schema,
@@ -899,8 +899,8 @@ fn assert_terminal_sort_task(
 		} if order_by.len() == 2
 			&& matches!(
 				input.as_ref(),
-				ExecutionPlan::Scan { legacy_table_id, .. }
-					if *legacy_table_id == toron::distributed::task::shuffle_input_table_id(exchange_id)
+				ExecutionPlan::Scan { local_table_id, .. }
+					if *local_table_id == toron::distributed::task::shuffle_input_table_id(exchange_id)
 			)
 	));
 }

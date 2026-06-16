@@ -1542,7 +1542,7 @@ fn shuffle_input_scan(
 	exchange_id: ExchangeId,
 ) -> ExecutionPlan {
 	ExecutionPlan::Scan {
-		legacy_table_id: shuffle_input_table_id(exchange_id),
+		local_table_id: shuffle_input_table_id(exchange_id),
 		table: metadata.table,
 		fingerprint: metadata.fingerprint,
 		schema,
@@ -2051,13 +2051,13 @@ mod tests {
 			ExecutionPlan::Join { left, right, .. } => {
 				assert!(matches!(
 					&**left,
-					ExecutionPlan::Scan { legacy_table_id, .. }
-						if *legacy_table_id == crate::distributed::task::shuffle_input_table_id(ExchangeId::new(0))
+					ExecutionPlan::Scan { local_table_id, .. }
+						if *local_table_id == crate::distributed::task::shuffle_input_table_id(ExchangeId::new(0))
 				));
 				assert!(matches!(
 					&**right,
-					ExecutionPlan::Scan { legacy_table_id, .. }
-						if *legacy_table_id == crate::distributed::task::shuffle_input_table_id(ExchangeId::new(1))
+					ExecutionPlan::Scan { local_table_id, .. }
+						if *local_table_id == crate::distributed::task::shuffle_input_table_id(ExchangeId::new(1))
 				));
 			}
 			other => panic!("expected join consumer plan, got {other:?}"),
@@ -2389,7 +2389,7 @@ mod tests {
 		let descriptor = descriptor();
 		let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
 		ExecutionPlan::Scan {
-			legacy_table_id: table_id,
+			local_table_id: table_id,
 			table: TableObjectId::new([object_byte; 16]),
 			fingerprint: descriptor.physical_descriptor_fingerprint,
 			schema,
@@ -2436,7 +2436,7 @@ mod tests {
 		let descriptor = descriptor();
 		let schema = Arc::new(Schema::new(vec![Field::new("key", data_type, false)]));
 		ExecutionPlan::Scan {
-			legacy_table_id: table_id,
+			local_table_id: table_id,
 			table: TableObjectId::new([object_byte; 16]),
 			fingerprint: descriptor.physical_descriptor_fingerprint,
 			schema,

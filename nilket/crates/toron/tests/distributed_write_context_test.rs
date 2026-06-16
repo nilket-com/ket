@@ -247,7 +247,7 @@ async fn seed_people(catalog: &MockCatalog, storage: &InMemoryTableStorage, tabl
 			session_id: SessionId(1),
 			query_id: QueryId::from_u128(1),
 			tenant_id: TenantId(1),
-			table_id: binding.legacy_table_id,
+			table_id: binding.local_table_id,
 			table_object_id: binding.table,
 			physical_descriptor_fingerprint: binding.fingerprint,
 			payload: people_batch(),

@@ -1253,7 +1253,7 @@ pub(crate) fn adr091_catalog_create_rebinds_logical_descriptors_with_resolver() 
 	for body in [mock_create, wendelon_create] {
 		assert!(body.contains("TableBinding::from_descriptor_with_logical_types"));
 		assert!(body.contains("LogicalTypeResolver::with_registry"));
-		assert!(!body.contains("TableBinding::from_descriptor(legacy_table_id, &descriptor)"));
+		assert!(!body.contains("TableBinding::from_descriptor(local_table_id, &descriptor)"));
 	}
 }
 

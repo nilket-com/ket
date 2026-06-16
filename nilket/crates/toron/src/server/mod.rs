@@ -3432,7 +3432,7 @@ mod tests {
 		)
 		.expect("descriptor");
 		ExecutionPlan::Scan {
-			legacy_table_id: table_id,
+			local_table_id: table_id,
 			table: descriptor.table_object_id,
 			fingerprint: descriptor.physical_descriptor_fingerprint,
 			schema,
@@ -3712,7 +3712,7 @@ fn drive_streamable_plan<'a>(
 	Box::pin(async move {
 		match plan {
 			ExecutionPlan::Scan {
-				legacy_table_id,
+				local_table_id,
 				table,
 				fingerprint,
 				projection,
@@ -3730,7 +3730,7 @@ fn drive_streamable_plan<'a>(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
+					table_id: *local_table_id,
 					table_object_id: *table,
 					physical_descriptor_fingerprint: *fingerprint,
 					read_bound: context.read_bound,
@@ -4032,10 +4032,10 @@ fn legacy_single_shuffle_override(
 fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<SchemaRef> {
 	match plan {
 		ExecutionPlan::Scan {
-			legacy_table_id,
+			local_table_id,
 			schema,
 			..
-		} if *legacy_table_id == table_id => Some(schema.clone()),
+		} if *local_table_id == table_id => Some(schema.clone()),
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }

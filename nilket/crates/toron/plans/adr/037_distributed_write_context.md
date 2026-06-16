@@ -587,7 +587,7 @@ RowIdentityProjection` field.
 
 ```rust
 ExecutionPlan::Scan {
-    legacy_table_id: TableId,
+    local_table_id: TableId,
     table: TableObjectId,
     fingerprint: PhysicalDescriptorFingerprint,
     schema: SchemaRef,

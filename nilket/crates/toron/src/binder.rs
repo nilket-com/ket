@@ -1906,7 +1906,7 @@ impl<'a> Binder<'a> {
 		};
 
 		Ok(ExecutionPlan::Delete {
-			legacy_table_id: binding.legacy_table_id,
+			local_table_id: binding.local_table_id,
 			table: binding.table,
 			fingerprint: binding.fingerprint,
 			schema: binding.schema,
@@ -2002,7 +2002,7 @@ impl<'a> Binder<'a> {
 		}
 
 		Ok(ExecutionPlan::Insert {
-			legacy_table_id: binding.legacy_table_id,
+			local_table_id: binding.local_table_id,
 			table: binding.table,
 			fingerprint: binding.fingerprint,
 			schema,
@@ -2059,7 +2059,7 @@ impl<'a> Binder<'a> {
 		}
 
 		Ok(ExecutionPlan::InsertSelect {
-			legacy_table_id: binding.legacy_table_id,
+			local_table_id: binding.local_table_id,
 			table: binding.table,
 			fingerprint: binding.fingerprint,
 			schema,
@@ -2148,7 +2148,7 @@ impl<'a> Binder<'a> {
 		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
 
 		Ok(ExecutionPlan::Update {
-			legacy_table_id: binding.legacy_table_id,
+			local_table_id: binding.local_table_id,
 			table: binding.table,
 			fingerprint: binding.fingerprint,
 			schema,
@@ -3240,7 +3240,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		.map(|(ordinals, fact)| (ordinals.clone(), *fact))
 		.collect::<Vec<_>>();
 	ExecutionPlan::Scan {
-		legacy_table_id: binding.legacy_table_id,
+		local_table_id: binding.local_table_id,
 		table: binding.table,
 		fingerprint: binding.fingerprint,
 		schema: binding.schema,
@@ -3374,7 +3374,7 @@ fn optimize_for_required(
 			Ok((ExecutionPlan::SystemTable { kind, schema, rows }, remap))
 		}
 		ExecutionPlan::Scan {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -3450,7 +3450,7 @@ fn optimize_for_required(
 
 			Ok((
 				ExecutionPlan::Scan {
-					legacy_table_id,
+					local_table_id,
 					table,
 					fingerprint,
 					schema,
@@ -3798,7 +3798,7 @@ fn optimize_for_required(
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::Delete {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -3808,7 +3808,7 @@ fn optimize_for_required(
 			returning,
 		} => Ok((
 			ExecutionPlan::Delete {
-				legacy_table_id,
+				local_table_id,
 				table,
 				fingerprint,
 				schema,
@@ -3820,7 +3820,7 @@ fn optimize_for_required(
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::Update {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -3831,7 +3831,7 @@ fn optimize_for_required(
 			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
 				ExecutionPlan::Update {
-					legacy_table_id,
+					local_table_id,
 					table,
 					fingerprint,
 					schema,
@@ -3843,7 +3843,7 @@ fn optimize_for_required(
 			))
 		}
 		ExecutionPlan::Insert {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -3851,7 +3851,7 @@ fn optimize_for_required(
 			returning,
 		} => Ok((
 			ExecutionPlan::Insert {
-				legacy_table_id,
+				local_table_id,
 				table,
 				fingerprint,
 				schema,
@@ -3861,7 +3861,7 @@ fn optimize_for_required(
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::InsertSelect {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -3872,7 +3872,7 @@ fn optimize_for_required(
 			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
 				ExecutionPlan::InsertSelect {
-					legacy_table_id,
+					local_table_id,
 					table,
 					fingerprint,
 					schema,

@@ -259,7 +259,7 @@ fn take_one_observation(
 fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 	match plan {
 		ExecutionPlan::Scan {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -276,7 +276,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			column_group_ndv,
 			..
 		} => ExecutionPlan::Scan {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,

@@ -240,7 +240,7 @@ before `StorageWrite::write`.
 
 ```rust
 ExecutionPlan::Insert {
-    legacy_table_id: TableId,
+    local_table_id: TableId,
     table: TableObjectId,
     fingerprint: PhysicalDescriptorFingerprint,
     schema: SchemaRef,
@@ -587,7 +587,7 @@ write-path failures).
 | ADR 029 `architecture_guards_unchanged_plus_sort_variant` | **Adjusted.** `LogicalPlan` variant count 10 → 11 with `Insert {` assertion; `ExecutionPlan` variant count 8 → 9 with `Insert {` assertion. |
 | **NEW** `adr030_insert_destructure_is_exhaustive` | Source-reads `lower_insert` body for representative rejected fields (`into`, `has_table_keyword`, `source`, `returning`, `on`, `replace_into`, `overwrite`, `partitioned`, `assignments`, `format_clause`) + absence of `..` rest pattern. |
 | **NEW** `adr030_logical_plan_insert_uses_insert_literal` | Source-reads `LogicalPlan::Insert` for `rows: Vec<Vec<InsertLiteral>>` field; asserts absence of `Vec<Vec<Expr>>` parallel shape. |
-| **NEW** `adr030_execution_plan_insert_has_no_record_batch` | Source-reads `ExecutionPlan::Insert` variant body for the full field shape (`legacy_table_id`, `table`, `fingerprint`, `schema`, `rows: Vec<Vec<ScalarValue>>`); asserts absence of `RecordBatch` and `payload`. |
+| **NEW** `adr030_execution_plan_insert_has_no_record_batch` | Source-reads `ExecutionPlan::Insert` variant body for the full field shape (`local_table_id`, `table`, `fingerprint`, `schema`, `rows: Vec<Vec<ScalarValue>>`); asserts absence of `RecordBatch` and `payload`. |
 | **NEW** `adr030_catalog_has_no_insert_method` | Source-reads `Catalog` trait body for absence of `insert` / `write_` method names. |
 | **NEW** `adr030_no_storage_synthetic_column_construction_in_toron` | Source-reads `coordinator/write.rs` for absence of any of the five `STORAGE_ROW_*` constants (the planner-side ADR 029 D12 reject in `sql_planner.rs` is the only legitimate reference). |
 | **NEW** `adr030_no_blake3_in_toron_insert_path` | Source-reads `crates/toron/Cargo.toml` for absence of `blake3` dependency declaration; source-reads `coordinator/write.rs` for absence of `blake3` references. |
@@ -871,7 +871,7 @@ ADR 031+ candidates:
 - [ ] `LogicalPlan::Insert { table, columns:
       Option<Vec<String>>, rows: Vec<Vec<InsertLiteral>> }`
       leaf variant.
-- [ ] `ExecutionPlan::Insert { legacy_table_id, table,
+- [ ] `ExecutionPlan::Insert { local_table_id, table,
       fingerprint, schema, rows: Vec<Vec<ScalarValue>> }`
       leaf variant; `schema()` returns
       `Arc::new(Schema::empty())`.

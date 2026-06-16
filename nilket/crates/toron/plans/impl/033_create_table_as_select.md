@@ -532,7 +532,7 @@ cargo test -p toron coordinator::write::tests
                query_id: context.query_id,
                tenant_id: context.tenant_id,
                // R1 (iter-0): table identity from create_table binding, not from bound plan.
-               table_id: binding.legacy_table_id,
+               table_id: binding.local_table_id,
                table_object_id: binding.table,
                physical_descriptor_fingerprint: binding.fingerprint,
                payload,
@@ -768,7 +768,7 @@ cycle narrow-detector pattern).
 | 9 | `adr033_schema_inference_uses_adr029_type_lattice` | Six-type admissibility helper present |
 | 10 | `adr033_local_coordinator_intercepts_before_retry` | CTAS intercept precedes SELECT retry loop |
 | 11 | `adr033_coordinator_creates_table_before_source_execution` | Byte-position comparison: `catalog.create_table` < `executor.execute_bound` in CTAS arm |
-| 12 | `adr033_coordinator_uses_create_table_binding_for_write` | `WriteRequest` table identity from `binding.legacy_table_id` / `binding.table` / `binding.fingerprint` |
+| 12 | `adr033_coordinator_uses_create_table_binding_for_write` | `WriteRequest` table identity from `binding.local_table_id` / `binding.table` / `binding.fingerprint` |
 | 13 | `adr033_empty_source_ctas_writes_zero_row_batch` | CTAS arm matches `None` → calls `materialize_empty_record_batch` → writes |
 | 14 | `adr033_distributed_coordinator_rejects_before_fragment` | Byte-position comparison in distributed coordinator |
 | 15 | `adr033_fragmenter_rejects_before_join_or_exchange` | Byte-position comparison: `CreateTableAsSelectNotFragmentable` < `contains_join` / `count_exchanges` |

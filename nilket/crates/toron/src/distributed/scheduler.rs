@@ -1283,7 +1283,7 @@ mod tests {
 			join_runtime_observation_mode:
 				crate::distributed::task::JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Scan {
-				legacy_table_id: crate::ir::TableId(1),
+				local_table_id: crate::ir::TableId(1),
 				table: TableObjectId::new([1; 16]),
 				fingerprint: physical_fingerprint(),
 				schema: Arc::new(Schema::empty()),
@@ -1638,7 +1638,7 @@ mod tests {
 	) -> TaskPlan {
 		let mut consumer = task(stage_id, TaskId::new(0));
 		consumer.spec.plan = ExecutionPlan::Scan {
-			legacy_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
+			local_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
 			table: TableObjectId::new([9; 16]),
 			fingerprint: physical_fingerprint(),
 			schema: Arc::new(Schema::empty()),
@@ -1667,7 +1667,7 @@ mod tests {
 	fn shuffle_input_scan(exchange_id: ExchangeId, object_byte: u8) -> ExecutionPlan {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 		ExecutionPlan::Scan {
-			legacy_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
+			local_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
 			table: TableObjectId::new([object_byte; 16]),
 			fingerprint: physical_fingerprint(),
 			schema,

@@ -710,7 +710,7 @@ impl Executor {
 					Ok(vec![materialize_scalar_rows(schema, rows)?])
 				}
 				ExecutionPlan::Scan {
-					legacy_table_id,
+					local_table_id,
 					table,
 					fingerprint,
 					projection,
@@ -724,7 +724,7 @@ impl Executor {
 						session_id: self.context.session_id,
 						query_id: self.context.query_id,
 						tenant_id: self.context.tenant_id,
-						table_id: *legacy_table_id,
+						table_id: *local_table_id,
 						table_object_id: *table,
 						physical_descriptor_fingerprint: *fingerprint,
 						read_bound: self.context.read_bound,
@@ -7817,7 +7817,7 @@ mod tests {
 		.with_runtime_filter(Some(runtime_filter.clone()));
 		let executor = Executor::with_context(storage, context);
 		let bound = ExecutionPlan::Scan {
-			legacy_table_id: TableId(1),
+			local_table_id: TableId(1),
 			table: descriptor.table_object_id,
 			fingerprint: descriptor.physical_descriptor_fingerprint,
 			schema: batch.schema(),
@@ -8811,7 +8811,7 @@ mod tests {
 		)
 		.expect("descriptor");
 		ExecutionPlan::Scan {
-			legacy_table_id: table_id,
+			local_table_id: table_id,
 			table: TableObjectId::new([object_byte; 16]),
 			fingerprint: descriptor.physical_descriptor_fingerprint,
 			schema,

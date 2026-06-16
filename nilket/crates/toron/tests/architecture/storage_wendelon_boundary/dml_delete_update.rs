@@ -291,7 +291,7 @@ pub(crate) fn adr030_execution_plan_insert_has_no_record_batch() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert!(execution_plan.contains("Insert {\n\t\tlegacy_table_id: TableId,"));
+	assert!(execution_plan.contains("Insert {\n\t\tlocal_table_id: TableId,"));
 	assert!(execution_plan.contains("table: TableObjectId,"));
 	assert!(execution_plan.contains("fingerprint: PhysicalDescriptorFingerprint,"));
 	assert!(execution_plan.contains("schema: SchemaRef,"));
@@ -500,7 +500,7 @@ pub(crate) fn adr032_insert_select_carries_target_columns() {
 		.expect("ExecutionPlan enum");
 
 	assert!(execution_plan.contains("InsertSelect {"));
-	assert!(execution_plan.contains("legacy_table_id: TableId,"));
+	assert!(execution_plan.contains("local_table_id: TableId,"));
 	assert!(execution_plan.contains("table: TableObjectId,"));
 	assert!(execution_plan.contains("fingerprint: PhysicalDescriptorFingerprint,"));
 	assert!(execution_plan.contains("schema: SchemaRef,"));
@@ -994,7 +994,7 @@ pub(crate) fn adr036_execution_delete_carries_shape_a_identity() {
 		.1;
 
 	for field in [
-		"legacy_table_id: TableId",
+		"local_table_id: TableId",
 		"table: TableObjectId",
 		"fingerprint: PhysicalDescriptorFingerprint",
 		"schema: SchemaRef",
@@ -1499,7 +1499,7 @@ pub(crate) fn adr063_execution_update_shape_is_source_bearing() {
 		.1;
 
 	for required in [
-		"legacy_table_id: TableId",
+		"local_table_id: TableId",
 		"table: TableObjectId",
 		"fingerprint: PhysicalDescriptorFingerprint",
 		"schema: SchemaRef",
@@ -1576,7 +1576,7 @@ pub(crate) fn adr063_coordinator_update_uses_storage_write_not_delete() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
 	let update_start = coordinator
-		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.find("ExecutionPlan::Update {\n\t\t\tlocal")
 		.expect("coordinator update arm start");
 	let update_end = update_start
 		+ coordinator[update_start..]
@@ -1633,7 +1633,7 @@ pub(crate) fn adr063_no_transaction_lock_compare_swap_surface_after_adr070() {
 		.expect("bind_update")
 		.1;
 	let update_start = coordinator
-		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.find("ExecutionPlan::Update {\n\t\t\tlocal")
 		.expect("coordinator update arm start");
 	let update_end = update_start
 		+ coordinator[update_start..]

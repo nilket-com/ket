@@ -1635,7 +1635,7 @@ pub(crate) fn adr070_update_remains_coordinator_owned_source_bearing_write() {
 		.expect("execution update")
 		.1;
 	let update_start = coordinator
-		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.find("ExecutionPlan::Update {\n\t\t\tlocal")
 		.expect("coordinator update arm start");
 	let update_end = update_start
 		+ coordinator[update_start..]
@@ -1702,7 +1702,7 @@ pub(crate) fn adr070_no_transaction_lock_cas_retry_or_safety_knob() {
 		.expect("bind_update")
 		.1;
 	let update_start = coordinator
-		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.find("ExecutionPlan::Update {\n\t\t\tlocal")
 		.expect("coordinator update arm start");
 	let update_end = update_start
 		+ coordinator[update_start..]

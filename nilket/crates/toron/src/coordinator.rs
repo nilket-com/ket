@@ -1816,7 +1816,7 @@ async fn drop_existing_table_with_storage_admin(
 			session_id: context.session_id,
 			query_id: context.query_id,
 			tenant_id: context.tenant_id,
-			table_id: binding.legacy_table_id,
+			table_id: binding.local_table_id,
 			table_object_id: binding.table,
 			schema_generation: binding.schema_generation,
 			physical_descriptor_fingerprint: binding.fingerprint,
@@ -1935,7 +1935,7 @@ async fn execute_write_plan_with_source(
 	let logical_types = catalog.logical_type_registry();
 	match bound {
 		ExecutionPlan::Insert {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -1955,7 +1955,7 @@ async fn execute_write_plan_with_source(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
+					table_id: *local_table_id,
 					table_object_id: *table,
 					physical_descriptor_fingerprint: *fingerprint,
 					payload,
@@ -1971,7 +1971,7 @@ async fn execute_write_plan_with_source(
 			}
 		}
 		ExecutionPlan::InsertSelect {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -2001,7 +2001,7 @@ async fn execute_write_plan_with_source(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
+					table_id: *local_table_id,
 					table_object_id: *table,
 					physical_descriptor_fingerprint: *fingerprint,
 					payload,
@@ -2017,7 +2017,7 @@ async fn execute_write_plan_with_source(
 			}
 		}
 		ExecutionPlan::Update {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -2046,7 +2046,7 @@ async fn execute_write_plan_with_source(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
+					table_id: *local_table_id,
 					table_object_id: *table,
 					physical_descriptor_fingerprint: *fingerprint,
 					payload,
@@ -2117,7 +2117,7 @@ async fn execute_write_plan_with_source(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: binding.legacy_table_id,
+					table_id: binding.local_table_id,
 					table_object_id: binding.table,
 					physical_descriptor_fingerprint: binding.fingerprint,
 					payload,
@@ -2128,7 +2128,7 @@ async fn execute_write_plan_with_source(
 			Ok(Vec::new())
 		}
 		ExecutionPlan::Delete {
-			legacy_table_id,
+			local_table_id,
 			table,
 			fingerprint,
 			schema,
@@ -2159,7 +2159,7 @@ async fn execute_write_plan_with_source(
 					session_id: context.session_id,
 					query_id: context.query_id,
 					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
+					table_id: *local_table_id,
 					table_object_id: *table,
 					physical_descriptor_fingerprint: *fingerprint,
 					row_key_ids,
@@ -2251,7 +2251,7 @@ fn verify_delete_returning_receipt(
 
 fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, QueryError> {
 	let ExecutionPlan::Delete {
-		legacy_table_id,
+		local_table_id,
 		table,
 		fingerprint,
 		schema,
@@ -2267,7 +2267,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 	};
 
 	let scan = ExecutionPlan::Scan {
-		legacy_table_id: *legacy_table_id,
+		local_table_id: *local_table_id,
 		table: *table,
 		fingerprint: *fingerprint,
 		schema: schema.clone(),
@@ -3930,7 +3930,7 @@ mod tests {
 			state
 				.current
 				.as_ref()
-				.filter(|binding| binding.legacy_table_id == table)
+				.filter(|binding| binding.local_table_id == table)
 				.cloned()
 				.ok_or_else(|| CatalogError::TableNotFound {
 					table: format!("{table:?}"),
@@ -3954,7 +3954,7 @@ mod tests {
 			let Some(binding) = state
 				.current
 				.take()
-				.filter(|binding| binding.legacy_table_id == table)
+				.filter(|binding| binding.local_table_id == table)
 			else {
 				self.metrics.record_missing();
 				return Ok(None);
