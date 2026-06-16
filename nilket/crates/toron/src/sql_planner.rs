@@ -6,7 +6,7 @@ use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CreateTableColumn, CreateTableColumnType,
 	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
-	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, WindowFrame,
+	SetOpAllKind, SortExpr, TemporalExtractField, TemporalTruncField, ValueFunction, WindowFrame,
 	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, WindowFunctionCall,
 	data_type_to_logical_type_physical,
 };
@@ -3944,11 +3944,21 @@ impl SqlPlanner {
 					));
 				}
 			}
+		} else if let Some((value_fn, value_args)) = self.extract_value_function(function)? {
+			(WindowFunction::Value(value_fn), value_args)
 		} else {
 			return Err(unsupported(
-				"only ROW_NUMBER, RANK, DENSE_RANK, and COUNT/SUM/MIN/MAX/AVG window functions are supported",
+				"only ROW_NUMBER, RANK, DENSE_RANK, COUNT/SUM/MIN/MAX/AVG, and LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE window functions are supported",
 			));
 		};
+		// LAG/LEAD are positional navigation — meaningless without an order.
+		if matches!(
+			window_function,
+			WindowFunction::Value(ValueFunction::Lag { .. } | ValueFunction::Lead { .. })
+		) && spec.order_by.is_empty()
+		{
+			return Err(unsupported("LAG/LEAD require an ORDER BY"));
+		}
 		let partition_by = spec
 			.partition_by
 			.iter()
@@ -3973,7 +3983,10 @@ impl SqlPlanner {
 		// column; GROUPS count offsets need an ORDER BY (to define peer groups), but any key/count.
 		let frame = match &spec.window_frame {
 			Some(frame) => {
-				if !matches!(window_function, WindowFunction::Aggregate(_)) {
+				if matches!(
+					window_function,
+					WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank
+				) {
 					return Err(unsupported(
 						"window frames are not supported on ranking functions",
 					));
@@ -4003,6 +4016,111 @@ impl SqlPlanner {
 			args: window_args,
 			frame,
 		}))
+	}
+
+	/// ADR 246: recognise a value/navigation window function (`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/
+	/// `NTH_VALUE`) and lower it to `(ValueFunction, [value_expr])`. `None` if the call is not one of these.
+	/// `IGNORE/RESPECT NULLS`, `FILTER`, and non-constant `LAG`/`LEAD` defaults stay rejected.
+	fn extract_value_function(
+		&self,
+		function: &Function,
+	) -> Result<Option<(ValueFunction, Vec<Expr>)>, FrontendError> {
+		let name = if function_name_eq(&function.name, "LAG") {
+			"LAG"
+		} else if function_name_eq(&function.name, "LEAD") {
+			"LEAD"
+		} else if function_name_eq(&function.name, "FIRST_VALUE") {
+			"FIRST_VALUE"
+		} else if function_name_eq(&function.name, "LAST_VALUE") {
+			"LAST_VALUE"
+		} else if function_name_eq(&function.name, "NTH_VALUE") {
+			"NTH_VALUE"
+		} else {
+			return Ok(None);
+		};
+		if function.null_treatment.is_some() {
+			return Err(unsupported(
+				"IGNORE/RESPECT NULLS is not supported for window functions",
+			));
+		}
+		if function.filter.is_some() {
+			return Err(unsupported("FILTER is not supported for window functions"));
+		}
+		let FunctionArguments::List(list) = &function.args else {
+			return Err(unsupported(
+				"value window functions require an argument list",
+			));
+		};
+		let args = &list.args;
+		let value_expr = self.lower_expr(value_function_arg_expr(args.first())?)?;
+		let value_fn = match name {
+			"LAG" | "LEAD" => {
+				let offset = match args.get(1) {
+					Some(arg) => window_frame_offset(value_function_arg_expr(Some(arg))?)?,
+					None => 1,
+				};
+				let default = match args.get(2) {
+					Some(arg) => {
+						Some(self.lower_value_default(value_function_arg_expr(Some(arg))?)?)
+					}
+					None => None,
+				};
+				if args.len() > 3 {
+					return Err(unsupported("LAG/LEAD take at most three arguments"));
+				}
+				if name == "LAG" {
+					ValueFunction::Lag { offset, default }
+				} else {
+					ValueFunction::Lead { offset, default }
+				}
+			}
+			"FIRST_VALUE" => {
+				if args.len() != 1 {
+					return Err(unsupported("FIRST_VALUE takes one argument"));
+				}
+				ValueFunction::FirstValue
+			}
+			"LAST_VALUE" => {
+				if args.len() != 1 {
+					return Err(unsupported("LAST_VALUE takes one argument"));
+				}
+				ValueFunction::LastValue
+			}
+			_ => {
+				let position = value_function_arg_expr(args.get(1))?;
+				let n = window_frame_offset(position)?;
+				if n == 0 {
+					return Err(unsupported("NTH_VALUE position must be at least 1"));
+				}
+				if args.len() != 2 {
+					return Err(unsupported("NTH_VALUE takes two arguments"));
+				}
+				ValueFunction::NthValue { n }
+			}
+		};
+		Ok(Some((value_fn, vec![value_expr])))
+	}
+
+	/// ADR 246: lower a `LAG`/`LEAD` default to a constant `ScalarValue`. A bare `-1` parses as a unary
+	/// minus over a numeric literal, so strip and negate it; other non-literal defaults are rejected.
+	fn lower_value_default(&self, expr: &SqlExpr) -> Result<ScalarValue, FrontendError> {
+		let (negate, inner) = match expr {
+			SqlExpr::UnaryOp {
+				op: sqlparser::ast::UnaryOperator::Minus,
+				expr,
+			} => (true, expr.as_ref()),
+			other => (false, other),
+		};
+		match self.lower_expr(inner)? {
+			Expr::Literal(value) => {
+				if negate {
+					negate_scalar_literal(value)
+				} else {
+					Ok(value)
+				}
+			}
+			_ => Err(unsupported("LAG/LEAD default must be a constant literal")),
+		}
 	}
 
 	/// ADR 243/244: lower a sqlparser `<unit> BETWEEN …` frame to the IR `WindowFrame`. `GROUPS` stays
@@ -7111,6 +7229,32 @@ fn frame_has_offset_bound(frame: &WindowFrame) -> bool {
 	)
 }
 
+/// Extract the expression from an unnamed value-window-function argument.
+/// Negate a numeric `ScalarValue` literal (for a `LAG`/`LEAD` `-n` default).
+fn negate_scalar_literal(value: ScalarValue) -> Result<ScalarValue, FrontendError> {
+	match value {
+		ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(-v))),
+		ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(-v))),
+		ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(-v))),
+		ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(-v))),
+		_ => Err(unsupported(
+			"LAG/LEAD numeric default expected after unary minus",
+		)),
+	}
+}
+
+fn value_function_arg_expr(arg: Option<&FunctionArg>) -> Result<&SqlExpr, FrontendError> {
+	match arg {
+		Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => Ok(expr),
+		Some(_) => Err(unsupported(
+			"value window function arguments must be expressions",
+		)),
+		None => Err(unsupported(
+			"value window function is missing a required argument",
+		)),
+	}
+}
+
 fn window_function_default_name(function: &WindowFunction) -> &'static str {
 	match function {
 		WindowFunction::RowNumber => "row_number",
@@ -7119,6 +7263,13 @@ fn window_function_default_name(function: &WindowFunction) -> &'static str {
 		WindowFunction::Aggregate(function) => aggregate_kernel::stable_spec_for_function(function)
 			.map(|spec| spec.output_name)
 			.unwrap_or("window"),
+		WindowFunction::Value(value) => match value {
+			ValueFunction::Lag { .. } => "lag",
+			ValueFunction::Lead { .. } => "lead",
+			ValueFunction::FirstValue => "first_value",
+			ValueFunction::LastValue => "last_value",
+			ValueFunction::NthValue { .. } => "nth_value",
+		},
 	}
 }
 

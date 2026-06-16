@@ -838,6 +838,33 @@ async fn range_frame_distributed_gate_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_functions_distributed_gate_is_value_discriminating() {
+	// ADR 246 distributed gate (236/238). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL]. The NULL
+	// partition holds ids 2 and 4 (scan-shared across workers). LAG(id, 1, 0) over the ordered NULL
+	// partition gives id 2 -> 0 (default, no prior) and id 4 -> 2 (the prior row) — only once the exchange
+	// co-locates and orders both rows; a single producer sees one and reaches only 0.
+	let run = run_window_process_query(
+		1_440,
+		0,
+		"SELECT set_left.set_key, \
+		        LAG(set_left.id, 1, 0) OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS l \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 0), (None, 2), (Some(7), 0), (Some(9), 0)],
+		"the NULL partition (ids 2,4) LAG is 0 then 2; singletons have no prior row -> 0"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the NULL partition's LAG value 2 for id 4 requires the partition exchange to co-locate id 2 \
+		 (scan-shared on the other worker) and order it before id 4; a single producer reaches only 0",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

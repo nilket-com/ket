@@ -42,8 +42,8 @@ pub(crate) fn adr241_adds_window_logical_and_physical_node() {
 
 #[test]
 pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
-	// Reconciled for ADR 242: ranking variants stay, aggregate windows are now a variant, and the
-	// offset/value window families remain deferred.
+	// Reconciled for ADR 246: ranking variants stay; aggregate (242) and value (246) functions are
+	// `WindowFunction` variants; NTILE stays deferred.
 	let ir = source("src/ir.rs");
 	let window_function = source_block(&ir, "pub enum WindowFunction");
 	for variant in ["RowNumber", "Rank", "DenseRank"] {
@@ -52,12 +52,11 @@ pub(crate) fn adr241_window_function_enum_retains_ranking_variants() {
 			"WindowFunction must retain ranking variant {variant}"
 		);
 	}
-	for deferred in ["Lag", "Lead", "Ntile", "FirstValue", "LastValue"] {
-		assert!(
-			!window_function.contains(deferred),
-			"offset/value window functions are deferred: {deferred}"
-		);
-	}
+	let value = source_block(&ir, "pub enum ValueFunction");
+	assert!(
+		!value.contains("Ntile") && !window_function.contains("Ntile"),
+		"NTILE stays deferred (bucketing, not a value lookup)"
+	);
 }
 
 #[test]
@@ -576,7 +575,14 @@ pub(crate) fn adr245_groups_frame_executor_is_peer_group_count_not_row_or_value(
 	assert!(exec.contains("fn execute_window_aggregate_groups"));
 	let groups = source_block(&exec, "fn execute_window_aggregate_groups");
 	assert!(
-		groups.contains("group_id") && groups.contains("group_start_row"),
+		groups.contains("groups_frame_slices"),
+		"the GROUPS executor delegates per-row framing to the shared peer-group slice helper"
+	);
+	// Reconciled for ADR 246: the peer-group-count framing lives in the shared `groups_frame_slices`
+	// helper (reused by the aggregate and value executors), still keyed on peer-group ordinal.
+	let slices = source_block(&exec, "fn groups_frame_slices");
+	assert!(
+		slices.contains("group_id") && slices.contains("group_start_row"),
 		"GROUPS slices by peer-group ordinal, not physical row or value distance"
 	);
 	let tests = source("tests/window_test.rs");
@@ -645,5 +651,123 @@ pub(crate) fn adr245_no_new_physical_optimizer_durable_wendelon_or_rune_surface(
 	assert!(
 		wendelon_offenders.is_empty(),
 		"group frames must not cross into Wendelon: {wendelon_offenders:?}"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 246 — value window functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr246_window_function_has_value_function_arm() {
+	let ir = source("src/ir.rs");
+	let window_function = source_block(&ir, "pub enum WindowFunction");
+	assert!(window_function.contains("Value(ValueFunction)"));
+	let value = source_block(&ir, "pub enum ValueFunction");
+	for variant in ["Lag", "Lead", "FirstValue", "LastValue", "NthValue"] {
+		assert!(
+			value.contains(variant),
+			"ValueFunction must include {variant}"
+		);
+	}
+	assert!(
+		!value.contains("Ntile"),
+		"NTILE is deferred, not a value function"
+	);
+}
+
+#[test]
+pub(crate) fn adr246_lag_lead_are_positional_and_ignore_the_frame() {
+	let exec = source("src/exec.rs");
+	let value_fn = source_block(&exec, "fn execute_window_value");
+	assert!(
+		value_fn.contains("partition_start") && value_fn.contains("partition_end"),
+		"LAG/LEAD take a positional offset clamped to the partition"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("lag_ignores_frame"));
+}
+
+#[test]
+pub(crate) fn adr246_first_last_nth_value_reuse_the_frame_slice() {
+	let exec = source("src/exec.rs");
+	let value_fn = source_block(&exec, "fn execute_window_value");
+	assert!(
+		value_fn.contains("value_frame_slices"),
+		"FIRST/LAST/NTH take a row from the per-row frame slice"
+	);
+	let slices = source_block(&exec, "fn value_frame_slices");
+	assert!(
+		slices.contains("range_frame_slices") && slices.contains("groups_frame_slices"),
+		"the value frame slice reuses the same helpers as the aggregate executors"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("first_last_value_respect_frame"));
+}
+
+#[test]
+pub(crate) fn adr246_value_function_output_is_expr_typed_and_row_preserving() {
+	let binder = binder_source();
+	assert!(
+		binder.contains("with_nullable(true)"),
+		"value output column takes the expr's type but is nullable"
+	);
+	assert!(binder.contains("PlanOptimizerFacts::composite_with_row"));
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("value_functions_share_one_window_node"));
+}
+
+#[test]
+pub(crate) fn adr246_ntile_null_treatment_and_ranking_value_forms_stay_rejected() {
+	let planner = source("src/sql_planner.rs");
+	let extract = source_block(&planner, "fn extract_value_function");
+	assert!(
+		extract.contains("IGNORE/RESPECT NULLS"),
+		"IGNORE/RESPECT NULLS stays rejected for value functions"
+	);
+	assert!(planner.contains("LAG/LEAD require an ORDER BY"));
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("deferred_window_forms_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr246_value_functions_reuse_partition_exchange_fragmentation() {
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(
+		!fragment.contains("fn fragment_window_plan"),
+		"no dedicated window fragmenter"
+	);
+	let dispatch = source_block(&fragment, "fn fragment_join_plan");
+	assert!(
+		!dispatch.contains("Window"),
+		"no Window arm in the join fragmenter dispatch"
+	);
+}
+
+#[test]
+pub(crate) fn adr246_value_functions_distributed_gate_is_value_discriminating() {
+	let distributed = source("tests/distributed_process_test.rs");
+	assert!(distributed.contains("value_functions_distributed_gate_is_value_discriminating"));
+	let gate = source_block(
+		&distributed,
+		"async fn value_functions_distributed_gate_is_value_discriminating",
+	);
+	assert!(
+		gate.contains("assert_cross_producer_cardinal_is_value_discriminating"),
+		"the distributed value-function gate must use the 236/238 cross-producer cardinal discipline"
+	);
+}
+
+#[test]
+pub(crate) fn adr246_no_new_physical_optimizer_durable_wendelon_or_rune_surface() {
+	let wendelon_offenders: Vec<_> = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("ValueFunction") || line.contains("WindowFunction::Value")
+		})
+		.collect();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"value window functions must not cross into Wendelon: {wendelon_offenders:?}"
 	);
 }

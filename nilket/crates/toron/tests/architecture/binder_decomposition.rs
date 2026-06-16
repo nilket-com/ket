@@ -147,10 +147,11 @@ pub(crate) fn adr176_semantic_modules_exist() {
 #[test]
 pub(crate) fn adr176_binder_root_is_bounded() {
 	let lines = binder_root_source().lines().count();
-	// The post-ADR176 target tracks legitimate IR growth; ADR 241 added the `Window` bind + prune arms.
+	// The post-ADR176 target tracks legitimate IR growth; ADR 241 added the `Window` bind + prune arms,
+	// ADR 246 the `WindowFunction::Value` bind arm.
 	assert!(
-		lines <= 5_200,
-		"binder root has {lines} lines; expected <= 5,200 (bounded; bump only for real new IR nodes)"
+		lines <= 5_250,
+		"binder root has {lines} lines; expected <= 5,250 (bounded; bump only for real new IR nodes)"
 	);
 }
 

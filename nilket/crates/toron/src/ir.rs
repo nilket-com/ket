@@ -866,17 +866,39 @@ pub enum AggregateFunction {
 	ApproxQuantile(f64),
 }
 
-/// Window functions over one `OVER (...)` spec. Ranking functions (ADR 241) take no arguments and
-/// depend only on the partition + order. `Aggregate` (ADR 242) carries an `AggregateFunction` evaluated
-/// over a frame: the SQL default (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW` — peer-aware cumulative, or
-/// whole-partition with no `ORDER BY`) when the call carries no explicit frame, or an explicit `ROWS`
-/// frame (ADR 243). `RANGE`/`GROUPS` explicit units and LAG/LEAD/NTILE are deferred follow-ons.
+/// Window functions over one `OVER (...)` spec. Ranking functions (ADR 241) depend only on the partition
+/// + order. `Aggregate` (ADR 242) folds a frame (default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`, or
+/// an explicit `ROWS`/`RANGE`/`GROUPS` frame, ADR 243–245). `Value` (ADR 246) returns an expression's
+/// value at another row of the ordered partition — positional for `LAG`/`LEAD`, frame-boundary for
+/// `FirstValue`/`LastValue`/`NthValue`. `NTILE` is a deferred follow-on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFunction {
 	RowNumber,
 	Rank,
 	DenseRank,
 	Aggregate(AggregateFunction),
+	Value(ValueFunction),
+}
+
+/// ADR 246: value/navigation window functions. The value expression rides on the window call's argument.
+/// `Lag`/`Lead` are positional (offset from the current row, frame-independent) with a constant `default`
+/// returned at the partition edge (`None` = NULL); `FirstValue`/`LastValue`/`NthValue` are frame-aware
+/// (the first/last/nth row of the active frame).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ValueFunction {
+	Lag {
+		offset: u64,
+		default: Option<ScalarValue>,
+	},
+	Lead {
+		offset: u64,
+		default: Option<ScalarValue>,
+	},
+	FirstValue,
+	LastValue,
+	NthValue {
+		n: u64,
+	},
 }
 
 /// ADR 243: an explicit `ROWS` window-frame bound. `Preceding(n)`/`Following(n)` are physical row offsets

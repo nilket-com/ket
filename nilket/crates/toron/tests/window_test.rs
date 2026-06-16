@@ -155,6 +155,12 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT SUM(score) OVER (ORDER BY grp, score RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM wins",
 		// invalid bound ordering (start after end)
 		"SELECT SUM(score) OVER (ORDER BY score ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM wins",
+		// NTILE (bucketing — deferred follow-on, not a value function)
+		"SELECT NTILE(2) OVER (ORDER BY score) FROM wins",
+		// LAG without ORDER BY (positional navigation needs an order)
+		"SELECT LAG(score) OVER (PARTITION BY grp) FROM wins",
+		// IGNORE NULLS on a value function (deferred)
+		"SELECT LAG(score) IGNORE NULLS OVER (ORDER BY id) FROM wins",
 		// DISTINCT window aggregate
 		"SELECT SUM(DISTINCT score) OVER (PARTITION BY grp) FROM wins",
 		// experimental window aggregate
@@ -827,6 +833,129 @@ async fn groups_frame_multiple_functions_can_differ_in_frame() {
 		by_rows, by_groups,
 		"ROWS and GROUPS frames differ in one node"
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 246 — value window functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lag_returns_prior_row_value() {
+	// LAG(score) over id-order: the previous row's score, NULL at the partition start, per-partition.
+	let rows = run_wins_window_opt_i64(
+		"SELECT grp, LAG(score) OVER (PARTITION BY grp ORDER BY id) AS l FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&rows, "a"), vec![None, Some(10), Some(10)]);
+	assert_eq!(obs_values(&rows, "b"), vec![None, Some(5)]);
+}
+
+#[tokio::test]
+async fn lead_returns_next_row_value() {
+	let rows = run_wins_window_opt_i64(
+		"SELECT grp, LEAD(score) OVER (PARTITION BY grp ORDER BY id) AS l FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&rows, "a"), vec![Some(10), Some(20), None]);
+	assert_eq!(obs_values(&rows, "b"), vec![Some(5), None]);
+}
+
+#[tokio::test]
+async fn lag_offset_and_default_at_partition_edge() {
+	// LAG(score, 2, -1): two rows back, or the default -1 past the partition start (not NULL, not a leak
+	// from the prior partition). grp a [10,10,20] -> [-1, -1, 10]; grp b [5,5] -> [-1, -1].
+	let rows = run_window(
+		"SELECT grp, LAG(score, 2, -1) OVER (PARTITION BY grp ORDER BY id) AS l FROM wins",
+	)
+	.await;
+	assert_eq!(group_values(&rows, "a"), vec![-1, -1, 10]);
+	assert_eq!(group_values(&rows, "b"), vec![-1, -1]);
+}
+
+#[tokio::test]
+async fn lag_ignores_frame() {
+	// LAG is positional — an explicit frame is ignored. The framed and unframed forms are identical.
+	let framed = run_wins_window_opt_i64(
+		"SELECT grp, LAG(score) OVER (PARTITION BY grp ORDER BY id \
+		 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS l FROM wins",
+	)
+	.await;
+	let unframed = run_wins_window_opt_i64(
+		"SELECT grp, LAG(score) OVER (PARTITION BY grp ORDER BY id) AS l FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&framed, "a"), obs_values(&unframed, "a"));
+	assert_eq!(obs_values(&framed, "a"), vec![None, Some(10), Some(10)]);
+}
+
+#[tokio::test]
+async fn first_last_value_respect_frame() {
+	// FIRST/LAST_VALUE are frame-defined. Ordered by score, grp a's peer group {id1,id2} (score 10) and
+	// {id3} (score 20). LAST_VALUE(id) over the DEFAULT frame = the last value of the current *peer group*
+	// (the tied rows share id 2, NOT their own id); over a whole-partition ROWS frame = the partition's
+	// last (id 3). FIRST_VALUE(id) = the partition's first (id 1).
+	let last_default = run_window(
+		"SELECT grp, LAST_VALUE(id) OVER (PARTITION BY grp ORDER BY score) AS v FROM wins",
+	)
+	.await;
+	assert_eq!(
+		group_values(&last_default, "a"),
+		vec![2, 2, 3],
+		"peer-group last, tied rows share"
+	);
+	let last_whole = run_window(
+		"SELECT grp, LAST_VALUE(id) OVER (PARTITION BY grp ORDER BY score \
+		 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS v FROM wins",
+	)
+	.await;
+	assert_eq!(
+		group_values(&last_whole, "a"),
+		vec![3, 3, 3],
+		"whole-partition frame -> partition last"
+	);
+	assert_ne!(
+		group_values(&last_default, "a"),
+		group_values(&last_whole, "a"),
+		"LAST_VALUE is frame-defined"
+	);
+	let first = run_window(
+		"SELECT grp, FIRST_VALUE(id) OVER (PARTITION BY grp ORDER BY score) AS v FROM wins",
+	)
+	.await;
+	assert_eq!(
+		group_values(&first, "a"),
+		vec![1, 1, 1],
+		"frame start = partition first"
+	);
+}
+
+#[tokio::test]
+async fn nth_value_uses_frame_ordinal_and_null_past_end() {
+	// NTH_VALUE(id, 2) over the default frame [partition start, current row]: the 2nd row of the frame, or
+	// NULL when the frame has fewer than 2 rows. grp a by id -> [NULL, 2, 2].
+	let rows = run_wins_window_opt_i64(
+		"SELECT grp, NTH_VALUE(id, 2) OVER (PARTITION BY grp ORDER BY id) AS v FROM wins",
+	)
+	.await;
+	assert_eq!(obs_values(&rows, "a"), vec![None, Some(2), Some(2)]);
+	assert_eq!(obs_values(&rows, "b"), vec![None, Some(5)]);
+}
+
+#[tokio::test]
+async fn value_functions_share_one_window_node() {
+	// A navigation function and an aggregate over one OVER spec collapse to a single Window node.
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT LAG(score) OVER (PARTITION BY grp ORDER BY id) AS l, \
+			        SUM(score) OVER (PARTITION BY grp ORDER BY id) AS s FROM wins",
+		)
+		.expect("plan LAG + SUM window");
+	assert_eq!(
+		count_window_nodes(&plan),
+		1,
+		"one Window node for one OVER spec"
+	);
+	assert_eq!(first_window_functions(&plan), Some(2));
 }
 
 // ---------------------------------------------------------------------------

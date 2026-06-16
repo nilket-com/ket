@@ -1369,6 +1369,26 @@ impl<'a> Binder<'a> {
 								fields.push(field);
 								Some(arg)
 							}
+							WindowFunction::Value(_) => {
+								// ADR 246: bind the value expression; the output column takes the expr's
+								// type but is nullable (partition edges, empty frames, and out-of-range
+								// NTH_VALUE yield NULL).
+								let arg = self
+									.bind_expr_program_scoped(
+										&call.args,
+										&input_schema,
+										&input.scope,
+									)
+									.await?;
+								let field = schema_for_exprs(&arg)
+									.field(0)
+									.as_ref()
+									.clone()
+									.with_name(call.output_name.clone())
+									.with_nullable(true);
+								fields.push(field);
+								Some(arg)
+							}
 						};
 						if let Some(frame) = &call.frame {
 							validate_range_frame_offsets(frame, &order_by, &input_schema)?;

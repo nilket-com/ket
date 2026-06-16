@@ -14,8 +14,9 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
 	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
-	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
-	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, nanos_per_timestamp_unit,
+	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, ValueFunction,
+	WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction,
+	nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -3840,6 +3841,35 @@ fn execute_window(
 				)?;
 				columns.push(column);
 			}
+			WindowFunction::Value(value) => {
+				// ADR 246: evaluate the value expression over the sorted partition layout.
+				let program =
+					call.arg
+						.as_ref()
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "value window function requires a value argument".to_string(),
+						})?;
+				let evaluated = Executor::evaluate_bound_program_without_storage(program, &batch)?;
+				let column_value = evaluated.into_iter().next().ok_or_else(|| {
+					ExecutionError::InvalidExpression {
+						message: "value window argument produced no column".to_string(),
+					}
+				})?;
+				let sorted_value = take(&column_value, &indices, None)?;
+				let output_type = output_schema.field(input_columns + call_idx).data_type();
+				let column = execute_window_value(
+					value,
+					&sorted_value,
+					call.frame.as_ref(),
+					&range_inputs,
+					&is_peer_group_end,
+					&partition_start,
+					&partition_end,
+					rows,
+					output_type,
+				)?;
+				columns.push(column);
+			}
 		}
 	}
 
@@ -3998,12 +4028,35 @@ fn execute_window_aggregate_range(
 	output_type: &arrow::datatypes::DataType,
 ) -> Result<ArrayRef, ExecutionError> {
 	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+	let slices = range_frame_slices(frame, range, partition_start, partition_end, rows)?;
+	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	for row in 0..rows {
+		let mut count: i64 = 0;
+		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		if let Some((lo, hi)) = slices[row] {
+			for slot in lo..=hi {
+				window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
+			}
+		}
+		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+	}
+	concat_window_columns(&row_arrays)
+}
 
-	// Value-offset bounds need the sorted key + arithmetic; peer/`UNBOUNDED` bounds never touch the key
-	// (so peer/whole-partition RANGE binds on any single key, even multi-key or `Utf8`). One RowConverter
-	// (direction + nulls matching the partition sort) encodes both the key and the computed bound values,
-	// so comparisons reduce to byte-ordered row comparisons and the encoded key is non-decreasing with row
-	// position inside a partition.
+/// ADR 244/246: per-row `[lo, hi]` slice (inclusive) of a `RANGE` frame, shared by the aggregate executor
+/// and the value functions so `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` frame exactly as `SUM`/… do. Value
+/// offsets search the sorted key; `UNBOUNDED`/`CURRENT ROW` use the partition/peer edge (any key). `None`
+/// = empty frame. A NULL ORDER BY value collapses value offsets to its NULL peer group.
+fn range_frame_slices(
+	frame: &WindowFrame,
+	range: &RangeWindowInputs<'_>,
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+) -> Result<Vec<Option<(usize, usize)>>, ExecutionError> {
+	// One RowConverter (direction + nulls matching the partition sort) encodes both the key and the
+	// computed bound values, so comparisons reduce to byte-ordered row comparisons and the encoded key is
+	// non-decreasing with row position inside a partition.
 	let key_encoding = if bound_is_value_offset(&frame.start) || bound_is_value_offset(&frame.end) {
 		let key = range
 			.sorted_key
@@ -4026,12 +4079,10 @@ fn execute_window_aggregate_range(
 		None
 	};
 
-	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	let mut slices: Vec<Option<(usize, usize)>> = Vec::with_capacity(rows);
 	for row in 0..rows {
 		let p_start = partition_start[row];
 		let p_end = partition_end[row];
-		// A NULL ORDER BY value has no value distance: its frame is just its NULL peer group, so value
-		// offsets collapse to the peer boundary (UNBOUNDED bounds still reach the partition edge).
 		let key_is_null = key_encoding
 			.as_ref()
 			.is_some_and(|(key, ..)| key.is_null(row));
@@ -4066,19 +4117,12 @@ fn execute_window_aggregate_range(
 				}
 			}
 		};
-
-		let mut count: i64 = 0;
-		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
-		if let (Some(lo), Some(hi)) = (lo, hi)
-			&& lo <= hi
-		{
-			for slot in lo..=hi {
-				window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
-			}
-		}
-		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+		slices.push(match (lo, hi) {
+			(Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
+			_ => None,
+		});
 	}
-	concat_window_columns(&row_arrays)
+	Ok(slices)
 }
 
 /// Whether a frame bound carries a `RANGE` value offset (vs `UNBOUNDED`/`CURRENT ROW`, which are
@@ -4273,10 +4317,40 @@ fn execute_window_aggregate_groups(
 	output_type: &arrow::datatypes::DataType,
 ) -> Result<ArrayRef, ExecutionError> {
 	let arg_type = sorted_arg.map(|array| array.data_type().clone());
+	let slices = groups_frame_slices(
+		frame,
+		is_peer_group_end,
+		partition_start,
+		partition_end,
+		rows,
+	);
+	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	for row in 0..rows {
+		let mut count: i64 = 0;
+		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
+		if let Some((lo, hi)) = slices[row] {
+			for slot in lo..=hi {
+				window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
+			}
+		}
+		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+	}
+	concat_window_columns(&row_arrays)
+}
 
-	// Peer-group structure (partition-aligned): each row's group ordinal + each group's row span. A new
-	// group starts at row 0 or right after a peer-group end (so a partition boundary, which is also a
-	// peer-group end, starts a fresh group).
+/// ADR 245/246: per-row `[lo, hi]` slice (inclusive) of a `GROUPS` frame, shared by the aggregate executor
+/// and the value functions. Builds a partition-aligned peer-group index + each group's row span, resolves
+/// each bound to a group ordinal (clamped to the partition's group range), and maps the span back to rows.
+/// `None` = the span lands entirely outside the partition's groups.
+fn groups_frame_slices(
+	frame: &WindowFrame,
+	is_peer_group_end: &[bool],
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+) -> Vec<Option<(usize, usize)>> {
+	// A new group starts at row 0 or right after a peer-group end (a partition boundary, also a peer-group
+	// end, starts a fresh group), so group ids are partition-aligned.
 	let mut group_id = vec![0_usize; rows];
 	let mut group_start_row: Vec<usize> = Vec::new();
 	let mut group_end_row: Vec<usize> = Vec::new();
@@ -4290,30 +4364,24 @@ fn execute_window_aggregate_groups(
 		group_end_row[current] = row;
 	}
 
-	let mut row_arrays: Vec<ArrayRef> = Vec::with_capacity(rows);
+	let mut slices: Vec<Option<(usize, usize)>> = Vec::with_capacity(rows);
 	for row in 0..rows {
 		let g = group_id[row] as i64;
-		// The partition's group-id range (partition boundaries are group boundaries).
 		let first_group = group_id[partition_start[row]] as i64;
 		let last_group = group_id[partition_end[row]] as i64;
 		let start_group = groups_bound_group(&frame.start, g, first_group, last_group);
 		let end_group = groups_bound_group(&frame.end, g, first_group, last_group);
-
-		let mut count: i64 = 0;
-		let mut state = fresh_window_agg_state(function, arg_type.as_ref())?;
 		// Empty when the span lands entirely outside the partition's groups; otherwise clamp.
-		if start_group <= last_group && end_group >= first_group {
+		let slice = if start_group <= last_group && end_group >= first_group {
 			let lo_group = start_group.max(first_group) as usize;
 			let hi_group = end_group.min(last_group) as usize;
-			if lo_group <= hi_group {
-				for slot in group_start_row[lo_group]..=group_end_row[hi_group] {
-					window_agg_add(function, &mut state, &mut count, sorted_arg, slot)?;
-				}
-			}
-		}
-		row_arrays.push(window_agg_finalize(function, &state, count, output_type)?);
+			(lo_group <= hi_group).then(|| (group_start_row[lo_group], group_end_row[hi_group]))
+		} else {
+			None
+		};
+		slices.push(slice);
 	}
-	concat_window_columns(&row_arrays)
+	slices
 }
 
 /// Resolve a `GROUPS` frame bound to a peer-group ordinal, relative to the current group `g` and the
@@ -4333,6 +4401,130 @@ fn groups_count(delta: &WindowFrameDelta) -> i64 {
 	match delta {
 		WindowFrameDelta::Groups(n) => i64::try_from(*n).unwrap_or(i64::MAX),
 		WindowFrameDelta::Rows(_) | WindowFrameDelta::Range(_) => i64::MAX,
+	}
+}
+
+/// ADR 246: per-row frame slice `[lo, hi]` for the frame-aware value functions, dispatching to the SAME
+/// slice logic the aggregate executors use (so `FIRST_VALUE`/… frame identically to `SUM`/…). The absent
+/// frame is the 242 default (`[partition start, current peer-group end]`).
+fn value_frame_slices(
+	frame: Option<&WindowFrame>,
+	range: &RangeWindowInputs<'_>,
+	is_peer_group_end: &[bool],
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+) -> Result<Vec<Option<(usize, usize)>>, ExecutionError> {
+	Ok(match frame {
+		None => (0..rows)
+			.map(|row| Some((partition_start[row], range.peer_end[row])))
+			.collect(),
+		Some(frame) => match frame.unit {
+			WindowFrameUnit::Rows => (0..rows)
+				.map(|row| window_frame_slice(frame, row, partition_start[row], partition_end[row]))
+				.collect(),
+			WindowFrameUnit::Range => {
+				range_frame_slices(frame, range, partition_start, partition_end, rows)?
+			}
+			WindowFrameUnit::Groups => groups_frame_slices(
+				frame,
+				is_peer_group_end,
+				partition_start,
+				partition_end,
+				rows,
+			),
+		},
+	})
+}
+
+/// ADR 246: compute one value-function column. `Lag`/`Lead` take the value at a positional offset
+/// (partition-clamped; out of partition → the constant default, else NULL); `FirstValue`/`LastValue`/
+/// `NthValue` take the value at the first/last/nth row of the per-row frame slice (NULL for an empty frame
+/// or an out-of-range `NthValue`). Assembled by a single `take` over a per-row target index.
+fn execute_window_value(
+	value_fn: &ValueFunction,
+	sorted_value: &ArrayRef,
+	frame: Option<&WindowFrame>,
+	range: &RangeWindowInputs<'_>,
+	is_peer_group_end: &[bool],
+	partition_start: &[usize],
+	partition_end: &[usize],
+	rows: usize,
+	output_type: &arrow::datatypes::DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	let mut targets: Vec<Option<usize>> = Vec::with_capacity(rows);
+	match value_fn {
+		ValueFunction::Lag { offset, .. } | ValueFunction::Lead { offset, .. } => {
+			let is_lag = matches!(value_fn, ValueFunction::Lag { .. });
+			let offset = i64::try_from(*offset).unwrap_or(i64::MAX);
+			for row in 0..rows {
+				let target = if is_lag {
+					(row as i64).checked_sub(offset)
+				} else {
+					(row as i64).checked_add(offset)
+				};
+				let in_partition = target.is_some_and(|t| {
+					t >= partition_start[row] as i64 && t <= partition_end[row] as i64
+				});
+				targets.push(in_partition.then(|| target.expect("checked above") as usize));
+			}
+		}
+		ValueFunction::FirstValue | ValueFunction::LastValue | ValueFunction::NthValue { .. } => {
+			let slices = value_frame_slices(
+				frame,
+				range,
+				is_peer_group_end,
+				partition_start,
+				partition_end,
+				rows,
+			)?;
+			for slice in &slices {
+				targets.push(slice.and_then(|(lo, hi)| match value_fn {
+					ValueFunction::FirstValue => Some(lo),
+					ValueFunction::LastValue => Some(hi),
+					ValueFunction::NthValue { n } => {
+						let idx = lo + (*n as usize) - 1;
+						(idx <= hi).then_some(idx)
+					}
+					_ => None,
+				}));
+			}
+		}
+	}
+
+	// Take the value at each target; a `None` target (edge / empty frame / out-of-range) yields NULL.
+	let index: UInt32Array = targets
+		.iter()
+		.map(|target| target.map(|i| u32::try_from(i).unwrap_or(u32::MAX)))
+		.collect();
+	let taken = take(sorted_value, &index, None)?;
+
+	// LAG/LEAD with an explicit (non-NULL) default: fill the out-of-partition positions with it.
+	let default = match value_fn {
+		ValueFunction::Lag { default, .. } | ValueFunction::Lead { default, .. } => {
+			default.as_ref()
+		}
+		_ => None,
+	};
+	match default {
+		Some(default) => {
+			let default_array = literal_array(default, rows);
+			let default_array = if default_array.data_type() == output_type {
+				default_array
+			} else {
+				evaluate_cast(&default_array, output_type)?
+			};
+			let edge_mask: BooleanArray = targets
+				.iter()
+				.map(|target| Some(target.is_none()))
+				.collect();
+			Ok(arrow::compute::kernels::zip::zip(
+				&edge_mask,
+				&default_array.as_ref(),
+				&taken.as_ref(),
+			)?)
+		}
+		None => Ok(taken),
 	}
 }
 
