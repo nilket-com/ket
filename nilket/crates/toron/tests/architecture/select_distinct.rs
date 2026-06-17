@@ -458,11 +458,13 @@ pub(crate) fn adr233_group_by_join_retains_top_level_distinct_and_derived_shape_
 			"lower_select lost {required}"
 		);
 	}
-	assert!(derived_select.contains("joins inside derived tables are not supported"));
+	// ADR 254 lifts the joins-inside-derived fence (the binder presents a join-bodied subplan as a named
+	// relation); the nested-derived-table fence remains the derived-shape boundary.
+	assert!(derived_select.contains("nested derived tables are not supported"));
 	assert!(exists_select.contains("!group_by_is_empty(&select.group_by)"));
 	assert!(tests.contains("public_group_by_without_aggregate_still_rejects"));
 	assert!(tests.contains("distinct_with_aggregate_group_by_or_having_is_explicit_unsupported"));
-	assert!(tests.contains("joins_inside_derived_tables_still_reject"));
+	assert!(tests.contains("derived_table_join_body_executes"));
 	assert!(tests.contains("group_by_inside_exists_subquery_still_rejects"));
 }
 

@@ -2153,8 +2153,8 @@ pub(crate) fn adr143_sql_join_filter_pushdown_is_planner_lowering_only() {
 	assert!(lower_select.contains("JoinFilterTarget::Left"));
 	assert!(lower_select.contains("JoinFilterTarget::Right"));
 	assert!(lower_select.contains("combine_and_sql_exprs"));
-	assert!(lower_select.contains("self.lower_where(plan, &selection)?"));
-	assert!(lower_select.contains("self.lower_where(plan, selection)?"));
+	assert!(lower_select.contains("self.lower_where(plan, &selection, cte)?"));
+	assert!(lower_select.contains("self.lower_where(plan, selection, cte)?"));
 	assert!(!lower_select.contains("joins around derived tables are not supported"));
 	assert!(lower_where.contains("plan = LogicalPlan::Filter"));
 	assert!(push.contains("pending.drain(..)"));
@@ -2245,9 +2245,9 @@ pub(crate) fn adr145_derived_tables_allowed_in_inner_join_chains() {
 	);
 	assert!(
 		lower_select
-			.contains("let mut plan = self.lower_table_factor(&table_with_joins.relation)?")
+			.contains("let mut plan = self.lower_table_factor(&table_with_joins.relation, cte)?")
 	);
-	assert!(lower_select.contains("let mut right = self.lower_table_factor(&join.relation)?"));
+	assert!(lower_select.contains("let mut right = self.lower_table_factor(&join.relation, cte)?"));
 	assert!(!lower_select.contains("joins around derived tables are not supported"));
 	assert!(planner.contains("sql_derived_join_digest_matches_hand_authored_logical_plan"));
 }
@@ -2260,9 +2260,10 @@ pub(crate) fn adr145_derived_join_rejects_non_inner_chains() {
 	assert!(
 		lower_select.contains("derived tables in joins are only supported in all-inner chains")
 	);
+	// ADR 254 lifts the joins-inside-derived fence (now `sql_join_inside_derived_table_plans`); the
+	// outer-join-around-derived and nested/lateral fences remain ADR 145 reject gates.
 	for gate in [
 		"sql_outer_join_around_derived_table_stays_rejected",
-		"sql_join_inside_derived_table_stays_rejected",
 		"sql_nested_lateral_sampled_derived_join_fences_hold",
 	] {
 		assert!(planner.contains(gate), "missing ADR145 planner gate {gate}");
@@ -2288,10 +2289,8 @@ pub(crate) fn adr145_derived_join_keeps_v1_derived_fences() {
 			"missing derived table-factor fence {marker}"
 		);
 	}
-	for marker in [
-		"joins inside derived tables are not supported",
-		"nested derived tables are not supported",
-	] {
+	// ADR 254 lifts the joins-inside fence; the nested-derived fence remains.
+	for marker in ["nested derived tables are not supported"] {
 		assert!(
 			select_shape.contains(marker),
 			"missing derived select-shape fence {marker}"

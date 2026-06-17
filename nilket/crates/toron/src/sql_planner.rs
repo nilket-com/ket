@@ -3222,6 +3222,18 @@ impl SqlPlanner {
 	}
 
 	fn lower_query(&self, query: &Query) -> Result<LogicalPlan, FrontendError> {
+		self.lower_query_scoped(query, &CteScope::new())
+	}
+
+	/// ADR 254: lower a query with an `outer` CTE scope visible (empty at the top level). The query's own
+	/// `WITH` clause extends the scope: each CTE body lowers with the outer scope plus the earlier siblings
+	/// already lowered (non-recursive — a self/forward reference simply misses the map and falls through to
+	/// the catalog), then the main body lowers with the full scope.
+	fn lower_query_scoped(
+		&self,
+		query: &Query,
+		outer: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
 		let Query {
 			with,
 			body,
@@ -3235,9 +3247,6 @@ impl SqlPlanner {
 			pipe_operators,
 		} = query;
 
-		if with.is_some() {
-			return Err(unsupported("WITH is not supported"));
-		}
 		if fetch.is_some() {
 			return Err(unsupported("FETCH is not supported"));
 		}
@@ -3256,10 +3265,29 @@ impl SqlPlanner {
 		if !pipe_operators.is_empty() {
 			return Err(unsupported("pipe operators are not supported"));
 		}
+
+		let mut owned: Vec<(String, LogicalPlan)> = Vec::new();
+		if let Some(with) = with {
+			if with.recursive {
+				return Err(unsupported("WITH RECURSIVE is not supported"));
+			}
+			for cte in &with.cte_tables {
+				let name = cte.alias.name.value.clone();
+				if owned.iter().any(|(existing, _)| existing == &name) {
+					return Err(unsupported(format!("duplicate WITH name '{name}'")));
+				}
+				let scope = cte_scope_view(outer, &owned);
+				let body_plan = self.lower_query_scoped(&cte.query, &scope)?;
+				let aliased = alias_plan(body_plan, Some(&cte.alias))?;
+				owned.push((name, aliased));
+			}
+		}
+
+		let scope = cte_scope_view(outer, &owned);
 		let LoweredSelect {
 			plan,
 			aggregate_output_catalog,
-		} = self.lower_query_body(body)?;
+		} = self.lower_query_body(body, &scope)?;
 
 		self.apply_order_by_limit_tail(
 			plan,
@@ -3269,17 +3297,21 @@ impl SqlPlanner {
 		)
 	}
 
-	fn lower_query_body(&self, body: &SetExpr) -> Result<LoweredSelect, FrontendError> {
+	fn lower_query_body(
+		&self,
+		body: &SetExpr,
+		cte: &CteScope,
+	) -> Result<LoweredSelect, FrontendError> {
 		match body {
-			SetExpr::Select(select) => self.lower_select(select),
+			SetExpr::Select(select) => self.lower_select(select, cte),
 			SetExpr::SetOperation {
 				left,
 				op,
 				set_quantifier,
 				right,
 			} => {
-				let left = self.lower_query_body(left)?.plan;
-				let right = self.lower_query_body(right)?.plan;
+				let left = self.lower_query_body(left, cte)?.plan;
+				let right = self.lower_query_body(right, cte)?.plan;
 				let plan = self.lower_set_operation(left, right, op, set_quantifier)?;
 				Ok(LoweredSelect {
 					plan,
@@ -3423,7 +3455,11 @@ impl SqlPlanner {
 		}
 	}
 
-	fn lower_select(&self, select: &Select) -> Result<LoweredSelect, FrontendError> {
+	fn lower_select(
+		&self,
+		select: &Select,
+		cte: &CteScope,
+	) -> Result<LoweredSelect, FrontendError> {
 		let Select {
 			select_token,
 			optimizer_hints,
@@ -3572,9 +3608,9 @@ impl SqlPlanner {
 			_ => Vec::new(),
 		};
 		let mut pushed_leftmost_filter = false;
-		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
+		let mut plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
 		for join in &table_with_joins.joins {
-			let mut right = self.lower_table_factor(&join.relation)?;
+			let mut right = self.lower_table_factor(&join.relation, cte)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
 			if all_inner_join_chain {
 				let right_qualifiers = plan_qualifiers(&right);
@@ -3614,9 +3650,9 @@ impl SqlPlanner {
 		// then cross-joined onto the running plan with `on: []`, leaving the binder to force the
 		// broadcast-only strategy for `Cross`.
 		for table_with_joins in from.iter().skip(1) {
-			let mut right = self.lower_table_factor(&table_with_joins.relation)?;
+			let mut right = self.lower_table_factor(&table_with_joins.relation, cte)?;
 			for join in &table_with_joins.joins {
-				let inner = self.lower_table_factor(&join.relation)?;
+				let inner = self.lower_table_factor(&join.relation, cte)?;
 				let (kind, on) = self.lower_join_operator(&join.join_operator)?;
 				let strategy_intent =
 					join_strategy_intent_for_hint(&mut broadcast_hint, &right, &inner)?;
@@ -3637,10 +3673,10 @@ impl SqlPlanner {
 		if let Some(selection) = selection {
 			if all_inner_join_chain {
 				if let Some(selection) = combine_and_sql_exprs(&pending_where_conjuncts) {
-					plan = self.lower_where(plan, &selection)?;
+					plan = self.lower_where(plan, &selection, cte)?;
 				}
 			} else {
-				plan = self.lower_where(plan, selection)?;
+				plan = self.lower_where(plan, selection, cte)?;
 			}
 		}
 		// 3. Handle SELECT list (Project or Aggregate)
@@ -4956,13 +4992,14 @@ impl SqlPlanner {
 		&self,
 		subquery: &Query,
 		alias: &TableAlias,
+		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		let select = validate_derived_query_shape(subquery)?;
 		validate_derived_select_shape(select)?;
 		let LoweredSelect {
 			plan,
 			aggregate_output_catalog,
-		} = self.lower_select(select)?;
+		} = self.lower_select(select, cte)?;
 		let plan = self.apply_order_by_limit_tail(
 			plan,
 			aggregate_output_catalog.as_ref(),
@@ -4972,7 +5009,11 @@ impl SqlPlanner {
 		alias_plan(plan, Some(alias))
 	}
 
-	fn lower_table_factor(&self, factor: &TableFactor) -> Result<LogicalPlan, FrontendError> {
+	fn lower_table_factor(
+		&self,
+		factor: &TableFactor,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
 		match factor {
 			TableFactor::Table {
 				name,
@@ -5010,6 +5051,17 @@ impl SqlPlanner {
 				if sample.is_some() {
 					return Err(unsupported("unsupported table factor: sample"));
 				}
+				// ADR 254: a bare single-ident name resolves to a CTE before the catalog (a CTE shadows a
+				// like-named table). The stored plan is already aliased to the CTE name; a reference with
+				// its own alias (`FROM a AS t`) re-aliases the clone.
+				if let [part] = name.0.as_slice() {
+					if let Some(ident) = part.as_ident() {
+						if let Some(cte_plan) = cte.get(&ident.value) {
+							let plan = (*cte_plan).clone();
+							return alias_plan(plan, alias.as_ref());
+						}
+					}
+				}
 				let table = lower_table_ref_object_name(name, "SELECT")?;
 				let plan = LogicalPlan::ScanNamed {
 					table,
@@ -5035,7 +5087,7 @@ impl SqlPlanner {
 				if alias.at.is_some() {
 					return Err(unsupported("derived table alias AT is not supported"));
 				}
-				self.lower_derived_table(subquery, alias)
+				self.lower_derived_table(subquery, alias, cte)
 			}
 			_ => Err(unsupported("unsupported table factor")),
 		}
@@ -5074,12 +5126,13 @@ impl SqlPlanner {
 		&self,
 		mut plan: LogicalPlan,
 		selection: &SqlExpr,
+		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		let mut residuals = Vec::new();
 		for conjunct in split_top_level_and(selection) {
 			match strip_nested_sql_expr(conjunct) {
 				SqlExpr::Exists { subquery, negated } => {
-					plan = self.lower_exists_join(plan, subquery, *negated)?;
+					plan = self.lower_exists_join(plan, subquery, *negated, cte)?;
 				}
 				_ => residuals.push(self.lower_expr(conjunct)?),
 			}
@@ -5100,6 +5153,7 @@ impl SqlPlanner {
 		outer_plan: LogicalPlan,
 		subquery: &Query,
 		negated: bool,
+		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		validate_exists_query_shape(subquery)?;
 		let SetExpr::Select(select) = &*subquery.body else {
@@ -5112,7 +5166,7 @@ impl SqlPlanner {
 			.from
 			.first()
 			.expect("exists select shape has one FROM item");
-		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation)?;
+		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
 		let outer_qualifiers = plan_qualifiers(&outer_plan);
 		let inner_qualifiers = plan_qualifiers(&inner_plan);
 		let mut on = Vec::new();
@@ -7233,6 +7287,24 @@ struct WindowSpecGroup {
 /// definition that is itself a reference — `WINDOW w2 AS w1` — resolves lazily through the merge (253).
 type NamedWindowMap<'a> = HashMap<String, &'a NamedWindowExpr>;
 
+/// ADR 254: non-recursive `WITH name AS (...)` definitions in scope for a query, keyed by name, mapping
+/// to the already-lowered (and CTE-name-aliased) body plan. A `FROM name` reference resolves to a clone
+/// of this plan in `lower_table_factor` — before the catalog — so a CTE shadows a like-named table. The
+/// bodies are owned by the `lower_query_scoped` frame; the map is a borrowed view rebuilt as the `WITH`
+/// list is processed (non-recursive: a body sees only the outer scope plus earlier siblings).
+type CteScope<'a> = HashMap<String, &'a LogicalPlan>;
+
+/// ADR 254: build a borrowed CTE scope = the outer scope plus the already-lowered sibling prefix `owned`.
+/// The view borrows `owned`, so it must be consumed before the next push (NLL ends the borrow at the
+/// `lower_*` call that uses it, leaving `owned` free to grow).
+fn cte_scope_view<'a>(outer: &CteScope<'a>, owned: &'a [(String, LogicalPlan)]) -> CteScope<'a> {
+	let mut scope = outer.clone();
+	for (name, plan) in owned {
+		scope.insert(name.clone(), plan);
+	}
+	scope
+}
+
 /// ADR 253: merge a named-window `reference` (which names `base` and adds clauses) onto its resolved
 /// `base` spec, producing a plain inline `WindowSpec` (`window_name = None`). The SQL §7.15 referencing
 /// rules: PARTITION BY is inherited and may not be re-added; ORDER BY is inherited and may not be
@@ -8309,10 +8381,9 @@ fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
 			"derived table subquery must have exactly one FROM source",
 		));
 	}
+	// ADR 254: joins inside a derived table now lower (the binder presents a join-bodied subplan as a
+	// named relation — the same capability CTEs use). Nested derived tables and lateral stay deferred.
 	let source = &select.from[0];
-	if !source.joins.is_empty() {
-		return Err(unsupported("joins inside derived tables are not supported"));
-	}
 	match &source.relation {
 		TableFactor::Table { .. } => Ok(()),
 		TableFactor::Derived { .. } => Err(unsupported("nested derived tables are not supported")),
@@ -9014,13 +9085,16 @@ mod tests {
 	}
 
 	#[test]
-	fn sql_join_inside_derived_table_stays_rejected() {
-		assert_plan_rejects(
-			"SELECT * FROM orders o \
-			 INNER JOIN (SELECT c.id FROM customers c INNER JOIN orders o2 ON c.id = o2.customer_id) d \
-			 ON o.customer_id = d.id",
-			"joins inside derived tables are not supported",
-		);
+	fn sql_join_inside_derived_table_plans() {
+		// ADR 254: a join-bodied derived table lowers (the binder presents the join subplan as a named
+		// relation — the same capability CTEs use). Nested/lateral derived joins stay fenced below.
+		SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN (SELECT c.id FROM customers c INNER JOIN orders o2 ON c.id = o2.customer_id) d \
+				 ON o.customer_id = d.id",
+			)
+			.expect("join-bodied derived table should plan");
 	}
 
 	#[test]

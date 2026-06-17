@@ -1720,7 +1720,6 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 	for marker in [
 		"projection_contains_window_function",
 		"select.from.len() != 1",
-		"!source.joins.is_empty()",
 		"TableFactor::Derived",
 		"unsupported derived table source",
 	] {
@@ -2151,7 +2150,7 @@ pub(crate) fn adr106_lower_derived_table_lifts_only_aggregate_fence() {
 	for marker in [
 		"validate_derived_query_shape(subquery)",
 		"validate_derived_select_shape(select)",
-		"self.lower_select(select)?",
+		"self.lower_select(select, cte)?",
 		"alias_plan(plan, Some(alias))",
 	] {
 		assert!(
@@ -2185,7 +2184,6 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 	for marker in [
 		"projection_contains_window_function",
 		"select.from.len() != 1",
-		"!source.joins.is_empty()",
 		"TableFactor::Derived",
 		"unsupported derived table source",
 	] {

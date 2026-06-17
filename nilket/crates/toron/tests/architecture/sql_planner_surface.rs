@@ -1960,10 +1960,11 @@ pub(crate) fn adr073_query_limit_clause_preserves_ordered_limit_offset_else_reje
 		.next()
 		.expect("lower_limit_clause")
 		.1;
-	let lower_query = brace_blocks_after_marker(&planner, "fn lower_query")
+	// ADR 254: the order-by/limit tail moved into `lower_query_scoped` (the WITH-aware lowering body).
+	let lower_query = brace_blocks_after_marker(&planner, "fn lower_query_scoped")
 		.into_iter()
 		.next()
-		.expect("lower_query")
+		.expect("lower_query_scoped")
 		.1;
 	let tail = brace_blocks_after_marker(&planner, "fn apply_order_by_limit_tail")
 		.into_iter()
@@ -2195,7 +2196,7 @@ pub(crate) fn adr115_derived_lowering_does_not_delegate_to_lower_query() {
 	for required in [
 		"validate_derived_query_shape(subquery)?",
 		"validate_derived_select_shape(select)?",
-		"self.lower_select(select)?",
+		"self.lower_select(select, cte)?",
 		"self.apply_order_by_limit_tail(",
 		"alias_plan(plan, Some(alias))",
 	] {

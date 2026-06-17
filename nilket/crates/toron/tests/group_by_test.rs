@@ -2213,15 +2213,163 @@ async fn distinct_inside_exists_is_accepted_and_stripped() {
 	);
 }
 
-#[test]
-fn joins_inside_derived_tables_still_reject() {
-	assert_unsupported_message(
+#[tokio::test]
+async fn derived_table_join_body_executes() {
+	// ADR 254: the derived-table joins-inside fence is lifted — a join-bodied derived table now lowers
+	// (the same "subplan as a named relation" capability CTEs use). Inner JOIN on k matches left_dups
+	// (A,A@k=1; B@k=2) with right_dups (gold,gold@k=1; silver@k=2) -> bucket A x4, B x1.
+	let results = run_logical(&plan_sql(
 		"SELECT bucket, COUNT(*) \
 		 FROM (SELECT left_dups.label AS bucket \
 		       FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k) d \
 		 GROUP BY bucket",
-		"joins inside derived tables are not supported",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4), (Some("B".to_string()), 1)]
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 254 — common table expressions (non-recursive WITH)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cte_resolves_like_inline_subquery() {
+	// `WITH a AS (q) SELECT … FROM a` resolves identically to the inline derived-table spelling.
+	let cte = run_logical(&plan_sql(
+		"WITH a AS (SELECT label, COUNT(*) AS n FROM left_dups GROUP BY label) SELECT label, n FROM a",
+	))
+	.await;
+	let inline = run_logical(&plan_sql(
+		"SELECT label, n FROM (SELECT label, COUNT(*) AS n FROM left_dups GROUP BY label) a",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&cte, 0, 1),
+		sorted_utf8_int64_rows(&inline, 0, 1),
+		"a CTE resolves like the inline subquery"
+	);
+	assert_eq!(
+		sorted_utf8_int64_rows(&cte, 0, 1),
+		vec![
+			(Some("A".to_string()), 2),
+			(Some("B".to_string()), 1),
+			(Some("missing".to_string()), 2),
+		]
+	);
+}
+
+#[tokio::test]
+async fn cte_body_with_join_binds_and_executes() {
+	// The deliver-the-name gate: a join-bodied CTE plans + executes (the case the derived-table framing
+	// would have rejected). A ⋈ on k -> label A x4, B x1.
+	let results = run_logical(&plan_sql(
+		"WITH j AS (SELECT left_dups.label AS label \
+		            FROM left_dups JOIN right_dups ON left_dups.k = right_dups.k) \
+		 SELECT label, COUNT(*) FROM j GROUP BY label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4), (Some("B".to_string()), 1)]
+	);
+}
+
+#[tokio::test]
+async fn multiple_ctes_later_references_earlier() {
+	// Linear scope: `b` references the earlier sibling `a` by its renamed output column `grp` — b can only
+	// bind if it sees a's projected schema (and not the catalog `left_dups`, which has no `grp`).
+	let results = run_logical(&plan_sql(
+		"WITH a AS (SELECT label AS grp FROM left_dups), \
+		      b AS (SELECT grp, COUNT(*) AS n FROM a GROUP BY grp) \
+		 SELECT grp, n FROM b",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(Some("A".to_string()), 2),
+			(Some("B".to_string()), 1),
+			(Some("missing".to_string()), 2),
+		]
+	);
+}
+
+#[tokio::test]
+async fn cte_referenced_in_a_join() {
+	// A CTE referenced inside a JOIN binds as a named relation on the join side.
+	let results = run_logical(&plan_sql(
+		"WITH a AS (SELECT k, label FROM left_dups) \
+		 SELECT a.label, COUNT(*) FROM a JOIN right_dups ON a.k = right_dups.k GROUP BY a.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4), (Some("B".to_string()), 1)]
+	);
+}
+
+#[tokio::test]
+async fn cte_shadows_catalog_table() {
+	// A CTE named like a catalog table shadows it: this `left_dups` reads right_dups (tier AS label), so
+	// grouping yields right_dups's tiers (gold x2, orphan x2, silver x1), not the real left_dups labels.
+	let results = run_logical(&plan_sql(
+		"WITH left_dups AS (SELECT k, tier AS label FROM right_dups) \
+		 SELECT label, COUNT(*) FROM left_dups GROUP BY label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(Some("gold".to_string()), 2),
+			(Some("orphan".to_string()), 2),
+			(Some("silver".to_string()), 1),
+		]
+	);
+}
+
+#[tokio::test]
+async fn cte_column_alias_list_renames_output() {
+	// `WITH a(x, y) AS (SELECT label, k …)` renames the output columns; `x` (was `label`) is projectable.
+	let results = run_logical(&plan_sql(
+		"WITH a(x, y) AS (SELECT label, k FROM left_dups) SELECT x, COUNT(*) FROM a GROUP BY x",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![
+			(Some("A".to_string()), 2),
+			(Some("B".to_string()), 1),
+			(Some("missing".to_string()), 2),
+		]
+	);
+}
+
+#[tokio::test]
+async fn cte_table_arguments_still_reject() {
+	// A CTE name must not swallow table-function syntax. Arguments are rejected before CTE lookup.
+	assert_unsupported_message(
+		"WITH a AS (SELECT k FROM left_dups) SELECT * FROM a(1)",
+		"unsupported table factor: table arguments",
+	);
+}
+
+#[tokio::test]
+async fn recursive_and_self_reference_ctes_stay_rejected() {
+	// WITH RECURSIVE is the deferred mechanism boundary (plan-level reject).
+	assert_unsupported_message(
+		"WITH RECURSIVE a AS (SELECT k FROM left_dups) SELECT k FROM a",
+		"WITH RECURSIVE is not supported",
+	);
+	// A self reference is non-recursive: `a` is not in scope inside its own body, so it falls through to
+	// the catalog and fails to bind as an unknown table — it is NOT resolved as a CTE.
+	let logical = plan_sql("WITH a AS (SELECT k FROM a) SELECT k FROM a");
+	let (catalog, _) = fixture();
+	bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("a self-referential CTE must not resolve");
 }
 
 #[test]

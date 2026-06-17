@@ -3,6 +3,7 @@ pub(crate) mod cockpit;
 pub(crate) mod converted_predicate_pushdown;
 pub(crate) mod core_invariants;
 pub(crate) mod cross_join;
+pub(crate) mod cte;
 pub(crate) mod distributed_execution;
 pub(crate) mod distributed_fixture;
 pub(crate) mod heavy_hitter;
