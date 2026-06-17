@@ -2542,6 +2542,99 @@ async fn not_in_and_scalar_subquery_stay_rejected() {
 	);
 }
 
+// ---------------------------------------------------------------------------
+// ADR 257 — scalar subqueries (provably-scalar / global-aggregate form)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scalar_aggregate_subquery_in_projection_attaches_value() {
+	// `(SELECT AVG(amount) FROM sales)` is provably scalar (a global aggregate, row=1). It pulls up into
+	// a scalar Cross broadcast onto every region row. amount=[10,20,_,30,_,7] → AVG = 67/4 = 16.75.
+	let plan = plan_sql("SELECT region, (SELECT AVG(amount) FROM sales) FROM regions");
+	assert!(
+		plan_contains_cross_join(&plan),
+		"a projection scalar subquery lowers into a Cross: {plan:?}"
+	);
+	let results = run_logical(&plan).await;
+	assert_eq!(
+		row_count(&results),
+		2,
+		"one row per region, no multiplication"
+	);
+	assert_eq!(
+		sorted_utf8_column_rows(&results, 0),
+		vec![Some("east".to_string()), Some("west".to_string())]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 1),
+		vec![Some(16.75), Some(16.75)],
+		"every region row carries the global AVG"
+	);
+}
+
+#[tokio::test]
+async fn scalar_aggregate_subquery_in_where_filters() {
+	// `id > (SELECT COUNT(*) FROM regions)` filters per-row against the scalar (regions has 2 rows). The
+	// scalar column rides a Cross above the scan, so the comparison is a residual Toron filter (not a
+	// pushed scan predicate that the FixtureScan would drop). id=[1..6] > 2 → ids 3,4,5,6.
+	let plan = plan_sql("SELECT id FROM sales WHERE id > (SELECT COUNT(*) FROM regions)");
+	assert!(
+		plan_contains_cross_join(&plan),
+		"a WHERE scalar subquery lowers into a Cross: {plan:?}"
+	);
+	let results = run_logical(&plan).await;
+	assert_eq!(
+		sorted_int64_column_rows(&results, 0),
+		vec![3, 4, 5, 6],
+		"only rows above the scalar count survive"
+	);
+}
+
+#[test]
+fn scalar_aggregate_subquery_in_having_filters() {
+	// SCOPED OUT this cut: a scalar subquery in HAVING (or a grouped/aggregate projection) must recombine
+	// ABOVE the aggregate, but the aggregate's group-keyed exchange is not an exchange-free probe input for
+	// the broadcast scalar `Cross` (the broadcast placement requires the probe side carry no terminal
+	// exchange). That above-aggregate recombination is a distinct mechanism — deferred to a follow-on.
+	assert_unsupported_message(
+		"SELECT region, COUNT(*) FROM sales \
+		 GROUP BY region HAVING COUNT(*) > (SELECT COUNT(*) FROM regions)",
+		"scalar subqueries in GROUP BY/HAVING are not supported",
+	);
+}
+
+#[tokio::test]
+async fn one_side_scalar_cross_broadcasts_the_scalar() {
+	// The binder extension (Phase 1): `outer × (global aggregate)` is a Cross with a provably-scalar
+	// (row=1) RIGHT side. On main it rejected ("CROSS JOIN requires a broadcast-eligible build side"); the
+	// `ScalarBroadcastCross` branch now binds it by broadcasting the 1-row aggregate to every outer row.
+	let plan = plan_sql("SELECT region, (SELECT AVG(amount) FROM sales) FROM regions");
+	assert!(plan_contains_cross_join(&plan));
+	let (catalog, _storage) = fixture();
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("outer × scalar Cross must bind by broadcasting the scalar side");
+	assert!(
+		contains_execution_join(&bound),
+		"the bound plan recombines the scalar via a Join: {bound:?}"
+	);
+}
+
+#[tokio::test]
+async fn non_aggregate_and_correlated_scalar_subqueries_stay_rejected() {
+	// A non-aggregate scalar subquery `(SELECT x FROM t)` needs a runtime cardinality assert (deferred).
+	assert_unsupported_message(
+		"SELECT region, (SELECT region FROM regions) FROM regions",
+		"non-aggregate scalar subqueries are not supported",
+	);
+	// A correlated scalar subquery (references an outer relation) needs decorrelation (deferred).
+	assert_unsupported_message(
+		"SELECT region FROM regions \
+		 WHERE active < (SELECT AVG(amount) FROM sales WHERE sales.region = regions.region)",
+		"correlated scalar subqueries are not supported",
+	);
+}
+
 #[test]
 fn group_by_inside_exists_subquery_still_rejects() {
 	assert_unsupported(

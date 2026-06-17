@@ -42,6 +42,11 @@ pub(crate) enum JoinStrategyDecisionReason {
 	/// (`row_upper_bound <= 1`) binds as a local cartesian gathered to a single partition — never a
 	/// broadcast and never an empty-key hash *repartition* (the single bucket here holds one row).
 	ScalarLocalCross,
+	/// ADR 257 (scalar subquery): a CROSS where exactly one side is provably scalar (`row_upper_bound
+	/// <= 1`, e.g. a scalar-subquery aggregate) broadcasts that 1-row side to every partition of the
+	/// non-scalar side. A 1-row build cannot multiply partitions, so it is broadcast-eligible regardless
+	/// of being a composite (aggregate) branch — the scan-linear requirement only bounds broadcast size.
+	ScalarBroadcastCross,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,6 +566,19 @@ fn choose_cross_join_strategy(
 			strategy: JoinStrategy::HashPartitioned,
 			placement: JoinPhysicalPlacement::Natural,
 			reason: JoinStrategyDecisionReason::ScalarLocalCross,
+		});
+	}
+	// ADR 257 (scalar subquery): when exactly one side is provably scalar (`row_upper_bound <= 1`),
+	// broadcast that 1-row side to every partition of the non-scalar side. Broadcasting one row cannot
+	// multiply partitions, so a scalar side is broadcast-eligible even though it is composite (an
+	// aggregate) — the scan-linear/base-relation requirement exists to bound broadcast *size*, and one
+	// row is trivially bounded. The scalar-subquery lowering always places the scalar subplan on the
+	// right (`outer × scalar`), so this binds via the CROSS right-build (SwappedRightBuild) placement.
+	if plan_is_scalar(&right_input.facts) {
+		return Ok(JoinStrategyDecision {
+			strategy: JoinStrategy::Broadcast,
+			placement: pinned_broadcast_placement(JoinKind::Cross, BroadcastBuildSide::Right)?,
+			reason: JoinStrategyDecisionReason::ScalarBroadcastCross,
 		});
 	}
 	if force_hash {

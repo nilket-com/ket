@@ -31,6 +31,7 @@ pub(crate) mod recursive_cte;
 pub(crate) mod ring_placement;
 pub(crate) mod rune_frontend;
 pub(crate) mod rune_optimizer_readouts;
+pub(crate) mod scalar_subquery;
 pub(crate) mod select_distinct;
 pub(crate) mod set_ops;
 pub(crate) mod sql_planner_surface;

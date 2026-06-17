@@ -59,6 +59,9 @@ const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
 const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
 const MAX_IN_LIST_ITEMS: usize = 32;
 const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str = "unsupported aggregate argument";
+/// ADR 257: the single output column a pulled-up scalar subquery exposes (renamed via its `__scalar_N`
+/// alias's column list). The rewritten expression references `__scalar_N.value`.
+const SCALAR_SUBQUERY_COLUMN: &str = "value";
 const NESTED_AGGREGATE_ARGUMENT_MESSAGE: &str =
 	"aggregate arguments must not contain aggregate calls";
 const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
@@ -3745,15 +3748,76 @@ impl SqlPlanner {
 		}
 		reject_unused_broadcast_hint(&broadcast_hint)?;
 
-		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
-		if let Some(selection) = selection {
-			if all_inner_join_chain {
-				if let Some(selection) = combine_and_sql_exprs(&pending_where_conjuncts) {
-					plan = self.lower_where(plan, &selection, cte)?;
+		// ADR 257: pull uncorrelated provably-scalar (global-aggregate) subqueries up into scalar `Cross`
+		// joins. WHERE scalars cross onto `plan` BEFORE WHERE lowering (the filter runs pre-aggregation in
+		// both aggregate and non-aggregate queries). Projection scalars cross only in a NON-aggregate
+		// query.
+		let is_aggregate_query =
+			group_keys.is_some() || projection_contains_aggregate_call(projection);
+		// A scalar subquery in a GROUP BY / HAVING (aggregate) query must recombine ABOVE the aggregate,
+		// but the aggregate's group-keyed exchange is not an exchange-free probe input for the broadcast
+		// scalar `Cross` (the broadcast placement requires the probe side carry no terminal exchange).
+		// That recombination is a distinct mechanism — deferred. WHERE scalars are still pulled (they cross
+		// pre-aggregation), but a scalar in HAVING or in an aggregate/grouped projection rejects here.
+		if is_aggregate_query
+			&& (having.as_ref().is_some_and(expr_contains_subquery)
+				|| projection.iter().any(select_item_contains_subquery))
+		{
+			return Err(unsupported(
+				"scalar subqueries in GROUP BY/HAVING are not supported",
+			));
+		}
+		let effective_selection = if all_inner_join_chain {
+			combine_and_sql_exprs(&pending_where_conjuncts)
+		} else {
+			selection.clone()
+		};
+		let mut owned_projection: Vec<SelectItem>;
+		let mut projection: &[SelectItem] = projection;
+		let mut effective_selection = effective_selection;
+		let pull_projection =
+			!is_aggregate_query && projection.iter().any(select_item_contains_subquery);
+		let pull_where = effective_selection
+			.as_ref()
+			.is_some_and(expr_contains_subquery);
+		if pull_projection || pull_where {
+			let outer_qualifiers = plan_qualifiers(&plan);
+			let mut collected = Vec::new();
+			if pull_projection {
+				owned_projection = Vec::with_capacity(projection.len());
+				for projection_item in projection {
+					owned_projection.push(self.rewrite_select_item_scalar_subqueries(
+						projection_item,
+						&mut collected,
+						&outer_qualifiers,
+						cte,
+					)?);
 				}
-			} else {
-				plan = self.lower_where(plan, selection, cte)?;
+				projection = &owned_projection;
 			}
+			if pull_where {
+				effective_selection = match effective_selection {
+					Some(selection) => Some(self.pull_up_scalar_subqueries(
+						&selection,
+						&mut collected,
+						&outer_qualifiers,
+						cte,
+					)?),
+					None => None,
+				};
+			}
+			plan = self.cross_join_scalar_subplans(plan, collected)?;
+		}
+
+		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation). `effective_selection` is the WHERE
+		// predicate after the ADR 257 scalar pull-up — the recombined inner-chain residual conjuncts, or
+		// the raw selection — so both the all-inner-chain and the generic path lower it directly.
+		if all_inner_join_chain {
+			if let Some(selection) = effective_selection {
+				plan = self.lower_where(plan, &selection, cte)?;
+			}
+		} else if let Some(selection) = &effective_selection {
+			plan = self.lower_where(plan, selection, cte)?;
 		}
 		// 3. Handle SELECT list (Project or Aggregate)
 		if let Some(group_keys) = group_keys {
@@ -3772,10 +3836,6 @@ impl SqlPlanner {
 				&group_keys,
 				AggregateSqlMode::Grouped,
 			)?;
-			let having_predicate = having
-				.as_ref()
-				.map(|having| self.lower_having_predicate(having, &catalog))
-				.transpose()?;
 			if aggr_expr.is_empty() {
 				return Err(unsupported("GROUP BY requires at least one aggregate call"));
 			}
@@ -3794,7 +3854,8 @@ impl SqlPlanner {
 					aggr_expr,
 				}
 			};
-			let plan = if let Some(predicate) = having_predicate {
+			let plan = if let Some(having) = having.as_ref() {
+				let predicate = self.lower_having_predicate(having, &catalog)?;
 				LogicalPlan::Filter {
 					input: Box::new(aggregate),
 					predicate,
@@ -3865,7 +3926,7 @@ impl SqlPlanner {
 			});
 		}
 
-		if matches!(projection.as_slice(), [SelectItem::Wildcard(_)]) {
+		if matches!(projection, [SelectItem::Wildcard(_)]) {
 			return Ok(LoweredSelect {
 				plan: wrap_distinct_if_needed(plan, distinct_requested),
 				aggregate_output_catalog: None,
@@ -5414,6 +5475,207 @@ impl SqlPlanner {
 		}
 
 		Ok(ExistsConjunct::InnerResidual(self.lower_expr(conjunct)?))
+	}
+
+	/// ADR 257: recursively rewrite `expr`, pulling each uncorrelated provably-scalar (global-aggregate)
+	/// `SqlExpr::Subquery` value out into `collected` (its aliased row=1 subplan) and replacing the
+	/// subquery node with a synthetic `__scalar_N.value` column reference. The caller folds each collected
+	/// subplan onto the running plan as a scalar `Cross` (the binder broadcasts the row=1 side via
+	/// `ScalarBroadcastCross`), bringing `__scalar_N.value` into scope for the rewritten expression.
+	///
+	/// `outer_qualifiers` are the relations the subquery may NOT reference (a correlated scalar rejects).
+	/// The threading descends through the comparison/arithmetic/CASE container nodes a scalar subquery can
+	/// appear in as a value operand; a subquery in an unhandled position is cloned through and rejects
+	/// later in `lower_expr` (the deferred boundary is preserved). Non-aggregate and correlated scalar
+	/// subqueries reject here.
+	fn pull_up_scalar_subqueries(
+		&self,
+		expr: &SqlExpr,
+		collected: &mut Vec<LogicalPlan>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		match expr {
+			SqlExpr::Subquery(query) => {
+				let alias = format!("__scalar_{}", collected.len());
+				validate_scalar_subquery_is_global_aggregate(query, outer_qualifiers)?;
+				let subplan = self.lower_query_scoped(query, cte)?;
+				collected.push(LogicalPlan::Alias {
+					input: Box::new(subplan),
+					alias: TableRef::new(alias.clone()),
+					columns: vec![SCALAR_SUBQUERY_COLUMN.to_string()],
+				});
+				Ok(SqlExpr::CompoundIdentifier(vec![
+					Ident::new(alias),
+					Ident::new(SCALAR_SUBQUERY_COLUMN),
+				]))
+			}
+			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
+				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+				left: Box::new(self.pull_up_scalar_subqueries(
+					left,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				op: op.clone(),
+				right: Box::new(self.pull_up_scalar_subqueries(
+					right,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+				op: *op,
+				expr: Box::new(self.pull_up_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
+				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
+				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::Cast {
+				kind,
+				expr,
+				data_type,
+				array,
+				format,
+			} => Ok(SqlExpr::Cast {
+				kind: kind.clone(),
+				expr: Box::new(self.pull_up_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				data_type: data_type.clone(),
+				array: *array,
+				format: format.clone(),
+			}),
+			SqlExpr::Between {
+				expr,
+				negated,
+				low,
+				high,
+			} => Ok(SqlExpr::Between {
+				expr: Box::new(self.pull_up_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				negated: *negated,
+				low: Box::new(self.pull_up_scalar_subqueries(
+					low,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				high: Box::new(self.pull_up_scalar_subqueries(
+					high,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::Case {
+				case_token,
+				end_token,
+				operand,
+				conditions,
+				else_result,
+			} => Ok(SqlExpr::Case {
+				case_token: case_token.clone(),
+				end_token: end_token.clone(),
+				operand: operand
+					.as_ref()
+					.map(|operand| {
+						self.pull_up_scalar_subqueries(operand, collected, outer_qualifiers, cte)
+					})
+					.transpose()?
+					.map(Box::new),
+				conditions: conditions
+					.iter()
+					.map(|case_when| {
+						Ok(CaseWhen {
+							condition: self.pull_up_scalar_subqueries(
+								&case_when.condition,
+								collected,
+								outer_qualifiers,
+								cte,
+							)?,
+							result: self.pull_up_scalar_subqueries(
+								&case_when.result,
+								collected,
+								outer_qualifiers,
+								cte,
+							)?,
+						})
+					})
+					.collect::<Result<Vec<_>, FrontendError>>()?,
+				else_result: else_result
+					.as_ref()
+					.map(|else_result| {
+						self.pull_up_scalar_subqueries(
+							else_result,
+							collected,
+							outer_qualifiers,
+							cte,
+						)
+					})
+					.transpose()?
+					.map(Box::new),
+			}),
+			_ => Ok(expr.clone()),
+		}
+	}
+
+	/// ADR 257: rewrite a SELECT projection item, pulling scalar subqueries in its expression up into
+	/// `collected` (see `pull_up_scalar_subqueries`). The item's alias (if any) is preserved.
+	fn rewrite_select_item_scalar_subqueries(
+		&self,
+		item: &SelectItem,
+		collected: &mut Vec<LogicalPlan>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SelectItem, FrontendError> {
+		match item {
+			SelectItem::UnnamedExpr(expr) => Ok(SelectItem::UnnamedExpr(
+				self.pull_up_scalar_subqueries(expr, collected, outer_qualifiers, cte)?,
+			)),
+			SelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::ExprWithAlias {
+				expr: self.pull_up_scalar_subqueries(expr, collected, outer_qualifiers, cte)?,
+				alias: alias.clone(),
+			}),
+			other => Ok(other.clone()),
+		}
+	}
+
+	/// ADR 257: fold each collected scalar subplan onto `plan` as a keyless `Cross` join. The scalar
+	/// (row=1) subplan is placed on the RIGHT so the binder's `ScalarBroadcastCross` branch
+	/// (`plan_is_scalar(right)`) broadcasts it to every partition of the outer plan. Built directly via
+	/// `build_auto_join_plan` — the keyless `Cross` the comma-join fold already uses — NOT the SQL
+	/// JOIN-with-derived path (which trips the adr145 fence); the `Auto` intent lets the binder physicalize
+	/// the broadcast (a partition_count=1 build on the scalar side, swapped to a right-build), rather than
+	/// a frontend-pinned hash exchange that the broadcast placement check rejects.
+	fn cross_join_scalar_subplans(
+		&self,
+		mut plan: LogicalPlan,
+		collected: Vec<LogicalPlan>,
+	) -> Result<LogicalPlan, FrontendError> {
+		for subplan in collected {
+			plan = build_auto_join_plan(plan, subplan, JoinKind::Cross, vec![]);
+		}
+		Ok(plan)
 	}
 
 	fn lower_join_on(&self, expr: &SqlExpr) -> Result<Vec<(Expr, Expr)>, FrontendError> {
@@ -8809,6 +9071,178 @@ fn collect_scope_refs(
 		_ => {}
 	}
 	Ok(())
+}
+
+/// ADR 257: validate that a scalar subquery used as a value is an uncorrelated, provably-scalar
+/// (global-aggregate) subquery this cut supports. Provably scalar = a single `SELECT <one aggregate>
+/// FROM <one table> [WHERE <uncorrelated>]` with no GROUP BY (a global aggregate carries
+/// `row_upper_bound = 1`). Non-aggregate / multi-column / grouped scalar subqueries reject; a reference
+/// to any `outer_qualifiers` relation is correlated and rejects (correlated decorrelation is deferred).
+fn validate_scalar_subquery_is_global_aggregate(
+	query: &Query,
+	outer_qualifiers: &[TableRef],
+) -> Result<(), FrontendError> {
+	validate_exists_query_shape(query)
+		.map_err(|_| unsupported("non-aggregate scalar subqueries are not supported"))?;
+	let SetExpr::Select(select) = query.body.as_ref() else {
+		return Err(unsupported(
+			"non-aggregate scalar subqueries are not supported",
+		));
+	};
+	// A global aggregate is a single FROM source, no joins, no GROUP BY, exactly one projected aggregate.
+	if select.from.len() != 1
+		|| !select.from[0].joins.is_empty()
+		|| !group_by_is_empty(&select.group_by)
+		|| select.having.is_some()
+		|| select.distinct.is_some()
+	{
+		return Err(unsupported(
+			"non-aggregate scalar subqueries are not supported",
+		));
+	}
+	let projection_expr = match select.projection.as_slice() {
+		[SelectItem::UnnamedExpr(expr)] => expr,
+		[SelectItem::ExprWithAlias { expr, .. }] => expr,
+		_ => {
+			return Err(unsupported(
+				"non-aggregate scalar subqueries are not supported",
+			));
+		}
+	};
+	if !expr_contains_aggregate_call(projection_expr) {
+		return Err(unsupported(
+			"non-aggregate scalar subqueries are not supported",
+		));
+	}
+	// Uncorrelated: the subquery's projection and WHERE must not reference an outer relation.
+	let inner_qualifiers = match &select.from[0].relation {
+		TableFactor::Table { name, alias, .. } => {
+			let qualifier = alias
+				.as_ref()
+				.map(|alias| TableRef::new(alias.name.value.clone()))
+				.or_else(|| {
+					name.0.last().and_then(|part| {
+						part.as_ident()
+							.map(|ident| TableRef::new(ident.value.clone()))
+					})
+				});
+			qualifier.into_iter().collect::<Vec<_>>()
+		}
+		_ => Vec::new(),
+	};
+	if sql_expr_references_outer_qualifier(projection_expr, outer_qualifiers, &inner_qualifiers) {
+		return Err(unsupported(
+			"correlated scalar subqueries are not supported",
+		));
+	}
+	if let Some(selection) = &select.selection
+		&& sql_expr_references_outer_qualifier(selection, outer_qualifiers, &inner_qualifiers)
+	{
+		return Err(unsupported(
+			"correlated scalar subqueries are not supported",
+		));
+	}
+	Ok(())
+}
+
+/// ADR 257: does `expr` reference an outer-query relation (a correlated reference)? A qualified column
+/// whose qualifier is an outer relation and not an inner one is correlated. Unqualified columns belong to
+/// the subquery's single inner relation, so they are not correlation evidence. Reuses the same scope
+/// reasoning as the EXISTS classifier (`resolve_column_scope`), but tolerates unqualified inner columns
+/// (an aggregate over a bare column) rather than rejecting them.
+fn sql_expr_references_outer_qualifier(
+	expr: &SqlExpr,
+	outer_qualifiers: &[TableRef],
+	inner_qualifiers: &[TableRef],
+) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => {
+			let qualifier = TableRef::new(idents[0].value.clone());
+			outer_qualifiers.contains(&qualifier) && !inner_qualifiers.contains(&qualifier)
+		}
+		SqlExpr::BinaryOp { left, right, .. } => {
+			sql_expr_references_outer_qualifier(left, outer_qualifiers, inner_qualifiers)
+				|| sql_expr_references_outer_qualifier(right, outer_qualifiers, inner_qualifiers)
+		}
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Cast { expr, .. } => {
+			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+		}
+		SqlExpr::Between {
+			expr, low, high, ..
+		} => {
+			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+				|| sql_expr_references_outer_qualifier(low, outer_qualifiers, inner_qualifiers)
+				|| sql_expr_references_outer_qualifier(high, outer_qualifiers, inner_qualifiers)
+		}
+		SqlExpr::InList { expr, list, .. } => {
+			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+				|| list.iter().any(|item| {
+					sql_expr_references_outer_qualifier(item, outer_qualifiers, inner_qualifiers)
+				})
+		}
+		SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+				|| sql_expr_references_outer_qualifier(pattern, outer_qualifiers, inner_qualifiers)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			operand.as_deref().is_some_and(|operand| {
+				sql_expr_references_outer_qualifier(operand, outer_qualifiers, inner_qualifiers)
+			}) || conditions.iter().any(|case_when| {
+				sql_expr_references_outer_qualifier(
+					&case_when.condition,
+					outer_qualifiers,
+					inner_qualifiers,
+				) || sql_expr_references_outer_qualifier(
+					&case_when.result,
+					outer_qualifiers,
+					inner_qualifiers,
+				)
+			}) || else_result.as_deref().is_some_and(|else_result| {
+				sql_expr_references_outer_qualifier(else_result, outer_qualifiers, inner_qualifiers)
+			})
+		}
+		SqlExpr::Function(function) => match &function.args {
+			sqlparser::ast::FunctionArguments::List(list) => {
+				list.args.iter().any(|arg| match arg {
+					FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+					| FunctionArg::Named {
+						arg: FunctionArgExpr::Expr(expr),
+						..
+					}
+					| FunctionArg::ExprNamed {
+						arg: FunctionArgExpr::Expr(expr),
+						..
+					} => sql_expr_references_outer_qualifier(
+						expr,
+						outer_qualifiers,
+						inner_qualifiers,
+					),
+					_ => false,
+				})
+			}
+			_ => false,
+		},
+		_ => false,
+	}
+}
+
+/// ADR 257: does a SELECT projection item carry a scalar subquery used as a value?
+fn select_item_contains_subquery(item: &SelectItem) -> bool {
+	match item {
+		SelectItem::UnnamedExpr(expr) => expr_contains_subquery(expr),
+		SelectItem::ExprWithAlias { expr, alias: _ } => expr_contains_subquery(expr),
+		SelectItem::ExprWithAliases { .. }
+		| SelectItem::QualifiedWildcard(_, _)
+		| SelectItem::Wildcard(_) => false,
+	}
 }
 
 fn join_filter_conjunct_matches(

@@ -2367,6 +2367,15 @@ pub(super) fn optimizer_explain_build_columns(
 				None,
 			))
 		}
+		JoinStrategyDecisionReason::ScalarBroadcastCross => Ok((
+			Some(match receipt.placement {
+				JoinPhysicalPlacement::Natural => "left",
+				JoinPhysicalPlacement::SwappedRightBuild => "right",
+			}),
+			None,
+			None,
+			None,
+		)),
 		JoinStrategyDecisionReason::PinnedByAuthor
 		| JoinStrategyDecisionReason::HashByDefault { .. }
 		| JoinStrategyDecisionReason::ScalarLocalCross => Ok((None, None, None, None)),
@@ -2403,6 +2412,7 @@ pub(super) fn join_strategy_decision_reason_label(
 		JoinStrategyDecisionReason::BroadcastEstimated { .. } => "broadcast_estimated",
 		JoinStrategyDecisionReason::HashByDefault { .. } => "hash_by_default",
 		JoinStrategyDecisionReason::ScalarLocalCross => "scalar_local_cross",
+		JoinStrategyDecisionReason::ScalarBroadcastCross => "scalar_broadcast_cross",
 	}
 }
 
@@ -2416,7 +2426,8 @@ pub(super) fn join_strategy_decision_reason_detail(
 		JoinStrategyDecisionReason::PinnedByAuthor
 		| JoinStrategyDecisionReason::BroadcastInferred { .. }
 		| JoinStrategyDecisionReason::BroadcastEstimated { .. }
-		| JoinStrategyDecisionReason::ScalarLocalCross => None,
+		| JoinStrategyDecisionReason::ScalarLocalCross
+		| JoinStrategyDecisionReason::ScalarBroadcastCross => None,
 	}
 }
 

@@ -64,7 +64,7 @@ pub(crate) fn lower_select_does_not_return_input_from_wildcard_projection_loop()
 		.and_then(|rest| rest.split("Ok(LogicalPlan::Project").next())
 		.expect("non-aggregate projection loop");
 
-	assert!(lower_select.contains("matches!(projection.as_slice(), [SelectItem::Wildcard(_)])"));
+	assert!(lower_select.contains("matches!(projection, [SelectItem::Wildcard(_)])"));
 	assert!(
 		!projection_loop.contains("return Ok(plan)"),
 		"wildcard projection loop still returns the input plan"
