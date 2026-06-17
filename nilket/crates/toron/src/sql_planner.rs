@@ -5372,7 +5372,7 @@ impl SqlPlanner {
 		outer_qualifiers: &[TableRef],
 		cte: &CteScope,
 		context: &str,
-	) -> Result<(LogicalPlan, Expr), FrontendError> {
+	) -> Result<(LogicalPlan, Expr, Vec<(Expr, Expr)>), FrontendError> {
 		validate_exists_query_shape(subquery)?;
 		let SetExpr::Select(select) = &*subquery.body else {
 			return Err(unsupported(format!("unsupported {context} subquery body")));
@@ -5412,8 +5412,12 @@ impl SqlPlanner {
 				)));
 			}
 		};
-		// The subquery's own WHERE must be uncorrelated (correlated IN / NOT IN is deferred).
+		// ADR 259: the subquery's WHERE splits into inner residuals (filtered onto the inner plan) and
+		// correlated equi-pairs (`sub.b = outer.a`), which decorrelate onto the membership join `on` exactly
+		// as a correlated EXISTS does. Uncorrelated `IN`/`NOT IN` (256/258) is the `correlation_pairs == []`
+		// case. (`context` parameterizes the shared shape-validation messages above.)
 		let mut inner_residuals = Vec::new();
+		let mut correlation_pairs = Vec::new();
 		if let Some(selection) = &select.selection {
 			for conjunct in split_top_level_and(selection) {
 				match self.classify_exists_conjunct(
@@ -5422,10 +5426,8 @@ impl SqlPlanner {
 					&inner_qualifiers,
 				)? {
 					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
-					ExistsConjunct::CorrelatedPair { .. } => {
-						return Err(unsupported(format!(
-							"correlated {context} is not supported"
-						)));
+					ExistsConjunct::CorrelatedPair { outer, inner } => {
+						correlation_pairs.push((outer, inner));
 					}
 				}
 			}
@@ -5436,7 +5438,7 @@ impl SqlPlanner {
 				predicate,
 			};
 		}
-		Ok((inner_plan, inner_key))
+		Ok((inner_plan, inner_key, correlation_pairs))
 	}
 
 	fn lower_in_subquery_join(
@@ -5447,9 +5449,11 @@ impl SqlPlanner {
 		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		let outer_qualifiers = plan_qualifiers(&outer_plan);
-		let (inner_plan, inner_key) =
+		let (inner_plan, inner_key, mut on) =
 			self.lower_membership_subquery(subquery, &outer_qualifiers, cte, "IN")?;
-		let on = vec![(self.lower_expr(expr)?, inner_key)];
+		// ADR 259: the correlation equi-pairs lead the `on`; the membership key (`x = y`) follows. An
+		// uncorrelated IN has no pairs, so this is 256's single-key semi-join.
+		on.push((self.lower_expr(expr)?, inner_key));
 		build_join_plan(
 			outer_plan,
 			inner_plan,
@@ -5461,10 +5465,12 @@ impl SqlPlanner {
 		)
 	}
 
-	/// ADR 258: `x NOT IN (sub)` ≡ `x IS NOT NULL AND NOT EXISTS(sub WHERE key IS NULL) AND
-	/// NOT EXISTS(sub WHERE key = x)` — a null-`x` filter, a keyless null-guard `LeftAnti` (any NULL key in
-	/// the subquery empties the result), and a correlated membership `LeftAnti`. Reuses 256's anti-join
-	/// machinery; no null-aware-anti operator and no new execution op.
+	/// ADR 258/259: `x NOT IN (sub)` ≡ `x IS NOT NULL AND NOT EXISTS(sub WHERE key IS NULL) AND
+	/// NOT EXISTS(sub WHERE key = x)` — a null-`x` filter, a null-guard `LeftAnti`, and a membership
+	/// `LeftAnti`. ADR 259 threads the subquery's correlation equi-pairs (`correlation_pairs`) onto both
+	/// antis: the null-guard becomes keyed (a NULL key empties only the matching correlation group; keyless
+	/// ⇒ 258's whole-result guard), and the membership keys on the pairs plus `key = inner_key`. Reuses
+	/// 256's anti-join machinery; no null-aware-anti operator and no new execution op.
 	fn lower_not_in_subquery_join(
 		&self,
 		outer_plan: LogicalPlan,
@@ -5473,7 +5479,7 @@ impl SqlPlanner {
 		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		let outer_qualifiers = plan_qualifiers(&outer_plan);
-		let (inner_plan, inner_key) =
+		let (inner_plan, inner_key, correlation_pairs) =
 			self.lower_membership_subquery(subquery, &outer_qualifiers, cte, "NOT IN")?;
 		let key = self.lower_expr(expr)?;
 		// 1. A NULL `x` never qualifies for NOT IN.
@@ -5481,8 +5487,8 @@ impl SqlPlanner {
 			input: Box::new(outer_plan),
 			predicate: Expr::IsNotNull(Box::new(key.clone())),
 		};
-		// 2. Null guard: any NULL key in the subquery empties the result (keyless anti over the
-		//    NULL-key rows — non-empty ⇒ every outer row dropped; empty ⇒ a no-op).
+		// 2. Null guard: a NULL subquery key empties the result — keyed on the correlation pairs (so it
+		//    empties only the matching correlation group), or keyless (whole result) when uncorrelated.
 		let null_guard = LogicalPlan::Filter {
 			input: Box::new(inner_plan.clone()),
 			predicate: Expr::IsNull(Box::new(inner_key.clone())),
@@ -5491,17 +5497,19 @@ impl SqlPlanner {
 			plan,
 			null_guard,
 			JoinKind::LeftAnti,
-			Vec::new(),
+			correlation_pairs.clone(),
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
 			None,
 		)?;
-		// 3. Membership: drop rows whose key equals a subquery key.
+		// 3. Membership: drop rows whose key equals a subquery key (within the correlation group).
+		let mut membership_on = correlation_pairs;
+		membership_on.push((key, inner_key));
 		build_join_plan(
 			plan,
 			inner_plan,
 			JoinKind::LeftAnti,
-			vec![(key, inner_key)],
+			membership_on,
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
 			None,

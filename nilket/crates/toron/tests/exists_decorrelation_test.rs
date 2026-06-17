@@ -196,6 +196,144 @@ fn exists_with_zero_correlation_pairs_lowers_to_keyless_semi() {
 	);
 }
 
+// ===== ADR 259: correlated IN / NOT IN (membership-subquery decorrelation) =====
+
+#[tokio::test]
+async fn correlated_in_decorrelates_to_semi_join() {
+	// fact.k = [1,2,3,NULL,4,5], dim.k = [1,1,3,4,NULL]. The correlated subquery for each fact row is
+	// {dim.k : dim.k = fact.k}, so fact.pk qualifies iff fact.pk = fact.k AND that value is in dim.k.
+	let batch =
+		run_sql("SELECT * FROM fact WHERE fact.pk IN (SELECT dim.k FROM dim WHERE dim.k = fact.k)")
+			.await;
+	assert_pk_values(&batch, &[1, 3]);
+
+	// The correlation changes the answer: uncorrelated, pk=4 (value 4 is in dim.k) is kept; correlated it
+	// is dropped because its `k` is NULL → empty correlated subquery.
+	let uncorrelated = run_sql("SELECT * FROM fact WHERE fact.pk IN (SELECT dim.k FROM dim)").await;
+	assert_pk_values(&uncorrelated, &[1, 3, 4]);
+}
+
+#[test]
+fn correlated_in_membership_and_correlation_pairs_both_on_join() {
+	let plan = plan_sql(
+		"SELECT * FROM fact WHERE fact.pk IN (SELECT dim.k FROM dim WHERE dim.k = fact.k)",
+	);
+	let LogicalPlan::Join { kind, on, .. } = plan else {
+		panic!("expected join plan");
+	};
+	assert_eq!(kind, JoinKind::LeftSemi);
+	assert_eq!(
+		on.len(),
+		2,
+		"correlation pair (fact.k, dim.k) + membership pair (fact.pk, dim.k)"
+	);
+}
+
+#[tokio::test]
+async fn correlated_in_with_inner_residual_decorrelates() {
+	// The residual `dim.active = false` (a Toron Filter on the inner) removes pk=3's only correlated dim
+	// row (k=3 is active), so only pk=1 survives (k=1 has an inactive dim row, pk 11).
+	let batch = run_sql(
+		"SELECT * FROM fact WHERE fact.pk IN \
+		 (SELECT dim.k FROM dim WHERE dim.k = fact.k AND dim.active = false)",
+	)
+	.await;
+	assert_pk_values(&batch, &[1]);
+}
+
+#[tokio::test]
+async fn correlated_not_in_decorrelates_to_anti_joins() {
+	// The complement of `correlated_in_decorrelates_to_semi_join` among non-null-`x` rows (every fact.pk is
+	// non-null). pk=4 is kept because its correlated subquery is empty (k is NULL). The null-guard is
+	// vacuous here: an equi-correlated subquery can never project a NULL key.
+	let batch = run_sql(
+		"SELECT * FROM fact WHERE fact.pk NOT IN (SELECT dim.k FROM dim WHERE dim.k = fact.k)",
+	)
+	.await;
+	assert_pk_values(&batch, &[2, 4, 5, 6]);
+
+	// Plan-shape: null-`x` filter → keyed null-guard anti → membership anti (correlation + membership pairs).
+	let plan = plan_sql(
+		"SELECT * FROM fact WHERE fact.pk NOT IN (SELECT dim.k FROM dim WHERE dim.k = fact.k)",
+	);
+	let LogicalPlan::Join { kind, on, .. } = plan else {
+		panic!("expected membership anti join");
+	};
+	assert_eq!(kind, JoinKind::LeftAnti);
+	assert_eq!(
+		on.len(),
+		2,
+		"membership anti keys on the correlation pair + (fact.pk, dim.k)"
+	);
+}
+
+#[test]
+fn uncorrelated_in_and_not_in_unchanged() {
+	// The `correlation_pairs == []` path is byte-identical to 256/258.
+	let LogicalPlan::Join { kind, on, .. } =
+		plan_sql("SELECT * FROM fact WHERE fact.pk IN (SELECT dim.k FROM dim)")
+	else {
+		panic!("expected semi join");
+	};
+	assert_eq!(kind, JoinKind::LeftSemi);
+	assert_eq!(
+		on.len(),
+		1,
+		"uncorrelated IN stays a single-key semi-join (256)"
+	);
+
+	let LogicalPlan::Join { kind, on, left, .. } =
+		plan_sql("SELECT * FROM fact WHERE fact.pk NOT IN (SELECT dim.k FROM dim)")
+	else {
+		panic!("expected membership anti join");
+	};
+	assert_eq!(kind, JoinKind::LeftAnti);
+	assert_eq!(
+		on.len(),
+		1,
+		"uncorrelated NOT IN membership stays single-key (258)"
+	);
+	let LogicalPlan::Exchange { input, .. } = *left else {
+		panic!("expected exchange above the null-guard");
+	};
+	let LogicalPlan::Join { on: guard_on, .. } = *input else {
+		panic!("expected the keyless null-guard anti");
+	};
+	assert!(
+		guard_on.is_empty(),
+		"uncorrelated null-guard stays keyless (258)"
+	);
+}
+
+#[test]
+fn non_equi_correlated_in_and_correlated_scalar_stay_rejected() {
+	// Non-equi correlation isn't decorrelated (the classifier only spends equi-pairs).
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact WHERE fact.pk IN \
+			 (SELECT dim.k FROM dim WHERE dim.score > fact.pk)",
+		)
+		.expect_err("non-equi correlated IN should be unsupported");
+	assert!(
+		err.to_string()
+			.contains("unsupported EXISTS subquery predicate"),
+		"{err}"
+	);
+
+	// Correlated scalar subqueries are a separate (grouped-aggregate) mechanism.
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact WHERE fact.pk > \
+			 (SELECT MIN(dim.score) FROM dim WHERE dim.k = fact.k)",
+		)
+		.expect_err("correlated scalar subquery should be unsupported");
+	assert!(
+		err.to_string()
+			.contains("correlated scalar subqueries are not supported"),
+		"{err}"
+	);
+}
+
 #[test]
 fn exists_with_outer_only_subquery_predicate_is_unsupported() {
 	assert_unsupported(

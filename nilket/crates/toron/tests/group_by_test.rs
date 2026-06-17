@@ -2526,13 +2526,8 @@ async fn not_exists_lowers_to_anti_join() {
 }
 
 #[tokio::test]
-async fn correlated_in_and_scalar_subquery_stay_rejected() {
-	// Correlated IN and (non-aggregate) scalar subqueries are the deferred boundaries (256/257).
-	assert_unsupported_message(
-		"SELECT * FROM left_dups \
-		 WHERE left_dups.k IN (SELECT k FROM right_dups WHERE right_dups.tier = left_dups.label)",
-		"correlated IN is not supported",
-	);
+async fn scalar_subquery_comparison_stays_rejected() {
+	// Correlated IN now decorrelates (259); a non-aggregate scalar subquery in a comparison stays deferred.
 	assert_unsupported(
 		"SELECT left_dups.k FROM left_dups WHERE left_dups.k = (SELECT k FROM right_dups)",
 	);
@@ -2592,14 +2587,9 @@ async fn not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter() {
 }
 
 #[tokio::test]
-async fn cross_type_and_correlated_not_in_stay_rejected() {
-	// Correlated NOT IN rejects at lowering.
-	assert_unsupported_message(
-		"SELECT * FROM left_dups \
-		 WHERE left_dups.k NOT IN (SELECT k FROM right_dups WHERE right_dups.tier = left_dups.label)",
-		"correlated NOT IN is not supported",
-	);
-	// Cross-type membership key (Int64 k vs Int32 amount) rejects at bind (the deferred coercion gap).
+async fn cross_type_not_in_stays_rejected() {
+	// Cross-type membership key (Int64 k vs Int32 amount) rejects at bind — the deferred coercion gap.
+	// (Correlated NOT IN now decorrelates per 259.)
 	let logical = plan_sql(
 		"SELECT left_dups.k FROM left_dups WHERE left_dups.k NOT IN (SELECT amount FROM sales)",
 	);
