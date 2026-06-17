@@ -35,6 +35,7 @@ pub(crate) mod select_distinct;
 pub(crate) mod set_ops;
 pub(crate) mod sql_planner_surface;
 pub(crate) mod storage_wendelon_boundary;
+pub(crate) mod subquery_predicates;
 pub(crate) mod support;
 pub(crate) mod temporal;
 pub(crate) mod window_functions;

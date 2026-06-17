@@ -196,6 +196,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/catalog_logical_identity_test.rs",
 				"crates/toron/tests/cross_join_test.rs",
 				"crates/toron/tests/distributed_process_test.rs",
+				"crates/toron/tests/exists_decorrelation_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/group_by_test.rs",
 				"crates/toron/tests/hash_join_fast_path_parity_test.rs",

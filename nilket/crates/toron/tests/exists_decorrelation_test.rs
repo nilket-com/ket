@@ -187,8 +187,13 @@ async fn exists_select_list_is_semantically_ignored_for_select_one_star_and_inne
 }
 
 #[test]
-fn exists_with_zero_correlation_pairs_is_unsupported() {
-	assert_unsupported("SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim)");
+fn exists_with_zero_correlation_pairs_lowers_to_keyless_semi() {
+	// ADR 256: an uncorrelated EXISTS (zero correlation pairs) now lowers to a keyless LeftSemi join.
+	let plan = plan_sql("SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim)");
+	assert!(
+		format!("{plan:?}").contains("LeftSemi"),
+		"uncorrelated EXISTS lowers to a keyless LeftSemi: {plan:?}"
+	);
 }
 
 #[test]
@@ -225,7 +230,8 @@ fn exists_unsupported_shapes_stay_unsupported() {
 		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE dim.k > fact.k)",
 		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE dim.k + 1 = fact.k)",
 		"SELECT * FROM fact WHERE EXISTS (SELECT COUNT(*) FROM dim WHERE dim.k = fact.k)",
-		"SELECT * FROM fact WHERE EXISTS (SELECT DISTINCT dim.k FROM dim WHERE dim.k = fact.k)",
+		// NB: `EXISTS (SELECT DISTINCT ...)` is INERT per ADR 234 (DISTINCT ignored, still decorrelates),
+		// so it is intentionally NOT unsupported and is omitted here.
 		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE dim.k = fact.k LIMIT 1)",
 		"SELECT * FROM fact WHERE EXISTS \
 		 (SELECT 1 FROM dim WHERE dim.k = fact.k \

@@ -250,12 +250,16 @@ fn sql_outer_semi_anti_joins_lower_to_join_kind() {
 }
 
 #[test]
-fn sql_uncorrelated_exists_predicate_remains_unsupported() {
-	let err = SqlPlanner::new()
+fn sql_uncorrelated_exists_lowers_to_keyless_left_semi() {
+	// ADR 256: an uncorrelated EXISTS lowers to a keyless LeftSemi join (every outer row passes iff the
+	// subquery is non-empty) — the deferral reject is lifted.
+	let plan = SqlPlanner::new()
 		.plan("SELECT * FROM left_t WHERE EXISTS (SELECT * FROM right_t)")
-		.expect_err("uncorrelated EXISTS stays unsupported");
-
-	assert!(err.to_string().contains("unsupported"));
+		.expect("uncorrelated EXISTS now plans");
+	assert!(
+		format!("{plan:?}").contains("LeftSemi"),
+		"uncorrelated EXISTS lowers to a LeftSemi join: {plan:?}"
+	);
 }
 
 fn planned_join_kind(sql: &str) -> JoinKind {

@@ -2451,6 +2451,97 @@ async fn recursive_cte_union_distinct_and_malformed_shapes_reject() {
 	);
 }
 
+// ---------------------------------------------------------------------------
+// ADR 256 — uncorrelated subquery predicates (IN / EXISTS / NOT EXISTS)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_subquery_lowers_to_semi_join() {
+	// `k IN (SELECT k FROM right_dups)` → keyed LeftSemi membership. left_dups k=[1,1,2,3,3] vs right
+	// k∈{1,2,4} → k∈{1,2} → A:2, B:1.
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) FROM left_dups \
+		 WHERE left_dups.k IN (SELECT k FROM right_dups) GROUP BY left_dups.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 2), (Some("B".to_string()), 1)]
+	);
+}
+
+#[tokio::test]
+async fn uncorrelated_exists_passes_all_rows_iff_subquery_nonempty() {
+	// Keyless LeftSemi: non-empty subquery ⇒ all rows; empty ⇒ none.
+	let nonempty = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) FROM left_dups \
+		 WHERE EXISTS (SELECT 1 FROM right_dups) GROUP BY left_dups.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&nonempty, 0, 1),
+		vec![
+			(Some("A".to_string()), 2),
+			(Some("B".to_string()), 1),
+			(Some("missing".to_string()), 2),
+		]
+	);
+	let empty = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) FROM left_dups \
+		 WHERE EXISTS (SELECT 1 FROM empty_sales) GROUP BY left_dups.label",
+	))
+	.await;
+	assert!(
+		empty.iter().all(|batch| batch.num_rows() == 0),
+		"an empty subquery passes no rows"
+	);
+}
+
+#[tokio::test]
+async fn not_exists_lowers_to_anti_join() {
+	// Uncorrelated NOT EXISTS → keyless LeftAnti: over an empty subquery all rows pass; over a non-empty
+	// subquery none do.
+	let over_empty = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) FROM left_dups \
+		 WHERE NOT EXISTS (SELECT 1 FROM empty_sales) GROUP BY left_dups.label",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&over_empty, 0, 1),
+		vec![
+			(Some("A".to_string()), 2),
+			(Some("B".to_string()), 1),
+			(Some("missing".to_string()), 2),
+		]
+	);
+	let over_nonempty = run_logical(&plan_sql(
+		"SELECT left_dups.label, COUNT(*) FROM left_dups \
+		 WHERE NOT EXISTS (SELECT 1 FROM right_dups) GROUP BY left_dups.label",
+	))
+	.await;
+	assert!(
+		over_nonempty.iter().all(|batch| batch.num_rows() == 0),
+		"NOT EXISTS over a non-empty subquery passes no rows"
+	);
+}
+
+#[tokio::test]
+async fn not_in_and_scalar_subquery_stay_rejected() {
+	// NOT IN (null-aware anti), correlated IN, and scalar subqueries are the deferred boundaries.
+	assert_unsupported_message(
+		"SELECT * FROM left_dups WHERE left_dups.k NOT IN (SELECT k FROM right_dups)",
+		"NOT IN (subquery) is not supported; use NOT EXISTS",
+	);
+	assert_unsupported_message(
+		"SELECT * FROM left_dups \
+		 WHERE left_dups.k IN (SELECT k FROM right_dups WHERE right_dups.tier = left_dups.label)",
+		"correlated IN is not supported",
+	);
+	assert_unsupported(
+		"SELECT left_dups.k FROM left_dups WHERE left_dups.k = (SELECT k FROM right_dups)",
+	);
+}
+
 #[test]
 fn group_by_inside_exists_subquery_still_rejects() {
 	assert_unsupported(

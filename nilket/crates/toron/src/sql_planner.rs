@@ -5210,6 +5210,19 @@ impl SqlPlanner {
 				SqlExpr::Exists { subquery, negated } => {
 					plan = self.lower_exists_join(plan, subquery, *negated, cte)?;
 				}
+				// ADR 256: `x IN (subquery)` lowers to a semi-join; `NOT IN` is deferred (NULL semantics).
+				SqlExpr::InSubquery {
+					expr,
+					subquery,
+					negated,
+				} => {
+					if *negated {
+						return Err(unsupported(
+							"NOT IN (subquery) is not supported; use NOT EXISTS",
+						));
+					}
+					plan = self.lower_in_subquery_join(plan, expr, subquery, cte)?;
+				}
 				_ => residuals.push(self.lower_expr(conjunct)?),
 			}
 		}
@@ -5261,10 +5274,8 @@ impl SqlPlanner {
 			}
 		}
 
-		if on.is_empty() {
-			return Err(unsupported("uncorrelated EXISTS is not supported"));
-		}
-
+		// ADR 256: an uncorrelated EXISTS (no correlated pair → `on` empty) lowers to a KEYLESS semi/anti
+		// join — every outer row passes (EXISTS) / is dropped (NOT EXISTS) iff the subquery is non-empty.
 		if let Some(predicate) = combine_and_exprs(inner_residuals) {
 			inner_plan = LogicalPlan::Filter {
 				input: Box::new(inner_plan),
@@ -5280,6 +5291,89 @@ impl SqlPlanner {
 			} else {
 				JoinKind::LeftSemi
 			},
+			on,
+			JoinStrategy::HashPartitioned,
+			JoinStrategyPinSource::Direct,
+			None,
+		)
+	}
+
+	/// ADR 256: lower `x IN (SELECT y FROM t [WHERE p])` to a `LeftSemi` join keyed on `(x, t.y)` — the
+	/// membership-as-semi-join reuse. The subquery must be uncorrelated and project exactly one column;
+	/// correlated IN and NOT IN are deferred. Reuses the EXISTS validators + correlation classifier so the
+	/// key is properly scoped (qualified to the inner relation) and a correlated subquery rejects cleanly.
+	fn lower_in_subquery_join(
+		&self,
+		outer_plan: LogicalPlan,
+		expr: &SqlExpr,
+		subquery: &Query,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
+		validate_exists_query_shape(subquery)?;
+		let SetExpr::Select(select) = &*subquery.body else {
+			return Err(unsupported("unsupported IN subquery body"));
+		};
+		validate_exists_select_shape(select)?;
+		let key_item = match select.projection.as_slice() {
+			[SelectItem::UnnamedExpr(expr)] => expr,
+			[SelectItem::ExprWithAlias { expr, .. }] => expr,
+			_ => return Err(unsupported("IN subquery must project exactly one column")),
+		};
+		let table_with_joins = select
+			.from
+			.first()
+			.expect("exists select shape has one FROM item");
+		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
+		let outer_qualifiers = plan_qualifiers(&outer_plan);
+		let inner_qualifiers = plan_qualifiers(&inner_plan);
+		// The membership key is the subquery's single projected column, qualified to the subquery's sole
+		// relation so it is unambiguous against the join's combined left+right scope.
+		let inner_key = match strip_nested_sql_expr(key_item) {
+			SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => Expr::qualified_column(
+				TableRef::new(idents[0].value.clone()),
+				idents[1].value.clone(),
+			),
+			SqlExpr::Identifier(ident) => {
+				let [qualifier] = inner_qualifiers.as_slice() else {
+					return Err(unsupported(
+						"IN subquery projection column is ambiguous; qualify it",
+					));
+				};
+				Expr::qualified_column(qualifier.clone(), ident.value.clone())
+			}
+			_ => {
+				return Err(unsupported(
+					"IN subquery must project a single column of the subquery",
+				));
+			}
+		};
+		// The subquery's own WHERE must be uncorrelated (correlated IN is deferred).
+		let mut inner_residuals = Vec::new();
+		if let Some(selection) = &select.selection {
+			for conjunct in split_top_level_and(selection) {
+				match self.classify_exists_conjunct(
+					conjunct,
+					&outer_qualifiers,
+					&inner_qualifiers,
+				)? {
+					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
+					ExistsConjunct::CorrelatedPair { .. } => {
+						return Err(unsupported("correlated IN is not supported"));
+					}
+				}
+			}
+		}
+		if let Some(predicate) = combine_and_exprs(inner_residuals) {
+			inner_plan = LogicalPlan::Filter {
+				input: Box::new(inner_plan),
+				predicate,
+			};
+		}
+		let on = vec![(self.lower_expr(expr)?, inner_key)];
+		build_join_plan(
+			outer_plan,
+			inner_plan,
+			JoinKind::LeftSemi,
 			on,
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
