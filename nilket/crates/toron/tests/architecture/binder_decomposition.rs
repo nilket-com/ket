@@ -148,10 +148,11 @@ pub(crate) fn adr176_semantic_modules_exist() {
 pub(crate) fn adr176_binder_root_is_bounded() {
 	let lines = binder_root_source().lines().count();
 	// The post-ADR176 target tracks legitimate IR growth; ADR 241 added the `Window` bind + prune arms,
-	// ADR 246 the `WindowFunction::Value` bind arm.
+	// ADR 246 the `WindowFunction::Value` bind arm, ADR 255 the `RecursiveCte`/`RecursiveRef` bind arms
+	// plus the `bind_recursive_cte` helper and the `recursive_ctx` threading through the dispatch.
 	assert!(
-		lines <= 5_250,
-		"binder root has {lines} lines; expected <= 5,250 (bounded; bump only for real new IR nodes)"
+		lines <= 5_500,
+		"binder root has {lines} lines; expected <= 5,500 (bounded; bump only for real new IR nodes)"
 	);
 }
 

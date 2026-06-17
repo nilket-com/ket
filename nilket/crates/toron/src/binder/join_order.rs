@@ -2202,7 +2202,12 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		LogicalPlan::SetOpAll { left, right, .. } => {
 			logical_plan_contains_join(left) || logical_plan_contains_join(right)
 		}
-		LogicalPlan::Scan { .. }
+		// ADR 255: opaque-local — a recursive CTE is a self-contained local fixpoint whose
+		// internals are invisible to outer join-order planning, and its self-reference is a
+		// leaf; neither exposes a reorderable join to the star/galaxy detector.
+		LogicalPlan::RecursiveCte { .. }
+		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateLogicalType { .. }
@@ -4007,6 +4012,7 @@ impl<'a> Binder<'a> {
 				&mut scratch_trace,
 				&mut scratch_render_trace,
 				JoinOrderSourceCapture::On,
+				None,
 			)
 			.await?;
 		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
@@ -4023,6 +4029,7 @@ impl<'a> Binder<'a> {
 						&mut scratch_trace,
 						&mut scratch_render_trace,
 						JoinOrderSourceCapture::On,
+						None,
 					)
 					.await?
 			} else {
@@ -4032,6 +4039,7 @@ impl<'a> Binder<'a> {
 						&mut scratch_trace,
 						&mut scratch_render_trace,
 						JoinOrderSourceCapture::On,
+						None,
 					)
 					.await?
 			};
@@ -4101,6 +4109,7 @@ impl<'a> Binder<'a> {
 				trace,
 				render_trace,
 				JoinOrderSourceCapture::On,
+				None,
 			)
 			.await?;
 		let Some(real_probe_label) = real_probe_plan.scope.unique_source_label() else {
@@ -4115,6 +4124,7 @@ impl<'a> Binder<'a> {
 						trace,
 						render_trace,
 						JoinOrderSourceCapture::On,
+						None,
 					)
 					.await?
 			} else {
@@ -4123,6 +4133,7 @@ impl<'a> Binder<'a> {
 					trace,
 					render_trace,
 					JoinOrderSourceCapture::On,
+					None,
 				)
 				.await?
 			};
@@ -4284,7 +4295,13 @@ impl<'a> Binder<'a> {
 		);
 		let bound = self
 			.without_decision_recording()
-			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
+			.bind_plan_with_trace(
+				&rerooted,
+				trace,
+				render_trace,
+				JoinOrderSourceCapture::On,
+				None,
+			)
 			.await?;
 		// The receipt reflects the applied re-root, not the re-rooted graph's intrinsic recommendation.
 		if let Some(render_trace) = render_trace.as_mut() {
@@ -4324,6 +4341,7 @@ impl<'a> Binder<'a> {
 				&mut scratch_trace,
 				&mut scratch_render_trace,
 				JoinOrderSourceCapture::On,
+				None,
 			)
 			.await?;
 		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
@@ -4359,6 +4377,7 @@ impl<'a> Binder<'a> {
 					&mut scratch_trace,
 					&mut scratch_render_trace,
 					JoinOrderSourceCapture::On,
+					None,
 				)
 				.await?;
 			dimension_inputs.push(dimension_plan);
@@ -4444,6 +4463,7 @@ impl<'a> Binder<'a> {
 				trace,
 				render_trace,
 				JoinOrderSourceCapture::On,
+				None,
 			)
 			.await?;
 		let mut real_dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
@@ -4454,6 +4474,7 @@ impl<'a> Binder<'a> {
 					trace,
 					render_trace,
 					JoinOrderSourceCapture::On,
+					None,
 				)
 				.await?;
 			real_dimension_inputs.push(plan);

@@ -2357,19 +2357,98 @@ async fn cte_table_arguments_still_reject() {
 }
 
 #[tokio::test]
-async fn recursive_and_self_reference_ctes_stay_rejected() {
-	// WITH RECURSIVE is the deferred mechanism boundary (plan-level reject).
-	assert_unsupported_message(
-		"WITH RECURSIVE a AS (SELECT k FROM left_dups) SELECT k FROM a",
-		"WITH RECURSIVE is not supported",
+async fn recursive_cte_counter_series_enumerates() {
+	// ADR 255: the canonical local `UNION ALL` fixpoint. Seed {1} (PK lookup on sales.id), recursive term
+	// `n + 1 WHERE n < 5` enumerates 1..5 and terminates delta-empty when 5 < 5 fails.
+	let results = run_logical(&plan_sql(
+		"WITH RECURSIVE t(n) AS (\
+		   SELECT MIN(id) FROM sales \
+		   UNION ALL \
+		   SELECT n + 1 FROM t WHERE n < 5\
+		 ) SELECT n FROM t",
+	))
+	.await;
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn recursive_cte_terminates_on_empty_recursive_term() {
+	// The recursive term yields no rows on the first pass (1 < 1 is false) -> result is just the seed.
+	let results = run_logical(&plan_sql(
+		"WITH RECURSIVE t(n) AS (\
+		   SELECT MIN(id) FROM sales \
+		   UNION ALL \
+		   SELECT n + 1 FROM t WHERE n < 1\
+		 ) SELECT n FROM t",
+	))
+	.await;
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![1]);
+}
+
+#[tokio::test]
+async fn recursive_cte_outer_query_consumes_result() {
+	// The outer query references the recursive CTE like any relation and filters it.
+	let results = run_logical(&plan_sql(
+		"WITH RECURSIVE t(n) AS (\
+		   SELECT MIN(id) FROM sales \
+		   UNION ALL \
+		   SELECT n + 1 FROM t WHERE n < 5\
+		 ) SELECT n FROM t WHERE n > 2",
+	))
+	.await;
+	assert_eq!(sorted_int64_column_rows(&results, 0), vec![3, 4, 5]);
+}
+
+#[tokio::test]
+async fn recursive_cte_nonterminating_hits_iteration_cap() {
+	// A recursive term with no termination predicate grows forever -> the safety cap errors (no hang).
+	let logical = plan_sql(
+		"WITH RECURSIVE t(n) AS (\
+		   SELECT MIN(id) FROM sales \
+		   UNION ALL \
+		   SELECT n + 1 FROM t\
+		 ) SELECT n FROM t",
 	);
-	// A self reference is non-recursive: `a` is not in scope inside its own body, so it falls through to
-	// the catalog and fails to bind as an unknown table — it is NOT resolved as a CTE.
-	let logical = plan_sql("WITH a AS (SELECT k FROM a) SELECT k FROM a");
-	let (catalog, _) = fixture();
-	bind(&logical, &catalog, &PlannerConfig::default())
+	let (catalog, storage) = fixture();
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("a self-referential CTE must not resolve");
+		.expect("bind unbounded recursive CTE");
+	Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("an unbounded recursive query must hit the iteration cap, not hang");
+}
+
+#[tokio::test]
+async fn recursive_cte_union_distinct_and_malformed_shapes_reject() {
+	// UNION (distinct), a join in the recursive term, a missing column list, and a non-`UNION ALL` body
+	// all reject at lowering with precise messages.
+	assert_unsupported_message(
+		"WITH RECURSIVE t(n) AS (SELECT MIN(id) FROM sales UNION SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t",
+		"recursive UNION (distinct) is not supported; use UNION ALL",
+	);
+	assert_unsupported_message(
+		"WITH RECURSIVE t AS (SELECT MIN(id) FROM sales UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t",
+		"a recursive CTE requires an explicit column list, e.g. WITH RECURSIVE t(n) AS (...)",
+	);
+	// A recursive term whose body does not reference the CTE is not actually recursive.
+	assert_unsupported_message(
+		"WITH RECURSIVE t(n) AS (SELECT MIN(id) FROM sales UNION ALL SELECT id FROM sales WHERE id = 2) SELECT n FROM t",
+		"a recursive CTE's recursive term must reference the CTE",
+	);
+	// A join inside the recursive term is beyond the first-cut exchange-free shape.
+	assert!(
+		SqlPlanner::new()
+			.plan(
+				"WITH RECURSIVE t(n) AS (\
+				   SELECT MIN(id) FROM sales \
+				   UNION ALL \
+				   SELECT s.id FROM t JOIN sales s ON t.n = s.id\
+				 ) SELECT n FROM t"
+			)
+			.is_err(),
+		"a join in the recursive term must reject (deferred to the distributed/graph cut)"
+	);
 }
 
 #[test]
@@ -5054,7 +5133,9 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. }
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -5088,7 +5169,9 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Update { .. }
 		| LogicalPlan::Insert { .. }
-		| LogicalPlan::InsertSelect { .. } => false,
+		| LogicalPlan::InsertSelect { .. }
+		| LogicalPlan::RecursiveCte { .. }
+		| LogicalPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -5124,7 +5207,9 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Update { .. }
 		| LogicalPlan::Insert { .. }
-		| LogicalPlan::InsertSelect { .. } => false,
+		| LogicalPlan::InsertSelect { .. }
+		| LogicalPlan::RecursiveCte { .. }
+		| LogicalPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -5154,7 +5239,9 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. }
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => false,
 	}
 }
 

@@ -21097,7 +21097,11 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => {}
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
+		// so it is an opaque leaf to these join collectors.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => {}
 	}
 }
 
@@ -21138,7 +21142,11 @@ fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>)
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => {}
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
+		// so it is an opaque leaf to these join collectors.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => {}
 	}
 }
 
@@ -21176,7 +21184,11 @@ fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => {}
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
+		// so it is an opaque leaf to these join collectors.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => {}
 	}
 }
 
@@ -21219,7 +21231,11 @@ fn collect_join_replay_metadata(
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => {}
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
+		// so it is an opaque leaf to these join collectors.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => {}
 	}
 }
 
@@ -21288,6 +21304,9 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Update { .. }
+		// ADR 255: the first-cut recursive CTE body has no joins — opaque leaf to this join collector.
+		| LogicalPlan::RecursiveCte { .. }
+		| LogicalPlan::RecursiveRef { .. }
 		| LogicalPlan::Insert { .. } => {}
 	}
 }

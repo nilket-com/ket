@@ -232,6 +232,7 @@ pub(crate) async fn bind_with_trace(
 			&mut trace,
 			&mut render_trace,
 			JoinOrderSourceCapture::Off,
+			None,
 		)
 		.await?;
 	let logical_types = catalog.logical_type_registry();
@@ -265,6 +266,7 @@ async fn bind_with_explain_trace(
 			&mut trace,
 			&mut render_trace,
 			JoinOrderSourceCapture::On,
+			None,
 		)
 		.await?;
 	let logical_types = catalog.logical_type_registry();
@@ -884,6 +886,7 @@ impl<'a> Binder<'a> {
 				&mut trace,
 				&mut render_trace,
 				JoinOrderSourceCapture::Off,
+				None,
 			)
 			.await
 		})
@@ -895,6 +898,11 @@ impl<'a> Binder<'a> {
 		trace: &'b mut OptimizerTrace,
 		render_trace: &'b mut Option<OptimizerExplainRenderTrace>,
 		join_order_source_capture: JoinOrderSourceCapture,
+		// ADR 255: the active recursive CTE's `(name, working-table schema)`. `Some` only while binding a
+		// recursive term; the `RecursiveRef` leaf reads it. Only one recursive CTE is ever active (no
+		// mutual recursion), so a single owned slot suffices — threaded (cloned) down the recursive
+		// descent so a `RecursiveRef` nested under Filter/Project/Alias still sees it.
+		recursive_ctx: Option<(String, Arc<Schema>)>,
 	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
 			match plan {
@@ -968,7 +976,13 @@ impl<'a> Binder<'a> {
 					columns,
 				} => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let facts = input.facts;
 					let join_order_sources =
@@ -984,7 +998,13 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let input_facts = input.facts;
 					let bound_predicate = self
@@ -1117,7 +1137,13 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
@@ -1140,19 +1166,43 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Union { left, right } => {
 					let left = self
-						.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							left,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let right = self
-						.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							right,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					bind_union(left, right)
 				}
 				LogicalPlan::SetOpAll { left, right, kind } => {
 					let left = self
-						.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							left,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let right = self
-						.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							right,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					self.bind_set_op_all(
 						left,
@@ -1166,7 +1216,13 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Repeat { input, count } => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let count_expr = self
 						.bind_projection_expr_program_scoped(
@@ -1197,7 +1253,13 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let group_expr = all_output_columns_program(&input.schema())?;
 					let output_schema = input.schema();
@@ -1222,7 +1284,13 @@ impl<'a> Binder<'a> {
 					aggr_expr,
 				} => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let input_schema = input.schema();
 					let group_expr = self
@@ -1248,7 +1316,13 @@ impl<'a> Binder<'a> {
 					key,
 				} => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let facts = input.facts.exchange();
 					let input_schema = input.schema();
@@ -1276,7 +1350,13 @@ impl<'a> Binder<'a> {
 					offset,
 				} => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let output_schema = input.schema();
@@ -1304,7 +1384,13 @@ impl<'a> Binder<'a> {
 					functions,
 				} => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let input_schema = input.schema();
 					let partition_by = self
@@ -1421,7 +1507,13 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Take { input, limit } => {
 					let input = self
-						.bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
 						.await?;
 					let facts = input.facts.take(*limit);
 					let output_schema = input.schema();
@@ -1436,6 +1528,51 @@ impl<'a> Binder<'a> {
 						scope,
 						facts,
 						join_order_sources,
+					))
+				}
+				// ADR 255: a recursive CTE. Bind the seed (anchor) in the outer scope, then bind the
+				// recursive term with the CTE name resolving (via the threaded `recursive_ctx`) to a
+				// working-table relation whose schema is the seed's output types relabeled by the
+				// declared `column_names`. Seed and recursive output schemas must union-align (same
+				// arity + unifiable types), reusing the `Union` arm's reconciliation.
+				LogicalPlan::RecursiveCte {
+					name,
+					column_names,
+					seed,
+					recursive,
+				} => {
+					self.bind_recursive_cte(
+						name,
+						column_names,
+						seed,
+						recursive,
+						trace,
+						render_trace,
+						join_order_source_capture,
+					)
+					.await
+				}
+				// ADR 255: the self-reference leaf inside a recursive term. It binds to the working-table
+				// relation carried by `recursive_ctx` (the seed schema relabeled by `column_names`). A
+				// `RecursiveRef` reached outside a recursive term is a lowering invariant violation.
+				LogicalPlan::RecursiveRef {
+					name,
+					column_names: _,
+				} => {
+					let Some((ctx_name, ctx_schema)) = recursive_ctx else {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"recursive self-reference to `{name}` appears outside a recursive CTE term"
+							),
+						});
+					};
+					let scope = RelationScope::scan(TableRef::new(ctx_name), &ctx_schema);
+					Ok(ScopedExecutionPlan::new_with_facts(
+						ExecutionPlan::RecursiveRef {
+							output_schema: ctx_schema,
+						},
+						scope,
+						PlanOptimizerFacts::composite_unknown(),
 					))
 				}
 				LogicalPlan::Join {
@@ -1640,6 +1777,81 @@ impl<'a> Binder<'a> {
 					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 			}
+		})
+	}
+
+	// ADR 255: bind a recursive CTE. This is a SEPARATE boxed future (not an inline `bind_plan_with_trace`
+	// arm) on purpose: `bind_plan_with_trace` is a deeply-recursing async fn, and inlining this body's
+	// large locals (two `ScopedExecutionPlan`s held across awaits) would inflate every frame of that
+	// recursion enough to overflow the stack on otherwise-shallow plans. Bind the seed (anchor) in the
+	// outer scope, then bind the recursive term with the CTE name resolving (via `recursive_ctx`) to a
+	// working-table relation whose schema is the seed's output types relabeled by `column_names`. Seed
+	// and recursive output schemas must union-align (same arity + unifiable types), reusing the `Union`
+	// arm's reconciliation.
+	fn bind_recursive_cte<'b>(
+		&'b self,
+		name: &'b str,
+		column_names: &'b [String],
+		seed: &'b LogicalPlan,
+		recursive: &'b LogicalPlan,
+		trace: &'b mut OptimizerTrace,
+		render_trace: &'b mut Option<OptimizerExplainRenderTrace>,
+		join_order_source_capture: JoinOrderSourceCapture,
+	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let bound_seed = self
+				.bind_plan_with_trace(seed, trace, render_trace, join_order_source_capture, None)
+				.await?;
+			let seed_schema = bound_seed.schema();
+			if seed_schema.fields().len() != column_names.len() {
+				return Err(BindingError::UnsupportedExpression {
+					message: format!(
+						"recursive CTE `{name}` declares {} column(s) but the seed produces {}",
+						column_names.len(),
+						seed_schema.fields().len()
+					),
+				});
+			}
+			// The working-table schema `s_prime`: seed data-types/nullability, names relabeled.
+			let s_prime_fields = seed_schema
+				.fields()
+				.iter()
+				.zip(column_names.iter())
+				.map(|(field, column_name)| {
+					field_with_logical_type_metadata(
+						column_name.clone(),
+						field.data_type().clone(),
+						field.is_nullable(),
+						LogicalTypeId::NAKED,
+					)
+				})
+				.collect::<Vec<_>>();
+			let s_prime: Arc<Schema> = Arc::new(Schema::new(s_prime_fields));
+			let bound_recursive = self
+				.bind_plan_with_trace(
+					recursive,
+					trace,
+					render_trace,
+					join_order_source_capture,
+					Some((name.to_string(), s_prime.clone())),
+				)
+				.await?;
+			// Reconcile seed/recursive output schemas (union-compatible), then normalize each arm to the
+			// common `output_schema` so the fixpoint append is type-aligned.
+			let output_schema = set_op_output_schema(&s_prime, &bound_recursive.schema())?;
+			let seed_plan = normalize_set_op_arm(bound_seed.plan, &output_schema)?;
+			let recursive_plan = normalize_set_op_arm(bound_recursive.plan, &output_schema)?;
+			let scope = RelationScope::scan(TableRef::new(name.to_string()), &output_schema);
+			Ok(ScopedExecutionPlan::new_with_facts(
+				ExecutionPlan::RecursiveCte {
+					seed: Box::new(seed_plan),
+					recursive: Box::new(recursive_plan),
+					output_schema,
+				},
+				scope,
+				// A recursive result has an unknown row count — the most conservative facts.
+				PlanOptimizerFacts::composite_unknown(),
+			))
 		})
 	}
 
@@ -1851,7 +2063,7 @@ impl<'a> Binder<'a> {
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
 		let source = self
-			.bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)
+			.bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)
 			.await?;
 		let source = source.plan;
 		let source_schema = source.schema();
@@ -2029,7 +2241,7 @@ impl<'a> Binder<'a> {
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
 		let source = self
-			.bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)
+			.bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)
 			.await?;
 		let source = source.plan;
 		let source_schema = source.schema();
@@ -2372,10 +2584,10 @@ impl<'a> Binder<'a> {
 		join_order_source_capture: JoinOrderSourceCapture,
 	) -> Result<ScopedExecutionPlan, BindingError> {
 		let left_plan = self
-			.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture)
+			.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture, None)
 			.await?;
 		let right_plan = self
-			.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture)
+			.bind_plan_with_trace(right, trace, render_trace, join_order_source_capture, None)
 			.await?;
 		let declared_position = trace.join_decisions.len();
 		self.bind_scoped_join(
@@ -3744,6 +3956,46 @@ fn optimize_for_required(
 				},
 				output_remap,
 			))
+		}
+		// ADR 255: a recursive CTE is a projection barrier — the working-table fixpoint feeds every
+		// `output_schema` column back into the recursive term, so no outer requirement may be pushed
+		// inward. Recurse into both subplans with `None` (nested scans still get their own pushdown),
+		// keep the full output schema, and return an identity remap (like Join/Repeat).
+		ExecutionPlan::RecursiveCte {
+			seed,
+			recursive,
+			output_schema,
+		} => {
+			let (seed, _) = optimize_for_required(*seed, None, logical_types)?;
+			let (recursive, _) = optimize_for_required(*recursive, None, logical_types)?;
+			let output_len = output_schema.fields().len();
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::RecursiveCte {
+					seed: Box::new(seed),
+					recursive: Box::new(recursive),
+					output_schema,
+				},
+				output_remap,
+			))
+		}
+		// ADR 255: the self-reference leaf — a working-table placeholder. Identity over its full schema;
+		// the executor substitutes a `SystemTable` of all columns each iteration, so no projection may be
+		// pushed in.
+		ExecutionPlan::RecursiveRef { output_schema } => {
+			let output_len = output_schema.fields().len();
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((ExecutionPlan::RecursiveRef { output_schema }, output_remap))
 		}
 		ExecutionPlan::CreateTable {
 			name,

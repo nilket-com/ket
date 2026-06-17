@@ -194,7 +194,12 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. } => distinct_input_unsupported_message(input),
 		LogicalPlan::Scan { .. } | LogicalPlan::ScanNamed { .. } => None,
-		LogicalPlan::Explain { .. }
+		// ADR 255: opaque-local — a recursive CTE is a self-contained local fixpoint (and its
+		// self-reference a leaf) whose internals are not walked for DISTINCT support in this
+		// first cut; conservatively report the shape as unsupported rather than recursing.
+		LogicalPlan::RecursiveCte { .. }
+		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateLogicalType { .. }

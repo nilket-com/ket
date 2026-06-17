@@ -327,7 +327,11 @@ impl<'a> Binder<'a> {
 					),
 					returning: returning.clone(),
 				}),
-				LogicalPlan::Scan { .. }
+				// ADR 255: opaque-local — a recursive CTE's body is bound separately; outer-join
+				// demotion does not rewrite inside it, and its self-reference is a leaf.
+				LogicalPlan::RecursiveCte { .. }
+				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
@@ -400,7 +404,11 @@ impl<'a> Binder<'a> {
 						&schema,
 					)))
 				}
-				LogicalPlan::Project { .. }
+				// ADR 255: opaque-local — a recursive CTE's internal schema is not resolved for
+				// outer-demotion column routing (sealed local node); its self-reference is a leaf.
+				LogicalPlan::RecursiveCte { .. }
+				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Project { .. }
 				| LogicalPlan::Aggregate { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
@@ -784,7 +792,11 @@ impl<'a> Binder<'a> {
 						receipts: routed.receipts,
 					})
 				}
-				stopped @ (LogicalPlan::Scan { .. }
+				// ADR 255: opaque-local — filter conjuncts are not pushed into a sealed recursive CTE
+				// fixpoint, and its self-reference is a leaf; routing stops here as for Scan.
+				stopped @ (LogicalPlan::RecursiveCte { .. }
+				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Filter { .. }
 				| LogicalPlan::Union { .. }

@@ -395,6 +395,18 @@ pub enum ExecutionPlan {
 		source: Box<ExecutionPlan>,
 		returning: Option<BoundReturningProjection>,
 	},
+	/// ADR 255: a recursive CTE executed as a local `UNION ALL` fixpoint. The `recursive` term contains
+	/// one or more `RecursiveRef` leaves that the executor swaps for the working table each iteration.
+	RecursiveCte {
+		seed: Box<ExecutionPlan>,
+		recursive: Box<ExecutionPlan>,
+		output_schema: SchemaRef,
+	},
+	/// ADR 255: the bound self-reference leaf — replaced by the working table (a `SystemTable`) per
+	/// iteration during fixpoint execution; never executed directly.
+	RecursiveRef {
+		output_schema: SchemaRef,
+	},
 }
 
 impl ExecutionPlan {
@@ -417,6 +429,8 @@ impl ExecutionPlan {
 			Self::Window { output_schema, .. } => output_schema.clone(),
 			Self::Take { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
+			Self::RecursiveCte { output_schema, .. } => output_schema.clone(),
+			Self::RecursiveRef { output_schema } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::CreateLogicalType { .. } => Arc::new(Schema::empty()),
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),

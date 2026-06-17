@@ -1183,7 +1183,10 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local node — opaque to these plan walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 
@@ -1209,7 +1212,10 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local node — opaque to these plan walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -1239,6 +1245,9 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Update { .. } => "update",
 			ExecutionPlan::Insert { .. } => "insert",
 			ExecutionPlan::InsertSelect { .. } => "insert_select",
+			// ADR 255: a recursive CTE's body is opaque; it is labelled as one node.
+			ExecutionPlan::RecursiveCte { .. } => "recursive_cte",
+			ExecutionPlan::RecursiveRef { .. } => "recursive_ref",
 		}
 	}
 }
@@ -1412,7 +1421,10 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local node — opaque to these plan walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -3825,7 +3837,11 @@ fn drive_streamable_plan<'a>(
 			| ExecutionPlan::Delete { .. }
 			| ExecutionPlan::Update { .. }
 			| ExecutionPlan::Insert { .. }
-			| ExecutionPlan::InsertSelect { .. } => Err(QueryError::Internal {
+			| ExecutionPlan::InsertSelect { .. }
+			// ADR 255: a recursive CTE is a materializing fixpoint, not streamable — it runs through
+			// the buffered executor path (`execute_recursive_cte`), never this live-stream driver.
+			| ExecutionPlan::RecursiveCte { .. }
+			| ExecutionPlan::RecursiveRef { .. } => Err(QueryError::Internal {
 				message: "internal: non-streamable plan reached live stream path".to_string(),
 			}),
 		}
@@ -4058,7 +4074,10 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local node — opaque to these plan walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 

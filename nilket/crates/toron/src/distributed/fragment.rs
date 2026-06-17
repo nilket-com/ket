@@ -983,7 +983,11 @@ fn rewrite_broadcast_star_probe_inner(
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => Err(FragmentError::BroadcastProbeNotStarLinear),
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => Err(FragmentError::BroadcastProbeNotStarLinear),
 	}
 }
 
@@ -1324,7 +1328,11 @@ fn leading_exchange_before_join(plan: &ExecutionPlan) -> Option<ExchangeBoundary
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 
@@ -1372,7 +1380,11 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 
@@ -1425,7 +1437,11 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 
@@ -1451,7 +1467,11 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => 0,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => 0,
 	}
 }
 
@@ -1491,7 +1511,11 @@ fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => 0,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => 0,
 	}
 }
 
@@ -1532,7 +1556,11 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 
@@ -1679,7 +1707,11 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => plan,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => plan,
 	}
 }
 
@@ -1787,7 +1819,11 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => plan,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => plan,
 	}
 }
 

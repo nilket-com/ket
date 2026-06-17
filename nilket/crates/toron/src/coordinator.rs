@@ -1588,7 +1588,12 @@ fn collect_replayable_broadcast_join_ids(plan: &ExecutionPlan, ids: &mut BTreeSe
 			collect_replayable_broadcast_join_ids(left, ids);
 			collect_replayable_broadcast_join_ids(right, ids);
 		}
-		ExecutionPlan::EmptyRelation { .. }
+		// ADR 255: opaque-local — broadcast-cap replay IDs only apply to cross-stage broadcast
+		// joins; a recursive CTE runs as a self-contained single-task local fixpoint (and its
+		// self-reference is a leaf), so its interior holds no cross-stage replay candidates.
+		ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }

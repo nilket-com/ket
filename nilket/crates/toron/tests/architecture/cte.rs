@@ -79,9 +79,9 @@ pub(crate) fn adr254_cte_is_frontend_only() {
 
 #[test]
 pub(crate) fn adr254_recursive_cte_stays_deferred() {
-	// `WITH RECURSIVE` is the next mechanism boundary (fixpoint iteration) and stays rejected.
+	// ADR 255 lands local `UNION ALL` `WITH RECURSIVE`: the deferral reject is gone and the lowering
+	// builds the new `RecursiveCte` node. (Reject-string absence is the architecture guard here.)
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("WITH RECURSIVE is not supported"));
-	let tests = source("tests/group_by_test.rs");
-	assert!(tests.contains("recursive_and_self_reference_ctes_stay_rejected"));
+	assert!(!planner.contains("WITH RECURSIVE is not supported"));
+	assert!(planner.contains("lower_recursive_cte"));
 }

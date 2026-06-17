@@ -1760,6 +1760,8 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		ExecutionPlan::Update { .. } => panic!("UPDATE has no scan"),
 		ExecutionPlan::Insert { .. } => panic!("INSERT has no scan"),
 		ExecutionPlan::InsertSelect { .. } => panic!("INSERT INTO ... SELECT has no scan"),
+		ExecutionPlan::RecursiveCte { .. } => panic!("recursive CTE has no top-level scan"),
+		ExecutionPlan::RecursiveRef { .. } => panic!("recursive reference has no scan"),
 	}
 }
 

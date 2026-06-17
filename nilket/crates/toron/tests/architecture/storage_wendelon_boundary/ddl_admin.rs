@@ -267,7 +267,7 @@ pub(crate) fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 25);
+	assert_eq!(enum_variant_count(logical_plan), 27);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
@@ -291,7 +291,7 @@ pub(crate) fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 21);
+	assert_eq!(enum_variant_count(execution_plan), 23);
 	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
@@ -384,7 +384,7 @@ pub(crate) fn adr033_binder_binds_source_before_inferring_schema() {
 		.expect("bind_create_table_as_select body")
 		.1;
 	let bind_source = body
-		.find("bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)")
+		.find("bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)")
 		.expect("source bind");
 	let infer_schema = body.find("infer_ctas_schema").expect("schema inference");
 
@@ -834,7 +834,7 @@ pub(crate) fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 25);
+	assert_eq!(enum_variant_count(logical_plan), 27);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
@@ -856,7 +856,7 @@ pub(crate) fn adr034_execution_variant_count_is_12() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 21);
+	assert_eq!(enum_variant_count(execution_plan), 23);
 	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
@@ -1286,7 +1286,7 @@ pub(crate) fn adr061_ctas_binds_source_before_existing_target_skip() {
 		.expect("bind_create_table_as_select")
 		.1;
 	let bind_source = bind_body
-		.find("bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)")
+		.find("bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)")
 		.expect("source bind");
 	let infer_schema = bind_body
 		.find("infer_ctas_schema")

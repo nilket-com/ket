@@ -14,9 +14,9 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
 	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
-	ScalarValue, SessionId, TableId, TemporalExtractField, TemporalTruncField, ValueFunction,
-	WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction,
-	nanos_per_timestamp_unit,
+	ScalarValue, SessionId, SystemTableKind, TableId, TemporalExtractField, TemporalTruncField,
+	ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit,
+	WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -62,6 +62,11 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// ADR 255: the safety cap on recursive-CTE fixpoint iterations. Termination is normally delta-empty
+/// (the recursive term self-limits via its `WHERE`); this is the hard net so an unbounded recursion
+/// errors instead of hanging.
+const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 
 #[derive(Debug, Clone, Copy)]
 enum ArithmeticOp {
@@ -660,6 +665,13 @@ impl Executor {
 				LogicalPlan::Repeat { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical repeat execution",
 				}),
+				// ADR 255: recursive CTEs execute only via the bound fixpoint path (`execute_bound`).
+				LogicalPlan::RecursiveCte { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound recursive CTE execution",
+				}),
+				LogicalPlan::RecursiveRef { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound recursive reference execution",
+				}),
 				LogicalPlan::Explain { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound EXPLAIN execution",
 				}),
@@ -786,6 +798,23 @@ impl Executor {
 					}
 					Ok(output)
 				}
+				// ADR 255: the local `UNION ALL` fixpoint loop. See `execute_recursive_cte`.
+				ExecutionPlan::RecursiveCte {
+					seed,
+					recursive,
+					output_schema,
+				} => {
+					self.execute_recursive_cte(seed, recursive, output_schema, morsel)
+						.await
+				}
+				// ADR 255: the self-reference leaf is always substituted for a `SystemTable` before the
+				// recursive term executes, so it is never reached directly.
+				ExecutionPlan::RecursiveRef { .. } => Err(ExecutionError::InvalidExpression {
+					message:
+						"recursive self-reference (RecursiveRef) reached the executor without \
+						substitution"
+							.to_string(),
+				}),
 				ExecutionPlan::Repeat {
 					input,
 					count_column,
@@ -1215,6 +1244,39 @@ impl Executor {
 				}),
 			},
 		}
+	}
+
+	/// ADR 255: the local `UNION ALL` recursive-CTE fixpoint (semi-naive). Each iteration substitutes the
+	/// prior pass's rows (the *working table*) for the `RecursiveRef` leaves in the recursive term — via
+	/// the existing `SystemTable` in-memory relation — re-executes, and appends. Termination is
+	/// delta-empty (the recursive term self-limits via its `WHERE`) or the iteration cap.
+	async fn execute_recursive_cte(
+		&self,
+		seed: &ExecutionPlan,
+		recursive: &ExecutionPlan,
+		output_schema: &SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let mut working = self.execute_bound(seed, morsel).await?;
+		let mut result = working.clone();
+		for _ in 0..RECURSIVE_CTE_MAX_ITERATIONS {
+			if batches_total_rows(&working) == 0 {
+				return Ok(finalize_recursive_result(result, output_schema));
+			}
+			let working_rows = batches_to_scalar_rows(&working, output_schema)?;
+			let injected = substitute_recursive_ref(recursive, &working_rows, output_schema);
+			let next = self.execute_bound(&injected, morsel).await?;
+			if batches_total_rows(&next) == 0 {
+				return Ok(finalize_recursive_result(result, output_schema));
+			}
+			result.extend(next.clone());
+			working = next;
+		}
+		Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"recursive query did not terminate within {RECURSIVE_CTE_MAX_ITERATIONS} iterations"
+			),
+		})
 	}
 
 	pub fn evaluate_bound_program(
@@ -1909,6 +1971,181 @@ fn timestamp_literal_array(value: &Option<i64>, unit: TimeUnit, num_rows: usize)
 		}
 		TimeUnit::Second => unreachable!("TimestampSecond is not a supported Toron timestamp unit"),
 	}
+}
+
+/// ADR 255: total row count across a set of batches (delta-empty termination test).
+fn batches_total_rows(batches: &[RecordBatch]) -> usize {
+	batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+/// ADR 255: the result-finalizer — an empty result still yields one empty batch carrying the schema
+/// (mirrors the `Union` arm), so downstream operators see the correct column layout.
+fn finalize_recursive_result(
+	result: Vec<RecordBatch>,
+	output_schema: &SchemaRef,
+) -> Vec<RecordBatch> {
+	if batches_total_rows(&result) == 0 {
+		vec![RecordBatch::new_empty(output_schema.clone())]
+	} else {
+		result
+	}
+}
+
+/// ADR 255: clone the recursive term, replacing every `RecursiveRef` leaf with a `SystemTable` built
+/// from the working table's rows. The first-cut recursive shape is Filter/Project over a `RecursiveRef`,
+/// so only those node kinds recurse; everything else is a pass-through clone (the leaf is the only thing
+/// substituted, so deeper structure is irrelevant — but cloning keeps the helper total).
+fn substitute_recursive_ref(
+	plan: &ExecutionPlan,
+	working_rows: &[Vec<ScalarValue>],
+	output_schema: &SchemaRef,
+) -> ExecutionPlan {
+	match plan {
+		ExecutionPlan::RecursiveRef { .. } => ExecutionPlan::SystemTable {
+			// `OptimizerExplain` is a neutral, side-effect-free in-memory kind; the executor's
+			// `SystemTable` arm reads only `schema`/`rows`, never `kind`.
+			kind: SystemTableKind::OptimizerExplain,
+			schema: output_schema.clone(),
+			rows: working_rows.to_vec(),
+		},
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => ExecutionPlan::Filter {
+			input: Box::new(substitute_recursive_ref(input, working_rows, output_schema)),
+			predicate: predicate.clone(),
+			disposition: *disposition,
+		},
+		ExecutionPlan::Project {
+			input,
+			exprs,
+			output_schema: project_schema,
+		} => ExecutionPlan::Project {
+			input: Box::new(substitute_recursive_ref(input, working_rows, output_schema)),
+			exprs: exprs.clone(),
+			output_schema: project_schema.clone(),
+		},
+		other => other.clone(),
+	}
+}
+
+/// ADR 255: convert a working table's batches to scalar rows that round-trip through
+/// `materialize_scalar_rows` (the `SystemTable` execution path). Inverts `system_table_array` exactly so
+/// the supported type set matches; an unsupported column type is an error rather than a silent drop.
+fn batches_to_scalar_rows(
+	batches: &[RecordBatch],
+	schema: &SchemaRef,
+) -> Result<Vec<Vec<ScalarValue>>, ExecutionError> {
+	let total = batches_total_rows(batches);
+	let mut rows: Vec<Vec<ScalarValue>> = (0..total)
+		.map(|_| Vec::with_capacity(schema.fields().len()))
+		.collect();
+	let mut row_base = 0;
+	for batch in batches {
+		for (col_index, field) in schema.fields().iter().enumerate() {
+			let array = batch.column(col_index);
+			for row in 0..batch.num_rows() {
+				let value = scalar_value_from_array(array, row, field.data_type(), field.name())?;
+				rows[row_base + row].push(value);
+			}
+		}
+		row_base += batch.num_rows();
+	}
+	Ok(rows)
+}
+
+/// ADR 255: read one cell of an arrow array as a `ScalarValue`, covering exactly the type set that
+/// `system_table_array` builds (so the SystemTable round-trip is lossless).
+fn scalar_value_from_array(
+	array: &ArrayRef,
+	row: usize,
+	data_type: &DataType,
+	field_name: &str,
+) -> Result<ScalarValue, ExecutionError> {
+	macro_rules! downcast {
+		($ty:ty) => {
+			array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+				ExecutionError::InvalidExpression {
+					message: format!(
+						"recursive working table column `{field_name}` is not the expected {} array",
+						stringify!($ty)
+					),
+				}
+			})?
+		};
+	}
+	let is_null = array.is_null(row);
+	let value = match data_type {
+		DataType::Boolean => {
+			let arr = downcast!(BooleanArray);
+			ScalarValue::Boolean(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Int32 => {
+			let arr = downcast!(Int32Array);
+			ScalarValue::Int32(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Int64 => {
+			let arr = downcast!(Int64Array);
+			ScalarValue::Int64(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Date32 => {
+			let arr = downcast!(Date32Array);
+			ScalarValue::Date32(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			let value = if is_null {
+				None
+			} else {
+				Some(match unit {
+					TimeUnit::Millisecond => downcast!(TimestampMillisecondArray).value(row),
+					TimeUnit::Microsecond => downcast!(TimestampMicrosecondArray).value(row),
+					TimeUnit::Nanosecond => downcast!(TimestampNanosecondArray).value(row),
+					TimeUnit::Second => {
+						return Err(ExecutionError::InvalidExpression {
+							message: format!(
+								"recursive working table column `{field_name}` has unsupported \
+								 Timestamp(Second) type"
+							),
+						});
+					}
+				})
+			};
+			ScalarValue::Timestamp { value, unit: *unit }
+		}
+		DataType::Duration(TimeUnit::Nanosecond) => {
+			let arr = downcast!(DurationNanosecondArray);
+			ScalarValue::Interval(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Interval(IntervalUnit::YearMonth) => {
+			let arr = downcast!(IntervalYearMonthArray);
+			ScalarValue::CalendarMonthInterval(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Float32 => {
+			let arr = downcast!(Float32Array);
+			ScalarValue::Float32(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Float64 => {
+			let arr = downcast!(Float64Array);
+			ScalarValue::Float64(if is_null { None } else { Some(arr.value(row)) })
+		}
+		DataType::Utf8 => {
+			let arr = downcast!(StringArray);
+			ScalarValue::Utf8(if is_null {
+				None
+			} else {
+				Some(arr.value(row).to_string())
+			})
+		}
+		other => {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"recursive working table column `{field_name}` has unsupported type {other:?}"
+				),
+			});
+		}
+	};
+	Ok(value)
 }
 
 pub(crate) fn materialize_scalar_rows(

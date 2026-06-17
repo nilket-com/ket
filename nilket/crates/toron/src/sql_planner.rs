@@ -3269,17 +3269,20 @@ impl SqlPlanner {
 		let mut owned: Vec<(String, LogicalPlan)> = Vec::new();
 		if let Some(with) = with {
 			if with.recursive {
-				return Err(unsupported("WITH RECURSIVE is not supported"));
-			}
-			for cte in &with.cte_tables {
-				let name = cte.alias.name.value.clone();
-				if owned.iter().any(|(existing, _)| existing == &name) {
-					return Err(unsupported(format!("duplicate WITH name '{name}'")));
+				// ADR 255: a recursive CTE builds a single `RecursiveCte` node (outer references then
+				// resolve to it like any CTE).
+				owned.push(self.lower_recursive_cte(&with.cte_tables, outer)?);
+			} else {
+				for cte in &with.cte_tables {
+					let name = cte.alias.name.value.clone();
+					if owned.iter().any(|(existing, _)| existing == &name) {
+						return Err(unsupported(format!("duplicate WITH name '{name}'")));
+					}
+					let scope = cte_scope_view(outer, &owned);
+					let body_plan = self.lower_query_scoped(&cte.query, &scope)?;
+					let aliased = alias_plan(body_plan, Some(&cte.alias))?;
+					owned.push((name, aliased));
 				}
-				let scope = cte_scope_view(outer, &owned);
-				let body_plan = self.lower_query_scoped(&cte.query, &scope)?;
-				let aliased = alias_plan(body_plan, Some(&cte.alias))?;
-				owned.push((name, aliased));
 			}
 		}
 
@@ -3295,6 +3298,79 @@ impl SqlPlanner {
 			order_by.as_ref(),
 			limit_clause.as_ref(),
 		)
+	}
+
+	/// ADR 255: lower a `WITH RECURSIVE` clause (single CTE, `seed UNION ALL recursive`) to a
+	/// `RecursiveCte` node. The recursive term is lowered with the CTE name resolving to a `RecursiveRef`
+	/// self-reference; only the exchange-free scan/filter/project shape is supported in this first cut.
+	fn lower_recursive_cte(
+		&self,
+		cte_tables: &[sqlparser::ast::Cte],
+		outer: &CteScope,
+	) -> Result<(String, LogicalPlan), FrontendError> {
+		let [cte] = cte_tables else {
+			return Err(unsupported(
+				"multiple or mutually recursive CTEs are not supported",
+			));
+		};
+		let name = cte.alias.name.value.clone();
+		let column_names: Vec<String> = cte
+			.alias
+			.columns
+			.iter()
+			.map(|column| column.name.value.clone())
+			.collect();
+		if column_names.is_empty() {
+			return Err(unsupported(
+				"a recursive CTE requires an explicit column list, e.g. WITH RECURSIVE t(n) AS (...)",
+			));
+		}
+		let SetExpr::SetOperation {
+			op: SetOperator::Union,
+			set_quantifier,
+			left,
+			right,
+		} = cte.query.body.as_ref()
+		else {
+			return Err(unsupported(
+				"a recursive CTE body must be `seed UNION ALL recursive`",
+			));
+		};
+		if !matches!(set_quantifier, SetQuantifier::All) {
+			return Err(unsupported(
+				"recursive UNION (distinct) is not supported; use UNION ALL",
+			));
+		}
+		// Seed (anchor) term: no self-reference, lowered in the outer scope.
+		let seed = self.lower_query_body(&**left, outer)?.plan;
+		// Recursive term: the CTE name resolves to a `RecursiveRef` self-reference in scope.
+		let recursive_owned = vec![(
+			name.clone(),
+			LogicalPlan::RecursiveRef {
+				name: name.clone(),
+				column_names: column_names.clone(),
+			},
+		)];
+		let recursive_scope = cte_scope_view(outer, &recursive_owned);
+		let recursive = self.lower_query_body(&**right, &recursive_scope)?.plan;
+		if !plan_references_recursive_cte(&recursive, &name) {
+			return Err(unsupported(
+				"a recursive CTE's recursive term must reference the CTE",
+			));
+		}
+		if !recursive_term_shape_is_local(&recursive) {
+			return Err(unsupported(
+				"a recursive term must be a scan/filter/project over the recursive reference; \
+				 joins, aggregates, and subqueries in recursion are not supported",
+			));
+		}
+		let plan = LogicalPlan::RecursiveCte {
+			name: name.clone(),
+			column_names,
+			seed: Box::new(seed),
+			recursive: Box::new(recursive),
+		};
+		Ok((name, plan))
 	}
 
 	fn lower_query_body(
@@ -7305,6 +7381,35 @@ fn cte_scope_view<'a>(outer: &CteScope<'a>, owned: &'a [(String, LogicalPlan)]) 
 	scope
 }
 
+/// ADR 255: does the recursive term reference the CTE (contain a `RecursiveRef` to `name`)? The recursive
+/// shape is a chain of Project/Filter/Alias over the reference, so a simple descent suffices.
+fn plan_references_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
+	match plan {
+		LogicalPlan::RecursiveRef {
+			name: reference, ..
+		} => reference == name,
+		LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Alias { input, .. } => plan_references_recursive_cte(input, name),
+		_ => false,
+	}
+}
+
+/// ADR 255: the first-cut recursive-term shape — Project/Filter/Alias over a `RecursiveRef` (or a bare
+/// scan, for a constant recursive term). Joins, aggregates, exchanges, set-ops, sorts, and windows in the
+/// recursion are out of scope (they introduce a non-local shape) and reject.
+fn recursive_term_shape_is_local(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::Scan { .. } => true,
+		LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Alias { input, .. } => recursive_term_shape_is_local(input),
+		_ => false,
+	}
+}
+
 /// ADR 253: merge a named-window `reference` (which names `base` and adds clauses) onto its resolved
 /// `base` spec, producing a plain inline `WindowSpec` (`window_name = None`). The SQL §7.15 referencing
 /// rules: PARTITION BY is inherited and may not be re-added; ORDER BY is inherited and may not be
@@ -8685,6 +8790,11 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 			}
 		},
 		LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Vec::new(),
+		// ADR 255: a recursive CTE exposes its own name as a relation qualifier (like a named scan); its
+		// seed/recursive body is opaque (the working table is internal, not a referenceable qualifier).
+		LogicalPlan::RecursiveCte { name, .. } => vec![TableRef::new(name.clone())],
+		// ADR 255: the self-reference leaf likewise exposes the CTE name (it stands in for the relation).
+		LogicalPlan::RecursiveRef { name, .. } => vec![TableRef::new(name.clone())],
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
@@ -9602,6 +9712,11 @@ mod tests {
 				filter_count(left) + filter_count(right)
 			}
 			LogicalPlan::CreateTableAsSelect { source, .. } => filter_count(source),
+			// ADR 255: count filters in both the seed and recursive terms; the self-reference is a leaf.
+			LogicalPlan::RecursiveCte {
+				seed, recursive, ..
+			} => filter_count(seed) + filter_count(recursive),
+			LogicalPlan::RecursiveRef { .. } => 0,
 			LogicalPlan::Scan { .. }
 			| LogicalPlan::ScanNamed { .. }
 			| LogicalPlan::CreateTable { .. }

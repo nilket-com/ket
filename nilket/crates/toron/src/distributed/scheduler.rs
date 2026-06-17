@@ -1141,7 +1141,10 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local task — opaque to scheduler walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => false,
 	}
 }
 
@@ -1181,7 +1184,10 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => None,
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE is one self-contained local task — opaque to scheduler walkers.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => None,
 	}
 }
 

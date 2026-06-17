@@ -312,6 +312,10 @@ impl StatementClass {
 			| LogicalPlan::Window { .. }
 			| LogicalPlan::Take { .. }
 			| LogicalPlan::Join { .. }
+			// ADR 255: recursive CTEs are read-only SELECT-shaped queries; both the
+			// fixpoint node and its self-reference leaf classify as Select.
+			| LogicalPlan::RecursiveCte { .. }
+			| LogicalPlan::RecursiveRef { .. }
 			| LogicalPlan::Explain { .. }
 			| LogicalPlan::ExplainAnalyze { .. } => Self::Select,
 		}

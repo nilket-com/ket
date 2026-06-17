@@ -421,7 +421,7 @@ pub(crate) fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 25);
+	assert_eq!(enum_variant_count(logical_plan), 27);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("InsertSelect {"));
@@ -444,7 +444,7 @@ pub(crate) fn adr032_execution_plan_retains_insert_select_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 21);
+	assert_eq!(enum_variant_count(execution_plan), 23);
 	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
@@ -586,11 +586,9 @@ pub(crate) fn adr032_binder_enforces_source_target_arity() {
 
 	assert!(bind_insert_select.contains("resolve_insert_target_columns(&schema, columns)?"));
 	assert!(bind_insert_select.contains("validate_omitted_insert_target_columns"));
-	assert!(
-		bind_insert_select.contains(
-			"bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)"
-		)
-	);
+	assert!(bind_insert_select.contains(
+		"bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)"
+	));
 	assert!(bind_insert_select.contains("source_schema.fields().len() != target_columns.len()"));
 	assert!(bind_insert_select.contains("is_insert_select_coercible"));
 	assert!(bind_insert_select.contains("ExecutionPlan::InsertSelect"));
@@ -701,27 +699,27 @@ pub(crate) fn adr032_distributed_walkers_treat_insert_select_as_leaf() {
 	for (function, marker) in [
 		(
 			"fn first_join",
-			"| ExecutionPlan::InsertSelect { .. } => None",
+			"| ExecutionPlan::RecursiveRef { .. } => None",
 		),
 		(
 			"fn find_exchange",
-			"| ExecutionPlan::InsertSelect { .. } => None",
+			"| ExecutionPlan::RecursiveRef { .. } => None",
 		),
 		(
 			"fn count_exchanges",
-			"| ExecutionPlan::InsertSelect { .. } => 0",
+			"| ExecutionPlan::RecursiveRef { .. } => 0",
 		),
 		(
 			"fn first_scan_metadata",
-			"| ExecutionPlan::InsertSelect { .. } => None",
+			"| ExecutionPlan::RecursiveRef { .. } => None",
 		),
 		(
 			"fn replace_exchange_with_scan",
-			"| ExecutionPlan::InsertSelect { .. } => plan",
+			"| ExecutionPlan::RecursiveRef { .. } => plan",
 		),
 		(
 			"fn replace_first_join",
-			"| ExecutionPlan::InsertSelect { .. } => plan",
+			"| ExecutionPlan::RecursiveRef { .. } => plan",
 		),
 	] {
 		let body = brace_blocks_after_marker(&fragmenter, function)
@@ -737,19 +735,19 @@ pub(crate) fn adr032_distributed_walkers_treat_insert_select_as_leaf() {
 	for (function, marker) in [
 		(
 			"fn join_strategy_label",
-			"| ExecutionPlan::InsertSelect { .. } => None",
+			"| ExecutionPlan::RecursiveRef { .. } => None",
 		),
 		(
 			"fn contains_join",
-			"| ExecutionPlan::InsertSelect { .. } => false",
+			"| ExecutionPlan::RecursiveRef { .. } => false",
 		),
 		(
 			"fn contains_broadcast_join",
-			"| ExecutionPlan::InsertSelect { .. } => false",
+			"| ExecutionPlan::RecursiveRef { .. } => false",
 		),
 		(
 			"fn scan_schema_for_table_id",
-			"| ExecutionPlan::InsertSelect { .. } => None",
+			"| ExecutionPlan::RecursiveRef { .. } => None",
 		),
 	] {
 		let body = brace_blocks_after_marker(&server, function)
@@ -768,7 +766,7 @@ pub(crate) fn adr032_distributed_walkers_treat_insert_select_as_leaf() {
 		.next()
 		.expect("first_scan_fingerprint body")
 		.1;
-	assert!(first_scan_fingerprint.contains("| ExecutionPlan::InsertSelect { .. } => None"));
+	assert!(first_scan_fingerprint.contains("| ExecutionPlan::RecursiveRef { .. } => None"));
 }
 
 #[test]
@@ -922,7 +920,7 @@ pub(crate) fn adr036_logical_variant_count_is_15() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 25);
+	assert_eq!(enum_variant_count(logical_plan), 27);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("Delete {"));
@@ -944,7 +942,7 @@ pub(crate) fn adr036_execution_variant_count_is_13() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 21);
+	assert_eq!(enum_variant_count(execution_plan), 23);
 	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));

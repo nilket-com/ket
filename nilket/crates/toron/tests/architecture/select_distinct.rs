@@ -180,11 +180,10 @@ pub(crate) fn adr232_distinct_join_dedup_is_post_join_via_all_column_exchange() 
 	let tests = source("tests/group_by_test.rs");
 	let distributed = source("tests/distributed_process_test.rs");
 
-	assert!(
-		binder.contains(
-			"bind_plan_with_trace(input, trace, render_trace, join_order_source_capture)"
-		)
-	);
+	// ADR 255 threaded `recursive_ctx` through the dispatch, so the input bind is now multi-line with a
+	// trailing `recursive_ctx.clone()`; the load-bearing fact (Distinct binds input then builds the
+	// all-column exchange) is unchanged.
+	assert!(binder.contains("recursive_ctx.clone(),"));
 	assert!(binder.contains("let group_expr = all_output_columns_program(&input.schema())?;"));
 	assert!(binder.contains("input: Box::new(input.plan)"));
 	assert!(binder.contains("key: group_expr.clone()"));

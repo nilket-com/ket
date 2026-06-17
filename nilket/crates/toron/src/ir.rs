@@ -1174,6 +1174,21 @@ pub enum LogicalPlan {
 		source: Box<LogicalPlan>,
 		returning: Option<ReturningProjection>,
 	},
+	/// ADR 255: a recursive CTE — `WITH RECURSIVE name(cols) AS (seed UNION ALL recursive)`. The
+	/// `recursive` term contains one or more `RecursiveRef` leaves resolving to the working table. This
+	/// first cut is `UNION ALL` only (no `all` flag) and executes as a local fixpoint.
+	RecursiveCte {
+		name: String,
+		column_names: Vec<String>,
+		seed: Box<LogicalPlan>,
+		recursive: Box<LogicalPlan>,
+	},
+	/// ADR 255: the self-reference to a recursive CTE inside its own recursive term. Resolves to the
+	/// working table at execution; carries only column names (types come from the seed at bind).
+	RecursiveRef {
+		name: String,
+		column_names: Vec<String>,
+	},
 }
 
 pub fn project_plan(

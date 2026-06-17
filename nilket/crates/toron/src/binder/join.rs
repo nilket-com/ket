@@ -923,6 +923,10 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Window { .. }
+		// ADR 255: opaque-local — a recursive CTE is a self-contained local fixpoint and its
+		// self-reference is a leaf; neither is a scan-linear probe, so both block linearity.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf),
 	}
@@ -1294,6 +1298,10 @@ pub(super) fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExpr
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Union { .. }
 		| ExecutionPlan::Join { .. }
+		// ADR 255: opaque-local — a recursive CTE is a single-task local node (no terminal
+		// exchange visible to outer fragmentation) and its self-reference is a leaf.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
