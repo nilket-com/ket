@@ -58,23 +58,41 @@ reuses the 256 anti-join substrate.
 
 ## Discriminators (each fails on `main`)
 
-- **`not_in_subquery_excludes_members`** — `x NOT IN (SELECT y FROM t)` over a NULL-free subquery keeps
-  exactly the non-members.
+- **`not_in_subquery_excludes_members`** — `x NOT IN (SELECT y FROM t)` over a NULL-free subquery (a
+  non-nullable subquery key, so the null-guard `key IS NULL` constant-folds to a no-op) keeps exactly the
+  non-members.
 - **`not_in_with_null_in_subquery_returns_no_rows`** — a NULL in the subquery key empties the result (the
   three-valued gate; a plain `LeftAnti` would wrongly return rows).
-- **`not_in_excludes_null_outer_rows`** — a NULL `x` row never qualifies.
-- **`not_in_lowers_to_anti_joins_no_new_op`** — the plan is anti-joins + a filter (no new execution node).
-- **`not_in_null_guard_holds_across_partitions`** *(distributed, Gemini)* — a NULL on any one worker's
-  subquery partition empties the whole result (the keyless null-guard anti must see global non-emptiness).
-- **`cross_type_and_correlated_not_in_stay_rejected`** — cross-type and correlated `NOT IN` reject.
+- **`not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter`** — the plan-shape gate: `LeftAnti`
+  (never `LeftSemi`) + an `IS NOT NULL` filter (null-`x` exclusion) + an `IS NULL` null-guard, no new
+  execution node.
+- **`cross_type_and_correlated_not_in_stay_rejected`** — cross-type (`JoinKeyTypeMismatch` at bind) and
+  correlated `NOT IN` reject.
+
+### Test-harness note — the null-`x` / null-guard *runtime* gates can't execute against the mock
+
+The FixtureScan mock **drops pushed scan predicates** (`reference_multitablestoragescan_ignores_pushed_predicates`),
+so an `IS NULL` / `IS NOT NULL` filter on a *nullable* column is silently a no-op against the mock — the
+null-guard would wrongly fire and empty every nullable-keyed `NOT IN`, and the fixture has no nullable
+`Int64` column to pair a nullable outer `x` against a non-nullable subquery key. So:
+
+- The null-`x` exclusion and the null-guard composition are pinned at **plan-shape** (`IsNotNull` + `IsNull`
+  + two `LeftAnti`) by `not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter`, and their **runtime**
+  semantics by the **manual NOT-EXISTS-expansion probe** (grounded receipt above) — which real storage
+  honors.
+- The originally-penciled execute-tests **`not_in_excludes_null_outer_rows`** (null-`x`) and the
+  distributed **`not_in_null_guard_holds_across_partitions`** (Gemini's cross-partition null-guard gate) are
+  **deferred to a predicate-honoring / real-storage harness** — the mock cannot run them for the right
+  reason. The desugar reuses the distributed `LeftAnti` unchanged, so global null-guard non-emptiness rides
+  on the landed 256 distributed anti-join semantics.
 
 ## Architecture guards
 
-- `adr258_not_in_desugars_to_not_exists_anti_joins` — `lower_in_subquery_join`'s `negated` arm builds the
-  `x IS NOT NULL` filter + the keyless null-guard `LeftAnti` + the correlated membership `LeftAnti`; the
-  256 `"NOT IN (subquery) is not supported"` reject is gone.
-- `adr258_not_in_is_frontend_lowering_only` — no IR / executor / fragmenter surface (reuses the landed
-  `LeftAnti`).
+- `adr258_not_in_desugars_to_not_exists_anti_joins` — `lower_not_in_subquery_join` (the `negated` arm of
+  `lower_where`) builds the `x IS NOT NULL` filter + the keyless null-guard `LeftAnti` + the correlated
+  membership `LeftAnti` (≥2 anti-joins); the 256 `"NOT IN (subquery) is not supported"` reject is gone.
+- `adr258_not_in_is_frontend_lowering_only` — no IR / executor / fragmenter surface and **no null-aware-anti
+  operator** (reuses the landed `LeftAnti`).
 - `adr258_cross_type_and_correlated_not_in_stay_deferred` — those rejects remain.
 
 ## Deferred

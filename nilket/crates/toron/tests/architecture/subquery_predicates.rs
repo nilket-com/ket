@@ -61,14 +61,14 @@ pub(crate) fn adr256_subquery_predicates_are_frontend_lowering_only() {
 }
 
 #[test]
-pub(crate) fn adr256_not_in_and_scalar_subquery_stay_deferred() {
+pub(crate) fn adr256_correlated_in_and_scalar_subquery_stay_deferred() {
+	// ADR 258 lands `NOT IN` (the reject is gone); correlated IN, scalar subqueries, and SELECT-without-
+	// FROM remain deferred.
 	let planner = source("src/sql_planner.rs");
 	assert!(
-		planner.contains("NOT IN (subquery) is not supported"),
-		"NOT IN (null-aware) is deferred"
-	);
-	assert!(
-		planner.contains("correlated IN is not supported"),
+		// ADR 258 shares the membership-subquery lowering between IN / NOT IN, so the correlated reject is
+		// a `{context}`-parameterized format string ("correlated IN…" / "correlated NOT IN…" at runtime).
+		planner.contains("correlated {context} is not supported"),
 		"correlated IN is deferred"
 	);
 	assert!(
@@ -76,5 +76,85 @@ pub(crate) fn adr256_not_in_and_scalar_subquery_stay_deferred() {
 		"SELECT without FROM stays deferred (its own cut)"
 	);
 	let tests = source("tests/group_by_test.rs");
-	assert!(tests.contains("not_in_and_scalar_subquery_stay_rejected"));
+	assert!(tests.contains("correlated_in_and_scalar_subquery_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr258_not_in_desugars_to_not_exists_anti_joins() {
+	// `x NOT IN (sub)` ≡ `x IS NOT NULL AND NOT EXISTS(sub WHERE key IS NULL) AND
+	// NOT EXISTS(sub WHERE key = x)`: a null-`x` filter + a keyless null-guard `LeftAnti` + a membership
+	// `LeftAnti` — no null-aware-anti operator.
+	let planner = source("src/sql_planner.rs");
+	assert!(
+		planner.contains("fn lower_not_in_subquery_join"),
+		"`NOT IN (subquery)` has a dedicated null-aware lowering"
+	);
+	let body = brace_blocks_after_marker(&planner, "fn lower_not_in_subquery_join")
+		.into_iter()
+		.next()
+		.expect("lower_not_in_subquery_join body")
+		.1;
+	assert!(
+		body.contains("Expr::IsNotNull"),
+		"the null-`x` filter drops NULL outer keys: {body}"
+	);
+	assert!(
+		body.contains("Expr::IsNull"),
+		"the keyless null-guard filters the subquery to its NULL keys: {body}"
+	);
+	let anti_joins = body.matches("JoinKind::LeftAnti").count();
+	assert!(
+		anti_joins >= 2,
+		"NOT IN desugars to two anti-joins (null-guard + membership), got {anti_joins}: {body}"
+	);
+	assert!(
+		!planner.contains("NOT IN (subquery) is not supported"),
+		"the 256 NOT IN reject is lifted"
+	);
+	let tests = source("tests/group_by_test.rs");
+	assert!(
+		tests.contains("not_in_subquery_excludes_members")
+			&& tests.contains("not_in_with_null_in_subquery_returns_no_rows")
+			&& tests.contains("not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter"),
+		"the NOT IN discriminators are pinned"
+	);
+}
+
+#[test]
+pub(crate) fn adr258_not_in_is_frontend_lowering_only() {
+	assert!(
+		source("src/sql_planner.rs").contains("fn lower_not_in_subquery_join"),
+		"the NOT IN desugar lives in the planner"
+	);
+	for path in [
+		"src/ir.rs",
+		"src/ir/execution.rs",
+		"src/exec.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let src = source(path);
+		assert!(
+			!src.contains("lower_not_in_subquery_join")
+				&& !src.contains("NotInSubquery")
+				&& !src.contains("NullAwareAnti"),
+			"NOT IN lowering — and the absence of any null-aware-anti operator — stays out of the \
+			 IR/executor/fragmenter: {path}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr258_cross_type_and_correlated_not_in_stay_deferred() {
+	// Correlated NOT IN rejects at lowering ("correlated {context}…" with context = "NOT IN"); cross-type
+	// membership keys reject at bind (the deferred coercion gap, same as correlated IN / scalar subqueries).
+	let planner = source("src/sql_planner.rs");
+	assert!(
+		planner.contains("correlated {context} is not supported"),
+		"correlated IN / NOT IN stays deferred"
+	);
+	let tests = source("tests/group_by_test.rs");
+	assert!(
+		tests.contains("cross_type_and_correlated_not_in_stay_rejected"),
+		"the cross-type / correlated NOT IN deferral is pinned"
+	);
 }

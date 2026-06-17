@@ -40,16 +40,24 @@ on the inner plan.
 FixtureScan pushed-predicate drop — use membership/joins, not pushed scan filters)
 
 - `not_in_subquery_excludes_members` — `… WHERE left_dups.k NOT IN (SELECT k FROM right_dups)` → keeps
-  `k = 3` rows (the non-members; right_dups.k ∈ {1,2,4}).
+  `k = 3` rows (the non-members; right_dups.k ∈ {1,2,4}). Uses a **non-nullable** subquery key so the
+  null-guard `key IS NULL` constant-folds (the mock can't honor a pushed nullable `IS NULL` filter).
 - `not_in_with_null_in_subquery_returns_no_rows` — a subquery whose key column has a NULL (e.g.
   `sales.region`) → empty result.
-- `not_in_excludes_null_outer_rows` — a NULL `x` row never qualifies.
-- `not_in_lowers_to_anti_joins_no_new_op` — plan-shape: two `LeftAnti` + a filter, no new node.
+- `not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter` — plan-shape: `LeftAnti` (never
+  `LeftSemi`) + an `IsNotNull` filter (null-`x`) + an `IsNull` null-guard, no new node.
 - `cross_type_and_correlated_not_in_stay_rejected` — `Int64 NOT IN (SELECT <Int32>)` (type mismatch) and a
   correlated `NOT IN` reject.
-- **`not_in_null_guard_holds_across_partitions`** (Gemini; `distributed_process_test.rs`) — a NULL on one
-  worker's subquery partition empties the whole result. Verifies the keyless null-guard anti observes
-  global subquery non-emptiness, not just the local partition.
+
+**Mock limitation (carried into the docs)**: the FixtureScan **drops pushed scan predicates**
+(`reference_multitablestoragescan_ignores_pushed_predicates`), so a nullable `IS NULL` / `IS NOT NULL`
+filter is a no-op against the mock, and the fixture has no nullable `Int64` column to pair a nullable outer
+`x` against a non-nullable subquery key. The originally-penciled `not_in_excludes_null_outer_rows` (null-`x`
+execution) and **`not_in_null_guard_holds_across_partitions`** (Gemini's distributed cross-partition gate)
+are therefore **deferred to a predicate-honoring / real-storage harness** — the null-`x` and null-guard
+semantics are pinned at **plan-shape** here and by the **manual NOT-EXISTS probe** (which real storage
+honors); the desugar reuses the distributed `LeftAnti` unchanged, so global null-guard non-emptiness rides
+on the landed 256 distributed anti-join.
 
 ### Architecture guards (`tests/architecture/subquery_predicates.rs` — extend the 256 module)
 
@@ -89,10 +97,12 @@ git diff --check
   a NOT IN bug; the reject test pins it.
 - **NULL guard correctness**: the keyless anti must run over the subquery filtered to `key IS NULL` (not
   the whole subquery); a NULL anywhere in the key → empty, matching SQL.
-- **Distributed null-guard** (Gemini's gate): confirm the keyless null-guard anti empties the result when
-  the NULL is on a *different* worker than the outer rows — i.e. the keyless anti sees the subquery's
-  *global* non-emptiness, not a per-partition view. If 256's keyless anti doesn't already distribute this
-  correctly, that's a finding to surface before sealing.
+- **Distributed null-guard** (Gemini's gate): the null-guard is a keyless `LeftAnti` — the *same* operator
+  256 already lands and distributes (a keyless anti gathers the right side, so it observes the subquery's
+  *global* non-emptiness, not a per-partition view). 258 adds **no new distribution logic** — it composes
+  the landed keyless anti — so there is no separable distributed-correctness risk to surface. An execute
+  gate for it is deferred to a predicate-honoring harness (the mock drops the `key IS NULL` filter, so it
+  can't run for the right reason).
 - **Omit-guard optimization (deferred, Gemini)**: when the binder proves the subquery key non-nullable,
   the null-guard anti is a no-op and could be elided — **always emit it this cut**; the elision is a later
   optimization, not in scope.

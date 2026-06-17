@@ -5271,18 +5271,18 @@ impl SqlPlanner {
 				SqlExpr::Exists { subquery, negated } => {
 					plan = self.lower_exists_join(plan, subquery, *negated, cte)?;
 				}
-				// ADR 256: `x IN (subquery)` lowers to a semi-join; `NOT IN` is deferred (NULL semantics).
+				// ADR 256/258: `x IN (subquery)` → semi-join; `x NOT IN (subquery)` → the null-aware
+				// anti-join desugar (null-`x` filter + keyless null-guard anti + correlated membership anti).
 				SqlExpr::InSubquery {
 					expr,
 					subquery,
 					negated,
 				} => {
-					if *negated {
-						return Err(unsupported(
-							"NOT IN (subquery) is not supported; use NOT EXISTS",
-						));
-					}
-					plan = self.lower_in_subquery_join(plan, expr, subquery, cte)?;
+					plan = if *negated {
+						self.lower_not_in_subquery_join(plan, expr, subquery, cte)?
+					} else {
+						self.lower_in_subquery_join(plan, expr, subquery, cte)?
+					};
 				}
 				_ => residuals.push(self.lower_expr(conjunct)?),
 			}
@@ -5363,32 +5363,36 @@ impl SqlPlanner {
 	/// membership-as-semi-join reuse. The subquery must be uncorrelated and project exactly one column;
 	/// correlated IN and NOT IN are deferred. Reuses the EXISTS validators + correlation classifier so the
 	/// key is properly scoped (qualified to the inner relation) and a correlated subquery rejects cleanly.
-	fn lower_in_subquery_join(
+	/// ADR 256/258: validate an uncorrelated single-column `IN`/`NOT IN` subquery and lower it to its
+	/// (residual-filtered) relation plus the membership key (qualified to the subquery's sole relation, so
+	/// it is unambiguous against the join's combined scope). `context` is `"IN"` / `"NOT IN"` for messages.
+	fn lower_membership_subquery(
 		&self,
-		outer_plan: LogicalPlan,
-		expr: &SqlExpr,
 		subquery: &Query,
+		outer_qualifiers: &[TableRef],
 		cte: &CteScope,
-	) -> Result<LogicalPlan, FrontendError> {
+		context: &str,
+	) -> Result<(LogicalPlan, Expr), FrontendError> {
 		validate_exists_query_shape(subquery)?;
 		let SetExpr::Select(select) = &*subquery.body else {
-			return Err(unsupported("unsupported IN subquery body"));
+			return Err(unsupported(format!("unsupported {context} subquery body")));
 		};
 		validate_exists_select_shape(select)?;
 		let key_item = match select.projection.as_slice() {
 			[SelectItem::UnnamedExpr(expr)] => expr,
 			[SelectItem::ExprWithAlias { expr, .. }] => expr,
-			_ => return Err(unsupported("IN subquery must project exactly one column")),
+			_ => {
+				return Err(unsupported(format!(
+					"{context} subquery must project exactly one column"
+				)));
+			}
 		};
 		let table_with_joins = select
 			.from
 			.first()
 			.expect("exists select shape has one FROM item");
 		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
-		let outer_qualifiers = plan_qualifiers(&outer_plan);
 		let inner_qualifiers = plan_qualifiers(&inner_plan);
-		// The membership key is the subquery's single projected column, qualified to the subquery's sole
-		// relation so it is unambiguous against the join's combined left+right scope.
 		let inner_key = match strip_nested_sql_expr(key_item) {
 			SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => Expr::qualified_column(
 				TableRef::new(idents[0].value.clone()),
@@ -5396,30 +5400,32 @@ impl SqlPlanner {
 			),
 			SqlExpr::Identifier(ident) => {
 				let [qualifier] = inner_qualifiers.as_slice() else {
-					return Err(unsupported(
-						"IN subquery projection column is ambiguous; qualify it",
-					));
+					return Err(unsupported(format!(
+						"{context} subquery projection column is ambiguous; qualify it"
+					)));
 				};
 				Expr::qualified_column(qualifier.clone(), ident.value.clone())
 			}
 			_ => {
-				return Err(unsupported(
-					"IN subquery must project a single column of the subquery",
-				));
+				return Err(unsupported(format!(
+					"{context} subquery must project a single column of the subquery"
+				)));
 			}
 		};
-		// The subquery's own WHERE must be uncorrelated (correlated IN is deferred).
+		// The subquery's own WHERE must be uncorrelated (correlated IN / NOT IN is deferred).
 		let mut inner_residuals = Vec::new();
 		if let Some(selection) = &select.selection {
 			for conjunct in split_top_level_and(selection) {
 				match self.classify_exists_conjunct(
 					conjunct,
-					&outer_qualifiers,
+					outer_qualifiers,
 					&inner_qualifiers,
 				)? {
 					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
 					ExistsConjunct::CorrelatedPair { .. } => {
-						return Err(unsupported("correlated IN is not supported"));
+						return Err(unsupported(format!(
+							"correlated {context} is not supported"
+						)));
 					}
 				}
 			}
@@ -5430,12 +5436,72 @@ impl SqlPlanner {
 				predicate,
 			};
 		}
+		Ok((inner_plan, inner_key))
+	}
+
+	fn lower_in_subquery_join(
+		&self,
+		outer_plan: LogicalPlan,
+		expr: &SqlExpr,
+		subquery: &Query,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
+		let outer_qualifiers = plan_qualifiers(&outer_plan);
+		let (inner_plan, inner_key) =
+			self.lower_membership_subquery(subquery, &outer_qualifiers, cte, "IN")?;
 		let on = vec![(self.lower_expr(expr)?, inner_key)];
 		build_join_plan(
 			outer_plan,
 			inner_plan,
 			JoinKind::LeftSemi,
 			on,
+			JoinStrategy::HashPartitioned,
+			JoinStrategyPinSource::Direct,
+			None,
+		)
+	}
+
+	/// ADR 258: `x NOT IN (sub)` ≡ `x IS NOT NULL AND NOT EXISTS(sub WHERE key IS NULL) AND
+	/// NOT EXISTS(sub WHERE key = x)` — a null-`x` filter, a keyless null-guard `LeftAnti` (any NULL key in
+	/// the subquery empties the result), and a correlated membership `LeftAnti`. Reuses 256's anti-join
+	/// machinery; no null-aware-anti operator and no new execution op.
+	fn lower_not_in_subquery_join(
+		&self,
+		outer_plan: LogicalPlan,
+		expr: &SqlExpr,
+		subquery: &Query,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
+		let outer_qualifiers = plan_qualifiers(&outer_plan);
+		let (inner_plan, inner_key) =
+			self.lower_membership_subquery(subquery, &outer_qualifiers, cte, "NOT IN")?;
+		let key = self.lower_expr(expr)?;
+		// 1. A NULL `x` never qualifies for NOT IN.
+		let mut plan = LogicalPlan::Filter {
+			input: Box::new(outer_plan),
+			predicate: Expr::IsNotNull(Box::new(key.clone())),
+		};
+		// 2. Null guard: any NULL key in the subquery empties the result (keyless anti over the
+		//    NULL-key rows — non-empty ⇒ every outer row dropped; empty ⇒ a no-op).
+		let null_guard = LogicalPlan::Filter {
+			input: Box::new(inner_plan.clone()),
+			predicate: Expr::IsNull(Box::new(inner_key.clone())),
+		};
+		plan = build_join_plan(
+			plan,
+			null_guard,
+			JoinKind::LeftAnti,
+			Vec::new(),
+			JoinStrategy::HashPartitioned,
+			JoinStrategyPinSource::Direct,
+			None,
+		)?;
+		// 3. Membership: drop rows whose key equals a subquery key.
+		build_join_plan(
+			plan,
+			inner_plan,
+			JoinKind::LeftAnti,
+			vec![(key, inner_key)],
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
 			None,

@@ -2526,12 +2526,8 @@ async fn not_exists_lowers_to_anti_join() {
 }
 
 #[tokio::test]
-async fn not_in_and_scalar_subquery_stay_rejected() {
-	// NOT IN (null-aware anti), correlated IN, and scalar subqueries are the deferred boundaries.
-	assert_unsupported_message(
-		"SELECT * FROM left_dups WHERE left_dups.k NOT IN (SELECT k FROM right_dups)",
-		"NOT IN (subquery) is not supported; use NOT EXISTS",
-	);
+async fn correlated_in_and_scalar_subquery_stay_rejected() {
+	// Correlated IN and (non-aggregate) scalar subqueries are the deferred boundaries (256/257).
 	assert_unsupported_message(
 		"SELECT * FROM left_dups \
 		 WHERE left_dups.k IN (SELECT k FROM right_dups WHERE right_dups.tier = left_dups.label)",
@@ -2540,6 +2536,77 @@ async fn not_in_and_scalar_subquery_stay_rejected() {
 	assert_unsupported(
 		"SELECT left_dups.k FROM left_dups WHERE left_dups.k = (SELECT k FROM right_dups)",
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 258 — NOT IN (subquery), null-aware
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn not_in_subquery_excludes_members() {
+	// left_dups k=[1,1,2,3,3] NOT IN right_dups k∈{1,2,4} → keeps k=3,3 (label "missing").
+	let results = run_logical(&plan_sql(
+		"SELECT left_dups.label FROM left_dups WHERE left_dups.k NOT IN (SELECT k FROM right_dups)",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_column_rows(&results, 0),
+		vec![Some("missing".to_string()), Some("missing".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn not_in_with_null_in_subquery_returns_no_rows() {
+	// sales.region has a NULL → a NULL in the subquery key empties the whole NOT IN result.
+	let results = run_logical(&plan_sql(
+		"SELECT sales.id FROM sales WHERE sales.region NOT IN (SELECT region FROM sales s)",
+	))
+	.await;
+	let rows: usize = results.iter().map(|b| b.num_rows()).sum();
+	assert_eq!(rows, 0, "a NULL in the subquery key empties NOT IN");
+}
+
+#[tokio::test]
+async fn not_in_lowers_to_anti_joins_with_null_guard_and_null_x_filter() {
+	// Plan-shape gate: NOT IN desugars to anti-joins (not a semi-join), an `IS NOT NULL` filter on the
+	// outer key (null-`x` exclusion), and an `IS NULL` null-guard over the subquery. (The runtime null-`x`
+	// / null-guard execution can't be tested here — the FixtureScan mock drops pushed `IS NULL` scan
+	// filters; the manual NOT-EXISTS-expansion probe covered the runtime semantics, and real storage
+	// honors the filters.)
+	let plan = plan_sql(
+		"SELECT left_dups.label FROM left_dups WHERE left_dups.k NOT IN (SELECT k FROM right_dups)",
+	);
+	let debug = format!("{plan:?}");
+	assert!(
+		debug.contains("LeftAnti") && !debug.contains("LeftSemi"),
+		"NOT IN lowers to anti-joins, not a semi-join: {debug}"
+	);
+	assert!(
+		debug.contains("IsNotNull"),
+		"NOT IN adds the null-x filter: {debug}"
+	);
+	assert!(
+		debug.contains("IsNull"),
+		"NOT IN adds the null-guard: {debug}"
+	);
+}
+
+#[tokio::test]
+async fn cross_type_and_correlated_not_in_stay_rejected() {
+	// Correlated NOT IN rejects at lowering.
+	assert_unsupported_message(
+		"SELECT * FROM left_dups \
+		 WHERE left_dups.k NOT IN (SELECT k FROM right_dups WHERE right_dups.tier = left_dups.label)",
+		"correlated NOT IN is not supported",
+	);
+	// Cross-type membership key (Int64 k vs Int32 amount) rejects at bind (the deferred coercion gap).
+	let logical = plan_sql(
+		"SELECT left_dups.k FROM left_dups WHERE left_dups.k NOT IN (SELECT amount FROM sales)",
+	);
+	let (catalog, _) = fixture();
+	bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("cross-type NOT IN membership key must reject at bind");
 }
 
 // ---------------------------------------------------------------------------
