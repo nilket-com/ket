@@ -173,10 +173,9 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT rn FROM (SELECT ROW_NUMBER() OVER (ORDER BY score) AS rn FROM wins) d",
 		// window in WHERE
 		"SELECT grp FROM wins WHERE ROW_NUMBER() OVER (ORDER BY score) > 1",
-		// ADR 250: window inheritance (WINDOW w2 AS w1) is a spec-merge mechanism, deferred
-		"SELECT RANK() OVER w2 FROM wins WINDOW w1 AS (ORDER BY score), w2 AS w1",
-		// ADR 250: window extension (OVER (w ...) merging a named base with added clauses), deferred
-		"SELECT RANK() OVER (w ORDER BY id) FROM wins WINDOW w AS (PARTITION BY grp)",
+		// ADR 253 lands inheritance (WINDOW w2 AS w1) and extension (OVER (w ...)); the conflicting-merge
+		// and cyclic forms stay rejected — see extension_cannot_override_partition_or_order /
+		// window_reference_cycle_rejects / window_alias_to_framed_base_rejects / frame_on_referenced_window_rejects.
 	] {
 		assert!(
 			SqlPlanner::new().plan(sql).is_err(),
@@ -1241,6 +1240,105 @@ async fn unknown_named_window_rejects() {
 			.is_err(),
 		"OVER w with no WINDOW clause rejects"
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 253 — named-window spec-merge (inheritance + extension)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn over_extension_inherits_base_partition() {
+	// `OVER (w ORDER BY score)` extends the named base `w` (PARTITION BY grp) with an ORDER BY — the
+	// merged spec equals the inline `PARTITION BY grp ORDER BY score`.
+	let extended = run_window(
+		"SELECT grp, RANK() OVER (w ORDER BY score) AS r FROM wins WINDOW w AS (PARTITION BY grp)",
+	)
+	.await;
+	let inline =
+		run_window("SELECT grp, RANK() OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	assert_eq!(extended, inline, "extension inherits the base PARTITION BY");
+	assert_eq!(group_values(&extended, "a"), vec![1, 1, 3]);
+}
+
+#[tokio::test]
+async fn window_inheritance_alias_resolves() {
+	// `WINDOW w2 AS w1` is a pure alias — `OVER w2` resolves to `w1`.
+	let alias = run_window(
+		"SELECT grp, RANK() OVER w2 AS r FROM wins \
+		 WINDOW w1 AS (PARTITION BY grp ORDER BY score), w2 AS w1",
+	)
+	.await;
+	let direct = run_window(
+		"SELECT grp, RANK() OVER w1 AS r FROM wins WINDOW w1 AS (PARTITION BY grp ORDER BY score)",
+	)
+	.await;
+	assert_eq!(alias, direct, "WINDOW w2 AS w1 aliases w1");
+	assert_eq!(group_values(&alias, "a"), vec![1, 1, 3]);
+}
+
+#[tokio::test]
+async fn window_inheritance_chain_resolves() {
+	// Multi-level: w3 aliases w2, which extends w1's PARTITION BY with an ORDER BY. The whole chain
+	// resolves to the inline `PARTITION BY grp ORDER BY score`.
+	let chained = run_window(
+		"SELECT grp, RANK() OVER w3 AS r FROM wins \
+		 WINDOW w1 AS (PARTITION BY grp), w2 AS (w1 ORDER BY score), w3 AS w2",
+	)
+	.await;
+	let inline =
+		run_window("SELECT grp, RANK() OVER (PARTITION BY grp ORDER BY score) AS r FROM wins")
+			.await;
+	assert_eq!(chained, inline, "a multi-level reference chain resolves");
+	assert_eq!(group_values(&chained, "a"), vec![1, 1, 3]);
+}
+
+#[tokio::test]
+async fn extension_cannot_override_partition_or_order() {
+	// PARTITION BY is inherited only, and the base's ORDER BY cannot be replaced.
+	for sql in [
+		"SELECT RANK() OVER (w PARTITION BY id) FROM wins WINDOW w AS (PARTITION BY grp ORDER BY score)",
+		"SELECT RANK() OVER (w ORDER BY id) FROM wins WINDOW w AS (PARTITION BY grp ORDER BY score)",
+	] {
+		assert!(SqlPlanner::new().plan(sql).is_err(), "must reject: {sql}");
+	}
+}
+
+#[tokio::test]
+async fn window_alias_to_framed_base_rejects() {
+	// A framed window may not be referenced — even by a pure alias (SQL §7.15).
+	let sql = "SELECT SUM(score) OVER w2 FROM wins \
+	           WINDOW w1 AS (PARTITION BY grp ORDER BY score ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+	           w2 AS w1";
+	assert!(
+		SqlPlanner::new().plan(sql).is_err(),
+		"alias to a framed base rejects"
+	);
+}
+
+#[tokio::test]
+async fn frame_on_referenced_window_rejects() {
+	// Extending a framed base rejects too — the no-frame-on-referenced-base rule covers both forms.
+	let sql = "SELECT SUM(score) OVER (w ORDER BY score) FROM wins \
+	           WINDOW w AS (PARTITION BY grp ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)";
+	assert!(
+		SqlPlanner::new().plan(sql).is_err(),
+		"extension over a framed base rejects"
+	);
+}
+
+#[tokio::test]
+async fn window_reference_cycle_rejects() {
+	// A cyclic definition terminates with an error instead of recursing forever.
+	for sql in [
+		"SELECT RANK() OVER a FROM wins WINDOW a AS b, b AS a",
+		"SELECT RANK() OVER a FROM wins WINDOW a AS (b ORDER BY score), b AS (a ORDER BY id)",
+	] {
+		assert!(
+			SqlPlanner::new().plan(sql).is_err(),
+			"cycle must reject: {sql}"
+		);
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use wendelon::schema::{
@@ -3485,20 +3486,12 @@ impl SqlPlanner {
 		if !sort_by.is_empty() {
 			return Err(unsupported("SORT BY is not supported"));
 		}
-		// ADR 250: collect the WINDOW clause definitions into a name -> spec map for `OVER w` resolution
-		// in lower_select_window. A definition that is itself a reference (`WINDOW w2 AS w1`) is window
-		// inheritance — a spec-merge mechanism, deferred.
+		// ADR 250/253: collect the WINDOW clause definitions into a name -> definition map for `OVER w`
+		// resolution in lower_select_window. The full `NamedWindowExpr` is stored so a definition that is
+		// itself a reference (`WINDOW w2 AS w1`, inheritance) resolves lazily through the 253 spec-merge.
 		let mut named_windows: NamedWindowMap = HashMap::new();
 		for NamedWindowDefinition(name, expr) in named_window {
-			let spec = match expr {
-				NamedWindowExpr::WindowSpec(spec) => spec,
-				NamedWindowExpr::NamedWindow(_) => {
-					return Err(unsupported(
-						"window inheritance (WINDOW w AS other_window) is not supported",
-					));
-				}
-			};
-			if named_windows.insert(name.value.clone(), spec).is_some() {
+			if named_windows.insert(name.value.clone(), expr).is_some() {
 				return Err(unsupported(format!(
 					"duplicate WINDOW definition '{}'",
 					name.value
@@ -3912,22 +3905,26 @@ impl SqlPlanner {
 		let Some(over) = &function.over else {
 			return Ok(None);
 		};
-		// ADR 250: `OVER w` resolves to the `WINDOW w AS (...)` definition; a resolved spec is then
-		// processed exactly like an inline one (it carries no further name).
-		let spec = match over {
-			WindowType::WindowSpec(spec) => spec,
-			WindowType::NamedWindow(name) => named_windows
-				.get(name.value.as_str())
-				.copied()
-				.ok_or_else(|| unsupported(format!("unknown named window '{}'", name.value)))?,
+		// ADR 250/253: resolve the OVER spec to a plain inline `WindowSpec` that is then processed exactly
+		// like a hand-written inline one. A bare inline spec borrows unchanged; `OVER w` resolves the named
+		// definition; `OVER (w ...)` merges the added clauses onto the resolved base (253 spec-merge).
+		let resolved: Cow<WindowSpec> = match over {
+			WindowType::WindowSpec(spec) if spec.window_name.is_none() => Cow::Borrowed(spec),
+			WindowType::WindowSpec(spec) => {
+				let base = spec
+					.window_name
+					.as_ref()
+					.expect("window_name is Some in this arm");
+				let base_spec = resolve_named_window(&base.value, named_windows, &mut Vec::new())?;
+				Cow::Owned(merge_window_specs(base_spec, spec)?)
+			}
+			WindowType::NamedWindow(name) => Cow::Owned(resolve_named_window(
+				&name.value,
+				named_windows,
+				&mut Vec::new(),
+			)?),
 		};
-		// The `OVER (w ...)` extension form (a named base merged with added clauses) is a spec-merge
-		// mechanism, deferred — only the bare `OVER w` reference resolves.
-		if spec.window_name.is_some() {
-			return Err(unsupported(
-				"window reference inside OVER (...) is not supported; use OVER <name>",
-			));
-		}
+		let spec = resolved.as_ref();
 		// ADR 241 ranking + ADR 242 aggregate windows. Ranking takes no arguments; aggregate windows
 		// reuse the ordinary aggregate lowering (COUNT(*)/COUNT(x)/SUM/MIN/MAX/AVG) over the SQL default
 		// frame. Explicit frames, DISTINCT, and experimental aggregates stay rejected.
@@ -7231,9 +7228,81 @@ struct WindowSpecGroup {
 	functions: Vec<WindowFunctionCall>,
 }
 
-/// ADR 250: `WINDOW w AS (...)` definitions in scope for a SELECT, keyed by window name, for
-/// resolving `OVER w` references. Window inheritance/extension is a spec-merge mechanism, deferred.
-type NamedWindowMap<'a> = HashMap<String, &'a WindowSpec>;
+/// ADR 250/253: `WINDOW w AS (...)` definitions in scope for a SELECT, keyed by window name, for
+/// resolving `OVER w` references. The full `NamedWindowExpr` is stored (not just the `WindowSpec`) so a
+/// definition that is itself a reference — `WINDOW w2 AS w1` — resolves lazily through the merge (253).
+type NamedWindowMap<'a> = HashMap<String, &'a NamedWindowExpr>;
+
+/// ADR 253: merge a named-window `reference` (which names `base` and adds clauses) onto its resolved
+/// `base` spec, producing a plain inline `WindowSpec` (`window_name = None`). The SQL §7.15 referencing
+/// rules: PARTITION BY is inherited and may not be re-added; ORDER BY is inherited and may not be
+/// replaced; a framed base may not be referenced at all (the referencing window may add a frame only
+/// when the base has none).
+fn merge_window_specs(
+	base: WindowSpec,
+	reference: &WindowSpec,
+) -> Result<WindowSpec, FrontendError> {
+	if !reference.partition_by.is_empty() {
+		return Err(unsupported("a window reference cannot add PARTITION BY"));
+	}
+	if base.window_frame.is_some() {
+		return Err(unsupported("the referenced window already defines a frame"));
+	}
+	let order_by = if reference.order_by.is_empty() {
+		base.order_by
+	} else if base.order_by.is_empty() {
+		reference.order_by.clone()
+	} else {
+		return Err(unsupported(
+			"a window reference cannot override the referenced window's ORDER BY",
+		));
+	};
+	Ok(WindowSpec {
+		window_name: None,
+		partition_by: base.partition_by,
+		order_by,
+		window_frame: reference.window_frame.clone(),
+	})
+}
+
+/// ADR 253: resolve a named-window reference to a plain inline `WindowSpec`, recursively merging the
+/// definition chain. `visiting` carries the names currently being resolved so a cycle
+/// (`WINDOW a AS b, b AS a`) rejects instead of recursing forever. A pure alias `WINDOW w2 AS w1`
+/// references `w1`, so a framed `w1` is rejected the same as an extension over a framed base.
+fn resolve_named_window(
+	name: &str,
+	named_windows: &NamedWindowMap<'_>,
+	visiting: &mut Vec<String>,
+) -> Result<WindowSpec, FrontendError> {
+	if visiting.iter().any(|seen| seen == name) {
+		return Err(unsupported(format!(
+			"window reference cycle involving '{name}'"
+		)));
+	}
+	let expr = named_windows
+		.get(name)
+		.copied()
+		.ok_or_else(|| unsupported(format!("unknown named window '{name}'")))?;
+	visiting.push(name.to_string());
+	let resolved = match expr {
+		NamedWindowExpr::WindowSpec(spec) => match &spec.window_name {
+			Some(base) => {
+				let base_spec = resolve_named_window(&base.value, named_windows, visiting)?;
+				merge_window_specs(base_spec, spec)?
+			}
+			None => spec.clone(),
+		},
+		NamedWindowExpr::NamedWindow(base) => {
+			let base_spec = resolve_named_window(&base.value, named_windows, visiting)?;
+			if base_spec.window_frame.is_some() {
+				return Err(unsupported("the referenced window already defines a frame"));
+			}
+			base_spec
+		}
+	};
+	visiting.pop();
+	Ok(resolved)
+}
 
 /// ADR 243: lower a sqlparser `ROWS BETWEEN …` frame to the IR `WindowFrame`. `RANGE`/`GROUPS` units stay
 /// rejected (→ ADR 244); the `end_bound = None` shorthand (`ROWS n PRECEDING`) means `… AND CURRENT ROW`.

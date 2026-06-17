@@ -146,8 +146,8 @@ pub(crate) fn adr250_named_window_resolves_in_lowering() {
 	let planner = source("src/sql_planner.rs");
 	let lower = source_block(&planner, "fn lower_select");
 	assert!(
-		lower.contains("NamedWindowMap") && lower.contains("NamedWindowExpr::WindowSpec"),
-		"lower_select builds the name->spec map from the WINDOW clause"
+		lower.contains("NamedWindowMap") && lower.contains("NamedWindowDefinition"),
+		"lower_select builds the name->definition map from the WINDOW clause"
 	);
 	assert!(
 		!lower.contains("WINDOW is not supported"),
@@ -155,7 +155,7 @@ pub(crate) fn adr250_named_window_resolves_in_lowering() {
 	);
 	let extract = source_block(&planner, "fn extract_window_call");
 	assert!(
-		extract.contains("WindowType::NamedWindow(name) => named_windows"),
+		extract.contains("WindowType::NamedWindow(name) => Cow::Owned(resolve_named_window"),
 		"OVER w resolves against the map, not a reject"
 	);
 	let tests = source("tests/window_test.rs");
@@ -955,23 +955,6 @@ pub(crate) fn adr250_named_windows_are_frontend_only() {
 	}
 }
 
-#[test]
-pub(crate) fn adr250_window_inheritance_and_extension_stay_rejected() {
-	let planner = source("src/sql_planner.rs");
-	let lower = source_block(&planner, "fn lower_select");
-	assert!(
-		lower.contains("window inheritance"),
-		"WINDOW w AS other_window (inheritance) rejects at map build"
-	);
-	let extract = source_block(&planner, "fn extract_window_call");
-	assert!(
-		extract.contains("window reference inside OVER (...) is not supported"),
-		"OVER (w ...) extension rejects"
-	);
-	let tests = source("tests/window_test.rs");
-	assert!(tests.contains("deferred_window_forms_stay_rejected"));
-}
-
 // ---------------------------------------------------------------------------
 // ADR 251 — Rune window builder
 // ---------------------------------------------------------------------------
@@ -1116,9 +1099,81 @@ pub(crate) fn adr252_rune_value_ignore_nulls_method() {
 }
 
 #[test]
-pub(crate) fn adr252_named_window_spec_merge_stays_deferred() {
-	// The 253 boundary: this cut is null-skipping only; inheritance/extension stay rejected.
+pub(crate) fn adr253_named_window_spec_merge_resolves_in_lowering() {
+	// 253 resolves named-window references (inheritance + extension) recursively and merges the allowed
+	// clauses into a plain inline spec; the 250 deferral rejects are gone.
 	let planner = source("src/sql_planner.rs");
-	assert!(planner.contains("window inheritance (WINDOW w AS other_window) is not supported"));
-	assert!(planner.contains("window reference inside OVER (...) is not supported"));
+	assert!(
+		planner.contains("fn resolve_named_window") && planner.contains("fn merge_window_specs"),
+		"the recursive resolver + merge live in the planner"
+	);
+	assert!(
+		planner.contains("type NamedWindowMap<'a> = HashMap<String, &'a NamedWindowExpr>"),
+		"the map stores the full definition so references resolve lazily"
+	);
+	assert!(
+		!planner.contains("window inheritance (WINDOW w AS other_window) is not supported")
+			&& !planner.contains("window reference inside OVER (...) is not supported"),
+		"the 250 inheritance/extension deferral rejects are gone"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(
+		tests.contains("over_extension_inherits_base_partition")
+			&& tests.contains("window_inheritance_alias_resolves")
+			&& tests.contains("window_inheritance_chain_resolves"),
+		"the resolution discriminators are pinned"
+	);
+}
+
+#[test]
+pub(crate) fn adr253_spec_merge_is_frontend_only() {
+	// The spec-merge is a pure frontend desugar — no IR / binder / executor / fragmenter surface.
+	assert!(
+		source("src/sql_planner.rs").contains("fn merge_window_specs"),
+		"the merge lives in the planner"
+	);
+	for path in [
+		"src/ir.rs",
+		"src/binder.rs",
+		"src/exec.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let src = source(path);
+		assert!(
+			!src.contains("merge_window_specs")
+				&& !src.contains("resolve_named_window")
+				&& !src.contains("NamedWindowExpr"),
+			"spec-merge must stay in lowering: {path}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr253_window_reference_merge_rules_enforced() {
+	// The three SQL §7.15 merge rules + cycle detection reject strings, and the reject discriminators.
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("a window reference cannot add PARTITION BY"));
+	assert!(
+		planner.contains("a window reference cannot override the referenced window's ORDER BY")
+	);
+	assert!(planner.contains("window reference cycle involving"));
+	let tests = source("tests/window_test.rs");
+	assert!(
+		tests.contains("extension_cannot_override_partition_or_order")
+			&& tests.contains("window_reference_cycle_rejects"),
+		"the merge-rule reject discriminators are pinned"
+	);
+}
+
+#[test]
+pub(crate) fn adr253_referenced_frame_blocks_merge() {
+	// A framed window may not be referenced — by alias or extension (SQL §7.15).
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("the referenced window already defines a frame"));
+	let tests = source("tests/window_test.rs");
+	assert!(
+		tests.contains("window_alias_to_framed_base_rejects")
+			&& tests.contains("frame_on_referenced_window_rejects"),
+		"both framed-base reject discriminators are pinned"
+	);
 }
