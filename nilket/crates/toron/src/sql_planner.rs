@@ -18,10 +18,11 @@ use sqlparser::ast::{
 	Delete, DescribeAlias, Distinct, DuplicateTreatment, ExactNumberInfo, Expr as SqlExpr,
 	FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
 	GroupByExpr, HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint,
-	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
-	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
-	SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor,
-	TableObject, TimezoneInfo, TypedString, UnaryOperator, Value, WindowSpec, WindowType,
+	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, NullTreatment, ObjectName,
+	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
+	Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
+	TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString, UnaryOperator, Value,
+	WindowSpec, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3856,6 +3857,7 @@ impl SqlPlanner {
 						output_name: internal_name,
 						args: window.args,
 						frame: window.frame,
+						ignore_nulls: window.ignore_nulls,
 					};
 					match groups.iter_mut().find(|group| {
 						window_specs_match(
@@ -4013,6 +4015,15 @@ impl SqlPlanner {
 		{
 			return Err(unsupported("LAG/LEAD require an ORDER BY"));
 		}
+		// ADR 252: IGNORE/RESPECT NULLS is a value-function modifier — reject it on ranking / aggregate /
+		// NTILE; for value functions, IGNORE NULLS sets `ignore_nulls` (RESPECT / absent = the default).
+		if function.null_treatment.is_some() && !matches!(window_function, WindowFunction::Value(_))
+		{
+			return Err(unsupported(
+				"IGNORE/RESPECT NULLS is supported only on LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE",
+			));
+		}
+		let ignore_nulls = matches!(function.null_treatment, Some(NullTreatment::IgnoreNulls));
 		let partition_by = spec
 			.partition_by
 			.iter()
@@ -4072,6 +4083,7 @@ impl SqlPlanner {
 			order_by,
 			args: window_args,
 			frame,
+			ignore_nulls,
 		}))
 	}
 
@@ -4095,11 +4107,8 @@ impl SqlPlanner {
 		} else {
 			return Ok(None);
 		};
-		if function.null_treatment.is_some() {
-			return Err(unsupported(
-				"IGNORE/RESPECT NULLS is not supported for window functions",
-			));
-		}
+		// ADR 252: IGNORE/RESPECT NULLS is accepted on value functions (mapped to `ignore_nulls` by the
+		// caller); only FILTER stays rejected here.
 		if function.filter.is_some() {
 			return Err(unsupported("FILTER is not supported for window functions"));
 		}
@@ -7210,6 +7219,7 @@ struct ExtractedWindow {
 	order_by: Vec<SortExpr>,
 	args: Vec<Expr>,
 	frame: Option<WindowFrame>,
+	ignore_nulls: bool,
 }
 
 /// ADR 248: window calls sharing one `(PARTITION BY, ORDER BY)` spec, collected into a single

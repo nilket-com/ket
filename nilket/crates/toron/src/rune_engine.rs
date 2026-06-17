@@ -1017,6 +1017,7 @@ fn window_call(function: WindowFunction, args: Vec<Expr>) -> WindowFunctionCall 
 		output_name,
 		args,
 		frame: None,
+		ignore_nulls: false,
 	}
 }
 
@@ -1219,6 +1220,18 @@ impl WindowFunctionCall {
 			}
 			_ => return VmResult::panic("default(..) applies only to lag/lead window calls"),
 		}
+		VmResult::Ok(self)
+	}
+
+	/// ADR 252: skip NULL values when navigating a value call — `lag(col, 1).ignore_nulls()`. Errors on
+	/// a non-value call (ranking / aggregate / NTILE do not take IGNORE NULLS).
+	pub fn ignore_nulls(mut self) -> VmResult<WindowFunctionCall> {
+		if !matches!(self.function, WindowFunction::Value(_)) {
+			return VmResult::panic(
+				"ignore_nulls applies only to lag/lead/first_value/last_value/nth_value",
+			);
+		}
+		self.ignore_nulls = true;
 		VmResult::Ok(self)
 	}
 }
@@ -1588,6 +1601,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("frame", WindowFunctionCall::frame)?;
 	m.associated_function("named", WindowFunctionCall::named)?;
 	m.associated_function("with_default", WindowFunctionCall::with_default)?;
+	m.associated_function("ignore_nulls", WindowFunctionCall::ignore_nulls)?;
 
 	// Expression methods
 	m.associated_function("asc", RuneExpr::asc)?;

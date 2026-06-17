@@ -924,6 +924,34 @@ async fn ntile_distributed_gate_is_value_discriminating() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ignore_nulls_distributed_gate_is_value_discriminating() {
+	// ADR 252 distributed gate (236/238). set_left: id=[1,2,3,4], set_key=[7,NULL,9,NULL], spread across
+	// both workers. LAG(set_key, 1, 0) IGNORE NULLS over the whole input (empty PARTITION BY -> gather to
+	// one partition): id 3 (set_key 9) skips id 2's NULL and returns id 1's 7 — which holds only once the
+	// gather co-locates ids 1,2,3 across both producers. A single producer reaching only its shard finds
+	// no prior non-NULL and returns the default 0.
+	let run = run_window_process_query(
+		1_446,
+		0,
+		"SELECT set_left.set_key, \
+		        LAG(set_left.set_key, 1, 0) IGNORE NULLS OVER (ORDER BY set_left.id) AS l \
+		 FROM set_left",
+	)
+	.await;
+
+	assert_eq!(
+		run.rows,
+		vec![(None, 7), (None, 9), (Some(7), 0), (Some(9), 7)],
+		"id 3 (set_key 9) skips id 2's NULL to id 1's 7; id 1 has no prior non-NULL -> default 0"
+	);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"id 3's IGNORE-NULLS LAG value 7 requires the gather to co-locate ids 1,2,3 (scan-shared across \
+		 both workers) and skip id 2's NULL; a single producer finds no prior non-NULL and returns 0",
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_distinct_dedups_across_partitions() {
 	let run = run_set_op_process_query(
 		1_390,

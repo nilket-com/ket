@@ -3904,6 +3904,7 @@ fn execute_window(
 					&partition_end,
 					rows,
 					output_type,
+					call.ignore_nulls,
 				)?;
 				columns.push(column);
 			}
@@ -4478,6 +4479,43 @@ fn value_frame_slices(
 /// (partition-clamped; out of partition → the constant default, else NULL); `FirstValue`/`LastValue`/
 /// `NthValue` take the value at the first/last/nth row of the per-row frame slice (NULL for an empty frame
 /// or an out-of-range `NthValue`). Assembled by a single `take` over a per-row target index.
+/// ADR 252: step `offset` NON-NULL rows from `row` toward the partition edge (back if `backward`),
+/// staying within `[lo, hi]`. Returns the offset-th non-NULL row, or `None` if fewer exist. Offset 0
+/// is the current row (the LAG/LEAD offset-0 case).
+fn nth_non_null_step(
+	values: &ArrayRef,
+	row: usize,
+	offset: usize,
+	backward: bool,
+	lo: usize,
+	hi: usize,
+) -> Option<usize> {
+	if offset == 0 {
+		return Some(row);
+	}
+	let mut i = row;
+	let mut count = 0;
+	loop {
+		if backward {
+			if i == lo {
+				return None;
+			}
+			i -= 1;
+		} else {
+			if i == hi {
+				return None;
+			}
+			i += 1;
+		}
+		if !values.is_null(i) {
+			count += 1;
+			if count == offset {
+				return Some(i);
+			}
+		}
+	}
+}
+
 fn execute_window_value(
 	value_fn: &ValueFunction,
 	sorted_value: &ArrayRef,
@@ -4488,22 +4526,37 @@ fn execute_window_value(
 	partition_end: &[usize],
 	rows: usize,
 	output_type: &arrow::datatypes::DataType,
+	ignore_nulls: bool,
 ) -> Result<ArrayRef, ExecutionError> {
 	let mut targets: Vec<Option<usize>> = Vec::with_capacity(rows);
 	match value_fn {
 		ValueFunction::Lag { offset, .. } | ValueFunction::Lead { offset, .. } => {
 			let is_lag = matches!(value_fn, ValueFunction::Lag { .. });
+			let offset_steps = *offset as usize;
 			let offset = i64::try_from(*offset).unwrap_or(i64::MAX);
 			for row in 0..rows {
-				let target = if is_lag {
-					(row as i64).checked_sub(offset)
+				let target = if ignore_nulls {
+					// ADR 252: step `offset` NON-NULL rows toward the partition edge.
+					nth_non_null_step(
+						sorted_value,
+						row,
+						offset_steps,
+						is_lag,
+						partition_start[row],
+						partition_end[row],
+					)
 				} else {
-					(row as i64).checked_add(offset)
+					let t = if is_lag {
+						(row as i64).checked_sub(offset)
+					} else {
+						(row as i64).checked_add(offset)
+					};
+					t.filter(|t| {
+						*t >= partition_start[row] as i64 && *t <= partition_end[row] as i64
+					})
+					.map(|t| t as usize)
 				};
-				let in_partition = target.is_some_and(|t| {
-					t >= partition_start[row] as i64 && t <= partition_end[row] as i64
-				});
-				targets.push(in_partition.then(|| target.expect("checked above") as usize));
+				targets.push(target);
 			}
 		}
 		ValueFunction::FirstValue | ValueFunction::LastValue | ValueFunction::NthValue { .. } => {
@@ -4516,14 +4569,32 @@ fn execute_window_value(
 				rows,
 			)?;
 			for slice in &slices {
-				targets.push(slice.and_then(|(lo, hi)| match value_fn {
-					ValueFunction::FirstValue => Some(lo),
-					ValueFunction::LastValue => Some(hi),
-					ValueFunction::NthValue { n } => {
-						let idx = lo + (*n as usize) - 1;
-						(idx <= hi).then_some(idx)
+				targets.push(slice.and_then(|(lo, hi)| {
+					if ignore_nulls {
+						// ADR 252: first / last / n-th NON-NULL row in the frame slice.
+						match value_fn {
+							ValueFunction::FirstValue => {
+								(lo..=hi).find(|&i| !sorted_value.is_null(i))
+							}
+							ValueFunction::LastValue => {
+								(lo..=hi).rev().find(|&i| !sorted_value.is_null(i))
+							}
+							ValueFunction::NthValue { n } => (lo..=hi)
+								.filter(|&i| !sorted_value.is_null(i))
+								.nth((*n as usize).saturating_sub(1)),
+							_ => None,
+						}
+					} else {
+						match value_fn {
+							ValueFunction::FirstValue => Some(lo),
+							ValueFunction::LastValue => Some(hi),
+							ValueFunction::NthValue { n } => {
+								let idx = lo + (*n as usize) - 1;
+								(idx <= hi).then_some(idx)
+							}
+							_ => None,
+						}
 					}
-					_ => None,
 				}));
 			}
 		}

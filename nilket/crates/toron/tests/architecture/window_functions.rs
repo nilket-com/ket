@@ -1053,3 +1053,72 @@ pub(crate) fn adr251_rune_window_reuses_ir_types_no_new_surface() {
 		);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR 252 — IGNORE / RESPECT NULLS (value functions)
+// ---------------------------------------------------------------------------
+
+#[test]
+pub(crate) fn adr252_window_call_carries_ignore_nulls() {
+	let ir = source("src/ir.rs");
+	let execution = source("src/ir/execution.rs");
+	assert!(
+		source_block(&ir, "pub struct WindowFunctionCall").contains("ignore_nulls: bool"),
+		"WindowFunctionCall carries ignore_nulls"
+	);
+	assert!(
+		source_block(&execution, "pub struct BoundWindowCall").contains("ignore_nulls: bool"),
+		"BoundWindowCall carries ignore_nulls"
+	);
+}
+
+#[test]
+pub(crate) fn adr252_value_executor_skips_nulls_under_ignore() {
+	let exec = source("src/exec.rs");
+	let value_fn = source_block(&exec, "fn execute_window_value");
+	assert!(
+		value_fn.contains("ignore_nulls"),
+		"the value executor consults ignore_nulls"
+	);
+	assert!(
+		value_fn.contains("nth_non_null_step") && value_fn.contains("is_null"),
+		"IGNORE NULLS navigation skips is_null rows (LAG/LEAD step + FIRST/LAST/NTH scan)"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(tests.contains("lag_ignore_nulls_skips_null_rows"));
+}
+
+#[test]
+pub(crate) fn adr252_ignore_nulls_scoped_to_value_functions() {
+	let planner = source("src/sql_planner.rs");
+	let extract = source_block(&planner, "fn extract_window_call");
+	assert!(
+		extract.contains("IGNORE/RESPECT NULLS is supported only on"),
+		"IGNORE/RESPECT NULLS rejects on ranking / aggregate / NTILE"
+	);
+	let tests = source("tests/window_test.rs");
+	assert!(
+		tests.contains("RANK() IGNORE NULLS"),
+		"deferred_window_forms_stay_rejected pins the non-value rejects"
+	);
+}
+
+#[test]
+pub(crate) fn adr252_rune_value_ignore_nulls_method() {
+	let rune = source("src/rune_engine.rs");
+	assert!(rune.contains("pub fn ignore_nulls"));
+	assert!(
+		rune.contains("m.associated_function(\"ignore_nulls\", WindowFunctionCall::ignore_nulls)"),
+		"the Rune ignore_nulls method is registered"
+	);
+	let tests = source("tests/rune_window_test.rs");
+	assert!(tests.contains("rune_value_ignore_nulls_matches_sql"));
+}
+
+#[test]
+pub(crate) fn adr252_named_window_spec_merge_stays_deferred() {
+	// The 253 boundary: this cut is null-skipping only; inheritance/extension stay rejected.
+	let planner = source("src/sql_planner.rs");
+	assert!(planner.contains("window inheritance (WINDOW w AS other_window) is not supported"));
+	assert!(planner.contains("window reference inside OVER (...) is not supported"));
+}

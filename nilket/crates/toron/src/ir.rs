@@ -961,6 +961,9 @@ pub struct WindowFunctionCall {
 	pub output_name: String,
 	pub args: Vec<Expr>,
 	pub frame: Option<WindowFrame>,
+	/// ADR 252: `IGNORE NULLS` skips NULL values when navigating; `false` = `RESPECT NULLS` (the
+	/// default, today's behavior). Only meaningful for value functions (ADR 246).
+	pub ignore_nulls: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

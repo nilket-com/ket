@@ -471,3 +471,60 @@ async fn rune_temporal_range_offset_matches_sql_frame() {
 		"the Rune offset reached the IR as an INTERVAL value distance"
 	);
 }
+
+// ---------------------------------------------------------------------------
+// ADR 252 — IGNORE / RESPECT NULLS (value functions)
+// ---------------------------------------------------------------------------
+
+fn first_window_ignore_nulls(plan: &LogicalPlan) -> Option<bool> {
+	match plan {
+		LogicalPlan::Window { functions, .. } => functions.first().map(|call| call.ignore_nulls),
+		LogicalPlan::Project { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Distinct { input } => first_window_ignore_nulls(input),
+		_ => None,
+	}
+}
+
+#[tokio::test]
+async fn rune_value_ignore_nulls_matches_sql() {
+	// `lag(col, 1).ignore_nulls()` sets the same IR flag as SQL `LAG(...) IGNORE NULLS`.
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("wins")
+                .window([], [col("id").asc()], [lag(col("score"), 1).ignore_nulls().named("l")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune ignore_nulls window");
+	let sql = sql_plan("SELECT LAG(score, 1) IGNORE NULLS OVER (ORDER BY id) AS l FROM wins").await;
+	assert_eq!(
+		first_window_ignore_nulls(&rune),
+		Some(true),
+		"Rune .ignore_nulls() sets the flag"
+	);
+	assert_eq!(
+		first_window_ignore_nulls(&rune),
+		first_window_ignore_nulls(&sql),
+		"Rune ignore_nulls flag matches SQL IGNORE NULLS"
+	);
+}
+
+#[tokio::test]
+async fn rune_ignore_nulls_rejects_non_value() {
+	// ignore_nulls() on a ranking call errors (value-only).
+	let err = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("wins").window([], [col("id").asc()], [rank().ignore_nulls().named("r")])
+        }
+    "#,
+	)
+	.await;
+	assert!(err.is_err(), "ignore_nulls on rank() must reject");
+}

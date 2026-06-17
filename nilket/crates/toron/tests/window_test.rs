@@ -161,8 +161,10 @@ async fn deferred_window_forms_stay_rejected() {
 		"SELECT NTILE(score) OVER (ORDER BY score) FROM wins",
 		// LAG without ORDER BY (positional navigation needs an order)
 		"SELECT LAG(score) OVER (PARTITION BY grp) FROM wins",
-		// IGNORE NULLS on a value function (deferred)
-		"SELECT LAG(score) IGNORE NULLS OVER (ORDER BY id) FROM wins",
+		// ADR 252: IGNORE/RESPECT NULLS is value-only — rejected on ranking / aggregate / NTILE
+		"SELECT RANK() IGNORE NULLS OVER (ORDER BY score) FROM wins",
+		"SELECT SUM(score) IGNORE NULLS OVER (PARTITION BY grp) FROM wins",
+		"SELECT NTILE(2) IGNORE NULLS OVER (ORDER BY score) FROM wins",
 		// DISTINCT window aggregate
 		"SELECT SUM(DISTINCT score) OVER (PARTITION BY grp) FROM wins",
 		// experimental window aggregate
@@ -1239,6 +1241,76 @@ async fn unknown_named_window_rejects() {
 			.is_err(),
 		"OVER w with no WINDOW clause rejects"
 	);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 252 — IGNORE / RESPECT NULLS (value functions)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lag_ignore_nulls_skips_null_rows() {
+	// v = [10, NULL, 20, 5, 5] (id 2 nulled). At id 3, LAG(v, 1) IGNORE NULLS skips id 2's NULL and
+	// returns id 1's 10; RESPECT NULLS sees the physical prior (id 2) -> NULL. They differ at id 3.
+	let value = "CASE WHEN id = 2 THEN NULL ELSE score END";
+	let ignore = run_wins_window_opt_i64(&format!(
+		"SELECT grp, LAG({value}, 1) IGNORE NULLS OVER (ORDER BY id) AS l FROM wins"
+	))
+	.await;
+	let respect = run_wins_window_opt_i64(&format!(
+		"SELECT grp, LAG({value}, 1) OVER (ORDER BY id) AS l FROM wins"
+	))
+	.await;
+	let vals =
+		|rows: &[(Option<String>, Option<i64>)]| rows.iter().map(|(_, v)| *v).collect::<Vec<_>>();
+	assert_eq!(
+		vals(&ignore),
+		vec![None, Some(10), Some(10), Some(20), Some(5)],
+		"LAG IGNORE NULLS skips the NULL at id 2"
+	);
+	assert_eq!(
+		vals(&respect),
+		vec![None, Some(10), None, Some(20), Some(5)],
+		"LAG RESPECT NULLS returns the physical prior (NULL at id 3)"
+	);
+	assert_ne!(vals(&ignore), vals(&respect));
+}
+
+#[tokio::test]
+async fn last_value_ignore_nulls_skips_trailing_nulls() {
+	// v = [10, 10, 20, NULL, NULL] (ids 4,5 nulled). LAST_VALUE over the whole partition: IGNORE NULLS
+	// returns the last non-NULL (20); RESPECT NULLS returns the physical last row's value (NULL).
+	let value = "CASE WHEN id >= 4 THEN NULL ELSE score END";
+	let ignore = run_wins_window_opt_i64(&format!(
+		"SELECT grp, LAST_VALUE({value}) IGNORE NULLS \
+		 OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM wins"
+	))
+	.await;
+	let respect = run_wins_window_opt_i64(&format!(
+		"SELECT grp, LAST_VALUE({value}) \
+		 OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM wins"
+	))
+	.await;
+	assert!(
+		ignore.iter().all(|(_, v)| *v == Some(20)),
+		"LAST_VALUE IGNORE NULLS -> last non-null 20"
+	);
+	assert!(
+		respect.iter().all(|(_, v)| v.is_none()),
+		"LAST_VALUE RESPECT NULLS -> the physical last row is NULL"
+	);
+}
+
+#[tokio::test]
+async fn respect_nulls_is_default_unchanged() {
+	// Explicit RESPECT NULLS is the default no-op — identical to omitting the modifier (the 246 path).
+	let respect = run_wins_window_opt_i64(
+		"SELECT grp, LAG(score, 1) RESPECT NULLS OVER (ORDER BY id) AS l FROM wins",
+	)
+	.await;
+	let default =
+		run_wins_window_opt_i64("SELECT grp, LAG(score, 1) OVER (ORDER BY id) AS l FROM wins")
+			.await;
+	assert_eq!(respect, default, "RESPECT NULLS == the default behavior");
 }
 
 // ---------------------------------------------------------------------------

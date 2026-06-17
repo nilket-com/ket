@@ -159,6 +159,9 @@ pub struct BoundWindowCall {
 	pub function: WindowFunction,
 	pub arg: Option<BoundExprProgram>,
 	pub frame: Option<WindowFrame>,
+	/// ADR 252: `IGNORE NULLS` skips NULL values when navigating value functions; `false` = `RESPECT
+	/// NULLS` (default). Carried from `WindowFunctionCall`.
+	pub ignore_nulls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

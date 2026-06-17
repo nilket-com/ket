@@ -1398,6 +1398,7 @@ impl<'a> Binder<'a> {
 							function: call.function.clone(),
 							arg,
 							frame: call.frame.clone(),
+							ignore_nulls: call.ignore_nulls,
 						});
 					}
 					let output_schema = Arc::new(Schema::new(fields));
