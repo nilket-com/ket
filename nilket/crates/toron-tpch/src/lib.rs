@@ -331,10 +331,10 @@ pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 262 — Strict Q6: the official-*typed* `Decimal128(15,2)` fixture + Q6 shape, recording the first
-/// phase it blocks. Grounded result: `phase=bind reason=unsupported_decimal_scalar` (decimal literals
-/// lower to `Float64`, mismatching the `Decimal128` column at bind). "strict" here = official physical
-/// types + shape, NOT official provenance or answer correctness — NOT a TPC-H result.
+/// ADR 263 — Strict Q6: the official-*typed* `Decimal128(15,2)` fixture + Q6 shape. Grounded result:
+/// `phase=execute status=pass` — the Decimal ScalarValue slice coerces the comparison literals at bind,
+/// widens `*` to `Decimal128(31,4)`, and carries `SUM` through. "strict" here = official physical types
+/// + shape reaching execute, NOT official provenance or answer correctness — NOT a TPC-H result.
 pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
 	let schema = strict_lineitem_schema();
 	run_q6(

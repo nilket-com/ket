@@ -22,7 +22,7 @@ use crate::ir::{
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
 	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
 	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
 	IntervalYearMonthArray, IntervalYearMonthBuilder, StringArray, StringBuilder,
@@ -1009,6 +1009,17 @@ impl Executor {
 						])))
 					}
 					ScalarValue::Float64(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
+					ScalarValue::Decimal128 {
+						value,
+						precision,
+						scale,
+					} => Ok(Arc::new(
+						Decimal128Array::from(vec![*value; num_rows])
+							.with_precision_and_scale(*precision, *scale)
+							.map_err(|error| ExecutionError::Kernel {
+								message: error.to_string(),
+							})?,
+					)),
 					ScalarValue::Utf8(v) => Ok(Arc::new(StringArray::from(vec![
 						v.clone()
 							.as_deref();
@@ -1313,7 +1324,7 @@ impl Executor {
 							message: format!("literal slot {literal} out of bounds"),
 						}
 					})?;
-					literal_array(value, batch.num_rows())
+					literal_array(value, batch.num_rows())?
 				}
 				BoundExprNode::NullLiteral => {
 					arrow::array::new_null_array(&DataType::Null, batch.num_rows())
@@ -1937,8 +1948,8 @@ fn evaluated_child(
 		})
 }
 
-fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
-	match value {
+fn literal_array(value: &ScalarValue, num_rows: usize) -> Result<ArrayRef, ExecutionError> {
+	Ok(match value {
 		ScalarValue::Boolean(value) => Arc::new(BooleanArray::from(vec![*value; num_rows])),
 		ScalarValue::Int32(value) => Arc::new(Int32Array::from(vec![*value; num_rows])),
 		ScalarValue::Int64(value) => Arc::new(Int64Array::from(vec![*value; num_rows])),
@@ -1952,10 +1963,21 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		}
 		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
+		ScalarValue::Decimal128 {
+			value,
+			precision,
+			scale,
+		} => Arc::new(
+			Decimal128Array::from(vec![*value; num_rows])
+				.with_precision_and_scale(*precision, *scale)
+				.map_err(|error| ExecutionError::Kernel {
+					message: error.to_string(),
+				})?,
+		),
 		ScalarValue::Utf8(value) => {
 			Arc::new(StringArray::from(vec![value.clone().as_deref(); num_rows]))
 		}
-	}
+	})
 }
 
 fn timestamp_literal_array(value: &Option<i64>, unit: TimeUnit, num_rows: usize) -> ArrayRef {
@@ -2440,6 +2462,16 @@ fn evaluate_bound_binary(
 			if let Some(result) = evaluate_temporal_arithmetic(arithmetic_op, left_arr, right_arr)?
 			{
 				return Ok(result);
+			}
+			// ADR 263: Decimal128 * Decimal128 — Arrow's numeric `mul` widens to
+			// `Decimal128(p1+p2+1, s1+s2)`, matching the binder's bound output type (the operands keep
+			// their own (p,s), so this bypasses `evaluate_arithmetic`'s operands-equal-output path). Q6
+			// slice: only `*`.
+			if matches!(arithmetic_op, ArithmeticOp::Mul)
+				&& matches!(left_arr.data_type(), DataType::Decimal128(_, _))
+				&& matches!(right_arr.data_type(), DataType::Decimal128(_, _))
+			{
+				return Ok(arrow::compute::kernels::numeric::mul(left_arr, right_arr)?);
 			}
 			let left_type =
 				program
@@ -4430,7 +4462,7 @@ fn range_bound_value_rows(
 	} else {
 		ArithmeticOp::Sub
 	};
-	let offset_array = literal_array(offset, key.len());
+	let offset_array = literal_array(offset, key.len())?;
 	let bound_values = evaluate_unbound_arithmetic(op, key.clone(), offset_array)?;
 	Ok(Some(
 		converter.convert_columns(std::slice::from_ref(&bound_values))?,
@@ -4853,7 +4885,7 @@ fn execute_window_value(
 	};
 	match default {
 		Some(default) => {
-			let default_array = literal_array(default, rows);
+			let default_array = literal_array(default, rows)?;
 			let default_array = if default_array.data_type() == output_type {
 				default_array
 			} else {
@@ -6212,6 +6244,16 @@ fn sum_state_array(state: &AggState, data_type: &DataType) -> Result<ArrayRef, E
 		(AggState::SumInt { total, seen }, DataType::Float64) => {
 			Ok(Arc::new(Float64Array::from(vec![seen.then_some(*total as f64)])) as ArrayRef)
 		}
+		// ADR 263: SUM(Decimal128) finalizes the i128 accumulator back to the column's (precision,
+		// scale) (Q6 slice — global aggregate, no GROUP BY).
+		(AggState::SumInt { total, seen }, DataType::Decimal128(precision, scale)) => Ok(Arc::new(
+			Decimal128Array::from(vec![seen.then_some(*total)])
+				.with_precision_and_scale(*precision, *scale)
+				.map_err(|error| ExecutionError::Kernel {
+					message: error.to_string(),
+				})?,
+		)
+			as ArrayRef),
 		(other, data_type) => Err(ExecutionError::InvalidExpression {
 			message: format!("cannot materialize {other:?} as SUM output {data_type:?}"),
 		}),
@@ -6275,6 +6317,36 @@ fn sum_column_from_groups(
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+		// ADR 263: grouped SUM(Decimal128) mirrors the global finalize — the per-group i128 `SumInt`
+		// accumulator carries the raw running sum at the column's shared scale. Keeps bind and execute
+		// in lockstep (the SUM-Decimal domain accepts Decimal128 at bind, so execute must too).
+		DataType::Decimal128(precision, scale) => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::SumInt { total, seen } => seen.then_some(total),
+					AggState::SumFloat { .. }
+					| AggState::Count(_)
+					| AggState::MinInt32 { .. }
+					| AggState::MinInt64 { .. }
+					| AggState::MinFloat32 { .. }
+					| AggState::MinFloat64 { .. }
+					| AggState::MaxInt32 { .. }
+					| AggState::MaxInt64 { .. }
+					| AggState::MaxFloat32 { .. }
+					| AggState::MaxFloat64 { .. }
+					| AggState::AvgInt { .. }
+					| AggState::AvgFloat { .. } => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::Kernel {
+						message: error.to_string(),
+					})?,
+			) as ArrayRef)
 		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported SUM output type: {data_type:?}"),
@@ -6418,6 +6490,11 @@ fn numeric_value(array: &ArrayRef, row: usize) -> Result<Option<NumericValue>, E
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
 		return Ok(Some(NumericValue::Float(array.value(row))));
+	}
+	// ADR 263: a Decimal128 value enters the i128 accumulator as its raw (unscaled) integer; the
+	// SUM finalize re-applies the column's (precision, scale). (Q6 slice: SUM over Decimal.)
+	if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
+		return Ok(Some(NumericValue::Int(array.value(row))));
 	}
 	Err(ExecutionError::InvalidExpression {
 		message: format!(

@@ -5292,8 +5292,137 @@ fn coerce_literal_value(
 				unit: *unit,
 			}
 		}
+		// ADR 263: coerce an Int/Float/Decimal literal to a Decimal column's exact `(p,s)` so the
+		// comparison's operands match (Arrow cmp requires identical precision/scale). Approach 1 — the
+		// literal is rewritten in place (no Cast node); Float→Decimal rounds (a known reachability
+		// simplification, not answer-exactness).
+		(ScalarValue::Int32(value), DataType::Decimal128(precision, scale)) => {
+			decimal_literal_from_i128(value.map(i128::from), *precision, *scale)?
+		}
+		(ScalarValue::Int64(value), DataType::Decimal128(precision, scale)) => {
+			decimal_literal_from_i128(value.map(i128::from), *precision, *scale)?
+		}
+		(ScalarValue::Float32(value), DataType::Decimal128(precision, scale)) => {
+			decimal_literal_from_f64(value.map(f64::from), *precision, *scale)?
+		}
+		(ScalarValue::Float64(value), DataType::Decimal128(precision, scale)) => {
+			decimal_literal_from_f64(value, *precision, *scale)?
+		}
+		(
+			ScalarValue::Decimal128 {
+				value,
+				scale: from_scale,
+				..
+			},
+			DataType::Decimal128(precision, scale),
+		) => decimal_rescale(value, from_scale, *precision, *scale)?,
 		(value, _) => value,
 	})
+}
+
+/// ADR 263: the `10^scale` factor for a `Decimal128(_, scale)` literal. Rejects negative scale (out of
+/// the Q6 slice) and any factor that would overflow `i128` — a clean bind error, never a panic.
+fn decimal_scale_factor(precision: u8, scale: i8) -> Result<i128, BindingError> {
+	let exponent = u32::try_from(scale).map_err(|_| decimal_out_of_range(precision, scale))?;
+	10i128
+		.checked_pow(exponent)
+		.ok_or_else(|| decimal_out_of_range(precision, scale))
+}
+
+/// ADR 263: a clean bind error for a literal that does not fit a `Decimal128(precision, scale)`.
+fn decimal_out_of_range(precision: u8, scale: i8) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!("literal does not fit Decimal128({precision}, {scale})"),
+	}
+}
+
+/// ADR 263: wrap a raw `i128` into a `Decimal128(precision, scale)` literal, validating it fits the
+/// declared precision (`|raw| < 10^precision`) so an oversized literal is a clean bind error rather than
+/// a wrong value or a downstream panic at execute.
+fn decimal_literal_checked(
+	value: Option<i128>,
+	precision: u8,
+	scale: i8,
+) -> Result<ScalarValue, BindingError> {
+	if let Some(raw) = value {
+		let bound = 10i128
+			.checked_pow(u32::from(precision))
+			.ok_or_else(|| decimal_out_of_range(precision, scale))?;
+		if raw <= -bound || raw >= bound {
+			return Err(decimal_out_of_range(precision, scale));
+		}
+	}
+	Ok(ScalarValue::Decimal128 {
+		value,
+		precision,
+		scale,
+	})
+}
+
+/// ADR 263: an integer literal as a `Decimal128(precision, scale)` (value scaled by `10^scale`).
+fn decimal_literal_from_i128(
+	value: Option<i128>,
+	precision: u8,
+	scale: i8,
+) -> Result<ScalarValue, BindingError> {
+	let factor = decimal_scale_factor(precision, scale)?;
+	let value = value
+		.map(|value| {
+			value
+				.checked_mul(factor)
+				.ok_or_else(|| decimal_out_of_range(precision, scale))
+		})
+		.transpose()?;
+	decimal_literal_checked(value, precision, scale)
+}
+
+/// ADR 263: a float literal as a `Decimal128(precision, scale)`, rounding at the target scale. Non-finite
+/// floats and out-of-range magnitudes reject at bind. Float→Decimal rounding is a known reachability
+/// simplification, not answer-exactness.
+fn decimal_literal_from_f64(
+	value: Option<f64>,
+	precision: u8,
+	scale: i8,
+) -> Result<ScalarValue, BindingError> {
+	let factor = decimal_scale_factor(precision, scale)? as f64;
+	let value = value
+		.map(|value| {
+			if !value.is_finite() {
+				return Err(decimal_out_of_range(precision, scale));
+			}
+			let scaled = (value * factor).round();
+			if scaled < i128::MIN as f64 || scaled > i128::MAX as f64 {
+				return Err(decimal_out_of_range(precision, scale));
+			}
+			Ok(scaled as i128)
+		})
+		.transpose()?;
+	decimal_literal_checked(value, precision, scale)
+}
+
+/// ADR 263: rescale a `Decimal128` literal from `from_scale` to `(precision, scale)`.
+fn decimal_rescale(
+	value: Option<i128>,
+	from_scale: i8,
+	precision: u8,
+	scale: i8,
+) -> Result<ScalarValue, BindingError> {
+	let diff = i32::from(scale) - i32::from(from_scale);
+	let value = value
+		.map(|value| {
+			let factor = 10i128
+				.checked_pow(diff.unsigned_abs())
+				.ok_or_else(|| decimal_out_of_range(precision, scale))?;
+			if diff >= 0 {
+				value
+					.checked_mul(factor)
+					.ok_or_else(|| decimal_out_of_range(precision, scale))
+			} else {
+				Ok(value / factor)
+			}
+		})
+		.transpose()?;
+	decimal_literal_checked(value, precision, scale)
 }
 
 fn parse_timestamp_text_for_bind(

@@ -7646,6 +7646,16 @@ fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
 			9u8.hash(state);
 			value.hash(state);
 		}
+		ScalarValue::Decimal128 {
+			value,
+			precision,
+			scale,
+		} => {
+			10u8.hash(state);
+			precision.hash(state);
+			scale.hash(state);
+			value.hash(state);
+		}
 	}
 }
 

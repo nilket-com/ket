@@ -1120,6 +1120,17 @@ pub(super) fn bind_arithmetic(
 	{
 		return Ok(output);
 	}
+	// ADR 263: Decimal128 * Decimal128 -> Decimal128(p1+p2+1, s1+s2) (the SQL mul rule). Operands keep
+	// their own (p,s); the executor routes to Arrow `numeric::mul`, which widens. Q6 slice — only `*`;
+	// decimal +/-/÷ fall through to the unsupported error below until a query needs them.
+	if op == BoundBinaryOp::Mul
+		&& let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
+			(&left_type, &right_type)
+	{
+		let precision = (p1 + p2 + 1).min(38);
+		let scale = s1 + s2;
+		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, scale)));
+	}
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {

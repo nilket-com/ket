@@ -1316,6 +1316,7 @@ fn scalar_value_is_null(value: &ScalarValue) -> bool {
 		ScalarValue::CalendarMonthInterval(value) => value.is_none(),
 		ScalarValue::Float32(value) => value.is_none(),
 		ScalarValue::Float64(value) => value.is_none(),
+		ScalarValue::Decimal128 { value, .. } => value.is_none(),
 		ScalarValue::Utf8(value) => value.is_none(),
 	}
 }

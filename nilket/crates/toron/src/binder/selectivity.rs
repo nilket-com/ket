@@ -2091,6 +2091,7 @@ pub(super) fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::CalendarMonthInterval(value) => value.is_some(),
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
+		ScalarValue::Decimal128 { value, .. } => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
 	}
 }

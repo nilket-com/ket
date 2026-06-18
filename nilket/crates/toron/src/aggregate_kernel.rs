@@ -211,6 +211,8 @@ fn sum_numeric_output(input: &DataType) -> Option<DataType> {
 		| DataType::UInt32
 		| DataType::UInt64 => Some(DataType::Int64),
 		DataType::Float32 | DataType::Float64 => Some(DataType::Float64),
+		// ADR 263: SUM(Decimal128(p,s)) -> Decimal128(p,s) (the sum carries the input type).
+		DataType::Decimal128(precision, scale) => Some(DataType::Decimal128(*precision, *scale)),
 		_ => None,
 	}
 }

@@ -459,11 +459,20 @@ pub enum ScalarValue {
 	Int32(Option<i32>),
 	Int64(Option<i64>),
 	Date32(Option<i32>),
-	Timestamp { value: Option<i64>, unit: TimeUnit },
+	Timestamp {
+		value: Option<i64>,
+		unit: TimeUnit,
+	},
 	Interval(Option<i64>),
 	CalendarMonthInterval(Option<i32>),
 	Float32(Option<f32>),
 	Float64(Option<f64>),
+	/// ADR 263: a fixed-point decimal mirroring Arrow `Decimal128(precision, scale)` (`i128` storage).
+	Decimal128 {
+		value: Option<i128>,
+		precision: u8,
+		scale: i8,
+	},
 	Utf8(Option<String>),
 }
 
@@ -496,6 +505,9 @@ impl ScalarValue {
 			Self::CalendarMonthInterval(_) => calendar_month_interval_data_type(),
 			Self::Float32(_) => DataType::Float32,
 			Self::Float64(_) => DataType::Float64,
+			Self::Decimal128 {
+				precision, scale, ..
+			} => DataType::Decimal128(*precision, *scale),
 			Self::Utf8(_) => DataType::Utf8,
 		}
 	}
@@ -567,6 +579,11 @@ pub fn scalar_literal_key(value: &ScalarValue) -> ScalarLiteralKeyClassification
 			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Utf8(value.clone()))
 		}
 		ScalarValue::Utf8(None) => ScalarLiteralKeyClassification::Null,
+		// ADR 263: Decimal in GROUP BY / join keys is out of the Q6 slice — keep it unsupported.
+		ScalarValue::Decimal128 { value: Some(_), .. } => {
+			ScalarLiteralKeyClassification::Unsupported
+		}
+		ScalarValue::Decimal128 { value: None, .. } => ScalarLiteralKeyClassification::Null,
 	}
 }
 
@@ -601,6 +618,29 @@ impl fmt::Display for ScalarValue {
 			Self::Float32(None) => f.write_str("NULL"),
 			Self::Float64(Some(value)) => write!(f, "{value}"),
 			Self::Float64(None) => f.write_str("NULL"),
+			Self::Decimal128 {
+				value: Some(value),
+				scale,
+				..
+			} => {
+				let scale = *scale;
+				if scale <= 0 {
+					write!(f, "{value}e{}", -i32::from(scale))
+				} else {
+					let scale = scale as u32;
+					let divisor = 10u128.pow(scale);
+					let sign = if *value < 0 { "-" } else { "" };
+					let abs = value.unsigned_abs();
+					write!(
+						f,
+						"{sign}{}.{:0width$}",
+						abs / divisor,
+						abs % divisor,
+						width = scale as usize
+					)
+				}
+			}
+			Self::Decimal128 { value: None, .. } => f.write_str("NULL"),
 			Self::Utf8(Some(value)) => f.write_str(value),
 			Self::Utf8(None) => f.write_str("NULL"),
 		}

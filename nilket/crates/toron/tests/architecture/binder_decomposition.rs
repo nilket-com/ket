@@ -149,10 +149,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	let lines = binder_root_source().lines().count();
 	// The post-ADR176 target tracks legitimate IR growth; ADR 241 added the `Window` bind + prune arms,
 	// ADR 246 the `WindowFunction::Value` bind arm, ADR 255 the `RecursiveCte`/`RecursiveRef` bind arms
-	// plus the `bind_recursive_cte` helper and the `recursive_ctx` threading through the dispatch.
+	// plus the `bind_recursive_cte` helper and the `recursive_ctx` threading through the dispatch; ADR
+	// 263 added the `ScalarValue::Decimal128` literal coercion arms + the decimal-literal helpers.
 	assert!(
-		lines <= 5_500,
-		"binder root has {lines} lines; expected <= 5,500 (bounded; bump only for real new IR nodes)"
+		lines <= 5_600,
+		"binder root has {lines} lines; expected <= 5,600 (bounded; bump only for real new IR nodes)"
 	);
 }
 
@@ -178,6 +179,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 			let later_adr_test_and_runtime_surfaces = [
 				"crates/toron/benches/distributed_inner_equi_join.rs",
 				"crates/toron/benches/storage_execution.rs",
+				"crates/toron/src/aggregate_kernel.rs",
 				"crates/toron/src/audit.rs",
 				"crates/toron/src/bin/toron_fixture_worker.rs",
 				"crates/toron/src/coordinator.rs",

@@ -103,9 +103,9 @@ fn adr262_strict_q6_attempts_decimal128_compute() {
 	);
 	let probe = source("tests/decimal_probe.rs");
 	assert!(
-		probe.contains("decimal128_compute_blocks_at_bind")
+		probe.contains("decimal128_compute_binds_and_executes")
 			&& probe.contains("decimal_ddl_blocks_at_plan"),
-		"both probes are retained as tests"
+		"both probes are retained as tests (ADR 263 moved the compute probe past the bind wall)"
 	);
 }
 

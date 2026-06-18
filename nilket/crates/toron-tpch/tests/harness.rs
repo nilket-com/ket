@@ -18,25 +18,23 @@ async fn dev_q6_reaches_execute() {
 	assert_eq!(attempt.query, "q06");
 }
 
-// ADR 262: strict Q6 now ATTEMPTS the official-typed Decimal128 fixture (no user inputs) and records
-// the measured first block — decimal literals lower to Float64, mismatching the Decimal128 column at
-// bind. (Reconciles ADR 261's `strict_without_inputs_is_not_attempted`.)
+// ADR 263: strict Q6 (official-typed Decimal128 fixture, no user inputs) now REACHES execute — the
+// Decimal ScalarValue slice coerces the comparison literals, widens `*`, and carries `SUM` through the
+// Decimal128 path. The gauge moved `blocked(unsupported_decimal_scalar@bind)` → `pass@execute`.
+// (Reconciles ADR 262's `strict_q6_blocks_at_bind_on_decimal`.)
 #[tokio::test]
-async fn strict_q6_blocks_at_bind_on_decimal() {
+async fn strict_q6_reaches_execute() {
 	let attempt = run_strict_q6(0.0001).await;
-	assert_eq!(attempt.status, Status::Blocked, "{}", attempt.human());
-	assert_eq!(attempt.phase, Phase::Bind);
-	assert_eq!(
-		attempt.reason.as_deref(),
-		Some("unsupported_decimal_scalar")
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+	assert_eq!(attempt.phase, Phase::Execute);
+	assert!(
+		attempt.digest.is_some(),
+		"a pass carries a result digest: {}",
+		attempt.human()
 	);
 	assert!(
-		attempt.is_process_success(true),
-		"a recognized block exits 0 under --allow-blocked"
-	);
-	assert!(
-		!attempt.is_process_success(false),
-		"a block is non-success without --allow-blocked"
+		attempt.is_process_success(false),
+		"a pass is success even without --allow-blocked"
 	);
 }
 
@@ -71,11 +69,13 @@ fn status_marks_q06_strict_implemented_not_last_result() {
 	);
 }
 
-// ADR 262: the matrix is regenerated from the JSONL — the measured red row comes from there, not state.
+// ADR 263: the matrix is regenerated from the JSONL — the measured rows come from there, not state.
+// q06 now reads pass@execute in both modes; a blocked row (illustrative q01) still renders its phase.
 #[test]
 fn matrix_regenerates_from_jsonl() {
 	let log = "{\"query\":\"q06\",\"mode\":\"dev\",\"phase\":\"execute\",\"status\":\"pass\",\"reason\":null}\n\
-		{\"query\":\"q06\",\"mode\":\"strict\",\"phase\":\"bind\",\"status\":\"blocked\",\"reason\":\"unsupported_decimal_scalar\"}\n";
+		{\"query\":\"q06\",\"mode\":\"strict\",\"phase\":\"execute\",\"status\":\"pass\",\"reason\":null}\n\
+		{\"query\":\"q01\",\"mode\":\"strict\",\"phase\":\"bind\",\"status\":\"blocked\",\"reason\":\"unsupported_decimal_scalar\"}\n";
 	let rows = matrix_from_log(log);
 	let q06 = rows
 		.iter()
@@ -86,8 +86,16 @@ fn matrix_regenerates_from_jsonl() {
 		"matrix reflects the dev row: {q06}"
 	);
 	assert!(
-		q06.contains("strict=blocked(unsupported_decimal_scalar@bind)"),
-		"matrix reflects the measured strict red row: {q06}"
+		q06.contains("strict=pass@execute"),
+		"ADR 263: strict q06 now reaches execute: {q06}"
+	);
+	let q01 = rows
+		.iter()
+		.find(|row| row.starts_with("q01"))
+		.expect("q01 row");
+	assert!(
+		q01.contains("strict=blocked(unsupported_decimal_scalar@bind)"),
+		"matrix still renders a blocked row's reason@phase: {q01}"
 	);
 }
 

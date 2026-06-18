@@ -169,7 +169,14 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 			"timestamp helper missing {required}"
 		);
 	}
-	assert!(scalar.contains("Timestamp { value: Option<i64>, unit: TimeUnit }"));
+	// ADR 263 added a multi-line `Decimal128` struct variant, so rustfmt now renders the sibling
+	// `Timestamp` struct variant multi-line too — assert the tz-anchored shape format-agnostically.
+	assert!(
+		scalar.contains("Timestamp {")
+			&& scalar.contains("value: Option<i64>")
+			&& scalar.contains("unit: TimeUnit"),
+		"ScalarValue::Timestamp stays tz-anchored (value: Option<i64>, unit: TimeUnit): {scalar}"
+	);
 	assert!(ir.contains("utc_timestamp_data_type(*unit)"));
 	assert!(ir.contains("format_utc_timestamp"));
 	assert!(insert_literal.contains("Timestamp { value: i64, unit: TimeUnit }"));

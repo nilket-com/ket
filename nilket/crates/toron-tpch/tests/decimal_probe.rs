@@ -1,5 +1,5 @@
-//! ADR 262 verify-first probe (retained): where does strict Q6 (official physical types) block?
-//! Two probes — the SQL-surface DDL gap (plan), and the load-bearing Decimal128 compute gap (bind).
+//! ADR 262/263 verify-first probe (retained): the SQL-surface DDL gap (still rejected at plan), and
+//! the load-bearing Decimal128 compute path — which ADR 263 moved from a bind wall to a clean execute.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,11 +40,114 @@ fn decimal_ddl_blocks_at_plan() {
 	);
 }
 
-/// The load-bearing compute gap: a `Decimal128(15,2)` fixture + strict Q6 binds past descriptor/plan
-/// and blocks at BIND — decimal literals lower to `Float64`, so `l_discount BETWEEN 0.05 …` mismatches
-/// the `Decimal128` column. This is the measured first red row.
+/// The load-bearing compute path: a `Decimal128(15,2)` fixture + strict Q6 binds past descriptor/plan
+/// and now EXECUTES (ADR 263). Decimal comparison literals coerce to `Decimal128` at bind, `*` widens
+/// to `Decimal128(31,4)`, and `SUM` carries that type. Only row 0 survives `l_quantity < 24`, so
+/// `revenue = 100.00 * 0.06 = 6.0000` → `Decimal128(31,4)` raw `60000`. The wall ADR 262 measured at
+/// bind is gone; this probe is now the regression test that the decimal Q6 slice computes.
 #[tokio::test]
-async fn decimal128_compute_blocks_at_bind() {
+async fn decimal128_compute_binds_and_executes() {
+	let (catalog, storage) = lineitem_fixture();
+
+	// plan accepts the strict Q6.
+	let logical = SqlPlanner::new().plan(STRICT_Q6).expect("strict Q6 plans");
+
+	// bind now succeeds: decimal comparison literals coerce to Decimal128(15,2).
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 263: strict Q6 binds on the Decimal128 fixture");
+
+	// execute computes the revenue over the surviving row(s).
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 263: strict Q6 executes on the Decimal128 fixture");
+
+	let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+	assert_eq!(rows, 1, "the global SUM produces a single revenue row");
+	let revenue = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("a non-empty result batch")
+		.column(0);
+	assert_eq!(
+		revenue.data_type(),
+		&DataType::Decimal128(31, 4),
+		"`*` widens to Decimal128(31,4) and SUM carries it"
+	);
+	let revenue = revenue
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("revenue is a Decimal128 column");
+	assert_eq!(
+		revenue.value(0),
+		60_000,
+		"only row 0 survives l_quantity < 24: 100.00 * 0.06 = 6.0000 (raw 60000 at scale 4)"
+	);
+}
+
+/// ADR 263 review (finding 1): grouped SUM(Decimal128) must EXECUTE, not bind-then-fail. GROUP BY
+/// l_shipdate over the fixture yields two single-row groups → revenue {100.00, 200.00}. This would fail
+/// under the pre-fix grouped finalize (which rejected Decimal as an unsupported SUM output type).
+#[tokio::test]
+async fn grouped_decimal_sum_executes() {
+	let (catalog, storage) = lineitem_fixture();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT l_shipdate, SUM(l_extendedprice) AS revenue FROM lineitem GROUP BY l_shipdate",
+		)
+		.expect("grouped decimal SUM plans");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("grouped decimal SUM binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 263: grouped decimal SUM executes (not bind-then-fail)");
+
+	let mut revenue = Vec::new();
+	for batch in &batches {
+		let column = batch.column_by_name("revenue").expect("revenue column");
+		assert_eq!(
+			column.data_type(),
+			&DataType::Decimal128(15, 2),
+			"grouped SUM(Decimal128(15,2)) carries the input (p,s)"
+		);
+		let column = column
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("revenue is Decimal128");
+		revenue.extend((0..column.len()).map(|i| column.value(i)));
+	}
+	revenue.sort_unstable();
+	assert_eq!(
+		revenue,
+		vec![10_000, 20_000],
+		"two groups: 100.00 and 200.00 (raw at scale 2)"
+	);
+}
+
+/// ADR 263 review (finding 2): a literal that does not fit the column's Decimal128(15,2) precision is a
+/// clean bind error — not a wrong value or a panic at execute. Would panic/overflow under the pre-fix
+/// unchecked literal helpers.
+#[tokio::test]
+async fn oversized_decimal_literal_rejects_at_bind() {
+	let (catalog, _storage) = lineitem_fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT l_extendedprice FROM lineitem WHERE l_extendedprice < 999999999999999999")
+		.expect("plan accepts the comparison shape");
+	let error = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("an oversized decimal literal rejects at bind");
+	assert!(
+		format!("{error:?}").contains("does not fit Decimal128(15, 2)"),
+		"clean precision-fit bind error: {error:?}"
+	);
+}
+
+/// The Decimal128(15,2) `lineitem` fixture shared by the decimal probes: two rows —
+/// (q=10.00, price=100.00, disc=0.06, ship=8900) and (q=30.00, price=200.00, disc=0.05, ship=8950).
+fn lineitem_fixture() -> (MockCatalog, Arc<HarnessScan>) {
 	let decimal = |name: &str| Field::new(name, DataType::Decimal128(15, 2), false);
 	let schema = Arc::new(Schema::new(vec![
 		decimal("l_quantity"),
@@ -90,18 +193,5 @@ async fn decimal128_compute_blocks_at_bind() {
 	let storage = Arc::new(HarnessScan {
 		batches: HashMap::from([(TableId(2), batch)]),
 	});
-
-	// plan accepts the strict Q6 (the gap is not here either).
-	let logical = SqlPlanner::new().plan(STRICT_Q6).expect("strict Q6 plans");
-
-	// bind is the first wall: Decimal128 column vs Float64 literal.
-	let error = bind(&logical, &catalog, &PlannerConfig::default())
-		.await
-		.expect_err("strict Q6 should block at bind on the decimal/float type gap");
-	let _ = Executor::new(storage); // executor never runs — bind blocks first
-	assert!(
-		format!("{error:?}").contains("Decimal128(15, 2)")
-			&& format!("{error:?}").contains("Float64"),
-		"the bind block is the Decimal column vs Float64 literal gap: {error:?}"
-	);
+	(catalog, storage)
 }
