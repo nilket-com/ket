@@ -58,8 +58,11 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"strict_inputs_required",
 	"unsupported_decimal_ddl",
 	"unsupported_decimal_scalar",
+	"unsupported_decimal_arithmetic",
+	"unsupported_decimal_avg",
 	"unsupported_decimal_arrow",
 	"unsupported_date_interval",
+	"ambiguous_aggregate_projection",
 	"unsupported_query_surface",
 ];
 
@@ -84,11 +87,25 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// is the measured strict-Q6 bind gap. Keep the marker specific (`comparison operands`) so an
 		// unrelated Decimal message that merely mentions "type" is NOT overclassified here.
 		"unsupported_decimal_scalar"
+	} else if lowered.contains("decimal") && lowered.contains("arithmetic operands") {
+		// ADR 266: a Decimal operand in arithmetic the binder can't type (mixed-scale `+`/`-`, or `÷`).
+		// q01's first measured wall (`1 - l_discount`) before ADR 266 lands its same-(p,s) `+`/`-` arm.
+		// Kept specific (`arithmetic operands`) so it does not collide with the comparison/scalar gap.
+		"unsupported_decimal_arithmetic"
+	} else if lowered.contains("decimal") && lowered.contains("avg expects numeric input") {
+		// ADR 266: AVG over a Decimal column — needs decimal division + a finalize policy (ADR 267).
+		// q01's deeper blocker once `+`/`-` bind.
+		"unsupported_decimal_avg"
 	} else if lowered.contains("decimal") {
 		// Reserved for a future Decimal carrier/load gap (Arrow Decimal data the engine can't carry).
 		"unsupported_decimal_arrow"
 	} else if lowered.contains("interval") {
 		"unsupported_date_interval"
+	} else if lowered.contains("ambiguous aggregate projection") {
+		// ADR 266: q01's measured first wall — a projection with multiple same-function aggregates (e.g.
+		// two SUMs) the aggregate-projection accounting can't disambiguate. The genuine q01 prerequisite
+		// (ADR 267), distinct from the broad query-surface bucket. Checked before the generic fallback.
+		"ambiguous_aggregate_projection"
 	} else if lowered.contains("not supported") || lowered.contains("unsupported") {
 		"unsupported_query_surface"
 	} else {

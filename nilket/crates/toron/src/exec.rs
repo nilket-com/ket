@@ -2473,6 +2473,23 @@ fn evaluate_bound_binary(
 			{
 				return Ok(arrow::compute::kernels::numeric::mul(left_arr, right_arr)?);
 			}
+			// ADR 266: Decimal128 +/- Decimal128 — Arrow's numeric `add`/`sub` carry the scale and add one
+			// precision digit, matching the binder's same-(p,s) bound output type (operands keep their
+			// (p,s), bypassing `evaluate_arithmetic`'s operands-equal-output path). Q1 slice: only `+`/`-`.
+			if matches!(arithmetic_op, ArithmeticOp::Add | ArithmeticOp::Sub)
+				&& matches!(left_arr.data_type(), DataType::Decimal128(_, _))
+				&& matches!(right_arr.data_type(), DataType::Decimal128(_, _))
+			{
+				return Ok(match arithmetic_op {
+					ArithmeticOp::Add => {
+						arrow::compute::kernels::numeric::add(left_arr, right_arr)?
+					}
+					ArithmeticOp::Sub => {
+						arrow::compute::kernels::numeric::sub(left_arr, right_arr)?
+					}
+					_ => unreachable!("add/sub matched"),
+				});
+			}
 			let left_type =
 				program
 					.node_type(left)

@@ -81,3 +81,45 @@ fn arrow_decimal128_mul_widens_and_sum_carries() {
 		"the summed revenue carries the product's (precision, scale)"
 	);
 }
+
+/// ADR 266: `+`/`-` on equal-`(p,s)` decimals carry the scale and add one precision digit for carry — the
+/// rule the binder encodes (`Decimal(p,s) ± Decimal(p,s) → Decimal128(min(38, p+1), s)`). Unlike `*`, the
+/// scale is unchanged. q01's `1 - l_discount` is this shape (after the literal coerces to the column's
+/// `(15,2)`).
+#[test]
+fn arrow_decimal128_add_sub_carries_scale_plus_one_precision() {
+	let a = dec(vec![10000, 5], 15, 2); // 100.00, 0.05
+	let b = dec(vec![100, 5], 15, 2); //   1.00, 0.05
+
+	let sum: ArrayRef = numeric::add(&a, &b).expect("decimal add");
+	assert_eq!(
+		sum.data_type(),
+		&DataType::Decimal128(16, 2),
+		"add carries scale, +1 precision for carry"
+	);
+	let sum = sum
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("sum is Decimal128");
+	assert_eq!(
+		(0..sum.len()).map(|i| sum.value(i)).collect::<Vec<_>>(),
+		vec![10100, 10],
+		"100.00+1.00=101.00, 0.05+0.05=0.10 at scale 2"
+	);
+
+	let diff: ArrayRef = numeric::sub(&a, &b).expect("decimal sub");
+	assert_eq!(
+		diff.data_type(),
+		&DataType::Decimal128(16, 2),
+		"sub carries scale, +1 precision"
+	);
+	let diff = diff
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("diff is Decimal128");
+	assert_eq!(
+		(0..diff.len()).map(|i| diff.value(i)).collect::<Vec<_>>(),
+		vec![9900, 0],
+		"100.00-1.00=99.00, 0.05-0.05=0.00 at scale 2"
+	);
+}

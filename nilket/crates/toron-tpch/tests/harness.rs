@@ -1,7 +1,10 @@
 //! ADR 261/262 behavioral gates for the TPC-H reachability harness.
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
-use toron_tpch::{ALL_QUERY_IDS, matrix_from_log, run_dev_q6, run_strict_q6, status_rows};
+use toron_tpch::{
+	ALL_QUERY_IDS, matrix_from_log, run_dev_q1, run_dev_q6, run_strict_q1, run_strict_q6,
+	status_rows,
+};
 
 #[tokio::test]
 async fn dev_q6_reaches_execute() {
@@ -36,6 +39,27 @@ async fn strict_q6_reaches_execute() {
 		attempt.is_process_success(false),
 		"a pass is success even without --allow-blocked"
 	);
+}
+
+// ADR 266: q01 is attempted; its measured FIRST wall is `ambiguous aggregate projection` at PLAN —
+// multiple same-function aggregates (four SUMs) the projection accounting can't disambiguate, reached
+// BEFORE the decimal arithmetic bind. The decimal `+`/`-` slice (q01-nominated) is proven separately in
+// decimal_probe; q01's true next blocker is the aggregate-projection gap (ADR 267). Same wall in dev and
+// strict (it is type-independent), so this is the honest two-truths acceptance: the decimal slice passes,
+// and full q01 reports its real first wall — not a guessed arithmetic/AVG blocker.
+#[tokio::test]
+async fn q01_attempts_and_blocks_at_aggregate_projection() {
+	for attempt in [run_strict_q1(0.0001).await, run_dev_q1(0.0001).await] {
+		assert_eq!(attempt.query, "q01");
+		assert_eq!(attempt.status, Status::Blocked, "{}", attempt.human());
+		assert_eq!(attempt.phase, Phase::Plan);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("ambiguous_aggregate_projection"),
+			"q01's first wall is multiple-same-function-aggregate projection (ADR 267): {}",
+			attempt.human()
+		);
+	}
 }
 
 #[test]

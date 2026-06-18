@@ -1,4 +1,9 @@
-# ADR 266 — Q1 reachability slice: decimal `+`/`-`
+# ADR 266 — Decimal `+`/`-` (q01-nominated slice) + q01 first-wall measurement
+
+> Re-cut during implementation: the gauge measured q01's *first* wall as `ambiguous aggregate projection`
+> at PLAN (multiple same-function aggregates), not the decimal arithmetic bind the iter-1 single-aggregate
+> probe predicted. The decimal `+`/`-` cut is kept (correct, q01-nominated, tested); the acceptance is
+> split into two independent truths (below). See `plans/impl/266_..._results.md`.
 
 ## Status
 
@@ -42,22 +47,34 @@ matrix move to the next real blocker — it does **not** guess the rest of the s
 4. **AVG stays out.** AVG(Decimal) introduces decimal **division** + a finalize/rounding policy — a
    different semantic surface than fixed-scale `+`/`-`. Deferred to ADR 267 (named below).
 
-## Acceptance (monotonic-progress)
-q01 strict **no longer blocks on arithmetic bind**: the matrix cell moves from
-`blocked(unsupported_decimal_arithmetic@bind)` to the measured `blocked(unsupported_decimal_avg@bind)` —
-or, unexpectedly, `pass@execute`. A remaining red row must be the *earned* deeper blocker, not the one
-266 set out to clear.
+## Acceptance — two independent truths
+1. **The decimal slice passes.** `SUM(l_extendedprice * (1 - l_discount))` (and `1 - l_discount` itself)
+   **binds and executes** on the strict `Decimal128(15,2)` fixture — the integer literal coerces to
+   `Decimal128(15,2)`, `±` types to `Decimal128(16,2)`, `*` widens, `SUM` carries. This is the
+   q01-nominated op the cut delivers.
+2. **q01 is attempted and reports its real first wall.** The full q01 shape is run through the gauge and
+   honestly records `blocked(ambiguous_aggregate_projection@plan)` — a recognized blocker, in both dev and
+   strict. q01 moved from `not_attempted` to a measured, named blocker; the gauge named the next cut from
+   evidence (it just wasn't the arithmetic wall iter-1 guessed).
+
+NOT claimed: that q01 reaches the arithmetic bind or `pass@execute` — it blocks two layers earlier on
+multiple same-function aggregates.
 
 ## Deferred (named)
-- **ADR 267 — AVG(Decimal):** decimal division (SUM/COUNT) + finalize/rounding policy; flips q01 off the
-  `unsupported_decimal_avg` blocker.
-- Mixed-scale/mixed-precision Decimal `+`/`-` via Decimal casts; Decimal `÷` generally; exact decimal
-  literals (answer-correctness); the official q01 interval date expression; durable-type error names
-  (265).
+- **ADR 267 — multiple same-function aggregate projection:** q01's measured first wall. The
+  aggregate-projection accounting (`rewrite_aggregate_calls_for_projection`) can't disambiguate two
+  same-function calls (e.g. `SUM(a), SUM(b)`); q01 has four `SUM`s + three `AVG`s. This is the genuine q01
+  prerequisite and the next gauge step.
+- **Deeper deferred (behind 267, in q01's bind order):** `AVG(Decimal)` — decimal division (SUM/COUNT) +
+  finalize/rounding policy (`unsupported_decimal_avg`, already classified).
+- Mixed-scale/precision Decimal `+`/`-` via Decimal casts; Decimal `÷`; exact decimal literals
+  (answer-correctness); the official q01 interval date expression; durable-type error names (265).
 
 ## Tests / discriminators
-- gauge: `run_strict_q1` advances past `@bind` with telemetry query id `q01` (the q01 row moves off
-  `unsupported_decimal_arithmetic`).
+- gauge (truth 2): `run_strict_q1`/`run_dev_q1` (telemetry query id `q01`) report
+  `blocked(ambiguous_aggregate_projection@plan)` — q01 attempted, real first wall measured.
+- decimal slice (truth 1): `SUM(l_extendedprice * (1 - l_discount))` binds + executes on the strict
+  Decimal128 fixture (`decimal_add_sub_binds_and_executes`).
 - binder: `decimal ± int/float literal` binds (coercion) and same-`(p,s)`
   `decimal ± decimal → Decimal128(min(38, p + 1), s)`; a `(15,2)` case pins the exact `(16,2)` output.
 - executor: `SUM(l_extendedprice * (1 - l_discount))` over a small fixture computes the expected decimal

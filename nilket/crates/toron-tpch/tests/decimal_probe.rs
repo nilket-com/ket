@@ -145,6 +145,71 @@ async fn oversized_decimal_literal_rejects_at_bind() {
 	);
 }
 
+/// ADR 266: decimal `+`/`-` with literal coercion binds + executes. `1 - l_discount` coerces the integer
+/// literal to `Decimal128(15,2)` and subtracts to `Decimal128(16,2)`; the q01 `disc_price` chain
+/// (`SUM(l_extendedprice * (1 - l_discount))`) runs coercion → `-` → `*` → `SUM` end-to-end. (q01
+/// *nominates* this op but blocks earlier on multiple-aggregate projection — ADR 267.)
+#[tokio::test]
+async fn decimal_add_sub_binds_and_executes() {
+	let (catalog, storage) = lineitem_fixture();
+
+	// `1 - l_discount` -> Decimal128(16,2): 1.00-0.06=0.94, 1.00-0.05=0.95 (raw 94, 95 at scale 2).
+	let plan = SqlPlanner::new()
+		.plan("SELECT (1 - l_discount) AS d FROM lineitem")
+		.expect("plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 266: decimal sub binds (literal coerces to Decimal)");
+	let batches = Executor::new(storage.clone())
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 266: decimal sub executes");
+	let column = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("rows")
+		.column(0);
+	assert_eq!(
+		column.data_type(),
+		&DataType::Decimal128(16, 2),
+		"`1 - decimal` carries the scale and adds one precision digit"
+	);
+	let column = column
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("Decimal128");
+	let mut values: Vec<i128> = (0..column.len()).map(|i| column.value(i)).collect();
+	values.sort_unstable();
+	assert_eq!(values, vec![94, 95], "1.00-0.06=0.94, 1.00-0.05=0.95");
+
+	// q01's disc_price chain: coercion -> `-` -> `*` -> SUM, end-to-end.
+	let plan = SqlPlanner::new()
+		.plan("SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue FROM lineitem")
+		.expect("plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 266: coercion -> sub -> mul -> SUM binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 266: disc_price chain executes");
+	let revenue = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("a revenue row")
+		.column(0);
+	let revenue = revenue
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("revenue is Decimal128");
+	// 100.00*0.94 + 200.00*0.95 = 94.0000 + 190.0000 = 284.0000 at scale 4 (Decimal128(32,4)).
+	assert_eq!(
+		revenue.value(0),
+		2_840_000,
+		"SUM(price*(1-discount)) = 284.0000"
+	);
+}
+
 /// The Decimal128(15,2) `lineitem` fixture shared by the decimal probes: two rows —
 /// (q=10.00, price=100.00, disc=0.06, ship=8900) and (q=30.00, price=200.00, disc=0.05, ship=8950).
 fn lineitem_fixture() -> (MockCatalog, Arc<HarnessScan>) {

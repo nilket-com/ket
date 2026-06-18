@@ -98,7 +98,7 @@ fn adr262_strict_q6_attempts_decimal128_compute() {
 		"strict mode builds a Decimal128(15,2) fixture + strict Q6"
 	);
 	assert!(
-		lib.contains("fn run_strict_q6") && lib.contains("run_q6("),
+		lib.contains("fn run_strict_q6") && lib.contains("run_query("),
 		"strict run goes through the shared plan/bind/execute runner"
 	);
 	let probe = source("tests/decimal_probe.rs");
@@ -119,7 +119,7 @@ fn adr262_first_red_row_is_grounded_not_predeclared() {
 	);
 	// the strict run delegates to the shared, classified runner (no predeclared reason in its body)
 	assert!(
-		lib.contains("fn run_strict_q6") && lib.contains("run_q6("),
+		lib.contains("fn run_strict_q6") && lib.contains("run_query("),
 		"strict run does not predeclare a blocker"
 	);
 }

@@ -1073,6 +1073,24 @@ pub(super) fn bind_arithmetic(
 		.node_type(right)
 		.cloned()
 		.expect("builder returns typed right node");
+	// ADR 266: coerce an Int/Float literal operand to the other side's Decimal128(p,s) so `+`/`-` over a
+	// decimal column and a numeric literal (`1 - l_discount`) binds — rewrite in place (no Cast node),
+	// mirroring the comparison coercion. Gated to `+`/`-`, so non-decimal arithmetic is untouched.
+	let (left_type, right_type) = if matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub) {
+		coerce_decimal_arithmetic_literal(builder, ctx, left, right, &left_type, &right_type)?;
+		(
+			builder
+				.node_type(left)
+				.cloned()
+				.expect("builder returns typed left node"),
+			builder
+				.node_type(right)
+				.cloned()
+				.expect("builder returns typed right node"),
+		)
+	} else {
+		(left_type, right_type)
+	};
 	if let Some(output_type) = calendar_arithmetic_output_type(&op, &left_type, &right_type)? {
 		if let (Some(left_literal), Some(right_literal)) = (
 			builder.literal(left).cloned(),
@@ -1136,6 +1154,19 @@ pub(super) fn bind_arithmetic(
 		let scale = s1 + s2;
 		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, scale)));
 	}
+	// ADR 266: same-(p,s) Decimal128 +/- Decimal128 -> Decimal128(min(38, p+1), s) — carry one precision
+	// digit, scale unchanged (Arrow `numeric::add`/`sub` matches; verified by arrow_decimal_probe). Q1
+	// slice — only `+`/`-` at equal (p,s); mixed-scale/precision +/- and `÷` stay unsupported (no Decimal
+	// cast surface) until a query needs them.
+	if matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub)
+		&& let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
+			(&left_type, &right_type)
+		&& p1 == p2
+		&& s1 == s2
+	{
+		let precision = (p1 + 1).min(38);
+		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, *s1)));
+	}
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {
@@ -1147,6 +1178,42 @@ pub(super) fn bind_arithmetic(
 	let left = cast_if_needed(builder, left, &output_type)?;
 	let right = cast_if_needed(builder, right, &output_type)?;
 	Ok(builder.append_binary(op, left, right, output_type))
+}
+
+/// ADR 266: coerce an Int/Float literal operand to the other operand's `Decimal128(p,s)` (rewrite in
+/// place) so decimal `+`/`-` with a numeric literal binds. No-op unless one side is `Decimal128` and the
+/// other an Int/Float literal; reuses the checked `coerce_literal_value` path (no unchecked scaling).
+fn coerce_decimal_arithmetic_literal(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+) -> Result<(), BindingError> {
+	let is_numeric_literal = |value: &ScalarValue| {
+		matches!(
+			value,
+			ScalarValue::Int32(_)
+				| ScalarValue::Int64(_)
+				| ScalarValue::Float32(_)
+				| ScalarValue::Float64(_)
+		)
+	};
+	if matches!(right_type, DataType::Decimal128(_, _))
+		&& let Some(value) = builder.literal(left).cloned()
+		&& is_numeric_literal(&value)
+	{
+		let value = coerce_literal_value(value, right_type, ctx.session_timezone)?;
+		let _ = builder.rewrite_literal(left, value);
+	} else if matches!(left_type, DataType::Decimal128(_, _))
+		&& let Some(value) = builder.literal(right).cloned()
+		&& is_numeric_literal(&value)
+	{
+		let value = coerce_literal_value(value, left_type, ctx.session_timezone)?;
+		let _ = builder.rewrite_literal(right, value);
+	}
+	Ok(())
 }
 
 pub(super) enum LogicalArithmeticDomain {

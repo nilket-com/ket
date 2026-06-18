@@ -6,7 +6,8 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, run_dev_q6, run_strict_q6, status_rows,
+	CACHE_ROOT, generate_dev_lineitem, matrix, run_dev_q1, run_dev_q6, run_strict_q1,
+	run_strict_q6, status_rows,
 };
 
 #[tokio::main]
@@ -49,9 +50,24 @@ async fn run_command(args: &[String]) -> ExitCode {
 	let sf = sf_arg(args);
 	let allow_blocked = args.iter().any(|arg| arg == "--allow-blocked");
 
-	let attempt = if query != "q06" && query != "q6" {
-		// ADR 261 implements only Q6; the other 21 are inventoried but not attempted.
-		Attempt {
+	let strict = mode == "strict";
+	let attempt = match query {
+		"q06" | "q6" => {
+			if strict {
+				run_strict_q6(sf).await
+			} else {
+				run_dev_q6(sf).await
+			}
+		}
+		// ADR 266 adds Q1; the other 20 are inventoried but not yet attempted.
+		"q01" | "q1" => {
+			if strict {
+				run_strict_q1(sf).await
+			} else {
+				run_dev_q1(sf).await
+			}
+		}
+		_ => Attempt {
 			query: query.to_string(),
 			scale_factor: sf,
 			mode: mode.to_string(),
@@ -60,11 +76,7 @@ async fn run_command(args: &[String]) -> ExitCode {
 			reason: Some("query_not_implemented".to_string()),
 			elapsed_ms: 0.0,
 			digest: None,
-		}
-	} else if mode == "strict" {
-		run_strict_q6(sf).await
-	} else {
-		run_dev_q6(sf).await
+		},
 	};
 
 	emit(&attempt);

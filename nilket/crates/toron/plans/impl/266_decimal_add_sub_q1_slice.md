@@ -41,21 +41,21 @@ Int/Float literal-to-decimal coercion. q01 advances from the arithmetic bind wal
 
 ## Phase 4 — telemetry reasons (`crates/toron-tpch/src/telemetry.rs`)
 - Classifier (`reason_for_error`) + recognized-blocker allowlist (`RECOGNIZED_BLOCKERS`): add
-  `unsupported_decimal_arithmetic` (matches the "arithmetic operands must be Int32, Int64, Float32, or
-  Float64 … Decimal128" bind error — distinct from the older `unsupported_decimal_scalar`) and
-  `unsupported_decimal_avg` (matches "AVG expects numeric input … Decimal128"). Put both checks before
-  the existing broad Decimal fallback to `unsupported_decimal_arrow`. Keep the precise-match discipline
-  from ADR 262 (don't broaden to a bare "decimal"/"arithmetic" substring that overclassifies).
+  `unsupported_decimal_arithmetic` ("arithmetic operands must be Int32, Int64, Float32, or Float64 …
+  Decimal128"), `unsupported_decimal_avg` ("AVG expects numeric input … Decimal128"), and — the measured
+  q01 first wall — `ambiguous_aggregate_projection` ("ambiguous aggregate projection"). Put the decimal
+  checks before the broad Decimal fallback, and the ambiguous check before the generic "unsupported"
+  fallback. Precise-match discipline from ADR 262 (no bare-substring overclassification).
 
 ## Tests
-- `toron-tpch` harness: `strict_q01_advances_past_decimal_arithmetic_bind` — `run_strict_q1` is NOT
-  `(Bind, unsupported_decimal_arithmetic)`; it is `Pass` or a strictly-deeper `unsupported_decimal_avg`.
-  Retain/extend the decimal probe to assert `1 - l_discount` and `decimal ± decimal` now bind.
-- `toron` (`logical_type`/binder + exec tests): `decimal ± int/float literal` binds; same-`(p,s)`
-  `decimal ± decimal → Decimal128(min(38, p + 1), s)` (pin `(15,2) → (16,2)`);
-  `SUM(l_extendedprice * (1 - l_discount))`
-  executes to the expected decimal; a non-decimal arithmetic domain error still fires (assertion not
-  loosened). Add a negative for mixed-scale Decimal `+`/`-` if a fixture can construct it cleanly.
+- `toron-tpch` harness (truth 2): `q01_attempts_and_blocks_at_aggregate_projection` — `run_strict_q1`
+  and `run_dev_q1` report `(Plan, ambiguous_aggregate_projection)` (q01's measured first wall).
+- `toron-tpch` decimal_probe (truth 1): `decimal_add_sub_binds_and_executes` — `1 - l_discount` types to
+  `Decimal128(16,2)` (values 0.94/0.95) and `SUM(l_extendedprice * (1 - l_discount))` executes to
+  284.0000; `arrow_decimal_probe` asserts Arrow's `add`/`sub` `(15,2)±(15,2)→(16,2)`.
+- binder/exec: `decimal ± int/float literal` binds (coercion) and same-`(p,s)`
+  `decimal ± decimal → Decimal128(min(38, p + 1), s)`; a non-decimal arithmetic domain error still fires
+  (the Decimal arm is additive, not a loosening).
 
 ## Verification gate (ADR 264 seal gate; cargo via scripts/cargo-cgroup, AFTER fmt)
 ```
@@ -68,8 +68,9 @@ scripts/cargo-cgroup run  -p toron-tpch -- run --query q01 --mode strict --allow
 scripts/cargo-cgroup run  -p toron-tpch -- matrix
 git diff --check
 ```
-Acceptance: q01 strict moves off `unsupported_decimal_arithmetic@bind` to `unsupported_decimal_avg@bind`
-(or `pass@execute`); q06 unchanged; full suite green; `--all-targets` if a widely-constructed type grows.
+Acceptance — two truths: (1) the decimal slice `SUM(l_extendedprice * (1 - l_discount))` binds + executes
+on strict Decimal128; (2) full q01 reports `blocked(ambiguous_aggregate_projection@plan)` (dev + strict).
+q06 unchanged; full suite green. NOT claimed: q01 reaching the arithmetic bind or `pass@execute`.
 
 ## Seal
 `impl: adr 266 q1 reachability slice decimal add sub`,

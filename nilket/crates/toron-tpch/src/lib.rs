@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Date32Array, Decimal128Array, Float64Array};
+use arrow::array::{Date32Array, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -64,6 +64,43 @@ pub const STRICT_Q6_SQL: &str = "SELECT SUM(l_extendedprice * l_discount) AS rev
 	  AND l_discount BETWEEN 0.05 AND 0.07 \
 	  AND l_quantity < 24";
 
+/// ADR 266 — dev Q1: the `Float64` proxy of TPC-H Q1's pricing summary. A literal cutoff date
+/// (`DATE '1998-09-02'`) replaces the official `DATE '1998-12-01' - INTERVAL '90' DAY` so date arithmetic
+/// doesn't mask the real wall. Full Q1 currently stops at PLAN on `ambiguous aggregate projection`
+/// (multiple same-function aggregates — ADR 267), the same wall in dev and strict. The decimal `+`/`-`
+/// this query also needs is verified separately by the focused decimal probe, not via this attempt.
+pub const Q1_DEV_SQL: &str = "SELECT l_returnflag, l_linestatus, \
+	SUM(l_quantity) AS sum_qty, \
+	SUM(l_extendedprice) AS sum_base_price, \
+	SUM(l_extendedprice * (1.0 - l_discount)) AS sum_disc_price, \
+	SUM(l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax)) AS sum_charge, \
+	AVG(l_quantity) AS avg_qty, \
+	AVG(l_extendedprice) AS avg_price, \
+	AVG(l_discount) AS avg_disc, \
+	COUNT(*) AS count_order \
+	FROM lineitem \
+	WHERE l_shipdate <= DATE '1998-09-02' \
+	GROUP BY l_returnflag, l_linestatus \
+	ORDER BY l_returnflag, l_linestatus";
+
+/// ADR 266 — strict Q1: the official-*typed* `Decimal128(15,2)` fixture + Q1 shape with the literal
+/// cutoff date. The `1 - l_discount` / `1 + l_tax` integer literals coerce to `Decimal128` and `+`/`-`
+/// bind (266); the first `AVG` over a `Decimal128` column is the measured deeper blocker
+/// (`unsupported_decimal_avg` → ADR 267). NOT a TPC-H result.
+pub const STRICT_Q1_SQL: &str = "SELECT l_returnflag, l_linestatus, \
+	SUM(l_quantity) AS sum_qty, \
+	SUM(l_extendedprice) AS sum_base_price, \
+	SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+	SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+	AVG(l_quantity) AS avg_qty, \
+	AVG(l_extendedprice) AS avg_price, \
+	AVG(l_discount) AS avg_disc, \
+	COUNT(*) AS count_order \
+	FROM lineitem \
+	WHERE l_shipdate <= DATE '1998-09-02' \
+	GROUP BY l_returnflag, l_linestatus \
+	ORDER BY l_returnflag, l_linestatus";
+
 /// The dev `LINEITEM` schema: only the Q6 columns, money/qty/discount as `Float64`, ship date as
 /// `Date32`. No string carriers; an append-only (PK-less) identity, so no synthetic key column.
 fn dev_lineitem_schema() -> SchemaRef {
@@ -72,6 +109,10 @@ fn dev_lineitem_schema() -> SchemaRef {
 		Field::new("l_extendedprice", DataType::Float64, false),
 		Field::new("l_discount", DataType::Float64, false),
 		Field::new("l_shipdate", DataType::Date32, false),
+		// ADR 266: q01 columns (GROUP BY keys + tax) — Utf8 flags, Float64 tax in the dev proxy.
+		Field::new("l_returnflag", DataType::Utf8, false),
+		Field::new("l_linestatus", DataType::Utf8, false),
+		Field::new("l_tax", DataType::Float64, false),
 	]))
 }
 
@@ -98,11 +139,17 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut extendedprice = Vec::new();
 	let mut discount = Vec::new();
 	let mut shipdate = Vec::new();
+	let mut returnflag = Vec::new();
+	let mut linestatus = Vec::new();
+	let mut tax = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
 		discount.push(item.l_discount.as_f64());
 		shipdate.push(item.l_shipdate.to_unix_epoch());
+		returnflag.push(item.l_returnflag.to_string());
+		linestatus.push(item.l_linestatus.to_string());
+		tax.push(item.l_tax.as_f64());
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -111,6 +158,9 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Float64Array::from(extendedprice)),
 			Arc::new(Float64Array::from(discount)),
 			Arc::new(Date32Array::from(shipdate)),
+			Arc::new(StringArray::from(returnflag)),
+			Arc::new(StringArray::from(linestatus)),
+			Arc::new(Float64Array::from(tax)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -126,6 +176,10 @@ fn strict_lineitem_schema() -> SchemaRef {
 		decimal("l_extendedprice"),
 		decimal("l_discount"),
 		Field::new("l_shipdate", DataType::Date32, false),
+		// ADR 266: q01 columns (GROUP BY keys + tax) — Utf8 flags, official Decimal128(15,2) tax.
+		Field::new("l_returnflag", DataType::Utf8, false),
+		Field::new("l_linestatus", DataType::Utf8, false),
+		decimal("l_tax"),
 	]))
 }
 
@@ -153,11 +207,17 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut extendedprice = Vec::new();
 	let mut discount = Vec::new();
 	let mut shipdate = Vec::new();
+	let mut returnflag = Vec::new();
+	let mut linestatus = Vec::new();
+	let mut tax = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
 		discount.push(item.l_discount.into_inner() as i128);
 		shipdate.push(item.l_shipdate.to_unix_epoch());
+		returnflag.push(item.l_returnflag.to_string());
+		linestatus.push(item.l_linestatus.to_string());
+		tax.push(item.l_tax.into_inner() as i128);
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -173,6 +233,9 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			decimal(extendedprice),
 			decimal(discount),
 			Arc::new(Date32Array::from(shipdate)),
+			Arc::new(StringArray::from(returnflag)),
+			Arc::new(StringArray::from(linestatus)),
+			decimal(tax),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -224,7 +287,8 @@ impl StorageScan for HarnessScan {
 /// Run a Q6 variant single-node over a pre-built fixture, recording the deepest phase reached. A stage
 /// error is classified against the recognized-blocker allowlist: a recognized reason is `blocked`,
 /// anything else is `fail`. Shared by the dev (Float64) and strict (Decimal128) runs.
-async fn run_q6(
+async fn run_query(
+	query_id: &str,
 	mode: &str,
 	scale_factor: f64,
 	sql: &str,
@@ -234,7 +298,7 @@ async fn run_q6(
 	let start = Instant::now();
 	let attempt =
 		|phase: Phase, status: Status, reason: Option<String>, digest: Option<String>| Attempt {
-			query: "q06".to_string(),
+			query: query_id.to_string(),
 			scale_factor,
 			mode: mode.to_string(),
 			phase,
@@ -321,12 +385,44 @@ async fn run_q6(
 /// correctness.
 pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 	let schema = dev_lineitem_schema();
-	run_q6(
+	run_query(
+		"q06",
 		"dev",
 		scale_factor,
 		Q6_DEV_SQL,
 		generate_dev_lineitem(scale_factor),
 		dev_lineitem_descriptor(schema.as_ref()),
+	)
+	.await
+}
+
+/// ADR 266 — dev Q1: the `Float64` proxy reaching execute (reachability, not TPC-H correctness).
+pub async fn run_dev_q1(scale_factor: f64) -> Attempt {
+	let schema = dev_lineitem_schema();
+	run_query(
+		"q01",
+		"dev",
+		scale_factor,
+		Q1_DEV_SQL,
+		generate_dev_lineitem(scale_factor),
+		dev_lineitem_descriptor(schema.as_ref()),
+	)
+	.await
+}
+
+/// ADR 266 — strict Q1: official-typed `Decimal128(15,2)` + Q1 shape. Full Q1 currently stops at PLAN on
+/// `ambiguous aggregate projection` (multiple same-function aggregates — ADR 267), before the decimal
+/// arithmetic bind. The decimal `+`/`-` slice (which q01 needs) is verified by the focused decimal probe;
+/// `AVG(Decimal)` is a deeper blocker still, behind 267 in q01's bind order.
+pub async fn run_strict_q1(scale_factor: f64) -> Attempt {
+	let schema = strict_lineitem_schema();
+	run_query(
+		"q01",
+		"strict",
+		scale_factor,
+		STRICT_Q1_SQL,
+		generate_strict_lineitem(scale_factor),
+		strict_lineitem_descriptor(schema.as_ref()),
 	)
 	.await
 }
@@ -337,7 +433,8 @@ pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 /// + shape reaching execute, NOT official provenance or answer correctness — NOT a TPC-H result.
 pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
 	let schema = strict_lineitem_schema();
-	run_q6(
+	run_query(
+		"q06",
 		"strict",
 		scale_factor,
 		STRICT_Q6_SQL,
@@ -354,7 +451,7 @@ pub fn status_rows() -> Vec<String> {
 	ALL_QUERY_IDS
 		.iter()
 		.map(|id| {
-			let state = if *id == "q06" {
+			let state = if *id == "q06" || *id == "q01" {
 				"implemented"
 			} else {
 				"not_attempted"
