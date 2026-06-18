@@ -12,6 +12,7 @@ use crate::ir::{
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, DateTimeField,
@@ -3780,6 +3781,7 @@ impl SqlPlanner {
 		let pull_where = effective_selection
 			.as_ref()
 			.is_some_and(expr_contains_subquery);
+		let mut where_scalar_pulled = false;
 		if pull_projection || pull_where {
 			let outer_qualifiers = plan_qualifiers(&plan);
 			let mut collected = Vec::new();
@@ -3796,6 +3798,7 @@ impl SqlPlanner {
 				projection = &owned_projection;
 			}
 			if pull_where {
+				let before = collected.len();
 				effective_selection = match effective_selection {
 					Some(selection) => Some(self.pull_up_scalar_subqueries(
 						&selection,
@@ -3805,8 +3808,11 @@ impl SqlPlanner {
 					)?),
 					None => None,
 				};
+				// Did a *value* scalar subquery actually fold in (adding `__scalar_N` columns)? EXISTS /
+				// IN are not `SqlExpr::Subquery`, so they collect nothing here and never set this.
+				where_scalar_pulled = collected.len() > before;
 			}
-			plan = self.cross_join_scalar_subplans(plan, collected)?;
+			plan = self.join_scalar_subplans(plan, collected)?;
 		}
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation). `effective_selection` is the WHERE
@@ -3927,6 +3933,17 @@ impl SqlPlanner {
 		}
 
 		if matches!(projection, [SelectItem::Wildcard(_)]) {
+			// ADR 260: a scalar subquery pulled from WHERE folds in as an extra join input, appending its
+			// synthetic `__scalar_N` columns (257's `value`, plus 260's correlation `key_i`) to the plan.
+			// A bare `*` would expose them — the frontend is schema-less, so it cannot project back to the
+			// visible input columns here (that pruning is a binder concern). Reject rather than leak; an
+			// explicit projection list (e.g. `SELECT fact.pk, …`) lowers correctly today. EXISTS / IN in
+			// WHERE are unaffected (semi/anti joins emit left columns only — no leak).
+			if where_scalar_pulled {
+				return Err(unsupported(
+					"SELECT * with a scalar subquery in WHERE is not supported — list the output columns explicitly",
+				));
+			}
 			return Ok(LoweredSelect {
 				plan: wrap_distinct_if_needed(plan, distinct_requested),
 				aggregate_output_catalog: None,
@@ -5565,24 +5582,135 @@ impl SqlPlanner {
 	fn pull_up_scalar_subqueries(
 		&self,
 		expr: &SqlExpr,
-		collected: &mut Vec<LogicalPlan>,
+		collected: &mut Vec<PulledScalar>,
 		outer_qualifiers: &[TableRef],
 		cte: &CteScope,
 	) -> Result<SqlExpr, FrontendError> {
 		match expr {
 			SqlExpr::Subquery(query) => {
 				let alias = format!("__scalar_{}", collected.len());
-				validate_scalar_subquery_is_global_aggregate(query, outer_qualifiers)?;
-				let subplan = self.lower_query_scoped(query, cte)?;
-				collected.push(LogicalPlan::Alias {
-					input: Box::new(subplan),
-					alias: TableRef::new(alias.clone()),
-					columns: vec![SCALAR_SUBQUERY_COLUMN.to_string()],
+				validate_aggregate_scalar_subquery_shape(query, outer_qualifiers)?;
+				let SetExpr::Select(select) = query.body.as_ref() else {
+					// validate_aggregate_scalar_subquery_shape guarantees a Select body.
+					return Err(unsupported(
+						"non-aggregate scalar subqueries are not supported",
+					));
+				};
+				// ADR 260: a scalar subquery whose WHERE references an outer relation is correlated; it
+				// decorrelates to a grouped aggregate keyed on the correlation + a `LeftOuter` recombine.
+				// An uncorrelated scalar stays ADR 257's keyless `Cross` over the global aggregate,
+				// byte-identical (it never enters the correlated path below).
+				let inner_qualifiers = scalar_subquery_inner_qualifiers(select);
+				let where_is_correlated = select.selection.as_ref().is_some_and(|selection| {
+					sql_expr_references_outer_qualifier(
+						selection,
+						outer_qualifiers,
+						&inner_qualifiers,
+					)
 				});
-				Ok(SqlExpr::CompoundIdentifier(vec![
-					Ident::new(alias),
-					Ident::new(SCALAR_SUBQUERY_COLUMN),
-				]))
+				if !where_is_correlated {
+					let subplan = self.lower_query_scoped(query, cte)?;
+					collected.push(PulledScalar {
+						plan: LogicalPlan::Alias {
+							input: Box::new(subplan),
+							alias: TableRef::new(alias.clone()),
+							columns: vec![SCALAR_SUBQUERY_COLUMN.to_string()],
+						},
+						on: Vec::new(),
+					});
+					return Ok(scalar_value_reference(&alias));
+				}
+
+				// Correlated: classify the WHERE into equi-correlation pairs (the EXISTS splitter; a
+				// non-equi outer reference rejects as "unsupported EXISTS subquery predicate") and inner
+				// residuals, then build a grouped aggregate keyed on the inner correlation keys.
+				let LoweredAggregateCall {
+					function,
+					args,
+					distinct,
+				} = self.lower_aggregate_function(
+					scalar_subquery_bare_aggregate(select)?,
+					AggregateSqlMode::Grouped,
+				)?;
+				if distinct {
+					return Err(unsupported(
+						"DISTINCT in a correlated scalar aggregate is not supported",
+					));
+				}
+				let mut inner_plan = self.lower_table_factor(&select.from[0].relation, cte)?;
+				let mut correlation_pairs: Vec<(Expr, Expr)> = Vec::new();
+				let mut inner_residuals: Vec<Expr> = Vec::new();
+				if let Some(selection) = &select.selection {
+					for conjunct in split_top_level_and(selection) {
+						match self.classify_exists_conjunct(
+							conjunct,
+							outer_qualifiers,
+							&inner_qualifiers,
+						)? {
+							ExistsConjunct::CorrelatedPair { outer, inner } => {
+								correlation_pairs.push((outer, inner))
+							}
+							ExistsConjunct::InnerResidual(predicate) => {
+								inner_residuals.push(predicate)
+							}
+						}
+					}
+				}
+				if let Some(predicate) = combine_and_exprs(inner_residuals) {
+					inner_plan = LogicalPlan::Filter {
+						input: Box::new(inner_plan),
+						predicate,
+					};
+				}
+				let group_expr: Vec<Expr> = correlation_pairs
+					.iter()
+					.map(|(_, inner)| inner.clone())
+					.collect();
+				let aggregate = LogicalPlan::Aggregate {
+					input: Box::new(LogicalPlan::Exchange {
+						input: Box::new(inner_plan),
+						partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+						key: group_expr.clone(),
+					}),
+					group_expr,
+					aggr_expr: vec![(function.clone(), args)],
+				};
+				// The aggregate exposes `[key_0, …, key_n, value]`; the keys recombine on the join `on`,
+				// the value feeds the rewritten outer expression. Names are positional (Alias.columns).
+				let mut columns: Vec<String> = (0..correlation_pairs.len())
+					.map(|index| format!("key_{index}"))
+					.collect();
+				columns.push(SCALAR_SUBQUERY_COLUMN.to_string());
+				let on: Vec<(Expr, Expr)> = correlation_pairs
+					.into_iter()
+					.enumerate()
+					.map(|(index, (outer, _))| {
+						(
+							outer,
+							Expr::qualified_column(
+								TableRef::new(alias.clone()),
+								format!("key_{index}"),
+							),
+						)
+					})
+					.collect();
+				collected.push(PulledScalar {
+					plan: LogicalPlan::Alias {
+						input: Box::new(aggregate),
+						alias: TableRef::new(alias.clone()),
+						columns,
+					},
+					on,
+				});
+				let value_reference = scalar_value_reference(&alias);
+				if matches!(
+					function,
+					AggregateFunction::CountAll | AggregateFunction::Count
+				) {
+					Ok(count_empty_group_coalesce(value_reference))
+				} else {
+					Ok(value_reference)
+				}
 			}
 			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
 				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
@@ -5718,7 +5846,7 @@ impl SqlPlanner {
 	fn rewrite_select_item_scalar_subqueries(
 		&self,
 		item: &SelectItem,
-		collected: &mut Vec<LogicalPlan>,
+		collected: &mut Vec<PulledScalar>,
 		outer_qualifiers: &[TableRef],
 		cte: &CteScope,
 	) -> Result<SelectItem, FrontendError> {
@@ -5734,20 +5862,33 @@ impl SqlPlanner {
 		}
 	}
 
-	/// ADR 257: fold each collected scalar subplan onto `plan` as a keyless `Cross` join. The scalar
-	/// (row=1) subplan is placed on the RIGHT so the binder's `ScalarBroadcastCross` branch
-	/// (`plan_is_scalar(right)`) broadcasts it to every partition of the outer plan. Built directly via
-	/// `build_auto_join_plan` — the keyless `Cross` the comma-join fold already uses — NOT the SQL
-	/// JOIN-with-derived path (which trips the adr145 fence); the `Auto` intent lets the binder physicalize
-	/// the broadcast (a partition_count=1 build on the scalar side, swapped to a right-build), rather than
-	/// a frontend-pinned hash exchange that the broadcast placement check rejects.
-	fn cross_join_scalar_subplans(
+	/// ADR 257/260: fold each collected scalar subplan onto `plan`. An uncorrelated scalar (`on` empty)
+	/// folds as a keyless `Cross`: the scalar (row=1) subplan is placed on the RIGHT so the binder's
+	/// `ScalarBroadcastCross` branch (`plan_is_scalar(right)`) broadcasts it to every partition of the
+	/// outer plan, built directly via `build_auto_join_plan` (the `Auto` intent lets the binder
+	/// physicalize the broadcast as a right-build) — NOT the SQL JOIN-with-derived path (which trips the
+	/// adr145 fence). A correlated scalar (`on` non-empty) folds as a hash-partitioned `LeftOuter` keyed
+	/// on the correlation: the grouped-aggregate subplan preserves outer rows with a NULL value when no
+	/// inner group matches, and a `LeftOuter` cannot broadcast, so it fragments on the hash path.
+	fn join_scalar_subplans(
 		&self,
 		mut plan: LogicalPlan,
-		collected: Vec<LogicalPlan>,
+		collected: Vec<PulledScalar>,
 	) -> Result<LogicalPlan, FrontendError> {
-		for subplan in collected {
-			plan = build_auto_join_plan(plan, subplan, JoinKind::Cross, vec![]);
+		for PulledScalar { plan: subplan, on } in collected {
+			plan = if on.is_empty() {
+				build_auto_join_plan(plan, subplan, JoinKind::Cross, vec![])
+			} else {
+				build_join_plan(
+					plan,
+					subplan,
+					JoinKind::LeftOuter,
+					on,
+					JoinStrategy::HashPartitioned,
+					JoinStrategyPinSource::Direct,
+					None,
+				)?
+			};
 		}
 		Ok(plan)
 	}
@@ -9147,12 +9288,90 @@ fn collect_scope_refs(
 	Ok(())
 }
 
-/// ADR 257: validate that a scalar subquery used as a value is an uncorrelated, provably-scalar
-/// (global-aggregate) subquery this cut supports. Provably scalar = a single `SELECT <one aggregate>
-/// FROM <one table> [WHERE <uncorrelated>]` with no GROUP BY (a global aggregate carries
-/// `row_upper_bound = 1`). Non-aggregate / multi-column / grouped scalar subqueries reject; a reference
-/// to any `outer_qualifiers` relation is correlated and rejects (correlated decorrelation is deferred).
-fn validate_scalar_subquery_is_global_aggregate(
+/// ADR 257/260: the column a pulled scalar subquery exposes to the rewritten outer expression
+/// (`__scalar_N.value`), plus the keys that recombine it. `on` empty = ADR 257's uncorrelated keyless
+/// `Cross` over a global aggregate; `on` non-empty = ADR 260's correlated `LeftOuter` over a grouped
+/// aggregate keyed on the correlation.
+struct PulledScalar {
+	plan: LogicalPlan,
+	on: Vec<(Expr, Expr)>,
+}
+
+/// The `__scalar_N.value` reference the rewritten outer expression uses in place of a pulled scalar.
+fn scalar_value_reference(alias: &str) -> SqlExpr {
+	SqlExpr::CompoundIdentifier(vec![Ident::new(alias), Ident::new(SCALAR_SUBQUERY_COLUMN)])
+}
+
+/// The qualifier(s) a scalar subquery's single FROM table contributes (its alias, else its name): the
+/// scope against which a correlation reference is judged (a column qualified by an outer relation is
+/// correlated).
+fn scalar_subquery_inner_qualifiers(select: &Select) -> Vec<TableRef> {
+	match &select.from[0].relation {
+		TableFactor::Table { name, alias, .. } => {
+			let qualifier = alias
+				.as_ref()
+				.map(|alias| TableRef::new(alias.name.value.clone()))
+				.or_else(|| {
+					name.0.last().and_then(|part| {
+						part.as_ident()
+							.map(|ident| TableRef::new(ident.value.clone()))
+					})
+				});
+			qualifier.into_iter().collect::<Vec<_>>()
+		}
+		_ => Vec::new(),
+	}
+}
+
+/// ADR 260: the single bare aggregate a *correlated* scalar subquery projects. Grouped-aggregate
+/// decorrelation needs a bare aggregate so the grouped output is one column and the COUNT empty-group
+/// identity is well-defined; an aggregate wrapped in further computation (`MAX(x) + 1`) is a deferred
+/// correlated-scalar form.
+fn scalar_subquery_bare_aggregate(select: &Select) -> Result<&Function, FrontendError> {
+	let projection_expr = match select.projection.as_slice() {
+		[SelectItem::UnnamedExpr(expr)] => expr,
+		[SelectItem::ExprWithAlias { expr, .. }] => expr,
+		_ => {
+			return Err(unsupported(
+				"correlated scalar subqueries are not supported",
+			));
+		}
+	};
+	match strip_nested_sql_expr(projection_expr) {
+		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+			Ok(function)
+		}
+		_ => Err(unsupported(
+			"correlated scalar subqueries are not supported",
+		)),
+	}
+}
+
+/// ADR 260: wrap a correlated COUNT scalar in `COALESCE(value, 0)`. COUNT over an empty correlated
+/// group is `0`, but the `LeftOuter` no-match yields NULL — so emit the `CASE WHEN value IS NOT NULL
+/// THEN value ELSE 0 END` shape `lower_coalesce` produces. MAX/MIN/SUM/AVG keep NULL (their empty-set
+/// identity).
+fn count_empty_group_coalesce(value_reference: SqlExpr) -> SqlExpr {
+	SqlExpr::Case {
+		case_token: AttachedToken::empty(),
+		end_token: AttachedToken::empty(),
+		operand: None,
+		conditions: vec![CaseWhen {
+			condition: SqlExpr::IsNotNull(Box::new(value_reference.clone())),
+			result: value_reference,
+		}],
+		else_result: Some(Box::new(SqlExpr::Value(
+			Value::Number("0".to_string(), false).with_empty_span(),
+		))),
+	}
+}
+
+/// ADR 257/260: validate that a scalar subquery used as a value is a provably-scalar aggregate this cut
+/// supports — a single `SELECT <one aggregate> FROM <one table> [WHERE ...]` with no
+/// GROUP BY/HAVING/DISTINCT. A correlation reference in the *projection* (the aggregate argument) rejects
+/// (undecorrelatable by GROUP BY); a correlation reference in the *WHERE* no longer rejects here —
+/// `pull_up_scalar_subqueries` decorrelates it into a grouped aggregate + `LeftOuter` (ADR 260).
+fn validate_aggregate_scalar_subquery_shape(
 	query: &Query,
 	outer_qualifiers: &[TableRef],
 ) -> Result<(), FrontendError> {
@@ -9163,7 +9382,8 @@ fn validate_scalar_subquery_is_global_aggregate(
 			"non-aggregate scalar subqueries are not supported",
 		));
 	};
-	// A global aggregate is a single FROM source, no joins, no GROUP BY, exactly one projected aggregate.
+	// A scalar aggregate is a single FROM source, no joins, no GROUP BY/HAVING/DISTINCT, one projected
+	// aggregate.
 	if select.from.len() != 1
 		|| !select.from[0].joins.is_empty()
 		|| !group_by_is_empty(&select.group_by)
@@ -9188,30 +9408,9 @@ fn validate_scalar_subquery_is_global_aggregate(
 			"non-aggregate scalar subqueries are not supported",
 		));
 	}
-	// Uncorrelated: the subquery's projection and WHERE must not reference an outer relation.
-	let inner_qualifiers = match &select.from[0].relation {
-		TableFactor::Table { name, alias, .. } => {
-			let qualifier = alias
-				.as_ref()
-				.map(|alias| TableRef::new(alias.name.value.clone()))
-				.or_else(|| {
-					name.0.last().and_then(|part| {
-						part.as_ident()
-							.map(|ident| TableRef::new(ident.value.clone()))
-					})
-				});
-			qualifier.into_iter().collect::<Vec<_>>()
-		}
-		_ => Vec::new(),
-	};
+	// A correlation reference in the aggregate argument is undecorrelatable by GROUP BY — stays deferred.
+	let inner_qualifiers = scalar_subquery_inner_qualifiers(select);
 	if sql_expr_references_outer_qualifier(projection_expr, outer_qualifiers, &inner_qualifiers) {
-		return Err(unsupported(
-			"correlated scalar subqueries are not supported",
-		));
-	}
-	if let Some(selection) = &select.selection
-		&& sql_expr_references_outer_qualifier(selection, outer_qualifiers, &inner_qualifiers)
-	{
 		return Err(unsupported(
 			"correlated scalar subqueries are not supported",
 		));

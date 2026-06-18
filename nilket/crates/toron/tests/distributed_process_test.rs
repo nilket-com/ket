@@ -2916,3 +2916,81 @@ fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDesc
 	)
 	.expect("descriptor")
 }
+
+// ADR 260 verify-first distribution gate.
+// A correlated aggregate scalar `(SELECT MAX(orders.id) FROM orders WHERE orders.customer_id =
+// customers.id)` decorrelates to a `LeftOuter` over a grouped aggregate, recombined on the
+// correlation key. This pins that the decorrelated *plan shape* binds and fragments on the hash
+// path — the load-bearing "frontend-only, no fragmenter change" claim. We express the shape with a
+// CTE (a named table factor) rather than an inline `LEFT JOIN (subquery)`, because the SQL surface
+// rejects a derived table in a non-inner join chain (`lower_select`: "derived tables in joins are
+// only supported in all-inner chains"); 260's lowering sidesteps that guard by building the
+// `LeftOuter` node directly via `build_join_plan`, so the CTE plan is the faithful proxy.
+fn adr260_probe_find_join(plan: &ExecutionPlan) -> Option<(JoinKind, JoinStrategy)> {
+	match plan {
+		ExecutionPlan::Join {
+			kind,
+			strategy,
+			left,
+			right,
+			..
+		} => Some(
+			adr260_probe_find_join(left)
+				.or_else(|| adr260_probe_find_join(right))
+				.unwrap_or((*kind, *strategy)),
+		),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => adr260_probe_find_join(input),
+		_ => None,
+	}
+}
+
+#[tokio::test]
+async fn adr260_verify_probe_left_outer_over_grouped_aggregate_fragments() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"WITH s AS (SELECT orders.customer_id, MAX(orders.id) AS v \
+			            FROM orders GROUP BY orders.customer_id) \
+			 SELECT customers.id \
+			 FROM customers \
+			 LEFT JOIN s ON customers.id = s.customer_id",
+		)
+		.expect("plan manual correlated-scalar shape (CTE form)");
+	let bound = bind(
+		&logical,
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind LeftOuter over grouped aggregate");
+
+	let (kind, strategy) =
+		adr260_probe_find_join(&bound).expect("a join is present in the bound plan");
+	assert!(
+		matches!(kind, JoinKind::LeftOuter),
+		"the decorrelated recombine is a LeftOuter, got {kind:?}"
+	);
+	assert!(
+		matches!(strategy, JoinStrategy::HashPartitioned),
+		"a LeftOuter cannot broadcast, so it fragments on the hash path, got {strategy:?}"
+	);
+
+	let stages = fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("LeftOuter over a grouped aggregate fragments");
+	// Hash join over two producers: left producer + right (grouped-aggregate) producer + join consumer.
+	assert_eq!(
+		stages.len(),
+		3,
+		"hash LeftOuter over grouped aggregate is a 3-stage plan"
+	);
+}

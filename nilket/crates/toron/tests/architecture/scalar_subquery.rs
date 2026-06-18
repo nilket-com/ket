@@ -64,20 +64,26 @@ pub(crate) fn adr257_scalar_subquery_pulls_up_into_cross() {
 
 	// The frontend pull-up: a scalar SqlExpr::Subquery lowers into a keyless Cross plus a reference to the
 	// aliased subplan's single column. Built via the keyless build_auto_join_plan (NOT the SQL
-	// JOIN-with-derived path, which trips the adr145 fence).
+	// JOIN-with-derived path, which trips the adr145 fence). ADR 260 renamed the fold to
+	// `join_scalar_subplans` (it also handles the correlated `LeftOuter` case); the uncorrelated scalar
+	// still folds as this keyless Cross.
 	assert!(
 		planner.contains("fn pull_up_scalar_subqueries"),
 		"the planner must pull scalar subqueries up"
 	);
-	let fold = source_block(&planner, "fn cross_join_scalar_subplans");
+	let fold = source_block(&planner, "fn join_scalar_subplans");
 	assert!(
 		fold.contains("build_auto_join_plan(plan, subplan, JoinKind::Cross, vec![])"),
-		"the scalar subplan must fold onto the plan as a keyless Cross via build_auto_join_plan"
+		"the uncorrelated scalar subplan must fold onto the plan as a keyless Cross via build_auto_join_plan"
 	);
 	let pull = source_block(&planner, "fn pull_up_scalar_subqueries");
 	assert!(
-		pull.contains("SqlExpr::Subquery(query)") && pull.contains("SqlExpr::CompoundIdentifier"),
+		pull.contains("SqlExpr::Subquery(query)") && pull.contains("scalar_value_reference"),
 		"a scalar SqlExpr::Subquery must be replaced by a qualified column reference"
+	);
+	assert!(
+		source_block(&planner, "fn scalar_value_reference").contains("SqlExpr::CompoundIdentifier"),
+		"the scalar value reference is a qualified column (CompoundIdentifier)"
 	);
 
 	let behavior = source("tests/group_by_test.rs");

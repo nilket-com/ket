@@ -320,18 +320,159 @@ fn non_equi_correlated_in_and_correlated_scalar_stay_rejected() {
 		"{err}"
 	);
 
-	// Correlated scalar subqueries are a separate (grouped-aggregate) mechanism.
+	// ADR 260 lowers a WHERE-correlated aggregate scalar; a correlation in the aggregate ARGUMENT is
+	// undecorrelatable by GROUP BY and stays deferred (a separate mechanism).
 	let err = SqlPlanner::new()
 		.plan(
 			"SELECT * FROM fact WHERE fact.pk > \
-			 (SELECT MIN(dim.score) FROM dim WHERE dim.k = fact.k)",
+			 (SELECT MIN(dim.score + fact.pk) FROM dim WHERE dim.k = fact.k)",
 		)
-		.expect_err("correlated scalar subquery should be unsupported");
+		.expect_err("aggregate-argument correlated scalar should be unsupported");
 	assert!(
 		err.to_string()
 			.contains("correlated scalar subqueries are not supported"),
 		"{err}"
 	);
+}
+
+// ADR 260: a WHERE-correlated aggregate scalar decorrelates to a grouped aggregate (keyed on the
+// correlation) recombined with a `LeftOuter`. `MAX(dim.score)` per `fact.k` is
+// {k1: 20, k3: 30, k4: 40} (k=2,NULL,5 match no dim group → NULL).
+#[tokio::test]
+async fn correlated_aggregate_scalar_decorrelates_to_left_outer() {
+	let batch = run_sql(
+		"SELECT fact.pk FROM fact \
+		 WHERE (SELECT MAX(dim.score) FROM dim WHERE dim.k = fact.k) > 25",
+	)
+	.await;
+	assert_pk_values(&batch, &[3, 5]);
+
+	// The correlation changes the answer: the uncorrelated global MAX is 50 (> 25 for every row).
+	let uncorrelated =
+		run_sql("SELECT fact.pk FROM fact WHERE (SELECT MAX(dim.score) FROM dim) > 25").await;
+	assert_pk_values(&uncorrelated, &[1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn correlated_scalar_recombines_as_keyed_left_outer() {
+	let plan =
+		plan_sql("SELECT fact.pk, (SELECT MAX(dim.score) FROM dim WHERE dim.k = fact.k) FROM fact");
+	let LogicalPlan::Project { input, .. } = plan else {
+		panic!("expected projection over the recombine");
+	};
+	let LogicalPlan::Join {
+		kind, on, right, ..
+	} = *input
+	else {
+		panic!("expected a join recombine");
+	};
+	assert_eq!(kind, JoinKind::LeftOuter);
+	assert_eq!(on.len(), 1, "recombine keys on the single correlation pair");
+	assert!(
+		find_aggregate(&right),
+		"the recombined right side is a grouped aggregate, not a keyless scalar Cross"
+	);
+}
+
+// ADR 260 COUNT empty-group identity: COUNT over an empty correlated group is 0 (not NULL). pk 2, 4, 6
+// match no dim group (k=2, NULL, 5), so COALESCE(value, 0) = 0 keeps them; a naive un-wrapped LeftOuter
+// would yield NULL and drop all three.
+#[tokio::test]
+async fn correlated_count_scalar_empty_group_is_zero() {
+	let batch = run_sql(
+		"SELECT fact.pk FROM fact \
+		 WHERE (SELECT COUNT(*) FROM dim WHERE dim.k = fact.k) = 0",
+	)
+	.await;
+	assert_pk_values(&batch, &[2, 4, 6]);
+}
+
+// ADR 260: an inner residual (`dim.active = true`) filters the inner rows before aggregation, coexisting
+// with the correlation key. It empties k=4's group (its only dim row is inactive), dropping pk=5 vs the
+// no-residual {3, 5}.
+#[tokio::test]
+async fn correlated_aggregate_scalar_with_inner_residual() {
+	let batch = run_sql(
+		"SELECT fact.pk FROM fact \
+		 WHERE (SELECT MAX(dim.score) FROM dim WHERE dim.k = fact.k AND dim.active = true) > 25",
+	)
+	.await;
+	assert_pk_values(&batch, &[3]);
+}
+
+// ADR 260 regression: an uncorrelated global-aggregate scalar still folds via ADR 257's keyless `Cross`
+// (the `correlation_pairs == []` path), not a `LeftOuter`.
+#[test]
+fn uncorrelated_global_aggregate_scalar_unchanged() {
+	let plan = plan_sql("SELECT fact.pk, (SELECT MAX(dim.score) FROM dim) FROM fact");
+	let LogicalPlan::Project { input, .. } = plan else {
+		panic!("expected projection over the scalar Cross");
+	};
+	let LogicalPlan::Join { kind, on, .. } = *input else {
+		panic!("expected a Cross join recombine");
+	};
+	assert_eq!(kind, JoinKind::Cross);
+	assert!(on.is_empty(), "the uncorrelated scalar fold stays keyless");
+}
+
+#[test]
+fn aggregate_arg_and_non_aggregate_correlated_scalar_stay_rejected() {
+	// Correlation in the aggregate argument is undecorrelatable by GROUP BY.
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT fact.pk FROM fact WHERE fact.pk > \
+			 (SELECT MAX(dim.score + fact.pk) FROM dim WHERE dim.k = fact.k)",
+		)
+		.expect_err("aggregate-argument correlation should reject");
+	assert!(
+		err.to_string()
+			.contains("correlated scalar subqueries are not supported"),
+		"{err}"
+	);
+
+	// A non-aggregate correlated scalar needs a ≤1-row cardinality assert (a separate, deferred cut).
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT fact.pk FROM fact WHERE fact.pk > \
+			 (SELECT dim.score FROM dim WHERE dim.k = fact.k)",
+		)
+		.expect_err("non-aggregate correlated scalar should reject");
+	assert!(
+		err.to_string()
+			.contains("non-aggregate scalar subqueries are not supported"),
+		"{err}"
+	);
+}
+
+// ADR 260: a scalar subquery pulled from WHERE appends its synthetic `__scalar_N` columns to the plan;
+// a bare `SELECT *` would expose them (the frontend is schema-less and cannot project back). Reject
+// rather than leak — an explicit projection list lowers correctly (see the execute tests above).
+#[tokio::test]
+async fn wildcard_over_where_scalar_rejects_rather_than_leaking() {
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact \
+			 WHERE (SELECT MAX(dim.score) FROM dim WHERE dim.k = fact.k) > 25",
+		)
+		.expect_err("SELECT * over a WHERE scalar should reject, not leak __scalar columns");
+	assert!(
+		err.to_string()
+			.contains("SELECT * with a scalar subquery in WHERE is not supported"),
+		"{err}"
+	);
+
+	// The explicit-projection form (which drops the synthetic columns via its Project) still works.
+	let batch = run_sql(
+		"SELECT fact.pk FROM fact \
+		 WHERE (SELECT MAX(dim.score) FROM dim WHERE dim.k = fact.k) > 25",
+	)
+	.await;
+	assert_eq!(
+		batch.num_columns(),
+		1,
+		"explicit projection exposes only the listed column"
+	);
+	assert_pk_values(&batch, &[3, 5]);
 }
 
 #[test]
@@ -403,6 +544,19 @@ async fn existing_sql_queries_byte_identical_after_lower_select_refactor() {
 
 fn plan_sql(sql: &str) -> LogicalPlan {
 	SqlPlanner::new().plan(sql).expect("plan sql")
+}
+
+/// Does the subtree contain a grouped `Aggregate` (the ADR 260 decorrelated recombine's right side)?
+fn find_aggregate(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Aggregate { .. } => true,
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. } => find_aggregate(input),
+		LogicalPlan::Join { left, right, .. } => find_aggregate(left) || find_aggregate(right),
+		_ => false,
+	}
 }
 
 fn assert_unsupported(sql: &str) {

@@ -2684,10 +2684,11 @@ async fn non_aggregate_and_correlated_scalar_subqueries_stay_rejected() {
 		"SELECT region, (SELECT region FROM regions) FROM regions",
 		"non-aggregate scalar subqueries are not supported",
 	);
-	// A correlated scalar subquery (references an outer relation) needs decorrelation (deferred).
+	// ADR 260 lowers a WHERE-correlated aggregate scalar; a correlation in the aggregate ARGUMENT is
+	// undecorrelatable by GROUP BY and stays deferred.
 	assert_unsupported_message(
 		"SELECT region FROM regions \
-		 WHERE active < (SELECT AVG(amount) FROM sales WHERE sales.region = regions.region)",
+		 WHERE active < (SELECT AVG(amount + regions.region) FROM sales WHERE sales.region = regions.region)",
 		"correlated scalar subqueries are not supported",
 	);
 }

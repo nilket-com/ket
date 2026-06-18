@@ -212,8 +212,89 @@ pub(crate) fn adr259_non_equi_and_scalar_correlation_stay_deferred() {
 	);
 	assert!(
 		planner.contains("correlated scalar subqueries are not supported"),
-		"correlated scalar subqueries stay deferred (a separate grouped-aggregate mechanism)"
+		"a correlated scalar's aggregate-argument reference stays deferred (ADR 260 lowers WHERE \
+		 correlation; this string now narrows to aggregate-argument correlation)"
 	);
 	let tests = source("tests/exists_decorrelation_test.rs");
 	assert!(tests.contains("non_equi_correlated_in_and_correlated_scalar_stay_rejected"));
+}
+
+#[test]
+pub(crate) fn adr260_correlated_aggregate_scalar_decorrelates_via_grouped_left_outer() {
+	// A WHERE-correlated aggregate scalar splits its WHERE via the EXISTS classifier, builds a grouped
+	// Aggregate keyed on the correlation, and recombines with a `LeftOuter` — no new join kind / operator.
+	let planner = source("src/sql_planner.rs");
+	let pull_up = brace_blocks_after_marker(&planner, "fn pull_up_scalar_subqueries")
+		.into_iter()
+		.next()
+		.expect("pull_up_scalar_subqueries body")
+		.1;
+	assert!(
+		pull_up.contains("classify_exists_conjunct")
+			&& pull_up.contains("ExistsConjunct::CorrelatedPair"),
+		"the correlated scalar WHERE is split via the EXISTS classifier: {pull_up}"
+	);
+	assert!(
+		pull_up.contains("LogicalPlan::Aggregate"),
+		"the correlation decorrelates into a grouped aggregate: {pull_up}"
+	);
+	let fold = brace_blocks_after_marker(&planner, "fn join_scalar_subplans")
+		.into_iter()
+		.next()
+		.expect("join_scalar_subplans body")
+		.1;
+	assert!(
+		fold.contains("JoinKind::LeftOuter") && fold.contains("JoinKind::Cross"),
+		"the fold recombines correlated scalars via LeftOuter and uncorrelated via keyless Cross: {fold}"
+	);
+	let tests = source("tests/exists_decorrelation_test.rs");
+	assert!(
+		tests.contains("correlated_aggregate_scalar_decorrelates_to_left_outer")
+			&& tests.contains("correlated_scalar_recombines_as_keyed_left_outer")
+			&& tests.contains("correlated_count_scalar_empty_group_is_zero")
+			&& tests.contains("uncorrelated_global_aggregate_scalar_unchanged"),
+		"the decorrelation + COUNT + uncorrelated-regression discriminators are pinned"
+	);
+}
+
+#[test]
+pub(crate) fn adr260_correlated_scalar_is_frontend_only() {
+	assert!(
+		source("src/sql_planner.rs").contains("fn join_scalar_subplans"),
+		"the scalar decorrelation lives in the planner"
+	);
+	for path in [
+		"src/ir.rs",
+		"src/ir/execution.rs",
+		"src/exec.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let src = source(path);
+		assert!(
+			!src.contains("join_scalar_subplans") && !src.contains("pull_up_scalar_subqueries"),
+			"correlated scalar decorrelation stays out of the IR/executor/fragmenter: {path}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr260_aggregate_arg_and_non_aggregate_scalar_stay_deferred() {
+	let planner = source("src/sql_planner.rs");
+	assert!(
+		planner.contains("correlated scalar subqueries are not supported"),
+		"aggregate-argument correlation stays deferred (undecorrelatable by GROUP BY)"
+	);
+	assert!(
+		planner.contains("non-aggregate scalar subqueries are not supported"),
+		"non-aggregate scalar subqueries stay deferred (need a ≤1-row cardinality assert)"
+	);
+	assert!(
+		planner.contains("scalar subqueries in GROUP BY/HAVING are not supported"),
+		"a scalar in GROUP BY/HAVING stays deferred (recombine above the aggregate)"
+	);
+	let tests = source("tests/exists_decorrelation_test.rs");
+	assert!(
+		tests.contains("aggregate_arg_and_non_aggregate_correlated_scalar_stay_rejected"),
+		"the deferred-shape rejects are pinned"
+	);
 }
