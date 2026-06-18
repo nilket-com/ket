@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Date32Array, Float64Array};
+use arrow::array::{Date32Array, Decimal128Array, Float64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -52,6 +52,17 @@ pub const Q6_DEV_SQL: &str = "SELECT SUM(l_extendedprice * l_discount) AS revenu
 	  AND l_shipdate <  DATE '1995-01-01' \
 	  AND l_discount BETWEEN 0.05 AND 0.07 \
 	  AND l_quantity < 24.0";
+
+/// ADR 262: the strict Q6 query — the same Q6 *shape* with literal date bounds, run against the
+/// official-*typed* `Decimal128(15,2)` fixture. The numeric literals (`0.05`, `0.07`, `24`) lower to
+/// `Float64`/integer (Toron has no Decimal `ScalarValue`), so `l_discount BETWEEN 0.05 AND 0.07`
+/// compares `Decimal128` against `Float64` — the measured bind-time blocker. NOT a TPC-H result.
+pub const STRICT_Q6_SQL: &str = "SELECT SUM(l_extendedprice * l_discount) AS revenue \
+	FROM lineitem \
+	WHERE l_shipdate >= DATE '1994-01-01' \
+	  AND l_shipdate <  DATE '1995-01-01' \
+	  AND l_discount BETWEEN 0.05 AND 0.07 \
+	  AND l_quantity < 24";
 
 /// The dev `LINEITEM` schema: only the Q6 columns, money/qty/discount as `Float64`, ship date as
 /// `Date32`. No string carriers; an append-only (PK-less) identity, so no synthetic key column.
@@ -105,6 +116,68 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	.expect("dev lineitem batch")
 }
 
+/// ADR 262: the strict `LINEITEM` schema — official physical types: `Decimal128(15,2)` for
+/// money/quantity/discount, `Date32` for ship date. Same columns as dev, different *types* (the gap
+/// this cut measures).
+fn strict_lineitem_schema() -> SchemaRef {
+	let decimal = |name: &str| Field::new(name, DataType::Decimal128(15, 2), false);
+	Arc::new(Schema::new(vec![
+		decimal("l_quantity"),
+		decimal("l_extendedprice"),
+		decimal("l_discount"),
+		Field::new("l_shipdate", DataType::Date32, false),
+	]))
+}
+
+fn strict_lineitem_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([2; 16]),
+		1,
+		"default",
+		"lineitem",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("strict lineitem descriptor")
+}
+
+/// Generate the Q6-needed `LINEITEM` columns at `scale_factor` as official `Decimal128(15,2)` Arrow —
+/// no `Float64` conversion (that is the dev path). `TPCHDecimal::into_inner()` is already the scale-2
+/// raw value; the whole-number quantity is scaled by 100.
+pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
+	let generator = LineItemGenerator::new(scale_factor, 1, 1);
+	let mut quantity = Vec::new();
+	let mut extendedprice = Vec::new();
+	let mut discount = Vec::new();
+	let mut shipdate = Vec::new();
+	for item in generator.iter() {
+		quantity.push(item.l_quantity as i128 * 100);
+		extendedprice.push(item.l_extendedprice.into_inner() as i128);
+		discount.push(item.l_discount.into_inner() as i128);
+		shipdate.push(item.l_shipdate.to_unix_epoch());
+	}
+	let decimal = |values: Vec<i128>| {
+		Arc::new(
+			Decimal128Array::from(values)
+				.with_precision_and_scale(15, 2)
+				.expect("decimal128 column"),
+		) as arrow::array::ArrayRef
+	};
+	RecordBatch::try_new(
+		strict_lineitem_schema(),
+		vec![
+			decimal(quantity),
+			decimal(extendedprice),
+			decimal(discount),
+			Arc::new(Date32Array::from(shipdate)),
+		],
+	)
+	.expect("strict lineitem batch")
+}
+
 /// The load seam: an in-memory [`StorageScan`] over generated batches, mirroring the test `FixtureScan`
 /// (honor a pushed PBC predicate, then a projection). This is the one place the harness reaches into
 /// Toron's storage trait.
@@ -148,15 +221,22 @@ impl StorageScan for HarnessScan {
 	}
 }
 
-/// Run the dev Q6 proxy single-node, recording the deepest phase reached. A stage error is classified
-/// against the recognized-blocker allowlist: a recognized reason is `blocked`, anything else is `fail`.
-pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
+/// Run a Q6 variant single-node over a pre-built fixture, recording the deepest phase reached. A stage
+/// error is classified against the recognized-blocker allowlist: a recognized reason is `blocked`,
+/// anything else is `fail`. Shared by the dev (Float64) and strict (Decimal128) runs.
+async fn run_q6(
+	mode: &str,
+	scale_factor: f64,
+	sql: &str,
+	batch: RecordBatch,
+	descriptor: TableSchemaDescriptor,
+) -> Attempt {
 	let start = Instant::now();
 	let attempt =
 		|phase: Phase, status: Status, reason: Option<String>, digest: Option<String>| Attempt {
 			query: "q06".to_string(),
 			scale_factor,
-			mode: "dev".to_string(),
+			mode: mode.to_string(),
 			phase,
 			status,
 			reason,
@@ -164,13 +244,9 @@ pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 			digest,
 		};
 
-	// generate + load
-	let batch = generate_dev_lineitem(scale_factor);
-	let schema = dev_lineitem_schema();
+	// load
 	let mut catalog = MockCatalog::new();
-	if let Err(error) =
-		catalog.register_descriptor(TableId(1), dev_lineitem_descriptor(schema.as_ref()))
-	{
+	if let Err(error) = catalog.register_descriptor(TableId(1), descriptor) {
 		let reason = reason_for_error(&format!("{error:?}"));
 		return attempt(
 			Phase::Load,
@@ -184,7 +260,7 @@ pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 	});
 
 	// plan
-	let logical = match SqlPlanner::new().plan(Q6_DEV_SQL) {
+	let logical = match SqlPlanner::new().plan(sql) {
 		Ok(plan) => plan,
 		Err(error) => {
 			let reason = reason_for_error(&error.to_string());
@@ -241,33 +317,98 @@ pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
 	attempt(Phase::Execute, Status::Pass, None, Some(digest))
 }
 
-/// Strict-mode Q6 is a skeleton in ADR 261: it requires the (deferred) official schema/data/answer
-/// pipeline, so it records `not_attempted reason=strict_inputs_required` rather than fabricating an
-/// engine blocker. Reporting the first real phase a user-supplied official run reaches is a follow-on.
-pub fn run_strict_q6() -> Attempt {
-	Attempt {
-		query: "q06".to_string(),
-		scale_factor: 0.0,
-		mode: "strict".to_string(),
-		phase: Phase::Generate,
-		status: Status::NotAttempted,
-		reason: Some("strict_inputs_required".to_string()),
-		elapsed_ms: 0.0,
-		digest: None,
-	}
+/// Dev Q6: the `Float64` proxy. A `pass` means the shape reached `execute` (reachability), not TPC-H
+/// correctness.
+pub async fn run_dev_q6(scale_factor: f64) -> Attempt {
+	let schema = dev_lineitem_schema();
+	run_q6(
+		"dev",
+		scale_factor,
+		Q6_DEV_SQL,
+		generate_dev_lineitem(scale_factor),
+		dev_lineitem_descriptor(schema.as_ref()),
+	)
+	.await
 }
 
-/// The 22-query reachability inventory: dev implementation state + strict (input-gated) state.
+/// ADR 262 — Strict Q6: the official-*typed* `Decimal128(15,2)` fixture + Q6 shape, recording the first
+/// phase it blocks. Grounded result: `phase=bind reason=unsupported_decimal_scalar` (decimal literals
+/// lower to `Float64`, mismatching the `Decimal128` column at bind). "strict" here = official physical
+/// types + shape, NOT official provenance or answer correctness — NOT a TPC-H result.
+pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
+	let schema = strict_lineitem_schema();
+	run_q6(
+		"strict",
+		scale_factor,
+		STRICT_Q6_SQL,
+		generate_strict_lineitem(scale_factor),
+		strict_lineitem_descriptor(schema.as_ref()),
+	)
+	.await
+}
+
+/// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
+/// NOT the last measured result. q06 is implemented in both modes; the rest are not yet attempted.
+/// Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed [`matrix`].
 pub fn status_rows() -> Vec<String> {
 	ALL_QUERY_IDS
 		.iter()
 		.map(|id| {
-			let dev = if *id == "q06" {
+			let state = if *id == "q06" {
 				"implemented"
 			} else {
 				"not_attempted"
 			};
-			format!("{id} dev={dev} strict=input_gated")
+			format!("{id} dev={state} strict={state}")
+		})
+		.collect()
+}
+
+/// Regenerate the query × mode reachability matrix from `target/tpch/reachability.jsonl` — the latest
+/// recorded outcome per (query, mode). This is the only place measured `blocked`/`fail` rows live (the
+/// `status` inventory never encodes a measured result). An absent/unreadable log → the static inventory.
+pub fn matrix() -> Vec<String> {
+	let log = format!("{CACHE_ROOT}/reachability.jsonl");
+	let contents = std::fs::read_to_string(&log).unwrap_or_default();
+	if contents.trim().is_empty() {
+		return status_rows();
+	}
+	matrix_from_log(&contents)
+}
+
+/// The pure matrix renderer over a `reachability.jsonl` body — the latest outcome per (query, mode).
+/// Split out so it is testable without the shared cache file.
+pub fn matrix_from_log(contents: &str) -> Vec<String> {
+	let mut latest: HashMap<(String, String), String> = HashMap::new();
+	for line in contents.lines() {
+		let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+			continue;
+		};
+		let query = row["query"].as_str().unwrap_or("?").to_string();
+		let mode = row["mode"].as_str().unwrap_or("?").to_string();
+		let phase = row["phase"].as_str().unwrap_or("?");
+		let status = row["status"].as_str().unwrap_or("?");
+		let cell = match status {
+			"blocked" | "fail" => {
+				format!(
+					"{status}({}@{phase})",
+					row["reason"].as_str().unwrap_or("?")
+				)
+			}
+			_ => format!("{status}@{phase}"),
+		};
+		latest.insert((query, mode), cell);
+	}
+	ALL_QUERY_IDS
+		.iter()
+		.map(|id| {
+			let cell = |mode: &str| {
+				latest
+					.get(&(id.to_string(), mode.to_string()))
+					.cloned()
+					.unwrap_or_else(|| "not_run".to_string())
+			};
+			format!("{id} dev={} strict={}", cell("dev"), cell("strict"))
 		})
 		.collect()
 }

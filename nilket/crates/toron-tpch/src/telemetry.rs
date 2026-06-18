@@ -57,6 +57,7 @@ impl Status {
 pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"strict_inputs_required",
 	"unsupported_decimal_ddl",
+	"unsupported_decimal_scalar",
 	"unsupported_decimal_arrow",
 	"unsupported_date_interval",
 	"unsupported_query_surface",
@@ -77,7 +78,14 @@ pub fn reason_for_error(message: &str) -> &'static str {
 	let lowered = message.to_ascii_lowercase();
 	if lowered.contains("decimal") && lowered.contains("create table") {
 		"unsupported_decimal_ddl"
+	} else if lowered.contains("decimal") && lowered.contains("comparison operands") {
+		// A Decimal column compared against a non-Decimal literal: Toron has no Decimal `ScalarValue`,
+		// so decimal literals lower to `Float64`/integer and the comparison fails type unification. This
+		// is the measured strict-Q6 bind gap. Keep the marker specific (`comparison operands`) so an
+		// unrelated Decimal message that merely mentions "type" is NOT overclassified here.
+		"unsupported_decimal_scalar"
 	} else if lowered.contains("decimal") {
+		// Reserved for a future Decimal carrier/load gap (Arrow Decimal data the engine can't carry).
 		"unsupported_decimal_arrow"
 	} else if lowered.contains("interval") {
 		"unsupported_date_interval"

@@ -87,3 +87,62 @@ fn adr261_cache_root_is_target_not_tracked() {
 		"the cache/output root defaults under target/, never a tracked path"
 	);
 }
+
+#[test]
+fn adr262_strict_q6_attempts_decimal128_compute() {
+	let lib = source("src/lib.rs");
+	assert!(
+		lib.contains("Decimal128")
+			&& lib.contains("fn generate_strict_lineitem")
+			&& lib.contains("STRICT_Q6_SQL"),
+		"strict mode builds a Decimal128(15,2) fixture + strict Q6"
+	);
+	assert!(
+		lib.contains("fn run_strict_q6") && lib.contains("run_q6("),
+		"strict run goes through the shared plan/bind/execute runner"
+	);
+	let probe = source("tests/decimal_probe.rs");
+	assert!(
+		probe.contains("decimal128_compute_blocks_at_bind")
+			&& probe.contains("decimal_ddl_blocks_at_plan"),
+		"both probes are retained as tests"
+	);
+}
+
+#[test]
+fn adr262_first_red_row_is_grounded_not_predeclared() {
+	let lib = source("src/lib.rs");
+	// stage errors are classified from the actual engine message, not hardcoded
+	assert!(
+		lib.contains("reason_for_error(&format!"),
+		"the run path classifies the engine error message"
+	);
+	// the strict run delegates to the shared, classified runner (no predeclared reason in its body)
+	assert!(
+		lib.contains("fn run_strict_q6") && lib.contains("run_q6("),
+		"strict run does not predeclare a blocker"
+	);
+}
+
+#[test]
+fn adr262_matrix_regenerated_from_jsonl() {
+	let lib = source("src/lib.rs");
+	assert!(
+		lib.contains("reachability.jsonl") && lib.contains("fn matrix_from_log"),
+		"the matrix regenerates from the JSONL log; no hand-maintained matrix state"
+	);
+}
+
+#[test]
+fn adr262_status_is_inventory_not_last_result() {
+	let lib = source("src/lib.rs");
+	let tests = source("tests/harness.rs");
+	assert!(
+		lib.contains("fn status_rows") && !lib.contains("strict=blocked"),
+		"status is static inventory and never encodes a measured `blocked` result"
+	);
+	assert!(
+		tests.contains("status_marks_q06_strict_implemented_not_last_result"),
+		"the status-is-inventory behavior is pinned"
+	);
+}

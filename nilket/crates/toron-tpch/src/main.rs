@@ -5,7 +5,9 @@
 use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
-use toron_tpch::{CACHE_ROOT, generate_dev_lineitem, run_dev_q6, run_strict_q6, status_rows};
+use toron_tpch::{
+	CACHE_ROOT, generate_dev_lineitem, matrix, run_dev_q6, run_strict_q6, status_rows,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -28,6 +30,12 @@ async fn main() -> ExitCode {
 				"prepared dev lineitem rows={} sf={sf} cache_root={CACHE_ROOT}",
 				batch.num_rows()
 			);
+			ExitCode::SUCCESS
+		}
+		"matrix" => {
+			for row in matrix() {
+				println!("{row}");
+			}
 			ExitCode::SUCCESS
 		}
 		"run" => run_command(&args).await,
@@ -54,7 +62,7 @@ async fn run_command(args: &[String]) -> ExitCode {
 			digest: None,
 		}
 	} else if mode == "strict" {
-		run_strict_q6()
+		run_strict_q6(sf).await
 	} else {
 		run_dev_q6(sf).await
 	};
@@ -100,7 +108,7 @@ fn sf_arg(args: &[String]) -> f64 {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run> [--query q06] [--mode dev|strict] [--sf 0.01] [--allow-blocked]"
+		"usage: toron-tpch <status|prepare|run|matrix> [--query q06] [--mode dev|strict] [--sf 0.01] [--allow-blocked]"
 	);
 	ExitCode::from(2)
 }
