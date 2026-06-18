@@ -2970,28 +2970,107 @@ async fn derived_table_source_scope_rejects_general_subquery_features() {
 	}
 }
 
-/// ADR 264 → ADR 265 known gap: a JOIN inside a derived table is supported (ADR 254 lowers it as a named
-/// relation), but a *logical-typed* column does not yet survive the join-bodied derived-table schema
-/// propagation — it errors at bind with `unknown logical type`. ADR 265 will thread the logical-type
-/// registry through and flip this assertion to a positive bind+execute. Discriminating: it fails the day
-/// 265 lands, forcing the update.
+/// ADR 265 (flips ADR 264's known-gap tripwire): a JOIN inside a derived table carrying a *durable*
+/// logical-typed column now binds and executes — the catalog registry is threaded into the join-key
+/// validation.
 #[tokio::test]
-async fn join_bodied_derived_table_with_logical_type_is_adr265_known_gap() {
+async fn join_bodied_derived_table_with_logical_type_now_binds_and_executes() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	execute(
+		&coordinator,
+		&planner,
+		"INSERT INTO people VALUES (1, 'a'), (2, 'b')",
+	)
+	.await;
+
+	let sql = "SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0";
+	let plan = planner.plan(sql).expect("plans");
+	bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("ADR 265: durable logical type resolves through the threaded registry");
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("ADR 265: binds and executes end-to-end");
+}
+
+/// ADR 265 corrected headline: a *plain* equi-join on a durable logical-typed key binds and executes —
+/// not just the derived-table case. `PersonId` is a durable NON-seed type, so this proves the registry is
+/// actually threaded (a seed-typed key would resolve via the seed leg and mask a threading regression).
+#[tokio::test]
+async fn plain_equi_join_on_durable_logical_type_binds_and_executes() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	execute(
+		&coordinator,
+		&planner,
+		"INSERT INTO people VALUES (1, 'a'), (2, 'b')",
+	)
+	.await;
+
+	let sql = "SELECT people.id FROM people JOIN people AS other ON people.id = other.id";
+	let plan = planner.plan(sql).expect("plans");
+	bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("ADR 265: durable join key resolves");
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("ADR 265: binds and executes end-to-end");
+}
+
+/// ADR 265 second caller: a direct `Expr::LogicalAscription` ascribing the durable `PersonId` over
+/// `people.id` binds and preserves the `PersonId` identity. It reaches the same registry-aware
+/// `validate_logical_ascription_physical` as the join path; fails today on seed-only resolution.
+#[tokio::test]
+async fn direct_durable_logical_ascription_binds_with_catalog_registry() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
 
-	let sql = "SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0";
-	let plan = planner
-		.plan(sql)
-		.expect("ADR 254: a join inside a derived table plans");
+	let plan = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("people"),
+			projection: None,
+		}),
+		exprs: vec![Expr::LogicalAscription {
+			expr: Box::new(Expr::column("id")),
+			logical_type: LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+		}],
+		output_names: vec![Some("id".to_string())],
+	};
+	let bound = bind_logical(catalog.as_ref(), plan).await;
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+/// ADR 265 guard: the fix expands *resolution*, not *compatibility*. A join whose two keys carry
+/// *different* durable logical types still rejects with a nominal-type mismatch — reached only because
+/// both durable types now resolve (pre-fix it died earlier at `unknown logical type`).
+#[tokio::test]
+async fn equi_join_on_incompatible_durable_logical_types_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE LOGICAL TYPE AccountId AS BIGINT",
+		"CREATE TABLE people (id PersonId, note TEXT)",
+		"CREATE TABLE accounts (account_id AccountId, label TEXT)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let sql = "SELECT people.id FROM people JOIN accounts ON people.id = accounts.account_id";
+	let plan = planner.plan(sql).expect("plans");
 	let error = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
 		.await
-		.expect_err(
-			"ADR 265 gap: logical type does not yet propagate through a join-bodied derived table",
-		);
+		.expect_err("incompatible durable logical join keys must reject");
+	let rendered = format!("{error:?}");
 	assert!(
-		format!("{error:?}").contains("unknown logical type"),
-		"the known gap is the logical-type propagation bind error, not a derived-table rejection: {error:?}"
+		rendered.contains("NominalTypeMismatch"),
+		"rejects on logical-identity mismatch, not silently accepted: {rendered}"
+	);
+	assert!(
+		!rendered.contains("unknown logical type"),
+		"both durable types resolve now — the rejection is compatibility, not the seed-only failure: {rendered}"
 	);
 }
 

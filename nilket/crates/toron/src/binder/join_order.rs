@@ -5085,10 +5085,16 @@ impl<'a> Binder<'a> {
 	) -> Result<Option<StarDimensionJoinEdge>, BindingError> {
 		let mut left_resolved_keys = Vec::new();
 		let mut right_resolved_keys = Vec::new();
+		// ADR 265: thread the catalog registry so durable logical-typed star-join keys resolve.
+		let logical_type_registry = self.catalog.logical_type_registry();
 		for (left_expr, right_expr) in on {
-			let Ok((left_key, right_key)) =
-				bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)
-			else {
+			let Ok((left_key, right_key)) = bind_join_key_pair(
+				left_expr,
+				right_expr,
+				&left_plan.scope,
+				&right_plan.scope,
+				&logical_type_registry,
+			) else {
 				return Ok(None);
 			};
 			validate_join_key_types(&left_key, &right_key)?;

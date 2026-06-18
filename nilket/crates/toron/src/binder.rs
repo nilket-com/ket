@@ -35,8 +35,7 @@ use crate::ir::{
 	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, arithmetic_output_type,
 	calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
-	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
-	schema_for_exprs,
+	logical_type_name, nanos_per_timestamp_unit, scalar_literal_key, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -2645,9 +2644,17 @@ impl<'a> Binder<'a> {
 				right_resolved_keys.push(right_key);
 			}
 		} else {
+			// ADR 265: the join-key path validates each key's logical type; thread the catalog registry
+			// so durable (runtime-registered) logical types resolve, not just seeds.
+			let logical_type_registry = self.catalog.logical_type_registry();
 			for (left_expr, right_expr) in on {
-				let (left_key, right_key) =
-					bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)?;
+				let (left_key, right_key) = bind_join_key_pair(
+					left_expr,
+					right_expr,
+					&left_plan.scope,
+					&right_plan.scope,
+					&logical_type_registry,
+				)?;
 				validate_join_key_types(&left_key, &right_key)?;
 				left_keys.push(left_key.column.ordinal);
 				right_keys.push(right_key.column.ordinal);

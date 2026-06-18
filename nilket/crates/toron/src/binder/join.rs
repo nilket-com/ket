@@ -432,6 +432,7 @@ pub(super) fn bind_join_key_pair(
 	right_expr: &Expr,
 	left_scope: &RelationScope,
 	right_scope: &RelationScope,
+	registry: &LogicalTypeRegistry,
 ) -> Result<(ResolvedJoinKey, ResolvedJoinKey), BindingError> {
 	let (left_ref, left_logical_type) = join_key_column_ref(left_expr)?;
 	let (right_ref, right_logical_type) = join_key_column_ref(right_expr)?;
@@ -448,12 +449,12 @@ pub(super) fn bind_join_key_pair(
 		resolve_join_column_across(right_ref, left_scope, right_scope)?,
 	) {
 		(JoinColumnResolution::Left(left), JoinColumnResolution::Right(right)) => Ok((
-			resolved_join_key(left, left_logical_type)?,
-			resolved_join_key(right, right_logical_type)?,
+			resolved_join_key(left, left_logical_type, registry)?,
+			resolved_join_key(right, right_logical_type, registry)?,
 		)),
 		(JoinColumnResolution::Right(right), JoinColumnResolution::Left(left)) => Ok((
-			resolved_join_key(left, right_logical_type)?,
-			resolved_join_key(right, left_logical_type)?,
+			resolved_join_key(left, right_logical_type, registry)?,
+			resolved_join_key(right, left_logical_type, registry)?,
 		)),
 		(JoinColumnResolution::Left(_), JoinColumnResolution::Left(_))
 		| (JoinColumnResolution::Right(_), JoinColumnResolution::Right(_)) => {
@@ -1173,14 +1174,19 @@ pub(super) fn join_key_column_ref(
 pub(super) fn resolved_join_key(
 	column: ResolvedLogicalColumn,
 	declared_logical_type: LogicalTypeId,
+	registry: &LogicalTypeRegistry,
 ) -> Result<ResolvedJoinKey, BindingError> {
-	validate_logical_ascription_physical(&column.column.data_type, declared_logical_type)?;
+	validate_logical_ascription_physical(
+		&column.column.data_type,
+		declared_logical_type,
+		registry,
+	)?;
 	let logical_type = reconcile_identity(
 		column.logical_type,
 		declared_logical_type,
 		&column.column.data_type,
 	)?;
-	validate_logical_ascription_physical(&column.column.data_type, logical_type)?;
+	validate_logical_ascription_physical(&column.column.data_type, logical_type, registry)?;
 	Ok(ResolvedJoinKey {
 		column: column.column,
 		logical_type,

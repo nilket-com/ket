@@ -762,7 +762,7 @@ pub(super) fn bind_logical_ascription(
 		.node_type(inner)
 		.cloned()
 		.expect("builder returns typed logical ascription input");
-	validate_logical_ascription_physical(&physical, logical_type)?;
+	validate_logical_ascription_physical(&physical, logical_type, ctx.logical_type_registry)?;
 	let existing = builder
 		.node_logical_type(inner)
 		.expect("builder returns logical type for logical ascription input");
@@ -973,11 +973,16 @@ pub(super) fn unit_offset_to_f64(offset: &UnitOffset) -> f64 {
 pub(super) fn validate_logical_ascription_physical(
 	physical: &DataType,
 	logical_type: LogicalTypeId,
+	registry: &LogicalTypeRegistry,
 ) -> Result<(), BindingError> {
 	if logical_type.is_naked() {
 		return Ok(());
 	}
-	let Some(spec) = logical_type_spec(logical_type) else {
+	// ADR 265: resolve through the catalog registry (seed-or-durable), not the seed-only free fn, so a
+	// durable runtime-registered logical type on a join key / ascription resolves. No seed-only fallback
+	// here — that would let a missing/empty registry "succeed" via seeds and mask a threading bug; the
+	// non-seed positive tests prove the registry is actually threaded.
+	let Some(spec) = LogicalTypeResolver::with_registry(registry).spec(logical_type) else {
 		return Err(BindingError::UnsupportedExpression {
 			message: format!("unknown logical type {}", logical_type_name(logical_type)),
 		});
