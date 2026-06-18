@@ -1,0 +1,23 @@
+[package]
+name = "toron-tpch"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# ADR 261: a repo-local TPC-H *reachability* harness. Depends on `toron`; the `toron` library must NOT
+# depend on this crate (architecture guard). Dev-mode data is generated from the pure-Rust `tpchgen`
+# row structs into workspace-Arrow arrays — deliberately NOT the Arrow-output generator variant, which
+# pins a different Arrow major than Toron and would cross a second `RecordBatch` type boundary.
+
+[[bin]]
+name = "toron-tpch"
+path = "src/main.rs"
+
+[dependencies]
+toron = { path = "../toron" }
+wendelon = { path = "../wendelon" }
+arrow.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+serde_json = "1.0"
+tpchgen = "2.0.2"
