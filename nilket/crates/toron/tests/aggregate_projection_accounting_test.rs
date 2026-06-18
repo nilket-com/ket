@@ -45,8 +45,8 @@ fn malformed_aggregate_arity_or_modifiers_reject_cleanly() {
 	for sql in [
 		"SELECT COUNT() FROM sales",
 		"SELECT COUNT(amount, region) FROM sales",
-		"SELECT COUNT(DISTINCT amount) FROM sales",
-		"SELECT SUM(DISTINCT amount) FROM sales",
+		// ADR 240: COUNT(DISTINCT x) / SUM(DISTINCT x) are supported (dedup via Aggregate{Distinct{…}}),
+		// so they no longer belong in the reject list. Arity errors below stay rejected.
 		"SELECT SUM() FROM sales",
 		"SELECT SUM(amount, region) FROM sales",
 		"SELECT LINEAR_REGRESS(amount) FROM sales",

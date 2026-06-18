@@ -665,7 +665,7 @@ fn in_list_rejects_empty_over_limit_subquery_unnest_or_rowvalue() {
 	for sql in [
 		"SELECT id FROM sales WHERE id IN ()",
 		over_limit.as_str(),
-		"SELECT id FROM sales WHERE id IN (SELECT id FROM sales)",
+		// ADR 256: IN (subquery) is supported (lowers to a LeftSemi join — see in_subquery_lowers_to_semi_join).
 		"SELECT id FROM sales WHERE id IN UNNEST([1, 2])",
 		"SELECT id FROM sales WHERE (id, amount) IN ((1, 10))",
 	] {
@@ -773,7 +773,7 @@ fn unsupported_pattern_predicates_and_case_subquery_in_remain_unsupported() {
 		"SELECT id FROM sales WHERE status RLIKE 'o.*'",
 		"SELECT id FROM sales WHERE status ~~ 'o%'",
 		"SELECT id FROM sales WHERE status ~~* 'o%'",
-		"SELECT id FROM sales WHERE id IN (SELECT id FROM sales)",
+		// ADR 256: IN (subquery) is supported (lowers to a LeftSemi join).
 	] {
 		assert_plan_rejected(sql);
 	}

@@ -69,7 +69,7 @@ fn sqlparser_062_comma_limit_variant_remains_unsupported() {
 #[test]
 fn unsupported_query_level_clauses_are_loud() {
 	for sql in [
-		"WITH cte AS (SELECT id FROM t) SELECT id FROM cte",
+		// ADR 254: non-recursive WITH (CTE) is supported (lowered as a frontend desugar).
 		"SELECT id FROM t ORDER BY id FETCH FIRST 1 ROWS ONLY",
 		"SELECT id FROM t FOR UPDATE",
 	] {
@@ -80,7 +80,7 @@ fn unsupported_query_level_clauses_are_loud() {
 #[test]
 fn unsupported_select_level_clauses_are_loud() {
 	for sql in [
-		"SELECT DISTINCT id FROM t",
+		// ADR 231: SELECT DISTINCT is supported (lowered to a Distinct marker).
 		"SELECT id FROM t GROUP BY id",
 		"SELECT id FROM t HAVING id > 1",
 		"SELECT id FROM t QUALIFY id > 1",

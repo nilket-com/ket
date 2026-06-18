@@ -137,7 +137,7 @@ deliberately — the focus is worth more than the throughput.
 - *"One final iteration, and promote."* → verify consensus (see below),
   then the operator promotes.
 - *"ADR N is in the git stage ready for your code review."* → the impl
-  landed as a `feat` commit; review it independently.
+  landed as an `impl: adr NNN` commit; review it independently.
 
 ## File & naming conventions
 
@@ -165,12 +165,44 @@ history); the next-topic hints live in the new ADR's "Forward arc" +
 
 ## The plan→implement block-chain
 
-`plan: adr NNN` (the design) and `feat: adr NNN` (the implementation)
-are separate commits. After the feat lands, the operator says "ready for
+`plan: adr NNN` (the design) and `impl: adr NNN` (the implementation)
+are separate commits. After the impl lands, the operator says "ready for
 code review" and the council reviews it **independently**: re-run the
 ADR's architecture guards, the reconciled prior guards, and the
 behavior net — don't just trust the evidence doc. Verdict is APPROVE or
 concrete findings.
+
+### The seal gate (run before every `impl:` seal)
+
+The implementation seal must pass this gate, run via `scripts/cargo-cgroup`
+(never raw cargo) and **after** `cargo fmt` — fmt can reformat source the
+architecture guards source-scan, so a pre-fmt run can pass while the sealed
+tree is red (ADR 263 shipped a red `adr150` exactly this way):
+
+```
+scripts/cargo-cgroup fmt  -p toron -- --check
+scripts/cargo-cgroup test -p toron --lib
+scripts/cargo-cgroup test -p toron --test architecture_test   # FULL — source-scanning guards
+scripts/cargo-cgroup test -p toron --no-fail-fast             # the WHOLE integration suite
+scripts/cargo-cgroup test -p toron-tpch                       # the reachability gauge
+git diff --check
+```
+
+The `--no-fail-fast` integration leg is **additive** — it does not replace
+`--lib`, `architecture_test`, or `toron-tpch`. It catches the
+"should-reject" / behavioral tests those legs skip — the drift class that
+left six accounting tests silently red outside the green path until ADR 264.
+A green run requires **zero** failures except an explicit, commented
+`-- --skip <family>` list of families *proven* flaky by repeated reruns (for
+example `LiveWendelonFixture` / distributed isolation-ordering). That skip
+list is auditable debt meant to shrink to empty — never a curated
+*inclusion* subset, which recreates the same off-path rot for anything not
+curated in. As of ADR 264 the suite is green with an **empty** skip list.
+
+Future impl plans inherit this gate. Widen the `-p` set (e.g. add
+`wendelon`) when a cut crosses crates, and add `check -p toron --all-targets`
+when a cut adds a widely-constructed IR field (benches/examples that
+`cargo test` skips).
 
 ---
 

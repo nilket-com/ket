@@ -2960,13 +2960,39 @@ async fn derived_table_source_scope_rejects_general_subquery_features() {
 		"SELECT id FROM (SELECT id FROM people) WHERE id < 0",
 		"SELECT id FROM LATERAL (SELECT id FROM people) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM (SELECT id FROM people) AS q) AS p WHERE id < 0",
-		"SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0",
+		// ADR 254: a JOIN inside a derived table now lowers (presented as a named relation), so it is no
+		// longer rejected here — its current logical-type bind gap is the ADR-265 known-gap test below.
 		"SELECT id FROM (SELECT id FROM people) AS p LEFT JOIN people AS other ON p.id = other.id",
 		"SELECT id FROM (WITH q AS (SELECT id FROM people) SELECT id FROM q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people UNION SELECT id FROM people) AS p WHERE id < 0",
 	] {
 		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "derived").await;
 	}
+}
+
+/// ADR 264 → ADR 265 known gap: a JOIN inside a derived table is supported (ADR 254 lowers it as a named
+/// relation), but a *logical-typed* column does not yet survive the join-bodied derived-table schema
+/// propagation — it errors at bind with `unknown logical type`. ADR 265 will thread the logical-type
+/// registry through and flip this assertion to a positive bind+execute. Discriminating: it fails the day
+/// 265 lands, forcing the update.
+#[tokio::test]
+async fn join_bodied_derived_table_with_logical_type_is_adr265_known_gap() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let sql = "SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0";
+	let plan = planner
+		.plan(sql)
+		.expect("ADR 254: a join inside a derived table plans");
+	let error = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect_err(
+			"ADR 265 gap: logical type does not yet propagate through a join-bodied derived table",
+		);
+	assert!(
+		format!("{error:?}").contains("unknown logical type"),
+		"the known gap is the logical-type propagation bind error, not a derived-table rejection: {error:?}"
+	);
 }
 
 #[tokio::test]
