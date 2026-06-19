@@ -8,7 +8,7 @@
 
 pub mod telemetry;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -930,6 +930,331 @@ pub async fn check_strict_q6(scale_factor: f64) -> CorrectnessAttempt {
 		);
 	}
 	match compare_strict_q6(&batches, expected) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+/// ADR 276: one strict-q01 group's raw `i128` accumulators (the SUM columns) + the `i64` row count. The AVG
+/// columns are finalized from these via [`avg_decimal_raw`]; `sum_discount` feeds `avg_disc` (q01 has no
+/// `SUM(discount)` output column of its own).
+#[derive(Default)]
+pub struct Q1Group {
+	pub sum_qty: i128,
+	pub sum_base_price: i128,
+	pub sum_disc_price: i128,
+	pub sum_charge: i128,
+	pub sum_discount: i128,
+	pub count: i64,
+}
+
+/// ADR 276: the independent strict-q01 oracle — traverse `LineItemGenerator` directly, filter
+/// `l_shipdate <= DATE '1998-09-02'` (day-count 10471), and accumulate raw scale-correct `i128` per
+/// `(l_returnflag, l_linestatus)` group. The `BTreeMap` is sorted, matching q01's `ORDER BY` ASC/ASC.
+/// Quantity raws are `l_quantity * 100` (scale 2), mirroring the strict fixture; `disc_price` is scale 4
+/// (`extprice * (1 - disc)`) and `charge` is scale 6 (`disc_price * (1 + tax)`).
+pub fn strict_q1_oracle(scale_factor: f64) -> BTreeMap<(String, String), Q1Group> {
+	let generator = LineItemGenerator::new(scale_factor, 1, 1);
+	let mut groups: BTreeMap<(String, String), Q1Group> = BTreeMap::new();
+	for item in generator.iter() {
+		if item.l_shipdate.to_unix_epoch() > 10471 {
+			continue;
+		}
+		let qty_raw = item.l_quantity as i128 * 100;
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let disc_raw = item.l_discount.into_inner() as i128;
+		let tax_raw = item.l_tax.into_inner() as i128;
+		let group = groups
+			.entry((item.l_returnflag.to_string(), item.l_linestatus.to_string()))
+			.or_default();
+		group.sum_qty += qty_raw;
+		group.sum_base_price += extprice_raw;
+		group.sum_discount += disc_raw;
+		group.sum_disc_price += extprice_raw * (100 - disc_raw);
+		group.sum_charge += extprice_raw * (100 - disc_raw) * (100 + tax_raw);
+		group.count += 1;
+	}
+	groups
+}
+
+/// Mirror `exec.rs::decimal_fits_precision`: a `Decimal128(precision, _)` value must satisfy
+/// `|value| < 10^precision`.
+fn decimal_fits_precision(value: i128, precision: u8) -> bool {
+	match 10_i128.checked_pow(u32::from(precision)) {
+		Some(limit) => value.unsigned_abs() < limit.unsigned_abs(),
+		None => true,
+	}
+}
+
+/// ADR 276: replicate `exec.rs::avg_decimal_finalize` bit-for-bit for the q01 averages — rescale the raw sum
+/// to the output scale, divide by the count, round **half away from zero** (`scaled.signum()` direction), and
+/// enforce the output precision fit (the executor's final guard). Fallible like the executor's finalize: a
+/// zero count, an output scale below the input scale, checked-arithmetic overflow, or a result that does not
+/// fit `out_precision` returns `Err` (→ `fail@compare`) rather than a harness panic.
+pub fn avg_decimal_raw(
+	total: i128,
+	count: i64,
+	input_scale: i8,
+	out_scale: i8,
+	out_precision: u8,
+) -> Result<i128, String> {
+	if count == 0 {
+		return Err("avg over zero rows".to_string());
+	}
+	let scale_delta = i32::from(out_scale) - i32::from(input_scale);
+	if scale_delta < 0 {
+		return Err("avg output scale below input scale".to_string());
+	}
+	let multiplier = 10_i128
+		.checked_pow(scale_delta as u32)
+		.ok_or_else(|| "avg scale overflow".to_string())?;
+	let scaled = total
+		.checked_mul(multiplier)
+		.ok_or_else(|| "avg scale overflow".to_string())?;
+	let count = i128::from(count);
+	let mut quotient = scaled / count;
+	let remainder = scaled % count;
+	if remainder.unsigned_abs() * 2 >= count.unsigned_abs() {
+		quotient = quotient
+			.checked_add(scaled.signum())
+			.ok_or_else(|| "avg rounding overflow".to_string())?;
+	}
+	if !decimal_fits_precision(quotient, out_precision) {
+		return Err(format!(
+			"avg result {quotient} does not fit output precision {out_precision}"
+		));
+	}
+	Ok(quotient)
+}
+
+/// ADR 276: the strict-q01 output schema (name, exact type) — asserted before any value comparison so a
+/// silent scale drift can't make the oracle compare at the wrong place. Read from the executor's actual
+/// output, not derived (`sum_disc_price` is `Decimal128(32,4)`, not the `(31,4)` an on-paper derivation gives).
+fn strict_q1_expected_schema() -> [(&'static str, DataType); 10] {
+	[
+		("l_returnflag", DataType::Utf8),
+		("l_linestatus", DataType::Utf8),
+		("sum_qty", DataType::Decimal128(15, 2)),
+		("sum_base_price", DataType::Decimal128(15, 2)),
+		("sum_disc_price", DataType::Decimal128(32, 4)),
+		("sum_charge", DataType::Decimal128(38, 6)),
+		("avg_qty", DataType::Decimal128(19, 6)),
+		("avg_price", DataType::Decimal128(19, 6)),
+		("avg_disc", DataType::Decimal128(19, 6)),
+		("count_order", DataType::Int64),
+	]
+}
+
+/// Assert strict q01's actual output schema matches [`strict_q1_expected_schema`] (column count, names, exact
+/// `(p,s)`). A drift is a compare failure — never a wrong-scale value comparison.
+pub fn assert_strict_q1_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q1_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q01 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+/// Compare strict q01's output to the independent oracle: assert the schema, then align output rows to the
+/// sorted oracle groups by key (verifying the ASC/ASC order), and assert each cell's raw value exactly (sums
+/// direct; averages via [`avg_decimal_raw`]; `count_order` as `i64`). Any mismatch → `Err` (`fail@compare`).
+pub fn compare_strict_q1(
+	batches: &[RecordBatch],
+	oracle: &BTreeMap<(String, String), Q1Group>,
+) -> Result<(), String> {
+	assert_strict_q1_schema(batches)?;
+
+	struct OutRow {
+		returnflag: String,
+		linestatus: String,
+		aggregates: [i128; 7],
+		count: i64,
+	}
+	let mut rows: Vec<OutRow> = Vec::new();
+	for batch in batches {
+		let utf8 = |idx: usize| -> Result<&StringArray, String> {
+			batch
+				.column(idx)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.ok_or_else(|| format!("column {idx} is not Utf8"))
+		};
+		let dec = |idx: usize| -> Result<&Decimal128Array, String> {
+			batch
+				.column(idx)
+				.as_any()
+				.downcast_ref::<Decimal128Array>()
+				.ok_or_else(|| format!("column {idx} is not Decimal128"))
+		};
+		let returnflag = utf8(0)?;
+		let linestatus = utf8(1)?;
+		let decimals = [
+			dec(2)?,
+			dec(3)?,
+			dec(4)?,
+			dec(5)?,
+			dec(6)?,
+			dec(7)?,
+			dec(8)?,
+		];
+		let count = batch
+			.column(9)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or_else(|| "column 9 (count_order) is not Int64".to_string())?;
+		for row in 0..batch.num_rows() {
+			// Every q01 output cell over a non-empty group is non-null; a NULL key/aggregate/count is an
+			// anomaly, not a value to compare through its (garbage) slot — return it as fail@compare.
+			let schema = strict_q1_expected_schema();
+			if returnflag.is_null(row) {
+				return Err(format!(
+					"column {} is unexpectedly NULL at row {row}",
+					schema[0].0
+				));
+			}
+			if linestatus.is_null(row) {
+				return Err(format!(
+					"column {} is unexpectedly NULL at row {row}",
+					schema[1].0
+				));
+			}
+			for (idx, decimal) in decimals.iter().enumerate() {
+				if decimal.is_null(row) {
+					return Err(format!(
+						"column {} is unexpectedly NULL at row {row}",
+						schema[idx + 2].0
+					));
+				}
+			}
+			if count.is_null(row) {
+				return Err(format!(
+					"column {} is unexpectedly NULL at row {row}",
+					schema[9].0
+				));
+			}
+			rows.push(OutRow {
+				returnflag: returnflag.value(row).to_string(),
+				linestatus: linestatus.value(row).to_string(),
+				aggregates: std::array::from_fn(|i| decimals[i].value(row)),
+				count: count.value(row),
+			});
+		}
+	}
+
+	if rows.len() != oracle.len() {
+		return Err(format!(
+			"expected {} groups, got {} output rows",
+			oracle.len(),
+			rows.len()
+		));
+	}
+	for (row, ((returnflag, linestatus), group)) in rows.iter().zip(oracle.iter()) {
+		if &row.returnflag != returnflag || &row.linestatus != linestatus {
+			return Err(format!(
+				"row order/key mismatch: output ({:?},{:?}) vs oracle ({returnflag:?},{linestatus:?})",
+				row.returnflag, row.linestatus
+			));
+		}
+		let expected = [
+			("sum_qty", group.sum_qty),
+			("sum_base_price", group.sum_base_price),
+			("sum_disc_price", group.sum_disc_price),
+			("sum_charge", group.sum_charge),
+			(
+				"avg_qty",
+				avg_decimal_raw(group.sum_qty, group.count, 2, 6, 19)?,
+			),
+			(
+				"avg_price",
+				avg_decimal_raw(group.sum_base_price, group.count, 2, 6, 19)?,
+			),
+			(
+				"avg_disc",
+				avg_decimal_raw(group.sum_discount, group.count, 2, 6, 19)?,
+			),
+		];
+		for (idx, (column, want)) in expected.iter().enumerate() {
+			if row.aggregates[idx] != *want {
+				return Err(format!(
+					"group ({returnflag:?},{linestatus:?}) {column}: expected {want}, got {}",
+					row.aggregates[idx]
+				));
+			}
+		}
+		if row.count != group.count {
+			return Err(format!(
+				"group ({returnflag:?},{linestatus:?}) count_order: expected {}, got {}",
+				group.count, row.count
+			));
+		}
+	}
+	Ok(())
+}
+
+/// ADR 276 — the strict q01 correctness check: execute strict q01, assert its schema, guard non-vacuity
+/// (≥ 1 selected input row AND > 1 group — genuinely multi-row), then compare every cell to the independent
+/// oracle. A mismatch is `fail@compare`; a query that can't execute carries its deepest phase + reason.
+pub async fn check_strict_q1(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let lineitem = generate_strict_lineitem(scale_factor);
+	let tables = vec![HarnessTable {
+		id: TableId(1),
+		name: "lineitem",
+		descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
+		facts: facts_for_batch(&lineitem),
+		batch: lineitem,
+	}];
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q01".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q1_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	let oracle = strict_q1_oracle(scale_factor);
+	let selected_rows: i64 = oracle.values().map(|group| group.count).sum();
+	if selected_rows < 1 || oracle.len() <= 1 {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: selected_rows={selected_rows} groups={}",
+				oracle.len()
+			)),
+		);
+	}
+	match compare_strict_q1(&batches, &oracle) {
 		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
 		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
 	}

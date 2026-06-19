@@ -1,14 +1,17 @@
-//! ADR 273: the strict q06 correctness rail — the first answer-checked cell, kept separate from reachability.
+//! ADR 273/276: the strict correctness rail — answer-checked cells (q06 scalar, q01 multi-row), kept separate
+//! from reachability.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::Decimal128Array;
+use arrow::array::{ArrayRef, Decimal128Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	check_strict_q6, compare_strict_q6, correctness_matrix_from_log, q6_row_revenue,
-	strict_q6_oracle,
+	Q1Group, assert_strict_q1_schema, avg_decimal_raw, check_strict_q1, check_strict_q6,
+	compare_strict_q1, compare_strict_q6, correctness_matrix_from_log, q6_row_revenue,
+	strict_q1_oracle, strict_q6_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -98,5 +101,238 @@ fn correctness_matrix_is_separate_from_reachability() {
 	assert!(
 		q01.contains("strict=unchecked"),
 		"a reachability-suite row must not leak into the correctness matrix: {q01}"
+	);
+}
+
+// ADR 276: Toron's strict q01 output (10 columns, N groups) equals the independent oracle — schema asserted,
+// then every cell's raw i128 (sums + half-away averages) and count compared exactly.
+#[tokio::test]
+async fn strict_q1_matches_independent_oracle() {
+	let attempt = check_strict_q1(0.01).await;
+	assert_eq!(attempt.query, "q01");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+// The oracle is genuinely multi-row (the headline of q01 vs q06's scalar): > 1 group, ≥ 1 selected input row.
+#[test]
+fn strict_q1_oracle_selects_multiple_groups() {
+	let oracle = strict_q1_oracle(0.01);
+	let selected_rows: i64 = oracle.values().map(|group| group.count).sum();
+	assert!(selected_rows >= 1, "selected {selected_rows} input rows");
+	assert!(oracle.len() > 1, "expected > 1 group, got {}", oracle.len());
+}
+
+// avg_decimal_raw mirrors avg_decimal_finalize: half-away rounding, direction-aware via scaled.signum(), and
+// FALLIBLE on impossible inputs (no harness panic).
+#[test]
+fn avg_decimal_raw_matches_half_away_and_is_fallible() {
+	// Ties round away from zero in BOTH directions (out_precision is generous here).
+	assert_eq!(avg_decimal_raw(5, 2, 0, 0, 19).unwrap(), 3); // 2.5 -> 3
+	assert_eq!(avg_decimal_raw(-5, 2, 0, 0, 19).unwrap(), -3); // -2.5 -> -3
+	assert_eq!(avg_decimal_raw(7, 2, 0, 0, 19).unwrap(), 4); // 3.5 -> 4
+	assert_eq!(avg_decimal_raw(4, 2, 0, 0, 19).unwrap(), 2); // exact
+	assert_eq!(avg_decimal_raw(7, 3, 0, 0, 19).unwrap(), 2); // 2.33 -> 2 (below the half)
+	// Rescale from input scale 2 to output scale 6 (×10_000), as q01's averages do.
+	assert_eq!(avg_decimal_raw(3, 2, 2, 6, 19).unwrap(), 15_000); // 30000 / 2
+	// Impossible inputs are Err, not panics.
+	assert!(avg_decimal_raw(5, 0, 0, 0, 19).is_err(), "zero count");
+	assert!(
+		avg_decimal_raw(5, 2, 6, 2, 19).is_err(),
+		"output scale below input scale"
+	);
+	// The executor's final guard: a result that does not fit the output precision is Err (500 needs 3 digits).
+	assert!(
+		avg_decimal_raw(500, 1, 0, 0, 2).is_err(),
+		"result exceeds output precision"
+	);
+}
+
+// A single canonical q01 output row (1 group) matching the exact 10-column schema.
+fn q1_batch(returnflag: &str, linestatus: &str, aggregates: [i128; 7], count: i64) -> RecordBatch {
+	let decimal_types = [
+		(15, 2),
+		(15, 2),
+		(32, 4),
+		(38, 6),
+		(19, 6),
+		(19, 6),
+		(19, 6),
+	];
+	let names = [
+		"sum_qty",
+		"sum_base_price",
+		"sum_disc_price",
+		"sum_charge",
+		"avg_qty",
+		"avg_price",
+		"avg_disc",
+	];
+	let mut fields = vec![
+		Field::new("l_returnflag", DataType::Utf8, false),
+		Field::new("l_linestatus", DataType::Utf8, false),
+	];
+	for (name, (precision, scale)) in names.iter().zip(decimal_types) {
+		fields.push(Field::new(
+			*name,
+			DataType::Decimal128(precision, scale),
+			false,
+		));
+	}
+	fields.push(Field::new("count_order", DataType::Int64, false));
+	let mut columns: Vec<ArrayRef> = vec![
+		Arc::new(StringArray::from(vec![returnflag])),
+		Arc::new(StringArray::from(vec![linestatus])),
+	];
+	for (value, (precision, scale)) in aggregates.iter().zip(decimal_types) {
+		columns.push(Arc::new(
+			Decimal128Array::from(vec![*value])
+				.with_precision_and_scale(precision, scale)
+				.expect("decimal column"),
+		));
+	}
+	columns.push(Arc::new(Int64Array::from(vec![count])));
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("q1 batch")
+}
+
+// The comparator detects a wrong answer: a consistent (output, oracle) pair matches; a one-cell perturbation
+// of the oracle is fail@compare.
+#[test]
+fn q1_correctness_mismatch_is_fail_at_compare() {
+	let count = 2_i64;
+	let (sum_qty, sum_base, sum_discount) = (3_400_i128, 500_000_i128, 14_i128);
+	let (sum_disc_price, sum_charge) = (49_000_000_i128, 5_292_000_000_i128);
+	let batch = q1_batch(
+		"A",
+		"F",
+		[
+			sum_qty,
+			sum_base,
+			sum_disc_price,
+			sum_charge,
+			avg_decimal_raw(sum_qty, count, 2, 6, 19).unwrap(),
+			avg_decimal_raw(sum_base, count, 2, 6, 19).unwrap(),
+			avg_decimal_raw(sum_discount, count, 2, 6, 19).unwrap(),
+		],
+		count,
+	);
+	let batches = vec![batch];
+	let key = ("A".to_string(), "F".to_string());
+	let mut oracle = BTreeMap::new();
+	oracle.insert(
+		key.clone(),
+		Q1Group {
+			sum_qty,
+			sum_base_price: sum_base,
+			sum_disc_price,
+			sum_charge,
+			sum_discount,
+			count,
+		},
+	);
+	assert!(
+		compare_strict_q1(&batches, &oracle).is_ok(),
+		"a consistent (output, oracle) pair matches"
+	);
+	oracle.get_mut(&key).unwrap().sum_qty += 1;
+	assert!(
+		compare_strict_q1(&batches, &oracle).is_err(),
+		"a one-cell oracle perturbation is fail@compare"
+	);
+}
+
+// Schema-first: a drifted output type (sum_disc_price as Decimal128(31,4), not the measured (32,4)) is caught
+// by the Phase-0 assertion BEFORE any value comparison.
+#[test]
+fn strict_q1_schema_drift_is_detected() {
+	let fields = vec![
+		Field::new("l_returnflag", DataType::Utf8, false),
+		Field::new("l_linestatus", DataType::Utf8, false),
+		Field::new("sum_qty", DataType::Decimal128(15, 2), false),
+		Field::new("sum_base_price", DataType::Decimal128(15, 2), false),
+		// Drift: the real type is Decimal128(32, 4).
+		Field::new("sum_disc_price", DataType::Decimal128(31, 4), false),
+		Field::new("sum_charge", DataType::Decimal128(38, 6), false),
+		Field::new("avg_qty", DataType::Decimal128(19, 6), false),
+		Field::new("avg_price", DataType::Decimal128(19, 6), false),
+		Field::new("avg_disc", DataType::Decimal128(19, 6), false),
+		Field::new("count_order", DataType::Int64, false),
+	];
+	let decimal = |precision: u8, scale: i8| -> ArrayRef {
+		Arc::new(
+			Decimal128Array::from(vec![0_i128])
+				.with_precision_and_scale(precision, scale)
+				.expect("decimal column"),
+		)
+	};
+	let columns: Vec<ArrayRef> = vec![
+		Arc::new(StringArray::from(vec!["A"])),
+		Arc::new(StringArray::from(vec!["F"])),
+		decimal(15, 2),
+		decimal(15, 2),
+		decimal(31, 4),
+		decimal(38, 6),
+		decimal(19, 6),
+		decimal(19, 6),
+		decimal(19, 6),
+		Arc::new(Int64Array::from(vec![1_i64])),
+	];
+	let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("drift batch");
+	let error = assert_strict_q1_schema(&[batch]).expect_err("schema drift must be detected");
+	assert!(
+		error.contains("sum_disc_price"),
+		"the drift names the offending column: {error}"
+	);
+}
+
+// ADR 276 review (Finding 1): a NULL output cell must be rejected (fail@compare), not compared through its
+// garbage value slot. q01 aggregates over non-empty groups are always non-null, so a NULL is an anomaly.
+#[test]
+fn q1_null_cell_is_fail_at_compare() {
+	let fields = vec![
+		Field::new("l_returnflag", DataType::Utf8, false),
+		Field::new("l_linestatus", DataType::Utf8, false),
+		// sum_qty is nullable here so a NULL can be injected; the schema assert checks type, not nullability.
+		Field::new("sum_qty", DataType::Decimal128(15, 2), true),
+		Field::new("sum_base_price", DataType::Decimal128(15, 2), false),
+		Field::new("sum_disc_price", DataType::Decimal128(32, 4), false),
+		Field::new("sum_charge", DataType::Decimal128(38, 6), false),
+		Field::new("avg_qty", DataType::Decimal128(19, 6), false),
+		Field::new("avg_price", DataType::Decimal128(19, 6), false),
+		Field::new("avg_disc", DataType::Decimal128(19, 6), false),
+		Field::new("count_order", DataType::Int64, false),
+	];
+	let decimal = |precision: u8, scale: i8, value: Option<i128>| -> ArrayRef {
+		Arc::new(
+			Decimal128Array::from(vec![value])
+				.with_precision_and_scale(precision, scale)
+				.expect("decimal column"),
+		)
+	};
+	let columns: Vec<ArrayRef> = vec![
+		Arc::new(StringArray::from(vec!["A"])),
+		Arc::new(StringArray::from(vec!["F"])),
+		decimal(15, 2, None), // sum_qty is NULL
+		decimal(15, 2, Some(0)),
+		decimal(32, 4, Some(0)),
+		decimal(38, 6, Some(0)),
+		decimal(19, 6, Some(0)),
+		decimal(19, 6, Some(0)),
+		decimal(19, 6, Some(0)),
+		Arc::new(Int64Array::from(vec![1_i64])),
+	];
+	let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("null batch");
+	let mut oracle = BTreeMap::new();
+	oracle.insert(
+		("A".to_string(), "F".to_string()),
+		Q1Group {
+			count: 1,
+			..Default::default()
+		},
+	);
+	let error = compare_strict_q1(&[batch], &oracle).expect_err("a NULL cell must be fail@compare");
+	assert!(
+		error.contains("sum_qty") && error.contains("NULL"),
+		"the failure names the null column: {error}"
 	);
 }
