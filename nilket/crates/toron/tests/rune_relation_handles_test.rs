@@ -1269,9 +1269,11 @@ async fn rune_aggregate_helper_pack_binds_stable_outputs() {
 		.await
 		.expect("bind stable aggregate helpers");
 
+	// ADR 267: the two COUNTs share the natural name "count", so they disambiguate to stable unique
+	// internal names (`__agg_<position>`); the singleton SUM/AVG/MIN/MAX keep their natural names.
 	assert_schema_names(
 		bound.schema().as_ref(),
-		&["count", "count", "sum", "avg", "min", "max"],
+		&["__agg_0", "__agg_1", "sum", "avg", "min", "max"],
 	);
 }
 
@@ -1296,7 +1298,7 @@ async fn rune_project_named_post_aggregate_renames_outputs() {
 }
 
 #[tokio::test]
-async fn rune_duplicate_aggregate_output_name_is_ambiguous() {
+async fn rune_duplicate_aggregate_output_name_is_not_addressable() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
@@ -1308,13 +1310,15 @@ async fn rune_duplicate_aggregate_output_name_is_ambiguous() {
 	)
 	.await
 	.expect("duplicate aggregate output plan");
+	// ADR 267: the two SUMs disambiguate to unique internal names, so the natural "sum" referenced by the
+	// downstream project is no longer an addressable output column (alias the aggregates to project them).
 	let error = bind(&logical, &catalog(), &PlannerConfig::default())
 		.await
-		.expect_err("duplicate aggregate output name should be ambiguous");
+		.expect_err("unaliased duplicate aggregate name is not addressable");
 
 	assert!(matches!(
 		error,
-		BindingError::AmbiguousColumn { column } if column == "sum"
+		BindingError::UnknownColumn { column } if column == "sum"
 	));
 }
 

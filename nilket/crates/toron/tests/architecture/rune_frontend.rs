@@ -457,12 +457,16 @@ pub(crate) fn adr080_no_logical_aggregate_output_names_or_alias_field() {
 	}
 }
 
+// ADR 267 supersedes ADR 080's original contract here. ADR 080 reused the existing `AmbiguousColumn`
+// for duplicate aggregate output names; ADR 267 disambiguates same-function aggregates to stable, unique
+// internal `__agg_<i>` names, so the shared natural name (e.g. "sum") is no longer an addressable output
+// column. A downstream project that references it is therefore `UnknownColumn`, not `AmbiguousColumn`.
 #[test]
-pub(crate) fn adr080_duplicate_aggregate_output_names_use_existing_ambiguous_error() {
+pub(crate) fn adr267_duplicate_same_function_aggregate_output_is_unaddressable() {
 	let tests = rune_relation_handles_test_source();
 
-	assert!(tests.contains("rune_duplicate_aggregate_output_name_is_ambiguous"));
-	assert!(tests.contains("BindingError::AmbiguousColumn"));
+	assert!(tests.contains("rune_duplicate_aggregate_output_name_is_not_addressable"));
+	assert!(tests.contains("BindingError::UnknownColumn"));
 	assert!(tests.contains("column == \"sum\""));
 	assert!(tests.contains("[sum(col(\"amount\")), sum(col(\"id\"))]"));
 }

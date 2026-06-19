@@ -478,7 +478,9 @@ pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_are_adr113_o
 	let aggregate_field = source_block(&binder, "fn aggregate_field");
 
 	assert!(aggregate_schema.contains("schema_for_exprs(group_expr)"));
-	assert!(aggregate_schema.contains("fields.push(aggregate_field(call, logical_types)?)"));
+	// ADR 267: `aggregate_field` is collected then same-name duplicates disambiguated (the per-call `?`
+	// moved onto the `.collect::<Result<_, _>>()?`); the adr113 identity ownership the guard pins holds.
+	assert!(aggregate_schema.contains("aggregate_field(call, logical_types)"));
 	assert!(!aggregate_schema.contains("field_with_logical_type_metadata"));
 	assert!(!aggregate_schema.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
 	assert!(!aggregate_field.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
@@ -673,7 +675,7 @@ pub(crate) fn adr169_identity_additive_gate_is_frontend_shared() {
 	assert!(bind_aggregate.contains("bind_stable_aggregate_call"));
 	assert!(bind_stable_aggregate.contains("bind_expr_program(args, input_schema, ctx)?"));
 	assert!(arithmetic.contains("bind_logical_arithmetic"));
-	assert!(aggregate_schema.contains("aggregate_field(call, logical_types)?"));
+	assert!(aggregate_schema.contains("aggregate_field(call, logical_types)"));
 }
 
 #[test]

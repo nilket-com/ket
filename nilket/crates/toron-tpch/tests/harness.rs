@@ -41,25 +41,38 @@ async fn strict_q6_reaches_execute() {
 	);
 }
 
-// ADR 266: q01 is attempted; its measured FIRST wall is `ambiguous aggregate projection` at PLAN —
-// multiple same-function aggregates (four SUMs) the projection accounting can't disambiguate, reached
-// BEFORE the decimal arithmetic bind. The decimal `+`/`-` slice (q01-nominated) is proven separately in
-// decimal_probe; q01's true next blocker is the aggregate-projection gap (ADR 267). Same wall in dev and
-// strict (it is type-independent), so this is the honest two-truths acceptance: the decimal slice passes,
-// and full q01 reports its real first wall — not a guessed arithmetic/AVG blocker.
+// ADR 267: multiple same-function aggregate projection now resolves (the gauge's prior
+// `ambiguous_aggregate_projection@plan` wall is gone). dev q01 — four SUMs, three AVGs, COUNT, GROUP BY,
+// ORDER BY, all `Float64` — now reaches execute end-to-end (the strongest test that same-function
+// aggregates disambiguate). strict q01 advances to the measured `unsupported_decimal_avg@bind`: 266's
+// decimal `+`/`-` are exercised in the q01 path, and AVG(Decimal) is the next wall (ADR 268).
 #[tokio::test]
-async fn q01_attempts_and_blocks_at_aggregate_projection() {
-	for attempt in [run_strict_q1(0.0001).await, run_dev_q1(0.0001).await] {
-		assert_eq!(attempt.query, "q01");
-		assert_eq!(attempt.status, Status::Blocked, "{}", attempt.human());
-		assert_eq!(attempt.phase, Phase::Plan);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("ambiguous_aggregate_projection"),
-			"q01's first wall is multiple-same-function-aggregate projection (ADR 267): {}",
-			attempt.human()
-		);
-	}
+async fn q01_advances_past_aggregate_projection() {
+	let dev = run_dev_q1(0.0001).await;
+	assert_eq!(dev.query, "q01");
+	assert_eq!(
+		dev.status,
+		Status::Pass,
+		"dev q01 reaches execute: {}",
+		dev.human()
+	);
+	assert_eq!(dev.phase, Phase::Execute);
+	assert!(
+		dev.digest.is_some(),
+		"a pass carries a digest: {}",
+		dev.human()
+	);
+
+	let strict = run_strict_q1(0.0001).await;
+	assert_eq!(strict.query, "q01");
+	assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
+	assert_eq!(strict.phase, Phase::Bind);
+	assert_eq!(
+		strict.reason.as_deref(),
+		Some("unsupported_decimal_avg"),
+		"267 clears the projection wall; AVG(Decimal) is q01's next blocker (ADR 268): {}",
+		strict.human()
+	);
 }
 
 #[test]

@@ -245,8 +245,25 @@ pub(super) fn aggregate_schema(
 			.iter()
 			.map(|field| field.as_ref().clone()),
 	);
-	for call in aggr_expr {
-		fields.push(aggregate_field(call, logical_types)?);
+	// ADR 267: name the aggregate output fields, then disambiguate multiple same-natural-name aggregates
+	// (e.g. several `SUM`s) to a unique `__agg_<i>` internal name. `i` is the aggregate's position in
+	// `aggr_expr`, which matches the frontend `AggregateOutputCatalog` entry order, so the projection's
+	// rewritten references resolve to these columns. A single aggregate keeps its natural name.
+	let agg_fields = aggr_expr
+		.iter()
+		.map(|call| aggregate_field(call, logical_types))
+		.collect::<Result<Vec<_>, _>>()?;
+	let mut natural_counts: HashMap<String, usize> = HashMap::new();
+	for field in &agg_fields {
+		*natural_counts.entry(field.name().clone()).or_insert(0) += 1;
+	}
+	for (index, field) in agg_fields.into_iter().enumerate() {
+		let field = if natural_counts.get(field.name()).copied().unwrap_or(0) > 1 {
+			field.with_name(format!("__agg_{index}"))
+		} else {
+			field
+		};
+		fields.push(field);
 	}
 	Ok(Arc::new(Schema::new(fields)))
 }

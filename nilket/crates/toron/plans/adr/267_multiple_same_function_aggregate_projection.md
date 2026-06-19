@@ -11,8 +11,15 @@ ADR 023's `AggregateOutputCatalog` names each aggregate output by the function's
 (`aggregate_output_name`: `SUM→"sum"`, `AVG→"avg"`, …). `resolve_natural` (`sql_planner.rs:7083`) finds
 the entry **by signature** (so `SUM(a)`/`SUM(b)` are distinct), then bails `ResolveOutcome::Ambiguous`
 solely because that natural name is shared (`natural_output_name_counts["sum"] > 1`). Collides **with or
-without** SELECT aliases. The binder already synthesizes unique per-aggregate names downstream
-(`__md_b0_a0`…), so this is purely the frontend rewrite being over-conservative.
+without** SELECT aliases.
+
+> **Implementation reconciliation (seal):** the plan asserted "the binder already synthesizes unique
+> per-aggregate names downstream (`__md_b0_a0`…), so this is purely the frontend rewrite being
+> over-conservative." That holds only for ADR 240's distinct-rewrite path. The **general** grouped-aggregate
+> path re-derives output field names in the binder's `aggregate_schema` (`binder/aggregate.rs`) straight
+> from the natural name (`SUM→"sum"`), so two `SUM`s produce two `"sum"` fields there too. The frontend
+> rename alone left the binder re-colliding (q01 surfaced `UnknownColumn { "__agg_0" }`). The fix therefore
+> applies the **same** position-keyed disambiguation in both places — see Decision 3.
 
 ## Decision
 
@@ -29,16 +36,23 @@ without** SELECT aliases. The binder already synthesizes unique per-aggregate na
    not through the old visible-name vector where multiple unaliased `SUM(...)` entries all look like
    `"sum"`. Disambiguating the output names once resolves all three uniformly — don't leave a twin gap
    one resolver over.
-3. **Frontend-only.** `sql_planner` aggregate-projection accounting; no binder / exec / IR change. The
-   aggregate entries gain unique names; the SELECT `Project` on top applies aliases (user-visible)
-   exactly as before. Pre-existing group-key/output-label clashes remain fenced as genuine ambiguity.
+3. **Naming layer, frontend + binder (no exec / IR change).** The disambiguation lives in two name-deriving
+   sites that must agree: `sql_planner`'s `AggregateOutputCatalog` (the projection rewrite) **and** the
+   binder's `aggregate_schema` (the `Aggregate` node's output fields). Both rename colliding same-natural-name
+   aggregates to `__agg_<i>`, keyed on the **aggregate's position** — identical between the two because
+   `aggr_expr` is built from the catalog entries in order — so the rewritten references resolve to the
+   binder's columns. No execution-path, `ExecutionPlan`, or `LogicalPlan` IR change: the aggregate *values*
+   are unchanged and `LogicalPlan::Aggregate` gains no naming field (still derived). The SELECT `Project` on
+   top applies aliases (user-visible) exactly as before. Pre-existing group-key/output-label clashes remain
+   fenced as genuine ambiguity.
 
 ## Watch-items (operator) → guards
 - Synthesized names are **internal + stable**: deterministic across runs (so architecture guards can pin
   them), prefixed/shaped so they're unmistakably internal, and **not surfaced as a final projection label
   whenever an alias is present**. A discriminating test asserts the aliased projection's output columns are
   the aliases (no internal name leaks).
-- No execution-path change: this is a naming fix; the aggregate values are unchanged.
+- No execution-path change: this is a naming fix; the aggregate values are unchanged. The binder change is
+  confined to `aggregate_schema` field naming (the same `__agg_<i>` disambiguation), not the kernels.
 
 ## Acceptance
 - `SELECT …, SUM(a), SUM(b) … GROUP BY` — **aliased and un-aliased** — plans, binds, and executes with

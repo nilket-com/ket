@@ -1,10 +1,19 @@
 # Implementation Plan — ADR 267: Multiple same-function aggregate projection
 
 ## Summary
-Frontend-only fix: give each distinct-signature aggregate entry a unique, internal, stable output name in
-`AggregateOutputCatalog`, and have all three resolvers (`resolve_natural` → projection + HAVING,
-`resolve_for_order_by`) return it. Removes the natural-name-collision `Ambiguous` bail so multiple
-same-function aggregates (q01's four SUMs + three AVGs) resolve. No binder/exec/IR change.
+Naming-layer fix in two agreeing sites: give each distinct-signature aggregate entry a unique, internal,
+stable output name (`__agg_<i>`, keyed on aggregate position) in **both** `AggregateOutputCatalog`
+(`sql_planner.rs`) and the binder's `aggregate_schema` (`binder/aggregate.rs`), and have all three resolvers
+(`resolve_natural` → projection + HAVING, `resolve_for_order_by`) return it. Removes the
+natural-name-collision `Ambiguous` bail so multiple same-function aggregates (q01's four SUMs + three AVGs)
+resolve. No exec/IR change (values unchanged; no IR naming field).
+
+> **Reconciliation vs the promoted plan:** the plan said "frontend-only; no binder change," resting on the
+> premise that the binder already synthesizes unique downstream names. That is true only on ADR 240's
+> distinct-rewrite path; the general grouped-aggregate path re-derives field names in `aggregate_schema`
+> from the natural name and re-collides. The frontend rename alone left q01 failing with
+> `UnknownColumn { "__agg_0" }`, so Phase 1b extends the identical disambiguation into the binder. See the
+> results doc.
 
 ## Phase 1 — synthesize a unique internal name per entry (`crates/toron/src/sql_planner.rs`)
 - In `add_requirement` (`:7005`), alongside `natural_name`, compute a **unique internal** name for the
@@ -15,6 +24,14 @@ same-function aggregates (q01's four SUMs + three AVGs) resolve. No binder/exec/
   collision policy; those residual clashes stay fenced by the existing ambiguity path.
 - Internal-name shape is unmistakably internal (e.g. `__agg_` prefix for the disambiguated 2nd+), so it
   can't be confused with a user column and architecture guards can pin it.
+
+## Phase 1b — binder re-derives the same names (`crates/toron/src/binder/aggregate.rs`)
+- `aggregate_schema` (`:235`) builds the `Aggregate` node's output fields via `aggregate_field` per call,
+  whose name is the natural name (`SUM→"sum"`). Two same-function aggregates therefore produce two `"sum"`
+  fields here independently of the frontend. Count natural-name collisions across `agg_fields` and rename
+  the colliding ones to `__agg_<index>` (`field.with_name(...)`), where `index` is the call's position in
+  `aggr_expr` — **the same key the frontend uses**, because `aggr_expr` is built from the catalog entries in
+  order. This is the load-bearing piece the original "frontend-only" framing missed.
 
 ## Phase 2 — resolvers return the unique name (remove the collision bail)
 - `resolve_natural` (`:7083`, projection + HAVING): find the entry by signature (unchanged) and return

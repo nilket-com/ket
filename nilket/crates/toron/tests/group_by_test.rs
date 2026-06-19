@@ -994,24 +994,35 @@ fn having_aggregate_call_not_in_select_is_computed_and_dropped() {
 }
 
 #[test]
-fn having_aggregate_call_ambiguity_is_rejected() {
-	for sql in [
+fn having_aggregate_call_resolves_unless_group_key_clash() {
+	// ADR 267: distinct same-function HAVING aggregate-calls now resolve by signature (was rejected as
+	// ambiguous on the shared natural name).
+	let _ = plan_sql(
 		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region HAVING COUNT(*) > 5",
-		"SELECT count, COUNT(amount) FROM events GROUP BY count HAVING COUNT(amount) > 0",
-	] {
-		assert_unsupported_message(sql, "ambiguous HAVING aggregate-call");
-	}
+	);
 	let duplicate_signature = plan_sql(
 		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 5",
 	);
 	assert_project_over_aggregate(&duplicate_signature);
+	// A HAVING aggregate whose natural name clashes with a GROUP BY key is still genuine ambiguity.
+	assert_unsupported_message(
+		"SELECT count, COUNT(amount) FROM events GROUP BY count HAVING COUNT(amount) > 0",
+		"ambiguous HAVING aggregate-call",
+	);
 }
 
 #[test]
-fn order_by_aggregate_call_ambiguity_is_rejected() {
-	for sql in [
+fn order_by_aggregate_call_resolves_unless_group_key_clash() {
+	// ADR 267: a distinct same-function ORDER BY aggregate-call resolves by signature to its own unique
+	// internal output column (`ORDER BY COUNT(*)` picks the COUNT(*) entry, not COUNT(amount)).
+	let _ = plan_sql(
 		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region ORDER BY COUNT(*)",
+	);
+	for sql in [
+		// Two identical COUNT(*) projection columns produce two equally-named final columns, so ORDER BY is
+		// genuinely ambiguous between them (the duplicate is in the final projection, not the entry set).
 		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region ORDER BY COUNT(*)",
+		// An aggregate whose natural name clashes with a GROUP BY key stays genuine ambiguity.
 		"SELECT count, COUNT(amount) FROM events GROUP BY count ORDER BY COUNT(amount)",
 	] {
 		assert_unsupported_message(sql, "ambiguous ORDER BY aggregate-call");
@@ -2848,16 +2859,18 @@ async fn min_max_bind_with_identity_output_types_and_reject_deferred_domains() {
 	let ExecutionPlan::Aggregate { output_schema, .. } = bound else {
 		panic!("expected aggregate");
 	};
-	assert_eq!(output_schema.field(0).name(), "min");
+	// ADR 267: two MINs + two MAXs collide on the natural names "min"/"max", so each disambiguates to a
+	// unique internal `__agg_<i>` output name (the identity data types are unchanged).
+	assert_eq!(output_schema.field(0).name(), "__agg_0");
 	assert_eq!(output_schema.field(0).data_type(), &DataType::Int32);
 	assert!(output_schema.field(0).is_nullable());
-	assert_eq!(output_schema.field(1).name(), "max");
+	assert_eq!(output_schema.field(1).name(), "__agg_1");
 	assert_eq!(output_schema.field(1).data_type(), &DataType::Int64);
 	assert!(output_schema.field(1).is_nullable());
-	assert_eq!(output_schema.field(2).name(), "min");
+	assert_eq!(output_schema.field(2).name(), "__agg_2");
 	assert_eq!(output_schema.field(2).data_type(), &DataType::Float64);
 	assert!(output_schema.field(2).is_nullable());
-	assert_eq!(output_schema.field(3).name(), "max");
+	assert_eq!(output_schema.field(3).name(), "__agg_3");
 	assert_eq!(output_schema.field(3).data_type(), &DataType::Float32);
 	assert!(output_schema.field(3).is_nullable());
 
@@ -2914,8 +2927,15 @@ async fn avg_bind_with_float64_output_and_numeric_domain() {
 		panic!("expected aggregate");
 	};
 	assert_eq!(output_schema.fields().len(), 3);
+	// ADR 267: three AVGs collide on the natural name "avg", so each disambiguates to a unique internal
+	// `__agg_<i>` output name (Float64 output unchanged).
+	let names: Vec<&str> = output_schema
+		.fields()
+		.iter()
+		.map(|field| field.name().as_str())
+		.collect();
+	assert_eq!(names, ["__agg_0", "__agg_1", "__agg_2"]);
 	for field in output_schema.fields() {
-		assert_eq!(field.name(), "avg");
 		assert_eq!(field.data_type(), &DataType::Float64);
 		assert!(field.is_nullable());
 	}
@@ -2986,12 +3006,15 @@ async fn grouped_aggregate_order_by_duplicate_generated_name_is_ambiguous() {
 		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region ORDER BY count DESC",
 	);
 
+	// ADR 267: the two unaliased COUNTs disambiguate to unique internal `__agg_<i>` names, so the natural
+	// name "count" is no longer an addressable output column — `ORDER BY count` is now unknown, not
+	// ambiguous (alias the aggregates to order by them).
 	let err = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("duplicate generated aggregate name should be ambiguous");
+		.expect_err("unaliased duplicate aggregate name is not addressable");
 	assert!(matches!(
 		err,
-		BindingError::AmbiguousColumn { column } if column == "count"
+		BindingError::UnknownColumn { column } if column == "count"
 	));
 }
 
@@ -3131,12 +3154,14 @@ async fn grouped_aggregate_having_generated_name_duplicate_is_ambiguous() {
 		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region HAVING count > 0",
 	);
 
+	// ADR 267: the two unaliased COUNTs disambiguate to unique internal `__agg_<i>` names, so "count" is
+	// no longer an addressable output column — `HAVING count` is now unknown, not ambiguous.
 	let err = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("duplicate generated HAVING name should be ambiguous");
+		.expect_err("unaliased duplicate aggregate name is not addressable");
 	assert!(matches!(
 		err,
-		BindingError::AmbiguousColumn { column } if column == "count"
+		BindingError::UnknownColumn { column } if column == "count"
 	));
 }
 
@@ -3196,6 +3221,92 @@ async fn grouped_aggregate_having_executes_after_aggregation() {
 	assert_eq!(
 		region_count_rows(&count_results),
 		vec![(Some("east".to_string()), 3)]
+	);
+}
+
+// ADR 267: multiple same-function aggregates in one projection.
+//
+// `SUM(amount)` and `SUM(rating32)` both carry the natural name "sum"; before 267 the second collapsed
+// onto the first and the projection was rejected as `ambiguous aggregate projection`. The fixture data is
+// deliberately rank-inverting between the two columns: SUM(amount) ranks east(40) > west(20) > null(7),
+// while SUM(rating32) ranks west(7.0) > east(5.0) > null(0.25). That inversion is what makes the ORDER BY
+// / HAVING cases *discriminating* — they could only pass if the engine resolves each aggregate-call to its
+// own column, never a same-named sibling's. (The mock scan ignores pushed `WHERE` predicates, so the
+// null-region group is filtered via HAVING, not WHERE — see the residual-filter behavior in the q06 path.)
+
+#[tokio::test]
+async fn same_function_aggregate_projection_binds_distinct_internal_names() {
+	let (catalog, _) = fixture();
+	// Unaliased: the two SUMs disambiguate to stable, unique internal `__agg_<i>` output columns.
+	let bound = bind(
+		&plan_sql("SELECT region, SUM(amount), SUM(rating32) FROM sales GROUP BY region"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind two same-function aggregates");
+	let ExecutionPlan::Aggregate { output_schema, .. } = bound else {
+		panic!("expected aggregate root for matching projection");
+	};
+	assert_eq!(output_schema.field(0).name(), "region");
+	assert_eq!(output_schema.field(1).name(), "__agg_0");
+	assert_eq!(output_schema.field(1).data_type(), &DataType::Int64);
+	assert!(output_schema.field(1).is_nullable());
+	assert_eq!(output_schema.field(2).name(), "__agg_1");
+	assert!(output_schema.field(2).is_nullable());
+}
+
+#[tokio::test]
+async fn aliased_same_function_aggregates_use_aliases_not_internal_names() {
+	// Aliased: the internal `__agg_<i>` names must NOT leak — the visible labels are the user's aliases,
+	// and the two columns hold distinct per-region values (proving they are not collapsed).
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) AS total_amount, SUM(rating32) AS total_rating \
+		 FROM sales GROUP BY region ORDER BY region",
+	))
+	.await;
+	let schema = results[0].schema();
+	assert_eq!(schema.field(0).name(), "region");
+	assert_eq!(schema.field(1).name(), "total_amount");
+	assert_eq!(schema.field(2).name(), "total_rating");
+	assert_eq!(
+		utf8_column_rows(&results, 0),
+		vec![Some("east".to_string()), Some("west".to_string()), None]
+	);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 1),
+		vec![Some(40), Some(20), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn order_by_same_function_aggregate_resolves_to_its_own_column() {
+	// `ORDER BY SUM(rating32)` must sort by the rating column (west, east, null), NOT by the same-named
+	// SUM(amount) (which would give east, west, null). The rank inversion of east/west is the discriminator.
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount), SUM(rating32) \
+		 FROM sales GROUP BY region ORDER BY SUM(rating32) DESC",
+	))
+	.await;
+	assert_eq!(
+		utf8_column_rows(&results, 0),
+		vec![Some("west".to_string()), Some("east".to_string()), None]
+	);
+}
+
+#[tokio::test]
+async fn having_same_function_aggregate_filters_by_its_own_column() {
+	// `HAVING SUM(rating32) > 6` keeps only west (7.0); east (5.0) and null (0.25) are dropped. Filtering by
+	// the same-named SUM(amount) (east 40, west 20, null 7) would keep east and west, so a [west]-only
+	// result proves the HAVING aggregate-call resolves to the rating column, not its same-named sibling.
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount), SUM(rating32) \
+		 FROM sales GROUP BY region HAVING SUM(rating32) > 6 ORDER BY region",
+	))
+	.await;
+	assert_eq!(
+		utf8_column_rows(&results, 0),
+		vec![Some("west".to_string())]
 	);
 }
 
@@ -3736,11 +3847,12 @@ fn aggregate_arguments_reject_nested_aggregates() {
 }
 
 #[test]
-fn computed_aggregate_arguments_preserve_output_name_ambiguity() {
-	assert_unsupported_message(
-		"SELECT SUM(amount + 1), SUM(amount + 2) FROM sales HAVING SUM(amount + 1) > 0",
-		"ambiguous HAVING aggregate-call",
-	);
+fn computed_aggregate_arguments_resolve_by_distinct_signature() {
+	// ADR 267: two SUMs over different computed arguments are distinct signatures, so they disambiguate to
+	// unique internal names and the HAVING aggregate-call resolves to its own entry (was rejected as
+	// ambiguous on the shared natural "sum").
+	let _ =
+		plan_sql("SELECT SUM(amount + 1), SUM(amount + 2) FROM sales HAVING SUM(amount + 1) > 0");
 }
 
 #[tokio::test]

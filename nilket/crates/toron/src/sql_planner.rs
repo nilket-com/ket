@@ -4566,6 +4566,9 @@ impl SqlPlanner {
 			self.discover_aggregate_calls(having, mode, AggregateSource::Having, &mut catalog)?;
 		}
 		catalog.reject_having_alias_references(having)?;
+		// ADR 267: all aggregate entries are now discovered; assign each its unique internal output name
+		// so multiple same-function aggregates resolve to distinct columns.
+		catalog.finalize_output_names();
 		let distinct_rewrite = build_distinct_aggregate_rewrite(&catalog)?;
 
 		let final_projection = self.lower_final_aggregate_projection(projection, mode, &catalog)?;
@@ -7030,6 +7033,8 @@ impl AggregateOutputCatalog {
 			args,
 			distinct,
 			signature,
+			// Provisional; `finalize_output_names` resolves collisions to a unique internal name.
+			output_name: natural_name.clone(),
 			natural_name,
 			in_select: matches!(source, AggregateSource::Select),
 			in_having: matches!(source, AggregateSource::Having),
@@ -7061,7 +7066,7 @@ impl AggregateOutputCatalog {
 		self.group_keys
 			.iter()
 			.map(|key| key.name.clone())
-			.chain(self.entries.iter().map(|entry| entry.natural_name.clone()))
+			.chain(self.entries.iter().map(|entry| entry.output_name.clone()))
 			.collect()
 	}
 
@@ -7069,6 +7074,35 @@ impl AggregateOutputCatalog {
 		self.final_output_name_counts.clear();
 		for name in names {
 			*self.final_output_name_counts.entry(name).or_insert(0) += 1;
+		}
+	}
+
+	/// ADR 267: after the discovery pass, assign each aggregate entry its unique internal output name. A
+	/// natural name shared by ≥2 aggregate entries (multiple same-function aggregates) is disambiguated to
+	/// a `__agg_<index>` internal name per entry; a unique natural name is kept (single-aggregate behavior
+	/// unchanged). Any un-aliased ORDER BY visible name recorded as the (now-shared) natural name is
+	/// re-pointed to the entry's unique output name, so `ORDER BY SUM(b)` resolves by signature to its own
+	/// column, never a sibling's shared `"sum"`.
+	fn finalize_output_names(&mut self) {
+		let mut natural_counts: HashMap<String, usize> = HashMap::new();
+		for entry in &self.entries {
+			*natural_counts
+				.entry(entry.natural_name.clone())
+				.or_insert(0) += 1;
+		}
+		for index in 0..self.entries.len() {
+			let natural = self.entries[index].natural_name.clone();
+			let output_name = if natural_counts.get(&natural).copied().unwrap_or(0) > 1 {
+				format!("__agg_{index}")
+			} else {
+				natural.clone()
+			};
+			for visible in self.entries[index].order_by_visible_names.iter_mut() {
+				if *visible == natural {
+					*visible = output_name.clone();
+				}
+			}
+			self.entries[index].output_name = output_name;
 		}
 	}
 
@@ -7084,16 +7118,18 @@ impl AggregateOutputCatalog {
 		let Some(entry) = self.entry_for_signature(signature) else {
 			return ResolveOutcome::NotInSelect;
 		};
+		// ADR 267: each entry carries a unique internal output name (same-function aggregates are
+		// disambiguated by `finalize_output_names`), so `SUM(a), SUM(b)` resolve to distinct columns. A
+		// residual clash of an aggregate output with a GROUP BY key name is genuine ambiguity — keep it
+		// fenced.
 		if self
-			.natural_output_name_counts
-			.get(&entry.natural_name)
-			.copied()
-			.unwrap_or(0)
-			> 1
+			.group_keys
+			.iter()
+			.any(|key| key.name == entry.output_name)
 		{
 			return ResolveOutcome::Ambiguous;
 		}
-		ResolveOutcome::Found(entry.natural_name.clone())
+		ResolveOutcome::Found(entry.output_name.clone())
 	}
 
 	fn resolve_for_order_by(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
@@ -7235,6 +7271,12 @@ struct AggregateOutputEntry {
 	distinct: bool,
 	signature: Option<GroupedAggregateSignature>,
 	natural_name: String,
+	/// ADR 267: the unique, internal, stable output name for this entry — the natural name when it is the
+	/// only entry with that natural name, else a synthesized `__agg_<index>` (so multiple same-function
+	/// aggregates, e.g. `SUM(a), SUM(b)`, resolve to distinct columns instead of colliding on `"sum"`).
+	/// Finalized by `finalize_output_names` after the discovery pass; never user-visible when an alias
+	/// exists (the SELECT projection renames it).
+	output_name: String,
 	in_select: bool,
 	in_having: bool,
 	order_by_visible_names: Vec<String>,
