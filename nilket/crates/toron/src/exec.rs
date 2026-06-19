@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::aggregate_kernel;
 use crate::coordinator::{materialize_scan_stream, materialize_scan_stream_bounded};
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
@@ -434,22 +433,49 @@ impl Executor {
 								));
 							}
 							AggregateFunction::Avg => {
-								let mut state = AggState::AvgFloat {
-									total: 0.0,
-									count: 0,
-								};
+								// ADR 268: derive the AVG accumulator and output type from the observed
+								// argument type (so AVG(Decimal) takes the decimal path), instead of
+								// hardcoding AvgFloat/Float64. Empty unbound input keeps the historical
+								// Float64 default.
+								let mut state = None;
+								let mut input_type = None;
 								for batch in &input_batches {
 									let arr = self.evaluate_expr(&args[0], batch)?;
+									if state.is_none() {
+										state = Some(avg_state_for_data_type(arr.data_type())?);
+										input_type = Some(arr.data_type().clone());
+									}
+									let state = state
+										.as_mut()
+										.expect("avg state initialized from observed array");
 									for row in 0..batch.num_rows() {
 										if let Some(value) = numeric_value(&arr, row)? {
-											add_avg_value(&mut state, value)?;
+											add_avg_value(state, value)?;
 										}
 									}
 								}
-								results_cols.push(avg_state_array(&state)?);
+								let (state, output_type) = match (state, input_type) {
+									(Some(state), Some(input_type)) => {
+										let output_type =
+											aggregate_kernel::stable_output_data_type(
+												&AggregateFunction::Avg,
+												Some(&input_type),
+											)
+											.unwrap_or(arrow::datatypes::DataType::Float64);
+										(state, output_type)
+									}
+									_ => (
+										AggState::AvgFloat {
+											total: 0.0,
+											count: 0,
+										},
+										arrow::datatypes::DataType::Float64,
+									),
+								};
+								results_cols.push(avg_state_array(&state, &output_type)?);
 								results_fields.push(arrow::datatypes::Field::new(
 									"avg",
-									arrow::datatypes::DataType::Float64,
+									output_type,
 									true,
 								));
 							}
@@ -1481,7 +1507,10 @@ impl Executor {
 							}
 						}
 					}
-					results_cols.push(avg_state_array(&state)?);
+					results_cols.push(avg_state_array(
+						&state,
+						output_schema.field(results_cols.len()).data_type(),
+					)?);
 				}
 				AggregateFunction::Min => {
 					let mut state = min_state_for_data_type(first_arg_type(call)?)?;
@@ -1610,7 +1639,9 @@ impl Executor {
 									add_sum_value(state, value)?;
 								}
 							}
-							AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
+							AggState::AvgInt { .. }
+							| AggState::AvgFloat { .. }
+							| AggState::AvgDecimal { .. } => {
 								if let Some(value) = numeric_value(array, row)? {
 									add_avg_value(state, value)?;
 								}
@@ -1664,7 +1695,8 @@ impl Executor {
 							| AggState::MaxFloat32 { .. }
 							| AggState::MaxFloat64 { .. }
 							| AggState::AvgInt { .. }
-							| AggState::AvgFloat { .. } => 0,
+							| AggState::AvgFloat { .. }
+							| AggState::AvgDecimal { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -1682,7 +1714,10 @@ impl Executor {
 					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Avg => {
-					columns.push(avg_column_from_groups(&groups, agg_idx)?);
+					let output_type = aggregate_output_types[agg_idx]
+						.clone()
+						.unwrap_or(DataType::Float64);
+					columns.push(avg_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -1780,7 +1815,9 @@ impl Executor {
 									add_sum_value(state, value)?;
 								}
 							}
-							AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
+							AggState::AvgInt { .. }
+							| AggState::AvgFloat { .. }
+							| AggState::AvgDecimal { .. } => {
 								if let Some(value) = numeric_value(array, row)? {
 									add_avg_value(state, value)?;
 								}
@@ -1827,7 +1864,8 @@ impl Executor {
 							| AggState::MaxFloat32 { .. }
 							| AggState::MaxFloat64 { .. }
 							| AggState::AvgInt { .. }
-							| AggState::AvgFloat { .. } => 0,
+							| AggState::AvgFloat { .. }
+							| AggState::AvgDecimal { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -1841,7 +1879,8 @@ impl Executor {
 					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Avg => {
-					columns.push(avg_column_from_groups(&groups, agg_idx)?);
+					let output_type = output_schema.field(columns.len()).data_type().clone();
+					columns.push(avg_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -4578,7 +4617,9 @@ fn window_agg_finalize(
 		AggregateFunction::Sum => {
 			sum_state_array(state.as_ref().expect("sum window state"), output_type)?
 		}
-		AggregateFunction::Avg => avg_state_array(state.as_ref().expect("avg window state"))?,
+		AggregateFunction::Avg => {
+			avg_state_array(state.as_ref().expect("avg window state"), output_type)?
+		}
 		AggregateFunction::Min | AggregateFunction::Max => {
 			min_max_state_array(state.as_ref().expect("min/max window state"))?
 		}
@@ -5708,18 +5749,53 @@ enum GroupValue {
 #[derive(Debug, Clone, Copy)]
 enum AggState {
 	Count(i64),
-	SumInt { total: i128, seen: bool },
-	SumFloat { total: f64, seen: bool },
-	MinInt32 { value: Option<i32> },
-	MinInt64 { value: Option<i64> },
-	MinFloat32 { value: Option<f32> },
-	MinFloat64 { value: Option<f64> },
-	MaxInt32 { value: Option<i32> },
-	MaxInt64 { value: Option<i64> },
-	MaxFloat32 { value: Option<f32> },
-	MaxFloat64 { value: Option<f64> },
-	AvgInt { total: i128, count: u64 },
-	AvgFloat { total: f64, count: u64 },
+	SumInt {
+		total: i128,
+		seen: bool,
+	},
+	SumFloat {
+		total: f64,
+		seen: bool,
+	},
+	MinInt32 {
+		value: Option<i32>,
+	},
+	MinInt64 {
+		value: Option<i64>,
+	},
+	MinFloat32 {
+		value: Option<f32>,
+	},
+	MinFloat64 {
+		value: Option<f64>,
+	},
+	MaxInt32 {
+		value: Option<i32>,
+	},
+	MaxInt64 {
+		value: Option<i64>,
+	},
+	MaxFloat32 {
+		value: Option<f32>,
+	},
+	MaxFloat64 {
+		value: Option<f64>,
+	},
+	AvgInt {
+		total: i128,
+		count: u64,
+	},
+	AvgFloat {
+		total: f64,
+		count: u64,
+	},
+	// ADR 268: AVG(Decimal) accumulates the raw unscaled i128 (like SumInt) and carries the input scale so
+	// the finalize can rescale to the widened output scale before dividing.
+	AvgDecimal {
+		total: i128,
+		count: u64,
+		input_scale: i8,
+	},
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5780,7 +5856,11 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 			_ => DataType::Int64,
 		},
 		AggregateFunction::Min | AggregateFunction::Max => input_type.clone(),
-		AggregateFunction::Avg => DataType::Float64,
+		// ADR 268: delegate to the kernel so AVG(Decimal) yields the widened Decimal type, not Float64.
+		AggregateFunction::Avg => {
+			aggregate_kernel::stable_output_data_type(function, Some(input_type))
+				.unwrap_or(DataType::Float64)
+		}
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 			DataType::Float64
 		}
@@ -5955,6 +6035,22 @@ fn avg_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 		| DataType::UInt16
 		| DataType::UInt32
 		| DataType::UInt64 => Ok(AggState::AvgInt { total: 0, count: 0 }),
+		// ADR 268: AVG(Decimal) — raw i128 accumulator carrying the input scale for the rescale-and-divide
+		// finalize. Validate through the same kernel rule used by bind/type derivation so an invalid
+		// high-scale Decimal cannot form a Decimal state and later fall back to Float64 materialization.
+		DataType::Decimal128(_, scale)
+			if aggregate_kernel::stable_output_data_type(
+				&AggregateFunction::Avg,
+				Some(data_type),
+			)
+			.is_some() =>
+		{
+			Ok(AggState::AvgDecimal {
+				total: 0,
+				count: 0,
+				input_scale: *scale,
+			})
+		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("AVG does not support input type {:?}", data_type),
 		}),
@@ -5997,7 +6093,8 @@ fn add_sum_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		| (AggState::MaxFloat32 { .. }, _)
 		| (AggState::MaxFloat64 { .. }, _)
 		| (AggState::AvgInt { .. }, _)
-		| (AggState::AvgFloat { .. }, _) => Err(ExecutionError::InvalidExpression {
+		| (AggState::AvgFloat { .. }, _)
+		| (AggState::AvgDecimal { .. }, _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
 		}),
 	}
@@ -6033,6 +6130,23 @@ fn add_avg_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		(AggState::AvgInt { .. }, NumericValue::Float(_)) => {
 			Err(ExecutionError::InvalidExpression {
 				message: "floating AVG value reached integer accumulator".to_string(),
+			})
+		}
+		// ADR 268: a Decimal value enters the i128 accumulator as its raw unscaled integer.
+		(AggState::AvgDecimal { total, count, .. }, NumericValue::Int(value)) => {
+			*total = total
+				.checked_add(value)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "decimal AVG overflow".to_string(),
+				})?;
+			*count = count.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "AVG count overflow".to_string(),
+			})?;
+			Ok(())
+		}
+		(AggState::AvgDecimal { .. }, NumericValue::Float(_)) => {
+			Err(ExecutionError::InvalidExpression {
+				message: "floating AVG value reached decimal accumulator".to_string(),
 			})
 		}
 		(AggState::Count(_), _)
@@ -6309,7 +6423,8 @@ fn sum_column_from_groups(
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
 					| AggState::AvgInt { .. }
-					| AggState::AvgFloat { .. } => Ok(None),
+					| AggState::AvgFloat { .. }
+					| AggState::AvgDecimal { .. } => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -6330,7 +6445,8 @@ fn sum_column_from_groups(
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
 					| AggState::AvgInt { .. }
-					| AggState::AvgFloat { .. } => None,
+					| AggState::AvgFloat { .. }
+					| AggState::AvgDecimal { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -6354,7 +6470,8 @@ fn sum_column_from_groups(
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
 					| AggState::AvgInt { .. }
-					| AggState::AvgFloat { .. } => None,
+					| AggState::AvgFloat { .. }
+					| AggState::AvgDecimal { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(
@@ -6435,19 +6552,111 @@ fn avg_finalize(state: &AggState) -> Result<Option<f64>, ExecutionError> {
 	}
 }
 
-fn avg_state_array(state: &AggState) -> Result<ArrayRef, ExecutionError> {
-	Ok(Arc::new(Float64Array::from(vec![avg_finalize(state)?])) as ArrayRef)
+// ADR 268: finalize AVG(Decimal). Rescale the i128 sum from the input scale to the widened output scale,
+// then divide by the count rounding **half away from zero**, all in checked integer arithmetic. Returns the
+// raw unscaled i128 (the caller stamps `(out_precision, out_scale)` onto the Decimal128 array).
+fn avg_decimal_finalize(
+	state: &AggState,
+	out_precision: u8,
+	out_scale: i8,
+) -> Result<Option<i128>, ExecutionError> {
+	let AggState::AvgDecimal {
+		total,
+		count,
+		input_scale,
+	} = state
+	else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "decimal AVG finalize over non-decimal-AVG state".to_string(),
+		});
+	};
+	if *count == 0 {
+		return Ok(None);
+	}
+	let scale_delta = i32::from(out_scale) - i32::from(*input_scale);
+	if scale_delta < 0 {
+		return Err(ExecutionError::Kernel {
+			message: "AVG decimal output scale is below input scale".to_string(),
+		});
+	}
+	let scale_overflow = || ExecutionError::Kernel {
+		message: "AVG decimal scale overflow".to_string(),
+	};
+	let multiplier = 10_i128
+		.checked_pow(scale_delta as u32)
+		.ok_or_else(scale_overflow)?;
+	let scaled = total.checked_mul(multiplier).ok_or_else(scale_overflow)?;
+	let count = i128::from(*count);
+	let mut quotient = scaled / count;
+	let remainder = scaled % count;
+	// Half away from zero: round up when twice the magnitude of the remainder reaches the divisor.
+	if remainder.unsigned_abs() * 2 >= count.unsigned_abs() {
+		quotient = quotient
+			.checked_add(scaled.signum())
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "AVG decimal rounding overflow".to_string(),
+			})?;
+	}
+	if !decimal_fits_precision(quotient, out_precision) {
+		return Err(ExecutionError::Kernel {
+			message: "AVG decimal result does not fit output precision".to_string(),
+		});
+	}
+	Ok(Some(quotient))
+}
+
+// `value` fits a Decimal128 of `precision` iff its magnitude is below 10^precision. precision <= 38, so
+// 10^precision is always representable in i128.
+fn decimal_fits_precision(value: i128, precision: u8) -> bool {
+	match 10_i128.checked_pow(u32::from(precision)) {
+		Some(limit) => value.unsigned_abs() < limit.unsigned_abs(),
+		None => true,
+	}
+}
+
+fn avg_state_array(state: &AggState, output_type: &DataType) -> Result<ArrayRef, ExecutionError> {
+	match output_type {
+		DataType::Decimal128(precision, scale) => {
+			let value = avg_decimal_finalize(state, *precision, *scale)?;
+			Ok(Arc::new(
+				Decimal128Array::from(vec![value])
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::Kernel {
+						message: error.to_string(),
+					})?,
+			) as ArrayRef)
+		}
+		_ => Ok(Arc::new(Float64Array::from(vec![avg_finalize(state)?])) as ArrayRef),
+	}
 }
 
 fn avg_column_from_groups(
 	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
 	agg_idx: usize,
+	output_type: &DataType,
 ) -> Result<ArrayRef, ExecutionError> {
-	let values = groups
-		.values()
-		.map(|states| avg_finalize(&states[agg_idx]))
-		.collect::<Result<Vec<_>, _>>()?;
-	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+	match output_type {
+		DataType::Decimal128(precision, scale) => {
+			let values = groups
+				.values()
+				.map(|states| avg_decimal_finalize(&states[agg_idx], *precision, *scale))
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::Kernel {
+						message: error.to_string(),
+					})?,
+			) as ArrayRef)
+		}
+		_ => {
+			let values = groups
+				.values()
+				.map(|states| avg_finalize(&states[agg_idx]))
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+	}
 }
 
 #[cfg(test)]
@@ -8030,6 +8239,51 @@ mod tests {
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	// ADR 268: the decimal AVG finalize rescales to the widened output scale and divides half away from
+	// zero, in pure integer arithmetic. Pins the rounding sign (positive AND negative ties) and the
+	// non-divisible case the discriminating execute test can't reach from a 2-row fixture.
+	#[test]
+	fn avg_decimal_finalize_rounds_half_away_from_zero() {
+		let avg = |total: i128, count: u64, input_scale: i8, p: u8, s: i8| {
+			avg_decimal_finalize(
+				&AggState::AvgDecimal {
+					total,
+					count,
+					input_scale,
+				},
+				p,
+				s,
+			)
+			.expect("finalize ok")
+		};
+		// Non-divisible: AVG(0.01, 0.02, 0.02) at scale 2 -> sum raw 5, count 3, widen to scale 6:
+		// 5*10^4/3 = 50000/3 = 16666.67 -> 16667 (0.016667).
+		assert_eq!(avg(5, 3, 2, 19, 6), Some(16667));
+		// Exact: AVG(0.06, 0.05) -> sum 11, count 2 -> 110000/2 = 55000 (0.055000), no rounding.
+		assert_eq!(avg(11, 2, 2, 19, 6), Some(55000));
+		// Positive tie: 5/2 = 2.5 -> 3 (away from zero).
+		assert_eq!(avg(5, 2, 0, 19, 0), Some(3));
+		// Negative tie: -5/2 = -2.5 -> -3 (away from zero, not -2).
+		assert_eq!(avg(-5, 2, 0, 19, 0), Some(-3));
+		// Empty group -> NULL.
+		assert_eq!(avg(0, 0, 2, 19, 6), None);
+	}
+
+	#[test]
+	fn avg_decimal_state_rejects_unrepresentable_widening() {
+		assert!(
+			matches!(
+				avg_state_for_data_type(&DataType::Decimal128(15, 2)),
+				Ok(AggState::AvgDecimal { .. })
+			),
+			"ordinary Decimal128 AVG state is allowed"
+		);
+		assert!(
+			avg_state_for_data_type(&DataType::Decimal128(38, 35)).is_err(),
+			"scale 35 would widen to scale 39, which cannot fit Decimal128"
+		);
+	}
 
 	#[tokio::test]
 	async fn execute_rejects_unbound_drop_table() {

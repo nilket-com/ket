@@ -403,6 +403,9 @@ pub(super) fn additive_unit_aggregate_logical_type(
 					let Some(input_type) = call.args.root_type(0) else {
 						return Ok(LogicalTypeId::NAKED);
 					};
+					// ADR 268: AVG(Decimal) widens its output type (scale/precision +4), so input != output
+					// and a decimal average is deliberately NAKED — the widened quotient is a plain Decimal,
+					// not the column's declared unit, until a logical-type widening policy is designed.
 					if input_type == output_type && spec.physical == *output_type {
 						return Ok(logical_type);
 					}

@@ -148,7 +148,7 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		"input_domain: AggregateInputDomain::AvgNumeric",
 		"input_domain: AggregateInputDomain::OrderedMinMax",
 		"output_rule: AggregateOutputRule::Int64",
-		"output_rule: AggregateOutputRule::Float64",
+		"output_rule: AggregateOutputRule::AvgNumeric",
 		"output_rule: AggregateOutputRule::SameAsInput",
 		"output_rule: AggregateOutputRule::SumNumeric",
 		"nullable: false",
@@ -198,7 +198,8 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggState enum");
-	assert_eq!(enum_variant_count(agg_state_enum), 13);
+	// ADR 268 added `AvgDecimal` for AVG(Decimal) (raw i128 accumulator + input scale).
+	assert_eq!(enum_variant_count(agg_state_enum), 14);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Copy"));
@@ -1413,7 +1414,7 @@ pub(crate) fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 	assert!(catalog.contains("kind: StableAggregateKernel::Avg"));
 	assert!(catalog.contains("output_name: \"avg\""));
 	assert!(catalog.contains("input_domain: AggregateInputDomain::AvgNumeric"));
-	assert!(catalog.contains("output_rule: AggregateOutputRule::Float64"));
+	assert!(catalog.contains("output_rule: AggregateOutputRule::AvgNumeric"));
 
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");

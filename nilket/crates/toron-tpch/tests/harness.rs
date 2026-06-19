@@ -41,13 +41,13 @@ async fn strict_q6_reaches_execute() {
 	);
 }
 
-// ADR 267: multiple same-function aggregate projection now resolves (the gauge's prior
-// `ambiguous_aggregate_projection@plan` wall is gone). dev q01 — four SUMs, three AVGs, COUNT, GROUP BY,
-// ORDER BY, all `Float64` — now reaches execute end-to-end (the strongest test that same-function
-// aggregates disambiguate). strict q01 advances to the measured `unsupported_decimal_avg@bind`: 266's
-// decimal `+`/`-` are exercised in the q01 path, and AVG(Decimal) is the next wall (ADR 268).
+// ADR 268: AVG(Decimal) now binds and executes, so strict q01 reaches execute end-to-end. q01's body is
+// four SUMs, three AVGs, COUNT, GROUP BY, ORDER BY over `Decimal128(15,2)`; with 263's Decimal SUM/`*`,
+// 266's Decimal `+`/`-`, and now 268's Decimal AVG, every arithmetic piece resolves. dev q01 was already
+// pass@execute on `Float64`. (Supersedes ADR 267's `q01_advances_past_aggregate_projection`, which measured
+// the prior `unsupported_decimal_avg@bind` wall.)
 #[tokio::test]
-async fn q01_advances_past_aggregate_projection() {
+async fn q01_reaches_execute_in_both_modes() {
 	let dev = run_dev_q1(0.0001).await;
 	assert_eq!(dev.query, "q01");
 	assert_eq!(
@@ -65,12 +65,16 @@ async fn q01_advances_past_aggregate_projection() {
 
 	let strict = run_strict_q1(0.0001).await;
 	assert_eq!(strict.query, "q01");
-	assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
-	assert_eq!(strict.phase, Phase::Bind);
 	assert_eq!(
-		strict.reason.as_deref(),
-		Some("unsupported_decimal_avg"),
-		"267 clears the projection wall; AVG(Decimal) is q01's next blocker (ADR 268): {}",
+		strict.status,
+		Status::Pass,
+		"268 clears AVG(Decimal); strict q01 now reaches execute: {}",
+		strict.human()
+	);
+	assert_eq!(strict.phase, Phase::Execute);
+	assert!(
+		strict.digest.is_some(),
+		"a pass carries a digest: {}",
 		strict.human()
 	);
 }

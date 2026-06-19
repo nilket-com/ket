@@ -30,9 +30,11 @@ pub(crate) enum AggregateInputDomain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AggregateOutputRule {
 	Int64,
-	Float64,
 	SameAsInput,
 	SumNumeric,
+	// ADR 268: AVG — Float64 for integer/float input, widened Decimal for Decimal input (subsumes the
+	// former flat `Float64` rule, which AVG was the only user of).
+	AvgNumeric,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,7 +106,7 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		output_name: "avg",
 		arity: AggregateArity::One,
 		input_domain: AggregateInputDomain::AvgNumeric,
-		output_rule: AggregateOutputRule::Float64,
+		output_rule: AggregateOutputRule::AvgNumeric,
 		nullable: true,
 		grouped_supported: true,
 	},
@@ -167,9 +169,9 @@ pub(crate) fn stable_output_data_type(
 	}
 	match (spec.output_rule, input) {
 		(AggregateOutputRule::Int64, _) => Some(DataType::Int64),
-		(AggregateOutputRule::Float64, _) => Some(DataType::Float64),
 		(AggregateOutputRule::SameAsInput, Some(data_type)) => Some(data_type.clone()),
 		(AggregateOutputRule::SumNumeric, Some(data_type)) => sum_numeric_output(data_type),
+		(AggregateOutputRule::AvgNumeric, Some(data_type)) => avg_numeric_output(data_type),
 		(_, None) => None,
 	}
 }
@@ -193,7 +195,8 @@ pub(crate) fn input_domain_accepts(domain: AggregateInputDomain, input: Option<&
 
 fn fallback_output_data_type(rule: AggregateOutputRule) -> DataType {
 	match rule {
-		AggregateOutputRule::Float64 => DataType::Float64,
+		// ADR 268: AvgNumeric's fallback (no input type available) is Float64, matching plain AVG.
+		AggregateOutputRule::AvgNumeric => DataType::Float64,
 		AggregateOutputRule::Int64
 		| AggregateOutputRule::SameAsInput
 		| AggregateOutputRule::SumNumeric => DataType::Int64,
@@ -221,20 +224,41 @@ fn is_sum_numeric_input(input: &DataType) -> bool {
 	sum_numeric_output(input).is_some()
 }
 
-fn is_avg_numeric_input(input: &DataType) -> bool {
-	matches!(
-		input,
+// ADR 268: input-domain acceptance and output-type derivation for AVG share this one helper, so a
+// high-scale Decimal whose widened average cannot fit Decimal128 is rejected by the input domain rather
+// than admitted and then silently masked by `stable_output_field`'s fallback type.
+fn avg_numeric_output(input: &DataType) -> Option<DataType> {
+	match input {
 		DataType::Int8
-			| DataType::Int16
-			| DataType::Int32
-			| DataType::Int64
-			| DataType::UInt8
-			| DataType::UInt16
-			| DataType::UInt32
-			| DataType::UInt64
-			| DataType::Float32
-			| DataType::Float64
-	)
+		| DataType::Int16
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::UInt8
+		| DataType::UInt16
+		| DataType::UInt32
+		| DataType::UInt64
+		| DataType::Float32
+		| DataType::Float64 => Some(DataType::Float64),
+		// ADR 268: AVG over Decimal stays Decimal (decimal-faithful), widened scale/precision.
+		DataType::Decimal128(precision, scale) => decimal_avg_output_type(*precision, *scale),
+		_ => None,
+	}
+}
+
+// ADR 268: `AVG(Decimal128(p,s)) -> Decimal128(min(38, p+4), s+4)`. The fractional budget grows by four and
+// precision grows with it so the integer-digit budget `(p-s)` is preserved. Returns `None` (a clean bind
+// rejection) when the widened scale cannot fit the widened precision — e.g. a very high-scale input.
+fn decimal_avg_output_type(precision: u8, scale: i8) -> Option<DataType> {
+	let out_precision = precision.saturating_add(4).min(38);
+	let out_scale = scale.checked_add(4)?;
+	if out_scale < 0 || i16::from(out_scale) > i16::from(out_precision) {
+		return None;
+	}
+	Some(DataType::Decimal128(out_precision, out_scale))
+}
+
+fn is_avg_numeric_input(input: &DataType) -> bool {
+	avg_numeric_output(input).is_some()
 }
 
 fn is_ordered_min_max_input(input: &DataType) -> bool {

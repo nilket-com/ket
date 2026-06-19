@@ -93,8 +93,9 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// Kept specific (`arithmetic operands`) so it does not collide with the comparison/scalar gap.
 		"unsupported_decimal_arithmetic"
 	} else if lowered.contains("decimal") && lowered.contains("avg expects numeric input") {
-		// ADR 266: AVG over a Decimal column — needs decimal division + a finalize policy (ADR 267).
-		// q01's deeper blocker once `+`/`-` bind.
+		// ADR 268 implements AVG(Decimal) (widened `Decimal128(p+4,s+4)` finalize). This now fires only for
+		// a Decimal whose `+4` widening can't fit Decimal128's precision ceiling — a genuine edge gap, kept
+		// a recognized blocker rather than a silent fail.
 		"unsupported_decimal_avg"
 	} else if lowered.contains("decimal") {
 		// Reserved for a future Decimal carrier/load gap (Arrow Decimal data the engine can't carry).

@@ -210,6 +210,92 @@ async fn decimal_add_sub_binds_and_executes() {
 	);
 }
 
+/// ADR 268: AVG(Decimal) binds and executes, finalizing to a widened `Decimal128(p+4, s+4)`. Over the
+/// fixture: AVG(l_extendedprice) = (100.00 + 200.00)/2 = 150.000000; AVG(l_discount) = (0.06 + 0.05)/2 =
+/// 0.055000. The `Decimal128(19,6)` output type discriminates against a Float64 collapse, and the
+/// 0.055000 value against a same-scale (scale-2) average — which would round 0.055 to 0.06. Two same-
+/// function AVGs in one projection also exercise ADR 267's aliased disambiguation.
+#[tokio::test]
+async fn decimal_avg_binds_and_executes() {
+	let (catalog, storage) = lineitem_fixture();
+	let plan = SqlPlanner::new()
+		.plan("SELECT AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc FROM lineitem")
+		.expect("decimal AVG plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 268: decimal AVG binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 268: decimal AVG executes");
+	let batch = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("a result row");
+
+	let avg_price = batch.column_by_name("avg_price").expect("avg_price column");
+	assert_eq!(
+		avg_price.data_type(),
+		&DataType::Decimal128(19, 6),
+		"AVG(Decimal128(15,2)) widens to Decimal128(19,6)"
+	);
+	let avg_price = avg_price
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("avg_price is Decimal128");
+	assert_eq!(avg_price.value(0), 150_000_000, "150.000000 at scale 6");
+
+	let avg_disc = batch.column_by_name("avg_disc").expect("avg_disc column");
+	let avg_disc = avg_disc
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("avg_disc is Decimal128");
+	assert_eq!(
+		avg_disc.value(0),
+		55_000,
+		"0.055000 — not a scale-2 average rounded to 0.06"
+	);
+}
+
+/// ADR 268: grouped AVG(Decimal) executes per group, in lockstep with grouped SUM. GROUP BY l_shipdate
+/// gives two single-row groups, so each group's average is that row: {100.000000, 200.000000}.
+#[tokio::test]
+async fn grouped_decimal_avg_executes() {
+	let (catalog, storage) = lineitem_fixture();
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT l_shipdate, AVG(l_extendedprice) AS avg_price FROM lineitem GROUP BY l_shipdate",
+		)
+		.expect("grouped decimal AVG plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("grouped decimal AVG binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 268: grouped decimal AVG executes");
+	let mut avgs = Vec::new();
+	for batch in &batches {
+		let column = batch.column_by_name("avg_price").expect("avg_price column");
+		assert_eq!(
+			column.data_type(),
+			&DataType::Decimal128(19, 6),
+			"grouped AVG(Decimal128(15,2)) widens to Decimal128(19,6)"
+		);
+		let column = column
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("avg_price is Decimal128");
+		avgs.extend((0..column.len()).map(|i| column.value(i)));
+	}
+	avgs.sort_unstable();
+	assert_eq!(
+		avgs,
+		vec![100_000_000, 200_000_000],
+		"single-row groups: 100.000000 and 200.000000 at scale 6"
+	);
+}
+
 /// The Decimal128(15,2) `lineitem` fixture shared by the decimal probes: two rows —
 /// (q=10.00, price=100.00, disc=0.06, ship=8900) and (q=30.00, price=200.00, disc=0.05, ship=8950).
 fn lineitem_fixture() -> (MockCatalog, Arc<HarnessScan>) {

@@ -83,10 +83,10 @@ pub const Q1_DEV_SQL: &str = "SELECT l_returnflag, l_linestatus, \
 	GROUP BY l_returnflag, l_linestatus \
 	ORDER BY l_returnflag, l_linestatus";
 
-/// ADR 266 — strict Q1: the official-*typed* `Decimal128(15,2)` fixture + Q1 shape with the literal
-/// cutoff date. The `1 - l_discount` / `1 + l_tax` integer literals coerce to `Decimal128` and `+`/`-`
-/// bind (266); the first `AVG` over a `Decimal128` column is the measured deeper blocker
-/// (`unsupported_decimal_avg` → ADR 267). NOT a TPC-H result.
+/// strict Q1: the official-*typed* `Decimal128(15,2)` fixture + Q1 shape with the literal cutoff date.
+/// Every arithmetic piece now binds and executes — `1 - l_discount` / `1 + l_tax` coerce to `Decimal128`
+/// and `+`/`-` bind (266), `*` and `SUM` carry `Decimal128` (263), and `AVG(Decimal)` finalizes to a
+/// widened `Decimal128(p+4,s+4)` (268) — so strict Q1 reaches execute. NOT a validated TPC-H result.
 pub const STRICT_Q1_SQL: &str = "SELECT l_returnflag, l_linestatus, \
 	SUM(l_quantity) AS sum_qty, \
 	SUM(l_extendedprice) AS sum_base_price, \
@@ -410,10 +410,9 @@ pub async fn run_dev_q1(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 266 — strict Q1: official-typed `Decimal128(15,2)` + Q1 shape. Full Q1 currently stops at PLAN on
-/// `ambiguous aggregate projection` (multiple same-function aggregates — ADR 267), before the decimal
-/// arithmetic bind. The decimal `+`/`-` slice (which q01 needs) is verified by the focused decimal probe;
-/// `AVG(Decimal)` is a deeper blocker still, behind 267 in q01's bind order.
+/// strict Q1: official-typed `Decimal128(15,2)` + Q1 shape. Reaches execute end-to-end — ADR 267 cleared
+/// the multiple-same-function aggregate projection wall, and ADRs 263/266/268 cover the Decimal `*`/`SUM`,
+/// `+`/`-`, and `AVG` arithmetic. The focused decimal probes pin the individual arithmetic slices.
 pub async fn run_strict_q1(scale_factor: f64) -> Attempt {
 	let schema = strict_lineitem_schema();
 	run_query(
