@@ -4,11 +4,11 @@
 
 use std::process::ExitCode;
 
-use toron_tpch::telemetry::{Attempt, Phase, Status};
+use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q3,
-	run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q14,
-	status_rows,
+	CACHE_ROOT, check_strict_q6, correctness_matrix, generate_dev_lineitem, matrix,
+	parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q6, run_dev_q14, run_strict_q1,
+	run_strict_q3, run_strict_q6, run_strict_q14, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -47,8 +47,46 @@ async fn main() -> ExitCode {
 			ExitCode::SUCCESS
 		}
 		"run" => run_command(&args).await,
+		// ADR 273: the correctness rail — answer-check a query against an independent oracle.
+		"correctness" => correctness_command(&args).await,
+		"correctness-matrix" => {
+			for row in correctness_matrix() {
+				println!("{row}");
+			}
+			ExitCode::SUCCESS
+		}
 		_ => usage(),
 	}
+}
+
+/// ADR 273: answer-check a query against its independent oracle and record a correctness row (separate from
+/// reachability). Only `q06` (strict) is checked in this cut; any other query is a usage error (exit 2, no
+/// row), not a fake telemetry row.
+async fn correctness_command(args: &[String]) -> ExitCode {
+	let query = flag_value(args, "--query").unwrap_or("q06");
+	let sf = match resolved_sf(args) {
+		Ok(sf) => sf,
+		Err(message) => return harness_error(&message),
+	};
+	let attempt = match query {
+		"q06" | "q6" => check_strict_q6(sf).await,
+		other => return harness_error(&format!("correctness --query {other} is not supported")),
+	};
+	emit_correctness(&attempt);
+	if attempt.is_process_success() {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
+	}
+}
+
+fn emit_correctness(attempt: &CorrectnessAttempt) {
+	println!("{}", attempt.human());
+	println!("{}", attempt.jsonl());
+	let _ = std::fs::create_dir_all(CACHE_ROOT);
+	let path = format!("{CACHE_ROOT}/correctness.jsonl");
+	let existing = std::fs::read_to_string(&path).unwrap_or_default();
+	let _ = std::fs::write(&path, format!("{existing}{}\n", attempt.jsonl()));
 }
 
 async fn run_command(args: &[String]) -> ExitCode {
@@ -163,7 +201,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix> [--query q06] [--mode dev|strict] [--sf 0.01] [--allow-blocked]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix> [--query q06] [--mode dev|strict] [--sf 0.01] [--allow-blocked]"
 	);
 	ExitCode::from(2)
 }

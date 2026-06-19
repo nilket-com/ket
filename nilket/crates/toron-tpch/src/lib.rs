@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{
-	Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+	Array, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -35,7 +35,7 @@ use wendelon::schema::{
 	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
-use telemetry::{Attempt, Phase, Status, reason_for_error, status_for_reason};
+use telemetry::{Attempt, CorrectnessAttempt, Phase, Status, reason_for_error, status_for_reason};
 
 /// Default cache / output root — always under `target/`, never a tracked path.
 pub const CACHE_ROOT: &str = "target/tpch";
@@ -524,9 +524,60 @@ async fn run_query(
 	.await
 }
 
-/// Run a query single-node over N pre-built fixtures, recording the deepest phase reached. Registers every
-/// descriptor and seeds its optimizer facts (so join planning sees real build sides — ADR 269) before
-/// plan/bind. A stage error is classified against the recognized-blocker allowlist.
+/// A stage error from the shared execution path: the deepest phase reached and its classified reason.
+struct StageError {
+	phase: Phase,
+	reason: String,
+}
+
+/// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
+/// every descriptor, seed its optimizer facts, assemble storage, then plan/bind/execute, returning the
+/// result batches or the deepest-phase stage error. Reachability adds a digest; correctness adds the oracle
+/// compare — neither forks the execution path (ADR 273).
+async fn execute_query_with_tables(
+	sql: &str,
+	tables: Vec<HarnessTable>,
+) -> Result<Vec<RecordBatch>, StageError> {
+	let mut catalog = MockCatalog::new();
+	let mut batches = HashMap::new();
+	for table in tables {
+		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
+			return Err(StageError {
+				phase: Phase::Load,
+				reason: reason_for_error(&format!("{error:?}")).to_string(),
+			});
+		}
+		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
+			return Err(StageError {
+				phase: Phase::Load,
+				reason: reason_for_error(&format!("{error:?}")).to_string(),
+			});
+		}
+		batches.insert(table.id, table.batch);
+	}
+	let storage = Arc::new(HarnessScan { batches });
+
+	let logical = SqlPlanner::new().plan(sql).map_err(|error| StageError {
+		phase: Phase::Plan,
+		reason: reason_for_error(&error.to_string()).to_string(),
+	})?;
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| StageError {
+			phase: Phase::Bind,
+			reason: reason_for_error(&format!("{error:?}")).to_string(),
+		})?;
+	Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.map_err(|error| StageError {
+			phase: Phase::Execute,
+			reason: reason_for_error(&format!("{error:?}")).to_string(),
+		})
+}
+
+/// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
+/// canonical digest. A stage error is classified against the recognized-blocker allowlist.
 async fn run_query_with_tables(
 	query_id: &str,
 	mode: &str,
@@ -547,71 +598,10 @@ async fn run_query_with_tables(
 			digest,
 		};
 
-	// load: register every descriptor + seed its optimizer facts, then assemble storage.
-	let mut catalog = MockCatalog::new();
-	let mut batches = HashMap::new();
-	for table in tables {
-		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
-			let reason = reason_for_error(&format!("{error:?}"));
-			return attempt(
-				Phase::Load,
-				status_for_reason(reason),
-				Some(reason.to_string()),
-				None,
-			);
-		}
-		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
-			let reason = reason_for_error(&format!("{error:?}"));
-			return attempt(
-				Phase::Load,
-				status_for_reason(reason),
-				Some(reason.to_string()),
-				None,
-			);
-		}
-		batches.insert(table.id, table.batch);
-	}
-	let storage = Arc::new(HarnessScan { batches });
-
-	// plan
-	let logical = match SqlPlanner::new().plan(sql) {
-		Ok(plan) => plan,
-		Err(error) => {
-			let reason = reason_for_error(&error.to_string());
-			return attempt(
-				Phase::Plan,
-				status_for_reason(reason),
-				Some(reason.to_string()),
-				None,
-			);
-		}
-	};
-
-	// bind
-	let bound = match bind(&logical, &catalog, &PlannerConfig::default()).await {
-		Ok(bound) => bound,
-		Err(error) => {
-			let reason = reason_for_error(&format!("{error:?}"));
-			return attempt(
-				Phase::Bind,
-				status_for_reason(reason),
-				Some(reason.to_string()),
-				None,
-			);
-		}
-	};
-
-	// execute
-	let batches = match Executor::new(storage).execute_bound(&bound, None).await {
+	let batches = match execute_query_with_tables(sql, tables).await {
 		Ok(batches) => batches,
-		Err(error) => {
-			let reason = reason_for_error(&format!("{error:?}"));
-			return attempt(
-				Phase::Execute,
-				status_for_reason(reason),
-				Some(reason.to_string()),
-				None,
-			);
+		Err(StageError { phase, reason }) => {
+			return attempt(phase, status_for_reason(&reason), Some(reason), None);
 		}
 	};
 
@@ -691,6 +681,142 @@ pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
 		strict_lineitem_descriptor(schema.as_ref()),
 	)
 	.await
+}
+
+/// ADR 273: the independent strict-q06 oracle — `Σ (l_extendedprice_raw × l_discount_raw)` (scale-4 i128)
+/// over the rows the strict-q06 filters select, by traversing `LineItemGenerator` directly (NOT Toron's
+/// loaded batch). Returns the expected raw sum (`None` = `SUM(empty)` → NULL) and the matched-row count (a
+/// zero count would let a threshold bug masquerade as a vacuous pass). Raw `Decimal128(15,2)` thresholds:
+/// discount `0.05..=0.07` = `5..=7`; quantity `< 24` = `*100 < 2400`; shipdate `[1994-01-01, 1995-01-01)` =
+/// `Date32` day counts `8766..9131`.
+pub fn strict_q6_oracle(scale_factor: f64) -> (Option<i128>, usize) {
+	let generator = LineItemGenerator::new(scale_factor, 1, 1);
+	let mut sum: i128 = 0;
+	let mut matched = 0usize;
+	for item in generator.iter() {
+		if let Some(revenue) = q6_row_revenue(
+			item.l_extendedprice.into_inner() as i128,
+			item.l_discount.into_inner() as i128,
+			item.l_quantity as i128 * 100,
+			item.l_shipdate.to_unix_epoch(),
+		) {
+			sum += revenue;
+			matched += 1;
+		}
+	}
+	if matched == 0 {
+		(None, 0)
+	} else {
+		(Some(sum), matched)
+	}
+}
+
+/// ADR 273: the per-row q06 contribution — `Some(extendedprice_raw × discount_raw)` (scale 4) when the row
+/// matches the strict-q06 filters, else `None`. Split out so the scaled-`i128` arithmetic and the raw bounds
+/// (discount `5..=7`, quantity `*100 < 2400`, shipdate day-count `8766..9131`) are testable on crafted values.
+pub fn q6_row_revenue(
+	extendedprice_raw: i128,
+	discount_raw: i128,
+	quantity_scaled: i128,
+	shipdate_days: i32,
+) -> Option<i128> {
+	if (5..=7).contains(&discount_raw)
+		&& quantity_scaled < 2400
+		&& (8766..9131).contains(&shipdate_days)
+	{
+		Some(extendedprice_raw * discount_raw)
+	} else {
+		None
+	}
+}
+
+/// Compare Toron's strict-q06 executor output to the oracle's raw scale-4 `i128`. Requires one column, ≤ 1
+/// row, and exact type `Decimal128(31,4)`; compares the raw value and nullness (never a formatted string, so a
+/// future Decimal-widening change can't silently pass). `Ok(())` = match; `Err(reason)` = mismatch.
+pub fn compare_strict_q6(batches: &[RecordBatch], expected: Option<i128>) -> Result<(), String> {
+	let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+	if total_rows > 1 {
+		return Err(format!("expected <= 1 output row, got {total_rows}"));
+	}
+	let Some(batch) = batches.iter().find(|batch| batch.num_rows() == 1) else {
+		// No output row — treat as SUM(empty) = NULL.
+		return match expected {
+			None => Ok(()),
+			Some(value) => Err(format!("expected raw {value}, got an empty result")),
+		};
+	};
+	if batch.num_columns() != 1 {
+		return Err(format!(
+			"expected 1 output column, got {}",
+			batch.num_columns()
+		));
+	}
+	let column = batch.column(0);
+	if column.data_type() != &DataType::Decimal128(31, 4) {
+		return Err(format!(
+			"expected Decimal128(31,4), got {:?}",
+			column.data_type()
+		));
+	}
+	let array = column
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.ok_or_else(|| "output column is not Decimal128".to_string())?;
+	let actual = if array.is_null(0) {
+		None
+	} else {
+		Some(array.value(0))
+	};
+	if actual == expected {
+		Ok(())
+	} else {
+		Err(format!(
+			"raw mismatch: expected {expected:?}, got {actual:?}"
+		))
+	}
+}
+
+/// ADR 273 — strict q06 correctness check: execute strict q06 over the shared substrate, then compare the
+/// single `Decimal128(31,4)` output against the independent oracle. A mismatch is `fail@compare` (no "wrong
+/// answer" blocker); a query that can't plan/bind/execute carries its deepest phase + reachability-style
+/// reason. The oracle must select ≥ 1 row (else a vacuous `0 == 0` would mask a threshold bug).
+pub async fn check_strict_q6(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let lineitem = generate_strict_lineitem(scale_factor);
+	let tables = vec![HarnessTable {
+		id: TableId(1),
+		name: "lineitem",
+		descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
+		facts: facts_for_batch(&lineitem),
+		batch: lineitem,
+	}];
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q06".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q6_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	let (expected, matched) = strict_q6_oracle(scale_factor);
+	if matched == 0 {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some("oracle matched zero rows at this scale".to_string()),
+		);
+	}
+	match compare_strict_q6(&batches, expected) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
 }
 
 /// Validate an explicit `--sf` (scale-factor) value: it must be a **finite, strictly-positive** number.
@@ -891,6 +1017,46 @@ pub fn matrix_from_log(contents: &str) -> Vec<String> {
 					.unwrap_or_else(|| "not_run".to_string())
 			};
 			format!("{id} dev={} strict={}", cell("dev"), cell("strict"))
+		})
+		.collect()
+}
+
+/// ADR 273: regenerate the strict correctness matrix from `target/tpch/correctness.jsonl` — a rail separate
+/// from the reachability matrix. The latest answer-check per query; an unchecked query renders `unchecked`.
+pub fn correctness_matrix() -> Vec<String> {
+	let log = format!("{CACHE_ROOT}/correctness.jsonl");
+	let contents = std::fs::read_to_string(&log).unwrap_or_default();
+	correctness_matrix_from_log(&contents)
+}
+
+/// The pure correctness-matrix renderer over a `correctness.jsonl` body (strict-only). Split out so it is
+/// testable without the shared cache file, and so a reachability row cannot leak in (the `suite` is checked).
+pub fn correctness_matrix_from_log(contents: &str) -> Vec<String> {
+	let mut latest: HashMap<String, String> = HashMap::new();
+	for line in contents.lines() {
+		let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+			continue;
+		};
+		if row["suite"].as_str() != Some("tpch_correctness") {
+			continue;
+		}
+		let query = row["query"].as_str().unwrap_or("?").to_string();
+		let phase = row["phase"].as_str().unwrap_or("?");
+		let status = row["status"].as_str().unwrap_or("?");
+		let cell = match status {
+			"fail" => format!("fail({}@{phase})", row["reason"].as_str().unwrap_or("?")),
+			_ => format!("{status}@{phase}"),
+		};
+		latest.insert(query, cell);
+	}
+	ALL_QUERY_IDS
+		.iter()
+		.map(|id| {
+			let cell = latest
+				.get(*id)
+				.cloned()
+				.unwrap_or_else(|| "unchecked".to_string());
+			format!("{id} strict={cell}")
 		})
 		.collect()
 }

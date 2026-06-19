@@ -176,3 +176,55 @@ impl Attempt {
 		}
 	}
 }
+
+/// ADR 273: one correctness-check outcome — a rail distinct from [`Attempt`]. The human line is
+/// `tpch_correctness` (NOT `tpch_reachability`), so it cannot be confused with a reachability row, and it
+/// carries no digest (correctness compares the raw Decimal value, not the digest). `phase=compare
+/// status=pass|fail` is the answer check; a query that fails to plan/bind/execute carries that deepest phase
+/// with a reachability-style reason.
+#[derive(Debug, Clone)]
+pub struct CorrectnessAttempt {
+	pub query: String,
+	pub scale_factor: f64,
+	pub mode: String,
+	pub phase: Phase,
+	pub status: Status,
+	pub reason: Option<String>,
+	pub elapsed_ms: f64,
+}
+
+impl CorrectnessAttempt {
+	pub fn human(&self) -> String {
+		format!(
+			"tpch_correctness query={} sf={} mode={} phase={} status={} reason={} elapsed_ms={:.1}",
+			self.query,
+			self.scale_factor,
+			self.mode,
+			self.phase.as_str(),
+			self.status.as_str(),
+			self.reason.as_deref().unwrap_or("none"),
+			self.elapsed_ms,
+		)
+	}
+
+	pub fn jsonl(&self) -> String {
+		serde_json::json!({
+			"suite": "tpch_correctness",
+			"query": self.query,
+			"scale_factor": self.scale_factor,
+			"mode": self.mode,
+			"phase": self.phase.as_str(),
+			"status": self.status.as_str(),
+			"reason": self.reason,
+			"elapsed_ms": self.elapsed_ms,
+		})
+		.to_string()
+	}
+
+	/// A correctness check succeeds only when it reached `compare` and matched (`Pass`). A mismatch
+	/// (`Fail`) or a query that couldn't be executed is a process failure — there is no `--allow-blocked`
+	/// escape on the correctness rail.
+	pub fn is_process_success(&self) -> bool {
+		self.status == Status::Pass
+	}
+}
