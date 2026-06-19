@@ -2,8 +2,8 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q6, run_dev_q14,
-	run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q6,
+	run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -127,6 +127,48 @@ async fn q14_runs_keyed_at_default_scale() {
 		"a pass carries a digest: {}",
 		dev.human()
 	);
+}
+
+// q03 (the first 3-table query) reaches execute in both modes: dev over Float64, strict over Decimal128.
+#[tokio::test]
+async fn q03_executes_in_both_modes() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q03 dev=implemented strict=implemented"),
+		"q03 is an implemented capability in the static inventory"
+	);
+	for (mode, attempt) in [
+		("dev", run_dev_q3(0.0001).await),
+		("strict", run_strict_q3(0.0001).await),
+	] {
+		assert_eq!(attempt.query, "q03");
+		assert_eq!(
+			attempt.status,
+			Status::Pass,
+			"q03 {mode} reaches execute: {}",
+			attempt.human()
+		);
+		assert_eq!(attempt.phase, Phase::Execute);
+		assert!(
+			attempt.digest.is_some(),
+			"a pass carries a digest: {}",
+			attempt.human()
+		);
+	}
+}
+
+// q03's 3-table comma join is keyed, not a cartesian: at sf=0.01 a cartesian would exceed 10^12 rows.
+#[tokio::test]
+async fn q03_runs_keyed_at_default_scale() {
+	let dev = run_dev_q3(0.01).await;
+	assert_eq!(
+		dev.status,
+		Status::Pass,
+		"q03 dev reaches execute at the default scale via a keyed (non-cartesian) join: {}",
+		dev.human()
+	);
+	assert_eq!(dev.phase, Phase::Execute);
 }
 
 // CLI hygiene (ADR 261 boundary): a `--sf` value must be a finite, positive number. Malformed / zero /

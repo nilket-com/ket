@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q6,
-	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q3,
+	run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q14,
+	status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -69,7 +70,7 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_dev_q6(sf).await
 			}
 		}
-		// ADR 266 adds Q1; the other 20 are inventoried but not yet attempted.
+		// Single-table reachability attempt over the lineitem fixture.
 		"q01" | "q1" => {
 			if strict {
 				run_strict_q1(sf).await
@@ -77,8 +78,15 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_dev_q1(sf).await
 			}
 		}
-		// ADR 269 adds q14 (the first multi-table query); ADR 270's comma-join recognition keys the join so
-		// it no longer rides a cartesian, so q14 resolves --sf like any other query (no scale cap).
+		// Three-table reachability attempt over customer/orders/lineitem.
+		"q03" | "q3" => {
+			if strict {
+				run_strict_q3(sf).await
+			} else {
+				run_dev_q3(sf).await
+			}
+		}
+		// Two-table decimal-ratio reachability attempt.
 		"q14" => {
 			if strict {
 				run_strict_q14(sf).await

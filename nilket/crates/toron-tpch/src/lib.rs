@@ -1,8 +1,8 @@
 //! ADR 261: TPC-H Reachability Harness — the library half (CLI lives in `main.rs`).
 //!
-//! Dev mode generates the Q6-needed `LINEITEM` columns from the pure-Rust `tpchgen` row structs,
+//! Dev mode generates the harness `LINEITEM` subset from the pure-Rust `tpchgen` row structs,
 //! converts `TPCHDecimal → Float64` and `TPCHDate → Date32` into workspace-Arrow, loads them through a
-//! local [`StorageScan`], and runs a Toron-authored Q6 proxy single-node through `plan → bind →
+//! local [`StorageScan`], and runs Toron-authored reachability SQL single-node through `plan → bind →
 //! execute`. A `pass` here means *reachability* (the shape ran and produced a digest), not TPC-H
 //! correctness — dev data is synthetic and explicitly NOT a TPC-H result.
 
@@ -12,11 +12,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+	Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use tpchgen::generators::{LineItemGenerator, PartGenerator};
+use tpchgen::generators::{CustomerGenerator, LineItemGenerator, OrderGenerator, PartGenerator};
 
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
@@ -118,8 +120,26 @@ pub const Q14_DEV_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%
 /// `Decimal128(15,2)` types instead of `Float64`.
 pub const STRICT_Q14_SQL: &str = Q14_DEV_SQL;
 
-/// The dev `LINEITEM` schema: only the Q6 columns, money/qty/discount as `Float64`, ship date as
-/// `Date32`. No string carriers; an append-only (PK-less) identity, so no synthetic key column.
+/// Q3 Shipping Priority reachability SQL: tpchgen-2.0.2's Q3 text with the `:1`/`:2`
+/// params bound to literals (`'BUILDING'`, `DATE '1995-03-15'`) and no `LIMIT` (the
+/// bundled text carries none). Same text both modes; only `lineitem` types differ.
+pub const Q3_DEV_SQL: &str = "SELECT l_orderkey, \
+	SUM(l_extendedprice * (1 - l_discount)) AS revenue, \
+	o_orderdate, o_shippriority \
+	FROM customer, orders, lineitem \
+	WHERE c_mktsegment = 'BUILDING' \
+	  AND c_custkey = o_custkey \
+	  AND l_orderkey = o_orderkey \
+	  AND o_orderdate < DATE '1995-03-15' \
+	  AND l_shipdate > DATE '1995-03-15' \
+	GROUP BY l_orderkey, o_orderdate, o_shippriority \
+	ORDER BY revenue DESC, o_orderdate";
+
+/// strict q03 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
+pub const STRICT_Q3_SQL: &str = Q3_DEV_SQL;
+
+/// The dev `LINEITEM` schema: the q01/q03/q06/q14 reachability subset. Money/quantity/discount/tax are
+/// `Float64`, ship date is `Date32`, string flags stay `Utf8`, and join keys are `Int64`.
 fn dev_lineitem_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("l_quantity", DataType::Float64, false),
@@ -130,8 +150,9 @@ fn dev_lineitem_schema() -> SchemaRef {
 		Field::new("l_returnflag", DataType::Utf8, false),
 		Field::new("l_linestatus", DataType::Utf8, false),
 		Field::new("l_tax", DataType::Float64, false),
-		// ADR 269: q14 join key (appended so q01/q06 column positions / digests don't move).
+		// Append join keys after earlier query columns so q01/q06 positions and digests stay stable.
 		Field::new("l_partkey", DataType::Int64, false),
+		Field::new("l_orderkey", DataType::Int64, false),
 	]))
 }
 
@@ -151,7 +172,7 @@ fn dev_lineitem_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	.expect("dev lineitem descriptor")
 }
 
-/// Generate the Q6-needed `LINEITEM` columns at `scale_factor` from `tpchgen` rows into workspace-Arrow.
+/// Generate the dev `LINEITEM` reachability subset at `scale_factor` from `tpchgen` rows into workspace-Arrow.
 pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let generator = LineItemGenerator::new(scale_factor, 1, 1);
 	let mut quantity = Vec::new();
@@ -162,6 +183,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut linestatus = Vec::new();
 	let mut tax = Vec::new();
 	let mut partkey = Vec::new();
+	let mut orderkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -171,6 +193,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		linestatus.push(item.l_linestatus.to_string());
 		tax.push(item.l_tax.as_f64());
 		partkey.push(item.l_partkey);
+		orderkey.push(item.l_orderkey);
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -183,6 +206,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(linestatus)),
 			Arc::new(Float64Array::from(tax)),
 			Arc::new(Int64Array::from(partkey)),
+			Arc::new(Int64Array::from(orderkey)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -202,8 +226,9 @@ fn strict_lineitem_schema() -> SchemaRef {
 		Field::new("l_returnflag", DataType::Utf8, false),
 		Field::new("l_linestatus", DataType::Utf8, false),
 		decimal("l_tax"),
-		// ADR 269: q14 join key (appended so q01/q06 column positions / digests don't move).
+		// Append join keys after earlier query columns so q01/q06 positions and digests stay stable.
 		Field::new("l_partkey", DataType::Int64, false),
+		Field::new("l_orderkey", DataType::Int64, false),
 	]))
 }
 
@@ -222,9 +247,8 @@ fn strict_lineitem_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	.expect("strict lineitem descriptor")
 }
 
-/// Generate the Q6-needed `LINEITEM` columns at `scale_factor` as official `Decimal128(15,2)` Arrow —
-/// no `Float64` conversion (that is the dev path). `TPCHDecimal::into_inner()` is already the scale-2
-/// raw value; the whole-number quantity is scaled by 100.
+/// Generate the strict `LINEITEM` reachability subset at `scale_factor` as official `Decimal128(15,2)` Arrow.
+/// `TPCHDecimal::into_inner()` is already the scale-2 raw value; whole-number quantity is scaled by 100.
 pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let generator = LineItemGenerator::new(scale_factor, 1, 1);
 	let mut quantity = Vec::new();
@@ -235,6 +259,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut linestatus = Vec::new();
 	let mut tax = Vec::new();
 	let mut partkey = Vec::new();
+	let mut orderkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -244,6 +269,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		linestatus.push(item.l_linestatus.to_string());
 		tax.push(item.l_tax.into_inner() as i128);
 		partkey.push(item.l_partkey);
+		orderkey.push(item.l_orderkey);
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -263,6 +289,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(linestatus)),
 			decimal(tax),
 			Arc::new(Int64Array::from(partkey)),
+			Arc::new(Int64Array::from(orderkey)),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -309,6 +336,101 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 		],
 	)
 	.expect("part batch")
+}
+
+/// The q03 `CUSTOMER` fixture: the join key + the market-segment filter column. No decimals → identical in
+/// dev and strict (like `part`).
+fn customer_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("c_custkey", DataType::Int64, false),
+		Field::new("c_mktsegment", DataType::Utf8, false),
+	]))
+}
+
+fn customer_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([15; 16]),
+		1,
+		"default",
+		"customer",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("customer descriptor")
+}
+
+/// Generate the q03-needed `CUSTOMER` columns (`c_custkey`, `c_mktsegment`) at `scale_factor`.
+pub fn generate_customer(scale_factor: f64) -> RecordBatch {
+	let generator = CustomerGenerator::new(scale_factor, 1, 1);
+	let mut custkey = Vec::new();
+	let mut mktsegment = Vec::new();
+	for item in generator.iter() {
+		custkey.push(item.c_custkey);
+		mktsegment.push(item.c_mktsegment.to_string());
+	}
+	RecordBatch::try_new(
+		customer_schema(),
+		vec![
+			Arc::new(Int64Array::from(custkey)),
+			Arc::new(StringArray::from(mktsegment)),
+		],
+	)
+	.expect("customer batch")
+}
+
+/// The q03 `ORDERS` fixture: the two join keys + the date filter + the group key. No decimals (q03 ignores
+/// `o_totalprice`) → identical in dev and strict.
+fn orders_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("o_orderkey", DataType::Int64, false),
+		Field::new("o_custkey", DataType::Int64, false),
+		Field::new("o_orderdate", DataType::Date32, false),
+		Field::new("o_shippriority", DataType::Int32, false),
+	]))
+}
+
+fn orders_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([16; 16]),
+		1,
+		"default",
+		"orders",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("orders descriptor")
+}
+
+/// Generate the q03-needed `ORDERS` columns (`o_orderkey`, `o_custkey`, `o_orderdate`, `o_shippriority`) at
+/// `scale_factor`. `o_orderdate` converts `TPCHDate → Date32` like `l_shipdate`.
+pub fn generate_orders(scale_factor: f64) -> RecordBatch {
+	let generator = OrderGenerator::new(scale_factor, 1, 1);
+	let mut orderkey = Vec::new();
+	let mut custkey = Vec::new();
+	let mut orderdate = Vec::new();
+	let mut shippriority = Vec::new();
+	for item in generator.iter() {
+		orderkey.push(item.o_orderkey);
+		custkey.push(item.o_custkey);
+		orderdate.push(item.o_orderdate.to_unix_epoch());
+		shippriority.push(item.o_shippriority);
+	}
+	RecordBatch::try_new(
+		orders_schema(),
+		vec![
+			Arc::new(Int64Array::from(orderkey)),
+			Arc::new(Int64Array::from(custkey)),
+			Arc::new(Date32Array::from(orderdate)),
+			Arc::new(Int32Array::from(shippriority)),
+		],
+	)
+	.expect("orders batch")
 }
 
 /// Honest optimizer facts for a fixture batch: its real row count and in-memory byte size, so join
@@ -643,14 +765,78 @@ pub async fn run_strict_q14(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// Run q03 over the `Float64` proxy `lineitem`.
+pub async fn run_dev_q3(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q03",
+		"dev",
+		scale_factor,
+		Q3_DEV_SQL,
+		q03_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// Run q03 with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q3(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q03",
+		"strict",
+		scale_factor,
+		STRICT_Q3_SQL,
+		q03_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The three q03 harness tables. `lineitem` is the only mode-sensitive fixture (`Float64` vs
+/// `Decimal128`); `customer`/`orders` carry no decimals and are identical in both modes.
+fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let customer = generate_customer(scale_factor);
+	let orders = generate_orders(scale_factor);
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "customer",
+			descriptor: customer_descriptor(customer_schema().as_ref()),
+			facts: facts_for_batch(&customer),
+			batch: customer,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
+		},
+	]
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
-/// NOT the last measured result. q06 is implemented in both modes; the rest are not yet attempted.
-/// Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed [`matrix`].
+/// NOT the last measured result. Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed
+/// [`matrix`].
 pub fn status_rows() -> Vec<String> {
 	ALL_QUERY_IDS
 		.iter()
 		.map(|id| {
-			let state = if *id == "q06" || *id == "q01" || *id == "q14" {
+			let state = if *id == "q06" || *id == "q01" || *id == "q14" || *id == "q03" {
 				"implemented"
 			} else {
 				"not_attempted"
