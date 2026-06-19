@@ -8,7 +8,7 @@
 
 pub mod telemetry;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1418,6 +1418,282 @@ pub async fn check_strict_q1(scale_factor: f64) -> CorrectnessAttempt {
 		);
 	}
 	match compare_strict_q1(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+/// ADR 280: one q03 result group, keyed by the unique `l_orderkey` (a given orderkey carries exactly one
+/// `(o_orderdate, o_shippriority)` from its 1:1 order). `revenue` is raw `i128` at scale 4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q3Group {
+	pub revenue: i128,
+	pub orderdate: i32,
+	pub shippriority: i32,
+}
+
+/// ADR 280: the independent strict-q03 oracle result — the sorted group map plus the count of contributing
+/// lineitem rows (the non-vacuity guard reads `selected_rows ≥ 1` AND `groups.len() > 1`).
+pub struct Q3Oracle {
+	pub groups: BTreeMap<i64, Q3Group>,
+	pub selected_rows: usize,
+}
+
+/// ADR 280: the independent strict-q03 oracle — traverse the Customer/Order/LineItem generators directly,
+/// apply q03's `c_mktsegment = 'BUILDING'` + date filters and the two join keys, and accumulate raw scale-4
+/// revenue per `l_orderkey`. `DATE '1995-03-15'` is day-count `9204` (cross-check: q01 used `10471` for
+/// `1998-09-02`; the 1267-day gap gives `9204 + 1267 = 10471`). `revenue` mirrors q01's `sum_disc_price`:
+/// `extprice_raw * (100 - disc_raw)` at scale 4 — no float, no tolerance.
+pub fn strict_q3_oracle(scale_factor: f64) -> Q3Oracle {
+	const CUTOFF: i32 = 9204; // DATE '1995-03-15' as a Date32 day-count.
+
+	let mut building_customers: HashSet<i64> = HashSet::new();
+	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		if customer.c_mktsegment == "BUILDING" {
+			building_customers.insert(customer.c_custkey);
+		}
+	}
+
+	let mut orders: HashMap<i64, (i32, i32)> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		if order.o_orderdate.to_unix_epoch() < CUTOFF
+			&& building_customers.contains(&order.o_custkey)
+		{
+			orders.insert(
+				order.o_orderkey,
+				(order.o_orderdate.to_unix_epoch(), order.o_shippriority),
+			);
+		}
+	}
+
+	let mut groups: BTreeMap<i64, Q3Group> = BTreeMap::new();
+	let mut selected_rows = 0usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		if item.l_shipdate.to_unix_epoch() <= CUTOFF {
+			continue;
+		}
+		let Some(&(orderdate, shippriority)) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let disc_raw = item.l_discount.into_inner() as i128;
+		let group = groups.entry(item.l_orderkey).or_insert(Q3Group {
+			revenue: 0,
+			orderdate,
+			shippriority,
+		});
+		group.revenue += extprice_raw * (100 - disc_raw);
+		selected_rows += 1;
+	}
+
+	Q3Oracle {
+		groups,
+		selected_rows,
+	}
+}
+
+/// strict q03's measured output schema (read from the executor's actual output — `revenue` is q01's
+/// `sum_disc_price` expression, measured `Decimal128(32,4)` in ADR 276).
+fn strict_q3_expected_schema() -> [(&'static str, DataType); 4] {
+	[
+		("l_orderkey", DataType::Int64),
+		("revenue", DataType::Decimal128(32, 4)),
+		("o_orderdate", DataType::Date32),
+		("o_shippriority", DataType::Int32),
+	]
+}
+
+/// Assert strict q03's actual output schema matches [`strict_q3_expected_schema`] (column count, names, exact
+/// `(p,s)`) before any value compare. A drift is a compare failure — never a wrong-scale value comparison.
+pub fn assert_strict_q3_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q3_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q03 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+/// Compare strict q03's output to the independent oracle. Assert the schema, then verify the two things SQL
+/// specifies: (1) **answer-correctness** — the emitted rows form a bijection with the oracle groups keyed by
+/// the unique `l_orderkey` (a duplicate emitted key is rejected up front, not silently overwritten), with each
+/// cell's raw value matching exactly; (2) **order-correctness** — the emitted sequence respects the `ORDER BY
+/// revenue DESC, o_orderdate` prefix. Ties on `l_orderkey`/`o_shippriority` are unspecified by SQL (the
+/// executor's `bind_sort_keys` totalizes — an implementation detail this comparator does not pin). Any
+/// mismatch → `Err` (`fail@compare`).
+pub fn compare_strict_q3(
+	batches: &[RecordBatch],
+	oracle: &BTreeMap<i64, Q3Group>,
+) -> Result<(), String> {
+	assert_strict_q3_schema(batches)?;
+
+	// Emitted rows, in emit order (used as-is for the order check; deduped into a map for the bijection).
+	let mut emitted: Vec<(i64, i128, i32, i32)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 4 {
+			return Err(format!("expected 4 columns, got {}", batch.num_columns()));
+		}
+		let orderkeys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 0 (l_orderkey) not Int64")?;
+		let revenues = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 1 (revenue) not Decimal128")?;
+		let orderdates = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Date32Array>()
+			.ok_or("column 2 (o_orderdate) not Date32")?;
+		let shippriorities = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.ok_or("column 3 (o_shippriority) not Int32")?;
+		for i in 0..batch.num_rows() {
+			if orderkeys.is_null(i)
+				|| revenues.is_null(i)
+				|| orderdates.is_null(i)
+				|| shippriorities.is_null(i)
+			{
+				return Err(format!("unexpected NULL in emitted row {}", emitted.len()));
+			}
+			emitted.push((
+				orderkeys.value(i),
+				revenues.value(i),
+				orderdates.value(i),
+				shippriorities.value(i),
+			));
+		}
+	}
+
+	// (1) Answer-correctness: a bijection with the oracle, keyed by the unique l_orderkey.
+	if emitted.len() != oracle.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<i64, (i128, i32, i32)> = BTreeMap::new();
+	for &(orderkey, revenue, orderdate, shippriority) in &emitted {
+		if seen
+			.insert(orderkey, (revenue, orderdate, shippriority))
+			.is_some()
+		{
+			return Err(format!("duplicate emitted l_orderkey {orderkey}"));
+		}
+	}
+	// |seen| == |oracle| and every oracle key present below ⇒ the key sets are equal (a bijection).
+	for (orderkey, group) in oracle {
+		let Some(&(revenue, orderdate, shippriority)) = seen.get(orderkey) else {
+			return Err(format!("oracle l_orderkey {orderkey} missing from output"));
+		};
+		if revenue != group.revenue {
+			return Err(format!(
+				"l_orderkey {orderkey}: revenue mismatch: expected {}, got {revenue}",
+				group.revenue
+			));
+		}
+		if orderdate != group.orderdate {
+			return Err(format!(
+				"l_orderkey {orderkey}: o_orderdate mismatch: expected {}, got {orderdate}",
+				group.orderdate
+			));
+		}
+		if shippriority != group.shippriority {
+			return Err(format!(
+				"l_orderkey {orderkey}: o_shippriority mismatch: expected {}, got {shippriority}",
+				group.shippriority
+			));
+		}
+	}
+
+	// (2) Order-correctness: ORDER BY revenue DESC, o_orderdate (ASC) — the prefix SQL specifies.
+	for pair in emitted.windows(2) {
+		let (_, rev_a, date_a, _) = pair[0];
+		let (_, rev_b, date_b, _) = pair[1];
+		if rev_a < rev_b {
+			return Err(format!(
+				"ORDER BY revenue DESC violated: {rev_a} emitted before {rev_b}"
+			));
+		}
+		if rev_a == rev_b && date_a > date_b {
+			return Err(format!(
+				"ORDER BY o_orderdate ASC violated within equal revenue: {date_a} emitted before {date_b}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+/// ADR 280: the strict-q03 correctness check — execute strict q03, assert its schema, guard non-vacuity (≥ 1
+/// contributing lineitem row AND > 1 group), then verify the answer bijection + `ORDER BY` prefix against the
+/// independent oracle. A mismatch is `fail@compare`; a query that can't execute carries its deepest phase.
+pub async fn check_strict_q3(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q03_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q03".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q3_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q3_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q3_oracle(scale_factor);
+	if oracle.selected_rows < 1 || oracle.groups.len() <= 1 {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: selected_rows={} groups={}",
+				oracle.selected_rows,
+				oracle.groups.len()
+			)),
+		);
+	}
+	match compare_strict_q3(&batches, &oracle.groups) {
 		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
 		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
 	}

@@ -6,10 +6,10 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, check_strict_q1, check_strict_q6, correctness_matrix, generate_dev_lineitem,
-	matrix, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6,
-	run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q04, run_strict_q05,
-	run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
+	CACHE_ROOT, check_strict_q1, check_strict_q3, check_strict_q6, correctness_matrix,
+	generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04,
+	run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -72,6 +72,7 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 	let attempt = match query {
 		"q06" | "q6" => check_strict_q6(sf).await,
 		"q01" | "q1" => check_strict_q1(sf).await,
+		"q03" | "q3" => check_strict_q3(sf).await,
 		other => return harness_error(&format!("correctness --query {other} is not supported")),
 	};
 	emit_correctness(&attempt);

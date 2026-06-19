@@ -4,14 +4,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Decimal128Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	Q1Group, assert_strict_q1_schema, avg_decimal_raw, check_strict_q1, check_strict_q6,
-	compare_strict_q1, compare_strict_q6, correctness_matrix_from_log, q6_row_revenue,
-	strict_q1_oracle, strict_q6_oracle,
+	Q1Group, Q3Group, assert_strict_q1_schema, assert_strict_q3_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q3, check_strict_q6, compare_strict_q1, compare_strict_q3,
+	compare_strict_q6, correctness_matrix_from_log, q6_row_revenue, strict_q1_oracle,
+	strict_q3_oracle, strict_q6_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -334,5 +335,175 @@ fn q1_null_cell_is_fail_at_compare() {
 	assert!(
 		error.contains("sum_qty") && error.contains("NULL"),
 		"the failure names the null column: {error}"
+	);
+}
+
+// ADR 280: a q03 output batch matching the exact 4-column strict schema, rows in the given emit order.
+fn q3_batch(rows: &[(i64, i128, i32, i32)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("l_orderkey", DataType::Int64, false),
+		Field::new("revenue", DataType::Decimal128(32, 4), false),
+		Field::new("o_orderdate", DataType::Date32, false),
+		Field::new("o_shippriority", DataType::Int32, false),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				rows.iter().map(|r| r.0).collect::<Vec<i64>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|r| r.1).collect::<Vec<i128>>())
+					.with_precision_and_scale(32, 4)
+					.expect("revenue decimal column"),
+			),
+			Arc::new(Date32Array::from(
+				rows.iter().map(|r| r.2).collect::<Vec<i32>>(),
+			)),
+			Arc::new(Int32Array::from(
+				rows.iter().map(|r| r.3).collect::<Vec<i32>>(),
+			)),
+		],
+	)
+	.expect("q3 batch")
+}
+
+fn q3_oracle(rows: &[(i64, i128, i32, i32)]) -> BTreeMap<i64, Q3Group> {
+	rows.iter()
+		.map(|&(orderkey, revenue, orderdate, shippriority)| {
+			(
+				orderkey,
+				Q3Group {
+					revenue,
+					orderdate,
+					shippriority,
+				},
+			)
+		})
+		.collect()
+}
+
+// ADR 280: Toron's strict q03 output (the first multi-table answer-check) equals the independent
+// generator-traversal oracle — schema asserted, then the answer bijection + ORDER BY prefix verified.
+#[tokio::test]
+async fn strict_q3_matches_independent_oracle() {
+	let attempt = check_strict_q3(0.01).await;
+	assert_eq!(attempt.query, "q03");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+// The oracle is genuinely multi-table + multi-group: > 1 group and ≥ 1 contributing lineitem row.
+#[test]
+fn strict_q3_oracle_selects_multiple_groups() {
+	let oracle = strict_q3_oracle(0.01);
+	assert!(
+		oracle.selected_rows >= 1,
+		"selected {} contributing rows",
+		oracle.selected_rows
+	);
+	assert!(
+		oracle.groups.len() > 1,
+		"expected > 1 group, got {}",
+		oracle.groups.len()
+	);
+}
+
+// The Phase-0 schema gate accepts the exact 4-column schema and rejects a drifted revenue precision (a
+// (31,4)-vs-(32,4) slip would otherwise compare at the wrong place — the ADR 276 trap).
+#[test]
+fn strict_q3_output_schema_is_asserted() {
+	assert!(assert_strict_q3_schema(&[q3_batch(&[(1, 100, 9300, 0)])]).is_ok());
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("l_orderkey", DataType::Int64, false),
+			Field::new("revenue", DataType::Decimal128(31, 4), false),
+			Field::new("o_orderdate", DataType::Date32, false),
+			Field::new("o_shippriority", DataType::Int32, false),
+		])),
+		vec![
+			Arc::new(Int64Array::from(vec![1_i64])),
+			Arc::new(
+				Decimal128Array::from(vec![100_i128])
+					.with_precision_and_scale(31, 4)
+					.expect("decimal"),
+			),
+			Arc::new(Date32Array::from(vec![9300_i32])),
+			Arc::new(Int32Array::from(vec![0_i32])),
+		],
+	)
+	.expect("drifted batch");
+	assert!(
+		assert_strict_q3_schema(&[drifted]).is_err(),
+		"a (31,4) revenue must trip the schema gate"
+	);
+}
+
+// The discriminating test for the design decision: when two groups tie on (revenue, o_orderdate), the
+// comparator accepts EITHER emit order — it keys answers by the unique l_orderkey and only checks the ORDER BY
+// prefix, never the executor's internal tiebreak.
+#[test]
+fn q3_comparator_accepts_either_tie_order() {
+	let oracle = q3_oracle(&[(10, 500, 100, 0), (20, 500, 100, 7)]);
+	assert!(
+		compare_strict_q3(
+			&[q3_batch(&[(10, 500, 100, 0), (20, 500, 100, 7)])],
+			&oracle
+		)
+		.is_ok(),
+		"tie order [10, 20] accepted"
+	);
+	assert!(
+		compare_strict_q3(
+			&[q3_batch(&[(20, 500, 100, 7), (10, 500, 100, 0)])],
+			&oracle
+		)
+		.is_ok(),
+		"tie order [20, 10] equally accepted"
+	);
+}
+
+// A revenue ordering that violates ORDER BY revenue DESC is fail@compare even when every cell matches.
+#[test]
+fn q3_order_prefix_violation_is_fail() {
+	let oracle = q3_oracle(&[(10, 100, 100, 0), (20, 200, 100, 0)]);
+	assert!(
+		compare_strict_q3(
+			&[q3_batch(&[(10, 100, 100, 0), (20, 200, 100, 0)])],
+			&oracle
+		)
+		.is_err(),
+		"revenue ascending violates ORDER BY revenue DESC"
+	);
+}
+
+// A single wrong cell is fail@compare (else the rail could never catch a wrong answer).
+#[test]
+fn q3_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q3_oracle(&[(10, 500, 100, 0), (20, 300, 100, 0)]);
+	// Emit order keeps revenue DESC (501 then 300); orderkey 10's revenue is off by one.
+	assert!(
+		compare_strict_q3(
+			&[q3_batch(&[(10, 501, 100, 0), (20, 300, 100, 0)])],
+			&oracle
+		)
+		.is_err(),
+		"an off-by-one revenue is a mismatch"
+	);
+}
+
+// A duplicate emitted l_orderkey is rejected up front (it must not silently overwrite in the bijection map).
+#[test]
+fn q3_duplicate_output_key_is_fail_at_compare() {
+	let oracle = q3_oracle(&[(10, 500, 100, 0), (20, 300, 100, 0)]);
+	// Row count (2) matches the oracle, but orderkey 10 appears twice and 20 is absent.
+	assert!(
+		compare_strict_q3(
+			&[q3_batch(&[(10, 500, 100, 0), (10, 500, 100, 0)])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted l_orderkey is rejected"
 	);
 }
