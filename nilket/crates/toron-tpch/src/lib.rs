@@ -18,7 +18,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use tpchgen::generators::{CustomerGenerator, LineItemGenerator, OrderGenerator, PartGenerator};
+use tpchgen::generators::{
+	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
+};
 
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
@@ -137,6 +139,27 @@ pub const Q3_DEV_SQL: &str = "SELECT l_orderkey, \
 
 /// strict q03 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
 pub const STRICT_Q3_SQL: &str = Q3_DEV_SQL;
+
+/// ADR 274 — tpch.q10 (Returned Item Reporting): the first 4-table query, tpchgen-2.0.2's exact Q10 text with
+/// `:1` → `DATE '1993-10-01'`, the interval upper bound literalized to `DATE '1994-01-01'`, and `ORDER BY
+/// revenue DESC` only (no tiebreak, no LIMIT — the bundled text carries none). Groups by `c_acctbal`, a
+/// numeric key. Same text both modes; only `lineitem`/`customer` types differ.
+pub const Q10_DEV_SQL: &str = "SELECT c_custkey, c_name, \
+	SUM(l_extendedprice * (1 - l_discount)) AS revenue, \
+	c_acctbal, n_name, c_address, c_phone, c_comment \
+	FROM customer, orders, lineitem, nation \
+	WHERE c_custkey = o_custkey \
+	  AND l_orderkey = o_orderkey \
+	  AND o_orderdate >= DATE '1993-10-01' \
+	  AND o_orderdate < DATE '1994-01-01' \
+	  AND l_returnflag = 'R' \
+	  AND c_nationkey = n_nationkey \
+	GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment \
+	ORDER BY revenue DESC";
+
+/// strict q10 — identical shape; `lineitem`/`customer` fixtures carry official `Decimal128(15,2)` types
+/// (`c_acctbal` becomes a `Decimal128` GROUP BY key).
+pub const STRICT_Q10_SQL: &str = Q10_DEV_SQL;
 
 /// The dev `LINEITEM` schema: the q01/q03/q06/q14 reachability subset. Money/quantity/discount/tax are
 /// `Float64`, ship date is `Date32`, string flags stay `Utf8`, and join keys are `Int64`.
@@ -338,12 +361,25 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 	.expect("part batch")
 }
 
-/// The q03 `CUSTOMER` fixture: the join key + the market-segment filter column. No decimals → identical in
-/// dev and strict (like `part`).
-fn customer_schema() -> SchemaRef {
+/// The `CUSTOMER` fixture for q03/q10. Mode-sensitive: `c_acctbal` is `Float64` (dev) / `Decimal128(15,2)`
+/// (strict), like the `lineitem` money columns; every other column is mode-independent. q03 uses only
+/// `c_custkey`/`c_mktsegment`; ADR 274 appended the rest for q10 (so q03's positions don't move).
+fn customer_schema(strict: bool) -> SchemaRef {
+	let acctbal = if strict {
+		Field::new("c_acctbal", DataType::Decimal128(15, 2), false)
+	} else {
+		Field::new("c_acctbal", DataType::Float64, false)
+	};
 	Arc::new(Schema::new(vec![
 		Field::new("c_custkey", DataType::Int64, false),
 		Field::new("c_mktsegment", DataType::Utf8, false),
+		// ADR 274: q10 columns, appended so q03's c_custkey/c_mktsegment positions don't move.
+		Field::new("c_name", DataType::Utf8, false),
+		acctbal,
+		Field::new("c_address", DataType::Utf8, false),
+		Field::new("c_phone", DataType::Utf8, false),
+		Field::new("c_comment", DataType::Utf8, false),
+		Field::new("c_nationkey", DataType::Int64, false),
 	]))
 }
 
@@ -362,20 +398,53 @@ fn customer_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	.expect("customer descriptor")
 }
 
-/// Generate the q03-needed `CUSTOMER` columns (`c_custkey`, `c_mktsegment`) at `scale_factor`.
-pub fn generate_customer(scale_factor: f64) -> RecordBatch {
+/// Generate `CUSTOMER` at `scale_factor`. `c_acctbal` is `Float64` (dev) or scale-2 `Decimal128(15,2)`
+/// (strict) — `TPCHDecimal::into_inner()` is the scale-2 raw, like the `lineitem` money columns.
+pub fn generate_customer(strict: bool, scale_factor: f64) -> RecordBatch {
 	let generator = CustomerGenerator::new(scale_factor, 1, 1);
 	let mut custkey = Vec::new();
 	let mut mktsegment = Vec::new();
+	let mut name = Vec::new();
+	let mut acctbal_dev = Vec::new();
+	let mut acctbal_strict = Vec::new();
+	let mut address = Vec::new();
+	let mut phone = Vec::new();
+	let mut comment = Vec::new();
+	let mut nationkey = Vec::new();
 	for item in generator.iter() {
 		custkey.push(item.c_custkey);
 		mktsegment.push(item.c_mktsegment.to_string());
+		name.push(item.c_name.to_string());
+		if strict {
+			acctbal_strict.push(item.c_acctbal.into_inner() as i128);
+		} else {
+			acctbal_dev.push(item.c_acctbal.as_f64());
+		}
+		address.push(item.c_address.to_string());
+		phone.push(item.c_phone.to_string());
+		comment.push(item.c_comment.to_string());
+		nationkey.push(item.c_nationkey);
 	}
+	let acctbal: arrow::array::ArrayRef = if strict {
+		Arc::new(
+			Decimal128Array::from(acctbal_strict)
+				.with_precision_and_scale(15, 2)
+				.expect("c_acctbal decimal column"),
+		)
+	} else {
+		Arc::new(Float64Array::from(acctbal_dev))
+	};
 	RecordBatch::try_new(
-		customer_schema(),
+		customer_schema(strict),
 		vec![
 			Arc::new(Int64Array::from(custkey)),
 			Arc::new(StringArray::from(mktsegment)),
+			Arc::new(StringArray::from(name)),
+			acctbal,
+			Arc::new(StringArray::from(address)),
+			Arc::new(StringArray::from(phone)),
+			Arc::new(StringArray::from(comment)),
+			Arc::new(Int64Array::from(nationkey)),
 		],
 	)
 	.expect("customer batch")
@@ -431,6 +500,53 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 		],
 	)
 	.expect("orders batch")
+}
+
+/// The q10 `NATION` fixture: the join key + the grouped name. A fixed 25-row lookup; no decimals → identical
+/// in dev and strict (like `part`).
+fn nation_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("n_nationkey", DataType::Int64, false),
+		Field::new("n_name", DataType::Utf8, false),
+		Field::new("n_regionkey", DataType::Int64, false),
+	]))
+}
+
+fn nation_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([17; 16]),
+		1,
+		"default",
+		"nation",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("nation descriptor")
+}
+
+/// Generate the q10-needed `NATION` columns (`n_nationkey`, `n_name`, `n_regionkey`).
+pub fn generate_nation(scale_factor: f64) -> RecordBatch {
+	let generator = NationGenerator::new(scale_factor, 1, 1);
+	let mut nationkey = Vec::new();
+	let mut name = Vec::new();
+	let mut regionkey = Vec::new();
+	for item in generator.iter() {
+		nationkey.push(item.n_nationkey);
+		name.push(item.n_name.to_string());
+		regionkey.push(item.n_regionkey);
+	}
+	RecordBatch::try_new(
+		nation_schema(),
+		vec![
+			Arc::new(Int64Array::from(nationkey)),
+			Arc::new(StringArray::from(name)),
+			Arc::new(Int64Array::from(regionkey)),
+		],
+	)
+	.expect("nation batch")
 }
 
 /// Honest optimizer facts for a fixture batch: its real row count and in-memory byte size, so join
@@ -915,15 +1031,15 @@ pub async fn run_strict_q3(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// The three q03 harness tables. `lineitem` is the only mode-sensitive fixture (`Float64` vs
-/// `Decimal128`); `customer`/`orders` carry no decimals and are identical in both modes.
+/// The three q03 harness tables. `lineitem` and `customer` are mode-sensitive (`Float64` vs `Decimal128` —
+/// customer for `c_acctbal`, ADR 274); `orders` carries no decimals and is identical in both modes.
 fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let lineitem = if strict {
 		generate_strict_lineitem(scale_factor)
 	} else {
 		generate_dev_lineitem(scale_factor)
 	};
-	let customer = generate_customer(scale_factor);
+	let customer = generate_customer(strict, scale_factor);
 	let orders = generate_orders(scale_factor);
 	let lineitem_descriptor = if strict {
 		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
@@ -941,7 +1057,7 @@ fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(2),
 			name: "customer",
-			descriptor: customer_descriptor(customer_schema().as_ref()),
+			descriptor: customer_descriptor(customer_schema(strict).as_ref()),
 			facts: facts_for_batch(&customer),
 			batch: customer,
 		},
@@ -955,6 +1071,46 @@ fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	]
 }
 
+/// ADR 274 — dev q10: the first 4-table query (`customer`/`orders`/`lineitem`/`nation`). A reachability
+/// attempt — records whichever wall q10 hits first.
+pub async fn run_dev_q10(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q10",
+		"dev",
+		scale_factor,
+		Q10_DEV_SQL,
+		q10_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 274 — strict q10: the same shape with official `Decimal128(15,2)` types — `c_acctbal` becomes a
+/// `Decimal128` GROUP BY key (the candidate wall).
+pub async fn run_strict_q10(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q10",
+		"strict",
+		scale_factor,
+		STRICT_Q10_SQL,
+		q10_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The four q10 harness tables: q03's lineitem/customer/orders + `nation`.
+fn q10_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let mut tables = q03_tables(strict, scale_factor);
+	let nation = generate_nation(scale_factor);
+	tables.push(HarnessTable {
+		id: TableId(4),
+		name: "nation",
+		descriptor: nation_descriptor(nation_schema().as_ref()),
+		facts: facts_for_batch(&nation),
+		batch: nation,
+	});
+	tables
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
 /// NOT the last measured result. Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed
 /// [`matrix`].
@@ -962,11 +1118,12 @@ pub fn status_rows() -> Vec<String> {
 	ALL_QUERY_IDS
 		.iter()
 		.map(|id| {
-			let state = if *id == "q06" || *id == "q01" || *id == "q14" || *id == "q03" {
-				"implemented"
-			} else {
-				"not_attempted"
-			};
+			let state =
+				if *id == "q06" || *id == "q01" || *id == "q14" || *id == "q03" || *id == "q10" {
+					"implemented"
+				} else {
+					"not_attempted"
+				};
 			format!("{id} dev={state} strict={state}")
 		})
 		.collect()

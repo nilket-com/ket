@@ -61,6 +61,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_decimal_arithmetic",
 	"unsupported_decimal_avg",
 	"unsupported_decimal_case",
+	"unsupported_decimal_group_key",
 	"unsupported_decimal_arrow",
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
@@ -106,6 +107,16 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// the comma-join. Kept specific (`case result branches cannot be unified`) so it does not fall to
 		// the generic Decimal-carrier bucket below.
 		"unsupported_decimal_case"
+	} else if (lowered.contains("exchange partition key type")
+		|| lowered.contains("unsupported group by type"))
+		&& lowered.contains("decimal")
+	{
+		// ADR 274: q10's `GROUP BY c_acctbal` over a `Decimal128` key. The *measured* first wall is the
+		// group-by repartition exchange — `"unsupported exchange partition key type: Decimal128(15, 2)"` —
+		// which rejects the Decimal partition key before `group_value` (which also lacks a Decimal128 arm) is
+		// reached. Both are the same Decimal-group-key gap; names ADR 275 (Decimal group-key support). Kept
+		// specific so it does not fall to the generic Decimal-carrier bucket below.
+		"unsupported_decimal_group_key"
 	} else if lowered.contains("decimal") {
 		// Reserved for a future Decimal carrier/load gap (Arrow Decimal data the engine can't carry).
 		"unsupported_decimal_arrow"

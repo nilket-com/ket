@@ -3,7 +3,8 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q6,
-	run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q14, status_rows,
+	run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q10,
+	run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -169,6 +170,78 @@ async fn q03_runs_keyed_at_default_scale() {
 		dev.human()
 	);
 	assert_eq!(dev.phase, Phase::Execute);
+}
+
+// ADR 274: q10 — the first 4-table query. dev (Float64) reaches execute; strict walls at the group-by
+// repartition on the Decimal128 `c_acctbal` group key — the measured row that names ADR 275. The 4-table join
+// and grouping work; the gap is a Decimal group/partition key.
+//
+// q10's 4-table execution future is deeper than libtest's default test-thread stack — it overflows there even
+// on a multi-thread runtime (`block_on` polls the root future inline on the test thread) and with a raised
+// `RUST_MIN_STACK` (which libtest's test thread does not honor). The CLI runs dev q10 fine on the main thread's
+// larger stack, as does production; so run the assertions on an explicitly-sized thread to match that.
+#[test]
+fn q10_dev_executes_and_strict_blocks_at_decimal_group_key() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q10 dev=implemented strict=implemented"),
+					"q10 is an implemented capability in the static inventory"
+				);
+				let dev = run_dev_q10(0.0001).await;
+				assert_eq!(dev.query, "q10");
+				assert_eq!(
+					dev.status,
+					Status::Pass,
+					"dev q10 reaches execute: {}",
+					dev.human()
+				);
+				assert_eq!(dev.phase, Phase::Execute);
+				assert!(
+					dev.digest.is_some(),
+					"a pass carries a digest: {}",
+					dev.human()
+				);
+
+				let strict = run_strict_q10(0.0001).await;
+				assert_eq!(strict.query, "q10");
+				assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
+				assert_eq!(strict.phase, Phase::Execute);
+				assert_eq!(
+					strict.reason.as_deref(),
+					Some("unsupported_decimal_group_key"),
+					"strict q10's measured wall is the Decimal group/partition key (names ADR 275): {}",
+					strict.human()
+				);
+			});
+		})
+		.expect("spawn q10 thread")
+		.join()
+		.expect("q10 thread panicked");
+}
+
+// ADR 274: the Decimal group/partition-key error classifies precisely (not the generic Decimal-carrier
+// bucket) — for both the measured exchange-partition-key message and the group_value message.
+#[test]
+fn decimal_group_key_error_classifies_precisely() {
+	assert_eq!(
+		reason_for_error(
+			"InvalidExpression { message: \"unsupported exchange partition key type: Decimal128(15, 2)\" }"
+		),
+		"unsupported_decimal_group_key"
+	);
+	assert_eq!(
+		reason_for_error("Kernel { message: \"unsupported GROUP BY type: Decimal128(15, 2)\" }"),
+		"unsupported_decimal_group_key"
+	);
 }
 
 // CLI hygiene (ADR 261 boundary): a `--sf` value must be a finite, positive number. Malformed / zero /
