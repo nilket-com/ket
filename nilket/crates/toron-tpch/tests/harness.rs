@@ -3,8 +3,9 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04,
-	run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
+	run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_strict_q1, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14, run_strict_q17,
+	status_rows,
 };
 
 #[tokio::test]
@@ -305,6 +306,46 @@ async fn q04_executes_in_both_modes() {
 		assert!(
 			attempt.digest.is_some(),
 			"a pass carries a digest: {}",
+			attempt.human()
+		);
+	}
+}
+
+// ADR 281: q17 — the correlated-scalar-subquery probe — walls at BIND in both modes. The binder resolves the
+// scalar subquery's UNqualified outer ref `p_partkey` against the inner `lineitem` scope and fails with a
+// generic `UnknownColumn { column: "p_partkey" }`. That message is too generic to allowlist as a recognized
+// blocker (it would mask real column-resolution bugs), so this is an HONEST `fail`, not a `blocked` — naming
+// the correlated-scalar outer-ref resolution cut (the scalar analogue of ADR 279's EXISTS work). Walls in
+// <2 ms at bind, so a bare test suffices.
+#[tokio::test]
+async fn q17_fails_at_bind_on_unqualified_correlated_scalar() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q17 dev=implemented strict=implemented"),
+		"q17 is an implemented capability in the static inventory"
+	);
+	for (mode, attempt) in [
+		("dev", run_dev_q17(0.01).await),
+		("strict", run_strict_q17(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q17");
+		assert_eq!(
+			attempt.status,
+			Status::Fail,
+			"q17 {mode} walls at bind (unqualified correlated scalar ref): {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.phase,
+			Phase::Bind,
+			"q17 {mode}: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unrecognized"),
+			"q17 {mode}'s bind error is a generic UnknownColumn, honestly unrecognized (not a recognized blocker): {}",
 			attempt.human()
 		);
 	}

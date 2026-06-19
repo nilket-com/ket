@@ -123,6 +123,21 @@ pub const Q14_DEV_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%
 /// `Decimal128(15,2)` types instead of `Float64`.
 pub const STRICT_Q14_SQL: &str = Q14_DEV_SQL;
 
+/// ADR 281 — tpch.q17 (Small-Quantity-Order Revenue): tpchgen-2.0.2's exact Q17 with `:1` → `'Brand#23'`,
+/// `:2` → `'MED BOX'`, no LIMIT. The official UNqualified correlated scalar subquery
+/// `(SELECT 0.2 * AVG(l_quantity) ... WHERE l_partkey = p_partkey)` is kept verbatim — it is the measured
+/// frontier (an unqualified outer ref, with the aggregate wrapped in `0.2 *` arithmetic beyond ADR 260's bare
+/// correlated aggregate scalar). Not pre-qualified, not pre-decorrelated.
+pub const Q17_DEV_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
+	FROM lineitem, part \
+	WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' \
+	  AND l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
+
+/// strict q17 — start identical to the dev text; if strict walls only on harness literal typing (`7.0`/`0.2`)
+/// before the intended correlated-scalar wall, a narrow strict variant is introduced + documented as a harness
+/// deviation in the results doc (ADR 281).
+pub const STRICT_Q17_SQL: &str = Q17_DEV_SQL;
+
 /// Q3 Shipping Priority reachability SQL: tpchgen-2.0.2's Q3 text with the `:1`/`:2`
 /// params bound to literals (`'BUILDING'`, `DATE '1995-03-15'`) and no `LIMIT` (the
 /// bundled text carries none). Same text both modes; only `lineitem` types differ.
@@ -396,6 +411,9 @@ fn part_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("p_partkey", DataType::Int64, false),
 		Field::new("p_type", DataType::Utf8, false),
+		// ADR 281: q17 filters (p_brand = 'Brand#23', p_container = 'MED BOX'), appended (q14 ignores them).
+		Field::new("p_brand", DataType::Utf8, false),
+		Field::new("p_container", DataType::Utf8, false),
 	]))
 }
 
@@ -419,15 +437,21 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 	let generator = PartGenerator::new(scale_factor, 1, 1);
 	let mut partkey = Vec::new();
 	let mut part_type = Vec::new();
+	let mut brand = Vec::new();
+	let mut container = Vec::new();
 	for item in generator.iter() {
 		partkey.push(item.p_partkey);
 		part_type.push(item.p_type.to_string());
+		brand.push(item.p_brand.to_string());
+		container.push(item.p_container.to_string());
 	}
 	RecordBatch::try_new(
 		part_schema(),
 		vec![
 			Arc::new(Int64Array::from(partkey)),
 			Arc::new(StringArray::from(part_type)),
+			Arc::new(StringArray::from(brand)),
+			Arc::new(StringArray::from(container)),
 		],
 	)
 	.expect("part batch")
@@ -1771,6 +1795,65 @@ pub async fn run_strict_q14(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 281 — run q17 over the `Float64` proxy `lineitem` (+ `part`). The correlated scalar subquery is the
+/// measured frontier.
+pub async fn run_dev_q17(scale_factor: f64) -> Attempt {
+	let lineitem = generate_dev_lineitem(scale_factor);
+	let part = generate_part(scale_factor);
+	run_query_with_tables(
+		"q17",
+		"dev",
+		scale_factor,
+		Q17_DEV_SQL,
+		vec![
+			HarnessTable {
+				id: TableId(1),
+				name: "lineitem",
+				descriptor: dev_lineitem_descriptor(dev_lineitem_schema().as_ref()),
+				facts: facts_for_batch(&lineitem),
+				batch: lineitem,
+			},
+			HarnessTable {
+				id: TableId(2),
+				name: "part",
+				descriptor: part_descriptor(part_schema().as_ref()),
+				facts: facts_for_batch(&part),
+				batch: part,
+			},
+		],
+	)
+	.await
+}
+
+/// ADR 281 — strict q17: the same shape with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q17(scale_factor: f64) -> Attempt {
+	let lineitem = generate_strict_lineitem(scale_factor);
+	let part = generate_part(scale_factor);
+	run_query_with_tables(
+		"q17",
+		"strict",
+		scale_factor,
+		STRICT_Q17_SQL,
+		vec![
+			HarnessTable {
+				id: TableId(1),
+				name: "lineitem",
+				descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
+				facts: facts_for_batch(&lineitem),
+				batch: lineitem,
+			},
+			HarnessTable {
+				id: TableId(2),
+				name: "part",
+				descriptor: part_descriptor(part_schema().as_ref()),
+				facts: facts_for_batch(&part),
+				batch: part,
+			},
+		],
+	)
+	.await
+}
+
 /// Run q03 over the `Float64` proxy `lineitem`.
 pub async fn run_dev_q3(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -1991,6 +2074,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q01" || *id == "q14"
 					|| *id == "q03" || *id == "q10"
 					|| *id == "q05" || *id == "q04"
+					|| *id == "q17"
 				{
 					"implemented"
 				} else {
