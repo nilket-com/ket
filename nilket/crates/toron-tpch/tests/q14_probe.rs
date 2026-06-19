@@ -1,7 +1,8 @@
-//! ADR 269 verify-first probe (kept): grounds why honest optimizer facts matter for q14's measured wall.
-//! Without facts the keyless comma-join is rejected as a CROSS JOIN outright; with honest facts the tiny
-//! `part` is broadcast-eligible, the join is admitted, and q14's real wall is the CASE Decimal-vs-integer
-//! gap — the row the harness records.
+//! ADR 269/270 grounding probe. ADR 269 found q14's comma join lowered to a keyless CROSS JOIN whose
+//! admission depended on optimizer facts (a tiny broadcast-eligible `part`). ADR 270's binder-side
+//! recognition lifts the `l_partkey = p_partkey` equality into a keyed inner join **before** strategy
+//! selection, so the join is now keyed regardless of facts — and q14's real wall is the CASE
+//! Decimal-vs-integer gap in both cases. These two tests pin that fact-independence.
 
 use arrow::record_batch::RecordBatch;
 
@@ -58,19 +59,24 @@ fn q14_catalog(seed_facts: bool) -> MockCatalog {
 	catalog
 }
 
-/// Without optimizer facts, the comma-join's equi-predicate is never lifted into a join key and the
-/// keyless CROSS JOIN is rejected — a fixture artifact, not q14's real wall.
+/// ADR 270: even without optimizer facts, the comma-join equality is lifted into a keyed inner join, so
+/// q14 no longer walls at the keyless CROSS JOIN — it reaches the CASE Decimal-vs-integer gap, exactly like
+/// the seeded-facts case. (Pre-270 this walled at `CROSS JOIN`; recognition made the join fact-independent.)
 #[tokio::test]
-async fn q14_without_optimizer_facts_walls_at_cross_join() {
+async fn q14_recognized_keyed_inner_without_optimizer_facts() {
 	let catalog = q14_catalog(false);
 	let plan = SqlPlanner::new().plan(STRICT_Q14_SQL).expect("q14 plans");
 	let error = bind(&plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("no-facts q14 walls at the keyless cross-join");
+		.expect_err("no-facts q14 walls at the CASE decimal gap, not the cross-join");
 	let message = format!("{error:?}");
 	assert!(
-		message.contains("CROSS JOIN"),
-		"without optimizer facts the keyless cross-join is rejected: {message}"
+		!message.contains("CROSS JOIN"),
+		"recognition lifts the equi into keys, so no keyless-cross wall even without facts: {message}"
+	);
+	assert!(
+		message.contains("CASE result branches cannot be unified"),
+		"the real wall is CASE Decimal unification, independent of optimizer facts: {message}"
 	);
 }
 

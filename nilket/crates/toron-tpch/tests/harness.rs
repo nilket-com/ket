@@ -2,8 +2,8 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, Q14_GAUGE_SCALE, matrix_from_log, parse_scale_factor, resolve_q14_scale,
-	run_dev_q1, run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q6, run_dev_q14,
+	run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -120,24 +120,23 @@ async fn q14_dev_executes_and_strict_blocks_at_decimal_case() {
 	);
 }
 
-// ADR 269: q14 rides a broadcast cartesian until comma-join recognition (ADR 270), so it is tractable only
-// at the gauge scale. The CLI defaults q14 to that scale and refuses a larger explicit --sf rather than hang
-// on a ~100M-row cartesian. (A usage constraint, not a query wall — it never becomes a telemetry row.)
-#[test]
-fn q14_scale_is_capped_at_the_gauge_scale() {
+// ADR 270: comma-join recognition keys q14's join, so it no longer rides a cartesian and the ADR 269 scale
+// cap is gone — q14 runs at the CLI default scale the capped version refused. At sf=0.01 a keyless cartesian
+// would be ~120M rows and never return, so completing here is itself proof the join is keyed.
+#[tokio::test]
+async fn q14_runs_keyed_at_default_scale() {
+	let dev = run_dev_q14(0.01).await;
 	assert_eq!(
-		resolve_q14_scale(None),
-		Ok(Q14_GAUGE_SCALE),
-		"no --sf defaults q14 to the gauge scale"
+		dev.status,
+		Status::Pass,
+		"q14 dev reaches execute at the default scale via a keyed (non-cartesian) join: {}",
+		dev.human()
 	);
-	assert_eq!(
-		resolve_q14_scale(Some(Q14_GAUGE_SCALE)),
-		Ok(Q14_GAUGE_SCALE),
-		"an explicit scale at the cap is honored"
-	);
+	assert_eq!(dev.phase, Phase::Execute);
 	assert!(
-		resolve_q14_scale(Some(0.01)).is_err(),
-		"a larger explicit --sf is refused (the cartesian would hang)"
+		dev.digest.is_some(),
+		"a pass carries a digest: {}",
+		dev.human()
 	);
 }
 

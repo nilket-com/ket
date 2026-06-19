@@ -202,6 +202,110 @@ async fn n_ary_comma_join_binds_left_deep_broadcast_cross_chain() {
 	);
 }
 
+// ---------------------------------------------------------------------------
+// ADR 270 — comma-join equi-join recognition (binder-side, syntax-agnostic).
+//
+// Discriminating lever: a *keyless* Cross with an oversized build fails loud
+// (`cross_join_oversized_build_fails_loud`), but a *keyed* Inner join hash-partitions. So "an oversized
+// build binds HashPartitioned" proves the equi was lifted into join keys (not left as a residual filter
+// over a keyless Cross).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn adr270_comma_equi_recognized_as_keyed_inner() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM left_t, right_t WHERE left_t.id = right_t.id")
+		.expect("plan comma equi join");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("a comma equi-join binds as a keyed inner join, not a rejected keyless cross");
+	assert_eq!(
+		find_join_strategy(&bound),
+		Some(JoinStrategy::HashPartitioned),
+		"an oversized build hash-partitions — only possible because the equi was lifted into keys"
+	);
+}
+
+#[tokio::test]
+async fn adr270_explicit_cross_join_equi_recognized_as_keyed_inner() {
+	// Syntax-agnostic: an explicit CROSS JOIN with a cross-bridging equi rewrites the same way (it would
+	// otherwise fail loud on the oversized build, exactly like the keyless comma cross).
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM left_t CROSS JOIN right_t WHERE left_t.id = right_t.id")
+		.expect("plan explicit cross join with equi");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("explicit CROSS JOIN + bridging equi binds as a keyed inner join");
+	assert_eq!(
+		find_join_strategy(&bound),
+		Some(JoinStrategy::HashPartitioned),
+		"the explicit-cross equi is lifted into keys (syntax-agnostic recognition)"
+	);
+}
+
+#[tokio::test]
+async fn adr270_non_equi_comma_stays_keyless_cross_and_fails_loud() {
+	// A non-equi cross-side predicate is not a join key: the comma join stays a keyless Cross, so an
+	// oversized build still fails loud (nothing was lifted).
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM left_t, right_t WHERE left_t.id < right_t.id")
+		.expect("plan non-equi comma join");
+	let err = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect_err(
+			"a non-equi comma join stays a keyless Cross and an oversized build fails loud",
+		);
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message.contains("broadcast-eligible")),
+		"expected the keyless-cross broadcast-eligibility failure, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr270_n_ary_comma_equi_lifts_both_edges() {
+	// `FROM left_t, right_t, third_t WHERE left_t.id = right_t.id AND right_t.id = third_t.id`:
+	// the outer Cross(Cross(left_t, right_t), third_t) bridges right_t.id = third_t.id, while
+	// left_t.id = right_t.id is left-only at the outer Cross and must be ROUTED into the inner Cross to
+	// lift. Both edges become keyed inner joins (two hash-partitioned joins under oversized builds).
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t, third_t \
+			 WHERE left_t.id = right_t.id AND right_t.id = third_t.id",
+		)
+		.expect("plan n-ary comma equi join");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("n-ary comma equi join binds as a keyed inner-join chain");
+	assert_eq!(
+		join_strategy_count(&bound, JoinStrategy::HashPartitioned),
+		2,
+		"both comma edges lift into keyed inner joins (the inner edge required routing down)"
+	);
+}
+
+#[tokio::test]
+async fn adr270_unsupported_join_key_type_stays_residual_filter() {
+	// Float join keys are explicitly unsupported by the keyed-join path. Pre-270, this query could still
+	// bind as a small broadcast Cross plus residual Float equality filter. ADR 270 must not turn that
+	// legal filtered-cartesian shape into a `JoinKeyTypeUnsupported` error by lifting the equality.
+	let catalog = float_cross_catalog(Some(1_024));
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM left_floats, right_floats WHERE left_floats.f = right_floats.f")
+		.expect("plan float equality over comma join");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("unsupported key type stays a residual filter over a broadcast Cross");
+	assert_eq!(
+		find_join_strategy(&bound),
+		Some(JoinStrategy::Broadcast),
+		"float equality must stay residual; lifting would hit the unsupported float join-key path"
+	);
+}
+
 #[tokio::test]
 async fn scalar_cross_join_binds_as_local_cartesian() {
 	// ADR 239 scalar-local Cross refinement: a CROSS recombine of two global-aggregate branches (each
@@ -357,6 +461,27 @@ fn cross_catalog(right_byte_upper_bound: Option<u64>) -> MockCatalog {
 	catalog
 }
 
+fn float_cross_catalog(right_byte_upper_bound: Option<u64>) -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(11),
+			descriptor(11, "left_floats", float_schema().as_ref()),
+		)
+		.expect("register left_floats");
+	catalog
+		.register_descriptor(
+			TableId(12),
+			descriptor(12, "right_floats", float_schema().as_ref()),
+		)
+		.expect("register right_floats");
+	seed_byte_upper_bound(&mut catalog, "left_floats", 64 * 1024 * 1024);
+	if let Some(bytes) = right_byte_upper_bound {
+		seed_byte_upper_bound(&mut catalog, "right_floats", bytes);
+	}
+	catalog
+}
+
 fn auto_broadcast_config(max_build_bytes: u64) -> PlannerConfig {
 	PlannerConfig {
 		auto_broadcast_max_build_bytes: Some(ByteCount::new(max_build_bytes)),
@@ -394,6 +519,13 @@ fn third_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("third_value", DataType::Boolean, false),
+	]))
+}
+
+fn float_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("f", DataType::Float64, false),
 	]))
 }
 

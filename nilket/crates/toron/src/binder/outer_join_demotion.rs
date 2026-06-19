@@ -345,6 +345,272 @@ impl<'a> Binder<'a> {
 		})
 	}
 
+	/// ADR 270: comma-join equi-join recognition. Lifts cross-bridging equality conjuncts out of a
+	/// `Filter` over a keyless `Cross` into the join's `on` keys (`Cross` → `Inner`), routing single-side
+	/// conjuncts into a `Cross` child so a left-deep n-ary comma fold lifts every edge. Syntax-agnostic: any
+	/// keyless `Cross` carrying an extractable bridging equi rewrites (comma join or explicit `CROSS JOIN`)
+	/// — result-identical, and it hands the keyed shape to the existing inner-join strategy/fragmenter.
+	/// Runs in the binder (post-resolution) because official TPC-H join columns are unqualified and the SQL
+	/// planner has no catalog to resolve a column's side.
+	pub(super) fn recognize_cross_equi_joins<'b>(
+		&'b self,
+		plan: &'b LogicalPlan,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			match plan {
+				LogicalPlan::Filter { input, predicate } => {
+					let input = self.recognize_cross_equi_joins(input).await?;
+					match input {
+						LogicalPlan::Join {
+							left,
+							right,
+							kind: JoinKind::Cross,
+							strategy_intent,
+							..
+						} => {
+							let conjuncts = split_logical_and_conjuncts(predicate);
+							self.lift_cross_equi(*left, *right, strategy_intent, conjuncts)
+								.await
+						}
+						other => Ok(LogicalPlan::Filter {
+							input: Box::new(other),
+							predicate: predicate.clone(),
+						}),
+					}
+				}
+				LogicalPlan::Alias {
+					input,
+					alias,
+					columns,
+				} => Ok(LogicalPlan::Alias {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					alias: alias.clone(),
+					columns: columns.clone(),
+				}),
+				LogicalPlan::Project {
+					input,
+					exprs,
+					output_names,
+				} => Ok(LogicalPlan::Project {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					exprs: exprs.clone(),
+					output_names: output_names.clone(),
+				}),
+				LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+				}),
+				LogicalPlan::Union { left, right } => Ok(LogicalPlan::Union {
+					left: Box::new(self.recognize_cross_equi_joins(left).await?),
+					right: Box::new(self.recognize_cross_equi_joins(right).await?),
+				}),
+				LogicalPlan::SetOpAll { left, right, kind } => Ok(LogicalPlan::SetOpAll {
+					left: Box::new(self.recognize_cross_equi_joins(left).await?),
+					right: Box::new(self.recognize_cross_equi_joins(right).await?),
+					kind: *kind,
+				}),
+				LogicalPlan::Repeat { input, count } => Ok(LogicalPlan::Repeat {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					count: count.clone(),
+				}),
+				LogicalPlan::Aggregate {
+					input,
+					group_expr,
+					aggr_expr,
+				} => Ok(LogicalPlan::Aggregate {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					group_expr: group_expr.clone(),
+					aggr_expr: aggr_expr.clone(),
+				}),
+				LogicalPlan::Exchange {
+					input,
+					partition_count,
+					key,
+				} => Ok(LogicalPlan::Exchange {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					partition_count: *partition_count,
+					key: key.clone(),
+				}),
+				LogicalPlan::Sort {
+					input,
+					order_by,
+					limit,
+					offset,
+				} => Ok(LogicalPlan::Sort {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					order_by: order_by.clone(),
+					limit: *limit,
+					offset: *offset,
+				}),
+				LogicalPlan::Window {
+					input,
+					partition_by,
+					order_by,
+					functions,
+				} => Ok(LogicalPlan::Window {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					partition_by: partition_by.clone(),
+					order_by: order_by.clone(),
+					functions: functions.clone(),
+				}),
+				LogicalPlan::Take { input, limit } => Ok(LogicalPlan::Take {
+					input: Box::new(self.recognize_cross_equi_joins(input).await?),
+					limit: *limit,
+				}),
+				LogicalPlan::Join {
+					left,
+					right,
+					kind,
+					on,
+					null_safe_keys,
+					strategy_intent,
+				} => Ok(LogicalPlan::Join {
+					left: Box::new(self.recognize_cross_equi_joins(left).await?),
+					right: Box::new(self.recognize_cross_equi_joins(right).await?),
+					kind: *kind,
+					on: on.clone(),
+					null_safe_keys: *null_safe_keys,
+					strategy_intent: *strategy_intent,
+				}),
+				LogicalPlan::CreateTableAsSelect {
+					table,
+					if_not_exists,
+					or_replace,
+					source,
+				} => Ok(LogicalPlan::CreateTableAsSelect {
+					table: table.clone(),
+					if_not_exists: *if_not_exists,
+					or_replace: *or_replace,
+					source: Box::new(self.recognize_cross_equi_joins(source).await?),
+				}),
+				LogicalPlan::InsertSelect {
+					table,
+					columns,
+					source,
+					returning,
+				} => Ok(LogicalPlan::InsertSelect {
+					table: table.clone(),
+					columns: columns.clone(),
+					source: Box::new(self.recognize_cross_equi_joins(source).await?),
+					returning: returning.clone(),
+				}),
+				LogicalPlan::RecursiveCte { .. }
+				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Scan { .. }
+				| LogicalPlan::ScanNamed { .. }
+				| LogicalPlan::Explain { .. }
+				| LogicalPlan::ExplainAnalyze { .. }
+				| LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::DropTable { .. }
+				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
+				| LogicalPlan::Insert { .. } => Ok(plan.clone()),
+			}
+		})
+	}
+
+	/// ADR 270 helper: given the two children of a keyless `Cross` and the conjuncts of the filter above it,
+	/// lift cross-bridging equalities into `on` (demoting to `Inner`, preserving `strategy_intent`), route
+	/// single-side conjuncts into a `Cross` child (so nested comma edges lift), and re-wrap the rest as the
+	/// residual filter. If a child scope is opaque (e.g. aggregate/union), the cross is left untouched.
+	fn lift_cross_equi<'b>(
+		&'b self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		strategy_intent: JoinStrategyIntent,
+		conjuncts: Vec<Expr>,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let (Some(left_scope), Some(right_scope)) = (
+				self.logical_scope_for_outer_demotion(&left).await?,
+				self.logical_scope_for_outer_demotion(&right).await?,
+			) else {
+				let join = LogicalPlan::Join {
+					left: Box::new(left),
+					right: Box::new(right),
+					kind: JoinKind::Cross,
+					on: Vec::new(),
+					null_safe_keys: false,
+					strategy_intent,
+				};
+				return Ok(wrap_residual_filter(join, conjuncts));
+			};
+			let mut keys: Vec<(Expr, Expr)> = Vec::new();
+			let mut left_only: Vec<Expr> = Vec::new();
+			let mut right_only: Vec<Expr> = Vec::new();
+			let mut residual: Vec<Expr> = Vec::new();
+			for conjunct in conjuncts {
+				let lifted = match &conjunct {
+					Expr::Eq(l, r) => {
+						orient_bridging_equi(l.as_ref(), r.as_ref(), &left_scope, &right_scope)
+					}
+					_ => None,
+				};
+				if let Some(pair) = lifted {
+					keys.push(pair);
+					continue;
+				}
+				let sides = conjunct_column_sides(&conjunct, &left_scope, &right_scope);
+				if sides.left && !sides.right && !sides.ambiguous {
+					left_only.push(conjunct);
+				} else if sides.right && !sides.left && !sides.ambiguous {
+					right_only.push(conjunct);
+				} else {
+					residual.push(conjunct);
+				}
+			}
+			let left = self
+				.push_into_cross_child(left, left_only, &mut residual)
+				.await?;
+			let right = self
+				.push_into_cross_child(right, right_only, &mut residual)
+				.await?;
+			let kind = if keys.is_empty() {
+				JoinKind::Cross
+			} else {
+				JoinKind::Inner
+			};
+			let join = LogicalPlan::Join {
+				left: Box::new(left),
+				right: Box::new(right),
+				kind,
+				on: keys,
+				null_safe_keys: false,
+				strategy_intent,
+			};
+			Ok(wrap_residual_filter(join, residual))
+		})
+	}
+
+	/// ADR 270 helper: route single-side conjuncts into a `Cross` child (wrap them as a filter and recurse,
+	/// so a nested comma edge can lift there); for a non-`Cross` child keep them in the parent residual (the
+	/// existing predicate-pushdown places them at the scan). Either way recurse the child for nested shapes.
+	fn push_into_cross_child<'b>(
+		&'b self,
+		child: LogicalPlan,
+		conjuncts: Vec<Expr>,
+		residual: &'b mut Vec<Expr>,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			if conjuncts.is_empty() {
+				return self.recognize_cross_equi_joins(&child).await;
+			}
+			if matches!(
+				child,
+				LogicalPlan::Join {
+					kind: JoinKind::Cross,
+					..
+				}
+			) {
+				let pushed = wrap_residual_filter(child, conjuncts);
+				self.recognize_cross_equi_joins(&pushed).await
+			} else {
+				residual.extend(conjuncts);
+				self.recognize_cross_equi_joins(&child).await
+			}
+		})
+	}
+
 	fn logical_scope_for_outer_demotion<'b>(
 		&'b self,
 		plan: &'b LogicalPlan,
@@ -1214,6 +1480,74 @@ fn null_rejecting_column_side(
 	match column_side(column_ref, left_scope, right_scope) {
 		Some(side) => NullRejectedSides::side(side),
 		None => NullRejectedSides::default(),
+	}
+}
+
+/// ADR 270: orient a cross-side equality `l = r` of direct columns into a `(left_input, right_input)`
+/// join-key pair, or `None` if it is not a clean bridge — a non-column operand, the same side on both, or an
+/// ambiguous/unresolved column (`column_side` returns `None` for those, so an ambiguous unqualified equality
+/// never silently picks a side).
+fn orient_bridging_equi(
+	left_expr: &Expr,
+	right_expr: &Expr,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
+) -> Option<(Expr, Expr)> {
+	let (Expr::Column(left_col), Expr::Column(right_col)) = (left_expr, right_expr) else {
+		return None;
+	};
+	match (
+		column_side_with_type(left_col, left_scope, right_scope),
+		column_side_with_type(right_col, left_scope, right_scope),
+	) {
+		(Some((LogicalJoinSide::Left, left_type)), Some((LogicalJoinSide::Right, right_type)))
+			if cross_equi_join_key_type_supported(&left_type, &right_type) =>
+		{
+			Some((left_expr.clone(), right_expr.clone()))
+		}
+		(Some((LogicalJoinSide::Right, right_type)), Some((LogicalJoinSide::Left, left_type)))
+			if cross_equi_join_key_type_supported(&left_type, &right_type) =>
+		{
+			Some((right_expr.clone(), left_expr.clone()))
+		}
+		_ => None,
+	}
+}
+
+fn column_side_with_type(
+	column_ref: &ColumnRef,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
+) -> Option<(LogicalJoinSide, DataType)> {
+	let left = left_scope.resolve_join_column(column_ref, "left").ok()?;
+	let right = right_scope.resolve_join_column(column_ref, "right").ok()?;
+	match (left, right) {
+		(Some(left), None) => Some((LogicalJoinSide::Left, left.column.data_type)),
+		(None, Some(right)) => Some((LogicalJoinSide::Right, right.column.data_type)),
+		(Some(_), Some(_)) | (None, None) => None,
+	}
+}
+
+fn cross_equi_join_key_type_supported(left: &DataType, right: &DataType) -> bool {
+	if left != right {
+		return false;
+	}
+	match left {
+		DataType::Boolean
+		| DataType::Int8
+		| DataType::Int16
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::UInt8
+		| DataType::UInt16
+		| DataType::UInt32
+		| DataType::UInt64
+		| DataType::Date32
+		| DataType::Utf8 => true,
+		DataType::Timestamp(TimeUnit::Millisecond, Some(timezone))
+		| DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+		| DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => timezone.as_ref() == "UTC",
+		_ => false,
 	}
 }
 

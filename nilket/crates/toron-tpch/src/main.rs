@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, resolve_q14_scale, run_dev_q1,
-	run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q6,
+	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -77,14 +77,15 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_dev_q1(sf).await
 			}
 		}
-		// ADR 269 adds q14 (the first multi-table query) as a reachability attempt. It rides a broadcast
-		// cartesian until comma-join recognition (ADR 270), so it is scale-capped: default to the gauge
-		// scale and refuse a larger explicit --sf (a harness error, exit 2) rather than hang.
-		"q14" => match resolve_q14_scale(explicit) {
-			Ok(sf) if strict => run_strict_q14(sf).await,
-			Ok(sf) => run_dev_q14(sf).await,
-			Err(message) => return harness_error(&message),
-		},
+		// ADR 269 adds q14 (the first multi-table query); ADR 270's comma-join recognition keys the join so
+		// it no longer rides a cartesian, so q14 resolves --sf like any other query (no scale cap).
+		"q14" => {
+			if strict {
+				run_strict_q14(sf).await
+			} else {
+				run_dev_q14(sf).await
+			}
+		}
 		_ => Attempt {
 			query: query.to_string(),
 			scale_factor: sf,

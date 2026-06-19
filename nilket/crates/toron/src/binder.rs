@@ -223,6 +223,12 @@ pub(crate) async fn bind_with_trace(
 		LogicalPlan::Explain { .. } => (plan.clone(), Vec::new()),
 		_ => binder.demote_null_rejected_outer_joins(plan).await?,
 	};
+	// ADR 270: lift comma-join (and explicit-CROSS) cross-bridging equalities out of a keyless Cross into
+	// keyed Inner joins — a binder pass after outer-join demotion, before binding.
+	let normalized_plan = match plan {
+		LogicalPlan::Explain { .. } => normalized_plan,
+		_ => binder.recognize_cross_equi_joins(&normalized_plan).await?,
+	};
 	let decision_provenance = decision_provenance_for_outer_join_demotions(&outer_join_demotions);
 	let binder = binder.with_decision_provenance(decision_provenance);
 	let plan = binder

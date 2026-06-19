@@ -74,6 +74,28 @@ pub(crate) fn adr239_cross_join_and_comma_lower_to_keyless_cross() {
 }
 
 #[test]
+pub(crate) fn adr270_comma_equi_recognition_is_binder_wired() {
+	// ADR 270: the SQL planner still folds comma joins to a keyless Cross (asserted above); recognition is
+	// a *binder* pass that lifts cross-bridging equalities into keyed Inner joins, run before binding. This
+	// pins the placement decision — recognition lives where the catalog resolves unqualified TPC-H columns,
+	// not in the SQL frontend — and that the pass can't be silently dropped from the bind path. (Read the
+	// binder root via the sanctioned helper, per adr176_no_scattered_binder_file_reads.)
+	let binder = binder_root_source();
+	let demotion = source("src/binder/outer_join_demotion.rs");
+
+	assert!(
+		binder.contains("recognize_cross_equi_joins(&normalized_plan)"),
+		"the bind entry must run the comma-join equi recognizer after demotion, before binding"
+	);
+	// The recognizer rewrites to the existing Inner kind — it must not invent a new join kind/operator.
+	let recognizer = source_block(&demotion, "fn lift_cross_equi");
+	assert!(
+		recognizer.contains("JoinKind::Inner"),
+		"recognition must rewrite a keyless Cross into a keyed Inner join (reusing the existing kind)"
+	);
+}
+
+#[test]
 pub(crate) fn adr239_cross_join_forces_broadcast_strategy() {
 	let join = source("src/binder/join.rs");
 

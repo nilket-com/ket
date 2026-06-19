@@ -584,28 +584,6 @@ pub fn parse_scale_factor(raw: &str) -> Result<f64, String> {
 	}
 }
 
-/// The scale q14 is measured at. q14's comma-join is admitted as a broadcast cross-join + residual
-/// equi-filter (the equality is not yet lifted into a join *key* — that recognition is ADR 270), so it
-/// rides an O(lineitem × part) cartesian. That is correct but only tractable at this tiny gauge scale; at
-/// `--sf 0.01` the cartesian is ~100M rows and never returns. The CLI therefore caps q14 here (see
-/// [`resolve_q14_scale`]) rather than hang. ADR 270's comma-join → hash-join recognition lifts the cap.
-pub const Q14_GAUGE_SCALE: f64 = 0.0001;
-
-/// Resolve q14's run scale. With no explicit `--sf`, use the gauge scale; an explicit scale at or below
-/// the gauge cap is honored; a larger one is **refused** (an `Err` the CLI turns into a harness error)
-/// because q14's broadcast cartesian would hang. This is a usage constraint, not a query wall — it never
-/// becomes a telemetry row. See [`Q14_GAUGE_SCALE`].
-pub fn resolve_q14_scale(explicit: Option<f64>) -> Result<f64, String> {
-	match explicit {
-		None => Ok(Q14_GAUGE_SCALE),
-		Some(sf) if sf <= Q14_GAUGE_SCALE => Ok(sf),
-		Some(sf) => Err(format!(
-			"q14 is scale-capped at --sf {Q14_GAUGE_SCALE} pending comma-join recognition (ADR 270); \
-			 its broadcast cartesian is intractable at --sf {sf}"
-		)),
-	}
-}
-
 /// ADR 269 — dev q14: the decimal ratio query over the `Float64` proxy `lineitem` + `part`. A reachability
 /// attempt — records whichever wall q14 hits first.
 pub async fn run_dev_q14(scale_factor: f64) -> Attempt {
