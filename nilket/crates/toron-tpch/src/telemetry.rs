@@ -60,6 +60,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_decimal_scalar",
 	"unsupported_decimal_arithmetic",
 	"unsupported_decimal_avg",
+	"unsupported_decimal_case",
 	"unsupported_decimal_arrow",
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
@@ -97,6 +98,14 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// a Decimal whose `+4` widening can't fit Decimal128's precision ceiling — a genuine edge gap, kept
 		// a recognized blocker rather than a silent fail.
 		"unsupported_decimal_avg"
+	} else if lowered.contains("decimal")
+		&& lowered.contains("case result branches cannot be unified")
+	{
+		// ADR 269: q14's `CASE WHEN … THEN <Decimal> ELSE 0 END` — the Decimal `THEN` branch won't unify
+		// with the integer `ELSE 0` literal. q14's measured first wall once honest optimizer facts admit
+		// the comma-join. Kept specific (`case result branches cannot be unified`) so it does not fall to
+		// the generic Decimal-carrier bucket below.
+		"unsupported_decimal_case"
 	} else if lowered.contains("decimal") {
 		// Reserved for a future Decimal carrier/load gap (Arrow Decimal data the engine can't carry).
 		"unsupported_decimal_arrow"

@@ -2,8 +2,8 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, run_dev_q1, run_dev_q6, run_strict_q1, run_strict_q6,
-	status_rows,
+	ALL_QUERY_IDS, Q14_GAUGE_SCALE, matrix_from_log, resolve_q14_scale, run_dev_q1, run_dev_q6,
+	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -76,6 +76,68 @@ async fn q01_reaches_execute_in_both_modes() {
 		strict.digest.is_some(),
 		"a pass carries a digest: {}",
 		strict.human()
+	);
+}
+
+// ADR 269: q14 — the first multi-table query, brought into the gauge as a reachability attempt. With honest
+// optimizer facts the tiny `part` is broadcast-eligible, so the comma equi-join is admitted: dev q14
+// (Float64) reaches execute, and strict q14 walls at bind on the CASE Decimal-vs-integer (`ELSE 0`) gap —
+// the measured row that names ADR 270. (The keyless cross-join is a wall only *without* facts — that
+// no-facts artifact is pinned separately by `q14_probe.rs`.)
+#[tokio::test]
+async fn q14_dev_executes_and_strict_blocks_at_decimal_case() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q14 dev=implemented strict=implemented"),
+		"q14 is now an implemented capability in the static inventory"
+	);
+
+	let dev = run_dev_q14(0.0001).await;
+	assert_eq!(dev.query, "q14");
+	assert_eq!(
+		dev.status,
+		Status::Pass,
+		"dev q14 reaches execute: {}",
+		dev.human()
+	);
+	assert_eq!(dev.phase, Phase::Execute);
+	assert!(
+		dev.digest.is_some(),
+		"a pass carries a digest: {}",
+		dev.human()
+	);
+
+	let strict = run_strict_q14(0.0001).await;
+	assert_eq!(strict.query, "q14");
+	assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
+	assert_eq!(strict.phase, Phase::Bind);
+	assert_eq!(
+		strict.reason.as_deref(),
+		Some("unsupported_decimal_case"),
+		"q14's measured first wall is the CASE Decimal-vs-integer gap (names ADR 270): {}",
+		strict.human()
+	);
+}
+
+// ADR 269: q14 rides a broadcast cartesian until comma-join recognition (ADR 270), so it is tractable only
+// at the gauge scale. The CLI defaults q14 to that scale and refuses a larger explicit --sf rather than hang
+// on a ~100M-row cartesian. (A usage constraint, not a query wall — it never becomes a telemetry row.)
+#[test]
+fn q14_scale_is_capped_at_the_gauge_scale() {
+	assert_eq!(
+		resolve_q14_scale(None),
+		Ok(Q14_GAUGE_SCALE),
+		"no --sf defaults q14 to the gauge scale"
+	);
+	assert_eq!(
+		resolve_q14_scale(Some(Q14_GAUGE_SCALE)),
+		Ok(Q14_GAUGE_SCALE),
+		"an explicit scale at the cap is honored"
+	);
+	assert!(
+		resolve_q14_scale(Some(0.01)).is_err(),
+		"a larger explicit --sf is refused (the cartesian would hang)"
 	);
 }
 

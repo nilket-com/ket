@@ -12,15 +12,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Date32Array, Decimal128Array, Float64Array, StringArray};
+use arrow::array::{Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use tpchgen::generators::LineItemGenerator;
+use tpchgen::generators::{LineItemGenerator, PartGenerator};
 
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::MockCatalog;
+use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
+use toron::distributed::budget::ByteCount;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::task::RowCount;
 use toron::error::StorageError;
 use toron::exec::Executor;
 use toron::ir::TableId;
@@ -101,6 +103,21 @@ pub const STRICT_Q1_SQL: &str = "SELECT l_returnflag, l_linestatus, \
 	GROUP BY l_returnflag, l_linestatus \
 	ORDER BY l_returnflag, l_linestatus";
 
+/// ADR 269 — tpch.q14: the decimal ratio query, official-shaped (comma-join + literal date bounds). It
+/// stacks a comma equi-join, a CASE over the `disc_price` chain, a Decimal-literal `*`, and a
+/// Decimal ÷ Decimal — the reachability attempt measures whichever it walls on first. Same text in both
+/// modes; only the fixture column types differ (the q01/q06 dev/strict discipline).
+pub const Q14_DEV_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' \
+		THEN l_extendedprice * (1 - l_discount) ELSE 0 END) \
+	/ SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue \
+	FROM lineitem, part \
+	WHERE l_partkey = p_partkey \
+	  AND l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'";
+
+/// strict q14 — identical shape to the dev proxy; the `lineitem` fixture carries official
+/// `Decimal128(15,2)` types instead of `Float64`.
+pub const STRICT_Q14_SQL: &str = Q14_DEV_SQL;
+
 /// The dev `LINEITEM` schema: only the Q6 columns, money/qty/discount as `Float64`, ship date as
 /// `Date32`. No string carriers; an append-only (PK-less) identity, so no synthetic key column.
 fn dev_lineitem_schema() -> SchemaRef {
@@ -113,6 +130,8 @@ fn dev_lineitem_schema() -> SchemaRef {
 		Field::new("l_returnflag", DataType::Utf8, false),
 		Field::new("l_linestatus", DataType::Utf8, false),
 		Field::new("l_tax", DataType::Float64, false),
+		// ADR 269: q14 join key (appended so q01/q06 column positions / digests don't move).
+		Field::new("l_partkey", DataType::Int64, false),
 	]))
 }
 
@@ -142,6 +161,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut returnflag = Vec::new();
 	let mut linestatus = Vec::new();
 	let mut tax = Vec::new();
+	let mut partkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -150,6 +170,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		returnflag.push(item.l_returnflag.to_string());
 		linestatus.push(item.l_linestatus.to_string());
 		tax.push(item.l_tax.as_f64());
+		partkey.push(item.l_partkey);
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -161,6 +182,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(returnflag)),
 			Arc::new(StringArray::from(linestatus)),
 			Arc::new(Float64Array::from(tax)),
+			Arc::new(Int64Array::from(partkey)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -180,6 +202,8 @@ fn strict_lineitem_schema() -> SchemaRef {
 		Field::new("l_returnflag", DataType::Utf8, false),
 		Field::new("l_linestatus", DataType::Utf8, false),
 		decimal("l_tax"),
+		// ADR 269: q14 join key (appended so q01/q06 column positions / digests don't move).
+		Field::new("l_partkey", DataType::Int64, false),
 	]))
 }
 
@@ -210,6 +234,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut returnflag = Vec::new();
 	let mut linestatus = Vec::new();
 	let mut tax = Vec::new();
+	let mut partkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -218,6 +243,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		returnflag.push(item.l_returnflag.to_string());
 		linestatus.push(item.l_linestatus.to_string());
 		tax.push(item.l_tax.into_inner() as i128);
+		partkey.push(item.l_partkey);
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -236,9 +262,63 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(returnflag)),
 			Arc::new(StringArray::from(linestatus)),
 			decimal(tax),
+			Arc::new(Int64Array::from(partkey)),
 		],
 	)
 	.expect("strict lineitem batch")
+}
+
+/// The q14 `PART` fixture: the join key + the type string q14's CASE matches. Same in dev and strict (no
+/// decimals). Generated from `tpchgen` so partkeys align with the generated `lineitem`.
+fn part_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("p_partkey", DataType::Int64, false),
+		Field::new("p_type", DataType::Utf8, false),
+	]))
+}
+
+fn part_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([14; 16]),
+		1,
+		"default",
+		"part",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("part descriptor")
+}
+
+/// Generate the q14-needed `PART` columns (`p_partkey`, `p_type`) at `scale_factor`.
+pub fn generate_part(scale_factor: f64) -> RecordBatch {
+	let generator = PartGenerator::new(scale_factor, 1, 1);
+	let mut partkey = Vec::new();
+	let mut part_type = Vec::new();
+	for item in generator.iter() {
+		partkey.push(item.p_partkey);
+		part_type.push(item.p_type.to_string());
+	}
+	RecordBatch::try_new(
+		part_schema(),
+		vec![
+			Arc::new(Int64Array::from(partkey)),
+			Arc::new(StringArray::from(part_type)),
+		],
+	)
+	.expect("part batch")
+}
+
+/// Honest optimizer facts for a fixture batch: its real row count and in-memory byte size, so join
+/// planning sees a true (tiny) build side rather than an unbounded one (ADR 269).
+fn facts_for_batch(batch: &RecordBatch) -> TableOptimizerFacts {
+	TableOptimizerFacts {
+		row_upper_bound: Some(RowCount::new(batch.num_rows() as u64)),
+		byte_upper_bound: Some(ByteCount::new(batch.get_array_memory_size() as u64)),
+		..Default::default()
+	}
 }
 
 /// The load seam: an in-memory [`StorageScan`] over generated batches, mirroring the test `FixtureScan`
@@ -287,6 +367,17 @@ impl StorageScan for HarnessScan {
 /// Run a Q6 variant single-node over a pre-built fixture, recording the deepest phase reached. A stage
 /// error is classified against the recognized-blocker allowlist: a recognized reason is `blocked`,
 /// anything else is `fail`. Shared by the dev (Float64) and strict (Decimal128) runs.
+/// A harness table: id, name (for fact seeding), descriptor, data, and optimizer facts.
+pub struct HarnessTable {
+	pub id: TableId,
+	pub name: &'static str,
+	pub descriptor: TableSchemaDescriptor,
+	pub batch: RecordBatch,
+	pub facts: TableOptimizerFacts,
+}
+
+/// One-table wrapper (q01/q06): registers `TableId(1)` with default optimizer facts, preserving the
+/// original single-table behavior.
 async fn run_query(
 	query_id: &str,
 	mode: &str,
@@ -294,6 +385,32 @@ async fn run_query(
 	sql: &str,
 	batch: RecordBatch,
 	descriptor: TableSchemaDescriptor,
+) -> Attempt {
+	run_query_with_tables(
+		query_id,
+		mode,
+		scale_factor,
+		sql,
+		vec![HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor,
+			batch,
+			facts: TableOptimizerFacts::default(),
+		}],
+	)
+	.await
+}
+
+/// Run a query single-node over N pre-built fixtures, recording the deepest phase reached. Registers every
+/// descriptor and seeds its optimizer facts (so join planning sees real build sides — ADR 269) before
+/// plan/bind. A stage error is classified against the recognized-blocker allowlist.
+async fn run_query_with_tables(
+	query_id: &str,
+	mode: &str,
+	scale_factor: f64,
+	sql: &str,
+	tables: Vec<HarnessTable>,
 ) -> Attempt {
 	let start = Instant::now();
 	let attempt =
@@ -308,20 +425,31 @@ async fn run_query(
 			digest,
 		};
 
-	// load
+	// load: register every descriptor + seed its optimizer facts, then assemble storage.
 	let mut catalog = MockCatalog::new();
-	if let Err(error) = catalog.register_descriptor(TableId(1), descriptor) {
-		let reason = reason_for_error(&format!("{error:?}"));
-		return attempt(
-			Phase::Load,
-			status_for_reason(reason),
-			Some(reason.to_string()),
-			None,
-		);
+	let mut batches = HashMap::new();
+	for table in tables {
+		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
+			let reason = reason_for_error(&format!("{error:?}"));
+			return attempt(
+				Phase::Load,
+				status_for_reason(reason),
+				Some(reason.to_string()),
+				None,
+			);
+		}
+		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
+			let reason = reason_for_error(&format!("{error:?}"));
+			return attempt(
+				Phase::Load,
+				status_for_reason(reason),
+				Some(reason.to_string()),
+				None,
+			);
+		}
+		batches.insert(table.id, table.batch);
 	}
-	let storage = Arc::new(HarnessScan {
-		batches: HashMap::from([(TableId(1), batch)]),
-	});
+	let storage = Arc::new(HarnessScan { batches });
 
 	// plan
 	let logical = match SqlPlanner::new().plan(sql) {
@@ -443,6 +571,87 @@ pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// The scale q14 is measured at. q14's comma-join is admitted as a broadcast cross-join + residual
+/// equi-filter (the equality is not yet lifted into a join *key* — that recognition is ADR 270), so it
+/// rides an O(lineitem × part) cartesian. That is correct but only tractable at this tiny gauge scale; at
+/// `--sf 0.01` the cartesian is ~100M rows and never returns. The CLI therefore caps q14 here (see
+/// [`resolve_q14_scale`]) rather than hang. ADR 270's comma-join → hash-join recognition lifts the cap.
+pub const Q14_GAUGE_SCALE: f64 = 0.0001;
+
+/// Resolve q14's run scale. With no explicit `--sf`, use the gauge scale; an explicit scale at or below
+/// the gauge cap is honored; a larger one is **refused** (an `Err` the CLI turns into a harness error)
+/// because q14's broadcast cartesian would hang. This is a usage constraint, not a query wall — it never
+/// becomes a telemetry row. See [`Q14_GAUGE_SCALE`].
+pub fn resolve_q14_scale(explicit: Option<f64>) -> Result<f64, String> {
+	match explicit {
+		None => Ok(Q14_GAUGE_SCALE),
+		Some(sf) if sf <= Q14_GAUGE_SCALE => Ok(sf),
+		Some(sf) => Err(format!(
+			"q14 is scale-capped at --sf {Q14_GAUGE_SCALE} pending comma-join recognition (ADR 270); \
+			 its broadcast cartesian is intractable at --sf {sf}"
+		)),
+	}
+}
+
+/// ADR 269 — dev q14: the decimal ratio query over the `Float64` proxy `lineitem` + `part`. A reachability
+/// attempt — records whichever wall q14 hits first.
+pub async fn run_dev_q14(scale_factor: f64) -> Attempt {
+	let lineitem = generate_dev_lineitem(scale_factor);
+	let part = generate_part(scale_factor);
+	run_query_with_tables(
+		"q14",
+		"dev",
+		scale_factor,
+		Q14_DEV_SQL,
+		vec![
+			HarnessTable {
+				id: TableId(1),
+				name: "lineitem",
+				descriptor: dev_lineitem_descriptor(dev_lineitem_schema().as_ref()),
+				facts: facts_for_batch(&lineitem),
+				batch: lineitem,
+			},
+			HarnessTable {
+				id: TableId(2),
+				name: "part",
+				descriptor: part_descriptor(part_schema().as_ref()),
+				facts: facts_for_batch(&part),
+				batch: part,
+			},
+		],
+	)
+	.await
+}
+
+/// ADR 269 — strict q14: the same shape with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q14(scale_factor: f64) -> Attempt {
+	let lineitem = generate_strict_lineitem(scale_factor);
+	let part = generate_part(scale_factor);
+	run_query_with_tables(
+		"q14",
+		"strict",
+		scale_factor,
+		STRICT_Q14_SQL,
+		vec![
+			HarnessTable {
+				id: TableId(1),
+				name: "lineitem",
+				descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
+				facts: facts_for_batch(&lineitem),
+				batch: lineitem,
+			},
+			HarnessTable {
+				id: TableId(2),
+				name: "part",
+				descriptor: part_descriptor(part_schema().as_ref()),
+				facts: facts_for_batch(&part),
+				batch: part,
+			},
+		],
+	)
+	.await
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
 /// NOT the last measured result. q06 is implemented in both modes; the rest are not yet attempted.
 /// Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed [`matrix`].
@@ -450,7 +659,7 @@ pub fn status_rows() -> Vec<String> {
 	ALL_QUERY_IDS
 		.iter()
 		.map(|id| {
-			let state = if *id == "q06" || *id == "q01" {
+			let state = if *id == "q06" || *id == "q01" || *id == "q14" {
 				"implemented"
 			} else {
 				"not_attempted"

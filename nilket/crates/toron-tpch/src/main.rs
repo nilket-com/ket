@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, run_dev_q1, run_dev_q6, run_strict_q1,
-	run_strict_q6, status_rows,
+	CACHE_ROOT, generate_dev_lineitem, matrix, resolve_q14_scale, run_dev_q1, run_dev_q6,
+	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
 
 #[tokio::main]
@@ -67,6 +67,17 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_dev_q1(sf).await
 			}
 		}
+		// ADR 269 adds q14 (the first multi-table query) as a reachability attempt. It rides a broadcast
+		// cartesian until comma-join recognition (ADR 270), so it is scale-capped: default to the gauge
+		// scale and refuse a larger explicit --sf (a harness error, exit 2) rather than hang.
+		"q14" => match resolve_q14_scale(explicit_sf(args)) {
+			Ok(sf) if strict => run_strict_q14(sf).await,
+			Ok(sf) => run_dev_q14(sf).await,
+			Err(message) => {
+				eprintln!("{message}");
+				return ExitCode::from(2);
+			}
+		},
 		_ => Attempt {
 			query: query.to_string(),
 			scale_factor: sf,
@@ -112,10 +123,13 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 		.map(String::as_str)
 }
 
+/// The explicitly-passed `--sf`, if any (parsed). `None` means "use the per-query default".
+fn explicit_sf(args: &[String]) -> Option<f64> {
+	flag_value(args, "--sf").and_then(|value| value.parse().ok())
+}
+
 fn sf_arg(args: &[String]) -> f64 {
-	flag_value(args, "--sf")
-		.and_then(|value| value.parse().ok())
-		.unwrap_or(0.01)
+	explicit_sf(args).unwrap_or(0.01)
 }
 
 fn usage() -> ExitCode {
