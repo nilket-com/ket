@@ -1075,8 +1075,13 @@ pub(super) fn bind_arithmetic(
 		.expect("builder returns typed right node");
 	// ADR 266: coerce an Int/Float literal operand to the other side's Decimal128(p,s) so `+`/`-` over a
 	// decimal column and a numeric literal (`1 - l_discount`) binds — rewrite in place (no Cast node),
-	// mirroring the comparison coercion. Gated to `+`/`-`, so non-decimal arithmetic is untouched.
-	let (left_type, right_type) = if matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub) {
+	// mirroring the comparison coercion. ADR 271 extends this to `*` (`100.00 * SUM(...)` in q14); the
+	// coercion is a no-op unless one side is Decimal128 and the other a numeric literal, so non-decimal
+	// arithmetic is untouched.
+	let (left_type, right_type) = if matches!(
+		op,
+		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul
+	) {
 		coerce_decimal_arithmetic_literal(builder, ctx, left, right, &left_type, &right_type)?;
 		(
 			builder
@@ -1167,6 +1172,23 @@ pub(super) fn bind_arithmetic(
 		let precision = (p1 + 1).min(38);
 		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, *s1)));
 	}
+	// ADR 271: scalar Decimal128 / Decimal128 -> the validated Arrow divide shape (scale = s1+4). Reject an
+	// out-of-range output explicitly (no silent scale-cap / negative-scale denominator-rescale); the executor
+	// uses the same shared `decimal_division_output_type` so the bound type and stamped (p,s) cannot drift.
+	if op == BoundBinaryOp::Div
+		&& let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
+			(&left_type, &right_type)
+	{
+		let (precision, scale) =
+			decimal_division_output_type(*p1, *s1, *p2, *s2).ok_or_else(|| {
+				BindingError::UnsupportedExpression {
+					message: format!(
+						"Decimal division output type out of range: Decimal128({p1},{s1}) / Decimal128({p2},{s2})"
+					),
+				}
+			})?;
+		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, scale)));
+	}
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {
@@ -1212,6 +1234,47 @@ fn coerce_decimal_arithmetic_literal(
 	{
 		let value = coerce_literal_value(value, left_type, ctx.session_timezone)?;
 		let _ = builder.rewrite_literal(right, value);
+	}
+	Ok(())
+}
+
+/// ADR 271: when exactly one Decimal128 branch type is present among CASE result branches, coerce each
+/// numeric-literal branch (e.g. `ELSE 0`) to it in place (the `coerce_literal_value` path). Literal-scoped:
+/// non-literal branches are untouched, and multiple *differing* Decimal branch types are left for
+/// `case_common_type` to reject — this cut adds no rescale Cast.
+pub(super) fn coerce_case_decimal_literals(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	result_ids: &[BoundExprId],
+) -> Result<(), BindingError> {
+	let mut target: Option<DataType> = None;
+	for id in result_ids {
+		if let Some(node_type @ DataType::Decimal128(_, _)) = builder.node_type(*id) {
+			let node_type = node_type.clone();
+			match &target {
+				None => target = Some(node_type),
+				Some(existing) if *existing == node_type => {}
+				Some(_) => return Ok(()),
+			}
+		}
+	}
+	let Some(target) = target else {
+		return Ok(());
+	};
+	for id in result_ids {
+		let Some(value) = builder.literal(*id).cloned() else {
+			continue;
+		};
+		if matches!(
+			value,
+			ScalarValue::Int32(_)
+				| ScalarValue::Int64(_)
+				| ScalarValue::Float32(_)
+				| ScalarValue::Float64(_)
+		) {
+			let coerced = coerce_literal_value(value, &target, ctx.session_timezone)?;
+			let _ = builder.rewrite_literal(*id, coerced);
+		}
 	}
 	Ok(())
 }

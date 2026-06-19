@@ -79,45 +79,34 @@ async fn q01_reaches_execute_in_both_modes() {
 	);
 }
 
-// ADR 269: q14 — the first multi-table query, brought into the gauge as a reachability attempt. With honest
-// optimizer facts the tiny `part` is broadcast-eligible, so the comma equi-join is admitted: dev q14
-// (Float64) reaches execute, and strict q14 walls at bind on the CASE Decimal-vs-integer (`ELSE 0`) gap —
-// the measured row that names ADR 270. (The keyless cross-join is a wall only *without* facts — that
-// no-facts artifact is pinned separately by `q14_probe.rs`.)
+// q14 (the decimal-ratio query) reaches execute in both modes: dev over Float64, strict over Decimal128.
 #[tokio::test]
-async fn q14_dev_executes_and_strict_blocks_at_decimal_case() {
+async fn q14_executes_in_both_modes() {
 	assert!(
 		status_rows()
 			.iter()
 			.any(|row| row == "q14 dev=implemented strict=implemented"),
-		"q14 is now an implemented capability in the static inventory"
+		"q14 is an implemented capability in the static inventory"
 	);
 
-	let dev = run_dev_q14(0.0001).await;
-	assert_eq!(dev.query, "q14");
-	assert_eq!(
-		dev.status,
-		Status::Pass,
-		"dev q14 reaches execute: {}",
-		dev.human()
-	);
-	assert_eq!(dev.phase, Phase::Execute);
-	assert!(
-		dev.digest.is_some(),
-		"a pass carries a digest: {}",
-		dev.human()
-	);
-
-	let strict = run_strict_q14(0.0001).await;
-	assert_eq!(strict.query, "q14");
-	assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
-	assert_eq!(strict.phase, Phase::Bind);
-	assert_eq!(
-		strict.reason.as_deref(),
-		Some("unsupported_decimal_case"),
-		"q14's measured first wall is the CASE Decimal-vs-integer gap (names ADR 270): {}",
-		strict.human()
-	);
+	for (mode, attempt) in [
+		("dev", run_dev_q14(0.0001).await),
+		("strict", run_strict_q14(0.0001).await),
+	] {
+		assert_eq!(attempt.query, "q14");
+		assert_eq!(
+			attempt.status,
+			Status::Pass,
+			"q14 {mode} reaches execute: {}",
+			attempt.human()
+		);
+		assert_eq!(attempt.phase, Phase::Execute);
+		assert!(
+			attempt.digest.is_some(),
+			"a pass carries a digest: {}",
+			attempt.human()
+		);
+	}
 }
 
 // ADR 270: comma-join recognition keys q14's join, so it no longer rides a cartesian and the ADR 269 scale

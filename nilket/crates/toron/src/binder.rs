@@ -33,7 +33,7 @@ use crate::ir::{
 	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SetOpAllKind, SortExpr,
 	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
 	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, arithmetic_output_type,
-	calendar_month_interval_data_type, decode_column_logical_type,
+	calendar_month_interval_data_type, decimal_division_output_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, nanos_per_timestamp_unit, scalar_literal_key, schema_for_exprs,
 };
@@ -4553,6 +4553,8 @@ fn bind_case(
 		None
 	};
 
+	// A numeric-literal CASE branch coerces to a single Decimal branch type so the branches unify.
+	coerce_case_decimal_literals(builder, ctx, &typed_result_ids)?;
 	let result_types = typed_result_ids
 		.iter()
 		.map(|id| {

@@ -1059,6 +1059,29 @@ pub fn arithmetic_output_type(left: &DataType, right: &DataType) -> Option<DataT
 	}
 }
 
+/// ADR 271: scalar `Decimal128(p1,s1) / Decimal128(p2,s2)` output type — the grounded Arrow/Hive divide
+/// shape (`scale = s1 + 4`, `precision = min(38, p1 - s1 + s2 + scale)`; `p1/s1` are the numerator's),
+/// validated **explicitly** rather than inheriting Arrow's silent scale-cap or a negative-scale
+/// denominator-rescale. `Some((precision, scale))` when valid; `None` when out of range — the binder maps
+/// `None` to a clean bind reject, the executor to a kernel error. Shared so the binder's bound type and the
+/// executor's stamped `(p,s)` cannot drift. The numerator-scaling exponent `scale + s2 - s1` is part of the
+/// validity check (rejected if negative for this slice).
+pub fn decimal_division_output_type(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<(u8, i8)> {
+	let scale = i32::from(s1) + 4;
+	let precision = (i32::from(p1) - i32::from(s1) + i32::from(s2) + scale).min(38);
+	let scale_delta = scale + i32::from(s2) - i32::from(s1);
+	if scale < 0
+		|| scale > 38
+		|| precision < 1
+		|| scale > precision
+		|| !(0..=38).contains(&scale_delta)
+	{
+		return None;
+	}
+	let _ = p2;
+	Some((precision as u8, scale as i8))
+}
+
 pub fn is_integer_type(data_type: &DataType) -> bool {
 	matches!(data_type, DataType::Int32 | DataType::Int64)
 }

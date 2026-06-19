@@ -1,8 +1,5 @@
-//! ADR 269/270 grounding probe. ADR 269 found q14's comma join lowered to a keyless CROSS JOIN whose
-//! admission depended on optimizer facts (a tiny broadcast-eligible `part`). ADR 270's binder-side
-//! recognition lifts the `l_partkey = p_partkey` equality into a keyed inner join **before** strategy
-//! selection, so the join is now keyed regardless of facts — and q14's real wall is the CASE
-//! Decimal-vs-integer gap in both cases. These two tests pin that fact-independence.
+//! Invariant: strict q14 binding does not depend on optimizer facts — comma-join equality recognition keys
+//! the join before strategy selection, so the same query binds with and without seeded facts.
 
 use arrow::record_batch::RecordBatch;
 
@@ -59,39 +56,20 @@ fn q14_catalog(seed_facts: bool) -> MockCatalog {
 	catalog
 }
 
-/// ADR 270: even without optimizer facts, the comma-join equality is lifted into a keyed inner join, so
-/// q14 no longer walls at the keyless CROSS JOIN — it reaches the CASE Decimal-vs-integer gap, exactly like
-/// the seeded-facts case. (Pre-270 this walled at `CROSS JOIN`; recognition made the join fact-independent.)
 #[tokio::test]
-async fn q14_recognized_keyed_inner_without_optimizer_facts() {
+async fn strict_q14_binds_without_optimizer_facts() {
 	let catalog = q14_catalog(false);
 	let plan = SqlPlanner::new().plan(STRICT_Q14_SQL).expect("q14 plans");
-	let error = bind(&plan, &catalog, &PlannerConfig::default())
+	bind(&plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("no-facts q14 walls at the CASE decimal gap, not the cross-join");
-	let message = format!("{error:?}");
-	assert!(
-		!message.contains("CROSS JOIN"),
-		"recognition lifts the equi into keys, so no keyless-cross wall even without facts: {message}"
-	);
-	assert!(
-		message.contains("CASE result branches cannot be unified"),
-		"the real wall is CASE Decimal unification, independent of optimizer facts: {message}"
-	);
+		.expect("strict q14 binds without optimizer facts");
 }
 
-/// With honest facts the tiny `part` is broadcast-eligible, the join is admitted, and strict q14's real
-/// first wall is the CASE Decimal-vs-integer (`ELSE 0`) result unification — the row the harness records.
 #[tokio::test]
-async fn q14_with_seeded_facts_walls_at_decimal_case() {
+async fn strict_q14_binds_with_seeded_optimizer_facts() {
 	let catalog = q14_catalog(true);
 	let plan = SqlPlanner::new().plan(STRICT_Q14_SQL).expect("q14 plans");
-	let error = bind(&plan, &catalog, &PlannerConfig::default())
+	bind(&plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("seeded-facts strict q14 walls at the CASE decimal gap");
-	let message = format!("{error:?}");
-	assert!(
-		message.contains("CASE result branches cannot be unified"),
-		"seeded facts admit the join; the real wall is CASE Decimal unification: {message}"
-	);
+		.expect("strict q14 binds with seeded optimizer facts");
 }

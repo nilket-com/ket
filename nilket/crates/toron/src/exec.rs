@@ -9,6 +9,7 @@ use crate::error::ExecutionError;
 #[cfg(test)]
 use crate::ir::BroadcastReplayEligibility;
 use crate::ir::arithmetic_output_type;
+use crate::ir::decimal_division_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
@@ -2528,6 +2529,15 @@ fn evaluate_bound_binary(
 					}
 					_ => unreachable!("add/sub matched"),
 				});
+			}
+			// ADR 271: Decimal128 / Decimal128 — a custom Toron i128 divide (NOT Arrow `numeric::div`, which
+			// errors on a zero divisor). div-by-zero -> NULL (ADR 084), half-away-from-zero rounding (ADR
+			// 268), stamped with the shared validated output (p,s).
+			if matches!(arithmetic_op, ArithmeticOp::Div)
+				&& matches!(left_arr.data_type(), DataType::Decimal128(_, _))
+				&& matches!(right_arr.data_type(), DataType::Decimal128(_, _))
+			{
+				return evaluate_decimal_division(left_arr, right_arr);
 			}
 			let left_type =
 				program
@@ -6614,6 +6624,78 @@ fn decimal_fits_precision(value: i128, precision: u8) -> bool {
 	}
 }
 
+/// ADR 271: scalar `Decimal128 / Decimal128`. A custom i128 loop — NOT Arrow `numeric::div`, which errors on a
+/// zero divisor. A NULL operand or a zero divisor yields a NULL slot (ADR 084); the quotient rounds half away
+/// from zero (reusing ADR 268's remainder check) in the direction of the true quotient's sign
+/// (`sign(num)*sign(divisor)`), so a negative denominator rounds correctly; the output `(p,s)` is the shared
+/// `decimal_division_output_type` (so the executor's stamp matches the binder's bound type).
+fn evaluate_decimal_division(
+	left_arr: &ArrayRef,
+	right_arr: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
+		(left_arr.data_type(), right_arr.data_type())
+	else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "decimal division over non-decimal operands".to_string(),
+		});
+	};
+	let (out_precision, out_scale) =
+		decimal_division_output_type(*p1, *s1, *p2, *s2).ok_or_else(|| ExecutionError::Kernel {
+			message: "decimal division output type out of range".to_string(),
+		})?;
+	let left = left_arr
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("checked Decimal128 numerator");
+	let right = right_arr
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("checked Decimal128 denominator");
+	let overflow = || ExecutionError::Kernel {
+		message: "decimal division scale overflow".to_string(),
+	};
+	// `decimal_division_output_type` guarantees this exponent is in `0..=38`, so `10^scale_delta` fits i128.
+	let scale_delta = i32::from(out_scale) + i32::from(*s2) - i32::from(*s1);
+	let multiplier = 10_i128
+		.checked_pow(u32::try_from(scale_delta).map_err(|_| overflow())?)
+		.ok_or_else(overflow)?;
+	let mut values: Vec<Option<i128>> = Vec::with_capacity(left.len());
+	for index in 0..left.len() {
+		if left.is_null(index) || right.is_null(index) {
+			values.push(None);
+			continue;
+		}
+		let divisor = right.value(index);
+		if divisor == 0 {
+			values.push(None); // ADR 084: div-by-zero -> NULL
+			continue;
+		}
+		let scaled = left
+			.value(index)
+			.checked_mul(multiplier)
+			.ok_or_else(overflow)?;
+		let mut quotient = scaled / divisor;
+		let remainder = scaled % divisor;
+		if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
+			quotient = quotient
+				.checked_add(scaled.signum() * divisor.signum())
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "decimal division rounding overflow".to_string(),
+				})?;
+		}
+		if !decimal_fits_precision(quotient, out_precision) {
+			return Err(ExecutionError::Kernel {
+				message: "decimal division result does not fit output precision".to_string(),
+			});
+		}
+		values.push(Some(quotient));
+	}
+	Ok(Arc::new(
+		Decimal128Array::from(values).with_precision_and_scale(out_precision, out_scale)?,
+	))
+}
+
 fn avg_state_array(state: &AggState, output_type: &DataType) -> Result<ArrayRef, ExecutionError> {
 	match output_type {
 		DataType::Decimal128(precision, scale) => {
@@ -8239,6 +8321,53 @@ mod tests {
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	// ADR 271: the scalar Decimal `/` output type — grounded Arrow shape, validated explicitly.
+	#[test]
+	fn decimal_division_output_type_validates() {
+		// q14: (38,8) / (32,4) -> scale = 8+4 = 12, precision = min(38, 38-8+4+12) = 38.
+		assert_eq!(decimal_division_output_type(38, 8, 32, 4), Some((38, 12)));
+		// (10,2) / (10,2) -> scale 6, precision = min(38, 10-2+2+6) = 16.
+		assert_eq!(decimal_division_output_type(10, 2, 10, 2), Some((16, 6)));
+		// Over-wide numerator scale: s1=36 -> scale 40 > 38 -> rejected (no silent cap).
+		assert_eq!(decimal_division_output_type(38, 36, 10, 2), None);
+	}
+
+	// ADR 271: the scalar Decimal `/` kernel — half-away-from-zero rounding (discriminated from truncation),
+	// a NEGATIVE denominator (rounds away in the quotient's sign), div-by-zero -> NULL (ADR 084), and NULL
+	// operand propagation. (The 2-row q14 fixture can't discriminate these.)
+	#[test]
+	fn evaluate_decimal_division_rounds_half_away_and_nulls() {
+		let decimal = |values: Vec<Option<i128>>| -> ArrayRef {
+			Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(20, 0)
+					.expect("decimal operand"),
+			)
+		};
+		// 1 / 20000 = 0.00005 -> at scale 4, half away from zero -> 0.0001 (truncation would be 0.0000).
+		let left = decimal(vec![Some(1), Some(1), Some(1), None]);
+		let right = decimal(vec![Some(20_000), Some(-20_000), Some(0), Some(5)]);
+		let out = evaluate_decimal_division(&left, &right).expect("decimal division");
+		let out = out
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("decimal128 result");
+		// (20,0) / (20,0) -> scale 4, precision min(38, 20-0+0+4) = 24.
+		assert_eq!(out.data_type(), &DataType::Decimal128(24, 4));
+		assert_eq!(
+			out.value(0),
+			1,
+			"half away from zero rounds 0.00005 up to 0.0001"
+		);
+		assert_eq!(
+			out.value(1),
+			-1,
+			"a negative denominator rounds away from zero -> -0.0001"
+		);
+		assert!(out.is_null(2), "div-by-zero -> NULL (ADR 084)");
+		assert!(out.is_null(3), "a NULL operand -> NULL");
+	}
 
 	// ADR 268: the decimal AVG finalize rescales to the widened output scale and divides half away from
 	// zero, in pure integer arithmetic. Pins the rounding sign (positive AND negative ties) and the
