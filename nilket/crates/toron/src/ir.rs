@@ -579,7 +579,9 @@ pub fn scalar_literal_key(value: &ScalarValue) -> ScalarLiteralKeyClassification
 			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Utf8(value.clone()))
 		}
 		ScalarValue::Utf8(None) => ScalarLiteralKeyClassification::Null,
-		// ADR 263: Decimal in GROUP BY / join keys is out of the Q6 slice — keep it unsupported.
+		// ADR 275: a Decimal GROUP BY key now groups in the executor (group_value/group_column). This arm is the
+		// separate literal/stat-key path — a Decimal stat key feeds the Wendelon-produced storage-fact decode,
+		// a distinct cross-ring cut — so a Decimal literal key stays unsupported here.
 		ScalarValue::Decimal128 { value: Some(_), .. } => {
 			ScalarLiteralKeyClassification::Unsupported
 		}

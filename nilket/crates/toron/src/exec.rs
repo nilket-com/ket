@@ -5733,6 +5733,17 @@ fn encode_partition_key_value(
 			);
 			encoded.extend_from_slice(value);
 		}
+		// ADR 275: Decimal128 group/partition key. One (p,s) per column, so the raw i128 partitions exactly
+		// (equal Decimal value → equal bytes → same partition); tag 17 is the next unused after the Timestamp
+		// units (14..16).
+		DataType::Decimal128(_, _) => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Decimal128Array>()
+				.expect("decimal128 data type");
+			encoded.push(17);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
 		data_type => {
 			return Err(ExecutionError::InvalidExpression {
 				message: format!("unsupported exchange partition key type: {data_type:?}"),
@@ -5754,6 +5765,9 @@ enum GroupValue {
 	Date32(i32),
 	Timestamp(TimeUnit, i64),
 	Utf8(String),
+	// ADR 275: a Decimal128 group key. The raw i128 is exact (no float-bit canonicalization), so equal Decimal
+	// values group together and reconstruct losslessly.
+	Decimal128(i128),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5968,6 +5982,10 @@ fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionErro
 	}
 	if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
 		return Ok(GroupValue::Utf8(array.value(row).to_string()));
+	}
+	// ADR 275: Decimal128 group key — the raw i128 keys the group exactly.
+	if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
+		return Ok(GroupValue::Decimal128(array.value(row)));
 	}
 	Err(ExecutionError::InvalidExpression {
 		message: format!("unsupported GROUP BY type: {:?}", array.data_type()),
@@ -6929,6 +6947,24 @@ fn group_column(
 				})
 				.collect::<Result<Vec<_>, _>>()?,
 		))),
+		// ADR 275: rebuild the Decimal128 group key, carrying the exact (precision, scale) from the column type.
+		arrow::datatypes::DataType::Decimal128(precision, scale) => {
+			let values = keys
+				.iter()
+				.map(|key| match &key[idx] {
+					GroupValue::Null => Ok(None),
+					GroupValue::Decimal128(value) => Ok(Some(*value)),
+					other => Err(group_type_error(data_type, other)),
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::InvalidExpression {
+						message: format!("decimal128 group column: {error}"),
+					})?,
+			))
+		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported GROUP BY type: {data_type:?}"),
 		}),
@@ -9306,6 +9342,70 @@ mod tests {
 			partition_bucket(&key_arrays, 0, 17).expect("partition bucket"),
 			(XxHash3_64::oneshot(&encoded) % 17) as usize
 		);
+	}
+
+	// ADR 275: a Decimal128 partition key encodes as tag 17 + the raw i128 (little-endian). Pins the stable
+	// encoding so a future tag/serialization change can't silently re-bucket Decimal keys.
+	#[test]
+	fn exchange_partition_bucket_uses_stable_xxh3_64_encoding_for_decimal128() {
+		let key_arrays = vec![Arc::new(
+			Decimal128Array::from(vec![Some(12_345_i128)])
+				.with_precision_and_scale(15, 2)
+				.expect("decimal column"),
+		) as ArrayRef];
+		let mut encoded = vec![17];
+		encoded.extend_from_slice(&12_345_i128.to_le_bytes());
+
+		assert_eq!(
+			partition_bucket(&key_arrays, 0, 17).expect("partition bucket"),
+			(XxHash3_64::oneshot(&encoded) % 17) as usize
+		);
+	}
+
+	// ADR 275: group_value reads a Decimal128 key as the raw i128 (NULL handled by the leading null-check).
+	#[test]
+	fn group_value_reads_decimal128_raw_i128() {
+		let array: ArrayRef = Arc::new(
+			Decimal128Array::from(vec![Some(12_345_i128), None, Some(-67_800_i128)])
+				.with_precision_and_scale(15, 2)
+				.expect("decimal column"),
+		);
+		assert_eq!(
+			group_value(&array, 0).expect("group value"),
+			GroupValue::Decimal128(12_345)
+		);
+		assert_eq!(
+			group_value(&array, 1).expect("group value"),
+			GroupValue::Null
+		);
+		assert_eq!(
+			group_value(&array, 2).expect("group value"),
+			GroupValue::Decimal128(-67_800)
+		);
+	}
+
+	// ADR 275: group_column rebuilds the Decimal128 group key with the EXACT (precision, scale) from the column
+	// type and the exact raw i128 values (incl. NULL). The core (p,s) round-trip the q10 digest can't pin.
+	#[test]
+	fn group_column_rebuilds_decimal128_with_exact_precision_scale_and_values() {
+		let keys = vec![
+			vec![GroupValue::Decimal128(12_345)],
+			vec![GroupValue::Decimal128(-67_800)],
+			vec![GroupValue::Null],
+		];
+		let column = group_column(&keys, 0, &arrow::datatypes::DataType::Decimal128(15, 2))
+			.expect("group column");
+		assert_eq!(
+			column.data_type(),
+			&arrow::datatypes::DataType::Decimal128(15, 2)
+		);
+		let decimals = column
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("decimal128 column");
+		assert_eq!(decimals.value(0), 12_345);
+		assert_eq!(decimals.value(1), -67_800);
+		assert!(decimals.is_null(2));
 	}
 
 	#[test]

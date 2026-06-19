@@ -172,16 +172,17 @@ async fn q03_runs_keyed_at_default_scale() {
 	assert_eq!(dev.phase, Phase::Execute);
 }
 
-// ADR 274: q10 — the first 4-table query. dev (Float64) reaches execute; strict walls at the group-by
-// repartition on the Decimal128 `c_acctbal` group key — the measured row that names ADR 275. The 4-table join
-// and grouping work; the gap is a Decimal group/partition key.
+// ADR 274/275: q10 — the first 4-table query — reaches execute in both modes: dev over Float64, strict over
+// Decimal128. ADR 275 added Decimal128 group/partition keys (encode_partition_key_value, GroupValue,
+// group_value, group_column), flipping strict q10 from blocked(unsupported_decimal_group_key@execute) to
+// pass@execute.
 //
-// q10's 4-table execution future is deeper than libtest's default test-thread stack — it overflows there even
-// on a multi-thread runtime (`block_on` polls the root future inline on the test thread) and with a raised
-// `RUST_MIN_STACK` (which libtest's test thread does not honor). The CLI runs dev q10 fine on the main thread's
-// larger stack, as does production; so run the assertions on an explicitly-sized thread to match that.
+// Runs on an explicit large stack: q10's 4-table execution future overflows libtest's default test-thread
+// stack — even on a multi-thread runtime (`block_on` polls the root future inline on the test thread) and with
+// a raised `RUST_MIN_STACK` (which libtest's test thread does not honor). The CLI runs q10 fine on the main
+// thread's larger stack, as does production.
 #[test]
-fn q10_dev_executes_and_strict_blocks_at_decimal_group_key() {
+fn q10_executes_in_both_modes() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -196,31 +197,24 @@ fn q10_dev_executes_and_strict_blocks_at_decimal_group_key() {
 						.any(|row| row == "q10 dev=implemented strict=implemented"),
 					"q10 is an implemented capability in the static inventory"
 				);
-				let dev = run_dev_q10(0.0001).await;
-				assert_eq!(dev.query, "q10");
-				assert_eq!(
-					dev.status,
-					Status::Pass,
-					"dev q10 reaches execute: {}",
-					dev.human()
-				);
-				assert_eq!(dev.phase, Phase::Execute);
-				assert!(
-					dev.digest.is_some(),
-					"a pass carries a digest: {}",
-					dev.human()
-				);
-
-				let strict = run_strict_q10(0.0001).await;
-				assert_eq!(strict.query, "q10");
-				assert_eq!(strict.status, Status::Blocked, "{}", strict.human());
-				assert_eq!(strict.phase, Phase::Execute);
-				assert_eq!(
-					strict.reason.as_deref(),
-					Some("unsupported_decimal_group_key"),
-					"strict q10's measured wall is the Decimal group/partition key (names ADR 275): {}",
-					strict.human()
-				);
+				for (mode, attempt) in [
+					("dev", run_dev_q10(0.0001).await),
+					("strict", run_strict_q10(0.0001).await),
+				] {
+					assert_eq!(attempt.query, "q10");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q10 {mode} reaches execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
 			});
 		})
 		.expect("spawn q10 thread")

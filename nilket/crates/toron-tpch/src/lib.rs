@@ -1217,3 +1217,82 @@ pub fn correctness_matrix_from_log(contents: &str) -> Vec<String> {
 		})
 		.collect()
 }
+
+#[cfg(test)]
+mod adr275_decimal_join_probe {
+	use super::*;
+
+	// ADR 275 review (Finding 1): encode_partition_key_value now supports Decimal128, and the EXPLICIT
+	// `JOIN ... ON` gate (binder::join::validate_join_key_types) rejects only floats — not Decimal128 — so an
+	// explicit Decimal equi-join is enabled by this cut as a side effect. (The comma-join recognizer is a
+	// separate path that still gates Decimal via cross_equi_join_key_type_supported.) This probe pins the
+	// measured behaviour end-to-end; if it ever regresses to a wall, the panic records the actual reason.
+	#[tokio::test]
+	async fn explicit_decimal_equi_join_executes() {
+		fn schema(value_col: &str) -> SchemaRef {
+			Arc::new(Schema::new(vec![
+				Field::new("k", DataType::Decimal128(15, 2), false),
+				Field::new(value_col, DataType::Int64, false),
+			]))
+		}
+		fn keys() -> Decimal128Array {
+			Decimal128Array::from(vec![100_i128, 250])
+				.with_precision_and_scale(15, 2)
+				.expect("decimal keys")
+		}
+		fn descriptor(id: u8, name: &str, schema: &Schema) -> TableSchemaDescriptor {
+			TableSchemaDescriptor::new_with_layout(
+				TableObjectId::new([id; 16]),
+				1,
+				"default",
+				name,
+				schema,
+				RowIdentityPolicy::AppendOnly,
+				LocalityPolicy::default_table_spread(),
+				RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+				SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.expect("descriptor")
+		}
+		let left = RecordBatch::try_new(
+			schema("av"),
+			vec![Arc::new(keys()), Arc::new(Int64Array::from(vec![1_i64, 2]))],
+		)
+		.expect("left batch");
+		let right = RecordBatch::try_new(
+			schema("bv"),
+			vec![
+				Arc::new(keys()),
+				Arc::new(Int64Array::from(vec![10_i64, 20])),
+			],
+		)
+		.expect("right batch");
+		let tables = vec![
+			HarnessTable {
+				id: TableId(1),
+				name: "a",
+				descriptor: descriptor(21, "a", schema("av").as_ref()),
+				facts: facts_for_batch(&left),
+				batch: left,
+			},
+			HarnessTable {
+				id: TableId(2),
+				name: "b",
+				descriptor: descriptor(22, "b", schema("bv").as_ref()),
+				facts: facts_for_batch(&right),
+				batch: right,
+			},
+		];
+		match execute_query_with_tables("SELECT a.av, b.bv FROM a JOIN b ON a.k = b.k", tables)
+			.await
+		{
+			Ok(batches) => {
+				let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+				assert_eq!(rows, 2, "both Decimal keys (100, 250) match across a and b");
+			}
+			Err(StageError { phase, reason }) => {
+				panic!("explicit Decimal equi-join walled at {phase:?}: {reason}");
+			}
+		}
+	}
+}
