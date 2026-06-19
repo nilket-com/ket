@@ -5344,13 +5344,31 @@ impl SqlPlanner {
 
 		if let Some(selection) = &select.selection {
 			for conjunct in split_top_level_and(selection) {
-				match self.classify_exists_conjunct(
-					conjunct,
-					&outer_qualifiers,
-					&inner_qualifiers,
-				)? {
-					ExistsConjunct::CorrelatedPair { outer, inner } => on.push((outer, inner)),
-					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
+				match self.classify_exists_conjunct(conjunct, &outer_qualifiers, &inner_qualifiers)
+				{
+					Ok(ExistsConjunct::CorrelatedPair { outer, inner }) => on.push((outer, inner)),
+					Ok(ExistsConjunct::InnerResidual(predicate)) => inner_residuals.push(predicate),
+					// ADR 279: defer ONLY the unqualified-correlated-ref case — the frontend is purely
+					// syntactic and can't resolve which relation owns a bare column. Genuinely-unsupported
+					// QUALIFIED shapes (outer-only, non-equi, computed keys) still reject here as before; the
+					// binder resolves the deferred predicates catalog-aware (and rejects ambiguous ones).
+					Err(error)
+						if error
+							.to_string()
+							.contains("unsupported EXISTS column reference") =>
+					{
+						let predicates = split_top_level_and(selection)
+							.into_iter()
+							.map(|conjunct| self.lower_expr(conjunct))
+							.collect::<Result<Vec<_>, _>>()?;
+						return Ok(LogicalPlan::DeferredExists {
+							outer: Box::new(outer_plan),
+							inner: Box::new(inner_plan),
+							predicates,
+							negated,
+						});
+					}
+					Err(error) => return Err(error),
 				}
 			}
 		}
@@ -9643,6 +9661,9 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 			}
 		},
 		LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Vec::new(),
+		// ADR 279: a deferred EXISTS resolves to a LeftSemi/LeftAnti, whose output is the outer rows —
+		// expose the outer qualifiers only (the inner subquery is not in the output scope).
+		LogicalPlan::DeferredExists { outer, .. } => plan_qualifiers(outer),
 		// ADR 255: a recursive CTE exposes its own name as a relation qualifier (like a named scan); its
 		// seed/recursive body is opaque (the working table is internal, not a referenceable qualifier).
 		LogicalPlan::RecursiveCte { name, .. } => vec![TableRef::new(name.clone())],
@@ -10561,6 +10582,9 @@ mod tests {
 			| LogicalPlan::Explain { input }
 			| LogicalPlan::ExplainAnalyze { input } => filter_count(input),
 			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),
+			LogicalPlan::DeferredExists { outer, inner, .. } => {
+				filter_count(outer) + filter_count(inner)
+			}
 			LogicalPlan::Union { left, right } | LogicalPlan::SetOpAll { left, right, .. } => {
 				filter_count(left) + filter_count(right)
 			}

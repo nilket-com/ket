@@ -50,6 +50,38 @@ fn sql_correlated_not_exists_lowers_to_left_anti_join() {
 	assert_eq!(on.len(), 1);
 }
 
+// ADR 279: an UNqualified correlated EXISTS ref is resolved in the binder (catalog-aware). When the ref is
+// genuinely ambiguous across the outer + inner scopes (both `fact` and `dim` have `k`), the binder must
+// reject rather than guess — the safe-resolution invariant. (q04's distinct `l_`/`o_` refs resolve cleanly;
+// this pins the ambiguous case.) The frontend defers the unqualified predicate; the binder is where it fails.
+#[tokio::test]
+async fn unqualified_ambiguous_correlated_exists_rejects_in_binder() {
+	let (catalog, _storage) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE k = k)")
+		.expect("frontend defers the unqualified correlated EXISTS");
+	let error = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("an ambiguous unqualified correlated EXISTS must reject");
+	assert!(
+		error.to_string().to_lowercase().contains("ambiguous"),
+		"the rejection names the ambiguity: {error}"
+	);
+}
+
+// ADR 279: an UNqualified correlated EXISTS with a UNIQUE column pair (`flag` is fact-only, `active` is
+// dim-only) is lifted to the *same keyed LeftSemi* as its qualified equivalent — proving the binder actually
+// resolves + keys the correlation (a regression to a keyless / semantically-wrong semi-join would change the
+// digest and fail here).
+#[tokio::test]
+async fn unqualified_unique_correlated_exists_matches_qualified() {
+	assert_same_digest(
+		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE active = flag)",
+		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE dim.active = fact.flag)",
+	)
+	.await;
+}
+
 #[tokio::test]
 async fn exists_digest_matches_hand_written_left_semi_join() {
 	assert_same_digest(
@@ -485,7 +517,9 @@ fn exists_with_outer_only_subquery_predicate_is_unsupported() {
 
 #[test]
 fn exists_with_unqualified_ambiguous_correlation_is_unsupported() {
-	assert_unsupported("SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM dim WHERE k = fact.k)");
+	// ADR 279: a qualified ref ambiguous across both scopes (inner FROM fact, outer fact) still rejects at the
+	// frontend. (The UNqualified ambiguous case `k = fact.k` now defers to the binder — see
+	// `unqualified_ambiguous_correlated_exists_rejects_in_binder`.)
 	assert_unsupported(
 		"SELECT * FROM fact WHERE EXISTS (SELECT 1 FROM fact WHERE fact.k = fact.k)",
 	);

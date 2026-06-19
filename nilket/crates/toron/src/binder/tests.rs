@@ -21297,6 +21297,11 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 			collect_logical_join_kinds(left, kinds);
 			collect_logical_join_kinds(right, kinds);
 		}
+		// ADR 279: a deferred EXISTS resolves to a semi-join later; recurse both sides for inner joins.
+		LogicalPlan::DeferredExists { outer, inner, .. } => {
+			collect_logical_join_kinds(outer, kinds);
+			collect_logical_join_kinds(inner, kinds);
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }

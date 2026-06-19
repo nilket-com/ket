@@ -179,6 +179,8 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 	match plan {
 		LogicalPlan::Join { left, right, .. } => distinct_input_unsupported_message(left)
 			.or_else(|| distinct_input_unsupported_message(right)),
+		// ADR 279: a deferred EXISTS resolves to a semi-join whose output is the outer rows.
+		LogicalPlan::DeferredExists { outer, .. } => distinct_input_unsupported_message(outer),
 		LogicalPlan::Union { left, right } => distinct_input_unsupported_message(left)
 			.or_else(|| distinct_input_unsupported_message(right)),
 		LogicalPlan::SetOpAll { left, right, .. } => distinct_input_unsupported_message(left)

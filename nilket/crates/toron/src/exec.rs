@@ -686,6 +686,11 @@ impl Executor {
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
+				// ADR 279: the binder resolves DeferredExists into a real join before execution, so this
+				// legacy unbound-logical executor never sees it.
+				LogicalPlan::DeferredExists { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound deferred-EXISTS execution",
+				}),
 				LogicalPlan::SetOpAll { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical set-op ALL execution",
 				}),

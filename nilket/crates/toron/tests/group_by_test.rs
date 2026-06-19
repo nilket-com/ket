@@ -5525,7 +5525,8 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
-		| LogicalPlan::RecursiveRef { .. } => false,
+		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::DeferredExists { .. } => false,
 	}
 }
 
@@ -5563,7 +5564,8 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
-		| LogicalPlan::RecursiveRef { .. } => false,
+		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::DeferredExists { .. } => false,
 	}
 }
 

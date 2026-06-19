@@ -327,6 +327,25 @@ impl<'a> Binder<'a> {
 					),
 					returning: returning.clone(),
 				}),
+				// ADR 279: a pre-bind DeferredExists — recurse into both sides (the outer query's own joins
+				// still need demotion) and rebuild; the binder resolves it to a real Join later.
+				LogicalPlan::DeferredExists {
+					outer,
+					inner,
+					predicates,
+					negated,
+				} => Ok(LogicalPlan::DeferredExists {
+					outer: Box::new(
+						self.demote_null_rejected_outer_joins_inner(outer, receipts)
+							.await?,
+					),
+					inner: Box::new(
+						self.demote_null_rejected_outer_joins_inner(inner, receipts)
+							.await?,
+					),
+					predicates: predicates.clone(),
+					negated: *negated,
+				}),
 				// ADR 255: opaque-local — a recursive CTE's body is bound separately; outer-join
 				// demotion does not rewrite inside it, and its self-reference is a leaf.
 				LogicalPlan::RecursiveCte { .. }
@@ -492,6 +511,19 @@ impl<'a> Binder<'a> {
 					columns: columns.clone(),
 					source: Box::new(self.recognize_cross_equi_joins(source).await?),
 					returning: returning.clone(),
+				}),
+				// ADR 279: recurse both sides (the outer query may carry comma-joins to recognize), then
+				// rebuild; the binder resolves it to a real Join afterward.
+				LogicalPlan::DeferredExists {
+					outer,
+					inner,
+					predicates,
+					negated,
+				} => Ok(LogicalPlan::DeferredExists {
+					outer: Box::new(self.recognize_cross_equi_joins(outer).await?),
+					inner: Box::new(self.recognize_cross_equi_joins(inner).await?),
+					predicates: predicates.clone(),
+					negated: *negated,
 				}),
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
@@ -685,7 +717,10 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 				| LogicalPlan::Insert { .. }
-				| LogicalPlan::InsertSelect { .. } => Ok(None),
+				| LogicalPlan::InsertSelect { .. }
+				// ADR 279: opaque for outer-demotion column routing — demotion does not cross a deferred
+				// EXISTS (it is resolved to a real Join afterward).
+				| LogicalPlan::DeferredExists { .. } => Ok(None),
 			}
 		})
 	}
@@ -1081,7 +1116,9 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 				| LogicalPlan::Insert { .. }
-				| LogicalPlan::InsertSelect { .. }) => Ok(RoutedConjuncts {
+				| LogicalPlan::InsertSelect { .. }
+					// ADR 279: conjuncts don't route through a deferred EXISTS; keep them as a residual above.
+					| LogicalPlan::DeferredExists { .. }) => Ok(RoutedConjuncts {
 					input: stopped,
 					residual: routed_originals(conjuncts),
 					receipts: Vec::new(),
@@ -1632,6 +1669,77 @@ fn conjunct_column_sides(
 			}
 			sides
 		}
+	}
+}
+
+/// ADR 279: one classified conjunct of a deferred correlated EXISTS — either a correlated equality lifted to a
+/// join key (oriented outer-first) or an inner-only/constant predicate kept as an inner residual.
+pub(super) enum DeferredExistsConjunct {
+	Correlated { outer_key: Expr, inner_key: Expr },
+	InnerResidual(Expr),
+}
+
+/// ADR 279: classify a deferred correlated-EXISTS predicate against the bound outer (`left`) + inner (`right`)
+/// scopes (catalog-aware via [`column_side`]) — the binder-side analogue of the frontend's
+/// `classify_exists_conjunct`, but resolving *unqualified* columns by ownership. Ambiguous, outer-only, or a
+/// non-column-equi correlation are rejected (the safe-resolution invariant — never guess).
+pub(super) fn classify_deferred_exists_predicate(
+	predicate: &Expr,
+	outer_scope: &RelationScope,
+	inner_scope: &RelationScope,
+) -> Result<DeferredExistsConjunct, BindingError> {
+	let sides = conjunct_column_sides(predicate, outer_scope, inner_scope);
+	if sides.ambiguous {
+		return Err(BindingError::UnsupportedExpression {
+			message: "ambiguous correlated EXISTS column reference".to_string(),
+		});
+	}
+	match (sides.left, sides.right) {
+		// No outer reference → an inner-only (or constant) predicate; keep it on the inner side.
+		(false, _) => Ok(DeferredExistsConjunct::InnerResidual(predicate.clone())),
+		// References both sides → must be a simple correlated equality (one outer column = one inner column).
+		(true, true) => {
+			let Expr::Eq(left, right) = predicate else {
+				return Err(BindingError::UnsupportedExpression {
+					message: "correlated EXISTS predicate must be a column equality".to_string(),
+				});
+			};
+			match (
+				column_only_side(left, outer_scope, inner_scope),
+				column_only_side(right, outer_scope, inner_scope),
+			) {
+				(Some(LogicalJoinSide::Left), Some(LogicalJoinSide::Right)) => {
+					Ok(DeferredExistsConjunct::Correlated {
+						outer_key: (**left).clone(),
+						inner_key: (**right).clone(),
+					})
+				}
+				(Some(LogicalJoinSide::Right), Some(LogicalJoinSide::Left)) => {
+					Ok(DeferredExistsConjunct::Correlated {
+						outer_key: (**right).clone(),
+						inner_key: (**left).clone(),
+					})
+				}
+				_ => Err(BindingError::UnsupportedExpression {
+					message: "unsupported correlated EXISTS predicate".to_string(),
+				}),
+			}
+		}
+		// References only the outer query → cannot correlate to the inner subquery.
+		(true, false) => Err(BindingError::UnsupportedExpression {
+			message: "correlated EXISTS predicate references only the outer query".to_string(),
+		}),
+	}
+}
+
+fn column_only_side(
+	expr: &Expr,
+	outer_scope: &RelationScope,
+	inner_scope: &RelationScope,
+) -> Option<LogicalJoinSide> {
+	match expr {
+		Expr::Column(column_ref) => column_side(column_ref, outer_scope, inner_scope),
+		_ => None,
 	}
 }
 

@@ -277,13 +277,13 @@ fn q05_executes_in_both_modes() {
 		.expect("q05 thread panicked");
 }
 
-// ADR 278: q04 — the gauge's first correlated-subquery query. Its EXISTS uses an UNQUALIFIED correlated ref
-// (`l_orderkey = o_orderkey`); the qualifier-driven decorrelation classifier rejects it at PLAN
-// (`unsupported_correlated_exists`) — the measured first wall, naming the decorrelation-generality ADR. (The
-// official `+ INTERVAL '3' MONTH` bound is literal+literal, constant-folded; the EXISTS is hit first.) Blocks
-// at plan in <1 ms, so a bare test suffices — no deep execution future, no large-stack wrapper needed.
+// ADR 278/279: q04 — the gauge's first correlated-subquery query — reaches execute in both modes. ADR 279
+// resolved its UNQUALIFIED correlated EXISTS ref (`l_orderkey = o_orderkey`) in the binder (catalog-aware,
+// reusing the ADR 270 column_side machinery), flipping q04 from
+// blocked(unsupported_correlated_exists@plan) to pass@execute. The official `+ INTERVAL '3' MONTH` bound is
+// literal+literal (constant-folded). Both modes match (q04 uses no lineitem decimals).
 #[tokio::test]
-async fn q04_blocks_at_plan_on_unqualified_correlated_exists() {
+async fn q04_executes_in_both_modes() {
 	assert!(
 		status_rows()
 			.iter()
@@ -297,30 +297,25 @@ async fn q04_blocks_at_plan_on_unqualified_correlated_exists() {
 		assert_eq!(attempt.query, "q04");
 		assert_eq!(
 			attempt.status,
-			Status::Blocked,
-			"q04 {mode}: {}",
+			Status::Pass,
+			"q04 {mode} reaches execute (the correlated EXISTS resolves): {}",
 			attempt.human()
 		);
-		assert_eq!(
-			attempt.phase,
-			Phase::Plan,
-			"q04 {mode}: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unsupported_correlated_exists"),
-			"q04 {mode}'s measured wall is the unqualified correlated EXISTS (names the decorrelation ADR): {}",
+		assert_eq!(attempt.phase, Phase::Execute);
+		assert!(
+			attempt.digest.is_some(),
+			"a pass carries a digest: {}",
 			attempt.human()
 		);
 	}
 }
 
-// ADR 278: the unqualified-correlated-EXISTS error classifies precisely (not the generic query-surface bucket).
+// ADR 278/279: a genuinely-unsupported correlated EXISTS (e.g. an ambiguous ref the binder can't orient)
+// still classifies precisely as `unsupported_correlated_exists`, not the generic query-surface bucket.
 #[test]
 fn correlated_exists_error_classifies_precisely() {
 	assert_eq!(
-		reason_for_error("unsupported frontend construct: unsupported EXISTS column reference"),
+		reason_for_error("ambiguous correlated EXISTS column reference"),
 		"unsupported_correlated_exists"
 	);
 }

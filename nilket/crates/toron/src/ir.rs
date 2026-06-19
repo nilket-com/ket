@@ -1164,6 +1164,16 @@ pub enum LogicalPlan {
 		null_safe_keys: bool,
 		strategy_intent: JoinStrategyIntent,
 	},
+	/// ADR 279: a correlated EXISTS/NOT EXISTS the frontend could not classify syntactically (unqualified
+	/// correlated refs). A purely transient, pre-bind node: the binder resolves each `predicates` conjunct's
+	/// column scope (catalog-aware) into the real `LeftSemi`/`LeftAnti` `on` keys + inner residuals and emits a
+	/// `Join`, so no later pass, the executor, or the fragmenter ever sees this variant. `negated` → `LeftAnti`.
+	DeferredExists {
+		outer: Box<LogicalPlan>,
+		inner: Box<LogicalPlan>,
+		predicates: Vec<Expr>,
+		negated: bool,
+	},
 	Explain {
 		input: Box<LogicalPlan>,
 	},

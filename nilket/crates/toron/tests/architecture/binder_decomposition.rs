@@ -152,10 +152,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// plus the `bind_recursive_cte` helper and the `recursive_ctx` threading through the dispatch; ADR
 	// 263 added the `ScalarValue::Decimal128` literal coercion arms + the decimal-literal helpers; ADR 270
 	// wired the comma-join equi recognition pass into the bind entry (kept inline so the demote→recognize→
-	// bind sequence stays legible in the root, per adr209/adr216).
+	// bind sequence stays legible in the root, per adr209/adr216); ADR 279 added the `DeferredExists` bind
+	// arm + the `bind_deferred_exists` resolve (the correlated-EXISTS frontend→binder handoff, incl. its
+	// scratch-trace scope-probe binds so discarded plans don't pollute the optimizer trace).
 	assert!(
-		lines <= 5_605,
-		"binder root has {lines} lines; expected <= 5,605 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 5_706,
+		"binder root has {lines} lines; expected <= 5,706 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

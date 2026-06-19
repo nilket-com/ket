@@ -2182,6 +2182,9 @@ pub(super) fn reverse_chain_evidence(
 fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 	match plan {
 		LogicalPlan::Join { .. } => true,
+		// ADR 279: a deferred EXISTS resolves to its own semi-join; reordering only cares about joins in the
+		// outer query body.
+		LogicalPlan::DeferredExists { outer, .. } => logical_plan_contains_join(outer),
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }

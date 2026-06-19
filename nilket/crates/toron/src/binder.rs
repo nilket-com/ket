@@ -1580,6 +1580,23 @@ impl<'a> Binder<'a> {
 						PlanOptimizerFacts::composite_unknown(),
 					))
 				}
+				LogicalPlan::DeferredExists {
+					outer,
+					inner,
+					predicates,
+					negated,
+				} => {
+					self.bind_deferred_exists(
+						outer,
+						inner,
+						predicates,
+						*negated,
+						trace,
+						render_trace,
+						join_order_source_capture,
+					)
+					.await
+				}
 				LogicalPlan::Join {
 					left,
 					right,
@@ -2574,6 +2591,90 @@ impl<'a> Binder<'a> {
 			}
 			_ => None,
 		}
+	}
+
+	/// ADR 279: bind a deferred correlated EXISTS (the frontend couldn't classify its unqualified refs). Bind
+	/// both sides for their catalog-resolved scopes, classify each predicate (`column_side`-aware): correlated
+	/// equalities become join keys (outer-first), inner-only/constant predicates become an inner residual
+	/// filter, and ambiguous/outer-only/non-equi correlations reject. Then bind through the normal join path as
+	/// a `LeftSemi`/`LeftAnti` (`negated`) — so no later pass or the executor ever sees `DeferredExists`.
+	async fn bind_deferred_exists(
+		&self,
+		outer: &LogicalPlan,
+		inner: &LogicalPlan,
+		predicates: &[Expr],
+		negated: bool,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+		join_order_source_capture: JoinOrderSourceCapture,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		// Probe-bind both sides only to read their catalog-resolved scopes for classification. These binds are
+		// discarded, so they run on SCRATCH trace/render state — otherwise any joins inside the sub-plans
+		// record optimizer decisions + render edges that the real `bind_join` below then records again,
+		// corrupting EXPLAIN/replay IDs and shifting join indices off the returned plan (ADR 279 review).
+		let mut scope_trace = OptimizerTrace::default();
+		let mut scope_render = None;
+		let outer_scoped = self
+			.bind_plan_with_trace(
+				outer,
+				&mut scope_trace,
+				&mut scope_render,
+				join_order_source_capture,
+				None,
+			)
+			.await?;
+		let inner_scoped = self
+			.bind_plan_with_trace(
+				inner,
+				&mut scope_trace,
+				&mut scope_render,
+				join_order_source_capture,
+				None,
+			)
+			.await?;
+		let mut on = Vec::new();
+		let mut residuals = Vec::new();
+		for predicate in predicates {
+			match classify_deferred_exists_predicate(
+				predicate,
+				&outer_scoped.scope,
+				&inner_scoped.scope,
+			)? {
+				DeferredExistsConjunct::Correlated {
+					outer_key,
+					inner_key,
+				} => on.push((outer_key, inner_key)),
+				DeferredExistsConjunct::InnerResidual(residual) => residuals.push(residual),
+			}
+		}
+		// Re-bind through the normal join path: inner residuals filter the inner; correlated pairs are the keys.
+		let inner_logical = match residuals
+			.into_iter()
+			.reduce(|acc, next| Expr::And(Box::new(acc), Box::new(next)))
+		{
+			Some(predicate) => LogicalPlan::Filter {
+				input: Box::new(inner.clone()),
+				predicate,
+			},
+			None => inner.clone(),
+		};
+		let kind = if negated {
+			JoinKind::LeftAnti
+		} else {
+			JoinKind::LeftSemi
+		};
+		self.bind_join(
+			outer,
+			&inner_logical,
+			kind,
+			&on,
+			false,
+			JoinStrategyIntent::Auto,
+			trace,
+			render_trace,
+			join_order_source_capture,
+		)
+		.await
 	}
 
 	async fn bind_join(

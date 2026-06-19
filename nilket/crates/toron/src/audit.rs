@@ -312,6 +312,8 @@ impl StatementClass {
 			| LogicalPlan::Window { .. }
 			| LogicalPlan::Take { .. }
 			| LogicalPlan::Join { .. }
+			// ADR 279: a correlated EXISTS is a read-only SELECT shape (it resolves to a semi-join).
+			| LogicalPlan::DeferredExists { .. }
 			// ADR 255: recursive CTEs are read-only SELECT-shaped queries; both the
 			// fixpoint node and its self-reference leaf classify as Select.
 			| LogicalPlan::RecursiveCte { .. }
