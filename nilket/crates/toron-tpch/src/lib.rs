@@ -20,6 +20,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use tpchgen::generators::{
 	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
+	RegionGenerator, SupplierGenerator,
 };
 
 use toron::binder::{PlannerConfig, bind};
@@ -161,6 +162,29 @@ pub const Q10_DEV_SQL: &str = "SELECT c_custkey, c_name, \
 /// (`c_acctbal` becomes a `Decimal128` GROUP BY key).
 pub const STRICT_Q10_SQL: &str = Q10_DEV_SQL;
 
+/// ADR 277 — tpch.q05 (Local Supplier Volume): the first 6-table query, tpchgen-2.0.2's exact Q5 with `:1` →
+/// `'ASIA'`, `:2` → `'1994-01-01'`, the interval upper bound literalized to `DATE '1995-01-01'`, and `ORDER BY
+/// revenue DESC` only (no LIMIT). The first cyclic join graph — the supplier edge carries multiple equalities
+/// (`l_suppkey = s_suppkey` plus `c_nationkey = s_nationkey`). Same text both modes; only `lineitem` types
+/// differ.
+pub const Q5_DEV_SQL: &str = "SELECT n_name, \
+	SUM(l_extendedprice * (1 - l_discount)) AS revenue \
+	FROM customer, orders, lineitem, supplier, nation, region \
+	WHERE c_custkey = o_custkey \
+	  AND l_orderkey = o_orderkey \
+	  AND l_suppkey = s_suppkey \
+	  AND c_nationkey = s_nationkey \
+	  AND s_nationkey = n_nationkey \
+	  AND n_regionkey = r_regionkey \
+	  AND r_name = 'ASIA' \
+	  AND o_orderdate >= DATE '1994-01-01' \
+	  AND o_orderdate < DATE '1995-01-01' \
+	GROUP BY n_name \
+	ORDER BY revenue DESC";
+
+/// strict q05 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
+pub const STRICT_Q5_SQL: &str = Q5_DEV_SQL;
+
 /// The dev `LINEITEM` schema: the q01/q03/q06/q14 reachability subset. Money/quantity/discount/tax are
 /// `Float64`, ship date is `Date32`, string flags stay `Utf8`, and join keys are `Int64`.
 fn dev_lineitem_schema() -> SchemaRef {
@@ -176,6 +200,8 @@ fn dev_lineitem_schema() -> SchemaRef {
 		// Append join keys after earlier query columns so q01/q06 positions and digests stay stable.
 		Field::new("l_partkey", DataType::Int64, false),
 		Field::new("l_orderkey", DataType::Int64, false),
+		// ADR 277: q05 supplier join key, appended (existing queries don't reference it).
+		Field::new("l_suppkey", DataType::Int64, false),
 	]))
 }
 
@@ -207,6 +233,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut tax = Vec::new();
 	let mut partkey = Vec::new();
 	let mut orderkey = Vec::new();
+	let mut suppkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -217,6 +244,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		tax.push(item.l_tax.as_f64());
 		partkey.push(item.l_partkey);
 		orderkey.push(item.l_orderkey);
+		suppkey.push(item.l_suppkey);
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -230,6 +258,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Float64Array::from(tax)),
 			Arc::new(Int64Array::from(partkey)),
 			Arc::new(Int64Array::from(orderkey)),
+			Arc::new(Int64Array::from(suppkey)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -252,6 +281,8 @@ fn strict_lineitem_schema() -> SchemaRef {
 		// Append join keys after earlier query columns so q01/q06 positions and digests stay stable.
 		Field::new("l_partkey", DataType::Int64, false),
 		Field::new("l_orderkey", DataType::Int64, false),
+		// ADR 277: q05 supplier join key, appended (existing queries don't reference it).
+		Field::new("l_suppkey", DataType::Int64, false),
 	]))
 }
 
@@ -283,6 +314,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut tax = Vec::new();
 	let mut partkey = Vec::new();
 	let mut orderkey = Vec::new();
+	let mut suppkey = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -293,6 +325,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		tax.push(item.l_tax.into_inner() as i128);
 		partkey.push(item.l_partkey);
 		orderkey.push(item.l_orderkey);
+		suppkey.push(item.l_suppkey);
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -313,6 +346,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			decimal(tax),
 			Arc::new(Int64Array::from(partkey)),
 			Arc::new(Int64Array::from(orderkey)),
+			Arc::new(Int64Array::from(suppkey)),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -547,6 +581,92 @@ pub fn generate_nation(scale_factor: f64) -> RecordBatch {
 		],
 	)
 	.expect("nation batch")
+}
+
+/// The q05 `SUPPLIER` fixture: the two join keys q05 needs (`s_suppkey`, `s_nationkey`). No decimals → identical
+/// in dev and strict (like `nation`/`part`; q05 ignores `s_acctbal`).
+fn supplier_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("s_suppkey", DataType::Int64, false),
+		Field::new("s_nationkey", DataType::Int64, false),
+	]))
+}
+
+fn supplier_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([19; 16]),
+		1,
+		"default",
+		"supplier",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("supplier descriptor")
+}
+
+/// Generate the q05-needed `SUPPLIER` columns (`s_suppkey`, `s_nationkey`) at `scale_factor`.
+pub fn generate_supplier(scale_factor: f64) -> RecordBatch {
+	let generator = SupplierGenerator::new(scale_factor, 1, 1);
+	let mut suppkey = Vec::new();
+	let mut nationkey = Vec::new();
+	for item in generator.iter() {
+		suppkey.push(item.s_suppkey);
+		nationkey.push(item.s_nationkey);
+	}
+	RecordBatch::try_new(
+		supplier_schema(),
+		vec![
+			Arc::new(Int64Array::from(suppkey)),
+			Arc::new(Int64Array::from(nationkey)),
+		],
+	)
+	.expect("supplier batch")
+}
+
+/// The q05 `REGION` fixture: the join key + the name filter column. A fixed 5-row lookup; no decimals →
+/// identical in dev and strict.
+fn region_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("r_regionkey", DataType::Int64, false),
+		Field::new("r_name", DataType::Utf8, false),
+	]))
+}
+
+fn region_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([21; 16]),
+		1,
+		"default",
+		"region",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("region descriptor")
+}
+
+/// Generate the q05-needed `REGION` columns (`r_regionkey`, `r_name`).
+pub fn generate_region(scale_factor: f64) -> RecordBatch {
+	let generator = RegionGenerator::new(scale_factor, 1, 1);
+	let mut regionkey = Vec::new();
+	let mut name = Vec::new();
+	for item in generator.iter() {
+		regionkey.push(item.r_regionkey);
+		name.push(item.r_name.to_string());
+	}
+	RecordBatch::try_new(
+		region_schema(),
+		vec![
+			Arc::new(Int64Array::from(regionkey)),
+			Arc::new(StringArray::from(name)),
+		],
+	)
+	.expect("region batch")
 }
 
 /// Honest optimizer facts for a fixture batch: its real row count and in-memory byte size, so join
@@ -1436,6 +1556,53 @@ fn q10_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	tables
 }
 
+/// ADR 277 — dev q05: the first 6-table query (customer/orders/lineitem/supplier/nation/region). A
+/// reachability attempt — records whichever wall q05 hits first.
+pub async fn run_dev_q05(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q05",
+		"dev",
+		scale_factor,
+		Q5_DEV_SQL,
+		q05_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 277 — strict q05: the same shape with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q05(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q05",
+		"strict",
+		scale_factor,
+		STRICT_Q5_SQL,
+		q05_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The six q05 harness tables: q10's lineitem/customer/orders/nation + `supplier` + `region`.
+fn q05_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let mut tables = q10_tables(strict, scale_factor);
+	let supplier = generate_supplier(scale_factor);
+	tables.push(HarnessTable {
+		id: TableId(5),
+		name: "supplier",
+		descriptor: supplier_descriptor(supplier_schema().as_ref()),
+		facts: facts_for_batch(&supplier),
+		batch: supplier,
+	});
+	let region = generate_region(scale_factor);
+	tables.push(HarnessTable {
+		id: TableId(6),
+		name: "region",
+		descriptor: region_descriptor(region_schema().as_ref()),
+		facts: facts_for_batch(&region),
+		batch: region,
+	});
+	tables
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
 /// NOT the last measured result. Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed
 /// [`matrix`].
@@ -1444,7 +1611,11 @@ pub fn status_rows() -> Vec<String> {
 		.iter()
 		.map(|id| {
 			let state =
-				if *id == "q06" || *id == "q01" || *id == "q14" || *id == "q03" || *id == "q10" {
+				if *id == "q06"
+					|| *id == "q01" || *id == "q14"
+					|| *id == "q03" || *id == "q10"
+					|| *id == "q05"
+				{
 					"implemented"
 				} else {
 					"not_attempted"

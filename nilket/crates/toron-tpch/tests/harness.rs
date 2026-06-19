@@ -2,9 +2,9 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q6,
-	run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q6, run_strict_q10,
-	run_strict_q14, status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q05,
+	run_dev_q6, run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q05,
+	run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -220,6 +220,61 @@ fn q10_executes_in_both_modes() {
 		.expect("spawn q10 thread")
 		.join()
 		.expect("q10 thread panicked");
+}
+
+// ADR 277: q05 — the first 6-table query and the first cyclic join graph (the supplier edge carries multiple
+// equalities: l_suppkey=s_suppkey plus c_nationkey=s_nationkey). Both modes reach execute — the multi-key/
+// cyclic join recognition handled it. The sf=0.01 dev check proves the join is keyed: a 6-table cartesian
+// would be astronomically large and never complete, so finishing there is itself the proof. Runs on the
+// explicit large-stack thread (a 6-table future is deeper than q10's 4-table, which already overflowed
+// libtest's default test-thread stack).
+#[test]
+fn q05_executes_in_both_modes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q05 dev=implemented strict=implemented"),
+					"q05 is an implemented capability in the static inventory"
+				);
+				for (mode, attempt) in [
+					("dev", run_dev_q05(0.0001).await),
+					("strict", run_strict_q05(0.0001).await),
+				] {
+					assert_eq!(attempt.query, "q05");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q05 {mode} reaches execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
+				let dev_default = run_dev_q05(0.01).await;
+				assert_eq!(
+					dev_default.status,
+					Status::Pass,
+					"q05 dev reaches execute at the default scale via a keyed (non-cartesian) join: {}",
+					dev_default.human()
+				);
+				assert_eq!(dev_default.phase, Phase::Execute);
+			});
+		})
+		.expect("spawn q05 thread")
+		.join()
+		.expect("q05 thread panicked");
 }
 
 // ADR 274: the Decimal group/partition-key error classifies precisely (not the generic Decimal-carrier
