@@ -65,6 +65,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_decimal_arrow",
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
+	"unsupported_correlated_exists",
 	"unsupported_query_surface",
 ];
 
@@ -127,6 +128,13 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// two SUMs) the aggregate-projection accounting can't disambiguate. The genuine q01 prerequisite
 		// (ADR 267), distinct from the broad query-surface bucket. Checked before the generic fallback.
 		"ambiguous_aggregate_projection"
+	} else if lowered.contains("exists column reference") {
+		// ADR 278: q04's correlated EXISTS uses an UNQUALIFIED reference (`l_orderkey = o_orderkey`); the
+		// qualifier-driven `classify_exists_conjunct` can't resolve which side each column is on and rejects
+		// it at plan ("unsupported EXISTS column reference"). q04's measured first wall — the
+		// correlated-subquery class; names the decorrelation-generality ADR. Kept specific so it does not fall
+		// to the generic query-surface bucket below.
+		"unsupported_correlated_exists"
 	} else if lowered.contains("not supported") || lowered.contains("unsupported") {
 		"unsupported_query_surface"
 	} else {

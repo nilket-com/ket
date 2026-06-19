@@ -7,9 +7,9 @@ use std::process::ExitCode;
 use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
 	CACHE_ROOT, check_strict_q1, check_strict_q6, correctness_matrix, generate_dev_lineitem,
-	matrix, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q05, run_dev_q6, run_dev_q10,
-	run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q05, run_strict_q6, run_strict_q10,
-	run_strict_q14, status_rows,
+	matrix, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6,
+	run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q04, run_strict_q05,
+	run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -140,6 +140,14 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_strict_q05(sf).await
 			} else {
 				run_dev_q05(sf).await
+			}
+		}
+		// Correlated-subquery reachability attempt: orders + an EXISTS over lineitem.
+		"q04" | "q4" => {
+			if strict {
+				run_strict_q04(sf).await
+			} else {
+				run_dev_q04(sf).await
 			}
 		}
 		// Two-table decimal-ratio reachability attempt.

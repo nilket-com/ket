@@ -2,9 +2,9 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q05,
-	run_dev_q6, run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3, run_strict_q05,
-	run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04,
+	run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_strict_q1, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -275,6 +275,54 @@ fn q05_executes_in_both_modes() {
 		.expect("spawn q05 thread")
 		.join()
 		.expect("q05 thread panicked");
+}
+
+// ADR 278: q04 — the gauge's first correlated-subquery query. Its EXISTS uses an UNQUALIFIED correlated ref
+// (`l_orderkey = o_orderkey`); the qualifier-driven decorrelation classifier rejects it at PLAN
+// (`unsupported_correlated_exists`) — the measured first wall, naming the decorrelation-generality ADR. (The
+// official `+ INTERVAL '3' MONTH` bound is literal+literal, constant-folded; the EXISTS is hit first.) Blocks
+// at plan in <1 ms, so a bare test suffices — no deep execution future, no large-stack wrapper needed.
+#[tokio::test]
+async fn q04_blocks_at_plan_on_unqualified_correlated_exists() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q04 dev=implemented strict=implemented"),
+		"q04 is an implemented capability in the static inventory"
+	);
+	for (mode, attempt) in [
+		("dev", run_dev_q04(0.0001).await),
+		("strict", run_strict_q04(0.0001).await),
+	] {
+		assert_eq!(attempt.query, "q04");
+		assert_eq!(
+			attempt.status,
+			Status::Blocked,
+			"q04 {mode}: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.phase,
+			Phase::Plan,
+			"q04 {mode}: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unsupported_correlated_exists"),
+			"q04 {mode}'s measured wall is the unqualified correlated EXISTS (names the decorrelation ADR): {}",
+			attempt.human()
+		);
+	}
+}
+
+// ADR 278: the unqualified-correlated-EXISTS error classifies precisely (not the generic query-surface bucket).
+#[test]
+fn correlated_exists_error_classifies_precisely() {
+	assert_eq!(
+		reason_for_error("unsupported frontend construct: unsupported EXISTS column reference"),
+		"unsupported_correlated_exists"
+	);
 }
 
 // ADR 274: the Decimal group/partition-key error classifies precisely (not the generic Decimal-carrier

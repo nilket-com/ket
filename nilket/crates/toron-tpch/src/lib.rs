@@ -185,6 +185,26 @@ pub const Q5_DEV_SQL: &str = "SELECT n_name, \
 /// strict q05 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
 pub const STRICT_Q5_SQL: &str = Q5_DEV_SQL;
 
+/// ADR 278 — tpch.q04 (Order Priority Checking): the gauge's first correlated-subquery query, tpchgen-2.0.2's
+/// exact Q4 with `:1` → `'1993-07-01'`. The `+ INTERVAL '3' MONTH` bound is **kept official** (a `Date32 +
+/// CalendarMonthInterval` expression — both operands literal, so it may constant-fold at bind) and the
+/// `EXISTS (… l_orderkey = o_orderkey …)` is unqualified — q04 carries both new classes, and the measured
+/// first wall (plan/bind/execute) decides the next ADR. Same text both modes; only `lineitem` types differ.
+pub const Q4_DEV_SQL: &str = "SELECT o_orderpriority, COUNT(*) AS order_count \
+	FROM orders \
+	WHERE o_orderdate >= DATE '1993-07-01' \
+	  AND o_orderdate < DATE '1993-07-01' + INTERVAL '3' MONTH \
+	  AND EXISTS ( \
+	    SELECT * FROM lineitem \
+	    WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate \
+	  ) \
+	GROUP BY o_orderpriority \
+	ORDER BY o_orderpriority";
+
+/// strict q04 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types (q04 uses no
+/// `lineitem` decimals, so the modes differ only incidentally).
+pub const STRICT_Q4_SQL: &str = Q4_DEV_SQL;
+
 /// The dev `LINEITEM` schema: the q01/q03/q06/q14 reachability subset. Money/quantity/discount/tax are
 /// `Float64`, ship date is `Date32`, string flags stay `Utf8`, and join keys are `Int64`.
 fn dev_lineitem_schema() -> SchemaRef {
@@ -202,6 +222,9 @@ fn dev_lineitem_schema() -> SchemaRef {
 		Field::new("l_orderkey", DataType::Int64, false),
 		// ADR 277: q05 supplier join key, appended (existing queries don't reference it).
 		Field::new("l_suppkey", DataType::Int64, false),
+		// ADR 278: q04 EXISTS-subquery dates, appended.
+		Field::new("l_commitdate", DataType::Date32, false),
+		Field::new("l_receiptdate", DataType::Date32, false),
 	]))
 }
 
@@ -234,6 +257,8 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut partkey = Vec::new();
 	let mut orderkey = Vec::new();
 	let mut suppkey = Vec::new();
+	let mut commitdate = Vec::new();
+	let mut receiptdate = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -245,6 +270,8 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		partkey.push(item.l_partkey);
 		orderkey.push(item.l_orderkey);
 		suppkey.push(item.l_suppkey);
+		commitdate.push(item.l_commitdate.to_unix_epoch());
+		receiptdate.push(item.l_receiptdate.to_unix_epoch());
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -259,6 +286,8 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int64Array::from(partkey)),
 			Arc::new(Int64Array::from(orderkey)),
 			Arc::new(Int64Array::from(suppkey)),
+			Arc::new(Date32Array::from(commitdate)),
+			Arc::new(Date32Array::from(receiptdate)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -283,6 +312,9 @@ fn strict_lineitem_schema() -> SchemaRef {
 		Field::new("l_orderkey", DataType::Int64, false),
 		// ADR 277: q05 supplier join key, appended (existing queries don't reference it).
 		Field::new("l_suppkey", DataType::Int64, false),
+		// ADR 278: q04 EXISTS-subquery dates, appended.
+		Field::new("l_commitdate", DataType::Date32, false),
+		Field::new("l_receiptdate", DataType::Date32, false),
 	]))
 }
 
@@ -315,6 +347,8 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut partkey = Vec::new();
 	let mut orderkey = Vec::new();
 	let mut suppkey = Vec::new();
+	let mut commitdate = Vec::new();
+	let mut receiptdate = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -326,6 +360,8 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		partkey.push(item.l_partkey);
 		orderkey.push(item.l_orderkey);
 		suppkey.push(item.l_suppkey);
+		commitdate.push(item.l_commitdate.to_unix_epoch());
+		receiptdate.push(item.l_receiptdate.to_unix_epoch());
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -347,6 +383,8 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int64Array::from(partkey)),
 			Arc::new(Int64Array::from(orderkey)),
 			Arc::new(Int64Array::from(suppkey)),
+			Arc::new(Date32Array::from(commitdate)),
+			Arc::new(Date32Array::from(receiptdate)),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -492,6 +530,8 @@ fn orders_schema() -> SchemaRef {
 		Field::new("o_custkey", DataType::Int64, false),
 		Field::new("o_orderdate", DataType::Date32, false),
 		Field::new("o_shippriority", DataType::Int32, false),
+		// ADR 278: q04 GROUP BY key, appended (q03/q10 don't reference it).
+		Field::new("o_orderpriority", DataType::Utf8, false),
 	]))
 }
 
@@ -518,11 +558,13 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 	let mut custkey = Vec::new();
 	let mut orderdate = Vec::new();
 	let mut shippriority = Vec::new();
+	let mut orderpriority = Vec::new();
 	for item in generator.iter() {
 		orderkey.push(item.o_orderkey);
 		custkey.push(item.o_custkey);
 		orderdate.push(item.o_orderdate.to_unix_epoch());
 		shippriority.push(item.o_shippriority);
+		orderpriority.push(item.o_orderpriority.to_string());
 	}
 	RecordBatch::try_new(
 		orders_schema(),
@@ -531,6 +573,7 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int64Array::from(custkey)),
 			Arc::new(Date32Array::from(orderdate)),
 			Arc::new(Int32Array::from(shippriority)),
+			Arc::new(StringArray::from(orderpriority)),
 		],
 	)
 	.expect("orders batch")
@@ -1603,6 +1646,63 @@ fn q05_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	tables
 }
 
+/// ADR 278 — dev q04: the first correlated-subquery query (orders + an EXISTS over lineitem). A reachability
+/// attempt — records whichever wall q04 hits first (date-interval or the unqualified correlated EXISTS).
+pub async fn run_dev_q04(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q04",
+		"dev",
+		scale_factor,
+		Q4_DEV_SQL,
+		q04_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 278 — strict q04: the same shape with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q04(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q04",
+		"strict",
+		scale_factor,
+		STRICT_Q4_SQL,
+		q04_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The two q04 harness tables: `orders` (the FROM) + the mode-sensitive `lineitem` (the EXISTS subquery's
+/// relation). q04 references no customer/nation/etc.
+fn q04_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	let orders = generate_orders(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
+		},
+	]
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
 /// NOT the last measured result. Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed
 /// [`matrix`].
@@ -1614,7 +1714,7 @@ pub fn status_rows() -> Vec<String> {
 				if *id == "q06"
 					|| *id == "q01" || *id == "q14"
 					|| *id == "q03" || *id == "q10"
-					|| *id == "q05"
+					|| *id == "q05" || *id == "q04"
 				{
 					"implemented"
 				} else {
