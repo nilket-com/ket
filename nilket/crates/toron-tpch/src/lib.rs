@@ -571,6 +571,19 @@ pub async fn run_strict_q6(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// Validate an explicit `--sf` (scale-factor) value: it must be a **finite, strictly-positive** number.
+/// Malformed (unparseable), zero, negative, NaN, and infinite values are *usage* errors — the CLI maps the
+/// `Err` to a harness error (exit 2, no telemetry row), per ADR 261's "a bad arg is a harness error, not a
+/// query `blocked`/`fail`" boundary. Keeps degenerate scales out of `reachability.jsonl`.
+pub fn parse_scale_factor(raw: &str) -> Result<f64, String> {
+	match raw.parse::<f64>() {
+		Ok(sf) if sf.is_finite() && sf > 0.0 => Ok(sf),
+		_ => Err(format!(
+			"--sf must be a finite, positive number (got {raw:?})"
+		)),
+	}
+}
+
 /// The scale q14 is measured at. q14's comma-join is admitted as a broadcast cross-join + residual
 /// equi-filter (the equality is not yet lifted into a join *key* — that recognition is ADR 270), so it
 /// rides an O(lineitem × part) cartesian. That is correct but only tractable at this tiny gauge scale; at

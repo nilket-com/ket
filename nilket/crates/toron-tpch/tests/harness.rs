@@ -2,8 +2,8 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, Q14_GAUGE_SCALE, matrix_from_log, resolve_q14_scale, run_dev_q1, run_dev_q6,
-	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	ALL_QUERY_IDS, Q14_GAUGE_SCALE, matrix_from_log, parse_scale_factor, resolve_q14_scale,
+	run_dev_q1, run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
 
 #[tokio::test]
@@ -139,6 +139,29 @@ fn q14_scale_is_capped_at_the_gauge_scale() {
 		resolve_q14_scale(Some(0.01)).is_err(),
 		"a larger explicit --sf is refused (the cartesian would hang)"
 	);
+}
+
+// CLI hygiene (ADR 261 boundary): a `--sf` value must be a finite, positive number. Malformed / zero /
+// negative / NaN / infinite is a usage error (the CLI maps it to exit 2 with no telemetry row) — degenerate
+// scales never accumulate as `reachability.jsonl` rows.
+#[test]
+fn sf_parsing_rejects_nonpositive_and_malformed() {
+	assert_eq!(
+		parse_scale_factor("0.01"),
+		Ok(0.01),
+		"a normal scale parses"
+	);
+	assert_eq!(
+		parse_scale_factor("0.0001"),
+		Ok(0.0001),
+		"the gauge scale parses"
+	);
+	for bad in ["nope", "0", "-1", "NaN", "nan", "inf", "-inf", "infinity"] {
+		assert!(
+			parse_scale_factor(bad).is_err(),
+			"--sf {bad:?} must be a usage error, not a silently-coerced scale"
+		);
+	}
 }
 
 #[test]

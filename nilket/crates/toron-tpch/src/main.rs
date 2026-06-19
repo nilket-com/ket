@@ -6,9 +6,12 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, generate_dev_lineitem, matrix, resolve_q14_scale, run_dev_q1, run_dev_q6,
-	run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
+	CACHE_ROOT, generate_dev_lineitem, matrix, parse_scale_factor, resolve_q14_scale, run_dev_q1,
+	run_dev_q6, run_dev_q14, run_strict_q1, run_strict_q6, run_strict_q14, status_rows,
 };
+
+/// The default scale factor when `--sf` is omitted (a tiny reachability scale).
+const DEFAULT_SF: f64 = 0.01;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,7 +27,10 @@ async fn main() -> ExitCode {
 			ExitCode::SUCCESS
 		}
 		"prepare" => {
-			let sf = sf_arg(&args);
+			let sf = match resolved_sf(&args) {
+				Ok(sf) => sf,
+				Err(message) => return harness_error(&message),
+			};
 			let batch = generate_dev_lineitem(sf);
 			let _ = std::fs::create_dir_all(CACHE_ROOT);
 			println!(
@@ -47,7 +53,11 @@ async fn main() -> ExitCode {
 async fn run_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("dev");
-	let sf = sf_arg(args);
+	let explicit = match explicit_sf(args) {
+		Ok(explicit) => explicit,
+		Err(message) => return harness_error(&message),
+	};
+	let sf = explicit.unwrap_or(DEFAULT_SF);
 	let allow_blocked = args.iter().any(|arg| arg == "--allow-blocked");
 
 	let strict = mode == "strict";
@@ -70,13 +80,10 @@ async fn run_command(args: &[String]) -> ExitCode {
 		// ADR 269 adds q14 (the first multi-table query) as a reachability attempt. It rides a broadcast
 		// cartesian until comma-join recognition (ADR 270), so it is scale-capped: default to the gauge
 		// scale and refuse a larger explicit --sf (a harness error, exit 2) rather than hang.
-		"q14" => match resolve_q14_scale(explicit_sf(args)) {
+		"q14" => match resolve_q14_scale(explicit) {
 			Ok(sf) if strict => run_strict_q14(sf).await,
 			Ok(sf) => run_dev_q14(sf).await,
-			Err(message) => {
-				eprintln!("{message}");
-				return ExitCode::from(2);
-			}
+			Err(message) => return harness_error(&message),
 		},
 		_ => Attempt {
 			query: query.to_string(),
@@ -123,13 +130,26 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 		.map(String::as_str)
 }
 
-/// The explicitly-passed `--sf`, if any (parsed). `None` means "use the per-query default".
-fn explicit_sf(args: &[String]) -> Option<f64> {
-	flag_value(args, "--sf").and_then(|value| value.parse().ok())
+/// The explicitly-passed, validated `--sf`. `Ok(None)` means the flag was absent (use the default);
+/// `Ok(Some(sf))` is a finite, positive scale; `Err` is a malformed / zero / negative / NaN / infinite
+/// value — a usage error the caller turns into [`harness_error`]. See [`parse_scale_factor`].
+fn explicit_sf(args: &[String]) -> Result<Option<f64>, String> {
+	match flag_value(args, "--sf") {
+		None => Ok(None),
+		Some(raw) => parse_scale_factor(raw).map(Some),
+	}
 }
 
-fn sf_arg(args: &[String]) -> f64 {
-	explicit_sf(args).unwrap_or(0.01)
+/// The resolved scale: a validated `--sf` if present, else [`DEFAULT_SF`].
+fn resolved_sf(args: &[String]) -> Result<f64, String> {
+	explicit_sf(args).map(|explicit| explicit.unwrap_or(DEFAULT_SF))
+}
+
+/// Print a usage error and exit 2 — a *harness* error (bad arg), distinct from a query `blocked`/`fail`
+/// (ADR 261). No telemetry row is emitted.
+fn harness_error(message: &str) -> ExitCode {
+	eprintln!("{message}");
+	ExitCode::from(2)
 }
 
 fn usage() -> ExitCode {
