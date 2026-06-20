@@ -100,8 +100,11 @@ pub(crate) fn adr257_scalar_subquery_pulls_up_into_cross() {
 
 #[test]
 pub(crate) fn adr257_scalar_subquery_pull_up_is_frontend_lowering_only() {
-	// The recombination reuses the existing Cross/broadcast executor — no new IR node or execution op. The
-	// pull-up lives only in the planner.
+	// The pull-up + recombination of CLASSIFIABLE scalars (257 uncorrelated, 260 qualified-correlated) live
+	// only in the planner and reuse the existing Cross/broadcast executor. (ADR 282 adds a transient
+	// `DeferredScalarSubquery` node + `bind_deferred_scalar_subquery` resolve for the one case the catalog-free
+	// planner CANNOT classify — an unqualified correlated ref; that handoff is exempt from this guard, which
+	// still pins that the pull-up function + `__scalar_` synthesis stay out of the IR/executor/fragmenter.)
 	assert!(
 		source("src/sql_planner.rs").contains("fn pull_up_scalar_subqueries"),
 		"the scalar-subquery pull-up lives in the planner"

@@ -154,10 +154,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// wired the comma-join equi recognition pass into the bind entry (kept inline so the demote→recognize→
 	// bind sequence stays legible in the root, per adr209/adr216); ADR 279 added the `DeferredExists` bind
 	// arm + the `bind_deferred_exists` resolve (the correlated-EXISTS frontend→binder handoff, incl. its
-	// scratch-trace scope-probe binds so discarded plans don't pollute the optimizer trace).
+	// scratch-trace scope-probe binds so discarded plans don't pollute the optimizer trace); ADR 282 added the
+	// `DeferredScalarSubquery` bind arm + the `bind_deferred_scalar_subquery` resolve (the correlated-scalar
+	// frontend→binder handoff, reusing the same scratch-trace + ownership-classification machinery).
 	assert!(
-		lines <= 5_706,
-		"binder root has {lines} lines; expected <= 5,706 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 5_843,
+		"binder root has {lines} lines; expected <= 5,843 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -202,6 +204,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/aggregate_projection_accounting_test.rs",
 				"crates/toron/tests/catalog_logical_identity_test.rs",
 				"crates/toron/tests/clause_accounting_test.rs",
+				"crates/toron/tests/correlated_scalar_test.rs",
 				"crates/toron/tests/cross_join_test.rs",
 				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/exists_decorrelation_test.rs",

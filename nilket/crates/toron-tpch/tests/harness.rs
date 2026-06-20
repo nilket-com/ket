@@ -311,44 +311,59 @@ async fn q04_executes_in_both_modes() {
 	}
 }
 
-// ADR 281: q17 — the correlated-scalar-subquery probe — walls at BIND in both modes. The binder resolves the
-// scalar subquery's UNqualified outer ref `p_partkey` against the inner `lineitem` scope and fails with a
-// generic `UnknownColumn { column: "p_partkey" }`. That message is too generic to allowlist as a recognized
-// blocker (it would mask real column-resolution bugs), so this is an HONEST `fail`, not a `blocked` — naming
-// the correlated-scalar outer-ref resolution cut (the scalar analogue of ADR 279's EXISTS work). Walls in
-// <2 ms at bind, so a bare test suffices.
+// ADR 282: q17 — the correlated-scalar-subquery probe. ADR 282 resolved its UNqualified correlated ref
+// `l_partkey = p_partkey` in the binder (inner-first ownership: the inner `lineitem` shadows the outer
+// `lineitem`, so `l_partkey` is inner, `p_partkey` the outer correlation key), folding the `0.2 * AVG(...)`
+// wrapper onto the rewritten outer expression. DEV reaches execute (the `Float64` proxy). STRICT advances PAST
+// the resolution to the next wall — `0.2`/`7.0` are `Float64` literals against the official `Decimal128`
+// columns — a recognized `unsupported_decimal_scalar` blocker, the Decimal-literal-typing cut named for
+// ADR 283.
+//
+// This is a REACHABILITY probe: at sf=0.0001 no `part` matches `Brand#23`+`MED BOX`, so the result is empty
+// and the correlated recombine is not exercised with data. The resolution's behavioral correctness (over
+// matching rows, and the inner-residual + comma-join-fold gaps) is locked by the engine-level
+// `correlated_scalar_test.rs`. The ADR 282 review also fixed the default-scale (sf=0.01) cartesian: the
+// comma join's bridging equality was stranded above the deferred recombine, so `part`×`lineitem` ran as a
+// materialized cartesian (OOM) — it now folds to a keyed join.
 #[tokio::test]
-async fn q17_fails_at_bind_on_unqualified_correlated_scalar() {
+async fn q17_dev_executes_strict_hits_decimal_literal_wall() {
 	assert!(
 		status_rows()
 			.iter()
 			.any(|row| row == "q17 dev=implemented strict=implemented"),
 		"q17 is an implemented capability in the static inventory"
 	);
-	for (mode, attempt) in [
-		("dev", run_dev_q17(0.01).await),
-		("strict", run_strict_q17(0.01).await),
-	] {
-		assert_eq!(attempt.query, "q17");
-		assert_eq!(
-			attempt.status,
-			Status::Fail,
-			"q17 {mode} walls at bind (unqualified correlated scalar ref): {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.phase,
-			Phase::Bind,
-			"q17 {mode}: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unrecognized"),
-			"q17 {mode}'s bind error is a generic UnknownColumn, honestly unrecognized (not a recognized blocker): {}",
-			attempt.human()
-		);
-	}
+
+	let dev = run_dev_q17(0.0001).await;
+	assert_eq!(dev.query, "q17");
+	assert_eq!(
+		dev.status,
+		Status::Pass,
+		"dev q17 reaches execute (the correlated scalar resolves): {}",
+		dev.human()
+	);
+	assert_eq!(dev.phase, Phase::Execute);
+	assert!(
+		dev.digest.is_some(),
+		"a pass carries a digest: {}",
+		dev.human()
+	);
+
+	let strict = run_strict_q17(0.0001).await;
+	assert_eq!(strict.query, "q17");
+	assert_eq!(
+		strict.status,
+		Status::Blocked,
+		"strict q17 advances past the correlated-scalar resolution to the Decimal-literal wall: {}",
+		strict.human()
+	);
+	assert_eq!(strict.phase, Phase::Bind, "strict q17: {}", strict.human());
+	assert_eq!(
+		strict.reason.as_deref(),
+		Some("unsupported_decimal_scalar"),
+		"strict q17's next wall is the 0.2/7.0 Float-vs-Decimal literal typing (names ADR 283): {}",
+		strict.human()
+	);
 }
 
 // ADR 278/279: a genuinely-unsupported correlated EXISTS (e.g. an ambiguous ref the binder can't orient)

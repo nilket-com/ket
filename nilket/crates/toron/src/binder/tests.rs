@@ -21302,6 +21302,10 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 			collect_logical_join_kinds(outer, kinds);
 			collect_logical_join_kinds(inner, kinds);
 		}
+		LogicalPlan::DeferredScalarSubquery { outer, inner, .. } => {
+			collect_logical_join_kinds(outer, kinds);
+			collect_logical_join_kinds(inner, kinds);
+		}
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }

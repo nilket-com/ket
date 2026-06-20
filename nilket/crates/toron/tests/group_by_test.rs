@@ -3352,23 +3352,40 @@ async fn aggregate_derived_having_binds_and_executes() {
 	);
 }
 
-#[tokio::test]
-async fn sql_aggregate_derived_top_k_executes() {
-	let results = run_logical(&plan_sql(
-		"SELECT bucket, total \
-		 FROM (SELECT region AS bucket, SUM(amount) AS total FROM sales GROUP BY region \
-		       ORDER BY SUM(amount) + 1 DESC LIMIT 2) AS p \
-		 WHERE total > 0",
-	))
-	.await;
+// Runs on an explicit large stack: this derived-table top-k's bind+execute future recursion overflows
+// libtest's default ~2MB test-thread stack (cumulative bind-dispatch frame growth; deep but finite — the CLI
+// and production run it fine on their larger stacks). Same treatment as `q10_executes_in_both_modes` in the
+// tpch harness. (Pre-existing; surfaced when running the full suite — unrelated to the deferred-scalar path.)
+#[test]
+fn sql_aggregate_derived_top_k_executes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let results = run_logical(&plan_sql(
+					"SELECT bucket, total \
+					 FROM (SELECT region AS bucket, SUM(amount) AS total FROM sales GROUP BY region \
+					       ORDER BY SUM(amount) + 1 DESC LIMIT 2) AS p \
+					 WHERE total > 0",
+				))
+				.await;
 
-	assert_eq!(
-		ordered_region_sum_rows(&results),
-		vec![
-			(Some("east".to_string()), Some(40)),
-			(Some("west".to_string()), Some(20)),
-		]
-	);
+				assert_eq!(
+					ordered_region_sum_rows(&results),
+					vec![
+						(Some("east".to_string()), Some(40)),
+						(Some("west".to_string()), Some(20)),
+					]
+				);
+			});
+		})
+		.expect("spawn derived-top-k thread")
+		.join()
+		.expect("derived-top-k thread panicked");
 }
 
 #[tokio::test]
@@ -5526,7 +5543,8 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
-		| LogicalPlan::DeferredExists { .. } => false,
+		| LogicalPlan::DeferredExists { .. }
+		| LogicalPlan::DeferredScalarSubquery { .. } => false,
 	}
 }
 
@@ -5565,7 +5583,8 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
-		| LogicalPlan::DeferredExists { .. } => false,
+		| LogicalPlan::DeferredExists { .. }
+		| LogicalPlan::DeferredScalarSubquery { .. } => false,
 	}
 }
 

@@ -2185,6 +2185,8 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		// ADR 279: a deferred EXISTS resolves to its own semi-join; reordering only cares about joins in the
 		// outer query body.
 		LogicalPlan::DeferredExists { outer, .. } => logical_plan_contains_join(outer),
+		// ADR 282: a deferred scalar subquery resolves to its own LeftOuter; reordering cares about the outer body.
+		LogicalPlan::DeferredScalarSubquery { outer, .. } => logical_plan_contains_join(outer),
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }

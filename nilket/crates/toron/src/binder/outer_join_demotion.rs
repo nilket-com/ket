@@ -346,6 +346,25 @@ impl<'a> Binder<'a> {
 					predicates: predicates.clone(),
 					negated: *negated,
 				}),
+				LogicalPlan::DeferredScalarSubquery {
+					outer,
+					inner,
+					predicates,
+					aggregate,
+					alias,
+				} => Ok(LogicalPlan::DeferredScalarSubquery {
+					outer: Box::new(
+						self.demote_null_rejected_outer_joins_inner(outer, receipts)
+							.await?,
+					),
+					inner: Box::new(
+						self.demote_null_rejected_outer_joins_inner(inner, receipts)
+							.await?,
+					),
+					predicates: predicates.clone(),
+					aggregate: aggregate.clone(),
+					alias: alias.clone(),
+				}),
 				// ADR 255: opaque-local — a recursive CTE's body is bound separately; outer-join
 				// demotion does not rewrite inside it, and its self-reference is a leaf.
 				LogicalPlan::RecursiveCte { .. }
@@ -389,6 +408,14 @@ impl<'a> Binder<'a> {
 						} => {
 							let conjuncts = split_logical_and_conjuncts(predicate);
 							self.lift_cross_equi(*left, *right, strategy_intent, conjuncts)
+								.await
+						}
+						// ADR 282: a deferred scalar subquery's recombine sits between the WHERE filter and the
+						// comma-join Cross it filters; push the outer-only conjuncts down so the recognizer can
+						// key the comma join. Kept in a separate future (like `lift_cross_equi`) so this
+						// recursive dispatch's poll frame stays small (deep plans share its stack).
+						input @ LogicalPlan::DeferredScalarSubquery { .. } => {
+							self.push_deferred_scalar_outer_filter(input, predicate)
 								.await
 						}
 						other => Ok(LogicalPlan::Filter {
@@ -525,6 +552,19 @@ impl<'a> Binder<'a> {
 					predicates: predicates.clone(),
 					negated: *negated,
 				}),
+				LogicalPlan::DeferredScalarSubquery {
+					outer,
+					inner,
+					predicates,
+					aggregate,
+					alias,
+				} => Ok(LogicalPlan::DeferredScalarSubquery {
+					outer: Box::new(self.recognize_cross_equi_joins(outer).await?),
+					inner: Box::new(self.recognize_cross_equi_joins(inner).await?),
+					predicates: predicates.clone(),
+					aggregate: aggregate.clone(),
+					alias: alias.clone(),
+				}),
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
 				| LogicalPlan::Scan { .. }
@@ -538,6 +578,56 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Update { .. }
 				| LogicalPlan::Insert { .. } => Ok(plan.clone()),
 			}
+		})
+	}
+
+	/// ADR 282 helper: filter pushdown through a deferred scalar subquery recombine. The recombine sits
+	/// between a WHERE filter and the comma-join `Cross` it filters, so the bridging equality
+	/// (`p_partkey = l_partkey`) is stranded above where [`recognize_cross_equi_joins`] can't key it — and the
+	/// comma join would execute as a materialized cartesian. Push the conjuncts that do NOT reference the
+	/// scalar value down into the outer (a valid pushdown through the left-preserving recombine; recurse so
+	/// the recognizer keys the comma join), and keep the value-referencing conjuncts above. A separate future
+	/// (like [`lift_cross_equi`]) so the deep-recursing dispatch's poll frame stays small.
+	fn push_deferred_scalar_outer_filter<'b>(
+		&'b self,
+		recombine: LogicalPlan,
+		predicate: &'b Expr,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let LogicalPlan::DeferredScalarSubquery {
+				outer,
+				inner,
+				predicates,
+				aggregate,
+				alias,
+			} = recombine
+			else {
+				unreachable!(
+					"push_deferred_scalar_outer_filter is only called on a DeferredScalarSubquery"
+				);
+			};
+			let alias_ref = TableRef::new(alias.clone());
+			let (above, pushed): (Vec<Expr>, Vec<Expr>) = split_logical_and_conjuncts(predicate)
+				.into_iter()
+				.partition(|conjunct| {
+					expr_any_column(conjunct, &|column_ref| {
+						column_ref.qualifier.as_ref() == Some(&alias_ref)
+					})
+				});
+			let outer = if pushed.is_empty() {
+				outer
+			} else {
+				let pushed_outer = push_logical_filter_conjuncts(*outer, pushed);
+				Box::new(self.recognize_cross_equi_joins(&pushed_outer).await?)
+			};
+			let recombine = LogicalPlan::DeferredScalarSubquery {
+				outer,
+				inner,
+				predicates,
+				aggregate,
+				alias,
+			};
+			Ok(wrap_residual_filter(recombine, above))
 		})
 	}
 
@@ -720,7 +810,8 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::InsertSelect { .. }
 				// ADR 279: opaque for outer-demotion column routing — demotion does not cross a deferred
 				// EXISTS (it is resolved to a real Join afterward).
-				| LogicalPlan::DeferredExists { .. } => Ok(None),
+				| LogicalPlan::DeferredExists { .. }
+				| LogicalPlan::DeferredScalarSubquery { .. } => Ok(None),
 			}
 		})
 	}
@@ -1118,7 +1209,8 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Insert { .. }
 				| LogicalPlan::InsertSelect { .. }
 					// ADR 279: conjuncts don't route through a deferred EXISTS; keep them as a residual above.
-					| LogicalPlan::DeferredExists { .. }) => Ok(RoutedConjuncts {
+					| LogicalPlan::DeferredExists { .. }
+					| LogicalPlan::DeferredScalarSubquery { .. }) => Ok(RoutedConjuncts {
 					input: stopped,
 					residual: routed_originals(conjuncts),
 					receipts: Vec::new(),
@@ -1395,6 +1487,56 @@ fn push_logical_filter_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> Lo
 
 fn wrap_residual_filter(input: LogicalPlan, residual: Vec<Expr>) -> LogicalPlan {
 	push_logical_filter_conjuncts(input, residual)
+}
+
+/// ADR 282: does any column in `expr` satisfy `predicate`? A focused expression walker reused by the
+/// deferred-scalar filter pushdown (qualifier match) and the deferred-scalar correlation classifier
+/// (outer-ownership match). Mirrors [`conjunct_column_sides`]'s variant coverage and is exhaustive, so a
+/// new `Expr` variant forces an update here too.
+fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> bool {
+	match expr {
+		Expr::Column(column_ref) => predicate(column_ref),
+		Expr::Literal(_) | Expr::UntypedNull => false,
+		Expr::LogicalAscription { expr, .. }
+		| Expr::SqlLogicalCast { expr, .. }
+		| Expr::SqlConvert { expr, .. } => expr_any_column(expr, predicate),
+		Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _)
+		| Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner) => expr_any_column(inner, predicate),
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => expr_any_column(left, predicate) || expr_any_column(right, predicate),
+		Expr::InList { expr, list, .. } => {
+			expr_any_column(expr, predicate)
+				|| list.iter().any(|item| expr_any_column(item, predicate))
+		}
+		Expr::Like { expr, .. } => expr_any_column(expr, predicate),
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			when_then.iter().any(|(when_expr, then_expr)| {
+				expr_any_column(when_expr, predicate) || expr_any_column(then_expr, predicate)
+			}) || else_expr
+				.as_ref()
+				.is_some_and(|else_expr| expr_any_column(else_expr, predicate))
+		}
+	}
 }
 
 fn demoted_join_kind(kind: JoinKind, rejected: NullRejectedSides) -> Option<JoinKind> {
@@ -1741,6 +1883,88 @@ fn column_only_side(
 		Expr::Column(column_ref) => column_side(column_ref, outer_scope, inner_scope),
 		_ => None,
 	}
+}
+
+/// ADR 282: inner-first column ownership for a deferred scalar subquery's correlation. SQL subquery scoping
+/// resolves an unqualified column in the INNER scope first (it shadows the outer), so a column resolvable in
+/// `inner_scope` is inner even when the same relation also appears in `outer_scope` (q17's inner `lineitem`
+/// shadows the outer `lineitem` — symmetric `column_side` would wrongly flag `l_partkey` ambiguous). A column
+/// resolvable only in `outer_scope` is the correlated outer ref. `Left` = outer, `Right` = inner.
+fn scalar_column_side(
+	column_ref: &ColumnRef,
+	outer_scope: &RelationScope,
+	inner_scope: &RelationScope,
+) -> Option<LogicalJoinSide> {
+	if inner_scope
+		.resolve_join_column(column_ref, "right")
+		.ok()
+		.flatten()
+		.is_some()
+	{
+		Some(LogicalJoinSide::Right)
+	} else if outer_scope
+		.resolve_join_column(column_ref, "left")
+		.ok()
+		.flatten()
+		.is_some()
+	{
+		Some(LogicalJoinSide::Left)
+	} else {
+		None
+	}
+}
+
+/// ADR 282: classify a deferred correlated-scalar predicate by inner-first ownership — the binder-side
+/// analogue of [`classify_deferred_exists_predicate`]. A predicate that references no outer-owned column
+/// (inner-only or constant, e.g. `dim.active = true`) is kept as an inner residual exactly as the EXISTS
+/// classifier does (review parity fix — the simple-column-equality requirement is only for predicates that
+/// actually correlate). A predicate that references the outer must be a simple column equality with one
+/// outer-owned side and one inner-owned side, which becomes a correlation key (outer-first); anything else
+/// (outer-only, non-equi, non-column) rejects as out of scope.
+pub(super) fn classify_deferred_scalar_predicate(
+	predicate: &Expr,
+	outer_scope: &RelationScope,
+	inner_scope: &RelationScope,
+) -> Result<DeferredExistsConjunct, BindingError> {
+	let references_outer = expr_any_column(predicate, &|column_ref| {
+		matches!(
+			scalar_column_side(column_ref, outer_scope, inner_scope),
+			Some(LogicalJoinSide::Left)
+		)
+	});
+	if !references_outer {
+		// No outer reference → an inner-only (or constant) predicate; keep it on the inner side.
+		return Ok(DeferredExistsConjunct::InnerResidual(predicate.clone()));
+	}
+	// References the outer → must be a simple correlated equality (one outer column = one inner column).
+	if let Expr::Eq(left, right) = predicate {
+		let left_side = match left.as_ref() {
+			Expr::Column(column_ref) => scalar_column_side(column_ref, outer_scope, inner_scope),
+			_ => None,
+		};
+		let right_side = match right.as_ref() {
+			Expr::Column(column_ref) => scalar_column_side(column_ref, outer_scope, inner_scope),
+			_ => None,
+		};
+		match (left_side, right_side) {
+			(Some(LogicalJoinSide::Left), Some(LogicalJoinSide::Right)) => {
+				return Ok(DeferredExistsConjunct::Correlated {
+					outer_key: (**left).clone(),
+					inner_key: (**right).clone(),
+				});
+			}
+			(Some(LogicalJoinSide::Right), Some(LogicalJoinSide::Left)) => {
+				return Ok(DeferredExistsConjunct::Correlated {
+					outer_key: (**right).clone(),
+					inner_key: (**left).clone(),
+				});
+			}
+			_ => {}
+		}
+	}
+	Err(BindingError::UnsupportedExpression {
+		message: "unsupported correlated scalar subquery predicate".to_string(),
+	})
 }
 
 fn non_null_literal(expr: &Expr) -> bool {

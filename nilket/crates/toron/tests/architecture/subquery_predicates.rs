@@ -259,6 +259,10 @@ pub(crate) fn adr260_correlated_aggregate_scalar_decorrelates_via_grouped_left_o
 
 #[test]
 pub(crate) fn adr260_correlated_scalar_is_frontend_only() {
+	// The QUALIFIED-correlated decorrelation construction lives in the planner. (ADR 282 carves out the one
+	// case the catalog-free planner cannot classify — an UNqualified correlated ref — handing it to the binder
+	// via the transient `DeferredScalarSubquery` node + `bind_deferred_scalar_subquery`; that handoff is exempt.
+	// This guard still pins that the planner-side decorrelation function stays out of the IR/executor/fragmenter.)
 	assert!(
 		source("src/sql_planner.rs").contains("fn join_scalar_subplans"),
 		"the scalar decorrelation lives in the planner"

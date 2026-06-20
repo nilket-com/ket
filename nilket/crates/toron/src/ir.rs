@@ -1174,6 +1174,20 @@ pub enum LogicalPlan {
 		predicates: Vec<Expr>,
 		negated: bool,
 	},
+	/// ADR 282: a correlated scalar subquery the frontend could not classify syntactically (an unqualified
+	/// correlated ref), the scalar analogue of [`LogicalPlan::DeferredExists`]. Transient + pre-bind: the binder
+	/// resolves each `predicates` conjunct's column scope (catalog-aware) into the correlation keys, builds the
+	/// grouped-aggregate + `LeftOuter` recombine ADR 260 builds (a global aggregate when no correlation pair is
+	/// found), and emits a `Join` exposing `<alias>.value` — so no later pass, the executor, or the fragmenter
+	/// ever sees this variant. The projection's scalar wrapper (e.g. `0.2 *`) already rides the rewritten outer
+	/// expression in `outer` (which references `<alias>.value`); the subplan computes the bare `aggregate`.
+	DeferredScalarSubquery {
+		outer: Box<LogicalPlan>,
+		inner: Box<LogicalPlan>,
+		predicates: Vec<Expr>,
+		aggregate: (AggregateFunction, Vec<Expr>),
+		alias: String,
+	},
 	Explain {
 		input: Box<LogicalPlan>,
 	},

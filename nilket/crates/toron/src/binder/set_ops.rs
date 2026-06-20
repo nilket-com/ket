@@ -181,6 +181,10 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 			.or_else(|| distinct_input_unsupported_message(right)),
 		// ADR 279: a deferred EXISTS resolves to a semi-join whose output is the outer rows.
 		LogicalPlan::DeferredExists { outer, .. } => distinct_input_unsupported_message(outer),
+		// ADR 282: a deferred scalar subquery resolves to a LeftOuter whose output is the outer rows.
+		LogicalPlan::DeferredScalarSubquery { outer, .. } => {
+			distinct_input_unsupported_message(outer)
+		}
 		LogicalPlan::Union { left, right } => distinct_input_unsupported_message(left)
 			.or_else(|| distinct_input_unsupported_message(right)),
 		LogicalPlan::SetOpAll { left, right, .. } => distinct_input_unsupported_message(left)

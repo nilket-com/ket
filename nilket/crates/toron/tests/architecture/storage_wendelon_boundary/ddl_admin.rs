@@ -267,7 +267,7 @@ pub(crate) fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 28);
+	assert_eq!(enum_variant_count(logical_plan), 29);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
@@ -834,7 +834,7 @@ pub(crate) fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 28);
+	assert_eq!(enum_variant_count(logical_plan), 29);
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));

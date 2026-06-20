@@ -1597,6 +1597,25 @@ impl<'a> Binder<'a> {
 					)
 					.await
 				}
+				LogicalPlan::DeferredScalarSubquery {
+					outer,
+					inner,
+					predicates,
+					aggregate,
+					alias,
+				} => {
+					self.bind_deferred_scalar_subquery(
+						outer,
+						inner,
+						predicates,
+						aggregate,
+						alias,
+						trace,
+						render_trace,
+						join_order_source_capture,
+					)
+					.await
+				}
 				LogicalPlan::Join {
 					left,
 					right,
@@ -2666,6 +2685,124 @@ impl<'a> Binder<'a> {
 		self.bind_join(
 			outer,
 			&inner_logical,
+			kind,
+			&on,
+			false,
+			JoinStrategyIntent::Auto,
+			trace,
+			render_trace,
+			join_order_source_capture,
+		)
+		.await
+	}
+
+	/// ADR 282: bind a deferred correlated scalar subquery (the frontend couldn't classify its unqualified
+	/// ref). Probe-bind both sides on scratch trace/render for their scopes, classify each predicate by
+	/// `column_side` ownership (reusing the EXISTS classifier) into correlation key pairs + inner residuals,
+	/// then build ADR 260's shape directly — a grouped aggregate keyed on the inner correlation keys, aliased
+	/// `<alias>[key_i…, value]`, recombined via `LeftOuter` (or a keyless `Cross` when uncorrelated). The
+	/// projection wrapper already rides the rewritten outer expression (which references `<alias>.value`).
+	async fn bind_deferred_scalar_subquery(
+		&self,
+		outer: &LogicalPlan,
+		inner: &LogicalPlan,
+		predicates: &[Expr],
+		aggregate: &(AggregateFunction, Vec<Expr>),
+		alias: &str,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+		join_order_source_capture: JoinOrderSourceCapture,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		// Probe-bind both sides on scratch trace/render state for their scopes (ADR 279 review fix).
+		let mut scope_trace = OptimizerTrace::default();
+		let mut scope_render = None;
+		let outer_scoped = self
+			.bind_plan_with_trace(
+				outer,
+				&mut scope_trace,
+				&mut scope_render,
+				join_order_source_capture,
+				None,
+			)
+			.await?;
+		let inner_scoped = self
+			.bind_plan_with_trace(
+				inner,
+				&mut scope_trace,
+				&mut scope_render,
+				join_order_source_capture,
+				None,
+			)
+			.await?;
+		let mut pairs: Vec<(Expr, Expr)> = Vec::new();
+		let mut residuals: Vec<Expr> = Vec::new();
+		for predicate in predicates {
+			match classify_deferred_scalar_predicate(
+				predicate,
+				&outer_scoped.scope,
+				&inner_scoped.scope,
+			)? {
+				DeferredExistsConjunct::Correlated {
+					outer_key,
+					inner_key,
+				} => pairs.push((outer_key, inner_key)),
+				DeferredExistsConjunct::InnerResidual(residual) => residuals.push(residual),
+			}
+		}
+		// Inner residual filter, then group + aggregate on the inner correlation keys (ADR 260's shape).
+		let inner_filtered = match residuals
+			.into_iter()
+			.reduce(|acc, next| Expr::And(Box::new(acc), Box::new(next)))
+		{
+			Some(predicate) => LogicalPlan::Filter {
+				input: Box::new(inner.clone()),
+				predicate,
+			},
+			None => inner.clone(),
+		};
+		let group_expr: Vec<Expr> = pairs
+			.iter()
+			.map(|(_, inner_key)| inner_key.clone())
+			.collect();
+		let aggregate_plan = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::Exchange {
+				input: Box::new(inner_filtered),
+				partition_count: DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+				key: group_expr.clone(),
+			}),
+			group_expr,
+			aggr_expr: vec![aggregate.clone()],
+		};
+		let mut columns: Vec<String> = (0..pairs.len())
+			.map(|index| format!("key_{index}"))
+			.collect();
+		columns.push("value".to_string());
+		let scalar_subplan = LogicalPlan::Alias {
+			input: Box::new(aggregate_plan),
+			alias: TableRef::new(alias.to_string()),
+			columns,
+		};
+		let on: Vec<(Expr, Expr)> = pairs
+			.into_iter()
+			.enumerate()
+			.map(|(index, (outer_key, _))| {
+				(
+					outer_key,
+					Expr::qualified_column(
+						TableRef::new(alias.to_string()),
+						format!("key_{index}"),
+					),
+				)
+			})
+			.collect();
+		let kind = if on.is_empty() {
+			JoinKind::Cross
+		} else {
+			JoinKind::LeftOuter
+		};
+		self.bind_join(
+			outer,
+			&scalar_subplan,
 			kind,
 			&on,
 			false,

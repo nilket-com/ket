@@ -691,6 +691,10 @@ impl Executor {
 				LogicalPlan::DeferredExists { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound deferred-EXISTS execution",
 				}),
+				// ADR 282: the binder resolves DeferredScalarSubquery into a real join before execution.
+				LogicalPlan::DeferredScalarSubquery { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound deferred-scalar-subquery execution",
+				}),
 				LogicalPlan::SetOpAll { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical set-op ALL execution",
 				}),
