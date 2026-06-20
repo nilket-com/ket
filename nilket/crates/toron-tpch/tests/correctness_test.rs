@@ -1,5 +1,4 @@
-//! ADR 273/276: the strict correctness rail — answer-checked cells (q06 scalar, q01 multi-row), kept separate
-//! from reachability.
+//! The strict correctness rail — answer-checked cells, kept separate from reachability.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,11 +8,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	Q1Group, Q3Group, Q5Group, assert_strict_q1_schema, assert_strict_q3_schema,
-	assert_strict_q5_schema, avg_decimal_raw, check_strict_q1, check_strict_q3, check_strict_q5,
-	check_strict_q6, compare_strict_q1, compare_strict_q3, compare_strict_q5, compare_strict_q6,
-	correctness_matrix_from_log, q6_row_revenue, strict_q1_oracle, strict_q3_oracle,
-	strict_q5_oracle, strict_q6_oracle,
+	DecimalRaw, Q1Group, Q3Group, Q5Group, Q17_CORRECTNESS_SCALE, Q17Oracle,
+	assert_strict_q1_schema, assert_strict_q3_schema, assert_strict_q5_schema,
+	assert_strict_q17_schema, avg_decimal_raw, check_strict_q1, check_strict_q3, check_strict_q5,
+	check_strict_q6, check_strict_q17, compare_strict_q1, compare_strict_q3, compare_strict_q5,
+	compare_strict_q6, compare_strict_q17, correctness_matrix_from_log, decimal_division_raw,
+	q6_row_revenue, strict_q1_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle,
+	strict_q17_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -661,5 +662,152 @@ fn q5_null_cell_is_fail_at_compare() {
 	assert!(
 		compare_strict_q5(&[q5_nullable_batch(&[(Some("ARGENTINA"), None)])], &oracle).is_err(),
 		"a NULL revenue is fail@compare"
+	);
+}
+
+fn q17_batch(values: &[Option<i128>], precision: u8, scale: i8) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"avg_yearly",
+		DataType::Decimal128(precision, scale),
+		true,
+	)]));
+	RecordBatch::try_new(
+		schema,
+		vec![Arc::new(
+			Decimal128Array::from(values.to_vec())
+				.with_precision_and_scale(precision, scale)
+				.expect("q17 avg_yearly decimal column"),
+		)],
+	)
+	.expect("q17 batch")
+}
+
+fn q17_oracle(value: Option<i128>) -> Q17Oracle {
+	Q17Oracle {
+		avg_yearly: DecimalRaw {
+			value,
+			precision: 21,
+			scale: 6,
+		},
+		eligible_parts: 1,
+		contributing_rows: 1,
+	}
+}
+
+#[test]
+fn strict_q17_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q17())
+		})
+		.expect("spawn q17 correctness thread")
+		.join()
+		.expect("q17 correctness thread panicked");
+	assert_eq!(attempt.query, "q17");
+	assert_eq!(attempt.scale_factor, Q17_CORRECTNESS_SCALE);
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q17_oracle_is_non_vacuous_at_correctness_scale() {
+	let oracle = strict_q17_oracle(Q17_CORRECTNESS_SCALE).expect("q17 oracle");
+	assert!(
+		oracle.eligible_parts >= 1,
+		"eligible parts at sf={Q17_CORRECTNESS_SCALE}: {}",
+		oracle.eligible_parts
+	);
+	assert!(
+		oracle.contributing_rows >= 1,
+		"contributing rows at sf={Q17_CORRECTNESS_SCALE}: {}",
+		oracle.contributing_rows
+	);
+	assert!(
+		oracle.avg_yearly.value.is_some(),
+		"a non-empty q17 oracle must produce a non-NULL avg_yearly"
+	);
+	assert_eq!(oracle.avg_yearly.precision, 21);
+	assert_eq!(oracle.avg_yearly.scale, 6);
+}
+
+#[test]
+fn q17_decimal_division_rounds_half_away_from_zero() {
+	assert_eq!(
+		decimal_division_raw(1, 10, 0, 20_000, 10, 0)
+			.expect("positive division")
+			.value,
+		Some(1),
+		"0.00005 rounds to 0.0001, not truncation"
+	);
+	assert_eq!(
+		decimal_division_raw(1, 10, 0, -20_000, 10, 0)
+			.expect("negative division")
+			.value,
+		Some(-1),
+		"a negative quotient rounds away from zero"
+	);
+	assert_eq!(
+		decimal_division_raw(100, 10, 0, 0, 10, 0)
+			.expect("zero divisor")
+			.value,
+		None,
+		"the executor treats Decimal division by zero as NULL"
+	);
+}
+
+#[test]
+fn strict_q17_output_schema_is_asserted() {
+	assert!(assert_strict_q17_schema(&[q17_batch(&[Some(100)], 21, 6)]).is_ok());
+	assert!(
+		assert_strict_q17_schema(&[q17_batch(&[Some(100)], 20, 6)]).is_err(),
+		"a non-measured precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q17_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q17_oracle(Some(123));
+	assert!(
+		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &oracle).is_ok(),
+		"exact raw match"
+	);
+	assert!(
+		compare_strict_q17(&[q17_batch(&[Some(124)], 21, 6)], &oracle).is_err(),
+		"an off-by-one avg_yearly is a mismatch"
+	);
+	let mut drifted_oracle = q17_oracle(Some(123));
+	drifted_oracle.avg_yearly.precision = 20;
+	assert!(
+		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &drifted_oracle).is_err(),
+		"the oracle-side Decimal type is part of the exact comparison"
+	);
+}
+
+#[test]
+fn q17_null_or_empty_result_is_fail_at_compare() {
+	assert!(
+		compare_strict_q17(&[q17_batch(&[None], 21, 6)], &q17_oracle(Some(123))).is_err(),
+		"a NULL output is fail@compare at the non-empty correctness scale"
+	);
+	assert!(
+		compare_strict_q17(&[q17_batch(&[], 21, 6)], &q17_oracle(Some(123))).is_err(),
+		"zero rows is fail@compare"
+	);
+	assert!(
+		compare_strict_q17(
+			&[q17_batch(&[Some(123), Some(123)], 21, 6)],
+			&q17_oracle(Some(123))
+		)
+		.is_err(),
+		"q17 must emit exactly one row"
+	);
+	assert!(
+		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &q17_oracle(None)).is_err(),
+		"a NULL oracle is rejected by the anti-empty guard"
 	);
 }

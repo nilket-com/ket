@@ -6,11 +6,12 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, check_strict_q1, check_strict_q3, check_strict_q5, check_strict_q6,
-	correctness_matrix, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02,
-	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17,
-	run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
-	run_strict_q6, run_strict_q10, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
+	CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_q1, check_strict_q3, check_strict_q5,
+	check_strict_q6, check_strict_q17, correctness_matrix, generate_dev_lineitem, matrix,
+	parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6,
+	run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
+	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14,
+	run_strict_q17, run_strict_q20, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -65,11 +66,18 @@ async fn main() -> ExitCode {
 /// (separate from reachability). Unsupported queries are a usage error (exit 2, no row), not fake telemetry.
 async fn correctness_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
-	let sf = match resolved_sf(args) {
-		Ok(sf) => sf,
+	let explicit = match explicit_sf(args) {
+		Ok(explicit) => explicit,
 		Err(message) => return harness_error(&message),
 	};
+	let sf = explicit.unwrap_or(DEFAULT_SF);
 	let attempt = match query {
+		"q17" => {
+			if let Err(message) = q17_correctness_sf(explicit) {
+				return harness_error(&message);
+			}
+			check_strict_q17().await
+		}
 		"q06" | "q6" => check_strict_q6(sf).await,
 		"q01" | "q1" => check_strict_q1(sf).await,
 		"q03" | "q3" => check_strict_q3(sf).await,
@@ -81,6 +89,16 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 		ExitCode::SUCCESS
 	} else {
 		ExitCode::FAILURE
+	}
+}
+
+fn q17_correctness_sf(explicit: Option<f64>) -> Result<f64, String> {
+	match explicit {
+		None => Ok(Q17_CORRECTNESS_SCALE),
+		Some(sf) if (sf - Q17_CORRECTNESS_SCALE).abs() <= f64::EPSILON => Ok(sf),
+		Some(sf) => Err(format!(
+			"q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {sf}"
+		)),
 	}
 }
 
@@ -256,4 +274,19 @@ fn usage() -> ExitCode {
 		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix> [--query q06] [--mode dev|strict] [--sf 0.01] [--allow-blocked]"
 	);
 	ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn q17_correctness_scale_policy_rejects_masked_empty_scale() {
+		assert_eq!(q17_correctness_sf(None).unwrap(), Q17_CORRECTNESS_SCALE);
+		assert_eq!(
+			q17_correctness_sf(Some(Q17_CORRECTNESS_SCALE)).unwrap(),
+			Q17_CORRECTNESS_SCALE
+		);
+		assert!(q17_correctness_sf(Some(0.01)).is_err());
+	}
 }

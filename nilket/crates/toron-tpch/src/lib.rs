@@ -30,7 +30,7 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::RowCount;
 use toron::error::StorageError;
 use toron::exec::Executor;
-use toron::ir::TableId;
+use toron::ir::{TableId, decimal_division_output_type};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -2143,6 +2143,252 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+pub const Q17_CORRECTNESS_SCALE: f64 = 0.02;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecimalRaw {
+	pub value: Option<i128>,
+	pub precision: u8,
+	pub scale: i8,
+}
+
+/// Mirror the executor's scalar `Decimal128 / Decimal128` path: NULL/zero divisor -> NULL and
+/// non-integral quotients round half away from zero.
+pub fn decimal_division_raw(
+	numerator: i128,
+	numerator_precision: u8,
+	numerator_scale: i8,
+	divisor: i128,
+	divisor_precision: u8,
+	divisor_scale: i8,
+) -> Result<DecimalRaw, String> {
+	let (precision, scale) = decimal_division_output_type(
+		numerator_precision,
+		numerator_scale,
+		divisor_precision,
+		divisor_scale,
+	)
+	.ok_or_else(|| "decimal division output type out of range".to_string())?;
+	if divisor == 0 {
+		return Ok(DecimalRaw {
+			value: None,
+			precision,
+			scale,
+		});
+	}
+
+	let scale_delta = i32::from(scale) + i32::from(divisor_scale) - i32::from(numerator_scale);
+	if scale_delta < 0 {
+		return Err("decimal division scale delta below zero".to_string());
+	}
+	let multiplier = 10_i128
+		.checked_pow(scale_delta as u32)
+		.ok_or_else(|| "decimal division scale overflow".to_string())?;
+	let scaled = numerator
+		.checked_mul(multiplier)
+		.ok_or_else(|| "decimal division scale overflow".to_string())?;
+	let mut quotient = scaled / divisor;
+	let remainder = scaled % divisor;
+	if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
+		quotient = quotient
+			.checked_add(scaled.signum() * divisor.signum())
+			.ok_or_else(|| "decimal division rounding overflow".to_string())?;
+	}
+	if !decimal_fits_precision(quotient, precision) {
+		return Err(format!(
+			"decimal division result {quotient} does not fit output precision {precision}"
+		));
+	}
+	Ok(DecimalRaw {
+		value: Some(quotient),
+		precision,
+		scale,
+	})
+}
+
+#[derive(Debug, Clone)]
+pub struct Q17Oracle {
+	pub avg_yearly: DecimalRaw,
+	pub eligible_parts: usize,
+	pub contributing_rows: usize,
+}
+
+/// Independent strict-q17 oracle at the non-empty scale. Quantity and money raws are scale-2, matching the
+/// strict fixture; `0.2 * AVG(l_quantity)` compares at scale 8.
+pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
+	let eligible_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|item| {
+			item.p_brand.to_string() == "Brand#23" && item.p_container.to_string() == "MED BOX"
+		})
+		.map(|item| item.p_partkey)
+		.collect();
+
+	let mut quantity_by_part: HashMap<i64, (i128, i64)> = HashMap::new();
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		if eligible_parts.contains(&item.l_partkey) {
+			let entry = quantity_by_part.entry(item.l_partkey).or_insert((0, 0));
+			entry.0 += item.l_quantity as i128 * 100;
+			entry.1 += 1;
+		}
+	}
+
+	let mut threshold_by_part: HashMap<i64, i128> = HashMap::new();
+	for (&partkey, &(quantity_sum, count)) in &quantity_by_part {
+		let avg_raw = avg_decimal_raw(quantity_sum, count, 2, 6, 19)?;
+		let threshold_raw = 20_i128
+			.checked_mul(avg_raw)
+			.ok_or_else(|| "q17 threshold multiplication overflow".to_string())?;
+		threshold_by_part.insert(partkey, threshold_raw);
+	}
+
+	let mut extendedprice_sum = 0_i128;
+	let mut contributing_rows = 0_usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let Some(&threshold_raw) = threshold_by_part.get(&item.l_partkey) else {
+			continue;
+		};
+		let quantity_at_threshold_scale = (item.l_quantity as i128 * 100)
+			.checked_mul(1_000_000)
+			.ok_or_else(|| "q17 quantity rescale overflow".to_string())?;
+		if quantity_at_threshold_scale < threshold_raw {
+			extendedprice_sum += item.l_extendedprice.into_inner() as i128;
+			contributing_rows += 1;
+		}
+	}
+
+	let avg_yearly = if contributing_rows == 0 {
+		DecimalRaw {
+			value: None,
+			precision: 21,
+			scale: 6,
+		}
+	} else {
+		decimal_division_raw(extendedprice_sum, 15, 2, 700, 15, 2)?
+	};
+	Ok(Q17Oracle {
+		avg_yearly,
+		eligible_parts: eligible_parts.len(),
+		contributing_rows,
+	})
+}
+
+fn strict_q17_expected_schema() -> [(&'static str, DataType); 1] {
+	[("avg_yearly", DataType::Decimal128(21, 6))]
+}
+
+pub fn assert_strict_q17_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q17_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q17 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q17(batches: &[RecordBatch], oracle: &Q17Oracle) -> Result<(), String> {
+	assert_strict_q17_schema(batches)?;
+	if oracle.eligible_parts == 0 || oracle.contributing_rows == 0 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: eligible_parts={} contributing_rows={}",
+			oracle.eligible_parts, oracle.contributing_rows
+		));
+	}
+	let Some(expected_value) = oracle.avg_yearly.value else {
+		return Err("oracle avg_yearly is NULL".to_string());
+	};
+	if oracle.avg_yearly.precision != 21 || oracle.avg_yearly.scale != 6 {
+		return Err(format!(
+			"oracle avg_yearly type drift: Decimal128({}, {})",
+			oracle.avg_yearly.precision, oracle.avg_yearly.scale
+		));
+	}
+
+	let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+	if row_count != 1 {
+		return Err(format!("expected exactly one q17 row, got {row_count}"));
+	}
+	for batch in batches {
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 0 (avg_yearly) not Decimal128")?;
+		if column.is_null(0) {
+			return Err("column avg_yearly row 0 is NULL".to_string());
+		}
+		let actual_value = column.value(0);
+		if actual_value != expected_value {
+			return Err(format!(
+				"avg_yearly mismatch: expected {expected_value}, got {actual_value}"
+			));
+		}
+		return Ok(());
+	}
+	Err("strict q17 produced no row".to_string())
+}
+
+pub async fn check_strict_q17() -> CorrectnessAttempt {
+	let start = Instant::now();
+	let scale_factor = Q17_CORRECTNESS_SCALE;
+	let tables = q17_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q17".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q17_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q17_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q17_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q17(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// Validate an explicit `--sf` (scale-factor) value: it must be a **finite, strictly-positive** number.
 /// Malformed (unparseable), zero, negative, NaN, and infinite values are *usage* errors — the CLI maps the
 /// `Err` to a harness error (exit 2, no telemetry row), per ADR 261's "a bad arg is a harness error, not a
@@ -2218,60 +2464,56 @@ pub async fn run_strict_q14(scale_factor: f64) -> Attempt {
 /// ADR 281 — run q17 over the `Float64` proxy `lineitem` (+ `part`). The correlated scalar subquery is the
 /// measured frontier.
 pub async fn run_dev_q17(scale_factor: f64) -> Attempt {
-	let lineitem = generate_dev_lineitem(scale_factor);
-	let part = generate_part(scale_factor);
 	run_query_with_tables(
 		"q17",
 		"dev",
 		scale_factor,
 		Q17_DEV_SQL,
-		vec![
-			HarnessTable {
-				id: TableId(1),
-				name: "lineitem",
-				descriptor: dev_lineitem_descriptor(dev_lineitem_schema().as_ref()),
-				facts: facts_for_batch(&lineitem),
-				batch: lineitem,
-			},
-			HarnessTable {
-				id: TableId(2),
-				name: "part",
-				descriptor: part_descriptor(part_schema().as_ref()),
-				facts: facts_for_batch(&part),
-				batch: part,
-			},
-		],
+		q17_tables(false, scale_factor),
 	)
 	.await
 }
 
 /// ADR 281 — strict q17: the same shape with official `Decimal128(15,2)` `lineitem` types.
 pub async fn run_strict_q17(scale_factor: f64) -> Attempt {
-	let lineitem = generate_strict_lineitem(scale_factor);
-	let part = generate_part(scale_factor);
 	run_query_with_tables(
 		"q17",
 		"strict",
 		scale_factor,
 		STRICT_Q17_SQL,
-		vec![
-			HarnessTable {
-				id: TableId(1),
-				name: "lineitem",
-				descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
-				facts: facts_for_batch(&lineitem),
-				batch: lineitem,
-			},
-			HarnessTable {
-				id: TableId(2),
-				name: "part",
-				descriptor: part_descriptor(part_schema().as_ref()),
-				facts: facts_for_batch(&part),
-				batch: part,
-			},
-		],
+		q17_tables(true, scale_factor),
 	)
 	.await
+}
+
+/// The two q17 harness tables: `lineitem` and `part`.
+fn q17_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let part = generate_part(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor: if strict {
+				strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+			} else {
+				dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+			},
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+	]
 }
 
 /// ADR 284 — dev q02: first multi-table-inner correlated scalar query.
