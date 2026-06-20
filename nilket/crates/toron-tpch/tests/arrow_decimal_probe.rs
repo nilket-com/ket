@@ -46,6 +46,25 @@ fn arrow_decimal128_comparison_requires_exact_precision_and_scale() {
 	);
 }
 
+/// The binder-inserted Decimal comparison cast relies on Arrow's Decimal128-to-Decimal128 cast to widen
+/// scale exactly. Scaling up multiplies the raw value and preserves NULLs. Overflow/range protection is
+/// Toron's binder responsibility, pinned by `decimal_comparison_precision_overflow_rejects_at_bind`.
+#[test]
+fn arrow_decimal128_cast_widens_scale_exactly() {
+	let source = Decimal128Array::from(vec![Some(12_345_i128), None])
+		.with_precision_and_scale(15, 2)
+		.expect("decimal source");
+	let casted = arrow::compute::cast(&source, &DataType::Decimal128(20, 4))
+		.expect("scale-widening decimal cast");
+	assert_eq!(casted.data_type(), &DataType::Decimal128(20, 4));
+	let casted = casted
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("casted decimal");
+	assert_eq!(casted.value(0), 1_234_500, "123.45 -> 123.4500");
+	assert!(casted.is_null(1), "NULL survives Decimal cast");
+}
+
 /// `*` widens to `Decimal128(31,4)` and `SUM` carries that type — the result-typing the binder encodes
 /// (`p1+p2+1, s1+s2`) and the executor's SUM finalize reattaches.
 #[test]

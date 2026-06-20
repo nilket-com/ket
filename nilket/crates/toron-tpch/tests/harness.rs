@@ -311,22 +311,11 @@ async fn q04_executes_in_both_modes() {
 	}
 }
 
-// ADR 282: q17 — the correlated-scalar-subquery probe. ADR 282 resolved its UNqualified correlated ref
-// `l_partkey = p_partkey` in the binder (inner-first ownership: the inner `lineitem` shadows the outer
-// `lineitem`, so `l_partkey` is inner, `p_partkey` the outer correlation key), folding the `0.2 * AVG(...)`
-// wrapper onto the rewritten outer expression. DEV reaches execute (the `Float64` proxy). STRICT advances PAST
-// the resolution to the next wall — `0.2`/`7.0` are `Float64` literals against the official `Decimal128`
-// columns — a recognized `unsupported_decimal_scalar` blocker, the Decimal-literal-typing cut named for
-// ADR 283.
-//
-// This is a REACHABILITY probe: at sf=0.0001 no `part` matches `Brand#23`+`MED BOX`, so the result is empty
-// and the correlated recombine is not exercised with data. The resolution's behavioral correctness (over
-// matching rows, and the inner-residual + comma-join-fold gaps) is locked by the engine-level
-// `correlated_scalar_test.rs`. The ADR 282 review also fixed the default-scale (sf=0.01) cartesian: the
-// comma join's bridging equality was stranded above the deferred recombine, so `part`×`lineitem` ran as a
-// materialized cartesian (OOM) — it now folds to a keyed join.
+// ADR 282 resolved q17's unqualified correlated scalar. ADR 283 clears the strict Decimal operand-alignment
+// walls behind it: non-literal Decimal comparison rescale and `SUM(decimal) / 7.0` literal coercion. q17 now
+// reaches execute in both modes with the official SQL unchanged.
 #[tokio::test]
-async fn q17_dev_executes_strict_hits_decimal_literal_wall() {
+async fn q17_executes_in_both_modes() {
 	assert!(
 		status_rows()
 			.iter()
@@ -353,15 +342,19 @@ async fn q17_dev_executes_strict_hits_decimal_literal_wall() {
 	assert_eq!(strict.query, "q17");
 	assert_eq!(
 		strict.status,
-		Status::Blocked,
-		"strict q17 advances past the correlated-scalar resolution to the Decimal-literal wall: {}",
+		Status::Pass,
+		"strict q17 reaches execute after Decimal operand alignment: {}",
 		strict.human()
 	);
-	assert_eq!(strict.phase, Phase::Bind, "strict q17: {}", strict.human());
 	assert_eq!(
-		strict.reason.as_deref(),
-		Some("unsupported_decimal_scalar"),
-		"strict q17's next wall is the 0.2/7.0 Float-vs-Decimal literal typing (names ADR 283): {}",
+		strict.phase,
+		Phase::Execute,
+		"strict q17: {}",
+		strict.human()
+	);
+	assert!(
+		strict.digest.is_some(),
+		"a pass carries a digest: {}",
 		strict.human()
 	);
 }

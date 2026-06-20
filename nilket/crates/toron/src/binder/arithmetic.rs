@@ -1075,12 +1075,12 @@ pub(super) fn bind_arithmetic(
 		.expect("builder returns typed right node");
 	// ADR 266: coerce an Int/Float literal operand to the other side's Decimal128(p,s) so `+`/`-` over a
 	// decimal column and a numeric literal (`1 - l_discount`) binds — rewrite in place (no Cast node),
-	// mirroring the comparison coercion. ADR 271 extends this to `*` (`100.00 * SUM(...)` in q14); the
-	// coercion is a no-op unless one side is Decimal128 and the other a numeric literal, so non-decimal
-	// arithmetic is untouched.
+	// mirroring the comparison coercion. ADR 271 extends this to `*` (`100.00 * SUM(...)` in q14);
+	// ADR 283 extends it to `/` (`SUM(...) / 7.0` in q17). The coercion is a no-op unless one side is
+	// Decimal128 and the other a numeric literal, so non-decimal arithmetic is untouched.
 	let (left_type, right_type) = if matches!(
 		op,
-		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul
+		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div
 	) {
 		coerce_decimal_arithmetic_literal(builder, ctx, left, right, &left_type, &right_type)?;
 		(
@@ -1236,6 +1236,123 @@ fn coerce_decimal_arithmetic_literal(
 		let _ = builder.rewrite_literal(right, value);
 	}
 	Ok(())
+}
+
+pub(super) fn coerce_comparison_literals(
+	builder: &mut BoundExprProgramBuilder,
+	left: BoundExprId,
+	right: BoundExprId,
+	session_timezone: Tz,
+) -> Result<(), BindingError> {
+	if builder.literal(left).is_some() && builder.literal(right).is_some() {
+		return Ok(());
+	}
+	if let Some(value) = builder.literal(left).cloned() {
+		let Some(data_type) = builder.node_type(right).cloned() else {
+			return Ok(());
+		};
+		let value = coerce_literal_value(value, &data_type, session_timezone)?;
+		let _ = builder.rewrite_literal(left, value);
+		return Ok(());
+	}
+	if let Some(value) = builder.literal(right).cloned() {
+		let Some(data_type) = builder.node_type(left).cloned() else {
+			return Ok(());
+		};
+		let value = coerce_literal_value(value, &data_type, session_timezone)?;
+		let _ = builder.rewrite_literal(right, value);
+	}
+	Ok(())
+}
+
+pub(super) fn reconcile_decimal_comparison(
+	builder: &mut BoundExprProgramBuilder,
+	left: &mut BoundExprId,
+	right: &mut BoundExprId,
+) -> Result<(), BindingError> {
+	let left_type = builder
+		.node_type(*left)
+		.cloned()
+		.expect("builder returns typed comparison left");
+	let right_type = builder
+		.node_type(*right)
+		.cloned()
+		.expect("builder returns typed comparison right");
+	let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) = (&left_type, &right_type)
+	else {
+		return Ok(());
+	};
+	if (p1, s1) == (p2, s2) {
+		return Ok(());
+	}
+	let Some(logical_type) = decimal_comparison_logical_type(builder, *left, *right) else {
+		return Ok(());
+	};
+	let common = decimal_comparison_common_type(*p1, *s1, *p2, *s2).ok_or_else(|| {
+		BindingError::TypeMismatch {
+			message: format!(
+				"Decimal comparison operands exceed precision 38: {left_type:?} and {right_type:?}"
+			),
+		}
+	})?;
+	if left_type != common {
+		*left = append_decimal_comparison_cast(builder, *left, common.clone(), logical_type)?;
+	}
+	if right_type != common {
+		*right = append_decimal_comparison_cast(builder, *right, common, logical_type)?;
+	}
+	Ok(())
+}
+
+fn decimal_comparison_common_type(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<DataType> {
+	if s1 < 0 || s2 < 0 {
+		return None;
+	}
+	let scale = s1.max(s2);
+	let integer_digits = (i16::from(p1) - i16::from(s1)).max(i16::from(p2) - i16::from(s2));
+	if integer_digits < 0 {
+		return None;
+	}
+	let precision = integer_digits + i16::from(scale);
+	if !(1..=38).contains(&precision) {
+		return None;
+	}
+	Some(DataType::Decimal128(precision as u8, scale))
+}
+
+fn decimal_comparison_logical_type(
+	builder: &BoundExprProgramBuilder,
+	left: BoundExprId,
+	right: BoundExprId,
+) -> Option<LogicalTypeId> {
+	let left_logical = builder
+		.node_logical_type(left)
+		.expect("builder returns logical type for comparison left");
+	let right_logical = builder
+		.node_logical_type(right)
+		.expect("builder returns logical type for comparison right");
+	if left_logical.is_naked() && right_logical.is_naked() {
+		Some(LogicalTypeId::NAKED)
+	} else if left_logical == right_logical {
+		Some(left_logical)
+	} else {
+		None
+	}
+}
+
+fn append_decimal_comparison_cast(
+	builder: &mut BoundExprProgramBuilder,
+	input: BoundExprId,
+	target: DataType,
+	logical_type: LogicalTypeId,
+) -> Result<BoundExprId, BindingError> {
+	let output = builder.append_cast(input, target.clone(), target);
+	if !logical_type.is_naked() && !builder.set_node_logical_type(output, logical_type) {
+		return Err(BindingError::UnsupportedExpression {
+			message: "Decimal comparison logical identity target is malformed".to_string(),
+		});
+	}
+	Ok(output)
 }
 
 /// ADR 271: when exactly one Decimal128 branch type is present among CASE result branches, coerce each

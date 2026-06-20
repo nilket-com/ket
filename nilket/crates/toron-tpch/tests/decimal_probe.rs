@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Date32Array, Decimal128Array};
+use arrow::array::{Array, Date32Array, Decimal128Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -210,6 +210,93 @@ async fn decimal_add_sub_binds_and_executes() {
 	);
 }
 
+/// Non-literal Decimal comparison operands with different `(p,s)` reconcile through a binder-inserted,
+/// value-preserving Decimal cast.
+#[tokio::test]
+async fn decimal_comparison_rescales_non_literal_operands() {
+	let (catalog, storage) = lineitem_fixture();
+	let plan = SqlPlanner::new()
+		.plan("SELECT l_quantity FROM lineitem WHERE l_quantity < (l_extendedprice * 0.2)")
+		.expect("decimal comparison plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 283: mismatched Decimal comparison operands bind");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 283: mismatched Decimal comparison operands execute");
+	let mut values = Vec::new();
+	for batch in &batches {
+		let column = batch.column(0);
+		assert_eq!(column.data_type(), &DataType::Decimal128(15, 2));
+		let column = column
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("quantity Decimal128");
+		values.extend((0..column.len()).map(|i| column.value(i)));
+	}
+	values.sort_unstable();
+	assert_eq!(
+		values,
+		vec![1_000, 3_000],
+		"10.00 < 20.0000 and 30.00 < 40.0000"
+	);
+}
+
+/// A Decimal comparison whose value-preserving common type would exceed Decimal128's 38 digit precision
+/// rejects cleanly at bind: no silent cap, no execute-time cast surprise.
+#[tokio::test]
+async fn decimal_comparison_precision_overflow_rejects_at_bind() {
+	let (catalog, _storage) = wide_decimal_fixture();
+	let plan = SqlPlanner::new()
+		.plan("SELECT a FROM wide_decimal WHERE a < b")
+		.expect("wide decimal comparison plans");
+	let error = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("common Decimal comparison precision >38 rejects");
+	assert!(
+		format!("{error:?}").contains("Decimal comparison operands exceed precision 38"),
+		"clean precision-overflow bind error: {error:?}"
+	);
+}
+
+/// Decimal `/` gets the same literal coercion as `+`, `-`, and `*`, so `SUM(decimal) / 7.0` binds to
+/// Decimal/Decimal and executes through the checked Decimal division kernel.
+#[tokio::test]
+async fn decimal_division_coerces_float_literal() {
+	let (catalog, storage) = lineitem_fixture();
+	let plan = SqlPlanner::new()
+		.plan("SELECT SUM(l_extendedprice) / 7.0 AS yearly FROM lineitem")
+		.expect("decimal division plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("ADR 283: Decimal / Float literal binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("ADR 283: Decimal / Float literal executes");
+	let yearly = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("a result row")
+		.column(0);
+	assert_eq!(
+		yearly.data_type(),
+		&DataType::Decimal128(21, 6),
+		"Decimal128(15,2) / Decimal128(15,2) -> Decimal128(21,6)"
+	);
+	let yearly = yearly
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("yearly Decimal128");
+	assert!(!yearly.is_null(0), "non-zero divisor produces a value");
+	assert_eq!(
+		yearly.value(0),
+		42_857_143,
+		"(100.00 + 200.00) / 7.00 = 42.857143"
+	);
+}
+
 /// ADR 268: AVG(Decimal) binds and executes, finalizing to a widened `Decimal128(p+4, s+4)`. Over the
 /// fixture: AVG(l_extendedprice) = (100.00 + 200.00)/2 = 150.000000; AVG(l_discount) = (0.06 + 0.05)/2 =
 /// 0.055000. The `Decimal128(19,6)` output type discriminates against a Float64 collapse, and the
@@ -343,6 +430,45 @@ fn lineitem_fixture() -> (MockCatalog, Arc<HarnessScan>) {
 		.expect("Decimal128 registration is accepted");
 	let storage = Arc::new(HarnessScan {
 		batches: HashMap::from([(TableId(2), batch)]),
+	});
+	(catalog, storage)
+}
+
+fn wide_decimal_fixture() -> (MockCatalog, Arc<HarnessScan>) {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("a", DataType::Decimal128(38, 0), false),
+		Field::new("b", DataType::Decimal128(38, 36), false),
+	]));
+	let dec = |values: Vec<i128>, precision: u8, scale: i8| {
+		Arc::new(
+			Decimal128Array::from(values)
+				.with_precision_and_scale(precision, scale)
+				.expect("wide decimal column"),
+		) as arrow::array::ArrayRef
+	};
+	let batch = RecordBatch::try_new(
+		schema.clone(),
+		vec![dec(vec![1], 38, 0), dec(vec![1], 38, 36)],
+	)
+	.expect("wide decimal batch");
+	let descriptor = TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([3; 16]),
+		1,
+		"default",
+		"wide_decimal",
+		schema.as_ref(),
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("wide Decimal128 descriptor is accepted");
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(3), descriptor)
+		.expect("wide Decimal128 registration is accepted");
+	let storage = Arc::new(HarnessScan {
+		batches: HashMap::from([(TableId(3), batch)]),
 	});
 	(catalog, storage)
 }

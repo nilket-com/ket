@@ -5217,9 +5217,10 @@ fn bind_comparison(
 		}
 		(false, false) => {}
 	}
-	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
-	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
+	let mut left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+	let mut right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	coerce_comparison_literals(builder, left, right, ctx.session_timezone)?;
+	arithmetic::reconcile_decimal_comparison(builder, &mut left, &mut right)?;
 	let left_type = builder
 		.node_type(left)
 		.cloned()
@@ -5458,33 +5459,6 @@ fn bind_like(
 		});
 	}
 	Ok(builder.append_like(expr, pattern.to_string(), negated, case_insensitive))
-}
-
-fn coerce_comparison_literals(
-	builder: &mut BoundExprProgramBuilder,
-	left: BoundExprId,
-	right: BoundExprId,
-	session_timezone: Tz,
-) -> Result<(), BindingError> {
-	if builder.literal(left).is_some() && builder.literal(right).is_some() {
-		return Ok(());
-	}
-	if let Some(value) = builder.literal(left).cloned() {
-		let Some(data_type) = builder.node_type(right).cloned() else {
-			return Ok(());
-		};
-		let value = coerce_literal_value(value, &data_type, session_timezone)?;
-		let _ = builder.rewrite_literal(left, value);
-		return Ok(());
-	}
-	if let Some(value) = builder.literal(right).cloned() {
-		let Some(data_type) = builder.node_type(left).cloned() else {
-			return Ok(());
-		};
-		let value = coerce_literal_value(value, &data_type, session_timezone)?;
-		let _ = builder.rewrite_literal(right, value);
-	}
-	Ok(())
 }
 
 fn coerce_literal_value(
