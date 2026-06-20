@@ -9,10 +9,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	Q1Group, Q3Group, assert_strict_q1_schema, assert_strict_q3_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q3, check_strict_q6, compare_strict_q1, compare_strict_q3,
-	compare_strict_q6, correctness_matrix_from_log, q6_row_revenue, strict_q1_oracle,
-	strict_q3_oracle, strict_q6_oracle,
+	Q1Group, Q3Group, Q5Group, assert_strict_q1_schema, assert_strict_q3_schema,
+	assert_strict_q5_schema, avg_decimal_raw, check_strict_q1, check_strict_q3, check_strict_q5,
+	check_strict_q6, compare_strict_q1, compare_strict_q3, compare_strict_q5, compare_strict_q6,
+	correctness_matrix_from_log, q6_row_revenue, strict_q1_oracle, strict_q3_oracle,
+	strict_q5_oracle, strict_q6_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -505,5 +506,160 @@ fn q3_duplicate_output_key_is_fail_at_compare() {
 		)
 		.is_err(),
 		"a duplicate emitted l_orderkey is rejected"
+	);
+}
+
+fn q5_batch(rows: &[(&str, i128)]) -> RecordBatch {
+	let nullable_rows: Vec<(Option<&str>, Option<i128>)> = rows
+		.iter()
+		.map(|&(name, revenue)| (Some(name), Some(revenue)))
+		.collect();
+	q5_nullable_batch(&nullable_rows)
+}
+
+fn q5_nullable_batch(rows: &[(Option<&str>, Option<i128>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("n_name", DataType::Utf8, true),
+		Field::new("revenue", DataType::Decimal128(32, 4), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.1).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(32, 4)
+					.expect("q5 revenue decimal column"),
+			),
+		],
+	)
+	.expect("q5 batch")
+}
+
+fn q5_oracle(rows: &[(&str, i128)]) -> BTreeMap<String, Q5Group> {
+	rows.iter()
+		.map(|&(name, revenue)| (name.to_string(), Q5Group { revenue }))
+		.collect()
+}
+
+#[test]
+fn strict_q5_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q5(0.01))
+		})
+		.expect("spawn q5 correctness thread")
+		.join()
+		.expect("q5 correctness thread panicked");
+	assert_eq!(attempt.query, "q05");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q5_oracle_selects_multiple_groups() {
+	let oracle = strict_q5_oracle(0.01);
+	assert!(
+		oracle.selected_rows >= 1,
+		"selected {} contributing rows",
+		oracle.selected_rows
+	);
+	assert!(
+		oracle.groups.len() > 1,
+		"expected > 1 group, got {}",
+		oracle.groups.len()
+	);
+}
+
+#[test]
+fn strict_q5_output_schema_is_asserted() {
+	assert!(assert_strict_q5_schema(&[q5_batch(&[("ARGENTINA", 100)])]).is_ok());
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("n_name", DataType::Utf8, false),
+			Field::new("revenue", DataType::Decimal128(31, 4), false),
+		])),
+		vec![
+			Arc::new(StringArray::from(vec!["ARGENTINA"])),
+			Arc::new(
+				Decimal128Array::from(vec![100_i128])
+					.with_precision_and_scale(31, 4)
+					.expect("decimal"),
+			),
+		],
+	)
+	.expect("drifted q5 batch");
+	assert!(
+		assert_strict_q5_schema(&[drifted]).is_err(),
+		"a non-measured revenue precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q5_comparator_accepts_either_tie_order() {
+	let oracle = q5_oracle(&[("ARGENTINA", 500), ("BRAZIL", 500)]);
+	assert!(
+		compare_strict_q5(&[q5_batch(&[("ARGENTINA", 500), ("BRAZIL", 500)])], &oracle).is_ok(),
+		"tie order [ARGENTINA, BRAZIL] accepted"
+	);
+	assert!(
+		compare_strict_q5(&[q5_batch(&[("BRAZIL", 500), ("ARGENTINA", 500)])], &oracle).is_ok(),
+		"tie order [BRAZIL, ARGENTINA] equally accepted"
+	);
+}
+
+#[test]
+fn q5_order_prefix_violation_is_fail() {
+	let oracle = q5_oracle(&[("ARGENTINA", 100), ("BRAZIL", 200)]);
+	assert!(
+		compare_strict_q5(&[q5_batch(&[("ARGENTINA", 100), ("BRAZIL", 200)])], &oracle).is_err(),
+		"revenue ascending violates ORDER BY revenue DESC"
+	);
+}
+
+#[test]
+fn q5_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q5_oracle(&[("ARGENTINA", 500), ("BRAZIL", 300)]);
+	assert!(
+		compare_strict_q5(&[q5_batch(&[("ARGENTINA", 501), ("BRAZIL", 300)])], &oracle).is_err(),
+		"an off-by-one revenue is a mismatch"
+	);
+}
+
+#[test]
+fn q5_missing_or_duplicate_group_is_fail_at_compare() {
+	let oracle = q5_oracle(&[("ARGENTINA", 500), ("BRAZIL", 300)]);
+	assert!(
+		compare_strict_q5(&[q5_batch(&[("ARGENTINA", 500)])], &oracle).is_err(),
+		"a dropped group is a mismatch"
+	);
+	assert!(
+		compare_strict_q5(
+			&[q5_batch(&[("ARGENTINA", 500), ("ARGENTINA", 500)])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted n_name is rejected"
+	);
+}
+
+#[test]
+fn q5_null_cell_is_fail_at_compare() {
+	let oracle = q5_oracle(&[("ARGENTINA", 500)]);
+	assert!(
+		compare_strict_q5(&[q5_nullable_batch(&[(None, Some(500))])], &oracle).is_err(),
+		"a NULL n_name is fail@compare"
+	);
+	assert!(
+		compare_strict_q5(&[q5_nullable_batch(&[(Some("ARGENTINA"), None)])], &oracle).is_err(),
+		"a NULL revenue is fail@compare"
 	);
 }

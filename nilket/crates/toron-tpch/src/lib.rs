@@ -1643,6 +1643,10 @@ pub struct Q3Oracle {
 	pub selected_rows: usize,
 }
 
+fn discounted_price_raw(extprice_raw: i128, discount_raw: i128) -> i128 {
+	extprice_raw * (100 - discount_raw)
+}
+
 /// ADR 280: the independent strict-q03 oracle — traverse the Customer/Order/LineItem generators directly,
 /// apply q03's `c_mktsegment = 'BUILDING'` + date filters and the two join keys, and accumulate raw scale-4
 /// revenue per `l_orderkey`. `DATE '1995-03-15'` is day-count `9204` (cross-check: q01 used `10471` for
@@ -1686,7 +1690,7 @@ pub fn strict_q3_oracle(scale_factor: f64) -> Q3Oracle {
 			orderdate,
 			shippriority,
 		});
-		group.revenue += extprice_raw * (100 - disc_raw);
+		group.revenue += discounted_price_raw(extprice_raw, disc_raw);
 		selected_rows += 1;
 	}
 
@@ -1898,6 +1902,242 @@ pub async fn check_strict_q3(scale_factor: f64) -> CorrectnessAttempt {
 		);
 	}
 	match compare_strict_q3(&batches, &oracle.groups) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q5Group {
+	pub revenue: i128,
+}
+
+pub struct Q5Oracle {
+	pub groups: BTreeMap<String, Q5Group>,
+	pub selected_rows: usize,
+}
+
+/// ADR 287: the independent strict-q05 oracle — traverse the six q05 generators directly, apply every join
+/// gate including the cyclic `c_nationkey = s_nationkey`, then group raw scale-4 revenue by `n_name`.
+pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
+	const START_1994: i32 = 8766;
+	const START_1995: i32 = 9131;
+
+	let mut asia_regions: HashSet<i64> = HashSet::new();
+	for region in RegionGenerator::new(scale_factor, 1, 1).iter() {
+		if region.r_name == "ASIA" {
+			asia_regions.insert(region.r_regionkey);
+		}
+	}
+
+	let mut asia_nations: HashMap<i64, String> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		if asia_regions.contains(&nation.n_regionkey) {
+			asia_nations.insert(nation.n_nationkey, nation.n_name.to_string());
+		}
+	}
+
+	let mut suppliers: HashMap<i64, i64> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		suppliers.insert(supplier.s_suppkey, supplier.s_nationkey);
+	}
+
+	let mut customers: HashMap<i64, i64> = HashMap::new();
+	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		customers.insert(customer.c_custkey, customer.c_nationkey);
+	}
+
+	let mut orders: HashMap<i64, i64> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		let orderdate = order.o_orderdate.to_unix_epoch();
+		if (START_1994..START_1995).contains(&orderdate) {
+			orders.insert(order.o_orderkey, order.o_custkey);
+		}
+	}
+
+	let mut groups: BTreeMap<String, Q5Group> = BTreeMap::new();
+	let mut selected_rows = 0usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let Some(&custkey) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let Some(&customer_nationkey) = customers.get(&custkey) else {
+			continue;
+		};
+		let Some(&supplier_nationkey) = suppliers.get(&item.l_suppkey) else {
+			continue;
+		};
+		if customer_nationkey != supplier_nationkey {
+			continue;
+		}
+		let Some(nation_name) = asia_nations.get(&supplier_nationkey) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let disc_raw = item.l_discount.into_inner() as i128;
+		groups
+			.entry(nation_name.clone())
+			.or_insert(Q5Group { revenue: 0 })
+			.revenue += discounted_price_raw(extprice_raw, disc_raw);
+		selected_rows += 1;
+	}
+
+	Q5Oracle {
+		groups,
+		selected_rows,
+	}
+}
+
+/// strict q05's measured output schema (Phase-0 measured at sf=0.01): q05's revenue expression is q03's
+/// `sum_disc_price` shape, and the executor returns scale-4 revenue.
+fn strict_q5_expected_schema() -> [(&'static str, DataType); 2] {
+	[
+		("n_name", DataType::Utf8),
+		("revenue", DataType::Decimal128(32, 4)),
+	]
+}
+
+pub fn assert_strict_q5_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q5_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q05 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+/// Compare strict q05's grouped output to the independent oracle. Answers are matched by unique `n_name`;
+/// ordering is only the SQL-specified `ORDER BY revenue DESC` prefix.
+pub fn compare_strict_q5(
+	batches: &[RecordBatch],
+	oracle: &BTreeMap<String, Q5Group>,
+) -> Result<(), String> {
+	assert_strict_q5_schema(batches)?;
+
+	let mut emitted: Vec<(String, i128)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let names = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (n_name) not Utf8")?;
+		let revenues = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 1 (revenue) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			if names.is_null(i) {
+				return Err(format!("column n_name row {} is NULL", emitted.len()));
+			}
+			if revenues.is_null(i) {
+				return Err(format!("column revenue row {} is NULL", emitted.len()));
+			}
+			emitted.push((names.value(i).to_string(), revenues.value(i)));
+		}
+	}
+
+	if emitted.len() != oracle.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<String, i128> = BTreeMap::new();
+	for (name, revenue) in &emitted {
+		if seen.insert(name.clone(), *revenue).is_some() {
+			return Err(format!("duplicate emitted n_name {name:?}"));
+		}
+	}
+	for (name, group) in oracle {
+		let Some(&revenue) = seen.get(name) else {
+			return Err(format!("oracle n_name {name:?} missing from output"));
+		};
+		if revenue != group.revenue {
+			return Err(format!(
+				"n_name {name:?}: revenue mismatch: expected {}, got {revenue}",
+				group.revenue
+			));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		let (_, rev_a) = &pair[0];
+		let (_, rev_b) = &pair[1];
+		if rev_a < rev_b {
+			return Err(format!(
+				"ORDER BY revenue DESC violated: {rev_a} emitted before {rev_b}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q05_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q05".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q5_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q5_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q5_oracle(scale_factor);
+	if oracle.selected_rows < 1 || oracle.groups.len() <= 1 {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: selected_rows={} groups={}",
+				oracle.selected_rows,
+				oracle.groups.len()
+			)),
+		);
+	}
+	match compare_strict_q5(&batches, &oracle.groups) {
 		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
 		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
 	}

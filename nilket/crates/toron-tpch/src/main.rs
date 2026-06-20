@@ -6,11 +6,11 @@ use std::process::ExitCode;
 
 use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
-	CACHE_ROOT, check_strict_q1, check_strict_q3, check_strict_q6, correctness_matrix,
-	generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q10, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
+	CACHE_ROOT, check_strict_q1, check_strict_q3, check_strict_q5, check_strict_q6,
+	correctness_matrix, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02,
+	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17,
+	run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
+	run_strict_q6, run_strict_q10, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -61,9 +61,8 @@ async fn main() -> ExitCode {
 	}
 }
 
-/// ADR 273/276: answer-check a query against its independent oracle and record a correctness row (separate
-/// from reachability). `q06` (scalar) and `q01` (multi-row) strict are checked; any other query is a usage
-/// error (exit 2, no row), not a fake telemetry row.
+/// ADR 273/276/280/287: answer-check a query against its independent oracle and record a correctness row
+/// (separate from reachability). Unsupported queries are a usage error (exit 2, no row), not fake telemetry.
 async fn correctness_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let sf = match resolved_sf(args) {
@@ -74,6 +73,7 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 		"q06" | "q6" => check_strict_q6(sf).await,
 		"q01" | "q1" => check_strict_q1(sf).await,
 		"q03" | "q3" => check_strict_q3(sf).await,
+		"q05" | "q5" => check_strict_q5(sf).await,
 		other => return harness_error(&format!("correctness --query {other} is not supported")),
 	};
 	emit_correctness(&attempt);
