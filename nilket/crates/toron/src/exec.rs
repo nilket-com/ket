@@ -521,7 +521,7 @@ impl Executor {
 									})?;
 								let output_type =
 									output_type.expect("MIN/MAX output type observed");
-								results_cols.push(min_max_state_array(&state)?);
+								results_cols.push(min_max_state_array(&state, &output_type)?);
 								results_fields.push(arrow::datatypes::Field::new(
 									aggregate_state_output_name(func),
 									output_type,
@@ -1530,7 +1530,10 @@ impl Executor {
 							update_min_state(&mut state, &arr, row)?;
 						}
 					}
-					results_cols.push(min_max_state_array(&state)?);
+					results_cols.push(min_max_state_array(
+						&state,
+						output_schema.field(results_cols.len()).data_type(),
+					)?);
 				}
 				AggregateFunction::Max => {
 					let mut state = max_state_for_data_type(first_arg_type(call)?)?;
@@ -1540,7 +1543,10 @@ impl Executor {
 							update_max_state(&mut state, &arr, row)?;
 						}
 					}
-					results_cols.push(min_max_state_array(&state)?);
+					results_cols.push(min_max_state_array(
+						&state,
+						output_schema.field(results_cols.len()).data_type(),
+					)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -1659,13 +1665,15 @@ impl Executor {
 							AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
 							| AggState::MinFloat32 { .. }
-							| AggState::MinFloat64 { .. } => {
+							| AggState::MinFloat64 { .. }
+							| AggState::MinDecimal128 { .. } => {
 								update_min_state(state, array, row)?;
 							}
 							AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
 							| AggState::MaxFloat32 { .. }
-							| AggState::MaxFloat64 { .. } => {
+							| AggState::MaxFloat64 { .. }
+							| AggState::MaxDecimal128 { .. } => {
 								update_max_state(state, array, row)?;
 							}
 						},
@@ -1700,10 +1708,12 @@ impl Executor {
 							| AggState::MinInt64 { .. }
 							| AggState::MinFloat32 { .. }
 							| AggState::MinFloat64 { .. }
+							| AggState::MinDecimal128 { .. }
 							| AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
 							| AggState::MaxFloat32 { .. }
 							| AggState::MaxFloat64 { .. }
+							| AggState::MaxDecimal128 { .. }
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. }
 							| AggState::AvgDecimal { .. } => 0,
@@ -1835,13 +1845,15 @@ impl Executor {
 							AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
 							| AggState::MinFloat32 { .. }
-							| AggState::MinFloat64 { .. } => {
+							| AggState::MinFloat64 { .. }
+							| AggState::MinDecimal128 { .. } => {
 								update_min_state(state, array, row)?;
 							}
 							AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
 							| AggState::MaxFloat32 { .. }
-							| AggState::MaxFloat64 { .. } => {
+							| AggState::MaxFloat64 { .. }
+							| AggState::MaxDecimal128 { .. } => {
 								update_max_state(state, array, row)?;
 							}
 						},
@@ -1869,10 +1881,12 @@ impl Executor {
 							| AggState::MinInt64 { .. }
 							| AggState::MinFloat32 { .. }
 							| AggState::MinFloat64 { .. }
+							| AggState::MinDecimal128 { .. }
 							| AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
 							| AggState::MaxFloat32 { .. }
 							| AggState::MaxFloat64 { .. }
+							| AggState::MaxDecimal128 { .. }
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. }
 							| AggState::AvgDecimal { .. } => 0,
@@ -4640,7 +4654,7 @@ fn window_agg_finalize(
 			avg_state_array(state.as_ref().expect("avg window state"), output_type)?
 		}
 		AggregateFunction::Min | AggregateFunction::Max => {
-			min_max_state_array(state.as_ref().expect("min/max window state"))?
+			min_max_state_array(state.as_ref().expect("min/max window state"), output_type)?
 		}
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 			return Err(ExecutionError::NotImplemented {
@@ -5802,6 +5816,9 @@ enum AggState {
 	MinFloat64 {
 		value: Option<f64>,
 	},
+	MinDecimal128 {
+		value: Option<i128>,
+	},
 	MaxInt32 {
 		value: Option<i32>,
 	},
@@ -5813,6 +5830,9 @@ enum AggState {
 	},
 	MaxFloat64 {
 		value: Option<f64>,
+	},
+	MaxDecimal128 {
+		value: Option<i128>,
 	},
 	AvgInt {
 		total: i128,
@@ -6040,6 +6060,7 @@ fn min_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 		DataType::Int64 => Ok(AggState::MinInt64 { value: None }),
 		DataType::Float32 => Ok(AggState::MinFloat32 { value: None }),
 		DataType::Float64 => Ok(AggState::MinFloat64 { value: None }),
+		DataType::Decimal128(_, _) => Ok(AggState::MinDecimal128 { value: None }),
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("MIN does not support input type {:?}", data_type),
 		}),
@@ -6052,6 +6073,7 @@ fn max_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 		DataType::Int64 => Ok(AggState::MaxInt64 { value: None }),
 		DataType::Float32 => Ok(AggState::MaxFloat32 { value: None }),
 		DataType::Float64 => Ok(AggState::MaxFloat64 { value: None }),
+		DataType::Decimal128(_, _) => Ok(AggState::MaxDecimal128 { value: None }),
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("MAX does not support input type {:?}", data_type),
 		}),
@@ -6125,10 +6147,12 @@ fn add_sum_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		| (AggState::MinInt64 { .. }, _)
 		| (AggState::MinFloat32 { .. }, _)
 		| (AggState::MinFloat64 { .. }, _)
+		| (AggState::MinDecimal128 { .. }, _)
 		| (AggState::MaxInt32 { .. }, _)
 		| (AggState::MaxInt64 { .. }, _)
 		| (AggState::MaxFloat32 { .. }, _)
 		| (AggState::MaxFloat64 { .. }, _)
+		| (AggState::MaxDecimal128 { .. }, _)
 		| (AggState::AvgInt { .. }, _)
 		| (AggState::AvgFloat { .. }, _)
 		| (AggState::AvgDecimal { .. }, _) => Err(ExecutionError::InvalidExpression {
@@ -6193,10 +6217,12 @@ fn add_avg_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		| (AggState::MinInt64 { .. }, _)
 		| (AggState::MinFloat32 { .. }, _)
 		| (AggState::MinFloat64 { .. }, _)
+		| (AggState::MinDecimal128 { .. }, _)
 		| (AggState::MaxInt32 { .. }, _)
 		| (AggState::MaxInt64 { .. }, _)
 		| (AggState::MaxFloat32 { .. }, _)
-		| (AggState::MaxFloat64 { .. }, _) => Err(ExecutionError::InvalidExpression {
+		| (AggState::MaxFloat64 { .. }, _)
+		| (AggState::MaxDecimal128 { .. }, _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
 	}
@@ -6305,6 +6331,17 @@ fn update_min_state(
 			}));
 			Ok(())
 		}
+		AggState::MinDecimal128 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Decimal128Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MIN(Decimal128) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.min(candidate)));
+			Ok(())
+		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: "MIN value reached non-MIN accumulator".to_string(),
 		}),
@@ -6368,28 +6405,56 @@ fn update_max_state(
 			}));
 			Ok(())
 		}
+		AggState::MaxDecimal128 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Decimal128Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MAX(Decimal128) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.max(candidate)));
+			Ok(())
+		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: "MAX value reached non-MAX accumulator".to_string(),
 		}),
 	}
 }
 
-fn min_max_state_array(state: &AggState) -> Result<ArrayRef, ExecutionError> {
-	match state {
-		AggState::MinInt32 { value } | AggState::MaxInt32 { value } => {
+fn min_max_state_array(
+	state: &AggState,
+	output_type: &DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	match (state, output_type) {
+		(AggState::MinInt32 { value }, DataType::Int32)
+		| (AggState::MaxInt32 { value }, DataType::Int32) => {
 			Ok(Arc::new(Int32Array::from(vec![*value])) as ArrayRef)
 		}
-		AggState::MinInt64 { value } | AggState::MaxInt64 { value } => {
+		(AggState::MinInt64 { value }, DataType::Int64)
+		| (AggState::MaxInt64 { value }, DataType::Int64) => {
 			Ok(Arc::new(Int64Array::from(vec![*value])) as ArrayRef)
 		}
-		AggState::MinFloat32 { value } | AggState::MaxFloat32 { value } => {
+		(AggState::MinFloat32 { value }, DataType::Float32)
+		| (AggState::MaxFloat32 { value }, DataType::Float32) => {
 			Ok(Arc::new(Float32Array::from(vec![*value])) as ArrayRef)
 		}
-		AggState::MinFloat64 { value } | AggState::MaxFloat64 { value } => {
+		(AggState::MinFloat64 { value }, DataType::Float64)
+		| (AggState::MaxFloat64 { value }, DataType::Float64) => {
 			Ok(Arc::new(Float64Array::from(vec![*value])) as ArrayRef)
 		}
-		_ => Err(ExecutionError::InvalidExpression {
-			message: "MIN/MAX finalize over non-MIN/MAX state".to_string(),
+		(
+			AggState::MinDecimal128 { value } | AggState::MaxDecimal128 { value },
+			DataType::Decimal128(precision, scale),
+		) => Ok(Arc::new(
+			Decimal128Array::from(vec![*value])
+				.with_precision_and_scale(*precision, *scale)
+				.map_err(|error| ExecutionError::Kernel {
+					message: error.to_string(),
+				})?,
+		) as ArrayRef),
+		(other, data_type) => Err(ExecutionError::InvalidExpression {
+			message: format!("cannot materialize {other:?} as MIN/MAX output {data_type:?}"),
 		}),
 	}
 }
@@ -6455,10 +6520,12 @@ fn sum_column_from_groups(
 					| AggState::MinInt64 { .. }
 					| AggState::MinFloat32 { .. }
 					| AggState::MinFloat64 { .. }
+					| AggState::MinDecimal128 { .. }
 					| AggState::MaxInt32 { .. }
 					| AggState::MaxInt64 { .. }
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
+					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. } => Ok(None),
@@ -6477,10 +6544,12 @@ fn sum_column_from_groups(
 					| AggState::MinInt64 { .. }
 					| AggState::MinFloat32 { .. }
 					| AggState::MinFloat64 { .. }
+					| AggState::MinDecimal128 { .. }
 					| AggState::MaxInt32 { .. }
 					| AggState::MaxInt64 { .. }
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
+					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. } => None,
@@ -6502,10 +6571,12 @@ fn sum_column_from_groups(
 					| AggState::MinInt64 { .. }
 					| AggState::MinFloat32 { .. }
 					| AggState::MinFloat64 { .. }
+					| AggState::MinDecimal128 { .. }
 					| AggState::MaxInt32 { .. }
 					| AggState::MaxInt64 { .. }
 					| AggState::MaxFloat32 { .. }
 					| AggState::MaxFloat64 { .. }
+					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. } => None,
@@ -6570,6 +6641,22 @@ fn min_max_column_from_groups(
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+		DataType::Decimal128(precision, scale) => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::MinDecimal128 { value } | AggState::MaxDecimal128 { value } => value,
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::Kernel {
+						message: error.to_string(),
+					})?,
+			) as ArrayRef)
 		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported MIN/MAX output type: {output_type:?}"),

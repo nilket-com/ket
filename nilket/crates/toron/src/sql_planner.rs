@@ -5166,6 +5166,30 @@ impl SqlPlanner {
 		alias_plan(plan, Some(alias))
 	}
 
+	fn lower_scalar_subquery_from_list(
+		&self,
+		select: &Select,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
+		let Some((first, rest)) = select.from.split_first() else {
+			return Err(unsupported(
+				"non-aggregate scalar subqueries are not supported",
+			));
+		};
+		if !first.joins.is_empty() || rest.iter().any(|source| !source.joins.is_empty()) {
+			return Err(unsupported(
+				"non-aggregate scalar subqueries are not supported",
+			));
+		}
+
+		let mut plan = self.lower_table_factor(&first.relation, cte)?;
+		for source in rest {
+			let right = self.lower_table_factor(&source.relation, cte)?;
+			plan = build_auto_join_plan(plan, right, JoinKind::Cross, Vec::new());
+		}
+		Ok(plan)
+	}
+
 	fn lower_table_factor(
 		&self,
 		factor: &TableFactor,
@@ -5669,7 +5693,7 @@ impl SqlPlanner {
 							"COUNT in an unqualified correlated scalar subquery is not supported",
 						));
 					}
-					let inner_plan = self.lower_table_factor(&select.from[0].relation, cte)?;
+					let inner_plan = self.lower_scalar_subquery_from_list(select, cte)?;
 					let predicates = select
 						.selection
 						.as_ref()
@@ -5691,6 +5715,7 @@ impl SqlPlanner {
 					return Ok(value_sql);
 				}
 				if !where_is_correlated {
+					validate_single_source_scalar_subquery(select)?;
 					let subplan = self.lower_query_scoped(query, cte)?;
 					collected.push(PulledScalar::Resolved {
 						plan: LogicalPlan::Alias {
@@ -5719,6 +5744,7 @@ impl SqlPlanner {
 						"DISTINCT in a correlated scalar aggregate is not supported",
 					));
 				}
+				validate_single_source_scalar_subquery(select)?;
 				let mut inner_plan = self.lower_table_factor(&select.from[0].relation, cte)?;
 				let mut correlation_pairs: Vec<(Expr, Expr)> = Vec::new();
 				let mut inner_residuals: Vec<Expr> = Vec::new();
@@ -9536,13 +9562,14 @@ fn replace_scalar_aggregate<'a>(
 	}
 }
 
-/// The qualifier(s) a scalar subquery's single FROM table contributes (its alias, else its name): the
-/// scope against which a correlation reference is judged (a column qualified by an outer relation is
-/// correlated).
+/// The qualifier(s) a scalar subquery's FROM tables contribute (their alias, else their name): the scope
+/// against which a correlation reference is judged (a column qualified by an outer relation is correlated).
 fn scalar_subquery_inner_qualifiers(select: &Select) -> Vec<TableRef> {
-	match &select.from[0].relation {
-		TableFactor::Table { name, alias, .. } => {
-			let qualifier = alias
+	select
+		.from
+		.iter()
+		.filter_map(|source| match &source.relation {
+			TableFactor::Table { name, alias, .. } => alias
 				.as_ref()
 				.map(|alias| TableRef::new(alias.name.value.clone()))
 				.or_else(|| {
@@ -9550,11 +9577,10 @@ fn scalar_subquery_inner_qualifiers(select: &Select) -> Vec<TableRef> {
 						part.as_ident()
 							.map(|ident| TableRef::new(ident.value.clone()))
 					})
-				});
-			qualifier.into_iter().collect::<Vec<_>>()
-		}
-		_ => Vec::new(),
-	}
+				}),
+			_ => None,
+		})
+		.collect()
 }
 
 /// ADR 260: the single bare aggregate a *correlated* scalar subquery projects. Grouped-aggregate
@@ -9610,11 +9636,12 @@ fn count_empty_group_coalesce(value_reference: SqlExpr) -> SqlExpr {
 	}
 }
 
-/// ADR 257/260: validate that a scalar subquery used as a value is a provably-scalar aggregate this cut
-/// supports — a single `SELECT <one aggregate> FROM <one table> [WHERE ...]` with no
-/// GROUP BY/HAVING/DISTINCT. A correlation reference in the *projection* (the aggregate argument) rejects
-/// (undecorrelatable by GROUP BY); a correlation reference in the *WHERE* no longer rejects here —
-/// `pull_up_scalar_subqueries` decorrelates it into a grouped aggregate + `LeftOuter` (ADR 260).
+/// ADR 257/260/284: validate that a scalar subquery used as a value is a provably-scalar aggregate this
+/// cut supports — `SELECT <one aggregate-bearing expr> FROM ... [WHERE ...]` with no
+/// GROUP BY/HAVING/DISTINCT. Single-source restrictions are enforced by the individual lowering paths;
+/// the deferred correlated path can carry a comma-list inner FROM (ADR 284). A correlation reference in the
+/// *projection* (the aggregate argument) rejects (undecorrelatable by GROUP BY); a correlation reference in
+/// the *WHERE* is handled by the correlated/deferred paths.
 fn validate_aggregate_scalar_subquery_shape(
 	query: &Query,
 	outer_qualifiers: &[TableRef],
@@ -9626,10 +9653,7 @@ fn validate_aggregate_scalar_subquery_shape(
 			"non-aggregate scalar subqueries are not supported",
 		));
 	};
-	// A scalar aggregate is a single FROM source, no joins, no GROUP BY/HAVING/DISTINCT, one projected
-	// aggregate.
-	if select.from.len() != 1
-		|| !select.from[0].joins.is_empty()
+	if select.from.is_empty()
 		|| !group_by_is_empty(&select.group_by)
 		|| select.having.is_some()
 		|| select.distinct.is_some()
@@ -9657,6 +9681,15 @@ fn validate_aggregate_scalar_subquery_shape(
 	if sql_expr_references_outer_qualifier(projection_expr, outer_qualifiers, &inner_qualifiers) {
 		return Err(unsupported(
 			"correlated scalar subqueries are not supported",
+		));
+	}
+	Ok(())
+}
+
+fn validate_single_source_scalar_subquery(select: &Select) -> Result<(), FrontendError> {
+	if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+		return Err(unsupported(
+			"non-aggregate scalar subqueries are not supported",
 		));
 	}
 	Ok(())

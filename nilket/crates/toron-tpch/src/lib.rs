@@ -20,7 +20,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use tpchgen::generators::{
 	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
-	RegionGenerator, SupplierGenerator,
+	PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 
 use toron::binder::{PlannerConfig, bind};
@@ -137,6 +137,34 @@ pub const Q17_DEV_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
 /// before the intended correlated-scalar wall, a narrow strict variant is introduced + documented as a harness
 /// deviation in the results doc (ADR 281).
 pub const STRICT_Q17_SQL: &str = Q17_DEV_SQL;
+
+/// ADR 284 — tpch.q02 (Minimum Cost Supplier): tpchgen-2.0.2's exact Q2 with `:1` → `15`, `:2` →
+/// `BRASS`, `:3` → `EUROPE`, and no LIMIT. The correlated scalar `MIN(ps_supplycost)` has a multi-table
+/// comma-join inner input (`partsupp, supplier, nation, region`) and is the measured frontier.
+pub const Q2_DEV_SQL: &str = "SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, \
+	s_address, s_phone, s_comment \
+	FROM part, supplier, partsupp, nation, region \
+	WHERE p_partkey = ps_partkey \
+	  AND s_suppkey = ps_suppkey \
+	  AND p_size = 15 \
+	  AND p_type LIKE '%BRASS' \
+	  AND s_nationkey = n_nationkey \
+	  AND n_regionkey = r_regionkey \
+	  AND r_name = 'EUROPE' \
+	  AND ps_supplycost = ( \
+	    SELECT MIN(ps_supplycost) \
+	    FROM partsupp, supplier, nation, region \
+	    WHERE p_partkey = ps_partkey \
+	      AND s_suppkey = ps_suppkey \
+	      AND s_nationkey = n_nationkey \
+	      AND n_regionkey = r_regionkey \
+	      AND r_name = 'EUROPE' \
+	  ) \
+	ORDER BY s_acctbal DESC, n_name, s_name, p_partkey";
+
+/// strict q02 — identical shape; `supplier.s_acctbal` and `partsupp.ps_supplycost` carry official
+/// `Decimal128(15,2)` types.
+pub const STRICT_Q2_SQL: &str = Q2_DEV_SQL;
 
 /// Q3 Shipping Priority reachability SQL: tpchgen-2.0.2's Q3 text with the `:1`/`:2`
 /// params bound to literals (`'BUILDING'`, `DATE '1995-03-15'`) and no `LIMIT` (the
@@ -414,6 +442,9 @@ fn part_schema() -> SchemaRef {
 		// ADR 281: q17 filters (p_brand = 'Brand#23', p_container = 'MED BOX'), appended (q14 ignores them).
 		Field::new("p_brand", DataType::Utf8, false),
 		Field::new("p_container", DataType::Utf8, false),
+		// ADR 284: q02 filter/projection columns, appended (q14/q17 ignore them).
+		Field::new("p_size", DataType::Int32, false),
+		Field::new("p_mfgr", DataType::Utf8, false),
 	]))
 }
 
@@ -439,11 +470,15 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 	let mut part_type = Vec::new();
 	let mut brand = Vec::new();
 	let mut container = Vec::new();
+	let mut size = Vec::new();
+	let mut mfgr = Vec::new();
 	for item in generator.iter() {
 		partkey.push(item.p_partkey);
 		part_type.push(item.p_type.to_string());
 		brand.push(item.p_brand.to_string());
 		container.push(item.p_container.to_string());
+		size.push(item.p_size);
+		mfgr.push(item.p_mfgr.to_string());
 	}
 	RecordBatch::try_new(
 		part_schema(),
@@ -452,6 +487,8 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(part_type)),
 			Arc::new(StringArray::from(brand)),
 			Arc::new(StringArray::from(container)),
+			Arc::new(Int32Array::from(size)),
+			Arc::new(StringArray::from(mfgr)),
 		],
 	)
 	.expect("part batch")
@@ -650,12 +687,22 @@ pub fn generate_nation(scale_factor: f64) -> RecordBatch {
 	.expect("nation batch")
 }
 
-/// The q05 `SUPPLIER` fixture: the two join keys q05 needs (`s_suppkey`, `s_nationkey`). No decimals → identical
-/// in dev and strict (like `nation`/`part`; q05 ignores `s_acctbal`).
-fn supplier_schema() -> SchemaRef {
+/// The `SUPPLIER` fixture: q05 needs the keys; q02 appends the output columns and `s_acctbal`.
+/// Mode-sensitive like `customer`: account balance is `Float64` in dev and `Decimal128(15,2)` in strict.
+fn supplier_schema(strict: bool) -> SchemaRef {
+	let acctbal = if strict {
+		Field::new("s_acctbal", DataType::Decimal128(15, 2), false)
+	} else {
+		Field::new("s_acctbal", DataType::Float64, false)
+	};
 	Arc::new(Schema::new(vec![
 		Field::new("s_suppkey", DataType::Int64, false),
 		Field::new("s_nationkey", DataType::Int64, false),
+		Field::new("s_name", DataType::Utf8, false),
+		Field::new("s_address", DataType::Utf8, false),
+		Field::new("s_phone", DataType::Utf8, false),
+		acctbal,
+		Field::new("s_comment", DataType::Utf8, false),
 	]))
 }
 
@@ -674,23 +721,122 @@ fn supplier_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	.expect("supplier descriptor")
 }
 
-/// Generate the q05-needed `SUPPLIER` columns (`s_suppkey`, `s_nationkey`) at `scale_factor`.
-pub fn generate_supplier(scale_factor: f64) -> RecordBatch {
+/// Generate `SUPPLIER` at `scale_factor`. `s_acctbal` is `Float64` (dev) or scale-2
+/// `Decimal128(15,2)` (strict).
+pub fn generate_supplier(strict: bool, scale_factor: f64) -> RecordBatch {
 	let generator = SupplierGenerator::new(scale_factor, 1, 1);
 	let mut suppkey = Vec::new();
 	let mut nationkey = Vec::new();
+	let mut name = Vec::new();
+	let mut address = Vec::new();
+	let mut phone = Vec::new();
+	let mut acctbal_dev = Vec::new();
+	let mut acctbal_strict = Vec::new();
+	let mut comment = Vec::new();
 	for item in generator.iter() {
 		suppkey.push(item.s_suppkey);
 		nationkey.push(item.s_nationkey);
+		name.push(item.s_name.to_string());
+		address.push(item.s_address.to_string());
+		phone.push(item.s_phone.to_string());
+		if strict {
+			acctbal_strict.push(item.s_acctbal.into_inner() as i128);
+		} else {
+			acctbal_dev.push(item.s_acctbal.as_f64());
+		}
+		comment.push(item.s_comment);
 	}
+	let acctbal: arrow::array::ArrayRef = if strict {
+		Arc::new(
+			Decimal128Array::from(acctbal_strict)
+				.with_precision_and_scale(15, 2)
+				.expect("s_acctbal decimal column"),
+		)
+	} else {
+		Arc::new(Float64Array::from(acctbal_dev))
+	};
 	RecordBatch::try_new(
-		supplier_schema(),
+		supplier_schema(strict),
 		vec![
 			Arc::new(Int64Array::from(suppkey)),
 			Arc::new(Int64Array::from(nationkey)),
+			Arc::new(StringArray::from(name)),
+			Arc::new(StringArray::from(address)),
+			Arc::new(StringArray::from(phone)),
+			acctbal,
+			Arc::new(StringArray::from(comment)),
 		],
 	)
 	.expect("supplier batch")
+}
+
+/// The q02 `PARTSUPP` fixture. `ps_supplycost` is mode-sensitive like the TPC-H money columns.
+fn partsupp_schema(strict: bool) -> SchemaRef {
+	let supplycost = if strict {
+		Field::new("ps_supplycost", DataType::Decimal128(15, 2), false)
+	} else {
+		Field::new("ps_supplycost", DataType::Float64, false)
+	};
+	Arc::new(Schema::new(vec![
+		Field::new("ps_partkey", DataType::Int64, false),
+		Field::new("ps_suppkey", DataType::Int64, false),
+		Field::new("ps_availqty", DataType::Int32, false),
+		supplycost,
+	]))
+}
+
+fn partsupp_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([20; 16]),
+		1,
+		"default",
+		"partsupp",
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("partsupp descriptor")
+}
+
+/// Generate q02-needed `PARTSUPP` columns at `scale_factor`.
+pub fn generate_partsupp(strict: bool, scale_factor: f64) -> RecordBatch {
+	let generator = PartSuppGenerator::new(scale_factor, 1, 1);
+	let mut partkey = Vec::new();
+	let mut suppkey = Vec::new();
+	let mut availqty = Vec::new();
+	let mut supplycost_dev = Vec::new();
+	let mut supplycost_strict = Vec::new();
+	for item in generator.iter() {
+		partkey.push(item.ps_partkey);
+		suppkey.push(item.ps_suppkey);
+		availqty.push(item.ps_availqty);
+		if strict {
+			supplycost_strict.push(item.ps_supplycost.into_inner() as i128);
+		} else {
+			supplycost_dev.push(item.ps_supplycost.as_f64());
+		}
+	}
+	let supplycost: arrow::array::ArrayRef = if strict {
+		Arc::new(
+			Decimal128Array::from(supplycost_strict)
+				.with_precision_and_scale(15, 2)
+				.expect("ps_supplycost decimal column"),
+		)
+	} else {
+		Arc::new(Float64Array::from(supplycost_dev))
+	};
+	RecordBatch::try_new(
+		partsupp_schema(strict),
+		vec![
+			Arc::new(Int64Array::from(partkey)),
+			Arc::new(Int64Array::from(suppkey)),
+			Arc::new(Int32Array::from(availqty)),
+			supplycost,
+		],
+	)
+	.expect("partsupp batch")
 }
 
 /// The q05 `REGION` fixture: the join key + the name filter column. A fixed 5-row lookup; no decimals →
@@ -1854,6 +2000,76 @@ pub async fn run_strict_q17(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 284 — dev q02: first multi-table-inner correlated scalar query.
+pub async fn run_dev_q02(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q02",
+		"dev",
+		scale_factor,
+		Q2_DEV_SQL,
+		q02_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 284 — strict q02: same shape with official `Decimal128(15,2)` supplier/partsupp money columns.
+pub async fn run_strict_q02(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q02",
+		"strict",
+		scale_factor,
+		STRICT_Q2_SQL,
+		q02_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The five q02 harness tables: `part`, `supplier`, `partsupp`, `nation`, and `region`.
+fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let part = generate_part(scale_factor);
+	let supplier = generate_supplier(strict, scale_factor);
+	let partsupp = generate_partsupp(strict, scale_factor);
+	let nation = generate_nation(scale_factor);
+	let region = generate_region(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "partsupp",
+			descriptor: partsupp_descriptor(partsupp_schema(strict).as_ref()),
+			facts: facts_for_batch(&partsupp),
+			batch: partsupp,
+		},
+		HarnessTable {
+			id: TableId(4),
+			name: "nation",
+			descriptor: nation_descriptor(nation_schema().as_ref()),
+			facts: facts_for_batch(&nation),
+			batch: nation,
+		},
+		HarnessTable {
+			id: TableId(5),
+			name: "region",
+			descriptor: region_descriptor(region_schema().as_ref()),
+			facts: facts_for_batch(&region),
+			batch: region,
+		},
+	]
+}
+
 /// Run q03 over the `Float64` proxy `lineitem`.
 pub async fn run_dev_q3(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -1986,11 +2202,11 @@ pub async fn run_strict_q05(scale_factor: f64) -> Attempt {
 /// The six q05 harness tables: q10's lineitem/customer/orders/nation + `supplier` + `region`.
 fn q05_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let mut tables = q10_tables(strict, scale_factor);
-	let supplier = generate_supplier(scale_factor);
+	let supplier = generate_supplier(strict, scale_factor);
 	tables.push(HarnessTable {
 		id: TableId(5),
 		name: "supplier",
-		descriptor: supplier_descriptor(supplier_schema().as_ref()),
+		descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
 		facts: facts_for_batch(&supplier),
 		batch: supplier,
 	});
@@ -2074,7 +2290,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q01" || *id == "q14"
 					|| *id == "q03" || *id == "q10"
 					|| *id == "q05" || *id == "q04"
-					|| *id == "q17"
+					|| *id == "q17" || *id == "q02"
 				{
 					"implemented"
 				} else {

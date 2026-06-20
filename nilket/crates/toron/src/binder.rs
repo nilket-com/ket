@@ -2697,11 +2697,11 @@ impl<'a> Binder<'a> {
 	}
 
 	/// ADR 282: bind a deferred correlated scalar subquery (the frontend couldn't classify its unqualified
-	/// ref). Probe-bind both sides on scratch trace/render for their scopes, classify each predicate by
-	/// `column_side` ownership (reusing the EXISTS classifier) into correlation key pairs + inner residuals,
-	/// then build ADR 260's shape directly — a grouped aggregate keyed on the inner correlation keys, aliased
-	/// `<alias>[key_i…, value]`, recombined via `LeftOuter` (or a keyless `Cross` when uncorrelated). The
-	/// projection wrapper already rides the rewritten outer expression (which references `<alias>.value`).
+	/// ref). Derive both logical scopes without binding the raw inner comma list, classify each predicate by
+	/// `column_side` ownership into correlation key pairs + inner residuals, then build ADR 260's shape
+	/// directly — a grouped aggregate keyed on the inner correlation keys, aliased `<alias>[key_i…, value]`,
+	/// recombined via `LeftOuter` (or a keyless `Cross` when uncorrelated). The projection wrapper already
+	/// rides the rewritten outer expression (which references `<alias>.value`).
 	async fn bind_deferred_scalar_subquery(
 		&self,
 		outer: &LogicalPlan,
@@ -2713,35 +2713,20 @@ impl<'a> Binder<'a> {
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 		join_order_source_capture: JoinOrderSourceCapture,
 	) -> Result<ScopedExecutionPlan, BindingError> {
-		// Probe-bind both sides on scratch trace/render state for their scopes (ADR 279 review fix).
-		let mut scope_trace = OptimizerTrace::default();
-		let mut scope_render = None;
-		let outer_scoped = self
-			.bind_plan_with_trace(
-				outer,
-				&mut scope_trace,
-				&mut scope_render,
-				join_order_source_capture,
-				None,
-			)
-			.await?;
-		let inner_scoped = self
-			.bind_plan_with_trace(
-				inner,
-				&mut scope_trace,
-				&mut scope_render,
-				join_order_source_capture,
-				None,
-			)
-			.await?;
+		let Some(outer_scope) = self.logical_scope_for_outer_demotion(outer).await? else {
+			return Err(BindingError::UnsupportedExpression {
+				message: "unsupported correlated scalar subquery outer scope".to_string(),
+			});
+		};
+		let Some(inner_scope) = self.logical_scope_for_outer_demotion(inner).await? else {
+			return Err(BindingError::UnsupportedExpression {
+				message: "unsupported correlated scalar subquery inner scope".to_string(),
+			});
+		};
 		let mut pairs: Vec<(Expr, Expr)> = Vec::new();
 		let mut residuals: Vec<Expr> = Vec::new();
 		for predicate in predicates {
-			match classify_deferred_scalar_predicate(
-				predicate,
-				&outer_scoped.scope,
-				&inner_scoped.scope,
-			)? {
+			match classify_deferred_scalar_predicate(predicate, &outer_scope, &inner_scope)? {
 				DeferredExistsConjunct::Correlated {
 					outer_key,
 					inner_key,
@@ -2760,6 +2745,7 @@ impl<'a> Binder<'a> {
 			},
 			None => inner.clone(),
 		};
+		let inner_filtered = self.recognize_cross_equi_joins(&inner_filtered).await?;
 		let group_expr: Vec<Expr> = pairs
 			.iter()
 			.map(|(_, inner_key)| inner_key.clone())

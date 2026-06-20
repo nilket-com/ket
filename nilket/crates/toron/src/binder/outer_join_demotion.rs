@@ -733,7 +733,7 @@ impl<'a> Binder<'a> {
 		})
 	}
 
-	fn logical_scope_for_outer_demotion<'b>(
+	pub(super) fn logical_scope_for_outer_demotion<'b>(
 		&'b self,
 		plan: &'b LogicalPlan,
 	) -> Pin<Box<dyn Future<Output = Result<Option<RelationScope>, BindingError>> + Send + 'b>> {

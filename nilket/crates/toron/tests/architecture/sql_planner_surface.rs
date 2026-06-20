@@ -198,8 +198,8 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggState enum");
-	// ADR 268 added `AvgDecimal` for AVG(Decimal) (raw i128 accumulator + input scale).
-	assert_eq!(enum_variant_count(agg_state_enum), 14);
+	// ADR 268 added `AvgDecimal`; ADR 284 added Decimal MIN/MAX for strict q02.
+	assert_eq!(enum_variant_count(agg_state_enum), 16);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Copy"));
@@ -1383,10 +1383,12 @@ pub(crate) fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 	assert!(exec.contains("AggState::MinInt64"));
 	assert!(exec.contains("AggState::MinFloat32"));
 	assert!(exec.contains("AggState::MinFloat64"));
+	assert!(exec.contains("AggState::MinDecimal128"));
 	assert!(exec.contains("AggState::MaxInt32"));
 	assert!(exec.contains("AggState::MaxInt64"));
 	assert!(exec.contains("AggState::MaxFloat32"));
 	assert!(exec.contains("AggState::MaxFloat64"));
+	assert!(exec.contains("AggState::MaxDecimal128"));
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Copy"));

@@ -264,6 +264,10 @@ fn is_avg_numeric_input(input: &DataType) -> bool {
 fn is_ordered_min_max_input(input: &DataType) -> bool {
 	matches!(
 		input,
-		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+		DataType::Int32
+			| DataType::Int64
+			| DataType::Float32
+			| DataType::Float64
+			| DataType::Decimal128(_, _)
 	)
 }

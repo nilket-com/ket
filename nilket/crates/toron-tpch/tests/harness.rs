@@ -2,10 +2,10 @@
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q3, run_dev_q04,
-	run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_strict_q1, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14, run_strict_q17,
-	status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_strict_q1,
+	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10,
+	run_strict_q14, run_strict_q17, status_rows,
 };
 
 #[tokio::test]
@@ -276,6 +276,62 @@ fn q05_executes_in_both_modes() {
 		.expect("spawn q05 thread")
 		.join()
 		.expect("q05 thread panicked");
+}
+
+// ADR 284: q02 exercises a five-table outer comma join plus a correlated scalar whose inner side is a
+// four-table comma join. It runs on a large stack like q05/q10, and the default-scale checks prove the inner
+// residual joins are keyed rather than materialized as a cartesian before the grouped MIN.
+#[test]
+fn q02_executes_in_both_modes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q02 dev=implemented strict=implemented"),
+					"q02 is an implemented capability in the static inventory"
+				);
+				for (mode, attempt) in [
+					("dev", run_dev_q02(0.0001).await),
+					("strict", run_strict_q02(0.0001).await),
+				] {
+					assert_eq!(attempt.query, "q02");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q02 {mode} reaches execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
+				for (mode, attempt) in [
+					("dev", run_dev_q02(0.01).await),
+					("strict", run_strict_q02(0.01).await),
+				] {
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q02 {mode} reaches execute at the default scale via keyed joins: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+				}
+			});
+		})
+		.expect("spawn q02 thread")
+		.join()
+		.expect("q02 thread panicked");
 }
 
 // ADR 278/279: q04 — the gauge's first correlated-subquery query — reaches execute in both modes. ADR 279

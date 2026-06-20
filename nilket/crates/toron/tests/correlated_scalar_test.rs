@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
@@ -107,6 +107,69 @@ async fn deferred_correlated_scalar_with_inner_residual() {
 	assert_id_values(&batch, &[1]);
 }
 
+#[tokio::test]
+async fn deferred_correlated_scalar_with_multi_table_inner_executes() {
+	let batch = run_sql(
+		"SELECT prt.p_id FROM prt \
+		 WHERE prt.p_lim < ( \
+		   SELECT MIN(l_qty) \
+		   FROM itm, dim \
+		   WHERE l_pid = p_id AND l_pid = d_pid AND d_region = 'EUROPE' \
+		 )",
+	)
+	.await;
+	assert_id_values(&batch, &[1]);
+}
+
+#[tokio::test]
+async fn deferred_correlated_scalar_multi_table_inner_is_keyed() {
+	let catalog = oversized_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT prt.p_id FROM prt \
+			 WHERE prt.p_lim < ( \
+			   SELECT MIN(l_qty) \
+			   FROM itm, dim \
+			   WHERE l_pid = p_id AND l_pid = d_pid AND d_region = 'EUROPE' \
+			 )",
+		)
+		.expect("plan deferred scalar with a multi-table inner");
+	let bound = bind(&logical, &catalog, &small_broadcast_config())
+		.await
+		.expect("inner residual equality lifts to a keyed join before binding");
+	assert!(
+		join_strategy_count(&bound, JoinStrategy::HashPartitioned) >= 2,
+		"expected both the scalar recombine and the inner comma join to bind as keyed joins"
+	);
+}
+
+#[test]
+fn multi_table_non_aggregate_scalar_still_rejects() {
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT prt.p_id FROM prt \
+			 WHERE prt.p_lim < ( \
+			   SELECT l_qty FROM itm, dim WHERE l_pid = p_id AND l_pid = d_pid \
+			 )",
+		)
+		.expect_err("non-aggregate scalar remains unsupported even with a comma-list inner");
+	assert!(
+		err.to_string()
+			.contains("non-aggregate scalar subqueries are not supported"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
+async fn deferred_correlated_scalar_decimal_min_executes() {
+	let batch = run_sql(
+		"SELECT prt.p_id FROM prt \
+		 WHERE prt.p_cost_lim < (SELECT MIN(l_cost) FROM itm WHERE l_pid = p_id)",
+	)
+	.await;
+	assert_id_values(&batch, &[1]);
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -169,6 +232,7 @@ fn join_strategy_count(plan: &ExecutionPlan, expected: JoinStrategy) -> usize {
 fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	let prt = prt_schema();
 	let itm = itm_schema();
+	let dim = dim_schema();
 	let mut catalog = MockCatalog::new();
 	catalog
 		.register_descriptor(TableId(1), descriptor(1, "prt", prt.as_ref()))
@@ -176,8 +240,15 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	catalog
 		.register_descriptor(TableId(2), descriptor(2, "itm", itm.as_ref()))
 		.expect("register itm");
+	catalog
+		.register_descriptor(TableId(3), descriptor(3, "dim", dim.as_ref()))
+		.expect("register dim");
 	let storage = Arc::new(FixtureScan {
-		batches: HashMap::from([(TableId(1), prt_batch(prt)), (TableId(2), itm_batch(itm))]),
+		batches: HashMap::from([
+			(TableId(1), prt_batch(prt)),
+			(TableId(2), itm_batch(itm)),
+			(TableId(3), dim_batch(dim)),
+		]),
 	});
 	(catalog, storage)
 }
@@ -188,6 +259,7 @@ fn oversized_catalog() -> MockCatalog {
 	let (mut catalog, _storage) = fixture();
 	seed_byte_upper_bound(&mut catalog, "prt", 64 * 1024 * 1024);
 	seed_byte_upper_bound(&mut catalog, "itm", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "dim", 64 * 1024 * 1024);
 	catalog
 }
 
@@ -214,6 +286,7 @@ fn prt_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("p_id", DataType::Int64, false),
 		Field::new("p_lim", DataType::Float64, false),
+		Field::new("p_cost_lim", DataType::Decimal128(15, 2), false),
 	]))
 }
 
@@ -222,6 +295,14 @@ fn itm_schema() -> SchemaRef {
 		Field::new("l_pid", DataType::Int64, false),
 		Field::new("l_qty", DataType::Float64, false),
 		Field::new("l_kind", DataType::Utf8, false),
+		Field::new("l_cost", DataType::Decimal128(15, 2), false),
+	]))
+}
+
+fn dim_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("d_pid", DataType::Int64, false),
+		Field::new("d_region", DataType::Utf8, false),
 	]))
 }
 
@@ -231,6 +312,11 @@ fn prt_batch(schema: SchemaRef) -> RecordBatch {
 		vec![
 			Arc::new(Int64Array::from(vec![1, 2])),
 			Arc::new(Float64Array::from(vec![5.0, 100.0])),
+			Arc::new(
+				Decimal128Array::from(vec![Some(900), Some(21_000)])
+					.with_precision_and_scale(15, 2)
+					.expect("p_cost_lim decimal"),
+			),
 		],
 	)
 	.expect("prt batch")
@@ -243,9 +329,25 @@ fn itm_batch(schema: SchemaRef) -> RecordBatch {
 			Arc::new(Int64Array::from(vec![1, 1, 2])),
 			Arc::new(Float64Array::from(vec![10.0, 50.0, 200.0])),
 			Arc::new(StringArray::from(vec!["A", "B", "B"])),
+			Arc::new(
+				Decimal128Array::from(vec![Some(1_000), Some(5_000), Some(20_000)])
+					.with_precision_and_scale(15, 2)
+					.expect("l_cost decimal"),
+			),
 		],
 	)
 	.expect("itm batch")
+}
+
+fn dim_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2])),
+			Arc::new(StringArray::from(vec!["EUROPE", "ASIA"])),
+		],
+	)
+	.expect("dim batch")
 }
 
 fn descriptor(id: u8, name: &str, schema: &Schema) -> TableSchemaDescriptor {
