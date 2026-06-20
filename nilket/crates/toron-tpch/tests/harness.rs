@@ -415,11 +415,10 @@ async fn q17_executes_in_both_modes() {
 	);
 }
 
-// ADR 285: q20's nested IN body now composes its own nested IN and correlated scalar instead of stopping at
-// the old `IN subquery is not supported` frontend wall. The measured next wall is the non-literal numeric
-// comparison `ps_availqty > 0.5 * SUM(l_quantity)`, so the honest reachability row is blocked@bind.
+// ADR 286: q20's nested IN body and correlated scalar now compose with comparison-local numeric operand
+// alignment (`ps_availqty > 0.5 * SUM(l_quantity)`), so both dev and strict modes reach execute.
 #[test]
-fn q20_advances_to_numeric_comparison_wall() {
+fn q20_executes_in_both_modes() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -442,20 +441,19 @@ fn q20_advances_to_numeric_comparison_wall() {
 					assert_eq!(attempt.query, "q20");
 					assert_eq!(
 						attempt.status,
-						Status::Blocked,
-						"q20 {mode} should advance to a classified bind wall: {}",
+						Status::Pass,
+						"q20 {mode} should reach execute: {}",
 						attempt.human()
 					);
 					assert_eq!(
 						attempt.phase,
-						Phase::Bind,
+						Phase::Execute,
 						"q20 {mode}: {}",
 						attempt.human()
 					);
-					assert_eq!(
-						attempt.reason.as_deref(),
-						Some("unsupported_numeric_comparison_alignment"),
-						"q20 {mode}: {}",
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
 						attempt.human()
 					);
 				}
@@ -619,12 +617,12 @@ fn reason_for_error_classifies_numeric_comparison_alignment_precisely() {
 	assert_eq!(
 		reason_for_error("comparison operands have different types: Int32 and Float64"),
 		"unsupported_numeric_comparison_alignment",
-		"q20 dev's measured second wall"
+		"q20 dev's historical second wall"
 	);
 	assert_eq!(
-		reason_for_error("comparison operands have different types: Int32 and Decimal128(15, 2)"),
+		reason_for_error("comparison operands have different types: Int32 and Decimal128(31, 4)"),
 		"unsupported_numeric_comparison_alignment",
-		"q20 strict's predicted second wall"
+		"q20 strict's historical second wall"
 	);
 	assert_eq!(
 		status_for_reason("unsupported_numeric_comparison_alignment"),

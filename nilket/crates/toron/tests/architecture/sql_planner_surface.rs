@@ -667,6 +667,36 @@ pub(crate) fn adr025_cast_supports_numeric_primitive_lattice() {
 }
 
 #[test]
+pub(crate) fn adr286_int_decimal_cast_is_internal_comparison_support_only() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let binder = binder_root_source();
+	let arithmetic = std::fs::read_to_string(manifest_dir().join("src/binder/arithmetic.rs"))
+		.expect("read arithmetic source");
+	let evaluate_cast = brace_blocks_after_marker(&exec, "fn evaluate_cast")
+		.into_iter()
+		.next()
+		.expect("evaluate_cast body")
+		.1;
+	let explicit_policy =
+		brace_blocks_after_marker(&binder, "fn is_supported_explicit_numeric_cast")
+			.into_iter()
+			.next()
+			.expect("is_supported_explicit_numeric_cast body")
+			.1;
+
+	assert!(binder.contains("reconcile_decimal_comparison(builder, &mut left, &mut right)?;"));
+	assert!(binder.contains("reconcile_numeric_comparison(builder, &mut left, &mut right)?;"));
+	assert!(arithmetic.contains("pub(super) fn reconcile_numeric_comparison"));
+	assert!(evaluate_cast.contains("(DataType::Int32, DataType::Decimal128(_, _))"));
+	assert!(evaluate_cast.contains("(DataType::Int64, DataType::Decimal128(_, _))"));
+	assert!(
+		!explicit_policy.contains("Decimal128"),
+		"ADR 286 adds internal comparison casts, not public explicit CAST Decimal support"
+	);
+}
+
+#[test]
 pub(crate) fn adr025_cast_failure_returns_kernel_error_with_prefix() {
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");

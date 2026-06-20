@@ -1296,10 +1296,48 @@ pub(super) fn reconcile_decimal_comparison(
 		}
 	})?;
 	if left_type != common {
-		*left = append_decimal_comparison_cast(builder, *left, common.clone(), logical_type)?;
+		*left = append_comparison_cast(builder, *left, common.clone(), logical_type)?;
 	}
 	if right_type != common {
-		*right = append_decimal_comparison_cast(builder, *right, common, logical_type)?;
+		*right = append_comparison_cast(builder, *right, common, logical_type)?;
+	}
+	Ok(())
+}
+
+pub(super) fn reconcile_numeric_comparison(
+	builder: &mut BoundExprProgramBuilder,
+	left: &mut BoundExprId,
+	right: &mut BoundExprId,
+) -> Result<(), BindingError> {
+	let left_type = builder
+		.node_type(*left)
+		.cloned()
+		.expect("builder returns typed comparison left");
+	let right_type = builder
+		.node_type(*right)
+		.cloned()
+		.expect("builder returns typed comparison right");
+	if left_type == right_type
+		|| matches!(
+			(&left_type, &right_type),
+			(DataType::Decimal128(_, _), DataType::Decimal128(_, _))
+		) {
+		return Ok(());
+	}
+	if builder.literal(*left).is_some() && builder.literal(*right).is_some() {
+		return Ok(());
+	}
+	let Some(logical_type) = decimal_comparison_logical_type(builder, *left, *right) else {
+		return Ok(());
+	};
+	let Some(common) = numeric_comparison_common_type(&left_type, &right_type)? else {
+		return Ok(());
+	};
+	if left_type != common {
+		*left = append_comparison_cast(builder, *left, common.clone(), logical_type)?;
+	}
+	if right_type != common {
+		*right = append_comparison_cast(builder, *right, common, logical_type)?;
 	}
 	Ok(())
 }
@@ -1318,6 +1356,68 @@ fn decimal_comparison_common_type(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<Data
 		return None;
 	}
 	Some(DataType::Decimal128(precision as u8, scale))
+}
+
+fn numeric_comparison_common_type(
+	left: &DataType,
+	right: &DataType,
+) -> Result<Option<DataType>, BindingError> {
+	if let Some(common) = primitive_numeric_comparison_common_type(left, right) {
+		return Ok(Some(common));
+	}
+	match (left, right) {
+		(DataType::Int32 | DataType::Int64, DataType::Decimal128(precision, scale))
+		| (DataType::Decimal128(precision, scale), DataType::Int32 | DataType::Int64) => {
+			let common = integer_decimal_comparison_common_type(left, right, *precision, *scale)
+				.ok_or_else(|| BindingError::TypeMismatch {
+					message: format!(
+						"Integer/Decimal comparison operands exceed precision 38: {left:?} and {right:?}"
+					),
+				})?;
+			Ok(Some(common))
+		}
+		_ => Ok(None),
+	}
+}
+
+fn primitive_numeric_comparison_common_type(left: &DataType, right: &DataType) -> Option<DataType> {
+	match (left, right) {
+		(DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => {
+			Some(DataType::Int64)
+		}
+		(DataType::Int32 | DataType::Int64 | DataType::Float32, DataType::Float64)
+		| (DataType::Float64, DataType::Int32 | DataType::Int64 | DataType::Float32)
+		| (DataType::Int32 | DataType::Int64, DataType::Float32)
+		| (DataType::Float32, DataType::Int32 | DataType::Int64) => Some(DataType::Float64),
+		_ => None,
+	}
+}
+
+fn integer_decimal_comparison_common_type(
+	left: &DataType,
+	right: &DataType,
+	decimal_precision: u8,
+	decimal_scale: i8,
+) -> Option<DataType> {
+	if decimal_scale < 0 {
+		return None;
+	}
+	let decimal_integer_digits = i16::from(decimal_precision) - i16::from(decimal_scale);
+	if decimal_integer_digits < 0 {
+		return None;
+	}
+	let integer_digits = match (left, right) {
+		(DataType::Int32, DataType::Decimal128(_, _))
+		| (DataType::Decimal128(_, _), DataType::Int32) => 10,
+		(DataType::Int64, DataType::Decimal128(_, _))
+		| (DataType::Decimal128(_, _), DataType::Int64) => 19,
+		_ => return None,
+	};
+	let precision = decimal_integer_digits.max(integer_digits) + i16::from(decimal_scale);
+	if !(1..=38).contains(&precision) {
+		return None;
+	}
+	Some(DataType::Decimal128(precision as u8, decimal_scale))
 }
 
 fn decimal_comparison_logical_type(
@@ -1340,7 +1440,7 @@ fn decimal_comparison_logical_type(
 	}
 }
 
-fn append_decimal_comparison_cast(
+fn append_comparison_cast(
 	builder: &mut BoundExprProgramBuilder,
 	input: BoundExprId,
 	target: DataType,
@@ -1349,7 +1449,7 @@ fn append_decimal_comparison_cast(
 	let output = builder.append_cast(input, target.clone(), target);
 	if !logical_type.is_naked() && !builder.set_node_logical_type(output, logical_type) {
 		return Err(BindingError::UnsupportedExpression {
-			message: "Decimal comparison logical identity target is malformed".to_string(),
+			message: "comparison logical identity target is malformed".to_string(),
 		});
 	}
 	Ok(output)

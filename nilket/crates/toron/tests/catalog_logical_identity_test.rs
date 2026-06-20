@@ -10,10 +10,10 @@ use toron::coordinator::QueryCoordinator;
 use toron::error::{BindingError, CatalogError, QueryError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-	JoinStrategyIntent, JoinStrategyPinSource, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan,
-	LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, QueryId, ScalarValue, SessionId, TableId,
-	decode_column_logical_type,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, DURABLE_LOGICAL_TYPE_MIN_ID, ExecutionPlan, Expr,
+	JoinKind, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource,
+	LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, QueryId,
+	ScalarValue, SessionId, TableId, decode_column_logical_type,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -24,6 +24,7 @@ use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
 };
+use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical};
 
 #[tokio::test]
 async fn catalog_logical_column_binds_and_executes_against_literal() {
@@ -92,6 +93,30 @@ async fn catalog_logical_vs_naked_non_literal_rejects() {
 	.expect_err("catalog identity vs naked non-literal rejects");
 
 	assert_nominal_mismatch(error, "CustomerId", "naked", "Int64");
+}
+
+#[tokio::test]
+async fn numeric_alignment_does_not_erase_logical_identity_mismatch() {
+	let error = bind(
+		&filter(
+			"mixed_ids",
+			Expr::Gt(
+				Box::new(Expr::column("small_id")),
+				Box::new(Expr::column("big_id")),
+			),
+		),
+		&mixed_numeric_logical_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("different logical identities must not be reconciled by numeric casts");
+
+	let message = format!("{error:?}");
+	assert!(
+		message.contains("comparison operands have different types")
+			|| message.contains("NominalTypeMismatch"),
+		"different identities should reject, not bind through an inserted cast: {message}"
+	);
 }
 
 #[test]
@@ -882,6 +907,44 @@ fn join_catalog(left_join_id: LogicalTypeId, right_join_id: LogicalTypeId) -> Mo
 	catalog
 }
 
+fn mixed_numeric_logical_catalog() -> MockCatalog {
+	let small_id = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 20);
+	let big_id = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 21);
+	let mut catalog = MockCatalog::new();
+	for definition in [
+		LogicalTypeDefinition {
+			logical_type_id: small_id.0,
+			name: "SmallId".to_string(),
+			physical: LogicalTypePhysical::Int32,
+			refinement: None,
+			unit: None,
+		},
+		LogicalTypeDefinition {
+			logical_type_id: big_id.0,
+			name: "BigId".to_string(),
+			physical: LogicalTypePhysical::Int64,
+			refinement: None,
+			unit: None,
+		},
+	] {
+		catalog
+			.register_logical_type_for_tenant(TenantId(1), definition)
+			.expect("register mixed logical type");
+	}
+	catalog
+		.register_descriptor(
+			TableId(9),
+			descriptor(
+				9,
+				"mixed_ids",
+				mixed_numeric_logical_schema().as_ref(),
+				"big_id",
+			),
+		)
+		.expect("register mixed logical table");
+	catalog
+}
+
 fn sales_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		logical_field("customer_id", DataType::Int64, CUSTOMER_ID_LOGICAL_TYPE),
@@ -889,6 +952,21 @@ fn sales_schema() -> SchemaRef {
 		logical_field("product_id", DataType::Int64, PRODUCT_ID_LOGICAL_TYPE),
 		Field::new("raw_id", DataType::Int64, false),
 		Field::new("region", DataType::Utf8, true),
+	]))
+}
+
+fn mixed_numeric_logical_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		logical_field(
+			"small_id",
+			DataType::Int32,
+			LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 20),
+		),
+		logical_field(
+			"big_id",
+			DataType::Int64,
+			LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 21),
+		),
 	]))
 }
 

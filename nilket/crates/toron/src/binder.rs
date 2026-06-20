@@ -5207,6 +5207,7 @@ fn bind_comparison(
 	let mut right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	coerce_comparison_literals(builder, left, right, ctx.session_timezone)?;
 	arithmetic::reconcile_decimal_comparison(builder, &mut left, &mut right)?;
+	arithmetic::reconcile_numeric_comparison(builder, &mut left, &mut right)?;
 	let left_type = builder
 		.node_type(left)
 		.cloned()

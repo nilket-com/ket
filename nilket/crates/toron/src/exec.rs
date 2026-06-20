@@ -7150,6 +7150,9 @@ pub(crate) fn evaluate_cast(
 		(DataType::Float64, DataType::Int32) => cast_f64_to_i32(array),
 		(DataType::Float64, DataType::Int64) => cast_f64_to_i64(array),
 		(DataType::Float64, DataType::Float32) => cast_f64_to_f32(array),
+		(DataType::Int32, DataType::Decimal128(_, _))
+		| (DataType::Int64, DataType::Decimal128(_, _)) => arrow::compute::cast(array, target)
+			.map_err(|error| cast_failed(array.data_type(), target, error)),
 		(DataType::Decimal128(_, _), DataType::Decimal128(_, _)) => {
 			arrow::compute::cast(array, target)
 				.map_err(|error| cast_failed(array.data_type(), target, error))

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
@@ -170,6 +170,45 @@ async fn deferred_correlated_scalar_decimal_min_executes() {
 	assert_id_values(&batch, &[1]);
 }
 
+#[tokio::test]
+async fn deferred_correlated_scalar_int32_vs_float64_expression_aligns() {
+	let batch = run_sql(
+		"SELECT prt.p_id FROM prt \
+		 WHERE prt.p_stock > (SELECT AVG(l_qty) FROM itm WHERE l_pid = p_id)",
+	)
+	.await;
+	assert_id_values(&batch, &[2]);
+}
+
+#[tokio::test]
+async fn deferred_correlated_scalar_int32_vs_decimal_expression_aligns() {
+	let batch = run_sql(
+		"SELECT prt.p_id FROM prt \
+		 WHERE prt.p_stock > (SELECT MAX(l_cost) FROM itm WHERE l_pid = p_id)",
+	)
+	.await;
+	assert_id_values(&batch, &[2]);
+}
+
+#[tokio::test]
+async fn int64_decimal_comparison_precision_overflow_rejects_at_bind() {
+	let (catalog, _storage) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT p_id FROM prt WHERE p_big > p_high_scale")
+		.expect("plan overflow comparison");
+	let error = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("Int64 compared to high-scale Decimal exceeds Decimal128 precision");
+	assert!(
+		matches!(
+			error,
+			BindingError::TypeMismatch { ref message }
+				if message.contains("Integer/Decimal comparison operands exceed precision 38")
+		),
+		"unexpected error: {error:?}"
+	);
+}
+
 #[test]
 fn membership_body_composes_nested_in_and_correlated_scalar() {
 	std::thread::Builder::new()
@@ -319,6 +358,9 @@ fn prt_schema() -> SchemaRef {
 		Field::new("p_id", DataType::Int64, false),
 		Field::new("p_lim", DataType::Float64, false),
 		Field::new("p_cost_lim", DataType::Decimal128(15, 2), false),
+		Field::new("p_stock", DataType::Int32, false),
+		Field::new("p_big", DataType::Int64, false),
+		Field::new("p_high_scale", DataType::Decimal128(38, 20), false),
 	]))
 }
 
@@ -348,6 +390,13 @@ fn prt_batch(schema: SchemaRef) -> RecordBatch {
 				Decimal128Array::from(vec![Some(900), Some(21_000)])
 					.with_precision_and_scale(15, 2)
 					.expect("p_cost_lim decimal"),
+			),
+			Arc::new(Int32Array::from(vec![25, 250])),
+			Arc::new(Int64Array::from(vec![25_i64, 250])),
+			Arc::new(
+				Decimal128Array::from(vec![Some(1_i128), Some(2)])
+					.with_precision_and_scale(38, 20)
+					.expect("p_high_scale decimal"),
 			),
 		],
 	)
