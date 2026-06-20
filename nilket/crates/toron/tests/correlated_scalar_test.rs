@@ -170,6 +170,38 @@ async fn deferred_correlated_scalar_decimal_min_executes() {
 	assert_id_values(&batch, &[1]);
 }
 
+#[test]
+fn membership_body_composes_nested_in_and_correlated_scalar() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let batch = run_sql(
+					"SELECT prt.p_id FROM prt \
+					 WHERE p_id IN ( \
+					   SELECT outer_itm.l_pid \
+					   FROM itm AS outer_itm \
+					   WHERE outer_itm.l_pid IN (SELECT d_pid FROM dim WHERE d_region = 'EUROPE') \
+					     AND outer_itm.l_qty < ( \
+					       SELECT MAX(inner_itm.l_qty) \
+					       FROM itm AS inner_itm \
+					       WHERE inner_itm.l_pid = outer_itm.l_pid \
+					     ) \
+					 )",
+				)
+				.await;
+				assert_id_values(&batch, &[1]);
+			});
+		})
+		.expect("spawn membership-body thread")
+		.join()
+		.expect("membership-body thread panicked");
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------

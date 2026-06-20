@@ -63,6 +63,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_decimal_case",
 	"unsupported_decimal_group_key",
 	"unsupported_decimal_arrow",
+	"unsupported_numeric_comparison_alignment",
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
 	"unsupported_correlated_exists",
@@ -84,6 +85,14 @@ pub fn reason_for_error(message: &str) -> &'static str {
 	let lowered = message.to_ascii_lowercase();
 	if lowered.contains("decimal") && lowered.contains("create table") {
 		"unsupported_decimal_ddl"
+	} else if lowered.contains("comparison operands have different types")
+		&& lowered.contains("int32")
+		&& (lowered.contains("float64") || lowered.contains("decimal128"))
+	{
+		// ADR 285: q20's `ps_availqty > 0.5 * SUM(l_quantity)` compares an Int32 column against a
+		// non-literal Float64/Decimal scalar expression. Literal coercion and Decimal-vs-Decimal alignment do
+		// not cover this general numeric comparison alignment.
+		"unsupported_numeric_comparison_alignment"
 	} else if lowered.contains("decimal") && lowered.contains("comparison operands") {
 		// A Decimal column compared against a non-Decimal literal: Toron has no Decimal `ScalarValue`,
 		// so decimal literals lower to `Float64`/integer and the comparison fails type unification. This

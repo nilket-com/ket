@@ -5342,6 +5342,30 @@ impl SqlPlanner {
 		Ok(plan)
 	}
 
+	fn lower_filtering_body(
+		&self,
+		mut plan: LogicalPlan,
+		selection: Option<&SqlExpr>,
+		cte: &CteScope,
+	) -> Result<LogicalPlan, FrontendError> {
+		let Some(selection) = selection else {
+			return Ok(plan);
+		};
+		let mut effective_selection = selection.clone();
+		if expr_contains_subquery(&effective_selection) {
+			let body_qualifiers = plan_qualifiers(&plan);
+			let mut collected = Vec::new();
+			effective_selection = self.pull_up_scalar_subqueries(
+				&effective_selection,
+				&mut collected,
+				&body_qualifiers,
+				cte,
+			)?;
+			plan = self.join_scalar_subplans(plan, collected)?;
+		}
+		self.lower_where(plan, &effective_selection, cte)
+	}
+
 	fn lower_exists_join(
 		&self,
 		outer_plan: LogicalPlan,
@@ -5480,7 +5504,17 @@ impl SqlPlanner {
 		// case. (`context` parameterizes the shared shape-validation messages above.)
 		let mut inner_residuals = Vec::new();
 		let mut correlation_pairs = Vec::new();
-		if let Some(selection) = &select.selection {
+		let use_filtering_pipeline = select.selection.as_ref().is_some_and(|selection| {
+			context == "IN"
+				&& !membership_selection_references_outer(
+					selection,
+					outer_qualifiers,
+					&inner_qualifiers,
+				)
+		});
+		if use_filtering_pipeline {
+			inner_plan = self.lower_filtering_body(inner_plan, select.selection.as_ref(), cte)?;
+		} else if let Some(selection) = &select.selection {
 			for conjunct in split_top_level_and(selection) {
 				match self.classify_exists_conjunct(
 					conjunct,
@@ -9518,6 +9552,16 @@ fn where_has_unqualified_correlation_candidate(selection: &SqlExpr) -> bool {
 			false
 		}
 	})
+}
+
+fn membership_selection_references_outer(
+	selection: &SqlExpr,
+	outer_qualifiers: &[TableRef],
+	inner_qualifiers: &[TableRef],
+) -> bool {
+	split_top_level_and(selection).into_iter().any(|conjunct| {
+		sql_expr_references_outer_qualifier(conjunct, outer_qualifiers, inner_qualifiers)
+	}) || where_has_unqualified_correlation_candidate(selection)
 }
 
 /// ADR 282: rewrite a scalar subquery's projection, replacing its single aggregate call with `replacement`

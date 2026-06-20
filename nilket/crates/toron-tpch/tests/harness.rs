@@ -3,9 +3,9 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_strict_q1,
-	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10,
-	run_strict_q14, run_strict_q17, status_rows,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20,
+	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
+	run_strict_q10, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
 };
 
 #[tokio::test]
@@ -415,6 +415,57 @@ async fn q17_executes_in_both_modes() {
 	);
 }
 
+// ADR 285: q20's nested IN body now composes its own nested IN and correlated scalar instead of stopping at
+// the old `IN subquery is not supported` frontend wall. The measured next wall is the non-literal numeric
+// comparison `ps_availqty > 0.5 * SUM(l_quantity)`, so the honest reachability row is blocked@bind.
+#[test]
+fn q20_advances_to_numeric_comparison_wall() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q20 dev=implemented strict=implemented"),
+					"q20 is an implemented capability in the static inventory"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q20(0.0001).await),
+					("strict", run_strict_q20(0.0001).await),
+				] {
+					assert_eq!(attempt.query, "q20");
+					assert_eq!(
+						attempt.status,
+						Status::Blocked,
+						"q20 {mode} should advance to a classified bind wall: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.phase,
+						Phase::Bind,
+						"q20 {mode}: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.reason.as_deref(),
+						Some("unsupported_numeric_comparison_alignment"),
+						"q20 {mode}: {}",
+						attempt.human()
+					);
+				}
+			});
+		})
+		.expect("spawn q20 thread")
+		.join()
+		.expect("q20 thread panicked");
+}
+
 // ADR 278/279: a genuinely-unsupported correlated EXISTS (e.g. an ambiguous ref the binder can't orient)
 // still classifies precisely as `unsupported_correlated_exists`, not the generic query-surface bucket.
 #[test]
@@ -560,5 +611,24 @@ fn reason_for_error_classifies_decimal_precisely() {
 		reason_for_error("unsupported decimal data type in storage"),
 		"unsupported_decimal_arrow",
 		"an unrelated Decimal message mentioning 'type' must NOT become the scalar gap"
+	);
+}
+
+#[test]
+fn reason_for_error_classifies_numeric_comparison_alignment_precisely() {
+	assert_eq!(
+		reason_for_error("comparison operands have different types: Int32 and Float64"),
+		"unsupported_numeric_comparison_alignment",
+		"q20 dev's measured second wall"
+	);
+	assert_eq!(
+		reason_for_error("comparison operands have different types: Int32 and Decimal128(15, 2)"),
+		"unsupported_numeric_comparison_alignment",
+		"q20 strict's predicted second wall"
+	);
+	assert_eq!(
+		status_for_reason("unsupported_numeric_comparison_alignment"),
+		Status::Blocked,
+		"the precise q20 second wall is a recognized blocker"
 	);
 }

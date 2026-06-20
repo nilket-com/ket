@@ -166,6 +166,35 @@ pub const Q2_DEV_SQL: &str = "SELECT s_acctbal, s_name, n_name, p_partkey, p_mfg
 /// `Decimal128(15,2)` types.
 pub const STRICT_Q2_SQL: &str = Q2_DEV_SQL;
 
+/// ADR 285 — tpch.q20 (Potential Part Promotion): nested membership with a correlated aggregate scalar inside
+/// the membership body. The official interval upper bound is literalized (`DATE '1995-01-01'`) to keep runtime
+/// interval arithmetic out of this reachability row.
+pub const Q20_DEV_SQL: &str = "SELECT s_name, s_address \
+	FROM supplier, nation \
+	WHERE s_suppkey IN ( \
+	  SELECT ps_suppkey \
+	  FROM partsupp \
+	  WHERE ps_partkey IN ( \
+	    SELECT p_partkey \
+	    FROM part \
+	    WHERE p_name LIKE 'forest%' \
+	  ) \
+	    AND ps_availqty > ( \
+	      SELECT 0.5 * SUM(l_quantity) \
+	      FROM lineitem \
+	      WHERE l_partkey = ps_partkey \
+	        AND l_suppkey = ps_suppkey \
+	        AND l_shipdate >= DATE '1994-01-01' \
+	        AND l_shipdate < DATE '1995-01-01' \
+	    ) \
+	) \
+	  AND s_nationkey = n_nationkey \
+	  AND n_name = 'CANADA' \
+	ORDER BY s_name";
+
+/// strict q20 — identical SQL shape; strict mode carries official Decimal128 lineitem quantities.
+pub const STRICT_Q20_SQL: &str = Q20_DEV_SQL;
+
 /// Q3 Shipping Priority reachability SQL: tpchgen-2.0.2's Q3 text with the `:1`/`:2`
 /// params bound to literals (`'BUILDING'`, `DATE '1995-03-15'`) and no `LIMIT` (the
 /// bundled text carries none). Same text both modes; only `lineitem` types differ.
@@ -445,6 +474,8 @@ fn part_schema() -> SchemaRef {
 		// ADR 284: q02 filter/projection columns, appended (q14/q17 ignore them).
 		Field::new("p_size", DataType::Int32, false),
 		Field::new("p_mfgr", DataType::Utf8, false),
+		// ADR 285: q20 filters by part name prefix; appended so prior projections keep their positions.
+		Field::new("p_name", DataType::Utf8, false),
 	]))
 }
 
@@ -472,6 +503,7 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 	let mut container = Vec::new();
 	let mut size = Vec::new();
 	let mut mfgr = Vec::new();
+	let mut name = Vec::new();
 	for item in generator.iter() {
 		partkey.push(item.p_partkey);
 		part_type.push(item.p_type.to_string());
@@ -479,6 +511,7 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 		container.push(item.p_container.to_string());
 		size.push(item.p_size);
 		mfgr.push(item.p_mfgr.to_string());
+		name.push(item.p_name.to_string());
 	}
 	RecordBatch::try_new(
 		part_schema(),
@@ -489,6 +522,7 @@ pub fn generate_part(scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(container)),
 			Arc::new(Int32Array::from(size)),
 			Arc::new(StringArray::from(mfgr)),
+			Arc::new(StringArray::from(name)),
 		],
 	)
 	.expect("part batch")
@@ -2024,6 +2058,30 @@ pub async fn run_strict_q02(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 285 — dev q20: nested membership plus a correlated scalar in the membership body.
+pub async fn run_dev_q20(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q20",
+		"dev",
+		scale_factor,
+		Q20_DEV_SQL,
+		q20_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 285 — strict q20: same shape, with the strict `Decimal128(15,2)` lineitem quantity.
+pub async fn run_strict_q20(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q20",
+		"strict",
+		scale_factor,
+		STRICT_Q20_SQL,
+		q20_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// The five q02 harness tables: `part`, `supplier`, `partsupp`, `nation`, and `region`.
 fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let part = generate_part(scale_factor);
@@ -2066,6 +2124,61 @@ fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: region_descriptor(region_schema().as_ref()),
 			facts: facts_for_batch(&region),
 			batch: region,
+		},
+	]
+}
+
+/// The five q20 harness tables: supplier/nation outer query, partsupp/part nested membership, lineitem scalar.
+fn q20_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let supplier = generate_supplier(strict, scale_factor);
+	let nation = generate_nation(scale_factor);
+	let partsupp = generate_partsupp(strict, scale_factor);
+	let part = generate_part(scale_factor);
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "nation",
+			descriptor: nation_descriptor(nation_schema().as_ref()),
+			facts: facts_for_batch(&nation),
+			batch: nation,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "partsupp",
+			descriptor: partsupp_descriptor(partsupp_schema(strict).as_ref()),
+			facts: facts_for_batch(&partsupp),
+			batch: partsupp,
+		},
+		HarnessTable {
+			id: TableId(4),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+		HarnessTable {
+			id: TableId(5),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
 		},
 	]
 }
@@ -2291,6 +2404,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q03" || *id == "q10"
 					|| *id == "q05" || *id == "q04"
 					|| *id == "q17" || *id == "q02"
+					|| *id == "q20"
 				{
 					"implemented"
 				} else {
