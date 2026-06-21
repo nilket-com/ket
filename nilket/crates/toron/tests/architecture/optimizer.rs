@@ -2274,7 +2274,7 @@ pub(crate) fn adr145_derived_join_rejects_non_inner_chains() {
 pub(crate) fn adr145_derived_join_keeps_v1_derived_fences() {
 	let planner = planner_source();
 	let table_factor = source_block(&planner, "fn lower_table_factor");
-	let select_shape = source_block(&planner, "fn validate_derived_select_shape");
+	let factor_shape = source_block(&planner, "fn validate_derived_table_factor");
 	let query_shape = source_block(&planner, "fn validate_derived_query_shape");
 
 	for marker in [
@@ -2292,8 +2292,8 @@ pub(crate) fn adr145_derived_join_keeps_v1_derived_fences() {
 	// ADR 254 lifts the joins-inside fence; the nested-derived fence remains.
 	for marker in ["nested derived tables are not supported"] {
 		assert!(
-			select_shape.contains(marker),
-			"missing derived select-shape fence {marker}"
+			factor_shape.contains(marker),
+			"missing derived factor-shape fence {marker}"
 		);
 	}
 	assert!(query_shape.contains("unsupported derived table query body"));

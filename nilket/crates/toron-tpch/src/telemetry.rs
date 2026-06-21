@@ -146,10 +146,8 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// to the generic query-surface bucket below.
 		"unsupported_correlated_exists"
 	} else if lowered.contains("derived table subquery must have exactly one from source") {
-		// ADR 293: q07's `shipping` derived table has an official comma-join FROM list
-		// (`supplier, lineitem, orders, customer, nation n1, nation n2`). The current derived-table
-		// frontend accepts join-bodied single FROM sources, but still rejects multi-source comma lists before
-		// the self-join alias question is reached.
+		// ADR 293/294: this was q07's raw derived comma-list wall before ADR 294 relaxed the derived-table
+		// validator. Keep the classifier precise for old rows and targeted regression probes.
 		"unsupported_derived_multi_source"
 	} else if lowered.contains("not supported") || lowered.contains("unsupported") {
 		"unsupported_query_surface"

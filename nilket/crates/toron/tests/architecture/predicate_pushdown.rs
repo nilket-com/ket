@@ -1689,6 +1689,8 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 	let table_factor = first_block(&planner, "fn lower_table_factor");
 	let query_shape = first_block(&planner, "fn validate_derived_query_shape");
 	let select_shape = first_block(&planner, "fn validate_derived_select_shape");
+	let source_shape = first_block(&planner, "fn validate_derived_table_source");
+	let factor_shape = first_block(&planner, "fn validate_derived_table_factor");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 
 	assert!(table_factor.contains("TableFactor::Derived"));
@@ -1719,13 +1721,27 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 	assert!(!query_shape.contains("query_has_limit_or_offset"));
 	for marker in [
 		"projection_contains_window_function",
-		"select.from.len() != 1",
-		"TableFactor::Derived",
-		"unsupported derived table source",
+		"select.from.is_empty()",
+		"validate_derived_table_source(source)?",
 	] {
 		assert!(
 			select_shape.contains(marker),
 			"missing select-shape marker {marker}"
+		);
+	}
+	for marker in [
+		"validate_derived_table_factor(&source.relation)?",
+		"validate_derived_table_factor(&join.relation)?",
+	] {
+		assert!(
+			source_shape.contains(marker),
+			"missing derived source-shape marker {marker}"
+		);
+	}
+	for marker in ["TableFactor::Derived", "unsupported derived table source"] {
+		assert!(
+			factor_shape.contains(marker),
+			"missing derived factor-shape marker {marker}"
 		);
 	}
 	assert!(lower_select.contains("contains_derived_join_factor"));
@@ -2168,6 +2184,8 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 	let planner = source("src/sql_planner.rs");
 	let query_shape = first_block(&planner, "fn validate_derived_query_shape");
 	let select_shape = first_block(&planner, "fn validate_derived_select_shape");
+	let source_shape = first_block(&planner, "fn validate_derived_table_source");
+	let factor_shape = first_block(&planner, "fn validate_derived_table_factor");
 
 	for marker in [
 		"query.with.is_some()",
@@ -2183,13 +2201,27 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 	assert!(!query_shape.contains("query_has_limit_or_offset"));
 	for marker in [
 		"projection_contains_window_function",
-		"select.from.len() != 1",
-		"TableFactor::Derived",
-		"unsupported derived table source",
+		"select.from.is_empty()",
+		"validate_derived_table_source(source)?",
 	] {
 		assert!(
 			select_shape.contains(marker),
 			"missing derived select fence {marker}"
+		);
+	}
+	for marker in [
+		"validate_derived_table_factor(&source.relation)?",
+		"validate_derived_table_factor(&join.relation)?",
+	] {
+		assert!(
+			source_shape.contains(marker),
+			"missing derived source fence {marker}"
+		);
+	}
+	for marker in ["TableFactor::Derived", "unsupported derived table source"] {
+		assert!(
+			factor_shape.contains(marker),
+			"missing derived factor fence {marker}"
 		);
 	}
 	for removed in [

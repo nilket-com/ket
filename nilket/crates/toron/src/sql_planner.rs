@@ -22,8 +22,8 @@ use sqlparser::ast::{
 	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, NullTreatment, ObjectName,
 	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
 	Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
-	TableConstraint, TableFactor, TableObject, TimezoneInfo, TypedString, UnaryOperator, Value,
-	WindowSpec, WindowType,
+	TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TypedString,
+	UnaryOperator, Value, WindowSpec, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -9261,15 +9261,29 @@ fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
 	if projection_contains_window_function(&select.projection) {
 		return Err(unsupported("unsupported derived table projection"));
 	}
-	if select.from.len() != 1 {
+	if select.from.is_empty() {
 		return Err(unsupported(
-			"derived table subquery must have exactly one FROM source",
+			"derived table subquery must have at least one FROM source",
 		));
 	}
-	// ADR 254: joins inside a derived table now lower (the binder presents a join-bodied subplan as a
-	// named relation — the same capability CTEs use). Nested derived tables and lateral stay deferred.
-	let source = &select.from[0];
-	match &source.relation {
+	for source in &select.from {
+		validate_derived_table_source(source)?;
+	}
+	Ok(())
+}
+
+fn validate_derived_table_source(source: &TableWithJoins) -> Result<(), FrontendError> {
+	validate_derived_table_factor(&source.relation)?;
+	for join in &source.joins {
+		validate_derived_table_factor(&join.relation)?;
+	}
+	Ok(())
+}
+
+fn validate_derived_table_factor(factor: &TableFactor) -> Result<(), FrontendError> {
+	// Table join bodies and comma-list bodies lower through the shared `lower_select` path. Nested
+	// derived factors stay fenced; detailed table-factor checks remain in `lower_table_factor`.
+	match factor {
 		TableFactor::Table { .. } => Ok(()),
 		TableFactor::Derived { .. } => Err(unsupported("nested derived tables are not supported")),
 		_ => Err(unsupported("unsupported derived table source")),

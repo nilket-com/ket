@@ -163,5 +163,5 @@ fn adr293_q07_is_wired_as_a_single_physical_nation_self_join() {
 	);
 	assert!(lib.contains("|| *id == \"q07\""));
 	assert!(main.contains("\"q07\" | \"q7\""));
-	assert!(harness.contains("q07_advances_to_derived_multi_source_wall"));
+	assert!(harness.contains("q07_executes_in_both_modes"));
 }

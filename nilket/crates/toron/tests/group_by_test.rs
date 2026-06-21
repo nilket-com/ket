@@ -2242,6 +2242,39 @@ async fn derived_table_join_body_executes() {
 	);
 }
 
+#[tokio::test]
+async fn derived_table_comma_list_body_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT bucket, COUNT(*) \
+		 FROM (SELECT left_dups.label AS bucket \
+		       FROM left_dups, right_dups \
+		       WHERE left_dups.k = right_dups.k) d \
+		 GROUP BY bucket",
+	))
+	.await;
+	assert_eq!(
+		sorted_utf8_int64_rows(&results, 0, 1),
+		vec![(Some("A".to_string()), 4), (Some("B".to_string()), 1)]
+	);
+}
+
+#[test]
+fn derived_table_comma_list_keeps_nested_derived_fences() {
+	assert_unsupported_message(
+		"SELECT bucket \
+		 FROM (SELECT left_dups.label AS bucket \
+		       FROM left_dups, (SELECT k FROM right_dups) r \
+		       WHERE left_dups.k = r.k) d",
+		"nested derived tables are not supported",
+	);
+	assert_unsupported_message(
+		"SELECT bucket \
+		 FROM (SELECT left_dups.label AS bucket \
+		       FROM left_dups JOIN (SELECT k FROM right_dups) r ON left_dups.k = r.k) d",
+		"nested derived tables are not supported",
+	);
+}
+
 // ---------------------------------------------------------------------------
 // ADR 254 — common table expressions (non-recursive WITH)
 // ---------------------------------------------------------------------------

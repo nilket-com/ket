@@ -279,43 +279,48 @@ fn q05_executes_in_both_modes() {
 		.expect("q05 thread panicked");
 }
 
-// ADR 293: q07 is wired into the gauge with the official derived `shipping` subquery. The first measured
-// wall is earlier than the intended self-join probe: the derived-table frontend still rejects a comma-join
-// FROM list (`derived table subquery must have exactly one FROM source`), so both modes stop at plan with a
-// precise blocker. This is an honest red row naming ADR 294, not a hollow green.
-#[tokio::test]
-async fn q07_advances_to_derived_multi_source_wall() {
-	assert!(
-		status_rows()
-			.iter()
-			.any(|row| row == "q07 dev=implemented strict=implemented"),
-		"q07 is an implemented capability in the static inventory"
-	);
+// ADR 294: q07's derived `shipping` subquery has a comma-list FROM body. Both modes now reach execute at
+// the default scale, which proves the derived comma join is keyed rather than materialized as a cartesian.
+#[test]
+fn q07_executes_in_both_modes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q07 dev=implemented strict=implemented"),
+					"q07 is an implemented capability in the static inventory"
+				);
 
-	for (mode, attempt) in [
-		("dev", run_dev_q07(0.01).await),
-		("strict", run_strict_q07(0.01).await),
-	] {
-		assert_eq!(attempt.query, "q07");
-		assert_eq!(attempt.status, Status::Blocked, "{}", attempt.human());
-		assert_eq!(
-			attempt.phase,
-			Phase::Plan,
-			"q07 {mode}: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unsupported_derived_multi_source"),
-			"q07 {mode} first wall should be precise: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.digest.is_none(),
-			"blocked q07 must not carry a digest: {}",
-			attempt.human()
-		);
-	}
+				for (mode, attempt) in [
+					("dev", run_dev_q07(0.01).await),
+					("strict", run_strict_q07(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q07");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q07 {mode} reaches execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
+			});
+		})
+		.expect("spawn q07 thread")
+		.join()
+		.expect("q07 thread panicked");
 }
 
 // ADR 284: q02 exercises a five-table outer comma join plus a correlated scalar whose inner side is a
