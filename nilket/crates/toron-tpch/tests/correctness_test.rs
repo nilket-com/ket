@@ -8,15 +8,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	DecimalRaw, Q1Group, Q3Group, Q5Group, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE,
-	Q17Oracle, assert_strict_q1_schema, assert_strict_q3_schema, assert_strict_q5_schema,
-	assert_strict_q12_schema, assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q12,
-	check_strict_q14, check_strict_q17, compare_strict_q1, compare_strict_q3, compare_strict_q5,
-	compare_strict_q6, compare_strict_q12, compare_strict_q14, compare_strict_q17,
-	correctness_matrix_from_log, decimal_division_raw, q6_row_revenue, strict_q1_oracle,
-	strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q12_oracle, strict_q14_oracle,
-	strict_q17_oracle,
+	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q5Group, Q12Group, Q12Oracle, Q14Oracle,
+	Q17_CORRECTNESS_SCALE, Q17Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
+	assert_strict_q3_schema, assert_strict_q5_schema, assert_strict_q12_schema,
+	assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw, check_strict_q1,
+	check_strict_q02, check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q12,
+	check_strict_q14, check_strict_q17, compare_strict_q1, compare_strict_q02, compare_strict_q3,
+	compare_strict_q5, compare_strict_q6, compare_strict_q12, compare_strict_q14,
+	compare_strict_q17, correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
+	q6_row_revenue, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q5_oracle,
+	strict_q6_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -509,6 +510,316 @@ fn q3_duplicate_output_key_is_fail_at_compare() {
 		)
 		.is_err(),
 		"a duplicate emitted l_orderkey is rejected"
+	);
+}
+
+#[derive(Clone)]
+struct NullableQ02Row {
+	s_acctbal: Option<i128>,
+	s_name: Option<String>,
+	n_name: Option<String>,
+	p_partkey: Option<i64>,
+	p_mfgr: Option<String>,
+	s_address: Option<String>,
+	s_phone: Option<String>,
+	s_comment: Option<String>,
+}
+
+fn q02_row(s_acctbal: i128, s_name: &str, n_name: &str, p_partkey: i64, p_mfgr: &str) -> Q02Row {
+	Q02Row {
+		s_acctbal,
+		s_name: s_name.to_string(),
+		n_name: n_name.to_string(),
+		p_partkey,
+		p_mfgr: p_mfgr.to_string(),
+		s_address: format!("{s_name} address"),
+		s_phone: format!("{s_name} phone"),
+		s_comment: format!("{s_name} comment"),
+	}
+}
+
+fn nullable_q02_row(row: &Q02Row) -> NullableQ02Row {
+	NullableQ02Row {
+		s_acctbal: Some(row.s_acctbal),
+		s_name: Some(row.s_name.clone()),
+		n_name: Some(row.n_name.clone()),
+		p_partkey: Some(row.p_partkey),
+		p_mfgr: Some(row.p_mfgr.clone()),
+		s_address: Some(row.s_address.clone()),
+		s_phone: Some(row.s_phone.clone()),
+		s_comment: Some(row.s_comment.clone()),
+	}
+}
+
+fn q02_batch(rows: &[Q02Row]) -> RecordBatch {
+	let nullable_rows: Vec<NullableQ02Row> = rows.iter().map(nullable_q02_row).collect();
+	q02_nullable_batch(&nullable_rows)
+}
+
+fn q02_nullable_batch(rows: &[NullableQ02Row]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("s_acctbal", DataType::Decimal128(15, 2), true),
+		Field::new("s_name", DataType::Utf8, true),
+		Field::new("n_name", DataType::Utf8, true),
+		Field::new("p_partkey", DataType::Int64, true),
+		Field::new("p_mfgr", DataType::Utf8, true),
+		Field::new("s_address", DataType::Utf8, true),
+		Field::new("s_phone", DataType::Utf8, true),
+		Field::new("s_comment", DataType::Utf8, true),
+	]));
+	let strings = |f: fn(&NullableQ02Row) -> &Option<String>| {
+		Arc::new(StringArray::from(
+			rows.iter()
+				.map(|row| f(row).as_deref())
+				.collect::<Vec<Option<&str>>>(),
+		)) as ArrayRef
+	};
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.s_acctbal).collect::<Vec<_>>())
+					.with_precision_and_scale(15, 2)
+					.expect("q02 s_acctbal decimal column"),
+			),
+			strings(|row| &row.s_name),
+			strings(|row| &row.n_name),
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.p_partkey).collect::<Vec<_>>(),
+			)),
+			strings(|row| &row.p_mfgr),
+			strings(|row| &row.s_address),
+			strings(|row| &row.s_phone),
+			strings(|row| &row.s_comment),
+		],
+	)
+	.expect("q02 batch")
+}
+
+fn q02_int32_partkey_batch() -> RecordBatch {
+	let row = q02_row(100, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("s_acctbal", DataType::Decimal128(15, 2), true),
+			Field::new("s_name", DataType::Utf8, true),
+			Field::new("n_name", DataType::Utf8, true),
+			Field::new("p_partkey", DataType::Int32, true),
+			Field::new("p_mfgr", DataType::Utf8, true),
+			Field::new("s_address", DataType::Utf8, true),
+			Field::new("s_phone", DataType::Utf8, true),
+			Field::new("s_comment", DataType::Utf8, true),
+		])),
+		vec![
+			Arc::new(
+				Decimal128Array::from(vec![Some(row.s_acctbal)])
+					.with_precision_and_scale(15, 2)
+					.expect("q02 acctbal"),
+			),
+			Arc::new(StringArray::from(vec![Some(row.s_name.as_str())])),
+			Arc::new(StringArray::from(vec![Some(row.n_name.as_str())])),
+			Arc::new(Int32Array::from(vec![Some(row.p_partkey as i32)])),
+			Arc::new(StringArray::from(vec![Some(row.p_mfgr.as_str())])),
+			Arc::new(StringArray::from(vec![Some(row.s_address.as_str())])),
+			Arc::new(StringArray::from(vec![Some(row.s_phone.as_str())])),
+			Arc::new(StringArray::from(vec![Some(row.s_comment.as_str())])),
+		],
+	)
+	.expect("q02 int32 partkey batch")
+}
+
+fn q02_oracle(rows: Vec<Q02Row>) -> Q02Oracle {
+	Q02Oracle {
+		matched_parts: rows
+			.iter()
+			.map(|row| row.p_partkey)
+			.collect::<std::collections::BTreeSet<_>>()
+			.len(),
+		rows,
+		min_tie_parts: 0,
+	}
+}
+
+#[test]
+fn strict_q02_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q02(0.01))
+		})
+		.expect("spawn q02 correctness thread")
+		.join()
+		.expect("q02 correctness thread panicked");
+	assert_eq!(attempt.query, "q02");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q02_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q02_oracle(0.01);
+	assert!(
+		oracle.matched_parts > 0,
+		"matched parts: {}",
+		oracle.matched_parts
+	);
+	assert!(
+		!oracle.rows.is_empty(),
+		"oracle rows: {}",
+		oracle.rows.len()
+	);
+}
+
+#[test]
+fn strict_q02_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q02_schema(&[q02_batch(&[q02_row(
+			100,
+			"Supplier#000000001",
+			"GERMANY",
+			10,
+			"Manufacturer#1"
+		)])])
+		.is_ok()
+	);
+	assert!(
+		assert_strict_q02_schema(&[q02_int32_partkey_batch()]).is_err(),
+		"a non-measured p_partkey type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q02_brass_is_suffix_match() {
+	assert!(q02_type_matches_brass("ECONOMY ANODIZED BRASS"));
+	assert!(q02_type_matches_brass("BRASS"));
+	assert!(
+		!q02_type_matches_brass("BRASS PLATED STEEL"),
+		"LIKE '%BRASS' is a suffix match, not contains"
+	);
+	assert!(!q02_type_matches_brass("ECONOMY ANODIZED BRASSX"));
+}
+
+#[test]
+fn q02_correctness_mismatch_is_fail_at_compare() {
+	let row = q02_row(500, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	let oracle = q02_oracle(vec![row.clone()]);
+
+	let mut wrong_acctbal = row.clone();
+	wrong_acctbal.s_acctbal += 1;
+	assert!(
+		compare_strict_q02(&[q02_batch(&[wrong_acctbal])], &oracle).is_err(),
+		"an off-by-one Decimal acctbal is a mismatch"
+	);
+
+	let mut wrong_string = row.clone();
+	wrong_string.s_name.push_str("-wrong");
+	assert!(
+		compare_strict_q02(&[q02_batch(&[wrong_string])], &oracle).is_err(),
+		"a wrong projected string is a mismatch"
+	);
+
+	let mut wrong_partkey = row.clone();
+	wrong_partkey.p_partkey += 1;
+	assert!(
+		compare_strict_q02(&[q02_batch(&[wrong_partkey])], &oracle).is_err(),
+		"a wrong p_partkey is a mismatch"
+	);
+}
+
+#[test]
+fn q02_dropped_min_tie_supplier_is_fail() {
+	let row_a = q02_row(500, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	let row_b = q02_row(400, "Supplier#000000002", "GERMANY", 10, "Manufacturer#1");
+	let mut oracle = q02_oracle(vec![row_a.clone(), row_b.clone()]);
+	oracle.min_tie_parts = 1;
+	assert!(
+		compare_strict_q02(&[q02_batch(&[row_a])], &oracle).is_err(),
+		"dropping one same-part min supplier must fail"
+	);
+}
+
+#[test]
+fn q02_extra_missing_or_duplicate_row_is_fail_at_compare() {
+	let row_a = q02_row(500, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	let row_b = q02_row(400, "Supplier#000000002", "FRANCE", 20, "Manufacturer#2");
+	let oracle = q02_oracle(vec![row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q02(&[q02_batch(&[row_a.clone()])], &oracle).is_err(),
+		"a missing row is a mismatch"
+	);
+	let extra = q02_row(300, "Supplier#000000003", "FRANCE", 20, "Manufacturer#2");
+	assert!(
+		compare_strict_q02(
+			&[q02_batch(&[row_a.clone(), row_b.clone(), extra])],
+			&oracle
+		)
+		.is_err(),
+		"an extra non-min row is a mismatch"
+	);
+	assert!(
+		compare_strict_q02(&[q02_batch(&[row_a.clone(), row_a])], &oracle).is_err(),
+		"an unexpected duplicate row is a mismatch"
+	);
+}
+
+#[test]
+fn q02_null_cell_is_fail_at_compare() {
+	let row = q02_row(500, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	let oracle = q02_oracle(vec![row.clone()]);
+	let mut cases: Vec<(&str, NullableQ02Row)> = Vec::new();
+
+	let mut null_row = nullable_q02_row(&row);
+	null_row.s_acctbal = None;
+	cases.push(("s_acctbal", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.s_name = None;
+	cases.push(("s_name", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.n_name = None;
+	cases.push(("n_name", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.p_partkey = None;
+	cases.push(("p_partkey", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.p_mfgr = None;
+	cases.push(("p_mfgr", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.s_address = None;
+	cases.push(("s_address", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.s_phone = None;
+	cases.push(("s_phone", null_row));
+	let mut null_row = nullable_q02_row(&row);
+	null_row.s_comment = None;
+	cases.push(("s_comment", null_row));
+
+	for (column, row) in cases {
+		assert!(
+			compare_strict_q02(&[q02_nullable_batch(&[row])], &oracle).is_err(),
+			"a NULL {column} is fail@compare"
+		);
+	}
+}
+
+#[test]
+fn q02_order_violation_is_fail() {
+	let row_a = q02_row(100, "Supplier#000000001", "GERMANY", 10, "Manufacturer#1");
+	let row_b = q02_row(200, "Supplier#000000002", "GERMANY", 20, "Manufacturer#1");
+	let oracle = q02_oracle(vec![row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q02(&[q02_batch(&[row_a, row_b])], &oracle).is_err(),
+		"s_acctbal ascending violates ORDER BY s_acctbal DESC"
+	);
+
+	let row_a = q02_row(100, "Supplier#000000001", "ZAMBIA", 10, "Manufacturer#1");
+	let row_b = q02_row(100, "Supplier#000000002", "ARGENTINA", 20, "Manufacturer#1");
+	let oracle = q02_oracle(vec![row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q02(&[q02_batch(&[row_a, row_b])], &oracle).is_err(),
+		"n_name descending within equal acctbal violates the ASC secondary key"
 	);
 }
 

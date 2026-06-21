@@ -2173,6 +2173,388 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Q02Row {
+	pub s_acctbal: i128,
+	pub s_name: String,
+	pub n_name: String,
+	pub p_partkey: i64,
+	pub p_mfgr: String,
+	pub s_address: String,
+	pub s_phone: String,
+	pub s_comment: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q02Oracle {
+	pub rows: Vec<Q02Row>,
+	pub matched_parts: usize,
+	pub min_tie_parts: usize,
+}
+
+pub fn q02_type_matches_brass(part_type: &str) -> bool {
+	part_type.ends_with("BRASS")
+}
+
+#[derive(Debug, Clone)]
+struct Q02Supplier {
+	acctbal_raw: i128,
+	name: String,
+	nation_name: String,
+	address: String,
+	phone: String,
+	comment: String,
+}
+
+#[derive(Debug, Clone)]
+struct Q02PartSupp {
+	partkey: i64,
+	suppkey: i64,
+	supplycost_raw: i128,
+}
+
+/// Independent strict-q02 oracle: traverse the five q02 generators directly, compute the EUROPE-scoped
+/// per-part minimum supply cost, then emit every min-cost supplier row.
+pub fn strict_q02_oracle(scale_factor: f64) -> Q02Oracle {
+	let mut europe_regions: HashSet<i64> = HashSet::new();
+	for region in RegionGenerator::new(scale_factor, 1, 1).iter() {
+		if region.r_name == "EUROPE" {
+			europe_regions.insert(region.r_regionkey);
+		}
+	}
+
+	let mut europe_nations: HashMap<i64, String> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		if europe_regions.contains(&nation.n_regionkey) {
+			europe_nations.insert(nation.n_nationkey, nation.n_name.to_string());
+		}
+	}
+
+	let mut suppliers: HashMap<i64, Q02Supplier> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		let Some(nation_name) = europe_nations.get(&supplier.s_nationkey) else {
+			continue;
+		};
+		suppliers.insert(
+			supplier.s_suppkey,
+			Q02Supplier {
+				acctbal_raw: supplier.s_acctbal.into_inner() as i128,
+				name: supplier.s_name.to_string(),
+				nation_name: nation_name.clone(),
+				address: supplier.s_address.to_string(),
+				phone: supplier.s_phone.to_string(),
+				comment: supplier.s_comment.to_string(),
+			},
+		);
+	}
+
+	let mut parts: HashMap<i64, String> = HashMap::new();
+	for part in PartGenerator::new(scale_factor, 1, 1).iter() {
+		if part.p_size == 15 && q02_type_matches_brass(part.p_type) {
+			parts.insert(part.p_partkey, part.p_mfgr.to_string());
+		}
+	}
+
+	let mut candidates = Vec::new();
+	let mut min_by_part: BTreeMap<i64, i128> = BTreeMap::new();
+	for partsupp in PartSuppGenerator::new(scale_factor, 1, 1).iter() {
+		if !parts.contains_key(&partsupp.ps_partkey)
+			|| !suppliers.contains_key(&partsupp.ps_suppkey)
+		{
+			continue;
+		}
+		let supplycost_raw = partsupp.ps_supplycost.into_inner() as i128;
+		candidates.push(Q02PartSupp {
+			partkey: partsupp.ps_partkey,
+			suppkey: partsupp.ps_suppkey,
+			supplycost_raw,
+		});
+		min_by_part
+			.entry(partsupp.ps_partkey)
+			.and_modify(|current| *current = (*current).min(supplycost_raw))
+			.or_insert(supplycost_raw);
+	}
+
+	let mut min_counts: BTreeMap<i64, usize> = BTreeMap::new();
+	let mut rows = Vec::new();
+	for candidate in candidates {
+		let Some(&min_cost) = min_by_part.get(&candidate.partkey) else {
+			continue;
+		};
+		if candidate.supplycost_raw != min_cost {
+			continue;
+		}
+		*min_counts.entry(candidate.partkey).or_insert(0) += 1;
+		let Some(part_mfgr) = parts.get(&candidate.partkey) else {
+			continue;
+		};
+		let Some(supplier) = suppliers.get(&candidate.suppkey) else {
+			continue;
+		};
+		rows.push(Q02Row {
+			s_acctbal: supplier.acctbal_raw,
+			s_name: supplier.name.clone(),
+			n_name: supplier.nation_name.clone(),
+			p_partkey: candidate.partkey,
+			p_mfgr: part_mfgr.clone(),
+			s_address: supplier.address.clone(),
+			s_phone: supplier.phone.clone(),
+			s_comment: supplier.comment.clone(),
+		});
+	}
+
+	rows.sort_by(q02_ordering);
+	let min_tie_parts = min_counts.values().filter(|&&count| count >= 2).count();
+	Q02Oracle {
+		rows,
+		matched_parts: min_by_part.len(),
+		min_tie_parts,
+	}
+}
+
+fn q02_ordering(left: &Q02Row, right: &Q02Row) -> std::cmp::Ordering {
+	right
+		.s_acctbal
+		.cmp(&left.s_acctbal)
+		.then_with(|| left.n_name.cmp(&right.n_name))
+		.then_with(|| left.s_name.cmp(&right.s_name))
+		.then_with(|| left.p_partkey.cmp(&right.p_partkey))
+}
+
+fn q02_order_pair_is_valid(left: &Q02Row, right: &Q02Row) -> bool {
+	use std::cmp::Ordering;
+
+	match left.s_acctbal.cmp(&right.s_acctbal) {
+		Ordering::Greater => return true,
+		Ordering::Less => return false,
+		Ordering::Equal => {}
+	}
+	match left.n_name.cmp(&right.n_name) {
+		Ordering::Less => return true,
+		Ordering::Greater => return false,
+		Ordering::Equal => {}
+	}
+	match left.s_name.cmp(&right.s_name) {
+		Ordering::Less => return true,
+		Ordering::Greater => return false,
+		Ordering::Equal => {}
+	}
+	left.p_partkey <= right.p_partkey
+}
+
+fn strict_q02_expected_schema() -> [(&'static str, DataType); 8] {
+	[
+		("s_acctbal", DataType::Decimal128(15, 2)),
+		("s_name", DataType::Utf8),
+		("n_name", DataType::Utf8),
+		("p_partkey", DataType::Int64),
+		("p_mfgr", DataType::Utf8),
+		("s_address", DataType::Utf8),
+		("s_phone", DataType::Utf8),
+		("s_comment", DataType::Utf8),
+	]
+}
+
+pub fn assert_strict_q02_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q02_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q02 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q02(batches: &[RecordBatch], oracle: &Q02Oracle) -> Result<(), String> {
+	assert_strict_q02_schema(batches)?;
+	if oracle.matched_parts == 0 || oracle.rows.is_empty() {
+		return Err(format!(
+			"oracle non-vacuous guard failed: matched_parts={} rows={}",
+			oracle.matched_parts,
+			oracle.rows.len()
+		));
+	}
+
+	let mut emitted = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 8 {
+			return Err(format!("expected 8 columns, got {}", batch.num_columns()));
+		}
+		let acctbals = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 0 (s_acctbal) not Decimal128")?;
+		let supplier_names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (s_name) not Utf8")?;
+		let nation_names = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 2 (n_name) not Utf8")?;
+		let partkeys = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 3 (p_partkey) not Int64")?;
+		let mfgrs = batch
+			.column(4)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 4 (p_mfgr) not Utf8")?;
+		let addresses = batch
+			.column(5)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 5 (s_address) not Utf8")?;
+		let phones = batch
+			.column(6)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 6 (s_phone) not Utf8")?;
+		let comments = batch
+			.column(7)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 7 (s_comment) not Utf8")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if acctbals.is_null(i) {
+				return Err(format!("column s_acctbal row {row_index} is NULL"));
+			}
+			if supplier_names.is_null(i) {
+				return Err(format!("column s_name row {row_index} is NULL"));
+			}
+			if nation_names.is_null(i) {
+				return Err(format!("column n_name row {row_index} is NULL"));
+			}
+			if partkeys.is_null(i) {
+				return Err(format!("column p_partkey row {row_index} is NULL"));
+			}
+			if mfgrs.is_null(i) {
+				return Err(format!("column p_mfgr row {row_index} is NULL"));
+			}
+			if addresses.is_null(i) {
+				return Err(format!("column s_address row {row_index} is NULL"));
+			}
+			if phones.is_null(i) {
+				return Err(format!("column s_phone row {row_index} is NULL"));
+			}
+			if comments.is_null(i) {
+				return Err(format!("column s_comment row {row_index} is NULL"));
+			}
+			emitted.push(Q02Row {
+				s_acctbal: acctbals.value(i),
+				s_name: supplier_names.value(i).to_string(),
+				n_name: nation_names.value(i).to_string(),
+				p_partkey: partkeys.value(i),
+				p_mfgr: mfgrs.value(i).to_string(),
+				s_address: addresses.value(i).to_string(),
+				s_phone: phones.value(i).to_string(),
+				s_comment: comments.value(i).to_string(),
+			});
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if !q02_order_pair_is_valid(&pair[0], &pair[1]) {
+			return Err(format!(
+				"ORDER BY s_acctbal DESC, n_name, s_name, p_partkey violated between {:?} and {:?}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	let mut actual = emitted;
+	let mut expected = oracle.rows.clone();
+	actual.sort();
+	expected.sort();
+	if actual.len() != expected.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			expected.len(),
+			actual.len()
+		));
+	}
+	for (idx, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate() {
+		if actual_row != expected_row {
+			return Err(format!(
+				"row {idx} mismatch after canonical sort: expected {:?}, got {:?}",
+				expected_row, actual_row
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q02(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q02_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q02".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q2_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q02_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q02_oracle(scale_factor);
+	if oracle.matched_parts == 0 || oracle.rows.is_empty() {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: matched_parts={} rows={}",
+				oracle.matched_parts,
+				oracle.rows.len()
+			)),
+		);
+	}
+	match compare_strict_q02(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q12Group {
 	pub high_line_count: i64,
