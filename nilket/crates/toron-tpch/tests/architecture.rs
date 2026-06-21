@@ -146,3 +146,22 @@ fn adr262_status_is_inventory_not_last_result() {
 		"the status-is-inventory behavior is pinned"
 	);
 }
+
+#[test]
+fn adr293_q07_is_wired_as_a_single_physical_nation_self_join() {
+	let lib = source("src/lib.rs");
+	let main = source("src/main.rs");
+	let harness = source("tests/harness.rs");
+	assert!(lib.contains("pub const Q7_DEV_SQL"));
+	assert!(lib.contains("STRICT_Q7_SQL"));
+	assert!(lib.contains("nation n1, nation n2"));
+	assert!(lib.contains("fn q07_tables"));
+	assert!(lib.contains("table.name != \"region\""));
+	assert!(
+		!lib.contains("nation_1") && !lib.contains("nation_2"),
+		"q07 must use SQL aliases over one physical nation table"
+	);
+	assert!(lib.contains("|| *id == \"q07\""));
+	assert!(main.contains("\"q07\" | \"q7\""));
+	assert!(harness.contains("q07_advances_to_derived_multi_source_wall"));
+}

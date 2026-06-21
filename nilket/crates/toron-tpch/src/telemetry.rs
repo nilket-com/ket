@@ -67,6 +67,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
 	"unsupported_correlated_exists",
+	"unsupported_derived_multi_source",
 	"unsupported_query_surface",
 ];
 
@@ -144,6 +145,12 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// correlated-subquery class; names the decorrelation-generality ADR. Kept specific so it does not fall
 		// to the generic query-surface bucket below.
 		"unsupported_correlated_exists"
+	} else if lowered.contains("derived table subquery must have exactly one from source") {
+		// ADR 293: q07's `shipping` derived table has an official comma-join FROM list
+		// (`supplier, lineitem, orders, customer, nation n1, nation n2`). The current derived-table
+		// frontend accepts join-bodied single FROM sources, but still rejects multi-source comma lists before
+		// the self-join alias question is reached.
+		"unsupported_derived_multi_source"
 	} else if lowered.contains("not supported") || lowered.contains("unsupported") {
 		"unsupported_query_surface"
 	} else {

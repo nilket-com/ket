@@ -257,6 +257,32 @@ pub const Q5_DEV_SQL: &str = "SELECT n_name, \
 /// strict q05 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
 pub const STRICT_Q5_SQL: &str = Q5_DEV_SQL;
 
+/// ADR 293 — tpch.q07 (Volume Shipping): the self-join reachability probe. tpchgen-2.0.2's exact Q7
+/// shape with `:1` → `'FRANCE'`, `:2` → `'GERMANY'`, and no LIMIT. The query intentionally references
+/// `nation` twice via SQL aliases (`nation n1`, `nation n2`) while the harness registers one physical
+/// `nation` table.
+pub const Q7_DEV_SQL: &str = "SELECT supp_nation, cust_nation, l_year, SUM(volume) AS revenue \
+	FROM ( \
+	  SELECT n1.n_name AS supp_nation, \
+	         n2.n_name AS cust_nation, \
+	         EXTRACT(year FROM l_shipdate) AS l_year, \
+	         l_extendedprice * (1 - l_discount) AS volume \
+	  FROM supplier, lineitem, orders, customer, nation n1, nation n2 \
+	  WHERE s_suppkey = l_suppkey \
+	    AND o_orderkey = l_orderkey \
+	    AND c_custkey = o_custkey \
+	    AND s_nationkey = n1.n_nationkey \
+	    AND c_nationkey = n2.n_nationkey \
+	    AND ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') \
+	      OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')) \
+	    AND l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31' \
+	) AS shipping \
+	GROUP BY supp_nation, cust_nation, l_year \
+	ORDER BY supp_nation, cust_nation, l_year";
+
+/// strict q07 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
+pub const STRICT_Q7_SQL: &str = Q7_DEV_SQL;
+
 /// ADR 278 — tpch.q04 (Order Priority Checking): the gauge's first correlated-subquery query, tpchgen-2.0.2's
 /// exact Q4 with `:1` → `'1993-07-01'`. The `+ INTERVAL '3' MONTH` bound is **kept official** (a `Date32 +
 /// CalendarMonthInterval` expression — both operands literal, so it may constant-fold at bind) and the
@@ -3653,6 +3679,38 @@ fn q05_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	tables
 }
 
+/// ADR 293 — dev q07: a six-relation logical join with one physical `nation` table scanned twice via SQL
+/// aliases (`nation n1`, `nation n2`).
+pub async fn run_dev_q07(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q07",
+		"dev",
+		scale_factor,
+		Q7_DEV_SQL,
+		q07_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 293 — strict q07: same shape with official `Decimal128(15,2)` `lineitem` types.
+pub async fn run_strict_q07(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q07",
+		"strict",
+		scale_factor,
+		STRICT_Q7_SQL,
+		q07_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// The five physical q07 harness tables. `nation` is registered once; q07's `n1`/`n2` are SQL aliases.
+fn q07_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let mut tables = q05_tables(strict, scale_factor);
+	tables.retain(|table| table.name != "region");
+	tables
+}
+
 /// ADR 278 — dev q04: the first correlated-subquery query (orders + an EXISTS over lineitem). A reachability
 /// attempt — records whichever wall q04 hits first (date-interval or the unqualified correlated EXISTS).
 pub async fn run_dev_q04(scale_factor: f64) -> Attempt {
@@ -3753,6 +3811,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q05" || *id == "q04"
 					|| *id == "q17" || *id == "q02"
 					|| *id == "q20" || *id == "q12"
+					|| *id == "q07"
 				{
 					"implemented"
 				} else {

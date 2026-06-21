@@ -3,10 +3,10 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q12, run_dev_q14, run_dev_q17,
-	run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
-	run_strict_q6, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
-	status_rows,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q10, run_dev_q12, run_dev_q14,
+	run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04,
+	run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q10, run_strict_q12, run_strict_q14,
+	run_strict_q17, run_strict_q20, status_rows,
 };
 
 #[tokio::test]
@@ -279,6 +279,45 @@ fn q05_executes_in_both_modes() {
 		.expect("q05 thread panicked");
 }
 
+// ADR 293: q07 is wired into the gauge with the official derived `shipping` subquery. The first measured
+// wall is earlier than the intended self-join probe: the derived-table frontend still rejects a comma-join
+// FROM list (`derived table subquery must have exactly one FROM source`), so both modes stop at plan with a
+// precise blocker. This is an honest red row naming ADR 294, not a hollow green.
+#[tokio::test]
+async fn q07_advances_to_derived_multi_source_wall() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q07 dev=implemented strict=implemented"),
+		"q07 is an implemented capability in the static inventory"
+	);
+
+	for (mode, attempt) in [
+		("dev", run_dev_q07(0.01).await),
+		("strict", run_strict_q07(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q07");
+		assert_eq!(attempt.status, Status::Blocked, "{}", attempt.human());
+		assert_eq!(
+			attempt.phase,
+			Phase::Plan,
+			"q07 {mode}: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unsupported_derived_multi_source"),
+			"q07 {mode} first wall should be precise: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.digest.is_none(),
+			"blocked q07 must not carry a digest: {}",
+			attempt.human()
+		);
+	}
+}
+
 // ADR 284: q02 exercises a five-table outer comma join plus a correlated scalar whose inner side is a
 // four-table comma join. It runs on a large stack like q05/q10, and the default-scale checks prove the inner
 // residual joins are keyed rather than materialized as a cartesian before the grouped MIN.
@@ -502,6 +541,18 @@ fn correlated_exists_error_classifies_precisely() {
 	assert_eq!(
 		reason_for_error("ambiguous correlated EXISTS column reference"),
 		"unsupported_correlated_exists"
+	);
+}
+
+#[test]
+fn q07_derived_multi_source_error_classifies_precisely() {
+	assert_eq!(
+		reason_for_error("derived table subquery must have exactly one FROM source"),
+		"unsupported_derived_multi_source"
+	);
+	assert_eq!(
+		status_for_reason("unsupported_derived_multi_source"),
+		Status::Blocked
 	);
 }
 
