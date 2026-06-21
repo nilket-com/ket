@@ -195,6 +195,23 @@ pub const Q20_DEV_SQL: &str = "SELECT s_name, s_address \
 /// strict q20 — identical SQL shape; strict mode carries official Decimal128 lineitem quantities.
 pub const STRICT_Q20_SQL: &str = Q20_DEV_SQL;
 
+/// ADR 307 - tpch.q13 (Customer Distribution): official-shaped q13 with the fixed
+/// `%special%requests%` comment pattern and no LIMIT. This is a verify-first reachability probe for
+/// the non-equality `LEFT OUTER JOIN ... ON` residual; the shared `orders` fixture intentionally does
+/// not add `o_comment` until the query advances past the frontend ON-clause wall.
+pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
+	FROM ( \
+	  SELECT c_custkey, COUNT(o_orderkey) AS c_count \
+	  FROM customer LEFT OUTER JOIN orders \
+	    ON c_custkey = o_custkey AND o_comment NOT LIKE '%special%requests%' \
+	  GROUP BY c_custkey \
+	) AS c_orders \
+	GROUP BY c_count \
+	ORDER BY custdist DESC, c_count DESC";
+
+/// strict q13 - identical SQL shape; q13's measured wall is frontend lowering, before strict-only types matter.
+pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
+
 /// ADR 304/305 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes
 /// inlined and no LIMIT. ADR 305's SUBSTRING support makes this a reachability pass in both modes.
 pub const Q22_DEV_SQL: &str = "SELECT cntrycode, COUNT(*) AS numcust, SUM(c_acctbal) AS totacctbal \
@@ -5471,6 +5488,30 @@ pub async fn run_strict_q20(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 307 - dev q13: customer distribution reachability probe for non-equality LEFT OUTER ON residuals.
+pub async fn run_dev_q13(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q13",
+		"dev",
+		scale_factor,
+		Q13_DEV_SQL,
+		q13_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 307 - strict q13: identical SQL shape; the expected wall is frontend lowering, before strict types matter.
+pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q13",
+		"strict",
+		scale_factor,
+		STRICT_Q13_SQL,
+		q13_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// ADR 304/305 - dev q22: customer + orders reachability probe for SQL SUBSTRING.
 pub async fn run_dev_q22(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -5537,6 +5578,29 @@ fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: region_descriptor(region_schema().as_ref()),
 			facts: facts_for_batch(&region),
 			batch: region,
+		},
+	]
+}
+
+/// The two q13 harness tables: existing `customer` + `orders`. `orders.o_comment` is intentionally deferred
+/// until q13 advances past the frontend ON-clause wall.
+fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let customer = generate_customer(strict, scale_factor);
+	let orders = generate_orders(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "customer",
+			descriptor: customer_descriptor(customer_schema(strict).as_ref()),
+			facts: facts_for_batch(&customer),
+			batch: customer,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
 		},
 	]
 }
@@ -6027,7 +6091,8 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q17" || *id == "q02"
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
-					|| *id == "q09" || *id == "q22"
+					|| *id == "q09" || *id == "q13"
+					|| *id == "q22"
 				{
 					"implemented"
 				} else {

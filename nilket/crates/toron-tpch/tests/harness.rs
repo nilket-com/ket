@@ -4,10 +4,10 @@ use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
-	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
-	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
-	run_strict_q22, status_rows,
+	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1,
+	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
+	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13, run_strict_q14,
+	run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -542,6 +542,53 @@ async fn q12_executes_in_both_modes_at_default_scale() {
 	}
 }
 
+// ADR 307: q13 is the first outer-join ON-residual probe. It stops during frontend lowering because
+// `lower_join_on` accepts equality predicates only; this is before binding, so the orders fixture
+// deliberately does not grow `o_comment` in this cut.
+#[tokio::test]
+async fn q13_advances_to_non_equi_join_on_wall() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q13 dev=implemented strict=implemented"),
+		"q13 is an implemented capability in the static inventory"
+	);
+
+	for (mode, attempt) in [
+		("dev", run_dev_q13(0.01).await),
+		("strict", run_strict_q13(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q13");
+		assert_eq!(
+			attempt.status,
+			Status::Blocked,
+			"q13 {mode} should classify the ON-residual wall: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.phase,
+			Phase::Plan,
+			"q13 {mode}: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unsupported_non_equi_join_on"),
+			"q13 {mode}: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.digest.is_none(),
+			"a blocked row has no digest: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.is_process_success(true),
+			"recognized blocked rows are successful only with --allow-blocked"
+		);
+	}
+}
+
 // ADR 282 resolved q17's unqualified correlated scalar. ADR 283 clears the strict Decimal operand-alignment
 // walls behind it: non-literal Decimal comparison rescale and `SUM(decimal) / 7.0` literal coercion. q17 now
 // reaches execute in both modes with the official SQL unchanged.
@@ -724,6 +771,24 @@ fn q07_derived_multi_source_error_classifies_precisely() {
 	assert_eq!(
 		status_for_reason("unsupported_derived_multi_source"),
 		Status::Blocked
+	);
+}
+
+#[test]
+fn reason_for_error_classifies_non_equi_join_on_precisely() {
+	assert_eq!(
+		reason_for_error("join ON only supports equality predicates"),
+		"unsupported_non_equi_join_on"
+	);
+	assert_eq!(
+		status_for_reason("unsupported_non_equi_join_on"),
+		Status::Blocked,
+		"the measured q13 wall is a recognized blocker"
+	);
+	assert_eq!(
+		reason_for_error("JOIN requires ON equality predicates"),
+		"unrecognized",
+		"the non-ON join-constraint guard is not q13's ON-residual wall"
 	);
 }
 
