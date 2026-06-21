@@ -2173,6 +2173,255 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q12Group {
+	pub high_line_count: i64,
+	pub low_line_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q12Oracle {
+	pub groups: BTreeMap<String, Q12Group>,
+	pub selected_rows: usize,
+	pub high_rows: usize,
+	pub low_rows: usize,
+}
+
+/// Independent strict-q12 oracle: traverse orders and lineitem generators directly, apply every q12 filter,
+/// then group high/low priority counts by ship mode.
+pub fn strict_q12_oracle(scale_factor: f64) -> Q12Oracle {
+	const START_1994: i32 = 8766;
+	const START_1995: i32 = 9131;
+
+	let mut orders_by_key: HashMap<i64, String> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		orders_by_key.insert(order.o_orderkey, order.o_orderpriority.to_string());
+	}
+
+	let mut groups: BTreeMap<String, Q12Group> = BTreeMap::new();
+	let mut selected_rows = 0_usize;
+	let mut high_rows = 0_usize;
+	let mut low_rows = 0_usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let shipmode = item.l_shipmode;
+		if shipmode != "MAIL" && shipmode != "SHIP" {
+			continue;
+		}
+		if item.l_commitdate.to_unix_epoch() >= item.l_receiptdate.to_unix_epoch() {
+			continue;
+		}
+		if item.l_shipdate.to_unix_epoch() >= item.l_commitdate.to_unix_epoch() {
+			continue;
+		}
+		let receiptdate = item.l_receiptdate.to_unix_epoch();
+		if !(START_1994..START_1995).contains(&receiptdate) {
+			continue;
+		}
+		let Some(priority) = orders_by_key.get(&item.l_orderkey) else {
+			continue;
+		};
+
+		selected_rows += 1;
+		let group = groups.entry(shipmode.to_string()).or_insert(Q12Group {
+			high_line_count: 0,
+			low_line_count: 0,
+		});
+		if priority == "1-URGENT" || priority == "2-HIGH" {
+			group.high_line_count += 1;
+			high_rows += 1;
+		} else {
+			group.low_line_count += 1;
+			low_rows += 1;
+		}
+	}
+
+	Q12Oracle {
+		groups,
+		selected_rows,
+		high_rows,
+		low_rows,
+	}
+}
+
+fn strict_q12_expected_schema() -> [(&'static str, DataType); 3] {
+	[
+		("l_shipmode", DataType::Utf8),
+		("high_line_count", DataType::Int64),
+		("low_line_count", DataType::Int64),
+	]
+}
+
+pub fn assert_strict_q12_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q12_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q12 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q12(batches: &[RecordBatch], oracle: &Q12Oracle) -> Result<(), String> {
+	assert_strict_q12_schema(batches)?;
+
+	if !oracle.groups.contains_key("MAIL") || !oracle.groups.contains_key("SHIP") {
+		return Err(format!(
+			"oracle non-vacuous guard failed: groups={:?}",
+			oracle.groups.keys().collect::<Vec<_>>()
+		));
+	}
+	if oracle.selected_rows == 0 || oracle.high_rows == 0 || oracle.low_rows == 0 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: selected_rows={} high_rows={} low_rows={}",
+			oracle.selected_rows, oracle.high_rows, oracle.low_rows
+		));
+	}
+	for (shipmode, group) in &oracle.groups {
+		if group.high_line_count <= 0 || group.low_line_count <= 0 {
+			return Err(format!(
+				"oracle non-vacuous guard failed for {shipmode}: high={} low={}",
+				group.high_line_count, group.low_line_count
+			));
+		}
+	}
+
+	let mut emitted: Vec<(String, i64, i64)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 3 {
+			return Err(format!("expected 3 columns, got {}", batch.num_columns()));
+		}
+		let shipmodes = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (l_shipmode) not Utf8")?;
+		let high_counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (high_line_count) not Int64")?;
+		let low_counts = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 2 (low_line_count) not Int64")?;
+		for i in 0..batch.num_rows() {
+			if shipmodes.is_null(i) {
+				return Err(format!("column l_shipmode row {} is NULL", emitted.len()));
+			}
+			if high_counts.is_null(i) {
+				return Err(format!(
+					"column high_line_count row {} is NULL",
+					emitted.len()
+				));
+			}
+			if low_counts.is_null(i) {
+				return Err(format!(
+					"column low_line_count row {} is NULL",
+					emitted.len()
+				));
+			}
+			emitted.push((
+				shipmodes.value(i).to_string(),
+				high_counts.value(i),
+				low_counts.value(i),
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+	for (shipmode, high, low) in &emitted {
+		if seen.insert(shipmode.clone(), (*high, *low)).is_some() {
+			return Err(format!("duplicate emitted l_shipmode {shipmode:?}"));
+		}
+	}
+	for (shipmode, group) in &oracle.groups {
+		let Some(&(high, low)) = seen.get(shipmode) else {
+			return Err(format!(
+				"oracle l_shipmode {shipmode:?} missing from output"
+			));
+		};
+		if high != group.high_line_count || low != group.low_line_count {
+			return Err(format!(
+				"l_shipmode {shipmode:?}: count mismatch: expected high={} low={}, got high={high} low={low}",
+				group.high_line_count, group.low_line_count
+			));
+		}
+	}
+
+	let expected_order: Vec<&String> = oracle.groups.keys().collect();
+	for (idx, (shipmode, _, _)) in emitted.iter().enumerate() {
+		if shipmode != expected_order[idx] {
+			return Err(format!(
+				"ORDER BY l_shipmode violated at row {idx}: expected {:?}, got {shipmode:?}",
+				expected_order[idx]
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q12(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q12_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q12".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q12_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q12_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q12_oracle(scale_factor);
+	match compare_strict_q12(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 pub const Q17_CORRECTNESS_SCALE: f64 = 0.02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

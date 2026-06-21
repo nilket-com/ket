@@ -8,13 +8,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	DecimalRaw, Q1Group, Q3Group, Q5Group, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
-	assert_strict_q1_schema, assert_strict_q3_schema, assert_strict_q5_schema,
-	assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw, check_strict_q1,
-	check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q14, check_strict_q17,
-	compare_strict_q1, compare_strict_q3, compare_strict_q5, compare_strict_q6, compare_strict_q14,
-	compare_strict_q17, correctness_matrix_from_log, decimal_division_raw, q6_row_revenue,
-	strict_q1_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q14_oracle,
+	DecimalRaw, Q1Group, Q3Group, Q5Group, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE,
+	Q17Oracle, assert_strict_q1_schema, assert_strict_q3_schema, assert_strict_q5_schema,
+	assert_strict_q12_schema, assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q12,
+	check_strict_q14, check_strict_q17, compare_strict_q1, compare_strict_q3, compare_strict_q5,
+	compare_strict_q6, compare_strict_q12, compare_strict_q14, compare_strict_q17,
+	correctness_matrix_from_log, decimal_division_raw, q6_row_revenue, strict_q1_oracle,
+	strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q12_oracle, strict_q14_oracle,
 	strict_q17_oracle,
 };
 
@@ -663,6 +664,221 @@ fn q5_null_cell_is_fail_at_compare() {
 	assert!(
 		compare_strict_q5(&[q5_nullable_batch(&[(Some("ARGENTINA"), None)])], &oracle).is_err(),
 		"a NULL revenue is fail@compare"
+	);
+}
+
+fn q12_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+	let nullable_rows: Vec<(Option<&str>, Option<i64>, Option<i64>)> = rows
+		.iter()
+		.map(|&(shipmode, high, low)| (Some(shipmode), Some(high), Some(low)))
+		.collect();
+	q12_nullable_batch(&nullable_rows)
+}
+
+fn q12_nullable_batch(rows: &[(Option<&str>, Option<i64>, Option<i64>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("l_shipmode", DataType::Utf8, true),
+		Field::new("high_line_count", DataType::Int64, true),
+		Field::new("low_line_count", DataType::Int64, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i64>>>(),
+			)),
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.2).collect::<Vec<Option<i64>>>(),
+			)),
+		],
+	)
+	.expect("q12 batch")
+}
+
+fn q12_int32_count_batch() -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("l_shipmode", DataType::Utf8, true),
+		Field::new("high_line_count", DataType::Int32, true),
+		Field::new("low_line_count", DataType::Int32, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(vec!["MAIL"])),
+			Arc::new(Int32Array::from(vec![1])),
+			Arc::new(Int32Array::from(vec![2])),
+		],
+	)
+	.expect("q12 int32-count batch")
+}
+
+fn q12_oracle(rows: &[(&str, i64, i64)]) -> Q12Oracle {
+	let groups: BTreeMap<String, Q12Group> = rows
+		.iter()
+		.map(|&(shipmode, high, low)| {
+			(
+				shipmode.to_string(),
+				Q12Group {
+					high_line_count: high,
+					low_line_count: low,
+				},
+			)
+		})
+		.collect();
+	Q12Oracle {
+		groups,
+		selected_rows: rows.iter().map(|(_, high, low)| high + low).sum::<i64>() as usize,
+		high_rows: rows.iter().map(|(_, high, _)| *high).sum::<i64>() as usize,
+		low_rows: rows.iter().map(|(_, _, low)| *low).sum::<i64>() as usize,
+	}
+}
+
+#[tokio::test]
+async fn strict_q12_matches_independent_oracle() {
+	let attempt = check_strict_q12(0.01).await;
+	assert_eq!(attempt.query, "q12");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q12_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q12_oracle(0.01);
+	assert!(oracle.groups.contains_key("MAIL"), "{oracle:?}");
+	assert!(oracle.groups.contains_key("SHIP"), "{oracle:?}");
+	assert!(
+		oracle.selected_rows > 0,
+		"selected {} contributing rows",
+		oracle.selected_rows
+	);
+	assert!(oracle.high_rows > 0, "high rows: {}", oracle.high_rows);
+	assert!(oracle.low_rows > 0, "low rows: {}", oracle.low_rows);
+	for (shipmode, group) in &oracle.groups {
+		assert!(
+			group.high_line_count > 0,
+			"{shipmode} high rows: {}",
+			group.high_line_count
+		);
+		assert!(
+			group.low_line_count > 0,
+			"{shipmode} low rows: {}",
+			group.low_line_count
+		);
+	}
+}
+
+#[test]
+fn strict_q12_output_schema_is_asserted() {
+	assert!(assert_strict_q12_schema(&[q12_batch(&[("MAIL", 1, 2)])]).is_ok());
+	assert!(
+		assert_strict_q12_schema(&[q12_int32_count_batch()]).is_err(),
+		"a non-measured count type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q12_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 3, 4), ("SHIP", 5, 6)])], &oracle).is_ok(),
+		"exact high/low counts match"
+	);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 4, 4), ("SHIP", 5, 6)])], &oracle).is_err(),
+		"an off-by-one high_line_count is a mismatch"
+	);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 3, 5), ("SHIP", 5, 6)])], &oracle).is_err(),
+		"an off-by-one low_line_count is a mismatch"
+	);
+}
+
+#[test]
+fn q12_high_low_swapped_is_fail_at_compare() {
+	let oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 4, 3), ("SHIP", 5, 6)])], &oracle).is_err(),
+		"swapping the CASE arms must fail"
+	);
+}
+
+#[test]
+fn q12_missing_or_duplicate_group_is_fail_at_compare() {
+	let oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 3, 4)])], &oracle).is_err(),
+		"a dropped shipmode group is a mismatch"
+	);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 3, 4), ("MAIL", 3, 4)])], &oracle).is_err(),
+		"a duplicate emitted l_shipmode is rejected"
+	);
+}
+
+#[test]
+fn q12_null_cell_is_fail_at_compare() {
+	let oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	assert!(
+		compare_strict_q12(
+			&[q12_nullable_batch(&[
+				(None, Some(3), Some(4)),
+				(Some("SHIP"), Some(5), Some(6))
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL l_shipmode is fail@compare"
+	);
+	assert!(
+		compare_strict_q12(
+			&[q12_nullable_batch(&[
+				(Some("MAIL"), None, Some(4)),
+				(Some("SHIP"), Some(5), Some(6))
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL high_line_count is fail@compare"
+	);
+	assert!(
+		compare_strict_q12(
+			&[q12_nullable_batch(&[
+				(Some("MAIL"), Some(3), None),
+				(Some("SHIP"), Some(5), Some(6))
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL low_line_count is fail@compare"
+	);
+}
+
+#[test]
+fn q12_out_of_order_groups_is_fail_at_compare() {
+	let oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("SHIP", 5, 6), ("MAIL", 3, 4)])], &oracle).is_err(),
+		"q12's ORDER BY l_shipmode is part of the exact answer"
+	);
+}
+
+#[test]
+fn q12_hollow_oracle_is_fail_at_compare() {
+	let mut oracle = q12_oracle(&[("MAIL", 0, 4), ("SHIP", 5, 6)]);
+	oracle.high_rows = 5;
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 0, 4), ("SHIP", 5, 6)])], &oracle).is_err(),
+		"a per-group missing CASE branch is a hollow oracle"
+	);
+
+	let mut oracle = q12_oracle(&[("MAIL", 3, 4), ("SHIP", 5, 6)]);
+	oracle.low_rows = 0;
+	assert!(
+		compare_strict_q12(&[q12_batch(&[("MAIL", 3, 4), ("SHIP", 5, 6)])], &oracle).is_err(),
+		"a globally missing CASE branch is a hollow oracle"
 	);
 }
 
