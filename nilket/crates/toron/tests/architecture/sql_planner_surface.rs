@@ -501,6 +501,7 @@ pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 	assert!(validator.contains("| Expr::AtTimeZone(inner, _)"));
 	assert!(validator.contains("| Expr::Extract(_, inner)"));
 	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
+	assert!(validator.contains("| Expr::Substring { input: inner, .. }"));
 	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
@@ -1059,6 +1060,7 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 	assert!(validator.contains("| Expr::AtTimeZone(inner, _)"));
 	assert!(validator.contains("| Expr::Extract(_, inner)"));
 	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
+	assert!(validator.contains("| Expr::Substring { input: inner, .. }"));
 }
 
 #[test]
@@ -1169,6 +1171,7 @@ pub(crate) fn adr028_aggregate_signature_visitors_are_exhaustive() {
 		"Expr::AtTimeZone",
 		"Expr::Extract",
 		"Expr::DateTrunc",
+		"Expr::Substring",
 	] {
 		assert!(
 			hash_body.contains(variant),
@@ -1276,6 +1279,7 @@ pub(crate) fn adr028_nested_aggregate_rejects_at_sql_walk() {
 		"SqlExpr::IsNotNull",
 		"SqlExpr::Extract",
 		"SqlExpr::AtTimeZone",
+		"SqlExpr::Substring",
 		"SqlExpr::Nested",
 	] {
 		assert!(walker.contains(arm), "walker missing {arm}");

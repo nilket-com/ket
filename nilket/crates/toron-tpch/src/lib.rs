@@ -195,9 +195,8 @@ pub const Q20_DEV_SQL: &str = "SELECT s_name, s_address \
 /// strict q20 — identical SQL shape; strict mode carries official Decimal128 lineitem quantities.
 pub const STRICT_Q20_SQL: &str = Q20_DEV_SQL;
 
-/// ADR 304 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes inlined and
-/// no LIMIT. This is a reachability probe for SQL `SUBSTRING(c_phone FROM 1 FOR 2)`: the query should wall
-/// there before the `AVG` threshold or correlated `NOT EXISTS` becomes relevant.
+/// ADR 304/305 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes
+/// inlined and no LIMIT. ADR 305's SUBSTRING support makes this a reachability pass in both modes.
 pub const Q22_DEV_SQL: &str = "SELECT cntrycode, COUNT(*) AS numcust, SUM(c_acctbal) AS totacctbal \
 	FROM ( \
 	  SELECT SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal \
@@ -5188,7 +5187,7 @@ pub async fn run_strict_q20(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 304 - dev q22: customer + orders reachability probe for SQL SUBSTRING.
+/// ADR 304/305 - dev q22: customer + orders reachability probe for SQL SUBSTRING.
 pub async fn run_dev_q22(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q22",
@@ -5200,7 +5199,7 @@ pub async fn run_dev_q22(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 304 - strict q22: same SQL shape, with strict Decimal128 customer balances.
+/// ADR 304/305 - strict q22: same SQL shape, with strict Decimal128 customer balances.
 pub async fn run_strict_q22(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q22",

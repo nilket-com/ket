@@ -639,46 +639,52 @@ fn q20_executes_in_both_modes() {
 		.expect("q20 thread panicked");
 }
 
-// ADR 304: q22 is wired into the gauge unchanged, and the current measured wall is the SQL
-// `SUBSTRING(c_phone FROM 1 FOR 2)` frontend-lowering gap.
-#[tokio::test]
-async fn q22_advances_to_substring_wall() {
-	assert!(
-		status_rows()
-			.iter()
-			.any(|row| row == "q22 dev=implemented strict=implemented"),
-		"q22 is an implemented capability in the static inventory"
-	);
+// ADR 305: SUBSTRING support clears q22's measured wall; both modes now reach execute.
+#[test]
+fn q22_executes_in_both_modes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q22 dev=implemented strict=implemented"),
+					"q22 is an implemented capability in the static inventory"
+				);
 
-	for (mode, attempt) in [
-		("dev", run_dev_q22(0.01).await),
-		("strict", run_strict_q22(0.01).await),
-	] {
-		assert_eq!(attempt.query, "q22");
-		assert_eq!(
-			attempt.status,
-			Status::Blocked,
-			"q22 {mode} should record the expected SUBSTRING wall: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.phase,
-			Phase::Plan,
-			"q22 {mode} walls in frontend lowering: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unsupported_substring"),
-			"q22 {mode}: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.digest.is_none(),
-			"a blocked attempt must not carry a digest: {}",
-			attempt.human()
-		);
-	}
+				for (mode, attempt) in [
+					("dev", run_dev_q22(0.01).await),
+					("strict", run_strict_q22(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q22");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q22 {mode} should execute after SUBSTRING support: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.phase,
+						Phase::Execute,
+						"q22 {mode}: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
+			});
+		})
+		.expect("spawn q22 thread")
+		.join()
+		.expect("q22 thread panicked");
 }
 
 #[test]

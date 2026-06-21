@@ -171,6 +171,15 @@ pub(super) fn offset_bound_node(
 			negated,
 			case_insensitive,
 		},
+		BoundExprNode::Substring {
+			input,
+			from,
+			length,
+		} => BoundExprNode::Substring {
+			input: offset_id(input),
+			from,
+			length,
+		},
 		BoundExprNode::Case {
 			when_then,
 			else_input,

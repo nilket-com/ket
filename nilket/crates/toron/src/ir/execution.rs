@@ -111,6 +111,11 @@ pub enum BoundExprNode {
 		negated: bool,
 		case_insensitive: bool,
 	},
+	Substring {
+		input: BoundExprId,
+		from: i64,
+		length: Option<u64>,
+	},
 	Case {
 		when_then: Vec<(BoundExprId, BoundExprId)>,
 		else_input: BoundExprId,
@@ -584,6 +589,23 @@ impl BoundExprProgramBuilder {
 		)
 	}
 
+	pub fn append_substring(
+		&mut self,
+		input: BoundExprId,
+		from: i64,
+		length: Option<u64>,
+	) -> BoundExprId {
+		self.assert_existing_child(input);
+		self.append_node(
+			BoundExprNode::Substring {
+				input,
+				from,
+				length,
+			},
+			DataType::Utf8,
+		)
+	}
+
 	pub fn append_case(
 		&mut self,
 		when_then: Vec<(BoundExprId, BoundExprId)>,
@@ -817,6 +839,7 @@ impl BoundExprProgram {
 				Some(expr_nullable || list_nullable)
 			}
 			BoundExprNode::Like { expr, .. } => self.node_nullable(*expr),
+			BoundExprNode::Substring { input, .. } => self.node_nullable(*input),
 			BoundExprNode::Case {
 				when_then,
 				else_input,
@@ -963,6 +986,19 @@ impl BoundExprProgram {
 				};
 				format!("{} {op} {pattern:?}", self.pretty_node(*expr))
 			}
+			BoundExprNode::Substring {
+				input,
+				from,
+				length,
+			} => match length {
+				Some(length) => {
+					format!(
+						"SUBSTRING({} FROM {from} FOR {length})",
+						self.pretty_node(*input)
+					)
+				}
+				None => format!("SUBSTRING({} FROM {from})", self.pretty_node(*input)),
+			},
 			BoundExprNode::Case {
 				when_then,
 				else_input,
@@ -1018,6 +1054,7 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
+		| BoundExprNode::Substring { input, .. }
 		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }

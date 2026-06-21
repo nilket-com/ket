@@ -600,6 +600,34 @@ pub(crate) fn adr075_like_ilike_are_first_class_residual_only_predicates() {
 }
 
 #[test]
+pub(crate) fn adr305_substring_is_literal_bounded_and_residual_only() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let binder = binder_source();
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+
+	assert!(ir.contains("Substring {"));
+	assert!(ir.contains("| Self::Substring { .. }"));
+	assert!(execution_ir.contains("BoundExprNode::Substring"));
+	assert!(execution_ir.contains("pub fn append_substring"));
+	assert!(planner.contains("SqlExpr::Substring {"));
+	assert!(planner.contains("SUBSTR shorthand is not supported"));
+	assert!(planner.contains("SUBSTRING FROM must be >= 1"));
+	assert!(planner.contains("SUBSTRING FOR must be >= 0"));
+	assert!(binder.contains("fn bind_substring"));
+	assert!(binder.contains("SUBSTRING expects Utf8 input"));
+	assert!(pbc.contains("BoundExprNode::Substring { .. }"));
+	assert!(pbc.contains("SUBSTRING is not PBC-eligible"));
+	assert!(exec.contains("substring_by_char"));
+	assert!(exec.contains("let start = from - 1"));
+	assert!(!pbc.contains("OP_SUBSTRING"));
+}
+
+#[test]
 pub(crate) fn adr108_case_is_residual_bound_expression() {
 	let manifest_dir = manifest_dir();
 	let ir = std::fs::read_to_string(manifest_dir.join("src/ir.rs")).expect("read ir");

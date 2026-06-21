@@ -247,6 +247,21 @@ fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 		| SqlExpr::Extract { expr, .. }
 		| SqlExpr::Interval(SqlInterval { value: expr, .. })
 		| SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			reject_nested_aggregate(expr)?;
+			if let Some(substring_from) = substring_from {
+				reject_nested_aggregate(substring_from)?;
+			}
+			if let Some(substring_for) = substring_for {
+				reject_nested_aggregate(substring_for)?;
+			}
+			Ok(())
+		}
 		SqlExpr::AtTimeZone {
 			timestamp,
 			time_zone,
@@ -486,6 +501,35 @@ fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
 			expr,
 		} => interval_literal_integer(expr),
 		_ => Err(unsupported("INTERVAL value must be a literal")),
+	}
+}
+
+fn substring_bound_literal(expr: &SqlExpr, context: &str) -> Result<i64, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Value(value) => match &value.value {
+			Value::Number(value, _) => {
+				if value.contains('.') || value.contains('e') || value.contains('E') {
+					return Err(unsupported(format!("{context} expects an integer literal")));
+				}
+				value
+					.parse::<i64>()
+					.map_err(|_| unsupported(format!("{context} expects an integer literal")))
+			}
+			_ => Err(unsupported(format!("{context} expects an integer literal"))),
+		},
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Minus,
+			expr,
+		} => substring_bound_literal(expr, context).and_then(|value| {
+			value
+				.checked_neg()
+				.ok_or_else(|| unsupported(format!("{context} overflows i64 range")))
+		}),
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Plus,
+			expr,
+		} => substring_bound_literal(expr, context),
+		_ => Err(unsupported(format!("{context} expects an integer literal"))),
 	}
 }
 
@@ -6235,6 +6279,36 @@ impl SqlPlanner {
 				lower_extract_datetime_field(field)?,
 				Box::new(self.lower_expr(expr)?),
 			)),
+			SqlExpr::Substring {
+				expr,
+				substring_from,
+				substring_for,
+				special: _,
+				shorthand,
+			} => {
+				if *shorthand {
+					return Err(unsupported("SUBSTR shorthand is not supported"));
+				}
+				let Some(substring_from) = substring_from.as_deref() else {
+					return Err(unsupported("SUBSTRING requires a FROM/start literal"));
+				};
+				let from = substring_bound_literal(substring_from, "SUBSTRING FROM")?;
+				if from <= 0 {
+					return Err(unsupported("SUBSTRING FROM must be >= 1"));
+				}
+				let length = substring_for
+					.as_deref()
+					.map(|expr| substring_bound_literal(expr, "SUBSTRING FOR"))
+					.transpose()?;
+				if length.is_some_and(|length| length < 0) {
+					return Err(unsupported("SUBSTRING FOR must be >= 0"));
+				}
+				Ok(Expr::Substring {
+					input: Box::new(self.lower_expr(expr)?),
+					from,
+					length: length.map(|length| length as u64),
+				})
+			}
 			SqlExpr::AtTimeZone {
 				timestamp,
 				time_zone,
@@ -6751,6 +6825,7 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
+		| Expr::Substring { input: inner, .. }
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -7606,6 +7681,16 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			negated.hash(state);
 			case_insensitive.hash(state);
 		}
+		Expr::Substring {
+			input,
+			from,
+			length,
+		} => {
+			29u8.hash(state);
+			hash_expr_structural(input, state);
+			from.hash(state);
+			length.hash(state);
+		}
 		Expr::LogicalAscription { expr, logical_type } => {
 			22u8.hash(state);
 			logical_type.hash(state);
@@ -7755,6 +7840,22 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 				&& left_negated == right_negated
 				&& left_case_insensitive == right_case_insensitive
 				&& expr_structural_eq(left_expr, right_expr)
+		}
+		(
+			Expr::Substring {
+				input: left_input,
+				from: left_from,
+				length: left_length,
+			},
+			Expr::Substring {
+				input: right_input,
+				from: right_from,
+				length: right_length,
+			},
+		) => {
+			left_from == right_from
+				&& left_length == right_length
+				&& expr_structural_eq(left_input, right_input)
 		}
 		(
 			Expr::InList {
@@ -8079,6 +8180,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
+		| Expr::Substring { input: inner, .. }
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -8508,6 +8610,20 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_aggregate_call(expr)
 		}
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			expr_contains_aggregate_call(expr)
+				|| substring_from
+					.as_deref()
+					.is_some_and(expr_contains_aggregate_call)
+				|| substring_for
+					.as_deref()
+					.is_some_and(expr_contains_aggregate_call)
+		}
 		SqlExpr::Convert { expr, styles, .. } => {
 			expr_contains_aggregate_call(expr) || styles.iter().any(expr_contains_aggregate_call)
 		}
@@ -8543,6 +8659,18 @@ fn expr_contains_subquery(expr: &SqlExpr) -> bool {
 				}) || else_result.as_deref().is_some_and(expr_contains_subquery)
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => expr_contains_subquery(expr),
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			expr_contains_subquery(expr)
+				|| substring_from
+					.as_deref()
+					.is_some_and(expr_contains_subquery)
+				|| substring_for.as_deref().is_some_and(expr_contains_subquery)
+		}
 		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_subquery(value),
 		SqlExpr::AtTimeZone {
 			timestamp,
@@ -8588,6 +8716,20 @@ fn expr_contains_window_function(expr: &SqlExpr) -> bool {
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_window_function(expr)
+		}
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			expr_contains_window_function(expr)
+				|| substring_from
+					.as_deref()
+					.is_some_and(expr_contains_window_function)
+				|| substring_for
+					.as_deref()
+					.is_some_and(expr_contains_window_function)
 		}
 		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_window_function(value),
 		SqlExpr::AtTimeZone {
@@ -8680,6 +8822,20 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_nonaggregate_column_reference(expr)
+		}
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			expr_contains_nonaggregate_column_reference(expr)
+				|| substring_from
+					.as_deref()
+					.is_some_and(expr_contains_nonaggregate_column_reference)
+				|| substring_for
+					.as_deref()
+					.is_some_and(expr_contains_nonaggregate_column_reference)
 		}
 		SqlExpr::Convert { expr, styles, .. } => {
 			expr_contains_nonaggregate_column_reference(expr)
@@ -9022,6 +9178,15 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 			pattern: pattern.clone(),
 			negated: *negated,
 			case_insensitive: *case_insensitive,
+		},
+		Expr::Substring {
+			input,
+			from,
+			length,
+		} => Expr::Substring {
+			input: Box::new(canonical_aggregate_signature_expr(input)),
+			from: *from,
+			length: *length,
 		},
 		Expr::Case {
 			when_then,
@@ -9479,6 +9644,20 @@ fn collect_scope_refs(
 		SqlExpr::Cast { expr, .. } => {
 			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
 		}
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
+			if let Some(substring_from) = substring_from {
+				collect_scope_refs(substring_from, outer_qualifiers, inner_qualifiers, refs)?;
+			}
+			if let Some(substring_for) = substring_for {
+				collect_scope_refs(substring_for, outer_qualifiers, inner_qualifiers, refs)?;
+			}
+		}
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
 			collect_scope_refs(inner, outer_qualifiers, inner_qualifiers, refs)?;
 		}
@@ -9794,6 +9973,19 @@ fn sql_expr_references_outer_qualifier(
 		SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
 			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
 				|| sql_expr_references_outer_qualifier(pattern, outer_qualifiers, inner_qualifiers)
+		}
+		SqlExpr::Substring {
+			expr,
+			substring_from,
+			substring_for,
+			..
+		} => {
+			sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+				|| substring_from.as_deref().is_some_and(|expr| {
+					sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+				}) || substring_for.as_deref().is_some_and(|expr| {
+				sql_expr_references_outer_qualifier(expr, outer_qualifiers, inner_qualifiers)
+			})
 		}
 		SqlExpr::Case {
 			operand,
@@ -10798,6 +10990,7 @@ mod tests {
 			| Expr::AtTimeZone(expr, _)
 			| Expr::Extract(_, expr)
 			| Expr::DateTrunc(_, expr)
+			| Expr::Substring { input: expr, .. }
 			| Expr::Cast(expr, _)
 			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
 			Expr::Add(left, right)

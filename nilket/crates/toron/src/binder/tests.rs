@@ -11,7 +11,7 @@ use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 use crate::sql_planner::SqlPlanner;
 use crate::storage::{InMemoryTableStorage, StorageWrite, TenantId, WriteRequest};
 use arrow::array::{
-	ArrayRef, BinaryArray, Date32Array, DurationNanosecondArray, Int32Array, Int64Array,
+	Array, ArrayRef, BinaryArray, Date32Array, DurationNanosecondArray, Int32Array, Int64Array,
 	LargeStringArray, StringArray, TimestampMillisecondArray,
 };
 use arrow::datatypes::{Field, Schema};
@@ -20020,6 +20020,48 @@ fn temporal_batch(event_time: i64, signup_date: i32) -> RecordBatch {
 	.expect("temporal batch")
 }
 
+fn substring_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("name", DataType::Utf8, true),
+		Field::new("amount", DataType::Int32, true),
+	]))
+}
+
+fn substring_batch() -> RecordBatch {
+	RecordBatch::try_new(
+		substring_schema(),
+		vec![
+			Arc::new(StringArray::from(vec![Some("abcde"), Some("aé日z"), None])) as ArrayRef,
+			Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+		],
+	)
+	.expect("substring batch")
+}
+
+fn bind_substring_expr(expr: Expr) -> Result<BoundExprProgram, BindingError> {
+	let config = PlannerConfig::default();
+	let logical_casts = HashMap::new();
+	let logical_type_registry = LogicalTypeRegistry::default();
+	let ctx = ExprBindContext {
+		config: &config,
+		session_timezone: config
+			.resolved_session_timezone()
+			.expect("session timezone"),
+		logical_type_specs: &logical_casts,
+		logical_type_registry: &logical_type_registry,
+		relation_scope: None,
+	};
+	bind_expr_program(&[expr], &substring_schema(), &ctx)
+}
+
+fn substring_expr(from: i64, length: Option<u64>) -> Expr {
+	Expr::Substring {
+		input: Box::new(Expr::column("name")),
+		from,
+		length,
+	}
+}
+
 fn bind_temporal_expr(expr: Expr, session_timezone: &str) -> BoundExprProgram {
 	try_bind_temporal_expr(expr, session_timezone).expect("bind temporal expr")
 }
@@ -20041,6 +20083,122 @@ fn try_bind_temporal_expr(
 		relation_scope: None,
 	};
 	bind_expr_program(&[expr], &temporal_schema(), &ctx)
+}
+
+#[test]
+fn substring_sql_lowers_from_for_and_comma_forms() {
+	for (sql, expected) in [
+		(
+			"SELECT SUBSTRING(c_phone FROM 1 FOR 2) FROM customer",
+			(1, Some(2)),
+		),
+		(
+			"SELECT SUBSTRING(c_phone, 3, 4) FROM customer",
+			(3, Some(4)),
+		),
+		("SELECT SUBSTRING(c_phone FROM 5) FROM customer", (5, None)),
+	] {
+		let plan = SqlPlanner::new().plan(sql).expect("plan substring");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("expected project for {sql}");
+		};
+		let Expr::Substring {
+			input,
+			from,
+			length,
+		} = &exprs[0]
+		else {
+			panic!("expected substring expression for {sql}: {:?}", exprs[0]);
+		};
+		assert!(matches!(input.as_ref(), Expr::Column(column) if column.name.0 == "c_phone"));
+		assert_eq!((*from, *length), expected, "{sql}");
+	}
+}
+
+#[test]
+fn substring_sql_rejects_unsupported_bounds() {
+	for (sql, expected) in [
+		(
+			"SELECT SUBSTRING(c_phone FROM 0 FOR 2) FROM customer",
+			"SUBSTRING FROM must be >= 1",
+		),
+		(
+			"SELECT SUBSTRING(c_phone FROM 1 FOR -1) FROM customer",
+			"SUBSTRING FOR must be >= 0",
+		),
+		(
+			"SELECT SUBSTRING(c_phone FROM c_acctbal FOR 2) FROM customer",
+			"SUBSTRING FROM expects an integer literal",
+		),
+		(
+			"SELECT SUBSTRING(c_phone FROM 1 FOR c_acctbal) FROM customer",
+			"SUBSTRING FOR expects an integer literal",
+		),
+		(
+			"SELECT SUBSTR(c_phone FROM 1 FOR 2) FROM customer",
+			"SUBSTR shorthand is not supported",
+		),
+	] {
+		let error = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("substring shape should reject");
+		assert!(
+			error.to_string().contains(expected),
+			"{sql}: expected {expected:?}, got {error}"
+		);
+	}
+}
+
+#[test]
+fn substring_exec_uses_one_based_character_offsets() {
+	let program = bind_substring_expr(substring_expr(2, Some(2))).expect("bind substring");
+	let outputs = Executor::evaluate_bound_program_without_storage(&program, &substring_batch())
+		.expect("evaluate substring");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("substring output");
+
+	assert_eq!(values.value(0), "bc");
+	assert_eq!(values.value(1), "é日");
+	assert!(values.is_null(2));
+	assert_eq!(program.node_type(program.roots[0]), Some(&DataType::Utf8));
+}
+
+#[test]
+fn substring_without_for_returns_rest_and_for_zero_returns_empty() {
+	let rest = bind_substring_expr(substring_expr(3, None)).expect("bind substring rest");
+	let empty = bind_substring_expr(substring_expr(3, Some(0))).expect("bind substring empty");
+	let batch = substring_batch();
+	let rest_outputs = Executor::evaluate_bound_program_without_storage(&rest, &batch)
+		.expect("evaluate substring rest");
+	let empty_outputs = Executor::evaluate_bound_program_without_storage(&empty, &batch)
+		.expect("evaluate substring empty");
+	let rest_values = rest_outputs[0]
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("substring rest output");
+	let empty_values = empty_outputs[0]
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("substring empty output");
+
+	assert_eq!(rest_values.value(0), "cde");
+	assert_eq!(rest_values.value(1), "日z");
+	assert_eq!(empty_values.value(0), "");
+	assert_eq!(empty_values.value(1), "");
+}
+
+#[test]
+fn substring_bind_rejects_non_utf8_input() {
+	let error = bind_substring_expr(Expr::Substring {
+		input: Box::new(Expr::column("amount")),
+		from: 1,
+		length: Some(2),
+	})
+	.expect_err("non-Utf8 substring input should reject");
+
+	assert!(error.to_string().contains("SUBSTRING expects Utf8 input"));
 }
 
 fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {

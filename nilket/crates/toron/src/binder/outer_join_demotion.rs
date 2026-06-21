@@ -1430,6 +1430,15 @@ where
 			negated: *negated,
 			case_insensitive: *case_insensitive,
 		},
+		Expr::Substring {
+			input,
+			from,
+			length,
+		} => Expr::Substring {
+			input: Box::new(child!(input)),
+			from: *from,
+			length: *length,
+		},
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -1508,7 +1517,8 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => expr_any_column(inner, predicate),
+		| Expr::DateTrunc(_, inner)
+		| Expr::Substring { input: inner, .. } => expr_any_column(inner, predicate),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -1621,6 +1631,7 @@ fn null_rejecting_sides(
 		| Expr::Not(_)
 		| Expr::InList { .. }
 		| Expr::Like { .. }
+		| Expr::Substring { .. }
 		| Expr::Case { .. }
 		| Expr::IsNull(_)
 		| Expr::TimeBucket(_, _)
@@ -1772,7 +1783,8 @@ fn conjunct_column_sides(
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => conjunct_column_sides(inner, left_scope, right_scope),
+		| Expr::DateTrunc(_, inner)
+		| Expr::Substring { input: inner, .. } => conjunct_column_sides(inner, left_scope, right_scope),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)

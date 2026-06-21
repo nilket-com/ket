@@ -35,6 +35,7 @@ use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::kernels::comparison::{
 	ilike as arrow_ilike, like as arrow_like, nilike as arrow_nilike, nlike as arrow_nlike,
 };
+use arrow::compute::kernels::substring::substring_by_char;
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
@@ -1204,6 +1205,14 @@ impl Executor {
 				let expr_arr = self.evaluate_expr(expr, batch)?;
 				evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)
 			}
+			Expr::Substring {
+				input,
+				from,
+				length,
+			} => {
+				let input_arr = self.evaluate_expr(input, batch)?;
+				evaluate_substring(&input_arr, *from, *length)
+			}
 			Expr::Case {
 				when_then,
 				else_expr,
@@ -1402,6 +1411,14 @@ impl Executor {
 				} => {
 					let expr_arr = evaluated_child(&outputs, *expr)?;
 					evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)?
+				}
+				BoundExprNode::Substring {
+					input,
+					from,
+					length,
+				} => {
+					let input_arr = evaluated_child(&outputs, *input)?;
+					evaluate_substring(&input_arr, *from, *length)?
 				}
 				BoundExprNode::Case {
 					when_then,
@@ -2657,6 +2674,29 @@ fn evaluate_like(
 		(false, true) => arrow_ilike(expr_arr, &pattern)?,
 		(true, true) => arrow_nilike(expr_arr, &pattern)?,
 	};
+	Ok(Arc::new(result) as ArrayRef)
+}
+
+fn evaluate_substring(
+	input_arr: &ArrayRef,
+	from: i64,
+	length: Option<u64>,
+) -> Result<ArrayRef, ExecutionError> {
+	if from <= 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "SUBSTRING FROM must be >= 1".to_string(),
+		});
+	}
+	let Some(input) = input_arr.as_any().downcast_ref::<StringArray>() else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"SUBSTRING expects Utf8 input, got {:?}",
+				input_arr.data_type()
+			),
+		});
+	};
+	let start = from - 1;
+	let result = substring_by_char(input, start, length)?;
 	Ok(Arc::new(result) as ArrayRef)
 }
 

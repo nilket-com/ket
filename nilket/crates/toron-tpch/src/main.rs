@@ -246,7 +246,7 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_dev_q20(sf).await
 			}
 		}
-		// Global-sales-opportunity reachability attempt: customer + orders, currently walls on SUBSTRING.
+		// Global-sales-opportunity reachability attempt: customer + orders with SQL SUBSTRING.
 		"q22" => {
 			if strict {
 				run_strict_q22(sf).await
