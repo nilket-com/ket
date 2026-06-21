@@ -3,10 +3,11 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q10, run_dev_q12,
-	run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q10,
-	run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
+	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
+	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
+	status_rows,
 };
 
 #[tokio::test]
@@ -365,6 +366,64 @@ fn q08_executes_in_both_modes() {
 		.expect("spawn q08 thread")
 		.join()
 		.expect("q08 thread panicked");
+}
+
+// ADR 301: q09's six-table product-profit query reaches execute in dev at the default scale, proving the
+// derived comma join is keyed. Strict reaches the measured Decimal arithmetic wall in profit subtraction.
+#[test]
+fn q09_dev_executes_strict_blocks_on_decimal_arithmetic() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q09 dev=implemented strict=implemented"),
+					"q09 is an implemented capability in the static inventory"
+				);
+
+				let dev = run_dev_q09(0.01).await;
+				assert_eq!(dev.query, "q09");
+				assert_eq!(
+					dev.status,
+					Status::Pass,
+					"q09 dev reaches execute at the default scale via keyed joins: {}",
+					dev.human()
+				);
+				assert_eq!(dev.phase, Phase::Execute);
+				assert!(
+					dev.digest.is_some(),
+					"a pass carries a digest: {}",
+					dev.human()
+				);
+
+				let strict = run_strict_q09(0.01).await;
+				assert_eq!(strict.query, "q09");
+				assert_eq!(
+					strict.status,
+					Status::Blocked,
+					"q09 strict records the measured wall: {}",
+					strict.human()
+				);
+				assert_eq!(strict.phase, Phase::Bind);
+				assert_eq!(
+					strict.reason.as_deref(),
+					Some("unsupported_decimal_arithmetic")
+				);
+				assert!(
+					strict.digest.is_none(),
+					"blocked rows do not carry a digest"
+				);
+			});
+		})
+		.expect("spawn q09 thread")
+		.join()
+		.expect("q09 thread panicked");
 }
 
 // ADR 284: q02 exercises a five-table outer comma join plus a correlated scalar whose inner side is a

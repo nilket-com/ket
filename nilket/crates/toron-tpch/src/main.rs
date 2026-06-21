@@ -10,10 +10,11 @@ use toron_tpch::{
 	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
 	check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17, check_strict_q20,
 	correctness_matrix, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02,
-	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q10,
-	run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
+	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09,
+	run_dev_q10, run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
 	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
-	run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
+	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
+	status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -194,6 +195,14 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_strict_q08(sf).await
 			} else {
 				run_dev_q08(sf).await
+			}
+		}
+		// Product-profit reachability attempt over part/supplier/lineitem/partsupp/orders/nation.
+		"q09" | "q9" => {
+			if strict {
+				run_strict_q09(sf).await
+			} else {
+				run_dev_q09(sf).await
 			}
 		}
 		// Correlated-subquery reachability attempt: orders + an EXISTS over lineitem.

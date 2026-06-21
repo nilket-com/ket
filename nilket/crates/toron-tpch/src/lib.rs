@@ -223,6 +223,29 @@ pub const Q8_DEV_SQL: &str = "SELECT o_year, \
 /// strict q08 — identical shape; strict mode carries official Decimal128 lineitem pricing columns.
 pub const STRICT_Q8_SQL: &str = Q8_DEV_SQL;
 
+/// ADR 301 — tpch.q09 (Product Type Profit Measure): tpchgen-2.0.2's Q9 with `:1` → `'green'`
+/// and no LIMIT. q09 is a reachability attempt over a six-table derived comma join plus strict profit
+/// arithmetic `(revenue - supply cost)`.
+pub const Q9_DEV_SQL: &str = "SELECT nation, o_year, SUM(amount) AS sum_profit \
+	FROM ( \
+	  SELECT n_name AS nation, \
+	         EXTRACT(year FROM o_orderdate) AS o_year, \
+	         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount \
+	  FROM part, supplier, lineitem, partsupp, orders, nation \
+	  WHERE s_suppkey = l_suppkey \
+	    AND ps_suppkey = l_suppkey \
+	    AND ps_partkey = l_partkey \
+	    AND p_partkey = l_partkey \
+	    AND o_orderkey = l_orderkey \
+	    AND s_nationkey = n_nationkey \
+	    AND p_name LIKE '%green%' \
+	) AS profit \
+	GROUP BY nation, o_year \
+	ORDER BY nation, o_year DESC";
+
+/// strict q09 — identical shape; strict mode carries official Decimal128 lineitem/partsupp numeric columns.
+pub const STRICT_Q9_SQL: &str = Q9_DEV_SQL;
+
 /// Q3 Shipping Priority reachability SQL: tpchgen-2.0.2's Q3 text with the `:1`/`:2`
 /// params bound to literals (`'BUILDING'`, `DATE '1995-03-15'`) and no `LIMIT` (the
 /// bundled text carries none). Same text both modes; only `lineitem` types differ.
@@ -1092,6 +1115,7 @@ async fn run_query(
 }
 
 /// A stage error from the shared execution path: the deepest phase reached and its classified reason.
+#[derive(Debug)]
 struct StageError {
 	phase: Phase,
 	reason: String,
@@ -5157,6 +5181,30 @@ pub async fn run_strict_q08(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 301 — dev q09: six-table product-profit reachability query.
+pub async fn run_dev_q09(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q09",
+		"dev",
+		scale_factor,
+		Q9_DEV_SQL,
+		q09_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 301 — strict q09: same shape with official Decimal128 lineitem/partsupp numeric columns.
+pub async fn run_strict_q09(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q09",
+		"strict",
+		scale_factor,
+		STRICT_Q9_SQL,
+		q09_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// The seven physical q08 harness tables. `nation` is registered once; q08's `n1`/`n2` are SQL aliases.
 fn q08_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let mut tables = q05_tables(strict, scale_factor);
@@ -5169,6 +5217,69 @@ fn q08_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		batch: part,
 	});
 	tables
+}
+
+/// The six physical q09 harness tables. Unlike q08, q09 needs `partsupp` and does not use customer/region.
+fn q09_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let part = generate_part(scale_factor);
+	let supplier = generate_supplier(strict, scale_factor);
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let partsupp = generate_partsupp(strict, scale_factor);
+	let orders = generate_orders(scale_factor);
+	let nation = generate_nation(scale_factor);
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(4),
+			name: "partsupp",
+			descriptor: partsupp_descriptor(partsupp_schema(strict).as_ref()),
+			facts: facts_for_batch(&partsupp),
+			batch: partsupp,
+		},
+		HarnessTable {
+			id: TableId(5),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
+		},
+		HarnessTable {
+			id: TableId(6),
+			name: "nation",
+			descriptor: nation_descriptor(nation_schema().as_ref()),
+			facts: facts_for_batch(&nation),
+			batch: nation,
+		},
+	]
 }
 
 /// ADR 278 — dev q04: the first correlated-subquery query (orders + an EXISTS over lineitem). A reachability
@@ -5272,6 +5383,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q17" || *id == "q02"
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
+					|| *id == "q09"
 				{
 					"implemented"
 				} else {
@@ -5369,6 +5481,69 @@ pub fn correctness_matrix_from_log(contents: &str) -> Vec<String> {
 			format!("{id} strict={cell}")
 		})
 		.collect()
+}
+
+#[cfg(test)]
+mod adr301_q09_probe {
+	use super::*;
+
+	#[test]
+	fn dev_q09_is_non_empty_at_default_scale() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					let batches = execute_query_with_tables(Q9_DEV_SQL, q09_tables(false, 0.01))
+						.await
+						.expect("dev q09 reaches execute at the default scale");
+					let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+					assert!(rows > 0, "dev q09 has rows at sf=0.01");
+				});
+			})
+			.expect("spawn q09 probe thread")
+			.join()
+			.expect("q09 probe thread panicked");
+	}
+
+	#[test]
+	fn strict_q09_walls_on_decimal_profit_subtraction_at_bind() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					let mut catalog = MockCatalog::new();
+					for table in q09_tables(true, 0.01) {
+						catalog
+							.register_descriptor(table.id, table.descriptor)
+							.expect("register q09 table");
+						catalog
+							.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
+							.expect("seed q09 facts");
+					}
+					let logical = SqlPlanner::new().plan(STRICT_Q9_SQL).expect("q09 plans");
+					let error = bind(&logical, &catalog, &PlannerConfig::default())
+						.await
+						.expect_err("strict q09 walls at bind");
+					let message = format!("{error:?}");
+					assert!(
+						message.contains("Decimal128") && message.contains("arithmetic operands"),
+						"strict q09 wall should be Decimal arithmetic, got: {message}"
+					);
+					assert_eq!(reason_for_error(&message), "unsupported_decimal_arithmetic");
+				});
+			})
+			.expect("spawn q09 bind probe thread")
+			.join()
+			.expect("q09 bind probe thread panicked");
+	}
 }
 
 #[cfg(test)]
