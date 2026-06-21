@@ -165,3 +165,23 @@ fn adr293_q07_is_wired_as_a_single_physical_nation_self_join() {
 	assert!(main.contains("\"q07\" | \"q7\""));
 	assert!(harness.contains("q07_executes_in_both_modes"));
 }
+
+#[test]
+fn adr297_q08_reuses_q05_tables_plus_one_physical_nation() {
+	let lib = source("src/lib.rs");
+	let main = source("src/main.rs");
+	let harness = source("tests/harness.rs");
+	assert!(lib.contains("pub const Q8_DEV_SQL"));
+	assert!(lib.contains("STRICT_Q8_SQL"));
+	assert!(lib.contains("nation n1, nation n2"));
+	assert!(lib.contains("fn q08_tables"));
+	assert!(lib.contains("q05_tables(strict, scale_factor)"));
+	assert!(lib.contains("name: \"part\""));
+	assert!(
+		!lib.contains("nation_1") && !lib.contains("nation_2"),
+		"q08 must use SQL aliases over one physical nation table"
+	);
+	assert!(lib.contains("|| *id == \"q08\""));
+	assert!(main.contains("\"q08\" | \"q8\""));
+	assert!(harness.contains("q08_executes_in_both_modes"));
+}

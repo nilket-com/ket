@@ -3,10 +3,10 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q10, run_dev_q12, run_dev_q14,
-	run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04,
-	run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q10, run_strict_q12, run_strict_q14,
-	run_strict_q17, run_strict_q20, status_rows,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q10, run_dev_q12,
+	run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q10,
+	run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
 };
 
 #[tokio::test]
@@ -321,6 +321,50 @@ fn q07_executes_in_both_modes() {
 		.expect("spawn q07 thread")
 		.join()
 		.expect("q07 thread panicked");
+}
+
+// ADR 297: q08 is q07's derived self-join shape plus `part` and `region`, with an outer grouped ratio.
+// Completing at the default scale is the practical keyed-join tripwire for the eight-factor derived body.
+#[test]
+fn q08_executes_in_both_modes() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q08 dev=implemented strict=implemented"),
+					"q08 is an implemented capability in the static inventory"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q08(0.01).await),
+					("strict", run_strict_q08(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q08");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q08 {mode} reaches execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute);
+					assert!(
+						attempt.digest.is_some(),
+						"a pass carries a digest: {}",
+						attempt.human()
+					);
+				}
+			});
+		})
+		.expect("spawn q08 thread")
+		.join()
+		.expect("q08 thread panicked");
 }
 
 // ADR 284: q02 exercises a five-table outer comma join plus a correlated scalar whose inner side is a
