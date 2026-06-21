@@ -3579,6 +3579,269 @@ pub async fn check_strict_q17() -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q20Row {
+	pub s_name: String,
+	pub s_address: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q20Oracle {
+	pub rows: Vec<Q20Row>,
+	pub selected_partsupp_rows: usize,
+	pub qualifying_suppliers: usize,
+	pub threshold_pass_rows: usize,
+	pub threshold_fail_rows: usize,
+	pub absent_group_rows: usize,
+}
+
+pub fn q20_part_name_is_forest_prefix(name: &str) -> bool {
+	name.starts_with("forest")
+}
+
+pub fn q20_threshold_passes(ps_availqty: i32, sum_qty_raw: Option<i128>) -> bool {
+	let Some(sum_qty_raw) = sum_qty_raw else {
+		return false;
+	};
+	(ps_availqty as i128) * 10_000 > 50 * sum_qty_raw
+}
+
+/// ADR 296: the independent strict-q20 oracle traverses the five q20 generators directly, preserves SQL's
+/// `SUM(empty) = NULL` threshold semantics, then answer-check the qualifying CANADA suppliers by `s_name`.
+pub fn strict_q20_oracle(scale_factor: f64) -> Q20Oracle {
+	const START_1994: i32 = 8766;
+	const START_1995: i32 = 9131;
+
+	let forest_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|part| q20_part_name_is_forest_prefix(&part.p_name.to_string()))
+		.map(|part| part.p_partkey)
+		.collect();
+
+	let mut canada_nations: HashSet<i64> = HashSet::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		if nation.n_name == "CANADA" {
+			canada_nations.insert(nation.n_nationkey);
+		}
+	}
+
+	let mut canada_suppliers: HashMap<i64, Q20Row> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		if canada_nations.contains(&supplier.s_nationkey) {
+			canada_suppliers.insert(
+				supplier.s_suppkey,
+				Q20Row {
+					s_name: supplier.s_name.to_string(),
+					s_address: supplier.s_address.to_string(),
+				},
+			);
+		}
+	}
+
+	let mut quantity_by_part_supp: HashMap<(i64, i64), i128> = HashMap::new();
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let shipdate = item.l_shipdate.to_unix_epoch();
+		if !(START_1994..START_1995).contains(&shipdate) {
+			continue;
+		}
+		*quantity_by_part_supp
+			.entry((item.l_partkey, item.l_suppkey))
+			.or_insert(0) += item.l_quantity as i128 * 100;
+	}
+
+	let mut selected_partsupp_rows = 0usize;
+	let mut threshold_pass_rows = 0usize;
+	let mut threshold_fail_rows = 0usize;
+	let mut absent_group_rows = 0usize;
+	let mut qualifying_suppkeys: HashSet<i64> = HashSet::new();
+	for partsupp in PartSuppGenerator::new(scale_factor, 1, 1).iter() {
+		if !forest_parts.contains(&partsupp.ps_partkey) {
+			continue;
+		}
+		selected_partsupp_rows += 1;
+		let sum_qty_raw = quantity_by_part_supp
+			.get(&(partsupp.ps_partkey, partsupp.ps_suppkey))
+			.copied();
+		if sum_qty_raw.is_none() {
+			absent_group_rows += 1;
+		}
+		if q20_threshold_passes(partsupp.ps_availqty, sum_qty_raw) {
+			threshold_pass_rows += 1;
+			qualifying_suppkeys.insert(partsupp.ps_suppkey);
+		} else {
+			threshold_fail_rows += 1;
+		}
+	}
+
+	let mut rows: Vec<Q20Row> = qualifying_suppkeys
+		.iter()
+		.filter_map(|suppkey| canada_suppliers.get(suppkey).cloned())
+		.collect();
+	rows.sort_by(|left, right| left.s_name.cmp(&right.s_name));
+	Q20Oracle {
+		rows,
+		selected_partsupp_rows,
+		qualifying_suppliers: qualifying_suppkeys.len(),
+		threshold_pass_rows,
+		threshold_fail_rows,
+		absent_group_rows,
+	}
+}
+
+fn strict_q20_expected_schema() -> [(&'static str, DataType); 2] {
+	[("s_name", DataType::Utf8), ("s_address", DataType::Utf8)]
+}
+
+pub fn assert_strict_q20_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q20_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q20 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q20(batches: &[RecordBatch], oracle: &Q20Oracle) -> Result<(), String> {
+	assert_strict_q20_schema(batches)?;
+	if oracle.rows.is_empty()
+		|| oracle.selected_partsupp_rows == 0
+		|| oracle.threshold_pass_rows == 0
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: rows={} selected_partsupp_rows={} threshold_pass_rows={}",
+			oracle.rows.len(),
+			oracle.selected_partsupp_rows,
+			oracle.threshold_pass_rows
+		));
+	}
+
+	let mut emitted = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let names = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (s_name) not Utf8")?;
+		let addresses = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (s_address) not Utf8")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if names.is_null(i) {
+				return Err(format!("column s_name row {row_index} is NULL"));
+			}
+			if addresses.is_null(i) {
+				return Err(format!("column s_address row {row_index} is NULL"));
+			}
+			emitted.push(Q20Row {
+				s_name: names.value(i).to_string(),
+				s_address: addresses.value(i).to_string(),
+			});
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].s_name > pair[1].s_name {
+			return Err(format!(
+				"ORDER BY s_name violated: {:?} emitted before {:?}",
+				pair[0].s_name, pair[1].s_name
+			));
+		}
+	}
+
+	if emitted.len() != oracle.rows.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			oracle.rows.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<String, String> = BTreeMap::new();
+	for row in emitted {
+		if seen
+			.insert(row.s_name.clone(), row.s_address.clone())
+			.is_some()
+		{
+			return Err(format!("duplicate emitted s_name {:?}", row.s_name));
+		}
+	}
+	for expected in &oracle.rows {
+		let Some(address) = seen.get(&expected.s_name) else {
+			return Err(format!(
+				"oracle s_name {:?} missing from output",
+				expected.s_name
+			));
+		};
+		if address != &expected.s_address {
+			return Err(format!(
+				"s_name {:?}: s_address mismatch: expected {:?}, got {:?}",
+				expected.s_name, expected.s_address, address
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q20(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q20_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q20".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q20_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q20_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q20_oracle(scale_factor);
+	match compare_strict_q20(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// Validate an explicit `--sf` (scale-factor) value: it must be a **finite, strictly-positive** number.
 /// Malformed (unparseable), zero, negative, NaN, and infinite values are *usage* errors — the CLI maps the
 /// `Err` to a harness error (exit 2, no telemetry row), per ADR 261's "a bad arg is a harness error, not a

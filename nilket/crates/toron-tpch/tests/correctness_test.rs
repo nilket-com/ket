@@ -9,16 +9,18 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q5Group, Q10Oracle, Q10Row, Q12Group,
-	Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, assert_strict_q1_schema,
-	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q5_schema,
-	assert_strict_q10_schema, assert_strict_q12_schema, assert_strict_q14_schema,
-	assert_strict_q17_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
-	check_strict_q5, check_strict_q6, check_strict_q10, check_strict_q12, check_strict_q14,
-	check_strict_q17, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q5,
-	compare_strict_q6, compare_strict_q10, compare_strict_q12, compare_strict_q14,
-	compare_strict_q17, correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
-	q6_row_revenue, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q5_oracle,
-	strict_q6_oracle, strict_q10_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle,
+	Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle, Q20Row,
+	assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
+	assert_strict_q5_schema, assert_strict_q10_schema, assert_strict_q12_schema,
+	assert_strict_q14_schema, assert_strict_q17_schema, assert_strict_q20_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q5, check_strict_q6,
+	check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17, check_strict_q20,
+	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q5, compare_strict_q6,
+	compare_strict_q10, compare_strict_q12, compare_strict_q14, compare_strict_q17,
+	compare_strict_q20, correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
+	q6_row_revenue, q20_part_name_is_forest_prefix, q20_threshold_passes, strict_q1_oracle,
+	strict_q02_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q10_oracle,
+	strict_q12_oracle, strict_q14_oracle, strict_q17_oracle, strict_q20_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -1778,5 +1780,227 @@ fn q17_null_or_empty_result_is_fail_at_compare() {
 	assert!(
 		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &q17_oracle(None)).is_err(),
 		"a NULL oracle is rejected by the anti-empty guard"
+	);
+}
+
+fn q20_row(name: &str, address: &str) -> Q20Row {
+	Q20Row {
+		s_name: name.to_string(),
+		s_address: address.to_string(),
+	}
+}
+
+fn q20_oracle(rows: &[Q20Row]) -> Q20Oracle {
+	Q20Oracle {
+		rows: rows.to_vec(),
+		selected_partsupp_rows: rows.len().max(1),
+		qualifying_suppliers: rows.len(),
+		threshold_pass_rows: rows.len().max(1),
+		threshold_fail_rows: 1,
+		absent_group_rows: 1,
+	}
+}
+
+fn q20_batch(rows: &[Q20Row]) -> RecordBatch {
+	let nullable_rows: Vec<(Option<&str>, Option<&str>)> = rows
+		.iter()
+		.map(|row| (Some(row.s_name.as_str()), Some(row.s_address.as_str())))
+		.collect();
+	q20_nullable_batch(&nullable_rows)
+}
+
+fn q20_nullable_batch(rows: &[(Option<&str>, Option<&str>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("s_name", DataType::Utf8, true),
+		Field::new("s_address", DataType::Utf8, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<&str>>>(),
+			)),
+		],
+	)
+	.expect("q20 batch")
+}
+
+#[test]
+fn strict_q20_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q20(0.01))
+		})
+		.expect("spawn q20 correctness thread")
+		.join()
+		.expect("q20 correctness thread panicked");
+	assert_eq!(attempt.query, "q20");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q20_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q20_oracle(0.01);
+	assert!(
+		!oracle.rows.is_empty(),
+		"expected a non-empty q20 answer at sf=0.01"
+	);
+	assert!(
+		oracle.selected_partsupp_rows > 0,
+		"selected forest partsupp rows at sf=0.01: {}",
+		oracle.selected_partsupp_rows
+	);
+	assert!(
+		oracle.threshold_pass_rows > 0,
+		"threshold pass rows at sf=0.01: {}",
+		oracle.threshold_pass_rows
+	);
+	assert_eq!(
+		oracle.threshold_pass_rows + oracle.threshold_fail_rows,
+		oracle.selected_partsupp_rows,
+		"every selected partsupp row must either pass or fail the threshold"
+	);
+	assert!(
+		oracle.threshold_fail_rows > 0,
+		"live q20 should exercise threshold failure rows at sf=0.01"
+	);
+	assert!(
+		oracle.absent_group_rows > 0,
+		"live q20 should exercise absent correlated groups at sf=0.01"
+	);
+	assert!(
+		oracle.qualifying_suppliers >= oracle.rows.len(),
+		"outer CANADA filter can only reduce the qualifying supplier set"
+	);
+}
+
+#[test]
+fn strict_q20_output_schema_is_asserted() {
+	let row = q20_row("Supplier#000000001", "1 Main Street");
+	assert!(assert_strict_q20_schema(&[q20_batch(&[row])]).is_ok());
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("s_name", DataType::Utf8, false),
+			Field::new("s_address", DataType::Int64, false),
+		])),
+		vec![
+			Arc::new(StringArray::from(vec!["Supplier#000000001"])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+		],
+	)
+	.expect("drifted q20 batch");
+	assert!(
+		assert_strict_q20_schema(&[drifted]).is_err(),
+		"a non-measured address type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q20_threshold_boundary_flip() {
+	let sum_qty_raw = Some(200_i128);
+	assert!(
+		!q20_threshold_passes(1, sum_qty_raw),
+		"strict > excludes equality: 1*10000 == 50*200"
+	);
+	assert!(
+		q20_threshold_passes(2, sum_qty_raw),
+		"a partsupp just above the 0.5*SUM threshold qualifies"
+	);
+}
+
+#[test]
+fn q20_absent_lineitem_group_follows_sql_null_rule() {
+	assert!(
+		!q20_threshold_passes(100, None),
+		"SUM over an absent correlated group is NULL, so the comparison is unknown and fails"
+	);
+}
+
+#[test]
+fn q20_forest_is_prefix_match() {
+	assert!(q20_part_name_is_forest_prefix("forest green"));
+	assert!(
+		!q20_part_name_is_forest_prefix("deep forest green"),
+		"q20's LIKE 'forest%' is a prefix predicate, not contains"
+	);
+	assert!(
+		!q20_part_name_is_forest_prefix("FOREST GREEN"),
+		"the oracle follows the case-sensitive harness LIKE semantics"
+	);
+}
+
+#[test]
+fn q20_correctness_mismatch_is_fail_at_compare() {
+	let row = q20_row("Supplier#000000001", "1 Main Street");
+	let oracle = q20_oracle(std::slice::from_ref(&row));
+	assert!(
+		compare_strict_q20(&[q20_batch(std::slice::from_ref(&row))], &oracle).is_ok(),
+		"exact supplier row match"
+	);
+
+	let wrong_address = q20_row("Supplier#000000001", "wrong address");
+	assert!(
+		compare_strict_q20(&[q20_batch(&[wrong_address])], &oracle).is_err(),
+		"a wrong supplier address is a mismatch"
+	);
+
+	let missing = q20_row("Supplier#000000002", "2 Main Street");
+	let two_row_oracle = q20_oracle(&[row.clone(), missing.clone()]);
+	assert!(
+		compare_strict_q20(&[q20_batch(std::slice::from_ref(&row))], &two_row_oracle).is_err(),
+		"a dropped supplier is a mismatch"
+	);
+
+	let extra = q20_row("Supplier#000000003", "3 Main Street");
+	assert!(
+		compare_strict_q20(&[q20_batch(&[row.clone(), extra])], &oracle).is_err(),
+		"an extra supplier is a mismatch"
+	);
+
+	assert!(
+		compare_strict_q20(&[q20_batch(&[row.clone(), row])], &two_row_oracle).is_err(),
+		"a duplicate emitted s_name is rejected"
+	);
+}
+
+#[test]
+fn q20_null_cell_is_fail_at_compare() {
+	let oracle = q20_oracle(&[q20_row("Supplier#000000001", "1 Main Street")]);
+	assert!(
+		compare_strict_q20(
+			&[q20_nullable_batch(&[(None, Some("1 Main Street"))])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL s_name is fail@compare"
+	);
+	assert!(
+		compare_strict_q20(
+			&[q20_nullable_batch(&[(Some("Supplier#000000001"), None)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL s_address is fail@compare"
+	);
+}
+
+#[test]
+fn q20_order_violation_is_fail() {
+	let row_a = q20_row("Supplier#000000001", "1 Main Street");
+	let row_b = q20_row("Supplier#000000002", "2 Main Street");
+	let oracle = q20_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q20(&[q20_batch(&[row_b, row_a])], &oracle).is_err(),
+		"s_name descending violates ORDER BY s_name"
 	);
 }
