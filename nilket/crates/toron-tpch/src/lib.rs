@@ -2227,6 +2227,292 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Q07Oracle {
+	pub groups: BTreeMap<(String, String, i32), i128>,
+	pub selected_rows: usize,
+}
+
+fn q07_ship_year(shipdate: i32) -> Option<i32> {
+	const START_1995: i32 = 9131;
+	const START_1996: i32 = 9496;
+	const START_1997: i32 = 9862;
+
+	match shipdate {
+		START_1995..START_1996 => Some(1995),
+		START_1996..START_1997 => Some(1996),
+		_ => None,
+	}
+}
+
+pub fn q07_contribution(
+	supp_nation: &str,
+	cust_nation: &str,
+	shipdate: i32,
+	extprice_raw: i128,
+	discount_raw: i128,
+) -> Option<((String, String, i32), i128)> {
+	if !((supp_nation == "FRANCE" && cust_nation == "GERMANY")
+		|| (supp_nation == "GERMANY" && cust_nation == "FRANCE"))
+	{
+		return None;
+	}
+	let l_year = q07_ship_year(shipdate)?;
+	let key = (supp_nation.to_string(), cust_nation.to_string(), l_year);
+	Some((key, discounted_price_raw(extprice_raw, discount_raw)))
+}
+
+/// ADR 299: the independent strict-q07 oracle. Resolve q07's nation self-join explicitly: supplier nation
+/// comes through `l_suppkey`, customer nation through `l_orderkey -> o_custkey`.
+pub fn strict_q07_oracle(scale_factor: f64) -> Q07Oracle {
+	let mut nations: HashMap<i64, String> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		nations.insert(nation.n_nationkey, nation.n_name.to_string());
+	}
+
+	let mut suppliers: HashMap<i64, i64> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		suppliers.insert(supplier.s_suppkey, supplier.s_nationkey);
+	}
+
+	let mut customers: HashMap<i64, i64> = HashMap::new();
+	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		customers.insert(customer.c_custkey, customer.c_nationkey);
+	}
+
+	let mut orders: HashMap<i64, i64> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		orders.insert(order.o_orderkey, order.o_custkey);
+	}
+
+	let mut groups: BTreeMap<(String, String, i32), i128> = BTreeMap::new();
+	let mut selected_rows = 0_usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let Some(&supplier_nationkey) = suppliers.get(&item.l_suppkey) else {
+			continue;
+		};
+		let Some(supp_nation) = nations.get(&supplier_nationkey) else {
+			continue;
+		};
+		let Some(&custkey) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let Some(&customer_nationkey) = customers.get(&custkey) else {
+			continue;
+		};
+		let Some(cust_nation) = nations.get(&customer_nationkey) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let discount_raw = item.l_discount.into_inner() as i128;
+		let Some((key, revenue)) = q07_contribution(
+			supp_nation,
+			cust_nation,
+			item.l_shipdate.to_unix_epoch(),
+			extprice_raw,
+			discount_raw,
+		) else {
+			continue;
+		};
+		*groups.entry(key).or_default() += revenue;
+		selected_rows += 1;
+	}
+
+	Q07Oracle {
+		groups,
+		selected_rows,
+	}
+}
+
+fn strict_q07_expected_schema() -> [(&'static str, DataType); 4] {
+	[
+		("supp_nation", DataType::Utf8),
+		("cust_nation", DataType::Utf8),
+		("l_year", DataType::Int32),
+		("revenue", DataType::Decimal128(32, 4)),
+	]
+}
+
+pub fn assert_strict_q07_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q07_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q07 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q07(batches: &[RecordBatch], oracle: &Q07Oracle) -> Result<(), String> {
+	assert_strict_q07_schema(batches)?;
+
+	let mut emitted: Vec<((String, String, i32), i128)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 4 {
+			return Err(format!("expected 4 columns, got {}", batch.num_columns()));
+		}
+		let supp_nations = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (supp_nation) not Utf8")?;
+		let cust_nations = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (cust_nation) not Utf8")?;
+		let years = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.ok_or("column 2 (l_year) not Int32")?;
+		let revenues = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 3 (revenue) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			if supp_nations.is_null(i) {
+				return Err(format!("column supp_nation row {} is NULL", emitted.len()));
+			}
+			if cust_nations.is_null(i) {
+				return Err(format!("column cust_nation row {} is NULL", emitted.len()));
+			}
+			if years.is_null(i) {
+				return Err(format!("column l_year row {} is NULL", emitted.len()));
+			}
+			if revenues.is_null(i) {
+				return Err(format!("column revenue row {} is NULL", emitted.len()));
+			}
+			emitted.push((
+				(
+					supp_nations.value(i).to_string(),
+					cust_nations.value(i).to_string(),
+					years.value(i),
+				),
+				revenues.value(i),
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<(String, String, i32), i128> = BTreeMap::new();
+	for (key, revenue) in &emitted {
+		if seen.insert(key.clone(), *revenue).is_some() {
+			return Err(format!("duplicate emitted q07 group {key:?}"));
+		}
+	}
+	for (key, expected_revenue) in &oracle.groups {
+		let Some(actual_revenue) = seen.get(key) else {
+			return Err(format!("oracle q07 group {key:?} missing from output"));
+		};
+		if actual_revenue != expected_revenue {
+			return Err(format!(
+				"q07 group {key:?}: revenue mismatch: expected {expected_revenue}, got {actual_revenue}"
+			));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].0 > pair[1].0 {
+			return Err(format!(
+				"ORDER BY supp_nation, cust_nation, l_year violated: {:?} emitted before {:?}",
+				pair[0].0, pair[1].0
+			));
+		}
+	}
+
+	Ok(())
+}
+
+fn q07_expected_group_keys() -> [(&'static str, &'static str, i32); 4] {
+	[
+		("FRANCE", "GERMANY", 1995),
+		("FRANCE", "GERMANY", 1996),
+		("GERMANY", "FRANCE", 1995),
+		("GERMANY", "FRANCE", 1996),
+	]
+}
+
+pub async fn check_strict_q07(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q07_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q07".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q7_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q07_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q07_oracle(scale_factor);
+	let missing_keys: Vec<String> = q07_expected_group_keys()
+		.iter()
+		.filter(|(supp, cust, year)| {
+			!oracle
+				.groups
+				.contains_key(&(supp.to_string(), cust.to_string(), *year))
+		})
+		.map(|(supp, cust, year)| format!("({supp},{cust},{year})"))
+		.collect();
+	if oracle.selected_rows < 1 || oracle.groups.len() != 4 || !missing_keys.is_empty() {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: selected_rows={} groups={} missing={missing_keys:?}",
+				oracle.selected_rows,
+				oracle.groups.len()
+			)),
+		);
+	}
+	match compare_strict_q07(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q10Row {
 	pub c_custkey: i64,
