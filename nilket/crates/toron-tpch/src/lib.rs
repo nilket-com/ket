@@ -2199,6 +2199,329 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q10Row {
+	pub c_custkey: i64,
+	pub c_name: String,
+	pub revenue: i128,
+	pub c_acctbal: i128,
+	pub n_name: String,
+	pub c_address: String,
+	pub c_phone: String,
+	pub c_comment: String,
+}
+
+pub struct Q10Oracle {
+	pub rows: Vec<Q10Row>,
+	pub selected_rows: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Q10Customer {
+	name: String,
+	acctbal_raw: i128,
+	nationkey: i64,
+	address: String,
+	phone: String,
+	comment: String,
+}
+
+/// ADR 295: the independent strict-q10 oracle — traverse the four q10 generators directly, apply the
+/// returned-item date/window filters, then group raw scale-4 revenue by the customer key while checking every
+/// projected customer/nation attribute.
+pub fn strict_q10_oracle(scale_factor: f64) -> Q10Oracle {
+	const START_1993_10_01: i32 = 8674;
+	const START_1994_01_01: i32 = 8766;
+
+	let mut nations: HashMap<i64, String> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		nations.insert(nation.n_nationkey, nation.n_name.to_string());
+	}
+
+	let mut customers: HashMap<i64, Q10Customer> = HashMap::new();
+	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		customers.insert(
+			customer.c_custkey,
+			Q10Customer {
+				name: customer.c_name.to_string(),
+				acctbal_raw: customer.c_acctbal.into_inner() as i128,
+				nationkey: customer.c_nationkey,
+				address: customer.c_address.to_string(),
+				phone: customer.c_phone.to_string(),
+				comment: customer.c_comment.to_string(),
+			},
+		);
+	}
+
+	let mut orders: HashMap<i64, i64> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		let orderdate = order.o_orderdate.to_unix_epoch();
+		if (START_1993_10_01..START_1994_01_01).contains(&orderdate) {
+			orders.insert(order.o_orderkey, order.o_custkey);
+		}
+	}
+
+	let mut groups: BTreeMap<i64, Q10Row> = BTreeMap::new();
+	let mut selected_rows = 0usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		if item.l_returnflag != "R" {
+			continue;
+		}
+		let Some(&custkey) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let Some(customer) = customers.get(&custkey) else {
+			continue;
+		};
+		let Some(nation_name) = nations.get(&customer.nationkey) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let disc_raw = item.l_discount.into_inner() as i128;
+		groups
+			.entry(custkey)
+			.or_insert_with(|| Q10Row {
+				c_custkey: custkey,
+				c_name: customer.name.clone(),
+				revenue: 0,
+				c_acctbal: customer.acctbal_raw,
+				n_name: nation_name.clone(),
+				c_address: customer.address.clone(),
+				c_phone: customer.phone.clone(),
+				c_comment: customer.comment.clone(),
+			})
+			.revenue += discounted_price_raw(extprice_raw, disc_raw);
+		selected_rows += 1;
+	}
+
+	let mut rows: Vec<Q10Row> = groups.into_values().collect();
+	rows.sort_by(|left, right| right.revenue.cmp(&left.revenue));
+	Q10Oracle {
+		rows,
+		selected_rows,
+	}
+}
+
+fn strict_q10_expected_schema() -> [(&'static str, DataType); 8] {
+	[
+		("c_custkey", DataType::Int64),
+		("c_name", DataType::Utf8),
+		("revenue", DataType::Decimal128(32, 4)),
+		("c_acctbal", DataType::Decimal128(15, 2)),
+		("n_name", DataType::Utf8),
+		("c_address", DataType::Utf8),
+		("c_phone", DataType::Utf8),
+		("c_comment", DataType::Utf8),
+	]
+}
+
+pub fn assert_strict_q10_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q10_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q10 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q10(batches: &[RecordBatch], oracle: &Q10Oracle) -> Result<(), String> {
+	assert_strict_q10_schema(batches)?;
+	if oracle.selected_rows == 0 || oracle.rows.is_empty() {
+		return Err(format!(
+			"oracle non-vacuous guard failed: selected_rows={} rows={}",
+			oracle.selected_rows,
+			oracle.rows.len()
+		));
+	}
+
+	let mut emitted = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 8 {
+			return Err(format!("expected 8 columns, got {}", batch.num_columns()));
+		}
+		let custkeys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 0 (c_custkey) not Int64")?;
+		let customer_names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (c_name) not Utf8")?;
+		let revenues = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 2 (revenue) not Decimal128")?;
+		let acctbals = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 3 (c_acctbal) not Decimal128")?;
+		let nation_names = batch
+			.column(4)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 4 (n_name) not Utf8")?;
+		let addresses = batch
+			.column(5)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 5 (c_address) not Utf8")?;
+		let phones = batch
+			.column(6)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 6 (c_phone) not Utf8")?;
+		let comments = batch
+			.column(7)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 7 (c_comment) not Utf8")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if custkeys.is_null(i) {
+				return Err(format!("column c_custkey row {row_index} is NULL"));
+			}
+			if customer_names.is_null(i) {
+				return Err(format!("column c_name row {row_index} is NULL"));
+			}
+			if revenues.is_null(i) {
+				return Err(format!("column revenue row {row_index} is NULL"));
+			}
+			if acctbals.is_null(i) {
+				return Err(format!("column c_acctbal row {row_index} is NULL"));
+			}
+			if nation_names.is_null(i) {
+				return Err(format!("column n_name row {row_index} is NULL"));
+			}
+			if addresses.is_null(i) {
+				return Err(format!("column c_address row {row_index} is NULL"));
+			}
+			if phones.is_null(i) {
+				return Err(format!("column c_phone row {row_index} is NULL"));
+			}
+			if comments.is_null(i) {
+				return Err(format!("column c_comment row {row_index} is NULL"));
+			}
+			emitted.push(Q10Row {
+				c_custkey: custkeys.value(i),
+				c_name: customer_names.value(i).to_string(),
+				revenue: revenues.value(i),
+				c_acctbal: acctbals.value(i),
+				n_name: nation_names.value(i).to_string(),
+				c_address: addresses.value(i).to_string(),
+				c_phone: phones.value(i).to_string(),
+				c_comment: comments.value(i).to_string(),
+			});
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].revenue < pair[1].revenue {
+			return Err(format!(
+				"ORDER BY revenue DESC violated: {} emitted before {}",
+				pair[0].revenue, pair[1].revenue
+			));
+		}
+	}
+
+	if emitted.len() != oracle.rows.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			oracle.rows.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<i64, Q10Row> = BTreeMap::new();
+	for row in emitted {
+		if seen.insert(row.c_custkey, row.clone()).is_some() {
+			return Err(format!("duplicate emitted c_custkey {}", row.c_custkey));
+		}
+	}
+	for expected in &oracle.rows {
+		let Some(actual) = seen.get(&expected.c_custkey) else {
+			return Err(format!(
+				"oracle c_custkey {} missing from output",
+				expected.c_custkey
+			));
+		};
+		if actual != expected {
+			return Err(format!(
+				"c_custkey {} mismatch: expected {:?}, got {:?}",
+				expected.c_custkey, expected, actual
+			));
+		}
+	}
+	Ok(())
+}
+
+pub async fn check_strict_q10(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q10_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q10".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q10_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q10_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q10_oracle(scale_factor);
+	if oracle.selected_rows <= 1 || oracle.rows.len() <= 1 {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!(
+				"oracle non-vacuous guard failed: selected_rows={} rows={}",
+				oracle.selected_rows,
+				oracle.rows.len()
+			)),
+		);
+	}
+	match compare_strict_q10(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Q02Row {
 	pub s_acctbal: i128,

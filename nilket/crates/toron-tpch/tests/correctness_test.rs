@@ -8,16 +8,17 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q5Group, Q12Group, Q12Oracle, Q14Oracle,
-	Q17_CORRECTNESS_SCALE, Q17Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
-	assert_strict_q3_schema, assert_strict_q5_schema, assert_strict_q12_schema,
-	assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw, check_strict_q1,
-	check_strict_q02, check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q12,
-	check_strict_q14, check_strict_q17, compare_strict_q1, compare_strict_q02, compare_strict_q3,
-	compare_strict_q5, compare_strict_q6, compare_strict_q12, compare_strict_q14,
+	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q5Group, Q10Oracle, Q10Row, Q12Group,
+	Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, assert_strict_q1_schema,
+	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q5_schema,
+	assert_strict_q10_schema, assert_strict_q12_schema, assert_strict_q14_schema,
+	assert_strict_q17_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q5, check_strict_q6, check_strict_q10, check_strict_q12, check_strict_q14,
+	check_strict_q17, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q5,
+	compare_strict_q6, compare_strict_q10, compare_strict_q12, compare_strict_q14,
 	compare_strict_q17, correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
 	q6_row_revenue, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q5_oracle,
-	strict_q6_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle,
+	strict_q6_oracle, strict_q10_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -975,6 +976,285 @@ fn q5_null_cell_is_fail_at_compare() {
 	assert!(
 		compare_strict_q5(&[q5_nullable_batch(&[(Some("ARGENTINA"), None)])], &oracle).is_err(),
 		"a NULL revenue is fail@compare"
+	);
+}
+
+fn q10_row(c_custkey: i64, revenue: i128) -> Q10Row {
+	Q10Row {
+		c_custkey,
+		c_name: format!("Customer#{c_custkey:09}"),
+		revenue,
+		c_acctbal: 10_000 + c_custkey as i128,
+		n_name: "ARGENTINA".to_string(),
+		c_address: format!("{c_custkey} Main Street"),
+		c_phone: format!("10-000-000-{c_custkey:04}"),
+		c_comment: format!("comment {c_custkey}"),
+	}
+}
+
+fn q10_oracle(rows: &[Q10Row]) -> Q10Oracle {
+	Q10Oracle {
+		rows: rows.to_vec(),
+		selected_rows: rows.len(),
+	}
+}
+
+fn q10_batch(rows: &[Q10Row]) -> RecordBatch {
+	let nullable_rows: Vec<Q10NullableRow<'_>> = rows
+		.iter()
+		.map(|row| {
+			(
+				Some(row.c_custkey),
+				Some(row.c_name.as_str()),
+				Some(row.revenue),
+				Some(row.c_acctbal),
+				Some(row.n_name.as_str()),
+				Some(row.c_address.as_str()),
+				Some(row.c_phone.as_str()),
+				Some(row.c_comment.as_str()),
+			)
+		})
+		.collect();
+	q10_nullable_batch(&nullable_rows)
+}
+
+type Q10NullableRow<'a> = (
+	Option<i64>,
+	Option<&'a str>,
+	Option<i128>,
+	Option<i128>,
+	Option<&'a str>,
+	Option<&'a str>,
+	Option<&'a str>,
+	Option<&'a str>,
+);
+
+fn q10_nullable_batch(rows: &[Q10NullableRow<'_>]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("c_custkey", DataType::Int64, true),
+		Field::new("c_name", DataType::Utf8, true),
+		Field::new("revenue", DataType::Decimal128(32, 4), true),
+		Field::new("c_acctbal", DataType::Decimal128(15, 2), true),
+		Field::new("n_name", DataType::Utf8, true),
+		Field::new("c_address", DataType::Utf8, true),
+		Field::new("c_phone", DataType::Utf8, true),
+		Field::new("c_comment", DataType::Utf8, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<i64>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.2).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(32, 4)
+					.expect("q10 revenue decimal column"),
+			),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.3).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(15, 2)
+					.expect("q10 c_acctbal decimal column"),
+			),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.4).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.5).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.6).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.7).collect::<Vec<Option<&str>>>(),
+			)),
+		],
+	)
+	.expect("q10 batch")
+}
+
+fn q10_batch_with_null(null_column: usize) -> RecordBatch {
+	let row: Q10NullableRow<'_> = (
+		(null_column != 0).then_some(1),
+		(null_column != 1).then_some("Customer#000000001"),
+		(null_column != 2).then_some(500),
+		(null_column != 3).then_some(12345),
+		(null_column != 4).then_some("ARGENTINA"),
+		(null_column != 5).then_some("1 Main Street"),
+		(null_column != 6).then_some("10-000-000-0001"),
+		(null_column != 7).then_some("comment 1"),
+	);
+	q10_nullable_batch(&[row])
+}
+
+#[test]
+fn strict_q10_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q10(0.01))
+		})
+		.expect("spawn q10 correctness thread")
+		.join()
+		.expect("q10 correctness thread panicked");
+	assert_eq!(attempt.query, "q10");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q10_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q10_oracle(0.01);
+	assert!(
+		oracle.selected_rows > 1,
+		"selected {} contributing rows",
+		oracle.selected_rows
+	);
+	assert!(
+		oracle.rows.len() > 1,
+		"expected > 1 q10 group, got {}",
+		oracle.rows.len()
+	);
+}
+
+#[test]
+fn strict_q10_output_schema_is_asserted() {
+	let row = q10_row(1, 500);
+	assert!(assert_strict_q10_schema(&[q10_batch(&[row])]).is_ok());
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("c_custkey", DataType::Int64, false),
+			Field::new("c_name", DataType::Utf8, false),
+			Field::new("revenue", DataType::Decimal128(31, 4), false),
+			Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
+			Field::new("n_name", DataType::Utf8, false),
+			Field::new("c_address", DataType::Utf8, false),
+			Field::new("c_phone", DataType::Utf8, false),
+			Field::new("c_comment", DataType::Utf8, false),
+		])),
+		vec![
+			Arc::new(Int64Array::from(vec![1])),
+			Arc::new(StringArray::from(vec!["Customer#000000001"])),
+			Arc::new(
+				Decimal128Array::from(vec![500_i128])
+					.with_precision_and_scale(31, 4)
+					.expect("drifted revenue"),
+			),
+			Arc::new(
+				Decimal128Array::from(vec![12345_i128])
+					.with_precision_and_scale(15, 2)
+					.expect("acctbal"),
+			),
+			Arc::new(StringArray::from(vec!["ARGENTINA"])),
+			Arc::new(StringArray::from(vec!["1 Main Street"])),
+			Arc::new(StringArray::from(vec!["10-000-000-0001"])),
+			Arc::new(StringArray::from(vec!["comment 1"])),
+		],
+	)
+	.expect("drifted q10 batch");
+	assert!(
+		assert_strict_q10_schema(&[drifted]).is_err(),
+		"a non-measured revenue precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q10_correctness_mismatch_is_fail_at_compare() {
+	let row = q10_row(1, 500);
+	let oracle = q10_oracle(std::slice::from_ref(&row));
+	assert!(
+		compare_strict_q10(&[q10_batch(std::slice::from_ref(&row))], &oracle).is_ok(),
+		"exact row match"
+	);
+
+	let mut wrong_revenue = row.clone();
+	wrong_revenue.revenue += 1;
+	assert!(
+		compare_strict_q10(&[q10_batch(&[wrong_revenue])], &oracle).is_err(),
+		"an off-by-one revenue is a mismatch"
+	);
+
+	let mut wrong_acctbal = row.clone();
+	wrong_acctbal.c_acctbal += 1;
+	assert!(
+		compare_strict_q10(&[q10_batch(&[wrong_acctbal])], &oracle).is_err(),
+		"an off-by-one c_acctbal is a mismatch"
+	);
+
+	let mut wrong_name = row;
+	wrong_name.n_name = "BRAZIL".to_string();
+	assert!(
+		compare_strict_q10(&[q10_batch(&[wrong_name])], &oracle).is_err(),
+		"a wrong string attribute is a mismatch"
+	);
+}
+
+#[test]
+fn q10_missing_extra_or_duplicate_row_is_fail_at_compare() {
+	let row_a = q10_row(1, 500);
+	let row_b = q10_row(2, 300);
+	let oracle = q10_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q10(&[q10_batch(std::slice::from_ref(&row_a))], &oracle).is_err(),
+		"a dropped row is a mismatch"
+	);
+	let row_c = q10_row(3, 100);
+	assert!(
+		compare_strict_q10(
+			&[q10_batch(&[row_a.clone(), row_b.clone(), row_c])],
+			&oracle
+		)
+		.is_err(),
+		"an extra row is a mismatch"
+	);
+	assert!(
+		compare_strict_q10(&[q10_batch(&[row_a.clone(), row_a])], &oracle).is_err(),
+		"a duplicate emitted c_custkey is rejected"
+	);
+}
+
+#[test]
+fn q10_null_cell_is_fail_at_compare() {
+	let oracle = q10_oracle(&[q10_row(1, 500)]);
+	for column in 0..8 {
+		assert!(
+			compare_strict_q10(&[q10_batch_with_null(column)], &oracle).is_err(),
+			"NULL in q10 column {column} is fail@compare"
+		);
+	}
+}
+
+#[test]
+fn q10_order_prefix_violation_is_fail() {
+	let row_a = q10_row(1, 500);
+	let row_b = q10_row(2, 300);
+	let oracle = q10_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q10(&[q10_batch(&[row_b, row_a])], &oracle).is_err(),
+		"revenue ascending violates ORDER BY revenue DESC"
+	);
+}
+
+#[test]
+fn q10_comparator_accepts_tied_revenue_permutation() {
+	let row_a = q10_row(1, 500);
+	let row_b = q10_row(2, 500);
+	let oracle = q10_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q10(&[q10_batch(&[row_a.clone(), row_b.clone()])], &oracle).is_ok(),
+		"tie order [a,b] accepted"
+	);
+	assert!(
+		compare_strict_q10(&[q10_batch(&[row_b, row_a])], &oracle).is_ok(),
+		"tie order [b,a] equally accepted"
 	);
 }
 
