@@ -2842,6 +2842,295 @@ pub async fn check_strict_q08(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Q09Oracle {
+	pub groups: BTreeMap<(String, i32), i128>,
+	pub selected_rows: usize,
+	pub negative_amount_rows: usize,
+}
+
+pub fn q09_part_name_contains_green(name: &str) -> bool {
+	name.contains("green")
+}
+
+pub fn q09_amount_raw(
+	extendedprice_raw: i128,
+	discount_raw: i128,
+	supplycost_raw: i128,
+	quantity_raw: i128,
+) -> i128 {
+	discounted_price_raw(extendedprice_raw, discount_raw) - supplycost_raw * quantity_raw
+}
+
+pub fn q09_partsupp_cost(
+	costs: &HashMap<(i64, i64), i128>,
+	partkey: i64,
+	suppkey: i64,
+) -> Option<i128> {
+	costs.get(&(partkey, suppkey)).copied()
+}
+
+pub fn q09_order_year(orderdate: i32) -> i32 {
+	let (year, _, _) = civil_from_date32_days(i64::from(orderdate));
+	i32::try_from(year).expect("q09 order year fits i32")
+}
+
+fn civil_from_date32_days(days: i64) -> (i64, u32, u32) {
+	let days = days + 719_468;
+	let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+	let day_of_era = days - era * 146_097;
+	let year_of_era =
+		(day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+	let mut year = year_of_era + era * 400;
+	let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+	let month_prime = (5 * day_of_year + 2) / 153;
+	let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+	let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+	year += i64::from(month <= 2);
+	(
+		year,
+		u32::try_from(month).expect("month in range"),
+		u32::try_from(day).expect("day in range"),
+	)
+}
+
+/// ADR 303: the independent strict-q09 oracle. The profit term is raw scale-4 signed Decimal arithmetic:
+/// `extendedprice*(1-discount) - supplycost*quantity`, grouped by `(nation, EXTRACT(year FROM o_orderdate))`.
+pub fn strict_q09_oracle(scale_factor: f64) -> Q09Oracle {
+	let green_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|part| q09_part_name_contains_green(&part.p_name.to_string()))
+		.map(|part| part.p_partkey)
+		.collect();
+
+	let mut partsupp_costs: HashMap<(i64, i64), i128> = HashMap::new();
+	for partsupp in PartSuppGenerator::new(scale_factor, 1, 1).iter() {
+		partsupp_costs.insert(
+			(partsupp.ps_partkey, partsupp.ps_suppkey),
+			partsupp.ps_supplycost.into_inner() as i128,
+		);
+	}
+
+	let mut nations: HashMap<i64, String> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		nations.insert(nation.n_nationkey, nation.n_name.to_string());
+	}
+
+	let mut suppliers: HashMap<i64, i64> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		suppliers.insert(supplier.s_suppkey, supplier.s_nationkey);
+	}
+
+	let mut orders: HashMap<i64, i32> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		orders.insert(
+			order.o_orderkey,
+			q09_order_year(order.o_orderdate.to_unix_epoch()),
+		);
+	}
+
+	let mut groups: BTreeMap<(String, i32), i128> = BTreeMap::new();
+	let mut selected_rows = 0usize;
+	let mut negative_amount_rows = 0usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		if !green_parts.contains(&item.l_partkey) {
+			continue;
+		}
+		let Some(supplycost_raw) =
+			q09_partsupp_cost(&partsupp_costs, item.l_partkey, item.l_suppkey)
+		else {
+			continue;
+		};
+		let Some(&o_year) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let Some(&supplier_nationkey) = suppliers.get(&item.l_suppkey) else {
+			continue;
+		};
+		let Some(nation) = nations.get(&supplier_nationkey) else {
+			continue;
+		};
+		let amount_raw = q09_amount_raw(
+			item.l_extendedprice.into_inner() as i128,
+			item.l_discount.into_inner() as i128,
+			supplycost_raw,
+			item.l_quantity as i128 * 100,
+		);
+		if amount_raw < 0 {
+			negative_amount_rows += 1;
+		}
+		*groups.entry((nation.clone(), o_year)).or_default() += amount_raw;
+		selected_rows += 1;
+	}
+
+	Q09Oracle {
+		groups,
+		selected_rows,
+		negative_amount_rows,
+	}
+}
+
+fn strict_q09_expected_schema() -> [(&'static str, DataType); 3] {
+	[
+		("nation", DataType::Utf8),
+		("o_year", DataType::Int32),
+		("sum_profit", DataType::Decimal128(33, 4)),
+	]
+}
+
+pub fn assert_strict_q09_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q09_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q09 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q09(batches: &[RecordBatch], oracle: &Q09Oracle) -> Result<(), String> {
+	assert_strict_q09_schema(batches)?;
+	if oracle.selected_rows == 0 || oracle.groups.len() <= 1 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: selected_rows={} groups={}",
+			oracle.selected_rows,
+			oracle.groups.len()
+		));
+	}
+
+	let mut emitted: Vec<((String, i32), i128)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 3 {
+			return Err(format!("expected 3 columns, got {}", batch.num_columns()));
+		}
+		let nations = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (nation) not Utf8")?;
+		let years = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.ok_or("column 1 (o_year) not Int32")?;
+		let profits = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 2 (sum_profit) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if nations.is_null(i) {
+				return Err(format!("column nation row {row_index} is NULL"));
+			}
+			if years.is_null(i) {
+				return Err(format!("column o_year row {row_index} is NULL"));
+			}
+			if profits.is_null(i) {
+				return Err(format!("column sum_profit row {row_index} is NULL"));
+			}
+			emitted.push((
+				(nations.value(i).to_string(), years.value(i)),
+				profits.value(i),
+			));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		let (nation_a, year_a) = &pair[0].0;
+		let (nation_b, year_b) = &pair[1].0;
+		if nation_a > nation_b {
+			return Err(format!(
+				"ORDER BY nation ASC violated: {nation_a:?} emitted before {nation_b:?}"
+			));
+		}
+		if nation_a == nation_b && year_a < year_b {
+			return Err(format!(
+				"ORDER BY o_year DESC violated within nation {nation_a:?}: {year_a} emitted before {year_b}"
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<(String, i32), i128> = BTreeMap::new();
+	for (key, sum_profit) in emitted {
+		if seen.insert(key.clone(), sum_profit).is_some() {
+			return Err(format!("duplicate emitted q09 group {key:?}"));
+		}
+	}
+	for (key, expected_profit) in &oracle.groups {
+		let Some(actual_profit) = seen.get(key) else {
+			return Err(format!("oracle q09 group {key:?} missing from output"));
+		};
+		if actual_profit != expected_profit {
+			return Err(format!(
+				"q09 group {key:?}: sum_profit mismatch: expected {expected_profit}, got {actual_profit}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q09(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q09_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q09".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q9_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q09_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q09_oracle(scale_factor);
+	match compare_strict_q09(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q10Row {
 	pub c_custkey: i64,

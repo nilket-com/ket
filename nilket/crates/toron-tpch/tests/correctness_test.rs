@@ -1,6 +1,6 @@
 //! The strict correctness rail — answer-checked cells, kept separate from reachability.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray};
@@ -9,22 +9,24 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
-	Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle,
-	Q20Row, assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
+	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
+	Q20Oracle, Q20Row, assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
 	assert_strict_q04_schema, assert_strict_q5_schema, assert_strict_q07_schema,
-	assert_strict_q08_schema, assert_strict_q10_schema, assert_strict_q12_schema,
-	assert_strict_q14_schema, assert_strict_q17_schema, assert_strict_q20_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
-	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q10, check_strict_q12,
-	check_strict_q14, check_strict_q17, check_strict_q20, compare_strict_q1, compare_strict_q02,
-	compare_strict_q3, compare_strict_q04, compare_strict_q5, compare_strict_q6,
-	compare_strict_q07, compare_strict_q08, compare_strict_q10, compare_strict_q12,
-	compare_strict_q14, compare_strict_q17, compare_strict_q20, correctness_matrix_from_log,
-	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
-	q07_contribution, q08_contribution, q08_market_share_raw, q20_part_name_is_forest_prefix,
+	assert_strict_q08_schema, assert_strict_q09_schema, assert_strict_q10_schema,
+	assert_strict_q12_schema, assert_strict_q14_schema, assert_strict_q17_schema,
+	assert_strict_q20_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
+	check_strict_q09, check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17,
+	check_strict_q20, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
+	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
+	compare_strict_q09, compare_strict_q10, compare_strict_q12, compare_strict_q14,
+	compare_strict_q17, compare_strict_q20, correctness_matrix_from_log, decimal_division_raw,
+	q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue, q07_contribution,
+	q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
+	q09_part_name_contains_green, q09_partsupp_cost, q20_part_name_is_forest_prefix,
 	q20_threshold_passes, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q04_oracle,
-	strict_q5_oracle, strict_q6_oracle, strict_q07_oracle, strict_q08_oracle, strict_q10_oracle,
-	strict_q12_oracle, strict_q14_oracle, strict_q17_oracle, strict_q20_oracle,
+	strict_q5_oracle, strict_q6_oracle, strict_q07_oracle, strict_q08_oracle, strict_q09_oracle,
+	strict_q10_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle, strict_q20_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -1507,6 +1509,277 @@ fn q08_order_violation_is_fail() {
 	assert!(
 		compare_strict_q08(&[q08_batch(&[(1996, 200), (1995, 100)])], &oracle).is_err(),
 		"q08's ORDER BY o_year is part of the exact answer"
+	);
+}
+
+type Q09NullableRow<'a> = (Option<&'a str>, Option<i32>, Option<i128>);
+
+fn q09_batch(rows: &[(&str, i32, i128)]) -> RecordBatch {
+	let nullable_rows: Vec<Q09NullableRow<'_>> = rows
+		.iter()
+		.map(|&(nation, year, profit)| (Some(nation), Some(year), Some(profit)))
+		.collect();
+	q09_nullable_batch(&nullable_rows)
+}
+
+fn q09_nullable_batch(rows: &[Q09NullableRow<'_>]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("nation", DataType::Utf8, true),
+		Field::new("o_year", DataType::Int32, true),
+		Field::new("sum_profit", DataType::Decimal128(33, 4), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(Int32Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i32>>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.2).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(33, 4)
+					.expect("q09 profit decimal column"),
+			),
+		],
+	)
+	.expect("q09 batch")
+}
+
+fn q09_oracle(rows: &[(&str, i32, i128)]) -> Q09Oracle {
+	Q09Oracle {
+		groups: rows
+			.iter()
+			.map(|&(nation, year, profit)| ((nation.to_string(), year), profit))
+			.collect(),
+		selected_rows: rows.len(),
+		negative_amount_rows: rows.iter().filter(|row| row.2 < 0).count(),
+	}
+}
+
+#[test]
+fn strict_q09_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q09(0.01))
+		})
+		.expect("spawn q09 correctness thread")
+		.join()
+		.expect("q09 correctness thread panicked");
+	assert_eq!(attempt.query, "q09");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q09_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q09_oracle(0.01);
+	assert!(
+		oracle.selected_rows > 0,
+		"selected q09 rows at sf=0.01: {}",
+		oracle.selected_rows
+	);
+	assert!(
+		oracle.groups.len() > 1,
+		"q09 groups at sf=0.01: {}",
+		oracle.groups.len()
+	);
+	assert!(
+		oracle.negative_amount_rows <= oracle.selected_rows,
+		"negative rows cannot exceed selected rows: {oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q09_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q09_schema(&[q09_batch(&[
+			("ARGENTINA", 1995, 100),
+			("BRAZIL", 1994, 200)
+		])])
+		.is_ok()
+	);
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("nation", DataType::Utf8, false),
+			Field::new("o_year", DataType::Int64, false),
+			Field::new("sum_profit", DataType::Decimal128(33, 4), false),
+		])),
+		vec![
+			Arc::new(StringArray::from(vec!["ARGENTINA"])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1995_i64])) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(vec![100_i128])
+					.with_precision_and_scale(33, 4)
+					.expect("profit"),
+			) as ArrayRef,
+		],
+	)
+	.expect("drifted q09 batch");
+	assert!(
+		assert_strict_q09_schema(&[drifted]).is_err(),
+		"a non-measured o_year type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q09_amount_is_revenue_minus_cost_signed() {
+	let amount = q09_amount_raw(10_000, 0, 15_000, 100);
+	assert_eq!(amount, -500_000, "100.00*(1-0.00)-150.00*1.00 = -50.0000");
+	assert_ne!(
+		amount,
+		q09_amount_raw(10_000, 0, 0, 100),
+		"dropping the cost term must change the answer"
+	);
+}
+
+#[test]
+fn q09_partsupp_composite_key_picks_right_cost() {
+	let costs = HashMap::from([((1_i64, 10_i64), 100_i128), ((1_i64, 11_i64), 200_i128)]);
+	assert_eq!(q09_partsupp_cost(&costs, 1, 10), Some(100));
+	assert_eq!(q09_partsupp_cost(&costs, 1, 11), Some(200));
+	assert_eq!(
+		q09_partsupp_cost(&costs, 2, 10),
+		None,
+		"both partkey and suppkey are required"
+	);
+}
+
+#[test]
+fn q09_green_is_contains_match() {
+	assert!(q09_part_name_contains_green("forest green"));
+	assert!(q09_part_name_contains_green("green forest"));
+	assert!(
+		!q09_part_name_contains_green("forest"),
+		"q09 uses contains LIKE, not a broader color inference"
+	);
+	assert!(
+		!q09_part_name_contains_green("GREEN"),
+		"LIKE matching is case-sensitive in the current harness"
+	);
+}
+
+#[test]
+fn q09_order_year_extracts_general_date32_years() {
+	assert_eq!(q09_order_year(0), 1970);
+	assert_eq!(q09_order_year(9131), 1995);
+	assert_eq!(q09_order_year(9861), 1996);
+	assert_eq!(q09_order_year(9862), 1997);
+}
+
+#[test]
+fn q09_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q09_oracle(&[("ARGENTINA", 1995, 100), ("BRAZIL", 1994, 200)]);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("ARGENTINA", 1995, 101),
+				("BRAZIL", 1994, 200)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an off-by-one sum_profit is a mismatch"
+	);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("ARGENTINA", 1996, 100),
+				("BRAZIL", 1994, 200)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a wrong o_year changes the group key"
+	);
+}
+
+#[test]
+fn q09_missing_extra_or_duplicate_group_is_fail() {
+	let oracle = q09_oracle(&[("ARGENTINA", 1995, 100), ("BRAZIL", 1994, 200)]);
+	assert!(
+		compare_strict_q09(&[q09_batch(&[("ARGENTINA", 1995, 100)])], &oracle).is_err(),
+		"a dropped group is a mismatch"
+	);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("ARGENTINA", 1995, 100),
+				("BRAZIL", 1994, 200),
+				("CANADA", 1993, 300)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an extra group is a mismatch"
+	);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("ARGENTINA", 1995, 100),
+				("ARGENTINA", 1995, 100)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted group is rejected"
+	);
+}
+
+#[test]
+fn q09_null_cell_is_fail() {
+	let oracle = q09_oracle(&[("ARGENTINA", 1995, 100), ("BRAZIL", 1994, 200)]);
+	for row in [
+		(None, Some(1995), Some(100)),
+		(Some("ARGENTINA"), None, Some(100)),
+		(Some("ARGENTINA"), Some(1995), None),
+	] {
+		assert!(
+			compare_strict_q09(
+				&[q09_nullable_batch(&[
+					row,
+					(Some("BRAZIL"), Some(1994), Some(200))
+				])],
+				&oracle
+			)
+			.is_err(),
+			"NULL cell is fail@compare"
+		);
+	}
+}
+
+#[test]
+fn q09_order_violation_is_fail() {
+	let oracle = q09_oracle(&[("ARGENTINA", 1995, 100), ("ARGENTINA", 1994, 200)]);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("ARGENTINA", 1994, 200),
+				("ARGENTINA", 1995, 100)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"q09's ORDER BY nation ASC, o_year DESC is part of the exact answer"
+	);
+	let oracle = q09_oracle(&[("ARGENTINA", 1995, 100), ("BRAZIL", 1995, 200)]);
+	assert!(
+		compare_strict_q09(
+			&[q09_batch(&[
+				("BRAZIL", 1995, 200),
+				("ARGENTINA", 1995, 100)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"nation order is ascending"
 	);
 }
 
