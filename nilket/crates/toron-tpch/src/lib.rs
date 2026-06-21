@@ -2207,6 +2207,186 @@ pub fn decimal_division_raw(
 }
 
 #[derive(Debug, Clone)]
+pub struct Q14Oracle {
+	pub promo_revenue: DecimalRaw,
+	pub denominator_rows: usize,
+	pub promo_rows: usize,
+}
+
+/// Independent strict-q14 oracle at the default correctness scale. `disc_price` is raw scale 4; the
+/// `100.00` literal is aligned to that same scale before Decimal division, matching the strict query.
+pub fn strict_q14_oracle(scale_factor: f64) -> Result<Q14Oracle, String> {
+	let promo_by_part: HashMap<i64, bool> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.map(|part| (part.p_partkey, part.p_type.to_string().starts_with("PROMO")))
+		.collect();
+
+	let mut sum_all_raw = 0_i128;
+	let mut sum_promo_raw = 0_i128;
+	let mut denominator_rows = 0_usize;
+	let mut promo_rows = 0_usize;
+
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let shipdate = item.l_shipdate.to_unix_epoch();
+		if !(9374..9404).contains(&shipdate) {
+			continue;
+		}
+		let Some(&is_promo) = promo_by_part.get(&item.l_partkey) else {
+			continue;
+		};
+
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let discount_raw = item.l_discount.into_inner() as i128;
+		let disc_price = discounted_price_raw(extprice_raw, discount_raw);
+		sum_all_raw = sum_all_raw
+			.checked_add(disc_price)
+			.ok_or_else(|| "q14 denominator sum overflow".to_string())?;
+		denominator_rows += 1;
+
+		if is_promo {
+			sum_promo_raw = sum_promo_raw
+				.checked_add(disc_price)
+				.ok_or_else(|| "q14 promo sum overflow".to_string())?;
+			promo_rows += 1;
+		}
+	}
+
+	let promo_revenue = if denominator_rows == 0 || sum_all_raw == 0 {
+		DecimalRaw {
+			value: None,
+			precision: 38,
+			scale: 12,
+		}
+	} else {
+		let numerator = sum_promo_raw
+			.checked_mul(1_000_000)
+			.ok_or_else(|| "q14 numerator multiplication overflow".to_string())?;
+		decimal_division_raw(numerator, 38, 8, sum_all_raw, 38, 4)?
+	};
+
+	Ok(Q14Oracle {
+		promo_revenue,
+		denominator_rows,
+		promo_rows,
+	})
+}
+
+fn strict_q14_expected_schema() -> [(&'static str, DataType); 1] {
+	[("promo_revenue", DataType::Decimal128(38, 12))]
+}
+
+pub fn assert_strict_q14_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q14_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q14 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q14(batches: &[RecordBatch], oracle: &Q14Oracle) -> Result<(), String> {
+	assert_strict_q14_schema(batches)?;
+	if oracle.denominator_rows == 0 || oracle.promo_rows == 0 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: denominator_rows={} promo_rows={}",
+			oracle.denominator_rows, oracle.promo_rows
+		));
+	}
+	let Some(expected_value) = oracle.promo_revenue.value else {
+		return Err("oracle promo_revenue is NULL".to_string());
+	};
+	if oracle.promo_revenue.precision != 38 || oracle.promo_revenue.scale != 12 {
+		return Err(format!(
+			"oracle promo_revenue type drift: Decimal128({}, {})",
+			oracle.promo_revenue.precision, oracle.promo_revenue.scale
+		));
+	}
+
+	let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+	if row_count != 1 {
+		return Err(format!("expected exactly one q14 row, got {row_count}"));
+	}
+	for batch in batches {
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 0 (promo_revenue) not Decimal128")?;
+		if column.is_null(0) {
+			return Err("column promo_revenue row 0 is NULL".to_string());
+		}
+		let actual_value = column.value(0);
+		if actual_value != expected_value {
+			return Err(format!(
+				"promo_revenue mismatch: expected {expected_value}, got {actual_value}"
+			));
+		}
+		return Ok(());
+	}
+	Err("strict q14 produced no row".to_string())
+}
+
+pub async fn check_strict_q14(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q14_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q14".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q14_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q14_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q14_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q14(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+#[derive(Debug, Clone)]
 pub struct Q17Oracle {
 	pub avg_yearly: DecimalRaw,
 	pub eligible_parts: usize,
@@ -2405,60 +2585,56 @@ pub fn parse_scale_factor(raw: &str) -> Result<f64, String> {
 /// ADR 269 — dev q14: the decimal ratio query over the `Float64` proxy `lineitem` + `part`. A reachability
 /// attempt — records whichever wall q14 hits first.
 pub async fn run_dev_q14(scale_factor: f64) -> Attempt {
-	let lineitem = generate_dev_lineitem(scale_factor);
-	let part = generate_part(scale_factor);
 	run_query_with_tables(
 		"q14",
 		"dev",
 		scale_factor,
 		Q14_DEV_SQL,
-		vec![
-			HarnessTable {
-				id: TableId(1),
-				name: "lineitem",
-				descriptor: dev_lineitem_descriptor(dev_lineitem_schema().as_ref()),
-				facts: facts_for_batch(&lineitem),
-				batch: lineitem,
-			},
-			HarnessTable {
-				id: TableId(2),
-				name: "part",
-				descriptor: part_descriptor(part_schema().as_ref()),
-				facts: facts_for_batch(&part),
-				batch: part,
-			},
-		],
+		q14_tables(false, scale_factor),
 	)
 	.await
 }
 
 /// ADR 269 — strict q14: the same shape with official `Decimal128(15,2)` `lineitem` types.
 pub async fn run_strict_q14(scale_factor: f64) -> Attempt {
-	let lineitem = generate_strict_lineitem(scale_factor);
-	let part = generate_part(scale_factor);
 	run_query_with_tables(
 		"q14",
 		"strict",
 		scale_factor,
 		STRICT_Q14_SQL,
-		vec![
-			HarnessTable {
-				id: TableId(1),
-				name: "lineitem",
-				descriptor: strict_lineitem_descriptor(strict_lineitem_schema().as_ref()),
-				facts: facts_for_batch(&lineitem),
-				batch: lineitem,
-			},
-			HarnessTable {
-				id: TableId(2),
-				name: "part",
-				descriptor: part_descriptor(part_schema().as_ref()),
-				facts: facts_for_batch(&part),
-				batch: part,
-			},
-		],
+		q14_tables(true, scale_factor),
 	)
 	.await
+}
+
+/// The two q14 harness tables: `lineitem` and `part`.
+fn q14_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let part = generate_part(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor: if strict {
+				strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+			} else {
+				dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+			},
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+	]
 }
 
 /// ADR 281 — run q17 over the `Float64` proxy `lineitem` (+ `part`). The correlated scalar subquery is the

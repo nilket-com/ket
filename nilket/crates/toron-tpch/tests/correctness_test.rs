@@ -8,12 +8,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	DecimalRaw, Q1Group, Q3Group, Q5Group, Q17_CORRECTNESS_SCALE, Q17Oracle,
+	DecimalRaw, Q1Group, Q3Group, Q5Group, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
 	assert_strict_q1_schema, assert_strict_q3_schema, assert_strict_q5_schema,
-	assert_strict_q17_schema, avg_decimal_raw, check_strict_q1, check_strict_q3, check_strict_q5,
-	check_strict_q6, check_strict_q17, compare_strict_q1, compare_strict_q3, compare_strict_q5,
-	compare_strict_q6, compare_strict_q17, correctness_matrix_from_log, decimal_division_raw,
-	q6_row_revenue, strict_q1_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle,
+	assert_strict_q14_schema, assert_strict_q17_schema, avg_decimal_raw, check_strict_q1,
+	check_strict_q3, check_strict_q5, check_strict_q6, check_strict_q14, check_strict_q17,
+	compare_strict_q1, compare_strict_q3, compare_strict_q5, compare_strict_q6, compare_strict_q14,
+	compare_strict_q17, correctness_matrix_from_log, decimal_division_raw, q6_row_revenue,
+	strict_q1_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q14_oracle,
 	strict_q17_oracle,
 };
 
@@ -662,6 +663,167 @@ fn q5_null_cell_is_fail_at_compare() {
 	assert!(
 		compare_strict_q5(&[q5_nullable_batch(&[(Some("ARGENTINA"), None)])], &oracle).is_err(),
 		"a NULL revenue is fail@compare"
+	);
+}
+
+fn q14_batch(values: &[Option<i128>], precision: u8, scale: i8) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"promo_revenue",
+		DataType::Decimal128(precision, scale),
+		true,
+	)]));
+	RecordBatch::try_new(
+		schema,
+		vec![Arc::new(
+			Decimal128Array::from(values.to_vec())
+				.with_precision_and_scale(precision, scale)
+				.expect("q14 promo_revenue decimal column"),
+		)],
+	)
+	.expect("q14 batch")
+}
+
+fn q14_oracle(value: Option<i128>) -> Q14Oracle {
+	Q14Oracle {
+		promo_revenue: DecimalRaw {
+			value,
+			precision: 38,
+			scale: 12,
+		},
+		denominator_rows: 2,
+		promo_rows: 1,
+	}
+}
+
+#[test]
+fn strict_q14_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q14(0.01))
+		})
+		.expect("spawn q14 correctness thread")
+		.join()
+		.expect("q14 correctness thread panicked");
+	assert_eq!(attempt.query, "q14");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q14_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q14_oracle(0.01).expect("q14 oracle");
+	assert!(
+		oracle.denominator_rows >= 1,
+		"denominator rows at sf=0.01: {}",
+		oracle.denominator_rows
+	);
+	assert!(
+		oracle.promo_rows >= 1,
+		"PROMO rows at sf=0.01: {}",
+		oracle.promo_rows
+	);
+	assert!(
+		oracle.promo_revenue.value.is_some(),
+		"a non-empty q14 oracle must produce a non-NULL promo_revenue"
+	);
+	assert_eq!(oracle.promo_revenue.precision, 38);
+	assert_eq!(oracle.promo_revenue.scale, 12);
+}
+
+#[test]
+fn strict_q14_output_schema_is_asserted() {
+	assert!(assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 12)]).is_ok());
+	assert!(
+		assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 10)]).is_err(),
+		"a non-measured scale must trip the schema gate"
+	);
+}
+
+#[test]
+fn q14_promo_branch_is_required() {
+	let mut oracle = q14_oracle(Some(123));
+	oracle.promo_rows = 0;
+	assert!(
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &oracle).is_err(),
+		"a denominator-only q14 oracle is a hollow CASE-true proof"
+	);
+}
+
+#[test]
+fn q14_ratio_uses_half_away_division() {
+	assert_eq!(
+		decimal_division_raw(1, 38, 8, 200_000_000, 38, 4)
+			.expect("q14-shaped division")
+			.value,
+		Some(1),
+		"the q14 ratio rounds 0.5 ulp away from zero, not toward zero"
+	);
+}
+
+#[test]
+fn q14_non_promo_rows_contribute_to_denominator() {
+	let correct = decimal_division_raw(10 * 1_000_000, 38, 8, 30, 38, 4)
+		.expect("ratio with promo + non-promo denominator")
+		.value;
+	let promo_only_denominator = decimal_division_raw(10 * 1_000_000, 38, 8, 10, 38, 4)
+		.expect("ratio with wrong promo-only denominator")
+		.value;
+	assert_ne!(
+		correct, promo_only_denominator,
+		"excluding non-PROMO rows from the denominator changes q14's ratio"
+	);
+	let oracle = q14_oracle(correct);
+	assert!(
+		compare_strict_q14(&[q14_batch(&[promo_only_denominator], 38, 12)], &oracle).is_err(),
+		"the comparator catches the classic CASE denominator bug"
+	);
+}
+
+#[test]
+fn q14_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q14_oracle(Some(123));
+	assert!(
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &oracle).is_ok(),
+		"exact raw match"
+	);
+	assert!(
+		compare_strict_q14(&[q14_batch(&[Some(124)], 38, 12)], &oracle).is_err(),
+		"an off-by-one promo_revenue is a mismatch"
+	);
+	let mut drifted_oracle = q14_oracle(Some(123));
+	drifted_oracle.promo_revenue.scale = 10;
+	assert!(
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &drifted_oracle).is_err(),
+		"the oracle-side Decimal type is part of the exact comparison"
+	);
+}
+
+#[test]
+fn q14_null_or_empty_result_is_fail_at_compare() {
+	assert!(
+		compare_strict_q14(&[q14_batch(&[None], 38, 12)], &q14_oracle(Some(123))).is_err(),
+		"a NULL output is fail@compare"
+	);
+	assert!(
+		compare_strict_q14(&[q14_batch(&[], 38, 12)], &q14_oracle(Some(123))).is_err(),
+		"zero rows is fail@compare"
+	);
+	assert!(
+		compare_strict_q14(
+			&[q14_batch(&[Some(123), Some(123)], 38, 12)],
+			&q14_oracle(Some(123))
+		)
+		.is_err(),
+		"q14 must emit exactly one row"
+	);
+	assert!(
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &q14_oracle(None)).is_err(),
+		"a NULL oracle is rejected by the anti-empty guard"
 	);
 }
 

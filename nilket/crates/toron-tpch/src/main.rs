@@ -7,9 +7,9 @@ use std::process::ExitCode;
 use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
 use toron_tpch::{
 	CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_q1, check_strict_q3, check_strict_q5,
-	check_strict_q6, check_strict_q17, correctness_matrix, generate_dev_lineitem, matrix,
-	parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6,
-	run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
+	check_strict_q6, check_strict_q14, check_strict_q17, correctness_matrix, generate_dev_lineitem,
+	matrix, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
+	run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
 	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q10, run_strict_q14,
 	run_strict_q17, run_strict_q20, status_rows,
 };
@@ -62,8 +62,8 @@ async fn main() -> ExitCode {
 	}
 }
 
-/// ADR 273/276/280/287: answer-check a query against its independent oracle and record a correctness row
-/// (separate from reachability). Unsupported queries are a usage error (exit 2, no row), not fake telemetry.
+/// Answer-check a query against its independent oracle and record a correctness row. Unsupported queries are a
+/// usage error (exit 2, no row), not fake telemetry.
 async fn correctness_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let explicit = match explicit_sf(args) {
@@ -82,6 +82,7 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 		"q01" | "q1" => check_strict_q1(sf).await,
 		"q03" | "q3" => check_strict_q3(sf).await,
 		"q05" | "q5" => check_strict_q5(sf).await,
+		"q14" => check_strict_q14(sf).await,
 		other => return harness_error(&format!("correctness --query {other} is not supported")),
 	};
 	emit_correctness(&attempt);
