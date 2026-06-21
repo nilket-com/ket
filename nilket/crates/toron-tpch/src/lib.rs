@@ -5510,7 +5510,7 @@ mod adr301_q09_probe {
 	}
 
 	#[test]
-	fn strict_q09_walls_on_decimal_profit_subtraction_at_bind() {
+	fn strict_q09_is_non_empty_at_default_scale() {
 		std::thread::Builder::new()
 			.stack_size(64 * 1024 * 1024)
 			.spawn(|| {
@@ -5519,30 +5519,16 @@ mod adr301_q09_probe {
 					.build()
 					.expect("tokio runtime");
 				runtime.block_on(async {
-					let mut catalog = MockCatalog::new();
-					for table in q09_tables(true, 0.01) {
-						catalog
-							.register_descriptor(table.id, table.descriptor)
-							.expect("register q09 table");
-						catalog
-							.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
-							.expect("seed q09 facts");
-					}
-					let logical = SqlPlanner::new().plan(STRICT_Q9_SQL).expect("q09 plans");
-					let error = bind(&logical, &catalog, &PlannerConfig::default())
+					let batches = execute_query_with_tables(STRICT_Q9_SQL, q09_tables(true, 0.01))
 						.await
-						.expect_err("strict q09 walls at bind");
-					let message = format!("{error:?}");
-					assert!(
-						message.contains("Decimal128") && message.contains("arithmetic operands"),
-						"strict q09 wall should be Decimal arithmetic, got: {message}"
-					);
-					assert_eq!(reason_for_error(&message), "unsupported_decimal_arithmetic");
+						.expect("strict q09 reaches execute at the default scale");
+					let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+					assert!(rows > 0, "strict q09 has rows at sf=0.01");
 				});
 			})
-			.expect("spawn q09 bind probe thread")
+			.expect("spawn q09 probe thread")
 			.join()
-			.expect("q09 bind probe thread panicked");
+			.expect("q09 probe thread panicked");
 	}
 }
 

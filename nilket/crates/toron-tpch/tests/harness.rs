@@ -368,10 +368,10 @@ fn q08_executes_in_both_modes() {
 		.expect("q08 thread panicked");
 }
 
-// ADR 301: q09's six-table product-profit query reaches execute in dev at the default scale, proving the
-// derived comma join is keyed. Strict reaches the measured Decimal arithmetic wall in profit subtraction.
+// ADR 301/302: q09's six-table product-profit query reaches execute in both modes at the default scale. Dev
+// proves the derived comma join is keyed; strict proves Decimal add/sub aligns the two profit terms.
 #[test]
-fn q09_dev_executes_strict_blocks_on_decimal_arithmetic() {
+fn q09_executes_in_both_modes() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -406,18 +406,15 @@ fn q09_dev_executes_strict_blocks_on_decimal_arithmetic() {
 				assert_eq!(strict.query, "q09");
 				assert_eq!(
 					strict.status,
-					Status::Blocked,
-					"q09 strict records the measured wall: {}",
+					Status::Pass,
+					"q09 strict reaches execute after Decimal add/sub operand alignment: {}",
 					strict.human()
 				);
-				assert_eq!(strict.phase, Phase::Bind);
-				assert_eq!(
-					strict.reason.as_deref(),
-					Some("unsupported_decimal_arithmetic")
-				);
+				assert_eq!(strict.phase, Phase::Execute);
 				assert!(
-					strict.digest.is_none(),
-					"blocked rows do not carry a digest"
+					strict.digest.is_some(),
+					"a pass carries a digest: {}",
+					strict.human()
 				);
 			});
 		})

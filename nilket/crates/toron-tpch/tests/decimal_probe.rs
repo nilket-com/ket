@@ -210,6 +210,65 @@ async fn decimal_add_sub_binds_and_executes() {
 	);
 }
 
+/// ADR 302: Decimal +/- now follows Arrow's mixed-(p,s) add/sub typing. q09's profit expression is exactly
+/// this shape: a `Decimal128(32,4)` revenue term minus a `Decimal128(31,4)` cost term.
+#[tokio::test]
+async fn decimal_add_sub_aligns_mixed_precision_and_scale() {
+	let (catalog, storage) = lineitem_fixture();
+
+	let plan = SqlPlanner::new()
+		.plan(
+			"SELECT l_extendedprice * (1 - l_discount) - l_extendedprice * l_discount AS amount \
+			 FROM lineitem",
+		)
+		.expect("plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("mixed-precision Decimal sub binds");
+	let batches = Executor::new(storage.clone())
+		.execute_bound(&bound, None)
+		.await
+		.expect("mixed-precision Decimal sub executes");
+	let column = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("rows")
+		.column(0);
+	assert_eq!(
+		column.data_type(),
+		&DataType::Decimal128(33, 4),
+		"Decimal128(32,4)-Decimal128(31,4) -> Decimal128(33,4)"
+	);
+	let column = column
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("Decimal128");
+	let mut values: Vec<i128> = (0..column.len()).map(|i| column.value(i)).collect();
+	values.sort_unstable();
+	assert_eq!(values, vec![880_000, 1_800_000], "88.0000 and 180.0000");
+
+	let plan = SqlPlanner::new()
+		.plan("SELECT l_extendedprice + l_discount * l_discount AS amount FROM lineitem")
+		.expect("plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("mixed-scale Decimal add binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("mixed-scale Decimal add executes");
+	let column = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("rows")
+		.column(0);
+	assert_eq!(
+		column.data_type(),
+		&DataType::Decimal128(32, 4),
+		"Decimal128(15,2)+Decimal128(31,4) -> Decimal128(32,4)"
+	);
+}
+
 /// Non-literal Decimal comparison operands with different `(p,s)` reconcile through a binder-inserted,
 /// value-preserving Decimal cast.
 #[tokio::test]

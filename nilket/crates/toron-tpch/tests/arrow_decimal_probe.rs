@@ -142,3 +142,36 @@ fn arrow_decimal128_add_sub_carries_scale_plus_one_precision() {
 		"100.00-1.00=99.00, 0.05-0.05=0.00 at scale 2"
 	);
 }
+
+/// ADR 302: Arrow already handles Decimal add/sub with differing `(precision, scale)`, rescaling to
+/// `max(scale)` and stamping the Hive-rule output. The binder mirrors this output type.
+#[test]
+fn arrow_decimal128_add_sub_aligns_mixed_precision_and_scale() {
+	let profit = dec(vec![940_000], 32, 4); // 94.0000
+	let cost = dec(vec![60_000], 31, 4); // 6.0000
+	let diff: ArrayRef = numeric::sub(&profit, &cost).expect("mixed-precision decimal sub");
+	assert_eq!(
+		diff.data_type(),
+		&DataType::Decimal128(33, 4),
+		"Decimal128(32,4)-Decimal128(31,4) carries one precision digit"
+	);
+	let diff = diff
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("diff is Decimal128");
+	assert_eq!(diff.value(0), 880_000, "94.0000-6.0000=88.0000");
+
+	let price = dec(vec![12_345], 15, 2); // 123.45
+	let fee = dec(vec![67], 15, 4); // 0.0067
+	let sum: ArrayRef = numeric::add(&price, &fee).expect("mixed-scale decimal add");
+	assert_eq!(
+		sum.data_type(),
+		&DataType::Decimal128(18, 4),
+		"scale aligns to max scale and precision follows the Hive rule"
+	);
+	let sum = sum
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("sum is Decimal128");
+	assert_eq!(sum.value(0), 1_234_567, "123.45+0.0067=123.4567");
+}

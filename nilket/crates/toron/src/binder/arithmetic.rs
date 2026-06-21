@@ -1149,8 +1149,7 @@ pub(super) fn bind_arithmetic(
 		return Ok(output);
 	}
 	// ADR 263: Decimal128 * Decimal128 -> Decimal128(p1+p2+1, s1+s2) (the SQL mul rule). Operands keep
-	// their own (p,s); the executor routes to Arrow `numeric::mul`, which widens. Q6 slice — only `*`;
-	// decimal +/-/÷ fall through to the unsupported error below until a query needs them.
+	// their own (p,s); the executor routes to Arrow `numeric::mul`, which widens.
 	if op == BoundBinaryOp::Mul
 		&& let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
 			(&left_type, &right_type)
@@ -1159,18 +1158,21 @@ pub(super) fn bind_arithmetic(
 		let scale = s1 + s2;
 		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, scale)));
 	}
-	// ADR 266: same-(p,s) Decimal128 +/- Decimal128 -> Decimal128(min(38, p+1), s) — carry one precision
-	// digit, scale unchanged (Arrow `numeric::add`/`sub` matches; verified by arrow_decimal_probe). Q1
-	// slice — only `+`/`-` at equal (p,s); mixed-scale/precision +/- and `÷` stay unsupported (no Decimal
-	// cast surface) until a query needs them.
+	// ADR 302: Decimal128 +/- Decimal128 follows Arrow's Hive rule: runtime rescale to max(s1,s2), plus
+	// one precision digit for carry. No operand casts are needed because Arrow numeric::add/sub handles
+	// differing (p,s) directly.
 	if matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub)
 		&& let (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) =
 			(&left_type, &right_type)
-		&& p1 == p2
-		&& s1 == s2
 	{
-		let precision = (p1 + 1).min(38);
-		return Ok(builder.append_binary(op, left, right, DataType::Decimal128(precision, *s1)));
+		let output_type = decimal_add_sub_output_type(*p1, *s1, *p2, *s2).ok_or_else(|| {
+			BindingError::TypeMismatch {
+				message: format!(
+					"Decimal add/sub output type out of range: Decimal128({p1},{s1}) {op:?} Decimal128({p2},{s2})"
+				),
+			}
+		})?;
+		return Ok(builder.append_binary(op, left, right, output_type));
 	}
 	// ADR 271: scalar Decimal128 / Decimal128 -> the validated Arrow divide shape (scale = s1+4). Reject an
 	// out-of-range output explicitly (no silent scale-cap / negative-scale denominator-rescale); the executor
@@ -1352,6 +1354,22 @@ fn decimal_comparison_common_type(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<Data
 		return None;
 	}
 	let precision = integer_digits + i16::from(scale);
+	if !(1..=38).contains(&precision) {
+		return None;
+	}
+	Some(DataType::Decimal128(precision as u8, scale))
+}
+
+fn decimal_add_sub_output_type(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<DataType> {
+	if s1 < 0 || s2 < 0 {
+		return None;
+	}
+	let scale = s1.max(s2);
+	let integer_digits = (i16::from(p1) - i16::from(s1)).max(i16::from(p2) - i16::from(s2));
+	if integer_digits < 0 {
+		return None;
+	}
+	let precision = (integer_digits + i16::from(scale) + 1).min(38);
 	if !(1..=38).contains(&precision) {
 		return None;
 	}
