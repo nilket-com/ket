@@ -4,10 +4,10 @@ use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_strict_q1, run_strict_q02,
+	run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
 	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
 	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
-	status_rows,
+	run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -637,6 +637,66 @@ fn q20_executes_in_both_modes() {
 		.expect("spawn q20 thread")
 		.join()
 		.expect("q20 thread panicked");
+}
+
+// ADR 304: q22 is wired into the gauge unchanged, and the current measured wall is the SQL
+// `SUBSTRING(c_phone FROM 1 FOR 2)` frontend-lowering gap.
+#[tokio::test]
+async fn q22_advances_to_substring_wall() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q22 dev=implemented strict=implemented"),
+		"q22 is an implemented capability in the static inventory"
+	);
+
+	for (mode, attempt) in [
+		("dev", run_dev_q22(0.01).await),
+		("strict", run_strict_q22(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q22");
+		assert_eq!(
+			attempt.status,
+			Status::Blocked,
+			"q22 {mode} should record the expected SUBSTRING wall: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.phase,
+			Phase::Plan,
+			"q22 {mode} walls in frontend lowering: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unsupported_substring"),
+			"q22 {mode}: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.digest.is_none(),
+			"a blocked attempt must not carry a digest: {}",
+			attempt.human()
+		);
+	}
+}
+
+#[test]
+fn reason_for_error_classifies_substring_precisely() {
+	assert_eq!(
+		reason_for_error("unsupported expression: Substring { expr: Identifier(c_phone) }"),
+		"unsupported_substring"
+	);
+	assert_eq!(
+		status_for_reason("unsupported_substring"),
+		Status::Blocked,
+		"the measured q22 wall is a recognized blocker"
+	);
+	assert_eq!(
+		reason_for_error("unsupported expression: Function { name: lower }"),
+		"unsupported_query_surface",
+		"an unrelated unsupported expression must not become the substring wall"
+	);
 }
 
 // ADR 278/279: a genuinely-unsupported correlated EXISTS (e.g. an ambiguous ref the binder can't orient)

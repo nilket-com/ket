@@ -68,6 +68,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"ambiguous_aggregate_projection",
 	"unsupported_correlated_exists",
 	"unsupported_derived_multi_source",
+	"unsupported_substring",
 	"unsupported_query_surface",
 ];
 
@@ -149,6 +150,10 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// ADR 293/294: this was q07's raw derived comma-list wall before ADR 294 relaxed the derived-table
 		// validator. Keep the classifier precise for old rows and targeted regression probes.
 		"unsupported_derived_multi_source"
+	} else if lowered.contains("unsupported expression") && lowered.contains("substring") {
+		// ADR 304: q22's first wall is frontend lowering for SQL `SUBSTRING(x FROM s FOR n)`, which reports
+		// `unsupported expression: Substring { ... }`. Keep this ahead of the generic query-surface bucket.
+		"unsupported_substring"
 	} else if lowered.contains("not supported") || lowered.contains("unsupported") {
 		"unsupported_query_surface"
 	} else {

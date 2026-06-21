@@ -195,6 +195,32 @@ pub const Q20_DEV_SQL: &str = "SELECT s_name, s_address \
 /// strict q20 — identical SQL shape; strict mode carries official Decimal128 lineitem quantities.
 pub const STRICT_Q20_SQL: &str = Q20_DEV_SQL;
 
+/// ADR 304 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes inlined and
+/// no LIMIT. This is a reachability probe for SQL `SUBSTRING(c_phone FROM 1 FOR 2)`: the query should wall
+/// there before the `AVG` threshold or correlated `NOT EXISTS` becomes relevant.
+pub const Q22_DEV_SQL: &str = "SELECT cntrycode, COUNT(*) AS numcust, SUM(c_acctbal) AS totacctbal \
+	FROM ( \
+	  SELECT SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal \
+	  FROM customer \
+	  WHERE SUBSTRING(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17') \
+	    AND c_acctbal > ( \
+	      SELECT AVG(c_acctbal) \
+	      FROM customer \
+	      WHERE c_acctbal > 0.00 \
+	        AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17') \
+	    ) \
+	    AND NOT EXISTS ( \
+	      SELECT * \
+	      FROM orders \
+	      WHERE o_custkey = c_custkey \
+	    ) \
+	) AS custsale \
+	GROUP BY cntrycode \
+	ORDER BY cntrycode";
+
+/// strict q22 - identical SQL shape; strict mode carries official Decimal128 customer account balances.
+pub const STRICT_Q22_SQL: &str = Q22_DEV_SQL;
+
 /// ADR 297 — tpch.q08 (National Market Share): tpchgen-2.0.2's Q8 with `:1` → `'BRAZIL'`,
 /// `:2` → `'AMERICA'`, `:3` → `'ECONOMY ANODIZED STEEL'`, and no LIMIT. The derived body has eight
 /// logical relation factors, but `nation n1` and `nation n2` are SQL aliases over one physical `nation`
@@ -5162,6 +5188,30 @@ pub async fn run_strict_q20(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 304 - dev q22: customer + orders reachability probe for SQL SUBSTRING.
+pub async fn run_dev_q22(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q22",
+		"dev",
+		scale_factor,
+		Q22_DEV_SQL,
+		q22_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 304 - strict q22: same SQL shape, with strict Decimal128 customer balances.
+pub async fn run_strict_q22(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q22",
+		"strict",
+		scale_factor,
+		STRICT_Q22_SQL,
+		q22_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// The five q02 harness tables: `part`, `supplier`, `partsupp`, `nation`, and `region`.
 fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let part = generate_part(scale_factor);
@@ -5204,6 +5254,28 @@ fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: region_descriptor(region_schema().as_ref()),
 			facts: facts_for_batch(&region),
 			batch: region,
+		},
+	]
+}
+
+/// The two q22 harness tables: `customer` (SUBSTRING/account-balance source) and `orders` (`NOT EXISTS` target).
+fn q22_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let customer = generate_customer(strict, scale_factor);
+	let orders = generate_orders(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "customer",
+			descriptor: customer_descriptor(customer_schema(strict).as_ref()),
+			facts: facts_for_batch(&customer),
+			batch: customer,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
 		},
 	]
 }
@@ -5672,7 +5744,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q17" || *id == "q02"
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
-					|| *id == "q09"
+					|| *id == "q09" || *id == "q22"
 				{
 					"implemented"
 				} else {
