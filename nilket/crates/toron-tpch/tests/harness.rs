@@ -3,9 +3,10 @@
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q14, run_dev_q17, run_dev_q20,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q10, run_strict_q14, run_strict_q17, run_strict_q20, status_rows,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q10, run_dev_q12, run_dev_q14, run_dev_q17,
+	run_dev_q20, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
+	run_strict_q6, run_strict_q10, run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20,
+	status_rows,
 };
 
 #[tokio::test]
@@ -356,6 +357,36 @@ async fn q04_executes_in_both_modes() {
 			attempt.status,
 			Status::Pass,
 			"q04 {mode} reaches execute (the correlated EXISTS resolves): {}",
+			attempt.human()
+		);
+		assert_eq!(attempt.phase, Phase::Execute);
+		assert!(
+			attempt.digest.is_some(),
+			"a pass carries a digest: {}",
+			attempt.human()
+		);
+	}
+}
+
+// ADR 290: q12's orders/lineitem comma join is keyed at the default scale, and the grouped CASE-count shape
+// reaches execute in both modes. q12 uses no mode-specific Decimal columns.
+#[tokio::test]
+async fn q12_executes_in_both_modes_at_default_scale() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q12 dev=implemented strict=implemented"),
+		"q12 is an implemented capability in the static inventory"
+	);
+	for (mode, attempt) in [
+		("dev", run_dev_q12(0.01).await),
+		("strict", run_strict_q12(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q12");
+		assert_eq!(
+			attempt.status,
+			Status::Pass,
+			"q12 {mode} reaches execute at the default scale via a keyed join: {}",
 			attempt.human()
 		);
 		assert_eq!(attempt.phase, Phase::Execute);

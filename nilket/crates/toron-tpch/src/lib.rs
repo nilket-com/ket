@@ -277,6 +277,26 @@ pub const Q4_DEV_SQL: &str = "SELECT o_orderpriority, COUNT(*) AS order_count \
 /// `lineitem` decimals, so the modes differ only incidentally).
 pub const STRICT_Q4_SQL: &str = Q4_DEV_SQL;
 
+/// ADR 290 — tpch.q12 (Shipping Modes and Order Priority): tpchgen-2.0.2's Q12 with `:1` → `'MAIL'`,
+/// `:2` → `'SHIP'`, `:3` → `DATE '1994-01-01'`, and the interval upper bound literalized to
+/// `DATE '1995-01-01'`. Same text both modes; q12 references only shared key/date/string columns and integer
+/// CASE literals.
+pub const Q12_DEV_SQL: &str = "SELECT l_shipmode, \
+	SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count, \
+	SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count \
+	FROM orders, lineitem \
+	WHERE o_orderkey = l_orderkey \
+	  AND l_shipmode IN ('MAIL', 'SHIP') \
+	  AND l_commitdate < l_receiptdate \
+	  AND l_shipdate < l_commitdate \
+	  AND l_receiptdate >= DATE '1994-01-01' \
+	  AND l_receiptdate < DATE '1995-01-01' \
+	GROUP BY l_shipmode \
+	ORDER BY l_shipmode";
+
+/// strict q12 — identical shape; q12 uses no mode-specific Decimal columns.
+pub const STRICT_Q12_SQL: &str = Q12_DEV_SQL;
+
 /// The dev `LINEITEM` schema: the q01/q03/q06/q14 reachability subset. Money/quantity/discount/tax are
 /// `Float64`, ship date is `Date32`, string flags stay `Utf8`, and join keys are `Int64`.
 fn dev_lineitem_schema() -> SchemaRef {
@@ -297,6 +317,8 @@ fn dev_lineitem_schema() -> SchemaRef {
 		// ADR 278: q04 EXISTS-subquery dates, appended.
 		Field::new("l_commitdate", DataType::Date32, false),
 		Field::new("l_receiptdate", DataType::Date32, false),
+		// ADR 290: q12 ship-mode filter/group key, appended.
+		Field::new("l_shipmode", DataType::Utf8, false),
 	]))
 }
 
@@ -331,6 +353,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut suppkey = Vec::new();
 	let mut commitdate = Vec::new();
 	let mut receiptdate = Vec::new();
+	let mut shipmode = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -344,6 +367,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		suppkey.push(item.l_suppkey);
 		commitdate.push(item.l_commitdate.to_unix_epoch());
 		receiptdate.push(item.l_receiptdate.to_unix_epoch());
+		shipmode.push(item.l_shipmode.to_string());
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -360,6 +384,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int64Array::from(suppkey)),
 			Arc::new(Date32Array::from(commitdate)),
 			Arc::new(Date32Array::from(receiptdate)),
+			Arc::new(StringArray::from(shipmode)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -387,6 +412,8 @@ fn strict_lineitem_schema() -> SchemaRef {
 		// ADR 278: q04 EXISTS-subquery dates, appended.
 		Field::new("l_commitdate", DataType::Date32, false),
 		Field::new("l_receiptdate", DataType::Date32, false),
+		// ADR 290: q12 ship-mode filter/group key, appended.
+		Field::new("l_shipmode", DataType::Utf8, false),
 	]))
 }
 
@@ -421,6 +448,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut suppkey = Vec::new();
 	let mut commitdate = Vec::new();
 	let mut receiptdate = Vec::new();
+	let mut shipmode = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -434,6 +462,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		suppkey.push(item.l_suppkey);
 		commitdate.push(item.l_commitdate.to_unix_epoch());
 		receiptdate.push(item.l_receiptdate.to_unix_epoch());
+		shipmode.push(item.l_shipmode.to_string());
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -457,6 +486,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int64Array::from(suppkey)),
 			Arc::new(Date32Array::from(commitdate)),
 			Arc::new(Date32Array::from(receiptdate)),
+			Arc::new(StringArray::from(shipmode)),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -3017,6 +3047,30 @@ pub async fn run_strict_q04(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 290 — dev q12: two-table shipping-mode reachability query over orders + lineitem.
+pub async fn run_dev_q12(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q12",
+		"dev",
+		scale_factor,
+		Q12_DEV_SQL,
+		q12_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 290 — strict q12: same shape; q12 uses no mode-specific Decimal columns.
+pub async fn run_strict_q12(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q12",
+		"strict",
+		scale_factor,
+		STRICT_Q12_SQL,
+		q12_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// The two q04 harness tables: `orders` (the FROM) + the mode-sensitive `lineitem` (the EXISTS subquery's
 /// relation). q04 references no customer/nation/etc.
 fn q04_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
@@ -3049,6 +3103,11 @@ fn q04_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	]
 }
 
+/// The two q12 harness tables: `orders` and mode-sensitive `lineitem`.
+fn q12_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	q04_tables(strict, scale_factor)
+}
+
 /// The 22-query reachability *inventory* — static capability (does the harness implement an attempt?),
 /// NOT the last measured result. Measured `blocked`/`fail`/`pass` rows come only from the JSONL-backed
 /// [`matrix`].
@@ -3062,7 +3121,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q03" || *id == "q10"
 					|| *id == "q05" || *id == "q04"
 					|| *id == "q17" || *id == "q02"
-					|| *id == "q20"
+					|| *id == "q20" || *id == "q12"
 				{
 					"implemented"
 				} else {
