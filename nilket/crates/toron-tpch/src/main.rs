@@ -9,12 +9,12 @@ use toron_tpch::{
 	CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_q1, check_strict_q02, check_strict_q3,
 	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
 	check_strict_q09, check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17,
-	check_strict_q20, correctness_matrix, generate_dev_lineitem, matrix, parse_scale_factor,
-	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
-	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q12, run_dev_q14, run_dev_q17, run_dev_q20,
-	run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
-	run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12,
-	run_strict_q14, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	check_strict_q20, check_strict_q22, correctness_matrix, generate_dev_lineitem, matrix,
+	parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6,
+	run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q12, run_dev_q14, run_dev_q17,
+	run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04,
+	run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10,
+	run_strict_q12, run_strict_q14, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -94,6 +94,7 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 		"q12" => check_strict_q12(sf).await,
 		"q14" => check_strict_q14(sf).await,
 		"q20" => check_strict_q20(sf).await,
+		"q22" => check_strict_q22(sf).await,
 		other => return harness_error(&format!("correctness --query {other} is not supported")),
 	};
 	emit_correctness(&attempt);

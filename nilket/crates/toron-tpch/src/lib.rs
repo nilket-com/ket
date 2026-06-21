@@ -5016,6 +5016,290 @@ pub async fn check_strict_q20(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q22Group {
+	pub numcust: i64,
+	pub totacctbal_raw: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q22Oracle {
+	pub groups: BTreeMap<String, Q22Group>,
+	pub avg_threshold_raw: i128,
+	pub with_orders_excluded: usize,
+	pub selected_rows: usize,
+}
+
+const Q22_COUNTRY_CODES: [&str; 7] = ["13", "31", "23", "29", "30", "18", "17"];
+
+pub fn q22_country_code(phone: &str) -> Option<String> {
+	let mut chars = phone.chars();
+	let first = chars.next()?;
+	let second = chars.next()?;
+	Some(format!("{first}{second}"))
+}
+
+pub fn q22_country_code_is_selected(code: &str) -> bool {
+	Q22_COUNTRY_CODES.contains(&code)
+}
+
+pub fn q22_acctbal_above_threshold(
+	acctbal_raw: i128,
+	avg_threshold_raw: i128,
+) -> Result<bool, String> {
+	let aligned = acctbal_raw
+		.checked_mul(10_000)
+		.ok_or_else(|| "q22 account-balance rescale overflow".to_string())?;
+	Ok(aligned > avg_threshold_raw)
+}
+
+pub fn q22_oracle_from_rows(
+	customers: impl IntoIterator<Item = (i64, String, i128)>,
+	order_custkeys: impl IntoIterator<Item = i64>,
+) -> Result<Q22Oracle, String> {
+	let customers: Vec<(i64, String, i128)> = customers.into_iter().collect();
+	let mut threshold_sum = 0_i128;
+	let mut threshold_count = 0_i64;
+	for (_, phone, acctbal_raw) in &customers {
+		let Some(code) = q22_country_code(phone) else {
+			continue;
+		};
+		if q22_country_code_is_selected(&code) && *acctbal_raw > 0 {
+			threshold_sum = threshold_sum
+				.checked_add(*acctbal_raw)
+				.ok_or_else(|| "q22 AVG threshold sum overflow".to_string())?;
+			threshold_count += 1;
+		}
+	}
+	let avg_threshold_raw = avg_decimal_raw(threshold_sum, threshold_count, 2, 6, 19)?;
+	let order_custkeys: HashSet<i64> = order_custkeys.into_iter().collect();
+
+	let mut groups: BTreeMap<String, Q22Group> = BTreeMap::new();
+	let mut with_orders_excluded = 0_usize;
+	let mut selected_rows = 0_usize;
+	for (custkey, phone, acctbal_raw) in customers {
+		let Some(code) = q22_country_code(&phone) else {
+			continue;
+		};
+		if !q22_country_code_is_selected(&code) {
+			continue;
+		}
+		if !q22_acctbal_above_threshold(acctbal_raw, avg_threshold_raw)? {
+			continue;
+		}
+		if order_custkeys.contains(&custkey) {
+			with_orders_excluded += 1;
+			continue;
+		}
+
+		let group = groups.entry(code).or_insert(Q22Group {
+			numcust: 0,
+			totacctbal_raw: 0,
+		});
+		group.numcust += 1;
+		group.totacctbal_raw = group
+			.totacctbal_raw
+			.checked_add(acctbal_raw)
+			.ok_or_else(|| "q22 totacctbal sum overflow".to_string())?;
+		selected_rows += 1;
+	}
+
+	Ok(Q22Oracle {
+		groups,
+		avg_threshold_raw,
+		with_orders_excluded,
+		selected_rows,
+	})
+}
+
+pub fn strict_q22_oracle(scale_factor: f64) -> Result<Q22Oracle, String> {
+	q22_oracle_from_rows(
+		CustomerGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|customer| {
+				(
+					customer.c_custkey,
+					customer.c_phone.to_string(),
+					customer.c_acctbal.into_inner() as i128,
+				)
+			}),
+		OrderGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|order| order.o_custkey),
+	)
+}
+
+fn strict_q22_expected_schema() -> [(&'static str, DataType); 3] {
+	[
+		("cntrycode", DataType::Utf8),
+		("numcust", DataType::Int64),
+		("totacctbal", DataType::Decimal128(15, 2)),
+	]
+}
+
+pub fn assert_strict_q22_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q22_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q22 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q22(batches: &[RecordBatch], oracle: &Q22Oracle) -> Result<(), String> {
+	assert_strict_q22_schema(batches)?;
+	if oracle.selected_rows == 0 || oracle.groups.is_empty() {
+		return Err(format!(
+			"oracle non-vacuous guard failed: selected_rows={} groups={}",
+			oracle.selected_rows,
+			oracle.groups.len()
+		));
+	}
+	if oracle.avg_threshold_raw <= 0 {
+		return Err(format!(
+			"oracle AVG threshold should be positive, got {}",
+			oracle.avg_threshold_raw
+		));
+	}
+
+	let mut emitted_order = Vec::new();
+	let mut emitted: BTreeMap<String, Q22Group> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 3 {
+			return Err(format!("expected 3 columns, got {}", batch.num_columns()));
+		}
+		let codes = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (cntrycode) not Utf8")?;
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (numcust) not Int64")?;
+		let totals = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 2 (totacctbal) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted_order.len();
+			if codes.is_null(i) {
+				return Err(format!("column cntrycode row {row_index} is NULL"));
+			}
+			if counts.is_null(i) {
+				return Err(format!("column numcust row {row_index} is NULL"));
+			}
+			if totals.is_null(i) {
+				return Err(format!("column totacctbal row {row_index} is NULL"));
+			}
+			let code = codes.value(i).to_string();
+			let group = Q22Group {
+				numcust: counts.value(i),
+				totacctbal_raw: totals.value(i),
+			};
+			if emitted.insert(code.clone(), group).is_some() {
+				return Err(format!("duplicate emitted cntrycode {code:?}"));
+			}
+			emitted_order.push(code);
+		}
+	}
+
+	for pair in emitted_order.windows(2) {
+		if pair[0] > pair[1] {
+			return Err(format!(
+				"ORDER BY cntrycode violated: {:?} emitted before {:?}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	for (code, expected) in &oracle.groups {
+		let Some(actual) = emitted.get(code) else {
+			return Err(format!("oracle cntrycode {code:?} missing from output"));
+		};
+		if actual.numcust != expected.numcust {
+			return Err(format!(
+				"cntrycode {code:?} numcust mismatch: expected {}, got {}",
+				expected.numcust, actual.numcust
+			));
+		}
+		if actual.totacctbal_raw != expected.totacctbal_raw {
+			return Err(format!(
+				"cntrycode {code:?} totacctbal mismatch: expected {}, got {}",
+				expected.totacctbal_raw, actual.totacctbal_raw
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q22(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q22_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q22".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q22_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q22_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q22_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q22(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// Validate an explicit `--sf` (scale-factor) value: it must be a **finite, strictly-positive** number.
 /// Malformed (unparseable), zero, negative, NaN, and infinite values are *usage* errors — the CLI maps the
 /// `Err` to a harness error (exit 2, no telemetry row), per ADR 261's "a bad arg is a harness error, not a

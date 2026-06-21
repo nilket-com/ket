@@ -10,23 +10,26 @@ use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
 	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
-	Q20Oracle, Q20Row, assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
-	assert_strict_q04_schema, assert_strict_q5_schema, assert_strict_q07_schema,
-	assert_strict_q08_schema, assert_strict_q09_schema, assert_strict_q10_schema,
-	assert_strict_q12_schema, assert_strict_q14_schema, assert_strict_q17_schema,
-	assert_strict_q20_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
-	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
-	check_strict_q09, check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17,
-	check_strict_q20, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
+	Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
+	assert_strict_q3_schema, assert_strict_q04_schema, assert_strict_q5_schema,
+	assert_strict_q07_schema, assert_strict_q08_schema, assert_strict_q09_schema,
+	assert_strict_q10_schema, assert_strict_q12_schema, assert_strict_q14_schema,
+	assert_strict_q17_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
+	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
+	check_strict_q12, check_strict_q14, check_strict_q17, check_strict_q20, check_strict_q22,
+	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
 	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
 	compare_strict_q09, compare_strict_q10, compare_strict_q12, compare_strict_q14,
-	compare_strict_q17, compare_strict_q20, correctness_matrix_from_log, decimal_division_raw,
-	q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue, q07_contribution,
-	q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
+	compare_strict_q17, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
+	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
+	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
 	q09_part_name_contains_green, q09_partsupp_cost, q20_part_name_is_forest_prefix,
-	q20_threshold_passes, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q04_oracle,
-	strict_q5_oracle, strict_q6_oracle, strict_q07_oracle, strict_q08_oracle, strict_q09_oracle,
-	strict_q10_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle, strict_q20_oracle,
+	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
+	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
+	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
+	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q12_oracle, strict_q14_oracle,
+	strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -3005,5 +3008,302 @@ fn q20_order_violation_is_fail() {
 	assert!(
 		compare_strict_q20(&[q20_batch(&[row_b, row_a])], &oracle).is_err(),
 		"s_name descending violates ORDER BY s_name"
+	);
+}
+
+fn q22_group(numcust: i64, totacctbal_raw: i128) -> Q22Group {
+	Q22Group {
+		numcust,
+		totacctbal_raw,
+	}
+}
+
+fn q22_oracle(rows: &[(&str, i64, i128)]) -> Q22Oracle {
+	let mut groups = BTreeMap::new();
+	let mut selected_rows = 0_usize;
+	for (code, numcust, total) in rows {
+		groups.insert((*code).to_string(), q22_group(*numcust, *total));
+		selected_rows += *numcust as usize;
+	}
+	Q22Oracle {
+		groups,
+		avg_threshold_raw: 1,
+		with_orders_excluded: 1,
+		selected_rows,
+	}
+}
+
+fn q22_nullable_batch(
+	rows: &[(Option<&str>, Option<i64>, Option<i128>)],
+	precision: u8,
+	scale: i8,
+) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("cntrycode", DataType::Utf8, true),
+		Field::new("numcust", DataType::Int64, true),
+		Field::new("totacctbal", DataType::Decimal128(precision, scale), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.2).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(precision, scale)
+					.expect("q22 totacctbal decimal column"),
+			) as ArrayRef,
+		],
+	)
+	.expect("q22 batch")
+}
+
+fn q22_batch(rows: &[(&str, i64, i128)]) -> RecordBatch {
+	let nullable = rows
+		.iter()
+		.map(|(code, count, total)| (Some(*code), Some(*count), Some(*total)))
+		.collect::<Vec<_>>();
+	q22_nullable_batch(&nullable, 15, 2)
+}
+
+#[test]
+fn strict_q22_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q22(0.01))
+		})
+		.expect("spawn q22 correctness thread")
+		.join()
+		.expect("q22 correctness thread panicked");
+	assert_eq!(attempt.query, "q22");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q22_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q22_oracle(0.01).expect("q22 oracle");
+	assert!(
+		!oracle.groups.is_empty(),
+		"expected non-empty q22 groups at sf=0.01: {oracle:?}"
+	);
+	assert!(
+		oracle.selected_rows > 0,
+		"selected q22 customers at sf=0.01: {}",
+		oracle.selected_rows
+	);
+	assert!(
+		oracle.avg_threshold_raw > 0,
+		"q22 AVG threshold should be positive: {}",
+		oracle.avg_threshold_raw
+	);
+	assert_eq!(
+		oracle
+			.groups
+			.values()
+			.map(|group| group.numcust)
+			.sum::<i64>() as usize,
+		oracle.selected_rows,
+		"selected row count should equal grouped COUNT(*) total"
+	);
+	assert!(
+		oracle.with_orders_excluded > 0,
+		"live q22 should exercise anti-join exclusions at sf=0.01"
+	);
+}
+
+#[test]
+fn strict_q22_output_schema_is_asserted() {
+	assert!(assert_strict_q22_schema(&[q22_batch(&[("13", 1, 12_345)])]).is_ok());
+	assert!(
+		assert_strict_q22_schema(&[q22_nullable_batch(
+			&[(Some("13"), Some(1), Some(12_345))],
+			16,
+			2
+		)])
+		.is_err(),
+		"a non-measured precision must trip the schema gate"
+	);
+	assert!(
+		assert_strict_q22_schema(&[q22_nullable_batch(
+			&[(Some("13"), Some(1), Some(12_345))],
+			15,
+			3
+		)])
+		.is_err(),
+		"a non-measured scale must trip the schema gate"
+	);
+}
+
+#[test]
+fn q22_not_exists_anti_join_excludes_customers_with_orders() {
+	let oracle = q22_oracle_from_rows(
+		[
+			(1_i64, "13-111-111-1111".to_string(), 20_000_i128),
+			(2_i64, "13-222-222-2222".to_string(), 20_000_i128),
+			(3_i64, "13-333-333-3333".to_string(), 1_000_i128),
+		],
+		[2_i64],
+	)
+	.expect("q22 oracle");
+	assert_eq!(oracle.selected_rows, 1, "{oracle:?}");
+	assert_eq!(oracle.with_orders_excluded, 1, "{oracle:?}");
+	assert_eq!(oracle.groups.get("13"), Some(&q22_group(1, 20_000)));
+}
+
+#[test]
+fn q22_avg_threshold_boundary_is_strict() {
+	let oracle = q22_oracle_from_rows(
+		[
+			(1_i64, "13-111-111-1111".to_string(), 10_000_i128),
+			(2_i64, "13-222-222-2222".to_string(), 10_000_i128),
+			(3_i64, "13-333-333-3333".to_string(), 10_001_i128),
+		],
+		[],
+	)
+	.expect("q22 oracle");
+	assert_eq!(
+		oracle.avg_threshold_raw,
+		avg_decimal_raw(30_001, 3, 2, 6, 19).expect("threshold avg")
+	);
+	assert!(
+		!q22_acctbal_above_threshold(10_000, oracle.avg_threshold_raw).unwrap(),
+		"at/below the AVG threshold is excluded by strict >"
+	);
+	assert!(
+		q22_acctbal_above_threshold(10_001, oracle.avg_threshold_raw).unwrap(),
+		"a just-above row qualifies"
+	);
+	assert_eq!(oracle.selected_rows, 1, "{oracle:?}");
+	assert_eq!(oracle.groups.get("13"), Some(&q22_group(1, 10_001)));
+}
+
+#[test]
+fn q22_substring_prefix_and_in7_filter() {
+	assert_eq!(q22_country_code("13-111-111-1111").as_deref(), Some("13"));
+	assert!(q22_country_code_is_selected("13"));
+	assert!(!q22_country_code_is_selected("99"));
+	assert_eq!(q22_country_code("1").as_deref(), None);
+	assert_eq!(
+		q22_country_code("Γa-rest").as_deref(),
+		Some("Γa"),
+		"country-code extraction follows character positions, not byte offsets"
+	);
+
+	let oracle = q22_oracle_from_rows(
+		[
+			(1_i64, "13-111-111-1111".to_string(), 20_000_i128),
+			(2_i64, "99-222-222-2222".to_string(), 1_000_i128),
+			(3_i64, "13-333-333-3333".to_string(), 1_000_i128),
+		],
+		[],
+	)
+	.expect("q22 oracle");
+	assert_eq!(oracle.selected_rows, 1, "{oracle:?}");
+	assert_eq!(oracle.groups.get("13"), Some(&q22_group(1, 20_000)));
+	assert!(
+		!oracle.groups.contains_key("99"),
+		"a non-seven country code is excluded"
+	);
+}
+
+#[test]
+fn q22_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q22_oracle(&[("13", 2, 30_000)]);
+	assert!(
+		compare_strict_q22(&[q22_batch(&[("13", 2, 30_000)])], &oracle).is_ok(),
+		"exact q22 group match"
+	);
+	assert!(
+		compare_strict_q22(&[q22_batch(&[("13", 1, 30_000)])], &oracle).is_err(),
+		"a wrong numcust is a mismatch"
+	);
+	assert!(
+		compare_strict_q22(&[q22_batch(&[("13", 2, 30_001)])], &oracle).is_err(),
+		"a wrong totacctbal is a mismatch"
+	);
+}
+
+#[test]
+fn q22_missing_extra_or_duplicate_cntrycode_is_fail() {
+	let oracle = q22_oracle(&[("13", 1, 10_000), ("31", 1, 20_000)]);
+	assert!(
+		compare_strict_q22(&[q22_batch(&[("13", 1, 10_000)])], &oracle).is_err(),
+		"a missing cntrycode is a mismatch"
+	);
+	assert!(
+		compare_strict_q22(
+			&[q22_batch(&[
+				("13", 1, 10_000),
+				("31", 1, 20_000),
+				("23", 1, 30_000)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an extra cntrycode is a mismatch"
+	);
+	assert!(
+		compare_strict_q22(
+			&[q22_batch(&[("13", 1, 10_000), ("13", 1, 10_000)])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted cntrycode is rejected"
+	);
+}
+
+#[test]
+fn q22_null_cell_is_fail_at_compare() {
+	let oracle = q22_oracle(&[("13", 1, 10_000)]);
+	assert!(
+		compare_strict_q22(
+			&[q22_nullable_batch(&[(None, Some(1), Some(10_000))], 15, 2)],
+			&oracle
+		)
+		.is_err(),
+		"a NULL cntrycode is fail@compare"
+	);
+	assert!(
+		compare_strict_q22(
+			&[q22_nullable_batch(
+				&[(Some("13"), None, Some(10_000))],
+				15,
+				2
+			)],
+			&oracle
+		)
+		.is_err(),
+		"a NULL numcust is fail@compare"
+	);
+	assert!(
+		compare_strict_q22(
+			&[q22_nullable_batch(&[(Some("13"), Some(1), None)], 15, 2)],
+			&oracle
+		)
+		.is_err(),
+		"a NULL totacctbal is fail@compare"
+	);
+}
+
+#[test]
+fn q22_order_violation_is_fail() {
+	let oracle = q22_oracle(&[("13", 1, 10_000), ("31", 1, 20_000)]);
+	assert!(
+		compare_strict_q22(
+			&[q22_batch(&[("31", 1, 20_000), ("13", 1, 10_000)])],
+			&oracle
+		)
+		.is_err(),
+		"cntrycode descending violates ORDER BY cntrycode"
 	);
 }
