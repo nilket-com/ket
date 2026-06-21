@@ -2513,6 +2513,311 @@ pub async fn check_strict_q07(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Q08Oracle {
+	pub groups: BTreeMap<i32, DecimalRaw>,
+	pub denominator_rows: usize,
+	pub brazil_rows: usize,
+}
+
+fn q08_order_year(orderdate: i32) -> Option<i32> {
+	q07_ship_year(orderdate)
+}
+
+pub fn q08_market_share_raw(
+	numerator_raw: i128,
+	denominator_raw: i128,
+) -> Result<DecimalRaw, String> {
+	decimal_division_raw(numerator_raw, 32, 4, denominator_raw, 32, 4)
+}
+
+pub fn q08_contribution(
+	part_type: &str,
+	customer_region: &str,
+	supplier_nation: &str,
+	orderdate: i32,
+	extprice_raw: i128,
+	discount_raw: i128,
+) -> Option<(i32, i128, bool)> {
+	if part_type != "ECONOMY ANODIZED STEEL" {
+		return None;
+	}
+	if customer_region != "AMERICA" {
+		return None;
+	}
+	let o_year = q08_order_year(orderdate)?;
+	let volume = discounted_price_raw(extprice_raw, discount_raw);
+	Some((o_year, volume, supplier_nation == "BRAZIL"))
+}
+
+/// ADR 300: the independent strict-q08 oracle. Resolve the `nation` self-join roles explicitly: customer nation
+/// supplies the AMERICA region filter, supplier nation supplies the BRAZIL CASE branch.
+pub fn strict_q08_oracle(scale_factor: f64) -> Result<Q08Oracle, String> {
+	let america_regions: HashSet<i64> = RegionGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|region| region.r_name == "AMERICA")
+		.map(|region| region.r_regionkey)
+		.collect();
+
+	let mut nations: HashMap<i64, (String, i64)> = HashMap::new();
+	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		nations.insert(
+			nation.n_nationkey,
+			(nation.n_name.to_string(), nation.n_regionkey),
+		);
+	}
+
+	let economy_anodized_steel_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|part| part.p_type == "ECONOMY ANODIZED STEEL")
+		.map(|part| part.p_partkey)
+		.collect();
+
+	let mut suppliers: HashMap<i64, i64> = HashMap::new();
+	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		suppliers.insert(supplier.s_suppkey, supplier.s_nationkey);
+	}
+
+	let mut customers: HashMap<i64, i64> = HashMap::new();
+	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		customers.insert(customer.c_custkey, customer.c_nationkey);
+	}
+
+	let mut orders: HashMap<i64, (i64, i32, i32)> = HashMap::new();
+	for order in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		let orderdate = order.o_orderdate.to_unix_epoch();
+		let Some(o_year) = q08_order_year(orderdate) else {
+			continue;
+		};
+		orders.insert(order.o_orderkey, (order.o_custkey, orderdate, o_year));
+	}
+
+	let mut raw_groups: BTreeMap<i32, (i128, i128)> = BTreeMap::new();
+	let mut denominator_rows = 0_usize;
+	let mut brazil_rows = 0_usize;
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		if !economy_anodized_steel_parts.contains(&item.l_partkey) {
+			continue;
+		}
+		let Some(&(custkey, orderdate, _)) = orders.get(&item.l_orderkey) else {
+			continue;
+		};
+		let Some(&customer_nationkey) = customers.get(&custkey) else {
+			continue;
+		};
+		let Some((_, customer_regionkey)) = nations.get(&customer_nationkey) else {
+			continue;
+		};
+		let customer_region = if america_regions.contains(customer_regionkey) {
+			"AMERICA"
+		} else {
+			"OTHER"
+		};
+		let Some(&supplier_nationkey) = suppliers.get(&item.l_suppkey) else {
+			continue;
+		};
+		let Some((supplier_nation, _)) = nations.get(&supplier_nationkey) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let discount_raw = item.l_discount.into_inner() as i128;
+		let Some((o_year, volume, is_brazil)) = q08_contribution(
+			"ECONOMY ANODIZED STEEL",
+			customer_region,
+			supplier_nation,
+			orderdate,
+			extprice_raw,
+			discount_raw,
+		) else {
+			continue;
+		};
+		let (num_raw, den_raw) = raw_groups.entry(o_year).or_insert((0, 0));
+		*den_raw += volume;
+		denominator_rows += 1;
+		if is_brazil {
+			*num_raw += volume;
+			brazil_rows += 1;
+		}
+	}
+
+	let mut groups = BTreeMap::new();
+	for (o_year, (num_raw, den_raw)) in raw_groups {
+		let mkt_share = q08_market_share_raw(num_raw, den_raw)?;
+		if mkt_share.precision != 38 || mkt_share.scale != 8 {
+			return Err(format!(
+				"q08 mkt_share type drift: Decimal128({}, {})",
+				mkt_share.precision, mkt_share.scale
+			));
+		}
+		groups.insert(o_year, mkt_share);
+	}
+
+	Ok(Q08Oracle {
+		groups,
+		denominator_rows,
+		brazil_rows,
+	})
+}
+
+fn strict_q08_expected_schema() -> [(&'static str, DataType); 2] {
+	[
+		("o_year", DataType::Int32),
+		("mkt_share", DataType::Decimal128(38, 8)),
+	]
+}
+
+pub fn assert_strict_q08_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q08_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q08 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q08(batches: &[RecordBatch], oracle: &Q08Oracle) -> Result<(), String> {
+	assert_strict_q08_schema(batches)?;
+	if oracle.groups.len() != 2
+		|| !oracle.groups.contains_key(&1995)
+		|| !oracle.groups.contains_key(&1996)
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: groups={:?}",
+			oracle.groups.keys().collect::<Vec<_>>()
+		));
+	}
+	if oracle.denominator_rows == 0 {
+		return Err("oracle non-vacuous guard failed: denominator_rows=0".to_string());
+	}
+
+	let mut emitted: Vec<(i32, i128)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let years = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.ok_or("column 0 (o_year) not Int32")?;
+		let shares = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 1 (mkt_share) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			if years.is_null(i) {
+				return Err(format!("column o_year row {} is NULL", emitted.len()));
+			}
+			if shares.is_null(i) {
+				return Err(format!("column mkt_share row {} is NULL", emitted.len()));
+			}
+			emitted.push((years.value(i), shares.value(i)));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<i32, i128> = BTreeMap::new();
+	for (year, mkt_share) in &emitted {
+		if seen.insert(*year, *mkt_share).is_some() {
+			return Err(format!("duplicate emitted o_year {year}"));
+		}
+	}
+	for (year, expected) in &oracle.groups {
+		let Some(expected_value) = expected.value else {
+			return Err(format!("oracle q08 year {year} is NULL"));
+		};
+		if expected.precision != 38 || expected.scale != 8 {
+			return Err(format!(
+				"oracle q08 year {year} type drift: Decimal128({}, {})",
+				expected.precision, expected.scale
+			));
+		}
+		let Some(actual_value) = seen.get(year) else {
+			return Err(format!("oracle q08 year {year} missing from output"));
+		};
+		if *actual_value != expected_value {
+			return Err(format!(
+				"q08 year {year}: mkt_share mismatch: expected {expected_value}, got {actual_value}"
+			));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].0 > pair[1].0 {
+			return Err(format!(
+				"ORDER BY o_year violated: {} emitted before {}",
+				pair[0].0, pair[1].0
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q08(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q08_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q08".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q8_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q08_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q08_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q08(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q10Row {
 	pub c_custkey: i64,
