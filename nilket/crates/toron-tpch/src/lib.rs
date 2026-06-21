@@ -2932,6 +2932,223 @@ pub async fn check_strict_q02(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Q04Oracle {
+	pub groups: BTreeMap<String, i64>,
+	pub orders_pass_exists: usize,
+	pub orders_fail_exists: usize,
+}
+
+pub fn q04_oracle_from_rows(
+	orders: impl IntoIterator<Item = (i64, i32, String)>,
+	lineitems: impl IntoIterator<Item = (i64, i32, i32)>,
+) -> Q04Oracle {
+	const START_1993_Q3: i32 = 8582;
+	const START_1993_Q4: i32 = 8674;
+
+	let mut exists_orderkeys: HashSet<i64> = HashSet::new();
+	for (orderkey, commitdate, receiptdate) in lineitems {
+		if commitdate < receiptdate {
+			exists_orderkeys.insert(orderkey);
+		}
+	}
+
+	let mut groups: BTreeMap<String, i64> = BTreeMap::new();
+	let mut orders_pass_exists = 0_usize;
+	let mut orders_fail_exists = 0_usize;
+	for (orderkey, orderdate, orderpriority) in orders {
+		if !(START_1993_Q3..START_1993_Q4).contains(&orderdate) {
+			continue;
+		}
+		if exists_orderkeys.contains(&orderkey) {
+			*groups.entry(orderpriority).or_default() += 1;
+			orders_pass_exists += 1;
+		} else {
+			orders_fail_exists += 1;
+		}
+	}
+
+	Q04Oracle {
+		groups,
+		orders_pass_exists,
+		orders_fail_exists,
+	}
+}
+
+/// Independent strict-q04 oracle: traverse orders and lineitem generators directly, model the correlated EXISTS
+/// as a semijoin, then group counted orders by order priority.
+pub fn strict_q04_oracle(scale_factor: f64) -> Q04Oracle {
+	q04_oracle_from_rows(
+		OrderGenerator::new(scale_factor, 1, 1).iter().map(|order| {
+			(
+				order.o_orderkey,
+				order.o_orderdate.to_unix_epoch(),
+				order.o_orderpriority.to_string(),
+			)
+		}),
+		LineItemGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|item| {
+				(
+					item.l_orderkey,
+					item.l_commitdate.to_unix_epoch(),
+					item.l_receiptdate.to_unix_epoch(),
+				)
+			}),
+	)
+}
+
+fn strict_q04_expected_schema() -> [(&'static str, DataType); 2] {
+	[
+		("o_orderpriority", DataType::Utf8),
+		("order_count", DataType::Int64),
+	]
+}
+
+pub fn assert_strict_q04_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q04_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q04 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q04(batches: &[RecordBatch], oracle: &Q04Oracle) -> Result<(), String> {
+	assert_strict_q04_schema(batches)?;
+
+	if oracle.orders_pass_exists == 0 || oracle.orders_fail_exists == 0 || oracle.groups.is_empty()
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: pass={} fail={} groups={}",
+			oracle.orders_pass_exists,
+			oracle.orders_fail_exists,
+			oracle.groups.len()
+		));
+	}
+
+	let mut emitted: Vec<(String, i64)> = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let priorities = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (o_orderpriority) not Utf8")?;
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (order_count) not Int64")?;
+		for i in 0..batch.num_rows() {
+			if priorities.is_null(i) {
+				return Err(format!(
+					"column o_orderpriority row {} is NULL",
+					emitted.len()
+				));
+			}
+			if counts.is_null(i) {
+				return Err(format!("column order_count row {} is NULL", emitted.len()));
+			}
+			emitted.push((priorities.value(i).to_string(), counts.value(i)));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	let mut seen: BTreeMap<String, i64> = BTreeMap::new();
+	for (priority, count) in &emitted {
+		if seen.insert(priority.clone(), *count).is_some() {
+			return Err(format!("duplicate emitted o_orderpriority {priority:?}"));
+		}
+	}
+	for (priority, expected_count) in &oracle.groups {
+		let Some(actual_count) = seen.get(priority) else {
+			return Err(format!(
+				"oracle o_orderpriority {priority:?} missing from output"
+			));
+		};
+		if actual_count != expected_count {
+			return Err(format!(
+				"o_orderpriority {priority:?}: count mismatch: expected {expected_count}, got {actual_count}"
+			));
+		}
+	}
+
+	let expected_order: Vec<&String> = oracle.groups.keys().collect();
+	for (idx, (priority, _)) in emitted.iter().enumerate() {
+		if priority != expected_order[idx] {
+			return Err(format!(
+				"ORDER BY o_orderpriority violated at row {idx}: expected {:?}, got {priority:?}",
+				expected_order[idx]
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q04(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q04_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q04".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q4_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q04_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q04_oracle(scale_factor);
+	match compare_strict_q04(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q12Group {
 	pub high_line_count: i64,

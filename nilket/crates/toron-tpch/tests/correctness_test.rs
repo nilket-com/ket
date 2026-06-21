@@ -8,19 +8,21 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
-	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q5Group, Q10Oracle, Q10Row, Q12Group,
-	Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle, Q20Row,
+	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q10Oracle, Q10Row,
+	Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle, Q20Row,
 	assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
-	assert_strict_q5_schema, assert_strict_q10_schema, assert_strict_q12_schema,
-	assert_strict_q14_schema, assert_strict_q17_schema, assert_strict_q20_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q5, check_strict_q6,
-	check_strict_q10, check_strict_q12, check_strict_q14, check_strict_q17, check_strict_q20,
-	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q5, compare_strict_q6,
+	assert_strict_q04_schema, assert_strict_q5_schema, assert_strict_q10_schema,
+	assert_strict_q12_schema, assert_strict_q14_schema, assert_strict_q17_schema,
+	assert_strict_q20_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q10, check_strict_q12,
+	check_strict_q14, check_strict_q17, check_strict_q20, compare_strict_q1, compare_strict_q02,
+	compare_strict_q3, compare_strict_q04, compare_strict_q5, compare_strict_q6,
 	compare_strict_q10, compare_strict_q12, compare_strict_q14, compare_strict_q17,
 	compare_strict_q20, correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
-	q6_row_revenue, q20_part_name_is_forest_prefix, q20_threshold_passes, strict_q1_oracle,
-	strict_q02_oracle, strict_q3_oracle, strict_q5_oracle, strict_q6_oracle, strict_q10_oracle,
-	strict_q12_oracle, strict_q14_oracle, strict_q17_oracle, strict_q20_oracle,
+	q04_oracle_from_rows, q6_row_revenue, q20_part_name_is_forest_prefix, q20_threshold_passes,
+	strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q04_oracle, strict_q5_oracle,
+	strict_q6_oracle, strict_q10_oracle, strict_q12_oracle, strict_q14_oracle, strict_q17_oracle,
+	strict_q20_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -1257,6 +1259,207 @@ fn q10_comparator_accepts_tied_revenue_permutation() {
 	assert!(
 		compare_strict_q10(&[q10_batch(&[row_b, row_a])], &oracle).is_ok(),
 		"tie order [b,a] equally accepted"
+	);
+}
+
+fn q04_batch(rows: &[(&str, i64)]) -> RecordBatch {
+	let nullable_rows: Vec<(Option<&str>, Option<i64>)> = rows
+		.iter()
+		.map(|&(priority, count)| (Some(priority), Some(count)))
+		.collect();
+	q04_nullable_batch(&nullable_rows)
+}
+
+fn q04_nullable_batch(rows: &[(Option<&str>, Option<i64>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("o_orderpriority", DataType::Utf8, true),
+		Field::new("order_count", DataType::Int64, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i64>>>(),
+			)),
+		],
+	)
+	.expect("q04 batch")
+}
+
+fn q04_int32_count_batch() -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("o_orderpriority", DataType::Utf8, true),
+		Field::new("order_count", DataType::Int32, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(vec!["1-URGENT"])),
+			Arc::new(Int32Array::from(vec![1])),
+		],
+	)
+	.expect("q04 int32-count batch")
+}
+
+fn q04_oracle(rows: &[(&str, i64)]) -> Q04Oracle {
+	Q04Oracle {
+		groups: rows
+			.iter()
+			.map(|&(priority, count)| (priority.to_string(), count))
+			.collect(),
+		orders_pass_exists: rows.iter().map(|(_, count)| *count).sum::<i64>() as usize,
+		orders_fail_exists: 1,
+	}
+}
+
+#[tokio::test]
+async fn strict_q04_matches_independent_oracle() {
+	let attempt = check_strict_q04(0.01).await;
+	assert_eq!(attempt.query, "q04");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q04_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q04_oracle(0.01);
+	assert_eq!(oracle.orders_pass_exists, 535, "{oracle:?}");
+	assert_eq!(oracle.orders_fail_exists, 47, "{oracle:?}");
+	for priority in ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"] {
+		let count = oracle
+			.groups
+			.get(priority)
+			.unwrap_or_else(|| panic!("missing priority group {priority}: {oracle:?}"));
+		assert!(*count > 0, "{priority} count: {count}");
+	}
+}
+
+#[test]
+fn strict_q04_output_schema_is_asserted() {
+	assert!(assert_strict_q04_schema(&[q04_batch(&[("1-URGENT", 1)])]).is_ok());
+	assert!(
+		assert_strict_q04_schema(&[q04_int32_count_batch()]).is_err(),
+		"a non-measured count type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q04_exists_counts_order_once() {
+	let oracle = q04_oracle_from_rows(
+		[(1_i64, 8582_i32, "1-URGENT".to_string())],
+		[(1_i64, 1_i32, 2_i32), (1, 2, 3)],
+	);
+	assert_eq!(oracle.orders_pass_exists, 1, "{oracle:?}");
+	assert_eq!(oracle.orders_fail_exists, 0, "{oracle:?}");
+	assert_eq!(
+		oracle.groups.get("1-URGENT"),
+		Some(&1),
+		"multiple qualifying lineitems still count one order"
+	);
+}
+
+#[test]
+fn q04_order_failing_exists_is_excluded() {
+	let oracle = q04_oracle_from_rows(
+		[
+			(1_i64, 8582_i32, "1-URGENT".to_string()),
+			(2_i64, 8582_i32, "2-HIGH".to_string()),
+			(3_i64, 8582_i32, "3-MEDIUM".to_string()),
+			(4_i64, 8674_i32, "4-NOT SPECIFIED".to_string()),
+		],
+		[(1_i64, 1_i32, 2_i32), (2, 3, 3), (4, 1, 2)],
+	);
+	assert_eq!(oracle.orders_pass_exists, 1, "{oracle:?}");
+	assert_eq!(oracle.orders_fail_exists, 2, "{oracle:?}");
+	assert_eq!(oracle.groups.get("1-URGENT"), Some(&1));
+	assert!(
+		!oracle.groups.contains_key("2-HIGH"),
+		"commitdate >= receiptdate fails EXISTS"
+	);
+	assert!(
+		!oracle.groups.contains_key("3-MEDIUM"),
+		"no lineitem fails EXISTS"
+	);
+	assert!(
+		!oracle.groups.contains_key("4-NOT SPECIFIED"),
+		"orders outside the q04 date window are ignored"
+	);
+}
+
+#[test]
+fn q04_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q04_oracle(&[("1-URGENT", 3), ("2-HIGH", 4)]);
+	assert!(
+		compare_strict_q04(&[q04_batch(&[("1-URGENT", 3), ("2-HIGH", 4)])], &oracle).is_ok(),
+		"exact order counts match"
+	);
+	assert!(
+		compare_strict_q04(&[q04_batch(&[("1-URGENT", 4), ("2-HIGH", 4)])], &oracle).is_err(),
+		"an off-by-one order_count is a mismatch"
+	);
+}
+
+#[test]
+fn q04_missing_extra_or_duplicate_group_is_fail_at_compare() {
+	let oracle = q04_oracle(&[("1-URGENT", 3), ("2-HIGH", 4)]);
+	assert!(
+		compare_strict_q04(&[q04_batch(&[("1-URGENT", 3)])], &oracle).is_err(),
+		"a dropped priority group is a mismatch"
+	);
+	assert!(
+		compare_strict_q04(
+			&[q04_batch(&[
+				("1-URGENT", 3),
+				("2-HIGH", 4),
+				("3-MEDIUM", 5)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an extra priority group is a mismatch"
+	);
+	assert!(
+		compare_strict_q04(&[q04_batch(&[("1-URGENT", 3), ("1-URGENT", 3)])], &oracle).is_err(),
+		"a duplicate emitted priority group is rejected"
+	);
+}
+
+#[test]
+fn q04_null_cell_is_fail_at_compare() {
+	let oracle = q04_oracle(&[("1-URGENT", 3), ("2-HIGH", 4)]);
+	assert!(
+		compare_strict_q04(
+			&[q04_nullable_batch(&[
+				(None, Some(3)),
+				(Some("2-HIGH"), Some(4))
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL o_orderpriority is fail@compare"
+	);
+	assert!(
+		compare_strict_q04(
+			&[q04_nullable_batch(&[
+				(Some("1-URGENT"), None),
+				(Some("2-HIGH"), Some(4))
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL order_count is fail@compare"
+	);
+}
+
+#[test]
+fn q04_order_violation_is_fail_at_compare() {
+	let oracle = q04_oracle(&[("1-URGENT", 3), ("2-HIGH", 4)]);
+	assert!(
+		compare_strict_q04(&[q04_batch(&[("2-HIGH", 4), ("1-URGENT", 3)])], &oracle).is_err(),
+		"q04's ORDER BY o_orderpriority is part of the exact answer"
 	);
 }
 
