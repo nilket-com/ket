@@ -9,10 +9,11 @@ use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
 	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
 	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14,
-	run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
-	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
-	run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14,
-	run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q20, run_dev_q22, run_strict_q1,
+	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
+	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
+	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q20,
+	run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -894,6 +895,57 @@ async fn q17_executes_in_both_modes() {
 		"a pass carries a digest: {}",
 		strict.human()
 	);
+}
+
+// ADR 315: q18 currently walls before bind on the grouped membership-subquery body.
+#[tokio::test]
+async fn q18_blocks_on_grouped_membership_subquery_shape() {
+	assert!(
+		status_rows()
+			.iter()
+			.any(|row| row == "q18 dev=implemented strict=implemented"),
+		"q18 is an implemented capability in the static inventory"
+	);
+
+	for (mode, attempt) in [
+		("dev", run_dev_q18(0.01).await),
+		("strict", run_strict_q18(0.01).await),
+	] {
+		assert_eq!(attempt.query, "q18");
+		assert_eq!(
+			attempt.status,
+			Status::Blocked,
+			"q18 {mode} records a recognized blocker: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.phase,
+			Phase::Plan,
+			"q18 {mode} blocks before bind reaches the deferred o_totalprice fixture gap: {}",
+			attempt.human()
+		);
+		assert_eq!(
+			attempt.reason.as_deref(),
+			Some("unsupported_query_surface"),
+			"q18 {mode} keeps the shared grouped-IN shape reject in the broad query-surface bucket: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.digest.is_none(),
+			"a blocked attempt carries no digest: {}",
+			attempt.human()
+		);
+		assert!(
+			attempt.is_process_success(true),
+			"a recognized q18 blocker succeeds only with --allow-blocked: {}",
+			attempt.human()
+		);
+		assert!(
+			!attempt.is_process_success(false),
+			"a recognized q18 blocker is not a normal process success: {}",
+			attempt.human()
+		);
+	}
 }
 
 // ADR 286: q20's nested IN body and correlated scalar now compose with comparison-local numeric operand

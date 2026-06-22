@@ -138,6 +138,26 @@ pub const Q17_DEV_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
 /// deviation in the results doc (ADR 281).
 pub const STRICT_Q17_SQL: &str = Q17_DEV_SQL;
 
+/// ADR 315 — tpch.q18 (Large Volume Customer): official-shaped q18 with `:1` -> `300` and `LIMIT 100`.
+/// The grouped `IN` subquery body is intentionally kept verbatim; this reachability attempt measures the
+/// first wall rather than pre-solving the membership-subquery shape.
+pub const Q18_DEV_SQL: &str = "SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, SUM(l_quantity) \
+	FROM customer, orders, lineitem \
+	WHERE o_orderkey IN ( \
+	  SELECT l_orderkey \
+	  FROM lineitem \
+	  GROUP BY l_orderkey \
+	  HAVING SUM(l_quantity) > 300 \
+	) \
+	  AND c_custkey = o_custkey \
+	  AND o_orderkey = l_orderkey \
+	GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice \
+	ORDER BY o_totalprice DESC, o_orderdate \
+	LIMIT 100";
+
+/// strict q18 — identical SQL shape; strict mode carries official Decimal128 lineitem quantity.
+pub const STRICT_Q18_SQL: &str = Q18_DEV_SQL;
+
 /// ADR 284 — tpch.q02 (Minimum Cost Supplier): tpchgen-2.0.2's exact Q2 with `:1` → `15`, `:2` →
 /// `BRASS`, `:3` → `EUROPE`, and no LIMIT. The correlated scalar `MIN(ps_supplycost)` has a multi-table
 /// comma-join inner input (`partsupp, supplier, nation, region`) and is the measured frontier.
@@ -6002,6 +6022,30 @@ pub async fn run_strict_q17(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 315 - dev q18: grouped-IN reachability probe over customer/orders/lineitem.
+pub async fn run_dev_q18(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q18",
+		"dev",
+		scale_factor,
+		Q18_DEV_SQL,
+		q18_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 315 - strict q18: identical SQL shape with strict Decimal128 lineitem quantity.
+pub async fn run_strict_q18(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q18",
+		"strict",
+		scale_factor,
+		STRICT_Q18_SQL,
+		q18_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// The two q17 harness tables: `lineitem` and `part`.
 fn q17_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let lineitem = if strict {
@@ -6631,6 +6675,12 @@ fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	]
 }
 
+/// The three q18 harness tables match q03's customer/orders/lineitem family. `o_totalprice` stays deferred
+/// until the grouped-IN plan wall moves far enough for bind to prove the fixture gap.
+fn q18_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	q03_tables(strict, scale_factor)
+}
+
 /// ADR 274 — dev q10: the first 4-table query (`customer`/`orders`/`lineitem`/`nation`). A reachability
 /// attempt — records whichever wall q10 hits first.
 pub async fn run_dev_q10(scale_factor: f64) -> Attempt {
@@ -6978,7 +7028,8 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q07" || *id == "q08"
 					|| *id == "q09" || *id == "q13"
 					|| *id == "q11" || *id == "q15"
-					|| *id == "q16" || *id == "q22"
+					|| *id == "q16" || *id == "q18"
+					|| *id == "q22"
 				{
 					"implemented"
 				} else {
