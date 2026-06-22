@@ -668,9 +668,9 @@ fn q15_executes_with_keyed_supplier_revenue_join() {
 		.expect("q15 thread panicked");
 }
 
-// ADR 314: q11 measures the HAVING scalar-subquery wall before joins or Decimal arithmetic are reached.
+// ADR 320: q11's HAVING scalar recombines; strict now reaches the Decimal x Int arithmetic wall.
 #[test]
-fn q11_blocks_on_having_scalar_subquery() {
+fn q11_moves_past_having_scalar_subquery() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -686,38 +686,42 @@ fn q11_blocks_on_having_scalar_subquery() {
 					"q11 is an implemented capability in the static inventory"
 				);
 
-				for (mode, attempt) in [
-					("dev", run_dev_q11(0.01).await),
-					("strict", run_strict_q11(0.01).await),
-				] {
-					assert_eq!(attempt.query, "q11");
-					assert_eq!(
-						attempt.status,
-						Status::Blocked,
-						"q11 {mode} should measure the HAVING scalar-subquery wall: {}",
-						attempt.human()
-					);
-					assert_eq!(attempt.phase, Phase::Plan, "{}", attempt.human());
-					assert_eq!(
-						attempt.reason.as_deref(),
-						Some("unsupported_having_scalar_subquery"),
-						"q11 {mode} should classify the measured wall precisely: {}",
-						attempt.human()
-					);
-					assert!(
-						attempt.digest.is_none(),
-						"a blocked row carries no digest: {}",
-						attempt.human()
-					);
-					assert!(
-						attempt.is_process_success(true),
-						"a recognized blocked row succeeds under --allow-blocked"
-					);
-					assert!(
-						!attempt.is_process_success(false),
-						"a blocked row still fails without --allow-blocked"
-					);
-				}
+				let dev = run_dev_q11(0.01).await;
+				assert_eq!(dev.query, "q11");
+				assert_eq!(dev.status, Status::Pass, "{}", dev.human());
+				assert_eq!(dev.phase, Phase::Execute, "{}", dev.human());
+				assert!(dev.reason.is_none(), "{}", dev.human());
+				assert!(dev.digest.is_some(), "{}", dev.human());
+				assert!(dev.is_process_success(false));
+
+				let strict = run_strict_q11(0.01).await;
+				assert_eq!(strict.query, "q11");
+				assert_eq!(
+					strict.status,
+					Status::Blocked,
+					"strict q11 should measure the deeper Decimal arithmetic wall: {}",
+					strict.human()
+				);
+				assert_eq!(strict.phase, Phase::Bind, "{}", strict.human());
+				assert_eq!(
+					strict.reason.as_deref(),
+					Some("unsupported_decimal_arithmetic"),
+					"strict q11 should classify the measured wall precisely: {}",
+					strict.human()
+				);
+				assert!(
+					strict.digest.is_none(),
+					"a blocked row carries no digest: {}",
+					strict.human()
+				);
+				assert!(
+					strict.is_process_success(true),
+					"a recognized blocked row succeeds under --allow-blocked"
+				);
+				assert!(
+					!strict.is_process_success(false),
+					"a blocked row still fails without --allow-blocked"
+				);
 			});
 		})
 		.expect("spawn q11 thread")

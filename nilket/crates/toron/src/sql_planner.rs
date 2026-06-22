@@ -3808,15 +3808,9 @@ impl SqlPlanner {
 		// query.
 		let is_aggregate_query =
 			group_keys.is_some() || projection_contains_aggregate_call(projection);
-		// A scalar subquery in a GROUP BY / HAVING (aggregate) query must recombine ABOVE the aggregate,
-		// but the aggregate's group-keyed exchange is not an exchange-free probe input for the broadcast
-		// scalar `Cross` (the broadcast placement requires the probe side carry no terminal exchange).
-		// That recombination is a distinct mechanism — deferred. WHERE scalars are still pulled (they cross
-		// pre-aggregation), but a scalar in HAVING or in an aggregate/grouped projection rejects here.
-		if is_aggregate_query
-			&& (having.as_ref().is_some_and(expr_contains_subquery)
-				|| projection.iter().any(select_item_contains_subquery))
-		{
+		// ADR 320: a HAVING scalar subquery recombines after the aggregate; projection scalars in aggregate
+		// queries still stay fenced because they would need hidden output-shape repair beyond this cut.
+		if is_aggregate_query && projection.iter().any(select_item_contains_subquery) {
 			return Err(unsupported(
 				"scalar subqueries in GROUP BY/HAVING are not supported",
 			));
@@ -3878,6 +3872,28 @@ impl SqlPlanner {
 		} else if let Some(selection) = &effective_selection {
 			plan = self.lower_where(plan, selection, cte)?;
 		}
+
+		let mut owned_having: Option<SqlExpr> = None;
+		let mut having_scalar_subplans = Vec::new();
+		if is_aggregate_query
+			&& let Some(having_expr) = having.as_ref()
+			&& expr_contains_subquery(having_expr)
+		{
+			let outer_qualifiers = plan_qualifiers(&plan);
+			let rewritten = self.pull_up_having_scalar_subqueries(
+				having_expr,
+				&mut having_scalar_subplans,
+				&outer_qualifiers,
+				cte,
+			)?;
+			if expr_contains_subquery(&rewritten) {
+				return Err(unsupported(
+					"scalar subqueries in GROUP BY/HAVING are not supported",
+				));
+			}
+			owned_having = Some(rewritten);
+		}
+		let effective_having = owned_having.as_ref().or(having.as_ref());
 		// 3. Handle SELECT list (Project or Aggregate)
 		if let Some(group_keys) = group_keys {
 			let group_expr = group_keys
@@ -3891,7 +3907,7 @@ impl SqlPlanner {
 				distinct_rewrite,
 			} = self.lower_aggregate_projection(
 				projection,
-				having.as_ref(),
+				effective_having,
 				&group_keys,
 				AggregateSqlMode::Grouped,
 			)?;
@@ -3913,7 +3929,10 @@ impl SqlPlanner {
 					aggr_expr,
 				}
 			};
-			let plan = if let Some(having) = having.as_ref() {
+			let scalar_joined = !having_scalar_subplans.is_empty();
+			let aggregate =
+				self.join_having_scalar_subplans(aggregate, having_scalar_subplans, &catalog)?;
+			let plan = if let Some(having) = effective_having {
 				let predicate = self.lower_having_predicate(having, &catalog)?;
 				LogicalPlan::Filter {
 					input: Box::new(aggregate),
@@ -3923,6 +3942,13 @@ impl SqlPlanner {
 				aggregate
 			};
 			let plan = if let Some(final_projection) = final_projection {
+				LogicalPlan::Project {
+					input: Box::new(plan),
+					exprs: final_projection.exprs,
+					output_names: final_projection.output_names,
+				}
+			} else if scalar_joined {
+				let final_projection = self.aggregate_natural_final_projection(&catalog);
 				LogicalPlan::Project {
 					input: Box::new(plan),
 					exprs: final_projection.exprs,
@@ -3947,7 +3973,7 @@ impl SqlPlanner {
 				distinct_rewrite,
 			} = self.lower_aggregate_projection(
 				projection,
-				having.as_ref(),
+				effective_having,
 				&[],
 				AggregateSqlMode::Global,
 			)?;
@@ -3961,7 +3987,10 @@ impl SqlPlanner {
 					aggr_expr,
 				}
 			};
-			let plan = if let Some(having) = having.as_ref() {
+			let scalar_joined = !having_scalar_subplans.is_empty();
+			let aggregate =
+				self.join_having_scalar_subplans(aggregate, having_scalar_subplans, &catalog)?;
+			let plan = if let Some(having) = effective_having {
 				let predicate = self.lower_having_predicate(having, &catalog)?;
 				LogicalPlan::Filter {
 					input: Box::new(aggregate),
@@ -3971,6 +4000,13 @@ impl SqlPlanner {
 				aggregate
 			};
 			let plan = if let Some(final_projection) = final_projection {
+				LogicalPlan::Project {
+					input: Box::new(plan),
+					exprs: final_projection.exprs,
+					output_names: final_projection.output_names,
+				}
+			} else if scalar_joined {
+				let final_projection = self.aggregate_natural_final_projection(&catalog);
 				LogicalPlan::Project {
 					input: Box::new(plan),
 					exprs: final_projection.exprs,
@@ -4924,6 +4960,92 @@ impl SqlPlanner {
 			output_names,
 			required,
 		})
+	}
+
+	fn aggregate_natural_final_projection(
+		&self,
+		catalog: &AggregateOutputCatalog,
+	) -> FinalProjection {
+		let output_names = catalog.natural_output_names();
+		FinalProjection {
+			exprs: output_names
+				.iter()
+				.map(|name| Expr::column(name.clone()))
+				.collect(),
+			output_names: output_names.into_iter().map(Some).collect(),
+		}
+	}
+
+	fn join_having_scalar_subplans(
+		&self,
+		plan: LogicalPlan,
+		collected: Vec<HavingScalar>,
+		catalog: &AggregateOutputCatalog,
+	) -> Result<LogicalPlan, FrontendError> {
+		if collected.is_empty() {
+			return Ok(plan);
+		}
+		if collected.len() > 1 {
+			return Err(unsupported(
+				"multiple scalar subqueries in HAVING are not supported",
+			));
+		}
+		let HavingScalar {
+			alias,
+			plan: subplan,
+		} = collected.into_iter().next().expect("checked non-empty");
+		let scalar_alias = TableRef::new(alias);
+		let outer_join_key = "__having_scalar_outer_key_0".to_string();
+		let scalar_join_key = "__having_scalar_inner_key_0".to_string();
+		let aggregate_outputs = catalog.natural_output_names();
+		let mut keyed_outer_exprs: Vec<Expr> = aggregate_outputs
+			.iter()
+			.cloned()
+			.map(Expr::column)
+			.collect();
+		keyed_outer_exprs.push(Expr::Literal(ScalarValue::Int32(Some(1))));
+		let mut keyed_outer_names: Vec<Option<String>> =
+			aggregate_outputs.iter().cloned().map(Some).collect();
+		keyed_outer_names.push(Some(outer_join_key.clone()));
+		let keyed_outer = LogicalPlan::Project {
+			input: Box::new(plan),
+			exprs: keyed_outer_exprs,
+			output_names: keyed_outer_names,
+		};
+		let scalar_value_column = SCALAR_SUBQUERY_COLUMN.to_string();
+		let aliased_scalar = LogicalPlan::Alias {
+			input: Box::new(subplan),
+			alias: scalar_alias.clone(),
+			columns: vec![scalar_value_column.clone()],
+		};
+		let keyed_scalar_project = LogicalPlan::Project {
+			input: Box::new(aliased_scalar),
+			exprs: vec![
+				Expr::qualified_column(scalar_alias.clone(), scalar_value_column.clone()),
+				Expr::Literal(ScalarValue::Int32(Some(1))),
+			],
+			output_names: vec![
+				Some(scalar_value_column.clone()),
+				Some(scalar_join_key.clone()),
+			],
+		};
+		let keyed_scalar = LogicalPlan::Alias {
+			input: Box::new(keyed_scalar_project),
+			alias: scalar_alias.clone(),
+			columns: vec![scalar_value_column, scalar_join_key.clone()],
+		};
+		build_join_plan(
+			keyed_outer,
+			keyed_scalar,
+			JoinKind::Inner,
+			vec![(
+				Expr::column(outer_join_key),
+				Expr::qualified_column(scalar_alias, scalar_join_key),
+			)],
+			JoinStrategy::HashPartitioned,
+			JoinStrategyPinSource::Direct,
+			None,
+		)
 	}
 
 	fn rewrite_aggregate_calls_for_projection(
@@ -6052,6 +6174,175 @@ impl SqlPlanner {
 				alias: alias.clone(),
 			}),
 			other => Ok(other.clone()),
+		}
+	}
+
+	fn pull_up_having_scalar_subqueries(
+		&self,
+		expr: &SqlExpr,
+		collected: &mut Vec<HavingScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		match expr {
+			SqlExpr::Subquery(query) => {
+				let alias = format!("__scalar_{}", collected.len());
+				validate_aggregate_scalar_subquery_shape(query, outer_qualifiers)?;
+				let SetExpr::Select(select) = query.body.as_ref() else {
+					return Err(unsupported(
+						"non-aggregate scalar subqueries are not supported",
+					));
+				};
+				let inner_qualifiers = scalar_subquery_inner_qualifiers(select);
+				if select.selection.as_ref().is_some_and(|selection| {
+					sql_expr_references_outer_qualifier(
+						selection,
+						outer_qualifiers,
+						&inner_qualifiers,
+					)
+				}) {
+					return Err(unsupported(
+						"correlated scalar subqueries are not supported",
+					));
+				}
+				let subplan = self.lower_query_scoped(query, cte)?;
+				collected.push(HavingScalar {
+					alias: alias.clone(),
+					plan: subplan,
+				});
+				Ok(scalar_value_reference(&alias))
+			}
+			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
+				self.pull_up_having_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+				left: Box::new(self.pull_up_having_scalar_subqueries(
+					left,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				op: op.clone(),
+				right: Box::new(self.pull_up_having_scalar_subqueries(
+					right,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+				op: *op,
+				expr: Box::new(self.pull_up_having_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
+				self.pull_up_having_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
+				self.pull_up_having_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+			))),
+			SqlExpr::Cast {
+				kind,
+				expr,
+				data_type,
+				array,
+				format,
+			} => Ok(SqlExpr::Cast {
+				kind: kind.clone(),
+				expr: Box::new(self.pull_up_having_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				data_type: data_type.clone(),
+				array: *array,
+				format: format.clone(),
+			}),
+			SqlExpr::Between {
+				expr,
+				negated,
+				low,
+				high,
+			} => Ok(SqlExpr::Between {
+				expr: Box::new(self.pull_up_having_scalar_subqueries(
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				negated: *negated,
+				low: Box::new(self.pull_up_having_scalar_subqueries(
+					low,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+				high: Box::new(self.pull_up_having_scalar_subqueries(
+					high,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?),
+			}),
+			SqlExpr::Case {
+				case_token,
+				end_token,
+				operand,
+				conditions,
+				else_result,
+			} => Ok(SqlExpr::Case {
+				case_token: case_token.clone(),
+				end_token: end_token.clone(),
+				operand: operand
+					.as_ref()
+					.map(|operand| {
+						self.pull_up_having_scalar_subqueries(
+							operand,
+							collected,
+							outer_qualifiers,
+							cte,
+						)
+					})
+					.transpose()?
+					.map(Box::new),
+				conditions: conditions
+					.iter()
+					.map(|case_when| {
+						Ok(CaseWhen {
+							condition: self.pull_up_having_scalar_subqueries(
+								&case_when.condition,
+								collected,
+								outer_qualifiers,
+								cte,
+							)?,
+							result: self.pull_up_having_scalar_subqueries(
+								&case_when.result,
+								collected,
+								outer_qualifiers,
+								cte,
+							)?,
+						})
+					})
+					.collect::<Result<Vec<_>, FrontendError>>()?,
+				else_result: else_result
+					.as_ref()
+					.map(|else_result| {
+						self.pull_up_having_scalar_subqueries(
+							else_result,
+							collected,
+							outer_qualifiers,
+							cte,
+						)
+					})
+					.transpose()?
+					.map(Box::new),
+			}),
+			_ => Ok(expr.clone()),
 		}
 	}
 
@@ -9735,6 +10026,12 @@ fn collect_scope_refs(
 		_ => {}
 	}
 	Ok(())
+}
+
+/// ADR 320: a HAVING scalar gets a post-aggregate recombine shape instead of ADR 257's scalar Cross.
+struct HavingScalar {
+	alias: String,
+	plan: LogicalPlan,
 }
 
 /// ADR 257/260: the column a pulled scalar subquery exposes to the rewritten outer expression

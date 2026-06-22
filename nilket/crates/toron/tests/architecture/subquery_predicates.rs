@@ -294,7 +294,7 @@ pub(crate) fn adr260_aggregate_arg_and_non_aggregate_scalar_stay_deferred() {
 	);
 	assert!(
 		planner.contains("scalar subqueries in GROUP BY/HAVING are not supported"),
-		"a scalar in GROUP BY/HAVING stays deferred (recombine above the aggregate)"
+		"aggregate/grouped-projection scalar subqueries stay deferred"
 	);
 	let tests = source("tests/exists_decorrelation_test.rs");
 	assert!(

@@ -2691,15 +2691,54 @@ async fn scalar_aggregate_subquery_in_where_filters() {
 	);
 }
 
-#[test]
-fn scalar_aggregate_subquery_in_having_filters() {
-	// SCOPED OUT this cut: a scalar subquery in HAVING (or a grouped/aggregate projection) must recombine
-	// ABOVE the aggregate, but the aggregate's group-keyed exchange is not an exchange-free probe input for
-	// the broadcast scalar `Cross` (the broadcast placement requires the probe side carry no terminal
-	// exchange). That above-aggregate recombination is a distinct mechanism — deferred to a follow-on.
-	assert_unsupported_message(
+#[tokio::test]
+async fn scalar_aggregate_subquery_in_having_filters() {
+	// ADR 320: HAVING scalars recombine after the grouped aggregate. The scalar threshold is the single
+	// global regions COUNT (2), so only east's grouped COUNT (3) survives.
+	let plan = plan_sql(
 		"SELECT region, COUNT(*) FROM sales \
 		 GROUP BY region HAVING COUNT(*) > (SELECT COUNT(*) FROM regions)",
+	);
+	let results = run_logical(&plan).await;
+	assert_eq!(row_count(&results), 1);
+	assert_eq!(
+		sorted_utf8_column_rows(&results, 0),
+		vec![Some("east".to_string())]
+	);
+	assert_eq!(scalar_int64_column_rows(&results, 1), vec![Some(3)]);
+	let fields = results[0].schema().fields().clone();
+	assert_eq!(
+		fields.len(),
+		2,
+		"synthetic scalar/key columns must be hidden"
+	);
+	assert!(
+		fields
+			.iter()
+			.all(|field| !field.name().contains("__scalar_")
+				&& !field.name().contains("__having_scalar_")),
+		"visible schema must not leak HAVING scalar internals: {fields:?}"
+	);
+}
+
+#[test]
+fn having_scalar_deferred_shapes_stay_rejected() {
+	assert_unsupported_message(
+		"SELECT region, SUM(amount) FROM sales \
+		 GROUP BY region HAVING SUM(amount) > \
+		   (SELECT amount FROM sales)",
+		"non-aggregate scalar subqueries are not supported",
+	);
+	assert_unsupported_message(
+		"SELECT sales.region, SUM(sales.amount) FROM sales \
+		 GROUP BY sales.region HAVING SUM(sales.amount) > \
+		   (SELECT SUM(other.amount) FROM sales AS other WHERE other.region = sales.region)",
+		"correlated scalar subqueries are not supported",
+	);
+	assert_unsupported_message(
+		"SELECT region, SUM(amount), \
+		        (SELECT SUM(amount) FROM sales WHERE region = 'west') \
+		 FROM sales GROUP BY region",
 		"scalar subqueries in GROUP BY/HAVING are not supported",
 	);
 }

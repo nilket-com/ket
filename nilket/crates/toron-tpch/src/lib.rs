@@ -6365,7 +6365,7 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 314 - dev q11: partsupp/supplier/nation reachability with a HAVING scalar threshold.
+/// ADR 320 - dev q11: HAVING scalar threshold recombines and reaches execute.
 pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q11",
@@ -6377,7 +6377,7 @@ pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 314 - strict q11: identical SQL shape; strict mode carries official Decimal128 partsupp supply cost.
+/// ADR 320 - strict q11: identical SQL shape; currently walls at Decimal x Int arithmetic.
 pub async fn run_strict_q11(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q11",

@@ -4,8 +4,8 @@
 //! facts: the binder broadcasts a one-side-scalar (`row_upper_bound <= 1`) `Cross` via
 //! `ScalarBroadcastCross` (the both-scalar `ScalarLocalCross` path is unchanged); the frontend pulls a
 //! scalar `SqlExpr::Subquery` up into a keyless `Cross` + a column reference (frontend-only, reusing the
-//! `Cross`/broadcast executor — no new execution op); and the non-aggregate / correlated / GROUP-BY-HAVING
-//! scalar boundaries stay deferred.
+//! `Cross`/broadcast executor — no new execution op). ADR 320 adds a separate post-aggregate HAVING
+//! scalar recombine; non-aggregate / correlated / aggregate-projection scalar boundaries stay deferred.
 
 use super::support::*;
 
@@ -139,7 +139,34 @@ pub(crate) fn adr257_non_aggregate_and_correlated_scalar_stay_deferred() {
 	let behavior = source("tests/group_by_test.rs");
 	assert!(
 		behavior.contains("non_aggregate_and_correlated_scalar_subqueries_stay_rejected")
-			&& behavior.contains("scalar_aggregate_subquery_in_having_filters"),
+			&& behavior.contains("having_scalar_deferred_shapes_stay_rejected"),
 		"the deferred-boundary behavior gates must exist"
+	);
+}
+
+#[test]
+pub(crate) fn adr320_having_scalar_recombines_post_aggregate() {
+	let planner = source("src/sql_planner.rs");
+	assert!(
+		planner.contains("fn pull_up_having_scalar_subqueries")
+			&& planner.contains("fn join_having_scalar_subplans"),
+		"HAVING scalar collection and recombine must stay explicit in the planner"
+	);
+	let recombine = source_block(&planner, "fn join_having_scalar_subplans");
+	assert!(
+		recombine.contains("JoinKind::Inner")
+			&& recombine.contains("JoinStrategy::HashPartitioned")
+			&& recombine.contains("__having_scalar_outer_key_0")
+			&& recombine.contains("__having_scalar_inner_key_0"),
+		"HAVING scalar recombine must use side-specific synthetic keys on a hash join: {recombine}"
+	);
+	assert!(
+		recombine.contains("multiple scalar subqueries in HAVING are not supported"),
+		"the ADR 320 vertical slice must stay limited to one HAVING scalar"
+	);
+	let behavior = source("tests/group_by_test.rs");
+	assert!(
+		behavior.contains("scalar_aggregate_subquery_in_having_filters"),
+		"the positive HAVING scalar behavior gate must exist"
 	);
 }
