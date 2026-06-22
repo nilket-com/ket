@@ -5561,12 +5561,7 @@ impl SqlPlanner {
 		let mut inner_residuals = Vec::new();
 		let mut correlation_pairs = Vec::new();
 		let use_filtering_pipeline = select.selection.as_ref().is_some_and(|selection| {
-			context == "IN"
-				&& !membership_selection_references_outer(
-					selection,
-					outer_qualifiers,
-					&inner_qualifiers,
-				)
+			!membership_selection_references_outer(selection, outer_qualifiers, &inner_qualifiers)
 		});
 		if use_filtering_pipeline {
 			inner_plan = self.lower_filtering_body(inner_plan, select.selection.as_ref(), cte)?;

@@ -1,13 +1,17 @@
 //! ADR 261/262 behavioral gates for the TPC-H reachability harness.
 
+use std::collections::{HashMap, HashSet};
+
+use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
+
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1,
-	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
-	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13, run_strict_q14,
-	run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22,
+	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
+	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13,
+	run_strict_q14, run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -601,6 +605,115 @@ fn q13_executes_in_both_modes_at_default_scale() {
 		.expect("spawn q13 thread")
 		.join()
 		.expect("q13 thread panicked");
+}
+
+fn q16_supplier_comment_excluded(comment: &str) -> bool {
+	comment
+		.find("Customer")
+		.is_some_and(|idx| comment[idx + "Customer".len()..].contains("Complaints"))
+}
+
+#[test]
+fn q16_default_fixture_is_nonempty_but_anti_join_is_not_live() {
+	let scale_factor = 0.01;
+	let sizes = HashSet::from([49, 14, 23, 45, 19, 3, 36, 9]);
+	let parts: HashMap<i64, (String, String, i32)> = PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter_map(|part| {
+			let brand = part.p_brand.to_string();
+			let part_type = part.p_type.to_string();
+			if brand == "Brand#45"
+				|| part_type.starts_with("MEDIUM POLISHED")
+				|| !sizes.contains(&part.p_size)
+			{
+				return None;
+			}
+			Some((part.p_partkey, (brand, part_type, part.p_size)))
+		})
+		.collect();
+	let excluded_suppliers: HashSet<i64> = SupplierGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|supplier| q16_supplier_comment_excluded(&supplier.s_comment))
+		.map(|supplier| supplier.s_suppkey)
+		.collect();
+	assert!(
+		excluded_suppliers.is_empty(),
+		"q16's default fixture does not exercise the NOT IN exclusion branch; the correctness oracle must use a larger scale or synthetic"
+	);
+
+	let mut groups: HashMap<(String, String, i32), HashSet<i64>> = HashMap::new();
+	for partsupp in PartSuppGenerator::new(scale_factor, 1, 1).iter() {
+		if excluded_suppliers.contains(&partsupp.ps_suppkey) {
+			continue;
+		}
+		let Some(group_key) = parts.get(&partsupp.ps_partkey) else {
+			continue;
+		};
+		groups
+			.entry(group_key.clone())
+			.or_default()
+			.insert(partsupp.ps_suppkey);
+	}
+	assert!(
+		groups.values().any(|suppliers| !suppliers.is_empty()),
+		"q16 default fixture should produce at least one result group"
+	);
+}
+
+// ADR 310: q16 composes DISTINCT aggregation with an uncorrelated NOT IN anti-join.
+#[test]
+fn q16_executes_in_both_modes_at_tiny_scale() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q16 dev=implemented strict=implemented"),
+					"q16 is an implemented capability in the static inventory"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q16(0.0001).await),
+					("strict", run_strict_q16(0.0001).await),
+				] {
+					assert_eq!(attempt.query, "q16");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q16 {mode} should reach execute: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.phase,
+						Phase::Execute,
+						"q16 {mode}: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.digest.as_deref(),
+						Some(
+							"ArrowIpcDigest([11, 131, 186, 222, 220, 230, 55, 14, 13, 119, 182, 8, 125, 144, 17, 27, 122, 90, 109, 138, 119, 159, 236, 203, 211, 161, 87, 98, 116, 195, 227, 178])"
+						),
+						"q16 {mode}: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.reason.is_none(),
+						"a pass carries no blocker reason: {}",
+						attempt.human()
+					);
+				}
+			});
+		})
+		.expect("spawn q16 thread")
+		.join()
+		.expect("q16 thread panicked");
 }
 
 // ADR 282 resolved q17's unqualified correlated scalar. ADR 283 clears the strict Decimal operand-alignment

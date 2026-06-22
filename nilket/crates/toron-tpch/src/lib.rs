@@ -210,6 +210,25 @@ pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 /// strict q13 - identical SQL shape; q13 has no strict-only decimal surface.
 pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
 
+/// ADR 310 - tpch.q16 (Parts/Supplier Relationship): official-shaped q16 with `:1` -> `Brand#45`,
+/// `:2` -> `MEDIUM POLISHED`, `:3` -> `(49, 14, 23, 45, 19, 3, 36, 9)`, and no LIMIT.
+pub const Q16_DEV_SQL: &str = "SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt \
+	FROM partsupp, part \
+	WHERE p_partkey = ps_partkey \
+	  AND p_brand <> 'Brand#45' \
+	  AND p_type NOT LIKE 'MEDIUM POLISHED%' \
+	  AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9) \
+	  AND ps_suppkey NOT IN ( \
+	    SELECT s_suppkey \
+	    FROM supplier \
+	    WHERE s_comment LIKE '%Customer%Complaints%' \
+	  ) \
+	GROUP BY p_brand, p_type, p_size \
+	ORDER BY supplier_cnt DESC, p_brand, p_type, p_size";
+
+/// strict q16 - identical SQL shape; q16 projects no Decimal values.
+pub const STRICT_Q16_SQL: &str = Q16_DEV_SQL;
+
 /// ADR 304/305 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes
 /// inlined and no LIMIT. ADR 305's SUBSTRING support makes this a reachability pass in both modes.
 pub const Q22_DEV_SQL: &str = "SELECT cntrycode, COUNT(*) AS numcust, SUM(c_acctbal) AS totacctbal \
@@ -5758,6 +5777,30 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 310 - dev q16: parts/supplier relationship reachability over part + partsupp + supplier.
+pub async fn run_dev_q16(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q16",
+		"dev",
+		scale_factor,
+		Q16_DEV_SQL,
+		q16_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 310 - strict q16: identical SQL shape; strict-only Decimal columns are not projected.
+pub async fn run_strict_q16(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q16",
+		"strict",
+		scale_factor,
+		STRICT_Q16_SQL,
+		q16_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// ADR 304/305 - dev q22: customer + orders reachability probe for SQL SUBSTRING.
 pub async fn run_dev_q22(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -5846,6 +5889,36 @@ fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: orders_descriptor(orders_schema().as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
+		},
+	]
+}
+
+/// The three q16 harness tables: `part`, `partsupp`, and `supplier`.
+fn q16_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let part = generate_part(scale_factor);
+	let partsupp = generate_partsupp(strict, scale_factor);
+	let supplier = generate_supplier(strict, scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "part",
+			descriptor: part_descriptor(part_schema().as_ref()),
+			facts: facts_for_batch(&part),
+			batch: part,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "partsupp",
+			descriptor: partsupp_descriptor(partsupp_schema(strict).as_ref()),
+			facts: facts_for_batch(&partsupp),
+			batch: partsupp,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
 		},
 	]
 }
@@ -6337,7 +6410,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
 					|| *id == "q09" || *id == "q13"
-					|| *id == "q22"
+					|| *id == "q16" || *id == "q22"
 				{
 					"implemented"
 				} else {
