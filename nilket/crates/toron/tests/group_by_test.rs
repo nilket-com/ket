@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+	Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
@@ -1341,6 +1343,8 @@ async fn select_distinct_star_groups_all_visible_columns() {
 			"score",
 			"rating32",
 			"zero64",
+			"decimal_price",
+			"decimal_wide",
 		]
 	);
 
@@ -3601,6 +3605,135 @@ async fn arithmetic_bind_injects_only_widening_casts() {
 }
 
 #[tokio::test]
+async fn decimal_multiply_coerces_non_literal_integer_operands() {
+	let (catalog, storage) = fixture();
+	let logical = plan_sql(
+		"SELECT \
+		   decimal_price * amount, \
+		   decimal_price * id, \
+		   amount * decimal_price, \
+		   decimal_price * (amount + 1), \
+		   decimal_price * 2 \
+		 FROM sales",
+	);
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Decimal x Int multiply");
+	assert_eq!(
+		bound.schema().field(0).data_type(),
+		&DataType::Decimal128(26, 2)
+	);
+	assert_eq!(
+		bound.schema().field(1).data_type(),
+		&DataType::Decimal128(35, 2)
+	);
+	assert_eq!(
+		bound.schema().field(2).data_type(),
+		&DataType::Decimal128(26, 2)
+	);
+	assert_eq!(
+		bound.schema().field(3).data_type(),
+		&DataType::Decimal128(26, 2)
+	);
+	assert_eq!(
+		bound.schema().field(4).data_type(),
+		&DataType::Decimal128(31, 4),
+		"Decimal x Int literal remains ADR 266's literal path"
+	);
+	let wide = bind(
+		&plan_sql("SELECT decimal_wide * id FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind wide Decimal x Int64 multiply");
+	assert_eq!(
+		wide.schema().field(0).data_type(),
+		&DataType::Decimal128(38, 2),
+		"wide Decimal x Int64 keeps the existing Decimal mul precision cap at bind"
+	);
+
+	let ExecutionPlan::Project { exprs, .. } = &bound else {
+		panic!("expected project");
+	};
+	assert_mul_with_casted_right(
+		exprs,
+		0,
+		DataType::Decimal128(10, 0),
+		"decimal_price",
+		"amount",
+	);
+	assert_mul_with_casted_left(
+		exprs,
+		2,
+		DataType::Decimal128(10, 0),
+		"amount",
+		"decimal_price",
+	);
+	assert_mul_with_casted_right_expr(exprs, 3, DataType::Decimal128(10, 0));
+
+	let results = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute Decimal x Int multiply");
+	assert_eq!(
+		scalar_decimal128_column_rows(&results, 0),
+		vec![
+			Some(12_340),
+			Some(-10_000),
+			None,
+			Some(30_000),
+			None,
+			Some(1_750),
+		]
+	);
+	assert_eq!(
+		scalar_decimal128_column_rows(&results, 1),
+		vec![
+			Some(1_234),
+			Some(-1_000),
+			None,
+			Some(4_000),
+			Some(49_995),
+			Some(1_500),
+		]
+	);
+	assert_eq!(
+		scalar_decimal128_column_rows(&results, 2),
+		vec![
+			Some(12_340),
+			Some(-10_000),
+			None,
+			Some(30_000),
+			None,
+			Some(1_750),
+		]
+	);
+	assert_eq!(
+		scalar_decimal128_column_rows(&results, 3),
+		vec![
+			Some(13_574),
+			Some(-10_500),
+			None,
+			Some(31_000),
+			None,
+			Some(2_000),
+		]
+	);
+	assert_eq!(
+		scalar_decimal128_column_rows(&results, 4),
+		vec![
+			Some(246_800),
+			Some(-100_000),
+			None,
+			Some(200_000),
+			Some(1_999_800),
+			Some(50_000),
+		]
+	);
+}
+
+#[tokio::test]
 async fn integer_arithmetic_overflow_is_a_kernel_error() {
 	let (catalog, storage) = fixture();
 	let bound = bind(
@@ -5405,6 +5538,25 @@ fn scalar_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<O
 	rows
 }
 
+fn scalar_decimal128_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i128>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("Decimal128 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows
+}
+
 fn sorted_int32_optional_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i32>> {
 	let mut rows = scalar_int32_column_rows(results, column_idx);
 	rows.sort();
@@ -6297,6 +6449,92 @@ fn assert_add_with_casted_left(
 	);
 }
 
+fn assert_mul_with_casted_right(
+	program: &BoundExprProgram,
+	root_index: usize,
+	right_cast_type: DataType,
+	left_column_name: &str,
+	right_column_name: &str,
+) {
+	let root = program.roots[root_index];
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Mul,
+		left,
+		right,
+	} = program.node(root).expect("mul root")
+	else {
+		panic!("expected Mul root, got {:?}", program.node(root));
+	};
+	assert_column_node(program, *left, left_column_name, None, None);
+	let BoundExprNode::Cast { input, target } = program.node(*right).expect("right cast") else {
+		panic!(
+			"expected casted right child, got {:?}",
+			program.node(*right)
+		);
+	};
+	assert_eq!(target, &right_cast_type);
+	assert_column_node(program, *input, right_column_name, None, None);
+}
+
+fn assert_mul_with_casted_left(
+	program: &BoundExprProgram,
+	root_index: usize,
+	left_cast_type: DataType,
+	left_column_name: &str,
+	right_column_name: &str,
+) {
+	let root = program.roots[root_index];
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Mul,
+		left,
+		right,
+	} = program.node(root).expect("mul root")
+	else {
+		panic!("expected Mul root, got {:?}", program.node(root));
+	};
+	let BoundExprNode::Cast { input, target } = program.node(*left).expect("left cast") else {
+		panic!("expected casted left child, got {:?}", program.node(*left));
+	};
+	assert_eq!(target, &left_cast_type);
+	assert_column_node(program, *input, left_column_name, None, None);
+	assert_column_node(program, *right, right_column_name, None, None);
+}
+
+fn assert_mul_with_casted_right_expr(
+	program: &BoundExprProgram,
+	root_index: usize,
+	right_cast_type: DataType,
+) {
+	let root = program.roots[root_index];
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Mul,
+		left,
+		right,
+	} = program.node(root).expect("mul root")
+	else {
+		panic!("expected Mul root, got {:?}", program.node(root));
+	};
+	assert_column_node(program, *left, "decimal_price", None, None);
+	let BoundExprNode::Cast { input, target } = program.node(*right).expect("right cast") else {
+		panic!(
+			"expected casted right child, got {:?}",
+			program.node(*right)
+		);
+	};
+	assert_eq!(target, &right_cast_type);
+	assert!(
+		matches!(
+			program.node(*input),
+			Some(BoundExprNode::Binary {
+				op: BoundBinaryOp::Add,
+				..
+			})
+		),
+		"computed Int expression must be cast as a whole, got {:?}",
+		program.node(*input)
+	);
+}
+
 fn assert_cast_root(
 	program: &BoundExprProgram,
 	root_index: usize,
@@ -6416,6 +6654,8 @@ fn sales_schema() -> SchemaRef {
 		Field::new("score", DataType::Float64, true),
 		Field::new("rating32", DataType::Float32, true),
 		Field::new("zero64", DataType::Float64, true),
+		Field::new("decimal_price", DataType::Decimal128(15, 2), true),
+		Field::new("decimal_wide", DataType::Decimal128(25, 2), true),
 	]))
 }
 
@@ -6502,6 +6742,30 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 				None,
 				Some(-0.0),
 			])),
+			Arc::new(
+				Decimal128Array::from(vec![
+					Some(1_234_i128),
+					Some(-500),
+					None,
+					Some(1_000),
+					Some(9_999),
+					Some(250),
+				])
+				.with_precision_and_scale(15, 2)
+				.expect("decimal_price column"),
+			),
+			Arc::new(
+				Decimal128Array::from(vec![
+					Some(123_456_789_012_345_i128),
+					Some(-222_222_222_222_222),
+					None,
+					Some(1_000_000_000_000),
+					Some(99_999_999_999_999),
+					Some(42),
+				])
+				.with_precision_and_scale(25, 2)
+				.expect("decimal_wide column"),
+			),
 		],
 	)
 	.expect("sales batch")
@@ -6520,6 +6784,16 @@ fn empty_sales_batch(schema: SchemaRef) -> RecordBatch {
 			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
 			Arc::new(Float32Array::from(Vec::<Option<f32>>::new())),
 			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
+			Arc::new(
+				Decimal128Array::from(Vec::<Option<i128>>::new())
+					.with_precision_and_scale(15, 2)
+					.expect("empty decimal_price column"),
+			),
+			Arc::new(
+				Decimal128Array::from(Vec::<Option<i128>>::new())
+					.with_precision_and_scale(25, 2)
+					.expect("empty decimal_wide column"),
+			),
 		],
 	)
 	.expect("empty sales batch")

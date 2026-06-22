@@ -668,9 +668,10 @@ fn q15_executes_with_keyed_supplier_revenue_join() {
 		.expect("q15 thread panicked");
 }
 
-// ADR 320: q11's HAVING scalar recombines; strict now reaches the Decimal x Int arithmetic wall.
+// ADR 321: q11's Decimal x Int multiply aligns, so both modes reach execute. This is reachability only:
+// q11 correctness still owes the `* 0.0001` Decimal-literal scale policy.
 #[test]
-fn q11_moves_past_having_scalar_subquery() {
+fn q11_executes_in_both_modes() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -686,42 +687,42 @@ fn q11_moves_past_having_scalar_subquery() {
 					"q11 is an implemented capability in the static inventory"
 				);
 
-				let dev = run_dev_q11(0.01).await;
-				assert_eq!(dev.query, "q11");
-				assert_eq!(dev.status, Status::Pass, "{}", dev.human());
-				assert_eq!(dev.phase, Phase::Execute, "{}", dev.human());
-				assert!(dev.reason.is_none(), "{}", dev.human());
-				assert!(dev.digest.is_some(), "{}", dev.human());
-				assert!(dev.is_process_success(false));
-
-				let strict = run_strict_q11(0.01).await;
-				assert_eq!(strict.query, "q11");
-				assert_eq!(
-					strict.status,
-					Status::Blocked,
-					"strict q11 should measure the deeper Decimal arithmetic wall: {}",
-					strict.human()
-				);
-				assert_eq!(strict.phase, Phase::Bind, "{}", strict.human());
-				assert_eq!(
-					strict.reason.as_deref(),
-					Some("unsupported_decimal_arithmetic"),
-					"strict q11 should classify the measured wall precisely: {}",
-					strict.human()
-				);
-				assert!(
-					strict.digest.is_none(),
-					"a blocked row carries no digest: {}",
-					strict.human()
-				);
-				assert!(
-					strict.is_process_success(true),
-					"a recognized blocked row succeeds under --allow-blocked"
-				);
-				assert!(
-					!strict.is_process_success(false),
-					"a blocked row still fails without --allow-blocked"
-				);
+				for (mode, attempt, expected_digest) in [
+					(
+						"dev",
+						run_dev_q11(0.01).await,
+						"ArrowIpcDigest([141, 153, 28, 87, 121, 125, 41, 87, 196, 108, 66, 183, 246, 64, 251, 53, 224, 42, 106, 104, 72, 158, 212, 10, 31, 9, 27, 35, 250, 79, 117, 208])",
+					),
+					(
+						"strict",
+						run_strict_q11(0.01).await,
+						"ArrowIpcDigest([143, 195, 243, 21, 27, 76, 161, 92, 136, 153, 5, 19, 83, 58, 186, 163, 4, 175, 4, 84, 244, 41, 132, 69, 2, 4, 38, 48, 199, 46, 87, 182])",
+					),
+				] {
+					assert_eq!(attempt.query, "q11");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q11 {mode} should reach execute: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Execute, "{}", attempt.human());
+					assert_eq!(
+						attempt.digest.as_deref(),
+						Some(expected_digest),
+						"q11 {mode}: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.reason.is_none(),
+						"a pass carries no blocker reason: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(false),
+						"pass rows are successful without --allow-blocked"
+					);
+				}
 			});
 		})
 		.expect("spawn q11 thread")

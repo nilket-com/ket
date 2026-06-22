@@ -6365,7 +6365,7 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 320 - dev q11: HAVING scalar threshold recombines and reaches execute.
+/// ADR 320/321 - dev q11: HAVING scalar threshold recombines and reaches execute.
 pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q11",
@@ -6377,7 +6377,7 @@ pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 320 - strict q11: identical SQL shape; currently walls at Decimal x Int arithmetic.
+/// ADR 321 - strict q11: Decimal x Int multiply aligns, so strict reaches execute (reach, not correctness).
 pub async fn run_strict_q11(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q11",

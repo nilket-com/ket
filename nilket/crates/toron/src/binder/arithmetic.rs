@@ -1148,6 +1148,11 @@ pub(super) fn bind_arithmetic(
 	{
 		return Ok(output);
 	}
+	let (left, right, left_type, right_type) = if op == BoundBinaryOp::Mul {
+		reconcile_decimal_integer_multiply(builder, left, right, left_type, right_type)
+	} else {
+		(left, right, left_type, right_type)
+	};
 	// ADR 263: Decimal128 * Decimal128 -> Decimal128(p1+p2+1, s1+s2) (the SQL mul rule). Operands keep
 	// their own (p,s); the executor routes to Arrow `numeric::mul`, which widens.
 	if op == BoundBinaryOp::Mul
@@ -1202,6 +1207,38 @@ pub(super) fn bind_arithmetic(
 	let left = cast_if_needed(builder, left, &output_type)?;
 	let right = cast_if_needed(builder, right, &output_type)?;
 	Ok(builder.append_binary(op, left, right, output_type))
+}
+
+fn reconcile_decimal_integer_multiply(
+	builder: &mut BoundExprProgramBuilder,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: DataType,
+	right_type: DataType,
+) -> (BoundExprId, BoundExprId, DataType, DataType) {
+	if matches!(left_type, DataType::Decimal128(_, _))
+		&& builder.literal(right).is_none()
+		&& let Some(target) = integer_as_decimal_type(&right_type)
+	{
+		let right = builder.append_cast(right, target.clone(), target.clone());
+		return (left, right, left_type, target);
+	}
+	if matches!(right_type, DataType::Decimal128(_, _))
+		&& builder.literal(left).is_none()
+		&& let Some(target) = integer_as_decimal_type(&left_type)
+	{
+		let left = builder.append_cast(left, target.clone(), target.clone());
+		return (left, right, target, right_type);
+	}
+	(left, right, left_type, right_type)
+}
+
+fn integer_as_decimal_type(data_type: &DataType) -> Option<DataType> {
+	match data_type {
+		DataType::Int32 => Some(DataType::Decimal128(10, 0)),
+		DataType::Int64 => Some(DataType::Decimal128(19, 0)),
+		_ => None,
+	}
 }
 
 /// ADR 266: coerce an Int/Float literal operand to the other operand's `Decimal128(p,s)` (rewrite in
