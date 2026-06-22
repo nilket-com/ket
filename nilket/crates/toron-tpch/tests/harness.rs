@@ -610,10 +610,9 @@ fn q13_executes_in_both_modes_at_default_scale() {
 		.expect("q13 thread panicked");
 }
 
-// ADR 313: q15 currently walls at the keyless CROSS JOIN admission guard, so the row is
-// a recognized blocker rather than a pass.
+// ADR 318: q15's supplier/revenue comma equality must key even though `revenue` is an aggregate CTE.
 #[test]
-fn q15_blocks_on_keyless_cross_join() {
+fn q15_executes_with_keyed_supplier_revenue_join() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -628,20 +627,12 @@ fn q15_blocks_on_keyless_cross_join() {
 						.any(|row| row == "q15 dev=implemented strict=implemented"),
 					"q15 is an implemented capability in the static inventory"
 				);
-				let dev_keying = q15_supplier_revenue_join_is_keyed(false, 0.01)
+				q15_supplier_revenue_join_is_keyed(false, 0.01)
 					.await
-					.expect_err("dev q15 has not keyed the supplier/revenue join yet");
-				assert!(
-					dev_keying.contains("CROSS JOIN requires a broadcast-eligible build side"),
-					"q15 dev wall stays the keyless CROSS JOIN guard: {dev_keying}"
-				);
-				let strict_keying = q15_supplier_revenue_join_is_keyed(true, 0.01)
+					.expect("dev q15 supplier/revenue join is keyed");
+				q15_supplier_revenue_join_is_keyed(true, 0.01)
 					.await
-					.expect_err("strict q15 has not keyed the supplier/revenue join yet");
-				assert!(
-					strict_keying.contains("CROSS JOIN requires a broadcast-eligible build side"),
-					"q15 strict wall stays the keyless CROSS JOIN guard: {strict_keying}"
-				);
+					.expect("strict q15 supplier/revenue join is keyed");
 
 				for (mode, attempt) in [
 					("dev", run_dev_q15(0.01).await),
@@ -650,29 +641,24 @@ fn q15_blocks_on_keyless_cross_join() {
 					assert_eq!(attempt.query, "q15");
 					assert_eq!(
 						attempt.status,
-						Status::Blocked,
-						"q15 {mode} should be a recognized blocked row: {}",
+						Status::Pass,
+						"q15 {mode} should execute once the supplier/revenue join is keyed: {}",
 						attempt.human()
 					);
-					assert_eq!(attempt.phase, Phase::Bind, "{}", attempt.human());
-					assert_eq!(
-						attempt.reason.as_deref(),
-						Some("unsupported_cross_join"),
-						"q15 {mode} should classify the measured wall precisely: {}",
-						attempt.human()
-					);
+					assert_eq!(attempt.phase, Phase::Execute, "{}", attempt.human());
+					assert!(attempt.reason.is_none(), "{}", attempt.human());
 					assert!(
-						attempt.digest.is_none(),
-						"a blocked row carries no digest: {}",
+						attempt.digest.is_some(),
+						"a passing row carries a digest: {}",
 						attempt.human()
 					);
 					assert!(
 						attempt.is_process_success(true),
-						"a recognized blocked row succeeds under --allow-blocked"
+						"pass rows are successful under --allow-blocked"
 					);
 					assert!(
-						!attempt.is_process_success(false),
-						"a blocked row still fails without --allow-blocked"
+						attempt.is_process_success(false),
+						"pass rows are successful without --allow-blocked"
 					);
 				}
 			});

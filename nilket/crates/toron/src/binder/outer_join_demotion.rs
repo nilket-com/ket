@@ -944,6 +944,26 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Sort { input, .. }
 				| LogicalPlan::Window { input, .. }
 				| LogicalPlan::Take { input, .. } => self.logical_scope_for_outer_demotion(input).await,
+				LogicalPlan::Project {
+					input,
+					exprs,
+					output_names,
+				} => {
+					let Some(input) = self.logical_scope_for_outer_demotion(input).await? else {
+						return Ok(None);
+					};
+					Ok(Some(input.logical_project_passthrough(exprs, output_names)))
+				}
+				LogicalPlan::Aggregate {
+					input,
+					group_expr,
+					aggr_expr,
+				} => {
+					let Some(input) = self.logical_scope_for_outer_demotion(input).await? else {
+						return Ok(None);
+					};
+					Ok(Some(input.logical_aggregate_group_keys(group_expr, aggr_expr)))
+				}
 				LogicalPlan::Union { .. } | LogicalPlan::SetOpAll { .. } => Ok(None),
 				LogicalPlan::Join {
 					left, right, kind, ..
@@ -968,8 +988,6 @@ impl<'a> Binder<'a> {
 				// outer-demotion column routing (sealed local node); its self-reference is a leaf.
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
-				| LogicalPlan::Project { .. }
-				| LogicalPlan::Aggregate { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
 				| LogicalPlan::CreateTable { .. }

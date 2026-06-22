@@ -221,6 +221,54 @@ impl RelationScope {
 		}
 	}
 
+	pub(super) fn logical_project_passthrough(
+		&self,
+		exprs: &[Expr],
+		output_names: &[Option<String>],
+	) -> Self {
+		let mut fields = Vec::with_capacity(exprs.len());
+		let mut entries = Vec::new();
+		for (output_idx, expr) in exprs.iter().enumerate() {
+			let output_name = output_names
+				.get(output_idx)
+				.and_then(|name| name.clone())
+				.unwrap_or_else(|| logical_expr_output_name(expr, output_idx));
+			let output_ordinal =
+				ColumnOrdinal(u32::try_from(output_idx).expect("column ordinal overflow"));
+			let passthrough_column = match expr {
+				Expr::Column(column_ref) => self
+					.resolve_join_column(column_ref, "project input")
+					.ok()
+					.flatten(),
+				_ => None,
+			};
+			let (data_type, nullable) = passthrough_column
+				.as_ref()
+				.map(|column| (column.column.data_type.clone(), column.column.nullable))
+				.unwrap_or((DataType::Null, true));
+			fields.push(Field::new(output_name.clone(), data_type, nullable));
+			if let Some(column) = passthrough_column {
+				for entry in self
+					.entries
+					.iter()
+					.filter(|entry| entry.ordinal == column.column.ordinal)
+				{
+					entries.push(RelationScopeEntry {
+						qualifier: entry.qualifier.clone(),
+						column: output_name.clone(),
+						ordinal: output_ordinal,
+						source_id: entry.source_id,
+					});
+				}
+			}
+		}
+		Self {
+			schema: Arc::new(Schema::new(fields)),
+			entries,
+			next_source_id: self.next_source_id,
+		}
+	}
+
 	pub(super) fn aggregate(
 		&self,
 		group_expr: &BoundExprProgram,
@@ -249,6 +297,55 @@ impl RelationScope {
 		}
 		Self {
 			schema: output_schema.clone(),
+			entries,
+			next_source_id: self.next_source_id,
+		}
+	}
+
+	pub(super) fn logical_aggregate_group_keys(
+		&self,
+		group_expr: &[Expr],
+		aggr_expr: &[(AggregateFunction, Vec<Expr>)],
+	) -> Self {
+		let mut fields = Vec::with_capacity(group_expr.len() + aggr_expr.len());
+		let mut entries = Vec::new();
+		for (output_idx, expr) in group_expr.iter().enumerate() {
+			let output_name = logical_expr_output_name(expr, output_idx);
+			let output_ordinal =
+				ColumnOrdinal(u32::try_from(output_idx).expect("column ordinal overflow"));
+			let passthrough_column = match expr {
+				Expr::Column(column_ref) => self
+					.resolve_join_column(column_ref, "aggregate input")
+					.ok()
+					.flatten(),
+				_ => None,
+			};
+			let (data_type, nullable) = passthrough_column
+				.as_ref()
+				.map(|column| (column.column.data_type.clone(), column.column.nullable))
+				.unwrap_or((DataType::Null, true));
+			fields.push(Field::new(output_name.clone(), data_type, nullable));
+			if let Some(column) = passthrough_column {
+				for entry in self
+					.entries
+					.iter()
+					.filter(|entry| entry.ordinal == column.column.ordinal)
+				{
+					entries.push(RelationScopeEntry {
+						qualifier: entry.qualifier.clone(),
+						column: output_name.clone(),
+						ordinal: output_ordinal,
+						source_id: entry.source_id,
+					});
+				}
+			}
+		}
+		let agg_names = logical_aggregate_output_names(aggr_expr);
+		for name in agg_names {
+			fields.push(Field::new(name, DataType::Null, true));
+		}
+		Self {
+			schema: Arc::new(Schema::new(fields)),
 			entries,
 			next_source_id: self.next_source_id,
 		}
@@ -362,6 +459,46 @@ impl RelationScope {
 			None
 		}
 	}
+}
+
+fn logical_expr_output_name(expr: &Expr, index: usize) -> String {
+	match expr {
+		Expr::Column(column_ref) => column_ref.name.0.clone(),
+		_ => format!("col_{index}"),
+	}
+}
+
+fn logical_aggregate_output_names(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<String> {
+	let mut names = aggr_expr
+		.iter()
+		.map(|(function, _)| {
+			aggregate_kernel::stable_spec_for_function(function)
+				.map(|spec| spec.output_name)
+				.unwrap_or_else(|| match function {
+					AggregateFunction::LinearRegress => "linreg",
+					AggregateFunction::ApproxQuantile(_) => "quantile",
+					AggregateFunction::CountAll
+					| AggregateFunction::Count
+					| AggregateFunction::Sum
+					| AggregateFunction::Min
+					| AggregateFunction::Max
+					| AggregateFunction::Avg => {
+						unreachable!("stable aggregate metadata missing")
+					}
+				})
+				.to_string()
+		})
+		.collect::<Vec<_>>();
+	let mut counts = HashMap::new();
+	for name in &names {
+		*counts.entry(name.clone()).or_insert(0usize) += 1;
+	}
+	for (index, name) in names.iter_mut().enumerate() {
+		if counts.get(name).copied().unwrap_or(0) > 1 {
+			*name = format!("__agg_{index}");
+		}
+	}
+	names
 }
 
 pub(super) fn resolve_qualified_column(

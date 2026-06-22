@@ -4450,6 +4450,44 @@ async fn sql_broadcast_hint_targets_derived_alias() {
 }
 
 #[tokio::test]
+async fn comma_join_keys_projected_aggregate_cte_group_key() {
+	let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, None);
+	let logical = SqlPlanner::new()
+		.plan(
+			"WITH revenue AS ( \
+			   SELECT customer_id AS supplier_no, SUM(id) AS total_revenue \
+			   FROM orders \
+			   GROUP BY customer_id \
+			 ) \
+			 SELECT id, total_revenue \
+			 FROM customers, revenue \
+			 WHERE id = supplier_no",
+		)
+		.expect("plan aggregate CTE comma join");
+
+	let plan = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("aggregate CTE group key must key the comma join");
+
+	let ExecutionPlan::Join {
+		kind,
+		left_keys,
+		right_keys,
+		output_schema,
+		..
+	} = first_join_plan(&plan)
+	else {
+		panic!("expected keyed join, got {plan:?}");
+	};
+	assert_eq!(*kind, JoinKind::Inner);
+	assert_eq!(left_keys.len(), 1);
+	assert_eq!(right_keys.len(), 1);
+	assert!(output_schema.field_with_name("id").is_ok());
+	assert!(output_schema.field_with_name("supplier_no").is_ok());
+	assert!(output_schema.field_with_name("total_revenue").is_ok());
+}
+
+#[tokio::test]
 async fn range_lt_and_gt_estimate_clipped_fraction() {
 	let catalog = descriptor_sidecar_join_catalog_with_customer_range(
 		None,
