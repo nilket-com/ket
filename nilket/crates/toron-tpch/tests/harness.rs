@@ -660,9 +660,11 @@ fn q16_default_fixture_is_nonempty_but_anti_join_is_not_live() {
 	);
 }
 
-// ADR 310: q16 composes DISTINCT aggregation with an uncorrelated NOT IN anti-join.
+// ADR 311: q16's NOT IN anti-join stack no longer strands the partsupp/part comma equality above the cross
+// recognizer. Running at the default scale is the anti-mask: the ADR 310 cartesian was multi-GB/minute-scale,
+// while the keyed shape completes quickly with the same digest.
 #[test]
-fn q16_executes_in_both_modes_at_tiny_scale() {
+fn q16_executes_in_both_modes_at_default_scale() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -679,8 +681,8 @@ fn q16_executes_in_both_modes_at_tiny_scale() {
 				);
 
 				for (mode, attempt) in [
-					("dev", run_dev_q16(0.0001).await),
-					("strict", run_strict_q16(0.0001).await),
+					("dev", run_dev_q16(0.01).await),
+					("strict", run_strict_q16(0.01).await),
 				] {
 					assert_eq!(attempt.query, "q16");
 					assert_eq!(
@@ -698,7 +700,7 @@ fn q16_executes_in_both_modes_at_tiny_scale() {
 					assert_eq!(
 						attempt.digest.as_deref(),
 						Some(
-							"ArrowIpcDigest([11, 131, 186, 222, 220, 230, 55, 14, 13, 119, 182, 8, 125, 144, 17, 27, 122, 90, 109, 138, 119, 159, 236, 203, 211, 161, 87, 98, 116, 195, 227, 178])"
+							"ArrowIpcDigest([164, 183, 72, 40, 46, 101, 81, 163, 233, 202, 133, 17, 254, 134, 141, 48, 25, 145, 205, 121, 138, 19, 238, 208, 235, 133, 137, 224, 90, 240, 14, 132])"
 						),
 						"q16 {mode}: {}",
 						attempt.human()

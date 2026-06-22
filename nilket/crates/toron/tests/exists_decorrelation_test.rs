@@ -345,6 +345,18 @@ async fn uncorrelated_not_in_with_unqualified_inner_residual_filters_subquery() 
 	assert_pk_values(&batch, &[2, 3, 5, 6]);
 }
 
+#[tokio::test]
+async fn not_in_over_comma_join_matches_explicit_keyed_join() {
+	assert_same_digest(
+		"SELECT fact.pk FROM fact, bridge \
+		 WHERE fact.pk = bridge.fact_pk \
+		   AND fact.pk NOT IN (SELECT dim.k FROM dim WHERE dim.active = false)",
+		"SELECT fact.pk FROM fact INNER JOIN bridge ON fact.pk = bridge.fact_pk \
+		 WHERE fact.pk NOT IN (SELECT dim.k FROM dim WHERE dim.active = false)",
+	)
+	.await;
+}
+
 #[test]
 fn non_equi_correlated_in_and_correlated_scalar_stay_rejected() {
 	// Non-equi correlation isn't decorrelated (the classifier only spends equi-pairs).

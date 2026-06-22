@@ -288,6 +288,41 @@ async fn adr270_n_ary_comma_equi_lifts_both_edges() {
 }
 
 #[tokio::test]
+async fn adr311_not_in_filter_pushes_comma_equi_through_left_anti_stack() {
+	// q16-shaped: the NOT IN desugar wraps the comma join in two LeftAnti joins, then the residual
+	// left_t.id = right_t.id sits above that anti stack. With oversized build inputs, a stranded keyless
+	// Cross fails loud; binding proves the equality pushed through the LeftAnti output side and keyed the
+	// comma join.
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT left_t.id FROM left_t, right_t \
+			 WHERE left_t.id = right_t.id \
+			   AND left_t.id NOT IN (SELECT id FROM third_t)",
+		)
+		.expect("plan NOT IN over comma join");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("NOT IN anti stack should not strand the comma equality as a keyless Cross");
+
+	assert_eq!(
+		join_kind_count(&bound, JoinKind::Inner),
+		1,
+		"the underlying comma join is keyed as Inner"
+	);
+	assert_eq!(
+		join_kind_count(&bound, JoinKind::Cross),
+		0,
+		"the NOT IN stack must not hide a keyless Cross"
+	);
+	assert_eq!(
+		join_kind_count(&bound, JoinKind::LeftAnti),
+		2,
+		"NOT IN still lowers to null-guard + membership anti-joins"
+	);
+}
+
+#[tokio::test]
 async fn adr270_unsupported_join_key_type_stays_residual_filter() {
 	// Float join keys are explicitly unsupported by the keyed-join path. Pre-270, this query could still
 	// bind as a small broadcast Cross plus residual Float equality filter. ADR 270 must not turn that
@@ -404,6 +439,29 @@ fn join_strategy_count(plan: &ExecutionPlan, expected: JoinStrategy) -> usize {
 		| ExecutionPlan::Repeat { input, .. } => join_strategy_count(input, expected),
 		ExecutionPlan::Union { left, right, .. } => {
 			join_strategy_count(left, expected) + join_strategy_count(right, expected)
+		}
+		_ => 0,
+	}
+}
+
+fn join_kind_count(plan: &ExecutionPlan, expected: JoinKind) -> usize {
+	match plan {
+		ExecutionPlan::Join {
+			left, right, kind, ..
+		} => {
+			usize::from(*kind == expected)
+				+ join_kind_count(left, expected)
+				+ join_kind_count(right, expected)
+		}
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => join_kind_count(input, expected),
+		ExecutionPlan::Union { left, right, .. } => {
+			join_kind_count(left, expected) + join_kind_count(right, expected)
 		}
 		_ => 0,
 	}

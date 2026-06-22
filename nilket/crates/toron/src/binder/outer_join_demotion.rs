@@ -428,6 +428,13 @@ impl<'a> Binder<'a> {
 							self.push_deferred_scalar_outer_filter(input, predicate)
 								.await
 						}
+						input @ LogicalPlan::Join {
+							kind: JoinKind::LeftSemi | JoinKind::LeftAnti,
+							..
+						} => {
+							self.push_left_semi_anti_output_filter(input, predicate)
+								.await
+						}
 						other => Ok(LogicalPlan::Filter {
 							input: Box::new(other),
 							predicate: predicate.clone(),
@@ -645,6 +652,79 @@ impl<'a> Binder<'a> {
 				alias,
 			};
 			Ok(wrap_residual_filter(recombine, above))
+		})
+	}
+
+	/// A `LeftSemi`/`LeftAnti` emits only its left rows, so left-output-only conjuncts above
+	/// the join can move into the left child without changing semi/anti semantics. Ambiguous,
+	/// right-only, and cross-side conjuncts stay above.
+	fn push_left_semi_anti_output_filter<'b>(
+		&'b self,
+		join: LogicalPlan,
+		predicate: &'b Expr,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				on,
+				on_filter,
+				null_safe_keys,
+				strategy_intent,
+			} = join
+			else {
+				unreachable!(
+					"push_left_semi_anti_output_filter is only called on a semi/anti Join"
+				);
+			};
+			debug_assert!(matches!(kind, JoinKind::LeftSemi | JoinKind::LeftAnti));
+
+			let (Some(left_scope), Some(right_scope)) = (
+				self.logical_scope_for_outer_demotion(&left).await?,
+				self.logical_scope_for_outer_demotion(&right).await?,
+			) else {
+				let join = LogicalPlan::Join {
+					left,
+					right,
+					kind,
+					on,
+					on_filter,
+					null_safe_keys,
+					strategy_intent,
+				};
+				return Ok(LogicalPlan::Filter {
+					input: Box::new(join),
+					predicate: predicate.clone(),
+				});
+			};
+
+			let mut left_push = Vec::new();
+			let mut residual = Vec::new();
+			for conjunct in split_logical_and_conjuncts(predicate) {
+				if conjunct_column_sides(&conjunct, &left_scope, &right_scope).is_left_only() {
+					left_push.push(conjunct);
+				} else {
+					residual.push(conjunct);
+				}
+			}
+
+			let left = if left_push.is_empty() {
+				left
+			} else {
+				let pushed = push_left_output_filter_conjuncts(*left, left_push);
+				Box::new(self.recognize_cross_equi_joins(&pushed).await?)
+			};
+			let join = LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				on,
+				on_filter,
+				null_safe_keys,
+				strategy_intent,
+			};
+			Ok(wrap_residual_filter(join, residual))
 		})
 	}
 
@@ -1592,6 +1672,28 @@ fn push_logical_filter_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> Lo
 			predicate,
 		},
 		None => input,
+	}
+}
+
+fn push_left_output_filter_conjuncts(input: LogicalPlan, mut conjuncts: Vec<Expr>) -> LogicalPlan {
+	if conjuncts.is_empty() {
+		return input;
+	}
+	match input {
+		LogicalPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => LogicalPlan::Exchange {
+			input: Box::new(push_left_output_filter_conjuncts(*input, conjuncts)),
+			partition_count,
+			key,
+		},
+		LogicalPlan::Filter { input, predicate } => {
+			conjuncts.extend(split_logical_and_conjuncts(&predicate));
+			push_left_output_filter_conjuncts(*input, conjuncts)
+		}
+		other => push_logical_filter_conjuncts(other, conjuncts),
 	}
 }
 
