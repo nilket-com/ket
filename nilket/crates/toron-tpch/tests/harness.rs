@@ -7,13 +7,13 @@ use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
-	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
-	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14,
-	run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q20, run_dev_q22, run_strict_q1,
-	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
-	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
-	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q20,
-	run_strict_q22, status_rows,
+	q19_lineitem_part_join_is_keyed, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
+	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
+	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
+	run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04,
+	run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10,
+	run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16,
+	run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -946,6 +946,77 @@ async fn q18_blocks_on_grouped_membership_subquery_shape() {
 			attempt.human()
 		);
 	}
+}
+
+// ADR 316: after the l_shipinstruct fixture gap is closed, q19's OR-of-ANDs leaves the lineitem/part
+// equality hidden inside OR branches. The harness blocks on the unkeyed bound shape before executing the
+// default-scale cartesian.
+#[test]
+fn q19_blocks_on_disjunctive_keyless_cross() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q19 dev=implemented strict=implemented"),
+					"q19 is an implemented capability in the static inventory"
+				);
+
+				let keying = q19_lineitem_part_join_is_keyed(false, 0.01)
+					.await
+					.expect_err("q19 has not keyed the lineitem/part join yet");
+				assert!(
+					keying.contains("was not a keyed Inner join"),
+					"q19 keying guard should report the disjunctive keying wall: {keying}"
+				);
+				assert!(
+					keying.contains("Cross left_keys=0 right_keys=0"),
+					"q19 still binds a keyless Cross because the equi-key is inside OR branches: {keying}"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q19(0.01).await),
+					("strict", run_strict_q19(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q19");
+					assert_eq!(
+						attempt.status,
+						Status::Blocked,
+						"q19 {mode} should block before executing the cartesian: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Bind, "{}", attempt.human());
+					assert_eq!(
+						attempt.reason.as_deref(),
+						Some("unsupported_cross_join"),
+						"q19 {mode} should reuse the keyless-cross blocker: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.digest.is_none(),
+						"a blocked row carries no digest: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(true),
+						"a recognized q19 blocker succeeds under --allow-blocked"
+					);
+					assert!(
+						!attempt.is_process_success(false),
+						"a q19 blocker still fails without --allow-blocked"
+					);
+				}
+			});
+		})
+		.expect("spawn q19 thread")
+		.join()
+		.expect("q19 thread panicked");
 }
 
 // ADR 286: q20's nested IN body and correlated scalar now compose with comparison-local numeric operand

@@ -158,6 +158,39 @@ pub const Q18_DEV_SQL: &str = "SELECT c_name, c_custkey, o_orderkey, o_orderdate
 /// strict q18 — identical SQL shape; strict mode carries official Decimal128 lineitem quantity.
 pub const STRICT_Q18_SQL: &str = Q18_DEV_SQL;
 
+/// ADR 316 — tpch.q19 (Discounted Revenue): official-shaped q19 with the three OR branches inlined.
+/// The `l_shipinstruct` fixture contingency fired; with the column present, q19 measures the disjunctive
+/// keyless-cross wall instead of a fixture gap.
+pub const Q19_DEV_SQL: &str = "SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue \
+	FROM lineitem, part \
+	WHERE (p_partkey = l_partkey \
+	    AND p_brand = 'Brand#12' \
+	    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') \
+	    AND l_quantity >= 1 \
+	    AND l_quantity <= 11 \
+	    AND p_size BETWEEN 1 AND 5 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON') \
+	   OR (p_partkey = l_partkey \
+	    AND p_brand = 'Brand#23' \
+	    AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') \
+	    AND l_quantity >= 10 \
+	    AND l_quantity <= 20 \
+	    AND p_size BETWEEN 1 AND 10 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON') \
+	   OR (p_partkey = l_partkey \
+	    AND p_brand = 'Brand#34' \
+	    AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') \
+	    AND l_quantity >= 20 \
+	    AND l_quantity <= 30 \
+	    AND p_size BETWEEN 1 AND 15 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON')";
+
+/// strict q19 — identical SQL shape; strict mode carries official Decimal128 lineitem money/quantity types.
+pub const STRICT_Q19_SQL: &str = Q19_DEV_SQL;
+
 /// ADR 284 — tpch.q02 (Minimum Cost Supplier): tpchgen-2.0.2's exact Q2 with `:1` → `15`, `:2` →
 /// `BRASS`, `:3` → `EUROPE`, and no LIMIT. The correlated scalar `MIN(ps_supplycost)` has a multi-table
 /// comma-join inner input (`partsupp, supplier, nation, region`) and is the measured frontier.
@@ -515,6 +548,8 @@ fn dev_lineitem_schema() -> SchemaRef {
 		Field::new("l_receiptdate", DataType::Date32, false),
 		// ADR 290: q12 ship-mode filter/group key, appended.
 		Field::new("l_shipmode", DataType::Utf8, false),
+		// ADR 316: q19 ship-instruction branch filter, appended.
+		Field::new("l_shipinstruct", DataType::Utf8, false),
 	]))
 }
 
@@ -550,6 +585,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut commitdate = Vec::new();
 	let mut receiptdate = Vec::new();
 	let mut shipmode = Vec::new();
+	let mut shipinstruct = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as f64);
 		extendedprice.push(item.l_extendedprice.as_f64());
@@ -564,6 +600,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 		commitdate.push(item.l_commitdate.to_unix_epoch());
 		receiptdate.push(item.l_receiptdate.to_unix_epoch());
 		shipmode.push(item.l_shipmode.to_string());
+		shipinstruct.push(item.l_shipinstruct.to_string());
 	}
 	RecordBatch::try_new(
 		dev_lineitem_schema(),
@@ -581,6 +618,7 @@ pub fn generate_dev_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Date32Array::from(commitdate)),
 			Arc::new(Date32Array::from(receiptdate)),
 			Arc::new(StringArray::from(shipmode)),
+			Arc::new(StringArray::from(shipinstruct)),
 		],
 	)
 	.expect("dev lineitem batch")
@@ -610,6 +648,8 @@ fn strict_lineitem_schema() -> SchemaRef {
 		Field::new("l_receiptdate", DataType::Date32, false),
 		// ADR 290: q12 ship-mode filter/group key, appended.
 		Field::new("l_shipmode", DataType::Utf8, false),
+		// ADR 316: q19 ship-instruction branch filter, appended.
+		Field::new("l_shipinstruct", DataType::Utf8, false),
 	]))
 }
 
@@ -645,6 +685,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let mut commitdate = Vec::new();
 	let mut receiptdate = Vec::new();
 	let mut shipmode = Vec::new();
+	let mut shipinstruct = Vec::new();
 	for item in generator.iter() {
 		quantity.push(item.l_quantity as i128 * 100);
 		extendedprice.push(item.l_extendedprice.into_inner() as i128);
@@ -659,6 +700,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		commitdate.push(item.l_commitdate.to_unix_epoch());
 		receiptdate.push(item.l_receiptdate.to_unix_epoch());
 		shipmode.push(item.l_shipmode.to_string());
+		shipinstruct.push(item.l_shipinstruct.to_string());
 	}
 	let decimal = |values: Vec<i128>| {
 		Arc::new(
@@ -683,6 +725,7 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 			Arc::new(Date32Array::from(commitdate)),
 			Arc::new(Date32Array::from(receiptdate)),
 			Arc::new(StringArray::from(shipmode)),
+			Arc::new(StringArray::from(shipinstruct)),
 		],
 	)
 	.expect("strict lineitem batch")
@@ -6046,6 +6089,123 @@ pub async fn run_strict_q18(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 316 - dev q19: discounted-revenue reachability probe over lineitem/part with OR-branch predicates.
+pub async fn run_dev_q19(scale_factor: f64) -> Attempt {
+	run_q19("dev", false, scale_factor, Q19_DEV_SQL).await
+}
+
+/// ADR 316 - strict q19: identical SQL shape with strict Decimal128 lineitem columns.
+pub async fn run_strict_q19(scale_factor: f64) -> Attempt {
+	run_q19("strict", true, scale_factor, STRICT_Q19_SQL).await
+}
+
+async fn run_q19(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Attempt {
+	let start = Instant::now();
+	if let Err(message) = q19_lineitem_part_join_is_keyed(strict, scale_factor).await {
+		let phase = if message.starts_with("plan q19") {
+			Phase::Plan
+		} else {
+			Phase::Bind
+		};
+		let reason = if message.contains("was not a keyed Inner join") {
+			"unsupported_cross_join"
+		} else {
+			reason_for_error(&message)
+		};
+		return Attempt {
+			query: "q19".to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			phase,
+			status: status_for_reason(reason),
+			reason: Some(reason.to_string()),
+			elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+			digest: None,
+		};
+	}
+	run_query_with_tables(
+		"q19",
+		mode,
+		scale_factor,
+		sql,
+		q19_tables(strict, scale_factor),
+	)
+	.await
+}
+
+/// Bind q19 and check whether the lineitem/part comma equality becomes a keyed Inner join.
+pub async fn q19_lineitem_part_join_is_keyed(
+	strict: bool,
+	scale_factor: f64,
+) -> Result<(), String> {
+	let mut catalog = MockCatalog::new();
+	for table in q19_tables(strict, scale_factor) {
+		catalog
+			.register_descriptor(table.id, table.descriptor)
+			.map_err(|error| format!("register {}: {error:?}", table.name))?;
+		catalog
+			.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
+			.map_err(|error| format!("seed facts {}: {error:?}", table.name))?;
+	}
+	let sql = if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL };
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.map_err(|error| format!("plan q19: {error}"))?;
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind q19: {error:?}"))?;
+	if has_q19_lineitem_part_keyed_join(&bound) {
+		Ok(())
+	} else {
+		let mut summaries = Vec::new();
+		collect_join_summaries(&bound, &mut summaries);
+		Err(format!(
+			"q19 lineitem/part equality was not a keyed Inner join; joins={summaries:?}"
+		))
+	}
+}
+
+fn has_q19_lineitem_part_keyed_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			output_schema,
+			..
+		} => {
+			(*kind == JoinKind::Inner
+				&& left_keys.len() == 1
+				&& right_keys.len() == 1
+				&& schema_has_fields(
+					output_schema,
+					&["l_partkey", "p_partkey", "p_brand", "l_shipinstruct"],
+				)) || has_q19_lineitem_part_keyed_join(left)
+				|| has_q19_lineitem_part_keyed_join(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => has_q19_lineitem_part_keyed_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			has_q19_lineitem_part_keyed_join(left) || has_q19_lineitem_part_keyed_join(right)
+		}
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => has_q19_lineitem_part_keyed_join(seed) || has_q19_lineitem_part_keyed_join(recursive),
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. }
+		| ExecutionPlan::Update { source, .. } => has_q19_lineitem_part_keyed_join(source),
+		_ => false,
+	}
+}
+
 /// The two q17 harness tables: `lineitem` and `part`.
 fn q17_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let lineitem = if strict {
@@ -6681,6 +6841,11 @@ fn q18_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	q03_tables(strict, scale_factor)
 }
 
+/// The two q19 harness tables match q14/q17's lineitem/part family.
+fn q19_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	q14_tables(strict, scale_factor)
+}
+
 /// ADR 274 — dev q10: the first 4-table query (`customer`/`orders`/`lineitem`/`nation`). A reachability
 /// attempt — records whichever wall q10 hits first.
 pub async fn run_dev_q10(scale_factor: f64) -> Attempt {
@@ -7029,7 +7194,7 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q09" || *id == "q13"
 					|| *id == "q11" || *id == "q15"
 					|| *id == "q16" || *id == "q18"
-					|| *id == "q22"
+					|| *id == "q19" || *id == "q22"
 				{
 					"implemented"
 				} else {
