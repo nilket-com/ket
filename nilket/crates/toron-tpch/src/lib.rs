@@ -30,7 +30,7 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::RowCount;
 use toron::error::StorageError;
 use toron::exec::Executor;
-use toron::ir::{TableId, decimal_division_output_type};
+use toron::ir::{ExecutionPlan, JoinKind, TableId, decimal_division_output_type};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -209,6 +209,26 @@ pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 
 /// strict q13 - identical SQL shape; q13 has no strict-only decimal surface.
 pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
+
+/// ADR 313 - tpch.q15 (Top Supplier): official-shaped q15 with `:1` -> `DATE '1996-01-01'`.
+/// The `revenue` CTE is intentionally referenced twice: once as an outer `FROM` source and again as the source
+/// of an uncorrelated aggregate scalar subquery.
+pub const Q15_DEV_SQL: &str = "WITH revenue AS ( \
+	  SELECT l_suppkey AS supplier_no, \
+	         SUM(l_extendedprice * (1 - l_discount)) AS total_revenue \
+	  FROM lineitem \
+	  WHERE l_shipdate >= DATE '1996-01-01' \
+	    AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH \
+	  GROUP BY l_suppkey \
+	) \
+	SELECT s_suppkey, s_name, s_address, s_phone, total_revenue \
+	FROM supplier, revenue \
+	WHERE s_suppkey = supplier_no \
+	  AND total_revenue = (SELECT MAX(total_revenue) FROM revenue) \
+	ORDER BY s_suppkey";
+
+/// strict q15 - identical SQL shape; strict mode carries official Decimal128 lineitem pricing columns.
+pub const STRICT_Q15_SQL: &str = Q15_DEV_SQL;
 
 /// ADR 310 - tpch.q16 (Parts/Supplier Relationship): official-shaped q16 with `:1` -> `Brand#45`,
 /// `:2` -> `MEDIUM POLISHED`, `:3` -> `(49, 14, 23, 45, 19, 3, 36, 9)`, and no LIMIT.
@@ -6064,6 +6084,161 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 313 - dev q15: CTE-as-FROM-source plus scalar aggregate over the same CTE.
+pub async fn run_dev_q15(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q15",
+		"dev",
+		scale_factor,
+		Q15_DEV_SQL,
+		q15_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 313 - strict q15: identical SQL shape; strict mode carries official Decimal128 lineitem pricing columns.
+pub async fn run_strict_q15(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q15",
+		"strict",
+		scale_factor,
+		STRICT_Q15_SQL,
+		q15_tables(true, scale_factor),
+	)
+	.await
+}
+
+/// Bind q15 and check whether the supplier/revenue comma equality becomes a keyed Inner join.
+pub async fn q15_supplier_revenue_join_is_keyed(
+	strict: bool,
+	scale_factor: f64,
+) -> Result<(), String> {
+	let mut catalog = MockCatalog::new();
+	for table in q15_tables(strict, scale_factor) {
+		catalog
+			.register_descriptor(table.id, table.descriptor)
+			.map_err(|error| format!("register {}: {error:?}", table.name))?;
+		catalog
+			.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
+			.map_err(|error| format!("seed facts {}: {error:?}", table.name))?;
+	}
+	let sql = if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL };
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.map_err(|error| format!("plan q15: {error}"))?;
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind q15: {error:?}"))?;
+	if has_q15_supplier_revenue_keyed_join(&bound) {
+		Ok(())
+	} else {
+		let mut summaries = Vec::new();
+		collect_join_summaries(&bound, &mut summaries);
+		Err(format!(
+			"q15 supplier/revenue equality was not a keyed Inner join; joins={summaries:?}"
+		))
+	}
+}
+
+fn has_q15_supplier_revenue_keyed_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			output_schema,
+			..
+		} => {
+			(*kind == JoinKind::Inner
+				&& left_keys.len() == 1
+				&& right_keys.len() == 1
+				&& schema_has_fields(
+					output_schema,
+					&["s_suppkey", "s_name", "supplier_no", "total_revenue"],
+				)) || has_q15_supplier_revenue_keyed_join(left)
+				|| has_q15_supplier_revenue_keyed_join(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => has_q15_supplier_revenue_keyed_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			has_q15_supplier_revenue_keyed_join(left) || has_q15_supplier_revenue_keyed_join(right)
+		}
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => {
+			has_q15_supplier_revenue_keyed_join(seed)
+				|| has_q15_supplier_revenue_keyed_join(recursive)
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. }
+		| ExecutionPlan::Update { source, .. } => has_q15_supplier_revenue_keyed_join(source),
+		_ => false,
+	}
+}
+
+fn schema_has_fields(schema: &SchemaRef, names: &[&str]) -> bool {
+	names
+		.iter()
+		.all(|name| schema.field_with_name(name).is_ok())
+}
+
+fn collect_join_summaries(plan: &ExecutionPlan, summaries: &mut Vec<String>) {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			output_schema,
+			..
+		} => {
+			let fields = output_schema
+				.fields()
+				.iter()
+				.map(|field| field.name().as_str())
+				.collect::<Vec<_>>();
+			summaries.push(format!(
+				"{kind:?} left_keys={} right_keys={} fields={fields:?}",
+				left_keys.len(),
+				right_keys.len()
+			));
+			collect_join_summaries(left, summaries);
+			collect_join_summaries(right, summaries);
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => collect_join_summaries(input, summaries),
+		ExecutionPlan::Union { left, right, .. } => {
+			collect_join_summaries(left, summaries);
+			collect_join_summaries(right, summaries);
+		}
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => {
+			collect_join_summaries(seed, summaries);
+			collect_join_summaries(recursive, summaries);
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. }
+		| ExecutionPlan::Update { source, .. } => collect_join_summaries(source, summaries),
+		_ => {}
+	}
+}
+
 /// ADR 310 - dev q16: parts/supplier relationship reachability over part + partsupp + supplier.
 pub async fn run_dev_q16(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -6176,6 +6351,37 @@ fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: orders_descriptor(orders_schema().as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
+		},
+	]
+}
+
+/// The two q15 harness tables: `supplier` plus mode-sensitive `lineitem`.
+fn q15_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let supplier = generate_supplier(strict, scale_factor);
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
 		},
 	]
 }
@@ -6697,7 +6903,8 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
 					|| *id == "q09" || *id == "q13"
-					|| *id == "q16" || *id == "q22"
+					|| *id == "q15" || *id == "q16"
+					|| *id == "q22"
 				{
 					"implemented"
 				} else {

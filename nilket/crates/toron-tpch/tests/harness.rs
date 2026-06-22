@@ -6,12 +6,13 @@ use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13,
-	run_strict_q14, run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
+	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
+	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
+	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
+	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
+	run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -607,6 +608,78 @@ fn q13_executes_in_both_modes_at_default_scale() {
 		.expect("q13 thread panicked");
 }
 
+// ADR 313: q15 currently walls at the keyless CROSS JOIN admission guard, so the row is
+// a recognized blocker rather than a pass.
+#[test]
+fn q15_blocks_on_keyless_cross_join() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q15 dev=implemented strict=implemented"),
+					"q15 is an implemented capability in the static inventory"
+				);
+				let dev_keying = q15_supplier_revenue_join_is_keyed(false, 0.01)
+					.await
+					.expect_err("dev q15 has not keyed the supplier/revenue join yet");
+				assert!(
+					dev_keying.contains("CROSS JOIN requires a broadcast-eligible build side"),
+					"q15 dev wall stays the keyless CROSS JOIN guard: {dev_keying}"
+				);
+				let strict_keying = q15_supplier_revenue_join_is_keyed(true, 0.01)
+					.await
+					.expect_err("strict q15 has not keyed the supplier/revenue join yet");
+				assert!(
+					strict_keying.contains("CROSS JOIN requires a broadcast-eligible build side"),
+					"q15 strict wall stays the keyless CROSS JOIN guard: {strict_keying}"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q15(0.01).await),
+					("strict", run_strict_q15(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q15");
+					assert_eq!(
+						attempt.status,
+						Status::Blocked,
+						"q15 {mode} should be a recognized blocked row: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Bind, "{}", attempt.human());
+					assert_eq!(
+						attempt.reason.as_deref(),
+						Some("unsupported_cross_join"),
+						"q15 {mode} should classify the measured wall precisely: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.digest.is_none(),
+						"a blocked row carries no digest: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(true),
+						"a recognized blocked row succeeds under --allow-blocked"
+					);
+					assert!(
+						!attempt.is_process_success(false),
+						"a blocked row still fails without --allow-blocked"
+					);
+				}
+			});
+		})
+		.expect("spawn q15 thread")
+		.join()
+		.expect("q15 thread panicked");
+}
+
 fn q16_supplier_comment_excluded(comment: &str) -> bool {
 	comment
 		.find("Customer")
@@ -919,6 +992,17 @@ fn reason_for_error_classifies_non_equi_join_on_precisely() {
 		"unrecognized",
 		"the non-ON join-constraint guard is not q13's ON-residual wall"
 	);
+}
+
+#[test]
+fn reason_for_error_classifies_keyless_cross_join_precisely() {
+	assert_eq!(
+		reason_for_error(
+			"UnsupportedExpression { message: \"CROSS JOIN requires a broadcast-eligible build side under the broadcast cap\" }"
+		),
+		"unsupported_cross_join"
+	);
+	assert_eq!(status_for_reason("unsupported_cross_join"), Status::Blocked);
 }
 
 // ADR 274: the Decimal group/partition-key error classifies precisely (not the generic Decimal-carrier

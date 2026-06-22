@@ -12,10 +12,11 @@ use toron_tpch::{
 	check_strict_q16, check_strict_q17, check_strict_q20, check_strict_q22, correctness_matrix,
 	generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3,
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13,
-	run_strict_q14, run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q20,
+	run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
+	run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q12,
+	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q20,
+	run_strict_q22, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -240,6 +241,14 @@ async fn run_command(args: &[String]) -> ExitCode {
 				run_strict_q14(sf).await
 			} else {
 				run_dev_q14(sf).await
+			}
+		}
+		// Top-supplier reachability attempt: CTE used as a joined source and scalar-subquery source.
+		"q15" => {
+			if strict {
+				run_strict_q15(sf).await
+			} else {
+				run_dev_q15(sf).await
 			}
 		}
 		// Parts/supplier relationship reachability attempt over part + partsupp + supplier.

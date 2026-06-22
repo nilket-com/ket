@@ -69,6 +69,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_correlated_exists",
 	"unsupported_derived_multi_source",
 	"unsupported_non_equi_join_on",
+	"unsupported_cross_join",
 	"unsupported_substring",
 	"unsupported_query_surface",
 ];
@@ -155,6 +156,10 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// ADR 307's q13 row used this wall before ADR 308 added side-local ON residual pushdown. Keep
 		// the classifier precise for old telemetry and targeted regression probes.
 		"unsupported_non_equi_join_on"
+	} else if lowered.contains("cross join requires a broadcast-eligible build side") {
+		// A keyless CROSS JOIN is only admitted when one side can be broadcast. Keep this narrower than the
+		// generic unsupported-query bucket so the gauge reports cartesian/keying walls honestly.
+		"unsupported_cross_join"
 	} else if lowered.contains("unsupported expression") && lowered.contains("substring") {
 		// ADR 304's q22 row used this wall before ADR 305 added SUBSTRING support; keep it precise for old
 		// telemetry and targeted regression probes.
