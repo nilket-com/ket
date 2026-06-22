@@ -1621,9 +1621,32 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					on_filter,
 					null_safe_keys,
 					strategy_intent,
 				} => {
+					if on_filter.is_some() {
+						let normalized = self
+							.push_on_clause_residual(
+								(**left).clone(),
+								(**right).clone(),
+								*kind,
+								on.clone(),
+								on_filter.clone(),
+								*null_safe_keys,
+								*strategy_intent,
+							)
+							.await?;
+						return self
+							.bind_plan_with_trace(
+								&normalized,
+								trace,
+								render_trace,
+								join_order_source_capture,
+								recursive_ctx,
+							)
+							.await;
+					}
 					// ADR 200: the unified bounded graph root-swap, galaxy then bridge. A query is a
 					// galaxy XOR a bridge (conformed vs distinct junction signatures), so the arms never
 					// both fire. The committed decision is accrued here (one per recognized graph); on the

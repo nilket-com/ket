@@ -268,6 +268,7 @@ fn join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,

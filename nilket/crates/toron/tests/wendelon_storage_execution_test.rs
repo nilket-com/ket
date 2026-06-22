@@ -1130,6 +1130,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 				Expr::qualified_column(orders.clone(), "customer_id"),
 				Expr::qualified_column(customers.clone(), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),
@@ -1149,6 +1150,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "product_id"),
 			Expr::qualified_column(products.clone(), "id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
@@ -1163,6 +1165,7 @@ fn demoted_durable_star_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "store_id"),
 			Expr::qualified_column(stores.clone(), "id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
@@ -1210,6 +1213,7 @@ fn durable_probe_linearity_hash_fallback_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "customer_id"),
 			Expr::qualified_column(customers.clone(), "id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
@@ -1228,6 +1232,7 @@ fn durable_probe_linearity_hash_fallback_plan() -> LogicalPlan {
 			Expr::qualified_column(orders.clone(), "product_id"),
 			Expr::qualified_column(products.clone(), "id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};

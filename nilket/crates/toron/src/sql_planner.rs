@@ -3513,6 +3513,7 @@ impl SqlPlanner {
 				right: Box::new(right),
 				kind,
 				on: Vec::new(),
+				on_filter: None,
 				null_safe_keys: true,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
@@ -3735,7 +3736,7 @@ impl SqlPlanner {
 		let mut plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
 		for join in &table_with_joins.joins {
 			let mut right = self.lower_table_factor(&join.relation, cte)?;
-			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
+			let (kind, on, on_filter) = self.lower_join_operator(&join.join_operator)?;
 			if all_inner_join_chain {
 				let right_qualifiers = plan_qualifiers(&right);
 				if !pushed_leftmost_filter {
@@ -3761,12 +3762,16 @@ impl SqlPlanner {
 			let strategy_intent =
 				join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right)?;
 			plan = match strategy_intent {
-				JoinStrategyIntent::Auto => build_auto_join_plan(plan, right, kind, on),
+				JoinStrategyIntent::Auto => {
+					build_auto_join_plan_with_filter(plan, right, kind, on, on_filter)
+				}
 				JoinStrategyIntent::Pinned {
 					strategy,
 					source,
 					build_side,
-				} => build_join_plan(plan, right, kind, on, strategy, source, build_side)?,
+				} => build_join_plan_with_filter(
+					plan, right, kind, on, on_filter, strategy, source, build_side,
+				)?,
 			};
 		}
 		// ADR 239: fold any comma-separated FROM entries left-deep as keyless `Cross` joins. Each
@@ -3777,16 +3782,20 @@ impl SqlPlanner {
 			let mut right = self.lower_table_factor(&table_with_joins.relation, cte)?;
 			for join in &table_with_joins.joins {
 				let inner = self.lower_table_factor(&join.relation, cte)?;
-				let (kind, on) = self.lower_join_operator(&join.join_operator)?;
+				let (kind, on, on_filter) = self.lower_join_operator(&join.join_operator)?;
 				let strategy_intent =
 					join_strategy_intent_for_hint(&mut broadcast_hint, &right, &inner)?;
 				right = match strategy_intent {
-					JoinStrategyIntent::Auto => build_auto_join_plan(right, inner, kind, on),
+					JoinStrategyIntent::Auto => {
+						build_auto_join_plan_with_filter(right, inner, kind, on, on_filter)
+					}
 					JoinStrategyIntent::Pinned {
 						strategy,
 						source,
 						build_side,
-					} => build_join_plan(right, inner, kind, on, strategy, source, build_side)?,
+					} => build_join_plan_with_filter(
+						right, inner, kind, on, on_filter, strategy, source, build_side,
+					)?,
 				};
 			}
 			plan = build_auto_join_plan(plan, right, JoinKind::Cross, Vec::new());
@@ -4539,7 +4548,7 @@ impl SqlPlanner {
 	fn lower_join_operator(
 		&self,
 		operator: &JoinOperator,
-	) -> Result<(JoinKind, Vec<(Expr, Expr)>), FrontendError> {
+	) -> Result<(JoinKind, Vec<(Expr, Expr)>, Option<Expr>), FrontendError> {
 		let (kind, constraint) = match operator {
 			JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
 				(JoinKind::Inner, constraint)
@@ -4563,7 +4572,7 @@ impl SqlPlanner {
 			// carries `JoinConstraint::None`; `ON`/`USING`/`NATURAL` on a cross join is
 			// not valid and falls through to the reject arm below.
 			JoinOperator::CrossJoin(JoinConstraint::None) => {
-				return Ok((JoinKind::Cross, Vec::new()));
+				return Ok((JoinKind::Cross, Vec::new(), None));
 			}
 			JoinOperator::CrossJoin(_)
 			| JoinOperator::CrossApply
@@ -4580,7 +4589,10 @@ impl SqlPlanner {
 		};
 
 		match constraint {
-			JoinConstraint::On(expr) => Ok((kind, self.lower_join_on(expr)?)),
+			JoinConstraint::On(expr) => {
+				let (on, on_filter) = self.lower_join_on(expr)?;
+				Ok((kind, on, on_filter))
+			}
 			_ => Err(unsupported("JOIN requires ON equality predicates")),
 		}
 	}
@@ -6097,17 +6109,30 @@ impl SqlPlanner {
 		Ok(plan)
 	}
 
-	fn lower_join_on(&self, expr: &SqlExpr) -> Result<Vec<(Expr, Expr)>, FrontendError> {
+	fn lower_join_on(
+		&self,
+		expr: &SqlExpr,
+	) -> Result<(Vec<(Expr, Expr)>, Option<Expr>), FrontendError> {
 		match expr {
 			SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-				let mut pairs = self.lower_join_on(left)?;
-				pairs.extend(self.lower_join_on(right)?);
-				Ok(pairs)
+				let (mut pairs, left_filter) = self.lower_join_on(left)?;
+				let (right_pairs, right_filter) = self.lower_join_on(right)?;
+				pairs.extend(right_pairs);
+				Ok((
+					pairs,
+					combine_and_exprs(left_filter.into_iter().chain(right_filter).collect()),
+				))
 			}
 			SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
-				Ok(vec![(self.lower_expr(left)?, self.lower_expr(right)?)])
+				let left = self.lower_expr(left)?;
+				let right = self.lower_expr(right)?;
+				if matches!((&left, &right), (Expr::Column(_), Expr::Column(_))) {
+					Ok((vec![(left, right)], None))
+				} else {
+					Ok((Vec::new(), Some(Expr::Eq(Box::new(left), Box::new(right)))))
+				}
 			}
-			_ => Err(unsupported("join ON only supports equality predicates")),
+			_ => Ok((Vec::new(), Some(self.lower_expr(expr)?))),
 		}
 	}
 
@@ -6653,6 +6678,19 @@ pub(crate) fn build_join_plan(
 	source: JoinStrategyPinSource,
 	build_side: Option<BroadcastBuildSide>,
 ) -> Result<LogicalPlan, FrontendError> {
+	build_join_plan_with_filter(left, right, kind, on, None, strategy, source, build_side)
+}
+
+pub(crate) fn build_join_plan_with_filter(
+	left: LogicalPlan,
+	right: LogicalPlan,
+	kind: JoinKind,
+	on: Vec<(Expr, Expr)>,
+	on_filter: Option<Expr>,
+	strategy: JoinStrategy,
+	source: JoinStrategyPinSource,
+	build_side: Option<BroadcastBuildSide>,
+) -> Result<LogicalPlan, FrontendError> {
 	let (left_keys, right_keys) = derive_join_exchange_keys(&on, &left, &right)?;
 	match strategy {
 		JoinStrategy::HashPartitioned if build_side.is_some() => Err(unsupported(
@@ -6671,6 +6709,7 @@ pub(crate) fn build_join_plan(
 			}),
 			kind,
 			on,
+			on_filter,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy,
@@ -6689,6 +6728,7 @@ pub(crate) fn build_join_plan(
 				right: Box::new(right),
 				kind,
 				on,
+				on_filter,
 				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Pinned {
 					strategy,
@@ -6706,11 +6746,22 @@ pub(crate) fn build_auto_join_plan(
 	kind: JoinKind,
 	on: Vec<(Expr, Expr)>,
 ) -> LogicalPlan {
+	build_auto_join_plan_with_filter(left, right, kind, on, None)
+}
+
+pub(crate) fn build_auto_join_plan_with_filter(
+	left: LogicalPlan,
+	right: LogicalPlan,
+	kind: JoinKind,
+	on: Vec<(Expr, Expr)>,
+	on_filter: Option<Expr>,
+) -> LogicalPlan {
 	LogicalPlan::Join {
 		left: Box::new(left),
 		right: Box::new(right),
 		kind,
 		on,
+		on_filter,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	}
@@ -7157,6 +7208,7 @@ impl DistinctAggregateRewrite {
 			right: Box::new(right),
 			kind: JoinKind::Inner,
 			on,
+			on_filter: None,
 			null_safe_keys: true,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
@@ -10506,6 +10558,7 @@ mod tests {
 					Expr::qualified_column(TableRef::new("o"), "customer_id"),
 					Expr::qualified_column(TableRef::new("c"), "id"),
 				)],
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
@@ -10837,6 +10890,7 @@ mod tests {
 			}),
 			kind: JoinKind::Inner,
 			on: vec![],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,

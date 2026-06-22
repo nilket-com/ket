@@ -525,7 +525,7 @@ pub(crate) fn adr211_pinned_broadcast_intent_carries_build_side() {
 	let planner = planner_source();
 	let binder = binder_source();
 	let join_intent = source_block(&ir, "pub enum JoinStrategyIntent");
-	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
 	let choose = source_block(&binder, "fn choose_join_strategy");
 
 	assert!(ir.contains("pub enum BroadcastBuildSide"));
@@ -545,7 +545,7 @@ pub(crate) fn adr211_pinned_broadcast_intent_carries_build_side() {
 pub(crate) fn adr211_frontends_do_not_preshape_pinned_broadcast() {
 	let planner = planner_source();
 	let binder_root = binder_root_source();
-	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
 	let broadcast_arm = build_join_plan
 		.split("JoinStrategy::Broadcast =>")
 		.nth(1)

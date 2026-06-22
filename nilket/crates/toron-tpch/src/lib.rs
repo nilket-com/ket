@@ -195,10 +195,8 @@ pub const Q20_DEV_SQL: &str = "SELECT s_name, s_address \
 /// strict q20 — identical SQL shape; strict mode carries official Decimal128 lineitem quantities.
 pub const STRICT_Q20_SQL: &str = Q20_DEV_SQL;
 
-/// ADR 307 - tpch.q13 (Customer Distribution): official-shaped q13 with the fixed
-/// `%special%requests%` comment pattern and no LIMIT. This is a verify-first reachability probe for
-/// the non-equality `LEFT OUTER JOIN ... ON` residual; the shared `orders` fixture intentionally does
-/// not add `o_comment` until the query advances past the frontend ON-clause wall.
+/// ADR 307/308 - tpch.q13 (Customer Distribution): official-shaped q13 with the fixed
+/// `%special%requests%` comment pattern and no LIMIT.
 pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 	FROM ( \
 	  SELECT c_custkey, COUNT(o_orderkey) AS c_count \
@@ -209,7 +207,7 @@ pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 	GROUP BY c_count \
 	ORDER BY custdist DESC, c_count DESC";
 
-/// strict q13 - identical SQL shape; q13's measured wall is frontend lowering, before strict-only types matter.
+/// strict q13 - identical SQL shape; q13 has no strict-only decimal surface.
 pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
 
 /// ADR 304/305 - tpch.q22 (Global Sales Opportunity): official-shaped q22 with `:1` country codes
@@ -766,8 +764,7 @@ pub fn generate_customer(strict: bool, scale_factor: f64) -> RecordBatch {
 	.expect("customer batch")
 }
 
-/// The q03 `ORDERS` fixture: the two join keys + the date filter + the group key. No decimals (q03 ignores
-/// `o_totalprice`) → identical in dev and strict.
+/// The shared `ORDERS` fixture: the keys and date/comment columns used by the reached TPC-H subset.
 fn orders_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("o_orderkey", DataType::Int64, false),
@@ -776,6 +773,7 @@ fn orders_schema() -> SchemaRef {
 		Field::new("o_shippriority", DataType::Int32, false),
 		// ADR 278: q04 GROUP BY key, appended (q03/q10 don't reference it).
 		Field::new("o_orderpriority", DataType::Utf8, false),
+		Field::new("o_comment", DataType::Utf8, false),
 	]))
 }
 
@@ -794,8 +792,8 @@ fn orders_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	.expect("orders descriptor")
 }
 
-/// Generate the q03-needed `ORDERS` columns (`o_orderkey`, `o_custkey`, `o_orderdate`, `o_shippriority`) at
-/// `scale_factor`. `o_orderdate` converts `TPCHDate → Date32` like `l_shipdate`.
+/// Generate the reached-query `ORDERS` columns at `scale_factor`. `o_orderdate` converts `TPCHDate`
+/// to `Date32` like `l_shipdate`.
 pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 	let generator = OrderGenerator::new(scale_factor, 1, 1);
 	let mut orderkey = Vec::new();
@@ -803,12 +801,14 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 	let mut orderdate = Vec::new();
 	let mut shippriority = Vec::new();
 	let mut orderpriority = Vec::new();
+	let mut comment = Vec::new();
 	for item in generator.iter() {
 		orderkey.push(item.o_orderkey);
 		custkey.push(item.o_custkey);
 		orderdate.push(item.o_orderdate.to_unix_epoch());
 		shippriority.push(item.o_shippriority);
 		orderpriority.push(item.o_orderpriority.to_string());
+		comment.push(item.o_comment.to_string());
 	}
 	RecordBatch::try_new(
 		orders_schema(),
@@ -818,6 +818,7 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 			Arc::new(Date32Array::from(orderdate)),
 			Arc::new(Int32Array::from(shippriority)),
 			Arc::new(StringArray::from(orderpriority)),
+			Arc::new(StringArray::from(comment)),
 		],
 	)
 	.expect("orders batch")
@@ -5488,7 +5489,7 @@ pub async fn run_strict_q20(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 307 - dev q13: customer distribution reachability probe for non-equality LEFT OUTER ON residuals.
+/// ADR 307/308 - dev q13: customer distribution reachability probe for side-local LEFT OUTER ON residuals.
 pub async fn run_dev_q13(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q13",
@@ -5500,7 +5501,7 @@ pub async fn run_dev_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 307 - strict q13: identical SQL shape; the expected wall is frontend lowering, before strict types matter.
+/// ADR 307/308 - strict q13: identical SQL shape; q13 has no strict-only decimal surface.
 pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q13",
@@ -5582,8 +5583,7 @@ fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	]
 }
 
-/// The two q13 harness tables: existing `customer` + `orders`. `orders.o_comment` is intentionally deferred
-/// until q13 advances past the frontend ON-clause wall.
+/// The two q13 harness tables: `customer` + `orders`.
 fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let customer = generate_customer(strict, scale_factor);
 	let orders = generate_orders(scale_factor);

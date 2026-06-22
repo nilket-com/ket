@@ -270,6 +270,7 @@ impl RuneDataFrame {
 				right: Box::new(right.plan),
 				kind: JoinKind::Inner,
 				on: pairs,
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			},
@@ -573,6 +574,7 @@ fn pin_broadcast_build(
 		right,
 		kind,
 		on,
+		on_filter,
 		null_safe_keys,
 		strategy_intent,
 	} = plan
@@ -586,6 +588,7 @@ fn pin_broadcast_build(
 			right,
 			kind,
 			on,
+			on_filter,
 			null_safe_keys,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
@@ -602,6 +605,7 @@ fn pin_broadcast_build(
 			right: strip_logical_root_exchange(right),
 			kind,
 			on,
+			on_filter,
 			null_safe_keys,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,

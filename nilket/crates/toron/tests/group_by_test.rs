@@ -2788,6 +2788,7 @@ async fn distinct_over_joined_aggregate_input_still_rejects() {
 			}),
 			kind: JoinKind::Inner,
 			on: vec![(Expr::column("region"), Expr::column("region"))],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}),

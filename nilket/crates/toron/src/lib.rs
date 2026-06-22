@@ -27,7 +27,7 @@ pub mod wire;
 
 #[cfg(test)]
 mod tests {
-	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+	use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
 	use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -584,6 +584,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
@@ -998,6 +999,7 @@ mod tests {
 					Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 					Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				)],
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
@@ -1036,6 +1038,124 @@ mod tests {
 			canonical_arrow_ipc_digest(&above_join_results, SortPolicy::FullRowLex)
 				.expect("above-join digest")
 		);
+	}
+
+	#[tokio::test]
+	async fn sql_left_outer_on_right_residual_preserves_unmatched_left_rows() {
+		let plan = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, customers.region \
+				 FROM orders LEFT OUTER JOIN customers \
+				 ON orders.customer_id = customers.id AND customers.region = 'west' \
+				 ORDER BY orders.id",
+			)
+			.expect("plan LEFT OUTER ON residual");
+		let results = run_local_join_query_with_catalog_config(
+			plan,
+			join_catalog(),
+			PlannerConfig::default(),
+		)
+		.await;
+
+		assert_eq!(results.len(), 1);
+		let batch = &results[0];
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		let regions = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let rows = (0..batch.num_rows())
+			.map(|row| {
+				(
+					ids.value(row),
+					if regions.is_null(row) {
+						None
+					} else {
+						Some(regions.value(row).to_string())
+					},
+				)
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			rows,
+			vec![
+				(100, None),
+				(101, Some("west".to_string())),
+				(102, Some("west".to_string())),
+				(103, None)
+			]
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_inner_join_on_single_side_residual_executes() {
+		let plan = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, customers.region \
+				 FROM orders INNER JOIN customers \
+				 ON orders.customer_id = customers.id AND customers.region = 'west' \
+				 ORDER BY orders.id",
+			)
+			.expect("plan INNER ON residual");
+		let results = run_local_join_query_with_catalog_config(
+			plan,
+			join_catalog(),
+			PlannerConfig::default(),
+		)
+		.await;
+
+		assert_eq!(results.len(), 1);
+		let batch = &results[0];
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		let regions = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let rows = (0..batch.num_rows())
+			.map(|row| (ids.value(row), regions.value(row).to_string()))
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			rows,
+			vec![(101, "west".to_string()), (102, "west".to_string())]
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_on_residual_rejects_unsupported_semantics() {
+		for sql in [
+			"SELECT * FROM orders LEFT OUTER JOIN customers \
+			 ON orders.customer_id = customers.id AND orders.id > 100",
+			"SELECT * FROM orders LEFT OUTER JOIN customers \
+			 ON orders.customer_id = customers.id AND orders.id > customers.id",
+			"SELECT * FROM orders FULL OUTER JOIN customers \
+			 ON orders.customer_id = customers.id AND customers.region = 'west'",
+			"SELECT * FROM orders INNER JOIN customers ON customers.region = 'west'",
+			"SELECT * FROM orders INNER JOIN customers \
+			 ON orders.customer_id = customers.id AND TRUE",
+		] {
+			let plan = crate::sql_planner::SqlPlanner::new()
+				.plan(sql)
+				.expect("plan ON residual");
+			let err = bind(&plan, join_catalog().as_ref(), &PlannerConfig::default())
+				.await
+				.expect_err("unsupported ON residual should reject");
+			assert!(
+				err.to_string().contains("unsupported ON-clause residual"),
+				"{sql}: {err}"
+			);
+		}
 	}
 
 	#[tokio::test]
@@ -4611,6 +4731,7 @@ mod tests {
 						),
 					),
 				],
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent: JoinStrategyIntent::Auto,
 			}),
@@ -4623,6 +4744,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("line_prices"), "region_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("regions"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
@@ -5046,6 +5168,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
@@ -5084,6 +5207,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
@@ -5120,6 +5244,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
@@ -5149,6 +5274,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
@@ -5178,6 +5304,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent,
 		}
@@ -5197,6 +5324,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent,
 		}
@@ -5263,6 +5391,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: JoinStrategyIntent::Auto,
 		}
@@ -5909,6 +6038,7 @@ mod tests {
 	fn assert_broadcast_pin_source(plan: &LogicalPlan, expected: JoinStrategyPinSource) {
 		match plan {
 			LogicalPlan::Join {
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent:
 					JoinStrategyIntent::Pinned {

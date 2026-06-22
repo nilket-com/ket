@@ -542,51 +542,65 @@ async fn q12_executes_in_both_modes_at_default_scale() {
 	}
 }
 
-// ADR 307: q13 is the first outer-join ON-residual probe. It stops during frontend lowering because
-// `lower_join_on` accepts equality predicates only; this is before binding, so the orders fixture
-// deliberately does not grow `o_comment` in this cut.
-#[tokio::test]
-async fn q13_advances_to_non_equi_join_on_wall() {
-	assert!(
-		status_rows()
-			.iter()
-			.any(|row| row == "q13 dev=implemented strict=implemented"),
-		"q13 is an implemented capability in the static inventory"
-	);
+// ADR 308: q13's right-side LEFT OUTER ON residual is pushed into `orders`, so the join stays key-only.
+// The derived aggregate + outer join future is deep enough to need the same explicit stack as q05/q10.
+#[test]
+fn q13_executes_in_both_modes_at_default_scale() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q13 dev=implemented strict=implemented"),
+					"q13 is an implemented capability in the static inventory"
+				);
 
-	for (mode, attempt) in [
-		("dev", run_dev_q13(0.01).await),
-		("strict", run_strict_q13(0.01).await),
-	] {
-		assert_eq!(attempt.query, "q13");
-		assert_eq!(
-			attempt.status,
-			Status::Blocked,
-			"q13 {mode} should classify the ON-residual wall: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.phase,
-			Phase::Plan,
-			"q13 {mode}: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unsupported_non_equi_join_on"),
-			"q13 {mode}: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.digest.is_none(),
-			"a blocked row has no digest: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.is_process_success(true),
-			"recognized blocked rows are successful only with --allow-blocked"
-		);
-	}
+				for (mode, attempt) in [
+					("dev", run_dev_q13(0.01).await),
+					("strict", run_strict_q13(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q13");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q13 {mode} should reach execute after ON residual pushdown: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.phase,
+						Phase::Execute,
+						"q13 {mode}: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.digest.as_deref(),
+						Some(
+							"ArrowIpcDigest([6, 95, 246, 6, 27, 55, 213, 177, 25, 224, 9, 168, 103, 227, 170, 45, 253, 215, 34, 121, 181, 93, 71, 245, 175, 11, 37, 250, 13, 221, 8, 35])"
+						),
+						"q13 {mode}: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.reason.is_none(),
+						"a pass carries no blocker reason: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(false),
+						"pass rows are successful without --allow-blocked"
+					);
+				}
+			});
+		})
+		.expect("spawn q13 thread")
+		.join()
+		.expect("q13 thread panicked");
 }
 
 // ADR 282 resolved q17's unqualified correlated scalar. ADR 283 clears the strict Decimal operand-alignment
@@ -783,7 +797,7 @@ fn reason_for_error_classifies_non_equi_join_on_precisely() {
 	assert_eq!(
 		status_for_reason("unsupported_non_equi_join_on"),
 		Status::Blocked,
-		"the measured q13 wall is a recognized blocker"
+		"the former q13 wall remains recognized for historical telemetry"
 	);
 	assert_eq!(
 		reason_for_error("JOIN requires ON equality predicates"),

@@ -69,6 +69,14 @@ impl ConjunctColumnSides {
 		self.right |= other.right;
 		self.ambiguous |= other.ambiguous;
 	}
+
+	fn is_left_only(&self) -> bool {
+		self.left && !self.right && !self.ambiguous
+	}
+
+	fn is_right_only(&self) -> bool {
+		self.right && !self.left && !self.ambiguous
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +291,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					on_filter,
 					null_safe_keys,
 					strategy_intent,
 				} => Ok(LogicalPlan::Join {
@@ -296,6 +305,7 @@ impl<'a> Binder<'a> {
 					),
 					kind: *kind,
 					on: on.clone(),
+					on_filter: on_filter.clone(),
 					null_safe_keys: *null_safe_keys,
 					strategy_intent: *strategy_intent,
 				}),
@@ -507,16 +517,23 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					on_filter,
 					null_safe_keys,
 					strategy_intent,
-				} => Ok(LogicalPlan::Join {
-					left: Box::new(self.recognize_cross_equi_joins(left).await?),
-					right: Box::new(self.recognize_cross_equi_joins(right).await?),
-					kind: *kind,
-					on: on.clone(),
-					null_safe_keys: *null_safe_keys,
-					strategy_intent: *strategy_intent,
-				}),
+				} => {
+					let left = self.recognize_cross_equi_joins(left).await?;
+					let right = self.recognize_cross_equi_joins(right).await?;
+					self.push_on_clause_residual(
+						left,
+						right,
+						*kind,
+						on.clone(),
+						on_filter.clone(),
+						*null_safe_keys,
+						*strategy_intent,
+					)
+					.await
+				}
 				LogicalPlan::CreateTableAsSelect {
 					table,
 					if_not_exists,
@@ -631,6 +648,79 @@ impl<'a> Binder<'a> {
 		})
 	}
 
+	/// ADR 308: classify a SQL ON residual after table schemas are available, then push the side-local cases
+	/// that are equivalent to filtering one join input before the key-only join. Cross-side/preserved-side
+	/// residuals need full theta-join match semantics, so this cut rejects them instead of smuggling a
+	/// post-join WHERE.
+	pub(super) fn push_on_clause_residual<'b>(
+		&'b self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		kind: JoinKind,
+		on: Vec<(Expr, Expr)>,
+		on_filter: Option<Expr>,
+		null_safe_keys: bool,
+		strategy_intent: JoinStrategyIntent,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let Some(on_filter) = on_filter else {
+				return Ok(LogicalPlan::Join {
+					left: Box::new(left),
+					right: Box::new(right),
+					kind,
+					on,
+					on_filter: None,
+					null_safe_keys,
+					strategy_intent,
+				});
+			};
+			if on.is_empty() {
+				return Err(on_clause_residual_unsupported());
+			}
+			let (Some(left_scope), Some(right_scope)) = (
+				self.logical_scope_for_outer_demotion(&left).await?,
+				self.logical_scope_for_outer_demotion(&right).await?,
+			) else {
+				return Err(on_clause_residual_unsupported());
+			};
+
+			let mut left_push = Vec::new();
+			let mut right_push = Vec::new();
+			for conjunct in split_logical_and_conjuncts(&on_filter) {
+				let sides = conjunct_column_sides(&conjunct, &left_scope, &right_scope);
+				match kind {
+					JoinKind::Inner if sides.is_left_only() => left_push.push(conjunct),
+					JoinKind::Inner if sides.is_right_only() => right_push.push(conjunct),
+					JoinKind::LeftOuter if sides.is_right_only() => right_push.push(conjunct),
+					JoinKind::RightOuter if sides.is_left_only() => left_push.push(conjunct),
+					_ => return Err(on_clause_residual_unsupported()),
+				}
+			}
+
+			let left = if left_push.is_empty() {
+				left
+			} else {
+				let pushed = push_logical_filter_conjuncts(left, left_push);
+				self.recognize_cross_equi_joins(&pushed).await?
+			};
+			let right = if right_push.is_empty() {
+				right
+			} else {
+				let pushed = push_logical_filter_conjuncts(right, right_push);
+				self.recognize_cross_equi_joins(&pushed).await?
+			};
+			Ok(LogicalPlan::Join {
+				left: Box::new(left),
+				right: Box::new(right),
+				kind,
+				on,
+				on_filter: None,
+				null_safe_keys,
+				strategy_intent,
+			})
+		})
+	}
+
 	/// ADR 270 helper: given the two children of a keyless `Cross` and the conjuncts of the filter above it,
 	/// lift cross-bridging equalities into `on` (demoting to `Inner`, preserving `strategy_intent`), route
 	/// single-side conjuncts into a `Cross` child (so nested comma edges lift), and re-wrap the rest as the
@@ -652,6 +742,7 @@ impl<'a> Binder<'a> {
 					right: Box::new(right),
 					kind: JoinKind::Cross,
 					on: Vec::new(),
+					on_filter: None,
 					null_safe_keys: false,
 					strategy_intent,
 				};
@@ -697,6 +788,7 @@ impl<'a> Binder<'a> {
 				right: Box::new(right),
 				kind,
 				on: keys,
+				on_filter: None,
 				null_safe_keys: false,
 				strategy_intent,
 			};
@@ -852,6 +944,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind: JoinKind::Inner,
 					on,
+					on_filter,
 					null_safe_keys,
 					strategy_intent,
 				} => {
@@ -863,6 +956,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind: JoinKind::Inner,
 								on,
+								on_filter,
 								null_safe_keys,
 								strategy_intent,
 							},
@@ -878,6 +972,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind: JoinKind::Inner,
 								on,
+								on_filter,
 								null_safe_keys,
 								strategy_intent,
 							},
@@ -919,6 +1014,7 @@ impl<'a> Binder<'a> {
 							right: Box::new(right.input),
 							kind: JoinKind::Inner,
 							on,
+							on_filter,
 							null_safe_keys,
 							strategy_intent,
 						},
@@ -931,6 +1027,7 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
+					on_filter,
 					null_safe_keys,
 					strategy_intent,
 				} => {
@@ -942,6 +1039,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								on_filter,
 								null_safe_keys,
 								strategy_intent,
 							},
@@ -957,6 +1055,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								on_filter,
 								null_safe_keys,
 								strategy_intent,
 							},
@@ -985,6 +1084,7 @@ impl<'a> Binder<'a> {
 								right,
 								kind,
 								on,
+								on_filter,
 								null_safe_keys,
 								strategy_intent,
 							},
@@ -1025,6 +1125,7 @@ impl<'a> Binder<'a> {
 							right: Box::new(right),
 							kind: to_kind,
 							on,
+							on_filter,
 							null_safe_keys,
 							strategy_intent,
 						},
@@ -1496,6 +1597,14 @@ fn push_logical_filter_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> Lo
 
 fn wrap_residual_filter(input: LogicalPlan, residual: Vec<Expr>) -> LogicalPlan {
 	push_logical_filter_conjuncts(input, residual)
+}
+
+fn on_clause_residual_unsupported() -> BindingError {
+	BindingError::UnsupportedExpression {
+		message:
+			"unsupported ON-clause residual: requires side-local predicate on null-supplying input"
+				.to_string(),
+	}
 }
 
 /// ADR 282: does any column in `expr` satisfy `predicate`? A focused expression walker reused by the

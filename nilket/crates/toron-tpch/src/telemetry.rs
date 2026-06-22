@@ -152,8 +152,8 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// validator. Keep the classifier precise for old rows and targeted regression probes.
 		"unsupported_derived_multi_source"
 	} else if lowered.contains("join on only supports equality predicates") {
-		// ADR 307: q13's LEFT OUTER JOIN ON clause contains an equality key plus a non-equality residual
-		// (`o_comment NOT LIKE ...`). The frontend currently accepts equality predicates only in ON.
+		// ADR 307's q13 row used this wall before ADR 308 added side-local ON residual pushdown. Keep
+		// the classifier precise for old telemetry and targeted regression probes.
 		"unsupported_non_equi_join_on"
 	} else if lowered.contains("unsupported expression") && lowered.contains("substring") {
 		// ADR 304's q22 row used this wall before ADR 305 added SUBSTRING support; keep it precise for old

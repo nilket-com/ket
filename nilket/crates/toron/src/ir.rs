@@ -1167,6 +1167,10 @@ pub enum LogicalPlan {
 		right: Box<LogicalPlan>,
 		kind: JoinKind,
 		on: Vec<(Expr, Expr)>,
+		/// ADR 308: transient pre-bind ON residual for side-local pushdown. The binder rewrites supported
+		/// residuals into a `Filter` below this key-only join, or rejects residuals that need full
+		/// theta-join match semantics. No `ExecutionPlan::Join` carries this field.
+		on_filter: Option<Expr>,
 		null_safe_keys: bool,
 		strategy_intent: JoinStrategyIntent,
 	},

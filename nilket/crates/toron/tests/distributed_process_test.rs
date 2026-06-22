@@ -2522,6 +2522,7 @@ fn hash_join_plan_with_partitions_and_kind(partition_count: u32, kind: JoinKind)
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
@@ -2550,6 +2551,7 @@ fn broadcast_join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,

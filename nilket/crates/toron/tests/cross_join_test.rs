@@ -318,6 +318,7 @@ async fn scalar_cross_join_binds_as_local_cartesian() {
 		right: Box::new(global_count_distinct_branch("right_t", "right_value")),
 		kind: JoinKind::Cross,
 		on: vec![],
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: JoinStrategyIntent::Auto,
 	};

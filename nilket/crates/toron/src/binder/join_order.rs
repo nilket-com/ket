@@ -1741,9 +1741,11 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 				right,
 				kind,
 				on,
+				on_filter,
 				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::Inner
+				&& on_filter.is_none()
 				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& !logical_plan_contains_join(right) =>
@@ -1791,9 +1793,11 @@ fn extract_left_preserved_outer_star_join_candidate(
 				right,
 				kind,
 				on,
+				on_filter,
 				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::LeftOuter
+				&& on_filter.is_none()
 				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& left_outer_star_dimension_label(right).is_some() =>
@@ -1839,9 +1843,11 @@ fn extract_right_preserved_outer_star_join_candidate(
 				right,
 				kind,
 				on,
+				on_filter,
 				null_safe_keys,
 				strategy_intent,
 			} if *kind == JoinKind::RightOuter
+				&& on_filter.is_none()
 				&& !*null_safe_keys
 				&& *strategy_intent == JoinStrategyIntent::Auto
 				&& left_outer_star_base_leaf_label(left).is_some() =>
@@ -1980,13 +1986,18 @@ pub(super) fn reroot_galaxy_join_tree(
 			right,
 			kind,
 			on,
+			on_filter,
 			null_safe_keys,
 			strategy_intent,
 		} = node
 		else {
 			return None;
 		};
-		if *null_safe_keys || *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+		if on_filter.is_some()
+			|| *null_safe_keys
+			|| *kind != JoinKind::Inner
+			|| logical_plan_contains_join(right)
+		{
 			return None;
 		}
 		join_meta.push((*kind, *strategy_intent));
@@ -2037,6 +2048,7 @@ pub(super) fn reroot_galaxy_join_tree(
 		right: Box::new(dim_leaf.clone()),
 		kind: base_kind,
 		on: fact_on[base_idx].clone(),
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: base_intent,
 	};
@@ -2051,6 +2063,7 @@ pub(super) fn reroot_galaxy_join_tree(
 				.iter()
 				.map(|(fact, dim)| (dim.clone(), fact.clone()))
 				.collect(),
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: intent,
 		};
@@ -2080,13 +2093,18 @@ pub(super) fn reverse_bridge_chain_join_tree(
 			right,
 			kind,
 			on,
+			on_filter,
 			null_safe_keys,
 			strategy_intent,
 		} = node
 		else {
 			return None;
 		};
-		if *null_safe_keys || *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+		if on_filter.is_some()
+			|| *null_safe_keys
+			|| *kind != JoinKind::Inner
+			|| logical_plan_contains_join(right)
+		{
 			return None;
 		}
 		join_meta.push((*kind, *strategy_intent));
@@ -2120,6 +2138,7 @@ pub(super) fn reverse_bridge_chain_join_tree(
 			right: Box::new(leaves[i].clone()),
 			kind,
 			on: swap(&conds[i - 1]),
+			on_filter: None,
 			null_safe_keys: false,
 			strategy_intent: intent,
 		};
@@ -2130,6 +2149,7 @@ pub(super) fn reverse_bridge_chain_join_tree(
 		right: Box::new(base_leaf),
 		kind,
 		on: swap(conds.last()?),
+		on_filter: None,
 		null_safe_keys: false,
 		strategy_intent: intent,
 	})
@@ -4214,12 +4234,17 @@ impl<'a> Binder<'a> {
 			right,
 			kind,
 			on,
+			on_filter,
 			null_safe_keys,
 			strategy_intent,
 		} = plan
 		else {
 			return Ok(GraphActuationResult::NotCandidate);
 		};
+
+		if on_filter.is_some() {
+			return Ok(GraphActuationResult::NotCandidate);
+		}
 
 		let mut scratch_trace = trace.clone();
 		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());

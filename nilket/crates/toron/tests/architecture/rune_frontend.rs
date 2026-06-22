@@ -1720,7 +1720,7 @@ pub(crate) fn adr122_rune_join_surface_exposed_without_join_kind_type() {
 pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	let planner = sql_planner_source();
 	let rune = rune_engine_source();
-	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
 	let lower_exists = source_block(&planner, "fn lower_exists_join");
 
 	assert!(builder.contains("on: Vec<(Expr, Expr)>"));
@@ -1729,9 +1729,8 @@ pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	assert!(builder.contains("LogicalPlan::Join"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned"));
 	assert!(builder.contains("JoinStrategy::Broadcast"));
-	assert!(
-		planner.contains("build_join_plan(plan, right, kind, on, strategy, source, build_side)?")
-	);
+	assert!(planner.contains("build_join_plan_with_filter("));
+	assert!(planner.contains("on_filter"));
 	assert!(lower_exists.contains("build_join_plan("));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(rune.contains(
@@ -1764,7 +1763,7 @@ pub(crate) fn adr122_rune_predicate_bridge_is_narrow_and_sql_does_not_call_it() 
 #[test]
 pub(crate) fn adr122_join_builder_inserts_terminal_hash_exchanges() {
 	let planner = sql_planner_source();
-	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
 	let hash_arm = builder
 		.split("JoinStrategy::HashPartitioned =>")
 		.nth(1)
@@ -1819,10 +1818,16 @@ pub(crate) fn adr125_rune_broadcast_authoring_stays_narrow_after_adr211() {
 #[test]
 pub(crate) fn adr125_strategy_aware_join_builder_is_single_helper() {
 	let planner = sql_planner_source();
-	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
 	let rune = rune_engine_source();
 
 	assert_eq!(planner.matches("pub(crate) fn build_join_plan(").count(), 1);
+	assert_eq!(
+		planner
+			.matches("pub(crate) fn build_join_plan_with_filter(")
+			.count(),
+		1
+	);
 	assert!(!planner.contains("fn build_hash_join_plan"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned =>"));
 	assert!(builder.contains("JoinStrategy::Broadcast =>"));
@@ -1880,11 +1885,9 @@ pub(crate) fn adr128_sql_broadcast_hint_authoring_is_narrow() {
 	assert!(planner.contains("BROADCAST"));
 	assert!(lower_select.contains("parse_broadcast_join_hint(optimizer_hints)?"));
 	assert!(lower_select.contains("join_strategy_intent_for_hint"));
-	assert!(lower_select.contains("build_auto_join_plan(plan, right, kind, on)"));
-	assert!(
-		lower_select
-			.contains("build_join_plan(plan, right, kind, on, strategy, source, build_side)?")
-	);
+	assert!(lower_select.contains("build_auto_join_plan_with_filter"));
+	assert!(lower_select.contains("build_join_plan_with_filter"));
+	assert!(lower_select.contains("on_filter"));
 	assert!(planner.contains("JoinStrategy::Broadcast"));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(!lower_exists.contains("JoinStrategy::Broadcast"));
@@ -2046,8 +2049,9 @@ pub(crate) fn adr129_tiny_broadcast_requires_hard_byte_upper_bound() {
 pub(crate) fn adr129_exchange_insertion_split_is_temporary() {
 	let planner = sql_planner_source();
 	let binder = binder_source();
-	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
-	let build_auto_join_plan = source_block(&planner, "pub(crate) fn build_auto_join_plan");
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan_with_filter");
+	let build_auto_join_plan =
+		source_block(&planner, "pub(crate) fn build_auto_join_plan_with_filter");
 	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
 	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned {"));
