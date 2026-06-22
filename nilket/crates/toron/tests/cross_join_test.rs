@@ -3,18 +3,23 @@
 //! The executor-level cartesian/multiplicity proof lives in `hash_join_kinds_test.rs` (reuses the
 //! `Executor` harness) and the distributed value-discriminating gate in `distributed_process_test.rs`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::ByteCount;
-use toron::error::BindingError;
+use toron::error::{BindingError, StorageError};
+use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
 	LogicalPlan, TableId,
 };
 use toron::sql_planner::SqlPlanner;
+use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -323,6 +328,97 @@ async fn adr311_not_in_filter_pushes_comma_equi_through_left_anti_stack() {
 }
 
 #[tokio::test]
+async fn adr319_or_branch_common_equi_keys_comma_join() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND left_t.left_value = 'small') \
+			    OR (right_t.id = left_t.id AND right_t.right_value = 23) \
+			    OR (left_t.id = right_t.id AND right_t.right_value = 34)",
+		)
+		.expect("plan OR-branch comma equi");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("common OR-branch equi key should lift, avoiding the keyless Cross");
+
+	assert_eq!(
+		join_kind_count(&bound, JoinKind::Inner),
+		1,
+		"the common OR-branch equality lifts into one keyed inner join"
+	);
+	assert_eq!(
+		join_kind_count(&bound, JoinKind::Cross),
+		0,
+		"the OR residual must not leave a keyless Cross behind"
+	);
+	assert_eq!(
+		find_join_strategy(&bound),
+		Some(JoinStrategy::HashPartitioned),
+		"oversized build hash-partitions only if the OR-hidden key was extracted"
+	);
+}
+
+#[tokio::test]
+async fn adr319_or_branch_missing_key_stays_keyless_cross_and_fails_loud() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND left_t.left_value = 'small') \
+			    OR right_t.right_value = 23",
+		)
+		.expect("plan partial-key OR");
+	let err = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect_err("a key present in only one OR branch must not be lifted");
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message.contains("broadcast-eligible")),
+		"expected the keyless-cross broadcast-eligibility failure, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr319_or_without_common_key_stays_keyless_cross_and_fails_loud() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND left_t.left_value = 'small') \
+			    OR (left_t.id < right_t.id AND right_t.right_value = 23)",
+		)
+		.expect("plan OR without common equi key");
+	let err = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect_err("an OR without a common bridging equality stays keyless");
+	assert!(
+		matches!(err, BindingError::UnsupportedExpression { ref message } if message.contains("broadcast-eligible")),
+		"expected the keyless-cross broadcast-eligibility failure, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr319_or_branch_key_extraction_matches_explicit_factored_filter() {
+	let extracted = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE (left_n.k = right_n.k AND left_n.left_value = 'small') \
+		    OR (right_n.k = left_n.k AND right_n.right_value = 23) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+	let explicit = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE left_n.k = right_n.k \
+		   AND (left_n.left_value = 'small' OR right_n.right_value = 23) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+	let expected = vec![(1, 23), (1, 34), (2, 23), (3, 99)];
+	assert_eq!(int64_int32_rows(&extracted), expected);
+	assert_eq!(int64_int32_rows(&explicit), expected);
+}
+
+#[tokio::test]
 async fn adr270_unsupported_join_key_type_stays_residual_filter() {
 	// Float join keys are explicitly unsupported by the keyed-join path. Pre-270, this query could still
 	// bind as a small broadcast Cross plus residual Float equality filter. ADR 270 must not turn that
@@ -467,6 +563,48 @@ fn join_kind_count(plan: &ExecutionPlan, expected: JoinKind) -> usize {
 	}
 }
 
+async fn run_cross_sql(sql: &str) -> RecordBatch {
+	let catalog = nullable_key_catalog();
+	let logical = SqlPlanner::new().plan(sql).expect("plan cross fixture sql");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("bind cross fixture sql");
+	let batches = Executor::new(Arc::new(CrossFixtureScan {
+		batches: HashMap::from([
+			(TableId(21), nullable_left_batch()),
+			(TableId(22), nullable_right_batch()),
+		]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute cross fixture sql");
+	assert_eq!(batches.len(), 1, "single-partition result");
+	batches.into_iter().next().expect("result batch")
+}
+
+fn int64_int32_rows(batch: &RecordBatch) -> Vec<(i64, i32)> {
+	let ids = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id column");
+	let values = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("right_value column");
+	let mut rows = Vec::with_capacity(batch.num_rows());
+	for row in 0..batch.num_rows() {
+		assert!(!ids.is_null(row), "id row {row} should not be null");
+		assert!(
+			!values.is_null(row),
+			"right_value row {row} should not be null"
+		);
+		rows.push((ids.value(row), values.value(row)));
+	}
+	rows
+}
+
 /// A broadcast build publishes through a single-partition (partition_count == 1) exchange, which is
 /// fine. A *hash* partition on the empty key is the forbidden single-bucket trap — a
 /// `partition_count > 1` exchange with an empty key program.
@@ -600,4 +738,101 @@ fn descriptor(id: u8, name: &str, schema: &Schema) -> TableSchemaDescriptor {
 		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
+}
+
+fn nullable_key_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(21),
+			descriptor(21, "left_n", nullable_left_schema().as_ref()),
+		)
+		.expect("register left_n");
+	catalog
+		.register_descriptor(
+			TableId(22),
+			descriptor(22, "right_n", nullable_right_schema().as_ref()),
+		)
+		.expect("register right_n");
+	catalog
+}
+
+fn nullable_left_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("k", DataType::Int64, true),
+		Field::new("left_value", DataType::Utf8, true),
+	]))
+}
+
+fn nullable_right_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("k", DataType::Int64, true),
+		Field::new("right_value", DataType::Int32, false),
+	]))
+}
+
+fn nullable_left_batch() -> RecordBatch {
+	RecordBatch::try_new(
+		nullable_left_schema(),
+		vec![
+			Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+			Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(3)])),
+			Arc::new(StringArray::from(vec![
+				Some("small"),
+				Some("large"),
+				Some("small"),
+				Some("small"),
+			])),
+		],
+	)
+	.expect("left batch")
+}
+
+fn nullable_right_batch() -> RecordBatch {
+	RecordBatch::try_new(
+		nullable_right_schema(),
+		vec![
+			Arc::new(Int64Array::from(vec![101, 102, 103, 104, 105])),
+			Arc::new(Int64Array::from(vec![
+				Some(1),
+				Some(1),
+				Some(2),
+				None,
+				Some(3),
+			])),
+			Arc::new(Int32Array::from(vec![
+				Some(23),
+				Some(34),
+				Some(23),
+				Some(23),
+				Some(99),
+			])),
+		],
+	)
+	.expect("right batch")
+}
+
+struct CrossFixtureScan {
+	batches: HashMap<TableId, RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl StorageScan for CrossFixtureScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		let batch =
+			self.batches
+				.get(&request.table_id)
+				.cloned()
+				.ok_or(StorageError::TableNotFound {
+					table: request.table_id,
+				})?;
+		Ok(ScanStream::from_batches(
+			batch.schema(),
+			request.session_id,
+			request.query_id,
+			vec![batch],
+		))
+	}
 }

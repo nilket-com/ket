@@ -158,9 +158,9 @@ pub const Q18_DEV_SQL: &str = "SELECT c_name, c_custkey, o_orderkey, o_orderdate
 /// strict q18 — identical SQL shape; strict mode carries official Decimal128 lineitem quantity.
 pub const STRICT_Q18_SQL: &str = Q18_DEV_SQL;
 
-/// ADR 316 — tpch.q19 (Discounted Revenue): official-shaped q19 with the three OR branches inlined.
-/// The `l_shipinstruct` fixture contingency fired; with the column present, q19 measures the disjunctive
-/// keyless-cross wall instead of a fixture gap.
+/// ADR 316/319 — tpch.q19 (Discounted Revenue): official-shaped q19 with the three OR branches inlined.
+/// The harness keeps a keyed-plan guard so the OR-branch extraction cannot regress into a default-scale
+/// cartesian.
 pub const Q19_DEV_SQL: &str = "SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue \
 	FROM lineitem, part \
 	WHERE (p_partkey = l_partkey \
@@ -6121,12 +6121,12 @@ pub async fn run_strict_q18(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 316 - dev q19: discounted-revenue reachability probe over lineitem/part with OR-branch predicates.
+/// ADR 319 - dev q19: discounted-revenue reachability over a keyed lineitem/part OR-branch join.
 pub async fn run_dev_q19(scale_factor: f64) -> Attempt {
 	run_q19("dev", false, scale_factor, Q19_DEV_SQL).await
 }
 
-/// ADR 316 - strict q19: identical SQL shape with strict Decimal128 lineitem columns.
+/// ADR 319 - strict q19: identical SQL shape with strict Decimal128 lineitem columns.
 pub async fn run_strict_q19(scale_factor: f64) -> Attempt {
 	run_q19("strict", true, scale_factor, STRICT_Q19_SQL).await
 }

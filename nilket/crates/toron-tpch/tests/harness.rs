@@ -935,11 +935,10 @@ async fn q18_blocks_on_grouped_membership_subquery_shape() {
 	}
 }
 
-// ADR 316: after the l_shipinstruct fixture gap is closed, q19's OR-of-ANDs leaves the lineitem/part
-// equality hidden inside OR branches. The harness blocks on the unkeyed bound shape before executing the
-// default-scale cartesian.
+// ADR 319: the lineitem/part equality appears inside every q19 OR branch, and the binder extracts that
+// common key before binding. The default-scale harness must prove the row is keyed, not a hidden cartesian.
 #[test]
-fn q19_blocks_on_disjunctive_keyless_cross() {
+fn q19_executes_with_keyed_lineitem_part_join() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -955,17 +954,12 @@ fn q19_blocks_on_disjunctive_keyless_cross() {
 					"q19 is an implemented capability in the static inventory"
 				);
 
-				let keying = q19_lineitem_part_join_is_keyed(false, 0.01)
+				q19_lineitem_part_join_is_keyed(false, 0.01)
 					.await
-					.expect_err("q19 has not keyed the lineitem/part join yet");
-				assert!(
-					keying.contains("was not a keyed Inner join"),
-					"q19 keying guard should report the disjunctive keying wall: {keying}"
-				);
-				assert!(
-					keying.contains("Cross left_keys=0 right_keys=0"),
-					"q19 still binds a keyless Cross because the equi-key is inside OR branches: {keying}"
-				);
+					.expect("dev q19 lineitem/part join is keyed");
+				q19_lineitem_part_join_is_keyed(true, 0.01)
+					.await
+					.expect("strict q19 lineitem/part join is keyed");
 
 				for (mode, attempt) in [
 					("dev", run_dev_q19(0.01).await),
@@ -974,29 +968,29 @@ fn q19_blocks_on_disjunctive_keyless_cross() {
 					assert_eq!(attempt.query, "q19");
 					assert_eq!(
 						attempt.status,
-						Status::Blocked,
-						"q19 {mode} should block before executing the cartesian: {}",
+						Status::Pass,
+						"q19 {mode} should execute through the keyed join: {}",
 						attempt.human()
 					);
-					assert_eq!(attempt.phase, Phase::Bind, "{}", attempt.human());
+					assert_eq!(attempt.phase, Phase::Execute, "{}", attempt.human());
 					assert_eq!(
 						attempt.reason.as_deref(),
-						Some("unsupported_cross_join"),
-						"q19 {mode} should reuse the keyless-cross blocker: {}",
+						None,
+						"q19 {mode} should not carry a blocker reason: {}",
 						attempt.human()
 					);
 					assert!(
-						attempt.digest.is_none(),
-						"a blocked row carries no digest: {}",
+						attempt.digest.is_some(),
+						"a pass row carries a digest: {}",
 						attempt.human()
 					);
 					assert!(
 						attempt.is_process_success(true),
-						"a recognized q19 blocker succeeds under --allow-blocked"
+						"q19 {mode} should succeed with --allow-blocked"
 					);
 					assert!(
-						!attempt.is_process_success(false),
-						"a q19 blocker still fails without --allow-blocked"
+						attempt.is_process_success(false),
+						"q19 {mode} should be a normal process success"
 					);
 				}
 			});

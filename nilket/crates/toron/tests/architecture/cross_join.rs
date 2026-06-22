@@ -96,6 +96,24 @@ pub(crate) fn adr270_comma_equi_recognition_is_binder_wired() {
 }
 
 #[test]
+pub(crate) fn adr319_or_branch_key_extraction_stays_in_cross_recognizer() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let recognizer = source_block(&demotion, "fn lift_cross_equi");
+
+	assert!(
+		demotion.contains("fn split_logical_or_disjuncts")
+			&& demotion.contains("fn extract_common_or_bridging_keys"),
+		"ADR 319 must keep OR-branch key extraction as a focused binder helper"
+	);
+	assert!(
+		recognizer
+			.contains("extract_common_or_bridging_keys(&conjunct, &left_scope, &right_scope)")
+			&& recognizer.contains("push_join_key_if_absent(&mut keys, pair)"),
+		"lift_cross_equi must extract common OR-branch keys after relation scopes are known"
+	);
+}
+
+#[test]
 pub(crate) fn adr239_cross_join_forces_broadcast_strategy() {
 	let join = source("src/binder/join.rs");
 

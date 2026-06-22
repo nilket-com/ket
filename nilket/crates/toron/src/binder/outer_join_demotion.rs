@@ -833,6 +833,17 @@ impl<'a> Binder<'a> {
 			let mut right_only: Vec<Expr> = Vec::new();
 			let mut residual: Vec<Expr> = Vec::new();
 			for conjunct in conjuncts {
+				if let Some((lifted_keys, residual_or)) =
+					extract_common_or_bridging_keys(&conjunct, &left_scope, &right_scope)
+				{
+					for pair in lifted_keys {
+						push_join_key_if_absent(&mut keys, pair);
+					}
+					if let Some(residual_or) = residual_or {
+						residual.push(residual_or);
+					}
+					continue;
+				}
 				let lifted = match &conjunct {
 					Expr::Eq(l, r) => {
 						orient_bridging_equi(l.as_ref(), r.as_ref(), &left_scope, &right_scope)
@@ -840,7 +851,7 @@ impl<'a> Binder<'a> {
 					_ => None,
 				};
 				if let Some(pair) = lifted {
-					keys.push(pair);
+					push_join_key_if_absent(&mut keys, pair);
 					continue;
 				}
 				let sides = conjunct_column_sides(&conjunct, &left_scope, &right_scope);
@@ -1677,10 +1688,27 @@ fn split_logical_and_conjuncts(expr: &Expr) -> Vec<Expr> {
 	}
 }
 
+fn split_logical_or_disjuncts(expr: &Expr) -> Vec<Expr> {
+	match expr {
+		Expr::Or(left, right) => {
+			let mut disjuncts = split_logical_or_disjuncts(left);
+			disjuncts.extend(split_logical_or_disjuncts(right));
+			disjuncts
+		}
+		_ => vec![expr.clone()],
+	}
+}
+
 fn combine_logical_and_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
 	conjuncts
 		.into_iter()
 		.reduce(|left, right| Expr::And(Box::new(left), Box::new(right)))
+}
+
+fn combine_logical_or_disjuncts(disjuncts: Vec<Expr>) -> Option<Expr> {
+	disjuncts
+		.into_iter()
+		.reduce(|left, right| Expr::Or(Box::new(left), Box::new(right)))
 }
 
 fn push_logical_filter_conjuncts(input: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
@@ -1717,6 +1745,94 @@ fn push_left_output_filter_conjuncts(input: LogicalPlan, mut conjuncts: Vec<Expr
 
 fn wrap_residual_filter(input: LogicalPlan, residual: Vec<Expr>) -> LogicalPlan {
 	push_logical_filter_conjuncts(input, residual)
+}
+
+fn extract_common_or_bridging_keys(
+	expr: &Expr,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
+) -> Option<(Vec<(Expr, Expr)>, Option<Expr>)> {
+	let disjuncts = split_logical_or_disjuncts(expr);
+	if disjuncts.len() < 2 {
+		return None;
+	}
+
+	let mut branches = Vec::with_capacity(disjuncts.len());
+	for disjunct in disjuncts {
+		let conjuncts = split_logical_and_conjuncts(&disjunct);
+		let keys = conjuncts
+			.iter()
+			.filter_map(|conjunct| oriented_key_for_conjunct(conjunct, left_scope, right_scope))
+			.collect::<Vec<_>>();
+		if keys.is_empty() {
+			return None;
+		}
+		branches.push((conjuncts, keys));
+	}
+
+	let mut common_keys = Vec::new();
+	for key in &branches[0].1 {
+		if common_keys
+			.iter()
+			.any(|existing| join_key_pair_same(existing, key))
+		{
+			continue;
+		}
+		if branches[1..].iter().all(|(_, keys)| {
+			keys.iter()
+				.any(|candidate| join_key_pair_same(candidate, key))
+		}) {
+			common_keys.push(key.clone());
+		}
+	}
+	if common_keys.is_empty() {
+		return None;
+	}
+
+	let mut residuals = Vec::with_capacity(branches.len());
+	for (mut conjuncts, _) in branches {
+		for key in &common_keys {
+			let index = conjuncts.iter().position(|conjunct| {
+				oriented_key_for_conjunct(conjunct, left_scope, right_scope)
+					.is_some_and(|candidate| join_key_pair_same(&candidate, key))
+			})?;
+			conjuncts.remove(index);
+		}
+		let Some(residual) = combine_logical_and_conjuncts(conjuncts) else {
+			return Some((common_keys, None));
+		};
+		residuals.push(residual);
+	}
+
+	Some((common_keys, combine_logical_or_disjuncts(residuals)))
+}
+
+fn oriented_key_for_conjunct(
+	conjunct: &Expr,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
+) -> Option<(Expr, Expr)> {
+	let Expr::Eq(left, right) = conjunct else {
+		return None;
+	};
+	orient_bridging_equi(left.as_ref(), right.as_ref(), left_scope, right_scope)
+}
+
+fn push_join_key_if_absent(keys: &mut Vec<(Expr, Expr)>, pair: (Expr, Expr)) {
+	if !keys
+		.iter()
+		.any(|existing| join_key_pair_same(existing, &pair))
+	{
+		keys.push(pair);
+	}
+}
+
+fn join_key_pair_same(left: &(Expr, Expr), right: &(Expr, Expr)) -> bool {
+	expr_column_same(&left.0, &right.0) && expr_column_same(&left.1, &right.1)
+}
+
+fn expr_column_same(left: &Expr, right: &Expr) -> bool {
+	matches!((left, right), (Expr::Column(left), Expr::Column(right)) if left == right)
 }
 
 fn on_clause_residual_unsupported() -> BindingError {
