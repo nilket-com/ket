@@ -70,6 +70,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_derived_multi_source",
 	"unsupported_non_equi_join_on",
 	"unsupported_cross_join",
+	"unsupported_having_scalar_subquery",
 	"unsupported_substring",
 	"unsupported_query_surface",
 ];
@@ -160,6 +161,10 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// A keyless CROSS JOIN is only admitted when one side can be broadcast. Keep this narrower than the
 		// generic unsupported-query bucket so the gauge reports cartesian/keying walls honestly.
 		"unsupported_cross_join"
+	} else if lowered.contains("scalar subqueries in group by/having") {
+		// ADR 314: q11's HAVING threshold is an uncorrelated aggregate scalar subquery. The frontend keeps
+		// scalar subqueries out of GROUP BY/HAVING, so q11 walls at plan before its joins or Decimal arithmetic.
+		"unsupported_having_scalar_subquery"
 	} else if lowered.contains("unsupported expression") && lowered.contains("substring") {
 		// ADR 304's q22 row used this wall before ADR 305 added SUBSTRING support; keep it precise for old
 		// telemetry and targeted regression probes.

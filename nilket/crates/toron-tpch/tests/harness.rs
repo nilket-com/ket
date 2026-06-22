@@ -8,11 +8,11 @@ use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
 	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
-	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
+	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14,
+	run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02,
 	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
-	run_strict_q09, run_strict_q10, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
-	run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
+	run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14,
+	run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q20, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -678,6 +678,63 @@ fn q15_blocks_on_keyless_cross_join() {
 		.expect("spawn q15 thread")
 		.join()
 		.expect("q15 thread panicked");
+}
+
+// ADR 314: q11 measures the HAVING scalar-subquery wall before joins or Decimal arithmetic are reached.
+#[test]
+fn q11_blocks_on_having_scalar_subquery() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q11 dev=implemented strict=implemented"),
+					"q11 is an implemented capability in the static inventory"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q11(0.01).await),
+					("strict", run_strict_q11(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q11");
+					assert_eq!(
+						attempt.status,
+						Status::Blocked,
+						"q11 {mode} should measure the HAVING scalar-subquery wall: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Plan, "{}", attempt.human());
+					assert_eq!(
+						attempt.reason.as_deref(),
+						Some("unsupported_having_scalar_subquery"),
+						"q11 {mode} should classify the measured wall precisely: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.digest.is_none(),
+						"a blocked row carries no digest: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(true),
+						"a recognized blocked row succeeds under --allow-blocked"
+					);
+					assert!(
+						!attempt.is_process_success(false),
+						"a blocked row still fails without --allow-blocked"
+					);
+				}
+			});
+		})
+		.expect("spawn q11 thread")
+		.join()
+		.expect("q11 thread panicked");
 }
 
 fn q16_supplier_comment_excluded(comment: &str) -> bool {

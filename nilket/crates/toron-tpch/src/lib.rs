@@ -210,6 +210,26 @@ pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 /// strict q13 - identical SQL shape; q13 has no strict-only decimal surface.
 pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
 
+/// ADR 314 - tpch.q11 (Important Stock Identification): official-shaped q11 with `:1` ->
+/// `GERMANY`, `:2` -> `0.0001`, and no LIMIT.
+pub const Q11_DEV_SQL: &str = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value \
+	FROM partsupp, supplier, nation \
+	WHERE ps_suppkey = s_suppkey \
+	  AND s_nationkey = n_nationkey \
+	  AND n_name = 'GERMANY' \
+	GROUP BY ps_partkey \
+	HAVING SUM(ps_supplycost * ps_availqty) > ( \
+	  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001 \
+	  FROM partsupp, supplier, nation \
+	  WHERE ps_suppkey = s_suppkey \
+	    AND s_nationkey = n_nationkey \
+	    AND n_name = 'GERMANY' \
+	) \
+	ORDER BY value DESC";
+
+/// strict q11 - identical SQL shape; strict mode carries official Decimal128 partsupp supply cost.
+pub const STRICT_Q11_SQL: &str = Q11_DEV_SQL;
+
 /// ADR 313 - tpch.q15 (Top Supplier): official-shaped q15 with `:1` -> `DATE '1996-01-01'`.
 /// The `revenue` CTE is intentionally referenced twice: once as an outer `FROM` source and again as the source
 /// of an uncorrelated aggregate scalar subquery.
@@ -6084,6 +6104,30 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
+/// ADR 314 - dev q11: partsupp/supplier/nation reachability with a HAVING scalar threshold.
+pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q11",
+		"dev",
+		scale_factor,
+		Q11_DEV_SQL,
+		q11_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 314 - strict q11: identical SQL shape; strict mode carries official Decimal128 partsupp supply cost.
+pub async fn run_strict_q11(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q11",
+		"strict",
+		scale_factor,
+		STRICT_Q11_SQL,
+		q11_tables(true, scale_factor),
+	)
+	.await
+}
+
 /// ADR 313 - dev q15: CTE-as-FROM-source plus scalar aggregate over the same CTE.
 pub async fn run_dev_q15(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
@@ -6351,6 +6395,36 @@ fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 			descriptor: orders_descriptor(orders_schema().as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
+		},
+	]
+}
+
+/// The three q11 harness tables: `partsupp`, `supplier`, and `nation`.
+fn q11_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let partsupp = generate_partsupp(strict, scale_factor);
+	let supplier = generate_supplier(strict, scale_factor);
+	let nation = generate_nation(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "partsupp",
+			descriptor: partsupp_descriptor(partsupp_schema(strict).as_ref()),
+			facts: facts_for_batch(&partsupp),
+			batch: partsupp,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "nation",
+			descriptor: nation_descriptor(nation_schema().as_ref()),
+			facts: facts_for_batch(&nation),
+			batch: nation,
 		},
 	]
 }
@@ -6903,8 +6977,8 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q20" || *id == "q12"
 					|| *id == "q07" || *id == "q08"
 					|| *id == "q09" || *id == "q13"
-					|| *id == "q15" || *id == "q16"
-					|| *id == "q22"
+					|| *id == "q11" || *id == "q15"
+					|| *id == "q16" || *id == "q22"
 				{
 					"implemented"
 				} else {
