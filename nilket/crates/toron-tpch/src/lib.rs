@@ -191,6 +191,38 @@ pub const Q19_DEV_SQL: &str = "SELECT SUM(l_extendedprice * (1 - l_discount)) AS
 /// strict q19 — identical SQL shape; strict mode carries official Decimal128 lineitem money/quantity types.
 pub const STRICT_Q19_SQL: &str = Q19_DEV_SQL;
 
+/// ADR 317 — tpch.q21 (Supplier Who Kept Orders Waiting): official-shaped q21 with `:1` -> `'SAUDI ARABIA'`
+/// and `LIMIT 100` preserved. The query carries a correlated `EXISTS` and correlated `NOT EXISTS` over
+/// lineitem self-aliases; this harness row measures that surface without pre-solving it.
+pub const Q21_DEV_SQL: &str = "SELECT s_name, COUNT(*) AS numwait \
+	FROM supplier, lineitem l1, orders, nation \
+	WHERE s_suppkey = l1.l_suppkey \
+	  AND o_orderkey = l1.l_orderkey \
+	  AND o_orderstatus = 'F' \
+	  AND l1.l_receiptdate > l1.l_commitdate \
+	  AND EXISTS ( \
+	    SELECT * \
+	    FROM lineitem l2 \
+	    WHERE l2.l_orderkey = l1.l_orderkey \
+	      AND l2.l_suppkey <> l1.l_suppkey \
+	  ) \
+	  AND NOT EXISTS ( \
+	    SELECT * \
+	    FROM lineitem l3 \
+	    WHERE l3.l_orderkey = l1.l_orderkey \
+	      AND l3.l_suppkey <> l1.l_suppkey \
+	      AND l3.l_receiptdate > l3.l_commitdate \
+	  ) \
+	  AND s_nationkey = n_nationkey \
+	  AND n_name = 'SAUDI ARABIA' \
+	GROUP BY s_name \
+	ORDER BY numwait DESC, s_name \
+	LIMIT 100";
+
+/// strict q21 — identical SQL shape; q21 projects only `s_name` and `COUNT(*)`, so there is no strict-only
+/// Decimal output surface.
+pub const STRICT_Q21_SQL: &str = Q21_DEV_SQL;
+
 /// ADR 284 — tpch.q02 (Minimum Cost Supplier): tpchgen-2.0.2's exact Q2 with `:1` → `15`, `:2` →
 /// `BRASS`, `:3` → `EUROPE`, and no LIMIT. The correlated scalar `MIN(ps_supplycost)` has a multi-table
 /// comma-join inner input (`partsupp, supplier, nation, region`) and is the measured frontier.
@@ -6099,6 +6131,31 @@ pub async fn run_strict_q19(scale_factor: f64) -> Attempt {
 	run_q19("strict", true, scale_factor, STRICT_Q19_SQL).await
 }
 
+/// ADR 317 - dev q21: final reachability probe over supplier/lineitem/orders/nation with correlated
+/// EXISTS/NOT EXISTS self-aliases.
+pub async fn run_dev_q21(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q21",
+		"dev",
+		scale_factor,
+		Q21_DEV_SQL,
+		q21_tables(false, scale_factor),
+	)
+	.await
+}
+
+/// ADR 317 - strict q21: identical SQL shape; strict mode carries official Decimal128 lineitem columns.
+pub async fn run_strict_q21(scale_factor: f64) -> Attempt {
+	run_query_with_tables(
+		"q21",
+		"strict",
+		scale_factor,
+		STRICT_Q21_SQL,
+		q21_tables(true, scale_factor),
+	)
+	.await
+}
+
 async fn run_q19(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Attempt {
 	let start = Instant::now();
 	if let Err(message) = q19_lineitem_part_join_is_keyed(strict, scale_factor).await {
@@ -6846,6 +6903,53 @@ fn q19_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	q14_tables(strict, scale_factor)
 }
 
+/// The four q21 harness tables: supplier + mode-sensitive lineitem + orders + nation.
+fn q21_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
+	let supplier = generate_supplier(strict, scale_factor);
+	let lineitem = if strict {
+		generate_strict_lineitem(scale_factor)
+	} else {
+		generate_dev_lineitem(scale_factor)
+	};
+	let lineitem_descriptor = if strict {
+		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+	} else {
+		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+	};
+	let orders = generate_orders(scale_factor);
+	let nation = generate_nation(scale_factor);
+	vec![
+		HarnessTable {
+			id: TableId(1),
+			name: "supplier",
+			descriptor: supplier_descriptor(supplier_schema(strict).as_ref()),
+			facts: facts_for_batch(&supplier),
+			batch: supplier,
+		},
+		HarnessTable {
+			id: TableId(2),
+			name: "lineitem",
+			descriptor: lineitem_descriptor,
+			facts: facts_for_batch(&lineitem),
+			batch: lineitem,
+		},
+		HarnessTable {
+			id: TableId(3),
+			name: "orders",
+			descriptor: orders_descriptor(orders_schema().as_ref()),
+			facts: facts_for_batch(&orders),
+			batch: orders,
+		},
+		HarnessTable {
+			id: TableId(4),
+			name: "nation",
+			descriptor: nation_descriptor(nation_schema().as_ref()),
+			facts: facts_for_batch(&nation),
+			batch: nation,
+		},
+	]
+}
+
 /// ADR 274 — dev q10: the first 4-table query (`customer`/`orders`/`lineitem`/`nation`). A reachability
 /// attempt — records whichever wall q10 hits first.
 pub async fn run_dev_q10(scale_factor: f64) -> Attempt {
@@ -7194,7 +7298,8 @@ pub fn status_rows() -> Vec<String> {
 					|| *id == "q09" || *id == "q13"
 					|| *id == "q11" || *id == "q15"
 					|| *id == "q16" || *id == "q18"
-					|| *id == "q19" || *id == "q22"
+					|| *id == "q19" || *id == "q21"
+					|| *id == "q22"
 				{
 					"implemented"
 				} else {

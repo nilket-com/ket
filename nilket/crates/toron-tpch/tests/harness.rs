@@ -10,10 +10,11 @@ use toron_tpch::{
 	q19_lineitem_part_join_is_keyed, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
 	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
 	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
-	run_dev_q20, run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04,
-	run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10,
-	run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16,
-	run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q22, status_rows,
+	run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
+	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
+	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
+	run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -1066,6 +1067,78 @@ fn q20_executes_in_both_modes() {
 		.expect("spawn q20 thread")
 		.join()
 		.expect("q20 thread panicked");
+}
+
+// ADR 317: q21 closes the reachability atlas. The first measured wall is the correlated EXISTS/NOT EXISTS
+// predicate body (`unsupported EXISTS subquery predicate`), before the deferred `o_orderstatus` fixture gap.
+#[test]
+fn q21_blocks_on_correlated_exists_predicate_shape() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q21 dev=implemented strict=implemented"),
+					"q21 is an implemented capability in the static inventory"
+				);
+
+				for (mode, attempt) in [
+					("dev", run_dev_q21(0.01).await),
+					("strict", run_strict_q21(0.01).await),
+				] {
+					assert_eq!(attempt.query, "q21");
+					assert_eq!(
+						attempt.status,
+						Status::Blocked,
+						"q21 {mode} should record a recognized blocker: {}",
+						attempt.human()
+					);
+					assert_eq!(attempt.phase, Phase::Plan, "{}", attempt.human());
+					assert_eq!(
+						attempt.reason.as_deref(),
+						Some("unsupported_query_surface"),
+						"q21 {mode} keeps the broad EXISTS-predicate shape reject in the query-surface bucket: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.digest.is_none(),
+						"a blocked row carries no digest: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(true),
+						"a recognized q21 blocker succeeds under --allow-blocked"
+					);
+					assert!(
+						!attempt.is_process_success(false),
+						"a q21 blocker still fails without --allow-blocked"
+					);
+				}
+			});
+		})
+		.expect("spawn q21 thread")
+		.join()
+		.expect("q21 thread panicked");
+}
+
+#[test]
+fn reason_for_error_keeps_q21_exists_predicate_in_query_surface_bucket() {
+	assert_eq!(
+		reason_for_error("unsupported frontend construct: unsupported EXISTS subquery predicate"),
+		"unsupported_query_surface",
+		"the q21 raw error is not specific enough for a narrower classifier"
+	);
+	assert_eq!(
+		status_for_reason("unsupported_query_surface"),
+		Status::Blocked,
+		"the measured q21 wall remains a recognized blocker"
+	);
 }
 
 // ADR 305: SUBSTRING support clears q22's measured wall; both modes now reach execute.
