@@ -1,6 +1,6 @@
 //! The strict correctness rail — answer-checked cells, kept separate from reachability.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray};
@@ -9,29 +9,31 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
-	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q13Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE,
-	Q17Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
-	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q04_schema,
-	assert_strict_q5_schema, assert_strict_q07_schema, assert_strict_q08_schema,
-	assert_strict_q09_schema, assert_strict_q10_schema, assert_strict_q12_schema,
-	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q17_schema,
-	assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw, check_strict_q1,
-	check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5, check_strict_q6,
-	check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10, check_strict_q12,
-	check_strict_q13, check_strict_q14, check_strict_q17, check_strict_q20, check_strict_q22,
-	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
-	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
-	compare_strict_q09, compare_strict_q10, compare_strict_q12, compare_strict_q13,
-	compare_strict_q14, compare_strict_q17, compare_strict_q20, compare_strict_q22,
+	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q13Oracle, Q14Oracle, Q16Oracle,
+	Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle,
+	assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
+	assert_strict_q04_schema, assert_strict_q5_schema, assert_strict_q07_schema,
+	assert_strict_q08_schema, assert_strict_q09_schema, assert_strict_q10_schema,
+	assert_strict_q12_schema, assert_strict_q13_schema, assert_strict_q14_schema,
+	assert_strict_q16_schema, assert_strict_q17_schema, assert_strict_q20_schema,
+	assert_strict_q22_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
+	check_strict_q09, check_strict_q10, check_strict_q12, check_strict_q13, check_strict_q14,
+	check_strict_q16, check_strict_q17, check_strict_q20, check_strict_q22, compare_strict_q1,
+	compare_strict_q02, compare_strict_q3, compare_strict_q04, compare_strict_q5,
+	compare_strict_q6, compare_strict_q07, compare_strict_q08, compare_strict_q09,
+	compare_strict_q10, compare_strict_q12, compare_strict_q13, compare_strict_q14,
+	compare_strict_q16, compare_strict_q17, compare_strict_q20, compare_strict_q22,
 	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
 	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
 	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
-	q13_comment_matches_pattern, q13_oracle_from_rows, q20_part_name_is_forest_prefix,
-	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
-	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
-	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
-	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q12_oracle, strict_q13_oracle,
-	strict_q14_oracle, strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
+	q13_comment_matches_pattern, q13_oracle_from_rows, q16_customer_complaints_matches_pattern,
+	q16_oracle_from_rows, q20_part_name_is_forest_prefix, q20_threshold_passes,
+	q22_acctbal_above_threshold, q22_country_code, q22_country_code_is_selected,
+	q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q04_oracle,
+	strict_q5_oracle, strict_q6_oracle, strict_q07_oracle, strict_q08_oracle, strict_q09_oracle,
+	strict_q10_oracle, strict_q12_oracle, strict_q13_oracle, strict_q14_oracle, strict_q16_oracle,
+	strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -3230,6 +3232,403 @@ fn q13_order_violation_is_fail() {
 	assert!(
 		compare_strict_q13(&[q13_batch(&[(1, 1), (2, 1), (0, 1)])], &tie_oracle).is_err(),
 		"c_count DESC is enforced when custdist ties"
+	);
+}
+
+fn q16_oracle(rows: &[(&str, &str, i32, i64)]) -> Q16Oracle {
+	let mut groups = BTreeMap::new();
+	let mut kept_partsupp_rows = 0_usize;
+	for (idx, (brand, part_type, size, supplier_cnt)) in rows.iter().enumerate() {
+		let suppliers = (0..*supplier_cnt)
+			.map(|offset| idx as i64 * 1_000 + offset)
+			.collect::<HashSet<_>>();
+		kept_partsupp_rows += suppliers.len();
+		groups.insert(
+			((*brand).to_string(), (*part_type).to_string(), *size),
+			suppliers,
+		);
+	}
+	Q16Oracle {
+		groups,
+		excluded_suppliers: 0,
+		kept_partsupp_rows,
+		dedup_groups: 1,
+		pruned_parts: 1,
+	}
+}
+
+fn q16_nullable_batch(
+	rows: &[(Option<&str>, Option<&str>, Option<i32>, Option<i64>)],
+) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("p_brand", DataType::Utf8, true),
+		Field::new("p_type", DataType::Utf8, true),
+		Field::new("p_size", DataType::Int32, true),
+		Field::new("supplier_cnt", DataType::Int64, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)) as ArrayRef,
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<&str>>>(),
+			)) as ArrayRef,
+			Arc::new(Int32Array::from(
+				rows.iter().map(|row| row.2).collect::<Vec<Option<i32>>>(),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.3).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+		],
+	)
+	.expect("q16 batch")
+}
+
+fn q16_batch(rows: &[(&str, &str, i32, i64)]) -> RecordBatch {
+	let nullable = rows
+		.iter()
+		.map(|(brand, part_type, size, count)| {
+			(Some(*brand), Some(*part_type), Some(*size), Some(*count))
+		})
+		.collect::<Vec<_>>();
+	q16_nullable_batch(&nullable)
+}
+
+fn q16_int64_size_batch() -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("p_brand", DataType::Utf8, false),
+		Field::new("p_type", DataType::Utf8, false),
+		Field::new("p_size", DataType::Int64, false),
+		Field::new("supplier_cnt", DataType::Int64, false),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(vec!["Brand#12"])) as ArrayRef,
+			Arc::new(StringArray::from(vec!["SMALL BRUSHED TIN"])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![49])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+		],
+	)
+	.expect("q16 int64-size batch")
+}
+
+#[test]
+fn strict_q16_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q16(0.01))
+		})
+		.expect("spawn q16 correctness thread")
+		.join()
+		.expect("q16 correctness thread panicked");
+	assert_eq!(attempt.query, "q16");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q16_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q16_oracle(0.01);
+	assert_eq!(oracle.groups.len(), 296, "{oracle:?}");
+	assert_eq!(oracle.kept_partsupp_rows, 1196, "{oracle:?}");
+	assert_eq!(oracle.dedup_groups, 1, "{oracle:?}");
+	assert_eq!(oracle.pruned_parts, 1701, "{oracle:?}");
+	assert_eq!(
+		oracle.excluded_suppliers, 0,
+		"default-scale q16 does not exercise supplier-comment exclusion; synthetic coverage is mandatory"
+	);
+}
+
+#[test]
+fn strict_q16_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q16_schema(&[q16_batch(&[("Brand#12", "SMALL BRUSHED TIN", 49, 1)])]).is_ok()
+	);
+	assert!(
+		assert_strict_q16_schema(&[q16_int64_size_batch()]).is_err(),
+		"a non-measured p_size type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q16_count_distinct_dedups_supplier_per_group() {
+	let oracle = q16_oracle_from_rows(
+		[
+			(
+				1_i64,
+				"Brand#12".to_string(),
+				"SMALL BRUSHED TIN".to_string(),
+				49,
+			),
+			(
+				2_i64,
+				"Brand#12".to_string(),
+				"SMALL BRUSHED TIN".to_string(),
+				49,
+			),
+		],
+		[(7_i64, "ordinary supplier".to_string())],
+		[(1_i64, 7_i64), (2_i64, 7_i64)],
+	);
+	let suppliers = oracle
+		.groups
+		.get(&("Brand#12".to_string(), "SMALL BRUSHED TIN".to_string(), 49))
+		.expect("q16 group");
+	assert_eq!(suppliers.len(), 1, "{oracle:?}");
+	assert_eq!(oracle.kept_partsupp_rows, 2, "{oracle:?}");
+	assert_eq!(oracle.dedup_groups, 1, "{oracle:?}");
+}
+
+#[test]
+fn q16_not_in_excludes_complaint_supplier() {
+	let oracle = q16_oracle_from_rows(
+		[(
+			1_i64,
+			"Brand#12".to_string(),
+			"SMALL BRUSHED TIN".to_string(),
+			49,
+		)],
+		[
+			(7_i64, "zz Customer yy Complaints xx".to_string()),
+			(8_i64, "ordinary supplier".to_string()),
+		],
+		[(1_i64, 7_i64), (1_i64, 8_i64)],
+	);
+	let suppliers = oracle
+		.groups
+		.get(&("Brand#12".to_string(), "SMALL BRUSHED TIN".to_string(), 49))
+		.expect("q16 group");
+	assert_eq!(oracle.excluded_suppliers, 1, "{oracle:?}");
+	assert!(!suppliers.contains(&7), "{oracle:?}");
+	assert!(suppliers.contains(&8), "{oracle:?}");
+	assert_eq!(suppliers.len(), 1, "{oracle:?}");
+}
+
+#[test]
+fn q16_customer_complaints_matcher_is_positional() {
+	assert!(q16_customer_complaints_matches_pattern(
+		"alpha Customer beta Complaints gamma"
+	));
+	assert!(q16_customer_complaints_matches_pattern(
+		"CustomerComplaints"
+	));
+	assert!(!q16_customer_complaints_matches_pattern(
+		"Complaints before Customer"
+	));
+	assert!(!q16_customer_complaints_matches_pattern(
+		"Customer without second token"
+	));
+	assert!(!q16_customer_complaints_matches_pattern(
+		"Complaints without first token"
+	));
+	assert!(!q16_customer_complaints_matches_pattern(
+		"customer beta complaints"
+	));
+}
+
+#[test]
+fn q16_filter_predicates_are_exact() {
+	let oracle = q16_oracle_from_rows(
+		[
+			(
+				1_i64,
+				"Brand#12".to_string(),
+				"SMALL BRUSHED TIN".to_string(),
+				49,
+			),
+			(
+				2_i64,
+				"Brand#45".to_string(),
+				"SMALL BRUSHED TIN".to_string(),
+				49,
+			),
+			(
+				3_i64,
+				"Brand#12".to_string(),
+				"MEDIUM POLISHED TIN".to_string(),
+				49,
+			),
+			(
+				4_i64,
+				"Brand#12".to_string(),
+				"SMALL BRUSHED TIN".to_string(),
+				50,
+			),
+		],
+		[(7_i64, "ordinary supplier".to_string())],
+		[
+			(1_i64, 7_i64),
+			(2_i64, 7_i64),
+			(3_i64, 7_i64),
+			(4_i64, 7_i64),
+		],
+	);
+	assert_eq!(oracle.pruned_parts, 3, "{oracle:?}");
+	assert_eq!(oracle.kept_partsupp_rows, 1, "{oracle:?}");
+	assert!(oracle.groups.contains_key(&(
+		"Brand#12".to_string(),
+		"SMALL BRUSHED TIN".to_string(),
+		49
+	)));
+}
+
+#[test]
+fn q16_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q16_oracle(&[("Brand#12", "SMALL BRUSHED TIN", 49, 2)]);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[("Brand#12", "SMALL BRUSHED TIN", 49, 2)])],
+			&oracle
+		)
+		.is_ok(),
+		"exact q16 group match"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[("Brand#12", "SMALL BRUSHED TIN", 49, 3)])],
+			&oracle
+		)
+		.is_err(),
+		"a wrong supplier_cnt is a mismatch"
+	);
+}
+
+#[test]
+fn q16_missing_extra_or_duplicate_group_is_fail() {
+	let oracle = q16_oracle(&[
+		("Brand#12", "SMALL BRUSHED TIN", 49, 2),
+		("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+	]);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[("Brand#12", "SMALL BRUSHED TIN", 49, 2)])],
+			&oracle
+		)
+		.is_err(),
+		"a missing group is a mismatch"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[
+				("Brand#12", "SMALL BRUSHED TIN", 49, 2),
+				("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+				("Brand#14", "SMALL BRUSHED TIN", 49, 1)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an extra group is a mismatch"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[
+				("Brand#12", "SMALL BRUSHED TIN", 49, 2),
+				("Brand#12", "SMALL BRUSHED TIN", 49, 2),
+				("Brand#13", "SMALL BRUSHED TIN", 49, 1)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted group is rejected"
+	);
+}
+
+#[test]
+fn q16_null_cell_is_fail() {
+	let oracle = q16_oracle(&[("Brand#12", "SMALL BRUSHED TIN", 49, 2)]);
+	assert!(
+		compare_strict_q16(
+			&[q16_nullable_batch(&[(
+				None,
+				Some("SMALL BRUSHED TIN"),
+				Some(49),
+				Some(2)
+			)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL p_brand is fail@compare"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_nullable_batch(&[(
+				Some("Brand#12"),
+				None,
+				Some(49),
+				Some(2)
+			)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL p_type is fail@compare"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_nullable_batch(&[(
+				Some("Brand#12"),
+				Some("SMALL BRUSHED TIN"),
+				None,
+				Some(2)
+			)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL p_size is fail@compare"
+	);
+	assert!(
+		compare_strict_q16(
+			&[q16_nullable_batch(&[(
+				Some("Brand#12"),
+				Some("SMALL BRUSHED TIN"),
+				Some(49),
+				None
+			)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL supplier_cnt is fail@compare"
+	);
+}
+
+#[test]
+fn q16_four_key_order_violation_is_fail() {
+	let oracle = q16_oracle(&[
+		("Brand#12", "SMALL BRUSHED TIN", 49, 2),
+		("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+	]);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[
+				("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+				("Brand#12", "SMALL BRUSHED TIN", 49, 2)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"supplier_cnt DESC is enforced"
+	);
+	let tie_oracle = q16_oracle(&[
+		("Brand#12", "SMALL BRUSHED TIN", 49, 1),
+		("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+	]);
+	assert!(
+		compare_strict_q16(
+			&[q16_batch(&[
+				("Brand#13", "SMALL BRUSHED TIN", 49, 1),
+				("Brand#12", "SMALL BRUSHED TIN", 49, 1)
+			])],
+			&tie_oracle
+		)
+		.is_err(),
+		"p_brand ASC is enforced when supplier_cnt ties"
 	);
 }
 

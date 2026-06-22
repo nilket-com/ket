@@ -5299,6 +5299,293 @@ pub async fn check_strict_q13(scale_factor: f64) -> CorrectnessAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q16Oracle {
+	pub groups: BTreeMap<(String, String, i32), HashSet<i64>>,
+	pub excluded_suppliers: usize,
+	pub kept_partsupp_rows: usize,
+	pub dedup_groups: usize,
+	pub pruned_parts: usize,
+}
+
+const Q16_SIZES: [i32; 8] = [49, 14, 23, 45, 19, 3, 36, 9];
+
+pub fn q16_customer_complaints_matches_pattern(comment: &str) -> bool {
+	let Some(customer) = comment.find("Customer") else {
+		return false;
+	};
+	comment[customer + "Customer".len()..].contains("Complaints")
+}
+
+fn q16_part_is_kept(brand: &str, part_type: &str, size: i32) -> bool {
+	brand != "Brand#45" && !part_type.starts_with("MEDIUM POLISHED") && Q16_SIZES.contains(&size)
+}
+
+pub fn q16_oracle_from_rows(
+	parts: impl IntoIterator<Item = (i64, String, String, i32)>,
+	suppliers: impl IntoIterator<Item = (i64, String)>,
+	partsupp: impl IntoIterator<Item = (i64, i64)>,
+) -> Q16Oracle {
+	let excluded: HashSet<i64> = suppliers
+		.into_iter()
+		.filter_map(|(suppkey, comment)| {
+			q16_customer_complaints_matches_pattern(&comment).then_some(suppkey)
+		})
+		.collect();
+	let mut kept_parts = HashMap::new();
+	let mut pruned_parts = 0_usize;
+	for (partkey, brand, part_type, size) in parts {
+		if q16_part_is_kept(&brand, &part_type, size) {
+			kept_parts.insert(partkey, (brand, part_type, size));
+		} else {
+			pruned_parts += 1;
+		}
+	}
+
+	let mut groups: BTreeMap<(String, String, i32), HashSet<i64>> = BTreeMap::new();
+	let mut row_counts: BTreeMap<(String, String, i32), usize> = BTreeMap::new();
+	let mut kept_partsupp_rows = 0_usize;
+	for (partkey, suppkey) in partsupp {
+		if excluded.contains(&suppkey) {
+			continue;
+		}
+		let Some(group_key) = kept_parts.get(&partkey) else {
+			continue;
+		};
+		kept_partsupp_rows += 1;
+		let group_key = group_key.clone();
+		*row_counts.entry(group_key.clone()).or_default() += 1;
+		groups.entry(group_key).or_default().insert(suppkey);
+	}
+	let dedup_groups = row_counts
+		.iter()
+		.filter(|(key, row_count)| {
+			groups
+				.get(*key)
+				.is_some_and(|suppliers| suppliers.len() < **row_count)
+		})
+		.count();
+
+	Q16Oracle {
+		groups,
+		excluded_suppliers: excluded.len(),
+		kept_partsupp_rows,
+		dedup_groups,
+		pruned_parts,
+	}
+}
+
+pub fn strict_q16_oracle(scale_factor: f64) -> Q16Oracle {
+	q16_oracle_from_rows(
+		PartGenerator::new(scale_factor, 1, 1).iter().map(|part| {
+			(
+				part.p_partkey,
+				part.p_brand.to_string(),
+				part.p_type.to_string(),
+				part.p_size,
+			)
+		}),
+		SupplierGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|supplier| (supplier.s_suppkey, supplier.s_comment.to_string())),
+		PartSuppGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|partsupp| (partsupp.ps_partkey, partsupp.ps_suppkey)),
+	)
+}
+
+fn strict_q16_expected_schema() -> [(&'static str, DataType); 4] {
+	[
+		("p_brand", DataType::Utf8),
+		("p_type", DataType::Utf8),
+		("p_size", DataType::Int32),
+		("supplier_cnt", DataType::Int64),
+	]
+}
+
+pub fn assert_strict_q16_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q16_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q16 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q16Row {
+	pub p_brand: String,
+	pub p_type: String,
+	pub p_size: i32,
+	pub supplier_cnt: i64,
+}
+
+pub fn compare_strict_q16(batches: &[RecordBatch], oracle: &Q16Oracle) -> Result<(), String> {
+	assert_strict_q16_schema(batches)?;
+	if oracle.groups.is_empty()
+		|| oracle.kept_partsupp_rows == 0
+		|| oracle.dedup_groups == 0
+		|| oracle.pruned_parts == 0
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: groups={} kept_partsupp_rows={} dedup_groups={} pruned_parts={}",
+			oracle.groups.len(),
+			oracle.kept_partsupp_rows,
+			oracle.dedup_groups,
+			oracle.pruned_parts
+		));
+	}
+
+	let mut emitted = Vec::new();
+	let mut emitted_by_key: BTreeMap<(String, String, i32), i64> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 4 {
+			return Err(format!("expected 4 columns, got {}", batch.num_columns()));
+		}
+		let brands = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (p_brand) not Utf8")?;
+		let types = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (p_type) not Utf8")?;
+		let sizes = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.ok_or("column 2 (p_size) not Int32")?;
+		let counts = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 3 (supplier_cnt) not Int64")?;
+		for row in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if brands.is_null(row) {
+				return Err(format!("column p_brand row {row_index} is NULL"));
+			}
+			if types.is_null(row) {
+				return Err(format!("column p_type row {row_index} is NULL"));
+			}
+			if sizes.is_null(row) {
+				return Err(format!("column p_size row {row_index} is NULL"));
+			}
+			if counts.is_null(row) {
+				return Err(format!("column supplier_cnt row {row_index} is NULL"));
+			}
+			let output = Q16Row {
+				p_brand: brands.value(row).to_string(),
+				p_type: types.value(row).to_string(),
+				p_size: sizes.value(row),
+				supplier_cnt: counts.value(row),
+			};
+			let key = (output.p_brand.clone(), output.p_type.clone(), output.p_size);
+			if emitted_by_key
+				.insert(key.clone(), output.supplier_cnt)
+				.is_some()
+			{
+				return Err(format!("duplicate emitted q16 group {key:?}"));
+			}
+			emitted.push(output);
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		let previous = &pair[0];
+		let next = &pair[1];
+		let order_violation = previous.supplier_cnt < next.supplier_cnt
+			|| (previous.supplier_cnt == next.supplier_cnt
+				&& (
+					previous.p_brand.as_str(),
+					previous.p_type.as_str(),
+					previous.p_size,
+				) > (next.p_brand.as_str(), next.p_type.as_str(), next.p_size));
+		if order_violation {
+			return Err(format!(
+				"ORDER BY supplier_cnt DESC, p_brand, p_type, p_size violated: {previous:?} emitted before {next:?}"
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	for (key, suppliers) in &oracle.groups {
+		let expected = suppliers.len() as i64;
+		let Some(actual) = emitted_by_key.get(key) else {
+			return Err(format!("oracle q16 group {key:?} missing from output"));
+		};
+		if *actual != expected {
+			return Err(format!(
+				"q16 group {key:?}: supplier_cnt mismatch: expected {expected}, got {actual}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q16(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q16_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q16".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q16_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q16_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q16_oracle(scale_factor);
+	match compare_strict_q16(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q22Group {
 	pub numcust: i64,
 	pub totacctbal_raw: i128,
