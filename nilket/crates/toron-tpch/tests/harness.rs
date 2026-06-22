@@ -7,14 +7,14 @@ use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
 	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
-	q19_lineitem_part_join_is_keyed, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
-	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
-	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
-	run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
-	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
-	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
-	run_strict_q22, status_rows,
+	q18_grouped_membership_join_is_keyed, q19_lineitem_part_join_is_keyed, run_dev_q1, run_dev_q02,
+	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09,
+	run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16,
+	run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1,
+	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
+	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
+	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19,
+	run_strict_q20, run_strict_q21, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -889,55 +889,81 @@ async fn q17_executes_in_both_modes() {
 	);
 }
 
-// ADR 315: q18 currently walls before bind on the grouped membership-subquery body.
-#[tokio::test]
-async fn q18_blocks_on_grouped_membership_subquery_shape() {
-	assert!(
-		status_rows()
-			.iter()
-			.any(|row| row == "q18 dev=implemented strict=implemented"),
-		"q18 is an implemented capability in the static inventory"
-	);
+// ADR 322: q18 admits the grouped-IN body and keys the membership semi-join on the grouped output.
+#[test]
+fn q18_executes_with_keyed_grouped_membership_body() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				assert!(
+					status_rows()
+						.iter()
+						.any(|row| row == "q18 dev=implemented strict=implemented"),
+					"q18 is an implemented capability in the static inventory"
+				);
 
-	for (mode, attempt) in [
-		("dev", run_dev_q18(0.01).await),
-		("strict", run_strict_q18(0.01).await),
-	] {
-		assert_eq!(attempt.query, "q18");
-		assert_eq!(
-			attempt.status,
-			Status::Blocked,
-			"q18 {mode} records a recognized blocker: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.phase,
-			Phase::Plan,
-			"q18 {mode} blocks before bind reaches the deferred o_totalprice fixture gap: {}",
-			attempt.human()
-		);
-		assert_eq!(
-			attempt.reason.as_deref(),
-			Some("unsupported_query_surface"),
-			"q18 {mode} keeps the shared grouped-IN shape reject in the broad query-surface bucket: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.digest.is_none(),
-			"a blocked attempt carries no digest: {}",
-			attempt.human()
-		);
-		assert!(
-			attempt.is_process_success(true),
-			"a recognized q18 blocker succeeds only with --allow-blocked: {}",
-			attempt.human()
-		);
-		assert!(
-			!attempt.is_process_success(false),
-			"a recognized q18 blocker is not a normal process success: {}",
-			attempt.human()
-		);
-	}
+				q18_grouped_membership_join_is_keyed(false, 0.01)
+					.await
+					.expect("dev q18 grouped-IN semi-join is keyed");
+				q18_grouped_membership_join_is_keyed(true, 0.01)
+					.await
+					.expect("strict q18 grouped-IN semi-join is keyed");
+
+				for (mode, attempt, expected_digest) in [
+					(
+						"dev",
+						run_dev_q18(0.01).await,
+						"ArrowIpcDigest([28, 48, 18, 202, 14, 6, 96, 104, 59, 127, 243, 219, 154, 38, 231, 39, 85, 146, 182, 89, 30, 20, 12, 135, 97, 59, 15, 38, 211, 89, 7, 103])",
+					),
+					(
+						"strict",
+						run_strict_q18(0.01).await,
+						"ArrowIpcDigest([63, 211, 92, 198, 125, 214, 217, 115, 117, 24, 126, 202, 144, 247, 214, 60, 136, 143, 103, 186, 184, 77, 143, 255, 130, 163, 188, 63, 1, 220, 59, 23])",
+					),
+				] {
+					assert_eq!(attempt.query, "q18");
+					assert_eq!(
+						attempt.status,
+						Status::Pass,
+						"q18 {mode} should execute through the keyed grouped-IN semi-join: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.phase,
+						Phase::Execute,
+						"q18 {mode}: {}",
+						attempt.human()
+					);
+					assert_eq!(
+						attempt.digest.as_deref(),
+						Some(expected_digest),
+						"q18 {mode}: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.reason.is_none(),
+						"a pass carries no blocker reason: {}",
+						attempt.human()
+					);
+					assert!(
+						attempt.is_process_success(true),
+						"q18 {mode} should succeed with --allow-blocked"
+					);
+					assert!(
+						attempt.is_process_success(false),
+						"q18 {mode} should be a normal process success"
+					);
+				}
+			});
+		})
+		.expect("spawn q18 thread")
+		.join()
+		.expect("q18 thread panicked");
 }
 
 // ADR 319: the lineitem/part equality appears inside every q19 OR branch, and the binder extracts that

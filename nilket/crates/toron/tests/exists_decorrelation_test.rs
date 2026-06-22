@@ -345,6 +345,76 @@ async fn uncorrelated_not_in_with_unqualified_inner_residual_filters_subquery() 
 	assert_pk_values(&batch, &[2, 3, 5, 6]);
 }
 
+// ADR 322: q18 needs an IN body that is itself a grouped aggregate. The semi-join keys on the grouped
+// body's projected output column, and the right side remains the grouped Aggregate subtree.
+#[tokio::test]
+async fn grouped_in_membership_body_lowers_and_executes() {
+	let sql = "SELECT * FROM fact WHERE fact.k IN \
+	           (SELECT dim.k FROM dim GROUP BY dim.k HAVING COUNT(*) > 1)";
+	let plan = plan_sql(sql);
+	let LogicalPlan::Join {
+		kind, on, right, ..
+	} = &plan
+	else {
+		panic!("expected grouped-IN membership semi-join");
+	};
+	assert_eq!(*kind, JoinKind::LeftSemi);
+	assert_eq!(on.len(), 1, "membership keys on the grouped body output");
+	assert!(
+		find_aggregate(right),
+		"the grouped-IN right side must lower through a grouped Aggregate"
+	);
+
+	let batch = run_sql(sql).await;
+	assert_pk_values(&batch, &[1]);
+}
+
+#[test]
+fn grouped_exists_and_not_in_bodies_stay_rejected() {
+	for sql in [
+		"SELECT * FROM fact WHERE EXISTS \
+		 (SELECT dim.k FROM dim GROUP BY dim.k HAVING COUNT(*) > 1)",
+		"SELECT * FROM fact WHERE fact.k NOT IN \
+		 (SELECT dim.k FROM dim GROUP BY dim.k HAVING COUNT(*) > 1)",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("grouped body support is IN-only");
+		assert!(
+			err.to_string()
+				.contains("unsupported EXISTS subquery shape"),
+			"{sql}: {err}"
+		);
+	}
+}
+
+#[test]
+fn grouped_in_correlated_and_scalar_having_bodies_stay_rejected() {
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact WHERE fact.k IN \
+			 (SELECT dim.k FROM dim WHERE dim.k = fact.k GROUP BY dim.k HAVING COUNT(*) > 1)",
+		)
+		.expect_err("correlated grouped-IN body should stay unsupported");
+	assert!(
+		err.to_string().contains("unsupported IN subquery shape"),
+		"{err}"
+	);
+
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact WHERE fact.k IN \
+			 (SELECT dim.k FROM dim GROUP BY dim.k \
+			  HAVING COUNT(*) > (SELECT COUNT(*) FROM deny))",
+		)
+		.expect_err("grouped-IN body with scalar HAVING should stay unsupported");
+	assert!(
+		err.to_string()
+			.contains("IN subquery grouped body requires aggregate HAVING against a literal"),
+		"{err}"
+	);
+}
+
 #[tokio::test]
 async fn not_in_over_comma_join_matches_explicit_keyed_join() {
 	assert_same_digest(

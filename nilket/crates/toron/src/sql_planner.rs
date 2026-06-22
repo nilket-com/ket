@@ -5641,6 +5641,9 @@ impl SqlPlanner {
 		let SetExpr::Select(select) = &*subquery.body else {
 			return Err(unsupported(format!("unsupported {context} subquery body")));
 		};
+		if context == "IN" && membership_select_is_grouped(select) {
+			return self.lower_grouped_in_membership_subquery(select, cte);
+		}
 		validate_exists_select_shape(select)?;
 		let key_item = match select.projection.as_slice() {
 			[SelectItem::UnnamedExpr(expr)] => expr,
@@ -5708,6 +5711,34 @@ impl SqlPlanner {
 			};
 		}
 		Ok((inner_plan, inner_key, correlation_pairs))
+	}
+
+	fn lower_grouped_in_membership_subquery(
+		&self,
+		select: &Select,
+		cte: &CteScope,
+	) -> Result<(LogicalPlan, Expr, Vec<(Expr, Expr)>), FrontendError> {
+		validate_grouped_in_select_shape(select)?;
+		let LoweredSelect { plan, .. } = self.lower_select(select, cte)?;
+		let names = visible_output_names(&plan, None).ok_or_else(|| {
+			unsupported("IN subquery grouped body must project a visible output column")
+		})?;
+		let [name] = names.as_slice() else {
+			return Err(unsupported(
+				"IN subquery grouped body must project exactly one column",
+			));
+		};
+		let key_name = name.clone();
+		let alias = TableRef::new("__toron_grouped_in");
+		Ok((
+			LogicalPlan::Alias {
+				input: Box::new(plan),
+				alias: alias.clone(),
+				columns: names,
+			},
+			Expr::qualified_column(alias, key_name),
+			Vec::new(),
+		))
 	}
 
 	fn lower_in_subquery_join(
@@ -9817,6 +9848,91 @@ fn validate_exists_select_shape(select: &Select) -> Result<(), FrontendError> {
 		return Err(unsupported("unsupported EXISTS subquery shape"));
 	}
 	Ok(())
+}
+
+fn membership_select_is_grouped(select: &Select) -> bool {
+	!group_by_is_empty(&select.group_by)
+}
+
+fn validate_grouped_in_select_shape(select: &Select) -> Result<(), FrontendError> {
+	if select.top.is_some()
+		|| select.into.is_some()
+		|| select.from.len() != 1
+		|| !select.from[0].joins.is_empty()
+		|| !select.lateral_views.is_empty()
+		|| select.prewhere.is_some()
+		|| select.selection.is_some()
+		|| group_by_is_empty(&select.group_by)
+		|| !select.cluster_by.is_empty()
+		|| !select.distribute_by.is_empty()
+		|| !select.sort_by.is_empty()
+		|| !select.named_window.is_empty()
+		|| select.qualify.is_some()
+		|| select.value_table_mode.is_some()
+		|| !select.connect_by.is_empty()
+		|| !select.optimizer_hints.is_empty()
+		|| select.select_modifiers.is_some()
+		|| select.exclude.is_some()
+		|| !matches!(select.flavor, sqlparser::ast::SelectFlavor::Standard)
+	{
+		return Err(unsupported("unsupported IN subquery shape"));
+	}
+	let [item] = select.projection.as_slice() else {
+		return Err(unsupported(
+			"IN subquery grouped body must project exactly one column",
+		));
+	};
+	let (projected, _) = select_item_expr_and_alias(item)?;
+	if !grouped_in_projection_supported(projected) {
+		return Err(unsupported(
+			"IN subquery grouped body must project a single group key",
+		));
+	}
+	let Some(having) = &select.having else {
+		return Err(unsupported(
+			"IN subquery grouped body requires aggregate HAVING",
+		));
+	};
+	if !grouped_in_having_supported(having) {
+		return Err(unsupported(
+			"IN subquery grouped body requires aggregate HAVING against a literal",
+		));
+	}
+	Ok(())
+}
+
+fn grouped_in_projection_supported(expr: &SqlExpr) -> bool {
+	matches!(
+		strip_nested_sql_expr(expr),
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
+	)
+}
+
+fn grouped_in_having_supported(expr: &SqlExpr) -> bool {
+	let SqlExpr::BinaryOp { left, op, right } = strip_nested_sql_expr(expr) else {
+		return false;
+	};
+	if !matches!(
+		op,
+		BinaryOperator::Eq
+			| BinaryOperator::NotEq
+			| BinaryOperator::Gt
+			| BinaryOperator::GtEq
+			| BinaryOperator::Lt
+			| BinaryOperator::LtEq
+	) {
+		return false;
+	}
+	!expr_contains_subquery(expr)
+		&& ((expr_contains_aggregate_call(left) && grouped_in_literal_side(right))
+			|| (grouped_in_literal_side(left) && expr_contains_aggregate_call(right)))
+}
+
+fn grouped_in_literal_side(expr: &SqlExpr) -> bool {
+	matches!(
+		stripped_sql_value(expr),
+		Some(Value::Number(_, _) | Value::SingleQuotedString(_) | Value::Boolean(_) | Value::Null)
+	)
 }
 
 fn validate_exists_projection(projection: &[SelectItem]) -> Result<(), FrontendError> {

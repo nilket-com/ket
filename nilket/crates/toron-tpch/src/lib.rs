@@ -918,8 +918,13 @@ pub fn generate_customer(strict: bool, scale_factor: f64) -> RecordBatch {
 	.expect("customer batch")
 }
 
-/// The shared `ORDERS` fixture: the keys and date/comment columns used by the reached TPC-H subset.
-fn orders_schema() -> SchemaRef {
+/// The shared `ORDERS` fixture: the keys, dates, comments, and q18 total price.
+fn orders_schema(strict: bool) -> SchemaRef {
+	let totalprice = if strict {
+		DataType::Decimal128(15, 2)
+	} else {
+		DataType::Float64
+	};
 	Arc::new(Schema::new(vec![
 		Field::new("o_orderkey", DataType::Int64, false),
 		Field::new("o_custkey", DataType::Int64, false),
@@ -928,6 +933,8 @@ fn orders_schema() -> SchemaRef {
 		// ADR 278: q04 GROUP BY key, appended (q03/q10 don't reference it).
 		Field::new("o_orderpriority", DataType::Utf8, false),
 		Field::new("o_comment", DataType::Utf8, false),
+		// ADR 322: q18 SELECT/GROUP BY/ORDER BY surface, appended to preserve existing fixtures.
+		Field::new("o_totalprice", totalprice, false),
 	]))
 }
 
@@ -947,8 +954,8 @@ fn orders_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 }
 
 /// Generate the reached-query `ORDERS` columns at `scale_factor`. `o_orderdate` converts `TPCHDate`
-/// to `Date32` like `l_shipdate`.
-pub fn generate_orders(scale_factor: f64) -> RecordBatch {
+/// to `Date32` like `l_shipdate`; `o_totalprice` follows the harness mode's numeric representation.
+pub fn generate_orders(strict: bool, scale_factor: f64) -> RecordBatch {
 	let generator = OrderGenerator::new(scale_factor, 1, 1);
 	let mut orderkey = Vec::new();
 	let mut custkey = Vec::new();
@@ -956,6 +963,8 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 	let mut shippriority = Vec::new();
 	let mut orderpriority = Vec::new();
 	let mut comment = Vec::new();
+	let mut totalprice_strict = Vec::new();
+	let mut totalprice_dev = Vec::new();
 	for item in generator.iter() {
 		orderkey.push(item.o_orderkey);
 		custkey.push(item.o_custkey);
@@ -963,9 +972,20 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 		shippriority.push(item.o_shippriority);
 		orderpriority.push(item.o_orderpriority.to_string());
 		comment.push(item.o_comment.to_string());
+		totalprice_strict.push(item.o_totalprice.into_inner() as i128);
+		totalprice_dev.push(item.o_totalprice.as_f64());
 	}
+	let totalprice: Arc<dyn Array> = if strict {
+		Arc::new(
+			Decimal128Array::from(totalprice_strict)
+				.with_precision_and_scale(15, 2)
+				.expect("o_totalprice decimal column"),
+		)
+	} else {
+		Arc::new(Float64Array::from(totalprice_dev))
+	};
 	RecordBatch::try_new(
-		orders_schema(),
+		orders_schema(strict),
 		vec![
 			Arc::new(Int64Array::from(orderkey)),
 			Arc::new(Int64Array::from(custkey)),
@@ -973,6 +993,7 @@ pub fn generate_orders(scale_factor: f64) -> RecordBatch {
 			Arc::new(Int32Array::from(shippriority)),
 			Arc::new(StringArray::from(orderpriority)),
 			Arc::new(StringArray::from(comment)),
+			totalprice,
 		],
 	)
 	.expect("orders batch")
@@ -6097,28 +6118,80 @@ pub async fn run_strict_q17(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 315 - dev q18: grouped-IN reachability probe over customer/orders/lineitem.
+/// ADR 322 - dev q18: grouped-IN body is admitted and the membership semi-join keys on the body output.
 pub async fn run_dev_q18(scale_factor: f64) -> Attempt {
+	run_q18("dev", false, scale_factor, Q18_DEV_SQL).await
+}
+
+/// ADR 322 - strict q18: identical SQL shape with strict Decimal128 lineitem quantity/order total.
+pub async fn run_strict_q18(scale_factor: f64) -> Attempt {
+	run_q18("strict", true, scale_factor, STRICT_Q18_SQL).await
+}
+
+async fn run_q18(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Attempt {
+	let start = Instant::now();
+	if let Err(message) = q18_grouped_membership_join_is_keyed(strict, scale_factor).await {
+		let phase = if message.starts_with("plan q18") {
+			Phase::Plan
+		} else {
+			Phase::Bind
+		};
+		let reason = if message.contains("was not a keyed LeftSemi join") {
+			"unsupported_cross_join"
+		} else {
+			reason_for_error(&message)
+		};
+		return Attempt {
+			query: "q18".to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			phase,
+			status: status_for_reason(reason),
+			reason: Some(reason.to_string()),
+			elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+			digest: None,
+		};
+	}
 	run_query_with_tables(
 		"q18",
-		"dev",
+		mode,
 		scale_factor,
-		Q18_DEV_SQL,
-		q18_tables(false, scale_factor),
+		sql,
+		q18_tables(strict, scale_factor),
 	)
 	.await
 }
 
-/// ADR 315 - strict q18: identical SQL shape with strict Decimal128 lineitem quantity.
-pub async fn run_strict_q18(scale_factor: f64) -> Attempt {
-	run_query_with_tables(
-		"q18",
-		"strict",
-		scale_factor,
-		STRICT_Q18_SQL,
-		q18_tables(true, scale_factor),
-	)
-	.await
+/// Bind q18 and check whether the grouped-IN subquery is a keyed LeftSemi over a grouped body.
+pub async fn q18_grouped_membership_join_is_keyed(
+	strict: bool,
+	scale_factor: f64,
+) -> Result<(), String> {
+	let mut catalog = MockCatalog::new();
+	for table in q18_tables(strict, scale_factor) {
+		catalog
+			.register_descriptor(table.id, table.descriptor)
+			.map_err(|error| format!("register {}: {error:?}", table.name))?;
+		catalog
+			.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
+			.map_err(|error| format!("seed facts {}: {error:?}", table.name))?;
+	}
+	let sql = if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL };
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.map_err(|error| format!("plan q18: {error}"))?;
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind q18: {error:?}"))?;
+	if has_q18_grouped_membership_keyed_join(&bound) {
+		Ok(())
+	} else {
+		let mut summaries = Vec::new();
+		collect_join_summaries(&bound, &mut summaries);
+		Err(format!(
+			"q18 grouped-IN membership was not a keyed LeftSemi join; joins={summaries:?}"
+		))
+	}
 }
 
 /// ADR 319 - dev q19: discounted-revenue reachability over a keyed lineitem/part OR-branch join.
@@ -6259,6 +6332,73 @@ fn has_q19_lineitem_part_keyed_join(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::CreateTableAsSelect { source, .. }
 		| ExecutionPlan::InsertSelect { source, .. }
 		| ExecutionPlan::Update { source, .. } => has_q19_lineitem_part_keyed_join(source),
+		_ => false,
+	}
+}
+
+fn has_q18_grouped_membership_keyed_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			output_schema,
+			..
+		} => {
+			(*kind == JoinKind::LeftSemi
+				&& left_keys.len() == 1
+				&& right_keys.len() == 1
+				&& schema_has_fields(output_schema, &["c_name", "o_orderkey", "l_orderkey"])
+				&& execution_plan_contains_aggregate(right))
+				|| has_q18_grouped_membership_keyed_join(left)
+				|| has_q18_grouped_membership_keyed_join(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => has_q18_grouped_membership_keyed_join(input),
+		ExecutionPlan::Union { left, right, .. } => {
+			has_q18_grouped_membership_keyed_join(left)
+				|| has_q18_grouped_membership_keyed_join(right)
+		}
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => {
+			has_q18_grouped_membership_keyed_join(seed)
+				|| has_q18_grouped_membership_keyed_join(recursive)
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. }
+		| ExecutionPlan::Update { source, .. } => has_q18_grouped_membership_keyed_join(source),
+		_ => false,
+	}
+}
+
+fn execution_plan_contains_aggregate(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Aggregate { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => execution_plan_contains_aggregate(input),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			execution_plan_contains_aggregate(left) || execution_plan_contains_aggregate(right)
+		}
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => execution_plan_contains_aggregate(seed) || execution_plan_contains_aggregate(recursive),
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. }
+		| ExecutionPlan::Update { source, .. } => execution_plan_contains_aggregate(source),
 		_ => false,
 	}
 }
@@ -6641,7 +6781,7 @@ fn q02_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 /// The two q13 harness tables: `customer` + `orders`.
 fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let customer = generate_customer(strict, scale_factor);
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	vec![
 		HarnessTable {
 			id: TableId(1),
@@ -6653,7 +6793,7 @@ fn q13_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(2),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},
@@ -6754,7 +6894,7 @@ fn q16_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 /// The two q22 harness tables: `customer` (SUBSTRING/account-balance source) and `orders` (`NOT EXISTS` target).
 fn q22_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let customer = generate_customer(strict, scale_factor);
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	vec![
 		HarnessTable {
 			id: TableId(1),
@@ -6766,7 +6906,7 @@ fn q22_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(2),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},
@@ -6853,7 +6993,7 @@ pub async fn run_strict_q3(scale_factor: f64) -> Attempt {
 }
 
 /// The three q03 harness tables. `lineitem` and `customer` are mode-sensitive (`Float64` vs `Decimal128` —
-/// customer for `c_acctbal`, ADR 274); `orders` carries no decimals and is identical in both modes.
+/// customer for `c_acctbal`, ADR 274; orders for `o_totalprice`, ADR 322).
 fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	let lineitem = if strict {
 		generate_strict_lineitem(scale_factor)
@@ -6861,7 +7001,7 @@ fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		generate_dev_lineitem(scale_factor)
 	};
 	let customer = generate_customer(strict, scale_factor);
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	let lineitem_descriptor = if strict {
 		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
 	} else {
@@ -6885,15 +7025,14 @@ fn q03_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(3),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},
 	]
 }
 
-/// The three q18 harness tables match q03's customer/orders/lineitem family. `o_totalprice` stays deferred
-/// until the grouped-IN plan wall moves far enough for bind to prove the fixture gap.
+/// The three q18 harness tables match q03's customer/orders/lineitem family.
 fn q18_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	q03_tables(strict, scale_factor)
 }
@@ -6916,7 +7055,7 @@ fn q21_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	} else {
 		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
 	};
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	let nation = generate_nation(scale_factor);
 	vec![
 		HarnessTable {
@@ -6936,7 +7075,7 @@ fn q21_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(3),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},
@@ -7141,7 +7280,7 @@ fn q09_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		generate_dev_lineitem(scale_factor)
 	};
 	let partsupp = generate_partsupp(strict, scale_factor);
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	let nation = generate_nation(scale_factor);
 	let lineitem_descriptor = if strict {
 		strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
@@ -7180,7 +7319,7 @@ fn q09_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(5),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},
@@ -7256,7 +7395,7 @@ fn q04_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 	} else {
 		dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
 	};
-	let orders = generate_orders(scale_factor);
+	let orders = generate_orders(strict, scale_factor);
 	vec![
 		HarnessTable {
 			id: TableId(1),
@@ -7268,7 +7407,7 @@ fn q04_tables(strict: bool, scale_factor: f64) -> Vec<HarnessTable> {
 		HarnessTable {
 			id: TableId(3),
 			name: "orders",
-			descriptor: orders_descriptor(orders_schema().as_ref()),
+			descriptor: orders_descriptor(orders_schema(strict).as_ref()),
 			facts: facts_for_batch(&orders),
 			batch: orders,
 		},

@@ -680,10 +680,7 @@ impl<'a> Binder<'a> {
 			};
 			debug_assert!(matches!(kind, JoinKind::LeftSemi | JoinKind::LeftAnti));
 
-			let (Some(left_scope), Some(right_scope)) = (
-				self.logical_scope_for_outer_demotion(&left).await?,
-				self.logical_scope_for_outer_demotion(&right).await?,
-			) else {
+			let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await? else {
 				let join = LogicalPlan::Join {
 					left,
 					right,
@@ -702,7 +699,7 @@ impl<'a> Binder<'a> {
 			let mut left_push = Vec::new();
 			let mut residual = Vec::new();
 			for conjunct in split_logical_and_conjuncts(predicate) {
-				if conjunct_column_sides(&conjunct, &left_scope, &right_scope).is_left_only() {
+				if expr_columns_resolve_in_scope(&conjunct, &left_scope) {
 					left_push.push(conjunct);
 				} else {
 					residual.push(conjunct);
@@ -1890,6 +1887,82 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 			}) || else_expr
 				.as_ref()
 				.is_some_and(|else_expr| expr_any_column(else_expr, predicate))
+		}
+	}
+}
+
+fn expr_columns_resolve_in_scope(expr: &Expr, scope: &RelationScope) -> bool {
+	let (has_column, all_resolve) = expr_column_resolution_in_scope(expr, scope);
+	has_column && all_resolve
+}
+
+fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool, bool) {
+	match expr {
+		Expr::Column(column_ref) => (
+			true,
+			scope
+				.resolve_join_column(column_ref, "output")
+				.ok()
+				.flatten()
+				.is_some(),
+		),
+		Expr::Literal(_) | Expr::UntypedNull => (false, true),
+		Expr::LogicalAscription { expr, .. }
+		| Expr::SqlLogicalCast { expr, .. }
+		| Expr::SqlConvert { expr, .. } => expr_column_resolution_in_scope(expr, scope),
+		Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _)
+		| Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner)
+		| Expr::Substring { input: inner, .. } => expr_column_resolution_in_scope(inner, scope),
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => {
+			let left = expr_column_resolution_in_scope(left, scope);
+			let right = expr_column_resolution_in_scope(right, scope);
+			(left.0 || right.0, left.1 && right.1)
+		}
+		Expr::InList { expr, list, .. } => {
+			let mut result = expr_column_resolution_in_scope(expr, scope);
+			for item in list {
+				let item = expr_column_resolution_in_scope(item, scope);
+				result.0 |= item.0;
+				result.1 &= item.1;
+			}
+			result
+		}
+		Expr::Like { expr, .. } => expr_column_resolution_in_scope(expr, scope),
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			let mut result = (false, true);
+			for (when_expr, then_expr) in when_then {
+				let when_result = expr_column_resolution_in_scope(when_expr, scope);
+				let then_result = expr_column_resolution_in_scope(then_expr, scope);
+				result.0 |= when_result.0 || then_result.0;
+				result.1 &= when_result.1 && then_result.1;
+			}
+			if let Some(else_expr) = else_expr {
+				let else_result = expr_column_resolution_in_scope(else_expr, scope);
+				result.0 |= else_result.0;
+				result.1 &= else_result.1;
+			}
+			result
 		}
 	}
 }
