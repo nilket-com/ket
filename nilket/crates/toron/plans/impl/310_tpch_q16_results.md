@@ -13,6 +13,12 @@ Measured CLI runtimes under `scripts/cargo-cgroup` were slow but finite: dev ~75
 The identical digest matches the ADR's mode-agnostic expectation: q16 projects strings, `p_size`, and an integer
 count, not the strict-only Decimal columns.
 
+**Correction (ADR 310 review):** that slowness is a **materialized cartesian, not "just slow."** The built binary
+measured ~8.25 GB RSS at sf=0.01, scaling O(n²) (join memory 82 MB → 8 GB for 10× data) = `partsupp × part` (~16M
+rows). The `p_partkey = ps_partkey` equality is **stranded** above the deferred `NOT IN` (`DeferredExists`) node,
+so `recognize_cross_equi_joins` never keys the comma join — the ADR 282 / q17 pattern recurring. The `sf=0.0001`
+test scale masked it. **q16 reaches execute but is NOT keyed; see ADR 311.**
+
 For the permanent harness test, q16 is pinned at sf=0.0001 to avoid making `cargo test -p toron-tpch` inherit a
 multi-minute q16 run:
 
@@ -53,15 +59,18 @@ Pinned by `harness::q16_default_fixture_is_nonempty_but_anti_join_is_not_live`.
 
 ## Board impact
 
-Reachability moves 16 -> 17:
+q16 reaches `pass@execute`, **but via a cartesian (not keyed)** — so it is **not yet a true reach-17 cell**. The
+keyed green is earned by **ADR 311** (push the outer equality through the deferred `NOT IN` node). Until 311 lands,
+treat the board as **16 keyed-reach + q16 executes-but-cartesian**.
 
 ```text
-q01/q02/q03/q04/q05/q06/q07/q08/q09/q10/q12/q13/q14/q16/q17/q20/q22 pass@execute
+keyed reach: q01/q02/q03/q04/q05/q06/q07/q08/q09/q10/q12/q13/q14/q17/q20/q22  (16)
+q16: pass@execute but cartesian — keyed green pending ADR 311
 ```
 
 Correctness remains 16/22; no correctness oracle was added in this cut.
 
 ## Forward arc
 
-q16 correctness is the natural next rail catchup if the council wants to stay level. The remaining reach frontier is
-q11/q15/q18/q19/q21.
+**ADR 311** keys q16's comma join (the ADR 282 pattern for `DeferredExists`); once it lands q16 is a real reach-17
+cell and its correctness oracle is the next rail catchup. The remaining reach frontier is q11/q15/q18/q19/q21.
