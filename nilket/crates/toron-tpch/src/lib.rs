@@ -5035,6 +5035,251 @@ pub async fn check_strict_q20(scale_factor: f64) -> CorrectnessAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q13Oracle {
+	pub groups: Vec<(i64, i64)>,
+	pub total_customers: usize,
+	pub qualifying_orders: usize,
+	pub comment_excluded_orders: usize,
+	pub zero_count_customers: usize,
+	pub positive_count_customers: usize,
+	pub no_order_customers: usize,
+	pub only_excluded_order_customers: usize,
+}
+
+pub fn q13_comment_matches_pattern(comment: &str) -> bool {
+	let Some(special) = comment.find("special") else {
+		return false;
+	};
+	comment[special + "special".len()..].contains("requests")
+}
+
+pub fn q13_oracle_from_rows(
+	customers: impl IntoIterator<Item = i64>,
+	orders: impl IntoIterator<Item = (i64, String)>,
+) -> Q13Oracle {
+	let customers: Vec<i64> = customers.into_iter().collect();
+	let total_customers = customers.len();
+	let customer_keys: HashSet<i64> = customers.iter().copied().collect();
+	let mut total_orders_by_customer: HashMap<i64, i64> = HashMap::new();
+	let mut qualifying_orders_by_customer: HashMap<i64, i64> = HashMap::new();
+	let mut qualifying_orders = 0_usize;
+	let mut comment_excluded_orders = 0_usize;
+
+	for (custkey, comment) in orders {
+		if !customer_keys.contains(&custkey) {
+			continue;
+		}
+		*total_orders_by_customer.entry(custkey).or_default() += 1;
+		if q13_comment_matches_pattern(&comment) {
+			comment_excluded_orders += 1;
+		} else {
+			*qualifying_orders_by_customer.entry(custkey).or_default() += 1;
+			qualifying_orders += 1;
+		}
+	}
+
+	let mut group_counts: BTreeMap<i64, i64> = BTreeMap::new();
+	let mut zero_count_customers = 0_usize;
+	let mut positive_count_customers = 0_usize;
+	let mut no_order_customers = 0_usize;
+	let mut only_excluded_order_customers = 0_usize;
+	for custkey in customers {
+		let c_count = qualifying_orders_by_customer
+			.get(&custkey)
+			.copied()
+			.unwrap_or(0);
+		*group_counts.entry(c_count).or_default() += 1;
+		if c_count == 0 {
+			zero_count_customers += 1;
+		} else {
+			positive_count_customers += 1;
+		}
+		let total_orders = total_orders_by_customer.get(&custkey).copied().unwrap_or(0);
+		if total_orders == 0 {
+			no_order_customers += 1;
+		} else if c_count == 0 {
+			only_excluded_order_customers += 1;
+		}
+	}
+
+	let mut groups: Vec<(i64, i64)> = group_counts.into_iter().collect();
+	groups.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+
+	Q13Oracle {
+		groups,
+		total_customers,
+		qualifying_orders,
+		comment_excluded_orders,
+		zero_count_customers,
+		positive_count_customers,
+		no_order_customers,
+		only_excluded_order_customers,
+	}
+}
+
+pub fn strict_q13_oracle(scale_factor: f64) -> Q13Oracle {
+	q13_oracle_from_rows(
+		CustomerGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|customer| customer.c_custkey),
+		OrderGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|order| (order.o_custkey, order.o_comment.to_string())),
+	)
+}
+
+fn strict_q13_expected_schema() -> [(&'static str, DataType); 2] {
+	[("c_count", DataType::Int64), ("custdist", DataType::Int64)]
+}
+
+pub fn assert_strict_q13_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q13_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q13 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q13(batches: &[RecordBatch], oracle: &Q13Oracle) -> Result<(), String> {
+	assert_strict_q13_schema(batches)?;
+	if oracle.total_customers == 0
+		|| oracle.groups.len() <= 1
+		|| oracle.zero_count_customers == 0
+		|| oracle.positive_count_customers == 0
+		|| oracle.qualifying_orders == 0
+		|| oracle.comment_excluded_orders == 0
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: total_customers={} groups={} zero_count_customers={} positive_count_customers={} qualifying_orders={} comment_excluded_orders={}",
+			oracle.total_customers,
+			oracle.groups.len(),
+			oracle.zero_count_customers,
+			oracle.positive_count_customers,
+			oracle.qualifying_orders,
+			oracle.comment_excluded_orders
+		));
+	}
+
+	let mut emitted: Vec<(i64, i64)> = Vec::new();
+	let mut emitted_by_count: BTreeMap<i64, i64> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let counts = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 0 (c_count) not Int64")?;
+		let distributions = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (custdist) not Int64")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if counts.is_null(i) {
+				return Err(format!("column c_count row {row_index} is NULL"));
+			}
+			if distributions.is_null(i) {
+				return Err(format!("column custdist row {row_index} is NULL"));
+			}
+			let c_count = counts.value(i);
+			let custdist = distributions.value(i);
+			if emitted_by_count.insert(c_count, custdist).is_some() {
+				return Err(format!("duplicate emitted c_count {c_count}"));
+			}
+			emitted.push((c_count, custdist));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		let (prev_count, prev_dist) = pair[0];
+		let (next_count, next_dist) = pair[1];
+		if prev_dist < next_dist || (prev_dist == next_dist && prev_count < next_count) {
+			return Err(format!(
+				"ORDER BY custdist DESC, c_count DESC violated: ({prev_count}, {prev_dist}) emitted before ({next_count}, {next_dist})"
+			));
+		}
+	}
+
+	if emitted.len() != oracle.groups.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, output has {} rows",
+			oracle.groups.len(),
+			emitted.len()
+		));
+	}
+	for (c_count, expected_custdist) in &oracle.groups {
+		let Some(actual_custdist) = emitted_by_count.get(c_count) else {
+			return Err(format!("oracle c_count {c_count} missing from output"));
+		};
+		if actual_custdist != expected_custdist {
+			return Err(format!(
+				"c_count {c_count} custdist mismatch: expected {expected_custdist}, got {actual_custdist}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q13(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q13_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q13".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q13_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q13_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = strict_q13_oracle(scale_factor);
+	match compare_strict_q13(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q22Group {
 	pub numcust: i64,
 	pub totacctbal_raw: i128,

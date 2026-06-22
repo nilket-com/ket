@@ -9,27 +9,29 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
-	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
-	Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
-	assert_strict_q3_schema, assert_strict_q04_schema, assert_strict_q5_schema,
-	assert_strict_q07_schema, assert_strict_q08_schema, assert_strict_q09_schema,
-	assert_strict_q10_schema, assert_strict_q12_schema, assert_strict_q14_schema,
-	assert_strict_q17_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
-	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
-	check_strict_q12, check_strict_q14, check_strict_q17, check_strict_q20, check_strict_q22,
+	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q13Oracle, Q14Oracle, Q17_CORRECTNESS_SCALE,
+	Q17Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
+	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q04_schema,
+	assert_strict_q5_schema, assert_strict_q07_schema, assert_strict_q08_schema,
+	assert_strict_q09_schema, assert_strict_q10_schema, assert_strict_q12_schema,
+	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q17_schema,
+	assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw, check_strict_q1,
+	check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5, check_strict_q6,
+	check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10, check_strict_q12,
+	check_strict_q13, check_strict_q14, check_strict_q17, check_strict_q20, check_strict_q22,
 	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
 	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
-	compare_strict_q09, compare_strict_q10, compare_strict_q12, compare_strict_q14,
-	compare_strict_q17, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
-	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
-	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
-	q09_part_name_contains_green, q09_partsupp_cost, q20_part_name_is_forest_prefix,
+	compare_strict_q09, compare_strict_q10, compare_strict_q12, compare_strict_q13,
+	compare_strict_q14, compare_strict_q17, compare_strict_q20, compare_strict_q22,
+	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
+	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
+	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
+	q13_comment_matches_pattern, q13_oracle_from_rows, q20_part_name_is_forest_prefix,
 	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
 	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
 	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
-	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q12_oracle, strict_q14_oracle,
-	strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
+	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q12_oracle, strict_q13_oracle,
+	strict_q14_oracle, strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -3008,6 +3010,226 @@ fn q20_order_violation_is_fail() {
 	assert!(
 		compare_strict_q20(&[q20_batch(&[row_b, row_a])], &oracle).is_err(),
 		"s_name descending violates ORDER BY s_name"
+	);
+}
+
+fn q13_oracle(rows: &[(i64, i64)]) -> Q13Oracle {
+	let total_customers = rows
+		.iter()
+		.map(|(_, custdist)| *custdist as usize)
+		.sum::<usize>();
+	let zero_count_customers = rows
+		.iter()
+		.find_map(|(count, custdist)| (*count == 0).then_some(*custdist as usize))
+		.unwrap_or(0);
+	let qualifying_orders = rows
+		.iter()
+		.filter(|(count, _)| *count > 0)
+		.map(|(count, custdist)| (*count * *custdist) as usize)
+		.sum::<usize>();
+	Q13Oracle {
+		groups: rows.to_vec(),
+		total_customers,
+		qualifying_orders,
+		comment_excluded_orders: 1,
+		zero_count_customers,
+		positive_count_customers: total_customers.saturating_sub(zero_count_customers),
+		no_order_customers: zero_count_customers,
+		only_excluded_order_customers: 1,
+	}
+}
+
+fn q13_nullable_batch(rows: &[(Option<i64>, Option<i64>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("c_count", DataType::Int64, true),
+		Field::new("custdist", DataType::Int64, true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+		],
+	)
+	.expect("q13 batch")
+}
+
+fn q13_batch(rows: &[(i64, i64)]) -> RecordBatch {
+	let nullable = rows
+		.iter()
+		.map(|(count, custdist)| (Some(*count), Some(*custdist)))
+		.collect::<Vec<_>>();
+	q13_nullable_batch(&nullable)
+}
+
+fn q13_int32_count_batch() -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("c_count", DataType::Int32, false),
+		Field::new("custdist", DataType::Int64, false),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int32Array::from(vec![0])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+		],
+	)
+	.expect("q13 int32-count batch")
+}
+
+#[test]
+fn strict_q13_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q13(0.01))
+		})
+		.expect("spawn q13 correctness thread")
+		.join()
+		.expect("q13 correctness thread panicked");
+	assert_eq!(attempt.query, "q13");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q13_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q13_oracle(0.01);
+	assert_eq!(oracle.total_customers, 1500, "{oracle:?}");
+	assert!(oracle.groups.len() > 1, "{oracle:?}");
+	assert!(oracle.zero_count_customers > 0, "{oracle:?}");
+	assert!(oracle.positive_count_customers > 0, "{oracle:?}");
+	assert!(oracle.no_order_customers > 0, "{oracle:?}");
+	assert!(oracle.qualifying_orders > 0, "{oracle:?}");
+	assert!(oracle.comment_excluded_orders > 0, "{oracle:?}");
+	assert!(
+		oracle.only_excluded_order_customers <= oracle.zero_count_customers,
+		"{oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q13_output_schema_is_asserted() {
+	assert!(assert_strict_q13_schema(&[q13_batch(&[(0, 2), (1, 1)])]).is_ok());
+	assert!(
+		assert_strict_q13_schema(&[q13_int32_count_batch()]).is_err(),
+		"a non-measured c_count type must trip the schema gate"
+	);
+}
+
+#[test]
+fn q13_comment_pattern_matching_is_exact() {
+	assert!(q13_comment_matches_pattern("special requests"));
+	assert!(q13_comment_matches_pattern("special other requests"));
+	assert!(q13_comment_matches_pattern("specialrequests"));
+	assert!(!q13_comment_matches_pattern("requests special"));
+	assert!(!q13_comment_matches_pattern("special"));
+	assert!(!q13_comment_matches_pattern("requests"));
+	assert!(!q13_comment_matches_pattern("Special requests"));
+}
+
+#[test]
+fn q13_outer_join_preservation_is_pinned() {
+	let oracle = q13_oracle_from_rows(
+		[1_i64, 2, 3],
+		[
+			(2_i64, "special requests".to_string()),
+			(3_i64, "ordinary comment".to_string()),
+		],
+	);
+	assert_eq!(oracle.groups, vec![(0, 2), (1, 1)], "{oracle:?}");
+	assert_eq!(oracle.zero_count_customers, 2, "{oracle:?}");
+	assert_eq!(oracle.no_order_customers, 1, "{oracle:?}");
+	assert_eq!(oracle.only_excluded_order_customers, 1, "{oracle:?}");
+}
+
+#[test]
+fn q13_count_o_orderkey_counts_only_qualifying_orders() {
+	let oracle = q13_oracle_from_rows(
+		[1_i64, 2, 3],
+		[
+			(1_i64, "special requests".to_string()),
+			(1_i64, "ordinary comment".to_string()),
+			(2_i64, "first qualifying".to_string()),
+			(2_i64, "second qualifying".to_string()),
+			(999_i64, "ignored missing customer".to_string()),
+		],
+	);
+	assert_eq!(oracle.groups, vec![(2, 1), (1, 1), (0, 1)], "{oracle:?}");
+	assert_eq!(oracle.qualifying_orders, 3, "{oracle:?}");
+	assert_eq!(oracle.comment_excluded_orders, 1, "{oracle:?}");
+}
+
+#[test]
+fn q13_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q13_oracle(&[(1, 2), (0, 1)]);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 2), (0, 1)])], &oracle).is_ok(),
+		"exact q13 groups match"
+	);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 3), (0, 1)])], &oracle).is_err(),
+		"a wrong custdist is a mismatch"
+	);
+}
+
+#[test]
+fn q13_missing_extra_or_duplicate_group_is_fail() {
+	let oracle = q13_oracle(&[(1, 2), (0, 1)]);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 2)])], &oracle).is_err(),
+		"a missing c_count group is a mismatch"
+	);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 2), (0, 1), (2, 1)])], &oracle).is_err(),
+		"an extra c_count group is a mismatch"
+	);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 2), (1, 2), (0, 1)])], &oracle).is_err(),
+		"a duplicate emitted c_count is rejected"
+	);
+}
+
+#[test]
+fn q13_null_cell_is_fail() {
+	let oracle = q13_oracle(&[(1, 2), (0, 1)]);
+	assert!(
+		compare_strict_q13(
+			&[q13_nullable_batch(&[(Some(1), Some(2)), (None, Some(1))])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL c_count is rejected"
+	);
+	assert!(
+		compare_strict_q13(
+			&[q13_nullable_batch(&[(Some(1), Some(2)), (Some(0), None)])],
+			&oracle
+		)
+		.is_err(),
+		"a NULL custdist is rejected"
+	);
+}
+
+#[test]
+fn q13_order_violation_is_fail() {
+	let oracle = q13_oracle(&[(1, 2), (0, 1)]);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(0, 1), (1, 2)])], &oracle).is_err(),
+		"custdist DESC, c_count DESC order is enforced"
+	);
+	let tie_oracle = q13_oracle(&[(2, 1), (1, 1), (0, 1)]);
+	assert!(
+		compare_strict_q13(&[q13_batch(&[(1, 1), (2, 1), (0, 1)])], &tie_oracle).is_err(),
+		"c_count DESC is enforced when custdist ties"
 	);
 }
 
