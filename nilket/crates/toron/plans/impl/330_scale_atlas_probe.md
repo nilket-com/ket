@@ -18,6 +18,8 @@ capped, mechanical classification.
   ceiling + a wall-clock timeout for that scale.
 - Classify the cell by rule:
   - finishes within both caps + `status=pass` -> **green (reach)**.
+  - `phase=bind status=blocked` -> **bind-fail**.
+  - `phase=execute status=fail` -> **execute-fail**.
   - OOM / memory-ceiling hit -> **memory**.
   - wall-clock cap exceeded (killed) -> **time**.
 - Record the measured RSS + wall-clock per cell (the evidence), plus the keyed-plan status where the harness asserts
@@ -31,8 +33,9 @@ capped, mechanical classification.
 - Flag the reach-only queries (q17, any non-scale-general oracle) explicitly in the atlas - not silently skipped.
 
 ## D3 - the atlas (the deliverable)
-- Assemble the `(query, sf)` -> {green / memory / time / distributed-correctness} matrix with per-cell evidence
-  (RSS, wall-clock, reason). Record it in the results doc. Honest - greens and walls both.
+- Assemble the `(query, sf)` -> {green / bind-fail / execute-fail / memory / time / distributed-correctness}
+  matrix with per-cell evidence (RSS, wall-clock, reason). Record it in the results doc. Honest - greens and walls
+  both.
 - Optional (only if cheap): a `scale-matrix` harness helper that drives the sweep + prints the classified atlas;
   otherwise a recorded command sequence + the captured table is sufficient (this is a probe, not a permanent gate).
 

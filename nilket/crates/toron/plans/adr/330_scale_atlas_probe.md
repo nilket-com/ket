@@ -33,6 +33,8 @@ change - measure-don't-predict.
 ### D3 - the classification (per query x scale point), concrete thresholds
 A "scale atlas": `(query, sf)` -> one of, by **fixed rules** (no soft post-hoc judgment):
 - **green** - finishes within both bounds; `pass@execute` (reach) and, where scale-stable, `pass@compare`.
+- **bind-fail** - the query fails at bind under scale, with the recorded reason.
+- **execute-fail** - the query reaches execute but fails before a pass row, with the recorded reason.
 - **memory** - the process hits the cgroup memory ceiling or is OOM-killed.
 - **time** - wall clock exceeds the fixed per-query cap at that scale.
 - **distributed-correctness** - the query finishes within bounds but a scale-stable correctness probe at that same sf
@@ -56,8 +58,9 @@ A "scale atlas": `(query, sf)` -> one of, by **fixed rules** (no soft post-hoc j
   that fit at sf=0.1 will OOM or time out at sf=1 (that's the signal, not noise).
 
 ## Acceptance - the atlas is the deliverable
-- A **scale atlas** produced: 22 queries x {sf=0.1, sf=1}, each cell classified (green / memory / time /
-  distributed-correctness) by the fixed rules, with the precise reason. Honest - greens *and* walls.
+- A **scale atlas** produced: 22 queries x {sf=0.1, sf=1}, each cell classified (green / bind-fail / execute-fail /
+  memory / time / distributed-correctness) by the fixed rules, with the precise reason. Honest - greens *and*
+  walls.
 - Reach probed via `run --sf` for all 22; correctness probed via `correctness --query --sf` only where scale-stable,
   with the reach-only queries (q17, any non-scale-general oracle) flagged.
 - Measured on the built binary under the memory + timeout caps; reproducible (a recorded command sequence).
