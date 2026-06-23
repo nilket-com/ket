@@ -1080,10 +1080,9 @@ fn q20_executes_in_both_modes() {
 		.expect("q20 thread panicked");
 }
 
-// ADR 317: q21 closes the reachability atlas. The first measured wall is the correlated EXISTS/NOT EXISTS
-// predicate body (`unsupported EXISTS subquery predicate`), before the deferred `o_orderstatus` fixture gap.
+// ADR 323 clears q21's keyed semi/anti EXISTS residual wall; both modes now reach execute.
 #[test]
-fn q21_blocks_on_correlated_exists_predicate_shape() {
+fn q21_executes_in_both_modes() {
 	std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -1106,29 +1105,21 @@ fn q21_blocks_on_correlated_exists_predicate_shape() {
 					assert_eq!(attempt.query, "q21");
 					assert_eq!(
 						attempt.status,
-						Status::Blocked,
-						"q21 {mode} should record a recognized blocker: {}",
+						Status::Pass,
+						"q21 {mode} should reach execute: {}",
 						attempt.human()
 					);
-					assert_eq!(attempt.phase, Phase::Plan, "{}", attempt.human());
+					assert_eq!(attempt.phase, Phase::Execute, "{}", attempt.human());
 					assert_eq!(
 						attempt.reason.as_deref(),
-						Some("unsupported_query_surface"),
-						"q21 {mode} keeps the broad EXISTS-predicate shape reject in the query-surface bucket: {}",
+						None,
+						"q21 {mode} pass carries no blocker reason: {}",
 						attempt.human()
 					);
 					assert!(
-						attempt.digest.is_none(),
-						"a blocked row carries no digest: {}",
+						attempt.digest.is_some(),
+						"a passing q21 row carries a digest: {}",
 						attempt.human()
-					);
-					assert!(
-						attempt.is_process_success(true),
-						"a recognized q21 blocker succeeds under --allow-blocked"
-					);
-					assert!(
-						!attempt.is_process_success(false),
-						"a q21 blocker still fails without --allow-blocked"
 					);
 				}
 			});
@@ -1139,16 +1130,16 @@ fn q21_blocks_on_correlated_exists_predicate_shape() {
 }
 
 #[test]
-fn reason_for_error_keeps_q21_exists_predicate_in_query_surface_bucket() {
+fn reason_for_error_classifies_non_equi_exists_correlation_precisely() {
 	assert_eq!(
-		reason_for_error("unsupported frontend construct: unsupported EXISTS subquery predicate"),
-		"unsupported_query_surface",
-		"the q21 raw error is not specific enough for a narrower classifier"
+		reason_for_error("unsupported non-equi EXISTS correlation without an equality key"),
+		"unsupported_non_equi_exists_correlation",
+		"non-equi-only EXISTS stays a precise, recognized blocker"
 	);
 	assert_eq!(
-		status_for_reason("unsupported_query_surface"),
+		status_for_reason("unsupported_non_equi_exists_correlation"),
 		Status::Blocked,
-		"the measured q21 wall remains a recognized blocker"
+		"the remaining non-equi-only boundary remains a recognized blocker"
 	);
 }
 

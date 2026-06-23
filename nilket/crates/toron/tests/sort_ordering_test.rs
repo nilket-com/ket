@@ -760,6 +760,7 @@ fn join_plan(left: ExecutionPlan, right: ExecutionPlan, strategy: JoinStrategy) 
 		kind: JoinKind::Inner,
 		left_keys: vec![ColumnOrdinal(0)],
 		right_keys: vec![ColumnOrdinal(0)],
+		match_filter: None,
 		strategy,
 		null_safe_keys: false,
 		output_schema: join_output_schema(),

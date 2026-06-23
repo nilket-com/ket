@@ -67,6 +67,7 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_date_interval",
 	"ambiguous_aggregate_projection",
 	"unsupported_correlated_exists",
+	"unsupported_non_equi_exists_correlation",
 	"unsupported_derived_multi_source",
 	"unsupported_non_equi_join_on",
 	"unsupported_cross_join",
@@ -149,6 +150,11 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// correlated-subquery class; names the decorrelation-generality ADR. Kept specific so it does not fall
 		// to the generic query-surface bucket below.
 		"unsupported_correlated_exists"
+	} else if lowered.contains("unsupported non-equi exists correlation") {
+		// ADR 323 keeps non-equi-only EXISTS correlation rejected. A non-equi residual can be evaluated only
+		// inside an already-keyed semi/anti probe; without at least one equality key it would be a cartesian
+		// correlated search.
+		"unsupported_non_equi_exists_correlation"
 	} else if lowered.contains("derived table subquery must have exactly one from source") {
 		// ADR 293/294: this was q07's raw derived comma-list wall before ADR 294 relaxed the derived-table
 		// validator. Keep the classifier precise for old rows and targeted regression probes.

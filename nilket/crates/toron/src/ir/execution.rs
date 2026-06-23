@@ -336,6 +336,10 @@ pub enum ExecutionPlan {
 		kind: JoinKind,
 		left_keys: Vec<ColumnOrdinal>,
 		right_keys: Vec<ColumnOrdinal>,
+		/// ADR 323: optional keyed semi/anti match predicate, bound against the physical left+right join
+		/// input schema. It is evaluated inside the hash-probe match loop; `None` preserves the key-only
+		/// path used by ordinary joins and existing semi/anti decorrelations.
+		match_filter: Option<BoundExprProgram>,
 		null_safe_keys: bool,
 		strategy: JoinStrategy,
 		output_schema: SchemaRef,

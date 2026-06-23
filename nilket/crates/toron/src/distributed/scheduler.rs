@@ -1713,6 +1713,7 @@ mod tests {
 			kind,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: crate::binder::join_schema(kind, &left_schema, &right_schema),

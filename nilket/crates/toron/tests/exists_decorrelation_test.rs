@@ -122,6 +122,60 @@ async fn exists_with_inner_only_residual_pushes_filter_on_subquery_side() {
 	assert_pk_values(&batch, &[1, 3]);
 }
 
+#[test]
+fn exists_with_non_equi_correlated_residual_lowers_to_keyed_match_filter() {
+	let plan = plan_sql(
+		"SELECT * FROM fact WHERE EXISTS \
+		 (SELECT 1 FROM dim WHERE dim.k = fact.k AND dim.active <> fact.flag)",
+	);
+	let LogicalPlan::Join {
+		kind,
+		on,
+		on_filter,
+		..
+	} = plan
+	else {
+		panic!("expected join plan");
+	};
+	assert_eq!(kind, JoinKind::LeftSemi);
+	assert_eq!(on.len(), 1);
+	assert!(
+		on_filter.is_some(),
+		"the non-equi correlation is a semi-join match filter"
+	);
+}
+
+#[tokio::test]
+async fn exists_non_equi_correlated_residual_filters_matches_inside_probe() {
+	let batch = run_sql(
+		"SELECT * FROM fact WHERE EXISTS \
+		 (SELECT 1 FROM dim WHERE dim.k = fact.k AND dim.active <> fact.flag)",
+	)
+	.await;
+	assert_pk_values(&batch, &[1]);
+}
+
+#[tokio::test]
+async fn not_exists_non_equi_correlated_residual_filters_matches_inside_probe() {
+	let batch = run_sql(
+		"SELECT * FROM fact WHERE NOT EXISTS \
+		 (SELECT 1 FROM dim WHERE dim.k = fact.k AND dim.active <> fact.flag)",
+	)
+	.await;
+	assert_pk_values(&batch, &[2, 3, 4, 5, 6]);
+}
+
+#[tokio::test]
+async fn exists_non_equi_correlated_residual_composes_with_inner_residual() {
+	let batch = run_sql(
+		"SELECT * FROM fact WHERE EXISTS \
+		 (SELECT 1 FROM dim \
+		  WHERE dim.k = fact.k AND dim.active <> fact.flag AND dim.score < 10)",
+	)
+	.await;
+	assert_pk_values(&batch, &[1]);
+}
+
 #[tokio::test]
 async fn exists_with_outer_residual_preserves_filter_semantics() {
 	assert_same_digest(
@@ -429,7 +483,8 @@ async fn not_in_over_comma_join_matches_explicit_keyed_join() {
 
 #[test]
 fn non_equi_correlated_in_and_correlated_scalar_stay_rejected() {
-	// Non-equi correlation isn't decorrelated (the classifier only spends equi-pairs).
+	// ADR 323 spends non-equi correlated residuals only for keyed EXISTS/NOT EXISTS probes; membership
+	// subqueries still require equality correlations.
 	let err = SqlPlanner::new()
 		.plan(
 			"SELECT * FROM fact WHERE fact.pk IN \
@@ -438,7 +493,7 @@ fn non_equi_correlated_in_and_correlated_scalar_stay_rejected() {
 		.expect_err("non-equi correlated IN should be unsupported");
 	assert!(
 		err.to_string()
-			.contains("unsupported EXISTS subquery predicate"),
+			.contains("IN subquery predicate must be an equality correlation"),
 		"{err}"
 	);
 
@@ -644,6 +699,21 @@ fn exists_unsupported_shapes_stay_unsupported() {
 	] {
 		assert_unsupported(sql);
 	}
+}
+
+#[test]
+fn non_equi_only_exists_correlation_stays_rejected() {
+	let err = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM fact WHERE EXISTS \
+			 (SELECT 1 FROM dim WHERE dim.active <> fact.flag)",
+		)
+		.expect_err("non-equi-only correlation should stay unsupported");
+	assert!(
+		err.to_string()
+			.contains("unsupported non-equi EXISTS correlation"),
+		"{err}"
+	);
 }
 
 #[tokio::test]

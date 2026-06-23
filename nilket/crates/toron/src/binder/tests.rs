@@ -9363,6 +9363,7 @@ async fn probe_linearity_nested_broadcast_propagates_inner_cause() {
 		kind,
 		left_keys,
 		right_keys,
+		match_filter,
 		strategy,
 		output_schema,
 		..
@@ -9378,6 +9379,7 @@ async fn probe_linearity_nested_broadcast_propagates_inner_cause() {
 		kind,
 		left_keys,
 		right_keys,
+		match_filter,
 		null_safe_keys: false,
 		strategy,
 		output_schema,

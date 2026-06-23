@@ -39,7 +39,7 @@ use arrow::compute::kernels::substring::substring_by_char;
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::collections::hash_map::Entry;
@@ -945,6 +945,7 @@ impl Executor {
 					kind,
 					left_keys,
 					right_keys,
+					match_filter,
 					null_safe_keys,
 					strategy,
 					output_schema,
@@ -960,6 +961,7 @@ impl Executor {
 						*kind,
 						left_keys,
 						right_keys,
+						match_filter.as_ref(),
 						*null_safe_keys,
 						*replay_id,
 						*strategy,
@@ -2931,6 +2933,7 @@ async fn execute_hash_join(
 	kind: JoinKind,
 	left_keys: &[crate::ir::ColumnOrdinal],
 	right_keys: &[crate::ir::ColumnOrdinal],
+	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
@@ -2989,6 +2992,7 @@ async fn execute_hash_join(
 			&left_key_arrays,
 			&right_key_arrays,
 			output_schema,
+			match_filter,
 			null_safe_keys,
 			task_budget,
 			telemetry.clone(),
@@ -3031,6 +3035,7 @@ async fn execute_hash_join(
 			&left_key_arrays,
 			&right_key_arrays,
 			output_schema,
+			match_filter,
 			null_safe_keys,
 			task_budget,
 			telemetry.clone(),
@@ -3068,6 +3073,9 @@ async fn execute_hash_join(
 		left_batch.num_rows(),
 		&right_key_arrays,
 		right_batch.num_rows(),
+		match_filter,
+		&left_batch,
+		&right_batch,
 		null_safe_keys,
 	)?;
 	record_task_telemetry(&telemetry, |task| {
@@ -3434,10 +3442,14 @@ fn probe_in_memory_join_rows(
 	left_rows: usize,
 	right_key_arrays: &[ArrayRef],
 	rows: usize,
+	match_filter: Option<&BoundExprProgram>,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
 	null_safe_keys: bool,
 ) -> Result<Vec<JoinOutputRow>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_rows);
+	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
 
 	match join_key_plan {
 		JoinKeyPlan::Int32 => {
@@ -3454,6 +3466,7 @@ fn probe_in_memory_join_rows(
 							matches.rows(),
 							matched_build_rows.as_deref_mut(),
 							&mut selection,
+							&mut residual,
 						)?
 					} else {
 						false
@@ -3478,6 +3491,7 @@ fn probe_in_memory_join_rows(
 							matches.rows(),
 							matched_build_rows.as_deref_mut(),
 							&mut selection,
+							&mut residual,
 						)?
 					} else {
 						false
@@ -3507,6 +3521,7 @@ fn probe_in_memory_join_rows(
 						matches.rows(),
 						matched_build_rows.as_deref_mut(),
 						&mut selection,
+						&mut residual,
 					)?
 				} else {
 					false
@@ -3555,10 +3570,14 @@ fn append_join_matches_for_kind(
 	matches: impl Iterator<Item = u32>,
 	mut matched_build_rows: Option<&mut [u64]>,
 	selection: &mut Vec<JoinOutputRow>,
+	residual: &mut JoinMatchResidual<'_>,
 ) -> Result<bool, ExecutionError> {
 	let right_index = join_probe_row_index(probe_row)?;
 	let mut matched = false;
 	for left_index in matches {
+		if !residual.matches(left_index, right_index)? {
+			continue;
+		}
 		matched = true;
 		if let Some(bitmap) = matched_build_rows.as_deref_mut() {
 			set_build_row_matched(bitmap, left_index);
@@ -3580,6 +3599,92 @@ fn append_join_matches_for_kind(
 		selection.push(JoinOutputRow::RightPreserved { right: right_index });
 	}
 	Ok(matched)
+}
+
+struct JoinMatchResidual<'a> {
+	program: Option<&'a BoundExprProgram>,
+	left_batch: &'a RecordBatch,
+	right_batch: &'a RecordBatch,
+	schema: Option<SchemaRef>,
+}
+
+impl<'a> JoinMatchResidual<'a> {
+	fn new(
+		program: Option<&'a BoundExprProgram>,
+		left_batch: &'a RecordBatch,
+		right_batch: &'a RecordBatch,
+	) -> Self {
+		let schema = program.map(|_| {
+			let fields = left_batch
+				.schema()
+				.fields()
+				.iter()
+				.chain(right_batch.schema().fields().iter())
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>();
+			Arc::new(Schema::new(fields))
+		});
+		Self {
+			program,
+			left_batch,
+			right_batch,
+			schema,
+		}
+	}
+
+	fn matches(&mut self, left_row: u32, right_row: u32) -> Result<bool, ExecutionError> {
+		let Some(program) = self.program else {
+			return Ok(true);
+		};
+		let batch = join_match_pair_batch(
+			self.left_batch,
+			self.right_batch,
+			left_row,
+			right_row,
+			self.schema
+				.as_ref()
+				.expect("residual schema exists when program exists")
+				.clone(),
+		)?;
+		let mut roots =
+			Executor::evaluate_bound_program_without_storage(program, &batch)?.into_iter();
+		let Some(root) = roots.next() else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "JOIN match filter must have exactly one root".to_string(),
+			});
+		};
+		if roots.next().is_some() {
+			return Err(ExecutionError::InvalidExpression {
+				message: "JOIN match filter must have exactly one root".to_string(),
+			});
+		}
+		let bools = root
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "JOIN match filter must return Boolean".to_string(),
+			})?;
+		Ok(bools.is_valid(0) && bools.value(0))
+	}
+}
+
+fn join_match_pair_batch(
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	left_row: u32,
+	right_row: u32,
+	schema: SchemaRef,
+) -> Result<RecordBatch, ExecutionError> {
+	let left_index = UInt32Array::from(vec![left_row]);
+	let right_index = UInt32Array::from(vec![right_row]);
+	let mut columns = Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+	for column in left_batch.columns() {
+		columns.push(take(column, &left_index, None)?);
+	}
+	for column in right_batch.columns() {
+		columns.push(take(column, &right_index, None)?);
+	}
+	Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 fn append_unmatched_probe_row(
@@ -3692,6 +3797,7 @@ async fn execute_spilled_hash_join(
 	left_key_arrays: &[ArrayRef],
 	right_key_arrays: &[ArrayRef],
 	output_schema: &arrow::datatypes::SchemaRef,
+	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
 	task_budget: TaskBudget,
 	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
@@ -3763,6 +3869,7 @@ async fn execute_spilled_hash_join(
 		right_key_arrays,
 		left_batch,
 		output_schema,
+		match_filter,
 		null_safe_keys,
 	)
 	.await;
@@ -3790,10 +3897,12 @@ async fn probe_spilled_hash_join(
 	right_key_arrays: &[ArrayRef],
 	left_batch: &RecordBatch,
 	output_schema: &arrow::datatypes::SchemaRef,
+	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
+	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
 	for row in 0..right_batch.num_rows() {
 		let key = if null_safe_keys {
 			join_key_bytes_null_safe(right_key_arrays, row)?
@@ -3811,6 +3920,7 @@ async fn probe_spilled_hash_join(
 			matches.into_iter(),
 			matched_build_rows.as_deref_mut(),
 			&mut selection,
+			&mut residual,
 		)?;
 		if !matched {
 			append_unmatched_probe_row(kind, row, &mut selection)?;
@@ -9236,6 +9346,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1)],
 			right_keys: vec![ColumnOrdinal(1)],
+			match_filter: None,
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema,
@@ -9290,6 +9401,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
 			right_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+			match_filter: None,
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema,
@@ -9901,6 +10013,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(1)],
 			right_keys: vec![ColumnOrdinal(1)],
+			match_filter: None,
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: Arc::new(Schema::new(vec![

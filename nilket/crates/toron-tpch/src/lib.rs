@@ -918,7 +918,7 @@ pub fn generate_customer(strict: bool, scale_factor: f64) -> RecordBatch {
 	.expect("customer batch")
 }
 
-/// The shared `ORDERS` fixture: the keys, dates, comments, and q18 total price.
+/// The shared `ORDERS` fixture: the keys, dates, status, comments, and q18 total price.
 fn orders_schema(strict: bool) -> SchemaRef {
 	let totalprice = if strict {
 		DataType::Decimal128(15, 2)
@@ -935,6 +935,8 @@ fn orders_schema(strict: bool) -> SchemaRef {
 		Field::new("o_comment", DataType::Utf8, false),
 		// ADR 322: q18 SELECT/GROUP BY/ORDER BY surface, appended to preserve existing fixtures.
 		Field::new("o_totalprice", totalprice, false),
+		// ADR 323: q21 filters final orders; appended to preserve existing fixtures.
+		Field::new("o_orderstatus", DataType::Utf8, false),
 	]))
 }
 
@@ -963,6 +965,7 @@ pub fn generate_orders(strict: bool, scale_factor: f64) -> RecordBatch {
 	let mut shippriority = Vec::new();
 	let mut orderpriority = Vec::new();
 	let mut comment = Vec::new();
+	let mut orderstatus = Vec::new();
 	let mut totalprice_strict = Vec::new();
 	let mut totalprice_dev = Vec::new();
 	for item in generator.iter() {
@@ -972,6 +975,7 @@ pub fn generate_orders(strict: bool, scale_factor: f64) -> RecordBatch {
 		shippriority.push(item.o_shippriority);
 		orderpriority.push(item.o_orderpriority.to_string());
 		comment.push(item.o_comment.to_string());
+		orderstatus.push(item.o_orderstatus.to_string());
 		totalprice_strict.push(item.o_totalprice.into_inner() as i128);
 		totalprice_dev.push(item.o_totalprice.as_f64());
 	}
@@ -994,6 +998,7 @@ pub fn generate_orders(strict: bool, scale_factor: f64) -> RecordBatch {
 			Arc::new(StringArray::from(orderpriority)),
 			Arc::new(StringArray::from(comment)),
 			totalprice,
+			Arc::new(StringArray::from(orderstatus)),
 		],
 	)
 	.expect("orders batch")

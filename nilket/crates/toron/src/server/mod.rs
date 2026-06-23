@@ -1561,6 +1561,7 @@ mod tests {
 				kind: JoinKind::Inner,
 				left_keys: vec![ColumnOrdinal(0)],
 				right_keys: vec![ColumnOrdinal(0)],
+				match_filter: None,
 				null_safe_keys: false,
 				strategy: JoinStrategy::Broadcast,
 				output_schema: Arc::new(Schema::new(vec![
@@ -3081,6 +3082,7 @@ mod tests {
 			kind: JoinKind::Inner,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: crate::binder::join_schema(
@@ -3185,6 +3187,7 @@ mod tests {
 				kind,
 				left_keys: vec![ColumnOrdinal(0)],
 				right_keys: vec![ColumnOrdinal(0)],
+				match_filter: None,
 				null_safe_keys: false,
 				strategy: JoinStrategy::HashPartitioned,
 				output_schema: crate::binder::join_schema(kind, &left.schema(), &right.schema()),

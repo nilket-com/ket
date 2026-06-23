@@ -4260,6 +4260,7 @@ impl<'a> Binder<'a> {
 				&mut scratch_trace,
 				&mut scratch_render,
 				JoinOrderSourceCapture::On,
+				None,
 			)
 			.await?;
 		let scratch_render = scratch_render.expect("graph scratch render trace present");
@@ -4796,6 +4797,7 @@ impl<'a> Binder<'a> {
 				trace,
 				render_trace,
 				dimension.declared_position,
+				None,
 			)?;
 		}
 		Ok(current)
@@ -5268,6 +5270,7 @@ impl<'a> Binder<'a> {
 				trace,
 				render_trace,
 				dimension.evidence.declared_position,
+				None,
 			)?;
 		}
 		Ok(current)
@@ -5294,6 +5297,7 @@ impl<'a> Binder<'a> {
 				trace,
 				render_trace,
 				dimension.evidence.declared_position,
+				None,
 			)?;
 		}
 		Ok(current)

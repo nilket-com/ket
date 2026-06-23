@@ -530,6 +530,19 @@ impl<'a> Binder<'a> {
 				} => {
 					let left = self.recognize_cross_equi_joins(left).await?;
 					let right = self.recognize_cross_equi_joins(right).await?;
+					if matches!(kind, JoinKind::LeftSemi | JoinKind::LeftAnti)
+						&& on_filter.is_some()
+					{
+						return Ok(LogicalPlan::Join {
+							left: Box::new(left),
+							right: Box::new(right),
+							kind: *kind,
+							on: on.clone(),
+							on_filter: on_filter.clone(),
+							null_safe_keys: *null_safe_keys,
+							strategy_intent: *strategy_intent,
+						});
+					}
 					self.push_on_clause_residual(
 						left,
 						right,
@@ -2248,6 +2261,7 @@ fn conjunct_column_sides(
 /// join key (oriented outer-first) or an inner-only/constant predicate kept as an inner residual.
 pub(super) enum DeferredExistsConjunct {
 	Correlated { outer_key: Expr, inner_key: Expr },
+	CorrelatedResidual(Expr),
 	InnerResidual(Expr),
 }
 
@@ -2269,33 +2283,32 @@ pub(super) fn classify_deferred_exists_predicate(
 	match (sides.left, sides.right) {
 		// No outer reference → an inner-only (or constant) predicate; keep it on the inner side.
 		(false, _) => Ok(DeferredExistsConjunct::InnerResidual(predicate.clone())),
-		// References both sides → must be a simple correlated equality (one outer column = one inner column).
+		// References both sides → simple equality becomes a key; other predicates are an ADR 323 keyed
+		// semi/anti match residual, admitted only once some sibling equality supplies the hash key.
 		(true, true) => {
-			let Expr::Eq(left, right) = predicate else {
-				return Err(BindingError::UnsupportedExpression {
-					message: "correlated EXISTS predicate must be a column equality".to_string(),
-				});
-			};
-			match (
-				column_only_side(left, outer_scope, inner_scope),
-				column_only_side(right, outer_scope, inner_scope),
-			) {
-				(Some(LogicalJoinSide::Left), Some(LogicalJoinSide::Right)) => {
-					Ok(DeferredExistsConjunct::Correlated {
-						outer_key: (**left).clone(),
-						inner_key: (**right).clone(),
-					})
+			if let Expr::Eq(left, right) = predicate {
+				match (
+					column_only_side(left, outer_scope, inner_scope),
+					column_only_side(right, outer_scope, inner_scope),
+				) {
+					(Some(LogicalJoinSide::Left), Some(LogicalJoinSide::Right)) => {
+						return Ok(DeferredExistsConjunct::Correlated {
+							outer_key: (**left).clone(),
+							inner_key: (**right).clone(),
+						});
+					}
+					(Some(LogicalJoinSide::Right), Some(LogicalJoinSide::Left)) => {
+						return Ok(DeferredExistsConjunct::Correlated {
+							outer_key: (**right).clone(),
+							inner_key: (**left).clone(),
+						});
+					}
+					_ => {}
 				}
-				(Some(LogicalJoinSide::Right), Some(LogicalJoinSide::Left)) => {
-					Ok(DeferredExistsConjunct::Correlated {
-						outer_key: (**right).clone(),
-						inner_key: (**left).clone(),
-					})
-				}
-				_ => Err(BindingError::UnsupportedExpression {
-					message: "unsupported correlated EXISTS predicate".to_string(),
-				}),
 			}
+			Ok(DeferredExistsConjunct::CorrelatedResidual(
+				predicate.clone(),
+			))
 		}
 		// References only the outer query → cannot correlate to the inner subquery.
 		(true, false) => Err(BindingError::UnsupportedExpression {

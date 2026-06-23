@@ -5567,6 +5567,7 @@ impl SqlPlanner {
 		let inner_qualifiers = plan_qualifiers(&inner_plan);
 		let mut on = Vec::new();
 		let mut inner_residuals = Vec::new();
+		let mut correlated_residuals = Vec::new();
 
 		if let Some(selection) = &select.selection {
 			for conjunct in split_top_level_and(selection) {
@@ -5574,10 +5575,13 @@ impl SqlPlanner {
 				{
 					Ok(ExistsConjunct::CorrelatedPair { outer, inner }) => on.push((outer, inner)),
 					Ok(ExistsConjunct::InnerResidual(predicate)) => inner_residuals.push(predicate),
+					Ok(ExistsConjunct::CorrelatedResidual(predicate)) => {
+						correlated_residuals.push(predicate);
+					}
 					// ADR 279: defer ONLY the unqualified-correlated-ref case — the frontend is purely
-					// syntactic and can't resolve which relation owns a bare column. Genuinely-unsupported
-					// QUALIFIED shapes (outer-only, non-equi, computed keys) still reject here as before; the
-					// binder resolves the deferred predicates catalog-aware (and rejects ambiguous ones).
+					// syntactic and can't resolve which relation owns a bare column. Qualified outer-only
+					// and computed-key shapes still reject here; qualified non-equi correlations with an
+					// equality key become ADR 323 match residuals.
 					Err(error)
 						if error
 							.to_string()
@@ -5607,8 +5611,12 @@ impl SqlPlanner {
 				predicate,
 			};
 		}
+		let on_filter = combine_and_exprs(correlated_residuals);
+		if on_filter.is_some() && on.is_empty() {
+			return Err(unsupported("unsupported non-equi EXISTS correlation"));
+		}
 
-		build_join_plan(
+		build_join_plan_with_filter(
 			outer_plan,
 			inner_plan,
 			if negated {
@@ -5617,6 +5625,7 @@ impl SqlPlanner {
 				JoinKind::LeftSemi
 			},
 			on,
+			on_filter,
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
 			None,
@@ -5700,6 +5709,11 @@ impl SqlPlanner {
 					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
 					ExistsConjunct::CorrelatedPair { outer, inner } => {
 						correlation_pairs.push((outer, inner));
+					}
+					ExistsConjunct::CorrelatedResidual(_) => {
+						return Err(unsupported(format!(
+							"{context} subquery predicate must be an equality correlation"
+						)));
 					}
 				}
 			}
@@ -5845,6 +5859,11 @@ impl SqlPlanner {
 			&mut scope_refs,
 		)?;
 		if scope_refs.outer || scope_refs.unsupported {
+			if scope_refs.outer && scope_refs.inner && !scope_refs.unsupported {
+				return Ok(ExistsConjunct::CorrelatedResidual(
+					self.lower_expr(conjunct)?,
+				));
+			}
 			return Err(unsupported("unsupported EXISTS subquery predicate"));
 		}
 
@@ -5998,6 +6017,11 @@ impl SqlPlanner {
 							}
 							ExistsConjunct::InnerResidual(predicate) => {
 								inner_residuals.push(predicate)
+							}
+							ExistsConjunct::CorrelatedResidual(_) => {
+								return Err(unsupported(
+									"unsupported correlated scalar subquery predicate",
+								));
 							}
 						}
 					}
@@ -9666,6 +9690,7 @@ enum JoinSide {
 #[derive(Debug)]
 enum ExistsConjunct {
 	CorrelatedPair { outer: Expr, inner: Expr },
+	CorrelatedResidual(Expr),
 	InnerResidual(Expr),
 }
 
@@ -10770,6 +10795,7 @@ mod tests {
 				assert_qualified_column(&inner, "dim", "k");
 			}
 			ExistsConjunct::InnerResidual(_) => panic!("expected correlated pair"),
+			ExistsConjunct::CorrelatedResidual(_) => panic!("expected correlated pair"),
 		}
 	}
 
@@ -10801,9 +10827,24 @@ mod tests {
 	}
 
 	#[test]
-	fn classifier_rejects_non_equi_and_computed_correlation() {
-		assert_classifier_rejects("SELECT * FROM fact WHERE dim.k > fact.k");
-		assert_classifier_rejects("SELECT * FROM fact WHERE dim.k + 1 = fact.k");
+	fn classifier_marks_non_equi_and_computed_correlation_as_residual() {
+		let planner = SqlPlanner::new();
+		for sql in [
+			"SELECT * FROM fact WHERE dim.k > fact.k",
+			"SELECT * FROM fact WHERE dim.k + 1 = fact.k",
+		] {
+			let classified = planner
+				.classify_exists_conjunct(
+					&parse_selection(sql),
+					&[TableRef::new("fact")],
+					&[TableRef::new("dim")],
+				)
+				.expect("cross-side non-key predicate is a residual candidate");
+			assert!(
+				matches!(classified, ExistsConjunct::CorrelatedResidual(_)),
+				"{sql}"
+			);
+		}
 	}
 
 	#[test]

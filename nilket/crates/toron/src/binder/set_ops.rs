@@ -280,6 +280,7 @@ impl<'a> Binder<'a> {
 			trace,
 			render_trace,
 			declared_position,
+			None,
 		)?;
 
 		let mut project_exprs = group_aliases

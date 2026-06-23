@@ -1731,7 +1731,7 @@ pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	assert!(builder.contains("JoinStrategy::Broadcast"));
 	assert!(planner.contains("build_join_plan_with_filter("));
 	assert!(planner.contains("on_filter"));
-	assert!(lower_exists.contains("build_join_plan("));
+	assert!(lower_exists.contains("build_join_plan_with_filter("));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(rune.contains(
 		"join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned, None)"

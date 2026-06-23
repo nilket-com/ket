@@ -1626,6 +1626,23 @@ impl<'a> Binder<'a> {
 					strategy_intent,
 				} => {
 					if on_filter.is_some() {
+						if matches!(kind, JoinKind::LeftSemi | JoinKind::LeftAnti) && !on.is_empty()
+						{
+							return self
+								.bind_join(
+									left,
+									right,
+									*kind,
+									on,
+									*null_safe_keys,
+									*strategy_intent,
+									trace,
+									render_trace,
+									join_order_source_capture,
+									on_filter.as_ref(),
+								)
+								.await;
+						}
 						let normalized = self
 							.push_on_clause_residual(
 								(**left).clone(),
@@ -1713,6 +1730,7 @@ impl<'a> Binder<'a> {
 									trace,
 									render_trace,
 									join_order_source_capture,
+									None,
 								)
 								.await;
 						}
@@ -1727,6 +1745,7 @@ impl<'a> Binder<'a> {
 						trace,
 						render_trace,
 						join_order_source_capture,
+						None,
 					)
 					.await
 				}
@@ -2676,6 +2695,7 @@ impl<'a> Binder<'a> {
 			.await?;
 		let mut on = Vec::new();
 		let mut residuals = Vec::new();
+		let mut correlated_residuals = Vec::new();
 		for predicate in predicates {
 			match classify_deferred_exists_predicate(
 				predicate,
@@ -2686,6 +2706,9 @@ impl<'a> Binder<'a> {
 					outer_key,
 					inner_key,
 				} => on.push((outer_key, inner_key)),
+				DeferredExistsConjunct::CorrelatedResidual(residual) => {
+					correlated_residuals.push(residual);
+				}
 				DeferredExistsConjunct::InnerResidual(residual) => residuals.push(residual),
 			}
 		}
@@ -2705,6 +2728,9 @@ impl<'a> Binder<'a> {
 		} else {
 			JoinKind::LeftSemi
 		};
+		let match_filter = correlated_residuals
+			.into_iter()
+			.reduce(|acc, next| Expr::And(Box::new(acc), Box::new(next)));
 		self.bind_join(
 			outer,
 			&inner_logical,
@@ -2715,6 +2741,7 @@ impl<'a> Binder<'a> {
 			trace,
 			render_trace,
 			join_order_source_capture,
+			match_filter.as_ref(),
 		)
 		.await
 	}
@@ -2754,6 +2781,11 @@ impl<'a> Binder<'a> {
 					outer_key,
 					inner_key,
 				} => pairs.push((outer_key, inner_key)),
+				DeferredExistsConjunct::CorrelatedResidual(_) => {
+					return Err(BindingError::UnsupportedExpression {
+						message: "unsupported correlated scalar subquery predicate".to_string(),
+					});
+				}
 				DeferredExistsConjunct::InnerResidual(residual) => residuals.push(residual),
 			}
 		}
@@ -2819,6 +2851,7 @@ impl<'a> Binder<'a> {
 			trace,
 			render_trace,
 			join_order_source_capture,
+			None,
 		)
 		.await
 	}
@@ -2834,6 +2867,7 @@ impl<'a> Binder<'a> {
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 		join_order_source_capture: JoinOrderSourceCapture,
+		match_filter: Option<&Expr>,
 	) -> Result<ScopedExecutionPlan, BindingError> {
 		let left_plan = self
 			.bind_plan_with_trace(left, trace, render_trace, join_order_source_capture, None)
@@ -2852,6 +2886,7 @@ impl<'a> Binder<'a> {
 			trace,
 			render_trace,
 			declared_position,
+			match_filter,
 		)
 	}
 
@@ -2866,6 +2901,7 @@ impl<'a> Binder<'a> {
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 		declared_position: usize,
+		match_filter: Option<&Expr>,
 	) -> Result<ScopedExecutionPlan, BindingError> {
 		let mut left_keys = Vec::new();
 		let mut right_keys = Vec::new();
@@ -3066,6 +3102,51 @@ impl<'a> Binder<'a> {
 		let physical_kind = mirrored_broadcast_physical_kind(kind, decision.placement);
 		let physical_output_schema =
 			join_schema(physical_kind, &left_plan.schema(), &right_plan.schema());
+		let match_filter = match match_filter {
+			Some(filter) => {
+				if left_keys.is_empty() {
+					return Err(BindingError::UnsupportedExpression {
+						message: "unsupported non-equi EXISTS correlation without an equality key"
+							.to_string(),
+					});
+				}
+				if !matches!(
+					physical_kind,
+					JoinKind::LeftSemi
+						| JoinKind::LeftAnti
+						| JoinKind::RightSemi
+						| JoinKind::RightAnti
+				) {
+					return Err(BindingError::UnsupportedExpression {
+						message: "unsupported semi/anti join residual placement".to_string(),
+					});
+				}
+				let match_schema = Arc::new(Schema::new(join_fields(
+					&left_plan.schema(),
+					&right_plan.schema(),
+				)));
+				let match_scope = RelationScope::join(
+					JoinKind::Inner,
+					&left_plan.scope,
+					&right_plan.scope,
+					&match_schema,
+				);
+				let logical_type_specs = HashMap::new();
+				let logical_type_registry = self.catalog.logical_type_registry();
+				let ctx = ExprBindContext {
+					config: self.config,
+					session_timezone: self.config.resolved_session_timezone()?,
+					logical_type_specs: &logical_type_specs,
+					logical_type_registry: &logical_type_registry,
+					relation_scope: Some(&match_scope),
+				};
+				let bound_filter =
+					bind_expr_program(std::slice::from_ref(filter), &match_schema, &ctx)?;
+				require_single_boolean_root(&bound_filter, "JOIN match filter")?;
+				Some(bound_filter)
+			}
+			None => None,
+		};
 		let join_plan = ExecutionPlan::Join {
 			replay_id,
 			replay_eligibility: broadcast_replay_eligibility(strategy_intent),
@@ -3074,6 +3155,7 @@ impl<'a> Binder<'a> {
 			kind: physical_kind,
 			left_keys,
 			right_keys,
+			match_filter,
 			null_safe_keys,
 			strategy: decision.strategy,
 			output_schema: physical_output_schema.clone(),
@@ -4190,6 +4272,7 @@ fn optimize_for_required(
 			kind,
 			left_keys,
 			right_keys,
+			match_filter,
 			null_safe_keys,
 			strategy,
 			output_schema,
@@ -4212,6 +4295,7 @@ fn optimize_for_required(
 					kind,
 					left_keys,
 					right_keys,
+					match_filter,
 					null_safe_keys,
 					strategy,
 					output_schema,
