@@ -7276,6 +7276,307 @@ pub async fn check_strict_q15(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q18Row {
+	pub c_name: String,
+	pub c_custkey: i64,
+	pub o_orderkey: i64,
+	pub o_orderdate: i32,
+	pub o_totalprice_raw: i128,
+	pub sum_raw: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q18Oracle {
+	pub rows: Vec<Q18Row>,
+	pub qualifying_orders: usize,
+	pub threshold_fail_orders: usize,
+	pub selected_lineitem_rows: usize,
+}
+
+pub fn q18_oracle_from_rows(
+	customers: impl IntoIterator<Item = (i64, String)>,
+	orders: impl IntoIterator<Item = (i64, i64, i32, i128)>,
+	lineitems: impl IntoIterator<Item = (i64, i128)>,
+) -> Result<Q18Oracle, String> {
+	let customers: HashMap<i64, String> = customers.into_iter().collect();
+	let orders: HashMap<i64, (i64, i32, i128)> = orders
+		.into_iter()
+		.map(|(orderkey, custkey, orderdate, totalprice_raw)| {
+			(orderkey, (custkey, orderdate, totalprice_raw))
+		})
+		.collect();
+	let mut quantity_by_order: HashMap<i64, i128> = HashMap::new();
+	let mut selected_lineitem_rows = 0_usize;
+	for (orderkey, quantity_raw) in lineitems {
+		selected_lineitem_rows += 1;
+		let entry = quantity_by_order.entry(orderkey).or_insert(0);
+		*entry = entry
+			.checked_add(quantity_raw)
+			.ok_or_else(|| "q18 order quantity overflow".to_string())?;
+	}
+
+	let mut rows = Vec::new();
+	let mut qualifying_orders = 0_usize;
+	let mut threshold_fail_orders = 0_usize;
+	for (orderkey, (custkey, orderdate, totalprice_raw)) in orders {
+		let Some(c_name) = customers.get(&custkey) else {
+			continue;
+		};
+		let Some(sum_raw) = quantity_by_order.get(&orderkey).copied() else {
+			continue;
+		};
+		if sum_raw > 30_000 {
+			qualifying_orders += 1;
+			rows.push(Q18Row {
+				c_name: c_name.clone(),
+				c_custkey: custkey,
+				o_orderkey: orderkey,
+				o_orderdate: orderdate,
+				o_totalprice_raw: totalprice_raw,
+				sum_raw,
+			});
+		} else {
+			threshold_fail_orders += 1;
+		}
+	}
+	rows.sort_by(|left, right| {
+		right
+			.o_totalprice_raw
+			.cmp(&left.o_totalprice_raw)
+			.then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
+			.then_with(|| left.o_orderkey.cmp(&right.o_orderkey))
+	});
+
+	Ok(Q18Oracle {
+		rows,
+		qualifying_orders,
+		threshold_fail_orders,
+		selected_lineitem_rows,
+	})
+}
+
+pub fn strict_q18_oracle(scale_factor: f64) -> Result<Q18Oracle, String> {
+	q18_oracle_from_rows(
+		CustomerGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|customer| (customer.c_custkey, customer.c_name.to_string())),
+		OrderGenerator::new(scale_factor, 1, 1).iter().map(|order| {
+			(
+				order.o_orderkey,
+				order.o_custkey,
+				order.o_orderdate.to_unix_epoch(),
+				order.o_totalprice.into_inner() as i128,
+			)
+		}),
+		LineItemGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|item| (item.l_orderkey, item.l_quantity as i128 * 100)),
+	)
+}
+
+fn strict_q18_expected_schema() -> [(&'static str, DataType); 6] {
+	[
+		("c_name", DataType::Utf8),
+		("c_custkey", DataType::Int64),
+		("o_orderkey", DataType::Int64),
+		("o_orderdate", DataType::Date32),
+		("o_totalprice", DataType::Decimal128(15, 2)),
+		("sum", DataType::Decimal128(15, 2)),
+	]
+}
+
+pub fn assert_strict_q18_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q18_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q18 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q18(batches: &[RecordBatch], oracle: &Q18Oracle) -> Result<(), String> {
+	assert_strict_q18_schema(batches)?;
+	if oracle.rows.is_empty()
+		|| oracle.qualifying_orders == 0
+		|| oracle.threshold_fail_orders == 0
+		|| oracle.selected_lineitem_rows == 0
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: rows={} qualifying_orders={} threshold_fail_orders={} selected_lineitem_rows={}",
+			oracle.rows.len(),
+			oracle.qualifying_orders,
+			oracle.threshold_fail_orders,
+			oracle.selected_lineitem_rows
+		));
+	}
+
+	let mut emitted = Vec::new();
+	let mut emitted_by_key: BTreeMap<i64, Q18Row> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 6 {
+			return Err(format!("expected 6 columns, got {}", batch.num_columns()));
+		}
+		let names = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (c_name) not Utf8")?;
+		let custkeys = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (c_custkey) not Int64")?;
+		let orderkeys = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 2 (o_orderkey) not Int64")?;
+		let orderdates = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Date32Array>()
+			.ok_or("column 3 (o_orderdate) not Date32")?;
+		let totalprices = batch
+			.column(4)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 4 (o_totalprice) not Decimal128")?;
+		let sums = batch
+			.column(5)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 5 (sum) not Decimal128")?;
+		for i in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if names.is_null(i) {
+				return Err(format!("column c_name row {row_index} is NULL"));
+			}
+			if custkeys.is_null(i) {
+				return Err(format!("column c_custkey row {row_index} is NULL"));
+			}
+			if orderkeys.is_null(i) {
+				return Err(format!("column o_orderkey row {row_index} is NULL"));
+			}
+			if orderdates.is_null(i) {
+				return Err(format!("column o_orderdate row {row_index} is NULL"));
+			}
+			if totalprices.is_null(i) {
+				return Err(format!("column o_totalprice row {row_index} is NULL"));
+			}
+			if sums.is_null(i) {
+				return Err(format!("column sum row {row_index} is NULL"));
+			}
+			let row = Q18Row {
+				c_name: names.value(i).to_string(),
+				c_custkey: custkeys.value(i),
+				o_orderkey: orderkeys.value(i),
+				o_orderdate: orderdates.value(i),
+				o_totalprice_raw: totalprices.value(i),
+				sum_raw: sums.value(i),
+			};
+			if emitted_by_key.insert(row.o_orderkey, row.clone()).is_some() {
+				return Err(format!("duplicate emitted o_orderkey {}", row.o_orderkey));
+			}
+			emitted.push(row);
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].o_totalprice_raw < pair[1].o_totalprice_raw
+			|| (pair[0].o_totalprice_raw == pair[1].o_totalprice_raw
+				&& pair[0].o_orderdate > pair[1].o_orderdate)
+		{
+			return Err(format!(
+				"ORDER BY o_totalprice DESC, o_orderdate violated: {:?} emitted before {:?}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	let expected = oracle.rows.iter().take(100).collect::<Vec<_>>();
+	if emitted.len() != expected.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			expected.len(),
+			emitted.len()
+		));
+	}
+	for expected_row in expected {
+		let Some(actual) = emitted_by_key.get(&expected_row.o_orderkey) else {
+			return Err(format!(
+				"oracle o_orderkey {} missing from output",
+				expected_row.o_orderkey
+			));
+		};
+		if actual != expected_row {
+			return Err(format!(
+				"o_orderkey {} mismatch: expected {:?}, got {:?}",
+				expected_row.o_orderkey, expected_row, actual
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q18(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q18_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q18".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q18_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q18_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q18_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q18(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// ADR 310 - dev q16: parts/supplier relationship reachability over part + partsupp + supplier.
 pub async fn run_dev_q16(scale_factor: f64) -> Attempt {
 	run_query_with_tables(

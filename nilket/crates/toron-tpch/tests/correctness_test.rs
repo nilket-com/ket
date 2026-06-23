@@ -11,32 +11,33 @@ use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
 	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q12Group,
 	Q12Oracle, Q13Oracle, Q14Oracle, Q15Row, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
-	Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
-	assert_strict_q3_schema, assert_strict_q04_schema, assert_strict_q5_schema,
-	assert_strict_q07_schema, assert_strict_q08_schema, assert_strict_q09_schema,
-	assert_strict_q10_schema, assert_strict_q11_schema, assert_strict_q12_schema,
-	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q15_schema,
-	assert_strict_q16_schema, assert_strict_q17_schema, assert_strict_q20_schema,
-	assert_strict_q22_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
-	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
-	check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12, check_strict_q13,
-	check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17, check_strict_q20,
-	check_strict_q22, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
+	Q18Oracle, Q18Row, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
+	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q04_schema,
+	assert_strict_q5_schema, assert_strict_q07_schema, assert_strict_q08_schema,
+	assert_strict_q09_schema, assert_strict_q10_schema, assert_strict_q11_schema,
+	assert_strict_q12_schema, assert_strict_q13_schema, assert_strict_q14_schema,
+	assert_strict_q15_schema, assert_strict_q16_schema, assert_strict_q17_schema,
+	assert_strict_q18_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
+	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
+	check_strict_q11, check_strict_q12, check_strict_q13, check_strict_q14, check_strict_q15,
+	check_strict_q16, check_strict_q17, check_strict_q18, check_strict_q20, check_strict_q22,
+	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
 	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
 	compare_strict_q09, compare_strict_q10, compare_strict_q11, compare_strict_q12,
 	compare_strict_q13, compare_strict_q14, compare_strict_q15, compare_strict_q16,
-	compare_strict_q17, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
-	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
-	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
-	q09_part_name_contains_green, q09_partsupp_cost, q11_oracle_from_rows, q11_threshold_passes,
-	q13_comment_matches_pattern, q13_oracle_from_rows, q15_oracle_from_rows,
-	q16_customer_complaints_matches_pattern, q16_oracle_from_rows, q20_part_name_is_forest_prefix,
-	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
-	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
-	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
-	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle, strict_q12_oracle,
-	strict_q13_oracle, strict_q14_oracle, strict_q15_oracle, strict_q16_oracle, strict_q17_oracle,
-	strict_q20_oracle, strict_q22_oracle,
+	compare_strict_q17, compare_strict_q18, compare_strict_q20, compare_strict_q22,
+	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
+	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
+	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
+	q11_oracle_from_rows, q11_threshold_passes, q13_comment_matches_pattern, q13_oracle_from_rows,
+	q15_oracle_from_rows, q16_customer_complaints_matches_pattern, q16_oracle_from_rows,
+	q20_part_name_is_forest_prefix, q20_threshold_passes, q22_acctbal_above_threshold,
+	q22_country_code, q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle,
+	strict_q02_oracle, strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle,
+	strict_q07_oracle, strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle,
+	strict_q12_oracle, strict_q13_oracle, strict_q14_oracle, strict_q15_oracle, strict_q16_oracle,
+	strict_q17_oracle, strict_q18_oracle, strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -3272,6 +3273,333 @@ fn q17_null_or_empty_result_is_fail_at_compare() {
 	assert!(
 		compare_strict_q17(&[q17_batch(&[Some(123)], 20, 6)], &q17_oracle(None)).is_err(),
 		"a NULL oracle is rejected by the anti-empty guard"
+	);
+}
+
+type Q18NullableRow<'a> = (
+	Option<&'a str>,
+	Option<i64>,
+	Option<i64>,
+	Option<i32>,
+	Option<i128>,
+	Option<i128>,
+);
+
+fn q18_batch(rows: &[Q18Row]) -> RecordBatch {
+	let nullable_rows: Vec<Q18NullableRow<'_>> = rows
+		.iter()
+		.map(|row| {
+			(
+				Some(row.c_name.as_str()),
+				Some(row.c_custkey),
+				Some(row.o_orderkey),
+				Some(row.o_orderdate),
+				Some(row.o_totalprice_raw),
+				Some(row.sum_raw),
+			)
+		})
+		.collect();
+	q18_nullable_batch(&nullable_rows)
+}
+
+fn q18_nullable_batch(rows: &[Q18NullableRow<'_>]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("c_name", DataType::Utf8, true),
+		Field::new("c_custkey", DataType::Int64, true),
+		Field::new("o_orderkey", DataType::Int64, true),
+		Field::new("o_orderdate", DataType::Date32, true),
+		Field::new("o_totalprice", DataType::Decimal128(15, 2), true),
+		Field::new("sum", DataType::Decimal128(15, 2), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<&str>>>(),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.2).collect::<Vec<Option<i64>>>(),
+			)) as ArrayRef,
+			Arc::new(Date32Array::from(
+				rows.iter().map(|row| row.3).collect::<Vec<Option<i32>>>(),
+			)) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.4).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(15, 2)
+					.expect("q18 o_totalprice decimal column"),
+			) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.5).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(15, 2)
+					.expect("q18 sum decimal column"),
+			) as ArrayRef,
+		],
+	)
+	.expect("q18 batch")
+}
+
+fn q18_row(
+	orderkey: i64,
+	name: &str,
+	custkey: i64,
+	orderdate: i32,
+	totalprice_raw: i128,
+	sum_raw: i128,
+) -> Q18Row {
+	Q18Row {
+		c_name: name.to_string(),
+		c_custkey: custkey,
+		o_orderkey: orderkey,
+		o_orderdate: orderdate,
+		o_totalprice_raw: totalprice_raw,
+		sum_raw,
+	}
+}
+
+fn q18_oracle(rows: &[Q18Row]) -> Q18Oracle {
+	Q18Oracle {
+		rows: rows.to_vec(),
+		qualifying_orders: rows.len().max(1),
+		threshold_fail_orders: 1,
+		selected_lineitem_rows: 1,
+	}
+}
+
+#[test]
+fn strict_q18_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q18(0.01))
+		})
+		.expect("spawn q18 correctness thread")
+		.join()
+		.expect("q18 correctness thread panicked");
+	assert_eq!(attempt.query, "q18");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q18_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q18_oracle(0.01).expect("q18 oracle");
+	assert!(
+		!oracle.rows.is_empty(),
+		"q18 oracle selected no rows: {oracle:?}"
+	);
+	assert!(
+		oracle.qualifying_orders > 0,
+		"q18 oracle selected no qualifying orders: {oracle:?}"
+	);
+	assert!(
+		oracle.threshold_fail_orders > 0,
+		"q18 oracle must exercise an excluded order: {oracle:?}"
+	);
+	assert!(
+		oracle.selected_lineitem_rows > 0,
+		"q18 oracle selected no lineitem rows: {oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q18_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q18_schema(&[q18_batch(&[q18_row(
+			1,
+			"Customer#000000001",
+			1,
+			9300,
+			50_000,
+			31_000
+		)])])
+		.is_ok()
+	);
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("c_name", DataType::Utf8, false),
+			Field::new("c_custkey", DataType::Int64, false),
+			Field::new("o_orderkey", DataType::Int64, false),
+			Field::new("o_orderdate", DataType::Date32, false),
+			Field::new("o_totalprice", DataType::Decimal128(15, 2), false),
+			Field::new("sum", DataType::Decimal128(14, 2), false),
+		])),
+		vec![
+			Arc::new(StringArray::from(vec!["Customer#000000001"])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+			Arc::new(Date32Array::from(vec![9300_i32])) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(vec![50_000_i128])
+					.with_precision_and_scale(15, 2)
+					.expect("drifted q18 totalprice"),
+			) as ArrayRef,
+			Arc::new(
+				Decimal128Array::from(vec![31_000_i128])
+					.with_precision_and_scale(14, 2)
+					.expect("drifted q18 sum"),
+			) as ArrayRef,
+		],
+	)
+	.expect("drifted q18 batch");
+	assert!(
+		assert_strict_q18_schema(&[drifted]).is_err(),
+		"a non-measured sum precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q18_correctness_mismatch_is_fail_at_compare() {
+	let row = q18_row(1, "Customer#000000001", 1, 9300, 50_000, 31_000);
+	let oracle = q18_oracle(std::slice::from_ref(&row));
+	assert!(
+		compare_strict_q18(&[q18_batch(std::slice::from_ref(&row))], &oracle).is_ok(),
+		"exact row match"
+	);
+
+	let mut wrong_sum = row.clone();
+	wrong_sum.sum_raw += 1;
+	assert!(
+		compare_strict_q18(&[q18_batch(&[wrong_sum])], &oracle).is_err(),
+		"an off-by-one sum is a mismatch"
+	);
+
+	let mut wrong_price = row.clone();
+	wrong_price.o_totalprice_raw += 1;
+	assert!(
+		compare_strict_q18(&[q18_batch(&[wrong_price])], &oracle).is_err(),
+		"an off-by-one o_totalprice is a mismatch"
+	);
+}
+
+#[test]
+fn q18_missing_extra_or_duplicate_row_is_fail_at_compare() {
+	let row_a = q18_row(1, "Customer#000000001", 1, 9300, 50_000, 31_000);
+	let row_b = q18_row(2, "Customer#000000002", 2, 9301, 49_000, 32_000);
+	let oracle = q18_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q18(&[q18_batch(std::slice::from_ref(&row_a))], &oracle).is_err(),
+		"a dropped row is a mismatch"
+	);
+	assert!(
+		compare_strict_q18(
+			&[q18_batch(&[
+				row_a.clone(),
+				row_b.clone(),
+				q18_row(3, "Customer#000000003", 3, 9302, 48_000, 33_000)
+			])],
+			&oracle
+		)
+		.is_err(),
+		"an extra row is a mismatch"
+	);
+	assert!(
+		compare_strict_q18(&[q18_batch(&[row_a.clone(), row_a])], &oracle).is_err(),
+		"a duplicate emitted o_orderkey is rejected"
+	);
+}
+
+#[test]
+fn q18_null_cell_is_fail_at_compare() {
+	let oracle = q18_oracle(&[q18_row(1, "Customer#000000001", 1, 9300, 50_000, 31_000)]);
+	for (column, row) in [
+		(
+			0,
+			(
+				None,
+				Some(1_i64),
+				Some(1_i64),
+				Some(9300_i32),
+				Some(50_000_i128),
+				Some(31_000_i128),
+			),
+		),
+		(
+			1,
+			(
+				Some("Customer#000000001"),
+				None,
+				Some(1_i64),
+				Some(9300_i32),
+				Some(50_000_i128),
+				Some(31_000_i128),
+			),
+		),
+		(
+			2,
+			(
+				Some("Customer#000000001"),
+				Some(1_i64),
+				None,
+				Some(9300_i32),
+				Some(50_000_i128),
+				Some(31_000_i128),
+			),
+		),
+		(
+			3,
+			(
+				Some("Customer#000000001"),
+				Some(1_i64),
+				Some(1_i64),
+				None,
+				Some(50_000_i128),
+				Some(31_000_i128),
+			),
+		),
+		(
+			4,
+			(
+				Some("Customer#000000001"),
+				Some(1_i64),
+				Some(1_i64),
+				Some(9300_i32),
+				None,
+				Some(31_000_i128),
+			),
+		),
+		(
+			5,
+			(
+				Some("Customer#000000001"),
+				Some(1_i64),
+				Some(1_i64),
+				Some(9300_i32),
+				Some(50_000_i128),
+				None,
+			),
+		),
+	] {
+		assert!(
+			compare_strict_q18(&[q18_nullable_batch(&[row])], &oracle).is_err(),
+			"NULL in q18 column {column} is fail@compare"
+		);
+	}
+}
+
+#[test]
+fn q18_order_violation_is_fail() {
+	let row_a = q18_row(1, "Customer#000000001", 1, 9300, 50_000, 31_000);
+	let row_b = q18_row(2, "Customer#000000002", 2, 9301, 49_000, 32_000);
+	let oracle = q18_oracle(&[row_a.clone(), row_b.clone()]);
+	assert!(
+		compare_strict_q18(&[q18_batch(&[row_b.clone(), row_a.clone()])], &oracle).is_err(),
+		"higher o_totalprice must sort first"
+	);
+
+	let tie_a = q18_row(3, "Customer#000000003", 3, 9300, 50_000, 31_000);
+	let tie_b = q18_row(4, "Customer#000000004", 4, 9300, 50_000, 31_000);
+	let tie_oracle = q18_oracle(&[tie_a.clone(), tie_b.clone()]);
+	assert!(
+		compare_strict_q18(&[q18_batch(&[tie_b, tie_a])], &tie_oracle).is_ok(),
+		"ties on o_totalprice and o_orderdate may emit in either order"
 	);
 }
 
