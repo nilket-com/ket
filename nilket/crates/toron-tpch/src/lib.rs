@@ -8,7 +8,7 @@
 
 pub mod telemetry;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -3672,6 +3672,310 @@ pub async fn check_strict_q10(scale_factor: f64) -> CorrectnessAttempt {
 		);
 	}
 	match compare_strict_q10(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
+pub const Q11_DECIMAL_LITERAL_SCALE_REASON: &str = "decimal_literal_scale";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q11Row {
+	pub ps_partkey: i64,
+	pub value_raw: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q11Oracle {
+	pub rows: Vec<Q11Row>,
+	pub global_value_raw: i128,
+	pub total_german_parts: usize,
+	pub positive_german_parts: usize,
+	pub threshold_fail_groups: usize,
+	pub threshold_failed_partkeys: BTreeSet<i64>,
+}
+
+pub fn q11_threshold_passes(value_raw: i128, global_value_raw: i128) -> Result<bool, String> {
+	let scaled_value = value_raw
+		.checked_mul(10_000)
+		.ok_or_else(|| "q11 threshold comparison overflow".to_string())?;
+	Ok(scaled_value > global_value_raw)
+}
+
+pub fn q11_oracle_from_rows(
+	partsupp: impl IntoIterator<Item = (i64, i64, i32, i128)>,
+	suppliers: impl IntoIterator<Item = (i64, i64)>,
+	nations: impl IntoIterator<Item = (i64, String)>,
+) -> Result<Q11Oracle, String> {
+	let germany_nations: HashSet<i64> = nations
+		.into_iter()
+		.filter_map(|(nation_key, name)| (name == "GERMANY").then_some(nation_key))
+		.collect();
+	let germany_suppliers: HashSet<i64> = suppliers
+		.into_iter()
+		.filter_map(|(suppkey, nation_key)| {
+			germany_nations.contains(&nation_key).then_some(suppkey)
+		})
+		.collect();
+
+	let mut groups: BTreeMap<i64, i128> = BTreeMap::new();
+	for (partkey, suppkey, availqty, supplycost_raw) in partsupp {
+		if !germany_suppliers.contains(&suppkey) {
+			continue;
+		}
+		let value_raw = supplycost_raw
+			.checked_mul(i128::from(availqty))
+			.ok_or_else(|| "q11 supplycost*availqty overflow".to_string())?;
+		let current = groups.entry(partkey).or_insert(0);
+		*current = current
+			.checked_add(value_raw)
+			.ok_or_else(|| "q11 grouped value overflow".to_string())?;
+	}
+
+	let mut global_value_raw = 0_i128;
+	for value in groups.values() {
+		global_value_raw = global_value_raw
+			.checked_add(*value)
+			.ok_or_else(|| "q11 global value overflow".to_string())?;
+	}
+
+	let total_german_parts = groups.len();
+	let positive_german_parts = groups.values().filter(|&&value| value > 0).count();
+	let mut threshold_fail_groups = 0_usize;
+	let mut threshold_failed_partkeys = BTreeSet::new();
+	let mut rows = Vec::new();
+	for (partkey, value_raw) in groups {
+		if q11_threshold_passes(value_raw, global_value_raw)? {
+			rows.push(Q11Row {
+				ps_partkey: partkey,
+				value_raw,
+			});
+		} else if value_raw > 0 {
+			threshold_fail_groups += 1;
+			threshold_failed_partkeys.insert(partkey);
+		}
+	}
+	rows.sort_by(|left, right| {
+		right
+			.value_raw
+			.cmp(&left.value_raw)
+			.then_with(|| left.ps_partkey.cmp(&right.ps_partkey))
+	});
+
+	Ok(Q11Oracle {
+		rows,
+		global_value_raw,
+		total_german_parts,
+		positive_german_parts,
+		threshold_fail_groups,
+		threshold_failed_partkeys,
+	})
+}
+
+pub fn strict_q11_oracle(scale_factor: f64) -> Result<Q11Oracle, String> {
+	q11_oracle_from_rows(
+		PartSuppGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|partsupp| {
+				(
+					partsupp.ps_partkey,
+					partsupp.ps_suppkey,
+					partsupp.ps_availqty,
+					partsupp.ps_supplycost.into_inner() as i128,
+				)
+			}),
+		SupplierGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|supplier| (supplier.s_suppkey, supplier.s_nationkey)),
+		NationGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|nation| (nation.n_nationkey, nation.n_name.to_string())),
+	)
+}
+
+fn strict_q11_expected_schema() -> [(&'static str, DataType); 2] {
+	[
+		("ps_partkey", DataType::Int64),
+		("value", DataType::Decimal128(26, 2)),
+	]
+}
+
+pub fn assert_strict_q11_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q11_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q11 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q11(batches: &[RecordBatch], oracle: &Q11Oracle) -> Result<(), String> {
+	assert_strict_q11_schema(batches)?;
+	if oracle.rows.is_empty()
+		|| oracle.positive_german_parts <= oracle.rows.len()
+		|| oracle.threshold_fail_groups == 0
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: rows={} total_german_parts={} positive_german_parts={} threshold_fail_groups={} global_value_raw={}",
+			oracle.rows.len(),
+			oracle.total_german_parts,
+			oracle.positive_german_parts,
+			oracle.threshold_fail_groups,
+			oracle.global_value_raw
+		));
+	}
+
+	let mut emitted = Vec::new();
+	let mut emitted_by_part: BTreeMap<i64, i128> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let partkeys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 0 (ps_partkey) not Int64")?;
+		let values = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 1 (value) not Decimal128")?;
+		for row in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if partkeys.is_null(row) {
+				return Err(format!("column ps_partkey row {row_index} is NULL"));
+			}
+			if values.is_null(row) {
+				return Err(format!("column value row {row_index} is NULL"));
+			}
+			let output = Q11Row {
+				ps_partkey: partkeys.value(row),
+				value_raw: values.value(row),
+			};
+			if emitted_by_part
+				.insert(output.ps_partkey, output.value_raw)
+				.is_some()
+			{
+				return Err(format!(
+					"duplicate emitted ps_partkey {}",
+					output.ps_partkey
+				));
+			}
+			emitted.push(output);
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].value_raw < pair[1].value_raw {
+			return Err(format!(
+				"ORDER BY value DESC violated: {:?} emitted before {:?}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	let expected_by_part: BTreeMap<i64, i128> = oracle
+		.rows
+		.iter()
+		.map(|row| (row.ps_partkey, row.value_raw))
+		.collect();
+	let missing = expected_by_part
+		.keys()
+		.filter(|partkey| !emitted_by_part.contains_key(*partkey))
+		.count();
+	let extra_partkeys: BTreeSet<i64> = emitted_by_part
+		.keys()
+		.filter(|partkey| !expected_by_part.contains_key(*partkey))
+		.copied()
+		.collect();
+	let extras = extra_partkeys.len();
+	if missing == 0
+		&& extra_partkeys == oracle.threshold_failed_partkeys
+		&& emitted_by_part.len() == oracle.positive_german_parts
+		&& emitted_by_part.values().all(|value| *value > 0)
+	{
+		return Err(Q11_DECIMAL_LITERAL_SCALE_REASON.to_string());
+	}
+
+	if emitted_by_part.len() != expected_by_part.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			expected_by_part.len(),
+			emitted_by_part.len()
+		));
+	}
+	if missing > 0 || extras > 0 {
+		return Err(format!(
+			"q11 key set mismatch: missing {missing} expected rows, extra {extras} output rows"
+		));
+	}
+	for (partkey, expected_value) in expected_by_part {
+		let Some(actual_value) = emitted_by_part.get(&partkey) else {
+			return Err(format!("oracle ps_partkey {partkey} missing from output"));
+		};
+		if *actual_value != expected_value {
+			return Err(format!(
+				"ps_partkey {partkey}: value mismatch: expected {expected_value}, got {actual_value}"
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q11(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q11_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q11".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q11_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q11_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q11_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q11(&batches, &oracle) {
 		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
 		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
 	}

@@ -1,6 +1,6 @@
 //! The strict correctness rail — answer-checked cells, kept separate from reachability.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray};
@@ -9,31 +9,33 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
-	Q09Oracle, Q10Oracle, Q10Row, Q12Group, Q12Oracle, Q13Oracle, Q14Oracle, Q16Oracle,
-	Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle,
-	assert_strict_q1_schema, assert_strict_q02_schema, assert_strict_q3_schema,
-	assert_strict_q04_schema, assert_strict_q5_schema, assert_strict_q07_schema,
-	assert_strict_q08_schema, assert_strict_q09_schema, assert_strict_q10_schema,
-	assert_strict_q12_schema, assert_strict_q13_schema, assert_strict_q14_schema,
-	assert_strict_q16_schema, assert_strict_q17_schema, assert_strict_q20_schema,
-	assert_strict_q22_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
-	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
-	check_strict_q09, check_strict_q10, check_strict_q12, check_strict_q13, check_strict_q14,
-	check_strict_q16, check_strict_q17, check_strict_q20, check_strict_q22, compare_strict_q1,
-	compare_strict_q02, compare_strict_q3, compare_strict_q04, compare_strict_q5,
-	compare_strict_q6, compare_strict_q07, compare_strict_q08, compare_strict_q09,
-	compare_strict_q10, compare_strict_q12, compare_strict_q13, compare_strict_q14,
+	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q12Group,
+	Q12Oracle, Q13Oracle, Q14Oracle, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle,
+	Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
+	assert_strict_q3_schema, assert_strict_q04_schema, assert_strict_q5_schema,
+	assert_strict_q07_schema, assert_strict_q08_schema, assert_strict_q09_schema,
+	assert_strict_q10_schema, assert_strict_q11_schema, assert_strict_q12_schema,
+	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q16_schema,
+	assert_strict_q17_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
+	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
+	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
+	check_strict_q11, check_strict_q12, check_strict_q13, check_strict_q14, check_strict_q16,
+	check_strict_q17, check_strict_q20, check_strict_q22, compare_strict_q1, compare_strict_q02,
+	compare_strict_q3, compare_strict_q04, compare_strict_q5, compare_strict_q6,
+	compare_strict_q07, compare_strict_q08, compare_strict_q09, compare_strict_q10,
+	compare_strict_q11, compare_strict_q12, compare_strict_q13, compare_strict_q14,
 	compare_strict_q16, compare_strict_q17, compare_strict_q20, compare_strict_q22,
 	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
 	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
 	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
-	q13_comment_matches_pattern, q13_oracle_from_rows, q16_customer_complaints_matches_pattern,
-	q16_oracle_from_rows, q20_part_name_is_forest_prefix, q20_threshold_passes,
-	q22_acctbal_above_threshold, q22_country_code, q22_country_code_is_selected,
-	q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle, strict_q3_oracle, strict_q04_oracle,
-	strict_q5_oracle, strict_q6_oracle, strict_q07_oracle, strict_q08_oracle, strict_q09_oracle,
-	strict_q10_oracle, strict_q12_oracle, strict_q13_oracle, strict_q14_oracle, strict_q16_oracle,
-	strict_q17_oracle, strict_q20_oracle, strict_q22_oracle,
+	q11_oracle_from_rows, q11_threshold_passes, q13_comment_matches_pattern, q13_oracle_from_rows,
+	q16_customer_complaints_matches_pattern, q16_oracle_from_rows, q20_part_name_is_forest_prefix,
+	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
+	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
+	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
+	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle, strict_q12_oracle,
+	strict_q13_oracle, strict_q14_oracle, strict_q16_oracle, strict_q17_oracle, strict_q20_oracle,
+	strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -2066,6 +2068,177 @@ fn q10_comparator_accepts_tied_revenue_permutation() {
 	assert!(
 		compare_strict_q10(&[q10_batch(&[row_b, row_a])], &oracle).is_ok(),
 		"tie order [b,a] equally accepted"
+	);
+}
+
+fn q11_row(ps_partkey: i64, value_raw: i128) -> Q11Row {
+	Q11Row {
+		ps_partkey,
+		value_raw,
+	}
+}
+
+fn q11_oracle(rows: Vec<Q11Row>, positive_german_parts: usize) -> Q11Oracle {
+	Q11Oracle {
+		threshold_fail_groups: positive_german_parts.saturating_sub(rows.len()),
+		threshold_failed_partkeys: BTreeSet::new(),
+		total_german_parts: positive_german_parts,
+		positive_german_parts,
+		global_value_raw: rows.iter().map(|row| row.value_raw).sum(),
+		rows,
+	}
+}
+
+fn q11_batch(rows: &[Q11Row]) -> RecordBatch {
+	let nullable_rows: Vec<(Option<i64>, Option<i128>)> = rows
+		.iter()
+		.map(|row| (Some(row.ps_partkey), Some(row.value_raw)))
+		.collect();
+	q11_nullable_batch(&nullable_rows)
+}
+
+fn q11_nullable_batch(rows: &[(Option<i64>, Option<i128>)]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("ps_partkey", DataType::Int64, true),
+		Field::new("value", DataType::Decimal128(26, 2), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<i64>>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.1).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(26, 2)
+					.expect("q11 value decimal column"),
+			),
+		],
+	)
+	.expect("q11 batch")
+}
+
+#[test]
+fn strict_q11_expected_red_documents_decimal_literal_scale() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q11(0.01))
+		})
+		.expect("spawn q11 correctness thread")
+		.join()
+		.expect("q11 correctness thread panicked");
+	assert_eq!(attempt.query, "q11");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Fail, "{}", attempt.human());
+	assert_eq!(
+		attempt.reason.as_deref(),
+		Some(Q11_DECIMAL_LITERAL_SCALE_REASON),
+		"{}",
+		attempt.human()
+	);
+}
+
+#[test]
+fn strict_q11_oracle_is_selective_at_default_scale() {
+	let oracle = strict_q11_oracle(0.01).expect("q11 oracle");
+	assert!(
+		!oracle.rows.is_empty(),
+		"q11 oracle selected no rows: {oracle:?}"
+	);
+	assert!(
+		oracle.rows.len() < oracle.positive_german_parts,
+		"q11 threshold must select a proper subset: {oracle:?}"
+	);
+	assert!(
+		oracle.threshold_fail_groups > 0,
+		"q11 must have positive German groups below the exact threshold: {oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q11_output_schema_is_asserted() {
+	assert!(assert_strict_q11_schema(&[q11_batch(&[q11_row(1, 20_000)])]).is_ok());
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("ps_partkey", DataType::Int64, false),
+			Field::new("value", DataType::Decimal128(27, 2), false),
+		])),
+		vec![
+			Arc::new(Int64Array::from(vec![1_i64])),
+			Arc::new(
+				Decimal128Array::from(vec![20_000_i128])
+					.with_precision_and_scale(27, 2)
+					.expect("drifted q11 value"),
+			),
+		],
+	)
+	.expect("drifted q11 batch");
+	assert!(
+		assert_strict_q11_schema(&[drifted]).is_err(),
+		"a non-measured value precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q11_exact_threshold_is_integer_comparison() {
+	assert!(
+		q11_threshold_passes(2, 10_000).expect("threshold check"),
+		"2 raw cents > 100.00 * 0.0001"
+	);
+	assert!(
+		!q11_threshold_passes(1, 10_000).expect("threshold check"),
+		"1 raw cent is not > 100.00 * 0.0001"
+	);
+}
+
+#[test]
+fn q11_decimal_literal_scale_extra_rows_are_expected_red() {
+	let oracle = q11_oracle_from_rows(
+		[(1_i64, 10_i64, 1_i32, 20_000_i128), (2, 10, 1, 1)],
+		[(10_i64, 1_i64)],
+		[(1_i64, "GERMANY".to_string())],
+	)
+	.expect("q11 oracle");
+	assert_eq!(oracle.rows, vec![q11_row(1, 20_000)]);
+	assert_eq!(oracle.positive_german_parts, 2);
+	assert_eq!(oracle.threshold_fail_groups, 1);
+
+	assert!(
+		compare_strict_q11(&[q11_batch(&oracle.rows)], &oracle).is_ok(),
+		"exact oracle output matches"
+	);
+	let mut zero_threshold_output = oracle.rows.clone();
+	zero_threshold_output.push(q11_row(2, 1));
+	let error = compare_strict_q11(&[q11_batch(&zero_threshold_output)], &oracle)
+		.expect_err("the zero-threshold output is the expected q11 red");
+	assert_eq!(error, Q11_DECIMAL_LITERAL_SCALE_REASON);
+}
+
+#[test]
+fn q11_null_cell_is_fail_at_compare() {
+	let oracle = q11_oracle(vec![q11_row(1, 20_000)], 2);
+	for (column, row) in [(0, (None, Some(20_000_i128))), (1, (Some(1_i64), None))] {
+		assert!(
+			compare_strict_q11(&[q11_nullable_batch(&[row])], &oracle).is_err(),
+			"NULL in q11 column {column} is fail@compare"
+		);
+	}
+}
+
+#[test]
+fn q11_order_prefix_violation_is_fail() {
+	let row_a = q11_row(1, 20_000);
+	let row_b = q11_row(2, 10_000);
+	let oracle = q11_oracle(vec![row_a.clone(), row_b.clone()], 3);
+	assert!(
+		compare_strict_q11(&[q11_batch(&[row_b, row_a])], &oracle).is_err(),
+		"value ascending violates ORDER BY value DESC"
 	);
 }
 
