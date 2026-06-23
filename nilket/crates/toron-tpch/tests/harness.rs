@@ -1,20 +1,25 @@
 //! ADR 261/262 behavioral gates for the TPC-H reachability harness.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use arrow::array::{Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, matrix_from_log, parse_scale_factor, q15_supplier_revenue_join_is_keyed,
-	q18_grouped_membership_join_is_keyed, q19_lineitem_part_join_is_keyed, run_dev_q1, run_dev_q02,
-	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09,
-	run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16,
-	run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1,
-	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
-	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
-	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19,
-	run_strict_q20, run_strict_q21, run_strict_q22, status_rows,
+	ALL_QUERY_IDS, compare_strict_q21, matrix_from_log, parse_scale_factor,
+	q15_supplier_revenue_join_is_keyed, q18_grouped_membership_join_is_keyed,
+	q19_lineitem_part_join_is_keyed, q21_oracle_from_rows, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1, run_strict_q02,
+	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
+	run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14,
+	run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20,
+	run_strict_q21, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -1078,6 +1083,60 @@ fn q20_executes_in_both_modes() {
 		.expect("spawn q20 thread")
 		.join()
 		.expect("q20 thread panicked");
+}
+
+#[test]
+fn q21_oracle_counts_rows_and_discriminates_antijoins() {
+	let oracle = q21_oracle_from_rows(
+		[
+			(1, "S1".to_string(), 10),
+			(2, "S2".to_string(), 10),
+			(3, "S3".to_string(), 11),
+		],
+		[
+			(10, "SAUDI ARABIA".to_string()),
+			(11, "MOROCCO".to_string()),
+		],
+		[
+			(100, "F".to_string()),
+			(101, "F".to_string()),
+			(102, "F".to_string()),
+			(103, "O".to_string()),
+		],
+		[
+			(100, 1, 10, 20),
+			(100, 1, 11, 21),
+			(100, 2, 10, 10),
+			(101, 1, 10, 20),
+			(101, 2, 10, 20),
+			(102, 1, 10, 20),
+			(103, 3, 10, 20),
+		],
+	)
+	.expect("q21 oracle");
+
+	assert_eq!(
+		oracle.contributing_rows, 2,
+		"the oracle counts qualifying l1 rows"
+	);
+	assert_eq!(oracle.rows.len(), 1, "only S1 should qualify");
+	assert_eq!(oracle.rows[0].s_name, "S1");
+	assert_eq!(oracle.rows[0].numwait, 2);
+
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("s_name", DataType::Utf8, false),
+		Field::new("numwait", DataType::Int64, false),
+	]));
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(vec!["S1"])),
+			Arc::new(Int64Array::from(vec![2])),
+		],
+	)
+	.expect("q21 record batch");
+
+	compare_strict_q21(&[batch], &oracle).expect("q21 compare");
 }
 
 // ADR 323 clears q21's keyed semi/anti EXISTS residual wall; both modes now reach execute.

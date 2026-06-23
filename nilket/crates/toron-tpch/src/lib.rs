@@ -6538,6 +6538,282 @@ pub async fn run_strict_q21(scale_factor: f64) -> Attempt {
 	.await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q21Row {
+	pub s_name: String,
+	pub numwait: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q21Oracle {
+	pub rows: Vec<Q21Row>,
+	pub contributing_rows: usize,
+}
+
+/// Independent strict-q21 oracle: traverse the generators directly, count every qualifying `l1` row, and
+/// group the answer by supplier name with the executor's `numwait DESC, s_name` ordering.
+pub fn q21_oracle_from_rows(
+	suppliers: impl IntoIterator<Item = (i64, String, i64)>,
+	nations: impl IntoIterator<Item = (i64, String)>,
+	orders: impl IntoIterator<Item = (i64, String)>,
+	lineitems: impl IntoIterator<Item = (i64, i64, i32, i32)>,
+) -> Result<Q21Oracle, String> {
+	let suppliers: HashMap<i64, (String, i64)> = suppliers
+		.into_iter()
+		.map(|(suppkey, name, nationkey)| (suppkey, (name, nationkey)))
+		.collect();
+	let nations: HashMap<i64, String> = nations.into_iter().collect();
+	let orders: HashMap<i64, String> = orders.into_iter().collect();
+
+	let mut lineitems_by_order: HashMap<i64, Vec<(i64, i32, i32)>> = HashMap::new();
+	for (orderkey, suppkey, commitdate, receiptdate) in lineitems {
+		lineitems_by_order
+			.entry(orderkey)
+			.or_default()
+			.push((suppkey, commitdate, receiptdate));
+	}
+
+	let mut counts: HashMap<String, i64> = HashMap::new();
+	let mut contributing_rows = 0_usize;
+	for (orderkey, items) in lineitems_by_order {
+		let Some(orderstatus) = orders.get(&orderkey) else {
+			continue;
+		};
+		if orderstatus != "F" {
+			continue;
+		}
+
+		let supplier_set: HashSet<i64> = items.iter().map(|(suppkey, _, _)| *suppkey).collect();
+		let late_supplier_set: HashSet<i64> = items
+			.iter()
+			.filter(|(_, commitdate, receiptdate)| receiptdate > commitdate)
+			.map(|(suppkey, _, _)| *suppkey)
+			.collect();
+
+		for (suppkey, commitdate, receiptdate) in items {
+			if receiptdate <= commitdate {
+				continue;
+			}
+			let Some((s_name, nationkey)) = suppliers.get(&suppkey) else {
+				continue;
+			};
+			let Some(nation_name) = nations.get(nationkey) else {
+				continue;
+			};
+			if nation_name != "SAUDI ARABIA" {
+				continue;
+			}
+			if !supplier_set
+				.iter()
+				.any(|other_suppkey| *other_suppkey != suppkey)
+			{
+				continue;
+			}
+			if late_supplier_set
+				.iter()
+				.any(|other_suppkey| *other_suppkey != suppkey)
+			{
+				continue;
+			}
+			contributing_rows += 1;
+			*counts.entry(s_name.clone()).or_insert(0) += 1;
+		}
+	}
+
+	let mut rows = counts
+		.into_iter()
+		.map(|(s_name, numwait)| Q21Row { s_name, numwait })
+		.collect::<Vec<_>>();
+	rows.sort_by(|left, right| {
+		right
+			.numwait
+			.cmp(&left.numwait)
+			.then_with(|| left.s_name.cmp(&right.s_name))
+	});
+
+	Ok(Q21Oracle {
+		rows,
+		contributing_rows,
+	})
+}
+
+pub fn strict_q21_oracle(scale_factor: f64) -> Result<Q21Oracle, String> {
+	q21_oracle_from_rows(
+		SupplierGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|supplier| {
+				(
+					supplier.s_suppkey,
+					supplier.s_name.to_string(),
+					supplier.s_nationkey,
+				)
+			}),
+		NationGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|nation| (nation.n_nationkey, nation.n_name.to_string())),
+		OrderGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|order| (order.o_orderkey, order.o_orderstatus.to_string())),
+		LineItemGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|item| {
+				(
+					item.l_orderkey,
+					item.l_suppkey,
+					item.l_commitdate.to_unix_epoch(),
+					item.l_receiptdate.to_unix_epoch(),
+				)
+			}),
+	)
+}
+
+fn strict_q21_expected_schema() -> [(&'static str, DataType); 2] {
+	[("s_name", DataType::Utf8), ("numwait", DataType::Int64)]
+}
+
+pub fn assert_strict_q21_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q21_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q21 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q21(batches: &[RecordBatch], oracle: &Q21Oracle) -> Result<(), String> {
+	assert_strict_q21_schema(batches)?;
+	if oracle.contributing_rows == 0 || oracle.rows.is_empty() {
+		return Err(format!(
+			"oracle non-vacuous guard failed: contributing_rows={} rows={}",
+			oracle.contributing_rows,
+			oracle.rows.len()
+		));
+	}
+
+	let mut emitted = Vec::new();
+	for batch in batches {
+		if batch.num_columns() != 2 {
+			return Err(format!("expected 2 columns, got {}", batch.num_columns()));
+		}
+		let names = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 0 (s_name) not Utf8")?;
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 1 (numwait) not Int64")?;
+		for row in 0..batch.num_rows() {
+			let row_index = emitted.len();
+			if names.is_null(row) {
+				return Err(format!("column s_name row {row_index} is NULL"));
+			}
+			if counts.is_null(row) {
+				return Err(format!("column numwait row {row_index} is NULL"));
+			}
+			emitted.push(Q21Row {
+				s_name: names.value(row).to_string(),
+				numwait: counts.value(row),
+			});
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		if pair[0].numwait < pair[1].numwait
+			|| (pair[0].numwait == pair[1].numwait && pair[0].s_name > pair[1].s_name)
+		{
+			return Err(format!(
+				"ORDER BY numwait DESC, s_name violated: {:?} emitted before {:?}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	let expected = oracle.rows.iter().take(100).collect::<Vec<_>>();
+	if emitted.len() != expected.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			expected.len(),
+			emitted.len()
+		));
+	}
+	for (idx, (actual, expected_row)) in emitted.iter().zip(expected.iter()).enumerate() {
+		if actual.s_name != expected_row.s_name {
+			return Err(format!(
+				"row {idx}: expected s_name {:?}, got {:?}",
+				expected_row.s_name, actual.s_name
+			));
+		}
+		if actual.numwait != expected_row.numwait {
+			return Err(format!(
+				"row {idx} ({}) numwait mismatch: expected {}, got {}",
+				actual.s_name, expected_row.numwait, actual.numwait
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q21(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q21_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q21".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q21_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q21_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q21_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q21(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 async fn run_q19(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Attempt {
 	let start = Instant::now();
 	if let Err(message) = q19_lineitem_part_join_is_keyed(strict, scale_factor).await {
