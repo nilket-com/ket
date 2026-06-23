@@ -10,32 +10,33 @@ use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
 	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q12Group,
-	Q12Oracle, Q13Oracle, Q14Oracle, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle, Q20Oracle,
-	Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
+	Q12Oracle, Q13Oracle, Q14Oracle, Q15Row, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
+	Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema, assert_strict_q02_schema,
 	assert_strict_q3_schema, assert_strict_q04_schema, assert_strict_q5_schema,
 	assert_strict_q07_schema, assert_strict_q08_schema, assert_strict_q09_schema,
 	assert_strict_q10_schema, assert_strict_q11_schema, assert_strict_q12_schema,
-	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q16_schema,
-	assert_strict_q17_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
-	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
-	check_strict_q11, check_strict_q12, check_strict_q13, check_strict_q14, check_strict_q16,
-	check_strict_q17, check_strict_q20, check_strict_q22, compare_strict_q1, compare_strict_q02,
-	compare_strict_q3, compare_strict_q04, compare_strict_q5, compare_strict_q6,
-	compare_strict_q07, compare_strict_q08, compare_strict_q09, compare_strict_q10,
-	compare_strict_q11, compare_strict_q12, compare_strict_q13, compare_strict_q14,
-	compare_strict_q16, compare_strict_q17, compare_strict_q20, compare_strict_q22,
-	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
-	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
-	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
-	q11_oracle_from_rows, q11_threshold_passes, q13_comment_matches_pattern, q13_oracle_from_rows,
+	assert_strict_q13_schema, assert_strict_q14_schema, assert_strict_q15_schema,
+	assert_strict_q16_schema, assert_strict_q17_schema, assert_strict_q20_schema,
+	assert_strict_q22_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
+	check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12, check_strict_q13,
+	check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17, check_strict_q20,
+	check_strict_q22, compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
+	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
+	compare_strict_q09, compare_strict_q10, compare_strict_q11, compare_strict_q12,
+	compare_strict_q13, compare_strict_q14, compare_strict_q15, compare_strict_q16,
+	compare_strict_q17, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
+	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
+	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
+	q09_part_name_contains_green, q09_partsupp_cost, q11_oracle_from_rows, q11_threshold_passes,
+	q13_comment_matches_pattern, q13_oracle_from_rows, q15_oracle_from_rows,
 	q16_customer_complaints_matches_pattern, q16_oracle_from_rows, q20_part_name_is_forest_prefix,
 	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
 	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
 	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
 	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle, strict_q12_oracle,
-	strict_q13_oracle, strict_q14_oracle, strict_q16_oracle, strict_q17_oracle, strict_q20_oracle,
-	strict_q22_oracle,
+	strict_q13_oracle, strict_q14_oracle, strict_q15_oracle, strict_q16_oracle, strict_q17_oracle,
+	strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -2235,6 +2236,319 @@ fn q11_order_prefix_violation_is_fail() {
 		compare_strict_q11(&[q11_batch(&[row_b, row_a])], &oracle).is_err(),
 		"value ascending violates ORDER BY value DESC"
 	);
+}
+
+type Q15NullableRow<'a> = (
+	Option<i64>,
+	Option<&'a str>,
+	Option<&'a str>,
+	Option<&'a str>,
+	Option<i128>,
+);
+
+fn q15_batch(rows: &[Q15Row]) -> RecordBatch {
+	let nullable_rows: Vec<Q15NullableRow<'_>> = rows
+		.iter()
+		.map(|row| {
+			(
+				Some(row.s_suppkey),
+				Some(row.s_name.as_str()),
+				Some(row.s_address.as_str()),
+				Some(row.s_phone.as_str()),
+				Some(row.total_revenue_raw),
+			)
+		})
+		.collect();
+	q15_nullable_batch(&nullable_rows)
+}
+
+fn q15_nullable_batch(rows: &[Q15NullableRow<'_>]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("s_suppkey", DataType::Int64, true),
+		Field::new("s_name", DataType::Utf8, true),
+		Field::new("s_address", DataType::Utf8, true),
+		Field::new("s_phone", DataType::Utf8, true),
+		Field::new("total_revenue", DataType::Decimal128(32, 4), true),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				rows.iter().map(|row| row.0).collect::<Vec<Option<i64>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.1).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.2).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(StringArray::from(
+				rows.iter().map(|row| row.3).collect::<Vec<Option<&str>>>(),
+			)),
+			Arc::new(
+				Decimal128Array::from(rows.iter().map(|row| row.4).collect::<Vec<Option<i128>>>())
+					.with_precision_and_scale(32, 4)
+					.expect("q15 total_revenue decimal column"),
+			),
+		],
+	)
+	.expect("q15 batch")
+}
+
+#[test]
+fn strict_q15_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q15(0.01))
+		})
+		.expect("spawn q15 correctness thread")
+		.join()
+		.expect("q15 correctness thread panicked");
+	assert_eq!(attempt.query, "q15");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q15_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q15_oracle(0.01).expect("q15 oracle");
+	assert!(
+		!oracle.rows.is_empty(),
+		"q15 oracle selected no rows: {oracle:?}"
+	);
+	assert!(
+		oracle.selected_rows > 0,
+		"q15 oracle selected no rows: {oracle:?}"
+	);
+	assert!(
+		oracle.selected_rows < oracle.suppliers_in_window,
+		"q15 oracle must select a proper subset: {oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q15_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q15_schema(&[q15_batch(&[Q15Row {
+			s_suppkey: 1,
+			s_name: "Supplier#000000001".to_string(),
+			s_address: "1 Main Street".to_string(),
+			s_phone: "10-000-000-0001".to_string(),
+			total_revenue_raw: 50_000,
+		}])])
+		.is_ok()
+	);
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("s_suppkey", DataType::Int64, false),
+			Field::new("s_name", DataType::Utf8, false),
+			Field::new("s_address", DataType::Utf8, false),
+			Field::new("s_phone", DataType::Utf8, false),
+			Field::new("total_revenue", DataType::Decimal128(31, 4), false),
+		])),
+		vec![
+			Arc::new(Int64Array::from(vec![1_i64])),
+			Arc::new(StringArray::from(vec!["Supplier#000000001"])),
+			Arc::new(StringArray::from(vec!["1 Main Street"])),
+			Arc::new(StringArray::from(vec!["10-000-000-0001"])),
+			Arc::new(
+				Decimal128Array::from(vec![50_000_i128])
+					.with_precision_and_scale(31, 4)
+					.expect("drifted q15 revenue"),
+			),
+		],
+	)
+	.expect("drifted q15 batch");
+	assert!(
+		assert_strict_q15_schema(&[drifted]).is_err(),
+		"a non-measured total_revenue precision must trip the schema gate"
+	);
+}
+
+#[test]
+fn q15_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q15_oracle_from_rows(
+		[
+			(
+				1_i64,
+				"Supplier#000000001".to_string(),
+				"1 Main Street".to_string(),
+				"10-000-000-0001".to_string(),
+			),
+			(
+				2_i64,
+				"Supplier#000000002".to_string(),
+				"2 Main Street".to_string(),
+				"10-000-000-0002".to_string(),
+			),
+		],
+		[(1_i64, 9500_i32, 500_i128, 0_i128), (2_i64, 9500, 300, 0)],
+	)
+	.expect("q15 oracle");
+	assert_eq!(oracle.rows.len(), 1, "{oracle:?}");
+	assert!(
+		compare_strict_q15(&[q15_batch(&oracle.rows)], &oracle).is_ok(),
+		"exact row match"
+	);
+
+	let mut wrong_revenue = oracle.rows[0].clone();
+	wrong_revenue.total_revenue_raw += 1;
+	assert!(
+		compare_strict_q15(&[q15_batch(&[wrong_revenue])], &oracle).is_err(),
+		"an off-by-one total_revenue is a mismatch"
+	);
+
+	let mut wrong_name = oracle.rows[0].clone();
+	wrong_name.s_name = "Supplier#999999999".to_string();
+	assert!(
+		compare_strict_q15(&[q15_batch(&[wrong_name])], &oracle).is_err(),
+		"a wrong string attribute is a mismatch"
+	);
+}
+
+#[test]
+fn q15_missing_extra_or_duplicate_row_is_fail_at_compare() {
+	let oracle = q15_oracle_from_rows(
+		[
+			(
+				1_i64,
+				"Supplier#000000001".to_string(),
+				"1 Main Street".to_string(),
+				"10-000-000-0001".to_string(),
+			),
+			(
+				2_i64,
+				"Supplier#000000002".to_string(),
+				"2 Main Street".to_string(),
+				"10-000-000-0002".to_string(),
+			),
+			(
+				3_i64,
+				"Supplier#000000003".to_string(),
+				"3 Main Street".to_string(),
+				"10-000-000-0003".to_string(),
+			),
+		],
+		[
+			(1_i64, 9500_i32, 500_i128, 0_i128),
+			(2_i64, 9500_i32, 500_i128, 0_i128),
+			(3_i64, 9500_i32, 300_i128, 0_i128),
+		],
+	)
+	.expect("q15 tie oracle");
+	assert_eq!(oracle.rows.len(), 2, "{oracle:?}");
+	assert!(
+		compare_strict_q15(&[q15_batch(&oracle.rows)], &oracle).is_ok(),
+		"both tied max suppliers are emitted"
+	);
+	assert!(
+		compare_strict_q15(&[q15_batch(&oracle.rows[..1])], &oracle).is_err(),
+		"a dropped tied row is a mismatch"
+	);
+	assert!(
+		compare_strict_q15(
+			&[q15_batch(&[oracle.rows[1].clone(), oracle.rows[0].clone()])],
+			&oracle
+		)
+		.is_err(),
+		"q15's ORDER BY s_suppkey is part of the exact answer"
+	);
+	assert!(
+		compare_strict_q15(
+			&[q15_batch(&[oracle.rows[0].clone(), oracle.rows[0].clone()])],
+			&oracle
+		)
+		.is_err(),
+		"a duplicate emitted s_suppkey is rejected"
+	);
+}
+
+#[test]
+fn q15_null_cell_is_fail_at_compare() {
+	let oracle = q15_oracle_from_rows(
+		[
+			(
+				1_i64,
+				"Supplier#000000001".to_string(),
+				"1 Main Street".to_string(),
+				"10-000-000-0001".to_string(),
+			),
+			(
+				2_i64,
+				"Supplier#000000002".to_string(),
+				"2 Main Street".to_string(),
+				"10-000-000-0002".to_string(),
+			),
+		],
+		[
+			(1_i64, 9500_i32, 500_i128, 0_i128),
+			(2_i64, 9500_i32, 300_i128, 0_i128),
+		],
+	)
+	.expect("q15 oracle");
+	for (column, row) in [
+		(
+			0,
+			(
+				None,
+				Some("Supplier#000000001"),
+				Some("1 Main Street"),
+				Some("10-000-000-0001"),
+				Some(50_000_i128),
+			),
+		),
+		(
+			1,
+			(
+				Some(1_i64),
+				None,
+				Some("1 Main Street"),
+				Some("10-000-000-0001"),
+				Some(50_000_i128),
+			),
+		),
+		(
+			2,
+			(
+				Some(1_i64),
+				Some("Supplier#000000001"),
+				None,
+				Some("10-000-000-0001"),
+				Some(50_000_i128),
+			),
+		),
+		(
+			3,
+			(
+				Some(1_i64),
+				Some("Supplier#000000001"),
+				Some("1 Main Street"),
+				None,
+				Some(50_000_i128),
+			),
+		),
+		(
+			4,
+			(
+				Some(1_i64),
+				Some("Supplier#000000001"),
+				Some("1 Main Street"),
+				Some("10-000-000-0001"),
+				None,
+			),
+		),
+	] {
+		assert!(
+			compare_strict_q15(&[q15_nullable_batch(&[row])], &oracle).is_err(),
+			"NULL in q15 column {column} is fail@compare"
+		);
+	}
 }
 
 fn q04_batch(rows: &[(&str, i64)]) -> RecordBatch {

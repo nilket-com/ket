@@ -6994,6 +6994,288 @@ fn collect_join_summaries(plan: &ExecutionPlan, summaries: &mut Vec<String>) {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q15Row {
+	pub s_suppkey: i64,
+	pub s_name: String,
+	pub s_address: String,
+	pub s_phone: String,
+	pub total_revenue_raw: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct Q15Oracle {
+	pub rows: Vec<Q15Row>,
+	pub suppliers_in_window: usize,
+	pub selected_rows: usize,
+	pub max_total_revenue_raw: i128,
+}
+
+fn q15_shipdate_in_window(shipdate: i32) -> bool {
+	(9496..9587).contains(&shipdate)
+}
+
+/// Independent strict-q15 oracle: traverse the supplier and lineitem generators directly, filter the
+/// `1996-01-01` to `1996-04-01` shipdate window, compute per-supplier revenue at the executor's raw
+/// Decimal128 scale, then keep every supplier tied at the max.
+pub fn q15_oracle_from_rows(
+	suppliers: impl IntoIterator<Item = (i64, String, String, String)>,
+	lineitems: impl IntoIterator<Item = (i64, i32, i128, i128)>,
+) -> Result<Q15Oracle, String> {
+	let suppliers: HashMap<i64, (String, String, String)> = suppliers
+		.into_iter()
+		.map(|(suppkey, name, address, phone)| (suppkey, (name, address, phone)))
+		.collect();
+
+	let mut revenue_by_supplier: BTreeMap<i64, i128> = BTreeMap::new();
+	for (suppkey, shipdate, extprice_raw, discount_raw) in lineitems {
+		if !q15_shipdate_in_window(shipdate) {
+			continue;
+		}
+		let Some(_) = suppliers.get(&suppkey) else {
+			continue;
+		};
+		let revenue_raw = discounted_price_raw(extprice_raw, discount_raw);
+		let current = revenue_by_supplier.entry(suppkey).or_insert(0);
+		*current = current
+			.checked_add(revenue_raw)
+			.ok_or_else(|| "q15 supplier revenue overflow".to_string())?;
+	}
+
+	let suppliers_in_window = revenue_by_supplier.len();
+	let max_total_revenue_raw = revenue_by_supplier.values().copied().max().unwrap_or(0);
+	let mut rows = Vec::new();
+	for (suppkey, total_revenue_raw) in revenue_by_supplier {
+		if total_revenue_raw != max_total_revenue_raw {
+			continue;
+		}
+		let Some((name, address, phone)) = suppliers.get(&suppkey) else {
+			continue;
+		};
+		rows.push(Q15Row {
+			s_suppkey: suppkey,
+			s_name: name.clone(),
+			s_address: address.clone(),
+			s_phone: phone.clone(),
+			total_revenue_raw,
+		});
+	}
+	let selected_rows = rows.len();
+
+	Ok(Q15Oracle {
+		rows,
+		suppliers_in_window,
+		selected_rows,
+		max_total_revenue_raw,
+	})
+}
+
+pub fn strict_q15_oracle(scale_factor: f64) -> Result<Q15Oracle, String> {
+	q15_oracle_from_rows(
+		SupplierGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|supplier| {
+				(
+					supplier.s_suppkey,
+					supplier.s_name.to_string(),
+					supplier.s_address.to_string(),
+					supplier.s_phone.to_string(),
+				)
+			}),
+		LineItemGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|item| {
+				(
+					item.l_suppkey,
+					item.l_shipdate.to_unix_epoch(),
+					item.l_extendedprice.into_inner() as i128,
+					item.l_discount.into_inner() as i128,
+				)
+			}),
+	)
+}
+
+fn strict_q15_expected_schema() -> [(&'static str, DataType); 5] {
+	[
+		("s_suppkey", DataType::Int64),
+		("s_name", DataType::Utf8),
+		("s_address", DataType::Utf8),
+		("s_phone", DataType::Utf8),
+		("total_revenue", DataType::Decimal128(32, 4)),
+	]
+}
+
+pub fn assert_strict_q15_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q15_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q15 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q15(batches: &[RecordBatch], oracle: &Q15Oracle) -> Result<(), String> {
+	assert_strict_q15_schema(batches)?;
+	if oracle.rows.is_empty()
+		|| oracle.selected_rows == 0
+		|| oracle.suppliers_in_window == 0
+		|| oracle.selected_rows >= oracle.suppliers_in_window
+	{
+		return Err(format!(
+			"oracle non-vacuous guard failed: rows={} suppliers_in_window={} selected_rows={} max_total_revenue_raw={}",
+			oracle.rows.len(),
+			oracle.suppliers_in_window,
+			oracle.selected_rows,
+			oracle.max_total_revenue_raw
+		));
+	}
+
+	let mut emitted_order = Vec::new();
+	let mut emitted: BTreeMap<i64, Q15Row> = BTreeMap::new();
+	for batch in batches {
+		if batch.num_columns() != 5 {
+			return Err(format!("expected 5 columns, got {}", batch.num_columns()));
+		}
+		let suppkeys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("column 0 (s_suppkey) not Int64")?;
+		let names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 1 (s_name) not Utf8")?;
+		let addresses = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 2 (s_address) not Utf8")?;
+		let phones = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.ok_or("column 3 (s_phone) not Utf8")?;
+		let revenues = batch
+			.column(4)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 4 (total_revenue) not Decimal128")?;
+		for row in 0..batch.num_rows() {
+			let row_index = emitted_order.len();
+			if suppkeys.is_null(row)
+				|| names.is_null(row)
+				|| addresses.is_null(row)
+				|| phones.is_null(row)
+				|| revenues.is_null(row)
+			{
+				return Err(format!("unexpected NULL in emitted row {row_index}"));
+			}
+			let output = Q15Row {
+				s_suppkey: suppkeys.value(row),
+				s_name: names.value(row).to_string(),
+				s_address: addresses.value(row).to_string(),
+				s_phone: phones.value(row).to_string(),
+				total_revenue_raw: revenues.value(row),
+			};
+			if emitted.insert(output.s_suppkey, output.clone()).is_some() {
+				return Err(format!("duplicate emitted s_suppkey {}", output.s_suppkey));
+			}
+			emitted_order.push(output.s_suppkey);
+		}
+	}
+
+	for pair in emitted_order.windows(2) {
+		if pair[0] > pair[1] {
+			return Err(format!(
+				"ORDER BY s_suppkey violated: {} emitted before {}",
+				pair[0], pair[1]
+			));
+		}
+	}
+
+	if emitted.len() != oracle.rows.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} rows, output has {} rows",
+			oracle.rows.len(),
+			emitted.len()
+		));
+	}
+	for expected in &oracle.rows {
+		let Some(actual) = emitted.get(&expected.s_suppkey) else {
+			return Err(format!(
+				"oracle s_suppkey {} missing from output",
+				expected.s_suppkey
+			));
+		};
+		if actual != expected {
+			return Err(format!(
+				"s_suppkey {} mismatch: expected {:?}, got {:?}",
+				expected.s_suppkey, expected, actual
+			));
+		}
+	}
+
+	Ok(())
+}
+
+pub async fn check_strict_q15(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q15_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q15".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q15_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q15_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q15_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q15(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// ADR 310 - dev q16: parts/supplier relationship reachability over part + partsupp + supplier.
 pub async fn run_dev_q16(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
