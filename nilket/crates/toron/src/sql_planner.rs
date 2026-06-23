@@ -1691,6 +1691,55 @@ fn parse_insert_number(text: &str, negate: bool) -> Result<InsertLiteral, Fronte
 		.map_err(|_| unsupported(format!("INSERT VALUES literal not representable: {text}")))
 }
 
+fn decimal_point_number_literal(text: &str) -> Result<Option<ScalarValue>, FrontendError> {
+	if !text.contains('.') || text.contains('e') || text.contains('E') {
+		return Ok(None);
+	}
+	let (negative, unsigned) = match text.strip_prefix('-') {
+		Some(unsigned) => (true, unsigned),
+		None => match text.strip_prefix('+') {
+			Some(unsigned) => (false, unsigned),
+			None => (false, text),
+		},
+	};
+	let Some((integer, fractional)) = unsigned.split_once('.') else {
+		return Ok(None);
+	};
+	if integer.is_empty() && fractional.is_empty() {
+		return Err(unsupported(format!("unsupported number literal: {text}")));
+	}
+	if !integer.chars().all(|ch| ch.is_ascii_digit())
+		|| !fractional.chars().all(|ch| ch.is_ascii_digit())
+	{
+		return Err(unsupported(format!("unsupported number literal: {text}")));
+	}
+	let precision = integer.len() + fractional.len();
+	if precision > 38 {
+		return Err(unsupported(format!(
+			"decimal-point literal exceeds Decimal128 precision 38: {text}"
+		)));
+	}
+	let scale = i8::try_from(fractional.len())
+		.expect("decimal-point literal scale fits i8 because precision <= 38");
+	let mut raw = 0_i128;
+	for digit in integer.bytes().chain(fractional.bytes()) {
+		raw = raw
+			.checked_mul(10)
+			.and_then(|raw| raw.checked_add(i128::from(digit - b'0')))
+			.ok_or_else(|| unsupported(format!("decimal-point literal overflows i128: {text}")))?;
+	}
+	if negative {
+		raw = raw
+			.checked_neg()
+			.ok_or_else(|| unsupported(format!("decimal-point literal overflows i128: {text}")))?;
+	}
+	Ok(Some(ScalarValue::Decimal128 {
+		value: Some(raw),
+		precision: precision as u8,
+		scale,
+	}))
+}
+
 struct LoweredCreateTableColumn {
 	column: CreateTableColumn,
 	primary_key: bool,
@@ -6488,6 +6537,8 @@ impl SqlPlanner {
 				Value::Number(n, _) => {
 					if let Ok(i) = n.parse::<i32>() {
 						Ok(Expr::Literal(ScalarValue::Int32(Some(i))))
+					} else if let Some(decimal) = decimal_point_number_literal(n)? {
+						Ok(Expr::Literal(decimal))
 					} else if let Ok(f) = n.parse::<f64>() {
 						Ok(Expr::Literal(ScalarValue::Float64(Some(f))))
 					} else {
@@ -8379,6 +8430,22 @@ fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
 			left.map(f64::to_bits) == right.map(f64::to_bits)
 		}
 		(ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left == right,
+		(
+			ScalarValue::Decimal128 {
+				value: left_value,
+				precision: left_precision,
+				scale: left_scale,
+			},
+			ScalarValue::Decimal128 {
+				value: right_value,
+				precision: right_precision,
+				scale: right_scale,
+			},
+		) => {
+			left_precision == right_precision
+				&& left_scale == right_scale
+				&& left_value == right_value
+		}
 		_ => false,
 	}
 }
@@ -8858,6 +8925,18 @@ fn negate_scalar_literal(value: ScalarValue) -> Result<ScalarValue, FrontendErro
 		ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(-v))),
 		ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(-v))),
 		ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(-v))),
+		ScalarValue::Decimal128 {
+			value: Some(v),
+			precision,
+			scale,
+		} => Ok(ScalarValue::Decimal128 {
+			value: Some(
+				v.checked_neg()
+					.ok_or_else(|| unsupported("LAG/LEAD numeric default overflows"))?,
+			),
+			precision,
+			scale,
+		}),
 		_ => Err(unsupported(
 			"LAG/LEAD numeric default expected after unary minus",
 		)),
@@ -10776,6 +10855,56 @@ mod tests {
 
 		let message = err.to_string();
 		assert!(message.contains("explicit offset"), "{message}");
+	}
+
+	#[test]
+	fn decimal_point_literals_preserve_text_precision_and_scale() {
+		let plan = SqlPlanner::new()
+			.plan("SELECT 0.0001, 0.05, 100.00, 42 FROM sales")
+			.expect("decimal-point literals plan");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("expected project");
+		};
+		assert!(matches!(
+			&exprs[0],
+			Expr::Literal(ScalarValue::Decimal128 {
+				value: Some(1),
+				precision: 5,
+				scale: 4
+			})
+		));
+		assert!(matches!(
+			&exprs[1],
+			Expr::Literal(ScalarValue::Decimal128 {
+				value: Some(5),
+				precision: 3,
+				scale: 2
+			})
+		));
+		assert!(matches!(
+			&exprs[2],
+			Expr::Literal(ScalarValue::Decimal128 {
+				value: Some(10_000),
+				precision: 5,
+				scale: 2
+			})
+		));
+		assert!(matches!(
+			&exprs[3],
+			Expr::Literal(ScalarValue::Int32(Some(42)))
+		));
+	}
+
+	#[test]
+	fn over_precision_decimal_point_literal_rejects_at_lowering() {
+		let err = SqlPlanner::new()
+			.plan("SELECT 123456789012345678901234567890123456789.0 FROM sales")
+			.expect_err("over-precision decimal-point literal should reject");
+		let message = err.to_string();
+		assert!(
+			message.contains("Decimal128 precision 38"),
+			"expected precision reject, got {message}"
+		);
 	}
 
 	#[test]

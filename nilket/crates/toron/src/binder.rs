@@ -5044,6 +5044,12 @@ fn bind_explicit_cast(
 		return resolve_untyped_null(builder, target);
 	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	coerce_decimal_literal_to_legacy_explicit_numeric_source(
+		builder,
+		inner,
+		target,
+		ctx.session_timezone,
+	)?;
 	let source = builder
 		.node_type(inner)
 		.cloned()
@@ -5069,6 +5075,12 @@ fn bind_try_cast(
 		return resolve_untyped_null(builder, target);
 	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	coerce_decimal_literal_to_legacy_explicit_numeric_source(
+		builder,
+		inner,
+		target,
+		ctx.session_timezone,
+	)?;
 	let source = builder
 		.node_type(inner)
 		.cloned()
@@ -5135,6 +5147,23 @@ fn is_supported_explicit_numeric_cast(source: &DataType, target: &DataType) -> b
 			| (DataType::Float64, DataType::Float32)
 			| (DataType::Float64, DataType::Float64)
 	)
+}
+
+fn coerce_decimal_literal_to_legacy_explicit_numeric_source(
+	builder: &mut BoundExprProgramBuilder,
+	id: BoundExprId,
+	target: &DataType,
+	session_timezone: Tz,
+) -> Result<(), BindingError> {
+	if !is_supported_explicit_numeric_cast(&DataType::Float64, target) {
+		return Ok(());
+	}
+	let Some(value @ ScalarValue::Decimal128 { .. }) = builder.literal(id).cloned() else {
+		return Ok(());
+	};
+	let value = coerce_literal_value(value, &DataType::Float64, session_timezone)?;
+	let _ = builder.rewrite_literal(id, value);
+	Ok(())
 }
 
 fn is_insert_select_coercible(source: &DataType, target: &DataType) -> bool {
@@ -5663,6 +5692,12 @@ fn coerce_literal_value(
 		(ScalarValue::Float64(value), DataType::Decimal128(precision, scale)) => {
 			decimal_literal_from_f64(value, *precision, *scale)?
 		}
+		(ScalarValue::Decimal128 { value, scale, .. }, DataType::Float32) => {
+			ScalarValue::Float32(decimal_literal_to_f32(value, scale)?)
+		}
+		(ScalarValue::Decimal128 { value, scale, .. }, DataType::Float64) => {
+			ScalarValue::Float64(decimal_literal_to_f64(value, scale)?)
+		}
 		(
 			ScalarValue::Decimal128 {
 				value,
@@ -5753,6 +5788,30 @@ fn decimal_literal_from_f64(
 		})
 		.transpose()?;
 	decimal_literal_checked(value, precision, scale)
+}
+
+fn decimal_literal_to_f64(value: Option<i128>, scale: i8) -> Result<Option<f64>, BindingError> {
+	let Some(value) = value else {
+		return Ok(None);
+	};
+	let scaled = value as f64 / 10_f64.powi(i32::from(scale));
+	if !scaled.is_finite() {
+		return Err(BindingError::TypeMismatch {
+			message: format!("literal does not fit Float64: Decimal128(_, {scale})"),
+		});
+	}
+	Ok(Some(scaled))
+}
+
+fn decimal_literal_to_f32(value: Option<i128>, scale: i8) -> Result<Option<f32>, BindingError> {
+	let value = decimal_literal_to_f64(value, scale)?;
+	let value = value.map(|value| value as f32);
+	if value.is_some_and(|value| !value.is_finite()) {
+		return Err(BindingError::TypeMismatch {
+			message: format!("literal does not fit Float32: Decimal128(_, {scale})"),
+		});
+	}
+	Ok(value)
 }
 
 /// ADR 263: rescale a `Decimal128` literal from `from_scale` to `(precision, scale)`.

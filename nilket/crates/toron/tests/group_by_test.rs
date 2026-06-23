@@ -3148,8 +3148,9 @@ async fn grouped_aggregate_having_binds_against_aggregate_output() {
 #[tokio::test]
 async fn avg_having_binds_with_float64_literal_coercion() {
 	let (catalog, _) = fixture();
-	let logical =
-		plan_sql("SELECT status, AVG(amount) FROM sales GROUP BY status HAVING AVG(amount) > 10");
+	let logical = plan_sql(
+		"SELECT status, AVG(amount) FROM sales GROUP BY status HAVING AVG(amount) > 10.00",
+	);
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
 		.expect("bind AVG HAVING");
@@ -3200,6 +3201,33 @@ async fn float32_min_having_binds_with_literal_coercion() {
 			ColumnOrdinal(0),
 			|value| value == &expected,
 		);
+	}
+}
+
+#[tokio::test]
+async fn float_arithmetic_decimal_point_literals_rewrite_to_float_literals() {
+	let multiplied = run_logical(&plan_sql("SELECT price * 0.0001 FROM sales")).await;
+	let rows = scalar_float64_column_rows(&multiplied, 0);
+	let expected = [
+		Some(0.00105),
+		Some(0.00205),
+		None,
+		Some(0.00305),
+		None,
+		Some(0.00075),
+	];
+	assert_eq!(rows.len(), expected.len());
+	for (actual, expected) in rows.iter().zip(expected) {
+		match (actual, expected) {
+			(Some(actual), Some(expected)) => {
+				assert!(
+					(actual - expected).abs() < 1e-12,
+					"expected {expected}, got {actual}"
+				);
+			}
+			(None, None) => {}
+			other => panic!("unexpected Float64 multiplication row: {other:?}"),
+		}
 	}
 }
 

@@ -158,10 +158,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// `DeferredScalarSubquery` bind arm + the `bind_deferred_scalar_subquery` resolve (the correlated-scalar
 	// frontend→binder handoff, reusing the same scratch-trace + ownership-classification machinery). ADR 308
 	// added the logical ON-residual normalization fallback at bind entry. ADR 323 added the semi/anti
-	// match-filter binding path for non-equi correlated EXISTS residuals.
+	// match-filter binding path for non-equi correlated EXISTS residuals. ADR 325 added exact decimal-point
+	// literal preservation plus the literal-only Decimal→Float compatibility rewrites for pre-existing float
+	// expression contexts.
 	assert!(
-		lines <= 5_950,
-		"binder root has {lines} lines; expected <= 5,950 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_020,
+		"binder root has {lines} lines; expected <= 6,020 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

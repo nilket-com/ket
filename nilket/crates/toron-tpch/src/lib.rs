@@ -4900,7 +4900,7 @@ pub struct Q14Oracle {
 }
 
 /// Independent strict-q14 oracle at the default correctness scale. `disc_price` is raw scale 4; the
-/// `100.00` literal is aligned to that same scale before Decimal division, matching the strict query.
+/// exact `100.00` literal contributes raw 10000 at scale 2 before Decimal division.
 pub fn strict_q14_oracle(scale_factor: f64) -> Result<Q14Oracle, String> {
 	let promo_by_part: HashMap<i64, bool> = PartGenerator::new(scale_factor, 1, 1)
 		.iter()
@@ -4941,13 +4941,13 @@ pub fn strict_q14_oracle(scale_factor: f64) -> Result<Q14Oracle, String> {
 		DecimalRaw {
 			value: None,
 			precision: 38,
-			scale: 12,
+			scale: 10,
 		}
 	} else {
 		let numerator = sum_promo_raw
-			.checked_mul(1_000_000)
+			.checked_mul(10_000)
 			.ok_or_else(|| "q14 numerator multiplication overflow".to_string())?;
-		decimal_division_raw(numerator, 38, 8, sum_all_raw, 38, 4)?
+		decimal_division_raw(numerator, 38, 6, sum_all_raw, 38, 4)?
 	};
 
 	Ok(Q14Oracle {
@@ -4958,7 +4958,7 @@ pub fn strict_q14_oracle(scale_factor: f64) -> Result<Q14Oracle, String> {
 }
 
 fn strict_q14_expected_schema() -> [(&'static str, DataType); 1] {
-	[("promo_revenue", DataType::Decimal128(38, 12))]
+	[("promo_revenue", DataType::Decimal128(38, 10))]
 }
 
 pub fn assert_strict_q14_schema(batches: &[RecordBatch]) -> Result<(), String> {
@@ -5003,7 +5003,7 @@ pub fn compare_strict_q14(batches: &[RecordBatch], oracle: &Q14Oracle) -> Result
 	let Some(expected_value) = oracle.promo_revenue.value else {
 		return Err("oracle promo_revenue is NULL".to_string());
 	};
-	if oracle.promo_revenue.precision != 38 || oracle.promo_revenue.scale != 12 {
+	if oracle.promo_revenue.precision != 38 || oracle.promo_revenue.scale != 10 {
 		return Err(format!(
 			"oracle promo_revenue type drift: Decimal128({}, {})",
 			oracle.promo_revenue.precision, oracle.promo_revenue.scale
@@ -5080,7 +5080,7 @@ pub struct Q17Oracle {
 }
 
 /// Independent strict-q17 oracle at the non-empty scale. Quantity and money raws are scale-2, matching the
-/// strict fixture; `0.2 * AVG(l_quantity)` compares at scale 8.
+/// strict fixture; exact `0.2` carries scale 1 and `0.2 * AVG(l_quantity)` compares at scale 7.
 pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 	let eligible_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
 		.iter()
@@ -5102,7 +5102,7 @@ pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 	let mut threshold_by_part: HashMap<i64, i128> = HashMap::new();
 	for (&partkey, &(quantity_sum, count)) in &quantity_by_part {
 		let avg_raw = avg_decimal_raw(quantity_sum, count, 2, 6, 19)?;
-		let threshold_raw = 20_i128
+		let threshold_raw = 2_i128
 			.checked_mul(avg_raw)
 			.ok_or_else(|| "q17 threshold multiplication overflow".to_string())?;
 		threshold_by_part.insert(partkey, threshold_raw);
@@ -5115,7 +5115,7 @@ pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 			continue;
 		};
 		let quantity_at_threshold_scale = (item.l_quantity as i128 * 100)
-			.checked_mul(1_000_000)
+			.checked_mul(100_000)
 			.ok_or_else(|| "q17 quantity rescale overflow".to_string())?;
 		if quantity_at_threshold_scale < threshold_raw {
 			extendedprice_sum += item.l_extendedprice.into_inner() as i128;
@@ -5126,11 +5126,11 @@ pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 	let avg_yearly = if contributing_rows == 0 {
 		DecimalRaw {
 			value: None,
-			precision: 21,
+			precision: 20,
 			scale: 6,
 		}
 	} else {
-		decimal_division_raw(extendedprice_sum, 15, 2, 700, 15, 2)?
+		decimal_division_raw(extendedprice_sum, 15, 2, 70, 2, 1)?
 	};
 	Ok(Q17Oracle {
 		avg_yearly,
@@ -5140,7 +5140,7 @@ pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 }
 
 fn strict_q17_expected_schema() -> [(&'static str, DataType); 1] {
-	[("avg_yearly", DataType::Decimal128(21, 6))]
+	[("avg_yearly", DataType::Decimal128(20, 6))]
 }
 
 pub fn assert_strict_q17_schema(batches: &[RecordBatch]) -> Result<(), String> {
@@ -5185,7 +5185,7 @@ pub fn compare_strict_q17(batches: &[RecordBatch], oracle: &Q17Oracle) -> Result
 	let Some(expected_value) = oracle.avg_yearly.value else {
 		return Err("oracle avg_yearly is NULL".to_string());
 	};
-	if oracle.avg_yearly.precision != 21 || oracle.avg_yearly.scale != 6 {
+	if oracle.avg_yearly.precision != 20 || oracle.avg_yearly.scale != 6 {
 		return Err(format!(
 			"oracle avg_yearly type drift: Decimal128({}, {})",
 			oracle.avg_yearly.precision, oracle.avg_yearly.scale
@@ -6826,7 +6826,8 @@ pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 321 - strict q11: Decimal x Int multiply aligns, so strict reaches execute (reach, not correctness).
+/// ADR 321/325 - strict q11: Decimal x Int multiply aligns, and decimal-point literals preserve
+/// the exact `0.0001` threshold.
 pub async fn run_strict_q11(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
 		"q11",

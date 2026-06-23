@@ -802,6 +802,12 @@ pub(super) fn bind_sql_logical_cast(
 		return Ok(output);
 	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	coerce_decimal_literal_to_legacy_explicit_numeric_source(
+		builder,
+		inner,
+		&spec.physical,
+		ctx.session_timezone,
+	)?;
 	let source = builder
 		.node_type(inner)
 		.cloned()
@@ -1241,9 +1247,9 @@ fn integer_as_decimal_type(data_type: &DataType) -> Option<DataType> {
 	}
 }
 
-/// ADR 266: coerce an Int/Float literal operand to the other operand's `Decimal128(p,s)` (rewrite in
-/// place) so decimal `+`/`-` with a numeric literal binds. No-op unless one side is `Decimal128` and the
-/// other an Int/Float literal; reuses the checked `coerce_literal_value` path (no unchecked scaling).
+/// ADR 266/325: coerce literal arithmetic operands without opening general casts. Int/Float literals
+/// beside Decimal128 rewrite toward Decimal; Decimal128 literals beside Float rewrite toward Float so dev
+/// Float queries survive exact decimal-point literal lowering.
 fn coerce_decimal_arithmetic_literal(
 	builder: &mut BoundExprProgramBuilder,
 	ctx: &ExprBindContext<'_>,
@@ -1270,6 +1276,16 @@ fn coerce_decimal_arithmetic_literal(
 	} else if matches!(left_type, DataType::Decimal128(_, _))
 		&& let Some(value) = builder.literal(right).cloned()
 		&& is_numeric_literal(&value)
+	{
+		let value = coerce_literal_value(value, left_type, ctx.session_timezone)?;
+		let _ = builder.rewrite_literal(right, value);
+	} else if matches!(right_type, DataType::Float32 | DataType::Float64)
+		&& let Some(value @ ScalarValue::Decimal128 { .. }) = builder.literal(left).cloned()
+	{
+		let value = coerce_literal_value(value, right_type, ctx.session_timezone)?;
+		let _ = builder.rewrite_literal(left, value);
+	} else if matches!(left_type, DataType::Float32 | DataType::Float64)
+		&& let Some(value @ ScalarValue::Decimal128 { .. }) = builder.literal(right).cloned()
 	{
 		let value = coerce_literal_value(value, left_type, ctx.session_timezone)?;
 		let _ = builder.rewrite_literal(right, value);
@@ -1510,29 +1526,54 @@ fn append_comparison_cast(
 	Ok(output)
 }
 
-/// ADR 271: when exactly one Decimal128 branch type is present among CASE result branches, coerce each
-/// numeric-literal branch (e.g. `ELSE 0`) to it in place (the `coerce_literal_value` path). Literal-scoped:
-/// non-literal branches are untouched, and multiple *differing* Decimal branch types are left for
-/// `case_common_type` to reject — this cut adds no rescale Cast.
+/// ADR 271/325: keep CASE coercion literal-scoped. A real Decimal branch (for example a
+/// Decimal128 column) pulls numeric literals to Decimal. If the only Decimal branches are
+/// decimal-point literals beside primitive numeric branches, rewrite those literals to Float64 so
+/// the old primitive numeric widening behavior survives exact literal lowering.
 pub(super) fn coerce_case_decimal_literals(
 	builder: &mut BoundExprProgramBuilder,
 	ctx: &ExprBindContext<'_>,
 	result_ids: &[BoundExprId],
 ) -> Result<(), BindingError> {
 	let mut target: Option<DataType> = None;
+	let mut decimal_branches_are_literals = true;
+	let mut decimal_branch_types_differ = false;
+	let mut has_primitive_numeric_branch = false;
 	for id in result_ids {
-		if let Some(node_type @ DataType::Decimal128(_, _)) = builder.node_type(*id) {
-			let node_type = node_type.clone();
-			match &target {
-				None => target = Some(node_type),
-				Some(existing) if *existing == node_type => {}
-				Some(_) => return Ok(()),
+		match builder.node_type(*id) {
+			Some(node_type @ DataType::Decimal128(_, _)) => {
+				if builder.literal(*id).is_none() {
+					decimal_branches_are_literals = false;
+				}
+				let node_type = node_type.clone();
+				match &target {
+					None => target = Some(node_type),
+					Some(existing) if *existing == node_type => {}
+					Some(_) => decimal_branch_types_differ = true,
+				}
 			}
+			Some(DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64) => {
+				has_primitive_numeric_branch = true;
+			}
+			_ => {}
 		}
 	}
 	let Some(target) = target else {
 		return Ok(());
 	};
+	if decimal_branches_are_literals && has_primitive_numeric_branch {
+		for id in result_ids {
+			let Some(value @ ScalarValue::Decimal128 { .. }) = builder.literal(*id).cloned() else {
+				continue;
+			};
+			let coerced = coerce_literal_value(value, &DataType::Float64, ctx.session_timezone)?;
+			let _ = builder.rewrite_literal(*id, coerced);
+		}
+		return Ok(());
+	}
+	if decimal_branch_types_differ {
+		return Ok(());
+	}
 	for id in result_ids {
 		let Some(value) = builder.literal(*id).cloned() else {
 			continue;

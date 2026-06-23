@@ -2119,7 +2119,7 @@ fn q11_nullable_batch(rows: &[(Option<i64>, Option<i128>)]) -> RecordBatch {
 }
 
 #[test]
-fn strict_q11_expected_red_documents_decimal_literal_scale() {
+fn strict_q11_matches_independent_oracle() {
 	let attempt = std::thread::Builder::new()
 		.stack_size(64 * 1024 * 1024)
 		.spawn(|| {
@@ -2134,13 +2134,8 @@ fn strict_q11_expected_red_documents_decimal_literal_scale() {
 		.expect("q11 correctness thread panicked");
 	assert_eq!(attempt.query, "q11");
 	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
-	assert_eq!(attempt.status, Status::Fail, "{}", attempt.human());
-	assert_eq!(
-		attempt.reason.as_deref(),
-		Some(Q11_DECIMAL_LITERAL_SCALE_REASON),
-		"{}",
-		attempt.human()
-	);
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+	assert_eq!(attempt.reason.as_deref(), None, "{}", attempt.human());
 }
 
 #[test]
@@ -2198,7 +2193,7 @@ fn q11_exact_threshold_is_integer_comparison() {
 }
 
 #[test]
-fn q11_decimal_literal_scale_extra_rows_are_expected_red() {
+fn q11_decimal_literal_scale_extra_rows_are_classified() {
 	let oracle = q11_oracle_from_rows(
 		[(1_i64, 10_i64, 1_i32, 20_000_i128), (2, 10, 1, 1)],
 		[(10_i64, 1_i64)],
@@ -2680,7 +2675,7 @@ fn q14_oracle(value: Option<i128>) -> Q14Oracle {
 		promo_revenue: DecimalRaw {
 			value,
 			precision: 38,
-			scale: 12,
+			scale: 10,
 		},
 		denominator_rows: 2,
 		promo_rows: 1,
@@ -2724,14 +2719,14 @@ fn strict_q14_oracle_is_non_vacuous_at_default_scale() {
 		"a non-empty q14 oracle must produce a non-NULL promo_revenue"
 	);
 	assert_eq!(oracle.promo_revenue.precision, 38);
-	assert_eq!(oracle.promo_revenue.scale, 12);
+	assert_eq!(oracle.promo_revenue.scale, 10);
 }
 
 #[test]
 fn strict_q14_output_schema_is_asserted() {
-	assert!(assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 12)]).is_ok());
+	assert!(assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 10)]).is_ok());
 	assert!(
-		assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 10)]).is_err(),
+		assert_strict_q14_schema(&[q14_batch(&[Some(100)], 38, 12)]).is_err(),
 		"a non-measured scale must trip the schema gate"
 	);
 }
@@ -2741,7 +2736,7 @@ fn q14_promo_branch_is_required() {
 	let mut oracle = q14_oracle(Some(123));
 	oracle.promo_rows = 0;
 	assert!(
-		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &oracle).is_err(),
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 10)], &oracle).is_err(),
 		"a denominator-only q14 oracle is a hollow CASE-true proof"
 	);
 }
@@ -2749,7 +2744,7 @@ fn q14_promo_branch_is_required() {
 #[test]
 fn q14_ratio_uses_half_away_division() {
 	assert_eq!(
-		decimal_division_raw(1, 38, 8, 200_000_000, 38, 4)
+		decimal_division_raw(1, 38, 6, 200_000_000, 38, 4)
 			.expect("q14-shaped division")
 			.value,
 		Some(1),
@@ -2759,10 +2754,10 @@ fn q14_ratio_uses_half_away_division() {
 
 #[test]
 fn q14_non_promo_rows_contribute_to_denominator() {
-	let correct = decimal_division_raw(10 * 1_000_000, 38, 8, 30, 38, 4)
+	let correct = decimal_division_raw(10 * 10_000, 38, 6, 30, 38, 4)
 		.expect("ratio with promo + non-promo denominator")
 		.value;
-	let promo_only_denominator = decimal_division_raw(10 * 1_000_000, 38, 8, 10, 38, 4)
+	let promo_only_denominator = decimal_division_raw(10 * 10_000, 38, 6, 10, 38, 4)
 		.expect("ratio with wrong promo-only denominator")
 		.value;
 	assert_ne!(
@@ -2771,7 +2766,7 @@ fn q14_non_promo_rows_contribute_to_denominator() {
 	);
 	let oracle = q14_oracle(correct);
 	assert!(
-		compare_strict_q14(&[q14_batch(&[promo_only_denominator], 38, 12)], &oracle).is_err(),
+		compare_strict_q14(&[q14_batch(&[promo_only_denominator], 38, 10)], &oracle).is_err(),
 		"the comparator catches the classic CASE denominator bug"
 	);
 }
@@ -2780,17 +2775,17 @@ fn q14_non_promo_rows_contribute_to_denominator() {
 fn q14_correctness_mismatch_is_fail_at_compare() {
 	let oracle = q14_oracle(Some(123));
 	assert!(
-		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &oracle).is_ok(),
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 10)], &oracle).is_ok(),
 		"exact raw match"
 	);
 	assert!(
-		compare_strict_q14(&[q14_batch(&[Some(124)], 38, 12)], &oracle).is_err(),
+		compare_strict_q14(&[q14_batch(&[Some(124)], 38, 10)], &oracle).is_err(),
 		"an off-by-one promo_revenue is a mismatch"
 	);
 	let mut drifted_oracle = q14_oracle(Some(123));
-	drifted_oracle.promo_revenue.scale = 10;
+	drifted_oracle.promo_revenue.scale = 12;
 	assert!(
-		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &drifted_oracle).is_err(),
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 10)], &drifted_oracle).is_err(),
 		"the oracle-side Decimal type is part of the exact comparison"
 	);
 }
@@ -2798,23 +2793,23 @@ fn q14_correctness_mismatch_is_fail_at_compare() {
 #[test]
 fn q14_null_or_empty_result_is_fail_at_compare() {
 	assert!(
-		compare_strict_q14(&[q14_batch(&[None], 38, 12)], &q14_oracle(Some(123))).is_err(),
+		compare_strict_q14(&[q14_batch(&[None], 38, 10)], &q14_oracle(Some(123))).is_err(),
 		"a NULL output is fail@compare"
 	);
 	assert!(
-		compare_strict_q14(&[q14_batch(&[], 38, 12)], &q14_oracle(Some(123))).is_err(),
+		compare_strict_q14(&[q14_batch(&[], 38, 10)], &q14_oracle(Some(123))).is_err(),
 		"zero rows is fail@compare"
 	);
 	assert!(
 		compare_strict_q14(
-			&[q14_batch(&[Some(123), Some(123)], 38, 12)],
+			&[q14_batch(&[Some(123), Some(123)], 38, 10)],
 			&q14_oracle(Some(123))
 		)
 		.is_err(),
 		"q14 must emit exactly one row"
 	);
 	assert!(
-		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 12)], &q14_oracle(None)).is_err(),
+		compare_strict_q14(&[q14_batch(&[Some(123)], 38, 10)], &q14_oracle(None)).is_err(),
 		"a NULL oracle is rejected by the anti-empty guard"
 	);
 }
@@ -2840,7 +2835,7 @@ fn q17_oracle(value: Option<i128>) -> Q17Oracle {
 	Q17Oracle {
 		avg_yearly: DecimalRaw {
 			value,
-			precision: 21,
+			precision: 20,
 			scale: 6,
 		},
 		eligible_parts: 1,
@@ -2885,7 +2880,7 @@ fn strict_q17_oracle_is_non_vacuous_at_correctness_scale() {
 		oracle.avg_yearly.value.is_some(),
 		"a non-empty q17 oracle must produce a non-NULL avg_yearly"
 	);
-	assert_eq!(oracle.avg_yearly.precision, 21);
+	assert_eq!(oracle.avg_yearly.precision, 20);
 	assert_eq!(oracle.avg_yearly.scale, 6);
 }
 
@@ -2916,9 +2911,9 @@ fn q17_decimal_division_rounds_half_away_from_zero() {
 
 #[test]
 fn strict_q17_output_schema_is_asserted() {
-	assert!(assert_strict_q17_schema(&[q17_batch(&[Some(100)], 21, 6)]).is_ok());
+	assert!(assert_strict_q17_schema(&[q17_batch(&[Some(100)], 20, 6)]).is_ok());
 	assert!(
-		assert_strict_q17_schema(&[q17_batch(&[Some(100)], 20, 6)]).is_err(),
+		assert_strict_q17_schema(&[q17_batch(&[Some(100)], 21, 6)]).is_err(),
 		"a non-measured precision must trip the schema gate"
 	);
 }
@@ -2927,17 +2922,17 @@ fn strict_q17_output_schema_is_asserted() {
 fn q17_correctness_mismatch_is_fail_at_compare() {
 	let oracle = q17_oracle(Some(123));
 	assert!(
-		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &oracle).is_ok(),
+		compare_strict_q17(&[q17_batch(&[Some(123)], 20, 6)], &oracle).is_ok(),
 		"exact raw match"
 	);
 	assert!(
-		compare_strict_q17(&[q17_batch(&[Some(124)], 21, 6)], &oracle).is_err(),
+		compare_strict_q17(&[q17_batch(&[Some(124)], 20, 6)], &oracle).is_err(),
 		"an off-by-one avg_yearly is a mismatch"
 	);
 	let mut drifted_oracle = q17_oracle(Some(123));
-	drifted_oracle.avg_yearly.precision = 20;
+	drifted_oracle.avg_yearly.precision = 21;
 	assert!(
-		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &drifted_oracle).is_err(),
+		compare_strict_q17(&[q17_batch(&[Some(123)], 20, 6)], &drifted_oracle).is_err(),
 		"the oracle-side Decimal type is part of the exact comparison"
 	);
 }
@@ -2945,23 +2940,23 @@ fn q17_correctness_mismatch_is_fail_at_compare() {
 #[test]
 fn q17_null_or_empty_result_is_fail_at_compare() {
 	assert!(
-		compare_strict_q17(&[q17_batch(&[None], 21, 6)], &q17_oracle(Some(123))).is_err(),
+		compare_strict_q17(&[q17_batch(&[None], 20, 6)], &q17_oracle(Some(123))).is_err(),
 		"a NULL output is fail@compare at the non-empty correctness scale"
 	);
 	assert!(
-		compare_strict_q17(&[q17_batch(&[], 21, 6)], &q17_oracle(Some(123))).is_err(),
+		compare_strict_q17(&[q17_batch(&[], 20, 6)], &q17_oracle(Some(123))).is_err(),
 		"zero rows is fail@compare"
 	);
 	assert!(
 		compare_strict_q17(
-			&[q17_batch(&[Some(123), Some(123)], 21, 6)],
+			&[q17_batch(&[Some(123), Some(123)], 20, 6)],
 			&q17_oracle(Some(123))
 		)
 		.is_err(),
 		"q17 must emit exactly one row"
 	);
 	assert!(
-		compare_strict_q17(&[q17_batch(&[Some(123)], 21, 6)], &q17_oracle(None)).is_err(),
+		compare_strict_q17(&[q17_batch(&[Some(123)], 20, 6)], &q17_oracle(None)).is_err(),
 		"a NULL oracle is rejected by the anti-empty guard"
 	);
 }

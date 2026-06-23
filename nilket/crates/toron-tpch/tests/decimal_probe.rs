@@ -319,10 +319,10 @@ async fn decimal_comparison_precision_overflow_rejects_at_bind() {
 	);
 }
 
-/// Decimal `/` gets the same literal coercion as `+`, `-`, and `*`, so `SUM(decimal) / 7.0` binds to
-/// Decimal/Decimal and executes through the checked Decimal division kernel.
+/// Decimal `/` accepts an exact decimal-point literal, so `SUM(decimal) / 7.0` binds to
+/// Decimal128(15,2) / Decimal128(2,1) and executes through the checked Decimal division kernel.
 #[tokio::test]
-async fn decimal_division_coerces_float_literal() {
+async fn decimal_division_preserves_exact_literal_scale() {
 	let (catalog, storage) = lineitem_fixture();
 	let plan = SqlPlanner::new()
 		.plan("SELECT SUM(l_extendedprice) / 7.0 AS yearly FROM lineitem")
@@ -341,8 +341,8 @@ async fn decimal_division_coerces_float_literal() {
 		.column(0);
 	assert_eq!(
 		yearly.data_type(),
-		&DataType::Decimal128(21, 6),
-		"Decimal128(15,2) / Decimal128(15,2) -> Decimal128(21,6)"
+		&DataType::Decimal128(20, 6),
+		"Decimal128(15,2) / Decimal128(2,1) -> Decimal128(20,6)"
 	);
 	let yearly = yearly
 		.as_any()
@@ -352,7 +352,47 @@ async fn decimal_division_coerces_float_literal() {
 	assert_eq!(
 		yearly.value(0),
 		42_857_143,
-		"(100.00 + 200.00) / 7.00 = 42.857143"
+		"(100.00 + 200.00) / 7.0 = 42.857143"
+	);
+}
+
+/// ADR 325: a decimal-point expression literal keeps its own text scale. This is the q11 bug shape:
+/// Decimal128(15,2) * 0.0001 must multiply by a scale-4 literal, not by 0.00 at the column's scale.
+#[tokio::test]
+async fn decimal_point_literal_preserves_own_scale_in_strict_arithmetic() {
+	let (catalog, storage) = lineitem_fixture();
+	let plan = SqlPlanner::new()
+		.plan("SELECT l_extendedprice * 0.0001 AS threshold FROM lineitem")
+		.expect("decimal literal scale plans");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("Decimal * exact decimal-point literal binds");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("Decimal * exact decimal-point literal executes");
+	let threshold = batches
+		.iter()
+		.find(|batch| batch.num_rows() > 0)
+		.expect("threshold rows")
+		.column(0);
+	assert_eq!(
+		threshold.data_type(),
+		&DataType::Decimal128(21, 6),
+		"Decimal128(15,2) * Decimal128(5,4) -> Decimal128(21,6)"
+	);
+	let threshold = threshold
+		.as_any()
+		.downcast_ref::<Decimal128Array>()
+		.expect("threshold is Decimal128");
+	let mut values: Vec<i128> = (0..threshold.len())
+		.map(|row| threshold.value(row))
+		.collect();
+	values.sort_unstable();
+	assert_eq!(
+		values,
+		vec![10_000, 20_000],
+		"100.00 and 200.00 times 0.0001 produce 0.010000 and 0.020000"
 	);
 }
 

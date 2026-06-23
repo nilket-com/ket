@@ -668,8 +668,8 @@ fn q15_executes_with_keyed_supplier_revenue_join() {
 		.expect("q15 thread panicked");
 }
 
-// ADR 321: q11's Decimal x Int multiply aligns, so both modes reach execute. This is reachability only:
-// q11 correctness still owes the `* 0.0001` Decimal-literal scale policy.
+// ADR 321/325: q11's Decimal x Int multiply reaches execute, and exact decimal-point literals keep
+// the `* 0.0001` threshold from collapsing to zero.
 #[test]
 fn q11_executes_in_both_modes() {
 	std::thread::Builder::new()
@@ -696,7 +696,7 @@ fn q11_executes_in_both_modes() {
 					(
 						"strict",
 						run_strict_q11(0.01).await,
-						"ArrowIpcDigest([143, 195, 243, 21, 27, 76, 161, 92, 136, 153, 5, 19, 83, 58, 186, 163, 4, 175, 4, 84, 244, 41, 132, 69, 2, 4, 38, 48, 199, 46, 87, 182])",
+						"ArrowIpcDigest([220, 110, 59, 234, 8, 27, 172, 152, 253, 67, 152, 138, 28, 27, 41, 96, 151, 54, 204, 89, 217, 206, 178, 82, 239, 235, 73, 242, 121, 209, 65, 47])",
 					),
 				] {
 					assert_eq!(attempt.query, "q11");
