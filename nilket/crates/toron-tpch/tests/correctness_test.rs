@@ -11,33 +11,34 @@ use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
 	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q12Group,
 	Q12Oracle, Q13Oracle, Q14Oracle, Q15Row, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
-	Q18Oracle, Q18Row, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
+	Q18Oracle, Q18Row, Q19Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
 	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q04_schema,
 	assert_strict_q5_schema, assert_strict_q07_schema, assert_strict_q08_schema,
 	assert_strict_q09_schema, assert_strict_q10_schema, assert_strict_q11_schema,
 	assert_strict_q12_schema, assert_strict_q13_schema, assert_strict_q14_schema,
 	assert_strict_q15_schema, assert_strict_q16_schema, assert_strict_q17_schema,
-	assert_strict_q18_schema, assert_strict_q20_schema, assert_strict_q22_schema, avg_decimal_raw,
-	check_strict_q1, check_strict_q02, check_strict_q3, check_strict_q04, check_strict_q5,
-	check_strict_q6, check_strict_q07, check_strict_q08, check_strict_q09, check_strict_q10,
-	check_strict_q11, check_strict_q12, check_strict_q13, check_strict_q14, check_strict_q15,
-	check_strict_q16, check_strict_q17, check_strict_q18, check_strict_q20, check_strict_q22,
-	compare_strict_q1, compare_strict_q02, compare_strict_q3, compare_strict_q04,
-	compare_strict_q5, compare_strict_q6, compare_strict_q07, compare_strict_q08,
-	compare_strict_q09, compare_strict_q10, compare_strict_q11, compare_strict_q12,
-	compare_strict_q13, compare_strict_q14, compare_strict_q15, compare_strict_q16,
-	compare_strict_q17, compare_strict_q18, compare_strict_q20, compare_strict_q22,
-	correctness_matrix_from_log, decimal_division_raw, q02_type_matches_brass,
-	q04_oracle_from_rows, q6_row_revenue, q07_contribution, q08_contribution, q08_market_share_raw,
-	q09_amount_raw, q09_order_year, q09_part_name_contains_green, q09_partsupp_cost,
-	q11_oracle_from_rows, q11_threshold_passes, q13_comment_matches_pattern, q13_oracle_from_rows,
-	q15_oracle_from_rows, q16_customer_complaints_matches_pattern, q16_oracle_from_rows,
-	q20_part_name_is_forest_prefix, q20_threshold_passes, q22_acctbal_above_threshold,
-	q22_country_code, q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle,
-	strict_q02_oracle, strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle,
-	strict_q07_oracle, strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle,
-	strict_q12_oracle, strict_q13_oracle, strict_q14_oracle, strict_q15_oracle, strict_q16_oracle,
-	strict_q17_oracle, strict_q18_oracle, strict_q20_oracle, strict_q22_oracle,
+	assert_strict_q18_schema, assert_strict_q19_schema, assert_strict_q20_schema,
+	assert_strict_q22_schema, avg_decimal_raw, check_strict_q1, check_strict_q02, check_strict_q3,
+	check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07, check_strict_q08,
+	check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12, check_strict_q13,
+	check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17, check_strict_q18,
+	check_strict_q19, check_strict_q20, check_strict_q22, compare_strict_q1, compare_strict_q02,
+	compare_strict_q3, compare_strict_q04, compare_strict_q5, compare_strict_q6,
+	compare_strict_q07, compare_strict_q08, compare_strict_q09, compare_strict_q10,
+	compare_strict_q11, compare_strict_q12, compare_strict_q13, compare_strict_q14,
+	compare_strict_q15, compare_strict_q16, compare_strict_q17, compare_strict_q18,
+	compare_strict_q19, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
+	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
+	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
+	q09_part_name_contains_green, q09_partsupp_cost, q11_oracle_from_rows, q11_threshold_passes,
+	q13_comment_matches_pattern, q13_oracle_from_rows, q15_oracle_from_rows,
+	q16_customer_complaints_matches_pattern, q16_oracle_from_rows, q20_part_name_is_forest_prefix,
+	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
+	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
+	strict_q3_oracle, strict_q04_oracle, strict_q5_oracle, strict_q6_oracle, strict_q07_oracle,
+	strict_q08_oracle, strict_q09_oracle, strict_q10_oracle, strict_q11_oracle, strict_q12_oracle,
+	strict_q13_oracle, strict_q14_oracle, strict_q15_oracle, strict_q16_oracle, strict_q17_oracle,
+	strict_q18_oracle, strict_q19_oracle, strict_q20_oracle, strict_q22_oracle,
 };
 
 // Toron's strict q06 executor output equals the independent `LineItemGenerator`-traversal oracle.
@@ -3600,6 +3601,254 @@ fn q18_order_violation_is_fail() {
 	assert!(
 		compare_strict_q18(&[q18_batch(&[tie_b, tie_a])], &tie_oracle).is_ok(),
 		"ties on o_totalprice and o_orderdate may emit in either order"
+	);
+}
+
+fn q19_batch(values: &[Option<i128>]) -> RecordBatch {
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"revenue",
+		DataType::Decimal128(32, 4),
+		true,
+	)]));
+	RecordBatch::try_new(
+		schema,
+		vec![Arc::new(
+			Decimal128Array::from(values.to_vec())
+				.with_precision_and_scale(32, 4)
+				.expect("q19 revenue decimal column"),
+		)],
+	)
+	.expect("q19 batch")
+}
+
+fn q19_oracle(revenue: Option<i128>, qualifying_rows: usize, branch_hits: [usize; 3]) -> Q19Oracle {
+	Q19Oracle {
+		revenue: DecimalRaw {
+			value: revenue,
+			precision: 32,
+			scale: 4,
+		},
+		qualifying_rows,
+		branch_hits,
+	}
+}
+
+#[tokio::test]
+async fn strict_q19_matches_independent_oracle() {
+	let attempt = std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(check_strict_q19(0.01))
+		})
+		.expect("spawn q19 correctness thread")
+		.join()
+		.expect("q19 correctness thread panicked");
+	assert_eq!(attempt.query, "q19");
+	assert_eq!(attempt.phase, Phase::Compare, "{}", attempt.human());
+	assert_eq!(attempt.status, Status::Pass, "{}", attempt.human());
+}
+
+#[test]
+fn strict_q19_oracle_is_non_vacuous_at_default_scale() {
+	let oracle = strict_q19_oracle(0.01).expect("q19 oracle");
+	assert!(
+		oracle.qualifying_rows > 0,
+		"q19 oracle selected no qualifying rows: {oracle:?}"
+	);
+	assert!(
+		oracle.revenue.value.is_some(),
+		"q19 oracle selected rows but produced a NULL revenue: {oracle:?}"
+	);
+}
+
+#[test]
+fn strict_q19_output_schema_is_asserted() {
+	assert!(
+		assert_strict_q19_schema(&[q19_batch(&[Some(12_345)])]).is_ok(),
+		"the strict q19 schema should accept the measured Decimal128(32,4) column"
+	);
+
+	let drifted = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new(
+			"revenue",
+			DataType::Decimal128(31, 4),
+			false,
+		)])),
+		vec![Arc::new(
+			Decimal128Array::from(vec![Some(12_345_i128)])
+				.with_precision_and_scale(31, 4)
+				.expect("drifted q19 revenue decimal column"),
+		)],
+	)
+	.expect("drifted q19 batch");
+	assert!(
+		assert_strict_q19_schema(&[drifted]).is_err(),
+		"a non-measured Decimal128(31,4) q19 column must trip the schema gate"
+	);
+}
+
+#[test]
+fn q19_correctness_mismatch_is_fail_at_compare() {
+	let oracle = q19_oracle(Some(12_345), 1, [1, 0, 0]);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[Some(12_345)])], &oracle).is_ok(),
+		"exact raw match"
+	);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[Some(12_346)])], &oracle).is_err(),
+		"an off-by-one revenue is a mismatch"
+	);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[None])], &oracle).is_err(),
+		"a NULL output is fail@compare"
+	);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[])], &oracle).is_err(),
+		"zero rows is fail@compare"
+	);
+}
+
+#[test]
+fn q19_synthetic_branch_coverage_is_discriminating() {
+	// One qualifying row per branch, plus six near-miss controls that miss by exactly one predicate family.
+	let parts = [
+		(1_i64, "Brand#12", "SM CASE", 1_i32),
+		(2_i64, "Brand#23", "MED BOX", 5_i32),
+		(3_i64, "Brand#34", "LG PACK", 10_i32),
+		(4_i64, "Brand#99", "SM CASE", 1_i32),  // wrong brand
+		(5_i64, "Brand#12", "SM CRATE", 1_i32), // wrong container
+		(6_i64, "Brand#12", "SM CASE", 6_i32),  // wrong size
+		(7_i64, "Brand#23", "MED BOX", 11_i32), // wrong size
+		(8_i64, "Brand#34", "LG CASE", 16_i32), // wrong size
+	];
+	let lineitems = [
+		(
+			1_i64,
+			100_i128,
+			10_000_i128,
+			600_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			2_i64,
+			1_500_i128,
+			20_000_i128,
+			500_i128,
+			"AIR REG",
+			"DELIVER IN PERSON",
+		),
+		(
+			3_i64,
+			2_500_i128,
+			30_000_i128,
+			400_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			4_i64,
+			100_i128,
+			10_000_i128,
+			600_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			5_i64,
+			100_i128,
+			10_000_i128,
+			600_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			6_i64,
+			50_i128,
+			10_000_i128,
+			600_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			7_i64,
+			1_500_i128,
+			20_000_i128,
+			500_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			8_i64,
+			2_500_i128,
+			30_000_i128,
+			400_i128,
+			"AIR",
+			"DELIVER IN PERSON",
+		),
+		(
+			1_i64,
+			100_i128,
+			10_000_i128,
+			600_i128,
+			"TRUCK",
+			"DELIVER IN PERSON",
+		),
+		(
+			1_i64,
+			100_i128,
+			10_000_i128,
+			600_i128,
+			"AIR",
+			"TAKE BACK RETURN",
+		),
+	];
+	let mut expected_revenue = 0_i128;
+	let mut qualifying_rows = 0_usize;
+	let mut branch_hits = [0_usize; 3];
+	for (partkey, brand, container, size) in parts {
+		for (line_partkey, qty_raw, extprice_raw, discount_raw, shipmode, shipinstruct) in lineitems
+		{
+			if partkey != line_partkey {
+				continue;
+			}
+			let branch = match (brand, container, size, qty_raw, shipmode, shipinstruct) {
+				("Brand#12", "SM CASE", 1, 100, "AIR", "DELIVER IN PERSON") => Some(0),
+				("Brand#23", "MED BOX", 5, 1_500, "AIR REG", "DELIVER IN PERSON") => Some(1),
+				("Brand#34", "LG PACK", 10, 2_500, "AIR", "DELIVER IN PERSON") => Some(2),
+				_ => None,
+			};
+			let Some(branch) = branch else {
+				continue;
+			};
+			expected_revenue += extprice_raw * (100 - discount_raw);
+			qualifying_rows += 1;
+			branch_hits[branch] += 1;
+		}
+	}
+
+	assert_eq!(
+		qualifying_rows, 3,
+		"only the three branch rows should qualify"
+	);
+	assert_eq!(
+		branch_hits,
+		[1, 1, 1],
+		"each OR branch must be exercised once"
+	);
+
+	let oracle = q19_oracle(Some(expected_revenue), qualifying_rows, branch_hits);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[Some(expected_revenue)])], &oracle).is_ok(),
+		"the synthetic oracle should round-trip"
+	);
+	assert!(
+		compare_strict_q19(&[q19_batch(&[Some(expected_revenue + 1)])], &oracle).is_err(),
+		"the synthetic oracle should reject a wrong revenue"
 	);
 }
 

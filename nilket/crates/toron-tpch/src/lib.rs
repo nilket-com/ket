@@ -7577,6 +7577,227 @@ pub async fn check_strict_q18(scale_factor: f64) -> CorrectnessAttempt {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Q19Oracle {
+	pub revenue: DecimalRaw,
+	pub qualifying_rows: usize,
+	pub branch_hits: [usize; 3],
+}
+
+fn q19_branch_index(
+	brand: &str,
+	container: &str,
+	size: i32,
+	quantity_raw: i128,
+	shipmode: &str,
+	shipinstruct: &str,
+) -> Option<usize> {
+	if shipinstruct != "DELIVER IN PERSON" || !matches!(shipmode, "AIR" | "AIR REG") {
+		return None;
+	}
+
+	let container_matches = |candidates: &[&str]| candidates.contains(&container);
+	if brand == "Brand#12"
+		&& container_matches(&["SM CASE", "SM BOX", "SM PACK", "SM PKG"])
+		&& (100..=1100).contains(&quantity_raw)
+		&& (1..=5).contains(&size)
+	{
+		Some(0)
+	} else if brand == "Brand#23"
+		&& container_matches(&["MED BAG", "MED BOX", "MED PKG", "MED PACK"])
+		&& (1000..=2000).contains(&quantity_raw)
+		&& (1..=10).contains(&size)
+	{
+		Some(1)
+	} else if brand == "Brand#34"
+		&& container_matches(&["LG CASE", "LG BOX", "LG PACK", "LG PKG"])
+		&& (2000..=3000).contains(&quantity_raw)
+		&& (1..=15).contains(&size)
+	{
+		Some(2)
+	} else {
+		None
+	}
+}
+
+/// The independent strict-q19 oracle — traverse the generated `PART`/`LINEITEM` rows directly, sum the
+/// matching branch contributions, and keep a qualifying-row count so the answer check can reject vacuous
+/// `NULL == NULL` passes.
+pub fn strict_q19_oracle(scale_factor: f64) -> Result<Q19Oracle, String> {
+	let mut parts: HashMap<i64, (String, String, i32)> = HashMap::new();
+	for part in PartGenerator::new(scale_factor, 1, 1).iter() {
+		parts.insert(
+			part.p_partkey,
+			(
+				part.p_brand.to_string(),
+				part.p_container.to_string(),
+				part.p_size,
+			),
+		);
+	}
+
+	let mut revenue_raw = 0_i128;
+	let mut qualifying_rows = 0_usize;
+	let mut branch_hits = [0_usize; 3];
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		let Some((brand, container, size)) = parts.get(&item.l_partkey) else {
+			continue;
+		};
+		let quantity_raw = item.l_quantity as i128 * 100;
+		let Some(branch) = q19_branch_index(
+			brand,
+			container,
+			*size,
+			quantity_raw,
+			&item.l_shipmode.to_string(),
+			&item.l_shipinstruct.to_string(),
+		) else {
+			continue;
+		};
+		let extprice_raw = item.l_extendedprice.into_inner() as i128;
+		let discount_raw = item.l_discount.into_inner() as i128;
+		revenue_raw = revenue_raw
+			.checked_add(discounted_price_raw(extprice_raw, discount_raw))
+			.ok_or_else(|| "q19 revenue overflow".to_string())?;
+		qualifying_rows += 1;
+		branch_hits[branch] += 1;
+	}
+
+	let revenue = if qualifying_rows == 0 {
+		DecimalRaw {
+			value: None,
+			precision: 32,
+			scale: 4,
+		}
+	} else {
+		DecimalRaw {
+			value: Some(revenue_raw),
+			precision: 32,
+			scale: 4,
+		}
+	};
+	Ok(Q19Oracle {
+		revenue,
+		qualifying_rows,
+		branch_hits,
+	})
+}
+
+fn strict_q19_expected_schema() -> [(&'static str, DataType); 1] {
+	[("revenue", DataType::Decimal128(32, 4))]
+}
+
+pub fn assert_strict_q19_schema(batches: &[RecordBatch]) -> Result<(), String> {
+	let expected = strict_q19_expected_schema();
+	let Some(first) = batches.first() else {
+		return Err("strict q19 produced no output batch".to_string());
+	};
+	let schema = first.schema();
+	if schema.fields().len() != expected.len() {
+		return Err(format!(
+			"expected {} columns, got {}",
+			expected.len(),
+			schema.fields().len()
+		));
+	}
+	for (idx, (name, data_type)) in expected.iter().enumerate() {
+		let field = schema.field(idx);
+		if field.name() != name {
+			return Err(format!(
+				"column {idx}: expected name {name:?}, got {:?}",
+				field.name()
+			));
+		}
+		if field.data_type() != data_type {
+			return Err(format!(
+				"column {idx} ({name}): expected {data_type:?}, got {:?}",
+				field.data_type()
+			));
+		}
+	}
+	Ok(())
+}
+
+pub fn compare_strict_q19(batches: &[RecordBatch], oracle: &Q19Oracle) -> Result<(), String> {
+	assert_strict_q19_schema(batches)?;
+	if oracle.qualifying_rows == 0 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: qualifying_rows={} branch_hits={:?}",
+			oracle.qualifying_rows, oracle.branch_hits
+		));
+	}
+	if oracle.revenue.precision != 32 || oracle.revenue.scale != 4 {
+		return Err(format!(
+			"oracle revenue type drift: Decimal128({}, {})",
+			oracle.revenue.precision, oracle.revenue.scale
+		));
+	}
+	let Some(expected_value) = oracle.revenue.value else {
+		return Err("oracle revenue is NULL".to_string());
+	};
+
+	let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+	if row_count != 1 {
+		return Err(format!("expected exactly one q19 row, got {row_count}"));
+	}
+	for batch in batches {
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("column 0 (revenue) not Decimal128")?;
+		if column.is_null(0) {
+			return Err("column revenue row 0 is NULL".to_string());
+		}
+		let actual_value = column.value(0);
+		if actual_value != expected_value {
+			return Err(format!(
+				"revenue mismatch: expected {expected_value}, got {actual_value}"
+			));
+		}
+		return Ok(());
+	}
+	Err("strict q19 produced no row".to_string())
+}
+
+pub async fn check_strict_q19(scale_factor: f64) -> CorrectnessAttempt {
+	let start = Instant::now();
+	let tables = q19_tables(true, scale_factor);
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: "q19".to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let batches = match execute_query_with_tables(STRICT_Q19_SQL, tables).await {
+		Ok(batches) => batches,
+		Err(StageError { phase, reason }) => {
+			return outcome(phase, status_for_reason(&reason), Some(reason));
+		}
+	};
+	if let Err(reason) = assert_strict_q19_schema(&batches) {
+		return outcome(
+			Phase::Compare,
+			Status::Fail,
+			Some(format!("schema drift: {reason}")),
+		);
+	}
+	let oracle = match strict_q19_oracle(scale_factor) {
+		Ok(oracle) => oracle,
+		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+	};
+	match compare_strict_q19(&batches, &oracle) {
+		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+	}
+}
+
 /// ADR 310 - dev q16: parts/supplier relationship reachability over part + partsupp + supplier.
 pub async fn run_dev_q16(scale_factor: f64) -> Attempt {
 	run_query_with_tables(
