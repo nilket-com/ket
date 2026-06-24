@@ -428,6 +428,48 @@ impl<'a> Binder<'a> {
 							self.push_deferred_scalar_outer_filter(input, predicate)
 								.await
 						}
+						LogicalPlan::Project {
+							input: project_input,
+							exprs,
+							output_names,
+						} => {
+							let Some(input_scope) = self
+								.logical_scope_for_outer_demotion(&project_input)
+								.await?
+							else {
+								return Ok(LogicalPlan::Filter {
+									input: Box::new(LogicalPlan::Project {
+										input: project_input,
+										exprs,
+										output_names,
+									}),
+									predicate: predicate.clone(),
+								});
+							};
+							let project_input = *project_input;
+							let map = project_passthrough_map(&exprs, &output_names, &input_scope)?;
+							let mut routed = Vec::new();
+							let mut residual = Vec::new();
+							for conjunct in split_logical_and_conjuncts(predicate) {
+								match remap_expr_through_project(&conjunct, &map, &input_scope)? {
+									Some(routed_conjunct) => routed.push(routed_conjunct),
+									None => residual.push(conjunct),
+								}
+							}
+							let pushed_input = if routed.is_empty() {
+								project_input
+							} else {
+								push_logical_filter_conjuncts(project_input, routed)
+							};
+							let pushed_input =
+								self.recognize_cross_equi_joins(&pushed_input).await?;
+							let projected = LogicalPlan::Project {
+								input: Box::new(pushed_input),
+								exprs,
+								output_names,
+							};
+							Ok(wrap_residual_filter(projected, residual))
+						}
 						input @ LogicalPlan::Join {
 							kind: JoinKind::LeftSemi | JoinKind::LeftAnti,
 							..
@@ -873,6 +915,25 @@ impl<'a> Binder<'a> {
 					residual.push(conjunct);
 				}
 			}
+			if !keys.is_empty()
+				&& !self.contains_nested_cross_equi(&left, &left_only).await?
+				&& !self.contains_nested_cross_equi(&right, &right_only).await?
+			{
+				let mut reassociated_residual = residual.clone();
+				reassociated_residual.extend(left_only.iter().cloned());
+				reassociated_residual.extend(right_only.iter().cloned());
+				if let Some(join) = self
+					.reassociate_lifted_cross_child(
+						left.clone(),
+						right.clone(),
+						strategy_intent,
+						&keys,
+					)
+					.await?
+				{
+					return Ok(wrap_residual_filter(join, reassociated_residual));
+				}
+			}
 			let left = self
 				.push_into_cross_child(left, left_only, &mut residual)
 				.await?;
@@ -884,6 +945,19 @@ impl<'a> Binder<'a> {
 			} else {
 				JoinKind::Inner
 			};
+			if kind == JoinKind::Inner {
+				if let Some(join) = self
+					.reassociate_lifted_cross_child(
+						left.clone(),
+						right.clone(),
+						strategy_intent,
+						&keys,
+					)
+					.await?
+				{
+					return Ok(wrap_residual_filter(join, residual));
+				}
+			}
 			let join = LogicalPlan::Join {
 				left: Box::new(left),
 				right: Box::new(right),
@@ -894,6 +968,250 @@ impl<'a> Binder<'a> {
 				strategy_intent,
 			};
 			Ok(wrap_residual_filter(join, residual))
+		})
+	}
+
+	fn contains_nested_cross_equi<'b>(
+		&'b self,
+		plan: &'b LogicalPlan,
+		conjuncts: &'b [Expr],
+	) -> Pin<Box<dyn Future<Output = Result<bool, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			match plan {
+				LogicalPlan::Join {
+					left,
+					right,
+					kind: JoinKind::Cross,
+					..
+				} => {
+					if let (Some(left_scope), Some(right_scope)) = (
+						self.logical_scope_for_outer_demotion(left).await?,
+						self.logical_scope_for_outer_demotion(right).await?,
+					) {
+						if conjuncts.iter().any(|conjunct| {
+							oriented_key_for_conjunct(conjunct, &left_scope, &right_scope).is_some()
+						}) {
+							return Ok(true);
+						}
+					}
+					if self.contains_nested_cross_equi(left, conjuncts).await? {
+						return Ok(true);
+					}
+					self.contains_nested_cross_equi(right, conjuncts).await
+				}
+				LogicalPlan::Join { left, right, .. } => {
+					if self.contains_nested_cross_equi(left, conjuncts).await? {
+						return Ok(true);
+					}
+					self.contains_nested_cross_equi(right, conjuncts).await
+				}
+				LogicalPlan::Filter { input, .. }
+				| LogicalPlan::Project { input, .. }
+				| LogicalPlan::Exchange { input, .. }
+				| LogicalPlan::Sort { input, .. }
+				| LogicalPlan::Window { input, .. }
+				| LogicalPlan::Take { input, .. }
+				| LogicalPlan::Repeat { input, .. }
+				| LogicalPlan::Distinct { input }
+				| LogicalPlan::Alias { input, .. }
+				| LogicalPlan::Aggregate { input, .. }
+				| LogicalPlan::Explain { input }
+				| LogicalPlan::ExplainAnalyze { input } => {
+					self.contains_nested_cross_equi(input, conjuncts).await
+				}
+				LogicalPlan::Union { left, right } | LogicalPlan::SetOpAll { left, right, .. } => {
+					if self.contains_nested_cross_equi(left, conjuncts).await? {
+						return Ok(true);
+					}
+					self.contains_nested_cross_equi(right, conjuncts).await
+				}
+				LogicalPlan::DeferredExists { outer, inner, .. }
+				| LogicalPlan::DeferredScalarSubquery { outer, inner, .. } => {
+					if self.contains_nested_cross_equi(outer, conjuncts).await? {
+						return Ok(true);
+					}
+					self.contains_nested_cross_equi(inner, conjuncts).await
+				}
+				LogicalPlan::CreateTableAsSelect { source, .. }
+				| LogicalPlan::InsertSelect { source, .. } => {
+					self.contains_nested_cross_equi(source, conjuncts).await
+				}
+				LogicalPlan::Scan { .. }
+				| LogicalPlan::ScanNamed { .. }
+				| LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::DropTable { .. }
+				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
+				| LogicalPlan::Insert { .. }
+				| LogicalPlan::RecursiveCte { .. }
+				| LogicalPlan::RecursiveRef { .. } => Ok(false),
+			}
+		})
+	}
+
+	fn reassociate_lifted_cross_child<'b>(
+		&'b self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		strategy_intent: JoinStrategyIntent,
+		keys: &'b [(Expr, Expr)],
+	) -> Pin<Box<dyn Future<Output = Result<Option<LogicalPlan>, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			if let Some(join) = self
+				.reassociate_left_cross_child(left.clone(), right.clone(), strategy_intent, keys)
+				.await?
+			{
+				return Ok(Some(join));
+			}
+			self.reassociate_right_cross_child(left, right, strategy_intent, keys)
+				.await
+		})
+	}
+
+	fn reassociate_left_cross_child<'b>(
+		&'b self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		strategy_intent: JoinStrategyIntent,
+		keys: &'b [(Expr, Expr)],
+	) -> Pin<Box<dyn Future<Output = Result<Option<LogicalPlan>, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let LogicalPlan::Join {
+				left: cross_left,
+				right: cross_right,
+				kind: JoinKind::Cross,
+				on,
+				on_filter,
+				null_safe_keys,
+				strategy_intent: cross_intent,
+			} = left
+			else {
+				return Ok(None);
+			};
+			if !on.is_empty()
+				|| on_filter.is_some()
+				|| null_safe_keys
+				|| cross_intent != JoinStrategyIntent::Auto
+			{
+				return Ok(None);
+			}
+			let (Some(cross_left_scope), Some(cross_right_scope), Some(other_scope)) = (
+				self.logical_scope_for_outer_demotion(&cross_left).await?,
+				self.logical_scope_for_outer_demotion(&cross_right).await?,
+				self.logical_scope_for_outer_demotion(&right).await?,
+			) else {
+				return Ok(None);
+			};
+			let mut left_keys = Vec::new();
+			let mut right_keys = Vec::new();
+			for (cross_expr, other_expr) in keys {
+				if expr_resolves_in_scope(cross_expr, &cross_left_scope)
+					&& expr_resolves_in_scope(other_expr, &other_scope)
+				{
+					left_keys.push((cross_expr.clone(), other_expr.clone()));
+				} else if expr_resolves_in_scope(cross_expr, &cross_right_scope)
+					&& expr_resolves_in_scope(other_expr, &other_scope)
+				{
+					right_keys.push((cross_expr.clone(), other_expr.clone()));
+				} else {
+					return Ok(None);
+				}
+			}
+			if left_keys.is_empty() || right_keys.is_empty() {
+				return Ok(None);
+			}
+			let first = LogicalPlan::Join {
+				left: cross_right,
+				right: Box::new(right),
+				kind: JoinKind::Inner,
+				on: right_keys,
+				on_filter: None,
+				null_safe_keys: false,
+				strategy_intent,
+			};
+			Ok(Some(LogicalPlan::Join {
+				left: cross_left,
+				right: Box::new(first),
+				kind: JoinKind::Inner,
+				on: left_keys,
+				on_filter: None,
+				null_safe_keys: false,
+				strategy_intent,
+			}))
+		})
+	}
+
+	fn reassociate_right_cross_child<'b>(
+		&'b self,
+		left: LogicalPlan,
+		right: LogicalPlan,
+		strategy_intent: JoinStrategyIntent,
+		keys: &'b [(Expr, Expr)],
+	) -> Pin<Box<dyn Future<Output = Result<Option<LogicalPlan>, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let LogicalPlan::Join {
+				left: cross_left,
+				right: cross_right,
+				kind: JoinKind::Cross,
+				on,
+				on_filter,
+				null_safe_keys,
+				strategy_intent: cross_intent,
+			} = right
+			else {
+				return Ok(None);
+			};
+			if !on.is_empty()
+				|| on_filter.is_some()
+				|| null_safe_keys
+				|| cross_intent != JoinStrategyIntent::Auto
+			{
+				return Ok(None);
+			}
+			let (Some(other_scope), Some(cross_left_scope), Some(cross_right_scope)) = (
+				self.logical_scope_for_outer_demotion(&left).await?,
+				self.logical_scope_for_outer_demotion(&cross_left).await?,
+				self.logical_scope_for_outer_demotion(&cross_right).await?,
+			) else {
+				return Ok(None);
+			};
+			let mut left_keys = Vec::new();
+			let mut right_keys = Vec::new();
+			for (other_expr, cross_expr) in keys {
+				if expr_resolves_in_scope(other_expr, &other_scope)
+					&& expr_resolves_in_scope(cross_expr, &cross_left_scope)
+				{
+					left_keys.push((other_expr.clone(), cross_expr.clone()));
+				} else if expr_resolves_in_scope(other_expr, &other_scope)
+					&& expr_resolves_in_scope(cross_expr, &cross_right_scope)
+				{
+					right_keys.push((other_expr.clone(), cross_expr.clone()));
+				} else {
+					return Ok(None);
+				}
+			}
+			if left_keys.is_empty() || right_keys.is_empty() {
+				return Ok(None);
+			}
+			let first = LogicalPlan::Join {
+				left: Box::new(left),
+				right: cross_left,
+				kind: JoinKind::Inner,
+				on: left_keys,
+				on_filter: None,
+				null_safe_keys: false,
+				strategy_intent,
+			};
+			Ok(Some(LogicalPlan::Join {
+				left: Box::new(first),
+				right: cross_right,
+				kind: JoinKind::Inner,
+				on: right_keys,
+				on_filter: None,
+				null_safe_keys: false,
+				strategy_intent,
+			}))
 		})
 	}
 
@@ -910,18 +1228,127 @@ impl<'a> Binder<'a> {
 			if conjuncts.is_empty() {
 				return self.recognize_cross_equi_joins(&child).await;
 			}
-			if matches!(
-				child,
+			match child {
 				LogicalPlan::Join {
 					kind: JoinKind::Cross,
 					..
+				} => {
+					let pushed = wrap_residual_filter(child, conjuncts);
+					self.recognize_cross_equi_joins(&pushed).await
 				}
-			) {
-				let pushed = wrap_residual_filter(child, conjuncts);
-				self.recognize_cross_equi_joins(&pushed).await
-			} else {
-				residual.extend(conjuncts);
-				self.recognize_cross_equi_joins(&child).await
+				LogicalPlan::Filter { input, predicate } => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Filter {
+						input: Box::new(pushed),
+						predicate,
+					})
+				}
+				LogicalPlan::Project {
+					input,
+					exprs,
+					output_names,
+				} => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Project {
+						input: Box::new(pushed),
+						exprs,
+						output_names,
+					})
+				}
+				LogicalPlan::Exchange {
+					input,
+					partition_count,
+					key,
+				} => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Exchange {
+						input: Box::new(pushed),
+						partition_count,
+						key,
+					})
+				}
+				LogicalPlan::Sort {
+					input,
+					order_by,
+					limit,
+					offset,
+				} => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Sort {
+						input: Box::new(pushed),
+						order_by,
+						limit,
+						offset,
+					})
+				}
+				LogicalPlan::Window {
+					input,
+					partition_by,
+					order_by,
+					functions,
+				} => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Window {
+						input: Box::new(pushed),
+						partition_by,
+						order_by,
+						functions,
+					})
+				}
+				LogicalPlan::Take { input, limit } => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Take {
+						input: Box::new(pushed),
+						limit,
+					})
+				}
+				LogicalPlan::Repeat { input, count } => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Repeat {
+						input: Box::new(pushed),
+						count,
+					})
+				}
+				LogicalPlan::Distinct { input } => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Distinct {
+						input: Box::new(pushed),
+					})
+				}
+				LogicalPlan::Alias {
+					input,
+					alias,
+					columns,
+				} => {
+					let pushed = self
+						.push_into_cross_child(*input, conjuncts, residual)
+						.await?;
+					Ok(LogicalPlan::Alias {
+						input: Box::new(pushed),
+						alias,
+						columns,
+					})
+				}
+				other => {
+					residual.extend(conjuncts);
+					self.recognize_cross_equi_joins(&other).await
+				}
 			}
 		})
 	}
@@ -2133,6 +2560,17 @@ fn orient_bridging_equi(
 		}
 		_ => None,
 	}
+}
+
+fn expr_resolves_in_scope(expr: &Expr, scope: &RelationScope) -> bool {
+	let Expr::Column(column_ref) = expr else {
+		return false;
+	};
+	scope
+		.resolve_join_column(column_ref, "reassociated join key")
+		.ok()
+		.flatten()
+		.is_some()
 }
 
 fn column_side_with_type(

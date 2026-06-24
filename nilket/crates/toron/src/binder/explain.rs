@@ -2855,6 +2855,58 @@ pub(super) fn broadcast_build_side_label(side: BroadcastBuildSide) -> &'static s
 	}
 }
 
+fn summarize_join_decisions(trace: &OptimizerTrace) -> String {
+	trace
+		.join_decisions
+		.iter()
+		.map(|receipt| {
+			format!(
+				"#{} {} {} {}",
+				receipt.target.join_index,
+				join_strategy_label(receipt.strategy),
+				join_physical_placement_label(receipt.placement),
+				join_strategy_decision_reason_label(&receipt.reason)
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
+fn summarize_join_order_edges(render: &OptimizerExplainRenderTrace) -> String {
+	render
+		.join_order_edges
+		.iter()
+		.map(|edge| {
+			format!(
+				"#{} {:?} probe={:?} dim={:?} left_keys={:?} right_keys={:?} rows={:?} linearity={:?}",
+				edge.target.join_index,
+				edge.join_kind,
+				edge.probe,
+				edge.dimension,
+				edge.left_key_signature,
+				edge.right_key_signature,
+				edge.estimated_rows,
+				edge.probe_linearity
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(" | ")
+}
+
+#[doc(hidden)]
+pub async fn bind_with_explain_summary(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, String, String), BindingError> {
+	let (plan, trace, render_trace) = bind_with_explain_trace(plan, catalog, config).await?;
+	Ok((
+		plan,
+		summarize_join_decisions(&trace),
+		summarize_join_order_edges(&render_trace),
+	))
+}
+
 pub(super) fn scan_filter_target_label(target: ScanTraceTarget) -> Result<String, BindingError> {
 	let scan = usize_to_i64(target.scan_index, "scan_index")?;
 	Ok(match target.table_id {

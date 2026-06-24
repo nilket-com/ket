@@ -21220,6 +21220,44 @@ fn join_order_edge_dimensions(render: &OptimizerExplainRenderTrace) -> Vec<Strin
 		.collect()
 }
 
+fn join_decision_summary(trace: &OptimizerTrace) -> String {
+	trace
+		.join_decisions
+		.iter()
+		.map(|receipt| {
+			format!(
+				"#{} {} {} {}",
+				receipt.target.join_index,
+				join_strategy_label(receipt.strategy),
+				join_physical_placement_label(receipt.placement),
+				join_strategy_decision_reason_label(&receipt.reason)
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
+fn join_order_edge_summary(render: &OptimizerExplainRenderTrace) -> String {
+	render
+		.join_order_edges
+		.iter()
+		.map(|edge| {
+			format!(
+				"#{} {:?} probe={:?} dim={:?} left_keys={:?} right_keys={:?} rows={:?} linearity={:?}",
+				edge.target.join_index,
+				edge.join_kind,
+				edge.probe,
+				edge.dimension,
+				edge.left_key_signature,
+				edge.right_key_signature,
+				edge.estimated_rows,
+				edge.probe_linearity
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(" | ")
+}
+
 fn broadcast_build_scan_ids_in_applied_order(plan: &ExecutionPlan) -> Vec<TableId> {
 	let mut top_down_build_ids = Vec::new();
 	collect_broadcast_build_scan_ids_top_down(plan, &mut top_down_build_ids);
@@ -23118,6 +23156,93 @@ fn selective_bridge_order_sql() -> &'static str {
 	 WHERE products.category = 5"
 }
 
+fn mediated_non_key_cross_join_catalog(
+	a_byte_upper_bound: u64,
+	fact_byte_upper_bound: u64,
+	b_byte_upper_bound: u64,
+) -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(81),
+			named_descriptor(
+				81,
+				"a",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("a_payload", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register non-key a");
+	catalog
+		.register_descriptor(
+			TableId(82),
+			named_descriptor(
+				82,
+				"fact",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("a_id", DataType::Int64, false),
+					Field::new("b_id", DataType::Int64, false),
+					Field::new("fact_payload", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register non-key fact");
+	catalog
+		.register_descriptor(
+			TableId(83),
+			named_descriptor(
+				83,
+				"b",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("b_payload", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register non-key b");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"a",
+		Some(a_byte_upper_bound),
+		Some(2_500),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(2_500))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"fact",
+		Some(fact_byte_upper_bound),
+		Some(100_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(100_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(2_500)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(2_500)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"b",
+		Some(b_byte_upper_bound),
+		Some(2_500),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(2_500))],
+	);
+	catalog
+}
+
+fn non_key_cross_join_sql() -> &'static str {
+	"SELECT a.id AS a_id, b.id AS b_id, fact.id AS fact_id FROM a, b, fact \
+	 WHERE fact.a_id = a.id \
+	   AND fact.b_id = b.id"
+}
+
+fn non_key_cross_join_star_sql() -> &'static str {
+	"SELECT * FROM a, b, fact \
+	 WHERE fact.a_id = a.id \
+	   AND fact.b_id = b.id"
+}
+
 // ADR 199 positive gate (binder level): a bridge with a selective predicate on the dimension reroots
 // to the dimension. The EXPLAIN bridge receipt flips to `action=reordered; applied_root=products`, and
 // the recursion terminates (the re-rooted bridge is not re-rooted again).
@@ -23139,6 +23264,96 @@ async fn bridge_reroots_to_selective_dimension() {
 	);
 	assert_utf8_contains(&bridge_row[3], "action=reordered");
 	assert_utf8_contains(&bridge_row[3], "applied_root=products");
+}
+
+// ADR 331 Phase 1b: the smaller repro. Keep the fixture to three relations, use the mediated
+// join shape, and capture only a compact join-decision summary. This remains a diagnostic surrogate,
+// not the official q08/q09 shape.
+#[tokio::test]
+async fn mediated_join_stays_keyed_at_scale() {
+	let keyed_catalog =
+		mediated_non_key_cross_join_catalog(4 * 1024 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024);
+	let scaled_catalog =
+		mediated_non_key_cross_join_catalog(12 * 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(non_key_cross_join_sql())
+		.expect("plan mediated comma cross");
+	let default_cap = auto_broadcast_config(8 * 1024 * 1024);
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &keyed_catalog, &default_cap)
+			.await
+			.expect("bind default-cap mediated comma cross explain trace");
+
+	assert_eq!(trace.join_decisions.len(), 2);
+	assert_eq!(render_trace.join_order_edges.len(), 2);
+	assert!(
+		render_trace.join_order_edges.iter().all(|edge| {
+			edge.join_kind == JoinKind::Inner
+				&& edge.inner_equi
+				&& !edge.left_key_signature.is_empty()
+				&& !edge.right_key_signature.is_empty()
+		}),
+		"small mediated join must stay keyed, got: {}",
+		join_order_edge_summary(&render_trace)
+	);
+	let summary = join_decision_summary(&trace);
+	assert!(
+		summary.contains("broadcast"),
+		"expected a compact join summary, got: {summary}"
+	);
+	assert_eq!(
+		field_names(&plan.schema()),
+		vec!["a_id", "b_id", "fact_id"],
+		"projected mediated join must preserve SQL projection order"
+	);
+
+	let (scaled_plan, scaled_trace, scaled_render_trace) =
+		bind_with_explain_trace(&logical, &scaled_catalog, &default_cap)
+			.await
+			.expect("scaled mediated join should stay keyed under the default cap");
+	assert_eq!(scaled_trace.join_decisions.len(), 2);
+	assert_eq!(scaled_render_trace.join_order_edges.len(), 2);
+	assert!(
+		scaled_render_trace.join_order_edges.iter().all(|edge| {
+			edge.join_kind == JoinKind::Inner
+				&& edge.inner_equi
+				&& !edge.left_key_signature.is_empty()
+				&& !edge.right_key_signature.is_empty()
+		}),
+		"scaled mediated join must stay keyed, got: {}",
+		join_order_edge_summary(&scaled_render_trace)
+	);
+	let scaled_summary = join_decision_summary(&scaled_trace);
+	assert!(
+		scaled_summary.contains("broadcast"),
+		"expected a compact scaled join summary, got: {scaled_summary}"
+	);
+	assert_eq!(
+		field_names(&scaled_plan.schema()),
+		vec!["a_id", "b_id", "fact_id"],
+		"scaled projected mediated join must preserve SQL projection order"
+	);
+
+	let star_logical = SqlPlanner::new()
+		.plan(non_key_cross_join_star_sql())
+		.expect("plan mediated comma cross star");
+	let star_plan = bind(&star_logical, &scaled_catalog, &default_cap)
+		.await
+		.expect("scaled mediated star join should bind under the default cap");
+	assert_eq!(
+		field_names(&star_plan.schema()),
+		vec![
+			"id",
+			"a_payload",
+			"id",
+			"b_payload",
+			"id",
+			"a_id",
+			"b_id",
+			"fact_payload"
+		],
+		"reassociated mediated star join must preserve FROM column order"
+	);
 }
 
 // ADR 199: the Rune frontend (primary interface) actuates the selective bridge identically to SQL — the

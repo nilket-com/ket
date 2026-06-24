@@ -8978,6 +8978,300 @@ mod adr301_q09_probe {
 }
 
 #[cfg(test)]
+mod adr331_q08_scale_probe {
+	use super::*;
+	use toron::binder::bind_with_explain_summary;
+
+	fn catalog_from_tables(tables: Vec<HarnessTable>) -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		for table in tables {
+			catalog
+				.register_descriptor(table.id, table.descriptor)
+				.expect("register q08 table");
+			catalog
+				.seed_optimizer_facts(&TableRef::new(table.name), table.facts)
+				.expect("seed q08 facts");
+		}
+		catalog
+	}
+
+	fn join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>) {
+		match plan {
+			ExecutionPlan::Join {
+				left, right, kind, ..
+			} => {
+				kinds.push(*kind);
+				join_kinds(left, kinds);
+				join_kinds(right, kinds);
+			}
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Window { input, .. }
+			| ExecutionPlan::Take { input, .. }
+			| ExecutionPlan::Repeat { input, .. } => join_kinds(input, kinds),
+			ExecutionPlan::Union { left, right, .. } => {
+				join_kinds(left, kinds);
+				join_kinds(right, kinds);
+			}
+			ExecutionPlan::EmptyRelation { .. }
+			| ExecutionPlan::SystemTable { .. }
+			| ExecutionPlan::Scan { .. }
+			| ExecutionPlan::CreateTable { .. }
+			| ExecutionPlan::CreateLogicalType { .. }
+			| ExecutionPlan::CreateTableAsSelect { .. }
+			| ExecutionPlan::DropTable { .. }
+			| ExecutionPlan::Delete { .. }
+			| ExecutionPlan::Update { .. }
+			| ExecutionPlan::Insert { .. }
+			| ExecutionPlan::InsertSelect { .. }
+			| ExecutionPlan::RecursiveCte { .. }
+			| ExecutionPlan::RecursiveRef { .. } => {}
+		}
+	}
+
+	fn plan_shape(plan: &ExecutionPlan) -> String {
+		match plan {
+			ExecutionPlan::Join {
+				left,
+				right,
+				kind,
+				strategy,
+				left_keys,
+				right_keys,
+				..
+			} => format!(
+				"Join({kind:?},{strategy:?},keys={left_keys:?}/{right_keys:?},left={},right={})",
+				plan_shape(left),
+				plan_shape(right)
+			),
+			ExecutionPlan::Filter { input, .. } => format!("Filter({})", plan_shape(input)),
+			ExecutionPlan::Project { input, .. } => format!("Project({})", plan_shape(input)),
+			ExecutionPlan::Aggregate { input, .. } => format!("Agg({})", plan_shape(input)),
+			ExecutionPlan::Exchange { input, .. } => format!("Exchange({})", plan_shape(input)),
+			ExecutionPlan::Sort { input, .. } => format!("Sort({})", plan_shape(input)),
+			ExecutionPlan::Window { input, .. } => format!("Window({})", plan_shape(input)),
+			ExecutionPlan::Take { input, .. } => format!("Take({})", plan_shape(input)),
+			ExecutionPlan::Repeat { input, .. } => format!("Repeat({})", plan_shape(input)),
+			ExecutionPlan::Union { left, right, .. } => {
+				format!(
+					"Union(left={},right={})",
+					plan_shape(left),
+					plan_shape(right)
+				)
+			}
+			ExecutionPlan::Scan { local_table_id, .. } => format!("Scan({local_table_id:?})"),
+			ExecutionPlan::EmptyRelation { .. } => "EmptyRelation".to_string(),
+			ExecutionPlan::SystemTable { .. } => "SystemTable".to_string(),
+			ExecutionPlan::CreateTable { .. } => "CreateTable".to_string(),
+			ExecutionPlan::CreateLogicalType { .. } => "CreateLogicalType".to_string(),
+			ExecutionPlan::CreateTableAsSelect { source, .. } => {
+				format!("CTAS({})", plan_shape(source))
+			}
+			ExecutionPlan::DropTable { .. } => "DropTable".to_string(),
+			ExecutionPlan::Delete { .. } => "Delete".to_string(),
+			ExecutionPlan::Update { .. } => "Update".to_string(),
+			ExecutionPlan::Insert { .. } => "Insert".to_string(),
+			ExecutionPlan::InsertSelect { source, .. } => {
+				format!("InsertSelect({})", plan_shape(source))
+			}
+			ExecutionPlan::RecursiveCte { .. } => "RecursiveCte".to_string(),
+			ExecutionPlan::RecursiveRef { .. } => "RecursiveRef".to_string(),
+		}
+	}
+
+	fn assert_no_cross_join(query: &str, scale: &str, plan: &ExecutionPlan) {
+		let mut kinds = Vec::new();
+		join_kinds(plan, &mut kinds);
+		assert!(
+			!kinds.contains(&JoinKind::Cross),
+			"{query} {scale} should stay keyed, got: {}",
+			plan_shape(plan)
+		);
+	}
+
+	async fn assert_explain_stays_keyed(
+		query: &str,
+		scale: &str,
+		logical: &toron::ir::LogicalPlan,
+		catalog: &MockCatalog,
+		config: &PlannerConfig,
+	) {
+		let (_plan, _decisions, edges) = bind_with_explain_summary(logical, catalog, config)
+			.await
+			.unwrap_or_else(|err| panic!("{query} {scale} explain bind should succeed: {err}"));
+		assert!(
+			!edges.contains(" Cross"),
+			"{query} {scale} explain path should stay keyed, got edges: {edges}"
+		);
+	}
+
+	async fn assert_strict_query_stays_keyed(
+		query: &str,
+		sql: &str,
+		small_catalog: MockCatalog,
+		scaled_catalog: MockCatalog,
+	) {
+		let logical = SqlPlanner::new()
+			.plan(sql)
+			.unwrap_or_else(|err| panic!("plan strict {query}: {err}"));
+		let default_cap = PlannerConfig::default();
+
+		assert_strict_query_stays_keyed_at_scale(
+			query,
+			"sf=0.01",
+			&logical,
+			&small_catalog,
+			&default_cap,
+		)
+		.await;
+		assert_strict_query_stays_keyed_at_scale(
+			query,
+			"sf=1",
+			&logical,
+			&scaled_catalog,
+			&default_cap,
+		)
+		.await;
+	}
+
+	async fn assert_strict_query_stays_keyed_at_scale(
+		query: &str,
+		scale: &str,
+		logical: &toron::ir::LogicalPlan,
+		catalog: &MockCatalog,
+		config: &PlannerConfig,
+	) {
+		let plan = match bind(logical, catalog, config).await {
+			Ok(plan) => plan,
+			Err(err) => {
+				let relaxed_cap = PlannerConfig {
+					auto_broadcast_max_build_bytes: Some(ByteCount::new(u64::MAX / 4)),
+					..PlannerConfig::default()
+				};
+				let relaxed = match bind_with_explain_summary(logical, catalog, &relaxed_cap).await
+				{
+					Ok((_plan, decisions, edges)) => {
+						format!("relaxed decisions=[{decisions}] edges=[{edges}]")
+					}
+					Err(relaxed_err) => format!("relaxed explain failed: {relaxed_err}"),
+				};
+				panic!("bind strict {query} {scale}: {err}; {relaxed}");
+			}
+		};
+		assert_no_cross_join(query, scale, &plan);
+		assert_explain_stays_keyed(query, scale, logical, catalog, config).await;
+	}
+
+	#[test]
+	fn strict_q08_stays_keyed_at_small_and_scaled() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					assert_strict_query_stays_keyed(
+						"q08",
+						STRICT_Q8_SQL,
+						catalog_from_tables(q08_tables(true, 0.01)),
+						catalog_from_tables(q08_tables(true, 1.0)),
+					)
+					.await;
+				});
+			})
+			.expect("spawn q08 thread")
+			.join()
+			.expect("q08 thread panicked");
+	}
+
+	#[test]
+	fn strict_q09_stays_keyed_at_small_and_scaled() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					assert_strict_query_stays_keyed(
+						"q09",
+						STRICT_Q9_SQL,
+						catalog_from_tables(q09_tables(true, 0.01)),
+						catalog_from_tables(q09_tables(true, 1.0)),
+					)
+					.await;
+				});
+			})
+			.expect("spawn q09 thread")
+			.join()
+			.expect("q09 thread panicked");
+	}
+
+	// ADR 331: q02 is a free beneficiary of the same comma-Cross reassociation - its `(A x B) join F`
+	// shape keyed at sf=1 once q08/q09 did. This canary guards that: revert the reassociation and q02
+	// regresses to a keyless Cross at sf=1.
+	#[test]
+	fn strict_q02_stays_keyed_at_small_and_scaled() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					assert_strict_query_stays_keyed(
+						"q02",
+						STRICT_Q2_SQL,
+						catalog_from_tables(q02_tables(true, 0.01)),
+						catalog_from_tables(q02_tables(true, 1.0)),
+					)
+					.await;
+				});
+			})
+			.expect("spawn q02 thread")
+			.join()
+			.expect("q02 thread panicked");
+	}
+
+	#[test]
+	fn strict_q05_stays_keyed_at_default_scale() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					let logical = SqlPlanner::new()
+						.plan(STRICT_Q5_SQL)
+						.expect("plan strict q05");
+					let default_cap = PlannerConfig::default();
+					let catalog = catalog_from_tables(q05_tables(true, 0.01));
+					assert_strict_query_stays_keyed_at_scale(
+						"q05",
+						"sf=0.01",
+						&logical,
+						&catalog,
+						&default_cap,
+					)
+					.await;
+				});
+			})
+			.expect("spawn q05 thread")
+			.join()
+			.expect("q05 thread panicked");
+	}
+}
+
+#[cfg(test)]
 mod adr275_decimal_join_probe {
 	use super::*;
 

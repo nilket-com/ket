@@ -80,6 +80,7 @@ use self::set_ops::{
 };
 
 pub use self::decision_log::OptimizerDecisionLog;
+pub use self::explain::bind_with_explain_summary;
 pub(crate) use self::join::JoinStrategyDecisionReason;
 pub use self::join::join_schema;
 pub use self::join_order::SoftMarginLadderStep;
@@ -258,6 +259,7 @@ async fn bind_with_explain_trace(
 	let tree_join_order_soft_margin_step = binder.join_order_policy.tree_step;
 	let (normalized_plan, outer_join_demotions) =
 		binder.demote_null_rejected_outer_joins(plan).await?;
+	let normalized_plan = binder.recognize_cross_equi_joins(&normalized_plan).await?;
 	let decision_provenance = decision_provenance_for_outer_join_demotions(&outer_join_demotions);
 	if let Some(render_trace) = render_trace.as_mut() {
 		render_trace
