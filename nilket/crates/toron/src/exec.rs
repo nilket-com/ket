@@ -268,6 +268,22 @@ impl Executor {
 		Ok(output)
 	}
 
+	fn filter_batch_with_bound_predicate(
+		&self,
+		predicate: &BoundExprProgram,
+		batch: RecordBatch,
+		context: &'static str,
+	) -> Result<RecordBatch, ExecutionError> {
+		let mask = self.evaluate_bound_single_root(predicate, &batch, context)?;
+		let mask_bool = mask
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: format!("{context} must return boolean"),
+			})?;
+		Ok(filter_record_batch(&batch, mask_bool)?)
+	}
+
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
@@ -877,10 +893,22 @@ impl Executor {
 					aggr_expr,
 					output_schema,
 				} => {
-					let input_batches = self.execute_bound(input, morsel).await?;
 					if group_expr.is_empty_roots() {
+						if let Some(output) = self
+							.try_streaming_collapsing_global_aggregate(
+								input,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
+						let input_batches = self.execute_bound(input, morsel).await?;
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
+						let input_batches = self.execute_bound(input, morsel).await?;
 						self.bound_grouped_aggregate(
 							&input_batches,
 							group_expr,
@@ -1496,82 +1524,80 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let mut results_cols = Vec::new();
-		for call in aggr_expr {
+		let mut state = init_global_aggregate_state(aggr_expr)?;
+		for batch in input_batches {
+			self.fold_global_aggregate_state(&mut state, aggr_expr, batch)?;
+		}
+		finalize_global_aggregate_state(&state, aggr_expr, output_schema)
+	}
+
+	fn fold_global_aggregate_state(
+		&self,
+		state: &mut [AggState],
+		aggr_expr: &[BoundAggregateCall],
+		batch: &RecordBatch,
+	) -> Result<(), ExecutionError> {
+		for (state, call) in state.iter_mut().zip(aggr_expr.iter()) {
 			match call.function {
 				AggregateFunction::CountAll => {
-					let total = input_batches
-						.iter()
-						.map(|batch| batch.num_rows() as i64)
-						.sum::<i64>();
-					results_cols.push(Arc::new(Int64Array::from(vec![total])) as ArrayRef);
+					let AggState::Count(total) = state else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "COUNT ALL reached non-COUNT accumulator".to_string(),
+						});
+					};
+					*total = total
+						.checked_add(i64::try_from(batch.num_rows()).map_err(|_| {
+							ExecutionError::Kernel {
+								message: "COUNT ALL row count exceeds Int64".to_string(),
+							}
+						})?)
+						.ok_or_else(|| ExecutionError::Kernel {
+							message: "COUNT ALL overflow".to_string(),
+						})?;
 				}
 				AggregateFunction::Count => {
-					let mut total = 0i64;
-					for batch in input_batches {
-						let arr =
-							self.evaluate_bound_single_root(&call.args, batch, "COUNT arg")?;
-						for row in 0..batch.num_rows() {
-							if !arr.is_null(row) {
-								total += 1;
-							}
+					let arr = self.evaluate_bound_single_root(&call.args, batch, "COUNT arg")?;
+					let AggState::Count(total) = state else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "COUNT reached non-COUNT accumulator".to_string(),
+						});
+					};
+					for row in 0..batch.num_rows() {
+						if !arr.is_null(row) {
+							*total =
+								total.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+									message: "COUNT overflow".to_string(),
+								})?;
 						}
 					}
-					results_cols.push(Arc::new(Int64Array::from(vec![total])) as ArrayRef);
 				}
 				AggregateFunction::Sum => {
-					let mut state = sum_state_for_data_type(first_arg_type(call)?);
-					for batch in input_batches {
-						let arr = self.evaluate_bound_single_root(&call.args, batch, "SUM arg")?;
-						for row in 0..batch.num_rows() {
-							if let Some(value) = numeric_value(&arr, row)? {
-								add_sum_value(&mut state, value)?;
-							}
+					let arr = self.evaluate_bound_single_root(&call.args, batch, "SUM arg")?;
+					for row in 0..batch.num_rows() {
+						if let Some(value) = numeric_value(&arr, row)? {
+							add_sum_value(state, value)?;
 						}
 					}
-					let output_type = output_schema.field(results_cols.len()).data_type().clone();
-					results_cols.push(sum_state_array(&state, &output_type)?);
 				}
 				AggregateFunction::Avg => {
-					let mut state = avg_state_for_data_type(first_arg_type(call)?)?;
-					for batch in input_batches {
-						let arr = self.evaluate_bound_single_root(&call.args, batch, "AVG arg")?;
-						for row in 0..batch.num_rows() {
-							if let Some(value) = numeric_value(&arr, row)? {
-								add_avg_value(&mut state, value)?;
-							}
+					let arr = self.evaluate_bound_single_root(&call.args, batch, "AVG arg")?;
+					for row in 0..batch.num_rows() {
+						if let Some(value) = numeric_value(&arr, row)? {
+							add_avg_value(state, value)?;
 						}
 					}
-					results_cols.push(avg_state_array(
-						&state,
-						output_schema.field(results_cols.len()).data_type(),
-					)?);
 				}
 				AggregateFunction::Min => {
-					let mut state = min_state_for_data_type(first_arg_type(call)?)?;
-					for batch in input_batches {
-						let arr = self.evaluate_bound_single_root(&call.args, batch, "MIN arg")?;
-						for row in 0..batch.num_rows() {
-							update_min_state(&mut state, &arr, row)?;
-						}
+					let arr = self.evaluate_bound_single_root(&call.args, batch, "MIN arg")?;
+					for row in 0..batch.num_rows() {
+						update_min_state(state, &arr, row)?;
 					}
-					results_cols.push(min_max_state_array(
-						&state,
-						output_schema.field(results_cols.len()).data_type(),
-					)?);
 				}
 				AggregateFunction::Max => {
-					let mut state = max_state_for_data_type(first_arg_type(call)?)?;
-					for batch in input_batches {
-						let arr = self.evaluate_bound_single_root(&call.args, batch, "MAX arg")?;
-						for row in 0..batch.num_rows() {
-							update_max_state(&mut state, &arr, row)?;
-						}
+					let arr = self.evaluate_bound_single_root(&call.args, batch, "MAX arg")?;
+					for row in 0..batch.num_rows() {
+						update_max_state(state, &arr, row)?;
 					}
-					results_cols.push(min_max_state_array(
-						&state,
-						output_schema.field(results_cols.len()).data_type(),
-					)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -1580,11 +1606,155 @@ impl Executor {
 				}
 			}
 		}
+		Ok(())
+	}
+}
 
-		Ok(vec![RecordBatch::try_new(
-			output_schema.clone(),
-			results_cols,
-		)?])
+fn init_global_aggregate_state(
+	aggr_expr: &[BoundAggregateCall],
+) -> Result<Vec<AggState>, ExecutionError> {
+	init_bound_states(aggr_expr)
+}
+
+fn finalize_global_aggregate_state(
+	state: &[AggState],
+	aggr_expr: &[BoundAggregateCall],
+	output_schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let mut results_cols = Vec::new();
+	for (state, call) in state.iter().zip(aggr_expr.iter()) {
+		match call.function {
+			AggregateFunction::CountAll => {
+				let AggState::Count(total) = state else {
+					return Err(ExecutionError::InvalidExpression {
+						message: "COUNT ALL reached non-COUNT accumulator".to_string(),
+					});
+				};
+				results_cols.push(Arc::new(Int64Array::from(vec![*total])) as ArrayRef);
+			}
+			AggregateFunction::Count => {
+				let AggState::Count(total) = state else {
+					return Err(ExecutionError::InvalidExpression {
+						message: "COUNT reached non-COUNT accumulator".to_string(),
+					});
+				};
+				results_cols.push(Arc::new(Int64Array::from(vec![*total])) as ArrayRef);
+			}
+			AggregateFunction::Sum => {
+				let output_type = output_schema.field(results_cols.len()).data_type().clone();
+				results_cols.push(sum_state_array(&state, &output_type)?);
+			}
+			AggregateFunction::Avg => {
+				results_cols.push(avg_state_array(
+					&state,
+					output_schema.field(results_cols.len()).data_type(),
+				)?);
+			}
+			AggregateFunction::Min => {
+				results_cols.push(min_max_state_array(
+					&state,
+					output_schema.field(results_cols.len()).data_type(),
+				)?);
+			}
+			AggregateFunction::Max => {
+				results_cols.push(min_max_state_array(
+					&state,
+					output_schema.field(results_cols.len()).data_type(),
+				)?);
+			}
+			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				return Err(ExecutionError::NotImplemented {
+					feature: "bound experimental aggregate execution",
+				});
+			}
+		}
+	}
+
+	Ok(vec![RecordBatch::try_new(
+		output_schema.clone(),
+		results_cols,
+	)?])
+}
+
+impl Executor {
+	async fn try_streaming_collapsing_global_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let (join, filter_predicate) = match input {
+			ExecutionPlan::Join {
+				kind: JoinKind::Inner,
+				..
+			} => (input, None),
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition,
+			} => {
+				let ExecutionPlan::Join {
+					kind: JoinKind::Inner,
+					..
+				} = input.as_ref()
+				else {
+					return Ok(None);
+				};
+				let filter_predicate = match disposition {
+					FilterDisposition::FullyPushed => None,
+					FilterDisposition::EvaluateInToron => Some(predicate),
+				};
+				(input.as_ref(), filter_predicate)
+			}
+			_ => return Ok(None),
+		};
+
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema: join_output_schema,
+			..
+		} = join
+		else {
+			return Ok(None);
+		};
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let right_batches = self.execute_bound(right, morsel).await?;
+		let mut state = init_global_aggregate_state(aggr_expr)?;
+		execute_hash_join_into_global_aggregate(
+			self,
+			left.schema(),
+			right.schema(),
+			&left_batches,
+			&right_batches,
+			*kind,
+			left_keys,
+			right_keys,
+			match_filter.as_ref(),
+			*null_safe_keys,
+			*replay_id,
+			*strategy,
+			join_output_schema,
+			filter_predicate,
+			aggr_expr,
+			&mut state,
+			self.context.task_budget,
+			self.context.task_telemetry.clone(),
+			self.context.join_runtime_observation_mode.clone(),
+			self.context.join_spill_file_ops.clone(),
+			self.context.join_spill_dir.clone(),
+		)
+		.await?;
+		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
 	}
 
 	#[cfg(test)]
@@ -3118,6 +3288,197 @@ async fn execute_hash_join(
 	Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_hash_join_into_global_aggregate(
+	executor: &Executor,
+	left_schema: arrow::datatypes::SchemaRef,
+	right_schema: arrow::datatypes::SchemaRef,
+	left_batches: &[RecordBatch],
+	right_batches: &[RecordBatch],
+	kind: JoinKind,
+	left_keys: &[crate::ir::ColumnOrdinal],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: Option<&BoundExprProgram>,
+	aggr_expr: &[BoundAggregateCall],
+	aggregate_state: &mut [AggState],
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	join_runtime_observation_mode: JoinRuntimeObservationMode,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+) -> Result<(), ExecutionError> {
+	if left_keys.len() != right_keys.len() {
+		return Err(ExecutionError::InvalidExpression {
+			message: "join key arity mismatch".to_string(),
+		});
+	}
+	if kind != JoinKind::Inner {
+		return Err(ExecutionError::InvalidExpression {
+			message: "streaming collapsing aggregate supports only inner joins".to_string(),
+		});
+	}
+
+	let left_batch = concat_or_empty(left_schema, left_batches)?;
+	let right_batch = concat_or_empty(right_schema, right_batches)?;
+	let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+	let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+	record_task_telemetry(&telemetry, |task| {
+		task.counters.build_rows = task
+			.counters
+			.build_rows
+			.saturating_add(left_batch.num_rows() as u64);
+		task.counters.probe_rows = task
+			.counters
+			.probe_rows
+			.saturating_add(right_batch.num_rows() as u64);
+	});
+
+	if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+		> task_budget.memory.get()
+	{
+		let result = execute_spilled_hash_join_into_global_aggregate(
+			executor,
+			kind,
+			&left_batch,
+			&right_batch,
+			&left_key_arrays,
+			&right_key_arrays,
+			join_output_schema,
+			filter_predicate,
+			aggr_expr,
+			aggregate_state,
+			match_filter,
+			null_safe_keys,
+			task_budget,
+			telemetry.clone(),
+			spill_file_ops,
+			spill_dir,
+		)
+		.await;
+		if let Ok(output_rows) = &result {
+			record_join_runtime_observation(
+				&telemetry,
+				&join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id,
+					strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(*output_rows),
+				},
+			);
+		}
+		return result.map(|_| ());
+	}
+
+	let join_key_plan =
+		JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, null_safe_keys);
+
+	let build_started = Instant::now();
+	let Some(build_rows) = build_in_memory_join_rows(
+		join_key_plan,
+		&left_key_arrays,
+		left_batch.num_rows(),
+		task_budget.memory.get(),
+		null_safe_keys,
+	)?
+	else {
+		let result = execute_spilled_hash_join_into_global_aggregate(
+			executor,
+			kind,
+			&left_batch,
+			&right_batch,
+			&left_key_arrays,
+			&right_key_arrays,
+			join_output_schema,
+			filter_predicate,
+			aggr_expr,
+			aggregate_state,
+			match_filter,
+			null_safe_keys,
+			task_budget,
+			telemetry.clone(),
+			spill_file_ops,
+			spill_dir,
+		)
+		.await;
+		if let Ok(output_rows) = &result {
+			record_join_runtime_observation(
+				&telemetry,
+				&join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id,
+					strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(*output_rows),
+				},
+			);
+		}
+		return result.map(|_| ());
+	};
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.build_micros = task
+			.phases
+			.build_micros
+			.saturating_add(duration_micros(build_started));
+	});
+
+	let probe_started = Instant::now();
+	let selection = probe_in_memory_join_rows(
+		kind,
+		join_key_plan,
+		&build_rows,
+		left_batch.num_rows(),
+		&right_key_arrays,
+		right_batch.num_rows(),
+		match_filter,
+		&left_batch,
+		&right_batch,
+		null_safe_keys,
+	)?;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.probe_micros = task
+			.phases
+			.probe_micros
+			.saturating_add(duration_micros(probe_started));
+		task.counters.matched_rows = task
+			.counters
+			.matched_rows
+			.saturating_add(selection.len() as u64);
+	});
+
+	fold_join_selection_chunks_into_global_aggregate(
+		executor,
+		kind,
+		&left_batch,
+		&right_batch,
+		&selection,
+		join_output_schema,
+		filter_predicate,
+		aggr_expr,
+		aggregate_state,
+		task_budget.memory.get(),
+	)?;
+	record_join_runtime_observation(
+		&telemetry,
+		&join_runtime_observation_mode,
+		JoinRuntimeObservation {
+			replay_id,
+			strategy,
+			build_rows: RowCount::new(left_batch.num_rows() as u64),
+			probe_rows: RowCount::new(right_batch.num_rows() as u64),
+			output_rows: RowCount::new(selection.len() as u64),
+		},
+	);
+	Ok(())
+}
+
 /// Maximum output rows accumulated before a CROSS-join batch is flushed — bounds the match-all
 /// selection allocation so a large cartesian streams out in chunks (ADR 239 D5).
 const CROSS_JOIN_OUTPUT_CHUNK_ROWS: usize = 8192;
@@ -4010,6 +4371,126 @@ async fn execute_spilled_hash_join(
 	result
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_spilled_hash_join_into_global_aggregate(
+	executor: &Executor,
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	left_key_arrays: &[ArrayRef],
+	right_key_arrays: &[ArrayRef],
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: Option<&BoundExprProgram>,
+	aggr_expr: &[BoundAggregateCall],
+	aggregate_state: &mut [AggState],
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+) -> Result<u64, ExecutionError> {
+	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+	let build_started = Instant::now();
+	for row in 0..left_batch.num_rows() {
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(left_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+				continue;
+			};
+			key
+		};
+		build_rows
+			.entry(key)
+			.or_default()
+			.push(u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+				message: "join build row index exceeds UInt32 take index".to_string(),
+			})?);
+	}
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.build_micros = task
+			.phases
+			.build_micros
+			.saturating_add(duration_micros(build_started));
+	});
+	if build_rows.is_empty() {
+		let mut selection = Vec::new();
+		for row in 0..right_batch.num_rows() {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
+		}
+		append_build_side_after_probe_rows(
+			kind,
+			left_batch.num_rows(),
+			build_match_bitmap(kind, left_batch.num_rows()).as_deref(),
+			&mut selection,
+		)?;
+		let output_rows = selection.len() as u64;
+		fold_join_selection_chunks_into_global_aggregate(
+			executor,
+			kind,
+			left_batch,
+			right_batch,
+			&selection,
+			join_output_schema,
+			filter_predicate,
+			aggr_expr,
+			aggregate_state,
+			task_budget.memory.get(),
+		)?;
+		return Ok(output_rows);
+	}
+
+	guard_spill_retained_entry_memory(
+		left_batch,
+		right_batch,
+		&build_rows,
+		task_budget.memory.get(),
+	)?;
+
+	let spill_started = Instant::now();
+	let mut spilled =
+		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.spill_micros = task
+			.phases
+			.spill_micros
+			.saturating_add(duration_micros(spill_started));
+		task.counters.spill_bytes = task
+			.counters
+			.spill_bytes
+			.saturating_add(spilled.spill_bytes());
+	});
+	let probe_started = Instant::now();
+	let result = probe_spilled_hash_join_into_global_aggregate(
+		executor,
+		kind,
+		&mut spilled,
+		right_batch,
+		right_key_arrays,
+		left_batch,
+		join_output_schema,
+		filter_predicate,
+		aggr_expr,
+		aggregate_state,
+		match_filter,
+		null_safe_keys,
+		task_budget.memory.get(),
+	)
+	.await;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.probe_micros = task
+			.phases
+			.probe_micros
+			.saturating_add(duration_micros(probe_started));
+		if let Ok(output_rows) = &result {
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
+		}
+	});
+	spilled.cleanup().await;
+	result
+}
+
 async fn probe_spilled_hash_join(
 	kind: JoinKind,
 	spilled: &mut SpilledJoinBuild,
@@ -4062,6 +4543,103 @@ async fn probe_spilled_hash_join(
 		output_schema,
 		memory_cap,
 	)?])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_spilled_hash_join_into_global_aggregate(
+	executor: &Executor,
+	kind: JoinKind,
+	spilled: &mut SpilledJoinBuild,
+	right_batch: &RecordBatch,
+	right_key_arrays: &[ArrayRef],
+	left_batch: &RecordBatch,
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: Option<&BoundExprProgram>,
+	aggr_expr: &[BoundAggregateCall],
+	aggregate_state: &mut [AggState],
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	memory_cap: u64,
+) -> Result<u64, ExecutionError> {
+	let mut selection = Vec::new();
+	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
+	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
+	for row in 0..right_batch.num_rows() {
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(right_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+				append_unmatched_probe_row(kind, row, &mut selection)?;
+				continue;
+			};
+			key
+		};
+		let matches = spilled.lookup(&key).await?;
+		let matched = append_join_matches_for_kind(
+			kind,
+			row,
+			matches.into_iter(),
+			matched_build_rows.as_deref_mut(),
+			&mut selection,
+			&mut residual,
+		)?;
+		if !matched {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
+		}
+	}
+	append_build_side_after_probe_rows(
+		kind,
+		left_batch.num_rows(),
+		matched_build_rows.as_deref(),
+		&mut selection,
+	)?;
+
+	let output_rows = selection.len() as u64;
+	fold_join_selection_chunks_into_global_aggregate(
+		executor,
+		kind,
+		left_batch,
+		right_batch,
+		&selection,
+		join_output_schema,
+		filter_predicate,
+		aggr_expr,
+		aggregate_state,
+		memory_cap,
+	)?;
+	Ok(output_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_join_selection_chunks_into_global_aggregate(
+	executor: &Executor,
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	selection: &[JoinOutputRow],
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: Option<&BoundExprProgram>,
+	aggr_expr: &[BoundAggregateCall],
+	aggregate_state: &mut [AggState],
+	memory_cap: u64,
+) -> Result<(), ExecutionError> {
+	for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+		let batch = materialize_join_selection(
+			kind,
+			left_batch,
+			right_batch,
+			chunk,
+			join_output_schema,
+			memory_cap,
+		)?;
+		let batch = if let Some(predicate) = filter_predicate {
+			executor.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+		} else {
+			batch
+		};
+		executor.fold_global_aggregate_state(aggregate_state, aggr_expr, &batch)?;
+	}
+	Ok(())
 }
 
 fn concat_or_empty(
@@ -8768,7 +9346,10 @@ mod tests {
 	use crate::catalog::{MockCatalog, TableRef};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 	use crate::error::StorageError;
-	use crate::ir::{ColumnOrdinal, QueryId, QueryProfileHint, SessionId, TableId};
+	use crate::ir::{
+		BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, QueryId,
+		QueryProfileHint, ResolvedColumn, SessionId, TableId,
+	};
 	use crate::storage::InMemoryStorageScan;
 	use crate::storage::ScanStream;
 	use crate::storage::{HlcBound, TenantId};
@@ -9720,6 +10301,167 @@ mod tests {
 		));
 	}
 
+	#[tokio::test]
+	async fn streaming_collapsing_aggregate_matches_materialized_float64_and_decimal_order() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
+
+		let (executor, plan, join, filter, aggr_expr, output_schema) =
+			streaming_aggregate_fixture(StreamingValueKind::Float64, rows, 0, high_test_budget());
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streaming float aggregate");
+		let materialized = materialized_join_filter_aggregate(
+			&executor,
+			&join,
+			&filter,
+			&aggr_expr,
+			&output_schema,
+		)
+		.await
+		.expect("materialized float aggregate");
+		let streamed_float = streamed[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("float sum")
+			.value(0);
+		let materialized_float = materialized[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("materialized float sum")
+			.value(0);
+		assert_eq!(
+			streamed_float.to_bits(),
+			materialized_float.to_bits(),
+			"chunking must preserve Float64 fold order exactly"
+		);
+
+		let (executor, plan, join, filter, aggr_expr, output_schema) =
+			streaming_aggregate_fixture(StreamingValueKind::Decimal, rows, 0, high_test_budget());
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streaming decimal aggregate");
+		let materialized = materialized_join_filter_aggregate(
+			&executor,
+			&join,
+			&filter,
+			&aggr_expr,
+			&output_schema,
+		)
+		.await
+		.expect("materialized decimal aggregate");
+		let streamed_decimal = streamed[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("decimal sum");
+		let materialized_decimal = materialized[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("materialized decimal sum");
+		assert_eq!(streamed_decimal.value(0), materialized_decimal.value(0));
+		assert_eq!(
+			streamed_decimal.data_type(),
+			materialized_decimal.data_type()
+		);
+	}
+
+	#[tokio::test]
+	async fn streaming_collapsing_aggregate_covers_spilled_join_route() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 1_024;
+		let spill_budget = TaskBudget {
+			memory: ByteCount::new(960 * 1024),
+			spill_bytes: ByteCount::new(16 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let context = ExecutionContext::local_test()
+			.with_task_budget(spill_budget)
+			.with_task_telemetry(telemetry.clone());
+		let (executor, plan, _join, filter, aggr_expr, output_schema) =
+			streaming_aggregate_fixture_with_context(StreamingValueKind::Float64, rows, 0, context);
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streaming aggregate should cover spilled hash join");
+
+		let (baseline_executor, _, baseline_join, baseline_filter, baseline_aggr, baseline_schema) =
+			streaming_aggregate_fixture(StreamingValueKind::Float64, rows, 0, high_test_budget());
+		let materialized = materialized_join_filter_aggregate(
+			&baseline_executor,
+			&baseline_join,
+			&baseline_filter,
+			&baseline_aggr,
+			&baseline_schema,
+		)
+		.await
+		.expect("materialized baseline");
+		let streamed_value = streamed[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("streamed sum")
+			.value(0);
+		let baseline_value = materialized[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("baseline sum")
+			.value(0);
+
+		assert_eq!(streamed_value.to_bits(), baseline_value.to_bits());
+		assert!(telemetry.lock().unwrap().counters.spill_bytes > 0);
+		assert_eq!(filter.roots.len(), 1);
+		assert_eq!(aggr_expr.len(), 1);
+		assert_eq!(output_schema.fields().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn streaming_collapsing_aggregate_shape_fence_keeps_grouped_path_materialized() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 12_000;
+		let low_budget = TaskBudget {
+			memory: ByteCount::new(1024 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (_, aggregate, ..) =
+			streaming_aggregate_fixture(StreamingValueKind::Float64, rows, 1024, low_budget);
+		let ExecutionPlan::Aggregate {
+			input,
+			aggr_expr,
+			output_schema,
+			..
+		} = aggregate
+		else {
+			panic!("aggregate fixture");
+		};
+		let grouped = ExecutionPlan::Aggregate {
+			input,
+			group_expr: bound_column_root("keep", ColumnOrdinal(4), DataType::Int64, false),
+			aggr_expr,
+			output_schema,
+		};
+		let (executor, _, ..) =
+			streaming_aggregate_fixture(StreamingValueKind::Float64, rows, 1024, low_budget);
+
+		let err = executor
+			.execute_bound(&grouped, None)
+			.await
+			.expect_err("grouped aggregate is outside the streaming shape fence");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
 	#[test]
 	fn spill_retained_footprint_budget_guard_fires_before_write() {
 		let (left_batch, right_batch) = spill_retained_guard_fixture();
@@ -10440,6 +11182,204 @@ mod tests {
 			])),
 		};
 		(executor, plan)
+	}
+
+	#[derive(Clone, Copy)]
+	enum StreamingValueKind {
+		Float64,
+		Decimal,
+	}
+
+	fn high_test_budget() -> TaskBudget {
+		TaskBudget {
+			memory: ByteCount::new(128 * 1024 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		}
+	}
+
+	fn streaming_aggregate_fixture(
+		kind: StreamingValueKind,
+		rows: usize,
+		blob_len: usize,
+		budget: TaskBudget,
+	) -> (
+		Executor,
+		ExecutionPlan,
+		ExecutionPlan,
+		BoundExprProgram,
+		Vec<BoundAggregateCall>,
+		SchemaRef,
+	) {
+		streaming_aggregate_fixture_with_context(
+			kind,
+			rows,
+			blob_len,
+			ExecutionContext::local_test().with_task_budget(budget),
+		)
+	}
+
+	fn streaming_aggregate_fixture_with_context(
+		kind: StreamingValueKind,
+		rows: usize,
+		blob_len: usize,
+		context: ExecutionContext,
+	) -> (
+		Executor,
+		ExecutionPlan,
+		ExecutionPlan,
+		BoundExprProgram,
+		Vec<BoundAggregateCall>,
+		SchemaRef,
+	) {
+		let amount_type = match kind {
+			StreamingValueKind::Float64 => DataType::Float64,
+			StreamingValueKind::Decimal => DataType::Decimal128(20, 2),
+		};
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("amount", amount_type.clone(), true),
+			Field::new("blob", DataType::Utf8, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("keep", DataType::Int64, false),
+		]));
+		let keys = (0..i64::try_from(rows).expect("rows fit i64")).collect::<Vec<_>>();
+		let amount: ArrayRef = match kind {
+			StreamingValueKind::Float64 => Arc::new(Float64Array::from(
+				(0..rows)
+					.map(|row| match row % 3 {
+						0 => Some(1.0e16),
+						1 => Some(1.0),
+						_ => Some(-1.0e16),
+					})
+					.collect::<Vec<_>>(),
+			)),
+			StreamingValueKind::Decimal => Arc::new(
+				Decimal128Array::from(
+					(0..rows)
+						.map(|row| Some(((row % 17) as i128 + 1) * 100))
+						.collect::<Vec<_>>(),
+				)
+				.with_precision_and_scale(20, 2)
+				.expect("decimal amount"),
+			),
+		};
+		let blob = "x".repeat(blob_len);
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(keys.clone())),
+				amount,
+				Arc::new(StringArray::from(vec![blob.as_str(); rows])),
+			],
+		)
+		.expect("left streaming batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(keys)),
+				Arc::new(Int64Array::from(vec![1; rows])),
+			],
+		)
+		.expect("right streaming batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_batch),
+				(TableId(2), right_batch),
+			]),
+		});
+		let executor = Executor::with_context(storage, context);
+		let join_output_schema = Arc::new(Schema::new(
+			left_schema
+				.fields()
+				.iter()
+				.chain(right_schema.fields().iter())
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>(),
+		));
+		let join = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: join_output_schema,
+		};
+		let filter = keep_filter_program(ColumnOrdinal(4));
+		let aggregate_type = amount_type;
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: bound_column_root("amount", ColumnOrdinal(1), aggregate_type.clone(), true),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![Field::new(
+			"sum_amount",
+			aggregate_type,
+			true,
+		)]));
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(ExecutionPlan::Filter {
+				input: Box::new(join.clone()),
+				predicate: filter.clone(),
+				disposition: FilterDisposition::EvaluateInToron,
+			}),
+			group_expr: BoundExprProgramBuilder::new().build(),
+			aggr_expr: aggr_expr.clone(),
+			output_schema: output_schema.clone(),
+		};
+		(executor, plan, join, filter, aggr_expr, output_schema)
+	}
+
+	fn bound_column_root(
+		name: &str,
+		ordinal: ColumnOrdinal,
+		data_type: DataType,
+		nullable: bool,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let column = builder.append_column(ResolvedColumn {
+			name: ColumnName(name.to_string()),
+			ordinal,
+			data_type,
+			nullable,
+			pbc_eligible: false,
+		});
+		builder.push_root(column);
+		builder.build()
+	}
+
+	fn keep_filter_program(ordinal: ColumnOrdinal) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let keep = builder.append_column(ResolvedColumn {
+			name: ColumnName("keep".to_string()),
+			ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let zero = builder.append_literal(ScalarValue::Int64(Some(0)));
+		let predicate = builder.append_binary(BoundBinaryOp::Gt, keep, zero, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	async fn materialized_join_filter_aggregate(
+		executor: &Executor,
+		join: &ExecutionPlan,
+		filter: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &SchemaRef,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let joined = executor.execute_bound(join, None).await?;
+		let filtered =
+			executor.filter_batches_with_bound_predicate(filter, joined, "filter predicate")?;
+		executor.bound_global_aggregate(&filtered, aggr_expr, output_schema)
 	}
 
 	fn materialization_guard_fixture() -> (RecordBatch, RecordBatch, SchemaRef) {
