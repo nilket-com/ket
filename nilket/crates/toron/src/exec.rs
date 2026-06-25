@@ -65,6 +65,9 @@ const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 /// ADR 335: the raw 64 MiB task cap false-trips accepted sf=1 controls; the output guard
 /// targets the GiB-scale materializations that cgroup-kill before the engine can report a row.
 const JOIN_OUTPUT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER: u64 = 16;
+/// ADR 336: Phase 0 measured q05 as the largest green spill-completer at 440,765,522
+/// retained bytes and q18 at 1,423,571,737; 16x the default task memory cap sits in that gap.
+const JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER: u64 = 16;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// ADR 255: the safety cap on recursive-CTE fixpoint iterations. Termination is normally delta-empty
@@ -3957,6 +3960,13 @@ async fn execute_spilled_hash_join(
 		)?]);
 	}
 
+	guard_spill_retained_entry_memory(
+		left_batch,
+		right_batch,
+		&build_rows,
+		task_budget.memory.get(),
+	)?;
+
 	let spill_started = Instant::now();
 	let mut spilled =
 		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
@@ -5357,6 +5367,58 @@ fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
 		})
 		.sum::<usize>();
 	u64::try_from(rows.saturating_mul(112 + key_width)).unwrap_or(u64::MAX)
+}
+
+fn estimate_spill_retained_entry_bytes(
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	build_rows: &HashMap<Vec<u8>, Vec<u32>>,
+) -> u64 {
+	record_batch_memory_bytes(left_batch)
+		.saturating_add(record_batch_memory_bytes(right_batch))
+		.saturating_add(estimate_spill_build_map_bytes(build_rows))
+}
+
+fn guard_spill_retained_entry_memory(
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	build_rows: &HashMap<Vec<u8>, Vec<u32>>,
+	memory_cap: u64,
+) -> Result<(), ExecutionError> {
+	let retained_bytes = estimate_spill_retained_entry_bytes(left_batch, right_batch, build_rows);
+	let retained_cap = join_spill_retained_footprint_memory_cap(memory_cap);
+	if retained_bytes > retained_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			retained_bytes,
+			retained_cap,
+		));
+	}
+	Ok(())
+}
+
+fn join_spill_retained_footprint_memory_cap(memory_cap: u64) -> u64 {
+	memory_cap.saturating_mul(JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER)
+}
+
+fn record_batch_memory_bytes(batch: &RecordBatch) -> u64 {
+	u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
+}
+
+fn estimate_spill_build_map_bytes(build_rows: &HashMap<Vec<u8>, Vec<u32>>) -> u64 {
+	let bucket_bytes = build_rows
+		.capacity()
+		.saturating_mul(std::mem::size_of::<(Vec<u8>, Vec<u32>)>().saturating_add(16));
+	build_rows
+		.iter()
+		.map(|(key, rows)| {
+			key.capacity()
+				.saturating_add(rows.capacity().saturating_mul(std::mem::size_of::<u32>()))
+		})
+		.fold(
+			u64::try_from(bucket_bytes).unwrap_or(u64::MAX),
+			|total, bytes| total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX)),
+		)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9659,6 +9721,111 @@ mod tests {
 	}
 
 	#[test]
+	fn spill_retained_footprint_budget_guard_fires_before_write() {
+		let (left_batch, right_batch) = spill_retained_guard_fixture();
+		let mut build_rows = std::collections::HashMap::new();
+		build_rows.insert(vec![1, 2, 3, 4], vec![0, 1, 2, 3]);
+
+		let err = guard_spill_retained_entry_memory(&left_batch, &right_batch, &build_rows, 1)
+			.expect_err("over-budget spill retained footprint must fail before write");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn spill_retained_footprint_budget_guard_allows_fitting_entry() {
+		let (left_batch, right_batch) = spill_retained_guard_fixture();
+		let mut build_rows = std::collections::HashMap::new();
+		build_rows.insert(vec![1, 2, 3, 4], vec![0, 1]);
+
+		guard_spill_retained_entry_memory(&left_batch, &right_batch, &build_rows, 1024 * 1024)
+			.expect("fitting spill retained footprint");
+	}
+
+	#[test]
+	fn spill_retained_footprint_counts_build_map_term() {
+		let (left_batch, right_batch) = spill_retained_guard_fixture();
+		let mut build_rows = std::collections::HashMap::with_capacity(2_048);
+		for key in 0..64u32 {
+			build_rows.insert(key.to_le_bytes().to_vec(), vec![0; 16]);
+		}
+		let retained_cap = join_spill_retained_footprint_memory_cap(8 * 1024);
+		let retained_inputs = record_batch_memory_bytes(&left_batch)
+			.saturating_add(record_batch_memory_bytes(&right_batch));
+
+		assert!(retained_inputs <= retained_cap);
+		assert!(
+			estimate_spill_retained_entry_bytes(&left_batch, &right_batch, &build_rows)
+				> retained_cap
+		);
+		let err =
+			guard_spill_retained_entry_memory(&left_batch, &right_batch, &build_rows, 8 * 1024)
+				.expect_err("build map term must count against retained spill footprint");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn spill_retained_footprint_counts_both_input_batches() {
+		let left_schema = Arc::new(Schema::new(vec![Field::new(
+			"left_id",
+			DataType::Int64,
+			false,
+		)]));
+		let right_schema = Arc::new(Schema::new(vec![Field::new(
+			"right_blob",
+			DataType::Utf8,
+			true,
+		)]));
+		let left_batch =
+			RecordBatch::try_new(left_schema, vec![Arc::new(Int64Array::from(vec![1]))])
+				.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema,
+			vec![Arc::new(StringArray::from(vec![Some(
+				"x".repeat(80 * 1024),
+			)]))],
+		)
+		.expect("right batch");
+		let mut build_rows = std::collections::HashMap::new();
+		build_rows.insert(vec![1], vec![0]);
+		let retained_cap = join_spill_retained_footprint_memory_cap(4 * 1024);
+		let left_plus_map = record_batch_memory_bytes(&left_batch)
+			.saturating_add(estimate_spill_build_map_bytes(&build_rows));
+
+		assert!(left_plus_map <= retained_cap);
+		assert!(
+			estimate_spill_retained_entry_bytes(&left_batch, &right_batch, &build_rows)
+				> retained_cap
+		);
+		let err =
+			guard_spill_retained_entry_memory(&left_batch, &right_batch, &build_rows, 4 * 1024)
+				.expect_err(
+					"right input batch is retained even when output would preserve only one side",
+				);
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[test]
 	fn join_materialization_budget_guard_fires_before_take() {
 		let (left_batch, right_batch, output_schema) = materialization_guard_fixture();
 		let selection = vec![
@@ -10307,6 +10474,26 @@ mod tests {
 			Field::new("right_value", DataType::Int64, false),
 		]));
 		(left_batch, right_batch, output_schema)
+	}
+
+	fn spill_retained_guard_fixture() -> (RecordBatch, RecordBatch) {
+		let left_schema = Arc::new(Schema::new(vec![Field::new(
+			"left_id",
+			DataType::Int64,
+			false,
+		)]));
+		let right_schema = Arc::new(Schema::new(vec![Field::new(
+			"right_id",
+			DataType::Int64,
+			false,
+		)]));
+		let left_batch =
+			RecordBatch::try_new(left_schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])
+				.expect("left batch");
+		let right_batch =
+			RecordBatch::try_new(right_schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])
+				.expect("right batch");
+		(left_batch, right_batch)
 	}
 
 	fn batch() -> RecordBatch {
