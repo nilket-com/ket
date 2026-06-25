@@ -914,6 +914,18 @@ impl Executor {
 						let input_batches = self.execute_bound(input, morsel).await?;
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
+						if let Some(output) = self
+							.try_streaming_reoriented_inner_chain_grouped_aggregate(
+								input,
+								group_expr,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
 						let input_batches = self.execute_bound(input, morsel).await?;
 						self.bound_grouped_aggregate(
 							&input_batches,
@@ -1688,6 +1700,77 @@ fn finalize_global_aggregate_state(
 	)?])
 }
 
+struct ReorientedInnerJoinStage<'a> {
+	replay_id: JoinReplayId,
+	probe_schema: SchemaRef,
+	probe_keys: Vec<crate::ir::ColumnOrdinal>,
+	build: &'a ExecutionPlan,
+	build_keys: Vec<crate::ir::ColumnOrdinal>,
+	output_schema: SchemaRef,
+	strategy: JoinStrategy,
+}
+
+struct ReorientedInnerJoinRuntime {
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
+	build_batch: RecordBatch,
+	build_rows: HashMap<JoinKey, BuildRowList>,
+	key_plan: JoinKeyPlan,
+	probe_keys: Vec<crate::ir::ColumnOrdinal>,
+	output_schema: SchemaRef,
+	probe_rows: u64,
+	output_rows: u64,
+}
+
+fn extract_reoriented_inner_chain(
+	top: &ExecutionPlan,
+) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
+	let mut current = top;
+	let mut stages = Vec::new();
+	for expected in (1..=4).rev() {
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+			..
+		} = current
+		else {
+			return None;
+		};
+		if *replay_id != JoinReplayId(expected) {
+			return None;
+		}
+		let ExecutionPlan::Exchange {
+			input: left_input, ..
+		} = left.as_ref()
+		else {
+			return None;
+		};
+		stages.push(ReorientedInnerJoinStage {
+			replay_id: *replay_id,
+			probe_schema: left.schema(),
+			probe_keys: left_keys.clone(),
+			build: right.as_ref(),
+			build_keys: right_keys.clone(),
+			output_schema: output_schema.clone(),
+			strategy: JoinStrategy::HashPartitioned,
+		});
+		if expected == 1 {
+			stages.reverse();
+			return Some((left.as_ref(), stages));
+		}
+		current = left_input.as_ref();
+	}
+	None
+}
+
 impl Executor {
 	async fn try_streaming_join0_filter(
 		&self,
@@ -2004,6 +2087,277 @@ impl Executor {
 		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
 	}
 
+	async fn try_streaming_reoriented_inner_chain_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: aggregate_input,
+			..
+		} = input
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Project {
+			input: project_input,
+			exprs: project_exprs,
+			output_schema: project_output_schema,
+		} = aggregate_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: filter_input,
+			predicate: outer_predicate,
+			disposition: FilterDisposition::EvaluateInToron,
+		} = project_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		let Some((base, stages)) = extract_reoriented_inner_chain(filter_input) else {
+			return Ok(None);
+		};
+
+		let mut runtimes = Vec::with_capacity(stages.len());
+		for stage in stages {
+			let Some(runtime) = self
+				.prepare_reoriented_inner_join_runtime(stage, morsel)
+				.await?
+			else {
+				return Ok(None);
+			};
+			runtimes.push(runtime);
+		}
+
+		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut group_types = Vec::new();
+		let matched = self
+			.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
+				let mut batches = vec![base_batch];
+				for runtime in runtimes.iter_mut() {
+					let mut next = Vec::new();
+					for batch in batches {
+						next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+					}
+					batches = next;
+					if batches.is_empty() {
+						break;
+					}
+				}
+
+				for batch in batches {
+					let filtered = self.filter_batch_with_bound_predicate(
+						outer_predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if filtered.num_rows() == 0 {
+						continue;
+					}
+					let projected = RecordBatch::try_new(
+						project_output_schema.clone(),
+						self.evaluate_bound_program(project_exprs, &filtered)?,
+					)?;
+					self.fold_bound_grouped_aggregate_batch(
+						&mut groups,
+						&mut group_types,
+						group_expr,
+						aggr_expr,
+						&projected,
+					)?;
+				}
+				Ok(())
+			})
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+
+		for runtime in &runtimes {
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: runtime.replay_id,
+					strategy: runtime.strategy,
+					build_rows: RowCount::new(runtime.build_batch.num_rows() as u64),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+		}
+
+		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+			.map(Some)
+	}
+
+	async fn prepare_reoriented_inner_join_runtime(
+		&self,
+		stage: ReorientedInnerJoinStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<ReorientedInnerJoinRuntime>, ExecutionError> {
+		let build_batches = self.execute_bound(stage.build, morsel).await?;
+		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
+		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
+		let build_memory_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
+			&build_key_arrays,
+			&stage.probe_schema,
+			&stage.probe_keys,
+			false,
+		)?;
+		let estimated_build_bytes =
+			estimated_build_hash_bytes(&build_key_arrays, build_batch.num_rows());
+		if estimated_build_bytes > build_memory_cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"reoriented join build accumulator",
+				estimated_build_bytes,
+				build_memory_cap,
+			));
+		}
+		let Some(build_rows) = build_in_memory_join_rows(
+			key_plan,
+			&build_key_arrays,
+			build_batch.num_rows(),
+			build_memory_cap,
+			false,
+		)?
+		else {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"reoriented join build accumulator",
+				estimated_build_bytes,
+				build_memory_cap,
+			));
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(build_batch.num_rows() as u64);
+		});
+		Ok(Some(ReorientedInnerJoinRuntime {
+			replay_id: stage.replay_id,
+			strategy: stage.strategy,
+			build_batch,
+			build_rows,
+			key_plan,
+			probe_keys: stage.probe_keys,
+			output_schema: stage.output_schema,
+			probe_rows: 0,
+			output_rows: 0,
+		}))
+	}
+
+	async fn try_visit_streaming_reoriented_inner_chain_base<F>(
+		&self,
+		base: &ExecutionPlan,
+		morsel: Option<(MorselId, u32)>,
+		mut visit_batch: F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} = base
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: filter_input,
+			predicate,
+			disposition,
+		} = input.as_ref()
+		else {
+			return Ok(None);
+		};
+
+		let matched = self
+			.try_visit_streaming_join0_filter_chunks(
+				filter_input,
+				predicate,
+				*disposition,
+				morsel,
+				|batch| {
+					for (_partition, partitioned) in
+						self.repartition_exchange_batch(&batch, *partition_count, key)?
+					{
+						if partitioned.num_rows() > 0 {
+							visit_batch(partitioned)?;
+						}
+					}
+					Ok(())
+				},
+			)
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+		Ok(Some(()))
+	}
+
+	fn probe_reoriented_inner_join(
+		&self,
+		runtime: &mut ReorientedInnerJoinRuntime,
+		probe_batch: &RecordBatch,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		if probe_batch.num_rows() == 0 {
+			return Ok(Vec::new());
+		}
+		let probe_key_arrays = key_arrays(probe_batch, &runtime.probe_keys)?;
+		runtime.probe_rows = runtime
+			.probe_rows
+			.saturating_add(probe_batch.num_rows() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(probe_batch.num_rows() as u64);
+		});
+		let mut selection = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			runtime.key_plan,
+			&runtime.build_rows,
+			runtime.build_batch.num_rows(),
+			&probe_key_arrays,
+			probe_batch.num_rows(),
+			None,
+			&runtime.build_batch,
+			probe_batch,
+			false,
+		)?;
+		runtime.output_rows = runtime.output_rows.saturating_add(selection.len() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
+		});
+		let mut output = Vec::new();
+		for chunk in selection.chunks_mut(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_reoriented_inner_selection(
+				probe_batch,
+				&runtime.build_batch,
+				chunk,
+				&runtime.output_schema,
+				self.context.task_budget.memory.get(),
+			)?;
+			if batch.num_rows() > 0 {
+				output.push(batch);
+			}
+		}
+		Ok(output)
+	}
+
 	#[cfg(test)]
 	fn cast_to_f64(&self, arr: &ArrayRef) -> Result<Float64Array, ExecutionError> {
 		if let Some(f64_arr) = arr.as_any().downcast_ref::<Float64Array>() {
@@ -2219,91 +2573,120 @@ impl Executor {
 		let mut group_types = Vec::new();
 
 		for batch in input_batches {
-			let group_arrays = self.evaluate_bound_program(group_expr, batch)?;
-			if group_types.is_empty() {
-				group_types = group_arrays
-					.iter()
-					.map(|array| array.data_type().clone())
-					.collect();
-			}
+			self.fold_bound_grouped_aggregate_batch(
+				&mut groups,
+				&mut group_types,
+				group_expr,
+				aggr_expr,
+				batch,
+			)?;
+		}
 
-			let aggr_arrays = aggr_expr
+		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+	}
+
+	fn fold_bound_grouped_aggregate_batch(
+		&self,
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		batch: &RecordBatch,
+	) -> Result<(), ExecutionError> {
+		let group_arrays = self.evaluate_bound_program(group_expr, batch)?;
+		if group_types.is_empty() {
+			*group_types = group_arrays
 				.iter()
-				.map(|call| match call.function {
-					AggregateFunction::CountAll => Ok(None),
-					AggregateFunction::Count
-					| AggregateFunction::Sum
-					| AggregateFunction::Min
-					| AggregateFunction::Max
-					| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_single_root(
-						&call.args,
-						batch,
-						"aggregate arg",
-					)?)),
-					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-						Err(ExecutionError::NotImplemented {
-							feature: "bound grouped experimental aggregate",
-						})
-					}
-				})
-				.collect::<Result<Vec<_>, _>>()?;
+				.map(|array| array.data_type().clone())
+				.collect();
+		}
 
-			for row in 0..batch.num_rows() {
-				let key = group_arrays
-					.iter()
-					.map(|array| group_value(array, row))
-					.collect::<Result<Vec<_>, _>>()?;
-				let states = match groups.entry(key) {
-					std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-					std::collections::btree_map::Entry::Vacant(entry) => {
-						entry.insert(init_bound_states(aggr_expr)?)
+		let aggr_arrays = aggr_expr
+			.iter()
+			.map(|call| match call.function {
+				AggregateFunction::CountAll => Ok(None),
+				AggregateFunction::Count
+				| AggregateFunction::Sum
+				| AggregateFunction::Min
+				| AggregateFunction::Max
+				| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_single_root(
+					&call.args,
+					batch,
+					"aggregate arg",
+				)?)),
+				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+					Err(ExecutionError::NotImplemented {
+						feature: "bound grouped experimental aggregate",
+					})
+				}
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+
+		for row in 0..batch.num_rows() {
+			let key = group_arrays
+				.iter()
+				.map(|array| group_value(array, row))
+				.collect::<Result<Vec<_>, _>>()?;
+			let states = match groups.entry(key) {
+				std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+				std::collections::btree_map::Entry::Vacant(entry) => {
+					entry.insert(init_bound_states(aggr_expr)?)
+				}
+			};
+			for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
+				match input {
+					None => {
+						if let AggState::Count(total) = state {
+							*total += 1;
+						}
 					}
-				};
-				for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
-					match input {
-						None => {
-							if let AggState::Count(total) = state {
+					Some(array) => match state {
+						AggState::Count(total) => {
+							if !array.is_null(row) {
 								*total += 1;
 							}
 						}
-						Some(array) => match state {
-							AggState::Count(total) => {
-								if !array.is_null(row) {
-									*total += 1;
-								}
+						AggState::SumInt { .. } | AggState::SumFloat { .. } => {
+							if let Some(value) = numeric_value(array, row)? {
+								add_sum_value(state, value)?;
 							}
-							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-								if let Some(value) = numeric_value(array, row)? {
-									add_sum_value(state, value)?;
-								}
+						}
+						AggState::AvgInt { .. }
+						| AggState::AvgFloat { .. }
+						| AggState::AvgDecimal { .. } => {
+							if let Some(value) = numeric_value(array, row)? {
+								add_avg_value(state, value)?;
 							}
-							AggState::AvgInt { .. }
-							| AggState::AvgFloat { .. }
-							| AggState::AvgDecimal { .. } => {
-								if let Some(value) = numeric_value(array, row)? {
-									add_avg_value(state, value)?;
-								}
-							}
-							AggState::MinInt32 { .. }
-							| AggState::MinInt64 { .. }
-							| AggState::MinFloat32 { .. }
-							| AggState::MinFloat64 { .. }
-							| AggState::MinDecimal128 { .. } => {
-								update_min_state(state, array, row)?;
-							}
-							AggState::MaxInt32 { .. }
-							| AggState::MaxInt64 { .. }
-							| AggState::MaxFloat32 { .. }
-							| AggState::MaxFloat64 { .. }
-							| AggState::MaxDecimal128 { .. } => {
-								update_max_state(state, array, row)?;
-							}
-						},
-					}
+						}
+						AggState::MinInt32 { .. }
+						| AggState::MinInt64 { .. }
+						| AggState::MinFloat32 { .. }
+						| AggState::MinFloat64 { .. }
+						| AggState::MinDecimal128 { .. } => {
+							update_min_state(state, array, row)?;
+						}
+						AggState::MaxInt32 { .. }
+						| AggState::MaxInt64 { .. }
+						| AggState::MaxFloat32 { .. }
+						| AggState::MaxFloat64 { .. }
+						| AggState::MaxDecimal128 { .. } => {
+							update_max_state(state, array, row)?;
+						}
+					},
 				}
 			}
 		}
 
+		Ok(())
+	}
+
+	fn finalize_bound_grouped_aggregate(
+		&self,
+		groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &[DataType],
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let keys = groups.keys().cloned().collect::<Vec<_>>();
 		let mut columns = Vec::new();
 		for (idx, data_type) in group_types.iter().enumerate() {
@@ -3935,6 +4318,57 @@ fn materialize_join_selection(
 	Ok(RecordBatch::try_new(output_schema.clone(), output_columns)?)
 }
 
+fn materialize_reoriented_inner_selection(
+	probe_batch: &RecordBatch,
+	build_batch: &RecordBatch,
+	selection: &[JoinOutputRow],
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if selection.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let estimated_output_bytes = estimate_join_materialization_bytes(
+		JoinKind::Inner,
+		probe_batch,
+		build_batch,
+		selection.len(),
+	);
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"reoriented join output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut probe_indices = Vec::with_capacity(selection.len());
+	let mut build_indices = Vec::with_capacity(selection.len());
+	for row in selection {
+		match *row {
+			JoinOutputRow::Paired { left, right } => {
+				build_indices.push(Some(left));
+				probe_indices.push(Some(right));
+			}
+			_ => return Err(invalid_join_selection(JoinKind::Inner, row)),
+		}
+	}
+	let probe_indices = UInt32Array::from(probe_indices);
+	let build_indices = UInt32Array::from(build_indices);
+	let mut columns = Vec::with_capacity(probe_batch.num_columns() + build_batch.num_columns());
+	for column in probe_batch.columns() {
+		columns.push(arrow::compute::take(column, &probe_indices, None)?);
+	}
+	for column in build_batch.columns() {
+		columns.push(arrow::compute::take(column, &build_indices, None)?);
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
 fn estimate_join_materialization_bytes(
 	kind: JoinKind,
 	left_batch: &RecordBatch,
@@ -4091,6 +4525,34 @@ impl JoinKeyPlan {
 			DataType::Int64 => Self::Int64,
 			_ => Self::Generic,
 		}
+	}
+
+	fn from_build_arrays_and_probe_schema(
+		build_key_arrays: &[ArrayRef],
+		probe_schema: &SchemaRef,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+	) -> Result<Self, ExecutionError> {
+		if null_safe_keys {
+			return Ok(Self::Generic);
+		}
+		if build_key_arrays.len() != 1 || probe_keys.len() != 1 {
+			return Ok(Self::Generic);
+		}
+		let probe_index = usize::try_from(probe_keys[0].0).expect("column ordinal fits usize");
+		let Some(probe_field) = probe_schema.fields().get(probe_index) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("probe join key ordinal {probe_index} out of bounds"),
+			});
+		};
+		if build_key_arrays[0].data_type() != probe_field.data_type() {
+			return Ok(Self::Generic);
+		}
+		Ok(match build_key_arrays[0].data_type() {
+			DataType::Int32 => Self::Int32,
+			DataType::Int64 => Self::Int64,
+			_ => Self::Generic,
+		})
 	}
 }
 
@@ -11054,6 +11516,124 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn reoriented_inner_chain_grouped_aggregate_matches_materialized_float64_and_decimal_order()
+	 {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
+
+		let (stream_executor, stream_plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			0,
+			high_test_budget(),
+			true,
+		);
+		let (materialized_executor, materialized_plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			0,
+			high_test_budget(),
+			false,
+		);
+		let streamed = stream_executor
+			.execute_bound(&stream_plan, None)
+			.await
+			.expect("streamed inner-chain float chain");
+		let materialized = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized inner-chain float chain");
+		assert_record_batches_equal(&streamed, &materialized);
+
+		let (stream_executor, stream_plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Decimal,
+			rows,
+			0,
+			high_test_budget(),
+			true,
+		);
+		let (materialized_executor, materialized_plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Decimal,
+			rows,
+			0,
+			high_test_budget(),
+			false,
+		);
+		let streamed = stream_executor
+			.execute_bound(&stream_plan, None)
+			.await
+			.expect("streamed inner-chain decimal chain");
+		let materialized = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized inner-chain decimal chain");
+		assert_record_batches_equal(&streamed, &materialized);
+	}
+
+	#[tokio::test]
+	async fn reoriented_inner_chain_removes_intermediate_build_accumulator() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 4 + 2_000;
+		let budget = TaskBudget {
+			memory: ByteCount::new(512 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+
+		let (materialized_executor, materialized_plan) =
+			reoriented_inner_chain_fixture(StreamingValueKind::Float64, rows, 256, budget, false);
+		let materialized_err = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect_err("replay-id-disabled chain should keep the materialized wall");
+		assert!(
+			matches!(
+				materialized_err,
+				ExecutionError::BudgetExhausted {
+					dimension: BudgetDimension::Memory,
+					producer: "join output materialization",
+					..
+				}
+			),
+			"unexpected materialized error: {materialized_err:?}"
+		);
+
+		let (stream_executor, stream_plan) =
+			reoriented_inner_chain_fixture(StreamingValueKind::Float64, rows, 256, budget, true);
+		let streamed = stream_executor
+			.execute_bound(&stream_plan, None)
+			.await
+			.expect("streaming chain should avoid the materialized intermediate wall");
+		assert!(record_batch_row_count(&streamed) > 0);
+	}
+
+	#[tokio::test]
+	async fn reoriented_inner_chain_shape_fence_keeps_other_replay_ids_materialized() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 4 + 2_000;
+		let budget = TaskBudget {
+			memory: ByteCount::new(512 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (executor, plan) =
+			reoriented_inner_chain_fixture(StreamingValueKind::Decimal, rows, 256, budget, false);
+
+		let err = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("non-matching replay ids stay on the materialized path");
+		assert!(
+			matches!(
+				err,
+				ExecutionError::BudgetExhausted {
+					dimension: BudgetDimension::Memory,
+					producer: "join output materialization",
+					..
+				}
+			),
+			"unexpected shape-fence error: {err:?}"
+		);
+	}
+
 	#[test]
 	fn spill_retained_footprint_budget_guard_fires_before_write() {
 		let (left_batch, right_batch) = spill_retained_guard_fixture();
@@ -11720,6 +12300,43 @@ mod tests {
 		}
 	}
 
+	fn test_scan_plan_with_first_field_key(
+		table_id: TableId,
+		schema: Arc<Schema>,
+		object_byte: u8,
+	) -> ExecutionPlan {
+		let primary_key = schema.field(0).name().to_string();
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([object_byte; 16]),
+			1,
+			"default",
+			"join_test",
+			schema.as_ref(),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.expect("descriptor");
+		ExecutionPlan::Scan {
+			local_table_id: table_id,
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
+		}
+	}
+
 	fn duplicate_join_fixture(build_rows: usize, budget: TaskBudget) -> (Executor, ExecutionPlan) {
 		let left_schema = Arc::new(Schema::new(vec![
 			Field::new("pk", DataType::Int64, false),
@@ -12037,6 +12654,292 @@ mod tests {
 		(executor, plan, join, filter)
 	}
 
+	fn reoriented_inner_chain_fixture(
+		kind: StreamingValueKind,
+		rows: usize,
+		blob_len: usize,
+		budget: TaskBudget,
+		streaming_replay_ids: bool,
+	) -> (Executor, ExecutionPlan) {
+		let amount_type = match kind {
+			StreamingValueKind::Float64 => DataType::Float64,
+			StreamingValueKind::Decimal => DataType::Decimal128(20, 2),
+		};
+		let supplier_schema = Arc::new(Schema::new(vec![
+			Field::new("s_suppkey", DataType::Int64, false),
+			Field::new("s_nationkey", DataType::Int64, false),
+		]));
+		let lineitem_schema = Arc::new(Schema::new(vec![
+			Field::new("l_orderkey", DataType::Int64, false),
+			Field::new("l_suppkey", DataType::Int64, false),
+			Field::new("amount", amount_type.clone(), true),
+			Field::new("keep", DataType::Int64, false),
+			Field::new("blob", DataType::Utf8, false),
+		]));
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("o_orderkey", DataType::Int64, false),
+			Field::new("o_custkey", DataType::Int64, false),
+		]));
+		let customer_schema = Arc::new(Schema::new(vec![
+			Field::new("c_custkey", DataType::Int64, false),
+			Field::new("c_nationkey", DataType::Int64, false),
+		]));
+		let nation_schema = Arc::new(Schema::new(vec![
+			Field::new("n_nationkey", DataType::Int64, false),
+			Field::new("n_name", DataType::Utf8, false),
+		]));
+
+		let supplier_batch = RecordBatch::try_new(
+			supplier_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20])),
+				Arc::new(Int64Array::from(vec![1, 2])),
+			],
+		)
+		.expect("supplier batch");
+		let keys = (0..rows)
+			.map(|row| i64::try_from(row % 3).expect("row key fits"))
+			.collect::<Vec<_>>();
+		let suppkeys = (0..rows)
+			.map(|row| if row % 2 == 0 { 10 } else { 20 })
+			.collect::<Vec<_>>();
+		let amount: ArrayRef = match kind {
+			StreamingValueKind::Float64 => Arc::new(Float64Array::from(vec![Some(1.0); rows])),
+			StreamingValueKind::Decimal => Arc::new(
+				Decimal128Array::from(vec![Some(100i128); rows])
+					.with_precision_and_scale(20, 2)
+					.expect("decimal amount"),
+			),
+		};
+		let blob = "x".repeat(blob_len);
+		let lineitem_batch = RecordBatch::try_new(
+			lineitem_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(keys)),
+				Arc::new(Int64Array::from(suppkeys)),
+				amount,
+				Arc::new(Int64Array::from(vec![1; rows])),
+				Arc::new(StringArray::from(vec![blob.as_str(); rows])),
+			],
+		)
+		.expect("lineitem batch");
+		let orders_batch = RecordBatch::try_new(
+			orders_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![0, 1, 2])),
+				Arc::new(Int64Array::from(vec![100, 200, 100])),
+			],
+		)
+		.expect("orders batch");
+		let customer_batch = RecordBatch::try_new(
+			customer_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![100, 200])),
+				Arc::new(Int64Array::from(vec![2, 1])),
+			],
+		)
+		.expect("customer batch");
+		let nation_batch = RecordBatch::try_new(
+			nation_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(StringArray::from(vec!["FRANCE", "GERMANY"])),
+			],
+		)
+		.expect("nation batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), lineitem_batch),
+				(TableId(2), customer_batch),
+				(TableId(3), orders_batch),
+				(TableId(4), nation_batch),
+				(TableId(5), supplier_batch),
+			]),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(budget),
+		);
+
+		let replay = |id| {
+			if streaming_replay_ids {
+				JoinReplayId(id)
+			} else {
+				JoinReplayId::SYNTHETIC
+			}
+		};
+		let supplier = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(5), supplier_schema.clone(), 5),
+			bound_column_root("s_suppkey", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let lineitem = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(1), lineitem_schema.clone(), 1),
+			bound_column_root("l_suppkey", ColumnOrdinal(1), DataType::Int64, false),
+			4,
+		);
+		let join0_schema = concat_test_schema(&supplier_schema, &lineitem_schema);
+		let join0 = inner_join_plan(
+			replay(0),
+			supplier,
+			lineitem,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(1)],
+			join0_schema,
+		);
+		let lower_filter = ExecutionPlan::Filter {
+			input: Box::new(join0),
+			predicate: keep_filter_program(ColumnOrdinal(5)),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let mut current = exchange_plan(
+			lower_filter,
+			bound_column_root("l_orderkey", ColumnOrdinal(2), DataType::Int64, false),
+			4,
+		);
+
+		let dimensions = [
+			(
+				replay(1),
+				test_scan_plan_with_first_field_key(TableId(3), orders_schema.clone(), 3),
+				bound_column_root("o_orderkey", ColumnOrdinal(0), DataType::Int64, false),
+				vec![ColumnOrdinal(2)],
+				vec![ColumnOrdinal(0)],
+			),
+			(
+				replay(2),
+				test_scan_plan_with_first_field_key(TableId(2), customer_schema.clone(), 2),
+				bound_column_root("c_custkey", ColumnOrdinal(0), DataType::Int64, false),
+				vec![ColumnOrdinal(8)],
+				vec![ColumnOrdinal(0)],
+			),
+			(
+				replay(3),
+				test_scan_plan_with_first_field_key(TableId(4), nation_schema.clone(), 4),
+				bound_column_root("n_nationkey", ColumnOrdinal(0), DataType::Int64, false),
+				vec![ColumnOrdinal(1)],
+				vec![ColumnOrdinal(0)],
+			),
+			(
+				replay(4),
+				test_scan_plan_with_first_field_key(TableId(4), nation_schema.clone(), 4),
+				bound_column_root("n_nationkey", ColumnOrdinal(0), DataType::Int64, false),
+				vec![ColumnOrdinal(10)],
+				vec![ColumnOrdinal(0)],
+			),
+		];
+		for (replay_id, dimension_scan, dimension_key, left_keys, right_keys) in dimensions {
+			let dimension = exchange_plan(dimension_scan, dimension_key, 4);
+			let output_schema = concat_test_schema(&current.schema(), &dimension.schema());
+			let joined = inner_join_plan(
+				replay_id,
+				current,
+				dimension,
+				left_keys,
+				right_keys,
+				output_schema,
+			);
+			let next_key = match replay_id.0 {
+				1 => bound_column_root("o_custkey", ColumnOrdinal(8), DataType::Int64, false),
+				2 => bound_column_root("s_nationkey", ColumnOrdinal(1), DataType::Int64, false),
+				3 => bound_column_root("c_nationkey", ColumnOrdinal(10), DataType::Int64, false),
+				_ => bound_column_root("s_suppkey", ColumnOrdinal(0), DataType::Int64, false),
+			};
+			current = if replay_id.0 == 4 {
+				joined
+			} else {
+				exchange_plan(joined, next_key, 4)
+			};
+		}
+
+		let filtered = ExecutionPlan::Filter {
+			input: Box::new(current),
+			predicate: keep_filter_program(ColumnOrdinal(0)),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let project_schema = Arc::new(Schema::new(vec![
+			Field::new("supp_nation", DataType::Utf8, false),
+			Field::new("cust_nation", DataType::Utf8, false),
+			Field::new("l_year", DataType::Int64, false),
+			Field::new("volume", amount_type.clone(), true),
+		]));
+		let project_exprs = bound_columns_program(vec![
+			("supp_nation", ColumnOrdinal(12), DataType::Utf8, false),
+			("cust_nation", ColumnOrdinal(14), DataType::Utf8, false),
+			("l_year", ColumnOrdinal(2), DataType::Int64, false),
+			("volume", ColumnOrdinal(4), amount_type.clone(), true),
+		]);
+		let projected = ExecutionPlan::Project {
+			input: Box::new(filtered),
+			exprs: project_exprs,
+			output_schema: project_schema,
+		};
+		let aggregate_input = exchange_plan(
+			projected,
+			bound_columns_program(vec![
+				("supp_nation", ColumnOrdinal(0), DataType::Utf8, false),
+				("cust_nation", ColumnOrdinal(1), DataType::Utf8, false),
+				("l_year", ColumnOrdinal(2), DataType::Int64, false),
+			]),
+			4,
+		);
+		let group_expr = bound_columns_program(vec![
+			("supp_nation", ColumnOrdinal(0), DataType::Utf8, false),
+			("cust_nation", ColumnOrdinal(1), DataType::Utf8, false),
+			("l_year", ColumnOrdinal(2), DataType::Int64, false),
+		]);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: bound_column_root("volume", ColumnOrdinal(3), amount_type.clone(), true),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("supp_nation", DataType::Utf8, false),
+			Field::new("cust_nation", DataType::Utf8, false),
+			Field::new("l_year", DataType::Int64, false),
+			Field::new("sum", amount_type, true),
+		]));
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(aggregate_input),
+			group_expr,
+			aggr_expr,
+			output_schema,
+		};
+		(executor, plan)
+	}
+
+	fn concat_test_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+		Arc::new(Schema::new(
+			left.fields()
+				.iter()
+				.chain(right.fields().iter())
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>(),
+		))
+	}
+
+	fn inner_join_plan(
+		replay_id: JoinReplayId,
+		left: ExecutionPlan,
+		right: ExecutionPlan,
+		left_keys: Vec<ColumnOrdinal>,
+		right_keys: Vec<ColumnOrdinal>,
+		output_schema: SchemaRef,
+	) -> ExecutionPlan {
+		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(left),
+			right: Box::new(right),
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+		}
+	}
+
 	fn exchange_plan(
 		input: ExecutionPlan,
 		key: BoundExprProgram,
@@ -12064,6 +12967,23 @@ mod tests {
 			pbc_eligible: false,
 		});
 		builder.push_root(column);
+		builder.build()
+	}
+
+	fn bound_columns_program(
+		columns: Vec<(&str, ColumnOrdinal, DataType, bool)>,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		for (name, ordinal, data_type, nullable) in columns {
+			let column = builder.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal,
+				data_type,
+				nullable,
+				pbc_eligible: false,
+			});
+			builder.push_root(column);
+		}
 		builder.build()
 	}
 
