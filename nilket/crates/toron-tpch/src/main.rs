@@ -331,6 +331,7 @@ async fn run_command(args: &[String]) -> ExitCode {
 			reason: Some("query_not_implemented".to_string()),
 			elapsed_ms: 0.0,
 			digest: None,
+			diagnostic_message: None,
 		},
 	};
 

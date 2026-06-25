@@ -112,9 +112,12 @@ fn adr262_strict_q6_attempts_decimal128_compute() {
 #[test]
 fn adr262_first_red_row_is_grounded_not_predeclared() {
 	let lib = source("src/lib.rs");
-	// stage errors are classified from the actual engine message, not hardcoded
+	// stage errors are classified from the actual engine message and retain that same message for diagnostics,
+	// not a hardcoded/predeclared reason.
 	assert!(
-		lib.contains("reason_for_error(&format!"),
+		lib.contains("fn from_message(phase: Phase, message: String) -> Self")
+			&& lib.contains("let reason = reason_for_error(&message).to_string()")
+			&& lib.contains("message,"),
 		"the run path classifies the engine error message"
 	);
 	// the strict run delegates to the shared, classified runner (no predeclared reason in its body)

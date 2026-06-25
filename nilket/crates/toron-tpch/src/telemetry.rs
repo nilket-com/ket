@@ -76,7 +76,8 @@ pub const RECOGNIZED_BLOCKERS: &[&str] = &[
 	"unsupported_query_surface",
 ];
 
-/// The honesty rule: a recognized reason is a `blocked`; an unrecognized one is a `fail`.
+/// The honesty rule: only allowlisted blocker reasons are `blocked`.
+/// Any other reason, including named non-blockers and `unrecognized`, is a `fail`.
 pub fn status_for_reason(reason: &str) -> Status {
 	if RECOGNIZED_BLOCKERS.contains(&reason) {
 		Status::Blocked
@@ -89,7 +90,12 @@ pub fn status_for_reason(reason: &str) -> Status {
 /// returns `"unrecognized"`, which [`status_for_reason`] classifies as `fail` — never `blocked`.
 pub fn reason_for_error(message: &str) -> &'static str {
 	let lowered = message.to_ascii_lowercase();
-	if lowered.contains("decimal") && lowered.contains("create table") {
+	if lowered.contains("budgetexhausted") && lowered.contains("dimension: memory") {
+		// ADR 332: q04/q12/q20 at sf=1 reach execute, then exhaust the per-task memory budget. This is
+		// a named scale/cost-bound wall, not an unsupported SQL surface, so it intentionally stays out
+		// of RECOGNIZED_BLOCKERS and remains fail(memory_budget_exhausted@execute).
+		"memory_budget_exhausted"
+	} else if lowered.contains("decimal") && lowered.contains("create table") {
 		"unsupported_decimal_ddl"
 	} else if lowered.contains("comparison operands have different types")
 		&& lowered.contains("int32")
@@ -193,6 +199,7 @@ pub struct Attempt {
 	pub reason: Option<String>,
 	pub elapsed_ms: f64,
 	pub digest: Option<String>,
+	pub diagnostic_message: Option<String>,
 }
 
 impl Attempt {
@@ -211,7 +218,7 @@ impl Attempt {
 	}
 
 	pub fn jsonl(&self) -> String {
-		serde_json::json!({
+		let mut row = serde_json::json!({
 			"suite": "tpch",
 			"query": self.query,
 			"scale_factor": self.scale_factor,
@@ -221,8 +228,13 @@ impl Attempt {
 			"reason": self.reason,
 			"elapsed_ms": self.elapsed_ms,
 			"digest": self.digest,
-		})
-		.to_string()
+		});
+		if let Some(message) = &self.diagnostic_message {
+			row.as_object_mut()
+				.expect("attempt JSON row is an object")
+				.insert("diagnostic_message".to_string(), serde_json::json!(message));
+		}
+		row.to_string()
 	}
 
 	/// Exit-code policy: `pass` / `not_attempted` always succeed; a recognized `blocked` succeeds only

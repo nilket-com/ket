@@ -1337,11 +1337,32 @@ async fn run_query(
 	.await
 }
 
-/// A stage error from the shared execution path: the deepest phase reached and its classified reason.
+/// A stage error from the shared execution path: the deepest phase reached, its classified reason,
+/// and the raw message that produced the classification.
 #[derive(Debug)]
 struct StageError {
 	phase: Phase,
 	reason: String,
+	message: String,
+}
+
+impl StageError {
+	fn from_message(phase: Phase, message: String) -> Self {
+		let reason = reason_for_error(&message).to_string();
+		Self {
+			phase,
+			reason,
+			message,
+		}
+	}
+
+	fn from_debug(phase: Phase, error: impl std::fmt::Debug) -> Self {
+		Self::from_message(phase, format!("{error:?}"))
+	}
+
+	fn from_display(phase: Phase, error: impl std::fmt::Display) -> Self {
+		Self::from_message(phase, error.to_string())
+	}
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -1356,38 +1377,25 @@ async fn execute_query_with_tables(
 	let mut batches = HashMap::new();
 	for table in tables {
 		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
-			return Err(StageError {
-				phase: Phase::Load,
-				reason: reason_for_error(&format!("{error:?}")).to_string(),
-			});
+			return Err(StageError::from_debug(Phase::Load, error));
 		}
 		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
-			return Err(StageError {
-				phase: Phase::Load,
-				reason: reason_for_error(&format!("{error:?}")).to_string(),
-			});
+			return Err(StageError::from_debug(Phase::Load, error));
 		}
 		batches.insert(table.id, table.batch);
 	}
 	let storage = Arc::new(HarnessScan { batches });
 
-	let logical = SqlPlanner::new().plan(sql).map_err(|error| StageError {
-		phase: Phase::Plan,
-		reason: reason_for_error(&error.to_string()).to_string(),
-	})?;
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.map_err(|error| StageError::from_display(Phase::Plan, error))?;
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
-		.map_err(|error| StageError {
-			phase: Phase::Bind,
-			reason: reason_for_error(&format!("{error:?}")).to_string(),
-		})?;
+		.map_err(|error| StageError::from_debug(Phase::Bind, error))?;
 	Executor::new(storage)
 		.execute_bound(&bound, None)
 		.await
-		.map_err(|error| StageError {
-			phase: Phase::Execute,
-			reason: reason_for_error(&format!("{error:?}")).to_string(),
-		})
+		.map_err(|error| StageError::from_debug(Phase::Execute, error))
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
@@ -1400,39 +1408,55 @@ async fn run_query_with_tables(
 	tables: Vec<HarnessTable>,
 ) -> Attempt {
 	let start = Instant::now();
-	let attempt =
-		|phase: Phase, status: Status, reason: Option<String>, digest: Option<String>| Attempt {
-			query: query_id.to_string(),
-			scale_factor,
-			mode: mode.to_string(),
-			phase,
-			status,
-			reason,
-			elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-			digest,
-		};
+	let attempt = |phase: Phase,
+	               status: Status,
+	               reason: Option<String>,
+	               digest: Option<String>,
+	               diagnostic_message: Option<String>| Attempt {
+		query: query_id.to_string(),
+		scale_factor,
+		mode: mode.to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+		digest,
+		diagnostic_message,
+	};
 
 	let batches = match execute_query_with_tables(sql, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
-			return attempt(phase, status_for_reason(&reason), Some(reason), None);
+		Err(StageError {
+			phase,
+			reason,
+			message,
+		}) => {
+			return attempt(
+				phase,
+				status_for_reason(&reason),
+				Some(reason),
+				None,
+				Some(message),
+			);
 		}
 	};
 
 	let digest = match canonical_arrow_ipc_digest(&batches, SortPolicy::FullRowLex) {
 		Ok(digest) => format!("{digest:?}"),
 		Err(error) => {
-			let reason = reason_for_error(&format!("{error:?}"));
+			let message = format!("{error:?}");
+			let reason = reason_for_error(&message);
 			return attempt(
 				Phase::Execute,
 				status_for_reason(reason),
 				Some(reason.to_string()),
 				None,
+				Some(message),
 			);
 		}
 	};
 
-	attempt(Phase::Execute, Status::Pass, None, Some(digest))
+	attempt(Phase::Execute, Status::Pass, None, Some(digest), None)
 }
 
 /// Dev Q6: the `Float64` proxy. A `pass` means the shape reached `execute` (reachability), not TPC-H
@@ -1615,7 +1639,7 @@ pub async fn check_strict_q6(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q6_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -1936,7 +1960,7 @@ pub async fn check_strict_q1(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q1_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -2209,7 +2233,7 @@ pub async fn check_strict_q3(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q3_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -2445,7 +2469,7 @@ pub async fn check_strict_q5(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q5_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -2722,7 +2746,7 @@ pub async fn check_strict_q07(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q7_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -3044,7 +3068,7 @@ pub async fn check_strict_q08(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q8_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -3336,7 +3360,7 @@ pub async fn check_strict_q09(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q9_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -3648,7 +3672,7 @@ pub async fn check_strict_q10(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q10_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -3960,7 +3984,7 @@ pub async fn check_strict_q11(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q11_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -4334,7 +4358,7 @@ pub async fn check_strict_q02(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q2_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -4562,7 +4586,7 @@ pub async fn check_strict_q04(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q4_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -4811,7 +4835,7 @@ pub async fn check_strict_q12(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q12_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -5051,7 +5075,7 @@ pub async fn check_strict_q14(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q14_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -5234,7 +5258,7 @@ pub async fn check_strict_q17() -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q17_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -5500,7 +5524,7 @@ pub async fn check_strict_q20(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q20_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -5745,7 +5769,7 @@ pub async fn check_strict_q13(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q13_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -6032,7 +6056,7 @@ pub async fn check_strict_q16(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q16_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -6313,7 +6337,7 @@ pub async fn check_strict_q22(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q22_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -6459,6 +6483,7 @@ async fn run_q18(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Atte
 			reason: Some(reason.to_string()),
 			elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
 			digest: None,
+			diagnostic_message: Some(message),
 		};
 	}
 	run_query_with_tables(
@@ -6793,7 +6818,7 @@ pub async fn check_strict_q21(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q21_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -6836,6 +6861,7 @@ async fn run_q19(mode: &str, strict: bool, scale_factor: f64, sql: &str) -> Atte
 			reason: Some(reason.to_string()),
 			elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
 			digest: None,
+			diagnostic_message: Some(message),
 		};
 	}
 	run_query_with_tables(
@@ -7531,7 +7557,7 @@ pub async fn check_strict_q15(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q15_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -7832,7 +7858,7 @@ pub async fn check_strict_q18(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q18_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -8053,7 +8079,7 @@ pub async fn check_strict_q19(scale_factor: f64) -> CorrectnessAttempt {
 	};
 	let batches = match execute_query_with_tables(STRICT_Q19_SQL, tables).await {
 		Ok(batches) => batches,
-		Err(StageError { phase, reason }) => {
+		Err(StageError { phase, reason, .. }) => {
 			return outcome(phase, status_for_reason(&reason), Some(reason));
 		}
 	};
@@ -8929,6 +8955,98 @@ pub fn correctness_matrix_from_log(contents: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod adr332_unrecognized_diagnostics {
+	use super::*;
+
+	#[test]
+	fn attempt_jsonl_carries_diagnostic_message_only_when_present() {
+		let pass = Attempt {
+			query: "q04".to_string(),
+			scale_factor: 1.0,
+			mode: "strict".to_string(),
+			phase: Phase::Execute,
+			status: Status::Pass,
+			reason: None,
+			elapsed_ms: 1.0,
+			digest: Some("digest".to_string()),
+			diagnostic_message: None,
+		};
+		let pass_row: serde_json::Value =
+			serde_json::from_str(&pass.jsonl()).expect("pass attempt json");
+		assert!(
+			pass_row.get("diagnostic_message").is_none(),
+			"successful rows should not grow a diagnostic field"
+		);
+
+		let fail = Attempt {
+			query: "q04".to_string(),
+			scale_factor: 1.0,
+			mode: "strict".to_string(),
+			phase: Phase::Execute,
+			status: Status::Fail,
+			reason: Some("unrecognized".to_string()),
+			elapsed_ms: 1.0,
+			digest: None,
+			diagnostic_message: Some("opaque executor failure".to_string()),
+		};
+		let fail_row: serde_json::Value =
+			serde_json::from_str(&fail.jsonl()).expect("fail attempt json");
+		assert_eq!(
+			fail_row["diagnostic_message"],
+			serde_json::Value::String("opaque executor failure".to_string())
+		);
+	}
+
+	#[test]
+	fn matrix_ignores_diagnostic_message_and_renders_classified_reason() {
+		let row = serde_json::json!({
+			"suite": "tpch",
+			"query": "q04",
+			"scale_factor": 1.0,
+			"mode": "strict",
+			"phase": "execute",
+			"status": "fail",
+			"reason": "named_execute_bug",
+			"elapsed_ms": 1.0,
+			"digest": null,
+			"diagnostic_message": "raw executor detail"
+		});
+		let rows = matrix_from_log(&row.to_string());
+		assert!(
+			rows.iter()
+				.any(|line| line == "q04 dev=not_run strict=fail(named_execute_bug@execute)"),
+			"matrix must keep rendering the classified reason cell"
+		);
+	}
+
+	#[test]
+	fn stage_error_retains_the_message_it_classifies() {
+		let message = "opaque executor failure".to_string();
+		let error = StageError::from_message(Phase::Execute, message.clone());
+		assert_eq!(error.reason, "unrecognized");
+		assert_eq!(error.message, message);
+	}
+
+	#[test]
+	fn memory_budget_exhausted_is_named_fail_not_blocked() {
+		let message = "BudgetExhausted { dimension: Memory, requested: ByteCount(121631060), available: ByteCount(67108864) }";
+		assert_eq!(reason_for_error(message), "memory_budget_exhausted");
+		assert_eq!(
+			status_for_reason("memory_budget_exhausted"),
+			Status::Fail,
+			"memory budget exhaustion is a scale wall, not an allowlisted blocker"
+		);
+	}
+
+	#[test]
+	fn budget_classifier_stays_memory_specific() {
+		let message =
+			"BudgetExhausted { dimension: Cpu, requested: ByteCount(2), available: ByteCount(1) }";
+		assert_eq!(reason_for_error(message), "unrecognized");
+	}
+}
+
+#[cfg(test)]
 mod adr301_q09_probe {
 	use super::*;
 
@@ -9343,7 +9461,7 @@ mod adr275_decimal_join_probe {
 				let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 				assert_eq!(rows, 2, "both Decimal keys (100, 250) match across a and b");
 			}
-			Err(StageError { phase, reason }) => {
+			Err(StageError { phase, reason, .. }) => {
 				panic!("explicit Decimal equi-join walled at {phase:?}: {reason}");
 			}
 		}
