@@ -27,6 +27,8 @@ systemd-run --user --same-dir --wait --collect --pipe --property=MemoryMax=4G \
 - ADR 340 moved the q07/q21 sf=1 first wall off the ADR 335 `Join(0)` raw-output guard:
   q07 now fails at a later join-output materialization (requested 1,177,978,914), and q21 fails at the budgeted
   streamed-filter accumulator (requested 1,074,312,896). Both remain `memory_budget_exhausted@execute`.
+- ADR 341 moved q21's sf=1 wall off the ADR 340 streamed-filter accumulator and onto the budgeted Exchange-output
+  accumulator (requested 1,074,142,886). q07 remains at the later join-output wall.
 
 ## Reach atlas
 Format: `class (stage; wall-clock / RSS)`
@@ -98,3 +100,17 @@ first sf=1 wall:
 
 The atlas classification remains `memory_budget_exhausted@execute`; the producer/bytes now identify the next staged
 substrate cuts.
+
+## Later Delta - ADR 341
+
+ADR 341 streams ADR 340's filtered batches into the Exchange before the Filter result `Vec` exists. The current
+materialize-each executor still requires Exchange to return `Vec<RecordBatch>`, so this is Branch 2 from the plan:
+q21 remains red, but at the next named wall.
+
+| query | pre-ADR 341 first wall | post-ADR 341 first wall |
+| --- | --- | --- |
+| q07 | later join output materialization, requested 1,177,978,914 | unchanged: later join output materialization, requested 1,177,978,914 |
+| q21 | streamed-filter accumulator, requested 1,074,312,896 | streamed exchange output accumulator, requested 1,074,142,886 |
+
+The atlas classification remains `memory_budget_exhausted@execute`; ADR 342 owns the consumer streaming /
+join-to-join boundary needed to move past the returned Exchange output.
