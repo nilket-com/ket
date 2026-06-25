@@ -114,3 +114,14 @@ q21 remains red, but at the next named wall.
 
 The atlas classification remains `memory_budget_exhausted@execute`; ADR 342 owns the consumer streaming /
 join-to-join boundary needed to move past the returned Exchange output.
+
+## Later Delta - ADR 345
+
+ADR 345 streams and spills the semi/anti existence-set build instead of retaining the full existence batch. q21 moves
+from the ADR 344 semi existence-set wall to green at `sf=1`.
+
+| query | pre-ADR 345 first wall | post-ADR 345 result |
+| --- | --- | --- |
+| q21 | `semi/anti existence-set build/spill accumulator`, requested 1,526,014,069 | `pass@execute` at sf=1; `pass@compare` at sf=1 |
+
+This leaves the current strict sf=1 memory walls as q04, q12, q18, and q20.

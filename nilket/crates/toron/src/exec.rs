@@ -40,12 +40,16 @@ use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef, TimeUnit};
+use arrow::ipc::CompressionType;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
+use futures::StreamExt;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1747,18 +1751,47 @@ struct StreamingSemiAntiStage<'a> {
 	strategy: JoinStrategy,
 }
 
+#[allow(dead_code)]
+enum StreamingSemiAntiExistence {
+	InMemory {
+		batch: RecordBatch,
+		rows: HashMap<JoinKey, BuildRowList>,
+	},
+	Spilled(SpilledSemiAntiExistenceBuild),
+}
+
+enum StreamingExistenceOp<'a> {
+	Filter(&'a BoundExprProgram),
+	Project {
+		exprs: &'a BoundExprProgram,
+		output_schema: SchemaRef,
+	},
+	Exchange {
+		partition_count: u32,
+		key: &'a BoundExprProgram,
+	},
+}
+
 struct StreamingSemiAntiRuntime<'a> {
 	replay_id: JoinReplayId,
 	kind: JoinKind,
 	strategy: JoinStrategy,
-	existence_batch: RecordBatch,
-	existence_rows: HashMap<JoinKey, BuildRowList>,
+	existence: StreamingSemiAntiExistence,
+	existence_row_count: u64,
 	key_plan: JoinKeyPlan,
 	preserved_keys: Vec<crate::ir::ColumnOrdinal>,
 	match_filter: &'a BoundExprProgram,
 	output_schema: SchemaRef,
 	probe_rows: u64,
 	output_rows: u64,
+}
+
+impl StreamingSemiAntiRuntime<'_> {
+	async fn cleanup(self) {
+		if let StreamingSemiAntiExistence::Spilled(spilled) = self.existence {
+			spilled.cleanup().await;
+		}
+	}
 }
 
 struct StreamingSemiAntiChain<'a> {
@@ -1835,6 +1868,54 @@ fn exchange_input(plan: &ExecutionPlan) -> Option<&ExecutionPlan> {
 		return None;
 	};
 	Some(input.as_ref())
+}
+
+fn decompose_streaming_existence_plan(
+	plan: &ExecutionPlan,
+) -> Option<(&ExecutionPlan, Vec<StreamingExistenceOp<'_>>)> {
+	let mut current = plan;
+	let mut ops = Vec::new();
+	loop {
+		match current {
+			ExecutionPlan::Exchange {
+				input,
+				partition_count,
+				key,
+			} => {
+				ops.push(StreamingExistenceOp::Exchange {
+					partition_count: *partition_count,
+					key,
+				});
+				current = input.as_ref();
+			}
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition,
+			} => {
+				if *disposition == FilterDisposition::EvaluateInToron {
+					ops.push(StreamingExistenceOp::Filter(predicate));
+				}
+				current = input.as_ref();
+			}
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => {
+				ops.push(StreamingExistenceOp::Project {
+					exprs,
+					output_schema: output_schema.clone(),
+				});
+				current = input.as_ref();
+			}
+			ExecutionPlan::Scan { .. } => {
+				ops.reverse();
+				return Some((current, ops));
+			}
+			_ => return None,
+		}
+	}
 }
 
 fn extract_streaming_inner_prefix_semi_anti_chain(
@@ -2422,18 +2503,145 @@ impl Executor {
 			};
 			inner_runtimes.push(runtime);
 		}
-		let mut semi_runtime = self
+		let Some(mut semi_runtime) = self
 			.prepare_streaming_semi_anti_runtime(chain.semi_stage, morsel)
-			.await?;
-		let mut anti_runtime = self
+			.await?
+		else {
+			return Ok(None);
+		};
+		let Some(mut anti_runtime) = self
 			.prepare_streaming_semi_anti_runtime(chain.anti_stage, morsel)
-			.await?;
+			.await?
+		else {
+			return Ok(None);
+		};
 
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
-		let matched = self
-			.try_visit_streaming_reoriented_inner_chain_base(chain.base, morsel, |base_batch| {
-				let mut batches = vec![base_batch];
+		let ExecutionPlan::Exchange {
+			input: base_input,
+			partition_count,
+			key: base_exchange_key,
+		} = chain.base
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: join0,
+			predicate: join0_filter,
+			disposition,
+		} = base_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *disposition == FilterDisposition::FullyPushed {
+			return Ok(None);
+		}
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema: join0_output_schema,
+			..
+		} = join0.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *replay_id != JoinReplayId(0) {
+			return Ok(None);
+		}
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let right_batches = self.execute_bound(right, morsel).await?;
+		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let right_batch = concat_or_empty(right.schema(), &right_batches)?;
+		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+		let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan =
+			JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&left_key_arrays,
+			left_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			*null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(right_batch.num_rows() as u64);
+		});
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+		let probe_started = Instant::now();
+		let selection = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			join_key_plan,
+			&build_rows,
+			left_batch.num_rows(),
+			&right_key_arrays,
+			right_batch.num_rows(),
+			match_filter.as_ref(),
+			&left_batch,
+			&right_batch,
+			*null_safe_keys,
+		)?;
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
+		});
+
+		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_join_selection(
+				JoinKind::Inner,
+				&left_batch,
+				&right_batch,
+				chunk,
+				join0_output_schema,
+				self.context.task_budget.memory.get(),
+			)?;
+			let batch =
+				self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?;
+			if batch.num_rows() == 0 {
+				continue;
+			}
+			for (_partition, partitioned) in
+				self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
+			{
+				if partitioned.num_rows() == 0 {
+					continue;
+				}
+				let mut batches = vec![partitioned];
 				for runtime in inner_runtimes.iter_mut() {
 					let mut next = Vec::new();
 					for batch in batches {
@@ -2461,11 +2669,17 @@ impl Executor {
 
 				let mut semi_batches = Vec::new();
 				for batch in batches {
-					semi_batches.extend(self.probe_streaming_semi_anti(&mut semi_runtime, &batch)?);
+					semi_batches.extend(
+						self.probe_streaming_semi_anti(&mut semi_runtime, &batch)
+							.await?,
+					);
 				}
 				let mut anti_batches = Vec::new();
 				for batch in semi_batches {
-					anti_batches.extend(self.probe_streaming_semi_anti(&mut anti_runtime, &batch)?);
+					anti_batches.extend(
+						self.probe_streaming_semi_anti(&mut anti_runtime, &batch)
+							.await?,
+					);
 				}
 				for batch in anti_batches {
 					self.fold_bound_grouped_aggregate_batch(
@@ -2476,12 +2690,19 @@ impl Executor {
 						&batch,
 					)?;
 				}
-				Ok(())
-			})
-			.await?;
-		if matched.is_none() {
-			return Ok(None);
+			}
 		}
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: *strategy,
+				build_rows: RowCount::new(left_batch.num_rows() as u64),
+				probe_rows: RowCount::new(right_batch.num_rows() as u64),
+				output_rows: RowCount::new(selection.len() as u64),
+			},
+		);
 
 		for runtime in &inner_runtimes {
 			record_join_runtime_observation(
@@ -2503,15 +2724,18 @@ impl Executor {
 				JoinRuntimeObservation {
 					replay_id: runtime.replay_id,
 					strategy: runtime.strategy,
-					build_rows: RowCount::new(runtime.existence_batch.num_rows() as u64),
+					build_rows: RowCount::new(runtime.existence_row_count),
 					probe_rows: RowCount::new(runtime.probe_rows),
 					output_rows: RowCount::new(runtime.output_rows),
 				},
 			);
 		}
 
-		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
-			.map(Some)
+		let output =
+			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema);
+		semi_runtime.cleanup().await;
+		anti_runtime.cleanup().await;
+		output.map(Some)
 	}
 
 	async fn prepare_reoriented_inner_join_runtime<'a>(
@@ -2579,67 +2803,173 @@ impl Executor {
 		&self,
 		stage: StreamingSemiAntiStage<'a>,
 		morsel: Option<(MorselId, u32)>,
-	) -> Result<StreamingSemiAntiRuntime<'a>, ExecutionError> {
+	) -> Result<Option<StreamingSemiAntiRuntime<'a>>, ExecutionError> {
 		debug_assert!(matches!(
 			stage.kind,
 			JoinKind::LeftSemi | JoinKind::LeftAnti
 		));
-		let existence_batches = self.execute_bound(stage.existence, morsel).await?;
-		let existence_batch = concat_or_empty(stage.existence.schema(), &existence_batches)?;
-		let existence_key_arrays = key_arrays(&existence_batch, &stage.existence_keys)?;
-		let existence_memory_cap =
-			join_spill_retained_footprint_memory_cap(self.context.task_budget.memory.get());
-		let estimated_build_bytes = record_batch_memory_bytes(&existence_batch).saturating_add(
-			estimated_build_hash_bytes(&existence_key_arrays, existence_batch.num_rows()),
-		);
-		if estimated_build_bytes > existence_memory_cap {
-			return Err(budget_exhausted(
-				BudgetDimension::Memory,
-				"semi/anti existence-set build/spill accumulator",
-				estimated_build_bytes,
-				existence_memory_cap,
-			));
-		}
-		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
-			&existence_key_arrays,
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&stage.existence.schema(),
+			&stage.existence_keys,
 			&stage.output_schema,
 			&stage.preserved_keys,
 			false,
 		)?;
-		let Some(existence_rows) = build_in_memory_join_rows(
-			key_plan,
-			&existence_key_arrays,
-			existence_batch.num_rows(),
-			existence_memory_cap,
-			false,
-		)?
+		let mut spilled = SpilledSemiAntiExistenceBuild::create(
+			self.context.task_budget,
+			self.context.join_spill_file_ops.clone(),
+			self.context.join_spill_dir.clone(),
+		)
+		.await?;
+		let Some(()) = self
+			.write_streaming_semi_anti_existence(
+				stage.existence,
+				&stage.existence_keys,
+				key_plan,
+				morsel,
+				&mut spilled,
+			)
+			.await?
 		else {
-			return Err(budget_exhausted(
-				BudgetDimension::Memory,
-				"semi/anti existence-set build/spill accumulator",
-				estimated_build_bytes,
-				existence_memory_cap,
-			));
+			spilled.cleanup().await;
+			return Ok(None);
 		};
+		spilled.finish(self.context.task_budget).await?;
+		let existence_row_count = spilled.input_row_count();
 		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.build_rows = task
+			task.counters.build_rows = task.counters.build_rows.saturating_add(existence_row_count);
+			task.counters.spill_bytes = task
 				.counters
-				.build_rows
-				.saturating_add(existence_batch.num_rows() as u64);
+				.spill_bytes
+				.saturating_add(spilled.spill_bytes());
 		});
-		Ok(StreamingSemiAntiRuntime {
+		Ok(Some(StreamingSemiAntiRuntime {
 			replay_id: stage.replay_id,
 			kind: stage.kind,
 			strategy: stage.strategy,
-			existence_batch,
-			existence_rows,
+			existence: StreamingSemiAntiExistence::Spilled(spilled),
+			existence_row_count,
 			key_plan,
 			preserved_keys: stage.preserved_keys,
 			match_filter: stage.match_filter,
 			output_schema: stage.output_schema,
 			probe_rows: 0,
 			output_rows: 0,
-		})
+		}))
+	}
+
+	async fn write_streaming_semi_anti_existence(
+		&self,
+		plan: &ExecutionPlan,
+		existence_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		morsel: Option<(MorselId, u32)>,
+		spilled: &mut SpilledSemiAntiExistenceBuild,
+	) -> Result<Option<()>, ExecutionError> {
+		let Some((scan_plan, ops)) = decompose_streaming_existence_plan(plan) else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Scan {
+			local_table_id,
+			table,
+			fingerprint,
+			projection,
+			pbc_program,
+			row_limit,
+			row_identity,
+			profile_hint,
+			..
+		} = scan_plan
+		else {
+			return Ok(None);
+		};
+		let req = ScanRequest {
+			session_id: self.context.session_id,
+			query_id: self.context.query_id,
+			tenant_id: self.context.tenant_id,
+			table_id: *local_table_id,
+			table_object_id: *table,
+			physical_descriptor_fingerprint: *fingerprint,
+			read_bound: self.context.read_bound,
+			projected_columns: projection.clone(),
+			pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
+			runtime_filter: self.context.runtime_filter.clone(),
+			row_identity: *row_identity,
+			profile_hint: Some(*profile_hint),
+			trace_context: self.context.trace_context,
+			morsel,
+			row_limit: *row_limit,
+			downstream_cancellation: self.context.downstream_cancellation.clone(),
+		};
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		let mut remaining = *row_limit;
+		while let Some(batch) = stream.next().await {
+			let mut batch = batch?;
+			if let Some(limit) = remaining.as_mut() {
+				if *limit == 0 {
+					break;
+				}
+				if batch.num_rows() > *limit {
+					batch = batch.slice(0, *limit);
+				}
+				*limit = (*limit).saturating_sub(batch.num_rows());
+			}
+			let mut batches = vec![batch];
+			for op in &ops {
+				let mut next = Vec::new();
+				for batch in batches {
+					match op {
+						StreamingExistenceOp::Filter(predicate) => {
+							let batch = self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?;
+							if batch.num_rows() > 0 {
+								next.push(batch);
+							}
+						}
+						StreamingExistenceOp::Project {
+							exprs,
+							output_schema,
+						} => {
+							let columns = self.evaluate_bound_program(exprs, &batch)?;
+							next.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+						}
+						StreamingExistenceOp::Exchange {
+							partition_count,
+							key,
+						} => {
+							if *partition_count == 0 {
+								return Err(ExecutionError::InvalidExpression {
+									message: "exchange partition_count must be greater than zero"
+										.to_string(),
+								});
+							}
+							for (_partition, partitioned) in
+								self.repartition_exchange_batch(&batch, *partition_count, key)?
+							{
+								if partitioned.num_rows() > 0 {
+									next.push(partitioned);
+								}
+							}
+						}
+					}
+				}
+				batches = next;
+				if batches.is_empty() {
+					break;
+				}
+			}
+			for batch in batches {
+				spilled
+					.write_batch_chunks(&batch, key_plan, existence_keys, self.context.task_budget)
+					.await?;
+			}
+		}
+		Ok(Some(()))
 	}
 
 	async fn try_visit_streaming_reoriented_inner_chain_base<F>(
@@ -2692,7 +3022,7 @@ impl Executor {
 		Ok(Some(()))
 	}
 
-	fn probe_streaming_semi_anti(
+	async fn probe_streaming_semi_anti(
 		&self,
 		runtime: &mut StreamingSemiAntiRuntime<'_>,
 		preserved_batch: &RecordBatch,
@@ -2711,31 +3041,38 @@ impl Executor {
 				.saturating_add(preserved_batch.num_rows() as u64);
 		});
 
-		let mut residual = JoinMatchResidual::new(
-			Some(runtime.match_filter),
-			preserved_batch,
-			&runtime.existence_batch,
-		);
+		let mut preserved_by_key: HashMap<JoinKey, Vec<u32>> = HashMap::new();
+		for row in 0..preserved_batch.num_rows() {
+			if let Some(key) = join_key_at(runtime.key_plan, &preserved_key_arrays, row, false)? {
+				preserved_by_key
+					.entry(key)
+					.or_default()
+					.push(join_probe_row_index(row)?);
+			}
+		}
+		let matched_rows = match &mut runtime.existence {
+			StreamingSemiAntiExistence::InMemory { batch, rows } => {
+				matching_preserved_rows_in_memory(
+					preserved_batch,
+					&preserved_by_key,
+					runtime.match_filter,
+					batch,
+					rows,
+				)?
+			}
+			StreamingSemiAntiExistence::Spilled(spilled) => {
+				spilled
+					.matching_preserved_rows(
+						preserved_batch,
+						&preserved_by_key,
+						runtime.match_filter,
+					)
+					.await?
+			}
+		};
 		let mut selected = Vec::<u32>::new();
 		for row in 0..preserved_batch.num_rows() {
-			let matched = match join_key_at(runtime.key_plan, &preserved_key_arrays, row, false)? {
-				Some(key) => {
-					if let Some(matches) = runtime.existence_rows.get(&key) {
-						let preserved_row = join_probe_row_index(row)?;
-						let mut matched = false;
-						for existence_row in matches.rows() {
-							if residual.matches(preserved_row, existence_row)? {
-								matched = true;
-								break;
-							}
-						}
-						matched
-					} else {
-						false
-					}
-				}
-				None => false,
-			};
+			let matched = matched_rows[row];
 			if (runtime.kind == JoinKind::LeftSemi && matched)
 				|| (runtime.kind == JoinKind::LeftAnti && !matched)
 			{
@@ -3265,6 +3602,34 @@ impl Executor {
 		}
 		Ok(partitioned)
 	}
+}
+
+fn matching_preserved_rows_in_memory(
+	preserved_batch: &RecordBatch,
+	preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
+	match_filter: &BoundExprProgram,
+	existence_batch: &RecordBatch,
+	existence_rows: &HashMap<JoinKey, BuildRowList>,
+) -> Result<Vec<bool>, ExecutionError> {
+	let mut matched = vec![false; preserved_batch.num_rows()];
+	let mut residual = JoinMatchResidual::new(Some(match_filter), preserved_batch, existence_batch);
+	for (key, preserved_rows) in preserved_by_key {
+		let Some(matches) = existence_rows.get(key) else {
+			continue;
+		};
+		for preserved_row in preserved_rows {
+			if matched[*preserved_row as usize] {
+				continue;
+			}
+			for existence_row in matches.rows() {
+				if residual.matches(*preserved_row, existence_row)? {
+					matched[*preserved_row as usize] = true;
+					break;
+				}
+			}
+		}
+	}
+	Ok(matched)
 }
 
 fn finalize_exchange_partitions(
@@ -5038,6 +5403,41 @@ impl JoinKeyPlan {
 			return Ok(Self::Generic);
 		}
 		Ok(match build_key_arrays[0].data_type() {
+			DataType::Int32 => Self::Int32,
+			DataType::Int64 => Self::Int64,
+			_ => Self::Generic,
+		})
+	}
+
+	fn from_build_schema_and_probe_schema(
+		build_schema: &SchemaRef,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		probe_schema: &SchemaRef,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+	) -> Result<Self, ExecutionError> {
+		if null_safe_keys {
+			return Ok(Self::Generic);
+		}
+		if build_keys.len() != 1 || probe_keys.len() != 1 {
+			return Ok(Self::Generic);
+		}
+		let build_index = usize::try_from(build_keys[0].0).expect("column ordinal fits usize");
+		let probe_index = usize::try_from(probe_keys[0].0).expect("column ordinal fits usize");
+		let Some(build_field) = build_schema.fields().get(build_index) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("build join key ordinal {build_index} out of bounds"),
+			});
+		};
+		let Some(probe_field) = probe_schema.fields().get(probe_index) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("probe join key ordinal {probe_index} out of bounds"),
+			});
+		};
+		if build_field.data_type() != probe_field.data_type() {
+			return Ok(Self::Generic);
+		}
+		Ok(match build_field.data_type() {
 			DataType::Int32 => Self::Int32,
 			DataType::Int64 => Self::Int64,
 			_ => Self::Generic,
@@ -7584,6 +7984,355 @@ impl SpilledJoinBuild {
 	}
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SpilledExistenceRowRef {
+	page_index: usize,
+	row: u32,
+}
+
+struct SpilledSemiAntiExistenceBuild {
+	spill_id: u64,
+	path: PathBuf,
+	file_ops: Arc<dyn AsyncFileOps>,
+	file: FileHandle,
+	key: LessSafeKey,
+	pages: Vec<JoinSpillPage>,
+	index: HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
+	cache: HashMap<usize, CachedJoinSpillPage>,
+	lru: VecDeque<usize>,
+	cache_bytes: u64,
+	cache_cap: u64,
+	spill_bytes: u64,
+	writer_peak: u64,
+	rows: u64,
+	input_rows: u64,
+	input_batches_written: u64,
+	next_offset: u64,
+}
+
+impl SpilledSemiAntiExistenceBuild {
+	async fn create(
+		task_budget: TaskBudget,
+		file_ops: Arc<dyn AsyncFileOps>,
+		spill_dir: PathBuf,
+	) -> Result<Self, ExecutionError> {
+		let spill_id = NEXT_JOIN_SPILL_ID.fetch_add(1, Ordering::SeqCst);
+		let path = spill_dir.join(format!(
+			"spill_{}_{}.existence",
+			std::process::id(),
+			spill_id
+		));
+		match Self::create_inner(spill_id, path.clone(), task_budget, file_ops.clone()).await {
+			Ok(spill) => Ok(spill),
+			Err(error) => {
+				let _ = file_ops.unlink(&path).await;
+				Err(error)
+			}
+		}
+	}
+
+	async fn create_inner(
+		spill_id: u64,
+		path: PathBuf,
+		task_budget: TaskBudget,
+		file_ops: Arc<dyn AsyncFileOps>,
+	) -> Result<Self, ExecutionError> {
+		let spill_dir = path.parent().ok_or_else(|| ExecutionError::Kernel {
+			message: "semi/anti existence spill path has no parent directory".to_string(),
+		})?;
+		file_ops
+			.create_dir_all(spill_dir)
+			.await
+			.map_err(|error| join_spill_io_error("create_dir_all", error))?;
+		let mut key_bytes = [0u8; 32];
+		aws_lc_rs::rand::fill(&mut key_bytes).map_err(|error| ExecutionError::Kernel {
+			message: format!("semi/anti existence spill key generation failed: {error:?}"),
+		})?;
+		let unbound = UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).map_err(|error| {
+			ExecutionError::Kernel {
+				message: format!("semi/anti existence spill key construction failed: {error:?}"),
+			}
+		})?;
+		let key = LessSafeKey::new(unbound);
+		let file = file_ops
+			.open(
+				&path,
+				OpenFlags {
+					read: true,
+					write: true,
+					create_new: true,
+					..OpenFlags::default()
+				},
+			)
+			.await
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("semi/anti existence spill open failed: {error}"),
+			})?;
+		let cache_cap = JOIN_SPILL_CACHE_TARGET_BYTES.min(task_budget.memory.get());
+		Ok(Self {
+			spill_id,
+			path,
+			file_ops,
+			file,
+			key,
+			pages: Vec::new(),
+			index: HashMap::new(),
+			cache: HashMap::new(),
+			lru: VecDeque::new(),
+			cache_bytes: 0,
+			cache_cap,
+			spill_bytes: 0,
+			writer_peak: 0,
+			rows: 0,
+			input_rows: 0,
+			input_batches_written: 0,
+			next_offset: 0,
+		})
+	}
+
+	async fn write_batch_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			self.write_page_batch(&chunk, key_plan, existence_keys, task_budget)
+				.await?;
+		}
+		Ok(())
+	}
+
+	async fn write_page_batch(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		let key_arrays = key_arrays(batch, existence_keys)?;
+		let mut refs = Vec::new();
+		for row in 0..batch.num_rows() {
+			let Some(key) = join_key_at(key_plan, &key_arrays, row, false)? else {
+				continue;
+			};
+			refs.push((key, join_build_row_index(row)?));
+		}
+		if refs.is_empty() {
+			return Ok(());
+		}
+
+		let page_index = self.pages.len();
+		let plaintext = encode_record_batch_ipc(batch)?;
+		let page = write_join_spill_plaintext_page(
+			self.file_ops.as_ref(),
+			&self.file,
+			&self.key,
+			self.spill_id,
+			page_index,
+			self.next_offset,
+			plaintext,
+		)
+		.await?;
+		self.spill_bytes = self.spill_bytes.saturating_add(page.ciphertext_len as u64);
+		self.writer_peak = self.writer_peak.max(page.plaintext_len as u64);
+		if self.spill_bytes > task_budget.spill_bytes.get() {
+			return Err(budget_exhausted(
+				BudgetDimension::SpillBytes,
+				"semi/anti existence-set spill writer",
+				self.spill_bytes,
+				task_budget.spill_bytes.get(),
+			));
+		}
+		for (key, row) in refs {
+			self.index
+				.entry(key)
+				.or_default()
+				.push(SpilledExistenceRowRef { page_index, row });
+			self.rows = self.rows.saturating_add(1);
+		}
+		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
+		self.pages.push(page);
+		self.guard_resident_state(task_budget.memory.get())?;
+		Ok(())
+	}
+
+	async fn finish(&self, task_budget: TaskBudget) -> Result<(), ExecutionError> {
+		self.file_ops
+			.set_len(&self.file, self.next_offset)
+			.await
+			.map_err(|error| join_spill_io_error("set_len", error))?;
+		self.file_ops
+			.fdatasync(&self.file)
+			.await
+			.map_err(|error| join_spill_io_error("fdatasync", error))?;
+		self.guard_resident_state(task_budget.memory.get())
+	}
+
+	fn guard_resident_state(&self, memory_cap: u64) -> Result<(), ExecutionError> {
+		let resident = semi_anti_existence_spill_index_bytes(&self.index)
+			.saturating_add(self.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		if resident > cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"semi/anti existence-set spill resident state",
+				resident,
+				cap,
+			));
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	fn row_count(&self) -> u64 {
+		self.rows
+	}
+
+	fn input_row_count(&self) -> u64 {
+		self.input_rows
+	}
+
+	fn spill_bytes(&self) -> u64 {
+		self.spill_bytes
+	}
+
+	#[cfg(test)]
+	fn input_batches_written(&self) -> u64 {
+		self.input_batches_written
+	}
+
+	async fn matching_preserved_rows(
+		&mut self,
+		preserved_batch: &RecordBatch,
+		preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
+		match_filter: &BoundExprProgram,
+	) -> Result<Vec<bool>, ExecutionError> {
+		let mut page_work: BTreeMap<usize, Vec<(Vec<u32>, Vec<u32>)>> = BTreeMap::new();
+		for (key, preserved_rows) in preserved_by_key {
+			let Some(row_refs) = self.index.get(key) else {
+				continue;
+			};
+			let mut rows_by_page: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+			for row_ref in row_refs {
+				rows_by_page
+					.entry(row_ref.page_index)
+					.or_default()
+					.push(row_ref.row);
+			}
+			for (page_index, existence_rows) in rows_by_page {
+				page_work
+					.entry(page_index)
+					.or_default()
+					.push((preserved_rows.clone(), existence_rows));
+			}
+		}
+
+		let mut matched = vec![false; preserved_batch.num_rows()];
+		for (page_index, groups) in page_work {
+			let existence_batch = self.read_batch_page(page_index).await?;
+			let mut residual =
+				JoinMatchResidual::new(Some(match_filter), preserved_batch, &existence_batch);
+			for (preserved_rows, existence_rows) in groups {
+				for preserved_row in preserved_rows {
+					if matched[preserved_row as usize] {
+						continue;
+					}
+					for existence_row in &existence_rows {
+						if residual.matches(preserved_row, *existence_row)? {
+							matched[preserved_row as usize] = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		Ok(matched)
+	}
+
+	async fn read_batch_page(&mut self, page_index: usize) -> Result<RecordBatch, ExecutionError> {
+		let bytes = self.read_page(page_index).await?;
+		decode_record_batch_ipc(&bytes)
+	}
+
+	async fn read_page(&mut self, page_index: usize) -> Result<Vec<u8>, ExecutionError> {
+		if let Some(cached) = self.cache.get(&page_index) {
+			let bytes = cached.bytes.clone();
+			self.touch_cache_entry(page_index);
+			return Ok(bytes);
+		}
+
+		let page = self
+			.pages
+			.get(page_index)
+			.copied()
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: format!("semi/anti existence spill page {page_index} is missing"),
+			})?;
+		let mut ciphertext = read_plain_exact(
+			self.file_ops.as_ref(),
+			&self.file,
+			page.offset,
+			page.ciphertext_len,
+		)
+		.await?;
+		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
+		let plaintext = self
+			.key
+			.open_in_place(nonce, Aad::empty(), &mut ciphertext)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("semi/anti existence spill decrypt failed: {error:?}"),
+			})?
+			.to_vec();
+		self.insert_cache_entry(page_index, plaintext.clone());
+		Ok(plaintext)
+	}
+
+	async fn cleanup(self) {
+		let file_ops = self.file_ops.clone();
+		let path = self.path.clone();
+		drop(self);
+		let _ = file_ops.unlink(&path).await;
+	}
+
+	fn touch_cache_entry(&mut self, page_index: usize) {
+		self.lru.retain(|cached| *cached != page_index);
+		self.lru.push_back(page_index);
+	}
+
+	fn insert_cache_entry(&mut self, page_index: usize, bytes: Vec<u8>) {
+		let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+		if self.cache_cap == 0 || bytes_len > self.cache_cap {
+			return;
+		}
+		while self.cache_bytes.saturating_add(bytes_len) > self.cache_cap {
+			let Some(evicted) = self.lru.pop_front() else {
+				break;
+			};
+			if let Some(page) = self.cache.remove(&evicted) {
+				self.cache_bytes = self
+					.cache_bytes
+					.saturating_sub(u64::try_from(page.bytes.len()).unwrap_or(u64::MAX));
+			}
+		}
+		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
+		self.cache.insert(page_index, CachedJoinSpillPage { bytes });
+		self.touch_cache_entry(page_index);
+	}
+}
+
 async fn write_join_spill_page(
 	file_ops: &dyn AsyncFileOps,
 	file: &FileHandle,
@@ -7593,7 +8342,20 @@ async fn write_join_spill_page(
 	offset: u64,
 	entries: &[(Vec<u8>, Vec<u32>)],
 ) -> Result<JoinSpillPage, ExecutionError> {
-	let mut plaintext = encode_join_spill_page(entries)?;
+	let plaintext = encode_join_spill_page(entries)?;
+	write_join_spill_plaintext_page(file_ops, file, key, spill_id, page_index, offset, plaintext)
+		.await
+}
+
+async fn write_join_spill_plaintext_page(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	key: &LessSafeKey,
+	spill_id: u64,
+	page_index: usize,
+	offset: u64,
+	mut plaintext: Vec<u8>,
+) -> Result<JoinSpillPage, ExecutionError> {
 	let plaintext_len = plaintext.len();
 	let nonce = Nonce::assume_unique_for_key(join_spill_nonce(spill_id, page_index));
 	key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
@@ -7731,6 +8493,35 @@ fn decode_join_spill_page_for_key(
 	Ok(rows)
 }
 
+fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Vec<u8>, ExecutionError> {
+	let mut buffer = Vec::new();
+	{
+		let options =
+			IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME))?;
+		let mut writer = StreamWriter::try_new_with_options(&mut buffer, &batch.schema(), options)?;
+		writer.write(batch)?;
+		writer.finish()?;
+	}
+	Ok(buffer)
+}
+
+fn decode_record_batch_ipc(bytes: &[u8]) -> Result<RecordBatch, ExecutionError> {
+	let cursor = Cursor::new(bytes);
+	let mut reader = StreamReader::try_new(cursor, None)?;
+	let Some(batch) = reader.next() else {
+		return Err(ExecutionError::Kernel {
+			message: "semi/anti existence spill page contained no batch".to_string(),
+		});
+	};
+	let batch = batch?;
+	if reader.next().is_some() {
+		return Err(ExecutionError::Kernel {
+			message: "semi/anti existence spill page contained multiple batches".to_string(),
+		});
+	}
+	Ok(batch)
+}
+
 fn read_u32_le(page: &[u8], cursor: &mut usize) -> Result<u32, ExecutionError> {
 	let end = cursor.checked_add(4).ok_or_else(join_spill_decode_error)?;
 	let bytes = page.get(*cursor..end).ok_or_else(join_spill_decode_error)?;
@@ -7763,6 +8554,33 @@ fn join_spill_index_bytes(index: &HashMap<Vec<u8>, Vec<usize>>) -> u64 {
 			.unwrap_or(u64::MAX)
 		})
 		.fold(0u64, u64::saturating_add)
+}
+
+fn semi_anti_existence_spill_index_bytes(
+	index: &HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
+) -> u64 {
+	index
+		.iter()
+		.map(|(key, refs)| {
+			u64::try_from(
+				64usize
+					.saturating_add(join_key_heap_bytes(key))
+					.saturating_add(
+						refs.len()
+							.saturating_mul(std::mem::size_of::<SpilledExistenceRowRef>()),
+					),
+			)
+			.unwrap_or(u64::MAX)
+		})
+		.fold(0u64, u64::saturating_add)
+}
+
+fn join_key_heap_bytes(key: &JoinKey) -> usize {
+	match key {
+		JoinKey::Int32(_) => std::mem::size_of::<i32>(),
+		JoinKey::Int64(_) => std::mem::size_of::<i64>(),
+		JoinKey::Generic(bytes) => bytes.len(),
+	}
 }
 
 fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
@@ -12153,8 +12971,8 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn streaming_semi_anti_probe_applies_residual_and_preserves_left_rows() {
+	#[tokio::test]
+	async fn streaming_semi_anti_probe_applies_residual_and_preserves_left_rows() {
 		let preserved_schema = Arc::new(Schema::new(vec![
 			Field::new("orderkey", DataType::Int64, false),
 			Field::new("suppkey", DataType::Int64, false),
@@ -12196,6 +13014,7 @@ mod tests {
 
 		let semi = executor
 			.probe_streaming_semi_anti(&mut semi_runtime, &preserved_batch)
+			.await
 			.expect("semi probe");
 		assert_eq!(record_batch_row_count(&semi), 1);
 		let semi_tags = semi[0]
@@ -12213,6 +13032,7 @@ mod tests {
 		);
 		let anti = executor
 			.probe_streaming_semi_anti(&mut anti_runtime, &preserved_batch)
+			.await
 			.expect("anti probe");
 		assert_eq!(record_batch_row_count(&anti), 2);
 		let anti_tags = anti[0]
@@ -12227,8 +13047,8 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn streaming_left_anti_probe_applies_late_residual_conjunct() {
+	#[tokio::test]
+	async fn streaming_left_anti_probe_applies_late_residual_conjunct() {
 		let preserved_schema = Arc::new(Schema::new(vec![
 			Field::new("orderkey", DataType::Int64, false),
 			Field::new("suppkey", DataType::Int64, false),
@@ -12274,6 +13094,7 @@ mod tests {
 
 		let anti = executor
 			.probe_streaming_semi_anti(&mut anti_runtime, &preserved_batch)
+			.await
 			.expect("anti probe");
 		assert_eq!(record_batch_row_count(&anti), 1);
 		let tags = anti[0]
@@ -12289,7 +13110,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn streaming_semi_anti_existence_set_accumulator_is_budgeted() {
+	async fn streaming_semi_anti_existence_set_spill_resident_state_is_budgeted() {
 		let preserved_schema = Arc::new(Schema::new(vec![
 			Field::new("orderkey", DataType::Int64, false),
 			Field::new("suppkey", DataType::Int64, false),
@@ -12346,12 +13167,86 @@ mod tests {
 				err,
 				ExecutionError::BudgetExhausted {
 					dimension: BudgetDimension::Memory,
-					producer: "semi/anti existence-set build/spill accumulator",
+					producer: "semi/anti existence-set spill resident state",
 					..
 				}
 			),
 			"unexpected existence-set error: {err:?}"
 		);
+	}
+
+	#[tokio::test]
+	async fn streaming_semi_anti_existence_build_streams_scan_batches_without_concat() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("late", DataType::Int64, false),
+		]));
+		let existence_a = RecordBatch::try_new(
+			existence_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+				Arc::new(Int64Array::from(vec![1, 1])),
+			],
+		)
+		.expect("existence batch a");
+		let existence_b = RecordBatch::try_new(
+			existence_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![3, 4])),
+				Arc::new(Int64Array::from(vec![30, 40])),
+				Arc::new(Int64Array::from(vec![1, 1])),
+			],
+		)
+		.expect("existence batch b");
+		let executor = Executor::with_context(
+			Arc::new(MultiBatchTableStorageScan {
+				batches: std::collections::HashMap::from([(
+					TableId(7),
+					vec![existence_a, existence_b],
+				)]),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let residual = suppkey_neq_residual_program(ColumnOrdinal(1), ColumnOrdinal(3));
+		let existence_plan =
+			test_scan_plan_with_first_field_key(TableId(7), existence_schema.clone(), 7);
+		let stage = StreamingSemiAntiStage {
+			replay_id: JoinReplayId(3),
+			kind: JoinKind::LeftSemi,
+			preserved_keys: vec![ColumnOrdinal(0)],
+			existence: &existence_plan,
+			existence_keys: vec![ColumnOrdinal(0)],
+			match_filter: &residual,
+			output_schema: preserved_schema,
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let runtime = executor
+			.prepare_streaming_semi_anti_runtime(stage, None)
+			.await
+			.expect("prepare existence runtime")
+			.expect("streamable existence plan");
+		match runtime.existence {
+			StreamingSemiAntiExistence::Spilled(spilled) => {
+				assert_eq!(
+					spilled.input_batches_written(),
+					2,
+					"existence scan batches must be written separately, not concat_or_empty'd first"
+				);
+				assert_eq!(spilled.input_row_count(), 4);
+				assert_eq!(spilled.row_count(), 4);
+				spilled.cleanup().await;
+			}
+			StreamingSemiAntiExistence::InMemory { .. } => {
+				panic!("matched existence path must use the streamed-spilled build")
+			}
+		}
 	}
 
 	#[test]
@@ -12970,6 +13865,31 @@ mod tests {
 				request.session_id,
 				request.query_id,
 				vec![batch],
+			))
+		}
+	}
+
+	struct MultiBatchTableStorageScan {
+		batches: std::collections::HashMap<TableId, Vec<RecordBatch>>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for MultiBatchTableStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let batches = self.batches.get(&request.table_id).cloned().ok_or(
+				StorageError::TableNotFound {
+					table: request.table_id,
+				},
+			)?;
+			let schema = batches
+				.first()
+				.map(RecordBatch::schema)
+				.unwrap_or_else(|| Arc::new(Schema::empty()));
+			Ok(ScanStream::from_batches(
+				schema,
+				request.session_id,
+				request.query_id,
+				batches,
 			))
 		}
 	}
@@ -13840,8 +14760,11 @@ mod tests {
 			replay_id: JoinReplayId::SYNTHETIC,
 			kind,
 			strategy: JoinStrategy::HashPartitioned,
-			existence_batch,
-			existence_rows,
+			existence_row_count: existence_batch.num_rows() as u64,
+			existence: StreamingSemiAntiExistence::InMemory {
+				batch: existence_batch,
+				rows: existence_rows,
+			},
 			key_plan,
 			preserved_keys: vec![ColumnOrdinal(0)],
 			match_filter: residual,
