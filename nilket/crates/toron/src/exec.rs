@@ -821,6 +821,12 @@ impl Executor {
 					predicate,
 					disposition,
 				} => {
+					if let Some(output) = self
+						.try_streaming_join0_filter(input, predicate, *disposition, morsel)
+						.await?
+					{
+						return Ok(output);
+					}
 					let input_batches = self.execute_bound(input, morsel).await?;
 					if *disposition == FilterDisposition::FullyPushed {
 						return Ok(input_batches);
@@ -1677,6 +1683,124 @@ fn finalize_global_aggregate_state(
 }
 
 impl Executor {
+	async fn try_streaming_join0_filter(
+		&self,
+		input: &ExecutionPlan,
+		predicate: &BoundExprProgram,
+		disposition: FilterDisposition,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		if disposition == FilterDisposition::FullyPushed {
+			return Ok(None);
+		}
+
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema,
+			..
+		} = input
+		else {
+			return Ok(None);
+		};
+		if *replay_id != JoinReplayId(0) {
+			return Ok(None);
+		}
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let right_batches = self.execute_bound(right, morsel).await?;
+		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let right_batch = concat_or_empty(right.schema(), &right_batches)?;
+		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+		let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan =
+			JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&left_key_arrays,
+			left_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			*null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(right_batch.num_rows() as u64);
+		});
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+		let probe_started = Instant::now();
+		let selection = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			join_key_plan,
+			&build_rows,
+			left_batch.num_rows(),
+			&right_key_arrays,
+			right_batch.num_rows(),
+			match_filter.as_ref(),
+			&left_batch,
+			&right_batch,
+			*null_safe_keys,
+		)?;
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
+		});
+		let filtered = materialize_join_selection_chunks_filter_accumulate(
+			self,
+			JoinKind::Inner,
+			&left_batch,
+			&right_batch,
+			&selection,
+			output_schema,
+			predicate,
+			self.context.task_budget.memory.get(),
+		)?;
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: *strategy,
+				build_rows: RowCount::new(left_batch.num_rows() as u64),
+				probe_rows: RowCount::new(right_batch.num_rows() as u64),
+				output_rows: RowCount::new(selection.len() as u64),
+			},
+		);
+		Ok(Some(filtered))
+	}
+
 	async fn try_streaming_collapsing_global_aggregate(
 		&self,
 		input: &ExecutionPlan,
@@ -3586,6 +3710,7 @@ fn materialize_join_selection(
 	if estimated_output_bytes > materialization_cap {
 		return Err(budget_exhausted(
 			BudgetDimension::Memory,
+			"join output materialization",
 			estimated_output_bytes,
 			materialization_cap,
 		));
@@ -4642,6 +4767,53 @@ fn fold_join_selection_chunks_into_global_aggregate(
 	Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn materialize_join_selection_chunks_filter_accumulate(
+	executor: &Executor,
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	selection: &[JoinOutputRow],
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: &BoundExprProgram,
+	memory_cap: u64,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let accumulator_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut accumulated_bytes = 0u64;
+	let mut output = Vec::new();
+	for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+		let batch = materialize_join_selection(
+			kind,
+			left_batch,
+			right_batch,
+			chunk,
+			join_output_schema,
+			memory_cap,
+		)?;
+		let batch = executor.filter_batch_with_bound_predicate(
+			filter_predicate,
+			batch,
+			"filter predicate",
+		)?;
+		accumulated_bytes = accumulated_bytes.saturating_add(record_batch_memory_bytes(&batch));
+		if accumulated_bytes > accumulator_cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"streamed join filter accumulator",
+				accumulated_bytes,
+				accumulator_cap,
+			));
+		}
+		if batch.num_rows() > 0 {
+			output.push(batch);
+		}
+	}
+	if output.is_empty() {
+		output.push(RecordBatch::new_empty(join_output_schema.clone()));
+	}
+	Ok(output)
+}
+
 fn concat_or_empty(
 	schema: arrow::datatypes::SchemaRef,
 	batches: &[RecordBatch],
@@ -4690,6 +4862,7 @@ fn execute_repeat(
 					.checked_add(count)
 					.ok_or_else(|| ExecutionError::BudgetExhausted {
 						dimension: BudgetDimension::Memory,
+						producer: "repeat output row count",
 						requested: ByteCount::new(u64::MAX),
 						available: task_budget.memory,
 					})?;
@@ -4712,6 +4885,7 @@ fn execute_repeat(
 		if estimate > task_budget.memory.get() {
 			return Err(ExecutionError::BudgetExhausted {
 				dimension: BudgetDimension::Memory,
+				producer: "repeat output materialization",
 				requested: ByteCount::new(estimate),
 				available: task_budget.memory,
 			});
@@ -4772,6 +4946,7 @@ fn execute_sort(
 	if estimate > task_budget.memory.get() {
 		return Err(ExecutionError::BudgetExhausted {
 			dimension: BudgetDimension::Memory,
+			producer: "sort materialization",
 			requested: ByteCount::new(estimate),
 			available: task_budget.memory,
 		});
@@ -4880,6 +5055,7 @@ fn execute_window(
 	if estimate > task_budget.memory.get() {
 		return Err(ExecutionError::BudgetExhausted {
 			dimension: BudgetDimension::Memory,
+			producer: "window materialization",
 			requested: ByteCount::new(estimate),
 			available: task_budget.memory,
 		});
@@ -5968,6 +6144,7 @@ fn guard_spill_retained_entry_memory(
 	if retained_bytes > retained_cap {
 		return Err(budget_exhausted(
 			BudgetDimension::Memory,
+			"join spill retained entry",
 			retained_bytes,
 			retained_cap,
 		));
@@ -6118,6 +6295,7 @@ impl SpilledJoinBuild {
 				if spill_bytes > task_budget.spill_bytes.get() {
 					return Err(budget_exhausted(
 						BudgetDimension::SpillBytes,
+						"join spill writer",
 						spill_bytes,
 						task_budget.spill_bytes.get(),
 					));
@@ -6152,6 +6330,7 @@ impl SpilledJoinBuild {
 			if spill_bytes > task_budget.spill_bytes.get() {
 				return Err(budget_exhausted(
 					BudgetDimension::SpillBytes,
+					"join spill writer",
 					spill_bytes,
 					task_budget.spill_bytes.get(),
 				));
@@ -6178,6 +6357,7 @@ impl SpilledJoinBuild {
 		if resident_without_cache > task_budget.memory.get() {
 			return Err(budget_exhausted(
 				BudgetDimension::Memory,
+				"join spill writer resident state",
 				resident_without_cache,
 				task_budget.memory.get(),
 			));
@@ -6477,9 +6657,15 @@ fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
 	nonce
 }
 
-fn budget_exhausted(dimension: BudgetDimension, requested: u64, available: u64) -> ExecutionError {
+fn budget_exhausted(
+	dimension: BudgetDimension,
+	source: &'static str,
+	requested: u64,
+	available: u64,
+) -> ExecutionError {
 	ExecutionError::BudgetExhausted {
 		dimension,
+		producer: source,
 		requested: ByteCount::new(requested),
 		available: ByteCount::new(available),
 	}
@@ -10462,6 +10648,146 @@ mod tests {
 		));
 	}
 
+	#[tokio::test]
+	async fn streaming_join0_filter_matches_materialized_float64_and_decimal_order() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
+
+		let (executor, plan, join, filter) = streaming_filter_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			0,
+			high_test_budget(),
+			3,
+			JoinReplayId(0),
+		);
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streaming float filter");
+		let materialized = materialized_join_filter(&executor, &join, &filter)
+			.await
+			.expect("materialized float filter");
+		assert_record_batches_equal(&streamed, &materialized);
+
+		let (executor, plan, join, filter) = streaming_filter_fixture(
+			StreamingValueKind::Decimal,
+			rows,
+			0,
+			high_test_budget(),
+			3,
+			JoinReplayId(0),
+		);
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streaming decimal filter");
+		let materialized = materialized_join_filter(&executor, &join, &filter)
+			.await
+			.expect("materialized decimal filter");
+		assert_record_batches_equal(&streamed, &materialized);
+	}
+
+	#[tokio::test]
+	async fn streaming_join0_filter_replaces_raw_join_materialization() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 2_000;
+		let budget = TaskBudget {
+			memory: ByteCount::new(4 * 1024 * 1024),
+			spill_bytes: ByteCount::new(128 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (executor, plan, join, _filter) = streaming_filter_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			4096,
+			budget,
+			64,
+			JoinReplayId(0),
+		);
+
+		let direct_join_err = executor
+			.execute_bound(&join, None)
+			.await
+			.expect_err("raw join materialization should exceed the output cap");
+		assert!(matches!(
+			direct_join_err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: "join output materialization",
+				..
+			}
+		));
+
+		let streamed = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("filter streaming should avoid the raw join output wall");
+		assert!(record_batch_row_count(&streamed) > 0);
+	}
+
+	#[tokio::test]
+	async fn streaming_join0_filter_accumulator_is_budgeted() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 2 + 1_000;
+		let budget = TaskBudget {
+			memory: ByteCount::new(4 * 1024 * 1024),
+			spill_bytes: ByteCount::new(128 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (executor, plan, _join, _filter) = streaming_filter_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			4096,
+			budget,
+			1,
+			JoinReplayId(0),
+		);
+
+		let err = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("filtered accumulator must fail cleanly when it remains too large");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: "streamed join filter accumulator",
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn streaming_join0_filter_shape_fence_keeps_other_join_ids_materialized() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 2_000;
+		let budget = TaskBudget {
+			memory: ByteCount::new(2 * 1024 * 1024),
+			spill_bytes: ByteCount::new(128 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (executor, plan, _join, _filter) = streaming_filter_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			4096,
+			budget,
+			64,
+			JoinReplayId::SYNTHETIC,
+		);
+
+		let err = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("non-Join(0) filter shape stays on the materialized path");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: "join output materialization",
+				..
+			}
+		));
+	}
+
 	#[test]
 	fn spill_retained_footprint_budget_guard_fires_before_write() {
 		let (left_batch, right_batch) = spill_retained_guard_fixture();
@@ -11336,6 +11662,115 @@ mod tests {
 		(executor, plan, join, filter, aggr_expr, output_schema)
 	}
 
+	fn streaming_filter_fixture(
+		kind: StreamingValueKind,
+		rows: usize,
+		blob_len: usize,
+		budget: TaskBudget,
+		keep_every: usize,
+		replay_id: JoinReplayId,
+	) -> (Executor, ExecutionPlan, ExecutionPlan, BoundExprProgram) {
+		let amount_type = match kind {
+			StreamingValueKind::Float64 => DataType::Float64,
+			StreamingValueKind::Decimal => DataType::Decimal128(20, 2),
+		};
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("amount", amount_type.clone(), true),
+			Field::new("blob", DataType::Utf8, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("keep", DataType::Int64, false),
+		]));
+		let keys = (0..i64::try_from(rows).expect("rows fit i64")).collect::<Vec<_>>();
+		let amount: ArrayRef = match kind {
+			StreamingValueKind::Float64 => Arc::new(Float64Array::from(
+				(0..rows)
+					.map(|row| match row % 3 {
+						0 => Some(1.0e16),
+						1 => Some(1.0),
+						_ => Some(-1.0e16),
+					})
+					.collect::<Vec<_>>(),
+			)),
+			StreamingValueKind::Decimal => Arc::new(
+				Decimal128Array::from(
+					(0..rows)
+						.map(|row| Some(((row % 17) as i128 + 1) * 100))
+						.collect::<Vec<_>>(),
+				)
+				.with_precision_and_scale(20, 2)
+				.expect("decimal amount"),
+			),
+		};
+		let blob = "x".repeat(blob_len);
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(keys.clone())),
+				amount,
+				Arc::new(StringArray::from(vec![blob.as_str(); rows])),
+			],
+		)
+		.expect("left streaming filter batch");
+		let keep_values = (0..rows)
+			.map(|row| {
+				if keep_every == 0 || row % keep_every == 0 {
+					1
+				} else {
+					0
+				}
+			})
+			.collect::<Vec<_>>();
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(keys)),
+				Arc::new(Int64Array::from(keep_values)),
+			],
+		)
+		.expect("right streaming filter batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_batch),
+				(TableId(2), right_batch),
+			]),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(budget),
+		);
+		let join_output_schema = Arc::new(Schema::new(
+			left_schema
+				.fields()
+				.iter()
+				.chain(right_schema.fields().iter())
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>(),
+		));
+		let join = ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: join_output_schema,
+		};
+		let filter = keep_filter_program(ColumnOrdinal(4));
+		let plan = ExecutionPlan::Filter {
+			input: Box::new(join.clone()),
+			predicate: filter.clone(),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		(executor, plan, join, filter)
+	}
+
 	fn bound_column_root(
 		name: &str,
 		ordinal: ColumnOrdinal,
@@ -11380,6 +11815,32 @@ mod tests {
 		let filtered =
 			executor.filter_batches_with_bound_predicate(filter, joined, "filter predicate")?;
 		executor.bound_global_aggregate(&filtered, aggr_expr, output_schema)
+	}
+
+	async fn materialized_join_filter(
+		executor: &Executor,
+		join: &ExecutionPlan,
+		filter: &BoundExprProgram,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let joined = executor.execute_bound(join, None).await?;
+		executor.filter_batches_with_bound_predicate(filter, joined, "filter predicate")
+	}
+
+	fn assert_record_batches_equal(left: &[RecordBatch], right: &[RecordBatch]) {
+		let left_schema = left.first().expect("left batches").schema();
+		let right_schema = right.first().expect("right batches").schema();
+		assert_eq!(left_schema, right_schema);
+		let left_batch = concat_or_empty(left_schema.clone(), left).expect("left concat");
+		let right_batch = concat_or_empty(right_schema, right).expect("right concat");
+		assert_eq!(left_batch.num_rows(), right_batch.num_rows());
+		assert_eq!(left_batch.num_columns(), right_batch.num_columns());
+		for column in 0..left_batch.num_columns() {
+			assert_eq!(
+				format!("{:?}", left_batch.column(column)),
+				format!("{:?}", right_batch.column(column)),
+				"column {column} differs"
+			);
+		}
 	}
 
 	fn materialization_guard_fixture() -> (RecordBatch, RecordBatch, SchemaRef) {

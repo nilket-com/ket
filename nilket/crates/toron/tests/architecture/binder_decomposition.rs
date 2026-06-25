@@ -197,6 +197,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/distributed/fragment.rs",
 				"crates/toron/src/distributed/scheduler.rs",
 				"crates/toron/src/distributed/task.rs",
+				// ADR 340: BudgetExhausted carries a producer label so scale wall-movers can be
+				// verified from retained diagnostics.
+				"crates/toron/src/error.rs",
 				"crates/toron/src/exec.rs",
 				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",

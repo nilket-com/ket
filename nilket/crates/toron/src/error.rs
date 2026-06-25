@@ -200,9 +200,12 @@ pub enum ExecutionError {
 	InvalidExpression { message: String },
 	#[error("kernel error: {message}")]
 	Kernel { message: String },
-	#[error("budget exhausted: {dimension:?}, requested {requested:?}, available {available:?}")]
+	#[error(
+		"budget exhausted: {dimension:?}, producer {producer}, requested {requested:?}, available {available:?}"
+	)]
 	BudgetExhausted {
 		dimension: crate::distributed::budget::BudgetDimension,
+		producer: &'static str,
 		requested: crate::distributed::budget::ByteCount,
 		available: crate::distributed::budget::ByteCount,
 	},

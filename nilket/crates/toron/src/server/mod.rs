@@ -4468,6 +4468,7 @@ where
 		}
 		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
 			dimension,
+			producer: _,
 			requested,
 			available,
 		}) => TaskFailureKind::BudgetExhausted {
@@ -4552,6 +4553,7 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 		QueryError::Runtime(RuntimeError::TaskFailure { kind }) => kind,
 		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
 			dimension,
+			producer: _,
 			requested,
 			available,
 		}) => TaskFailureKind::BudgetExhausted {

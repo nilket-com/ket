@@ -1753,6 +1753,7 @@ mod tests {
 		let (code, message) =
 			map_sql_query_error(QueryError::Execution(ExecutionError::BudgetExhausted {
 				dimension: BudgetDimension::Memory,
+				producer: "test",
 				requested: ByteCount::new(16),
 				available: ByteCount::new(8),
 			}));

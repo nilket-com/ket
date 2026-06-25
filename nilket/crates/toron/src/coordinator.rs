@@ -1638,6 +1638,7 @@ impl DistributedAttemptError {
 fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {
 	QueryError::Execution(ExecutionError::BudgetExhausted {
 		dimension: rejection.dimension,
+		producer: "tenant budget admission",
 		requested: rejection.requested,
 		available: rejection.available,
 	})
@@ -3179,6 +3180,7 @@ mod tests {
 			err,
 			QueryError::Execution(ExecutionError::BudgetExhausted {
 				dimension: BudgetDimension::Memory,
+				producer: _,
 				requested: ByteCount(8),
 				available: ByteCount(0),
 			})
@@ -3244,6 +3246,7 @@ mod tests {
 			err,
 			QueryError::Execution(ExecutionError::BudgetExhausted {
 				dimension: BudgetDimension::Memory,
+				producer: _,
 				requested: ByteCount(8),
 				available: ByteCount(0),
 			})

@@ -24,6 +24,9 @@ systemd-run --user --same-dir --wait --collect --pipe --property=MemoryMax=4G \
 - q17 is reach-only at scale; its correctness oracle is fixed to sf=0.02 and is not scale-general.
 - ADR 333 release re-measured q07/q14/q17/q18/q19/q21 with diagnostic retention. All six remain sf=1
   OOM-guard-gaps: systemd killed the process at 4G before the harness emitted a row.
+- ADR 340 moved the q07/q21 sf=1 first wall off the ADR 335 `Join(0)` raw-output guard:
+  q07 now fails at a later join-output materialization (requested 1,177,978,914), and q21 fails at the budgeted
+  streamed-filter accumulator (requested 1,074,312,896). Both remain `memory_budget_exhausted@execute`.
 
 ## Reach atlas
 Format: `class (stage; wall-clock / RSS)`
@@ -82,3 +85,16 @@ Scale-stable correctness was run only for the queries that still reached compare
 
 ## Result
 The scale atlas exists, is classified, and names the next arc from measured evidence instead of guesswork.
+
+## Later Delta - ADR 340
+
+ADR 340 is the first q07/q21 streaming-substrate wall-mover. It does not make either cell green, but it changes the
+first sf=1 wall:
+
+| query | pre-ADR 340 first wall | post-ADR 340 first wall |
+| --- | --- | --- |
+| q07 | `Join(0)` raw output materialization, requested 1,975,900,039 | later join output materialization, requested 1,177,978,914 |
+| q21 | `Join(0)` raw output materialization, requested 1,975,900,039 | streamed-filter accumulator, requested 1,074,312,896 |
+
+The atlas classification remains `memory_budget_exhausted@execute`; the producer/bytes now identify the next staged
+substrate cuts.
