@@ -915,6 +915,18 @@ impl Executor {
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
 						if let Some(output) = self
+							.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
+								input,
+								group_expr,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
+						if let Some(output) = self
 							.try_streaming_reoriented_inner_chain_grouped_aggregate(
 								input,
 								group_expr,
@@ -1708,9 +1720,10 @@ struct ReorientedInnerJoinStage<'a> {
 	build_keys: Vec<crate::ir::ColumnOrdinal>,
 	output_schema: SchemaRef,
 	strategy: JoinStrategy,
+	post_filter: Option<&'a BoundExprProgram>,
 }
 
-struct ReorientedInnerJoinRuntime {
+struct ReorientedInnerJoinRuntime<'a> {
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
 	build_batch: RecordBatch,
@@ -1718,8 +1731,41 @@ struct ReorientedInnerJoinRuntime {
 	key_plan: JoinKeyPlan,
 	probe_keys: Vec<crate::ir::ColumnOrdinal>,
 	output_schema: SchemaRef,
+	post_filter: Option<&'a BoundExprProgram>,
 	probe_rows: u64,
 	output_rows: u64,
+}
+
+struct StreamingSemiAntiStage<'a> {
+	replay_id: JoinReplayId,
+	kind: JoinKind,
+	preserved_keys: Vec<crate::ir::ColumnOrdinal>,
+	existence: &'a ExecutionPlan,
+	existence_keys: Vec<crate::ir::ColumnOrdinal>,
+	match_filter: &'a BoundExprProgram,
+	output_schema: SchemaRef,
+	strategy: JoinStrategy,
+}
+
+struct StreamingSemiAntiRuntime<'a> {
+	replay_id: JoinReplayId,
+	kind: JoinKind,
+	strategy: JoinStrategy,
+	existence_batch: RecordBatch,
+	existence_rows: HashMap<JoinKey, BuildRowList>,
+	key_plan: JoinKeyPlan,
+	preserved_keys: Vec<crate::ir::ColumnOrdinal>,
+	match_filter: &'a BoundExprProgram,
+	output_schema: SchemaRef,
+	probe_rows: u64,
+	output_rows: u64,
+}
+
+struct StreamingSemiAntiChain<'a> {
+	base: &'a ExecutionPlan,
+	inner_stages: Vec<ReorientedInnerJoinStage<'a>>,
+	semi_stage: StreamingSemiAntiStage<'a>,
+	anti_stage: StreamingSemiAntiStage<'a>,
 }
 
 fn extract_reoriented_inner_chain(
@@ -1761,6 +1807,7 @@ fn extract_reoriented_inner_chain(
 			build_keys: right_keys.clone(),
 			output_schema: output_schema.clone(),
 			strategy: JoinStrategy::HashPartitioned,
+			post_filter: None,
 		});
 		if expected == 1 {
 			stages.reverse();
@@ -1769,6 +1816,157 @@ fn extract_reoriented_inner_chain(
 		current = left_input.as_ref();
 	}
 	None
+}
+
+fn filter_input<'a>(plan: &'a ExecutionPlan) -> Option<(&'a ExecutionPlan, &'a BoundExprProgram)> {
+	let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition: FilterDisposition::EvaluateInToron,
+	} = plan
+	else {
+		return None;
+	};
+	Some((input.as_ref(), predicate))
+}
+
+fn exchange_input(plan: &ExecutionPlan) -> Option<&ExecutionPlan> {
+	let ExecutionPlan::Exchange { input, .. } = plan else {
+		return None;
+	};
+	Some(input.as_ref())
+}
+
+fn extract_streaming_inner_prefix_semi_anti_chain(
+	top: &ExecutionPlan,
+) -> Option<StreamingSemiAntiChain<'_>> {
+	let ExecutionPlan::Join {
+		replay_id: anti_replay_id,
+		left: anti_left,
+		right: anti_right,
+		kind: JoinKind::LeftAnti,
+		left_keys: anti_left_keys,
+		right_keys: anti_right_keys,
+		match_filter: Some(anti_filter),
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema: anti_output_schema,
+		..
+	} = top
+	else {
+		return None;
+	};
+	if *anti_replay_id != JoinReplayId(4) {
+		return None;
+	}
+	let semi = exchange_input(anti_left)?;
+	let ExecutionPlan::Join {
+		replay_id: semi_replay_id,
+		left: semi_left,
+		right: semi_right,
+		kind: JoinKind::LeftSemi,
+		left_keys: semi_left_keys,
+		right_keys: semi_right_keys,
+		match_filter: Some(semi_filter),
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema: semi_output_schema,
+		..
+	} = semi
+	else {
+		return None;
+	};
+	if *semi_replay_id != JoinReplayId(3) {
+		return None;
+	}
+
+	let (join2, join2_post_filter) = filter_input(exchange_input(semi_left)?)?;
+	let ExecutionPlan::Join {
+		replay_id: join2_replay_id,
+		left: join2_left,
+		right: join2_right,
+		kind: JoinKind::Inner,
+		left_keys: join2_left_keys,
+		right_keys: join2_right_keys,
+		match_filter: None,
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema: join2_output_schema,
+		..
+	} = join2
+	else {
+		return None;
+	};
+	if *join2_replay_id != JoinReplayId(2) {
+		return None;
+	}
+
+	let (join1, join1_post_filter) = filter_input(exchange_input(join2_left)?)?;
+	let ExecutionPlan::Join {
+		replay_id: join1_replay_id,
+		left: join1_left,
+		right: join1_right,
+		kind: JoinKind::Inner,
+		left_keys: join1_left_keys,
+		right_keys: join1_right_keys,
+		match_filter: None,
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema: join1_output_schema,
+		..
+	} = join1
+	else {
+		return None;
+	};
+	if *join1_replay_id != JoinReplayId(1) {
+		return None;
+	}
+
+	Some(StreamingSemiAntiChain {
+		base: join1_left.as_ref(),
+		inner_stages: vec![
+			ReorientedInnerJoinStage {
+				replay_id: *join1_replay_id,
+				probe_schema: join1_left.schema(),
+				probe_keys: join1_left_keys.clone(),
+				build: join1_right.as_ref(),
+				build_keys: join1_right_keys.clone(),
+				output_schema: join1_output_schema.clone(),
+				strategy: JoinStrategy::HashPartitioned,
+				post_filter: Some(join1_post_filter),
+			},
+			ReorientedInnerJoinStage {
+				replay_id: *join2_replay_id,
+				probe_schema: join2_left.schema(),
+				probe_keys: join2_left_keys.clone(),
+				build: join2_right.as_ref(),
+				build_keys: join2_right_keys.clone(),
+				output_schema: join2_output_schema.clone(),
+				strategy: JoinStrategy::HashPartitioned,
+				post_filter: Some(join2_post_filter),
+			},
+		],
+		semi_stage: StreamingSemiAntiStage {
+			replay_id: *semi_replay_id,
+			kind: JoinKind::LeftSemi,
+			preserved_keys: semi_left_keys.clone(),
+			existence: semi_right.as_ref(),
+			existence_keys: semi_right_keys.clone(),
+			match_filter: semi_filter,
+			output_schema: semi_output_schema.clone(),
+			strategy: JoinStrategy::HashPartitioned,
+		},
+		anti_stage: StreamingSemiAntiStage {
+			replay_id: *anti_replay_id,
+			kind: JoinKind::LeftAnti,
+			preserved_keys: anti_left_keys.clone(),
+			existence: anti_right.as_ref(),
+			existence_keys: anti_right_keys.clone(),
+			match_filter: anti_filter,
+			output_schema: anti_output_schema.clone(),
+			strategy: JoinStrategy::HashPartitioned,
+		},
+	})
 }
 
 impl Executor {
@@ -2195,11 +2393,132 @@ impl Executor {
 			.map(Some)
 	}
 
-	async fn prepare_reoriented_inner_join_runtime(
+	async fn try_streaming_inner_prefix_semi_anti_grouped_aggregate(
 		&self,
-		stage: ReorientedInnerJoinStage<'_>,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
-	) -> Result<Option<ReorientedInnerJoinRuntime>, ExecutionError> {
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: aggregate_input,
+			..
+		} = input
+		else {
+			return Ok(None);
+		};
+		let Some(chain) = extract_streaming_inner_prefix_semi_anti_chain(aggregate_input) else {
+			return Ok(None);
+		};
+
+		let mut inner_runtimes = Vec::with_capacity(chain.inner_stages.len());
+		for stage in chain.inner_stages {
+			let Some(runtime) = self
+				.prepare_reoriented_inner_join_runtime(stage, morsel)
+				.await?
+			else {
+				return Ok(None);
+			};
+			inner_runtimes.push(runtime);
+		}
+		let mut semi_runtime = self
+			.prepare_streaming_semi_anti_runtime(chain.semi_stage, morsel)
+			.await?;
+		let mut anti_runtime = self
+			.prepare_streaming_semi_anti_runtime(chain.anti_stage, morsel)
+			.await?;
+
+		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut group_types = Vec::new();
+		let matched = self
+			.try_visit_streaming_reoriented_inner_chain_base(chain.base, morsel, |base_batch| {
+				let mut batches = vec![base_batch];
+				for runtime in inner_runtimes.iter_mut() {
+					let mut next = Vec::new();
+					for batch in batches {
+						next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+					}
+					batches = next;
+					if let Some(predicate) = runtime.post_filter {
+						let mut filtered = Vec::new();
+						for batch in batches {
+							let batch = self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?;
+							if batch.num_rows() > 0 {
+								filtered.push(batch);
+							}
+						}
+						batches = filtered;
+					}
+					if batches.is_empty() {
+						break;
+					}
+				}
+
+				let mut semi_batches = Vec::new();
+				for batch in batches {
+					semi_batches.extend(self.probe_streaming_semi_anti(&mut semi_runtime, &batch)?);
+				}
+				let mut anti_batches = Vec::new();
+				for batch in semi_batches {
+					anti_batches.extend(self.probe_streaming_semi_anti(&mut anti_runtime, &batch)?);
+				}
+				for batch in anti_batches {
+					self.fold_bound_grouped_aggregate_batch(
+						&mut groups,
+						&mut group_types,
+						group_expr,
+						aggr_expr,
+						&batch,
+					)?;
+				}
+				Ok(())
+			})
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+
+		for runtime in &inner_runtimes {
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: runtime.replay_id,
+					strategy: runtime.strategy,
+					build_rows: RowCount::new(runtime.build_batch.num_rows() as u64),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+		}
+		for runtime in [&semi_runtime, &anti_runtime] {
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: runtime.replay_id,
+					strategy: runtime.strategy,
+					build_rows: RowCount::new(runtime.existence_batch.num_rows() as u64),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+		}
+
+		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+			.map(Some)
+	}
+
+	async fn prepare_reoriented_inner_join_runtime<'a>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		let build_batches = self.execute_bound(stage.build, morsel).await?;
 		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
@@ -2250,9 +2569,77 @@ impl Executor {
 			key_plan,
 			probe_keys: stage.probe_keys,
 			output_schema: stage.output_schema,
+			post_filter: stage.post_filter,
 			probe_rows: 0,
 			output_rows: 0,
 		}))
+	}
+
+	async fn prepare_streaming_semi_anti_runtime<'a>(
+		&self,
+		stage: StreamingSemiAntiStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<StreamingSemiAntiRuntime<'a>, ExecutionError> {
+		debug_assert!(matches!(
+			stage.kind,
+			JoinKind::LeftSemi | JoinKind::LeftAnti
+		));
+		let existence_batches = self.execute_bound(stage.existence, morsel).await?;
+		let existence_batch = concat_or_empty(stage.existence.schema(), &existence_batches)?;
+		let existence_key_arrays = key_arrays(&existence_batch, &stage.existence_keys)?;
+		let existence_memory_cap =
+			join_spill_retained_footprint_memory_cap(self.context.task_budget.memory.get());
+		let estimated_build_bytes = record_batch_memory_bytes(&existence_batch).saturating_add(
+			estimated_build_hash_bytes(&existence_key_arrays, existence_batch.num_rows()),
+		);
+		if estimated_build_bytes > existence_memory_cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"semi/anti existence-set build/spill accumulator",
+				estimated_build_bytes,
+				existence_memory_cap,
+			));
+		}
+		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
+			&existence_key_arrays,
+			&stage.output_schema,
+			&stage.preserved_keys,
+			false,
+		)?;
+		let Some(existence_rows) = build_in_memory_join_rows(
+			key_plan,
+			&existence_key_arrays,
+			existence_batch.num_rows(),
+			existence_memory_cap,
+			false,
+		)?
+		else {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"semi/anti existence-set build/spill accumulator",
+				estimated_build_bytes,
+				existence_memory_cap,
+			));
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(existence_batch.num_rows() as u64);
+		});
+		Ok(StreamingSemiAntiRuntime {
+			replay_id: stage.replay_id,
+			kind: stage.kind,
+			strategy: stage.strategy,
+			existence_batch,
+			existence_rows,
+			key_plan,
+			preserved_keys: stage.preserved_keys,
+			match_filter: stage.match_filter,
+			output_schema: stage.output_schema,
+			probe_rows: 0,
+			output_rows: 0,
+		})
 	}
 
 	async fn try_visit_streaming_reoriented_inner_chain_base<F>(
@@ -2305,9 +2692,82 @@ impl Executor {
 		Ok(Some(()))
 	}
 
+	fn probe_streaming_semi_anti(
+		&self,
+		runtime: &mut StreamingSemiAntiRuntime<'_>,
+		preserved_batch: &RecordBatch,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		if preserved_batch.num_rows() == 0 {
+			return Ok(Vec::new());
+		}
+		let preserved_key_arrays = key_arrays(preserved_batch, &runtime.preserved_keys)?;
+		runtime.probe_rows = runtime
+			.probe_rows
+			.saturating_add(preserved_batch.num_rows() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(preserved_batch.num_rows() as u64);
+		});
+
+		let mut residual = JoinMatchResidual::new(
+			Some(runtime.match_filter),
+			preserved_batch,
+			&runtime.existence_batch,
+		);
+		let mut selected = Vec::<u32>::new();
+		for row in 0..preserved_batch.num_rows() {
+			let matched = match join_key_at(runtime.key_plan, &preserved_key_arrays, row, false)? {
+				Some(key) => {
+					if let Some(matches) = runtime.existence_rows.get(&key) {
+						let preserved_row = join_probe_row_index(row)?;
+						let mut matched = false;
+						for existence_row in matches.rows() {
+							if residual.matches(preserved_row, existence_row)? {
+								matched = true;
+								break;
+							}
+						}
+						matched
+					} else {
+						false
+					}
+				}
+				None => false,
+			};
+			if (runtime.kind == JoinKind::LeftSemi && matched)
+				|| (runtime.kind == JoinKind::LeftAnti && !matched)
+			{
+				selected.push(join_probe_row_index(row)?);
+			}
+		}
+		runtime.output_rows = runtime.output_rows.saturating_add(selected.len() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selected.len() as u64);
+		});
+
+		let mut output = Vec::new();
+		for chunk in selected.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_preserved_selection(
+				preserved_batch,
+				chunk,
+				&runtime.output_schema,
+				self.context.task_budget.memory.get(),
+			)?;
+			if batch.num_rows() > 0 {
+				output.push(batch);
+			}
+		}
+		Ok(output)
+	}
+
 	fn probe_reoriented_inner_join(
 		&self,
-		runtime: &mut ReorientedInnerJoinRuntime,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
 		probe_batch: &RecordBatch,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		if probe_batch.num_rows() == 0 {
@@ -4369,6 +4829,35 @@ fn materialize_reoriented_inner_selection(
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
+fn materialize_preserved_selection(
+	preserved_batch: &RecordBatch,
+	selection: &[u32],
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if selection.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+	let estimated_output_bytes = join_take_index_bytes(selection.len()).saturating_add(
+		estimate_selected_batch_bytes(preserved_batch, selection.len()),
+	);
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"semi/anti preserved output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+	let indices = UInt32Array::from(selection.iter().copied().map(Some).collect::<Vec<_>>());
+	let mut columns = Vec::with_capacity(preserved_batch.num_columns());
+	for column in preserved_batch.columns() {
+		columns.push(arrow::compute::take(column, &indices, None)?);
+	}
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
 fn estimate_join_materialization_bytes(
 	kind: JoinKind,
 	left_batch: &RecordBatch,
@@ -4554,6 +5043,36 @@ impl JoinKeyPlan {
 			_ => Self::Generic,
 		})
 	}
+}
+
+fn join_key_at(
+	join_key_plan: JoinKeyPlan,
+	key_arrays: &[ArrayRef],
+	row: usize,
+	null_safe_keys: bool,
+) -> Result<Option<JoinKey>, ExecutionError> {
+	Ok(match join_key_plan {
+		JoinKeyPlan::Int32 => {
+			let values = single_join_key_array::<Int32Array>(key_arrays, "Int32")?;
+			if values.is_null(row) {
+				None
+			} else {
+				Some(JoinKey::Int32(values.value(row)))
+			}
+		}
+		JoinKeyPlan::Int64 => {
+			let values = single_join_key_array::<Int64Array>(key_arrays, "Int64")?;
+			if values.is_null(row) {
+				None
+			} else {
+				Some(JoinKey::Int64(values.value(row)))
+			}
+		}
+		JoinKeyPlan::Generic if null_safe_keys => {
+			Some(JoinKey::Generic(join_key_bytes_null_safe(key_arrays, row)?))
+		}
+		JoinKeyPlan::Generic => join_key_bytes(key_arrays, row)?.map(JoinKey::Generic),
+	})
 }
 
 fn build_in_memory_join_rows(
@@ -11635,6 +12154,235 @@ mod tests {
 	}
 
 	#[test]
+	fn streaming_semi_anti_probe_applies_residual_and_preserves_left_rows() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("tag", DataType::Int64, false),
+		]));
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("late", DataType::Int64, false),
+		]));
+		let preserved_batch = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+				Arc::new(Int64Array::from(vec![10, 20, 30])),
+				Arc::new(Int64Array::from(vec![100, 200, 300])),
+			],
+		)
+		.expect("preserved batch");
+		let existence_batch = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 4])),
+				Arc::new(Int64Array::from(vec![20, 20, 40])),
+				Arc::new(Int64Array::from(vec![1, 1, 1])),
+			],
+		)
+		.expect("existence batch");
+		let residual = suppkey_neq_residual_program(ColumnOrdinal(1), ColumnOrdinal(4));
+		let mut semi_runtime = semi_anti_runtime(
+			JoinKind::LeftSemi,
+			preserved_schema.clone(),
+			existence_batch.clone(),
+			&residual,
+		);
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(preserved_schema.clone()),
+		}));
+
+		let semi = executor
+			.probe_streaming_semi_anti(&mut semi_runtime, &preserved_batch)
+			.expect("semi probe");
+		assert_eq!(record_batch_row_count(&semi), 1);
+		let semi_tags = semi[0]
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("semi tags");
+		assert_eq!(semi_tags.values(), &[100]);
+
+		let mut anti_runtime = semi_anti_runtime(
+			JoinKind::LeftAnti,
+			preserved_schema,
+			existence_batch,
+			&residual,
+		);
+		let anti = executor
+			.probe_streaming_semi_anti(&mut anti_runtime, &preserved_batch)
+			.expect("anti probe");
+		assert_eq!(record_batch_row_count(&anti), 2);
+		let anti_tags = anti[0]
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("anti tags");
+		assert_eq!(
+			anti_tags.values(),
+			&[200, 300],
+			"same-supplier existence rows must not satisfy the non-equi residual"
+		);
+	}
+
+	#[test]
+	fn streaming_left_anti_probe_applies_late_residual_conjunct() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("tag", DataType::Int64, false),
+		]));
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("late", DataType::Int64, false),
+		]));
+		let preserved_batch = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+				Arc::new(Int64Array::from(vec![100, 200])),
+			],
+		)
+		.expect("preserved batch");
+		let existence_batch = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![30, 40])),
+				Arc::new(Int64Array::from(vec![1, 0])),
+			],
+		)
+		.expect("existence batch");
+		let residual = suppkey_neq_and_late_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(4),
+			ColumnOrdinal(5),
+		);
+		let mut anti_runtime = semi_anti_runtime(
+			JoinKind::LeftAnti,
+			preserved_schema.clone(),
+			existence_batch,
+			&residual,
+		);
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(preserved_schema),
+		}));
+
+		let anti = executor
+			.probe_streaming_semi_anti(&mut anti_runtime, &preserved_batch)
+			.expect("anti probe");
+		assert_eq!(record_batch_row_count(&anti), 1);
+		let tags = anti[0]
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("anti tags");
+		assert_eq!(
+			tags.values(),
+			&[200],
+			"on-time existence rows must not satisfy the anti residual"
+		);
+	}
+
+	#[tokio::test]
+	async fn streaming_semi_anti_existence_set_accumulator_is_budgeted() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("blob", DataType::Utf8, false),
+		]));
+		let existence_batch = RecordBatch::try_new(
+			existence_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1])),
+				Arc::new(Int64Array::from(vec![2])),
+				Arc::new(StringArray::from(vec![Some("x".repeat(64 * 1024))])),
+			],
+		)
+		.expect("existence batch");
+		let budget = TaskBudget {
+			memory: ByteCount::new(1024),
+			spill_bytes: ByteCount::new(1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let executor = Executor::with_context(
+			Arc::new(TableStorageScan {
+				batches: std::collections::HashMap::from([(TableId(7), existence_batch)]),
+			}),
+			ExecutionContext::local_test().with_task_budget(budget),
+		);
+		let residual = suppkey_neq_residual_program(ColumnOrdinal(1), ColumnOrdinal(3));
+		let existence_plan =
+			test_scan_plan_with_first_field_key(TableId(7), existence_schema.clone(), 7);
+		let stage = StreamingSemiAntiStage {
+			replay_id: JoinReplayId(3),
+			kind: JoinKind::LeftSemi,
+			preserved_keys: vec![ColumnOrdinal(0)],
+			existence: &existence_plan,
+			existence_keys: vec![ColumnOrdinal(0)],
+			match_filter: &residual,
+			output_schema: preserved_schema,
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let err = match executor
+			.prepare_streaming_semi_anti_runtime(stage, None)
+			.await
+		{
+			Ok(_) => panic!("oversized existence set must fail cleanly"),
+			Err(err) => err,
+		};
+
+		assert!(
+			matches!(
+				err,
+				ExecutionError::BudgetExhausted {
+					dimension: BudgetDimension::Memory,
+					producer: "semi/anti existence-set build/spill accumulator",
+					..
+				}
+			),
+			"unexpected existence-set error: {err:?}"
+		);
+	}
+
+	#[test]
+	fn streaming_inner_prefix_semi_anti_shape_fence_rejects_unmatched_topology() {
+		let schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)]));
+		let join = ExecutionPlan::Join {
+			replay_id: JoinReplayId(4),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(test_scan_plan(TableId(1), schema.clone(), 1)),
+			right: Box::new(test_scan_plan(TableId(2), schema.clone(), 2)),
+			kind: JoinKind::LeftAnti,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: Some(bound_column_root(
+				"id",
+				ColumnOrdinal(0),
+				DataType::Int64,
+				false,
+			)),
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: schema,
+		};
+
+		assert!(
+			extract_streaming_inner_prefix_semi_anti_chain(&join).is_none(),
+			"semi/anti streaming must not engage without the full guarded topology"
+		);
+	}
+
+	#[test]
 	fn spill_retained_footprint_budget_guard_fires_before_write() {
 		let (left_batch, right_batch) = spill_retained_guard_fixture();
 		let mut build_rows = std::collections::HashMap::new();
@@ -13000,6 +13748,107 @@ mod tests {
 		let predicate = builder.append_binary(BoundBinaryOp::Gt, keep, zero, DataType::Boolean);
 		builder.push_root(predicate);
 		builder.build()
+	}
+
+	fn suppkey_neq_residual_program(
+		preserved_suppkey: ColumnOrdinal,
+		existence_suppkey: ColumnOrdinal,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let preserved = builder.append_column(ResolvedColumn {
+			name: ColumnName("preserved_suppkey".to_string()),
+			ordinal: preserved_suppkey,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let existence = builder.append_column(ResolvedColumn {
+			name: ColumnName("existence_suppkey".to_string()),
+			ordinal: existence_suppkey,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let predicate =
+			builder.append_binary(BoundBinaryOp::Neq, preserved, existence, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	fn suppkey_neq_and_late_residual_program(
+		preserved_suppkey: ColumnOrdinal,
+		existence_suppkey: ColumnOrdinal,
+		existence_late: ColumnOrdinal,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let preserved = builder.append_column(ResolvedColumn {
+			name: ColumnName("preserved_suppkey".to_string()),
+			ordinal: preserved_suppkey,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let existence = builder.append_column(ResolvedColumn {
+			name: ColumnName("existence_suppkey".to_string()),
+			ordinal: existence_suppkey,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let late = builder.append_column(ResolvedColumn {
+			name: ColumnName("late".to_string()),
+			ordinal: existence_late,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let zero = builder.append_literal(ScalarValue::Int64(Some(0)));
+		let different =
+			builder.append_binary(BoundBinaryOp::Neq, preserved, existence, DataType::Boolean);
+		let late = builder.append_binary(BoundBinaryOp::Gt, late, zero, DataType::Boolean);
+		let predicate =
+			builder.append_binary(BoundBinaryOp::And, different, late, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	fn semi_anti_runtime<'a>(
+		kind: JoinKind,
+		preserved_schema: SchemaRef,
+		existence_batch: RecordBatch,
+		residual: &'a BoundExprProgram,
+	) -> StreamingSemiAntiRuntime<'a> {
+		let existence_key_arrays =
+			key_arrays(&existence_batch, &[ColumnOrdinal(0)]).expect("existence keys");
+		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
+			&existence_key_arrays,
+			&preserved_schema,
+			&[ColumnOrdinal(0)],
+			false,
+		)
+		.expect("key plan");
+		let existence_rows = build_in_memory_join_rows(
+			key_plan,
+			&existence_key_arrays,
+			existence_batch.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build existence rows")
+		.expect("in-memory existence rows");
+		StreamingSemiAntiRuntime {
+			replay_id: JoinReplayId::SYNTHETIC,
+			kind,
+			strategy: JoinStrategy::HashPartitioned,
+			existence_batch,
+			existence_rows,
+			key_plan,
+			preserved_keys: vec![ColumnOrdinal(0)],
+			match_filter: residual,
+			output_schema: preserved_schema,
+			probe_rows: 0,
+			output_rows: 0,
+		}
 	}
 
 	async fn materialized_join_filter_aggregate(
