@@ -62,6 +62,9 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+/// ADR 335: the raw 64 MiB task cap false-trips accepted sf=1 controls; the output guard
+/// targets the GiB-scale materializations that cgroup-kill before the engine can report a row.
+const JOIN_OUTPUT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER: u64 = 16;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// ADR 255: the safety cap on recursive-CTE fixpoint iterations. Termination is normally delta-empty
@@ -2962,6 +2965,7 @@ async fn execute_hash_join(
 			&left_batch,
 			&right_batch,
 			output_schema,
+			task_budget.memory.get(),
 			replay_id,
 			strategy,
 			&telemetry,
@@ -3095,6 +3099,7 @@ async fn execute_hash_join(
 		&right_batch,
 		&selection,
 		output_schema,
+		task_budget.memory.get(),
 	)?];
 	record_join_runtime_observation(
 		&telemetry,
@@ -3123,6 +3128,7 @@ fn execute_cross_join_match_all(
 	left_batch: &RecordBatch,
 	right_batch: &RecordBatch,
 	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
 	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
@@ -3150,6 +3156,7 @@ fn execute_cross_join_match_all(
 						right_batch,
 						&selection,
 						output_schema,
+						memory_cap,
 					)?);
 					selection.clear();
 				}
@@ -3162,6 +3169,7 @@ fn execute_cross_join_match_all(
 				right_batch,
 				&selection,
 				output_schema,
+				memory_cap,
 			)?);
 		}
 	}
@@ -3202,9 +3210,21 @@ fn materialize_join_selection(
 	right_batch: &RecordBatch,
 	selection: &[JoinOutputRow],
 	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
 ) -> Result<RecordBatch, ExecutionError> {
 	if selection.is_empty() {
 		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let estimated_output_bytes =
+		estimate_join_materialization_bytes(kind, left_batch, right_batch, selection.len());
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			estimated_output_bytes,
+			materialization_cap,
+		));
 	}
 
 	let output_columns = match kind {
@@ -3279,6 +3299,94 @@ fn materialize_join_selection(
 	};
 
 	Ok(RecordBatch::try_new(output_schema.clone(), output_columns)?)
+}
+
+fn estimate_join_materialization_bytes(
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	output_rows: usize,
+) -> u64 {
+	let mut bytes = 0u64;
+	match kind {
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::LeftOuter
+		| JoinKind::RightOuter
+		| JoinKind::FullOuter => {
+			bytes = bytes
+				.saturating_add(join_take_index_bytes(output_rows))
+				.saturating_add(join_take_index_bytes(output_rows))
+				.saturating_add(estimate_selected_batch_bytes(left_batch, output_rows))
+				.saturating_add(estimate_selected_batch_bytes(right_batch, output_rows));
+		}
+		JoinKind::LeftSemi | JoinKind::LeftAnti => {
+			bytes = bytes
+				.saturating_add(join_take_index_bytes(output_rows))
+				.saturating_add(estimate_selected_batch_bytes(left_batch, output_rows));
+		}
+		JoinKind::RightSemi | JoinKind::RightAnti => {
+			bytes = bytes
+				.saturating_add(join_take_index_bytes(output_rows))
+				.saturating_add(estimate_selected_batch_bytes(right_batch, output_rows));
+		}
+	}
+	bytes
+}
+
+fn join_output_materialization_memory_cap(memory_cap: u64) -> u64 {
+	memory_cap.saturating_mul(JOIN_OUTPUT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER)
+}
+
+fn join_take_index_bytes(rows: usize) -> u64 {
+	let rows = u64::try_from(rows).unwrap_or(u64::MAX);
+	rows.saturating_mul(std::mem::size_of::<u32>() as u64)
+		.saturating_add(rows.saturating_add(7) / 8)
+}
+
+fn estimate_selected_batch_bytes(batch: &RecordBatch, output_rows: usize) -> u64 {
+	batch
+		.columns()
+		.iter()
+		.map(|column| estimate_selected_column_bytes(column, batch.num_rows(), output_rows))
+		.fold(0u64, u64::saturating_add)
+}
+
+fn estimate_selected_column_bytes(
+	column: &ArrayRef,
+	source_rows: usize,
+	output_rows: usize,
+) -> u64 {
+	if output_rows == 0 {
+		return 0;
+	}
+
+	let output_rows = u64::try_from(output_rows).unwrap_or(u64::MAX);
+	let bytes_per_row = if source_rows == 0 {
+		empty_source_column_row_width(column.data_type())
+	} else {
+		let source_bytes = u64::try_from(column.get_array_memory_size()).unwrap_or(u64::MAX);
+		let source_rows = u64::try_from(source_rows).unwrap_or(u64::MAX);
+		source_bytes.saturating_add(source_rows.saturating_sub(1)) / source_rows
+	};
+	bytes_per_row.saturating_mul(output_rows)
+}
+
+fn empty_source_column_row_width(data_type: &DataType) -> u64 {
+	match data_type {
+		DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+		DataType::Int16 | DataType::UInt16 => 2,
+		DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
+		DataType::Int64
+		| DataType::UInt64
+		| DataType::Float64
+		| DataType::Timestamp(_, _)
+		| DataType::Duration(_) => 8,
+		DataType::Decimal128(_, _) => 16,
+		DataType::Utf8 | DataType::Binary => 8,
+		DataType::LargeUtf8 | DataType::LargeBinary => 16,
+		_ => 16,
+	}
 }
 
 fn invalid_join_selection(kind: JoinKind, row: &JoinOutputRow) -> ExecutionError {
@@ -3845,6 +3953,7 @@ async fn execute_spilled_hash_join(
 			right_batch,
 			&selection,
 			output_schema,
+			task_budget.memory.get(),
 		)?]);
 	}
 
@@ -3871,6 +3980,7 @@ async fn execute_spilled_hash_join(
 		output_schema,
 		match_filter,
 		null_safe_keys,
+		task_budget.memory.get(),
 	)
 	.await;
 	record_task_telemetry(&telemetry, |task| {
@@ -3899,6 +4009,7 @@ async fn probe_spilled_hash_join(
 	output_schema: &arrow::datatypes::SchemaRef,
 	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
+	memory_cap: u64,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
@@ -3939,6 +4050,7 @@ async fn probe_spilled_hash_join(
 		right_batch,
 		&selection,
 		output_schema,
+		memory_cap,
 	)?])
 }
 
@@ -9546,6 +9658,143 @@ mod tests {
 		));
 	}
 
+	#[test]
+	fn join_materialization_budget_guard_fires_before_take() {
+		let (left_batch, right_batch, output_schema) = materialization_guard_fixture();
+		let selection = vec![
+			JoinOutputRow::Paired { left: 0, right: 0 },
+			JoinOutputRow::Paired { left: 1, right: 1 },
+		];
+
+		let err = materialize_join_selection(
+			JoinKind::Inner,
+			&left_batch,
+			&right_batch,
+			&selection,
+			&output_schema,
+			1,
+		)
+		.expect_err("over-budget materialization must fail before take");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn join_materialization_budget_guard_allows_fitting_join() {
+		let (left_batch, right_batch, output_schema) = materialization_guard_fixture();
+		let selection = vec![
+			JoinOutputRow::Paired { left: 0, right: 0 },
+			JoinOutputRow::Paired { left: 1, right: 1 },
+		];
+
+		let batch = materialize_join_selection(
+			JoinKind::Inner,
+			&left_batch,
+			&right_batch,
+			&selection,
+			&output_schema,
+			1024 * 1024,
+		)
+		.expect("fitting materialization");
+
+		assert_eq!(batch.num_rows(), 2);
+		let right_values = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right value");
+		assert_eq!(right_values.values(), &[10, 20]);
+	}
+
+	#[test]
+	fn join_materialization_budget_guard_counts_only_preserved_semi_side() {
+		let left_schema = Arc::new(Schema::new(vec![Field::new(
+			"left_id",
+			DataType::Int64,
+			false,
+		)]));
+		let right_schema = Arc::new(Schema::new(vec![Field::new(
+			"right_blob",
+			DataType::Utf8,
+			true,
+		)]));
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1, 2]))],
+		)
+		.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema,
+			vec![Arc::new(StringArray::from(vec![
+				Some("x".repeat(16 * 1024)),
+				Some("y".repeat(16 * 1024)),
+			]))],
+		)
+		.expect("right batch");
+		let selection = vec![
+			JoinOutputRow::LeftPreserved { left: 0 },
+			JoinOutputRow::LeftPreserved { left: 1 },
+		];
+
+		let batch = materialize_join_selection(
+			JoinKind::LeftSemi,
+			&left_batch,
+			&right_batch,
+			&selection,
+			&left_schema,
+			1024,
+		)
+		.expect("semi join should not charge unmaterialized right side");
+
+		assert_eq!(batch.num_rows(), 2);
+		assert_eq!(batch.num_columns(), 1);
+	}
+
+	#[test]
+	fn cross_join_materialization_chunks_use_budget_guard() {
+		let (left_batch, right_batch, output_schema) = materialization_guard_fixture();
+
+		let err = execute_cross_join_match_all(
+			&left_batch,
+			&right_batch,
+			&output_schema,
+			1,
+			JoinReplayId::SYNTHETIC,
+			JoinStrategy::HashPartitioned,
+			&None,
+			&JoinRuntimeObservationMode::Disabled,
+		)
+		.expect_err("cross materialization must use the shared guard");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn join_materialization_estimate_saturates_for_huge_selection() {
+		let (left_batch, right_batch, _) = materialization_guard_fixture();
+
+		let estimate = estimate_join_materialization_bytes(
+			JoinKind::Inner,
+			&left_batch,
+			&right_batch,
+			usize::MAX,
+		);
+
+		assert_eq!(estimate, u64::MAX);
+	}
+
 	#[tokio::test]
 	async fn execute_bound_exchange_partitions_projected_input() {
 		let storage = Arc::new(RecordingStorageScan {
@@ -10024,6 +10273,40 @@ mod tests {
 			])),
 		};
 		(executor, plan)
+	}
+
+	fn materialization_guard_fixture() -> (RecordBatch, RecordBatch, SchemaRef) {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("left_id", DataType::Int64, false),
+			Field::new("left_label", DataType::Utf8, true),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("right_id", DataType::Int64, false),
+			Field::new("right_value", DataType::Int64, false),
+		]));
+		let left_batch = RecordBatch::try_new(
+			left_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(StringArray::from(vec![Some("alpha"), Some("beta")])),
+			],
+		)
+		.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+			],
+		)
+		.expect("right batch");
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("left_id", DataType::Int64, false),
+			Field::new("left_label", DataType::Utf8, true),
+			Field::new("right_id", DataType::Int64, false),
+			Field::new("right_value", DataType::Int64, false),
+		]));
+		(left_batch, right_batch, output_schema)
 	}
 
 	fn batch() -> RecordBatch {
