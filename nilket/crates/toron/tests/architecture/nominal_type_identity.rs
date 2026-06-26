@@ -11,10 +11,6 @@ fn execution_source() -> String {
 		.expect("read execution IR source")
 }
 
-fn exec_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
-}
-
 fn pbc_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc source")
 }

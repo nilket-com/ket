@@ -502,7 +502,7 @@ pub(crate) fn adr074_in_list_negation_uses_existing_not_opcode() {
 
 #[test]
 pub(crate) fn adr074_in_list_residual_eval_is_implemented_without_new_wendelon_surface() {
-	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 	let manifest =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
 
@@ -577,7 +577,7 @@ pub(crate) fn adr075_like_ilike_are_first_class_residual_only_predicates() {
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
-	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 
 	assert!(ir.contains("Like {"));
 	assert!(ir.contains("| Self::Like { .. }"));
@@ -608,7 +608,7 @@ pub(crate) fn adr305_substring_is_literal_bounded_and_residual_only() {
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
-	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 
 	assert!(ir.contains("Substring {"));
 	assert!(ir.contains("| Self::Substring { .. }"));
@@ -637,7 +637,7 @@ pub(crate) fn adr108_case_is_residual_bound_expression() {
 		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
 	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
-	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 	let storage =
 		std::fs::read_to_string(manifest_dir.join("src/storage.rs")).expect("read storage");
 	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
@@ -1678,7 +1678,7 @@ pub(crate) fn adr098_no_boolean_algebra_beyond_and() {
 pub(crate) fn adr098_no_wendelon_pbc_executor_storage_or_wire_change() {
 	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
@@ -1875,7 +1875,7 @@ pub(crate) fn adr100_no_ir_exec_pbc_storage_or_wendelon_change() {
 	let planner = source("src/sql_planner.rs");
 	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
@@ -1981,7 +1981,7 @@ pub(crate) fn adr104_no_execution_pbc_storage_wendelon_information_schema_surfac
 	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let runtime_markers = [
@@ -2128,7 +2128,7 @@ pub(crate) fn adr105_no_sql_ir_exec_pbc_storage_wendelon_information_schema_surf
 	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let markers = [
@@ -2300,7 +2300,7 @@ pub(crate) fn adr106_no_ir_exec_pbc_storage_wendelon_information_schema_surface(
 	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let rune = source("src/rune_engine.rs");
@@ -2375,7 +2375,7 @@ pub(crate) fn adr097_no_wendelon_096_contract_pbc_executor_storage_or_wire_chang
 
 	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
-	let executor = source("src/exec.rs");
+	let executor = exec_source();
 	let storage = source("src/storage.rs");
 
 	assert!(binder.contains("fn refinement_static_filter_class"));

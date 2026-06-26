@@ -735,8 +735,7 @@ pub(crate) fn adr026_cast_syntax_doublecolon_and_format_remain_rejected() {
 
 #[test]
 pub(crate) fn adr025_float_to_int_uses_exclusive_upper_bound() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	assert!(exec.contains("const F64_I32_LOWER: f64 = i32::MIN as f64"));
 	assert!(exec.contains("const F64_I32_UPPER: f64 = 2147483648.0"));
 	assert!(exec.contains("const F64_I64_LOWER: f64 = i64::MIN as f64"));
@@ -873,8 +872,7 @@ pub(crate) fn adr026_try_cast_policy_is_separate() {
 
 #[test]
 pub(crate) fn adr026_try_cast_supports_numeric_primitive_lattice() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let evaluate_try_cast = brace_blocks_after_marker(&exec, "fn evaluate_try_cast")
 		.into_iter()
 		.next()
@@ -906,8 +904,7 @@ pub(crate) fn adr026_try_cast_supports_numeric_primitive_lattice() {
 
 #[test]
 pub(crate) fn adr026_try_cast_nulls_only_data_domain_failures() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	assert!(!exec.contains("catch_unwind"));
 	for kernel in [
 		"fn try_cast_i64_to_i32",
@@ -1686,7 +1683,7 @@ pub(crate) fn adr070_update_remains_non_fragmentable_and_worker_rejected() {
 		.expect("read fragmenter");
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
-	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
 		.expect("read update tests");
 
@@ -2243,8 +2240,7 @@ pub(crate) fn adr115_sort_reuses_existing_ir_and_executor() {
 	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
 	let execution_ir = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 

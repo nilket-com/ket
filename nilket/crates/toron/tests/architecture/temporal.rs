@@ -17,7 +17,7 @@ pub(crate) fn adr149_date32_selectivity_breadth_is_typed_and_estimate_only() {
 	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let rune = source("src/rune_engine.rs");
 	let date32 = source("src/date32.rs");
 	let write = source("src/coordinator/write.rs");
@@ -280,7 +280,7 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	let ir = source("src/ir.rs");
 	let execution_ir = source("src/ir/execution.rs");
 	let planner = source("src/sql_planner.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let timestamp = source("src/timestamp.rs");
 	let date32 = source("src/date32.rs");
 	let daemon = source("src/daemon.rs");
@@ -387,7 +387,7 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	let ir = source("src/ir.rs");
 	let execution_ir = source("src/ir/execution.rs");
 	let planner = source("src/sql_planner.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let pbc = source("src/pbc.rs");
 	let rune = source("src/rune_engine.rs");
 	let lower_expr = source_block(&planner, "fn lower_expr");
@@ -490,7 +490,7 @@ pub(crate) fn adr153_calendar_month_year_interval_arithmetic_is_session_framed()
 	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let timestamp = source("src/timestamp.rs");
 	let date32 = source("src/date32.rs");
 	let pbc = source("src/pbc.rs");

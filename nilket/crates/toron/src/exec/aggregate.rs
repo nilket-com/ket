@@ -1269,7 +1269,7 @@ pub(in crate::exec) fn sum_state_array(
 			Ok(Arc::new(Float64Array::from(vec![seen.then_some(*total as f64)])) as ArrayRef)
 		}
 		// ADR 263: SUM(Decimal128) finalizes the i128 accumulator back to the column's (precision,
-		// scale) (Q6 slice — global aggregate, no GROUP BY).
+		// scale) (scalar global aggregate, no GROUP BY).
 		(AggState::SumInt { total, seen }, DataType::Decimal128(precision, scale)) => Ok(Arc::new(
 			Decimal128Array::from(vec![seen.then_some(*total)])
 				.with_precision_and_scale(*precision, *scale)
@@ -1630,7 +1630,7 @@ pub(in crate::exec) fn numeric_value(
 		return Ok(Some(NumericValue::Float(array.value(row))));
 	}
 	// ADR 263: a Decimal128 value enters the i128 accumulator as its raw (unscaled) integer; the
-	// SUM finalize re-applies the column's (precision, scale). (Q6 slice: SUM over Decimal.)
+	// SUM finalize re-applies the column's (precision, scale). (SUM over Decimal.)
 	if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
 		return Ok(Some(NumericValue::Int(array.value(row))));
 	}

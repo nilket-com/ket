@@ -10,7 +10,7 @@ pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
 		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
 	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
-	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 
 	let lower_expr = brace_blocks_after_marker(&planner, "fn lower_expr")
 		.into_iter()
@@ -157,7 +157,7 @@ pub(crate) fn adr112_null_sentinel_retired() {
 pub(crate) fn adr112_explicit_null_is_transient_binder_consumed() {
 	let ir = source("src/ir.rs");
 	let execution_ir = source("src/ir/execution.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let planner = source("src/sql_planner.rs");
 	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
@@ -225,7 +225,7 @@ pub(crate) fn adr112_null_predicates_stay_residual() {
 pub(crate) fn adr114_contextless_null_projection_is_result_position_only() {
 	let execution_ir = source("src/ir/execution.rs");
 	let binder = binder_source();
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let pbc = source("src/pbc.rs");
 	let bound_node = execution_ir
 		.split("pub enum BoundExprNode")

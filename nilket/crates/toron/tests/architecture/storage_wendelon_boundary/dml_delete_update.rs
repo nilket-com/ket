@@ -165,8 +165,7 @@ pub(crate) fn adr031_pbc_reads_bound_expr_program() {
 
 #[test]
 pub(crate) fn adr031_executor_evaluates_program_linearly() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let method = brace_blocks_after_marker(&exec, "pub fn evaluate_bound_program")
 		.into_iter()
 		.next()
@@ -393,8 +392,7 @@ pub(crate) fn adr030_distributed_coordinator_routes_insert_before_fragment_plan(
 
 #[test]
 pub(crate) fn adr030_executor_and_fragmenter_reject_insert() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
 	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
@@ -674,8 +672,7 @@ pub(crate) fn adr032_distributed_coordinator_routes_before_fragment() {
 
 #[test]
 pub(crate) fn adr032_fragmenter_rejects_before_join_or_exchange() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
 	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
@@ -1237,8 +1234,7 @@ pub(crate) fn adr036_fragmenter_delete_defensive_reject() {
 
 #[test]
 pub(crate) fn adr036_executor_delete_defensive_arms() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 
 	assert!(exec.contains("unbound DELETE execution"));
 	assert!(exec.contains("DELETE execution is coordinator-only"));
@@ -1259,8 +1255,7 @@ pub(crate) fn adr036_operator_label_is_delete() {
 
 #[test]
 pub(crate) fn adr036_filter_helper_preserves_execution_plan_filter() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let helper =
 		brace_blocks_after_marker(&exec, "pub(crate) fn filter_batches_with_bound_predicate")
 			.into_iter()
@@ -1598,7 +1593,7 @@ pub(crate) fn adr063_update_remains_non_fragmentable_and_worker_rejected() {
 		.expect("read fragmenter");
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
-	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let exec = exec_source();
 
 	assert!(fragmenter.contains("UpdateNotFragmentable"));
 	assert!(fragmenter.contains("matches!(plan, ExecutionPlan::Update { .. })"));

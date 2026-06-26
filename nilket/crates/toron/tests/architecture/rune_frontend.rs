@@ -25,10 +25,6 @@ fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
 
-fn exec_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
-}
-
 fn pbc_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source")
 }
@@ -1840,10 +1836,7 @@ pub(crate) fn adr125_strategy_aware_join_builder_is_single_helper() {
 pub(crate) fn adr125_no_executor_fragmenter_binder_pbc_wendelon_change() {
 	let manifest_dir = manifest_dir();
 	for (label, source) in [
-		(
-			"src/exec.rs",
-			std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read Toron source"),
-		),
+		("src/exec.rs", exec_source()),
 		(
 			"src/pbc.rs",
 			std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read Toron source"),
@@ -1927,10 +1920,7 @@ pub(crate) fn adr128_broadcast_hint_recognizer_consumes_optimizer_hint_text() {
 pub(crate) fn adr128_broadcast_hints_do_not_touch_execution_substrate() {
 	let manifest_dir = manifest_dir();
 	for (label, source) in [
-		(
-			"src/exec.rs",
-			std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read Toron source"),
-		),
+		("src/exec.rs", exec_source()),
 		(
 			"src/pbc.rs",
 			std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read Toron source"),

@@ -2,6 +2,7 @@ use super::support::*;
 
 const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
 const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_500;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_800;
 
@@ -41,6 +42,27 @@ pub(crate) fn adr353_exec_aggregate_module_exists() {
 	assert!(
 		path.exists(),
 		"missing exec/aggregate.rs aggregate executor module"
+	);
+}
+
+#[test]
+pub(crate) fn adr354_exec_root_declares_expr_module() {
+	let root = exec_root_source();
+
+	assert!(
+		root.contains("mod expr;"),
+		"exec root must declare the expression evaluator module"
+	);
+}
+
+#[test]
+pub(crate) fn adr354_exec_expr_module_exists() {
+	let manifest = manifest_dir();
+	let path = manifest.join("src/exec/expr.rs");
+
+	assert!(
+		path.exists(),
+		"missing exec/expr.rs expression evaluator module"
 	);
 }
 
@@ -175,6 +197,32 @@ pub(crate) fn adr353_exec_root_excludes_carved_aggregate_executor_cluster() {
 }
 
 #[test]
+pub(crate) fn adr354_exec_root_excludes_carved_expr_evaluator_cluster() {
+	let root = exec_root_source();
+
+	for carved_definition in [
+		"pub fn evaluate_bound_program(",
+		"pub fn evaluate_bound_program_without_storage(",
+		"fn evaluate_bound_single_root(",
+		"fn filter_batches_with_bound_predicate(",
+		"fn filter_batch_with_bound_predicate(",
+		"fn evaluate_bound_binary(",
+		"fn evaluate_bound_unary(",
+		"fn evaluate_unbound_arithmetic(",
+		"pub(crate) fn evaluate_cast(",
+		"fn evaluate_decimal_division(",
+		"fn evaluate_arithmetic(",
+		"enum ArithmeticOp",
+		"const F64_I32_LOWER",
+	] {
+		assert!(
+			!root.contains(carved_definition),
+			"exec root still defines carved expression evaluator marker {carved_definition}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr350_exec_root_is_bounded() {
 	let lines = exec_root_source().lines().count();
 	// ADR 350: first semantic executor decomposition ratchet. The post-join-carve root measured
@@ -195,6 +243,18 @@ pub(crate) fn adr353_exec_root_is_bounded_after_aggregate_carve() {
 	assert!(
 		lines <= EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT,
 		"exec root has {lines} lines; expected <= {EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT} after ADR 353 aggregate carve"
+	);
+}
+
+#[test]
+pub(crate) fn adr354_exec_root_is_bounded_after_expr_carve() {
+	let lines = exec_root_source().lines().count();
+	// ADR 354: expression evaluator cluster carved from exec.rs into exec/expr.rs.
+	// The post-carve root measured below this threshold after fmt; 7,500 leaves module/import
+	// churn slack while failing if expression evaluator logic drifts back into the root.
+	assert!(
+		lines <= EXEC_ROOT_AFTER_EXPR_LINE_LIMIT,
+		"exec root has {lines} lines; expected <= {EXEC_ROOT_AFTER_EXPR_LINE_LIMIT} after ADR 354 expr carve"
 	);
 }
 
@@ -223,7 +283,7 @@ pub(crate) fn adr352_exec_join_root_is_bounded_after_streaming_carve() {
 }
 
 #[test]
-pub(crate) fn adr350_exec_modules_have_no_query_number_identifiers() {
+pub(crate) fn adr350_exec_modules_have_no_query_number_references() {
 	let manifest = manifest_dir();
 	let offenders = exec_source_files()
 		.into_iter()
@@ -233,7 +293,7 @@ pub(crate) fn adr350_exec_modules_have_no_query_number_identifiers() {
 				.lines()
 				.enumerate()
 				.filter_map(|(idx, line)| {
-					if contains_query_number_identifier(line) {
+					if contains_query_number_reference(line) {
 						Some((path.clone(), idx + 1, line.to_string()))
 					} else {
 						None
@@ -260,17 +320,18 @@ pub(crate) fn adr350_exec_public_surface_is_still_rooted() {
 	assert!(root.contains("pub struct Executor"));
 	assert!(root.contains("pub struct ExecutionContext"));
 	assert!(exec.contains("pub(crate) fn materialize_scalar_rows("));
+	assert!(root.contains("pub(crate) use self::expr::evaluate_cast;"));
+	assert!(exec.contains("pub(crate) fn evaluate_cast("));
 	let _ = std::mem::size_of::<toron::exec::Executor>();
 	let _ = std::mem::size_of::<toron::exec::ExecutionContext>();
 }
 
-fn contains_query_number_identifier(line: &str) -> bool {
+fn contains_query_number_reference(line: &str) -> bool {
 	line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
 		.any(|token| {
 			let bytes = token.as_bytes();
-			bytes.len() >= 3
+			matches!(bytes.len(), 2 | 3)
 				&& matches!(bytes[0], b'q' | b'Q')
-				&& bytes[1].is_ascii_digit()
-				&& bytes[2].is_ascii_digit()
+				&& bytes[1..].iter().all(u8::is_ascii_digit)
 		})
 }
