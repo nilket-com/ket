@@ -95,6 +95,10 @@ pub fn reason_for_error(message: &str) -> &'static str {
 		// a named scale/cost-bound wall, not an unsupported SQL surface, so it intentionally stays out
 		// of RECOGNIZED_BLOCKERS and remains fail(memory_budget_exhausted@execute).
 		"memory_budget_exhausted"
+	} else if lowered.contains("budgetexhausted") && lowered.contains("dimension: spillbytes") {
+		// ADR 347: streamed spill can make memory walls observable as spill-volume walls. This is still
+		// a scale/cost-bound fail, not an unsupported SQL blocker.
+		"spill_budget_exhausted"
 	} else if lowered.contains("decimal") && lowered.contains("create table") {
 		"unsupported_decimal_ddl"
 	} else if lowered.contains("comparison operands have different types")

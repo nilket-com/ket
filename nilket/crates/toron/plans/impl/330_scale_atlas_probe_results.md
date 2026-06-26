@@ -31,6 +31,9 @@ systemd-run --user --same-dir --wait --collect --pipe --property=MemoryMax=4G \
   accumulator (requested 1,074,142,886). q07 remains at the later join-output wall.
 - ADR 346 moved q17 from the `join output materialization` wall (requested 1,651,834,429) to `pass@execute` at sf=1.
   q17 correctness remains fixed at sf=0.02; no sf=1 `pass@compare` claim is made for q17.
+- ADR 347 moved q12 from `memory_budget_exhausted` to `pass@execute` + `pass@compare` at sf=1. q18 moved off the
+  retained-input memory wall and now fails cleanly at `spill_budget_exhausted` (requested 537,631,256 spill bytes /
+  available 536,870,912).
 
 ## Reach atlas
 Format: `class (stage; wall-clock / RSS)`
@@ -48,13 +51,13 @@ Format: `class (stage; wall-clock / RSS)`
 | q09 | memory (oom-kill; 6.58s / 1 GB) | bind-fail (unsupported_cross_join; 65.7 ms / 2.1 GB) |
 | q10 | green (execute; 5.73s / 620428 KB) | green (execute; 22.88s / 3135540 KB) |
 | q11 | green (execute; 4.28s / 384308 KB) | green (execute; 22.99s / 912076 KB) |
-| q12 | green (execute; 6.26s / 806136 KB) | execute-fail (memory_budget_exhausted; 2.32s / 3.4 GB) |
+| q12 | green (execute; 6.26s / 806136 KB) | green (execute; 3.21s / not remeasured) |
 | q13 | green (execute; 4.91s / 454188 KB) | green (execute; 14.42s / 1438460 KB) |
 | q14 | green (execute; 18.20s / 755568 KB) | OOM-guard-gap (oom-kill; no row; 16.320s / 4 GB) |
 | q15 | green (execute; 4.32s / 516784 KB) | green (execute; 9.97s / 2252740 KB) |
 | q16 | green (execute; 4.09s / 379696 KB) | green (execute; 107.81s / 673536 KB) |
 | q17 | green (execute; 19.15s / 759676 KB) | OOM-guard-gap (oom-kill; no row; 17.085s / 4 GB) |
-| q18 | green (execute; 9.35s / 1043576 KB) | OOM-guard-gap (oom-kill; no row; 7.236s / 4 GB) |
+| q18 | green (execute; 9.35s / 1043576 KB) | execute-fail (spill_budget_exhausted; 13.30s / not remeasured) |
 | q19 | green (execute; 20.18s / 921560 KB) | OOM-guard-gap (oom-kill; no row; 19.189s / 4 GB) |
 | q20 | green (execute; 4.64s / 522592 KB) | execute-fail (memory_budget_exhausted; 1.47s / 2.1 GB) |
 | q21 | green (execute; 10.45s / 895356 KB) | OOM-guard-gap (oom-kill; no row; 4.295s / 4 GB) |
@@ -71,6 +74,7 @@ Scale-stable correctness was run only for the queries that still reached compare
 | q06 | pass@compare (4.31s / 515464 KB) | pass@compare (10.39s / 2250528 KB) |
 | q10 | pass@compare (5.47s / 619192 KB) | pass@compare (23.13s / 3137604 KB) |
 | q11 | pass@compare (3.94s / 384076 KB) | pass@compare (21.04s / 910340 KB) |
+| q12 | pass@compare (0.98s / not remeasured) | pass@compare (6.58s / not remeasured) |
 | q13 | pass@compare (5.09s / 455420 KB) | pass@compare (15.19s / 1440044 KB) |
 | q15 | pass@compare (4.69s / 516540 KB) | pass@compare (11.19s / 2253116 KB) |
 | q16 | pass@compare (4.30s / 379484 KB) | pass@compare (104.63s / 672660 KB) |
@@ -139,5 +143,16 @@ spilled-capable. q17 moves from the ADR 335 output-materialization wall to green
 | q17 | `join output materialization`, requested 1,651,834,429 | `pass@execute` at sf=1 |
 
 q17 remains a fixed-scale correctness case: its oracle is pinned to sf=0.02, so this delta updates reachability only.
-The current strict sf=1 memory walls remain q04, q12, q18, and q20; q02 remains a separate
+## Later Delta - ADR 347
+
+ADR 347 streams regular-inner spilled builds with build-column retrieval and adds a residual-free LeftSemi preserved
+side spill path. q12 clears the retained-input wall and reaches scale correctness. q18 clears the retained-input wall
+but exposes a spill-volume wall.
+
+| query | pre-ADR 347 first wall | post-ADR 347 result |
+| --- | --- | --- |
+| q12 | `join spill retained entry`, requested 1,136,180,270 | `pass@execute` at sf=1; `pass@compare` at sf=1 |
+| q18 | `join spill retained entry`, requested 2,791,071,873 in this pass | `spill_budget_exhausted`, producer `streamed inner join build spill writer`, requested 537,631,256 / available 536,870,912 |
+
+The current strict sf=1 memory walls remain q04 and q20. q18 is now a named spill-volume wall; q02 remains a separate
 `unrecognized@execute` wall.

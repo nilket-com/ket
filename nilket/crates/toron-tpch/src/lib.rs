@@ -9039,7 +9039,18 @@ mod adr332_unrecognized_diagnostics {
 	}
 
 	#[test]
-	fn budget_classifier_stays_memory_specific() {
+	fn spill_budget_exhausted_is_named_fail_not_blocked() {
+		let message = "BudgetExhausted { dimension: SpillBytes, producer: \"streamed inner join build spill writer\", requested: ByteCount(537631256), available: ByteCount(536870912) }";
+		assert_eq!(reason_for_error(message), "spill_budget_exhausted");
+		assert_eq!(
+			status_for_reason("spill_budget_exhausted"),
+			Status::Fail,
+			"spill budget exhaustion is a scale wall, not an allowlisted blocker"
+		);
+	}
+
+	#[test]
+	fn budget_classifier_stays_dimension_specific() {
 		let message =
 			"BudgetExhausted { dimension: Cpu, requested: ByteCount(2), available: ByteCount(1) }";
 		assert_eq!(reason_for_error(message), "unrecognized");
