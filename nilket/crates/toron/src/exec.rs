@@ -5493,6 +5493,30 @@ async fn execute_hash_join(
 		return Ok(output);
 	}
 
+	if let Some(output) = try_execute_partitioned_spilled_left_outer_join(
+		left_schema.clone(),
+		right_schema.clone(),
+		left_batches,
+		right_batches,
+		kind,
+		left_keys,
+		right_keys,
+		match_filter,
+		null_safe_keys,
+		replay_id,
+		strategy,
+		output_schema,
+		task_budget,
+		telemetry.clone(),
+		join_runtime_observation_mode.clone(),
+		spill_file_ops.clone(),
+		spill_dir.clone(),
+	)
+	.await?
+	{
+		return Ok(output);
+	}
+
 	let left_batch = concat_or_empty(left_schema, left_batches)?;
 	let right_batch = concat_or_empty(right_schema, right_batches)?;
 
@@ -7119,6 +7143,319 @@ async fn probe_streamed_spilled_left_semi_join(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn try_execute_partitioned_spilled_left_outer_join(
+	left_schema: arrow::datatypes::SchemaRef,
+	right_schema: arrow::datatypes::SchemaRef,
+	left_batches: &[RecordBatch],
+	right_batches: &[RecordBatch],
+	kind: JoinKind,
+	left_keys: &[crate::ir::ColumnOrdinal],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	join_runtime_observation_mode: JoinRuntimeObservationMode,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+	if kind != JoinKind::LeftOuter || match_filter.is_some() {
+		return Ok(None);
+	}
+	let estimated_build_bytes = estimated_build_hash_bytes_for_batches(left_batches, left_keys)?;
+	if estimated_build_bytes <= task_budget.memory.get() {
+		return Ok(None);
+	}
+
+	let partition_count =
+		streamed_spill_partition_count(estimated_build_bytes, task_budget.memory.get())?;
+	let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+		&left_schema,
+		left_keys,
+		&right_schema,
+		right_keys,
+		null_safe_keys,
+	)?;
+	let mut output = Vec::new();
+	let output_cap = join_output_materialization_memory_cap(task_budget.memory.get());
+	let mut output_bytes = 0u64;
+	let mut total_build_rows = 0u64;
+	let mut total_probe_rows = 0u64;
+	let mut total_output_rows = 0u64;
+
+	for partition in 0..partition_count {
+		let mut spilled =
+			SpilledInnerJoinBuild::create(task_budget, spill_file_ops.clone(), spill_dir.clone())
+				.await?;
+		let build_started = Instant::now();
+		for batch in left_batches {
+			let partitioned = select_join_partition_batch(
+				batch,
+				left_keys,
+				partition_count,
+				partition,
+				null_safe_keys,
+				true,
+			)?;
+			spilled
+				.write_preserved_batch_chunks(
+					&partitioned,
+					key_plan,
+					left_keys,
+					null_safe_keys,
+					task_budget,
+				)
+				.await?;
+		}
+		spilled.finish(task_budget).await?;
+		let build_rows = spilled.input_row_count();
+		total_build_rows = total_build_rows.saturating_add(build_rows);
+		record_task_telemetry(&telemetry, |task| {
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
+			task.phases.spill_micros = task
+				.phases
+				.spill_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.spill_bytes = task
+				.counters
+				.spill_bytes
+				.saturating_add(spilled.spill_bytes());
+		});
+
+		let probe_started = Instant::now();
+		let mut visit = |batch: RecordBatch| -> Result<(), ExecutionError> {
+			if batch.num_rows() == 0 {
+				return Ok(());
+			}
+			output_bytes = output_bytes.saturating_add(record_batch_memory_bytes(&batch));
+			if output_bytes > output_cap {
+				return Err(budget_exhausted(
+					BudgetDimension::Memory,
+					"partitioned left outer output accumulator",
+					output_bytes,
+					output_cap,
+				));
+			}
+			total_output_rows = total_output_rows.saturating_add(batch.num_rows() as u64);
+			output.push(batch);
+			Ok(())
+		};
+		let (probe_rows, output_rows) = visit_partitioned_spilled_left_outer_join_chunks(
+			&mut spilled,
+			right_batches,
+			right_keys,
+			partition_count,
+			partition,
+			key_plan,
+			null_safe_keys,
+			&right_schema,
+			output_schema,
+			task_budget.memory.get(),
+			&mut visit,
+		)
+		.await?;
+		total_probe_rows = total_probe_rows.saturating_add(probe_rows);
+		record_task_telemetry(&telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+		});
+		spilled.cleanup().await;
+	}
+
+	if output.is_empty() {
+		output.push(RecordBatch::new_empty(output_schema.clone()));
+	}
+	if output.len() > 1 {
+		output = vec![concat_batches(output_schema, &output)?];
+	}
+	record_join_runtime_observation(
+		&telemetry,
+		&join_runtime_observation_mode,
+		JoinRuntimeObservation {
+			replay_id,
+			strategy,
+			build_rows: RowCount::new(total_build_rows),
+			probe_rows: RowCount::new(total_probe_rows),
+			output_rows: RowCount::new(total_output_rows),
+		},
+	);
+	Ok(Some(output))
+}
+
+fn streamed_spill_partition_count(
+	estimated_build_bytes: u64,
+	memory_cap: u64,
+) -> Result<u32, ExecutionError> {
+	let target = (memory_cap / 2).max(1);
+	let needed = estimated_build_bytes.saturating_add(target.saturating_sub(1)) / target;
+	let needed = needed.max(1);
+	let partitions = needed.next_power_of_two().min(1024);
+	u32::try_from(partitions).map_err(|_| ExecutionError::Kernel {
+		message: "streamed spill partition count exceeds u32".to_string(),
+	})
+}
+
+fn select_join_partition_batch(
+	batch: &RecordBatch,
+	keys: &[crate::ir::ColumnOrdinal],
+	partition_count: u32,
+	partition: u32,
+	null_safe_keys: bool,
+	retain_unkeyed_rows: bool,
+) -> Result<RecordBatch, ExecutionError> {
+	let key_arrays = key_arrays(batch, keys)?;
+	let partition = usize::try_from(partition).expect("partition fits usize");
+	let mut indices = Vec::new();
+	for row in 0..batch.num_rows() {
+		let row_partition = if null_safe_keys {
+			Some(partition_bucket(&key_arrays, row, partition_count)?)
+		} else if join_key_bytes(&key_arrays, row)?.is_some() {
+			Some(partition_bucket(&key_arrays, row, partition_count)?)
+		} else if retain_unkeyed_rows {
+			Some(0)
+		} else {
+			None
+		};
+		if row_partition == Some(partition) {
+			indices.push(Some(join_probe_row_index(row)?));
+		}
+	}
+	if indices.is_empty() {
+		return Ok(RecordBatch::new_empty(batch.schema()));
+	}
+	let indices = UInt32Array::from(indices);
+	let columns = batch
+		.columns()
+		.iter()
+		.map(|column| take(column, &indices, None))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn visit_partitioned_spilled_left_outer_join_chunks<F>(
+	spilled: &mut SpilledInnerJoinBuild,
+	right_batches: &[RecordBatch],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	partition_count: u32,
+	partition: u32,
+	key_plan: JoinKeyPlan,
+	null_safe_keys: bool,
+	right_schema: &SchemaRef,
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+	visit_batch: &mut F,
+) -> Result<(u64, u64), ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	let mut matched = spilled.empty_page_match_bitmap();
+	let mut probe_rows = 0u64;
+	let mut output_rows = 0u64;
+	for batch in right_batches {
+		let partitioned = select_join_partition_batch(
+			batch,
+			right_keys,
+			partition_count,
+			partition,
+			null_safe_keys,
+			false,
+		)?;
+		if partitioned.num_rows() == 0 {
+			continue;
+		}
+		probe_rows = probe_rows.saturating_add(partitioned.num_rows() as u64);
+		let right_key_arrays = key_arrays(&partitioned, right_keys)?;
+		for offset in (0..partitioned.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(partitioned.num_rows() - offset);
+			let probe_chunk = partitioned.slice(offset, len);
+			let right_key_arrays = right_key_arrays
+				.iter()
+				.map(|array| array.slice(offset, len))
+				.collect::<Vec<_>>();
+			let mut matches = Vec::new();
+			for row in 0..probe_chunk.num_rows() {
+				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
+					continue;
+				};
+				for build in spilled.lookup(&key).await? {
+					spilled.mark_page_row_matched(&mut matched, build);
+					matches.push(SpilledInnerJoinMatch {
+						build,
+						probe: join_probe_row_index(row)?,
+					});
+				}
+			}
+			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let batch = materialize_streamed_spilled_left_outer_matches(
+					spilled,
+					&probe_chunk,
+					chunk,
+					output_schema,
+					memory_cap,
+				)
+				.await?;
+				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
+				visit_batch(batch)?;
+			}
+		}
+	}
+
+	let mut unmatched = Vec::new();
+	for page_index in 0..spilled.page_count() {
+		let rows = spilled.page_row_count(page_index)?;
+		for row in 0..rows {
+			if spilled.page_row_matched(&matched, page_index, row as usize) {
+				continue;
+			}
+			unmatched.push(SpilledBatchRowRef {
+				page_index,
+				row: join_build_row_index(row as usize)?,
+			});
+			if unmatched.len() == CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+				let batch = materialize_streamed_spilled_left_outer_unmatched(
+					spilled,
+					&unmatched,
+					right_schema,
+					output_schema,
+					memory_cap,
+				)
+				.await?;
+				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
+				visit_batch(batch)?;
+				unmatched.clear();
+			}
+		}
+	}
+	if !unmatched.is_empty() {
+		let batch = materialize_streamed_spilled_left_outer_unmatched(
+			spilled,
+			&unmatched,
+			right_schema,
+			output_schema,
+			memory_cap,
+		)
+		.await?;
+		output_rows = output_rows.saturating_add(batch.num_rows() as u64);
+		visit_batch(batch)?;
+	}
+
+	Ok((probe_rows, output_rows))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_execute_streamed_spilled_inner_join(
 	left_schema: arrow::datatypes::SchemaRef,
 	right_schema: arrow::datatypes::SchemaRef,
@@ -7553,6 +7890,161 @@ async fn materialize_projected_streamed_spilled_build_rows(
 				refs.len(),
 			)?);
 		}
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+async fn materialize_streamed_spilled_left_outer_matches(
+	spilled: &mut SpilledInnerJoinBuild,
+	probe_batch: &RecordBatch,
+	matches: &[SpilledInnerJoinMatch],
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if matches.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in matches {
+		page_sources
+			.entry(row.build.page_index)
+			.or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let estimated_output_bytes = join_take_index_bytes(matches.len())
+		.saturating_add(join_interleave_index_bytes(matches.len()))
+		.saturating_add(estimate_spilled_inner_build_selection_bytes(
+			&build_pages,
+			matches.len(),
+		))
+		.saturating_add(estimate_selected_batch_bytes(probe_batch, matches.len()));
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"partitioned left outer output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(matches.len());
+	let mut probe_indices = Vec::with_capacity(matches.len());
+	for row in matches {
+		let source_index =
+			*page_sources
+				.get(&row.build.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"partitioned left outer missing spilled page source {}",
+						row.build.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.build.row as usize));
+		probe_indices.push(Some(row.probe));
+	}
+
+	let mut columns = Vec::with_capacity(
+		build_pages
+			.first()
+			.map(RecordBatch::num_columns)
+			.unwrap_or(0)
+			.saturating_add(probe_batch.num_columns()),
+	);
+	for column_index in 0..build_pages
+		.first()
+		.map(RecordBatch::num_columns)
+		.unwrap_or(0)
+	{
+		let source_columns = build_pages
+			.iter()
+			.map(|batch| batch.column(column_index).as_ref())
+			.collect::<Vec<_>>();
+		columns.push(interleave(&source_columns, &build_indices)?);
+	}
+	let probe_indices = UInt32Array::from(probe_indices);
+	for column in probe_batch.columns() {
+		columns.push(take(column, &probe_indices, None)?);
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+async fn materialize_streamed_spilled_left_outer_unmatched(
+	spilled: &mut SpilledInnerJoinBuild,
+	refs: &[SpilledBatchRowRef],
+	right_schema: &SchemaRef,
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if refs.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in refs {
+		page_sources.entry(row.page_index).or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let estimated_output_bytes = join_interleave_index_bytes(refs.len()).saturating_add(
+		estimate_spilled_inner_build_selection_bytes(&build_pages, refs.len()),
+	);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"partitioned left outer unmatched materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(refs.len());
+	for row in refs {
+		let source_index =
+			*page_sources
+				.get(&row.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"partitioned left outer missing unmatched page source {}",
+						row.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.row as usize));
+	}
+
+	let mut columns = Vec::with_capacity(output_schema.fields().len());
+	for column_index in 0..build_pages
+		.first()
+		.map(RecordBatch::num_columns)
+		.unwrap_or(0)
+	{
+		let source_columns = build_pages
+			.iter()
+			.map(|batch| batch.column(column_index).as_ref())
+			.collect::<Vec<_>>();
+		columns.push(interleave(&source_columns, &build_indices)?);
+	}
+	for field in right_schema.fields() {
+		columns.push(arrow::array::new_null_array(field.data_type(), refs.len()));
 	}
 
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
@@ -9920,6 +10412,7 @@ struct SpilledInnerJoinBuild {
 	file: FileHandle,
 	key: LessSafeKey,
 	pages: Vec<JoinSpillPage>,
+	page_rows: Vec<u32>,
 	index: HashMap<JoinKey, Vec<SpilledBatchRowRef>>,
 	cache: HashMap<usize, CachedJoinSpillPage>,
 	lru: VecDeque<usize>,
@@ -9995,6 +10488,7 @@ impl SpilledInnerJoinBuild {
 			file,
 			key,
 			pages: Vec::new(),
+			page_rows: Vec::new(),
 			index: HashMap::new(),
 			cache: HashMap::new(),
 			lru: VecDeque::new(),
@@ -10025,8 +10519,44 @@ impl SpilledInnerJoinBuild {
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let chunk = batch.slice(offset, len);
-			self.write_page_batch(&chunk, key_plan, build_keys, null_safe_keys, task_budget)
-				.await?;
+			self.write_page_batch(
+				&chunk,
+				key_plan,
+				build_keys,
+				null_safe_keys,
+				false,
+				task_budget,
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
+	async fn write_preserved_batch_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			self.write_page_batch(
+				&chunk,
+				key_plan,
+				build_keys,
+				null_safe_keys,
+				true,
+				task_budget,
+			)
+			.await?;
 		}
 		Ok(())
 	}
@@ -10054,6 +10584,7 @@ impl SpilledInnerJoinBuild {
 				key_plan,
 				projected_build_keys,
 				null_safe_keys,
+				false,
 				task_budget,
 			)
 			.await?;
@@ -10067,6 +10598,7 @@ impl SpilledInnerJoinBuild {
 		key_plan: JoinKeyPlan,
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
+		retain_unkeyed_rows: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
@@ -10080,7 +10612,7 @@ impl SpilledInnerJoinBuild {
 			};
 			refs.push((key, join_build_row_index(row)?));
 		}
-		if refs.is_empty() {
+		if refs.is_empty() && !retain_unkeyed_rows {
 			return Ok(());
 		}
 
@@ -10114,6 +10646,7 @@ impl SpilledInnerJoinBuild {
 			self.rows = self.rows.saturating_add(1);
 		}
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
+		self.page_rows.push(join_build_row_index(batch.num_rows())?);
 		self.pages.push(page);
 		self.guard_resident_state(task_budget.memory.get())?;
 		Ok(())
@@ -10152,6 +10685,40 @@ impl SpilledInnerJoinBuild {
 		join_key: &JoinKey,
 	) -> Result<Vec<SpilledBatchRowRef>, ExecutionError> {
 		Ok(self.index.get(join_key).cloned().unwrap_or_default())
+	}
+
+	fn page_count(&self) -> usize {
+		self.pages.len()
+	}
+
+	fn page_row_count(&self, page_index: usize) -> Result<usize, ExecutionError> {
+		self.page_rows
+			.get(page_index)
+			.copied()
+			.map(|rows| rows as usize)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: format!("inner join batch spill page {page_index} is missing row count"),
+			})
+	}
+
+	fn empty_page_match_bitmap(&self) -> Vec<Vec<u64>> {
+		self.page_rows
+			.iter()
+			.map(|rows| vec![0; (*rows as usize).div_ceil(64)])
+			.collect()
+	}
+
+	fn mark_page_row_matched(&self, matched: &mut [Vec<u64>], row: SpilledBatchRowRef) {
+		let Some(bitmap) = matched.get_mut(row.page_index) else {
+			return;
+		};
+		set_build_row_matched(bitmap, row.row);
+	}
+
+	fn page_row_matched(&self, matched: &[Vec<u64>], page_index: usize, row: usize) -> bool {
+		matched
+			.get(page_index)
+			.is_some_and(|bitmap| build_row_matched(bitmap, row))
 	}
 
 	async fn read_batch_page(&mut self, page_index: usize) -> Result<RecordBatch, ExecutionError> {
@@ -14856,6 +15423,220 @@ mod tests {
 			.expect("preserved labels");
 		assert_eq!(labels.value(0), "left-0");
 		assert_eq!(labels.value(rows - 1), format!("left-{}", rows - 1));
+	}
+
+	#[tokio::test]
+	async fn partitioned_spilled_left_outer_join_matches_materialized_full_row() {
+		let rows = 2_048usize;
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("build_key", DataType::Int64, true),
+			Field::new("build_id", DataType::Int64, false),
+			Field::new("build_label", DataType::Utf8, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("probe_key", DataType::Int64, false),
+			Field::new("probe_value", DataType::Int64, false),
+		]));
+		let build_keys = (0..rows)
+			.map(|row| {
+				if row % 257 == 0 {
+					None
+				} else {
+					Some(i64::try_from(row % 193).expect("key fits"))
+				}
+			})
+			.collect::<Vec<_>>();
+		let build_ids = (0..rows)
+			.map(|row| i64::try_from(row).expect("row fits"))
+			.collect::<Vec<_>>();
+		let build_labels = (0..rows)
+			.map(|row| format!("left-{row}"))
+			.collect::<Vec<_>>();
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(build_keys)),
+				Arc::new(Int64Array::from(build_ids)),
+				Arc::new(StringArray::from(build_labels)),
+			],
+		)
+		.expect("left batch");
+		let left_batches = vec![
+			left_batch.slice(0, rows / 2),
+			left_batch.slice(rows / 2, rows / 2),
+		];
+		let probe_keys = (0..256)
+			.map(|row| i64::try_from(row % 193).expect("probe key fits"))
+			.collect::<Vec<_>>();
+		let probe_values = (0..256)
+			.map(|row| i64::try_from(row * 10).expect("probe value fits"))
+			.collect::<Vec<_>>();
+		let right_batches = vec![
+			RecordBatch::try_new(
+				right_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(probe_keys)),
+					Arc::new(Int64Array::from(probe_values)),
+				],
+			)
+			.expect("right batch"),
+		];
+		let output_schema = Arc::new(Schema::new(
+			left_schema
+				.fields()
+				.iter()
+				.map(|field| field.as_ref().clone())
+				.chain(
+					right_schema
+						.fields()
+						.iter()
+						.map(|field| Field::new(field.name(), field.data_type().clone(), true)),
+				)
+				.collect::<Vec<_>>(),
+		));
+		let low_budget = TaskBudget {
+			memory: ByteCount::new(32 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let context = ExecutionContext::local_test();
+
+		let streamed = try_execute_partitioned_spilled_left_outer_join(
+			left_schema.clone(),
+			right_schema.clone(),
+			&left_batches,
+			&right_batches,
+			JoinKind::LeftOuter,
+			&[ColumnOrdinal(0)],
+			&[ColumnOrdinal(0)],
+			None,
+			false,
+			JoinReplayId::SYNTHETIC,
+			JoinStrategy::HashPartitioned,
+			&output_schema,
+			low_budget,
+			None,
+			JoinRuntimeObservationMode::Disabled,
+			context.join_spill_file_ops,
+			context.join_spill_dir,
+		)
+		.await
+		.expect("partitioned left outer should execute")
+		.expect("partitioned route should engage");
+		assert_eq!(
+			streamed.len(),
+			1,
+			"partitioned left outer preserves the join executor's single-batch result contract"
+		);
+		let materialized = execute_hash_join(
+			left_schema,
+			right_schema,
+			&left_batches,
+			&right_batches,
+			JoinKind::LeftOuter,
+			&[ColumnOrdinal(0)],
+			&[ColumnOrdinal(0)],
+			None,
+			false,
+			JoinReplayId::SYNTHETIC,
+			JoinStrategy::HashPartitioned,
+			&output_schema,
+			high_test_budget(),
+			None,
+			JoinRuntimeObservationMode::Disabled,
+			ExecutionContext::local_test().join_spill_file_ops,
+			ExecutionContext::local_test().join_spill_dir,
+		)
+		.await
+		.expect("materialized left outer");
+
+		assert_eq!(
+			record_batch_row_count(&streamed),
+			record_batch_row_count(&materialized)
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&streamed, SortPolicy::FullRowLex).expect("streamed digest"),
+			canonical_arrow_ipc_digest(&materialized, SortPolicy::FullRowLex)
+				.expect("materialized digest"),
+			"partitioned spilled left outer must preserve the same rows and null-fill values"
+		);
+	}
+
+	#[tokio::test]
+	async fn partitioned_spilled_left_outer_build_writes_preserved_batches_without_concat() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, true),
+			Field::new("payload", DataType::Utf8, false),
+		]));
+		let batch_a = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), None])),
+				Arc::new(StringArray::from(vec!["a", "null-key"])),
+			],
+		)
+		.expect("batch a");
+		let batch_b = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(2), Some(3)])),
+				Arc::new(StringArray::from(vec!["b", "c"])),
+			],
+		)
+		.expect("batch b");
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&schema,
+			&[ColumnOrdinal(0)],
+			&schema,
+			&[ColumnOrdinal(0)],
+			false,
+		)
+		.expect("key plan");
+		let budget = high_test_budget();
+		let context = ExecutionContext::local_test();
+		let mut spilled = SpilledInnerJoinBuild::create(
+			budget,
+			context.join_spill_file_ops,
+			context.join_spill_dir,
+		)
+		.await
+		.expect("create spill");
+
+		spilled
+			.write_preserved_batch_chunks(&batch_a, key_plan, &[ColumnOrdinal(0)], false, budget)
+			.await
+			.expect("write batch a");
+		spilled
+			.write_preserved_batch_chunks(&batch_b, key_plan, &[ColumnOrdinal(0)], false, budget)
+			.await
+			.expect("write batch b");
+
+		assert_eq!(
+			spilled.input_batches_written(),
+			2,
+			"preserved build input must be written batch-by-batch, not concat_or_empty'd first"
+		);
+		assert_eq!(spilled.input_row_count(), 4);
+		assert_eq!(spilled.page_count(), 2);
+		assert_eq!(spilled.page_row_count(0).expect("page 0 rows"), 2);
+		assert_eq!(spilled.page_row_count(1).expect("page 1 rows"), 2);
+		spilled.cleanup().await;
+	}
+
+	#[test]
+	fn streamed_spill_partition_count_grows_to_keep_partition_resident_bounded() {
+		let memory_cap = 64 * 1024 * 1024;
+		let sf1_estimate = 121 * 1024 * 1024;
+		let sf10_estimate = sf1_estimate * 10;
+		let sf1_partitions =
+			u64::from(streamed_spill_partition_count(sf1_estimate, memory_cap).unwrap());
+		let sf10_partitions =
+			u64::from(streamed_spill_partition_count(sf10_estimate, memory_cap).unwrap());
+		let target = memory_cap / 2;
+
+		assert!(sf10_partitions > sf1_partitions);
+		assert!(sf1_estimate.div_ceil(sf1_partitions) <= target);
+		assert!(sf10_estimate.div_ceil(sf10_partitions) <= target);
 	}
 
 	#[tokio::test]
