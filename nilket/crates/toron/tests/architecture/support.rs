@@ -217,6 +217,28 @@ pub(crate) fn binder_source() -> String {
 		.join("\n")
 }
 
+pub(crate) fn exec_root_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec root source")
+}
+
+pub(crate) fn exec_source_files() -> Vec<PathBuf> {
+	let src = manifest_dir().join("src");
+	let module_root = src.join("exec");
+	let mut files = vec![src.join("exec.rs")];
+	if module_root.exists() {
+		files.extend(source_files(&module_root));
+	}
+	files
+}
+
+pub(crate) fn exec_source() -> String {
+	exec_source_files()
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read exec source"))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 pub(crate) fn wendelon_storage_manager_source() -> String {
 	let src = wendelon_manifest_dir().join("src/storage");
 	let module_root = src.join("manager");

@@ -6,6 +6,7 @@ pub(crate) mod cross_join;
 pub(crate) mod cte;
 pub(crate) mod distributed_execution;
 pub(crate) mod distributed_fixture;
+pub(crate) mod exec_decomposition;
 pub(crate) mod heavy_hitter;
 pub(crate) mod join_cardinality;
 pub(crate) mod join_order;

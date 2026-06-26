@@ -217,7 +217,7 @@ pub(crate) fn adr239_scalar_local_cross_is_bounded_single_partition_gather() {
 
 #[test]
 pub(crate) fn adr239_cross_join_executor_match_all_path_is_explicit() {
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 
 	// D5: a dedicated keyless match-all path, routed before the hash build/probe.
 	assert!(

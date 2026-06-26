@@ -1028,8 +1028,7 @@ pub(crate) fn adr119_consumer_readiness_uses_running_not_advertisement() {
 
 #[test]
 pub(crate) fn g19_join_hash_spill_uses_m10_async_file_ops() {
-	let source =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read execution source");
+	let source = exec_source();
 	let spill = source
 		.split("struct SpilledJoinBuild")
 		.nth(1)

@@ -201,6 +201,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// verified from retained diagnostics.
 				"crates/toron/src/error.rs",
 				"crates/toron/src/exec.rs",
+				// ADR 350: semantic executor decomposition moves join substrate out of exec.rs.
+				"crates/toron/src/exec/join.rs",
 				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",
 				"crates/toron/src/lib.rs",

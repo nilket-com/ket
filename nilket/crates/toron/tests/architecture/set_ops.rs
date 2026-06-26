@@ -55,7 +55,7 @@ pub(crate) fn adr235_union_is_only_concat_execution_state() {
 pub(crate) fn adr235_set_membership_join_path_is_private_and_null_safe() {
 	let binder = binder_source();
 	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 
 	assert!(bind_scoped_join.contains("if null_safe_keys && on.is_empty()"));
 	assert!(bind_scoped_join.contains("set_op_output_schema"));

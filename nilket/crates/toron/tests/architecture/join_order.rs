@@ -239,7 +239,7 @@ pub(crate) fn adr179_explain_analyze_is_implemented_not_rejected() {
 
 #[test]
 pub(crate) fn adr179_runtime_evidence_is_observational() {
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let coordinator = source("src/coordinator.rs");
 	let recorder = first_block(&exec, "fn record_join_runtime_observation");
 	let local = first_block(&coordinator, "async fn execute_explain_analyze(");
@@ -271,7 +271,7 @@ pub(crate) fn adr179_measures_does_not_act() {
 pub(crate) fn adr179_actual_correlates_via_replay_id() {
 	let binder = binder_source();
 	let task = source("src/distributed/task.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let render = first_block(&binder, "fn optimizer_analyze_join_order_row");
 	let measurement = first_block(&binder, "fn join_order_runtime_measurement");
 	let replay_ids = first_block(&binder, "fn star_order_runtime_replay_ids");
@@ -311,7 +311,7 @@ pub(crate) fn adr179_reuses_178_estimate_no_second_estimator() {
 
 #[test]
 pub(crate) fn adr179_capture_is_cheap_and_analyze_gated() {
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let coordinator = source("src/coordinator.rs");
 	let context_new = first_block(&exec, "pub fn new(");
 	let recorder = first_block(&exec, "fn record_join_runtime_observation");
