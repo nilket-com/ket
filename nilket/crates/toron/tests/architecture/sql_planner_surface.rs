@@ -191,8 +191,7 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 	assert!(base_fragment.contains("terminal_output.wrap_plan"));
 	assert!(base_fragment.contains("replace_exchange_with_scan"));
 
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let agg_state_enum = exec
 		.split("enum AggState")
 		.nth(1)
@@ -630,8 +629,7 @@ pub(crate) fn adr025_explicit_cast_policy_is_separate_from_implicit_widening() {
 
 #[test]
 pub(crate) fn adr025_cast_supports_numeric_primitive_lattice() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let evaluate_cast = brace_blocks_after_marker(&exec, "fn evaluate_cast")
 		.into_iter()
 		.next()
@@ -669,8 +667,7 @@ pub(crate) fn adr025_cast_supports_numeric_primitive_lattice() {
 
 #[test]
 pub(crate) fn adr286_int_decimal_cast_is_internal_comparison_support_only() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let binder = binder_root_source();
 	let arithmetic = std::fs::read_to_string(manifest_dir().join("src/binder/arithmetic.rs"))
 		.expect("read arithmetic source");
@@ -699,8 +696,7 @@ pub(crate) fn adr286_int_decimal_cast_is_internal_comparison_support_only() {
 
 #[test]
 pub(crate) fn adr025_cast_failure_returns_kernel_error_with_prefix() {
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	let cast_failed = brace_blocks_after_marker(&exec, "fn cast_failed")
 		.into_iter()
 		.next()
@@ -1342,8 +1338,7 @@ pub(crate) fn adr028_binder_executor_aggregate_args_preserved() {
 		.expect("bind stable aggregate call")
 		.1;
 	assert!(stable_bind.contains("bind_expr_program(args"));
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	assert!(exec.contains("self.evaluate_expr(&args[0]"));
 	assert!(exec.contains("self.evaluate_bound_single_root(&call.args"));
 }
@@ -1411,8 +1406,7 @@ pub(crate) fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 	assert!(aggregate_function.contains("Min,"));
 	assert!(aggregate_function.contains("Max,"));
 
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	assert!(exec.contains("AggState::MinInt32"));
 	assert!(exec.contains("AggState::MinInt64"));
 	assert!(exec.contains("AggState::MinFloat32"));
@@ -1452,8 +1446,7 @@ pub(crate) fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 	assert!(catalog.contains("input_domain: AggregateInputDomain::AvgNumeric"));
 	assert!(catalog.contains("output_rule: AggregateOutputRule::AvgNumeric"));
 
-	let exec =
-		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let exec = exec_source();
 	assert!(exec.contains("AggState::AvgInt"));
 	assert!(exec.contains("AggState::AvgFloat"));
 	assert!(exec.contains("fn avg_state_for_data_type"));

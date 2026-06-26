@@ -207,6 +207,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec/join/spill.rs",
 				// ADR 352: join streaming orchestration submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/streaming.rs",
+				// ADR 353: aggregate executor/state submodule inside the semantic executor split.
+				"crates/toron/src/exec/aggregate.rs",
 				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",
 				"crates/toron/src/lib.rs",

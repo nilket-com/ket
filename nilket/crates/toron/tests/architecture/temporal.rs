@@ -120,7 +120,7 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
-	let exec = source("src/exec.rs");
+	let exec = exec_source();
 	let write = source("src/coordinator/write.rs");
 	let pbc = source("src/pbc.rs");
 	let rune = source("src/rune_engine.rs");
@@ -149,7 +149,7 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 	let pbc_literal = source_block(&pbc, "fn emit_literal");
 	let literal_array = source_block(&exec, "fn timestamp_literal_array");
 	let encode_partition = source_block(&exec, "fn encode_partition_key_value");
-	let group_array = source_block(&exec, "fn group_column");
+	let group_array = source_block(&exec, "fn group_column(");
 	let write_build_array = source_block(&write, "fn build_array");
 	let write_timestamp_array = source_block(&write, "fn build_timestamp_array");
 	let restamp = source_block(&daemon, "fn restamp_sql_result_field");

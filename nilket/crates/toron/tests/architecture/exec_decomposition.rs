@@ -1,6 +1,7 @@
 use super::support::*;
 
 const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
+const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_800;
 
@@ -20,6 +21,27 @@ pub(crate) fn adr350_exec_join_module_exists() {
 	let path = manifest.join("src/exec/join.rs");
 
 	assert!(path.exists(), "missing exec/join.rs semantic module");
+}
+
+#[test]
+pub(crate) fn adr353_exec_root_declares_aggregate_module() {
+	let root = exec_root_source();
+
+	assert!(
+		root.contains("mod aggregate;"),
+		"exec root must declare the aggregate executor module"
+	);
+}
+
+#[test]
+pub(crate) fn adr353_exec_aggregate_module_exists() {
+	let manifest = manifest_dir();
+	let path = manifest.join("src/exec/aggregate.rs");
+
+	assert!(
+		path.exists(),
+		"missing exec/aggregate.rs aggregate executor module"
+	);
 }
 
 #[test]
@@ -128,6 +150,31 @@ pub(crate) fn adr352_exec_join_root_excludes_carved_streaming_orchestration() {
 }
 
 #[test]
+pub(crate) fn adr353_exec_root_excludes_carved_aggregate_executor_cluster() {
+	let root = exec_root_source();
+
+	for carved_definition in [
+		"fn bound_global_aggregate(",
+		"fn fold_global_aggregate_state(",
+		"fn init_global_aggregate_state(",
+		"fn finalize_global_aggregate_state(",
+		"fn bound_grouped_aggregate(",
+		"fn fold_bound_grouped_aggregate_batch(",
+		"fn finalize_bound_grouped_aggregate(",
+		"enum AggState",
+		"enum GroupValue",
+		"fn init_bound_states(",
+		"fn group_value(",
+		"fn group_column(",
+	] {
+		assert!(
+			!root.contains(carved_definition),
+			"exec root still defines carved aggregate executor marker {carved_definition}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr350_exec_root_is_bounded() {
 	let lines = exec_root_source().lines().count();
 	// ADR 350: first semantic executor decomposition ratchet. The post-join-carve root measured
@@ -136,6 +183,18 @@ pub(crate) fn adr350_exec_root_is_bounded() {
 	assert!(
 		lines <= EXEC_ROOT_LINE_LIMIT,
 		"exec root has {lines} lines; expected <= {EXEC_ROOT_LINE_LIMIT} after ADR 350 join carve"
+	);
+}
+
+#[test]
+pub(crate) fn adr353_exec_root_is_bounded_after_aggregate_carve() {
+	let lines = exec_root_source().lines().count();
+	// ADR 353: aggregate executor/state cluster carved from exec.rs into exec/aggregate.rs.
+	// The post-carve root measured 9,772 lines after fmt; 10,000 leaves import/module churn slack
+	// while failing if aggregate executor logic drifts back into the root.
+	assert!(
+		lines <= EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT,
+		"exec root has {lines} lines; expected <= {EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT} after ADR 353 aggregate carve"
 	);
 }
 
