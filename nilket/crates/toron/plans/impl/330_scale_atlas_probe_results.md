@@ -29,6 +29,8 @@ systemd-run --user --same-dir --wait --collect --pipe --property=MemoryMax=4G \
   streamed-filter accumulator (requested 1,074,312,896). Both remain `memory_budget_exhausted@execute`.
 - ADR 341 moved q21's sf=1 wall off the ADR 340 streamed-filter accumulator and onto the budgeted Exchange-output
   accumulator (requested 1,074,142,886). q07 remains at the later join-output wall.
+- ADR 346 moved q17 from the `join output materialization` wall (requested 1,651,834,429) to `pass@execute` at sf=1.
+  q17 correctness remains fixed at sf=0.02; no sf=1 `pass@compare` claim is made for q17.
 
 ## Reach atlas
 Format: `class (stage; wall-clock / RSS)`
@@ -83,7 +85,8 @@ Scale-stable correctness was run only for the queries that still reached compare
   q04/q12/q20 fail in execute with `memory_budget_exhausted`.
 - q04/q12/q20's execute walls were renamed by ADR 332: the raw error is `BudgetExhausted { dimension: Memory, ... }`,
   classified as `memory_budget_exhausted` and left as `fail`, not a recognized blocker.
-- q17 remains the fixed-scale outlier: reach-only at scale, correctness pinned to sf=0.02.
+- q17 remains the fixed-scale correctness outlier: reach is now green at sf=1 after ADR 346, while correctness remains
+  pinned to sf=0.02.
 
 ## Result
 The scale atlas exists, is classified, and names the next arc from measured evidence instead of guesswork.
@@ -125,3 +128,16 @@ from the ADR 344 semi existence-set wall to green at `sf=1`.
 | q21 | `semi/anti existence-set build/spill accumulator`, requested 1,526,014,069 | `pass@execute` at sf=1; `pass@compare` at sf=1 |
 
 This leaves the current strict sf=1 memory walls as q04, q12, q18, and q20.
+
+## Later Delta - ADR 346
+
+ADR 346 streams q17's correlated-scalar LeftOuter recombine path after making the filtered Join(0) visitor
+spilled-capable. q17 moves from the ADR 335 output-materialization wall to green reachability at `sf=1`.
+
+| query | pre-ADR 346 first wall | post-ADR 346 result |
+| --- | --- | --- |
+| q17 | `join output materialization`, requested 1,651,834,429 | `pass@execute` at sf=1 |
+
+q17 remains a fixed-scale correctness case: its oracle is pinned to sf=0.02, so this delta updates reachability only.
+The current strict sf=1 memory walls remain q04, q12, q18, and q20; q02 remains a separate
+`unrecognized@execute` wall.

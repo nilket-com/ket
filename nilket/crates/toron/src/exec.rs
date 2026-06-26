@@ -905,6 +905,17 @@ impl Executor {
 				} => {
 					if group_expr.is_empty_roots() {
 						if let Some(output) = self
+							.try_streaming_correlated_scalar_left_outer_global_aggregate(
+								input,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
+						if let Some(output) = self
 							.try_streaming_collapsing_global_aggregate(
 								input,
 								aggr_expr,
@@ -1786,6 +1797,20 @@ struct StreamingSemiAntiRuntime<'a> {
 	output_rows: u64,
 }
 
+struct StreamingLeftOuterRecombineRuntime<'a> {
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
+	scalar_batch: RecordBatch,
+	scalar_rows: HashMap<JoinKey, BuildRowList>,
+	key_plan: JoinKeyPlan,
+	preserved_keys: Vec<crate::ir::ColumnOrdinal>,
+	match_filter: Option<&'a BoundExprProgram>,
+	null_safe_keys: bool,
+	output_schema: SchemaRef,
+	probe_rows: u64,
+	output_rows: u64,
+}
+
 impl StreamingSemiAntiRuntime<'_> {
 	async fn cleanup(self) {
 		if let StreamingSemiAntiExistence::Spilled(spilled) = self.existence {
@@ -2163,6 +2188,188 @@ impl Executor {
 		)?))
 	}
 
+	async fn try_streaming_correlated_scalar_left_outer_global_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Filter {
+			input: recombine,
+			predicate: recombine_filter,
+			disposition: FilterDisposition::EvaluateInToron,
+		} = input
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::LeftOuter,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema: recombine_output_schema,
+			..
+		} = recombine.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Exchange {
+			input: preserved_exchange_input,
+			partition_count,
+			key: preserved_exchange_key,
+		} = left.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: preserved_filter_input,
+			predicate: preserved_filter,
+			disposition,
+		} = preserved_exchange_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *partition_count == 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: "exchange partition_count must be greater than zero".to_string(),
+			});
+		}
+
+		let scalar_batches = self.execute_bound(right, morsel).await?;
+		let scalar_batch = concat_or_empty(right.schema(), &scalar_batches)?;
+		let scalar_key_arrays = key_arrays(&scalar_batch, right_keys)?;
+		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
+			&scalar_key_arrays,
+			&left.schema(),
+			left_keys,
+			*null_safe_keys,
+		)?;
+		let build_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let estimated_build_bytes =
+			estimated_build_hash_bytes(&scalar_key_arrays, scalar_batch.num_rows());
+		if estimated_build_bytes > build_cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"correlated scalar recombine build accumulator",
+				estimated_build_bytes,
+				build_cap,
+			));
+		}
+		let Some(scalar_rows) = build_in_memory_join_rows(
+			key_plan,
+			&scalar_key_arrays,
+			scalar_batch.num_rows(),
+			build_cap,
+			*null_safe_keys,
+		)?
+		else {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"correlated scalar recombine build accumulator",
+				estimated_build_bytes,
+				build_cap,
+			));
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(scalar_batch.num_rows() as u64);
+		});
+		let mut runtime = StreamingLeftOuterRecombineRuntime {
+			replay_id: *replay_id,
+			strategy: *strategy,
+			scalar_batch,
+			scalar_rows,
+			key_plan,
+			preserved_keys: left_keys.clone(),
+			match_filter: match_filter.as_ref(),
+			null_safe_keys: *null_safe_keys,
+			output_schema: recombine_output_schema.clone(),
+			probe_rows: 0,
+			output_rows: 0,
+		};
+
+		let partition_count_usize =
+			usize::try_from(*partition_count).expect("partition count fits usize");
+		let mut partition_batches: Vec<Vec<RecordBatch>> =
+			(0..partition_count_usize).map(|_| Vec::new()).collect();
+		let accumulator_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let mut accumulated_bytes = 0u64;
+		let matched = self
+			.try_visit_streaming_join0_filter_chunks(
+				preserved_filter_input,
+				preserved_filter,
+				*disposition,
+				morsel,
+				|batch| {
+					for (partition, partitioned) in self.repartition_exchange_batch(
+						&batch,
+						*partition_count,
+						preserved_exchange_key,
+					)? {
+						accumulated_bytes = accumulated_bytes
+							.saturating_add(record_batch_memory_bytes(&partitioned));
+						if accumulated_bytes > accumulator_cap {
+							return Err(budget_exhausted(
+								BudgetDimension::Memory,
+								"correlated scalar preserved-side exchange accumulator",
+								accumulated_bytes,
+								accumulator_cap,
+							));
+						}
+						if partitioned.num_rows() > 0 {
+							partition_batches[partition].push(partitioned);
+						}
+					}
+					Ok(())
+				},
+			)
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+
+		let mut state = init_global_aggregate_state(aggr_expr)?;
+		for partition in partition_batches {
+			for preserved_batch in partition {
+				let recombined_batches =
+					self.probe_streaming_left_outer_recombine(&mut runtime, &preserved_batch)?;
+				for recombined in recombined_batches {
+					let filtered = self.filter_batch_with_bound_predicate(
+						recombine_filter,
+						recombined,
+						"filter predicate",
+					)?;
+					if filtered.num_rows() > 0 {
+						self.fold_global_aggregate_state(&mut state, aggr_expr, &filtered)?;
+					}
+				}
+			}
+		}
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: runtime.replay_id,
+				strategy: runtime.strategy,
+				build_rows: RowCount::new(runtime.scalar_batch.num_rows() as u64),
+				probe_rows: RowCount::new(runtime.probe_rows),
+				output_rows: RowCount::new(runtime.output_rows),
+			},
+		);
+
+		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+	}
+
 	async fn try_visit_streaming_join0_filter_chunks<F>(
 		&self,
 		input: &ExecutionPlan,
@@ -2204,10 +2411,49 @@ impl Executor {
 		let right_batch = concat_or_empty(right.schema(), &right_batches)?;
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 		let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(right_batch.num_rows() as u64);
+		});
 		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
 			> self.context.task_budget.memory.get()
 		{
-			return Ok(None);
+			let output_rows = visit_spilled_hash_join_filtered_chunks(
+				self,
+				JoinKind::Inner,
+				&left_batch,
+				&right_batch,
+				&left_key_arrays,
+				&right_key_arrays,
+				output_schema,
+				predicate,
+				match_filter.as_ref(),
+				*null_safe_keys,
+				self.context.task_budget,
+				self.context.task_telemetry.clone(),
+				self.context.join_spill_file_ops.clone(),
+				self.context.join_spill_dir.clone(),
+				&mut visit_filtered_batch,
+			)
+			.await?;
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: *replay_id,
+					strategy: *strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(output_rows),
+				},
+			);
+			return Ok(Some(()));
 		}
 		let join_key_plan =
 			JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
@@ -2222,16 +2468,6 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.build_rows = task
-				.counters
-				.build_rows
-				.saturating_add(left_batch.num_rows() as u64);
-			task.counters.probe_rows = task
-				.counters
-				.probe_rows
-				.saturating_add(right_batch.num_rows() as u64);
-		});
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.phases.build_micros = task
 				.phases
@@ -3091,6 +3327,80 @@ impl Executor {
 		for chunk in selected.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let batch = materialize_preserved_selection(
 				preserved_batch,
+				chunk,
+				&runtime.output_schema,
+				self.context.task_budget.memory.get(),
+			)?;
+			if batch.num_rows() > 0 {
+				output.push(batch);
+			}
+		}
+		Ok(output)
+	}
+
+	fn probe_streaming_left_outer_recombine(
+		&self,
+		runtime: &mut StreamingLeftOuterRecombineRuntime<'_>,
+		preserved_batch: &RecordBatch,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		if preserved_batch.num_rows() == 0 {
+			return Ok(Vec::new());
+		}
+		let preserved_key_arrays = key_arrays(preserved_batch, &runtime.preserved_keys)?;
+		runtime.probe_rows = runtime
+			.probe_rows
+			.saturating_add(preserved_batch.num_rows() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.probe_rows = task
+				.counters
+				.probe_rows
+				.saturating_add(preserved_batch.num_rows() as u64);
+		});
+
+		let mut selection = Vec::new();
+		let mut residual =
+			JoinMatchResidual::new(runtime.match_filter, preserved_batch, &runtime.scalar_batch);
+		for row in 0..preserved_batch.num_rows() {
+			let left = join_build_row_index(row)?;
+			let matched = if let Some(key) = join_key_at(
+				runtime.key_plan,
+				&preserved_key_arrays,
+				row,
+				runtime.null_safe_keys,
+			)? {
+				if let Some(matches) = runtime.scalar_rows.get(&key) {
+					let mut matched = false;
+					for right in matches.rows() {
+						if residual.matches(left, right)? {
+							matched = true;
+							selection.push(JoinOutputRow::Paired { left, right });
+						}
+					}
+					matched
+				} else {
+					false
+				}
+			} else {
+				false
+			};
+			if !matched {
+				selection.push(JoinOutputRow::LeftFillNull { left });
+			}
+		}
+		runtime.output_rows = runtime.output_rows.saturating_add(selection.len() as u64);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
+		});
+
+		let mut output = Vec::new();
+		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_join_selection(
+				JoinKind::LeftOuter,
+				preserved_batch,
+				&runtime.scalar_batch,
 				chunk,
 				&runtime.output_schema,
 				self.context.task_budget.memory.get(),
@@ -6142,6 +6452,126 @@ async fn execute_spilled_hash_join_into_global_aggregate(
 	result
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn visit_spilled_hash_join_filtered_chunks<F>(
+	executor: &Executor,
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	left_key_arrays: &[ArrayRef],
+	right_key_arrays: &[ArrayRef],
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: &BoundExprProgram,
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+	visit_filtered_batch: &mut F,
+) -> Result<u64, ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+	let build_started = Instant::now();
+	for row in 0..left_batch.num_rows() {
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(left_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+				continue;
+			};
+			key
+		};
+		build_rows
+			.entry(key)
+			.or_default()
+			.push(u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+				message: "join build row index exceeds UInt32 take index".to_string(),
+			})?);
+	}
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.build_micros = task
+			.phases
+			.build_micros
+			.saturating_add(duration_micros(build_started));
+	});
+	if build_rows.is_empty() {
+		let mut selection = Vec::new();
+		for row in 0..right_batch.num_rows() {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
+		}
+		append_build_side_after_probe_rows(
+			kind,
+			left_batch.num_rows(),
+			build_match_bitmap(kind, left_batch.num_rows()).as_deref(),
+			&mut selection,
+		)?;
+		let output_rows = selection.len() as u64;
+		visit_join_selection_filtered_chunks(
+			executor,
+			kind,
+			left_batch,
+			right_batch,
+			&selection,
+			join_output_schema,
+			filter_predicate,
+			task_budget.memory.get(),
+			visit_filtered_batch,
+		)?;
+		return Ok(output_rows);
+	}
+
+	guard_spill_retained_entry_memory(
+		left_batch,
+		right_batch,
+		&build_rows,
+		task_budget.memory.get(),
+	)?;
+
+	let spill_started = Instant::now();
+	let mut spilled =
+		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.spill_micros = task
+			.phases
+			.spill_micros
+			.saturating_add(duration_micros(spill_started));
+		task.counters.spill_bytes = task
+			.counters
+			.spill_bytes
+			.saturating_add(spilled.spill_bytes());
+	});
+	let probe_started = Instant::now();
+	let result = probe_spilled_hash_join_filtered_chunks(
+		executor,
+		kind,
+		&mut spilled,
+		right_batch,
+		right_key_arrays,
+		left_batch,
+		join_output_schema,
+		filter_predicate,
+		match_filter,
+		null_safe_keys,
+		task_budget.memory.get(),
+		visit_filtered_batch,
+	)
+	.await;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.probe_micros = task
+			.phases
+			.probe_micros
+			.saturating_add(duration_micros(probe_started));
+		if let Ok(output_rows) = &result {
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
+		}
+	});
+	spilled.cleanup().await;
+	result
+}
+
 async fn probe_spilled_hash_join(
 	kind: JoinKind,
 	spilled: &mut SpilledJoinBuild,
@@ -6257,6 +6687,72 @@ async fn probe_spilled_hash_join_into_global_aggregate(
 		aggr_expr,
 		aggregate_state,
 		memory_cap,
+	)?;
+	Ok(output_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_spilled_hash_join_filtered_chunks<F>(
+	executor: &Executor,
+	kind: JoinKind,
+	spilled: &mut SpilledJoinBuild,
+	right_batch: &RecordBatch,
+	right_key_arrays: &[ArrayRef],
+	left_batch: &RecordBatch,
+	join_output_schema: &arrow::datatypes::SchemaRef,
+	filter_predicate: &BoundExprProgram,
+	match_filter: Option<&BoundExprProgram>,
+	null_safe_keys: bool,
+	memory_cap: u64,
+	visit_filtered_batch: &mut F,
+) -> Result<u64, ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	let mut selection = Vec::new();
+	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
+	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
+	for row in 0..right_batch.num_rows() {
+		let key = if null_safe_keys {
+			join_key_bytes_null_safe(right_key_arrays, row)?
+		} else {
+			let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+				append_unmatched_probe_row(kind, row, &mut selection)?;
+				continue;
+			};
+			key
+		};
+		let matches = spilled.lookup(&key).await?;
+		let matched = append_join_matches_for_kind(
+			kind,
+			row,
+			matches.into_iter(),
+			matched_build_rows.as_deref_mut(),
+			&mut selection,
+			&mut residual,
+		)?;
+		if !matched {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
+		}
+	}
+	append_build_side_after_probe_rows(
+		kind,
+		left_batch.num_rows(),
+		matched_build_rows.as_deref(),
+		&mut selection,
+	)?;
+
+	let output_rows = selection.len() as u64;
+	visit_join_selection_filtered_chunks(
+		executor,
+		kind,
+		left_batch,
+		right_batch,
+		&selection,
+		join_output_schema,
+		filter_predicate,
+		memory_cap,
+		visit_filtered_batch,
 	)?;
 	Ok(output_rows)
 }
@@ -12972,6 +13468,61 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn correlated_scalar_left_outer_stream_matches_materialized_avg_recombine() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
+		let (stream_executor, stream_plan) =
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), true, 4);
+		let (materialized_executor, materialized_plan) =
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), false, 4);
+
+		let streamed = stream_executor
+			.execute_bound(&stream_plan, None)
+			.await
+			.expect("streamed correlated scalar recombine");
+		let materialized = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized correlated scalar recombine");
+		assert_record_batches_equal(&streamed, &materialized);
+	}
+
+	#[tokio::test]
+	async fn correlated_scalar_left_outer_stream_removes_join0_materialization_wall() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 2;
+		let budget = TaskBudget {
+			memory: ByteCount::new(2 * 1024 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+
+		let (materialized_executor, materialized_plan) =
+			correlated_scalar_left_outer_fixture(rows, 2048, budget, false, 1);
+		let materialized_err = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect_err("disabled streaming shape keeps the raw Join(0) output wall");
+		assert!(
+			matches!(
+				materialized_err,
+				ExecutionError::BudgetExhausted {
+					dimension: BudgetDimension::Memory,
+					producer: "join output materialization",
+					..
+				}
+			),
+			"unexpected materialized error: {materialized_err:?}"
+		);
+
+		let (stream_executor, stream_plan) =
+			correlated_scalar_left_outer_fixture(rows, 2048, budget, true, 1);
+		let streamed = stream_executor
+			.execute_bound(&stream_plan, None)
+			.await
+			.expect("streamed correlated scalar recombine should avoid raw Join(0) output");
+		assert_eq!(record_batch_row_count(&streamed), 1);
+	}
+
+	#[tokio::test]
 	async fn streaming_semi_anti_probe_applies_residual_and_preserves_left_rows() {
 		let preserved_schema = Arc::new(Schema::new(vec![
 			Field::new("orderkey", DataType::Int64, false),
@@ -14575,6 +15126,143 @@ mod tests {
 		(executor, plan)
 	}
 
+	fn correlated_scalar_left_outer_fixture(
+		rows: usize,
+		blob_len: usize,
+		budget: TaskBudget,
+		streaming_replay_id: bool,
+		kept_part_keys: i64,
+	) -> (Executor, ExecutionPlan) {
+		let fact_schema = Arc::new(Schema::new(vec![
+			Field::new("partkey", DataType::Int64, false),
+			Field::new("quantity", DataType::Float64, false),
+			Field::new("extendedprice", DataType::Float64, false),
+			Field::new("blob", DataType::Utf8, false),
+		]));
+		let part_schema = Arc::new(Schema::new(vec![
+			Field::new("partkey", DataType::Int64, false),
+			Field::new("keep", DataType::Int64, false),
+		]));
+		let partkeys = (0..rows)
+			.map(|row| i64::try_from(row % 4).expect("part key fits"))
+			.collect::<Vec<_>>();
+		let quantities = (0..rows)
+			.map(|row| Some(((row % 5) + 1) as f64))
+			.collect::<Vec<_>>();
+		let prices = (0..rows)
+			.map(|row| Some(((row % 7) + 10) as f64))
+			.collect::<Vec<_>>();
+		let blob = "x".repeat(blob_len);
+		let fact_batch = RecordBatch::try_new(
+			fact_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(partkeys)),
+				Arc::new(Float64Array::from(quantities)),
+				Arc::new(Float64Array::from(prices)),
+				Arc::new(StringArray::from(vec![blob.as_str(); rows])),
+			],
+		)
+		.expect("fact batch");
+		let part_batch = RecordBatch::try_new(
+			part_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+				Arc::new(Int64Array::from(
+					(0..4)
+						.map(|key| if key < kept_part_keys { 1 } else { 0 })
+						.collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("part batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), fact_batch),
+				(TableId(2), part_batch),
+			]),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(budget),
+		);
+		let fact_scan = test_scan_plan_with_first_field_key(TableId(1), fact_schema.clone(), 1);
+		let part_scan = test_scan_plan_with_first_field_key(TableId(2), part_schema.clone(), 2);
+		let join0_schema = concat_test_schema(&fact_schema, &part_schema);
+		let join0 = inner_join_plan(
+			if streaming_replay_id {
+				JoinReplayId(0)
+			} else {
+				JoinReplayId::SYNTHETIC
+			},
+			fact_scan.clone(),
+			part_scan,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			join0_schema.clone(),
+		);
+		let preserved_filter = ExecutionPlan::Filter {
+			input: Box::new(join0),
+			predicate: keep_filter_program(ColumnOrdinal(5)),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let preserved_exchange = exchange_plan(
+			preserved_filter,
+			bound_column_root("partkey", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let scalar_group_expr =
+			bound_column_root("partkey", ColumnOrdinal(0), DataType::Int64, false);
+		let scalar_aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Avg,
+			args: bound_column_root("quantity", ColumnOrdinal(1), DataType::Float64, false),
+		}];
+		let scalar_schema = Arc::new(Schema::new(vec![
+			Field::new("key_0", DataType::Int64, true),
+			Field::new("value", DataType::Float64, true),
+		]));
+		let scalar = ExecutionPlan::Aggregate {
+			input: Box::new(exchange_plan(fact_scan, scalar_group_expr.clone(), 4)),
+			group_expr: scalar_group_expr,
+			aggr_expr: scalar_aggr_expr,
+			output_schema: scalar_schema,
+		};
+		let recombine_schema = concat_test_schema(&join0_schema, &scalar.schema());
+		let recombine = ExecutionPlan::Join {
+			replay_id: JoinReplayId(1),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(preserved_exchange),
+			right: Box::new(scalar),
+			kind: JoinKind::LeftOuter,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: recombine_schema,
+		};
+		let recombine_filter = ExecutionPlan::Filter {
+			input: Box::new(recombine),
+			predicate: quantity_lt_avg_program(ColumnOrdinal(1), ColumnOrdinal(7)),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: bound_column_root("extendedprice", ColumnOrdinal(2), DataType::Float64, false),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![Field::new(
+			"sum_extendedprice",
+			DataType::Float64,
+			true,
+		)]));
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(recombine_filter),
+			group_expr: BoundExprProgramBuilder::new().build(),
+			aggr_expr,
+			output_schema,
+		};
+		(executor, plan)
+	}
+
 	fn concat_test_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
 		Arc::new(Schema::new(
 			left.fields()
@@ -14666,6 +15354,30 @@ mod tests {
 		});
 		let zero = builder.append_literal(ScalarValue::Int64(Some(0)));
 		let predicate = builder.append_binary(BoundBinaryOp::Gt, keep, zero, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	fn quantity_lt_avg_program(
+		quantity_ordinal: ColumnOrdinal,
+		avg_ordinal: ColumnOrdinal,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let quantity = builder.append_column(ResolvedColumn {
+			name: ColumnName("quantity".to_string()),
+			ordinal: quantity_ordinal,
+			data_type: DataType::Float64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let avg = builder.append_column(ResolvedColumn {
+			name: ColumnName("avg_quantity".to_string()),
+			ordinal: avg_ordinal,
+			data_type: DataType::Float64,
+			nullable: true,
+			pbc_eligible: false,
+		});
+		let predicate = builder.append_binary(BoundBinaryOp::Lt, quantity, avg, DataType::Boolean);
 		builder.push_root(predicate);
 		builder.build()
 	}
