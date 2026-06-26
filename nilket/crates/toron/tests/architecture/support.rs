@@ -221,6 +221,11 @@ pub(crate) fn exec_root_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec root source")
 }
 
+pub(crate) fn exec_join_root_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/exec/join.rs"))
+		.expect("read exec join root source")
+}
+
 pub(crate) fn exec_source_files() -> Vec<PathBuf> {
 	let src = manifest_dir().join("src");
 	let module_root = src.join("exec");

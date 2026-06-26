@@ -203,6 +203,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec.rs",
 				// ADR 350: semantic executor decomposition moves join substrate out of exec.rs.
 				"crates/toron/src/exec/join.rs",
+				// ADR 351: join spill storage submodule inside the semantic executor split.
+				"crates/toron/src/exec/join/spill.rs",
 				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",
 				"crates/toron/src/lib.rs",

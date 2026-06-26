@@ -1,6 +1,7 @@
 use super::support::*;
 
 const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
+const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
@@ -18,6 +19,24 @@ pub(crate) fn adr350_exec_join_module_exists() {
 	let path = manifest.join("src/exec/join.rs");
 
 	assert!(path.exists(), "missing exec/join.rs semantic module");
+}
+
+#[test]
+pub(crate) fn adr351_exec_join_root_declares_spill_module() {
+	let join_root = exec_join_root_source();
+
+	assert!(
+		join_root.contains("mod spill;"),
+		"exec/join root must declare the spill storage submodule"
+	);
+}
+
+#[test]
+pub(crate) fn adr351_exec_join_spill_module_exists() {
+	let manifest = manifest_dir();
+	let path = manifest.join("src/exec/join/spill.rs");
+
+	assert!(path.exists(), "missing exec/join/spill.rs storage module");
 }
 
 #[test]
@@ -42,6 +61,27 @@ pub(crate) fn adr350_exec_root_excludes_carved_join_clusters() {
 }
 
 #[test]
+pub(crate) fn adr351_exec_join_root_excludes_carved_spill_storage() {
+	let join_root = exec_join_root_source();
+
+	for carved_definition in [
+		"struct SpilledJoinBuild",
+		"struct SpilledInnerJoinBuild",
+		"struct SpilledSemiAntiExistenceBuild",
+		"struct JoinSpillPage",
+		"fn write_join_spill_plaintext_page(",
+		"fn encode_record_batch_ipc(",
+		"fn join_spill_index_bytes(",
+		"static NEXT_JOIN_SPILL_ID",
+	] {
+		assert!(
+			!join_root.contains(carved_definition),
+			"exec/join root still defines carved spill storage marker {carved_definition}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr350_exec_root_is_bounded() {
 	let lines = exec_root_source().lines().count();
 	// ADR 350: first semantic executor decomposition ratchet. The post-join-carve root measured
@@ -50,6 +90,18 @@ pub(crate) fn adr350_exec_root_is_bounded() {
 	assert!(
 		lines <= EXEC_ROOT_LINE_LIMIT,
 		"exec root has {lines} lines; expected <= {EXEC_ROOT_LINE_LIMIT} after ADR 350 join carve"
+	);
+}
+
+#[test]
+pub(crate) fn adr351_exec_join_root_is_bounded() {
+	let lines = exec_join_root_source().lines().count();
+	// ADR 351: spill storage carved from exec/join.rs into exec/join/spill.rs. The post-carve
+	// join root measured 5,801 lines after fmt; 5,900 leaves import/module churn slack while
+	// failing if spill storage drifts back into the join root.
+	assert!(
+		lines <= EXEC_JOIN_ROOT_LINE_LIMIT,
+		"exec/join root has {lines} lines; expected <= {EXEC_JOIN_ROOT_LINE_LIMIT} after ADR 351 spill carve"
 	);
 }
 
