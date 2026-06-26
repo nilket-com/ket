@@ -12,11 +12,11 @@ use crate::ir::arithmetic_output_type;
 use crate::ir::decimal_division_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
-	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ExecutionPlan, ExecutionSortKey,
-	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint,
-	ScalarValue, SessionId, SystemTableKind, TableId, TemporalExtractField, TemporalTruncField,
-	ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit,
-	WindowFunction, nanos_per_timestamp_unit,
+	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ColumnOrdinal, ExecutionPlan,
+	ExecutionSortKey, FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId,
+	QueryProfileHint, ScalarValue, SessionId, SystemTableKind, TableId, TemporalExtractField,
+	TemporalTruncField, ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta,
+	WindowFrameUnit, WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -931,6 +931,18 @@ impl Executor {
 						let input_batches = self.execute_bound(input, morsel).await?;
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
+						if let Some(output) = self
+							.try_streaming_projected_left_semi_grouped_aggregate(
+								input,
+								group_expr,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
 						if let Some(output) = self
 							.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
 								input,
@@ -1897,6 +1909,171 @@ fn exchange_input(plan: &ExecutionPlan) -> Option<&ExecutionPlan> {
 	Some(input.as_ref())
 }
 
+fn collect_program_column_ordinals(
+	program: &BoundExprProgram,
+	columns: &mut BTreeSet<ColumnOrdinal>,
+) {
+	for root in &program.roots {
+		collect_program_node_column_ordinals(program, *root, columns);
+	}
+}
+
+fn collect_program_node_column_ordinals(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	columns: &mut BTreeSet<ColumnOrdinal>,
+) {
+	match program.node(id) {
+		Some(BoundExprNode::Column(column)) => {
+			columns.insert(column.ordinal);
+		}
+		Some(BoundExprNode::Literal(_)) | Some(BoundExprNode::NullLiteral) | None => {}
+		Some(BoundExprNode::Cast { input, .. })
+		| Some(BoundExprNode::TryCast { input, .. })
+		| Some(BoundExprNode::Unary { input, .. })
+		| Some(BoundExprNode::Like { expr: input, .. })
+		| Some(BoundExprNode::Substring { input, .. })
+		| Some(BoundExprNode::TimeBucket { input, .. })
+		| Some(BoundExprNode::AtTimeZone { input, .. })
+		| Some(BoundExprNode::Extract { input, .. })
+		| Some(BoundExprNode::DateTrunc { input, .. }) => {
+			collect_program_node_column_ordinals(program, *input, columns);
+		}
+		Some(BoundExprNode::Binary { left, right, .. }) => {
+			collect_program_node_column_ordinals(program, *left, columns);
+			collect_program_node_column_ordinals(program, *right, columns);
+		}
+		Some(BoundExprNode::InList { expr, list, .. }) => {
+			collect_program_node_column_ordinals(program, *expr, columns);
+			for item in list {
+				collect_program_node_column_ordinals(program, *item, columns);
+			}
+		}
+		Some(BoundExprNode::Case {
+			when_then,
+			else_input,
+		}) => {
+			for (condition, result) in when_then {
+				collect_program_node_column_ordinals(program, *condition, columns);
+				collect_program_node_column_ordinals(program, *result, columns);
+			}
+			collect_program_node_column_ordinals(program, *else_input, columns);
+		}
+	}
+}
+
+fn grouped_aggregate_input_columns(
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	exchange_key: &BoundExprProgram,
+	join_keys: &[ColumnOrdinal],
+) -> Vec<ColumnOrdinal> {
+	let mut columns = BTreeSet::new();
+	collect_program_column_ordinals(group_expr, &mut columns);
+	collect_program_column_ordinals(exchange_key, &mut columns);
+	for call in aggr_expr {
+		collect_program_column_ordinals(&call.args, &mut columns);
+	}
+	columns.extend(join_keys.iter().copied());
+	columns.into_iter().collect()
+}
+
+fn grouped_aggregate_is_order_insensitive(aggr_expr: &[BoundAggregateCall]) -> bool {
+	aggr_expr.iter().all(|call| match call.function {
+		AggregateFunction::Sum | AggregateFunction::Avg => call.args.roots.iter().all(|root| {
+			!matches!(
+				call.args.node_type(*root),
+				Some(DataType::Float32 | DataType::Float64)
+			)
+		}),
+		AggregateFunction::CountAll
+		| AggregateFunction::Count
+		| AggregateFunction::Min
+		| AggregateFunction::Max => true,
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => false,
+	})
+}
+
+fn projected_schema_for_columns(
+	schema: &SchemaRef,
+	columns: &[ColumnOrdinal],
+) -> Result<SchemaRef, ExecutionError> {
+	let fields = columns
+		.iter()
+		.map(|ordinal| {
+			schema
+				.fields()
+				.get(ordinal.0 as usize)
+				.map(|field| field.as_ref().clone())
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: format!("projected spill schema ordinal {} out of bounds", ordinal.0),
+				})
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Schema::new(fields)))
+}
+
+fn project_batch_columns(
+	batch: &RecordBatch,
+	columns: &[ColumnOrdinal],
+) -> Result<RecordBatch, ExecutionError> {
+	let projected_schema = projected_schema_for_columns(&batch.schema(), columns)?;
+	let projected_columns = columns
+		.iter()
+		.map(|ordinal| {
+			batch
+				.columns()
+				.get(ordinal.0 as usize)
+				.cloned()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: format!("projected spill column ordinal {} out of bounds", ordinal.0),
+				})
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(RecordBatch::try_new(projected_schema, projected_columns)?)
+}
+
+fn remap_column_ordinals(
+	projection: &[ColumnOrdinal],
+	ordinals: &[ColumnOrdinal],
+) -> Result<Vec<ColumnOrdinal>, ExecutionError> {
+	ordinals
+		.iter()
+		.map(|ordinal| {
+			projection
+				.iter()
+				.position(|candidate| candidate == ordinal)
+				.map(|position| ColumnOrdinal(position as u32))
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: format!("projected spill key ordinal {} was not retained", ordinal.0),
+				})
+		})
+		.collect()
+}
+
+fn default_array_for_unused_column(
+	data_type: &DataType,
+	rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+	Ok(match data_type {
+		DataType::Boolean => Arc::new(BooleanArray::from(vec![false; rows])) as ArrayRef,
+		DataType::Int32 => Arc::new(Int32Array::from(vec![0; rows])) as ArrayRef,
+		DataType::Int64 => Arc::new(Int64Array::from(vec![0; rows])) as ArrayRef,
+		DataType::Float32 => Arc::new(Float32Array::from(vec![0.0; rows])) as ArrayRef,
+		DataType::Float64 => Arc::new(Float64Array::from(vec![0.0; rows])) as ArrayRef,
+		DataType::Date32 => Arc::new(Date32Array::from(vec![0; rows])) as ArrayRef,
+		DataType::Utf8 => Arc::new(StringArray::from(vec![Some(""); rows])) as ArrayRef,
+		DataType::Decimal128(precision, scale) => Arc::new(
+			Decimal128Array::from(vec![Some(0); rows])
+				.with_precision_and_scale(*precision, *scale)
+				.map_err(|error| ExecutionError::Kernel {
+					message: error.to_string(),
+				})?,
+		) as ArrayRef,
+		_ => arrow::array::new_null_array(data_type, rows),
+	})
+}
+
 fn decompose_streaming_existence_plan(
 	plan: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<StreamingExistenceOp<'_>>)> {
@@ -2680,6 +2857,281 @@ impl Executor {
 		)
 		.await?;
 		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_projected_left_semi_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: aggregate_input,
+			partition_count,
+			key: exchange_key,
+		} = input
+		else {
+			return Ok(None);
+		};
+		if exchange_key != group_expr && !grouped_aggregate_is_order_insensitive(aggr_expr) {
+			return Ok(None);
+		}
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::LeftSemi,
+			left_keys,
+			right_keys,
+			match_filter: None,
+			null_safe_keys,
+			strategy,
+			output_schema: semi_output_schema,
+			..
+		} = aggregate_input.as_ref()
+		else {
+			return Ok(None);
+		};
+
+		let retained_columns =
+			grouped_aggregate_input_columns(group_expr, aggr_expr, exchange_key, left_keys);
+		if retained_columns.is_empty()
+			|| retained_columns.len() >= semi_output_schema.fields().len()
+		{
+			return Ok(None);
+		}
+		let projected_left_keys = remap_column_ordinals(&retained_columns, left_keys)?;
+		let projected_schema = projected_schema_for_columns(semi_output_schema, &retained_columns)?;
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let estimated_build_bytes =
+			estimated_build_hash_bytes_for_batches(&left_batches, left_keys)?;
+		if estimated_build_bytes <= self.context.task_budget.memory.get() {
+			return Ok(None);
+		}
+
+		let right_batches = self.execute_bound(right, morsel).await?;
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&projected_schema,
+			&projected_left_keys,
+			&right.schema(),
+			right_keys,
+			*null_safe_keys,
+		)?;
+		let mut spilled = SpilledInnerJoinBuild::create(
+			self.context.task_budget,
+			self.context.join_spill_file_ops.clone(),
+			self.context.join_spill_dir.clone(),
+		)
+		.await?;
+		let build_started = Instant::now();
+		for batch in &left_batches {
+			spilled
+				.write_projected_batch_chunks(
+					batch,
+					&retained_columns,
+					key_plan,
+					&projected_left_keys,
+					*null_safe_keys,
+					self.context.task_budget,
+				)
+				.await?;
+		}
+		spilled.finish(self.context.task_budget).await?;
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+			task.phases.spill_micros = task
+				.phases
+				.spill_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(spilled.input_row_count());
+			task.counters.spill_bytes = task
+				.counters
+				.spill_bytes
+				.saturating_add(spilled.spill_bytes());
+		});
+
+		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut group_types = Vec::new();
+		let probe_started = Instant::now();
+		let result = self
+			.fold_projected_streamed_left_semi_grouped_aggregate(
+				&mut spilled,
+				&right_batches,
+				right_keys,
+				key_plan,
+				*null_safe_keys,
+				semi_output_schema,
+				&retained_columns,
+				*partition_count,
+				exchange_key,
+				group_expr,
+				aggr_expr,
+				&mut groups,
+				&mut group_types,
+			)
+			.await;
+		let build_rows = spilled.input_row_count();
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			if let Ok((probe_rows, output_rows)) = &result {
+				task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(*output_rows);
+			}
+		});
+		let output = result.and_then(|(probe_rows, output_rows)| {
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: *replay_id,
+					strategy: *strategy,
+					build_rows: RowCount::new(build_rows),
+					probe_rows: RowCount::new(probe_rows),
+					output_rows: RowCount::new(output_rows),
+				},
+			);
+			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+		});
+		spilled.cleanup().await;
+		output.map(Some)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn fold_projected_streamed_left_semi_grouped_aggregate(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		right_batches: &[RecordBatch],
+		right_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		semi_output_schema: &arrow::datatypes::SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		partition_count: u32,
+		exchange_key: &BoundExprProgram,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+	) -> Result<(u64, u64), ExecutionError> {
+		let mut matched: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+		let mut probe_rows = 0u64;
+		for batch in right_batches {
+			for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+				let probe_chunk = batch.slice(offset, len);
+				probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+				let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+				for row in 0..probe_chunk.num_rows() {
+					let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+					else {
+						continue;
+					};
+					for build in spilled.lookup(&key).await? {
+						matched
+							.entry(build.page_index)
+							.or_default()
+							.insert(build.row);
+					}
+				}
+			}
+		}
+
+		let mut refs = Vec::new();
+		let mut output_rows = 0u64;
+		for (page_index, rows) in matched {
+			for row in rows {
+				refs.push(SpilledBatchRowRef { page_index, row });
+				if refs.len() == CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+					self.fold_projected_left_semi_refs(
+						spilled,
+						&refs,
+						semi_output_schema,
+						retained_columns,
+						partition_count,
+						exchange_key,
+						group_expr,
+						aggr_expr,
+						groups,
+						group_types,
+					)
+					.await?;
+					output_rows = output_rows.saturating_add(refs.len() as u64);
+					refs.clear();
+				}
+			}
+		}
+		if !refs.is_empty() {
+			self.fold_projected_left_semi_refs(
+				spilled,
+				&refs,
+				semi_output_schema,
+				retained_columns,
+				partition_count,
+				exchange_key,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+			)
+			.await?;
+			output_rows = output_rows.saturating_add(refs.len() as u64);
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn fold_projected_left_semi_refs(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		refs: &[SpilledBatchRowRef],
+		semi_output_schema: &arrow::datatypes::SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		partition_count: u32,
+		exchange_key: &BoundExprProgram,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+	) -> Result<(), ExecutionError> {
+		let batch = materialize_projected_streamed_spilled_build_rows(
+			spilled,
+			refs,
+			semi_output_schema,
+			retained_columns,
+			self.context.task_budget.memory.get(),
+		)
+		.await?;
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		for (_partition, partitioned) in
+			self.repartition_exchange_batch(&batch, partition_count, exchange_key)?
+		{
+			if partitioned.num_rows() == 0 {
+				continue;
+			}
+			self.fold_bound_grouped_aggregate_batch(
+				groups,
+				group_types,
+				group_expr,
+				aggr_expr,
+				&partitioned,
+			)?;
+		}
+		Ok(())
 	}
 
 	async fn try_streaming_reoriented_inner_chain_grouped_aggregate(
@@ -7031,6 +7483,81 @@ async fn materialize_streamed_spilled_build_rows(
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
+async fn materialize_projected_streamed_spilled_build_rows(
+	spilled: &mut SpilledInnerJoinBuild,
+	refs: &[SpilledBatchRowRef],
+	output_schema: &arrow::datatypes::SchemaRef,
+	retained_columns: &[ColumnOrdinal],
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if refs.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in refs {
+		page_sources.entry(row.page_index).or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let estimated_output_bytes = join_interleave_index_bytes(refs.len()).saturating_add(
+		estimate_spilled_inner_build_selection_bytes(&build_pages, refs.len()),
+	);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"projected streamed preserved join output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(refs.len());
+	for row in refs {
+		let source_index =
+			*page_sources
+				.get(&row.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"projected streamed preserved join missing spilled page source {}",
+						row.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.row as usize));
+	}
+
+	let retained_positions = retained_columns
+		.iter()
+		.enumerate()
+		.map(|(position, ordinal)| (ordinal.0 as usize, position))
+		.collect::<BTreeMap<_, _>>();
+	let mut columns = Vec::with_capacity(output_schema.fields().len());
+	for (column_index, field) in output_schema.fields().iter().enumerate() {
+		if let Some(retained_position) = retained_positions.get(&column_index).copied() {
+			let source_columns = build_pages
+				.iter()
+				.map(|batch| batch.column(retained_position).as_ref())
+				.collect::<Vec<_>>();
+			columns.push(interleave(&source_columns, &build_indices)?);
+		} else {
+			columns.push(default_array_for_unused_column(
+				field.data_type(),
+				refs.len(),
+			)?);
+		}
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
 async fn materialize_streamed_spilled_inner_matches(
 	spilled: &mut SpilledInnerJoinBuild,
 	probe_batch: &RecordBatch,
@@ -9500,6 +10027,36 @@ impl SpilledInnerJoinBuild {
 			let chunk = batch.slice(offset, len);
 			self.write_page_batch(&chunk, key_plan, build_keys, null_safe_keys, task_budget)
 				.await?;
+		}
+		Ok(())
+	}
+
+	async fn write_projected_batch_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		retained_columns: &[ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		projected_build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			let projected = project_batch_columns(&chunk, retained_columns)?;
+			self.write_page_batch(
+				&projected,
+				key_plan,
+				projected_build_keys,
+				null_safe_keys,
+				task_budget,
+			)
+			.await?;
 		}
 		Ok(())
 	}
@@ -14302,6 +14859,109 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn projected_spilled_inner_build_writes_only_retained_columns() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::Utf8, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+				Arc::new(Int64Array::from(vec![11, 12, 13])),
+				Arc::new(StringArray::from(vec!["wide-a", "wide-b", "wide-c"])),
+			],
+		)
+		.expect("projected spill input");
+		let retained = vec![ColumnOrdinal(1)];
+		let projected_schema = projected_schema_for_columns(&schema, &retained).expect("schema");
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&projected_schema,
+			&[ColumnOrdinal(0)],
+			&schema,
+			&[ColumnOrdinal(1)],
+			false,
+		)
+		.expect("key plan");
+		let budget = high_test_budget();
+		let context = ExecutionContext::local_test();
+		let mut spilled = SpilledInnerJoinBuild::create(
+			budget,
+			context.join_spill_file_ops,
+			context.join_spill_dir,
+		)
+		.await
+		.expect("create projected spill");
+
+		spilled
+			.write_projected_batch_chunks(
+				&batch,
+				&retained,
+				key_plan,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write projected page");
+		let page = spilled.read_batch_page(0).await.expect("read page");
+
+		assert_eq!(page.num_columns(), 1);
+		assert_eq!(page.schema().field(0).name(), "id");
+		assert_eq!(spilled.input_batches_written(), 1);
+		spilled.cleanup().await;
+	}
+
+	#[tokio::test]
+	async fn projected_left_semi_grouped_aggregate_prunes_unused_preserved_columns() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 512;
+		let low_budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(2 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let (stream_executor, plan) = projected_left_semi_grouped_aggregate_fixture(
+			rows,
+			4096,
+			low_budget,
+			telemetry.clone(),
+		);
+		let streamed = stream_executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("projected left-semi grouped aggregate");
+
+		let (baseline_executor, baseline_plan) = projected_left_semi_grouped_aggregate_fixture(
+			rows,
+			4096,
+			high_test_budget(),
+			Arc::new(Mutex::new(TaskTelemetry::default())),
+		);
+		let materialized = baseline_executor
+			.execute_bound(&baseline_plan, None)
+			.await
+			.expect("materialized left-semi grouped aggregate");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+			canonical_arrow_ipc_digest(&materialized, SortPolicy::None)
+				.expect("materialized digest"),
+			"projected spill must preserve grouped aggregate results"
+		);
+		let spill_bytes = telemetry.lock().unwrap().counters.spill_bytes;
+		assert!(
+			spill_bytes > 0,
+			"path should spill the projected preserved side"
+		);
+		assert!(
+			spill_bytes < low_budget.spill_bytes.get(),
+			"projected spill should stay within the unchanged spill budget"
+		);
+	}
+
+	#[tokio::test]
 	async fn streaming_collapsing_aggregate_matches_materialized_float64_and_decimal_order() {
 		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
 
@@ -16150,6 +16810,107 @@ mod tests {
 			null_safe_keys: false,
 			strategy: JoinStrategy::HashPartitioned,
 			output_schema: left_schema,
+		};
+		(executor, plan)
+	}
+
+	fn projected_left_semi_grouped_aggregate_fixture(
+		rows: usize,
+		payload_len: usize,
+		budget: TaskBudget,
+		telemetry: Arc<Mutex<TaskTelemetry>>,
+	) -> (Executor, ExecutionPlan) {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("quantity", DataType::Decimal128(20, 2), false),
+			Field::new("payload", DataType::Utf8, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+		]));
+		let payload = "x".repeat(payload_len);
+		let left_keys = (0..rows)
+			.map(|value| i64::try_from(value).expect("row fits i64"))
+			.collect::<Vec<_>>();
+		let quantity = Decimal128Array::from(
+			(0..rows)
+				.map(|row| Some(((row % 11) as i128 + 1) * 100))
+				.collect::<Vec<_>>(),
+		)
+		.with_precision_and_scale(20, 2)
+		.expect("quantity decimal");
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(left_keys.clone())),
+				Arc::new(Int64Array::from(left_keys.clone())),
+				Arc::new(quantity),
+				Arc::new(StringArray::from(vec![payload.as_str(); rows])),
+			],
+		)
+		.expect("projected left-semi preserved batch");
+		let right_keys = (0..rows)
+			.flat_map(|value| {
+				let value = i64::try_from(value).expect("row fits i64");
+				[value, value]
+			})
+			.collect::<Vec<_>>();
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..right_keys.len())
+						.map(|value| i64::try_from(value).expect("row fits i64"))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(right_keys)),
+			],
+		)
+		.expect("projected left-semi existence batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_batch),
+				(TableId(2), right_batch),
+			]),
+		});
+		let context = ExecutionContext::local_test()
+			.with_task_budget(budget)
+			.with_task_telemetry(telemetry);
+		let executor = Executor::with_context(storage, context);
+		let semi = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(test_scan_plan(TableId(1), left_schema.clone(), 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
+			kind: JoinKind::LeftSemi,
+			left_keys: vec![ColumnOrdinal(1)],
+			right_keys: vec![ColumnOrdinal(1)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: left_schema,
+		};
+		let group_expr = bound_column_root("order_key", ColumnOrdinal(1), DataType::Int64, false);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: bound_column_root(
+				"quantity",
+				ColumnOrdinal(2),
+				DataType::Decimal128(20, 2),
+				false,
+			),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("sum_quantity", DataType::Decimal128(20, 2), true),
+		]));
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(exchange_plan(semi, group_expr.clone(), 1)),
+			group_expr,
+			aggr_expr,
+			output_schema,
 		};
 		(executor, plan)
 	}
