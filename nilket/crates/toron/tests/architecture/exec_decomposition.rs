@@ -2,6 +2,7 @@ use super::support::*;
 
 const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_800;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
@@ -37,6 +38,27 @@ pub(crate) fn adr351_exec_join_spill_module_exists() {
 	let path = manifest.join("src/exec/join/spill.rs");
 
 	assert!(path.exists(), "missing exec/join/spill.rs storage module");
+}
+
+#[test]
+pub(crate) fn adr352_exec_join_root_declares_streaming_module() {
+	let join_root = exec_join_root_source();
+
+	assert!(
+		join_root.contains("mod streaming;"),
+		"exec/join root must declare the streaming orchestration submodule"
+	);
+}
+
+#[test]
+pub(crate) fn adr352_exec_join_streaming_module_exists() {
+	let manifest = manifest_dir();
+	let path = manifest.join("src/exec/join/streaming.rs");
+
+	assert!(
+		path.exists(),
+		"missing exec/join/streaming.rs orchestration module"
+	);
 }
 
 #[test]
@@ -82,6 +104,30 @@ pub(crate) fn adr351_exec_join_root_excludes_carved_spill_storage() {
 }
 
 #[test]
+pub(crate) fn adr352_exec_join_root_excludes_carved_streaming_orchestration() {
+	let join_root = exec_join_root_source();
+
+	for carved_definition in [
+		"struct ReorientedInnerJoinStage",
+		"struct StreamingSemiAntiStage",
+		"enum StreamingSemiAntiExistence",
+		"struct StreamingLeftOuterRecombineRuntime",
+		"fn extract_reoriented_inner_chain(",
+		"fn decompose_streaming_existence_plan(",
+		"fn extract_streaming_inner_prefix_semi_anti_chain(",
+		"async fn try_streaming_join0_filter(",
+		"async fn try_streaming_collapsing_global_aggregate(",
+		"async fn prepare_streaming_semi_anti_runtime(",
+		"fn probe_streaming_left_outer_recombine(",
+	] {
+		assert!(
+			!join_root.contains(carved_definition),
+			"exec/join root still defines carved streaming marker {carved_definition}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr350_exec_root_is_bounded() {
 	let lines = exec_root_source().lines().count();
 	// ADR 350: first semantic executor decomposition ratchet. The post-join-carve root measured
@@ -102,6 +148,18 @@ pub(crate) fn adr351_exec_join_root_is_bounded() {
 	assert!(
 		lines <= EXEC_JOIN_ROOT_LINE_LIMIT,
 		"exec/join root has {lines} lines; expected <= {EXEC_JOIN_ROOT_LINE_LIMIT} after ADR 351 spill carve"
+	);
+}
+
+#[test]
+pub(crate) fn adr352_exec_join_root_is_bounded_after_streaming_carve() {
+	let lines = exec_join_root_source().lines().count();
+	// ADR 352: streaming orchestration carved from exec/join.rs into exec/join/streaming.rs.
+	// The post-carve join root measured 3,684 lines before fmt; 3,800 leaves import/module
+	// churn slack while failing if streaming logic drifts back into the join root.
+	assert!(
+		lines <= EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT,
+		"exec/join root has {lines} lines; expected <= {EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT} after ADR 352 streaming carve"
 	);
 }
 
