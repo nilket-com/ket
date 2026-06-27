@@ -15,8 +15,7 @@ pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
-	build_batch: RecordBatch,
-	build_rows: HashMap<JoinKey, BuildRowList>,
+	build: ReorientedInnerJoinBuild,
 	key_plan: JoinKeyPlan,
 	probe_keys: Vec<crate::ir::ColumnOrdinal>,
 	output_schema: SchemaRef,
@@ -24,6 +23,18 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	probe_columns_first: bool,
 	probe_rows: u64,
 	output_rows: u64,
+}
+
+pub(in crate::exec) enum ReorientedInnerJoinBuild {
+	InMemory {
+		batch: RecordBatch,
+		rows: HashMap<JoinKey, BuildRowList>,
+	},
+	Spilled {
+		build: SpilledInnerJoinBuild,
+		materialized_output_schema: SchemaRef,
+		build_column_count: usize,
+	},
 }
 
 pub(in crate::exec) struct StreamingSemiAntiStage<'a> {
@@ -90,6 +101,21 @@ impl StreamingSemiAntiRuntime<'_> {
 	pub(in crate::exec) async fn cleanup(self) {
 		if let StreamingSemiAntiExistence::Spilled(spilled) = self.existence {
 			spilled.cleanup().await;
+		}
+	}
+}
+
+impl ReorientedInnerJoinRuntime<'_> {
+	pub(in crate::exec) fn build_row_count(&self) -> u64 {
+		match &self.build {
+			ReorientedInnerJoinBuild::InMemory { batch, .. } => batch.num_rows() as u64,
+			ReorientedInnerJoinBuild::Spilled { build, .. } => build.input_row_count(),
+		}
+	}
+
+	pub(in crate::exec) async fn cleanup(self) {
+		if let ReorientedInnerJoinBuild::Spilled { build, .. } = self.build {
+			build.cleanup().await;
 		}
 	}
 }
@@ -2581,15 +2607,19 @@ impl Executor {
 				JoinRuntimeObservation {
 					replay_id: runtime.replay_id,
 					strategy: runtime.strategy,
-					build_rows: RowCount::new(runtime.build_batch.num_rows() as u64),
+					build_rows: RowCount::new(runtime.build_row_count()),
 					probe_rows: RowCount::new(runtime.probe_rows),
 					output_rows: RowCount::new(runtime.output_rows),
 				},
 			);
 		}
 
-		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
-			.map(Some)
+		let output =
+			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema);
+		for runtime in runtimes {
+			runtime.cleanup().await;
+		}
+		output.map(Some)
 	}
 
 	pub(in crate::exec) async fn try_streaming_inner_prefix_semi_anti_grouped_aggregate(
@@ -2614,7 +2644,7 @@ impl Executor {
 		let mut inner_runtimes = Vec::with_capacity(chain.inner_stages.len());
 		for stage in chain.inner_stages {
 			let Some(runtime) = self
-				.prepare_reoriented_inner_join_runtime(stage, morsel)
+				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
 				.await?
 			else {
 				return Ok(None);
@@ -2781,7 +2811,10 @@ impl Executor {
 					for runtime in inner_runtimes.iter_mut() {
 						let mut next = Vec::new();
 						for batch in batches {
-							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+							next.extend(
+								self.probe_reoriented_inner_join_streaming(runtime, &batch)
+									.await?,
+							);
 						}
 						batches = next;
 						if let Some(predicate) = runtime.post_filter {
@@ -2848,7 +2881,7 @@ impl Executor {
 				JoinRuntimeObservation {
 					replay_id: runtime.replay_id,
 					strategy: runtime.strategy,
-					build_rows: RowCount::new(runtime.build_batch.num_rows() as u64),
+					build_rows: RowCount::new(runtime.build_row_count()),
 					probe_rows: RowCount::new(runtime.probe_rows),
 					output_rows: RowCount::new(runtime.output_rows),
 				},
@@ -2870,6 +2903,9 @@ impl Executor {
 
 		let output =
 			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema);
+		for runtime in inner_runtimes {
+			runtime.cleanup().await;
+		}
 		semi_runtime.cleanup().await;
 		anti_runtime.cleanup().await;
 		output.map(Some)
@@ -3038,7 +3074,10 @@ impl Executor {
 					for runtime in inner_runtimes.iter_mut() {
 						let mut next = Vec::new();
 						for batch in batches {
-							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+							next.extend(
+								self.probe_reoriented_inner_join_streaming(runtime, &batch)
+									.await?,
+							);
 						}
 						batches = next;
 						if let Some(predicate) = runtime.post_filter {
@@ -3109,6 +3148,91 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, false)
+			.await
+	}
+
+	pub(in crate::exec) async fn prepare_reoriented_inner_join_runtime_with_streamed_scan_build<
+		'a,
+	>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, true)
+			.await
+	}
+
+	async fn prepare_reoriented_inner_join_runtime_with_scan_build<'a>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+		stream_scan_build: bool,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		if stream_scan_build && decompose_streaming_scan_probe_input(stage.build).is_some() {
+			let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+				&stage.build.schema(),
+				&stage.build_keys,
+				&stage.probe_schema,
+				&stage.probe_keys,
+				false,
+			)?;
+			let mut spilled = SpilledInnerJoinBuild::create(
+				self.context.task_budget,
+				self.context.join_spill_file_ops.clone(),
+				self.context.join_spill_dir.clone(),
+			)
+			.await?;
+			let build_started = Instant::now();
+			self.write_streaming_scan_inner_build_batches(
+				&mut spilled,
+				decompose_streaming_scan_probe_input(stage.build).expect("checked scan build"),
+				&stage.build_keys,
+				key_plan,
+				false,
+				morsel,
+			)
+			.await?;
+			spilled.finish(self.context.task_budget).await?;
+			let build_rows = spilled.input_row_count();
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(build_started));
+				task.phases.spill_micros = task
+					.phases
+					.spill_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.spill_bytes = task
+					.counters
+					.spill_bytes
+					.saturating_add(spilled.spill_bytes());
+			});
+			let materialized_output_schema = if stage.probe_columns_first {
+				concat_join_schema(&stage.build.schema(), &stage.probe_schema)
+			} else {
+				stage.output_schema.clone()
+			};
+			return Ok(Some(ReorientedInnerJoinRuntime {
+				replay_id: stage.replay_id,
+				strategy: stage.strategy,
+				build: ReorientedInnerJoinBuild::Spilled {
+					build: spilled,
+					materialized_output_schema,
+					build_column_count: stage.build.schema().fields().len(),
+				},
+				key_plan,
+				probe_keys: stage.probe_keys,
+				output_schema: stage.output_schema,
+				post_filter: stage.post_filter,
+				probe_columns_first: stage.probe_columns_first,
+				probe_rows: 0,
+				output_rows: 0,
+			}));
+		}
+
 		let build_batches = self.execute_bound(stage.build, morsel).await?;
 		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
@@ -3154,8 +3278,10 @@ impl Executor {
 		Ok(Some(ReorientedInnerJoinRuntime {
 			replay_id: stage.replay_id,
 			strategy: stage.strategy,
-			build_batch,
-			build_rows,
+			build: ReorientedInnerJoinBuild::InMemory {
+				batch: build_batch,
+				rows: build_rows,
+			},
 			key_plan,
 			probe_keys: stage.probe_keys,
 			output_schema: stage.output_schema,
@@ -3518,53 +3644,134 @@ impl Executor {
 		runtime: &mut ReorientedInnerJoinRuntime<'_>,
 		probe_batch: &RecordBatch,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		if probe_batch.num_rows() == 0 {
-			return Ok(Vec::new());
-		}
-		let probe_key_arrays = key_arrays(probe_batch, &runtime.probe_keys)?;
-		runtime.probe_rows = runtime
-			.probe_rows
-			.saturating_add(probe_batch.num_rows() as u64);
+		let (output, probe_rows, output_rows) = {
+			let ReorientedInnerJoinBuild::InMemory { batch, rows } = &runtime.build else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "synchronous reoriented inner probe requires an in-memory build"
+						.to_string(),
+				});
+			};
+			self.probe_reoriented_inner_join_in_memory(
+				runtime.key_plan,
+				&runtime.probe_keys,
+				&runtime.output_schema,
+				runtime.probe_columns_first,
+				batch,
+				rows,
+				probe_batch,
+			)?
+		};
+		self.record_reoriented_inner_probe(runtime, probe_rows, output_rows);
+		Ok(output)
+	}
+
+	pub(in crate::exec) async fn probe_reoriented_inner_join_streaming(
+		&self,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		probe_batch: &RecordBatch,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let (output, probe_rows, output_rows) = match &mut runtime.build {
+			ReorientedInnerJoinBuild::InMemory { batch, rows } => self
+				.probe_reoriented_inner_join_in_memory(
+					runtime.key_plan,
+					&runtime.probe_keys,
+					&runtime.output_schema,
+					runtime.probe_columns_first,
+					batch,
+					rows,
+					probe_batch,
+				)?,
+			ReorientedInnerJoinBuild::Spilled {
+				build,
+				materialized_output_schema,
+				build_column_count,
+			} => {
+				if probe_batch.num_rows() == 0 {
+					(Vec::new(), 0, 0)
+				} else {
+					let mut output = Vec::new();
+					let (probe_rows, output_rows) = self
+						.visit_streaming_spilled_inner_probe_batch(
+							build,
+							probe_batch,
+							&runtime.probe_keys,
+							runtime.key_plan,
+							false,
+							materialized_output_schema,
+							&runtime.output_schema,
+							None,
+							runtime.probe_columns_first,
+							*build_column_count,
+							&mut |batch| {
+								output.push(batch);
+								Ok(())
+							},
+						)
+						.await?;
+					(output, probe_rows, output_rows)
+				}
+			}
+		};
+		self.record_reoriented_inner_probe(runtime, probe_rows, output_rows);
+		Ok(output)
+	}
+
+	fn record_reoriented_inner_probe(
+		&self,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		probe_rows: u64,
+		output_rows: u64,
+	) {
+		runtime.probe_rows = runtime.probe_rows.saturating_add(probe_rows);
+		runtime.output_rows = runtime.output_rows.saturating_add(output_rows);
 		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.probe_rows = task
-				.counters
-				.probe_rows
-				.saturating_add(probe_batch.num_rows() as u64);
+			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
+	}
+
+	fn probe_reoriented_inner_join_in_memory(
+		&self,
+		key_plan: JoinKeyPlan,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		output_schema: &SchemaRef,
+		probe_columns_first: bool,
+		build_batch: &RecordBatch,
+		build_rows: &HashMap<JoinKey, BuildRowList>,
+		probe_batch: &RecordBatch,
+	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
+		if probe_batch.num_rows() == 0 {
+			return Ok((Vec::new(), 0, 0));
+		}
+		let probe_key_arrays = key_arrays(probe_batch, probe_keys)?;
 		let mut selection = probe_in_memory_join_rows(
 			JoinKind::Inner,
-			runtime.key_plan,
-			&runtime.build_rows,
-			runtime.build_batch.num_rows(),
+			key_plan,
+			build_rows,
+			build_batch.num_rows(),
 			&probe_key_arrays,
 			probe_batch.num_rows(),
 			None,
-			&runtime.build_batch,
+			build_batch,
 			probe_batch,
 			false,
 		)?;
-		runtime.output_rows = runtime.output_rows.saturating_add(selection.len() as u64);
-		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.matched_rows = task
-				.counters
-				.matched_rows
-				.saturating_add(selection.len() as u64);
-		});
+		let output_rows = selection.len() as u64;
 		let mut output = Vec::new();
 		for chunk in selection.chunks_mut(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let batch = materialize_reoriented_inner_selection(
 				probe_batch,
-				&runtime.build_batch,
+				build_batch,
 				chunk,
-				&runtime.output_schema,
+				output_schema,
 				self.context.task_budget.memory.get(),
-				runtime.probe_columns_first,
+				probe_columns_first,
 			)?;
 			if batch.num_rows() > 0 {
 				output.push(batch);
 			}
 		}
-		Ok(output)
+		Ok((output, probe_batch.num_rows() as u64, output_rows))
 	}
 }
 fn matching_preserved_rows_in_memory(
@@ -3599,9 +3806,12 @@ fn matching_preserved_rows_in_memory(
 mod tests {
 	use super::*;
 	use crate::error::StorageError;
-	use crate::ir::{BroadcastReplayEligibility, ColumnOrdinal, QueryProfileHint, TableId};
+	use crate::ir::{
+		BoundExprProgram, BoundExprProgramBuilder, BroadcastReplayEligibility, ColumnName,
+		ColumnOrdinal, QueryProfileHint, ResolvedColumn, TableId,
+	};
 	use crate::storage::{ScanRequest, ScanStream, StorageScan};
-	use arrow::array::Int64Array;
+	use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::HashMap;
 	use std::sync::{Arc, Mutex};
@@ -3901,5 +4111,209 @@ mod tests {
 				.as_slice(),
 			&[TableId(2), TableId(1)]
 		);
+	}
+
+	#[tokio::test]
+	async fn reoriented_inner_runtime_streams_scan_build_batches_and_preserves_order() {
+		for value_kind in [StreamingValueKind::Float64, StreamingValueKind::Decimal] {
+			let value_type = value_kind.data_type();
+			let build_schema = Arc::new(Schema::new(vec![
+				Field::new("build_key", DataType::Int64, false),
+				Field::new("build_value", value_type.clone(), true),
+			]));
+			let probe_schema = Arc::new(Schema::new(vec![
+				Field::new("probe_key", DataType::Int64, false),
+				Field::new("probe_tag", DataType::Int64, false),
+			]));
+			let output_schema = concat_test_schema(&probe_schema, &build_schema);
+			let build_a = RecordBatch::try_new(
+				build_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![1, 2])),
+					value_kind.values(&[100, 200]),
+				],
+			)
+			.expect("build batch a");
+			let build_b = RecordBatch::try_new(
+				build_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![3])),
+					value_kind.values(&[300]),
+				],
+			)
+			.expect("build batch b");
+			let probe = RecordBatch::try_new(
+				probe_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![3, 1, 2])),
+					Arc::new(Int64Array::from(vec![30, 10, 20])),
+				],
+			)
+			.expect("probe batch");
+			let requested_tables = Arc::new(Mutex::new(Vec::new()));
+			let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(3), vec![build_a, build_b])]),
+				requested_tables: requested_tables.clone(),
+			});
+			let executor = Executor::with_context(
+				storage,
+				ExecutionContext::local_test().with_task_budget(TaskBudget {
+					memory: ByteCount::new(256 * 1024 * 1024),
+					spill_bytes: ByteCount::new(256 * 1024 * 1024),
+					..TaskBudget::from_query_budget(QueryBudget::test_default())
+				}),
+			);
+			let scan = test_scan_plan_with_first_field_key(TableId(3), build_schema.clone(), 3);
+			let build = ExecutionPlan::Exchange {
+				input: Box::new(scan),
+				partition_count: 1,
+				key: bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+			};
+			let mut streamed_runtime = executor
+				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+					reoriented_scan_build_stage(
+						&build,
+						probe_schema.clone(),
+						output_schema.clone(),
+					),
+					None,
+				)
+				.await
+				.expect("streamed runtime")
+				.expect("scan build should stream");
+			let ReorientedInnerJoinBuild::Spilled { build: spilled, .. } = &streamed_runtime.build
+			else {
+				panic!("scan build side must use the streamed-spilled build");
+			};
+			assert_eq!(
+				spilled.input_batches_written(),
+				2,
+				"scan build batches must be spilled one at a time, not concat_or_empty'd"
+			);
+			let mut materialized_runtime = executor
+				.prepare_reoriented_inner_join_runtime(
+					reoriented_scan_build_stage(
+						&build,
+						probe_schema.clone(),
+						output_schema.clone(),
+					),
+					None,
+				)
+				.await
+				.expect("materialized runtime")
+				.expect("materialized build should prepare");
+
+			let streamed = executor
+				.probe_reoriented_inner_join_streaming(&mut streamed_runtime, &probe)
+				.await
+				.expect("streamed probe");
+			let materialized = executor
+				.probe_reoriented_inner_join(&mut materialized_runtime, &probe)
+				.expect("materialized probe");
+			assert_record_batches_equal(&streamed, &materialized);
+			assert_eq!(
+				streamed.first().expect("streamed output").schema().as_ref(),
+				output_schema.as_ref(),
+				"streamed spilled build must restore probe-first column order"
+			);
+			assert_eq!(
+				requested_tables
+					.lock()
+					.expect("requested tables")
+					.as_slice(),
+				&[TableId(3), TableId(3)]
+			);
+
+			streamed_runtime.cleanup().await;
+			materialized_runtime.cleanup().await;
+		}
+	}
+
+	#[derive(Clone, Copy)]
+	enum StreamingValueKind {
+		Float64,
+		Decimal,
+	}
+
+	impl StreamingValueKind {
+		fn data_type(self) -> DataType {
+			match self {
+				Self::Float64 => DataType::Float64,
+				Self::Decimal => DataType::Decimal128(20, 2),
+			}
+		}
+
+		fn values(self, cents: &[i128]) -> ArrayRef {
+			match self {
+				Self::Float64 => Arc::new(Float64Array::from(
+					cents
+						.iter()
+						.map(|value| Some(*value as f64 / 100.0))
+						.collect::<Vec<_>>(),
+				)),
+				Self::Decimal => Arc::new(
+					Decimal128Array::from(
+						cents.iter().map(|value| Some(*value)).collect::<Vec<_>>(),
+					)
+					.with_precision_and_scale(20, 2)
+					.expect("decimal build values"),
+				),
+			}
+		}
+	}
+
+	fn bound_column_root(
+		name: &str,
+		ordinal: ColumnOrdinal,
+		data_type: DataType,
+		nullable: bool,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let column = builder.append_column(ResolvedColumn {
+			name: ColumnName(name.to_string()),
+			ordinal,
+			data_type,
+			nullable,
+			pbc_eligible: false,
+		});
+		builder.push_root(column);
+		builder.build()
+	}
+
+	fn reoriented_scan_build_stage(
+		build: &ExecutionPlan,
+		probe_schema: SchemaRef,
+		output_schema: SchemaRef,
+	) -> ReorientedInnerJoinStage<'_> {
+		ReorientedInnerJoinStage {
+			replay_id: JoinReplayId(1),
+			probe_schema,
+			probe_keys: vec![ColumnOrdinal(0)],
+			build,
+			build_keys: vec![ColumnOrdinal(0)],
+			output_schema,
+			strategy: JoinStrategy::HashPartitioned,
+			post_filter: None,
+			probe_columns_first: true,
+		}
+	}
+
+	fn assert_record_batches_equal(left: &[RecordBatch], right: &[RecordBatch]) {
+		let left_schema = left.first().expect("left batches").schema();
+		let right_schema = right.first().expect("right batches").schema();
+		assert_eq!(left_schema, right_schema);
+		let left_batch =
+			arrow::compute::concat_batches(&left_schema, left.iter()).expect("left concat");
+		let right_batch =
+			arrow::compute::concat_batches(&right_schema, right.iter()).expect("right concat");
+		assert_eq!(left_batch.num_rows(), right_batch.num_rows());
+		assert_eq!(left_batch.num_columns(), right_batch.num_columns());
+		for column in 0..left_batch.num_columns() {
+			assert_eq!(
+				format!("{:?}", left_batch.column(column)),
+				format!("{:?}", right_batch.column(column)),
+				"column {column} differs"
+			);
+		}
 	}
 }
