@@ -408,9 +408,15 @@ pub(crate) fn adr037_executor_threads_scan_row_identity_to_storage() {
 		.next()
 		.expect("execute_bound body")
 		.1;
+	let scan_request_builder = brace_blocks_after_marker(&exec, "fn bound_scan_request")
+		.into_iter()
+		.next()
+		.expect("bound_scan_request body")
+		.1;
 
-	assert!(execute_bound.contains("row_identity,"));
-	assert!(execute_bound.contains("row_identity: *row_identity"));
+	assert!(execute_bound.contains(".bound_scan_request(plan, morsel)"));
+	assert!(scan_request_builder.contains("row_identity,"));
+	assert!(scan_request_builder.contains("row_identity: *row_identity"));
 }
 
 #[test]

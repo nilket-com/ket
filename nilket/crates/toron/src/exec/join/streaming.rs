@@ -101,6 +101,18 @@ pub(in crate::exec) struct StreamingSemiAntiChain<'a> {
 	anti_stage: StreamingSemiAntiStage<'a>,
 }
 
+pub(in crate::exec) struct StreamingScanProbeInput<'a> {
+	scan: &'a ExecutionPlan,
+	filter_predicate: Option<&'a BoundExprProgram>,
+	exchange: Option<StreamingScanProbeExchange<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::exec) struct StreamingScanProbeExchange<'a> {
+	partition_count: u32,
+	key: &'a BoundExprProgram,
+}
+
 pub(in crate::exec) fn extract_reoriented_inner_chain(
 	top: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
@@ -246,6 +258,151 @@ pub(in crate::exec) fn exchange_input(plan: &ExecutionPlan) -> Option<&Execution
 	};
 	Some(input.as_ref())
 }
+
+pub(in crate::exec) fn decompose_streaming_scan_probe_input(
+	plan: &ExecutionPlan,
+) -> Option<StreamingScanProbeInput<'_>> {
+	match plan {
+		ExecutionPlan::Scan { .. } => Some(StreamingScanProbeInput {
+			scan: plan,
+			filter_predicate: None,
+			exchange: None,
+		}),
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => {
+			let ExecutionPlan::Scan { .. } = input.as_ref() else {
+				return None;
+			};
+			let filter_predicate = match disposition {
+				FilterDisposition::EvaluateInToron => Some(predicate),
+				FilterDisposition::FullyPushed => None,
+			};
+			Some(StreamingScanProbeInput {
+				scan: input.as_ref(),
+				filter_predicate,
+				exchange: None,
+			})
+		}
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => {
+			let mut scan_input = decompose_streaming_scan_probe_input(input.as_ref())?;
+			if scan_input.exchange.is_some() {
+				return None;
+			}
+			scan_input.exchange = Some(StreamingScanProbeExchange {
+				partition_count: *partition_count,
+				key,
+			});
+			Some(scan_input)
+		}
+		_ => None,
+	}
+}
+
+fn concat_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+	Arc::new(Schema::new(
+		left.fields()
+			.iter()
+			.chain(right.fields().iter())
+			.map(|field| field.as_ref().clone())
+			.collect::<Vec<_>>(),
+	))
+}
+
+fn reorder_spilled_inner_probe_before_build(
+	batch: RecordBatch,
+	build_column_count: usize,
+	output_schema: &SchemaRef,
+) -> Result<RecordBatch, ExecutionError> {
+	let column_count = batch.num_columns();
+	if build_column_count > column_count || output_schema.fields().len() != column_count {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"streamed spilled inner join column restore expected {} build columns in {} output columns",
+				build_column_count, column_count
+			),
+		});
+	}
+	let mut columns = Vec::with_capacity(column_count);
+	for column in &batch.columns()[build_column_count..] {
+		columns.push(column.clone());
+	}
+	for column in &batch.columns()[..build_column_count] {
+		columns.push(column.clone());
+	}
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+fn predicate_references_only_probe_prefix(
+	predicate: &BoundExprProgram,
+	probe_columns_first: bool,
+	probe_column_count: usize,
+) -> bool {
+	if !probe_columns_first {
+		return false;
+	}
+	let mut columns = BTreeSet::new();
+	collect_program_column_ordinals(predicate, &mut columns);
+	columns
+		.iter()
+		.all(|column| (column.0 as usize) < probe_column_count)
+}
+
+fn decompose_join_or_filtered_join(
+	plan: &ExecutionPlan,
+) -> Option<(&ExecutionPlan, Option<&BoundExprProgram>)> {
+	match plan {
+		ExecutionPlan::Join {
+			kind: JoinKind::Inner,
+			..
+		} => Some((plan, None)),
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => {
+			let ExecutionPlan::Join {
+				kind: JoinKind::Inner,
+				..
+			} = input.as_ref()
+			else {
+				return None;
+			};
+			let filter_predicate = match disposition {
+				FilterDisposition::FullyPushed => None,
+				FilterDisposition::EvaluateInToron => Some(predicate),
+			};
+			Some((input.as_ref(), filter_predicate))
+		}
+		_ => None,
+	}
+}
+
+fn limit_streaming_scan_batch(
+	batch: RecordBatch,
+	remaining: &mut Option<usize>,
+) -> Option<RecordBatch> {
+	let Some(limit) = remaining.as_mut() else {
+		return Some(batch);
+	};
+	if *limit == 0 {
+		return None;
+	}
+	let batch = if batch.num_rows() > *limit {
+		batch.slice(0, *limit)
+	} else {
+		batch
+	};
+	*limit = (*limit).saturating_sub(batch.num_rows());
+	Some(batch)
+}
+
 pub(in crate::exec) fn decompose_streaming_existence_plan(
 	plan: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<StreamingExistenceOp<'_>>)> {
@@ -740,6 +897,805 @@ impl Executor {
 			.await
 	}
 
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn try_visit_streaming_inner_join_scan_probe_chunks<F>(
+		&self,
+		build_plan: &ExecutionPlan,
+		probe_plan: &ExecutionPlan,
+		build_batches: Option<&[RecordBatch]>,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		match_filter: Option<&BoundExprProgram>,
+		null_safe_keys: bool,
+		replay_id: JoinReplayId,
+		strategy: JoinStrategy,
+		output_schema: &arrow::datatypes::SchemaRef,
+		filter_predicate: Option<&BoundExprProgram>,
+		probe_columns_first: bool,
+		morsel: Option<(MorselId, u32)>,
+		visit_batch: &mut F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		if probe_columns_first && match_filter.is_some() {
+			return Ok(None);
+		}
+		let Some(scan_input) = decompose_streaming_scan_probe_input(probe_plan) else {
+			return Ok(None);
+		};
+		if self.context.task_budget.memory.get() < 64 * 1024 * 1024 {
+			return Ok(None);
+		}
+		let probe_prefilter_predicate = filter_predicate.filter(|predicate| {
+			predicate_references_only_probe_prefix(
+				predicate,
+				probe_columns_first,
+				probe_plan.schema().fields().len(),
+			)
+		});
+		let join_filter_predicate = if probe_prefilter_predicate.is_some() {
+			None
+		} else {
+			filter_predicate
+		};
+
+		let build_started = Instant::now();
+		if let Some((mut spilled, key_plan)) = self
+			.try_create_streamed_spilled_inner_scan_build(
+				build_plan,
+				probe_plan,
+				build_keys,
+				probe_keys,
+				match_filter,
+				null_safe_keys,
+				morsel,
+			)
+			.await?
+		{
+			let materialized_output_schema = if probe_columns_first {
+				concat_join_schema(&build_plan.schema(), &probe_plan.schema())
+			} else {
+				output_schema.clone()
+			};
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.build_rows = task
+					.counters
+					.build_rows
+					.saturating_add(spilled.input_row_count());
+				task.phases.spill_micros = task
+					.phases
+					.spill_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.spill_bytes = task
+					.counters
+					.spill_bytes
+					.saturating_add(spilled.spill_bytes());
+			});
+			let probe_started = Instant::now();
+			let result = self
+				.visit_streaming_spilled_inner_scan_probe_chunks(
+					&mut spilled,
+					scan_input,
+					probe_keys,
+					key_plan,
+					null_safe_keys,
+					&materialized_output_schema,
+					output_schema,
+					probe_prefilter_predicate,
+					join_filter_predicate,
+					probe_columns_first,
+					build_plan.schema().fields().len(),
+					morsel,
+					visit_batch,
+				)
+				.await;
+			let build_rows = spilled.input_row_count();
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.probe_micros = task
+					.phases
+					.probe_micros
+					.saturating_add(duration_micros(probe_started));
+				if let Ok((probe_rows, output_rows)) = &result {
+					task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
+					task.counters.matched_rows =
+						task.counters.matched_rows.saturating_add(*output_rows);
+				}
+			});
+			if let Ok((probe_rows, output_rows)) = &result {
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id,
+						strategy,
+						build_rows: RowCount::new(build_rows),
+						probe_rows: RowCount::new(*probe_rows),
+						output_rows: RowCount::new(*output_rows),
+					},
+				);
+			}
+			spilled.cleanup().await;
+			result?;
+			return Ok(Some(()));
+		}
+
+		let Some(build_batches) = build_batches else {
+			return Ok(None);
+		};
+		if let Some((mut spilled, key_plan)) = try_create_streamed_spilled_inner_build(
+			build_plan.schema(),
+			probe_plan.schema(),
+			build_batches,
+			JoinKind::Inner,
+			build_keys,
+			probe_keys,
+			match_filter,
+			null_safe_keys,
+			self.context.task_budget,
+			self.context.join_spill_file_ops.clone(),
+			self.context.join_spill_dir.clone(),
+		)
+		.await?
+		{
+			let materialized_output_schema = if probe_columns_first {
+				concat_join_schema(&build_plan.schema(), &probe_plan.schema())
+			} else {
+				output_schema.clone()
+			};
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.build_rows = task
+					.counters
+					.build_rows
+					.saturating_add(spilled.input_row_count());
+				task.phases.spill_micros = task
+					.phases
+					.spill_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.spill_bytes = task
+					.counters
+					.spill_bytes
+					.saturating_add(spilled.spill_bytes());
+			});
+			let probe_started = Instant::now();
+			let result = self
+				.visit_streaming_spilled_inner_scan_probe_chunks(
+					&mut spilled,
+					scan_input,
+					probe_keys,
+					key_plan,
+					null_safe_keys,
+					&materialized_output_schema,
+					output_schema,
+					probe_prefilter_predicate,
+					join_filter_predicate,
+					probe_columns_first,
+					build_plan.schema().fields().len(),
+					morsel,
+					visit_batch,
+				)
+				.await;
+			let build_rows = spilled.input_row_count();
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.probe_micros = task
+					.phases
+					.probe_micros
+					.saturating_add(duration_micros(probe_started));
+				if let Ok((probe_rows, output_rows)) = &result {
+					task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
+					task.counters.matched_rows =
+						task.counters.matched_rows.saturating_add(*output_rows);
+				}
+			});
+			if let Ok((probe_rows, output_rows)) = &result {
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id,
+						strategy,
+						build_rows: RowCount::new(build_rows),
+						probe_rows: RowCount::new(*probe_rows),
+						output_rows: RowCount::new(*output_rows),
+					},
+				);
+			}
+			spilled.cleanup().await;
+			result?;
+			return Ok(Some(()));
+		}
+
+		let build_batch = concat_or_empty(build_plan.schema(), build_batches)?;
+		let build_key_arrays = key_arrays(&build_batch, build_keys)?;
+		if estimated_build_hash_bytes(&build_key_arrays, build_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&build_plan.schema(),
+			build_keys,
+			&probe_plan.schema(),
+			probe_keys,
+			null_safe_keys,
+		)?;
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&build_key_arrays,
+			build_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(build_batch.num_rows() as u64);
+		});
+
+		let probe_started = Instant::now();
+		let result = self
+			.visit_streaming_in_memory_inner_scan_probe_chunks(
+				&build_batch,
+				&build_rows,
+				join_key_plan,
+				scan_input,
+				probe_keys,
+				match_filter,
+				null_safe_keys,
+				output_schema,
+				probe_prefilter_predicate,
+				join_filter_predicate,
+				probe_columns_first,
+				morsel,
+				visit_batch,
+			)
+			.await;
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			if let Ok((probe_rows, output_rows)) = &result {
+				task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(*output_rows);
+			}
+		});
+		let (probe_rows, output_rows) = result?;
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id,
+				strategy,
+				build_rows: RowCount::new(build_batch.num_rows() as u64),
+				probe_rows: RowCount::new(probe_rows),
+				output_rows: RowCount::new(output_rows),
+			},
+		);
+		Ok(Some(()))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_create_streamed_spilled_inner_scan_build(
+		&self,
+		build_plan: &ExecutionPlan,
+		probe_plan: &ExecutionPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		match_filter: Option<&BoundExprProgram>,
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<(SpilledInnerJoinBuild, JoinKeyPlan)>, ExecutionError> {
+		if match_filter.is_some() {
+			return Ok(None);
+		}
+		let Some(scan_input) = decompose_streaming_scan_probe_input(build_plan) else {
+			return Ok(None);
+		};
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&build_plan.schema(),
+			build_keys,
+			&probe_plan.schema(),
+			probe_keys,
+			null_safe_keys,
+		)?;
+		let mut spilled = SpilledInnerJoinBuild::create(
+			self.context.task_budget,
+			self.context.join_spill_file_ops.clone(),
+			self.context.join_spill_dir.clone(),
+		)
+		.await?;
+		self.write_streaming_scan_inner_build_batches(
+			&mut spilled,
+			scan_input,
+			build_keys,
+			key_plan,
+			null_safe_keys,
+			morsel,
+		)
+		.await?;
+		spilled.finish(self.context.task_budget).await?;
+		Ok(Some((spilled, key_plan)))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn write_streaming_scan_inner_build_batches(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		scan_input: StreamingScanProbeInput<'_>,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(), ExecutionError> {
+		if let Some(exchange) = scan_input.exchange {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan build expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				for (_, partitioned) in
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
+				{
+					spilled
+						.write_batch_chunks(
+							&partitioned,
+							key_plan,
+							build_keys,
+							null_safe_keys,
+							self.context.task_budget,
+						)
+						.await?;
+				}
+			}
+		} else {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan build expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				spilled
+					.write_batch_chunks(
+						&batch,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await?;
+			}
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_spilled_inner_scan_probe_chunks<F>(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		scan_input: StreamingScanProbeInput<'_>,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		materialized_output_schema: &arrow::datatypes::SchemaRef,
+		output_schema: &arrow::datatypes::SchemaRef,
+		probe_prefilter_predicate: Option<&BoundExprProgram>,
+		filter_predicate: Option<&BoundExprProgram>,
+		probe_columns_first: bool,
+		build_column_count: usize,
+		morsel: Option<(MorselId, u32)>,
+		visit_batch: &mut F,
+	) -> Result<(u64, u64), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		if let Some(exchange) = scan_input.exchange {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan probe expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				if let Some(predicate) = probe_prefilter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"probe filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				for (_, partitioned) in
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
+				{
+					let (batch_probe_rows, batch_output_rows) = self
+						.visit_streaming_spilled_inner_probe_batch(
+							spilled,
+							&partitioned,
+							right_keys,
+							key_plan,
+							null_safe_keys,
+							materialized_output_schema,
+							output_schema,
+							filter_predicate,
+							probe_columns_first,
+							build_column_count,
+							&mut *visit_batch,
+						)
+						.await?;
+					probe_rows = probe_rows.saturating_add(batch_probe_rows);
+					output_rows = output_rows.saturating_add(batch_output_rows);
+				}
+			}
+		} else {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan probe expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				if let Some(predicate) = probe_prefilter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"probe filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				let (batch_probe_rows, batch_output_rows) = self
+					.visit_streaming_spilled_inner_probe_batch(
+						spilled,
+						&batch,
+						right_keys,
+						key_plan,
+						null_safe_keys,
+						materialized_output_schema,
+						output_schema,
+						filter_predicate,
+						probe_columns_first,
+						build_column_count,
+						&mut *visit_batch,
+					)
+					.await?;
+				probe_rows = probe_rows.saturating_add(batch_probe_rows);
+				output_rows = output_rows.saturating_add(batch_output_rows);
+			}
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_spilled_inner_probe_batch<F>(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		probe_batch: &RecordBatch,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		materialized_output_schema: &arrow::datatypes::SchemaRef,
+		output_schema: &arrow::datatypes::SchemaRef,
+		filter_predicate: Option<&BoundExprProgram>,
+		probe_columns_first: bool,
+		build_column_count: usize,
+		visit_batch: &mut F,
+	) -> Result<(u64, u64), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		visit_streamed_spilled_inner_join_chunks(
+			spilled,
+			std::slice::from_ref(probe_batch),
+			right_keys,
+			key_plan,
+			null_safe_keys,
+			materialized_output_schema,
+			self.context.task_budget.memory.get(),
+			|batch| {
+				let batch = if probe_columns_first {
+					reorder_spilled_inner_probe_before_build(
+						batch,
+						build_column_count,
+						output_schema,
+					)?
+				} else {
+					batch
+				};
+				let batch = if let Some(predicate) = filter_predicate {
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+				} else {
+					batch
+				};
+				if batch.num_rows() > 0 {
+					visit_batch(batch)?;
+				}
+				Ok(())
+			},
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_in_memory_inner_scan_probe_chunks<F>(
+		&self,
+		build_batch: &RecordBatch,
+		build_rows: &HashMap<JoinKey, BuildRowList>,
+		join_key_plan: JoinKeyPlan,
+		scan_input: StreamingScanProbeInput<'_>,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		match_filter: Option<&BoundExprProgram>,
+		null_safe_keys: bool,
+		output_schema: &arrow::datatypes::SchemaRef,
+		probe_prefilter_predicate: Option<&BoundExprProgram>,
+		filter_predicate: Option<&BoundExprProgram>,
+		probe_columns_first: bool,
+		morsel: Option<(MorselId, u32)>,
+		visit_batch: &mut F,
+	) -> Result<(u64, u64), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		let mut process_probe_batch = |right_batch: RecordBatch| -> Result<(), ExecutionError> {
+			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+			let right_key_arrays = key_arrays(&right_batch, probe_keys)?;
+			let selection = probe_in_memory_join_rows(
+				JoinKind::Inner,
+				join_key_plan,
+				build_rows,
+				build_batch.num_rows(),
+				&right_key_arrays,
+				right_batch.num_rows(),
+				match_filter,
+				build_batch,
+				&right_batch,
+				null_safe_keys,
+			)?;
+			output_rows = output_rows.saturating_add(selection.len() as u64);
+			self.visit_reoriented_inner_selection_filtered_chunks(
+				build_batch,
+				&right_batch,
+				&selection,
+				output_schema,
+				filter_predicate,
+				probe_columns_first,
+				visit_batch,
+			)?;
+			Ok(())
+		};
+		if let Some(exchange) = scan_input.exchange {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan probe expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining)
+				else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					right_batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						right_batch,
+						"filter predicate",
+					)?;
+					if right_batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				if let Some(predicate) = probe_prefilter_predicate {
+					right_batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						right_batch,
+						"probe filter predicate",
+					)?;
+					if right_batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				for (_, partitioned) in self.repartition_exchange_batch(
+					&right_batch,
+					exchange.partition_count,
+					exchange.key,
+				)? {
+					process_probe_batch(partitioned)?;
+				}
+			}
+		} else {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan probe expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining)
+				else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					right_batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						right_batch,
+						"filter predicate",
+					)?;
+					if right_batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				if let Some(predicate) = probe_prefilter_predicate {
+					right_batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						right_batch,
+						"probe filter predicate",
+					)?;
+					if right_batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				process_probe_batch(right_batch)?;
+			}
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	fn visit_reoriented_inner_selection_filtered_chunks<F>(
+		&self,
+		build_batch: &RecordBatch,
+		probe_batch: &RecordBatch,
+		selection: &[JoinOutputRow],
+		output_schema: &arrow::datatypes::SchemaRef,
+		filter_predicate: Option<&BoundExprProgram>,
+		probe_columns_first: bool,
+		visit_batch: &mut F,
+	) -> Result<(), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_reoriented_inner_selection(
+				probe_batch,
+				build_batch,
+				chunk,
+				output_schema,
+				self.context.task_budget.memory.get(),
+				probe_columns_first,
+			)?;
+			let batch = if let Some(predicate) = filter_predicate {
+				self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+			} else {
+				batch
+			};
+			if batch.num_rows() > 0 {
+				visit_batch(batch)?;
+			}
+		}
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn try_visit_streaming_join0_chunks<F>(
 		&self,
 		input: &ExecutionPlan,
@@ -770,8 +1726,119 @@ impl Executor {
 			return Ok(None);
 		}
 
-		let left_batches = self.execute_bound(left, morsel).await?;
-		let right_batches = self.execute_bound(right, morsel).await?;
+		let left_is_scan_probe = decompose_streaming_scan_probe_input(left).is_some();
+		let right_is_scan_probe = decompose_streaming_scan_probe_input(right).is_some();
+		let mut left_batches = None;
+		let mut right_batches = None;
+		if left_is_scan_probe {
+			if right_is_scan_probe
+				&& self
+					.try_visit_streaming_inner_join_scan_probe_chunks(
+						right,
+						left,
+						None,
+						right_keys,
+						left_keys,
+						match_filter.as_ref(),
+						*null_safe_keys,
+						*replay_id,
+						*strategy,
+						output_schema,
+						filter_predicate,
+						true,
+						morsel,
+						&mut visit_batch,
+					)
+					.await?
+					.is_some()
+			{
+				return Ok(Some(()));
+			}
+			let build_batches = self.execute_bound(right, morsel).await?;
+			if self
+				.try_visit_streaming_inner_join_scan_probe_chunks(
+					right,
+					left,
+					Some(&build_batches),
+					right_keys,
+					left_keys,
+					match_filter.as_ref(),
+					*null_safe_keys,
+					*replay_id,
+					*strategy,
+					output_schema,
+					filter_predicate,
+					true,
+					morsel,
+					&mut visit_batch,
+				)
+				.await?
+				.is_some()
+			{
+				return Ok(Some(()));
+			}
+			right_batches = Some(build_batches);
+		}
+		if right_is_scan_probe {
+			if left_is_scan_probe
+				&& self
+					.try_visit_streaming_inner_join_scan_probe_chunks(
+						left,
+						right,
+						None,
+						left_keys,
+						right_keys,
+						match_filter.as_ref(),
+						*null_safe_keys,
+						*replay_id,
+						*strategy,
+						output_schema,
+						filter_predicate,
+						false,
+						morsel,
+						&mut visit_batch,
+					)
+					.await?
+					.is_some()
+			{
+				return Ok(Some(()));
+			}
+			let build_batches = match left_batches.take() {
+				Some(batches) => batches,
+				None => self.execute_bound(left, morsel).await?,
+			};
+			if self
+				.try_visit_streaming_inner_join_scan_probe_chunks(
+					left,
+					right,
+					Some(&build_batches),
+					left_keys,
+					right_keys,
+					match_filter.as_ref(),
+					*null_safe_keys,
+					*replay_id,
+					*strategy,
+					output_schema,
+					filter_predicate,
+					false,
+					morsel,
+					&mut visit_batch,
+				)
+				.await?
+				.is_some()
+			{
+				return Ok(Some(()));
+			}
+			left_batches = Some(build_batches);
+		}
+		let left_batches = match left_batches {
+			Some(batches) => batches,
+			None => self.execute_bound(left, morsel).await?,
+		};
+		let right_batches = match right_batches {
+			Some(batches) => batches,
+			None => self.execute_bound(right, morsel).await?,
+		};
 		let build_started = Instant::now();
 		if let Some((mut spilled, key_plan)) = try_create_streamed_spilled_inner_build(
 			left.schema(),
@@ -986,28 +2053,60 @@ impl Executor {
 		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
-		let (join, filter_predicate) = match input {
+		let (join, join_filter_predicate, project, project_filter_predicate) = match input {
 			ExecutionPlan::Join {
 				kind: JoinKind::Inner,
 				..
-			} => (input, None),
+			} => (input, None, None, None),
 			ExecutionPlan::Filter {
 				input,
 				predicate,
 				disposition,
-			} => {
-				let ExecutionPlan::Join {
+			} => match input.as_ref() {
+				ExecutionPlan::Join {
 					kind: JoinKind::Inner,
 					..
-				} = input.as_ref()
+				} => {
+					let filter_predicate = match disposition {
+						FilterDisposition::FullyPushed => None,
+						FilterDisposition::EvaluateInToron => Some(predicate),
+					};
+					(input.as_ref(), filter_predicate, None, None)
+				}
+				ExecutionPlan::Project {
+					input,
+					exprs,
+					output_schema,
+				} => {
+					let Some((join, join_filter_predicate)) =
+						decompose_join_or_filtered_join(input.as_ref())
+					else {
+						return Ok(None);
+					};
+					let project_filter_predicate = match disposition {
+						FilterDisposition::FullyPushed => None,
+						FilterDisposition::EvaluateInToron => Some(predicate),
+					};
+					(
+						join,
+						join_filter_predicate,
+						Some((exprs, output_schema)),
+						project_filter_predicate,
+					)
+				}
+				_ => return Ok(None),
+			},
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => {
+				let Some((join, filter_predicate)) =
+					decompose_join_or_filtered_join(input.as_ref())
 				else {
 					return Ok(None);
 				};
-				let filter_predicate = match disposition {
-					FilterDisposition::FullyPushed => None,
-					FilterDisposition::EvaluateInToron => Some(predicate),
-				};
-				(input.as_ref(), filter_predicate)
+				(join, filter_predicate, Some((exprs, output_schema)), None)
 			}
 			_ => return Ok(None),
 		};
@@ -1029,9 +2128,37 @@ impl Executor {
 			return Ok(None);
 		};
 
+		let mut state = init_global_aggregate_state(aggr_expr)?;
+		if self
+			.try_visit_streaming_join0_chunks(join, join_filter_predicate, morsel, |batch| {
+				let batch = if let Some((exprs, project_schema)) = project {
+					let cols = self.evaluate_bound_program(exprs, &batch)?;
+					RecordBatch::try_new(project_schema.clone(), cols)?
+				} else {
+					batch
+				};
+				let batch = if let Some(predicate) = project_filter_predicate {
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+				} else {
+					batch
+				};
+				if batch.num_rows() == 0 {
+					Ok(())
+				} else {
+					self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)
+				}
+			})
+			.await?
+			.is_some()
+		{
+			return finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some);
+		}
+		if project.is_some() {
+			return Ok(None);
+		}
+
 		let left_batches = self.execute_bound(left, morsel).await?;
 		let right_batches = self.execute_bound(right, morsel).await?;
-		let mut state = init_global_aggregate_state(aggr_expr)?;
 		execute_hash_join_into_global_aggregate(
 			self,
 			left.schema(),
@@ -1046,7 +2173,7 @@ impl Executor {
 			*replay_id,
 			*strategy,
 			join_output_schema,
-			filter_predicate,
+			join_filter_predicate,
 			aggr_expr,
 			&mut state,
 			self.context.task_budget,
@@ -1509,191 +2636,210 @@ impl Executor {
 
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
-		let ExecutionPlan::Exchange {
-			input: base_input,
-			partition_count,
-			key: base_exchange_key,
-		} = chain.base
-		else {
-			return Ok(None);
-		};
-		let ExecutionPlan::Filter {
-			input: join0,
-			predicate: join0_filter,
-			disposition,
-		} = base_input.as_ref()
-		else {
-			return Ok(None);
-		};
-		if *disposition == FilterDisposition::FullyPushed {
-			return Ok(None);
-		}
-		let ExecutionPlan::Join {
-			replay_id,
-			left,
-			right,
-			kind: JoinKind::Inner,
-			left_keys,
-			right_keys,
-			match_filter,
-			null_safe_keys,
-			strategy,
-			output_schema: join0_output_schema,
-			..
-		} = join0.as_ref()
-		else {
-			return Ok(None);
-		};
-		if *replay_id != JoinReplayId(0) {
-			return Ok(None);
-		}
-
-		let left_batches = self.execute_bound(left, morsel).await?;
-		let right_batches = self.execute_bound(right, morsel).await?;
-		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
-		let right_batch = concat_or_empty(right.schema(), &right_batches)?;
-		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
-		let right_key_arrays = key_arrays(&right_batch, right_keys)?;
-		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
-			> self.context.task_budget.memory.get()
+		if self
+			.try_streaming_inner_prefix_semi_anti_scan_probe_base(
+				chain.base,
+				&mut inner_runtimes,
+				&mut semi_runtime,
+				&mut anti_runtime,
+				group_expr,
+				aggr_expr,
+				&mut groups,
+				&mut group_types,
+				morsel,
+			)
+			.await?
+			.is_none()
 		{
-			return Ok(None);
-		}
-		let join_key_plan =
-			JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
-		let build_started = Instant::now();
-		let Some(build_rows) = build_in_memory_join_rows(
-			join_key_plan,
-			&left_key_arrays,
-			left_batch.num_rows(),
-			self.context.task_budget.memory.get(),
-			*null_safe_keys,
-		)?
-		else {
-			return Ok(None);
-		};
-		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.build_rows = task
-				.counters
-				.build_rows
-				.saturating_add(left_batch.num_rows() as u64);
-			task.counters.probe_rows = task
-				.counters
-				.probe_rows
-				.saturating_add(right_batch.num_rows() as u64);
-		});
-		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.phases.build_micros = task
-				.phases
-				.build_micros
-				.saturating_add(duration_micros(build_started));
-		});
-		let probe_started = Instant::now();
-		let selection = probe_in_memory_join_rows(
-			JoinKind::Inner,
-			join_key_plan,
-			&build_rows,
-			left_batch.num_rows(),
-			&right_key_arrays,
-			right_batch.num_rows(),
-			match_filter.as_ref(),
-			&left_batch,
-			&right_batch,
-			*null_safe_keys,
-		)?;
-		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.phases.probe_micros = task
-				.phases
-				.probe_micros
-				.saturating_add(duration_micros(probe_started));
-			task.counters.matched_rows = task
-				.counters
-				.matched_rows
-				.saturating_add(selection.len() as u64);
-		});
+			let ExecutionPlan::Exchange {
+				input: base_input,
+				partition_count,
+				key: base_exchange_key,
+			} = chain.base
+			else {
+				return Ok(None);
+			};
+			let ExecutionPlan::Filter {
+				input: join0,
+				predicate: join0_filter,
+				disposition,
+			} = base_input.as_ref()
+			else {
+				return Ok(None);
+			};
+			if *disposition == FilterDisposition::FullyPushed {
+				return Ok(None);
+			}
+			let ExecutionPlan::Join {
+				replay_id,
+				left,
+				right,
+				kind: JoinKind::Inner,
+				left_keys,
+				right_keys,
+				match_filter,
+				null_safe_keys,
+				strategy,
+				output_schema: join0_output_schema,
+				..
+			} = join0.as_ref()
+			else {
+				return Ok(None);
+			};
+			if *replay_id != JoinReplayId(0) {
+				return Ok(None);
+			}
 
-		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
-			let batch = materialize_join_selection(
+			let left_batches = self.execute_bound(left, morsel).await?;
+			let right_batches = self.execute_bound(right, morsel).await?;
+			let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+			let right_batch = concat_or_empty(right.schema(), &right_batches)?;
+			let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+			if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+				> self.context.task_budget.memory.get()
+			{
+				return Ok(None);
+			}
+			let join_key_plan =
+				JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
+			let build_started = Instant::now();
+			let Some(build_rows) = build_in_memory_join_rows(
+				join_key_plan,
+				&left_key_arrays,
+				left_batch.num_rows(),
+				self.context.task_budget.memory.get(),
+				*null_safe_keys,
+			)?
+			else {
+				return Ok(None);
+			};
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.counters.build_rows = task
+					.counters
+					.build_rows
+					.saturating_add(left_batch.num_rows() as u64);
+				task.counters.probe_rows = task
+					.counters
+					.probe_rows
+					.saturating_add(right_batch.num_rows() as u64);
+			});
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(build_started));
+			});
+			let probe_started = Instant::now();
+			let selection = probe_in_memory_join_rows(
 				JoinKind::Inner,
+				join_key_plan,
+				&build_rows,
+				left_batch.num_rows(),
+				&right_key_arrays,
+				right_batch.num_rows(),
+				match_filter.as_ref(),
 				&left_batch,
 				&right_batch,
-				chunk,
-				join0_output_schema,
-				self.context.task_budget.memory.get(),
+				*null_safe_keys,
 			)?;
-			let batch =
-				self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?;
-			if batch.num_rows() == 0 {
-				continue;
-			}
-			for (_partition, partitioned) in
-				self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
-			{
-				if partitioned.num_rows() == 0 {
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.probe_micros = task
+					.phases
+					.probe_micros
+					.saturating_add(duration_micros(probe_started));
+				task.counters.matched_rows = task
+					.counters
+					.matched_rows
+					.saturating_add(selection.len() as u64);
+			});
+
+			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let batch = materialize_join_selection(
+					JoinKind::Inner,
+					&left_batch,
+					&right_batch,
+					chunk,
+					join0_output_schema,
+					self.context.task_budget.memory.get(),
+				)?;
+				let batch = self.filter_batch_with_bound_predicate(
+					join0_filter,
+					batch,
+					"filter predicate",
+				)?;
+				if batch.num_rows() == 0 {
 					continue;
 				}
-				let mut batches = vec![partitioned];
-				for runtime in inner_runtimes.iter_mut() {
-					let mut next = Vec::new();
-					for batch in batches {
-						next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+				for (_partition, partitioned) in
+					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
+				{
+					if partitioned.num_rows() == 0 {
+						continue;
 					}
-					batches = next;
-					if let Some(predicate) = runtime.post_filter {
-						let mut filtered = Vec::new();
+					let mut batches = vec![partitioned];
+					for runtime in inner_runtimes.iter_mut() {
+						let mut next = Vec::new();
 						for batch in batches {
-							let batch = self.filter_batch_with_bound_predicate(
-								predicate,
-								batch,
-								"filter predicate",
-							)?;
-							if batch.num_rows() > 0 {
-								filtered.push(batch);
-							}
+							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
 						}
-						batches = filtered;
+						batches = next;
+						if let Some(predicate) = runtime.post_filter {
+							let mut filtered = Vec::new();
+							for batch in batches {
+								let batch = self.filter_batch_with_bound_predicate(
+									predicate,
+									batch,
+									"filter predicate",
+								)?;
+								if batch.num_rows() > 0 {
+									filtered.push(batch);
+								}
+							}
+							batches = filtered;
+						}
+						if batches.is_empty() {
+							break;
+						}
 					}
-					if batches.is_empty() {
-						break;
-					}
-				}
 
-				let mut semi_batches = Vec::new();
-				for batch in batches {
-					semi_batches.extend(
-						self.probe_streaming_semi_anti(&mut semi_runtime, &batch)
-							.await?,
-					);
-				}
-				let mut anti_batches = Vec::new();
-				for batch in semi_batches {
-					anti_batches.extend(
-						self.probe_streaming_semi_anti(&mut anti_runtime, &batch)
-							.await?,
-					);
-				}
-				for batch in anti_batches {
-					self.fold_bound_grouped_aggregate_batch(
-						&mut groups,
-						&mut group_types,
-						group_expr,
-						aggr_expr,
-						&batch,
-					)?;
+					let mut semi_batches = Vec::new();
+					for batch in batches {
+						semi_batches.extend(
+							self.probe_streaming_semi_anti(&mut semi_runtime, &batch)
+								.await?,
+						);
+					}
+					let mut anti_batches = Vec::new();
+					for batch in semi_batches {
+						anti_batches.extend(
+							self.probe_streaming_semi_anti(&mut anti_runtime, &batch)
+								.await?,
+						);
+					}
+					for batch in anti_batches {
+						self.fold_bound_grouped_aggregate_batch(
+							&mut groups,
+							&mut group_types,
+							group_expr,
+							aggr_expr,
+							&batch,
+						)?;
+					}
 				}
 			}
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: *replay_id,
+					strategy: *strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(selection.len() as u64),
+				},
+			);
 		}
-		record_join_runtime_observation(
-			&self.context.task_telemetry,
-			&self.context.join_runtime_observation_mode,
-			JoinRuntimeObservation {
-				replay_id: *replay_id,
-				strategy: *strategy,
-				build_rows: RowCount::new(left_batch.num_rows() as u64),
-				probe_rows: RowCount::new(right_batch.num_rows() as u64),
-				output_rows: RowCount::new(selection.len() as u64),
-			},
-		);
 
 		for runtime in &inner_runtimes {
 			record_join_runtime_observation(
@@ -1727,6 +2873,235 @@ impl Executor {
 		semi_runtime.cleanup().await;
 		anti_runtime.cleanup().await;
 		output.map(Some)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_inner_prefix_semi_anti_scan_probe_base(
+		&self,
+		base: &ExecutionPlan,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		semi_runtime: &mut StreamingSemiAntiRuntime<'_>,
+		anti_runtime: &mut StreamingSemiAntiRuntime<'_>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<()>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: base_input,
+			partition_count,
+			key: base_exchange_key,
+		} = base
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: join0,
+			predicate: join0_filter,
+			disposition,
+		} = base_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *disposition == FilterDisposition::FullyPushed {
+			return Ok(None);
+		}
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema: join0_output_schema,
+			..
+		} = join0.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *replay_id != JoinReplayId(0) {
+			return Ok(None);
+		}
+		let Some(scan_input) = decompose_streaming_scan_probe_input(right) else {
+			return Ok(None);
+		};
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&left.schema(),
+			left_keys,
+			&right.schema(),
+			right_keys,
+			*null_safe_keys,
+		)?;
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&left_key_arrays,
+			left_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			*null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Ok(None);
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let probe_started = Instant::now();
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		while let Some(batch) = stream.next().await {
+			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				right_batch = self.filter_batch_with_bound_predicate(
+					predicate,
+					right_batch,
+					"filter predicate",
+				)?;
+				if right_batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+			let selection = probe_in_memory_join_rows(
+				JoinKind::Inner,
+				join_key_plan,
+				&build_rows,
+				left_batch.num_rows(),
+				&right_key_arrays,
+				right_batch.num_rows(),
+				match_filter.as_ref(),
+				&left_batch,
+				&right_batch,
+				*null_safe_keys,
+			)?;
+			output_rows = output_rows.saturating_add(selection.len() as u64);
+
+			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let batch = materialize_join_selection(
+					JoinKind::Inner,
+					&left_batch,
+					&right_batch,
+					chunk,
+					join0_output_schema,
+					self.context.task_budget.memory.get(),
+				)?;
+				let batch = self.filter_batch_with_bound_predicate(
+					join0_filter,
+					batch,
+					"filter predicate",
+				)?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+				for (_partition, partitioned) in
+					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
+				{
+					if partitioned.num_rows() == 0 {
+						continue;
+					}
+					let mut batches = vec![partitioned];
+					for runtime in inner_runtimes.iter_mut() {
+						let mut next = Vec::new();
+						for batch in batches {
+							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+						}
+						batches = next;
+						if let Some(predicate) = runtime.post_filter {
+							let mut filtered = Vec::new();
+							for batch in batches {
+								let batch = self.filter_batch_with_bound_predicate(
+									predicate,
+									batch,
+									"filter predicate",
+								)?;
+								if batch.num_rows() > 0 {
+									filtered.push(batch);
+								}
+							}
+							batches = filtered;
+						}
+						if batches.is_empty() {
+							break;
+						}
+					}
+
+					let mut semi_batches = Vec::new();
+					for batch in batches {
+						semi_batches
+							.extend(self.probe_streaming_semi_anti(semi_runtime, &batch).await?);
+					}
+					let mut anti_batches = Vec::new();
+					for batch in semi_batches {
+						anti_batches
+							.extend(self.probe_streaming_semi_anti(anti_runtime, &batch).await?);
+					}
+					for batch in anti_batches {
+						self.fold_bound_grouped_aggregate_batch(
+							groups,
+							group_types,
+							group_expr,
+							aggr_expr,
+							&batch,
+						)?;
+					}
+				}
+			}
+		}
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+		});
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: *strategy,
+				build_rows: RowCount::new(left_batch.num_rows() as u64),
+				probe_rows: RowCount::new(probe_rows),
+				output_rows: RowCount::new(output_rows),
+			},
+		);
+		Ok(Some(()))
 	}
 
 	pub(in crate::exec) async fn prepare_reoriented_inner_join_runtime<'a>(
@@ -1861,42 +3236,13 @@ impl Executor {
 		let Some((scan_plan, ops)) = decompose_streaming_existence_plan(plan) else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Scan {
-			local_table_id,
-			table,
-			fingerprint,
-			projection,
-			pbc_program,
-			row_limit,
-			row_identity,
-			profile_hint,
-			..
-		} = scan_plan
-		else {
+		let Some(req) = self.bound_scan_request(scan_plan, morsel) else {
 			return Ok(None);
 		};
-		let req = ScanRequest {
-			session_id: self.context.session_id,
-			query_id: self.context.query_id,
-			tenant_id: self.context.tenant_id,
-			table_id: *local_table_id,
-			table_object_id: *table,
-			physical_descriptor_fingerprint: *fingerprint,
-			read_bound: self.context.read_bound,
-			projected_columns: projection.clone(),
-			pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
-			runtime_filter: self.context.runtime_filter.clone(),
-			row_identity: *row_identity,
-			profile_hint: Some(*profile_hint),
-			trace_context: self.context.trace_context,
-			morsel,
-			row_limit: *row_limit,
-			downstream_cancellation: self.context.downstream_cancellation.clone(),
-		};
+		let mut remaining = req.row_limit;
 		let span = crate::telemetry::storage_scan_span(&req);
 		let stream = self.storage.scan(req).instrument(span).await?;
 		let mut stream = stream.into_batches();
-		let mut remaining = *row_limit;
 		while let Some(batch) = stream.next().await {
 			let mut batch = batch?;
 			if let Some(limit) = remaining.as_mut() {
@@ -2247,4 +3593,313 @@ fn matching_preserved_rows_in_memory(
 		}
 	}
 	Ok(matched)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::error::StorageError;
+	use crate::ir::{BroadcastReplayEligibility, ColumnOrdinal, QueryProfileHint, TableId};
+	use crate::storage::{ScanRequest, ScanStream, StorageScan};
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::collections::HashMap;
+	use std::sync::{Arc, Mutex};
+	use wendelon::schema::{
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
+		TableObjectId, TableSchemaDescriptor,
+	};
+
+	struct RecordingMultiBatchTableStorageScan {
+		batches: HashMap<TableId, Vec<RecordBatch>>,
+		requested_tables: Arc<Mutex<Vec<TableId>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for RecordingMultiBatchTableStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			self.requested_tables
+				.lock()
+				.expect("requested tables lock")
+				.push(request.table_id);
+			let batches = self.batches.get(&request.table_id).cloned().ok_or(
+				StorageError::TableNotFound {
+					table: request.table_id,
+				},
+			)?;
+			let schema = batches
+				.first()
+				.map(RecordBatch::schema)
+				.unwrap_or_else(|| Arc::new(Schema::empty()));
+			Ok(ScanStream::from_batches(
+				schema,
+				request.session_id,
+				request.query_id,
+				batches,
+			))
+		}
+	}
+
+	fn test_scan_plan_with_first_field_key(
+		table_id: TableId,
+		schema: Arc<Schema>,
+		object_byte: u8,
+	) -> ExecutionPlan {
+		let primary_key = schema.field(0).name().to_string();
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([object_byte; 16]),
+			1,
+			"default",
+			"join_test",
+			schema.as_ref(),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.expect("descriptor");
+		ExecutionPlan::Scan {
+			local_table_id: table_id,
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
+		}
+	}
+
+	fn concat_test_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+		Arc::new(Schema::new(
+			left.fields()
+				.iter()
+				.chain(right.fields().iter())
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>(),
+		))
+	}
+
+	fn inner_join_plan(
+		left: ExecutionPlan,
+		right: ExecutionPlan,
+		left_keys: Vec<ColumnOrdinal>,
+		right_keys: Vec<ColumnOrdinal>,
+		output_schema: SchemaRef,
+	) -> ExecutionPlan {
+		ExecutionPlan::Join {
+			replay_id: JoinReplayId(0),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(left),
+			right: Box::new(right),
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+		}
+	}
+
+	#[tokio::test]
+	async fn streaming_inner_join_scan_probe_visits_probe_batches_without_materializing_scan() {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("left_value", DataType::Int64, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("right_value", DataType::Int64, false),
+		]));
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+			],
+		)
+		.expect("left batch");
+		let right_batch_one = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1])),
+				Arc::new(Int64Array::from(vec![100])),
+			],
+		)
+		.expect("right batch one");
+		let right_batch_two = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![2])),
+				Arc::new(Int64Array::from(vec![200])),
+			],
+		)
+		.expect("right batch two");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([
+				(TableId(1), vec![left_batch]),
+				(TableId(2), vec![right_batch_one, right_batch_two]),
+			]),
+			requested_tables: requested_tables.clone(),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(TaskBudget {
+				memory: ByteCount::new(256 * 1024 * 1024),
+				spill_bytes: ByteCount::new(256 * 1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			}),
+		);
+		let join = inner_join_plan(
+			test_scan_plan_with_first_field_key(TableId(1), left_schema.clone(), 1),
+			test_scan_plan_with_first_field_key(TableId(2), right_schema.clone(), 2),
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			concat_test_schema(&left_schema, &right_schema),
+		);
+		let mut visited = Vec::new();
+
+		let matched = executor
+			.try_visit_streaming_join0_chunks(&join, None, None, |batch| {
+				visited.push(batch);
+				Ok(())
+			})
+			.await
+			.expect("stream scan probe");
+
+		assert!(matched.is_some());
+		assert_eq!(
+			visited.len(),
+			1,
+			"the scan-probe side should be joined and visited without first materializing it"
+		);
+		let joined =
+			concat_or_empty(join.schema(), &visited).expect("joined scan-probe output batches");
+		assert_eq!(joined.num_rows(), 2);
+		let left_values = joined
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left value");
+		let right_values = joined
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right value");
+		assert_eq!(left_values.values(), &[10, 20]);
+		assert_eq!(right_values.values(), &[100, 200]);
+		assert_eq!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.as_slice(),
+			&[TableId(2), TableId(1)]
+		);
+	}
+
+	#[tokio::test]
+	async fn streaming_inner_join_left_scan_probe_restores_original_column_order() {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("left_value", DataType::Int64, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("right_value", DataType::Int64, false),
+		]));
+		let left_batch_one = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1])),
+				Arc::new(Int64Array::from(vec![10])),
+			],
+		)
+		.expect("left batch one");
+		let left_batch_two = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![2])),
+				Arc::new(Int64Array::from(vec![20])),
+			],
+		)
+		.expect("left batch two");
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![100, 200])),
+			],
+		)
+		.expect("right batch");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([
+				(TableId(1), vec![left_batch_one, left_batch_two]),
+				(TableId(2), vec![right_batch]),
+			]),
+			requested_tables: requested_tables.clone(),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(TaskBudget {
+				memory: ByteCount::new(256 * 1024 * 1024),
+				spill_bytes: ByteCount::new(256 * 1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			}),
+		);
+		let join = inner_join_plan(
+			test_scan_plan_with_first_field_key(TableId(1), left_schema.clone(), 1),
+			test_scan_plan_with_first_field_key(TableId(2), right_schema.clone(), 2),
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			concat_test_schema(&left_schema, &right_schema),
+		);
+		let mut visited = Vec::new();
+
+		let matched = executor
+			.try_visit_streaming_join0_chunks(&join, None, None, |batch| {
+				visited.push(batch);
+				Ok(())
+			})
+			.await
+			.expect("stream left scan probe");
+
+		assert!(matched.is_some());
+		assert_eq!(
+			visited.len(),
+			2,
+			"left scan probe should stream each scan batch after building the right side"
+		);
+		let joined =
+			concat_or_empty(join.schema(), &visited).expect("joined scan-probe output batches");
+		assert_eq!(joined.schema(), join.schema());
+		let left_values = joined
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left value");
+		let right_values = joined
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right value");
+		assert_eq!(left_values.values(), &[10, 20]);
+		assert_eq!(right_values.values(), &[100, 200]);
+		assert_eq!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.as_slice(),
+			&[TableId(2), TableId(1)]
+		);
+	}
 }

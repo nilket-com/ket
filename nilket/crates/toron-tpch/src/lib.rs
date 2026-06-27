@@ -56,8 +56,6 @@ use telemetry::{
 pub const CACHE_ROOT: &str = "target/tpch";
 
 const TPCH_PERSISTED_CHUNK_ROWS: usize = 65_536;
-const TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES: u64 = 16 * 64 * 1024 * 1024;
-
 /// The 22 TPC-H query IDs (the reachability inventory).
 pub const ALL_QUERY_IDS: [&str; 22] = [
 	"q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13",
@@ -1434,24 +1432,6 @@ impl StorageScan for ParquetHarnessScan {
 				Ok(batch)
 			}?;
 			Ok(batch)
-		})
-		.scan(0_u64, |yielded_bytes, batch| {
-			Some(match batch {
-				Ok(batch) => {
-					*yielded_bytes += batch.get_array_memory_size() as u64;
-					if *yielded_bytes > TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES {
-						Err(StorageError::Internal {
-							message: format!(
-								"BudgetExhausted {{ dimension: Memory, producer: \"persisted parquet scan output accumulator\", requested: ByteCount({}), available: ByteCount({}) }}",
-								*yielded_bytes, TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES
-							),
-						})
-					} else {
-						Ok(batch)
-					}
-				}
-				Err(error) => Err(error),
-			})
 		}))
 		.boxed();
 

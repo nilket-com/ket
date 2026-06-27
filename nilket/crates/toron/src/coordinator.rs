@@ -72,33 +72,6 @@ pub(crate) async fn materialize_scan_stream(
 	stream.into_batches().try_collect().await
 }
 
-pub(crate) async fn materialize_scan_stream_bounded(
-	stream: ScanStream,
-	limit: usize,
-) -> Result<Vec<RecordBatch>, StorageError> {
-	let mut stream = stream.into_batches();
-	let mut rows = 0usize;
-	let mut batches = Vec::new();
-	while rows < limit {
-		let Some(batch) = stream.next().await else {
-			break;
-		};
-		let batch = batch?;
-		if batch.num_rows() == 0 {
-			continue;
-		}
-		let remaining = limit - rows;
-		if batch.num_rows() <= remaining {
-			rows += batch.num_rows();
-			batches.push(batch);
-		} else {
-			batches.push(batch.slice(0, remaining));
-			break;
-		}
-	}
-	Ok(batches)
-}
-
 pub struct DistributedResultStream {
 	receiver: mpsc::Receiver<Result<RecordBatch, QueryError>>,
 	active_query: ActiveQueryHandle,

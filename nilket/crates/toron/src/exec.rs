@@ -1,5 +1,4 @@
 use crate::aggregate_kernel;
-use crate::coordinator::{materialize_scan_stream, materialize_scan_stream_bounded};
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::{
@@ -20,7 +19,9 @@ use crate::ir::{
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
-use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
+use crate::storage::{
+	HlcBound, ScanRequest, ScanStream, ScanTablePin, StorageScan, TenantId, TraceContext,
+};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
 	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
@@ -234,6 +235,92 @@ impl Executor {
 		self.storage.clone()
 	}
 
+	pub(in crate::exec) fn bound_scan_request(
+		&self,
+		plan: &ExecutionPlan,
+		morsel: Option<(MorselId, u32)>,
+	) -> Option<ScanRequest> {
+		let ExecutionPlan::Scan {
+			local_table_id,
+			table,
+			fingerprint,
+			projection,
+			pbc_program,
+			row_limit,
+			row_identity,
+			profile_hint,
+			..
+		} = plan
+		else {
+			return None;
+		};
+		Some(ScanRequest {
+			session_id: self.context.session_id,
+			query_id: self.context.query_id,
+			tenant_id: self.context.tenant_id,
+			table_id: *local_table_id,
+			table_object_id: *table,
+			physical_descriptor_fingerprint: *fingerprint,
+			read_bound: self.context.read_bound,
+			projected_columns: projection.clone(),
+			pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
+			runtime_filter: self.context.runtime_filter.clone(),
+			row_identity: *row_identity,
+			profile_hint: Some(*profile_hint),
+			trace_context: self.context.trace_context,
+			morsel,
+			row_limit: *row_limit,
+			downstream_cancellation: self.context.downstream_cancellation.clone(),
+		})
+	}
+
+	async fn materialize_scan_stream_with_budget(
+		&self,
+		stream: ScanStream,
+		row_limit: Option<usize>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let task_memory_cap = self.context.task_budget.memory.get();
+		let memory_cap = (task_memory_cap >= 64 * 1024 * 1024)
+			.then(|| join::join_output_materialization_memory_cap(task_memory_cap));
+		let mut stream = stream.into_batches();
+		let mut rows = 0usize;
+		let mut output_bytes = 0u64;
+		let mut batches = Vec::new();
+		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			let Some(batch) = stream.next().await else {
+				break;
+			};
+			let batch = batch?;
+			if batch.num_rows() == 0 {
+				continue;
+			}
+			let batch = if let Some(limit) = row_limit {
+				let remaining = limit - rows;
+				if batch.num_rows() > remaining {
+					batch.slice(0, remaining)
+				} else {
+					batch
+				}
+			} else {
+				batch
+			};
+			rows = rows.saturating_add(batch.num_rows());
+			output_bytes = output_bytes.saturating_add(batch.get_array_memory_size() as u64);
+			if let Some(memory_cap) = memory_cap
+				&& output_bytes > memory_cap
+			{
+				return Err(join::budget_exhausted(
+					BudgetDimension::Memory,
+					"scan output accumulator",
+					output_bytes,
+					memory_cap,
+				));
+			}
+			batches.push(batch);
+		}
+		Ok(batches)
+	}
+
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
@@ -280,7 +367,7 @@ impl Executor {
 					};
 					let span = crate::telemetry::storage_scan_span(&req);
 					let stream = self.storage.scan(req).instrument(span).await?;
-					Ok(materialize_scan_stream(stream).await?)
+					Ok(crate::coordinator::materialize_scan_stream(stream).await?)
 				}
 				LogicalPlan::ScanNamed { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound named scan execution",
@@ -730,41 +817,15 @@ impl Executor {
 				ExecutionPlan::SystemTable { schema, rows, .. } => {
 					Ok(vec![materialize_scalar_rows(schema, rows)?])
 				}
-				ExecutionPlan::Scan {
-					local_table_id,
-					table,
-					fingerprint,
-					projection,
-					pbc_program,
-					row_limit,
-					row_identity,
-					profile_hint,
-					..
-				} => {
-					let req = ScanRequest {
-						session_id: self.context.session_id,
-						query_id: self.context.query_id,
-						tenant_id: self.context.tenant_id,
-						table_id: *local_table_id,
-						table_object_id: *table,
-						physical_descriptor_fingerprint: *fingerprint,
-						read_bound: self.context.read_bound,
-						projected_columns: projection.clone(),
-						pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
-						runtime_filter: self.context.runtime_filter.clone(),
-						row_identity: *row_identity,
-						profile_hint: Some(*profile_hint),
-						trace_context: self.context.trace_context,
-						morsel,
-						row_limit: *row_limit,
-						downstream_cancellation: self.context.downstream_cancellation.clone(),
-					};
+				ExecutionPlan::Scan { .. } => {
+					let req = self
+						.bound_scan_request(plan, morsel)
+						.expect("ExecutionPlan::Scan should build a ScanRequest");
+					let row_limit = req.row_limit;
 					let span = crate::telemetry::storage_scan_span(&req);
 					let stream = self.storage.scan(req).instrument(span).await?;
-					Ok(match row_limit {
-						Some(limit) => materialize_scan_stream_bounded(stream, *limit).await?,
-						None => materialize_scan_stream(stream).await?,
-					})
+					self.materialize_scan_stream_with_budget(stream, row_limit)
+						.await
 				}
 				ExecutionPlan::Filter {
 					input,
@@ -3123,22 +3184,23 @@ mod tests {
 	use super::*;
 	use crate::binder::{PlannerConfig, bind};
 	use crate::catalog::{MockCatalog, TableRef};
+	use crate::distributed::cancellation::DownstreamAttemptRegistry;
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 	use crate::error::StorageError;
 	use crate::ir::{
-		BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, QueryId,
-		QueryProfileHint, ResolvedColumn, SessionId, TableId,
+		BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, MorselId, PbcProgram,
+		QueryId, QueryProfileHint, ResolvedColumn, SessionId, TableId,
 	};
 	use crate::storage::InMemoryStorageScan;
 	use crate::storage::ScanStream;
-	use crate::storage::{HlcBound, TenantId};
+	use crate::storage::{HlcBound, RowIdentityProjection, TenantId, TraceContext};
 	use arrow::array::{
 		Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
 		UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::hash::{DefaultHasher, Hash, Hasher};
-	use std::sync::Mutex;
+	use std::sync::{Arc, Mutex};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterBloom,
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicy,
@@ -3281,6 +3343,97 @@ mod tests {
 		let observed = requests.lock().unwrap();
 		assert_eq!(observed.len(), 1);
 		assert_eq!(observed[0].runtime_filter, Some(runtime_filter));
+	}
+
+	#[test]
+	fn bound_scan_request_carries_every_bound_scan_field() {
+		let batch = batch();
+		let descriptor = descriptor();
+		let runtime_filter = RuntimeFilterDescriptor {
+			key_encoding_version: 1,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![0],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: 11,
+				bit_count: 16,
+				hash_count: 2,
+				byte_budget: 2,
+				target_fp_rate_bp: 100,
+				payload: vec![0b1010_1010, 0b0101_0101],
+			}),
+			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		};
+		let downstream_registry = DownstreamAttemptRegistry::with_default_limits(None);
+		let downstream_context = downstream_registry.context();
+		let trace_context = TraceContext {
+			trace_id: [3; 16],
+			span_id: [4; 8],
+		};
+		let context = ExecutionContext::new(
+			SessionId(77),
+			QueryId::from_u128(88),
+			TenantId(99),
+			HlcBound(123),
+		)
+		.with_runtime_filter(Some(runtime_filter.clone()))
+		.with_downstream_cancellation(Some(downstream_context.clone()));
+		let mut context = context;
+		context.trace_context = Some(trace_context);
+		let executor = Executor::with_context(
+			Arc::new(InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+			}),
+			context,
+		);
+		let scan = ExecutionPlan::Scan {
+			local_table_id: TableId(42),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema: batch.schema(),
+			projection: Some(vec![ColumnOrdinal(2), ColumnOrdinal(0)]),
+			pbc_program: Some(PbcProgram(vec![1, 3, 5, 7])),
+			row_identity: RowIdentityProjection::Append,
+			row_limit: Some(17),
+			profile_hint: QueryProfileHint::PointRead,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
+		};
+
+		let request = executor
+			.bound_scan_request(&scan, Some((MorselId(7), 11)))
+			.expect("scan request");
+
+		assert_eq!(request.session_id, SessionId(77));
+		assert_eq!(request.query_id, QueryId::from_u128(88));
+		assert_eq!(request.tenant_id, TenantId(99));
+		assert_eq!(request.table_id, TableId(42));
+		assert_eq!(request.table_object_id, descriptor.table_object_id);
+		let fingerprint = descriptor.physical_descriptor_fingerprint;
+		assert_eq!(request.physical_descriptor_fingerprint, fingerprint);
+		assert_eq!(request.read_bound, HlcBound(123));
+		assert_eq!(
+			request.projected_columns,
+			Some(vec![ColumnOrdinal(2), ColumnOrdinal(0)])
+		);
+		assert_eq!(request.pbc_predicate, Some(vec![1, 3, 5, 7]));
+		assert_eq!(request.runtime_filter, Some(runtime_filter));
+		assert_eq!(request.row_identity, RowIdentityProjection::Append);
+		assert_eq!(request.profile_hint, Some(QueryProfileHint::PointRead));
+		assert_eq!(request.trace_context, Some(trace_context));
+		assert_eq!(request.morsel, Some((MorselId(7), 11)));
+		assert_eq!(request.row_limit, Some(17));
+		assert!(
+			!request
+				.downstream_cancellation
+				.as_ref()
+				.unwrap()
+				.is_cancelled()
+		);
 	}
 
 	#[tokio::test]
