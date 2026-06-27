@@ -252,6 +252,96 @@ impl Attempt {
 	}
 }
 
+/// Discrete timings for the performance rail. `execute_ms` is the primary performance metric; the legacy
+/// reachability `elapsed_ms` remains a broad wall-clock telemetry field.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerfPhaseTimings {
+	pub load_ms: f64,
+	pub plan_ms: f64,
+	pub bind_ms: f64,
+	pub execute_ms: f64,
+	pub digest_ms: f64,
+	pub total_ms: f64,
+}
+
+impl PerfPhaseTimings {
+	pub fn json_value(self) -> serde_json::Value {
+		serde_json::json!({
+			"load_ms": self.load_ms,
+			"plan_ms": self.plan_ms,
+			"bind_ms": self.bind_ms,
+			"execute_ms": self.execute_ms,
+			"digest_ms": self.digest_ms,
+			"total_ms": self.total_ms,
+		})
+	}
+}
+
+/// One performance-run record. The parent process augments child records with RSS and parent-observed wall
+/// time before writing raw JSONL and summary rows.
+#[derive(Debug, Clone)]
+pub struct PerfAttempt {
+	pub engine: String,
+	pub query: String,
+	pub scale_factor: f64,
+	pub mode: String,
+	pub run_index: u32,
+	pub warmup: bool,
+	pub phase: Phase,
+	pub status: Status,
+	pub reason: Option<String>,
+	pub diagnostic_message: Option<String>,
+	pub timings: PerfPhaseTimings,
+	pub parent_wall_ms: Option<f64>,
+	pub peak_rss_kib: Option<u64>,
+	pub spill_bytes: u64,
+	pub plan_fingerprint: Option<String>,
+	pub digest: Option<String>,
+	pub debug_build: bool,
+}
+
+impl PerfAttempt {
+	pub fn json_value(&self) -> serde_json::Value {
+		let mut row = serde_json::json!({
+			"suite": "tpch_perf",
+			"engine": self.engine,
+			"query": self.query,
+			"scale_factor": self.scale_factor,
+			"mode": self.mode,
+			"run_index": self.run_index,
+			"warmup": self.warmup,
+			"profile": if self.debug_build { "debug" } else { "release" },
+			"debug_build": self.debug_build,
+			"phase": self.phase.as_str(),
+			"status": self.status.as_str(),
+			"reason": self.reason,
+			"parent_wall_ms": self.parent_wall_ms,
+			"peak_rss_kib": self.peak_rss_kib,
+			"spill_bytes": self.spill_bytes,
+			"plan_fingerprint": self.plan_fingerprint,
+			"digest": self.digest,
+		});
+		let object = row.as_object_mut().expect("perf JSON row is an object");
+		let timings = self
+			.timings
+			.json_value()
+			.as_object()
+			.expect("timings JSON is an object")
+			.clone();
+		for (key, value) in timings {
+			object.insert(key, value);
+		}
+		if let Some(message) = &self.diagnostic_message {
+			object.insert("diagnostic_message".to_string(), serde_json::json!(message));
+		}
+		row
+	}
+
+	pub fn jsonl(&self) -> String {
+		self.json_value().to_string()
+	}
+}
+
 /// ADR 273: one correctness-check outcome — a rail distinct from [`Attempt`]. The human line is
 /// `tpch_correctness` (NOT `tpch_reachability`), so it cannot be confused with a reachability row, and it
 /// carries no digest (correctness compares the raw Decimal value, not the digest). `phase=compare

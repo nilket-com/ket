@@ -10,6 +10,7 @@ pub mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use arrow::array::{
@@ -27,9 +28,9 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::ByteCount;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::task::RowCount;
+use toron::distributed::task::{RowCount, TaskTelemetry};
 use toron::error::StorageError;
-use toron::exec::Executor;
+use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{ExecutionPlan, JoinKind, TableId, decimal_division_output_type};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -38,7 +39,10 @@ use wendelon::schema::{
 	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
-use telemetry::{Attempt, CorrectnessAttempt, Phase, Status, reason_for_error, status_for_reason};
+use telemetry::{
+	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status, reason_for_error,
+	status_for_reason,
+};
 
 /// Default cache / output root — always under `target/`, never a tracked path.
 pub const CACHE_ROOT: &str = "target/tpch";
@@ -1344,6 +1348,9 @@ struct StageError {
 	phase: Phase,
 	reason: String,
 	message: String,
+	timings: PerfPhaseTimings,
+	plan_fingerprint: Option<String>,
+	spill_bytes: u64,
 }
 
 impl StageError {
@@ -1353,6 +1360,9 @@ impl StageError {
 			phase,
 			reason,
 			message,
+			timings: PerfPhaseTimings::default(),
+			plan_fingerprint: None,
+			spill_bytes: 0,
 		}
 	}
 
@@ -1363,6 +1373,25 @@ impl StageError {
 	fn from_display(phase: Phase, error: impl std::fmt::Display) -> Self {
 		Self::from_message(phase, error.to_string())
 	}
+
+	fn with_perf(
+		mut self,
+		timings: PerfPhaseTimings,
+		plan_fingerprint: Option<String>,
+		spill_bytes: u64,
+	) -> Self {
+		self.timings = timings;
+		self.plan_fingerprint = plan_fingerprint;
+		self.spill_bytes = spill_bytes;
+		self
+	}
+}
+
+struct QueryExecution {
+	batches: Vec<RecordBatch>,
+	timings: PerfPhaseTimings,
+	plan_fingerprint: String,
+	spill_bytes: u64,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -1373,29 +1402,115 @@ async fn execute_query_with_tables(
 	sql: &str,
 	tables: Vec<HarnessTable>,
 ) -> Result<Vec<RecordBatch>, StageError> {
+	execute_query_with_tables_timed(sql, tables)
+		.await
+		.map(|execution| execution.batches)
+}
+
+async fn execute_query_with_tables_timed(
+	sql: &str,
+	tables: Vec<HarnessTable>,
+) -> Result<QueryExecution, StageError> {
+	let total_start = Instant::now();
+	let mut timings = PerfPhaseTimings::default();
+	let mut plan_fingerprint = None;
+	let mut spill_bytes = 0;
+
+	let load_start = Instant::now();
 	let mut catalog = MockCatalog::new();
 	let mut batches = HashMap::new();
 	for table in tables {
 		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
-			return Err(StageError::from_debug(Phase::Load, error));
+			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Load, error).with_perf(
+				timings,
+				plan_fingerprint,
+				spill_bytes,
+			));
 		}
 		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
-			return Err(StageError::from_debug(Phase::Load, error));
+			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Load, error).with_perf(
+				timings,
+				plan_fingerprint,
+				spill_bytes,
+			));
 		}
 		batches.insert(table.id, table.batch);
 	}
 	let storage = Arc::new(HarnessScan { batches });
+	timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
-	let logical = SqlPlanner::new()
-		.plan(sql)
-		.map_err(|error| StageError::from_display(Phase::Plan, error))?;
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
-		.await
-		.map_err(|error| StageError::from_debug(Phase::Bind, error))?;
-	Executor::new(storage)
+	let plan_start = Instant::now();
+	let logical = match SqlPlanner::new().plan(sql) {
+		Ok(logical) => logical,
+		Err(error) => {
+			timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_display(Phase::Plan, error).with_perf(
+				timings,
+				plan_fingerprint,
+				spill_bytes,
+			));
+		}
+	};
+	timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
+	let bind_start = Instant::now();
+	let bound = match bind(&logical, &catalog, &PlannerConfig::default()).await {
+		Ok(bound) => bound,
+		Err(error) => {
+			timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Bind, error).with_perf(
+				timings,
+				plan_fingerprint,
+				spill_bytes,
+			));
+		}
+	};
+	timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
+	plan_fingerprint = Some(physical_plan_fingerprint(&bound));
+
+	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let context = ExecutionContext::local_test().with_task_telemetry(task_telemetry.clone());
+	let execute_start = Instant::now();
+	let batches = match Executor::with_context(storage, context)
 		.execute_bound(&bound, None)
 		.await
-		.map_err(|error| StageError::from_debug(Phase::Execute, error))
+	{
+		Ok(batches) => batches,
+		Err(error) => {
+			timings.execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			spill_bytes = task_telemetry
+				.lock()
+				.expect("task telemetry lock")
+				.counters
+				.spill_bytes;
+			return Err(StageError::from_debug(Phase::Execute, error).with_perf(
+				timings,
+				plan_fingerprint,
+				spill_bytes,
+			));
+		}
+	};
+	timings.execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+	timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+	spill_bytes = task_telemetry
+		.lock()
+		.expect("task telemetry lock")
+		.counters
+		.spill_bytes;
+
+	Ok(QueryExecution {
+		batches,
+		timings,
+		plan_fingerprint: plan_fingerprint.expect("bound plan has a fingerprint"),
+		spill_bytes,
+	})
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
@@ -1430,6 +1545,7 @@ async fn run_query_with_tables(
 			phase,
 			reason,
 			message,
+			..
 		}) => {
 			return attempt(
 				phase,
@@ -1457,6 +1573,268 @@ async fn run_query_with_tables(
 	};
 
 	attempt(Phase::Execute, Status::Pass, None, Some(digest), None)
+}
+
+fn physical_plan_fingerprint(plan: &ExecutionPlan) -> String {
+	const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+	const FNV_PRIME: u64 = 0x00000100000001b3;
+	let mut hash = FNV_OFFSET;
+	for byte in format!("{plan:?}").as_bytes() {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(FNV_PRIME);
+	}
+	format!("{hash:016x}")
+}
+
+async fn run_perf_query_with_tables(
+	query_id: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+	sql: &str,
+	tables: Vec<HarnessTable>,
+) -> PerfAttempt {
+	let mut execution = match execute_query_with_tables_timed(sql, tables).await {
+		Ok(execution) => execution,
+		Err(StageError {
+			phase,
+			reason,
+			message,
+			timings,
+			plan_fingerprint,
+			spill_bytes,
+		}) => {
+			return PerfAttempt {
+				engine: "toron".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase,
+				status: status_for_reason(&reason),
+				reason: Some(reason),
+				diagnostic_message: Some(message),
+				timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes,
+				plan_fingerprint,
+				digest: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+
+	let digest_start = Instant::now();
+	let digest = match canonical_arrow_ipc_digest(&execution.batches, SortPolicy::FullRowLex) {
+		Ok(digest) => format!("{digest:?}"),
+		Err(error) => {
+			let message = format!("{error:?}");
+			let reason = reason_for_error(&message);
+			execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+			execution.timings.total_ms += execution.timings.digest_ms;
+			return PerfAttempt {
+				engine: "toron".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase: Phase::Execute,
+				status: status_for_reason(reason),
+				reason: Some(reason.to_string()),
+				diagnostic_message: Some(message),
+				timings: execution.timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes: execution.spill_bytes,
+				plan_fingerprint: Some(execution.plan_fingerprint),
+				digest: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+	execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+	execution.timings.total_ms += execution.timings.digest_ms;
+
+	PerfAttempt {
+		engine: "toron".to_string(),
+		query: query_id.to_string(),
+		scale_factor,
+		mode: mode.to_string(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::Pass,
+		reason: None,
+		diagnostic_message: None,
+		timings: execution.timings,
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: execution.spill_bytes,
+		plan_fingerprint: Some(execution.plan_fingerprint),
+		digest: Some(digest),
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
+/// Run one query through the performance rail. This uses the same SQL and fixture constructors as the
+/// reachability rail, but it bypasses reachability-only preflight assertions so the timed phases are strictly
+/// load, plan, bind, execute, and digest.
+pub async fn run_perf_query(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+) -> Result<PerfAttempt, String> {
+	let strict = match mode {
+		"strict" => true,
+		"dev" => false,
+		other => return Err(format!("perf --mode {other} is not supported")),
+	};
+	let (query_id, sql, tables) = perf_query_spec(query, strict, scale_factor)?;
+	Ok(
+		run_perf_query_with_tables(query_id, mode, scale_factor, run_index, warmup, sql, tables)
+			.await,
+	)
+}
+
+fn perf_query_spec(
+	query: &str,
+	strict: bool,
+	scale_factor: f64,
+) -> Result<(&'static str, &'static str, Vec<HarnessTable>), String> {
+	let one_lineitem_table = |query_id, sql: &'static str| {
+		let batch = if strict {
+			generate_strict_lineitem(scale_factor)
+		} else {
+			generate_dev_lineitem(scale_factor)
+		};
+		let descriptor = if strict {
+			strict_lineitem_descriptor(strict_lineitem_schema().as_ref())
+		} else {
+			dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
+		};
+		Ok((
+			query_id,
+			sql,
+			vec![HarnessTable {
+				id: TableId(1),
+				name: "lineitem",
+				descriptor,
+				batch,
+				facts: TableOptimizerFacts::default(),
+			}],
+		))
+	};
+	match query {
+		"q01" | "q1" => one_lineitem_table("q01", if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
+		"q06" | "q6" => one_lineitem_table("q06", if strict { STRICT_Q6_SQL } else { Q6_DEV_SQL }),
+		"q02" | "q2" => Ok((
+			"q02",
+			if strict { STRICT_Q2_SQL } else { Q2_DEV_SQL },
+			q02_tables(strict, scale_factor),
+		)),
+		"q03" | "q3" => Ok((
+			"q03",
+			if strict { STRICT_Q3_SQL } else { Q3_DEV_SQL },
+			q03_tables(strict, scale_factor),
+		)),
+		"q04" | "q4" => Ok((
+			"q04",
+			if strict { STRICT_Q4_SQL } else { Q4_DEV_SQL },
+			q04_tables(strict, scale_factor),
+		)),
+		"q05" | "q5" => Ok((
+			"q05",
+			if strict { STRICT_Q5_SQL } else { Q5_DEV_SQL },
+			q05_tables(strict, scale_factor),
+		)),
+		"q07" | "q7" => Ok((
+			"q07",
+			if strict { STRICT_Q7_SQL } else { Q7_DEV_SQL },
+			q07_tables(strict, scale_factor),
+		)),
+		"q08" | "q8" => Ok((
+			"q08",
+			if strict { STRICT_Q8_SQL } else { Q8_DEV_SQL },
+			q08_tables(strict, scale_factor),
+		)),
+		"q09" | "q9" => Ok((
+			"q09",
+			if strict { STRICT_Q9_SQL } else { Q9_DEV_SQL },
+			q09_tables(strict, scale_factor),
+		)),
+		"q10" => Ok((
+			"q10",
+			if strict { STRICT_Q10_SQL } else { Q10_DEV_SQL },
+			q10_tables(strict, scale_factor),
+		)),
+		"q11" => Ok((
+			"q11",
+			if strict { STRICT_Q11_SQL } else { Q11_DEV_SQL },
+			q11_tables(strict, scale_factor),
+		)),
+		"q12" => Ok((
+			"q12",
+			if strict { STRICT_Q12_SQL } else { Q12_DEV_SQL },
+			q12_tables(strict, scale_factor),
+		)),
+		"q13" => Ok((
+			"q13",
+			if strict { STRICT_Q13_SQL } else { Q13_DEV_SQL },
+			q13_tables(strict, scale_factor),
+		)),
+		"q14" => Ok((
+			"q14",
+			if strict { STRICT_Q14_SQL } else { Q14_DEV_SQL },
+			q14_tables(strict, scale_factor),
+		)),
+		"q15" => Ok((
+			"q15",
+			if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL },
+			q15_tables(strict, scale_factor),
+		)),
+		"q16" => Ok((
+			"q16",
+			if strict { STRICT_Q16_SQL } else { Q16_DEV_SQL },
+			q16_tables(strict, scale_factor),
+		)),
+		"q17" => Ok((
+			"q17",
+			if strict { STRICT_Q17_SQL } else { Q17_DEV_SQL },
+			q17_tables(strict, scale_factor),
+		)),
+		"q18" => Ok((
+			"q18",
+			if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL },
+			q18_tables(strict, scale_factor),
+		)),
+		"q19" => Ok((
+			"q19",
+			if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL },
+			q19_tables(strict, scale_factor),
+		)),
+		"q20" => Ok((
+			"q20",
+			if strict { STRICT_Q20_SQL } else { Q20_DEV_SQL },
+			q20_tables(strict, scale_factor),
+		)),
+		"q21" => Ok((
+			"q21",
+			if strict { STRICT_Q21_SQL } else { Q21_DEV_SQL },
+			q21_tables(strict, scale_factor),
+		)),
+		"q22" => Ok((
+			"q22",
+			if strict { STRICT_Q22_SQL } else { Q22_DEV_SQL },
+			q22_tables(strict, scale_factor),
+		)),
+		other => Err(format!("perf --query {other} is not supported")),
+	}
 }
 
 /// Dev Q6: the `Float64` proxy. A `pass` means the shape reached `execute` (reachability), not TPC-H
@@ -9058,6 +9436,35 @@ mod adr332_unrecognized_diagnostics {
 }
 
 #[cfg(test)]
+mod adr356_perf_rail {
+	use super::*;
+
+	#[tokio::test]
+	async fn perf_attempt_carries_execute_timing_digest_and_stable_plan_fingerprint() {
+		let first = run_perf_query("q06", "strict", 0.01, 0, false)
+			.await
+			.expect("perf run");
+		let second = run_perf_query("q6", "strict", 0.01, 1, false)
+			.await
+			.expect("perf run");
+		assert_eq!(first.status, Status::Pass);
+		assert!(first.timings.execute_ms > 0.0);
+		assert!(first.timings.total_ms >= first.timings.execute_ms);
+		assert_eq!(first.spill_bytes, 0);
+		assert!(first.digest.is_some());
+		assert!(first.plan_fingerprint.is_some());
+		assert_eq!(first.plan_fingerprint, second.plan_fingerprint);
+
+		let row = first.json_value();
+		assert_eq!(row["engine"], "toron");
+		assert_eq!(row["query"], "q06");
+		assert!(row["execute_ms"].as_f64().expect("execute_ms") > 0.0);
+		assert!(row.get("elapsed_ms").is_none());
+		assert_eq!(row["spill_bytes"], 0);
+	}
+}
+
+#[cfg(test)]
 mod adr301_q09_probe {
 	use super::*;
 
@@ -9168,11 +9575,12 @@ mod adr331_q08_scale_probe {
 				right,
 				kind,
 				strategy,
+				replay_id,
 				left_keys,
 				right_keys,
 				..
 			} => format!(
-				"Join({kind:?},{strategy:?},keys={left_keys:?}/{right_keys:?},left={},right={})",
+				"Join(id={replay_id:?},{kind:?},{strategy:?},keys={left_keys:?}/{right_keys:?},left={},right={})",
 				plan_shape(left),
 				plan_shape(right)
 			),
