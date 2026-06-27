@@ -297,6 +297,9 @@ pub struct PerfAttempt {
 	pub spill_bytes: u64,
 	pub plan_fingerprint: Option<String>,
 	pub digest: Option<String>,
+	pub output_row_count: Option<u64>,
+	pub output_schema_fingerprint: Option<String>,
+	pub duckdb_version: Option<String>,
 	pub debug_build: bool,
 }
 
@@ -320,6 +323,9 @@ impl PerfAttempt {
 			"spill_bytes": self.spill_bytes,
 			"plan_fingerprint": self.plan_fingerprint,
 			"digest": self.digest,
+			"output_row_count": self.output_row_count,
+			"output_schema_fingerprint": self.output_schema_fingerprint,
+			"duckdb_version": self.duckdb_version,
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

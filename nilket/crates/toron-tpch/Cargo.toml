@@ -20,5 +20,6 @@ arrow.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
 libc = "0.2"
+parquet = "58.3.0"
 serde_json = "1.0"
 tpchgen = "2.0.2"

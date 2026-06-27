@@ -3,26 +3,30 @@
 //! distinct from a query `blocked`/`fail` (which is structured telemetry).
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
-use toron_tpch::telemetry::{Attempt, CorrectnessAttempt, Phase, Status};
+use toron_tpch::telemetry::{
+	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status,
+};
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_q1, check_strict_q02,
 	check_strict_q3, check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07,
 	check_strict_q08, check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12,
 	check_strict_q13, check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17,
 	check_strict_q18, check_strict_q19, check_strict_q20, check_strict_q21, check_strict_q22,
-	correctness_matrix, generate_dev_lineitem, matrix, parse_scale_factor, run_dev_q1, run_dev_q02,
-	run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09,
-	run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16,
-	run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
-	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
-	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22, status_rows,
+	correctness_matrix, export_perf_query_parquet, generate_dev_lineitem, matrix,
+	normalize_duckdb_type, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04,
+	run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11,
+	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18,
+	run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query, run_strict_q1,
+	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
+	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
+	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19,
+	run_strict_q20, run_strict_q21, run_strict_q22, schema_fingerprint_from_duckdb_fields,
+	stable_fingerprint, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -95,6 +99,44 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	ExitCode::SUCCESS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerfEngine {
+	Toron,
+	DuckDb,
+}
+
+fn parse_perf_engines(raw: &str) -> Result<Vec<PerfEngine>, String> {
+	let mut engines = Vec::new();
+	for item in raw.split(',') {
+		let engine = match item.trim() {
+			"" => continue,
+			"toron" => PerfEngine::Toron,
+			"duckdb" => PerfEngine::DuckDb,
+			"all" => {
+				push_perf_engine(&mut engines, PerfEngine::Toron);
+				push_perf_engine(&mut engines, PerfEngine::DuckDb);
+				continue;
+			}
+			other => {
+				return Err(format!(
+					"perf --engines contains unsupported engine {other:?}"
+				));
+			}
+		};
+		push_perf_engine(&mut engines, engine);
+	}
+	if engines.is_empty() {
+		return Err("perf --engines must include at least one engine".to_string());
+	}
+	Ok(engines)
+}
+
+fn push_perf_engine(engines: &mut Vec<PerfEngine>, engine: PerfEngine) {
+	if !engines.contains(&engine) {
+		engines.push(engine);
+	}
+}
+
 async fn perf_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("all");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
@@ -115,26 +157,43 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	let baseline_path = flag_value(args, "--baseline")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| output_dir.join(default_baseline_name(sf, mode)));
+	let engines = match parse_perf_engines(flag_value(args, "--engines").unwrap_or("toron")) {
+		Ok(engines) => engines,
+		Err(message) => return harness_error(&message),
+	};
 	let queries = match perf_query_list(query) {
 		Ok(queries) => queries,
 		Err(message) => return harness_error(&message),
 	};
 	let mut raw_rows = Vec::new();
 	for query_id in queries {
-		for warmup_index in 0..warmup {
-			match run_perf_child(query_id, mode, sf, warmup_index as u32, true) {
-				Ok(row) => raw_rows.push(row),
-				Err(message) => return harness_error(&message),
-			}
-		}
-		for run_index in 0..runs {
-			match run_perf_child(query_id, mode, sf, run_index as u32, false) {
-				Ok(row) => raw_rows.push(row),
-				Err(message) => return harness_error(&message),
+		for engine in &engines {
+			match engine {
+				PerfEngine::Toron => {
+					for warmup_index in 0..warmup {
+						match run_perf_child(query_id, mode, sf, warmup_index as u32, true) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
+					}
+					for run_index in 0..runs {
+						match run_perf_child(query_id, mode, sf, run_index as u32, false) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
+					}
+				}
+				PerfEngine::DuckDb => {
+					match run_duckdb_perf_rows(query_id, mode, sf, runs, warmup, &output_dir) {
+						Ok(rows) => raw_rows.extend(rows),
+						Err(message) => return harness_error(&message),
+					}
+				}
 			}
 		}
 	}
 
+	apply_duckdb_output_sanity_flags(&mut raw_rows);
 	let baseline_rows = read_baseline_rows(&baseline_path);
 	let summary_rows = summarize_perf_rows(&raw_rows, runs, warmup, &baseline_rows);
 	if let Err(error) = write_perf_outputs(&output_dir, &baseline_path, &raw_rows, &summary_rows) {
@@ -504,6 +563,586 @@ fn run_perf_child(
 	run_perf_child_args(&args)
 }
 
+fn run_duckdb_perf_rows(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	runs: usize,
+	warmup: usize,
+	_output_dir: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+	let duckdb_bin = duckdb_binary();
+	let Some(duckdb_version) = duckdb_cli_version(&duckdb_bin)? else {
+		let mut rows = Vec::new();
+		for warmup_index in 0..warmup {
+			rows.push(duckdb_not_attempted_row(
+				query,
+				mode,
+				sf,
+				warmup_index as u32,
+				true,
+				"duckdb_absent",
+				None,
+			));
+		}
+		for run_index in 0..runs {
+			rows.push(duckdb_not_attempted_row(
+				query,
+				mode,
+				sf,
+				run_index as u32,
+				false,
+				"duckdb_absent",
+				None,
+			));
+		}
+		return Ok(rows);
+	};
+
+	let export_root = PathBuf::from(CACHE_ROOT).join("parquet");
+	let export = export_perf_query_parquet(query, mode, sf, &export_root)?;
+	duckdb_type_parity_gate(&duckdb_bin, &export)?;
+	let output_schema_fingerprint = duckdb_output_schema_fingerprint(&duckdb_bin, &export)?;
+	let plan_fingerprint = duckdb_plan_fingerprint(&export);
+
+	let mut rows = Vec::new();
+	for warmup_index in 0..warmup {
+		rows.push(run_duckdb_perf_child(
+			&duckdb_bin,
+			&duckdb_version,
+			&export,
+			&plan_fingerprint,
+			&output_schema_fingerprint,
+			warmup_index as u32,
+			true,
+		)?);
+	}
+	for run_index in 0..runs {
+		rows.push(run_duckdb_perf_child(
+			&duckdb_bin,
+			&duckdb_version,
+			&export,
+			&plan_fingerprint,
+			&output_schema_fingerprint,
+			run_index as u32,
+			false,
+		)?);
+	}
+	Ok(rows)
+}
+
+fn duckdb_binary() -> String {
+	std::env::var("TORON_TPCH_DUCKDB_BIN").unwrap_or_else(|_| "duckdb".to_string())
+}
+
+fn duckdb_cli_version(duckdb_bin: &str) -> Result<Option<String>, String> {
+	match Command::new(duckdb_bin).arg("--version").output() {
+		Ok(output) if output.status.success() => {
+			let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+			let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+			Ok(Some(if stdout.is_empty() { stderr } else { stdout }))
+		}
+		Ok(output) => Err(format!(
+			"duckdb --version failed status={} stderr={:?}",
+			output.status,
+			String::from_utf8_lossy(&output.stderr)
+		)),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(format!("spawn duckdb --version: {error}")),
+	}
+}
+
+fn duckdb_not_attempted_row(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	run_index: u32,
+	warmup: bool,
+	reason: &str,
+	duckdb_version: Option<String>,
+) -> serde_json::Value {
+	PerfAttempt {
+		engine: "duckdb".to_string(),
+		query: query.to_string(),
+		scale_factor: sf,
+		mode: mode.to_string(),
+		run_index,
+		warmup,
+		phase: Phase::Generate,
+		status: Status::NotAttempted,
+		reason: Some(reason.to_string()),
+		diagnostic_message: None,
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: None,
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		duckdb_version,
+		debug_build: false,
+	}
+	.json_value()
+}
+
+fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
+	export
+		.tables
+		.iter()
+		.map(|table| {
+			format!(
+				"CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet({});",
+				table.name,
+				sql_string_literal(&table.path.display().to_string())
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn duckdb_query_statement(sql: &str) -> String {
+	format!("{};", sql.trim().trim_end_matches(';'))
+}
+
+fn sql_string_literal(value: &str) -> String {
+	format!("'{}'", value.replace('\'', "''"))
+}
+
+fn duckdb_plan_fingerprint(export: &toron_tpch::TpchParquetExport) -> String {
+	stable_fingerprint(&format!(
+		"duckdb_sql={};manifest={}",
+		export.sql, export.manifest_fingerprint
+	))
+}
+
+fn duckdb_type_parity_gate(
+	duckdb_bin: &str,
+	export: &toron_tpch::TpchParquetExport,
+) -> Result<(), String> {
+	for table in &export.tables {
+		let script = format!(
+			".mode json\nDESCRIBE SELECT * FROM read_parquet({});\nSELECT COUNT(*) AS row_count FROM read_parquet({});\n",
+			sql_string_literal(&table.path.display().to_string()),
+			sql_string_literal(&table.path.display().to_string())
+		);
+		let output = run_duckdb_script(duckdb_bin, &script)
+			.map_err(|error| format!("DuckDB type gate for {}: {error}", table.name))?;
+		if !output.status_success {
+			return Err(format!(
+				"DuckDB type gate for {} failed: stderr={:?}",
+				table.name, output.stderr
+			));
+		}
+		let arrays = extract_json_arrays(&output.stdout);
+		let describe = arrays
+			.first()
+			.ok_or_else(|| format!("DuckDB DESCRIBE for {} emitted no JSON", table.name))?;
+		let count = arrays
+			.get(1)
+			.ok_or_else(|| format!("DuckDB COUNT for {} emitted no JSON", table.name))?;
+		let observed_schema = duckdb_describe_schema_fingerprint(describe)?;
+		let observed_count = duckdb_count_result(count)?;
+		if observed_count != table.row_count {
+			return Err(format!(
+				"DuckDB row-count mismatch for {}: manifest={} duckdb={observed_count}",
+				table.name, table.row_count
+			));
+		}
+		if observed_schema != table.schema_fingerprint {
+			return Err(format!(
+				"DuckDB schema mismatch for {}: manifest={} duckdb={observed_schema}",
+				table.name, table.schema_fingerprint
+			));
+		}
+	}
+	Ok(())
+}
+
+fn duckdb_output_schema_fingerprint(
+	duckdb_bin: &str,
+	export: &toron_tpch::TpchParquetExport,
+) -> Result<String, String> {
+	let script = format!(
+		".mode json\n{}\nDESCRIBE SELECT * FROM ({}) AS toron_tpch_output;\n",
+		duckdb_setup_sql(export),
+		export.sql
+	);
+	let output = run_duckdb_script(duckdb_bin, &script)
+		.map_err(|error| format!("DuckDB output schema: {error}"))?;
+	if !output.status_success {
+		return Err(format!(
+			"DuckDB output schema failed: stderr={:?}",
+			output.stderr
+		));
+	}
+	let arrays = extract_json_arrays(&output.stdout);
+	let describe = arrays
+		.first()
+		.ok_or_else(|| "DuckDB output schema emitted no JSON".to_string())?;
+	duckdb_describe_schema_fingerprint(describe)
+}
+
+fn run_duckdb_perf_child(
+	duckdb_bin: &str,
+	duckdb_version: &str,
+	export: &toron_tpch::TpchParquetExport,
+	plan_fingerprint: &str,
+	output_schema_fingerprint: &str,
+	run_index: u32,
+	warmup: bool,
+) -> Result<serde_json::Value, String> {
+	let script = format!(
+		".mode json\n{}\n.timer on\n{}\n",
+		duckdb_setup_sql(export),
+		duckdb_query_statement(&export.sql)
+	);
+	let output = run_duckdb_script(duckdb_bin, &script)?;
+	if !output.status_success {
+		let mut timings = PerfPhaseTimings::default();
+		timings.total_ms = output.parent_wall_ms;
+		return Ok(PerfAttempt {
+			engine: "duckdb".to_string(),
+			query: export.query_id.clone(),
+			scale_factor: export.scale_factor,
+			mode: export.mode.clone(),
+			run_index,
+			warmup,
+			phase: Phase::Execute,
+			status: Status::Fail,
+			reason: Some("duckdb_query_failed".to_string()),
+			diagnostic_message: Some(format!("stderr={:?}", output.stderr)),
+			timings,
+			parent_wall_ms: Some(output.parent_wall_ms),
+			peak_rss_kib: output.peak_rss_kib,
+			spill_bytes: 0,
+			plan_fingerprint: Some(plan_fingerprint.to_string()),
+			digest: None,
+			output_row_count: None,
+			output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
+			duckdb_version: Some(duckdb_version.to_string()),
+			debug_build: false,
+		}
+		.json_value());
+	}
+	let combined = format!("{}\n{}", output.stdout, output.stderr);
+	let execute_ms = parse_duckdb_timer_ms(&combined)
+		.ok_or_else(|| format!("DuckDB timer output missing from {:?}", combined))?;
+	let arrays = extract_json_arrays(&output.stdout);
+	let result = arrays
+		.last()
+		.ok_or_else(|| "DuckDB query emitted no JSON result".to_string())?;
+	let row_count = result
+		.as_array()
+		.map(|rows| rows.len() as u64)
+		.ok_or_else(|| "DuckDB query JSON result was not an array".to_string())?;
+	let mut timings = PerfPhaseTimings::default();
+	timings.execute_ms = execute_ms;
+	timings.total_ms = execute_ms;
+	Ok(PerfAttempt {
+		engine: "duckdb".to_string(),
+		query: export.query_id.clone(),
+		scale_factor: export.scale_factor,
+		mode: export.mode.clone(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::Pass,
+		reason: None,
+		diagnostic_message: None,
+		timings,
+		parent_wall_ms: Some(output.parent_wall_ms),
+		peak_rss_kib: output.peak_rss_kib,
+		spill_bytes: 0,
+		plan_fingerprint: Some(plan_fingerprint.to_string()),
+		digest: None,
+		output_row_count: Some(row_count),
+		output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
+		duckdb_version: Some(duckdb_version.to_string()),
+		debug_build: false,
+	}
+	.json_value())
+}
+
+#[derive(Debug)]
+struct DuckDbCommandOutput {
+	stdout: String,
+	stderr: String,
+	parent_wall_ms: f64,
+	peak_rss_kib: Option<u64>,
+	status_success: bool,
+}
+
+#[cfg(unix)]
+fn run_duckdb_script(duckdb_bin: &str, script: &str) -> Result<DuckDbCommandOutput, String> {
+	let start = Instant::now();
+	let mut child = Command::new(duckdb_bin)
+		.arg(":memory:")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|error| format!("spawn duckdb: {error}"))?;
+	child
+		.stdin
+		.take()
+		.ok_or_else(|| "duckdb stdin was not piped".to_string())?
+		.write_all(script.as_bytes())
+		.map_err(|error| format!("write duckdb script: {error}"))?;
+	let pid = child.id() as libc::pid_t;
+	let mut stdout = child
+		.stdout
+		.take()
+		.ok_or_else(|| "duckdb stdout was not piped".to_string())?;
+	let mut stderr = child
+		.stderr
+		.take()
+		.ok_or_else(|| "duckdb stderr was not piped".to_string())?;
+	let stdout_reader = std::thread::spawn(move || {
+		let mut output = String::new();
+		stdout.read_to_string(&mut output).map(|_| output)
+	});
+	let stderr_reader = std::thread::spawn(move || {
+		let mut output = String::new();
+		stderr.read_to_string(&mut output).map(|_| output)
+	});
+	let mut status: libc::c_int = 0;
+	let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+	let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
+	if waited < 0 {
+		return Err(format!("wait4 duckdb: {}", std::io::Error::last_os_error()));
+	}
+	let usage = unsafe { usage.assume_init() };
+	let stdout = stdout_reader
+		.join()
+		.map_err(|_| "duckdb stdout reader panicked".to_string())?
+		.map_err(|error| format!("read duckdb stdout: {error}"))?;
+	let stderr = stderr_reader
+		.join()
+		.map_err(|_| "duckdb stderr reader panicked".to_string())?
+		.map_err(|error| format!("read duckdb stderr: {error}"))?;
+	Ok(DuckDbCommandOutput {
+		stdout,
+		stderr,
+		parent_wall_ms: start.elapsed().as_secs_f64() * 1000.0,
+		peak_rss_kib: Some(usage.ru_maxrss.max(0) as u64),
+		status_success: libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+	})
+}
+
+#[cfg(not(unix))]
+fn run_duckdb_script(duckdb_bin: &str, script: &str) -> Result<DuckDbCommandOutput, String> {
+	let start = Instant::now();
+	let mut child = Command::new(duckdb_bin)
+		.arg(":memory:")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|error| format!("spawn duckdb: {error}"))?;
+	child
+		.stdin
+		.take()
+		.ok_or_else(|| "duckdb stdin was not piped".to_string())?
+		.write_all(script.as_bytes())
+		.map_err(|error| format!("write duckdb script: {error}"))?;
+	let output = child
+		.wait_with_output()
+		.map_err(|error| format!("wait duckdb: {error}"))?;
+	Ok(DuckDbCommandOutput {
+		stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+		stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+		parent_wall_ms: start.elapsed().as_secs_f64() * 1000.0,
+		peak_rss_kib: None,
+		status_success: output.status.success(),
+	})
+}
+
+fn duckdb_describe_schema_fingerprint(value: &serde_json::Value) -> Result<String, String> {
+	let rows = value
+		.as_array()
+		.ok_or_else(|| "DuckDB DESCRIBE JSON was not an array".to_string())?;
+	let mut fields = Vec::new();
+	for row in rows {
+		let object = row
+			.as_object()
+			.ok_or_else(|| "DuckDB DESCRIBE row was not an object".to_string())?;
+		let name = object
+			.get("column_name")
+			.or_else(|| object.get("COLUMN_NAME"))
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("DuckDB DESCRIBE row missing column_name: {row}"))?;
+		let data_type = object
+			.get("column_type")
+			.or_else(|| object.get("COLUMN_TYPE"))
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("DuckDB DESCRIBE row missing column_type: {row}"))?;
+		fields.push((name.to_string(), normalize_duckdb_type(data_type)));
+	}
+	Ok(schema_fingerprint_from_duckdb_fields(&fields))
+}
+
+fn duckdb_count_result(value: &serde_json::Value) -> Result<u64, String> {
+	let rows = value
+		.as_array()
+		.ok_or_else(|| "DuckDB COUNT JSON was not an array".to_string())?;
+	let row = rows
+		.first()
+		.and_then(serde_json::Value::as_object)
+		.ok_or_else(|| "DuckDB COUNT JSON had no object row".to_string())?;
+	row.values()
+		.find_map(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("DuckDB COUNT row had no u64 value: {value}"))
+}
+
+fn parse_duckdb_timer_ms(output: &str) -> Option<f64> {
+	for line in output.lines().rev() {
+		if !line.to_ascii_lowercase().contains("run time") {
+			continue;
+		}
+		if let Some(real) = line.split("real").nth(1) {
+			if let Some(value) = real
+				.split_whitespace()
+				.find_map(|token| token.trim().parse::<f64>().ok())
+			{
+				return Some(value * 1000.0);
+			}
+		}
+	}
+	None
+}
+
+fn extract_json_arrays(input: &str) -> Vec<serde_json::Value> {
+	let mut arrays = Vec::new();
+	let mut start = None;
+	let mut depth = 0_i32;
+	let mut in_string = false;
+	let mut escaped = false;
+	for (index, byte) in input.bytes().enumerate() {
+		if let Some(start_index) = start {
+			if in_string {
+				if escaped {
+					escaped = false;
+				} else if byte == b'\\' {
+					escaped = true;
+				} else if byte == b'"' {
+					in_string = false;
+				}
+				continue;
+			}
+			match byte {
+				b'"' => in_string = true,
+				b'[' => depth += 1,
+				b']' => {
+					depth -= 1;
+					if depth == 0 {
+						if let Ok(value) = serde_json::from_str(&input[start_index..=index]) {
+							arrays.push(value);
+						}
+						start = None;
+					}
+				}
+				_ => {}
+			}
+		} else if byte == b'[' {
+			start = Some(index);
+			depth = 1;
+			in_string = false;
+			escaped = false;
+		}
+	}
+	arrays
+}
+
+fn apply_duckdb_output_sanity_flags(raw_rows: &mut [serde_json::Value]) {
+	let mut toron_outputs: BTreeMap<String, (u64, String)> = BTreeMap::new();
+	for row in raw_rows.iter() {
+		if row.get("engine").and_then(serde_json::Value::as_str) != Some("toron") {
+			continue;
+		}
+		if row
+			.get("warmup")
+			.and_then(serde_json::Value::as_bool)
+			.unwrap_or(false)
+		{
+			continue;
+		}
+		if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+			continue;
+		}
+		let Some(key) = perf_output_compare_key(row) else {
+			continue;
+		};
+		let Some(row_count) = row
+			.get("output_row_count")
+			.and_then(serde_json::Value::as_u64)
+		else {
+			continue;
+		};
+		let Some(schema) = row
+			.get("output_schema_fingerprint")
+			.and_then(serde_json::Value::as_str)
+		else {
+			continue;
+		};
+		toron_outputs
+			.entry(key)
+			.or_insert_with(|| (row_count, schema.to_string()));
+	}
+
+	for row in raw_rows.iter_mut() {
+		if row.get("engine").and_then(serde_json::Value::as_str) != Some("duckdb") {
+			continue;
+		}
+		if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+			continue;
+		}
+		let Some(key) = perf_output_compare_key(row) else {
+			continue;
+		};
+		let Some((toron_count, toron_schema)) = toron_outputs.get(&key) else {
+			continue;
+		};
+		let duckdb_count = row
+			.get("output_row_count")
+			.and_then(serde_json::Value::as_u64);
+		let duckdb_schema = row
+			.get("output_schema_fingerprint")
+			.and_then(serde_json::Value::as_str);
+		let schema_matches = duckdb_schema == Some(toron_schema.as_str());
+		if duckdb_count != Some(*toron_count) {
+			push_row_flag(row, "row_count_mismatch");
+		}
+		if !schema_matches {
+			push_row_flag(row, "schema_mismatch");
+		}
+	}
+}
+
+fn perf_output_compare_key(row: &serde_json::Value) -> Option<String> {
+	let query = row.get("query").and_then(serde_json::Value::as_str)?;
+	let mode = row.get("mode").and_then(serde_json::Value::as_str)?;
+	let sf = row
+		.get("scale_factor")
+		.and_then(serde_json::Value::as_f64)?;
+	Some(format!("{query}\t{mode}\t{sf}"))
+}
+
+fn push_row_flag(row: &mut serde_json::Value, flag: &str) {
+	let Some(object) = row.as_object_mut() else {
+		return;
+	};
+	let entry = object
+		.entry("flags".to_string())
+		.or_insert_with(|| serde_json::Value::Array(Vec::new()));
+	let Some(flags) = entry.as_array_mut() else {
+		return;
+	};
+	if !flags.iter().any(|existing| existing.as_str() == Some(flag)) {
+		flags.push(serde_json::json!(flag));
+	}
+}
+
 #[cfg(unix)]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
 	let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
@@ -615,7 +1254,7 @@ fn summarize_perf_rows(
 	warmup: usize,
 	baseline_rows: &BTreeMap<String, serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-	let mut by_query: BTreeMap<String, Vec<&serde_json::Value>> = BTreeMap::new();
+	let mut by_key: BTreeMap<String, Vec<&serde_json::Value>> = BTreeMap::new();
 	for row in raw_rows {
 		if row
 			.get("warmup")
@@ -624,20 +1263,23 @@ fn summarize_perf_rows(
 		{
 			continue;
 		}
-		if let Some(query) = row.get("query").and_then(serde_json::Value::as_str) {
-			by_query.entry(query.to_string()).or_default().push(row);
+		if let (Some(engine), Some(query)) = (
+			row.get("engine").and_then(serde_json::Value::as_str),
+			row.get("query").and_then(serde_json::Value::as_str),
+		) {
+			by_key
+				.entry(perf_summary_key(engine, query))
+				.or_default()
+				.push(row);
 		}
 	}
-	by_query
+	by_key
 		.into_iter()
-		.map(|(query, rows)| {
-			summarize_query_rows(&query, rows, runs, warmup, baseline_rows.get(&query))
-		})
+		.map(|(key, rows)| summarize_query_rows(rows, runs, warmup, baseline_rows.get(&key)))
 		.collect()
 }
 
 fn summarize_query_rows(
-	query: &str,
 	rows: Vec<&serde_json::Value>,
 	runs: usize,
 	warmup: usize,
@@ -666,6 +1308,14 @@ fn summarize_query_rows(
 		.max()
 		.unwrap_or(0);
 	let first = rows.first().copied();
+	let engine = first
+		.and_then(|row| row.get("engine"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("unknown");
+	let query = first
+		.and_then(|row| row.get("query"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("unknown");
 	let plan_fingerprint = first
 		.and_then(|row| row.get("plan_fingerprint"))
 		.and_then(serde_json::Value::as_str)
@@ -681,9 +1331,26 @@ fn summarize_query_rows(
 			== "pass"
 	}) {
 		"pass"
+	} else if rows.iter().all(|row| {
+		row.get("status")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or("fail")
+			== "not_attempted"
+	}) {
+		"not_attempted"
 	} else {
 		"fail"
 	};
+	let output_row_count = first
+		.and_then(|row| row.get("output_row_count"))
+		.and_then(serde_json::Value::as_u64);
+	let output_schema_fingerprint = first
+		.and_then(|row| row.get("output_schema_fingerprint"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("none");
+	let duckdb_version = first
+		.and_then(|row| row.get("duckdb_version"))
+		.and_then(serde_json::Value::as_str);
 	let scale_factor = first
 		.and_then(|row| row.get("scale_factor"))
 		.and_then(serde_json::Value::as_f64)
@@ -700,10 +1367,19 @@ fn summarize_query_rows(
 	const STABILITY_THRESHOLD: f64 = 0.20;
 	const REGRESSION_THRESHOLD: f64 = 0.10;
 	if spread_ratio > STABILITY_THRESHOLD {
-		flags.push("unstable");
+		push_summary_flag(&mut flags, "unstable");
 	}
 	if profile != "release" {
-		flags.push("debug_build");
+		push_summary_flag(&mut flags, "debug_build");
+	}
+	for row in &rows {
+		if let Some(row_flags) = row.get("flags").and_then(serde_json::Value::as_array) {
+			for flag in row_flags {
+				if let Some(flag) = flag.as_str() {
+					push_summary_flag(&mut flags, flag);
+				}
+			}
+		}
 	}
 	let mut baseline_execute_ms_median = None;
 	if let Some(baseline) = baseline {
@@ -712,7 +1388,7 @@ fn summarize_query_rows(
 			.and_then(serde_json::Value::as_str)
 			.unwrap_or("none");
 		if baseline_plan != plan_fingerprint {
-			flags.push("plan_changed");
+			push_summary_flag(&mut flags, "plan_changed");
 		} else if let Some(baseline_median) = baseline
 			.get("execute_ms_median")
 			.and_then(serde_json::Value::as_f64)
@@ -725,14 +1401,14 @@ fn summarize_query_rows(
 			let band = REGRESSION_THRESHOLD.max(2.0 * spread_ratio.max(baseline_spread));
 			if baseline_median > 0.0 && (execute_median - baseline_median) / baseline_median > band
 			{
-				flags.push("slower_than_baseline");
+				push_summary_flag(&mut flags, "slower_than_baseline");
 			}
 		}
 	}
 
 	serde_json::json!({
 		"suite": "tpch_perf_summary",
-		"engine": "toron",
+		"engine": engine,
 		"query": query,
 		"scale_factor": scale_factor,
 		"mode": mode,
@@ -748,9 +1424,22 @@ fn summarize_query_rows(
 		"spill_bytes_max": spill_bytes_max,
 		"plan_fingerprint": plan_fingerprint,
 		"digest": digest,
+		"output_row_count": output_row_count,
+		"output_schema_fingerprint": output_schema_fingerprint,
+		"duckdb_version": duckdb_version,
 		"baseline_execute_ms_median": baseline_execute_ms_median,
 		"flags": flags,
 	})
+}
+
+fn perf_summary_key(engine: &str, query: &str) -> String {
+	format!("{engine}\t{query}")
+}
+
+fn push_summary_flag<'a>(flags: &mut Vec<&'a str>, flag: &'a str) {
+	if !flags.contains(&flag) {
+		flags.push(flag);
+	}
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -774,9 +1463,13 @@ fn read_baseline_rows(path: &Path) -> BTreeMap<String, serde_json::Value> {
 		.lines()
 		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
 		.filter_map(|row| {
+			let engine = row
+				.get("engine")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or("toron");
 			row.get("query")
 				.and_then(serde_json::Value::as_str)
-				.map(|query| (query.to_string(), row.clone()))
+				.map(|query| (perf_summary_key(engine, query), row.clone()))
 		})
 		.collect()
 }
@@ -834,6 +1527,10 @@ fn perf_baseline_is_recordable(summary_rows: &[serde_json::Value]) -> bool {
 }
 
 fn print_perf_summary(row: &serde_json::Value) {
+	let engine = row
+		.get("engine")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("unknown");
 	let query = row
 		.get("query")
 		.and_then(serde_json::Value::as_str)
@@ -874,7 +1571,7 @@ fn print_perf_summary(row: &serde_json::Value) {
 		})
 		.unwrap_or_default();
 	println!(
-		"tpch_perf query={query} status={status} execute_ms_median={median:.1} execute_ms_min={min:.1} spread={spread:.3} peak_rss_kib={rss} spill_bytes={spill} flags={}",
+		"tpch_perf engine={engine} query={query} status={status} execute_ms_median={median:.1} execute_ms_min={min:.1} spread={spread:.3} peak_rss_kib={rss} spill_bytes={spill} flags={}",
 		if flags.is_empty() { "none" } else { &flags }
 	);
 }
@@ -936,7 +1633,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|duckdb|toron,duckdb] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -977,7 +1674,7 @@ mod tests {
 			"plan_fingerprint": "plan-b",
 		});
 		let mut baseline_rows = BTreeMap::new();
-		baseline_rows.insert("q06".to_string(), baseline);
+		baseline_rows.insert(perf_summary_key("toron", "q06"), baseline);
 
 		let summary = summarize_perf_rows(&rows, 3, 1, &baseline_rows);
 		assert_eq!(summary.len(), 1);
@@ -1007,7 +1704,7 @@ mod tests {
 			"plan_fingerprint": "plan-a",
 		});
 		let mut baseline_rows = BTreeMap::new();
-		baseline_rows.insert("q06".to_string(), baseline);
+		baseline_rows.insert(perf_summary_key("toron", "q06"), baseline);
 
 		let summary = summarize_perf_rows(&rows, 3, 0, &baseline_rows);
 		let flags = summary[0]["flags"]
@@ -1043,7 +1740,79 @@ mod tests {
 		)]));
 	}
 
+	#[test]
+	fn perf_summary_keeps_engines_separate_for_same_query() {
+		let rows = vec![
+			perf_row_for_engine("toron", "q06", 100.0, "toron-plan", true),
+			perf_row_for_engine("duckdb", "q06", 80.0, "duckdb-plan", true),
+		];
+		let summary = summarize_perf_rows(&rows, 1, 0, &BTreeMap::new());
+		assert_eq!(summary.len(), 2);
+		assert!(summary.iter().any(|row| {
+			row["engine"] == "toron" && row["query"] == "q06" && row["execute_ms_median"] == 100.0
+		}));
+		assert!(summary.iter().any(|row| {
+			row["engine"] == "duckdb" && row["query"] == "q06" && row["execute_ms_median"] == 80.0
+		}));
+	}
+
+	#[test]
+	fn duckdb_absent_rows_summarize_as_not_attempted() {
+		let rows = vec![duckdb_not_attempted_row(
+			"q06",
+			"strict",
+			1.0,
+			0,
+			false,
+			"duckdb_absent",
+			None,
+		)];
+		let summary = summarize_perf_rows(&rows, 1, 0, &BTreeMap::new());
+		assert_eq!(summary.len(), 1);
+		assert_eq!(summary[0]["engine"], "duckdb");
+		assert_eq!(summary[0]["status"], "not_attempted");
+	}
+
+	#[test]
+	fn perf_summary_deduplicates_row_flags() {
+		let mut first = perf_row_for_engine("duckdb", "q06", 80.0, "duckdb-plan", true);
+		first["flags"] = serde_json::json!(["schema_mismatch"]);
+		let mut second = perf_row_for_engine("duckdb", "q06", 82.0, "duckdb-plan", true);
+		second["flags"] = serde_json::json!(["schema_mismatch"]);
+
+		let summary = summarize_perf_rows(&[first, second], 2, 0, &BTreeMap::new());
+		let flags = summary[0]["flags"].as_array().expect("flags");
+		assert_eq!(flags.len(), 1);
+		assert_eq!(flags[0], "schema_mismatch");
+	}
+
+	#[test]
+	fn duckdb_schema_fingerprint_normalizes_describe_types() {
+		let describe = serde_json::json!([
+			{"column_name": "revenue", "column_type": "DECIMAL(32, 4)"},
+			{"column_name": "shipdate", "column_type": "DATE"},
+			{"column_name": "name", "column_type": "VARCHAR"}
+		]);
+		let observed = duckdb_describe_schema_fingerprint(&describe).unwrap();
+		let expected = schema_fingerprint_from_duckdb_fields(&[
+			("revenue".to_string(), "DECIMAL(32,4)".to_string()),
+			("shipdate".to_string(), "DATE".to_string()),
+			("name".to_string(), "VARCHAR".to_string()),
+		]);
+		assert_eq!(observed, expected);
+	}
+
 	fn perf_row(
+		query: &str,
+		execute_ms: f64,
+		plan_fingerprint: &str,
+		release: bool,
+	) -> serde_json::Value {
+		perf_row_for_engine("toron", query, execute_ms, plan_fingerprint, release)
+	}
+
+	fn perf_row_for_engine(
+		engine: &str,
 		query: &str,
 		execute_ms: f64,
 		plan_fingerprint: &str,
@@ -1051,7 +1820,7 @@ mod tests {
 	) -> serde_json::Value {
 		serde_json::json!({
 			"suite": "tpch_perf",
-			"engine": "toron",
+			"engine": engine,
 			"query": query,
 			"scale_factor": 1.0,
 			"mode": "strict",
@@ -1065,6 +1834,8 @@ mod tests {
 			"spill_bytes": 0,
 			"plan_fingerprint": plan_fingerprint,
 			"digest": "digest",
+			"output_row_count": 1,
+			"output_schema_fingerprint": "schema",
 		})
 	}
 
@@ -1085,6 +1856,8 @@ mod tests {
 			"spill_bytes_max": 0,
 			"plan_fingerprint": "plan-a",
 			"digest": "digest",
+			"output_row_count": 1,
+			"output_schema_fingerprint": "schema",
 			"flags": flags,
 		})
 	}

@@ -9,6 +9,9 @@
 pub mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -19,6 +22,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use parquet::arrow::ArrowWriter;
 use tpchgen::generators::{
 	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
 	PartSuppGenerator, RegionGenerator, SupplierGenerator,
@@ -1315,6 +1319,224 @@ pub struct HarnessTable {
 	pub facts: TableOptimizerFacts,
 }
 
+/// The exact SQL + generated table fixtures used by the perf rail for one query/mode/scale.
+pub struct PerfQuerySpec {
+	pub query_id: &'static str,
+	pub sql: &'static str,
+	pub tables: Vec<HarnessTable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TpchParquetTableExport {
+	pub name: String,
+	pub path: PathBuf,
+	pub row_count: u64,
+	pub schema_fingerprint: String,
+	pub schema_signature: String,
+	pub file_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TpchParquetExport {
+	pub query_id: String,
+	pub mode: String,
+	pub scale_factor: f64,
+	pub sql: String,
+	pub root_dir: PathBuf,
+	pub manifest_path: PathBuf,
+	pub manifest_fingerprint: String,
+	pub tables: Vec<TpchParquetTableExport>,
+}
+
+pub fn stable_fingerprint(text: &str) -> String {
+	let mut hash = FNV_OFFSET;
+	for byte in text.as_bytes() {
+		hash = fnv1a_update(hash, &[*byte]);
+	}
+	format!("fnv1a64:{hash:016x}")
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+	for byte in bytes {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(FNV_PRIME);
+	}
+	hash
+}
+
+fn stable_file_hash(path: &Path) -> Result<String, String> {
+	let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+	let mut reader = BufReader::new(file);
+	let mut buffer = [0_u8; 64 * 1024];
+	let mut hash = FNV_OFFSET;
+	loop {
+		let read = reader
+			.read(&mut buffer)
+			.map_err(|error| format!("read {}: {error}", path.display()))?;
+		if read == 0 {
+			break;
+		}
+		hash = fnv1a_update(hash, &buffer[..read]);
+	}
+	Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn canonical_sql_type(data_type: &DataType) -> String {
+	match data_type {
+		DataType::Boolean => "BOOLEAN".to_string(),
+		DataType::Int8 => "TINYINT".to_string(),
+		DataType::Int16 => "SMALLINT".to_string(),
+		DataType::Int32 => "INTEGER".to_string(),
+		DataType::Int64 => "BIGINT".to_string(),
+		DataType::UInt8 => "UTINYINT".to_string(),
+		DataType::UInt16 => "USMALLINT".to_string(),
+		DataType::UInt32 => "UINTEGER".to_string(),
+		DataType::UInt64 => "UBIGINT".to_string(),
+		DataType::Float32 => "FLOAT".to_string(),
+		DataType::Float64 => "DOUBLE".to_string(),
+		DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
+		DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+		DataType::Decimal128(precision, scale) => format!("DECIMAL({precision},{scale})"),
+		DataType::Decimal256(precision, scale) => format!("DECIMAL({precision},{scale})"),
+		other => format!("{other:?}").to_ascii_uppercase(),
+	}
+}
+
+pub fn normalize_duckdb_type(raw: &str) -> String {
+	raw.trim()
+		.replace(' ', "")
+		.to_ascii_uppercase()
+		.replace("INT64", "BIGINT")
+		.replace("INT32", "INTEGER")
+}
+
+pub fn schema_signature(schema: &Schema) -> String {
+	schema
+		.fields()
+		.iter()
+		.map(|field| format!("{}:{}", field.name(), canonical_sql_type(field.data_type())))
+		.collect::<Vec<_>>()
+		.join("|")
+}
+
+pub fn schema_fingerprint(schema: &Schema) -> String {
+	stable_fingerprint(&schema_signature(schema))
+}
+
+pub fn schema_fingerprint_from_duckdb_fields(fields: &[(String, String)]) -> String {
+	let signature = fields
+		.iter()
+		.map(|(name, data_type)| format!("{name}:{}", normalize_duckdb_type(data_type)))
+		.collect::<Vec<_>>()
+		.join("|");
+	stable_fingerprint(&signature)
+}
+
+pub fn output_row_count(batches: &[RecordBatch]) -> u64 {
+	batches.iter().map(|batch| batch.num_rows() as u64).sum()
+}
+
+pub fn output_schema_fingerprint(batches: &[RecordBatch]) -> Option<String> {
+	batches
+		.first()
+		.map(|batch| schema_fingerprint(batch.schema().as_ref()))
+}
+
+pub fn export_perf_query_parquet(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<TpchParquetExport, String> {
+	let spec = build_perf_query_spec(query, mode, scale_factor)?;
+	let export_dir = root
+		.join(mode)
+		.join(format!("sf{}", scale_factor.to_string().replace('.', "_")))
+		.join(spec.query_id);
+	std::fs::create_dir_all(&export_dir)
+		.map_err(|error| format!("create {}: {error}", export_dir.display()))?;
+
+	let mut table_exports = Vec::new();
+	for table in spec.tables {
+		let path = export_dir.join(format!("{}.parquet", table.name));
+		let file =
+			File::create(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
+		let mut writer = ArrowWriter::try_new(file, table.batch.schema(), None)
+			.map_err(|error| format!("create parquet writer for {}: {error}", table.name))?;
+		writer
+			.write(&table.batch)
+			.map_err(|error| format!("write parquet {}: {error}", table.name))?;
+		writer
+			.close()
+			.map_err(|error| format!("close parquet {}: {error}", table.name))?;
+
+		let schema_signature = schema_signature(table.batch.schema().as_ref());
+		table_exports.push(TpchParquetTableExport {
+			name: table.name.to_string(),
+			path: path.clone(),
+			row_count: table.batch.num_rows() as u64,
+			schema_fingerprint: stable_fingerprint(&schema_signature),
+			schema_signature,
+			file_hash: stable_file_hash(&path)?,
+		});
+	}
+
+	let manifest_signature = table_exports
+		.iter()
+		.map(|table| {
+			format!(
+				"{}:{}:{}:{}",
+				table.name, table.row_count, table.schema_fingerprint, table.file_hash
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("|");
+	let manifest_fingerprint = stable_fingerprint(&format!(
+		"query={};mode={mode};sf={scale_factor};tables={manifest_signature}",
+		spec.query_id
+	));
+	let manifest_path = export_dir.join("manifest.json");
+	let manifest_tables = table_exports
+		.iter()
+		.map(|table| {
+			serde_json::json!({
+				"name": table.name,
+				"path": table.path.display().to_string(),
+				"row_count": table.row_count,
+				"schema_fingerprint": table.schema_fingerprint,
+				"schema_signature": table.schema_signature,
+				"file_hash": table.file_hash,
+			})
+		})
+		.collect::<Vec<_>>();
+	let manifest = serde_json::json!({
+		"suite": "tpch_perf_parquet_manifest",
+		"query": spec.query_id,
+		"mode": mode,
+		"scale_factor": scale_factor,
+		"manifest_fingerprint": manifest_fingerprint,
+		"tables": manifest_tables,
+	});
+	let manifest_body = serde_json::to_string_pretty(&manifest)
+		.map_err(|error| format!("encode manifest {}: {error}", manifest_path.display()))?;
+	std::fs::write(&manifest_path, format!("{manifest_body}\n"))
+		.map_err(|error| format!("write {}: {error}", manifest_path.display()))?;
+
+	Ok(TpchParquetExport {
+		query_id: spec.query_id.to_string(),
+		mode: mode.to_string(),
+		scale_factor,
+		sql: spec.sql.to_string(),
+		root_dir: export_dir,
+		manifest_path,
+		manifest_fingerprint,
+		tables: table_exports,
+	})
+}
+
 /// One-table wrapper (q01/q06): registers `TableId(1)` with default optimizer facts, preserving the
 /// original single-table behavior.
 async fn run_query(
@@ -1622,6 +1844,9 @@ async fn run_perf_query_with_tables(
 				spill_bytes,
 				plan_fingerprint,
 				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
 		}
@@ -1652,12 +1877,17 @@ async fn run_perf_query_with_tables(
 				spill_bytes: execution.spill_bytes,
 				plan_fingerprint: Some(execution.plan_fingerprint),
 				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
 		}
 	};
 	execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
 	execution.timings.total_ms += execution.timings.digest_ms;
+	let output_row_count = output_row_count(&execution.batches);
+	let output_schema_fingerprint = output_schema_fingerprint(&execution.batches);
 
 	PerfAttempt {
 		engine: "toron".to_string(),
@@ -1676,6 +1906,9 @@ async fn run_perf_query_with_tables(
 		spill_bytes: execution.spill_bytes,
 		plan_fingerprint: Some(execution.plan_fingerprint),
 		digest: Some(digest),
+		output_row_count: Some(output_row_count),
+		output_schema_fingerprint,
+		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 	}
 }
@@ -1690,16 +1923,35 @@ pub async fn run_perf_query(
 	run_index: u32,
 	warmup: bool,
 ) -> Result<PerfAttempt, String> {
+	let spec = build_perf_query_spec(query, mode, scale_factor)?;
+	Ok(run_perf_query_with_tables(
+		spec.query_id,
+		mode,
+		scale_factor,
+		run_index,
+		warmup,
+		spec.sql,
+		spec.tables,
+	)
+	.await)
+}
+
+pub fn build_perf_query_spec(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+) -> Result<PerfQuerySpec, String> {
 	let strict = match mode {
 		"strict" => true,
 		"dev" => false,
 		other => return Err(format!("perf --mode {other} is not supported")),
 	};
 	let (query_id, sql, tables) = perf_query_spec(query, strict, scale_factor)?;
-	Ok(
-		run_perf_query_with_tables(query_id, mode, scale_factor, run_index, warmup, sql, tables)
-			.await,
-	)
+	Ok(PerfQuerySpec {
+		query_id,
+		sql,
+		tables,
+	})
 }
 
 fn perf_query_spec(
@@ -9454,6 +9706,8 @@ mod adr356_perf_rail {
 		assert!(first.digest.is_some());
 		assert!(first.plan_fingerprint.is_some());
 		assert_eq!(first.plan_fingerprint, second.plan_fingerprint);
+		assert!(first.output_row_count.is_some());
+		assert!(first.output_schema_fingerprint.is_some());
 
 		let row = first.json_value();
 		assert_eq!(row["engine"], "toron");
@@ -9461,6 +9715,37 @@ mod adr356_perf_rail {
 		assert!(row["execute_ms"].as_f64().expect("execute_ms") > 0.0);
 		assert!(row.get("elapsed_ms").is_none());
 		assert_eq!(row["spill_bytes"], 0);
+		assert!(row["output_row_count"].as_u64().expect("row count") > 0);
+		assert!(
+			row["output_schema_fingerprint"]
+				.as_str()
+				.expect("schema fingerprint")
+				.starts_with("fnv1a64:")
+		);
+	}
+
+	#[test]
+	fn parquet_export_manifest_matches_exact_perf_tables() {
+		let root =
+			std::env::temp_dir().join(format!("toron_tpch_adr358_export_{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let export = export_perf_query_parquet("q06", "strict", 0.01, &root).expect("export");
+		assert_eq!(export.query_id, "q06");
+		assert_eq!(export.tables.len(), 1);
+		let lineitem = &export.tables[0];
+		assert_eq!(lineitem.name, "lineitem");
+		assert!(lineitem.row_count > 0);
+		assert!(lineitem.path.exists());
+		assert!(export.manifest_path.exists());
+		assert!(lineitem.schema_signature.contains("l_shipdate:DATE"));
+		assert!(
+			lineitem
+				.schema_signature
+				.contains("l_extendedprice:DECIMAL(15,2)")
+		);
+		assert!(lineitem.file_hash.starts_with("fnv1a64:"));
+		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }
 
