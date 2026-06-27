@@ -17,12 +17,15 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use arrow::array::{
-	Array, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+	Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
+	StringArray, new_null_array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use parquet::arrow::ArrowWriter;
+use futures::{StreamExt, stream};
+use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::file::properties::WriterProperties;
 use tpchgen::generators::{
 	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
 	PartSuppGenerator, RegionGenerator, SupplierGenerator,
@@ -41,6 +44,7 @@ use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
+	pbc::{OP_PROJECT, Program},
 };
 
 use telemetry::{
@@ -50,6 +54,9 @@ use telemetry::{
 
 /// Default cache / output root — always under `target/`, never a tracked path.
 pub const CACHE_ROOT: &str = "target/tpch";
+
+const TPCH_PERSISTED_CHUNK_ROWS: usize = 65_536;
+const TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES: u64 = 16 * 64 * 1024 * 1024;
 
 /// The 22 TPC-H query IDs (the reachability inventory).
 pub const ALL_QUERY_IDS: [&str; 22] = [
@@ -1307,6 +1314,180 @@ impl StorageScan for HarnessScan {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct ParquetHarnessTableSource {
+	pub name: String,
+	pub path: PathBuf,
+	pub schema: SchemaRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParquetHarnessScan {
+	pub tables: HashMap<TableId, ParquetHarnessTableSource>,
+}
+
+fn append_projection_to_pbc(
+	bytecode: &mut Vec<u8>,
+	projected_columns: &[toron::ir::ColumnOrdinal],
+) -> Result<(), StorageError> {
+	let projection_len =
+		u16::try_from(projected_columns.len()).map_err(|_| StorageError::InvalidPbcProgram {
+			message: "projection column count exceeds u16::MAX".to_string(),
+		})?;
+	bytecode.push(OP_PROJECT);
+	bytecode.extend_from_slice(&projection_len.to_le_bytes());
+	for column in projected_columns {
+		bytecode.extend_from_slice(&column.0.to_le_bytes());
+	}
+	Ok(())
+}
+
+#[async_trait]
+impl StorageScan for ParquetHarnessScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		let source =
+			self.tables
+				.get(&request.table_id)
+				.cloned()
+				.ok_or(StorageError::TableNotFound {
+					table: request.table_id,
+				})?;
+
+		let projected_columns = request.projected_columns.clone();
+		let mut pbc = request.pbc_predicate.clone();
+		let full_column_count = source.schema.fields().len();
+		let pbc_projection = if let Some(program) = &mut pbc {
+			let compiled =
+				Program::compile(program).map_err(|error| StorageError::InvalidPbcProgram {
+					message: format!("{error:?}"),
+				})?;
+			let mut columns = match &projected_columns {
+				Some(projected) => projected
+					.iter()
+					.map(|column| column.0 as usize)
+					.collect::<Vec<_>>(),
+				None => (0..full_column_count).collect::<Vec<_>>(),
+			};
+			for column in compiled.referenced_columns() {
+				columns.push(column as usize);
+			}
+			columns.sort_unstable();
+			columns.dedup();
+			if let Some(projected) = &projected_columns {
+				append_projection_to_pbc(program, projected)?;
+			}
+			Some(columns)
+		} else {
+			None
+		};
+		let output_schema = if let Some(columns) = &projected_columns {
+			let indices = columns
+				.iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			Arc::new(source.schema.as_ref().project(&indices)?)
+		} else {
+			source.schema.clone()
+		};
+
+		let file = File::open(&source.path).map_err(|error| StorageError::Internal {
+			message: format!("open parquet {}: {error}", source.path.display()),
+		})?;
+		let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+			StorageError::Internal {
+				message: format!("read parquet metadata {}: {error}", source.path.display()),
+			}
+		})?;
+		if let Some(columns) = &pbc_projection {
+			if columns.len() < full_column_count {
+				let mask = ProjectionMask::leaves(builder.parquet_schema(), columns.clone());
+				builder = builder.with_projection(mask);
+			}
+		} else if let Some(columns) = &projected_columns {
+			let leaves = columns
+				.iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves);
+			builder = builder.with_projection(mask);
+		}
+		let reader = builder.build().map_err(|error| StorageError::Internal {
+			message: format!("open parquet reader {}: {error}", source.path.display()),
+		})?;
+		let full_schema = source.schema.clone();
+		let stream = stream::iter(reader.map(move |batch| {
+			let batch = batch.map_err(|error| StorageError::Internal {
+				message: format!("read parquet batch {}: {error}", source.path.display()),
+			})?;
+			let batch = if let Some(program) = &pbc {
+				let batch = if let Some(columns) = &pbc_projection {
+					inflate_projected_parquet_batch(batch, full_schema.clone(), columns)?
+				} else {
+					batch
+				};
+				wendelon::schema::pbc::execute(program, &batch).map_err(|error| {
+					StorageError::InvalidPbcProgram {
+						message: format!("{error:?}"),
+					}
+				})
+			} else {
+				Ok(batch)
+			}?;
+			Ok(batch)
+		})
+		.scan(0_u64, |yielded_bytes, batch| {
+			Some(match batch {
+				Ok(batch) => {
+					*yielded_bytes += batch.get_array_memory_size() as u64;
+					if *yielded_bytes > TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES {
+						Err(StorageError::Internal {
+							message: format!(
+								"BudgetExhausted {{ dimension: Memory, producer: \"persisted parquet scan output accumulator\", requested: ByteCount({}), available: ByteCount({}) }}",
+								*yielded_bytes, TPCH_PERSISTED_SCAN_OUTPUT_BUDGET_BYTES
+							),
+						})
+					} else {
+						Ok(batch)
+					}
+				}
+				Err(error) => Err(error),
+			})
+		}))
+		.boxed();
+
+		Ok(ScanStream::new(
+			output_schema,
+			request.session_id,
+			request.query_id,
+			stream,
+		))
+	}
+}
+
+fn inflate_projected_parquet_batch(
+	batch: RecordBatch,
+	full_schema: SchemaRef,
+	columns: &[usize],
+) -> Result<RecordBatch, StorageError> {
+	if columns.len() == full_schema.fields().len() {
+		return Ok(batch);
+	}
+	let mut arrays = Vec::with_capacity(full_schema.fields().len());
+	let mut projected_index = 0;
+	for column in 0..full_schema.fields().len() {
+		if projected_index < columns.len() && columns[projected_index] == column {
+			arrays.push(batch.column(projected_index).clone());
+			projected_index += 1;
+		} else {
+			arrays.push(new_null_array(
+				full_schema.field(column).data_type(),
+				batch.num_rows(),
+			));
+		}
+	}
+	RecordBatch::try_new(full_schema, arrays).map_err(StorageError::from)
+}
+
 /// Run a Q6 variant single-node over a pre-built fixture, recording the deepest phase reached. A stage
 /// error is classified against the recognized-blocker allowlist: a recognized reason is `blocked`,
 /// anything else is `fail`. Shared by the dev (Float64) and strict (Decimal128) runs.
@@ -1348,6 +1529,45 @@ pub struct TpchParquetExport {
 	pub tables: Vec<TpchParquetTableExport>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TpchPersistedTable {
+	pub name: String,
+	pub path: PathBuf,
+	pub row_count: u64,
+	pub logical_bytes: u64,
+	pub schema_fingerprint: String,
+	pub schema_signature: String,
+	pub file_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TpchPersistedDataset {
+	pub mode: String,
+	pub scale_factor: f64,
+	pub root_dir: PathBuf,
+	pub manifest_path: PathBuf,
+	pub manifest_fingerprint: String,
+	pub tables: BTreeMap<String, TpchPersistedTable>,
+}
+
+/// A query table registration decoupled from the in-memory fixture batch. Persisted scans seed the same
+/// catalog descriptors/facts as [`HarnessTable`] without constructing a full `RecordBatch`.
+#[derive(Debug, Clone)]
+pub struct HarnessTableMetadata {
+	pub id: TableId,
+	pub name: &'static str,
+	pub descriptor: TableSchemaDescriptor,
+	pub facts: TableOptimizerFacts,
+}
+
+pub struct PersistedPerfQuerySpec {
+	pub query_id: &'static str,
+	pub sql: &'static str,
+	pub tables: Vec<HarnessTableMetadata>,
+	pub storage: Arc<ParquetHarnessScan>,
+	pub export: TpchParquetExport,
+}
+
 pub fn stable_fingerprint(text: &str) -> String {
 	let mut hash = FNV_OFFSET;
 	for byte in text.as_bytes() {
@@ -1382,6 +1602,1049 @@ fn stable_file_hash(path: &Path) -> Result<String, String> {
 		hash = fnv1a_update(hash, &buffer[..read]);
 	}
 	Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn dataset_sf_dir_name(scale_factor: f64) -> String {
+	format!("sf{}", scale_factor.to_string().replace('.', "_"))
+}
+
+fn persisted_dataset_dir(root: &Path, mode: &str, scale_factor: f64) -> PathBuf {
+	root.join(mode).join(dataset_sf_dir_name(scale_factor))
+}
+
+fn table_schema_for_name(name: &str, strict: bool) -> Result<SchemaRef, String> {
+	match name {
+		"lineitem" if strict => Ok(strict_lineitem_schema()),
+		"lineitem" => Ok(dev_lineitem_schema()),
+		"part" => Ok(part_schema()),
+		"customer" => Ok(customer_schema(strict)),
+		"orders" => Ok(orders_schema(strict)),
+		"nation" => Ok(nation_schema()),
+		"supplier" => Ok(supplier_schema(strict)),
+		"partsupp" => Ok(partsupp_schema(strict)),
+		"region" => Ok(region_schema()),
+		other => Err(format!("unknown TPC-H table {other:?}")),
+	}
+}
+
+fn table_descriptor_for_name(name: &str, strict: bool) -> Result<TableSchemaDescriptor, String> {
+	let schema = table_schema_for_name(name, strict)?;
+	match name {
+		"lineitem" if strict => Ok(strict_lineitem_descriptor(schema.as_ref())),
+		"lineitem" => Ok(dev_lineitem_descriptor(schema.as_ref())),
+		"part" => Ok(part_descriptor(schema.as_ref())),
+		"customer" => Ok(customer_descriptor(schema.as_ref())),
+		"orders" => Ok(orders_descriptor(schema.as_ref())),
+		"nation" => Ok(nation_descriptor(schema.as_ref())),
+		"supplier" => Ok(supplier_descriptor(schema.as_ref())),
+		"partsupp" => Ok(partsupp_descriptor(schema.as_ref())),
+		"region" => Ok(region_descriptor(schema.as_ref())),
+		other => Err(format!("unknown TPC-H table {other:?}")),
+	}
+}
+
+fn table_facts_from_manifest(table: &TpchPersistedTable) -> TableOptimizerFacts {
+	TableOptimizerFacts {
+		row_upper_bound: Some(RowCount::new(table.row_count)),
+		byte_upper_bound: Some(ByteCount::new(table.logical_bytes)),
+		..Default::default()
+	}
+}
+
+fn persisted_table_metadata(
+	dataset: &TpchPersistedDataset,
+	strict: bool,
+	id: TableId,
+	name: &'static str,
+) -> Result<HarnessTableMetadata, String> {
+	let table = dataset
+		.tables
+		.get(name)
+		.ok_or_else(|| format!("persisted dataset is missing table {name}"))?;
+	Ok(HarnessTableMetadata {
+		id,
+		name,
+		descriptor: table_descriptor_for_name(name, strict)?,
+		facts: table_facts_from_manifest(table),
+	})
+}
+
+fn persisted_query_tables(
+	dataset: &TpchPersistedDataset,
+	strict: bool,
+	tables: &[(u64, &'static str)],
+) -> Result<Vec<HarnessTableMetadata>, String> {
+	tables
+		.iter()
+		.map(|(id, name)| persisted_table_metadata(dataset, strict, TableId(*id), name))
+		.collect()
+}
+
+fn persisted_query_table_names(query: &str) -> Result<Vec<(u64, &'static str)>, String> {
+	let tables = match query {
+		"q01" | "q1" | "q06" | "q6" => vec![(1, "lineitem")],
+		"q02" | "q2" => vec![
+			(1, "part"),
+			(2, "supplier"),
+			(3, "partsupp"),
+			(4, "nation"),
+			(5, "region"),
+		],
+		"q03" | "q3" | "q18" => vec![(1, "lineitem"), (2, "customer"), (3, "orders")],
+		"q04" | "q4" | "q12" => vec![(1, "lineitem"), (3, "orders")],
+		"q05" | "q5" => vec![
+			(1, "lineitem"),
+			(2, "customer"),
+			(3, "orders"),
+			(4, "nation"),
+			(5, "supplier"),
+			(6, "region"),
+		],
+		"q07" | "q7" => vec![
+			(1, "lineitem"),
+			(2, "customer"),
+			(3, "orders"),
+			(4, "nation"),
+			(5, "supplier"),
+		],
+		"q08" | "q8" => vec![
+			(1, "lineitem"),
+			(2, "customer"),
+			(3, "orders"),
+			(4, "nation"),
+			(5, "supplier"),
+			(6, "region"),
+			(7, "part"),
+		],
+		"q09" | "q9" => vec![
+			(1, "part"),
+			(2, "supplier"),
+			(3, "lineitem"),
+			(4, "partsupp"),
+			(5, "orders"),
+			(6, "nation"),
+		],
+		"q10" => vec![
+			(1, "lineitem"),
+			(2, "customer"),
+			(3, "orders"),
+			(4, "nation"),
+		],
+		"q11" => vec![(1, "partsupp"), (2, "supplier"), (3, "nation")],
+		"q13" | "q22" => vec![(1, "customer"), (2, "orders")],
+		"q14" | "q17" | "q19" => vec![(1, "lineitem"), (2, "part")],
+		"q15" => vec![(1, "supplier"), (2, "lineitem")],
+		"q16" => vec![(1, "part"), (2, "partsupp"), (3, "supplier")],
+		"q20" => vec![
+			(1, "supplier"),
+			(2, "nation"),
+			(3, "partsupp"),
+			(4, "part"),
+			(5, "lineitem"),
+		],
+		"q21" => vec![
+			(1, "supplier"),
+			(2, "lineitem"),
+			(3, "orders"),
+			(4, "nation"),
+		],
+		other => return Err(format!("perf --query {other} is not supported")),
+	};
+	Ok(tables)
+}
+
+fn manifest_signature_for_tables(
+	mode: &str,
+	scale_factor: f64,
+	tables: &BTreeMap<String, TpchPersistedTable>,
+) -> String {
+	let table_signature = tables
+		.values()
+		.map(|table| {
+			format!(
+				"{}:{}:{}:{}:{}",
+				table.name,
+				table.row_count,
+				table.logical_bytes,
+				table.schema_fingerprint,
+				table.file_hash
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("|");
+	format!("suite=tpch_persisted_dataset;mode={mode};sf={scale_factor};tables={table_signature}")
+}
+
+fn manifest_fingerprint_for_tables(
+	mode: &str,
+	scale_factor: f64,
+	tables: &BTreeMap<String, TpchPersistedTable>,
+) -> String {
+	stable_fingerprint(&manifest_signature_for_tables(mode, scale_factor, tables))
+}
+
+pub fn load_persisted_tpch_dataset(
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<TpchPersistedDataset, String> {
+	let root_dir = persisted_dataset_dir(root, mode, scale_factor);
+	let manifest_path = root_dir.join("manifest.json");
+	let body = std::fs::read_to_string(&manifest_path)
+		.map_err(|error| format!("read {}: {error}", manifest_path.display()))?;
+	let value: serde_json::Value = serde_json::from_str(&body)
+		.map_err(|error| format!("parse {}: {error}", manifest_path.display()))?;
+	if value.get("suite").and_then(serde_json::Value::as_str) != Some("tpch_persisted_dataset") {
+		return Err(format!(
+			"{} is not a persisted TPC-H manifest",
+			manifest_path.display()
+		));
+	}
+	let manifest_mode = value
+		.get("mode")
+		.and_then(serde_json::Value::as_str)
+		.ok_or_else(|| format!("{} missing mode", manifest_path.display()))?;
+	if manifest_mode != mode {
+		return Err(format!(
+			"{} mode mismatch: manifest={manifest_mode:?} requested={mode:?}",
+			manifest_path.display()
+		));
+	}
+	let manifest_sf = value
+		.get("scale_factor")
+		.and_then(serde_json::Value::as_f64)
+		.ok_or_else(|| format!("{} missing scale_factor", manifest_path.display()))?;
+	if (manifest_sf - scale_factor).abs() > f64::EPSILON {
+		return Err(format!(
+			"{} scale mismatch: manifest={manifest_sf} requested={scale_factor}",
+			manifest_path.display()
+		));
+	}
+
+	let mut tables = BTreeMap::new();
+	let table_values = value
+		.get("tables")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| format!("{} missing tables", manifest_path.display()))?;
+	for table in table_values {
+		let name = table
+			.get("name")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("{} table missing name", manifest_path.display()))?
+			.to_string();
+		let path = table
+			.get("path")
+			.and_then(serde_json::Value::as_str)
+			.map(PathBuf::from)
+			.ok_or_else(|| format!("{} table {name} missing path", manifest_path.display()))?;
+		let row_count = table
+			.get("row_count")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| format!("{} table {name} missing row_count", manifest_path.display()))?;
+		let logical_bytes = table
+			.get("logical_bytes")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| {
+				format!(
+					"{} table {name} missing logical_bytes",
+					manifest_path.display()
+				)
+			})?;
+		let schema_fingerprint = table
+			.get("schema_fingerprint")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| {
+				format!(
+					"{} table {name} missing schema_fingerprint",
+					manifest_path.display()
+				)
+			})?
+			.to_string();
+		let schema_signature = table
+			.get("schema_signature")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| {
+				format!(
+					"{} table {name} missing schema_signature",
+					manifest_path.display()
+				)
+			})?
+			.to_string();
+		let file_hash = table
+			.get("file_hash")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("{} table {name} missing file_hash", manifest_path.display()))?
+			.to_string();
+		if !path.exists() {
+			return Err(format!(
+				"manifest table {name} path does not exist: {}",
+				path.display()
+			));
+		}
+		let observed_hash = stable_file_hash(&path)?;
+		if observed_hash != file_hash {
+			return Err(format!(
+				"manifest table {name} hash mismatch: manifest={file_hash} observed={observed_hash}"
+			));
+		}
+		tables.insert(
+			name.clone(),
+			TpchPersistedTable {
+				name,
+				path,
+				row_count,
+				logical_bytes,
+				schema_fingerprint,
+				schema_signature,
+				file_hash,
+			},
+		);
+	}
+	let manifest_fingerprint = manifest_fingerprint_for_tables(mode, scale_factor, &tables);
+	let recorded = value
+		.get("manifest_fingerprint")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("");
+	if recorded != manifest_fingerprint {
+		return Err(format!(
+			"{} manifest fingerprint mismatch: manifest={recorded} observed={manifest_fingerprint}",
+			manifest_path.display()
+		));
+	}
+	Ok(TpchPersistedDataset {
+		mode: mode.to_string(),
+		scale_factor,
+		root_dir,
+		manifest_path,
+		manifest_fingerprint,
+		tables,
+	})
+}
+
+pub fn prepare_persisted_tpch_dataset(
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<TpchPersistedDataset, String> {
+	match mode {
+		"strict" | "dev" => {}
+		other => return Err(format!("persisted data mode {other:?} is not supported")),
+	}
+	if let Ok(dataset) = load_persisted_tpch_dataset(mode, scale_factor, root) {
+		return Ok(dataset);
+	}
+	let strict = mode == "strict";
+	let root_dir = persisted_dataset_dir(root, mode, scale_factor);
+	std::fs::create_dir_all(&root_dir)
+		.map_err(|error| format!("create {}: {error}", root_dir.display()))?;
+
+	let table_names = [
+		"lineitem", "part", "customer", "orders", "nation", "supplier", "partsupp", "region",
+	];
+	let mut tables = BTreeMap::new();
+	for name in table_names {
+		let path = root_dir.join(format!("{name}.parquet"));
+		let schema = table_schema_for_name(name, strict)?;
+		let stats = write_persisted_table(name, strict, scale_factor, schema.clone(), &path)?;
+		let signature = schema_signature(schema.as_ref());
+		tables.insert(
+			name.to_string(),
+			TpchPersistedTable {
+				name: name.to_string(),
+				path: path.clone(),
+				row_count: stats.row_count,
+				logical_bytes: stats.logical_bytes,
+				schema_fingerprint: stable_fingerprint(&signature),
+				schema_signature: signature,
+				file_hash: stable_file_hash(&path)?,
+			},
+		);
+	}
+
+	let manifest_fingerprint = manifest_fingerprint_for_tables(mode, scale_factor, &tables);
+	let manifest_path = root_dir.join("manifest.json");
+	let manifest_tables = tables
+		.values()
+		.map(|table| {
+			serde_json::json!({
+				"name": table.name,
+				"path": table.path.display().to_string(),
+				"row_count": table.row_count,
+				"logical_bytes": table.logical_bytes,
+				"schema_fingerprint": table.schema_fingerprint,
+				"schema_signature": table.schema_signature,
+				"file_hash": table.file_hash,
+			})
+		})
+		.collect::<Vec<_>>();
+	let manifest = serde_json::json!({
+		"suite": "tpch_persisted_dataset",
+		"mode": mode,
+		"scale_factor": scale_factor,
+		"manifest_fingerprint": manifest_fingerprint,
+		"chunk_rows": TPCH_PERSISTED_CHUNK_ROWS,
+		"tables": manifest_tables,
+	});
+	let body = serde_json::to_string_pretty(&manifest)
+		.map_err(|error| format!("encode {}: {error}", manifest_path.display()))?;
+	std::fs::write(&manifest_path, format!("{body}\n"))
+		.map_err(|error| format!("write {}: {error}", manifest_path.display()))?;
+	Ok(TpchPersistedDataset {
+		mode: mode.to_string(),
+		scale_factor,
+		root_dir,
+		manifest_path,
+		manifest_fingerprint,
+		tables,
+	})
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PersistedWriteStats {
+	row_count: u64,
+	logical_bytes: u64,
+}
+
+impl PersistedWriteStats {
+	fn add_batch(&mut self, batch: &RecordBatch) {
+		self.row_count += batch.num_rows() as u64;
+		self.logical_bytes += batch.get_array_memory_size() as u64;
+	}
+}
+
+fn decimal_array(values: Vec<i128>) -> ArrayRef {
+	Arc::new(
+		Decimal128Array::from(values)
+			.with_precision_and_scale(15, 2)
+			.expect("decimal128 column"),
+	)
+}
+
+fn parquet_writer(path: &Path, schema: SchemaRef) -> Result<ArrowWriter<File>, String> {
+	let file = File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+	let properties = WriterProperties::builder()
+		.set_max_row_group_row_count(Some(TPCH_PERSISTED_CHUNK_ROWS))
+		.build();
+	ArrowWriter::try_new(file, schema, Some(properties))
+		.map_err(|error| format!("create parquet writer for {}: {error}", path.display()))
+}
+
+fn write_batch(
+	writer: &mut ArrowWriter<File>,
+	path: &Path,
+	batch: &RecordBatch,
+	stats: &mut PersistedWriteStats,
+) -> Result<(), String> {
+	stats.add_batch(batch);
+	writer
+		.write(batch)
+		.map_err(|error| format!("write parquet {}: {error}", path.display()))
+}
+
+fn write_persisted_table(
+	name: &str,
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	match name {
+		"lineitem" => write_lineitem_parquet(strict, scale_factor, schema, path),
+		"part" => write_part_parquet(scale_factor, schema, path),
+		"customer" => write_customer_parquet(strict, scale_factor, schema, path),
+		"orders" => write_orders_parquet(strict, scale_factor, schema, path),
+		"nation" => write_nation_parquet(scale_factor, schema, path),
+		"supplier" => write_supplier_parquet(strict, scale_factor, schema, path),
+		"partsupp" => write_partsupp_parquet(strict, scale_factor, schema, path),
+		"region" => write_region_parquet(scale_factor, schema, path),
+		other => Err(format!("cannot persist unknown TPC-H table {other:?}")),
+	}
+}
+
+struct LineitemChunk {
+	quantity_dev: Vec<f64>,
+	quantity_strict: Vec<i128>,
+	extendedprice_dev: Vec<f64>,
+	extendedprice_strict: Vec<i128>,
+	discount_dev: Vec<f64>,
+	discount_strict: Vec<i128>,
+	shipdate: Vec<i32>,
+	returnflag: Vec<String>,
+	linestatus: Vec<String>,
+	tax_dev: Vec<f64>,
+	tax_strict: Vec<i128>,
+	partkey: Vec<i64>,
+	orderkey: Vec<i64>,
+	suppkey: Vec<i64>,
+	commitdate: Vec<i32>,
+	receiptdate: Vec<i32>,
+	shipmode: Vec<String>,
+	shipinstruct: Vec<String>,
+}
+
+impl LineitemChunk {
+	fn new() -> Self {
+		Self {
+			quantity_dev: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			quantity_strict: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			extendedprice_dev: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			extendedprice_strict: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			discount_dev: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			discount_strict: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			shipdate: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			returnflag: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			linestatus: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			tax_dev: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			tax_strict: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			partkey: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			orderkey: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			suppkey: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			commitdate: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			receiptdate: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			shipmode: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+			shipinstruct: Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS),
+		}
+	}
+
+	fn len(&self) -> usize {
+		self.shipdate.len()
+	}
+
+	fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	fn push(&mut self, item: tpchgen::generators::LineItem<'_>, strict: bool) {
+		if strict {
+			self.quantity_strict.push(item.l_quantity as i128 * 100);
+			self.extendedprice_strict
+				.push(item.l_extendedprice.into_inner() as i128);
+			self.discount_strict
+				.push(item.l_discount.into_inner() as i128);
+			self.tax_strict.push(item.l_tax.into_inner() as i128);
+		} else {
+			self.quantity_dev.push(item.l_quantity as f64);
+			self.extendedprice_dev.push(item.l_extendedprice.as_f64());
+			self.discount_dev.push(item.l_discount.as_f64());
+			self.tax_dev.push(item.l_tax.as_f64());
+		}
+		self.shipdate.push(item.l_shipdate.to_unix_epoch());
+		self.returnflag.push(item.l_returnflag.to_string());
+		self.linestatus.push(item.l_linestatus.to_string());
+		self.partkey.push(item.l_partkey);
+		self.orderkey.push(item.l_orderkey);
+		self.suppkey.push(item.l_suppkey);
+		self.commitdate.push(item.l_commitdate.to_unix_epoch());
+		self.receiptdate.push(item.l_receiptdate.to_unix_epoch());
+		self.shipmode.push(item.l_shipmode.to_string());
+		self.shipinstruct.push(item.l_shipinstruct.to_string());
+	}
+
+	fn flush(
+		&mut self,
+		strict: bool,
+		schema: SchemaRef,
+		writer: &mut ArrowWriter<File>,
+		path: &Path,
+		stats: &mut PersistedWriteStats,
+	) -> Result<(), String> {
+		if self.is_empty() {
+			return Ok(());
+		}
+		let quantity: ArrayRef = if strict {
+			decimal_array(std::mem::take(&mut self.quantity_strict))
+		} else {
+			Arc::new(Float64Array::from(std::mem::take(&mut self.quantity_dev)))
+		};
+		let extendedprice: ArrayRef = if strict {
+			decimal_array(std::mem::take(&mut self.extendedprice_strict))
+		} else {
+			Arc::new(Float64Array::from(std::mem::take(
+				&mut self.extendedprice_dev,
+			)))
+		};
+		let discount: ArrayRef = if strict {
+			decimal_array(std::mem::take(&mut self.discount_strict))
+		} else {
+			Arc::new(Float64Array::from(std::mem::take(&mut self.discount_dev)))
+		};
+		let tax: ArrayRef = if strict {
+			decimal_array(std::mem::take(&mut self.tax_strict))
+		} else {
+			Arc::new(Float64Array::from(std::mem::take(&mut self.tax_dev)))
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				quantity,
+				extendedprice,
+				discount,
+				Arc::new(Date32Array::from(std::mem::take(&mut self.shipdate))),
+				Arc::new(StringArray::from(std::mem::take(&mut self.returnflag))),
+				Arc::new(StringArray::from(std::mem::take(&mut self.linestatus))),
+				tax,
+				Arc::new(Int64Array::from(std::mem::take(&mut self.partkey))),
+				Arc::new(Int64Array::from(std::mem::take(&mut self.orderkey))),
+				Arc::new(Int64Array::from(std::mem::take(&mut self.suppkey))),
+				Arc::new(Date32Array::from(std::mem::take(&mut self.commitdate))),
+				Arc::new(Date32Array::from(std::mem::take(&mut self.receiptdate))),
+				Arc::new(StringArray::from(std::mem::take(&mut self.shipmode))),
+				Arc::new(StringArray::from(std::mem::take(&mut self.shipinstruct))),
+			],
+		)
+		.map_err(|error| format!("build persisted lineitem batch: {error}"))?;
+		write_batch(writer, path, &batch, stats)
+	}
+}
+
+fn write_lineitem_parquet(
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut chunk = LineitemChunk::new();
+	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		chunk.push(item, strict);
+		if chunk.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			chunk.flush(strict, schema.clone(), &mut writer, path, &mut stats)?;
+		}
+	}
+	chunk.flush(strict, schema, &mut writer, path, &mut stats)?;
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_part_parquet(
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut partkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut part_type = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut brand = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut container = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut size = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut mfgr = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut name = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in PartGenerator::new(scale_factor, 1, 1).iter() {
+		partkey.push(item.p_partkey);
+		part_type.push(item.p_type.to_string());
+		brand.push(item.p_brand.to_string());
+		container.push(item.p_container.to_string());
+		size.push(item.p_size);
+		mfgr.push(item.p_mfgr.to_string());
+		name.push(item.p_name.to_string());
+		if partkey.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			let batch = RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(std::mem::take(&mut partkey))),
+					Arc::new(StringArray::from(std::mem::take(&mut part_type))),
+					Arc::new(StringArray::from(std::mem::take(&mut brand))),
+					Arc::new(StringArray::from(std::mem::take(&mut container))),
+					Arc::new(Int32Array::from(std::mem::take(&mut size))),
+					Arc::new(StringArray::from(std::mem::take(&mut mfgr))),
+					Arc::new(StringArray::from(std::mem::take(&mut name))),
+				],
+			)
+			.map_err(|error| format!("build persisted part batch: {error}"))?;
+			write_batch(&mut writer, path, &batch, &mut stats)?;
+		}
+	}
+	if !partkey.is_empty() {
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(partkey)),
+				Arc::new(StringArray::from(part_type)),
+				Arc::new(StringArray::from(brand)),
+				Arc::new(StringArray::from(container)),
+				Arc::new(Int32Array::from(size)),
+				Arc::new(StringArray::from(mfgr)),
+				Arc::new(StringArray::from(name)),
+			],
+		)
+		.map_err(|error| format!("build persisted part batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_customer_parquet(
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut custkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut mktsegment = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut name = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut acctbal_dev = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut acctbal_strict = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut address = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut phone = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut comment = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut nationkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in CustomerGenerator::new(scale_factor, 1, 1).iter() {
+		custkey.push(item.c_custkey);
+		mktsegment.push(item.c_mktsegment.to_string());
+		name.push(item.c_name.to_string());
+		if strict {
+			acctbal_strict.push(item.c_acctbal.into_inner() as i128);
+		} else {
+			acctbal_dev.push(item.c_acctbal.as_f64());
+		}
+		address.push(item.c_address.to_string());
+		phone.push(item.c_phone.to_string());
+		comment.push(item.c_comment.to_string());
+		nationkey.push(item.c_nationkey);
+		if custkey.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			let acctbal: ArrayRef = if strict {
+				decimal_array(std::mem::take(&mut acctbal_strict))
+			} else {
+				Arc::new(Float64Array::from(std::mem::take(&mut acctbal_dev)))
+			};
+			let batch = RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(std::mem::take(&mut custkey))),
+					Arc::new(StringArray::from(std::mem::take(&mut mktsegment))),
+					Arc::new(StringArray::from(std::mem::take(&mut name))),
+					acctbal,
+					Arc::new(StringArray::from(std::mem::take(&mut address))),
+					Arc::new(StringArray::from(std::mem::take(&mut phone))),
+					Arc::new(StringArray::from(std::mem::take(&mut comment))),
+					Arc::new(Int64Array::from(std::mem::take(&mut nationkey))),
+				],
+			)
+			.map_err(|error| format!("build persisted customer batch: {error}"))?;
+			write_batch(&mut writer, path, &batch, &mut stats)?;
+		}
+	}
+	if !custkey.is_empty() {
+		let acctbal: ArrayRef = if strict {
+			decimal_array(acctbal_strict)
+		} else {
+			Arc::new(Float64Array::from(acctbal_dev))
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(custkey)),
+				Arc::new(StringArray::from(mktsegment)),
+				Arc::new(StringArray::from(name)),
+				acctbal,
+				Arc::new(StringArray::from(address)),
+				Arc::new(StringArray::from(phone)),
+				Arc::new(StringArray::from(comment)),
+				Arc::new(Int64Array::from(nationkey)),
+			],
+		)
+		.map_err(|error| format!("build persisted customer batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_orders_parquet(
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut orderkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut custkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut orderdate = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut shippriority = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut orderpriority = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut comment = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut totalprice_dev = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut totalprice_strict = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut orderstatus = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in OrderGenerator::new(scale_factor, 1, 1).iter() {
+		orderkey.push(item.o_orderkey);
+		custkey.push(item.o_custkey);
+		orderdate.push(item.o_orderdate.to_unix_epoch());
+		shippriority.push(item.o_shippriority);
+		orderpriority.push(item.o_orderpriority.to_string());
+		comment.push(item.o_comment.to_string());
+		if strict {
+			totalprice_strict.push(item.o_totalprice.into_inner() as i128);
+		} else {
+			totalprice_dev.push(item.o_totalprice.as_f64());
+		}
+		orderstatus.push(item.o_orderstatus.to_string());
+		if orderkey.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			let totalprice: ArrayRef = if strict {
+				decimal_array(std::mem::take(&mut totalprice_strict))
+			} else {
+				Arc::new(Float64Array::from(std::mem::take(&mut totalprice_dev)))
+			};
+			let batch = RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(std::mem::take(&mut orderkey))),
+					Arc::new(Int64Array::from(std::mem::take(&mut custkey))),
+					Arc::new(Date32Array::from(std::mem::take(&mut orderdate))),
+					Arc::new(Int32Array::from(std::mem::take(&mut shippriority))),
+					Arc::new(StringArray::from(std::mem::take(&mut orderpriority))),
+					Arc::new(StringArray::from(std::mem::take(&mut comment))),
+					totalprice,
+					Arc::new(StringArray::from(std::mem::take(&mut orderstatus))),
+				],
+			)
+			.map_err(|error| format!("build persisted orders batch: {error}"))?;
+			write_batch(&mut writer, path, &batch, &mut stats)?;
+		}
+	}
+	if !orderkey.is_empty() {
+		let totalprice: ArrayRef = if strict {
+			decimal_array(totalprice_strict)
+		} else {
+			Arc::new(Float64Array::from(totalprice_dev))
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(orderkey)),
+				Arc::new(Int64Array::from(custkey)),
+				Arc::new(Date32Array::from(orderdate)),
+				Arc::new(Int32Array::from(shippriority)),
+				Arc::new(StringArray::from(orderpriority)),
+				Arc::new(StringArray::from(comment)),
+				totalprice,
+				Arc::new(StringArray::from(orderstatus)),
+			],
+		)
+		.map_err(|error| format!("build persisted orders batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_nation_parquet(
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut nationkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut name = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut regionkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in NationGenerator::new(scale_factor, 1, 1).iter() {
+		nationkey.push(item.n_nationkey);
+		name.push(item.n_name.to_string());
+		regionkey.push(item.n_regionkey);
+	}
+	if !nationkey.is_empty() {
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(nationkey)),
+				Arc::new(StringArray::from(name)),
+				Arc::new(Int64Array::from(regionkey)),
+			],
+		)
+		.map_err(|error| format!("build persisted nation batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_supplier_parquet(
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut suppkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut nationkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut name = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut address = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut phone = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut acctbal_dev = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut acctbal_strict = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut comment = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in SupplierGenerator::new(scale_factor, 1, 1).iter() {
+		suppkey.push(item.s_suppkey);
+		nationkey.push(item.s_nationkey);
+		name.push(item.s_name.to_string());
+		address.push(item.s_address.to_string());
+		phone.push(item.s_phone.to_string());
+		if strict {
+			acctbal_strict.push(item.s_acctbal.into_inner() as i128);
+		} else {
+			acctbal_dev.push(item.s_acctbal.as_f64());
+		}
+		comment.push(item.s_comment.to_string());
+		if suppkey.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			let acctbal: ArrayRef = if strict {
+				decimal_array(std::mem::take(&mut acctbal_strict))
+			} else {
+				Arc::new(Float64Array::from(std::mem::take(&mut acctbal_dev)))
+			};
+			let batch = RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(std::mem::take(&mut suppkey))),
+					Arc::new(Int64Array::from(std::mem::take(&mut nationkey))),
+					Arc::new(StringArray::from(std::mem::take(&mut name))),
+					Arc::new(StringArray::from(std::mem::take(&mut address))),
+					Arc::new(StringArray::from(std::mem::take(&mut phone))),
+					acctbal,
+					Arc::new(StringArray::from(std::mem::take(&mut comment))),
+				],
+			)
+			.map_err(|error| format!("build persisted supplier batch: {error}"))?;
+			write_batch(&mut writer, path, &batch, &mut stats)?;
+		}
+	}
+	if !suppkey.is_empty() {
+		let acctbal: ArrayRef = if strict {
+			decimal_array(acctbal_strict)
+		} else {
+			Arc::new(Float64Array::from(acctbal_dev))
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(suppkey)),
+				Arc::new(Int64Array::from(nationkey)),
+				Arc::new(StringArray::from(name)),
+				Arc::new(StringArray::from(address)),
+				Arc::new(StringArray::from(phone)),
+				acctbal,
+				Arc::new(StringArray::from(comment)),
+			],
+		)
+		.map_err(|error| format!("build persisted supplier batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_partsupp_parquet(
+	strict: bool,
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut partkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut suppkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut availqty = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut supplycost_dev = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut supplycost_strict = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in PartSuppGenerator::new(scale_factor, 1, 1).iter() {
+		partkey.push(item.ps_partkey);
+		suppkey.push(item.ps_suppkey);
+		availqty.push(item.ps_availqty);
+		if strict {
+			supplycost_strict.push(item.ps_supplycost.into_inner() as i128);
+		} else {
+			supplycost_dev.push(item.ps_supplycost.as_f64());
+		}
+		if partkey.len() >= TPCH_PERSISTED_CHUNK_ROWS {
+			let supplycost: ArrayRef = if strict {
+				decimal_array(std::mem::take(&mut supplycost_strict))
+			} else {
+				Arc::new(Float64Array::from(std::mem::take(&mut supplycost_dev)))
+			};
+			let batch = RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(std::mem::take(&mut partkey))),
+					Arc::new(Int64Array::from(std::mem::take(&mut suppkey))),
+					Arc::new(Int32Array::from(std::mem::take(&mut availqty))),
+					supplycost,
+				],
+			)
+			.map_err(|error| format!("build persisted partsupp batch: {error}"))?;
+			write_batch(&mut writer, path, &batch, &mut stats)?;
+		}
+	}
+	if !partkey.is_empty() {
+		let supplycost: ArrayRef = if strict {
+			decimal_array(supplycost_strict)
+		} else {
+			Arc::new(Float64Array::from(supplycost_dev))
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(partkey)),
+				Arc::new(Int64Array::from(suppkey)),
+				Arc::new(Int32Array::from(availqty)),
+				supplycost,
+			],
+		)
+		.map_err(|error| format!("build persisted partsupp batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
+}
+
+fn write_region_parquet(
+	scale_factor: f64,
+	schema: SchemaRef,
+	path: &Path,
+) -> Result<PersistedWriteStats, String> {
+	let mut writer = parquet_writer(path, schema.clone())?;
+	let mut stats = PersistedWriteStats::default();
+	let mut regionkey = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	let mut name = Vec::with_capacity(TPCH_PERSISTED_CHUNK_ROWS);
+	for item in RegionGenerator::new(scale_factor, 1, 1).iter() {
+		regionkey.push(item.r_regionkey);
+		name.push(item.r_name.to_string());
+	}
+	if !regionkey.is_empty() {
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(regionkey)),
+				Arc::new(StringArray::from(name)),
+			],
+		)
+		.map_err(|error| format!("build persisted region batch: {error}"))?;
+		write_batch(&mut writer, path, &batch, &mut stats)?;
+	}
+	writer
+		.close()
+		.map_err(|error| format!("close parquet {}: {error}", path.display()))?;
+	Ok(stats)
 }
 
 fn canonical_sql_type(data_type: &DataType) -> String {
@@ -1633,6 +2896,26 @@ async fn execute_query_with_tables_timed(
 	sql: &str,
 	tables: Vec<HarnessTable>,
 ) -> Result<QueryExecution, StageError> {
+	let mut batches = HashMap::new();
+	let mut metadata = Vec::new();
+	for table in tables {
+		metadata.push(HarnessTableMetadata {
+			id: table.id,
+			name: table.name,
+			descriptor: table.descriptor,
+			facts: table.facts,
+		});
+		batches.insert(table.id, table.batch);
+	}
+	let storage: Arc<dyn StorageScan> = Arc::new(HarnessScan { batches });
+	execute_query_with_metadata_timed(sql, metadata, storage).await
+}
+
+async fn execute_query_with_metadata_timed(
+	sql: &str,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+) -> Result<QueryExecution, StageError> {
 	let total_start = Instant::now();
 	let mut timings = PerfPhaseTimings::default();
 	let mut plan_fingerprint = None;
@@ -1640,7 +2923,6 @@ async fn execute_query_with_tables_timed(
 
 	let load_start = Instant::now();
 	let mut catalog = MockCatalog::new();
-	let mut batches = HashMap::new();
 	for table in tables {
 		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
 			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
@@ -1660,9 +2942,7 @@ async fn execute_query_with_tables_timed(
 				spill_bytes,
 			));
 		}
-		batches.insert(table.id, table.batch);
 	}
-	let storage = Arc::new(HarnessScan { batches });
 	timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
 	let plan_start = Instant::now();
@@ -1913,6 +3193,112 @@ async fn run_perf_query_with_tables(
 	}
 }
 
+async fn run_perf_query_with_metadata(
+	query_id: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+	sql: &str,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+) -> PerfAttempt {
+	let mut execution = match execute_query_with_metadata_timed(sql, tables, storage).await {
+		Ok(execution) => execution,
+		Err(StageError {
+			phase,
+			reason,
+			message,
+			timings,
+			plan_fingerprint,
+			spill_bytes,
+		}) => {
+			return PerfAttempt {
+				engine: "toron".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase,
+				status: status_for_reason(&reason),
+				reason: Some(reason),
+				diagnostic_message: Some(message),
+				timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes,
+				plan_fingerprint,
+				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+
+	let digest_start = Instant::now();
+	let digest = match canonical_arrow_ipc_digest(&execution.batches, SortPolicy::FullRowLex) {
+		Ok(digest) => format!("{digest:?}"),
+		Err(error) => {
+			let message = format!("{error:?}");
+			let reason = reason_for_error(&message);
+			execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+			execution.timings.total_ms += execution.timings.digest_ms;
+			return PerfAttempt {
+				engine: "toron".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase: Phase::Execute,
+				status: status_for_reason(reason),
+				reason: Some(reason.to_string()),
+				diagnostic_message: Some(message),
+				timings: execution.timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes: execution.spill_bytes,
+				plan_fingerprint: Some(execution.plan_fingerprint),
+				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+	execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+	execution.timings.total_ms += execution.timings.digest_ms;
+	let output_row_count = output_row_count(&execution.batches);
+	let output_schema_fingerprint = output_schema_fingerprint(&execution.batches);
+
+	PerfAttempt {
+		engine: "toron".to_string(),
+		query: query_id.to_string(),
+		scale_factor,
+		mode: mode.to_string(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::Pass,
+		reason: None,
+		diagnostic_message: None,
+		timings: execution.timings,
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: execution.spill_bytes,
+		plan_fingerprint: Some(execution.plan_fingerprint),
+		digest: Some(digest),
+		output_row_count: Some(output_row_count),
+		output_schema_fingerprint,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
 /// Run one query through the performance rail. This uses the same SQL and fixture constructors as the
 /// reachability rail, but it bypasses reachability-only preflight assertions so the timed phases are strictly
 /// load, plan, bind, execute, and digest.
@@ -1936,6 +3322,113 @@ pub async fn run_perf_query(
 	.await)
 }
 
+pub async fn run_perf_query_with_data_source(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<PerfAttempt, String> {
+	match data_source {
+		"memory" => run_perf_query(query, mode, scale_factor, run_index, warmup).await,
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
+			Ok(run_perf_query_with_metadata(
+				spec.query_id,
+				mode,
+				scale_factor,
+				run_index,
+				warmup,
+				spec.sql,
+				spec.tables,
+				spec.storage,
+			)
+			.await)
+		}
+		other => Err(format!("perf --data-source {other:?} is not supported")),
+	}
+}
+
+pub fn build_persisted_perf_query_spec(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<PersistedPerfQuerySpec, String> {
+	let strict = match mode {
+		"strict" => true,
+		"dev" => false,
+		other => return Err(format!("perf --mode {other} is not supported")),
+	};
+	let dataset = prepare_persisted_tpch_dataset(mode, scale_factor, root)?;
+	let (query_id, sql) = perf_query_sql(query, strict)?;
+	let table_names = persisted_query_table_names(query)?;
+	let tables = persisted_query_tables(&dataset, strict, &table_names)?;
+	let mut scan_tables = HashMap::new();
+	let mut export_tables = Vec::new();
+	for table in &tables {
+		let persisted = dataset
+			.tables
+			.get(table.name)
+			.ok_or_else(|| format!("persisted dataset is missing table {}", table.name))?;
+		let schema = table_schema_for_name(table.name, strict)?;
+		scan_tables.insert(
+			table.id,
+			ParquetHarnessTableSource {
+				name: persisted.name.clone(),
+				path: persisted.path.clone(),
+				schema,
+			},
+		);
+		export_tables.push(TpchParquetTableExport {
+			name: persisted.name.clone(),
+			path: persisted.path.clone(),
+			row_count: persisted.row_count,
+			schema_fingerprint: persisted.schema_fingerprint.clone(),
+			schema_signature: persisted.schema_signature.clone(),
+			file_hash: persisted.file_hash.clone(),
+		});
+	}
+	let export = TpchParquetExport {
+		query_id: query_id.to_string(),
+		mode: mode.to_string(),
+		scale_factor,
+		sql: sql.to_string(),
+		root_dir: dataset.root_dir.clone(),
+		manifest_path: dataset.manifest_path.clone(),
+		manifest_fingerprint: stable_fingerprint(&format!(
+			"query={query_id};dataset={};tables={}",
+			dataset.manifest_fingerprint,
+			export_tables
+				.iter()
+				.map(|table| table.name.as_str())
+				.collect::<Vec<_>>()
+				.join(",")
+		)),
+		tables: export_tables,
+	};
+	Ok(PersistedPerfQuerySpec {
+		query_id,
+		sql,
+		tables,
+		storage: Arc::new(ParquetHarnessScan {
+			tables: scan_tables,
+		}),
+		export,
+	})
+}
+
+pub fn export_persisted_perf_query_parquet(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<TpchParquetExport, String> {
+	build_persisted_perf_query_spec(query, mode, scale_factor, root).map(|spec| spec.export)
+}
+
 pub fn build_perf_query_spec(
 	query: &str,
 	mode: &str,
@@ -1952,6 +3445,35 @@ pub fn build_perf_query_spec(
 		sql,
 		tables,
 	})
+}
+
+fn perf_query_sql(query: &str, strict: bool) -> Result<(&'static str, &'static str), String> {
+	let query_sql = match query {
+		"q01" | "q1" => ("q01", if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
+		"q06" | "q6" => ("q06", if strict { STRICT_Q6_SQL } else { Q6_DEV_SQL }),
+		"q02" | "q2" => ("q02", if strict { STRICT_Q2_SQL } else { Q2_DEV_SQL }),
+		"q03" | "q3" => ("q03", if strict { STRICT_Q3_SQL } else { Q3_DEV_SQL }),
+		"q04" | "q4" => ("q04", if strict { STRICT_Q4_SQL } else { Q4_DEV_SQL }),
+		"q05" | "q5" => ("q05", if strict { STRICT_Q5_SQL } else { Q5_DEV_SQL }),
+		"q07" | "q7" => ("q07", if strict { STRICT_Q7_SQL } else { Q7_DEV_SQL }),
+		"q08" | "q8" => ("q08", if strict { STRICT_Q8_SQL } else { Q8_DEV_SQL }),
+		"q09" | "q9" => ("q09", if strict { STRICT_Q9_SQL } else { Q9_DEV_SQL }),
+		"q10" => ("q10", if strict { STRICT_Q10_SQL } else { Q10_DEV_SQL }),
+		"q11" => ("q11", if strict { STRICT_Q11_SQL } else { Q11_DEV_SQL }),
+		"q12" => ("q12", if strict { STRICT_Q12_SQL } else { Q12_DEV_SQL }),
+		"q13" => ("q13", if strict { STRICT_Q13_SQL } else { Q13_DEV_SQL }),
+		"q14" => ("q14", if strict { STRICT_Q14_SQL } else { Q14_DEV_SQL }),
+		"q15" => ("q15", if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL }),
+		"q16" => ("q16", if strict { STRICT_Q16_SQL } else { Q16_DEV_SQL }),
+		"q17" => ("q17", if strict { STRICT_Q17_SQL } else { Q17_DEV_SQL }),
+		"q18" => ("q18", if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL }),
+		"q19" => ("q19", if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL }),
+		"q20" => ("q20", if strict { STRICT_Q20_SQL } else { Q20_DEV_SQL }),
+		"q21" => ("q21", if strict { STRICT_Q21_SQL } else { Q21_DEV_SQL }),
+		"q22" => ("q22", if strict { STRICT_Q22_SQL } else { Q22_DEV_SQL }),
+		other => return Err(format!("perf --query {other} is not supported")),
+	};
+	Ok(query_sql)
 }
 
 fn perf_query_spec(
@@ -9744,6 +11266,81 @@ mod adr356_perf_rail {
 				.contains("l_extendedprice:DECIMAL(15,2)")
 		);
 		assert!(lineitem.file_hash.starts_with("fnv1a64:"));
+		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
+		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+#[cfg(test)]
+mod adr360_persisted_data_surface {
+	use super::*;
+
+	fn temp_root(label: &str) -> PathBuf {
+		let root =
+			std::env::temp_dir().join(format!("toron_tpch_adr360_{label}_{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		root
+	}
+
+	#[test]
+	fn persisted_manifest_is_shared_and_idempotent() {
+		let root = temp_root("manifest");
+		let first =
+			prepare_persisted_tpch_dataset("strict", 0.01, &root).expect("prepare persisted");
+		assert_eq!(first.tables.len(), 8);
+		assert!(first.manifest_path.exists());
+		assert!(first.tables["lineitem"].path.exists());
+		assert_eq!(
+			first.tables["lineitem"].path.parent(),
+			Some(first.root_dir.as_path()),
+			"persisted tables live under the shared dataset root, not a query-shaped export"
+		);
+
+		let second =
+			prepare_persisted_tpch_dataset("strict", 0.01, &root).expect("reload persisted");
+		assert_eq!(first.manifest_fingerprint, second.manifest_fingerprint);
+		assert_eq!(
+			first.tables["lineitem"].file_hash,
+			second.tables["lineitem"].file_hash
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn persisted_q06_matches_in_memory_digest_at_default_scale() {
+		let root = temp_root("q06_parity");
+		let memory =
+			run_perf_query_with_data_source("q06", "strict", 0.01, 0, false, "memory", &root)
+				.await
+				.expect("memory perf");
+		let persisted =
+			run_perf_query_with_data_source("q06", "strict", 0.01, 0, false, "parquet", &root)
+				.await
+				.expect("persisted perf");
+		assert_eq!(memory.status, Status::Pass);
+		assert_eq!(persisted.status, Status::Pass);
+		assert_eq!(memory.digest, persisted.digest);
+		assert_eq!(
+			memory.output_schema_fingerprint,
+			persisted.output_schema_fingerprint
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn persisted_duckdb_export_uses_shared_dataset_manifest() {
+		let root = temp_root("duckdb_export");
+		let export =
+			export_persisted_perf_query_parquet("q14", "strict", 0.01, &root).expect("export");
+		assert_eq!(export.query_id, "q14");
+		assert_eq!(export.tables.len(), 2);
+		assert!(
+			export
+				.tables
+				.iter()
+				.all(|table| table.path.parent() == Some(export.root_dir.as_path()))
+		);
+		assert_eq!(export.manifest_path, export.root_dir.join("manifest.json"));
 		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
 		let _ = std::fs::remove_dir_all(&root);
 	}

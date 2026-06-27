@@ -17,11 +17,12 @@ use toron_tpch::{
 	check_strict_q08, check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12,
 	check_strict_q13, check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17,
 	check_strict_q18, check_strict_q19, check_strict_q20, check_strict_q21, check_strict_q22,
-	correctness_matrix, export_perf_query_parquet, generate_dev_lineitem, matrix,
-	normalize_duckdb_type, parse_scale_factor, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04,
-	run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11,
-	run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18,
-	run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query, run_strict_q1,
+	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
+	generate_dev_lineitem, matrix, normalize_duckdb_type, parse_scale_factor,
+	prepare_persisted_tpch_dataset, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
+	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
+	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
+	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source, run_strict_q1,
 	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
 	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
 	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19,
@@ -50,6 +51,22 @@ async fn main() -> ExitCode {
 				Ok(sf) => sf,
 				Err(message) => return harness_error(&message),
 			};
+			let data_source = flag_value(&args, "--data-source").unwrap_or("memory");
+			if matches!(data_source, "parquet" | "persisted") {
+				let mode = flag_value(&args, "--mode").unwrap_or("strict");
+				let data_dir = data_dir_from_args(&args);
+				let dataset = match prepare_persisted_tpch_dataset(mode, sf, &data_dir) {
+					Ok(dataset) => dataset,
+					Err(message) => return harness_error(&message),
+				};
+				println!(
+					"prepared persisted tpch mode={mode} sf={sf} root={} manifest={} tables={}",
+					dataset.root_dir.display(),
+					dataset.manifest_path.display(),
+					dataset.tables.len()
+				);
+				return ExitCode::SUCCESS;
+			}
 			let batch = generate_dev_lineitem(sf);
 			let _ = std::fs::create_dir_all(CACHE_ROOT);
 			println!(
@@ -82,6 +99,8 @@ async fn main() -> ExitCode {
 async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_dir = data_dir_from_args(args);
 	let sf = match explicit_sf(args) {
 		Ok(explicit) => explicit.unwrap_or(1.0),
 		Err(message) => return harness_error(&message),
@@ -91,7 +110,17 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Err(message) => return harness_error(&message),
 	};
 	let warmup = args.iter().any(|arg| arg == "--warmup-run");
-	let attempt = match run_perf_query(query, mode, sf, run_index, warmup).await {
+	let attempt = match run_perf_query_with_data_source(
+		query,
+		mode,
+		sf,
+		run_index,
+		warmup,
+		data_source,
+		&data_dir,
+	)
+	.await
+	{
 		Ok(attempt) => attempt,
 		Err(message) => return harness_error(&message),
 	};
@@ -137,9 +166,17 @@ fn push_perf_engine(engines: &mut Vec<PerfEngine>, engine: PerfEngine) {
 	}
 }
 
+fn data_dir_from_args(args: &[String]) -> PathBuf {
+	flag_value(args, "--data-dir")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from(CACHE_ROOT).join("data"))
+}
+
 async fn perf_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("all");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_dir = data_dir_from_args(args);
 	let sf = match explicit_sf(args) {
 		Ok(explicit) => explicit.unwrap_or(1.0),
 		Err(message) => return harness_error(&message),
@@ -171,20 +208,45 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			match engine {
 				PerfEngine::Toron => {
 					for warmup_index in 0..warmup {
-						match run_perf_child(query_id, mode, sf, warmup_index as u32, true) {
+						match run_perf_child(
+							query_id,
+							mode,
+							sf,
+							warmup_index as u32,
+							true,
+							data_source,
+							&data_dir,
+						) {
 							Ok(row) => raw_rows.push(row),
 							Err(message) => return harness_error(&message),
 						}
 					}
 					for run_index in 0..runs {
-						match run_perf_child(query_id, mode, sf, run_index as u32, false) {
+						match run_perf_child(
+							query_id,
+							mode,
+							sf,
+							run_index as u32,
+							false,
+							data_source,
+							&data_dir,
+						) {
 							Ok(row) => raw_rows.push(row),
 							Err(message) => return harness_error(&message),
 						}
 					}
 				}
 				PerfEngine::DuckDb => {
-					match run_duckdb_perf_rows(query_id, mode, sf, runs, warmup, &output_dir) {
+					match run_duckdb_perf_rows(
+						query_id,
+						mode,
+						sf,
+						runs,
+						warmup,
+						&output_dir,
+						data_source,
+						&data_dir,
+					) {
 						Ok(rows) => raw_rows.extend(rows),
 						Err(message) => return harness_error(&message),
 					}
@@ -545,6 +607,8 @@ fn run_perf_child(
 	sf: f64,
 	run_index: u32,
 	warmup: bool,
+	data_source: &str,
+	data_dir: &Path,
 ) -> Result<serde_json::Value, String> {
 	let mut args = vec![
 		"perf-run-one".to_string(),
@@ -556,6 +620,10 @@ fn run_perf_child(
 		sf.to_string(),
 		"--run-index".to_string(),
 		run_index.to_string(),
+		"--data-source".to_string(),
+		data_source.to_string(),
+		"--data-dir".to_string(),
+		data_dir.display().to_string(),
 	];
 	if warmup {
 		args.push("--warmup-run".to_string());
@@ -570,6 +638,8 @@ fn run_duckdb_perf_rows(
 	runs: usize,
 	warmup: usize,
 	_output_dir: &Path,
+	data_source: &str,
+	data_dir: &Path,
 ) -> Result<Vec<serde_json::Value>, String> {
 	let duckdb_bin = duckdb_binary();
 	let Some(duckdb_version) = duckdb_cli_version(&duckdb_bin)? else {
@@ -600,7 +670,11 @@ fn run_duckdb_perf_rows(
 	};
 
 	let export_root = PathBuf::from(CACHE_ROOT).join("parquet");
-	let export = export_perf_query_parquet(query, mode, sf, &export_root)?;
+	let export = match data_source {
+		"memory" => export_perf_query_parquet(query, mode, sf, &export_root)?,
+		"parquet" | "persisted" => export_persisted_perf_query_parquet(query, mode, sf, data_dir)?,
+		other => return Err(format!("perf --data-source {other:?} is not supported")),
+	};
 	duckdb_type_parity_gate(&duckdb_bin, &export)?;
 	let output_schema_fingerprint = duckdb_output_schema_fingerprint(&duckdb_bin, &export)?;
 	let plan_fingerprint = duckdb_plan_fingerprint(&export);
@@ -1633,7 +1707,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|duckdb|toron,duckdb] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|duckdb|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
