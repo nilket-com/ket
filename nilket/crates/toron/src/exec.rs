@@ -5463,6 +5463,38 @@ mod tests {
 	}
 
 	#[test]
+	fn reoriented_inner_materialization_can_restore_build_first_schema() {
+		let (build_batch, probe_batch, output_schema) = materialization_guard_fixture();
+		let selection = vec![
+			JoinOutputRow::Paired { left: 0, right: 0 },
+			JoinOutputRow::Paired { left: 1, right: 1 },
+		];
+
+		let batch = materialize_reoriented_inner_selection(
+			&probe_batch,
+			&build_batch,
+			&selection,
+			&output_schema,
+			1024 * 1024,
+			false,
+		)
+		.expect("reoriented materialization");
+
+		let left_ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left id");
+		let right_values = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right value");
+		assert_eq!(left_ids.values(), &[1, 2]);
+		assert_eq!(right_values.values(), &[10, 20]);
+	}
+
+	#[test]
 	fn join_materialization_budget_guard_counts_only_preserved_semi_side() {
 		let left_schema = Arc::new(Schema::new(vec![Field::new(
 			"left_id",

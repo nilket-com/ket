@@ -950,6 +950,7 @@ pub(super) fn materialize_reoriented_inner_selection(
 	selection: &[JoinOutputRow],
 	output_schema: &arrow::datatypes::SchemaRef,
 	memory_cap: u64,
+	probe_columns_first: bool,
 ) -> Result<RecordBatch, ExecutionError> {
 	if selection.is_empty() {
 		return Ok(RecordBatch::new_empty(output_schema.clone()));
@@ -985,11 +986,20 @@ pub(super) fn materialize_reoriented_inner_selection(
 	let probe_indices = UInt32Array::from(probe_indices);
 	let build_indices = UInt32Array::from(build_indices);
 	let mut columns = Vec::with_capacity(probe_batch.num_columns() + build_batch.num_columns());
-	for column in probe_batch.columns() {
-		columns.push(arrow::compute::take(column, &probe_indices, None)?);
-	}
-	for column in build_batch.columns() {
-		columns.push(arrow::compute::take(column, &build_indices, None)?);
+	if probe_columns_first {
+		for column in probe_batch.columns() {
+			columns.push(arrow::compute::take(column, &probe_indices, None)?);
+		}
+		for column in build_batch.columns() {
+			columns.push(arrow::compute::take(column, &build_indices, None)?);
+		}
+	} else {
+		for column in build_batch.columns() {
+			columns.push(arrow::compute::take(column, &build_indices, None)?);
+		}
+		for column in probe_batch.columns() {
+			columns.push(arrow::compute::take(column, &probe_indices, None)?);
+		}
 	}
 
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
@@ -3194,7 +3204,7 @@ pub(super) async fn visit_spilled_hash_join_filtered_chunks<F>(
 	left_key_arrays: &[ArrayRef],
 	right_key_arrays: &[ArrayRef],
 	join_output_schema: &arrow::datatypes::SchemaRef,
-	filter_predicate: &BoundExprProgram,
+	filter_predicate: Option<&BoundExprProgram>,
 	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
 	task_budget: TaskBudget,
@@ -3433,7 +3443,7 @@ pub(super) async fn probe_spilled_hash_join_filtered_chunks<F>(
 	right_key_arrays: &[ArrayRef],
 	left_batch: &RecordBatch,
 	join_output_schema: &arrow::datatypes::SchemaRef,
-	filter_predicate: &BoundExprProgram,
+	filter_predicate: Option<&BoundExprProgram>,
 	match_filter: Option<&BoundExprProgram>,
 	null_safe_keys: bool,
 	memory_cap: u64,
@@ -3530,7 +3540,7 @@ pub(super) fn visit_join_selection_filtered_chunks<F>(
 	right_batch: &RecordBatch,
 	selection: &[JoinOutputRow],
 	join_output_schema: &arrow::datatypes::SchemaRef,
-	filter_predicate: &BoundExprProgram,
+	filter_predicate: Option<&BoundExprProgram>,
 	memory_cap: u64,
 	visit_filtered_batch: &mut F,
 ) -> Result<(), ExecutionError>
@@ -3546,11 +3556,11 @@ where
 			join_output_schema,
 			memory_cap,
 		)?;
-		let batch = executor.filter_batch_with_bound_predicate(
-			filter_predicate,
-			batch,
-			"filter predicate",
-		)?;
+		let batch = if let Some(predicate) = filter_predicate {
+			executor.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+		} else {
+			batch
+		};
 		if batch.num_rows() > 0 {
 			visit_filtered_batch(batch)?;
 		}

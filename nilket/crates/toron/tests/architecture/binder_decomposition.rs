@@ -234,6 +234,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/observability_listener_test.rs",
 				"crates/toron/tests/predicate_widening_test.rs",
 				"crates/toron/tests/qualified_resolution_test.rs",
+				// ADR 357: focused executor regression for the generalized reoriented inner-chain shape.
+				"crates/toron/tests/reoriented_inner_chain_streaming_test.rs",
 				"crates/toron/tests/rune_relation_handles_test.rs",
 				"crates/toron/tests/rune_window_test.rs",
 				"crates/toron/tests/runtime_filter_pushdown_test.rs",

@@ -9,6 +9,7 @@ pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	output_schema: SchemaRef,
 	strategy: JoinStrategy,
 	post_filter: Option<&'a BoundExprProgram>,
+	probe_columns_first: bool,
 }
 
 pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
@@ -20,6 +21,7 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	probe_keys: Vec<crate::ir::ColumnOrdinal>,
 	output_schema: SchemaRef,
 	post_filter: Option<&'a BoundExprProgram>,
+	probe_columns_first: bool,
 	probe_rows: u64,
 	output_rows: u64,
 }
@@ -104,7 +106,15 @@ pub(in crate::exec) fn extract_reoriented_inner_chain(
 ) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
 	let mut current = top;
 	let mut stages = Vec::new();
-	for expected in (1..=4).rev() {
+	let ExecutionPlan::Join { replay_id, .. } = current else {
+		return None;
+	};
+	if replay_id.0 == 0 || *replay_id == JoinReplayId::SYNTHETIC {
+		return None;
+	}
+	let mut expected = replay_id.0;
+	let mut post_filter = None;
+	loop {
 		let ExecutionPlan::Join {
 			replay_id,
 			left,
@@ -124,29 +134,96 @@ pub(in crate::exec) fn extract_reoriented_inner_chain(
 		if *replay_id != JoinReplayId(expected) {
 			return None;
 		}
-		let ExecutionPlan::Exchange {
-			input: left_input, ..
-		} = left.as_ref()
-		else {
-			return None;
-		};
+		let (probe, probe_keys, build, build_keys, probe_columns_first, continuation) =
+			if let Some(continuation) = reoriented_chain_continuation(left.as_ref(), expected) {
+				(
+					left.as_ref(),
+					left_keys,
+					right.as_ref(),
+					right_keys,
+					true,
+					continuation,
+				)
+			} else if let Some(continuation) =
+				reoriented_chain_continuation(right.as_ref(), expected)
+			{
+				(
+					right.as_ref(),
+					right_keys,
+					left.as_ref(),
+					left_keys,
+					false,
+					continuation,
+				)
+			} else {
+				return None;
+			};
 		stages.push(ReorientedInnerJoinStage {
 			replay_id: *replay_id,
-			probe_schema: left.schema(),
-			probe_keys: left_keys.clone(),
-			build: right.as_ref(),
-			build_keys: right_keys.clone(),
+			probe_schema: probe.schema(),
+			probe_keys: probe_keys.clone(),
+			build,
+			build_keys: build_keys.clone(),
 			output_schema: output_schema.clone(),
 			strategy: JoinStrategy::HashPartitioned,
-			post_filter: None,
+			post_filter,
+			probe_columns_first,
 		});
 		if expected == 1 {
 			stages.reverse();
-			return Some((left.as_ref(), stages));
+			return Some((probe, stages));
 		}
-		current = left_input.as_ref();
+		current = continuation.plan;
+		post_filter = continuation.post_filter;
+		expected -= 1;
 	}
-	None
+}
+
+struct ReorientedChainContinuation<'a> {
+	plan: &'a ExecutionPlan,
+	post_filter: Option<&'a BoundExprProgram>,
+}
+
+fn reoriented_chain_continuation(
+	plan: &ExecutionPlan,
+	expected: u32,
+) -> Option<ReorientedChainContinuation<'_>> {
+	let ExecutionPlan::Exchange { input, .. } = plan else {
+		return None;
+	};
+	let (candidate, post_filter) = match input.as_ref() {
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition: FilterDisposition::EvaluateInToron,
+		} => (input.as_ref(), Some(predicate)),
+		ExecutionPlan::Filter {
+			input,
+			disposition: FilterDisposition::FullyPushed,
+			..
+		} => (input.as_ref(), None),
+		other => (other, None),
+	};
+	let ExecutionPlan::Join { replay_id, .. } = candidate else {
+		return None;
+	};
+	if expected == 1 {
+		if *replay_id == JoinReplayId(0) {
+			Some(ReorientedChainContinuation {
+				plan: candidate,
+				post_filter,
+			})
+		} else {
+			None
+		}
+	} else if *replay_id == JoinReplayId(expected - 1) {
+		Some(ReorientedChainContinuation {
+			plan: candidate,
+			post_filter,
+		})
+	} else {
+		None
+	}
 }
 
 pub(in crate::exec) fn filter_input<'a>(
@@ -314,6 +391,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				output_schema: join1_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
 				post_filter: Some(join1_post_filter),
+				probe_columns_first: true,
 			},
 			ReorientedInnerJoinStage {
 				replay_id: *join2_replay_id,
@@ -324,6 +402,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				output_schema: join2_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
 				post_filter: Some(join2_post_filter),
+				probe_columns_first: true,
 			},
 		],
 		semi_stage: StreamingSemiAntiStage {
@@ -649,7 +728,7 @@ impl Executor {
 		predicate: &BoundExprProgram,
 		disposition: FilterDisposition,
 		morsel: Option<(MorselId, u32)>,
-		mut visit_filtered_batch: F,
+		visit_filtered_batch: F,
 	) -> Result<Option<()>, ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
@@ -657,7 +736,20 @@ impl Executor {
 		if disposition == FilterDisposition::FullyPushed {
 			return Ok(None);
 		}
+		self.try_visit_streaming_join0_chunks(input, Some(predicate), morsel, visit_filtered_batch)
+			.await
+	}
 
+	pub(in crate::exec) async fn try_visit_streaming_join0_chunks<F>(
+		&self,
+		input: &ExecutionPlan,
+		filter_predicate: Option<&BoundExprProgram>,
+		morsel: Option<(MorselId, u32)>,
+		mut visit_batch: F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
 		let ExecutionPlan::Join {
 			replay_id,
 			left,
@@ -715,19 +807,33 @@ impl Executor {
 					.saturating_add(spilled.spill_bytes());
 			});
 			let probe_started = Instant::now();
-			let result = visit_streamed_spilled_inner_join_filtered_chunks(
-				self,
-				&mut spilled,
-				&right_batches,
-				right_keys,
-				key_plan,
-				*null_safe_keys,
-				output_schema,
-				predicate,
-				self.context.task_budget.memory.get(),
-				&mut visit_filtered_batch,
-			)
-			.await;
+			let result = if let Some(predicate) = filter_predicate {
+				visit_streamed_spilled_inner_join_filtered_chunks(
+					self,
+					&mut spilled,
+					&right_batches,
+					right_keys,
+					key_plan,
+					*null_safe_keys,
+					output_schema,
+					predicate,
+					self.context.task_budget.memory.get(),
+					&mut visit_batch,
+				)
+				.await
+			} else {
+				visit_streamed_spilled_inner_join_chunks(
+					&mut spilled,
+					&right_batches,
+					right_keys,
+					key_plan,
+					*null_safe_keys,
+					output_schema,
+					self.context.task_budget.memory.get(),
+					&mut visit_batch,
+				)
+				.await
+			};
 			let build_rows = spilled.input_row_count();
 			record_task_telemetry(&self.context.task_telemetry, |task| {
 				task.phases.probe_micros = task
@@ -783,14 +889,14 @@ impl Executor {
 				&left_key_arrays,
 				&right_key_arrays,
 				output_schema,
-				predicate,
+				filter_predicate,
 				match_filter.as_ref(),
 				*null_safe_keys,
 				self.context.task_budget,
 				self.context.task_telemetry.clone(),
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
-				&mut visit_filtered_batch,
+				&mut visit_batch,
 			)
 			.await?;
 			record_join_runtime_observation(
@@ -855,9 +961,9 @@ impl Executor {
 			&right_batch,
 			&selection,
 			output_schema,
-			predicate,
+			filter_predicate,
 			self.context.task_budget.memory.get(),
-			&mut visit_filtered_batch,
+			&mut visit_batch,
 		)?;
 		record_join_runtime_observation(
 			&self.context.task_telemetry,
@@ -1251,15 +1357,20 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Filter {
-			input: filter_input,
-			predicate: outer_predicate,
-			disposition: FilterDisposition::EvaluateInToron,
-		} = project_input.as_ref()
-		else {
-			return Ok(None);
+		let (chain_input, outer_predicate) = match project_input.as_ref() {
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition: FilterDisposition::EvaluateInToron,
+			} => (input.as_ref(), Some(predicate)),
+			ExecutionPlan::Filter {
+				input,
+				disposition: FilterDisposition::FullyPushed,
+				..
+			} => (input.as_ref(), None),
+			other => (other, None),
 		};
-		let Some((base, stages)) = extract_reoriented_inner_chain(filter_input) else {
+		let Some((base, stages)) = extract_reoriented_inner_chain(chain_input) else {
 			return Ok(None);
 		};
 
@@ -1288,14 +1399,32 @@ impl Executor {
 					if batches.is_empty() {
 						break;
 					}
+					if let Some(predicate) = runtime.post_filter {
+						let mut filtered = Vec::new();
+						for batch in batches {
+							let batch = self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?;
+							if batch.num_rows() > 0 {
+								filtered.push(batch);
+							}
+						}
+						batches = filtered;
+					}
 				}
 
 				for batch in batches {
-					let filtered = self.filter_batch_with_bound_predicate(
-						outer_predicate,
-						batch,
-						"filter predicate",
-					)?;
+					let filtered = if let Some(predicate) = outer_predicate {
+						self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"filter predicate",
+						)?
+					} else {
+						batch
+					};
 					if filtered.num_rows() == 0 {
 						continue;
 					}
@@ -1656,6 +1785,7 @@ impl Executor {
 			probe_keys: stage.probe_keys,
 			output_schema: stage.output_schema,
 			post_filter: stage.post_filter,
+			probe_columns_first: stage.probe_columns_first,
 			probe_rows: 0,
 			output_rows: 0,
 		}))
@@ -1851,32 +1981,31 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Filter {
-			input: filter_input,
-			predicate,
-			disposition,
-		} = input.as_ref()
-		else {
-			return Ok(None);
+		let (join0, filter_predicate) = match input.as_ref() {
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition: FilterDisposition::EvaluateInToron,
+			} => (input.as_ref(), Some(predicate)),
+			ExecutionPlan::Filter {
+				input,
+				disposition: FilterDisposition::FullyPushed,
+				..
+			} => (input.as_ref(), None),
+			other => (other, None),
 		};
 
 		let matched = self
-			.try_visit_streaming_join0_filter_chunks(
-				filter_input,
-				predicate,
-				*disposition,
-				morsel,
-				|batch| {
-					for (_partition, partitioned) in
-						self.repartition_exchange_batch(&batch, *partition_count, key)?
-					{
-						if partitioned.num_rows() > 0 {
-							visit_batch(partitioned)?;
-						}
+			.try_visit_streaming_join0_chunks(join0, filter_predicate, morsel, |batch| {
+				for (_partition, partitioned) in
+					self.repartition_exchange_batch(&batch, *partition_count, key)?
+				{
+					if partitioned.num_rows() > 0 {
+						visit_batch(partitioned)?;
 					}
-					Ok(())
-				},
-			)
+				}
+				Ok(())
+			})
 			.await?;
 		if matched.is_none() {
 			return Ok(None);
@@ -2083,6 +2212,7 @@ impl Executor {
 				chunk,
 				&runtime.output_schema,
 				self.context.task_budget.memory.get(),
+				runtime.probe_columns_first,
 			)?;
 			if batch.num_rows() > 0 {
 				output.push(batch);
