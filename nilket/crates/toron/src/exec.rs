@@ -282,6 +282,7 @@ impl Executor {
 		let task_memory_cap = self.context.task_budget.memory.get();
 		let memory_cap = (task_memory_cap >= 64 * 1024 * 1024)
 			.then(|| join::join_output_materialization_memory_cap(task_memory_cap));
+		let schema = stream.schema.clone();
 		let mut stream = stream.into_batches();
 		let mut rows = 0usize;
 		let mut output_bytes = 0u64;
@@ -291,9 +292,6 @@ impl Executor {
 				break;
 			};
 			let batch = batch?;
-			if batch.num_rows() == 0 {
-				continue;
-			}
 			let batch = if let Some(limit) = row_limit {
 				let remaining = limit - rows;
 				if batch.num_rows() > remaining {
@@ -318,9 +316,11 @@ impl Executor {
 			}
 			batches.push(batch);
 		}
+		if batches.is_empty() {
+			batches.push(RecordBatch::new_empty(schema));
+		}
 		Ok(batches)
 	}
-
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
