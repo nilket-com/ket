@@ -12,11 +12,7 @@ use toron_tpch::telemetry::{
 	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status,
 };
 use toron_tpch::{
-	ALL_QUERY_IDS, CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_q1, check_strict_q02,
-	check_strict_q3, check_strict_q04, check_strict_q5, check_strict_q6, check_strict_q07,
-	check_strict_q08, check_strict_q09, check_strict_q10, check_strict_q11, check_strict_q12,
-	check_strict_q13, check_strict_q14, check_strict_q15, check_strict_q16, check_strict_q17,
-	check_strict_q18, check_strict_q19, check_strict_q20, check_strict_q21, check_strict_q22,
+	ALL_QUERY_IDS, CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
 	generate_dev_lineitem, matrix, normalize_duckdb_type, parse_scale_factor,
 	prepare_persisted_tpch_dataset, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
@@ -272,40 +268,24 @@ async fn perf_command(args: &[String]) -> ExitCode {
 /// usage error (exit 2, no row), not fake telemetry.
 async fn correctness_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q06");
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_dir = data_dir_from_args(args);
 	let explicit = match explicit_sf(args) {
 		Ok(explicit) => explicit,
 		Err(message) => return harness_error(&message),
 	};
-	let sf = explicit.unwrap_or(DEFAULT_SF);
-	let attempt = match query {
-		"q17" => {
-			if let Err(message) = q17_correctness_sf(explicit) {
-				return harness_error(&message);
-			}
-			check_strict_q17().await
+	let sf = if matches!(query, "q17") {
+		match q17_correctness_sf(explicit) {
+			Ok(sf) => sf,
+			Err(message) => return harness_error(&message),
 		}
-		"q06" | "q6" => check_strict_q6(sf).await,
-		"q01" | "q1" => check_strict_q1(sf).await,
-		"q02" | "q2" => check_strict_q02(sf).await,
-		"q03" | "q3" => check_strict_q3(sf).await,
-		"q04" | "q4" => check_strict_q04(sf).await,
-		"q05" | "q5" => check_strict_q5(sf).await,
-		"q07" | "q7" => check_strict_q07(sf).await,
-		"q08" | "q8" => check_strict_q08(sf).await,
-		"q09" | "q9" => check_strict_q09(sf).await,
-		"q10" => check_strict_q10(sf).await,
-		"q11" => check_strict_q11(sf).await,
-		"q12" => check_strict_q12(sf).await,
-		"q13" => check_strict_q13(sf).await,
-		"q14" => check_strict_q14(sf).await,
-		"q15" => check_strict_q15(sf).await,
-		"q18" => check_strict_q18(sf).await,
-		"q19" => check_strict_q19(sf).await,
-		"q21" => check_strict_q21(sf).await,
-		"q16" => check_strict_q16(sf).await,
-		"q20" => check_strict_q20(sf).await,
-		"q22" => check_strict_q22(sf).await,
-		other => return harness_error(&format!("correctness --query {other} is not supported")),
+	} else {
+		explicit.unwrap_or(DEFAULT_SF)
+	};
+	let attempt = match check_strict_query_with_data_source(query, sf, data_source, &data_dir).await
+	{
+		Ok(attempt) => attempt,
+		Err(message) => return harness_error(&message),
 	};
 	emit_correctness(&attempt);
 	if attempt.is_process_success() {
@@ -320,7 +300,7 @@ fn q17_correctness_sf(explicit: Option<f64>) -> Result<f64, String> {
 		None => Ok(Q17_CORRECTNESS_SCALE),
 		Some(sf) if (sf - Q17_CORRECTNESS_SCALE).abs() <= f64::EPSILON => Ok(sf),
 		Some(sf) => Err(format!(
-			"q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {sf}"
+			"q17_sf10_oracle_policy_gap: q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {sf}"
 		)),
 	}
 }

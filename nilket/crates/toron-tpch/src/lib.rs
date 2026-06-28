@@ -3331,6 +3331,244 @@ pub async fn run_perf_query_with_data_source(
 	}
 }
 
+pub async fn check_strict_query_with_data_source(
+	query: &str,
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<CorrectnessAttempt, String> {
+	if query == "q17" && (scale_factor - Q17_CORRECTNESS_SCALE).abs() > f64::EPSILON {
+		return Err(format!(
+			"q17_sf10_oracle_policy_gap: q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {scale_factor}"
+		));
+	}
+	match data_source {
+		"memory" => check_strict_query_memory(query, scale_factor).await,
+		"parquet" | "persisted" => {
+			check_strict_query_with_persisted_source(query, scale_factor, data_root).await
+		}
+		other => Err(format!(
+			"correctness --data-source {other:?} is not supported"
+		)),
+	}
+}
+
+async fn check_strict_query_memory(
+	query: &str,
+	scale_factor: f64,
+) -> Result<CorrectnessAttempt, String> {
+	let attempt = match query {
+		"q06" | "q6" => check_strict_q6(scale_factor).await,
+		"q01" | "q1" => check_strict_q1(scale_factor).await,
+		"q02" | "q2" => check_strict_q02(scale_factor).await,
+		"q03" | "q3" => check_strict_q3(scale_factor).await,
+		"q04" | "q4" => check_strict_q04(scale_factor).await,
+		"q05" | "q5" => check_strict_q5(scale_factor).await,
+		"q07" | "q7" => check_strict_q07(scale_factor).await,
+		"q08" | "q8" => check_strict_q08(scale_factor).await,
+		"q09" | "q9" => check_strict_q09(scale_factor).await,
+		"q10" => check_strict_q10(scale_factor).await,
+		"q11" => check_strict_q11(scale_factor).await,
+		"q12" => check_strict_q12(scale_factor).await,
+		"q13" => check_strict_q13(scale_factor).await,
+		"q14" => check_strict_q14(scale_factor).await,
+		"q15" => check_strict_q15(scale_factor).await,
+		"q16" => check_strict_q16(scale_factor).await,
+		"q17" => check_strict_q17().await,
+		"q18" => check_strict_q18(scale_factor).await,
+		"q19" => check_strict_q19(scale_factor).await,
+		"q20" => check_strict_q20(scale_factor).await,
+		"q21" => check_strict_q21(scale_factor).await,
+		"q22" => check_strict_q22(scale_factor).await,
+		other => return Err(format!("correctness --query {other} is not supported")),
+	};
+	Ok(attempt)
+}
+
+async fn check_strict_query_with_persisted_source(
+	query: &str,
+	scale_factor: f64,
+	data_root: &Path,
+) -> Result<CorrectnessAttempt, String> {
+	let start = Instant::now();
+	let spec = build_persisted_perf_query_spec(query, "strict", scale_factor, data_root)?;
+	let query_id = spec.query_id;
+	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
+		query: query_id.to_string(),
+		scale_factor,
+		mode: "strict".to_string(),
+		phase,
+		status,
+		reason,
+		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+	};
+	let storage: Arc<dyn StorageScan> = spec.storage;
+	let batches = match execute_query_with_metadata_timed(spec.sql, spec.tables, storage).await {
+		Ok(execution) => execution.batches,
+		Err(StageError { phase, reason, .. }) => {
+			return Ok(outcome(phase, status_for_reason(&reason), Some(reason)));
+		}
+	};
+	Ok(
+		match compare_strict_query_batches(query_id, scale_factor, &batches) {
+			Ok(()) => outcome(Phase::Compare, Status::Pass, None),
+			Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
+		},
+	)
+}
+
+fn compare_strict_query_batches(
+	query_id: &str,
+	scale_factor: f64,
+	batches: &[RecordBatch],
+) -> Result<(), String> {
+	match query_id {
+		"q01" => {
+			let oracle = strict_q1_oracle(scale_factor);
+			let selected_rows: i64 = oracle.values().map(|group| group.count).sum();
+			if selected_rows < 1 || oracle.len() <= 1 {
+				return Err(format!(
+					"oracle non-vacuous guard failed: selected_rows={selected_rows} groups={}",
+					oracle.len()
+				));
+			}
+			compare_strict_q1(batches, &oracle)
+		}
+		"q02" => {
+			let oracle = strict_q02_oracle(scale_factor);
+			if oracle.matched_parts == 0 || oracle.rows.is_empty() {
+				return Err(format!(
+					"oracle non-vacuous guard failed: matched_parts={} rows={}",
+					oracle.matched_parts,
+					oracle.rows.len()
+				));
+			}
+			compare_strict_q02(batches, &oracle)
+		}
+		"q03" => {
+			let oracle = strict_q3_oracle(scale_factor);
+			if oracle.selected_rows < 1 || oracle.groups.len() <= 1 {
+				return Err(format!(
+					"oracle non-vacuous guard failed: selected_rows={} groups={}",
+					oracle.selected_rows,
+					oracle.groups.len()
+				));
+			}
+			compare_strict_q3(batches, &oracle.groups)
+		}
+		"q04" => {
+			let oracle = strict_q04_oracle(scale_factor);
+			compare_strict_q04(batches, &oracle)
+		}
+		"q05" => {
+			let oracle = strict_q5_oracle(scale_factor);
+			if oracle.selected_rows < 1 || oracle.groups.len() <= 1 {
+				return Err(format!(
+					"oracle non-vacuous guard failed: selected_rows={} groups={}",
+					oracle.selected_rows,
+					oracle.groups.len()
+				));
+			}
+			compare_strict_q5(batches, &oracle.groups)
+		}
+		"q06" => {
+			let (expected, matched) = strict_q6_oracle(scale_factor);
+			if matched == 0 {
+				return Err("oracle matched zero rows at this scale".to_string());
+			}
+			compare_strict_q6(batches, expected)
+		}
+		"q07" => {
+			let oracle = strict_q07_oracle(scale_factor);
+			let missing_keys: Vec<String> = q07_expected_group_keys()
+				.iter()
+				.filter(|(supp, cust, year)| {
+					!oracle
+						.groups
+						.contains_key(&(supp.to_string(), cust.to_string(), *year))
+				})
+				.map(|(supp, cust, year)| format!("({supp},{cust},{year})"))
+				.collect();
+			if oracle.selected_rows < 1 || oracle.groups.len() != 4 || !missing_keys.is_empty() {
+				return Err(format!(
+					"oracle non-vacuous guard failed: selected_rows={} groups={} missing={missing_keys:?}",
+					oracle.selected_rows,
+					oracle.groups.len()
+				));
+			}
+			compare_strict_q07(batches, &oracle)
+		}
+		"q08" => {
+			let oracle = strict_q08_oracle(scale_factor)?;
+			compare_strict_q08(batches, &oracle)
+		}
+		"q09" => {
+			let oracle = strict_q09_oracle(scale_factor);
+			compare_strict_q09(batches, &oracle)
+		}
+		"q10" => {
+			let oracle = strict_q10_oracle(scale_factor);
+			if oracle.selected_rows <= 1 || oracle.rows.len() <= 1 {
+				return Err(format!(
+					"oracle non-vacuous guard failed: selected_rows={} rows={}",
+					oracle.selected_rows,
+					oracle.rows.len()
+				));
+			}
+			compare_strict_q10(batches, &oracle)
+		}
+		"q11" => {
+			let oracle = strict_q11_oracle(scale_factor)?;
+			compare_strict_q11(batches, &oracle)
+		}
+		"q12" => {
+			let oracle = strict_q12_oracle(scale_factor);
+			compare_strict_q12(batches, &oracle)
+		}
+		"q13" => {
+			let oracle = strict_q13_oracle(scale_factor);
+			compare_strict_q13(batches, &oracle)
+		}
+		"q14" => {
+			let oracle = strict_q14_oracle(scale_factor)?;
+			compare_strict_q14(batches, &oracle)
+		}
+		"q15" => {
+			let oracle = strict_q15_oracle(scale_factor)?;
+			compare_strict_q15(batches, &oracle)
+		}
+		"q16" => {
+			let oracle = strict_q16_oracle(scale_factor);
+			compare_strict_q16(batches, &oracle)
+		}
+		"q17" => {
+			let oracle = strict_q17_oracle(scale_factor)?;
+			compare_strict_q17(batches, &oracle)
+		}
+		"q18" => {
+			let oracle = strict_q18_oracle(scale_factor)?;
+			compare_strict_q18(batches, &oracle)
+		}
+		"q19" => {
+			let oracle = strict_q19_oracle(scale_factor)?;
+			compare_strict_q19(batches, &oracle)
+		}
+		"q20" => {
+			let oracle = strict_q20_oracle(scale_factor);
+			compare_strict_q20(batches, &oracle)
+		}
+		"q21" => {
+			let oracle = strict_q21_oracle(scale_factor)?;
+			compare_strict_q21(batches, &oracle)
+		}
+		"q22" => {
+			let oracle = strict_q22_oracle(scale_factor)?;
+			compare_strict_q22(batches, &oracle)
+		}
+		other => Err(format!("correctness --query {other} is not supported")),
+	}
+}
+
 pub fn build_persisted_perf_query_spec(
 	query: &str,
 	mode: &str,
@@ -11322,6 +11560,55 @@ mod adr360_persisted_data_surface {
 		);
 		assert_eq!(export.manifest_path, export.root_dir.join("manifest.json"));
 		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
+		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+#[cfg(test)]
+mod adr365_persisted_correctness_surface {
+	use super::*;
+
+	fn temp_root(label: &str) -> PathBuf {
+		let root =
+			std::env::temp_dir().join(format!("toron_tpch_adr365_{label}_{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		root
+	}
+
+	#[tokio::test]
+	async fn persisted_correctness_q06_matches_memory_at_default_scale() {
+		let root = temp_root("q06_correctness");
+		let memory = check_strict_query_with_data_source("q06", 0.01, "memory", &root)
+			.await
+			.expect("memory correctness");
+		let persisted = check_strict_query_with_data_source("q6", 0.01, "parquet", &root)
+			.await
+			.expect("persisted correctness");
+		assert_eq!(memory.status, Status::Pass);
+		assert_eq!(persisted.status, Status::Pass);
+		assert_eq!(persisted.query, "q06");
+		assert_eq!(persisted.phase, Phase::Compare);
+		assert_eq!(persisted.reason, None);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn persisted_correctness_rejects_unknown_data_source_as_usage() {
+		let root = temp_root("bad_source");
+		let error = check_strict_query_with_data_source("q06", 0.01, "csv", &root)
+			.await
+			.expect_err("unsupported source should be a usage error");
+		assert!(error.contains("correctness --data-source"));
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn persisted_correctness_q17_policy_gap_is_named() {
+		let root = temp_root("q17_policy");
+		let error = check_strict_query_with_data_source("q17", 10.0, "parquet", &root)
+			.await
+			.expect_err("q17 sf=10 remains a named oracle-policy gap");
+		assert!(error.contains("q17_sf10_oracle_policy_gap"));
 		let _ = std::fs::remove_dir_all(&root);
 	}
 }
