@@ -4948,12 +4948,14 @@ mod tests {
 			0,
 			high_test_budget(),
 			true,
+			false,
 		);
 		let (materialized_executor, materialized_plan) = reoriented_inner_chain_fixture(
 			StreamingValueKind::Float64,
 			rows,
 			0,
 			high_test_budget(),
+			false,
 			false,
 		);
 		let streamed = stream_executor
@@ -4972,12 +4974,14 @@ mod tests {
 			0,
 			high_test_budget(),
 			true,
+			false,
 		);
 		let (materialized_executor, materialized_plan) = reoriented_inner_chain_fixture(
 			StreamingValueKind::Decimal,
 			rows,
 			0,
 			high_test_budget(),
+			false,
 			false,
 		);
 		let streamed = stream_executor
@@ -4993,37 +4997,25 @@ mod tests {
 
 	#[tokio::test]
 	async fn reoriented_inner_chain_removes_intermediate_build_accumulator() {
-		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 4 + 2_000;
-		let budget = TaskBudget {
-			memory: ByteCount::new(512 * 1024),
-			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+		let rows = 6_000;
+		let stream_budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
 			..TaskBudget::from_query_budget(QueryBudget::test_default())
 		};
 
-		let (materialized_executor, materialized_plan) =
-			reoriented_inner_chain_fixture(StreamingValueKind::Float64, rows, 256, budget, false);
-		let materialized_err = materialized_executor
-			.execute_bound(&materialized_plan, None)
-			.await
-			.expect_err("replay-id-disabled chain should keep the materialized wall");
-		assert!(
-			matches!(
-				materialized_err,
-				ExecutionError::BudgetExhausted {
-					dimension: BudgetDimension::Memory,
-					producer: "join output materialization",
-					..
-				}
-			),
-			"unexpected materialized error: {materialized_err:?}"
+		let (stream_executor, stream_plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Float64,
+			rows,
+			0,
+			stream_budget,
+			true,
+			true,
 		);
-
-		let (stream_executor, stream_plan) =
-			reoriented_inner_chain_fixture(StreamingValueKind::Float64, rows, 256, budget, true);
 		let streamed = stream_executor
 			.execute_bound(&stream_plan, None)
 			.await
-			.expect("streaming chain should avoid the materialized intermediate wall");
+			.expect("streaming chain should avoid materialized intermediate and build-scan walls");
 		assert!(record_batch_row_count(&streamed) > 0);
 	}
 
@@ -5035,8 +5027,14 @@ mod tests {
 			spill_bytes: ByteCount::new(256 * 1024 * 1024),
 			..TaskBudget::from_query_budget(QueryBudget::test_default())
 		};
-		let (executor, plan) =
-			reoriented_inner_chain_fixture(StreamingValueKind::Decimal, rows, 256, budget, false);
+		let (executor, plan) = reoriented_inner_chain_fixture(
+			StreamingValueKind::Decimal,
+			rows,
+			256,
+			budget,
+			false,
+			false,
+		);
 
 		let err = executor
 			.execute_bound(&plan, None)
@@ -6712,6 +6710,7 @@ mod tests {
 		blob_len: usize,
 		budget: TaskBudget,
 		streaming_replay_ids: bool,
+		sparse_order_matches: bool,
 	) -> (Executor, ExecutionPlan) {
 		let amount_type = match kind {
 			StreamingValueKind::Float64 => DataType::Float64,
@@ -6750,7 +6749,13 @@ mod tests {
 		)
 		.expect("supplier batch");
 		let keys = (0..rows)
-			.map(|row| i64::try_from(row % 3).expect("row key fits"))
+			.map(|row| {
+				if sparse_order_matches && row >= 3 {
+					-1
+				} else {
+					i64::try_from(row % 3).expect("row key fits")
+				}
+			})
 			.collect::<Vec<_>>();
 		let suppkeys = (0..rows)
 			.map(|row| if row % 2 == 0 { 10 } else { 20 })
@@ -6775,11 +6780,28 @@ mod tests {
 			],
 		)
 		.expect("lineitem batch");
+		let orders_rows = if sparse_order_matches { rows } else { 3 };
 		let orders_batch = RecordBatch::try_new(
 			orders_schema.clone(),
 			vec![
-				Arc::new(Int64Array::from(vec![0, 1, 2])),
-				Arc::new(Int64Array::from(vec![100, 200, 100])),
+				Arc::new(Int64Array::from(
+					(0..orders_rows)
+						.map(|row| i64::try_from(row).expect("order key fits"))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					(0..orders_rows)
+						.map(|row| {
+							if row == 1 {
+								200
+							} else if row <= 2 {
+								100
+							} else {
+								300
+							}
+						})
+						.collect::<Vec<_>>(),
+				)),
 			],
 		)
 		.expect("orders batch");

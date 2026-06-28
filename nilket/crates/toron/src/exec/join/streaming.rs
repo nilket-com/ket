@@ -553,6 +553,36 @@ fn is_streaming_left_outer_grouped_join(input: &ExecutionPlan) -> bool {
 	decompose_streaming_scan_probe_input(right).is_some()
 }
 
+fn reoriented_inner_chain_grouped_base_supports_scan_probe(base: &ExecutionPlan) -> bool {
+	let ExecutionPlan::Exchange {
+		input: base_input, ..
+	} = base
+	else {
+		return false;
+	};
+	let ExecutionPlan::Filter {
+		input: join0,
+		disposition,
+		..
+	} = base_input.as_ref()
+	else {
+		return false;
+	};
+	if *disposition == FilterDisposition::FullyPushed {
+		return false;
+	}
+	let ExecutionPlan::Join {
+		replay_id,
+		right,
+		kind: JoinKind::Inner,
+		..
+	} = join0.as_ref()
+	else {
+		return false;
+	};
+	*replay_id == JoinReplayId(0) && decompose_streaming_scan_probe_input(right).is_some()
+}
+
 fn concat_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
 	Arc::new(Schema::new(
 		left.fields()
@@ -4248,12 +4278,18 @@ impl Executor {
 		}
 		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
 
+		let stream_stage_scan_builds =
+			reoriented_inner_chain_grouped_base_supports_scan_probe(base);
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
-			let Some(runtime) = self
-				.prepare_reoriented_inner_join_runtime(stage, morsel)
-				.await?
-			else {
+			let runtime = if stream_stage_scan_builds {
+				self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
+					.await?
+			} else {
+				self.prepare_reoriented_inner_join_runtime(stage, morsel)
+					.await?
+			};
+			let Some(runtime) = runtime else {
 				return Ok(None);
 			};
 			runtimes.push(runtime);
@@ -4261,63 +4297,91 @@ impl Executor {
 
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
-		let matched = self
-			.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
-				let mut batches = vec![base_batch];
-				for runtime in runtimes.iter_mut() {
-					let mut next = Vec::new();
-					for batch in batches {
-						next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
-					}
-					batches = next;
-					if batches.is_empty() {
-						break;
-					}
-					if let Some(predicate) = runtime.post_filter {
-						let mut filtered = Vec::new();
+		let mut matched = self
+			.try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
+				base,
+				&mut runtimes,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				&mut groups,
+				&mut group_types,
+				morsel,
+			)
+			.await?;
+		if matched.is_none() {
+			if runtimes
+				.iter()
+				.any(|runtime| !matches!(runtime.build, ReorientedInnerJoinBuild::InMemory { .. }))
+			{
+				for runtime in runtimes {
+					runtime.cleanup().await;
+				}
+				return Ok(None);
+			}
+			matched = self
+				.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
+					let mut batches = vec![base_batch];
+					for runtime in runtimes.iter_mut() {
+						let mut next = Vec::new();
 						for batch in batches {
-							let batch = self.filter_batch_with_bound_predicate(
+							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
+						}
+						batches = next;
+						if batches.is_empty() {
+							break;
+						}
+						if let Some(predicate) = runtime.post_filter {
+							let mut filtered = Vec::new();
+							for batch in batches {
+								let batch = self.filter_batch_with_bound_predicate(
+									predicate,
+									batch,
+									"filter predicate",
+								)?;
+								if batch.num_rows() > 0 {
+									filtered.push(batch);
+								}
+							}
+							batches = filtered;
+						}
+					}
+
+					for batch in batches {
+						let filtered = if let Some(predicate) = outer_predicate {
+							self.filter_batch_with_bound_predicate(
 								predicate,
 								batch,
 								"filter predicate",
-							)?;
-							if batch.num_rows() > 0 {
-								filtered.push(batch);
-							}
+							)?
+						} else {
+							batch
+						};
+						if filtered.num_rows() == 0 {
+							continue;
 						}
-						batches = filtered;
+						let projected = RecordBatch::try_new(
+							project_output_schema.clone(),
+							self.evaluate_bound_program(project_exprs, &filtered)?,
+						)?;
+						self.fold_bound_grouped_aggregate_batch(
+							&mut groups,
+							&mut group_types,
+							group_expr,
+							aggr_expr,
+							&projected,
+						)?;
 					}
-				}
-
-				for batch in batches {
-					let filtered = if let Some(predicate) = outer_predicate {
-						self.filter_batch_with_bound_predicate(
-							predicate,
-							batch,
-							"filter predicate",
-						)?
-					} else {
-						batch
-					};
-					if filtered.num_rows() == 0 {
-						continue;
-					}
-					let projected = RecordBatch::try_new(
-						project_output_schema.clone(),
-						self.evaluate_bound_program(project_exprs, &filtered)?,
-					)?;
-					self.fold_bound_grouped_aggregate_batch(
-						&mut groups,
-						&mut group_types,
-						group_expr,
-						aggr_expr,
-						&projected,
-					)?;
-				}
-				Ok(())
-			})
-			.await?;
+					Ok(())
+				})
+				.await?;
+		}
 		if matched.is_none() {
+			for runtime in runtimes {
+				runtime.cleanup().await;
+			}
 			return Ok(None);
 		}
 
@@ -4341,6 +4405,245 @@ impl Executor {
 			runtime.cleanup().await;
 		}
 		output.map(Some)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
+		&self,
+		base: &ExecutionPlan,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: &BoundExprProgram,
+		project_output_schema: &arrow::datatypes::SchemaRef,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<()>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: base_input,
+			partition_count,
+			key: base_exchange_key,
+		} = base
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: join0,
+			predicate: join0_filter,
+			disposition,
+		} = base_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *disposition == FilterDisposition::FullyPushed {
+			return Ok(None);
+		}
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::Inner,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy,
+			output_schema: join0_output_schema,
+			..
+		} = join0.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *replay_id != JoinReplayId(0) {
+			return Ok(None);
+		}
+		let Some(scan_input) = decompose_streaming_scan_probe_input(right) else {
+			return Ok(None);
+		};
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&left.schema(),
+			left_keys,
+			&right.schema(),
+			right_keys,
+			*null_safe_keys,
+		)?;
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&left_key_arrays,
+			left_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			*null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Ok(None);
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let probe_started = Instant::now();
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		while let Some(batch) = stream.next().await {
+			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				right_batch = self.filter_batch_with_bound_predicate(
+					predicate,
+					right_batch,
+					"filter predicate",
+				)?;
+				if right_batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+			let selection = probe_in_memory_join_rows(
+				JoinKind::Inner,
+				join_key_plan,
+				&build_rows,
+				left_batch.num_rows(),
+				&right_key_arrays,
+				right_batch.num_rows(),
+				match_filter.as_ref(),
+				&left_batch,
+				&right_batch,
+				*null_safe_keys,
+			)?;
+			output_rows = output_rows.saturating_add(selection.len() as u64);
+
+			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let batch = materialize_join_selection(
+					JoinKind::Inner,
+					&left_batch,
+					&right_batch,
+					chunk,
+					join0_output_schema,
+					self.context.task_budget.memory.get(),
+				)?;
+				let batch = self.filter_batch_with_bound_predicate(
+					join0_filter,
+					batch,
+					"filter predicate",
+				)?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+				for (_partition, partitioned) in
+					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
+				{
+					if partitioned.num_rows() == 0 {
+						continue;
+					}
+					let mut batches = vec![partitioned];
+					for runtime in inner_runtimes.iter_mut() {
+						let mut next = Vec::new();
+						for batch in batches {
+							next.extend(
+								self.probe_reoriented_inner_join_streaming(runtime, &batch)
+									.await?,
+							);
+						}
+						batches = next;
+						if let Some(predicate) = runtime.post_filter {
+							let mut filtered = Vec::new();
+							for batch in batches {
+								let batch = self.filter_batch_with_bound_predicate(
+									predicate,
+									batch,
+									"filter predicate",
+								)?;
+								if batch.num_rows() > 0 {
+									filtered.push(batch);
+								}
+							}
+							batches = filtered;
+						}
+						if batches.is_empty() {
+							break;
+						}
+					}
+
+					for batch in batches {
+						let filtered = if let Some(predicate) = outer_predicate {
+							self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?
+						} else {
+							batch
+						};
+						if filtered.num_rows() == 0 {
+							continue;
+						}
+						let projected = RecordBatch::try_new(
+							project_output_schema.clone(),
+							self.evaluate_bound_program(project_exprs, &filtered)?,
+						)?;
+						self.fold_bound_grouped_aggregate_batch(
+							groups,
+							group_types,
+							group_expr,
+							aggr_expr,
+							&projected,
+						)?;
+					}
+				}
+			}
+		}
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+		});
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: *strategy,
+				build_rows: RowCount::new(left_batch.num_rows() as u64),
+				probe_rows: RowCount::new(probe_rows),
+				output_rows: RowCount::new(output_rows),
+			},
+		);
+		Ok(Some(()))
 	}
 
 	pub(in crate::exec) async fn try_streaming_inner_prefix_semi_anti_grouped_aggregate(
