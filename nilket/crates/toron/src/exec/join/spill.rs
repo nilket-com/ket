@@ -782,6 +782,7 @@ pub(in crate::exec) struct SpilledSemiAntiExistenceBuild {
 	file_ops: Arc<dyn AsyncFileOps>,
 	file: FileHandle,
 	key: LessSafeKey,
+	projection: Option<SpilledSemiAntiExistenceProjection>,
 	pages: Vec<JoinSpillPage>,
 	index: HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
 	cache: HashMap<usize, CachedJoinSpillPage>,
@@ -794,6 +795,12 @@ pub(in crate::exec) struct SpilledSemiAntiExistenceBuild {
 	input_rows: u64,
 	input_batches_written: u64,
 	next_offset: u64,
+}
+
+#[derive(Clone)]
+struct SpilledSemiAntiExistenceProjection {
+	full_schema: SchemaRef,
+	retained_columns: Vec<crate::ir::ColumnOrdinal>,
 }
 
 impl SpilledSemiAntiExistenceBuild {
@@ -861,6 +868,7 @@ impl SpilledSemiAntiExistenceBuild {
 			file_ops,
 			file,
 			key,
+			projection: None,
 			pages: Vec::new(),
 			index: HashMap::new(),
 			cache: HashMap::new(),
@@ -874,6 +882,42 @@ impl SpilledSemiAntiExistenceBuild {
 			input_batches_written: 0,
 			next_offset: 0,
 		})
+	}
+
+	pub(in crate::exec) fn set_projection(
+		&mut self,
+		full_schema: SchemaRef,
+		retained_columns: Vec<crate::ir::ColumnOrdinal>,
+	) -> Result<(), ExecutionError> {
+		if retained_columns.is_empty() || retained_columns.len() >= full_schema.fields().len() {
+			self.projection = None;
+			return Ok(());
+		}
+		let mut seen = BTreeSet::new();
+		for ordinal in &retained_columns {
+			let index = ordinal.0 as usize;
+			if index >= full_schema.fields().len() {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!(
+						"projected semi/anti existence column ordinal {} out of bounds",
+						ordinal.0
+					),
+				});
+			}
+			if !seen.insert(*ordinal) {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!(
+						"projected semi/anti existence column ordinal {} repeated",
+						ordinal.0
+					),
+				});
+			}
+		}
+		self.projection = Some(SpilledSemiAntiExistenceProjection {
+			full_schema,
+			retained_columns,
+		});
+		Ok(())
 	}
 
 	pub(in crate::exec) async fn write_batch_chunks(
@@ -895,6 +939,108 @@ impl SpilledSemiAntiExistenceBuild {
 				.await?;
 		}
 		Ok(())
+	}
+
+	pub(in crate::exec) async fn write_projected_batch_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		projected_existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		let retained_columns = self
+			.projection
+			.as_ref()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "projected semi/anti existence spill missing projection".to_string(),
+			})?
+			.retained_columns
+			.clone();
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			let projected = project_batch_columns(&chunk, &retained_columns)?;
+			self.write_page_batch(&projected, key_plan, projected_existence_keys, task_budget)
+				.await?;
+		}
+		Ok(())
+	}
+
+	pub(in crate::exec) fn write_membership_key_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			self.index_membership_keys(&chunk, key_plan, existence_keys, task_budget)?;
+		}
+		Ok(())
+	}
+
+	pub(in crate::exec) fn write_projected_membership_key_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		projected_existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		let retained_columns = self
+			.projection
+			.as_ref()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "projected semi/anti existence spill missing projection".to_string(),
+			})?
+			.retained_columns
+			.clone();
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			let projected = project_batch_columns(&chunk, &retained_columns)?;
+			self.index_membership_keys(
+				&projected,
+				key_plan,
+				projected_existence_keys,
+				task_budget,
+			)?;
+		}
+		Ok(())
+	}
+
+	fn index_membership_keys(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		existence_keys: &[crate::ir::ColumnOrdinal],
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		let key_arrays = key_arrays(batch, existence_keys)?;
+		for row in 0..batch.num_rows() {
+			let Some(key) = join_key_at(key_plan, &key_arrays, row, false)? else {
+				continue;
+			};
+			self.index.entry(key).or_default();
+			self.rows = self.rows.saturating_add(1);
+		}
+		self.guard_resident_state(task_budget.memory.get())
 	}
 
 	pub(in crate::exec) async fn write_page_batch(
@@ -1006,12 +1152,29 @@ impl SpilledSemiAntiExistenceBuild {
 		self.input_batches_written
 	}
 
+	#[cfg(test)]
+	pub(in crate::exec) fn page_count(&self) -> usize {
+		self.pages.len()
+	}
+
 	pub(in crate::exec) async fn matching_preserved_rows(
 		&mut self,
 		preserved_batch: &RecordBatch,
 		preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
 		match_filter: Option<&BoundExprProgram>,
 	) -> Result<Vec<bool>, ExecutionError> {
+		if match_filter.is_none() {
+			let mut matched = vec![false; preserved_batch.num_rows()];
+			for (key, preserved_rows) in preserved_by_key {
+				if self.index.contains_key(key) {
+					for preserved_row in preserved_rows {
+						matched[*preserved_row as usize] = true;
+					}
+				}
+			}
+			return Ok(matched);
+		}
+
 		let mut page_work: BTreeMap<usize, Vec<(Vec<u32>, Vec<u32>)>> = BTreeMap::new();
 		for (key, preserved_rows) in preserved_by_key {
 			let Some(row_refs) = self.index.get(key) else {
@@ -1035,6 +1198,11 @@ impl SpilledSemiAntiExistenceBuild {
 		let mut matched = vec![false; preserved_batch.num_rows()];
 		for (page_index, groups) in page_work {
 			let existence_batch = self.read_batch_page(page_index).await?;
+			let existence_batch = if match_filter.is_some() {
+				self.restore_projected_batch(existence_batch)?
+			} else {
+				existence_batch
+			};
 			let mut residual =
 				JoinMatchResidual::new(match_filter, preserved_batch, &existence_batch);
 			for (preserved_rows, existence_rows) in groups {
@@ -1052,6 +1220,43 @@ impl SpilledSemiAntiExistenceBuild {
 			}
 		}
 		Ok(matched)
+	}
+
+	fn restore_projected_batch(&self, batch: RecordBatch) -> Result<RecordBatch, ExecutionError> {
+		let Some(projection) = &self.projection else {
+			return Ok(batch);
+		};
+		let retained_positions = projection
+			.retained_columns
+			.iter()
+			.enumerate()
+			.map(|(position, ordinal)| (ordinal.0 as usize, position))
+			.collect::<BTreeMap<_, _>>();
+		let mut columns = Vec::with_capacity(projection.full_schema.fields().len());
+		for (column_index, field) in projection.full_schema.fields().iter().enumerate() {
+			if let Some(retained_position) = retained_positions.get(&column_index).copied() {
+				let column = batch
+					.columns()
+					.get(retained_position)
+					.cloned()
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: format!(
+							"projected semi/anti existence page missing retained column {}",
+							column_index
+						),
+					})?;
+				columns.push(column);
+			} else {
+				columns.push(default_array_for_unused_column(
+					field.data_type(),
+					batch.num_rows(),
+				)?);
+			}
+		}
+		Ok(RecordBatch::try_new(
+			projection.full_schema.clone(),
+			columns,
+		)?)
 	}
 
 	pub(in crate::exec) async fn read_batch_page(

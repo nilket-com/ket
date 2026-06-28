@@ -277,6 +277,42 @@ fn collect_left_side_program_columns(
 	}
 }
 
+fn retained_existence_columns_for_semi_anti_stage(
+	stage: &StreamingSemiAntiStage<'_>,
+) -> Result<Option<Vec<ColumnOrdinal>>, ExecutionError> {
+	let existence_schema = stage.existence.schema();
+	let existence_width = existence_schema.fields().len();
+	let mut columns = BTreeSet::new();
+	columns.extend(stage.existence_keys.iter().copied());
+	if let Some(match_filter) = stage.match_filter {
+		let preserved_width = stage.output_schema.fields().len();
+		let mut referenced = BTreeSet::new();
+		collect_program_column_ordinals(match_filter, &mut referenced);
+		for column in referenced {
+			let index = column.0 as usize;
+			if index < preserved_width {
+				continue;
+			}
+			let existence_index = index - preserved_width;
+			if existence_index >= existence_width {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!(
+						"semi/anti residual existence column {} exceeds existence width {}",
+						existence_index, existence_width
+					),
+				});
+			}
+			columns.insert(ColumnOrdinal(existence_index as u32));
+		}
+	}
+	let retained = columns.into_iter().collect::<Vec<_>>();
+	if retained.is_empty() || retained.len() >= existence_width {
+		Ok(None)
+	} else {
+		Ok(Some(retained))
+	}
+}
+
 fn retained_left_outer_grouped_columns(
 	left_column_count: usize,
 	left_keys: &[ColumnOrdinal],
@@ -5591,9 +5627,20 @@ impl Executor {
 			stage.kind,
 			JoinKind::LeftSemi | JoinKind::LeftAnti
 		));
+		let full_existence_schema = stage.existence.schema();
+		let retained_existence_columns = retained_existence_columns_for_semi_anti_stage(&stage)?;
+		let (build_schema, write_existence_keys) =
+			if let Some(retained_columns) = retained_existence_columns.as_ref() {
+				(
+					projected_schema_for_columns(&full_existence_schema, retained_columns)?,
+					remap_column_ordinals(retained_columns, &stage.existence_keys)?,
+				)
+			} else {
+				(full_existence_schema.clone(), stage.existence_keys.clone())
+			};
 		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
-			&stage.existence.schema(),
-			&stage.existence_keys,
+			&build_schema,
+			&write_existence_keys,
 			&stage.output_schema,
 			&stage.preserved_keys,
 			false,
@@ -5604,11 +5651,17 @@ impl Executor {
 			self.context.join_spill_dir.clone(),
 		)
 		.await?;
+		if let Some(retained_columns) = retained_existence_columns.as_ref() {
+			spilled.set_projection(full_existence_schema.clone(), retained_columns.clone())?;
+		}
+		let membership_only = stage.match_filter.is_none();
 		let Some(()) = self
 			.write_streaming_semi_anti_existence(
 				stage.existence,
-				&stage.existence_keys,
+				&write_existence_keys,
 				key_plan,
+				retained_existence_columns.as_deref(),
+				membership_only,
 				morsel,
 				&mut spilled,
 			)
@@ -5646,6 +5699,8 @@ impl Executor {
 		plan: &ExecutionPlan,
 		existence_keys: &[crate::ir::ColumnOrdinal],
 		key_plan: JoinKeyPlan,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		membership_only: bool,
 		morsel: Option<(MorselId, u32)>,
 		spilled: &mut SpilledSemiAntiExistenceBuild,
 	) -> Result<Option<()>, ExecutionError> {
@@ -5718,9 +5773,41 @@ impl Executor {
 				}
 			}
 			for batch in batches {
-				spilled
-					.write_batch_chunks(&batch, key_plan, existence_keys, self.context.task_budget)
-					.await?;
+				if membership_only {
+					if retained_columns.is_some() {
+						spilled.write_projected_membership_key_chunks(
+							&batch,
+							key_plan,
+							existence_keys,
+							self.context.task_budget,
+						)?;
+					} else {
+						spilled.write_membership_key_chunks(
+							&batch,
+							key_plan,
+							existence_keys,
+							self.context.task_budget,
+						)?;
+					}
+				} else if retained_columns.is_some() {
+					spilled
+						.write_projected_batch_chunks(
+							&batch,
+							key_plan,
+							existence_keys,
+							self.context.task_budget,
+						)
+						.await?;
+				} else {
+					spilled
+						.write_batch_chunks(
+							&batch,
+							key_plan,
+							existence_keys,
+							self.context.task_budget,
+						)
+						.await?;
+				}
 			}
 		}
 		Ok(Some(()))
@@ -7161,6 +7248,202 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn projected_semi_anti_existence_build_keys_only_matches_unprojected() {
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("dead_payload", DataType::Utf8, false),
+			Field::new("dead_value", DataType::Int64, false),
+		]));
+		let preserved_schema = Arc::new(Schema::new(vec![Field::new(
+			"order_key",
+			DataType::Int64,
+			false,
+		)]));
+		let existence = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 3])),
+				Arc::new(StringArray::from(vec!["unused-a", "unused-b"])),
+				Arc::new(Int64Array::from(vec![10, 30])),
+			],
+		)
+		.expect("existence batch");
+		let preserved = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+		)
+		.expect("preserved batch");
+		let preserved_by_key = HashMap::from([
+			(JoinKey::Int64(1), vec![0]),
+			(JoinKey::Int64(2), vec![1]),
+			(JoinKey::Int64(3), vec![2]),
+		]);
+		let keys = vec![ColumnOrdinal(0)];
+		let mut projected = projected_existence_spill(
+			existence.clone(),
+			preserved_schema.clone(),
+			&keys,
+			vec![ColumnOrdinal(0)],
+		)
+		.await;
+		let page = projected.read_batch_page(0).await.expect("projected page");
+		assert_eq!(
+			page.num_columns(),
+			1,
+			"keys-only semi existence spill should not write dead payload columns"
+		);
+		let mut unprojected = unprojected_existence_spill(existence, preserved_schema, &keys).await;
+
+		let projected_matches = projected
+			.matching_preserved_rows(&preserved, &preserved_by_key, None)
+			.await
+			.expect("projected keys-only matches");
+		let unprojected_matches = unprojected
+			.matching_preserved_rows(&preserved, &preserved_by_key, None)
+			.await
+			.expect("unprojected keys-only matches");
+
+		assert_eq!(projected_matches, unprojected_matches);
+		assert_eq!(projected_matches, vec![true, false, true]);
+		projected.cleanup().await;
+		unprojected.cleanup().await;
+	}
+
+	#[tokio::test]
+	async fn membership_only_projected_semi_anti_existence_writes_no_pages() {
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("dead_payload", DataType::Utf8, false),
+		]));
+		let preserved_schema = Arc::new(Schema::new(vec![Field::new(
+			"order_key",
+			DataType::Int64,
+			false,
+		)]));
+		let existence = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 3])),
+				Arc::new(StringArray::from(vec!["unused-a", "unused-b", "unused-c"])),
+			],
+		)
+		.expect("existence batch");
+		let preserved = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+		)
+		.expect("preserved batch");
+		let preserved_by_key = HashMap::from([
+			(JoinKey::Int64(1), vec![0]),
+			(JoinKey::Int64(2), vec![1]),
+			(JoinKey::Int64(3), vec![2]),
+		]);
+		let keys = vec![ColumnOrdinal(0)];
+		let mut projected = projected_membership_existence_spill(
+			existence.clone(),
+			preserved_schema.clone(),
+			&keys,
+			vec![ColumnOrdinal(0)],
+		)
+		.await;
+		assert_eq!(
+			projected.page_count(),
+			0,
+			"membership-only semi/anti existence should answer from the key index"
+		);
+		assert_eq!(
+			projected.spill_bytes(),
+			0,
+			"membership-only semi/anti existence should not write page payloads"
+		);
+		let mut unprojected = unprojected_existence_spill(existence, preserved_schema, &keys).await;
+
+		let projected_matches = projected
+			.matching_preserved_rows(&preserved, &preserved_by_key, None)
+			.await
+			.expect("projected membership matches");
+		let unprojected_matches = unprojected
+			.matching_preserved_rows(&preserved, &preserved_by_key, None)
+			.await
+			.expect("unprojected membership matches");
+
+		assert_eq!(projected_matches, unprojected_matches);
+		assert_eq!(projected_matches, vec![true, false, true]);
+		projected.cleanup().await;
+		unprojected.cleanup().await;
+	}
+
+	#[tokio::test]
+	async fn projected_semi_anti_existence_build_retains_residual_columns() {
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("supp_key", DataType::Int64, false),
+			Field::new("dead_payload", DataType::Utf8, false),
+		]));
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("supp_key", DataType::Int64, false),
+		]));
+		let existence = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10, 10, 20])),
+				Arc::new(Int64Array::from(vec![1, 2, 1])),
+				Arc::new(StringArray::from(vec!["dead-a", "dead-b", "dead-c"])),
+			],
+		)
+		.expect("existence batch");
+		let preserved = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 10, 20, 30])),
+				Arc::new(Int64Array::from(vec![1, 2, 1, 9])),
+			],
+		)
+		.expect("preserved batch");
+		let preserved_by_key = HashMap::from([
+			(JoinKey::Int64(10), vec![0, 1]),
+			(JoinKey::Int64(20), vec![2]),
+			(JoinKey::Int64(30), vec![3]),
+		]);
+		let keys = vec![ColumnOrdinal(0)];
+		let mut projected = projected_existence_spill(
+			existence.clone(),
+			preserved_schema.clone(),
+			&keys,
+			vec![ColumnOrdinal(0), ColumnOrdinal(1)],
+		)
+		.await;
+		let page = projected.read_batch_page(0).await.expect("projected page");
+		assert_eq!(
+			page.num_columns(),
+			2,
+			"residual semi/anti existence spill must keep key plus residual payload only"
+		);
+		let mut unprojected = unprojected_existence_spill(existence, preserved_schema, &keys).await;
+		let residual = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(3),
+			"preserved_supp",
+			"existence_supp",
+		);
+
+		let projected_matches = projected
+			.matching_preserved_rows(&preserved, &preserved_by_key, Some(&residual))
+			.await
+			.expect("projected residual matches");
+		let unprojected_matches = unprojected
+			.matching_preserved_rows(&preserved, &preserved_by_key, Some(&residual))
+			.await
+			.expect("unprojected residual matches");
+
+		assert_eq!(projected_matches, unprojected_matches);
+		assert_eq!(projected_matches, vec![true, true, false, false]);
+		projected.cleanup().await;
+		unprojected.cleanup().await;
+	}
+
 	#[derive(Clone, Copy)]
 	enum StreamingValueKind {
 		Float64,
@@ -7210,6 +7493,153 @@ mod tests {
 		});
 		builder.push_root(column);
 		builder.build()
+	}
+
+	fn not_equal_residual_program(
+		left_ordinal: ColumnOrdinal,
+		right_ordinal: ColumnOrdinal,
+		left_name: &str,
+		right_name: &str,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let left = builder.append_column(ResolvedColumn {
+			name: ColumnName(left_name.to_string()),
+			ordinal: left_ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let right = builder.append_column(ResolvedColumn {
+			name: ColumnName(right_name.to_string()),
+			ordinal: right_ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let predicate = builder.append_binary(BoundBinaryOp::Neq, left, right, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	async fn projected_existence_spill(
+		existence: RecordBatch,
+		preserved_schema: SchemaRef,
+		existence_keys: &[ColumnOrdinal],
+		retained_columns: Vec<ColumnOrdinal>,
+	) -> SpilledSemiAntiExistenceBuild {
+		let context = ExecutionContext::local_test().with_task_budget(high_test_budget());
+		let projected_schema = projected_schema_for_columns(&existence.schema(), &retained_columns)
+			.expect("projected existence schema");
+		let projected_keys =
+			remap_column_ordinals(&retained_columns, existence_keys).expect("projected keys");
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&projected_schema,
+			&projected_keys,
+			&preserved_schema,
+			existence_keys,
+			false,
+		)
+		.expect("projected key plan");
+		let mut spilled = SpilledSemiAntiExistenceBuild::create(
+			context.task_budget,
+			context.join_spill_file_ops.clone(),
+			context.join_spill_dir.clone(),
+		)
+		.await
+		.expect("projected existence spill");
+		spilled
+			.set_projection(existence.schema(), retained_columns)
+			.expect("set projection");
+		spilled
+			.write_projected_batch_chunks(
+				&existence,
+				key_plan,
+				&projected_keys,
+				context.task_budget,
+			)
+			.await
+			.expect("write projected existence");
+		spilled
+			.finish(context.task_budget)
+			.await
+			.expect("finish spill");
+		spilled
+	}
+
+	async fn projected_membership_existence_spill(
+		existence: RecordBatch,
+		preserved_schema: SchemaRef,
+		existence_keys: &[ColumnOrdinal],
+		retained_columns: Vec<ColumnOrdinal>,
+	) -> SpilledSemiAntiExistenceBuild {
+		let context = ExecutionContext::local_test().with_task_budget(high_test_budget());
+		let projected_schema = projected_schema_for_columns(&existence.schema(), &retained_columns)
+			.expect("projected existence schema");
+		let projected_keys =
+			remap_column_ordinals(&retained_columns, existence_keys).expect("projected keys");
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&projected_schema,
+			&projected_keys,
+			&preserved_schema,
+			existence_keys,
+			false,
+		)
+		.expect("projected membership key plan");
+		let mut spilled = SpilledSemiAntiExistenceBuild::create(
+			context.task_budget,
+			context.join_spill_file_ops.clone(),
+			context.join_spill_dir.clone(),
+		)
+		.await
+		.expect("projected membership existence spill");
+		spilled
+			.set_projection(existence.schema(), retained_columns)
+			.expect("set projection");
+		spilled
+			.write_projected_membership_key_chunks(
+				&existence,
+				key_plan,
+				&projected_keys,
+				context.task_budget,
+			)
+			.expect("write projected membership existence");
+		spilled
+			.finish(context.task_budget)
+			.await
+			.expect("finish spill");
+		spilled
+	}
+
+	async fn unprojected_existence_spill(
+		existence: RecordBatch,
+		preserved_schema: SchemaRef,
+		existence_keys: &[ColumnOrdinal],
+	) -> SpilledSemiAntiExistenceBuild {
+		let context = ExecutionContext::local_test().with_task_budget(high_test_budget());
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&existence.schema(),
+			existence_keys,
+			&preserved_schema,
+			existence_keys,
+			false,
+		)
+		.expect("unprojected key plan");
+		let mut spilled = SpilledSemiAntiExistenceBuild::create(
+			context.task_budget,
+			context.join_spill_file_ops.clone(),
+			context.join_spill_dir.clone(),
+		)
+		.await
+		.expect("unprojected existence spill");
+		spilled
+			.write_batch_chunks(&existence, key_plan, existence_keys, context.task_budget)
+			.await
+			.expect("write unprojected existence");
+		spilled
+			.finish(context.task_budget)
+			.await
+			.expect("finish spill");
+		spilled
 	}
 
 	fn reoriented_scan_build_stage(
