@@ -72,6 +72,28 @@ async fn streaming_scan_global_aggregate_matches_materialized_float64_and_decima
 	}
 }
 
+#[tokio::test]
+async fn streaming_scan_exchange_grouped_aggregate_matches_materialized_float64_and_decimal_order()
+{
+	for kind in [ValueKind::Float64, ValueKind::Decimal] {
+		let (executor, streaming_plan, materialized_plan) = grouped_fixture(kind);
+		let streamed = executor
+			.execute_bound(&streaming_plan, None)
+			.await
+			.expect("streamed grouped aggregate");
+		let materialized = executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized grouped aggregate");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+			canonical_arrow_ipc_digest(&materialized, SortPolicy::None)
+				.expect("materialized digest")
+		);
+	}
+}
+
 fn fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) {
 	let amount_type = match kind {
 		ValueKind::Float64 => DataType::Float64,
@@ -122,6 +144,86 @@ fn fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) {
 	(executor, streaming_plan, materialized_plan)
 }
 
+fn grouped_fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) {
+	let amount_type = match kind {
+		ValueKind::Float64 => DataType::Float64,
+		ValueKind::Decimal => DataType::Decimal128(20, 2),
+	};
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("group_key", DataType::Int64, false),
+		Field::new("amount", amount_type.clone(), true),
+		Field::new("keep", DataType::Int64, false),
+	]));
+	let batch_1 = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![2, 1, 3, 1])),
+			amount_batch(
+				kind,
+				&[
+					Some(1_000),
+					Some(1_000_000_000_000_000_000),
+					Some(50),
+					Some(100),
+				],
+			),
+			Arc::new(Int64Array::from(vec![1, 1, 0, 1])),
+		],
+	)
+	.expect("grouped batch 1");
+	let batch_2 = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3, 1])),
+			amount_batch(
+				kind,
+				&[
+					Some(200),
+					Some(400),
+					Some(800),
+					Some(-1_000_000_000_000_000_000),
+				],
+			),
+			Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+		],
+	)
+	.expect("grouped batch 2");
+	let storage = Arc::new(MultiBatchStorage {
+		batches: HashMap::from([(TableId(2), vec![batch_1, batch_2])]),
+	});
+	let executor = Executor::new(storage);
+	let input = ExecutionPlan::Filter {
+		input: Box::new(scan_plan(TableId(2), schema)),
+		predicate: keep_filter_program(ColumnOrdinal(2)),
+		disposition: FilterDisposition::EvaluateInToron,
+	};
+	let group_expr = bound_column_root("group_key", ColumnOrdinal(0), DataType::Int64, false);
+	let streaming_plan = grouped_aggregate_plan(
+		ExecutionPlan::Exchange {
+			input: Box::new(input.clone()),
+			partition_count: 4,
+			key: group_expr.clone(),
+		},
+		group_expr.clone(),
+		amount_type.clone(),
+	);
+	let materialized_input_schema = input.schema();
+	let materialized_plan = grouped_aggregate_plan(
+		ExecutionPlan::Exchange {
+			input: Box::new(ExecutionPlan::Take {
+				input: Box::new(input),
+				limit: usize::MAX,
+				output_schema: materialized_input_schema,
+			}),
+			partition_count: 4,
+			key: group_expr.clone(),
+		},
+		group_expr,
+		amount_type,
+	);
+	(executor, streaming_plan, materialized_plan)
+}
+
 fn amount_batch(kind: ValueKind, values: &[Option<i128>]) -> ArrayRef {
 	match kind {
 		ValueKind::Float64 => Arc::new(Float64Array::from(
@@ -135,6 +237,37 @@ fn amount_batch(kind: ValueKind, values: &[Option<i128>]) -> ArrayRef {
 				.with_precision_and_scale(20, 2)
 				.expect("decimal amount"),
 		),
+	}
+}
+
+fn grouped_aggregate_plan(
+	input: ExecutionPlan,
+	group_expr: BoundExprProgram,
+	amount_type: DataType,
+) -> ExecutionPlan {
+	ExecutionPlan::Aggregate {
+		input: Box::new(input),
+		group_expr,
+		aggr_expr: vec![
+			BoundAggregateCall {
+				function: AggregateFunction::Sum,
+				args: bound_column_root("amount", ColumnOrdinal(1), amount_type.clone(), true),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Avg,
+				args: bound_column_root("amount", ColumnOrdinal(1), amount_type.clone(), true),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::CountAll,
+				args: BoundExprProgramBuilder::new().build(),
+			},
+		],
+		output_schema: Arc::new(Schema::new(vec![
+			Field::new("group_key", DataType::Int64, true),
+			Field::new("sum_amount", amount_type.clone(), true),
+			Field::new("avg_amount", amount_type, true),
+			Field::new("count_all", DataType::Int64, false),
+		])),
 	}
 }
 
@@ -177,13 +310,14 @@ fn scan_plan(table_id: TableId, schema: SchemaRef) -> ExecutionPlan {
 }
 
 fn descriptor(schema: &Schema) -> TableSchemaDescriptor {
+	let primary_key = schema.field(0).name().to_string();
 	TableSchemaDescriptor::new(
 		TableObjectId::new([1; 16]),
 		1,
 		"default",
 		"scan_global_aggregate_test",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("pk")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
 		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicy::AdditiveOnly,
 	)

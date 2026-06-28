@@ -7,6 +7,19 @@ struct StreamingScanGlobalInput<'a> {
 	project_filter_predicate: Option<&'a BoundExprProgram>,
 }
 
+impl StreamingScanGlobalInput<'_> {
+	fn output_schema(&self) -> SchemaRef {
+		self.project
+			.map(|(_, schema)| schema.clone())
+			.unwrap_or_else(|| self.scan.schema())
+	}
+}
+
+struct StreamingScanGroupedInput<'a> {
+	scan_input: StreamingScanGlobalInput<'a>,
+	exchange: Option<(u32, &'a BoundExprProgram)>,
+}
+
 impl Executor {
 	pub(in crate::exec) async fn try_streaming_global_aggregate(
 		&self,
@@ -78,23 +91,149 @@ impl Executor {
 			};
 			rows = rows.saturating_add(batch.num_rows());
 
-			if let Some(predicate) = streaming_input.scan_filter_predicate {
-				batch =
-					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
-			}
-			if let Some((exprs, schema)) = streaming_input.project {
-				let cols = self.evaluate_bound_program(exprs, &batch)?;
-				batch = RecordBatch::try_new(schema.clone(), cols)?;
-			}
-			if let Some(predicate) = streaming_input.project_filter_predicate {
-				batch =
-					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
-			}
+			batch = self.apply_streaming_scan_input_ops(&streaming_input, batch)?;
 
 			self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)?;
 		}
 
 		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+	}
+
+	pub(in crate::exec) async fn try_streaming_scan_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let Some(streaming_input) =
+			decompose_scan_grouped_aggregate_input(input, group_expr, aggr_expr)?
+		else {
+			return Ok(None);
+		};
+		let req = self
+			.bound_scan_request(streaming_input.scan_input.scan, morsel)
+			.expect("streaming scan grouped aggregate input should build a ScanRequest");
+		let row_limit = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		let mut rows = 0usize;
+		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut group_types = Vec::new();
+		let mut folded_input = false;
+
+		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			let Some(batch) = stream.next().await else {
+				break;
+			};
+			let batch = batch?;
+			let batch = if let Some(limit) = row_limit {
+				let remaining = limit - rows;
+				if batch.num_rows() > remaining {
+					batch.slice(0, remaining)
+				} else {
+					batch
+				}
+			} else {
+				batch
+			};
+			rows = rows.saturating_add(batch.num_rows());
+
+			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			self.fold_streaming_grouped_scan_batch(
+				&streaming_input,
+				batch,
+				group_expr,
+				aggr_expr,
+				&mut groups,
+				&mut group_types,
+				&mut folded_input,
+			)?;
+		}
+
+		if !folded_input {
+			let batch = RecordBatch::new_empty(streaming_input.scan_input.output_schema());
+			self.fold_bound_grouped_aggregate_batch(
+				&mut groups,
+				&mut group_types,
+				group_expr,
+				aggr_expr,
+				&batch,
+			)?;
+		}
+
+		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+			.map(Some)
+	}
+
+	fn apply_streaming_scan_input_ops(
+		&self,
+		streaming_input: &StreamingScanGlobalInput<'_>,
+		mut batch: RecordBatch,
+	) -> Result<RecordBatch, ExecutionError> {
+		if let Some(predicate) = streaming_input.scan_filter_predicate {
+			batch = self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+		}
+		if let Some((exprs, schema)) = streaming_input.project {
+			let cols = self.evaluate_bound_program(exprs, &batch)?;
+			batch = RecordBatch::try_new(schema.clone(), cols)?;
+		}
+		if let Some(predicate) = streaming_input.project_filter_predicate {
+			batch = self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+		}
+		Ok(batch)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn fold_streaming_grouped_scan_batch(
+		&self,
+		streaming_input: &StreamingScanGroupedInput<'_>,
+		batch: RecordBatch,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			if !*folded_input {
+				self.fold_bound_grouped_aggregate_batch(
+					groups,
+					group_types,
+					group_expr,
+					aggr_expr,
+					&batch,
+				)?;
+				*folded_input = true;
+			}
+			return Ok(());
+		}
+		if let Some((partition_count, exchange_key)) = streaming_input.exchange {
+			for (_partition, partitioned) in
+				self.repartition_exchange_batch(&batch, partition_count, exchange_key)?
+			{
+				self.fold_bound_grouped_aggregate_batch(
+					groups,
+					group_types,
+					group_expr,
+					aggr_expr,
+					&partitioned,
+				)?;
+				*folded_input = true;
+			}
+		} else {
+			self.fold_bound_grouped_aggregate_batch(
+				groups,
+				group_types,
+				group_expr,
+				aggr_expr,
+				&batch,
+			)?;
+			*folded_input = true;
+		}
+		Ok(())
 	}
 
 	pub(in crate::exec) fn bound_global_aggregate(
@@ -240,6 +379,45 @@ fn decompose_scan_global_aggregate_input(
 			})
 		}
 		_ => None,
+	}
+}
+
+fn decompose_scan_grouped_aggregate_input<'a>(
+	input: &'a ExecutionPlan,
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+) -> Result<Option<StreamingScanGroupedInput<'a>>, ExecutionError> {
+	match input {
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => {
+			if *partition_count == 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: "exchange partition_count must be greater than zero".to_string(),
+				});
+			}
+			if key != group_expr && !super::join::grouped_aggregate_is_order_insensitive(aggr_expr)
+			{
+				return Ok(None);
+			}
+			let Some(scan_input) = decompose_scan_global_aggregate_input(input.as_ref()) else {
+				return Ok(None);
+			};
+			Ok(Some(StreamingScanGroupedInput {
+				scan_input,
+				exchange: Some((*partition_count, key)),
+			}))
+		}
+		_ => Ok(
+			decompose_scan_global_aggregate_input(input).map(|scan_input| {
+				StreamingScanGroupedInput {
+					scan_input,
+					exchange: None,
+				}
+			}),
+		),
 	}
 }
 

@@ -921,6 +921,18 @@ impl Executor {
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
 						if let Some(output) = self
+							.try_streaming_scan_grouped_aggregate(
+								input,
+								group_expr,
+								aggr_expr,
+								output_schema,
+								morsel,
+							)
+							.await?
+						{
+							return Ok(output);
+						}
+						if let Some(output) = self
 							.try_streaming_projected_left_semi_grouped_aggregate(
 								input,
 								group_expr,
