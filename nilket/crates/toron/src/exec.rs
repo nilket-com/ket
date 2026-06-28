@@ -5286,7 +5286,7 @@ mod tests {
 			preserved_keys: vec![ColumnOrdinal(0)],
 			existence: &existence_plan,
 			existence_keys: vec![ColumnOrdinal(0)],
-			match_filter: &residual,
+			match_filter: Some(&residual),
 			output_schema: preserved_schema,
 			strategy: JoinStrategy::HashPartitioned,
 		};
@@ -5359,7 +5359,7 @@ mod tests {
 			preserved_keys: vec![ColumnOrdinal(0)],
 			existence: &existence_plan,
 			existence_keys: vec![ColumnOrdinal(0)],
-			match_filter: &residual,
+			match_filter: Some(&residual),
 			output_schema: preserved_schema,
 			strategy: JoinStrategy::HashPartitioned,
 		};
@@ -7334,7 +7334,7 @@ mod tests {
 			},
 			key_plan,
 			preserved_keys: vec![ColumnOrdinal(0)],
-			match_filter: residual,
+			match_filter: Some(residual),
 			output_schema: preserved_schema,
 			probe_rows: 0,
 			output_rows: 0,

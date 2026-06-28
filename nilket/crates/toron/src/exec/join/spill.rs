@@ -1010,7 +1010,7 @@ impl SpilledSemiAntiExistenceBuild {
 		&mut self,
 		preserved_batch: &RecordBatch,
 		preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
-		match_filter: &BoundExprProgram,
+		match_filter: Option<&BoundExprProgram>,
 	) -> Result<Vec<bool>, ExecutionError> {
 		let mut page_work: BTreeMap<usize, Vec<(Vec<u32>, Vec<u32>)>> = BTreeMap::new();
 		for (key, preserved_rows) in preserved_by_key {
@@ -1036,7 +1036,7 @@ impl SpilledSemiAntiExistenceBuild {
 		for (page_index, groups) in page_work {
 			let existence_batch = self.read_batch_page(page_index).await?;
 			let mut residual =
-				JoinMatchResidual::new(Some(match_filter), preserved_batch, &existence_batch);
+				JoinMatchResidual::new(match_filter, preserved_batch, &existence_batch);
 			for (preserved_rows, existence_rows) in groups {
 				for preserved_row in preserved_rows {
 					if matched[preserved_row as usize] {

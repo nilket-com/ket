@@ -61,7 +61,7 @@ pub(in crate::exec) struct StreamingSemiAntiStage<'a> {
 	pub(in crate::exec) preserved_keys: Vec<crate::ir::ColumnOrdinal>,
 	pub(in crate::exec) existence: &'a ExecutionPlan,
 	pub(in crate::exec) existence_keys: Vec<crate::ir::ColumnOrdinal>,
-	pub(in crate::exec) match_filter: &'a BoundExprProgram,
+	pub(in crate::exec) match_filter: Option<&'a BoundExprProgram>,
 	pub(in crate::exec) output_schema: SchemaRef,
 	pub(in crate::exec) strategy: JoinStrategy,
 }
@@ -95,7 +95,7 @@ pub(in crate::exec) struct StreamingSemiAntiRuntime<'a> {
 	pub(in crate::exec) existence_row_count: u64,
 	pub(in crate::exec) key_plan: JoinKeyPlan,
 	pub(in crate::exec) preserved_keys: Vec<crate::ir::ColumnOrdinal>,
-	pub(in crate::exec) match_filter: &'a BoundExprProgram,
+	pub(in crate::exec) match_filter: Option<&'a BoundExprProgram>,
 	pub(in crate::exec) output_schema: SchemaRef,
 	pub(in crate::exec) probe_rows: u64,
 	pub(in crate::exec) output_rows: u64,
@@ -1243,7 +1243,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 			preserved_keys: semi_left_keys.clone(),
 			existence: semi_right.as_ref(),
 			existence_keys: semi_right_keys.clone(),
-			match_filter: semi_filter,
+			match_filter: Some(semi_filter),
 			output_schema: semi_output_schema.clone(),
 			strategy: JoinStrategy::HashPartitioned,
 		},
@@ -1253,7 +1253,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 			preserved_keys: anti_left_keys.clone(),
 			existence: anti_right.as_ref(),
 			existence_keys: anti_right_keys.clone(),
-			match_filter: anti_filter,
+			match_filter: Some(anti_filter),
 			output_schema: anti_output_schema.clone(),
 			strategy: JoinStrategy::HashPartitioned,
 		},
@@ -3958,6 +3958,148 @@ impl Executor {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_scan_left_semi_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: aggregate_input,
+			partition_count,
+			key: exchange_key,
+		} = input
+		else {
+			return Ok(None);
+		};
+		if exchange_key != group_expr && !grouped_aggregate_is_order_insensitive(aggr_expr) {
+			return Ok(None);
+		}
+		let ExecutionPlan::Filter {
+			input: semi_input,
+			predicate: post_filter,
+			disposition: FilterDisposition::EvaluateInToron,
+		} = aggregate_input.as_ref()
+		else {
+			return Ok(None);
+		};
+		let semi_input = semi_input.as_ref();
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::LeftSemi,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys: false,
+			strategy,
+			output_schema: semi_output_schema,
+			..
+		} = semi_input
+		else {
+			return Ok(None);
+		};
+		let Some(scan_input) = decompose_streaming_scan_probe_input(left) else {
+			return Ok(None);
+		};
+		if decompose_streaming_existence_plan(right).is_none() {
+			return Ok(None);
+		}
+
+		let stage = StreamingSemiAntiStage {
+			replay_id: *replay_id,
+			kind: JoinKind::LeftSemi,
+			preserved_keys: left_keys.clone(),
+			existence: right.as_ref(),
+			existence_keys: right_keys.clone(),
+			match_filter: match_filter.as_ref(),
+			output_schema: semi_output_schema.clone(),
+			strategy: *strategy,
+		};
+		let Some(mut runtime) = self
+			.prepare_streaming_semi_anti_runtime(stage, morsel)
+			.await?
+		else {
+			return Ok(None);
+		};
+
+		let output = async {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Ok(None);
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+			let mut group_types = Vec::new();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				batch =
+					self.filter_batch_with_bound_predicate(post_filter, batch, "filter predicate")?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+				let mut semi_batches = self.probe_streaming_semi_anti(&mut runtime, &batch).await?;
+				for batch in semi_batches.drain(..) {
+					if batch.num_rows() == 0 {
+						continue;
+					}
+					for (_partition, partitioned) in
+						self.repartition_exchange_batch(&batch, *partition_count, exchange_key)?
+					{
+						if partitioned.num_rows() == 0 {
+							continue;
+						}
+						self.fold_bound_grouped_aggregate_batch(
+							&mut groups,
+							&mut group_types,
+							group_expr,
+							aggr_expr,
+							&partitioned,
+						)?;
+					}
+				}
+			}
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: *replay_id,
+					strategy: *strategy,
+					build_rows: RowCount::new(runtime.existence_row_count),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+				.map(Some)
+		}
+		.await;
+		runtime.cleanup().await;
+		output
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	pub(in crate::exec) async fn try_streaming_projected_left_semi_grouped_aggregate(
 		&self,
 		input: &ExecutionPlan,
@@ -3966,6 +4108,18 @@ impl Executor {
 		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		if let Some(output) = self
+			.try_streaming_scan_left_semi_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
 		let ExecutionPlan::Exchange {
 			input: aggregate_input,
 			partition_count,
@@ -4668,16 +4822,20 @@ impl Executor {
 		let mut required_output = BTreeSet::new();
 		required_output.extend(chain.semi_stage.preserved_keys.iter().copied());
 		required_output.extend(chain.anti_stage.preserved_keys.iter().copied());
-		collect_left_side_program_columns(
-			chain.semi_stage.match_filter,
-			chain.semi_stage.output_schema.fields().len(),
-			&mut required_output,
-		);
-		collect_left_side_program_columns(
-			chain.anti_stage.match_filter,
-			chain.anti_stage.output_schema.fields().len(),
-			&mut required_output,
-		);
+		if let Some(match_filter) = chain.semi_stage.match_filter {
+			collect_left_side_program_columns(
+				match_filter,
+				chain.semi_stage.output_schema.fields().len(),
+				&mut required_output,
+			);
+		}
+		if let Some(match_filter) = chain.anti_stage.match_filter {
+			collect_left_side_program_columns(
+				match_filter,
+				chain.anti_stage.output_schema.fields().len(),
+				&mut required_output,
+			);
+		}
 		collect_program_column_ordinals(group_expr, &mut required_output);
 		collect_aggregate_columns(aggr_expr, &mut required_output);
 		mark_reoriented_inner_stage_projections(&mut chain.inner_stages, required_output)?;
@@ -6071,12 +6229,12 @@ impl Executor {
 fn matching_preserved_rows_in_memory(
 	preserved_batch: &RecordBatch,
 	preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
-	match_filter: &BoundExprProgram,
+	match_filter: Option<&BoundExprProgram>,
 	existence_batch: &RecordBatch,
 	existence_rows: &HashMap<JoinKey, BuildRowList>,
 ) -> Result<Vec<bool>, ExecutionError> {
 	let mut matched = vec![false; preserved_batch.num_rows()];
-	let mut residual = JoinMatchResidual::new(Some(match_filter), preserved_batch, existence_batch);
+	let mut residual = JoinMatchResidual::new(match_filter, preserved_batch, existence_batch);
 	for (key, preserved_rows) in preserved_by_key {
 		let Some(matches) = existence_rows.get(key) else {
 			continue;
@@ -6214,6 +6372,163 @@ mod tests {
 		}
 	}
 
+	fn left_semi_join_plan(
+		left: ExecutionPlan,
+		right: ExecutionPlan,
+		left_keys: Vec<ColumnOrdinal>,
+		right_keys: Vec<ColumnOrdinal>,
+		output_schema: SchemaRef,
+	) -> ExecutionPlan {
+		ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(left),
+			right: Box::new(right),
+			kind: JoinKind::LeftSemi,
+			left_keys,
+			right_keys,
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+		}
+	}
+
+	fn exchange_plan(
+		input: ExecutionPlan,
+		key: BoundExprProgram,
+		partition_count: u32,
+	) -> ExecutionPlan {
+		ExecutionPlan::Exchange {
+			input: Box::new(input),
+			partition_count,
+			key,
+		}
+	}
+
+	fn less_than_filter_program(ordinal: ColumnOrdinal, upper: i64) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let value = builder.append_column(ResolvedColumn {
+			name: ColumnName("value".to_string()),
+			ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let upper = builder.append_literal(ScalarValue::Int64(Some(upper)));
+		let predicate = builder.append_binary(BoundBinaryOp::Lt, value, upper, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	fn high_test_budget() -> TaskBudget {
+		TaskBudget {
+			memory: ByteCount::new(128 * 1024 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		}
+	}
+
+	fn filtered_scan_left_semi_grouped_aggregate_fixture(
+		rows: usize,
+		payload_len: usize,
+		budget: TaskBudget,
+	) -> (Executor, ExecutionPlan) {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("quantity", DataType::Decimal128(20, 2), false),
+			Field::new("payload", DataType::Utf8, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+		]));
+		let payload = "x".repeat(payload_len);
+		let left_keys = (0..rows)
+			.map(|value| i64::try_from(value).expect("row fits i64"))
+			.collect::<Vec<_>>();
+		let quantity = Decimal128Array::from(
+			(0..rows)
+				.map(|row| Some(((row % 11) as i128 + 1) * 100))
+				.collect::<Vec<_>>(),
+		)
+		.with_precision_and_scale(20, 2)
+		.expect("quantity decimal");
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(left_keys.clone())),
+				Arc::new(Int64Array::from(left_keys.clone())),
+				Arc::new(quantity),
+				Arc::new(StringArray::from(vec![payload.as_str(); rows])),
+			],
+		)
+		.expect("filtered scan preserved batch");
+		let right_keys = (0..rows)
+			.flat_map(|value| {
+				let value = i64::try_from(value).expect("row fits i64");
+				[value, value]
+			})
+			.collect::<Vec<_>>();
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..right_keys.len())
+						.map(|value| i64::try_from(value).expect("row fits i64"))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(right_keys)),
+			],
+		)
+		.expect("filtered scan existence batch");
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([
+				(TableId(1), vec![left_batch]),
+				(TableId(2), vec![right_batch]),
+			]),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		});
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(budget),
+		);
+		let semi = left_semi_join_plan(
+			test_scan_plan_with_first_field_key(TableId(1), left_schema.clone(), 1),
+			test_scan_plan_with_first_field_key(TableId(2), right_schema, 2),
+			vec![ColumnOrdinal(1)],
+			vec![ColumnOrdinal(1)],
+			left_schema,
+		);
+		let filtered = ExecutionPlan::Filter {
+			input: Box::new(semi),
+			predicate: less_than_filter_program(ColumnOrdinal(0), 4),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let group_expr = bound_column_root("order_key", ColumnOrdinal(1), DataType::Int64, false);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: bound_column_root(
+				"quantity",
+				ColumnOrdinal(2),
+				DataType::Decimal128(20, 2),
+				false,
+			),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("sum_quantity", DataType::Decimal128(20, 2), true),
+		]));
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(exchange_plan(filtered, group_expr.clone(), 1)),
+			group_expr,
+			aggr_expr,
+			output_schema,
+		};
+		(executor, plan)
+	}
+
 	#[tokio::test]
 	async fn streaming_inner_join_scan_probe_visits_probe_batches_without_materializing_scan() {
 		let left_schema = Arc::new(Schema::new(vec![
@@ -6308,6 +6623,36 @@ mod tests {
 				.expect("requested tables")
 				.as_slice(),
 			&[TableId(2), TableId(1)]
+		);
+	}
+
+	#[tokio::test]
+	async fn scan_filtered_left_semi_grouped_aggregate_bypasses_scan_output_accumulator() {
+		let rows = 512usize;
+		let low_budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (stream_executor, plan) =
+			filtered_scan_left_semi_grouped_aggregate_fixture(rows, 4096, low_budget);
+		let streamed = stream_executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("streamed scan left-semi grouped aggregate");
+
+		let (baseline_executor, baseline_plan) =
+			filtered_scan_left_semi_grouped_aggregate_fixture(rows, 4096, high_test_budget());
+		let materialized = baseline_executor
+			.execute_bound(&baseline_plan, None)
+			.await
+			.expect("materialized scan left-semi grouped aggregate");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+			canonical_arrow_ipc_digest(&materialized, SortPolicy::None)
+				.expect("materialized digest"),
+			"streamed scan left-semi grouped aggregate must match materialized output"
 		);
 	}
 
