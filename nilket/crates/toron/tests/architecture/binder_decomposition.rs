@@ -239,6 +239,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/rune_relation_handles_test.rs",
 				"crates/toron/tests/rune_window_test.rs",
 				"crates/toron/tests/runtime_filter_pushdown_test.rs",
+				// ADR 367: focused executor regression for scan-to-global-aggregate streaming.
+				"crates/toron/tests/scan_global_aggregate_streaming_test.rs",
 				"crates/toron/tests/sort_ordering_test.rs",
 				"crates/toron/tests/wendelon_storage_execution_test.rs",
 				"crates/toron/tests/window_test.rs",

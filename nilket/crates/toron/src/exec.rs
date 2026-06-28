@@ -912,23 +912,7 @@ impl Executor {
 				} => {
 					if group_expr.is_empty_roots() {
 						if let Some(output) = self
-							.try_streaming_correlated_scalar_left_outer_global_aggregate(
-								input,
-								aggr_expr,
-								output_schema,
-								morsel,
-							)
-							.await?
-						{
-							return Ok(output);
-						}
-						if let Some(output) = self
-							.try_streaming_collapsing_global_aggregate(
-								input,
-								aggr_expr,
-								output_schema,
-								morsel,
-							)
+							.try_streaming_global_aggregate(input, aggr_expr, output_schema, morsel)
 							.await?
 						{
 							return Ok(output);

@@ -1,6 +1,102 @@
 use super::*;
 
+struct StreamingScanGlobalInput<'a> {
+	scan: &'a ExecutionPlan,
+	scan_filter_predicate: Option<&'a BoundExprProgram>,
+	project: Option<(&'a BoundExprProgram, &'a SchemaRef)>,
+	project_filter_predicate: Option<&'a BoundExprProgram>,
+}
+
 impl Executor {
+	pub(in crate::exec) async fn try_streaming_global_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		if let Some(output) = self
+			.try_streaming_scan_global_aggregate(input, aggr_expr, output_schema, morsel)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_correlated_scalar_left_outer_global_aggregate(
+				input,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_collapsing_global_aggregate(input, aggr_expr, output_schema, morsel)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		Ok(None)
+	}
+
+	pub(in crate::exec) async fn try_streaming_scan_global_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let Some(streaming_input) = decompose_scan_global_aggregate_input(input) else {
+			return Ok(None);
+		};
+		let req = self
+			.bound_scan_request(streaming_input.scan, morsel)
+			.expect("streaming scan global aggregate input should build a ScanRequest");
+		let row_limit = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		let mut rows = 0usize;
+		let mut state = init_global_aggregate_state(aggr_expr)?;
+
+		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			let Some(batch) = stream.next().await else {
+				break;
+			};
+			let batch = batch?;
+			let mut batch = if let Some(limit) = row_limit {
+				let remaining = limit - rows;
+				if batch.num_rows() > remaining {
+					batch.slice(0, remaining)
+				} else {
+					batch
+				}
+			} else {
+				batch
+			};
+			rows = rows.saturating_add(batch.num_rows());
+
+			if let Some(predicate) = streaming_input.scan_filter_predicate {
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+			}
+			if let Some((exprs, schema)) = streaming_input.project {
+				let cols = self.evaluate_bound_program(exprs, &batch)?;
+				batch = RecordBatch::try_new(schema.clone(), cols)?;
+			}
+			if let Some(predicate) = streaming_input.project_filter_predicate {
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+			}
+
+			self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)?;
+		}
+
+		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+	}
+
 	pub(in crate::exec) fn bound_global_aggregate(
 		&self,
 		input_batches: &[RecordBatch],
@@ -90,6 +186,90 @@ impl Executor {
 			}
 		}
 		Ok(())
+	}
+}
+
+fn decompose_scan_global_aggregate_input(
+	input: &ExecutionPlan,
+) -> Option<StreamingScanGlobalInput<'_>> {
+	match input {
+		ExecutionPlan::Scan { .. } => Some(StreamingScanGlobalInput {
+			scan: input,
+			scan_filter_predicate: None,
+			project: None,
+			project_filter_predicate: None,
+		}),
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => match input.as_ref() {
+			ExecutionPlan::Scan { .. } => Some(StreamingScanGlobalInput {
+				scan: input.as_ref(),
+				scan_filter_predicate: streaming_filter_predicate(predicate, *disposition),
+				project: None,
+				project_filter_predicate: None,
+			}),
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => {
+				let (scan, scan_filter_predicate) =
+					decompose_scan_or_filtered_scan(input.as_ref())?;
+				Some(StreamingScanGlobalInput {
+					scan,
+					scan_filter_predicate,
+					project: Some((exprs, output_schema)),
+					project_filter_predicate: streaming_filter_predicate(predicate, *disposition),
+				})
+			}
+			_ => None,
+		},
+		ExecutionPlan::Project {
+			input,
+			exprs,
+			output_schema,
+		} => {
+			let (scan, scan_filter_predicate) = decompose_scan_or_filtered_scan(input.as_ref())?;
+			Some(StreamingScanGlobalInput {
+				scan,
+				scan_filter_predicate,
+				project: Some((exprs, output_schema)),
+				project_filter_predicate: None,
+			})
+		}
+		_ => None,
+	}
+}
+
+fn decompose_scan_or_filtered_scan(
+	input: &ExecutionPlan,
+) -> Option<(&ExecutionPlan, Option<&BoundExprProgram>)> {
+	match input {
+		ExecutionPlan::Scan { .. } => Some((input, None)),
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => match input.as_ref() {
+			ExecutionPlan::Scan { .. } => Some((
+				input.as_ref(),
+				streaming_filter_predicate(predicate, *disposition),
+			)),
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
+fn streaming_filter_predicate(
+	predicate: &BoundExprProgram,
+	disposition: FilterDisposition,
+) -> Option<&BoundExprProgram> {
+	match disposition {
+		FilterDisposition::FullyPushed => None,
+		FilterDisposition::EvaluateInToron => Some(predicate),
 	}
 }
 
