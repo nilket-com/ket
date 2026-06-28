@@ -9,8 +9,9 @@ use toron::error::StorageError;
 use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprProgram,
-	BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan, FilterDisposition,
-	QueryProfileHint, ResolvedColumn, ScalarValue, TableId,
+	BoundExprProgramBuilder, BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ExecutionPlan,
+	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, QueryProfileHint, ResolvedColumn,
+	ScalarValue, TableId,
 };
 use toron::storage::{RowIdentityProjection, ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -92,6 +93,24 @@ async fn streaming_scan_exchange_grouped_aggregate_matches_materialized_float64_
 				.expect("materialized digest")
 		);
 	}
+}
+
+#[tokio::test]
+async fn streaming_scan_left_outer_grouped_aggregate_matches_materialized_residual_and_null_fill() {
+	let (executor, streaming_plan, materialized_plan) = left_outer_grouped_fixture();
+	let streamed = executor
+		.execute_bound(&streaming_plan, None)
+		.await
+		.expect("streamed left outer grouped aggregate");
+	let materialized = executor
+		.execute_bound(&materialized_plan, None)
+		.await
+		.expect("materialized left outer grouped aggregate");
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+		canonical_arrow_ipc_digest(&materialized, SortPolicy::None).expect("materialized digest")
+	);
 }
 
 fn fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) {
@@ -222,6 +241,120 @@ fn grouped_fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) 
 		amount_type,
 	);
 	(executor, streaming_plan, materialized_plan)
+}
+
+fn left_outer_grouped_fixture() -> (Executor, ExecutionPlan, ExecutionPlan) {
+	let customer_schema = Arc::new(Schema::new(vec![Field::new(
+		"c_custkey",
+		DataType::Int64,
+		false,
+	)]));
+	let orders_schema = Arc::new(Schema::new(vec![
+		Field::new("o_orderkey", DataType::Int64, false),
+		Field::new("o_custkey", DataType::Int64, false),
+		Field::new("keep", DataType::Int64, false),
+	]));
+	let customer_batch = RecordBatch::try_new(
+		customer_schema.clone(),
+		vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+	)
+	.expect("customer batch");
+	let orders_batch_1 = RecordBatch::try_new(
+		orders_schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![10, 11, 12])),
+			Arc::new(Int64Array::from(vec![1, 1, 2])),
+			Arc::new(Int64Array::from(vec![1, 1, 0])),
+		],
+	)
+	.expect("orders batch 1");
+	let orders_batch_2 = RecordBatch::try_new(
+		orders_schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![13, 14, 15])),
+			Arc::new(Int64Array::from(vec![4, 4, 5])),
+			Arc::new(Int64Array::from(vec![1, 0, 1])),
+		],
+	)
+	.expect("orders batch 2");
+	let storage = Arc::new(MultiBatchStorage {
+		batches: HashMap::from([
+			(TableId(10), vec![customer_batch]),
+			(TableId(11), vec![orders_batch_1, orders_batch_2]),
+		]),
+	});
+	let executor = Executor::new(storage);
+
+	let customer = scan_plan(TableId(10), customer_schema.clone());
+	let orders = scan_plan(TableId(11), orders_schema.clone());
+	let materialized_orders = ExecutionPlan::Take {
+		input: Box::new(orders.clone()),
+		limit: usize::MAX,
+		output_schema: orders.schema(),
+	};
+	let streaming_inner = customer_count_by_order_count_plan(customer.clone(), orders);
+	let materialized_inner = customer_count_by_order_count_plan(customer, materialized_orders);
+	let outer_group = bound_column_root("c_count", ColumnOrdinal(1), DataType::Int64, false);
+	let streaming_plan = count_distribution_plan(streaming_inner, outer_group.clone());
+	let materialized_plan = count_distribution_plan(materialized_inner, outer_group);
+	(executor, streaming_plan, materialized_plan)
+}
+
+fn customer_count_by_order_count_plan(
+	customer: ExecutionPlan,
+	orders: ExecutionPlan,
+) -> ExecutionPlan {
+	let join_output_schema = Arc::new(Schema::new(vec![
+		Field::new("c_custkey", DataType::Int64, false),
+		Field::new("o_orderkey", DataType::Int64, true),
+		Field::new("o_custkey", DataType::Int64, true),
+		Field::new("keep", DataType::Int64, true),
+	]));
+	let group_expr = bound_column_root("c_custkey", ColumnOrdinal(0), DataType::Int64, false);
+	let join = ExecutionPlan::Join {
+		replay_id: JoinReplayId::SYNTHETIC,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
+		left: Box::new(customer),
+		right: Box::new(orders),
+		kind: JoinKind::LeftOuter,
+		left_keys: vec![ColumnOrdinal(0)],
+		right_keys: vec![ColumnOrdinal(1)],
+		match_filter: Some(keep_filter_program(ColumnOrdinal(3))),
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema: join_output_schema,
+	};
+	ExecutionPlan::Aggregate {
+		input: Box::new(ExecutionPlan::Exchange {
+			input: Box::new(join),
+			partition_count: 4,
+			key: group_expr.clone(),
+		}),
+		group_expr,
+		aggr_expr: vec![BoundAggregateCall {
+			function: AggregateFunction::Count,
+			args: bound_column_root("o_orderkey", ColumnOrdinal(1), DataType::Int64, true),
+		}],
+		output_schema: Arc::new(Schema::new(vec![
+			Field::new("c_custkey", DataType::Int64, true),
+			Field::new("c_count", DataType::Int64, false),
+		])),
+	}
+}
+
+fn count_distribution_plan(input: ExecutionPlan, group_expr: BoundExprProgram) -> ExecutionPlan {
+	ExecutionPlan::Aggregate {
+		input: Box::new(input),
+		group_expr,
+		aggr_expr: vec![BoundAggregateCall {
+			function: AggregateFunction::CountAll,
+			args: BoundExprProgramBuilder::new().build(),
+		}],
+		output_schema: Arc::new(Schema::new(vec![
+			Field::new("c_count", DataType::Int64, true),
+			Field::new("custdist", DataType::Int64, false),
+		])),
+	}
 }
 
 fn amount_batch(kind: ValueKind, values: &[Option<i128>]) -> ArrayRef {

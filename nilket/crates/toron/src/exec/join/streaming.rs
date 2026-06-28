@@ -115,6 +115,11 @@ pub(in crate::exec) struct StreamingLeftOuterRecombineRuntime<'a> {
 	output_rows: u64,
 }
 
+struct StreamingLeftOuterGroupedInput<'a> {
+	join: &'a ExecutionPlan,
+	exchange: Option<(u32, &'a BoundExprProgram)>,
+}
+
 impl StreamingSemiAntiRuntime<'_> {
 	pub(in crate::exec) async fn cleanup(self) {
 		if let StreamingSemiAntiExistence::Spilled(spilled) = self.existence {
@@ -270,6 +275,25 @@ fn collect_left_side_program_columns(
 			columns.insert(column);
 		}
 	}
+}
+
+fn retained_left_outer_grouped_columns(
+	left_column_count: usize,
+	left_keys: &[ColumnOrdinal],
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	exchange: Option<(u32, &BoundExprProgram)>,
+) -> Vec<ColumnOrdinal> {
+	let mut columns = BTreeSet::new();
+	columns.extend(left_keys.iter().copied());
+	collect_left_side_program_columns(group_expr, left_column_count, &mut columns);
+	if let Some((_partition_count, exchange_key)) = exchange {
+		collect_left_side_program_columns(exchange_key, left_column_count, &mut columns);
+	}
+	for call in aggr_expr {
+		collect_left_side_program_columns(&call.args, left_column_count, &mut columns);
+	}
+	columns.into_iter().collect()
 }
 
 fn mark_reoriented_inner_stage_projections(
@@ -479,6 +503,56 @@ pub(in crate::exec) fn decompose_streaming_scan_probe_input(
 	}
 }
 
+fn decompose_streaming_left_outer_grouped_input<'a>(
+	input: &'a ExecutionPlan,
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+) -> Result<Option<StreamingLeftOuterGroupedInput<'a>>, ExecutionError> {
+	match input {
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => {
+			if *partition_count == 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: "exchange partition_count must be greater than zero".to_string(),
+				});
+			}
+			if key != group_expr && !grouped_aggregate_is_order_insensitive(aggr_expr) {
+				return Ok(None);
+			}
+			if !is_streaming_left_outer_grouped_join(input.as_ref()) {
+				return Ok(None);
+			}
+			Ok(Some(StreamingLeftOuterGroupedInput {
+				join: input.as_ref(),
+				exchange: Some((*partition_count, key)),
+			}))
+		}
+		_ if is_streaming_left_outer_grouped_join(input) => {
+			Ok(Some(StreamingLeftOuterGroupedInput {
+				join: input,
+				exchange: None,
+			}))
+		}
+		_ => Ok(None),
+	}
+}
+
+fn is_streaming_left_outer_grouped_join(input: &ExecutionPlan) -> bool {
+	let ExecutionPlan::Join {
+		right,
+		kind: JoinKind::LeftOuter,
+		strategy: JoinStrategy::HashPartitioned,
+		..
+	} = input
+	else {
+		return false;
+	};
+	decompose_streaming_scan_probe_input(right).is_some()
+}
+
 fn concat_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
 	Arc::new(Schema::new(
 		left.fields()
@@ -671,6 +745,212 @@ async fn materialize_projected_streamed_spilled_inner_matches(
 	let probe_indices = UInt32Array::from(probe_indices);
 	for column in probe_batch.columns() {
 		columns.push(take(column, &probe_indices, None)?);
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+async fn materialize_projected_streamed_spilled_left_outer_matches(
+	spilled: &mut SpilledInnerJoinBuild,
+	probe_batch: &RecordBatch,
+	matches: &[SpilledInnerJoinMatch],
+	full_left_schema: &SchemaRef,
+	retained_columns: &[ColumnOrdinal],
+	output_schema: &SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if matches.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in matches {
+		page_sources
+			.entry(row.build.page_index)
+			.or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let retained_positions = retained_columns
+		.iter()
+		.enumerate()
+		.map(|(position, ordinal)| (ordinal.0 as usize, position))
+		.collect::<BTreeMap<_, _>>();
+	let mut default_columns = BTreeMap::new();
+	let mut default_column_bytes = 0u64;
+	for (column_index, field) in full_left_schema.fields().iter().enumerate() {
+		if retained_positions.contains_key(&column_index) {
+			continue;
+		}
+		let column = default_array_for_unused_column(field.data_type(), matches.len())?;
+		default_column_bytes = default_column_bytes
+			.saturating_add(u64::try_from(column.get_array_memory_size()).unwrap_or(u64::MAX));
+		default_columns.insert(column_index, column);
+	}
+
+	let estimated_output_bytes = join_take_index_bytes(matches.len())
+		.saturating_add(join_interleave_index_bytes(matches.len()))
+		.saturating_add(estimate_spilled_inner_build_selection_bytes(
+			&build_pages,
+			matches.len(),
+		))
+		.saturating_add(estimate_selected_batch_bytes(probe_batch, matches.len()))
+		.saturating_add(default_column_bytes);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"projected spilled left outer output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(matches.len());
+	let mut probe_indices = Vec::with_capacity(matches.len());
+	for row in matches {
+		let source_index =
+			*page_sources
+				.get(&row.build.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"projected spilled left outer missing spilled page source {}",
+						row.build.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.build.row as usize));
+		probe_indices.push(Some(row.probe));
+	}
+
+	let mut columns =
+		Vec::with_capacity(full_left_schema.fields().len() + probe_batch.num_columns());
+	for column_index in 0..full_left_schema.fields().len() {
+		if let Some(retained_position) = retained_positions.get(&column_index).copied() {
+			let source_columns = build_pages
+				.iter()
+				.map(|batch| batch.column(retained_position).as_ref())
+				.collect::<Vec<_>>();
+			columns.push(interleave(&source_columns, &build_indices)?);
+		} else {
+			columns.push(default_columns.remove(&column_index).ok_or_else(|| {
+				ExecutionError::Kernel {
+					message: format!(
+						"projected spilled left outer missing default column {}",
+						column_index
+					),
+				}
+			})?);
+		}
+	}
+	let probe_indices = UInt32Array::from(probe_indices);
+	for column in probe_batch.columns() {
+		columns.push(take(column, &probe_indices, None)?);
+	}
+
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+async fn materialize_projected_streamed_spilled_left_outer_unmatched(
+	spilled: &mut SpilledInnerJoinBuild,
+	refs: &[SpilledBatchRowRef],
+	full_left_schema: &SchemaRef,
+	retained_columns: &[ColumnOrdinal],
+	right_schema: &SchemaRef,
+	output_schema: &SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if refs.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in refs {
+		page_sources.entry(row.page_index).or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let retained_positions = retained_columns
+		.iter()
+		.enumerate()
+		.map(|(position, ordinal)| (ordinal.0 as usize, position))
+		.collect::<BTreeMap<_, _>>();
+	let mut default_columns = BTreeMap::new();
+	let mut default_column_bytes = 0u64;
+	for (column_index, field) in full_left_schema.fields().iter().enumerate() {
+		if retained_positions.contains_key(&column_index) {
+			continue;
+		}
+		let column = default_array_for_unused_column(field.data_type(), refs.len())?;
+		default_column_bytes = default_column_bytes
+			.saturating_add(u64::try_from(column.get_array_memory_size()).unwrap_or(u64::MAX));
+		default_columns.insert(column_index, column);
+	}
+
+	let estimated_output_bytes = join_interleave_index_bytes(refs.len())
+		.saturating_add(estimate_spilled_inner_build_selection_bytes(
+			&build_pages,
+			refs.len(),
+		))
+		.saturating_add(default_column_bytes);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"projected spilled left outer unmatched materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(refs.len());
+	for row in refs {
+		let source_index =
+			*page_sources
+				.get(&row.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"projected spilled left outer missing unmatched page source {}",
+						row.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.row as usize));
+	}
+
+	let mut columns = Vec::with_capacity(output_schema.fields().len());
+	for column_index in 0..full_left_schema.fields().len() {
+		if let Some(retained_position) = retained_positions.get(&column_index).copied() {
+			let source_columns = build_pages
+				.iter()
+				.map(|batch| batch.column(retained_position).as_ref())
+				.collect::<Vec<_>>();
+			columns.push(interleave(&source_columns, &build_indices)?);
+		} else {
+			columns.push(default_columns.remove(&column_index).ok_or_else(|| {
+				ExecutionError::Kernel {
+					message: format!(
+						"projected spilled left outer missing unmatched default column {}",
+						column_index
+					),
+				}
+			})?);
+		}
+	}
+	for field in right_schema.fields() {
+		columns.push(arrow::array::new_null_array(field.data_type(), refs.len()));
 	}
 
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
@@ -1594,6 +1874,7 @@ impl Executor {
 			build_keys,
 			key_plan,
 			null_safe_keys,
+			false,
 			None,
 			morsel,
 		)
@@ -1611,6 +1892,7 @@ impl Executor {
 		build_keys: &[crate::ir::ColumnOrdinal],
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
+		retain_unkeyed_rows: bool,
 		join_partition: Option<StreamingScanJoinPartition<'_>>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<(), ExecutionError> {
@@ -1667,6 +1949,7 @@ impl Executor {
 						key_plan,
 						build_keys,
 						null_safe_keys,
+						retain_unkeyed_rows,
 					)
 					.await?;
 				}
@@ -1721,6 +2004,7 @@ impl Executor {
 					key_plan,
 					build_keys,
 					null_safe_keys,
+					retain_unkeyed_rows,
 				)
 				.await?;
 			}
@@ -1793,28 +2077,54 @@ impl Executor {
 		key_plan: JoinKeyPlan,
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
+		retain_unkeyed_rows: bool,
 	) -> Result<(), ExecutionError> {
 		if let Some(retained_columns) = retained_columns {
-			spilled
-				.write_projected_batch_chunks(
-					batch,
-					retained_columns,
-					key_plan,
-					build_keys,
-					null_safe_keys,
-					self.context.task_budget,
-				)
-				.await
+			if retain_unkeyed_rows {
+				spilled
+					.write_projected_preserved_batch_chunks(
+						batch,
+						retained_columns,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await
+			} else {
+				spilled
+					.write_projected_batch_chunks(
+						batch,
+						retained_columns,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await
+			}
 		} else {
-			spilled
-				.write_batch_chunks(
-					batch,
-					key_plan,
-					build_keys,
-					null_safe_keys,
-					self.context.task_budget,
-				)
-				.await
+			if retain_unkeyed_rows {
+				spilled
+					.write_preserved_batch_chunks(
+						batch,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await
+			} else {
+				spilled
+					.write_batch_chunks(
+						batch,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await
+			}
 		}
 	}
 
@@ -2549,6 +2859,932 @@ impl Executor {
 			},
 		);
 		Ok(Some(()))
+	}
+
+	pub(in crate::exec) async fn try_streaming_left_outer_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let Some(streaming_input) =
+			decompose_streaming_left_outer_grouped_input(input, group_expr, aggr_expr)?
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::LeftOuter,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: join_output_schema,
+			..
+		} = streaming_input.join
+		else {
+			return Ok(None);
+		};
+		let Some(scan_input) = decompose_streaming_scan_probe_input(right) else {
+			return Ok(None);
+		};
+		if self.context.task_budget.memory.get() < 64 * 1024 * 1024 {
+			return Ok(None);
+		}
+
+		if match_filter.is_none() {
+			if let Some(left_scan_input) = decompose_streaming_scan_probe_input(left) {
+				let retained_columns = retained_left_outer_grouped_columns(
+					left.schema().fields().len(),
+					left_keys,
+					group_expr,
+					aggr_expr,
+					streaming_input.exchange,
+				);
+				if !retained_columns.is_empty()
+					&& retained_columns.len() < left.schema().fields().len()
+				{
+					let projected_left_keys = remap_column_ordinals(&retained_columns, left_keys)?;
+					let projected_left_schema =
+						projected_schema_for_columns(&left.schema(), &retained_columns)?;
+					let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+						&projected_left_schema,
+						&projected_left_keys,
+						&right.schema(),
+						right_keys,
+						*null_safe_keys,
+					)?;
+					let mut spilled = SpilledInnerJoinBuild::create(
+						self.context.task_budget,
+						self.context.join_spill_file_ops.clone(),
+						self.context.join_spill_dir.clone(),
+					)
+					.await?;
+					let build_started = Instant::now();
+					self.write_streaming_scan_inner_build_batches(
+						&mut spilled,
+						left_scan_input,
+						Some(&retained_columns),
+						&projected_left_keys,
+						key_plan,
+						*null_safe_keys,
+						true,
+						None,
+						morsel,
+					)
+					.await?;
+					spilled.finish(self.context.task_budget).await?;
+					let build_rows = spilled.input_row_count();
+					record_task_telemetry(&self.context.task_telemetry, |task| {
+						task.counters.build_rows =
+							task.counters.build_rows.saturating_add(build_rows);
+						task.phases.build_micros = task
+							.phases
+							.build_micros
+							.saturating_add(duration_micros(build_started));
+						task.phases.spill_micros = task
+							.phases
+							.spill_micros
+							.saturating_add(duration_micros(build_started));
+						task.counters.spill_bytes = task
+							.counters
+							.spill_bytes
+							.saturating_add(spilled.spill_bytes());
+					});
+
+					let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+					let mut group_types = Vec::new();
+					let mut folded_input = false;
+					let mut matched_build_rows = spilled.empty_page_match_bitmap();
+					let probe_started = Instant::now();
+					let (probe_rows, mut output_rows) = self
+						.visit_streaming_spilled_left_outer_scan_probe_chunks(
+							&mut spilled,
+							scan_input,
+							left.schema(),
+							&retained_columns,
+							&mut matched_build_rows,
+							key_plan,
+							right_keys,
+							*null_safe_keys,
+							join_output_schema,
+							streaming_input.exchange,
+							group_expr,
+							aggr_expr,
+							&mut groups,
+							&mut group_types,
+							&mut folded_input,
+							morsel,
+						)
+						.await?;
+					output_rows = output_rows.saturating_add(
+						self.fold_streaming_spilled_left_outer_unmatched_rows(
+							&mut spilled,
+							&matched_build_rows,
+							left.schema(),
+							&retained_columns,
+							right.schema(),
+							join_output_schema,
+							streaming_input.exchange,
+							group_expr,
+							aggr_expr,
+							&mut groups,
+							&mut group_types,
+							&mut folded_input,
+						)
+						.await?,
+					);
+					if !folded_input {
+						self.fold_bound_grouped_aggregate_batch(
+							&mut groups,
+							&mut group_types,
+							group_expr,
+							aggr_expr,
+							&RecordBatch::new_empty(join_output_schema.clone()),
+						)?;
+					}
+					record_task_telemetry(&self.context.task_telemetry, |task| {
+						task.phases.probe_micros = task
+							.phases
+							.probe_micros
+							.saturating_add(duration_micros(probe_started));
+						task.counters.probe_rows =
+							task.counters.probe_rows.saturating_add(probe_rows);
+						task.counters.matched_rows =
+							task.counters.matched_rows.saturating_add(output_rows);
+					});
+					record_join_runtime_observation(
+						&self.context.task_telemetry,
+						&self.context.join_runtime_observation_mode,
+						JoinRuntimeObservation {
+							replay_id: *replay_id,
+							strategy: JoinStrategy::HashPartitioned,
+							build_rows: RowCount::new(build_rows),
+							probe_rows: RowCount::new(probe_rows),
+							output_rows: RowCount::new(output_rows),
+						},
+					);
+					let output = self.finalize_bound_grouped_aggregate(
+						&groups,
+						&group_types,
+						aggr_expr,
+						output_schema,
+					);
+					spilled.cleanup().await;
+					return output.map(Some);
+				}
+			}
+		}
+
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+			> self.context.task_budget.memory.get()
+		{
+			return Ok(None);
+		}
+		let join_key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&left.schema(),
+			left_keys,
+			&right.schema(),
+			right_keys,
+			*null_safe_keys,
+		)?;
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&left_key_arrays,
+			left_batch.num_rows(),
+			self.context.task_budget.memory.get(),
+			*null_safe_keys,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(left_batch.num_rows() as u64);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+
+		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut group_types = Vec::new();
+		let mut folded_input = false;
+		let mut matched_build_rows = build_match_bitmap(JoinKind::LeftOuter, left_batch.num_rows())
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "left outer streaming expected a build match bitmap".to_string(),
+			})?;
+
+		let probe_started = Instant::now();
+		let (probe_rows, mut output_rows) = self
+			.visit_streaming_left_outer_scan_probe_chunks(
+				scan_input,
+				&left_batch,
+				&build_rows,
+				&mut matched_build_rows,
+				join_key_plan,
+				right_keys,
+				match_filter.as_ref(),
+				*null_safe_keys,
+				join_output_schema,
+				streaming_input.exchange,
+				group_expr,
+				aggr_expr,
+				&mut groups,
+				&mut group_types,
+				&mut folded_input,
+				morsel,
+			)
+			.await?;
+		output_rows = output_rows.saturating_add(self.fold_streaming_left_outer_unmatched_rows(
+			&left_batch,
+			&matched_build_rows,
+			right.schema(),
+			join_output_schema,
+			streaming_input.exchange,
+			group_expr,
+			aggr_expr,
+			&mut groups,
+			&mut group_types,
+			&mut folded_input,
+		)?);
+		if !folded_input {
+			self.fold_bound_grouped_aggregate_batch(
+				&mut groups,
+				&mut group_types,
+				group_expr,
+				aggr_expr,
+				&RecordBatch::new_empty(join_output_schema.clone()),
+			)?;
+		}
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+		});
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: JoinStrategy::HashPartitioned,
+				build_rows: RowCount::new(left_batch.num_rows() as u64),
+				probe_rows: RowCount::new(probe_rows),
+				output_rows: RowCount::new(output_rows),
+			},
+		);
+
+		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+			.map(Some)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_spilled_left_outer_scan_probe_chunks(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		scan_input: StreamingScanProbeInput<'_>,
+		full_left_schema: SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		matched_build_rows: &mut [Vec<u64>],
+		join_key_plan: JoinKeyPlan,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(u64, u64), ExecutionError> {
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming spilled left outer probe expected a scan input".to_string(),
+			});
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		while let Some(batch) = stream.next().await {
+			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				right_batch = self.filter_batch_with_bound_predicate(
+					predicate,
+					right_batch,
+					"filter predicate",
+				)?;
+				if right_batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			if let Some(scan_exchange) = scan_input.exchange {
+				for (_partition, partitioned) in self.repartition_exchange_batch(
+					&right_batch,
+					scan_exchange.partition_count,
+					scan_exchange.key,
+				)? {
+					let (batch_probe_rows, batch_output_rows) = self
+						.visit_streaming_spilled_left_outer_probe_batch(
+							spilled,
+							&partitioned,
+							&full_left_schema,
+							retained_columns,
+							matched_build_rows,
+							join_key_plan,
+							right_keys,
+							null_safe_keys,
+							join_output_schema,
+							exchange,
+							group_expr,
+							aggr_expr,
+							groups,
+							group_types,
+							folded_input,
+						)
+						.await?;
+					probe_rows = probe_rows.saturating_add(batch_probe_rows);
+					output_rows = output_rows.saturating_add(batch_output_rows);
+				}
+			} else {
+				let (batch_probe_rows, batch_output_rows) = self
+					.visit_streaming_spilled_left_outer_probe_batch(
+						spilled,
+						&right_batch,
+						&full_left_schema,
+						retained_columns,
+						matched_build_rows,
+						join_key_plan,
+						right_keys,
+						null_safe_keys,
+						join_output_schema,
+						exchange,
+						group_expr,
+						aggr_expr,
+						groups,
+						group_types,
+						folded_input,
+					)
+					.await?;
+				probe_rows = probe_rows.saturating_add(batch_probe_rows);
+				output_rows = output_rows.saturating_add(batch_output_rows);
+			}
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_spilled_left_outer_probe_batch(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		right_batch: &RecordBatch,
+		full_left_schema: &SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		matched_build_rows: &mut [Vec<u64>],
+		join_key_plan: JoinKeyPlan,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(u64, u64), ExecutionError> {
+		let mut output_rows = 0u64;
+		for offset in (0..right_batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(right_batch.num_rows() - offset);
+			let probe_chunk = right_batch.slice(offset, len);
+			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+			let mut matches = Vec::new();
+			for row in 0..probe_chunk.num_rows() {
+				let Some(key) = join_key_at(join_key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
+					continue;
+				};
+				for build in spilled.lookup(&key).await? {
+					spilled.mark_page_row_matched(matched_build_rows, build);
+					matches.push(SpilledInnerJoinMatch {
+						build,
+						probe: join_probe_row_index(row)?,
+					});
+				}
+			}
+			output_rows = output_rows.saturating_add(matches.len() as u64);
+			self.fold_projected_spilled_left_outer_join_selection_chunks(
+				spilled,
+				&probe_chunk,
+				&matches,
+				full_left_schema,
+				retained_columns,
+				join_output_schema,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)
+			.await?;
+		}
+		Ok((right_batch.num_rows() as u64, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn fold_streaming_spilled_left_outer_unmatched_rows(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		matched_build_rows: &[Vec<u64>],
+		full_left_schema: SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		right_schema: arrow::datatypes::SchemaRef,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<u64, ExecutionError> {
+		let mut unmatched = Vec::new();
+		let mut output_rows = 0u64;
+		for page_index in 0..spilled.page_count() {
+			let rows = spilled.page_row_count(page_index)?;
+			for row in 0..rows {
+				if spilled.page_row_matched(matched_build_rows, page_index, row) {
+					continue;
+				}
+				unmatched.push(SpilledBatchRowRef {
+					page_index,
+					row: join_build_row_index(row)?,
+				});
+				if unmatched.len() == CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+					output_rows = output_rows.saturating_add(unmatched.len() as u64);
+					let batch = materialize_projected_streamed_spilled_left_outer_unmatched(
+						spilled,
+						&unmatched,
+						&full_left_schema,
+						retained_columns,
+						&right_schema,
+						join_output_schema,
+						self.context.task_budget.memory.get(),
+					)
+					.await?;
+					self.fold_left_outer_grouped_batch(
+						batch,
+						exchange,
+						group_expr,
+						aggr_expr,
+						groups,
+						group_types,
+						folded_input,
+					)?;
+					unmatched.clear();
+				}
+			}
+		}
+		if !unmatched.is_empty() {
+			output_rows = output_rows.saturating_add(unmatched.len() as u64);
+			let batch = materialize_projected_streamed_spilled_left_outer_unmatched(
+				spilled,
+				&unmatched,
+				&full_left_schema,
+				retained_columns,
+				&right_schema,
+				join_output_schema,
+				self.context.task_budget.memory.get(),
+			)
+			.await?;
+			self.fold_left_outer_grouped_batch(
+				batch,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)?;
+		}
+		Ok(output_rows)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn fold_projected_spilled_left_outer_join_selection_chunks(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		right_batch: &RecordBatch,
+		matches: &[SpilledInnerJoinMatch],
+		full_left_schema: &SchemaRef,
+		retained_columns: &[ColumnOrdinal],
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(), ExecutionError> {
+		for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_projected_streamed_spilled_left_outer_matches(
+				spilled,
+				right_batch,
+				chunk,
+				full_left_schema,
+				retained_columns,
+				join_output_schema,
+				self.context.task_budget.memory.get(),
+			)
+			.await?;
+			self.fold_left_outer_grouped_batch(
+				batch,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)?;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn visit_streaming_left_outer_scan_probe_chunks(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		left_batch: &RecordBatch,
+		build_rows: &HashMap<JoinKey, BuildRowList>,
+		matched_build_rows: &mut [u64],
+		join_key_plan: JoinKeyPlan,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		match_filter: Option<&BoundExprProgram>,
+		null_safe_keys: bool,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(u64, u64), ExecutionError> {
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming left outer probe expected a scan input".to_string(),
+			});
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		while let Some(batch) = stream.next().await {
+			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				right_batch = self.filter_batch_with_bound_predicate(
+					predicate,
+					right_batch,
+					"filter predicate",
+				)?;
+				if right_batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			if let Some(scan_exchange) = scan_input.exchange {
+				for (_partition, partitioned) in self.repartition_exchange_batch(
+					&right_batch,
+					scan_exchange.partition_count,
+					scan_exchange.key,
+				)? {
+					let (batch_probe_rows, batch_output_rows) = self
+						.visit_streaming_left_outer_probe_batch(
+							left_batch,
+							&partitioned,
+							build_rows,
+							matched_build_rows,
+							join_key_plan,
+							right_keys,
+							match_filter,
+							null_safe_keys,
+							join_output_schema,
+							exchange,
+							group_expr,
+							aggr_expr,
+							groups,
+							group_types,
+							folded_input,
+						)?;
+					probe_rows = probe_rows.saturating_add(batch_probe_rows);
+					output_rows = output_rows.saturating_add(batch_output_rows);
+				}
+			} else {
+				let (batch_probe_rows, batch_output_rows) = self
+					.visit_streaming_left_outer_probe_batch(
+						left_batch,
+						&right_batch,
+						build_rows,
+						matched_build_rows,
+						join_key_plan,
+						right_keys,
+						match_filter,
+						null_safe_keys,
+						join_output_schema,
+						exchange,
+						group_expr,
+						aggr_expr,
+						groups,
+						group_types,
+						folded_input,
+					)?;
+				probe_rows = probe_rows.saturating_add(batch_probe_rows);
+				output_rows = output_rows.saturating_add(batch_output_rows);
+			}
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn visit_streaming_left_outer_probe_batch(
+		&self,
+		left_batch: &RecordBatch,
+		right_batch: &RecordBatch,
+		build_rows: &HashMap<JoinKey, BuildRowList>,
+		matched_build_rows: &mut [u64],
+		join_key_plan: JoinKeyPlan,
+		right_keys: &[crate::ir::ColumnOrdinal],
+		match_filter: Option<&BoundExprProgram>,
+		null_safe_keys: bool,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(u64, u64), ExecutionError> {
+		let mut output_rows = 0u64;
+		for offset in (0..right_batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(right_batch.num_rows() - offset);
+			let probe_chunk = right_batch.slice(offset, len);
+			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+			let mut selection = Vec::new();
+			let mut residual = JoinMatchResidual::new(match_filter, left_batch, &probe_chunk);
+			match join_key_plan {
+				JoinKeyPlan::Int32 => {
+					let values = single_join_key_array::<Int32Array>(&right_key_arrays, "Int32")?;
+					for row in 0..probe_chunk.num_rows() {
+						if values.is_null(row) {
+							continue;
+						}
+						let key = JoinKey::Int32(values.value(row));
+						if let Some(matches) = build_rows.get(&key) {
+							append_join_matches_for_kind(
+								JoinKind::LeftOuter,
+								row,
+								matches.rows(),
+								Some(matched_build_rows),
+								&mut selection,
+								&mut residual,
+							)?;
+						}
+					}
+				}
+				JoinKeyPlan::Int64 => {
+					let values = single_join_key_array::<Int64Array>(&right_key_arrays, "Int64")?;
+					for row in 0..probe_chunk.num_rows() {
+						if values.is_null(row) {
+							continue;
+						}
+						let key = JoinKey::Int64(values.value(row));
+						if let Some(matches) = build_rows.get(&key) {
+							append_join_matches_for_kind(
+								JoinKind::LeftOuter,
+								row,
+								matches.rows(),
+								Some(matched_build_rows),
+								&mut selection,
+								&mut residual,
+							)?;
+						}
+					}
+				}
+				JoinKeyPlan::Generic => {
+					for row in 0..probe_chunk.num_rows() {
+						let key = if null_safe_keys {
+							join_key_bytes_null_safe(&right_key_arrays, row)?
+						} else {
+							let Some(key) = join_key_bytes(&right_key_arrays, row)? else {
+								continue;
+							};
+							key
+						};
+						if let Some(matches) = build_rows.get(&JoinKey::Generic(key)) {
+							append_join_matches_for_kind(
+								JoinKind::LeftOuter,
+								row,
+								matches.rows(),
+								Some(matched_build_rows),
+								&mut selection,
+								&mut residual,
+							)?;
+						}
+					}
+				}
+			}
+			output_rows = output_rows.saturating_add(selection.len() as u64);
+			self.fold_left_outer_join_selection_chunks(
+				left_batch,
+				&probe_chunk,
+				&selection,
+				join_output_schema,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)?;
+		}
+		Ok((right_batch.num_rows() as u64, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn fold_streaming_left_outer_unmatched_rows(
+		&self,
+		left_batch: &RecordBatch,
+		matched_build_rows: &[u64],
+		right_schema: arrow::datatypes::SchemaRef,
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<u64, ExecutionError> {
+		let empty_right = RecordBatch::new_empty(right_schema);
+		let mut selection = Vec::new();
+		let mut output_rows = 0u64;
+		for row in 0..left_batch.num_rows() {
+			if build_row_matched(matched_build_rows, row) {
+				continue;
+			}
+			selection.push(JoinOutputRow::LeftFillNull {
+				left: join_build_row_index(row)?,
+			});
+			if selection.len() == CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+				output_rows = output_rows.saturating_add(selection.len() as u64);
+				self.fold_left_outer_join_selection_chunks(
+					left_batch,
+					&empty_right,
+					&selection,
+					join_output_schema,
+					exchange,
+					group_expr,
+					aggr_expr,
+					groups,
+					group_types,
+					folded_input,
+				)?;
+				selection.clear();
+			}
+		}
+		if !selection.is_empty() {
+			output_rows = output_rows.saturating_add(selection.len() as u64);
+			self.fold_left_outer_join_selection_chunks(
+				left_batch,
+				&empty_right,
+				&selection,
+				join_output_schema,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)?;
+		}
+		Ok(output_rows)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn fold_left_outer_join_selection_chunks(
+		&self,
+		left_batch: &RecordBatch,
+		right_batch: &RecordBatch,
+		selection: &[JoinOutputRow],
+		join_output_schema: &arrow::datatypes::SchemaRef,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(), ExecutionError> {
+		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let batch = materialize_join_selection(
+				JoinKind::LeftOuter,
+				left_batch,
+				right_batch,
+				chunk,
+				join_output_schema,
+				self.context.task_budget.memory.get(),
+			)?;
+			self.fold_left_outer_grouped_batch(
+				batch,
+				exchange,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				folded_input,
+			)?;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn fold_left_outer_grouped_batch(
+		&self,
+		batch: RecordBatch,
+		exchange: Option<(u32, &BoundExprProgram)>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		folded_input: &mut bool,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			if !*folded_input {
+				self.fold_bound_grouped_aggregate_batch(
+					groups,
+					group_types,
+					group_expr,
+					aggr_expr,
+					&batch,
+				)?;
+				*folded_input = true;
+			}
+			return Ok(());
+		}
+		if let Some((partition_count, exchange_key)) = exchange {
+			for (_partition, partitioned) in
+				self.repartition_exchange_batch(&batch, partition_count, exchange_key)?
+			{
+				if partitioned.num_rows() == 0 {
+					continue;
+				}
+				self.fold_bound_grouped_aggregate_batch(
+					groups,
+					group_types,
+					group_expr,
+					aggr_expr,
+					&partitioned,
+				)?;
+				*folded_input = true;
+			}
+		} else {
+			self.fold_bound_grouped_aggregate_batch(
+				groups,
+				group_types,
+				group_expr,
+				aggr_expr,
+				&batch,
+			)?;
+			*folded_input = true;
+		}
+		Ok(())
 	}
 
 	pub(in crate::exec) async fn try_streaming_collapsing_global_aggregate(
@@ -3785,6 +5021,7 @@ impl Executor {
 				write_build_keys,
 				key_plan,
 				false,
+				false,
 				None,
 				morsel,
 			)
@@ -4396,6 +5633,7 @@ impl Executor {
 					write_build_keys,
 					key_plan,
 					null_safe_keys,
+					false,
 					Some(StreamingScanJoinPartition {
 						keys: partition_build_keys,
 						partition_count,

@@ -502,6 +502,37 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
+	pub(in crate::exec) async fn write_projected_preserved_batch_chunks(
+		&mut self,
+		batch: &RecordBatch,
+		retained_columns: &[ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		projected_build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			let projected = project_batch_columns(&chunk, retained_columns)?;
+			self.write_page_batch(
+				&projected,
+				key_plan,
+				projected_build_keys,
+				null_safe_keys,
+				true,
+				task_budget,
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn write_page_batch(
 		&mut self,
 		batch: &RecordBatch,

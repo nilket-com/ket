@@ -21,6 +21,77 @@ struct StreamingScanGroupedInput<'a> {
 }
 
 impl Executor {
+	pub(in crate::exec) async fn try_streaming_grouped_aggregate(
+		&self,
+		input: &ExecutionPlan,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		if let Some(output) = self
+			.try_streaming_scan_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_left_outer_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_projected_left_semi_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		if let Some(output) = self
+			.try_streaming_reoriented_inner_chain_grouped_aggregate(
+				input,
+				group_expr,
+				aggr_expr,
+				output_schema,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(output));
+		}
+		Ok(None)
+	}
+
 	pub(in crate::exec) async fn try_streaming_global_aggregate(
 		&self,
 		input: &ExecutionPlan,
