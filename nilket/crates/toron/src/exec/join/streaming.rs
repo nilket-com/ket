@@ -6,6 +6,7 @@ pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	probe_keys: Vec<crate::ir::ColumnOrdinal>,
 	build: &'a ExecutionPlan,
 	build_keys: Vec<crate::ir::ColumnOrdinal>,
+	retained_build_columns: Option<Vec<crate::ir::ColumnOrdinal>>,
 	output_schema: SchemaRef,
 	strategy: JoinStrategy,
 	post_filter: Option<&'a BoundExprProgram>,
@@ -34,7 +35,13 @@ pub(in crate::exec) enum ReorientedInnerJoinBuild {
 		build: SpilledInnerJoinBuild,
 		materialized_output_schema: SchemaRef,
 		build_column_count: usize,
+		projection: Option<ProjectedInnerBuildProjection>,
 	},
+}
+
+pub(in crate::exec) struct ProjectedInnerBuildProjection {
+	full_build_schema: SchemaRef,
+	retained_columns: Vec<crate::ir::ColumnOrdinal>,
 }
 
 pub(in crate::exec) struct StreamingSemiAntiStage<'a> {
@@ -202,6 +209,7 @@ pub(in crate::exec) fn extract_reoriented_inner_chain(
 			probe_keys: probe_keys.clone(),
 			build,
 			build_keys: build_keys.clone(),
+			retained_build_columns: None,
 			output_schema: output_schema.clone(),
 			strategy: JoinStrategy::HashPartitioned,
 			post_filter,
@@ -215,6 +223,122 @@ pub(in crate::exec) fn extract_reoriented_inner_chain(
 		post_filter = continuation.post_filter;
 		expected -= 1;
 	}
+}
+
+fn collect_aggregate_columns(
+	aggr_expr: &[BoundAggregateCall],
+	columns: &mut BTreeSet<ColumnOrdinal>,
+) {
+	for call in aggr_expr {
+		collect_program_column_ordinals(&call.args, columns);
+	}
+}
+
+fn collect_left_side_program_columns(
+	program: &BoundExprProgram,
+	left_column_count: usize,
+	columns: &mut BTreeSet<ColumnOrdinal>,
+) {
+	let mut referenced = BTreeSet::new();
+	collect_program_column_ordinals(program, &mut referenced);
+	for column in referenced {
+		if (column.0 as usize) < left_column_count {
+			columns.insert(column);
+		}
+	}
+}
+
+fn mark_reoriented_inner_stage_projections(
+	stages: &mut [ReorientedInnerJoinStage<'_>],
+	mut required_after: BTreeSet<ColumnOrdinal>,
+) -> Result<(), ExecutionError> {
+	for stage in stages.iter_mut().rev() {
+		let mut required_output = required_after.clone();
+		if let Some(predicate) = stage.post_filter {
+			collect_program_column_ordinals(predicate, &mut required_output);
+		}
+		let retained = retained_build_columns_for_reoriented_stage(stage, &required_output)?;
+		let build_column_count = stage.build.schema().fields().len();
+		stage.retained_build_columns = if retained.len() < build_column_count {
+			Some(retained)
+		} else {
+			None
+		};
+		required_after = required_probe_columns_for_reoriented_stage(stage, &required_output)?;
+	}
+	Ok(())
+}
+
+fn retained_build_columns_for_reoriented_stage(
+	stage: &ReorientedInnerJoinStage<'_>,
+	required_output: &BTreeSet<ColumnOrdinal>,
+) -> Result<Vec<ColumnOrdinal>, ExecutionError> {
+	let probe_column_count = stage.probe_schema.fields().len();
+	let build_column_count = stage.build.schema().fields().len();
+	let output_column_count = stage.output_schema.fields().len();
+	let mut retained = BTreeSet::new();
+	retained.extend(stage.build_keys.iter().copied());
+	for column in required_output {
+		let index = column.0 as usize;
+		if index >= output_column_count {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"reoriented inner required output column {} exceeds output width {}",
+					column.0, output_column_count
+				),
+			});
+		}
+		let build_index = if stage.probe_columns_first {
+			index.checked_sub(probe_column_count)
+		} else if index < build_column_count {
+			Some(index)
+		} else {
+			None
+		};
+		if let Some(build_index) = build_index {
+			if build_index < build_column_count {
+				retained.insert(ColumnOrdinal(build_index as u32));
+			}
+		}
+	}
+	Ok(retained.into_iter().collect())
+}
+
+fn required_probe_columns_for_reoriented_stage(
+	stage: &ReorientedInnerJoinStage<'_>,
+	required_output: &BTreeSet<ColumnOrdinal>,
+) -> Result<BTreeSet<ColumnOrdinal>, ExecutionError> {
+	let probe_column_count = stage.probe_schema.fields().len();
+	let build_column_count = stage.build.schema().fields().len();
+	let output_column_count = stage.output_schema.fields().len();
+	let mut required = BTreeSet::new();
+	required.extend(stage.probe_keys.iter().copied());
+	for column in required_output {
+		let index = column.0 as usize;
+		if index >= output_column_count {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"reoriented inner required output column {} exceeds output width {}",
+					column.0, output_column_count
+				),
+			});
+		}
+		let probe_index = if stage.probe_columns_first {
+			if index < probe_column_count {
+				Some(index)
+			} else {
+				None
+			}
+		} else {
+			index
+				.checked_sub(build_column_count)
+				.filter(|index| *index < probe_column_count)
+		};
+		if let Some(probe_index) = probe_index {
+			required.insert(ColumnOrdinal(probe_index as u32));
+		}
+	}
+	Ok(required)
 }
 
 struct ReorientedChainContinuation<'a> {
@@ -362,6 +486,169 @@ fn reorder_spilled_inner_probe_before_build(
 	for column in &batch.columns()[..build_column_count] {
 		columns.push(column.clone());
 	}
+	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn visit_projected_streamed_spilled_inner_join_chunks<F>(
+	spilled: &mut SpilledInnerJoinBuild,
+	right_batches: &[RecordBatch],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	key_plan: JoinKeyPlan,
+	null_safe_keys: bool,
+	full_build_schema: &SchemaRef,
+	retained_columns: &[ColumnOrdinal],
+	output_schema: &SchemaRef,
+	memory_cap: u64,
+	mut visit_batch: F,
+) -> Result<(u64, u64), ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	let mut probe_rows = 0u64;
+	let mut output_rows = 0u64;
+	for batch in right_batches {
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let probe_chunk = batch.slice(offset, len);
+			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+			let mut matches = Vec::new();
+			for row in 0..probe_chunk.num_rows() {
+				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
+					continue;
+				};
+				for build in spilled.lookup(&key).await? {
+					matches.push(SpilledInnerJoinMatch {
+						build,
+						probe: join_probe_row_index(row)?,
+					});
+				}
+			}
+			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let batch = materialize_projected_streamed_spilled_inner_matches(
+					spilled,
+					&probe_chunk,
+					chunk,
+					full_build_schema,
+					retained_columns,
+					output_schema,
+					memory_cap,
+				)
+				.await?;
+				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
+				visit_batch(batch)?;
+			}
+		}
+	}
+	Ok((probe_rows, output_rows))
+}
+
+async fn materialize_projected_streamed_spilled_inner_matches(
+	spilled: &mut SpilledInnerJoinBuild,
+	probe_batch: &RecordBatch,
+	matches: &[SpilledInnerJoinMatch],
+	full_build_schema: &SchemaRef,
+	retained_columns: &[ColumnOrdinal],
+	output_schema: &SchemaRef,
+	memory_cap: u64,
+) -> Result<RecordBatch, ExecutionError> {
+	if matches.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let materialization_cap = join_output_materialization_memory_cap(memory_cap);
+	let mut page_sources = BTreeMap::new();
+	for row in matches {
+		page_sources
+			.entry(row.build.page_index)
+			.or_insert(usize::MAX);
+	}
+	let page_indices = page_sources.keys().copied().collect::<Vec<_>>();
+	for (source_index, page_index) in page_indices.iter().copied().enumerate() {
+		page_sources.insert(page_index, source_index);
+	}
+	let mut build_pages = Vec::with_capacity(page_sources.len());
+	for page_index in page_indices {
+		build_pages.push(spilled.read_batch_page(page_index).await?);
+	}
+
+	let retained_positions = retained_columns
+		.iter()
+		.enumerate()
+		.map(|(position, ordinal)| (ordinal.0 as usize, position))
+		.collect::<BTreeMap<_, _>>();
+	let mut default_columns = BTreeMap::new();
+	let mut default_column_bytes = 0u64;
+	for (column_index, field) in full_build_schema.fields().iter().enumerate() {
+		if retained_positions.contains_key(&column_index) {
+			continue;
+		}
+		let column = default_array_for_unused_column(field.data_type(), matches.len())?;
+		default_column_bytes = default_column_bytes
+			.saturating_add(u64::try_from(column.get_array_memory_size()).unwrap_or(u64::MAX));
+		default_columns.insert(column_index, column);
+	}
+
+	let estimated_output_bytes = join_take_index_bytes(matches.len())
+		.saturating_add(join_interleave_index_bytes(matches.len()))
+		.saturating_add(estimate_spilled_inner_build_selection_bytes(
+			&build_pages,
+			matches.len(),
+		))
+		.saturating_add(estimate_selected_batch_bytes(probe_batch, matches.len()))
+		.saturating_add(default_column_bytes);
+	if estimated_output_bytes > materialization_cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			"projected streamed inner join output materialization",
+			estimated_output_bytes,
+			materialization_cap,
+		));
+	}
+
+	let mut build_indices = Vec::with_capacity(matches.len());
+	let mut probe_indices = Vec::with_capacity(matches.len());
+	for row in matches {
+		let source_index =
+			*page_sources
+				.get(&row.build.page_index)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"projected streamed inner join missing spilled page source {}",
+						row.build.page_index
+					),
+				})?;
+		build_indices.push((source_index, row.build.row as usize));
+		probe_indices.push(Some(row.probe));
+	}
+
+	let mut columns =
+		Vec::with_capacity(full_build_schema.fields().len() + probe_batch.num_columns());
+	for column_index in 0..full_build_schema.fields().len() {
+		if let Some(retained_position) = retained_positions.get(&column_index).copied() {
+			let source_columns = build_pages
+				.iter()
+				.map(|batch| batch.column(retained_position).as_ref())
+				.collect::<Vec<_>>();
+			columns.push(interleave(&source_columns, &build_indices)?);
+		} else {
+			columns.push(default_columns.remove(&column_index).ok_or_else(|| {
+				ExecutionError::Kernel {
+					message: format!(
+						"projected streamed inner join missing default column {}",
+						column_index
+					),
+				}
+			})?);
+		}
+	}
+	let probe_indices = UInt32Array::from(probe_indices);
+	for column in probe_batch.columns() {
+		columns.push(take(column, &probe_indices, None)?);
+	}
+
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
@@ -571,6 +858,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				probe_keys: join1_left_keys.clone(),
 				build: join1_right.as_ref(),
 				build_keys: join1_right_keys.clone(),
+				retained_build_columns: None,
 				output_schema: join1_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
 				post_filter: Some(join1_post_filter),
@@ -582,6 +870,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				probe_keys: join2_left_keys.clone(),
 				build: join2_right.as_ref(),
 				build_keys: join2_right_keys.clone(),
+				retained_build_columns: None,
 				output_schema: join2_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
 				post_filter: Some(join2_post_filter),
@@ -1251,6 +1540,7 @@ impl Executor {
 		self.write_streaming_scan_inner_build_batches(
 			&mut spilled,
 			scan_input,
+			None,
 			build_keys,
 			key_plan,
 			null_safe_keys,
@@ -1266,6 +1556,7 @@ impl Executor {
 		&self,
 		spilled: &mut SpilledInnerJoinBuild,
 		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
 		build_keys: &[crate::ir::ColumnOrdinal],
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
@@ -1302,15 +1593,15 @@ impl Executor {
 				for (_, partitioned) in
 					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
 				{
-					spilled
-						.write_batch_chunks(
-							&partitioned,
-							key_plan,
-							build_keys,
-							null_safe_keys,
-							self.context.task_budget,
-						)
-						.await?;
+					self.write_streaming_scan_inner_build_batch(
+						spilled,
+						&partitioned,
+						retained_columns,
+						key_plan,
+						build_keys,
+						null_safe_keys,
+					)
+					.await?;
 				}
 			}
 		} else {
@@ -1341,18 +1632,51 @@ impl Executor {
 						continue;
 					}
 				}
-				spilled
-					.write_batch_chunks(
-						&batch,
-						key_plan,
-						build_keys,
-						null_safe_keys,
-						self.context.task_budget,
-					)
-					.await?;
+				self.write_streaming_scan_inner_build_batch(
+					spilled,
+					&batch,
+					retained_columns,
+					key_plan,
+					build_keys,
+					null_safe_keys,
+				)
+				.await?;
 			}
 		}
 		Ok(())
+	}
+
+	async fn write_streaming_scan_inner_build_batch(
+		&self,
+		spilled: &mut SpilledInnerJoinBuild,
+		batch: &RecordBatch,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+	) -> Result<(), ExecutionError> {
+		if let Some(retained_columns) = retained_columns {
+			spilled
+				.write_projected_batch_chunks(
+					batch,
+					retained_columns,
+					key_plan,
+					build_keys,
+					null_safe_keys,
+					self.context.task_budget,
+				)
+				.await
+		} else {
+			spilled
+				.write_batch_chunks(
+					batch,
+					key_plan,
+					build_keys,
+					null_safe_keys,
+					self.context.task_budget,
+				)
+				.await
+		}
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -1430,6 +1754,7 @@ impl Executor {
 							filter_predicate,
 							probe_columns_first,
 							build_column_count,
+							None,
 							&mut *visit_batch,
 						)
 						.await?;
@@ -1487,6 +1812,7 @@ impl Executor {
 						filter_predicate,
 						probe_columns_first,
 						build_column_count,
+						None,
 						&mut *visit_batch,
 					)
 					.await?;
@@ -1510,41 +1836,55 @@ impl Executor {
 		filter_predicate: Option<&BoundExprProgram>,
 		probe_columns_first: bool,
 		build_column_count: usize,
+		projection: Option<&ProjectedInnerBuildProjection>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
-		visit_streamed_spilled_inner_join_chunks(
-			spilled,
-			std::slice::from_ref(probe_batch),
-			right_keys,
-			key_plan,
-			null_safe_keys,
-			materialized_output_schema,
-			self.context.task_budget.memory.get(),
-			|batch| {
-				let batch = if probe_columns_first {
-					reorder_spilled_inner_probe_before_build(
-						batch,
-						build_column_count,
-						output_schema,
-					)?
-				} else {
-					batch
-				};
-				let batch = if let Some(predicate) = filter_predicate {
-					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
-				} else {
-					batch
-				};
-				if batch.num_rows() > 0 {
-					visit_batch(batch)?;
-				}
-				Ok(())
-			},
-		)
-		.await
+		let mut visit_output = |batch: RecordBatch| -> Result<(), ExecutionError> {
+			let batch = if probe_columns_first {
+				reorder_spilled_inner_probe_before_build(batch, build_column_count, output_schema)?
+			} else {
+				batch
+			};
+			let batch = if let Some(predicate) = filter_predicate {
+				self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+			} else {
+				batch
+			};
+			if batch.num_rows() > 0 {
+				visit_batch(batch)?;
+			}
+			Ok(())
+		};
+		if let Some(projection) = projection {
+			visit_projected_streamed_spilled_inner_join_chunks(
+				spilled,
+				std::slice::from_ref(probe_batch),
+				right_keys,
+				key_plan,
+				null_safe_keys,
+				&projection.full_build_schema,
+				&projection.retained_columns,
+				materialized_output_schema,
+				self.context.task_budget.memory.get(),
+				&mut visit_output,
+			)
+			.await
+		} else {
+			visit_streamed_spilled_inner_join_chunks(
+				spilled,
+				std::slice::from_ref(probe_batch),
+				right_keys,
+				key_plan,
+				null_safe_keys,
+				materialized_output_schema,
+				self.context.task_budget.memory.get(),
+				&mut visit_output,
+			)
+			.await
+		}
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -2523,9 +2863,15 @@ impl Executor {
 			} => (input.as_ref(), None),
 			other => (other, None),
 		};
-		let Some((base, stages)) = extract_reoriented_inner_chain(chain_input) else {
+		let Some((base, mut stages)) = extract_reoriented_inner_chain(chain_input) else {
 			return Ok(None);
 		};
+		let mut required_output = BTreeSet::new();
+		collect_program_column_ordinals(project_exprs, &mut required_output);
+		if let Some(predicate) = outer_predicate {
+			collect_program_column_ordinals(predicate, &mut required_output);
+		}
+		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
 
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
@@ -2637,9 +2983,26 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let Some(chain) = extract_streaming_inner_prefix_semi_anti_chain(aggregate_input) else {
+		let Some(mut chain) = extract_streaming_inner_prefix_semi_anti_chain(aggregate_input)
+		else {
 			return Ok(None);
 		};
+		let mut required_output = BTreeSet::new();
+		required_output.extend(chain.semi_stage.preserved_keys.iter().copied());
+		required_output.extend(chain.anti_stage.preserved_keys.iter().copied());
+		collect_left_side_program_columns(
+			chain.semi_stage.match_filter,
+			chain.semi_stage.output_schema.fields().len(),
+			&mut required_output,
+		);
+		collect_left_side_program_columns(
+			chain.anti_stage.match_filter,
+			chain.anti_stage.output_schema.fields().len(),
+			&mut required_output,
+		);
+		collect_program_column_ordinals(group_expr, &mut required_output);
+		collect_aggregate_columns(aggr_expr, &mut required_output);
+		mark_reoriented_inner_stage_projections(&mut chain.inner_stages, required_output)?;
 
 		let mut inner_runtimes = Vec::with_capacity(chain.inner_stages.len());
 		for stage in chain.inner_stages {
@@ -3170,13 +3533,61 @@ impl Executor {
 		stream_scan_build: bool,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		if stream_scan_build && decompose_streaming_scan_probe_input(stage.build).is_some() {
-			let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
-				&stage.build.schema(),
-				&stage.build_keys,
-				&stage.probe_schema,
-				&stage.probe_keys,
-				false,
-			)?;
+			let build_schema = stage.build.schema();
+			let projected_build = match stage.retained_build_columns.as_deref() {
+				Some(retained_columns) if retained_columns.len() < build_schema.fields().len() => {
+					let projected_build_keys =
+						remap_column_ordinals(retained_columns, &stage.build_keys)?;
+					let projected_schema =
+						projected_schema_for_columns(&build_schema, retained_columns)?;
+					Some((
+						retained_columns,
+						projected_build_keys,
+						projected_schema,
+						ProjectedInnerBuildProjection {
+							full_build_schema: build_schema.clone(),
+							retained_columns: retained_columns.to_vec(),
+						},
+					))
+				}
+				_ => None,
+			};
+			let (key_plan, write_build_keys, retained_columns, projection) = if let Some((
+				retained_columns,
+				projected_build_keys,
+				projected_schema,
+				projection,
+			)) = &projected_build
+			{
+				(
+					JoinKeyPlan::from_build_schema_and_probe_schema(
+						projected_schema,
+						projected_build_keys,
+						&stage.probe_schema,
+						&stage.probe_keys,
+						false,
+					)?,
+					projected_build_keys.as_slice(),
+					Some(*retained_columns),
+					Some(ProjectedInnerBuildProjection {
+						full_build_schema: projection.full_build_schema.clone(),
+						retained_columns: projection.retained_columns.clone(),
+					}),
+				)
+			} else {
+				(
+					JoinKeyPlan::from_build_schema_and_probe_schema(
+						&build_schema,
+						&stage.build_keys,
+						&stage.probe_schema,
+						&stage.probe_keys,
+						false,
+					)?,
+					stage.build_keys.as_slice(),
+					None,
+					None,
+				)
+			};
 			let mut spilled = SpilledInnerJoinBuild::create(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
@@ -3187,7 +3598,8 @@ impl Executor {
 			self.write_streaming_scan_inner_build_batches(
 				&mut spilled,
 				decompose_streaming_scan_probe_input(stage.build).expect("checked scan build"),
-				&stage.build_keys,
+				retained_columns,
+				write_build_keys,
 				key_plan,
 				false,
 				morsel,
@@ -3222,6 +3634,7 @@ impl Executor {
 					build: spilled,
 					materialized_output_schema,
 					build_column_count: stage.build.schema().fields().len(),
+					projection,
 				},
 				key_plan,
 				probe_keys: stage.probe_keys,
@@ -3685,6 +4098,7 @@ impl Executor {
 				build,
 				materialized_output_schema,
 				build_column_count,
+				projection,
 			} => {
 				if probe_batch.num_rows() == 0 {
 					(Vec::new(), 0, 0)
@@ -3702,6 +4116,7 @@ impl Executor {
 							None,
 							runtime.probe_columns_first,
 							*build_column_count,
+							projection.as_ref(),
 							&mut |batch| {
 								output.push(batch);
 								Ok(())
@@ -3811,7 +4226,7 @@ mod tests {
 		ColumnOrdinal, QueryProfileHint, ResolvedColumn, TableId,
 	};
 	use crate::storage::{ScanRequest, ScanStream, StorageScan};
-	use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
+	use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::HashMap;
 	use std::sync::{Arc, Mutex};
@@ -4229,6 +4644,143 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn projected_reoriented_inner_runtime_remaps_keys_and_restores_observable_schema() {
+		for value_kind in [StreamingValueKind::Float64, StreamingValueKind::Decimal] {
+			let value_type = value_kind.data_type();
+			let build_schema = Arc::new(Schema::new(vec![
+				Field::new("build_key", DataType::Int64, false),
+				Field::new("build_value", value_type.clone(), true),
+				Field::new("dead_payload", DataType::Utf8, false),
+			]));
+			let probe_schema = Arc::new(Schema::new(vec![
+				Field::new("probe_key", DataType::Int64, false),
+				Field::new("probe_tag", DataType::Int64, false),
+			]));
+			let output_schema = concat_test_schema(&probe_schema, &build_schema);
+			let build_a = RecordBatch::try_new(
+				build_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![1, 2])),
+					value_kind.values(&[100, 200]),
+					Arc::new(StringArray::from(vec!["wide-a", "wide-b"])),
+				],
+			)
+			.expect("projected build batch a");
+			let build_b = RecordBatch::try_new(
+				build_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![3])),
+					value_kind.values(&[300]),
+					Arc::new(StringArray::from(vec!["wide-c"])),
+				],
+			)
+			.expect("projected build batch b");
+			let probe = RecordBatch::try_new(
+				probe_schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(vec![3, 1, 2])),
+					Arc::new(Int64Array::from(vec![30, 10, 20])),
+				],
+			)
+			.expect("probe batch");
+			let requested_tables = Arc::new(Mutex::new(Vec::new()));
+			let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(4), vec![build_a, build_b])]),
+				requested_tables,
+			});
+			let executor = Executor::with_context(
+				storage,
+				ExecutionContext::local_test().with_task_budget(TaskBudget {
+					memory: ByteCount::new(256 * 1024 * 1024),
+					spill_bytes: ByteCount::new(256 * 1024 * 1024),
+					..TaskBudget::from_query_budget(QueryBudget::test_default())
+				}),
+			);
+			let scan = test_scan_plan_with_first_field_key(TableId(4), build_schema.clone(), 4);
+			let build = ExecutionPlan::Exchange {
+				input: Box::new(scan),
+				partition_count: 1,
+				key: bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+			};
+			let mut projected_stage =
+				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone());
+			projected_stage.retained_build_columns = Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)]);
+			let mut projected_runtime = executor
+				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+					projected_stage,
+					None,
+				)
+				.await
+				.expect("projected streamed runtime")
+				.expect("projected scan build should stream");
+			{
+				let ReorientedInnerJoinBuild::Spilled {
+					build: spilled,
+					projection,
+					..
+				} = &mut projected_runtime.build
+				else {
+					panic!("projected scan build must use the streamed-spilled build");
+				};
+				assert!(projection.is_some(), "projection metadata must be carried");
+				assert_eq!(spilled.input_batches_written(), 2);
+				let page = spilled.read_batch_page(0).await.expect("projected page");
+				assert_eq!(
+					page.num_columns(),
+					2,
+					"projected reoriented build pages should omit dead payload columns"
+				);
+			}
+
+			let mut materialized_runtime = executor
+				.prepare_reoriented_inner_join_runtime(
+					reoriented_scan_build_stage(
+						&build,
+						probe_schema.clone(),
+						output_schema.clone(),
+					),
+					None,
+				)
+				.await
+				.expect("materialized runtime")
+				.expect("materialized build should prepare");
+
+			let projected = executor
+				.probe_reoriented_inner_join_streaming(&mut projected_runtime, &probe)
+				.await
+				.expect("projected streamed probe");
+			let materialized = executor
+				.probe_reoriented_inner_join(&mut materialized_runtime, &probe)
+				.expect("materialized probe");
+			let projected_batch =
+				concat_or_empty(output_schema.clone(), &projected).expect("projected concat");
+			let materialized_batch =
+				concat_or_empty(output_schema.clone(), &materialized).expect("materialized concat");
+			assert_eq!(projected_batch.schema(), output_schema);
+			assert_eq!(projected_batch.num_rows(), materialized_batch.num_rows());
+			for column in 0..4 {
+				assert_eq!(
+					format!("{:?}", projected_batch.column(column)),
+					format!("{:?}", materialized_batch.column(column)),
+					"retained output column {column} differs"
+				);
+			}
+			let dead_payload = projected_batch
+				.column(4)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("dead payload defaults");
+			assert!(
+				(0..dead_payload.len()).all(|row| dead_payload.value(row).is_empty()),
+				"dead payload is restored only as sparse ordinal-compatible defaults"
+			);
+
+			projected_runtime.cleanup().await;
+			materialized_runtime.cleanup().await;
+		}
+	}
+
 	#[derive(Clone, Copy)]
 	enum StreamingValueKind {
 		Float64,
@@ -4291,6 +4843,7 @@ mod tests {
 			probe_keys: vec![ColumnOrdinal(0)],
 			build,
 			build_keys: vec![ColumnOrdinal(0)],
+			retained_build_columns: None,
 			output_schema,
 			strategy: JoinStrategy::HashPartitioned,
 			post_filter: None,
