@@ -83,6 +83,40 @@ struct JoinSpillPage {
 #[derive(Debug, Clone)]
 struct CachedJoinSpillPage {
 	bytes: Vec<u8>,
+	decoded_batch: Option<RecordBatch>,
+	decoded_bytes: u64,
+}
+
+impl CachedJoinSpillPage {
+	fn new(bytes: Vec<u8>) -> Self {
+		Self {
+			bytes,
+			decoded_batch: None,
+			decoded_bytes: 0,
+		}
+	}
+
+	fn total_bytes(&self) -> u64 {
+		u64::try_from(self.bytes.len())
+			.unwrap_or(u64::MAX)
+			.saturating_add(self.decoded_bytes)
+	}
+}
+
+fn evict_join_spill_cache(
+	cache: &mut HashMap<usize, CachedJoinSpillPage>,
+	lru: &mut VecDeque<usize>,
+	cache_bytes: &mut u64,
+	cache_cap: u64,
+) {
+	while cache_bytes.saturating_sub(cache_cap) > 0 {
+		let Some(evicted) = lru.pop_front() else {
+			break;
+		};
+		if let Some(page) = cache.remove(&evicted) {
+			*cache_bytes = cache_bytes.saturating_sub(page.total_bytes());
+		}
+	}
 }
 
 pub(in crate::exec) struct SpilledJoinBuild {
@@ -307,7 +341,11 @@ impl SpilledJoinBuild {
 		&mut self,
 		page_index: usize,
 	) -> Result<Vec<u8>, ExecutionError> {
-		if let Some(cached) = self.cache.get(&page_index) {
+		if let Some(cached) = self
+			.cache
+			.get(&page_index)
+			.filter(|cached| !cached.bytes.is_empty())
+		{
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
 			return Ok(bytes);
@@ -356,19 +394,19 @@ impl SpilledJoinBuild {
 		if self.cache_cap == 0 || bytes_len > self.cache_cap {
 			return;
 		}
-		while self.cache_bytes.saturating_add(bytes_len) > self.cache_cap {
-			let Some(evicted) = self.lru.pop_front() else {
-				break;
-			};
-			if let Some(page) = self.cache.remove(&evicted) {
-				self.cache_bytes = self
-					.cache_bytes
-					.saturating_sub(u64::try_from(page.bytes.len()).unwrap_or(u64::MAX));
-			}
+		if let Some(page) = self.cache.remove(&page_index) {
+			self.cache_bytes = self.cache_bytes.saturating_sub(page.total_bytes());
 		}
 		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
-		self.cache.insert(page_index, CachedJoinSpillPage { bytes });
+		self.cache
+			.insert(page_index, CachedJoinSpillPage::new(bytes));
 		self.touch_cache_entry(page_index);
+		evict_join_spill_cache(
+			&mut self.cache,
+			&mut self.lru,
+			&mut self.cache_bytes,
+			self.cache_cap,
+		);
 	}
 }
 
@@ -912,15 +950,29 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		page_index: usize,
 	) -> Result<RecordBatch, ExecutionError> {
+		if let Some(batch) = self
+			.cache
+			.get(&page_index)
+			.and_then(|cached| cached.decoded_batch.clone())
+		{
+			self.touch_cache_entry(page_index);
+			return Ok(batch);
+		}
 		let bytes = self.read_page(page_index).await?;
-		decode_record_batch_ipc(&bytes)
+		let batch = decode_record_batch_ipc(&bytes)?;
+		self.insert_decoded_cache_entry(page_index, batch.clone());
+		Ok(batch)
 	}
 
 	pub(in crate::exec) async fn read_page(
 		&mut self,
 		page_index: usize,
 	) -> Result<Vec<u8>, ExecutionError> {
-		if let Some(cached) = self.cache.get(&page_index) {
+		if let Some(cached) = self
+			.cache
+			.get(&page_index)
+			.filter(|cached| !cached.bytes.is_empty())
+		{
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
 			return Ok(bytes);
@@ -969,19 +1021,53 @@ impl SpilledInnerJoinBuild {
 		if self.cache_cap == 0 || bytes_len > self.cache_cap {
 			return;
 		}
-		while self.cache_bytes.saturating_add(bytes_len) > self.cache_cap {
-			let Some(evicted) = self.lru.pop_front() else {
-				break;
-			};
-			if let Some(page) = self.cache.remove(&evicted) {
-				self.cache_bytes = self
-					.cache_bytes
-					.saturating_sub(u64::try_from(page.bytes.len()).unwrap_or(u64::MAX));
-			}
+		if let Some(page) = self.cache.remove(&page_index) {
+			self.cache_bytes = self.cache_bytes.saturating_sub(page.total_bytes());
 		}
 		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
-		self.cache.insert(page_index, CachedJoinSpillPage { bytes });
+		self.cache
+			.insert(page_index, CachedJoinSpillPage::new(bytes));
 		self.touch_cache_entry(page_index);
+		evict_join_spill_cache(
+			&mut self.cache,
+			&mut self.lru,
+			&mut self.cache_bytes,
+			self.cache_cap,
+		);
+	}
+
+	pub(in crate::exec) fn insert_decoded_cache_entry(
+		&mut self,
+		page_index: usize,
+		batch: RecordBatch,
+	) {
+		if self.cache_cap == 0 {
+			return;
+		}
+		let decoded_bytes = record_batch_memory_bytes(&batch);
+		if decoded_bytes > self.cache_cap {
+			return;
+		}
+		let Some(cached) = self.cache.get_mut(&page_index) else {
+			return;
+		};
+		let old_total = cached.total_bytes();
+		cached.bytes.clear();
+		cached.decoded_batch = Some(batch);
+		cached.decoded_bytes = decoded_bytes;
+		let new_total = cached.total_bytes();
+		if new_total >= old_total {
+			self.cache_bytes = self.cache_bytes.saturating_add(new_total - old_total);
+		} else {
+			self.cache_bytes = self.cache_bytes.saturating_sub(old_total - new_total);
+		}
+		self.touch_cache_entry(page_index);
+		evict_join_spill_cache(
+			&mut self.cache,
+			&mut self.lru,
+			&mut self.cache_bytes,
+			self.cache_cap,
+		);
 	}
 
 	#[cfg(test)]
@@ -1535,7 +1621,11 @@ impl SpilledSemiAntiExistenceBuild {
 		&mut self,
 		page_index: usize,
 	) -> Result<Vec<u8>, ExecutionError> {
-		if let Some(cached) = self.cache.get(&page_index) {
+		if let Some(cached) = self
+			.cache
+			.get(&page_index)
+			.filter(|cached| !cached.bytes.is_empty())
+		{
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
 			return Ok(bytes);
@@ -1584,19 +1674,19 @@ impl SpilledSemiAntiExistenceBuild {
 		if self.cache_cap == 0 || bytes_len > self.cache_cap {
 			return;
 		}
-		while self.cache_bytes.saturating_add(bytes_len) > self.cache_cap {
-			let Some(evicted) = self.lru.pop_front() else {
-				break;
-			};
-			if let Some(page) = self.cache.remove(&evicted) {
-				self.cache_bytes = self
-					.cache_bytes
-					.saturating_sub(u64::try_from(page.bytes.len()).unwrap_or(u64::MAX));
-			}
+		if let Some(page) = self.cache.remove(&page_index) {
+			self.cache_bytes = self.cache_bytes.saturating_sub(page.total_bytes());
 		}
 		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
-		self.cache.insert(page_index, CachedJoinSpillPage { bytes });
+		self.cache
+			.insert(page_index, CachedJoinSpillPage::new(bytes));
 		self.touch_cache_entry(page_index);
+		evict_join_spill_cache(
+			&mut self.cache,
+			&mut self.lru,
+			&mut self.cache_bytes,
+			self.cache_cap,
+		);
 	}
 }
 
@@ -2358,6 +2448,56 @@ mod tests {
 				row: 1
 			}]
 		);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_read_batch_page_reuses_decoded_cache() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_decoded_cache");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		let batch = batch_with_keys(&[1, 2, 3, 4]);
+
+		build
+			.write_batch_chunks(&batch, JoinKeyPlan::Int64, &keys, false, budget)
+			.await
+			.expect("write batch");
+		assert!(
+			build
+				.cache
+				.get(&0)
+				.and_then(|cached| cached.decoded_batch.as_ref())
+				.is_none(),
+			"writes cache plaintext only"
+		);
+
+		let decoded_first = build.read_batch_page(0).await.expect("first read");
+		assert_record_batch_equal(&decoded_first, &batch);
+		let cache_bytes_after_first = build.cache_bytes;
+		let cached = build.cache.get_mut(&0).expect("page cached");
+		assert!(
+			cached.decoded_batch.is_some(),
+			"first read caches decoded batch"
+		);
+		assert!(
+			cached.bytes.is_empty(),
+			"decoded cache entry drops plaintext bytes"
+		);
+		assert!(cached.decoded_bytes > 0);
+		cached.bytes.clear();
+
+		let decoded_second = build
+			.read_batch_page(0)
+			.await
+			.expect("second read uses decoded cache despite invalid plaintext bytes");
+		assert_record_batch_equal(&decoded_second, &batch);
+		assert_eq!(build.cache_bytes, cache_bytes_after_first);
 
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
