@@ -324,6 +324,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	pages: Vec<JoinSpillPage>,
 	page_rows: Vec<u32>,
 	index: HashMap<JoinKey, Vec<SpilledBatchRowRef>>,
+	resident_index_bytes: u64,
 	cache: HashMap<usize, CachedJoinSpillPage>,
 	lru: VecDeque<usize>,
 	cache_bytes: u64,
@@ -400,6 +401,7 @@ impl SpilledInnerJoinBuild {
 			pages: Vec::new(),
 			page_rows: Vec::new(),
 			index: HashMap::new(),
+			resident_index_bytes: 0,
 			cache: HashMap::new(),
 			lru: VecDeque::new(),
 			cache_bytes: 0,
@@ -580,10 +582,12 @@ impl SpilledInnerJoinBuild {
 			));
 		}
 		for (key, row) in refs {
-			self.index
-				.entry(key)
-				.or_default()
-				.push(SpilledBatchRowRef { page_index, row });
+			append_spilled_batch_row_ref(
+				&mut self.index,
+				&mut self.resident_index_bytes,
+				key,
+				SpilledBatchRowRef { page_index, row },
+			);
 			self.rows = self.rows.saturating_add(1);
 		}
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
@@ -612,7 +616,8 @@ impl SpilledInnerJoinBuild {
 		&self,
 		memory_cap: u64,
 	) -> Result<(), ExecutionError> {
-		let resident = spilled_batch_join_index_bytes(&self.index)
+		let resident = self
+			.resident_index_bytes
 			.saturating_add(self.writer_peak)
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
@@ -761,6 +766,16 @@ impl SpilledInnerJoinBuild {
 		self.input_batches_written
 	}
 
+	#[cfg(test)]
+	pub(in crate::exec) fn resident_index_bytes(&self) -> u64 {
+		self.resident_index_bytes
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn folded_index_bytes(&self) -> u64 {
+		spilled_batch_join_index_bytes(&self.index)
+	}
+
 	pub(in crate::exec) fn input_row_count(&self) -> u64 {
 		self.input_rows
 	}
@@ -785,6 +800,7 @@ pub(in crate::exec) struct SpilledSemiAntiExistenceBuild {
 	projection: Option<SpilledSemiAntiExistenceProjection>,
 	pages: Vec<JoinSpillPage>,
 	index: HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
+	resident_index_bytes: u64,
 	cache: HashMap<usize, CachedJoinSpillPage>,
 	lru: VecDeque<usize>,
 	cache_bytes: u64,
@@ -871,6 +887,7 @@ impl SpilledSemiAntiExistenceBuild {
 			projection: None,
 			pages: Vec::new(),
 			index: HashMap::new(),
+			resident_index_bytes: 0,
 			cache: HashMap::new(),
 			lru: VecDeque::new(),
 			cache_bytes: 0,
@@ -1037,7 +1054,7 @@ impl SpilledSemiAntiExistenceBuild {
 			let Some(key) = join_key_at(key_plan, &key_arrays, row, false)? else {
 				continue;
 			};
-			self.index.entry(key).or_default();
+			index_membership_key(&mut self.index, &mut self.resident_index_bytes, key);
 			self.rows = self.rows.saturating_add(1);
 		}
 		self.guard_resident_state(task_budget.memory.get())
@@ -1088,10 +1105,12 @@ impl SpilledSemiAntiExistenceBuild {
 			));
 		}
 		for (key, row) in refs {
-			self.index
-				.entry(key)
-				.or_default()
-				.push(SpilledExistenceRowRef { page_index, row });
+			append_spilled_existence_row_ref(
+				&mut self.index,
+				&mut self.resident_index_bytes,
+				key,
+				SpilledExistenceRowRef { page_index, row },
+			);
 			self.rows = self.rows.saturating_add(1);
 		}
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
@@ -1119,7 +1138,8 @@ impl SpilledSemiAntiExistenceBuild {
 		&self,
 		memory_cap: u64,
 	) -> Result<(), ExecutionError> {
-		let resident = semi_anti_existence_spill_index_bytes(&self.index)
+		let resident = self
+			.resident_index_bytes
 			.saturating_add(self.writer_peak)
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
@@ -1145,6 +1165,16 @@ impl SpilledSemiAntiExistenceBuild {
 
 	pub(in crate::exec) fn spill_bytes(&self) -> u64 {
 		self.spill_bytes
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn resident_index_bytes(&self) -> u64 {
+		self.resident_index_bytes
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn folded_index_bytes(&self) -> u64 {
+		semi_anti_existence_spill_index_bytes(&self.index)
 	}
 
 	#[cfg(test)]
@@ -1559,6 +1589,59 @@ fn join_spill_index_bytes(index: &HashMap<Vec<u8>, Vec<usize>>) -> u64 {
 		.fold(0u64, u64::saturating_add)
 }
 
+fn append_spilled_batch_row_ref(
+	index: &mut HashMap<JoinKey, Vec<SpilledBatchRowRef>>,
+	resident_index_bytes: &mut u64,
+	key: JoinKey,
+	row_ref: SpilledBatchRowRef,
+) {
+	match index.entry(key) {
+		Entry::Occupied(mut entry) => {
+			entry.get_mut().push(row_ref);
+		}
+		Entry::Vacant(entry) => {
+			*resident_index_bytes =
+				resident_index_bytes.saturating_add(join_key_index_base_bytes(entry.key()));
+			entry.insert(vec![row_ref]);
+		}
+	}
+	*resident_index_bytes =
+		resident_index_bytes.saturating_add(row_ref_size::<SpilledBatchRowRef>());
+}
+
+fn index_membership_key(
+	index: &mut HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
+	resident_index_bytes: &mut u64,
+	key: JoinKey,
+) {
+	if let Entry::Vacant(entry) = index.entry(key) {
+		*resident_index_bytes =
+			resident_index_bytes.saturating_add(join_key_index_base_bytes(entry.key()));
+		entry.insert(Vec::new());
+	}
+}
+
+fn append_spilled_existence_row_ref(
+	index: &mut HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
+	resident_index_bytes: &mut u64,
+	key: JoinKey,
+	row_ref: SpilledExistenceRowRef,
+) {
+	match index.entry(key) {
+		Entry::Occupied(mut entry) => {
+			entry.get_mut().push(row_ref);
+		}
+		Entry::Vacant(entry) => {
+			*resident_index_bytes =
+				resident_index_bytes.saturating_add(join_key_index_base_bytes(entry.key()));
+			entry.insert(vec![row_ref]);
+		}
+	}
+	*resident_index_bytes =
+		resident_index_bytes.saturating_add(row_ref_size::<SpilledExistenceRowRef>());
+}
+
+#[cfg(test)]
 fn semi_anti_existence_spill_index_bytes(
 	index: &HashMap<JoinKey, Vec<SpilledExistenceRowRef>>,
 ) -> u64 {
@@ -1578,6 +1661,7 @@ fn semi_anti_existence_spill_index_bytes(
 		.fold(0u64, u64::saturating_add)
 }
 
+#[cfg(test)]
 fn spilled_batch_join_index_bytes(index: &HashMap<JoinKey, Vec<SpilledBatchRowRef>>) -> u64 {
 	index
 		.iter()
@@ -1603,9 +1687,414 @@ fn join_key_heap_bytes(key: &JoinKey) -> usize {
 	}
 }
 
+fn join_key_index_base_bytes(key: &JoinKey) -> u64 {
+	u64::try_from(64usize.saturating_add(join_key_heap_bytes(key))).unwrap_or(u64::MAX)
+}
+
+fn row_ref_size<T>() -> u64 {
+	u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX)
+}
+
 fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
 	let mut nonce = [0u8; 12];
 	nonce[..8].copy_from_slice(&spill_id.to_le_bytes());
 	nonce[8..].copy_from_slice(&u32::try_from(page_index).unwrap_or(u32::MAX).to_le_bytes());
 	nonce
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn test_task_budget() -> TaskBudget {
+		let mut query_budget = QueryBudget::default();
+		query_budget.memory_per_task = ByteCount::new(64 * 1024 * 1024);
+		query_budget.spill_bytes_reserved_per_query = ByteCount::new(512 * 1024 * 1024);
+		TaskBudget::from_query_budget(query_budget)
+	}
+
+	fn test_spill_dir(name: &str) -> PathBuf {
+		let id = NEXT_JOIN_SPILL_ID.fetch_add(1, Ordering::SeqCst);
+		std::env::temp_dir().join(format!(
+			"toron_spill_accounting_{name}_{}_{}",
+			std::process::id(),
+			id
+		))
+	}
+
+	fn batch_with_keys(keys: &[i64]) -> RecordBatch {
+		let values = (0..keys.len())
+			.map(|row| i64::try_from(row).unwrap_or(i64::MAX).saturating_mul(10))
+			.collect::<Vec<_>>();
+		let extras = (0..keys.len())
+			.map(|row| i64::try_from(row).unwrap_or(i64::MAX).saturating_mul(100))
+			.collect::<Vec<_>>();
+		let schema = Arc::new(Schema::new(vec![
+			arrow::datatypes::Field::new("k", DataType::Int64, false),
+			arrow::datatypes::Field::new("v", DataType::Int64, false),
+			arrow::datatypes::Field::new("x", DataType::Int64, false),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef,
+				Arc::new(Int64Array::from(values)) as ArrayRef,
+				Arc::new(Int64Array::from(extras)) as ArrayRef,
+			],
+		)
+		.expect("test batch")
+	}
+
+	fn int64_base(value: i64) -> u64 {
+		join_key_index_base_bytes(&JoinKey::Int64(value))
+	}
+
+	fn fold_based_inner_guard_rejects(build: &SpilledInnerJoinBuild, memory_cap: u64) -> bool {
+		let resident = build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		resident > join_spill_retained_footprint_memory_cap(memory_cap)
+	}
+
+	fn fold_based_existence_guard_rejects(
+		build: &SpilledSemiAntiExistenceBuild,
+		memory_cap: u64,
+	) -> bool {
+		let resident = build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		resident > join_spill_retained_footprint_memory_cap(memory_cap)
+	}
+
+	fn align_inner_guard_resident_to_multiplier(build: &mut SpilledInnerJoinBuild) -> u64 {
+		let resident = build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		let remainder = resident % JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+		if remainder != 0 {
+			build.writer_peak = build
+				.writer_peak
+				.saturating_add(JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER - remainder);
+		}
+		build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+	}
+
+	fn align_existence_guard_resident_to_multiplier(
+		build: &mut SpilledSemiAntiExistenceBuild,
+	) -> u64 {
+		let resident = build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		let remainder = resident % JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+		if remainder != 0 {
+			build.writer_peak = build
+				.writer_peak
+				.saturating_add(JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER - remainder);
+		}
+		build
+			.folded_index_bytes()
+			.saturating_add(build.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+	}
+
+	#[tokio::test]
+	async fn incremental_inner_resident_index_tracks_new_and_duplicate_refs() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_refs");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		let ref_size = row_ref_size::<SpilledBatchRowRef>();
+
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&[1]),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write first key");
+		let mut expected = int64_base(1).saturating_add(ref_size);
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write duplicate and new key");
+		expected = expected
+			.saturating_add(ref_size)
+			.saturating_add(int64_base(2))
+			.saturating_add(ref_size);
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&[2, 3, 3]),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write multi-batch keys");
+		expected = expected
+			.saturating_add(ref_size)
+			.saturating_add(int64_base(3))
+			.saturating_add(ref_size)
+			.saturating_add(ref_size);
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn incremental_existence_membership_duplicates_add_no_bytes() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("existence_membership");
+		let mut build = SpilledSemiAntiExistenceBuild::create(
+			budget,
+			Arc::new(BlockingFileOps),
+			spill_dir.clone(),
+		)
+		.await
+		.expect("create existence spill");
+		let keys = [ColumnOrdinal(0)];
+
+		build
+			.write_membership_key_chunks(
+				&batch_with_keys(&[1, 1, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				budget,
+			)
+			.expect("write membership keys");
+		let expected = int64_base(1).saturating_add(int64_base(2));
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build
+			.set_projection(batch_with_keys(&[0]).schema(), vec![ColumnOrdinal(0)])
+			.expect("set projection");
+		build
+			.write_projected_membership_key_chunks(
+				&batch_with_keys(&[1, 2, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				budget,
+			)
+			.expect("write projected duplicate membership keys");
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn incremental_existence_payload_index_tracks_projected_writes() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("existence_payload");
+		let mut build = SpilledSemiAntiExistenceBuild::create(
+			budget,
+			Arc::new(BlockingFileOps),
+			spill_dir.clone(),
+		)
+		.await
+		.expect("create existence spill");
+		let full_batch = batch_with_keys(&[0]);
+		build
+			.set_projection(
+				full_batch.schema(),
+				vec![ColumnOrdinal(0), ColumnOrdinal(1)],
+			)
+			.expect("set projection");
+		let keys = [ColumnOrdinal(0)];
+		let ref_size = row_ref_size::<SpilledExistenceRowRef>();
+
+		build
+			.write_projected_batch_chunks(&batch_with_keys(&[1]), JoinKeyPlan::Int64, &keys, budget)
+			.await
+			.expect("write projected first key");
+		let mut expected = int64_base(1).saturating_add(ref_size);
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build
+			.write_projected_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				budget,
+			)
+			.await
+			.expect("write projected duplicate and new key");
+		expected = expected
+			.saturating_add(ref_size)
+			.saturating_add(int64_base(2))
+			.saturating_add(ref_size);
+		assert_eq!(build.resident_index_bytes(), expected);
+		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn incremental_resident_guard_decisions_match_fold() {
+		let budget = test_task_budget();
+		let inner_dir = test_spill_dir("inner_guard");
+		let mut inner =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), inner_dir.clone())
+				.await
+				.expect("create inner spill");
+		inner
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2, 2]),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write inner guard batch");
+		assert_eq!(inner.resident_index_bytes(), inner.folded_index_bytes());
+		let inner_resident = align_inner_guard_resident_to_multiplier(&mut inner);
+		let inner_equal = inner_resident / JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+		for memory_cap in [
+			inner_equal.saturating_sub(1),
+			inner_equal,
+			inner_equal.saturating_add(1),
+		] {
+			assert_eq!(
+				inner.guard_resident_state(memory_cap).is_err(),
+				fold_based_inner_guard_rejects(&inner, memory_cap)
+			);
+		}
+		inner.cleanup().await;
+		let _ = std::fs::remove_dir_all(inner_dir);
+
+		let existence_dir = test_spill_dir("existence_guard");
+		let mut existence = SpilledSemiAntiExistenceBuild::create(
+			budget,
+			Arc::new(BlockingFileOps),
+			existence_dir.clone(),
+		)
+		.await
+		.expect("create existence spill");
+		existence
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2, 2]),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				budget,
+			)
+			.await
+			.expect("write existence guard batch");
+		assert_eq!(
+			existence.resident_index_bytes(),
+			existence.folded_index_bytes()
+		);
+		let existence_resident = align_existence_guard_resident_to_multiplier(&mut existence);
+		let existence_equal =
+			existence_resident / JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+		for memory_cap in [
+			existence_equal.saturating_sub(1),
+			existence_equal,
+			existence_equal.saturating_add(1),
+		] {
+			assert_eq!(
+				existence.guard_resident_state(memory_cap).is_err(),
+				fold_based_existence_guard_rejects(&existence, memory_cap)
+			);
+		}
+		existence.cleanup().await;
+		let _ = std::fs::remove_dir_all(existence_dir);
+	}
+
+	#[tokio::test]
+	async fn incremental_resident_counters_start_fresh_for_new_spills() {
+		let budget = test_task_budget();
+		let inner_dir = test_spill_dir("inner_fresh");
+		let mut first_inner =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), inner_dir.clone())
+				.await
+				.expect("create first inner spill");
+		first_inner
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write first inner spill");
+		assert!(first_inner.resident_index_bytes() > 0);
+		first_inner.cleanup().await;
+		let second_inner =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), inner_dir.clone())
+				.await
+				.expect("create second inner spill");
+		assert_eq!(second_inner.resident_index_bytes(), 0);
+		assert_eq!(
+			second_inner.resident_index_bytes(),
+			second_inner.folded_index_bytes()
+		);
+		second_inner.cleanup().await;
+		let _ = std::fs::remove_dir_all(inner_dir);
+
+		let existence_dir = test_spill_dir("existence_fresh");
+		let mut first_existence = SpilledSemiAntiExistenceBuild::create(
+			budget,
+			Arc::new(BlockingFileOps),
+			existence_dir.clone(),
+		)
+		.await
+		.expect("create first existence spill");
+		first_existence
+			.write_membership_key_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				budget,
+			)
+			.expect("write first existence spill");
+		assert!(first_existence.resident_index_bytes() > 0);
+		first_existence.cleanup().await;
+		let second_existence = SpilledSemiAntiExistenceBuild::create(
+			budget,
+			Arc::new(BlockingFileOps),
+			existence_dir.clone(),
+		)
+		.await
+		.expect("create second existence spill");
+		assert_eq!(second_existence.resident_index_bytes(), 0);
+		assert_eq!(
+			second_existence.resident_index_bytes(),
+			second_existence.folded_index_bytes()
+		);
+		second_existence.cleanup().await;
+		let _ = std::fs::remove_dir_all(existence_dir);
+	}
 }
