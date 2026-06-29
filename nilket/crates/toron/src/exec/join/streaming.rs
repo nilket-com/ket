@@ -256,6 +256,77 @@ fn partition_streaming_join_batch_with_buckets(
 	Ok(partitioned)
 }
 
+fn partition_streaming_join_batch_active_group_with_buckets(
+	batch: &RecordBatch,
+	buckets: &[Option<u32>],
+	partition_count: u32,
+	partition_start: usize,
+	partition_end: usize,
+) -> Result<Vec<(usize, RecordBatch)>, ExecutionError> {
+	if buckets.len() != batch.num_rows() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"partition bucket count {} did not match batch rows {}",
+				buckets.len(),
+				batch.num_rows()
+			),
+		});
+	}
+	let partition_count_usize =
+		usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+			message: "join partition count did not fit usize".to_string(),
+		})?;
+	if partition_start > partition_end || partition_end > partition_count_usize {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"active join partition range {partition_start}..{partition_end} exceeded partition count {partition_count}"
+			),
+		});
+	}
+
+	let mut builders: Vec<Vec<u32>> = (partition_start..partition_end)
+		.map(|_| Vec::new())
+		.collect();
+	for (row, row_partition) in buckets.iter().enumerate() {
+		let Some(partition) = row_partition else {
+			continue;
+		};
+		let partition = usize::try_from(*partition).map_err(|_| ExecutionError::Kernel {
+			message: "join partition bucket did not fit usize".to_string(),
+		})?;
+		if partition >= partition_count_usize {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"join partition bucket {} exceeded partition count {}",
+					partition, partition_count
+				),
+			});
+		}
+		if partition < partition_start || partition >= partition_end {
+			continue;
+		}
+		builders[partition - partition_start].push(join_probe_row_index(row)?);
+	}
+
+	let mut partitioned = Vec::new();
+	for (offset, indices) in builders.into_iter().enumerate() {
+		if indices.is_empty() {
+			continue;
+		}
+		let indices = UInt32Array::from(indices);
+		let columns = batch
+			.columns()
+			.iter()
+			.map(|column| take(column, &indices, None))
+			.collect::<Result<Vec<_>, _>>()?;
+		partitioned.push((
+			partition_start + offset,
+			RecordBatch::try_new(batch.schema(), columns)?,
+		));
+	}
+	Ok(partitioned)
+}
+
 pub(in crate::exec) fn extract_reoriented_inner_chain(
 	top: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
@@ -3700,12 +3771,13 @@ impl Executor {
 			null_safe_keys,
 			false,
 		)?;
-		for (partition, partitioned) in
-			partition_streaming_join_batch_with_buckets(batch, &buckets, partition_count)?
-		{
-			if partition < partition_start || partition >= partition_end {
-				continue;
-			}
+		for (partition, partitioned) in partition_streaming_join_batch_active_group_with_buckets(
+			batch,
+			&buckets,
+			partition_count,
+			partition_start,
+			partition_end,
+		)? {
 			let Some(spilled) = partitioned_builds
 				.get_mut(partition)
 				.and_then(Option::as_mut)
@@ -8674,6 +8746,72 @@ mod tests {
 			],
 		)
 		.expect("partition parallel batch")
+	}
+
+	#[test]
+	fn active_group_partitioning_matches_all_partitions_filtered() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("payload", DataType::Utf8, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80])) as ArrayRef,
+				Arc::new(StringArray::from(vec![
+					"p0", "p2a", "p3a", "skip", "p1", "p2b", "p4", "p3b",
+				])) as ArrayRef,
+			],
+		)
+		.expect("partition test batch");
+		let buckets = vec![
+			Some(0),
+			Some(2),
+			Some(3),
+			None,
+			Some(1),
+			Some(2),
+			Some(4),
+			Some(3),
+		];
+		let all = partition_streaming_join_batch_with_buckets(&batch, &buckets, 5)
+			.expect("all partitions");
+		let expected = all
+			.into_iter()
+			.filter(|(partition, _)| (2..4).contains(partition))
+			.collect::<Vec<_>>();
+		let active =
+			partition_streaming_join_batch_active_group_with_buckets(&batch, &buckets, 5, 2, 4)
+				.expect("active partitions");
+
+		assert_eq!(
+			active
+				.iter()
+				.map(|(partition, _)| *partition)
+				.collect::<Vec<_>>(),
+			vec![2, 3]
+		);
+		assert_eq!(
+			active
+				.iter()
+				.map(|(partition, _)| *partition)
+				.collect::<Vec<_>>(),
+			expected
+				.iter()
+				.map(|(partition, _)| *partition)
+				.collect::<Vec<_>>()
+		);
+		for ((active_partition, active_batch), (expected_partition, expected_batch)) in
+			active.iter().zip(expected.iter())
+		{
+			assert_eq!(active_partition, expected_partition);
+			assert_record_batches_equal(&[active_batch.clone()], &[expected_batch.clone()]);
+		}
+
+		let empty =
+			partition_streaming_join_batch_active_group_with_buckets(&batch, &buckets, 5, 1, 1)
+				.expect("empty active group");
+		assert!(empty.is_empty());
 	}
 
 	#[test]
