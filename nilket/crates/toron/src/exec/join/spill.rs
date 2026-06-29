@@ -805,6 +805,16 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
+	pub(in crate::exec) async fn read_all_batch_pages(
+		&mut self,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let mut pages = Vec::with_capacity(self.pages.len());
+		for page_index in 0..self.pages.len() {
+			pages.push(self.read_batch_page(page_index).await?);
+		}
+		Ok(pages)
+	}
+
 	pub(in crate::exec) fn release_write_scratch(&mut self) {
 		self.scratch_plaintext = Vec::new();
 		self.scratch_refs = Vec::new();
@@ -995,6 +1005,17 @@ impl SpilledInnerJoinBuild {
 
 	pub(in crate::exec) fn spill_bytes(&self) -> u64 {
 		self.spill_bytes
+	}
+
+	pub(in crate::exec) fn loaded_page_bytes_estimate(&self) -> u64 {
+		self.pages
+			.iter()
+			.map(|page| page.plaintext_len as u64)
+			.fold(0u64, u64::saturating_add)
+	}
+
+	pub(in crate::exec) fn writer_peak_bytes(&self) -> u64 {
+		self.writer_peak
 	}
 }
 

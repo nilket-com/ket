@@ -109,6 +109,7 @@ pub struct ExecutionContext {
 	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
+	pub partition_parallelism: usize,
 	join_spill_file_ops: Arc<dyn AsyncFileOps>,
 	join_spill_dir: PathBuf,
 }
@@ -133,6 +134,7 @@ impl fmt::Debug for ExecutionContext {
 				"downstream_cancellation",
 				&self.downstream_cancellation.is_some(),
 			)
+			.field("partition_parallelism", &self.partition_parallelism)
 			.field("join_spill_dir", &self.join_spill_dir)
 			.finish_non_exhaustive()
 	}
@@ -158,6 +160,7 @@ impl ExecutionContext {
 			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			runtime_filter: None,
 			downstream_cancellation: None,
+			partition_parallelism: default_partition_parallelism(),
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: std::env::temp_dir().join("toron_join_spill"),
 		}
@@ -191,6 +194,11 @@ impl ExecutionContext {
 		self
 	}
 
+	pub fn with_partition_parallelism(mut self, partition_parallelism: usize) -> Self {
+		self.partition_parallelism = partition_parallelism.max(1);
+		self
+	}
+
 	pub fn with_join_spill_store(
 		mut self,
 		file_ops: Arc<dyn AsyncFileOps>,
@@ -213,6 +221,18 @@ impl ExecutionContext {
 			.insert(TableId(1), local_scan_table_pin(TableId(1)));
 		context
 	}
+}
+
+fn default_partition_parallelism() -> usize {
+	if let Ok(raw) = std::env::var("TORON_PARTITION_PARALLELISM") {
+		if let Ok(value) = raw.parse::<usize>() {
+			return value.max(1);
+		}
+	}
+	std::thread::available_parallelism()
+		.map(std::num::NonZeroUsize::get)
+		.unwrap_or(1)
+		.max(1)
 }
 
 impl Executor {
