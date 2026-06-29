@@ -303,7 +303,7 @@ impl SpilledJoinBuild {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::exec) struct SpilledBatchRowRef {
 	pub(super) page_index: usize,
 	pub(super) row: u32,
@@ -335,6 +335,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	input_rows: u64,
 	input_batches_written: u64,
 	next_offset: u64,
+	scratch_plaintext: Vec<u8>,
+	scratch_refs: Vec<(JoinKey, u32)>,
 }
 
 impl SpilledInnerJoinBuild {
@@ -412,6 +414,8 @@ impl SpilledInnerJoinBuild {
 			input_rows: 0,
 			input_batches_written: 0,
 			next_offset: 0,
+			scratch_plaintext: Vec::new(),
+			scratch_refs: Vec::new(),
 		})
 	}
 
@@ -548,7 +552,9 @@ impl SpilledInnerJoinBuild {
 			return Ok(());
 		}
 		let key_arrays = key_arrays(batch, build_keys)?;
-		let mut refs = Vec::new();
+		let mut refs = std::mem::take(&mut self.scratch_refs);
+		refs.clear();
+		refs.reserve(batch.num_rows());
 		for row in 0..batch.num_rows() {
 			let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
 				continue;
@@ -556,12 +562,15 @@ impl SpilledInnerJoinBuild {
 			refs.push((key, join_build_row_index(row)?));
 		}
 		if refs.is_empty() && !retain_unkeyed_rows {
+			self.scratch_refs = refs;
 			return Ok(());
 		}
 
 		let page_index = self.pages.len();
-		let plaintext = encode_record_batch_ipc(batch)?;
-		let page = write_join_spill_plaintext_page(
+		self.scratch_plaintext.clear();
+		encode_record_batch_ipc_into(&mut self.scratch_plaintext, batch)?;
+		let plaintext = std::mem::take(&mut self.scratch_plaintext);
+		let (page, mut plaintext) = write_join_spill_plaintext_page_returning_buffer(
 			self.file_ops.as_ref(),
 			&self.file,
 			&self.key,
@@ -571,9 +580,13 @@ impl SpilledInnerJoinBuild {
 			plaintext,
 		)
 		.await?;
+		plaintext.clear();
+		self.scratch_plaintext = plaintext;
 		self.spill_bytes = self.spill_bytes.saturating_add(page.ciphertext_len as u64);
 		self.writer_peak = self.writer_peak.max(page.plaintext_len as u64);
 		if self.spill_bytes > task_budget.spill_bytes.get() {
+			refs.clear();
+			self.scratch_refs = refs;
 			return Err(budget_exhausted(
 				BudgetDimension::SpillBytes,
 				"streamed inner join build spill writer",
@@ -581,7 +594,7 @@ impl SpilledInnerJoinBuild {
 				task_budget.spill_bytes.get(),
 			));
 		}
-		for (key, row) in refs {
+		for (key, row) in refs.drain(..) {
 			append_spilled_batch_row_ref(
 				&mut self.index,
 				&mut self.resident_index_bytes,
@@ -590,6 +603,8 @@ impl SpilledInnerJoinBuild {
 			);
 			self.rows = self.rows.saturating_add(1);
 		}
+		refs.clear();
+		self.scratch_refs = refs;
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
 		self.page_rows.push(join_build_row_index(batch.num_rows())?);
 		self.pages.push(page);
@@ -1387,8 +1402,24 @@ async fn write_join_spill_plaintext_page(
 	spill_id: u64,
 	page_index: usize,
 	offset: u64,
-	mut plaintext: Vec<u8>,
+	plaintext: Vec<u8>,
 ) -> Result<JoinSpillPage, ExecutionError> {
+	let (page, _) = write_join_spill_plaintext_page_returning_buffer(
+		file_ops, file, key, spill_id, page_index, offset, plaintext,
+	)
+	.await?;
+	Ok(page)
+}
+
+async fn write_join_spill_plaintext_page_returning_buffer(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	key: &LessSafeKey,
+	spill_id: u64,
+	page_index: usize,
+	offset: u64,
+	mut plaintext: Vec<u8>,
+) -> Result<(JoinSpillPage, Vec<u8>), ExecutionError> {
 	let plaintext_len = plaintext.len();
 	let nonce = Nonce::assume_unique_for_key(join_spill_nonce(spill_id, page_index));
 	key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
@@ -1396,20 +1427,23 @@ async fn write_join_spill_plaintext_page(
 			message: format!("join spill encrypt failed: {error:?}"),
 		})?;
 	let ciphertext_len = plaintext.len();
-	write_plain_all(file_ops, file, offset, plaintext).await?;
-	Ok(JoinSpillPage {
-		offset,
-		ciphertext_len,
-		plaintext_len,
-	})
+	let plaintext = write_plain_all_returning_buffer(file_ops, file, offset, plaintext).await?;
+	Ok((
+		JoinSpillPage {
+			offset,
+			ciphertext_len,
+			plaintext_len,
+		},
+		plaintext,
+	))
 }
 
-async fn write_plain_all(
+async fn write_plain_all_returning_buffer(
 	file_ops: &dyn AsyncFileOps,
 	file: &FileHandle,
 	offset: u64,
 	bytes: Vec<u8>,
-) -> Result<(), ExecutionError> {
+) -> Result<Vec<u8>, ExecutionError> {
 	let mut written_total = 0usize;
 	while written_total < bytes.len() {
 		let written = file_ops
@@ -1431,7 +1465,7 @@ async fn write_plain_all(
 		}
 		written_total = written_total.saturating_add(written);
 	}
-	Ok(())
+	Ok(bytes)
 }
 
 async fn read_plain_exact(
@@ -1528,14 +1562,24 @@ fn decode_join_spill_page_for_key(
 
 fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Vec<u8>, ExecutionError> {
 	let mut buffer = Vec::new();
+	encode_record_batch_ipc_into(&mut buffer, batch)?;
+	Ok(buffer)
+}
+
+fn encode_record_batch_ipc_into(
+	buffer: &mut Vec<u8>,
+	batch: &RecordBatch,
+) -> Result<(), ExecutionError> {
+	buffer.clear();
 	{
 		let options =
 			IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-		let mut writer = StreamWriter::try_new_with_options(&mut buffer, &batch.schema(), options)?;
+		let mut writer =
+			StreamWriter::try_new_with_options(&mut *buffer, &batch.schema(), options)?;
 		writer.write(batch)?;
 		writer.finish()?;
 	}
-	Ok(buffer)
+	Ok(())
 }
 
 fn decode_record_batch_ipc(bytes: &[u8]) -> Result<RecordBatch, ExecutionError> {
@@ -1745,6 +1789,50 @@ mod tests {
 		.expect("test batch")
 	}
 
+	fn nullable_batch_with_keys(keys: &[Option<i64>]) -> RecordBatch {
+		let values = keys
+			.iter()
+			.enumerate()
+			.map(|(row, key)| {
+				key.map(|_| i64::try_from(row).unwrap_or(i64::MAX).saturating_mul(10))
+			})
+			.collect::<Vec<_>>();
+		let extras = keys
+			.iter()
+			.enumerate()
+			.map(|(row, key)| {
+				key.map(|_| i64::try_from(row).unwrap_or(i64::MAX).saturating_mul(100))
+			})
+			.collect::<Vec<_>>();
+		let schema = Arc::new(Schema::new(vec![
+			arrow::datatypes::Field::new("k", DataType::Int64, true),
+			arrow::datatypes::Field::new("v", DataType::Int64, true),
+			arrow::datatypes::Field::new("x", DataType::Int64, true),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef,
+				Arc::new(Int64Array::from(values)) as ArrayRef,
+				Arc::new(Int64Array::from(extras)) as ArrayRef,
+			],
+		)
+		.expect("nullable test batch")
+	}
+
+	fn assert_record_batch_equal(left: &RecordBatch, right: &RecordBatch) {
+		assert_eq!(left.schema(), right.schema());
+		assert_eq!(left.num_rows(), right.num_rows());
+		assert_eq!(left.num_columns(), right.num_columns());
+		for column in 0..left.num_columns() {
+			assert_eq!(
+				format!("{:?}", left.column(column)),
+				format!("{:?}", right.column(column)),
+				"column {column} differs"
+			);
+		}
+	}
+
 	fn int64_base(value: i64) -> u64 {
 		join_key_index_base_bytes(&JoinKey::Int64(value))
 	}
@@ -1802,6 +1890,107 @@ mod tests {
 			.folded_index_bytes()
 			.saturating_add(build.writer_peak)
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+	}
+
+	#[test]
+	fn encode_record_batch_ipc_into_matches_fresh_and_reuses_scratch() {
+		let first = batch_with_keys(&[1, 2, 3]);
+		let second = nullable_batch_with_keys(&[Some(7), None, Some(9), Some(10)]);
+		let first_fresh = encode_record_batch_ipc(&first).expect("fresh first encode");
+		let second_fresh = encode_record_batch_ipc(&second).expect("fresh second encode");
+		let mut scratch = Vec::with_capacity(1);
+
+		encode_record_batch_ipc_into(&mut scratch, &first).expect("scratch first encode");
+		assert_eq!(scratch, first_fresh);
+		let first_capacity = scratch.capacity();
+		assert!(first_capacity >= scratch.len());
+
+		encode_record_batch_ipc_into(&mut scratch, &second).expect("scratch second encode");
+		assert_eq!(scratch, second_fresh);
+		assert!(scratch.capacity() >= first_capacity.min(second_fresh.len()));
+	}
+
+	#[tokio::test]
+	async fn inner_spill_page_write_reuses_scratch_and_round_trips() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_scratch_reuse");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		let first = batch_with_keys(&[1, 2, 2, 3]);
+		let second = batch_with_keys(&[4, 5]);
+		let first_plaintext = encode_record_batch_ipc(&first).expect("fresh first plaintext");
+		let second_plaintext = encode_record_batch_ipc(&second).expect("fresh second plaintext");
+
+		build
+			.write_batch_chunks(&first, JoinKeyPlan::Int64, &keys, false, budget)
+			.await
+			.expect("write first batch");
+		let first_scratch_capacity = build.scratch_plaintext.capacity();
+		let first_refs_capacity = build.scratch_refs.capacity();
+		assert_eq!(build.scratch_plaintext.len(), 0);
+		assert_eq!(build.scratch_refs.len(), 0);
+		assert!(first_scratch_capacity >= first_plaintext.len());
+		assert!(first_refs_capacity >= first.num_rows());
+
+		build
+			.write_batch_chunks(&second, JoinKeyPlan::Int64, &keys, false, budget)
+			.await
+			.expect("write second batch");
+		assert_eq!(build.scratch_plaintext.len(), 0);
+		assert_eq!(build.scratch_refs.len(), 0);
+		assert!(build.scratch_plaintext.capacity() >= first_scratch_capacity);
+		assert!(build.scratch_refs.capacity() >= first_refs_capacity);
+		assert_eq!(build.pages[0].plaintext_len, first_plaintext.len());
+		assert_eq!(build.pages[1].plaintext_len, second_plaintext.len());
+		assert_eq!(
+			build.writer_peak,
+			u64::try_from(first_plaintext.len().max(second_plaintext.len())).unwrap()
+		);
+		assert_eq!(
+			build.spill_bytes,
+			build
+				.pages
+				.iter()
+				.map(|page| page.ciphertext_len as u64)
+				.sum::<u64>()
+		);
+
+		let decoded_first = build.read_batch_page(0).await.expect("read first page");
+		let decoded_second = build.read_batch_page(1).await.expect("read second page");
+		assert_record_batch_equal(&decoded_first, &first);
+		assert_record_batch_equal(&decoded_second, &second);
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(2))
+				.await
+				.expect("lookup key 2"),
+			vec![
+				SpilledBatchRowRef {
+					page_index: 0,
+					row: 1
+				},
+				SpilledBatchRowRef {
+					page_index: 0,
+					row: 2
+				}
+			]
+		);
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(5))
+				.await
+				.expect("lookup key 5"),
+			vec![SpilledBatchRowRef {
+				page_index: 1,
+				row: 1
+			}]
+		);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 
 	#[tokio::test]
