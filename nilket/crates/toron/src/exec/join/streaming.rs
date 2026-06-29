@@ -175,6 +175,56 @@ struct StreamingScanJoinPartition<'a> {
 	null_safe_keys: bool,
 }
 
+fn partition_streaming_join_batch_with_buckets(
+	batch: &RecordBatch,
+	buckets: &[Option<u32>],
+	partition_count: u32,
+) -> Result<Vec<(usize, RecordBatch)>, ExecutionError> {
+	if buckets.len() != batch.num_rows() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"partition bucket count {} did not match batch rows {}",
+				buckets.len(),
+				batch.num_rows()
+			),
+		});
+	}
+
+	let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
+	for (row, row_partition) in buckets.iter().enumerate() {
+		let Some(partition) = row_partition else {
+			continue;
+		};
+		let partition = usize::try_from(*partition).map_err(|_| ExecutionError::Kernel {
+			message: "join partition bucket did not fit usize".to_string(),
+		})?;
+		let Some(indices) = builders.get_mut(partition) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"join partition bucket {} exceeded partition count {}",
+					partition, partition_count
+				),
+			});
+		};
+		indices.push(join_probe_row_index(row)?);
+	}
+
+	let mut partitioned = Vec::new();
+	for (partition, indices) in builders.into_iter().enumerate() {
+		if indices.is_empty() {
+			continue;
+		}
+		let indices = UInt32Array::from(indices);
+		let columns = batch
+			.columns()
+			.iter()
+			.map(|column| take(column, &indices, None))
+			.collect::<Result<Vec<_>, _>>()?;
+		partitioned.push((partition, RecordBatch::try_new(batch.schema(), columns)?));
+	}
+	Ok(partitioned)
+}
+
 pub(in crate::exec) fn extract_reoriented_inner_chain(
 	top: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
@@ -2073,6 +2123,179 @@ impl Executor {
 					retain_unkeyed_rows,
 				)
 				.await?;
+			}
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn write_partitioned_streaming_scan_inner_build_batches(
+		&self,
+		partitioned_builds: &mut [Option<SpilledInnerJoinBuild>],
+		total_spill_bytes: &mut u64,
+		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		partition_build_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(), ExecutionError> {
+		let partition_count =
+			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
+				message: "partitioned streamed inner build count exceeds u32".to_string(),
+			})?;
+		if let Some(exchange) = scan_input.exchange {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan build expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				for (_, partitioned) in
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
+				{
+					self.write_partitioned_streaming_scan_inner_build_batch(
+						partitioned_builds,
+						total_spill_bytes,
+						&partitioned,
+						retained_columns,
+						partition_build_keys,
+						write_build_keys,
+						partition_count,
+						key_plan,
+						null_safe_keys,
+					)
+					.await?;
+				}
+			}
+		} else {
+			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "streaming scan build expected a scan input".to_string(),
+				});
+			};
+			let mut remaining = req.row_limit;
+			let span = crate::telemetry::storage_scan_span(&req);
+			let mut stream = self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches();
+			while let Some(batch) = stream.next().await {
+				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+					break;
+				};
+				if let Some(predicate) = scan_input.filter_predicate {
+					batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() == 0 {
+						continue;
+					}
+				}
+				self.write_partitioned_streaming_scan_inner_build_batch(
+					partitioned_builds,
+					total_spill_bytes,
+					&batch,
+					retained_columns,
+					partition_build_keys,
+					write_build_keys,
+					partition_count,
+					key_plan,
+					null_safe_keys,
+				)
+				.await?;
+			}
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn write_partitioned_streaming_scan_inner_build_batch(
+		&self,
+		partitioned_builds: &mut [Option<SpilledInnerJoinBuild>],
+		total_spill_bytes: &mut u64,
+		batch: &RecordBatch,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		partition_build_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		partition_count: u32,
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+	) -> Result<(), ExecutionError> {
+		let buckets = precompute_join_partition_buckets(
+			batch,
+			partition_build_keys,
+			partition_count,
+			null_safe_keys,
+			false,
+		)?;
+		for (partition, partitioned) in
+			partition_streaming_join_batch_with_buckets(batch, &buckets, partition_count)?
+		{
+			let Some(spilled) = partitioned_builds
+				.get_mut(partition)
+				.and_then(Option::as_mut)
+			else {
+				continue;
+			};
+			let before = spilled.spill_bytes();
+			if let Some(retained_columns) = retained_columns {
+				spilled
+					.write_projected_batch_chunks_unindexed(
+						&partitioned,
+						retained_columns,
+						key_plan,
+						write_build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await?;
+			} else {
+				spilled
+					.write_batch_chunks_unindexed(
+						&partitioned,
+						key_plan,
+						write_build_keys,
+						null_safe_keys,
+						self.context.task_budget,
+					)
+					.await?;
+			}
+			*total_spill_bytes =
+				total_spill_bytes.saturating_add(spilled.spill_bytes().saturating_sub(before));
+			if *total_spill_bytes > self.context.task_budget.spill_bytes.get() {
+				return Err(budget_exhausted(
+					BudgetDimension::SpillBytes,
+					"partitioned streamed inner join build spill writer",
+					*total_spill_bytes,
+					self.context.task_budget.spill_bytes.get(),
+				));
 			}
 		}
 		Ok(())
@@ -6152,7 +6375,6 @@ impl Executor {
 		let mut output = Vec::new();
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
-		let mut total_build_rows = 0u64;
 		let probe_partition_buckets = precompute_join_partition_buckets(
 			probe_batch,
 			probe_keys,
@@ -6160,69 +6382,111 @@ impl Executor {
 			null_safe_keys,
 			false,
 		)?;
-		for partition in 0..partition_count {
-			let partitioned_probe = select_join_partition_batch_with_buckets(
-				probe_batch,
-				&probe_partition_buckets,
-				partition,
-			)?;
-			if partitioned_probe.num_rows() == 0 {
-				continue;
+		let partitioned_probe_batches = partition_streaming_join_batch_with_buckets(
+			probe_batch,
+			&probe_partition_buckets,
+			partition_count,
+		)?;
+		if partitioned_probe_batches.is_empty() {
+			return Ok((output, 0, 0, 0));
+		}
+		let active_partitions = partitioned_probe_batches
+			.iter()
+			.map(|(partition, _)| *partition)
+			.collect::<Vec<_>>();
+		let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
+			(0..partition_count).map(|_| None).collect();
+		for partition in &active_partitions {
+			if *partition >= partitioned_builds.len() {
+				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+				return Err(ExecutionError::Kernel {
+					message: format!("active join partition {partition} is out of range"),
+				});
 			}
-
-			let mut spilled = SpilledInnerJoinBuild::create(
+			let created = SpilledInnerJoinBuild::create(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
 			)
-			.await?;
-			let build_started = Instant::now();
-			let build_result = self
-				.write_streaming_scan_inner_build_batches(
-					&mut spilled,
-					scan_input,
-					projection.map(|projection| projection.retained_columns.as_slice()),
-					write_build_keys,
-					key_plan,
-					null_safe_keys,
-					false,
-					Some(StreamingScanJoinPartition {
-						keys: partition_build_keys,
-						partition_count,
-						partition,
-						null_safe_keys,
-					}),
-					morsel,
-				)
-				.await;
-			if let Err(error) = build_result {
-				spilled.cleanup().await;
-				return Err(error);
-			}
+			.await;
+			let created = match created {
+				Ok(created) => created,
+				Err(error) => {
+					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+					return Err(error);
+				}
+			};
+			partitioned_builds[*partition] = Some(created);
+		}
+
+		let build_started = Instant::now();
+		let mut total_spill_bytes = 0u64;
+		let build_result = self
+			.write_partitioned_streaming_scan_inner_build_batches(
+				&mut partitioned_builds,
+				&mut total_spill_bytes,
+				scan_input,
+				projection.map(|projection| projection.retained_columns.as_slice()),
+				partition_build_keys,
+				write_build_keys,
+				key_plan,
+				null_safe_keys,
+				morsel,
+			)
+			.await;
+		if let Err(error) = build_result {
+			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+			return Err(error);
+		}
+		let mut total_build_rows = 0u64;
+		for partition in &active_partitions {
+			let Some(spilled) = partitioned_builds
+				.get_mut(*partition)
+				.and_then(Option::as_mut)
+			else {
+				continue;
+			};
 			if let Err(error) = spilled.finish(self.context.task_budget).await {
-				spilled.cleanup().await;
+				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 				return Err(error);
 			}
-			let build_rows = spilled.input_row_count();
-			total_build_rows = total_build_rows.saturating_add(build_rows);
-			record_task_telemetry(&self.context.task_telemetry, |task| {
-				task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
-				task.phases.build_micros = task
-					.phases
-					.build_micros
-					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
-				task.counters.spill_bytes = task
-					.counters
-					.spill_bytes
-					.saturating_add(spilled.spill_bytes());
-			});
-			if build_rows == 0 {
+			spilled.release_write_scratch();
+			total_build_rows = total_build_rows.saturating_add(spilled.input_row_count());
+		}
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task.counters.build_rows.saturating_add(total_build_rows);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+			task.phases.spill_micros = task
+				.phases
+				.spill_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.spill_bytes = task.counters.spill_bytes.saturating_add(total_spill_bytes);
+		});
+
+		for (partition, partitioned_probe) in partitioned_probe_batches {
+			let Some(mut spilled) = partitioned_builds.get_mut(partition).and_then(Option::take)
+			else {
+				continue;
+			};
+			if spilled.input_row_count() == 0 {
 				spilled.cleanup().await;
 				continue;
+			}
+			if let Err(error) = spilled
+				.rebuild_index_from_pages(
+					key_plan,
+					write_build_keys,
+					null_safe_keys,
+					self.context.task_budget,
+				)
+				.await
+			{
+				spilled.cleanup().await;
+				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+				return Err(error);
 			}
 
 			let mut partition_output = Vec::new();
@@ -6246,17 +6510,32 @@ impl Executor {
 				)
 				.await;
 			spilled.cleanup().await;
-			let (probe_rows, output_rows) = result?;
+			let (probe_rows, output_rows) = match result {
+				Ok(result) => result,
+				Err(error) => {
+					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+					return Err(error);
+				}
+			};
 			total_probe_rows = total_probe_rows.saturating_add(probe_rows);
 			total_output_rows = total_output_rows.saturating_add(output_rows);
 			output.extend(partition_output);
 		}
+		Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 		Ok((
 			output,
 			total_probe_rows,
 			total_output_rows,
 			total_build_rows,
 		))
+	}
+
+	async fn cleanup_partitioned_streamed_inner_builds(
+		partitioned_builds: Vec<Option<SpilledInnerJoinBuild>>,
+	) {
+		for spilled in partitioned_builds.into_iter().flatten() {
+			spilled.cleanup().await;
+		}
 	}
 
 	fn record_reoriented_inner_probe(
@@ -7119,9 +7398,9 @@ mod tests {
 			let rows = 8_192usize;
 			let value_type = value_kind.data_type();
 			let build_schema = Arc::new(Schema::new(vec![
+				Field::new("dead_payload", DataType::Utf8, false),
 				Field::new("build_key", DataType::Int64, false),
 				Field::new("build_value", value_type.clone(), true),
-				Field::new("dead_payload", DataType::Utf8, false),
 			]));
 			let probe_schema = Arc::new(Schema::new(vec![
 				Field::new("probe_key", DataType::Int64, false),
@@ -7140,9 +7419,9 @@ mod tests {
 			let build_batch = RecordBatch::try_new(
 				build_schema.clone(),
 				vec![
+					Arc::new(StringArray::from(dead_payload)),
 					Arc::new(Int64Array::from(build_keys)),
 					value_kind.values(&build_values),
-					Arc::new(StringArray::from(dead_payload)),
 				],
 			)
 			.expect("partitioned build batch");
@@ -7171,16 +7450,18 @@ mod tests {
 			let build = ExecutionPlan::Exchange {
 				input: Box::new(scan),
 				partition_count: 1,
-				key: bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+				key: bound_column_root("build_key", ColumnOrdinal(1), DataType::Int64, false),
 			};
 			let mut stage =
 				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone());
-			stage.retained_build_columns = Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)]);
+			stage.build_keys = vec![ColumnOrdinal(1)];
+			stage.retained_build_columns = Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]);
 
+			let partitioned_requested_tables = Arc::new(Mutex::new(Vec::new()));
 			let partitioned_executor = Executor::with_context(
 				Arc::new(RecordingMultiBatchTableStorageScan {
 					batches: HashMap::from([(TableId(5), build_batches.clone())]),
-					requested_tables: Arc::new(Mutex::new(Vec::new())),
+					requested_tables: partitioned_requested_tables.clone(),
 				}),
 				ExecutionContext::local_test().with_task_budget(TaskBudget {
 					memory: ByteCount::new(64 * 1024),
@@ -7206,7 +7487,8 @@ mod tests {
 
 			let mut single_stage =
 				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone());
-			single_stage.retained_build_columns = Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)]);
+			single_stage.build_keys = vec![ColumnOrdinal(1)];
+			single_stage.retained_build_columns = Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]);
 			let single_executor = Executor::with_context(
 				Arc::new(RecordingMultiBatchTableStorageScan {
 					batches: HashMap::from([(TableId(5), build_batches)]),
@@ -7245,6 +7527,14 @@ mod tests {
 				canonical_arrow_ipc_digest(&single, SortPolicy::FullRowLex)
 					.expect("single-spill digest"),
 				"partitioned streamed inner build must preserve the same rows and sparse schema restoration as the single-spill projected path"
+			);
+			assert_eq!(
+				partitioned_requested_tables
+					.lock()
+					.expect("partitioned requested tables")
+					.as_slice(),
+				&[TableId(5), TableId(5)],
+				"partitioned scan build should scan once for estimation and once for the one-pass partitioned build route, not once per partition"
 			);
 
 			partitioned_runtime.cleanup().await;

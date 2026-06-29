@@ -517,6 +517,36 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
+	pub(in crate::exec) async fn write_batch_chunks_unindexed(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			self.write_page_batch_inner(
+				&chunk,
+				key_plan,
+				build_keys,
+				null_safe_keys,
+				false,
+				false,
+				task_budget,
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn write_preserved_batch_chunks(
 		&mut self,
 		batch: &RecordBatch,
@@ -577,6 +607,38 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
+	pub(in crate::exec) async fn write_projected_batch_chunks_unindexed(
+		&mut self,
+		batch: &RecordBatch,
+		retained_columns: &[ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		projected_build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0 {
+			return Ok(());
+		}
+		self.input_batches_written = self.input_batches_written.saturating_add(1);
+		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let chunk = batch.slice(offset, len);
+			let projected = project_batch_columns(&chunk, retained_columns)?;
+			self.write_page_batch_inner(
+				&projected,
+				key_plan,
+				projected_build_keys,
+				null_safe_keys,
+				false,
+				false,
+				task_budget,
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn write_projected_preserved_batch_chunks(
 		&mut self,
 		batch: &RecordBatch,
@@ -615,6 +677,28 @@ impl SpilledInnerJoinBuild {
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
 		retain_unkeyed_rows: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		self.write_page_batch_inner(
+			batch,
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			retain_unkeyed_rows,
+			true,
+			task_budget,
+		)
+		.await
+	}
+
+	async fn write_page_batch_inner(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		retain_unkeyed_rows: bool,
+		index_rows: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
@@ -663,14 +747,21 @@ impl SpilledInnerJoinBuild {
 				task_budget.spill_bytes.get(),
 			));
 		}
-		for (key, row) in refs.drain(..) {
-			append_spilled_batch_row_ref(
-				&mut self.index,
-				&mut self.resident_index_bytes,
-				key,
-				SpilledBatchRowRef { page_index, row },
-			);
-			self.rows = self.rows.saturating_add(1);
+		if index_rows {
+			for (key, row) in refs.drain(..) {
+				append_spilled_batch_row_ref(
+					&mut self.index,
+					&mut self.resident_index_bytes,
+					key,
+					SpilledBatchRowRef { page_index, row },
+				);
+				self.rows = self.rows.saturating_add(1);
+			}
+		} else {
+			self.rows = self
+				.rows
+				.saturating_add(u64::try_from(refs.len()).unwrap_or(u64::MAX));
+			refs.clear();
 		}
 		refs.clear();
 		self.scratch_refs = refs;
@@ -679,6 +770,44 @@ impl SpilledInnerJoinBuild {
 		self.pages.push(page);
 		self.guard_resident_state(task_budget.memory.get())?;
 		Ok(())
+	}
+
+	pub(in crate::exec) async fn rebuild_index_from_pages(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		self.index.clear();
+		self.resident_index_bytes = 0;
+		self.rows = 0;
+		for page_index in 0..self.pages.len() {
+			let batch = self.read_batch_page(page_index).await?;
+			let key_arrays = key_arrays(&batch, build_keys)?;
+			for row in 0..batch.num_rows() {
+				let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
+					continue;
+				};
+				append_spilled_batch_row_ref(
+					&mut self.index,
+					&mut self.resident_index_bytes,
+					key,
+					SpilledBatchRowRef {
+						page_index,
+						row: join_build_row_index(row)?,
+					},
+				);
+				self.rows = self.rows.saturating_add(1);
+			}
+			self.guard_resident_state(task_budget.memory.get())?;
+		}
+		Ok(())
+	}
+
+	pub(in crate::exec) fn release_write_scratch(&mut self) {
+		self.scratch_plaintext = Vec::new();
+		self.scratch_refs = Vec::new();
 	}
 
 	pub(in crate::exec) async fn finish(
