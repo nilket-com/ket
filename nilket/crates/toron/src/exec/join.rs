@@ -6,7 +6,9 @@ mod streaming;
 pub(in crate::exec) use self::spill::SpilledInnerJoinBuild;
 pub(in crate::exec) use self::spill::{
 	SpilledBatchRowRef, SpilledInnerJoinMatch, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
+	partition_bucket_if_non_null_with_scratch,
 };
+pub(crate) use self::spill::{partition_bucket, partition_bucket_with_scratch};
 #[cfg(test)]
 pub(in crate::exec) use self::streaming::{
 	StreamingSemiAntiExistence, StreamingSemiAntiRuntime, StreamingSemiAntiStage,
@@ -2009,6 +2011,30 @@ pub(super) async fn try_execute_partitioned_spilled_left_outer_join(
 		right_keys,
 		null_safe_keys,
 	)?;
+	let left_partition_buckets = left_batches
+		.iter()
+		.map(|batch| {
+			precompute_join_partition_buckets(
+				batch,
+				left_keys,
+				partition_count,
+				null_safe_keys,
+				true,
+			)
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let right_partition_buckets = right_batches
+		.iter()
+		.map(|batch| {
+			precompute_join_partition_buckets(
+				batch,
+				right_keys,
+				partition_count,
+				null_safe_keys,
+				false,
+			)
+		})
+		.collect::<Result<Vec<_>, _>>()?;
 	let mut output = Vec::new();
 	let output_cap = join_output_materialization_memory_cap(task_budget.memory.get());
 	let mut output_bytes = 0u64;
@@ -2021,15 +2047,8 @@ pub(super) async fn try_execute_partitioned_spilled_left_outer_join(
 			SpilledInnerJoinBuild::create(task_budget, spill_file_ops.clone(), spill_dir.clone())
 				.await?;
 		let build_started = Instant::now();
-		for batch in left_batches {
-			let partitioned = select_join_partition_batch(
-				batch,
-				left_keys,
-				partition_count,
-				partition,
-				null_safe_keys,
-				true,
-			)?;
+		for (batch, buckets) in left_batches.iter().zip(&left_partition_buckets) {
+			let partitioned = select_join_partition_batch_with_buckets(batch, buckets, partition)?;
 			spilled
 				.write_preserved_batch_chunks(
 					&partitioned,
@@ -2080,8 +2099,8 @@ pub(super) async fn try_execute_partitioned_spilled_left_outer_join(
 		let (probe_rows, output_rows) = visit_partitioned_spilled_left_outer_join_chunks(
 			&mut spilled,
 			right_batches,
+			&right_partition_buckets,
 			right_keys,
-			partition_count,
 			partition,
 			key_plan,
 			null_safe_keys,
@@ -2145,19 +2164,98 @@ pub(super) fn select_join_partition_batch(
 	retain_unkeyed_rows: bool,
 ) -> Result<RecordBatch, ExecutionError> {
 	let key_arrays = key_arrays(batch, keys)?;
-	let partition = usize::try_from(partition).expect("partition fits usize");
+	let mut scratch = Vec::new();
 	let mut indices = Vec::new();
 	for row in 0..batch.num_rows() {
 		let row_partition = if null_safe_keys {
-			Some(partition_bucket(&key_arrays, row, partition_count)?)
-		} else if join_key_bytes(&key_arrays, row)?.is_some() {
-			Some(partition_bucket(&key_arrays, row, partition_count)?)
+			Some(
+				u32::try_from(partition_bucket_with_scratch(
+					&key_arrays,
+					row,
+					partition_count,
+					&mut scratch,
+				)?)
+				.expect("partition bucket fits u32"),
+			)
+		} else if let Some(bucket) = partition_bucket_if_non_null_with_scratch(
+			&key_arrays,
+			row,
+			partition_count,
+			&mut scratch,
+		)? {
+			Some(u32::try_from(bucket).expect("partition bucket fits u32"))
 		} else if retain_unkeyed_rows {
 			Some(0)
 		} else {
 			None
 		};
 		if row_partition == Some(partition) {
+			indices.push(Some(join_probe_row_index(row)?));
+		}
+	}
+
+	if indices.is_empty() {
+		return Ok(RecordBatch::new_empty(batch.schema()));
+	}
+	let indices = UInt32Array::from(indices);
+	let columns = batch
+		.columns()
+		.iter()
+		.map(|column| take(column, &indices, None))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+pub(super) fn precompute_join_partition_buckets(
+	batch: &RecordBatch,
+	keys: &[crate::ir::ColumnOrdinal],
+	partition_count: u32,
+	null_safe_keys: bool,
+	retain_unkeyed_rows: bool,
+) -> Result<Vec<Option<u32>>, ExecutionError> {
+	let key_arrays = key_arrays(batch, keys)?;
+	let mut scratch = Vec::new();
+	let mut buckets = Vec::with_capacity(batch.num_rows());
+	for row in 0..batch.num_rows() {
+		let bucket = if null_safe_keys {
+			let bucket =
+				partition_bucket_with_scratch(&key_arrays, row, partition_count, &mut scratch)?;
+			Some(u32::try_from(bucket).expect("partition bucket fits u32"))
+		} else if let Some(bucket) = partition_bucket_if_non_null_with_scratch(
+			&key_arrays,
+			row,
+			partition_count,
+			&mut scratch,
+		)? {
+			Some(u32::try_from(bucket).expect("partition bucket fits u32"))
+		} else if retain_unkeyed_rows {
+			Some(0)
+		} else {
+			None
+		};
+		buckets.push(bucket);
+	}
+	Ok(buckets)
+}
+
+pub(super) fn select_join_partition_batch_with_buckets(
+	batch: &RecordBatch,
+	buckets: &[Option<u32>],
+	partition: u32,
+) -> Result<RecordBatch, ExecutionError> {
+	if buckets.len() != batch.num_rows() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"partition bucket count {} did not match batch rows {}",
+				buckets.len(),
+				batch.num_rows()
+			),
+		});
+	}
+
+	let mut indices = Vec::new();
+	for (row, row_partition) in buckets.iter().enumerate() {
+		if *row_partition == Some(partition) {
 			indices.push(Some(join_probe_row_index(row)?));
 		}
 	}
@@ -2177,8 +2275,8 @@ pub(super) fn select_join_partition_batch(
 pub(super) async fn visit_partitioned_spilled_left_outer_join_chunks<F>(
 	spilled: &mut SpilledInnerJoinBuild,
 	right_batches: &[RecordBatch],
+	right_partition_buckets: &[Vec<Option<u32>>],
 	right_keys: &[crate::ir::ColumnOrdinal],
-	partition_count: u32,
 	partition: u32,
 	key_plan: JoinKeyPlan,
 	null_safe_keys: bool,
@@ -2193,15 +2291,17 @@ where
 	let mut matched = spilled.empty_page_match_bitmap();
 	let mut probe_rows = 0u64;
 	let mut output_rows = 0u64;
-	for batch in right_batches {
-		let partitioned = select_join_partition_batch(
-			batch,
-			right_keys,
-			partition_count,
-			partition,
-			null_safe_keys,
-			false,
-		)?;
+	if right_partition_buckets.len() != right_batches.len() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"right partition bucket batch count {} did not match right batch count {}",
+				right_partition_buckets.len(),
+				right_batches.len()
+			),
+		});
+	}
+	for (batch, buckets) in right_batches.iter().zip(right_partition_buckets) {
+		let partitioned = select_join_partition_batch_with_buckets(batch, buckets, partition)?;
 		if partitioned.num_rows() == 0 {
 			continue;
 		}

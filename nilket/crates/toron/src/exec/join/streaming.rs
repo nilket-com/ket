@@ -6153,14 +6153,18 @@ impl Executor {
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
 		let mut total_build_rows = 0u64;
+		let probe_partition_buckets = precompute_join_partition_buckets(
+			probe_batch,
+			probe_keys,
+			partition_count,
+			null_safe_keys,
+			false,
+		)?;
 		for partition in 0..partition_count {
-			let partitioned_probe = select_join_partition_batch(
+			let partitioned_probe = select_join_partition_batch_with_buckets(
 				probe_batch,
-				probe_keys,
-				partition_count,
+				&probe_partition_buckets,
 				partition,
-				null_safe_keys,
-				false,
 			)?;
 			if partitioned_probe.num_rows() == 0 {
 				continue;

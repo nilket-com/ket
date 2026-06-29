@@ -1,8 +1,77 @@
 use super::*;
+use twox_hash::XxHash3_64;
 
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn partition_bucket(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	partition_count: u32,
+) -> Result<usize, ExecutionError> {
+	let mut encoded = Vec::new();
+	partition_bucket_with_scratch(key_arrays, row, partition_count, &mut encoded)
+}
+
+pub(crate) fn partition_bucket_with_scratch(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	partition_count: u32,
+	encoded: &mut Vec<u8>,
+) -> Result<usize, ExecutionError> {
+	if partition_count == 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "exchange partition_count must be greater than zero".to_string(),
+		});
+	}
+	Ok(
+		(partition_key_hash_with_scratch(key_arrays, row, encoded)? % u64::from(partition_count))
+			as usize,
+	)
+}
+
+pub(in crate::exec) fn partition_bucket_if_non_null_with_scratch(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	partition_count: u32,
+	encoded: &mut Vec<u8>,
+) -> Result<Option<usize>, ExecutionError> {
+	if partition_count == 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "exchange partition_count must be greater than zero".to_string(),
+		});
+	}
+	partition_key_hash_if_non_null_with_scratch(key_arrays, row, encoded)
+		.map(|hash| hash.map(|hash| (hash % u64::from(partition_count)) as usize))
+}
+
+fn partition_key_hash_with_scratch(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	encoded: &mut Vec<u8>,
+) -> Result<u64, ExecutionError> {
+	encoded.clear();
+	for array in key_arrays {
+		encode_partition_key_value(array.as_ref(), row, encoded)?;
+	}
+	Ok(XxHash3_64::oneshot(encoded.as_slice()))
+}
+
+fn partition_key_hash_if_non_null_with_scratch(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	encoded: &mut Vec<u8>,
+) -> Result<Option<u64>, ExecutionError> {
+	encoded.clear();
+	for array in key_arrays {
+		if array.is_null(row) {
+			return Ok(None);
+		}
+		encode_partition_key_value(array.as_ref(), row, encoded)?;
+	}
+	Ok(Some(XxHash3_64::oneshot(encoded.as_slice())))
+}
 
 #[derive(Debug, Clone, Copy)]
 struct JoinSpillPage {
@@ -1830,6 +1899,157 @@ mod tests {
 				format!("{:?}", right.column(column)),
 				"column {column} differs"
 			);
+		}
+	}
+
+	fn partition_test_batch() -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			arrow::datatypes::Field::new("k_int", DataType::Int64, true),
+			arrow::datatypes::Field::new("k_str", DataType::Utf8, true),
+			arrow::datatypes::Field::new("k_date", DataType::Date32, true),
+			arrow::datatypes::Field::new("k_decimal", DataType::Decimal128(15, 2), true),
+		]));
+		let decimal = Decimal128Array::from(vec![
+			Some(12_345_i128),
+			Some(67_890_i128),
+			None,
+			Some(-42_i128),
+			Some(777_i128),
+			Some(888_i128),
+		])
+		.with_precision_and_scale(15, 2)
+		.expect("decimal test column");
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![
+					Some(1),
+					Some(2),
+					Some(3),
+					None,
+					Some(5),
+					Some(6),
+				])) as ArrayRef,
+				Arc::new(StringArray::from(vec![
+					Some("alpha"),
+					None,
+					Some("gamma"),
+					Some("delta"),
+					Some("epsilon"),
+					Some("zeta"),
+				])) as ArrayRef,
+				Arc::new(Date32Array::from(vec![
+					Some(19_000),
+					Some(19_001),
+					Some(19_002),
+					Some(19_003),
+					None,
+					Some(19_005),
+				])) as ArrayRef,
+				Arc::new(decimal) as ArrayRef,
+			],
+		)
+		.expect("partition test batch")
+	}
+
+	#[test]
+	fn partition_bucket_with_scratch_matches_fresh_encoding() {
+		let batch = partition_test_batch();
+		let key_arrays = key_arrays(
+			&batch,
+			&[
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				ColumnOrdinal(2),
+				ColumnOrdinal(3),
+			],
+		)
+		.expect("key arrays");
+		let mut scratch = Vec::with_capacity(1);
+
+		for partition_count in [1, 3, 17, 64] {
+			for row in 0..batch.num_rows() {
+				let fresh =
+					partition_bucket(&key_arrays, row, partition_count).expect("fresh bucket");
+				let reused =
+					partition_bucket_with_scratch(&key_arrays, row, partition_count, &mut scratch)
+						.expect("scratch bucket");
+				assert_eq!(fresh, reused);
+			}
+		}
+		assert!(scratch.capacity() > 0);
+	}
+
+	#[test]
+	fn precomputed_partition_buckets_match_recompute_and_selector() {
+		let batch = partition_test_batch();
+		let keys = [
+			ColumnOrdinal(0),
+			ColumnOrdinal(1),
+			ColumnOrdinal(2),
+			ColumnOrdinal(3),
+		];
+		let key_arrays = key_arrays(&batch, &keys).expect("key arrays");
+
+		for partition_count in [1, 3, 17, 64] {
+			for (null_safe_keys, retain_unkeyed_rows) in
+				[(false, false), (false, true), (true, false)]
+			{
+				let buckets = super::super::precompute_join_partition_buckets(
+					&batch,
+					&keys,
+					partition_count,
+					null_safe_keys,
+					retain_unkeyed_rows,
+				)
+				.expect("precompute buckets");
+				assert_eq!(buckets.len(), batch.num_rows());
+
+				for (row, bucket) in buckets.iter().enumerate() {
+					let expected = if null_safe_keys {
+						Some(
+							u32::try_from(
+								partition_bucket(&key_arrays, row, partition_count)
+									.expect("null-safe bucket"),
+							)
+							.expect("bucket fits u32"),
+						)
+					} else if super::super::join_key_bytes(&key_arrays, row)
+						.expect("join key")
+						.is_some()
+					{
+						Some(
+							u32::try_from(
+								partition_bucket(&key_arrays, row, partition_count)
+									.expect("non-null bucket"),
+							)
+							.expect("bucket fits u32"),
+						)
+					} else if retain_unkeyed_rows {
+						Some(0)
+					} else {
+						None
+					};
+					assert_eq!(*bucket, expected, "row {row}");
+				}
+
+				for partition in 0..partition_count {
+					let cached = super::super::select_join_partition_batch_with_buckets(
+						&batch, &buckets, partition,
+					)
+					.expect("cached selector");
+					let recomputed = super::super::select_join_partition_batch(
+						&batch,
+						&keys,
+						partition_count,
+						partition,
+						null_safe_keys,
+						retain_unkeyed_rows,
+					)
+					.expect("recomputed selector");
+					assert_record_batch_equal(&cached, &recomputed);
+				}
+			}
 		}
 	}
 

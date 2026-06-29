@@ -57,6 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
+#[cfg(test)]
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterDescriptor,
@@ -84,7 +85,8 @@ pub(in crate::exec) use self::aggregate::{
 #[cfg(test)]
 pub(in crate::exec) use self::aggregate::{aggregate_state_keyword, aggregate_state_output_name};
 pub(crate) use self::expr::evaluate_cast;
-use self::join::execute_hash_join;
+pub(crate) use self::join::partition_bucket;
+use self::join::{execute_hash_join, partition_bucket_with_scratch};
 
 pub(crate) mod runtime_filter;
 
@@ -704,8 +706,14 @@ impl Executor {
 
 						let mut builders: Vec<Vec<u32>> =
 							(0..*partition_count).map(|_| Vec::new()).collect();
+						let mut partition_scratch = Vec::new();
 						for i in 0..num_rows {
-							let bucket = partition_bucket(&key_arrays, i, *partition_count)?;
+							let bucket = partition_bucket_with_scratch(
+								&key_arrays,
+								i,
+								*partition_count,
+								&mut partition_scratch,
+							)?;
 							builders[bucket].push(i as u32);
 						}
 
@@ -1146,8 +1154,14 @@ impl Executor {
 		let key_arrays = self.evaluate_bound_program(key, batch)?;
 
 		let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
+		let mut partition_scratch = Vec::new();
 		for row in 0..num_rows {
-			let bucket = partition_bucket(&key_arrays, row, partition_count)?;
+			let bucket = partition_bucket_with_scratch(
+				&key_arrays,
+				row,
+				partition_count,
+				&mut partition_scratch,
+			)?;
 			builders[bucket].push(row as u32);
 		}
 
@@ -2903,28 +2917,6 @@ fn window_rows_equal(rows: &Option<arrow::row::Rows>, a: usize, b: usize) -> boo
 		Some(rows) => rows.row(a) == rows.row(b),
 		None => true,
 	}
-}
-
-pub(crate) fn partition_bucket(
-	key_arrays: &[ArrayRef],
-	row: usize,
-	partition_count: u32,
-) -> Result<usize, ExecutionError> {
-	if partition_count == 0 {
-		return Err(ExecutionError::InvalidExpression {
-			message: "exchange partition_count must be greater than zero".to_string(),
-		});
-	}
-
-	Ok((partition_key_hash(key_arrays, row)? % u64::from(partition_count)) as usize)
-}
-
-fn partition_key_hash(key_arrays: &[ArrayRef], row: usize) -> Result<u64, ExecutionError> {
-	let mut encoded = Vec::new();
-	for array in key_arrays {
-		encode_partition_key_value(array.as_ref(), row, &mut encoded)?;
-	}
-	Ok(XxHash3_64::oneshot(&encoded))
 }
 
 fn encode_partition_key_value(
