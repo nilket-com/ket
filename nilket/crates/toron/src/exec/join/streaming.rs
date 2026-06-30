@@ -29,6 +29,12 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+enum ReorientedStageScanBuildDecision {
+	Stream,
+	Materialized,
+	MaterializedBatches(Vec<RecordBatch>),
+}
+
 pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 	InMemory {
 		batch: RecordBatch,
@@ -4314,11 +4320,11 @@ impl Executor {
 		}
 	}
 
-	async fn estimate_streaming_scan_output_bytes(
+	async fn materialize_streaming_scan_output_for_cap(
 		&self,
 		scan_input: StreamingScanProbeInput<'_>,
 		morsel: Option<(MorselId, u32)>,
-	) -> Result<u64, ExecutionError> {
+	) -> Result<(u64, Vec<RecordBatch>), ExecutionError> {
 		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
 			return Err(ExecutionError::InvalidExpression {
 				message: "streaming scan build expected a scan input".to_string(),
@@ -4333,6 +4339,7 @@ impl Executor {
 			.await?
 			.into_batches();
 		let mut estimated = 0u64;
+		let mut batches = Vec::new();
 		while let Some(batch) = stream.next().await {
 			let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
 				break;
@@ -4345,8 +4352,34 @@ impl Executor {
 				}
 			}
 			estimated = estimated.saturating_add(batch.get_array_memory_size() as u64);
+			batches.push(batch);
 		}
-		Ok(estimated)
+		Ok((estimated, batches))
+	}
+
+	async fn reoriented_inner_stage_scan_build_decision(
+		&self,
+		stage: &ReorientedInnerJoinStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<ReorientedStageScanBuildDecision, ExecutionError> {
+		let Some(scan_input) = decompose_streaming_scan_probe_input(stage.build) else {
+			return Ok(ReorientedStageScanBuildDecision::Materialized);
+		};
+		let task_memory_cap = self.context.task_budget.memory.get();
+		if task_memory_cap < 64 * 1024 * 1024 {
+			return Ok(ReorientedStageScanBuildDecision::Materialized);
+		}
+		let scan_output_cap = join_output_materialization_memory_cap(task_memory_cap);
+		let (estimated, batches) = self
+			.materialize_streaming_scan_output_for_cap(scan_input, morsel)
+			.await?;
+		if estimated > scan_output_cap {
+			Ok(ReorientedStageScanBuildDecision::Stream)
+		} else {
+			Ok(ReorientedStageScanBuildDecision::MaterializedBatches(
+				batches,
+			))
+		}
 	}
 
 	async fn reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
@@ -4354,18 +4387,11 @@ impl Executor {
 		stage: &ReorientedInnerJoinStage<'_>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<bool, ExecutionError> {
-		let Some(scan_input) = decompose_streaming_scan_probe_input(stage.build) else {
-			return Ok(false);
-		};
-		let task_memory_cap = self.context.task_budget.memory.get();
-		if task_memory_cap < 64 * 1024 * 1024 {
-			return Ok(false);
-		}
-		let scan_output_cap = join_output_materialization_memory_cap(task_memory_cap);
-		let estimated = self
-			.estimate_streaming_scan_output_bytes(scan_input, morsel)
-			.await?;
-		Ok(estimated > scan_output_cap)
+		Ok(matches!(
+			self.reoriented_inner_stage_scan_build_decision(stage, morsel)
+				.await?,
+			ReorientedStageScanBuildDecision::Stream
+		))
 	}
 
 	async fn write_streaming_scan_inner_build_batch(
@@ -6914,14 +6940,11 @@ impl Executor {
 		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
-		let ExecutionPlan::Exchange {
-			input: aggregate_input,
-			..
-		} = input
-		else {
-			return Ok(None);
+		let (aggregate_input, aggregate_input_wrapped) = match input {
+			ExecutionPlan::Exchange { input, .. } => (input.as_ref(), true),
+			other => (other, false),
 		};
-		let (project_input, project_exprs, project_output_schema) = match aggregate_input.as_ref() {
+		let (project_input, project_exprs, project_output_schema) = match aggregate_input {
 			ExecutionPlan::Project {
 				input,
 				exprs,
@@ -6961,22 +6984,43 @@ impl Executor {
 			);
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
-			let stream_scan_build = if force_stream_projected_filtered_base
+			let scan_build_decision = if force_stream_projected_filtered_base
 				&& matches!(
 					base_scan_probe_mode,
 					Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
 				) {
-				true
+				ReorientedStageScanBuildDecision::Stream
+			} else if aggregate_input_wrapped {
+				if self
+					.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+					.await?
+				{
+					ReorientedStageScanBuildDecision::Stream
+				} else {
+					ReorientedStageScanBuildDecision::Materialized
+				}
 			} else {
-				self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+				self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
 					.await?
 			};
-			let runtime = if stream_scan_build {
-				self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
+			let runtime = match scan_build_decision {
+				ReorientedStageScanBuildDecision::Stream => {
+					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+						stage, morsel,
+					)
 					.await?
-			} else {
-				self.prepare_reoriented_inner_join_runtime(stage, morsel)
+				}
+				ReorientedStageScanBuildDecision::Materialized => {
+					self.prepare_reoriented_inner_join_runtime(stage, morsel)
+						.await?
+				}
+				ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
+					self.prepare_reoriented_inner_join_runtime_from_build_batches(
+						stage,
+						build_batches,
+					)
 					.await?
+				}
 			};
 			let Some(runtime) = runtime else {
 				return Ok(None);
@@ -8161,6 +8205,15 @@ impl Executor {
 		}
 
 		let build_batches = self.execute_bound(stage.build, morsel).await?;
+		self.prepare_reoriented_inner_join_runtime_from_build_batches(stage, build_batches)
+			.await
+	}
+
+	async fn prepare_reoriented_inner_join_runtime_from_build_batches<'a>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		build_batches: Vec<RecordBatch>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
 		let build_memory_cap =
@@ -9813,7 +9866,7 @@ mod tests {
 		)
 		.expect("dim1 batch");
 
-		let build_plan = |budget| {
+		let build_plan = |budget, wrap_aggregate_input: bool| {
 			let storage = Arc::new(RecordingMultiBatchTableStorageScan {
 				batches: HashMap::from([
 					(TableId(1), vec![dim0_batch.clone()]),
@@ -9886,8 +9939,13 @@ mod tests {
 				Field::new("d1_label", DataType::Utf8, false),
 				Field::new("sum_amount", DataType::Int64, true),
 			]));
+			let aggregate_input = if wrap_aggregate_input {
+				exchange_plan(join1, group_expr.clone(), 4)
+			} else {
+				join1
+			};
 			let plan = ExecutionPlan::Aggregate {
-				input: Box::new(exchange_plan(join1, group_expr.clone(), 4)),
+				input: Box::new(aggregate_input),
 				group_expr,
 				aggr_expr,
 				output_schema,
@@ -9900,24 +9958,31 @@ mod tests {
 			spill_bytes: ByteCount::new(256 * 1024 * 1024),
 			..TaskBudget::from_query_budget(QueryBudget::test_default())
 		};
-		let (streaming_executor, streaming_plan) = build_plan(low_budget);
-		let streamed = streaming_executor
-			.execute_bound(&streaming_plan, None)
-			.await
-			.expect("generic base should consume streamed stage runtime");
+		for (wrap_aggregate_input, shape) in [
+			(true, "exchange-wrapped aggregate input"),
+			(false, "bare aggregate input"),
+		] {
+			let (streaming_executor, streaming_plan) = build_plan(low_budget, wrap_aggregate_input);
+			let streamed = streaming_executor
+				.execute_bound(&streaming_plan, None)
+				.await
+				.expect("generic base should consume streamed stage runtime");
 
-		let (materialized_executor, materialized_plan) = build_plan(high_test_budget());
-		let materialized = materialized_executor
-			.execute_bound(&materialized_plan, None)
-			.await
-			.expect("materialized baseline");
+			let (materialized_executor, materialized_plan) =
+				build_plan(high_test_budget(), wrap_aggregate_input);
+			let materialized = materialized_executor
+				.execute_bound(&materialized_plan, None)
+				.await
+				.expect("materialized baseline");
 
-		assert_eq!(
-			canonical_arrow_ipc_digest(&streamed, SortPolicy::FullRowLex).expect("streamed digest"),
-			canonical_arrow_ipc_digest(&materialized, SortPolicy::FullRowLex)
-				.expect("materialized digest"),
-			"generic base traversal must feed non-in-memory stage runtimes through the streaming probe"
-		);
+			assert_eq!(
+				canonical_arrow_ipc_digest(&streamed, SortPolicy::FullRowLex)
+					.expect("streamed digest"),
+				canonical_arrow_ipc_digest(&materialized, SortPolicy::FullRowLex)
+					.expect("materialized digest"),
+				"generic base traversal must feed non-in-memory stage runtimes through the streaming probe for {shape}"
+			);
+		}
 	}
 
 	#[test]
