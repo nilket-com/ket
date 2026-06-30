@@ -6961,21 +6961,15 @@ impl Executor {
 			);
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
-			let stream_scan_build = match base_scan_probe_mode {
-				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
-					if force_stream_projected_filtered_base =>
-				{
-					true
-				}
-				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0) => {
-					self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
-						.await?
-				}
-				Some(ReorientedInnerChainGroupedBaseScanProbeMode::BareJoin0) => {
-					self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
-						.await?
-				}
-				None => false,
+			let stream_scan_build = if force_stream_projected_filtered_base
+				&& matches!(
+					base_scan_probe_mode,
+					Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+				) {
+				true
+			} else {
+				self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+					.await?
 			};
 			let runtime = if stream_scan_build {
 				self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
@@ -7007,57 +7001,19 @@ impl Executor {
 			)
 			.await?;
 		if matched.is_none() {
-			if runtimes
-				.iter()
-				.any(|runtime| !matches!(runtime.build, ReorientedInnerJoinBuild::InMemory { .. }))
-			{
-				for runtime in runtimes {
-					runtime.cleanup().await;
-				}
-				return Ok(None);
-			}
 			matched = self
-				.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
-					let mut batches = vec![base_batch];
-					for runtime in runtimes.iter_mut() {
-						let mut next = Vec::new();
-						for batch in batches {
-							next.extend(self.probe_reoriented_inner_join(runtime, &batch)?);
-						}
-						batches = next;
-						if batches.is_empty() {
-							break;
-						}
-						if let Some(predicate) = runtime.post_filter {
-							let mut filtered = Vec::new();
-							for batch in batches {
-								let batch = self.filter_batch_with_bound_predicate(
-									predicate,
-									batch,
-									"filter predicate",
-								)?;
-								if batch.num_rows() > 0 {
-									filtered.push(batch);
-								}
-							}
-							batches = filtered;
-						}
-					}
-
-					for batch in batches {
-						self.fold_reoriented_grouped_output_batch(
-							&mut groups,
-							&mut group_types,
-							outer_predicate,
-							project_exprs,
-							project_output_schema,
-							group_expr,
-							aggr_expr,
-							batch,
-						)?;
-					}
-					Ok(())
-				})
+				.try_streaming_reoriented_inner_chain_generic_base_grouped(
+					base,
+					&mut runtimes,
+					outer_predicate,
+					project_exprs,
+					project_output_schema,
+					group_expr,
+					aggr_expr,
+					&mut groups,
+					&mut group_types,
+					morsel,
+				)
 				.await?;
 		}
 		if matched.is_none() {
@@ -7310,6 +7266,119 @@ impl Executor {
 			},
 		);
 		Ok(Some(()))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_reoriented_inner_chain_generic_base_grouped(
+		&self,
+		base: &ExecutionPlan,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<()>, ExecutionError> {
+		let mut base_batches = Vec::new();
+		let mut accumulated_bytes = 0u64;
+		let accumulator_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let matched = self
+			.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
+				accumulated_bytes =
+					accumulated_bytes.saturating_add(record_batch_memory_bytes(&base_batch));
+				if accumulated_bytes > accumulator_cap {
+					return Err(budget_exhausted(
+						BudgetDimension::Memory,
+						"reoriented inner chain base accumulator",
+						accumulated_bytes,
+						accumulator_cap,
+					));
+				}
+				if base_batch.num_rows() > 0 {
+					base_batches.push(base_batch);
+				}
+				Ok(())
+			})
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+		for base_batch in base_batches {
+			self.process_reoriented_inner_chain_grouped_base_batch(
+				base_batch,
+				inner_runtimes,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+			)
+			.await?;
+		}
+		Ok(Some(()))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn process_reoriented_inner_chain_grouped_base_batch(
+		&self,
+		base_batch: RecordBatch,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+	) -> Result<(), ExecutionError> {
+		let mut batches = vec![base_batch];
+		for runtime in inner_runtimes.iter_mut() {
+			let mut next = Vec::new();
+			for batch in batches {
+				next.extend(
+					self.probe_reoriented_inner_join_streaming(runtime, &batch)
+						.await?,
+				);
+			}
+			batches = next;
+			if batches.is_empty() {
+				break;
+			}
+			if let Some(predicate) = runtime.post_filter {
+				let mut filtered = Vec::new();
+				for batch in batches {
+					let batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() > 0 {
+						filtered.push(batch);
+					}
+				}
+				batches = filtered;
+			}
+		}
+
+		for batch in batches {
+			self.fold_reoriented_grouped_output_batch(
+				groups,
+				group_types,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				batch,
+			)?;
+		}
+		Ok(())
 	}
 
 	fn fold_reoriented_grouped_output_batch(
@@ -8548,32 +8617,6 @@ impl Executor {
 		Ok(output)
 	}
 
-	pub(in crate::exec) fn probe_reoriented_inner_join(
-		&self,
-		runtime: &mut ReorientedInnerJoinRuntime<'_>,
-		probe_batch: &RecordBatch,
-	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let (output, probe_rows, output_rows) = {
-			let ReorientedInnerJoinBuild::InMemory { batch, rows } = &runtime.build else {
-				return Err(ExecutionError::InvalidExpression {
-					message: "synchronous reoriented inner probe requires an in-memory build"
-						.to_string(),
-				});
-			};
-			self.probe_reoriented_inner_join_in_memory(
-				runtime.key_plan,
-				&runtime.probe_keys,
-				&runtime.output_schema,
-				runtime.probe_columns_first,
-				batch,
-				rows,
-				probe_batch,
-			)?
-		};
-		self.record_reoriented_inner_probe(runtime, probe_rows, output_rows);
-		Ok(output)
-	}
-
 	pub(in crate::exec) async fn probe_reoriented_inner_join_streaming(
 		&self,
 		runtime: &mut ReorientedInnerJoinRuntime<'_>,
@@ -9709,6 +9752,174 @@ mod tests {
 		));
 	}
 
+	#[tokio::test]
+	async fn reoriented_inner_chain_generic_base_consumes_streamed_stage_runtime() {
+		let dim0_schema = Arc::new(Schema::new(vec![
+			Field::new("d0_key", DataType::Int64, false),
+			Field::new("d0_label", DataType::Utf8, false),
+		]));
+		let dim1_schema = Arc::new(Schema::new(vec![
+			Field::new("d1_key", DataType::Int64, false),
+			Field::new("d1_label", DataType::Utf8, false),
+		]));
+		let fact_schema = Arc::new(Schema::new(vec![
+			Field::new("d0_key", DataType::Int64, false),
+			Field::new("d1_key", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, false),
+		]));
+		let dim0_batch = RecordBatch::try_new(
+			dim0_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![0, 1])),
+				Arc::new(StringArray::from(vec!["A", "B"])),
+			],
+		)
+		.expect("dim0 batch");
+		let fact_batch = RecordBatch::try_new(
+			fact_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..32)
+						.map(|row| if row % 2 == 0 { 0 } else { 1 })
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					(0..32)
+						.map(|row| i64::try_from(row % 4).expect("d1 key fits"))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					(0..32)
+						.map(|row| i64::try_from(row + 1).expect("amount fits"))
+						.collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("fact batch");
+		let dim1_rows = 512usize;
+		let dim1_labels = (0..dim1_rows)
+			.map(|row| format!("label-{row}-{}", "x".repeat(192)))
+			.collect::<Vec<_>>();
+		let dim1_batch = RecordBatch::try_new(
+			dim1_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..dim1_rows)
+						.map(|row| i64::try_from(row).expect("d1 key fits"))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(StringArray::from(dim1_labels)),
+			],
+		)
+		.expect("dim1 batch");
+
+		let build_plan = |budget| {
+			let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([
+					(TableId(1), vec![dim0_batch.clone()]),
+					(TableId(2), vec![fact_batch.clone()]),
+					(TableId(3), vec![dim1_batch.clone()]),
+				]),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			});
+			let executor = Executor::with_context(
+				storage,
+				ExecutionContext::local_test().with_task_budget(budget),
+			);
+			let dim0 = exchange_plan(
+				test_scan_plan_with_first_field_key(TableId(1), dim0_schema.clone(), 1),
+				bound_column_root("d0_key", ColumnOrdinal(0), DataType::Int64, false),
+				4,
+			);
+			let fact = exchange_plan(
+				test_scan_plan_with_first_field_key(TableId(2), fact_schema.clone(), 2),
+				bound_column_root("d0_key", ColumnOrdinal(0), DataType::Int64, false),
+				4,
+			);
+			let join0_schema = concat_test_schema(&dim0_schema, &fact_schema);
+			let join0 = inner_join_plan(
+				dim0,
+				fact,
+				vec![ColumnOrdinal(0)],
+				vec![ColumnOrdinal(0)],
+				join0_schema.clone(),
+			);
+			let base = exchange_plan(
+				ExecutionPlan::Filter {
+					input: Box::new(join0),
+					predicate: less_than_filter_program(ColumnOrdinal(0), 10),
+					disposition: FilterDisposition::FullyPushed,
+				},
+				bound_column_root("d1_key", ColumnOrdinal(3), DataType::Int64, false),
+				4,
+			);
+			assert!(
+				reoriented_inner_chain_grouped_base_scan_probe_mode(&base).is_none(),
+				"fixture must force the generic base traversal, not the specialized base path"
+			);
+
+			let dim1 = exchange_plan(
+				test_scan_plan_with_first_field_key(TableId(3), dim1_schema.clone(), 3),
+				bound_column_root("d1_key", ColumnOrdinal(0), DataType::Int64, false),
+				4,
+			);
+			let join1_schema = concat_test_schema(&dim1_schema, &join0_schema);
+			let join1 = ExecutionPlan::Join {
+				replay_id: JoinReplayId(1),
+				replay_eligibility: BroadcastReplayEligibility::Terminal,
+				left: Box::new(dim1),
+				right: Box::new(base),
+				kind: JoinKind::Inner,
+				left_keys: vec![ColumnOrdinal(0)],
+				right_keys: vec![ColumnOrdinal(3)],
+				match_filter: None,
+				null_safe_keys: false,
+				strategy: JoinStrategy::HashPartitioned,
+				output_schema: join1_schema,
+			};
+			let group_expr = bound_column_root("d1_label", ColumnOrdinal(1), DataType::Utf8, false);
+			let aggr_expr = vec![BoundAggregateCall {
+				function: AggregateFunction::Sum,
+				args: bound_column_root("amount", ColumnOrdinal(6), DataType::Int64, false),
+			}];
+			let output_schema = Arc::new(Schema::new(vec![
+				Field::new("d1_label", DataType::Utf8, false),
+				Field::new("sum_amount", DataType::Int64, true),
+			]));
+			let plan = ExecutionPlan::Aggregate {
+				input: Box::new(exchange_plan(join1, group_expr.clone(), 4)),
+				group_expr,
+				aggr_expr,
+				output_schema,
+			};
+			(executor, plan)
+		};
+
+		let low_budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (streaming_executor, streaming_plan) = build_plan(low_budget);
+		let streamed = streaming_executor
+			.execute_bound(&streaming_plan, None)
+			.await
+			.expect("generic base should consume streamed stage runtime");
+
+		let (materialized_executor, materialized_plan) = build_plan(high_test_budget());
+		let materialized = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized baseline");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&streamed, SortPolicy::FullRowLex).expect("streamed digest"),
+			canonical_arrow_ipc_digest(&materialized, SortPolicy::FullRowLex)
+				.expect("materialized digest"),
+			"generic base traversal must feed non-in-memory stage runtimes through the streaming probe"
+		);
+	}
+
 	#[test]
 	fn reoriented_grouped_required_columns_cover_identity_and_projected_inputs() {
 		let group_expr = bound_column_root("group_key", ColumnOrdinal(2), DataType::Int64, false);
@@ -10531,7 +10742,8 @@ mod tests {
 				.await
 				.expect("streamed probe");
 			let materialized = executor
-				.probe_reoriented_inner_join(&mut materialized_runtime, &probe)
+				.probe_reoriented_inner_join_streaming(&mut materialized_runtime, &probe)
+				.await
 				.expect("materialized probe");
 			assert_record_batches_equal(&streamed, &materialized);
 			assert_eq!(
@@ -10660,7 +10872,8 @@ mod tests {
 				.await
 				.expect("projected streamed probe");
 			let materialized = executor
-				.probe_reoriented_inner_join(&mut materialized_runtime, &probe)
+				.probe_reoriented_inner_join_streaming(&mut materialized_runtime, &probe)
+				.await
 				.expect("materialized probe");
 			let projected_batch =
 				concat_or_empty(output_schema.clone(), &projected).expect("projected concat");
