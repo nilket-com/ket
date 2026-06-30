@@ -18,12 +18,12 @@ use toron_tpch::{
 	prepare_persisted_tpch_dataset, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
 	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
 	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
-	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source, run_strict_q1,
-	run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07,
-	run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13,
-	run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19,
-	run_strict_q20, run_strict_q21, run_strict_q22, schema_fingerprint_from_duckdb_fields,
-	stable_fingerprint, status_rows,
+	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source,
+	run_rune_perf_query_with_data_source, run_strict_q1, run_strict_q02, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
+	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
+	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
+	run_strict_q22, schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -106,17 +106,40 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Err(message) => return harness_error(&message),
 	};
 	let warmup = args.iter().any(|arg| arg == "--warmup-run");
-	let attempt = match run_perf_query_with_data_source(
-		query,
-		mode,
-		sf,
-		run_index,
-		warmup,
-		data_source,
-		&data_dir,
-	)
-	.await
-	{
+	let engine = match parse_perf_engine(flag_value(args, "--engine").unwrap_or("toron")) {
+		Ok(engine) => engine,
+		Err(message) => return harness_error(&message),
+	};
+	let attempt_result = match engine {
+		PerfEngine::Toron => {
+			run_perf_query_with_data_source(
+				query,
+				mode,
+				sf,
+				run_index,
+				warmup,
+				data_source,
+				&data_dir,
+			)
+			.await
+		}
+		PerfEngine::Rune => {
+			run_rune_perf_query_with_data_source(
+				query,
+				mode,
+				sf,
+				run_index,
+				warmup,
+				data_source,
+				&data_dir,
+			)
+			.await
+		}
+		PerfEngine::DuckDb => {
+			Err("perf-run-one does not run duckdb; use perf --engines duckdb".to_string())
+		}
+	};
+	let attempt = match attempt_result {
 		Ok(attempt) => attempt,
 		Err(message) => return harness_error(&message),
 	};
@@ -127,7 +150,27 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PerfEngine {
 	Toron,
+	Rune,
 	DuckDb,
+}
+
+impl PerfEngine {
+	fn as_str(self) -> &'static str {
+		match self {
+			PerfEngine::Toron => "toron",
+			PerfEngine::Rune => "rune",
+			PerfEngine::DuckDb => "duckdb",
+		}
+	}
+}
+
+fn parse_perf_engine(raw: &str) -> Result<PerfEngine, String> {
+	match raw.trim() {
+		"toron" => Ok(PerfEngine::Toron),
+		"rune" => Ok(PerfEngine::Rune),
+		"duckdb" => Ok(PerfEngine::DuckDb),
+		other => Err(format!("unsupported perf engine {other:?}")),
+	}
 }
 
 fn parse_perf_engines(raw: &str) -> Result<Vec<PerfEngine>, String> {
@@ -136,6 +179,7 @@ fn parse_perf_engines(raw: &str) -> Result<Vec<PerfEngine>, String> {
 		let engine = match item.trim() {
 			"" => continue,
 			"toron" => PerfEngine::Toron,
+			"rune" => PerfEngine::Rune,
 			"duckdb" => PerfEngine::DuckDb,
 			"all" => {
 				push_perf_engine(&mut engines, PerfEngine::Toron);
@@ -205,6 +249,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 				PerfEngine::Toron => {
 					for warmup_index in 0..warmup {
 						match run_perf_child(
+							PerfEngine::Toron,
 							query_id,
 							mode,
 							sf,
@@ -219,6 +264,39 @@ async fn perf_command(args: &[String]) -> ExitCode {
 					}
 					for run_index in 0..runs {
 						match run_perf_child(
+							PerfEngine::Toron,
+							query_id,
+							mode,
+							sf,
+							run_index as u32,
+							false,
+							data_source,
+							&data_dir,
+						) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
+					}
+				}
+				PerfEngine::Rune => {
+					for warmup_index in 0..warmup {
+						match run_perf_child(
+							PerfEngine::Rune,
+							query_id,
+							mode,
+							sf,
+							warmup_index as u32,
+							true,
+							data_source,
+							&data_dir,
+						) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
+					}
+					for run_index in 0..runs {
+						match run_perf_child(
+							PerfEngine::Rune,
 							query_id,
 							mode,
 							sf,
@@ -582,6 +660,7 @@ fn perf_query_list(query: &str) -> Result<Vec<&'static str>, String> {
 }
 
 fn run_perf_child(
+	engine: PerfEngine,
 	query: &str,
 	mode: &str,
 	sf: f64,
@@ -592,6 +671,8 @@ fn run_perf_child(
 ) -> Result<serde_json::Value, String> {
 	let mut args = vec![
 		"perf-run-one".to_string(),
+		"--engine".to_string(),
+		engine.as_str().to_string(),
 		"--query".to_string(),
 		query.to_string(),
 		"--mode".to_string(),
@@ -1687,7 +1768,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|duckdb|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -1712,6 +1793,19 @@ mod tests {
 		assert_eq!(perf_query_list("q6").unwrap(), vec!["q06"]);
 		assert_eq!(perf_query_list("q21").unwrap(), vec!["q21"]);
 		assert!(perf_query_list("q23").is_err());
+	}
+
+	#[test]
+	fn perf_engines_accept_rune_without_changing_all() {
+		assert_eq!(
+			parse_perf_engines("toron,rune,duckdb").unwrap(),
+			vec![PerfEngine::Toron, PerfEngine::Rune, PerfEngine::DuckDb]
+		);
+		assert_eq!(
+			parse_perf_engines("all").unwrap(),
+			vec![PerfEngine::Toron, PerfEngine::DuckDb],
+			"all stays all-query safe; rune is a q03-only explicit probe"
+		);
 	}
 
 	#[test]

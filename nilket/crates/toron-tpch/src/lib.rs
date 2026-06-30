@@ -38,7 +38,8 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::{RowCount, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ExecutionPlan, JoinKind, TableId, decimal_division_output_type};
+use toron::ir::{ExecutionPlan, JoinKind, LogicalPlan, TableId, decimal_division_output_type};
+use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -460,6 +461,46 @@ pub const Q3_DEV_SQL: &str = "SELECT l_orderkey, \
 
 /// strict q03 — identical shape; the `lineitem` fixture carries official `Decimal128(15,2)` types.
 pub const STRICT_Q3_SQL: &str = Q3_DEV_SQL;
+
+/// ADR 391 — hand-authored Rune q03 shape. Rune still binds through the normal binder; this script only
+/// bypasses SQL parsing/lowering and pins the logical join shape we want to compare against SQL q03.
+pub const RUNE_Q3_SCRIPT: &str = r#"
+pub fn main(ctx) {
+    let customer = ctx.table("customer").alias("c")
+        .filter(qcol("c", "c_mktsegment").eq(lit_str("BUILDING")));
+    let orders = ctx.table("orders").alias("o")
+        .filter(qcol("o", "o_orderdate").lt(lit_date("1995-03-15")));
+    let lineitem = ctx.table("lineitem").alias("l")
+        .filter(qcol("l", "l_shipdate").gt(lit_date("1995-03-15")));
+
+    customer
+        .auto_join(
+            orders,
+            qcol("c", "c_custkey").eq(qcol("o", "o_custkey")),
+        )
+        .auto_join(
+            lineitem,
+            qcol("o", "o_orderkey").eq(qcol("l", "l_orderkey")),
+        )
+        .aggregate(
+            [
+                qcol("l", "l_orderkey"),
+                qcol("o", "o_orderdate"),
+                qcol("o", "o_shippriority"),
+            ],
+            [
+                sum(qcol("l", "l_extendedprice").mul(lit(1).sub(qcol("l", "l_discount")))),
+            ],
+        )
+        .project_named([
+            col("l_orderkey").named("l_orderkey"),
+            col("sum").named("revenue"),
+            col("o_orderdate").named("o_orderdate"),
+            col("o_shippriority").named("o_shippriority"),
+        ])
+        .sort([col("revenue").desc(), col("o_orderdate").asc()])
+}
+"#;
 
 /// ADR 274 — tpch.q10 (Returned Item Reporting): the first 4-table query, tpchgen-2.0.2's exact Q10 text with
 /// `:1` → `DATE '1993-10-01'`, the interval upper bound literalized to `DATE '1994-01-01'`, and `ORDER BY
@@ -2876,6 +2917,13 @@ async fn execute_query_with_tables_timed(
 	sql: &str,
 	tables: Vec<HarnessTable>,
 ) -> Result<QueryExecution, StageError> {
+	let (metadata, storage) = metadata_storage_from_tables(tables);
+	execute_query_with_metadata_timed(sql, metadata, storage).await
+}
+
+fn metadata_storage_from_tables(
+	tables: Vec<HarnessTable>,
+) -> (Vec<HarnessTableMetadata>, Arc<dyn StorageScan>) {
 	let mut batches = HashMap::new();
 	let mut metadata = Vec::new();
 	for table in tables {
@@ -2888,7 +2936,30 @@ async fn execute_query_with_tables_timed(
 		batches.insert(table.id, table.batch);
 	}
 	let storage: Arc<dyn StorageScan> = Arc::new(HarnessScan { batches });
-	execute_query_with_metadata_timed(sql, metadata, storage).await
+	(metadata, storage)
+}
+
+fn load_catalog_from_metadata(
+	tables: Vec<HarnessTableMetadata>,
+	timings: &mut PerfPhaseTimings,
+	total_start: Instant,
+) -> Result<MockCatalog, StageError> {
+	let load_start = Instant::now();
+	let mut catalog = MockCatalog::new();
+	for table in tables {
+		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
+			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Load, error).with_perf(*timings, None, 0));
+		}
+		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
+			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Load, error).with_perf(*timings, None, 0));
+		}
+	}
+	timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+	Ok(catalog)
 }
 
 async fn execute_query_with_metadata_timed(
@@ -2898,32 +2969,7 @@ async fn execute_query_with_metadata_timed(
 ) -> Result<QueryExecution, StageError> {
 	let total_start = Instant::now();
 	let mut timings = PerfPhaseTimings::default();
-	let mut plan_fingerprint = None;
-	let mut spill_bytes = 0;
-
-	let load_start = Instant::now();
-	let mut catalog = MockCatalog::new();
-	for table in tables {
-		if let Err(error) = catalog.register_descriptor(table.id, table.descriptor) {
-			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-			return Err(StageError::from_debug(Phase::Load, error).with_perf(
-				timings,
-				plan_fingerprint,
-				spill_bytes,
-			));
-		}
-		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
-			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-			return Err(StageError::from_debug(Phase::Load, error).with_perf(
-				timings,
-				plan_fingerprint,
-				spill_bytes,
-			));
-		}
-	}
-	timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+	let catalog = load_catalog_from_metadata(tables, &mut timings, total_start)?;
 
 	let plan_start = Instant::now();
 	let logical = match SqlPlanner::new().plan(sql) {
@@ -2931,15 +2977,55 @@ async fn execute_query_with_metadata_timed(
 		Err(error) => {
 			timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-			return Err(StageError::from_display(Phase::Plan, error).with_perf(
-				timings,
-				plan_fingerprint,
-				spill_bytes,
-			));
+			return Err(StageError::from_display(Phase::Plan, error).with_perf(timings, None, 0));
 		}
 	};
 	timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
+	execute_logical_with_catalog_timed(total_start, timings, catalog, logical, storage).await
+}
+
+async fn execute_rune_q03_with_metadata_timed(
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+) -> Result<QueryExecution, StageError> {
+	let total_start = Instant::now();
+	let mut timings = PerfPhaseTimings::default();
+	let catalog = load_catalog_from_metadata(tables, &mut timings, total_start)?;
+
+	let plan_start = Instant::now();
+	let logical = match rune_q03_logical_plan().await {
+		Ok(logical) => logical,
+		Err(error) => {
+			timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(error.with_perf(timings, None, 0));
+		}
+	};
+	timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
+	execute_logical_with_catalog_timed(total_start, timings, catalog, logical, storage).await
+}
+
+async fn rune_q03_logical_plan() -> Result<LogicalPlan, StageError> {
+	let config = RuneSandboxConfig::v1_default();
+	let engine = RuneEngine::with_config(config)
+		.map_err(|error| StageError::from_debug(Phase::Plan, error))?;
+	engine
+		.execute_script(RUNE_Q3_SCRIPT, &config)
+		.await
+		.map_err(|error| StageError::from_debug(Phase::Plan, error))
+}
+
+async fn execute_logical_with_catalog_timed(
+	total_start: Instant,
+	mut timings: PerfPhaseTimings,
+	catalog: MockCatalog,
+	logical: LogicalPlan,
+	storage: Arc<dyn StorageScan>,
+) -> Result<QueryExecution, StageError> {
+	let mut plan_fingerprint = None;
+	let mut spill_bytes = 0;
 	let bind_start = Instant::now();
 	let bound = match bind(&logical, &catalog, &PlannerConfig::default()).await {
 		Ok(bound) => bound,
@@ -3066,6 +3152,212 @@ fn physical_plan_fingerprint(plan: &ExecutionPlan) -> String {
 		hash = hash.wrapping_mul(FNV_PRIME);
 	}
 	format!("{hash:016x}")
+}
+
+#[derive(Debug, Clone)]
+pub struct RuneQ3IsolationProof {
+	pub sql_plan_fingerprint: String,
+	pub rune_plan_fingerprint: String,
+	pub sql_plan_shape: String,
+	pub rune_plan_shape: String,
+}
+
+impl RuneQ3IsolationProof {
+	pub fn plans_differ(&self) -> bool {
+		self.sql_plan_fingerprint != self.rune_plan_fingerprint
+			|| self.sql_plan_shape != self.rune_plan_shape
+	}
+}
+
+pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3IsolationProof, String> {
+	let spec = build_perf_query_spec("q03", "strict", scale_factor)?;
+	let (metadata, _) = metadata_storage_from_tables(spec.tables);
+	let mut timings = PerfPhaseTimings::default();
+	let catalog =
+		load_catalog_from_metadata(metadata, &mut timings, Instant::now()).map_err(|error| {
+			format!(
+				"load q03 catalog for rune isolation proof failed: {}",
+				error.message
+			)
+		})?;
+	let sql_logical = SqlPlanner::new()
+		.plan(spec.sql)
+		.map_err(|error| format!("plan SQL q03 for rune isolation proof failed: {error}"))?;
+	let rune_logical = rune_q03_logical_plan().await.map_err(|error| {
+		format!(
+			"plan Rune q03 for rune isolation proof failed: {}",
+			error.message
+		)
+	})?;
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind SQL q03 for rune isolation proof failed: {error:?}"))?;
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind Rune q03 for rune isolation proof failed: {error:?}"))?;
+	Ok(RuneQ3IsolationProof {
+		sql_plan_fingerprint: physical_plan_fingerprint(&sql_bound),
+		rune_plan_fingerprint: physical_plan_fingerprint(&rune_bound),
+		sql_plan_shape: format!("{sql_bound:#?}"),
+		rune_plan_shape: format!("{rune_bound:#?}"),
+	})
+}
+
+async fn run_rune_q03_perf_query_with_metadata(
+	query_id: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+) -> PerfAttempt {
+	let mut execution = match execute_rune_q03_with_metadata_timed(tables, storage).await {
+		Ok(execution) => execution,
+		Err(StageError {
+			phase,
+			reason,
+			message,
+			timings,
+			plan_fingerprint,
+			spill_bytes,
+		}) => {
+			return PerfAttempt {
+				engine: "rune".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase,
+				status: status_for_reason(&reason),
+				reason: Some(reason),
+				diagnostic_message: Some(message),
+				timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes,
+				plan_fingerprint,
+				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+
+	let digest_start = Instant::now();
+	let digest = match canonical_arrow_ipc_digest(&execution.batches, SortPolicy::FullRowLex) {
+		Ok(digest) => format!("{digest:?}"),
+		Err(error) => {
+			let message = format!("{error:?}");
+			let reason = reason_for_error(&message);
+			execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+			execution.timings.total_ms += execution.timings.digest_ms;
+			return PerfAttempt {
+				engine: "rune".to_string(),
+				query: query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				run_index,
+				warmup,
+				phase: Phase::Execute,
+				status: status_for_reason(reason),
+				reason: Some(reason.to_string()),
+				diagnostic_message: Some(message),
+				timings: execution.timings,
+				parent_wall_ms: None,
+				peak_rss_kib: None,
+				spill_bytes: execution.spill_bytes,
+				plan_fingerprint: Some(execution.plan_fingerprint),
+				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: None,
+				duckdb_version: None,
+				debug_build: cfg!(debug_assertions),
+			};
+		}
+	};
+	execution.timings.digest_ms = digest_start.elapsed().as_secs_f64() * 1000.0;
+	execution.timings.total_ms += execution.timings.digest_ms;
+	let output_row_count = output_row_count(&execution.batches);
+	let output_schema_fingerprint = output_schema_fingerprint(&execution.batches);
+
+	if mode != "strict" {
+		return PerfAttempt {
+			engine: "rune".to_string(),
+			query: query_id.to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			run_index,
+			warmup,
+			phase: Phase::Compare,
+			status: Status::Fail,
+			reason: Some("rune_q03_requires_strict_mode".to_string()),
+			diagnostic_message: Some(
+				"Rune q03 perf rows are oracle-checked only in strict mode".to_string(),
+			),
+			timings: execution.timings,
+			parent_wall_ms: None,
+			peak_rss_kib: None,
+			spill_bytes: execution.spill_bytes,
+			plan_fingerprint: Some(execution.plan_fingerprint),
+			digest: Some(digest),
+			output_row_count: Some(output_row_count),
+			output_schema_fingerprint,
+			duckdb_version: None,
+			debug_build: cfg!(debug_assertions),
+		};
+	}
+
+	if let Err(reason) = compare_strict_query_batches(query_id, scale_factor, &execution.batches) {
+		return PerfAttempt {
+			engine: "rune".to_string(),
+			query: query_id.to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			run_index,
+			warmup,
+			phase: Phase::Compare,
+			status: Status::Fail,
+			reason: Some("rune_q03_oracle_mismatch".to_string()),
+			diagnostic_message: Some(reason),
+			timings: execution.timings,
+			parent_wall_ms: None,
+			peak_rss_kib: None,
+			spill_bytes: execution.spill_bytes,
+			plan_fingerprint: Some(execution.plan_fingerprint),
+			digest: Some(digest),
+			output_row_count: Some(output_row_count),
+			output_schema_fingerprint,
+			duckdb_version: None,
+			debug_build: cfg!(debug_assertions),
+		};
+	}
+
+	PerfAttempt {
+		engine: "rune".to_string(),
+		query: query_id.to_string(),
+		scale_factor,
+		mode: mode.to_string(),
+		run_index,
+		warmup,
+		phase: Phase::Compare,
+		status: Status::Pass,
+		reason: None,
+		diagnostic_message: None,
+		timings: execution.timings,
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: execution.spill_bytes,
+		plan_fingerprint: Some(execution.plan_fingerprint),
+		digest: Some(digest),
+		output_row_count: Some(output_row_count),
+		output_schema_fingerprint,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
 }
 
 async fn run_perf_query_with_tables(
@@ -3322,6 +3614,52 @@ pub async fn run_perf_query_with_data_source(
 				run_index,
 				warmup,
 				spec.sql,
+				spec.tables,
+				spec.storage,
+			)
+			.await)
+		}
+		other => Err(format!("perf --data-source {other:?} is not supported")),
+	}
+}
+
+pub async fn run_rune_perf_query_with_data_source(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	run_index: u32,
+	warmup: bool,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<PerfAttempt, String> {
+	if !matches!(query, "q03" | "q3") {
+		return Err(format!(
+			"perf --engines rune supports only --query q03; got {query}"
+		));
+	}
+	match data_source {
+		"memory" => {
+			let spec = build_perf_query_spec("q03", mode, scale_factor)?;
+			let (metadata, storage) = metadata_storage_from_tables(spec.tables);
+			Ok(run_rune_q03_perf_query_with_metadata(
+				spec.query_id,
+				mode,
+				scale_factor,
+				run_index,
+				warmup,
+				metadata,
+				storage,
+			)
+			.await)
+		}
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
+			Ok(run_rune_q03_perf_query_with_metadata(
+				spec.query_id,
+				mode,
+				scale_factor,
+				run_index,
+				warmup,
 				spec.tables,
 				spec.storage,
 			)
@@ -11486,6 +11824,70 @@ mod adr356_perf_rail {
 		assert!(lineitem.file_hash.starts_with("fnv1a64:"));
 		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
 		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+#[cfg(test)]
+mod adr391_rune_perf_decomposition {
+	use super::*;
+
+	#[test]
+	fn rune_q03_isolation_proof_differs_from_sql_shape() {
+		run_on_large_stack(|| async {
+			let proof = rune_q03_isolation_proof(0.01)
+				.await
+				.expect("isolation proof");
+			assert!(
+				proof.plans_differ(),
+				"Rune q03 must bind to a distinct physical shape, or the logical-shape probe is void"
+			);
+			assert!(!proof.sql_plan_fingerprint.is_empty());
+			assert!(!proof.rune_plan_fingerprint.is_empty());
+			assert!(
+				proof.rune_plan_shape.contains("Join") || proof.rune_plan_shape.contains("join"),
+				"Rune q03 proof should expose a join-bearing physical plan"
+			);
+		});
+	}
+
+	#[test]
+	fn rune_q03_perf_row_matches_strict_oracle() {
+		run_on_large_stack(|| async {
+			let root = std::env::temp_dir()
+				.join(format!("toron_tpch_adr391_rune_q03_{}", std::process::id()));
+			let _ = std::fs::remove_dir_all(&root);
+			let attempt = run_rune_perf_query_with_data_source(
+				"q03", "strict", 0.01, 0, false, "memory", &root,
+			)
+			.await
+			.expect("rune q03 perf");
+			assert_eq!(attempt.engine, "rune");
+			assert_eq!(attempt.query, "q03");
+			assert_eq!(attempt.phase, Phase::Compare);
+			assert_eq!(attempt.status, Status::Pass);
+			assert_eq!(attempt.reason, None);
+			assert!(attempt.digest.is_some());
+			let _ = std::fs::remove_dir_all(&root);
+		});
+	}
+
+	fn run_on_large_stack<F, Fut>(body: F)
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: std::future::Future<Output = ()> + 'static,
+	{
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(move || {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(body());
+			})
+			.expect("spawn rune q03 probe thread")
+			.join()
+			.expect("rune q03 probe thread panicked");
 	}
 }
 
