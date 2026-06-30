@@ -2,6 +2,7 @@
 //! matching Toron's no-extra-framework style). An unknown command/arg is a *harness* error (exit 2),
 //! distinct from a query `blocked`/`fail` (which is structured telemetry).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -138,6 +139,15 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		PerfEngine::DuckDb => {
 			Err("perf-run-one does not run duckdb; use perf --engines duckdb".to_string())
 		}
+		PerfEngine::PolarsSql => run_polars_perf_query_with_data_source(
+			query,
+			mode,
+			sf,
+			run_index,
+			warmup,
+			data_source,
+			&data_dir,
+		),
 	};
 	let attempt = match attempt_result {
 		Ok(attempt) => attempt,
@@ -152,6 +162,7 @@ enum PerfEngine {
 	Toron,
 	Rune,
 	DuckDb,
+	PolarsSql,
 }
 
 impl PerfEngine {
@@ -160,6 +171,7 @@ impl PerfEngine {
 			PerfEngine::Toron => "toron",
 			PerfEngine::Rune => "rune",
 			PerfEngine::DuckDb => "duckdb",
+			PerfEngine::PolarsSql => "polars_sql",
 		}
 	}
 }
@@ -169,6 +181,7 @@ fn parse_perf_engine(raw: &str) -> Result<PerfEngine, String> {
 		"toron" => Ok(PerfEngine::Toron),
 		"rune" => Ok(PerfEngine::Rune),
 		"duckdb" => Ok(PerfEngine::DuckDb),
+		"polars_sql" => Ok(PerfEngine::PolarsSql),
 		other => Err(format!("unsupported perf engine {other:?}")),
 	}
 }
@@ -181,6 +194,7 @@ fn parse_perf_engines(raw: &str) -> Result<Vec<PerfEngine>, String> {
 			"toron" => PerfEngine::Toron,
 			"rune" => PerfEngine::Rune,
 			"duckdb" => PerfEngine::DuckDb,
+			"polars_sql" => PerfEngine::PolarsSql,
 			"all" => {
 				push_perf_engine(&mut engines, PerfEngine::Toron);
 				push_perf_engine(&mut engines, PerfEngine::DuckDb);
@@ -323,6 +337,38 @@ async fn perf_command(args: &[String]) -> ExitCode {
 					) {
 						Ok(rows) => raw_rows.extend(rows),
 						Err(message) => return harness_error(&message),
+					}
+				}
+				PerfEngine::PolarsSql => {
+					for warmup_index in 0..warmup {
+						match run_perf_child(
+							PerfEngine::PolarsSql,
+							query_id,
+							mode,
+							sf,
+							warmup_index as u32,
+							true,
+							data_source,
+							&data_dir,
+						) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
+					}
+					for run_index in 0..runs {
+						match run_perf_child(
+							PerfEngine::PolarsSql,
+							query_id,
+							mode,
+							sf,
+							run_index as u32,
+							false,
+							data_source,
+							&data_dir,
+						) {
+							Ok(row) => raw_rows.push(row),
+							Err(message) => return harness_error(&message),
+						}
 					}
 				}
 			}
@@ -787,6 +833,24 @@ fn duckdb_cli_version(duckdb_bin: &str) -> Result<Option<String>, String> {
 	}
 }
 
+fn run_polars_perf_query_with_data_source(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	run_index: u32,
+	warmup: bool,
+	data_source: &str,
+	data_dir: &Path,
+) -> Result<PerfAttempt, String> {
+	let export_root = PathBuf::from(CACHE_ROOT).join("parquet");
+	let export = match data_source {
+		"memory" => export_perf_query_parquet(query, mode, sf, &export_root)?,
+		"parquet" | "persisted" => export_persisted_perf_query_parquet(query, mode, sf, data_dir)?,
+		other => return Err(format!("perf --data-source {other:?} is not supported")),
+	};
+	Ok(run_polars_perf_export(&export, run_index, warmup))
+}
+
 fn duckdb_not_attempted_row(
 	query: &str,
 	mode: &str,
@@ -815,7 +879,44 @@ fn duckdb_not_attempted_row(
 		digest: None,
 		output_row_count: None,
 		output_schema_fingerprint: None,
+		engine_version: duckdb_version.clone(),
 		duckdb_version,
+		debug_build: false,
+	}
+	.json_value()
+}
+
+#[cfg(test)]
+fn polars_not_attempted_row(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	run_index: u32,
+	warmup: bool,
+	reason: &str,
+	engine_version: Option<String>,
+) -> serde_json::Value {
+	PerfAttempt {
+		engine: "polars_sql".to_string(),
+		query: query.to_string(),
+		scale_factor: sf,
+		mode: mode.to_string(),
+		run_index,
+		warmup,
+		phase: Phase::Generate,
+		status: Status::NotAttempted,
+		reason: Some(reason.to_string()),
+		diagnostic_message: None,
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: None,
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		engine_version,
+		duckdb_version: None,
 		debug_build: false,
 	}
 	.json_value()
@@ -849,6 +950,299 @@ fn duckdb_plan_fingerprint(export: &toron_tpch::TpchParquetExport) -> String {
 		"duckdb_sql={};manifest={}",
 		export.sql, export.manifest_fingerprint
 	))
+}
+
+fn polars_plan_fingerprint(export: &toron_tpch::TpchParquetExport) -> String {
+	let sql = polars_sql_text(export);
+	stable_fingerprint(&format!(
+		"polars_sql={};manifest={}",
+		sql, export.manifest_fingerprint
+	))
+}
+
+const POLARS_Q03_SQL: &str = "SELECT l_orderkey, \
+	SUM(l_extendedprice * (1 - l_discount)) AS revenue, \
+	o_orderdate, o_shippriority \
+	FROM customer \
+	JOIN orders ON c_custkey = o_custkey \
+	JOIN lineitem ON l_orderkey = o_orderkey \
+	WHERE c_mktsegment = 'BUILDING' \
+	  AND o_orderdate < DATE '1995-03-15' \
+	  AND l_shipdate > DATE '1995-03-15' \
+	GROUP BY l_orderkey, o_orderdate, o_shippriority \
+	ORDER BY revenue DESC, o_orderdate";
+
+const POLARS_Q14_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' \
+		THEN l_extendedprice * (1 - l_discount) ELSE 0 END) \
+	/ SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue \
+	FROM lineitem \
+	JOIN part ON l_partkey = p_partkey \
+	WHERE l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'";
+
+const POLARS_Q19_SQL: &str = "SELECT SUM(l_extendedprice * (1 - l_discount)) AS revenue \
+	FROM lineitem \
+	JOIN part ON p_partkey = l_partkey \
+	WHERE (p_brand = 'Brand#12' \
+	    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') \
+	    AND l_quantity >= 1 \
+	    AND l_quantity <= 11 \
+	    AND p_size BETWEEN 1 AND 5 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON') \
+	   OR (p_brand = 'Brand#23' \
+	    AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') \
+	    AND l_quantity >= 10 \
+	    AND l_quantity <= 20 \
+	    AND p_size BETWEEN 1 AND 10 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON') \
+	   OR (p_brand = 'Brand#34' \
+	    AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') \
+	    AND l_quantity >= 20 \
+	    AND l_quantity <= 30 \
+	    AND p_size BETWEEN 1 AND 15 \
+	    AND l_shipmode IN ('AIR', 'AIR REG') \
+	    AND l_shipinstruct = 'DELIVER IN PERSON')";
+
+fn polars_sql_text(export: &toron_tpch::TpchParquetExport) -> Cow<'_, str> {
+	match export.query_id.as_str() {
+		"q03" => Cow::Borrowed(POLARS_Q03_SQL),
+		"q14" => Cow::Borrowed(POLARS_Q14_SQL),
+		"q19" => Cow::Borrowed(POLARS_Q19_SQL),
+		_ => Cow::Borrowed(&export.sql),
+	}
+}
+
+#[cfg(not(feature = "polars-sql-reference"))]
+fn run_polars_perf_export(
+	export: &toron_tpch::TpchParquetExport,
+	run_index: u32,
+	warmup: bool,
+) -> PerfAttempt {
+	PerfAttempt {
+		engine: "polars_sql".to_string(),
+		query: export.query_id.clone(),
+		scale_factor: export.scale_factor,
+		mode: export.mode.clone(),
+		run_index,
+		warmup,
+		phase: Phase::Generate,
+		status: Status::NotAttempted,
+		reason: Some("polars_absent".to_string()),
+		diagnostic_message: Some(
+			"toron-tpch was built without --features polars-sql-reference".to_string(),
+		),
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: Some(polars_plan_fingerprint(export)),
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		engine_version: None,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn run_polars_perf_export(
+	export: &toron_tpch::TpchParquetExport,
+	run_index: u32,
+	warmup: bool,
+) -> PerfAttempt {
+	use polars::prelude::*;
+	use polars_sql::SQLContext;
+
+	let plan_fingerprint = polars_plan_fingerprint(export);
+	let engine_version = Some(polars::VERSION.to_string());
+	let mut context = SQLContext::new();
+	for table in &export.tables {
+		let Some(path) = table.path.to_str() else {
+			return polars_fail_attempt(
+				export,
+				&plan_fingerprint,
+				run_index,
+				warmup,
+				"polars_invalid_path",
+				&format!("non-utf8 parquet path {}", table.path.display()),
+				engine_version,
+			);
+		};
+		let lazy = match LazyFrame::scan_parquet(path.into(), Default::default()) {
+			Ok(lazy) => lazy,
+			Err(error) => {
+				return polars_fail_attempt(
+					export,
+					&plan_fingerprint,
+					run_index,
+					warmup,
+					"polars_scan_failed",
+					&format!("{error:?}"),
+					engine_version,
+				);
+			}
+		};
+		context.register(&table.name, lazy);
+	}
+
+	let polars_sql = polars_sql_text(export);
+	let lazy = match context.execute(polars_sql.as_ref()) {
+		Ok(lazy) => lazy,
+		Err(error) => {
+			return polars_unsupported_attempt(
+				export,
+				&plan_fingerprint,
+				run_index,
+				warmup,
+				&format!("{error:?}"),
+				engine_version,
+			);
+		}
+	};
+	let start = Instant::now();
+	let frame = match lazy.collect() {
+		Ok(frame) => frame,
+		Err(error) => {
+			return polars_unsupported_attempt(
+				export,
+				&plan_fingerprint,
+				run_index,
+				warmup,
+				&format!("{error:?}"),
+				engine_version,
+			);
+		}
+	};
+	let execute_ms = start.elapsed().as_secs_f64() * 1000.0;
+	let mut timings = PerfPhaseTimings::default();
+	timings.execute_ms = execute_ms;
+	timings.total_ms = execute_ms;
+	PerfAttempt {
+		engine: "polars_sql".to_string(),
+		query: export.query_id.clone(),
+		scale_factor: export.scale_factor,
+		mode: export.mode.clone(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::Pass,
+		reason: None,
+		diagnostic_message: None,
+		timings,
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: Some(plan_fingerprint),
+		digest: None,
+		output_row_count: Some(frame.height() as u64),
+		output_schema_fingerprint: Some(stable_fingerprint(&polars_schema_signature(&frame))),
+		engine_version,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn polars_schema_signature(frame: &polars::prelude::DataFrame) -> String {
+	frame
+		.schema()
+		.iter()
+		.map(|(name, dtype)| format!("{name}:{dtype:?}"))
+		.collect::<Vec<_>>()
+		.join("|")
+}
+
+#[cfg(any(feature = "polars-sql-reference", test))]
+fn polars_unsupported_attempt(
+	export: &toron_tpch::TpchParquetExport,
+	plan_fingerprint: &str,
+	run_index: u32,
+	warmup: bool,
+	message: &str,
+	engine_version: Option<String>,
+) -> PerfAttempt {
+	let error_class = classify_polars_error(message);
+	let reason = format!("polars_sql_unsupported_{error_class}");
+	PerfAttempt {
+		engine: "polars_sql".to_string(),
+		query: export.query_id.clone(),
+		scale_factor: export.scale_factor,
+		mode: export.mode.clone(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::NotAttempted,
+		reason: Some(reason),
+		diagnostic_message: Some(message.to_string()),
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: Some(plan_fingerprint.to_string()),
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		engine_version,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn polars_fail_attempt(
+	export: &toron_tpch::TpchParquetExport,
+	plan_fingerprint: &str,
+	run_index: u32,
+	warmup: bool,
+	reason: &str,
+	message: &str,
+	engine_version: Option<String>,
+) -> PerfAttempt {
+	PerfAttempt {
+		engine: "polars_sql".to_string(),
+		query: export.query_id.clone(),
+		scale_factor: export.scale_factor,
+		mode: export.mode.clone(),
+		run_index,
+		warmup,
+		phase: Phase::Execute,
+		status: Status::Fail,
+		reason: Some(reason.to_string()),
+		diagnostic_message: Some(message.to_string()),
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: Some(plan_fingerprint.to_string()),
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		engine_version,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+	}
+}
+
+#[cfg(any(feature = "polars-sql-reference", test))]
+fn classify_polars_error(message: &str) -> &'static str {
+	let lower = message.to_ascii_lowercase();
+	if lower.contains("subquer")
+		|| lower.contains("correlated")
+		|| lower.contains("exists")
+		|| lower.contains("outer")
+	{
+		"correlated_subquery"
+	} else if lower.contains("interval") {
+		"interval_syntax"
+	} else if lower.contains("not like") || lower.contains(" join") || lower.contains("join ") {
+		"join_constraint"
+	} else if lower.contains("2^32") || lower.contains("2**32") || lower.contains("index") {
+		"index_limit"
+	} else {
+		"other"
+	}
 }
 
 fn duckdb_type_parity_gate(
@@ -955,6 +1349,7 @@ fn run_duckdb_perf_child(
 			digest: None,
 			output_row_count: None,
 			output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
+			engine_version: Some(duckdb_version.to_string()),
 			duckdb_version: Some(duckdb_version.to_string()),
 			debug_build: false,
 		}
@@ -993,6 +1388,7 @@ fn run_duckdb_perf_child(
 		digest: None,
 		output_row_count: Some(row_count),
 		output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
+		engine_version: Some(duckdb_version.to_string()),
 		duckdb_version: Some(duckdb_version.to_string()),
 		debug_build: false,
 	}
@@ -1483,6 +1879,9 @@ fn summarize_query_rows(
 		.and_then(|row| row.get("output_schema_fingerprint"))
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("none");
+	let engine_version = first
+		.and_then(|row| row.get("engine_version"))
+		.and_then(serde_json::Value::as_str);
 	let duckdb_version = first
 		.and_then(|row| row.get("duckdb_version"))
 		.and_then(serde_json::Value::as_str);
@@ -1561,6 +1960,7 @@ fn summarize_query_rows(
 		"digest": digest,
 		"output_row_count": output_row_count,
 		"output_schema_fingerprint": output_schema_fingerprint,
+		"engine_version": engine_version,
 		"duckdb_version": duckdb_version,
 		"baseline_execute_ms_median": baseline_execute_ms_median,
 		"flags": flags,
@@ -1768,7 +2168,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -1798,13 +2198,18 @@ mod tests {
 	#[test]
 	fn perf_engines_accept_rune_without_changing_all() {
 		assert_eq!(
-			parse_perf_engines("toron,rune,duckdb").unwrap(),
-			vec![PerfEngine::Toron, PerfEngine::Rune, PerfEngine::DuckDb]
+			parse_perf_engines("toron,rune,polars_sql,duckdb").unwrap(),
+			vec![
+				PerfEngine::Toron,
+				PerfEngine::Rune,
+				PerfEngine::PolarsSql,
+				PerfEngine::DuckDb
+			]
 		);
 		assert_eq!(
 			parse_perf_engines("all").unwrap(),
 			vec![PerfEngine::Toron, PerfEngine::DuckDb],
-			"all stays all-query safe; rune is a q03-only explicit probe"
+			"all stays all-query safe; rune and polars_sql are explicit probes"
 		);
 	}
 
@@ -1922,6 +2327,67 @@ mod tests {
 	}
 
 	#[test]
+	fn polars_absent_rows_summarize_as_not_attempted() {
+		let rows = vec![polars_not_attempted_row(
+			"q03",
+			"strict",
+			1.0,
+			0,
+			false,
+			"polars_absent",
+			None,
+		)];
+		let summary = summarize_perf_rows(&rows, 1, 0, &BTreeMap::new());
+		assert_eq!(summary.len(), 1);
+		assert_eq!(summary[0]["engine"], "polars_sql");
+		assert_eq!(summary[0]["status"], "not_attempted");
+		assert_eq!(summary[0]["engine_version"], serde_json::Value::Null);
+	}
+
+	#[test]
+	fn polars_unsupported_attempt_maps_to_existing_not_attempted_status() {
+		let export = fake_polars_export();
+		let attempt = polars_unsupported_attempt(
+			&export,
+			"polars-plan",
+			0,
+			false,
+			"correlated subqueries are not supported",
+			Some("0.54.4".to_string()),
+		);
+		let row = attempt.json_value();
+		assert_eq!(row["engine"], "polars_sql");
+		assert_eq!(row["status"], "not_attempted");
+		assert_eq!(row["reason"], "polars_sql_unsupported_correlated_subquery");
+		assert_eq!(row["engine_version"], "0.54.4");
+		assert_eq!(row["duckdb_version"], serde_json::Value::Null);
+	}
+
+	#[test]
+	fn polars_sql_reference_uses_explicit_join_dialect_for_q03() {
+		let export = fake_polars_export();
+		let polars_sql = polars_sql_text(&export);
+		assert_ne!(polars_sql.as_ref(), export.sql);
+		assert!(polars_sql.contains("JOIN orders ON c_custkey = o_custkey"));
+		assert!(polars_sql.contains("JOIN lineitem ON l_orderkey = o_orderkey"));
+	}
+
+	#[test]
+	fn duckdb_version_is_mirrored_to_generic_engine_version() {
+		let row = duckdb_not_attempted_row(
+			"q06",
+			"strict",
+			1.0,
+			0,
+			false,
+			"duckdb_absent",
+			Some("DuckDB v1.5.4".to_string()),
+		);
+		assert_eq!(row["engine_version"], "DuckDB v1.5.4");
+		assert_eq!(row["duckdb_version"], "DuckDB v1.5.4");
+	}
+
+	#[test]
 	fn perf_summary_deduplicates_row_flags() {
 		let mut first = perf_row_for_engine("duckdb", "q06", 80.0, "duckdb-plan", true);
 		first["flags"] = serde_json::json!(["schema_mismatch"]);
@@ -1948,6 +2414,19 @@ mod tests {
 			("name".to_string(), "VARCHAR".to_string()),
 		]);
 		assert_eq!(observed, expected);
+	}
+
+	fn fake_polars_export() -> toron_tpch::TpchParquetExport {
+		toron_tpch::TpchParquetExport {
+			query_id: "q03".to_string(),
+			mode: "strict".to_string(),
+			scale_factor: 1.0,
+			sql: "select 1".to_string(),
+			root_dir: PathBuf::from("target/tpch/data/strict/sf1"),
+			manifest_path: PathBuf::from("target/tpch/data/strict/sf1/manifest.json"),
+			manifest_fingerprint: "manifest".to_string(),
+			tables: Vec::new(),
+		}
 	}
 
 	fn perf_row(

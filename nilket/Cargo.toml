@@ -9,6 +9,8 @@ resolver = "3"
 arrow = { version = "58.3.0", features = ["chrono-tz", "ipc_compression"] }
 arrow-schema = { version = "58.3.0", features = ["serde"] }
 postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
+polars = { version = "0.54.4", default-features = false }
+polars-sql = { version = "0.54.4", default-features = false }
 tokio = { version = "1.37", features = ["full"] }
 
 [profile.release]

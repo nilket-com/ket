@@ -299,6 +299,7 @@ pub struct PerfAttempt {
 	pub digest: Option<String>,
 	pub output_row_count: Option<u64>,
 	pub output_schema_fingerprint: Option<String>,
+	pub engine_version: Option<String>,
 	pub duckdb_version: Option<String>,
 	pub debug_build: bool,
 }
@@ -325,6 +326,7 @@ impl PerfAttempt {
 			"digest": self.digest,
 			"output_row_count": self.output_row_count,
 			"output_schema_fingerprint": self.output_schema_fingerprint,
+			"engine_version": self.engine_version,
 			"duckdb_version": self.duckdb_version,
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");

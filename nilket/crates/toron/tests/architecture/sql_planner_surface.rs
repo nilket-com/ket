@@ -1865,15 +1865,25 @@ pub(crate) fn adr073_sqlparser_is_pinned_to_062() {
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
 	let cargo_lock =
 		std::fs::read_to_string(workspace_root_dir().join("Cargo.lock")).expect("read lockfile");
-	let lock_entry = cargo_lock
+	let lock_entries = cargo_lock
 		.split("[[package]]")
-		.find(|entry| entry.contains("name = \"sqlparser\""))
-		.expect("sqlparser lockfile entry");
+		.filter(|entry| entry.contains("name = \"sqlparser\""))
+		.collect::<Vec<_>>();
 
 	assert!(manifest.contains("sqlparser = \"0.62\""));
-	assert!(lock_entry.contains("version = \"0.62.0\""));
+	assert!(
+		lock_entries
+			.iter()
+			.any(|entry| entry.contains("version = \"0.62.0\"")),
+		"Toron's sqlparser 0.62 lockfile entry is missing"
+	);
 	assert!(!manifest.contains("sqlparser = \"0.54\""));
-	assert!(!lock_entry.contains("version = \"0.54.0\""));
+	assert!(
+		lock_entries
+			.iter()
+			.all(|entry| !entry.contains("version = \"0.54.0\"")),
+		"sqlparser 0.54 must not re-enter the workspace lockfile"
+	);
 }
 
 #[test]

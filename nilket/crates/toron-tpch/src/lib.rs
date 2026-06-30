@@ -3241,6 +3241,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3274,6 +3275,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3306,6 +3308,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			digest: Some(digest),
 			output_row_count: Some(output_row_count),
 			output_schema_fingerprint,
+			engine_version: None,
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 		};
@@ -3331,6 +3334,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			digest: Some(digest),
 			output_row_count: Some(output_row_count),
 			output_schema_fingerprint,
+			engine_version: None,
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 		};
@@ -3355,6 +3359,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		digest: Some(digest),
 		output_row_count: Some(output_row_count),
 		output_schema_fingerprint,
+		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 	}
@@ -3398,6 +3403,7 @@ async fn run_perf_query_with_tables(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3431,6 +3437,7 @@ async fn run_perf_query_with_tables(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3460,6 +3467,7 @@ async fn run_perf_query_with_tables(
 		digest: Some(digest),
 		output_row_count: Some(output_row_count),
 		output_schema_fingerprint,
+		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 	}
@@ -3504,6 +3512,7 @@ async fn run_perf_query_with_metadata(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3537,6 +3546,7 @@ async fn run_perf_query_with_metadata(
 				digest: None,
 				output_row_count: None,
 				output_schema_fingerprint: None,
+				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 			};
@@ -3566,6 +3576,7 @@ async fn run_perf_query_with_metadata(
 		digest: Some(digest),
 		output_row_count: Some(output_row_count),
 		output_schema_fingerprint,
+		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 	}
