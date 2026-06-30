@@ -791,6 +791,25 @@ fn reoriented_inner_chain_grouped_base_scan_probe_mode(
 	.then_some(mode)
 }
 
+fn reoriented_grouped_required_output_columns(
+	project_exprs: Option<&BoundExprProgram>,
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	outer_predicate: Option<&BoundExprProgram>,
+) -> BTreeSet<ColumnOrdinal> {
+	let mut required_output = BTreeSet::new();
+	if let Some(project_exprs) = project_exprs {
+		collect_program_column_ordinals(project_exprs, &mut required_output);
+	} else {
+		collect_program_column_ordinals(group_expr, &mut required_output);
+		collect_aggregate_columns(aggr_expr, &mut required_output);
+	}
+	if let Some(predicate) = outer_predicate {
+		collect_program_column_ordinals(predicate, &mut required_output);
+	}
+	required_output
+}
+
 fn concat_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
 	Arc::new(Schema::new(
 		left.fields()
@@ -6571,15 +6590,15 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Project {
-			input: project_input,
-			exprs: project_exprs,
-			output_schema: project_output_schema,
-		} = aggregate_input.as_ref()
-		else {
-			return Ok(None);
+		let (project_input, project_exprs, project_output_schema) = match aggregate_input.as_ref() {
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => (input.as_ref(), Some(exprs), Some(output_schema)),
+			other => (other, None, None),
 		};
-		let (chain_input, outer_predicate) = match project_input.as_ref() {
+		let (chain_input, outer_predicate) = match project_input {
 			ExecutionPlan::Filter {
 				input,
 				predicate,
@@ -6595,18 +6614,32 @@ impl Executor {
 		let Some((base, mut stages)) = extract_reoriented_inner_chain(chain_input) else {
 			return Ok(None);
 		};
-		let mut required_output = BTreeSet::new();
-		collect_program_column_ordinals(project_exprs, &mut required_output);
-		if let Some(predicate) = outer_predicate {
-			collect_program_column_ordinals(predicate, &mut required_output);
-		}
+		let required_output = reoriented_grouped_required_output_columns(
+			project_exprs,
+			group_expr,
+			aggr_expr,
+			outer_predicate,
+		);
 		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
 
 		let base_scan_probe_mode = reoriented_inner_chain_grouped_base_scan_probe_mode(base);
+		let force_stream_projected_filtered_base = project_exprs.is_some()
+			&& matches!(
+				base_scan_probe_mode,
+				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+			);
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
 			let stream_scan_build = match base_scan_probe_mode {
-				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0) => true,
+				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+					if force_stream_projected_filtered_base =>
+				{
+					true
+				}
+				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0) => {
+					self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+						.await?
+				}
 				Some(ReorientedInnerChainGroupedBaseScanProbeMode::BareJoin0) => {
 					self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
 						.await?
@@ -6681,28 +6714,15 @@ impl Executor {
 					}
 
 					for batch in batches {
-						let filtered = if let Some(predicate) = outer_predicate {
-							self.filter_batch_with_bound_predicate(
-								predicate,
-								batch,
-								"filter predicate",
-							)?
-						} else {
-							batch
-						};
-						if filtered.num_rows() == 0 {
-							continue;
-						}
-						let projected = RecordBatch::try_new(
-							project_output_schema.clone(),
-							self.evaluate_bound_program(project_exprs, &filtered)?,
-						)?;
-						self.fold_bound_grouped_aggregate_batch(
+						self.fold_reoriented_grouped_output_batch(
 							&mut groups,
 							&mut group_types,
+							outer_predicate,
+							project_exprs,
+							project_output_schema,
 							group_expr,
 							aggr_expr,
-							&projected,
+							batch,
 						)?;
 					}
 					Ok(())
@@ -6744,8 +6764,8 @@ impl Executor {
 		base: &ExecutionPlan,
 		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
 		outer_predicate: Option<&BoundExprProgram>,
-		project_exprs: &BoundExprProgram,
-		project_output_schema: &arrow::datatypes::SchemaRef,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
 		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
@@ -6925,28 +6945,15 @@ impl Executor {
 					}
 
 					for batch in batches {
-						let filtered = if let Some(predicate) = outer_predicate {
-							self.filter_batch_with_bound_predicate(
-								predicate,
-								batch,
-								"filter predicate",
-							)?
-						} else {
-							batch
-						};
-						if filtered.num_rows() == 0 {
-							continue;
-						}
-						let projected = RecordBatch::try_new(
-							project_output_schema.clone(),
-							self.evaluate_bound_program(project_exprs, &filtered)?,
-						)?;
-						self.fold_bound_grouped_aggregate_batch(
+						self.fold_reoriented_grouped_output_batch(
 							groups,
 							group_types,
+							outer_predicate,
+							project_exprs,
+							project_output_schema,
 							group_expr,
 							aggr_expr,
-							&projected,
+							batch,
 						)?;
 					}
 				}
@@ -6972,6 +6979,46 @@ impl Executor {
 			},
 		);
 		Ok(Some(()))
+	}
+
+	fn fold_reoriented_grouped_output_batch(
+		&self,
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		batch: RecordBatch,
+	) -> Result<(), ExecutionError> {
+		let filtered = if let Some(predicate) = outer_predicate {
+			self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+		} else {
+			batch
+		};
+		if filtered.num_rows() == 0 {
+			return Ok(());
+		}
+		let aggregate_input = match (project_exprs, project_output_schema) {
+			(Some(project_exprs), Some(project_output_schema)) => RecordBatch::try_new(
+				project_output_schema.clone(),
+				self.evaluate_bound_program(project_exprs, &filtered)?,
+			)?,
+			(None, None) => filtered,
+			_ => {
+				return Err(ExecutionError::InvalidExpression {
+					message: "reoriented grouped projection metadata is incomplete".to_string(),
+				});
+			}
+		};
+		self.fold_bound_grouped_aggregate_batch(
+			groups,
+			group_types,
+			group_expr,
+			aggr_expr,
+			&aggregate_input,
+		)
 	}
 
 	pub(in crate::exec) async fn try_streaming_inner_prefix_semi_anti_grouped_aggregate(
@@ -9328,6 +9375,58 @@ mod tests {
 			reoriented_inner_chain_grouped_base_scan_probe_mode(&filtered_base),
 			Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
 		));
+	}
+
+	#[test]
+	fn reoriented_grouped_required_columns_cover_identity_and_projected_inputs() {
+		let group_expr = bound_column_root("group_key", ColumnOrdinal(2), DataType::Int64, false);
+		let aggr_arg = bound_column_root("amount", ColumnOrdinal(5), DataType::Int64, true);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: aggr_arg,
+		}];
+		let outer_predicate = less_than_filter_program(ColumnOrdinal(7), 10);
+
+		let identity_required = reoriented_grouped_required_output_columns(
+			None,
+			&group_expr,
+			&aggr_expr,
+			Some(&outer_predicate),
+		);
+		assert_eq!(
+			identity_required,
+			BTreeSet::from([ColumnOrdinal(2), ColumnOrdinal(5), ColumnOrdinal(7)])
+		);
+
+		let mut builder = BoundExprProgramBuilder::new();
+		let projected_a = builder.append_column(ResolvedColumn {
+			name: ColumnName("projected_a".to_string()),
+			ordinal: ColumnOrdinal(1),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let projected_b = builder.append_column(ResolvedColumn {
+			name: ColumnName("projected_b".to_string()),
+			ordinal: ColumnOrdinal(4),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		builder.push_root(projected_a);
+		builder.push_root(projected_b);
+		let project_exprs = builder.build();
+
+		let projected_required = reoriented_grouped_required_output_columns(
+			Some(&project_exprs),
+			&group_expr,
+			&aggr_expr,
+			None,
+		);
+		assert_eq!(
+			projected_required,
+			BTreeSet::from([ColumnOrdinal(1), ColumnOrdinal(4)])
+		);
 	}
 
 	fn less_than_filter_program(ordinal: ColumnOrdinal, upper: i64) -> BoundExprProgram {
