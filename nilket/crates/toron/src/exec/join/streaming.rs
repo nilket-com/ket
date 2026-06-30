@@ -747,34 +747,48 @@ fn is_streaming_left_outer_grouped_join(input: &ExecutionPlan) -> bool {
 	decompose_streaming_scan_probe_input(right).is_some()
 }
 
-fn reoriented_inner_chain_grouped_base_supports_scan_probe(base: &ExecutionPlan) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReorientedInnerChainGroupedBaseScanProbeMode {
+	FilteredJoin0,
+	BareJoin0,
+}
+
+fn reoriented_inner_chain_grouped_base_scan_probe_mode(
+	base: &ExecutionPlan,
+) -> Option<ReorientedInnerChainGroupedBaseScanProbeMode> {
 	let ExecutionPlan::Exchange {
 		input: base_input, ..
 	} = base
 	else {
-		return false;
+		return None;
 	};
-	let ExecutionPlan::Filter {
-		input: join0,
-		disposition,
-		..
-	} = base_input.as_ref()
-	else {
-		return false;
+	let (join0, mode) = match base_input.as_ref() {
+		ExecutionPlan::Filter {
+			input,
+			disposition: FilterDisposition::EvaluateInToron,
+			..
+		} => (
+			input.as_ref(),
+			ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0,
+		),
+		other @ ExecutionPlan::Join { .. } => (
+			other,
+			ReorientedInnerChainGroupedBaseScanProbeMode::BareJoin0,
+		),
+		_ => return None,
 	};
-	if *disposition == FilterDisposition::FullyPushed {
-		return false;
-	}
 	let ExecutionPlan::Join {
 		replay_id,
 		right,
 		kind: JoinKind::Inner,
 		..
-	} = join0.as_ref()
+	} = join0
 	else {
-		return false;
+		return None;
 	};
-	*replay_id == JoinReplayId(0) && decompose_streaming_scan_probe_input(right).is_some()
+	(*replay_id == JoinReplayId(0)
+		&& decompose_streaming_scan_probe_input(right.as_ref()).is_some())
+	.then_some(mode)
 }
 
 fn concat_join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
@@ -3950,6 +3964,60 @@ impl Executor {
 		Ok(estimated)
 	}
 
+	async fn estimate_streaming_scan_output_bytes(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<u64, ExecutionError> {
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming scan build expected a scan input".to_string(),
+			});
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let mut estimated = 0u64;
+		while let Some(batch) = stream.next().await {
+			let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			estimated = estimated.saturating_add(batch.get_array_memory_size() as u64);
+		}
+		Ok(estimated)
+	}
+
+	async fn reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
+		&self,
+		stage: &ReorientedInnerJoinStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<bool, ExecutionError> {
+		let Some(scan_input) = decompose_streaming_scan_probe_input(stage.build) else {
+			return Ok(false);
+		};
+		let task_memory_cap = self.context.task_budget.memory.get();
+		if task_memory_cap < 64 * 1024 * 1024 {
+			return Ok(false);
+		}
+		let scan_output_cap = join_output_materialization_memory_cap(task_memory_cap);
+		let estimated = self
+			.estimate_streaming_scan_output_bytes(scan_input, morsel)
+			.await?;
+		Ok(estimated > scan_output_cap)
+	}
+
 	async fn write_streaming_scan_inner_build_batch(
 		&self,
 		spilled: &mut SpilledInnerJoinBuild,
@@ -6534,11 +6602,18 @@ impl Executor {
 		}
 		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
 
-		let stream_stage_scan_builds =
-			reoriented_inner_chain_grouped_base_supports_scan_probe(base);
+		let base_scan_probe_mode = reoriented_inner_chain_grouped_base_scan_probe_mode(base);
 		let mut runtimes = Vec::with_capacity(stages.len());
 		for stage in stages {
-			let runtime = if stream_stage_scan_builds {
+			let stream_scan_build = match base_scan_probe_mode {
+				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0) => true,
+				Some(ReorientedInnerChainGroupedBaseScanProbeMode::BareJoin0) => {
+					self.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+						.await?
+				}
+				None => false,
+			};
+			let runtime = if stream_scan_build {
 				self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
 					.await?
 			} else {
@@ -6685,17 +6760,14 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Filter {
-			input: join0,
-			predicate: join0_filter,
-			disposition,
-		} = base_input.as_ref()
-		else {
-			return Ok(None);
+		let (join0, join0_filter) = match base_input.as_ref() {
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition: FilterDisposition::EvaluateInToron,
+			} => (input.as_ref(), Some(predicate)),
+			other => (other, None),
 		};
-		if *disposition == FilterDisposition::FullyPushed {
-			return Ok(None);
-		}
 		let ExecutionPlan::Join {
 			replay_id,
 			left,
@@ -6708,18 +6780,18 @@ impl Executor {
 			strategy,
 			output_schema: join0_output_schema,
 			..
-		} = join0.as_ref()
+		} = join0
 		else {
 			return Ok(None);
 		};
 		if *replay_id != JoinReplayId(0) {
 			return Ok(None);
 		}
-		let Some(scan_input) = decompose_streaming_scan_probe_input(right) else {
+		let Some(scan_input) = decompose_streaming_scan_probe_input(right.as_ref()) else {
 			return Ok(None);
 		};
 
-		let left_batches = self.execute_bound(left, morsel).await?;
+		let left_batches = self.execute_bound(left.as_ref(), morsel).await?;
 		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 		if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
@@ -6809,11 +6881,11 @@ impl Executor {
 					join0_output_schema,
 					self.context.task_budget.memory.get(),
 				)?;
-				let batch = self.filter_batch_with_bound_predicate(
-					join0_filter,
-					batch,
-					"filter predicate",
-				)?;
+				let batch = if let Some(join0_filter) = join0_filter {
+					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
+				} else {
+					batch
+				};
 				if batch.num_rows() == 0 {
 					continue;
 				}
@@ -9205,6 +9277,57 @@ mod tests {
 			partition_count,
 			key,
 		}
+	}
+
+	#[test]
+	fn reoriented_inner_chain_grouped_base_classifies_filtered_and_bare_scan_probe() {
+		let left_schema = Arc::new(Schema::new(vec![Field::new(
+			"left_key",
+			DataType::Int64,
+			false,
+		)]));
+		let right_schema = Arc::new(Schema::new(vec![Field::new(
+			"right_key",
+			DataType::Int64,
+			false,
+		)]));
+		let left = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(1), left_schema.clone(), 1),
+			bound_column_root("left_key", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let right = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(2), right_schema.clone(), 2),
+			bound_column_root("right_key", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let join = inner_join_plan(
+			left,
+			right,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			concat_test_schema(&left_schema, &right_schema),
+		);
+		let base_key = bound_column_root("left_key", ColumnOrdinal(0), DataType::Int64, false);
+		let bare_base = exchange_plan(join.clone(), base_key.clone(), 4);
+		assert!(matches!(
+			reoriented_inner_chain_grouped_base_scan_probe_mode(&bare_base),
+			Some(ReorientedInnerChainGroupedBaseScanProbeMode::BareJoin0)
+		));
+
+		let filtered_base = exchange_plan(
+			ExecutionPlan::Filter {
+				input: Box::new(join),
+				predicate: less_than_filter_program(ColumnOrdinal(0), 10),
+				disposition: FilterDisposition::EvaluateInToron,
+			},
+			base_key,
+			4,
+		);
+		assert!(matches!(
+			reoriented_inner_chain_grouped_base_scan_probe_mode(&filtered_base),
+			Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+		));
 	}
 
 	fn less_than_filter_program(ordinal: ColumnOrdinal, upper: i64) -> BoundExprProgram {
