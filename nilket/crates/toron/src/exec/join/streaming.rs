@@ -1,6 +1,7 @@
 use super::*;
 
 const STREAMED_INNER_LOADED_BUILD_ESTIMATE_SAFETY_MULTIPLIER: u64 = 64;
+const STREAMED_INNER_BUILD_MAX_PARTITIONS: u32 = 1024;
 
 pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	replay_id: JoinReplayId,
@@ -1847,6 +1848,67 @@ fn estimate_streaming_scan_build_batch_bytes(
 		.max(record_batch_memory_bytes(batch)))
 }
 
+fn add_streaming_scan_build_partition_byte_estimates(
+	partition_bytes: &mut [u64],
+	batch: &RecordBatch,
+	retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+	partition_build_keys: &[crate::ir::ColumnOrdinal],
+	write_build_keys: &[crate::ir::ColumnOrdinal],
+	partition_count: u32,
+	null_safe_keys: bool,
+) -> Result<(), ExecutionError> {
+	let buckets = precompute_join_partition_buckets(
+		batch,
+		partition_build_keys,
+		partition_count,
+		null_safe_keys,
+		false,
+	)?;
+	for partition in 0..partition_count {
+		let partitioned = select_join_partition_batch_with_buckets(batch, &buckets, partition)?;
+		if partitioned.num_rows() == 0 {
+			continue;
+		}
+		let partition_index = usize::try_from(partition).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition exceeds usize".to_string(),
+		})?;
+		partition_bytes[partition_index] = partition_bytes[partition_index].saturating_add(
+			estimate_streaming_scan_build_batch_bytes(
+				&partitioned,
+				retained_columns,
+				write_build_keys,
+				null_safe_keys,
+			)?,
+		);
+	}
+	Ok(())
+}
+
+fn estimate_materialized_inner_build_partition_bytes(
+	build_batches: &[RecordBatch],
+	build_keys: &[crate::ir::ColumnOrdinal],
+	partition_count: u32,
+	null_safe_keys: bool,
+) -> Result<Vec<u64>, ExecutionError> {
+	let partition_count_usize =
+		usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition count exceeds usize".to_string(),
+		})?;
+	let mut partition_bytes = vec![0u64; partition_count_usize];
+	for batch in build_batches {
+		add_streaming_scan_build_partition_byte_estimates(
+			&mut partition_bytes,
+			batch,
+			None,
+			build_keys,
+			build_keys,
+			partition_count,
+			null_safe_keys,
+		)?;
+	}
+	Ok(partition_bytes)
+}
+
 fn streamed_inner_build_partition_count(
 	estimated_build_bytes: u64,
 	memory_cap: u64,
@@ -1863,37 +1925,25 @@ fn streamed_inner_build_partition_count(
 	Ok(memory_partitions.max(spill_partitions))
 }
 
+#[cfg(test)]
 fn streamed_inner_build_group_count(
 	estimated_build_bytes: u64,
 	spill_budget: u64,
 	partition_count: u32,
 ) -> Result<u32, ExecutionError> {
-	if partition_count == 0 {
+	let partition_count_usize =
+		usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition count exceeds usize".to_string(),
+		})?;
+	if partition_count_usize == 0 {
 		return Err(ExecutionError::Kernel {
 			message: "streamed inner build partition count must be positive".to_string(),
 		});
 	}
-	let group_count = partition_count_for_target_bytes(
-		estimated_build_bytes,
-		streamed_inner_build_group_target_bytes(spill_budget),
-		"streamed inner join build partition group sizing",
-		spill_budget,
-	)?
-	.min(partition_count)
-	.max(1);
-	let group_count = if partition_count > 1 {
-		group_count.max(2).min(partition_count)
-	} else {
-		group_count
-	};
-	if group_count > 8 && group_count.saturating_mul(2) >= partition_count {
-		return Err(budget_exhausted(
-			BudgetDimension::SpillBytes,
-			"streamed inner join build partition group sizing",
-			estimated_build_bytes,
-			spill_budget,
-		));
-	}
+	let per_partition =
+		evenly_distributed_partition_bytes(estimated_build_bytes, partition_count_usize)?;
+	let (group_count, _) =
+		streamed_inner_build_group_count_for_partition_spill_bytes(&per_partition, spill_budget)?;
 	Ok(group_count)
 }
 
@@ -1901,8 +1951,166 @@ fn streamed_inner_build_writer_target_bytes(spill_budget: u64) -> u64 {
 	spill_budget.saturating_div(4).max(1)
 }
 
-fn streamed_inner_build_group_target_bytes(spill_budget: u64) -> u64 {
+fn streamed_inner_build_group_spill_budget(spill_budget: u64) -> u64 {
 	spill_budget.saturating_mul(3).saturating_div(4).max(1)
+}
+
+#[cfg(test)]
+fn streamed_inner_build_group_overhead_reserve_bytes(spill_budget: u64) -> u64 {
+	spill_budget.saturating_sub(streamed_inner_build_group_spill_budget(spill_budget))
+}
+
+fn ceil_div_u64(numerator: u64, denominator: u64) -> u64 {
+	if numerator == 0 {
+		return 0;
+	}
+	let denominator = denominator.max(1);
+	numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+}
+
+#[cfg(test)]
+fn evenly_distributed_partition_bytes(
+	total_bytes: u64,
+	partition_count: usize,
+) -> Result<Vec<u64>, ExecutionError> {
+	if partition_count == 0 {
+		return Err(ExecutionError::Kernel {
+			message: "streamed inner build partition count must be positive".to_string(),
+		});
+	}
+	let partition_count_u64 =
+		u64::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition count exceeds u64".to_string(),
+		})?;
+	let base = total_bytes / partition_count_u64;
+	let remainder = total_bytes % partition_count_u64;
+	let mut bytes = vec![base; partition_count];
+	for slot in bytes.iter_mut().take(
+		usize::try_from(remainder)
+			.unwrap_or(usize::MAX)
+			.min(partition_count),
+	) {
+		*slot = slot.saturating_add(1);
+	}
+	Ok(bytes)
+}
+
+fn max_partition_group_spill_bytes(
+	partition_spill_bytes: &[u64],
+	group_count: u32,
+) -> Result<u64, ExecutionError> {
+	let partition_count =
+		u32::try_from(partition_spill_bytes.len()).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition count exceeds u32".to_string(),
+		})?;
+	if partition_count == 0 {
+		return Err(ExecutionError::Kernel {
+			message: "streamed inner build partition count must be positive".to_string(),
+		});
+	}
+	let mut max_group = 0u64;
+	for group in 0..group_count {
+		let range = partition_group_bounds(partition_count, group_count, group)?;
+		let group_bytes = partition_spill_bytes[range]
+			.iter()
+			.fold(0u64, |acc, bytes| acc.saturating_add(*bytes));
+		max_group = max_group.max(group_bytes);
+	}
+	Ok(max_group)
+}
+
+fn streamed_inner_build_group_count_for_partition_spill_bytes(
+	partition_spill_bytes: &[u64],
+	spill_budget: u64,
+) -> Result<(u32, u64), ExecutionError> {
+	let partition_count =
+		u32::try_from(partition_spill_bytes.len()).map_err(|_| ExecutionError::Kernel {
+			message: "streamed inner build partition count exceeds u32".to_string(),
+		})?;
+	if partition_count == 0 {
+		return Err(ExecutionError::Kernel {
+			message: "streamed inner build partition count must be positive".to_string(),
+		});
+	}
+	let group_spill_budget = streamed_inner_build_group_spill_budget(spill_budget);
+	let total_spill = partition_spill_bytes
+		.iter()
+		.fold(0u64, |acc, bytes| acc.saturating_add(*bytes));
+	let target_groups = ceil_div_u64(total_spill, group_spill_budget)
+		.max(1)
+		.min(u64::from(partition_count));
+	let mut group_count = u32::try_from(target_groups).map_err(|_| ExecutionError::Kernel {
+		message: "streamed inner build group count exceeds u32".to_string(),
+	})?;
+	if partition_count > 1 {
+		group_count = group_count.max(2).min(partition_count);
+	}
+	loop {
+		let max_group = max_partition_group_spill_bytes(partition_spill_bytes, group_count)?;
+		if max_group <= group_spill_budget {
+			return Ok((group_count, max_group));
+		}
+		if group_count >= partition_count {
+			return Err(budget_exhausted(
+				BudgetDimension::SpillBytes,
+				"streamed inner join build partition group sizing",
+				max_group,
+				group_spill_budget,
+			));
+		}
+		group_count = group_count.saturating_add(1).min(partition_count);
+	}
+}
+
+fn next_streamed_inner_build_partition_count(partition_count: u32) -> Option<u32> {
+	if partition_count >= STREAMED_INNER_BUILD_MAX_PARTITIONS {
+		return None;
+	}
+	Some(
+		partition_count
+			.saturating_mul(2)
+			.max(1)
+			.min(STREAMED_INNER_BUILD_MAX_PARTITIONS),
+	)
+}
+
+fn choose_materialized_inner_build_partitioning(
+	estimated_build_bytes: u64,
+	memory_cap: u64,
+	spill_budget: u64,
+	build_batches: &[RecordBatch],
+	build_keys: &[crate::ir::ColumnOrdinal],
+	null_safe_keys: bool,
+) -> Result<(u32, u32, u64), ExecutionError> {
+	let mut partition_count =
+		streamed_inner_build_partition_count(estimated_build_bytes, memory_cap, spill_budget)?;
+	loop {
+		let partition_bytes = estimate_materialized_inner_build_partition_bytes(
+			build_batches,
+			build_keys,
+			partition_count,
+			null_safe_keys,
+		)?;
+		match streamed_inner_build_group_count_for_partition_spill_bytes(
+			&partition_bytes,
+			spill_budget,
+		) {
+			Ok((group_count, max_group_spill)) => {
+				return Ok((partition_count, group_count, max_group_spill));
+			}
+			Err(error) => {
+				let Some(next_partition_count) =
+					next_streamed_inner_build_partition_count(partition_count)
+				else {
+					return Err(error);
+				};
+				if next_partition_count == partition_count {
+					return Err(error);
+				}
+				partition_count = next_partition_count;
+			}
+		}
+	}
 }
 
 fn partition_count_for_target_bytes(
@@ -2926,19 +3134,20 @@ impl Executor {
 		if estimated_build_bytes <= self.context.task_budget.memory.get() {
 			return Ok(None);
 		}
-		let partition_count = streamed_inner_build_partition_count(
-			estimated_build_bytes,
-			self.context.task_budget.memory.get(),
-			self.context.task_budget.spill_bytes.get(),
-		)?;
+		let (partition_count, group_count, _max_group_spill) = self
+			.choose_streaming_scan_inner_build_partitioning(
+				estimated_build_bytes,
+				build_scan_input,
+				None,
+				build_keys,
+				build_keys,
+				null_safe_keys,
+				morsel,
+			)
+			.await?;
 		if partition_count <= 1 {
 			return Ok(None);
 		}
-		let group_count = streamed_inner_build_group_count(
-			estimated_build_bytes,
-			self.context.task_budget.spill_bytes.get(),
-			partition_count,
-		)?;
 		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
 			&build_plan.schema(),
 			build_keys,
@@ -3118,19 +3327,18 @@ impl Executor {
 		if estimated_build_bytes <= self.context.task_budget.memory.get() {
 			return Ok(None);
 		}
-		let partition_count = streamed_inner_build_partition_count(
-			estimated_build_bytes,
-			self.context.task_budget.memory.get(),
-			self.context.task_budget.spill_bytes.get(),
-		)?;
+		let (partition_count, group_count, _max_group_spill) =
+			choose_materialized_inner_build_partitioning(
+				estimated_build_bytes,
+				self.context.task_budget.memory.get(),
+				self.context.task_budget.spill_bytes.get(),
+				build_batches,
+				build_keys,
+				null_safe_keys,
+			)?;
 		if partition_count <= 1 {
 			return Ok(None);
 		}
-		let group_count = streamed_inner_build_group_count(
-			estimated_build_bytes,
-			self.context.task_budget.spill_bytes.get(),
-			partition_count,
-		)?;
 		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
 			&build_schema,
 			build_keys,
@@ -3164,6 +3372,8 @@ impl Executor {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		let group_count = group_count.max(1).min(partition_count);
+		let group_spill_budget =
+			streamed_inner_build_group_spill_budget(self.context.task_budget.spill_bytes.get());
 		let mut total_build_rows = 0u64;
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
@@ -3219,13 +3429,13 @@ impl Executor {
 						.await?;
 					group_spill_bytes = group_spill_bytes
 						.saturating_add(spilled.spill_bytes().saturating_sub(before));
-					if group_spill_bytes > self.context.task_budget.spill_bytes.get() {
+					if group_spill_bytes > group_spill_budget {
 						Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 						return Err(budget_exhausted(
 							BudgetDimension::SpillBytes,
 							"streamed inner join build partition group spill writer",
 							group_spill_bytes,
-							self.context.task_budget.spill_bytes.get(),
+							group_spill_budget,
 						));
 					}
 				}
@@ -3369,19 +3579,18 @@ impl Executor {
 		if estimated_build_bytes <= self.context.task_budget.memory.get() {
 			return Ok(None);
 		}
-		let partition_count = streamed_inner_build_partition_count(
-			estimated_build_bytes,
-			self.context.task_budget.memory.get(),
-			self.context.task_budget.spill_bytes.get(),
-		)?;
+		let (partition_count, group_count, _max_group_spill) =
+			choose_materialized_inner_build_partitioning(
+				estimated_build_bytes,
+				self.context.task_budget.memory.get(),
+				self.context.task_budget.spill_bytes.get(),
+				build_batches,
+				build_keys,
+				null_safe_keys,
+			)?;
 		if partition_count <= 1 {
 			return Ok(None);
 		}
-		let group_count = streamed_inner_build_group_count(
-			estimated_build_bytes,
-			self.context.task_budget.spill_bytes.get(),
-			partition_count,
-		)?;
 		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
 			&build_plan.schema(),
 			build_keys,
@@ -3408,6 +3617,8 @@ impl Executor {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		let group_count = group_count.max(1).min(partition_count);
+		let group_spill_budget =
+			streamed_inner_build_group_spill_budget(self.context.task_budget.spill_bytes.get());
 		let mut total_build_rows = 0u64;
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
@@ -3463,13 +3674,13 @@ impl Executor {
 						.await?;
 					group_spill_bytes = group_spill_bytes
 						.saturating_add(spilled.spill_bytes().saturating_sub(before));
-					if group_spill_bytes > self.context.task_budget.spill_bytes.get() {
+					if group_spill_bytes > group_spill_budget {
 						Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 						return Err(budget_exhausted(
 							BudgetDimension::SpillBytes,
 							"streamed inner join build partition group spill writer",
 							group_spill_bytes,
-							self.context.task_budget.spill_bytes.get(),
+							group_spill_budget,
 						));
 					}
 				}
@@ -3914,12 +4125,14 @@ impl Executor {
 			}
 			*total_spill_bytes =
 				total_spill_bytes.saturating_add(spilled.spill_bytes().saturating_sub(before));
-			if *total_spill_bytes > self.context.task_budget.spill_bytes.get() {
+			let group_spill_budget =
+				streamed_inner_build_group_spill_budget(self.context.task_budget.spill_bytes.get());
+			if *total_spill_bytes > group_spill_budget {
 				return Err(budget_exhausted(
 					BudgetDimension::SpillBytes,
 					"partitioned streamed inner join build spill writer",
 					*total_spill_bytes,
-					self.context.task_budget.spill_bytes.get(),
+					group_spill_budget,
 				));
 			}
 		}
@@ -3981,6 +4194,124 @@ impl Executor {
 			}
 		}
 		Ok(estimated)
+	}
+
+	async fn estimate_streaming_scan_inner_build_partition_bytes(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		partition_build_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		partition_count: u32,
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<u64>, ExecutionError> {
+		let partition_count_usize =
+			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+				message: "streamed inner build partition count exceeds usize".to_string(),
+			})?;
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming scan build expected a scan input".to_string(),
+			});
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let mut partition_bytes = vec![0u64; partition_count_usize];
+		while let Some(batch) = stream.next().await {
+			let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			if let Some(exchange) = scan_input.exchange {
+				for (_, partitioned) in
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
+				{
+					add_streaming_scan_build_partition_byte_estimates(
+						&mut partition_bytes,
+						&partitioned,
+						retained_columns,
+						partition_build_keys,
+						write_build_keys,
+						partition_count,
+						null_safe_keys,
+					)?;
+				}
+			} else {
+				add_streaming_scan_build_partition_byte_estimates(
+					&mut partition_bytes,
+					&batch,
+					retained_columns,
+					partition_build_keys,
+					write_build_keys,
+					partition_count,
+					null_safe_keys,
+				)?;
+			}
+		}
+		Ok(partition_bytes)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn choose_streaming_scan_inner_build_partitioning(
+		&self,
+		estimated_build_bytes: u64,
+		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		partition_build_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(u32, u32, u64), ExecutionError> {
+		let mut partition_count = streamed_inner_build_partition_count(
+			estimated_build_bytes,
+			self.context.task_budget.memory.get(),
+			self.context.task_budget.spill_bytes.get(),
+		)?;
+		loop {
+			let partition_bytes = self
+				.estimate_streaming_scan_inner_build_partition_bytes(
+					scan_input,
+					retained_columns,
+					partition_build_keys,
+					write_build_keys,
+					partition_count,
+					null_safe_keys,
+					morsel,
+				)
+				.await?;
+			match streamed_inner_build_group_count_for_partition_spill_bytes(
+				&partition_bytes,
+				self.context.task_budget.spill_bytes.get(),
+			) {
+				Ok((group_count, max_group_spill)) => {
+					return Ok((partition_count, group_count, max_group_spill));
+				}
+				Err(error) => {
+					let Some(next_partition_count) =
+						next_streamed_inner_build_partition_count(partition_count)
+					else {
+						return Err(error);
+					};
+					if next_partition_count == partition_count {
+						return Err(error);
+					}
+					partition_count = next_partition_count;
+				}
+			}
+		}
 	}
 
 	async fn estimate_streaming_scan_output_bytes(
@@ -7661,16 +7992,17 @@ impl Executor {
 					morsel,
 				)
 				.await?;
-			let partition_count = streamed_inner_build_partition_count(
-				estimated_build_bytes,
-				self.context.task_budget.memory.get(),
-				self.context.task_budget.spill_bytes.get(),
-			)?;
-			let group_count = streamed_inner_build_group_count(
-				estimated_build_bytes,
-				self.context.task_budget.spill_bytes.get(),
-				partition_count,
-			)?;
+			let (partition_count, group_count, _max_group_spill) = self
+				.choose_streaming_scan_inner_build_partitioning(
+					estimated_build_bytes,
+					scan_input,
+					retained_columns,
+					&stage.build_keys,
+					write_build_keys,
+					false,
+					morsel,
+				)
+				.await?;
 			if partition_count > 1 {
 				let partition_count_usize =
 					usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -10212,7 +10544,8 @@ mod tests {
 					.lock()
 					.expect("requested tables")
 					.as_slice(),
-				&[TableId(3), TableId(3), TableId(3)]
+				&[TableId(3), TableId(3), TableId(3), TableId(3)],
+				"streamed scan build reads once for total estimation, once for per-partition spill sizing, once for the live group, and once for the materialized comparison path"
 			);
 
 			streamed_runtime.cleanup().await;
@@ -10406,6 +10739,63 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn streamed_inner_build_group_count_uses_max_group_spill_not_average() {
+		let spill_budget = 1024;
+		let group_spill_budget = streamed_inner_build_group_spill_budget(spill_budget);
+		let overhead_reserve = streamed_inner_build_group_overhead_reserve_bytes(spill_budget);
+		assert_eq!(group_spill_budget, 768);
+		assert_eq!(overhead_reserve, 256);
+
+		let partition_bytes = vec![400, 400, 10, 10];
+		assert!(
+			partition_bytes.iter().sum::<u64>() / 2 <= group_spill_budget,
+			"average two-group sizing would look safe"
+		);
+		assert!(
+			max_partition_group_spill_bytes(&partition_bytes, 2).expect("two groups")
+				> group_spill_budget,
+			"but the max active group is not safe"
+		);
+
+		let (group_count, max_group_spill) =
+			streamed_inner_build_group_count_for_partition_spill_bytes(
+				&partition_bytes,
+				spill_budget,
+			)
+			.expect("max-bounded group count");
+		assert_eq!(group_count, 3);
+		assert_eq!(max_group_spill, 400);
+		assert!(max_group_spill <= group_spill_budget);
+	}
+
+	#[test]
+	fn streamed_inner_build_group_count_names_skew_floor_when_single_partition_exceeds_budget() {
+		let spill_budget = 1024;
+		let group_spill_budget = streamed_inner_build_group_spill_budget(spill_budget);
+		let partition_bytes = vec![group_spill_budget + 1, 1, 1, 1];
+		let error = streamed_inner_build_group_count_for_partition_spill_bytes(
+			&partition_bytes,
+			spill_budget,
+		)
+		.expect_err("hot partition must not be claimed bounded");
+
+		match error {
+			ExecutionError::BudgetExhausted {
+				dimension,
+				producer,
+				requested,
+				available,
+			} => {
+				assert_eq!(dimension, BudgetDimension::SpillBytes);
+				assert_eq!(producer, "streamed inner join build partition group sizing");
+				assert_eq!(requested.get(), group_spill_budget + 1);
+				assert_eq!(available.get(), group_spill_budget);
+			}
+			other => panic!("expected budget exhausted skew floor, got {other:?}"),
+		}
+	}
+
 	#[tokio::test]
 	async fn partitioned_reoriented_inner_runtime_matches_single_spill_projected_path() {
 		for value_kind in [StreamingValueKind::Float64, StreamingValueKind::Decimal] {
@@ -10549,7 +10939,7 @@ mod tests {
 				"partitioned streamed inner build must preserve the same rows and sparse schema restoration as the single-spill projected path"
 			);
 			let expected_scan_count =
-				1 + usize::try_from(group_count).expect("group count fits usize");
+				2 + usize::try_from(group_count).expect("group count fits usize");
 			let expected_tables = vec![TableId(5); expected_scan_count];
 			assert_eq!(
 				partitioned_requested_tables
@@ -10557,7 +10947,7 @@ mod tests {
 					.expect("partitioned requested tables")
 					.as_slice(),
 				expected_tables.as_slice(),
-				"partitioned scan build should scan once for estimation and once per live partition group, not once per partition"
+				"partitioned scan build should scan once for total estimation, once for per-partition group sizing, and once per live partition group, not once per writer partition"
 			);
 
 			partitioned_runtime.cleanup().await;
