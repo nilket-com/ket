@@ -2569,6 +2569,7 @@ where
 {
 	let mut probe_rows = 0u64;
 	let mut output_rows = 0u64;
+	let _ = spilled.try_pin_decoded_pages(memory_cap).await?;
 	for batch in right_batches {
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
@@ -2588,15 +2589,15 @@ where
 					});
 				}
 			}
+			let page_map = streaming::load_streamed_inner_match_pages(spilled, &matches).await?;
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 				let batch = materialize_streamed_spilled_inner_matches(
-					spilled,
+					&page_map,
 					&probe_chunk,
 					chunk,
 					output_schema,
 					memory_cap,
-				)
-				.await?;
+				)?;
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
 			}
@@ -2980,8 +2981,8 @@ pub(super) async fn materialize_streamed_spilled_left_outer_unmatched(
 	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
 }
 
-pub(super) async fn materialize_streamed_spilled_inner_matches(
-	spilled: &mut SpilledInnerJoinBuild,
+pub(super) fn materialize_streamed_spilled_inner_matches(
+	page_map: &BTreeMap<usize, RecordBatch>,
 	probe_batch: &RecordBatch,
 	matches: &[SpilledInnerJoinMatch],
 	output_schema: &arrow::datatypes::SchemaRef,
@@ -3004,7 +3005,11 @@ pub(super) async fn materialize_streamed_spilled_inner_matches(
 	}
 	let mut build_pages = Vec::with_capacity(page_sources.len());
 	for page_index in page_indices {
-		build_pages.push(spilled.read_batch_page(page_index).await?);
+		build_pages.push(page_map.get(&page_index).cloned().ok_or_else(|| {
+			ExecutionError::Kernel {
+				message: format!("streamed inner join missing preloaded spilled page {page_index}"),
+			}
+		})?);
 	}
 
 	let estimated_output_bytes = join_take_index_bytes(matches.len())

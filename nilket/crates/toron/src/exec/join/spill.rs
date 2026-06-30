@@ -436,6 +436,9 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	lru: VecDeque<usize>,
 	cache_bytes: u64,
 	cache_cap: u64,
+	pinned_decoded_pages: Option<Vec<RecordBatch>>,
+	pinned_decoded_bytes: u64,
+	pin_decoded_attempted: bool,
 	spill_bytes: u64,
 	writer_peak: u64,
 	rows: u64,
@@ -515,6 +518,9 @@ impl SpilledInnerJoinBuild {
 			lru: VecDeque::new(),
 			cache_bytes: 0,
 			cache_cap,
+			pinned_decoded_pages: None,
+			pinned_decoded_bytes: 0,
+			pin_decoded_attempted: false,
 			spill_bytes: 0,
 			writer_peak: 0,
 			rows: 0,
@@ -853,6 +859,51 @@ impl SpilledInnerJoinBuild {
 		Ok(pages)
 	}
 
+	pub(in crate::exec) async fn try_pin_decoded_pages(
+		&mut self,
+		memory_cap: u64,
+	) -> Result<bool, ExecutionError> {
+		if self.pinned_decoded_pages.is_some() {
+			return Ok(true);
+		}
+		if self.pin_decoded_attempted {
+			return Ok(false);
+		}
+		self.pin_decoded_attempted = true;
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let estimated_resident = self
+			.resident_index_bytes
+			.saturating_add(self.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+			.saturating_add(self.loaded_page_bytes_estimate());
+		if estimated_resident > cap {
+			return Ok(false);
+		}
+
+		let mut pages = Vec::with_capacity(self.pages.len());
+		let mut decoded_bytes = 0u64;
+		for page_index in 0..self.pages.len() {
+			let batch = self.read_batch_page(page_index).await?;
+			decoded_bytes = decoded_bytes.saturating_add(record_batch_memory_bytes(&batch));
+			let resident = self
+				.resident_index_bytes
+				.saturating_add(self.writer_peak)
+				.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+				.saturating_add(decoded_bytes);
+			if resident > cap {
+				return Ok(false);
+			}
+			pages.push(batch);
+		}
+		self.cache.clear();
+		self.lru.clear();
+		self.cache_bytes = 0;
+		self.pinned_decoded_bytes = decoded_bytes;
+		self.pinned_decoded_pages = Some(pages);
+		self.guard_resident_state(memory_cap)?;
+		Ok(true)
+	}
+
 	pub(in crate::exec) fn release_write_scratch(&mut self) {
 		self.scratch_plaintext = Vec::new();
 		self.scratch_refs = Vec::new();
@@ -880,7 +931,8 @@ impl SpilledInnerJoinBuild {
 		let resident = self
 			.resident_index_bytes
 			.saturating_add(self.writer_peak)
-			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+			.saturating_add(self.pinned_decoded_bytes);
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
 		if resident > cap {
 			return Err(budget_exhausted(
@@ -950,6 +1002,14 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		page_index: usize,
 	) -> Result<RecordBatch, ExecutionError> {
+		if let Some(batch) = self
+			.pinned_decoded_pages
+			.as_ref()
+			.and_then(|pages| pages.get(page_index))
+			.cloned()
+		{
+			return Ok(batch);
+		}
 		if let Some(batch) = self
 			.cache
 			.get(&page_index)
