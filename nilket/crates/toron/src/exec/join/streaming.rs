@@ -38,7 +38,7 @@ enum ReorientedStageScanBuildDecision {
 pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 	InMemory {
 		batch: RecordBatch,
-		rows: HashMap<JoinKey, BuildRowList>,
+		rows: JoinBuildRows,
 	},
 	Spilled {
 		build: SpilledInnerJoinBuild,
@@ -85,7 +85,7 @@ pub(in crate::exec) struct StreamingSemiAntiStage<'a> {
 pub(in crate::exec) enum StreamingSemiAntiExistence {
 	InMemory {
 		batch: RecordBatch,
-		rows: HashMap<JoinKey, BuildRowList>,
+		rows: JoinBuildRows,
 	},
 	Spilled(SpilledSemiAntiExistenceBuild),
 }
@@ -120,7 +120,7 @@ pub(in crate::exec) struct StreamingLeftOuterRecombineRuntime<'a> {
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
 	scalar_batch: RecordBatch,
-	scalar_rows: HashMap<JoinKey, BuildRowList>,
+	scalar_rows: JoinBuildRows,
 	key_plan: JoinKeyPlan,
 	preserved_keys: Vec<crate::ir::ColumnOrdinal>,
 	match_filter: Option<&'a BoundExprProgram>,
@@ -4886,7 +4886,7 @@ impl Executor {
 	async fn visit_streaming_in_memory_inner_scan_probe_chunks<F>(
 		&self,
 		build_batch: &RecordBatch,
-		build_rows: &HashMap<JoinKey, BuildRowList>,
+		build_rows: &JoinBuildRows,
 		join_key_plan: JoinKeyPlan,
 		scan_input: StreamingScanProbeInput<'_>,
 		probe_keys: &[crate::ir::ColumnOrdinal],
@@ -6013,7 +6013,7 @@ impl Executor {
 		&self,
 		scan_input: StreamingScanProbeInput<'_>,
 		left_batch: &RecordBatch,
-		build_rows: &HashMap<JoinKey, BuildRowList>,
+		build_rows: &JoinBuildRows,
 		matched_build_rows: &mut [u64],
 		join_key_plan: JoinKeyPlan,
 		right_keys: &[crate::ir::ColumnOrdinal],
@@ -6115,7 +6115,7 @@ impl Executor {
 		&self,
 		left_batch: &RecordBatch,
 		right_batch: &RecordBatch,
-		build_rows: &HashMap<JoinKey, BuildRowList>,
+		build_rows: &JoinBuildRows,
 		matched_build_rows: &mut [u64],
 		join_key_plan: JoinKeyPlan,
 		right_keys: &[crate::ir::ColumnOrdinal],
@@ -9429,7 +9429,7 @@ impl Executor {
 		output_schema: &SchemaRef,
 		probe_columns_first: bool,
 		build_batch: &RecordBatch,
-		build_rows: &HashMap<JoinKey, BuildRowList>,
+		build_rows: &JoinBuildRows,
 		probe_batch: &RecordBatch,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
 		if probe_batch.num_rows() == 0 {
@@ -9471,7 +9471,7 @@ fn matching_preserved_rows_in_memory(
 	preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
 	match_filter: Option<&BoundExprProgram>,
 	existence_batch: &RecordBatch,
-	existence_rows: &HashMap<JoinKey, BuildRowList>,
+	existence_rows: &JoinBuildRows,
 ) -> Result<Vec<bool>, ExecutionError> {
 	let mut matched = vec![false; preserved_batch.num_rows()];
 	let mut residual = JoinMatchResidual::new(match_filter, preserved_batch, existence_batch);

@@ -7,7 +7,7 @@ mod spill;
 mod streaming;
 
 pub(in crate::exec) use self::build_profile::record_join_build_profile;
-pub(super) use self::build_rows::BuildRowList;
+pub(super) use self::build_rows::{BuildRowList, JoinBuildRows, new_join_build_rows};
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 pub(in crate::exec) use self::spill::SpilledInnerJoinBuild;
 pub(in crate::exec) use self::spill::{
@@ -1277,8 +1277,8 @@ pub(super) fn build_in_memory_join_rows(
 	rows: usize,
 	memory_cap: u64,
 	null_safe_keys: bool,
-) -> Result<Option<HashMap<JoinKey, BuildRowList>>, ExecutionError> {
-	let mut build_rows = HashMap::with_capacity(rows);
+) -> Result<Option<JoinBuildRows>, ExecutionError> {
+	let mut build_rows = new_join_build_rows(rows);
 	let mut inserted_rows = 0usize;
 
 	match join_key_plan {
@@ -1357,7 +1357,7 @@ pub(super) fn build_in_memory_join_rows(
 pub(super) fn probe_in_memory_join_rows(
 	kind: JoinKind,
 	join_key_plan: JoinKeyPlan,
-	build_rows: &HashMap<JoinKey, BuildRowList>,
+	build_rows: &JoinBuildRows,
 	left_rows: usize,
 	right_key_arrays: &[ArrayRef],
 	rows: usize,
@@ -1475,11 +1475,7 @@ pub(super) fn single_join_key_array<'a, T: 'static>(
 }
 
 #[inline(always)]
-pub(super) fn insert_join_build_row(
-	build_rows: &mut HashMap<JoinKey, BuildRowList>,
-	key: JoinKey,
-	row: u32,
-) {
+pub(super) fn insert_join_build_row(build_rows: &mut JoinBuildRows, key: JoinKey, row: u32) {
 	match build_rows.entry(key) {
 		Entry::Occupied(mut entry) => entry.get_mut().push(row),
 		Entry::Vacant(entry) => {

@@ -1,9 +1,27 @@
+use std::collections::HashMap;
+
+use ahash::RandomState;
+
+use super::JoinKey;
+
 #[derive(Debug, Clone)]
 pub(in crate::exec) struct BuildRowList {
 	first: u32,
 	overflow: BuildRowOverflow,
 }
 
+pub(in crate::exec) fn new_join_build_rows(capacity: usize) -> JoinBuildRows {
+	HashMap::with_capacity_and_hasher(capacity, RandomState::new())
+}
+
+// Executor-internal join maps are private, per-task structures, but their keys still come from
+// table data. Use a per-map keyed fast hasher here rather than a fixed hash function.
+// The random hash seed is safe for determinism: join output is emitted in probe-row order,
+// never by iterating the build map.
+pub(in crate::exec) type JoinBuildRows = HashMap<JoinKey, BuildRowList, RandomState>;
+
+// The common TPC-H duplicate-key shape has up to six rows after the first row; keeping that
+// overflow inline avoids per-key heap churn while preserving a small fixed row-list footprint.
 const BUILD_ROW_INLINE_OVERFLOW_CAP: usize = 6;
 
 #[derive(Debug, Clone)]
@@ -133,18 +151,18 @@ impl Iterator for BuildRowListRows<'_> {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
 	use std::sync::Arc;
 
 	use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 
 	use crate::exec::join::{
 		JoinKey, JoinKeyPlan, build_in_memory_join_rows, insert_join_build_row, join_key_bytes,
+		new_join_build_rows,
 	};
 
 	#[test]
 	fn join_build_row_list_stores_unique_row_inline() {
-		let mut rows = HashMap::new();
+		let mut rows = new_join_build_rows(0);
 
 		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
 
@@ -155,7 +173,7 @@ mod tests {
 
 	#[test]
 	fn join_build_row_list_allocates_overflow_for_duplicates() {
-		let mut rows = HashMap::new();
+		let mut rows = new_join_build_rows(0);
 
 		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
 		insert_join_build_row(&mut rows, JoinKey::Int64(7), 12);

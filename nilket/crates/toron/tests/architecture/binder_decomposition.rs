@@ -251,6 +251,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/window_test.rs",
 				// ADR 305: SUBSTRING is a bound expression node and must explicitly decline PBC.
 				"crates/toron/src/pbc.rs",
+				// ADR 399: executor-internal join build maps use a private keyed fast hasher.
+				"crates/toron/Cargo.toml",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

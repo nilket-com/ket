@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
-use crate::exec::join::{BuildRowList, JoinKey, JoinKeyPlan};
+use crate::exec::join::{BuildRowList, JoinBuildRows, JoinKeyPlan};
 use crate::ir::{JoinReplayId, JoinStrategy};
 
 fn join_build_profile_enabled() -> bool {
@@ -15,7 +14,7 @@ pub(in crate::exec) fn record_join_build_profile(
 	replay_id: JoinReplayId,
 	strategy: JoinStrategy,
 	key_plan: JoinKeyPlan,
-	build_rows: &HashMap<JoinKey, BuildRowList>,
+	build_rows: &JoinBuildRows,
 	build_micros: u64,
 ) {
 	if !join_build_profile_enabled() {

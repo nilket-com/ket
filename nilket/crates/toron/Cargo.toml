@@ -31,6 +31,7 @@ blake3 = "1.5"
 rune = "0.14"
 sqlparser = "0.62"
 rand = "0.10"
+ahash = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
