@@ -203,6 +203,11 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec.rs",
 				// ADR 350: semantic executor decomposition moves join substrate out of exec.rs.
 				"crates/toron/src/exec/join.rs",
+				// ADR 396: join build row storage and env-gated build profiling live under the
+				// existing join executor substrate.
+				"crates/toron/src/exec/join/build_profile.rs",
+				"crates/toron/src/exec/join/build_rows.rs",
+				"crates/toron/src/exec/join/columns.rs",
 				// ADR 351: join spill storage submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/spill.rs",
 				// ADR 352: join streaming orchestration submodule inside the semantic executor split.

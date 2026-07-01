@@ -8234,6 +8234,7 @@ impl Executor {
 				build_memory_cap,
 			));
 		}
+		let build_started = Instant::now();
 		let Some(build_rows) = build_in_memory_join_rows(
 			key_plan,
 			&build_key_arrays,
@@ -8249,12 +8250,22 @@ impl Executor {
 				build_memory_cap,
 			));
 		};
+		let build_micros = duration_micros(build_started);
 		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.build_micros = task.phases.build_micros.saturating_add(build_micros);
 			task.counters.build_rows = task
 				.counters
 				.build_rows
 				.saturating_add(build_batch.num_rows() as u64);
 		});
+		record_join_build_profile(
+			&self.context.task_telemetry,
+			stage.replay_id,
+			stage.strategy,
+			key_plan,
+			&build_rows,
+			build_micros,
+		);
 		Ok(Some(ReorientedInnerJoinRuntime {
 			replay_id: stage.replay_id,
 			strategy: stage.strategy,

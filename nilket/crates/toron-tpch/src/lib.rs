@@ -35,7 +35,7 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::ByteCount;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::task::{RowCount, TaskTelemetry};
+use toron::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{ExecutionPlan, JoinKind, LogicalPlan, TableId, decimal_division_output_type};
@@ -3180,6 +3180,7 @@ pub struct RuneQ03ProfileLoopSummary {
 	pub spill_bytes_max: u64,
 	pub output_row_count: u64,
 	pub output_schema_fingerprint: Option<String>,
+	pub join_build_profiles: Vec<JoinBuildProfile>,
 }
 
 struct ProfileLoopIteration {
@@ -3187,6 +3188,7 @@ struct ProfileLoopIteration {
 	spill_bytes: u64,
 	output_row_count: u64,
 	output_schema_fingerprint: Option<String>,
+	join_build_profiles: Vec<JoinBuildProfile>,
 }
 
 pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3IsolationProof, String> {
@@ -3279,6 +3281,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 	let mut spill_bytes_max = warmup.spill_bytes;
 	let mut output_row_count = warmup.output_row_count;
 	let mut output_schema_fingerprint = warmup.output_schema_fingerprint.clone();
+	let mut join_build_profiles = warmup.join_build_profiles.clone();
 	for _ in 0..iterations {
 		let iteration = execute_bound_profile_iteration(&bound, storage.clone())
 			.await
@@ -3291,6 +3294,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 		spill_bytes_max = spill_bytes_max.max(iteration.spill_bytes);
 		output_row_count = iteration.output_row_count;
 		output_schema_fingerprint = iteration.output_schema_fingerprint.clone();
+		join_build_profiles = iteration.join_build_profiles.clone();
 		iteration_execute_ms.push(iteration.execute_ms);
 	}
 	let loop_execute_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
@@ -3305,6 +3309,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 		spill_bytes_max,
 		output_row_count,
 		output_schema_fingerprint,
+		join_build_profiles,
 	})
 }
 
@@ -3320,16 +3325,16 @@ async fn execute_bound_profile_iteration(
 		.await
 		.map_err(|error| StageError::from_debug(Phase::Execute, error))?;
 	let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
-	let spill_bytes = task_telemetry
-		.lock()
-		.expect("task telemetry lock")
-		.counters
-		.spill_bytes;
+	let telemetry = task_telemetry.lock().expect("task telemetry lock");
+	let spill_bytes = telemetry.counters.spill_bytes;
+	let join_build_profiles = telemetry.join_build_profiles.clone();
+	drop(telemetry);
 	Ok(ProfileLoopIteration {
 		execute_ms,
 		spill_bytes,
 		output_row_count: output_row_count(&batches),
 		output_schema_fingerprint: output_schema_fingerprint(&batches),
+		join_build_profiles,
 	})
 }
 

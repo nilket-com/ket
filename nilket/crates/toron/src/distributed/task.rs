@@ -81,6 +81,8 @@ pub struct TaskTelemetry {
 	pub counters: TaskTelemetryCounters,
 	pub phases: TaskTelemetryPhases,
 	pub join_observations: Vec<JoinRuntimeObservation>,
+	#[serde(default)]
+	pub join_build_profiles: Vec<JoinBuildProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +92,21 @@ pub struct JoinRuntimeObservation {
 	pub build_rows: RowCount,
 	pub probe_rows: RowCount,
 	pub output_rows: RowCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinBuildProfile {
+	pub replay_id: JoinReplayId,
+	pub strategy: JoinStrategy,
+	pub key_plan: String,
+	pub build_rows: RowCount,
+	pub unique_keys: RowCount,
+	pub duplicate_keys: RowCount,
+	pub overflow_rows: RowCount,
+	pub max_rows_per_key: RowCount,
+	pub row_list_value_bytes: u64,
+	pub overflow_heap_capacity_bytes: u64,
+	pub build_micros: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -5781,43 +5781,6 @@ mod tests {
 	}
 
 	#[test]
-	fn join_build_row_list_stores_unique_row_inline() {
-		let mut rows = HashMap::new();
-
-		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
-
-		let stored = rows.get(&JoinKey::Int64(7)).expect("row list");
-		assert_eq!(stored.rows().collect::<Vec<_>>(), vec![11]);
-		assert_eq!(stored.overflow_len(), 0);
-	}
-
-	#[test]
-	fn join_build_row_list_allocates_overflow_for_duplicates() {
-		let mut rows = HashMap::new();
-
-		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
-		insert_join_build_row(&mut rows, JoinKey::Int64(7), 12);
-		insert_join_build_row(&mut rows, JoinKey::Int64(7), 13);
-
-		let stored = rows.get(&JoinKey::Int64(7)).expect("row list");
-		assert_eq!(stored.rows().collect::<Vec<_>>(), vec![11, 12, 13]);
-		assert_eq!(stored.overflow_len(), 2);
-	}
-
-	#[test]
-	fn join_build_hash_map_preallocates_for_input_rows() {
-		let key_arrays =
-			vec![Arc::new(Int64Array::from((0_i64..32).collect::<Vec<_>>())) as ArrayRef];
-
-		let rows = build_in_memory_join_rows(JoinKeyPlan::Int64, &key_arrays, 32, u64::MAX, false)
-			.expect("build rows")
-			.expect("in memory rows");
-
-		assert!(rows.capacity() >= 32);
-		assert!(rows.values().all(|list| list.overflow_len() == 0));
-	}
-
-	#[test]
 	fn join_key_plan_uses_actual_child_output_array_type() {
 		let left = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef];
 		let right = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef];

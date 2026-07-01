@@ -1,8 +1,14 @@
 use super::*;
 
+mod build_profile;
+mod build_rows;
+mod columns;
 mod spill;
 mod streaming;
 
+pub(in crate::exec) use self::build_profile::record_join_build_profile;
+pub(super) use self::build_rows::BuildRowList;
+pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 pub(in crate::exec) use self::spill::SpilledInnerJoinBuild;
 pub(in crate::exec) use self::spill::{
 	SpilledBatchRowRef, SpilledInnerJoinMatch, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
@@ -22,75 +28,6 @@ pub(super) const JOIN_OUTPUT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER: u64 = 16;
 /// retained bytes and the retained-input wall at 1,423,571,737; 16x the default task memory
 /// cap sits in that gap.
 pub(super) const JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER: u64 = 16;
-
-pub(super) fn collect_program_column_ordinals(
-	program: &BoundExprProgram,
-	columns: &mut BTreeSet<ColumnOrdinal>,
-) {
-	for root in &program.roots {
-		collect_program_node_column_ordinals(program, *root, columns);
-	}
-}
-
-pub(super) fn collect_program_node_column_ordinals(
-	program: &BoundExprProgram,
-	id: BoundExprId,
-	columns: &mut BTreeSet<ColumnOrdinal>,
-) {
-	match program.node(id) {
-		Some(BoundExprNode::Column(column)) => {
-			columns.insert(column.ordinal);
-		}
-		Some(BoundExprNode::Literal(_)) | Some(BoundExprNode::NullLiteral) | None => {}
-		Some(BoundExprNode::Cast { input, .. })
-		| Some(BoundExprNode::TryCast { input, .. })
-		| Some(BoundExprNode::Unary { input, .. })
-		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::Substring { input, .. })
-		| Some(BoundExprNode::TimeBucket { input, .. })
-		| Some(BoundExprNode::AtTimeZone { input, .. })
-		| Some(BoundExprNode::Extract { input, .. })
-		| Some(BoundExprNode::DateTrunc { input, .. }) => {
-			collect_program_node_column_ordinals(program, *input, columns);
-		}
-		Some(BoundExprNode::Binary { left, right, .. }) => {
-			collect_program_node_column_ordinals(program, *left, columns);
-			collect_program_node_column_ordinals(program, *right, columns);
-		}
-		Some(BoundExprNode::InList { expr, list, .. }) => {
-			collect_program_node_column_ordinals(program, *expr, columns);
-			for item in list {
-				collect_program_node_column_ordinals(program, *item, columns);
-			}
-		}
-		Some(BoundExprNode::Case {
-			when_then,
-			else_input,
-		}) => {
-			for (condition, result) in when_then {
-				collect_program_node_column_ordinals(program, *condition, columns);
-				collect_program_node_column_ordinals(program, *result, columns);
-			}
-			collect_program_node_column_ordinals(program, *else_input, columns);
-		}
-	}
-}
-
-pub(super) fn grouped_aggregate_input_columns(
-	group_expr: &BoundExprProgram,
-	aggr_expr: &[BoundAggregateCall],
-	exchange_key: &BoundExprProgram,
-	join_keys: &[ColumnOrdinal],
-) -> Vec<ColumnOrdinal> {
-	let mut columns = BTreeSet::new();
-	collect_program_column_ordinals(group_expr, &mut columns);
-	collect_program_column_ordinals(exchange_key, &mut columns);
-	for call in aggr_expr {
-		collect_program_column_ordinals(&call.args, &mut columns);
-	}
-	columns.extend(join_keys.iter().copied());
-	columns.into_iter().collect()
-}
 
 pub(super) fn grouped_aggregate_is_order_insensitive(aggr_expr: &[BoundAggregateCall]) -> bool {
 	aggr_expr.iter().all(|call| match call.function {
@@ -436,12 +373,18 @@ pub(super) async fn execute_hash_join(
 		}
 		return result;
 	};
+	let build_micros = duration_micros(build_started);
 	record_task_telemetry(&telemetry, |task| {
-		task.phases.build_micros = task
-			.phases
-			.build_micros
-			.saturating_add(duration_micros(build_started));
+		task.phases.build_micros = task.phases.build_micros.saturating_add(build_micros);
 	});
+	record_join_build_profile(
+		&telemetry,
+		replay_id,
+		strategy,
+		join_key_plan,
+		&build_rows,
+		build_micros,
+	);
 
 	let probe_started = Instant::now();
 	let selection = probe_in_memory_join_rows(
@@ -702,12 +645,18 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 		}
 		return result.map(|_| ());
 	};
+	let build_micros = duration_micros(build_started);
 	record_task_telemetry(&telemetry, |task| {
-		task.phases.build_micros = task
-			.phases
-			.build_micros
-			.saturating_add(duration_micros(build_started));
+		task.phases.build_micros = task.phases.build_micros.saturating_add(build_micros);
 	});
+	record_join_build_profile(
+		&telemetry,
+		replay_id,
+		strategy,
+		join_key_plan,
+		&build_rows,
+		build_micros,
+	);
 
 	let probe_started = Instant::now();
 	let selection = probe_in_memory_join_rows(
@@ -1191,34 +1140,6 @@ pub(super) enum JoinKey {
 	Generic(Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct BuildRowList {
-	first: u32,
-	overflow: Option<Vec<u32>>,
-}
-
-impl BuildRowList {
-	pub(super) fn new(first: u32) -> Self {
-		Self {
-			first,
-			overflow: None,
-		}
-	}
-
-	pub(super) fn push(&mut self, row: u32) {
-		self.overflow.get_or_insert_with(Vec::new).push(row);
-	}
-
-	pub(super) fn rows(&self) -> impl Iterator<Item = u32> + '_ {
-		std::iter::once(self.first).chain(self.overflow.iter().flatten().copied())
-	}
-
-	#[cfg(test)]
-	pub(super) fn overflow_len(&self) -> usize {
-		self.overflow.as_ref().map(Vec::len).unwrap_or(0)
-	}
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JoinKeyPlan {
 	Int32,
@@ -1227,6 +1148,14 @@ pub(super) enum JoinKeyPlan {
 }
 
 impl JoinKeyPlan {
+	pub(super) fn label(self) -> &'static str {
+		match self {
+			Self::Int32 => "int32",
+			Self::Int64 => "int64",
+			Self::Generic => "generic",
+		}
+	}
+
 	pub(super) fn from_key_arrays(
 		left_key_arrays: &[ArrayRef],
 		right_key_arrays: &[ArrayRef],
@@ -1545,6 +1474,7 @@ pub(super) fn single_join_key_array<'a, T: 'static>(
 		})
 }
 
+#[inline(always)]
 pub(super) fn insert_join_build_row(
 	build_rows: &mut HashMap<JoinKey, BuildRowList>,
 	key: JoinKey,
@@ -1783,6 +1713,7 @@ pub(super) fn join_probe_row_index(row: usize) -> Result<u32, ExecutionError> {
 	})
 }
 
+#[inline(always)]
 pub(super) fn join_build_memory_fits(
 	key_arrays: &[ArrayRef],
 	rows: usize,
