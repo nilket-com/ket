@@ -14,6 +14,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use arrow::array::{
@@ -26,6 +27,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use parquet::file::properties::WriterProperties;
+use serde::Serialize;
 use tpchgen::generators::{
 	CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
 	PartSuppGenerator, RegionGenerator, SupplierGenerator,
@@ -1365,6 +1367,74 @@ pub struct ParquetHarnessScan {
 	pub tables: HashMap<TableId, ParquetHarnessTableSource>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ParquetScanBatchLedger {
+	pub raw_rows: usize,
+	pub raw_columns: usize,
+	pub raw_bytes: usize,
+	pub inflated_bytes: Option<usize>,
+	pub output_rows: usize,
+	pub output_columns: usize,
+	pub output_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParquetScanLedger {
+	pub table_id: u64,
+	pub table_name: String,
+	pub full_column_count: usize,
+	pub requested_projected_columns: Option<Vec<u32>>,
+	pub pbc_predicate_bytes: Option<usize>,
+	pub pbc_referenced_columns: Vec<usize>,
+	pub parquet_read_columns: Option<Vec<usize>>,
+	pub output_column_count: usize,
+	pub inflated_to_full_schema: bool,
+	pub batches: Vec<ParquetScanBatchLedger>,
+}
+
+fn parquet_scan_ledger_enabled() -> bool {
+	static ENABLED: OnceLock<bool> = OnceLock::new();
+	*ENABLED.get_or_init(|| std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some())
+}
+
+fn parquet_scan_ledger_store() -> &'static Mutex<Vec<ParquetScanLedger>> {
+	static LEDGER: OnceLock<Mutex<Vec<ParquetScanLedger>>> = OnceLock::new();
+	LEDGER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn clear_parquet_scan_ledger() {
+	if parquet_scan_ledger_enabled() {
+		parquet_scan_ledger_store()
+			.lock()
+			.expect("parquet scan ledger lock")
+			.clear();
+	}
+}
+
+fn take_parquet_scan_ledger() -> Vec<ParquetScanLedger> {
+	if !parquet_scan_ledger_enabled() {
+		return Vec::new();
+	}
+	std::mem::take(
+		&mut *parquet_scan_ledger_store()
+			.lock()
+			.expect("parquet scan ledger lock"),
+	)
+}
+
+fn record_parquet_scan_ledger(ledger: ParquetScanLedger) {
+	if parquet_scan_ledger_enabled() {
+		parquet_scan_ledger_store()
+			.lock()
+			.expect("parquet scan ledger lock")
+			.push(ledger);
+	}
+}
+
+fn record_batch_bytes(batch: &RecordBatch) -> usize {
+	batch.get_array_memory_size()
+}
+
 fn append_projection_to_pbc(
 	bytecode: &mut Vec<u8>,
 	projected_columns: &[toron::ir::ColumnOrdinal],
@@ -1392,9 +1462,11 @@ impl StorageScan for ParquetHarnessScan {
 					table: request.table_id,
 				})?;
 
+		let table_id = request.table_id.0;
 		let projected_columns = request.projected_columns.clone();
 		let mut pbc = request.pbc_predicate.clone();
 		let full_column_count = source.schema.fields().len();
+		let mut pbc_referenced_columns = Vec::new();
 		let pbc_projection = if let Some(program) = &mut pbc {
 			let compiled =
 				Program::compile(program).map_err(|error| StorageError::InvalidPbcProgram {
@@ -1408,10 +1480,14 @@ impl StorageScan for ParquetHarnessScan {
 				None => (0..full_column_count).collect::<Vec<_>>(),
 			};
 			for column in compiled.referenced_columns() {
-				columns.push(column as usize);
+				let column = column as usize;
+				columns.push(column);
+				pbc_referenced_columns.push(column);
 			}
 			columns.sort_unstable();
 			columns.dedup();
+			pbc_referenced_columns.sort_unstable();
+			pbc_referenced_columns.dedup();
 			if let Some(projected) = &projected_columns {
 				append_projection_to_pbc(program, projected)?;
 			}
@@ -1454,6 +1530,81 @@ impl StorageScan for ParquetHarnessScan {
 			message: format!("open parquet reader {}: {error}", source.path.display()),
 		})?;
 		let full_schema = source.schema.clone();
+		if parquet_scan_ledger_enabled() {
+			let mut ledger = ParquetScanLedger {
+				table_id,
+				table_name: source.name.clone(),
+				full_column_count,
+				requested_projected_columns: projected_columns
+					.as_ref()
+					.map(|columns| columns.iter().map(|column| column.0).collect()),
+				pbc_predicate_bytes: pbc.as_ref().map(Vec::len),
+				pbc_referenced_columns: pbc_referenced_columns.clone(),
+				parquet_read_columns: if let Some(columns) = &pbc_projection {
+					(columns.len() < full_column_count).then_some(columns.clone())
+				} else {
+					projected_columns.as_ref().map(|columns| {
+						columns
+							.iter()
+							.map(|column| column.0 as usize)
+							.collect::<Vec<_>>()
+					})
+				},
+				output_column_count: output_schema.fields().len(),
+				inflated_to_full_schema: pbc.is_some()
+					&& pbc_projection
+						.as_ref()
+						.is_some_and(|columns| columns.len() < full_column_count),
+				batches: Vec::new(),
+			};
+			let mut batches = Vec::new();
+			for batch in reader {
+				let raw_batch = batch.map_err(|error| StorageError::Internal {
+					message: format!("read parquet batch {}: {error}", source.path.display()),
+				})?;
+				let raw_rows = raw_batch.num_rows();
+				let raw_columns = raw_batch.num_columns();
+				let raw_bytes = record_batch_bytes(&raw_batch);
+				let mut inflated_bytes = None;
+				let output_batch = if let Some(program) = &pbc {
+					let pbc_batch = if let Some(columns) = &pbc_projection {
+						let inflated = inflate_projected_parquet_batch(
+							raw_batch,
+							full_schema.clone(),
+							columns,
+						)?;
+						inflated_bytes = Some(record_batch_bytes(&inflated));
+						inflated
+					} else {
+						raw_batch
+					};
+					wendelon::schema::pbc::execute(program, &pbc_batch).map_err(|error| {
+						StorageError::InvalidPbcProgram {
+							message: format!("{error:?}"),
+						}
+					})?
+				} else {
+					raw_batch
+				};
+				ledger.batches.push(ParquetScanBatchLedger {
+					raw_rows,
+					raw_columns,
+					raw_bytes,
+					inflated_bytes,
+					output_rows: output_batch.num_rows(),
+					output_columns: output_batch.num_columns(),
+					output_bytes: record_batch_bytes(&output_batch),
+				});
+				batches.push(output_batch);
+			}
+			record_parquet_scan_ledger(ledger);
+			return Ok(ScanStream::new(
+				output_schema,
+				request.session_id,
+				request.query_id,
+				stream::iter(batches.into_iter().map(Ok)).boxed(),
+			));
+		}
 		let stream = stream::iter(reader.map(move |batch| {
 			let batch = batch.map_err(|error| StorageError::Internal {
 				message: format!("read parquet batch {}: {error}", source.path.display()),
@@ -1494,19 +1645,28 @@ fn inflate_projected_parquet_batch(
 		return Ok(batch);
 	}
 	let mut arrays = Vec::with_capacity(full_schema.fields().len());
+	let mut fields = Vec::with_capacity(full_schema.fields().len());
 	let mut projected_index = 0;
 	for column in 0..full_schema.fields().len() {
 		if projected_index < columns.len() && columns[projected_index] == column {
+			fields.push(full_schema.field(column).as_ref().clone());
 			arrays.push(batch.column(projected_index).clone());
 			projected_index += 1;
 		} else {
+			fields.push(
+				full_schema
+					.field(column)
+					.as_ref()
+					.clone()
+					.with_nullable(true),
+			);
 			arrays.push(new_null_array(
 				full_schema.field(column).data_type(),
 				batch.num_rows(),
 			));
 		}
 	}
-	RecordBatch::try_new(full_schema, arrays).map_err(StorageError::from)
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(StorageError::from)
 }
 
 /// Run a Q6 variant single-node over a pre-built fixture, recording the deepest phase reached. A stage
@@ -3181,6 +3341,7 @@ pub struct RuneQ03ProfileLoopSummary {
 	pub output_row_count: u64,
 	pub output_schema_fingerprint: Option<String>,
 	pub join_build_profiles: Vec<JoinBuildProfile>,
+	pub parquet_scan_ledger: Vec<ParquetScanLedger>,
 }
 
 struct ProfileLoopIteration {
@@ -3189,6 +3350,7 @@ struct ProfileLoopIteration {
 	output_row_count: u64,
 	output_schema_fingerprint: Option<String>,
 	join_build_profiles: Vec<JoinBuildProfile>,
+	parquet_scan_ledger: Vec<ParquetScanLedger>,
 }
 
 pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3IsolationProof, String> {
@@ -3282,6 +3444,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 	let mut output_row_count = warmup.output_row_count;
 	let mut output_schema_fingerprint = warmup.output_schema_fingerprint.clone();
 	let mut join_build_profiles = warmup.join_build_profiles.clone();
+	let mut parquet_scan_ledger = warmup.parquet_scan_ledger.clone();
 	for _ in 0..iterations {
 		let iteration = execute_bound_profile_iteration(&bound, storage.clone())
 			.await
@@ -3295,6 +3458,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 		output_row_count = iteration.output_row_count;
 		output_schema_fingerprint = iteration.output_schema_fingerprint.clone();
 		join_build_profiles = iteration.join_build_profiles.clone();
+		parquet_scan_ledger = iteration.parquet_scan_ledger.clone();
 		iteration_execute_ms.push(iteration.execute_ms);
 	}
 	let loop_execute_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
@@ -3310,6 +3474,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 		output_row_count,
 		output_schema_fingerprint,
 		join_build_profiles,
+		parquet_scan_ledger,
 	})
 }
 
@@ -3319,6 +3484,7 @@ async fn execute_bound_profile_iteration(
 ) -> Result<ProfileLoopIteration, StageError> {
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 	let context = ExecutionContext::local_test().with_task_telemetry(task_telemetry.clone());
+	clear_parquet_scan_ledger();
 	let execute_start = Instant::now();
 	let batches = Executor::with_context(storage, context)
 		.execute_bound(bound, None)
@@ -3329,12 +3495,14 @@ async fn execute_bound_profile_iteration(
 	let spill_bytes = telemetry.counters.spill_bytes;
 	let join_build_profiles = telemetry.join_build_profiles.clone();
 	drop(telemetry);
+	let parquet_scan_ledger = take_parquet_scan_ledger();
 	Ok(ProfileLoopIteration {
 		execute_ms,
 		spill_bytes,
 		output_row_count: output_row_count(&batches),
 		output_schema_fingerprint: output_schema_fingerprint(&batches),
 		join_build_profiles,
+		parquet_scan_ledger,
 	})
 }
 
@@ -12502,6 +12670,32 @@ mod adr331_q08_scale_probe {
 			.expect("spawn q05 thread")
 			.join()
 			.expect("q05 thread panicked");
+	}
+}
+
+#[cfg(test)]
+mod parquet_scan_projection_tests {
+	use super::*;
+
+	#[test]
+	fn projected_pbc_inflation_allows_omitted_non_nullable_columns() {
+		let full_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("name", DataType::Utf8, false),
+		]));
+		let projected = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+		)
+		.expect("projected batch");
+
+		let inflated = inflate_projected_parquet_batch(projected, full_schema, &[0])
+			.expect("inflate projected batch");
+
+		assert_eq!(inflated.num_columns(), 2);
+		assert!(!inflated.schema().field(0).is_nullable());
+		assert!(inflated.schema().field(1).is_nullable());
+		assert_eq!(inflated.column(1).null_count(), 2);
 	}
 }
 

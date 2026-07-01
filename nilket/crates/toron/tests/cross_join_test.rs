@@ -821,13 +821,26 @@ struct CrossFixtureScan {
 #[async_trait::async_trait]
 impl StorageScan for CrossFixtureScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-		let batch =
+		let mut batch =
 			self.batches
 				.get(&request.table_id)
 				.cloned()
 				.ok_or(StorageError::TableNotFound {
 					table: request.table_id,
 				})?;
+		if let Some(projected_columns) = &request.projected_columns {
+			let schema = batch.schema();
+			let fields = projected_columns
+				.iter()
+				.map(|ordinal| schema.field(ordinal.0 as usize).clone())
+				.collect::<Vec<_>>();
+			let columns = projected_columns
+				.iter()
+				.map(|ordinal| batch.column(ordinal.0 as usize).clone())
+				.collect::<Vec<_>>();
+			batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+				.map_err(StorageError::from)?;
+		}
 		Ok(ScanStream::from_batches(
 			batch.schema(),
 			request.session_id,

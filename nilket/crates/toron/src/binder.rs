@@ -4279,30 +4279,32 @@ fn optimize_for_required(
 			strategy,
 			output_schema,
 		} => {
-			let (left, _) = optimize_for_required(*left, None, logical_types)?;
-			let (right, _) = optimize_for_required(*right, None, logical_types)?;
-			let output_len = output_schema.fields().len();
-			let output_remap = ordinal_remap(
-				&output_columns(output_len)
-					.iter()
-					.copied()
-					.collect::<Vec<_>>(),
-			);
+			let optimized = optimize_join_inputs_for_required(
+				kind,
+				*left,
+				*right,
+				left_keys,
+				right_keys,
+				match_filter,
+				&output_schema,
+				required_output,
+				logical_types,
+			)?;
 			Ok((
 				ExecutionPlan::Join {
 					replay_id,
 					replay_eligibility,
-					left: Box::new(left),
-					right: Box::new(right),
+					left: Box::new(optimized.left),
+					right: Box::new(optimized.right),
 					kind,
-					left_keys,
-					right_keys,
-					match_filter,
+					left_keys: optimized.left_keys,
+					right_keys: optimized.right_keys,
+					match_filter: optimized.match_filter,
 					null_safe_keys,
 					strategy,
-					output_schema,
+					output_schema: optimized.output_schema,
 				},
-				output_remap,
+				optimized.output_remap,
 			))
 		}
 		// ADR 255: a recursive CTE is a projection barrier — the working-table fixpoint feeds every

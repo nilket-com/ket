@@ -26,6 +26,280 @@ pub(super) fn attach_pbc_program(
 	}
 }
 
+pub(super) struct OptimizedJoinInputs {
+	pub(super) left: ExecutionPlan,
+	pub(super) right: ExecutionPlan,
+	pub(super) left_keys: Vec<ColumnOrdinal>,
+	pub(super) right_keys: Vec<ColumnOrdinal>,
+	pub(super) match_filter: Option<BoundExprProgram>,
+	pub(super) output_schema: SchemaRef,
+	pub(super) output_remap: OrdinalRemap,
+}
+
+pub(super) fn optimize_join_inputs_for_required(
+	kind: JoinKind,
+	left: ExecutionPlan,
+	right: ExecutionPlan,
+	left_keys: Vec<ColumnOrdinal>,
+	right_keys: Vec<ColumnOrdinal>,
+	match_filter: Option<BoundExprProgram>,
+	output_schema: &SchemaRef,
+	required_output: Option<BTreeSet<ColumnOrdinal>>,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<OptimizedJoinInputs, BindingError> {
+	let original_left_width = left.schema().fields().len();
+	let original_right_width = right.schema().fields().len();
+	let requested_outputs = required_output.unwrap_or_else(|| {
+		(0..output_schema.fields().len())
+			.map(|idx| ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow")))
+			.collect()
+	});
+	let requested_outputs_vec = requested_outputs.iter().copied().collect::<Vec<_>>();
+	let mut left_required = BTreeSet::new();
+	let mut right_required = BTreeSet::new();
+	for output in &requested_outputs_vec {
+		collect_join_output_column_requirement(
+			kind,
+			original_left_width,
+			original_right_width,
+			*output,
+			&mut left_required,
+			&mut right_required,
+		)?;
+	}
+	left_required.extend(left_keys.iter().copied());
+	right_required.extend(right_keys.iter().copied());
+	if let Some(filter) = &match_filter {
+		let mut filter_columns = BTreeSet::new();
+		collect_program_columns(filter, &mut filter_columns);
+		for column in filter_columns {
+			collect_concat_column_requirement(
+				original_left_width,
+				original_right_width,
+				column,
+				&mut left_required,
+				&mut right_required,
+			)?;
+		}
+	}
+	retain_row_bearing_column(&mut left_required, original_left_width);
+	retain_row_bearing_column(&mut right_required, original_right_width);
+
+	let (left, left_remap) = optimize_for_required(left, Some(left_required), logical_types)?;
+	let (right, right_remap) = optimize_for_required(right, Some(right_required), logical_types)?;
+	let optimized_left_width = left.schema().fields().len();
+	let left_keys = rewrite_join_side_keys(left_keys, &left_remap, "left join key")?;
+	let right_keys = rewrite_join_side_keys(right_keys, &right_remap, "right join key")?;
+	let match_filter = match_filter
+		.map(|filter| {
+			let filter_remap = join_concat_remap(
+				original_left_width,
+				original_right_width,
+				optimized_left_width,
+				&left_remap,
+				&right_remap,
+			);
+			rewrite_program_ordinals(filter, &filter_remap)
+		})
+		.transpose()?;
+	let output_remap = join_output_remap(
+		kind,
+		original_left_width,
+		original_right_width,
+		optimized_left_width,
+		&left_remap,
+		&right_remap,
+		&requested_outputs_vec,
+	)?;
+	let output_schema = join_schema(kind, &left.schema(), &right.schema());
+	Ok(OptimizedJoinInputs {
+		left,
+		right,
+		left_keys,
+		right_keys,
+		match_filter,
+		output_schema,
+		output_remap,
+	})
+}
+
+fn retain_row_bearing_column(required: &mut BTreeSet<ColumnOrdinal>, width: usize) {
+	if required.is_empty() && width > 0 {
+		required.insert(ColumnOrdinal(0));
+	}
+}
+
+pub(super) fn collect_join_output_column_requirement(
+	kind: JoinKind,
+	left_width: usize,
+	right_width: usize,
+	output: ColumnOrdinal,
+	left_required: &mut BTreeSet<ColumnOrdinal>,
+	right_required: &mut BTreeSet<ColumnOrdinal>,
+) -> Result<(), BindingError> {
+	match kind {
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::LeftOuter
+		| JoinKind::RightOuter
+		| JoinKind::FullOuter => collect_concat_column_requirement(
+			left_width,
+			right_width,
+			output,
+			left_required,
+			right_required,
+		),
+		JoinKind::LeftSemi | JoinKind::LeftAnti => {
+			validate_side_column(output, left_width, "left semi/anti join output")?;
+			left_required.insert(output);
+			Ok(())
+		}
+		JoinKind::RightSemi | JoinKind::RightAnti => {
+			validate_side_column(output, right_width, "right semi/anti join output")?;
+			right_required.insert(output);
+			Ok(())
+		}
+	}
+}
+
+pub(super) fn collect_concat_column_requirement(
+	left_width: usize,
+	right_width: usize,
+	column: ColumnOrdinal,
+	left_required: &mut BTreeSet<ColumnOrdinal>,
+	right_required: &mut BTreeSet<ColumnOrdinal>,
+) -> Result<(), BindingError> {
+	let index = column.0 as usize;
+	if index < left_width {
+		left_required.insert(column);
+		return Ok(());
+	}
+	let right_index = index.saturating_sub(left_width);
+	if right_index < right_width {
+		right_required.insert(ColumnOrdinal(
+			u32::try_from(right_index).expect("column ordinal overflow"),
+		));
+		return Ok(());
+	}
+	Err(BindingError::UnknownColumn {
+		column: format!("join input ordinal {}", column.0),
+	})
+}
+
+fn validate_side_column(
+	column: ColumnOrdinal,
+	width: usize,
+	label: &str,
+) -> Result<(), BindingError> {
+	if (column.0 as usize) < width {
+		return Ok(());
+	}
+	Err(BindingError::UnknownColumn {
+		column: format!("{label} ordinal {}", column.0),
+	})
+}
+
+pub(super) fn rewrite_join_side_keys(
+	keys: Vec<ColumnOrdinal>,
+	remap: &OrdinalRemap,
+	label: &str,
+) -> Result<Vec<ColumnOrdinal>, BindingError> {
+	keys.into_iter()
+		.map(|column| {
+			remap
+				.get(&column)
+				.copied()
+				.ok_or_else(|| BindingError::UnsupportedExpression {
+					message: format!("missing ordinal remap for {label} {:?}", column),
+				})
+		})
+		.collect()
+}
+
+pub(super) fn join_concat_remap(
+	original_left_width: usize,
+	original_right_width: usize,
+	optimized_left_width: usize,
+	left_remap: &OrdinalRemap,
+	right_remap: &OrdinalRemap,
+) -> OrdinalRemap {
+	let mut remap = OrdinalRemap::new();
+	for original in 0..original_left_width {
+		let original = ColumnOrdinal(u32::try_from(original).expect("column ordinal overflow"));
+		if let Some(mapped) = left_remap.get(&original) {
+			remap.insert(original, *mapped);
+		}
+	}
+	for original in 0..original_right_width {
+		let original_column =
+			ColumnOrdinal(u32::try_from(original).expect("column ordinal overflow"));
+		if let Some(mapped) = right_remap.get(&original_column) {
+			let original_output = ColumnOrdinal(
+				u32::try_from(original_left_width + original).expect("column ordinal overflow"),
+			);
+			let mapped_output = ColumnOrdinal(
+				u32::try_from(optimized_left_width + mapped.0 as usize)
+					.expect("column ordinal overflow"),
+			);
+			remap.insert(original_output, mapped_output);
+		}
+	}
+	remap
+}
+
+pub(super) fn join_output_remap(
+	kind: JoinKind,
+	original_left_width: usize,
+	original_right_width: usize,
+	optimized_left_width: usize,
+	left_remap: &OrdinalRemap,
+	right_remap: &OrdinalRemap,
+	requested_outputs: &[ColumnOrdinal],
+) -> Result<OrdinalRemap, BindingError> {
+	let mut output_remap = OrdinalRemap::new();
+	let concat_remap = join_concat_remap(
+		original_left_width,
+		original_right_width,
+		optimized_left_width,
+		left_remap,
+		right_remap,
+	);
+	for output in requested_outputs {
+		let mapped = match kind {
+			JoinKind::Inner
+			| JoinKind::Cross
+			| JoinKind::LeftOuter
+			| JoinKind::RightOuter
+			| JoinKind::FullOuter => concat_remap.get(output).copied().ok_or_else(|| {
+				BindingError::UnsupportedExpression {
+					message: format!("missing ordinal remap for join output {:?}", output),
+				}
+			})?,
+			JoinKind::LeftSemi | JoinKind::LeftAnti => {
+				left_remap.get(output).copied().ok_or_else(|| {
+					BindingError::UnsupportedExpression {
+						message: format!(
+							"missing ordinal remap for left semi/anti output {:?}",
+							output
+						),
+					}
+				})?
+			}
+			JoinKind::RightSemi | JoinKind::RightAnti => right_remap
+				.get(output)
+				.copied()
+				.ok_or_else(|| BindingError::UnsupportedExpression {
+					message: format!(
+						"missing ordinal remap for right semi/anti output {:?}",
+						output
+					),
+				})?,
+		};
+		output_remap.insert(*output, mapped);
+	}
+	Ok(output_remap)
+}
+
 pub(super) struct PredicatePushdownPlan {
 	pub(super) pushed_predicate: Option<BoundExprProgram>,
 	pub(super) residual_predicate: Option<BoundExprProgram>,

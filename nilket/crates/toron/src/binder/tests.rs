@@ -265,6 +265,89 @@ async fn binder_shapes_grouped_aggregate_plan() {
 }
 
 #[tokio::test]
+async fn join_projection_pushdown_keeps_join_keys_and_parent_columns() {
+	fn scan_projection(plan: &ExecutionPlan, table_id: TableId) -> Option<Vec<ColumnOrdinal>> {
+		match plan {
+			ExecutionPlan::Scan {
+				local_table_id,
+				projection,
+				..
+			} if *local_table_id == table_id => projection.clone(),
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Window { input, .. }
+			| ExecutionPlan::Take { input, .. }
+			| ExecutionPlan::Repeat { input, .. } => scan_projection(input, table_id),
+			ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+				scan_projection(left, table_id).or_else(|| scan_projection(right, table_id))
+			}
+			_ => None,
+		}
+	}
+
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(71),
+			named_descriptor(
+				71,
+				"orders",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("customer_id", DataType::Int64, false),
+					Field::new("amount", DataType::Int64, false),
+					Field::new("comment", DataType::Utf8, true),
+				]),
+			),
+		)
+		.expect("register orders");
+	catalog
+		.register_descriptor(
+			TableId(72),
+			named_descriptor(
+				72,
+				"customers",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+					Field::new("comment", DataType::Utf8, true),
+				]),
+			),
+		)
+		.expect("register customers");
+	let join = LogicalPlan::Join {
+		left: Box::new(named_scan("orders")),
+		right: Box::new(named_scan("customers")),
+		kind: JoinKind::Inner,
+		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		on_filter: None,
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let aggregate = LogicalPlan::Aggregate {
+		input: Box::new(join),
+		group_expr: vec![qcol("customers", "region")],
+		aggr_expr: vec![(AggregateFunction::Sum, vec![qcol("orders", "amount")])],
+	};
+
+	let plan = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind aggregate join");
+
+	assert_eq!(
+		scan_projection(&plan, TableId(71)),
+		Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)])
+	);
+	assert_eq!(
+		scan_projection(&plan, TableId(72)),
+		Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)])
+	);
+}
+
+#[tokio::test]
 async fn binder_attaches_pbc_program_for_eligible_scan_filter() {
 	let catalog = catalog();
 	let plan = LogicalPlan::Filter {

@@ -156,6 +156,7 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 					"output_row_count": summary.output_row_count,
 					"output_schema_fingerprint": summary.output_schema_fingerprint,
 					"join_build_profiles": summary.join_build_profiles,
+					"parquet_scan_ledger": summary.parquet_scan_ledger,
 					"materialized_path": summary.spill_bytes_max == 0,
 					"debug_build": cfg!(debug_assertions),
 				})
