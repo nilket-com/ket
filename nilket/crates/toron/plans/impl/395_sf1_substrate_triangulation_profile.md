@@ -7,8 +7,7 @@ temporary/off-by-default.
 ## Phase 0 - concrete value gate (feature-gated, reproducible)
 - Add a `#[cfg(feature = "polars-sql-reference")]` harness test/helper, e.g.
   `polars_sql_q03_value_compatible_with_oracle`, that:
-  - runs `polars_sql` q03 (the Rust explicit-join text) at sf=1 (or sf=0.01 for the gate's speed if the comparator is
-    scale-stable),
+  - runs `polars_sql` q03 (the Rust explicit-join text) at sf=1,
   - loads the q03 oracle / DuckDB result on the same data,
   - compares with **decimal tolerance** (scale 2 vs 4) and the **q03 tie-order policy** (revenue DESC, o_orderdate, +
     deterministic tiebreak) - not bare row/schema equality.

@@ -20,11 +20,12 @@ use toron_tpch::{
 	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
 	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
 	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source,
-	run_rune_perf_query_with_data_source, run_strict_q1, run_strict_q02, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
-	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
-	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
-	run_strict_q22, schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
+	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
+	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
+	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
+	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
+	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
+	schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -81,6 +82,7 @@ async fn main() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
 		// ADR 273: the correctness rail — answer-check a query against an independent oracle.
 		"correctness" => correctness_command(&args).await,
 		"correctness-matrix" => {
@@ -111,6 +113,55 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Ok(engine) => engine,
 		Err(message) => return harness_error(&message),
 	};
+	if engine == PerfEngine::Rune {
+		if let Some(raw_iterations) = std::env::var_os("TORON_TPCH_PROFILE_LOOP") {
+			let iterations = match raw_iterations.to_string_lossy().parse::<usize>() {
+				Ok(iterations) if iterations > 0 => iterations,
+				Ok(_) => return harness_error("TORON_TPCH_PROFILE_LOOP must be > 0"),
+				Err(error) => {
+					return harness_error(&format!(
+						"TORON_TPCH_PROFILE_LOOP must be a positive integer: {error}"
+					));
+				}
+			};
+			if query != "q03" && query != "q3" {
+				return harness_error("TORON_TPCH_PROFILE_LOOP supports only --query q03");
+			}
+			let summary = match run_rune_q03_profile_loop_with_data_source(
+				mode,
+				sf,
+				data_source,
+				&data_dir,
+				iterations,
+			)
+			.await
+			{
+				Ok(summary) => summary,
+				Err(message) => return harness_error(&message),
+			};
+			println!(
+				"{}",
+				serde_json::json!({
+					"engine": "rune",
+					"query": "q03",
+					"scale_factor": sf,
+					"mode": mode,
+					"profile_loop_iterations": summary.iterations,
+					"prepare_ms": summary.prepare_ms,
+					"warmup_execute_ms": summary.warmup_execute_ms,
+					"loop_execute_ms": summary.loop_execute_ms,
+					"iteration_execute_ms": summary.iteration_execute_ms,
+					"plan_fingerprint": summary.plan_fingerprint,
+					"spill_bytes_max": summary.spill_bytes_max,
+					"output_row_count": summary.output_row_count,
+					"output_schema_fingerprint": summary.output_schema_fingerprint,
+					"materialized_path": summary.spill_bytes_max == 0,
+					"debug_build": cfg!(debug_assertions),
+				})
+			);
+			return ExitCode::SUCCESS;
+		}
+	}
 	let attempt_result = match engine {
 		PerfEngine::Toron => {
 			run_perf_query_with_data_source(
@@ -851,6 +902,79 @@ fn run_polars_perf_query_with_data_source(
 	Ok(run_polars_perf_export(&export, run_index, warmup))
 }
 
+fn polars_q03_value_gate_command(args: &[String]) -> ExitCode {
+	let sf = match explicit_sf(args) {
+		Ok(explicit) => explicit.unwrap_or(1.0),
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let row = match run_polars_q03_value_gate(sf, mode, data_source, &data_dir) {
+		Ok(row) => row,
+		Err(message) => return harness_error(&message),
+	};
+	println!("{row}");
+	ExitCode::SUCCESS
+}
+
+#[cfg(not(feature = "polars-sql-reference"))]
+fn run_polars_q03_value_gate(
+	_scale_factor: f64,
+	_mode: &str,
+	_data_source: &str,
+	_data_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	Err("polars-q03-value-gate requires --features polars-sql-reference".to_string())
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn run_polars_q03_value_gate(
+	scale_factor: f64,
+	mode: &str,
+	data_source: &str,
+	data_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	if mode != "strict" {
+		return Err(format!(
+			"polars-q03-value-gate supports only --mode strict; got {mode:?}"
+		));
+	}
+	let export_root = PathBuf::from(CACHE_ROOT).join("parquet");
+	let export = match data_source {
+		"memory" => export_perf_query_parquet("q03", mode, scale_factor, &export_root)?,
+		"parquet" | "persisted" => {
+			export_persisted_perf_query_parquet("q03", mode, scale_factor, data_dir)?
+		}
+		other => return Err(format!("--data-source {other:?} is not supported")),
+	};
+	let frame = collect_polars_sql_frame(&export)?;
+	let oracle = toron_tpch::strict_q3_oracle(scale_factor);
+	if oracle.selected_rows < 1 || oracle.groups.len() <= 1 {
+		return Err(format!(
+			"oracle non-vacuous guard failed: selected_rows={} groups={}",
+			oracle.selected_rows,
+			oracle.groups.len()
+		));
+	}
+	let stats = compare_polars_q03_frame(&frame, &oracle.groups)?;
+	Ok(serde_json::json!({
+		"status": "pass",
+		"engine": "polars_sql",
+		"engine_version": polars::VERSION,
+		"query": "q03",
+		"scale_factor": scale_factor,
+		"mode": mode,
+		"data_source": data_source,
+		"rows": stats.rows,
+		"max_revenue_diff_raw_scale4": stats.max_revenue_diff_raw,
+		"revenue_tolerance_raw_scale4": POLARS_Q03_REVENUE_TOLERANCE_RAW,
+		"plan_fingerprint": polars_plan_fingerprint(&export),
+		"schema_fingerprint": stable_fingerprint(&polars_schema_signature(&frame)),
+		"value_gate": "oracle_decimal_tolerance_and_q03_order",
+	}))
+}
+
 fn duckdb_not_attempted_row(
 	query: &str,
 	mode: &str,
@@ -1152,6 +1276,221 @@ fn polars_schema_signature(frame: &polars::prelude::DataFrame) -> String {
 		.map(|(name, dtype)| format!("{name}:{dtype:?}"))
 		.collect::<Vec<_>>()
 		.join("|")
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn collect_polars_sql_frame(
+	export: &toron_tpch::TpchParquetExport,
+) -> Result<polars::prelude::DataFrame, String> {
+	use polars::prelude::*;
+	use polars_sql::SQLContext;
+
+	let mut context = SQLContext::new();
+	for table in &export.tables {
+		let Some(path) = table.path.to_str() else {
+			return Err(format!("non-utf8 parquet path {}", table.path.display()));
+		};
+		let lazy = LazyFrame::scan_parquet(path.into(), Default::default()).map_err(|error| {
+			format!(
+				"polars scan failed for {} ({}): {error:?}",
+				table.name,
+				table.path.display()
+			)
+		})?;
+		context.register(&table.name, lazy);
+	}
+	let polars_sql = polars_sql_text(export);
+	let lazy = context
+		.execute(polars_sql.as_ref())
+		.map_err(|error| format!("polars SQL execute failed: {error:?}"))?;
+	lazy.collect()
+		.map_err(|error| format!("polars collect failed: {error:?}"))
+}
+
+#[cfg(feature = "polars-sql-reference")]
+const POLARS_Q03_REVENUE_TOLERANCE_RAW: i128 = 1_000;
+
+#[cfg(feature = "polars-sql-reference")]
+struct PolarsQ03ValueGateStats {
+	rows: usize,
+	max_revenue_diff_raw: i128,
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn compare_polars_q03_frame(
+	frame: &polars::prelude::DataFrame,
+	oracle: &BTreeMap<i64, toron_tpch::Q3Group>,
+) -> Result<PolarsQ03ValueGateStats, String> {
+	let orderkeys = frame
+		.column("l_orderkey")
+		.map_err(|error| format!("missing l_orderkey: {error:?}"))?
+		.i64()
+		.map_err(|error| format!("l_orderkey not Int64: {error:?}"))?;
+	let revenues = frame
+		.column("revenue")
+		.map_err(|error| format!("missing revenue: {error:?}"))?;
+	let orderdates = frame
+		.column("o_orderdate")
+		.map_err(|error| format!("missing o_orderdate: {error:?}"))?;
+	let shippriorities = frame
+		.column("o_shippriority")
+		.map_err(|error| format!("missing o_shippriority: {error:?}"))?
+		.i32()
+		.map_err(|error| format!("o_shippriority not Int32: {error:?}"))?;
+
+	let mut emitted = Vec::with_capacity(frame.height());
+	for i in 0..frame.height() {
+		let orderkey = orderkeys
+			.get(i)
+			.ok_or_else(|| format!("NULL l_orderkey at row {i}"))?;
+		let revenue = polars_revenue_raw_scale4(revenues, i)?;
+		let orderdate = polars_date32_value(orderdates, i)?;
+		let shippriority = shippriorities
+			.get(i)
+			.ok_or_else(|| format!("NULL o_shippriority at row {i}"))?;
+		emitted.push((orderkey, revenue, orderdate, shippriority));
+	}
+
+	if emitted.len() != oracle.len() {
+		return Err(format!(
+			"row count mismatch: oracle has {} groups, polars_sql has {} rows",
+			oracle.len(),
+			emitted.len()
+		));
+	}
+	let mut seen = BTreeMap::new();
+	let mut max_revenue_diff_raw = 0i128;
+	for &(orderkey, revenue, orderdate, shippriority) in &emitted {
+		if seen
+			.insert(orderkey, (revenue, orderdate, shippriority))
+			.is_some()
+		{
+			return Err(format!("duplicate l_orderkey {orderkey}"));
+		}
+	}
+	for (orderkey, group) in oracle {
+		let Some(&(revenue, orderdate, shippriority)) = seen.get(orderkey) else {
+			return Err(format!(
+				"oracle l_orderkey {orderkey} missing from polars_sql"
+			));
+		};
+		let diff = (revenue - group.revenue).abs();
+		max_revenue_diff_raw = max_revenue_diff_raw.max(diff);
+		if diff > POLARS_Q03_REVENUE_TOLERANCE_RAW {
+			return Err(format!(
+				"l_orderkey {orderkey}: revenue mismatch beyond tolerance: expected {} got {revenue} diff {diff} tolerance {}",
+				group.revenue, POLARS_Q03_REVENUE_TOLERANCE_RAW
+			));
+		}
+		if orderdate != group.orderdate {
+			return Err(format!(
+				"l_orderkey {orderkey}: o_orderdate mismatch: expected {}, got {orderdate}",
+				group.orderdate
+			));
+		}
+		if shippriority != group.shippriority {
+			return Err(format!(
+				"l_orderkey {orderkey}: o_shippriority mismatch: expected {}, got {shippriority}",
+				group.shippriority
+			));
+		}
+	}
+
+	for pair in emitted.windows(2) {
+		let (_, rev_a, date_a, _) = pair[0];
+		let (_, rev_b, date_b, _) = pair[1];
+		if rev_a + POLARS_Q03_REVENUE_TOLERANCE_RAW < rev_b {
+			return Err(format!(
+				"ORDER BY revenue DESC violated: {rev_a} emitted before {rev_b}"
+			));
+		}
+		if rev_a == rev_b && date_a > date_b {
+			return Err(format!(
+				"ORDER BY o_orderdate ASC violated within equal revenue: {date_a} emitted before {date_b}"
+			));
+		}
+	}
+
+	Ok(PolarsQ03ValueGateStats {
+		rows: emitted.len(),
+		max_revenue_diff_raw,
+	})
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn polars_date32_value(column: &polars::prelude::Column, row: usize) -> Result<i32, String> {
+	use polars::prelude::DataType;
+
+	match column.dtype() {
+		DataType::Date => column
+			.date()
+			.map_err(|error| format!("o_orderdate not Date: {error:?}"))?
+			.physical()
+			.get(row)
+			.ok_or_else(|| format!("NULL o_orderdate at row {row}")),
+		DataType::Int32 => column
+			.i32()
+			.map_err(|error| format!("o_orderdate not Int32: {error:?}"))?
+			.get(row)
+			.ok_or_else(|| format!("NULL o_orderdate at row {row}")),
+		other => Err(format!("o_orderdate has unsupported dtype {other:?}")),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn polars_revenue_raw_scale4(column: &polars::prelude::Column, row: usize) -> Result<i128, String> {
+	use polars::prelude::DataType;
+
+	match column.dtype() {
+		DataType::Decimal(_, scale) => {
+			let raw = column
+				.decimal()
+				.map_err(|error| format!("revenue not Decimal: {error:?}"))?
+				.physical()
+				.get(row)
+				.ok_or_else(|| format!("NULL revenue at row {row}"))?;
+			Ok(normalize_decimal_raw_to_scale4(raw, *scale))
+		}
+		DataType::Float64 => {
+			let value = column
+				.f64()
+				.map_err(|error| format!("revenue not Float64: {error:?}"))?
+				.get(row)
+				.ok_or_else(|| format!("NULL revenue at row {row}"))?;
+			Ok((value * 10_000.0).round() as i128)
+		}
+		DataType::Float32 => {
+			let value = column
+				.f32()
+				.map_err(|error| format!("revenue not Float32: {error:?}"))?
+				.get(row)
+				.ok_or_else(|| format!("NULL revenue at row {row}"))?;
+			Ok((f64::from(value) * 10_000.0).round() as i128)
+		}
+		other => Err(format!("revenue has unsupported dtype {other:?}")),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn normalize_decimal_raw_to_scale4(value: i128, scale: usize) -> i128 {
+	match scale.cmp(&4) {
+		std::cmp::Ordering::Equal => value,
+		std::cmp::Ordering::Less => value * pow10_i128(4 - scale),
+		std::cmp::Ordering::Greater => {
+			let divisor = pow10_i128(scale - 4);
+			let half = divisor / 2;
+			if value >= 0 {
+				(value + half) / divisor
+			} else {
+				(value - half) / divisor
+			}
+		}
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn pow10_i128(exp: usize) -> i128 {
+	(0..exp).fold(1i128, |acc, _| acc * 10)
 }
 
 #[cfg(any(feature = "polars-sql-reference", test))]

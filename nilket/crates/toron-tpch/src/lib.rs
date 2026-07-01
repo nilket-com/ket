@@ -3169,6 +3169,26 @@ impl RuneQ3IsolationProof {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct RuneQ03ProfileLoopSummary {
+	pub iterations: usize,
+	pub prepare_ms: f64,
+	pub warmup_execute_ms: f64,
+	pub loop_execute_ms: f64,
+	pub iteration_execute_ms: Vec<f64>,
+	pub plan_fingerprint: String,
+	pub spill_bytes_max: u64,
+	pub output_row_count: u64,
+	pub output_schema_fingerprint: Option<String>,
+}
+
+struct ProfileLoopIteration {
+	execute_ms: f64,
+	spill_bytes: u64,
+	output_row_count: u64,
+	output_schema_fingerprint: Option<String>,
+}
+
 pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3IsolationProof, String> {
 	let spec = build_perf_query_spec("q03", "strict", scale_factor)?;
 	let (metadata, _) = metadata_storage_from_tables(spec.tables);
@@ -3200,6 +3220,116 @@ pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3Isolati
 		rune_plan_fingerprint: physical_plan_fingerprint(&rune_bound),
 		sql_plan_shape: format!("{sql_bound:#?}"),
 		rune_plan_shape: format!("{rune_bound:#?}"),
+	})
+}
+
+pub async fn run_rune_q03_profile_loop_with_data_source(
+	mode: &str,
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+	iterations: usize,
+) -> Result<RuneQ03ProfileLoopSummary, String> {
+	if iterations == 0 {
+		return Err("profile loop iterations must be > 0".to_string());
+	}
+	let (tables, storage) = match data_source {
+		"memory" => {
+			let spec = build_perf_query_spec("q03", mode, scale_factor)?;
+			let (metadata, storage) = metadata_storage_from_tables(spec.tables);
+			(metadata, storage)
+		}
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
+			let storage: Arc<dyn StorageScan> = spec.storage;
+			(spec.tables, storage)
+		}
+		other => return Err(format!("perf --data-source {other:?} is not supported")),
+	};
+
+	let prepare_start = Instant::now();
+	let mut timings = PerfPhaseTimings::default();
+	let catalog =
+		load_catalog_from_metadata(tables, &mut timings, prepare_start).map_err(|error| {
+			format!(
+				"load q03 catalog for rune profile loop failed: {}",
+				error.message
+			)
+		})?;
+	let logical = rune_q03_logical_plan()
+		.await
+		.map_err(|error| format!("plan Rune q03 for profile loop failed: {}", error.message))?;
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.map_err(|error| format!("bind Rune q03 for profile loop failed: {error:?}"))?;
+	let plan_fingerprint = physical_plan_fingerprint(&bound);
+	let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
+
+	let warmup = execute_bound_profile_iteration(&bound, storage.clone())
+		.await
+		.map_err(|error| {
+			format!(
+				"warmup Rune q03 profile loop failed at {:?}: {}",
+				error.phase, error.message
+			)
+		})?;
+
+	let loop_start = Instant::now();
+	let mut iteration_execute_ms = Vec::with_capacity(iterations);
+	let mut spill_bytes_max = warmup.spill_bytes;
+	let mut output_row_count = warmup.output_row_count;
+	let mut output_schema_fingerprint = warmup.output_schema_fingerprint.clone();
+	for _ in 0..iterations {
+		let iteration = execute_bound_profile_iteration(&bound, storage.clone())
+			.await
+			.map_err(|error| {
+				format!(
+					"Rune q03 profile loop failed at {:?}: {}",
+					error.phase, error.message
+				)
+			})?;
+		spill_bytes_max = spill_bytes_max.max(iteration.spill_bytes);
+		output_row_count = iteration.output_row_count;
+		output_schema_fingerprint = iteration.output_schema_fingerprint.clone();
+		iteration_execute_ms.push(iteration.execute_ms);
+	}
+	let loop_execute_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
+
+	Ok(RuneQ03ProfileLoopSummary {
+		iterations,
+		prepare_ms,
+		warmup_execute_ms: warmup.execute_ms,
+		loop_execute_ms,
+		iteration_execute_ms,
+		plan_fingerprint,
+		spill_bytes_max,
+		output_row_count,
+		output_schema_fingerprint,
+	})
+}
+
+async fn execute_bound_profile_iteration(
+	bound: &ExecutionPlan,
+	storage: Arc<dyn StorageScan>,
+) -> Result<ProfileLoopIteration, StageError> {
+	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let context = ExecutionContext::local_test().with_task_telemetry(task_telemetry.clone());
+	let execute_start = Instant::now();
+	let batches = Executor::with_context(storage, context)
+		.execute_bound(bound, None)
+		.await
+		.map_err(|error| StageError::from_debug(Phase::Execute, error))?;
+	let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+	let spill_bytes = task_telemetry
+		.lock()
+		.expect("task telemetry lock")
+		.counters
+		.spill_bytes;
+	Ok(ProfileLoopIteration {
+		execute_ms,
+		spill_bytes,
+		output_row_count: output_row_count(&batches),
+		output_schema_fingerprint: output_schema_fingerprint(&batches),
 	})
 }
 
