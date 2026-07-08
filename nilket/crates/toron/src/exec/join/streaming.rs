@@ -35,6 +35,20 @@ enum ReorientedStageScanBuildDecision {
 	MaterializedBatches(Vec<RecordBatch>),
 }
 
+fn reoriented_stage_scan_build_decision_for_materialized_batches(
+	scan_output_bytes: u64,
+	build_hash_bytes: u64,
+	materialization_cap: u64,
+	batches: Vec<RecordBatch>,
+) -> ReorientedStageScanBuildDecision {
+	// A scan-shaped build can fit as Arrow batches while the hash accumulator would not.
+	if scan_output_bytes > materialization_cap || build_hash_bytes > materialization_cap {
+		ReorientedStageScanBuildDecision::Stream
+	} else {
+		ReorientedStageScanBuildDecision::MaterializedBatches(batches)
+	}
+}
+
 pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 	InMemory {
 		batch: RecordBatch,
@@ -4373,13 +4387,16 @@ impl Executor {
 		let (estimated, batches) = self
 			.materialize_streaming_scan_output_for_cap(scan_input, morsel)
 			.await?;
-		if estimated > scan_output_cap {
-			Ok(ReorientedStageScanBuildDecision::Stream)
-		} else {
-			Ok(ReorientedStageScanBuildDecision::MaterializedBatches(
+		let estimated_build_hash_bytes =
+			estimated_build_hash_bytes_for_batches(&batches, &stage.build_keys)?;
+		Ok(
+			reoriented_stage_scan_build_decision_for_materialized_batches(
+				estimated,
+				estimated_build_hash_bytes,
+				scan_output_cap,
 				batches,
-			))
-		}
+			),
+		)
 	}
 
 	async fn reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
@@ -9559,6 +9576,41 @@ mod tests {
 		fn read_plain_calls(&self) -> u64 {
 			self.read_plain_calls
 				.load(std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+
+	#[test]
+	fn reoriented_scan_build_decision_checks_hash_accumulator_bytes() {
+		let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+		assert!(matches!(
+			reoriented_stage_scan_build_decision_for_materialized_batches(
+				512,
+				1025,
+				1024,
+				vec![batch.clone()]
+			),
+			ReorientedStageScanBuildDecision::Stream
+		));
+		assert!(matches!(
+			reoriented_stage_scan_build_decision_for_materialized_batches(
+				1025,
+				512,
+				1024,
+				vec![batch.clone()]
+			),
+			ReorientedStageScanBuildDecision::Stream
+		));
+		let decision = reoriented_stage_scan_build_decision_for_materialized_batches(
+			512,
+			1024,
+			1024,
+			vec![batch],
+		);
+		match decision {
+			ReorientedStageScanBuildDecision::MaterializedBatches(batches) => {
+				assert_eq!(batches.len(), 1)
+			}
+			_ => panic!("build should stay materialized when scan and hash estimates fit"),
 		}
 	}
 
