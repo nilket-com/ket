@@ -1216,12 +1216,30 @@ impl<'a> Binder<'a> {
 	}
 
 	/// ADR 270 helper: route single-side conjuncts into a `Cross` child (wrap them as a filter and recurse,
-	/// so a nested comma edge can lift there); for a non-`Cross` child keep them in the parent residual (the
-	/// existing predicate-pushdown places them at the scan). Either way recurse the child for nested shapes.
+	/// so a nested comma edge can lift there). ADR 401 extends the same side-local rule to non-`Cross`
+	/// children: for inner/cross comma normalization, `filter(A) join B` is equivalent to filtering the
+	/// joined result by an `A`-only predicate, and the earlier placement gives join-order policy the
+	/// post-filter facts that explicit inner joins and Rune already expose.
 	fn push_into_cross_child<'b>(
 		&'b self,
 		child: LogicalPlan,
 		conjuncts: Vec<Expr>,
+		residual: &'b mut Vec<Expr>,
+	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
+		let conjuncts = conjuncts
+			.into_iter()
+			.map(|expr| RoutedExpr {
+				original: expr.clone(),
+				routed: expr,
+			})
+			.collect();
+		self.push_routed_into_cross_child(child, conjuncts, residual)
+	}
+
+	fn push_routed_into_cross_child<'b>(
+		&'b self,
+		child: LogicalPlan,
+		conjuncts: Vec<RoutedExpr>,
 		residual: &'b mut Vec<Expr>,
 	) -> Pin<Box<dyn Future<Output = Result<LogicalPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
@@ -1229,29 +1247,60 @@ impl<'a> Binder<'a> {
 				return self.recognize_cross_equi_joins(&child).await;
 			}
 			match child {
-				LogicalPlan::Join {
+				pushable @ (LogicalPlan::Join {
 					kind: JoinKind::Cross,
 					..
-				} => {
-					let pushed = wrap_residual_filter(child, conjuncts);
+				}
+				| LogicalPlan::Scan { .. }
+				| LogicalPlan::ScanNamed { .. }) => {
+					let pushed = push_logical_filter_conjuncts(
+						pushable,
+						conjuncts
+							.into_iter()
+							.map(|conjunct| conjunct.routed)
+							.collect(),
+					);
 					self.recognize_cross_equi_joins(&pushed).await
 				}
 				LogicalPlan::Filter { input, predicate } => {
-					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+					let child_filter_reorder_safe = guard_filter_pushdown_safe(&predicate);
+					let (pushable, fenced): (Vec<_>, Vec<_>) =
+						conjuncts.into_iter().partition(|conjunct| {
+							child_filter_reorder_safe
+								&& guard_filter_pushdown_safe(&conjunct.routed)
+						});
+					let pushed_input = self
+						.push_routed_into_cross_child(*input, pushable, residual)
 						.await?;
-					Ok(LogicalPlan::Filter {
-						input: Box::new(pushed),
+					let guarded = LogicalPlan::Filter {
+						input: Box::new(pushed_input),
 						predicate,
-					})
+					};
+					let guarded = self.recognize_cross_equi_joins(&guarded).await?;
+					let fenced = fenced.into_iter().map(|conjunct| conjunct.routed).collect();
+					Ok(push_logical_filter_conjuncts(guarded, fenced))
 				}
 				LogicalPlan::Project {
 					input,
 					exprs,
 					output_names,
 				} => {
+					let Some(input_scope) = self.logical_scope_for_outer_demotion(&input).await?
+					else {
+						residual.extend(routed_originals(conjuncts));
+						let project = LogicalPlan::Project {
+							input,
+							exprs,
+							output_names,
+						};
+						return self.recognize_cross_equi_joins(&project).await;
+					};
+					let map = project_passthrough_map(&exprs, &output_names, &input_scope)?;
+					let (routed_conjuncts, blocked) =
+						route_conjuncts_through_project(conjuncts, &map, &input_scope)?;
+					residual.extend(blocked);
 					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+						.push_routed_into_cross_child(*input, routed_conjuncts, residual)
 						.await?;
 					Ok(LogicalPlan::Project {
 						input: Box::new(pushed),
@@ -1265,7 +1314,7 @@ impl<'a> Binder<'a> {
 					key,
 				} => {
 					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+						.push_routed_into_cross_child(*input, conjuncts, residual)
 						.await?;
 					Ok(LogicalPlan::Exchange {
 						input: Box::new(pushed),
@@ -1276,56 +1325,22 @@ impl<'a> Binder<'a> {
 				LogicalPlan::Sort {
 					input,
 					order_by,
-					limit,
-					offset,
+					limit: None,
+					offset: 0,
 				} => {
 					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+						.push_routed_into_cross_child(*input, conjuncts, residual)
 						.await?;
 					Ok(LogicalPlan::Sort {
 						input: Box::new(pushed),
 						order_by,
-						limit,
-						offset,
-					})
-				}
-				LogicalPlan::Window {
-					input,
-					partition_by,
-					order_by,
-					functions,
-				} => {
-					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
-						.await?;
-					Ok(LogicalPlan::Window {
-						input: Box::new(pushed),
-						partition_by,
-						order_by,
-						functions,
-					})
-				}
-				LogicalPlan::Take { input, limit } => {
-					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
-						.await?;
-					Ok(LogicalPlan::Take {
-						input: Box::new(pushed),
-						limit,
-					})
-				}
-				LogicalPlan::Repeat { input, count } => {
-					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
-						.await?;
-					Ok(LogicalPlan::Repeat {
-						input: Box::new(pushed),
-						count,
+						limit: None,
+						offset: 0,
 					})
 				}
 				LogicalPlan::Distinct { input } => {
 					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+						.push_routed_into_cross_child(*input, conjuncts, residual)
 						.await?;
 					Ok(LogicalPlan::Distinct {
 						input: Box::new(pushed),
@@ -1336,8 +1351,28 @@ impl<'a> Binder<'a> {
 					alias,
 					columns,
 				} => {
+					let Some(input_scope) = self.logical_scope_for_outer_demotion(&input).await?
+					else {
+						residual.extend(routed_originals(conjuncts));
+						let alias = LogicalPlan::Alias {
+							input,
+							alias,
+							columns,
+						};
+						return self.recognize_cross_equi_joins(&alias).await;
+					};
+					let alias_schema =
+						alias_schema_for_outer_demotion(&input_scope.schema, &columns)?;
+					let alias_scope = RelationScope::alias(alias.clone(), &alias_schema);
+					let (routed_conjuncts, blocked) = route_conjuncts_through_alias(
+						conjuncts,
+						&alias,
+						&alias_scope,
+						&input_scope,
+					)?;
+					residual.extend(blocked);
 					let pushed = self
-						.push_into_cross_child(*input, conjuncts, residual)
+						.push_routed_into_cross_child(*input, routed_conjuncts, residual)
 						.await?;
 					Ok(LogicalPlan::Alias {
 						input: Box::new(pushed),
@@ -1346,7 +1381,7 @@ impl<'a> Binder<'a> {
 					})
 				}
 				other => {
-					residual.extend(conjuncts);
+					residual.extend(routed_originals(conjuncts));
 					self.recognize_cross_equi_joins(&other).await
 				}
 			}
@@ -1704,22 +1739,12 @@ impl<'a> Binder<'a> {
 					let alias_schema =
 						alias_schema_for_outer_demotion(&input_scope.schema, &columns)?;
 					let alias_scope = RelationScope::alias(alias.clone(), &alias_schema);
-					let mut routed_conjuncts = Vec::new();
-					let mut residual = Vec::new();
-					for conjunct in conjuncts {
-						match remap_expr_through_alias(
-							&conjunct.routed,
-							&alias,
-							&alias_scope,
-							&input_scope,
-						)? {
-							Some(routed) => routed_conjuncts.push(RoutedExpr {
-								original: conjunct.original,
-								routed,
-							}),
-							None => residual.push(conjunct.original),
-						}
-					}
+					let (routed_conjuncts, mut residual) = route_conjuncts_through_alias(
+						conjuncts,
+						&alias,
+						&alias_scope,
+						&input_scope,
+					)?;
 					let mut wrapper_path = path;
 					wrapper_path.push(JoinSideStep::Alias(alias.clone()));
 					let routed = self
@@ -1754,17 +1779,8 @@ impl<'a> Binder<'a> {
 						});
 					};
 					let map = project_passthrough_map(&exprs, &output_names, &input_scope)?;
-					let mut routed_conjuncts = Vec::new();
-					let mut residual = Vec::new();
-					for conjunct in conjuncts {
-						match remap_expr_through_project(&conjunct.routed, &map, &input_scope)? {
-							Some(routed) => routed_conjuncts.push(RoutedExpr {
-								original: conjunct.original,
-								routed,
-							}),
-							None => residual.push(conjunct.original),
-						}
-					}
+					let (routed_conjuncts, mut residual) =
+						route_conjuncts_through_project(conjuncts, &map, &input_scope)?;
 					let mut wrapper_path = path;
 					wrapper_path.push(JoinSideStep::Project);
 					let routed = self
@@ -1872,6 +1888,95 @@ fn routed_originals(conjuncts: Vec<RoutedExpr>) -> Vec<Expr> {
 		.into_iter()
 		.map(|conjunct| conjunct.original)
 		.collect()
+}
+
+fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
+	match expr {
+		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => true,
+		Expr::LogicalAscription { expr, .. } => guard_filter_pushdown_safe(expr),
+		Expr::SqlLogicalCast { expr, try_cast, .. } => {
+			*try_cast && guard_filter_pushdown_safe(expr)
+		}
+		Expr::TryCast(inner, _) => guard_filter_pushdown_safe(inner),
+		Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::Not(inner)
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner)
+		| Expr::Substring { input: inner, .. }
+		| Expr::Like { expr: inner, .. } => guard_filter_pushdown_safe(inner),
+		Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => guard_filter_pushdown_safe(left) && guard_filter_pushdown_safe(right),
+		Expr::InList { expr, list, .. } => {
+			guard_filter_pushdown_safe(expr) && list.iter().all(guard_filter_pushdown_safe)
+		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			when_then.iter().all(|(when_expr, then_expr)| {
+				guard_filter_pushdown_safe(when_expr) && guard_filter_pushdown_safe(then_expr)
+			}) && else_expr
+				.as_ref()
+				.map_or(true, |else_expr| guard_filter_pushdown_safe(else_expr))
+		}
+		Expr::SqlConvert { .. }
+		| Expr::Cast(_, _)
+		| Expr::Add(_, _)
+		| Expr::Sub(_, _)
+		| Expr::Mul(_, _)
+		| Expr::Div(_, _) => false,
+	}
+}
+
+fn route_conjuncts_through_alias(
+	conjuncts: Vec<RoutedExpr>,
+	alias: &TableRef,
+	alias_scope: &RelationScope,
+	input_scope: &RelationScope,
+) -> Result<(Vec<RoutedExpr>, Vec<Expr>), BindingError> {
+	route_conjuncts_through(conjuncts, |expr| {
+		remap_expr_through_alias(expr, alias, alias_scope, input_scope)
+	})
+}
+
+fn route_conjuncts_through_project(
+	conjuncts: Vec<RoutedExpr>,
+	map: &HashMap<String, Option<ColumnRef>>,
+	input_scope: &RelationScope,
+) -> Result<(Vec<RoutedExpr>, Vec<Expr>), BindingError> {
+	route_conjuncts_through(conjuncts, |expr| {
+		remap_expr_through_project(expr, map, input_scope)
+	})
+}
+
+fn route_conjuncts_through<F>(
+	conjuncts: Vec<RoutedExpr>,
+	mut remap: F,
+) -> Result<(Vec<RoutedExpr>, Vec<Expr>), BindingError>
+where
+	F: FnMut(&Expr) -> Result<Option<Expr>, BindingError>,
+{
+	let mut routed_conjuncts = Vec::new();
+	let mut residual = Vec::new();
+	for conjunct in conjuncts {
+		match remap(&conjunct.routed)? {
+			Some(routed) => routed_conjuncts.push(RoutedExpr {
+				original: conjunct.original,
+				routed,
+			}),
+			None => residual.push(conjunct.original),
+		}
+	}
+	Ok((routed_conjuncts, residual))
 }
 
 fn remap_expr_through_alias(

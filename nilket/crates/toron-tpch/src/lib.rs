@@ -33,7 +33,7 @@ use tpchgen::generators::{
 	PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 
-use toron::binder::{PlannerConfig, bind};
+use toron::binder::{PlannerConfig, bind, bind_with_explain_summary};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::ByteCount;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -3316,10 +3316,20 @@ fn physical_plan_fingerprint(plan: &ExecutionPlan) -> String {
 
 #[derive(Debug, Clone)]
 pub struct RuneQ3IsolationProof {
+	pub data_source: String,
+	pub manifest_fingerprint: Option<String>,
 	pub sql_plan_fingerprint: String,
 	pub rune_plan_fingerprint: String,
+	pub sql_compact_shape: String,
+	pub rune_compact_shape: String,
 	pub sql_plan_shape: String,
 	pub rune_plan_shape: String,
+	pub optimizer_table_facts: String,
+	pub optimizer_evidence_gap: String,
+	pub sql_join_decisions: String,
+	pub rune_join_decisions: String,
+	pub sql_join_order_edges: String,
+	pub rune_join_order_edges: String,
 }
 
 impl RuneQ3IsolationProof {
@@ -3354,8 +3364,43 @@ struct ProfileLoopIteration {
 }
 
 pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3IsolationProof, String> {
-	let spec = build_perf_query_spec("q03", "strict", scale_factor)?;
-	let (metadata, _) = metadata_storage_from_tables(spec.tables);
+	rune_q03_isolation_proof_with_data_source(
+		"strict",
+		scale_factor,
+		"memory",
+		Path::new(CACHE_ROOT),
+	)
+	.await
+}
+
+pub async fn rune_q03_isolation_proof_with_data_source(
+	mode: &str,
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<RuneQ3IsolationProof, String> {
+	let (metadata, sql, manifest_fingerprint) = match data_source {
+		"memory" => {
+			let spec = build_perf_query_spec("q03", mode, scale_factor)?;
+			let sql = spec.sql;
+			let (metadata, _) = metadata_storage_from_tables(spec.tables);
+			(metadata, sql, None)
+		}
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
+			(
+				spec.tables,
+				spec.sql,
+				Some(spec.export.manifest_fingerprint.clone()),
+			)
+		}
+		other => {
+			return Err(format!(
+				"q03 isolation proof data source {other:?} is not supported"
+			));
+		}
+	};
+	let optimizer_table_facts = summarize_harness_table_facts(&metadata);
 	let mut timings = PerfPhaseTimings::default();
 	let catalog =
 		load_catalog_from_metadata(metadata, &mut timings, Instant::now()).map_err(|error| {
@@ -3365,7 +3410,7 @@ pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3Isolati
 			)
 		})?;
 	let sql_logical = SqlPlanner::new()
-		.plan(spec.sql)
+		.plan(sql)
 		.map_err(|error| format!("plan SQL q03 for rune isolation proof failed: {error}"))?;
 	let rune_logical = rune_q03_logical_plan().await.map_err(|error| {
 		format!(
@@ -3373,18 +3418,213 @@ pub async fn rune_q03_isolation_proof(scale_factor: f64) -> Result<RuneQ3Isolati
 			error.message
 		)
 	})?;
-	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
-		.await
-		.map_err(|error| format!("bind SQL q03 for rune isolation proof failed: {error:?}"))?;
-	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
-		.await
-		.map_err(|error| format!("bind Rune q03 for rune isolation proof failed: {error:?}"))?;
+	let (sql_bound, sql_join_decisions, sql_join_order_edges) =
+		bind_with_explain_summary(&sql_logical, &catalog, &PlannerConfig::default())
+			.await
+			.map_err(|error| format!("bind SQL q03 for rune isolation proof failed: {error:?}"))?;
+	let (rune_bound, rune_join_decisions, rune_join_order_edges) =
+		bind_with_explain_summary(&rune_logical, &catalog, &PlannerConfig::default())
+			.await
+			.map_err(|error| format!("bind Rune q03 for rune isolation proof failed: {error:?}"))?;
+	let optimizer_evidence_gap =
+		q03_optimizer_evidence_gap(&sql_join_order_edges, &rune_join_order_edges);
 	Ok(RuneQ3IsolationProof {
+		data_source: data_source.to_string(),
+		manifest_fingerprint,
 		sql_plan_fingerprint: physical_plan_fingerprint(&sql_bound),
 		rune_plan_fingerprint: physical_plan_fingerprint(&rune_bound),
+		sql_compact_shape: compact_execution_plan_shape(&sql_bound),
+		rune_compact_shape: compact_execution_plan_shape(&rune_bound),
 		sql_plan_shape: format!("{sql_bound:#?}"),
 		rune_plan_shape: format!("{rune_bound:#?}"),
+		optimizer_table_facts,
+		optimizer_evidence_gap,
+		sql_join_decisions,
+		rune_join_decisions,
+		sql_join_order_edges,
+		rune_join_order_edges,
 	})
+}
+
+fn summarize_harness_table_facts(metadata: &[HarnessTableMetadata]) -> String {
+	metadata
+		.iter()
+		.map(|table| {
+			format!(
+				"{} rows={:?} bytes={:?} ndv={} ranges={} range_dist={} heavy_hitters={} group_top_k={} group_ndv={}",
+				table.name,
+				table.facts.row_upper_bound.map(RowCount::get),
+				table.facts.byte_upper_bound.map(ByteCount::get),
+				table.facts.column_ndv.len(),
+				table.facts.column_range.len(),
+				table.facts.column_range_distributions.len(),
+				table.facts.column_heavy_hitters.len(),
+				table.facts.column_group_top_k.len(),
+				table.facts.column_group_ndv.len()
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(" | ")
+}
+
+fn q03_optimizer_evidence_gap(sql_join_order_edges: &str, rune_join_order_edges: &str) -> String {
+	format!(
+		"sql_join_order_rows_missing={}; rune_join_order_rows_missing={}; join_order_edge_fields=join_index,kind,probe,dim,left_keys,right_keys,rows,linearity; missing_evidence=post_filter_cardinality,multi_relation_cost",
+		sql_join_order_edges.contains("rows=None"),
+		rune_join_order_edges.contains("rows=None")
+	)
+}
+
+fn compact_execution_plan_shape(plan: &ExecutionPlan) -> String {
+	match plan {
+		ExecutionPlan::Scan {
+			local_table_id,
+			schema,
+			projection,
+			pbc_program,
+			..
+		} => format!(
+			"Scan(t={},cols=[{}],projection={:?},pbc={})",
+			local_table_id.0,
+			schema_field_names(schema),
+			projection,
+			pbc_program.is_some()
+		),
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => format!(
+			"Filter(disposition={disposition:?},predicate={},input={})",
+			predicate.pretty(),
+			compact_execution_plan_shape(input)
+		),
+		ExecutionPlan::Project {
+			input,
+			exprs,
+			output_schema,
+		} => format!(
+			"Project(roots={},cols=[{}],input={})",
+			exprs.root_count(),
+			schema_field_names(output_schema),
+			compact_execution_plan_shape(input)
+		),
+		ExecutionPlan::Aggregate {
+			input,
+			group_expr,
+			aggr_expr,
+			output_schema,
+		} => format!(
+			"Aggregate(groups={},aggrs={},cols=[{}],input={})",
+			group_expr.root_count(),
+			aggr_expr.len(),
+			schema_field_names(output_schema),
+			compact_execution_plan_shape(input)
+		),
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => format!(
+			"Exchange(parts={partition_count},keys={},input={})",
+			key.root_count(),
+			compact_execution_plan_shape(input)
+		),
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			..
+		} => {
+			let keys = order_by
+				.iter()
+				.map(|key| {
+					format!(
+						"{}:{}:{}",
+						key.ordinal.0,
+						if key.descending { "desc" } else { "asc" },
+						if key.nulls_first {
+							"nulls_first"
+						} else {
+							"nulls_last"
+						}
+					)
+				})
+				.collect::<Vec<_>>()
+				.join(",");
+			format!(
+				"Sort(keys=[{}],limit={limit:?},offset={offset},input={})",
+				keys,
+				compact_execution_plan_shape(input)
+			)
+		}
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			..
+		} => format!(
+			"Join(kind={kind:?},strategy={strategy:?},keys={:?}/{:?},left={},right={})",
+			left_keys,
+			right_keys,
+			compact_execution_plan_shape(left),
+			compact_execution_plan_shape(right)
+		),
+		ExecutionPlan::Union { left, right, .. } => format!(
+			"Union(left={},right={})",
+			compact_execution_plan_shape(left),
+			compact_execution_plan_shape(right)
+		),
+		ExecutionPlan::Window { input, .. } => {
+			format!("Window(input={})", compact_execution_plan_shape(input))
+		}
+		ExecutionPlan::Take { input, limit, .. } => {
+			format!(
+				"Take(limit={limit},input={})",
+				compact_execution_plan_shape(input)
+			)
+		}
+		ExecutionPlan::Repeat { input, .. } => {
+			format!("Repeat(input={})", compact_execution_plan_shape(input))
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. } => {
+			format!(
+				"CreateTableAsSelect(input={})",
+				compact_execution_plan_shape(source)
+			)
+		}
+		ExecutionPlan::Update { source, .. } => {
+			format!("Update(input={})", compact_execution_plan_shape(source))
+		}
+		ExecutionPlan::InsertSelect { source, .. } => {
+			format!(
+				"InsertSelect(input={})",
+				compact_execution_plan_shape(source)
+			)
+		}
+		ExecutionPlan::EmptyRelation { .. } => "EmptyRelation".to_string(),
+		ExecutionPlan::SystemTable { kind, .. } => format!("SystemTable({kind:?})"),
+		ExecutionPlan::CreateTable { .. } => "CreateTable".to_string(),
+		ExecutionPlan::CreateLogicalType { .. } => "CreateLogicalType".to_string(),
+		ExecutionPlan::DropTable { .. } => "DropTable".to_string(),
+		ExecutionPlan::Delete { .. } => "Delete".to_string(),
+		ExecutionPlan::Insert { .. } => "Insert".to_string(),
+		ExecutionPlan::RecursiveCte { .. } => "RecursiveCte".to_string(),
+		ExecutionPlan::RecursiveRef { .. } => "RecursiveRef".to_string(),
+	}
+}
+
+fn schema_field_names(schema: &SchemaRef) -> String {
+	schema
+		.fields()
+		.iter()
+		.map(|field| field.name().as_str())
+		.collect::<Vec<_>>()
+		.join(",")
 }
 
 pub async fn run_rune_q03_profile_loop_with_data_source(
@@ -12145,12 +12385,40 @@ mod adr356_perf_rail {
 mod adr391_rune_perf_decomposition {
 	use super::*;
 
+	struct TempRootCleanup(PathBuf);
+
+	impl Drop for TempRootCleanup {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn print_q03_proof(label: &str, proof: &RuneQ3IsolationProof) {
+		eprintln!(
+			"{label} q03 proof data_source={} manifest={:?}",
+			proof.data_source, proof.manifest_fingerprint
+		);
+		eprintln!(
+			"{label} fingerprints sql={} rune={}",
+			proof.sql_plan_fingerprint, proof.rune_plan_fingerprint
+		);
+		eprintln!("{label} SQL compact: {}", proof.sql_compact_shape);
+		eprintln!("{label} Rune compact: {}", proof.rune_compact_shape);
+		eprintln!("{label} SQL decisions: {}", proof.sql_join_decisions);
+		eprintln!("{label} Rune decisions: {}", proof.rune_join_decisions);
+		eprintln!("{label} SQL edges: {}", proof.sql_join_order_edges);
+		eprintln!("{label} Rune edges: {}", proof.rune_join_order_edges);
+	}
+
 	#[test]
 	fn rune_q03_isolation_proof_differs_from_sql_shape() {
 		run_on_large_stack(|| async {
 			let proof = rune_q03_isolation_proof(0.01)
 				.await
 				.expect("isolation proof");
+			if std::env::var_os("TORON_TPCH_PRINT_Q03_PROOF").is_some() {
+				print_q03_proof("memory", &proof);
+			}
 			assert!(
 				proof.plans_differ(),
 				"Rune q03 must bind to a distinct physical shape, or the logical-shape probe is void"
@@ -12160,6 +12428,87 @@ mod adr391_rune_perf_decomposition {
 			assert!(
 				proof.rune_plan_shape.contains("Join") || proof.rune_plan_shape.contains("join"),
 				"Rune q03 proof should expose a join-bearing physical plan"
+			);
+		});
+	}
+
+	#[test]
+	fn rune_q03_persisted_isolation_proof_uses_persisted_path() {
+		run_on_large_stack(|| async {
+			let root = std::env::temp_dir().join(format!(
+				"toron_tpch_adr401_q03_persisted_{}",
+				std::process::id()
+			));
+			let _cleanup = TempRootCleanup(root.clone());
+			let _ = std::fs::remove_dir_all(&root);
+			let proof = rune_q03_isolation_proof_with_data_source("strict", 0.01, "parquet", &root)
+				.await
+				.expect("persisted isolation proof");
+			if std::env::var_os("TORON_TPCH_PRINT_Q03_PROOF").is_some() {
+				print_q03_proof("persisted", &proof);
+			}
+			assert_eq!(proof.data_source, "parquet");
+			assert!(proof.manifest_fingerprint.is_some());
+			assert!(!proof.sql_plan_fingerprint.is_empty());
+			assert!(!proof.rune_plan_fingerprint.is_empty());
+			for table_name in ["customer", "orders", "lineitem"] {
+				assert!(
+					proof.optimizer_table_facts.contains(table_name),
+					"persisted q03 proof should expose optimizer facts for {table_name}: {}",
+					proof.optimizer_table_facts
+				);
+			}
+			assert!(
+				proof.optimizer_table_facts.contains("rows=Some(")
+					&& proof.optimizer_table_facts.contains("bytes=Some("),
+				"persisted q03 proof should expose row and byte facts: {}",
+				proof.optimizer_table_facts
+			);
+			assert!(
+				proof
+					.optimizer_evidence_gap
+					.contains("sql_join_order_rows_missing=true")
+					&& proof
+						.optimizer_evidence_gap
+						.contains("rune_join_order_rows_missing=true")
+					&& proof.optimizer_evidence_gap.contains(
+						"join_order_edge_fields=join_index,kind,probe,dim,left_keys,right_keys,rows,linearity"
+					) && proof
+					.optimizer_evidence_gap
+					.contains("missing_evidence=post_filter_cardinality,multi_relation_cost"),
+				"persisted q03 proof should compute the remaining optimizer evidence gap: {}",
+				proof.optimizer_evidence_gap
+			);
+			assert!(!proof.sql_join_decisions.is_empty());
+			assert!(!proof.rune_join_decisions.is_empty());
+			assert!(!proof.sql_join_order_edges.is_empty());
+			assert!(!proof.rune_join_order_edges.is_empty());
+			assert_eq!(proof.sql_join_decisions, proof.rune_join_decisions);
+			for predicate in ["c_mktsegment", "o_orderdate", "l_shipdate"] {
+				assert!(
+					proof.sql_compact_shape.contains(predicate),
+					"SQL compact shape should retain pushed {predicate} filter: {}",
+					proof.sql_compact_shape
+				);
+				assert!(
+					proof.rune_compact_shape.contains(predicate),
+					"Rune compact shape should retain {predicate} filter: {}",
+					proof.rune_compact_shape
+				);
+			}
+			assert!(
+				proof.sql_compact_shape.contains("Aggregate(groups=3")
+					&& proof
+						.sql_compact_shape
+						.contains("input=Exchange(parts=4,keys=3,input=Join"),
+				"SQL q03 still carries the distributed grouped-aggregate exchange residual: {}",
+				proof.sql_compact_shape
+			);
+			assert!(
+				proof.rune_compact_shape.contains("Aggregate(groups=3")
+					&& proof.rune_compact_shape.contains("input=Join"),
+				"Rune q03 aggregate remains the no-pre-aggregate-exchange control: {}",
+				proof.rune_compact_shape
 			);
 		});
 	}
@@ -12670,6 +13019,36 @@ mod adr331_q08_scale_probe {
 			.expect("spawn q05 thread")
 			.join()
 			.expect("q05 thread panicked");
+	}
+
+	#[test]
+	fn strict_q10_stays_keyed_at_default_scale() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("tokio runtime");
+				runtime.block_on(async {
+					let logical = SqlPlanner::new()
+						.plan(STRICT_Q10_SQL)
+						.expect("plan strict q10");
+					let default_cap = PlannerConfig::default();
+					let catalog = catalog_from_tables(q10_tables(true, 0.01));
+					assert_strict_query_stays_keyed_at_scale(
+						"q10",
+						"sf=0.01",
+						&logical,
+						&catalog,
+						&default_cap,
+					)
+					.await;
+				});
+			})
+			.expect("spawn q10 thread")
+			.join()
+			.expect("q10 thread panicked");
 	}
 }
 

@@ -4008,6 +4008,429 @@ async fn sql_inner_join_pushes_leftmost_local_conjunct_to_left_input() {
 }
 
 #[tokio::test]
+async fn sql_comma_join_pushes_local_conjunct_before_lifted_equi() {
+	let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+		Some(64 * 1024 * 1024),
+		None,
+		Some(20_000),
+		vec![(
+			ColumnOrdinal(1),
+			DistinctCountFact::Approx {
+				estimate: 10_000,
+				rel_err_ppm: 26_000,
+			},
+		)],
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM customers c, orders o \
+				 WHERE c.id = o.customer_id AND c.region = 'north'",
+		)
+		.expect("plan SQL comma join with filtered dimension");
+
+	let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind lifted comma join with side-local filter");
+
+	assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	assert!(matches!(
+		trace.join_decisions[0].reason,
+		JoinStrategyDecisionReason::BroadcastEstimated {
+			build_side: BroadcastBuildSide::Left,
+			..
+		}
+	));
+}
+
+#[tokio::test]
+async fn comma_join_side_local_conjunct_does_not_cross_take() {
+	let catalog = join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Take {
+				input: Box::new(named_scan("customers")),
+				limit: 1,
+			}),
+			right: Box::new(named_scan("orders")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(qcol("customers", "id")),
+				Box::new(qcol("orders", "customer_id")),
+			)),
+			Box::new(customers_region_is_north()),
+		),
+	};
+
+	let normalized = recognize_cross_equi_plan(&logical, &catalog).await;
+
+	let LogicalPlan::Filter { input, predicate } = normalized else {
+		panic!("take-fenced local predicate should remain a residual root filter");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(predicate_text.contains("region"), "{predicate_text}");
+	let LogicalPlan::Join {
+		left,
+		kind: JoinKind::Inner,
+		..
+	} = *input
+	else {
+		panic!("bridging equality should still lift the outer comma join");
+	};
+	let LogicalPlan::Take { input, .. } = *left else {
+		panic!("left child should remain take-fenced");
+	};
+	assert!(
+		matches!(*input, LogicalPlan::ScanNamed { .. }),
+		"local predicate must not materialize under Take"
+	);
+}
+
+#[tokio::test]
+async fn comma_join_side_local_conjunct_stays_above_child_filter_guard() {
+	let catalog = join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Filter {
+				input: Box::new(named_scan("customers")),
+				predicate: Expr::Neq(
+					Box::new(qcol("customers", "id")),
+					Box::new(int64_literal(0)),
+				),
+			}),
+			right: Box::new(named_scan("orders")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(qcol("customers", "id")),
+				Box::new(qcol("orders", "customer_id")),
+			)),
+			Box::new(Expr::Gt(
+				Box::new(Expr::Div(
+					Box::new(int64_literal(10)),
+					Box::new(qcol("customers", "id")),
+				)),
+				Box::new(int64_literal(1)),
+			)),
+		),
+	};
+
+	let normalized = recognize_cross_equi_plan(&logical, &catalog).await;
+
+	let LogicalPlan::Join {
+		left,
+		kind: JoinKind::Inner,
+		..
+	} = normalized
+	else {
+		panic!("bridging equality should lift the guarded comma join");
+	};
+	let LogicalPlan::Filter {
+		input,
+		predicate: pushed_predicate,
+	} = *left
+	else {
+		panic!("side-local arithmetic predicate should sit above the guard");
+	};
+	let pushed_text = format!("{pushed_predicate:?}");
+	assert!(
+		pushed_text.contains("Div") && pushed_text.contains("Gt"),
+		"{pushed_text}"
+	);
+	let LogicalPlan::Filter {
+		input,
+		predicate: guard_predicate,
+	} = *input
+	else {
+		panic!("child guard should remain below the pushed predicate");
+	};
+	let guard_text = format!("{guard_predicate:?}");
+	assert!(guard_text.contains("Neq"), "{guard_text}");
+	assert!(
+		matches!(*input, LogicalPlan::ScanNamed { .. }),
+		"guarded scan should not receive the arithmetic predicate"
+	);
+}
+
+#[tokio::test]
+async fn comma_join_safe_conjunct_stays_above_error_prone_child_filter() {
+	let catalog = join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Filter {
+				input: Box::new(named_scan("customers")),
+				predicate: Expr::Gt(
+					Box::new(Expr::Div(
+						Box::new(int64_literal(10)),
+						Box::new(qcol("customers", "id")),
+					)),
+					Box::new(int64_literal(1)),
+				),
+			}),
+			right: Box::new(named_scan("orders")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(qcol("customers", "id")),
+				Box::new(qcol("orders", "customer_id")),
+			)),
+			Box::new(customers_region_is_north()),
+		),
+	};
+
+	let normalized = recognize_cross_equi_plan(&logical, &catalog).await;
+
+	let LogicalPlan::Join {
+		left,
+		kind: JoinKind::Inner,
+		..
+	} = normalized
+	else {
+		panic!("bridging equality should still lift the guarded comma join");
+	};
+	let LogicalPlan::Filter {
+		input,
+		predicate: pushed_predicate,
+	} = *left
+	else {
+		panic!("safe side-local predicate should stay above the error-prone child filter");
+	};
+	let pushed_text = format!("{pushed_predicate:?}");
+	assert!(pushed_text.contains("region"), "{pushed_text}");
+	let LogicalPlan::Filter {
+		input,
+		predicate: guard_predicate,
+	} = *input
+	else {
+		panic!("error-prone child filter should remain between pushed predicate and scan");
+	};
+	let guard_text = format!("{guard_predicate:?}");
+	assert!(
+		guard_text.contains("Div") && guard_text.contains("Gt"),
+		"{guard_text}"
+	);
+	assert!(
+		matches!(*input, LogicalPlan::ScanNamed { .. }),
+		"safe predicate must not move below the error-prone child filter"
+	);
+}
+
+#[tokio::test]
+async fn comma_join_safe_equi_conjunct_crosses_child_filter_guard_to_key_nested_cross() {
+	let catalog = unique_three_table_join_catalog();
+	let guarded_ab = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(named_scan("a")),
+			right: Box::new(named_scan("b")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::Gt(Box::new(qcol("a", "id")), Box::new(qcol("b", "id"))),
+	};
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(guarded_ab),
+			right: Box::new(named_scan("c")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(Box::new(qcol("a", "x")), Box::new(qcol("b", "y")))),
+			Box::new(Expr::Eq(Box::new(qcol("b", "y")), Box::new(qcol("c", "z")))),
+		),
+	};
+
+	let normalized = recognize_cross_equi_plan(&logical, &catalog).await;
+
+	assert_eq!(
+		logical_join_kinds(&normalized),
+		vec![JoinKind::Inner, JoinKind::Inner]
+	);
+	let LogicalPlan::Join {
+		left,
+		kind: JoinKind::Inner,
+		..
+	} = normalized
+	else {
+		panic!("outer comma join should lift");
+	};
+	let LogicalPlan::Filter { input, predicate } = *left else {
+		panic!("pre-existing child guard should stay above the nested join");
+	};
+	let guard_text = format!("{predicate:?}");
+	assert!(guard_text.contains("Gt"), "{guard_text}");
+	assert!(
+		matches!(
+			*input,
+			LogicalPlan::Join {
+				kind: JoinKind::Inner,
+				..
+			}
+		),
+		"safe side-local equality should key the nested comma join"
+	);
+}
+
+#[tokio::test]
+async fn comma_join_alias_child_recurses_to_nested_cross() {
+	let catalog = unique_three_table_join_catalog();
+	let aliased_ab = LogicalPlan::Alias {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(named_scan("a")),
+			right: Box::new(named_scan("b")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		alias: TableRef::new("ab"),
+		columns: vec![
+			"a_id".to_string(),
+			"x".to_string(),
+			"b_id".to_string(),
+			"y".to_string(),
+		],
+	};
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(aliased_ab),
+			right: Box::new(named_scan("c")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("x")),
+				Box::new(Expr::column("y")),
+			)),
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("y")),
+				Box::new(Expr::column("z")),
+			)),
+		),
+	};
+
+	let normalized = recognize_cross_equi_plan(&logical, &catalog).await;
+
+	assert_eq!(
+		logical_join_kinds(&normalized),
+		vec![JoinKind::Inner, JoinKind::Inner]
+	);
+}
+
+#[tokio::test]
+async fn comma_join_project_child_remaps_only_passthrough_conjuncts() {
+	let catalog = unique_three_table_join_catalog();
+	let passthrough = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Project {
+				input: Box::new(LogicalPlan::Join {
+					left: Box::new(named_scan("a")),
+					right: Box::new(named_scan("b")),
+					kind: JoinKind::Cross,
+					on: Vec::new(),
+					on_filter: None,
+					null_safe_keys: false,
+					strategy_intent: JoinStrategyIntent::Auto,
+				}),
+				exprs: vec![qcol("a", "x"), qcol("b", "y")],
+				output_names: vec![Some("x".to_string()), Some("y".to_string())],
+			}),
+			right: Box::new(named_scan("c")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("x")),
+				Box::new(Expr::column("y")),
+			)),
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("y")),
+				Box::new(Expr::column("z")),
+			)),
+		),
+	};
+	let normalized = recognize_cross_equi_plan(&passthrough, &catalog).await;
+	assert_eq!(
+		logical_join_kinds(&normalized),
+		vec![JoinKind::Inner, JoinKind::Inner]
+	);
+
+	let computed = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Project {
+				input: Box::new(LogicalPlan::Join {
+					left: Box::new(named_scan("a")),
+					right: Box::new(named_scan("b")),
+					kind: JoinKind::Cross,
+					on: Vec::new(),
+					on_filter: None,
+					null_safe_keys: false,
+					strategy_intent: JoinStrategyIntent::Auto,
+				}),
+				exprs: vec![
+					qcol("a", "x"),
+					Expr::Add(Box::new(qcol("b", "y")), Box::new(int64_literal(0))),
+				],
+				output_names: vec![Some("x".to_string()), Some("y_plus".to_string())],
+			}),
+			right: Box::new(named_scan("c")),
+			kind: JoinKind::Cross,
+			on: Vec::new(),
+			on_filter: None,
+			null_safe_keys: false,
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("x")),
+				Box::new(Expr::column("y_plus")),
+			)),
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("x")),
+				Box::new(Expr::column("z")),
+			)),
+		),
+	};
+	let normalized = recognize_cross_equi_plan(&computed, &catalog).await;
+
+	let LogicalPlan::Filter { predicate, .. } = normalized else {
+		panic!("computed project conjunct should stay in the parent residual");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(predicate_text.contains("y_plus"), "{predicate_text}");
+}
+
+#[tokio::test]
 async fn sql_multi_dim_star_each_filtered_dim_broadcasts() {
 	let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
 		Some(64 * 1024 * 1024),
@@ -20647,6 +21070,15 @@ async fn demote_outer_join_plan(
 		.expect("demote outer joins")
 }
 
+async fn recognize_cross_equi_plan(logical: &LogicalPlan, catalog: &dyn Catalog) -> LogicalPlan {
+	let config = PlannerConfig::default();
+	let binder = Binder::new(catalog, &config);
+	binder
+		.recognize_cross_equi_joins(logical)
+		.await
+		.expect("recognize cross equi joins")
+}
+
 async fn optimizer_decision_rows(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
@@ -21719,6 +22151,30 @@ fn join_catalog() -> MockCatalog {
 			),
 		)
 		.expect("register customers");
+	catalog
+}
+
+fn unique_three_table_join_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	for (table_id, descriptor_id, table, column) in [
+		(101, 101, "a", "x"),
+		(102, 102, "b", "y"),
+		(103, 103, "c", "z"),
+	] {
+		catalog
+			.register_descriptor(
+				TableId(table_id),
+				named_descriptor(
+					descriptor_id,
+					table,
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new(column, DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register unique join table");
+	}
 	catalog
 }
 

@@ -390,6 +390,7 @@ pub(crate) fn adr210_filter_router_subsumes_depth_zero_demotion() {
 pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
 	let route = outer_join_route_source(&demotion);
+	let alias_router = source_block(&demotion, "fn route_conjuncts_through_alias");
 	let ownership = source_block(&demotion, "fn conjunct_column_sides");
 	let tests = binder_source();
 
@@ -401,7 +402,8 @@ pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
 	assert!(route.contains("limit: None"));
 	assert!(route.contains("offset: 0"));
 	assert!(route.contains("LogicalPlan::Alias {"));
-	assert!(route.contains("remap_expr_through_alias"));
+	assert!(route.contains("route_conjuncts_through_alias("));
+	assert!(alias_router.contains("remap_expr_through_alias("));
 	assert!(route.contains("LogicalPlan::Project {"));
 	assert!(route.contains("project_passthrough_map"));
 	assert!(route.contains("LogicalPlan::Aggregate { .. }"));
@@ -721,6 +723,7 @@ pub(crate) fn adr212_demoting_cross_side_or_keeps_conjunct_residual() {
 pub(crate) fn adr212_alias_descent_requires_identity_remap_unique_resolution() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
 	let route = outer_join_route_source(&demotion);
+	let alias_router = source_block(&demotion, "fn route_conjuncts_through_alias");
 	let alias = source_block(&demotion, "fn remap_expr_through_alias");
 	let ordinal = source_block(&demotion, "fn alias_output_ordinal");
 	let tests = binder_source();
@@ -728,7 +731,8 @@ pub(crate) fn adr212_alias_descent_requires_identity_remap_unique_resolution() {
 	assert!(route.contains("LogicalPlan::Alias {"));
 	assert!(route.contains("alias_schema_for_outer_demotion(&input_scope.schema, &columns)?"));
 	assert!(route.contains("RelationScope::alias(alias.clone(), &alias_schema)"));
-	assert!(route.contains("remap_expr_through_alias("));
+	assert!(route.contains("route_conjuncts_through_alias("));
+	assert!(alias_router.contains("remap_expr_through_alias("));
 	assert!(route.contains("JoinSideStep::Alias(alias.clone())"));
 	assert!(alias.contains("resolve_join_column(&remapped, \"alias input\")"));
 	assert!(ordinal.contains("unique_schema_ordinal("));
@@ -748,12 +752,14 @@ pub(crate) fn adr212_project_descent_requires_direct_column_passthrough() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
 	let route = outer_join_route_source(&demotion);
 	let map = source_block(&demotion, "fn project_passthrough_map");
+	let project_router = source_block(&demotion, "fn route_conjuncts_through_project");
 	let remap = source_block(&demotion, "fn remap_expr_through_project");
 	let tests = binder_source();
 
 	assert!(route.contains("LogicalPlan::Project {"));
 	assert!(route.contains("project_passthrough_map(&exprs, &output_names, &input_scope)?"));
-	assert!(route.contains("remap_expr_through_project("));
+	assert!(route.contains("route_conjuncts_through_project("));
+	assert!(project_router.contains("remap_expr_through_project("));
 	assert!(route.contains("JoinSideStep::Project"));
 	assert!(map.contains("Some(Expr::Column(column_ref))"));
 	assert!(map.contains("output_name.clone()"));
@@ -773,15 +779,21 @@ pub(crate) fn adr212_project_descent_requires_direct_column_passthrough() {
 pub(crate) fn adr212_residuals_preserve_original_form() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
 	let route = outer_join_route_source(&demotion);
+	let alias_router = source_block(&demotion, "fn route_conjuncts_through_alias");
+	let project_router = source_block(&demotion, "fn route_conjuncts_through_project");
+	let shared_router = source_block(&demotion, "fn route_conjuncts_through<F>");
 	let routed = source_block(&demotion, "struct RoutedExpr");
 	let originals = source_block(&demotion, "fn routed_originals");
 	let tests = binder_source();
 
 	assert!(routed.contains("original: Expr"));
 	assert!(routed.contains("routed: Expr"));
-	assert!(route.contains("original: conjunct.original"));
-	assert!(route.contains("routed,"));
+	assert!(alias_router.contains("route_conjuncts_through(conjuncts"));
+	assert!(project_router.contains("route_conjuncts_through(conjuncts"));
+	assert!(shared_router.contains("original: conjunct.original"));
+	assert!(shared_router.contains("routed,"));
 	assert!(route.contains("residual.push(conjunct.original)"));
+	assert!(shared_router.contains("residual.push(conjunct.original)"));
 	assert!(originals.contains("map(|conjunct| conjunct.original)"));
 	assert!(tests.contains("alias_project_residuals_preserve_original_filter_shape"));
 	assert!(tests.contains("remapped_conjunct_results_match_unwrapped_query"));

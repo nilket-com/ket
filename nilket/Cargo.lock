@@ -3105,7 +3105,6 @@ dependencies = [
  "polars-io",
  "polars-lazy",
  "polars-ops",
- "polars-parquet",
  "polars-sql",
  "polars-time",
  "polars-utils",

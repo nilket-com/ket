@@ -25,7 +25,8 @@ use toron_tpch::{
 	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
 	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
 	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
-	schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
+	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
+	stable_fingerprint, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -82,6 +83,7 @@ async fn main() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
 		// ADR 273: the correctness rail — answer-check a query against an independent oracle.
 		"correctness" => correctness_command(&args).await,
@@ -277,6 +279,43 @@ fn data_dir_from_args(args: &[String]) -> PathBuf {
 	flag_value(args, "--data-dir")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from(CACHE_ROOT).join("data"))
+}
+
+async fn q03_plan_proof_command(args: &[String]) -> ExitCode {
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_dir = data_dir_from_args(args);
+	let sf = match explicit_sf(args) {
+		Ok(explicit) => explicit.unwrap_or(DEFAULT_SF),
+		Err(message) => return harness_error(&message),
+	};
+	let proof =
+		match rune_q03_isolation_proof_with_data_source(mode, sf, data_source, &data_dir).await {
+			Ok(proof) => proof,
+			Err(message) => return harness_error(&message),
+		};
+	let row = serde_json::json!({
+		"suite": "tpch_q03_plan_proof",
+		"mode": mode,
+		"scale_factor": sf,
+		"data_source": proof.data_source,
+		"manifest_fingerprint": proof.manifest_fingerprint,
+		"sql_plan_fingerprint": proof.sql_plan_fingerprint,
+		"rune_plan_fingerprint": proof.rune_plan_fingerprint,
+		"plans_differ": proof.plans_differ(),
+		"sql_compact_shape": proof.sql_compact_shape,
+		"rune_compact_shape": proof.rune_compact_shape,
+		"sql_plan_shape": proof.sql_plan_shape,
+		"rune_plan_shape": proof.rune_plan_shape,
+		"optimizer_table_facts": proof.optimizer_table_facts,
+		"optimizer_evidence_gap": proof.optimizer_evidence_gap,
+		"sql_join_decisions": proof.sql_join_decisions,
+		"rune_join_decisions": proof.rune_join_decisions,
+		"sql_join_order_edges": proof.sql_join_order_edges,
+		"rune_join_order_edges": proof.rune_join_order_edges,
+	});
+	println!("{row}");
+	ExitCode::SUCCESS
 }
 
 async fn perf_command(args: &[String]) -> ExitCode {
@@ -1173,70 +1212,91 @@ fn run_polars_perf_export(
 }
 
 #[cfg(feature = "polars-sql-reference")]
+#[derive(Debug, Clone)]
+struct PolarsReferenceError {
+	reason: &'static str,
+	message: String,
+}
+
+#[cfg(feature = "polars-sql-reference")]
+impl PolarsReferenceError {
+	fn new(reason: &'static str, message: impl Into<String>) -> Self {
+		Self {
+			reason,
+			message: message.into(),
+		}
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
 fn run_polars_perf_export(
 	export: &toron_tpch::TpchParquetExport,
 	run_index: u32,
 	warmup: bool,
 ) -> PerfAttempt {
-	use polars::prelude::*;
 	use polars_sql::SQLContext;
 
 	let plan_fingerprint = polars_plan_fingerprint(export);
 	let engine_version = Some(polars::VERSION.to_string());
 	let mut context = SQLContext::new();
-	for table in &export.tables {
-		let Some(path) = table.path.to_str() else {
+	if let Err(error) = register_polars_reference_tables(export, &mut context) {
+		return polars_fail_attempt(
+			export,
+			&plan_fingerprint,
+			run_index,
+			warmup,
+			error.reason,
+			&error.message,
+			engine_version,
+		);
+	}
+
+	let polars_sql = polars_sql_text(export);
+	let lazy = match execute_polars_sql(&mut context, polars_sql.as_ref()) {
+		Ok(lazy) => lazy,
+		Err(message) if polars_error_is_known_unsupported(&message) => {
+			return polars_unsupported_attempt(
+				export,
+				&plan_fingerprint,
+				run_index,
+				warmup,
+				&message,
+				engine_version,
+			);
+		}
+		Err(message) => {
 			return polars_fail_attempt(
 				export,
 				&plan_fingerprint,
 				run_index,
 				warmup,
-				"polars_invalid_path",
-				&format!("non-utf8 parquet path {}", table.path.display()),
-				engine_version,
-			);
-		};
-		let lazy = match LazyFrame::scan_parquet(path.into(), Default::default()) {
-			Ok(lazy) => lazy,
-			Err(error) => {
-				return polars_fail_attempt(
-					export,
-					&plan_fingerprint,
-					run_index,
-					warmup,
-					"polars_scan_failed",
-					&format!("{error:?}"),
-					engine_version,
-				);
-			}
-		};
-		context.register(&table.name, lazy);
-	}
-
-	let polars_sql = polars_sql_text(export);
-	let lazy = match context.execute(polars_sql.as_ref()) {
-		Ok(lazy) => lazy,
-		Err(error) => {
-			return polars_unsupported_attempt(
-				export,
-				&plan_fingerprint,
-				run_index,
-				warmup,
-				&format!("{error:?}"),
+				"polars_execute_failed",
+				&message,
 				engine_version,
 			);
 		}
 	};
 	let start = Instant::now();
-	let frame = match lazy.collect() {
+	let frame = match collect_polars_lazy_frame(lazy) {
 		Ok(frame) => frame,
-		Err(error) => {
+		Err(message) if polars_error_is_known_unsupported(&message) => {
 			return polars_unsupported_attempt(
 				export,
 				&plan_fingerprint,
 				run_index,
 				warmup,
-				&format!("{error:?}"),
+				&message,
+				engine_version,
+			);
+		}
+		Err(message) => {
+			return polars_fail_attempt(
+				export,
+				&plan_fingerprint,
+				run_index,
+				warmup,
+				"polars_collect_failed",
+				&message,
 				engine_version,
 			);
 		}
@@ -1284,29 +1344,116 @@ fn polars_schema_signature(frame: &polars::prelude::DataFrame) -> String {
 fn collect_polars_sql_frame(
 	export: &toron_tpch::TpchParquetExport,
 ) -> Result<polars::prelude::DataFrame, String> {
-	use polars::prelude::*;
 	use polars_sql::SQLContext;
 
 	let mut context = SQLContext::new();
+	register_polars_reference_tables(export, &mut context).map_err(|error| error.message)?;
+	let polars_sql = polars_sql_text(export);
+	let lazy = execute_polars_sql(&mut context, polars_sql.as_ref())?;
+	collect_polars_lazy_frame(lazy).map_err(|error| format!("polars collect failed: {error}"))
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn register_polars_reference_tables(
+	export: &toron_tpch::TpchParquetExport,
+	context: &mut polars_sql::SQLContext,
+) -> Result<(), PolarsReferenceError> {
+	use polars::prelude::*;
+
 	for table in &export.tables {
 		let Some(path) = table.path.to_str() else {
-			return Err(format!("non-utf8 parquet path {}", table.path.display()));
+			return Err(PolarsReferenceError::new(
+				"polars_invalid_path",
+				format!("non-utf8 parquet path {}", table.path.display()),
+			));
 		};
 		let lazy = LazyFrame::scan_parquet(path.into(), Default::default()).map_err(|error| {
-			format!(
-				"polars scan failed for {} ({}): {error:?}",
-				table.name,
-				table.path.display()
+			PolarsReferenceError::new(
+				"polars_scan_failed",
+				format!(
+					"polars scan failed for {} ({}): {error:?}",
+					table.name,
+					table.path.display()
+				),
 			)
 		})?;
 		context.register(&table.name, lazy);
 	}
-	let polars_sql = polars_sql_text(export);
-	let lazy = context
-		.execute(polars_sql.as_ref())
-		.map_err(|error| format!("polars SQL execute failed: {error:?}"))?;
-	lazy.collect()
-		.map_err(|error| format!("polars collect failed: {error:?}"))
+	Ok(())
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn execute_polars_sql(
+	context: &mut polars_sql::SQLContext,
+	sql: &str,
+) -> Result<polars::prelude::LazyFrame, String> {
+	match catch_polars_unwind("polars SQL execute", || context.execute(sql)) {
+		Ok(Ok(lazy)) => Ok(lazy),
+		Ok(Err(error)) => Err(format!("polars SQL execute failed: {error:?}")),
+		Err(message) => Err(message),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn collect_polars_lazy_frame(
+	lazy: polars::prelude::LazyFrame,
+) -> Result<polars::prelude::DataFrame, String> {
+	match catch_polars_unwind("polars collect", || lazy.collect()) {
+		Ok(Ok(frame)) => Ok(frame),
+		Ok(Err(error)) => Err(format!("{error:?}")),
+		Err(message) => Err(message),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+static POLARS_PANIC_HOOK_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+	std::sync::OnceLock::new();
+
+#[cfg(feature = "polars-sql-reference")]
+fn catch_polars_unwind<T, F>(label: &str, f: F) -> Result<T, String>
+where
+	F: FnOnce() -> T,
+{
+	let hook_lock = POLARS_PANIC_HOOK_LOCK
+		.get_or_init(|| std::sync::Mutex::new(()))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner());
+	let current_thread = std::thread::current().id();
+	let previous_hook = std::sync::Arc::new(std::panic::take_hook());
+	let previous_hook_for_delegate = std::sync::Arc::clone(&previous_hook);
+	std::panic::set_hook(Box::new(move |info| {
+		if std::thread::current().id() != current_thread {
+			(previous_hook_for_delegate.as_ref())(info);
+		}
+	}));
+	let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+	let installed_hook = std::panic::take_hook();
+	drop(installed_hook);
+	let previous_hook = std::sync::Arc::try_unwrap(previous_hook).unwrap_or_else(|previous_hook| {
+		Box::new(move |info| {
+			(previous_hook.as_ref())(info);
+		})
+	});
+	std::panic::set_hook(previous_hook);
+	drop(hook_lock);
+	match result {
+		Ok(value) => Ok(value),
+		Err(payload) => Err(format!(
+			"{label} panic: {}",
+			polars_panic_payload_message(&payload)
+		)),
+	}
+}
+
+#[cfg(feature = "polars-sql-reference")]
+fn polars_panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(message) = payload.downcast_ref::<&str>() {
+		(*message).to_string()
+	} else if let Some(message) = payload.downcast_ref::<String>() {
+		message.clone()
+	} else {
+		"non-string panic payload".to_string()
+	}
 }
 
 #[cfg(feature = "polars-sql-reference")]
@@ -1532,6 +1679,14 @@ fn polars_unsupported_attempt(
 }
 
 #[cfg(feature = "polars-sql-reference")]
+fn polars_error_is_known_unsupported(message: &str) -> bool {
+	matches!(
+		classify_polars_error(message),
+		"correlated_subquery" | "interval_syntax" | "join_constraint" | "index_limit"
+	)
+}
+
+#[cfg(feature = "polars-sql-reference")]
 fn polars_fail_attempt(
 	export: &toron_tpch::TpchParquetExport,
 	plan_fingerprint: &str,
@@ -1569,17 +1724,23 @@ fn polars_fail_attempt(
 #[cfg(any(feature = "polars-sql-reference", test))]
 fn classify_polars_error(message: &str) -> &'static str {
 	let lower = message.to_ascii_lowercase();
-	if lower.contains("subquer")
-		|| lower.contains("correlated")
-		|| lower.contains("exists")
-		|| lower.contains("outer")
+	if lower.contains("panic") || lower.contains("panicked") {
+		return "other";
+	}
+	let explicitly_unsupported = lower.contains("not supported") || lower.contains("unsupported");
+	if explicitly_unsupported
+		&& (lower.contains("subquer") || lower.contains("correlated") || lower.contains("exists"))
 	{
 		"correlated_subquery"
-	} else if lower.contains("interval") {
+	} else if explicitly_unsupported && lower.contains("interval") {
 		"interval_syntax"
-	} else if lower.contains("not like") || lower.contains(" join") || lower.contains("join ") {
+	} else if explicitly_unsupported
+		&& (lower.contains("not like")
+			|| lower.contains("join constraint")
+			|| lower.contains("non-equi join"))
+	{
 		"join_constraint"
-	} else if lower.contains("2^32") || lower.contains("2**32") || lower.contains("index") {
+	} else if lower.contains("2^32") || lower.contains("2**32") || lower.contains("index limit") {
 		"index_limit"
 	} else {
 		"other"
@@ -2509,7 +2670,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -2702,6 +2863,62 @@ mod tests {
 		assert_eq!(row["reason"], "polars_sql_unsupported_correlated_subquery");
 		assert_eq!(row["engine_version"], "0.54.4");
 		assert_eq!(row["duckdb_version"], serde_json::Value::Null);
+
+		let attempt = polars_unsupported_attempt(
+			&export,
+			"polars-plan",
+			0,
+			false,
+			"query would exceed the Polars 2^32 index limit",
+			Some("0.54.4".to_string()),
+		);
+		assert_eq!(
+			attempt.json_value()["reason"],
+			"polars_sql_unsupported_index_limit"
+		);
+		assert_eq!(
+			classify_polars_error(
+				"panicked at /home/me/.cargo/registry/src/index.crates.io/polars/src/lib.rs:1: unrelated"
+			),
+			"other"
+		);
+		assert_eq!(
+			classify_polars_error("polars collect panic: outer join payload exploded"),
+			"other"
+		);
+		assert_eq!(
+			classify_polars_error(
+				"polars collect panic: get_streaming_executor_builder() failed (hint: missing feature new-streaming?)"
+			),
+			"other"
+		);
+		assert_eq!(
+			classify_polars_error("planning failed: outer relation join interval exists"),
+			"other"
+		);
+	}
+
+	#[cfg(all(feature = "polars-sql-reference", unix))]
+	#[test]
+	fn polars_register_reports_non_utf8_path_as_invalid_path() {
+		use std::ffi::OsString;
+		use std::os::unix::ffi::OsStringExt;
+
+		let mut export = fake_polars_export();
+		export.tables.push(toron_tpch::TpchParquetTableExport {
+			name: "bad_path".to_string(),
+			path: PathBuf::from(OsString::from_vec(vec![0xff])),
+			row_count: 0,
+			schema_fingerprint: "schema".to_string(),
+			schema_signature: "schema".to_string(),
+			file_hash: "hash".to_string(),
+		});
+		let mut context = polars_sql::SQLContext::new();
+		let error = register_polars_reference_tables(&export, &mut context)
+			.expect_err("non-UTF8 path should fail before scan");
+
+		assert_eq!(error.reason, "polars_invalid_path");
+		assert!(error.message.contains("non-utf8 parquet path"));
 	}
 
 	#[test]
