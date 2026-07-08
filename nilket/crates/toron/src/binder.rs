@@ -54,6 +54,7 @@ use wendelon_client::{
 };
 
 mod aggregate;
+mod aggregate_exchange;
 mod arithmetic;
 mod decision_log;
 mod explain;
@@ -66,6 +67,7 @@ mod selectivity;
 mod set_ops;
 
 use self::aggregate::*;
+use self::aggregate_exchange::*;
 use self::arithmetic::*;
 use self::decision_log::*;
 use self::explain::*;
@@ -2092,6 +2094,7 @@ impl<'a> Binder<'a> {
 		group_expr: BoundExprProgram,
 		aggr_expr: Vec<BoundAggregateCall>,
 	) -> Result<ScopedExecutionPlan, BindingError> {
+		let input = collapse_redundant_pre_aggregate_exchange(input, &group_expr);
 		let logical_types = self.catalog.logical_type_registry();
 		let output_schema = aggregate_schema(&group_expr, &aggr_expr, &logical_types)?;
 		let scope = input.scope.aggregate(&group_expr, &output_schema);

@@ -1,7 +1,8 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 11] = [
+const BINDER_MODULES: [&str; 12] = [
 	"aggregate",
+	"aggregate_exchange",
 	"arithmetic",
 	"decision_log",
 	"explain",
@@ -20,6 +21,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 	let expected = [
 		"src/binder.rs",
 		"src/binder/aggregate.rs",
+		"src/binder/aggregate_exchange.rs",
 		"src/binder/arithmetic.rs",
 		"src/binder/decision_log.rs",
 		"src/binder/explain.rs",

@@ -641,6 +641,135 @@ async fn bind_hash_join_resolves_qualified_keys_and_duplicate_output_names() {
 }
 
 #[tokio::test]
+async fn grouped_aggregate_drops_exchange_when_input_already_colocated_by_group_key() {
+	let catalog = join_catalog();
+	let join = LogicalPlan::Join {
+		left: Box::new(named_scan("orders")),
+		right: Box::new(named_scan("customers")),
+		kind: JoinKind::Inner,
+		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		on_filter: None,
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let aggregate = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(join),
+			partition_count: 4,
+			key: vec![qcol("orders", "customer_id"), qcol("customers", "region")],
+		}),
+		group_expr: vec![qcol("orders", "customer_id"), qcol("customers", "region")],
+		aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+	};
+
+	let plan = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind grouped aggregate");
+
+	match plan {
+		ExecutionPlan::Aggregate { input, .. } => {
+			assert!(
+				matches!(*input, ExecutionPlan::Join { .. }),
+				"pre-aggregate exchange should be removed when the join partition key is a group key"
+			);
+		}
+		other => panic!("expected aggregate, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn grouped_aggregate_keeps_exchange_without_colocation_proof() {
+	let catalog = join_catalog();
+	let aggregate = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(exchanged_named_scan("orders", "customer_id", 4)),
+			partition_count: 4,
+			key: vec![qcol("orders", "id")],
+		}),
+		group_expr: vec![qcol("orders", "id")],
+		aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+	};
+
+	let plan = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind grouped aggregate");
+
+	match plan {
+		ExecutionPlan::Aggregate { input, .. } => {
+			assert!(
+				matches!(*input, ExecutionPlan::Exchange { .. }),
+				"multi-partition input partitioned on a different key must keep the aggregate exchange"
+			);
+		}
+		other => panic!("expected aggregate, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn grouped_aggregate_keeps_exchange_after_keyless_multi_partition_input() {
+	let catalog = join_catalog();
+	let aggregate = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::Exchange {
+				input: Box::new(named_scan("orders")),
+				partition_count: 4,
+				key: Vec::new(),
+			}),
+			partition_count: 4,
+			key: vec![qcol("orders", "id")],
+		}),
+		group_expr: vec![qcol("orders", "id")],
+		aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+	};
+
+	let plan = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind grouped aggregate");
+
+	match plan {
+		ExecutionPlan::Aggregate { input, .. } => {
+			assert!(
+				matches!(&*input, ExecutionPlan::Exchange { input: inner, .. }
+					if matches!(inner.as_ref(), ExecutionPlan::Exchange { .. })),
+				"keyed pre-aggregate exchange must stay above the inner keyless multi-partition scatter: {input:?}"
+			);
+		}
+		other => panic!("expected aggregate, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn distinct_drops_exchange_when_input_already_colocated() {
+	let catalog = join_catalog();
+	let join = LogicalPlan::Join {
+		left: Box::new(named_scan("orders")),
+		right: Box::new(named_scan("customers")),
+		kind: JoinKind::Inner,
+		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		on_filter: None,
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let distinct = LogicalPlan::Distinct {
+		input: Box::new(join),
+	};
+
+	let plan = bind(&distinct, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind distinct");
+
+	match plan {
+		ExecutionPlan::Aggregate { input, .. } => {
+			assert!(
+				matches!(*input, ExecutionPlan::Join { .. }),
+				"distinct should reuse the pre-aggregate exchange collapse when input is already co-located"
+			);
+		}
+		other => panic!("expected aggregate, got {other:?}"),
+	}
+}
+
+#[tokio::test]
 async fn bind_hash_join_auto_swaps_reversed_on_pair() {
 	let catalog = join_catalog();
 	let plan = LogicalPlan::Join {

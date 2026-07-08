@@ -12411,7 +12411,7 @@ mod adr391_rune_perf_decomposition {
 	}
 
 	#[test]
-	fn rune_q03_isolation_proof_differs_from_sql_shape() {
+	fn rune_q03_isolation_proof_tracks_sql_rune_shape_closure() {
 		run_on_large_stack(|| async {
 			let proof = rune_q03_isolation_proof(0.01)
 				.await
@@ -12419,12 +12419,16 @@ mod adr391_rune_perf_decomposition {
 			if std::env::var_os("TORON_TPCH_PRINT_Q03_PROOF").is_some() {
 				print_q03_proof("memory", &proof);
 			}
-			assert!(
-				proof.plans_differ(),
-				"Rune q03 must bind to a distinct physical shape, or the logical-shape probe is void"
-			);
 			assert!(!proof.sql_plan_fingerprint.is_empty());
 			assert!(!proof.rune_plan_fingerprint.is_empty());
+			assert!(
+				proof.sql_compact_shape.contains("Aggregate(groups=3")
+					&& !proof
+						.sql_compact_shape
+						.contains("input=Exchange(parts=4,keys=3,input=Join"),
+				"SQL q03 memory proof should not carry the pre-aggregate exchange residual: {}",
+				proof.sql_compact_shape
+			);
 			assert!(
 				proof.rune_plan_shape.contains("Join") || proof.rune_plan_shape.contains("join"),
 				"Rune q03 proof should expose a join-bearing physical plan"
@@ -12436,7 +12440,7 @@ mod adr391_rune_perf_decomposition {
 	fn rune_q03_persisted_isolation_proof_uses_persisted_path() {
 		run_on_large_stack(|| async {
 			let root = std::env::temp_dir().join(format!(
-				"toron_tpch_adr401_q03_persisted_{}",
+				"toron_tpch_adr402_q03_persisted_{}",
 				std::process::id()
 			));
 			let _cleanup = TempRootCleanup(root.clone());
@@ -12496,19 +12500,16 @@ mod adr391_rune_perf_decomposition {
 					proof.rune_compact_shape
 				);
 			}
+			assert_eq!(proof.sql_plan_fingerprint, proof.rune_plan_fingerprint);
+			assert_eq!(proof.sql_compact_shape, proof.rune_compact_shape);
 			assert!(
 				proof.sql_compact_shape.contains("Aggregate(groups=3")
-					&& proof
+					&& proof.sql_compact_shape.contains("input=Join")
+					&& !proof
 						.sql_compact_shape
 						.contains("input=Exchange(parts=4,keys=3,input=Join"),
-				"SQL q03 still carries the distributed grouped-aggregate exchange residual: {}",
+				"SQL q03 aggregate should match Rune's no-pre-aggregate-exchange shape: {}",
 				proof.sql_compact_shape
-			);
-			assert!(
-				proof.rune_compact_shape.contains("Aggregate(groups=3")
-					&& proof.rune_compact_shape.contains("input=Join"),
-				"Rune q03 aggregate remains the no-pre-aggregate-exchange control: {}",
-				proof.rune_compact_shape
 			);
 		});
 	}
