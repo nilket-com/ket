@@ -8752,26 +8752,78 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 		build_batches: Vec<RecordBatch>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
-		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
 		let build_memory_cap =
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
-		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
-			&build_key_arrays,
+		let estimated_build_bytes =
+			estimated_build_hash_bytes_for_batches(&build_batches, &stage.build_keys)?;
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&stage.build.schema(),
+			&stage.build_keys,
 			&stage.probe_schema,
 			&stage.probe_keys,
 			false,
 		)?;
-		let estimated_build_bytes =
-			estimated_build_hash_bytes(&build_key_arrays, build_batch.num_rows());
 		if estimated_build_bytes > build_memory_cap {
-			return Err(budget_exhausted(
-				BudgetDimension::Memory,
-				"reoriented join build accumulator",
-				estimated_build_bytes,
-				build_memory_cap,
-			));
+			let mut spilled = SpilledInnerJoinBuild::create(
+				self.context.task_budget,
+				self.context.join_spill_file_ops.clone(),
+				self.context.join_spill_dir.clone(),
+			)
+			.await?;
+			let build_started = Instant::now();
+			for batch in &build_batches {
+				spilled
+					.write_batch_chunks(
+						batch,
+						key_plan,
+						&stage.build_keys,
+						false,
+						self.context.task_budget,
+					)
+					.await?;
+			}
+			spilled.finish(self.context.task_budget).await?;
+			let build_rows = spilled.input_row_count();
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(build_started));
+				task.phases.spill_micros = task
+					.phases
+					.spill_micros
+					.saturating_add(duration_micros(build_started));
+				task.counters.spill_bytes = task
+					.counters
+					.spill_bytes
+					.saturating_add(spilled.spill_bytes());
+			});
+			let materialized_output_schema = if stage.probe_columns_first {
+				concat_join_schema(&stage.build.schema(), &stage.probe_schema)
+			} else {
+				stage.output_schema.clone()
+			};
+			return Ok(Some(ReorientedInnerJoinRuntime {
+				replay_id: stage.replay_id,
+				strategy: stage.strategy,
+				build: ReorientedInnerJoinBuild::Spilled {
+					build: spilled,
+					materialized_output_schema,
+					build_column_count: stage.build.schema().fields().len(),
+					projection: None,
+				},
+				key_plan,
+				probe_keys: stage.probe_keys,
+				output_schema: stage.output_schema,
+				post_filter: stage.post_filter,
+				probe_columns_first: stage.probe_columns_first,
+				probe_rows: 0,
+				output_rows: 0,
+			}));
 		}
+		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
+		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
 		let build_started = Instant::now();
 		let Some(build_rows) = build_in_memory_join_rows(
 			key_plan,
@@ -11415,6 +11467,131 @@ mod tests {
 			streamed_runtime.cleanup().await;
 			materialized_runtime.cleanup().await;
 		}
+	}
+
+	#[tokio::test]
+	async fn reoriented_materialized_build_over_cap_spills_batches_without_concat() {
+		let build_schema = Arc::new(Schema::new(vec![
+			Field::new("build_key", DataType::Int64, false),
+			Field::new("build_value", DataType::Int64, false),
+		]));
+		let probe_schema = Arc::new(Schema::new(vec![
+			Field::new("probe_key", DataType::Int64, false),
+			Field::new("probe_tag", DataType::Int64, false),
+		]));
+		let output_schema = concat_test_schema(&probe_schema, &build_schema);
+		let first_rows = 5_000;
+		let second_rows = 5_000;
+		let mut first_keys = vec![1; first_rows];
+		first_keys[first_rows - 1] = 2;
+		let mut second_keys = vec![1; second_rows];
+		second_keys[second_rows - 1] = 2;
+		let build_a = RecordBatch::try_new(
+			build_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(first_keys)),
+				Arc::new(Int64Array::from_iter_values(0..first_rows as i64)),
+			],
+		)
+		.expect("build batch a");
+		let build_b = RecordBatch::try_new(
+			build_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(second_keys)),
+				Arc::new(Int64Array::from_iter_values(
+					first_rows as i64..(first_rows + second_rows) as i64,
+				)),
+			],
+		)
+		.expect("build batch b");
+		let probe = RecordBatch::try_new(
+			probe_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![2])),
+				Arc::new(Int64Array::from(vec![10])),
+			],
+		)
+		.expect("probe batch");
+		let build = test_scan_plan_with_first_field_key(TableId(30), build_schema.clone(), 30);
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::new(),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		});
+		let low_budget_executor = Executor::with_context(
+			storage.clone(),
+			ExecutionContext::local_test().with_task_budget(TaskBudget {
+				memory: ByteCount::new(64 * 1024),
+				spill_bytes: ByteCount::new(64 * 1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			}),
+		);
+		let mut spilled_runtime = low_budget_executor
+			.prepare_reoriented_inner_join_runtime_from_build_batches(
+				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone()),
+				vec![build_a.clone(), build_b.clone()],
+			)
+			.await
+			.expect("spilled materialized runtime")
+			.expect("runtime");
+		let ReorientedInnerJoinBuild::Spilled { build: spilled, .. } = &spilled_runtime.build
+		else {
+			panic!("over-cap materialized build must spill instead of erroring");
+		};
+		assert_eq!(
+			spilled.input_batches_written(),
+			2,
+			"already-materialized build batches must be spilled batch-by-batch, not concat-first"
+		);
+		assert_eq!(spilled.input_row_count(), (first_rows + second_rows) as u64);
+
+		let high_budget_executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let mut in_memory_runtime = high_budget_executor
+			.prepare_reoriented_inner_join_runtime_from_build_batches(
+				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone()),
+				vec![build_a, build_b],
+			)
+			.await
+			.expect("in-memory materialized runtime")
+			.expect("runtime");
+		assert!(
+			matches!(
+				in_memory_runtime.build,
+				ReorientedInnerJoinBuild::InMemory { .. }
+			),
+			"high-budget comparison path should still use the in-memory accumulator"
+		);
+
+		let spilled_output = low_budget_executor
+			.probe_reoriented_inner_join_streaming(&mut spilled_runtime, &probe)
+			.await
+			.expect("spilled probe");
+		let in_memory_output = high_budget_executor
+			.probe_reoriented_inner_join_streaming(&mut in_memory_runtime, &probe)
+			.await
+			.expect("in-memory probe");
+		assert_record_batches_equal(&spilled_output, &in_memory_output);
+		assert_eq!(
+			spilled_output
+				.iter()
+				.map(RecordBatch::num_rows)
+				.sum::<usize>(),
+			2
+		);
+		assert_eq!(
+			spilled_output
+				.first()
+				.expect("spilled output")
+				.schema()
+				.as_ref(),
+			output_schema.as_ref(),
+			"spilled materialized build must restore probe-first column order"
+		);
+
+		spilled_runtime.cleanup().await;
+		in_memory_runtime.cleanup().await;
 	}
 
 	#[tokio::test]
