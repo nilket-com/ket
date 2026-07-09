@@ -413,6 +413,81 @@ async fn sort_over_budget_fails_cleanly() {
 	));
 }
 
+#[tokio::test]
+async fn sort_materialization_allows_raw_overage_within_family_cap() {
+	let schema = sort_budget_schema();
+	let batch = sort_budget_batch(schema.clone(), 24, 64);
+	let raw_cap = 1_024u64;
+	let family_cap = raw_cap * 16;
+	let requested = sort_materialization_estimate(&batch);
+	assert!(
+		requested > raw_cap,
+		"fixture must exceed the raw per-task cap"
+	);
+	assert!(
+		requested <= family_cap,
+		"fixture must fit the aligned sort family cap"
+	);
+
+	let plan = scan_sort_plan(schema, vec![batch], vec![sort_key(0)], None, 0);
+	let budget = TaskBudget {
+		memory: ByteCount::new(raw_cap),
+		..TaskBudget::from_query_budget(QueryBudget::test_default())
+	};
+	let context = ExecutionContext::local_test().with_task_budget(budget);
+	let results = Executor::with_context(Arc::new(SingleBatchScan::new(plan.batch)), context)
+		.execute_bound(&plan.plan, None)
+		.await
+		.expect("sort within family cap");
+
+	let keys = results[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("sorted key column");
+	let expected = (0..24).map(i64::from).collect::<Vec<_>>();
+	assert_eq!(keys.values(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn sort_materialization_still_fails_over_family_cap() {
+	let schema = sort_budget_schema();
+	let batch = sort_budget_batch(schema.clone(), 128, 256);
+	let raw_cap = 1_024u64;
+	let family_cap = raw_cap * 16;
+	let requested = sort_materialization_estimate(&batch);
+	assert!(
+		requested > family_cap,
+		"fixture must exceed the aligned sort family cap"
+	);
+
+	let plan = scan_sort_plan(schema, vec![batch], vec![sort_key(0)], None, 0);
+	let budget = TaskBudget {
+		memory: ByteCount::new(raw_cap),
+		..TaskBudget::from_query_budget(QueryBudget::test_default())
+	};
+	let context = ExecutionContext::local_test().with_task_budget(budget);
+	let err = Executor::with_context(Arc::new(SingleBatchScan::new(plan.batch)), context)
+		.execute_bound(&plan.plan, None)
+		.await
+		.expect_err("sort over family cap must still fail");
+
+	match err {
+		ExecutionError::BudgetExhausted {
+			dimension,
+			producer,
+			requested: observed_requested,
+			available,
+		} => {
+			assert_eq!(dimension, BudgetDimension::Memory);
+			assert_eq!(producer, "sort materialization");
+			assert_eq!(observed_requested, ByteCount::new(requested));
+			assert_eq!(available, ByteCount::new(family_cap));
+		}
+		other => panic!("expected sort materialization budget error, got {other:?}"),
+	}
+}
+
 #[test]
 fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
 	let stages = fragment_plan(
@@ -595,6 +670,34 @@ fn sort_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("sort batch")
+}
+
+fn sort_budget_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("k", DataType::Int64, false),
+		Field::new("payload", DataType::Utf8, false),
+	]))
+}
+
+fn sort_budget_batch(schema: SchemaRef, rows: usize, payload_len: usize) -> RecordBatch {
+	let keys = (0..rows).rev().map(|row| row as i64).collect::<Vec<_>>();
+	let payload = "x".repeat(payload_len);
+	let payloads = (0..rows).map(|_| payload.as_str()).collect::<Vec<_>>();
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(keys)),
+			Arc::new(StringArray::from(payloads)),
+		],
+	)
+	.expect("sort budget batch")
+}
+
+fn sort_materialization_estimate(batch: &RecordBatch) -> u64 {
+	let estimate = batch
+		.get_array_memory_size()
+		.saturating_add(batch.num_rows() * std::mem::size_of::<u32>());
+	u64::try_from(estimate).expect("sort estimate fits u64")
 }
 
 struct FixtureScan {

@@ -1796,6 +1796,14 @@ fn execute_repeat(
 	Ok(output)
 }
 
+const SORT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER: u64 = 16;
+
+fn sort_materialization_memory_cap(task_memory: u64) -> u64 {
+	// Align sort with the materialization family: join output and retained spill
+	// footprint both get the same multiplier over the per-task memory budget.
+	task_memory.saturating_mul(SORT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER)
+}
+
 fn execute_sort(
 	input_schema: arrow::datatypes::SchemaRef,
 	input_batches: &[RecordBatch],
@@ -1815,12 +1823,13 @@ fn execute_sort(
 		.sum::<usize>()
 		.saturating_add(row_count.saturating_mul(std::mem::size_of::<u32>()));
 	let estimate = u64::try_from(estimate).unwrap_or(u64::MAX);
-	if estimate > task_budget.memory.get() {
+	let materialization_cap = sort_materialization_memory_cap(task_budget.memory.get());
+	if estimate > materialization_cap {
 		return Err(ExecutionError::BudgetExhausted {
 			dimension: BudgetDimension::Memory,
 			producer: "sort materialization",
 			requested: ByteCount::new(estimate),
-			available: task_budget.memory,
+			available: ByteCount::new(materialization_cap),
 		});
 	}
 
