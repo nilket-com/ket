@@ -9,12 +9,13 @@
 pub mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow::array::{
@@ -1431,6 +1432,39 @@ fn record_parquet_scan_ledger(ledger: ParquetScanLedger) {
 	}
 }
 
+fn parquet_scan_progress_path() -> Option<&'static PathBuf> {
+	static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+	PATH.get_or_init(|| {
+		std::env::var_os("TORON_TPCH_PARQUET_SCAN_PROGRESS_PATH").map(PathBuf::from)
+	})
+	.as_ref()
+}
+
+fn parquet_scan_progress_lock() -> &'static Mutex<()> {
+	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+	LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn next_parquet_scan_progress_id() -> u64 {
+	static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+	NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn record_parquet_scan_progress<T: Serialize>(event: &T) {
+	let Some(path) = parquet_scan_progress_path() else {
+		return;
+	};
+	let Ok(_guard) = parquet_scan_progress_lock().lock() else {
+		return;
+	};
+	let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+		return;
+	};
+	if serde_json::to_writer(&mut file, event).is_ok() {
+		let _ = file.write_all(b"\n");
+	}
+}
+
 fn record_batch_bytes(batch: &RecordBatch) -> usize {
 	batch.get_array_memory_size()
 }
@@ -1530,26 +1564,45 @@ impl StorageScan for ParquetHarnessScan {
 			message: format!("open parquet reader {}: {error}", source.path.display()),
 		})?;
 		let full_schema = source.schema.clone();
+		let scan_progress_id = next_parquet_scan_progress_id();
+		let requested_projected_columns = projected_columns
+			.as_ref()
+			.map(|columns| columns.iter().map(|column| column.0).collect::<Vec<_>>());
+		let parquet_read_columns = if let Some(columns) = &pbc_projection {
+			(columns.len() < full_column_count).then_some(columns.clone())
+		} else {
+			projected_columns.as_ref().map(|columns| {
+				columns
+					.iter()
+					.map(|column| column.0 as usize)
+					.collect::<Vec<_>>()
+			})
+		};
+		record_parquet_scan_progress(&serde_json::json!({
+			"event": "scan_start",
+			"scan_id": scan_progress_id,
+			"table_id": table_id,
+			"table_name": source.name.as_str(),
+			"full_column_count": full_column_count,
+			"requested_projected_columns": requested_projected_columns,
+			"pbc_predicate_bytes": pbc.as_ref().map(Vec::len),
+			"pbc_referenced_columns": pbc_referenced_columns.clone(),
+			"parquet_read_columns": parquet_read_columns,
+			"output_column_count": output_schema.fields().len(),
+			"inflated_to_full_schema": pbc.is_some()
+				&& pbc_projection
+					.as_ref()
+					.is_some_and(|columns| columns.len() < full_column_count),
+		}));
 		if parquet_scan_ledger_enabled() {
 			let mut ledger = ParquetScanLedger {
 				table_id,
 				table_name: source.name.clone(),
 				full_column_count,
-				requested_projected_columns: projected_columns
-					.as_ref()
-					.map(|columns| columns.iter().map(|column| column.0).collect()),
+				requested_projected_columns: requested_projected_columns.clone(),
 				pbc_predicate_bytes: pbc.as_ref().map(Vec::len),
 				pbc_referenced_columns: pbc_referenced_columns.clone(),
-				parquet_read_columns: if let Some(columns) = &pbc_projection {
-					(columns.len() < full_column_count).then_some(columns.clone())
-				} else {
-					projected_columns.as_ref().map(|columns| {
-						columns
-							.iter()
-							.map(|column| column.0 as usize)
-							.collect::<Vec<_>>()
-					})
-				},
+				parquet_read_columns: parquet_read_columns.clone(),
 				output_column_count: output_schema.fields().len(),
 				inflated_to_full_schema: pbc.is_some()
 					&& pbc_projection
@@ -1595,8 +1648,29 @@ impl StorageScan for ParquetHarnessScan {
 					output_columns: output_batch.num_columns(),
 					output_bytes: record_batch_bytes(&output_batch),
 				});
+				record_parquet_scan_progress(&serde_json::json!({
+					"event": "batch",
+					"scan_id": scan_progress_id,
+					"table_id": table_id,
+					"table_name": source.name.as_str(),
+					"batch_index": ledger.batches.len() - 1,
+					"raw_rows": raw_rows,
+					"raw_columns": raw_columns,
+					"raw_bytes": raw_bytes,
+					"inflated_bytes": inflated_bytes,
+					"output_rows": output_batch.num_rows(),
+					"output_columns": output_batch.num_columns(),
+					"output_bytes": record_batch_bytes(&output_batch),
+				}));
 				batches.push(output_batch);
 			}
+			record_parquet_scan_progress(&serde_json::json!({
+				"event": "scan_end",
+				"scan_id": scan_progress_id,
+				"table_id": table_id,
+				"table_name": source.name.as_str(),
+				"batch_count": ledger.batches.len(),
+			}));
 			record_parquet_scan_ledger(ledger);
 			return Ok(ScanStream::new(
 				output_schema,
@@ -1605,10 +1679,14 @@ impl StorageScan for ParquetHarnessScan {
 				stream::iter(batches.into_iter().map(Ok)).boxed(),
 			));
 		}
+		let mut batch_index = 0usize;
 		let stream = stream::iter(reader.map(move |batch| {
 			let batch = batch.map_err(|error| StorageError::Internal {
 				message: format!("read parquet batch {}: {error}", source.path.display()),
 			})?;
+			let raw_rows = batch.num_rows();
+			let raw_columns = batch.num_columns();
+			let raw_bytes = record_batch_bytes(&batch);
 			let batch = if let Some(program) = &pbc {
 				let batch = if let Some(columns) = &pbc_projection {
 					inflate_projected_parquet_batch(batch, full_schema.clone(), columns)?
@@ -1623,6 +1701,21 @@ impl StorageScan for ParquetHarnessScan {
 			} else {
 				Ok(batch)
 			}?;
+			record_parquet_scan_progress(&serde_json::json!({
+				"event": "batch",
+				"scan_id": scan_progress_id,
+				"table_id": table_id,
+				"table_name": source.name.as_str(),
+				"batch_index": batch_index,
+				"raw_rows": raw_rows,
+				"raw_columns": raw_columns,
+				"raw_bytes": raw_bytes,
+				"inflated_bytes": null,
+				"output_rows": batch.num_rows(),
+				"output_columns": batch.num_columns(),
+				"output_bytes": record_batch_bytes(&batch),
+			}));
+			batch_index += 1;
 			Ok(batch)
 		}))
 		.boxed();

@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
@@ -6,7 +9,36 @@ use crate::ir::{JoinReplayId, JoinStrategy};
 
 fn join_build_profile_enabled() -> bool {
 	static ENABLED: OnceLock<bool> = OnceLock::new();
-	*ENABLED.get_or_init(|| std::env::var_os("TORON_JOIN_BUILD_PROFILE").is_some())
+	*ENABLED.get_or_init(|| {
+		std::env::var_os("TORON_JOIN_BUILD_PROFILE").is_some()
+			|| std::env::var_os("TORON_JOIN_BUILD_PROFILE_PATH").is_some()
+	})
+}
+
+fn join_build_profile_path() -> Option<&'static PathBuf> {
+	static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+	PATH.get_or_init(|| std::env::var_os("TORON_JOIN_BUILD_PROFILE_PATH").map(PathBuf::from))
+		.as_ref()
+}
+
+fn join_build_profile_file_lock() -> &'static Mutex<()> {
+	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+	LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn record_join_build_profile_line(profile: &JoinBuildProfile) {
+	let Some(path) = join_build_profile_path() else {
+		return;
+	};
+	let Ok(_guard) = join_build_profile_file_lock().lock() else {
+		return;
+	};
+	let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+		return;
+	};
+	if serde_json::to_writer(&mut file, profile).is_ok() {
+		let _ = file.write_all(b"\n");
+	}
 }
 
 pub(in crate::exec) fn record_join_build_profile(
@@ -53,6 +85,7 @@ pub(in crate::exec) fn record_join_build_profile(
 		overflow_heap_capacity_bytes,
 		build_micros,
 	};
+	record_join_build_profile_line(&profile);
 	super::record_task_telemetry(telemetry, |task| {
 		task.join_build_profiles.push(profile);
 	});
