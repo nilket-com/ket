@@ -7,7 +7,9 @@ mod spill;
 mod streaming;
 
 pub(in crate::exec) use self::build_profile::record_join_build_profile;
-pub(super) use self::build_rows::{BuildRowList, JoinBuildRows, new_join_build_rows};
+pub(super) use self::build_rows::{
+	BuildRowList, JoinBuildRows, new_int64_join_build_rows, new_join_build_rows,
+};
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 pub(in crate::exec) use self::spill::SpilledInnerJoinBuild;
 pub(in crate::exec) use self::spill::{
@@ -1278,7 +1280,11 @@ pub(super) fn build_in_memory_join_rows(
 	memory_cap: u64,
 	null_safe_keys: bool,
 ) -> Result<Option<JoinBuildRows>, ExecutionError> {
-	let mut build_rows = new_join_build_rows(rows);
+	let mut build_rows = if join_key_plan == JoinKeyPlan::Int64 && !null_safe_keys {
+		new_int64_join_build_rows(rows)
+	} else {
+		new_join_build_rows(rows)
+	};
 	let mut inserted_rows = 0usize;
 
 	match join_key_plan {
@@ -1402,8 +1408,7 @@ pub(super) fn probe_in_memory_join_rows(
 				if values.is_null(row) {
 					append_unmatched_probe_row(kind, row, &mut selection)?;
 				} else {
-					let key = JoinKey::Int64(values.value(row));
-					let matched = if let Some(matches) = build_rows.get(&key) {
+					let matched = if let Some(matches) = build_rows.get_int64(values.value(row)) {
 						append_join_matches_for_kind(
 							kind,
 							row,
@@ -1476,12 +1481,7 @@ pub(super) fn single_join_key_array<'a, T: 'static>(
 
 #[inline(always)]
 pub(super) fn insert_join_build_row(build_rows: &mut JoinBuildRows, key: JoinKey, row: u32) {
-	match build_rows.entry(key) {
-		Entry::Occupied(mut entry) => entry.get_mut().push(row),
-		Entry::Vacant(entry) => {
-			entry.insert(BuildRowList::new(row));
-		}
-	}
+	build_rows.insert(key, row);
 }
 
 pub(super) fn append_join_matches_for_kind(
