@@ -6160,8 +6160,7 @@ impl Executor {
 						if values.is_null(row) {
 							continue;
 						}
-						let key = JoinKey::Int32(values.value(row));
-						if let Some(matches) = build_rows.get(&key) {
+						if let Some(matches) = build_rows.get_int32(values.value(row)) {
 							append_join_matches_for_kind(
 								JoinKind::LeftOuter,
 								row,

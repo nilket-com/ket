@@ -22,27 +22,32 @@ pub(in crate::exec) fn new_int64_join_build_rows(capacity: usize) -> JoinBuildRo
 	JoinBuildRows::new_int64(capacity)
 }
 
+pub(in crate::exec) fn new_int32_join_build_rows(capacity: usize) -> JoinBuildRows {
+	JoinBuildRows::new_int32(capacity)
+}
+
 pub(in crate::exec) struct JoinBuildRows {
 	inner: JoinBuildRowsInner,
 }
 
 enum JoinBuildRowsInner {
 	Hash(HashMap<JoinKey, BuildRowList, RandomState>),
-	Int64(Int64BuildTable),
+	Int32(PrimitiveBuildTable<i32>),
+	Int64(PrimitiveBuildTable<i64>),
 }
 
-struct Int64BuildTable {
+struct PrimitiveBuildTable<K> {
 	buckets: Vec<usize>,
-	entries: Vec<Int64BuildEntry>,
+	entries: Vec<PrimitiveBuildEntry<K>>,
 	hasher: RandomState,
 }
 
-struct Int64BuildEntry {
-	key: i64,
+struct PrimitiveBuildEntry<K> {
+	key: K,
 	rows: BuildRowList,
 }
 
-const EMPTY_INT64_BUCKET: usize = usize::MAX;
+const EMPTY_PRIMITIVE_BUCKET: usize = usize::MAX;
 
 impl JoinBuildRows {
 	fn new_hash(capacity: usize) -> Self {
@@ -54,14 +59,23 @@ impl JoinBuildRows {
 		}
 	}
 
+	fn new_int32(capacity: usize) -> Self {
+		Self {
+			inner: JoinBuildRowsInner::Int32(PrimitiveBuildTable::with_capacity(capacity)),
+		}
+	}
+
 	fn new_int64(capacity: usize) -> Self {
 		Self {
-			inner: JoinBuildRowsInner::Int64(Int64BuildTable::with_capacity(capacity)),
+			inner: JoinBuildRowsInner::Int64(PrimitiveBuildTable::with_capacity(capacity)),
 		}
 	}
 
 	pub(in crate::exec) fn insert(&mut self, key: JoinKey, row: u32) {
 		match (&mut self.inner, key) {
+			(JoinBuildRowsInner::Int32(table), JoinKey::Int32(key)) => {
+				table.insert(key, row);
+			}
 			(JoinBuildRowsInner::Int64(table), JoinKey::Int64(key)) => {
 				table.insert(key, row);
 			}
@@ -73,6 +87,9 @@ impl JoinBuildRows {
 					entry.insert(BuildRowList::new(row));
 				}
 			},
+			(JoinBuildRowsInner::Int32(_), key) => {
+				panic!("non-Int32 key inserted into Int32 join build table: {key:?}");
+			}
 			(JoinBuildRowsInner::Int64(_), key) => {
 				panic!("non-Int64 key inserted into Int64 join build table: {key:?}");
 			}
@@ -81,9 +98,18 @@ impl JoinBuildRows {
 
 	pub(in crate::exec) fn get(&self, key: &JoinKey) -> Option<&BuildRowList> {
 		match (&self.inner, key) {
+			(JoinBuildRowsInner::Int32(table), JoinKey::Int32(key)) => table.get(*key),
 			(JoinBuildRowsInner::Int64(table), JoinKey::Int64(key)) => table.get(*key),
 			(JoinBuildRowsInner::Hash(rows), key) => rows.get(key),
-			(JoinBuildRowsInner::Int64(_), _) => None,
+			(JoinBuildRowsInner::Int32(_) | JoinBuildRowsInner::Int64(_), _) => None,
+		}
+	}
+
+	pub(in crate::exec) fn get_int32(&self, key: i32) -> Option<&BuildRowList> {
+		match &self.inner {
+			JoinBuildRowsInner::Int32(table) => table.get(key),
+			JoinBuildRowsInner::Hash(rows) => rows.get(&JoinKey::Int32(key)),
+			JoinBuildRowsInner::Int64(_) => None,
 		}
 	}
 
@@ -91,12 +117,14 @@ impl JoinBuildRows {
 		match &self.inner {
 			JoinBuildRowsInner::Int64(table) => table.get(key),
 			JoinBuildRowsInner::Hash(rows) => rows.get(&JoinKey::Int64(key)),
+			JoinBuildRowsInner::Int32(_) => None,
 		}
 	}
 
 	pub(in crate::exec) fn values(&self) -> Box<dyn Iterator<Item = &BuildRowList> + '_> {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => Box::new(rows.values()),
+			JoinBuildRowsInner::Int32(table) => Box::new(table.values()),
 			JoinBuildRowsInner::Int64(table) => Box::new(table.values()),
 		}
 	}
@@ -104,6 +132,7 @@ impl JoinBuildRows {
 	pub(in crate::exec) fn len(&self) -> usize {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => rows.len(),
+			JoinBuildRowsInner::Int32(table) => table.len(),
 			JoinBuildRowsInner::Int64(table) => table.len(),
 		}
 	}
@@ -112,8 +141,14 @@ impl JoinBuildRows {
 	pub(super) fn capacity(&self) -> usize {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => rows.capacity(),
+			JoinBuildRowsInner::Int32(table) => table.capacity(),
 			JoinBuildRowsInner::Int64(table) => table.capacity(),
 		}
+	}
+
+	#[cfg(test)]
+	pub(super) fn is_int32_table(&self) -> bool {
+		matches!(self.inner, JoinBuildRowsInner::Int32(_))
 	}
 
 	#[cfg(test)]
@@ -122,30 +157,41 @@ impl JoinBuildRows {
 	}
 
 	#[cfg(test)]
+	pub(super) fn int32_bucket_capacity(&self) -> Option<usize> {
+		match &self.inner {
+			JoinBuildRowsInner::Int32(table) => Some(table.bucket_capacity()),
+			JoinBuildRowsInner::Hash(_) | JoinBuildRowsInner::Int64(_) => None,
+		}
+	}
+
+	#[cfg(test)]
 	pub(super) fn int64_bucket_capacity(&self) -> Option<usize> {
 		match &self.inner {
 			JoinBuildRowsInner::Int64(table) => Some(table.bucket_capacity()),
-			JoinBuildRowsInner::Hash(_) => None,
+			JoinBuildRowsInner::Hash(_) | JoinBuildRowsInner::Int32(_) => None,
 		}
 	}
 }
 
-impl Int64BuildTable {
+impl<K> PrimitiveBuildTable<K>
+where
+	K: Copy + Eq + std::hash::Hash,
+{
 	fn with_capacity(capacity: usize) -> Self {
 		let bucket_count = capacity.saturating_mul(2).next_power_of_two().max(1);
 		Self {
-			buckets: vec![EMPTY_INT64_BUCKET; bucket_count],
+			buckets: vec![EMPTY_PRIMITIVE_BUCKET; bucket_count],
 			entries: Vec::with_capacity(capacity),
 			hasher: RandomState::new(),
 		}
 	}
 
-	fn insert(&mut self, key: i64, row: u32) {
+	fn insert(&mut self, key: K, row: u32) {
 		let bucket = self.find_bucket(key);
 		let entry_index = self.buckets[bucket];
-		if entry_index == EMPTY_INT64_BUCKET {
+		if entry_index == EMPTY_PRIMITIVE_BUCKET {
 			let entry_index = self.entries.len();
-			self.entries.push(Int64BuildEntry {
+			self.entries.push(PrimitiveBuildEntry {
 				key,
 				rows: BuildRowList::new(row),
 			});
@@ -155,10 +201,10 @@ impl Int64BuildTable {
 		}
 	}
 
-	fn get(&self, key: i64) -> Option<&BuildRowList> {
+	fn get(&self, key: K) -> Option<&BuildRowList> {
 		let bucket = self.find_bucket(key);
 		let entry_index = self.buckets[bucket];
-		if entry_index == EMPTY_INT64_BUCKET {
+		if entry_index == EMPTY_PRIMITIVE_BUCKET {
 			None
 		} else {
 			Some(&self.entries[entry_index].rows)
@@ -183,19 +229,19 @@ impl Int64BuildTable {
 		self.buckets.len()
 	}
 
-	fn find_bucket(&self, key: i64) -> usize {
+	fn find_bucket(&self, key: K) -> usize {
 		let mask = self.buckets.len() - 1;
 		let mut bucket = self.bucket_for_key(key);
 		loop {
 			let entry_index = self.buckets[bucket];
-			if entry_index == EMPTY_INT64_BUCKET || self.entries[entry_index].key == key {
+			if entry_index == EMPTY_PRIMITIVE_BUCKET || self.entries[entry_index].key == key {
 				return bucket;
 			}
 			bucket = (bucket + 1) & mask;
 		}
 	}
 
-	fn bucket_for_key(&self, key: i64) -> usize {
+	fn bucket_for_key(&self, key: K) -> usize {
 		(self.hasher.hash_one(key) as usize) & (self.buckets.len() - 1)
 	}
 }
@@ -391,6 +437,7 @@ mod tests {
 			.expect("build rows")
 			.expect("in memory rows");
 
+		assert!(rows.is_int32_table());
 		assert_eq!(
 			rows.get(&JoinKey::Int32(1))
 				.expect("duplicate key")
@@ -440,6 +487,148 @@ mod tests {
 				.rows()
 				.collect::<Vec<_>>(),
 			vec![1]
+		);
+	}
+
+	#[test]
+	fn int32_join_build_rows_are_fenced_to_non_null_safe_int32_plan() {
+		let key_arrays = vec![Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef];
+
+		let int32_rows =
+			build_in_memory_join_rows(JoinKeyPlan::Int32, &key_arrays, 2, u64::MAX, false)
+				.expect("build rows")
+				.expect("in memory rows");
+		assert!(int32_rows.is_int32_table());
+
+		let null_safe_rows =
+			build_in_memory_join_rows(JoinKeyPlan::Int32, &key_arrays, 2, u64::MAX, true)
+				.expect("build rows")
+				.expect("in memory rows");
+		assert!(!null_safe_rows.is_int32_table());
+
+		let generic_rows =
+			build_in_memory_join_rows(JoinKeyPlan::Generic, &key_arrays, 2, u64::MAX, false)
+				.expect("build rows")
+				.expect("in memory rows");
+		assert!(!generic_rows.is_int32_table());
+	}
+
+	#[test]
+	fn int32_join_build_rows_preserve_duplicate_probe_order_and_null_routing() {
+		let left = int32_batch(vec![Some(1), Some(1), Some(2), None, Some(1)]);
+		let right = int32_batch(vec![Some(1), None, Some(2), Some(1)]);
+		let left_keys = key_arrays(&left);
+
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Int32,
+			&left_keys,
+			left.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build rows")
+		.expect("in memory rows");
+		assert!(rows.is_int32_table());
+
+		let selection = probe_int32(JoinKind::Inner, &rows, left.num_rows(), &left, &right);
+
+		assert_eq!(
+			selection,
+			vec![
+				JoinOutputRow::Paired { left: 0, right: 0 },
+				JoinOutputRow::Paired { left: 1, right: 0 },
+				JoinOutputRow::Paired { left: 4, right: 0 },
+				JoinOutputRow::Paired { left: 2, right: 2 },
+				JoinOutputRow::Paired { left: 0, right: 3 },
+				JoinOutputRow::Paired { left: 1, right: 3 },
+				JoinOutputRow::Paired { left: 4, right: 3 },
+			]
+		);
+	}
+
+	#[test]
+	fn int32_join_build_rows_match_hash_fallback_for_join_kinds() {
+		let left = int32_batch(vec![Some(1), Some(1), Some(2), Some(4), None]);
+		let right = int32_batch(vec![Some(1), Some(3), Some(2), Some(1), None]);
+		let left_values = left
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("left int32 values");
+		let left_keys = key_arrays(&left);
+
+		let primitive = build_in_memory_join_rows(
+			JoinKeyPlan::Int32,
+			&left_keys,
+			left.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build rows")
+		.expect("in memory rows");
+		assert!(primitive.is_int32_table());
+
+		let hash = hash_int32_rows(left_values);
+		assert!(!hash.is_int32_table());
+
+		for kind in [
+			JoinKind::Inner,
+			JoinKind::LeftOuter,
+			JoinKind::RightOuter,
+			JoinKind::FullOuter,
+			JoinKind::LeftSemi,
+			JoinKind::LeftAnti,
+			JoinKind::RightSemi,
+			JoinKind::RightAnti,
+		] {
+			assert_eq!(
+				probe_int32(kind, &primitive, left.num_rows(), &left, &right),
+				probe_int32(kind, &hash, left.num_rows(), &left, &right),
+				"{kind:?} selection differs between primitive and hash join rows"
+			);
+		}
+	}
+
+	#[test]
+	fn int32_join_build_rows_preserve_memory_guard_decision() {
+		let key_arrays =
+			vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef];
+		let two_row_cap = estimated_build_hash_bytes(&key_arrays, 2);
+
+		let accepted =
+			build_in_memory_join_rows(JoinKeyPlan::Int32, &key_arrays, 2, two_row_cap, false)
+				.expect("build rows")
+				.expect("two rows fit");
+		assert!(accepted.is_int32_table());
+
+		assert!(
+			build_in_memory_join_rows(JoinKeyPlan::Int32, &key_arrays, 3, two_row_cap, false)
+				.expect("build rows")
+				.is_none(),
+			"Int32 primitive table must keep the existing hash-estimate guard decision"
+		);
+	}
+
+	#[test]
+	fn int32_join_build_rows_keep_spare_bucket_for_absent_probe() {
+		let left = int32_batch(vec![Some(1), Some(2), Some(3), Some(4)]);
+		let right = int32_batch(vec![Some(9)]);
+		let left_keys = key_arrays(&left);
+
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Int32,
+			&left_keys,
+			left.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build rows")
+		.expect("in memory rows");
+
+		assert!(rows.int32_bucket_capacity().expect("int32 buckets") > rows.len());
+		assert_eq!(
+			probe_int32(JoinKind::Inner, &rows, left.num_rows(), &left, &right),
+			Vec::<JoinOutputRow>::new()
 		);
 	}
 
@@ -595,6 +784,23 @@ mod tests {
 		vec![batch.column(0).clone()]
 	}
 
+	fn int32_batch(values: Vec<Option<i32>>) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+		RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values)) as ArrayRef])
+			.expect("int32 batch")
+	}
+
+	fn hash_int32_rows(values: &Int32Array) -> JoinBuildRows {
+		let mut rows = new_join_build_rows(values.len());
+		for row in 0..values.len() {
+			if values.is_null(row) {
+				continue;
+			}
+			insert_join_build_row(&mut rows, JoinKey::Int32(values.value(row)), row as u32);
+		}
+		rows
+	}
+
 	fn hash_int64_rows(values: &Int64Array) -> JoinBuildRows {
 		let mut rows = new_join_build_rows(values.len());
 		for row in 0..values.len() {
@@ -604,6 +810,28 @@ mod tests {
 			insert_join_build_row(&mut rows, JoinKey::Int64(values.value(row)), row as u32);
 		}
 		rows
+	}
+
+	fn probe_int32(
+		kind: JoinKind,
+		build_rows: &JoinBuildRows,
+		left_rows: usize,
+		left_batch: &RecordBatch,
+		right_batch: &RecordBatch,
+	) -> Vec<JoinOutputRow> {
+		probe_in_memory_join_rows(
+			kind,
+			JoinKeyPlan::Int32,
+			build_rows,
+			left_rows,
+			&key_arrays(right_batch),
+			right_batch.num_rows(),
+			None,
+			left_batch,
+			right_batch,
+			false,
+		)
+		.expect("probe rows")
 	}
 
 	fn probe_int64(
