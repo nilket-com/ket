@@ -934,6 +934,8 @@ impl<'a> Binder<'a> {
 					let plan = scan_plan(binding, projection);
 					let facts = PlanOptimizerFacts::from_table(optimizer_facts)
 						.derive_estimated_byte_size(plan.schema().as_ref());
+					let mut plan = plan;
+					set_scan_estimated_byte_size(&mut plan, facts.estimated_byte_size);
 					let scope = RelationScope::empty(plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
@@ -971,6 +973,8 @@ impl<'a> Binder<'a> {
 					let plan = scan_plan(binding, projection);
 					let facts = PlanOptimizerFacts::from_table(optimizer_facts)
 						.derive_estimated_byte_size(plan.schema().as_ref());
+					let mut plan = plan;
+					set_scan_estimated_byte_size(&mut plan, facts.estimated_byte_size);
 					let scope = RelationScope::scan(table.clone(), &plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 						plan,
@@ -3811,6 +3815,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		row_limit: None,
 		row_identity: crate::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
+		estimated_byte_size: None,
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
 		column_ndv,
 		column_range,
@@ -3818,6 +3823,16 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		column_heavy_hitters,
 		column_group_top_k,
 		column_group_ndv,
+	}
+}
+
+fn set_scan_estimated_byte_size(plan: &mut ExecutionPlan, estimated: Option<ByteCount>) {
+	if let ExecutionPlan::Scan {
+		estimated_byte_size,
+		..
+	} = plan
+	{
+		*estimated_byte_size = estimated.map(ByteCount::get);
 	}
 }
 
@@ -3945,6 +3960,7 @@ fn optimize_for_required(
 			row_limit,
 			row_identity,
 			profile_hint,
+			estimated_byte_size,
 			primary_key_columns,
 			column_ndv,
 			column_range,
@@ -4021,6 +4037,7 @@ fn optimize_for_required(
 					row_limit,
 					row_identity,
 					profile_hint,
+					estimated_byte_size,
 					primary_key_columns,
 					column_ndv,
 					column_range,

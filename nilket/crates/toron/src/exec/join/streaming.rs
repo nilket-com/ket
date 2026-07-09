@@ -31,6 +31,7 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 
 enum ReorientedStageScanBuildDecision {
 	Stream,
+	StreamMaterializedBatches(Vec<RecordBatch>),
 	Materialized,
 	MaterializedBatches(Vec<RecordBatch>),
 }
@@ -42,8 +43,10 @@ fn reoriented_stage_scan_build_decision_for_materialized_batches(
 	batches: Vec<RecordBatch>,
 ) -> ReorientedStageScanBuildDecision {
 	// A scan-shaped build can fit as Arrow batches while the hash accumulator would not.
-	if scan_output_bytes > materialization_cap || build_hash_bytes > materialization_cap {
+	if scan_output_bytes > materialization_cap {
 		ReorientedStageScanBuildDecision::Stream
+	} else if build_hash_bytes > materialization_cap {
+		ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches)
 	} else {
 		ReorientedStageScanBuildDecision::MaterializedBatches(batches)
 	}
@@ -4411,6 +4414,40 @@ impl Executor {
 		))
 	}
 
+	fn reoriented_terminal_scan_build_estimated_over_cap(
+		&self,
+		stage: &ReorientedInnerJoinStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> bool {
+		if morsel.is_some() || self.context.task_budget.memory.get() < 64 * 1024 * 1024 {
+			return false;
+		}
+		let Some(scan_input) = decompose_streaming_scan_probe_input(stage.build) else {
+			return false;
+		};
+		let ExecutionPlan::Scan {
+			estimated_byte_size,
+			..
+		} = scan_input.scan
+		else {
+			return false;
+		};
+		estimated_byte_size
+			.map(|bytes| {
+				// This shortcut skips the measured scan-build classifier, so it only fires
+				// when metadata says the terminal scan is catastrophically beyond the
+				// materialization cap. At >=8x cap, the old grouped path needs many
+				// scan passes before it can make progress, so one cap-guarded attempt to
+				// build the other side is the safer first move. Moderate over-cap scans
+				// keep the old measured path because projected metadata can be much
+				// larger than the actual filtered/materialized build.
+				bytes
+					> join_output_materialization_memory_cap(self.context.task_budget.memory.get())
+						.saturating_mul(8)
+			})
+			.unwrap_or(false)
+	}
+
 	async fn write_streaming_scan_inner_build_batch(
 		&self,
 		spilled: &mut SpilledInnerJoinBuild,
@@ -6997,8 +7034,16 @@ impl Executor {
 				base_scan_probe_mode,
 				Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
 			);
-		let mut runtimes = Vec::with_capacity(stages.len());
-		for stage in stages {
+		let stage_count = stages.len();
+		let mut runtimes = Vec::with_capacity(stage_count);
+		let mut deferred_stream_stage = None;
+		for (stage_index, stage) in stages.into_iter().enumerate() {
+			if stage_index + 1 == stage_count
+				&& self.reoriented_terminal_scan_build_estimated_over_cap(&stage, morsel)
+			{
+				deferred_stream_stage = Some((stage, None, true));
+				break;
+			}
 			let scan_build_decision = if force_stream_projected_filtered_base
 				&& matches!(
 					base_scan_probe_mode,
@@ -7018,8 +7063,24 @@ impl Executor {
 				self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
 					.await?
 			};
+			let scan_build_decision = if stage_index + 1 == stage_count {
+				match scan_build_decision {
+					ReorientedStageScanBuildDecision::Stream => {
+						deferred_stream_stage = Some((stage, None, false));
+						break;
+					}
+					ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches) => {
+						deferred_stream_stage = Some((stage, Some(batches), false));
+						break;
+					}
+					other => other,
+				}
+			} else {
+				scan_build_decision
+			};
 			let runtime = match scan_build_decision {
-				ReorientedStageScanBuildDecision::Stream => {
+				ReorientedStageScanBuildDecision::Stream
+				| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
 					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
 						stage, morsel,
 					)
@@ -7045,20 +7106,105 @@ impl Executor {
 
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
-		let mut matched = self
-			.try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
-				base,
-				&mut runtimes,
-				outer_predicate,
-				project_exprs,
-				project_output_schema,
-				group_expr,
-				aggr_expr,
-				&mut groups,
-				&mut group_types,
-				morsel,
-			)
-			.await?;
+		let mut matched = None;
+		if let Some((stage, scan_probe_batches, needs_decision_fallback)) = deferred_stream_stage {
+			if let Some(candidate) =
+				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel)?
+			{
+				runtimes.push(candidate);
+				matched = self
+					.try_streaming_reoriented_inner_chain_adaptive_last_stage_grouped(
+						base,
+						&mut runtimes,
+						outer_predicate,
+						project_exprs,
+						project_output_schema,
+						group_expr,
+						aggr_expr,
+						&mut groups,
+						&mut group_types,
+						morsel,
+						scan_probe_batches,
+					)
+					.await?;
+				if matched.is_none() {
+					runtimes.pop();
+				}
+			}
+			if matched.is_none() {
+				let runtime = if needs_decision_fallback {
+					let scan_build_decision = if force_stream_projected_filtered_base
+						&& matches!(
+							base_scan_probe_mode,
+							Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+						) {
+						ReorientedStageScanBuildDecision::Stream
+					} else if aggregate_input_wrapped {
+						if self
+							.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
+								&stage, morsel,
+							)
+							.await?
+						{
+							ReorientedStageScanBuildDecision::Stream
+						} else {
+							ReorientedStageScanBuildDecision::Materialized
+						}
+					} else {
+						self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
+							.await?
+					};
+					match scan_build_decision {
+						ReorientedStageScanBuildDecision::Stream
+						| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
+							self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+								stage, morsel,
+							)
+							.await?
+						}
+						ReorientedStageScanBuildDecision::Materialized => {
+							self.prepare_reoriented_inner_join_runtime(stage, morsel)
+								.await?
+						}
+						ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
+							self.prepare_reoriented_inner_join_runtime_from_build_batches(
+								stage,
+								build_batches,
+							)
+							.await?
+						}
+					}
+				} else {
+					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+						stage, morsel,
+					)
+					.await?
+				};
+				let Some(runtime) = runtime else {
+					for runtime in runtimes {
+						runtime.cleanup().await;
+					}
+					return Ok(None);
+				};
+				runtimes.push(runtime);
+			}
+		}
+		if matched.is_none() {
+			matched = self
+				.try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
+					base,
+					&mut runtimes,
+					outer_predicate,
+					project_exprs,
+					project_output_schema,
+					group_expr,
+					aggr_expr,
+					&mut groups,
+					&mut group_types,
+					morsel,
+				)
+				.await?;
+		}
 		if matched.is_none() {
 			matched = self
 				.try_streaming_reoriented_inner_chain_generic_base_grouped(
@@ -7102,6 +7248,383 @@ impl Executor {
 			runtime.cleanup().await;
 		}
 		output.map(Some)
+	}
+
+	fn reoriented_adaptive_partitioned_scan_candidate<'a>(
+		&self,
+		stage: &ReorientedInnerJoinStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		let Some(scan_input) = decompose_streaming_scan_probe_input(stage.build) else {
+			return Ok(None);
+		};
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&stage.build.schema(),
+			&stage.build_keys,
+			&stage.probe_schema,
+			&stage.probe_keys,
+			false,
+		)?;
+		let materialized_output_schema = if stage.probe_columns_first {
+			concat_join_schema(&stage.build.schema(), &stage.probe_schema)
+		} else {
+			stage.output_schema.clone()
+		};
+		Ok(Some(ReorientedInnerJoinRuntime {
+			replay_id: stage.replay_id,
+			strategy: stage.strategy,
+			build: ReorientedInnerJoinBuild::PartitionedScan {
+				scan_input,
+				morsel,
+				partition_count: 1,
+				group_count: 1,
+				partition_build_keys: stage.build_keys.clone(),
+				write_build_keys: stage.build_keys.clone(),
+				materialized_output_schema,
+				build_column_count: stage.build.schema().fields().len(),
+				projection: None,
+				estimated_build_bytes: 0,
+				observed_build_rows: 0,
+				loaded_builds: vec![None],
+				loaded_resident_bytes: 0,
+				loaded_build_attempted: false,
+			},
+			key_plan,
+			probe_keys: stage.probe_keys.clone(),
+			output_schema: stage.output_schema.clone(),
+			post_filter: stage.post_filter,
+			probe_columns_first: stage.probe_columns_first,
+			probe_rows: 0,
+			output_rows: 0,
+		}))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_reoriented_inner_chain_adaptive_last_stage_grouped(
+		&self,
+		base: &ExecutionPlan,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		morsel: Option<(MorselId, u32)>,
+		scan_probe_batches: Option<Vec<RecordBatch>>,
+	) -> Result<Option<()>, ExecutionError> {
+		// The first adaptive cut only handles a terminal over-cap scan-build stage. If
+		// later stages still need async probing, buffering the flipped output would
+		// cross the output-order/materialization boundary this cut deliberately avoids.
+		let Some((runtime, prefix)) = inner_runtimes.split_last_mut() else {
+			return Ok(None);
+		};
+		if !prefix.is_empty() {
+			return Ok(None);
+		}
+		let mut visit_output = |batch: RecordBatch| -> Result<(), ExecutionError> {
+			self.fold_reoriented_grouped_output_batch(
+				groups,
+				group_types,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				batch,
+			)?;
+			Ok(())
+		};
+		self.try_visit_reoriented_adaptive_derived_last_stage(
+			base,
+			runtime,
+			morsel,
+			scan_probe_batches,
+			&mut visit_output,
+		)
+		.await
+	}
+
+	async fn try_visit_reoriented_adaptive_derived_last_stage<F>(
+		&self,
+		base: &ExecutionPlan,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		morsel: Option<(MorselId, u32)>,
+		scan_probe_batches: Option<Vec<RecordBatch>>,
+		visit_batch: &mut F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let (
+			scan_input,
+			scan_probe_keys,
+			runtime_probe_keys,
+			output_schema,
+			post_filter,
+			original_probe_columns_first,
+		) = match &runtime.build {
+			ReorientedInnerJoinBuild::PartitionedScan {
+				scan_input,
+				partition_build_keys,
+				..
+			} => (
+				*scan_input,
+				partition_build_keys.clone(),
+				runtime.probe_keys.clone(),
+				runtime.output_schema.clone(),
+				runtime.post_filter,
+				runtime.probe_columns_first,
+			),
+			_ => return Ok(None),
+		};
+		let Some(derived_batches) = self
+			.materialize_reoriented_inner_chain_base_under_cap(base, morsel)
+			.await?
+		else {
+			return Ok(None);
+		};
+		if derived_batches.is_empty() {
+			return Ok(Some(()));
+		}
+		let derived_schema = derived_batches[0].schema();
+		let derived_batch = concat_or_empty(derived_schema.clone(), &derived_batches)?;
+		let derived_key_arrays = key_arrays(&derived_batch, &runtime_probe_keys)?;
+		let build_memory_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let estimated_build_bytes =
+			estimated_build_hash_bytes(&derived_key_arrays, derived_batch.num_rows());
+		if estimated_build_bytes > build_memory_cap {
+			return Ok(None);
+		}
+		let scan_schema = scan_input.scan.schema();
+		let join_key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&derived_schema,
+			&runtime_probe_keys,
+			&scan_schema,
+			&scan_probe_keys,
+			false,
+		)?;
+		let build_started = Instant::now();
+		let Some(build_rows) = build_in_memory_join_rows(
+			join_key_plan,
+			&derived_key_arrays,
+			derived_batch.num_rows(),
+			build_memory_cap,
+			false,
+		)?
+		else {
+			return Ok(None);
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(derived_batch.num_rows() as u64);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+		});
+		if let ReorientedInnerJoinBuild::PartitionedScan {
+			observed_build_rows,
+			..
+		} = &mut runtime.build
+		{
+			*observed_build_rows = derived_batch.num_rows() as u64;
+		}
+
+		let probe_started = Instant::now();
+		let mut visit_output = |batch: RecordBatch| -> Result<(), ExecutionError> {
+			let batch = if let Some(predicate) = post_filter {
+				self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+			} else {
+				batch
+			};
+			if batch.num_rows() > 0 {
+				visit_batch(batch)?;
+			}
+			Ok(())
+		};
+		let (probe_rows, output_rows) = if let Some(scan_probe_batches) = scan_probe_batches {
+			self.visit_reoriented_adaptive_derived_probe_batches(
+				&derived_batch,
+				&build_rows,
+				join_key_plan,
+				scan_input,
+				&scan_probe_keys,
+				&output_schema,
+				!original_probe_columns_first,
+				&mut visit_output,
+				scan_probe_batches,
+			)?
+		} else {
+			self.visit_streaming_in_memory_inner_scan_probe_chunks(
+				&derived_batch,
+				&build_rows,
+				join_key_plan,
+				scan_input,
+				&scan_probe_keys,
+				None,
+				false,
+				&output_schema,
+				None,
+				None,
+				!original_probe_columns_first,
+				morsel,
+				&mut visit_output,
+			)
+			.await?
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.probe_micros = task
+				.phases
+				.probe_micros
+				.saturating_add(duration_micros(probe_started));
+		});
+		self.record_reoriented_inner_probe(runtime, probe_rows, output_rows);
+		Ok(Some(()))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn visit_reoriented_adaptive_derived_probe_batches<F>(
+		&self,
+		build_batch: &RecordBatch,
+		build_rows: &JoinBuildRows,
+		join_key_plan: JoinKeyPlan,
+		scan_input: StreamingScanProbeInput<'_>,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		output_schema: &arrow::datatypes::SchemaRef,
+		probe_columns_first: bool,
+		visit_batch: &mut F,
+		scan_probe_batches: Vec<RecordBatch>,
+	) -> Result<(u64, u64), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let mut probe_rows = 0u64;
+		let mut output_rows = 0u64;
+		for probe_batch in scan_probe_batches {
+			if let Some(exchange) = scan_input.exchange {
+				for (_, partitioned) in self.repartition_exchange_batch(
+					&probe_batch,
+					exchange.partition_count,
+					exchange.key,
+				)? {
+					let (batch_probe_rows, batch_output_rows) = self
+						.visit_reoriented_adaptive_derived_probe_batch(
+							build_batch,
+							build_rows,
+							join_key_plan,
+							&partitioned,
+							probe_keys,
+							output_schema,
+							probe_columns_first,
+							&mut *visit_batch,
+						)?;
+					probe_rows = probe_rows.saturating_add(batch_probe_rows);
+					output_rows = output_rows.saturating_add(batch_output_rows);
+				}
+			} else {
+				let (batch_probe_rows, batch_output_rows) = self
+					.visit_reoriented_adaptive_derived_probe_batch(
+						build_batch,
+						build_rows,
+						join_key_plan,
+						&probe_batch,
+						probe_keys,
+						output_schema,
+						probe_columns_first,
+						&mut *visit_batch,
+					)?;
+				probe_rows = probe_rows.saturating_add(batch_probe_rows);
+				output_rows = output_rows.saturating_add(batch_output_rows);
+			}
+		}
+		Ok((probe_rows, output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn visit_reoriented_adaptive_derived_probe_batch<F>(
+		&self,
+		build_batch: &RecordBatch,
+		build_rows: &JoinBuildRows,
+		join_key_plan: JoinKeyPlan,
+		probe_batch: &RecordBatch,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		output_schema: &arrow::datatypes::SchemaRef,
+		probe_columns_first: bool,
+		visit_batch: &mut F,
+	) -> Result<(u64, u64), ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		if probe_batch.num_rows() == 0 {
+			return Ok((0, 0));
+		}
+		let probe_key_arrays = key_arrays(probe_batch, probe_keys)?;
+		let selection = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			join_key_plan,
+			build_rows,
+			build_batch.num_rows(),
+			&probe_key_arrays,
+			probe_batch.num_rows(),
+			None,
+			build_batch,
+			probe_batch,
+			false,
+		)?;
+		let output_rows = selection.len() as u64;
+		self.visit_reoriented_inner_selection_filtered_chunks(
+			build_batch,
+			probe_batch,
+			&selection,
+			output_schema,
+			None,
+			probe_columns_first,
+			visit_batch,
+		)?;
+		Ok((probe_batch.num_rows() as u64, output_rows))
+	}
+
+	async fn materialize_reoriented_inner_chain_base_under_cap(
+		&self,
+		base: &ExecutionPlan,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let accumulator_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let mut accumulated_bytes = 0u64;
+		let mut batches = Vec::new();
+		let matched = self
+			.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |batch| {
+				accumulated_bytes =
+					accumulated_bytes.saturating_add(record_batch_memory_bytes(&batch));
+				if accumulated_bytes > accumulator_cap {
+					return Err(budget_exhausted(
+						BudgetDimension::Memory,
+						"adaptive derived-side build accumulator",
+						accumulated_bytes,
+						accumulator_cap,
+					));
+				}
+				if batch.num_rows() > 0 {
+					batches.push(batch);
+				}
+				Ok(())
+			})
+			.await;
+		match matched {
+			Ok(Some(())) => Ok(Some(batches)),
+			Ok(None) => Ok(None),
+			Err(ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}) => Ok(None),
+			Err(error) => Err(error),
+		}
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -9580,15 +10103,17 @@ mod tests {
 	#[test]
 	fn reoriented_scan_build_decision_checks_hash_accumulator_bytes() {
 		let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-		assert!(matches!(
-			reoriented_stage_scan_build_decision_for_materialized_batches(
-				512,
-				1025,
-				1024,
-				vec![batch.clone()]
-			),
-			ReorientedStageScanBuildDecision::Stream
-		));
+		match reoriented_stage_scan_build_decision_for_materialized_batches(
+			512,
+			1025,
+			1024,
+			vec![batch.clone()],
+		) {
+			ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches) => {
+				assert_eq!(batches.len(), 1)
+			}
+			_ => panic!("build hash over cap should stream while preserving measured batches"),
+		}
 		assert!(matches!(
 			reoriented_stage_scan_build_decision_for_materialized_batches(
 				1025,
@@ -9739,6 +10264,7 @@ mod tests {
 			row_identity: crate::storage::RowIdentityProjection::None,
 			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
+			estimated_byte_size: None,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
@@ -11295,6 +11821,275 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn adaptive_derived_last_stage_build_scans_leaf_once_and_restores_order() {
+		let customer_schema = Arc::new(Schema::new(vec![
+			Field::new("cust_key", DataType::Int64, false),
+			Field::new("cust_tag", DataType::Int64, false),
+		]));
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("order_custkey", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+		]));
+		let line_schema = Arc::new(Schema::new(vec![
+			Field::new("line_orderkey", DataType::Int64, false),
+			Field::new("line_value", DataType::Int64, false),
+		]));
+		let base_schema = concat_test_schema(&customer_schema, &orders_schema);
+		let output_schema = concat_test_schema(&base_schema, &line_schema);
+		let customer = RecordBatch::try_new(
+			customer_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+			],
+		)
+		.expect("customer batch");
+		let orders = RecordBatch::try_new(
+			orders_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+				Arc::new(Int64Array::from(vec![100, 200, 300])),
+			],
+		)
+		.expect("orders batch");
+		let lineitem = RecordBatch::try_new(
+			line_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![200, 100, 999])),
+				Arc::new(Int64Array::from(vec![2_000, 1_000, 9_990])),
+			],
+		)
+		.expect("lineitem batch");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([
+					(TableId(20), vec![customer]),
+					(TableId(21), vec![orders]),
+					(TableId(22), vec![lineitem]),
+				]),
+				requested_tables: requested_tables.clone(),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+
+		let customer_scan =
+			test_scan_plan_with_first_field_key(TableId(20), customer_schema.clone(), 20);
+		let orders_scan = test_scan_plan_with_first_field_key(TableId(21), orders_schema, 21);
+		let base_join = inner_join_plan(
+			customer_scan,
+			orders_scan,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			base_schema.clone(),
+		);
+		let base = exchange_plan(
+			base_join,
+			bound_column_root("order_key", ColumnOrdinal(3), DataType::Int64, false),
+			1,
+		);
+		let line_scan = test_scan_plan_with_first_field_key(TableId(22), line_schema.clone(), 22);
+		let line_exchange = exchange_plan(
+			line_scan,
+			bound_column_root("line_orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			1,
+		);
+		let scan_input =
+			decompose_streaming_scan_probe_input(&line_exchange).expect("line scan input");
+		let mut runtime = ReorientedInnerJoinRuntime {
+			replay_id: JoinReplayId(1),
+			strategy: JoinStrategy::HashPartitioned,
+			build: ReorientedInnerJoinBuild::PartitionedScan {
+				scan_input,
+				morsel: None,
+				partition_count: 4,
+				group_count: 4,
+				partition_build_keys: vec![ColumnOrdinal(0)],
+				write_build_keys: vec![ColumnOrdinal(0)],
+				materialized_output_schema: concat_test_schema(&line_schema, &base_schema),
+				build_column_count: line_schema.fields().len(),
+				projection: None,
+				estimated_build_bytes: u64::MAX,
+				observed_build_rows: 0,
+				loaded_builds: (0..4).map(|_| None).collect(),
+				loaded_resident_bytes: 0,
+				loaded_build_attempted: false,
+			},
+			key_plan: JoinKeyPlan::Int64,
+			probe_keys: vec![ColumnOrdinal(3)],
+			output_schema: output_schema.clone(),
+			post_filter: None,
+			probe_columns_first: true,
+			probe_rows: 0,
+			output_rows: 0,
+		};
+
+		let mut output = Vec::new();
+		let matched = executor
+			.try_visit_reoriented_adaptive_derived_last_stage(
+				&base,
+				&mut runtime,
+				None,
+				None,
+				&mut |batch| {
+					output.push(batch);
+					Ok(())
+				},
+			)
+			.await
+			.expect("adaptive derived build");
+		assert!(matched.is_some(), "fitting derived side should flip");
+		assert_eq!(runtime.build_row_count(), 2);
+		assert_eq!(runtime.probe_rows, 3);
+		assert_eq!(runtime.output_rows, 2);
+		let requested = requested_tables.lock().expect("requested tables");
+		assert_eq!(
+			requested
+				.iter()
+				.filter(|table| **table == TableId(22))
+				.count(),
+			1,
+			"adaptive flip must scan the terminal leaf side exactly once"
+		);
+		let output = arrow::compute::concat_batches(&output_schema, output.iter())
+			.expect("adaptive output concat");
+		assert_eq!(int64_column_values(&output, 0), vec![2, 1]);
+		assert_eq!(int64_column_values(&output, 3), vec![200, 100]);
+		assert_eq!(int64_column_values(&output, 5), vec![2_000, 1_000]);
+	}
+
+	#[tokio::test]
+	async fn adaptive_derived_last_stage_declines_when_measured_build_exceeds_cap() {
+		let customer_schema = Arc::new(Schema::new(vec![Field::new(
+			"cust_key",
+			DataType::Int64,
+			false,
+		)]));
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("order_custkey", DataType::Int64, false),
+			Field::new("order_key", DataType::Int64, false),
+		]));
+		let line_schema = Arc::new(Schema::new(vec![Field::new(
+			"line_orderkey",
+			DataType::Int64,
+			false,
+		)]));
+		let base_schema = concat_test_schema(&customer_schema, &orders_schema);
+		let output_schema = concat_test_schema(&base_schema, &line_schema);
+		let rows = 8_192usize;
+		let customer = RecordBatch::try_new(
+			customer_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1]))],
+		)
+		.expect("customer batch");
+		let orders = RecordBatch::try_new(
+			orders_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1; rows])),
+				Arc::new(Int64Array::from_iter_values(
+					0..i64::try_from(rows).expect("rows fit"),
+				)),
+			],
+		)
+		.expect("orders batch");
+		let lineitem = RecordBatch::try_new(
+			line_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![0]))],
+		)
+		.expect("lineitem batch");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([
+					(TableId(23), vec![customer]),
+					(TableId(24), vec![orders]),
+					(TableId(25), vec![lineitem]),
+				]),
+				requested_tables: requested_tables.clone(),
+			}),
+			ExecutionContext::local_test().with_task_budget(TaskBudget {
+				memory: ByteCount::new(32 * 1024),
+				spill_bytes: ByteCount::new(64 * 1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			}),
+		);
+		let customer_scan =
+			test_scan_plan_with_first_field_key(TableId(23), customer_schema.clone(), 23);
+		let orders_scan = test_scan_plan_with_first_field_key(TableId(24), orders_schema, 24);
+		let base_join = inner_join_plan(
+			customer_scan,
+			orders_scan,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(0)],
+			base_schema.clone(),
+		);
+		let base = exchange_plan(
+			base_join,
+			bound_column_root("order_key", ColumnOrdinal(2), DataType::Int64, false),
+			1,
+		);
+		let line_scan = test_scan_plan_with_first_field_key(TableId(25), line_schema.clone(), 25);
+		let line_exchange = exchange_plan(
+			line_scan,
+			bound_column_root("line_orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			1,
+		);
+		let scan_input =
+			decompose_streaming_scan_probe_input(&line_exchange).expect("line scan input");
+		let mut runtime = ReorientedInnerJoinRuntime {
+			replay_id: JoinReplayId(1),
+			strategy: JoinStrategy::HashPartitioned,
+			build: ReorientedInnerJoinBuild::PartitionedScan {
+				scan_input,
+				morsel: None,
+				partition_count: 4,
+				group_count: 4,
+				partition_build_keys: vec![ColumnOrdinal(0)],
+				write_build_keys: vec![ColumnOrdinal(0)],
+				materialized_output_schema: concat_test_schema(&line_schema, &base_schema),
+				build_column_count: line_schema.fields().len(),
+				projection: None,
+				estimated_build_bytes: u64::MAX,
+				observed_build_rows: 0,
+				loaded_builds: (0..4).map(|_| None).collect(),
+				loaded_resident_bytes: 0,
+				loaded_build_attempted: false,
+			},
+			key_plan: JoinKeyPlan::Int64,
+			probe_keys: vec![ColumnOrdinal(2)],
+			output_schema,
+			post_filter: None,
+			probe_columns_first: true,
+			probe_rows: 0,
+			output_rows: 0,
+		};
+		let matched = executor
+			.try_visit_reoriented_adaptive_derived_last_stage(
+				&base,
+				&mut runtime,
+				None,
+				None,
+				&mut |_batch| Ok(()),
+			)
+			.await
+			.expect("adaptive derived build");
+		assert!(
+			matched.is_none(),
+			"oversized measured derived side must decline the adaptive flip"
+		);
+		assert_eq!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.iter()
+				.filter(|table| **table == TableId(25))
+				.count(),
+			0,
+			"declined flip must not scan the terminal leaf side"
+		);
+	}
+
+	#[tokio::test]
 	async fn projected_semi_anti_existence_build_keys_only_matches_unprojected() {
 		let existence_schema = Arc::new(Schema::new(vec![
 			Field::new("order_key", DataType::Int64, false),
@@ -11724,5 +12519,16 @@ mod tests {
 				"column {column} differs"
 			);
 		}
+	}
+
+	fn int64_column_values(batch: &RecordBatch, column: usize) -> Vec<i64> {
+		batch
+			.column(column)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("int64 column")
+			.iter()
+			.map(|value| value.expect("non-null int64"))
+			.collect()
 	}
 }

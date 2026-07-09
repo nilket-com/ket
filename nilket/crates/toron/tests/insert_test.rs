@@ -1354,6 +1354,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		row_limit: None,
 		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
+		estimated_byte_size: None,
 		primary_key_columns: vec![],
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),

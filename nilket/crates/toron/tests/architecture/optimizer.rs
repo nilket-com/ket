@@ -1093,7 +1093,8 @@ pub(crate) fn adr138_no_substrate_or_wire_change() {
 			offenders.extend(
 				source_lines(&path)
 					.into_iter()
-					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
+					.filter(|(_, _, line)| line.trim() != "estimated_byte_size: None,"),
 			);
 		} else {
 			let source = std::fs::read_to_string(&path).expect("read Toron source");
@@ -1102,6 +1103,7 @@ pub(crate) fn adr138_no_substrate_or_wire_change() {
 					.lines()
 					.enumerate()
 					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.filter(|(_, line)| line.trim() != "estimated_byte_size: None,")
 					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
 			);
 		}
@@ -1109,7 +1111,8 @@ pub(crate) fn adr138_no_substrate_or_wire_change() {
 	offenders.extend(
 		source_lines(&wendelon_manifest_dir().join("src"))
 			.into_iter()
-			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
+			.filter(|(_, _, line)| line.trim() != "estimated_byte_size: None,"),
 	);
 	assert!(
 		offenders.is_empty(),

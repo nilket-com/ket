@@ -162,10 +162,10 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// added the logical ON-residual normalization fallback at bind entry. ADR 323 added the semi/anti
 	// match-filter binding path for non-equi correlated EXISTS residuals. ADR 325 added exact decimal-point
 	// literal preservation plus the literal-only Decimal→Float compatibility rewrites for pre-existing float
-	// expression contexts.
+	// expression contexts. ADR 409 threads scan-size metadata from binder facts into the execution scan node.
 	assert!(
-		lines <= 6_020,
-		"binder root has {lines} lines; expected <= 6,020 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_030,
+		"binder root has {lines} lines; expected <= 6,030 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -230,12 +230,15 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/clause_accounting_test.rs",
 				"crates/toron/tests/correlated_scalar_test.rs",
 				"crates/toron/tests/cross_join_test.rs",
+				// ADR 409: existing integration fixtures fill the new scan estimate metadata field.
+				"crates/toron/tests/ctas_test.rs",
 				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/exists_decorrelation_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/group_by_test.rs",
 				"crates/toron/tests/hash_join_fast_path_parity_test.rs",
 				"crates/toron/tests/hash_join_kinds_test.rs",
+				"crates/toron/tests/insert_test.rs",
 				"crates/toron/tests/join_kind_test.rs",
 				"crates/toron/tests/logical_type_ddl_test.rs",
 				"crates/toron/tests/observability_listener_test.rs",

@@ -3400,11 +3400,44 @@ fn physical_plan_fingerprint(plan: &ExecutionPlan) -> String {
 	const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 	const FNV_PRIME: u64 = 0x00000100000001b3;
 	let mut hash = FNV_OFFSET;
-	for byte in format!("{plan:?}").as_bytes() {
+	let shape = plan_fingerprint_shape(plan);
+	for byte in shape.as_bytes() {
 		hash ^= u64::from(*byte);
 		hash = hash.wrapping_mul(FNV_PRIME);
 	}
 	format!("{hash:016x}")
+}
+
+fn plan_fingerprint_shape(plan: &ExecutionPlan) -> String {
+	strip_plan_fingerprint_routing_hints(&format!("{plan:?}"))
+}
+
+fn strip_plan_fingerprint_routing_hints(shape: &str) -> String {
+	const FIELD: &str = "estimated_byte_size: ";
+	let mut output = String::with_capacity(shape.len());
+	let mut cursor = 0;
+	while let Some(relative_start) = shape[cursor..].find(FIELD) {
+		let field_start = cursor + relative_start;
+		output.push_str(&shape[cursor..field_start]);
+		let mut field_end = field_start + FIELD.len();
+		if shape[field_end..].starts_with("Some(") {
+			field_end += "Some(".len();
+			while field_end < shape.len() && shape.as_bytes()[field_end] != b')' {
+				field_end += 1;
+			}
+			if field_end < shape.len() {
+				field_end += 1;
+			}
+		} else if shape[field_end..].starts_with("None") {
+			field_end += "None".len();
+		}
+		if shape[field_end..].starts_with(", ") {
+			field_end += 2;
+		}
+		cursor = field_end;
+	}
+	output.push_str(&shape[cursor..]);
+	output
 }
 
 #[derive(Debug, Clone)]
@@ -13149,6 +13182,17 @@ mod adr331_q08_scale_probe {
 #[cfg(test)]
 mod parquet_scan_projection_tests {
 	use super::*;
+
+	#[test]
+	fn physical_plan_fingerprint_shape_ignores_scan_size_routing_hint() {
+		let with_none = "Scan { local_table_id: TableId(1), profile_hint: Scan, estimated_byte_size: None, primary_key_columns: [] }";
+		let with_bytes = "Scan { local_table_id: TableId(1), profile_hint: Scan, estimated_byte_size: Some(8520711296), primary_key_columns: [] }";
+		let expected =
+			"Scan { local_table_id: TableId(1), profile_hint: Scan, primary_key_columns: [] }";
+
+		assert_eq!(strip_plan_fingerprint_routing_hints(with_none), expected);
+		assert_eq!(strip_plan_fingerprint_routing_hints(with_bytes), expected);
+	}
 
 	#[test]
 	fn projected_pbc_inflation_allows_omitted_non_nullable_columns() {

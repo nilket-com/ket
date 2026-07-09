@@ -266,6 +266,7 @@ pub enum ExecutionPlan {
 		row_limit: Option<usize>,
 		row_identity: RowIdentityProjection,
 		profile_hint: QueryProfileHint,
+		estimated_byte_size: Option<u64>,
 		primary_key_columns: Vec<ColumnOrdinal>,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,

@@ -791,6 +791,7 @@ fn scan_with_schema(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Ex
 		row_identity: toron::storage::RowIdentityProjection::None,
 		row_limit: None,
 		profile_hint: QueryProfileHint::Scan,
+		estimated_byte_size: None,
 		primary_key_columns: vec![ColumnOrdinal(0)],
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),

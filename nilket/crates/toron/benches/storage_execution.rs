@@ -274,6 +274,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			column_heavy_hitters,
 			column_group_top_k,
 			column_group_ndv,
+			estimated_byte_size,
 			..
 		} => ExecutionPlan::Scan {
 			local_table_id,
@@ -288,6 +289,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			pbc_program: None,
 			row_limit,
 			profile_hint,
+			estimated_byte_size,
 			primary_key_columns,
 			column_ndv,
 			column_range,
