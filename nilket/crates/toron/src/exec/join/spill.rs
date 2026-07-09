@@ -80,6 +80,53 @@ struct JoinSpillPage {
 	plaintext_len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) enum SpillResidentGuardSite {
+	Write,
+	RebuildIndex,
+	PinDecodedPages,
+	Finish,
+}
+
+impl SpillResidentGuardSite {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Write => "write",
+			Self::RebuildIndex => "rebuild_index",
+			Self::PinDecodedPages => "pin_decoded_pages",
+			Self::Finish => "finish",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpillResidentState {
+	resident_index_bytes: u64,
+	writer_peak_bytes: u64,
+	page_reserve_bytes: u64,
+	pinned_decoded_bytes: u64,
+}
+
+impl SpillResidentState {
+	fn total(self) -> u64 {
+		self.resident_index_bytes
+			.saturating_add(self.writer_peak_bytes)
+			.saturating_add(self.page_reserve_bytes)
+			.saturating_add(self.pinned_decoded_bytes)
+	}
+
+	fn detail(self, site: SpillResidentGuardSite) -> crate::error::BudgetExhaustedDetail {
+		crate::error::BudgetExhaustedDetail::message(format!(
+			"site={}, resident_index_bytes={}, writer_peak_bytes={}, page_reserve_bytes={}, pinned_decoded_bytes={}",
+			site.as_str(),
+			self.resident_index_bytes,
+			self.writer_peak_bytes,
+			self.page_reserve_bytes,
+			self.pinned_decoded_bytes
+		))
+	}
+}
+
 #[derive(Debug, Clone)]
 struct CachedJoinSpillPage {
 	bytes: Vec<u8>,
@@ -812,7 +859,7 @@ impl SpilledInnerJoinBuild {
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
 		self.page_rows.push(join_build_row_index(batch.num_rows())?);
 		self.pages.push(page);
-		self.guard_resident_state(task_budget.memory.get())?;
+		self.guard_resident_state_after_write(task_budget.memory.get())?;
 		Ok(())
 	}
 
@@ -844,7 +891,10 @@ impl SpilledInnerJoinBuild {
 				);
 				self.rows = self.rows.saturating_add(1);
 			}
-			self.guard_resident_state(task_budget.memory.get())?;
+			self.guard_resident_state(
+				task_budget.memory.get(),
+				SpillResidentGuardSite::RebuildIndex,
+			)?;
 		}
 		Ok(())
 	}
@@ -900,13 +950,14 @@ impl SpilledInnerJoinBuild {
 		self.cache_bytes = 0;
 		self.pinned_decoded_bytes = decoded_bytes;
 		self.pinned_decoded_pages = Some(pages);
-		self.guard_resident_state(memory_cap)?;
+		self.guard_resident_state(memory_cap, SpillResidentGuardSite::PinDecodedPages)?;
 		Ok(true)
 	}
 
 	pub(in crate::exec) fn release_write_scratch(&mut self) {
 		self.scratch_plaintext = Vec::new();
 		self.scratch_refs = Vec::new();
+		self.writer_peak = 0;
 	}
 
 	pub(in crate::exec) async fn finish(
@@ -921,28 +972,44 @@ impl SpilledInnerJoinBuild {
 			.fdatasync(&self.file)
 			.await
 			.map_err(|error| join_spill_io_error("fdatasync", error))?;
-		self.guard_resident_state(task_budget.memory.get())
+		self.guard_resident_state(task_budget.memory.get(), SpillResidentGuardSite::Finish)
 	}
 
 	pub(in crate::exec) fn guard_resident_state(
 		&self,
 		memory_cap: u64,
+		site: SpillResidentGuardSite,
 	) -> Result<(), ExecutionError> {
-		let resident = self
-			.resident_index_bytes
-			.saturating_add(self.writer_peak)
-			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
-			.saturating_add(self.pinned_decoded_bytes);
+		let state = self.resident_state();
+		let resident = state.total();
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
 		if resident > cap {
-			return Err(budget_exhausted(
+			return Err(budget_exhausted_with_detail(
 				BudgetDimension::Memory,
 				"streamed inner join build spill resident state",
 				resident,
 				cap,
+				state.detail(site),
 			));
 		}
 		Ok(())
+	}
+
+	fn guard_resident_state_after_write(&mut self, memory_cap: u64) -> Result<(), ExecutionError> {
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		if self.resident_state().total() > cap && self.writer_peak > 0 {
+			self.release_write_scratch();
+		}
+		self.guard_resident_state(memory_cap, SpillResidentGuardSite::Write)
+	}
+
+	fn resident_state(&self) -> SpillResidentState {
+		SpillResidentState {
+			resident_index_bytes: self.resident_index_bytes,
+			writer_peak_bytes: self.writer_peak,
+			page_reserve_bytes: JOIN_SPILL_PAGE_SIZE as u64,
+			pinned_decoded_bytes: self.pinned_decoded_bytes,
+		}
 	}
 
 	pub(in crate::exec) async fn lookup(
@@ -2746,7 +2813,9 @@ mod tests {
 			inner_equal.saturating_add(1),
 		] {
 			assert_eq!(
-				inner.guard_resident_state(memory_cap).is_err(),
+				inner
+					.guard_resident_state(memory_cap, SpillResidentGuardSite::Finish)
+					.is_err(),
 				fold_based_inner_guard_rejects(&inner, memory_cap)
 			);
 		}
@@ -2789,6 +2858,77 @@ mod tests {
 		}
 		existence.cleanup().await;
 		let _ = std::fs::remove_dir_all(existence_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_guard_reports_component_detail_and_site() {
+		let budget = test_task_budget();
+		let memory_cap = 1024;
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let spill_dir = test_spill_dir("inner_guard_detail");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		build.resident_index_bytes = cap;
+		build.writer_peak = 1;
+
+		let err = build
+			.guard_resident_state(memory_cap, SpillResidentGuardSite::Finish)
+			.expect_err("resident state must fail");
+		match err {
+			ExecutionError::BudgetExhausted {
+				producer,
+				requested,
+				available,
+				detail: crate::error::BudgetExhaustedDetail::Message(detail),
+				..
+			} => {
+				assert_eq!(producer, "streamed inner join build spill resident state");
+				assert_eq!(requested.get(), cap + 1 + JOIN_SPILL_PAGE_SIZE as u64);
+				assert_eq!(available.get(), cap);
+				assert!(detail.contains("site=finish"));
+				assert!(detail.contains("resident_index_bytes=16384"));
+				assert!(detail.contains("writer_peak_bytes=1"));
+				assert!(detail.contains("page_reserve_bytes=65536"));
+				assert!(detail.contains("pinned_decoded_bytes=0"));
+			}
+			other => panic!("expected detailed budget exhaustion, got {other:?}"),
+		}
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_write_guard_sheds_writer_scratch_but_not_index_pressure() {
+		let budget = test_task_budget();
+		let memory_cap = 8 * 1024;
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let spill_dir = test_spill_dir("inner_guard_sheds_writer");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+
+		build.resident_index_bytes = cap - JOIN_SPILL_PAGE_SIZE as u64;
+		build.writer_peak = 1;
+		build.scratch_plaintext = Vec::with_capacity(64);
+		build.scratch_refs = Vec::with_capacity(64);
+		build
+			.guard_resident_state_after_write(memory_cap)
+			.expect("writer scratch should be shed before failing");
+		assert_eq!(build.writer_peak, 0);
+		assert_eq!(build.scratch_plaintext.capacity(), 0);
+		assert_eq!(build.scratch_refs.capacity(), 0);
+
+		build.resident_index_bytes = cap - JOIN_SPILL_PAGE_SIZE as u64 + 1;
+		build
+			.guard_resident_state_after_write(memory_cap)
+			.expect_err("resident index plus page reserve still exceeds the cap");
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 
 	#[tokio::test]

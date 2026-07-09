@@ -11828,6 +11828,7 @@ mod tests {
 				producer,
 				requested,
 				available,
+				..
 			} => {
 				assert_eq!(dimension, BudgetDimension::SpillBytes);
 				assert_eq!(producer, "streamed inner join build partition group sizing");

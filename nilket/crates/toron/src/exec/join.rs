@@ -3723,5 +3723,22 @@ pub(super) fn budget_exhausted(
 		producer: source,
 		requested: ByteCount::new(requested),
 		available: ByteCount::new(available),
+		detail: Default::default(),
+	}
+}
+
+pub(super) fn budget_exhausted_with_detail(
+	dimension: BudgetDimension,
+	source: &'static str,
+	requested: u64,
+	available: u64,
+	detail: crate::error::BudgetExhaustedDetail,
+) -> ExecutionError {
+	ExecutionError::BudgetExhausted {
+		dimension,
+		producer: source,
+		requested: ByteCount::new(requested),
+		available: ByteCount::new(available),
+		detail,
 	}
 }

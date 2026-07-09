@@ -1756,6 +1756,7 @@ mod tests {
 				producer: "test",
 				requested: ByteCount::new(16),
 				available: ByteCount::new(8),
+				detail: Default::default(),
 			}));
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);

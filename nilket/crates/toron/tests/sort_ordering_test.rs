@@ -478,6 +478,7 @@ async fn sort_materialization_still_fails_over_family_cap() {
 			producer,
 			requested: observed_requested,
 			available,
+			..
 		} => {
 			assert_eq!(dimension, BudgetDimension::Memory);
 			assert_eq!(producer, "sort materialization");

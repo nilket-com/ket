@@ -6,6 +6,28 @@ pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
 
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BudgetExhaustedDetail {
+	#[default]
+	None,
+	Message(String),
+}
+
+impl BudgetExhaustedDetail {
+	pub fn message(message: impl Into<String>) -> Self {
+		Self::Message(message.into())
+	}
+}
+
+impl std::fmt::Display for BudgetExhaustedDetail {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::None => Ok(()),
+			Self::Message(message) => write!(f, ", detail {message}"),
+		}
+	}
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
 	#[error("table not found: {table:?}")]
@@ -201,13 +223,14 @@ pub enum ExecutionError {
 	#[error("kernel error: {message}")]
 	Kernel { message: String },
 	#[error(
-		"budget exhausted: {dimension:?}, producer {producer}, requested {requested:?}, available {available:?}"
+		"budget exhausted: {dimension:?}, producer {producer}, requested {requested:?}, available {available:?}{detail}"
 	)]
 	BudgetExhausted {
 		dimension: crate::distributed::budget::BudgetDimension,
 		producer: &'static str,
 		requested: crate::distributed::budget::ByteCount,
 		available: crate::distributed::budget::ByteCount,
+		detail: BudgetExhaustedDetail,
 	},
 	#[error(
 		"tenant concurrency exhausted: tenant {tenant_id:?}, requested {requested}, available {available}"

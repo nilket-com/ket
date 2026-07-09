@@ -4472,6 +4472,7 @@ where
 			producer: _,
 			requested,
 			available,
+			..
 		}) => TaskFailureKind::BudgetExhausted {
 			dimension: *dimension,
 			requested: *requested,
@@ -4557,6 +4558,7 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 			producer: _,
 			requested,
 			available,
+			..
 		}) => TaskFailureKind::BudgetExhausted {
 			dimension,
 			requested,

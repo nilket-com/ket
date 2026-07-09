@@ -1614,6 +1614,7 @@ fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {
 		producer: "tenant budget admission",
 		requested: rejection.requested,
 		available: rejection.available,
+		detail: Default::default(),
 	})
 }
 
@@ -3157,6 +3158,7 @@ mod tests {
 				producer: _,
 				requested: ByteCount(8),
 				available: ByteCount(0),
+				..
 			})
 		));
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 1);
@@ -3223,6 +3225,7 @@ mod tests {
 				producer: _,
 				requested: ByteCount(8),
 				available: ByteCount(0),
+				..
 			})
 		));
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 1);

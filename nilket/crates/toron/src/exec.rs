@@ -1737,6 +1737,7 @@ fn execute_repeat(
 						producer: "repeat output row count",
 						requested: ByteCount::new(u64::MAX),
 						available: task_budget.memory,
+						detail: Default::default(),
 					})?;
 		}
 
@@ -1760,6 +1761,7 @@ fn execute_repeat(
 				producer: "repeat output materialization",
 				requested: ByteCount::new(estimate),
 				available: task_budget.memory,
+				detail: Default::default(),
 			});
 		}
 
@@ -1830,6 +1832,7 @@ fn execute_sort(
 			producer: "sort materialization",
 			requested: ByteCount::new(estimate),
 			available: ByteCount::new(materialization_cap),
+			detail: Default::default(),
 		});
 	}
 
@@ -1939,6 +1942,7 @@ fn execute_window(
 			producer: "window materialization",
 			requested: ByteCount::new(estimate),
 			available: task_budget.memory,
+			detail: Default::default(),
 		});
 	}
 
