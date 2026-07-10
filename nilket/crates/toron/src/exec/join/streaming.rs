@@ -3224,6 +3224,7 @@ impl Executor {
 					morsel,
 					group_range.start,
 					group_range.end,
+					true,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -3989,6 +3990,7 @@ impl Executor {
 		morsel: Option<(MorselId, u32)>,
 		partition_start: usize,
 		partition_end: usize,
+		enforce_group_spill_budget: bool,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
@@ -4037,6 +4039,7 @@ impl Executor {
 						null_safe_keys,
 						partition_start,
 						partition_end,
+						enforce_group_spill_budget,
 					)
 					.await?;
 				}
@@ -4081,6 +4084,7 @@ impl Executor {
 					null_safe_keys,
 					partition_start,
 					partition_end,
+					enforce_group_spill_budget,
 				)
 				.await?;
 			}
@@ -4102,6 +4106,7 @@ impl Executor {
 		null_safe_keys: bool,
 		partition_start: usize,
 		partition_end: usize,
+		enforce_group_spill_budget: bool,
 	) -> Result<(), ExecutionError> {
 		let buckets = precompute_join_partition_buckets(
 			batch,
@@ -4150,7 +4155,7 @@ impl Executor {
 				total_spill_bytes.saturating_add(spilled.spill_bytes().saturating_sub(before));
 			let group_spill_budget =
 				streamed_inner_build_group_spill_budget(self.context.task_budget.spill_bytes.get());
-			if *total_spill_bytes > group_spill_budget {
+			if enforce_group_spill_budget && *total_spill_bytes > group_spill_budget {
 				return Err(budget_exhausted(
 					BudgetDimension::SpillBytes,
 					"partitioned streamed inner join build spill writer",
@@ -7889,6 +7894,23 @@ impl Executor {
 		if matched.is_none() {
 			return Ok(None);
 		}
+		if self
+			.try_process_reoriented_inner_chain_grouped_partitioned_scan_reservoir(
+				&base_batches,
+				inner_runtimes,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				morsel,
+			)
+			.await?
+		{
+			return Ok(Some(()));
+		}
 		for base_batch in base_batches {
 			self.process_reoriented_inner_chain_grouped_base_batch(
 				base_batch,
@@ -7919,7 +7941,33 @@ impl Executor {
 		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
 		group_types: &mut Vec<DataType>,
 	) -> Result<(), ExecutionError> {
-		let mut batches = vec![base_batch];
+		self.process_reoriented_inner_chain_grouped_suffix_batch(
+			vec![base_batch],
+			inner_runtimes,
+			outer_predicate,
+			project_exprs,
+			project_output_schema,
+			group_expr,
+			aggr_expr,
+			groups,
+			group_types,
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn process_reoriented_inner_chain_grouped_suffix_batch(
+		&self,
+		mut batches: Vec<RecordBatch>,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+	) -> Result<(), ExecutionError> {
 		for runtime in inner_runtimes.iter_mut() {
 			let mut next = Vec::new();
 			for batch in batches {
@@ -7961,6 +8009,160 @@ impl Executor {
 			)?;
 		}
 		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_process_reoriented_inner_chain_grouped_partitioned_scan_reservoir(
+		&self,
+		base_batches: &[RecordBatch],
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		outer_predicate: Option<&BoundExprProgram>,
+		project_exprs: Option<&BoundExprProgram>,
+		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<bool, ExecutionError> {
+		let Some((runtime, suffix_runtimes)) = inner_runtimes.split_first_mut() else {
+			return Ok(false);
+		};
+		let (
+			scan_input,
+			build_morsel,
+			partition_count,
+			group_count,
+			partition_build_keys,
+			write_build_keys,
+			key_plan,
+			null_safe_keys,
+			materialized_output_schema,
+			output_schema,
+			probe_columns_first,
+			build_column_count,
+			projection,
+			probe_keys,
+			post_filter,
+		) = match &runtime.build {
+			ReorientedInnerJoinBuild::PartitionedScan {
+				scan_input,
+				morsel: build_morsel,
+				partition_count,
+				group_count,
+				partition_build_keys,
+				write_build_keys,
+				materialized_output_schema,
+				build_column_count,
+				projection,
+				..
+			} if *partition_count > 1 && *group_count > 1 => (
+				*scan_input,
+				*build_morsel,
+				*partition_count,
+				*group_count,
+				partition_build_keys.clone(),
+				write_build_keys.clone(),
+				runtime.key_plan,
+				false,
+				materialized_output_schema.clone(),
+				runtime.output_schema.clone(),
+				runtime.probe_columns_first,
+				*build_column_count,
+				projection.clone(),
+				runtime.probe_keys.clone(),
+				runtime.post_filter,
+			),
+			_ => return Ok(false),
+		};
+
+		let build_result = self
+			.build_partitioned_streaming_scan_inner_build_reservoir(
+				scan_input,
+				build_morsel.or(morsel),
+				partition_count,
+				&partition_build_keys,
+				&write_build_keys,
+				key_plan,
+				null_safe_keys,
+				projection.as_ref(),
+			)
+			.await;
+		let (mut reservoir, build_rows) = match build_result {
+			Ok(Some(result)) => result,
+			Ok(None) => return Ok(false),
+			Err(error) => return Err(error),
+		};
+
+		let mut total_probe_rows = 0u64;
+		let mut total_output_rows = 0u64;
+		let result = async {
+			let Some(first_base_batch) = base_batches.first() else {
+				return Ok::<(), ExecutionError>(());
+			};
+			let base_batch = concat_or_empty(first_base_batch.schema(), base_batches)?;
+			if base_batch.num_rows() == 0 {
+				return Ok(());
+			}
+			let (mut output, probe_rows, output_rows) = self
+				.probe_partitioned_streamed_inner_scan_build_reservoir(
+					&mut reservoir,
+					partition_count,
+					group_count,
+					&base_batch,
+					&probe_keys,
+					&write_build_keys,
+					key_plan,
+					null_safe_keys,
+					&materialized_output_schema,
+					&output_schema,
+					probe_columns_first,
+					build_column_count,
+					projection.as_ref(),
+				)
+				.await?;
+			total_probe_rows = total_probe_rows.saturating_add(probe_rows);
+			total_output_rows = total_output_rows.saturating_add(output_rows);
+			if let Some(predicate) = post_filter {
+				let mut filtered = Vec::new();
+				for batch in output {
+					let batch = self.filter_batch_with_bound_predicate(
+						predicate,
+						batch,
+						"filter predicate",
+					)?;
+					if batch.num_rows() > 0 {
+						filtered.push(batch);
+					}
+				}
+				output = filtered;
+			}
+			self.process_reoriented_inner_chain_grouped_suffix_batch(
+				output,
+				suffix_runtimes,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+			)
+			.await?;
+			Ok::<(), ExecutionError>(())
+		}
+		.await;
+		Self::cleanup_partitioned_streamed_inner_builds(reservoir).await;
+		result?;
+		if let ReorientedInnerJoinBuild::PartitionedScan {
+			observed_build_rows,
+			..
+		} = &mut runtime.build
+		{
+			*observed_build_rows = observed_build_rows.saturating_add(build_rows);
+		}
+		self.record_reoriented_inner_probe(runtime, total_probe_rows, total_output_rows);
+		Ok(true)
 	}
 
 	fn fold_reoriented_grouped_output_batch(
@@ -9468,6 +9670,7 @@ impl Executor {
 					morsel,
 					group_range.start,
 					group_range.end,
+					true,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -9558,6 +9761,98 @@ impl Executor {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	async fn build_partitioned_streaming_scan_inner_build_reservoir(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		morsel: Option<(MorselId, u32)>,
+		partition_count: u32,
+		partition_build_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		projection: Option<&ProjectedInnerBuildProjection>,
+	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
+		let partition_count_usize =
+			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+				message: "streamed inner build partition count exceeds usize".to_string(),
+			})?;
+		let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
+			(0..partition_count_usize).map(|_| None).collect();
+		for slot in &mut partitioned_builds {
+			let created = SpilledInnerJoinBuild::create(
+				self.context.task_budget,
+				self.context.join_spill_file_ops.clone(),
+				self.context.join_spill_dir.clone(),
+			)
+			.await?;
+			*slot = Some(created);
+		}
+
+		let build_started = Instant::now();
+		let mut total_spill_bytes = 0u64;
+		let build_result = self
+			.write_partitioned_streaming_scan_inner_build_batches(
+				&mut partitioned_builds,
+				&mut total_spill_bytes,
+				scan_input,
+				projection.map(|projection| projection.retained_columns.as_slice()),
+				partition_build_keys,
+				write_build_keys,
+				key_plan,
+				null_safe_keys,
+				morsel,
+				0,
+				partition_count_usize,
+				false,
+			)
+			.await;
+		if let Err(error) = build_result {
+			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+			if matches!(error, ExecutionError::BudgetExhausted { .. }) {
+				return Ok(None);
+			}
+			return Err(error);
+		}
+
+		let mut total_build_rows = 0u64;
+		for partition in 0..partition_count_usize {
+			let Some(spilled) = partitioned_builds
+				.get_mut(partition)
+				.and_then(Option::as_mut)
+			else {
+				continue;
+			};
+			if let Err(error) = spilled.finish(self.context.task_budget).await {
+				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+				return Err(error);
+			}
+			spilled.release_write_scratch();
+			total_build_rows = total_build_rows.saturating_add(spilled.input_row_count());
+			if spilled.input_row_count() == 0 {
+				let Some(empty) = partitioned_builds.get_mut(partition).and_then(Option::take)
+				else {
+					continue;
+				};
+				empty.cleanup().await;
+			}
+		}
+
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task.counters.build_rows.saturating_add(total_build_rows);
+			task.phases.build_micros = task
+				.phases
+				.build_micros
+				.saturating_add(duration_micros(build_started));
+			task.phases.spill_micros = task
+				.phases
+				.spill_micros
+				.saturating_add(duration_micros(build_started));
+			task.counters.spill_bytes = task.counters.spill_bytes.saturating_add(total_spill_bytes);
+		});
+		Ok(Some((partitioned_builds, total_build_rows)))
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	fn probe_loaded_partitioned_streamed_inner_scan_build(
 		&self,
 		loaded_builds: &[Option<LoadedSpilledInnerBuild>],
@@ -9607,6 +9902,123 @@ impl Executor {
 			total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
 			total_output_rows = total_output_rows.saturating_add(result.output_rows);
 			output.extend(result.output);
+		}
+		Ok((output, total_probe_rows, total_output_rows))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn probe_partitioned_streamed_inner_scan_build_reservoir(
+		&self,
+		partitioned_builds: &mut [Option<SpilledInnerJoinBuild>],
+		partition_count: u32,
+		group_count: u32,
+		probe_batch: &RecordBatch,
+		probe_keys: &[crate::ir::ColumnOrdinal],
+		write_build_keys: &[crate::ir::ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		materialized_output_schema: &SchemaRef,
+		output_schema: &SchemaRef,
+		probe_columns_first: bool,
+		build_column_count: usize,
+		projection: Option<&ProjectedInnerBuildProjection>,
+	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
+		let mut output = Vec::new();
+		let mut total_probe_rows = 0u64;
+		let mut total_output_rows = 0u64;
+		let probe_partition_buckets = precompute_join_partition_buckets(
+			probe_batch,
+			probe_keys,
+			partition_count,
+			null_safe_keys,
+			false,
+		)?;
+		let partitioned_probe_batches = partition_streaming_join_batch_with_buckets(
+			probe_batch,
+			&probe_partition_buckets,
+			partition_count,
+		)?;
+		if partitioned_probe_batches.is_empty() {
+			return Ok((output, 0, 0));
+		}
+		let group_count = group_count.max(1).min(partition_count);
+		for group in 0..group_count {
+			let group_range = partition_group_bounds(partition_count, group_count, group)?;
+			for (partition, partitioned_probe) in partitioned_probe_batches
+				.iter()
+				.filter(|(partition, _)| group_range.contains(partition))
+			{
+				let Some(spilled) = partitioned_builds
+					.get_mut(*partition)
+					.and_then(Option::as_mut)
+				else {
+					continue;
+				};
+				if spilled.input_row_count() == 0 {
+					continue;
+				}
+				let memory_cap = self.context.task_budget.memory.get();
+				let loaded_resident =
+					estimate_parallel_partition_resident(spilled, partitioned_probe, key_plan);
+				let loaded_cap = join_spill_retained_footprint_memory_cap(memory_cap);
+				if loaded_resident <= loaded_cap {
+					let build_pages = spilled.read_all_batch_pages().await?;
+					let work = LoadedPartitionWork {
+						partition: *partition,
+						build_pages,
+						probe_batch: partitioned_probe.clone(),
+						probe_keys: probe_keys.to_vec(),
+						write_build_keys: write_build_keys.to_vec(),
+						key_plan,
+						null_safe_keys,
+						materialized_output_schema: materialized_output_schema.clone(),
+						output_schema: output_schema.clone(),
+						probe_columns_first,
+						build_column_count,
+						projection: projection.cloned(),
+						memory_cap,
+					};
+					let result = run_loaded_partition_work(work)?;
+					total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
+					total_output_rows = total_output_rows.saturating_add(result.output_rows);
+					output.extend(result.output);
+				} else {
+					if let Err(error) = spilled
+						.rebuild_index_from_pages(
+							key_plan,
+							write_build_keys,
+							null_safe_keys,
+							self.context.task_budget,
+						)
+						.await
+					{
+						return Err(error);
+					}
+					let mut partition_output = Vec::new();
+					let (probe_rows, output_rows) = self
+						.visit_streaming_spilled_inner_probe_batch(
+							spilled,
+							partitioned_probe,
+							probe_keys,
+							key_plan,
+							null_safe_keys,
+							materialized_output_schema,
+							output_schema,
+							None,
+							probe_columns_first,
+							build_column_count,
+							projection,
+							&mut |batch| {
+								partition_output.push(batch);
+								Ok(())
+							},
+						)
+						.await?;
+					total_probe_rows = total_probe_rows.saturating_add(probe_rows);
+					total_output_rows = total_output_rows.saturating_add(output_rows);
+					output.extend(partition_output);
+				}
+			}
 		}
 		Ok((output, total_probe_rows, total_output_rows))
 	}
@@ -9702,6 +10114,7 @@ impl Executor {
 					morsel,
 					group_range.start,
 					group_range.end,
+					true,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -10445,6 +10858,165 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn partition_reservoir_scans_source_once_and_matches_group_rescan_path() {
+		let build_schema = Arc::new(Schema::new(vec![
+			Field::new("build_key", DataType::Int64, false),
+			Field::new("build_payload", DataType::Int64, false),
+		]));
+		let probe_schema = Arc::new(Schema::new(vec![
+			Field::new("probe_key", DataType::Int64, false),
+			Field::new("probe_tag", DataType::Int64, false),
+		]));
+		let materialized_output_schema = concat_test_schema(&build_schema, &probe_schema);
+		let output_schema = concat_test_schema(&probe_schema, &build_schema);
+		let build_rows = 64usize;
+		let build_batch = RecordBatch::try_new(
+			build_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from_iter_values(
+					0..i64::try_from(build_rows).expect("build rows fit"),
+				)),
+				Arc::new(Int64Array::from_iter_values(
+					(0..i64::try_from(build_rows).expect("build rows fit")).map(|row| row * 10),
+				)),
+			],
+		)
+		.expect("build batch");
+		let probe_batch = RecordBatch::try_new(
+			probe_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from_iter_values(
+					(0..i64::try_from(build_rows).expect("build rows fit")).rev(),
+				)),
+				Arc::new(Int64Array::from_iter_values(
+					(0..i64::try_from(build_rows).expect("build rows fit"))
+						.rev()
+						.map(|row| row * 100),
+				)),
+			],
+		)
+		.expect("probe batch");
+		let build_scan = test_scan_plan_with_first_field_key(TableId(40), build_schema.clone(), 40);
+		let build_exchange = exchange_plan(
+			build_scan,
+			bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+			8,
+		);
+		let scan_input =
+			decompose_streaming_scan_probe_input(&build_exchange).expect("build scan input");
+		let budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let build_keys = vec![ColumnOrdinal(0)];
+		let probe_keys = vec![ColumnOrdinal(0)];
+		let make_executor = |requested_tables: Arc<Mutex<Vec<TableId>>>| {
+			Executor::with_context(
+				Arc::new(RecordingMultiBatchTableStorageScan {
+					batches: HashMap::from([(TableId(40), vec![build_batch.clone()])]),
+					requested_tables,
+				}),
+				ExecutionContext::local_test().with_task_budget(budget),
+			)
+		};
+
+		let reservoir_requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let reservoir_executor = make_executor(reservoir_requested_tables.clone());
+		let (mut reservoir, reservoir_build_rows) = reservoir_executor
+			.build_partitioned_streaming_scan_inner_build_reservoir(
+				scan_input,
+				None,
+				8,
+				&build_keys,
+				&build_keys,
+				JoinKeyPlan::Int64,
+				false,
+				None,
+			)
+			.await
+			.expect("reservoir build")
+			.expect("reservoir should fit");
+		assert_eq!(
+			reservoir_build_rows, build_rows as u64,
+			"reservoir should write every build row exactly once"
+		);
+		assert_eq!(
+			reservoir_requested_tables
+				.lock()
+				.expect("reservoir requested tables")
+				.iter()
+				.filter(|table| **table == TableId(40))
+				.count(),
+			1,
+			"reservoir build must scan the source once, not once per partition group"
+		);
+		let reservoir_probe = reservoir_executor
+			.probe_partitioned_streamed_inner_scan_build_reservoir(
+				&mut reservoir,
+				8,
+				4,
+				&probe_batch,
+				&probe_keys,
+				&build_keys,
+				JoinKeyPlan::Int64,
+				false,
+				&materialized_output_schema,
+				&output_schema,
+				true,
+				build_schema.fields().len(),
+				None,
+			)
+			.await;
+		Executor::cleanup_partitioned_streamed_inner_builds(reservoir).await;
+		let (reservoir_output, reservoir_probe_rows, reservoir_output_rows) =
+			reservoir_probe.expect("reservoir probe");
+
+		let group_requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let group_executor = make_executor(group_requested_tables.clone());
+		let (group_output, group_probe_rows, group_output_rows, _) = group_executor
+			.probe_partitioned_streamed_inner_scan_build(
+				scan_input,
+				None,
+				8,
+				4,
+				&build_keys,
+				&build_keys,
+				&probe_batch,
+				&probe_keys,
+				JoinKeyPlan::Int64,
+				false,
+				&materialized_output_schema,
+				&output_schema,
+				true,
+				build_schema.fields().len(),
+				None,
+			)
+			.await
+			.expect("group re-scan probe");
+		let group_scan_count = group_requested_tables
+			.lock()
+			.expect("group requested tables")
+			.iter()
+			.filter(|table| **table == TableId(40))
+			.count();
+		assert!(
+			group_scan_count > 1,
+			"fixture must exercise the old repeated-scan comparison path"
+		);
+
+		assert_eq!(reservoir_probe_rows, group_probe_rows);
+		assert_eq!(reservoir_output_rows, group_output_rows);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&reservoir_output, SortPolicy::None)
+				.expect("reservoir digest"),
+			canonical_arrow_ipc_digest(&group_output, SortPolicy::None)
+				.expect("group re-scan digest"),
+			"one-pass reservoir output must match the old per-group scan path row-for-row"
+		);
+	}
+
+	#[tokio::test]
 	async fn reoriented_inner_chain_generic_base_consumes_streamed_stage_runtime() {
 		let dim0_schema = Arc::new(Schema::new(vec![
 			Field::new("d0_key", DataType::Int64, false),
@@ -10506,13 +11078,14 @@ mod tests {
 		.expect("dim1 batch");
 
 		let build_plan = |budget, wrap_aggregate_input: bool| {
+			let requested_tables = Arc::new(Mutex::new(Vec::new()));
 			let storage = Arc::new(RecordingMultiBatchTableStorageScan {
 				batches: HashMap::from([
 					(TableId(1), vec![dim0_batch.clone()]),
 					(TableId(2), vec![fact_batch.clone()]),
 					(TableId(3), vec![dim1_batch.clone()]),
 				]),
-				requested_tables: Arc::new(Mutex::new(Vec::new())),
+				requested_tables: requested_tables.clone(),
 			});
 			let executor = Executor::with_context(
 				storage,
@@ -10589,7 +11162,7 @@ mod tests {
 				aggr_expr,
 				output_schema,
 			};
-			(executor, plan)
+			(executor, plan, requested_tables)
 		};
 
 		let low_budget = TaskBudget {
@@ -10601,13 +11174,24 @@ mod tests {
 			(true, "exchange-wrapped aggregate input"),
 			(false, "bare aggregate input"),
 		] {
-			let (streaming_executor, streaming_plan) = build_plan(low_budget, wrap_aggregate_input);
+			let (streaming_executor, streaming_plan, streaming_requested_tables) =
+				build_plan(low_budget, wrap_aggregate_input);
 			let streamed = streaming_executor
 				.execute_bound(&streaming_plan, None)
 				.await
 				.expect("generic base should consume streamed stage runtime");
+			let dim1_scan_count = streaming_requested_tables
+				.lock()
+				.expect("requested tables")
+				.iter()
+				.filter(|table| **table == TableId(3))
+				.count();
+			assert_eq!(
+				dim1_scan_count, 1,
+				"streamed generic base should build the partition reservoir from the scan once for {shape}"
+			);
 
-			let (materialized_executor, materialized_plan) =
+			let (materialized_executor, materialized_plan, _) =
 				build_plan(high_test_budget(), wrap_aggregate_input);
 			let materialized = materialized_executor
 				.execute_bound(&materialized_plan, None)
