@@ -11,11 +11,12 @@ path**. Two cells, one shared producer, the strongest prior proof on the board.
 `SpilledBatchIndex::for_key_plan(...)` (`exec/join/spill.rs:1251`/`:1303`); disabled builds still append into the
 legacy `HashMap<JoinKey, Vec<SpilledBatchRowRef>>` (`:1262`/`:1323`). 414 opted in q12's streamed-spilled build
 helpers; **q07/q09 route through a creation path where the flag is still off**. A bounded in-place rescue also exists
-(`:965`, `COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES`), but q07/q09's 701,192-byte overshoot evidently
-exceeds it - and widening the rescue window would be a cap bump in disguise. The honest fix is **enabling the compact
-representation from the start on their path**, exactly as q12's.
+(`:965`, `COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES`), and q07/q09's 701,192-byte overshoot is below its
+1 MiB bound. It does not fire because the rescue opt-in is test-only and disabled on production builds. The honest
+fix is **enabling the compact representation from the start on their path**, exactly as q12's; widening or promoting
+the rescue is not the mechanism.
 
-**Operator tightening #1 - no inherited headroom:** q12's 2.001x accounted (~6.7x real) reduction does **not**
+**Operator tightening #1 - no inherited headroom:** q12's measured 2.001x accounted reduction does **not**
 transfer by assertion. 416 must prove, on q07 and q09 specifically: (a) the compact representation is enabled
 **before the first append** (not a mid-build rescue conversion, not a partial legacy index), and (b) the **measured**
 compact `resident_index_bytes` on these builds, recorded directly.
@@ -38,12 +39,13 @@ compact-safe. If any path legitimately needs the legacy representation (or is un
 ### The cut - opt in the second seam
 - Enable the compact index at q07/q09's creation path for primitive key plans; `Generic`/null-safe keep the fallback
   (the 414 fence). Likely a few lines riding 414's entire structure, tests, and guards.
-- **Enabled-before-first-append proof:** a discriminating test asserting the build's index is the compact
-  representation with **zero legacy entries** before the first `write_batch_chunks` on this path - it must fail if
-  the path stays legacy or only converts via the rescue.
+- **Enabled-before-first-append proof:** a discriminating test exercises the actual q07/q09 production helper for at
+  least one batch, asserts the compact representation, and asserts a monotonic
+  `legacy_index_insert_count == 0`. Inspecting an empty legacy map after conversion is insufficient because rescue
+  drains that map; the monotonic counter must fail if any row was first appended through legacy storage.
 - **Direct accounting on the drivers:** record the measured compact `resident_index_bytes` for the q07 and q09 builds
-  (component payload via a low-cap probe or telemetry observation) - the headroom claim is per-build measurement, not
-  q12 inheritance.
+  through a temporary finish-time profile on the unchanged 4 GiB runs. A low-cap crossing is not final-build
+  headroom. The headroom claim is per-build measurement, not q12 inheritance.
 - No cap/multiplier/scope change; no qNN branch; no rescue-window widening.
 
 ### Stop-lines
@@ -55,7 +57,7 @@ compact-safe. If any path legitimately needs the legacy representation (or is un
 - **Phase 0 recorded:** the creation-site identification (omission vs fence), the all-paths census, key-plan
   eligibility - before code.
 - **Primary: q07 and q09 both move off the resident-index wall** - persisted `pass@compare` each, **or a named +
-  reproduced next wall** (both were never-probed cells; q09 already peaks at 3,457.7 MiB *at the wall point*, deep in
+  reproduced next wall** (both are freshly classified red cells; q09 already peaks at 3,457.7 MiB *at the wall point*, deep in
   the q05/q20 borderline zone - an OOM behind the index wall is a live possibility and is recorded honestly, not
   rounded up).
 - **Enabled-before-first-append proven** (the discriminating test) and **measured per-build compact

@@ -838,6 +838,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	rows: u64,
 	input_rows: u64,
 	input_batches_written: u64,
+	#[cfg(test)]
+	legacy_index_insert_count: u64,
 	compact_index_enabled: bool,
 	compact_index_rescue_enabled: bool,
 	next_offset: u64,
@@ -923,6 +925,8 @@ impl SpilledInnerJoinBuild {
 			rows: 0,
 			input_rows: 0,
 			input_batches_written: 0,
+			#[cfg(test)]
+			legacy_index_insert_count: 0,
 			compact_index_enabled: false,
 			compact_index_rescue_enabled: false,
 			next_offset: 0,
@@ -1259,6 +1263,11 @@ impl SpilledInnerJoinBuild {
 				if let Some(index) = &mut self.compact_index {
 					index.insert(key, row_ref)?;
 				} else {
+					#[cfg(test)]
+					{
+						self.legacy_index_insert_count =
+							self.legacy_index_insert_count.saturating_add(1);
+					}
 					append_spilled_batch_row_ref(
 						&mut self.index,
 						&mut self.resident_index_bytes,
@@ -1320,6 +1329,11 @@ impl SpilledInnerJoinBuild {
 				if let Some(index) = &mut self.compact_index {
 					index.insert(key, row_ref)?;
 				} else {
+					#[cfg(test)]
+					{
+						self.legacy_index_insert_count =
+							self.legacy_index_insert_count.saturating_add(1);
+					}
 					append_spilled_batch_row_ref(
 						&mut self.index,
 						&mut self.resident_index_bytes,
@@ -1645,6 +1659,11 @@ impl SpilledInnerJoinBuild {
 	#[cfg(test)]
 	pub(in crate::exec) fn input_batches_written(&self) -> u64 {
 		self.input_batches_written
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn legacy_index_insert_count(&self) -> u64 {
+		self.legacy_index_insert_count
 	}
 
 	#[cfg(test)]

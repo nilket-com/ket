@@ -8972,6 +8972,7 @@ impl Executor {
 				self.context.join_spill_dir.clone(),
 			)
 			.await?;
+			spilled.use_compact_resident_index();
 			let build_started = Instant::now();
 			for batch in &build_batches {
 				spilled
@@ -12054,7 +12055,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn reoriented_materialized_build_over_cap_spills_batches_without_concat() {
+	async fn reoriented_materialized_build_over_cap_spills_compact_from_first_batch() {
 		let build_schema = Arc::new(Schema::new(vec![
 			Field::new("build_key", DataType::Int64, false),
 			Field::new("build_value", DataType::Int64, false),
@@ -12125,6 +12126,19 @@ mod tests {
 			spilled.input_batches_written(),
 			2,
 			"already-materialized build batches must be spilled batch-by-batch, not concat-first"
+		);
+		assert!(
+			spilled.uses_compact_int64_index(),
+			"the reoriented materialized spill path must select the compact Int64 index"
+		);
+		assert_eq!(
+			spilled.legacy_index_insert_count(),
+			0,
+			"the compact path must be selected before the first build-row append"
+		);
+		assert_eq!(
+			spilled.resident_index_bytes(),
+			spilled.computed_index_bytes()
 		);
 		assert_eq!(spilled.input_row_count(), (first_rows + second_rows) as u64);
 

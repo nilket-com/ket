@@ -30,11 +30,12 @@ separately.
   site(s), primitive plans only; Generic/null-safe fallback unchanged. No rescue-window change; no other flags moved.
 
 ## Tests (discriminating)
-- **Compact-from-first-append:** on the newly opted path, assert the compact representation is active with zero
-  legacy-index entries before the first `write_batch_chunks` - fails if the path stays legacy or relies on the
-  rescue conversion;
-- **Per-build accounting observation:** a low-cap probe (or telemetry assertion) records the compact
-  `resident_index_bytes` for a synthetic build on this path (accounted == computed fidelity re-asserted here);
+- **Compact-from-first-append:** exercise the actual newly opted production helper for at least one batch, assert the
+  compact representation, and assert a monotonic `legacy_index_insert_count == 0` - unlike inspecting the drained
+  map, this fails if the path stays legacy or relies on rescue conversion;
+- **Per-build accounting observation:** use a temporary finish-time profile on the real q07/q09 fixed-scope runs to
+  record each completed compact `resident_index_bytes`; a low-cap first crossing is not accepted as final headroom
+  (accounted == computed fidelity remains re-asserted in the path test);
 - carry the full 414 suite (fidelity, guard-armed, lookup-equality, truncation-bounds, fence) green;
 - carry spill/join/reservoir suites green.
 
@@ -55,8 +56,7 @@ for q in q07 q09; do
   rm -rf /tmp/toron_join_spill
 done
 # correctness for any completing driver (600s window)
-# measured compact index bytes on both drivers: low-cap probe forcing the component payload, or telemetry record -
-# the headroom number in the doc is from THESE builds.
+# measured compact index bytes on both drivers: temporary finish-time profile on THESE completed builds.
 # controls: spill-bearing greens
 for q in q03 q10 q12 q14 q16 q19 q20; do
   systemd-run --user --same-dir --wait --collect --quiet --pipe \
