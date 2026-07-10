@@ -1766,6 +1766,7 @@ pub(super) async fn try_execute_streamed_spilled_left_semi_join(
 		null_safe_keys,
 	)?;
 	let mut spilled = SpilledInnerJoinBuild::create(task_budget, spill_file_ops, spill_dir).await?;
+	spilled.use_compact_resident_index();
 	let build_started = Instant::now();
 	for batch in left_batches {
 		spilled
@@ -2439,6 +2440,7 @@ pub(super) async fn try_create_streamed_spilled_inner_build(
 		null_safe_keys,
 	)?;
 	let mut spilled = SpilledInnerJoinBuild::create(task_budget, spill_file_ops, spill_dir).await?;
+	spilled.use_compact_resident_index();
 	for batch in left_batches {
 		spilled
 			.write_batch_chunks(batch, key_plan, left_keys, null_safe_keys, task_budget)

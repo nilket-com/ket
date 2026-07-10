@@ -1,8 +1,11 @@
 use super::*;
+use ahash::RandomState;
 use twox_hash::XxHash3_64;
 
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+const COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES: u64 = 1024 * 1024;
+const COMPACT_SPILL_INDEX_MAX_INPUT_ROWS: u64 = 20_000_000;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn partition_bucket(
@@ -463,6 +466,349 @@ pub(in crate::exec) struct SpilledBatchRowRef {
 	pub(super) row: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactSpilledBatchRowRef {
+	page_index: u32,
+	row: u32,
+}
+
+impl CompactSpilledBatchRowRef {
+	fn try_from_ref(row_ref: SpilledBatchRowRef) -> Result<Self, ExecutionError> {
+		let page_index = u32::try_from(row_ref.page_index).map_err(|_| ExecutionError::Kernel {
+			message: format!(
+				"streamed inner join spill page index {} exceeds compact index range",
+				row_ref.page_index
+			),
+		})?;
+		Ok(Self {
+			page_index,
+			row: row_ref.row,
+		})
+	}
+
+	fn unpack(self) -> SpilledBatchRowRef {
+		SpilledBatchRowRef {
+			page_index: self.page_index as usize,
+			row: self.row,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct SpilledBatchRefList {
+	first: CompactSpilledBatchRowRef,
+	overflow: Option<Box<Vec<CompactSpilledBatchRowRef>>>,
+}
+
+impl SpilledBatchRefList {
+	fn new(first: CompactSpilledBatchRowRef) -> Self {
+		Self {
+			first,
+			overflow: None,
+		}
+	}
+
+	fn push(&mut self, row_ref: CompactSpilledBatchRowRef) -> u64 {
+		match &mut self.overflow {
+			Some(rows) => {
+				let before = rows.capacity();
+				rows.push(row_ref);
+				let after = rows.capacity();
+				after
+					.saturating_sub(before)
+					.saturating_mul(std::mem::size_of::<CompactSpilledBatchRowRef>())
+					.try_into()
+					.unwrap_or(u64::MAX)
+			}
+			None => {
+				let mut rows = Box::new(Vec::with_capacity(1));
+				rows.push(row_ref);
+				let bytes = std::mem::size_of::<Vec<CompactSpilledBatchRowRef>>().saturating_add(
+					rows.capacity()
+						.saturating_mul(std::mem::size_of::<CompactSpilledBatchRowRef>()),
+				);
+				self.overflow = Some(rows);
+				bytes.try_into().unwrap_or(u64::MAX)
+			}
+		}
+	}
+
+	fn refs(&self) -> Vec<SpilledBatchRowRef> {
+		let overflow_len = self.overflow.as_ref().map_or(0, |rows| rows.len());
+		let mut refs = Vec::with_capacity(1usize.saturating_add(overflow_len));
+		refs.push(self.first.unpack());
+		if let Some(rows) = &self.overflow {
+			refs.extend(rows.iter().map(|row| row.unpack()));
+		}
+		refs
+	}
+
+	#[cfg(test)]
+	fn heap_bytes(&self) -> u64 {
+		self.overflow
+			.as_ref()
+			.map(|rows| {
+				std::mem::size_of::<Vec<CompactSpilledBatchRowRef>>()
+					.saturating_add(
+						rows.capacity()
+							.saturating_mul(std::mem::size_of::<CompactSpilledBatchRowRef>()),
+					)
+					.try_into()
+					.unwrap_or(u64::MAX)
+			})
+			.unwrap_or(0)
+	}
+}
+
+enum SpilledBatchIndex {
+	Hash(HashMap<JoinKey, Vec<SpilledBatchRowRef>>),
+	Int32(PrimitiveSpilledBatchIndex<i32>),
+	Int64(PrimitiveSpilledBatchIndex<i64>),
+}
+
+impl SpilledBatchIndex {
+	fn for_key_plan(key_plan: JoinKeyPlan, null_safe_keys: bool) -> Self {
+		if null_safe_keys {
+			return Self::new_hash();
+		}
+		match key_plan {
+			JoinKeyPlan::Int32 => Self::Int32(PrimitiveSpilledBatchIndex::with_capacity(0)),
+			JoinKeyPlan::Int64 => Self::Int64(PrimitiveSpilledBatchIndex::with_capacity(0)),
+			JoinKeyPlan::Generic => Self::new_hash(),
+		}
+	}
+
+	fn new_hash() -> Self {
+		Self::Hash(HashMap::new())
+	}
+
+	fn insert(&mut self, key: JoinKey, row_ref: SpilledBatchRowRef) -> Result<(), ExecutionError> {
+		match (self, key) {
+			(Self::Int32(index), JoinKey::Int32(key)) => {
+				index.insert(key, CompactSpilledBatchRowRef::try_from_ref(row_ref)?)
+			}
+			(Self::Int64(index), JoinKey::Int64(key)) => {
+				index.insert(key, CompactSpilledBatchRowRef::try_from_ref(row_ref)?)
+			}
+			(Self::Hash(index), key) => {
+				match index.entry(key) {
+					Entry::Occupied(mut entry) => {
+						entry.get_mut().push(row_ref);
+					}
+					Entry::Vacant(entry) => {
+						entry.insert(vec![row_ref]);
+					}
+				}
+				Ok(())
+			}
+			(Self::Int32(_), key) => Err(ExecutionError::Kernel {
+				message: format!("non-Int32 key inserted into compact Int32 spill index: {key:?}"),
+			}),
+			(Self::Int64(_), key) => Err(ExecutionError::Kernel {
+				message: format!("non-Int64 key inserted into compact Int64 spill index: {key:?}"),
+			}),
+		}
+	}
+
+	fn lookup(&self, join_key: &JoinKey) -> Vec<SpilledBatchRowRef> {
+		match (self, join_key) {
+			(Self::Int32(index), JoinKey::Int32(key)) => index.lookup(*key),
+			(Self::Int64(index), JoinKey::Int64(key)) => index.lookup(*key),
+			(Self::Hash(index), key) => index.get(key).cloned().unwrap_or_default(),
+			(Self::Int32(_) | Self::Int64(_), _) => Vec::new(),
+		}
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		match self {
+			Self::Int32(index) => index.accounted_bytes(),
+			Self::Int64(index) => index.accounted_bytes(),
+			Self::Hash(index) => spilled_batch_join_hash_index_bytes(index),
+		}
+	}
+
+	#[cfg(test)]
+	fn computed_bytes(&self) -> u64 {
+		match self {
+			Self::Int32(index) => index.computed_bytes(),
+			Self::Int64(index) => index.computed_bytes(),
+			Self::Hash(index) => spilled_batch_join_hash_index_bytes(index),
+		}
+	}
+
+	#[cfg(test)]
+	fn is_int64(&self) -> bool {
+		matches!(self, Self::Int64(_))
+	}
+}
+
+struct PrimitiveSpilledBatchIndex<K> {
+	buckets: Vec<u32>,
+	entries: Vec<PrimitiveSpilledBatchIndexEntry<K>>,
+	hasher: RandomState,
+	accounted_bytes: u64,
+}
+
+struct PrimitiveSpilledBatchIndexEntry<K> {
+	key: K,
+	refs: SpilledBatchRefList,
+}
+
+const EMPTY_SPILLED_BATCH_BUCKET: u32 = u32::MAX;
+
+impl<K> PrimitiveSpilledBatchIndex<K>
+where
+	K: Copy + Eq + std::hash::Hash,
+{
+	fn with_capacity(capacity: usize) -> Self {
+		let bucket_count = capacity.saturating_mul(2).next_power_of_two().max(1);
+		let buckets = vec![EMPTY_SPILLED_BATCH_BUCKET; bucket_count];
+		let entries = Vec::with_capacity(capacity);
+		let accounted_bytes = spilled_primitive_index_base_bytes::<K>(&buckets, &entries, 0);
+		Self {
+			buckets,
+			entries,
+			hasher: RandomState::new(),
+			accounted_bytes,
+		}
+	}
+
+	fn insert(&mut self, key: K, row_ref: CompactSpilledBatchRowRef) -> Result<(), ExecutionError> {
+		let mut bucket = self.find_bucket(key);
+		let entry_index = self.buckets[bucket];
+		if entry_index == EMPTY_SPILLED_BATCH_BUCKET {
+			if self.entries.len().saturating_add(1).saturating_mul(2) > self.buckets.len() {
+				self.resize_buckets(self.buckets.len().saturating_mul(2).max(1))?;
+				bucket = self.find_bucket(key);
+			}
+			let before_capacity = self.entries.capacity();
+			let entry_index =
+				u32::try_from(self.entries.len()).map_err(|_| ExecutionError::Kernel {
+					message: "compact spill index entry count exceeds u32".to_string(),
+				})?;
+			self.entries.push(PrimitiveSpilledBatchIndexEntry {
+				key,
+				refs: SpilledBatchRefList::new(row_ref),
+			});
+			let after_capacity = self.entries.capacity();
+			let capacity_delta = after_capacity
+				.saturating_sub(before_capacity)
+				.saturating_mul(std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<K>>());
+			self.accounted_bytes = self
+				.accounted_bytes
+				.saturating_add(capacity_delta.try_into().unwrap_or(u64::MAX));
+			self.buckets[bucket] = entry_index;
+		} else {
+			let entry_index = usize::try_from(entry_index).map_err(|_| ExecutionError::Kernel {
+				message: "compact spill index bucket entry does not fit usize".to_string(),
+			})?;
+			let delta = self.entries[entry_index].refs.push(row_ref);
+			self.accounted_bytes = self.accounted_bytes.saturating_add(delta);
+		}
+		Ok(())
+	}
+
+	fn lookup(&self, key: K) -> Vec<SpilledBatchRowRef> {
+		let bucket = self.find_bucket(key);
+		let entry_index = self.buckets[bucket];
+		if entry_index == EMPTY_SPILLED_BATCH_BUCKET {
+			Vec::new()
+		} else {
+			self.entries[entry_index as usize].refs.refs()
+		}
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		self.accounted_bytes
+	}
+
+	#[cfg(test)]
+	fn computed_bytes(&self) -> u64 {
+		spilled_primitive_index_base_bytes(&self.buckets, &self.entries, self.overflow_heap_bytes())
+	}
+
+	#[cfg(test)]
+	fn overflow_heap_bytes(&self) -> u64 {
+		self.entries
+			.iter()
+			.map(|entry| entry.refs.heap_bytes())
+			.fold(0u64, u64::saturating_add)
+	}
+
+	fn resize_buckets(&mut self, bucket_count: usize) -> Result<(), ExecutionError> {
+		let old_bucket_bytes = self
+			.buckets
+			.len()
+			.saturating_mul(std::mem::size_of::<u32>());
+		let mut buckets = vec![EMPTY_SPILLED_BATCH_BUCKET; bucket_count.next_power_of_two().max(1)];
+		for (entry_index, entry) in self.entries.iter().enumerate() {
+			let entry_index = u32::try_from(entry_index).map_err(|_| ExecutionError::Kernel {
+				message: "compact spill index entry count exceeds u32".to_string(),
+			})?;
+			let mut bucket = Self::bucket_for_key(&self.hasher, buckets.len(), entry.key);
+			loop {
+				if buckets[bucket] == EMPTY_SPILLED_BATCH_BUCKET {
+					buckets[bucket] = entry_index;
+					break;
+				}
+				bucket = (bucket + 1) & (buckets.len() - 1);
+			}
+		}
+		let new_bucket_bytes = buckets.len().saturating_mul(std::mem::size_of::<u32>());
+		if new_bucket_bytes >= old_bucket_bytes {
+			self.accounted_bytes = self.accounted_bytes.saturating_add(
+				(new_bucket_bytes - old_bucket_bytes)
+					.try_into()
+					.unwrap_or(u64::MAX),
+			);
+		} else {
+			self.accounted_bytes = self.accounted_bytes.saturating_sub(
+				(old_bucket_bytes - new_bucket_bytes)
+					.try_into()
+					.unwrap_or(u64::MAX),
+			);
+		}
+		self.buckets = buckets;
+		Ok(())
+	}
+
+	fn find_bucket(&self, key: K) -> usize {
+		let mut bucket = Self::bucket_for_key(&self.hasher, self.buckets.len(), key);
+		loop {
+			let entry_index = self.buckets[bucket];
+			if entry_index == EMPTY_SPILLED_BATCH_BUCKET
+				|| self.entries[entry_index as usize].key == key
+			{
+				return bucket;
+			}
+			bucket = (bucket + 1) & (self.buckets.len() - 1);
+		}
+	}
+
+	fn bucket_for_key(hasher: &RandomState, bucket_count: usize, key: K) -> usize {
+		(hasher.hash_one(key) as usize) & (bucket_count - 1)
+	}
+}
+
+fn spilled_primitive_index_base_bytes<K>(
+	buckets: &[u32],
+	entries: &Vec<PrimitiveSpilledBatchIndexEntry<K>>,
+	overflow_heap_bytes: u64,
+) -> u64 {
+	u64::try_from(
+		buckets
+			.len()
+			.saturating_mul(std::mem::size_of::<u32>())
+			.saturating_add(
+				entries
+					.capacity()
+					.saturating_mul(std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<K>>()),
+			),
+	)
+	.unwrap_or(u64::MAX)
+	.saturating_add(overflow_heap_bytes)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::exec) struct SpilledInnerJoinMatch {
 	pub(super) build: SpilledBatchRowRef,
@@ -478,6 +824,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	pages: Vec<JoinSpillPage>,
 	page_rows: Vec<u32>,
 	index: HashMap<JoinKey, Vec<SpilledBatchRowRef>>,
+	compact_index: Option<SpilledBatchIndex>,
 	resident_index_bytes: u64,
 	cache: HashMap<usize, CachedJoinSpillPage>,
 	lru: VecDeque<usize>,
@@ -491,6 +838,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	rows: u64,
 	input_rows: u64,
 	input_batches_written: u64,
+	compact_index_enabled: bool,
+	compact_index_rescue_enabled: bool,
 	next_offset: u64,
 	scratch_plaintext: Vec<u8>,
 	scratch_refs: Vec<(JoinKey, u32)>,
@@ -560,6 +909,7 @@ impl SpilledInnerJoinBuild {
 			pages: Vec::new(),
 			page_rows: Vec::new(),
 			index: HashMap::new(),
+			compact_index: None,
 			resident_index_bytes: 0,
 			cache: HashMap::new(),
 			lru: VecDeque::new(),
@@ -573,10 +923,65 @@ impl SpilledInnerJoinBuild {
 			rows: 0,
 			input_rows: 0,
 			input_batches_written: 0,
+			compact_index_enabled: false,
+			compact_index_rescue_enabled: false,
 			next_offset: 0,
 			scratch_plaintext: Vec::new(),
 			scratch_refs: Vec::new(),
 		})
+	}
+
+	pub(in crate::exec) fn use_compact_resident_index(&mut self) {
+		self.compact_index_enabled = true;
+		self.index.clear();
+		self.compact_index = None;
+		self.resident_index_bytes = 0;
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn enable_compact_resident_index_rescue(&mut self) {
+		self.compact_index_rescue_enabled = true;
+	}
+
+	fn try_compact_near_cap_resident_index(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		memory_cap: u64,
+	) -> Result<(), ExecutionError> {
+		if !self.compact_index_rescue_enabled {
+			return Ok(());
+		}
+		if null_safe_keys || !matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64) {
+			return Ok(());
+		}
+		if self.compact_index.is_some() {
+			return Ok(());
+		}
+		if self.input_rows > COMPACT_SPILL_INDEX_MAX_INPUT_ROWS {
+			return Ok(());
+		}
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let resident = self.resident_state().total();
+		if resident <= cap
+			|| resident > cap.saturating_add(COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES)
+		{
+			return Ok(());
+		}
+		let index = std::mem::take(&mut self.index);
+		let mut compact = SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys);
+		for (key, refs) in index {
+			for row_ref in refs {
+				compact.insert(key.clone(), row_ref)?;
+			}
+		}
+		self.compact_index = Some(compact);
+		self.compact_index_enabled = true;
+		self.resident_index_bytes = self
+			.compact_index
+			.as_ref()
+			.map_or(0, SpilledBatchIndex::accounted_bytes);
+		Ok(())
 	}
 
 	pub(in crate::exec) async fn write_batch_chunks(
@@ -839,15 +1244,38 @@ impl SpilledInnerJoinBuild {
 			));
 		}
 		if index_rows {
+			if self.rows == 0 {
+				if self.compact_index_enabled {
+					self.index.clear();
+					self.compact_index =
+						Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys));
+				} else {
+					self.index.clear();
+					self.compact_index = None;
+				}
+			}
 			for (key, row) in refs.drain(..) {
-				append_spilled_batch_row_ref(
-					&mut self.index,
-					&mut self.resident_index_bytes,
-					key,
-					SpilledBatchRowRef { page_index, row },
-				);
+				let row_ref = SpilledBatchRowRef { page_index, row };
+				if let Some(index) = &mut self.compact_index {
+					index.insert(key, row_ref)?;
+				} else {
+					append_spilled_batch_row_ref(
+						&mut self.index,
+						&mut self.resident_index_bytes,
+						key,
+						row_ref,
+					);
+				}
 				self.rows = self.rows.saturating_add(1);
 			}
+			if let Some(index) = &self.compact_index {
+				self.resident_index_bytes = index.accounted_bytes();
+			}
+			self.try_compact_near_cap_resident_index(
+				key_plan,
+				null_safe_keys,
+				task_budget.memory.get(),
+			)?;
 		} else {
 			self.rows = self
 				.rows
@@ -871,6 +1299,11 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
 		self.index.clear();
+		self.compact_index = if self.compact_index_enabled {
+			Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys))
+		} else {
+			None
+		};
 		self.resident_index_bytes = 0;
 		self.rows = 0;
 		for page_index in 0..self.pages.len() {
@@ -880,16 +1313,24 @@ impl SpilledInnerJoinBuild {
 				let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
 					continue;
 				};
-				append_spilled_batch_row_ref(
-					&mut self.index,
-					&mut self.resident_index_bytes,
-					key,
-					SpilledBatchRowRef {
-						page_index,
-						row: join_build_row_index(row)?,
-					},
-				);
+				let row_ref = SpilledBatchRowRef {
+					page_index,
+					row: join_build_row_index(row)?,
+				};
+				if let Some(index) = &mut self.compact_index {
+					index.insert(key, row_ref)?;
+				} else {
+					append_spilled_batch_row_ref(
+						&mut self.index,
+						&mut self.resident_index_bytes,
+						key,
+						row_ref,
+					);
+				}
 				self.rows = self.rows.saturating_add(1);
+			}
+			if let Some(index) = &self.compact_index {
+				self.resident_index_bytes = index.accounted_bytes();
 			}
 			self.guard_resident_state(
 				task_budget.memory.get(),
@@ -1016,7 +1457,11 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		join_key: &JoinKey,
 	) -> Result<Vec<SpilledBatchRowRef>, ExecutionError> {
-		Ok(self.index.get(join_key).cloned().unwrap_or_default())
+		if let Some(index) = &self.compact_index {
+			Ok(index.lookup(join_key))
+		} else {
+			Ok(self.index.get(join_key).cloned().unwrap_or_default())
+		}
 	}
 
 	pub(in crate::exec) fn page_count(&self) -> usize {
@@ -1209,7 +1654,30 @@ impl SpilledInnerJoinBuild {
 
 	#[cfg(test)]
 	pub(in crate::exec) fn folded_index_bytes(&self) -> u64 {
-		spilled_batch_join_index_bytes(&self.index)
+		self.compact_index.as_ref().map_or_else(
+			|| spilled_batch_join_hash_index_bytes(&self.index),
+			SpilledBatchIndex::accounted_bytes,
+		)
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn computed_index_bytes(&self) -> u64 {
+		self.compact_index.as_ref().map_or_else(
+			|| spilled_batch_join_hash_index_bytes(&self.index),
+			SpilledBatchIndex::computed_bytes,
+		)
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn uses_compact_int64_index(&self) -> bool {
+		self.compact_index
+			.as_ref()
+			.is_some_and(SpilledBatchIndex::is_int64)
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn uses_hash_index(&self) -> bool {
+		self.compact_index.is_none()
 	}
 
 	pub(in crate::exec) fn input_row_count(&self) -> u64 {
@@ -2141,8 +2609,7 @@ fn semi_anti_existence_spill_index_bytes(
 		.fold(0u64, u64::saturating_add)
 }
 
-#[cfg(test)]
-fn spilled_batch_join_index_bytes(index: &HashMap<JoinKey, Vec<SpilledBatchRowRef>>) -> u64 {
+fn spilled_batch_join_hash_index_bytes(index: &HashMap<JoinKey, Vec<SpilledBatchRowRef>>) -> u64 {
 	index
 		.iter()
 		.map(|(key, refs)| {
@@ -2638,8 +3105,8 @@ mod tests {
 			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
 				.await
 				.expect("create inner spill");
+		build.use_compact_resident_index();
 		let keys = [ColumnOrdinal(0)];
-		let ref_size = row_ref_size::<SpilledBatchRowRef>();
 
 		build
 			.write_batch_chunks(
@@ -2651,9 +3118,8 @@ mod tests {
 			)
 			.await
 			.expect("write first key");
-		let mut expected = int64_base(1).saturating_add(ref_size);
-		assert_eq!(build.resident_index_bytes(), expected);
-		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+		assert!(build.uses_compact_int64_index());
+		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
 
 		build
 			.write_batch_chunks(
@@ -2665,12 +3131,25 @@ mod tests {
 			)
 			.await
 			.expect("write duplicate and new key");
-		expected = expected
-			.saturating_add(ref_size)
-			.saturating_add(int64_base(2))
-			.saturating_add(ref_size);
-		assert_eq!(build.resident_index_bytes(), expected);
-		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+		assert!(build.uses_compact_int64_index());
+		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(1))
+				.await
+				.expect("lookup duplicate key"),
+			vec![
+				SpilledBatchRowRef {
+					page_index: 0,
+					row: 0
+				},
+				SpilledBatchRowRef {
+					page_index: 1,
+					row: 0
+				}
+			],
+			"compact spill index must preserve duplicate ref insertion order"
+		);
 
 		build
 			.write_batch_chunks(
@@ -2682,16 +3161,198 @@ mod tests {
 			)
 			.await
 			.expect("write multi-batch keys");
-		expected = expected
-			.saturating_add(ref_size)
-			.saturating_add(int64_base(3))
-			.saturating_add(ref_size)
-			.saturating_add(ref_size);
-		assert_eq!(build.resident_index_bytes(), expected);
-		assert_eq!(build.resident_index_bytes(), build.folded_index_bytes());
+		assert!(build.uses_compact_int64_index());
+		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(3))
+				.await
+				.expect("lookup duplicate key"),
+			vec![
+				SpilledBatchRowRef {
+					page_index: 2,
+					row: 1
+				},
+				SpilledBatchRowRef {
+					page_index: 2,
+					row: 2
+				}
+			]
+		);
 
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_generic_and_null_safe_keep_hash_index_fence() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_hash_fence");
+		let mut generic =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create generic inner spill");
+		let keys = [ColumnOrdinal(0)];
+		generic
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Generic,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write generic keys");
+		assert!(generic.uses_hash_index());
+		assert_eq!(
+			generic.resident_index_bytes(),
+			generic.computed_index_bytes()
+		);
+		generic.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+
+		let spill_dir = test_spill_dir("inner_null_safe_hash_fence");
+		let mut null_safe =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create null-safe inner spill");
+		null_safe
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				true,
+				budget,
+			)
+			.await
+			.expect("write null-safe keys");
+		assert!(null_safe.uses_hash_index());
+		assert_eq!(
+			null_safe.resident_index_bytes(),
+			null_safe.computed_index_bytes()
+		);
+		null_safe.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_default_resident_index_keeps_int64_on_hash_path() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_hash_override");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write int64 keys on hash override");
+		assert!(build.uses_hash_index());
+		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(2))
+				.await
+				.expect("lookup duplicate key"),
+			vec![
+				SpilledBatchRowRef {
+					page_index: 0,
+					row: 1
+				},
+				SpilledBatchRowRef {
+					page_index: 0,
+					row: 2
+				}
+			]
+		);
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_compact_rescue_keeps_resident_guard_armed() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("inner_compact_rescue_guard");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		let input_keys = (0..20_000).map(i64::from).collect::<Vec<_>>();
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&input_keys),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write hash-indexed keys");
+		assert!(build.uses_hash_index());
+		let hash_resident = build.resident_state().total();
+		let trigger_cap = hash_resident.saturating_sub(512 * 1024);
+		let trigger_memory = trigger_cap / JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+
+		build.enable_compact_resident_index_rescue();
+		build
+			.try_compact_near_cap_resident_index(JoinKeyPlan::Int64, false, trigger_memory)
+			.expect("near-cap hash index compacts");
+		assert!(build.uses_compact_int64_index());
+		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
+		assert!(
+			build.resident_state().total()
+				<= join_spill_retained_footprint_memory_cap(trigger_memory),
+			"compact rescue should bring the synthetic build under the retained cap"
+		);
+
+		let compact_resident = build.resident_state().total();
+		let failing_memory = compact_resident.saturating_sub(1)
+			/ JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+		match build
+			.guard_resident_state(failing_memory, SpillResidentGuardSite::Write)
+			.expect_err("compact index must still fail when genuinely over cap")
+		{
+			ExecutionError::BudgetExhausted {
+				producer,
+				requested,
+				available,
+				detail: crate::error::BudgetExhaustedDetail::Message(detail),
+				..
+			} => {
+				assert_eq!(producer, "streamed inner join build spill resident state");
+				assert_eq!(requested.get(), compact_resident);
+				assert!(available.get() < requested.get());
+				assert!(detail.contains("site=write"));
+				assert!(detail.contains("resident_index_bytes="));
+			}
+			other => panic!("expected resident budget exhaustion, got {other:?}"),
+		}
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[test]
+	fn compact_spilled_batch_ref_rejects_page_index_truncation() {
+		let err = CompactSpilledBatchRowRef::try_from_ref(SpilledBatchRowRef {
+			page_index: usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX),
+			row: 7,
+		})
+		.expect_err("oversized page index must not truncate");
+		match err {
+			ExecutionError::Kernel { message } => {
+				assert!(message.contains("exceeds compact index range"));
+			}
+			other => panic!("expected kernel error, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
