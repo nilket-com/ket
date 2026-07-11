@@ -4994,7 +4994,6 @@ mod tests {
 			.await
 			.expect("materialized inner-chain float chain");
 		assert_record_batches_equal(&streamed, &materialized);
-
 		let (stream_executor, stream_plan) = reoriented_inner_chain_fixture(
 			StreamingValueKind::Decimal,
 			rows,
@@ -5021,7 +5020,6 @@ mod tests {
 			.expect("materialized inner-chain decimal chain");
 		assert_record_batches_equal(&streamed, &materialized);
 	}
-
 	#[tokio::test]
 	async fn reoriented_inner_chain_removes_intermediate_build_accumulator() {
 		let rows = 6_000;
@@ -5030,7 +5028,6 @@ mod tests {
 			spill_bytes: ByteCount::new(64 * 1024 * 1024),
 			..TaskBudget::from_query_budget(QueryBudget::test_default())
 		};
-
 		let (stream_executor, stream_plan) = reoriented_inner_chain_fixture(
 			StreamingValueKind::Float64,
 			rows,
@@ -5045,7 +5042,6 @@ mod tests {
 			.expect("streaming chain should avoid materialized intermediate and build-scan walls");
 		assert!(record_batch_row_count(&streamed) > 0);
 	}
-
 	#[tokio::test]
 	async fn reoriented_inner_chain_shape_fence_keeps_other_replay_ids_materialized() {
 		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 4 + 2_000;
@@ -5079,15 +5075,13 @@ mod tests {
 			"unexpected shape-fence error: {err:?}"
 		);
 	}
-
 	#[tokio::test]
 	async fn correlated_scalar_left_outer_stream_matches_materialized_avg_recombine() {
 		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
 		let (stream_executor, stream_plan) =
-			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), true, 4);
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), true, 4, true);
 		let (materialized_executor, materialized_plan) =
-			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), false, 4);
-
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), false, 4, true);
 		let streamed = stream_executor
 			.execute_bound(&stream_plan, None)
 			.await
@@ -5098,7 +5092,38 @@ mod tests {
 			.expect("materialized correlated scalar recombine");
 		assert_record_batches_equal(&streamed, &materialized);
 	}
-
+	#[tokio::test]
+	async fn correlated_scalar_bare_join0_stream_matches_materialized_recombine() {
+		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS + 257;
+		let (stream_executor, stream_plan) =
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), true, 4, false);
+		let (materialized_executor, materialized_plan) =
+			correlated_scalar_left_outer_fixture(rows, 0, high_test_budget(), false, 4, false);
+		let ExecutionPlan::Aggregate {
+			input,
+			aggr_expr,
+			output_schema,
+			..
+		} = &stream_plan
+		else {
+			panic!("correlated scalar fixture must be an aggregate");
+		};
+		let streamed = stream_executor
+			.try_streaming_correlated_scalar_left_outer_global_aggregate(
+				input,
+				aggr_expr,
+				output_schema,
+				None,
+			)
+			.await
+			.expect("streamed bare Join(0) correlated scalar recombine")
+			.expect("bare Join(0) alias must be eligible for correlated streaming");
+		let materialized = materialized_executor
+			.execute_bound(&materialized_plan, None)
+			.await
+			.expect("materialized bare Join(0) correlated scalar recombine");
+		assert_record_batches_equal(&streamed, &materialized);
+	}
 	#[tokio::test]
 	async fn correlated_scalar_left_outer_stream_removes_join0_materialization_wall() {
 		let rows = CROSS_JOIN_OUTPUT_CHUNK_ROWS * 2;
@@ -5107,9 +5132,8 @@ mod tests {
 			spill_bytes: ByteCount::new(256 * 1024 * 1024),
 			..TaskBudget::from_query_budget(QueryBudget::test_default())
 		};
-
 		let (materialized_executor, materialized_plan) =
-			correlated_scalar_left_outer_fixture(rows, 2048, budget, false, 1);
+			correlated_scalar_left_outer_fixture(rows, 2048, budget, false, 1, true);
 		let materialized_err = materialized_executor
 			.execute_bound(&materialized_plan, None)
 			.await
@@ -5125,16 +5149,14 @@ mod tests {
 			),
 			"unexpected materialized error: {materialized_err:?}"
 		);
-
 		let (stream_executor, stream_plan) =
-			correlated_scalar_left_outer_fixture(rows, 2048, budget, true, 1);
+			correlated_scalar_left_outer_fixture(rows, 2048, budget, true, 1, true);
 		let streamed = stream_executor
 			.execute_bound(&stream_plan, None)
 			.await
 			.expect("streamed correlated scalar recombine should avoid raw Join(0) output");
 		assert_eq!(record_batch_row_count(&streamed), 1);
 	}
-
 	#[tokio::test]
 	async fn streaming_semi_anti_probe_applies_residual_and_preserves_left_rows() {
 		let preserved_schema = Arc::new(Schema::new(vec![
@@ -6917,7 +6939,6 @@ mod tests {
 				exchange_plan(joined, next_key, 4)
 			};
 		}
-
 		let filtered = ExecutionPlan::Filter {
 			input: Box::new(current),
 			predicate: keep_filter_program(ColumnOrdinal(0)),
@@ -6972,13 +6993,13 @@ mod tests {
 		};
 		(executor, plan)
 	}
-
 	fn correlated_scalar_left_outer_fixture(
 		rows: usize,
 		blob_len: usize,
 		budget: TaskBudget,
 		streaming_replay_id: bool,
 		kept_part_keys: i64,
+		preserved_filter: bool,
 	) -> (Executor, ExecutionPlan) {
 		let fact_schema = Arc::new(Schema::new(vec![
 			Field::new("partkey", DataType::Int64, false),
@@ -7047,13 +7068,17 @@ mod tests {
 			vec![ColumnOrdinal(0)],
 			join0_schema.clone(),
 		);
-		let preserved_filter = ExecutionPlan::Filter {
-			input: Box::new(join0),
-			predicate: keep_filter_program(ColumnOrdinal(5)),
-			disposition: FilterDisposition::EvaluateInToron,
+		let preserved_input = if preserved_filter {
+			ExecutionPlan::Filter {
+				input: Box::new(join0),
+				predicate: keep_filter_program(ColumnOrdinal(5)),
+				disposition: FilterDisposition::EvaluateInToron,
+			}
+		} else {
+			join0
 		};
 		let preserved_exchange = exchange_plan(
-			preserved_filter,
+			preserved_input,
 			bound_column_root("partkey", ColumnOrdinal(0), DataType::Int64, false),
 			4,
 		);

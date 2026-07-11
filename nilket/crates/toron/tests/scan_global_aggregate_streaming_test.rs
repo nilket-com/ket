@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::task::TaskTelemetry;
 use toron::error::StorageError;
-use toron::exec::Executor;
+use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprProgram,
 	BoundExprProgramBuilder, BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ExecutionPlan,
@@ -97,7 +98,8 @@ async fn streaming_scan_exchange_grouped_aggregate_matches_materialized_float64_
 
 #[tokio::test]
 async fn streaming_scan_left_outer_grouped_aggregate_matches_materialized_residual_and_null_fill() {
-	let (executor, streaming_plan, materialized_plan) = left_outer_grouped_fixture();
+	let (executor, streaming_plan, materialized_plan, _telemetry) =
+		left_outer_grouped_fixture(false);
 	let streamed = executor
 		.execute_bound(&streaming_plan, None)
 		.await
@@ -106,6 +108,60 @@ async fn streaming_scan_left_outer_grouped_aggregate_matches_materialized_residu
 		.execute_bound(&materialized_plan, None)
 		.await
 		.expect("materialized left outer grouped aggregate");
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+		canonical_arrow_ipc_digest(&materialized, SortPolicy::None).expect("materialized digest")
+	);
+}
+
+#[tokio::test]
+async fn streaming_scan_left_outer_grouped_aggregate_keeps_all_preserved_columns() {
+	let (executor, streaming_plan, materialized_plan, telemetry) = left_outer_grouped_fixture(true);
+	let streamed = executor
+		.execute_bound(&streaming_plan, None)
+		.await
+		.expect("streamed all-columns-retained left outer grouped aggregate");
+	assert!(
+		telemetry
+			.lock()
+			.expect("task telemetry")
+			.counters
+			.spill_bytes
+			> 0,
+		"all-columns-retained alias must enter the streamed-spilled LeftOuter arm"
+	);
+	let materialized = executor
+		.execute_bound(&materialized_plan, None)
+		.await
+		.expect("materialized all-columns-retained left outer grouped aggregate");
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
+		canonical_arrow_ipc_digest(&materialized, SortPolicy::None).expect("materialized digest")
+	);
+}
+
+#[tokio::test]
+async fn streaming_inner_prefix_semi_anti_bare_join_alias_matches_materialized() {
+	let (executor, streaming_plan, materialized_plan, telemetry) = inner_prefix_semi_anti_fixture();
+	let streamed = executor
+		.execute_bound(&streaming_plan, None)
+		.await
+		.expect("streamed bare intermediate joins");
+	assert!(
+		telemetry
+			.lock()
+			.expect("task telemetry")
+			.counters
+			.spill_bytes
+			> 0,
+		"bare intermediate aliases must enter the streamed-spilled semi/anti chain"
+	);
+	let materialized = executor
+		.execute_bound(&materialized_plan, None)
+		.await
+		.expect("materialized bare intermediate joins");
 
 	assert_eq!(
 		canonical_arrow_ipc_digest(&streamed, SortPolicy::None).expect("streamed digest"),
@@ -243,7 +299,14 @@ fn grouped_fixture(kind: ValueKind) -> (Executor, ExecutionPlan, ExecutionPlan) 
 	(executor, streaming_plan, materialized_plan)
 }
 
-fn left_outer_grouped_fixture() -> (Executor, ExecutionPlan, ExecutionPlan) {
+fn left_outer_grouped_fixture(
+	filter_orders_before_join: bool,
+) -> (
+	Executor,
+	ExecutionPlan,
+	ExecutionPlan,
+	Arc<Mutex<TaskTelemetry>>,
+) {
 	let customer_schema = Arc::new(Schema::new(vec![Field::new(
 		"c_custkey",
 		DataType::Int64,
@@ -283,26 +346,218 @@ fn left_outer_grouped_fixture() -> (Executor, ExecutionPlan, ExecutionPlan) {
 			(TableId(11), vec![orders_batch_1, orders_batch_2]),
 		]),
 	});
-	let executor = Executor::new(storage);
+	let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let executor = Executor::with_context(
+		storage,
+		ExecutionContext::local_test().with_task_telemetry(telemetry.clone()),
+	);
 
 	let customer = scan_plan(TableId(10), customer_schema.clone());
 	let orders = scan_plan(TableId(11), orders_schema.clone());
+	let orders = if filter_orders_before_join {
+		ExecutionPlan::Filter {
+			input: Box::new(orders),
+			predicate: keep_filter_program(ColumnOrdinal(2)),
+			disposition: FilterDisposition::EvaluateInToron,
+		}
+	} else {
+		orders
+	};
 	let materialized_orders = ExecutionPlan::Take {
 		input: Box::new(orders.clone()),
 		limit: usize::MAX,
 		output_schema: orders.schema(),
 	};
-	let streaming_inner = customer_count_by_order_count_plan(customer.clone(), orders);
-	let materialized_inner = customer_count_by_order_count_plan(customer, materialized_orders);
+	let streaming_inner =
+		customer_count_by_order_count_plan(customer.clone(), orders, filter_orders_before_join);
+	let materialized_inner = customer_count_by_order_count_plan(
+		customer,
+		materialized_orders,
+		filter_orders_before_join,
+	);
 	let outer_group = bound_column_root("c_count", ColumnOrdinal(1), DataType::Int64, false);
 	let streaming_plan = count_distribution_plan(streaming_inner, outer_group.clone());
 	let materialized_plan = count_distribution_plan(materialized_inner, outer_group);
-	(executor, streaming_plan, materialized_plan)
+	(executor, streaming_plan, materialized_plan, telemetry)
+}
+
+fn inner_prefix_semi_anti_fixture() -> (
+	Executor,
+	ExecutionPlan,
+	ExecutionPlan,
+	Arc<Mutex<TaskTelemetry>>,
+) {
+	let scan_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+	let batch = RecordBatch::try_new(
+		scan_schema.clone(),
+		vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+	)
+	.expect("chain scan batch");
+	let anti_batch = RecordBatch::try_new(
+		scan_schema.clone(),
+		vec![Arc::new(Int64Array::from(vec![2]))],
+	)
+	.expect("anti scan batch");
+	let storage = Arc::new(MultiBatchStorage {
+		batches: HashMap::from([
+			(TableId(20), vec![batch.clone()]),
+			(TableId(21), vec![batch.clone()]),
+			(TableId(22), vec![batch.clone()]),
+			(TableId(23), vec![batch.clone()]),
+			(TableId(24), vec![batch]),
+			(TableId(25), vec![anti_batch]),
+		]),
+	});
+	let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let executor = Executor::with_context(
+		storage,
+		ExecutionContext::local_test().with_task_telemetry(telemetry.clone()),
+	);
+	let build = |streaming_replay_ids: bool| {
+		let replay = |id| {
+			if streaming_replay_ids {
+				JoinReplayId(id)
+			} else {
+				JoinReplayId::SYNTHETIC
+			}
+		};
+		let scan = |table| scan_plan(table, scan_schema.clone());
+
+		let join0_schema = concat_schema(&scan_schema, &scan_schema);
+		let join0 = inner_join_plan(
+			replay(0),
+			exchange_plan(scan(TableId(20))),
+			exchange_plan(scan(TableId(21))),
+			join0_schema.clone(),
+		);
+		let join1_schema = concat_schema(&join0_schema, &scan_schema);
+		let join1 = inner_join_plan(
+			replay(1),
+			exchange_plan(join0),
+			exchange_plan(scan(TableId(22))),
+			join1_schema.clone(),
+		);
+		let join2_schema = concat_schema(&join1_schema, &scan_schema);
+		let join2 = inner_join_plan(
+			replay(2),
+			exchange_plan(join1),
+			exchange_plan(scan(TableId(23))),
+			join2_schema.clone(),
+		);
+		let residual = equal_columns_program(
+			ColumnOrdinal(0),
+			ColumnOrdinal(join2_schema.fields().len() as u32),
+		);
+		let semi = ExecutionPlan::Join {
+			replay_id: replay(3),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(exchange_plan(join2)),
+			right: Box::new(exchange_plan(scan(TableId(24)))),
+			kind: JoinKind::LeftSemi,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: Some(residual.clone()),
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: join2_schema.clone(),
+		};
+		let anti = ExecutionPlan::Join {
+			replay_id: replay(4),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(exchange_plan(semi)),
+			right: Box::new(exchange_plan(scan(TableId(25)))),
+			kind: JoinKind::LeftAnti,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: Some(residual),
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: join2_schema,
+		};
+		let group_expr = bound_column_root("key", ColumnOrdinal(0), DataType::Int64, false);
+		ExecutionPlan::Aggregate {
+			input: Box::new(exchange_plan(anti)),
+			group_expr,
+			aggr_expr: vec![BoundAggregateCall {
+				function: AggregateFunction::CountAll,
+				args: BoundExprProgramBuilder::new().build(),
+			}],
+			output_schema: Arc::new(Schema::new(vec![
+				Field::new("key", DataType::Int64, false),
+				Field::new("count", DataType::Int64, false),
+			])),
+		}
+	};
+	(executor, build(true), build(false), telemetry)
+}
+
+fn concat_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+	Arc::new(Schema::new(
+		left.fields()
+			.iter()
+			.chain(right.fields().iter())
+			.map(|field| field.as_ref().clone())
+			.collect::<Vec<_>>(),
+	))
+}
+
+fn inner_join_plan(
+	replay_id: JoinReplayId,
+	left: ExecutionPlan,
+	right: ExecutionPlan,
+	output_schema: SchemaRef,
+) -> ExecutionPlan {
+	ExecutionPlan::Join {
+		replay_id,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
+		left: Box::new(left),
+		right: Box::new(right),
+		kind: JoinKind::Inner,
+		left_keys: vec![ColumnOrdinal(0)],
+		right_keys: vec![ColumnOrdinal(0)],
+		match_filter: None,
+		null_safe_keys: false,
+		strategy: JoinStrategy::HashPartitioned,
+		output_schema,
+	}
+}
+
+fn exchange_plan(input: ExecutionPlan) -> ExecutionPlan {
+	ExecutionPlan::Exchange {
+		input: Box::new(input),
+		partition_count: 4,
+		key: bound_column_root("key", ColumnOrdinal(0), DataType::Int64, false),
+	}
+}
+
+fn equal_columns_program(
+	left_ordinal: ColumnOrdinal,
+	right_ordinal: ColumnOrdinal,
+) -> BoundExprProgram {
+	let mut builder = BoundExprProgramBuilder::new();
+	let left = builder.append_column(ResolvedColumn {
+		name: ColumnName("left_key".to_string()),
+		ordinal: left_ordinal,
+		data_type: DataType::Int64,
+		nullable: false,
+		pbc_eligible: false,
+	});
+	let right = builder.append_column(ResolvedColumn {
+		name: ColumnName("right_key".to_string()),
+		ordinal: right_ordinal,
+		data_type: DataType::Int64,
+		nullable: false,
+		pbc_eligible: false,
+	});
+	let predicate = builder.append_binary(BoundBinaryOp::Eq, left, right, DataType::Boolean);
+	builder.push_root(predicate);
+	builder.build()
 }
 
 fn customer_count_by_order_count_plan(
 	customer: ExecutionPlan,
 	orders: ExecutionPlan,
+	orders_already_filtered: bool,
 ) -> ExecutionPlan {
 	let join_output_schema = Arc::new(Schema::new(vec![
 		Field::new("c_custkey", DataType::Int64, false),
@@ -319,7 +574,7 @@ fn customer_count_by_order_count_plan(
 		kind: JoinKind::LeftOuter,
 		left_keys: vec![ColumnOrdinal(0)],
 		right_keys: vec![ColumnOrdinal(1)],
-		match_filter: Some(keep_filter_program(ColumnOrdinal(3))),
+		match_filter: (!orders_already_filtered).then(|| keep_filter_program(ColumnOrdinal(3))),
 		null_safe_keys: false,
 		strategy: JoinStrategy::HashPartitioned,
 		output_schema: join_output_schema,

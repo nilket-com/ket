@@ -654,20 +654,6 @@ fn reoriented_chain_continuation(
 	}
 }
 
-pub(in crate::exec) fn filter_input<'a>(
-	plan: &'a ExecutionPlan,
-) -> Option<(&'a ExecutionPlan, &'a BoundExprProgram)> {
-	let ExecutionPlan::Filter {
-		input,
-		predicate,
-		disposition: FilterDisposition::EvaluateInToron,
-	} = plan
-	else {
-		return None;
-	};
-	Some((input.as_ref(), predicate))
-}
-
 pub(in crate::exec) fn exchange_input(plan: &ExecutionPlan) -> Option<&ExecutionPlan> {
 	let ExecutionPlan::Exchange { input, .. } = plan else {
 		return None;
@@ -2356,7 +2342,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 		return None;
 	}
 
-	let (join2, join2_post_filter) = filter_input(exchange_input(semi_left)?)?;
+	let (join2, join2_post_filter) = decompose_join_or_filtered_join(exchange_input(semi_left)?)?;
 	let ExecutionPlan::Join {
 		replay_id: join2_replay_id,
 		left: join2_left,
@@ -2377,7 +2363,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 		return None;
 	}
 
-	let (join1, join1_post_filter) = filter_input(exchange_input(join2_left)?)?;
+	let (join1, join1_post_filter) = decompose_join_or_filtered_join(exchange_input(join2_left)?)?;
 	let ExecutionPlan::Join {
 		replay_id: join1_replay_id,
 		left: join1_left,
@@ -2410,7 +2396,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				retained_build_columns: None,
 				output_schema: join1_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
-				post_filter: Some(join1_post_filter),
+				post_filter: join1_post_filter,
 				probe_columns_first: true,
 			},
 			ReorientedInnerJoinStage {
@@ -2422,7 +2408,7 @@ pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
 				retained_build_columns: None,
 				output_schema: join2_output_schema.clone(),
 				strategy: JoinStrategy::HashPartitioned,
-				post_filter: Some(join2_post_filter),
+				post_filter: join2_post_filter,
 				probe_columns_first: true,
 			},
 		],
@@ -2600,11 +2586,8 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Filter {
-			input: preserved_filter_input,
-			predicate: preserved_filter,
-			disposition,
-		} = preserved_exchange_input.as_ref()
+		let Some((preserved_join, preserved_filter)) =
+			decompose_join_or_filtered_join(preserved_exchange_input.as_ref())
 		else {
 			return Ok(None);
 		};
@@ -2678,34 +2661,28 @@ impl Executor {
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
 		let mut accumulated_bytes = 0u64;
 		let matched = self
-			.try_visit_streaming_join0_filter_chunks(
-				preserved_filter_input,
-				preserved_filter,
-				*disposition,
-				morsel,
-				|batch| {
-					for (partition, partitioned) in self.repartition_exchange_batch(
-						&batch,
-						*partition_count,
-						preserved_exchange_key,
-					)? {
-						accumulated_bytes = accumulated_bytes
-							.saturating_add(record_batch_memory_bytes(&partitioned));
-						if accumulated_bytes > accumulator_cap {
-							return Err(budget_exhausted(
-								BudgetDimension::Memory,
-								"correlated scalar preserved-side exchange accumulator",
-								accumulated_bytes,
-								accumulator_cap,
-							));
-						}
-						if partitioned.num_rows() > 0 {
-							partition_batches[partition].push(partitioned);
-						}
+			.try_visit_streaming_join0_chunks(preserved_join, preserved_filter, morsel, |batch| {
+				for (partition, partitioned) in self.repartition_exchange_batch(
+					&batch,
+					*partition_count,
+					preserved_exchange_key,
+				)? {
+					accumulated_bytes =
+						accumulated_bytes.saturating_add(record_batch_memory_bytes(&partitioned));
+					if accumulated_bytes > accumulator_cap {
+						return Err(budget_exhausted(
+							BudgetDimension::Memory,
+							"correlated scalar preserved-side exchange accumulator",
+							accumulated_bytes,
+							accumulator_cap,
+						));
 					}
-					Ok(())
-				},
-			)
+					if partitioned.num_rows() > 0 {
+						partition_batches[partition].push(partitioned);
+					}
+				}
+				Ok(())
+			})
 			.await?;
 		if matched.is_none() {
 			return Ok(None);
@@ -5541,9 +5518,7 @@ impl Executor {
 					aggr_expr,
 					streaming_input.exchange,
 				);
-				if !retained_columns.is_empty()
-					&& retained_columns.len() < left.schema().fields().len()
-				{
+				if !retained_columns.is_empty() {
 					let projected_left_keys = remap_column_ordinals(&retained_columns, left_keys)?;
 					let projected_left_schema =
 						projected_schema_for_columns(&left.schema(), &retained_columns)?;
@@ -8293,17 +8268,10 @@ impl Executor {
 			else {
 				return Ok(None);
 			};
-			let ExecutionPlan::Filter {
-				input: join0,
-				predicate: join0_filter,
-				disposition,
-			} = base_input.as_ref()
+			let Some((join0, join0_filter)) = decompose_join_or_filtered_join(base_input.as_ref())
 			else {
 				return Ok(None);
 			};
-			if *disposition == FilterDisposition::FullyPushed {
-				return Ok(None);
-			}
 			let ExecutionPlan::Join {
 				replay_id,
 				left,
@@ -8316,7 +8284,7 @@ impl Executor {
 				strategy,
 				output_schema: join0_output_schema,
 				..
-			} = join0.as_ref()
+			} = join0
 			else {
 				return Ok(None);
 			};
@@ -8397,11 +8365,11 @@ impl Executor {
 					join0_output_schema,
 					self.context.task_budget.memory.get(),
 				)?;
-				let batch = self.filter_batch_with_bound_predicate(
-					join0_filter,
-					batch,
-					"filter predicate",
-				)?;
+				let batch = if let Some(join0_filter) = join0_filter {
+					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
+				} else {
+					batch
+				};
 				if batch.num_rows() == 0 {
 					continue;
 				}
@@ -8536,17 +8504,10 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
-		let ExecutionPlan::Filter {
-			input: join0,
-			predicate: join0_filter,
-			disposition,
-		} = base_input.as_ref()
+		let Some((join0, join0_filter)) = decompose_join_or_filtered_join(base_input.as_ref())
 		else {
 			return Ok(None);
 		};
-		if *disposition == FilterDisposition::FullyPushed {
-			return Ok(None);
-		}
 		let ExecutionPlan::Join {
 			replay_id,
 			left,
@@ -8559,7 +8520,7 @@ impl Executor {
 			strategy,
 			output_schema: join0_output_schema,
 			..
-		} = join0.as_ref()
+		} = join0
 		else {
 			return Ok(None);
 		};
@@ -8660,11 +8621,11 @@ impl Executor {
 					join0_output_schema,
 					self.context.task_budget.memory.get(),
 				)?;
-				let batch = self.filter_batch_with_bound_predicate(
-					join0_filter,
-					batch,
-					"filter predicate",
-				)?;
+				let batch = if let Some(join0_filter) = join0_filter {
+					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
+				} else {
+					batch
+				};
 				if batch.num_rows() == 0 {
 					continue;
 				}
