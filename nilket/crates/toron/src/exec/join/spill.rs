@@ -176,7 +176,7 @@ const EMPTY_JOIN_SPILL_PAGE_BUCKET: u32 = u32::MAX;
 #[derive(Debug, Clone, Copy)]
 struct CompactJoinSpillPageEntry<K> {
 	key: K,
-	page_index: u32,
+	value: u32,
 }
 
 struct CompactJoinSpillPageLocator<K> {
@@ -198,10 +198,7 @@ where
 		}
 	}
 
-	fn insert(&mut self, key: K, page_index: usize) -> Result<(), ExecutionError> {
-		let page_index = u32::try_from(page_index).map_err(|_| ExecutionError::Kernel {
-			message: format!("join spill page index {page_index} exceeds compact locator range"),
-		})?;
+	fn insert(&mut self, key: K, value: u32) -> Result<(), ExecutionError> {
 		let mut bucket = self.bucket_for_key(key);
 		loop {
 			let entry_index = self.buckets[bucket];
@@ -210,8 +207,7 @@ where
 					u32::try_from(self.entries.len()).map_err(|_| ExecutionError::Kernel {
 						message: "join spill compact locator entry count exceeds u32".to_string(),
 					})?;
-				self.entries
-					.push(CompactJoinSpillPageEntry { key, page_index });
+				self.entries.push(CompactJoinSpillPageEntry { key, value });
 				self.buckets[bucket] = entry_index;
 				return Ok(());
 			}
@@ -224,7 +220,7 @@ where
 		}
 	}
 
-	fn lookup(&self, key: K) -> Option<usize> {
+	fn lookup(&self, key: K) -> Option<u32> {
 		let mut bucket = self.bucket_for_key(key);
 		loop {
 			let entry_index = self.buckets[bucket];
@@ -233,7 +229,7 @@ where
 			}
 			let entry = self.entries[entry_index as usize];
 			if entry.key == key {
-				return Some(entry.page_index as usize);
+				return Some(entry.value);
 			}
 			bucket = (bucket + 1) & (self.buckets.len() - 1);
 		}
@@ -260,15 +256,18 @@ where
 
 enum JoinSpillPageLocatorStorage {
 	Encoded(HashMap<Vec<u8>, Vec<usize>>),
-	Int32(CompactJoinSpillPageLocator<i32>),
-	Int64(CompactJoinSpillPageLocator<i64>),
+	Int32Pages(CompactJoinSpillPageLocator<i32>),
+	Int64Pages(CompactJoinSpillPageLocator<i64>),
+	Int32Rows(CompactJoinSpillPageLocator<i32>),
+	Int64Rows(CompactJoinSpillPageLocator<i64>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum JoinSpillPageLookup {
+enum JoinSpillLocatorLookup {
 	None,
-	One(usize),
-	Many(Vec<usize>),
+	Row(u32),
+	Page(usize),
+	Pages(Vec<usize>),
 }
 
 struct JoinSpillPageLocator {
@@ -278,15 +277,21 @@ struct JoinSpillPageLocator {
 }
 
 impl JoinSpillPageLocator {
-	fn for_key_plan(key_plan: JoinKeyPlan, key_count: usize) -> Self {
-		let storage = match key_plan {
-			JoinKeyPlan::Int32 => JoinSpillPageLocatorStorage::Int32(
+	fn for_key_plan(key_plan: JoinKeyPlan, key_count: usize, all_singleton: bool) -> Self {
+		let storage = match (key_plan, all_singleton) {
+			(JoinKeyPlan::Int32, true) => JoinSpillPageLocatorStorage::Int32Rows(
 				CompactJoinSpillPageLocator::with_key_count(key_count),
 			),
-			JoinKeyPlan::Int64 => JoinSpillPageLocatorStorage::Int64(
+			(JoinKeyPlan::Int64, true) => JoinSpillPageLocatorStorage::Int64Rows(
 				CompactJoinSpillPageLocator::with_key_count(key_count),
 			),
-			JoinKeyPlan::Generic => JoinSpillPageLocatorStorage::Encoded(HashMap::new()),
+			(JoinKeyPlan::Int32, false) => JoinSpillPageLocatorStorage::Int32Pages(
+				CompactJoinSpillPageLocator::with_key_count(key_count),
+			),
+			(JoinKeyPlan::Int64, false) => JoinSpillPageLocatorStorage::Int64Pages(
+				CompactJoinSpillPageLocator::with_key_count(key_count),
+			),
+			(JoinKeyPlan::Generic, _) => JoinSpillPageLocatorStorage::Encoded(HashMap::new()),
 		};
 		Self {
 			storage,
@@ -295,7 +300,12 @@ impl JoinSpillPageLocator {
 		}
 	}
 
-	fn insert(&mut self, encoded_key: &[u8], page_index: usize) -> Result<(), ExecutionError> {
+	fn insert(
+		&mut self,
+		encoded_key: &[u8],
+		page_index: usize,
+		rows: &[u32],
+	) -> Result<(), ExecutionError> {
 		match &mut self.storage {
 			JoinSpillPageLocatorStorage::Encoded(index) => {
 				index
@@ -308,38 +318,75 @@ impl JoinSpillPageLocator {
 				}
 				Ok(())
 			}
-			JoinSpillPageLocatorStorage::Int32(index) => {
-				index.insert(decode_join_spill_int32_key(encoded_key)?, page_index)
-			}
-			JoinSpillPageLocatorStorage::Int64(index) => {
-				index.insert(decode_join_spill_int64_key(encoded_key)?, page_index)
-			}
+			JoinSpillPageLocatorStorage::Int32Pages(index) => index.insert(
+				decode_join_spill_int32_key(encoded_key)?,
+				compact_join_spill_page_index(page_index)?,
+			),
+			JoinSpillPageLocatorStorage::Int64Pages(index) => index.insert(
+				decode_join_spill_int64_key(encoded_key)?,
+				compact_join_spill_page_index(page_index)?,
+			),
+			JoinSpillPageLocatorStorage::Int32Rows(index) => index.insert(
+				decode_join_spill_int32_key(encoded_key)?,
+				singleton_join_spill_row(rows)?,
+			),
+			JoinSpillPageLocatorStorage::Int64Rows(index) => index.insert(
+				decode_join_spill_int64_key(encoded_key)?,
+				singleton_join_spill_row(rows)?,
+			),
 		}
 	}
 
-	fn lookup(&self, encoded_key: &[u8]) -> Result<JoinSpillPageLookup, ExecutionError> {
+	fn lookup(&self, encoded_key: &[u8]) -> Result<JoinSpillLocatorLookup, ExecutionError> {
 		match &self.storage {
 			JoinSpillPageLocatorStorage::Encoded(index) => Ok(match index.get(encoded_key) {
-				None => JoinSpillPageLookup::None,
-				Some(pages) if pages.len() == 1 => JoinSpillPageLookup::One(pages[0]),
-				Some(pages) => JoinSpillPageLookup::Many(pages.clone()),
+				None => JoinSpillLocatorLookup::None,
+				Some(pages) if pages.len() == 1 => JoinSpillLocatorLookup::Page(pages[0]),
+				Some(pages) => JoinSpillLocatorLookup::Pages(pages.clone()),
 			}),
-			JoinSpillPageLocatorStorage::Int32(index) => Ok(index
+			JoinSpillPageLocatorStorage::Int32Pages(index) => Ok(index
 				.lookup(decode_join_spill_int32_key(encoded_key)?)
-				.map_or(JoinSpillPageLookup::None, JoinSpillPageLookup::One)),
-			JoinSpillPageLocatorStorage::Int64(index) => Ok(index
+				.map_or(JoinSpillLocatorLookup::None, |page| {
+					JoinSpillLocatorLookup::Page(page as usize)
+				})),
+			JoinSpillPageLocatorStorage::Int64Pages(index) => Ok(index
 				.lookup(decode_join_spill_int64_key(encoded_key)?)
-				.map_or(JoinSpillPageLookup::None, JoinSpillPageLookup::One)),
+				.map_or(JoinSpillLocatorLookup::None, |page| {
+					JoinSpillLocatorLookup::Page(page as usize)
+				})),
+			JoinSpillPageLocatorStorage::Int32Rows(index) => Ok(index
+				.lookup(decode_join_spill_int32_key(encoded_key)?)
+				.map_or(JoinSpillLocatorLookup::None, JoinSpillLocatorLookup::Row)),
+			JoinSpillPageLocatorStorage::Int64Rows(index) => Ok(index
+				.lookup(decode_join_spill_int64_key(encoded_key)?)
+				.map_or(JoinSpillLocatorLookup::None, JoinSpillLocatorLookup::Row)),
 		}
 	}
 
 	fn accounted_bytes(&self) -> u64 {
 		match &self.storage {
 			JoinSpillPageLocatorStorage::Encoded(index) => join_spill_index_bytes(index),
-			JoinSpillPageLocatorStorage::Int32(index) => index.accounted_bytes(),
-			JoinSpillPageLocatorStorage::Int64(index) => index.accounted_bytes(),
+			JoinSpillPageLocatorStorage::Int32Pages(index)
+			| JoinSpillPageLocatorStorage::Int32Rows(index) => index.accounted_bytes(),
+			JoinSpillPageLocatorStorage::Int64Pages(index)
+			| JoinSpillPageLocatorStorage::Int64Rows(index) => index.accounted_bytes(),
 		}
 	}
+}
+
+fn compact_join_spill_page_index(page_index: usize) -> Result<u32, ExecutionError> {
+	u32::try_from(page_index).map_err(|_| ExecutionError::Kernel {
+		message: format!("join spill page index {page_index} exceeds compact locator range"),
+	})
+}
+
+fn singleton_join_spill_row(rows: &[u32]) -> Result<u32, ExecutionError> {
+	let [row] = rows else {
+		return Err(ExecutionError::Kernel {
+			message: "join spill row locator requires exactly one build row".to_string(),
+		});
+	};
+	Ok(*row)
 }
 
 fn decode_join_spill_int32_key(encoded_key: &[u8]) -> Result<i32, ExecutionError> {
@@ -388,6 +435,56 @@ pub(in crate::exec) struct SpilledJoinBuild {
 	lru: VecDeque<usize>,
 	cache_bytes: u64,
 	cache_cap: u64,
+	#[cfg(test)]
+	page_read_count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::exec) enum JoinSpillRows {
+	NoMatch,
+	OneRow(u32),
+	Rows(Vec<u32>),
+}
+
+pub(in crate::exec) enum JoinSpillRowsIntoIter {
+	NoMatch,
+	OneRow(std::option::IntoIter<u32>),
+	Rows(std::vec::IntoIter<u32>),
+}
+
+impl Iterator for JoinSpillRowsIntoIter {
+	type Item = u32;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self {
+			Self::NoMatch => None,
+			Self::OneRow(row) => row.next(),
+			Self::Rows(rows) => rows.next(),
+		}
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		match self {
+			Self::NoMatch => (0, Some(0)),
+			Self::OneRow(row) => row.size_hint(),
+			Self::Rows(rows) => rows.size_hint(),
+		}
+	}
+}
+
+impl ExactSizeIterator for JoinSpillRowsIntoIter {}
+
+impl IntoIterator for JoinSpillRows {
+	type Item = u32;
+	type IntoIter = JoinSpillRowsIntoIter;
+
+	fn into_iter(self) -> Self::IntoIter {
+		match self {
+			Self::NoMatch => JoinSpillRowsIntoIter::NoMatch,
+			Self::OneRow(row) => JoinSpillRowsIntoIter::OneRow(Some(row).into_iter()),
+			Self::Rows(rows) => JoinSpillRowsIntoIter::Rows(rows.into_iter()),
+		}
+	}
 }
 
 impl SpilledJoinBuild {
@@ -458,8 +555,9 @@ impl SpilledJoinBuild {
 				message: format!("join spill open failed: {error}"),
 			})?;
 		let key_count = build_rows.len();
+		let all_singleton = build_rows.values().all(|rows| rows.len() == 1);
 		let mut pages = Vec::new();
-		let mut index = JoinSpillPageLocator::for_key_plan(key_plan, key_count);
+		let mut index = JoinSpillPageLocator::for_key_plan(key_plan, key_count, all_singleton);
 		let mut current_entries: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
 		let mut current_size = std::mem::size_of::<u32>();
 		let mut spill_bytes = 0u64;
@@ -492,8 +590,8 @@ impl SpilledJoinBuild {
 						task_budget.spill_bytes.get(),
 					));
 				}
-				for (key, _) in &current_entries {
-					index.insert(key, page_index)?;
+				for (key, rows) in &current_entries {
+					index.insert(key, page_index, rows)?;
 				}
 				next_offset = next_offset.saturating_add(page.ciphertext_len as u64);
 				pages.push(page);
@@ -527,8 +625,8 @@ impl SpilledJoinBuild {
 					task_budget.spill_bytes.get(),
 				));
 			}
-			for (key, _) in &current_entries {
-				index.insert(key, page_index)?;
+			for (key, rows) in &current_entries {
+				index.insert(key, page_index, rows)?;
 			}
 			next_offset = next_offset.saturating_add(page.ciphertext_len as u64);
 			pages.push(page);
@@ -573,6 +671,8 @@ impl SpilledJoinBuild {
 			lru: VecDeque::new(),
 			cache_bytes: 0,
 			cache_cap,
+			#[cfg(test)]
+			page_read_count: 0,
 		})
 	}
 
@@ -586,28 +686,35 @@ impl SpilledJoinBuild {
 	pub(in crate::exec) async fn lookup(
 		&mut self,
 		join_key: &[u8],
-	) -> Result<Vec<u32>, ExecutionError> {
-		let mut rows = Vec::new();
+	) -> Result<JoinSpillRows, ExecutionError> {
 		match self.index.lookup(join_key)? {
-			JoinSpillPageLookup::None => {}
-			JoinSpillPageLookup::One(page_index) => {
+			JoinSpillLocatorLookup::None => Ok(JoinSpillRows::NoMatch),
+			JoinSpillLocatorLookup::Row(row) => Ok(JoinSpillRows::OneRow(row)),
+			JoinSpillLocatorLookup::Page(page_index) => {
 				let page = self.read_page(page_index).await?;
-				rows.extend(decode_join_spill_page_for_key(&page, join_key)?);
+				Ok(JoinSpillRows::Rows(decode_join_spill_page_for_key(
+					&page, join_key,
+				)?))
 			}
-			JoinSpillPageLookup::Many(page_indices) => {
+			JoinSpillLocatorLookup::Pages(page_indices) => {
+				let mut rows = Vec::new();
 				for page_index in page_indices {
 					let page = self.read_page(page_index).await?;
 					rows.extend(decode_join_spill_page_for_key(&page, join_key)?);
 				}
+				Ok(JoinSpillRows::Rows(rows))
 			}
 		}
-		Ok(rows)
 	}
 
 	pub(in crate::exec) async fn read_page(
 		&mut self,
 		page_index: usize,
 	) -> Result<Vec<u8>, ExecutionError> {
+		#[cfg(test)]
+		{
+			self.page_read_count = self.page_read_count.saturating_add(1);
+		}
 		if let Some(cached) = self
 			.cache
 			.get(&page_index)
@@ -2888,6 +2995,7 @@ fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
 
 	fn test_task_budget() -> TaskBudget {
 		let mut query_budget = QueryBudget::default();
@@ -3001,6 +3109,30 @@ mod tests {
 		))
 	}
 
+	fn less_than_join_residual(
+		left_ordinal: ColumnOrdinal,
+		right_ordinal: ColumnOrdinal,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let left = builder.append_column(ResolvedColumn {
+			name: ColumnName("left_value".to_string()),
+			ordinal: left_ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let right = builder.append_column(ResolvedColumn {
+			name: ColumnName("right_value".to_string()),
+			ordinal: right_ordinal,
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let predicate = builder.append_binary(BoundBinaryOp::Lt, left, right, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
 	#[test]
 	fn compact_join_spill_page_locator_fences_and_accounts() {
 		assert_eq!(std::mem::size_of::<CompactJoinSpillPageEntry<i32>>(), 8);
@@ -3016,14 +3148,14 @@ mod tests {
 			"the ref-list entry consumes the full task budget before writer terms"
 		);
 
-		let mut int64 = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int64, 100);
+		let mut int64 = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int64, 100, false);
 		for key in 0..100i64 {
 			int64
-				.insert(&encoded_int64_join_key(key), key as usize)
+				.insert(&encoded_int64_join_key(key), key as usize, &[key as u32])
 				.expect("insert compact Int64 page");
 		}
 		assert_eq!(int64.legacy_insert_count, 0);
-		let JoinSpillPageLocatorStorage::Int64(int64_index) = &int64.storage else {
+		let JoinSpillPageLocatorStorage::Int64Pages(int64_index) = &int64.storage else {
 			panic!("expected compact Int64 locator");
 		};
 		assert_eq!(int64_index.lookup(42), Some(42));
@@ -3043,7 +3175,7 @@ mod tests {
 		.expect("computed locator bytes");
 		assert_eq!(int64.accounted_bytes(), computed);
 		let before_shrink = int64.accounted_bytes();
-		let JoinSpillPageLocatorStorage::Int64(int64_index) = &mut int64.storage else {
+		let JoinSpillPageLocatorStorage::Int64Pages(int64_index) = &mut int64.storage else {
 			unreachable!("Int64 locator kind already asserted");
 		};
 		int64_index.entries.shrink_to_fit();
@@ -3052,29 +3184,72 @@ mod tests {
 		assert!(after_shrink < before_shrink);
 		assert_eq!(int64.accounted_bytes(), after_shrink);
 
-		let mut int32 = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int32, 1);
+		let mut int32 = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int32, 1, false);
 		int32
-			.insert(&encoded_int32_join_key(7), 3)
+			.insert(&encoded_int32_join_key(7), 3, &[7])
 			.expect("insert compact Int32 page");
 		assert_eq!(
 			int32.lookup(&encoded_int32_join_key(7)).unwrap(),
-			JoinSpillPageLookup::One(3)
+			JoinSpillLocatorLookup::Page(3)
 		);
 
-		let mut fallback = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Generic, 1);
+		let mut fallback = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Generic, 1, false);
 		fallback
-			.insert(b"generic-key", 9)
+			.insert(b"generic-key", 9, &[7])
 			.expect("insert encoded fallback page");
 		assert_eq!(fallback.legacy_insert_count, 1);
 		assert_eq!(
 			fallback.lookup(b"generic-key").unwrap(),
-			JoinSpillPageLookup::One(9)
+			JoinSpillLocatorLookup::Page(9)
+		);
+
+		let mut int64_rows = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int64, 100, true);
+		for key in 0..100i64 {
+			int64_rows
+				.insert(&encoded_int64_join_key(key), 999, &[key as u32])
+				.expect("insert compact Int64 row");
+		}
+		assert!(matches!(
+			int64_rows.storage,
+			JoinSpillPageLocatorStorage::Int64Rows(_)
+		));
+		assert_eq!(
+			int64_rows.lookup(&encoded_int64_join_key(42)).unwrap(),
+			JoinSpillLocatorLookup::Row(42)
+		);
+		assert_eq!(int64_rows.accounted_bytes(), before_shrink);
+		assert_eq!(
+			JoinSpillRows::NoMatch.into_iter().collect::<Vec<_>>(),
+			Vec::<u32>::new()
+		);
+		assert_eq!(
+			JoinSpillRows::OneRow(17).into_iter().collect::<Vec<_>>(),
+			vec![17]
+		);
+		assert_eq!(
+			JoinSpillRows::Rows(vec![3, 5])
+				.into_iter()
+				.collect::<Vec<_>>(),
+			vec![3, 5]
+		);
+
+		let mut int32_rows = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int32, 1, true);
+		int32_rows
+			.insert(&encoded_int32_join_key(7), 999, &[11])
+			.expect("insert compact Int32 row");
+		assert_eq!(
+			int32_rows.lookup(&encoded_int32_join_key(7)).unwrap(),
+			JoinSpillLocatorLookup::Row(11)
 		);
 
 		assert!(int64.lookup(&encoded_int32_join_key(42)).is_err());
 		assert!(int64.lookup(&encoded_int64_join_key(42)[..8]).is_err());
-		let mut truncated = CompactJoinSpillPageLocator::<i64>::with_key_count(1);
-		assert!(truncated.insert(1, usize::MAX).is_err());
+		let mut truncated = JoinSpillPageLocator::for_key_plan(JoinKeyPlan::Int64, 1, false);
+		assert!(
+			truncated
+				.insert(&encoded_int64_join_key(1), usize::MAX, &[0])
+				.is_err()
+		);
 
 		let int64_array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
 		let int32_array = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
@@ -3142,7 +3317,7 @@ mod tests {
 		assert!(compact.pages.len() > 1);
 		assert!(legacy.pages.len() > 1);
 		assert_eq!(compact.index.legacy_insert_count, 0);
-		let JoinSpillPageLocatorStorage::Int64(compact_index) = &compact.index.storage else {
+		let JoinSpillPageLocatorStorage::Int64Pages(compact_index) = &compact.index.storage else {
 			panic!("expected compact Int64 locator");
 		};
 		assert_eq!(compact_index.entries.len(), 5_000);
@@ -3162,6 +3337,8 @@ mod tests {
 				legacy.lookup(&encoded).await.expect("legacy lookup")
 			);
 		}
+		assert!(compact.page_read_count > 0);
+		assert!(legacy.page_read_count > 0);
 
 		compact.cleanup().await;
 		legacy.cleanup().await;
@@ -3169,6 +3346,156 @@ mod tests {
 		assert_eq!(std::fs::read_dir(&legacy_dir).unwrap().count(), 0);
 		let _ = std::fs::remove_dir_all(compact_dir);
 		let _ = std::fs::remove_dir_all(legacy_dir);
+	}
+
+	#[tokio::test]
+	async fn join_spill_singleton_row_mode_eliminates_page_reads() {
+		let keys = (0..5_000).map(i64::from).collect::<Vec<_>>();
+		let left = batch_with_keys(&keys);
+		let right = batch_with_keys(&[0, 2_500, 4_999, 9_999]);
+		let right_keys = key_arrays(&right, &[ColumnOrdinal(0)]).expect("right key arrays");
+		let output_schema = joined_schema(&left.schema(), &right.schema());
+		let spill_dir = test_spill_dir("singleton_row_locator");
+		let mut build = SpilledJoinBuild::write(
+			legacy_join_spill_rows(keys.len()),
+			JoinKeyPlan::Int64,
+			test_task_budget(),
+			Arc::new(BlockingFileOps),
+			spill_dir.clone(),
+		)
+		.await
+		.expect("write singleton row locator");
+
+		assert!(build.pages.len() > 1);
+		assert!(matches!(
+			build.index.storage,
+			JoinSpillPageLocatorStorage::Int64Rows(_)
+		));
+		assert_eq!(build.index.legacy_insert_count, 0);
+		assert_eq!(
+			build.lookup(&encoded_int64_join_key(2_500)).await.unwrap(),
+			JoinSpillRows::OneRow(2_500)
+		);
+		assert_eq!(
+			build.lookup(&encoded_int64_join_key(9_999)).await.unwrap(),
+			JoinSpillRows::NoMatch
+		);
+		assert_eq!(build.page_read_count, 0);
+
+		let output = super::super::probe_spilled_hash_join(
+			JoinKind::Inner,
+			&mut build,
+			&right,
+			&right_keys,
+			&left,
+			&output_schema,
+			None,
+			false,
+			test_task_budget().memory.get(),
+		)
+		.await
+		.expect("probe singleton row locator");
+		assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+		assert_eq!(build.page_read_count, 0);
+
+		build.cleanup().await;
+		assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn join_spill_singleton_left_anti_residual_matches_encoded() {
+		let left = batch_with_keys(&[1, 2, 3]);
+		let right = batch_with_keys(&[2, 1, 9]);
+		let right_keys = key_arrays(&right, &[ColumnOrdinal(0)]).expect("right key arrays");
+		let residual = less_than_join_residual(ColumnOrdinal(1), ColumnOrdinal(4));
+		let rows = HashMap::from([
+			(encoded_int64_join_key(1), vec![0]),
+			(encoded_int64_join_key(2), vec![1]),
+			(encoded_int64_join_key(3), vec![2]),
+		]);
+		let row_dir = test_spill_dir("singleton_left_anti_row");
+		let encoded_dir = test_spill_dir("singleton_left_anti_encoded");
+		let mut row_build = SpilledJoinBuild::write(
+			rows.clone(),
+			JoinKeyPlan::Int64,
+			test_task_budget(),
+			Arc::new(BlockingFileOps),
+			row_dir.clone(),
+		)
+		.await
+		.expect("write row-mode anti build");
+		let mut encoded_build = SpilledJoinBuild::write(
+			rows,
+			JoinKeyPlan::Generic,
+			test_task_budget(),
+			Arc::new(BlockingFileOps),
+			encoded_dir.clone(),
+		)
+		.await
+		.expect("write encoded anti build");
+		assert_eq!(row_build.spill_bytes(), encoded_build.spill_bytes());
+		assert_eq!(
+			row_build
+				.pages
+				.iter()
+				.map(|page| (page.plaintext_len, page.ciphertext_len))
+				.collect::<Vec<_>>(),
+			encoded_build
+				.pages
+				.iter()
+				.map(|page| (page.plaintext_len, page.ciphertext_len))
+				.collect::<Vec<_>>()
+		);
+
+		let row_output = super::super::probe_spilled_hash_join(
+			JoinKind::LeftAnti,
+			&mut row_build,
+			&right,
+			&right_keys,
+			&left,
+			&left.schema(),
+			Some(&residual),
+			false,
+			test_task_budget().memory.get(),
+		)
+		.await
+		.expect("probe row-mode LeftAnti");
+		let encoded_output = super::super::probe_spilled_hash_join(
+			JoinKind::LeftAnti,
+			&mut encoded_build,
+			&right,
+			&right_keys,
+			&left,
+			&left.schema(),
+			Some(&residual),
+			false,
+			test_task_budget().memory.get(),
+		)
+		.await
+		.expect("probe encoded LeftAnti");
+
+		assert_eq!(row_output.len(), 1);
+		assert_eq!(encoded_output.len(), 1);
+		assert_record_batch_equal(&row_output[0], &encoded_output[0]);
+		assert_eq!(
+			row_output[0]
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.expect("anti output keys")
+				.values(),
+			&[2, 3]
+		);
+		assert_eq!(row_build.page_read_count, 0);
+		assert!(encoded_build.page_read_count > 0);
+
+		row_build.cleanup().await;
+		encoded_build.cleanup().await;
+		assert_eq!(std::fs::read_dir(&row_dir).unwrap().count(), 0);
+		assert_eq!(std::fs::read_dir(&encoded_dir).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(row_dir);
+		let _ = std::fs::remove_dir_all(encoded_dir);
 	}
 
 	#[tokio::test]
