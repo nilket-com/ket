@@ -5429,8 +5429,9 @@ mod tests {
 				assert_eq!(spilled.row_count(), 4);
 				spilled.cleanup().await;
 			}
-			StreamingSemiAntiExistence::InMemory { .. } => {
-				panic!("matched existence path must use the streamed-spilled build")
+			StreamingSemiAntiExistence::InMemory { .. }
+			| StreamingSemiAntiExistence::RecognizedNeqSummary { .. } => {
+				panic!("generic semi/anti preparer must use the streamed-spilled build")
 			}
 		}
 	}

@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
+use crate::distributed::task::{
+	ExistenceSummaryProfile, JoinBuildProfile, RowCount, TaskTelemetry,
+};
 use crate::exec::join::{BuildRowList, JoinBuildRows, JoinKeyPlan};
 use crate::ir::{JoinReplayId, JoinStrategy};
 
@@ -24,6 +26,32 @@ fn join_build_profile_path() -> Option<&'static PathBuf> {
 fn join_build_profile_file_lock() -> &'static Mutex<()> {
 	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 	LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn existence_summary_profile_path() -> Option<&'static PathBuf> {
+	static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+	PATH.get_or_init(|| std::env::var_os("TORON_EXISTENCE_SUMMARY_PROFILE_PATH").map(PathBuf::from))
+		.as_ref()
+}
+
+fn existence_summary_profile_file_lock() -> &'static Mutex<()> {
+	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+	LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn record_existence_summary_profile_line(profile: &ExistenceSummaryProfile) {
+	let Some(path) = existence_summary_profile_path() else {
+		return;
+	};
+	let Ok(_guard) = existence_summary_profile_file_lock().lock() else {
+		return;
+	};
+	let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+		return;
+	};
+	if serde_json::to_writer(&mut file, profile).is_ok() {
+		let _ = file.write_all(b"\n");
+	}
 }
 
 fn record_join_build_profile_line(profile: &JoinBuildProfile) {
@@ -88,5 +116,40 @@ pub(in crate::exec) fn record_join_build_profile(
 	record_join_build_profile_line(&profile);
 	super::record_task_telemetry(telemetry, |task| {
 		task.join_build_profiles.push(profile);
+	});
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::exec) fn record_existence_summary_profile(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	replay_id: JoinReplayId,
+	build_rows: u64,
+	unique_keys: u64,
+	multi_keys: u64,
+	entry_capacity: usize,
+	bucket_capacity: usize,
+	accounted_bytes: u64,
+	baseline_bytes: u64,
+	peak_combined_bytes: u64,
+	key_count_hint: Option<usize>,
+	build_micros: u64,
+) {
+	let profile = ExistenceSummaryProfile {
+		replay_id,
+		build_rows: RowCount::new(build_rows),
+		unique_keys: RowCount::new(unique_keys),
+		multi_keys: RowCount::new(multi_keys),
+		entry_capacity: u64::try_from(entry_capacity).unwrap_or(u64::MAX),
+		bucket_capacity: u64::try_from(bucket_capacity).unwrap_or(u64::MAX),
+		accounted_bytes,
+		baseline_bytes,
+		peak_combined_bytes,
+		key_count_hint: key_count_hint.map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+		page_reads: 0,
+		build_micros,
+	};
+	record_existence_summary_profile_line(&profile);
+	super::record_task_telemetry(telemetry, |task| {
+		task.existence_summary_profiles.push(profile);
 	});
 }

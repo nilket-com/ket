@@ -137,6 +137,37 @@ impl JoinBuildRows {
 		}
 	}
 
+	pub(in crate::exec) fn accounted_bytes(&self) -> u64 {
+		match &self.inner {
+			JoinBuildRowsInner::Hash(rows) => {
+				let buckets = rows.capacity().saturating_mul(
+					std::mem::size_of::<(JoinKey, BuildRowList)>().saturating_add(16),
+				);
+				rows.iter().fold(
+					u64::try_from(buckets).unwrap_or(u64::MAX),
+					|total, (key, row_list)| {
+						let key_bytes = match key {
+							JoinKey::Generic(bytes) => bytes.capacity(),
+							JoinKey::Int32(_) | JoinKey::Int64(_) => 0,
+						};
+						total.saturating_add(
+							u64::try_from(
+								key_bytes.saturating_add(
+									row_list
+										.heap_capacity_rows()
+										.saturating_mul(std::mem::size_of::<u32>()),
+								),
+							)
+							.unwrap_or(u64::MAX),
+						)
+					},
+				)
+			}
+			JoinBuildRowsInner::Int32(table) => table.accounted_bytes(),
+			JoinBuildRowsInner::Int64(table) => table.accounted_bytes(),
+		}
+	}
+
 	#[cfg(test)]
 	pub(super) fn capacity(&self) -> usize {
 		match &self.inner {
@@ -243,6 +274,31 @@ where
 
 	fn bucket_for_key(&self, key: K) -> usize {
 		(self.hasher.hash_one(key) as usize) & (self.buckets.len() - 1)
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		let fixed = self
+			.buckets
+			.capacity()
+			.saturating_mul(std::mem::size_of::<usize>())
+			.saturating_add(
+				self.entries
+					.capacity()
+					.saturating_mul(std::mem::size_of::<PrimitiveBuildEntry<K>>()),
+			);
+		self.entries
+			.iter()
+			.fold(u64::try_from(fixed).unwrap_or(u64::MAX), |total, entry| {
+				total.saturating_add(
+					u64::try_from(
+						entry
+							.rows
+							.heap_capacity_rows()
+							.saturating_mul(std::mem::size_of::<u32>()),
+					)
+					.unwrap_or(u64::MAX),
+				)
+			})
 	}
 }
 

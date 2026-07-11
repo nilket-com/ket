@@ -1,7 +1,406 @@
 use super::*;
+use ahash::RandomState;
 
 const STREAMED_INNER_LOADED_BUILD_ESTIMATE_SAFETY_MULTIPLIER: u64 = 64;
 const STREAMED_INNER_BUILD_MAX_PARTITIONS: u32 = 1024;
+const EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET: u32 = u32::MAX;
+const NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY: usize = 1024;
+const NEQ_EXISTENCE_SUMMARY_PRODUCER: &str = "recognized Neq existence summary resident state";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecognizedNeqExistenceSummaryColumns {
+	preserved_value: ColumnOrdinal,
+	existence_key: ColumnOrdinal,
+	existence_value: ColumnOrdinal,
+	key_count_hint: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NeqExistenceSummaryEntry {
+	key: i64,
+	representative: i64,
+}
+
+pub(in crate::exec) struct NeqExistenceSummary {
+	buckets: Vec<u32>,
+	entries: Vec<NeqExistenceSummaryEntry>,
+	multi: Vec<u64>,
+	entry_limit: usize,
+	hasher: RandomState,
+	input_rows: u64,
+	multi_keys: u64,
+	peak_combined_bytes: u64,
+	last_entry: Option<(i64, usize)>,
+	#[cfg(test)]
+	growth_count: u64,
+}
+
+impl NeqExistenceSummary {
+	fn new() -> Self {
+		Self {
+			buckets: Vec::new(),
+			entries: Vec::new(),
+			multi: Vec::new(),
+			entry_limit: 0,
+			hasher: RandomState::new(),
+			input_rows: 0,
+			multi_keys: 0,
+			peak_combined_bytes: 0,
+			last_entry: None,
+			#[cfg(test)]
+			growth_count: 0,
+		}
+	}
+
+	fn insert(
+		&mut self,
+		key: i64,
+		value: i64,
+		baseline_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		self.input_rows = self.input_rows.saturating_add(1);
+		if let Some((last_key, entry_index)) = self.last_entry
+			&& last_key == key
+		{
+			self.observe_value(entry_index, value);
+			return Ok(());
+		}
+		if let Some(entry_index) = self.lookup_entry_index(key) {
+			self.observe_value(entry_index, value);
+			self.last_entry = Some((key, entry_index));
+			return Ok(());
+		}
+		if self.entries.len() == self.entry_limit {
+			self.grow(baseline_bytes, cap)?;
+		}
+		let entry_index =
+			u32::try_from(self.entries.len()).map_err(|_| ExecutionError::Kernel {
+				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
+			})?;
+		let bucket = self.find_bucket(key)?;
+		let capacity_before = self.entries.capacity();
+		self.entries.push(NeqExistenceSummaryEntry {
+			key,
+			representative: value,
+		});
+		debug_assert_eq!(self.entries.capacity(), capacity_before);
+		self.buckets[bucket] = entry_index;
+		self.last_entry = Some((key, entry_index as usize));
+		Ok(())
+	}
+
+	fn observe_value(&mut self, entry_index: usize, value: i64) {
+		let entry = self.entries[entry_index];
+		if entry.representative != value && !self.is_multi(entry_index) {
+			self.set_multi(entry_index);
+			self.multi_keys = self.multi_keys.saturating_add(1);
+		}
+	}
+
+	fn matches(&self, key: i64, probe_value: i64) -> bool {
+		let Some(entry_index) = self.lookup_entry_index(key) else {
+			return false;
+		};
+		self.is_multi(entry_index) || self.entries[entry_index].representative != probe_value
+	}
+
+	fn matching_preserved_rows(
+		&self,
+		preserved_batch: &RecordBatch,
+		preserved_by_key: &HashMap<JoinKey, Vec<u32>>,
+		preserved_value: ColumnOrdinal,
+	) -> Result<Vec<bool>, ExecutionError> {
+		let values = preserved_batch
+			.columns()
+			.get(preserved_value.0 as usize)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary preserved value is out of range"
+					.to_string(),
+			})?
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary preserved value must be Int64"
+					.to_string(),
+			})?;
+		if values.null_count() != 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary received a null preserved value"
+					.to_string(),
+			});
+		}
+		let mut matched = vec![false; preserved_batch.num_rows()];
+		for (key, preserved_rows) in preserved_by_key {
+			let JoinKey::Int64(key) = key else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "recognized Neq existence summary received a non-Int64 key"
+						.to_string(),
+				});
+			};
+			for preserved_row in preserved_rows {
+				let row = *preserved_row as usize;
+				if self.matches(*key, values.value(row)) {
+					matched[row] = true;
+				}
+			}
+		}
+		Ok(matched)
+	}
+
+	fn write_batch(
+		&mut self,
+		batch: &RecordBatch,
+		existence_key: ColumnOrdinal,
+		existence_value: ColumnOrdinal,
+		baseline_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		let keys = batch
+			.columns()
+			.get(existence_key.0 as usize)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary build key is out of range".to_string(),
+			})?
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary build key must be Int64".to_string(),
+			})?;
+		let values = batch
+			.columns()
+			.get(existence_value.0 as usize)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary build value is out of range".to_string(),
+			})?
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary build value must be Int64".to_string(),
+			})?;
+		if keys.null_count() != 0 || values.null_count() != 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: "recognized Neq existence summary received a null build key/value"
+					.to_string(),
+			});
+		}
+		for row in 0..batch.num_rows() {
+			self.insert(keys.value(row), values.value(row), baseline_bytes, cap)?;
+		}
+		Ok(())
+	}
+
+	fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {
+		let target = if self.entry_limit == 0 {
+			NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY
+		} else {
+			self.entry_limit
+				.checked_mul(2)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "recognized Neq existence summary capacity overflow".to_string(),
+				})?
+		};
+		self.resize_capacity(target, baseline_bytes, cap)
+	}
+
+	fn reserve_key_count(
+		&mut self,
+		key_count: usize,
+		baseline_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		let target = key_count
+			.max(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY)
+			.checked_next_power_of_two()
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq existence summary capacity overflow".to_string(),
+			})?;
+		if target > self.entry_limit {
+			self.resize_capacity(target, baseline_bytes, cap)?;
+		}
+		Ok(())
+	}
+
+	fn resize_capacity(
+		&mut self,
+		target: usize,
+		baseline_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		if target > u32::MAX as usize {
+			return Err(ExecutionError::Kernel {
+				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
+			});
+		}
+
+		let requested_entry_bytes = summary_bytes::<NeqExistenceSummaryEntry>(target);
+		self.guard_allocation(baseline_bytes, requested_entry_bytes, cap)?;
+		let mut entries = Vec::new();
+		entries
+			.try_reserve_exact(target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary entry allocation failed: {error}"
+				),
+			})?;
+		let actual_entry_bytes = summary_bytes::<NeqExistenceSummaryEntry>(entries.capacity());
+		self.guard_allocation(baseline_bytes, actual_entry_bytes, cap)?;
+		entries.extend_from_slice(&self.entries);
+		self.observe_peak(baseline_bytes, actual_entry_bytes);
+		self.entries = entries;
+
+		let multi_words = target.saturating_add(63) / 64;
+		let requested_multi_bytes = summary_bytes::<u64>(multi_words);
+		self.guard_allocation(baseline_bytes, requested_multi_bytes, cap)?;
+		let mut multi = Vec::new();
+		multi
+			.try_reserve_exact(multi_words)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary bitset allocation failed: {error}"
+				),
+			})?;
+		let actual_multi_bytes = summary_bytes::<u64>(multi.capacity());
+		self.guard_allocation(baseline_bytes, actual_multi_bytes, cap)?;
+		multi.resize(multi_words, 0);
+		multi[..self.multi.len()].copy_from_slice(&self.multi);
+		self.observe_peak(baseline_bytes, actual_multi_bytes);
+		self.multi = multi;
+
+		let bucket_count = target
+			.checked_mul(2)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq existence summary bucket capacity overflow".to_string(),
+			})?;
+		let requested_bucket_bytes = summary_bytes::<u32>(bucket_count);
+		self.guard_allocation(baseline_bytes, requested_bucket_bytes, cap)?;
+		let mut buckets = Vec::new();
+		buckets
+			.try_reserve_exact(bucket_count)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary bucket allocation failed: {error}"
+				),
+			})?;
+		let actual_bucket_bytes = summary_bytes::<u32>(buckets.capacity());
+		self.guard_allocation(baseline_bytes, actual_bucket_bytes, cap)?;
+		buckets.resize(bucket_count, EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
+		for (entry_index, entry) in self.entries.iter().enumerate() {
+			let bucket = Self::find_bucket_in(&self.hasher, &buckets, &self.entries, entry.key)?;
+			buckets[bucket] = u32::try_from(entry_index).map_err(|_| ExecutionError::Kernel {
+				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
+			})?;
+		}
+		self.observe_peak(baseline_bytes, actual_bucket_bytes);
+		self.buckets = buckets;
+		self.entry_limit = target;
+		#[cfg(test)]
+		{
+			self.growth_count = self.growth_count.saturating_add(1);
+		}
+		Ok(())
+	}
+
+	fn lookup_entry_index(&self, key: i64) -> Option<usize> {
+		if self.buckets.is_empty() {
+			return None;
+		}
+		let bucket = self.find_bucket(key).ok()?;
+		let entry_index = self.buckets[bucket];
+		(entry_index != EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET).then_some(entry_index as usize)
+	}
+
+	fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {
+		Self::find_bucket_in(&self.hasher, &self.buckets, &self.entries, key)
+	}
+
+	fn find_bucket_in(
+		hasher: &RandomState,
+		buckets: &[u32],
+		entries: &[NeqExistenceSummaryEntry],
+		key: i64,
+	) -> Result<usize, ExecutionError> {
+		if buckets.is_empty() || !buckets.len().is_power_of_two() {
+			return Err(ExecutionError::Kernel {
+				message: "recognized Neq existence summary has invalid bucket capacity".to_string(),
+			});
+		}
+		let mut bucket = (hasher.hash_one(key) as usize) & (buckets.len() - 1);
+		for _ in 0..buckets.len() {
+			let entry_index = buckets[bucket];
+			if entry_index == EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET
+				|| entries
+					.get(entry_index as usize)
+					.is_some_and(|entry| entry.key == key)
+			{
+				return Ok(bucket);
+			}
+			bucket = (bucket + 1) & (buckets.len() - 1);
+		}
+		Err(ExecutionError::Kernel {
+			message: "recognized Neq existence summary has no free bucket".to_string(),
+		})
+	}
+
+	fn is_multi(&self, entry_index: usize) -> bool {
+		let word = entry_index / 64;
+		let bit = entry_index % 64;
+		self.multi
+			.get(word)
+			.is_some_and(|value| value & (1u64 << bit) != 0)
+	}
+
+	fn set_multi(&mut self, entry_index: usize) {
+		let word = entry_index / 64;
+		let bit = entry_index % 64;
+		self.multi[word] |= 1u64 << bit;
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		summary_bytes::<u32>(self.buckets.capacity())
+			.saturating_add(summary_bytes::<NeqExistenceSummaryEntry>(
+				self.entries.capacity(),
+			))
+			.saturating_add(summary_bytes::<u64>(self.multi.capacity()))
+	}
+
+	fn guard_allocation(
+		&self,
+		baseline_bytes: u64,
+		allocation_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		let requested = baseline_bytes
+			.saturating_add(self.accounted_bytes())
+			.saturating_add(allocation_bytes);
+		if requested > cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				NEQ_EXISTENCE_SUMMARY_PRODUCER,
+				requested,
+				cap,
+			));
+		}
+		Ok(())
+	}
+
+	fn observe_peak(&mut self, baseline_bytes: u64, allocation_bytes: u64) {
+		self.peak_combined_bytes = self.peak_combined_bytes.max(
+			baseline_bytes
+				.saturating_add(self.accounted_bytes())
+				.saturating_add(allocation_bytes),
+		);
+	}
+
+	#[cfg(test)]
+	fn computed_bytes(&self) -> u64 {
+		self.accounted_bytes()
+	}
+}
+
+fn summary_bytes<T>(capacity: usize) -> u64 {
+	u64::try_from(capacity.saturating_mul(std::mem::size_of::<T>())).unwrap_or(u64::MAX)
+}
 
 pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	replay_id: JoinReplayId,
@@ -105,6 +504,10 @@ pub(in crate::exec) enum StreamingSemiAntiExistence {
 		rows: JoinBuildRows,
 	},
 	Spilled(SpilledSemiAntiExistenceBuild),
+	RecognizedNeqSummary {
+		summary: NeqExistenceSummary,
+		preserved_value: ColumnOrdinal,
+	},
 }
 
 pub(in crate::exec) enum StreamingExistenceOp<'a> {
@@ -172,6 +575,18 @@ enum ReorientedChainOutputSink<'a> {
 }
 
 impl StreamingSemiAntiRuntime<'_> {
+	fn retained_resident_bytes(&self) -> u64 {
+		match &self.existence {
+			StreamingSemiAntiExistence::InMemory { batch, rows } => {
+				record_batch_memory_bytes(batch).saturating_add(rows.accounted_bytes())
+			}
+			StreamingSemiAntiExistence::Spilled(_) => 0,
+			StreamingSemiAntiExistence::RecognizedNeqSummary { summary, .. } => {
+				summary.accounted_bytes()
+			}
+		}
+	}
+
 	pub(in crate::exec) async fn cleanup(self) {
 		if let StreamingSemiAntiExistence::Spilled(spilled) = self.existence {
 			spilled.cleanup().await;
@@ -188,6 +603,22 @@ impl ReorientedInnerJoinRuntime<'_> {
 				observed_build_rows,
 				..
 			} => *observed_build_rows,
+		}
+	}
+
+	fn retained_resident_bytes(&self) -> u64 {
+		match &self.build {
+			ReorientedInnerJoinBuild::InMemory { batch, rows } => {
+				record_batch_memory_bytes(batch).saturating_add(rows.accounted_bytes())
+			}
+			ReorientedInnerJoinBuild::Spilled { build, .. } => build.retained_resident_bytes(),
+			ReorientedInnerJoinBuild::PartitionedScan {
+				loaded_builds,
+				loaded_resident_bytes,
+				..
+			} => loaded_resident_bytes.saturating_add(summary_bytes::<
+				Option<LoadedSpilledInnerBuild>,
+			>(loaded_builds.capacity())),
 		}
 	}
 
@@ -512,6 +943,82 @@ fn retained_existence_columns_for_semi_anti_stage(
 	} else {
 		Ok(Some(retained))
 	}
+}
+
+fn recognized_neq_existence_summary_columns(
+	stage: &StreamingSemiAntiStage<'_>,
+) -> Option<RecognizedNeqExistenceSummaryColumns> {
+	let match_filter = stage.match_filter?;
+	let root = match_filter.single_root()?;
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Neq,
+		left,
+		right,
+	} = match_filter.node(root)?
+	else {
+		return None;
+	};
+	let BoundExprNode::Column(left) = match_filter.node(*left)? else {
+		return None;
+	};
+	let BoundExprNode::Column(right) = match_filter.node(*right)? else {
+		return None;
+	};
+	if match_filter.node_type(root) != Some(&DataType::Boolean) {
+		return None;
+	}
+
+	let preserved_schema = &stage.output_schema;
+	let existence_schema = stage.existence.schema();
+	let preserved_width = preserved_schema.fields().len();
+	let classify = |column: &crate::ir::ResolvedColumn| {
+		let ordinal = column.ordinal.0 as usize;
+		if ordinal < preserved_width {
+			let field = preserved_schema.fields().get(ordinal)?;
+			(column.data_type == *field.data_type() && column.nullable == field.is_nullable())
+				.then_some((true, ColumnOrdinal(ordinal as u32)))
+		} else {
+			let local = ordinal.checked_sub(preserved_width)?;
+			let field = existence_schema.fields().get(local)?;
+			(column.data_type == *field.data_type() && column.nullable == field.is_nullable())
+				.then_some((false, ColumnOrdinal(local as u32)))
+		}
+	};
+	let left = classify(left)?;
+	let right = classify(right)?;
+	let (preserved_value, existence_value) = match (left, right) {
+		((true, preserved), (false, existence)) | ((false, existence), (true, preserved)) => {
+			(preserved, existence)
+		}
+		_ => return None,
+	};
+
+	if stage.preserved_keys.len() != 1 || stage.existence_keys.len() != 1 {
+		return None;
+	}
+	let preserved_key = stage.preserved_keys[0];
+	let existence_key = stage.existence_keys[0];
+	let preserved_key_field = preserved_schema.fields().get(preserved_key.0 as usize)?;
+	let existence_key_field = existence_schema.fields().get(existence_key.0 as usize)?;
+	let preserved_value_field = preserved_schema.fields().get(preserved_value.0 as usize)?;
+	let existence_value_field = existence_schema.fields().get(existence_value.0 as usize)?;
+	for field in [
+		preserved_key_field,
+		existence_key_field,
+		preserved_value_field,
+		existence_value_field,
+	] {
+		if field.data_type() != &DataType::Int64 || field.is_nullable() {
+			return None;
+		}
+	}
+
+	Some(RecognizedNeqExistenceSummaryColumns {
+		preserved_value,
+		existence_key,
+		existence_value,
+		key_count_hint: streaming_existence_key_count_hint(stage.existence, existence_key),
+	})
 }
 
 fn retained_left_outer_grouped_columns(
@@ -2316,6 +2823,42 @@ pub(in crate::exec) fn decompose_streaming_existence_plan(
 			_ => return None,
 		}
 	}
+}
+
+fn streaming_existence_key_count_hint(
+	plan: &ExecutionPlan,
+	existence_key: ColumnOrdinal,
+) -> Option<usize> {
+	let (scan, ops) = decompose_streaming_existence_plan(plan)?;
+	let mut scan_output_ordinal = existence_key;
+	for op in ops.iter().rev() {
+		if let StreamingExistenceOp::Project { exprs, .. } = op {
+			let columns = exprs.root_columns()?;
+			scan_output_ordinal = columns.get(scan_output_ordinal.0 as usize)?.ordinal;
+		}
+	}
+	let ExecutionPlan::Scan {
+		projection,
+		column_ndv,
+		..
+	} = scan
+	else {
+		return None;
+	};
+	let descriptor_ordinal = projection
+		.as_ref()
+		.and_then(|columns| columns.get(scan_output_ordinal.0 as usize).copied())
+		.unwrap_or(scan_output_ordinal);
+	let count = column_ndv.iter().find_map(|(column, fact)| {
+		if *column != descriptor_ordinal {
+			return None;
+		}
+		match fact {
+			crate::catalog::DistinctCountFact::Exact(count) => Some(*count),
+			crate::catalog::DistinctCountFact::Approx { .. } => None,
+		}
+	})?;
+	usize::try_from(count).ok()
 }
 
 pub(in crate::exec) fn extract_streaming_inner_prefix_semi_anti_chain(
@@ -9485,268 +10028,373 @@ impl Executor {
 		collect_program_column_ordinals(group_expr, &mut required_output);
 		collect_aggregate_columns(aggr_expr, &mut required_output);
 		mark_reoriented_inner_stage_projections(&mut chain.inner_stages, required_output)?;
+		let recognized_summaries =
+			self.recognized_neq_summary_pair(&chain.semi_stage, &chain.anti_stage, morsel);
 
-		let mut inner_runtimes = Vec::with_capacity(chain.inner_stages.len());
+		let mut inner_runtimes: Vec<ReorientedInnerJoinRuntime<'_>> =
+			Vec::with_capacity(chain.inner_stages.len());
 		for stage in chain.inner_stages {
-			let Some(runtime) = self
+			let prepared = self
 				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
-				.await?
-			else {
-				return Ok(None);
+				.await;
+			let runtime = match prepared {
+				Ok(Some(runtime)) => runtime,
+				Ok(None) => {
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Ok(None);
+				}
+				Err(error) => {
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
 			};
 			inner_runtimes.push(runtime);
 		}
-		let Some(mut semi_runtime) = self
-			.prepare_streaming_semi_anti_runtime(chain.semi_stage, morsel)
-			.await?
-		else {
-			return Ok(None);
-		};
-		let Some(mut anti_runtime) = self
-			.prepare_streaming_semi_anti_runtime(chain.anti_stage, morsel)
-			.await?
-		else {
-			return Ok(None);
-		};
-
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
-		let mut group_types = Vec::new();
-		if self
-			.try_streaming_inner_prefix_semi_anti_scan_probe_base(
-				chain.base,
-				&mut inner_runtimes,
-				&mut semi_runtime,
-				&mut anti_runtime,
-				group_expr,
-				aggr_expr,
-				&mut groups,
-				&mut group_types,
-				morsel,
-			)
-			.await?
-			.is_none()
+		let inner_resident_bytes = inner_runtimes.iter().fold(0u64, |total, runtime| {
+			total.saturating_add(runtime.retained_resident_bytes())
+		});
+		let (mut semi_runtime, mut anti_runtime) = if let Some((semi_columns, anti_columns)) =
+			recognized_summaries
 		{
-			let ExecutionPlan::Exchange {
-				input: base_input,
-				partition_count,
-				key: base_exchange_key,
-			} = chain.base
-			else {
-				return Ok(None);
-			};
-			let Some((join0, join0_filter)) = decompose_join_or_filtered_join(base_input.as_ref())
-			else {
-				return Ok(None);
-			};
-			let ExecutionPlan::Join {
-				replay_id,
-				left,
-				right,
-				kind: JoinKind::Inner,
-				left_keys,
-				right_keys,
-				match_filter,
-				null_safe_keys,
-				strategy,
-				output_schema: join0_output_schema,
-				..
-			} = join0
-			else {
-				return Ok(None);
-			};
-			if *replay_id != JoinReplayId(0) {
-				return Ok(None);
-			}
-
-			let left_batches = self.execute_bound(left, morsel).await?;
-			let right_batches = self.execute_bound(right, morsel).await?;
-			let left_batch = concat_or_empty(left.schema(), &left_batches)?;
-			let right_batch = concat_or_empty(right.schema(), &right_batches)?;
-			let left_key_arrays = key_arrays(&left_batch, left_keys)?;
-			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
-			if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
-				> self.context.task_budget.memory.get()
+			let semi = match self
+				.prepare_recognized_neq_semi_anti_runtime(
+					chain.semi_stage,
+					semi_columns,
+					morsel,
+					inner_resident_bytes,
+				)
+				.await
 			{
-				return Ok(None);
-			}
-			let join_key_plan =
-				JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
-			let build_started = Instant::now();
-			let Some(build_rows) = build_in_memory_join_rows(
-				join_key_plan,
-				&left_key_arrays,
-				left_batch.num_rows(),
-				self.context.task_budget.memory.get(),
-				*null_safe_keys,
-			)?
-			else {
-				return Ok(None);
+				Ok(runtime) => runtime,
+				Err(error) => {
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
 			};
-			record_task_telemetry(&self.context.task_telemetry, |task| {
-				task.counters.build_rows = task
-					.counters
-					.build_rows
-					.saturating_add(left_batch.num_rows() as u64);
-				task.counters.probe_rows = task
-					.counters
-					.probe_rows
-					.saturating_add(right_batch.num_rows() as u64);
-			});
-			record_task_telemetry(&self.context.task_telemetry, |task| {
-				task.phases.build_micros = task
-					.phases
-					.build_micros
-					.saturating_add(duration_micros(build_started));
-			});
-			let probe_started = Instant::now();
-			let selection = probe_in_memory_join_rows(
-				JoinKind::Inner,
-				join_key_plan,
-				&build_rows,
-				left_batch.num_rows(),
-				&right_key_arrays,
-				right_batch.num_rows(),
-				match_filter.as_ref(),
-				&left_batch,
-				&right_batch,
-				*null_safe_keys,
-			)?;
-			record_task_telemetry(&self.context.task_telemetry, |task| {
-				task.phases.probe_micros = task
-					.phases
-					.probe_micros
-					.saturating_add(duration_micros(probe_started));
-				task.counters.matched_rows = task
-					.counters
-					.matched_rows
-					.saturating_add(selection.len() as u64);
-			});
+			let anti_baseline = inner_resident_bytes.saturating_add(semi.retained_resident_bytes());
+			let anti = match self
+				.prepare_recognized_neq_semi_anti_runtime(
+					chain.anti_stage,
+					anti_columns,
+					morsel,
+					anti_baseline,
+				)
+				.await
+			{
+				Ok(runtime) => runtime,
+				Err(error) => {
+					semi.cleanup().await;
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
+			};
+			(semi, anti)
+		} else {
+			let semi = match self
+				.prepare_streaming_semi_anti_runtime(chain.semi_stage, morsel)
+				.await
+			{
+				Ok(Some(runtime)) => runtime,
+				Ok(None) => {
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Ok(None);
+				}
+				Err(error) => {
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
+			};
+			let anti = match self
+				.prepare_streaming_semi_anti_runtime(chain.anti_stage, morsel)
+				.await
+			{
+				Ok(Some(runtime)) => runtime,
+				Ok(None) => {
+					semi.cleanup().await;
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Ok(None);
+				}
+				Err(error) => {
+					semi.cleanup().await;
+					for runtime in inner_runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
+			};
+			(semi, anti)
+		};
 
-			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
-				let batch = materialize_join_selection(
+		let execution_result = async {
+			let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+			let mut group_types = Vec::new();
+			if self
+				.try_streaming_inner_prefix_semi_anti_scan_probe_base(
+					chain.base,
+					&mut inner_runtimes,
+					&mut semi_runtime,
+					&mut anti_runtime,
+					group_expr,
+					aggr_expr,
+					&mut groups,
+					&mut group_types,
+					morsel,
+				)
+				.await?
+				.is_none()
+			{
+				let ExecutionPlan::Exchange {
+					input: base_input,
+					partition_count,
+					key: base_exchange_key,
+				} = chain.base
+				else {
+					return Ok(None);
+				};
+				let Some((join0, join0_filter)) =
+					decompose_join_or_filtered_join(base_input.as_ref())
+				else {
+					return Ok(None);
+				};
+				let ExecutionPlan::Join {
+					replay_id,
+					left,
+					right,
+					kind: JoinKind::Inner,
+					left_keys,
+					right_keys,
+					match_filter,
+					null_safe_keys,
+					strategy,
+					output_schema: join0_output_schema,
+					..
+				} = join0
+				else {
+					return Ok(None);
+				};
+				if *replay_id != JoinReplayId(0) {
+					return Ok(None);
+				}
+
+				let left_batches = self.execute_bound(left, morsel).await?;
+				let right_batches = self.execute_bound(right, morsel).await?;
+				let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+				let right_batch = concat_or_empty(right.schema(), &right_batches)?;
+				let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+				let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+				if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+					> self.context.task_budget.memory.get()
+				{
+					return Ok(None);
+				}
+				let join_key_plan = JoinKeyPlan::from_key_arrays(
+					&left_key_arrays,
+					&right_key_arrays,
+					*null_safe_keys,
+				);
+				let build_started = Instant::now();
+				let Some(build_rows) = build_in_memory_join_rows(
+					join_key_plan,
+					&left_key_arrays,
+					left_batch.num_rows(),
+					self.context.task_budget.memory.get(),
+					*null_safe_keys,
+				)?
+				else {
+					return Ok(None);
+				};
+				record_task_telemetry(&self.context.task_telemetry, |task| {
+					task.counters.build_rows = task
+						.counters
+						.build_rows
+						.saturating_add(left_batch.num_rows() as u64);
+					task.counters.probe_rows = task
+						.counters
+						.probe_rows
+						.saturating_add(right_batch.num_rows() as u64);
+				});
+				record_task_telemetry(&self.context.task_telemetry, |task| {
+					task.phases.build_micros = task
+						.phases
+						.build_micros
+						.saturating_add(duration_micros(build_started));
+				});
+				let probe_started = Instant::now();
+				let selection = probe_in_memory_join_rows(
 					JoinKind::Inner,
+					join_key_plan,
+					&build_rows,
+					left_batch.num_rows(),
+					&right_key_arrays,
+					right_batch.num_rows(),
+					match_filter.as_ref(),
 					&left_batch,
 					&right_batch,
-					chunk,
-					join0_output_schema,
-					self.context.task_budget.memory.get(),
+					*null_safe_keys,
 				)?;
-				let batch = if let Some(join0_filter) = join0_filter {
-					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
-				} else {
-					batch
-				};
-				if batch.num_rows() == 0 {
-					continue;
-				}
-				for (_partition, partitioned) in
-					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
-				{
-					if partitioned.num_rows() == 0 {
+				record_task_telemetry(&self.context.task_telemetry, |task| {
+					task.phases.probe_micros = task
+						.phases
+						.probe_micros
+						.saturating_add(duration_micros(probe_started));
+					task.counters.matched_rows = task
+						.counters
+						.matched_rows
+						.saturating_add(selection.len() as u64);
+				});
+
+				for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+					let batch = materialize_join_selection(
+						JoinKind::Inner,
+						&left_batch,
+						&right_batch,
+						chunk,
+						join0_output_schema,
+						self.context.task_budget.memory.get(),
+					)?;
+					let batch = if let Some(join0_filter) = join0_filter {
+						self.filter_batch_with_bound_predicate(
+							join0_filter,
+							batch,
+							"filter predicate",
+						)?
+					} else {
+						batch
+					};
+					if batch.num_rows() == 0 {
 						continue;
 					}
-					let mut batches = vec![partitioned];
-					for runtime in inner_runtimes.iter_mut() {
-						let mut next = Vec::new();
+					for (_partition, partitioned) in self.repartition_exchange_batch(
+						&batch,
+						*partition_count,
+						base_exchange_key,
+					)? {
+						if partitioned.num_rows() == 0 {
+							continue;
+						}
+						let mut batches = vec![partitioned];
+						for runtime in inner_runtimes.iter_mut() {
+							let mut next = Vec::new();
+							for batch in batches {
+								next.extend(
+									self.probe_reoriented_inner_join_streaming(runtime, &batch)
+										.await?,
+								);
+							}
+							batches = next;
+							if let Some(predicate) = runtime.post_filter {
+								let mut filtered = Vec::new();
+								for batch in batches {
+									let batch = self.filter_batch_with_bound_predicate(
+										predicate,
+										batch,
+										"filter predicate",
+									)?;
+									if batch.num_rows() > 0 {
+										filtered.push(batch);
+									}
+								}
+								batches = filtered;
+							}
+							if batches.is_empty() {
+								break;
+							}
+						}
+
+						let mut semi_batches = Vec::new();
 						for batch in batches {
-							next.extend(
-								self.probe_reoriented_inner_join_streaming(runtime, &batch)
+							semi_batches.extend(
+								self.probe_streaming_semi_anti(&mut semi_runtime, &batch)
 									.await?,
 							);
 						}
-						batches = next;
-						if let Some(predicate) = runtime.post_filter {
-							let mut filtered = Vec::new();
-							for batch in batches {
-								let batch = self.filter_batch_with_bound_predicate(
-									predicate,
-									batch,
-									"filter predicate",
-								)?;
-								if batch.num_rows() > 0 {
-									filtered.push(batch);
-								}
-							}
-							batches = filtered;
+						let mut anti_batches = Vec::new();
+						for batch in semi_batches {
+							anti_batches.extend(
+								self.probe_streaming_semi_anti(&mut anti_runtime, &batch)
+									.await?,
+							);
 						}
-						if batches.is_empty() {
-							break;
+						for batch in anti_batches {
+							self.fold_bound_grouped_aggregate_batch(
+								&mut groups,
+								&mut group_types,
+								group_expr,
+								aggr_expr,
+								&batch,
+							)?;
 						}
-					}
-
-					let mut semi_batches = Vec::new();
-					for batch in batches {
-						semi_batches.extend(
-							self.probe_streaming_semi_anti(&mut semi_runtime, &batch)
-								.await?,
-						);
-					}
-					let mut anti_batches = Vec::new();
-					for batch in semi_batches {
-						anti_batches.extend(
-							self.probe_streaming_semi_anti(&mut anti_runtime, &batch)
-								.await?,
-						);
-					}
-					for batch in anti_batches {
-						self.fold_bound_grouped_aggregate_batch(
-							&mut groups,
-							&mut group_types,
-							group_expr,
-							aggr_expr,
-							&batch,
-						)?;
 					}
 				}
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id: *replay_id,
+						strategy: *strategy,
+						build_rows: RowCount::new(left_batch.num_rows() as u64),
+						probe_rows: RowCount::new(right_batch.num_rows() as u64),
+						output_rows: RowCount::new(selection.len() as u64),
+					},
+				);
 			}
-			record_join_runtime_observation(
-				&self.context.task_telemetry,
-				&self.context.join_runtime_observation_mode,
-				JoinRuntimeObservation {
-					replay_id: *replay_id,
-					strategy: *strategy,
-					build_rows: RowCount::new(left_batch.num_rows() as u64),
-					probe_rows: RowCount::new(right_batch.num_rows() as u64),
-					output_rows: RowCount::new(selection.len() as u64),
-				},
-			);
-		}
 
-		for runtime in &inner_runtimes {
-			record_join_runtime_observation(
-				&self.context.task_telemetry,
-				&self.context.join_runtime_observation_mode,
-				JoinRuntimeObservation {
-					replay_id: runtime.replay_id,
-					strategy: runtime.strategy,
-					build_rows: RowCount::new(runtime.build_row_count()),
-					probe_rows: RowCount::new(runtime.probe_rows),
-					output_rows: RowCount::new(runtime.output_rows),
-				},
-			);
-		}
-		for runtime in [&semi_runtime, &anti_runtime] {
-			record_join_runtime_observation(
-				&self.context.task_telemetry,
-				&self.context.join_runtime_observation_mode,
-				JoinRuntimeObservation {
-					replay_id: runtime.replay_id,
-					strategy: runtime.strategy,
-					build_rows: RowCount::new(runtime.existence_row_count),
-					probe_rows: RowCount::new(runtime.probe_rows),
-					output_rows: RowCount::new(runtime.output_rows),
-				},
-			);
-		}
+			for runtime in &inner_runtimes {
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id: runtime.replay_id,
+						strategy: runtime.strategy,
+						build_rows: RowCount::new(runtime.build_row_count()),
+						probe_rows: RowCount::new(runtime.probe_rows),
+						output_rows: RowCount::new(runtime.output_rows),
+					},
+				);
+			}
+			for runtime in [&semi_runtime, &anti_runtime] {
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id: runtime.replay_id,
+						strategy: runtime.strategy,
+						build_rows: RowCount::new(runtime.existence_row_count),
+						probe_rows: RowCount::new(runtime.probe_rows),
+						output_rows: RowCount::new(runtime.output_rows),
+					},
+				);
+			}
 
-		let output =
-			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema);
+			let output = self.finalize_bound_grouped_aggregate(
+				&groups,
+				&group_types,
+				aggr_expr,
+				output_schema,
+			);
+			output.map(Some)
+		}
+		.await;
 		for runtime in inner_runtimes {
 			runtime.cleanup().await;
 		}
 		semi_runtime.cleanup().await;
 		anti_runtime.cleanup().await;
-		output.map(Some)
+		execution_result
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -10379,6 +11027,187 @@ impl Executor {
 		}))
 	}
 
+	fn recognized_neq_summary_scan_is_eligible(
+		&self,
+		stage: &StreamingSemiAntiStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> bool {
+		let Some((scan_plan, _)) = decompose_streaming_existence_plan(stage.existence) else {
+			return false;
+		};
+		self.bound_scan_request(scan_plan, morsel).is_some()
+	}
+
+	fn recognized_neq_summary_pair(
+		&self,
+		semi: &StreamingSemiAntiStage<'_>,
+		anti: &StreamingSemiAntiStage<'_>,
+		morsel: Option<(MorselId, u32)>,
+	) -> Option<(
+		RecognizedNeqExistenceSummaryColumns,
+		RecognizedNeqExistenceSummaryColumns,
+	)> {
+		let semi_columns = recognized_neq_existence_summary_columns(semi)?;
+		let anti_columns = recognized_neq_existence_summary_columns(anti)?;
+		(self.recognized_neq_summary_scan_is_eligible(semi, morsel)
+			&& self.recognized_neq_summary_scan_is_eligible(anti, morsel))
+		.then_some((semi_columns, anti_columns))
+	}
+
+	async fn prepare_recognized_neq_semi_anti_runtime<'a>(
+		&self,
+		stage: StreamingSemiAntiStage<'a>,
+		columns: RecognizedNeqExistenceSummaryColumns,
+		morsel: Option<(MorselId, u32)>,
+		baseline_bytes: u64,
+	) -> Result<StreamingSemiAntiRuntime<'a>, ExecutionError> {
+		let cap = join_spill_retained_footprint_memory_cap(self.context.task_budget.memory.get());
+		let build_started = Instant::now();
+		let mut summary = NeqExistenceSummary::new();
+		if let Some(key_count_hint) = columns.key_count_hint {
+			summary.reserve_key_count(key_count_hint, baseline_bytes, cap)?;
+		}
+		self.write_streaming_recognized_neq_existence_summary(
+			stage.existence,
+			columns,
+			morsel,
+			baseline_bytes,
+			cap,
+			&mut summary,
+		)
+		.await?;
+		let existence_row_count = summary.input_rows;
+		record_existence_summary_profile(
+			&self.context.task_telemetry,
+			stage.replay_id,
+			existence_row_count,
+			summary.entries.len() as u64,
+			summary.multi_keys,
+			summary.entries.capacity(),
+			summary.buckets.capacity(),
+			summary.accounted_bytes(),
+			baseline_bytes,
+			summary.peak_combined_bytes,
+			columns.key_count_hint,
+			duration_micros(build_started),
+		);
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task.counters.build_rows.saturating_add(existence_row_count);
+		});
+		Ok(StreamingSemiAntiRuntime {
+			replay_id: stage.replay_id,
+			kind: stage.kind,
+			strategy: stage.strategy,
+			existence: StreamingSemiAntiExistence::RecognizedNeqSummary {
+				summary,
+				preserved_value: columns.preserved_value,
+			},
+			existence_row_count,
+			key_plan: JoinKeyPlan::Int64,
+			preserved_keys: stage.preserved_keys,
+			match_filter: stage.match_filter,
+			output_schema: stage.output_schema,
+			probe_rows: 0,
+			output_rows: 0,
+		})
+	}
+
+	async fn write_streaming_recognized_neq_existence_summary(
+		&self,
+		plan: &ExecutionPlan,
+		columns: RecognizedNeqExistenceSummaryColumns,
+		morsel: Option<(MorselId, u32)>,
+		baseline_bytes: u64,
+		cap: u64,
+		summary: &mut NeqExistenceSummary,
+	) -> Result<(), ExecutionError> {
+		let (scan_plan, ops) = decompose_streaming_existence_plan(plan).ok_or_else(|| {
+			ExecutionError::InvalidExpression {
+				message: "committed recognized Neq existence summary lost its scan plan"
+					.to_string(),
+			}
+		})?;
+		let req = self.bound_scan_request(scan_plan, morsel).ok_or_else(|| {
+			ExecutionError::InvalidExpression {
+				message: "committed recognized Neq existence summary lost its scan request"
+					.to_string(),
+			}
+		})?;
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		while let Some(batch) = stream.next().await {
+			let mut batch = batch?;
+			if let Some(limit) = remaining.as_mut() {
+				if *limit == 0 {
+					break;
+				}
+				if batch.num_rows() > *limit {
+					batch = batch.slice(0, *limit);
+				}
+				*limit = (*limit).saturating_sub(batch.num_rows());
+			}
+			let mut batches = vec![batch];
+			for op in &ops {
+				let mut next = Vec::new();
+				for batch in batches {
+					match op {
+						StreamingExistenceOp::Filter(predicate) => {
+							let batch = self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?;
+							if batch.num_rows() > 0 {
+								next.push(batch);
+							}
+						}
+						StreamingExistenceOp::Project {
+							exprs,
+							output_schema,
+						} => {
+							let columns = self.evaluate_bound_program(exprs, &batch)?;
+							next.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+						}
+						StreamingExistenceOp::Exchange {
+							partition_count,
+							key,
+						} => {
+							if *partition_count == 0 {
+								return Err(ExecutionError::InvalidExpression {
+									message: "exchange partition_count must be greater than zero"
+										.to_string(),
+								});
+							}
+							for (_partition, partitioned) in
+								self.repartition_exchange_batch(&batch, *partition_count, key)?
+							{
+								if partitioned.num_rows() > 0 {
+									next.push(partitioned);
+								}
+							}
+						}
+					}
+				}
+				batches = next;
+				if batches.is_empty() {
+					break;
+				}
+			}
+			for batch in batches {
+				summary.write_batch(
+					&batch,
+					columns.existence_key,
+					columns.existence_value,
+					baseline_bytes,
+					cap,
+				)?;
+			}
+		}
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn write_streaming_semi_anti_existence(
 		&self,
 		plan: &ExecutionPlan,
@@ -10594,6 +11423,14 @@ impl Executor {
 					)
 					.await?
 			}
+			StreamingSemiAntiExistence::RecognizedNeqSummary {
+				summary,
+				preserved_value,
+			} => summary.matching_preserved_rows(
+				preserved_batch,
+				&preserved_by_key,
+				*preserved_value,
+			)?,
 		};
 		let mut selected = Vec::<u32>::new();
 		for row in 0..preserved_batch.num_rows() {
@@ -14734,6 +15571,639 @@ mod tests {
 		let predicate = builder.append_binary(BoundBinaryOp::Neq, left, right, DataType::Boolean);
 		builder.push_root(predicate);
 		builder.build()
+	}
+
+	fn binary_residual_program(
+		op: BoundBinaryOp,
+		left_ordinal: ColumnOrdinal,
+		left_type: DataType,
+		left_nullable: bool,
+		right_ordinal: ColumnOrdinal,
+		right_type: DataType,
+		right_nullable: bool,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let left = builder.append_column(ResolvedColumn {
+			name: ColumnName("left".to_string()),
+			ordinal: left_ordinal,
+			data_type: left_type,
+			nullable: left_nullable,
+			pbc_eligible: false,
+		});
+		let right = builder.append_column(ResolvedColumn {
+			name: ColumnName("right".to_string()),
+			ordinal: right_ordinal,
+			data_type: right_type,
+			nullable: right_nullable,
+			pbc_eligible: false,
+		});
+		let predicate = builder.append_binary(op, left, right, DataType::Boolean);
+		builder.push_root(predicate);
+		builder.build()
+	}
+
+	fn recognized_summary_stage<'a>(
+		kind: JoinKind,
+		replay_id: u32,
+		existence: &'a ExecutionPlan,
+		match_filter: &'a BoundExprProgram,
+		preserved_schema: SchemaRef,
+	) -> StreamingSemiAntiStage<'a> {
+		StreamingSemiAntiStage {
+			replay_id: JoinReplayId(replay_id),
+			kind,
+			preserved_keys: vec![ColumnOrdinal(0)],
+			existence,
+			existence_keys: vec![ColumnOrdinal(0)],
+			match_filter: Some(match_filter),
+			output_schema: preserved_schema,
+			strategy: JoinStrategy::HashPartitioned,
+		}
+	}
+
+	fn recognized_summary_stage_with_filter<'a>(
+		kind: JoinKind,
+		replay_id: u32,
+		existence: &'a ExecutionPlan,
+		match_filter: Option<&'a BoundExprProgram>,
+		preserved_schema: SchemaRef,
+	) -> StreamingSemiAntiStage<'a> {
+		StreamingSemiAntiStage {
+			replay_id: JoinReplayId(replay_id),
+			kind,
+			preserved_keys: vec![ColumnOrdinal(0)],
+			existence,
+			existence_keys: vec![ColumnOrdinal(0)],
+			match_filter,
+			output_schema: preserved_schema,
+			strategy: JoinStrategy::HashPartitioned,
+		}
+	}
+
+	#[test]
+	fn recognized_neq_summary_structure_and_growth_are_exact() {
+		assert_eq!(std::mem::size_of::<NeqExistenceSummaryEntry>(), 16);
+		let mut summary = NeqExistenceSummary::new();
+		let cap = 1024 * 1024;
+		for key in 0..1_025i64 {
+			summary
+				.insert(key, key.saturating_add(10), 0, cap)
+				.expect("summary insert");
+		}
+		summary.insert(10, 10, 0, cap).expect("different value");
+		summary
+			.insert(10, 10, 0, cap)
+			.expect("repeated different value");
+		summary
+			.insert(i64::MIN, i64::MAX, 0, cap)
+			.expect("full-domain insert");
+
+		assert_eq!(summary.entry_limit, 2_048);
+		assert_eq!(summary.buckets.len(), 4_096);
+		assert_eq!(summary.multi.len(), 32);
+		assert_eq!(summary.accounted_bytes(), summary.computed_bytes());
+		assert_eq!(summary.growth_count, 2);
+		assert!(summary.matches(10, 20));
+		assert!(summary.matches(10, 10));
+		assert!(summary.matches(i64::MIN, 0));
+		assert!(!summary.matches(9_999, 0));
+	}
+
+	#[test]
+	fn recognized_neq_summary_growth_guard_counts_the_live_baseline() {
+		let mut summary = NeqExistenceSummary::new();
+		let initial_entries =
+			summary_bytes::<NeqExistenceSummaryEntry>(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY);
+		let baseline = 64u64 * 1024;
+		let cap = baseline.saturating_add(initial_entries).saturating_sub(1);
+		let error = summary
+			.insert(1, 2, baseline, cap)
+			.expect_err("combined baseline must arm the growth guard");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: NEQ_EXISTENCE_SUMMARY_PRODUCER,
+				..
+			}
+		));
+		assert!(summary.entries.is_empty());
+		assert!(summary.buckets.is_empty());
+	}
+
+	#[test]
+	fn recognized_neq_summary_pair_uses_one_combined_guard() {
+		let cap = 32 * 1024;
+		let mut first = NeqExistenceSummary::new();
+		first
+			.insert(1, 10, 0, cap)
+			.expect("one summary fits in isolation");
+		let first_bytes = first.accounted_bytes();
+		let mut isolated_second = NeqExistenceSummary::new();
+		isolated_second
+			.insert(2, 20, 0, cap)
+			.expect("second summary also fits in isolation");
+		let mut combined_second = NeqExistenceSummary::new();
+		let error = combined_second
+			.insert(2, 20, first_bytes, cap)
+			.expect_err("the live first summary must arm the combined guard");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				producer: NEQ_EXISTENCE_SUMMARY_PRODUCER,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn recognized_neq_summary_uses_scan_ndv_as_a_checked_capacity_hint() {
+		use crate::catalog::DistinctCountFact;
+
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let mut existence = test_scan_plan_with_first_field_key(TableId(77), schema.clone(), 77);
+		let ExecutionPlan::Scan { column_ndv, .. } = &mut existence else {
+			panic!("scan fixture");
+		};
+		column_ndv.push((ColumnOrdinal(0), DistinctCountFact::Exact(1_500)));
+		let residual = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(3),
+			"preserved",
+			"existence",
+		);
+		let stage = recognized_summary_stage(JoinKind::LeftSemi, 3, &existence, &residual, schema);
+		let columns = recognized_neq_existence_summary_columns(&stage).expect("recognized shape");
+		assert_eq!(columns.key_count_hint, Some(1_500));
+		let mut summary = NeqExistenceSummary::new();
+		summary
+			.reserve_key_count(1_500, 0, 1024 * 1024)
+			.expect("hinted reservation");
+		let growth_count = summary.growth_count;
+		for key in 0..1_500i64 {
+			summary
+				.insert(key, key, 0, 1024 * 1024)
+				.expect("hinted insert");
+		}
+		assert_eq!(summary.entry_limit, 2_048);
+		assert_eq!(summary.growth_count, growth_count);
+
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let mut approximate = test_scan_plan_with_first_field_key(TableId(79), schema.clone(), 79);
+		let ExecutionPlan::Scan { column_ndv, .. } = &mut approximate else {
+			panic!("scan fixture");
+		};
+		column_ndv.push((
+			ColumnOrdinal(0),
+			DistinctCountFact::Approx {
+				estimate: 1_500,
+				rel_err_ppm: 10_000,
+			},
+		));
+		let approximate_stage =
+			recognized_summary_stage(JoinKind::LeftSemi, 3, &approximate, &residual, schema);
+		assert_eq!(
+			recognized_neq_existence_summary_columns(&approximate_stage)
+				.expect("recognized approximate stage")
+				.key_count_hint,
+			None,
+			"approximate NDV is evidence, not hard preallocation authority"
+		);
+	}
+
+	#[test]
+	fn recognized_neq_summary_pair_is_atomic_and_pre_io() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let existence_schema = preserved_schema.clone();
+		let semi_plan =
+			test_scan_plan_with_first_field_key(TableId(71), existence_schema.clone(), 71);
+		let anti_plan =
+			test_scan_plan_with_first_field_key(TableId(72), existence_schema.clone(), 72);
+		let semi_filter = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(3),
+			"preserved",
+			"existence",
+		);
+		let anti_filter = not_equal_residual_program(
+			ColumnOrdinal(3),
+			ColumnOrdinal(1),
+			"existence",
+			"preserved",
+		);
+		let rejected_filter = binary_residual_program(
+			BoundBinaryOp::Eq,
+			ColumnOrdinal(1),
+			DataType::Int64,
+			false,
+			ColumnOrdinal(3),
+			DataType::Int64,
+			false,
+		);
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: requested_tables.clone(),
+			}),
+			ExecutionContext::local_test(),
+		);
+		let semi = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&semi_plan,
+			&semi_filter,
+			preserved_schema.clone(),
+		);
+		let anti = recognized_summary_stage(
+			JoinKind::LeftAnti,
+			4,
+			&anti_plan,
+			&anti_filter,
+			preserved_schema.clone(),
+		);
+		let selected = executor
+			.recognized_neq_summary_pair(&semi, &anti, None)
+			.expect("both operand orders must be admitted");
+		assert_eq!(selected.0.preserved_value, ColumnOrdinal(1));
+		assert_eq!(selected.0.existence_value, ColumnOrdinal(1));
+		assert_eq!(selected.1.preserved_value, ColumnOrdinal(1));
+		assert_eq!(selected.1.existence_value, ColumnOrdinal(1));
+
+		let rejected = recognized_summary_stage(
+			JoinKind::LeftAnti,
+			4,
+			&anti_plan,
+			&rejected_filter,
+			preserved_schema,
+		);
+		assert!(
+			executor
+				.recognized_neq_summary_pair(&semi, &rejected, None)
+				.is_none(),
+			"one rejected stage must reject the pair"
+		);
+		assert!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.is_empty(),
+			"pair selection must not open either scan"
+		);
+	}
+
+	#[test]
+	fn recognized_neq_summary_reject_matrix_is_structure_first() {
+		let int64_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let existence = test_scan_plan_with_first_field_key(TableId(73), int64_schema.clone(), 73);
+		let same_side = binary_residual_program(
+			BoundBinaryOp::Neq,
+			ColumnOrdinal(0),
+			DataType::Int64,
+			false,
+			ColumnOrdinal(1),
+			DataType::Int64,
+			false,
+		);
+		let out_of_range = binary_residual_program(
+			BoundBinaryOp::Neq,
+			ColumnOrdinal(1),
+			DataType::Int64,
+			false,
+			ColumnOrdinal(99),
+			DataType::Int64,
+			false,
+		);
+		let mut cast_builder = BoundExprProgramBuilder::new();
+		let preserved = cast_builder.append_column(ResolvedColumn {
+			name: ColumnName("preserved".to_string()),
+			ordinal: ColumnOrdinal(1),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let preserved = cast_builder.append_cast(preserved, DataType::Int64, DataType::Int64);
+		let existence_value = cast_builder.append_column(ResolvedColumn {
+			name: ColumnName("existence".to_string()),
+			ordinal: ColumnOrdinal(3),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let cast_root = cast_builder.append_binary(
+			BoundBinaryOp::Neq,
+			preserved,
+			existence_value,
+			DataType::Boolean,
+		);
+		cast_builder.push_root(cast_root);
+		let cast_child = cast_builder.build();
+		let mut multi_root_builder = BoundExprProgramBuilder::new();
+		let a = multi_root_builder.append_literal(ScalarValue::Boolean(Some(true)));
+		let b = multi_root_builder.append_literal(ScalarValue::Boolean(Some(false)));
+		multi_root_builder.push_root(a);
+		multi_root_builder.push_root(b);
+		let multi_root = multi_root_builder.build();
+
+		for residual in [&same_side, &out_of_range, &cast_child, &multi_root] {
+			let stage = recognized_summary_stage(
+				JoinKind::LeftSemi,
+				3,
+				&existence,
+				residual,
+				int64_schema.clone(),
+			);
+			assert!(recognized_neq_existence_summary_columns(&stage).is_none());
+		}
+
+		let nullable_preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, true),
+		]));
+		let nullable_preserved = binary_residual_program(
+			BoundBinaryOp::Neq,
+			ColumnOrdinal(1),
+			DataType::Int64,
+			true,
+			ColumnOrdinal(3),
+			DataType::Int64,
+			false,
+		);
+		let stage = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&existence,
+			&nullable_preserved,
+			nullable_preserved_schema,
+		);
+		assert!(recognized_neq_existence_summary_columns(&stage).is_none());
+
+		let nullable_existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, true),
+		]));
+		let nullable_existence_plan =
+			test_scan_plan_with_first_field_key(TableId(74), nullable_existence_schema, 74);
+		let nullable_existence = binary_residual_program(
+			BoundBinaryOp::Neq,
+			ColumnOrdinal(1),
+			DataType::Int64,
+			false,
+			ColumnOrdinal(3),
+			DataType::Int64,
+			true,
+		);
+		let stage = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&nullable_existence_plan,
+			&nullable_existence,
+			int64_schema.clone(),
+		);
+		assert!(recognized_neq_existence_summary_columns(&stage).is_none());
+
+		let int32_key_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int32, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let int32_key_plan =
+			test_scan_plan_with_first_field_key(TableId(75), int32_key_schema.clone(), 75);
+		let valid_shape = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(3),
+			"preserved",
+			"existence",
+		);
+		let stage = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&int32_key_plan,
+			&valid_shape,
+			int32_key_schema,
+		);
+		assert!(recognized_neq_existence_summary_columns(&stage).is_none());
+
+		let float_value_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Float64, false),
+		]));
+		let float_value_plan =
+			test_scan_plan_with_first_field_key(TableId(76), float_value_schema.clone(), 76);
+		let float_value = binary_residual_program(
+			BoundBinaryOp::Neq,
+			ColumnOrdinal(1),
+			DataType::Float64,
+			false,
+			ColumnOrdinal(3),
+			DataType::Float64,
+			false,
+		);
+		let stage = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&float_value_plan,
+			&float_value,
+			float_value_schema,
+		);
+		assert!(recognized_neq_existence_summary_columns(&stage).is_none());
+
+		let membership_only = recognized_summary_stage_with_filter(
+			JoinKind::LeftSemi,
+			3,
+			&existence,
+			None,
+			int64_schema,
+		);
+		assert!(recognized_neq_existence_summary_columns(&membership_only).is_none());
+	}
+
+	#[tokio::test]
+	async fn recognized_neq_summary_matches_residual_twin_for_semi_and_anti() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("tag", DataType::Int64, false),
+		]));
+		let existence_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let preserved = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 2, 3, 4])),
+				Arc::new(Int64Array::from(vec![10, 11, 20, 30, 41])),
+				Arc::new(Int64Array::from(vec![100, 101, 200, 300, 400])),
+			],
+		)
+		.expect("preserved batch");
+		let existence = RecordBatch::try_new(
+			existence_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 2, 2, 4])),
+				Arc::new(Int64Array::from(vec![10, 10, 20, 30, 40])),
+			],
+		)
+		.expect("existence batch");
+		let residual = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(4),
+			"preserved_suppkey",
+			"existence_suppkey",
+		);
+		let executor = Executor::new(Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::new(),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		}));
+
+		for kind in [JoinKind::LeftSemi, JoinKind::LeftAnti] {
+			let key_arrays = key_arrays(&existence, &[ColumnOrdinal(0)]).expect("existence keys");
+			let rows = build_in_memory_join_rows(
+				JoinKeyPlan::Int64,
+				&key_arrays,
+				existence.num_rows(),
+				u64::MAX,
+				false,
+			)
+			.expect("build rows")
+			.expect("in-memory rows");
+			let mut twin = StreamingSemiAntiRuntime {
+				replay_id: JoinReplayId::SYNTHETIC,
+				kind,
+				strategy: JoinStrategy::HashPartitioned,
+				existence: StreamingSemiAntiExistence::InMemory {
+					batch: existence.clone(),
+					rows,
+				},
+				existence_row_count: existence.num_rows() as u64,
+				key_plan: JoinKeyPlan::Int64,
+				preserved_keys: vec![ColumnOrdinal(0)],
+				match_filter: Some(&residual),
+				output_schema: preserved_schema.clone(),
+				probe_rows: 0,
+				output_rows: 0,
+			};
+			let mut summary = NeqExistenceSummary::new();
+			summary
+				.write_batch(
+					&existence,
+					ColumnOrdinal(0),
+					ColumnOrdinal(1),
+					0,
+					1024 * 1024,
+				)
+				.expect("summary build");
+			let mut summarized = StreamingSemiAntiRuntime {
+				replay_id: JoinReplayId::SYNTHETIC,
+				kind,
+				strategy: JoinStrategy::HashPartitioned,
+				existence: StreamingSemiAntiExistence::RecognizedNeqSummary {
+					summary,
+					preserved_value: ColumnOrdinal(1),
+				},
+				existence_row_count: existence.num_rows() as u64,
+				key_plan: JoinKeyPlan::Int64,
+				preserved_keys: vec![ColumnOrdinal(0)],
+				match_filter: Some(&residual),
+				output_schema: preserved_schema.clone(),
+				probe_rows: 0,
+				output_rows: 0,
+			};
+
+			let expected = executor
+				.probe_streaming_semi_anti(&mut twin, &preserved)
+				.await
+				.expect("residual twin probe");
+			let actual = executor
+				.probe_streaming_semi_anti(&mut summarized, &preserved)
+				.await
+				.expect("summary probe");
+			assert_record_batches_equal(&actual, &expected);
+			assert!(matches!(
+				summarized.existence,
+				StreamingSemiAntiExistence::RecognizedNeqSummary { .. }
+			));
+		}
+	}
+
+	#[tokio::test]
+	async fn recognized_neq_summary_prepare_is_page_free_and_profiled() {
+		let preserved_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let existence_batch = RecordBatch::try_new(
+			preserved_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20, 30])),
+			],
+		)
+		.expect("existence batch");
+		let existence_plan =
+			test_scan_plan_with_first_field_key(TableId(78), preserved_schema.clone(), 78);
+		let residual = not_equal_residual_program(
+			ColumnOrdinal(1),
+			ColumnOrdinal(3),
+			"preserved",
+			"existence",
+		);
+		let stage = recognized_summary_stage(
+			JoinKind::LeftSemi,
+			3,
+			&existence_plan,
+			&residual,
+			preserved_schema,
+		);
+		let columns = recognized_neq_existence_summary_columns(&stage).expect("recognized stage");
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(78), vec![existence_batch])]),
+				requested_tables: requested_tables.clone(),
+			}),
+			ExecutionContext::local_test()
+				.with_task_budget(high_test_budget())
+				.with_task_telemetry(telemetry.clone()),
+		);
+		let runtime = executor
+			.prepare_recognized_neq_semi_anti_runtime(stage, columns, None, 0)
+			.await
+			.expect("summary runtime");
+		assert!(matches!(
+			runtime.existence,
+			StreamingSemiAntiExistence::RecognizedNeqSummary { .. }
+		));
+		assert_eq!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.as_slice(),
+			&[TableId(78)]
+		);
+		let telemetry = telemetry.lock().expect("telemetry");
+		let [profile] = telemetry.existence_summary_profiles.as_slice() else {
+			panic!("one summary profile");
+		};
+		assert_eq!(profile.replay_id, JoinReplayId(3));
+		assert_eq!(profile.build_rows.get(), 3);
+		assert_eq!(profile.unique_keys.get(), 2);
+		assert_eq!(profile.multi_keys.get(), 1);
+		assert_eq!(profile.page_reads, 0);
+		assert_eq!(profile.accounted_bytes, 24_704);
 	}
 
 	async fn projected_existence_spill(

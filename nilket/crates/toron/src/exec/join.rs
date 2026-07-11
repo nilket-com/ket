@@ -6,7 +6,9 @@ mod columns;
 mod spill;
 mod streaming;
 
-pub(in crate::exec) use self::build_profile::record_join_build_profile;
+pub(in crate::exec) use self::build_profile::{
+	record_existence_summary_profile, record_join_build_profile,
+};
 pub(super) use self::build_rows::{
 	BuildRowList, JoinBuildRows, new_int32_join_build_rows, new_int64_join_build_rows,
 	new_join_build_rows,

@@ -2031,6 +2031,14 @@ impl SpilledInnerJoinBuild {
 		self.spill_bytes
 	}
 
+	pub(in crate::exec) fn retained_resident_bytes(&self) -> u64 {
+		self.resident_index_bytes
+			.saturating_add(self.writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
+			.saturating_add(self.cache_bytes)
+			.saturating_add(self.pinned_decoded_bytes)
+	}
+
 	pub(in crate::exec) fn loaded_page_bytes_estimate(&self) -> u64 {
 		self.pages
 			.iter()

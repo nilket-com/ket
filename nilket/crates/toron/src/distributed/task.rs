@@ -83,6 +83,8 @@ pub struct TaskTelemetry {
 	pub join_observations: Vec<JoinRuntimeObservation>,
 	#[serde(default)]
 	pub join_build_profiles: Vec<JoinBuildProfile>,
+	#[serde(default)]
+	pub existence_summary_profiles: Vec<ExistenceSummaryProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +108,22 @@ pub struct JoinBuildProfile {
 	pub max_rows_per_key: RowCount,
 	pub row_list_value_bytes: u64,
 	pub overflow_heap_capacity_bytes: u64,
+	pub build_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistenceSummaryProfile {
+	pub replay_id: JoinReplayId,
+	pub build_rows: RowCount,
+	pub unique_keys: RowCount,
+	pub multi_keys: RowCount,
+	pub entry_capacity: u64,
+	pub bucket_capacity: u64,
+	pub accounted_bytes: u64,
+	pub baseline_bytes: u64,
+	pub peak_combined_bytes: u64,
+	pub key_count_hint: Option<u64>,
+	pub page_reads: u64,
 	pub build_micros: u64,
 }
 
