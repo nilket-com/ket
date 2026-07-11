@@ -3014,6 +3014,7 @@ pub(super) async fn execute_spilled_hash_join(
 	spill_file_ops: Arc<dyn AsyncFileOps>,
 	spill_dir: PathBuf,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let key_plan = JoinKeyPlan::from_key_arrays(left_key_arrays, right_key_arrays, null_safe_keys);
 	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
 	let build_started = Instant::now();
 	for row in 0..left_batch.num_rows() {
@@ -3068,7 +3069,8 @@ pub(super) async fn execute_spilled_hash_join(
 
 	let spill_started = Instant::now();
 	let mut spilled =
-		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+		SpilledJoinBuild::write(build_rows, key_plan, task_budget, spill_file_ops, spill_dir)
+			.await?;
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.spill_micros = task
 			.phases
@@ -3128,6 +3130,7 @@ pub(super) async fn execute_spilled_hash_join_into_global_aggregate(
 	spill_file_ops: Arc<dyn AsyncFileOps>,
 	spill_dir: PathBuf,
 ) -> Result<u64, ExecutionError> {
+	let key_plan = JoinKeyPlan::from_key_arrays(left_key_arrays, right_key_arrays, null_safe_keys);
 	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
 	let build_started = Instant::now();
 	for row in 0..left_batch.num_rows() {
@@ -3188,7 +3191,8 @@ pub(super) async fn execute_spilled_hash_join_into_global_aggregate(
 
 	let spill_started = Instant::now();
 	let mut spilled =
-		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+		SpilledJoinBuild::write(build_rows, key_plan, task_budget, spill_file_ops, spill_dir)
+			.await?;
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.spill_micros = task
 			.phases
@@ -3250,6 +3254,7 @@ pub(super) async fn visit_spilled_hash_join_filtered_chunks<F>(
 where
 	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 {
+	let key_plan = JoinKeyPlan::from_key_arrays(left_key_arrays, right_key_arrays, null_safe_keys);
 	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
 	let build_started = Instant::now();
 	for row in 0..left_batch.num_rows() {
@@ -3309,7 +3314,8 @@ where
 
 	let spill_started = Instant::now();
 	let mut spilled =
-		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+		SpilledJoinBuild::write(build_rows, key_plan, task_budget, spill_file_ops, spill_dir)
+			.await?;
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.spill_micros = task
 			.phases
