@@ -11054,7 +11054,7 @@ pub struct Q18Row {
 	pub sum_raw: i128,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q18Oracle {
 	pub rows: Vec<Q18Row>,
 	pub qualifying_orders: usize,
@@ -11062,42 +11062,117 @@ pub struct Q18Oracle {
 	pub selected_lineitem_rows: usize,
 }
 
-pub fn q18_oracle_from_rows(
-	customers: impl IntoIterator<Item = (i64, String)>,
+#[derive(Debug)]
+struct Q18PendingRow {
+	c_custkey: i64,
+	o_orderkey: i64,
+	o_orderdate: i32,
+	o_totalprice_raw: i128,
+	sum_raw: i128,
+}
+
+struct Q18LineitemGroups<I>
+where
+	I: Iterator<Item = (i64, i128)>,
+{
+	rows: std::iter::Peekable<I>,
+	selected_lineitem_rows: usize,
+}
+
+impl<I> Q18LineitemGroups<I>
+where
+	I: Iterator<Item = (i64, i128)>,
+{
+	fn new(rows: I) -> Self {
+		Self {
+			rows: rows.peekable(),
+			selected_lineitem_rows: 0,
+		}
+	}
+
+	fn next_group(&mut self) -> Result<Option<(i64, i128)>, String> {
+		let Some((orderkey, quantity_raw)) = self.rows.next() else {
+			return Ok(None);
+		};
+		checked_q18_counter_increment(&mut self.selected_lineitem_rows, "selected_lineitem_rows")?;
+		let mut sum_raw = quantity_raw;
+
+		while let Some((next_orderkey, _)) = self.rows.peek() {
+			if *next_orderkey < orderkey {
+				return Err(format!(
+					"q18 lineitem order stream is not monotonic: previous group key {orderkey}, current key {next_orderkey}"
+				));
+			}
+			if *next_orderkey != orderkey {
+				break;
+			}
+			let (_, quantity_raw) = self.rows.next().expect("peeked q18 lineitem row");
+			checked_q18_counter_increment(
+				&mut self.selected_lineitem_rows,
+				"selected_lineitem_rows",
+			)?;
+			sum_raw = sum_raw
+				.checked_add(quantity_raw)
+				.ok_or_else(|| format!("q18 order quantity overflow for orderkey {orderkey}"))?;
+		}
+
+		Ok(Some((orderkey, sum_raw)))
+	}
+}
+
+fn checked_q18_counter_increment(counter: &mut usize, name: &str) -> Result<(), String> {
+	*counter = counter
+		.checked_add(1)
+		.ok_or_else(|| format!("q18 {name} counter overflow"))?;
+	Ok(())
+}
+
+fn q18_oracle_frugal_from_rows(
+	customer_keys: impl IntoIterator<Item = i64>,
+	customer_names: impl IntoIterator<Item = (i64, String)>,
 	orders: impl IntoIterator<Item = (i64, i64, i32, i128)>,
 	lineitems: impl IntoIterator<Item = (i64, i128)>,
 ) -> Result<Q18Oracle, String> {
-	let customers: HashMap<i64, String> = customers.into_iter().collect();
-	let orders: HashMap<i64, (i64, i32, i128)> = orders
-		.into_iter()
-		.map(|(orderkey, custkey, orderdate, totalprice_raw)| {
-			(orderkey, (custkey, orderdate, totalprice_raw))
-		})
-		.collect();
-	let mut quantity_by_order: HashMap<i64, i128> = HashMap::new();
-	let mut selected_lineitem_rows = 0_usize;
-	for (orderkey, quantity_raw) in lineitems {
-		selected_lineitem_rows += 1;
-		let entry = quantity_by_order.entry(orderkey).or_insert(0);
-		*entry = entry
-			.checked_add(quantity_raw)
-			.ok_or_else(|| "q18 order quantity overflow".to_string())?;
+	let mut customers = HashSet::new();
+	for custkey in customer_keys {
+		if !customers.insert(custkey) {
+			return Err(format!(
+				"q18 customer membership stream has duplicate key {custkey}"
+			));
+		}
 	}
 
-	let mut rows = Vec::new();
+	let mut grouped_lineitems = Q18LineitemGroups::new(lineitems.into_iter());
+	let mut next_group = grouped_lineitems.next_group()?;
+	let mut pending_rows = Vec::new();
 	let mut qualifying_orders = 0_usize;
 	let mut threshold_fail_orders = 0_usize;
-	for (orderkey, (custkey, orderdate, totalprice_raw)) in orders {
-		let Some(c_name) = customers.get(&custkey) else {
+	let mut previous_orderkey = None;
+	for (orderkey, custkey, orderdate, totalprice_raw) in orders {
+		if previous_orderkey.is_some_and(|previous| orderkey <= previous) {
+			return Err(format!(
+				"q18 orders stream is not strictly increasing: previous key {}, current key {orderkey}",
+				previous_orderkey.expect("checked q18 previous orderkey")
+			));
+		}
+		previous_orderkey = Some(orderkey);
+
+		while next_group.is_some_and(|(lineitem_orderkey, _)| lineitem_orderkey < orderkey) {
+			next_group = grouped_lineitems.next_group()?;
+		}
+		let Some((lineitem_orderkey, sum_raw)) = next_group else {
 			continue;
 		};
-		let Some(sum_raw) = quantity_by_order.get(&orderkey).copied() else {
+		if lineitem_orderkey != orderkey {
 			continue;
-		};
+		}
+		next_group = grouped_lineitems.next_group()?;
+		if !customers.contains(&custkey) {
+			continue;
+		}
 		if sum_raw > 30_000 {
-			qualifying_orders += 1;
-			rows.push(Q18Row {
-				c_name: c_name.clone(),
+			checked_q18_counter_increment(&mut qualifying_orders, "qualifying_orders")?;
+			pending_rows.push(Q18PendingRow {
 				c_custkey: custkey,
 				o_orderkey: orderkey,
 				o_orderdate: orderdate,
@@ -11105,8 +11180,45 @@ pub fn q18_oracle_from_rows(
 				sum_raw,
 			});
 		} else {
-			threshold_fail_orders += 1;
+			checked_q18_counter_increment(&mut threshold_fail_orders, "threshold_fail_orders")?;
 		}
+	}
+	while next_group.is_some() {
+		next_group = grouped_lineitems.next_group()?;
+	}
+
+	let qualifying_customer_keys: HashSet<i64> = pending_rows
+		.iter()
+		.map(|candidate| candidate.c_custkey)
+		.collect();
+	let mut qualifying_customer_names = HashMap::with_capacity(qualifying_customer_keys.len());
+	for (custkey, name) in customer_names {
+		if qualifying_customer_keys.contains(&custkey)
+			&& qualifying_customer_names.insert(custkey, name).is_some()
+		{
+			return Err(format!(
+				"q18 customer name stream has duplicate key {custkey}"
+			));
+		}
+	}
+	let mut rows = Vec::with_capacity(pending_rows.len());
+	for candidate in pending_rows {
+		let c_name = qualifying_customer_names
+			.get(&candidate.c_custkey)
+			.ok_or_else(|| {
+				format!(
+					"q18 qualifying customer {} is missing from the customer name stream",
+					candidate.c_custkey
+				)
+			})?;
+		rows.push(Q18Row {
+			c_name: c_name.clone(),
+			c_custkey: candidate.c_custkey,
+			o_orderkey: candidate.o_orderkey,
+			o_orderdate: candidate.o_orderdate,
+			o_totalprice_raw: candidate.o_totalprice_raw,
+			sum_raw: candidate.sum_raw,
+		});
 	}
 	rows.sort_by(|left, right| {
 		right
@@ -11120,12 +11232,15 @@ pub fn q18_oracle_from_rows(
 		rows,
 		qualifying_orders,
 		threshold_fail_orders,
-		selected_lineitem_rows,
+		selected_lineitem_rows: grouped_lineitems.selected_lineitem_rows,
 	})
 }
 
 pub fn strict_q18_oracle(scale_factor: f64) -> Result<Q18Oracle, String> {
-	q18_oracle_from_rows(
+	q18_oracle_frugal_from_rows(
+		CustomerGenerator::new(scale_factor, 1, 1)
+			.iter()
+			.map(|customer| customer.c_custkey),
 		CustomerGenerator::new(scale_factor, 1, 1)
 			.iter()
 			.map(|customer| (customer.c_custkey, customer.c_name.to_string())),
@@ -11141,6 +11256,236 @@ pub fn strict_q18_oracle(scale_factor: f64) -> Result<Q18Oracle, String> {
 			.iter()
 			.map(|item| (item.l_orderkey, item.l_quantity as i128 * 100)),
 	)
+}
+
+#[cfg(test)]
+mod adr425_q18_frugal_oracle {
+	use super::*;
+
+	fn q18_oracle_dense_from_rows(
+		customers: impl IntoIterator<Item = (i64, String)>,
+		orders: impl IntoIterator<Item = (i64, i64, i32, i128)>,
+		lineitems: impl IntoIterator<Item = (i64, i128)>,
+	) -> Result<Q18Oracle, String> {
+		let customers: HashMap<i64, String> = customers.into_iter().collect();
+		let orders: HashMap<i64, (i64, i32, i128)> = orders
+			.into_iter()
+			.map(|(orderkey, custkey, orderdate, totalprice_raw)| {
+				(orderkey, (custkey, orderdate, totalprice_raw))
+			})
+			.collect();
+		let mut quantity_by_order: HashMap<i64, i128> = HashMap::new();
+		let mut selected_lineitem_rows = 0_usize;
+		for (orderkey, quantity_raw) in lineitems {
+			selected_lineitem_rows += 1;
+			let entry = quantity_by_order.entry(orderkey).or_insert(0);
+			*entry = entry
+				.checked_add(quantity_raw)
+				.ok_or_else(|| "q18 order quantity overflow".to_string())?;
+		}
+
+		let mut rows = Vec::new();
+		let mut qualifying_orders = 0_usize;
+		let mut threshold_fail_orders = 0_usize;
+		for (orderkey, (custkey, orderdate, totalprice_raw)) in orders {
+			let Some(c_name) = customers.get(&custkey) else {
+				continue;
+			};
+			let Some(sum_raw) = quantity_by_order.get(&orderkey).copied() else {
+				continue;
+			};
+			if sum_raw > 30_000 {
+				qualifying_orders += 1;
+				rows.push(Q18Row {
+					c_name: c_name.clone(),
+					c_custkey: custkey,
+					o_orderkey: orderkey,
+					o_orderdate: orderdate,
+					o_totalprice_raw: totalprice_raw,
+					sum_raw,
+				});
+			} else {
+				threshold_fail_orders += 1;
+			}
+		}
+		rows.sort_by(|left, right| {
+			right
+				.o_totalprice_raw
+				.cmp(&left.o_totalprice_raw)
+				.then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
+				.then_with(|| left.o_orderkey.cmp(&right.o_orderkey))
+		});
+
+		Ok(Q18Oracle {
+			rows,
+			qualifying_orders,
+			threshold_fail_orders,
+			selected_lineitem_rows,
+		})
+	}
+
+	fn strict_q18_oracle_dense(scale_factor: f64) -> Result<Q18Oracle, String> {
+		q18_oracle_dense_from_rows(
+			CustomerGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|customer| (customer.c_custkey, customer.c_name.to_string())),
+			OrderGenerator::new(scale_factor, 1, 1).iter().map(|order| {
+				(
+					order.o_orderkey,
+					order.o_custkey,
+					order.o_orderdate.to_unix_epoch(),
+					order.o_totalprice.into_inner() as i128,
+				)
+			}),
+			LineItemGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|item| (item.l_orderkey, item.l_quantity as i128 * 100)),
+		)
+	}
+
+	fn frugal_from_vectors(
+		customers: Vec<(i64, String)>,
+		orders: Vec<(i64, i64, i32, i128)>,
+		lineitems: Vec<(i64, i128)>,
+	) -> Result<Q18Oracle, String> {
+		q18_oracle_frugal_from_rows(
+			customers.iter().map(|(custkey, _)| *custkey),
+			customers.clone(),
+			orders,
+			lineitems,
+		)
+	}
+
+	#[test]
+	fn frugal_matches_dense_at_supported_parity_scales() {
+		for scale_factor in [0.01, 1.0] {
+			let frugal = strict_q18_oracle(scale_factor).expect("frugal q18 oracle");
+			let dense = strict_q18_oracle_dense(scale_factor).expect("dense q18 oracle");
+			assert_eq!(frugal, dense, "q18 oracle drift at sf={scale_factor}");
+		}
+	}
+
+	#[test]
+	fn merge_preserves_all_dense_continue_cases_and_counters() {
+		let customers = vec![(1, "one".to_string()), (2, "two".to_string())];
+		let orders = vec![
+			(10, 1, 100, 1_000),
+			(20, 99, 101, 2_000),
+			(30, 2, 102, 3_000),
+			(40, 1, 103, 4_000),
+		];
+		let lineitems = vec![
+			(10, 10_000),
+			(10, 20_000),
+			(20, 31_000),
+			(40, 30_001),
+			(50, 500),
+		];
+		let frugal = frugal_from_vectors(customers.clone(), orders.clone(), lineitems.clone())
+			.expect("frugal edge oracle");
+		let dense =
+			q18_oracle_dense_from_rows(customers, orders, lineitems).expect("dense edge oracle");
+		assert_eq!(frugal, dense);
+		assert_eq!(frugal.qualifying_orders, 1);
+		assert_eq!(frugal.threshold_fail_orders, 1);
+		assert_eq!(frugal.selected_lineitem_rows, 5);
+		assert_eq!(frugal.rows.len(), 1);
+		assert_eq!(frugal.rows[0].o_orderkey, 40);
+		assert_eq!(frugal.rows[0].sum_raw, 30_001);
+	}
+
+	#[test]
+	fn final_group_is_flushed_and_contiguous_same_key_rows_succeed() {
+		let oracle = frugal_from_vectors(
+			vec![(1, "one".to_string())],
+			vec![(7, 1, 100, 1_000)],
+			vec![(7, 15_000), (7, 15_001)],
+		)
+		.expect("one-group q18 oracle");
+		assert_eq!(oracle.selected_lineitem_rows, 2);
+		assert_eq!(oracle.qualifying_orders, 1);
+		assert_eq!(oracle.rows[0].sum_raw, 30_001);
+	}
+
+	#[test]
+	fn order_and_lineitem_invariants_fail_loudly() {
+		let customers = vec![(1, "one".to_string())];
+		let shuffled = frugal_from_vectors(
+			customers.clone(),
+			vec![(2, 1, 100, 1_000), (1, 1, 100, 1_000)],
+			Vec::new(),
+		)
+		.expect_err("shuffled orders must fail");
+		assert!(shuffled.contains("orders stream") && shuffled.contains("previous key 2"));
+
+		let duplicate = frugal_from_vectors(
+			customers.clone(),
+			vec![(1, 1, 100, 1_000), (1, 1, 100, 1_000)],
+			Vec::new(),
+		)
+		.expect_err("duplicate orders must fail");
+		assert!(duplicate.contains("orders stream") && duplicate.contains("current key 1"));
+
+		let reappearing = frugal_from_vectors(
+			customers,
+			vec![(1, 1, 100, 1_000), (2, 1, 100, 1_000)],
+			vec![(1, 10_000), (2, 10_000), (1, 10_000)],
+		)
+		.expect_err("reappearing lineitem group must fail");
+		assert!(
+			reappearing.contains("lineitem order stream")
+				&& reappearing.contains("previous group key 2")
+				&& reappearing.contains("current key 1")
+		);
+	}
+
+	#[test]
+	fn duplicate_or_missing_customer_names_fail_loudly() {
+		let duplicate = frugal_from_vectors(
+			vec![(1, "one".to_string()), (1, "again".to_string())],
+			Vec::new(),
+			Vec::new(),
+		)
+		.expect_err("duplicate customer membership must fail");
+		assert!(duplicate.contains("customer membership stream has duplicate key 1"));
+
+		let missing_name = q18_oracle_frugal_from_rows(
+			[1],
+			std::iter::empty(),
+			[(1, 1, 100, 1_000)],
+			[(1, 30_001)],
+		)
+		.expect_err("missing qualifying customer name must fail");
+		assert!(missing_name.contains("qualifying customer 1 is missing"));
+	}
+
+	#[test]
+	fn checked_quantity_and_counter_overflow_are_loud() {
+		let quantity = frugal_from_vectors(
+			vec![(1, "one".to_string())],
+			vec![(1, 1, 100, 1_000)],
+			vec![(1, i128::MAX), (1, 1)],
+		)
+		.expect_err("quantity overflow must fail");
+		assert!(quantity.contains("quantity overflow for orderkey 1"));
+
+		let mut counter = usize::MAX;
+		let counter_error = checked_q18_counter_increment(&mut counter, "synthetic")
+			.expect_err("counter overflow must fail");
+		assert_eq!(counter_error, "q18 synthetic counter overflow");
+	}
+
+	#[test]
+	fn frugal_oracle_retains_all_qualifying_rows_before_limit() {
+		let orders: Vec<_> = (1_i64..=101)
+			.map(|orderkey| (orderkey, 1, 100, orderkey as i128))
+			.collect();
+		let lineitems: Vec<_> = (1_i64..=101).map(|orderkey| (orderkey, 30_001)).collect();
+		let oracle = frugal_from_vectors(vec![(1, "one".to_string())], orders, lineitems)
+			.expect("101-row frugal oracle");
+		assert_eq!(oracle.rows.len(), 101);
+		assert_eq!(oracle.qualifying_orders, 101);
+	}
 }
 
 fn strict_q18_expected_schema() -> [(&'static str, DataType); 6] {

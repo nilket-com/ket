@@ -3505,6 +3505,19 @@ fn strict_q18_oracle_is_non_vacuous_at_default_scale() {
 }
 
 #[test]
+fn strict_q18_non_vacuity_guard_stays_armed() {
+	let oracle = Q18Oracle {
+		rows: Vec::new(),
+		qualifying_orders: 0,
+		threshold_fail_orders: 0,
+		selected_lineitem_rows: 0,
+	};
+	let error = compare_strict_q18(&[q18_batch(&[])], &oracle)
+		.expect_err("empty q18 oracle must be rejected");
+	assert!(error.contains("oracle non-vacuous guard failed"));
+}
+
+#[test]
 fn strict_q18_output_schema_is_asserted() {
 	assert!(
 		assert_strict_q18_schema(&[q18_batch(&[q18_row(
