@@ -1,5 +1,11 @@
 use super::*;
+use ahash::RandomState;
 
+const EMPTY_PRIMITIVE_INT64_SUM_BUCKET: u32 = u32::MAX;
+const PRIMITIVE_INT64_SUM_INITIAL_CAPACITY: usize = 1024;
+const PRIMITIVE_INT64_SUM_PRODUCER: &str = "primitive Int64 grouped SUM resident state";
+
+#[derive(Clone, Copy)]
 struct StreamingScanGlobalInput<'a> {
 	scan: &'a ExecutionPlan,
 	scan_filter_predicate: Option<&'a BoundExprProgram>,
@@ -15,9 +21,307 @@ impl StreamingScanGlobalInput<'_> {
 	}
 }
 
+#[derive(Clone, Copy)]
 struct StreamingScanGroupedInput<'a> {
 	scan_input: StreamingScanGlobalInput<'a>,
 	exchange: Option<(u32, &'a BoundExprProgram)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrimitiveInt64SumInput {
+	Int64,
+	Decimal128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrimitiveInt64SumSpec {
+	group_column: ColumnOrdinal,
+	value_column: ColumnOrdinal,
+	input: PrimitiveInt64SumInput,
+}
+
+struct PrimitiveInt64SumGroups {
+	buckets: Vec<u32>,
+	keys: Vec<i64>,
+	totals: Vec<i128>,
+	entry_limit: usize,
+	hasher: RandomState,
+	input_rows: u64,
+	peak_bytes: u64,
+	#[cfg(test)]
+	growth_count: u64,
+}
+
+impl PrimitiveInt64SumGroups {
+	fn new() -> Self {
+		Self {
+			buckets: Vec::new(),
+			keys: Vec::new(),
+			totals: Vec::new(),
+			entry_limit: 0,
+			hasher: RandomState::new(),
+			input_rows: 0,
+			peak_bytes: 0,
+			#[cfg(test)]
+			growth_count: 0,
+		}
+	}
+
+	fn insert(&mut self, key: i64, value: i128, cap: u64) -> Result<(), ExecutionError> {
+		self.input_rows = self.input_rows.saturating_add(1);
+		if let Some(entry) = self.lookup_entry(key)? {
+			self.totals[entry] =
+				self.totals[entry]
+					.checked_add(value)
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: "primitive Int64 grouped SUM overflow".to_string(),
+					})?;
+			return Ok(());
+		}
+		if self.keys.len() == self.entry_limit {
+			self.grow(cap)?;
+		}
+		let entry = u32::try_from(self.keys.len()).map_err(|_| ExecutionError::Kernel {
+			message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+		})?;
+		if entry == EMPTY_PRIMITIVE_INT64_SUM_BUCKET {
+			return Err(ExecutionError::Kernel {
+				message: "primitive Int64 grouped SUM exhausted the u32 entry domain".to_string(),
+			});
+		}
+		let bucket = Self::find_bucket_in(&self.hasher, &self.buckets, &self.keys, key)?;
+		let key_capacity = self.keys.capacity();
+		let total_capacity = self.totals.capacity();
+		self.keys.push(key);
+		self.totals.push(value);
+		debug_assert_eq!(self.keys.capacity(), key_capacity);
+		debug_assert_eq!(self.totals.capacity(), total_capacity);
+		self.buckets[bucket] = entry;
+		Ok(())
+	}
+
+	fn grow(&mut self, cap: u64) -> Result<(), ExecutionError> {
+		let target = if self.entry_limit == 0 {
+			PRIMITIVE_INT64_SUM_INITIAL_CAPACITY
+		} else {
+			self.entry_limit
+				.checked_mul(2)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "primitive Int64 grouped SUM capacity overflow".to_string(),
+				})?
+		};
+		if target >= EMPTY_PRIMITIVE_INT64_SUM_BUCKET as usize {
+			return Err(ExecutionError::Kernel {
+				message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+			});
+		}
+		let bucket_count = target
+			.checked_mul(2)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "primitive Int64 grouped SUM bucket capacity overflow".to_string(),
+			})?;
+
+		let old_bytes = self.accounted_bytes();
+		let requested_key_bytes = primitive_capacity_bytes::<i64>(target);
+		self.guard_peak(old_bytes.saturating_add(requested_key_bytes), cap)?;
+		let mut keys = Vec::new();
+		keys.try_reserve_exact(target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("primitive Int64 grouped SUM key allocation failed: {error}"),
+			})?;
+		let key_bytes = primitive_capacity_bytes::<i64>(keys.capacity());
+		self.guard_peak(old_bytes.saturating_add(key_bytes), cap)?;
+		keys.extend_from_slice(&self.keys);
+
+		let requested_total_bytes = primitive_capacity_bytes::<i128>(target);
+		self.guard_peak(
+			old_bytes
+				.saturating_add(key_bytes)
+				.saturating_add(requested_total_bytes),
+			cap,
+		)?;
+		let mut totals = Vec::new();
+		totals
+			.try_reserve_exact(target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("primitive Int64 grouped SUM state allocation failed: {error}"),
+			})?;
+		let total_bytes = primitive_capacity_bytes::<i128>(totals.capacity());
+		self.guard_peak(
+			old_bytes
+				.saturating_add(key_bytes)
+				.saturating_add(total_bytes),
+			cap,
+		)?;
+		totals.extend_from_slice(&self.totals);
+
+		let requested_bucket_bytes = primitive_capacity_bytes::<u32>(bucket_count);
+		self.guard_peak(
+			old_bytes
+				.saturating_add(key_bytes)
+				.saturating_add(total_bytes)
+				.saturating_add(requested_bucket_bytes),
+			cap,
+		)?;
+		let mut buckets = Vec::new();
+		buckets
+			.try_reserve_exact(bucket_count)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("primitive Int64 grouped SUM bucket allocation failed: {error}"),
+			})?;
+		let bucket_bytes = primitive_capacity_bytes::<u32>(buckets.capacity());
+		let peak = old_bytes
+			.saturating_add(key_bytes)
+			.saturating_add(total_bytes)
+			.saturating_add(bucket_bytes);
+		self.guard_peak(peak, cap)?;
+		buckets.resize(bucket_count, EMPTY_PRIMITIVE_INT64_SUM_BUCKET);
+		for (entry, key) in keys.iter().copied().enumerate() {
+			let bucket = Self::find_bucket_in(&self.hasher, &buckets, &keys, key)?;
+			buckets[bucket] = u32::try_from(entry).map_err(|_| ExecutionError::Kernel {
+				message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+			})?;
+		}
+
+		self.peak_bytes = self.peak_bytes.max(peak);
+		self.keys = keys;
+		self.totals = totals;
+		self.buckets = buckets;
+		self.entry_limit = target;
+		#[cfg(test)]
+		{
+			self.growth_count = self.growth_count.saturating_add(1);
+		}
+		Ok(())
+	}
+
+	fn lookup_entry(&self, key: i64) -> Result<Option<usize>, ExecutionError> {
+		if self.buckets.is_empty() {
+			return Ok(None);
+		}
+		let bucket = Self::find_bucket_in(&self.hasher, &self.buckets, &self.keys, key)?;
+		let entry = self.buckets[bucket];
+		Ok((entry != EMPTY_PRIMITIVE_INT64_SUM_BUCKET).then_some(entry as usize))
+	}
+
+	fn find_bucket_in(
+		hasher: &RandomState,
+		buckets: &[u32],
+		keys: &[i64],
+		key: i64,
+	) -> Result<usize, ExecutionError> {
+		if buckets.is_empty() || !buckets.len().is_power_of_two() {
+			return Err(ExecutionError::Kernel {
+				message: "primitive Int64 grouped SUM has invalid bucket capacity".to_string(),
+			});
+		}
+		let mut bucket = (hasher.hash_one(key) as usize) & (buckets.len() - 1);
+		for _ in 0..buckets.len() {
+			let entry = buckets[bucket];
+			if entry == EMPTY_PRIMITIVE_INT64_SUM_BUCKET
+				|| keys
+					.get(entry as usize)
+					.is_some_and(|candidate| *candidate == key)
+			{
+				return Ok(bucket);
+			}
+			bucket = (bucket + 1) & (buckets.len() - 1);
+		}
+		Err(ExecutionError::Kernel {
+			message: "primitive Int64 grouped SUM has no free bucket".to_string(),
+		})
+	}
+
+	fn guard_peak(&self, requested: u64, cap: u64) -> Result<(), ExecutionError> {
+		if requested > cap {
+			return Err(super::join::budget_exhausted(
+				BudgetDimension::Memory,
+				PRIMITIVE_INT64_SUM_PRODUCER,
+				requested,
+				cap,
+			));
+		}
+		Ok(())
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		primitive_capacity_bytes::<u32>(self.buckets.capacity())
+			.saturating_add(primitive_capacity_bytes::<i64>(self.keys.capacity()))
+			.saturating_add(primitive_capacity_bytes::<i128>(self.totals.capacity()))
+	}
+
+	fn finish(
+		self,
+		output_schema: &SchemaRef,
+		memory_cap: u64,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let output_cap = super::join::join_output_materialization_memory_cap(memory_cap);
+		let output_bytes = primitive_capacity_bytes::<i64>(self.keys.len()).saturating_add(
+			match output_schema.field(1).data_type() {
+				DataType::Int64 => primitive_capacity_bytes::<i64>(self.totals.len()),
+				DataType::Decimal128(_, _) => primitive_capacity_bytes::<i128>(self.totals.len()),
+				_ => u64::MAX,
+			},
+		);
+		if output_bytes > output_cap {
+			return Err(super::join::budget_exhausted(
+				BudgetDimension::Memory,
+				"primitive Int64 grouped SUM output",
+				output_bytes,
+				output_cap,
+			));
+		}
+		if matches!(output_schema.field(1).data_type(), DataType::Int64) {
+			let conversion_peak = self
+				.accounted_bytes()
+				.saturating_add(primitive_capacity_bytes::<i64>(self.totals.len()));
+			self.guard_peak(
+				conversion_peak,
+				super::join::join_spill_retained_footprint_memory_cap(memory_cap),
+			)?;
+		}
+		let PrimitiveInt64SumGroups {
+			buckets,
+			keys,
+			totals,
+			..
+		} = self;
+		drop(buckets);
+		let group_column = Arc::new(Int64Array::from(keys)) as ArrayRef;
+		let sum_column = match output_schema.field(1).data_type() {
+			DataType::Int64 => {
+				let values = totals
+					.into_iter()
+					.map(|value| {
+						i64::try_from(value).map_err(|_| ExecutionError::Kernel {
+							message: "integer SUM result does not fit Int64".to_string(),
+						})
+					})
+					.collect::<Result<Vec<_>, _>>()?;
+				Arc::new(Int64Array::from(values)) as ArrayRef
+			}
+			DataType::Decimal128(precision, scale) => Arc::new(
+				Decimal128Array::from(totals)
+					.with_precision_and_scale(*precision, *scale)
+					.map_err(|error| ExecutionError::Kernel {
+						message: error.to_string(),
+					})?,
+			) as ArrayRef,
+			data_type => {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("primitive Int64 grouped SUM cannot produce {data_type:?}"),
+				});
+			}
+		};
+		Ok(vec![RecordBatch::try_new(
+			output_schema.clone(),
+			vec![group_column, sum_column],
+		)?])
+	}
+}
+
+fn primitive_capacity_bytes<T>(capacity: usize) -> u64 {
+	u64::try_from(capacity.saturating_mul(std::mem::size_of::<T>())).unwrap_or(u64::MAX)
 }
 
 impl Executor {
@@ -183,6 +487,19 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
+		if let Some(spec) =
+			primitive_int64_sum_spec(&streaming_input, group_expr, aggr_expr, output_schema)
+		{
+			return self
+				.execute_primitive_int64_sum_grouped_scan(
+					&streaming_input,
+					spec,
+					output_schema,
+					morsel,
+				)
+				.await
+				.map(Some);
+		}
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.expect("streaming scan grouped aggregate input should build a ScanRequest");
@@ -237,6 +554,98 @@ impl Executor {
 
 		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
 			.map(Some)
+	}
+
+	async fn execute_primitive_int64_sum_grouped_scan(
+		&self,
+		streaming_input: &StreamingScanGroupedInput<'_>,
+		spec: PrimitiveInt64SumSpec,
+		output_schema: &SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let req = self
+			.bound_scan_request(streaming_input.scan_input.scan, morsel)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "primitive Int64 grouped SUM lost its scan request".to_string(),
+			})?;
+		let row_limit = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		let cap = super::join::join_spill_retained_footprint_memory_cap(
+			self.context.task_budget.memory.get(),
+		);
+		let started = Instant::now();
+		let mut rows = 0usize;
+		let mut groups = PrimitiveInt64SumGroups::new();
+		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			let Some(batch) = stream.next().await else {
+				break;
+			};
+			let batch = batch?;
+			let batch = if let Some(limit) = row_limit {
+				let remaining = limit - rows;
+				if batch.num_rows() > remaining {
+					batch.slice(0, remaining)
+				} else {
+					batch
+				}
+			} else {
+				batch
+			};
+			rows = rows.saturating_add(batch.num_rows());
+			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			let keys = batch
+				.column(spec.group_column.0 as usize)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "primitive grouped SUM key must be Int64".to_string(),
+				})?;
+			if keys.null_count() != 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: "primitive grouped SUM received a null key".to_string(),
+				});
+			}
+			match spec.input {
+				PrimitiveInt64SumInput::Int64 => {
+					let values = batch
+						.column(spec.value_column.0 as usize)
+						.as_any()
+						.downcast_ref::<Int64Array>()
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM input must be Int64".to_string(),
+						})?;
+					if values.null_count() != 0 {
+						return Err(ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM received a null input".to_string(),
+						});
+					}
+					for row in 0..batch.num_rows() {
+						groups.insert(keys.value(row), i128::from(values.value(row)), cap)?;
+					}
+				}
+				PrimitiveInt64SumInput::Decimal128 => {
+					let values = batch
+						.column(spec.value_column.0 as usize)
+						.as_any()
+						.downcast_ref::<Decimal128Array>()
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM input must be Decimal128".to_string(),
+						})?;
+					if values.null_count() != 0 {
+						return Err(ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM received a null input".to_string(),
+						});
+					}
+					for row in 0..batch.num_rows() {
+						groups.insert(keys.value(row), values.value(row), cap)?;
+					}
+				}
+			}
+		}
+		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
+		groups.finish(output_schema, self.context.task_budget.memory.get())
 	}
 
 	fn apply_streaming_scan_input_ops(
@@ -396,6 +805,87 @@ impl Executor {
 			}
 		}
 		Ok(())
+	}
+}
+
+fn primitive_int64_sum_spec(
+	input: &StreamingScanGroupedInput<'_>,
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	output_schema: &SchemaRef,
+) -> Option<PrimitiveInt64SumSpec> {
+	if input.scan_input.scan_filter_predicate.is_some()
+		|| input.scan_input.project_filter_predicate.is_some()
+	{
+		return None;
+	}
+	let (_, exchange_key) = input.exchange?;
+	if exchange_key != group_expr || aggr_expr.len() != 1 {
+		return None;
+	}
+	let call = &aggr_expr[0];
+	if call.function != AggregateFunction::Sum {
+		return None;
+	}
+	let group = group_expr.single_column_root()?;
+	let value = call.args.single_column_root()?;
+	let input_schema = input.scan_input.output_schema();
+	let group_field = input_schema.fields().get(group.ordinal.0 as usize)?;
+	let value_field = input_schema.fields().get(value.ordinal.0 as usize)?;
+	if group.data_type != DataType::Int64
+		|| group.nullable
+		|| group_field.data_type() != &DataType::Int64
+		|| group_field.is_nullable()
+		|| group.data_type != *group_field.data_type()
+		|| value.nullable
+		|| value.data_type != *value_field.data_type()
+		|| value.nullable != value_field.is_nullable()
+		|| output_schema.fields().len() != 2
+		|| output_schema.field(0).data_type() != &DataType::Int64
+		|| output_schema.field(0).is_nullable()
+	{
+		return None;
+	}
+	let input = match (&value.data_type, output_schema.field(1).data_type()) {
+		(DataType::Int64, DataType::Int64) => PrimitiveInt64SumInput::Int64,
+		(DataType::Decimal128(_, input_scale), DataType::Decimal128(_, output_scale))
+			if input_scale == output_scale =>
+		{
+			PrimitiveInt64SumInput::Decimal128
+		}
+		_ => return None,
+	};
+	Some(PrimitiveInt64SumSpec {
+		group_column: group.ordinal,
+		value_column: value.ordinal,
+		input,
+	})
+}
+
+fn record_primitive_int64_sum_profile(
+	groups: &PrimitiveInt64SumGroups,
+	cap: u64,
+	elapsed: std::time::Duration,
+) {
+	let Some(path) = std::env::var_os("TORON_PRIMITIVE_GROUPED_SUM_PROFILE_PATH") else {
+		return;
+	};
+	let path = std::path::PathBuf::from(path);
+	let temporary = path.with_extension("tmp");
+	let elapsed_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+	let contents = format!(
+		"input_rows={}\ngroups={}\nentry_capacity={}\nbucket_capacity={}\naccounted_bytes={}\npeak_bytes={}\ncap={}\nelapsed_micros={}\n",
+		groups.input_rows,
+		groups.keys.len(),
+		groups.keys.capacity(),
+		groups.buckets.capacity(),
+		groups.accounted_bytes(),
+		groups.peak_bytes,
+		cap,
+		elapsed_micros,
+	);
+	if std::fs::write(&temporary, contents).is_ok() {
+		let _ = std::fs::rename(temporary, path);
 	}
 }
 
@@ -2221,6 +2711,245 @@ fn group_type_error(data_type: &arrow::datatypes::DataType, value: &GroupValue) 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
+	use crate::storage::InMemoryStorageScan;
+	use arrow::datatypes::Field;
+
+	fn column_program(
+		name: &str,
+		ordinal: ColumnOrdinal,
+		data_type: DataType,
+		nullable: bool,
+	) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let column = builder.append_column(ResolvedColumn {
+			name: ColumnName(name.to_string()),
+			ordinal,
+			data_type,
+			nullable,
+			pbc_eligible: false,
+		});
+		builder.push_root(column);
+		builder.build()
+	}
+
+	#[test]
+	fn primitive_int64_sum_groups_are_compact_guarded_and_exact() {
+		let mut groups = PrimitiveInt64SumGroups::new();
+		let cap = 1024 * 1024;
+		for key in 0..1_025i64 {
+			groups.insert(key, i128::from(key), cap).expect("insert");
+		}
+		groups.insert(10, 5, cap).expect("duplicate sum");
+		groups.insert(i64::MIN, 7, cap).expect("full-domain key");
+		assert_eq!(groups.entry_limit, 2_048);
+		assert_eq!(groups.keys.len(), 1_026);
+		assert_eq!(groups.buckets.len(), 4_096);
+		assert_eq!(groups.accounted_bytes(), 65_536);
+		assert_eq!(groups.peak_bytes, 98_304);
+		assert_eq!(groups.growth_count, 2);
+		let ten = groups.lookup_entry(10).expect("lookup").expect("key 10");
+		assert_eq!(groups.totals[ten], 15);
+		assert!(
+			groups
+				.lookup_entry(99_999)
+				.expect("missing lookup")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn primitive_int64_sum_growth_guard_is_preallocation() {
+		let mut groups = PrimitiveInt64SumGroups::new();
+		let initial_bytes = primitive_capacity_bytes::<i64>(1024)
+			.saturating_add(primitive_capacity_bytes::<i128>(1024))
+			.saturating_add(primitive_capacity_bytes::<u32>(2048));
+		let error = groups
+			.insert(1, 2, initial_bytes - 1)
+			.expect_err("guard must reject the complete allocation");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: PRIMITIVE_INT64_SUM_PRODUCER,
+				..
+			}
+		));
+		assert!(groups.keys.is_empty());
+		assert!(groups.totals.is_empty());
+		assert!(groups.buckets.is_empty());
+	}
+
+	#[test]
+	fn primitive_int64_decimal_sum_matches_generic_grouped_fold() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("quantity", DataType::Decimal128(15, 2), false),
+		]));
+		let quantities = Decimal128Array::from(vec![100_i128, 200, 350, -50])
+			.with_precision_and_scale(15, 2)
+			.expect("decimal quantities");
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![2, 1, 2, i64::MIN])),
+				Arc::new(quantities),
+			],
+		)
+		.expect("input batch");
+		let group_expr = column_program("order_key", ColumnOrdinal(0), DataType::Int64, false);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: column_program(
+				"quantity",
+				ColumnOrdinal(1),
+				DataType::Decimal128(15, 2),
+				false,
+			),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("sum_quantity", DataType::Decimal128(25, 2), true),
+		]));
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let generic = executor
+			.bound_grouped_aggregate(&[batch.clone()], &group_expr, &aggr_expr, &output_schema)
+			.expect("generic grouped fold");
+		let mut primitive = PrimitiveInt64SumGroups::new();
+		let keys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let values = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			primitive
+				.insert(keys.value(row), values.value(row), 1024 * 1024)
+				.expect("primitive insert");
+		}
+		let primitive = primitive
+			.finish(&output_schema, 64 * 1024 * 1024)
+			.expect("primitive finish");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&primitive, SortPolicy::FullRowLex)
+				.expect("primitive digest"),
+			canonical_arrow_ipc_digest(&generic, SortPolicy::FullRowLex).expect("generic digest")
+		);
+	}
+
+	#[test]
+	fn primitive_int64_sum_int64_finalize_checks_output_range() {
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Int64, false),
+			Field::new("sum", DataType::Int64, true),
+		]));
+		let mut valid = PrimitiveInt64SumGroups::new();
+		valid.insert(1, 10, 1024 * 1024).expect("first value");
+		valid.insert(1, -3, 1024 * 1024).expect("second value");
+		let output = valid
+			.finish(&output_schema, 64 * 1024 * 1024)
+			.expect("valid Int64 output");
+		let sums = output[0]
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 sum");
+		assert_eq!(sums.value(0), 7);
+
+		let mut overflow = PrimitiveInt64SumGroups::new();
+		overflow
+			.insert(1, i128::from(i64::MAX) + 1, 1024 * 1024)
+			.expect("i128 accumulator accepts value");
+		assert!(overflow.finish(&output_schema, 64 * 1024 * 1024).is_err());
+	}
+
+	#[test]
+	fn primitive_int64_sum_selection_is_structural() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("quantity", DataType::Decimal128(15, 2), false),
+		]));
+		let scan = ExecutionPlan::EmptyRelation {
+			schema: schema.clone(),
+		};
+		let group_expr = column_program("order_key", ColumnOrdinal(0), DataType::Int64, false);
+		let args = column_program(
+			"quantity",
+			ColumnOrdinal(1),
+			DataType::Decimal128(15, 2),
+			false,
+		);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args,
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("sum_quantity", DataType::Decimal128(25, 2), true),
+		]));
+		let input = StreamingScanGroupedInput {
+			scan_input: StreamingScanGlobalInput {
+				scan: &scan,
+				scan_filter_predicate: None,
+				project: None,
+				project_filter_predicate: None,
+			},
+			exchange: Some((4, &group_expr)),
+		};
+		assert!(
+			primitive_int64_sum_spec(&input, &group_expr, &aggr_expr, &output_schema).is_some()
+		);
+		let nullable_group = column_program("order_key", ColumnOrdinal(0), DataType::Int64, true);
+		let nullable_input = StreamingScanGroupedInput {
+			scan_input: input.scan_input,
+			exchange: Some((4, &nullable_group)),
+		};
+		assert!(
+			primitive_int64_sum_spec(&nullable_input, &nullable_group, &aggr_expr, &output_schema)
+				.is_none()
+		);
+		let mut count = aggr_expr.clone();
+		count[0].function = AggregateFunction::Count;
+		assert!(primitive_int64_sum_spec(&input, &group_expr, &count, &output_schema).is_none());
+		let nullable_args = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: column_program(
+				"quantity",
+				ColumnOrdinal(1),
+				DataType::Decimal128(15, 2),
+				true,
+			),
+		}];
+		assert!(
+			primitive_int64_sum_spec(&input, &group_expr, &nullable_args, &output_schema).is_none()
+		);
+		let filtered_input = StreamingScanGroupedInput {
+			scan_input: StreamingScanGlobalInput {
+				scan_filter_predicate: Some(&group_expr),
+				..input.scan_input
+			},
+			exchange: input.exchange,
+		};
+		assert!(
+			primitive_int64_sum_spec(&filtered_input, &group_expr, &aggr_expr, &output_schema)
+				.is_none()
+		);
+		let no_exchange = StreamingScanGroupedInput {
+			scan_input: input.scan_input,
+			exchange: None,
+		};
+		assert!(
+			primitive_int64_sum_spec(&no_exchange, &group_expr, &aggr_expr, &output_schema)
+				.is_none()
+		);
+	}
 
 	// ADR 268: the decimal AVG finalize rescales to the widened output scale and divides half away from
 	// zero, in pure integer arithmetic. Pins the rounding sign (positive AND negative ties) and the
