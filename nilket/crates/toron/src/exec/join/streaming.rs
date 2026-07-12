@@ -55,6 +55,241 @@ impl MembershipScheduleReceipt {
 	}
 }
 
+const CHAIN_STAGE_PROFILE_ENV: &str = "TORON_CHAIN_STAGE_PROFILE_PATH";
+const CHAIN_STAGE_COUNT: usize = 7;
+
+#[derive(Clone, Copy)]
+enum ChainStage {
+	BaseScan = 0,
+	InnerReplay0 = 1,
+	InnerReplay1 = 2,
+	InnerReplay2 = 3,
+	SemiReplay3 = 4,
+	AntiReplay4 = 5,
+	GroupedFold = 6,
+}
+
+impl ChainStage {
+	const ALL: [Self; CHAIN_STAGE_COUNT] = [
+		Self::BaseScan,
+		Self::InnerReplay0,
+		Self::InnerReplay1,
+		Self::InnerReplay2,
+		Self::SemiReplay3,
+		Self::AntiReplay4,
+		Self::GroupedFold,
+	];
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::BaseScan => "base_scan",
+			Self::InnerReplay0 => "inner_replay_0",
+			Self::InnerReplay1 => "inner_replay_1",
+			Self::InnerReplay2 => "inner_replay_2",
+			Self::SemiReplay3 => "semi_replay_3",
+			Self::AntiReplay4 => "anti_replay_4",
+			Self::GroupedFold => "grouped_fold",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChainStageMeasurement {
+	micros: u64,
+	calls: u64,
+	batches: u64,
+	input_rows: u64,
+	output_rows: u64,
+}
+
+struct ChainStageProfiler {
+	path: PathBuf,
+	temporary: PathBuf,
+	started: Instant,
+	sequence: u64,
+	completed_base_batches: u64,
+	raw_base_rows: u64,
+	post_filter_base_rows: u64,
+	drive_completed: bool,
+	terminal_error: Option<String>,
+	stages: [ChainStageMeasurement; CHAIN_STAGE_COUNT],
+}
+
+impl ChainStageProfiler {
+	fn from_env() -> Option<Self> {
+		static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+		let path = PATH
+			.get_or_init(|| std::env::var_os(CHAIN_STAGE_PROFILE_ENV).map(PathBuf::from))
+			.as_ref()?
+			.clone();
+		Some(Self::at_path(path))
+	}
+
+	fn at_path(path: PathBuf) -> Self {
+		let temporary = path.with_extension("tmp");
+		Self {
+			path,
+			temporary,
+			started: Instant::now(),
+			sequence: 0,
+			completed_base_batches: 0,
+			raw_base_rows: 0,
+			post_filter_base_rows: 0,
+			drive_completed: false,
+			terminal_error: None,
+			stages: [ChainStageMeasurement::default(); CHAIN_STAGE_COUNT],
+		}
+	}
+
+	fn add_micros(&mut self, stage: ChainStage, micros: u64) -> Result<(), ExecutionError> {
+		let measurement = &mut self.stages[stage as usize];
+		measurement.micros =
+			measurement
+				.micros
+				.checked_add(micros)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile duration overflow".to_string(),
+				})?;
+		Ok(())
+	}
+
+	fn add_elapsed(&mut self, stage: ChainStage, started: Instant) -> Result<(), ExecutionError> {
+		self.add_micros(stage, duration_micros(started))
+	}
+
+	fn add_flow(
+		&mut self,
+		stage: ChainStage,
+		calls: u64,
+		batches: u64,
+		input_rows: u64,
+		output_rows: u64,
+	) -> Result<(), ExecutionError> {
+		let measurement = &mut self.stages[stage as usize];
+		measurement.calls =
+			measurement
+				.calls
+				.checked_add(calls)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile call count overflow".to_string(),
+				})?;
+		measurement.batches =
+			measurement
+				.batches
+				.checked_add(batches)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile batch count overflow".to_string(),
+				})?;
+		measurement.input_rows =
+			measurement
+				.input_rows
+				.checked_add(input_rows)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile input row count overflow".to_string(),
+				})?;
+		measurement.output_rows = measurement
+			.output_rows
+			.checked_add(output_rows)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage profile output row count overflow".to_string(),
+			})?;
+		Ok(())
+	}
+
+	fn complete_base_batch(
+		&mut self,
+		raw_rows: u64,
+		post_filter_rows: u64,
+	) -> Result<(), ExecutionError> {
+		self.completed_base_batches =
+			self.completed_base_batches
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile completed batch count overflow".to_string(),
+				})?;
+		self.raw_base_rows =
+			self.raw_base_rows
+				.checked_add(raw_rows)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile raw row count overflow".to_string(),
+				})?;
+		self.post_filter_base_rows = self
+			.post_filter_base_rows
+			.checked_add(post_filter_rows)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage profile filtered row count overflow".to_string(),
+			})?;
+		Ok(())
+	}
+
+	fn snapshot_value(&self, total_drive_micros: u64) -> Result<serde_json::Value, ExecutionError> {
+		let stage_micros = self.stages.iter().try_fold(0u64, |total, stage| {
+			total
+				.checked_add(stage.micros)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage profile duration sum overflow".to_string(),
+				})
+		})?;
+		let unattributed_residual_micros = total_drive_micros
+			.checked_sub(stage_micros)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: format!(
+					"chain stage profile timers exceed total: stages={stage_micros} total={total_drive_micros}"
+				),
+			})?;
+		let stages = ChainStage::ALL
+			.iter()
+			.map(|stage| {
+				let measurement = self.stages[*stage as usize];
+				serde_json::json!({
+					"stage": stage.name(),
+					"micros": measurement.micros,
+					"calls": measurement.calls,
+					"batches": measurement.batches,
+					"input_rows": measurement.input_rows,
+					"output_rows": measurement.output_rows,
+				})
+			})
+			.collect::<Vec<_>>();
+		Ok(serde_json::json!({
+			"sequence": self.sequence,
+			"completed_base_batches": self.completed_base_batches,
+			"raw_base_rows": self.raw_base_rows,
+			"post_filter_base_rows": self.post_filter_base_rows,
+			"drive_completed": self.drive_completed,
+			"terminal_error": self.terminal_error,
+			"total_drive_micros": total_drive_micros,
+			"unattributed_residual_micros": unattributed_residual_micros,
+			"stages": stages,
+		}))
+	}
+
+	fn flush(&mut self) -> Result<(), ExecutionError> {
+		let value = self.snapshot_value(duration_micros(self.started))?;
+		let contents =
+			serde_json::to_vec_pretty(&value).map_err(|error| ExecutionError::Kernel {
+				message: format!("chain stage profile serialization failed: {error}"),
+			})?;
+		std::fs::write(&self.temporary, contents).map_err(|error| ExecutionError::Kernel {
+			message: format!("chain stage profile snapshot write failed: {error}"),
+		})?;
+		std::fs::rename(&self.temporary, &self.path).map_err(|error| ExecutionError::Kernel {
+			message: format!("chain stage profile snapshot rename failed: {error}"),
+		})?;
+		self.sequence = self
+			.sequence
+			.checked_add(1)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage profile sequence overflow".to_string(),
+			})?;
+		Ok(())
+	}
+
+	fn mark_terminal_error(&mut self, error: &ExecutionError) {
+		self.terminal_error = Some(error.to_string());
+	}
+}
+
 struct Int64PresenceSet {
 	buckets: Vec<u32>,
 	entries: Vec<i64>,
@@ -10986,118 +11221,336 @@ impl Executor {
 		};
 		let mut remaining = req.row_limit;
 		let span = crate::telemetry::storage_scan_span(&req);
-		let mut stream = self
-			.storage
-			.scan(req)
-			.instrument(span)
-			.await?
-			.into_batches();
+		let mut stage_profile = ChainStageProfiler::from_env();
+		if let Some(profile) = stage_profile.as_mut() {
+			profile.flush()?;
+		}
+		let scan_started = stage_profile.as_ref().map(|_| Instant::now());
+		let scan_result: Result<_, ExecutionError> = async {
+			Ok(self
+				.storage
+				.scan(req)
+				.instrument(span)
+				.await?
+				.into_batches())
+		}
+		.await;
+		if let (Some(profile), Some(started)) = (stage_profile.as_mut(), scan_started) {
+			profile.add_elapsed(ChainStage::BaseScan, started)?;
+		}
+		let mut stream = match scan_result {
+			Ok(stream) => stream,
+			Err(error) => {
+				if let Some(profile) = stage_profile.as_mut() {
+					profile.mark_terminal_error(&error);
+					let _ = profile.flush();
+				}
+				return Err(error);
+			}
+		};
 		let probe_started = Instant::now();
 		let mut probe_rows = 0u64;
 		let mut output_rows = 0u64;
-		while let Some(batch) = stream.next().await {
-			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
-				break;
-			};
-			if let Some(predicate) = scan_input.filter_predicate {
-				right_batch = self.filter_batch_with_bound_predicate(
-					predicate,
-					right_batch,
-					"filter predicate",
-				)?;
-				if right_batch.num_rows() == 0 {
-					continue;
-				}
-			}
-			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
-			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
-			let selection = probe_in_memory_join_rows(
-				JoinKind::Inner,
-				join_key_plan,
-				&build_rows,
-				left_batch.num_rows(),
-				&right_key_arrays,
-				right_batch.num_rows(),
-				match_filter.as_ref(),
-				&left_batch,
-				&right_batch,
-				*null_safe_keys,
-			)?;
-			output_rows = output_rows.saturating_add(selection.len() as u64);
-
-			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
-				let batch = materialize_join_selection(
-					JoinKind::Inner,
-					&left_batch,
-					&right_batch,
-					chunk,
-					join0_output_schema,
-					self.context.task_budget.memory.get(),
-				)?;
-				let batch = if let Some(join0_filter) = join0_filter {
-					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
-				} else {
-					batch
+		let drive_result: Result<(), ExecutionError> = async {
+			loop {
+				let base_started = stage_profile.as_ref().map(|_| Instant::now());
+				let next_batch = stream.next().await;
+				let Some(batch) = next_batch else {
+					if let (Some(profile), Some(started)) = (stage_profile.as_mut(), base_started) {
+						profile.add_elapsed(ChainStage::BaseScan, started)?;
+					}
+					break;
 				};
-				if batch.num_rows() == 0 {
-					continue;
-				}
-				for (_partition, partitioned) in
-					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
-				{
-					if partitioned.num_rows() == 0 {
-						continue;
-					}
-					let mut batches = vec![partitioned];
-					for runtime in inner_runtimes.iter_mut() {
-						let mut next = Vec::new();
-						for batch in batches {
-							next.extend(
-								self.probe_reoriented_inner_join_streaming(runtime, &batch)
-									.await?,
-							);
-						}
-						batches = next;
-						if let Some(predicate) = runtime.post_filter {
-							let mut filtered = Vec::new();
-							for batch in batches {
-								let batch = self.filter_batch_with_bound_predicate(
-									predicate,
-									batch,
-									"filter predicate",
-								)?;
-								if batch.num_rows() > 0 {
-									filtered.push(batch);
-								}
-							}
-							batches = filtered;
-						}
-						if batches.is_empty() {
-							break;
-						}
-					}
-
-					let mut semi_batches = Vec::new();
-					for batch in batches {
-						semi_batches
-							.extend(self.probe_streaming_semi_anti(semi_runtime, &batch).await?);
-					}
-					let mut anti_batches = Vec::new();
-					for batch in semi_batches {
-						anti_batches
-							.extend(self.probe_streaming_semi_anti(anti_runtime, &batch).await?);
-					}
-					for batch in anti_batches {
-						self.fold_bound_grouped_aggregate_batch(
-							groups,
-							group_types,
-							group_expr,
-							aggr_expr,
-							&batch,
+				let base_result: Result<Option<(u64, RecordBatch)>, ExecutionError> = (|| {
+					let raw_batch = batch?;
+					let raw_rows = raw_batch.num_rows() as u64;
+					let Some(mut right_batch) =
+						limit_streaming_scan_batch(raw_batch, &mut remaining)
+					else {
+						return Ok(None);
+					};
+					if let Some(predicate) = scan_input.filter_predicate {
+						right_batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							right_batch,
+							"filter predicate",
 						)?;
 					}
+					Ok(Some((raw_rows, right_batch)))
+				})();
+				if let (Some(profile), Some(started)) = (stage_profile.as_mut(), base_started) {
+					profile.add_elapsed(ChainStage::BaseScan, started)?;
+				}
+				let Some((raw_rows, right_batch)) = base_result? else {
+					break;
+				};
+				let post_filter_rows = right_batch.num_rows() as u64;
+				if let Some(profile) = stage_profile.as_mut() {
+					profile.add_flow(ChainStage::BaseScan, 1, 1, raw_rows, post_filter_rows)?;
+				}
+
+				if right_batch.num_rows() == 0 {
+					if let Some(profile) = stage_profile.as_mut() {
+						profile.complete_base_batch(raw_rows, post_filter_rows)?;
+						profile.flush()?;
+					}
+					continue;
+				}
+				probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+				let replay0_started = stage_profile.as_ref().map(|_| Instant::now());
+				let selection_result: Result<_, ExecutionError> = (|| {
+					let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+					probe_in_memory_join_rows(
+						JoinKind::Inner,
+						join_key_plan,
+						&build_rows,
+						left_batch.num_rows(),
+						&right_key_arrays,
+						right_batch.num_rows(),
+						match_filter.as_ref(),
+						&left_batch,
+						&right_batch,
+						*null_safe_keys,
+					)
+				})();
+				if let (Some(profile), Some(started)) = (stage_profile.as_mut(), replay0_started) {
+					profile.add_elapsed(ChainStage::InnerReplay0, started)?;
+				}
+				let selection = selection_result?;
+				output_rows = output_rows.saturating_add(selection.len() as u64);
+				let mut replay0_output_rows = 0u64;
+				let mut replay0_output_batches = 0u64;
+
+				for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+					let replay0_started = stage_profile.as_ref().map(|_| Instant::now());
+					let partitioned_result: Result<_, ExecutionError> = (|| {
+						let batch = materialize_join_selection(
+							JoinKind::Inner,
+							&left_batch,
+							&right_batch,
+							chunk,
+							join0_output_schema,
+							self.context.task_budget.memory.get(),
+						)?;
+						let batch = if let Some(join0_filter) = join0_filter {
+							self.filter_batch_with_bound_predicate(
+								join0_filter,
+								batch,
+								"filter predicate",
+							)?
+						} else {
+							batch
+						};
+						if batch.num_rows() == 0 {
+							Ok(Vec::new())
+						} else {
+							self.repartition_exchange_batch(
+								&batch,
+								*partition_count,
+								base_exchange_key,
+							)
+						}
+					})();
+					if let (Some(profile), Some(started)) =
+						(stage_profile.as_mut(), replay0_started)
+					{
+						profile.add_elapsed(ChainStage::InnerReplay0, started)?;
+					}
+					let partitioned_batches = partitioned_result?;
+
+					for (_partition, partitioned) in partitioned_batches {
+						if partitioned.num_rows() == 0 {
+							continue;
+						}
+						replay0_output_rows =
+							replay0_output_rows.saturating_add(partitioned.num_rows() as u64);
+						replay0_output_batches = replay0_output_batches.saturating_add(1);
+						let mut batches = vec![partitioned];
+						for runtime in inner_runtimes.iter_mut() {
+							let stage = match runtime.replay_id {
+								JoinReplayId(1) => Some(ChainStage::InnerReplay1),
+								JoinReplayId(2) => Some(ChainStage::InnerReplay2),
+								_ => None,
+							};
+							let input_rows = batches
+								.iter()
+								.map(|batch| batch.num_rows() as u64)
+								.fold(0u64, u64::saturating_add);
+							let input_batches = batches.len() as u64;
+							let mut next = Vec::new();
+							for batch in batches {
+								let started = stage
+									.filter(|_| stage_profile.is_some())
+									.map(|_| Instant::now());
+								let probe_result = self
+									.probe_reoriented_inner_join_streaming(runtime, &batch)
+									.await;
+								if let (Some(profile), Some(stage), Some(started)) =
+									(stage_profile.as_mut(), stage, started)
+								{
+									profile.add_elapsed(stage, started)?;
+								}
+								next.extend(probe_result?);
+							}
+							batches = next;
+							if let Some(predicate) = runtime.post_filter {
+								let started = stage
+									.filter(|_| stage_profile.is_some())
+									.map(|_| Instant::now());
+								let filter_result: Result<_, ExecutionError> = (|| {
+									let mut filtered = Vec::new();
+									for batch in batches {
+										let batch = self.filter_batch_with_bound_predicate(
+											predicate,
+											batch,
+											"filter predicate",
+										)?;
+										if batch.num_rows() > 0 {
+											filtered.push(batch);
+										}
+									}
+									Ok(filtered)
+								})();
+								if let (Some(profile), Some(stage), Some(started)) =
+									(stage_profile.as_mut(), stage, started)
+								{
+									profile.add_elapsed(stage, started)?;
+								}
+								batches = filter_result?;
+							}
+							if let (Some(profile), Some(stage)) = (stage_profile.as_mut(), stage) {
+								let stage_output_rows = batches
+									.iter()
+									.map(|batch| batch.num_rows() as u64)
+									.fold(0u64, u64::saturating_add);
+								profile.add_flow(
+									stage,
+									input_batches,
+									batches.len() as u64,
+									input_rows,
+									stage_output_rows,
+								)?;
+							}
+							if batches.is_empty() {
+								break;
+							}
+						}
+
+						let semi_input_rows = batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						let semi_input_batches = batches.len() as u64;
+						let mut semi_batches = Vec::new();
+						for batch in batches {
+							let started = stage_profile.as_ref().map(|_| Instant::now());
+							let probe_result =
+								self.probe_streaming_semi_anti(semi_runtime, &batch).await;
+							if let (Some(profile), Some(started)) =
+								(stage_profile.as_mut(), started)
+							{
+								profile.add_elapsed(ChainStage::SemiReplay3, started)?;
+							}
+							semi_batches.extend(probe_result?);
+						}
+						if let Some(profile) = stage_profile.as_mut() {
+							let semi_output_rows = semi_batches
+								.iter()
+								.map(|batch| batch.num_rows() as u64)
+								.fold(0u64, u64::saturating_add);
+							profile.add_flow(
+								ChainStage::SemiReplay3,
+								semi_input_batches,
+								semi_batches.len() as u64,
+								semi_input_rows,
+								semi_output_rows,
+							)?;
+						}
+
+						let anti_input_rows = semi_batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						let anti_input_batches = semi_batches.len() as u64;
+						let mut anti_batches = Vec::new();
+						for batch in semi_batches {
+							let started = stage_profile.as_ref().map(|_| Instant::now());
+							let probe_result =
+								self.probe_streaming_semi_anti(anti_runtime, &batch).await;
+							if let (Some(profile), Some(started)) =
+								(stage_profile.as_mut(), started)
+							{
+								profile.add_elapsed(ChainStage::AntiReplay4, started)?;
+							}
+							anti_batches.extend(probe_result?);
+						}
+						if let Some(profile) = stage_profile.as_mut() {
+							let anti_output_rows = anti_batches
+								.iter()
+								.map(|batch| batch.num_rows() as u64)
+								.fold(0u64, u64::saturating_add);
+							profile.add_flow(
+								ChainStage::AntiReplay4,
+								anti_input_batches,
+								anti_batches.len() as u64,
+								anti_input_rows,
+								anti_output_rows,
+							)?;
+						}
+
+						for batch in anti_batches {
+							let fold_rows = batch.num_rows() as u64;
+							let started = stage_profile.as_ref().map(|_| Instant::now());
+							let fold_result = self.fold_bound_grouped_aggregate_batch(
+								groups,
+								group_types,
+								group_expr,
+								aggr_expr,
+								&batch,
+							);
+							if let (Some(profile), Some(started)) =
+								(stage_profile.as_mut(), started)
+							{
+								profile.add_elapsed(ChainStage::GroupedFold, started)?;
+							}
+							fold_result?;
+							if let Some(profile) = stage_profile.as_mut() {
+								profile.add_flow(
+									ChainStage::GroupedFold,
+									1,
+									1,
+									fold_rows,
+									fold_rows,
+								)?;
+							}
+						}
+					}
+				}
+				if let Some(profile) = stage_profile.as_mut() {
+					profile.add_flow(
+						ChainStage::InnerReplay0,
+						1,
+						replay0_output_batches,
+						post_filter_rows,
+						replay0_output_rows,
+					)?;
+					profile.complete_base_batch(raw_rows, post_filter_rows)?;
+					profile.flush()?;
 				}
 			}
+			Ok(())
+		}
+		.await;
+		if let Err(error) = drive_result {
+			if let Some(profile) = stage_profile.as_mut() {
+				profile.mark_terminal_error(&error);
+				let _ = profile.flush();
+			}
+			return Err(error);
+		}
+		if let Some(profile) = stage_profile.as_mut() {
+			profile.drive_completed = true;
+			profile.flush()?;
 		}
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.phases.probe_micros = task
@@ -17188,5 +17641,129 @@ mod tests {
 			.iter()
 			.map(|value| value.expect("non-null int64"))
 			.collect()
+	}
+
+	fn chain_stage_profile_test_path(label: &str) -> PathBuf {
+		static NEXT: AtomicU64 = AtomicU64::new(0);
+		std::env::temp_dir().join(format!(
+			"toron_chain_stage_profile_{}_{}_{}.json",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::SeqCst),
+			label,
+		))
+	}
+
+	#[test]
+	fn chain_stage_profile_snapshot_has_exact_exclusive_accounting() {
+		let path = chain_stage_profile_test_path("accounting");
+		let temporary = path.with_extension("tmp");
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(&temporary);
+		let mut profile = ChainStageProfiler::at_path(path.clone());
+		profile
+			.add_micros(ChainStage::BaseScan, 5)
+			.expect("base timing");
+		profile
+			.add_micros(ChainStage::InnerReplay0, 7)
+			.expect("replay timing");
+		profile
+			.add_flow(ChainStage::BaseScan, 1, 1, 10, 8)
+			.expect("base flow");
+		profile.complete_base_batch(10, 8).expect("completed batch");
+
+		let snapshot = profile.snapshot_value(20).expect("snapshot");
+		assert_eq!(snapshot["sequence"], 0);
+		assert_eq!(snapshot["completed_base_batches"], 1);
+		assert_eq!(snapshot["raw_base_rows"], 10);
+		assert_eq!(snapshot["post_filter_base_rows"], 8);
+		assert_eq!(snapshot["total_drive_micros"], 20);
+		assert_eq!(snapshot["unattributed_residual_micros"], 8);
+		assert_eq!(
+			snapshot["stages"].as_array().expect("stages").len(),
+			CHAIN_STAGE_COUNT
+		);
+		let sum = snapshot["stages"]
+			.as_array()
+			.expect("stages")
+			.iter()
+			.map(|stage| stage["micros"].as_u64().expect("stage micros"))
+			.sum::<u64>();
+		assert_eq!(
+			sum + snapshot["unattributed_residual_micros"]
+				.as_u64()
+				.expect("residual"),
+			20
+		);
+
+		let error = profile
+			.snapshot_value(11)
+			.expect_err("stage timers greater than total must fail");
+		assert!(error.to_string().contains("timers exceed total"));
+		let _ = std::fs::remove_file(path);
+		let _ = std::fs::remove_file(temporary);
+	}
+
+	#[test]
+	fn chain_stage_profile_atomic_snapshot_preserves_last_complete_value() {
+		let path = chain_stage_profile_test_path("atomic");
+		let temporary = path.with_extension("tmp");
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(&temporary);
+		let mut profile = ChainStageProfiler::at_path(path.clone());
+		profile.flush().expect("start snapshot");
+		let start: serde_json::Value =
+			serde_json::from_slice(&std::fs::read(&path).expect("read start snapshot"))
+				.expect("parse start snapshot");
+		assert_eq!(start["sequence"], 0);
+		assert_eq!(start["completed_base_batches"], 0);
+		assert_eq!(start["drive_completed"], false);
+
+		profile
+			.add_flow(ChainStage::BaseScan, 1, 1, 4, 3)
+			.expect("base flow");
+		profile.complete_base_batch(4, 3).expect("completed batch");
+		profile.flush().expect("batch snapshot");
+		let completed_bytes = std::fs::read(&path).expect("read batch snapshot");
+		let completed: serde_json::Value =
+			serde_json::from_slice(&completed_bytes).expect("parse batch snapshot");
+		assert_eq!(completed["sequence"], 1);
+		assert_eq!(completed["completed_base_batches"], 1);
+
+		std::fs::write(&temporary, b"{interrupted").expect("write interrupted temporary");
+		assert_eq!(
+			std::fs::read(&path).expect("read preserved snapshot"),
+			completed_bytes,
+			"an interrupted temporary write must not corrupt the last renamed snapshot"
+		);
+		let _ = std::fs::remove_file(path);
+		let _ = std::fs::remove_file(temporary);
+	}
+
+	#[test]
+	fn chain_stage_profile_snapshot_failures_are_labeled_and_loud() {
+		let parent = chain_stage_profile_test_path("missing_parent").with_extension("dir");
+		let _ = std::fs::remove_dir_all(&parent);
+		let mut profile = ChainStageProfiler::at_path(parent.join("profile.json"));
+		let error = profile.flush().expect_err("missing parent must fail");
+		assert!(
+			error
+				.to_string()
+				.contains("chain stage profile snapshot write failed")
+		);
+		assert!(!parent.exists());
+
+		std::fs::create_dir(&parent).expect("create profile parent");
+		let target = parent.join("profile.json");
+		std::fs::create_dir(&target).expect("create directory at target path");
+		let mut profile = ChainStageProfiler::at_path(target);
+		let error = profile
+			.flush()
+			.expect_err("directory target must fail rename");
+		assert!(
+			error
+				.to_string()
+				.contains("chain stage profile snapshot rename failed")
+		);
+		let _ = std::fs::remove_dir_all(parent);
 	}
 }
