@@ -1,6 +1,8 @@
 //! ADR 261/262 behavioral gates for the TPC-H reachability harness.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
@@ -10,16 +12,17 @@ use tpchgen::generators::{PartGenerator, PartSuppGenerator, SupplierGenerator};
 
 use toron_tpch::telemetry::{Phase, Status, reason_for_error, status_for_reason};
 use toron_tpch::{
-	ALL_QUERY_IDS, compare_strict_q21, matrix_from_log, parse_scale_factor,
-	q15_supplier_revenue_join_is_keyed, q18_grouped_membership_join_is_keyed,
-	q19_lineitem_part_join_is_keyed, q21_oracle_from_rows, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_strict_q1, run_strict_q02,
-	run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08,
-	run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14,
-	run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20,
-	run_strict_q21, run_strict_q22, status_rows,
+	ALL_QUERY_IDS, Q11_DEV_SQL, Q11Scale, build_perf_query_spec, build_persisted_perf_query_spec,
+	check_strict_q11, check_strict_query_with_data_source, compare_strict_q21, matrix_from_log,
+	parse_scale_factor, q11_sql, q15_supplier_revenue_join_is_keyed,
+	q18_grouped_membership_join_is_keyed, q19_lineitem_part_join_is_keyed, q21_oracle_from_rows,
+	run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07,
+	run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14,
+	run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21,
+	run_dev_q22, run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05,
+	run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11,
+	run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17,
+	run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22, status_rows,
 };
 
 #[tokio::test]
@@ -673,8 +676,8 @@ fn q15_executes_with_keyed_supplier_revenue_join() {
 		.expect("q15 thread panicked");
 }
 
-// ADR 321/325: q11's Decimal x Int multiply reaches execute, and exact decimal-point literals keep
-// the `* 0.0001` threshold from collapsing to zero.
+// ADR 321/325/422: q11's Decimal x Int multiply reaches execute and the scale-owned literal keeps
+// the FRACTION exact at the admitted scale.
 #[test]
 fn q11_executes_in_both_modes() {
 	std::thread::Builder::new()
@@ -695,13 +698,13 @@ fn q11_executes_in_both_modes() {
 				for (mode, attempt, expected_digest) in [
 					(
 						"dev",
-						run_dev_q11(0.01).await,
-						"ArrowIpcDigest([141, 153, 28, 87, 121, 125, 41, 87, 196, 108, 66, 183, 246, 64, 251, 53, 224, 42, 106, 104, 72, 158, 212, 10, 31, 9, 27, 35, 250, 79, 117, 208])",
+						run_dev_q11(0.01).await.expect("supported q11 scale"),
+						"ArrowIpcDigest([178, 34, 129, 170, 233, 64, 153, 218, 48, 245, 72, 236, 149, 7, 191, 36, 14, 51, 182, 71, 190, 206, 104, 222, 135, 246, 4, 94, 161, 89, 87, 140])",
 					),
 					(
 						"strict",
-						run_strict_q11(0.01).await,
-						"ArrowIpcDigest([220, 110, 59, 234, 8, 27, 172, 152, 253, 67, 152, 138, 28, 27, 41, 96, 151, 54, 204, 89, 217, 206, 178, 82, 239, 235, 73, 242, 121, 209, 65, 47])",
+						run_strict_q11(0.01).await.expect("supported q11 scale"),
+						"ArrowIpcDigest([201, 4, 26, 40, 73, 100, 188, 144, 117, 247, 19, 173, 137, 158, 222, 21, 181, 71, 171, 191, 115, 204, 213, 13, 222, 140, 97, 91, 228, 52, 95, 156])",
 					),
 				] {
 					assert_eq!(attempt.query, "q11");
@@ -1356,6 +1359,147 @@ fn sf_parsing_rejects_nonpositive_and_malformed() {
 			"--sf {bad:?} must be a usage error, not a silently-coerced scale"
 		);
 	}
+}
+
+#[test]
+fn q11_runtime_sql_is_owned_and_sf1_matches_the_golden_text() {
+	let sf1 = Q11Scale::try_from_f64(1.0).expect("supported q11 scale");
+	assert_eq!(q11_sql(sf1), Q11_DEV_SQL);
+
+	let q11 = build_perf_query_spec("q11", "strict", 0.01).expect("q11 memory spec");
+	assert!(
+		matches!(&q11.sql, Cow::Owned(_)),
+		"runtime q11 SQL is owned"
+	);
+	assert_eq!(
+		q11.sql,
+		q11_sql(Q11Scale::try_from_f64(0.01).expect("supported q11 scale"))
+	);
+	let root = std::env::temp_dir().join(format!("toron_tpch_adr422_sql_{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	let persisted =
+		build_persisted_perf_query_spec("q11", "strict", 0.01, &root).expect("q11 persisted spec");
+	assert!(matches!(&persisted.sql, Cow::Owned(_)));
+	assert_eq!(persisted.sql, q11.sql);
+	assert_eq!(persisted.export.sql, q11.sql);
+	let _ = std::fs::remove_dir_all(&root);
+
+	let q06 = build_perf_query_spec("q06", "strict", 0.01).expect("q06 memory spec");
+	assert!(
+		matches!(q06.sql, Cow::Borrowed(_)),
+		"non-q11 SQL remains borrowed"
+	);
+}
+
+#[tokio::test]
+async fn q11_unsupported_scale_rejects_before_library_io() {
+	let unsupported = 0.0001;
+	assert!(run_dev_q11(unsupported).await.is_err());
+	assert!(run_strict_q11(unsupported).await.is_err());
+	assert!(check_strict_q11(unsupported).await.is_err());
+	assert!(build_perf_query_spec("q11", "strict", unsupported).is_err());
+
+	let root =
+		std::env::temp_dir().join(format!("toron_tpch_adr422_reject_{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	assert!(build_persisted_perf_query_spec("q11", "strict", unsupported, &root).is_err());
+	assert!(
+		!root.exists(),
+		"persisted spec rejection must precede dataset preparation"
+	);
+	assert!(
+		check_strict_query_with_data_source("q11", unsupported, "parquet", &root)
+			.await
+			.is_err()
+	);
+	assert!(
+		!root.exists(),
+		"correctness rejection must precede persisted preparation"
+	);
+}
+
+#[test]
+fn q11_cli_rejections_are_exit2_without_telemetry_or_persisted_io() {
+	let root = std::env::temp_dir().join(format!("toron_tpch_adr422_cli_{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	std::fs::create_dir_all(&root).expect("create isolated CLI cwd");
+	let data_root = root.join("rejected_data");
+	let exe = env!("CARGO_BIN_EXE_toron-tpch");
+	let commands: Vec<Vec<String>> = vec![
+		vec![
+			"run", "--query", "q11", "--mode", "strict", "--sf", "0.0001",
+		]
+		.into_iter()
+		.map(str::to_string)
+		.collect(),
+		vec![
+			"correctness",
+			"--query",
+			"q11",
+			"--sf",
+			"0.0001",
+			"--data-source",
+			"memory",
+		]
+		.into_iter()
+		.map(str::to_string)
+		.collect(),
+		vec![
+			"perf-run-one",
+			"--query",
+			"q11",
+			"--mode",
+			"strict",
+			"--sf",
+			"0.0001",
+			"--data-source",
+			"memory",
+		]
+		.into_iter()
+		.map(str::to_string)
+		.collect(),
+		vec![
+			"perf-run-one".to_string(),
+			"--query".to_string(),
+			"q11".to_string(),
+			"--mode".to_string(),
+			"strict".to_string(),
+			"--sf".to_string(),
+			"0.0001".to_string(),
+			"--data-source".to_string(),
+			"parquet".to_string(),
+			"--data-dir".to_string(),
+			data_root.display().to_string(),
+		],
+	];
+	for args in commands {
+		let output = Command::new(exe)
+			.current_dir(&root)
+			.args(&args)
+			.output()
+			.expect("run toron-tpch rejection command");
+		assert_eq!(
+			output.status.code(),
+			Some(2),
+			"args={args:?} stdout={} stderr={}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert!(output.stdout.is_empty(), "args={args:?} emitted telemetry");
+		assert!(
+			String::from_utf8_lossy(&output.stderr)
+				.contains("q11 requires an exactly supported scale"),
+			"args={args:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+	assert!(!root.join("target/tpch/reachability.jsonl").exists());
+	assert!(!root.join("target/tpch/correctness.jsonl").exists());
+	assert!(
+		!data_root.exists(),
+		"unsupported persisted q11 prepared data"
+	);
+	let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

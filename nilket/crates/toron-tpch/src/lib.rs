@@ -8,6 +8,7 @@
 
 pub mod telemetry;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -312,8 +313,79 @@ pub const Q13_DEV_SQL: &str = "SELECT c_count, COUNT(*) AS custdist \
 /// strict q13 - identical SQL shape; q13 has no strict-only decimal surface.
 pub const STRICT_Q13_SQL: &str = Q13_DEV_SQL;
 
-/// ADR 314 - tpch.q11 (Important Stock Identification): official-shaped q11 with `:1` ->
-/// `GERMANY`, `:2` -> `0.0001`, and no LIMIT.
+const Q11_SQL_TEMPLATE: &str = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value \
+	FROM partsupp, supplier, nation \
+	WHERE ps_suppkey = s_suppkey \
+	  AND s_nationkey = n_nationkey \
+	  AND n_name = 'GERMANY' \
+	GROUP BY ps_partkey \
+	HAVING SUM(ps_supplycost * ps_availqty) > ( \
+	  SELECT SUM(ps_supplycost * ps_availqty) * [FRACTION] \
+	  FROM partsupp, supplier, nation \
+	  WHERE ps_suppkey = s_suppkey \
+	    AND s_nationkey = n_nationkey \
+	    AND n_name = 'GERMANY' \
+	) \
+	ORDER BY value DESC";
+
+/// The exact q11 scale contract shared by SQL rendering and the independent oracle.
+///
+/// Fields are deliberately private: the only way to construct a value is the bit-exact lookup,
+/// so the scale numerator and rendered decimal literal cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Q11Scale {
+	hundredths_n: i128,
+	fraction_sql: &'static str,
+}
+
+impl Q11Scale {
+	pub fn try_from_f64(scale_factor: f64) -> Result<Self, String> {
+		let scale = match scale_factor.to_bits() {
+			bits if bits == 0.01_f64.to_bits() => Self {
+				hundredths_n: 1,
+				fraction_sql: "0.01",
+			},
+			bits if bits == 1.0_f64.to_bits() => Self {
+				hundredths_n: 100,
+				fraction_sql: "0.0001",
+			},
+			bits if bits == 10.0_f64.to_bits() => Self {
+				hundredths_n: 1_000,
+				fraction_sql: "0.00001",
+			},
+			_ => {
+				return Err(format!(
+					"q11 requires an exactly supported scale (0.01, 1, or 10); got {scale_factor:?}"
+				));
+			}
+		};
+		Ok(scale)
+	}
+
+	pub fn hundredths_n(self) -> i128 {
+		self.hundredths_n
+	}
+
+	pub fn fraction_sql(self) -> &'static str {
+		self.fraction_sql
+	}
+}
+
+/// Render q11 from the same exact scale value consumed by the oracle.
+pub fn q11_sql(scale: Q11Scale) -> String {
+	debug_assert_eq!(Q11_SQL_TEMPLATE.matches("[FRACTION]").count(), 1);
+	Q11_SQL_TEMPLATE.replace("[FRACTION]", scale.fraction_sql())
+}
+
+fn validate_query_scale(query: &str, scale_factor: f64) -> Result<(), String> {
+	if query == "q11" {
+		Q11Scale::try_from_f64(scale_factor)?;
+	}
+	Ok(())
+}
+
+/// ADR 314 - tpch.q11 (Important Stock Identification): the sf=1 golden text with `:1` ->
+/// `GERMANY`, `:2` -> `0.0001`, and no LIMIT. Runtime q11 paths use [`q11_sql`].
 pub const Q11_DEV_SQL: &str = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value \
 	FROM partsupp, supplier, nation \
 	WHERE ps_suppkey = s_suppkey \
@@ -329,7 +401,7 @@ pub const Q11_DEV_SQL: &str = "SELECT ps_partkey, SUM(ps_supplycost * ps_availqt
 	) \
 	ORDER BY value DESC";
 
-/// strict q11 - identical SQL shape; strict mode carries official Decimal128 partsupp supply cost.
+/// strict q11 sf=1 golden text; strict mode carries official Decimal128 partsupp supply cost.
 pub const STRICT_Q11_SQL: &str = Q11_DEV_SQL;
 
 /// ADR 313 - tpch.q15 (Top Supplier): official-shaped q15 with `:1` -> `DATE '1996-01-01'`.
@@ -1777,7 +1849,7 @@ pub struct HarnessTable {
 /// The exact SQL + generated table fixtures used by the perf rail for one query/mode/scale.
 pub struct PerfQuerySpec {
 	pub query_id: &'static str,
-	pub sql: &'static str,
+	pub sql: Cow<'static, str>,
 	pub tables: Vec<HarnessTable>,
 }
 
@@ -1836,7 +1908,7 @@ pub struct HarnessTableMetadata {
 
 pub struct PersistedPerfQuerySpec {
 	pub query_id: &'static str,
-	pub sql: &'static str,
+	pub sql: Cow<'static, str>,
 	pub tables: Vec<HarnessTableMetadata>,
 	pub storage: Arc<ParquetHarnessScan>,
 	pub export: TpchParquetExport,
@@ -3536,7 +3608,7 @@ pub async fn rune_q03_isolation_proof_with_data_source(
 			)
 		})?;
 	let sql_logical = SqlPlanner::new()
-		.plan(sql)
+		.plan(&sql)
 		.map_err(|error| format!("plan SQL q03 for rune isolation proof failed: {error}"))?;
 	let rune_logical = rune_q03_logical_plan().await.map_err(|error| {
 		format!(
@@ -4268,7 +4340,7 @@ pub async fn run_perf_query(
 		scale_factor,
 		run_index,
 		warmup,
-		spec.sql,
+		&spec.sql,
 		spec.tables,
 	)
 	.await)
@@ -4293,7 +4365,7 @@ pub async fn run_perf_query_with_data_source(
 				scale_factor,
 				run_index,
 				warmup,
-				spec.sql,
+				&spec.sql,
 				spec.tables,
 				spec.storage,
 			)
@@ -4355,6 +4427,7 @@ pub async fn check_strict_query_with_data_source(
 	data_source: &str,
 	data_root: &Path,
 ) -> Result<CorrectnessAttempt, String> {
+	validate_query_scale(query, scale_factor)?;
 	if query == "q17" && (scale_factor - Q17_CORRECTNESS_SCALE).abs() > f64::EPSILON {
 		return Err(format!(
 			"q17_sf10_oracle_policy_gap: q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {scale_factor}"
@@ -4386,7 +4459,7 @@ async fn check_strict_query_memory(
 		"q08" | "q8" => check_strict_q08(scale_factor).await,
 		"q09" | "q9" => check_strict_q09(scale_factor).await,
 		"q10" => check_strict_q10(scale_factor).await,
-		"q11" => check_strict_q11(scale_factor).await,
+		"q11" => return check_strict_q11(scale_factor).await,
 		"q12" => check_strict_q12(scale_factor).await,
 		"q13" => check_strict_q13(scale_factor).await,
 		"q14" => check_strict_q14(scale_factor).await,
@@ -4421,7 +4494,7 @@ async fn check_strict_query_with_persisted_source(
 		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
 	};
 	let storage: Arc<dyn StorageScan> = spec.storage;
-	let batches = match execute_query_with_metadata_timed(spec.sql, spec.tables, storage).await {
+	let batches = match execute_query_with_metadata_timed(&spec.sql, spec.tables, storage).await {
 		Ok(execution) => execution.batches,
 		Err(StageError { phase, reason, .. }) => {
 			return Ok(outcome(phase, status_for_reason(&reason), Some(reason)));
@@ -4598,8 +4671,9 @@ pub fn build_persisted_perf_query_spec(
 		"dev" => false,
 		other => return Err(format!("perf --mode {other} is not supported")),
 	};
+	validate_query_scale(query, scale_factor)?;
+	let (query_id, sql) = perf_query_sql(query, strict, scale_factor)?;
 	let dataset = prepare_persisted_tpch_dataset(mode, scale_factor, root)?;
-	let (query_id, sql) = perf_query_sql(query, strict)?;
 	let table_names = persisted_query_table_names(query)?;
 	let tables = persisted_query_tables(&dataset, strict, &table_names)?;
 	let mut scan_tables = HashMap::new();
@@ -4675,6 +4749,7 @@ pub fn build_perf_query_spec(
 		"dev" => false,
 		other => return Err(format!("perf --mode {other} is not supported")),
 	};
+	validate_query_scale(query, scale_factor)?;
 	let (query_id, sql, tables) = perf_query_spec(query, strict, scale_factor)?;
 	Ok(PerfQuerySpec {
 		query_id,
@@ -4683,30 +4758,100 @@ pub fn build_perf_query_spec(
 	})
 }
 
-fn perf_query_sql(query: &str, strict: bool) -> Result<(&'static str, &'static str), String> {
+fn perf_query_sql(
+	query: &str,
+	strict: bool,
+	scale_factor: f64,
+) -> Result<(&'static str, Cow<'static, str>), String> {
 	let query_sql = match query {
-		"q01" | "q1" => ("q01", if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
-		"q06" | "q6" => ("q06", if strict { STRICT_Q6_SQL } else { Q6_DEV_SQL }),
-		"q02" | "q2" => ("q02", if strict { STRICT_Q2_SQL } else { Q2_DEV_SQL }),
-		"q03" | "q3" => ("q03", if strict { STRICT_Q3_SQL } else { Q3_DEV_SQL }),
-		"q04" | "q4" => ("q04", if strict { STRICT_Q4_SQL } else { Q4_DEV_SQL }),
-		"q05" | "q5" => ("q05", if strict { STRICT_Q5_SQL } else { Q5_DEV_SQL }),
-		"q07" | "q7" => ("q07", if strict { STRICT_Q7_SQL } else { Q7_DEV_SQL }),
-		"q08" | "q8" => ("q08", if strict { STRICT_Q8_SQL } else { Q8_DEV_SQL }),
-		"q09" | "q9" => ("q09", if strict { STRICT_Q9_SQL } else { Q9_DEV_SQL }),
-		"q10" => ("q10", if strict { STRICT_Q10_SQL } else { Q10_DEV_SQL }),
-		"q11" => ("q11", if strict { STRICT_Q11_SQL } else { Q11_DEV_SQL }),
-		"q12" => ("q12", if strict { STRICT_Q12_SQL } else { Q12_DEV_SQL }),
-		"q13" => ("q13", if strict { STRICT_Q13_SQL } else { Q13_DEV_SQL }),
-		"q14" => ("q14", if strict { STRICT_Q14_SQL } else { Q14_DEV_SQL }),
-		"q15" => ("q15", if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL }),
-		"q16" => ("q16", if strict { STRICT_Q16_SQL } else { Q16_DEV_SQL }),
-		"q17" => ("q17", if strict { STRICT_Q17_SQL } else { Q17_DEV_SQL }),
-		"q18" => ("q18", if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL }),
-		"q19" => ("q19", if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL }),
-		"q20" => ("q20", if strict { STRICT_Q20_SQL } else { Q20_DEV_SQL }),
-		"q21" => ("q21", if strict { STRICT_Q21_SQL } else { Q21_DEV_SQL }),
-		"q22" => ("q22", if strict { STRICT_Q22_SQL } else { Q22_DEV_SQL }),
+		"q01" | "q1" => (
+			"q01",
+			Cow::Borrowed(if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
+		),
+		"q06" | "q6" => (
+			"q06",
+			Cow::Borrowed(if strict { STRICT_Q6_SQL } else { Q6_DEV_SQL }),
+		),
+		"q02" | "q2" => (
+			"q02",
+			Cow::Borrowed(if strict { STRICT_Q2_SQL } else { Q2_DEV_SQL }),
+		),
+		"q03" | "q3" => (
+			"q03",
+			Cow::Borrowed(if strict { STRICT_Q3_SQL } else { Q3_DEV_SQL }),
+		),
+		"q04" | "q4" => (
+			"q04",
+			Cow::Borrowed(if strict { STRICT_Q4_SQL } else { Q4_DEV_SQL }),
+		),
+		"q05" | "q5" => (
+			"q05",
+			Cow::Borrowed(if strict { STRICT_Q5_SQL } else { Q5_DEV_SQL }),
+		),
+		"q07" | "q7" => (
+			"q07",
+			Cow::Borrowed(if strict { STRICT_Q7_SQL } else { Q7_DEV_SQL }),
+		),
+		"q08" | "q8" => (
+			"q08",
+			Cow::Borrowed(if strict { STRICT_Q8_SQL } else { Q8_DEV_SQL }),
+		),
+		"q09" | "q9" => (
+			"q09",
+			Cow::Borrowed(if strict { STRICT_Q9_SQL } else { Q9_DEV_SQL }),
+		),
+		"q10" => (
+			"q10",
+			Cow::Borrowed(if strict { STRICT_Q10_SQL } else { Q10_DEV_SQL }),
+		),
+		"q11" => (
+			"q11",
+			Cow::Owned(q11_sql(Q11Scale::try_from_f64(scale_factor)?)),
+		),
+		"q12" => (
+			"q12",
+			Cow::Borrowed(if strict { STRICT_Q12_SQL } else { Q12_DEV_SQL }),
+		),
+		"q13" => (
+			"q13",
+			Cow::Borrowed(if strict { STRICT_Q13_SQL } else { Q13_DEV_SQL }),
+		),
+		"q14" => (
+			"q14",
+			Cow::Borrowed(if strict { STRICT_Q14_SQL } else { Q14_DEV_SQL }),
+		),
+		"q15" => (
+			"q15",
+			Cow::Borrowed(if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL }),
+		),
+		"q16" => (
+			"q16",
+			Cow::Borrowed(if strict { STRICT_Q16_SQL } else { Q16_DEV_SQL }),
+		),
+		"q17" => (
+			"q17",
+			Cow::Borrowed(if strict { STRICT_Q17_SQL } else { Q17_DEV_SQL }),
+		),
+		"q18" => (
+			"q18",
+			Cow::Borrowed(if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL }),
+		),
+		"q19" => (
+			"q19",
+			Cow::Borrowed(if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL }),
+		),
+		"q20" => (
+			"q20",
+			Cow::Borrowed(if strict { STRICT_Q20_SQL } else { Q20_DEV_SQL }),
+		),
+		"q21" => (
+			"q21",
+			Cow::Borrowed(if strict { STRICT_Q21_SQL } else { Q21_DEV_SQL }),
+		),
+		"q22" => (
+			"q22",
+			Cow::Borrowed(if strict { STRICT_Q22_SQL } else { Q22_DEV_SQL }),
+		),
 		other => return Err(format!("perf --query {other} is not supported")),
 	};
 	Ok(query_sql)
@@ -4716,8 +4861,9 @@ fn perf_query_spec(
 	query: &str,
 	strict: bool,
 	scale_factor: f64,
-) -> Result<(&'static str, &'static str, Vec<HarnessTable>), String> {
-	let one_lineitem_table = |query_id, sql: &'static str| {
+) -> Result<(&'static str, Cow<'static, str>, Vec<HarnessTable>), String> {
+	let (query_id, sql) = perf_query_sql(query, strict, scale_factor)?;
+	let one_lineitem_table = || {
 		let batch = if strict {
 			generate_strict_lineitem(scale_factor)
 		} else {
@@ -4728,123 +4874,39 @@ fn perf_query_spec(
 		} else {
 			dev_lineitem_descriptor(dev_lineitem_schema().as_ref())
 		};
-		Ok((
-			query_id,
-			sql,
-			vec![HarnessTable {
-				id: TableId(1),
-				name: "lineitem",
-				descriptor,
-				batch,
-				facts: TableOptimizerFacts::default(),
-			}],
-		))
+		vec![HarnessTable {
+			id: TableId(1),
+			name: "lineitem",
+			descriptor,
+			batch,
+			facts: TableOptimizerFacts::default(),
+		}]
 	};
-	match query {
-		"q01" | "q1" => one_lineitem_table("q01", if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
-		"q06" | "q6" => one_lineitem_table("q06", if strict { STRICT_Q6_SQL } else { Q6_DEV_SQL }),
-		"q02" | "q2" => Ok((
-			"q02",
-			if strict { STRICT_Q2_SQL } else { Q2_DEV_SQL },
-			q02_tables(strict, scale_factor),
-		)),
-		"q03" | "q3" => Ok((
-			"q03",
-			if strict { STRICT_Q3_SQL } else { Q3_DEV_SQL },
-			q03_tables(strict, scale_factor),
-		)),
-		"q04" | "q4" => Ok((
-			"q04",
-			if strict { STRICT_Q4_SQL } else { Q4_DEV_SQL },
-			q04_tables(strict, scale_factor),
-		)),
-		"q05" | "q5" => Ok((
-			"q05",
-			if strict { STRICT_Q5_SQL } else { Q5_DEV_SQL },
-			q05_tables(strict, scale_factor),
-		)),
-		"q07" | "q7" => Ok((
-			"q07",
-			if strict { STRICT_Q7_SQL } else { Q7_DEV_SQL },
-			q07_tables(strict, scale_factor),
-		)),
-		"q08" | "q8" => Ok((
-			"q08",
-			if strict { STRICT_Q8_SQL } else { Q8_DEV_SQL },
-			q08_tables(strict, scale_factor),
-		)),
-		"q09" | "q9" => Ok((
-			"q09",
-			if strict { STRICT_Q9_SQL } else { Q9_DEV_SQL },
-			q09_tables(strict, scale_factor),
-		)),
-		"q10" => Ok((
-			"q10",
-			if strict { STRICT_Q10_SQL } else { Q10_DEV_SQL },
-			q10_tables(strict, scale_factor),
-		)),
-		"q11" => Ok((
-			"q11",
-			if strict { STRICT_Q11_SQL } else { Q11_DEV_SQL },
-			q11_tables(strict, scale_factor),
-		)),
-		"q12" => Ok((
-			"q12",
-			if strict { STRICT_Q12_SQL } else { Q12_DEV_SQL },
-			q12_tables(strict, scale_factor),
-		)),
-		"q13" => Ok((
-			"q13",
-			if strict { STRICT_Q13_SQL } else { Q13_DEV_SQL },
-			q13_tables(strict, scale_factor),
-		)),
-		"q14" => Ok((
-			"q14",
-			if strict { STRICT_Q14_SQL } else { Q14_DEV_SQL },
-			q14_tables(strict, scale_factor),
-		)),
-		"q15" => Ok((
-			"q15",
-			if strict { STRICT_Q15_SQL } else { Q15_DEV_SQL },
-			q15_tables(strict, scale_factor),
-		)),
-		"q16" => Ok((
-			"q16",
-			if strict { STRICT_Q16_SQL } else { Q16_DEV_SQL },
-			q16_tables(strict, scale_factor),
-		)),
-		"q17" => Ok((
-			"q17",
-			if strict { STRICT_Q17_SQL } else { Q17_DEV_SQL },
-			q17_tables(strict, scale_factor),
-		)),
-		"q18" => Ok((
-			"q18",
-			if strict { STRICT_Q18_SQL } else { Q18_DEV_SQL },
-			q18_tables(strict, scale_factor),
-		)),
-		"q19" => Ok((
-			"q19",
-			if strict { STRICT_Q19_SQL } else { Q19_DEV_SQL },
-			q19_tables(strict, scale_factor),
-		)),
-		"q20" => Ok((
-			"q20",
-			if strict { STRICT_Q20_SQL } else { Q20_DEV_SQL },
-			q20_tables(strict, scale_factor),
-		)),
-		"q21" => Ok((
-			"q21",
-			if strict { STRICT_Q21_SQL } else { Q21_DEV_SQL },
-			q21_tables(strict, scale_factor),
-		)),
-		"q22" => Ok((
-			"q22",
-			if strict { STRICT_Q22_SQL } else { Q22_DEV_SQL },
-			q22_tables(strict, scale_factor),
-		)),
-		other => Err(format!("perf --query {other} is not supported")),
-	}
+	let tables = match query {
+		"q01" | "q1" | "q06" | "q6" => one_lineitem_table(),
+		"q02" | "q2" => q02_tables(strict, scale_factor),
+		"q03" | "q3" => q03_tables(strict, scale_factor),
+		"q04" | "q4" => q04_tables(strict, scale_factor),
+		"q05" | "q5" => q05_tables(strict, scale_factor),
+		"q07" | "q7" => q07_tables(strict, scale_factor),
+		"q08" | "q8" => q08_tables(strict, scale_factor),
+		"q09" | "q9" => q09_tables(strict, scale_factor),
+		"q10" => q10_tables(strict, scale_factor),
+		"q11" => q11_tables(strict, scale_factor),
+		"q12" => q12_tables(strict, scale_factor),
+		"q13" => q13_tables(strict, scale_factor),
+		"q14" => q14_tables(strict, scale_factor),
+		"q15" => q15_tables(strict, scale_factor),
+		"q16" => q16_tables(strict, scale_factor),
+		"q17" => q17_tables(strict, scale_factor),
+		"q18" => q18_tables(strict, scale_factor),
+		"q19" => q19_tables(strict, scale_factor),
+		"q20" => q20_tables(strict, scale_factor),
+		"q21" => q21_tables(strict, scale_factor),
+		"q22" => q22_tables(strict, scale_factor),
+		other => return Err(format!("perf --query {other} is not supported")),
+	};
+	Ok((query_id, sql, tables))
 }
 
 /// Dev Q6: the `Float64` proxy. A `pass` means the shape reached `execute` (reachability), not TPC-H
@@ -7107,9 +7169,16 @@ pub struct Q11Oracle {
 	pub threshold_failed_partkeys: BTreeSet<i64>,
 }
 
-pub fn q11_threshold_passes(value_raw: i128, global_value_raw: i128) -> Result<bool, String> {
+pub fn q11_threshold_passes(
+	value_raw: i128,
+	global_value_raw: i128,
+	scale: Q11Scale,
+) -> Result<bool, String> {
+	let multiplier = 100_i128
+		.checked_mul(scale.hundredths_n())
+		.ok_or_else(|| "q11 threshold comparison overflow".to_string())?;
 	let scaled_value = value_raw
-		.checked_mul(10_000)
+		.checked_mul(multiplier)
 		.ok_or_else(|| "q11 threshold comparison overflow".to_string())?;
 	Ok(scaled_value > global_value_raw)
 }
@@ -7118,6 +7187,7 @@ pub fn q11_oracle_from_rows(
 	partsupp: impl IntoIterator<Item = (i64, i64, i32, i128)>,
 	suppliers: impl IntoIterator<Item = (i64, i64)>,
 	nations: impl IntoIterator<Item = (i64, String)>,
+	scale: Q11Scale,
 ) -> Result<Q11Oracle, String> {
 	let germany_nations: HashSet<i64> = nations
 		.into_iter()
@@ -7157,7 +7227,7 @@ pub fn q11_oracle_from_rows(
 	let mut threshold_failed_partkeys = BTreeSet::new();
 	let mut rows = Vec::new();
 	for (partkey, value_raw) in groups {
-		if q11_threshold_passes(value_raw, global_value_raw)? {
+		if q11_threshold_passes(value_raw, global_value_raw, scale)? {
 			rows.push(Q11Row {
 				ps_partkey: partkey,
 				value_raw,
@@ -7185,6 +7255,7 @@ pub fn q11_oracle_from_rows(
 }
 
 pub fn strict_q11_oracle(scale_factor: f64) -> Result<Q11Oracle, String> {
+	let scale = Q11Scale::try_from_f64(scale_factor)?;
 	q11_oracle_from_rows(
 		PartSuppGenerator::new(scale_factor, 1, 1)
 			.iter()
@@ -7202,6 +7273,7 @@ pub fn strict_q11_oracle(scale_factor: f64) -> Result<Q11Oracle, String> {
 		NationGenerator::new(scale_factor, 1, 1)
 			.iter()
 			.map(|nation| (nation.n_nationkey, nation.n_name.to_string())),
+		scale,
 	)
 }
 
@@ -7358,8 +7430,10 @@ pub fn compare_strict_q11(batches: &[RecordBatch], oracle: &Q11Oracle) -> Result
 	Ok(())
 }
 
-pub async fn check_strict_q11(scale_factor: f64) -> CorrectnessAttempt {
+pub async fn check_strict_q11(scale_factor: f64) -> Result<CorrectnessAttempt, String> {
 	let start = Instant::now();
+	let scale = Q11Scale::try_from_f64(scale_factor)?;
+	let sql = q11_sql(scale);
 	let tables = q11_tables(true, scale_factor);
 	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
 		query: "q11".to_string(),
@@ -7370,27 +7444,27 @@ pub async fn check_strict_q11(scale_factor: f64) -> CorrectnessAttempt {
 		reason,
 		elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
 	};
-	let batches = match execute_query_with_tables(STRICT_Q11_SQL, tables).await {
+	let batches = match execute_query_with_tables(&sql, tables).await {
 		Ok(batches) => batches,
 		Err(StageError { phase, reason, .. }) => {
-			return outcome(phase, status_for_reason(&reason), Some(reason));
+			return Ok(outcome(phase, status_for_reason(&reason), Some(reason)));
 		}
 	};
 	if let Err(reason) = assert_strict_q11_schema(&batches) {
-		return outcome(
+		return Ok(outcome(
 			Phase::Compare,
 			Status::Fail,
 			Some(format!("schema drift: {reason}")),
-		);
+		));
 	}
 	let oracle = match strict_q11_oracle(scale_factor) {
 		Ok(oracle) => oracle,
-		Err(reason) => return outcome(Phase::Compare, Status::Fail, Some(reason)),
+		Err(reason) => return Ok(outcome(Phase::Compare, Status::Fail, Some(reason))),
 	};
-	match compare_strict_q11(&batches, &oracle) {
+	Ok(match compare_strict_q11(&batches, &oracle) {
 		Ok(()) => outcome(Phase::Compare, Status::Pass, None),
 		Err(reason) => outcome(Phase::Compare, Status::Fail, Some(reason)),
-	}
+	})
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -10504,29 +10578,33 @@ pub async fn run_strict_q13(scale_factor: f64) -> Attempt {
 	.await
 }
 
-/// ADR 320/321 - dev q11: HAVING scalar threshold recombines and reaches execute.
-pub async fn run_dev_q11(scale_factor: f64) -> Attempt {
-	run_query_with_tables(
+/// ADR 320/321/422 - dev q11: HAVING scalar threshold recombines with the scale-correct FRACTION.
+pub async fn run_dev_q11(scale_factor: f64) -> Result<Attempt, String> {
+	let scale = Q11Scale::try_from_f64(scale_factor)?;
+	let sql = q11_sql(scale);
+	Ok(run_query_with_tables(
 		"q11",
 		"dev",
 		scale_factor,
-		Q11_DEV_SQL,
+		&sql,
 		q11_tables(false, scale_factor),
 	)
-	.await
+	.await)
 }
 
-/// ADR 321/325 - strict q11: Decimal x Int multiply aligns, and decimal-point literals preserve
-/// the exact `0.0001` threshold.
-pub async fn run_strict_q11(scale_factor: f64) -> Attempt {
-	run_query_with_tables(
+/// ADR 321/325/422 - strict q11: Decimal x Int multiply aligns and the bit-exact scale contract
+/// renders the corresponding decimal FRACTION.
+pub async fn run_strict_q11(scale_factor: f64) -> Result<Attempt, String> {
+	let scale = Q11Scale::try_from_f64(scale_factor)?;
+	let sql = q11_sql(scale);
+	Ok(run_query_with_tables(
 		"q11",
 		"strict",
 		scale_factor,
-		STRICT_Q11_SQL,
+		&sql,
 		q11_tables(true, scale_factor),
 	)
-	.await
+	.await)
 }
 
 /// ADR 313 - dev q15: CTE-as-FROM-source plus scalar aggregate over the same CTE.
@@ -12504,6 +12582,56 @@ mod adr356_perf_rail {
 		assert!(lineitem.file_hash.starts_with("fnv1a64:"));
 		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
 		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+#[cfg(test)]
+mod adr422_q11_vacuous_baseline {
+	use super::*;
+
+	#[test]
+	#[ignore = "ADR 422 baseline executes the old unscaled q11 contract at sf=10"]
+	fn unscaled_sf10_sql_and_oracle_are_both_empty_but_instrument_rejected() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let batches = execute_query_with_tables(Q11_DEV_SQL, q11_tables(true, 10.0))
+						.await
+						.expect("old unscaled q11 executes");
+					assert_eq!(output_row_count(&batches), 0);
+
+					let oracle = q11_oracle_from_rows(
+						PartSuppGenerator::new(10.0, 1, 1).iter().map(|partsupp| {
+							(
+								partsupp.ps_partkey,
+								partsupp.ps_suppkey,
+								partsupp.ps_availqty,
+								partsupp.ps_supplycost.into_inner() as i128,
+							)
+						}),
+						SupplierGenerator::new(10.0, 1, 1)
+							.iter()
+							.map(|supplier| (supplier.s_suppkey, supplier.s_nationkey)),
+						NationGenerator::new(10.0, 1, 1)
+							.iter()
+							.map(|nation| (nation.n_nationkey, nation.n_name.to_string())),
+						Q11Scale::try_from_f64(1.0).expect("old unscaled threshold"),
+					)
+					.expect("old unscaled q11 oracle");
+					assert!(oracle.rows.is_empty());
+					let error = compare_strict_q11(&batches, &oracle)
+						.expect_err("empty-vs-empty baseline must stay instrument-rejected");
+					assert!(error.contains("oracle non-vacuous guard failed"));
+				});
+			})
+			.expect("spawn q11 baseline thread")
+			.join()
+			.expect("q11 baseline thread panicked");
 	}
 }
 

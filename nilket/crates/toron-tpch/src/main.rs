@@ -631,10 +631,14 @@ async fn run_command(args: &[String]) -> ExitCode {
 		}
 		// Part-supplier value reachability attempt over partsupp/supplier/nation.
 		"q11" => {
-			if strict {
+			let result = if strict {
 				run_strict_q11(sf).await
 			} else {
 				run_dev_q11(sf).await
+			};
+			match result {
+				Ok(attempt) => attempt,
+				Err(message) => return harness_error(&message),
 			}
 		}
 		// Customer-distribution reachability attempt over customer + orders.

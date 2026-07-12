@@ -9,8 +9,8 @@ use arrow::record_batch::RecordBatch;
 use toron_tpch::telemetry::{Phase, Status};
 use toron_tpch::{
 	DecimalRaw, Q1Group, Q02Oracle, Q02Row, Q3Group, Q04Oracle, Q5Group, Q07Oracle, Q08Oracle,
-	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q12Group,
-	Q12Oracle, Q13Oracle, Q14Oracle, Q15Row, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
+	Q09Oracle, Q10Oracle, Q10Row, Q11_DECIMAL_LITERAL_SCALE_REASON, Q11Oracle, Q11Row, Q11Scale,
+	Q12Group, Q12Oracle, Q13Oracle, Q14Oracle, Q15Row, Q16Oracle, Q17_CORRECTNESS_SCALE, Q17Oracle,
 	Q18Oracle, Q18Row, Q19Oracle, Q20Oracle, Q20Row, Q22Group, Q22Oracle, assert_strict_q1_schema,
 	assert_strict_q02_schema, assert_strict_q3_schema, assert_strict_q04_schema,
 	assert_strict_q5_schema, assert_strict_q07_schema, assert_strict_q08_schema,
@@ -30,8 +30,8 @@ use toron_tpch::{
 	compare_strict_q19, compare_strict_q20, compare_strict_q22, correctness_matrix_from_log,
 	decimal_division_raw, q02_type_matches_brass, q04_oracle_from_rows, q6_row_revenue,
 	q07_contribution, q08_contribution, q08_market_share_raw, q09_amount_raw, q09_order_year,
-	q09_part_name_contains_green, q09_partsupp_cost, q11_oracle_from_rows, q11_threshold_passes,
-	q13_comment_matches_pattern, q13_oracle_from_rows, q15_oracle_from_rows,
+	q09_part_name_contains_green, q09_partsupp_cost, q11_oracle_from_rows, q11_sql,
+	q11_threshold_passes, q13_comment_matches_pattern, q13_oracle_from_rows, q15_oracle_from_rows,
 	q16_customer_complaints_matches_pattern, q16_oracle_from_rows, q20_part_name_is_forest_prefix,
 	q20_threshold_passes, q22_acctbal_above_threshold, q22_country_code,
 	q22_country_code_is_selected, q22_oracle_from_rows, strict_q1_oracle, strict_q02_oracle,
@@ -2131,6 +2131,7 @@ fn strict_q11_matches_independent_oracle() {
 				.build()
 				.expect("runtime")
 				.block_on(check_strict_q11(0.01))
+				.expect("supported q11 scale")
 		})
 		.expect("spawn q11 correctness thread")
 		.join()
@@ -2156,6 +2157,45 @@ fn strict_q11_oracle_is_selective_at_default_scale() {
 		oracle.threshold_fail_groups > 0,
 		"q11 must have positive German groups below the exact threshold: {oracle:?}"
 	);
+}
+
+#[test]
+fn q11_scale_table_is_bit_exact_and_carries_its_sql_literal() {
+	for (scale_factor, hundredths_n, literal) in [
+		(0.01, 1, "0.01"),
+		(1.0, 100, "0.0001"),
+		(10.0, 1_000, "0.00001"),
+	] {
+		let scale = Q11Scale::try_from_f64(scale_factor).expect("supported q11 scale");
+		assert_eq!(scale.hundredths_n(), hundredths_n);
+		assert_eq!(scale.fraction_sql(), literal);
+		let sql = q11_sql(scale);
+		assert!(
+			sql.contains(&format!("SUM(ps_supplycost * ps_availqty) * {literal}")),
+			"rendered q11 SQL must carry the table-owned literal: {sql}"
+		);
+		assert!(!sql.contains("[FRACTION]"));
+	}
+
+	let alternate_spelling: f64 = "0.010".parse().expect("parse alternate scale spelling");
+	assert_eq!(
+		Q11Scale::try_from_f64(alternate_spelling).expect("same scale bits"),
+		Q11Scale::try_from_f64(0.01).expect("supported q11 scale")
+	);
+
+	let bits = 0.01_f64.to_bits();
+	for adjacent in [f64::from_bits(bits - 1), f64::from_bits(bits + 1)] {
+		assert!(
+			Q11Scale::try_from_f64(adjacent).is_err(),
+			"adjacent binary64 value {adjacent:?} must not round into sf=0.01"
+		);
+	}
+	for unsupported in [0.0001, 0.02, 0.1, f64::NAN, f64::INFINITY] {
+		assert!(
+			Q11Scale::try_from_f64(unsupported).is_err(),
+			"unsupported q11 scale {unsupported:?} must reject"
+		);
+	}
 }
 
 #[test]
@@ -2185,14 +2225,68 @@ fn strict_q11_output_schema_is_asserted() {
 
 #[test]
 fn q11_exact_threshold_is_integer_comparison() {
+	let scale = Q11Scale::try_from_f64(1.0).expect("sf=1 q11 scale");
 	assert!(
-		q11_threshold_passes(2, 10_000).expect("threshold check"),
+		q11_threshold_passes(2, 10_000, scale).expect("threshold check"),
 		"2 raw cents > 100.00 * 0.0001"
 	);
 	assert!(
-		!q11_threshold_passes(1, 10_000).expect("threshold check"),
+		!q11_threshold_passes(1, 10_000, scale).expect("threshold check"),
 		"1 raw cent is not > 100.00 * 0.0001"
 	);
+}
+
+#[test]
+fn q11_scaled_threshold_is_reduced_checked_and_strict() {
+	for scale_factor in [0.01, 1.0, 10.0] {
+		let scale = Q11Scale::try_from_f64(scale_factor).expect("supported q11 scale");
+		let boundary = 100 * scale.hundredths_n();
+		assert!(
+			!q11_threshold_passes(1, boundary, scale).expect("threshold boundary"),
+			"q11 threshold remains strict at sf={scale_factor}"
+		);
+		assert!(
+			q11_threshold_passes(2, boundary, scale).expect("threshold pass"),
+			"value above the exact boundary passes at sf={scale_factor}"
+		);
+	}
+	assert!(
+		q11_threshold_passes(
+			i128::MAX,
+			1,
+			Q11Scale::try_from_f64(10.0).expect("supported q11 scale")
+		)
+		.is_err(),
+		"threshold multiplication overflow must fail loudly"
+	);
+}
+
+#[test]
+fn q11_empty_oracle_reaches_and_trips_non_vacuity_guard() {
+	let oracle = q11_oracle(Vec::new(), 0);
+	let error = compare_strict_q11(&[q11_batch(&[])], &oracle)
+		.expect_err("empty-vs-empty q11 must remain instrument-rejected");
+	assert!(
+		error.contains("oracle non-vacuous guard failed"),
+		"typed zero-row output must reach the oracle guard: {error}"
+	);
+}
+
+#[test]
+#[ignore = "ADR 422 scale census includes the persisted-board sf=10 volume"]
+fn q11_scaled_oracles_are_selective_at_every_admitted_scale() {
+	for scale_factor in [0.01, 1.0, 10.0] {
+		let oracle = strict_q11_oracle(scale_factor).expect("supported q11 oracle scale");
+		assert!(!oracle.rows.is_empty(), "sf={scale_factor}: {oracle:?}");
+		assert!(
+			oracle.rows.len() < oracle.positive_german_parts,
+			"sf={scale_factor}: {oracle:?}"
+		);
+		assert!(
+			oracle.threshold_fail_groups > 0,
+			"sf={scale_factor}: {oracle:?}"
+		);
+	}
 }
 
 #[test]
@@ -2201,6 +2295,7 @@ fn q11_decimal_literal_scale_extra_rows_are_classified() {
 		[(1_i64, 10_i64, 1_i32, 20_000_i128), (2, 10, 1, 1)],
 		[(10_i64, 1_i64)],
 		[(1_i64, "GERMANY".to_string())],
+		Q11Scale::try_from_f64(1.0).expect("sf=1 q11 scale"),
 	)
 	.expect("q11 oracle");
 	assert_eq!(oracle.rows, vec![q11_row(1, 20_000)]);

@@ -17,8 +17,8 @@ this cycle closed the mystery in closed form:
    zero rows at sf=10.
 3. **Zero rows is mathematically forced at sf=10.** Each part has four `PARTSUPP` rows, so even
    the conservative all-German upper bound is `< 4 x 9,999 x 1,000.00 = 39,996,000` per part.
-   The measured German national total grows linearly with scale (~9.5e11 at sf=10), making the
-   unscaled `0.0001` threshold ~9.5e7. No part can pass. The fixture question is degenerate;
+   The measured German national total is ~8.10e11 at sf=10, making the unscaled `0.0001`
+   threshold ~8.10e7. No part can pass. The fixture question is degenerate;
    the execution is healthy.
 4. **The instrument worked.** The compare guard requires a non-empty proper subset with at least
    one threshold failure (`:7246-7258`); it correctly refused to bank empty-vs-empty as green.
@@ -40,17 +40,22 @@ Two facts the design must absorb (both council-corrected during iteration):
 
 ## Decision
 
-### The exact scale contract: a four-row bit-exact table
+### The exact scale contract: a three-row bit-exact table
 
 One closed value from a bit-exact constructor - conceptually
 `Q11Scale { hundredths_n, fraction_sql }`:
 
 ```text
 0.01_f64.to_bits() -> { n=1,    "0.01"    }
-0.02_f64.to_bits() -> { n=2,    "0.005"   }
 1.0_f64.to_bits()  -> { n=100,  "0.0001"  }
 10.0_f64.to_bits() -> { n=1000, "0.00001" }
 ```
+
+Phase 0 also measured the proposed sf=0.02 direction control before implementation: the scaled
+oracle selected 0 of 821 positive German groups. Because the unchanged guard correctly rejects
+that degenerate result, sf=0.02 is not an admitted q11 rail scale; it rejects like every other
+unsupported value. The operational contract contains the non-degenerate correctness scale,
+sf=1 identity scale, and sf=10 board target only.
 
 - **The SQL literal lives in the table** alongside `n` - never computed or formatted through
   `f64`. The renderer consumes `fraction_sql`; the oracle consumes `hundredths_n` in the
@@ -114,17 +119,18 @@ in the compare.
   17/22)** or records the first genuinely non-vacuous q11 mismatch as the next correctness
   finding - both outcomes are wins over the vacuous status quo.
 - **Selectivity locks (scale-scoped non-vacuity):** generated sf=0.01, sf=1, and sf=10 oracles
-  are non-empty proper subsets with threshold failures; sf=0.02 is the scale-direction control;
-  a strict-boundary synthetic pins `>` independent of generator accidents. Because sf=0.0001
+  are non-empty proper subsets with threshold failures; the Phase-0 sf=0.02 census records
+  `0 pass / 821 fail` and the exact table rejects it. A strict-boundary synthetic pins `>`
+  independent of generator accidents. Because sf=0.0001
   is not an admitted `Q11Scale`, its mathematical-emptiness lock is deliberately split: the
   scale table rejects it, and a synthetic empty `Q11Oracle` plus a correctly typed zero-row
   output batch proves the unchanged comparator guard still refuses empty-vs-empty. No
   unsupported scale bypasses the constructor, and the lock must reach the guard rather than
   fail earlier on absent output schema.
-- **Scale-fence locks:** all four table rows select their exact `(n, literal)` pair; alternate
+- **Scale-fence locks:** all three table rows select their exact `(n, literal)` pair; alternate
   spellings (`0.010`) select the same row; `f64::from_bits(bits +/- 1)` both reject; `0.0001`,
-  NaN/infinity via direct library call, and an otherwise-valid unsupported positive scale all
-  reject loudly.
+  `0.02`, NaN/infinity via direct library call, and an otherwise-valid unsupported positive
+  scale all reject loudly.
 - **Harness-error locks:** CLI reach, correctness, memory perf, and persisted perf each return
   **exit 2 with no telemetry row** for an unsupported q11 scale; the persisted case proves no
   dataset preparation occurred.
@@ -177,7 +183,7 @@ SQL: `toron-tpch/src/lib.rs:315-333` (hardcoded `0.0001`; strict aliases dev). O
 failure). Scale parsing: `:9753-9762` (any finite positive f64); harness test pins 0.0001
 valid. Four SQL seams: `:4602/:4686-4700`, `:4671/:4786-4790`, `:7361-7392`, `:10507-10528`;
 spec structs `:1780/:1839` (`&'static str`). Bounds arithmetic: four rows/part x
-availqty <= 9,999 x supplycost <= 1,000.00 -> <39,996,000/part vs ~9.5e11 measured German
+availqty <= 9,999 x supplycost <= 1,000.00 -> <39,996,000/part vs ~8.10e11 measured German
 total at sf=10. Spec: TPC-H 3.0.1 Clause
 2.4.11.3 item 2 (FRACTION = 0.0001/SF), 2.4.11.4 (qualification 0.0001 at sf=1). 415 rows:
 `plans/impl/415_sf10_full_board_live_sweep_results.md` (q11 zero rows, oracle guard fail,

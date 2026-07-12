@@ -1,7 +1,7 @@
 # ADR 422 - Implementation plan: q11 scale-correct FRACTION
 
 Pairs with `plans/adr/422_q11_scale_correct_fraction.md`. One bounded fixture-contract cut in
-`toron-tpch`: a four-row bit-exact q11 scale table (`(f64 bits, hundredths_n, SQL literal)`)
+`toron-tpch`: a three-row bit-exact q11 scale table (`(f64 bits, hundredths_n, SQL literal)`)
 feeding one shared SQL renderer and a scale-explicit integer oracle; unsupported q11 scales
 reject pre-I/O with exit-2/no-telemetry harness semantics. No Toron engine surface changes.
 
@@ -9,11 +9,10 @@ reject pre-I/O with exit-2/no-telemetry harness semantics. No Toron engine surfa
 
 1. **Spec pin:** cite TPC-H 3.0.1 Clause 2.4.11.3 item 2 (FRACTION = 0.0001/SF) and 2.4.11.4
    (qualification value 0.0001 = the sf=1 case) in the results doc.
-2. **Rail-scale inventory:** enumerate every scale q11 actually runs at in the rails (reach
-   default, correctness sf=0.01, sf=0.02 controls, sf=1, sf=10 board target) - this is the
-   four-row domain's justification; unsupported values become loud errors, so the inventory
-   must be complete.
-3. **Rendered-literal record:** for each table row, the exact SQL literal (`0.01`, `0.005`,
+2. **Rail-scale inventory:** enumerate every scale q11 actually runs at in the rails (reach /
+   correctness sf=0.01, sf=1 identity, sf=10 board target) and census the proposed sf=0.02
+   direction control. Unsupported values become loud errors, so the inventory must be complete.
+3. **Rendered-literal record:** for each admitted table row, the exact SQL literal (`0.01`,
    `0.0001`, `0.00001`) and a bind-level check that Toron and DuckDB parse the same threshold
    semantics from it (decimal literal, no float drift at the boundary).
 4. **Reproduce the vacuous baseline** at sf=10 (engines zero rows; oracle non-vacuity guard
@@ -21,21 +20,22 @@ reject pre-I/O with exit-2/no-telemetry harness semantics. No Toron engine surfa
 5. **Substitution audit:** walk the TPC-H substitution clauses / QGEN parameter contract for
    the other 21 fixtures and record whether any other SF-dependent parameter is frozen into
    fixture SQL. Fixture comments are not evidence.
-6. **Selectivity census before implementation:** independently apply the four exact fractions
-   to generated q11 groups at sf=0.01/0.02/1/10 and record pass/fail group counts. All four
-   must be non-empty proper subsets with at least one threshold failure. If any admitted row
-   is degenerate, stop and re-scope the table/rail contract; do not weaken the comparator guard.
+6. **Selectivity census before implementation:** independently apply the candidate exact
+   fractions to generated q11 groups at sf=0.01/0.02/1/10 and record pass/fail group counts.
+   Phase 0 measured sf=0.02 at `0 pass / 821 fail`, so the stop-line resolves by excluding it
+   from the admitted table. The sf=0.01/1/10 rows must be non-empty proper subsets with at least
+   one threshold failure; do not weaken the comparator guard.
 
 ## Phase 1 - the cut
 
-1. **`Q11Scale` table:** bit-exact constructor over the four rows
-   (`0.01 -> (1, "0.01")`, `0.02 -> (2, "0.005")`, `1.0 -> (100, "0.0001")`,
+1. **`Q11Scale` table:** bit-exact constructor over the three rows
+   (`0.01 -> (1, "0.01")`, `1.0 -> (100, "0.0001")`,
    `10.0 -> (1000, "0.00001")`); lookup by `f64::to_bits` equality; any other value ->
    `Err("q11 requires an exactly supported scale ...")`. No rounding, no epsilon, no
    float-formatted literals. Make it a public opaque `Copy` value with private fields and one
    public fallible constructor: the existing public oracle helpers are integration-test API,
    and no caller may construct a mismatched `(n, literal)` directly.
-2. **Shared renderer:** `q11_sql(mode, Q11Scale)` renders the one query text with the row's
+2. **Shared renderer:** `q11_sql(Q11Scale)` renders the mode-identical query text with the row's
    literal. Both spec structs (`:1780/:1839`) change `sql: &'static str` ->
    `Cow<'static, str>` (21 queries borrowed, q11 owned). All four seams (persisted spec,
    memory spec, `check_strict_q11`, reach helpers) consume the renderer; the static constants
@@ -60,9 +60,9 @@ reject pre-I/O with exit-2/no-telemetry harness semantics. No Toron engine surfa
 
 ## Tests (discriminating)
 
-- **Table locks:** four exact selections; alternate spellings (`"0.010"` -> same row);
-  `f64::from_bits(0.01.to_bits() - 1)` and `+ 1` both reject; `0.0001`, NaN, infinity, and an
-  unsupported positive scale reject loudly through the library API.
+- **Table locks:** three exact selections; alternate spellings (`"0.010"` -> same row);
+  `f64::from_bits(0.01.to_bits() - 1)` and `+ 1` both reject; `0.0001`, `0.02`, NaN, infinity,
+  and an unsupported positive scale reject loudly through the library API.
 - **Harness-error locks:** CLI reach, correctness, memory perf, and persisted perf each exit 2
   with no telemetry row on an unsupported q11 scale; the persisted case asserts no dataset
   directory/fingerprint was created.
@@ -87,7 +87,7 @@ reject pre-I/O with exit-2/no-telemetry harness semantics. No Toron engine surfa
 scripts/cargo-cgroup build -p toron-tpch --release
 mkdir -p target/tpch/adr422
 # live scaled correctness at the rail scales (small scales are cheap)
-for sf in 0.01 0.02 1; do
+for sf in 0.01 1; do
   target/release/toron-tpch correctness --query q11 --sf "$sf" --mode strict \
     --data-source memory >> target/tpch/adr422/q11_small.out 2>&1
 done
