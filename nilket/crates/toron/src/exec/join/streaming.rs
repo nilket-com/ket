@@ -6,6 +6,237 @@ const STREAMED_INNER_BUILD_MAX_PARTITIONS: u32 = 1024;
 const EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET: u32 = u32::MAX;
 const NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY: usize = 1024;
 const NEQ_EXISTENCE_SUMMARY_PRODUCER: &str = "recognized Neq existence summary resident state";
+const EMPTY_INT64_PRESENCE_BUCKET: u32 = u32::MAX;
+const INT64_PRESENCE_INITIAL_ENTRY_CAPACITY: usize = 1024;
+const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
+
+#[cfg(test)]
+static MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn record_membership_outer_writer_construct() {
+	#[cfg(test)]
+	MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+struct MembershipScheduleReceipt {
+	path: PathBuf,
+	rows: Vec<String>,
+}
+
+impl MembershipScheduleReceipt {
+	fn from_env() -> Option<Self> {
+		std::env::var_os("TORON_MEMBERSHIP_SCHEDULE_RECEIPT_PATH").map(|path| Self {
+			path: PathBuf::from(path),
+			rows: Vec::new(),
+		})
+	}
+
+	fn append(&mut self, milestone: &'static str, detail: serde_json::Value) {
+		self.rows.push(
+			serde_json::json!({
+				"milestone": milestone,
+				"detail": detail,
+			})
+			.to_string(),
+		);
+		let temporary = self.path.with_extension("tmp");
+		let contents = format!("{}\n", self.rows.join("\n"));
+		if std::fs::write(&temporary, contents).is_ok() {
+			let _ = std::fs::rename(temporary, &self.path);
+		}
+	}
+
+	#[cfg(test)]
+	fn at_path(path: PathBuf) -> Self {
+		Self {
+			path,
+			rows: Vec::new(),
+		}
+	}
+}
+
+struct Int64PresenceSet {
+	buckets: Vec<u32>,
+	entries: Vec<i64>,
+	hasher: RandomState,
+	construction_peak_bytes: u64,
+}
+
+impl Int64PresenceSet {
+	fn capacity_targets(row_upper_bound: usize) -> Result<(usize, usize), ExecutionError> {
+		let entry_target = row_upper_bound
+			.max(INT64_PRESENCE_INITIAL_ENTRY_CAPACITY)
+			.checked_next_power_of_two()
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "membership presence capacity overflow".to_string(),
+			})?;
+		if entry_target >= EMPTY_INT64_PRESENCE_BUCKET as usize {
+			return Err(ExecutionError::Kernel {
+				message: "membership presence set exceeds u32 entry range".to_string(),
+			});
+		}
+		let bucket_target = entry_target
+			.checked_mul(2)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "membership presence bucket capacity overflow".to_string(),
+			})?;
+		Ok((entry_target, bucket_target))
+	}
+
+	fn from_batches(
+		batches: &[RecordBatch],
+		key: ColumnOrdinal,
+		memory_cap: u64,
+	) -> Result<Option<Self>, ExecutionError> {
+		let row_upper_bound = batches.iter().try_fold(0usize, |rows, batch| {
+			rows.checked_add(batch.num_rows())
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "membership presence row bound overflow".to_string(),
+				})
+		})?;
+		if row_upper_bound == 0 {
+			return Ok(None);
+		}
+		let (entry_target, bucket_target) = Self::capacity_targets(row_upper_bound)?;
+		let batch_bytes = batches
+			.iter()
+			.map(record_batch_memory_bytes)
+			.fold(0u64, u64::saturating_add);
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let requested_entry_bytes = summary_bytes::<i64>(entry_target);
+		let requested_bucket_bytes = summary_bytes::<u32>(bucket_target);
+		let requested_peak = batch_bytes
+			.saturating_add(requested_entry_bytes)
+			.saturating_add(requested_bucket_bytes);
+		Self::guard_construction(requested_peak, cap)?;
+
+		let mut entries = Vec::new();
+		entries
+			.try_reserve_exact(entry_target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("membership presence entry allocation failed: {error}"),
+			})?;
+		let observed_entry_bytes = summary_bytes::<i64>(entries.capacity());
+		let observed_entry_requested_bucket_peak = batch_bytes
+			.saturating_add(observed_entry_bytes)
+			.saturating_add(requested_bucket_bytes);
+		Self::guard_construction(observed_entry_requested_bucket_peak, cap)?;
+
+		let mut buckets = Vec::new();
+		buckets
+			.try_reserve_exact(bucket_target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("membership presence bucket allocation failed: {error}"),
+			})?;
+		let observed_bucket_bytes = summary_bytes::<u32>(buckets.capacity());
+		let observed_peak = batch_bytes
+			.saturating_add(observed_entry_bytes)
+			.saturating_add(observed_bucket_bytes);
+		Self::guard_construction(observed_peak, cap)?;
+		buckets.resize(bucket_target, EMPTY_INT64_PRESENCE_BUCKET);
+
+		let mut set = Self {
+			buckets,
+			entries,
+			hasher: RandomState::new(),
+			construction_peak_bytes: requested_peak
+				.max(observed_entry_requested_bucket_peak)
+				.max(observed_peak),
+		};
+		for batch in batches {
+			let keys = batch
+				.columns()
+				.get(key.0 as usize)
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "membership presence key is out of range".to_string(),
+				})?
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "membership presence key must be Int64".to_string(),
+				})?;
+			if keys.null_count() != 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: "membership presence key must be non-null".to_string(),
+				});
+			}
+			for row in 0..batch.num_rows() {
+				set.insert(keys.value(row))?;
+			}
+		}
+		Ok(Some(set))
+	}
+
+	fn guard_construction(requested: u64, cap: u64) -> Result<(), ExecutionError> {
+		if requested > cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				INT64_PRESENCE_PRODUCER,
+				requested,
+				cap,
+			));
+		}
+		Ok(())
+	}
+
+	fn insert(&mut self, key: i64) -> Result<(), ExecutionError> {
+		let bucket = self.find_bucket(key)?;
+		if self.buckets[bucket] != EMPTY_INT64_PRESENCE_BUCKET {
+			return Ok(());
+		}
+		let entry = u32::try_from(self.entries.len()).map_err(|_| ExecutionError::Kernel {
+			message: "membership presence set exceeds u32 entry range".to_string(),
+		})?;
+		if entry == EMPTY_INT64_PRESENCE_BUCKET {
+			return Err(ExecutionError::Kernel {
+				message: "membership presence set exhausted u32 entry domain".to_string(),
+			});
+		}
+		let capacity = self.entries.capacity();
+		self.entries.push(key);
+		if self.entries.capacity() != capacity {
+			return Err(ExecutionError::Kernel {
+				message: "membership presence set grew after reservation".to_string(),
+			});
+		}
+		self.buckets[bucket] = entry;
+		Ok(())
+	}
+
+	fn contains(&self, key: i64) -> Result<bool, ExecutionError> {
+		let bucket = self.find_bucket(key)?;
+		Ok(self.buckets[bucket] != EMPTY_INT64_PRESENCE_BUCKET)
+	}
+
+	fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {
+		if self.buckets.is_empty() || !self.buckets.len().is_power_of_two() {
+			return Err(ExecutionError::Kernel {
+				message: "membership presence set has invalid bucket capacity".to_string(),
+			});
+		}
+		let mut bucket = (self.hasher.hash_one(key) as usize) & (self.buckets.len() - 1);
+		for _ in 0..self.buckets.len() {
+			let entry = self.buckets[bucket];
+			if entry == EMPTY_INT64_PRESENCE_BUCKET
+				|| self
+					.entries
+					.get(entry as usize)
+					.is_some_and(|candidate| *candidate == key)
+			{
+				return Ok(bucket);
+			}
+			bucket = (bucket + 1) & (self.buckets.len() - 1);
+		}
+		Err(ExecutionError::Kernel {
+			message: "membership presence set has no free bucket".to_string(),
+		})
+	}
+
+	fn accounted_bytes(&self) -> u64 {
+		summary_bytes::<u32>(self.buckets.capacity())
+			.saturating_add(summary_bytes::<i64>(self.entries.capacity()))
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecognizedNeqExistenceSummaryColumns {
@@ -402,6 +633,25 @@ fn summary_bytes<T>(capacity: usize) -> u64 {
 	u64::try_from(capacity.saturating_mul(std::mem::size_of::<T>())).unwrap_or(u64::MAX)
 }
 
+fn guard_membership_owner_resident(
+	baseline_bytes: u64,
+	local_resident_bytes: u64,
+	memory_cap: u64,
+	producer: &'static str,
+) -> Result<(), ExecutionError> {
+	let requested = baseline_bytes.saturating_add(local_resident_bytes);
+	let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+	if requested > cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			producer,
+			requested,
+			cap,
+		));
+	}
+	Ok(())
+}
+
 pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	replay_id: JoinReplayId,
 	probe_schema: SchemaRef,
@@ -565,12 +815,25 @@ enum ReorientedChainOutputSink<'a> {
 		group_expr: &'a BoundExprProgram,
 		aggr_expr: &'a [BoundAggregateCall],
 	},
+	#[allow(dead_code)]
 	ProjectedSpill {
 		spilled: &'a mut SpilledInnerJoinBuild,
 		retained_columns: &'a [ColumnOrdinal],
 		key_plan: JoinKeyPlan,
 		build_keys: &'a [ColumnOrdinal],
 		null_safe_keys: bool,
+	},
+	MembershipFilteredGroupedFold {
+		presence: &'a Int64PresenceSet,
+		left_key: ColumnOrdinal,
+		partition_count: u32,
+		exchange_key: &'a BoundExprProgram,
+		group_expr: &'a BoundExprProgram,
+		aggr_expr: &'a [BoundAggregateCall],
+		groups: &'a mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &'a mut Vec<DataType>,
+		input_rows: &'a mut u64,
+		output_rows: &'a mut u64,
 	},
 }
 
@@ -671,6 +934,7 @@ struct LoadedPartitionWork {
 	build_column_count: usize,
 	projection: Option<ProjectedInnerBuildProjection>,
 	memory_cap: u64,
+	resident_baseline_bytes: u64,
 }
 
 struct LoadedPartitionResult {
@@ -1583,6 +1847,7 @@ fn run_loaded_partition_work(
 		build_column_count,
 		projection,
 		memory_cap,
+		resident_baseline_bytes,
 	} = work;
 	let loaded = LoadedSpilledInnerBuild::new(
 		build_pages,
@@ -1590,6 +1855,7 @@ fn run_loaded_partition_work(
 		&write_build_keys,
 		null_safe_keys,
 		memory_cap,
+		resident_baseline_bytes,
 	)?;
 	visit_loaded_partition_work(
 		&loaded,
@@ -1697,6 +1963,7 @@ impl LoadedSpilledInnerBuild {
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
 		memory_cap: u64,
+		resident_baseline_bytes: u64,
 	) -> Result<Self, ExecutionError> {
 		let mut index = HashMap::new();
 		let mut resident_index_bytes = 0u64;
@@ -1718,7 +1985,8 @@ impl LoadedSpilledInnerBuild {
 					},
 				);
 			}
-			let resident = resident_index_bytes
+			let resident = resident_baseline_bytes
+				.saturating_add(resident_index_bytes)
 				.saturating_add(loaded_page_bytes)
 				.saturating_add(64 * 1024);
 			if resident > cap {
@@ -7295,15 +7563,6 @@ impl Executor {
 		{
 			return Ok(None);
 		}
-		let projected_left_keys = remap_column_ordinals(&retained_columns, left_keys)?;
-		let projected_schema = projected_schema_for_columns(semi_output_schema, &retained_columns)?;
-		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
-			&projected_schema,
-			&projected_left_keys,
-			&right.schema(),
-			right_keys,
-			*null_safe_keys,
-		)?;
 		let chain_input = exchange_input(left);
 		let has_reoriented_chain_top = matches!(
 			chain_input,
@@ -7320,20 +7579,243 @@ impl Executor {
 		if has_reoriented_chain_top && chain_candidate.is_none() {
 			return Ok(None);
 		}
-		let (left_batches, mut right_batches) = if chain_candidate.is_some() {
-			(None, None)
-		} else {
-			let left_batches = self.execute_bound(left, morsel).await?;
-			let estimated_build_bytes =
-				estimated_build_hash_bytes_for_batches(&left_batches, left_keys)?;
-			if estimated_build_bytes <= self.context.task_budget.memory.get() {
+		if let Some((base, mut stages)) = chain_candidate {
+			if *null_safe_keys || left_keys.len() != 1 || right_keys.len() != 1 {
 				return Ok(None);
 			}
-			(
-				Some(left_batches),
-				Some(self.execute_bound(right, morsel).await?),
-			)
-		};
+			let Some(left_field) = semi_output_schema.fields().get(left_keys[0].0 as usize) else {
+				return Ok(None);
+			};
+			let right_schema = right.schema();
+			let Some(right_field) = right_schema.fields().get(right_keys[0].0 as usize) else {
+				return Ok(None);
+			};
+			if left_field.data_type() != &DataType::Int64
+				|| right_field.data_type() != &DataType::Int64
+				|| left_field.is_nullable()
+				|| right_field.is_nullable()
+			{
+				return Ok(None);
+			}
+
+			let required_output = retained_columns.iter().copied().collect();
+			mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
+			let stage = stages.pop().expect("one-stage chain checked");
+			let mut receipt = MembershipScheduleReceipt::from_env();
+			if let Some(receipt) = &mut receipt {
+				receipt.append(
+					"selected/committed",
+					serde_json::json!({"outer_writer_constructed": false}),
+				);
+				receipt.append("membership_execute_started", serde_json::json!({}));
+			}
+			let membership_started = Instant::now();
+			let right_batches = self.execute_bound(right, morsel).await?;
+			let membership_rows = right_batches
+				.iter()
+				.map(|batch| batch.num_rows() as u64)
+				.fold(0u64, u64::saturating_add);
+			let membership_batch_bytes = right_batches
+				.iter()
+				.map(record_batch_memory_bytes)
+				.fold(0u64, u64::saturating_add);
+			if let Some(receipt) = &mut receipt {
+				receipt.append(
+					"membership_execute_completed",
+					serde_json::json!({
+						"rows": membership_rows,
+						"batch_bytes": membership_batch_bytes,
+					}),
+				);
+			}
+			let Some(presence) = Int64PresenceSet::from_batches(
+				&right_batches,
+				right_keys[0],
+				self.context.task_budget.memory.get(),
+			)?
+			else {
+				let mut groups = BTreeMap::new();
+				let mut group_types = Vec::new();
+				let empty = RecordBatch::new_empty(semi_output_schema.clone());
+				self.fold_bound_grouped_aggregate_batch(
+					&mut groups,
+					&mut group_types,
+					group_expr,
+					aggr_expr,
+					&empty,
+				)?;
+				if let Some(receipt) = &mut receipt {
+					receipt.append("empty_membership_finalized", serde_json::json!({}));
+				}
+				record_join_runtime_observation(
+					&self.context.task_telemetry,
+					&self.context.join_runtime_observation_mode,
+					JoinRuntimeObservation {
+						replay_id: *replay_id,
+						strategy: *strategy,
+						build_rows: RowCount::new(0),
+						probe_rows: RowCount::new(0),
+						output_rows: RowCount::new(0),
+					},
+				);
+				return self
+					.finalize_bound_grouped_aggregate(
+						&groups,
+						&group_types,
+						aggr_expr,
+						output_schema,
+					)
+					.map(Some);
+			};
+			let presence_bytes = presence.accounted_bytes();
+			let membership_micros = duration_micros(membership_started);
+			if let Some(receipt) = &mut receipt {
+				receipt.append(
+					"presence_set_completed",
+					serde_json::json!({
+						"entries": presence.entries.len(),
+						"accounted_bytes": presence_bytes,
+						"construction_peak_bytes": presence.construction_peak_bytes,
+					}),
+				);
+			}
+			drop(right_batches);
+
+			let chain_started = Instant::now();
+			if let Some(receipt) = &mut receipt {
+				receipt.append("chain_runtime_prepare_started", serde_json::json!({}));
+			}
+			let Some(mut runtime) = self
+				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline(
+					stage,
+					morsel,
+					presence_bytes,
+				)
+				.await?
+			else {
+				return Err(ExecutionError::InvalidExpression {
+					message: "committed membership-first chain lost its terminal scan stage"
+						.to_string(),
+				});
+			};
+			let mut groups = BTreeMap::new();
+			let mut group_types = Vec::new();
+			let mut chain_input_rows = 0u64;
+			let mut matched_rows = 0u64;
+			if let Some(receipt) = &mut receipt {
+				receipt.append("chain_drive_started", serde_json::json!({}));
+			}
+			let mut sink = ReorientedChainOutputSink::MembershipFilteredGroupedFold {
+				presence: &presence,
+				left_key: left_keys[0],
+				partition_count: *partition_count,
+				exchange_key,
+				group_expr,
+				aggr_expr,
+				groups: &mut groups,
+				group_types: &mut group_types,
+				input_rows: &mut chain_input_rows,
+				output_rows: &mut matched_rows,
+			};
+			let drive_result = self
+				.try_streaming_reoriented_inner_chain_scan_probe_base_to_sink(
+					base,
+					&mut runtime,
+					&mut sink,
+					morsel,
+					presence_bytes,
+				)
+				.await;
+			drop(sink);
+			if drive_result.as_ref().is_ok_and(|matched| matched.is_some()) {
+				if let Some(receipt) = &mut receipt {
+					receipt.append(
+						"chain_drive_completed",
+						serde_json::json!({
+							"input_rows": chain_input_rows,
+							"matched_rows": matched_rows,
+						}),
+					);
+				}
+			}
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: runtime.replay_id,
+					strategy: runtime.strategy,
+					build_rows: RowCount::new(runtime.build_row_count()),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+			runtime.cleanup().await;
+			match drive_result {
+				Ok(Some(())) => {}
+				Ok(None) => {
+					return Err(ExecutionError::InvalidExpression {
+						message:
+							"committed membership-first chain could not stream its terminal stage"
+								.to_string(),
+					});
+				}
+				Err(error) => return Err(error),
+			}
+			record_task_telemetry(&self.context.task_telemetry, |task| {
+				task.phases.probe_micros =
+					task.phases.probe_micros.saturating_add(membership_micros);
+				task.phases.build_micros = task
+					.phases
+					.build_micros
+					.saturating_add(duration_micros(chain_started));
+				task.counters.build_rows =
+					task.counters.build_rows.saturating_add(chain_input_rows);
+				task.counters.probe_rows = task.counters.probe_rows.saturating_add(membership_rows);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(matched_rows);
+			});
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: *replay_id,
+					strategy: *strategy,
+					build_rows: RowCount::new(chain_input_rows),
+					probe_rows: RowCount::new(membership_rows),
+					output_rows: RowCount::new(matched_rows),
+				},
+			);
+			let output = self.finalize_bound_grouped_aggregate(
+				&groups,
+				&group_types,
+				aggr_expr,
+				output_schema,
+			);
+			if output.is_ok()
+				&& let Some(receipt) = &mut receipt
+			{
+				receipt.append("finalized", serde_json::json!({}));
+			}
+			return output.map(Some);
+		}
+
+		let projected_left_keys = remap_column_ordinals(&retained_columns, left_keys)?;
+		let projected_schema = projected_schema_for_columns(semi_output_schema, &retained_columns)?;
+		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&projected_schema,
+			&projected_left_keys,
+			&right.schema(),
+			right_keys,
+			*null_safe_keys,
+		)?;
+		let left_batches = self.execute_bound(left, morsel).await?;
+		let estimated_build_bytes =
+			estimated_build_hash_bytes_for_batches(&left_batches, left_keys)?;
+		if estimated_build_bytes <= self.context.task_budget.memory.get() {
+			return Ok(None);
+		}
+		let right_batches = self.execute_bound(right, morsel).await?;
+		record_membership_outer_writer_construct();
 		let mut spilled = SpilledInnerJoinBuild::create(
 			self.context.task_budget,
 			self.context.join_spill_file_ops.clone(),
@@ -7341,81 +7823,22 @@ impl Executor {
 		)
 		.await?;
 		let build_started = Instant::now();
-		let build_result = if let Some((base, mut stages)) = chain_candidate {
-			let required_output = retained_columns.iter().copied().collect();
-			mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
-			let stage = stages.pop().expect("one-stage chain checked");
-			let Some(runtime) = self
-				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
-				.await?
-			else {
-				spilled.cleanup().await;
-				return Err(ExecutionError::InvalidExpression {
-					message: "committed reoriented semi chain lost its terminal scan stage"
-						.to_string(),
-				});
-			};
-			let mut runtimes = vec![runtime];
-			let mut sink = ReorientedChainOutputSink::ProjectedSpill {
-				spilled: &mut spilled,
-				retained_columns: &retained_columns,
-				key_plan,
-				build_keys: &projected_left_keys,
-				null_safe_keys: *null_safe_keys,
-			};
-			let drive_result = self
-				.try_streaming_reoriented_inner_chain_scan_probe_base_to_sink(
-					base,
-					&mut runtimes[0],
-					&mut sink,
-					morsel,
-				)
-				.await;
-			drop(sink);
-			let result = match drive_result {
-				Ok(Some(())) => spilled.finish(self.context.task_budget).await,
-				Ok(None) => Err(ExecutionError::InvalidExpression {
-					message: "committed reoriented semi chain could not stream its terminal stage"
-						.to_string(),
-				}),
-				Err(error) => Err(error),
-			};
-			for runtime in &runtimes {
-				record_join_runtime_observation(
-					&self.context.task_telemetry,
-					&self.context.join_runtime_observation_mode,
-					JoinRuntimeObservation {
-						replay_id: runtime.replay_id,
-						strategy: runtime.strategy,
-						build_rows: RowCount::new(runtime.build_row_count()),
-						probe_rows: RowCount::new(runtime.probe_rows),
-						output_rows: RowCount::new(runtime.output_rows),
-					},
-				);
+		let build_result = async {
+			for batch in &left_batches {
+				spilled
+					.write_projected_batch_chunks(
+						batch,
+						&retained_columns,
+						key_plan,
+						&projected_left_keys,
+						*null_safe_keys,
+						self.context.task_budget,
+					)
+					.await?;
 			}
-			for runtime in runtimes {
-				runtime.cleanup().await;
-			}
-			result
-		} else {
-			let result = async {
-				for batch in left_batches.as_ref().expect("materialized left batches") {
-					spilled
-						.write_projected_batch_chunks(
-							batch,
-							&retained_columns,
-							key_plan,
-							&projected_left_keys,
-							*null_safe_keys,
-							self.context.task_budget,
-						)
-						.await?;
-				}
-				spilled.finish(self.context.task_budget).await
-			}
-			.await;
-			result
-		};
+			spilled.finish(self.context.task_budget).await
+		}
+		.await;
 		if let Err(error) = build_result {
 			spilled.cleanup().await;
 			return Err(error);
@@ -7438,17 +7861,6 @@ impl Executor {
 				.spill_bytes
 				.saturating_add(spilled.spill_bytes());
 		});
-		if right_batches.is_none() {
-			right_batches = match self.execute_bound(right, morsel).await {
-				Ok(batches) => Some(batches),
-				Err(error) => {
-					spilled.cleanup().await;
-					return Err(error);
-				}
-			};
-		}
-		let right_batches = right_batches.expect("membership batches prepared");
-
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
 		let probe_started = Instant::now();
@@ -7665,6 +8077,61 @@ impl Executor {
 						self.context.task_budget,
 					)
 					.await
+			}
+			ReorientedChainOutputSink::MembershipFilteredGroupedFold {
+				presence,
+				left_key,
+				partition_count,
+				exchange_key,
+				group_expr,
+				aggr_expr,
+				groups,
+				group_types,
+				input_rows,
+				output_rows,
+			} => {
+				**input_rows = input_rows.saturating_add(batch.num_rows() as u64);
+				let keys = batch
+					.columns()
+					.get(left_key.0 as usize)
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: "membership-filtered fold key is out of range".to_string(),
+					})?
+					.as_any()
+					.downcast_ref::<Int64Array>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: "membership-filtered fold key must be Int64".to_string(),
+					})?;
+				if keys.null_count() != 0 {
+					return Err(ExecutionError::InvalidExpression {
+						message: "membership-filtered fold key must be non-null".to_string(),
+					});
+				}
+				let mut matches = Vec::with_capacity(batch.num_rows());
+				for row in 0..batch.num_rows() {
+					matches.push(presence.contains(keys.value(row))?);
+				}
+				let mask = BooleanArray::from(matches);
+				let filtered = filter_record_batch(&batch, &mask)?;
+				**output_rows = output_rows.saturating_add(filtered.num_rows() as u64);
+				if filtered.num_rows() == 0 {
+					return Ok(());
+				}
+				for (_partition, partitioned) in
+					self.repartition_exchange_batch(&filtered, *partition_count, exchange_key)?
+				{
+					if partitioned.num_rows() == 0 {
+						continue;
+					}
+					self.fold_bound_grouped_aggregate_batch(
+						groups,
+						group_types,
+						group_expr,
+						aggr_expr,
+						&partitioned,
+					)?;
+				}
+				Ok(())
 			}
 		}
 	}
@@ -8066,7 +8533,8 @@ impl Executor {
 				)
 				.await
 			}
-			ReorientedChainOutputSink::ProjectedSpill { .. } => {
+			ReorientedChainOutputSink::ProjectedSpill { .. }
+			| ReorientedChainOutputSink::MembershipFilteredGroupedFold { .. } => {
 				self.try_visit_reoriented_adaptive_derived_last_stage_to_sink(
 					base,
 					runtime,
@@ -8847,6 +9315,7 @@ impl Executor {
 		runtime: &mut ReorientedInnerJoinRuntime<'_>,
 		sink: &mut ReorientedChainOutputSink<'_>,
 		morsel: Option<(MorselId, u32)>,
+		resident_baseline_bytes: u64,
 	) -> Result<Option<()>, ExecutionError> {
 		let ExecutionPlan::Exchange {
 			input: base_input,
@@ -8908,7 +9377,11 @@ impl Executor {
 			probe_columns_first: false,
 		};
 		let Some(mut base_runtime) = self
-			.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(base_stage, morsel)
+			.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline(
+				base_stage,
+				morsel,
+				resident_baseline_bytes,
+			)
 			.await?
 		else {
 			return Ok(None);
@@ -9120,6 +9593,7 @@ impl Executor {
 				base_key_plan,
 				false,
 				base_projection.as_ref(),
+				resident_baseline_bytes,
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -9160,13 +9634,20 @@ impl Executor {
 				return Err(error);
 			}
 		};
+		guard_membership_owner_resident(
+			resident_baseline_bytes,
+			summary_bytes::<Option<SpilledInnerJoinBuild>>(partition_count_usize),
+			self.context.task_budget.memory.get(),
+			"reoriented chain intermediate spill handles",
+		)?;
 		let mut intermediate_partitions: Vec<Option<SpilledInnerJoinBuild>> =
 			(0..partition_count_usize).map(|_| None).collect();
 		for slot in &mut intermediate_partitions {
-			let created = SpilledInnerJoinBuild::create(
+			let created = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
+				resident_baseline_bytes,
 			)
 			.await;
 			match created {
@@ -9205,13 +9686,20 @@ impl Executor {
 				return Err(error);
 			}
 		};
+		guard_membership_owner_resident(
+			resident_baseline_bytes,
+			summary_bytes::<Option<SpilledInnerJoinBuild>>(base_partition_count_usize),
+			self.context.task_budget.memory.get(),
+			"reoriented chain base probe spill handles",
+		)?;
 		let mut base_probe_partitions: Vec<Option<SpilledInnerJoinBuild>> =
 			(0..base_partition_count_usize).map(|_| None).collect();
 		for slot in &mut base_probe_partitions {
-			let created = SpilledInnerJoinBuild::create(
+			let created = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
+				resident_baseline_bytes,
 			)
 			.await;
 			match created {
@@ -9338,6 +9826,7 @@ impl Executor {
 						base_probe_columns_first,
 						base_build_column_count,
 						base_projection.as_ref(),
+						resident_baseline_bytes,
 					)
 					.await;
 				let build_partition = base_reservoir.get_mut(partition).and_then(Option::take);
@@ -9485,14 +9974,21 @@ impl Executor {
 			let group_count = group_count.max(1).min(partition_count);
 			for group in 0..group_count {
 				let group_range = partition_group_bounds(partition_count, group_count, group)?;
+				guard_membership_owner_resident(
+					resident_baseline_bytes,
+					summary_bytes::<Option<SpilledInnerJoinBuild>>(partition_count_usize),
+					self.context.task_budget.memory.get(),
+					"reoriented chain terminal spill handles",
+				)?;
 				let mut terminal_partitions: Vec<Option<SpilledInnerJoinBuild>> =
 					(0..partition_count_usize).map(|_| None).collect();
 				let mut create_error = None;
 				for partition in group_range.clone() {
-					match SpilledInnerJoinBuild::create(
+					match SpilledInnerJoinBuild::create_with_resident_baseline(
 						self.context.task_budget,
 						self.context.join_spill_file_ops.clone(),
 						self.context.join_spill_dir.clone(),
+						resident_baseline_bytes,
 					)
 					.await
 					{
@@ -9572,6 +10068,7 @@ impl Executor {
 								probe_columns_first,
 								build_column_count,
 								projection.as_ref(),
+								resident_baseline_bytes,
 							)
 							.await;
 						let terminal_partition = terminal_partitions
@@ -9870,6 +10367,7 @@ impl Executor {
 				key_plan,
 				null_safe_keys,
 				projection.as_ref(),
+				0,
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
@@ -9903,6 +10401,7 @@ impl Executor {
 					probe_columns_first,
 					build_column_count,
 					projection.as_ref(),
+					0,
 				)
 				.await?;
 			total_probe_rows = total_probe_rows.saturating_add(probe_rows);
@@ -10627,7 +11126,7 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, false)
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, false, 0)
 			.await
 	}
 
@@ -10638,8 +11137,23 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, true)
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, true, 0)
 			.await
+	}
+
+	async fn prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline<'a>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		morsel: Option<(MorselId, u32)>,
+		resident_baseline_bytes: u64,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(
+			stage,
+			morsel,
+			true,
+			resident_baseline_bytes,
+		)
+		.await
 	}
 
 	async fn prepare_reoriented_inner_join_runtime_with_scan_build<'a>(
@@ -10647,6 +11161,7 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 		morsel: Option<(MorselId, u32)>,
 		stream_scan_build: bool,
+		resident_baseline_bytes: u64,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		if stream_scan_build && decompose_streaming_scan_probe_input(stage.build).is_some() {
 			let scan_input =
@@ -10736,6 +11251,12 @@ impl Executor {
 					usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
 						message: "streamed inner build partition count exceeds usize".to_string(),
 					})?;
+				guard_membership_owner_resident(
+					resident_baseline_bytes,
+					summary_bytes::<Option<LoadedSpilledInnerBuild>>(partition_count_usize),
+					self.context.task_budget.memory.get(),
+					"reoriented inner partition runtime",
+				)?;
 				return Ok(Some(ReorientedInnerJoinRuntime {
 					replay_id: stage.replay_id,
 					strategy: stage.strategy,
@@ -10764,26 +11285,34 @@ impl Executor {
 					output_rows: 0,
 				}));
 			}
-			let mut spilled = SpilledInnerJoinBuild::create(
+			let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
+				resident_baseline_bytes,
 			)
 			.await?;
 			let build_started = Instant::now();
-			self.write_streaming_scan_inner_build_batches(
-				&mut spilled,
-				scan_input,
-				retained_columns,
-				write_build_keys,
-				key_plan,
-				false,
-				false,
-				None,
-				morsel,
-			)
-			.await?;
-			spilled.finish(self.context.task_budget).await?;
+			let build_result = async {
+				self.write_streaming_scan_inner_build_batches(
+					&mut spilled,
+					scan_input,
+					retained_columns,
+					write_build_keys,
+					key_plan,
+					false,
+					false,
+					None,
+					morsel,
+				)
+				.await?;
+				spilled.finish(self.context.task_budget).await
+			}
+			.await;
+			if let Err(error) = build_result {
+				spilled.cleanup().await;
+				return Err(error);
+			}
 			let build_rows = spilled.input_row_count();
 			record_task_telemetry(&self.context.task_telemetry, |task| {
 				task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
@@ -10820,14 +11349,32 @@ impl Executor {
 		}
 
 		let build_batches = self.execute_bound(stage.build, morsel).await?;
-		self.prepare_reoriented_inner_join_runtime_from_build_batches(stage, build_batches)
-			.await
+		self.prepare_reoriented_inner_join_runtime_from_build_batches_with_baseline(
+			stage,
+			build_batches,
+			resident_baseline_bytes,
+		)
+		.await
 	}
 
 	async fn prepare_reoriented_inner_join_runtime_from_build_batches<'a>(
 		&self,
 		stage: ReorientedInnerJoinStage<'a>,
 		build_batches: Vec<RecordBatch>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		self.prepare_reoriented_inner_join_runtime_from_build_batches_with_baseline(
+			stage,
+			build_batches,
+			0,
+		)
+		.await
+	}
+
+	async fn prepare_reoriented_inner_join_runtime_from_build_batches_with_baseline<'a>(
+		&self,
+		stage: ReorientedInnerJoinStage<'a>,
+		build_batches: Vec<RecordBatch>,
+		resident_baseline_bytes: u64,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		let build_memory_cap =
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
@@ -10841,26 +11388,34 @@ impl Executor {
 			false,
 		)?;
 		if estimated_build_bytes > build_memory_cap {
-			let mut spilled = SpilledInnerJoinBuild::create(
+			let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
+				resident_baseline_bytes,
 			)
 			.await?;
 			spilled.use_compact_resident_index();
 			let build_started = Instant::now();
-			for batch in &build_batches {
-				spilled
-					.write_batch_chunks(
-						batch,
-						key_plan,
-						&stage.build_keys,
-						false,
-						self.context.task_budget,
-					)
-					.await?;
+			let build_result = async {
+				for batch in &build_batches {
+					spilled
+						.write_batch_chunks(
+							batch,
+							key_plan,
+							&stage.build_keys,
+							false,
+							self.context.task_budget,
+						)
+						.await?;
+				}
+				spilled.finish(self.context.task_budget).await
 			}
-			spilled.finish(self.context.task_budget).await?;
+			.await;
+			if let Err(error) = build_result {
+				spilled.cleanup().await;
+				return Err(error);
+			}
 			let build_rows = spilled.input_row_count();
 			record_task_telemetry(&self.context.task_telemetry, |task| {
 				task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
@@ -10900,6 +11455,12 @@ impl Executor {
 				output_rows: 0,
 			}));
 		}
+		guard_membership_owner_resident(
+			resident_baseline_bytes,
+			estimated_build_bytes,
+			self.context.task_budget.memory.get(),
+			"reoriented inner in-memory runtime",
+		)?;
 		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
 		let build_started = Instant::now();
@@ -11793,6 +12354,7 @@ impl Executor {
 					write_build_keys,
 					null_safe_keys,
 					self.context.task_budget.memory.get(),
+					0,
 				)?;
 				if loaded_resident_bytes.saturating_add(loaded.resident_bytes()) > loaded_cap {
 					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
@@ -11836,6 +12398,7 @@ impl Executor {
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
 		projection: Option<&ProjectedInnerBuildProjection>,
+		resident_baseline_bytes: u64,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -11844,10 +12407,11 @@ impl Executor {
 		let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
 			(0..partition_count_usize).map(|_| None).collect();
 		for slot in &mut partitioned_builds {
-			let created = SpilledInnerJoinBuild::create(
+			let created = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
+				resident_baseline_bytes,
 			)
 			.await?;
 			*slot = Some(created);
@@ -11987,6 +12551,7 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		projection: Option<&ProjectedInnerBuildProjection>,
+		resident_baseline_bytes: u64,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
 		let mut output = Vec::new();
 		let mut total_probe_rows = 0u64;
@@ -12026,7 +12591,7 @@ impl Executor {
 				let loaded_resident =
 					estimate_parallel_partition_resident(spilled, partitioned_probe, key_plan);
 				let loaded_cap = join_spill_retained_footprint_memory_cap(memory_cap);
-				if loaded_resident <= loaded_cap {
+				if resident_baseline_bytes.saturating_add(loaded_resident) <= loaded_cap {
 					let build_pages = spilled.read_all_batch_pages().await?;
 					let work = LoadedPartitionWork {
 						partition: *partition,
@@ -12042,6 +12607,7 @@ impl Executor {
 						build_column_count,
 						projection: projection.cloned(),
 						memory_cap,
+						resident_baseline_bytes,
 					};
 					let result = run_loaded_partition_work(work)?;
 					total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
@@ -12264,6 +12830,7 @@ impl Executor {
 						build_column_count,
 						projection: projection.cloned(),
 						memory_cap: self.context.task_budget.memory.get(),
+						resident_baseline_bytes: 0,
 					};
 					handles.push(tokio::task::spawn_blocking(move || {
 						let _permit = permit;
@@ -12380,6 +12947,7 @@ impl Executor {
 							build_column_count,
 							projection: projection.cloned(),
 							memory_cap,
+							resident_baseline_bytes: 0,
 						};
 						let result = match run_loaded_partition_work(work) {
 							Ok(result) => result,
@@ -12879,7 +13447,7 @@ mod tests {
 		budget: TaskBudget,
 		terminal_estimated_bytes: Option<u64>,
 		chain_replay_id: JoinReplayId,
-		include_membership: bool,
+		membership_keys: Option<Vec<i64>>,
 	) -> (
 		Executor,
 		ExecutionPlan,
@@ -12934,18 +13502,18 @@ mod tests {
 			],
 		)
 		.expect("line batch");
-		let membership = RecordBatch::try_new(
-			membership_schema.clone(),
-			vec![Arc::new(Int64Array::from(vec![10, 10, 20, 999]))],
-		)
-		.expect("membership batch");
 		let requested_tables = Arc::new(Mutex::new(Vec::new()));
 		let mut batches = HashMap::from([
 			(TableId(60), vec![customer]),
 			(TableId(61), vec![orders]),
 			(TableId(62), vec![line]),
 		]);
-		if include_membership {
+		if let Some(membership_keys) = membership_keys {
+			let membership = RecordBatch::try_new(
+				membership_schema.clone(),
+				vec![Arc::new(Int64Array::from(membership_keys))],
+			)
+			.expect("membership batch");
 			batches.insert(TableId(63), vec![membership]);
 		}
 		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
@@ -13055,6 +13623,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn reoriented_chain_under_semi_is_directly_admitted_and_matches_materialized() {
+		MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT.store(0, Ordering::SeqCst);
 		let budget = TaskBudget {
 			memory: ByteCount::new(64 * 1024 * 1024),
 			spill_bytes: ByteCount::new(256 * 1024 * 1024),
@@ -13062,7 +13631,12 @@ mod tests {
 		};
 		let metadata = Some(16 * 1024 * 1024 * 1024);
 		let (executor, input, _, group_expr, aggr_expr, output_schema, requested) =
-			reoriented_chain_under_semi_fixture(budget, metadata, JoinReplayId(1), true);
+			reoriented_chain_under_semi_fixture(
+				budget,
+				metadata,
+				JoinReplayId(1),
+				Some(vec![10, 10, 20, 999]),
+			);
 		let streamed_spill_dir = executor.context.join_spill_dir.clone();
 		let streamed = executor
 			.try_streaming_projected_left_semi_grouped_aggregate(
@@ -13075,9 +13649,18 @@ mod tests {
 			.await
 			.expect("direct recognizer")
 			.expect("exact chain must be admitted");
+		assert_eq!(
+			MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT.load(Ordering::SeqCst),
+			0,
+			"membership-first composition must not construct the outer projected writer"
+		);
 
-		let (baseline_executor, _, baseline_plan, _, _, _, _) =
-			reoriented_chain_under_semi_fixture(high_test_budget(), None, JoinReplayId(2), true);
+		let (baseline_executor, _, baseline_plan, _, _, _, _) = reoriented_chain_under_semi_fixture(
+			high_test_budget(),
+			None,
+			JoinReplayId(2),
+			Some(vec![10, 10, 20, 999]),
+		);
 		let baseline_spill_dir = baseline_executor.context.join_spill_dir.clone();
 		let materialized = baseline_executor
 			.execute_bound(&baseline_plan, None)
@@ -13117,7 +13700,12 @@ mod tests {
 			(Some(16 * 1024 * 1024 * 1024), JoinReplayId(2)),
 		] {
 			let (executor, input, _, group_expr, aggr_expr, output_schema, requested) =
-				reoriented_chain_under_semi_fixture(high_test_budget(), metadata, replay_id, true);
+				reoriented_chain_under_semi_fixture(
+					high_test_budget(),
+					metadata,
+					replay_id,
+					Some(vec![10, 10, 20, 999]),
+				);
 			let spill_dir = executor.context.join_spill_dir.clone();
 			let output = executor
 				.try_streaming_projected_left_semi_grouped_aggregate(
@@ -13142,7 +13730,7 @@ mod tests {
 				high_test_budget(),
 				Some(32 * 1024 * 1024 * 1024),
 				JoinReplayId(1),
-				true,
+				Some(vec![10, 10, 20, 999]),
 			);
 		let spill_dir = executor.context.join_spill_dir.clone();
 		let extra_schema = Arc::new(Schema::new(vec![Field::new(
@@ -13194,6 +13782,72 @@ mod tests {
 			"longer chain fence must not consume a scan"
 		);
 		let _ = std::fs::remove_dir_all(spill_dir);
+
+		for fence in ["null_safe", "composite", "nullable", "non_primitive"] {
+			let (executor, mut input, _, group_expr, aggr_expr, output_schema, requested) =
+				reoriented_chain_under_semi_fixture(
+					TaskBudget {
+						memory: ByteCount::new(64 * 1024 * 1024),
+						spill_bytes: ByteCount::new(256 * 1024 * 1024),
+						..TaskBudget::from_query_budget(QueryBudget::test_default())
+					},
+					Some(16 * 1024 * 1024 * 1024),
+					JoinReplayId(1),
+					Some(vec![10, 20]),
+				);
+			let spill_dir = executor.context.join_spill_dir.clone();
+			let ExecutionPlan::Exchange { input: semi, .. } = &mut input else {
+				panic!("aggregate input exchange")
+			};
+			let ExecutionPlan::Join {
+				left_keys,
+				right_keys,
+				null_safe_keys,
+				output_schema: semi_schema,
+				..
+			} = semi.as_mut()
+			else {
+				panic!("semi join")
+			};
+			match fence {
+				"null_safe" => *null_safe_keys = true,
+				"composite" => {
+					left_keys.push(left_keys[0]);
+					right_keys.push(right_keys[0]);
+				}
+				"nullable" | "non_primitive" => {
+					let mut fields = semi_schema
+						.fields()
+						.iter()
+						.map(|field| field.as_ref().clone())
+						.collect::<Vec<_>>();
+					let key_index = left_keys[0].0 as usize;
+					fields[key_index] = if fence == "nullable" {
+						Field::new(fields[key_index].name(), DataType::Int64, true)
+					} else {
+						Field::new(fields[key_index].name(), DataType::Utf8, false)
+					};
+					*semi_schema = Arc::new(Schema::new(fields));
+				}
+				_ => unreachable!(),
+			}
+			let admitted = executor
+				.try_streaming_projected_left_semi_grouped_aggregate(
+					&input,
+					&group_expr,
+					&aggr_expr,
+					&output_schema,
+					None,
+				)
+				.await
+				.expect("direct-filter fence");
+			assert!(admitted.is_none(), "{fence} must decline");
+			assert!(
+				requested.lock().expect("requested tables").is_empty(),
+				"{fence} must decline before I/O"
+			);
+			let _ = std::fs::remove_dir_all(spill_dir);
+		}
 	}
 
 	#[tokio::test]
@@ -13208,7 +13862,7 @@ mod tests {
 				budget,
 				Some(16 * 1024 * 1024 * 1024),
 				JoinReplayId(1),
-				false,
+				None,
 			);
 		let spill_dir = executor.context.join_spill_dir.clone();
 		let error = executor
@@ -13220,7 +13874,7 @@ mod tests {
 				None,
 			)
 			.await
-			.expect_err("missing membership table must fail after preserved spill");
+			.expect_err("missing membership table must fail before the preserved chain starts");
 		assert!(
 			matches!(
 				error,
@@ -13229,17 +13883,175 @@ mod tests {
 			"unexpected membership error: {error:?}"
 		);
 		assert!(
-			requested
-				.lock()
-				.expect("requested tables")
-				.contains(&TableId(63)),
-			"fixture must fail while opening the membership scan"
+			matches!(
+				requested.lock().expect("requested tables").as_slice(),
+				[TableId(63)]
+			),
+			"membership-first failure must not open a preserved-side scan"
 		);
 		let remaining = std::fs::read_dir(&spill_dir)
 			.map(|entries| entries.count())
 			.unwrap_or(0);
 		assert_eq!(remaining, 0, "membership error leaked spill scratch");
 		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn reoriented_chain_under_semi_empty_membership_skips_preserved_chain() {
+		MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT.store(0, Ordering::SeqCst);
+		let budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024 * 1024),
+			spill_bytes: ByteCount::new(256 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let (executor, input, _, group_expr, aggr_expr, output_schema, requested) =
+			reoriented_chain_under_semi_fixture(
+				budget,
+				Some(16 * 1024 * 1024 * 1024),
+				JoinReplayId(1),
+				Some(Vec::new()),
+			);
+		let spill_dir = executor.context.join_spill_dir.clone();
+		let output = executor
+			.try_streaming_projected_left_semi_grouped_aggregate(
+				&input,
+				&group_expr,
+				&aggr_expr,
+				&output_schema,
+				None,
+			)
+			.await
+			.expect("empty membership execution")
+			.expect("exact chain remains directly admitted");
+		assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+		assert_eq!(
+			requested.lock().expect("requested tables").as_slice(),
+			[TableId(63)],
+			"empty membership must skip every preserved-side scan"
+		);
+		assert_eq!(
+			MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT.load(Ordering::SeqCst),
+			0
+		);
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[test]
+	fn int64_presence_set_is_one_shot_duplicate_idempotent_and_full_domain_safe() {
+		assert_eq!(std::mem::size_of::<i64>(), 8);
+		assert_eq!(std::mem::size_of::<u32>(), 4);
+		let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(Int64Array::from(vec![i64::MIN, 10, 10, i64::MAX]))],
+		)
+		.expect("presence batch");
+		let set = Int64PresenceSet::from_batches(&[batch], ColumnOrdinal(0), 1024 * 1024)
+			.expect("presence build")
+			.expect("nonempty set");
+		assert_eq!(set.entries.len(), 3);
+		assert!(set.entries.capacity() >= 1024);
+		assert_eq!(set.buckets.len(), 2048);
+		assert!(set.buckets.capacity() >= 2048);
+		assert_eq!(
+			set.accounted_bytes(),
+			summary_bytes::<i64>(set.entries.capacity())
+				+ summary_bytes::<u32>(set.buckets.capacity())
+		);
+		assert!(set.contains(i64::MIN).expect("minimum lookup"));
+		assert!(set.contains(10).expect("duplicate lookup"));
+		assert!(set.contains(i64::MAX).expect("maximum lookup"));
+		assert!(!set.contains(11).expect("absent lookup"));
+		assert!(matches!(
+			Int64PresenceSet::capacity_targets(u32::MAX as usize),
+			Err(ExecutionError::Kernel { .. })
+		));
+	}
+
+	#[test]
+	fn membership_owner_baseline_changes_only_resident_guard_bytes() {
+		let estimated_build_bytes = 16 * 1024 * 1024 * 1024;
+		let memory_cap = 64 * 1024 * 1024;
+		let spill_budget = 8 * 1024 * 1024 * 1024;
+		let decision_without_baseline =
+			streamed_inner_build_partition_count(estimated_build_bytes, memory_cap, spill_budget)
+				.expect("partition decision");
+		let decision_with_owner_baseline =
+			streamed_inner_build_partition_count(estimated_build_bytes, memory_cap, spill_budget)
+				.expect("same partition decision");
+		assert_eq!(decision_without_baseline, decision_with_owner_baseline);
+
+		let guard_memory = 1024;
+		let local = join_spill_retained_footprint_memory_cap(guard_memory);
+		guard_membership_owner_resident(0, local, guard_memory, "baseline test")
+			.expect("local state exactly at cap");
+		let error = guard_membership_owner_resident(1, local, guard_memory, "baseline test")
+			.expect_err("baseline adds exactly to requested resident bytes");
+		match error {
+			ExecutionError::BudgetExhausted {
+				requested,
+				available,
+				..
+			} => {
+				assert_eq!(requested.get(), local + 1);
+				assert_eq!(available.get(), local);
+			}
+			other => panic!("expected resident guard crossing, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn int64_presence_set_construction_guard_counts_live_batches() {
+		let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+			.expect("presence batch");
+		let error = match Int64PresenceSet::from_batches(&[batch], ColumnOrdinal(0), 1024) {
+			Err(error) => error,
+			Ok(_) => panic!("set allocation fits alone but the live batch must cross the guard"),
+		};
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				producer: INT64_PRESENCE_PRODUCER,
+				..
+			}
+		));
+		assert!(
+			Int64PresenceSet::from_batches(&[], ColumnOrdinal(0), 0)
+				.expect("empty set")
+				.is_none(),
+			"empty membership must allocate nothing"
+		);
+	}
+
+	#[test]
+	fn membership_schedule_receipt_survives_a_post_commit_stop() {
+		let directory = std::env::temp_dir().join(format!(
+			"toron_membership_receipt_test_{}_{}",
+			std::process::id(),
+			NEXT_CHAIN_SEMI_TEST_DIR.fetch_add(1, Ordering::SeqCst)
+		));
+		std::fs::create_dir_all(&directory).expect("receipt directory");
+		let path = directory.join("receipt.jsonl");
+		{
+			let mut receipt = MembershipScheduleReceipt::at_path(path.clone());
+			receipt.append(
+				"selected/committed",
+				serde_json::json!({"outer_writer_constructed": false}),
+			);
+			receipt.append("membership_execute_started", serde_json::json!({}));
+			// Dropping here models termination after commit and before the subtree returns.
+		}
+		let rows = std::fs::read_to_string(&path).expect("durable receipt");
+		let parsed = rows
+			.lines()
+			.map(|line| serde_json::from_str::<serde_json::Value>(line).expect("receipt row"))
+			.collect::<Vec<_>>();
+		assert_eq!(parsed.len(), 2);
+		assert_eq!(parsed[0]["milestone"], "selected/committed");
+		assert_eq!(parsed[0]["detail"]["outer_writer_constructed"], false);
+		assert_eq!(parsed[1]["milestone"], "membership_execute_started");
+		let _ = std::fs::remove_dir_all(directory);
 	}
 
 	#[test]
@@ -13369,6 +14181,7 @@ mod tests {
 				JoinKeyPlan::Int64,
 				false,
 				None,
+				0,
 			)
 			.await
 			.expect("reservoir build")
@@ -13402,6 +14215,7 @@ mod tests {
 				true,
 				build_schema.fields().len(),
 				None,
+				0,
 			)
 			.await;
 		Executor::cleanup_partitioned_streamed_inner_builds(reservoir).await;

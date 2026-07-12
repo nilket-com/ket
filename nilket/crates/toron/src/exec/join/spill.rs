@@ -104,6 +104,7 @@ impl SpillResidentGuardSite {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SpillResidentState {
+	resident_baseline_bytes: u64,
 	resident_index_bytes: u64,
 	writer_peak_bytes: u64,
 	page_reserve_bytes: u64,
@@ -112,7 +113,8 @@ struct SpillResidentState {
 
 impl SpillResidentState {
 	fn total(self) -> u64 {
-		self.resident_index_bytes
+		self.resident_baseline_bytes
+			.saturating_add(self.resident_index_bytes)
 			.saturating_add(self.writer_peak_bytes)
 			.saturating_add(self.page_reserve_bytes)
 			.saturating_add(self.pinned_decoded_bytes)
@@ -120,8 +122,9 @@ impl SpillResidentState {
 
 	fn detail(self, site: SpillResidentGuardSite) -> crate::error::BudgetExhaustedDetail {
 		crate::error::BudgetExhaustedDetail::message(format!(
-			"site={}, resident_index_bytes={}, writer_peak_bytes={}, page_reserve_bytes={}, pinned_decoded_bytes={}",
+			"site={}, resident_baseline_bytes={}, resident_index_bytes={}, writer_peak_bytes={}, page_reserve_bytes={}, pinned_decoded_bytes={}",
 			site.as_str(),
+			self.resident_baseline_bytes,
 			self.resident_index_bytes,
 			self.writer_peak_bytes,
 			self.page_reserve_bytes,
@@ -1169,6 +1172,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	next_offset: u64,
 	scratch_plaintext: Vec<u8>,
 	scratch_refs: Vec<(JoinKey, u32)>,
+	resident_baseline_bytes: u64,
 }
 
 impl SpilledInnerJoinBuild {
@@ -1177,9 +1181,26 @@ impl SpilledInnerJoinBuild {
 		file_ops: Arc<dyn AsyncFileOps>,
 		spill_dir: PathBuf,
 	) -> Result<Self, ExecutionError> {
+		Self::create_with_resident_baseline(task_budget, file_ops, spill_dir, 0).await
+	}
+
+	pub(in crate::exec) async fn create_with_resident_baseline(
+		task_budget: TaskBudget,
+		file_ops: Arc<dyn AsyncFileOps>,
+		spill_dir: PathBuf,
+		resident_baseline_bytes: u64,
+	) -> Result<Self, ExecutionError> {
 		let spill_id = NEXT_JOIN_SPILL_ID.fetch_add(1, Ordering::SeqCst);
 		let path = spill_dir.join(format!("spill_{}_{}.inner", std::process::id(), spill_id));
-		match Self::create_inner(spill_id, path.clone(), task_budget, file_ops.clone()).await {
+		match Self::create_inner_with_resident_baseline(
+			spill_id,
+			path.clone(),
+			task_budget,
+			file_ops.clone(),
+			resident_baseline_bytes,
+		)
+		.await
+		{
 			Ok(spill) => Ok(spill),
 			Err(error) => {
 				let _ = file_ops.unlink(&path).await;
@@ -1188,11 +1209,12 @@ impl SpilledInnerJoinBuild {
 		}
 	}
 
-	pub(in crate::exec) async fn create_inner(
+	async fn create_inner_with_resident_baseline(
 		spill_id: u64,
 		path: PathBuf,
 		task_budget: TaskBudget,
 		file_ops: Arc<dyn AsyncFileOps>,
+		resident_baseline_bytes: u64,
 	) -> Result<Self, ExecutionError> {
 		let spill_dir = path.parent().ok_or_else(|| ExecutionError::Kernel {
 			message: "inner join batch spill path has no parent directory".to_string(),
@@ -1256,6 +1278,7 @@ impl SpilledInnerJoinBuild {
 			next_offset: 0,
 			scratch_plaintext: Vec::new(),
 			scratch_refs: Vec::new(),
+			resident_baseline_bytes,
 		})
 	}
 
@@ -1701,7 +1724,8 @@ impl SpilledInnerJoinBuild {
 		self.pin_decoded_attempted = true;
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
 		let estimated_resident = self
-			.resident_index_bytes
+			.resident_baseline_bytes
+			.saturating_add(self.resident_index_bytes)
 			.saturating_add(self.writer_peak)
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
 			.saturating_add(self.loaded_page_bytes_estimate());
@@ -1715,7 +1739,8 @@ impl SpilledInnerJoinBuild {
 			let batch = self.read_batch_page(page_index).await?;
 			decoded_bytes = decoded_bytes.saturating_add(record_batch_memory_bytes(&batch));
 			let resident = self
-				.resident_index_bytes
+				.resident_baseline_bytes
+				.saturating_add(self.resident_index_bytes)
 				.saturating_add(self.writer_peak)
 				.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
 				.saturating_add(decoded_bytes);
@@ -1784,6 +1809,7 @@ impl SpilledInnerJoinBuild {
 
 	fn resident_state(&self) -> SpillResidentState {
 		SpillResidentState {
+			resident_baseline_bytes: self.resident_baseline_bytes,
 			resident_index_bytes: self.resident_index_bytes,
 			writer_peak_bytes: self.writer_peak,
 			page_reserve_bytes: JOIN_SPILL_PAGE_SIZE as u64,
@@ -4510,12 +4536,62 @@ mod tests {
 				assert_eq!(requested.get(), cap + 1 + JOIN_SPILL_PAGE_SIZE as u64);
 				assert_eq!(available.get(), cap);
 				assert!(detail.contains("site=finish"));
+				assert!(detail.contains("resident_baseline_bytes=0"));
 				assert!(detail.contains("resident_index_bytes=16384"));
 				assert!(detail.contains("writer_peak_bytes=1"));
 				assert!(detail.contains("page_reserve_bytes=65536"));
 				assert!(detail.contains("pinned_decoded_bytes=0"));
 			}
 			other => panic!("expected detailed budget exhaustion, got {other:?}"),
+		}
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn inner_spill_guard_adds_explicit_baseline_without_double_counting_it() {
+		let budget = test_task_budget();
+		let memory_cap = 8 * 1024;
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let baseline = 60_000;
+		let local_index = 10_000;
+		assert!(baseline + JOIN_SPILL_PAGE_SIZE as u64 <= cap);
+		assert!(local_index + JOIN_SPILL_PAGE_SIZE as u64 <= cap);
+		let spill_dir = test_spill_dir("inner_guard_baseline");
+		let mut build = SpilledInnerJoinBuild::create_with_resident_baseline(
+			budget,
+			Arc::new(BlockingFileOps),
+			spill_dir.clone(),
+			baseline,
+		)
+		.await
+		.expect("create inner spill with baseline");
+		assert_eq!(
+			build.retained_resident_bytes(),
+			JOIN_SPILL_PAGE_SIZE as u64,
+			"only the spill's local page reserve is exported; the owner baseline is not"
+		);
+		build.resident_index_bytes = local_index;
+		let error = build
+			.guard_resident_state(memory_cap, SpillResidentGuardSite::Finish)
+			.expect_err("combined baseline and local state must cross the guard");
+		match error {
+			ExecutionError::BudgetExhausted {
+				requested,
+				available,
+				detail: crate::error::BudgetExhaustedDetail::Message(detail),
+				..
+			} => {
+				assert_eq!(
+					requested.get(),
+					baseline + local_index + JOIN_SPILL_PAGE_SIZE as u64
+				);
+				assert_eq!(available.get(), cap);
+				assert!(detail.contains("resident_baseline_bytes=60000"));
+				assert!(detail.contains("resident_index_bytes=10000"));
+			}
+			other => panic!("expected combined resident guard failure, got {other:?}"),
 		}
 
 		build.cleanup().await;
