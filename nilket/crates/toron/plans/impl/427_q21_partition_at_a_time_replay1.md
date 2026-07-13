@@ -21,8 +21,10 @@ the drain requires a global executor change rather than owner scheduling.
 3. **Build-page-reread baseline:** confirm the current reservoir probe re-decodes build pages per
    call (the 420-class risk the drain must avoid), so the after-measurement has a before.
 4. **Replay-0 output volume:** record the buffered probe-side row/byte volume at sf=10, the
-   build-reservoir bytes, their combined spill-quota peak, and all persistent handle/page-metadata
-   residency; confirm the probe side can stream per page rather than materializing.
+   build-reservoir bytes, aggregate reservoir disk volume, and all persistent
+   handle/page-metadata residency; confirm the probe side can stream per page rather than
+   materializing. Preserve ADR 413's landed quota contract: each partition writer stays under
+   the unchanged writer quota; do not invent an aggregate 512 MiB cap across all writers.
 5. **Combined-pass feasibility:** record that today's `rebuild_index_from_pages` followed by
    `try_pin_decoded_pages` reads the build pages twice. Confirm the full active partition fits
    while pages are retained, because 427 requires a one-pass rebuild-and-pin seam rather than

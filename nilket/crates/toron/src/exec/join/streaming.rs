@@ -9,6 +9,7 @@ const NEQ_EXISTENCE_SUMMARY_PRODUCER: &str = "recognized Neq existence summary r
 const EMPTY_INT64_PRESENCE_BUCKET: u32 = u32::MAX;
 const INT64_PRESENCE_INITIAL_ENTRY_CAPACITY: usize = 1024;
 const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
+const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident state";
 
 #[cfg(test)]
 static MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +58,8 @@ impl MembershipScheduleReceipt {
 
 const CHAIN_STAGE_PROFILE_ENV: &str = "TORON_CHAIN_STAGE_PROFILE_PATH";
 const CHAIN_STAGE_COUNT: usize = 7;
+const CHAIN_DEFERRED_BASE_FLUSH_INTERVAL: u64 = 256;
+const CHAIN_DEFERRED_PAGE_FLUSH_INTERVAL: u64 = 1024;
 
 #[derive(Clone, Copy)]
 enum ChainStage {
@@ -113,6 +116,18 @@ struct ChainStageProfiler {
 	drive_completed: bool,
 	terminal_error: Option<String>,
 	stages: [ChainStageMeasurement; CHAIN_STAGE_COUNT],
+	deferred_partition_count: u64,
+	deferred_active_partition: Option<u64>,
+	deferred_completed_partitions: u64,
+	deferred_probe_rows_buffered: u64,
+	deferred_index_builds: u64,
+	deferred_build_page_reads: u64,
+	deferred_build_decoded_bytes: u64,
+	deferred_probe_page_reads: u64,
+	deferred_build_spill_bytes: u64,
+	deferred_probe_spill_bytes: u64,
+	deferred_max_index_bytes: u64,
+	deferred_max_pinned_build_bytes: u64,
 }
 
 impl ChainStageProfiler {
@@ -138,7 +153,110 @@ impl ChainStageProfiler {
 			drive_completed: false,
 			terminal_error: None,
 			stages: [ChainStageMeasurement::default(); CHAIN_STAGE_COUNT],
+			deferred_partition_count: 0,
+			deferred_active_partition: None,
+			deferred_completed_partitions: 0,
+			deferred_probe_rows_buffered: 0,
+			deferred_index_builds: 0,
+			deferred_build_page_reads: 0,
+			deferred_build_decoded_bytes: 0,
+			deferred_probe_page_reads: 0,
+			deferred_build_spill_bytes: 0,
+			deferred_probe_spill_bytes: 0,
+			deferred_max_index_bytes: 0,
+			deferred_max_pinned_build_bytes: 0,
 		}
+	}
+
+	fn begin_deferred_replay(
+		&mut self,
+		partition_count: usize,
+		build_spill_bytes: u64,
+	) -> Result<(), ExecutionError> {
+		self.deferred_partition_count =
+			u64::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
+				message: "chain stage deferred partition count exceeds u64".to_string(),
+			})?;
+		self.deferred_build_spill_bytes = build_spill_bytes;
+		Ok(())
+	}
+
+	fn set_deferred_probe_spill_bytes(&mut self, probe_spill_bytes: u64) {
+		self.deferred_probe_spill_bytes = probe_spill_bytes;
+	}
+
+	fn add_deferred_probe_rows(&mut self, rows: u64) -> Result<(), ExecutionError> {
+		self.deferred_probe_rows_buffered = self
+			.deferred_probe_rows_buffered
+			.checked_add(rows)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage deferred probe row count overflow".to_string(),
+			})?;
+		Ok(())
+	}
+
+	fn begin_deferred_partition(&mut self, partition: usize) -> Result<(), ExecutionError> {
+		self.deferred_active_partition =
+			Some(
+				u64::try_from(partition).map_err(|_| ExecutionError::Kernel {
+					message: "chain stage active partition exceeds u64".to_string(),
+				})?,
+			);
+		Ok(())
+	}
+
+	fn record_deferred_index(
+		&mut self,
+		stats: PinnedSpilledInnerBuildStats,
+	) -> Result<(), ExecutionError> {
+		self.deferred_index_builds =
+			self.deferred_index_builds
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage deferred index build count overflow".to_string(),
+				})?;
+		self.deferred_build_page_reads = self
+			.deferred_build_page_reads
+			.checked_add(stats.page_reads)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage deferred build page read count overflow".to_string(),
+			})?;
+		self.deferred_build_decoded_bytes = self
+			.deferred_build_decoded_bytes
+			.checked_add(stats.decoded_bytes)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage deferred decoded byte count overflow".to_string(),
+			})?;
+		self.deferred_max_index_bytes = self.deferred_max_index_bytes.max(stats.index_bytes);
+		self.deferred_max_pinned_build_bytes = self
+			.deferred_max_pinned_build_bytes
+			.max(stats.decoded_bytes);
+		Ok(())
+	}
+
+	fn complete_deferred_probe_page(&mut self) -> Result<(), ExecutionError> {
+		self.deferred_probe_page_reads =
+			self.deferred_probe_page_reads
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "chain stage deferred probe page read count overflow".to_string(),
+				})?;
+		Ok(())
+	}
+
+	fn deferred_probe_page_flush_due(&self) -> bool {
+		self.deferred_probe_page_reads % CHAIN_DEFERRED_PAGE_FLUSH_INTERVAL == 0
+	}
+
+	fn complete_deferred_partition(&mut self) -> Result<(), ExecutionError> {
+		self.deferred_completed_partitions = self
+			.deferred_completed_partitions
+			.checked_add(1)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "chain stage deferred completed partition count overflow".to_string(),
+			})?;
+		self.deferred_active_partition = None;
+		Ok(())
 	}
 
 	fn add_micros(&mut self, stage: ChainStage, micros: u64) -> Result<(), ExecutionError> {
@@ -222,6 +340,11 @@ impl ChainStageProfiler {
 		Ok(())
 	}
 
+	fn base_batch_flush_due(&self) -> bool {
+		self.deferred_partition_count == 0
+			|| self.completed_base_batches % CHAIN_DEFERRED_BASE_FLUSH_INTERVAL == 0
+	}
+
 	fn snapshot_value(&self, total_drive_micros: u64) -> Result<serde_json::Value, ExecutionError> {
 		let stage_micros = self.stages.iter().try_fold(0u64, |total, stage| {
 			total
@@ -261,6 +384,20 @@ impl ChainStageProfiler {
 			"total_drive_micros": total_drive_micros,
 			"unattributed_residual_micros": unattributed_residual_micros,
 			"stages": stages,
+			"deferred_replay_1": {
+				"partition_count": self.deferred_partition_count,
+				"active_partition": self.deferred_active_partition,
+				"completed_partitions": self.deferred_completed_partitions,
+				"probe_rows_buffered": self.deferred_probe_rows_buffered,
+				"index_builds": self.deferred_index_builds,
+				"build_page_reads": self.deferred_build_page_reads,
+				"build_decoded_bytes": self.deferred_build_decoded_bytes,
+				"probe_page_reads": self.deferred_probe_page_reads,
+				"build_spill_bytes": self.deferred_build_spill_bytes,
+				"probe_spill_bytes": self.deferred_probe_spill_bytes,
+				"max_index_bytes": self.deferred_max_index_bytes,
+				"max_pinned_build_bytes": self.deferred_max_pinned_build_bytes,
+			},
 		}))
 	}
 
@@ -887,6 +1024,98 @@ fn guard_membership_owner_resident(
 	Ok(())
 }
 
+fn partition_replay_reservoir_bytes(
+	partitions: &[Option<SpilledInnerJoinBuild>],
+	partition_capacity: usize,
+) -> u64 {
+	summary_bytes::<Option<SpilledInnerJoinBuild>>(partition_capacity).saturating_add(
+		partitions
+			.iter()
+			.flatten()
+			.map(SpilledInnerJoinBuild::owner_retained_resident_bytes)
+			.fold(0u64, u64::saturating_add),
+	)
+}
+
+fn group_value_resident_bytes(value: &GroupValue) -> u64 {
+	match value {
+		GroupValue::Utf8(value) => u64::try_from(value.capacity()).unwrap_or(u64::MAX),
+		GroupValue::Timestamp(unit, _) => {
+			u64::try_from(std::mem::size_of_val(unit)).unwrap_or(u64::MAX)
+		}
+		_ => 0,
+	}
+}
+
+fn grouped_fold_resident_bytes(
+	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	group_type_capacity: usize,
+) -> u64 {
+	let entries = groups.iter().fold(0u64, |total, (key, states)| {
+		let key_bytes = summary_bytes::<GroupValue>(key.capacity()).saturating_add(
+			key.iter()
+				.map(group_value_resident_bytes)
+				.fold(0u64, u64::saturating_add),
+		);
+		let state_bytes = summary_bytes::<AggState>(states.capacity());
+		let node_overhead = u64::try_from(
+			std::mem::size_of::<Vec<GroupValue>>()
+				.saturating_add(std::mem::size_of::<Vec<AggState>>())
+				.saturating_add(4 * std::mem::size_of::<usize>()),
+		)
+		.unwrap_or(u64::MAX);
+		total
+			.saturating_add(key_bytes)
+			.saturating_add(state_bytes)
+			.saturating_add(node_overhead)
+	});
+	entries.saturating_add(summary_bytes::<DataType>(group_type_capacity))
+}
+
+fn record_batches_resident_bytes(batches: &[RecordBatch], capacity: usize) -> u64 {
+	summary_bytes::<RecordBatch>(capacity).saturating_add(
+		batches
+			.iter()
+			.map(record_batch_memory_bytes)
+			.fold(0u64, u64::saturating_add),
+	)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guard_partition_replay_owner_resident(
+	runtime_baseline_bytes: u64,
+	build_reservoir_bytes: u64,
+	probe_reservoir_bytes: u64,
+	active_build_bytes: u64,
+	active_probe_bytes: u64,
+	probe_page_bytes: u64,
+	output_bytes: u64,
+	fold_bytes: u64,
+	memory_cap: u64,
+) -> Result<(), ExecutionError> {
+	let requested = runtime_baseline_bytes
+		.saturating_add(build_reservoir_bytes)
+		.saturating_add(probe_reservoir_bytes)
+		.saturating_add(active_build_bytes)
+		.saturating_add(active_probe_bytes)
+		.saturating_add(probe_page_bytes)
+		.saturating_add(output_bytes)
+		.saturating_add(fold_bytes);
+	let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+	if requested > cap {
+		return Err(budget_exhausted_with_detail(
+			BudgetDimension::Memory,
+			PARTITION_REPLAY_PRODUCER,
+			requested,
+			cap,
+			crate::error::BudgetExhaustedDetail::message(format!(
+				"runtime_baseline_bytes={runtime_baseline_bytes}, build_reservoir_bytes={build_reservoir_bytes}, probe_reservoir_bytes={probe_reservoir_bytes}, active_build_bytes={active_build_bytes}, active_probe_bytes={active_probe_bytes}, probe_page_bytes={probe_page_bytes}, output_bytes={output_bytes}, fold_bytes={fold_bytes}"
+			)),
+		));
+	}
+	Ok(())
+}
+
 pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	replay_id: JoinReplayId,
 	probe_schema: SchemaRef,
@@ -1177,6 +1406,32 @@ struct LoadedPartitionResult {
 	output: Vec<RecordBatch>,
 	probe_rows: u64,
 	output_rows: u64,
+}
+
+#[derive(Clone)]
+struct PartitionAtATimeReplaySpec<'a> {
+	scan_input: StreamingScanProbeInput<'a>,
+	morsel: Option<(MorselId, u32)>,
+	partition_count: u32,
+	partition_build_keys: Vec<crate::ir::ColumnOrdinal>,
+	write_build_keys: Vec<crate::ir::ColumnOrdinal>,
+	materialized_output_schema: SchemaRef,
+	build_column_count: usize,
+	projection: Option<ProjectedInnerBuildProjection>,
+	estimated_build_bytes: u64,
+	key_plan: JoinKeyPlan,
+	probe_keys: Vec<crate::ir::ColumnOrdinal>,
+	output_schema: SchemaRef,
+	post_filter: Option<&'a BoundExprProgram>,
+	probe_columns_first: bool,
+}
+
+struct PartitionAtATimeReplayReservoir {
+	build: Vec<Option<SpilledInnerJoinBuild>>,
+	probe: Vec<Option<SpilledInnerJoinBuild>>,
+	build_rows: u64,
+	build_spill_bytes: u64,
+	probe_spill_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -4267,6 +4522,7 @@ impl Executor {
 					group_range.start,
 					group_range.end,
 					true,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -5033,6 +5289,7 @@ impl Executor {
 		partition_start: usize,
 		partition_end: usize,
 		enforce_group_spill_budget: bool,
+		combined_resident_baseline_bytes: Option<u64>,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
@@ -5082,6 +5339,7 @@ impl Executor {
 						partition_start,
 						partition_end,
 						enforce_group_spill_budget,
+						combined_resident_baseline_bytes,
 					)
 					.await?;
 				}
@@ -5127,6 +5385,7 @@ impl Executor {
 					partition_start,
 					partition_end,
 					enforce_group_spill_budget,
+					combined_resident_baseline_bytes,
 				)
 				.await?;
 			}
@@ -5149,6 +5408,7 @@ impl Executor {
 		partition_start: usize,
 		partition_end: usize,
 		enforce_group_spill_budget: bool,
+		combined_resident_baseline_bytes: Option<u64>,
 	) -> Result<(), ExecutionError> {
 		let buckets = precompute_join_partition_buckets(
 			batch,
@@ -5204,6 +5464,19 @@ impl Executor {
 					*total_spill_bytes,
 					group_spill_budget,
 				));
+			}
+			if let Some(baseline_bytes) = combined_resident_baseline_bytes {
+				guard_partition_replay_owner_resident(
+					baseline_bytes,
+					partition_replay_reservoir_bytes(partitioned_builds, partitioned_builds.len()),
+					0,
+					0,
+					0,
+					0,
+					0,
+					0,
+					self.context.task_budget.memory.get(),
+				)?;
 			}
 		}
 		Ok(())
@@ -9409,7 +9682,6 @@ impl Executor {
 				.build_micros
 				.saturating_add(duration_micros(build_started));
 		});
-
 		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
 			return Ok(None);
 		};
@@ -9829,6 +10101,7 @@ impl Executor {
 				false,
 				base_projection.as_ref(),
 				resident_baseline_bytes,
+				false,
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -10255,6 +10528,7 @@ impl Executor {
 						group_range.start,
 						group_range.end,
 						true,
+						None,
 					)
 					.await?;
 					terminal_spill_bytes = terminal_spill_bytes.saturating_add(group_spill_bytes);
@@ -10603,6 +10877,7 @@ impl Executor {
 				null_safe_keys,
 				projection.as_ref(),
 				0,
+				false,
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
@@ -11131,6 +11406,552 @@ impl Executor {
 		execution_result
 	}
 
+	fn partition_at_a_time_replay_spec<'a>(
+		inner_runtimes: &[ReorientedInnerJoinRuntime<'a>],
+		semi_runtime: &StreamingSemiAntiRuntime<'a>,
+		anti_runtime: &StreamingSemiAntiRuntime<'a>,
+	) -> Option<PartitionAtATimeReplaySpec<'a>> {
+		if inner_runtimes.len() != 2
+			|| inner_runtimes[0].replay_id != JoinReplayId(1)
+			|| inner_runtimes[1].replay_id != JoinReplayId(2)
+			|| semi_runtime.replay_id != JoinReplayId(3)
+			|| anti_runtime.replay_id != JoinReplayId(4)
+			|| !matches!(
+				semi_runtime.existence,
+				StreamingSemiAntiExistence::RecognizedNeqSummary { .. }
+			) || !matches!(
+			anti_runtime.existence,
+			StreamingSemiAntiExistence::RecognizedNeqSummary { .. }
+		) {
+			return None;
+		}
+		let runtime = &inner_runtimes[0];
+		let ReorientedInnerJoinBuild::PartitionedScan {
+			scan_input,
+			morsel,
+			partition_count,
+			partition_build_keys,
+			write_build_keys,
+			materialized_output_schema,
+			build_column_count,
+			projection,
+			estimated_build_bytes,
+			loaded_builds,
+			loaded_build_attempted,
+			..
+		} = &runtime.build
+		else {
+			return None;
+		};
+		if *partition_count <= 1
+			|| *loaded_build_attempted
+			|| loaded_builds.iter().any(Option::is_some)
+			|| !matches!(runtime.key_plan, JoinKeyPlan::Int64)
+		{
+			return None;
+		}
+		Some(PartitionAtATimeReplaySpec {
+			scan_input: *scan_input,
+			morsel: *morsel,
+			partition_count: *partition_count,
+			partition_build_keys: partition_build_keys.clone(),
+			write_build_keys: write_build_keys.clone(),
+			materialized_output_schema: materialized_output_schema.clone(),
+			build_column_count: *build_column_count,
+			projection: projection.clone(),
+			estimated_build_bytes: *estimated_build_bytes,
+			key_plan: runtime.key_plan,
+			probe_keys: runtime.probe_keys.clone(),
+			output_schema: runtime.output_schema.clone(),
+			post_filter: runtime.post_filter,
+			probe_columns_first: runtime.probe_columns_first,
+		})
+	}
+
+	async fn start_partition_at_a_time_replay_reservoir(
+		&self,
+		spec: &PartitionAtATimeReplaySpec<'_>,
+		morsel: Option<(MorselId, u32)>,
+		runtime_baseline_bytes: u64,
+	) -> Result<PartitionAtATimeReplayReservoir, ExecutionError> {
+		let build_result = self
+			.build_partitioned_streaming_scan_inner_build_reservoir(
+				spec.scan_input,
+				spec.morsel.or(morsel),
+				spec.partition_count,
+				&spec.partition_build_keys,
+				&spec.write_build_keys,
+				spec.key_plan,
+				false,
+				spec.projection.as_ref(),
+				runtime_baseline_bytes,
+				true,
+			)
+			.await?;
+		let Some((build, build_rows)) = build_result else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "committed partition replay build reservoir declined".to_string(),
+			});
+		};
+		let build_spill_bytes = build.iter().flatten().fold(0u64, |bytes, partition| {
+			bytes.saturating_add(partition.spill_bytes())
+		});
+		let partition_count =
+			usize::try_from(spec.partition_count).map_err(|_| ExecutionError::Kernel {
+				message: "partition-at-a-time replay partition count exceeds usize".to_string(),
+			})?;
+		let build_resident_bytes = partition_replay_reservoir_bytes(&build, build.capacity());
+		let mut probe: Vec<Option<SpilledInnerJoinBuild>> =
+			(0..partition_count).map(|_| None).collect();
+		for slot in &mut probe {
+			let created = SpilledInnerJoinBuild::create_with_resident_baseline(
+				self.context.task_budget,
+				self.context.join_spill_file_ops.clone(),
+				self.context.join_spill_dir.clone(),
+				runtime_baseline_bytes.saturating_add(build_resident_bytes),
+			)
+			.await;
+			match created {
+				Ok(created) => *slot = Some(created),
+				Err(error) => {
+					Self::cleanup_partitioned_streamed_inner_builds(probe).await;
+					Self::cleanup_partitioned_streamed_inner_builds(build).await;
+					return Err(error);
+				}
+			}
+		}
+		guard_partition_replay_owner_resident(
+			runtime_baseline_bytes,
+			build_resident_bytes,
+			partition_replay_reservoir_bytes(&probe, probe.capacity()),
+			0,
+			0,
+			0,
+			0,
+			0,
+			self.context.task_budget.memory.get(),
+		)?;
+		Ok(PartitionAtATimeReplayReservoir {
+			build,
+			probe,
+			build_rows,
+			build_spill_bytes,
+			probe_spill_bytes: 0,
+		})
+	}
+
+	async fn buffer_partition_at_a_time_replay_probe(
+		&self,
+		spec: &PartitionAtATimeReplaySpec<'_>,
+		state: &mut PartitionAtATimeReplayReservoir,
+		batch: &RecordBatch,
+		runtime_baseline_bytes: u64,
+	) -> Result<(), ExecutionError> {
+		let build_resident_bytes =
+			partition_replay_reservoir_bytes(&state.build, state.build.capacity());
+		let probe_partition_count = state.probe.len();
+		self.write_partitioned_streaming_scan_inner_build_batch(
+			&mut state.probe,
+			&mut state.probe_spill_bytes,
+			batch,
+			None,
+			&spec.probe_keys,
+			&spec.probe_keys,
+			spec.partition_count,
+			spec.key_plan,
+			false,
+			0,
+			probe_partition_count,
+			false,
+			Some(runtime_baseline_bytes.saturating_add(build_resident_bytes)),
+		)
+		.await?;
+		Ok(())
+	}
+
+	async fn finish_partition_at_a_time_probe_reservoir(
+		&self,
+		state: &mut PartitionAtATimeReplayReservoir,
+		runtime_baseline_bytes: u64,
+	) -> Result<(), ExecutionError> {
+		for partition_index in 0..state.probe.len() {
+			if let Some(partition) = state.probe[partition_index].as_mut() {
+				partition.finish(self.context.task_budget).await?;
+				partition.release_write_scratch();
+			}
+			guard_partition_replay_owner_resident(
+				runtime_baseline_bytes,
+				partition_replay_reservoir_bytes(&state.build, state.build.capacity()),
+				partition_replay_reservoir_bytes(&state.probe, state.probe.capacity()),
+				0,
+				0,
+				0,
+				0,
+				0,
+				self.context.task_budget.memory.get(),
+			)?;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn drain_partition_at_a_time_replay(
+		&self,
+		spec: &PartitionAtATimeReplaySpec<'_>,
+		state: &mut PartitionAtATimeReplayReservoir,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		suffix_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		semi_runtime: &mut StreamingSemiAntiRuntime<'_>,
+		anti_runtime: &mut StreamingSemiAntiRuntime<'_>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		group_types: &mut Vec<DataType>,
+		stage_profile: &mut Option<ChainStageProfiler>,
+		runtime_baseline_bytes: u64,
+	) -> Result<(), ExecutionError> {
+		let partition_count = state.build.len();
+		let mut total_probe_rows = 0u64;
+		let mut total_output_rows = 0u64;
+		for partition in 0..partition_count {
+			if let Some(profile) = stage_profile.as_mut() {
+				profile.begin_deferred_partition(partition)?;
+				profile.flush()?;
+			}
+			let mut active_build = state.build.get_mut(partition).and_then(Option::take);
+			let mut active_probe = state.probe.get_mut(partition).and_then(Option::take);
+			let partition_result = async {
+				let (Some(build), Some(probe)) = (active_build.as_mut(), active_probe.as_mut())
+				else {
+					return Ok::<(), ExecutionError>(());
+				};
+				if build.input_row_count() == 0 || probe.input_row_count() == 0 {
+					return Ok(());
+				}
+				let build_reservoir_bytes =
+					partition_replay_reservoir_bytes(&state.build, state.build.capacity());
+				let probe_reservoir_bytes =
+					partition_replay_reservoir_bytes(&state.probe, state.probe.capacity());
+				let fold_bytes = grouped_fold_resident_bytes(groups, group_types.capacity());
+				let active_probe_bytes = probe.owner_retained_resident_bytes();
+				let active_build_metadata = build.owner_retained_resident_bytes();
+				let active_baseline = runtime_baseline_bytes
+					.saturating_add(build_reservoir_bytes)
+					.saturating_add(probe_reservoir_bytes)
+					.saturating_add(active_probe_bytes)
+					.saturating_add(active_build_metadata)
+					.saturating_add(fold_bytes);
+				let index_started = stage_profile.as_ref().map(|_| Instant::now());
+				let stats = build
+					.rebuild_compact_index_and_pin_pages(
+						spec.key_plan,
+						&spec.write_build_keys,
+						false,
+						self.context.task_budget,
+						active_baseline,
+					)
+					.await?;
+				if let (Some(profile), Some(started)) = (stage_profile.as_mut(), index_started) {
+					profile.add_elapsed(ChainStage::InnerReplay1, started)?;
+					profile.record_deferred_index(stats)?;
+					profile.flush()?;
+				}
+				guard_partition_replay_owner_resident(
+					runtime_baseline_bytes,
+					build_reservoir_bytes,
+					probe_reservoir_bytes,
+					build.owner_retained_resident_bytes(),
+					probe.owner_retained_resident_bytes(),
+					0,
+					0,
+					fold_bytes,
+					self.context.task_budget.memory.get(),
+				)?;
+
+				for page_index in 0..probe.page_count() {
+					let replay_started = stage_profile.as_ref().map(|_| Instant::now());
+					let probe_page = probe.read_batch_page(page_index).await?;
+					let probe_page_bytes = record_batch_memory_bytes(&probe_page);
+					guard_partition_replay_owner_resident(
+						runtime_baseline_bytes,
+						build_reservoir_bytes,
+						probe_reservoir_bytes,
+						build.owner_retained_resident_bytes(),
+						probe.owner_retained_resident_bytes(),
+						probe_page_bytes,
+						0,
+						grouped_fold_resident_bytes(groups, group_types.capacity()),
+						self.context.task_budget.memory.get(),
+					)?;
+					let mut batches = Vec::new();
+					let (probe_rows, output_rows) = self
+						.visit_streaming_spilled_inner_probe_batch(
+							build,
+							&probe_page,
+							&spec.probe_keys,
+							spec.key_plan,
+							false,
+							&spec.materialized_output_schema,
+							&spec.output_schema,
+							None,
+							spec.probe_columns_first,
+							spec.build_column_count,
+							spec.projection.as_ref(),
+							&mut |batch| {
+								batches.push(batch);
+								Ok(())
+							},
+						)
+						.await?;
+					total_probe_rows = total_probe_rows.saturating_add(probe_rows);
+					total_output_rows = total_output_rows.saturating_add(output_rows);
+					if let Some(predicate) = spec.post_filter {
+						let mut filtered = Vec::new();
+						for batch in batches {
+							let batch = self.filter_batch_with_bound_predicate(
+								predicate,
+								batch,
+								"filter predicate",
+							)?;
+							if batch.num_rows() > 0 {
+								filtered.push(batch);
+							}
+						}
+						batches = filtered;
+					}
+					if let (Some(profile), Some(started)) = (stage_profile.as_mut(), replay_started)
+					{
+						profile.add_elapsed(ChainStage::InnerReplay1, started)?;
+						let replay_output_rows = batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						profile.add_flow(
+							ChainStage::InnerReplay1,
+							0,
+							batches.len() as u64,
+							0,
+							replay_output_rows,
+						)?;
+					}
+					guard_partition_replay_owner_resident(
+						runtime_baseline_bytes,
+						build_reservoir_bytes,
+						probe_reservoir_bytes,
+						build.owner_retained_resident_bytes(),
+						probe.owner_retained_resident_bytes(),
+						probe_page_bytes,
+						record_batches_resident_bytes(&batches, batches.capacity()),
+						grouped_fold_resident_bytes(groups, group_types.capacity()),
+						self.context.task_budget.memory.get(),
+					)?;
+
+					for suffix_runtime in suffix_runtimes.iter_mut() {
+						let stage = (suffix_runtime.replay_id == JoinReplayId(2))
+							.then_some(ChainStage::InnerReplay2);
+						let input_rows = batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						let input_batches = batches.len() as u64;
+						let started = stage
+							.filter(|_| stage_profile.is_some())
+							.map(|_| Instant::now());
+						let mut next = Vec::new();
+						for batch in batches {
+							next.extend(
+								self.probe_reoriented_inner_join_streaming(suffix_runtime, &batch)
+									.await?,
+							);
+						}
+						batches = next;
+						if let Some(predicate) = suffix_runtime.post_filter {
+							let mut filtered = Vec::new();
+							for batch in batches {
+								let batch = self.filter_batch_with_bound_predicate(
+									predicate,
+									batch,
+									"filter predicate",
+								)?;
+								if batch.num_rows() > 0 {
+									filtered.push(batch);
+								}
+							}
+							batches = filtered;
+						}
+						if let (Some(profile), Some(stage), Some(started)) =
+							(stage_profile.as_mut(), stage, started)
+						{
+							profile.add_elapsed(stage, started)?;
+							let output_rows = batches
+								.iter()
+								.map(|batch| batch.num_rows() as u64)
+								.fold(0u64, u64::saturating_add);
+							profile.add_flow(
+								stage,
+								input_batches,
+								batches.len() as u64,
+								input_rows,
+								output_rows,
+							)?;
+						}
+						guard_partition_replay_owner_resident(
+							runtime_baseline_bytes,
+							build_reservoir_bytes,
+							probe_reservoir_bytes,
+							build.owner_retained_resident_bytes(),
+							probe.owner_retained_resident_bytes(),
+							probe_page_bytes,
+							record_batches_resident_bytes(&batches, batches.capacity()),
+							grouped_fold_resident_bytes(groups, group_types.capacity()),
+							self.context.task_budget.memory.get(),
+						)?;
+						if batches.is_empty() {
+							break;
+						}
+					}
+
+					let semi_input_rows = batches
+						.iter()
+						.map(|batch| batch.num_rows() as u64)
+						.fold(0u64, u64::saturating_add);
+					let semi_input_batches = batches.len() as u64;
+					let semi_started = stage_profile.as_ref().map(|_| Instant::now());
+					let mut semi_batches = Vec::new();
+					for batch in batches {
+						semi_batches
+							.extend(self.probe_streaming_semi_anti(semi_runtime, &batch).await?);
+					}
+					if let (Some(profile), Some(started)) = (stage_profile.as_mut(), semi_started) {
+						profile.add_elapsed(ChainStage::SemiReplay3, started)?;
+						let rows = semi_batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						profile.add_flow(
+							ChainStage::SemiReplay3,
+							semi_input_batches,
+							semi_batches.len() as u64,
+							semi_input_rows,
+							rows,
+						)?;
+					}
+					guard_partition_replay_owner_resident(
+						runtime_baseline_bytes,
+						build_reservoir_bytes,
+						probe_reservoir_bytes,
+						build.owner_retained_resident_bytes(),
+						probe.owner_retained_resident_bytes(),
+						probe_page_bytes,
+						record_batches_resident_bytes(&semi_batches, semi_batches.capacity()),
+						grouped_fold_resident_bytes(groups, group_types.capacity()),
+						self.context.task_budget.memory.get(),
+					)?;
+					let anti_input_rows = semi_batches
+						.iter()
+						.map(|batch| batch.num_rows() as u64)
+						.fold(0u64, u64::saturating_add);
+					let anti_input_batches = semi_batches.len() as u64;
+					let anti_started = stage_profile.as_ref().map(|_| Instant::now());
+					let mut anti_batches = Vec::new();
+					for batch in semi_batches {
+						anti_batches
+							.extend(self.probe_streaming_semi_anti(anti_runtime, &batch).await?);
+					}
+					if let (Some(profile), Some(started)) = (stage_profile.as_mut(), anti_started) {
+						profile.add_elapsed(ChainStage::AntiReplay4, started)?;
+						let rows = anti_batches
+							.iter()
+							.map(|batch| batch.num_rows() as u64)
+							.fold(0u64, u64::saturating_add);
+						profile.add_flow(
+							ChainStage::AntiReplay4,
+							anti_input_batches,
+							anti_batches.len() as u64,
+							anti_input_rows,
+							rows,
+						)?;
+					}
+					guard_partition_replay_owner_resident(
+						runtime_baseline_bytes,
+						build_reservoir_bytes,
+						probe_reservoir_bytes,
+						build.owner_retained_resident_bytes(),
+						probe.owner_retained_resident_bytes(),
+						probe_page_bytes,
+						record_batches_resident_bytes(&anti_batches, anti_batches.capacity()),
+						grouped_fold_resident_bytes(groups, group_types.capacity()),
+						self.context.task_budget.memory.get(),
+					)?;
+					for batch in anti_batches {
+						let fold_rows = batch.num_rows() as u64;
+						let fold_started = stage_profile.as_ref().map(|_| Instant::now());
+						self.fold_bound_grouped_aggregate_batch(
+							groups,
+							group_types,
+							group_expr,
+							aggr_expr,
+							&batch,
+						)?;
+						if let (Some(profile), Some(started)) =
+							(stage_profile.as_mut(), fold_started)
+						{
+							profile.add_elapsed(ChainStage::GroupedFold, started)?;
+							profile.add_flow(
+								ChainStage::GroupedFold,
+								1,
+								1,
+								fold_rows,
+								fold_rows,
+							)?;
+						}
+					}
+					guard_partition_replay_owner_resident(
+						runtime_baseline_bytes,
+						build_reservoir_bytes,
+						probe_reservoir_bytes,
+						build.owner_retained_resident_bytes(),
+						probe.owner_retained_resident_bytes(),
+						probe_page_bytes,
+						0,
+						grouped_fold_resident_bytes(groups, group_types.capacity()),
+						self.context.task_budget.memory.get(),
+					)?;
+					drop(probe_page);
+					probe.clear_read_cache();
+					if let Some(profile) = stage_profile.as_mut() {
+						profile.complete_deferred_probe_page()?;
+						if profile.deferred_probe_page_flush_due() {
+							profile.flush()?;
+						}
+					}
+				}
+				Ok(())
+			}
+			.await;
+			if let Some(build) = active_build {
+				build.cleanup().await;
+			}
+			if let Some(probe) = active_probe {
+				probe.cleanup().await;
+			}
+			partition_result?;
+			if let Some(profile) = stage_profile.as_mut() {
+				profile.complete_deferred_partition()?;
+				profile.flush()?;
+			}
+		}
+		if let ReorientedInnerJoinBuild::PartitionedScan {
+			observed_build_rows,
+			..
+		} = &mut runtime.build
+		{
+			*observed_build_rows = observed_build_rows.saturating_add(state.build_rows);
+		}
+		self.record_reoriented_inner_probe(runtime, total_probe_rows, total_output_rows);
+		Ok(())
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	async fn try_streaming_inner_prefix_semi_anti_scan_probe_base(
 		&self,
@@ -11221,7 +12042,51 @@ impl Executor {
 		};
 		let mut remaining = req.row_limit;
 		let span = crate::telemetry::storage_scan_span(&req);
+		let runtime_baseline_bytes = inner_runtimes
+			.iter()
+			.map(ReorientedInnerJoinRuntime::retained_resident_bytes)
+			.chain([
+				semi_runtime.retained_resident_bytes(),
+				anti_runtime.retained_resident_bytes(),
+			])
+			.fold(0u64, u64::saturating_add);
+		let mut partition_replay_spec =
+			Self::partition_at_a_time_replay_spec(inner_runtimes, semi_runtime, anti_runtime);
+		if let Some(spec) = partition_replay_spec.as_ref() {
+			let partition_count = u64::from(spec.partition_count).max(1);
+			let estimated_partition_bytes =
+				ceil_div_u64(spec.estimated_build_bytes, partition_count);
+			let estimated_rows = ceil_div_u64(
+				ceil_div_u64(spec.estimated_build_bytes, 120),
+				partition_count,
+			);
+			let estimated_index_bytes = estimate_loaded_partition_index_bytes(
+				estimated_rows,
+				spec.key_plan,
+				estimated_partition_bytes,
+			);
+			let handles = summary_bytes::<Option<SpilledInnerJoinBuild>>(
+				usize::try_from(spec.partition_count).unwrap_or(usize::MAX),
+			)
+			.saturating_mul(2);
+			if guard_partition_replay_owner_resident(
+				runtime_baseline_bytes,
+				handles,
+				0,
+				estimated_index_bytes.saturating_add(estimated_partition_bytes),
+				0,
+				64 * 1024,
+				0,
+				0,
+				self.context.task_budget.memory.get(),
+			)
+			.is_err()
+			{
+				partition_replay_spec = None;
+			}
+		}
 		let mut stage_profile = ChainStageProfiler::from_env();
+		let mut partition_replay_state: Option<PartitionAtATimeReplayReservoir> = None;
 		if let Some(profile) = stage_profile.as_mut() {
 			profile.flush()?;
 		}
@@ -11292,7 +12157,9 @@ impl Executor {
 				if right_batch.num_rows() == 0 {
 					if let Some(profile) = stage_profile.as_mut() {
 						profile.complete_base_batch(raw_rows, post_filter_rows)?;
-						profile.flush()?;
+						if profile.base_batch_flush_due() {
+							profile.flush()?;
+						}
 					}
 					continue;
 				}
@@ -11365,6 +12232,56 @@ impl Executor {
 						replay0_output_rows =
 							replay0_output_rows.saturating_add(partitioned.num_rows() as u64);
 						replay0_output_batches = replay0_output_batches.saturating_add(1);
+						if let Some(spec) = partition_replay_spec.as_ref() {
+							let replay1_started = stage_profile.as_ref().map(|_| Instant::now());
+							if partition_replay_state.is_none() {
+								let state =
+									Box::pin(self.start_partition_at_a_time_replay_reservoir(
+										spec,
+										morsel,
+										runtime_baseline_bytes,
+									))
+									.await?;
+								if let Some(profile) = stage_profile.as_mut() {
+									profile.begin_deferred_replay(
+										state.build.len(),
+										state.build_spill_bytes,
+									)?;
+									profile.flush()?;
+								}
+								partition_replay_state = Some(state);
+							}
+							let buffered_rows = partitioned.num_rows() as u64;
+							let state = partition_replay_state.as_mut().ok_or_else(|| {
+								ExecutionError::InvalidExpression {
+									message: "committed partition replay lost its reservoir state"
+										.to_string(),
+								}
+							})?;
+							Box::pin(self.buffer_partition_at_a_time_replay_probe(
+								spec,
+								state,
+								&partitioned,
+								runtime_baseline_bytes,
+							))
+							.await?;
+							let probe_spill_bytes = state.probe_spill_bytes;
+							if let (Some(profile), Some(started)) =
+								(stage_profile.as_mut(), replay1_started)
+							{
+								profile.add_elapsed(ChainStage::InnerReplay1, started)?;
+								profile.add_flow(
+									ChainStage::InnerReplay1,
+									1,
+									0,
+									buffered_rows,
+									0,
+								)?;
+								profile.add_deferred_probe_rows(buffered_rows)?;
+								profile.set_deferred_probe_spill_bytes(probe_spill_bytes);
+							}
+							continue;
+						}
 						let mut batches = vec![partitioned];
 						for runtime in inner_runtimes.iter_mut() {
 							let stage = match runtime.replay_id {
@@ -11535,13 +12452,65 @@ impl Executor {
 						replay0_output_rows,
 					)?;
 					profile.complete_base_batch(raw_rows, post_filter_rows)?;
-					profile.flush()?;
+					if profile.base_batch_flush_due() {
+						profile.flush()?;
+					}
 				}
+			}
+			if let Some(mut state) = partition_replay_state.take() {
+				let deferred_result = async {
+					Box::pin(self.finish_partition_at_a_time_probe_reservoir(
+						&mut state,
+						runtime_baseline_bytes,
+					))
+					.await?;
+					let (runtime, suffix_runtimes) =
+						inner_runtimes.split_first_mut().ok_or_else(|| {
+							ExecutionError::InvalidExpression {
+								message: "committed partition replay lost replay 1 runtime"
+									.to_string(),
+							}
+						})?;
+					let spec = partition_replay_spec.as_ref().ok_or_else(|| {
+						ExecutionError::InvalidExpression {
+							message: "committed partition replay lost its admitted spec"
+								.to_string(),
+						}
+					})?;
+					Box::pin(self.drain_partition_at_a_time_replay(
+						spec,
+						&mut state,
+						runtime,
+						suffix_runtimes,
+						semi_runtime,
+						anti_runtime,
+						group_expr,
+						aggr_expr,
+						groups,
+						group_types,
+						&mut stage_profile,
+						runtime_baseline_bytes,
+					))
+					.await
+				}
+				.await;
+				let probe_spill_bytes = state.probe_spill_bytes;
+				Self::cleanup_partitioned_streamed_inner_builds(state.build).await;
+				Self::cleanup_partitioned_streamed_inner_builds(state.probe).await;
+				deferred_result?;
+				record_task_telemetry(&self.context.task_telemetry, |task| {
+					task.counters.spill_bytes =
+						task.counters.spill_bytes.saturating_add(probe_spill_bytes);
+				});
 			}
 			Ok(())
 		}
 		.await;
 		if let Err(error) = drive_result {
+			if let Some(state) = partition_replay_state.take() {
+				Self::cleanup_partitioned_streamed_inner_builds(state.build).await;
+				Self::cleanup_partitioned_streamed_inner_builds(state.probe).await;
+			}
 			if let Some(profile) = stage_profile.as_mut() {
 				profile.mark_terminal_error(&error);
 				let _ = profile.flush();
@@ -12750,6 +13719,7 @@ impl Executor {
 					group_range.start,
 					group_range.end,
 					true,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -12852,6 +13822,7 @@ impl Executor {
 		null_safe_keys: bool,
 		projection: Option<&ProjectedInnerBuildProjection>,
 		resident_baseline_bytes: u64,
+		committed_owner_path: bool,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -12886,11 +13857,12 @@ impl Executor {
 				0,
 				partition_count_usize,
 				false,
+				committed_owner_path.then_some(resident_baseline_bytes),
 			)
 			.await;
 		if let Err(error) = build_result {
 			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
-			if matches!(error, ExecutionError::BudgetExhausted { .. }) {
+			if !committed_owner_path && matches!(error, ExecutionError::BudgetExhausted { .. }) {
 				return Ok(None);
 			}
 			return Err(error);
@@ -13199,6 +14171,7 @@ impl Executor {
 					group_range.start,
 					group_range.end,
 					true,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -14635,6 +15608,7 @@ mod tests {
 				false,
 				None,
 				0,
+				false,
 			)
 			.await
 			.expect("reservoir build")
@@ -14717,6 +15691,80 @@ mod tests {
 				.expect("group re-scan digest"),
 			"one-pass reservoir output must match the old per-group scan path row-for-row"
 		);
+	}
+
+	#[tokio::test]
+	async fn committed_partition_reservoir_budget_failure_is_loud_and_cleans_scratch() {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"build_key",
+			DataType::Int64,
+			false,
+		)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from_iter_values(0..4096))],
+		)
+		.expect("build batch");
+		let scan = test_scan_plan_with_first_field_key(TableId(41), schema.clone(), 41);
+		let exchange = exchange_plan(
+			scan,
+			bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let scan_input =
+			decompose_streaming_scan_probe_input(&exchange).expect("streaming scan input");
+		let requested = Arc::new(Mutex::new(Vec::new()));
+		let budget = TaskBudget {
+			memory: ByteCount::new(64 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let spill_dir = chain_stage_profile_test_path("committed_cleanup").with_extension("spill");
+		let _ = std::fs::remove_dir_all(&spill_dir);
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(41), vec![batch])]),
+				requested_tables: requested.clone(),
+			}),
+			ExecutionContext::local_test()
+				.with_task_budget(budget)
+				.with_join_spill_store(Arc::new(BlockingFileOps), spill_dir.clone()),
+		);
+		let result = executor
+			.build_partitioned_streaming_scan_inner_build_reservoir(
+				scan_input,
+				None,
+				4,
+				&[ColumnOrdinal(0)],
+				&[ColumnOrdinal(0)],
+				JoinKeyPlan::Int64,
+				false,
+				None,
+				join_spill_retained_footprint_memory_cap(budget.memory.get()),
+				true,
+			)
+			.await;
+		let error = match result {
+			Err(error) => error,
+			Ok(_) => panic!("committed reservoir must not turn a late failure into None"),
+		};
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+		assert_eq!(
+			requested.lock().expect("requested tables").as_slice(),
+			&[TableId(41)],
+			"failure must occur after the committed source scan starts"
+		);
+		let remaining = std::fs::read_dir(&spill_dir)
+			.map(|entries| entries.count())
+			.unwrap_or(0);
+		assert_eq!(remaining, 0, "committed reservoir failure leaked scratch");
+		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 
 	#[tokio::test]
@@ -17701,6 +18749,143 @@ mod tests {
 		assert!(error.to_string().contains("timers exceed total"));
 		let _ = std::fs::remove_file(path);
 		let _ = std::fs::remove_file(temporary);
+	}
+
+	#[test]
+	fn deferred_replay_profile_keeps_logical_rows_and_durable_page_progress() {
+		let path = chain_stage_profile_test_path("deferred_progress");
+		let temporary = path.with_extension("tmp");
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(&temporary);
+		let mut profile = ChainStageProfiler::at_path(path.clone());
+		profile
+			.begin_deferred_replay(4, 1234)
+			.expect("begin deferred replay");
+		for _ in 0..CHAIN_DEFERRED_BASE_FLUSH_INTERVAL - 1 {
+			profile.complete_base_batch(1, 1).expect("base batch");
+		}
+		assert!(!profile.base_batch_flush_due());
+		profile.complete_base_batch(1, 1).expect("base batch");
+		assert!(profile.base_batch_flush_due());
+		profile
+			.add_flow(ChainStage::InnerReplay1, 2, 0, 11, 0)
+			.expect("buffer logical input");
+		profile
+			.add_deferred_probe_rows(11)
+			.expect("buffer progress");
+		profile.set_deferred_probe_spill_bytes(5678);
+		profile
+			.begin_deferred_partition(2)
+			.expect("begin partition");
+		profile
+			.record_deferred_index(PinnedSpilledInnerBuildStats {
+				page_reads: 3,
+				decoded_bytes: 400,
+				index_bytes: 500,
+				rows: 7,
+			})
+			.expect("record index");
+		for _ in 0..CHAIN_DEFERRED_PAGE_FLUSH_INTERVAL {
+			profile
+				.complete_deferred_probe_page()
+				.expect("record probe page");
+		}
+		assert!(profile.deferred_probe_page_flush_due());
+		profile
+			.add_flow(ChainStage::InnerReplay1, 0, 3, 0, 7)
+			.expect("record logical output");
+		profile.flush().expect("flush partial drain");
+		let snapshot: serde_json::Value =
+			serde_json::from_slice(&std::fs::read(&path).expect("read deferred snapshot"))
+				.expect("parse deferred snapshot");
+		assert_eq!(snapshot["drive_completed"], false);
+		assert_eq!(snapshot["deferred_replay_1"]["partition_count"], 4);
+		assert_eq!(snapshot["deferred_replay_1"]["active_partition"], 2);
+		assert_eq!(snapshot["deferred_replay_1"]["index_builds"], 1);
+		assert_eq!(snapshot["deferred_replay_1"]["build_page_reads"], 3);
+		assert_eq!(
+			snapshot["deferred_replay_1"]["probe_page_reads"],
+			CHAIN_DEFERRED_PAGE_FLUSH_INTERVAL
+		);
+		assert_eq!(snapshot["deferred_replay_1"]["max_index_bytes"], 500);
+		let replay = snapshot["stages"]
+			.as_array()
+			.expect("stages")
+			.iter()
+			.find(|stage| stage["stage"] == "inner_replay_1")
+			.expect("replay stage");
+		assert_eq!(replay["input_rows"], 11);
+		assert_eq!(replay["output_rows"], 7);
+		let _ = std::fs::remove_file(path);
+		let _ = std::fs::remove_file(temporary);
+	}
+
+	#[test]
+	fn partition_replay_owner_guard_names_every_live_component() {
+		let memory_cap = 1024;
+		let retained_cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		guard_partition_replay_owner_resident(
+			1,
+			2,
+			3,
+			4,
+			5,
+			6,
+			7,
+			retained_cap.saturating_sub(28),
+			memory_cap,
+		)
+		.expect("exact retained cap fits");
+		let error = guard_partition_replay_owner_resident(
+			2,
+			2,
+			3,
+			4,
+			5,
+			6,
+			7,
+			retained_cap.saturating_sub(28),
+			memory_cap,
+		)
+		.expect_err("later owner baseline must arm the guard");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: PARTITION_REPLAY_PRODUCER,
+				..
+			}
+		));
+		let detail = error.to_string();
+		for component in [
+			"runtime_baseline_bytes",
+			"build_reservoir_bytes",
+			"probe_reservoir_bytes",
+			"active_build_bytes",
+			"active_probe_bytes",
+			"probe_page_bytes",
+			"output_bytes",
+			"fold_bytes",
+		] {
+			assert!(detail.contains(component), "missing {component}: {detail}");
+		}
+	}
+
+	#[test]
+	fn partition_replay_drain_is_page_streamed_by_construction() {
+		let source = include_str!("streaming.rs");
+		let start = source
+			.find("async fn drain_partition_at_a_time_replay(")
+			.expect("partition replay drain");
+		let tail = &source[start..];
+		let end = tail
+			.find("async fn try_streaming_inner_prefix_semi_anti_scan_probe_base(")
+			.expect("next owner function");
+		let drain = &tail[..end];
+		assert!(drain.contains("for page_index in 0..probe.page_count()"));
+		assert!(drain.contains("probe.read_batch_page(page_index).await?"));
+		assert!(!drain.contains("read_all_batch_pages"));
+		assert!(!drain.contains("concat_or_empty"));
 	}
 
 	#[test]

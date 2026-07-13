@@ -155,7 +155,9 @@ for the replay-1 collapse.
   is an accepted named outcome.
 - **Buffered replay-0 output larger than expected** -> the probe side is spill-backed and
   streamed per page, so it is bounded; resident reservoir metadata/writer state is in the owner
-  peak and on-disk bytes remain governed separately by the unchanged spill quota.
+  peak. Aggregate reservoir disk volume is measured, while every partition writer remains under
+  the unchanged per-writer spill quota exactly like ADR 413's landed multi-writer reservoir; 427
+  does not reinterpret that quota as a new aggregate cap.
 - **Build-page re-decode amplification** -> the build-page-reread lock keeps the 420 class closed.
 - **Committed-arm leak** -> post-commit cleanup on every exit; the durable receipt + scratch
   check prove it.

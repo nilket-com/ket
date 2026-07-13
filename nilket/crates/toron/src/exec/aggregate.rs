@@ -369,15 +369,14 @@ impl Executor {
 		{
 			return Ok(Some(output));
 		}
-		if let Some(output) = self
-			.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
-				input,
-				group_expr,
-				aggr_expr,
-				output_schema,
-				morsel,
-			)
-			.await?
+		if let Some(output) = Box::pin(self.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
+			input,
+			group_expr,
+			aggr_expr,
+			output_schema,
+			morsel,
+		))
+		.await?
 		{
 			return Ok(Some(output));
 		}

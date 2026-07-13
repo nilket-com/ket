@@ -14,7 +14,7 @@ pub(super) use self::build_rows::{
 	new_join_build_rows,
 };
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
-pub(in crate::exec) use self::spill::SpilledInnerJoinBuild;
+pub(in crate::exec) use self::spill::{PinnedSpilledInnerBuildStats, SpilledInnerJoinBuild};
 pub(in crate::exec) use self::spill::{
 	SpilledBatchRowRef, SpilledInnerJoinMatch, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
 	partition_bucket_if_non_null_with_scratch,

@@ -176,6 +176,10 @@ const JOIN_SPILL_INT32_KEY_TAG: u8 = 4;
 const JOIN_SPILL_INT64_KEY_TAG: u8 = 5;
 const EMPTY_JOIN_SPILL_PAGE_BUCKET: u32 = u32::MAX;
 
+fn spill_capacity_bytes<T>(capacity: usize) -> u64 {
+	u64::try_from(capacity.saturating_mul(std::mem::size_of::<T>())).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CompactJoinSpillPageEntry<K> {
 	key: K,
@@ -1142,6 +1146,14 @@ pub(in crate::exec) struct SpilledInnerJoinMatch {
 	pub(super) probe: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) struct PinnedSpilledInnerBuildStats {
+	pub(in crate::exec) page_reads: u64,
+	pub(in crate::exec) decoded_bytes: u64,
+	pub(in crate::exec) index_bytes: u64,
+	pub(in crate::exec) rows: u64,
+}
+
 pub(in crate::exec) struct SpilledInnerJoinBuild {
 	spill_id: u64,
 	path: PathBuf,
@@ -1167,6 +1179,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	input_batches_written: u64,
 	#[cfg(test)]
 	legacy_index_insert_count: u64,
+	#[cfg(test)]
+	page_decode_count: u64,
 	compact_index_enabled: bool,
 	compact_index_rescue_enabled: bool,
 	next_offset: u64,
@@ -1273,6 +1287,8 @@ impl SpilledInnerJoinBuild {
 			input_batches_written: 0,
 			#[cfg(test)]
 			legacy_index_insert_count: 0,
+			#[cfg(test)]
+			page_decode_count: 0,
 			compact_index_enabled: false,
 			compact_index_rescue_enabled: false,
 			next_offset: 0,
@@ -1701,6 +1717,80 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
+	pub(in crate::exec) async fn rebuild_compact_index_and_pin_pages(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		resident_baseline_bytes: u64,
+	) -> Result<PinnedSpilledInnerBuildStats, ExecutionError> {
+		self.resident_baseline_bytes = resident_baseline_bytes;
+		self.index.clear();
+		self.compact_index = Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys));
+		self.compact_index_enabled = true;
+		self.resident_index_bytes = 0;
+		self.rows = 0;
+		self.cache.clear();
+		self.lru.clear();
+		self.cache_bytes = 0;
+		self.pinned_decoded_bytes = 0;
+		self.pinned_decoded_pages = Some(Vec::with_capacity(self.pages.len()));
+		self.pin_decoded_attempted = true;
+
+		let mut page_reads = 0u64;
+		for page_index in 0..self.pages.len() {
+			let batch = self.read_batch_page(page_index).await?;
+			page_reads = page_reads
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "streamed inner join pinned page read count overflow".to_string(),
+				})?;
+			if let Some(cached) = self.cache.remove(&page_index) {
+				self.cache_bytes = self.cache_bytes.saturating_sub(cached.total_bytes());
+			}
+			self.lru.retain(|cached| *cached != page_index);
+			let batch_bytes = record_batch_memory_bytes(&batch);
+			let key_arrays = key_arrays(&batch, build_keys)?;
+			for row in 0..batch.num_rows() {
+				let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
+					continue;
+				};
+				let row_ref = SpilledBatchRowRef {
+					page_index,
+					row: join_build_row_index(row)?,
+				};
+				self.compact_index
+					.as_mut()
+					.expect("combined rebuild initialized compact index")
+					.insert(key, row_ref)?;
+				self.rows = self.rows.saturating_add(1);
+			}
+			self.resident_index_bytes = self
+				.compact_index
+				.as_ref()
+				.map_or(0, SpilledBatchIndex::accounted_bytes);
+			self.pinned_decoded_bytes = self.pinned_decoded_bytes.saturating_add(batch_bytes);
+			self.pinned_decoded_pages
+				.as_mut()
+				.expect("combined rebuild initialized pinned pages")
+				.push(batch);
+			self.guard_resident_state(
+				task_budget.memory.get(),
+				SpillResidentGuardSite::PinDecodedPages,
+			)?;
+		}
+		self.cache.clear();
+		self.lru.clear();
+		self.cache_bytes = 0;
+		Ok(PinnedSpilledInnerBuildStats {
+			page_reads,
+			decoded_bytes: self.pinned_decoded_bytes,
+			index_bytes: self.resident_index_bytes,
+			rows: self.rows,
+		})
+	}
+
 	pub(in crate::exec) async fn read_all_batch_pages(
 		&mut self,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
@@ -1896,6 +1986,10 @@ impl SpilledInnerJoinBuild {
 		}
 		let bytes = self.read_page(page_index).await?;
 		let batch = decode_record_batch_ipc(&bytes)?;
+		#[cfg(test)]
+		{
+			self.page_decode_count = self.page_decode_count.saturating_add(1);
+		}
 		self.insert_decoded_cache_entry(page_index, batch.clone());
 		Ok(batch)
 	}
@@ -2017,6 +2111,11 @@ impl SpilledInnerJoinBuild {
 	}
 
 	#[cfg(test)]
+	pub(in crate::exec) fn page_decode_count(&self) -> u64 {
+		self.page_decode_count
+	}
+
+	#[cfg(test)]
 	pub(in crate::exec) fn resident_index_bytes(&self) -> u64 {
 		self.resident_index_bytes
 	}
@@ -2063,6 +2162,43 @@ impl SpilledInnerJoinBuild {
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
 			.saturating_add(self.cache_bytes)
 			.saturating_add(self.pinned_decoded_bytes)
+	}
+
+	pub(in crate::exec) fn owner_retained_resident_bytes(&self) -> u64 {
+		let page_metadata = spill_capacity_bytes::<JoinSpillPage>(self.pages.capacity())
+			.saturating_add(spill_capacity_bytes::<u32>(self.page_rows.capacity()));
+		let cache_metadata = u64::try_from(
+			self.cache
+				.capacity()
+				.saturating_mul(std::mem::size_of::<(usize, CachedJoinSpillPage)>() + 16),
+		)
+		.unwrap_or(u64::MAX)
+		.saturating_add(spill_capacity_bytes::<usize>(self.lru.capacity()));
+		let pinned_handles = self.pinned_decoded_pages.as_ref().map_or(0, |pages| {
+			spill_capacity_bytes::<RecordBatch>(pages.capacity())
+		});
+		let scratch_capacity = u64::try_from(self.scratch_plaintext.capacity())
+			.unwrap_or(u64::MAX)
+			.saturating_add(spill_capacity_bytes::<(JoinKey, u32)>(
+				self.scratch_refs.capacity(),
+			));
+		let retained_legacy_index = self
+			.compact_index
+			.as_ref()
+			.map_or(0, |_| spilled_batch_join_hash_index_bytes(&self.index));
+		self.retained_resident_bytes()
+			.saturating_add(page_metadata)
+			.saturating_add(cache_metadata)
+			.saturating_add(pinned_handles)
+			.saturating_add(scratch_capacity)
+			.saturating_add(retained_legacy_index)
+			.saturating_add(u64::try_from(self.path.capacity()).unwrap_or(u64::MAX))
+	}
+
+	pub(in crate::exec) fn clear_read_cache(&mut self) {
+		self.cache.clear();
+		self.lru.clear();
+		self.cache_bytes = 0;
 	}
 
 	pub(in crate::exec) fn loaded_page_bytes_estimate(&self) -> u64 {
@@ -4030,6 +4166,66 @@ mod tests {
 			}]
 		);
 
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn combined_rebuild_and_pin_decodes_each_build_page_once() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("combined_rebuild_pin");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let values = (0..(CROSS_JOIN_OUTPUT_CHUNK_ROWS + 17))
+			.map(|value| value as i64)
+			.collect::<Vec<_>>();
+		build
+			.write_batch_chunks_unindexed(
+				&batch_with_keys(&values),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write unindexed pages");
+		build.finish(budget).await.expect("finish spill");
+		build.release_write_scratch();
+		assert!(build.page_count() > 1);
+		let stats = build
+			.rebuild_compact_index_and_pin_pages(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+				1234,
+			)
+			.await
+			.expect("combined rebuild and pin");
+		assert_eq!(stats.page_reads, build.page_count() as u64);
+		assert_eq!(stats.rows, values.len() as u64);
+		assert!(stats.decoded_bytes > 0);
+		assert!(stats.index_bytes > 0);
+		assert_eq!(build.page_decode_count(), build.page_count() as u64);
+		assert!(build.uses_compact_int64_index());
+		assert_eq!(
+			build
+				.lookup(&JoinKey::Int64(values[values.len() - 1]))
+				.await
+				.expect("lookup pinned key")
+				.len(),
+			1
+		);
+		for page in 0..build.page_count() {
+			let _ = build.read_batch_page(page).await.expect("read pinned page");
+		}
+		assert_eq!(
+			build.page_decode_count(),
+			build.page_count() as u64,
+			"pinned probe reads must not decode build pages again"
+		);
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
 	}
