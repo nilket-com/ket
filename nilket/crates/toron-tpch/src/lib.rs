@@ -10031,10 +10031,146 @@ pub struct Q21Row {
 	pub numwait: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q21Oracle {
 	pub rows: Vec<Q21Row>,
 	pub contributing_rows: usize,
+}
+
+struct Q21LineitemGroups<I>
+where
+	I: Iterator<Item = (i64, i64, i32, i32)>,
+{
+	rows: std::iter::Peekable<I>,
+}
+
+impl<I> Q21LineitemGroups<I>
+where
+	I: Iterator<Item = (i64, i64, i32, i32)>,
+{
+	fn new(rows: I) -> Self {
+		Self {
+			rows: rows.peekable(),
+		}
+	}
+
+	fn next_group(&mut self) -> Result<Option<(i64, Vec<(i64, i32, i32)>)>, String> {
+		let Some((orderkey, suppkey, commitdate, receiptdate)) = self.rows.next() else {
+			return Ok(None);
+		};
+		let mut items = vec![(suppkey, commitdate, receiptdate)];
+
+		while let Some((next_orderkey, _, _, _)) = self.rows.peek() {
+			if *next_orderkey < orderkey {
+				return Err(format!(
+					"q21 lineitem order stream is not nondecreasing: previous group key {orderkey}, current key {next_orderkey}"
+				));
+			}
+			if *next_orderkey != orderkey {
+				break;
+			}
+			let (_, suppkey, commitdate, receiptdate) =
+				self.rows.next().expect("peeked q21 lineitem row");
+			items.push((suppkey, commitdate, receiptdate));
+		}
+
+		Ok(Some((orderkey, items)))
+	}
+}
+
+fn q21_next_order<I>(
+	orders: &mut I,
+	previous_orderkey: &mut Option<i64>,
+) -> Result<Option<(i64, String)>, String>
+where
+	I: Iterator<Item = (i64, String)>,
+{
+	let Some((orderkey, status)) = orders.next() else {
+		return Ok(None);
+	};
+	if previous_orderkey.is_some_and(|previous| orderkey <= previous) {
+		return Err(format!(
+			"q21 orders stream is not strictly increasing: previous key {}, current key {orderkey}",
+			previous_orderkey.expect("checked q21 previous orderkey")
+		));
+	}
+	*previous_orderkey = Some(orderkey);
+	Ok(Some((orderkey, status)))
+}
+
+fn q21_count_order(
+	order_status: &str,
+	items: &[(i64, i32, i32)],
+	suppliers: &HashMap<i64, (String, i64)>,
+	nations: &HashMap<i64, String>,
+	counts: &mut HashMap<String, i64>,
+	contributing_rows: &mut usize,
+) -> Result<(), String> {
+	if order_status != "F" {
+		return Ok(());
+	}
+
+	let supplier_set: HashSet<i64> = items.iter().map(|(suppkey, _, _)| *suppkey).collect();
+	let late_supplier_set: HashSet<i64> = items
+		.iter()
+		.filter(|(_, commitdate, receiptdate)| receiptdate > commitdate)
+		.map(|(suppkey, _, _)| *suppkey)
+		.collect();
+
+	for (suppkey, commitdate, receiptdate) in items {
+		if receiptdate <= commitdate {
+			continue;
+		}
+		let Some((s_name, nationkey)) = suppliers.get(suppkey) else {
+			continue;
+		};
+		let Some(nation_name) = nations.get(nationkey) else {
+			continue;
+		};
+		if nation_name != "SAUDI ARABIA" {
+			continue;
+		}
+		if !supplier_set
+			.iter()
+			.any(|other_suppkey| other_suppkey != suppkey)
+		{
+			continue;
+		}
+		if late_supplier_set
+			.iter()
+			.any(|other_suppkey| other_suppkey != suppkey)
+		{
+			continue;
+		}
+
+		*contributing_rows = contributing_rows
+			.checked_add(1)
+			.ok_or_else(|| "q21 contributing_rows counter overflow".to_string())?;
+		let count = counts.entry(s_name.clone()).or_insert(0);
+		*count = count
+			.checked_add(1)
+			.ok_or_else(|| format!("q21 supplier count overflow for {s_name:?}"))?;
+	}
+
+	Ok(())
+}
+
+fn q21_finish_oracle(counts: HashMap<String, i64>, contributing_rows: usize) -> Q21Oracle {
+	let mut rows = counts
+		.into_iter()
+		.map(|(s_name, numwait)| Q21Row { s_name, numwait })
+		.collect::<Vec<_>>();
+	rows.sort_by(|left, right| {
+		right
+			.numwait
+			.cmp(&left.numwait)
+			.then_with(|| left.s_name.cmp(&right.s_name))
+	});
+
+	Q21Oracle {
+		rows,
+		contributing_rows,
+	}
 }
 
 /// Independent strict-q21 oracle: traverse the generators directly, count every qualifying `l1` row, and
@@ -10050,78 +10186,48 @@ pub fn q21_oracle_from_rows(
 		.map(|(suppkey, name, nationkey)| (suppkey, (name, nationkey)))
 		.collect();
 	let nations: HashMap<i64, String> = nations.into_iter().collect();
-	let orders: HashMap<i64, String> = orders.into_iter().collect();
-
-	let mut lineitems_by_order: HashMap<i64, Vec<(i64, i32, i32)>> = HashMap::new();
-	for (orderkey, suppkey, commitdate, receiptdate) in lineitems {
-		lineitems_by_order
-			.entry(orderkey)
-			.or_default()
-			.push((suppkey, commitdate, receiptdate));
-	}
-
 	let mut counts: HashMap<String, i64> = HashMap::new();
 	let mut contributing_rows = 0_usize;
-	for (orderkey, items) in lineitems_by_order {
-		let Some(orderstatus) = orders.get(&orderkey) else {
-			continue;
-		};
-		if orderstatus != "F" {
-			continue;
-		}
 
-		let supplier_set: HashSet<i64> = items.iter().map(|(suppkey, _, _)| *suppkey).collect();
-		let late_supplier_set: HashSet<i64> = items
-			.iter()
-			.filter(|(_, commitdate, receiptdate)| receiptdate > commitdate)
-			.map(|(suppkey, _, _)| *suppkey)
-			.collect();
+	let mut orders = orders.into_iter();
+	let mut previous_orderkey = None;
+	let mut next_order = q21_next_order(&mut orders, &mut previous_orderkey)?;
+	let mut lineitem_groups = Q21LineitemGroups::new(lineitems.into_iter());
+	let mut next_group = lineitem_groups.next_group()?;
 
-		for (suppkey, commitdate, receiptdate) in items {
-			if receiptdate <= commitdate {
-				continue;
+	while let (Some((orderkey, order_status)), Some((lineitem_orderkey, items))) =
+		(next_order.as_ref(), next_group.as_ref())
+	{
+		match orderkey.cmp(lineitem_orderkey) {
+			std::cmp::Ordering::Less => {
+				next_order = q21_next_order(&mut orders, &mut previous_orderkey)?;
 			}
-			let Some((s_name, nationkey)) = suppliers.get(&suppkey) else {
-				continue;
-			};
-			let Some(nation_name) = nations.get(nationkey) else {
-				continue;
-			};
-			if nation_name != "SAUDI ARABIA" {
-				continue;
+			std::cmp::Ordering::Greater => {
+				next_group = lineitem_groups.next_group()?;
 			}
-			if !supplier_set
-				.iter()
-				.any(|other_suppkey| *other_suppkey != suppkey)
-			{
-				continue;
+			std::cmp::Ordering::Equal => {
+				q21_count_order(
+					order_status,
+					items,
+					&suppliers,
+					&nations,
+					&mut counts,
+					&mut contributing_rows,
+				)?;
+				next_order = q21_next_order(&mut orders, &mut previous_orderkey)?;
+				next_group = lineitem_groups.next_group()?;
 			}
-			if late_supplier_set
-				.iter()
-				.any(|other_suppkey| *other_suppkey != suppkey)
-			{
-				continue;
-			}
-			contributing_rows += 1;
-			*counts.entry(s_name.clone()).or_insert(0) += 1;
 		}
 	}
 
-	let mut rows = counts
-		.into_iter()
-		.map(|(s_name, numwait)| Q21Row { s_name, numwait })
-		.collect::<Vec<_>>();
-	rows.sort_by(|left, right| {
-		right
-			.numwait
-			.cmp(&left.numwait)
-			.then_with(|| left.s_name.cmp(&right.s_name))
-	});
+	while next_order.is_some() {
+		next_order = q21_next_order(&mut orders, &mut previous_orderkey)?;
+	}
+	while next_group.is_some() {
+		next_group = lineitem_groups.next_group()?;
+	}
 
-	Ok(Q21Oracle {
-		rows,
-		contributing_rows,
-	})
+	Ok(q21_finish_oracle(counts, contributing_rows))
 }
 
 pub fn strict_q21_oracle(scale_factor: f64) -> Result<Q21Oracle, String> {
@@ -10152,6 +10258,306 @@ pub fn strict_q21_oracle(scale_factor: f64) -> Result<Q21Oracle, String> {
 				)
 			}),
 	)
+}
+
+#[cfg(test)]
+mod adr428_q21_frugal_oracle {
+	use super::*;
+
+	type Q21SupplierRow = (i64, String, i64);
+	type Q21NationRow = (i64, String);
+	type Q21OrderRow = (i64, String);
+	type Q21LineitemRow = (i64, i64, i32, i32);
+
+	fn q21_oracle_dense_from_rows(
+		suppliers: impl IntoIterator<Item = Q21SupplierRow>,
+		nations: impl IntoIterator<Item = Q21NationRow>,
+		orders: impl IntoIterator<Item = Q21OrderRow>,
+		lineitems: impl IntoIterator<Item = Q21LineitemRow>,
+	) -> Result<Q21Oracle, String> {
+		let suppliers: HashMap<i64, (String, i64)> = suppliers
+			.into_iter()
+			.map(|(suppkey, name, nationkey)| (suppkey, (name, nationkey)))
+			.collect();
+		let nations: HashMap<i64, String> = nations.into_iter().collect();
+		let orders: HashMap<i64, String> = orders.into_iter().collect();
+		let mut lineitems_by_order: HashMap<i64, Vec<(i64, i32, i32)>> = HashMap::new();
+		for (orderkey, suppkey, commitdate, receiptdate) in lineitems {
+			lineitems_by_order.entry(orderkey).or_default().push((
+				suppkey,
+				commitdate,
+				receiptdate,
+			));
+		}
+
+		let mut counts = HashMap::new();
+		let mut contributing_rows = 0;
+		for (orderkey, items) in lineitems_by_order {
+			let Some(order_status) = orders.get(&orderkey) else {
+				continue;
+			};
+			q21_count_order(
+				order_status,
+				&items,
+				&suppliers,
+				&nations,
+				&mut counts,
+				&mut contributing_rows,
+			)?;
+		}
+
+		Ok(q21_finish_oracle(counts, contributing_rows))
+	}
+
+	fn strict_q21_oracle_dense(scale_factor: f64) -> Result<Q21Oracle, String> {
+		q21_oracle_dense_from_rows(
+			SupplierGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|supplier| {
+					(
+						supplier.s_suppkey,
+						supplier.s_name.to_string(),
+						supplier.s_nationkey,
+					)
+				}),
+			NationGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|nation| (nation.n_nationkey, nation.n_name.to_string())),
+			OrderGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|order| (order.o_orderkey, order.o_orderstatus.to_string())),
+			LineItemGenerator::new(scale_factor, 1, 1)
+				.iter()
+				.map(|item| {
+					(
+						item.l_orderkey,
+						item.l_suppkey,
+						item.l_commitdate.to_unix_epoch(),
+						item.l_receiptdate.to_unix_epoch(),
+					)
+				}),
+		)
+	}
+
+	fn assert_dense_frugal_equal(
+		suppliers: Vec<Q21SupplierRow>,
+		nations: Vec<Q21NationRow>,
+		orders: Vec<Q21OrderRow>,
+		lineitems: Vec<Q21LineitemRow>,
+	) -> Q21Oracle {
+		let frugal = q21_oracle_from_rows(
+			suppliers.clone(),
+			nations.clone(),
+			orders.clone(),
+			lineitems.clone(),
+		)
+		.expect("frugal q21 oracle");
+		let dense = q21_oracle_dense_from_rows(suppliers, nations, orders, lineitems)
+			.expect("dense q21 oracle");
+		assert_eq!(frugal, dense);
+		frugal
+	}
+
+	#[test]
+	fn frugal_matches_dense_at_supported_parity_scales() {
+		for scale_factor in [0.01, 1.0] {
+			let frugal = strict_q21_oracle(scale_factor).expect("frugal q21 oracle");
+			let dense = strict_q21_oracle_dense(scale_factor).expect("dense q21 oracle");
+			assert_eq!(frugal, dense, "q21 oracle drift at sf={scale_factor}");
+		}
+	}
+
+	#[test]
+	fn shared_counter_preserves_all_semi_anti_edges() {
+		let suppliers = vec![
+			(1, "SAUDI-1".to_string(), 10),
+			(2, "SAUDI-2".to_string(), 10),
+			(3, "UNKNOWN-NATION".to_string(), 99),
+			(4, "MOROCCAN".to_string(), 11),
+		];
+		let nations = vec![
+			(10, "SAUDI ARABIA".to_string()),
+			(11, "MOROCCO".to_string()),
+		];
+		let orders = vec![
+			(10, "O".to_string()),
+			(20, "F".to_string()),
+			(30, "F".to_string()),
+			(40, "F".to_string()),
+			(50, "F".to_string()),
+			(60, "F".to_string()),
+			(70, "F".to_string()),
+			(80, "F".to_string()),
+			(90, "F".to_string()),
+		];
+		let lineitems = vec![
+			(10, 1, 10, 20),
+			(10, 2, 10, 10),
+			(20, 1, 10, 20),
+			(20, 1, 11, 21),
+			(30, 1, 10, 20),
+			(30, 2, 10, 20),
+			(40, 1, 10, 20),
+			(40, 1, 11, 21),
+			(40, 2, 10, 10),
+			(50, 1, 10, 10),
+			(50, 2, 10, 10),
+			(60, 2, 10, 10),
+			(60, 4, 10, 20),
+			(70, 2, 10, 10),
+			(70, 999, 10, 20),
+			(80, 2, 10, 10),
+			(80, 3, 10, 20),
+			(100, 1, 10, 20),
+			(100, 2, 10, 10),
+		];
+
+		let oracle = assert_dense_frugal_equal(suppliers, nations, orders, lineitems);
+		assert_eq!(oracle.contributing_rows, 2);
+		assert_eq!(
+			oracle.rows,
+			vec![Q21Row {
+				s_name: "SAUDI-1".to_string(),
+				numwait: 2,
+			}]
+		);
+	}
+
+	#[test]
+	fn contiguous_lineitems_form_one_group() {
+		let oracle = q21_oracle_from_rows(
+			[(1, "SAUDI".to_string(), 10), (2, "OTHER".to_string(), 11)],
+			[
+				(10, "SAUDI ARABIA".to_string()),
+				(11, "MOROCCO".to_string()),
+			],
+			[(7, "F".to_string())],
+			[(7, 1, 10, 20), (7, 1, 11, 21), (7, 2, 10, 10)],
+		)
+		.expect("contiguous q21 group");
+		assert_eq!(oracle.contributing_rows, 2);
+	}
+
+	#[test]
+	fn order_and_lineitem_invariants_fail_loudly() {
+		let duplicate_orders = q21_oracle_from_rows(
+			Vec::<Q21SupplierRow>::new(),
+			Vec::<Q21NationRow>::new(),
+			[(1, "F".to_string()), (1, "F".to_string())],
+			Vec::<Q21LineitemRow>::new(),
+		)
+		.expect_err("duplicate q21 orders must fail");
+		assert!(duplicate_orders.contains("orders stream is not strictly increasing"));
+
+		let decreasing_orders = q21_oracle_from_rows(
+			Vec::<Q21SupplierRow>::new(),
+			Vec::<Q21NationRow>::new(),
+			[(2, "F".to_string()), (1, "F".to_string())],
+			Vec::<Q21LineitemRow>::new(),
+		)
+		.expect_err("decreasing q21 orders must fail");
+		assert!(decreasing_orders.contains("previous key 2, current key 1"));
+
+		let reappearing_lineitems = q21_oracle_from_rows(
+			Vec::<Q21SupplierRow>::new(),
+			Vec::<Q21NationRow>::new(),
+			Vec::<Q21OrderRow>::new(),
+			[(1, 1, 10, 10), (2, 1, 10, 10), (1, 1, 10, 10)],
+		)
+		.expect_err("reappearing q21 lineitem group must fail");
+		assert!(
+			reappearing_lineitems.contains("lineitem order stream is not nondecreasing")
+				&& reappearing_lineitems.contains("previous group key 2, current key 1")
+		);
+	}
+
+	#[test]
+	fn both_unmatched_tails_are_drained_and_validated() {
+		let order_tail = q21_oracle_from_rows(
+			Vec::<Q21SupplierRow>::new(),
+			Vec::<Q21NationRow>::new(),
+			[
+				(1, "F".to_string()),
+				(3, "F".to_string()),
+				(2, "F".to_string()),
+			],
+			[(1, 1, 10, 10)],
+		)
+		.expect_err("q21 order-tail violation must fail");
+		assert!(order_tail.contains("previous key 3, current key 2"));
+
+		let lineitem_tail = q21_oracle_from_rows(
+			Vec::<Q21SupplierRow>::new(),
+			Vec::<Q21NationRow>::new(),
+			[(1, "F".to_string())],
+			[(1, 1, 10, 10), (3, 1, 10, 10), (2, 1, 10, 10)],
+		)
+		.expect_err("q21 lineitem-tail violation must fail");
+		assert!(lineitem_tail.contains("previous group key 3, current key 2"));
+	}
+
+	#[test]
+	fn checked_counter_overflow_is_loud() {
+		let suppliers = HashMap::from([
+			(1, ("SAUDI".to_string(), 10)),
+			(2, ("OTHER".to_string(), 11)),
+		]);
+		let nations = HashMap::from([
+			(10, "SAUDI ARABIA".to_string()),
+			(11, "MOROCCO".to_string()),
+		]);
+		let items = [(1, 10, 20), (2, 10, 10)];
+
+		let mut counts = HashMap::new();
+		let mut contributing_rows = usize::MAX;
+		let rows_error = q21_count_order(
+			"F",
+			&items,
+			&suppliers,
+			&nations,
+			&mut counts,
+			&mut contributing_rows,
+		)
+		.expect_err("q21 contributing row overflow must fail");
+		assert_eq!(rows_error, "q21 contributing_rows counter overflow");
+
+		let mut counts = HashMap::from([("SAUDI".to_string(), i64::MAX)]);
+		let mut contributing_rows = 0;
+		let count_error = q21_count_order(
+			"F",
+			&items,
+			&suppliers,
+			&nations,
+			&mut counts,
+			&mut contributing_rows,
+		)
+		.expect_err("q21 supplier count overflow must fail");
+		assert!(count_error.contains("supplier count overflow for \"SAUDI\""));
+	}
+
+	#[test]
+	fn unchanged_non_vacuity_guard_stays_armed() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("s_name", DataType::Utf8, false),
+			Field::new("numwait", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(StringArray::from(Vec::<String>::new())),
+				Arc::new(Int64Array::from(Vec::<i64>::new())),
+			],
+		)
+		.expect("empty q21 batch");
+		let oracle = Q21Oracle {
+			rows: Vec::new(),
+			contributing_rows: 0,
+		};
+
+		let error =
+			compare_strict_q21(&[batch], &oracle).expect_err("empty q21 oracle must be rejected");
+		assert!(error.contains("oracle non-vacuous guard failed"));
+	}
 }
 
 fn strict_q21_expected_schema() -> [(&'static str, DataType); 2] {
