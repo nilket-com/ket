@@ -13,6 +13,26 @@ const EMPTY_INT64_PRESENCE_BUCKET: u32 = u32::MAX;
 const INT64_PRESENCE_INITIAL_ENTRY_CAPACITY: usize = 1024;
 const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
 const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident state";
+const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort input accumulator";
+
+fn account_streamed_correlated_sort_input(
+	accumulated_bytes: u64,
+	batch: &RecordBatch,
+	cap: u64,
+) -> Result<u64, ExecutionError> {
+	let requested = accumulated_bytes
+		.checked_add(record_batch_memory_bytes(batch))
+		.unwrap_or(u64::MAX);
+	if requested > cap {
+		return Err(budget_exhausted(
+			BudgetDimension::Memory,
+			STREAMED_CORRELATED_SORT_INPUT_PRODUCER,
+			requested,
+			cap,
+		));
+	}
+	Ok(requested)
+}
 
 #[cfg(test)]
 static MEMBERSHIP_OUTER_WRITER_CONSTRUCT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -4041,6 +4061,229 @@ impl Executor {
 		);
 
 		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+	}
+
+	pub(in crate::exec) async fn bound_sort(
+		&self,
+		input: &ExecutionPlan,
+		order_by: &[ExecutionSortKey],
+		limit: Option<usize>,
+		offset: usize,
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		if let Some(output) = Box::pin(self.try_streaming_correlated_scalar_left_outer_sort(
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+			morsel,
+		))
+		.await?
+		{
+			return Ok(output);
+		}
+		let input_batches = self.execute_bound(input, morsel).await?;
+		execute_sort(
+			input.schema(),
+			&input_batches,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+			self.context.task_budget,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn try_streaming_correlated_scalar_left_outer_sort(
+		&self,
+		input: &ExecutionPlan,
+		order_by: &[ExecutionSortKey],
+		limit: Option<usize>,
+		offset: usize,
+		output_schema: &arrow::datatypes::SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let ExecutionPlan::Exchange {
+			input: project,
+			partition_count: 1,
+			..
+		} = input
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Project {
+			input: filter,
+			exprs: project_exprs,
+			output_schema: project_output_schema,
+		} = project.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Filter {
+			input: recombine,
+			predicate: recombine_filter,
+			disposition: FilterDisposition::EvaluateInToron,
+		} = filter.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Join {
+			replay_id,
+			left,
+			right,
+			kind: JoinKind::LeftOuter,
+			left_keys,
+			right_keys,
+			match_filter,
+			null_safe_keys,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: recombine_output_schema,
+			..
+		} = recombine.as_ref()
+		else {
+			return Ok(None);
+		};
+		let ExecutionPlan::Exchange {
+			input: preserved_exchange_input,
+			partition_count,
+			key: preserved_exchange_key,
+		} = left.as_ref()
+		else {
+			return Ok(None);
+		};
+		if *partition_count == 0
+			|| extract_reoriented_inner_chain(preserved_exchange_input.as_ref()).is_none()
+		{
+			return Ok(None);
+		}
+
+		let scalar_batches = self.execute_bound(right, morsel).await?;
+		let scalar_batch = concat_or_empty(right.schema(), &scalar_batches)?;
+		let scalar_key_arrays = key_arrays(&scalar_batch, right_keys)?;
+		let key_plan = JoinKeyPlan::from_build_arrays_and_probe_schema(
+			&scalar_key_arrays,
+			&left.schema(),
+			left_keys,
+			*null_safe_keys,
+		)?;
+		let build_cap =
+			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let estimated_build_bytes =
+			estimated_build_hash_bytes(&scalar_key_arrays, scalar_batch.num_rows());
+		if estimated_build_bytes > build_cap {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"correlated scalar recombine build accumulator",
+				estimated_build_bytes,
+				build_cap,
+			));
+		}
+		let Some(scalar_rows) = build_in_memory_join_rows(
+			key_plan,
+			&scalar_key_arrays,
+			scalar_batch.num_rows(),
+			build_cap,
+			*null_safe_keys,
+		)?
+		else {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				"correlated scalar recombine build accumulator",
+				estimated_build_bytes,
+				build_cap,
+			));
+		};
+		record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.counters.build_rows = task
+				.counters
+				.build_rows
+				.saturating_add(scalar_batch.num_rows() as u64);
+		});
+		let mut runtime = StreamingLeftOuterRecombineRuntime {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			scalar_batch,
+			scalar_rows,
+			key_plan,
+			preserved_keys: left_keys.clone(),
+			match_filter: match_filter.as_ref(),
+			null_safe_keys: *null_safe_keys,
+			output_schema: recombine_output_schema.clone(),
+			probe_rows: 0,
+			output_rows: 0,
+		};
+
+		let accumulator_cap =
+			sort_materialization_memory_cap(self.context.task_budget.memory.get());
+		let mut accumulated_bytes = 0u64;
+		let mut survivors = Vec::new();
+		let matched = self
+			.try_visit_streaming_reoriented_inner_chain(
+				preserved_exchange_input,
+				morsel,
+				&mut |batch| {
+					for (_, partitioned) in self.repartition_exchange_batch(
+						&batch,
+						*partition_count,
+						preserved_exchange_key,
+					)? {
+						for recombined in
+							self.probe_streaming_left_outer_recombine(&mut runtime, &partitioned)?
+						{
+							let filtered = self.filter_batch_with_bound_predicate(
+								recombine_filter,
+								recombined,
+								"filter predicate",
+							)?;
+							if filtered.num_rows() == 0 {
+								continue;
+							}
+							let projected = RecordBatch::try_new(
+								project_output_schema.clone(),
+								self.evaluate_bound_program(project_exprs, &filtered)?,
+							)?;
+							accumulated_bytes = account_streamed_correlated_sort_input(
+								accumulated_bytes,
+								&projected,
+								accumulator_cap,
+							)?;
+							survivors.push(projected);
+						}
+					}
+					Ok(())
+				},
+			)
+			.await?;
+		if matched.is_none() {
+			return Ok(None);
+		}
+		record_join_runtime_observation(
+			&self.context.task_telemetry,
+			&self.context.join_runtime_observation_mode,
+			JoinRuntimeObservation {
+				replay_id: runtime.replay_id,
+				strategy: runtime.strategy,
+				build_rows: RowCount::new(runtime.scalar_batch.num_rows() as u64),
+				probe_rows: RowCount::new(runtime.probe_rows),
+				output_rows: RowCount::new(runtime.output_rows),
+			},
+		);
+		if survivors.is_empty() {
+			survivors.push(RecordBatch::new_empty(project_output_schema.clone()));
+		}
+		execute_sort(
+			input.schema(),
+			&survivors,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+			self.context.task_budget,
+		)
+		.map(Some)
 	}
 
 	pub(in crate::exec) async fn try_visit_streaming_join0_filter_chunks<F>(
@@ -9628,6 +9871,37 @@ impl Executor {
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<()>, ExecutionError> {
+		let mut visit_batch = |batch| {
+			self.fold_reoriented_grouped_output_batch(
+				groups,
+				group_types,
+				outer_predicate,
+				project_exprs,
+				project_output_schema,
+				group_expr,
+				aggr_expr,
+				batch,
+			)
+		};
+		self.try_visit_streaming_reoriented_inner_chain_scan_probe_base(
+			base,
+			inner_runtimes,
+			morsel,
+			&mut visit_batch,
+		)
+		.await
+	}
+
+	async fn try_visit_streaming_reoriented_inner_chain_scan_probe_base<F>(
+		&self,
+		base: &ExecutionPlan,
+		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
+		morsel: Option<(MorselId, u32)>,
+		visit_batch: &mut F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
 		let ExecutionPlan::Exchange {
 			input: base_input,
 			partition_count,
@@ -9800,16 +10074,7 @@ impl Executor {
 					}
 
 					for batch in batches {
-						self.fold_reoriented_grouped_output_batch(
-							groups,
-							group_types,
-							outer_predicate,
-							project_exprs,
-							project_output_schema,
-							group_expr,
-							aggr_expr,
-							batch,
-						)?;
+						visit_batch(batch)?;
 					}
 				}
 			}
@@ -9834,6 +10099,96 @@ impl Executor {
 			},
 		);
 		Ok(Some(()))
+	}
+
+	async fn try_visit_streaming_reoriented_inner_chain<F>(
+		&self,
+		input: &ExecutionPlan,
+		morsel: Option<(MorselId, u32)>,
+		visit_batch: &mut F,
+	) -> Result<Option<()>, ExecutionError>
+	where
+		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+	{
+		let Some((base, stages)) = extract_reoriented_inner_chain(input) else {
+			return Ok(None);
+		};
+		let mut runtimes: Vec<ReorientedInnerJoinRuntime<'_>> = Vec::with_capacity(stages.len());
+		for stage in stages {
+			let decision = match self
+				.reoriented_inner_stage_scan_build_decision(&stage, morsel)
+				.await
+			{
+				Ok(decision) => decision,
+				Err(error) => {
+					for runtime in runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
+			};
+			let runtime = match match decision {
+				ReorientedStageScanBuildDecision::Stream => {
+					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+						stage, morsel,
+					)
+					.await
+				}
+				ReorientedStageScanBuildDecision::StreamMaterializedBatches(build_batches)
+				| ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
+					self.prepare_reoriented_inner_join_runtime_from_build_batches(
+						stage,
+						build_batches,
+					)
+					.await
+				}
+				ReorientedStageScanBuildDecision::Materialized => {
+					self.prepare_reoriented_inner_join_runtime(stage, morsel)
+						.await
+				}
+			} {
+				Ok(runtime) => runtime,
+				Err(error) => {
+					for runtime in runtimes {
+						runtime.cleanup().await;
+					}
+					return Err(error);
+				}
+			};
+			let Some(runtime) = runtime else {
+				for runtime in runtimes {
+					runtime.cleanup().await;
+				}
+				return Ok(None);
+			};
+			runtimes.push(runtime);
+		}
+
+		let result = self
+			.try_visit_streaming_reoriented_inner_chain_scan_probe_base(
+				base,
+				&mut runtimes,
+				morsel,
+				visit_batch,
+			)
+			.await;
+		for runtime in &runtimes {
+			record_join_runtime_observation(
+				&self.context.task_telemetry,
+				&self.context.join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id: runtime.replay_id,
+					strategy: runtime.strategy,
+					build_rows: RowCount::new(runtime.build_row_count()),
+					probe_rows: RowCount::new(runtime.probe_rows),
+					output_rows: RowCount::new(runtime.output_rows),
+				},
+			);
+		}
+		for runtime in runtimes {
+			runtime.cleanup().await;
+		}
+		result
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -14792,6 +15147,33 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn streamed_correlated_sort_input_budget_is_named_and_exact() {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"value",
+			DataType::Int64,
+			false,
+		)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])
+			.expect("sort input batch");
+		let batch_bytes = record_batch_memory_bytes(&batch);
+		assert_eq!(
+			account_streamed_correlated_sort_input(7, &batch, 7 + batch_bytes)
+				.expect("exact cap fits"),
+			7 + batch_bytes
+		);
+		let error = account_streamed_correlated_sort_input(7, &batch, 6 + batch_bytes)
+			.expect_err("one byte over cap must fail");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: STREAMED_CORRELATED_SORT_INPUT_PRODUCER,
+				..
+			}
+		));
+	}
+
 	#[async_trait::async_trait]
 	impl AsyncFileOps for CountingFileOps {
 		async fn open(
@@ -14993,6 +15375,313 @@ mod tests {
 			input: Box::new(input),
 			partition_count,
 			key,
+		}
+	}
+
+	fn terminal_correlated_sort_fixture(
+		chain_replay_id: JoinReplayId,
+		top_partition_count: u32,
+	) -> (Executor, ExecutionPlan, Arc<Mutex<Vec<TableId>>>, PathBuf) {
+		let supplier_schema = Arc::new(Schema::new(vec![
+			Field::new("s_suppkey", DataType::Int64, false),
+			Field::new("s_name", DataType::Utf8, false),
+		]));
+		let partsupp_schema = Arc::new(Schema::new(vec![
+			Field::new("ps_partkey", DataType::Int64, false),
+			Field::new("ps_suppkey", DataType::Int64, false),
+			Field::new("ps_supplycost", DataType::Int64, false),
+		]));
+		let part_schema = Arc::new(Schema::new(vec![
+			Field::new("p_partkey", DataType::Int64, false),
+			Field::new("p_mfgr", DataType::Utf8, false),
+		]));
+		let scalar_schema = Arc::new(Schema::new(vec![
+			Field::new("key_0", DataType::Int64, false),
+			Field::new("value", DataType::Int64, false),
+		]));
+		let supplier = RecordBatch::try_new(
+			supplier_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30])),
+				Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+			],
+		)
+		.expect("supplier batch");
+		let partsupp_a = RecordBatch::try_new(
+			partsupp_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+				Arc::new(Int64Array::from(vec![5, 5])),
+			],
+		)
+		.expect("partsupp batch a");
+		let partsupp_b = RecordBatch::try_new(
+			partsupp_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![30, 20])),
+				Arc::new(Int64Array::from(vec![7, 3])),
+			],
+		)
+		.expect("partsupp batch b");
+		let part = RecordBatch::try_new(
+			part_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(StringArray::from(vec!["mfgr-1", "mfgr-2"])),
+			],
+		)
+		.expect("part batch");
+		let scalar = RecordBatch::try_new(
+			scalar_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![5, 3])),
+			],
+		)
+		.expect("scalar batch");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([
+				(TableId(80), vec![supplier]),
+				(TableId(81), vec![partsupp_a, partsupp_b]),
+				(TableId(82), vec![part]),
+				(TableId(83), vec![scalar]),
+			]),
+			requested_tables: requested_tables.clone(),
+		});
+		let spill_dir = std::env::temp_dir().join(format!(
+			"toron_terminal_correlated_sort_test_{}_{}",
+			std::process::id(),
+			NEXT_CHAIN_SEMI_TEST_DIR.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+		));
+		let executor = Executor::with_context(
+			storage,
+			ExecutionContext::local_test()
+				.with_task_budget(high_test_budget())
+				.with_join_spill_store(Arc::new(BlockingFileOps), spill_dir.clone()),
+		);
+
+		let supplier = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(80), supplier_schema.clone(), 80),
+			bound_column_root("s_suppkey", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let partsupp = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(81), partsupp_schema.clone(), 81),
+			bound_column_root("ps_suppkey", ColumnOrdinal(1), DataType::Int64, false),
+			4,
+		);
+		let join0_schema = concat_test_schema(&supplier_schema, &partsupp_schema);
+		let join0 = inner_join_plan(
+			supplier,
+			partsupp,
+			vec![ColumnOrdinal(0)],
+			vec![ColumnOrdinal(1)],
+			join0_schema.clone(),
+		);
+		let base = exchange_plan(
+			join0,
+			bound_column_root("ps_partkey", ColumnOrdinal(2), DataType::Int64, false),
+			4,
+		);
+		let part = exchange_plan(
+			test_scan_plan_with_first_field_key(TableId(82), part_schema.clone(), 82),
+			bound_column_root("p_partkey", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let chain_schema = concat_test_schema(&part_schema, &join0_schema);
+		let chain = ExecutionPlan::Join {
+			replay_id: chain_replay_id,
+			replay_eligibility: BroadcastReplayEligibility::Replayable,
+			left: Box::new(part),
+			right: Box::new(base),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(2)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: chain_schema.clone(),
+		};
+		let preserved = exchange_plan(
+			chain,
+			bound_column_root("p_partkey", ColumnOrdinal(0), DataType::Int64, false),
+			4,
+		);
+		let scalar = test_scan_plan_with_first_field_key(TableId(83), scalar_schema.clone(), 83);
+		let recombine_schema = concat_test_schema(&chain_schema, &scalar_schema);
+		let recombine = ExecutionPlan::Join {
+			replay_id: JoinReplayId(2),
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
+			left: Box::new(preserved),
+			right: Box::new(scalar),
+			kind: JoinKind::LeftOuter,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			match_filter: None,
+			null_safe_keys: false,
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: recombine_schema,
+		};
+		let filtered = ExecutionPlan::Filter {
+			input: Box::new(recombine),
+			predicate: binary_residual_program(
+				BoundBinaryOp::Eq,
+				ColumnOrdinal(6),
+				DataType::Int64,
+				false,
+				ColumnOrdinal(8),
+				DataType::Int64,
+				false,
+			),
+			disposition: FilterDisposition::EvaluateInToron,
+		};
+		let project_schema = Arc::new(Schema::new(vec![
+			Field::new("s_name", DataType::Utf8, false),
+			Field::new("p_partkey", DataType::Int64, false),
+			Field::new("ps_supplycost", DataType::Int64, false),
+		]));
+		let mut project_builder = BoundExprProgramBuilder::new();
+		for (name, ordinal, data_type) in [
+			("s_name", ColumnOrdinal(3), DataType::Utf8),
+			("p_partkey", ColumnOrdinal(0), DataType::Int64),
+			("ps_supplycost", ColumnOrdinal(6), DataType::Int64),
+		] {
+			let column = project_builder.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal,
+				data_type,
+				nullable: false,
+				pbc_eligible: false,
+			});
+			project_builder.push_root(column);
+		}
+		let projected = ExecutionPlan::Project {
+			input: Box::new(filtered),
+			exprs: project_builder.build(),
+			output_schema: project_schema.clone(),
+		};
+		let sort_input = exchange_plan(
+			projected,
+			bound_column_root("p_partkey", ColumnOrdinal(1), DataType::Int64, false),
+			top_partition_count,
+		);
+		let sort = ExecutionPlan::Sort {
+			input: Box::new(sort_input),
+			order_by: vec![
+				ExecutionSortKey {
+					ordinal: ColumnOrdinal(2),
+					descending: false,
+					nulls_first: false,
+				},
+				ExecutionSortKey {
+					ordinal: ColumnOrdinal(0),
+					descending: false,
+					nulls_first: false,
+				},
+			],
+			limit: None,
+			offset: 0,
+			output_schema: project_schema,
+		};
+		(executor, sort, requested_tables, spill_dir)
+	}
+
+	#[tokio::test]
+	async fn terminal_correlated_sort_streams_early_join_and_preserves_all_min_ties() {
+		let (executor, plan, requested, spill_dir) =
+			terminal_correlated_sort_fixture(JoinReplayId(1), 1);
+		let ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		} = &plan
+		else {
+			panic!("sort fixture")
+		};
+		let streamed = executor
+			.try_streaming_correlated_scalar_left_outer_sort(
+				input,
+				order_by,
+				*limit,
+				*offset,
+				output_schema,
+				None,
+			)
+			.await
+			.expect("streamed terminal correlated sort")
+			.expect("exact shape must be admitted");
+
+		let (baseline_executor, baseline_plan, _, baseline_spill_dir) =
+			terminal_correlated_sort_fixture(JoinReplayId(2), 1);
+		let materialized = baseline_executor
+			.execute_bound(&baseline_plan, None)
+			.await
+			.expect("shape-fenced materialized sort");
+		assert_record_batches_equal(&streamed, &materialized);
+		let output = arrow::compute::concat_batches(&streamed[0].schema(), streamed.iter())
+			.expect("streamed concat");
+		assert_eq!(int64_column_values(&output, 1), vec![2, 1, 1]);
+		assert_eq!(int64_column_values(&output, 2), vec![3, 5, 5]);
+		assert_eq!(
+			output
+				.column(0)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("name column")
+				.iter()
+				.collect::<Vec<_>>(),
+			vec![Some("beta"), Some("alpha"), Some("beta")]
+		);
+		let requested = requested.lock().expect("requested tables");
+		for table in [TableId(80), TableId(81), TableId(82), TableId(83)] {
+			assert_eq!(
+				requested
+					.iter()
+					.filter(|requested| **requested == table)
+					.count(),
+				1,
+				"streamed path must scan table {table:?} exactly once"
+			);
+		}
+		drop(requested);
+		let _ = std::fs::remove_dir_all(spill_dir);
+		let _ = std::fs::remove_dir_all(baseline_spill_dir);
+	}
+
+	#[tokio::test]
+	async fn terminal_correlated_sort_shape_fence_is_pre_io() {
+		for (replay_id, top_partition_count) in [(JoinReplayId(1), 2), (JoinReplayId(2), 1)] {
+			let (executor, plan, requested, spill_dir) =
+				terminal_correlated_sort_fixture(replay_id, top_partition_count);
+			let ExecutionPlan::Sort {
+				input,
+				order_by,
+				limit,
+				offset,
+				output_schema,
+			} = &plan
+			else {
+				panic!("sort fixture")
+			};
+			let output = executor
+				.try_streaming_correlated_scalar_left_outer_sort(
+					input,
+					order_by,
+					*limit,
+					*offset,
+					output_schema,
+					None,
+				)
+				.await
+				.expect("shape fence");
+			assert!(output.is_none());
+			assert!(requested.lock().expect("requested tables").is_empty());
+			let _ = std::fs::remove_dir_all(spill_dir);
 		}
 	}
 

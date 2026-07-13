@@ -990,16 +990,15 @@ impl Executor {
 					offset,
 					output_schema,
 				} => {
-					let input_batches = self.execute_bound(input, morsel).await?;
-					execute_sort(
-						input.schema(),
-						&input_batches,
+					Box::pin(self.bound_sort(
+						input,
 						order_by,
 						*limit,
 						*offset,
 						output_schema,
-						self.context.task_budget,
-					)
+						morsel,
+					))
+					.await
 				}
 				ExecutionPlan::Window {
 					input,
