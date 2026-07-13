@@ -5,6 +5,7 @@ mod build_rows;
 mod columns;
 mod residency_profile;
 mod spill;
+mod spill_placement;
 mod streaming;
 
 pub(in crate::exec) use self::build_profile::{
@@ -22,6 +23,7 @@ pub(in crate::exec) use self::spill::{
 	partition_bucket_if_non_null_with_scratch,
 };
 pub(crate) use self::spill::{partition_bucket, partition_bucket_with_scratch};
+pub(in crate::exec) use self::spill_placement::default_join_spill_dir;
 #[cfg(test)]
 pub(in crate::exec) use self::streaming::{
 	StreamingSemiAntiExistence, StreamingSemiAntiRuntime, StreamingSemiAntiStage,

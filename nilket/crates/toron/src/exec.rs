@@ -162,7 +162,7 @@ impl ExecutionContext {
 			downstream_cancellation: None,
 			partition_parallelism: default_partition_parallelism(),
 			join_spill_file_ops: Arc::new(BlockingFileOps),
-			join_spill_dir: std::env::temp_dir().join("toron_join_spill"),
+			join_spill_dir: crate::exec::join::default_join_spill_dir(),
 		}
 	}
 

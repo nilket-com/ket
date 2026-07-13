@@ -188,3 +188,20 @@ fn adr297_q08_reuses_q05_tables_plus_one_physical_nation() {
 	assert!(main.contains("\"q08\" | \"q8\""));
 	assert!(harness.contains("q08_executes_in_both_modes"));
 }
+
+#[test]
+fn adr430_tpch_execution_paths_share_disk_backed_join_spill_placement() {
+	let lib = source("src/lib.rs");
+	assert_eq!(
+		lib.matches("let context = tpch_execution_context(task_telemetry.clone());")
+			.count(),
+		2,
+		"both TPC-H executor context sites must use the centralized constructor"
+	);
+	assert!(
+		lib.contains("fn tpch_execution_context(")
+			&& lib.contains(".with_join_spill_store(")
+			&& lib.contains("PathBuf::from(CACHE_ROOT).join(\"join_spill\")"),
+		"the centralized context must keep join spill under the untracked TPC-H cache root"
+	);
+}

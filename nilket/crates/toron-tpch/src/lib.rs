@@ -3368,7 +3368,7 @@ async fn execute_logical_with_catalog_timed(
 	plan_fingerprint = Some(physical_plan_fingerprint(&bound));
 
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
-	let context = ExecutionContext::local_test().with_task_telemetry(task_telemetry.clone());
+	let context = tpch_execution_context(task_telemetry.clone());
 	let execute_start = Instant::now();
 	let batches = match Executor::with_context(storage, context)
 		.execute_bound(&bound, None)
@@ -3404,6 +3404,15 @@ async fn execute_logical_with_catalog_timed(
 		plan_fingerprint: plan_fingerprint.expect("bound plan has a fingerprint"),
 		spill_bytes,
 	})
+}
+
+fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> ExecutionContext {
+	ExecutionContext::local_test()
+		.with_task_telemetry(task_telemetry)
+		.with_join_spill_store(
+			Arc::new(wendelon::storage::BlockingFileOps),
+			PathBuf::from(CACHE_ROOT).join("join_spill"),
+		)
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
@@ -3921,7 +3930,7 @@ async fn execute_bound_profile_iteration(
 	storage: Arc<dyn StorageScan>,
 ) -> Result<ProfileLoopIteration, StageError> {
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
-	let context = ExecutionContext::local_test().with_task_telemetry(task_telemetry.clone());
+	let context = tpch_execution_context(task_telemetry.clone());
 	clear_parquet_scan_ledger();
 	let execute_start = Instant::now();
 	let batches = Executor::with_context(storage, context)
