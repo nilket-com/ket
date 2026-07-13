@@ -1189,6 +1189,45 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	resident_baseline_bytes: u64,
 }
 
+/// Query-neutral ownership census for the grouped-reservoir residency profile (ADR 429).
+/// Historical writer high-water is kept separate from current retained ownership because the
+/// former can overlap the latter. `current_resident_bytes` is therefore a checked sum of only
+/// the currently owned components.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(in crate::exec) struct SpilledInnerJoinResidencySnapshot {
+	pub(in crate::exec) resident_baseline_guard_bytes: u64,
+	pub(in crate::exec) resident_index_bytes: u64,
+	pub(in crate::exec) writer_scratch_peak_bytes: u64,
+	pub(in crate::exec) page_reserve_bytes: u64,
+	pub(in crate::exec) cache_payload_bytes: u64,
+	pub(in crate::exec) pinned_decoded_bytes: u64,
+	pub(in crate::exec) page_metadata_bytes: Option<u64>,
+	pub(in crate::exec) cache_metadata_bytes: Option<u64>,
+	pub(in crate::exec) pinned_handle_capacity_bytes: Option<u64>,
+	pub(in crate::exec) write_scratch_capacity_bytes: Option<u64>,
+	pub(in crate::exec) retained_legacy_index_bytes: Option<u64>,
+	pub(in crate::exec) path_capacity_bytes: Option<u64>,
+	pub(in crate::exec) open_file_handles: u64,
+	pub(in crate::exec) input_rows: u64,
+	pub(in crate::exec) spill_disk_bytes: u64,
+	pub(in crate::exec) current_resident_bytes: Option<u64>,
+	pub(in crate::exec) current_resident_error: Option<&'static str>,
+	pub(in crate::exec) guard_accounted_bytes: Option<u64>,
+	pub(in crate::exec) guard_accounted_error: Option<&'static str>,
+	pub(in crate::exec) overlap_label: &'static str,
+}
+
+fn checked_spill_capacity_bytes<T>(capacity: usize) -> Option<u64> {
+	let bytes = capacity.checked_mul(std::mem::size_of::<T>())?;
+	u64::try_from(bytes).ok()
+}
+
+fn checked_spill_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+	values
+		.into_iter()
+		.try_fold(0u64, |total, value| total.checked_add(value))
+}
+
 impl SpilledInnerJoinBuild {
 	pub(in crate::exec) async fn create(
 		task_budget: TaskBudget,
@@ -2193,6 +2232,90 @@ impl SpilledInnerJoinBuild {
 			.saturating_add(scratch_capacity)
 			.saturating_add(retained_legacy_index)
 			.saturating_add(u64::try_from(self.path.capacity()).unwrap_or(u64::MAX))
+	}
+
+	pub(in crate::exec) fn residency_snapshot(&self) -> SpilledInnerJoinResidencySnapshot {
+		let page_metadata_bytes = checked_spill_capacity_bytes::<JoinSpillPage>(
+			self.pages.capacity(),
+		)
+		.and_then(|pages| {
+			checked_spill_capacity_bytes::<u32>(self.page_rows.capacity())
+				.and_then(|rows| pages.checked_add(rows))
+		});
+		let cache_metadata_bytes = self
+			.cache
+			.capacity()
+			.checked_mul(std::mem::size_of::<(usize, CachedJoinSpillPage)>() + 16)
+			.and_then(|bytes| u64::try_from(bytes).ok())
+			.and_then(|cache| {
+				checked_spill_capacity_bytes::<usize>(self.lru.capacity())
+					.and_then(|lru| cache.checked_add(lru))
+			});
+		let pinned_handle_capacity_bytes =
+			self.pinned_decoded_pages.as_ref().map_or(Some(0), |pages| {
+				checked_spill_capacity_bytes::<RecordBatch>(pages.capacity())
+			});
+		let write_scratch_capacity_bytes = u64::try_from(self.scratch_plaintext.capacity())
+			.ok()
+			.and_then(|plaintext| {
+				checked_spill_capacity_bytes::<(JoinKey, u32)>(self.scratch_refs.capacity())
+					.and_then(|refs| plaintext.checked_add(refs))
+			});
+		let retained_legacy_index_bytes = self.compact_index.as_ref().map_or(Some(0), |_| {
+			Some(spilled_batch_join_hash_index_bytes(&self.index))
+		});
+		let path_capacity_bytes = u64::try_from(self.path.capacity()).ok();
+		let fixed = [
+			self.resident_index_bytes,
+			self.cache_bytes,
+			self.pinned_decoded_bytes,
+		];
+		let optional = [
+			page_metadata_bytes,
+			cache_metadata_bytes,
+			pinned_handle_capacity_bytes,
+			write_scratch_capacity_bytes,
+			retained_legacy_index_bytes,
+			path_capacity_bytes,
+		];
+		let current_resident_bytes = optional
+			.into_iter()
+			.collect::<Option<Vec<_>>>()
+			.and_then(|optional| checked_spill_sum(fixed.into_iter().chain(optional)));
+		let guard_accounted_bytes = checked_spill_sum([
+			self.resident_baseline_bytes,
+			self.resident_index_bytes,
+			self.writer_peak,
+			JOIN_SPILL_PAGE_SIZE as u64,
+			self.cache_bytes,
+			self.pinned_decoded_bytes,
+		]);
+		SpilledInnerJoinResidencySnapshot {
+			resident_baseline_guard_bytes: self.resident_baseline_bytes,
+			resident_index_bytes: self.resident_index_bytes,
+			writer_scratch_peak_bytes: self.writer_peak,
+			page_reserve_bytes: JOIN_SPILL_PAGE_SIZE as u64,
+			cache_payload_bytes: self.cache_bytes,
+			pinned_decoded_bytes: self.pinned_decoded_bytes,
+			page_metadata_bytes,
+			cache_metadata_bytes,
+			pinned_handle_capacity_bytes,
+			write_scratch_capacity_bytes,
+			retained_legacy_index_bytes,
+			path_capacity_bytes,
+			open_file_handles: 1,
+			input_rows: self.input_rows,
+			spill_disk_bytes: self.spill_bytes,
+			current_resident_bytes,
+			current_resident_error: current_resident_bytes
+				.is_none()
+				.then_some("writer current-resident accounting overflow"),
+			guard_accounted_bytes,
+			guard_accounted_error: guard_accounted_bytes
+				.is_none()
+				.then_some("writer guard-accounted accounting overflow"),
+			overlap_label: "baseline_page_reserve_and_writer_peak_are_guard_inputs_excluded_from_current_ownership",
+		}
 	}
 
 	pub(in crate::exec) fn clear_read_cache(&mut self) {

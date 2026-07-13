@@ -212,6 +212,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec/join/columns.rs",
 				// ADR 351: join spill storage submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/spill.rs",
+				// ADR 429: query-neutral grouped-reservoir diagnostics stay inside the semantic join
+				// executor split.
+				"crates/toron/src/exec/join/residency_profile.rs",
 				// ADR 352: join streaming orchestration submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/streaming.rs",
 				// ADR 353: aggregate executor/state submodule inside the semantic executor split.

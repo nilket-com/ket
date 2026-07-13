@@ -1,3 +1,6 @@
+use super::residency_profile::{
+	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
+};
 use super::*;
 use ahash::RandomState;
 
@@ -4523,6 +4526,7 @@ impl Executor {
 					group_range.end,
 					true,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -5290,6 +5294,7 @@ impl Executor {
 		partition_end: usize,
 		enforce_group_spill_budget: bool,
 		combined_resident_baseline_bytes: Option<u64>,
+		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
@@ -5323,9 +5328,15 @@ impl Executor {
 						continue;
 					}
 				}
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.before_reservoir_batch(partitioned_builds, &batch)?;
+				}
 				for (_, partitioned) in
 					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
 				{
+					if let Some(profile) = residency_profile.as_deref_mut() {
+						profile.before_reservoir_batch(partitioned_builds, &partitioned)?;
+					}
 					self.write_partitioned_streaming_scan_inner_build_batch(
 						partitioned_builds,
 						total_spill_bytes,
@@ -5342,6 +5353,10 @@ impl Executor {
 						combined_resident_baseline_bytes,
 					)
 					.await?;
+					if let Some(profile) = residency_profile.as_deref_mut() {
+						profile
+							.reservoir_batch_complete(partitioned_builds, partitioned.num_rows())?;
+					}
 				}
 			}
 		} else {
@@ -5372,6 +5387,9 @@ impl Executor {
 						continue;
 					}
 				}
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.before_reservoir_batch(partitioned_builds, &batch)?;
+				}
 				self.write_partitioned_streaming_scan_inner_build_batch(
 					partitioned_builds,
 					total_spill_bytes,
@@ -5388,6 +5406,9 @@ impl Executor {
 					combined_resident_baseline_bytes,
 				)
 				.await?;
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.reservoir_batch_complete(partitioned_builds, batch.num_rows())?;
+				}
 			}
 		}
 		Ok(())
@@ -10102,6 +10123,7 @@ impl Executor {
 				base_projection.as_ref(),
 				resident_baseline_bytes,
 				false,
+				None,
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -10529,6 +10551,7 @@ impl Executor {
 						group_range.end,
 						true,
 						None,
+						None,
 					)
 					.await?;
 					terminal_spill_bytes = terminal_spill_bytes.saturating_add(group_spill_bytes);
@@ -10684,6 +10707,23 @@ impl Executor {
 		if matched.is_none() {
 			return Ok(None);
 		}
+		let (profile_partition_count, profile_group_count) = inner_runtimes
+			.first()
+			.and_then(|runtime| match &runtime.build {
+				ReorientedInnerJoinBuild::PartitionedScan {
+					partition_count,
+					group_count,
+					..
+				} => Some((*partition_count, *group_count)),
+				_ => None,
+			})
+			.unwrap_or((0, 0));
+		let mut residency_profile = GroupedReservoirResidencyProfile::from_env(
+			&base_batches,
+			base_batches.capacity(),
+			profile_partition_count,
+			profile_group_count,
+		)?;
 		if self
 			.try_process_reoriented_inner_chain_grouped_partitioned_scan_reservoir(
 				&base_batches,
@@ -10696,6 +10736,7 @@ impl Executor {
 				groups,
 				group_types,
 				morsel,
+				residency_profile.as_mut(),
 			)
 			.await?
 		{
@@ -10814,8 +10855,12 @@ impl Executor {
 		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
+		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
 	) -> Result<bool, ExecutionError> {
 		let Some((runtime, suffix_runtimes)) = inner_runtimes.split_first_mut() else {
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.terminal(&[], "reservoir_path_missing_runtime")?;
+			}
 			return Ok(false);
 		};
 		let (
@@ -10846,7 +10891,7 @@ impl Executor {
 				build_column_count,
 				projection,
 				..
-			} if *partition_count > 1 && *group_count > 1 => (
+			} => (
 				*scan_input,
 				*build_morsel,
 				*partition_count,
@@ -10863,8 +10908,20 @@ impl Executor {
 				runtime.probe_keys.clone(),
 				runtime.post_filter,
 			),
-			_ => return Ok(false),
+			_ => {
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.terminal(&[], "reservoir_path_not_partitioned_scan")?;
+				}
+				return Ok(false);
+			}
 		};
+
+		if partition_count <= 1 || group_count <= 1 {
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.terminal(&[], "reservoir_path_not_admitted")?;
+			}
+			return Ok(false);
+		}
 
 		let build_result = self
 			.build_partitioned_streaming_scan_inner_build_reservoir(
@@ -10878,11 +10935,17 @@ impl Executor {
 				projection.as_ref(),
 				0,
 				false,
+				residency_profile.as_deref_mut(),
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
 			Ok(Some(result)) => result,
-			Ok(None) => return Ok(false),
+			Ok(None) => {
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.terminal(&[], "reservoir_build_declined")?;
+				}
+				return Ok(false);
+			}
 			Err(error) => return Err(error),
 		};
 
@@ -10892,9 +10955,19 @@ impl Executor {
 			let Some(first_base_batch) = base_batches.first() else {
 				return Ok::<(), ExecutionError>(());
 			};
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.base_concat_intent(&reservoir)?;
+			}
 			let base_batch = concat_or_empty(first_base_batch.schema(), base_batches)?;
 			if base_batch.num_rows() == 0 {
 				return Ok(());
+			}
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.phase(
+					ProfilePhase::ReservoirProbe,
+					&reservoir,
+					"base_concat_complete",
+				)?;
 			}
 			let (mut output, probe_rows, output_rows) = self
 				.probe_partitioned_streamed_inner_scan_build_reservoir(
@@ -10914,6 +10987,9 @@ impl Executor {
 					0,
 				)
 				.await?;
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.phase(ProfilePhase::Suffix, &reservoir, "reservoir_probe_complete")?;
+			}
 			total_probe_rows = total_probe_rows.saturating_add(probe_rows);
 			total_output_rows = total_output_rows.saturating_add(output_rows);
 			if let Some(predicate) = post_filter {
@@ -10942,9 +11018,20 @@ impl Executor {
 				group_types,
 			)
 			.await?;
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.phase(ProfilePhase::Fold, &reservoir, "suffix_and_fold_complete")?;
+			}
 			Ok::<(), ExecutionError>(())
 		}
 		.await;
+		if let Some(profile) = residency_profile.as_deref_mut() {
+			let status = if result.is_ok() {
+				"complete"
+			} else {
+				"execution_error"
+			};
+			profile.terminal(&reservoir, status)?;
+		}
 		Self::cleanup_partitioned_streamed_inner_builds(reservoir).await;
 		result?;
 		if let ReorientedInnerJoinBuild::PartitionedScan {
@@ -11486,6 +11573,7 @@ impl Executor {
 				spec.projection.as_ref(),
 				runtime_baseline_bytes,
 				true,
+				None,
 			)
 			.await?;
 		let Some((build, build_rows)) = build_result else {
@@ -13720,6 +13808,7 @@ impl Executor {
 					group_range.end,
 					true,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -13823,22 +13912,39 @@ impl Executor {
 		projection: Option<&ProjectedInnerBuildProjection>,
 		resident_baseline_bytes: u64,
 		committed_owner_path: bool,
+		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
 				message: "streamed inner build partition count exceeds usize".to_string(),
 			})?;
+		if let Some(profile) = residency_profile.as_deref_mut() {
+			profile.writer_set_intent(writer_set_collection_bytes(partition_count)?)?;
+		}
 		let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
 			(0..partition_count_usize).map(|_| None).collect();
-		for slot in &mut partitioned_builds {
-			let created = SpilledInnerJoinBuild::create_with_resident_baseline(
+		for partition in 0..partition_count_usize {
+			let created = match SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
 				self.context.join_spill_dir.clone(),
 				resident_baseline_bytes,
 			)
-			.await?;
-			*slot = Some(created);
+			.await
+			{
+				Ok(created) => created,
+				Err(error) => {
+					if let Some(profile) = residency_profile.as_deref_mut() {
+						profile.terminal(&partitioned_builds, "writer_creation_error")?;
+					}
+					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+					return Err(error);
+				}
+			};
+			partitioned_builds[partition] = Some(created);
+		}
+		if let Some(profile) = residency_profile.as_deref_mut() {
+			profile.writer_set_ready(&partitioned_builds)?;
 		}
 
 		let build_started = Instant::now();
@@ -13858,14 +13964,25 @@ impl Executor {
 				partition_count_usize,
 				false,
 				committed_owner_path.then_some(resident_baseline_bytes),
+				residency_profile.as_deref_mut(),
 			)
 			.await;
 		if let Err(error) = build_result {
+			if let Some(profile) = residency_profile.as_deref_mut() {
+				profile.terminal(&partitioned_builds, "reservoir_write_error")?;
+			}
 			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 			if !committed_owner_path && matches!(error, ExecutionError::BudgetExhausted { .. }) {
 				return Ok(None);
 			}
 			return Err(error);
+		}
+		if let Some(profile) = residency_profile.as_deref_mut() {
+			profile.phase(
+				ProfilePhase::ReservoirFinish,
+				&partitioned_builds,
+				"reservoir_write_complete",
+			)?;
 		}
 
 		let mut total_build_rows = 0u64;
@@ -13877,6 +13994,9 @@ impl Executor {
 				continue;
 			};
 			if let Err(error) = spilled.finish(self.context.task_budget).await {
+				if let Some(profile) = residency_profile.as_deref_mut() {
+					profile.terminal(&partitioned_builds, "reservoir_finish_error")?;
+				}
 				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 				return Err(error);
 			}
@@ -13889,6 +14009,13 @@ impl Executor {
 				};
 				empty.cleanup().await;
 			}
+		}
+		if let Some(profile) = residency_profile.as_deref_mut() {
+			profile.phase(
+				ProfilePhase::ReservoirFinish,
+				&partitioned_builds,
+				"reservoir_finish_complete",
+			)?;
 		}
 
 		record_task_telemetry(&self.context.task_telemetry, |task| {
@@ -14171,6 +14298,7 @@ impl Executor {
 					group_range.start,
 					group_range.end,
 					true,
+					None,
 					None,
 				)
 				.await;
@@ -15609,6 +15737,7 @@ mod tests {
 				None,
 				0,
 				false,
+				None,
 			)
 			.await
 			.expect("reservoir build")
@@ -15648,6 +15777,92 @@ mod tests {
 		Executor::cleanup_partitioned_streamed_inner_builds(reservoir).await;
 		let (reservoir_output, reservoir_probe_rows, reservoir_output_rows) =
 			reservoir_probe.expect("reservoir probe");
+
+		let profile_path = chain_stage_profile_test_path("reservoir_enabled_parity");
+		let _ = std::fs::remove_file(&profile_path);
+		let enabled_requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let enabled_executor = make_executor(enabled_requested_tables.clone());
+		let profile_base = Vec::<RecordBatch>::new();
+		let mut residency_profile = GroupedReservoirResidencyProfile::at_path_for_test(
+			profile_path.clone(),
+			&profile_base,
+			profile_base.capacity(),
+			8,
+			4,
+		)
+		.expect("enabled residency profile");
+		let (mut enabled_reservoir, enabled_build_rows) = enabled_executor
+			.build_partitioned_streaming_scan_inner_build_reservoir(
+				scan_input,
+				None,
+				8,
+				&build_keys,
+				&build_keys,
+				JoinKeyPlan::Int64,
+				false,
+				None,
+				0,
+				false,
+				Some(&mut residency_profile),
+			)
+			.await
+			.expect("enabled reservoir build")
+			.expect("enabled reservoir should fit");
+		let enabled_probe = enabled_executor
+			.probe_partitioned_streamed_inner_scan_build_reservoir(
+				&mut enabled_reservoir,
+				8,
+				4,
+				&probe_batch,
+				&probe_keys,
+				&build_keys,
+				JoinKeyPlan::Int64,
+				false,
+				&materialized_output_schema,
+				&output_schema,
+				true,
+				build_schema.fields().len(),
+				None,
+				0,
+			)
+			.await
+			.expect("enabled reservoir probe");
+		Executor::cleanup_partitioned_streamed_inner_builds(enabled_reservoir).await;
+		assert_eq!(enabled_build_rows, reservoir_build_rows);
+		assert_eq!(enabled_probe.1, reservoir_probe_rows);
+		assert_eq!(enabled_probe.2, reservoir_output_rows);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&enabled_probe.0, SortPolicy::None)
+				.expect("enabled reservoir digest"),
+			canonical_arrow_ipc_digest(&reservoir_output, SortPolicy::None)
+				.expect("disabled reservoir digest"),
+			"enabled profiling must not change reservoir output"
+		);
+		assert_eq!(
+			enabled_requested_tables
+				.lock()
+				.expect("enabled requested tables")
+				.as_slice(),
+			reservoir_requested_tables
+				.lock()
+				.expect("disabled requested tables")
+				.as_slice(),
+			"enabled profiling must not change scan telemetry"
+		);
+		let profile_snapshot: serde_json::Value = serde_json::from_slice(
+			&std::fs::read(&profile_path).expect("enabled profile snapshot"),
+		)
+		.expect("parse enabled profile snapshot");
+		assert_eq!(profile_snapshot["schema_version"], 1);
+		assert_eq!(profile_snapshot["phase"], "reservoir_finish");
+		assert_eq!(profile_snapshot["engine"]["reservoir"]["writer_count"], 8);
+		assert!(
+			profile_snapshot["engine"]["reservoir"]["component_summaries"]["resident_index_bytes"]
+				["aggregate_bytes"]["value"]
+				.as_u64()
+				.is_some()
+		);
+		let _ = std::fs::remove_file(profile_path);
 
 		let group_requested_tables = Arc::new(Mutex::new(Vec::new()));
 		let group_executor = make_executor(group_requested_tables.clone());
@@ -15742,6 +15957,7 @@ mod tests {
 				None,
 				join_spill_retained_footprint_memory_cap(budget.memory.get()),
 				true,
+				None,
 			)
 			.await;
 		let error = match result {
