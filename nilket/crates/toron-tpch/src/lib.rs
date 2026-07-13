@@ -156,6 +156,67 @@ pub const Q17_DEV_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
 /// deviation in the results doc (ADR 281).
 pub const STRICT_Q17_SQL: &str = Q17_DEV_SQL;
 
+fn q17_eligible_partkeys(scale_factor: f64) -> Vec<i64> {
+	PartGenerator::new(scale_factor, 1, 1)
+		.iter()
+		.filter(|item| {
+			item.p_brand.to_string() == "Brand#23" && item.p_container.to_string() == "MED BOX"
+		})
+		.map(|item| item.p_partkey)
+		.collect()
+}
+
+fn q17_census_partkey_predicate(column: &str, partkeys: &[i64]) -> Result<String, String> {
+	if partkeys.is_empty() {
+		return Err("q17 census found no eligible Brand#23/MED BOX parts".to_string());
+	}
+	// The SQL frontend intentionally caps each literal IN list at 32 items. Compose bounded lists with
+	// OR so the predicate remains one pushed scan filter rather than rereading lineitem per chunk.
+	Ok(partkeys
+		.chunks(32)
+		.map(|chunk| {
+			format!(
+				"{column} IN ({})",
+				chunk
+					.iter()
+					.map(i64::to_string)
+					.collect::<Vec<_>>()
+					.join(",")
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(" OR "))
+}
+
+/// At sf=10 the generic join-shaped diagnostic falls outside ADR 417's q17 streaming recognizer and
+/// would materialize the unfiltered lineitem scan. Materialize only the tiny eligible-key set in the
+/// harness SQL so the ordinary scan predicate removes non-eligible rows before aggregation.
+fn strict_q17_census_agg_sql(partkeys: &[i64]) -> Result<String, String> {
+	let eligible = q17_census_partkey_predicate("l_partkey", partkeys)?;
+	Ok(format!(
+		"SELECT l_partkey AS p_partkey, \
+		 SUM(l_quantity) AS quantity_sum, COUNT(*) AS quantity_count, AVG(l_quantity) AS quantity_avg \
+		 FROM lineitem WHERE ({eligible}) GROUP BY l_partkey"
+	))
+}
+
+/// Recompute AVG inside Toron, then compare every eligible lineitem row against Toron's emitted Decimal
+/// average. Both scans carry the same bounded eligible-key predicate; no oracle threshold enters the SQL.
+fn strict_q17_census_rows_sql(partkeys: &[i64]) -> Result<String, String> {
+	let inner_eligible = q17_census_partkey_predicate("l_partkey", partkeys)?;
+	let outer_eligible = q17_census_partkey_predicate("lineitem.l_partkey", partkeys)?;
+	Ok(format!(
+		"WITH part_avg AS ( \
+		 SELECT l_partkey AS avg_partkey, AVG(l_quantity) AS avg_quantity \
+		 FROM lineitem WHERE ({inner_eligible}) GROUP BY l_partkey \
+		 ) SELECT lineitem.l_partkey AS p_partkey, l_orderkey, l_suppkey, l_quantity, l_extendedprice \
+		 FROM lineitem, part_avg \
+		 WHERE lineitem.l_partkey = part_avg.avg_partkey \
+		 AND ({outer_eligible}) \
+		 AND lineitem.l_quantity < 0.2 * part_avg.avg_quantity"
+	))
+}
+
 /// ADR 315 — tpch.q18 (Large Volume Customer): official-shaped q18 with `:1` -> `300` and `LIMIT 100`.
 /// The grouped `IN` subquery body is intentionally kept verbatim; this reachability attempt measures the
 /// first wall rather than pre-solving the membership-subquery shape.
@@ -4437,10 +4498,8 @@ pub async fn check_strict_query_with_data_source(
 	data_root: &Path,
 ) -> Result<CorrectnessAttempt, String> {
 	validate_query_scale(query, scale_factor)?;
-	if query == "q17" && (scale_factor - Q17_CORRECTNESS_SCALE).abs() > f64::EPSILON {
-		return Err(format!(
-			"q17_sf10_oracle_policy_gap: q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {scale_factor}"
-		));
+	if query == "q17" {
+		q17_correctness_scale(Some(scale_factor))?;
 	}
 	match data_source {
 		"memory" => check_strict_query_memory(query, scale_factor).await,
@@ -4474,7 +4533,7 @@ async fn check_strict_query_memory(
 		"q14" => check_strict_q14(scale_factor).await,
 		"q15" => check_strict_q15(scale_factor).await,
 		"q16" => check_strict_q16(scale_factor).await,
-		"q17" => check_strict_q17().await,
+		"q17" => check_strict_q17(scale_factor).await,
 		"q18" => check_strict_q18(scale_factor).await,
 		"q19" => check_strict_q19(scale_factor).await,
 		"q20" => check_strict_q20(scale_factor).await,
@@ -8325,12 +8384,157 @@ pub async fn check_strict_q12(scale_factor: f64) -> CorrectnessAttempt {
 }
 
 pub const Q17_CORRECTNESS_SCALE: f64 = 0.02;
+pub const Q17_SF10_CORRECTNESS_SCALE: f64 = 10.0;
+
+/// ADR 431 — the shared pure q17 correctness-scale policy. The small non-vacuous fixture stays the
+/// implicit default; sf=10 is the only board-scale extension certified by the structural census.
+pub fn q17_correctness_scale(explicit: Option<f64>) -> Result<f64, String> {
+	match explicit {
+		None => Ok(Q17_CORRECTNESS_SCALE),
+		Some(scale)
+			if (scale - Q17_CORRECTNESS_SCALE).abs() <= f64::EPSILON
+				|| (scale - Q17_SF10_CORRECTNESS_SCALE).abs() <= f64::EPSILON =>
+		{
+			Ok(scale)
+		}
+		Some(scale) => Err(format!(
+			"q17_sf10_oracle_policy_gap: q17 correctness supports --sf {Q17_CORRECTNESS_SCALE} or --sf {Q17_SF10_CORRECTNESS_SCALE}; got {scale}"
+		)),
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecimalRaw {
 	pub value: Option<i128>,
 	pub precision: u8,
 	pub scale: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Q17PartAggregate {
+	pub partkey: i64,
+	pub quantity_sum_raw: i128,
+	pub quantity_count: i64,
+	pub quantity_avg_raw: i128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Q17SelectedRow {
+	pub partkey: i64,
+	pub orderkey: i64,
+	pub suppkey: i64,
+	pub quantity_raw: i128,
+	pub extendedprice_raw: i128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17CensusCommon {
+	pub part_aggregates: Vec<Q17PartAggregate>,
+	pub selected_rows: Vec<Q17SelectedRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Q17BoundaryCounts {
+	pub below: usize,
+	pub equal: usize,
+	pub above: usize,
+}
+
+impl Q17BoundaryCounts {
+	fn record(&mut self, ordering: std::cmp::Ordering) {
+		match ordering {
+			std::cmp::Ordering::Less => self.below += 1,
+			std::cmp::Ordering::Equal => self.equal += 1,
+			std::cmp::Ordering::Greater => self.above += 1,
+		}
+	}
+
+	fn add_assign(&mut self, other: &Self) {
+		self.below += other.below;
+		self.equal += other.equal;
+		self.above += other.above;
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17PartBoundaryReceipt {
+	pub partkey: i64,
+	pub rational: Q17BoundaryCounts,
+	pub rounded: Q17BoundaryCounts,
+	pub membership_difference_rows: usize,
+}
+
+impl Q17PartBoundaryReceipt {
+	fn record(&mut self, rational: std::cmp::Ordering, rounded: std::cmp::Ordering) -> bool {
+		self.rational.record(rational);
+		self.rounded.record(rounded);
+		let differs =
+			(rational == std::cmp::Ordering::Less) != (rounded == std::cmp::Ordering::Less);
+		if differs {
+			self.membership_difference_rows += 1;
+		}
+		differs
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17BoundaryReceipt {
+	pub parts: Vec<Q17PartBoundaryReceipt>,
+	pub membership_difference_rows: usize,
+}
+
+impl Q17BoundaryReceipt {
+	pub fn totals(&self) -> (Q17BoundaryCounts, Q17BoundaryCounts) {
+		let mut rational = Q17BoundaryCounts::default();
+		let mut rounded = Q17BoundaryCounts::default();
+		for part in &self.parts {
+			rational.add_assign(&part.rational);
+			rounded.add_assign(&part.rounded);
+		}
+		(rational, rounded)
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17BoundaryOracle {
+	pub common: Q17CensusCommon,
+	pub receipt: Q17BoundaryReceipt,
+	pub eligible_parts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17CensusFingerprints {
+	pub part_aggregates: String,
+	pub selected_rows: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Q17BoundaryCensusOutcome {
+	Clean,
+	DecimalContractDecision,
+	ImplementationOracleDivergence,
+}
+
+impl Q17BoundaryCensusOutcome {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Clean => "clean",
+			Self::DecimalContractDecision => "decimal_contract_decision",
+			Self::ImplementationOracleDivergence => "implementation_oracle_divergence",
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q17BoundaryCensus {
+	pub toron: Q17CensusCommon,
+	pub oracle: Q17CensusCommon,
+	pub receipt: Q17BoundaryReceipt,
+	pub eligible_parts: usize,
+	pub common_comparison_error: Option<String>,
+	pub toron_fingerprints: Q17CensusFingerprints,
+	pub oracle_fingerprints: Q17CensusFingerprints,
+	pub outcome: Q17BoundaryCensusOutcome,
 }
 
 /// Mirror the executor's scalar `Decimal128 / Decimal128` path: NULL/zero divisor -> NULL and
@@ -8576,47 +8780,115 @@ pub struct Q17Oracle {
 
 /// Independent strict-q17 oracle at the non-empty scale. Quantity and money raws are scale-2, matching the
 /// strict fixture; exact `0.2` carries scale 1 and `0.2 * AVG(l_quantity)` compares at scale 7.
-pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
-	let eligible_parts: HashSet<i64> = PartGenerator::new(scale_factor, 1, 1)
-		.iter()
-		.filter(|item| {
-			item.p_brand.to_string() == "Brand#23" && item.p_container.to_string() == "MED BOX"
-		})
-		.map(|item| item.p_partkey)
-		.collect();
+pub fn strict_q17_boundary_oracle(scale_factor: f64) -> Result<Q17BoundaryOracle, String> {
+	let eligible_partkeys = q17_eligible_partkeys(scale_factor);
+	let eligible_parts: HashSet<i64> = eligible_partkeys.iter().copied().collect();
 
-	let mut quantity_by_part: HashMap<i64, (i128, i64)> = HashMap::new();
+	let mut quantity_by_part: BTreeMap<i64, (i128, i64)> = BTreeMap::new();
 	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
 		if eligible_parts.contains(&item.l_partkey) {
 			let entry = quantity_by_part.entry(item.l_partkey).or_insert((0, 0));
-			entry.0 += item.l_quantity as i128 * 100;
-			entry.1 += 1;
+			entry.0 = entry
+				.0
+				.checked_add(item.l_quantity as i128 * 100)
+				.ok_or_else(|| "q17 quantity sum overflow".to_string())?;
+			entry.1 = entry
+				.1
+				.checked_add(1)
+				.ok_or_else(|| "q17 quantity count overflow".to_string())?;
 		}
 	}
 
-	let mut threshold_by_part: HashMap<i64, i128> = HashMap::new();
+	let mut boundary_by_part: BTreeMap<i64, (i128, i64, i128, i128)> = BTreeMap::new();
+	let mut part_aggregates = Vec::with_capacity(quantity_by_part.len());
 	for (&partkey, &(quantity_sum, count)) in &quantity_by_part {
 		let avg_raw = avg_decimal_raw(quantity_sum, count, 2, 6, 19)?;
 		let threshold_raw = 2_i128
 			.checked_mul(avg_raw)
 			.ok_or_else(|| "q17 threshold multiplication overflow".to_string())?;
-		threshold_by_part.insert(partkey, threshold_raw);
+		boundary_by_part.insert(partkey, (quantity_sum, count, avg_raw, threshold_raw));
+		part_aggregates.push(Q17PartAggregate {
+			partkey,
+			quantity_sum_raw: quantity_sum,
+			quantity_count: count,
+			quantity_avg_raw: avg_raw,
+		});
 	}
 
-	let mut extendedprice_sum = 0_i128;
-	let mut contributing_rows = 0_usize;
+	let mut receipt_by_part: BTreeMap<i64, Q17PartBoundaryReceipt> = boundary_by_part
+		.keys()
+		.map(|&partkey| {
+			(
+				partkey,
+				Q17PartBoundaryReceipt {
+					partkey,
+					rational: Q17BoundaryCounts::default(),
+					rounded: Q17BoundaryCounts::default(),
+					membership_difference_rows: 0,
+				},
+			)
+		})
+		.collect();
+	let mut selected_rows = Vec::new();
+	let mut membership_difference_rows = 0_usize;
 	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
-		let Some(&threshold_raw) = threshold_by_part.get(&item.l_partkey) else {
+		let Some(&(quantity_sum, count, _avg_raw, threshold_raw)) =
+			boundary_by_part.get(&item.l_partkey)
+		else {
 			continue;
 		};
-		let quantity_at_threshold_scale = (item.l_quantity as i128 * 100)
+		let quantity_raw = item.l_quantity as i128 * 100;
+		let rational_left = 5_i128
+			.checked_mul(quantity_raw)
+			.and_then(|value| value.checked_mul(i128::from(count)))
+			.ok_or_else(|| "q17 rational boundary multiplication overflow".to_string())?;
+		let quantity_at_threshold_scale = quantity_raw
 			.checked_mul(100_000)
 			.ok_or_else(|| "q17 quantity rescale overflow".to_string())?;
-		if quantity_at_threshold_scale < threshold_raw {
-			extendedprice_sum += item.l_extendedprice.into_inner() as i128;
-			contributing_rows += 1;
+		let rational = rational_left.cmp(&quantity_sum);
+		let rounded = quantity_at_threshold_scale.cmp(&threshold_raw);
+		let receipt = receipt_by_part
+			.get_mut(&item.l_partkey)
+			.expect("q17 receipt exists for every boundary");
+		if receipt.record(rational, rounded) {
+			membership_difference_rows += 1;
+		}
+		if rounded == std::cmp::Ordering::Less {
+			selected_rows.push(Q17SelectedRow {
+				partkey: item.l_partkey,
+				orderkey: item.l_orderkey,
+				suppkey: item.l_suppkey,
+				quantity_raw,
+				extendedprice_raw: item.l_extendedprice.into_inner() as i128,
+			});
 		}
 	}
+	selected_rows.sort();
+
+	Ok(Q17BoundaryOracle {
+		common: Q17CensusCommon {
+			part_aggregates,
+			selected_rows,
+		},
+		receipt: Q17BoundaryReceipt {
+			parts: receipt_by_part.into_values().collect(),
+			membership_difference_rows,
+		},
+		eligible_parts: eligible_parts.len(),
+	})
+}
+
+pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
+	let boundary = strict_q17_boundary_oracle(scale_factor)?;
+	let extendedprice_sum = boundary
+		.common
+		.selected_rows
+		.iter()
+		.try_fold(0_i128, |sum, row| {
+			sum.checked_add(row.extendedprice_raw)
+				.ok_or_else(|| "q17 extendedprice sum overflow".to_string())
+		})?;
+	let contributing_rows = boundary.common.selected_rows.len();
 
 	let avg_yearly = if contributing_rows == 0 {
 		DecimalRaw {
@@ -8629,8 +8901,311 @@ pub fn strict_q17_oracle(scale_factor: f64) -> Result<Q17Oracle, String> {
 	};
 	Ok(Q17Oracle {
 		avg_yearly,
-		eligible_parts: eligible_parts.len(),
+		eligible_parts: boundary.eligible_parts,
 		contributing_rows,
+	})
+}
+
+fn q17_assert_census_schema(
+	batches: &[RecordBatch],
+	expected: &[(&str, DataType)],
+	label: &str,
+) -> Result<(), String> {
+	let Some(first) = batches.first() else {
+		return Err(format!("q17 census {label} produced no output batch"));
+	};
+	for batch in batches {
+		let schema = batch.schema();
+		if schema.fields().len() != expected.len() {
+			return Err(format!(
+				"q17 census {label}: expected {} columns, got {}",
+				expected.len(),
+				schema.fields().len()
+			));
+		}
+		for (index, (name, data_type)) in expected.iter().enumerate() {
+			let field = schema.field(index);
+			if field.name() != name || field.data_type() != data_type {
+				return Err(format!(
+					"q17 census {label} column {index}: expected {name} {data_type:?}, got {} {:?}",
+					field.name(),
+					field.data_type()
+				));
+			}
+		}
+	}
+	let _ = first;
+	Ok(())
+}
+
+fn q17_census_common_from_batches(
+	aggregate_batches: &[RecordBatch],
+	selected_batches: &[RecordBatch],
+) -> Result<Q17CensusCommon, String> {
+	q17_assert_census_schema(
+		aggregate_batches,
+		&[
+			("p_partkey", DataType::Int64),
+			("quantity_sum", DataType::Decimal128(15, 2)),
+			("quantity_count", DataType::Int64),
+			("quantity_avg", DataType::Decimal128(19, 6)),
+		],
+		"aggregate",
+	)?;
+	q17_assert_census_schema(
+		selected_batches,
+		&[
+			("p_partkey", DataType::Int64),
+			("l_orderkey", DataType::Int64),
+			("l_suppkey", DataType::Int64),
+			("l_quantity", DataType::Decimal128(15, 2)),
+			("l_extendedprice", DataType::Decimal128(15, 2)),
+		],
+		"selected rows",
+	)?;
+
+	let mut part_aggregates = Vec::new();
+	for batch in aggregate_batches {
+		let partkey = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("q17 census aggregate column p_partkey is not Int64")?;
+		let quantity_sum = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("q17 census aggregate column quantity_sum is not Decimal128")?;
+		let quantity_count = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("q17 census aggregate column quantity_count is not Int64")?;
+		let quantity_avg = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("q17 census aggregate column quantity_avg is not Decimal128")?;
+		for row in 0..batch.num_rows() {
+			if partkey.is_null(row)
+				|| quantity_sum.is_null(row)
+				|| quantity_count.is_null(row)
+				|| quantity_avg.is_null(row)
+			{
+				return Err(format!("q17 census aggregate row {row} contains NULL"));
+			}
+			part_aggregates.push(Q17PartAggregate {
+				partkey: partkey.value(row),
+				quantity_sum_raw: quantity_sum.value(row),
+				quantity_count: quantity_count.value(row),
+				quantity_avg_raw: quantity_avg.value(row),
+			});
+		}
+	}
+	part_aggregates.sort();
+
+	let mut selected_rows = Vec::new();
+	for batch in selected_batches {
+		let partkey = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("q17 census selected column p_partkey is not Int64")?;
+		let orderkey = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("q17 census selected column l_orderkey is not Int64")?;
+		let suppkey = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.ok_or("q17 census selected column l_suppkey is not Int64")?;
+		let quantity = batch
+			.column(3)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("q17 census selected column l_quantity is not Decimal128")?;
+		let extendedprice = batch
+			.column(4)
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.ok_or("q17 census selected column l_extendedprice is not Decimal128")?;
+		for row in 0..batch.num_rows() {
+			if partkey.is_null(row)
+				|| orderkey.is_null(row)
+				|| suppkey.is_null(row)
+				|| quantity.is_null(row)
+				|| extendedprice.is_null(row)
+			{
+				return Err(format!("q17 census selected row {row} contains NULL"));
+			}
+			selected_rows.push(Q17SelectedRow {
+				partkey: partkey.value(row),
+				orderkey: orderkey.value(row),
+				suppkey: suppkey.value(row),
+				quantity_raw: quantity.value(row),
+				extendedprice_raw: extendedprice.value(row),
+			});
+		}
+	}
+	selected_rows.sort();
+
+	Ok(Q17CensusCommon {
+		part_aggregates,
+		selected_rows,
+	})
+}
+
+fn q17_first_difference<T: std::fmt::Debug + PartialEq>(
+	label: &str,
+	actual: &[T],
+	expected: &[T],
+) -> Option<String> {
+	let different = actual
+		.iter()
+		.zip(expected)
+		.position(|(actual, expected)| actual != expected);
+	if let Some(index) = different {
+		return Some(format!(
+			"q17 census {label} mismatch at {index}: Toron={:?}, oracle={:?}",
+			actual[index], expected[index]
+		));
+	}
+	if actual.len() != expected.len() {
+		let index = actual.len().min(expected.len());
+		return Some(format!(
+			"q17 census {label} length mismatch: Toron={} oracle={} first_extra_Toron={:?} first_extra_oracle={:?}",
+			actual.len(),
+			expected.len(),
+			actual.get(index),
+			expected.get(index)
+		));
+	}
+	None
+}
+
+pub fn compare_q17_census_common(
+	actual: &Q17CensusCommon,
+	expected: &Q17CensusCommon,
+) -> Result<(), String> {
+	if let Some(error) = q17_first_difference(
+		"part aggregates",
+		&actual.part_aggregates,
+		&expected.part_aggregates,
+	) {
+		return Err(error);
+	}
+	if let Some(error) = q17_first_difference(
+		"selected rows",
+		&actual.selected_rows,
+		&expected.selected_rows,
+	) {
+		return Err(error);
+	}
+	Ok(())
+}
+
+fn q17_fingerprint_part_aggregates(rows: &[Q17PartAggregate]) -> String {
+	let mut hash = fnv1a_update(FNV_OFFSET, &(rows.len() as u64).to_le_bytes());
+	for row in rows {
+		hash = fnv1a_update(hash, &row.partkey.to_le_bytes());
+		hash = fnv1a_update(hash, &row.quantity_sum_raw.to_le_bytes());
+		hash = fnv1a_update(hash, &row.quantity_count.to_le_bytes());
+		hash = fnv1a_update(hash, &row.quantity_avg_raw.to_le_bytes());
+	}
+	format!("fnv1a64:{hash:016x}")
+}
+
+fn q17_fingerprint_selected_rows(rows: &[Q17SelectedRow]) -> String {
+	let mut hash = fnv1a_update(FNV_OFFSET, &(rows.len() as u64).to_le_bytes());
+	for row in rows {
+		hash = fnv1a_update(hash, &row.partkey.to_le_bytes());
+		hash = fnv1a_update(hash, &row.orderkey.to_le_bytes());
+		hash = fnv1a_update(hash, &row.suppkey.to_le_bytes());
+		hash = fnv1a_update(hash, &row.quantity_raw.to_le_bytes());
+		hash = fnv1a_update(hash, &row.extendedprice_raw.to_le_bytes());
+	}
+	format!("fnv1a64:{hash:016x}")
+}
+
+pub fn q17_census_fingerprints(common: &Q17CensusCommon) -> Q17CensusFingerprints {
+	Q17CensusFingerprints {
+		part_aggregates: q17_fingerprint_part_aggregates(&common.part_aggregates),
+		selected_rows: q17_fingerprint_selected_rows(&common.selected_rows),
+	}
+}
+
+pub async fn run_q17_boundary_census_with_data_source(
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<Q17BoundaryCensus, String> {
+	const PARTKEYS_PER_QUERY: usize = 256;
+	let eligible_partkeys = q17_eligible_partkeys(scale_factor);
+	let (tables, storage): (Vec<HarnessTableMetadata>, Arc<dyn StorageScan>) = match data_source {
+		"memory" => metadata_storage_from_tables(q17_tables(true, scale_factor)),
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec("q17", "strict", scale_factor, data_root)?;
+			(spec.tables, spec.storage)
+		}
+		other => {
+			return Err(format!(
+				"q17 census --data-source {other:?} is not supported"
+			));
+		}
+	};
+
+	let mut aggregate_batches = Vec::new();
+	let mut selected_batches = Vec::new();
+	for (chunk_index, partkeys) in eligible_partkeys.chunks(PARTKEYS_PER_QUERY).enumerate() {
+		let aggregate_sql = strict_q17_census_agg_sql(partkeys)?;
+		let selected_sql = strict_q17_census_rows_sql(partkeys)?;
+		aggregate_batches.extend(
+			execute_query_with_metadata_timed(&aggregate_sql, tables.clone(), storage.clone())
+				.await
+				.map_err(|error| {
+					format!(
+						"q17 census aggregate chunk {chunk_index} failed at {:?}: {} ({})",
+						error.phase, error.reason, error.message
+					)
+				})?
+				.batches,
+		);
+		selected_batches.extend(
+			execute_query_with_metadata_timed(&selected_sql, tables.clone(), storage.clone())
+				.await
+				.map_err(|error| {
+					format!(
+						"q17 census selected-row chunk {chunk_index} failed at {:?}: {} ({})",
+						error.phase, error.reason, error.message
+					)
+				})?
+				.batches,
+		);
+	}
+	let toron = q17_census_common_from_batches(&aggregate_batches, &selected_batches)?;
+	let boundary_oracle = strict_q17_boundary_oracle(scale_factor)?;
+	let common_comparison_error = compare_q17_census_common(&toron, &boundary_oracle.common).err();
+	let outcome = if common_comparison_error.is_some() {
+		Q17BoundaryCensusOutcome::ImplementationOracleDivergence
+	} else if boundary_oracle.receipt.membership_difference_rows != 0 {
+		Q17BoundaryCensusOutcome::DecimalContractDecision
+	} else {
+		Q17BoundaryCensusOutcome::Clean
+	};
+	let toron_fingerprints = q17_census_fingerprints(&toron);
+	let oracle_fingerprints = q17_census_fingerprints(&boundary_oracle.common);
+
+	Ok(Q17BoundaryCensus {
+		toron,
+		oracle: boundary_oracle.common,
+		receipt: boundary_oracle.receipt,
+		eligible_parts: boundary_oracle.eligible_parts,
+		common_comparison_error,
+		toron_fingerprints,
+		oracle_fingerprints,
+		outcome,
 	})
 }
 
@@ -8714,9 +9289,8 @@ pub fn compare_strict_q17(batches: &[RecordBatch], oracle: &Q17Oracle) -> Result
 	Err("strict q17 produced no row".to_string())
 }
 
-pub async fn check_strict_q17() -> CorrectnessAttempt {
+pub async fn check_strict_q17(scale_factor: f64) -> CorrectnessAttempt {
 	let start = Instant::now();
-	let scale_factor = Q17_CORRECTNESS_SCALE;
 	let tables = q17_tables(true, scale_factor);
 	let outcome = |phase: Phase, status: Status, reason: Option<String>| CorrectnessAttempt {
 		query: "q17".to_string(),
@@ -13682,14 +14256,85 @@ mod adr365_persisted_correctness_surface {
 		let _ = std::fs::remove_dir_all(&root);
 	}
 
-	#[tokio::test]
-	async fn persisted_correctness_q17_policy_gap_is_named() {
-		let root = temp_root("q17_policy");
-		let error = check_strict_query_with_data_source("q17", 10.0, "parquet", &root)
-			.await
-			.expect_err("q17 sf=10 remains a named oracle-policy gap");
-		assert!(error.contains("q17_sf10_oracle_policy_gap"));
-		let _ = std::fs::remove_dir_all(&root);
+	#[test]
+	fn q17_correctness_scale_policy_is_pure() {
+		assert_eq!(q17_correctness_scale(None).unwrap(), 0.02);
+		assert_eq!(q17_correctness_scale(Some(0.02)).unwrap(), 0.02);
+		assert_eq!(q17_correctness_scale(Some(10.0)).unwrap(), 10.0);
+		assert!(q17_correctness_scale(Some(0.01)).is_err());
+		assert!(q17_correctness_scale(Some(1.0)).is_err());
+	}
+}
+
+#[cfg(test)]
+mod adr431_q17_boundary_census {
+	use super::*;
+
+	fn common_fixture() -> Q17CensusCommon {
+		Q17CensusCommon {
+			part_aggregates: vec![Q17PartAggregate {
+				partkey: 7,
+				quantity_sum_raw: 50_001,
+				quantity_count: 20_001,
+				quantity_avg_raw: 25_003,
+			}],
+			selected_rows: vec![Q17SelectedRow {
+				partkey: 7,
+				orderkey: 11,
+				suppkey: 13,
+				quantity_raw: 100,
+				extendedprice_raw: 17_00,
+			}],
+		}
+	}
+
+	#[test]
+	fn exact_common_comparison_is_the_gate_not_the_fingerprint() {
+		let expected = common_fixture();
+		assert_eq!(compare_q17_census_common(&expected, &expected), Ok(()));
+
+		let mut changed_aggregate = expected.clone();
+		changed_aggregate.part_aggregates[0].quantity_sum_raw += 1;
+		assert!(compare_q17_census_common(&changed_aggregate, &expected).is_err());
+
+		let mut changed_row = expected.clone();
+		changed_row.selected_rows[0].extendedprice_raw += 1;
+		assert!(compare_q17_census_common(&changed_row, &expected).is_err());
+		assert_ne!(
+			q17_census_fingerprints(&changed_row).selected_rows,
+			q17_census_fingerprints(&expected).selected_rows
+		);
+	}
+
+	#[test]
+	fn synthetic_rational_vs_rounded_membership_difference_is_counted() {
+		let quantity_raw = 100_i128;
+		let count = 20_001_i64;
+		let quantity_sum = 5 * quantity_raw * i128::from(count) + 1;
+		let avg_raw = avg_decimal_raw(quantity_sum, count, 2, 6, 19).unwrap();
+		let rational = (5 * quantity_raw * i128::from(count)).cmp(&quantity_sum);
+		let rounded = (quantity_raw * 100_000).cmp(&(2 * avg_raw));
+
+		let mut receipt = Q17PartBoundaryReceipt {
+			partkey: 7,
+			rational: Q17BoundaryCounts::default(),
+			rounded: Q17BoundaryCounts::default(),
+			membership_difference_rows: 0,
+		};
+		assert!(receipt.record(rational, rounded));
+		assert_eq!(receipt.rational.below, 1);
+		assert_eq!(receipt.rounded.equal, 1);
+		assert_eq!(receipt.membership_difference_rows, 1);
+	}
+
+	#[test]
+	fn eligible_part_filter_chunks_at_the_frontend_in_list_limit() {
+		let partkeys: Vec<i64> = (1..=65).collect();
+		let aggregate_sql = strict_q17_census_agg_sql(&partkeys).unwrap();
+		assert_eq!(aggregate_sql.matches(" IN (").count(), 3);
+		SqlPlanner::new()
+			.plan(&aggregate_sql)
+			.expect("chunked q17 census predicate stays inside the frontend limit");
 	}
 }
 

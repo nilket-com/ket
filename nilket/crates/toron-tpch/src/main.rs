@@ -13,13 +13,14 @@ use toron_tpch::telemetry::{
 	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status,
 };
 use toron_tpch::{
-	ALL_QUERY_IDS, CACHE_ROOT, Q17_CORRECTNESS_SCALE, check_strict_query_with_data_source,
+	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
 	generate_dev_lineitem, matrix, normalize_duckdb_type, parse_scale_factor,
-	prepare_persisted_tpch_dataset, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
-	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
-	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
-	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source,
+	prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
 	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
@@ -83,6 +84,7 @@ async fn main() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
 		// ADR 273: the correctness rail — answer-check a query against an independent oracle.
@@ -94,6 +96,54 @@ async fn main() -> ExitCode {
 			ExitCode::SUCCESS
 		}
 		_ => usage(),
+	}
+}
+
+async fn q17_census_command(args: &[String]) -> ExitCode {
+	let scale_factor = match resolved_sf(args) {
+		Ok(scale_factor) => scale_factor,
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	if mode != "strict" {
+		return harness_error("q17-census supports only --mode strict");
+	}
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_root = data_dir_from_args(args);
+	let census =
+		match run_q17_boundary_census_with_data_source(scale_factor, data_source, &data_root).await
+		{
+			Ok(census) => census,
+			Err(message) => return harness_error(&message),
+		};
+	let (rational, rounded) = census.receipt.totals();
+	println!(
+		"q17_boundary_census sf={scale_factor} outcome={} common_exact={} eligible_parts={} aggregate_parts={} selected_rows={} membership_difference_rows={}",
+		census.outcome.as_str(),
+		census.common_comparison_error.is_none(),
+		census.eligible_parts,
+		census.toron.part_aggregates.len(),
+		census.toron.selected_rows.len(),
+		census.receipt.membership_difference_rows,
+	);
+	println!(
+		"q17_boundary_totals rational_below={} rational_equal={} rational_above={} rounded_below={} rounded_equal={} rounded_above={}",
+		rational.below, rational.equal, rational.above, rounded.below, rounded.equal, rounded.above,
+	);
+	println!(
+		"q17_boundary_fingerprints toron_aggregates={} oracle_aggregates={} toron_selected={} oracle_selected={}",
+		census.toron_fingerprints.part_aggregates,
+		census.oracle_fingerprints.part_aggregates,
+		census.toron_fingerprints.selected_rows,
+		census.oracle_fingerprints.selected_rows,
+	);
+	if let Some(error) = census.common_comparison_error {
+		eprintln!("q17_boundary_difference {error}");
+	}
+	if census.outcome == Q17BoundaryCensusOutcome::Clean {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
 	}
 }
 
@@ -512,13 +562,7 @@ async fn correctness_command(args: &[String]) -> ExitCode {
 }
 
 fn q17_correctness_sf(explicit: Option<f64>) -> Result<f64, String> {
-	match explicit {
-		None => Ok(Q17_CORRECTNESS_SCALE),
-		Some(sf) if (sf - Q17_CORRECTNESS_SCALE).abs() <= f64::EPSILON => Ok(sf),
-		Some(sf) => Err(format!(
-			"q17_sf10_oracle_policy_gap: q17 correctness requires --sf {Q17_CORRECTNESS_SCALE}; got {sf}"
-		)),
-	}
+	q17_correctness_scale(explicit)
 }
 
 fn emit_correctness(attempt: &CorrectnessAttempt) {
@@ -2674,7 +2718,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -2682,6 +2726,7 @@ fn usage() -> ExitCode {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use toron_tpch::Q17_CORRECTNESS_SCALE;
 
 	#[test]
 	fn q17_correctness_scale_policy_rejects_masked_empty_scale() {
@@ -2690,7 +2735,9 @@ mod tests {
 			q17_correctness_sf(Some(Q17_CORRECTNESS_SCALE)).unwrap(),
 			Q17_CORRECTNESS_SCALE
 		);
+		assert_eq!(q17_correctness_sf(Some(10.0)).unwrap(), 10.0);
 		assert!(q17_correctness_sf(Some(0.01)).is_err());
+		assert!(q17_correctness_sf(Some(1.0)).is_err());
 	}
 
 	#[test]

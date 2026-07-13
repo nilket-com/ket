@@ -3263,7 +3263,7 @@ fn strict_q17_matches_independent_oracle() {
 				.enable_all()
 				.build()
 				.expect("runtime")
-				.block_on(check_strict_q17())
+				.block_on(check_strict_q17(Q17_CORRECTNESS_SCALE))
 		})
 		.expect("spawn q17 correctness thread")
 		.join()
