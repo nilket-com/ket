@@ -2980,7 +2980,9 @@ async fn materialize_projected_streamed_spilled_left_outer_matches(
 		columns.push(take(column, &probe_indices, None)?);
 	}
 
-	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+	let output = RecordBatch::try_new(output_schema.clone(), columns)?;
+	spilled.record_materialized_batch(matches.len(), page_sources.len());
+	Ok(output)
 }
 
 async fn materialize_projected_streamed_spilled_left_outer_unmatched(
@@ -3079,7 +3081,9 @@ async fn materialize_projected_streamed_spilled_left_outer_unmatched(
 		columns.push(arrow::array::new_null_array(field.data_type(), refs.len()));
 	}
 
-	Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+	let output = RecordBatch::try_new(output_schema.clone(), columns)?;
+	spilled.record_materialized_batch(refs.len(), page_sources.len());
+	Ok(output)
 }
 
 fn predicate_references_only_probe_prefix(
@@ -7151,6 +7155,9 @@ impl Executor {
 					)
 					.await?;
 					spilled.finish(self.context.task_budget).await?;
+					let profile_build_micros = spilled
+						.throughput_profile_enabled()
+						.then(|| duration_micros(build_started));
 					let build_rows = spilled.input_row_count();
 					record_task_telemetry(&self.context.task_telemetry, |task| {
 						task.counters.build_rows =
@@ -7220,6 +7227,14 @@ impl Executor {
 							&RecordBatch::new_empty(join_output_schema.clone()),
 						)?;
 					}
+					let profile_probe_micros = spilled
+						.throughput_profile_enabled()
+						.then(|| duration_micros(probe_started));
+					if let (Some(build_micros), Some(probe_micros)) =
+						(profile_build_micros, profile_probe_micros)
+					{
+						spilled.record_throughput_phase_micros(build_micros, probe_micros);
+					}
 					record_task_telemetry(&self.context.task_telemetry, |task| {
 						task.phases.probe_micros = task
 							.phases
@@ -7247,7 +7262,9 @@ impl Executor {
 						aggr_expr,
 						output_schema,
 					);
+					let profile_result = spilled.persist_throughput_profile();
 					spilled.cleanup().await;
+					profile_result?;
 					return output.map(Some);
 				}
 			}
@@ -7506,6 +7523,7 @@ impl Executor {
 					});
 				}
 			}
+			spilled.record_probe_chunk(probe_chunk.num_rows(), &matches);
 			output_rows = output_rows.saturating_add(matches.len() as u64);
 			self.fold_projected_spilled_left_outer_join_selection_chunks(
 				spilled,
@@ -7566,6 +7584,8 @@ impl Executor {
 						self.context.task_budget.memory.get(),
 					)
 					.await?;
+					let fold_rows = batch.num_rows();
+					let fold_started = spilled.throughput_profile_enabled().then(Instant::now);
 					self.fold_left_outer_grouped_batch(
 						batch,
 						exchange,
@@ -7575,6 +7595,9 @@ impl Executor {
 						group_types,
 						folded_input,
 					)?;
+					if let Some(fold_started) = fold_started {
+						spilled.record_grouped_fold(fold_rows, fold_started.elapsed());
+					}
 					unmatched.clear();
 				}
 			}
@@ -7591,6 +7614,8 @@ impl Executor {
 				self.context.task_budget.memory.get(),
 			)
 			.await?;
+			let fold_rows = batch.num_rows();
+			let fold_started = spilled.throughput_profile_enabled().then(Instant::now);
 			self.fold_left_outer_grouped_batch(
 				batch,
 				exchange,
@@ -7600,6 +7625,9 @@ impl Executor {
 				group_types,
 				folded_input,
 			)?;
+			if let Some(fold_started) = fold_started {
+				spilled.record_grouped_fold(fold_rows, fold_started.elapsed());
+			}
 		}
 		Ok(output_rows)
 	}
@@ -7631,6 +7659,8 @@ impl Executor {
 				self.context.task_budget.memory.get(),
 			)
 			.await?;
+			let fold_rows = batch.num_rows();
+			let fold_started = spilled.throughput_profile_enabled().then(Instant::now);
 			self.fold_left_outer_grouped_batch(
 				batch,
 				exchange,
@@ -7640,6 +7670,9 @@ impl Executor {
 				group_types,
 				folded_input,
 			)?;
+			if let Some(fold_started) = fold_started {
+				spilled.record_grouped_fold(fold_rows, fold_started.elapsed());
+			}
 		}
 		Ok(())
 	}

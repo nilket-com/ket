@@ -7,6 +7,7 @@ mod residency_profile;
 mod spill;
 mod spill_placement;
 mod streaming;
+mod throughput_profile;
 
 pub(in crate::exec) use self::build_profile::{
 	record_existence_summary_profile, record_join_build_profile,
@@ -28,6 +29,9 @@ pub(in crate::exec) use self::spill_placement::default_join_spill_dir;
 pub(in crate::exec) use self::streaming::{
 	StreamingSemiAntiExistence, StreamingSemiAntiRuntime, StreamingSemiAntiStage,
 	extract_streaming_inner_prefix_semi_anti_chain,
+};
+pub(in crate::exec) use self::throughput_profile::{
+	SpillCacheEvictions, StreamedSpilledLeftOuterProfile,
 };
 
 /// ADR 335: the raw 64 MiB task cap false-trips accepted sf=1 controls; the output guard

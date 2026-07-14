@@ -156,20 +156,35 @@ impl CachedJoinSpillPage {
 	}
 }
 
+fn cache_evictions_for_page(page: &CachedJoinSpillPage) -> SpillCacheEvictions {
+	SpillCacheEvictions {
+		plaintext_entries: u64::from(!page.bytes.is_empty()),
+		plaintext_bytes: u64::try_from(page.bytes.len()).unwrap_or(u64::MAX),
+		decoded_entries: u64::from(page.decoded_batch.is_some()),
+		decoded_bytes: page.decoded_bytes,
+	}
+}
+
 fn evict_join_spill_cache(
 	cache: &mut HashMap<usize, CachedJoinSpillPage>,
 	lru: &mut VecDeque<usize>,
 	cache_bytes: &mut u64,
 	cache_cap: u64,
-) {
+	collect_stats: bool,
+) -> SpillCacheEvictions {
+	let mut evictions = SpillCacheEvictions::default();
 	while cache_bytes.saturating_sub(cache_cap) > 0 {
 		let Some(evicted) = lru.pop_front() else {
 			break;
 		};
 		if let Some(page) = cache.remove(&evicted) {
 			*cache_bytes = cache_bytes.saturating_sub(page.total_bytes());
+			if collect_stats {
+				evictions.add(cache_evictions_for_page(&page));
+			}
 		}
 	}
+	evictions
 }
 
 const JOIN_SPILL_INT32_KEY_TAG: u8 = 4;
@@ -744,6 +759,7 @@ impl SpilledJoinBuild {
 			&self.file,
 			page.offset,
 			page.ciphertext_len,
+			None,
 		)
 		.await?;
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
@@ -787,6 +803,7 @@ impl SpilledJoinBuild {
 			&mut self.lru,
 			&mut self.cache_bytes,
 			self.cache_cap,
+			false,
 		);
 	}
 }
@@ -1187,6 +1204,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	scratch_plaintext: Vec<u8>,
 	scratch_refs: Vec<(JoinKey, u32)>,
 	resident_baseline_bytes: u64,
+	throughput_profile: Option<Box<StreamedSpilledLeftOuterProfile>>,
 }
 
 /// Query-neutral ownership census for the grouped-reservoir residency profile (ADR 429).
@@ -1301,6 +1319,7 @@ impl SpilledInnerJoinBuild {
 				message: format!("inner join batch spill open failed: {error}"),
 			})?;
 		let cache_cap = JOIN_SPILL_CACHE_TARGET_BYTES.min(task_budget.memory.get());
+		let throughput_profile = StreamedSpilledLeftOuterProfile::from_env()?.map(Box::new);
 		Ok(Self {
 			spill_id,
 			path,
@@ -1334,6 +1353,7 @@ impl SpilledInnerJoinBuild {
 			scratch_plaintext: Vec::new(),
 			scratch_refs: Vec::new(),
 			resident_baseline_bytes,
+			throughput_profile,
 		})
 	}
 
@@ -1950,15 +1970,82 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		join_key: &JoinKey,
 	) -> Result<Vec<SpilledBatchRowRef>, ExecutionError> {
-		if let Some(index) = &self.compact_index {
-			Ok(index.lookup(join_key))
+		let matches = if let Some(index) = &self.compact_index {
+			index.lookup(join_key)
 		} else {
-			Ok(self.index.get(join_key).cloned().unwrap_or_default())
+			self.index.get(join_key).cloned().unwrap_or_default()
+		};
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_lookup(matches.len());
 		}
+		Ok(matches)
 	}
 
 	pub(in crate::exec) fn page_count(&self) -> usize {
 		self.pages.len()
+	}
+
+	pub(in crate::exec) fn record_probe_chunk(
+		&mut self,
+		probe_rows: usize,
+		matches: &[SpilledInnerJoinMatch],
+	) {
+		let Some(profile) = &mut self.throughput_profile else {
+			return;
+		};
+		let unique_pages = matches
+			.iter()
+			.map(|matched| matched.build.page_index)
+			.collect::<BTreeSet<_>>()
+			.len();
+		profile.record_probe_chunk(probe_rows, unique_pages);
+	}
+
+	pub(in crate::exec) fn record_materialized_batch(
+		&mut self,
+		rows: usize,
+		unique_page_requests: usize,
+	) {
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_materialized_batch(rows, unique_page_requests);
+		}
+	}
+
+	pub(in crate::exec) fn throughput_profile_enabled(&self) -> bool {
+		self.throughput_profile.is_some()
+	}
+
+	pub(in crate::exec) fn record_grouped_fold(
+		&mut self,
+		rows: usize,
+		elapsed: std::time::Duration,
+	) {
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_grouped_fold(rows, elapsed);
+		}
+	}
+
+	pub(in crate::exec) fn record_throughput_phase_micros(
+		&mut self,
+		build_micros: u64,
+		probe_micros: u64,
+	) {
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_phase_micros(build_micros, probe_micros);
+		}
+	}
+
+	pub(in crate::exec) fn persist_throughput_profile(&self) -> Result<(), ExecutionError> {
+		let Some(profile) = &self.throughput_profile else {
+			return Ok(());
+		};
+		profile.persist(
+			self.spill_id,
+			self.spill_bytes,
+			self.pages.len(),
+			self.input_rows,
+			self.cache_cap,
+		)
 	}
 
 	pub(in crate::exec) fn page_row_count(
@@ -2020,11 +2107,27 @@ impl SpilledInnerJoinBuild {
 			.get(&page_index)
 			.and_then(|cached| cached.decoded_batch.clone())
 		{
+			if let Some(profile) = &mut self.throughput_profile {
+				profile.record_decoded_hit();
+			}
 			self.touch_cache_entry(page_index);
 			return Ok(batch);
 		}
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_decoded_miss();
+		}
 		let bytes = self.read_page(page_index).await?;
+		let decode_started = self.throughput_profile.as_ref().map(|_| Instant::now());
 		let batch = decode_record_batch_ipc(&bytes)?;
+		if let (Some(profile), Some(decode_started)) =
+			(&mut self.throughput_profile, decode_started)
+		{
+			profile.record_page_decode(
+				page_index,
+				record_batch_memory_bytes(&batch),
+				decode_started.elapsed(),
+			);
+		}
 		#[cfg(test)]
 		{
 			self.page_decode_count = self.page_decode_count.saturating_add(1);
@@ -2042,9 +2145,15 @@ impl SpilledInnerJoinBuild {
 			.get(&page_index)
 			.filter(|cached| !cached.bytes.is_empty())
 		{
+			if let Some(profile) = &mut self.throughput_profile {
+				profile.record_plaintext_hit();
+			}
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
 			return Ok(bytes);
+		}
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_plaintext_miss();
 		}
 
 		let page = self
@@ -2059,6 +2168,7 @@ impl SpilledInnerJoinBuild {
 			&self.file,
 			page.offset,
 			page.ciphertext_len,
+			self.throughput_profile.as_deref_mut(),
 		)
 		.await?;
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
@@ -2092,17 +2202,27 @@ impl SpilledInnerJoinBuild {
 		}
 		if let Some(page) = self.cache.remove(&page_index) {
 			self.cache_bytes = self.cache_bytes.saturating_sub(page.total_bytes());
+			if let Some(profile) = &mut self.throughput_profile {
+				profile.record_cache_evictions(cache_evictions_for_page(&page));
+			}
 		}
 		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_plaintext_insert(bytes_len);
+		}
 		self.cache
 			.insert(page_index, CachedJoinSpillPage::new(bytes));
 		self.touch_cache_entry(page_index);
-		evict_join_spill_cache(
+		let evictions = evict_join_spill_cache(
 			&mut self.cache,
 			&mut self.lru,
 			&mut self.cache_bytes,
 			self.cache_cap,
+			self.throughput_profile.is_some(),
 		);
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_cache_evictions(evictions);
+		}
 	}
 
 	pub(in crate::exec) fn insert_decoded_cache_entry(
@@ -2121,6 +2241,10 @@ impl SpilledInnerJoinBuild {
 			return;
 		};
 		let old_total = cached.total_bytes();
+		let removed_plaintext_bytes = self
+			.throughput_profile
+			.as_ref()
+			.map(|_| u64::try_from(cached.bytes.len()).unwrap_or(u64::MAX));
 		cached.bytes.clear();
 		cached.decoded_batch = Some(batch);
 		cached.decoded_bytes = decoded_bytes;
@@ -2130,13 +2254,23 @@ impl SpilledInnerJoinBuild {
 		} else {
 			self.cache_bytes = self.cache_bytes.saturating_sub(old_total - new_total);
 		}
+		if let (Some(profile), Some(removed_plaintext_bytes)) =
+			(&mut self.throughput_profile, removed_plaintext_bytes)
+		{
+			profile.record_plaintext_promotion(removed_plaintext_bytes);
+			profile.record_decoded_insert(decoded_bytes);
+		}
 		self.touch_cache_entry(page_index);
-		evict_join_spill_cache(
+		let evictions = evict_join_spill_cache(
 			&mut self.cache,
 			&mut self.lru,
 			&mut self.cache_bytes,
 			self.cache_cap,
+			self.throughput_profile.is_some(),
 		);
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_cache_evictions(evictions);
+		}
 	}
 
 	#[cfg(test)]
@@ -2874,6 +3008,7 @@ impl SpilledSemiAntiExistenceBuild {
 			&self.file,
 			page.offset,
 			page.ciphertext_len,
+			None,
 		)
 		.await?;
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
@@ -2917,6 +3052,7 @@ impl SpilledSemiAntiExistenceBuild {
 			&mut self.lru,
 			&mut self.cache_bytes,
 			self.cache_cap,
+			false,
 		);
 	}
 }
@@ -3013,17 +3149,33 @@ async fn read_plain_exact(
 	file: &FileHandle,
 	offset: u64,
 	len: usize,
+	mut profile: Option<&mut StreamedSpilledLeftOuterProfile>,
 ) -> Result<Vec<u8>, ExecutionError> {
 	let mut out = Vec::with_capacity(len);
 	while out.len() < len {
-		let chunk = file_ops
-			.read_plain_at(
-				file,
-				offset.saturating_add(out.len() as u64),
-				len.saturating_sub(out.len()),
-			)
+		let read_offset = offset.saturating_add(out.len() as u64);
+		let requested = len.saturating_sub(out.len());
+		let chunk = if let Some(profile) = profile.as_deref_mut() {
+			let started = Instant::now();
+			let mut returned_pending = false;
+			let mut read = file_ops.read_plain_at(file, read_offset, requested);
+			let result = std::future::poll_fn(|context| match read.as_mut().poll(context) {
+				std::task::Poll::Pending => {
+					returned_pending = true;
+					std::task::Poll::Pending
+				}
+				std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+			})
 			.await
 			.map_err(|error| join_spill_io_error("read", error))?;
+			profile.record_file_read(requested, result.len(), started.elapsed(), returned_pending);
+			result
+		} else {
+			file_ops
+				.read_plain_at(file, read_offset, requested)
+				.await
+				.map_err(|error| join_spill_io_error("read", error))?
+		};
 		if chunk.is_empty() {
 			return Err(join_spill_io_error(
 				"read",
