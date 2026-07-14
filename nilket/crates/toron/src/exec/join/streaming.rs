@@ -6492,9 +6492,10 @@ impl Executor {
 			}
 			Ok(())
 		};
-		let _ = spilled
+		let _pin_admitted = spilled
 			.try_pin_decoded_pages(self.context.task_budget.memory.get())
-			.await?;
+			.await?
+			.is_admitted();
 		if let Some(projection) = projection {
 			visit_projected_streamed_spilled_inner_join_chunks(
 				spilled,
@@ -7181,6 +7182,10 @@ impl Executor {
 					let mut folded_input = false;
 					let mut matched_build_rows = spilled.empty_page_match_bitmap();
 					let probe_started = Instant::now();
+					let _pin_admitted = spilled
+						.try_pin_decoded_pages(self.context.task_budget.memory.get())
+						.await?
+						.is_admitted();
 					let (probe_rows, mut output_rows) = self
 						.visit_streaming_spilled_left_outer_scan_probe_chunks(
 							&mut spilled,

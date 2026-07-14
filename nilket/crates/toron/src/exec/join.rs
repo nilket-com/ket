@@ -31,7 +31,7 @@ pub(in crate::exec) use self::streaming::{
 	extract_streaming_inner_prefix_semi_anti_chain,
 };
 pub(in crate::exec) use self::throughput_profile::{
-	SpillCacheEvictions, StreamedSpilledLeftOuterProfile,
+	SpillCacheEvictions, StreamedSpilledLeftOuterProfile, ThroughputOperationPhase,
 };
 
 /// ADR 335: the raw 64 MiB task cap false-trips accepted sf=1 controls; the output guard
@@ -2508,7 +2508,10 @@ where
 {
 	let mut probe_rows = 0u64;
 	let mut output_rows = 0u64;
-	let _ = spilled.try_pin_decoded_pages(memory_cap).await?;
+	let _pin_admitted = spilled
+		.try_pin_decoded_pages(memory_cap)
+		.await?
+		.is_admitted();
 	for batch in right_batches {
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);

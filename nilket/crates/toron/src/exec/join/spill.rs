@@ -1171,6 +1171,20 @@ pub(in crate::exec) struct PinnedSpilledInnerBuildStats {
 	pub(in crate::exec) rows: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::exec) enum PinDecodedPagesOutcome {
+	Admitted,
+	RejectedPreflight,
+	RejectedMidDecode,
+}
+
+impl PinDecodedPagesOutcome {
+	pub(in crate::exec) const fn is_admitted(self) -> bool {
+		matches!(self, Self::Admitted)
+	}
+}
+
 pub(in crate::exec) struct SpilledInnerJoinBuild {
 	spill_id: u64,
 	path: PathBuf,
@@ -1188,7 +1202,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	cache_cap: u64,
 	pinned_decoded_pages: Option<Vec<RecordBatch>>,
 	pinned_decoded_bytes: u64,
-	pin_decoded_attempted: bool,
+	pin_decoded_outcome: Option<PinDecodedPagesOutcome>,
 	spill_bytes: u64,
 	writer_peak: u64,
 	rows: u64,
@@ -1337,7 +1351,7 @@ impl SpilledInnerJoinBuild {
 			cache_cap,
 			pinned_decoded_pages: None,
 			pinned_decoded_bytes: 0,
-			pin_decoded_attempted: false,
+			pin_decoded_outcome: None,
 			spill_bytes: 0,
 			writer_peak: 0,
 			rows: 0,
@@ -1795,7 +1809,7 @@ impl SpilledInnerJoinBuild {
 		self.cache_bytes = 0;
 		self.pinned_decoded_bytes = 0;
 		self.pinned_decoded_pages = Some(Vec::with_capacity(self.pages.len()));
-		self.pin_decoded_attempted = true;
+		self.pin_decoded_outcome = Some(PinDecodedPagesOutcome::Admitted);
 
 		let mut page_reads = 0u64;
 		for page_index in 0..self.pages.len() {
@@ -1863,29 +1877,59 @@ impl SpilledInnerJoinBuild {
 	pub(in crate::exec) async fn try_pin_decoded_pages(
 		&mut self,
 		memory_cap: u64,
-	) -> Result<bool, ExecutionError> {
+	) -> Result<PinDecodedPagesOutcome, ExecutionError> {
 		if self.pinned_decoded_pages.is_some() {
-			return Ok(true);
+			return Ok(PinDecodedPagesOutcome::Admitted);
 		}
-		if self.pin_decoded_attempted {
-			return Ok(false);
+		if let Some(outcome) = self.pin_decoded_outcome {
+			return Ok(outcome);
 		}
-		self.pin_decoded_attempted = true;
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.set_operation_phase(ThroughputOperationPhase::Preload);
+		}
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		let loaded_page_estimate = self.loaded_page_bytes_estimate();
 		let estimated_resident = self
 			.resident_baseline_bytes
 			.saturating_add(self.resident_index_bytes)
 			.saturating_add(self.writer_peak)
 			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
-			.saturating_add(self.loaded_page_bytes_estimate());
+			.saturating_add(loaded_page_estimate);
 		if estimated_resident > cap {
-			return Ok(false);
+			let outcome = PinDecodedPagesOutcome::RejectedPreflight;
+			self.record_pin_decoded_pages_outcome(
+				memory_cap,
+				cap,
+				loaded_page_estimate,
+				estimated_resident,
+				0,
+				0,
+				0,
+				outcome,
+			);
+			return Ok(outcome);
 		}
 
 		let mut pages = Vec::with_capacity(self.pages.len());
 		let mut decoded_bytes = 0u64;
+		let mut pages_attempted = 0u64;
+		let mut pages_completed = 0u64;
 		for page_index in 0..self.pages.len() {
+			pages_attempted =
+				pages_attempted
+					.checked_add(1)
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: "streamed inner join pin attempted-page count overflow"
+							.to_string(),
+					})?;
 			let batch = self.read_batch_page(page_index).await?;
+			pages_completed =
+				pages_completed
+					.checked_add(1)
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: "streamed inner join pin completed-page count overflow"
+							.to_string(),
+					})?;
 			decoded_bytes = decoded_bytes.saturating_add(record_batch_memory_bytes(&batch));
 			let resident = self
 				.resident_baseline_bytes
@@ -1894,7 +1938,18 @@ impl SpilledInnerJoinBuild {
 				.saturating_add(JOIN_SPILL_PAGE_SIZE as u64)
 				.saturating_add(decoded_bytes);
 			if resident > cap {
-				return Ok(false);
+				let outcome = PinDecodedPagesOutcome::RejectedMidDecode;
+				self.record_pin_decoded_pages_outcome(
+					memory_cap,
+					cap,
+					loaded_page_estimate,
+					estimated_resident,
+					decoded_bytes,
+					pages_attempted,
+					pages_completed,
+					outcome,
+				);
+				return Ok(outcome);
 			}
 			pages.push(batch);
 		}
@@ -1904,7 +1959,50 @@ impl SpilledInnerJoinBuild {
 		self.pinned_decoded_bytes = decoded_bytes;
 		self.pinned_decoded_pages = Some(pages);
 		self.guard_resident_state(memory_cap, SpillResidentGuardSite::PinDecodedPages)?;
-		Ok(true)
+		let outcome = PinDecodedPagesOutcome::Admitted;
+		self.record_pin_decoded_pages_outcome(
+			memory_cap,
+			cap,
+			loaded_page_estimate,
+			estimated_resident,
+			decoded_bytes,
+			pages_attempted,
+			pages_completed,
+			outcome,
+		);
+		Ok(outcome)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn record_pin_decoded_pages_outcome(
+		&mut self,
+		memory_cap: u64,
+		retained_cap: u64,
+		loaded_page_estimate: u64,
+		preflight_estimate: u64,
+		decoded_bytes: u64,
+		pages_attempted: u64,
+		pages_completed: u64,
+		outcome: PinDecodedPagesOutcome,
+	) {
+		self.pin_decoded_outcome = Some(outcome);
+		if let Some(profile) = &mut self.throughput_profile {
+			profile.record_pin_receipt(
+				memory_cap,
+				retained_cap,
+				self.resident_baseline_bytes,
+				self.resident_index_bytes,
+				self.writer_peak,
+				JOIN_SPILL_PAGE_SIZE as u64,
+				loaded_page_estimate,
+				preflight_estimate,
+				decoded_bytes,
+				pages_attempted,
+				pages_completed,
+				outcome,
+			);
+			profile.set_operation_phase(ThroughputOperationPhase::Probe);
+		}
 	}
 
 	pub(in crate::exec) fn release_write_scratch(&mut self) {
@@ -4502,6 +4600,181 @@ mod tests {
 			"pinned probe reads must not decode build pages again"
 		);
 		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn decoded_page_pin_admits_and_probe_reads_do_not_decode_again() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("decoded_pin_admitted");
+		let profile_path = spill_dir.with_extension("profile.json");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let values = (0..(CROSS_JOIN_OUTPUT_CHUNK_ROWS + 17))
+			.map(|value| value as i64)
+			.collect::<Vec<_>>();
+		build
+			.write_batch_chunks(
+				&batch_with_keys(&values),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write pages");
+		build.finish(budget).await.expect("finish spill");
+		build.release_write_scratch();
+		build.throughput_profile = Some(Box::new(StreamedSpilledLeftOuterProfile::at_test_path(
+			profile_path.clone(),
+		)));
+		build.clear_read_cache();
+
+		let outcome = build
+			.try_pin_decoded_pages(budget.memory.get())
+			.await
+			.expect("pin decoded pages");
+		assert_eq!(outcome, PinDecodedPagesOutcome::Admitted);
+		assert!(build.pinned_decoded_pages.is_some());
+		assert_eq!(build.page_decode_count(), build.page_count() as u64);
+		for page_index in 0..build.page_count() {
+			let _ = build
+				.read_batch_page(page_index)
+				.await
+				.expect("read pinned page");
+		}
+		assert_eq!(build.page_decode_count(), build.page_count() as u64);
+		build
+			.persist_throughput_profile()
+			.expect("persist admitted pin receipt");
+		let receipt: serde_json::Value = serde_json::from_slice(
+			&std::fs::read(&profile_path).expect("read admitted pin receipt"),
+		)
+		.expect("decode admitted pin receipt");
+		assert_eq!(receipt["pin"]["outcome"], "admitted");
+		assert_eq!(
+			receipt["operation_phases"]["preload"]["file_read_calls"],
+			build.page_count() as u64
+		);
+		assert_eq!(receipt["operation_phases"]["probe"]["file_read_calls"], 0);
+		assert_eq!(receipt["operation_phases"]["probe"]["decoded_evictions"], 0);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_file(profile_path);
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn decoded_page_pin_preflight_reject_falls_back_value_identical() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("decoded_pin_preflight_reject");
+		let profile_path = spill_dir.with_extension("profile.json");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let expected = batch_with_keys(&[1, 2, 3, 4]);
+		build
+			.write_batch_chunks(
+				&expected,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write page");
+		build.finish(budget).await.expect("finish spill");
+		build.throughput_profile = Some(Box::new(StreamedSpilledLeftOuterProfile::at_test_path(
+			profile_path.clone(),
+		)));
+
+		let outcome = build
+			.try_pin_decoded_pages(1)
+			.await
+			.expect("preflight rejection is a fallback");
+		assert_eq!(outcome, PinDecodedPagesOutcome::RejectedPreflight);
+		assert!(build.pinned_decoded_pages.is_none());
+		let fallback = build
+			.read_batch_page(0)
+			.await
+			.expect("cached fallback read");
+		assert_record_batch_equal(&fallback, &expected);
+		build
+			.persist_throughput_profile()
+			.expect("persist preflight rejection receipt");
+		let receipt: serde_json::Value = serde_json::from_slice(
+			&std::fs::read(&profile_path).expect("read preflight rejection receipt"),
+		)
+		.expect("decode preflight rejection receipt");
+		assert_eq!(receipt["pin"]["outcome"], "rejected_preflight");
+		assert_eq!(receipt["pin"]["pages_attempted"], 0);
+		assert_eq!(receipt["pin"]["pages_completed"], 0);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_file(profile_path);
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn decoded_page_pin_mid_decode_reject_falls_back_value_identical() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("decoded_pin_mid_decode_reject");
+		let profile_path = spill_dir.with_extension("profile.json");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let expected = batch_with_keys(&[1, 2, 3, 4]);
+		build
+			.write_batch_chunks(
+				&expected,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write page");
+		build.finish(budget).await.expect("finish spill");
+		build.release_write_scratch();
+		for page in &mut build.pages {
+			page.plaintext_len = 0;
+		}
+		build.resident_index_bytes = 0;
+		build.throughput_profile = Some(Box::new(StreamedSpilledLeftOuterProfile::at_test_path(
+			profile_path.clone(),
+		)));
+		let memory_cap = (JOIN_SPILL_PAGE_SIZE as u64
+			+ JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER)
+			/ JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
+
+		let outcome = build
+			.try_pin_decoded_pages(memory_cap)
+			.await
+			.expect("mid-decode rejection is a fallback");
+		assert_eq!(outcome, PinDecodedPagesOutcome::RejectedMidDecode);
+		assert!(build.pinned_decoded_pages.is_none());
+		let fallback = build
+			.read_batch_page(0)
+			.await
+			.expect("cached fallback read");
+		assert_record_batch_equal(&fallback, &expected);
+		build
+			.persist_throughput_profile()
+			.expect("persist mid-decode rejection receipt");
+		let receipt: serde_json::Value = serde_json::from_slice(
+			&std::fs::read(&profile_path).expect("read mid-decode rejection receipt"),
+		)
+		.expect("decode mid-decode rejection receipt");
+		assert_eq!(receipt["pin"]["outcome"], "rejected_mid_decode");
+		assert_eq!(receipt["pin"]["pages_attempted"], 1);
+		assert_eq!(receipt["pin"]["pages_completed"], 1);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_file(profile_path);
 		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 

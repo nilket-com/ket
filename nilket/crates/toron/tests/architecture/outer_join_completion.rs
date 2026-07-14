@@ -36,6 +36,35 @@ fn outer_join_route_source(demotion: &str) -> String {
 }
 
 #[test]
+pub(crate) fn adr434_decoded_page_pin_stays_inside_projected_grouped_left_outer_shape() {
+	let streaming = source("src/exec/join/streaming.rs");
+	let grouped = source_block(
+		&streaming,
+		"pub(in crate::exec) async fn try_streaming_left_outer_grouped_aggregate",
+	);
+	assert_eq!(grouped.matches(".try_pin_decoded_pages(").count(), 1);
+	let shape_fence = grouped
+		.find("if match_filter.is_none()")
+		.expect("projected grouped shape fence");
+	let probe_started = grouped
+		.find("let probe_started = Instant::now()")
+		.expect("projected grouped probe boundary");
+	let pin = grouped
+		.find(".try_pin_decoded_pages(")
+		.expect("projected grouped decoded-page pin");
+	let probe = grouped
+		.find(".visit_streaming_spilled_left_outer_scan_probe_chunks(")
+		.expect("projected grouped probe call");
+	let off_shape_fallback = grouped
+		.find("let left_batches = self.execute_bound(left, morsel).await?")
+		.expect("off-shape materialized fallback");
+	assert!(shape_fence < probe_started);
+	assert!(probe_started < pin);
+	assert!(pin < probe);
+	assert!(probe < off_shape_fallback);
+}
+
+#[test]
 pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
 	let classifier = source_block(&demotion, "fn null_rejecting_sides");

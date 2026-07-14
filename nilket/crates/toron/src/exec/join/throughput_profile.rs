@@ -1,3 +1,4 @@
+use super::spill::PinDecodedPagesOutcome;
 use crate::error::ExecutionError;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -7,7 +8,7 @@ use std::time::Duration;
 
 pub(in crate::exec) const STREAMED_SPILLED_LEFT_OUTER_PROFILE_ENV: &str =
 	"TORON_STREAMED_SPILLED_LEFT_OUTER_PROFILE_PATH";
-const PROFILE_SCHEMA_VERSION: u32 = 1;
+const PROFILE_SCHEMA_VERSION: u32 = 2;
 
 fn profile_error(message: impl Into<String>) -> ExecutionError {
 	ExecutionError::Kernel {
@@ -51,6 +52,49 @@ impl SpillCacheEvictions {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::exec) enum ThroughputOperationPhase {
+	Preload,
+	#[default]
+	Probe,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct OperationPhaseSnapshot {
+	plaintext_hits: u64,
+	plaintext_misses: u64,
+	plaintext_evictions: u64,
+	plaintext_evicted_bytes: u64,
+	decoded_hits: u64,
+	decoded_misses: u64,
+	decoded_evictions: u64,
+	decoded_evicted_bytes: u64,
+	file_read_calls: u64,
+	file_read_completions: u64,
+	file_read_pending_calls: u64,
+	file_read_requested_bytes: u64,
+	file_read_returned_bytes: u64,
+	file_read_micros: u64,
+	page_decodes: u64,
+	page_decode_micros: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PinReceiptSnapshot {
+	memory_cap_bytes: u64,
+	retained_cap_bytes: u64,
+	resident_baseline_bytes: u64,
+	resident_index_bytes: u64,
+	writer_peak_bytes: u64,
+	page_reserve_bytes: u64,
+	loaded_page_estimate_bytes: u64,
+	preflight_estimate_bytes: u64,
+	decoded_bytes: u64,
+	pages_attempted: u64,
+	pages_completed: u64,
+	outcome: PinDecodedPagesOutcome,
+}
+
 #[derive(Debug)]
 pub(in crate::exec) struct StreamedSpilledLeftOuterProfile {
 	path: PathBuf,
@@ -91,6 +135,10 @@ pub(in crate::exec) struct StreamedSpilledLeftOuterProfile {
 	grouped_fold_micros: u64,
 	build_micros: u64,
 	probe_micros: u64,
+	operation_phase: ThroughputOperationPhase,
+	preload_operations: OperationPhaseSnapshot,
+	probe_operations: OperationPhaseSnapshot,
+	pin_receipt: Option<PinReceiptSnapshot>,
 	counter_overflowed: bool,
 }
 
@@ -151,8 +199,65 @@ impl StreamedSpilledLeftOuterProfile {
 			grouped_fold_micros: 0,
 			build_micros: 0,
 			probe_micros: 0,
+			operation_phase: ThroughputOperationPhase::Probe,
+			preload_operations: OperationPhaseSnapshot::default(),
+			probe_operations: OperationPhaseSnapshot::default(),
+			pin_receipt: None,
 			counter_overflowed: false,
 		}))
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn at_test_path(path: PathBuf) -> Self {
+		Self::from_lookup(|_| Some(path.into_os_string()))
+			.expect("test throughput profile path")
+			.expect("test throughput profile enabled")
+	}
+
+	fn record_operation(&mut self, record: impl FnOnce(&mut OperationPhaseSnapshot, &mut bool)) {
+		let mut overflowed = false;
+		let operations = match self.operation_phase {
+			ThroughputOperationPhase::Preload => &mut self.preload_operations,
+			ThroughputOperationPhase::Probe => &mut self.probe_operations,
+		};
+		record(operations, &mut overflowed);
+		self.counter_overflowed |= overflowed;
+	}
+
+	pub(in crate::exec) fn set_operation_phase(&mut self, phase: ThroughputOperationPhase) {
+		self.operation_phase = phase;
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) fn record_pin_receipt(
+		&mut self,
+		memory_cap_bytes: u64,
+		retained_cap_bytes: u64,
+		resident_baseline_bytes: u64,
+		resident_index_bytes: u64,
+		writer_peak_bytes: u64,
+		page_reserve_bytes: u64,
+		loaded_page_estimate_bytes: u64,
+		preflight_estimate_bytes: u64,
+		decoded_bytes: u64,
+		pages_attempted: u64,
+		pages_completed: u64,
+		outcome: PinDecodedPagesOutcome,
+	) {
+		self.pin_receipt = Some(PinReceiptSnapshot {
+			memory_cap_bytes,
+			retained_cap_bytes,
+			resident_baseline_bytes,
+			resident_index_bytes,
+			writer_peak_bytes,
+			page_reserve_bytes,
+			loaded_page_estimate_bytes,
+			preflight_estimate_bytes,
+			decoded_bytes,
+			pages_attempted,
+			pages_completed,
+			outcome,
+		});
 	}
 
 	pub(in crate::exec) fn record_lookup(&mut self, matched_references: usize) {
@@ -189,18 +294,30 @@ impl StreamedSpilledLeftOuterProfile {
 
 	pub(in crate::exec) fn record_plaintext_hit(&mut self) {
 		add_counter(&mut self.plaintext_hits, 1, &mut self.counter_overflowed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.plaintext_hits, 1, overflowed);
+		});
 	}
 
 	pub(in crate::exec) fn record_plaintext_miss(&mut self) {
 		add_counter(&mut self.plaintext_misses, 1, &mut self.counter_overflowed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.plaintext_misses, 1, overflowed);
+		});
 	}
 
 	pub(in crate::exec) fn record_decoded_hit(&mut self) {
 		add_counter(&mut self.decoded_hits, 1, &mut self.counter_overflowed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.decoded_hits, 1, overflowed);
+		});
 	}
 
 	pub(in crate::exec) fn record_decoded_miss(&mut self) {
 		add_counter(&mut self.decoded_misses, 1, &mut self.counter_overflowed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.decoded_misses, 1, overflowed);
+		});
 	}
 
 	pub(in crate::exec) fn record_plaintext_insert(&mut self, bytes: u64) {
@@ -269,6 +386,28 @@ impl StreamedSpilledLeftOuterProfile {
 		self.decoded_resident_bytes = self
 			.decoded_resident_bytes
 			.saturating_sub(evictions.decoded_bytes);
+		self.record_operation(|operations, overflowed| {
+			add_counter(
+				&mut operations.plaintext_evictions,
+				evictions.plaintext_entries,
+				overflowed,
+			);
+			add_counter(
+				&mut operations.plaintext_evicted_bytes,
+				evictions.plaintext_bytes,
+				overflowed,
+			);
+			add_counter(
+				&mut operations.decoded_evictions,
+				evictions.decoded_entries,
+				overflowed,
+			);
+			add_counter(
+				&mut operations.decoded_evicted_bytes,
+				evictions.decoded_bytes,
+				overflowed,
+			);
+		});
 	}
 
 	pub(in crate::exec) fn record_file_read(
@@ -306,6 +445,27 @@ impl StreamedSpilledLeftOuterProfile {
 			duration_micros(elapsed),
 			&mut self.counter_overflowed,
 		);
+		let requested_bytes = u64::try_from(requested_bytes).unwrap_or(u64::MAX);
+		let returned_bytes = u64::try_from(returned_bytes).unwrap_or(u64::MAX);
+		let elapsed_micros = duration_micros(elapsed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.file_read_calls, 1, overflowed);
+			add_counter(&mut operations.file_read_completions, 1, overflowed);
+			if returned_pending {
+				add_counter(&mut operations.file_read_pending_calls, 1, overflowed);
+			}
+			add_counter(
+				&mut operations.file_read_requested_bytes,
+				requested_bytes,
+				overflowed,
+			);
+			add_counter(
+				&mut operations.file_read_returned_bytes,
+				returned_bytes,
+				overflowed,
+			);
+			add_counter(&mut operations.file_read_micros, elapsed_micros, overflowed);
+		});
 	}
 
 	pub(in crate::exec) fn record_page_decode(
@@ -325,6 +485,15 @@ impl StreamedSpilledLeftOuterProfile {
 		{
 			self.counter_overflowed = true;
 		}
+		let elapsed_micros = duration_micros(elapsed);
+		self.record_operation(|operations, overflowed| {
+			add_counter(&mut operations.page_decodes, 1, overflowed);
+			add_counter(
+				&mut operations.page_decode_micros,
+				elapsed_micros,
+				overflowed,
+			);
+		});
 	}
 
 	pub(in crate::exec) fn record_materialized_batch(
@@ -449,6 +618,11 @@ impl StreamedSpilledLeftOuterProfile {
 				build_micros: self.build_micros,
 				probe_micros: self.probe_micros,
 			},
+			operation_phases: OperationPhasesSnapshot {
+				preload: &self.preload_operations,
+				probe: &self.probe_operations,
+			},
+			pin: self.pin_receipt.as_ref(),
 			counter_overflowed: self.counter_overflowed,
 		};
 		write_snapshot(&self.path, &snapshot)
@@ -456,7 +630,7 @@ impl StreamedSpilledLeftOuterProfile {
 }
 
 #[derive(Serialize)]
-struct ProfileSnapshot {
+struct ProfileSnapshot<'a> {
 	schema_version: u32,
 	spill_id: u64,
 	spill_bytes: u64,
@@ -472,7 +646,15 @@ struct ProfileSnapshot {
 	materialization: MaterializationSnapshot,
 	grouped_fold: FoldSnapshot,
 	phases: PhaseSnapshot,
+	operation_phases: OperationPhasesSnapshot<'a>,
+	pin: Option<&'a PinReceiptSnapshot>,
 	counter_overflowed: bool,
+}
+
+#[derive(Serialize)]
+struct OperationPhasesSnapshot<'a> {
+	preload: &'a OperationPhaseSnapshot,
+	probe: &'a OperationPhaseSnapshot,
 }
 
 #[derive(Serialize)]
@@ -550,7 +732,7 @@ struct PhaseSnapshot {
 	probe_micros: u64,
 }
 
-fn write_snapshot(path: &Path, snapshot: &ProfileSnapshot) -> Result<(), ExecutionError> {
+fn write_snapshot(path: &Path, snapshot: &ProfileSnapshot<'_>) -> Result<(), ExecutionError> {
 	if let Some(parent) = path.parent()
 		&& !parent.as_os_str().is_empty()
 	{
@@ -600,6 +782,7 @@ mod tests {
 				.expect("enabled profile");
 		profile.record_lookup(2);
 		profile.record_probe_chunk(3, 1);
+		profile.set_operation_phase(ThroughputOperationPhase::Preload);
 		profile.record_decoded_miss();
 		profile.record_plaintext_miss();
 		profile.record_file_read(64, 64, Duration::from_micros(7), true);
@@ -607,6 +790,22 @@ mod tests {
 		profile.record_page_decode(0, 80, Duration::from_micros(11));
 		profile.record_plaintext_promotion(48);
 		profile.record_decoded_insert(80);
+		profile.record_pin_receipt(
+			1024,
+			16_384,
+			1,
+			2,
+			3,
+			64,
+			70,
+			140,
+			80,
+			1,
+			1,
+			PinDecodedPagesOutcome::Admitted,
+		);
+		profile.set_operation_phase(ThroughputOperationPhase::Probe);
+		profile.record_decoded_hit();
 		profile.record_materialized_batch(2, 1);
 		profile.record_grouped_fold(2, Duration::from_micros(13));
 		profile.record_phase_micros(17, 19);
@@ -624,6 +823,17 @@ mod tests {
 		assert_eq!(snapshot["plaintext_cache"]["promotions_to_decoded"], 1);
 		assert_eq!(snapshot["plaintext_cache"]["evictions"], 0);
 		assert_eq!(snapshot["decoded_cache"]["final_resident_bytes"], 80);
+		assert_eq!(
+			snapshot["operation_phases"]["preload"]["file_read_calls"],
+			1
+		);
+		assert_eq!(snapshot["operation_phases"]["preload"]["page_decodes"], 1);
+		assert_eq!(snapshot["operation_phases"]["probe"]["decoded_hits"], 1);
+		assert_eq!(snapshot["operation_phases"]["probe"]["file_read_calls"], 0);
+		assert_eq!(snapshot["pin"]["retained_cap_bytes"], 16_384);
+		assert_eq!(snapshot["pin"]["preflight_estimate_bytes"], 140);
+		assert_eq!(snapshot["pin"]["pages_completed"], 1);
+		assert_eq!(snapshot["pin"]["outcome"], "admitted");
 		assert_eq!(snapshot["materialization"]["rows"], 2);
 		assert_eq!(snapshot["grouped_fold"]["micros"], 13);
 		assert_eq!(snapshot["counter_overflowed"], false);
