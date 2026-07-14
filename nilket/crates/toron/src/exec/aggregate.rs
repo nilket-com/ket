@@ -1,6 +1,11 @@
 use super::*;
 use ahash::RandomState;
 
+mod group_table;
+
+use self::group_table::BoundGroupedAggregateEntry;
+pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
+
 const EMPTY_PRIMITIVE_INT64_SUM_BUCKET: u32 = u32::MAX;
 const PRIMITIVE_INT64_SUM_INITIAL_CAPACITY: usize = 1024;
 const PRIMITIVE_INT64_SUM_PRODUCER: &str = "primitive Int64 grouped SUM resident state";
@@ -507,7 +512,7 @@ impl Executor {
 		let stream = self.storage.scan(req).instrument(span).await?;
 		let mut stream = stream.into_batches();
 		let mut rows = 0usize;
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut folded_input = false;
 
@@ -551,7 +556,7 @@ impl Executor {
 			)?;
 		}
 
-		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+		self.finalize_bound_grouped_aggregate(&mut groups, &group_types, aggr_expr, output_schema)
 			.map(Some)
 	}
 
@@ -672,7 +677,7 @@ impl Executor {
 		batch: RecordBatch,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(), ExecutionError> {
@@ -1102,7 +1107,7 @@ impl Executor {
 		group_expr: &[Expr],
 		aggr_expr: &[(AggregateFunction, Vec<Expr>)],
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut aggregate_output_types = vec![None; aggr_expr.len()];
 
@@ -1150,12 +1155,9 @@ impl Executor {
 					.iter()
 					.map(|array| group_value(array, row))
 					.collect::<Result<Vec<_>, _>>()?;
-				let states = match groups.entry(key) {
-					std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-					std::collections::btree_map::Entry::Vacant(entry) => {
-						entry.insert(init_states(aggr_expr, &aggr_arrays)?)
-					}
-				};
+				let states = groups.entry_or_init(key, aggr_expr.len(), || {
+					init_states(aggr_expr, &aggr_arrays)
+				})?;
 				for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
 					match input {
 						None => {
@@ -1201,7 +1203,11 @@ impl Executor {
 			}
 		}
 
-		let keys = groups.keys().cloned().collect::<Vec<_>>();
+		let entries = groups.finalize_sorted()?;
+		let keys = entries
+			.iter()
+			.map(|entry| entry.key.to_vec())
+			.collect::<Vec<_>>();
 		let mut columns = Vec::new();
 		let mut fields = Vec::new();
 
@@ -1217,9 +1223,9 @@ impl Executor {
 		for (agg_idx, (function, _)) in aggr_expr.iter().enumerate() {
 			match function {
 				AggregateFunction::CountAll | AggregateFunction::Count => {
-					let values = groups
-						.values()
-						.map(|states| match states[agg_idx] {
+					let values = entries
+						.iter()
+						.map(|entry| match entry.states[agg_idx] {
 							AggState::Count(value) => value,
 							AggState::SumInt { .. }
 							| AggState::SumFloat { .. }
@@ -1244,19 +1250,19 @@ impl Executor {
 					let output_type = aggregate_output_types[agg_idx]
 						.clone()
 						.unwrap_or(DataType::Int64);
-					columns.push(sum_column_from_groups(&groups, agg_idx, &output_type)?);
+					columns.push(sum_column_from_groups(&entries, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Min | AggregateFunction::Max => {
 					let output_type = aggregate_output_types[agg_idx]
 						.clone()
 						.unwrap_or(DataType::Int64);
-					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
+					columns.push(min_max_column_from_groups(&entries, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Avg => {
 					let output_type = aggregate_output_types[agg_idx]
 						.clone()
 						.unwrap_or(DataType::Float64);
-					columns.push(avg_column_from_groups(&groups, agg_idx, &output_type)?);
+					columns.push(avg_column_from_groups(&entries, agg_idx, &output_type)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -1292,7 +1298,7 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 
 		for batch in input_batches {
@@ -1305,18 +1311,27 @@ impl Executor {
 			)?;
 		}
 
-		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+		self.finalize_bound_grouped_aggregate(&mut groups, &group_types, aggr_expr, output_schema)
 	}
 
 	pub(in crate::exec) fn fold_bound_grouped_aggregate_batch(
 		&self,
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
 		batch: &RecordBatch,
 	) -> Result<(), ExecutionError> {
+		let fold_started = groups.profile_enabled().then(Instant::now);
+		let group_expression_started = groups.profile_enabled().then(Instant::now);
 		let group_arrays = self.evaluate_bound_program(group_expr, batch)?;
+		if let Some(started) = group_expression_started {
+			groups.record_group_expression_evaluation(
+				batch.num_rows(),
+				batch.num_rows().saturating_mul(group_arrays.len()),
+				started.elapsed(),
+			);
+		}
 		if group_types.is_empty() {
 			*group_types = group_arrays
 				.iter()
@@ -1350,12 +1365,8 @@ impl Executor {
 				.iter()
 				.map(|array| group_value(array, row))
 				.collect::<Result<Vec<_>, _>>()?;
-			let states = match groups.entry(key) {
-				std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-				std::collections::btree_map::Entry::Vacant(entry) => {
-					entry.insert(init_bound_states(aggr_expr)?)
-				}
-			};
+			let states =
+				groups.entry_or_init(key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
 			for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
 				match input {
 					None => {
@@ -1400,69 +1411,84 @@ impl Executor {
 			}
 		}
 
+		if let Some(started) = fold_started {
+			groups.record_fold_batch(batch.num_rows(), aggr_arrays.len(), started.elapsed());
+		}
+
 		Ok(())
 	}
 
 	pub(in crate::exec) fn finalize_bound_grouped_aggregate(
 		&self,
-		groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &[DataType],
 		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let keys = groups.keys().cloned().collect::<Vec<_>>();
-		let mut columns = Vec::new();
-		for (idx, data_type) in group_types.iter().enumerate() {
-			columns.push(group_column(&keys, idx, data_type)?);
-		}
+		let finalize_started = groups.profile_enabled().then(Instant::now);
+		let output = {
+			let entries = groups.finalize_sorted()?;
+			let keys = entries
+				.iter()
+				.map(|entry| entry.key.to_vec())
+				.collect::<Vec<_>>();
+			let mut columns = Vec::new();
+			for (idx, data_type) in group_types.iter().enumerate() {
+				columns.push(group_column(&keys, idx, data_type)?);
+			}
 
-		for (agg_idx, call) in aggr_expr.iter().enumerate() {
-			match call.function {
-				AggregateFunction::CountAll | AggregateFunction::Count => {
-					let values = groups
-						.values()
-						.map(|states| match states[agg_idx] {
-							AggState::Count(value) => value,
-							AggState::SumInt { .. }
-							| AggState::SumFloat { .. }
-							| AggState::MinInt32 { .. }
-							| AggState::MinInt64 { .. }
-							| AggState::MinFloat32 { .. }
-							| AggState::MinFloat64 { .. }
-							| AggState::MinDecimal128 { .. }
-							| AggState::MaxInt32 { .. }
-							| AggState::MaxInt64 { .. }
-							| AggState::MaxFloat32 { .. }
-							| AggState::MaxFloat64 { .. }
-							| AggState::MaxDecimal128 { .. }
-							| AggState::AvgInt { .. }
-							| AggState::AvgFloat { .. }
-							| AggState::AvgDecimal { .. } => 0,
-						})
-						.collect::<Vec<_>>();
-					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
-				}
-				AggregateFunction::Sum => {
-					let output_type = output_schema.field(columns.len()).data_type().clone();
-					columns.push(sum_column_from_groups(&groups, agg_idx, &output_type)?);
-				}
-				AggregateFunction::Min | AggregateFunction::Max => {
-					let output_type = output_schema.field(columns.len()).data_type().clone();
-					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
-				}
-				AggregateFunction::Avg => {
-					let output_type = output_schema.field(columns.len()).data_type().clone();
-					columns.push(avg_column_from_groups(&groups, agg_idx, &output_type)?);
-				}
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-					return Err(ExecutionError::NotImplemented {
-						feature: "bound grouped experimental aggregate",
-					});
+			for (agg_idx, call) in aggr_expr.iter().enumerate() {
+				match call.function {
+					AggregateFunction::CountAll | AggregateFunction::Count => {
+						let values = entries
+							.iter()
+							.map(|entry| match entry.states[agg_idx] {
+								AggState::Count(value) => value,
+								AggState::SumInt { .. }
+								| AggState::SumFloat { .. }
+								| AggState::MinInt32 { .. }
+								| AggState::MinInt64 { .. }
+								| AggState::MinFloat32 { .. }
+								| AggState::MinFloat64 { .. }
+								| AggState::MinDecimal128 { .. }
+								| AggState::MaxInt32 { .. }
+								| AggState::MaxInt64 { .. }
+								| AggState::MaxFloat32 { .. }
+								| AggState::MaxFloat64 { .. }
+								| AggState::MaxDecimal128 { .. }
+								| AggState::AvgInt { .. }
+								| AggState::AvgFloat { .. }
+								| AggState::AvgDecimal { .. } => 0,
+							})
+							.collect::<Vec<_>>();
+						columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
+					}
+					AggregateFunction::Sum => {
+						let output_type = output_schema.field(columns.len()).data_type().clone();
+						columns.push(sum_column_from_groups(&entries, agg_idx, &output_type)?);
+					}
+					AggregateFunction::Min | AggregateFunction::Max => {
+						let output_type = output_schema.field(columns.len()).data_type().clone();
+						columns.push(min_max_column_from_groups(&entries, agg_idx, &output_type)?);
+					}
+					AggregateFunction::Avg => {
+						let output_type = output_schema.field(columns.len()).data_type().clone();
+						columns.push(avg_column_from_groups(&entries, agg_idx, &output_type)?);
+					}
+					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+						return Err(ExecutionError::NotImplemented {
+							feature: "bound grouped experimental aggregate",
+						});
+					}
 				}
 			}
-		}
 
-		Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
+			RecordBatch::try_new(output_schema.clone(), columns)?
+		};
+		if let Some(started) = finalize_started {
+			groups.record_finalize_and_persist(started.elapsed())?;
+		}
+		Ok(vec![output])
 	}
 }
 
@@ -2203,15 +2229,15 @@ pub(in crate::exec) fn sum_state_array(
 }
 
 fn sum_column_from_groups(
-	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	groups: &[BoundGroupedAggregateEntry<'_>],
 	agg_idx: usize,
 	data_type: &DataType,
 ) -> Result<ArrayRef, ExecutionError> {
 	match data_type {
 		DataType::Int64 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::SumInt { total, seen } => {
 						if seen {
 							Ok::<Option<i64>, ExecutionError>(Some(i64::try_from(total).map_err(
@@ -2244,8 +2270,8 @@ fn sum_column_from_groups(
 		}
 		DataType::Float64 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::SumFloat { total, seen } => seen.then_some(total),
 					AggState::SumInt { total, seen } => seen.then_some(total as f64),
 					AggState::Count(_)
@@ -2271,8 +2297,8 @@ fn sum_column_from_groups(
 		// in lockstep (the SUM-Decimal domain accepts Decimal128 at bind, so execute must too).
 		DataType::Decimal128(precision, scale) => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::SumInt { total, seen } => seen.then_some(total),
 					AggState::SumFloat { .. }
 					| AggState::Count(_)
@@ -2306,15 +2332,15 @@ fn sum_column_from_groups(
 }
 
 fn min_max_column_from_groups(
-	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	groups: &[BoundGroupedAggregateEntry<'_>],
 	agg_idx: usize,
 	output_type: &DataType,
 ) -> Result<ArrayRef, ExecutionError> {
 	match output_type {
 		DataType::Int32 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::MinInt32 { value } | AggState::MaxInt32 { value } => value,
 					_ => None,
 				})
@@ -2323,8 +2349,8 @@ fn min_max_column_from_groups(
 		}
 		DataType::Int64 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::MinInt64 { value } | AggState::MaxInt64 { value } => value,
 					_ => None,
 				})
@@ -2333,8 +2359,8 @@ fn min_max_column_from_groups(
 		}
 		DataType::Float32 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::MinFloat32 { value } | AggState::MaxFloat32 { value } => value,
 					_ => None,
 				})
@@ -2343,8 +2369,8 @@ fn min_max_column_from_groups(
 		}
 		DataType::Float64 => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::MinFloat64 { value } | AggState::MaxFloat64 { value } => value,
 					_ => None,
 				})
@@ -2353,8 +2379,8 @@ fn min_max_column_from_groups(
 		}
 		DataType::Decimal128(precision, scale) => {
 			let values = groups
-				.values()
-				.map(|states| match states[agg_idx] {
+				.iter()
+				.map(|entry| match entry.states[agg_idx] {
 					AggState::MinDecimal128 { value } | AggState::MaxDecimal128 { value } => value,
 					_ => None,
 				})
@@ -2458,15 +2484,15 @@ pub(in crate::exec) fn avg_state_array(
 }
 
 fn avg_column_from_groups(
-	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	groups: &[BoundGroupedAggregateEntry<'_>],
 	agg_idx: usize,
 	output_type: &DataType,
 ) -> Result<ArrayRef, ExecutionError> {
 	match output_type {
 		DataType::Decimal128(precision, scale) => {
 			let values = groups
-				.values()
-				.map(|states| avg_decimal_finalize(&states[agg_idx], *precision, *scale))
+				.iter()
+				.map(|entry| avg_decimal_finalize(&entry.states[agg_idx], *precision, *scale))
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(
 				Decimal128Array::from(values)
@@ -2478,8 +2504,8 @@ fn avg_column_from_groups(
 		}
 		_ => {
 			let values = groups
-				.values()
-				.map(|states| avg_finalize(&states[agg_idx]))
+				.iter()
+				.map(|entry| avg_finalize(&entry.states[agg_idx]))
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
 		}
@@ -2731,6 +2757,114 @@ mod tests {
 		});
 		builder.push_root(column);
 		builder.build()
+	}
+
+	#[test]
+	fn generic_grouped_hash_finalize_is_order_sensitive_and_keeps_mixed_states_paired() {
+		let input_schema = Arc::new(Schema::new(vec![
+			Field::new("group_int", DataType::Int64, true),
+			Field::new("group_text", DataType::Utf8, false),
+			Field::new("value", DataType::Int64, true),
+		]));
+		let input = RecordBatch::try_new(
+			input_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![
+					Some(2),
+					Some(1),
+					Some(2),
+					None,
+					Some(1),
+					None,
+				])),
+				Arc::new(StringArray::from(vec!["b", "a", "b", "z", "a", "z"])),
+				Arc::new(Int64Array::from(vec![
+					Some(10),
+					Some(20),
+					None,
+					Some(5),
+					Some(30),
+					Some(7),
+				])),
+			],
+		)
+		.expect("mixed grouped input");
+		let mut group_builder = BoundExprProgramBuilder::new();
+		let group_int = group_builder.append_column(ResolvedColumn {
+			name: ColumnName("group_int".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type: DataType::Int64,
+			nullable: true,
+			pbc_eligible: false,
+		});
+		let group_text = group_builder.append_column(ResolvedColumn {
+			name: ColumnName("group_text".to_string()),
+			ordinal: ColumnOrdinal(1),
+			data_type: DataType::Utf8,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		group_builder.push_root(group_int);
+		group_builder.push_root(group_text);
+		let group_expr = group_builder.build();
+		let value = || column_program("value", ColumnOrdinal(2), DataType::Int64, true);
+		let aggr_expr = vec![
+			BoundAggregateCall {
+				function: AggregateFunction::CountAll,
+				args: BoundExprProgramBuilder::new().build(),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Count,
+				args: value(),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Sum,
+				args: value(),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Min,
+				args: value(),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Max,
+				args: value(),
+			},
+			BoundAggregateCall {
+				function: AggregateFunction::Avg,
+				args: value(),
+			},
+		];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("group_int", DataType::Int64, true),
+			Field::new("group_text", DataType::Utf8, false),
+			Field::new("count_all", DataType::Int64, false),
+			Field::new("count_value", DataType::Int64, false),
+			Field::new("sum_value", DataType::Int64, true),
+			Field::new("min_value", DataType::Int64, true),
+			Field::new("max_value", DataType::Int64, true),
+			Field::new("avg_value", DataType::Float64, true),
+		]));
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let output = executor
+			.bound_grouped_aggregate(&[input], &group_expr, &aggr_expr, &output_schema)
+			.expect("generic grouped output");
+		let expected = RecordBatch::try_new(
+			output_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![None, Some(1), Some(2)])),
+				Arc::new(StringArray::from(vec!["z", "a", "b"])),
+				Arc::new(Int64Array::from(vec![2, 2, 2])),
+				Arc::new(Int64Array::from(vec![2, 2, 1])),
+				Arc::new(Int64Array::from(vec![12, 50, 10])),
+				Arc::new(Int64Array::from(vec![5, 20, 10])),
+				Arc::new(Int64Array::from(vec![7, 30, 10])),
+				Arc::new(Float64Array::from(vec![6.0, 25.0, 10.0])),
+			],
+		)
+		.expect("expected grouped output");
+		assert_eq!(output, vec![expected]);
 	}
 
 	#[test]

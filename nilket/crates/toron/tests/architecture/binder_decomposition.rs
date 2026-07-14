@@ -224,6 +224,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec/join/streaming.rs",
 				// ADR 353: aggregate executor/state submodule inside the semantic executor split.
 				"crates/toron/src/exec/aggregate.rs",
+				// ADR 435: generic bound grouped folds share one hash-table/residency owner.
+				"crates/toron/src/exec/aggregate/group_table.rs",
 				// ADR 354: expression evaluator submodule inside the semantic executor split.
 				"crates/toron/src/exec/expr.rs",
 				"crates/toron/src/ir/execution.rs",

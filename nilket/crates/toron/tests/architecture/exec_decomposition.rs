@@ -46,6 +46,64 @@ pub(crate) fn adr353_exec_aggregate_module_exists() {
 }
 
 #[test]
+pub(crate) fn adr435_generic_bound_grouped_fold_has_one_table_owner() {
+	let manifest = manifest_dir();
+	let aggregate = std::fs::read_to_string(manifest.join("src/exec/aggregate.rs"))
+		.expect("read exec aggregate source");
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let group_table_path = manifest.join("src/exec/aggregate/group_table.rs");
+
+	assert!(
+		aggregate.contains("mod group_table;"),
+		"aggregate executor must own the ADR 435 group-table module"
+	);
+	assert!(
+		group_table_path.exists(),
+		"missing ADR 435 group-table owner"
+	);
+	for (path, source) in [
+		("src/exec/aggregate.rs", aggregate.as_str()),
+		("src/exec/join/streaming.rs", streaming.as_str()),
+	] {
+		assert!(
+			!source.contains("BTreeMap<Vec<GroupValue>, Vec<AggState>>"),
+			"{path} must not restore a raw generic grouped-fold BTreeMap"
+		);
+		assert!(
+			!source.contains("std::collections::btree_map::Entry"),
+			"{path} must route grouped-fold entry lookup through the ADR 435 owner"
+		);
+	}
+
+	let fold_sites = aggregate
+		.matches("fold_bound_grouped_aggregate_batch(")
+		.count()
+		+ streaming
+			.matches("fold_bound_grouped_aggregate_batch(")
+			.count();
+	let finalize_sites = aggregate
+		.matches("finalize_bound_grouped_aggregate(")
+		.count()
+		+ streaming
+			.matches("finalize_bound_grouped_aggregate(")
+			.count();
+	assert_eq!(
+		fold_sites, 19,
+		"expected one definition plus 18 fold callers"
+	);
+	assert_eq!(
+		finalize_sites, 11,
+		"expected one definition plus 10 finalize callers"
+	);
+	assert!(
+		aggregate.contains("groups: &mut BoundGroupedAggregateGroups")
+			&& streaming.contains("groups: &mut BoundGroupedAggregateGroups"),
+		"all generic fold consumers must use the shared group-table owner"
+	);
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 

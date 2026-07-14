@@ -77,10 +77,10 @@ mod expr;
 mod join;
 
 pub(in crate::exec) use self::aggregate::{
-	AggState, GroupValue, add_avg_value, add_sum_value, avg_state_array, avg_state_for_data_type,
-	finalize_global_aggregate_state, init_global_aggregate_state, max_state_for_data_type,
-	min_max_state_array, min_state_for_data_type, numeric_value, sum_state_array,
-	sum_state_for_data_type, update_max_state, update_min_state,
+	AggState, BoundGroupedAggregateGroups, add_avg_value, add_sum_value, avg_state_array,
+	avg_state_for_data_type, finalize_global_aggregate_state, init_global_aggregate_state,
+	max_state_for_data_type, min_max_state_array, min_state_for_data_type, numeric_value,
+	sum_state_array, sum_state_for_data_type, update_max_state, update_min_state,
 };
 #[cfg(test)]
 pub(in crate::exec) use self::aggregate::{aggregate_state_keyword, aggregate_state_output_name};

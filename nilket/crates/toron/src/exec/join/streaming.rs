@@ -1060,39 +1060,13 @@ fn partition_replay_reservoir_bytes(
 	)
 }
 
-fn group_value_resident_bytes(value: &GroupValue) -> u64 {
-	match value {
-		GroupValue::Utf8(value) => u64::try_from(value.capacity()).unwrap_or(u64::MAX),
-		GroupValue::Timestamp(unit, _) => {
-			u64::try_from(std::mem::size_of_val(unit)).unwrap_or(u64::MAX)
-		}
-		_ => 0,
-	}
-}
-
 fn grouped_fold_resident_bytes(
-	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	groups: &BoundGroupedAggregateGroups,
 	group_type_capacity: usize,
 ) -> u64 {
-	let entries = groups.iter().fold(0u64, |total, (key, states)| {
-		let key_bytes = summary_bytes::<GroupValue>(key.capacity()).saturating_add(
-			key.iter()
-				.map(group_value_resident_bytes)
-				.fold(0u64, u64::saturating_add),
-		);
-		let state_bytes = summary_bytes::<AggState>(states.capacity());
-		let node_overhead = u64::try_from(
-			std::mem::size_of::<Vec<GroupValue>>()
-				.saturating_add(std::mem::size_of::<Vec<AggState>>())
-				.saturating_add(4 * std::mem::size_of::<usize>()),
-		)
-		.unwrap_or(u64::MAX);
-		total
-			.saturating_add(key_bytes)
-			.saturating_add(state_bytes)
-			.saturating_add(node_overhead)
-	});
-	entries.saturating_add(summary_bytes::<DataType>(group_type_capacity))
+	groups
+		.current_resident_bytes()
+		.saturating_add(summary_bytes::<DataType>(group_type_capacity))
 }
 
 fn record_batches_resident_bytes(batches: &[RecordBatch], capacity: usize) -> u64 {
@@ -1294,7 +1268,7 @@ struct StreamingLeftOuterGroupedInput<'a> {
 
 enum ReorientedChainOutputSink<'a> {
 	GroupedFold {
-		groups: &'a mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &'a mut BoundGroupedAggregateGroups,
 		group_types: &'a mut Vec<DataType>,
 		outer_predicate: Option<&'a BoundExprProgram>,
 		project_exprs: Option<&'a BoundExprProgram>,
@@ -1317,7 +1291,7 @@ enum ReorientedChainOutputSink<'a> {
 		exchange_key: &'a BoundExprProgram,
 		group_expr: &'a BoundExprProgram,
 		aggr_expr: &'a [BoundAggregateCall],
-		groups: &'a mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &'a mut BoundGroupedAggregateGroups,
 		group_types: &'a mut Vec<DataType>,
 		input_rows: &'a mut u64,
 		output_rows: &'a mut u64,
@@ -7177,7 +7151,7 @@ impl Executor {
 							.saturating_add(spilled.spill_bytes());
 					});
 
-					let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+					let mut groups = BoundGroupedAggregateGroups::new();
 					let mut group_types = Vec::new();
 					let mut folded_input = false;
 					let mut matched_build_rows = spilled.empty_page_match_bitmap();
@@ -7262,7 +7236,7 @@ impl Executor {
 						},
 					);
 					let output = self.finalize_bound_grouped_aggregate(
-						&groups,
+						&mut groups,
 						&group_types,
 						aggr_expr,
 						output_schema,
@@ -7312,7 +7286,7 @@ impl Executor {
 				.saturating_add(duration_micros(build_started));
 		});
 
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut folded_input = false;
 		let mut matched_build_rows = build_match_bitmap(JoinKind::LeftOuter, left_batch.num_rows())
@@ -7382,7 +7356,7 @@ impl Executor {
 			},
 		);
 
-		self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+		self.finalize_bound_grouped_aggregate(&mut groups, &group_types, aggr_expr, output_schema)
 			.map(Some)
 	}
 
@@ -7401,7 +7375,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 		morsel: Option<(MorselId, u32)>,
@@ -7505,7 +7479,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(u64, u64), ExecutionError> {
@@ -7561,7 +7535,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<u64, ExecutionError> {
@@ -7649,7 +7623,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(), ExecutionError> {
@@ -7697,7 +7671,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 		morsel: Option<(MorselId, u32)>,
@@ -7799,7 +7773,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(u64, u64), ExecutionError> {
@@ -7897,7 +7871,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<u64, ExecutionError> {
@@ -7956,7 +7930,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(), ExecutionError> {
@@ -7989,7 +7963,7 @@ impl Executor {
 		exchange: Option<(u32, &BoundExprProgram)>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
 	) -> Result<(), ExecutionError> {
@@ -8256,7 +8230,7 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+			let mut groups = BoundGroupedAggregateGroups::new();
 			let mut group_types = Vec::new();
 			while let Some(batch) = stream.next().await {
 				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
@@ -8309,8 +8283,13 @@ impl Executor {
 					output_rows: RowCount::new(runtime.output_rows),
 				},
 			);
-			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
-				.map(Some)
+			self.finalize_bound_grouped_aggregate(
+				&mut groups,
+				&group_types,
+				aggr_expr,
+				output_schema,
+			)
+			.map(Some)
 		}
 		.await;
 		runtime.cleanup().await;
@@ -8444,7 +8423,7 @@ impl Executor {
 				self.context.task_budget.memory.get(),
 			)?
 			else {
-				let mut groups = BTreeMap::new();
+				let mut groups = BoundGroupedAggregateGroups::new();
 				let mut group_types = Vec::new();
 				let empty = RecordBatch::new_empty(semi_output_schema.clone());
 				self.fold_bound_grouped_aggregate_batch(
@@ -8470,7 +8449,7 @@ impl Executor {
 				);
 				return self
 					.finalize_bound_grouped_aggregate(
-						&groups,
+						&mut groups,
 						&group_types,
 						aggr_expr,
 						output_schema,
@@ -8508,7 +8487,7 @@ impl Executor {
 						.to_string(),
 				});
 			};
-			let mut groups = BTreeMap::new();
+			let mut groups = BoundGroupedAggregateGroups::new();
 			let mut group_types = Vec::new();
 			let mut chain_input_rows = 0u64;
 			let mut matched_rows = 0u64;
@@ -8596,7 +8575,7 @@ impl Executor {
 				},
 			);
 			let output = self.finalize_bound_grouped_aggregate(
-				&groups,
+				&mut groups,
 				&group_types,
 				aggr_expr,
 				output_schema,
@@ -8671,7 +8650,7 @@ impl Executor {
 				.spill_bytes
 				.saturating_add(spilled.spill_bytes());
 		});
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let probe_started = Instant::now();
 		let result = self
@@ -8715,7 +8694,12 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema)
+			self.finalize_bound_grouped_aggregate(
+				&mut groups,
+				&group_types,
+				aggr_expr,
+				output_schema,
+			)
 		});
 		spilled.cleanup().await;
 		output.map(Some)
@@ -8735,7 +8719,7 @@ impl Executor {
 		exchange_key: &BoundExprProgram,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 	) -> Result<(u64, u64), ExecutionError> {
 		let mut matched: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
@@ -8815,7 +8799,7 @@ impl Executor {
 		exchange_key: &BoundExprProgram,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 	) -> Result<(), ExecutionError> {
 		let batch = materialize_projected_streamed_spilled_build_rows(
@@ -9066,7 +9050,7 @@ impl Executor {
 			runtimes.push(runtime);
 		}
 
-		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut matched = None;
 		if let Some((stage, scan_probe_batches, needs_decision_fallback)) = deferred_stream_stage {
@@ -9204,8 +9188,12 @@ impl Executor {
 			);
 		}
 
-		let output =
-			self.finalize_bound_grouped_aggregate(&groups, &group_types, aggr_expr, output_schema);
+		let output = self.finalize_bound_grouped_aggregate(
+			&mut groups,
+			&group_types,
+			aggr_expr,
+			output_schema,
+		);
 		for runtime in runtimes {
 			runtime.cleanup().await;
 		}
@@ -9271,7 +9259,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 		scan_probe_batches: Option<Vec<RecordBatch>>,
@@ -9905,7 +9893,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<()>, ExecutionError> {
@@ -11071,7 +11059,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<()>, ExecutionError> {
@@ -11162,7 +11150,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 	) -> Result<(), ExecutionError> {
 		self.process_reoriented_inner_chain_grouped_suffix_batch(
@@ -11189,7 +11177,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 	) -> Result<(), ExecutionError> {
 		for runtime in inner_runtimes.iter_mut() {
@@ -11245,7 +11233,7 @@ impl Executor {
 		project_output_schema: Option<&arrow::datatypes::SchemaRef>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
@@ -11440,7 +11428,7 @@ impl Executor {
 
 	fn fold_reoriented_grouped_output_batch(
 		&self,
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		outer_predicate: Option<&BoundExprProgram>,
 		project_exprs: Option<&BoundExprProgram>,
@@ -11629,7 +11617,7 @@ impl Executor {
 		};
 
 		let execution_result = async {
-			let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
+			let mut groups = BoundGroupedAggregateGroups::new();
 			let mut group_types = Vec::new();
 			if self
 				.try_streaming_inner_prefix_semi_anti_scan_probe_base(
@@ -11870,7 +11858,7 @@ impl Executor {
 			}
 
 			let output = self.finalize_bound_grouped_aggregate(
-				&groups,
+				&mut groups,
 				&group_types,
 				aggr_expr,
 				output_schema,
@@ -12086,7 +12074,7 @@ impl Executor {
 		anti_runtime: &mut StreamingSemiAntiRuntime<'_>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		stage_profile: &mut Option<ChainStageProfiler>,
 		runtime_baseline_bytes: u64,
@@ -12364,6 +12352,23 @@ impl Executor {
 						grouped_fold_resident_bytes(groups, group_types.capacity()),
 						self.context.task_budget.memory.get(),
 					)?;
+					let non_fold_resident_bytes = runtime_baseline_bytes
+						.saturating_add(build_reservoir_bytes)
+						.saturating_add(probe_reservoir_bytes)
+						.saturating_add(build.owner_retained_resident_bytes())
+						.saturating_add(probe.owner_retained_resident_bytes())
+						.saturating_add(probe_page_bytes)
+						.saturating_add(record_batches_resident_bytes(
+							&anti_batches,
+							anti_batches.capacity(),
+						))
+						.saturating_add(summary_bytes::<DataType>(group_types.capacity()));
+					let retained_cap = join_spill_retained_footprint_memory_cap(
+						self.context.task_budget.memory.get(),
+					);
+					groups.set_growth_budget_bytes(Some(
+						retained_cap.saturating_sub(non_fold_resident_bytes),
+					));
 					for batch in anti_batches {
 						let fold_rows = batch.num_rows() as u64;
 						let fold_started = stage_profile.as_ref().map(|_| Instant::now());
@@ -12387,6 +12392,7 @@ impl Executor {
 							)?;
 						}
 					}
+					groups.set_growth_budget_bytes(None);
 					guard_partition_replay_owner_resident(
 						runtime_baseline_bytes,
 						build_reservoir_bytes,
@@ -12442,7 +12448,7 @@ impl Executor {
 		anti_runtime: &mut StreamingSemiAntiRuntime<'_>,
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
-		groups: &mut BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<()>, ExecutionError> {
