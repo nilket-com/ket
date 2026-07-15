@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 const EMPTY_BUCKET: u32 = u32::MAX;
 const INITIAL_ENTRY_CAPACITY: usize = 1024;
 const GROUPED_FOLD_PRODUCER: &str = "generic bound grouped-fold hash table";
-const PROFILE_SCHEMA_VERSION: u32 = 1;
+const PROFILE_SCHEMA_VERSION: u32 = 2;
+const PROBE_HISTOGRAM_EXACT_MAX: usize = 1023;
+const PROBE_HISTOGRAM_BIN_COUNT: usize = PROBE_HISTOGRAM_EXACT_MAX + 1;
+const PROBE_HISTOGRAM_OVERFLOW_DENOMINATOR: u64 = 1_000;
+const PROBE_TAIL_THRESHOLDS: [usize; 4] = [8, 16, 32, 64];
 pub(in crate::exec) const GENERIC_GROUPED_FOLD_PROFILE_ENV: &str =
 	"TORON_GENERIC_GROUPED_FOLD_PROFILE_DIR";
 
@@ -143,6 +147,18 @@ impl BoundGroupedAggregateGroups {
 		let lookup = self.state.lookup_entry(&key)?;
 		if let Some(profile) = self.state.profile.as_mut() {
 			profile.record_lookup(lookup.probes, lookup.entry.is_some());
+			if lookup.probes > 0 {
+				profile.record_probe(
+					if lookup.entry.is_some() {
+						ProbePhase::PrimaryOccupied
+					} else {
+						ProbePhase::PrimaryVacant
+					},
+					&lookup,
+					self.state.buckets.len(),
+					self.state.entry_limit,
+				);
+			}
 		}
 		if let Some(entry) = lookup.entry {
 			return self
@@ -158,6 +174,14 @@ impl BoundGroupedAggregateGroups {
 		let vacant = self.state.find_bucket(&key)?;
 		if vacant.entry.is_some() {
 			return Err(table_error("vacant grouped-fold lookup became occupied"));
+		}
+		if let Some(profile) = self.state.profile.as_mut() {
+			profile.record_probe(
+				ProbePhase::VacantPlacement,
+				&vacant,
+				self.state.buckets.len(),
+				self.state.entry_limit,
+			);
 		}
 		let key_bytes = group_key_resident_bytes(&key);
 		let requested_state_bytes = capacity_bytes::<AggState>(state_count);
@@ -248,7 +272,12 @@ impl BoundGroupedAggregateGroups {
 		let peak_resident_bytes = self.peak_resident_bytes();
 		let maximum_projected_growth_peak_bytes = self.maximum_projected_growth_peak_bytes();
 		let maximum_finalize_sort_scratch_bytes = self.maximum_finalize_sort_scratch_bytes();
-		if let Some(profile) = self.state.profile.as_mut() {
+		let final_occupied_cluster_runs = self
+			.profile_enabled()
+			.then(|| occupied_cluster_run_histogram(&self.state.buckets));
+		if let (Some(profile), Some(final_occupied_cluster_runs)) =
+			(self.state.profile.as_mut(), final_occupied_cluster_runs)
+		{
 			profile.record_finalize_total(elapsed);
 			profile.persist(
 				self.state.keys.len(),
@@ -256,6 +285,7 @@ impl BoundGroupedAggregateGroups {
 				peak_resident_bytes,
 				maximum_projected_growth_peak_bytes,
 				maximum_finalize_sort_scratch_bytes,
+				final_occupied_cluster_runs,
 			)?;
 		}
 		Ok(())
@@ -304,6 +334,166 @@ struct HashLookup {
 	bucket: usize,
 	entry: Option<usize>,
 	probes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbePhase {
+	PrimaryOccupied,
+	PrimaryVacant,
+	VacantPlacement,
+	Rehash,
+}
+
+impl ProbePhase {
+	const ALL: [Self; 4] = [
+		Self::PrimaryOccupied,
+		Self::PrimaryVacant,
+		Self::VacantPlacement,
+		Self::Rehash,
+	];
+
+	fn index(self) -> usize {
+		match self {
+			Self::PrimaryOccupied => 0,
+			Self::PrimaryVacant => 1,
+			Self::VacantPlacement => 2,
+			Self::Rehash => 3,
+		}
+	}
+
+	fn label(self) -> &'static str {
+		match self {
+			Self::PrimaryOccupied => "primary_occupied",
+			Self::PrimaryVacant => "primary_vacant",
+			Self::VacantPlacement => "vacant_placement",
+			Self::Rehash => "rehash",
+		}
+	}
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeHistogram {
+	exact_bins: Vec<u64>,
+	overflow: u64,
+	maximum: u64,
+}
+
+impl ProbeHistogram {
+	fn new() -> Self {
+		Self {
+			exact_bins: vec![0; PROBE_HISTOGRAM_BIN_COUNT],
+			overflow: 0,
+			maximum: 0,
+		}
+	}
+
+	fn record(&mut self, value: usize, counter_overflowed: &mut bool) {
+		let value_u64 = u64::try_from(value).unwrap_or(u64::MAX);
+		self.maximum = self.maximum.max(value_u64);
+		if let Some(bin) = self.exact_bins.get_mut(value) {
+			add_counter(bin, 1, counter_overflowed);
+		} else {
+			add_counter(&mut self.overflow, 1, counter_overflowed);
+		}
+	}
+
+	fn total(&self) -> u64 {
+		self.exact_bins
+			.iter()
+			.copied()
+			.fold(self.overflow, u64::saturating_add)
+	}
+
+	fn overflow_requires_widening(&self) -> bool {
+		let total = self.total();
+		total > 0
+			&& u128::from(self.overflow) * u128::from(PROBE_HISTOGRAM_OVERFLOW_DENOMINATOR)
+				>= u128::from(total)
+	}
+}
+
+#[derive(Debug, Serialize)]
+struct ProbePhaseCounters {
+	phase: &'static str,
+	hash_calls: u64,
+	bucket_visits: u64,
+	equality_invocations: u64,
+	matching_equalities: u64,
+	collision_mismatches: u64,
+	probe_histogram: ProbeHistogram,
+}
+
+impl ProbePhaseCounters {
+	fn new(phase: ProbePhase) -> Self {
+		Self {
+			phase: phase.label(),
+			hash_calls: 0,
+			bucket_visits: 0,
+			equality_invocations: 0,
+			matching_equalities: 0,
+			collision_mismatches: 0,
+			probe_histogram: ProbeHistogram::new(),
+		}
+	}
+
+	fn record(&mut self, lookup: &HashLookup, counter_overflowed: &mut bool) {
+		let probes = u64::try_from(lookup.probes).unwrap_or(u64::MAX);
+		let matching = u64::from(lookup.entry.is_some());
+		let equalities = if lookup.entry.is_some() {
+			probes
+		} else {
+			probes.saturating_sub(1)
+		};
+		let collisions = equalities.saturating_sub(matching);
+		add_counter(&mut self.hash_calls, 1, counter_overflowed);
+		add_counter(&mut self.bucket_visits, probes, counter_overflowed);
+		add_counter(
+			&mut self.equality_invocations,
+			equalities,
+			counter_overflowed,
+		);
+		add_counter(&mut self.matching_equalities, matching, counter_overflowed);
+		add_counter(
+			&mut self.collision_mismatches,
+			collisions,
+			counter_overflowed,
+		);
+		self.probe_histogram
+			.record(lookup.probes, counter_overflowed);
+	}
+
+	fn overflow_requires_widening(&self) -> bool {
+		self.probe_histogram.overflow_requires_widening()
+	}
+}
+
+fn empty_phase_counters() -> [ProbePhaseCounters; 4] {
+	ProbePhase::ALL.map(ProbePhaseCounters::new)
+}
+
+#[derive(Debug, Serialize)]
+struct GrowthEpochProbeCounters {
+	epoch: u64,
+	bucket_count: u64,
+	entry_limit: u64,
+	phases: [ProbePhaseCounters; 4],
+}
+
+impl GrowthEpochProbeCounters {
+	fn new(epoch: u64, bucket_count: usize, entry_limit: usize) -> Self {
+		Self {
+			epoch,
+			bucket_count: u64::try_from(bucket_count).unwrap_or(u64::MAX),
+			entry_limit: u64::try_from(entry_limit).unwrap_or(u64::MAX),
+			phases: empty_phase_counters(),
+		}
+	}
+
+	fn overflow_requires_widening(&self) -> bool {
+		self.phases
+			.iter()
+			.any(ProbePhaseCounters::overflow_requires_widening)
+	}
 }
 
 impl BoundGroupedAggregateGroupState {
@@ -382,6 +572,9 @@ impl BoundGroupedAggregateGroupState {
 				return Err(table_error(
 					"duplicate key while rebuilding grouped-fold hash table",
 				));
+			}
+			if let Some(profile) = self.profile.as_mut() {
+				profile.record_rehash_probe(&lookup, bucket_count, target);
 			}
 			buckets[lookup.bucket] = u32::try_from(entry)
 				.map_err(|_| table_error("grouped-fold entry index exceeds u32"))?;
@@ -465,6 +658,32 @@ fn find_bucket_in(
 	))
 }
 
+fn occupied_cluster_run_histogram(buckets: &[u32]) -> ProbeHistogram {
+	let mut histogram = ProbeHistogram::new();
+	let Some(empty) = buckets.iter().position(|entry| *entry == EMPTY_BUCKET) else {
+		if !buckets.is_empty() {
+			let mut overflowed = false;
+			histogram.record(buckets.len(), &mut overflowed);
+		}
+		return histogram;
+	};
+	let mut run = 0usize;
+	let mut overflowed = false;
+	for offset in 1..=buckets.len() {
+		let bucket = (empty + offset) & (buckets.len() - 1);
+		if buckets[bucket] == EMPTY_BUCKET {
+			if run > 0 {
+				histogram.record(run, &mut overflowed);
+				run = 0;
+			}
+		} else {
+			run = run.saturating_add(1);
+		}
+	}
+	debug_assert_eq!(run, 0, "scan ends at the selected empty bucket");
+	histogram
+}
+
 fn group_key_resident_bytes(key: &Vec<GroupValue>) -> u64 {
 	capacity_bytes::<GroupValue>(key.capacity()).saturating_add(
 		key.iter()
@@ -509,6 +728,8 @@ struct GenericGroupedFoldProfile {
 	growths_completed: u64,
 	maximum_projected_growth_peak_bytes: u64,
 	finalize_sort_scratch_bytes: u64,
+	probe_phases: [ProbePhaseCounters; 4],
+	growth_epochs: Vec<GrowthEpochProbeCounters>,
 	counter_overflowed: bool,
 }
 
@@ -540,6 +761,8 @@ impl GenericGroupedFoldProfile {
 			growths_completed: 0,
 			maximum_projected_growth_peak_bytes: 0,
 			finalize_sort_scratch_bytes: 0,
+			probe_phases: empty_phase_counters(),
+			growth_epochs: Vec::new(),
 			counter_overflowed: false,
 		})
 	}
@@ -583,6 +806,63 @@ impl GenericGroupedFoldProfile {
 		} else {
 			add_counter(&mut self.vacant_lookups, 1, &mut self.counter_overflowed);
 		}
+	}
+
+	fn record_probe(
+		&mut self,
+		phase: ProbePhase,
+		lookup: &HashLookup,
+		bucket_count: usize,
+		entry_limit: usize,
+	) {
+		let epoch = self.growths_completed;
+		self.record_probe_at_epoch(phase, lookup, epoch, bucket_count, entry_limit);
+	}
+
+	fn record_rehash_probe(
+		&mut self,
+		lookup: &HashLookup,
+		bucket_count: usize,
+		entry_limit: usize,
+	) {
+		let epoch = self.growths_completed.saturating_add(1);
+		self.record_probe_at_epoch(ProbePhase::Rehash, lookup, epoch, bucket_count, entry_limit);
+	}
+
+	fn record_probe_at_epoch(
+		&mut self,
+		phase: ProbePhase,
+		lookup: &HashLookup,
+		epoch: u64,
+		bucket_count: usize,
+		entry_limit: usize,
+	) {
+		self.probe_phases[phase.index()].record(lookup, &mut self.counter_overflowed);
+		let needs_epoch = self
+			.growth_epochs
+			.last()
+			.is_none_or(|current| current.epoch != epoch);
+		if needs_epoch {
+			self.growth_epochs.push(GrowthEpochProbeCounters::new(
+				epoch,
+				bucket_count,
+				entry_limit,
+			));
+		}
+		let current = self
+			.growth_epochs
+			.last_mut()
+			.expect("probe epoch was just initialized");
+		debug_assert_eq!(current.epoch, epoch);
+		debug_assert_eq!(
+			current.bucket_count,
+			u64::try_from(bucket_count).unwrap_or(u64::MAX)
+		);
+		debug_assert_eq!(
+			current.entry_limit,
+			u64::try_from(entry_limit).unwrap_or(u64::MAX)
+		);
+		current.phases[phase.index()].record(lookup, &mut self.counter_overflowed);
 	}
 
 	fn record_fold_batch(&mut self, rows: usize, aggregate_updates: usize, elapsed: Duration) {
@@ -634,7 +914,17 @@ impl GenericGroupedFoldProfile {
 		peak_resident_bytes: u64,
 		maximum_projected_growth_peak_bytes: u64,
 		maximum_finalize_sort_scratch_bytes: u64,
+		final_occupied_cluster_runs: ProbeHistogram,
 	) -> Result<(), ExecutionError> {
+		let histogram_overflow_requires_widening = self
+			.probe_phases
+			.iter()
+			.any(ProbePhaseCounters::overflow_requires_widening)
+			|| self
+				.growth_epochs
+				.iter()
+				.any(GrowthEpochProbeCounters::overflow_requires_widening)
+			|| final_occupied_cluster_runs.overflow_requires_widening();
 		let snapshot = GenericGroupedFoldSnapshot {
 			schema_version: PROFILE_SCHEMA_VERSION,
 			fold_id: self.fold_id,
@@ -661,6 +951,15 @@ impl GenericGroupedFoldProfile {
 				.max(self.maximum_projected_growth_peak_bytes),
 			finalize_sort_scratch_bytes: maximum_finalize_sort_scratch_bytes
 				.max(self.finalize_sort_scratch_bytes),
+			probe_ledger: ProbeLedgerSnapshot {
+				histogram_exact_max: u64::try_from(PROBE_HISTOGRAM_EXACT_MAX).unwrap_or(u64::MAX),
+				histogram_overflow_threshold_denominator: PROBE_HISTOGRAM_OVERFLOW_DENOMINATOR,
+				tail_thresholds: PROBE_TAIL_THRESHOLDS,
+				phases: &self.probe_phases,
+				growth_epochs: &self.growth_epochs,
+				final_occupied_cluster_runs,
+				histogram_overflow_requires_widening,
+			},
 			counter_overflowed: self.counter_overflowed,
 		};
 		write_snapshot(&self.directory, self.fold_id, &snapshot)
@@ -668,7 +967,18 @@ impl GenericGroupedFoldProfile {
 }
 
 #[derive(Serialize)]
-struct GenericGroupedFoldSnapshot {
+struct ProbeLedgerSnapshot<'a> {
+	histogram_exact_max: u64,
+	histogram_overflow_threshold_denominator: u64,
+	tail_thresholds: [usize; 4],
+	phases: &'a [ProbePhaseCounters; 4],
+	growth_epochs: &'a [GrowthEpochProbeCounters],
+	final_occupied_cluster_runs: ProbeHistogram,
+	histogram_overflow_requires_widening: bool,
+}
+
+#[derive(Serialize)]
+struct GenericGroupedFoldSnapshot<'a> {
 	schema_version: u32,
 	fold_id: u64,
 	batches: u64,
@@ -692,13 +1002,14 @@ struct GenericGroupedFoldSnapshot {
 	peak_resident_bytes: u64,
 	maximum_projected_growth_peak_bytes: u64,
 	finalize_sort_scratch_bytes: u64,
+	probe_ledger: ProbeLedgerSnapshot<'a>,
 	counter_overflowed: bool,
 }
 
 fn write_snapshot(
 	directory: &Path,
 	fold_id: u64,
-	snapshot: &GenericGroupedFoldSnapshot,
+	snapshot: &GenericGroupedFoldSnapshot<'_>,
 ) -> Result<(), ExecutionError> {
 	std::fs::create_dir_all(directory)
 		.map_err(|error| profile_error(format!("create profile directory: {error}")))?;
@@ -751,12 +1062,179 @@ mod tests {
 		vec![AggState::Count(value)]
 	}
 
+	fn int64_count_entries(groups: &mut BoundGroupedAggregateGroups) -> Vec<(i64, i64)> {
+		groups
+			.finalize_sorted()
+			.expect("finalize groups")
+			.iter()
+			.map(|entry| match (&entry.key[0], entry.states[0]) {
+				(GroupValue::Int64(key), AggState::Count(count)) => (*key, count),
+				other => panic!("unexpected entry {other:?}"),
+			})
+			.collect()
+	}
+
 	#[test]
 	fn disabled_profile_constructs_no_state_or_sink() {
 		let directory = test_directory("disabled");
 		let groups = BoundGroupedAggregateGroups::with_test_profile_lookup(4, |_| None);
 		assert!(!groups.profile_enabled());
 		assert!(!directory.exists());
+	}
+
+	#[test]
+	fn enabled_and_disabled_probe_ledgers_preserve_output_and_residency_telemetry() {
+		let directory = test_directory("probe_parity");
+		let mut disabled = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let mut enabled = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| {
+			Some(directory.clone().into_os_string())
+		});
+		for (key, count) in [(3, 30), (1, 10), (2, 20), (1, 11), (4, 40)] {
+			for groups in [&mut disabled, &mut enabled] {
+				let states = groups
+					.entry_or_init(vec![GroupValue::Int64(key)], 1, || Ok(count_state(count)))
+					.expect("fold group");
+				if let AggState::Count(value) = &mut states[0] {
+					*value += 1;
+				}
+			}
+		}
+
+		assert_eq!(
+			int64_count_entries(&mut disabled),
+			int64_count_entries(&mut enabled)
+		);
+		assert_eq!(
+			(
+				disabled.current_resident_bytes(),
+				disabled.peak_resident_bytes(),
+				disabled.maximum_projected_growth_peak_bytes(),
+				disabled.maximum_finalize_sort_scratch_bytes(),
+			),
+			(
+				enabled.current_resident_bytes(),
+				enabled.peak_resident_bytes(),
+				enabled.maximum_projected_growth_peak_bytes(),
+				enabled.maximum_finalize_sort_scratch_bytes(),
+			)
+		);
+		assert!(!directory.exists(), "receipt is published only at finalize");
+	}
+
+	#[test]
+	fn probe_ledger_reconciles_phase_hash_equality_and_collision_identities() {
+		let directory = test_directory("probe_reconciliation");
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| {
+			Some(directory.clone().into_os_string())
+		});
+		groups
+			.entry_or_init(vec![GroupValue::Int64(1)], 1, || Ok(count_state(10)))
+			.expect("first vacant insert");
+		groups
+			.entry_or_init(vec![GroupValue::Int64(1)], 1, || Ok(count_state(11)))
+			.expect("occupied lookup");
+
+		let mask = groups.state.buckets.len() - 1;
+		let first_bucket = (groups
+			.state
+			.hasher
+			.hash_one([GroupValue::Int64(1)].as_slice()) as usize)
+			& mask;
+		let collision = (2..10_000)
+			.find(|candidate| {
+				(groups
+					.state
+					.hasher
+					.hash_one([GroupValue::Int64(*candidate)].as_slice()) as usize)
+					& mask == first_bucket
+			})
+			.expect("find a colliding test key");
+		groups
+			.entry_or_init(vec![GroupValue::Int64(collision)], 1, || {
+				Ok(count_state(20))
+			})
+			.expect("colliding vacant insert");
+		let third = (2..10_000)
+			.find(|candidate| *candidate != collision)
+			.expect("third test key");
+		groups
+			.entry_or_init(vec![GroupValue::Int64(third)], 1, || Ok(count_state(30)))
+			.expect("growth and rehash insert");
+
+		let profile = groups.state.profile.as_ref().expect("enabled profile");
+		let occupied = &profile.probe_phases[ProbePhase::PrimaryOccupied.index()];
+		assert_eq!(occupied.hash_calls, 1);
+		assert_eq!(occupied.matching_equalities, occupied.hash_calls);
+		assert_eq!(
+			occupied.collision_mismatches,
+			occupied
+				.equality_invocations
+				.saturating_sub(occupied.matching_equalities)
+		);
+
+		for phase in [
+			ProbePhase::PrimaryVacant,
+			ProbePhase::VacantPlacement,
+			ProbePhase::Rehash,
+		] {
+			let counters = &profile.probe_phases[phase.index()];
+			assert_eq!(counters.matching_equalities, 0, "{phase:?}");
+			assert_eq!(
+				counters.collision_mismatches, counters.equality_invocations,
+				"{phase:?}"
+			);
+		}
+		for phase in [ProbePhase::VacantPlacement, ProbePhase::Rehash] {
+			let counters = &profile.probe_phases[phase.index()];
+			assert_eq!(
+				counters.equality_invocations,
+				counters.bucket_visits - counters.hash_calls,
+				"{phase:?}"
+			);
+		}
+		let total_hash_calls = profile
+			.probe_phases
+			.iter()
+			.map(|phase| phase.hash_calls)
+			.sum::<u64>();
+		assert_eq!(total_hash_calls, 8);
+		assert_eq!(
+			profile.probe_phases[ProbePhase::VacantPlacement.index()].hash_calls,
+			3
+		);
+		assert_eq!(
+			profile.probe_phases[ProbePhase::Rehash.index()].hash_calls,
+			2
+		);
+		assert_eq!(
+			profile
+				.growth_epochs
+				.iter()
+				.map(|epoch| epoch.epoch)
+				.collect::<Vec<_>>(),
+			vec![1, 2]
+		);
+	}
+
+	#[test]
+	fn probe_histogram_overflow_at_one_per_thousand_requires_widening() {
+		let mut histogram = ProbeHistogram::new();
+		let mut counter_overflowed = false;
+		for _ in 0..999 {
+			histogram.record(1, &mut counter_overflowed);
+		}
+		histogram.record(PROBE_HISTOGRAM_BIN_COUNT, &mut counter_overflowed);
+		assert!(!counter_overflowed);
+		assert_eq!(histogram.total(), 1_000);
+		assert_eq!(histogram.overflow, 1);
+		assert!(histogram.overflow_requires_widening());
+
+		let mut below_threshold = ProbeHistogram::new();
+		for _ in 0..1_000 {
+			below_threshold.record(1, &mut counter_overflowed);
+		}
+		below_threshold.record(PROBE_HISTOGRAM_BIN_COUNT, &mut counter_overflowed);
+		assert!(!below_threshold.overflow_requires_widening());
 	}
 
 	#[test]
@@ -793,9 +1271,14 @@ mod tests {
 		let snapshot: serde_json::Value =
 			serde_json::from_slice(&std::fs::read(path).expect("read profile"))
 				.expect("parse profile");
-		assert_eq!(snapshot["schema_version"], 1);
+		assert_eq!(snapshot["schema_version"], 2);
 		assert_eq!(snapshot["groups"], 3);
 		assert_eq!(snapshot["vacant_lookups"], 3);
+		assert_eq!(snapshot["probe_ledger"]["histogram_exact_max"], 1_023);
+		assert_eq!(
+			snapshot["probe_ledger"]["histogram_overflow_requires_widening"],
+			false
+		);
 		assert!(snapshot["finalize_sort_scratch_bytes"].as_u64().unwrap() > 0);
 		std::fs::remove_dir_all(directory).expect("remove profile directory");
 	}
