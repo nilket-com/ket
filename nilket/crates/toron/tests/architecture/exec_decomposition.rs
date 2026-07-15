@@ -104,6 +104,36 @@ pub(crate) fn adr435_generic_bound_grouped_fold_has_one_table_owner() {
 }
 
 #[test]
+pub(crate) fn adr438_global_fold_join_filter_profile_is_shape_owned_and_off_by_default() {
+	let manifest = manifest_dir();
+	let join =
+		std::fs::read_to_string(manifest.join("src/exec/join.rs")).expect("read exec join source");
+	let aggregate = std::fs::read_to_string(manifest.join("src/exec/aggregate.rs"))
+		.expect("read exec aggregate source");
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let profile_path = manifest.join("src/exec/join/global_fold_profile.rs");
+	let profile = std::fs::read_to_string(&profile_path).expect("read ADR 438 profile source");
+
+	assert!(join.contains("mod global_fold_profile;"));
+	assert!(profile_path.exists(), "missing ADR 438 profile owner");
+	assert!(profile.contains("TORON_GLOBAL_FOLD_JOIN_FILTER_PROFILE_DIR"));
+	assert!(profile.contains("return Ok(None);"));
+	assert!(profile.contains("active_leaf: Option<GlobalFoldProfileLeaf>"));
+	assert!(profile.contains("checked_sub(leaf_total)"));
+	assert!(profile.contains("M -> S reconciliation failed"));
+	assert!(streaming.contains("partitioned_streamed_scan_build_scan_probe"));
+	assert!(streaming.contains("GlobalFoldProfileLeaf::PredicateEvalFilter"));
+	assert!(aggregate.contains("GlobalFoldProfileLeaf::DecimalExpr"));
+	assert!(aggregate.contains("GlobalFoldProfileLeaf::NumericFold"));
+	assert!(streaming.contains("profile.persist()?"));
+	assert!(
+		!profile.contains("q19") && !streaming.contains("TORON_Q19"),
+		"ADR 438 profiler must stay query-neutral"
+	);
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 

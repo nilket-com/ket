@@ -3,6 +3,7 @@ use super::*;
 mod build_profile;
 mod build_rows;
 mod columns;
+mod global_fold_profile;
 mod residency_profile;
 mod spill;
 mod spill_placement;
@@ -17,6 +18,9 @@ pub(super) use self::build_rows::{
 	new_join_build_rows,
 };
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
+pub(in crate::exec) use self::global_fold_profile::{
+	GlobalFoldJoinFilterProfile, GlobalFoldProfileLeaf,
+};
 pub(in crate::exec) use self::spill::SpilledInnerJoinResidencySnapshot;
 pub(in crate::exec) use self::spill::{PinnedSpilledInnerBuildStats, SpilledInnerJoinBuild};
 pub(in crate::exec) use self::spill::{
@@ -2470,7 +2474,7 @@ pub(super) async fn probe_streamed_spilled_inner_join(
 	memory_cap: u64,
 ) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
 	let mut output = Vec::new();
-	let (probe_rows, output_rows) = visit_streamed_spilled_inner_join_chunks(
+	let (probe_rows, output_rows) = streaming::visit_streamed_spilled_inner_join_chunks(
 		spilled,
 		right_batches,
 		right_keys,
@@ -2493,62 +2497,6 @@ pub(super) async fn probe_streamed_spilled_inner_join(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn visit_streamed_spilled_inner_join_chunks<F>(
-	spilled: &mut SpilledInnerJoinBuild,
-	right_batches: &[RecordBatch],
-	right_keys: &[crate::ir::ColumnOrdinal],
-	key_plan: JoinKeyPlan,
-	null_safe_keys: bool,
-	output_schema: &arrow::datatypes::SchemaRef,
-	memory_cap: u64,
-	mut visit_batch: F,
-) -> Result<(u64, u64), ExecutionError>
-where
-	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
-{
-	let mut probe_rows = 0u64;
-	let mut output_rows = 0u64;
-	let _pin_admitted = spilled
-		.try_pin_decoded_pages(memory_cap)
-		.await?
-		.is_admitted();
-	for batch in right_batches {
-		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
-			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
-			let probe_chunk = batch.slice(offset, len);
-			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
-			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
-			let mut matches = Vec::new();
-			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
-				else {
-					continue;
-				};
-				for build in spilled.lookup(&key).await? {
-					matches.push(SpilledInnerJoinMatch {
-						build,
-						probe: join_probe_row_index(row)?,
-					});
-				}
-			}
-			let page_map = streaming::load_streamed_inner_match_pages(spilled, &matches).await?;
-			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
-				let batch = materialize_streamed_spilled_inner_matches(
-					&page_map,
-					&probe_chunk,
-					chunk,
-					output_schema,
-					memory_cap,
-				)?;
-				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
-				visit_batch(batch)?;
-			}
-		}
-	}
-	Ok((probe_rows, output_rows))
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn visit_streamed_spilled_inner_join_filtered_chunks<F>(
 	executor: &Executor,
 	spilled: &mut SpilledInnerJoinBuild,
@@ -2564,7 +2512,7 @@ pub(super) async fn visit_streamed_spilled_inner_join_filtered_chunks<F>(
 where
 	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 {
-	visit_streamed_spilled_inner_join_chunks(
+	streaming::visit_streamed_spilled_inner_join_chunks(
 		spilled,
 		right_batches,
 		right_keys,
@@ -2601,7 +2549,7 @@ pub(super) async fn fold_streamed_spilled_inner_join_into_global_aggregate(
 	aggregate_state: &mut [AggState],
 	memory_cap: u64,
 ) -> Result<(u64, u64), ExecutionError> {
-	visit_streamed_spilled_inner_join_chunks(
+	streaming::visit_streamed_spilled_inner_join_chunks(
 		spilled,
 		right_batches,
 		right_keys,

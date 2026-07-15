@@ -810,6 +810,69 @@ impl Executor {
 		}
 		Ok(())
 	}
+
+	pub(in crate::exec) fn fold_global_decimal_sum_state_profiled(
+		&self,
+		state: &mut [AggState],
+		aggr_expr: &[BoundAggregateCall],
+		batch: &RecordBatch,
+		profile: &super::join::GlobalFoldJoinFilterProfile,
+	) -> Result<(), ExecutionError> {
+		let [state] = state else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "profiled global Decimal SUM expected one accumulator".to_string(),
+			});
+		};
+		let [call] = aggr_expr else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "profiled global Decimal SUM expected one aggregate call".to_string(),
+			});
+		};
+		if call.function != AggregateFunction::Sum {
+			return Err(ExecutionError::InvalidExpression {
+				message: "profiled global Decimal SUM reached a non-SUM call".to_string(),
+			});
+		}
+
+		let expression_timer =
+			profile.begin_leaf(super::join::GlobalFoldProfileLeaf::DecimalExpr)?;
+		let evaluated = self.evaluate_bound_single_root(&call.args, batch, "SUM arg");
+		expression_timer.finish()?;
+		let arr = evaluated?;
+		profile.record_sum_argument_rows(batch.num_rows())?;
+
+		let fold_timer = profile.begin_leaf(super::join::GlobalFoldProfileLeaf::NumericFold)?;
+		let folded = (|| {
+			for row in 0..batch.num_rows() {
+				if let Some(value) = numeric_value(&arr, row)? {
+					add_sum_value(state, value)?;
+				}
+			}
+			Ok::<(), ExecutionError>(())
+		})();
+		fold_timer.finish()?;
+		folded?;
+		profile.record_numeric_fold_rows(batch.num_rows())
+	}
+}
+
+pub(in crate::exec) fn global_fold_join_filter_profile_eligible(
+	join_filter_predicate: Option<&BoundExprProgram>,
+	project: Option<(&BoundExprProgram, &SchemaRef)>,
+	project_filter_predicate: Option<&BoundExprProgram>,
+	aggr_expr: &[BoundAggregateCall],
+) -> bool {
+	let Some(_) = join_filter_predicate else {
+		return false;
+	};
+	if project.is_some() || project_filter_predicate.is_some() {
+		return false;
+	}
+	let [call] = aggr_expr else {
+		return false;
+	};
+	call.function == AggregateFunction::Sum
+		&& matches!(call.args.root_type(0), Some(DataType::Decimal128(_, _)))
 }
 
 fn primitive_int64_sum_spec(
@@ -2757,6 +2820,61 @@ mod tests {
 		});
 		builder.push_root(column);
 		builder.build()
+	}
+
+	#[test]
+	fn profiled_decimal_sum_preserves_unprofiled_output() {
+		let input_schema = Arc::new(Schema::new(vec![Field::new(
+			"amount",
+			DataType::Decimal128(15, 2),
+			false,
+		)]));
+		let amounts = Decimal128Array::from(vec![Some(125i128), Some(250), Some(-25)])
+			.with_precision_and_scale(15, 2)
+			.expect("decimal input");
+		let batch = RecordBatch::try_new(input_schema, vec![Arc::new(amounts)])
+			.expect("profile parity input");
+		let calls = vec![BoundAggregateCall {
+			function: AggregateFunction::Sum,
+			args: column_program(
+				"amount",
+				ColumnOrdinal(0),
+				DataType::Decimal128(15, 2),
+				false,
+			),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![Field::new(
+			"sum_amount",
+			DataType::Decimal128(25, 2),
+			true,
+		)]));
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let mut unprofiled = init_global_aggregate_state(&calls).expect("unprofiled state");
+		executor
+			.fold_global_aggregate_state(&mut unprofiled, &calls, &batch)
+			.expect("unprofiled fold");
+
+		let predicate = column_program("flag", ColumnOrdinal(0), DataType::Boolean, false);
+		let profile = super::join::GlobalFoldJoinFilterProfile::at_test_directory(
+			std::env::temp_dir().join(format!("toron_global_fold_parity_{}", std::process::id())),
+			&predicate,
+		)
+		.expect("test profile");
+		let root = profile.begin_root().expect("begin profile root");
+		let mut profiled = init_global_aggregate_state(&calls).expect("profiled state");
+		executor
+			.fold_global_decimal_sum_state_profiled(&mut profiled, &calls, &batch, &profile)
+			.expect("profiled fold");
+		profile.finish_root(root).expect("finish profile root");
+
+		assert_eq!(
+			finalize_global_aggregate_state(&unprofiled, &calls, &output_schema)
+				.expect("unprofiled output"),
+			finalize_global_aggregate_state(&profiled, &calls, &output_schema)
+				.expect("profiled output")
+		);
 	}
 
 	#[test]

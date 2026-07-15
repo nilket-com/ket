@@ -2204,6 +2204,120 @@ pub(super) async fn load_streamed_inner_match_pages(
 	Ok(pages)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn visit_streamed_spilled_inner_join_chunks<F>(
+	spilled: &mut SpilledInnerJoinBuild,
+	right_batches: &[RecordBatch],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	key_plan: JoinKeyPlan,
+	null_safe_keys: bool,
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+	mut visit_batch: F,
+) -> Result<(u64, u64), ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	visit_streamed_spilled_inner_join_chunks_profiled(
+		spilled,
+		right_batches,
+		right_keys,
+		key_plan,
+		null_safe_keys,
+		output_schema,
+		memory_cap,
+		None,
+		&mut visit_batch,
+	)
+	.await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn visit_streamed_spilled_inner_join_chunks_profiled<F>(
+	spilled: &mut SpilledInnerJoinBuild,
+	right_batches: &[RecordBatch],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	key_plan: JoinKeyPlan,
+	null_safe_keys: bool,
+	output_schema: &arrow::datatypes::SchemaRef,
+	memory_cap: u64,
+	profile: Option<&GlobalFoldJoinFilterProfile>,
+	mut visit_batch: F,
+) -> Result<(u64, u64), ExecutionError>
+where
+	F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
+{
+	let mut probe_rows = 0u64;
+	let mut output_rows = 0u64;
+	let pin_timer = profile
+		.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
+		.transpose()?;
+	let pin = spilled.try_pin_decoded_pages(memory_cap).await;
+	if let Some(timer) = pin_timer {
+		timer.finish()?;
+	}
+	let _pin_admitted = pin?.is_admitted();
+	for batch in right_batches {
+		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
+			let probe_chunk = batch.slice(offset, len);
+			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+			let selection_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ProbeLookupSelect))
+				.transpose()?;
+			let selection = async {
+				let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+				let mut matches = Vec::new();
+				for row in 0..probe_chunk.num_rows() {
+					let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+					else {
+						continue;
+					};
+					for build in spilled.lookup(&key).await? {
+						matches.push(SpilledInnerJoinMatch {
+							build,
+							probe: join_probe_row_index(row)?,
+						});
+					}
+				}
+				Ok::<Vec<SpilledInnerJoinMatch>, ExecutionError>(matches)
+			}
+			.await;
+			if let Some(timer) = selection_timer {
+				timer.finish()?;
+			}
+			let matches = selection?;
+			let page_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
+				.transpose()?;
+			let page_map = load_streamed_inner_match_pages(spilled, &matches).await;
+			if let Some(timer) = page_timer {
+				timer.finish()?;
+			}
+			let page_map = page_map?;
+			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let materialize_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ArrowMaterialize))
+					.transpose()?;
+				let materialized = materialize_streamed_spilled_inner_matches(
+					&page_map,
+					&probe_chunk,
+					chunk,
+					output_schema,
+					memory_cap,
+				);
+				if let Some(timer) = materialize_timer {
+					timer.finish()?;
+				}
+				let batch = materialized?;
+				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
+				visit_batch(batch)?;
+			}
+		}
+	}
+	Ok((probe_rows, output_rows))
+}
+
 fn materialize_projected_streamed_spilled_inner_matches(
 	page_map: &BTreeMap<usize, RecordBatch>,
 	probe_batch: &RecordBatch,
@@ -3981,8 +4095,12 @@ impl Executor {
 		let accumulator_cap =
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
 		let mut accumulated_bytes = 0u64;
-		let matched = self
-			.try_visit_streaming_join0_chunks(preserved_join, preserved_filter, morsel, |batch| {
+		let matched = Box::pin(self.try_visit_streaming_join0_chunks(
+			preserved_join,
+			preserved_filter,
+			morsel,
+			None,
+			|batch| {
 				for (partition, partitioned) in self.repartition_exchange_batch(
 					&batch,
 					*partition_count,
@@ -4003,8 +4121,9 @@ impl Executor {
 					}
 				}
 				Ok(())
-			})
-			.await?;
+			},
+		))
+		.await?;
 		if matched.is_none() {
 			return Ok(None);
 		}
@@ -4278,8 +4397,14 @@ impl Executor {
 		if disposition == FilterDisposition::FullyPushed {
 			return Ok(None);
 		}
-		self.try_visit_streaming_join0_chunks(input, Some(predicate), morsel, visit_filtered_batch)
-			.await
+		Box::pin(self.try_visit_streaming_join0_chunks(
+			input,
+			Some(predicate),
+			morsel,
+			None,
+			visit_filtered_batch,
+		))
+		.await
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -4298,6 +4423,7 @@ impl Executor {
 		filter_predicate: Option<&BoundExprProgram>,
 		probe_columns_first: bool,
 		morsel: Option<(MorselId, u32)>,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<Option<()>, ExecutionError>
 	where
@@ -4340,6 +4466,8 @@ impl Executor {
 				join_filter_predicate,
 				probe_columns_first,
 				morsel,
+				replay_id,
+				profile,
 				&mut *visit_batch,
 			)
 			.await?
@@ -4407,6 +4535,7 @@ impl Executor {
 					probe_columns_first,
 					build_plan.schema().fields().len(),
 					morsel,
+					profile,
 					visit_batch,
 				)
 				.await;
@@ -4528,6 +4657,7 @@ impl Executor {
 					probe_columns_first,
 					build_plan.schema().fields().len(),
 					morsel,
+					profile,
 					visit_batch,
 				)
 				.await;
@@ -4655,6 +4785,8 @@ impl Executor {
 		filter_predicate: Option<&BoundExprProgram>,
 		probe_columns_first: bool,
 		morsel: Option<(MorselId, u32)>,
+		replay_id: JoinReplayId,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<Option<(u64, u64, u64)>, ExecutionError>
 	where
@@ -4666,6 +4798,9 @@ impl Executor {
 		let Some(build_scan_input) = decompose_streaming_scan_probe_input(build_plan) else {
 			return Ok(None);
 		};
+		let estimate_timer = profile
+			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
+			.transpose()?;
 		let estimated_build_bytes = self
 			.estimate_streaming_scan_inner_build_bytes(
 				build_scan_input,
@@ -4674,11 +4809,18 @@ impl Executor {
 				null_safe_keys,
 				morsel,
 			)
-			.await?;
+			.await;
+		if let Some(timer) = estimate_timer {
+			timer.finish()?;
+		}
+		let estimated_build_bytes = estimated_build_bytes?;
 		if estimated_build_bytes <= self.context.task_budget.memory.get() {
 			return Ok(None);
 		}
-		let (partition_count, group_count, _max_group_spill) = self
+		let partition_timer = profile
+			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
+			.transpose()?;
+		let partitioning = self
 			.choose_streaming_scan_inner_build_partitioning(
 				estimated_build_bytes,
 				build_scan_input,
@@ -4688,9 +4830,22 @@ impl Executor {
 				null_safe_keys,
 				morsel,
 			)
-			.await?;
+			.await;
+		if let Some(timer) = partition_timer {
+			timer.finish()?;
+		}
+		let (partition_count, group_count, _max_group_spill) = partitioning?;
 		if partition_count <= 1 {
 			return Ok(None);
+		}
+		if let Some(profile) = profile {
+			profile.record_dispatch(
+				"partitioned_streamed_scan_build_scan_probe",
+				replay_id,
+				probe_columns_first,
+				&build_plan.schema(),
+				&probe_plan.schema(),
+			)?;
 		}
 		let key_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
 			&build_plan.schema(),
@@ -4710,6 +4865,9 @@ impl Executor {
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
 		for group in 0..group_count {
+			let group_build_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
+				.transpose()?;
 			let group_range = partition_group_bounds(partition_count, group_count, group)?;
 			let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
 				(0..partition_count).map(|_| None).collect();
@@ -4799,6 +4957,9 @@ impl Executor {
 				task.counters.spill_bytes =
 					task.counters.spill_bytes.saturating_add(group_spill_bytes);
 			});
+			if let Some(timer) = group_build_timer {
+				timer.finish()?;
+			}
 
 			let probe_started = Instant::now();
 			let result = self
@@ -4818,6 +4979,7 @@ impl Executor {
 					probe_columns_first,
 					build_plan.schema().fields().len(),
 					morsel,
+					profile,
 					visit_batch,
 				)
 				.await;
@@ -4838,7 +5000,13 @@ impl Executor {
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 				task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 			});
+			let cleanup_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
+				.transpose()?;
 			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+			if let Some(timer) = cleanup_timer {
+				timer.finish()?;
+			}
 		}
 		Ok(Some((
 			total_build_rows,
@@ -5068,6 +5236,7 @@ impl Executor {
 							false,
 							build_schema.fields().len(),
 							None,
+							None,
 							visit_batch,
 						)
 						.await?;
@@ -5295,6 +5464,7 @@ impl Executor {
 					probe_columns_first,
 					build_plan.schema().fields().len(),
 					morsel,
+					None,
 					visit_batch,
 				)
 				.await;
@@ -6084,6 +6254,7 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		morsel: Option<(MorselId, u32)>,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
@@ -6105,33 +6276,63 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
-				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+			loop {
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let next = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
+				}
+				let Some(batch) = next else {
 					break;
 				};
-				if let Some(predicate) = scan_input.filter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"filter predicate",
-					)?;
-					if batch.num_rows() == 0 {
-						continue;
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let prepared = (|| {
+					let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+						return Ok(None);
+					};
+					if let Some(predicate) = scan_input.filter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"filter predicate",
+						)?;
 					}
-				}
-				if let Some(predicate) = probe_prefilter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"probe filter predicate",
-					)?;
 					if batch.num_rows() == 0 {
-						continue;
+						return Ok(None);
 					}
+					if let Some(predicate) = probe_prefilter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"probe filter predicate",
+						)?;
+					}
+					Ok::<Option<RecordBatch>, ExecutionError>(
+						(batch.num_rows() > 0).then_some(batch),
+					)
+				})();
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
 				}
-				for (_, partitioned) in
-					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
-				{
+				let Some(batch) = prepared? else {
+					if remaining == Some(0) {
+						break;
+					}
+					continue;
+				};
+				let partition_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ProbeLookupSelect))
+					.transpose()?;
+				let partitioned =
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key);
+				if let Some(timer) = partition_timer {
+					timer.finish()?;
+				}
+				for (_, partitioned) in partitioned? {
 					let (batch_probe_rows, batch_output_rows) = self
 						.visit_streaming_spilled_inner_probe_batch(
 							spilled,
@@ -6145,6 +6346,7 @@ impl Executor {
 							probe_columns_first,
 							build_column_count,
 							None,
+							profile,
 							&mut *visit_batch,
 						)
 						.await?;
@@ -6203,6 +6405,7 @@ impl Executor {
 						probe_columns_first,
 						build_column_count,
 						None,
+						profile,
 						&mut *visit_batch,
 					)
 					.await?;
@@ -6231,6 +6434,7 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		morsel: Option<(MorselId, u32)>,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
@@ -6252,33 +6456,63 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
-				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+			loop {
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let next = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
+				}
+				let Some(batch) = next else {
 					break;
 				};
-				if let Some(predicate) = scan_input.filter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"filter predicate",
-					)?;
-					if batch.num_rows() == 0 {
-						continue;
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let prepared = (|| {
+					let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+						return Ok(None);
+					};
+					if let Some(predicate) = scan_input.filter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"filter predicate",
+						)?;
 					}
-				}
-				if let Some(predicate) = probe_prefilter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"probe filter predicate",
-					)?;
 					if batch.num_rows() == 0 {
-						continue;
+						return Ok(None);
 					}
+					if let Some(predicate) = probe_prefilter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"probe filter predicate",
+						)?;
+					}
+					Ok::<Option<RecordBatch>, ExecutionError>(
+						(batch.num_rows() > 0).then_some(batch),
+					)
+				})();
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
 				}
-				for (_, partitioned) in
-					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
-				{
+				let Some(batch) = prepared? else {
+					if remaining == Some(0) {
+						break;
+					}
+					continue;
+				};
+				let partition_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ProbeLookupSelect))
+					.transpose()?;
+				let partitioned =
+					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key);
+				if let Some(timer) = partition_timer {
+					timer.finish()?;
+				}
+				for (_, partitioned) in partitioned? {
 					let (batch_probe_rows, batch_output_rows) = self
 						.visit_partitioned_streaming_scan_probe_batch(
 							partitioned_builds,
@@ -6294,6 +6528,7 @@ impl Executor {
 							filter_predicate,
 							probe_columns_first,
 							build_column_count,
+							profile,
 							visit_batch,
 						)
 						.await?;
@@ -6315,30 +6550,54 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
-				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+			loop {
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let next = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
+				}
+				let Some(batch) = next else {
 					break;
 				};
-				if let Some(predicate) = scan_input.filter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"filter predicate",
-					)?;
-					if batch.num_rows() == 0 {
-						continue;
+				let scan_timer = profile
+					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ScanPollDecode))
+					.transpose()?;
+				let prepared = (|| {
+					let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+						return Ok(None);
+					};
+					if let Some(predicate) = scan_input.filter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"filter predicate",
+						)?;
 					}
-				}
-				if let Some(predicate) = probe_prefilter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"probe filter predicate",
-					)?;
 					if batch.num_rows() == 0 {
-						continue;
+						return Ok(None);
 					}
+					if let Some(predicate) = probe_prefilter_predicate {
+						batch = self.filter_batch_with_bound_predicate(
+							predicate,
+							batch,
+							"probe filter predicate",
+						)?;
+					}
+					Ok::<Option<RecordBatch>, ExecutionError>(
+						(batch.num_rows() > 0).then_some(batch),
+					)
+				})();
+				if let Some(timer) = scan_timer {
+					timer.finish()?;
 				}
+				let Some(batch) = prepared? else {
+					if remaining == Some(0) {
+						break;
+					}
+					continue;
+				};
 				let (batch_probe_rows, batch_output_rows) = self
 					.visit_partitioned_streaming_scan_probe_batch(
 						partitioned_builds,
@@ -6354,6 +6613,7 @@ impl Executor {
 						filter_predicate,
 						probe_columns_first,
 						build_column_count,
+						profile,
 						visit_batch,
 					)
 					.await?;
@@ -6380,23 +6640,31 @@ impl Executor {
 		filter_predicate: Option<&BoundExprProgram>,
 		probe_columns_first: bool,
 		build_column_count: usize,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
-		let buckets = precompute_join_partition_buckets(
-			batch,
-			right_keys,
-			partition_count,
-			null_safe_keys,
-			false,
-		)?;
+		let partition_timer = profile
+			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ProbeLookupSelect))
+			.transpose()?;
+		let partitioned = (|| {
+			let buckets = precompute_join_partition_buckets(
+				batch,
+				right_keys,
+				partition_count,
+				null_safe_keys,
+				false,
+			)?;
+			partition_streaming_join_batch_with_buckets(batch, &buckets, partition_count)
+		})();
+		if let Some(timer) = partition_timer {
+			timer.finish()?;
+		}
 		let mut probe_rows = 0u64;
 		let mut output_rows = 0u64;
-		for (partition, partitioned) in
-			partition_streaming_join_batch_with_buckets(batch, &buckets, partition_count)?
-		{
+		for (partition, partitioned) in partitioned? {
 			if partition < partition_start || partition >= partition_end {
 				continue;
 			}
@@ -6422,6 +6690,7 @@ impl Executor {
 					probe_columns_first,
 					build_column_count,
 					None,
+					profile,
 					visit_batch,
 				)
 				.await?;
@@ -6445,31 +6714,56 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		projection: Option<&ProjectedInnerBuildProjection>,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
 		let mut visit_output = |batch: RecordBatch| -> Result<(), ExecutionError> {
-			let batch = if probe_columns_first {
-				reorder_spilled_inner_probe_before_build(batch, build_column_count, output_schema)?
+			let materialize_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ArrowMaterialize))
+				.transpose()?;
+			let reordered = if probe_columns_first {
+				reorder_spilled_inner_probe_before_build(batch, build_column_count, output_schema)
 			} else {
-				batch
+				Ok(batch)
 			};
-			let batch = if let Some(predicate) = filter_predicate {
-				self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
+			if let Some(timer) = materialize_timer {
+				timer.finish()?;
+			}
+			let batch = reordered?;
+			let predicate_input_rows = batch.num_rows();
+			let predicate_timer = profile
+				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::PredicateEvalFilter))
+				.transpose()?;
+			let filtered = if let Some(predicate) = filter_predicate {
+				self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")
 			} else {
-				batch
+				Ok(batch)
 			};
+			if let Some(timer) = predicate_timer {
+				timer.finish()?;
+			}
+			let batch = filtered?;
+			if let Some(profile) = profile {
+				profile.record_predicate_rows(predicate_input_rows, batch.num_rows())?;
+			}
 			if batch.num_rows() > 0 {
 				visit_batch(batch)?;
 			}
 			Ok(())
 		};
-		let _pin_admitted = spilled
+		let pin_timer = profile
+			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
+			.transpose()?;
+		let pin = spilled
 			.try_pin_decoded_pages(self.context.task_budget.memory.get())
-			.await?
-			.is_admitted();
+			.await;
+		if let Some(timer) = pin_timer {
+			timer.finish()?;
+		}
+		let _pin_admitted = pin?.is_admitted();
 		if let Some(projection) = projection {
 			visit_projected_streamed_spilled_inner_join_chunks(
 				spilled,
@@ -6485,7 +6779,7 @@ impl Executor {
 			)
 			.await
 		} else {
-			visit_streamed_spilled_inner_join_chunks(
+			visit_streamed_spilled_inner_join_chunks_profiled(
 				spilled,
 				std::slice::from_ref(probe_batch),
 				right_keys,
@@ -6493,6 +6787,7 @@ impl Executor {
 				null_safe_keys,
 				materialized_output_schema,
 				self.context.task_budget.memory.get(),
+				profile,
 				&mut visit_output,
 			)
 			.await
@@ -6679,6 +6974,7 @@ impl Executor {
 		input: &ExecutionPlan,
 		filter_predicate: Option<&BoundExprProgram>,
 		morsel: Option<(MorselId, u32)>,
+		profile: Option<&GlobalFoldJoinFilterProfile>,
 		mut visit_batch: F,
 	) -> Result<Option<()>, ExecutionError>
 	where
@@ -6725,6 +7021,7 @@ impl Executor {
 						filter_predicate,
 						true,
 						morsel,
+						profile,
 						&mut visit_batch,
 					)
 					.await?
@@ -6748,6 +7045,7 @@ impl Executor {
 					filter_predicate,
 					true,
 					morsel,
+					profile,
 					&mut visit_batch,
 				)
 				.await?
@@ -6774,6 +7072,7 @@ impl Executor {
 						filter_predicate,
 						false,
 						morsel,
+						profile,
 						&mut visit_batch,
 					)
 					.await?
@@ -6800,6 +7099,7 @@ impl Executor {
 					filter_predicate,
 					false,
 					morsel,
+					profile,
 					&mut visit_batch,
 				)
 				.await?
@@ -8092,8 +8392,31 @@ impl Executor {
 		};
 
 		let mut state = init_global_aggregate_state(aggr_expr)?;
-		if self
-			.try_visit_streaming_join0_chunks(join, join_filter_predicate, morsel, |batch| {
+		let profile = if crate::exec::aggregate::global_fold_join_filter_profile_eligible(
+			join_filter_predicate,
+			project,
+			project_filter_predicate,
+			aggr_expr,
+		) {
+			GlobalFoldJoinFilterProfile::from_env(
+				join_filter_predicate.expect("eligible profile requires a join filter"),
+			)?
+		} else {
+			None
+		};
+		let profile_ref = profile.as_deref();
+		let root_started = profile_ref
+			.map(GlobalFoldJoinFilterProfile::begin_root)
+			.transpose()?;
+		// ADR 438: the profiled visitor carries several timer-bearing join futures. Keep this parent
+		// aggregate future pointer-sized so deep reoriented plan chains do not stack every child state
+		// machine inline (the same bounded-future discipline as the boxed profile state itself).
+		let visited = Box::pin(self.try_visit_streaming_join0_chunks(
+			join,
+			join_filter_predicate,
+			morsel,
+			profile_ref,
+			|batch| {
 				let batch = if let Some((exprs, project_schema)) = project {
 					let cols = self.evaluate_bound_program(exprs, &batch)?;
 					RecordBatch::try_new(project_schema.clone(), cols)?
@@ -8107,14 +8430,33 @@ impl Executor {
 				};
 				if batch.num_rows() == 0 {
 					Ok(())
+				} else if let Some(profile) = profile_ref {
+					self.fold_global_decimal_sum_state_profiled(
+						&mut state, aggr_expr, &batch, profile,
+					)
 				} else {
 					self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)
 				}
-			})
-			.await?
-			.is_some()
-		{
-			return finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some);
+			},
+		))
+		.await;
+		if let (Some(profile), Some(started)) = (profile_ref, root_started) {
+			profile.finish_root(started)?;
+		}
+		let visited = visited?;
+		if visited.is_some() {
+			let output = finalize_global_aggregate_state(&state, aggr_expr, output_schema)?;
+			if let Some(profile) = profile_ref {
+				profile.persist()?;
+			}
+			return Ok(Some(output));
+		}
+		if profile.is_some() {
+			return Err(ExecutionError::Kernel {
+				message:
+					"global fold join/filter profile did not reach its confirmed fused dispatch"
+						.to_string(),
+			});
 		}
 		if project.is_some() {
 			return Ok(None);
@@ -12166,6 +12508,7 @@ impl Executor {
 							spec.probe_columns_first,
 							spec.build_column_count,
 							spec.projection.as_ref(),
+							None,
 							&mut |batch| {
 								batches.push(batch);
 								Ok(())
@@ -13828,8 +14171,12 @@ impl Executor {
 			other => (other, None),
 		};
 
-		let matched = self
-			.try_visit_streaming_join0_chunks(join0, filter_predicate, morsel, |batch| {
+		let matched = Box::pin(self.try_visit_streaming_join0_chunks(
+			join0,
+			filter_predicate,
+			morsel,
+			None,
+			|batch| {
 				for (_partition, partitioned) in
 					self.repartition_exchange_batch(&batch, *partition_count, key)?
 				{
@@ -13838,8 +14185,9 @@ impl Executor {
 					}
 				}
 				Ok(())
-			})
-			.await?;
+			},
+		))
+		.await?;
 		if matched.is_none() {
 			return Ok(None);
 		}
@@ -14047,6 +14395,7 @@ impl Executor {
 							runtime.probe_columns_first,
 							*build_column_count,
 							projection.as_ref(),
+							None,
 							&mut |batch| {
 								output.push(batch);
 								Ok(())
@@ -14590,6 +14939,7 @@ impl Executor {
 							probe_columns_first,
 							build_column_count,
 							projection,
+							None,
 							&mut |batch| {
 								partition_output.push(batch);
 								Ok(())
@@ -14943,6 +15293,7 @@ impl Executor {
 								probe_columns_first,
 								build_column_count,
 								projection,
+								None,
 								&mut |batch| {
 									partition_output.push(batch);
 									Ok(())
@@ -17471,7 +17822,7 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, |batch| {
+			.try_visit_streaming_join0_chunks(&join, None, None, None, |batch| {
 				visited.push(batch);
 				Ok(())
 			})
@@ -17598,7 +17949,7 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, |batch| {
+			.try_visit_streaming_join0_chunks(&join, None, None, None, |batch| {
 				visited.push(batch);
 				Ok(())
 			})
