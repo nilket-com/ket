@@ -15,8 +15,8 @@ use toron::distributed::budget::ByteCount;
 use toron::error::{BindingError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
-	LogicalPlan, TableId,
+	AggregateFunction, BoundExprNode, BoundExprProgram, ExecutionPlan, Expr, FilterDisposition,
+	JoinKind, JoinStrategy, JoinStrategyIntent, LogicalPlan, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -419,6 +419,153 @@ async fn adr319_or_branch_key_extraction_matches_explicit_factored_filter() {
 }
 
 #[tokio::test]
+async fn adr440_common_or_side_predicate_routes_to_scan_child() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND right_t.right_value = 23 AND left_t.left_value = 'small') \
+			    OR (right_t.right_value = 23 AND right_t.id = left_t.id AND left_t.left_value = 'large') \
+			    OR (left_t.id = right_t.id AND left_t.id = 30 AND right_t.right_value = 23)",
+		)
+		.expect("plan common side-local OR conjunct");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("bind common side-local OR conjunct");
+
+	let (predicate, disposition) = scan_filter_for_table(&bound, TableId(2))
+		.expect("common right-side conjunct should reach the right scan boundary");
+	assert!(matches!(
+		disposition,
+		FilterDisposition::FullyPushed | FilterDisposition::EvaluateInToron
+	));
+	assert!(
+		program_contains_column_named(predicate, "right_value"),
+		"the routed scan filter must contain the common right-side predicate"
+	);
+}
+
+#[tokio::test]
+async fn adr440_common_or_predicate_missing_from_one_arm_stays_above_join() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND right_t.right_value = 23 AND left_t.left_value = 'small') \
+			    OR (right_t.id = left_t.id AND right_t.right_value = 23 AND left_t.left_value = 'large') \
+			    OR (left_t.id = right_t.id AND right_t.right_value = 34)",
+		)
+		.expect("plan non-common side-local OR conjunct");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("bind non-common side-local OR conjunct");
+
+	assert!(
+		scan_filter_for_table(&bound, TableId(2)).is_none(),
+		"a conjunct absent from one arm must not be routed to the scan"
+	);
+}
+
+#[tokio::test]
+async fn adr440_common_or_factoring_preserves_nullable_three_valued_logic() {
+	let extracted = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE (left_n.k = right_n.k AND left_n.left_value = 'small' AND right_n.right_value = 23) \
+		    OR (right_n.right_value = 34 AND right_n.k = left_n.k AND left_n.left_value = 'small') \
+		    OR (left_n.left_value = 'small' AND left_n.k = right_n.k AND right_n.right_value = 99) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+	let explicit = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE left_n.k = right_n.k \
+		   AND left_n.left_value = 'small' \
+		   AND (right_n.right_value = 23 OR right_n.right_value = 34 OR right_n.right_value = 99) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+
+	assert_eq!(int64_int32_rows(&extracted), int64_int32_rows(&explicit));
+	assert_eq!(
+		int64_int32_rows(&extracted),
+		vec![(1, 23), (1, 34), (3, 99)]
+	);
+}
+
+#[tokio::test]
+async fn adr440_common_or_duplicate_and_reordered_conjuncts_remove_one_occurrence_per_arm() {
+	let extracted = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE (left_n.left_value = 'small' AND left_n.k = right_n.k AND left_n.left_value = 'small' AND right_n.right_value = 23) \
+		    OR (right_n.right_value = 34 AND left_n.left_value = 'small' AND right_n.k = left_n.k) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+	let explicit = run_cross_sql(
+		"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+		 WHERE left_n.k = right_n.k AND left_n.left_value = 'small' \
+		   AND ((left_n.left_value = 'small' AND right_n.right_value = 23) OR right_n.right_value = 34) \
+		 ORDER BY left_n.k, right_n.right_value",
+	)
+	.await;
+
+	assert_eq!(int64_int32_rows(&extracted), int64_int32_rows(&explicit));
+	assert_eq!(int64_int32_rows(&extracted), vec![(1, 23), (1, 34)]);
+}
+
+#[tokio::test]
+async fn adr440_common_or_empty_reduced_arm_removes_the_residual_or() {
+	let catalog = nullable_key_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT left_n.k, right_n.right_value FROM left_n, right_n \
+			 WHERE (left_n.k = right_n.k AND left_n.left_value = 'small') \
+			    OR (right_n.k = left_n.k AND left_n.left_value = 'small' AND right_n.right_value = 23)",
+		)
+		.expect("plan empty reduced OR arm");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("bind empty reduced OR arm");
+	let result = Executor::new(Arc::new(CrossFixtureScan {
+		batches: HashMap::from([
+			(TableId(21), nullable_left_batch()),
+			(TableId(22), nullable_right_batch()),
+		]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute empty reduced OR arm");
+	let batch = result.first().expect("result batch");
+
+	assert_eq!(int64_int32_rows(batch), vec![(1, 23), (1, 34), (3, 99)]);
+	assert_eq!(
+		filter_count(&bound),
+		1,
+		"the empty reduced arm must leave only the routed child filter"
+	);
+}
+
+#[tokio::test]
+async fn adr440_common_or_unsafe_side_predicate_stays_above_join() {
+	let catalog = cross_catalog(Some(64 * 1024 * 1024));
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM left_t, right_t \
+			 WHERE (left_t.id = right_t.id AND left_t.id + 0 > 0 AND right_t.right_value = 23) \
+			    OR (right_t.id = left_t.id AND left_t.id + 0 > 0 AND right_t.right_value = 34)",
+		)
+		.expect("plan unsafe common side-local OR conjunct");
+	let bound = bind(&logical, &catalog, &auto_broadcast_config(1024 * 1024))
+		.await
+		.expect("bind unsafe common side-local OR conjunct");
+
+	assert!(
+		scan_filter_for_table(&bound, TableId(1)).is_none(),
+		"an expression rejected by the pushdown-safety guard must stay above the join"
+	);
+}
+
+#[tokio::test]
 async fn adr270_unsupported_join_key_type_stays_residual_filter() {
 	// Float join keys are explicitly unsupported by the keyed-join path. Pre-270, this query could still
 	// bind as a small broadcast Cross plus residual Float equality filter. ADR 270 must not turn that
@@ -603,6 +750,55 @@ fn int64_int32_rows(batch: &RecordBatch) -> Vec<(i64, i32)> {
 		rows.push((ids.value(row), values.value(row)));
 	}
 	rows
+}
+
+fn scan_filter_for_table(
+	plan: &ExecutionPlan,
+	table_id: TableId,
+) -> Option<(&BoundExprProgram, FilterDisposition)> {
+	match plan {
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} if matches!(input.as_ref(), ExecutionPlan::Scan { local_table_id, .. } if *local_table_id == table_id) => {
+			Some((predicate, *disposition))
+		}
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => scan_filter_for_table(input, table_id),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			scan_filter_for_table(left, table_id).or_else(|| scan_filter_for_table(right, table_id))
+		}
+		_ => None,
+	}
+}
+
+fn program_contains_column_named(program: &BoundExprProgram, name: &str) -> bool {
+	program
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(column) if column.name.0 == name))
+}
+
+fn filter_count(plan: &ExecutionPlan) -> usize {
+	match plan {
+		ExecutionPlan::Filter { input, .. } => 1 + filter_count(input),
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => filter_count(input),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			filter_count(left) + filter_count(right)
+		}
+		_ => 0,
+	}
 }
 
 /// A broadcast build publishes through a single-partition (partition_count == 1) exchange, which is
@@ -828,6 +1024,13 @@ impl StorageScan for CrossFixtureScan {
 				.ok_or(StorageError::TableNotFound {
 					table: request.table_id,
 				})?;
+		if let Some(pbc) = request.pbc_predicate {
+			batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
+				StorageError::InvalidPbcProgram {
+					message: format!("{error:?}"),
+				}
+			})?;
+		}
 		if let Some(projected_columns) = &request.projected_columns {
 			let schema = batch.schema();
 			let fields = projected_columns

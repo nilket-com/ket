@@ -42,7 +42,10 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ExecutionPlan, JoinKind, LogicalPlan, TableId, decimal_division_output_type};
+use toron::ir::{
+	BoundExprNode, BoundExprProgram, ExecutionPlan, JoinKind, LogicalPlan, TableId,
+	decimal_division_output_type,
+};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -11373,8 +11376,11 @@ fn has_q19_lineitem_part_keyed_join(plan: &ExecutionPlan) -> bool {
 				&& right_keys.len() == 1
 				&& schema_has_fields(
 					output_schema,
-					&["l_partkey", "p_partkey", "p_brand", "l_shipinstruct"],
-				)) || has_q19_lineitem_part_keyed_join(left)
+					&["l_partkey", "p_partkey", "p_brand", "l_quantity"],
+				) && !schema_has_fields(output_schema, &["l_shipmode"])
+				&& !schema_has_fields(output_schema, &["l_shipinstruct"])
+				&& (has_q19_probe_ship_filter(left) || has_q19_probe_ship_filter(right)))
+				|| has_q19_lineitem_part_keyed_join(left)
 				|| has_q19_lineitem_part_keyed_join(right)
 		}
 		ExecutionPlan::Filter { input, .. }
@@ -11396,6 +11402,37 @@ fn has_q19_lineitem_part_keyed_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Update { source, .. } => has_q19_lineitem_part_keyed_join(source),
 		_ => false,
 	}
+}
+
+fn has_q19_probe_ship_filter(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Filter {
+			input, predicate, ..
+		} => {
+			bound_program_has_column(predicate, "l_shipmode")
+				&& bound_program_has_column(predicate, "l_shipinstruct")
+				&& matches!(input.as_ref(), ExecutionPlan::Scan { .. })
+				|| has_q19_probe_ship_filter(input)
+		}
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => has_q19_probe_ship_filter(input),
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			has_q19_probe_ship_filter(left) || has_q19_probe_ship_filter(right)
+		}
+		_ => false,
+	}
+}
+
+fn bound_program_has_column(program: &BoundExprProgram, name: &str) -> bool {
+	program
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(column) if column.name.0 == name))
 }
 
 fn has_q18_grouped_membership_keyed_join(plan: &ExecutionPlan) -> bool {

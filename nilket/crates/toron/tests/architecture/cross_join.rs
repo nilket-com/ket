@@ -114,6 +114,40 @@ pub(crate) fn adr319_or_branch_key_extraction_stays_in_cross_recognizer() {
 }
 
 #[test]
+pub(crate) fn adr440_common_or_side_factoring_stays_structural_safe_and_binder_only() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let planner = source("src/sql_planner.rs");
+	let extraction = source_block(&demotion, "fn extract_common_or_bridging_keys");
+	let recognizer = source_block(&demotion, "fn lift_cross_equi");
+
+	assert!(
+		demotion.contains("struct CommonOrExtraction")
+			&& recognizer.contains("left_only.extend(extraction.left_common)")
+			&& recognizer.contains("right_only.extend(extraction.right_common)"),
+		"common keys, routed predicates, and residual must stay aligned in one binder owner"
+	);
+	assert!(
+		extraction.contains("common_keys.is_empty()")
+			&& extraction.contains("crate::sql_planner::expr_structural_eq")
+			&& extraction.contains("candidate.is_deterministic()")
+			&& extraction.contains("guard_filter_pushdown_safe(candidate)"),
+		"factoring must stay fenced to the common-key shape and use structural, deterministic, safe equality"
+	);
+	assert!(
+		planner.contains("pub(crate) fn expr_structural_eq")
+			&& !extraction.contains("format!(\"{candidate:?}\")")
+			&& !extraction.contains("serde"),
+		"the binder must reuse typed structural equality, never debug or serialization identity"
+	);
+	for query_brand in ["q19", "Q19", "tpch", "TPC-H"] {
+		assert!(
+			!extraction.contains(query_brand),
+			"common-OR extraction must remain shape-based: {query_brand}"
+		);
+	}
+}
+
+#[test]
 pub(crate) fn adr239_cross_join_forces_broadcast_strategy() {
 	let join = source("src/binder/join.rs");
 

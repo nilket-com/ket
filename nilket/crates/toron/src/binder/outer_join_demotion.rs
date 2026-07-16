@@ -87,6 +87,14 @@ struct RoutedConjuncts {
 }
 
 #[derive(Debug, Clone)]
+struct CommonOrExtraction {
+	keys: Vec<(Expr, Expr)>,
+	left_common: Vec<Expr>,
+	right_common: Vec<Expr>,
+	residual_or: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
 struct RoutedExpr {
 	original: Expr,
 	routed: Expr,
@@ -885,13 +893,15 @@ impl<'a> Binder<'a> {
 			let mut right_only: Vec<Expr> = Vec::new();
 			let mut residual: Vec<Expr> = Vec::new();
 			for conjunct in conjuncts {
-				if let Some((lifted_keys, residual_or)) =
+				if let Some(extraction) =
 					extract_common_or_bridging_keys(&conjunct, &left_scope, &right_scope)
 				{
-					for pair in lifted_keys {
+					for pair in extraction.keys {
 						push_join_key_if_absent(&mut keys, pair);
 					}
-					if let Some(residual_or) = residual_or {
+					left_only.extend(extraction.left_common);
+					right_only.extend(extraction.right_common);
+					if let Some(residual_or) = extraction.residual_or {
 						residual.push(residual_or);
 					}
 					continue;
@@ -2293,7 +2303,7 @@ fn extract_common_or_bridging_keys(
 	expr: &Expr,
 	left_scope: &RelationScope,
 	right_scope: &RelationScope,
-) -> Option<(Vec<(Expr, Expr)>, Option<Expr>)> {
+) -> Option<CommonOrExtraction> {
 	let disjuncts = split_logical_or_disjuncts(expr);
 	if disjuncts.len() < 2 {
 		return None;
@@ -2331,7 +2341,7 @@ fn extract_common_or_bridging_keys(
 		return None;
 	}
 
-	let mut residuals = Vec::with_capacity(branches.len());
+	let mut residual_branches = Vec::with_capacity(branches.len());
 	for (mut conjuncts, _) in branches {
 		for key in &common_keys {
 			let index = conjuncts.iter().position(|conjunct| {
@@ -2340,13 +2350,69 @@ fn extract_common_or_bridging_keys(
 			})?;
 			conjuncts.remove(index);
 		}
-		let Some(residual) = combine_logical_and_conjuncts(conjuncts) else {
-			return Some((common_keys, None));
-		};
-		residuals.push(residual);
+		residual_branches.push(conjuncts);
 	}
 
-	Some((common_keys, combine_logical_or_disjuncts(residuals)))
+	let mut left_common = Vec::new();
+	let mut right_common = Vec::new();
+	for candidate in &residual_branches[0] {
+		if left_common
+			.iter()
+			.chain(&right_common)
+			.any(|common| crate::sql_planner::expr_structural_eq(common, candidate))
+		{
+			continue;
+		}
+		if !candidate.is_deterministic() || !guard_filter_pushdown_safe(candidate) {
+			continue;
+		}
+		let sides = conjunct_column_sides(candidate, left_scope, right_scope);
+		if !sides.is_left_only() && !sides.is_right_only() {
+			continue;
+		}
+		if !residual_branches[1..].iter().all(|branch| {
+			branch
+				.iter()
+				.any(|conjunct| crate::sql_planner::expr_structural_eq(conjunct, candidate))
+		}) {
+			continue;
+		}
+		if sides.is_left_only() {
+			left_common.push(candidate.clone());
+		} else {
+			right_common.push(candidate.clone());
+		}
+	}
+
+	for common in left_common.iter().chain(&right_common) {
+		for branch in &mut residual_branches {
+			let index = branch
+				.iter()
+				.position(|conjunct| crate::sql_planner::expr_structural_eq(conjunct, common))?;
+			branch.remove(index);
+		}
+	}
+
+	let residual_or = if residual_branches.iter().any(Vec::is_empty) {
+		None
+	} else {
+		combine_logical_or_disjuncts(
+			residual_branches
+				.into_iter()
+				.map(|conjuncts| {
+					combine_logical_and_conjuncts(conjuncts)
+						.expect("non-empty common-OR residual branch")
+				})
+				.collect(),
+		)
+	};
+
+	Some(CommonOrExtraction {
+		keys: common_keys,
+		left_common,
+		right_common,
+		residual_or,
+	})
 }
 
 fn oriented_key_for_conjunct(

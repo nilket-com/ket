@@ -8191,7 +8191,7 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 	}
 }
 
-fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
+pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 	match (left, right) {
 		(Expr::Column(left), Expr::Column(right)) => left == right,
 		(Expr::Literal(left), Expr::Literal(right)) => scalar_structural_eq(left, right),
@@ -10800,6 +10800,40 @@ fn reject_unused_broadcast_hint(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn adr440_structural_expr_equality_discriminates_physical_literal_and_cast_details() {
+		assert!(!expr_structural_eq(
+			&Expr::Literal(ScalarValue::Float64(Some(0.0))),
+			&Expr::Literal(ScalarValue::Float64(Some(-0.0))),
+		));
+		assert!(!expr_structural_eq(
+			&Expr::Literal(ScalarValue::Timestamp {
+				value: Some(1),
+				unit: TimeUnit::Second,
+			}),
+			&Expr::Literal(ScalarValue::Timestamp {
+				value: Some(1),
+				unit: TimeUnit::Millisecond,
+			}),
+		));
+		assert!(!expr_structural_eq(
+			&Expr::Literal(ScalarValue::Decimal128 {
+				value: Some(100),
+				precision: 10,
+				scale: 2,
+			}),
+			&Expr::Literal(ScalarValue::Decimal128 {
+				value: Some(100),
+				precision: 10,
+				scale: 3,
+			}),
+		));
+		assert!(!expr_structural_eq(
+			&Expr::Cast(Box::new(Expr::column("value")), DataType::Int32),
+			&Expr::Cast(Box::new(Expr::column("value")), DataType::Int64),
+		));
+	}
 
 	#[test]
 	fn insert_table_function_target_rejects_after_parse() {
