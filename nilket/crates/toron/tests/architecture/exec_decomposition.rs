@@ -182,6 +182,71 @@ pub(crate) fn adr441_membership_chain_profile_is_post_fence_exclusive_and_query_
 }
 
 #[test]
+pub(crate) fn adr443_grouped_chain_profile_covers_the_top_owner_and_preserves_residency() {
+	let manifest = manifest_dir();
+	let join =
+		std::fs::read_to_string(manifest.join("src/exec/join.rs")).expect("read exec join source");
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let profile_path = manifest.join("src/exec/join/grouped_chain_profile.rs");
+	let profile = std::fs::read_to_string(&profile_path).expect("read ADR 443 profile source");
+	let residency = std::fs::read_to_string(manifest.join("src/exec/join/residency_profile.rs"))
+		.expect("read ADR 429 residency source");
+
+	assert!(join.contains("mod grouped_chain_profile;"));
+	assert!(profile_path.exists(), "missing ADR 443 profile owner");
+	assert!(profile.contains("TORON_GROUPED_CHAIN_PROFILE_DIR"));
+	assert!(profile.contains("return Ok(None);"));
+	assert!(profile.contains("active_leaf: Option<GroupedChainProfileLeaf>"));
+	assert!(profile.contains("checked_sub(leaf_total)"));
+	assert!(profile.contains("spill-role reconciliation failed"));
+	assert!(profile.contains("task_spill_at_root_start"));
+	assert!(profile.contains("task_spill_at_base_end"));
+	assert!(profile.contains("task_spill_at_root_end"));
+	assert!(residency.contains("TORON_GROUPED_RESERVOIR_RESIDENCY_PROFILE_PATH"));
+	assert!(residency.contains("const GROUPED_RESERVOIR_PROFILE_SCHEMA_VERSION: u32 = 1;"));
+
+	let owners = brace_blocks_after_marker(
+		&streaming,
+		"pub(in crate::exec) async fn try_streaming_reoriented_inner_chain_grouped_aggregate",
+	);
+	let [(_, owner)] = owners.as_slice() else {
+		panic!("expected one reoriented grouped-chain owner");
+	};
+	let fence = owner
+		.find("let Some((base, mut stages)) = extract_reoriented_inner_chain")
+		.expect("grouped-chain structural admission");
+	let construct = owner
+		.find("GroupedChainProfile::from_env(stages.len())?")
+		.expect("profile construction in top-level owner");
+	assert!(
+		fence < construct,
+		"profile construction must follow grouped-chain structural admission"
+	);
+	assert!(owner.contains("profile.persist()?"));
+	for leaf in [
+		"RuntimePrepBuild",
+		"Finalization",
+		"Cleanup",
+		"BaseAccumulation",
+		"ReservoirPartitionSpillWrite",
+		"BaseConcat",
+		"ReservoirReadProbe",
+		"SuffixJoin",
+		"GroupedFold",
+	] {
+		assert!(
+			streaming.contains(&format!("GroupedChainProfileLeaf::{leaf}")),
+			"missing ADR 443 leaf hook {leaf}"
+		);
+	}
+	assert!(
+		!profile.contains("q05") && !profile.contains("TPC-H") && !streaming.contains("TORON_Q05"),
+		"ADR 443 profiler must stay shape-owned and query-neutral"
+	);
+}
+
+#[test]
 pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_rebuild() {
 	let manifest = manifest_dir();
 	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))

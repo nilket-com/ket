@@ -911,6 +911,32 @@ fn strict_q5_oracle_selects_multiple_groups() {
 		"expected > 1 group, got {}",
 		oracle.groups.len()
 	);
+	let census = &oracle.stage_census;
+	assert_eq!(census.asia_rows, oracle.selected_rows);
+	assert!(census.lineitem_rows >= census.dated_order_lineitems);
+	assert!(census.dated_order_lineitems >= census.same_nation_rows);
+	assert!(census.same_nation_rows >= census.asia_rows);
+	assert!(census.dated_orders > 0);
+	assert!(census.supplier_rows > 0);
+	assert_eq!(census.nation_rows, 25);
+	assert_eq!(census.asia_region_rows, 1);
+}
+
+#[test]
+#[ignore = "sf=10 q05 stage census; run explicitly for ADR evidence"]
+fn strict_q5_sf10_independent_stage_census() {
+	let oracle = strict_q5_oracle(10.0);
+	let census = &oracle.stage_census;
+	assert_eq!(census.dated_orders, 2_275_919);
+	assert_eq!(census.lineitem_rows, 59_986_052);
+	assert_eq!(census.dated_order_lineitems, 9_103_367);
+	assert_eq!(census.supplier_rows, 100_000);
+	assert_eq!(census.same_nation_rows, 364_380);
+	assert_eq!(census.nation_rows, 25);
+	assert_eq!(census.asia_region_rows, 1);
+	assert_eq!(census.asia_rows, 72_985);
+	assert_eq!(oracle.selected_rows, 72_985);
+	assert_eq!(oracle.groups.len(), 5);
 }
 
 #[test]

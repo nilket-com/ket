@@ -9389,6 +9389,7 @@ impl Executor {
 				group_expr,
 				aggr_expr,
 				batch,
+				None,
 			),
 			ReorientedChainOutputSink::ProjectedSpill {
 				spilled,
@@ -9546,6 +9547,17 @@ impl Executor {
 			outer_predicate,
 		);
 		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
+		let grouped_chain_profile = GroupedChainProfile::from_env(stages.len())?;
+		let grouped_chain_root = if let Some(profile) = grouped_chain_profile.as_deref() {
+			let spill = GroupedChainProfile::task_spill_bytes(&self.context.task_telemetry)?;
+			Some(profile.begin_root(spill)?)
+		} else {
+			None
+		};
+		let mut runtime_prep_timer = grouped_chain_profile
+			.as_deref()
+			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::RuntimePrepBuild))
+			.transpose()?;
 
 		let base_scan_probe_mode = reoriented_inner_chain_grouped_base_scan_probe_mode(base);
 		let force_stream_projected_filtered_base = project_exprs.is_some()
@@ -9725,6 +9737,14 @@ impl Executor {
 				.await?;
 		}
 		if matched.is_none() {
+			if let Some(timer) = runtime_prep_timer.take() {
+				timer.finish()?;
+			}
+			if let Some(profile) = grouped_chain_profile.as_deref() {
+				profile.record_runtime_prep_end_spill(GroupedChainProfile::task_spill_bytes(
+					&self.context.task_telemetry,
+				)?)?;
+			}
 			matched = self
 				.try_streaming_reoriented_inner_chain_generic_base_grouped(
 					base,
@@ -9737,8 +9757,15 @@ impl Executor {
 					&mut groups,
 					&mut group_types,
 					morsel,
+					grouped_chain_profile.as_deref(),
 				)
 				.await?;
+		}
+		if runtime_prep_timer.is_some() && grouped_chain_profile.is_some() {
+			return Err(ExecutionError::Kernel {
+				message: "grouped-chain profile: admitted chain did not commit the generic grouped reservoir path"
+					.to_string(),
+			});
 		}
 		if matched.is_none() {
 			for runtime in runtimes {
@@ -9759,16 +9786,47 @@ impl Executor {
 					output_rows: RowCount::new(runtime.output_rows),
 				},
 			);
+			if let Some(profile) = grouped_chain_profile.as_deref() {
+				profile.record_runtime_stage(
+					runtime.replay_id,
+					runtime.build_row_count(),
+					runtime.probe_rows,
+					runtime.output_rows,
+				)?;
+			}
 		}
 
+		let finalization_timer = grouped_chain_profile
+			.as_deref()
+			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::Finalization))
+			.transpose()?;
 		let output = self.finalize_bound_grouped_aggregate(
 			&mut groups,
 			&group_types,
 			aggr_expr,
 			output_schema,
 		);
+		if let Some(timer) = finalization_timer {
+			timer.finish()?;
+		}
+		if let (Some(profile), Ok(output)) = (grouped_chain_profile.as_deref(), output.as_ref()) {
+			profile.record_final_group_rows(record_batch_row_count(output))?;
+		}
+		let cleanup_timer = grouped_chain_profile
+			.as_deref()
+			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::Cleanup))
+			.transpose()?;
 		for runtime in runtimes {
 			runtime.cleanup().await;
+		}
+		if let Some(timer) = cleanup_timer {
+			timer.finish()?;
+		}
+		if let (Some(profile), Some(root)) = (grouped_chain_profile.as_deref(), grouped_chain_root)
+		{
+			let spill = GroupedChainProfile::task_spill_bytes(&self.context.task_telemetry)?;
+			profile.finish_root(root, spill)?;
+			profile.persist()?;
 		}
 		output.map(Some)
 	}
@@ -9893,6 +9951,7 @@ impl Executor {
 						group_expr,
 						aggr_expr,
 						batch,
+						None,
 					)
 				};
 				self.try_visit_reoriented_adaptive_derived_last_stage(
@@ -10480,6 +10539,7 @@ impl Executor {
 				group_expr,
 				aggr_expr,
 				batch,
+				None,
 			)
 		};
 		self.try_visit_streaming_reoriented_inner_chain_scan_probe_base(
@@ -11802,13 +11862,19 @@ impl Executor {
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
+		grouped_chain_profile: Option<&GroupedChainProfile>,
 	) -> Result<Option<()>, ExecutionError> {
 		let mut base_batches = Vec::new();
+		let mut base_rows = 0u64;
 		let mut accumulated_bytes = 0u64;
 		let accumulator_cap =
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
+		let base_timer = grouped_chain_profile
+			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::BaseAccumulation))
+			.transpose()?;
 		let matched = self
 			.try_visit_streaming_reoriented_inner_chain_base(base, morsel, |base_batch| {
+				base_rows = base_rows.saturating_add(base_batch.num_rows() as u64);
 				accumulated_bytes =
 					accumulated_bytes.saturating_add(record_batch_memory_bytes(&base_batch));
 				if accumulated_bytes > accumulator_cap {
@@ -11825,6 +11891,15 @@ impl Executor {
 				Ok(())
 			})
 			.await?;
+		if let Some(timer) = base_timer {
+			timer.finish_with(base_rows, accumulated_bytes)?;
+		}
+		if let Some(profile) = grouped_chain_profile {
+			profile.record_base(base_batches.len(), base_rows, accumulated_bytes)?;
+			profile.record_base_end_spill(GroupedChainProfile::task_spill_bytes(
+				&self.context.task_telemetry,
+			)?)?;
+		}
 		if matched.is_none() {
 			return Ok(None);
 		}
@@ -11858,10 +11933,17 @@ impl Executor {
 				group_types,
 				morsel,
 				residency_profile.as_mut(),
+				grouped_chain_profile,
 			)
 			.await?
 		{
 			return Ok(Some(()));
+		}
+		if grouped_chain_profile.is_some() {
+			return Err(ExecutionError::Kernel {
+				message: "grouped-chain profile: generic grouped path did not commit the partitioned-scan reservoir"
+					.to_string(),
+			});
 		}
 		for base_batch in base_batches {
 			self.process_reoriented_inner_chain_grouped_base_batch(
@@ -11874,6 +11956,7 @@ impl Executor {
 				aggr_expr,
 				groups,
 				group_types,
+				None,
 			)
 			.await?;
 		}
@@ -11892,6 +11975,7 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
+		grouped_chain_profile: Option<&GroupedChainProfile>,
 	) -> Result<(), ExecutionError> {
 		self.process_reoriented_inner_chain_grouped_suffix_batch(
 			vec![base_batch],
@@ -11903,6 +11987,7 @@ impl Executor {
 			aggr_expr,
 			groups,
 			group_types,
+			grouped_chain_profile,
 		)
 		.await
 	}
@@ -11919,8 +12004,13 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
+		grouped_chain_profile: Option<&GroupedChainProfile>,
 	) -> Result<(), ExecutionError> {
 		for runtime in inner_runtimes.iter_mut() {
+			let suffix_input_rows = record_batch_row_count(&batches);
+			let suffix_timer = grouped_chain_profile
+				.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::SuffixJoin))
+				.transpose()?;
 			let mut next = Vec::new();
 			for batch in batches {
 				next.extend(
@@ -11930,6 +12020,9 @@ impl Executor {
 			}
 			batches = next;
 			if batches.is_empty() {
+				if let Some(timer) = suffix_timer {
+					timer.finish_with(suffix_input_rows, 0)?;
+				}
 				break;
 			}
 			if let Some(predicate) = runtime.post_filter {
@@ -11946,9 +12039,17 @@ impl Executor {
 				}
 				batches = filtered;
 			}
+			if let Some(timer) = suffix_timer {
+				timer.finish_with(suffix_input_rows, 0)?;
+			}
 		}
 
 		for batch in batches {
+			let fold_rows = batch.num_rows() as u64;
+			let fold_bytes = record_batch_memory_bytes(&batch);
+			let fold_timer = grouped_chain_profile
+				.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::GroupedFold))
+				.transpose()?;
 			self.fold_reoriented_grouped_output_batch(
 				groups,
 				group_types,
@@ -11958,7 +12059,11 @@ impl Executor {
 				group_expr,
 				aggr_expr,
 				batch,
+				grouped_chain_profile,
 			)?;
+			if let Some(timer) = fold_timer {
+				timer.finish_with(fold_rows, fold_bytes)?;
+			}
 		}
 		Ok(())
 	}
@@ -11977,6 +12082,7 @@ impl Executor {
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
+		grouped_chain_profile: Option<&GroupedChainProfile>,
 	) -> Result<bool, ExecutionError> {
 		let Some((runtime, suffix_runtimes)) = inner_runtimes.split_first_mut() else {
 			if let Some(profile) = residency_profile.as_deref_mut() {
@@ -12043,7 +12149,15 @@ impl Executor {
 			}
 			return Ok(false);
 		}
+		if let Some(profile) = grouped_chain_profile {
+			profile.record_reservoir_dispatch(runtime.replay_id, partition_count, group_count)?;
+		}
 
+		let reservoir_write_timer = grouped_chain_profile
+			.map(|profile| {
+				profile.begin_leaf(GroupedChainProfileLeaf::ReservoirPartitionSpillWrite)
+			})
+			.transpose()?;
 		let build_result = self
 			.build_partitioned_streaming_scan_inner_build_reservoir(
 				scan_input,
@@ -12070,6 +12184,21 @@ impl Executor {
 			}
 			Err(error) => return Err(error),
 		};
+		let reservoir_spill_bytes = reservoir.iter().try_fold(0u64, |total, build| {
+			total
+				.checked_add(build.as_ref().map_or(0, SpilledInnerJoinBuild::spill_bytes))
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "grouped-chain profile: reservoir spill total overflow".to_string(),
+				})
+		})?;
+		if let Some(timer) = reservoir_write_timer {
+			timer.finish_with(build_rows, reservoir_spill_bytes)?;
+		}
+		if let Some(profile) = grouped_chain_profile {
+			profile.record_reservoir_build_end_spill(GroupedChainProfile::task_spill_bytes(
+				&self.context.task_telemetry,
+			)?)?;
+		}
 
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
@@ -12080,7 +12209,16 @@ impl Executor {
 			if let Some(profile) = residency_profile.as_deref_mut() {
 				profile.base_concat_intent(&reservoir)?;
 			}
+			let base_concat_timer = grouped_chain_profile
+				.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::BaseConcat))
+				.transpose()?;
 			let base_batch = concat_or_empty(first_base_batch.schema(), base_batches)?;
+			if let Some(timer) = base_concat_timer {
+				timer.finish_with(
+					base_batch.num_rows() as u64,
+					record_batch_memory_bytes(&base_batch),
+				)?;
+			}
 			if base_batch.num_rows() == 0 {
 				return Ok(());
 			}
@@ -12091,6 +12229,9 @@ impl Executor {
 					"base_concat_complete",
 				)?;
 			}
+			let reservoir_probe_timer = grouped_chain_profile
+				.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::ReservoirReadProbe))
+				.transpose()?;
 			let (mut output, probe_rows, output_rows) = self
 				.probe_partitioned_streamed_inner_scan_build_reservoir(
 					&mut reservoir,
@@ -12129,6 +12270,14 @@ impl Executor {
 				}
 				output = filtered;
 			}
+			if let Some(timer) = reservoir_probe_timer {
+				timer.finish_with(probe_rows, output_rows)?;
+			}
+			if let Some(profile) = grouped_chain_profile {
+				profile.record_reservoir_probe_end_spill(GroupedChainProfile::task_spill_bytes(
+					&self.context.task_telemetry,
+				)?)?;
+			}
 			self.process_reoriented_inner_chain_grouped_suffix_batch(
 				output,
 				suffix_runtimes,
@@ -12139,14 +12288,28 @@ impl Executor {
 				aggr_expr,
 				groups,
 				group_types,
+				grouped_chain_profile,
 			)
 			.await?;
+			if let Some(profile) = grouped_chain_profile {
+				profile.record_suffix_fold_end_spill(GroupedChainProfile::task_spill_bytes(
+					&self.context.task_telemetry,
+				)?)?;
+			}
 			if let Some(profile) = residency_profile.as_deref_mut() {
 				profile.phase(ProfilePhase::Fold, &reservoir, "suffix_and_fold_complete")?;
 			}
 			Ok::<(), ExecutionError>(())
 		}
 		.await;
+		if let Some(profile) = grouped_chain_profile {
+			profile.record_reservoir(
+				reservoir_spill_bytes,
+				build_rows,
+				total_probe_rows,
+				total_output_rows,
+			)?;
+		}
 		if let Some(profile) = residency_profile.as_deref_mut() {
 			let status = if result.is_ok() {
 				"complete"
@@ -12155,7 +12318,13 @@ impl Executor {
 			};
 			profile.terminal(&reservoir, status)?;
 		}
+		let cleanup_timer = grouped_chain_profile
+			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::Cleanup))
+			.transpose()?;
 		Self::cleanup_partitioned_streamed_inner_builds(reservoir).await;
+		if let Some(timer) = cleanup_timer {
+			timer.finish()?;
+		}
 		result?;
 		if let ReorientedInnerJoinBuild::PartitionedScan {
 			observed_build_rows,
@@ -12178,6 +12347,7 @@ impl Executor {
 		group_expr: &BoundExprProgram,
 		aggr_expr: &[BoundAggregateCall],
 		batch: RecordBatch,
+		grouped_chain_profile: Option<&GroupedChainProfile>,
 	) -> Result<(), ExecutionError> {
 		let filtered = if let Some(predicate) = outer_predicate {
 			self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?
@@ -12199,6 +12369,9 @@ impl Executor {
 				});
 			}
 		};
+		if let Some(profile) = grouped_chain_profile {
+			profile.record_fold_input_rows(aggregate_input.num_rows())?;
+		}
 		self.fold_bound_grouped_aggregate_batch(
 			groups,
 			group_types,

@@ -5788,9 +5788,22 @@ pub struct Q5Group {
 	pub revenue: i128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q5StageCensus {
+	pub dated_orders: usize,
+	pub lineitem_rows: usize,
+	pub dated_order_lineitems: usize,
+	pub supplier_rows: usize,
+	pub same_nation_rows: usize,
+	pub nation_rows: usize,
+	pub asia_region_rows: usize,
+	pub asia_rows: usize,
+}
+
 pub struct Q5Oracle {
 	pub groups: BTreeMap<String, Q5Group>,
 	pub selected_rows: usize,
+	pub stage_census: Q5StageCensus,
 }
 
 /// ADR 287: the independent strict-q05 oracle — traverse the six q05 generators directly, apply every join
@@ -5805,9 +5818,12 @@ pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
 			asia_regions.insert(region.r_regionkey);
 		}
 	}
+	let asia_region_rows = asia_regions.len();
 
 	let mut asia_nations: HashMap<i64, String> = HashMap::new();
+	let mut nation_rows = 0usize;
 	for nation in NationGenerator::new(scale_factor, 1, 1).iter() {
+		q5_increment(&mut nation_rows, "nation rows");
 		if asia_regions.contains(&nation.n_regionkey) {
 			asia_nations.insert(nation.n_nationkey, nation.n_name.to_string());
 		}
@@ -5817,6 +5833,7 @@ pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
 	for supplier in SupplierGenerator::new(scale_factor, 1, 1).iter() {
 		suppliers.insert(supplier.s_suppkey, supplier.s_nationkey);
 	}
+	let supplier_rows = suppliers.len();
 
 	let mut customers: HashMap<i64, i64> = HashMap::new();
 	for customer in CustomerGenerator::new(scale_factor, 1, 1).iter() {
@@ -5830,13 +5847,19 @@ pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
 			orders.insert(order.o_orderkey, order.o_custkey);
 		}
 	}
+	let dated_orders = orders.len();
 
 	let mut groups: BTreeMap<String, Q5Group> = BTreeMap::new();
 	let mut selected_rows = 0usize;
+	let mut lineitem_rows = 0usize;
+	let mut dated_order_lineitems = 0usize;
+	let mut same_nation_rows = 0usize;
 	for item in LineItemGenerator::new(scale_factor, 1, 1).iter() {
+		q5_increment(&mut lineitem_rows, "lineitem rows");
 		let Some(&custkey) = orders.get(&item.l_orderkey) else {
 			continue;
 		};
+		q5_increment(&mut dated_order_lineitems, "dated-order lineitems");
 		let Some(&customer_nationkey) = customers.get(&custkey) else {
 			continue;
 		};
@@ -5846,6 +5869,7 @@ pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
 		if customer_nationkey != supplier_nationkey {
 			continue;
 		}
+		q5_increment(&mut same_nation_rows, "same-nation rows");
 		let Some(nation_name) = asia_nations.get(&supplier_nationkey) else {
 			continue;
 		};
@@ -5855,13 +5879,30 @@ pub fn strict_q5_oracle(scale_factor: f64) -> Q5Oracle {
 			.entry(nation_name.clone())
 			.or_insert(Q5Group { revenue: 0 })
 			.revenue += discounted_price_raw(extprice_raw, disc_raw);
-		selected_rows += 1;
+		q5_increment(&mut selected_rows, "selected rows");
 	}
 
 	Q5Oracle {
 		groups,
 		selected_rows,
+		stage_census: Q5StageCensus {
+			dated_orders,
+			lineitem_rows,
+			dated_order_lineitems,
+			supplier_rows,
+			same_nation_rows,
+			nation_rows,
+			asia_region_rows,
+			asia_rows: selected_rows,
+		},
 	}
+}
+
+#[inline]
+fn q5_increment(counter: &mut usize, label: &'static str) {
+	*counter = counter
+		.checked_add(1)
+		.unwrap_or_else(|| panic!("q05 oracle {label} overflow"));
 }
 
 /// strict q05's measured output schema (Phase-0 measured at sf=0.01): q05's revenue expression is q03's
