@@ -1295,6 +1295,7 @@ enum ReorientedChainOutputSink<'a> {
 		group_types: &'a mut Vec<DataType>,
 		input_rows: &'a mut u64,
 		output_rows: &'a mut u64,
+		profile: Option<&'a MembershipChainProfile>,
 	},
 }
 
@@ -2433,6 +2434,7 @@ fn materialize_projected_streamed_spilled_inner_matches(
 
 fn run_loaded_partition_work(
 	work: LoadedPartitionWork,
+	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 ) -> Result<LoadedPartitionResult, ExecutionError> {
 	let LoadedPartitionWork {
 		partition,
@@ -2450,6 +2452,9 @@ fn run_loaded_partition_work(
 		memory_cap,
 		resident_baseline_bytes,
 	} = work;
+	let index_timer = membership_profile
+		.map(|(profile, phase)| profile.begin_leaf(phase, MembershipChainOperation::IndexBuild))
+		.transpose()?;
 	let loaded = LoadedSpilledInnerBuild::new(
 		build_pages,
 		key_plan,
@@ -2458,6 +2463,9 @@ fn run_loaded_partition_work(
 		memory_cap,
 		resident_baseline_bytes,
 	)?;
+	if let Some(timer) = index_timer {
+		timer.finish_with(loaded.index.len() as u64, loaded.resident_bytes())?;
+	}
 	visit_loaded_partition_work(
 		&loaded,
 		partition,
@@ -2471,6 +2479,7 @@ fn run_loaded_partition_work(
 		build_column_count,
 		projection.as_ref(),
 		memory_cap,
+		membership_profile,
 	)
 }
 
@@ -2488,6 +2497,7 @@ fn visit_loaded_partition_work(
 	build_column_count: usize,
 	projection: Option<&ProjectedInnerBuildProjection>,
 	memory_cap: u64,
+	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 ) -> Result<LoadedPartitionResult, ExecutionError> {
 	let mut output = Vec::new();
 	let (probe_rows, output_rows) = if let Some(projection) = projection {
@@ -2501,6 +2511,7 @@ fn visit_loaded_partition_work(
 			&projection.retained_columns,
 			materialized_output_schema,
 			memory_cap,
+			membership_profile,
 			|batch| {
 				let batch = if probe_columns_first {
 					reorder_spilled_inner_probe_before_build(
@@ -2526,6 +2537,7 @@ fn visit_loaded_partition_work(
 			null_safe_keys,
 			materialized_output_schema,
 			memory_cap,
+			membership_profile,
 			|batch| {
 				let batch = if probe_columns_first {
 					reorder_spilled_inner_probe_before_build(
@@ -2665,6 +2677,7 @@ fn visit_loaded_projected_streamed_spilled_inner_join_chunks<F>(
 	retained_columns: &[ColumnOrdinal],
 	output_schema: &SchemaRef,
 	memory_cap: u64,
+	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2677,6 +2690,11 @@ where
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let probe_chunk = batch.slice(offset, len);
 			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+			let lookup_timer = membership_profile
+				.map(|(profile, phase)| {
+					profile.begin_leaf(phase, MembershipChainOperation::LookupSelection)
+				})
+				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
 			for row in 0..probe_chunk.num_rows() {
@@ -2691,7 +2709,15 @@ where
 					});
 				}
 			}
+			if let Some(timer) = lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0)?;
+			}
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let materialize_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::ArrowMaterialize)
+					})
+					.transpose()?;
 				let batch = materialize_loaded_projected_streamed_spilled_inner_matches(
 					loaded,
 					&probe_chunk,
@@ -2701,6 +2727,10 @@ where
 					output_schema,
 					memory_cap,
 				)?;
+				if let Some(timer) = materialize_timer {
+					timer
+						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
 			}
@@ -2718,6 +2748,7 @@ fn visit_loaded_streamed_spilled_inner_join_chunks<F>(
 	null_safe_keys: bool,
 	output_schema: &SchemaRef,
 	memory_cap: u64,
+	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2730,6 +2761,11 @@ where
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let probe_chunk = batch.slice(offset, len);
 			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+			let lookup_timer = membership_profile
+				.map(|(profile, phase)| {
+					profile.begin_leaf(phase, MembershipChainOperation::LookupSelection)
+				})
+				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
 			for row in 0..probe_chunk.num_rows() {
@@ -2744,7 +2780,15 @@ where
 					});
 				}
 			}
+			if let Some(timer) = lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0)?;
+			}
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let materialize_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::ArrowMaterialize)
+					})
+					.transpose()?;
 				let batch = materialize_loaded_streamed_spilled_inner_matches(
 					loaded,
 					&probe_chunk,
@@ -2752,6 +2796,10 @@ where
 					output_schema,
 					memory_cap,
 				)?;
+				if let Some(timer) = materialize_timer {
+					timer
+						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
 			}
@@ -4908,6 +4956,7 @@ impl Executor {
 					true,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -5691,6 +5740,7 @@ impl Executor {
 		enforce_group_spill_budget: bool,
 		combined_resident_baseline_bytes: Option<u64>,
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
+		membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
@@ -5710,7 +5760,25 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
+			loop {
+				let scan_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::StorageScanDecode)
+					})
+					.transpose()?;
+				let next_batch = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish_with(
+						next_batch
+							.as_ref()
+							.and_then(|batch| batch.as_ref().ok())
+							.map_or(0, |batch| batch.num_rows() as u64),
+						0,
+					)?;
+				}
+				let Some(batch) = next_batch else {
+					break;
+				};
 				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
 					break;
 				};
@@ -5727,6 +5795,11 @@ impl Executor {
 				if let Some(profile) = residency_profile.as_deref_mut() {
 					profile.before_reservoir_batch(partitioned_builds, &batch)?;
 				}
+				let write_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::PartitionSpillWrite)
+					})
+					.transpose()?;
 				for (_, partitioned) in
 					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
 				{
@@ -5754,6 +5827,10 @@ impl Executor {
 							.reservoir_batch_complete(partitioned_builds, partitioned.num_rows())?;
 					}
 				}
+				if let Some(timer) = write_timer {
+					timer
+						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
 			}
 		} else {
 			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
@@ -5769,7 +5846,25 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
+			loop {
+				let scan_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::StorageScanDecode)
+					})
+					.transpose()?;
+				let next_batch = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish_with(
+						next_batch
+							.as_ref()
+							.and_then(|batch| batch.as_ref().ok())
+							.map_or(0, |batch| batch.num_rows() as u64),
+						0,
+					)?;
+				}
+				let Some(batch) = next_batch else {
+					break;
+				};
 				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
 					break;
 				};
@@ -5786,6 +5881,11 @@ impl Executor {
 				if let Some(profile) = residency_profile.as_deref_mut() {
 					profile.before_reservoir_batch(partitioned_builds, &batch)?;
 				}
+				let write_timer = membership_profile
+					.map(|(profile, phase)| {
+						profile.begin_leaf(phase, MembershipChainOperation::PartitionSpillWrite)
+					})
+					.transpose()?;
 				self.write_partitioned_streaming_scan_inner_build_batch(
 					partitioned_builds,
 					total_spill_bytes,
@@ -5802,6 +5902,10 @@ impl Executor {
 					combined_resident_baseline_bytes,
 				)
 				.await?;
+				if let Some(timer) = write_timer {
+					timer
+						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
 				if let Some(profile) = residency_profile.as_deref_mut() {
 					profile.reservoir_batch_complete(partitioned_builds, batch.num_rows())?;
 				}
@@ -8737,6 +8841,11 @@ impl Executor {
 			let required_output = retained_columns.iter().copied().collect();
 			mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
 			let stage = stages.pop().expect("one-stage chain checked");
+			let membership_profile = MembershipChainProfile::from_env()?;
+			let profile = membership_profile.as_deref();
+			let profile_root = profile
+				.map(MembershipChainProfile::begin_root)
+				.transpose()?;
 			let mut receipt = MembershipScheduleReceipt::from_env();
 			if let Some(receipt) = &mut receipt {
 				receipt.append(
@@ -8746,6 +8855,14 @@ impl Executor {
 				receipt.append("membership_execute_started", serde_json::json!({}));
 			}
 			let membership_started = Instant::now();
+			let membership_timer = profile
+				.map(|profile| {
+					profile.begin_leaf(
+						MembershipChainPhase::Membership,
+						MembershipChainOperation::SubtreeExecute,
+					)
+				})
+				.transpose()?;
 			let right_batches = self.execute_bound(right, morsel).await?;
 			let membership_rows = right_batches
 				.iter()
@@ -8755,6 +8872,9 @@ impl Executor {
 				.iter()
 				.map(record_batch_memory_bytes)
 				.fold(0u64, u64::saturating_add);
+			if let Some(timer) = membership_timer {
+				timer.finish_with(membership_rows, membership_batch_bytes)?;
+			}
 			if let Some(receipt) = &mut receipt {
 				receipt.append(
 					"membership_execute_completed",
@@ -8764,12 +8884,30 @@ impl Executor {
 					}),
 				);
 			}
-			let Some(presence) = Int64PresenceSet::from_batches(
+			let presence_timer = profile
+				.map(|profile| {
+					profile.begin_leaf(
+						MembershipChainPhase::Membership,
+						MembershipChainOperation::PresenceSetBuild,
+					)
+				})
+				.transpose()?;
+			let presence_result = Int64PresenceSet::from_batches(
 				&right_batches,
 				right_keys[0],
 				self.context.task_budget.memory.get(),
-			)?
-			else {
+			)?;
+			if let Some(timer) = presence_timer {
+				timer.finish_with(
+					presence_result
+						.as_ref()
+						.map_or(0, |presence| presence.entries.len() as u64),
+					presence_result
+						.as_ref()
+						.map_or(0, Int64PresenceSet::accounted_bytes),
+				)?;
+			}
+			let Some(presence) = presence_result else {
 				let mut groups = BoundGroupedAggregateGroups::new();
 				let mut group_types = Vec::new();
 				let empty = RecordBatch::new_empty(semi_output_schema.clone());
@@ -8804,6 +8942,9 @@ impl Executor {
 					.map(Some);
 			};
 			let presence_bytes = presence.accounted_bytes();
+			if let Some(profile) = profile {
+				profile.record_presence_entries(presence.entries.len())?;
+			}
 			let membership_micros = duration_micros(membership_started);
 			if let Some(receipt) = &mut receipt {
 				receipt.append(
@@ -8821,14 +8962,25 @@ impl Executor {
 			if let Some(receipt) = &mut receipt {
 				receipt.append("chain_runtime_prepare_started", serde_json::json!({}));
 			}
-			let Some(mut runtime) = self
+			let prepare_timer = profile
+				.map(|profile| {
+					profile.begin_leaf(
+						MembershipChainPhase::Lifecycle,
+						MembershipChainOperation::RuntimePrepare,
+					)
+				})
+				.transpose()?;
+			let prepared_runtime = self
 				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline(
 					stage,
 					morsel,
 					presence_bytes,
 				)
-				.await?
-			else {
+				.await?;
+			if let Some(timer) = prepare_timer {
+				timer.finish()?;
+			}
+			let Some(mut runtime) = prepared_runtime else {
 				return Err(ExecutionError::InvalidExpression {
 					message: "committed membership-first chain lost its terminal scan stage"
 						.to_string(),
@@ -8852,6 +9004,7 @@ impl Executor {
 				group_types: &mut group_types,
 				input_rows: &mut chain_input_rows,
 				output_rows: &mut matched_rows,
+				profile,
 			};
 			let drive_result = self
 				.try_streaming_reoriented_inner_chain_scan_probe_base_to_sink(
@@ -8860,6 +9013,7 @@ impl Executor {
 					&mut sink,
 					morsel,
 					presence_bytes,
+					profile,
 				)
 				.await;
 			drop(sink);
@@ -8885,7 +9039,18 @@ impl Executor {
 					output_rows: RowCount::new(runtime.output_rows),
 				},
 			);
+			let cleanup_timer = profile
+				.map(|profile| {
+					profile.begin_leaf(
+						MembershipChainPhase::Lifecycle,
+						MembershipChainOperation::Cleanup,
+					)
+				})
+				.transpose()?;
 			runtime.cleanup().await;
+			if let Some(timer) = cleanup_timer {
+				timer.finish()?;
+			}
 			match drive_result {
 				Ok(Some(())) => {}
 				Ok(None) => {
@@ -8921,12 +9086,36 @@ impl Executor {
 					output_rows: RowCount::new(matched_rows),
 				},
 			);
+			let finalize_timer = profile
+				.map(|profile| {
+					profile.begin_leaf(
+						MembershipChainPhase::Lifecycle,
+						MembershipChainOperation::Finalize,
+					)
+				})
+				.transpose()?;
 			let output = self.finalize_bound_grouped_aggregate(
 				&mut groups,
 				&group_types,
 				aggr_expr,
 				output_schema,
 			);
+			if let Some(timer) = finalize_timer {
+				timer.finish()?;
+			}
+			if let (Ok(output_batches), Some(profile), Some(root)) =
+				(&output, profile, profile_root)
+			{
+				let root_rows = output_batches
+					.iter()
+					.try_fold(0usize, |rows, batch| rows.checked_add(batch.num_rows()))
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: "membership-chain root row count overflow".to_string(),
+					})?;
+				profile.record_root_aggregate_rows(root_rows)?;
+				profile.finish_root(root)?;
+				profile.persist()?;
+			}
 			if output.is_ok()
 				&& let Some(receipt) = &mut receipt
 			{
@@ -9230,8 +9419,17 @@ impl Executor {
 				group_types,
 				input_rows,
 				output_rows,
+				profile,
 			} => {
 				**input_rows = input_rows.saturating_add(batch.num_rows() as u64);
+				let presence_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::Sink,
+							MembershipChainOperation::PresenceFilter,
+						)
+					})
+					.transpose()?;
 				let keys = batch
 					.columns()
 					.get(left_key.0 as usize)
@@ -9255,15 +9453,40 @@ impl Executor {
 				let mask = BooleanArray::from(matches);
 				let filtered = filter_record_batch(&batch, &mask)?;
 				**output_rows = output_rows.saturating_add(filtered.num_rows() as u64);
+				if let Some(profile) = *profile {
+					profile.record_sink_rows(batch.num_rows(), filtered.num_rows())?;
+				}
+				if let Some(timer) = presence_timer {
+					timer.finish_with(batch.num_rows() as u64, 0)?;
+				}
 				if filtered.num_rows() == 0 {
 					return Ok(());
 				}
-				for (_partition, partitioned) in
-					self.repartition_exchange_batch(&filtered, *partition_count, exchange_key)?
-				{
+				let exchange_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::Sink,
+							MembershipChainOperation::Exchange,
+						)
+					})
+					.transpose()?;
+				let partitioned_batches =
+					self.repartition_exchange_batch(&filtered, *partition_count, exchange_key)?;
+				if let Some(timer) = exchange_timer {
+					timer.finish_with(filtered.num_rows() as u64, 0)?;
+				}
+				for (_partition, partitioned) in partitioned_batches {
 					if partitioned.num_rows() == 0 {
 						continue;
 					}
+					let fold_timer = profile
+						.map(|profile| {
+							profile.begin_leaf(
+								MembershipChainPhase::Sink,
+								MembershipChainOperation::GroupedFold,
+							)
+						})
+						.transpose()?;
 					self.fold_bound_grouped_aggregate_batch(
 						groups,
 						group_types,
@@ -9271,6 +9494,9 @@ impl Executor {
 						aggr_expr,
 						&partitioned,
 					)?;
+					if let Some(timer) = fold_timer {
+						timer.finish_with(partitioned.num_rows() as u64, 0)?;
+					}
 				}
 				Ok(())
 			}
@@ -10572,6 +10798,7 @@ impl Executor {
 		sink: &mut ReorientedChainOutputSink<'_>,
 		morsel: Option<(MorselId, u32)>,
 		resident_baseline_bytes: u64,
+		profile: Option<&MembershipChainProfile>,
 	) -> Result<Option<()>, ExecutionError> {
 		let ExecutionPlan::Exchange {
 			input: base_input,
@@ -10632,14 +10859,25 @@ impl Executor {
 			post_filter: join0_filter,
 			probe_columns_first: false,
 		};
-		let Some(mut base_runtime) = self
+		let base_prepare_timer = profile
+			.map(|profile| {
+				profile.begin_leaf(
+					MembershipChainPhase::Lifecycle,
+					MembershipChainOperation::RuntimePrepare,
+				)
+			})
+			.transpose()?;
+		let prepared_base_runtime = self
 			.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline(
 				base_stage,
 				morsel,
 				resident_baseline_bytes,
 			)
-			.await?
-		else {
+			.await?;
+		if let Some(timer) = base_prepare_timer {
+			timer.finish()?;
+		}
+		let Some(mut base_runtime) = prepared_base_runtime else {
 			return Ok(None);
 		};
 		if matches!(base_runtime.build, ReorientedInnerJoinBuild::Spilled { .. })
@@ -10838,6 +11076,18 @@ impl Executor {
 				return Ok(None);
 			}
 		};
+		if let Some(profile) = profile {
+			profile.record_dispatch(
+				replay_id.0,
+				runtime.replay_id.0,
+				base_build_partition_count,
+				base_build_group_count,
+				partition_count,
+				group_count,
+				base_probe_columns_first,
+				probe_columns_first,
+			)?;
+		}
 
 		let base_build_result = self
 			.build_partitioned_streaming_scan_inner_build_reservoir(
@@ -10852,6 +11102,13 @@ impl Executor {
 				resident_baseline_bytes,
 				false,
 				None,
+				profile.map(|profile| {
+					(
+						profile,
+						MembershipChainPhase::BaseBuild,
+						MembershipSpillRole::BaseBuild,
+					)
+				}),
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -10865,6 +11122,15 @@ impl Executor {
 				return Err(error);
 			}
 		};
+		let base_build_spill_bytes = base_reservoir
+			.iter()
+			.flatten()
+			.try_fold(0u64, |bytes, spilled| {
+				bytes.checked_add(spilled.spill_bytes())
+			})
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "membership-chain base-build spill bytes overflow".to_string(),
+			})?;
 
 		let mut base_probe_rows = 0u64;
 		let mut base_output_rows = 0u64;
@@ -10986,7 +11252,28 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
+			loop {
+				let scan_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::BaseProbeInput,
+							MembershipChainOperation::StorageScanDecode,
+						)
+					})
+					.transpose()?;
+				let next_batch = stream.next().await;
+				if let Some(timer) = scan_timer {
+					timer.finish_with(
+						next_batch
+							.as_ref()
+							.and_then(|batch| batch.as_ref().ok())
+							.map_or(0, |batch| batch.num_rows() as u64),
+						0,
+					)?;
+				}
+				let Some(batch) = next_batch else {
+					break;
+				};
 				let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining)
 				else {
 					break;
@@ -11001,6 +11288,14 @@ impl Executor {
 						continue;
 					}
 				}
+				let write_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::BaseProbeInput,
+							MembershipChainOperation::PartitionSpillWrite,
+						)
+					})
+					.transpose()?;
 				let buckets = precompute_join_partition_buckets(
 					&right_batch,
 					&base_probe_keys,
@@ -11033,6 +11328,12 @@ impl Executor {
 						)
 						.await?;
 				}
+				if let Some(timer) = write_timer {
+					timer.finish_with(
+						right_batch.num_rows() as u64,
+						record_batch_memory_bytes(&right_batch),
+					)?;
+				}
 			}
 
 			for spilled in base_probe_partitions.iter_mut().flatten() {
@@ -11048,6 +11349,14 @@ impl Executor {
 				else {
 					continue;
 				};
+				let read_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::BaseJoin,
+							MembershipChainOperation::SpillReadDecode,
+						)
+					})
+					.transpose()?;
 				let pages_result = probe_partition.read_all_batch_pages().await;
 				let pages = match pages_result {
 					Ok(pages) => pages,
@@ -11056,7 +11365,24 @@ impl Executor {
 						return Err(error);
 					}
 				};
+				if let Some(timer) = read_timer {
+					timer.finish_with(
+						pages.iter().map(|batch| batch.num_rows() as u64).sum(),
+						pages.iter().map(record_batch_memory_bytes).sum(),
+					)?;
+				}
+				let concat_timer = profile
+					.map(|profile| {
+						profile.begin_leaf(
+							MembershipChainPhase::BaseJoin,
+							MembershipChainOperation::PostReadMaterialize,
+						)
+					})
+					.transpose()?;
 				let right_batch_result = concat_or_empty(right.schema(), &pages);
+				if let Some(timer) = concat_timer {
+					timer.finish()?;
+				}
 				drop(pages);
 				probe_partition.cleanup().await;
 				let right_batch = right_batch_result?;
@@ -11085,6 +11411,7 @@ impl Executor {
 						base_build_column_count,
 						base_projection.as_ref(),
 						resident_baseline_bytes,
+						profile.map(|profile| (profile, MembershipChainPhase::BaseJoin)),
 					)
 					.await;
 				let build_partition = base_reservoir.get_mut(partition).and_then(Option::take);
@@ -11110,6 +11437,14 @@ impl Executor {
 				}
 
 				for base_batch in base_output {
+					let intermediate_write_timer = profile
+						.map(|profile| {
+							profile.begin_leaf(
+								MembershipChainPhase::Intermediate,
+								MembershipChainOperation::PartitionSpillWrite,
+							)
+						})
+						.transpose()?;
 					for (_partition, partitioned) in self.repartition_exchange_batch(
 						&base_batch,
 						*base_partition_count,
@@ -11151,6 +11486,12 @@ impl Executor {
 								.await?;
 						}
 					}
+					if let Some(timer) = intermediate_write_timer {
+						timer.finish_with(
+							base_batch.num_rows() as u64,
+							record_batch_memory_bytes(&base_batch),
+						)?;
+					}
 				}
 			}
 			Ok(Some(()))
@@ -11191,6 +11532,19 @@ impl Executor {
 				bytes.saturating_add(spilled.spill_bytes())
 			})
 			.saturating_add(base_probe_spill_bytes);
+		let intermediate_only_spill_bytes = intermediate_spill_bytes
+			.checked_sub(base_probe_spill_bytes)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "membership-chain intermediate spill underflow".to_string(),
+			})?;
+		if let Some(profile) = profile {
+			profile
+				.record_spill_bytes(MembershipSpillRole::BaseProbeInput, base_probe_spill_bytes)?;
+			profile.record_spill_bytes(
+				MembershipSpillRole::Intermediate,
+				intermediate_only_spill_bytes,
+			)?;
+		}
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.phases.spill_micros = task
 				.phases
@@ -11280,6 +11634,7 @@ impl Executor {
 						true,
 						None,
 						None,
+						profile.map(|profile| (profile, MembershipChainPhase::TerminalBuild)),
 					)
 					.await?;
 					terminal_spill_bytes = terminal_spill_bytes.saturating_add(group_spill_bytes);
@@ -11297,6 +11652,14 @@ impl Executor {
 						else {
 							continue;
 						};
+						let read_timer = profile
+							.map(|profile| {
+								profile.begin_leaf(
+									MembershipChainPhase::Intermediate,
+									MembershipChainOperation::SpillReadDecode,
+								)
+							})
+							.transpose()?;
 						let pages_result = intermediate.read_all_batch_pages().await;
 						let pages = match pages_result {
 							Ok(pages) => pages,
@@ -11305,7 +11668,24 @@ impl Executor {
 								return Err(error);
 							}
 						};
+						if let Some(timer) = read_timer {
+							timer.finish_with(
+								pages.iter().map(|batch| batch.num_rows() as u64).sum(),
+								pages.iter().map(record_batch_memory_bytes).sum(),
+							)?;
+						}
+						let concat_timer = profile
+							.map(|profile| {
+								profile.begin_leaf(
+									MembershipChainPhase::Intermediate,
+									MembershipChainOperation::PostReadMaterialize,
+								)
+							})
+							.transpose()?;
 						let base_batch_result = concat_or_empty(base_output_schema.clone(), &pages);
+						if let Some(timer) = concat_timer {
+							timer.finish()?;
+						}
 						drop(pages);
 						intermediate.cleanup().await;
 						let base_batch = base_batch_result?;
@@ -11329,6 +11709,8 @@ impl Executor {
 								build_column_count,
 								projection.as_ref(),
 								resident_baseline_bytes,
+								profile
+									.map(|profile| (profile, MembershipChainPhase::TerminalJoin)),
 							)
 							.await;
 						let terminal_partition = terminal_partitions
@@ -11369,6 +11751,17 @@ impl Executor {
 		.await;
 		Self::cleanup_partitioned_streamed_inner_builds(intermediate_partitions).await;
 		terminal_result?;
+		if let Some(profile) = profile {
+			profile.record_spill_bytes(MembershipSpillRole::TerminalBuild, terminal_spill_bytes)?;
+			let engine_spill_bytes = base_build_spill_bytes
+				.checked_add(base_probe_spill_bytes)
+				.and_then(|bytes| bytes.checked_add(intermediate_only_spill_bytes))
+				.and_then(|bytes| bytes.checked_add(terminal_spill_bytes))
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "membership-chain engine spill total overflow".to_string(),
+				})?;
+			profile.record_engine_spill_bytes(engine_spill_bytes)?;
+		}
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.counters.build_rows = task.counters.build_rows.saturating_add(terminal_build_rows);
 			task.phases.build_micros = task
@@ -11664,6 +12057,7 @@ impl Executor {
 				0,
 				false,
 				residency_profile.as_deref_mut(),
+				None,
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
@@ -11713,6 +12107,7 @@ impl Executor {
 					build_column_count,
 					projection.as_ref(),
 					0,
+					None,
 				)
 				.await?;
 			if let Some(profile) = residency_profile.as_deref_mut() {
@@ -12301,6 +12696,7 @@ impl Executor {
 				spec.projection.as_ref(),
 				runtime_baseline_bytes,
 				true,
+				None,
 				None,
 			)
 			.await?;
@@ -14562,6 +14958,7 @@ impl Executor {
 					true,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -14666,6 +15063,11 @@ impl Executor {
 		resident_baseline_bytes: u64,
 		committed_owner_path: bool,
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
+		membership_profile: Option<(
+			&MembershipChainProfile,
+			MembershipChainPhase,
+			MembershipSpillRole,
+		)>,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -14718,6 +15120,7 @@ impl Executor {
 				false,
 				committed_owner_path.then_some(resident_baseline_bytes),
 				residency_profile.as_deref_mut(),
+				membership_profile.map(|(profile, phase, _)| (profile, phase)),
 			)
 			.await;
 		if let Err(error) = build_result {
@@ -14783,6 +15186,9 @@ impl Executor {
 				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task.counters.spill_bytes.saturating_add(total_spill_bytes);
 		});
+		if let Some((profile, _, role)) = membership_profile {
+			profile.record_spill_bytes(role, total_spill_bytes)?;
+		}
 		Ok(Some((partitioned_builds, total_build_rows)))
 	}
 
@@ -14832,6 +15238,7 @@ impl Executor {
 				build_column_count,
 				projection,
 				self.context.task_budget.memory.get(),
+				None,
 			)?;
 			total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
 			total_output_rows = total_output_rows.saturating_add(result.output_rows);
@@ -14857,6 +15264,7 @@ impl Executor {
 		build_column_count: usize,
 		projection: Option<&ProjectedInnerBuildProjection>,
 		resident_baseline_bytes: u64,
+		membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
 		let mut output = Vec::new();
 		let mut total_probe_rows = 0u64;
@@ -14897,7 +15305,21 @@ impl Executor {
 					estimate_parallel_partition_resident(spilled, partitioned_probe, key_plan);
 				let loaded_cap = join_spill_retained_footprint_memory_cap(memory_cap);
 				if resident_baseline_bytes.saturating_add(loaded_resident) <= loaded_cap {
+					let read_timer = membership_profile
+						.map(|(profile, phase)| {
+							profile.begin_leaf(phase, MembershipChainOperation::SpillReadDecode)
+						})
+						.transpose()?;
 					let build_pages = spilled.read_all_batch_pages().await?;
+					if let Some(timer) = read_timer {
+						timer.finish_with(
+							build_pages
+								.iter()
+								.map(|batch| batch.num_rows() as u64)
+								.sum(),
+							build_pages.iter().map(record_batch_memory_bytes).sum(),
+						)?;
+					}
 					let work = LoadedPartitionWork {
 						partition: *partition,
 						build_pages,
@@ -14914,11 +15336,16 @@ impl Executor {
 						memory_cap,
 						resident_baseline_bytes,
 					};
-					let result = run_loaded_partition_work(work)?;
+					let result = run_loaded_partition_work(work, membership_profile)?;
 					total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
 					total_output_rows = total_output_rows.saturating_add(result.output_rows);
 					output.extend(result.output);
 				} else {
+					let index_timer = membership_profile
+						.map(|(profile, phase)| {
+							profile.begin_leaf(phase, MembershipChainOperation::IndexBuild)
+						})
+						.transpose()?;
 					if let Err(error) = spilled
 						.rebuild_index_from_pages(
 							key_plan,
@@ -14930,7 +15357,15 @@ impl Executor {
 					{
 						return Err(error);
 					}
+					if let Some(timer) = index_timer {
+						timer.finish()?;
+					}
 					let mut partition_output = Vec::new();
+					let lookup_timer = membership_profile
+						.map(|(profile, phase)| {
+							profile.begin_leaf(phase, MembershipChainOperation::LookupSelection)
+						})
+						.transpose()?;
 					let (probe_rows, output_rows) = self
 						.visit_streaming_spilled_inner_probe_batch(
 							spilled,
@@ -14951,6 +15386,9 @@ impl Executor {
 							},
 						)
 						.await?;
+					if let Some(timer) = lookup_timer {
+						timer.finish_with(partitioned_probe.num_rows() as u64, 0)?;
+					}
 					total_probe_rows = total_probe_rows.saturating_add(probe_rows);
 					total_output_rows = total_output_rows.saturating_add(output_rows);
 					output.extend(partition_output);
@@ -15054,6 +15492,7 @@ impl Executor {
 					true,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -15142,7 +15581,7 @@ impl Executor {
 					};
 					handles.push(tokio::task::spawn_blocking(move || {
 						let _permit = permit;
-						run_loaded_partition_work(work)
+						run_loaded_partition_work(work, None)
 					}));
 				}
 				let mut slots: Vec<Option<LoadedPartitionResult>> =
@@ -15257,7 +15696,7 @@ impl Executor {
 							memory_cap,
 							resident_baseline_bytes: 0,
 						};
-						let result = match run_loaded_partition_work(work) {
+						let result = match run_loaded_partition_work(work, None) {
 							Ok(result) => result,
 							Err(error) => {
 								Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds)
@@ -16827,6 +17266,7 @@ mod tests {
 				0,
 				false,
 				None,
+				None,
 			)
 			.await
 			.expect("reservoir build")
@@ -16861,6 +17301,7 @@ mod tests {
 				build_schema.fields().len(),
 				None,
 				0,
+				None,
 			)
 			.await;
 		Executor::cleanup_partitioned_streamed_inner_builds(reservoir).await;
@@ -16893,6 +17334,7 @@ mod tests {
 				0,
 				false,
 				Some(&mut residency_profile),
+				None,
 			)
 			.await
 			.expect("enabled reservoir build")
@@ -16913,6 +17355,7 @@ mod tests {
 				build_schema.fields().len(),
 				None,
 				0,
+				None,
 			)
 			.await
 			.expect("enabled reservoir probe");
@@ -17046,6 +17489,7 @@ mod tests {
 				None,
 				join_spill_retained_footprint_memory_cap(budget.memory.get()),
 				true,
+				None,
 				None,
 			)
 			.await;

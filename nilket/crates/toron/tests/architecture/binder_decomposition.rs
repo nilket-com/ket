@@ -213,6 +213,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// ADR 438: the query-neutral fused global-fold join/filter diagnosis ledger stays
 				// inside the semantic join executor split.
 				"crates/toron/src/exec/join/global_fold_profile.rs",
+				// ADR 441: query-neutral membership-chain phase/operation diagnostics stay inside
+				// the semantic join executor split.
+				"crates/toron/src/exec/join/membership_chain_profile.rs",
 				// ADR 351: join spill storage submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/spill.rs",
 				// ADR 430: join spill placement policy stays inside the semantic join executor split.

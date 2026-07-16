@@ -134,6 +134,54 @@ pub(crate) fn adr438_global_fold_join_filter_profile_is_shape_owned_and_off_by_d
 }
 
 #[test]
+pub(crate) fn adr441_membership_chain_profile_is_post_fence_exclusive_and_query_neutral() {
+	let manifest = manifest_dir();
+	let join =
+		std::fs::read_to_string(manifest.join("src/exec/join.rs")).expect("read exec join source");
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let profile_path = manifest.join("src/exec/join/membership_chain_profile.rs");
+	let profile = std::fs::read_to_string(&profile_path).expect("read ADR 441 profile source");
+
+	assert!(join.contains("mod membership_chain_profile;"));
+	assert!(profile_path.exists(), "missing ADR 441 profile owner");
+	assert!(profile.contains("TORON_MEMBERSHIP_CHAIN_PROFILE_DIR"));
+	assert!(profile.contains("return Ok(None);"));
+	assert!(profile.contains("active_leaf: Option<ActiveLeaf>"));
+	assert!(profile.contains("checked_sub(leaf_total)"));
+	assert!(profile.contains("spill-role reconciliation failed"));
+	assert!(profile.contains("presence/root reconciliation failed"));
+	assert!(streaming.contains("let membership_profile = MembershipChainProfile::from_env()?;"));
+	let owner = brace_blocks_after_marker(
+		&streaming,
+		"pub(in crate::exec) async fn try_streaming_projected_left_semi_grouped_aggregate",
+	);
+	let [(_, owner)] = owner.as_slice() else {
+		panic!("expected one projected LeftSemi grouped owner");
+	};
+	let fence = owner
+		.find("let stage = stages.pop().expect")
+		.expect("committed membership-chain stage");
+	let construct = owner
+		.find("MembershipChainProfile::from_env()?")
+		.expect("profile construction in live owner");
+	assert!(
+		fence < construct,
+		"profile construction must follow shape admission"
+	);
+	assert!(owner.contains("profile.persist()?"));
+	assert!(streaming.contains("MembershipChainOperation::StorageScanDecode"));
+	assert!(streaming.contains("MembershipChainOperation::PartitionSpillWrite"));
+	assert!(streaming.contains("MembershipChainOperation::SpillReadDecode"));
+	assert!(streaming.contains("MembershipChainOperation::LookupSelection"));
+	assert!(streaming.contains("MembershipChainOperation::ArrowMaterialize"));
+	assert!(
+		!profile.contains("q18") && !profile.contains("TPC-H") && !streaming.contains("TORON_Q18"),
+		"ADR 441 profiler must stay shape-owned and query-neutral"
+	);
+}
+
+#[test]
 pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_rebuild() {
 	let manifest = manifest_dir();
 	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))

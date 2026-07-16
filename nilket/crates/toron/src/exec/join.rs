@@ -4,6 +4,7 @@ mod build_profile;
 mod build_rows;
 mod columns;
 mod global_fold_profile;
+mod membership_chain_profile;
 mod residency_profile;
 mod spill;
 mod spill_placement;
@@ -20,6 +21,9 @@ pub(super) use self::build_rows::{
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 pub(in crate::exec) use self::global_fold_profile::{
 	GlobalFoldJoinFilterProfile, GlobalFoldProfileLeaf,
+};
+pub(in crate::exec) use self::membership_chain_profile::{
+	MembershipChainOperation, MembershipChainPhase, MembershipChainProfile, MembershipSpillRole,
 };
 pub(in crate::exec) use self::spill::SpilledInnerJoinResidencySnapshot;
 pub(in crate::exec) use self::spill::{PinnedSpilledInnerBuildStats, SpilledInnerJoinBuild};

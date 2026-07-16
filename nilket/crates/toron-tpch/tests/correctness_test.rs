@@ -3461,6 +3461,7 @@ fn q18_oracle(rows: &[Q18Row]) -> Q18Oracle {
 		qualifying_orders: rows.len().max(1),
 		threshold_fail_orders: 1,
 		selected_lineitem_rows: 1,
+		qualifying_lineitem_rows: 1,
 	}
 }
 
@@ -3511,6 +3512,7 @@ fn strict_q18_non_vacuity_guard_stays_armed() {
 		qualifying_orders: 0,
 		threshold_fail_orders: 0,
 		selected_lineitem_rows: 0,
+		qualifying_lineitem_rows: 0,
 	};
 	let error = compare_strict_q18(&[q18_batch(&[])], &oracle)
 		.expect_err("empty q18 oracle must be rejected");

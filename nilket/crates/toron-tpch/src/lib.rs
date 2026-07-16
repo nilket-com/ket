@@ -12086,6 +12086,7 @@ pub struct Q18Oracle {
 	pub qualifying_orders: usize,
 	pub threshold_fail_orders: usize,
 	pub selected_lineitem_rows: usize,
+	pub qualifying_lineitem_rows: usize,
 }
 
 #[derive(Debug)]
@@ -12116,12 +12117,13 @@ where
 		}
 	}
 
-	fn next_group(&mut self) -> Result<Option<(i64, i128)>, String> {
+	fn next_group(&mut self) -> Result<Option<(i64, i128, usize)>, String> {
 		let Some((orderkey, quantity_raw)) = self.rows.next() else {
 			return Ok(None);
 		};
 		checked_q18_counter_increment(&mut self.selected_lineitem_rows, "selected_lineitem_rows")?;
 		let mut sum_raw = quantity_raw;
+		let mut group_rows = 1_usize;
 
 		while let Some((next_orderkey, _)) = self.rows.peek() {
 			if *next_orderkey < orderkey {
@@ -12137,12 +12139,13 @@ where
 				&mut self.selected_lineitem_rows,
 				"selected_lineitem_rows",
 			)?;
+			checked_q18_counter_increment(&mut group_rows, "lineitem_group_rows")?;
 			sum_raw = sum_raw
 				.checked_add(quantity_raw)
 				.ok_or_else(|| format!("q18 order quantity overflow for orderkey {orderkey}"))?;
 		}
 
-		Ok(Some((orderkey, sum_raw)))
+		Ok(Some((orderkey, sum_raw, group_rows)))
 	}
 }
 
@@ -12172,6 +12175,7 @@ fn q18_oracle_frugal_from_rows(
 	let mut next_group = grouped_lineitems.next_group()?;
 	let mut pending_rows = Vec::new();
 	let mut qualifying_orders = 0_usize;
+	let mut qualifying_lineitem_rows = 0_usize;
 	let mut threshold_fail_orders = 0_usize;
 	let mut previous_orderkey = None;
 	for (orderkey, custkey, orderdate, totalprice_raw) in orders {
@@ -12183,10 +12187,10 @@ fn q18_oracle_frugal_from_rows(
 		}
 		previous_orderkey = Some(orderkey);
 
-		while next_group.is_some_and(|(lineitem_orderkey, _)| lineitem_orderkey < orderkey) {
+		while next_group.is_some_and(|(lineitem_orderkey, _, _)| lineitem_orderkey < orderkey) {
 			next_group = grouped_lineitems.next_group()?;
 		}
-		let Some((lineitem_orderkey, sum_raw)) = next_group else {
+		let Some((lineitem_orderkey, sum_raw, group_rows)) = next_group else {
 			continue;
 		};
 		if lineitem_orderkey != orderkey {
@@ -12198,6 +12202,9 @@ fn q18_oracle_frugal_from_rows(
 		}
 		if sum_raw > 30_000 {
 			checked_q18_counter_increment(&mut qualifying_orders, "qualifying_orders")?;
+			qualifying_lineitem_rows = qualifying_lineitem_rows
+				.checked_add(group_rows)
+				.ok_or_else(|| "q18 qualifying_lineitem_rows counter overflow".to_string())?;
 			pending_rows.push(Q18PendingRow {
 				c_custkey: custkey,
 				o_orderkey: orderkey,
@@ -12259,6 +12266,7 @@ fn q18_oracle_frugal_from_rows(
 		qualifying_orders,
 		threshold_fail_orders,
 		selected_lineitem_rows: grouped_lineitems.selected_lineitem_rows,
+		qualifying_lineitem_rows,
 	})
 }
 
@@ -12300,28 +12308,37 @@ mod adr425_q18_frugal_oracle {
 				(orderkey, (custkey, orderdate, totalprice_raw))
 			})
 			.collect();
-		let mut quantity_by_order: HashMap<i64, i128> = HashMap::new();
+		let mut quantity_by_order: HashMap<i64, (i128, usize)> = HashMap::new();
 		let mut selected_lineitem_rows = 0_usize;
 		for (orderkey, quantity_raw) in lineitems {
 			selected_lineitem_rows += 1;
-			let entry = quantity_by_order.entry(orderkey).or_insert(0);
-			*entry = entry
+			let entry = quantity_by_order.entry(orderkey).or_insert((0, 0));
+			entry.0 = entry
+				.0
 				.checked_add(quantity_raw)
 				.ok_or_else(|| "q18 order quantity overflow".to_string())?;
+			entry.1 = entry
+				.1
+				.checked_add(1)
+				.ok_or_else(|| "q18 lineitem group row counter overflow".to_string())?;
 		}
 
 		let mut rows = Vec::new();
 		let mut qualifying_orders = 0_usize;
+		let mut qualifying_lineitem_rows = 0_usize;
 		let mut threshold_fail_orders = 0_usize;
 		for (orderkey, (custkey, orderdate, totalprice_raw)) in orders {
 			let Some(c_name) = customers.get(&custkey) else {
 				continue;
 			};
-			let Some(sum_raw) = quantity_by_order.get(&orderkey).copied() else {
+			let Some((sum_raw, group_rows)) = quantity_by_order.get(&orderkey).copied() else {
 				continue;
 			};
 			if sum_raw > 30_000 {
 				qualifying_orders += 1;
+				qualifying_lineitem_rows = qualifying_lineitem_rows
+					.checked_add(group_rows)
+					.ok_or_else(|| "q18 qualifying lineitem counter overflow".to_string())?;
 				rows.push(Q18Row {
 					c_name: c_name.clone(),
 					c_custkey: custkey,
@@ -12347,6 +12364,7 @@ mod adr425_q18_frugal_oracle {
 			qualifying_orders,
 			threshold_fail_orders,
 			selected_lineitem_rows,
+			qualifying_lineitem_rows,
 		})
 	}
 
@@ -12392,6 +12410,21 @@ mod adr425_q18_frugal_oracle {
 	}
 
 	#[test]
+	#[ignore = "sf=10 oracle census; run explicitly for ADR evidence"]
+	fn sf10_independent_row_flow_receipt() {
+		let oracle = strict_q18_oracle(10.0).expect("sf=10 q18 oracle");
+		assert_eq!(oracle.qualifying_orders, 624);
+		assert_eq!(oracle.selected_lineitem_rows, 59_986_052);
+		assert_eq!(oracle.qualifying_lineitem_rows, 4_368);
+		eprintln!(
+			"q18 sf10 oracle: qualifying_orders={} selected_lineitem_rows={} qualifying_lineitem_rows={}",
+			oracle.qualifying_orders,
+			oracle.selected_lineitem_rows,
+			oracle.qualifying_lineitem_rows
+		);
+	}
+
+	#[test]
 	fn merge_preserves_all_dense_continue_cases_and_counters() {
 		let customers = vec![(1, "one".to_string()), (2, "two".to_string())];
 		let orders = vec![
@@ -12415,6 +12448,7 @@ mod adr425_q18_frugal_oracle {
 		assert_eq!(frugal.qualifying_orders, 1);
 		assert_eq!(frugal.threshold_fail_orders, 1);
 		assert_eq!(frugal.selected_lineitem_rows, 5);
+		assert_eq!(frugal.qualifying_lineitem_rows, 1);
 		assert_eq!(frugal.rows.len(), 1);
 		assert_eq!(frugal.rows[0].o_orderkey, 40);
 		assert_eq!(frugal.rows[0].sum_raw, 30_001);
@@ -12430,6 +12464,7 @@ mod adr425_q18_frugal_oracle {
 		.expect("one-group q18 oracle");
 		assert_eq!(oracle.selected_lineitem_rows, 2);
 		assert_eq!(oracle.qualifying_orders, 1);
+		assert_eq!(oracle.qualifying_lineitem_rows, 2);
 		assert_eq!(oracle.rows[0].sum_raw, 30_001);
 	}
 
@@ -12511,6 +12546,7 @@ mod adr425_q18_frugal_oracle {
 			.expect("101-row frugal oracle");
 		assert_eq!(oracle.rows.len(), 101);
 		assert_eq!(oracle.qualifying_orders, 101);
+		assert_eq!(oracle.qualifying_lineitem_rows, 101);
 	}
 }
 
