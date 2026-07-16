@@ -2382,6 +2382,11 @@ impl SpilledInnerJoinBuild {
 	}
 
 	#[cfg(test)]
+	pub(in crate::exec) fn legacy_index_is_empty(&self) -> bool {
+		self.index.is_empty()
+	}
+
+	#[cfg(test)]
 	pub(in crate::exec) fn page_decode_count(&self) -> u64 {
 		self.page_decode_count
 	}
@@ -4916,6 +4921,71 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn partitioned_unindexed_rebuild_selects_primitive_int64_before_probe() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("partitioned_primitive_rebuild");
+		let keys = [ColumnOrdinal(0)];
+		for partition_keys in [vec![1, 2, 2], vec![3, 4, 4]] {
+			let mut primitive =
+				SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+					.await
+					.expect("create primitive partition spill");
+			let mut legacy =
+				SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+					.await
+					.expect("create legacy partition spill");
+			let batch = batch_with_keys(&partition_keys);
+			for build in [&mut primitive, &mut legacy] {
+				build
+					.write_batch_chunks_unindexed(&batch, JoinKeyPlan::Int64, &keys, false, budget)
+					.await
+					.expect("write unindexed partition");
+				build.finish(budget).await.expect("finish partition spill");
+				build.release_write_scratch();
+			}
+
+			primitive.use_compact_resident_index();
+			primitive
+				.rebuild_index_from_pages(JoinKeyPlan::Int64, &keys, false, budget)
+				.await
+				.expect("rebuild primitive partition index");
+			legacy
+				.rebuild_index_from_pages(JoinKeyPlan::Int64, &keys, false, budget)
+				.await
+				.expect("rebuild legacy partition index");
+
+			assert!(primitive.uses_compact_int64_index());
+			assert!(primitive.legacy_index_is_empty());
+			assert_eq!(primitive.legacy_index_insert_count(), 0);
+			assert_eq!(
+				primitive.resident_index_bytes(),
+				primitive.computed_index_bytes()
+			);
+			assert!(legacy.uses_hash_index());
+			assert_eq!(
+				legacy.legacy_index_insert_count(),
+				partition_keys.len() as u64
+			);
+			for key in partition_keys {
+				assert_eq!(
+					primitive
+						.lookup(&JoinKey::Int64(key))
+						.await
+						.expect("primitive lookup"),
+					legacy
+						.lookup(&JoinKey::Int64(key))
+						.await
+						.expect("legacy lookup")
+				);
+			}
+
+			primitive.cleanup().await;
+			legacy.cleanup().await;
+		}
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
 	async fn inner_spill_generic_and_null_safe_keep_hash_index_fence() {
 		let budget = test_task_budget();
 		let spill_dir = test_spill_dir("inner_hash_fence");
@@ -4924,9 +4994,10 @@ mod tests {
 				.await
 				.expect("create generic inner spill");
 		let keys = [ColumnOrdinal(0)];
+		let generic_batch = batch_with_keys(&[1, 2]);
 		generic
-			.write_batch_chunks(
-				&batch_with_keys(&[1, 2]),
+			.write_batch_chunks_unindexed(
+				&generic_batch,
 				JoinKeyPlan::Generic,
 				&keys,
 				false,
@@ -4934,7 +5005,14 @@ mod tests {
 			)
 			.await
 			.expect("write generic keys");
+		generic.finish(budget).await.expect("finish generic spill");
+		generic.release_write_scratch();
+		generic
+			.rebuild_index_from_pages(JoinKeyPlan::Generic, &keys, false, budget)
+			.await
+			.expect("rebuild generic index");
 		assert!(generic.uses_hash_index());
+		assert_eq!(generic.legacy_index_insert_count(), 2);
 		assert_eq!(
 			generic.resident_index_bytes(),
 			generic.computed_index_bytes()
@@ -4947,22 +5025,101 @@ mod tests {
 			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
 				.await
 				.expect("create null-safe inner spill");
+		let null_safe_batch = nullable_batch_with_keys(&[Some(1), None, Some(2)]);
+		let null_safe_probe_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+			"probe_k",
+			DataType::Int64,
+			true,
+		)]));
+		let null_safe_plan = JoinKeyPlan::from_build_schema_and_probe_schema(
+			&null_safe_batch.schema(),
+			&keys,
+			&null_safe_probe_schema,
+			&keys,
+			true,
+		)
+		.expect("derive null-safe key plan");
+		assert_eq!(null_safe_plan, JoinKeyPlan::Generic);
 		null_safe
-			.write_batch_chunks(
-				&batch_with_keys(&[1, 2]),
-				JoinKeyPlan::Int64,
-				&keys,
-				true,
-				budget,
-			)
+			.write_batch_chunks_unindexed(&null_safe_batch, null_safe_plan, &keys, true, budget)
 			.await
 			.expect("write null-safe keys");
+		null_safe
+			.finish(budget)
+			.await
+			.expect("finish null-safe spill");
+		null_safe.release_write_scratch();
+		null_safe
+			.rebuild_index_from_pages(null_safe_plan, &keys, true, budget)
+			.await
+			.expect("rebuild null-safe index");
 		assert!(null_safe.uses_hash_index());
+		assert_eq!(null_safe.legacy_index_insert_count(), 3);
 		assert_eq!(
 			null_safe.resident_index_bytes(),
 			null_safe.computed_index_bytes()
 		);
+		let arrays = key_arrays(&null_safe_batch, &keys).expect("null-safe key arrays");
+		let null_key = join_key_at(null_safe_plan, &arrays, 1, true)
+			.expect("encode null-safe null")
+			.expect("null-safe null key");
+		assert_eq!(
+			null_safe.lookup(&null_key).await.expect("lookup null key"),
+			vec![SpilledBatchRowRef {
+				page_index: 0,
+				row: 1,
+			}]
+		);
 		null_safe.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn primitive_rebuild_resident_guard_fires_at_rebuild_site() {
+		let write_budget = test_task_budget();
+		let tight_budget = test_task_budget_with_memory(1);
+		let spill_dir = test_spill_dir("primitive_rebuild_guard");
+		let mut build = SpilledInnerJoinBuild::create(
+			write_budget,
+			Arc::new(BlockingFileOps),
+			spill_dir.clone(),
+		)
+		.await
+		.expect("create guarded primitive spill");
+		let keys = [ColumnOrdinal(0)];
+		build
+			.write_batch_chunks_unindexed(
+				&batch_with_keys(&(0..512).collect::<Vec<_>>()),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				write_budget,
+			)
+			.await
+			.expect("write guarded primitive spill");
+		build
+			.finish(write_budget)
+			.await
+			.expect("finish guarded spill");
+		build.release_write_scratch();
+		build.use_compact_resident_index();
+		let error = build
+			.rebuild_index_from_pages(JoinKeyPlan::Int64, &keys, false, tight_budget)
+			.await
+			.expect_err("tight budget must reject primitive rebuild");
+		match error {
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer,
+				detail,
+				..
+			} => {
+				assert_eq!(producer, "streamed inner join build spill resident state");
+				assert!(detail.to_string().contains("rebuild_index"));
+			}
+			other => panic!("unexpected primitive rebuild guard error: {other:?}"),
+		}
+		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 

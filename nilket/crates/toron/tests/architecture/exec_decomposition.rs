@@ -134,6 +134,59 @@ pub(crate) fn adr438_global_fold_join_filter_profile_is_shape_owned_and_off_by_d
 }
 
 #[test]
+pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_rebuild() {
+	let manifest = manifest_dir();
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let owners = brace_blocks_after_marker(
+		&streaming,
+		"async fn try_visit_partitioned_streamed_inner_scan_build_scan_probe_chunks",
+	);
+	let [(_, owner)] = owners.as_slice() else {
+		panic!("expected exactly one partitioned streamed scan-build owner");
+	};
+
+	let eligibility = owner
+		.find("let use_primitive_resident_index =")
+		.expect("primitive index eligibility in live owner");
+	let non_null_safe = owner[eligibility..]
+		.find("!null_safe_keys")
+		.map(|offset| eligibility + offset)
+		.expect("non-null-safe primitive index fence in live owner");
+	let primitive_variants = owner[non_null_safe..]
+		.find("matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64)")
+		.map(|offset| non_null_safe + offset)
+		.expect("primitive key-plan fence in live owner");
+	let guarded_opt_in = owner[primitive_variants..]
+		.find("if use_primitive_resident_index")
+		.map(|offset| primitive_variants + offset)
+		.expect("guarded primitive index opt-in in live owner");
+	let opt_in = owner[guarded_opt_in..]
+		.find("spilled.use_compact_resident_index();")
+		.map(|offset| guarded_opt_in + offset)
+		.expect("compact resident index opt-in in live owner");
+	let rebuild = owner[opt_in..]
+		.find(".rebuild_index_from_pages(")
+		.map(|offset| opt_in + offset)
+		.expect("adjacent resident index rebuild in live owner");
+
+	assert!(eligibility < primitive_variants);
+	assert!(eligibility < non_null_safe);
+	assert!(non_null_safe < primitive_variants);
+	assert!(primitive_variants < guarded_opt_in);
+	assert!(guarded_opt_in < opt_in);
+	assert!(opt_in < rebuild, "primitive opt-in must precede rebuild");
+	assert!(
+		!owner[opt_in..rebuild].contains("rebuild_index_from_pages"),
+		"no intervening rebuild may bypass the guarded primitive opt-in"
+	);
+	assert!(
+		!owner.contains("q19") && !owner.contains("TORON_Q19"),
+		"primitive index selection must remain shape-owned"
+	);
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 

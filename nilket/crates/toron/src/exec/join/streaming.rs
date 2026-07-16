@@ -4854,6 +4854,8 @@ impl Executor {
 			probe_keys,
 			null_safe_keys,
 		)?;
+		let use_primitive_resident_index =
+			!null_safe_keys && matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64);
 		let materialized_output_schema = if probe_columns_first {
 			concat_join_schema(&build_plan.schema(), &probe_plan.schema())
 		} else {
@@ -4928,6 +4930,9 @@ impl Executor {
 				spilled.release_write_scratch();
 				group_build_rows = group_build_rows.saturating_add(spilled.input_row_count());
 				if spilled.input_row_count() > 0 {
+					if use_primitive_resident_index {
+						spilled.use_compact_resident_index();
+					}
 					if let Err(error) = spilled
 						.rebuild_index_from_pages(
 							key_plan,
