@@ -956,6 +956,21 @@ fn duckdb_binary() -> String {
 	std::env::var("TORON_TPCH_DUCKDB_BIN").unwrap_or_else(|_| "duckdb".to_string())
 }
 
+fn toron_binary() -> Result<std::path::PathBuf, String> {
+	let current = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+	Ok(toron_binary_from_override(
+		std::env::var_os("TORON_TPCH_TORON_BIN"),
+		current,
+	))
+}
+
+fn toron_binary_from_override(
+	candidate: Option<std::ffi::OsString>,
+	current: std::path::PathBuf,
+) -> std::path::PathBuf {
+	candidate.map(Into::into).unwrap_or(current)
+}
+
 fn duckdb_cli_version(duckdb_bin: &str) -> Result<Option<String>, String> {
 	match Command::new(duckdb_bin).arg("--version").output() {
 		Ok(output) if output.status.success() => {
@@ -2226,7 +2241,7 @@ fn push_row_flag(row: &mut serde_json::Value, flag: &str) {
 
 #[cfg(unix)]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
-	let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+	let exe = toron_binary()?;
 	let start = Instant::now();
 	let mut child = Command::new(exe)
 		.args(args)
@@ -2297,7 +2312,7 @@ fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
 
 #[cfg(not(unix))]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
-	let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+	let exe = toron_binary()?;
 	let start = Instant::now();
 	let output = Command::new(exe)
 		.args(args)
@@ -2378,6 +2393,15 @@ fn summarize_query_rows(
 	} else {
 		0.0
 	};
+	let raw_execute_samples = rows
+		.iter()
+		.filter_map(|row| {
+			Some(serde_json::json!({
+				"run_index": row.get("run_index")?.as_u64()?,
+				"execute_ms": row.get("execute_ms")?.as_f64()?,
+			}))
+		})
+		.collect::<Vec<_>>();
 	let peak_rss_kib_max = rows
 		.iter()
 		.filter_map(|row| row.get("peak_rss_kib").and_then(serde_json::Value::as_u64))
@@ -2482,8 +2506,10 @@ fn summarize_query_rows(
 				.get("execute_ms_spread_ratio")
 				.and_then(serde_json::Value::as_f64)
 				.unwrap_or(0.0);
-			let band = REGRESSION_THRESHOLD.max(2.0 * spread_ratio.max(baseline_spread));
-			if baseline_median > 0.0 && (execute_median - baseline_median) / baseline_median > band
+			let regression_alarm_band =
+				REGRESSION_THRESHOLD.max(2.0 * spread_ratio.max(baseline_spread));
+			if baseline_median > 0.0
+				&& (execute_median - baseline_median) / baseline_median > regression_alarm_band
 			{
 				push_summary_flag(&mut flags, "slower_than_baseline");
 			}
@@ -2504,6 +2530,7 @@ fn summarize_query_rows(
 		"execute_ms_min": execute_min,
 		"execute_ms_max": execute_max,
 		"execute_ms_spread_ratio": spread_ratio,
+		"execute_ms_samples": raw_execute_samples,
 		"peak_rss_kib_max": peak_rss_kib_max,
 		"spill_bytes_max": spill_bytes_max,
 		"plan_fingerprint": plan_fingerprint,
@@ -2538,6 +2565,77 @@ fn median(values: &mut [f64]) -> f64 {
 	} else {
 		values[mid]
 	}
+}
+
+pub const MATERIALITY_FLOOR: f64 = 0.10;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PairedShift {
+	pub point: f64,
+	pub lower: f64,
+	pub upper: f64,
+	pub pairs: usize,
+}
+
+/// Deterministic Hodges–Lehmann paired shift with an exact two-sided
+/// Wilcoxon signed-rank interval. Zero differences are omitted from the rank
+/// calculation; fewer than six non-zero pairs cannot reach alpha=.05.
+pub fn paired_median_shift(diffs: &[f64]) -> Result<PairedShift, String> {
+	if diffs.iter().any(|value| !value.is_finite()) {
+		return Err("paired differences must be finite".to_string());
+	}
+	let nonzero = diffs
+		.iter()
+		.copied()
+		.filter(|value| *value != 0.0)
+		.collect::<Vec<_>>();
+	if nonzero.len() < 6 {
+		return Err("at least six non-zero paired differences are required".to_string());
+	}
+	if nonzero.len() > 20 {
+		return Err("at most twenty non-zero paired differences are supported".to_string());
+	}
+	let mut walsh = Vec::with_capacity(nonzero.len() * (nonzero.len() + 1) / 2);
+	for (index, left) in nonzero.iter().enumerate() {
+		for right in nonzero.iter().skip(index) {
+			walsh.push((left + right) / 2.0);
+		}
+	}
+	walsh.sort_by(f64::total_cmp);
+	let point = walsh[walsh.len() / 2];
+	let n = nonzero.len();
+	let total_rank_sum = n * (n + 1) / 2;
+	let mut counts = vec![0_u64; total_rank_sum + 1];
+	for mask in 0_u64..(1_u64 << n) {
+		let mut sum = 0usize;
+		for rank in 0..n {
+			if mask & (1_u64 << rank) != 0 {
+				sum += rank + 1;
+			}
+		}
+		counts[sum] += 1;
+	}
+	let total = 1_u64 << n;
+	let mut lower_tail = 0_u64;
+	let mut critical = 0usize;
+	for (rank, count) in counts.iter().enumerate() {
+		lower_tail += count;
+		if (lower_tail * 2) as f64 / total as f64 <= 0.05 {
+			critical = rank;
+		}
+	}
+	let lower_index = critical.saturating_sub(1).min(walsh.len() - 1);
+	let upper_index = walsh.len().saturating_sub(critical + 1);
+	Ok(PairedShift {
+		point,
+		lower: walsh[lower_index],
+		upper: walsh[upper_index],
+		pairs: n,
+	})
+}
+
+pub fn material_effect(point: f64, baseline_median: f64) -> bool {
+	point.abs() >= MATERIALITY_FLOOR * baseline_median.abs()
 }
 
 fn read_baseline_rows(path: &Path) -> BTreeMap<String, serde_json::Value> {
@@ -2821,6 +2919,77 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert!(flags.contains(&"slower_than_baseline".to_string()));
 		assert!(!flags.contains(&"plan_changed".to_string()));
+	}
+
+	#[test]
+	fn adr447_perf_summary_retains_raw_per_run_samples() {
+		let rows = (0..7)
+			.map(|index| perf_row("q06", 100.0 + f64::from(index), "plan-a", true))
+			.collect::<Vec<_>>();
+		let summary = summarize_perf_rows(&rows, 7, 1, &BTreeMap::new());
+		let samples = summary[0]["execute_ms_samples"]
+			.as_array()
+			.expect("raw samples");
+		assert_eq!(samples.len(), 7);
+		assert_eq!(samples[0]["run_index"], 0);
+		assert_eq!(samples[6]["execute_ms"], 106.0);
+		assert_eq!(summary[0]["execute_ms_min"], 100.0);
+		assert_eq!(summary[0]["execute_ms_max"], 106.0);
+	}
+
+	#[test]
+	fn adr447_estimator_detects_a_known_median_difference() {
+		let shift =
+			paired_median_shift(&[12.0, 11.5, 12.5, 11.8, 12.2, 12.1, 11.9, 12.4, 11.7, 12.3])
+				.expect("estimator");
+		assert!(shift.lower > 0.0 && shift.upper > 0.0);
+		assert!((shift.point - 12.0).abs() < 0.5);
+		assert!(material_effect(shift.point, 10.0));
+	}
+
+	#[test]
+	fn adr447_estimator_rejects_a_null_difference() {
+		let shift =
+			paired_median_shift(&[-1.0, 1.0, -0.5, 0.5, -0.25, 0.25, -0.1, 0.1, -0.05, 0.05])
+				.expect("estimator");
+		assert!(shift.lower <= 0.0 && shift.upper >= 0.0);
+	}
+
+	#[test]
+	fn adr447_estimator_separates_detectable_from_material() {
+		let shift = paired_median_shift(&[2.0, 2.1, 1.9, 2.05, 1.95, 2.02, 1.98, 2.03, 1.97, 2.01])
+			.expect("estimator");
+		assert!(shift.lower > 0.0 && shift.upper > 0.0);
+		assert!(!material_effect(shift.point, 100.0));
+	}
+
+	#[test]
+	fn adr447_estimator_is_not_range_based() {
+		let concentrated = paired_median_shift(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0])
+			.expect("concentrated estimator");
+		let dispersed = paired_median_shift(&[0.5, 0.6, 0.7, 0.8, 1.2, 1.3, 1.4, 1.5, 1.8, 2.5])
+			.expect("dispersed estimator");
+		assert_ne!(
+			(concentrated.lower, concentrated.upper),
+			(dispersed.lower, dispersed.upper)
+		);
+	}
+
+	#[test]
+	fn adr447_estimator_is_deterministic_and_rejects_short_samples() {
+		let diffs = [12.0, 11.5, 12.5, 11.8, 12.2, 12.1, 11.9, 12.4, 11.7, 12.3];
+		assert_eq!(paired_median_shift(&diffs), paired_median_shift(&diffs));
+		assert!(paired_median_shift(&[1.0, 2.0, 3.0, 4.0, 5.0]).is_err());
+	}
+
+	#[test]
+	fn adr447_perf_child_binary_defaults_and_honors_override() {
+		let current = std::path::PathBuf::from("current-toron-tpch");
+		assert_eq!(toron_binary_from_override(None, current.clone()), current);
+		assert_eq!(
+			toron_binary_from_override(Some("comparison-toron-tpch".into()), current),
+			std::path::PathBuf::from("comparison-toron-tpch")
+		);
 	}
 
 	#[test]

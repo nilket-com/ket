@@ -1660,6 +1660,7 @@ impl StorageScan for ParquetHarnessScan {
 
 		let table_id = request.table_id.0;
 		let projected_columns = request.projected_columns.clone();
+		let runtime_filter_present = request.runtime_filter.is_some();
 		let mut pbc = request.pbc_predicate.clone();
 		let full_column_count = source.schema.fields().len();
 		let mut pbc_referenced_columns = Vec::new();
@@ -1685,17 +1686,34 @@ impl StorageScan for ParquetHarnessScan {
 			pbc_referenced_columns.sort_unstable();
 			pbc_referenced_columns.dedup();
 			if let Some(projected) = &projected_columns {
-				append_projection_to_pbc(program, projected)?;
+				if !runtime_filter_present {
+					append_projection_to_pbc(program, projected)?;
+				}
 			}
 			Some(columns)
 		} else {
 			None
 		};
-		let runtime_filter_present = request.runtime_filter.is_some();
 		if runtime_filter_present {
-			// Runtime-filter ordinals are source-schema ordinals. Read the complete source
-			// batch so filtering precedes PBC/projection, matching the storage-ring path.
-			pbc_projection = Some((0..full_column_count).collect());
+			// Runtime-filter ordinals are source-schema ordinals. Read the filter keys
+			// alongside the columns needed by PBC/output, then inflate to the source
+			// schema before filtering. This preserves source-ordinal semantics without
+			// forcing every lineitem column through the harness.
+			let mut columns = pbc_projection.take().unwrap_or_default();
+			if let Some(projected) = &projected_columns {
+				columns.extend(projected.iter().map(|column| column.0 as usize));
+			}
+			if let Some(descriptor) = request.runtime_filter.as_ref() {
+				columns.extend(
+					descriptor
+						.probe_key_columns
+						.iter()
+						.map(|column| *column as usize),
+				);
+			}
+			columns.sort_unstable();
+			columns.dedup();
+			pbc_projection = Some(columns);
 		}
 		let output_schema = if let Some(columns) = &projected_columns {
 			let indices = columns
@@ -1809,12 +1827,27 @@ impl StorageScan for ParquetHarnessScan {
 						source_batch
 					};
 					if let Some(program) = &pbc {
-						wendelon::schema::pbc::execute(program, &source_batch).map_err(|error| {
-							StorageError::InvalidPbcProgram {
+						let filtered = wendelon::schema::pbc::execute(program, &source_batch)
+							.map_err(|error| StorageError::InvalidPbcProgram {
 								message: format!("{error:?}"),
-							}
-						})?
-					} else if let Some(columns) = &projected_columns {
+							})?;
+						if runtime_filter_present {
+							let columns = projected_columns
+								.as_ref()
+								.expect("projection when filtering");
+							filtered.project(
+								&columns
+									.iter()
+									.map(|column| column.0 as usize)
+									.collect::<Vec<_>>(),
+							)?
+						} else {
+							filtered
+						}
+					} else if runtime_filter_present {
+						let columns = projected_columns
+							.as_ref()
+							.expect("projection when filtering");
 						source_batch.project(
 							&columns
 								.iter()
@@ -1884,28 +1917,45 @@ impl StorageScan for ParquetHarnessScan {
 				} else {
 					batch
 				};
-				wendelon::schema::pbc::execute(program, &batch).map_err(|error| {
-					StorageError::InvalidPbcProgram {
-						message: format!("{error:?}"),
-					}
-				})
+				let filtered =
+					wendelon::schema::pbc::execute(program, &batch).map_err(|error| {
+						StorageError::InvalidPbcProgram {
+							message: format!("{error:?}"),
+						}
+					})?;
+				if runtime_filter_present {
+					let columns = projected_columns
+						.as_ref()
+						.expect("projection when filtering");
+					filtered.project(
+						&columns
+							.iter()
+							.map(|column| column.0 as usize)
+							.collect::<Vec<_>>(),
+					)?
+				} else {
+					filtered
+				}
 			} else {
 				let batch = if let Some(descriptor) = request.runtime_filter.as_ref() {
 					apply_harness_runtime_filter(batch, descriptor)?
 				} else {
 					batch
 				};
-				if let Some(columns) = &projected_columns {
-					Ok(batch.project(
+				if runtime_filter_present {
+					let columns = projected_columns
+						.as_ref()
+						.expect("projection when filtering");
+					batch.project(
 						&columns
 							.iter()
 							.map(|column| column.0 as usize)
 							.collect::<Vec<_>>(),
-					)?)
+					)?
 				} else {
-					Ok(batch)
+					batch
 				}
-			}?;
+			};
 			record_parquet_scan_progress(&serde_json::json!({
 				"event": "batch",
 				"scan_id": scan_progress_id,

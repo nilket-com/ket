@@ -77,3 +77,17 @@ The implementation/library and focused harness tests pass. This receipt does
 not convert the single wall sample into an article-grade performance claim, and
 it does not claim the unrun survival or five-child rails. Those remain required
 before sealing a throughput result or updating the benchmark baseline.
+
+## Forward invalidation (ADR 447 harness correction)
+
+ADR 447 later corrected the persisted-Parquet harness's runtime-filter
+composition. The 446 path forced `pbc_projection` to all source columns whenever
+the filter was present, so its wall/spill sample combined row reduction with a
+full-column read and is not a like-for-like measurement of the bridge. On the
+corrected harness, the seven-child q05 characterization cohort measured a
+110158.488554 ms median and 3365847016 task spill bytes (with a separate scan
+ledger measuring 17893398 filtered lineitem rows). Accordingly, this receipt's
+94.7934% spill-reduction/7.7547% wall comparison and its negative
+volume-proportional conclusion are withdrawn as invalidated performance
+evidence. The historical 446 implementation and correctness evidence remain;
+the 446 throughput verdict is not reclassified by this note.

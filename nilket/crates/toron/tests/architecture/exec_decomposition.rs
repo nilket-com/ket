@@ -481,6 +481,41 @@ pub(crate) fn adr446_local_runtime_filter_is_fenced_to_terminal_reservoir() {
 }
 
 #[test]
+pub(crate) fn adr447_materiality_floor_is_not_the_regression_threshold() {
+	let main = std::fs::read_to_string(
+		manifest_dir()
+			.parent()
+			.expect("crates directory")
+			.join("toron-tpch/src/main.rs"),
+	)
+	.expect("read toron-tpch perf harness");
+	assert_eq!(
+		main.matches("const REGRESSION_THRESHOLD: f64").count(),
+		1,
+		"regression alarm constant must remain a single declaration"
+	);
+	assert_eq!(
+		main.matches("pub const MATERIALITY_FLOOR: f64").count(),
+		1,
+		"materiality floor must remain a distinct declaration"
+	);
+	let estimator = brace_blocks_after_marker(&main, "pub fn paired_median_shift")
+		.into_iter()
+		.next()
+		.expect("materiality estimator must exist")
+		.1;
+	assert!(
+		!estimator.contains("REGRESSION_THRESHOLD"),
+		"materiality estimator must not read the regression alarm threshold"
+	);
+	assert!(
+		main.contains("regression_alarm_band")
+			|| main.contains("REGRESSION_THRESHOLD.max(2.0 * spread_ratio.max(baseline_spread))"),
+		"regression alarm must remain explicitly named and scoped"
+	);
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 
