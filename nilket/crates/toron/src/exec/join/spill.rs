@@ -1394,6 +1394,15 @@ impl SpilledInnerJoinBuild {
 		self.resident_index_bytes = 0;
 	}
 
+	/// Disable caching for a resident single-touch drain. The streamed probe path
+	/// deliberately leaves the cache enabled because it may revisit pages.
+	pub(in crate::exec) fn disable_page_cache(&mut self) {
+		self.cache_cap = 0;
+		self.cache.clear();
+		self.lru.clear();
+		self.cache_bytes = 0;
+	}
+
 	#[cfg(test)]
 	pub(in crate::exec) fn enable_compact_resident_index_rescue(&mut self) {
 		self.compact_index_rescue_enabled = true;
@@ -5051,6 +5060,42 @@ mod tests {
 			.expect("second read uses decoded cache despite invalid plaintext bytes");
 		assert_record_batch_equal(&decoded_second, &batch);
 		assert_eq!(build.cache_bytes, cache_bytes_after_first);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[tokio::test]
+	async fn resident_single_touch_drain_can_disable_page_cache() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("resident_cache_bypass");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let batch = batch_with_keys(&[1, 2, 3, 4]);
+		build
+			.write_batch_chunks(
+				&batch,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				budget,
+			)
+			.await
+			.expect("write batch");
+		let first = build.read_batch_page(0).await.expect("prime page cache");
+		assert_record_batch_equal(&first, &batch);
+		assert!(!build.cache.is_empty());
+		build.disable_page_cache();
+
+		let decoded = build.read_batch_page(0).await.expect("read resident page");
+		assert_record_batch_equal(&decoded, &batch);
+		assert_eq!(build.cache_cap, 0);
+		assert!(build.cache.is_empty());
+		assert!(build.lru.is_empty());
+		assert_eq!(build.cache_bytes, 0);
+		assert_eq!(build.page_decode_count(), 2);
 
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);

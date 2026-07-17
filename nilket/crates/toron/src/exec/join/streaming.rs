@@ -15694,6 +15694,7 @@ impl Executor {
 					if let Some(observer) = grouped_chain_observer {
 						observer.record_branch(true)?;
 					}
+					spilled.disable_page_cache();
 					let read_timer = membership_profile
 						.map(|(profile, phase)| {
 							profile.begin_leaf(phase, MembershipChainOperation::SpillReadDecode)

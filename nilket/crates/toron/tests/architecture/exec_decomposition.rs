@@ -384,6 +384,60 @@ pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_reb
 }
 
 #[test]
+pub(crate) fn adr445_page_cache_bypass_is_fenced_to_resident_arm() {
+	let manifest = manifest_dir();
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let owners = brace_blocks_after_marker(
+		&streaming,
+		"async fn probe_partitioned_streamed_inner_scan_build_reservoir",
+	);
+	let [(_, owner)] = owners.as_slice() else {
+		panic!("expected exactly one grouped-reservoir probe owner");
+	};
+	let resident = owner
+		.find("if resident_baseline_bytes.saturating_add(loaded_resident) <= loaded_cap")
+		.expect("resident arm fence");
+	let streamed = owner[resident..]
+		.find("} else {")
+		.map(|offset| resident + offset)
+		.expect("streamed arm fence");
+	let bypass = owner[resident..streamed]
+		.find("spilled.disable_page_cache();")
+		.map(|offset| resident + offset)
+		.expect("resident cache bypass");
+	let resident_drain = owner[bypass..]
+		.find("read_all_batch_pages_profiled")
+		.map(|offset| bypass + offset)
+		.expect("resident drain read");
+
+	assert!(resident < bypass);
+	assert!(bypass < resident_drain);
+	assert!(resident_drain < streamed);
+	assert!(
+		!owner[streamed..].contains("disable_page_cache"),
+		"streamed arm must retain its page cache"
+	);
+	let loaded_workers = brace_blocks_after_marker(&streaming, "fn run_loaded_partition_work");
+	let [(_, loaded_worker)] = loaded_workers.as_slice() else {
+		panic!("expected exactly one resident partition worker");
+	};
+	let loaded_signature = loaded_worker
+		.split_once('{')
+		.map_or(loaded_worker.as_str(), |(signature, _)| signature);
+	assert!(
+		!loaded_signature.contains("SpilledInnerJoinBuild")
+			&& !loaded_signature.contains("spilled"),
+		"resident worker must not regain access to the spill build"
+	);
+	let spill = std::fs::read_to_string(manifest.join("src/exec/join/spill.rs"))
+		.expect("read exec spill source");
+	assert!(spill.contains("pub(in crate::exec) fn disable_page_cache"));
+	assert!(spill.contains("if self.cache_cap == 0 || bytes_len > self.cache_cap"));
+	assert!(spill.contains("self.touch_cache_entry(page_index);"));
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 
