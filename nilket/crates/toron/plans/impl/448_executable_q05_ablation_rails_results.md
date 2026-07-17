@@ -52,3 +52,14 @@ after the filtered arm completed. That divergence is retained as qualitative
 evidence that the ablation arms are not identical; ADR 449 must attach the
 grouped-chain profile and verify the distinction directly through
 `reservoir_build_rows` before any paired cohort or wall claim.
+
+## Forward invalidation
+
+ADR 449's profiled sf=1 gate-zero run later showed that this scale does **not**
+commit the generic grouped-reservoir path: the profile fails with
+`admitted chain did not commit the generic grouped reservoir path`. Therefore
+the sf=1 sentence above is withdrawn as a path-reachability claim. The identical
+ON/OFF output remains a correctness result for that execution, but it does not
+exercise the ADR 446 runtime-filter bridge. The qualitative sf=10 OFF-arm
+divergence remains the only arm-difference evidence in this receipt; a future
+gate-zero run must use a scale that actually commits the generic reservoir path.

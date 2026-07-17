@@ -233,3 +233,25 @@ fn adr430_tpch_execution_paths_share_disk_backed_join_spill_placement() {
 		"the centralized context must keep join spill under the untracked TPC-H cache root"
 	);
 }
+
+#[test]
+fn adr449_gate_zero_is_profile_first_and_oracle_derived() {
+	let main = source("src/main.rs");
+	assert!(main.contains("adr449-gate-zero"));
+	assert!(main.contains("TORON_GROUPED_CHAIN_PROFILE_DIR"));
+	assert!(main.contains("profiled_reservoir_build_rows"));
+	assert!(main.contains("q05_reservoir_full_input_cardinality"));
+	assert!(main.contains("on_rows < off_rows"));
+	assert!(main.contains("off_rows == expected_off"));
+	assert!(main.contains("run_adr449_gate_zero"));
+}
+
+#[test]
+fn adr449_pairing_is_parity_checked_and_gate_zero_admissible() {
+	let main = source("src/main.rs");
+	assert!(main.contains("paired_ablation_differences"));
+	assert!(main.contains("differences_off_minus_on_ms") && main.contains("off.ok_or"));
+	assert!(main.contains("paired receipt requires a passed gate-zero record"));
+	assert!(main.contains("ablation arm parity mismatch"));
+	assert!(main.contains("paired_ablation"));
+}

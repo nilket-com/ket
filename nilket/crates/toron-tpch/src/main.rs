@@ -15,11 +15,11 @@ use toron_tpch::telemetry::{
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
-	generate_dev_lineitem, matrix, normalize_duckdb_type, parse_scale_factor,
-	prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	generate_dev_lineitem, generate_strict_lineitem, matrix, normalize_duckdb_type,
+	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
+	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
+	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -84,6 +84,7 @@ async fn main() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"adr449-gate-zero" => adr449_gate_zero_command(&args),
 		"adr448-capability" => {
 			println!("adr448-harness-capability-v1");
 			ExitCode::SUCCESS
@@ -402,6 +403,18 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Ok(queries) => queries,
 		Err(message) => return harness_error(&message),
 	};
+	let gate_zero = if flag_present(args, "--paired-ablation") {
+		if queries != vec!["q05"] {
+			return harness_error("--paired-ablation currently requires --query q05");
+		}
+		match run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir) {
+			Ok(record) if record["passed"] == true => Some(record),
+			Ok(record) => return harness_error(&format!("ADR 449 gate zero failed: {record}")),
+			Err(message) => return harness_error(&message),
+		}
+	} else {
+		None
+	};
 	let mut raw_rows = Vec::new();
 	for query_id in queries {
 		for engine in &engines {
@@ -539,6 +552,14 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	apply_duckdb_output_sanity_flags(&mut raw_rows);
 	let baseline_rows = read_baseline_rows(&baseline_path);
 	let summary_rows = summarize_perf_rows(&raw_rows, runs, warmup, &baseline_rows);
+	let summary_rows = if let Some(gate_zero) = gate_zero {
+		match attach_paired_ablation_receipt(summary_rows, runs, gate_zero) {
+			Ok(rows) => rows,
+			Err(message) => return harness_error(&message),
+		}
+	} else {
+		summary_rows
+	};
 	if let Err(error) = write_perf_outputs(&output_dir, &baseline_path, &raw_rows, &summary_rows) {
 		return harness_error(&format!("write perf output: {error}"));
 	}
@@ -547,6 +568,25 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		print_perf_summary(row);
 	}
 	ExitCode::SUCCESS
+}
+
+fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
+	let scale_factor = match resolved_sf(args) {
+		Ok(value) => value,
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let output_dir = PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/perf"));
+	match run_adr449_gate_zero(scale_factor, mode, data_source, &data_dir, &output_dir) {
+		Ok(record) if record["passed"] == true => ExitCode::SUCCESS,
+		Ok(record) => {
+			eprintln!("ADR 449 gate zero failed: {record}");
+			ExitCode::from(1)
+		}
+		Err(message) => harness_error(&message),
+	}
 }
 
 /// Answer-check a query against its independent oracle and record a correctness row. Unsupported queries are a
@@ -919,12 +959,12 @@ fn run_perf_child_with_ablation(
 		args.push("--warmup-run".to_string());
 	}
 	let mut row = match ablate_filter {
-		Some(ablate) => run_perf_child_args_with_env(
+		Some(ablate) => run_perf_child_args_with_envs(
 			&args,
-			Some((
+			&[(
 				"TORON_ABLATE_LOCAL_RUNTIME_FILTER",
 				if ablate { "1" } else { "0" },
-			)),
+			)],
 		)?,
 		None => run_perf_child_args(&args)?,
 	};
@@ -932,6 +972,239 @@ fn run_perf_child_with_ablation(
 		row["ablation_arm"] = serde_json::json!(if ablate { "off" } else { "on" });
 	}
 	Ok(row)
+}
+
+fn run_perf_child_with_envs(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	run_index: u32,
+	data_source: &str,
+	data_dir: &Path,
+	envs: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
+	let args = vec![
+		"perf-run-one".to_string(),
+		"--engine".to_string(),
+		"toron".to_string(),
+		"--query".to_string(),
+		query.to_string(),
+		"--mode".to_string(),
+		mode.to_string(),
+		"--sf".to_string(),
+		sf.to_string(),
+		"--run-index".to_string(),
+		run_index.to_string(),
+		"--data-source".to_string(),
+		data_source.to_string(),
+		"--data-dir".to_string(),
+		data_dir.display().to_string(),
+	];
+	run_perf_child_args_with_envs(&args, envs)
+}
+
+fn q05_reservoir_full_input_cardinality(scale_factor: f64) -> u64 {
+	generate_strict_lineitem(scale_factor).num_rows() as u64
+}
+
+fn adr449_gate_zero_passes(on_rows: u64, off_rows: u64, expected_off: u64) -> bool {
+	off_rows == expected_off && on_rows < off_rows
+}
+
+fn profile_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+	let mut files = std::fs::read_dir(directory)
+		.map_err(|error| format!("read profile directory {}: {error}", directory.display()))?
+		.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+		.filter(|path| {
+			path.file_name()
+				.and_then(|name| name.to_str())
+				.map(|name| name.starts_with("grouped_chain_") && name.ends_with(".json"))
+				.unwrap_or(false)
+		})
+		.collect::<Vec<_>>();
+	files.sort();
+	Ok(files)
+}
+
+fn profiled_reservoir_build_rows(directory: &Path) -> Result<u64, String> {
+	let files = profile_files(directory)?;
+	if files.len() != 1 {
+		return Err(format!(
+			"expected exactly one grouped-chain profile in {}, found {}",
+			directory.display(),
+			files.len()
+		));
+	}
+	let bytes = std::fs::read(&files[0])
+		.map_err(|error| format!("read profile {}: {error}", files[0].display()))?;
+	let value: serde_json::Value = serde_json::from_slice(&bytes)
+		.map_err(|error| format!("parse profile {}: {error}", files[0].display()))?;
+	value
+		.get("reservoir_build_rows")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("profile {} lacks reservoir_build_rows", files[0].display()))
+}
+
+fn run_adr449_gate_zero(
+	scale_factor: f64,
+	mode: &str,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	if data_source != "parquet" && data_source != "persisted" {
+		return Err("ADR 449 gate zero requires --data-source parquet".to_string());
+	}
+	let gate_dir = output_dir.join("adr449_gate_zero");
+	if gate_dir.exists() {
+		std::fs::remove_dir_all(&gate_dir)
+			.map_err(|error| format!("clear gate-zero directory: {error}"))?;
+	}
+	let on_dir = gate_dir.join("on");
+	let off_dir = gate_dir.join("off");
+	std::fs::create_dir_all(&on_dir)
+		.map_err(|error| format!("create ON profile directory: {error}"))?;
+	std::fs::create_dir_all(&off_dir)
+		.map_err(|error| format!("create OFF profile directory: {error}"))?;
+	let on_row = run_perf_child_with_envs(
+		"q05",
+		mode,
+		scale_factor,
+		0,
+		data_source,
+		data_dir,
+		&[
+			("TORON_ABLATE_LOCAL_RUNTIME_FILTER", "0"),
+			(
+				"TORON_GROUPED_CHAIN_PROFILE_DIR",
+				on_dir.to_str().ok_or("invalid ON profile path")?,
+			),
+		],
+	)?;
+	if on_row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+		return Err(format!("ADR 449 ON gate-zero child did not pass: {on_row}"));
+	}
+	let off_row = run_perf_child_with_envs(
+		"q05",
+		mode,
+		scale_factor,
+		1,
+		data_source,
+		data_dir,
+		&[
+			("TORON_ABLATE_LOCAL_RUNTIME_FILTER", "1"),
+			(
+				"TORON_GROUPED_CHAIN_PROFILE_DIR",
+				off_dir.to_str().ok_or("invalid OFF profile path")?,
+			),
+		],
+	)?;
+	if off_row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+		return Err(format!(
+			"ADR 449 OFF gate-zero child did not pass: {off_row}"
+		));
+	}
+	let on_rows = profiled_reservoir_build_rows(&on_dir)?;
+	let off_rows = profiled_reservoir_build_rows(&off_dir)?;
+	let expected_off = q05_reservoir_full_input_cardinality(scale_factor);
+	let passed = adr449_gate_zero_passes(on_rows, off_rows, expected_off);
+	let record = serde_json::json!({
+		"suite": "adr449_gate_zero",
+		"query": "q05",
+		"scale_factor": scale_factor,
+		"on_rows": on_rows,
+		"off_rows": off_rows,
+		"expected_off": expected_off,
+		"off_matches_expected": off_rows == expected_off,
+		"on_strictly_less": on_rows < off_rows,
+		"on_digest": on_row.get("digest"),
+		"off_digest": off_row.get("digest"),
+		"passed": passed,
+	});
+	println!("{record}");
+	Ok(record)
+}
+
+fn attach_paired_ablation_receipt(
+	mut summaries: Vec<serde_json::Value>,
+	runs: usize,
+	gate_zero: serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+	if !gate_zero
+		.get("passed")
+		.and_then(serde_json::Value::as_bool)
+		.unwrap_or(false)
+	{
+		return Err("paired receipt requires a passed gate-zero record".to_string());
+	}
+	if runs < 6 {
+		return Err("paired ablation requires at least six measured runs".to_string());
+	}
+	for summary in &mut summaries {
+		let samples = summary
+			.get("execute_ms_samples")
+			.and_then(serde_json::Value::as_array)
+			.ok_or("paired summary lacks execute_ms_samples")?;
+		let diffs = paired_ablation_differences(samples)?;
+		let shift = paired_median_shift(&diffs)?;
+		summary["gate_zero"] = gate_zero.clone();
+		summary["paired_ablation"] = serde_json::json!({
+			"differences_off_minus_on_ms": diffs,
+			"point_ms": shift.point,
+			"lower_ms": shift.lower,
+			"upper_ms": shift.upper,
+			"pairs": shift.pairs,
+			"material": material_effect(shift.point, summary["execute_ms_median"].as_f64().unwrap_or(0.0)),
+		});
+	}
+	Ok(summaries)
+}
+
+fn paired_ablation_differences(samples: &[serde_json::Value]) -> Result<Vec<f64>, String> {
+	let mut by_pair = BTreeMap::<u64, (Option<f64>, Option<f64>)>::new();
+	for sample in samples {
+		let index = sample
+			.get("run_index")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or("sample lacks run_index")?;
+		let arm = sample
+			.get("ablation_arm")
+			.and_then(serde_json::Value::as_str)
+			.ok_or("sample lacks ablation_arm")?;
+		let value = sample
+			.get("execute_ms")
+			.and_then(serde_json::Value::as_f64)
+			.ok_or("sample lacks execute_ms")?;
+		if (index % 2 == 0) != (arm == "on") {
+			return Err(format!("ablation arm parity mismatch at run_index {index}"));
+		}
+		let entry = by_pair.entry(index / 2).or_insert((None, None));
+		match arm {
+			"on" => {
+				if entry.0.replace(value).is_some() {
+					return Err(format!("duplicate ablation sample at run_index {index}"));
+				}
+			}
+			"off" => {
+				if entry.1.replace(value).is_some() {
+					return Err(format!("duplicate ablation sample at run_index {index}"));
+				}
+			}
+			_ => return Err(format!("unknown ablation arm {arm:?}")),
+		}
+	}
+	if by_pair.is_empty() {
+		return Err("no paired samples".to_string());
+	}
+	let expected = 0..(by_pair.len() as u64);
+	if by_pair.keys().copied().ne(expected) {
+		return Err("paired run indices are not contiguous".to_string());
+	}
+	// Pair entries are validated above; each index must contain both arms.
+	by_pair
+		.into_values()
+		.map(|(on, off)| Ok(off.ok_or("missing OFF sample")? - on.ok_or("missing ON sample")?))
+		.collect()
 }
 
 fn run_duckdb_perf_rows(
@@ -2316,19 +2589,19 @@ fn push_row_flag(row: &mut serde_json::Value, flag: &str) {
 
 #[cfg(unix)]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
-	run_perf_child_args_with_env(args, None)
+	run_perf_child_args_with_envs(args, &[])
 }
 
 #[cfg(unix)]
-fn run_perf_child_args_with_env(
+fn run_perf_child_args_with_envs(
 	args: &[String],
-	env: Option<(&str, &str)>,
+	envs: &[(&str, &str)],
 ) -> Result<serde_json::Value, String> {
 	let exe = toron_binary()?;
 	let start = Instant::now();
 	let mut command = Command::new(exe);
 	command.args(args);
-	if let Some((key, value)) = env {
+	for (key, value) in envs {
 		command.env(key, value);
 	}
 	let mut child = command
@@ -2399,19 +2672,19 @@ fn run_perf_child_args_with_env(
 
 #[cfg(not(unix))]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
-	run_perf_child_args_with_env(args, None)
+	run_perf_child_args_with_envs(args, &[])
 }
 
 #[cfg(not(unix))]
-fn run_perf_child_args_with_env(
+fn run_perf_child_args_with_envs(
 	args: &[String],
-	env: Option<(&str, &str)>,
+	envs: &[(&str, &str)],
 ) -> Result<serde_json::Value, String> {
 	let exe = toron_binary()?;
 	let start = Instant::now();
 	let mut command = Command::new(exe);
 	command.args(args);
-	if let Some((key, value)) = env {
+	for (key, value) in envs {
 		command.env(key, value);
 	}
 	let output = command
@@ -2950,7 +3223,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -2963,6 +3236,68 @@ mod tests {
 			(0..6).map(paired_ablation_arm).collect::<Vec<_>>(),
 			vec![false, true, false, true, false, true]
 		);
+	}
+
+	#[test]
+	fn adr449_pairing_is_by_run_index_and_uses_off_minus_on() {
+		let samples = vec![
+			serde_json::json!({"run_index": 1, "ablation_arm": "off", "execute_ms": 14.0}),
+			serde_json::json!({"run_index": 0, "ablation_arm": "on", "execute_ms": 10.0}),
+			serde_json::json!({"run_index": 3, "ablation_arm": "off", "execute_ms": 24.0}),
+			serde_json::json!({"run_index": 2, "ablation_arm": "on", "execute_ms": 20.0}),
+		];
+		assert_eq!(
+			paired_ablation_differences(&samples).unwrap(),
+			vec![4.0, 4.0]
+		);
+	}
+
+	#[test]
+	fn adr449_pairing_rejects_missing_or_misaligned_samples() {
+		let dropped = vec![
+			serde_json::json!({"run_index": 0, "ablation_arm": "on", "execute_ms": 10.0}),
+			serde_json::json!({"run_index": 1, "ablation_arm": "off", "execute_ms": 14.0}),
+			serde_json::json!({"run_index": 2, "ablation_arm": "on", "execute_ms": 20.0}),
+		];
+		assert!(paired_ablation_differences(&dropped).is_err());
+		let wrong_arm = vec![
+			serde_json::json!({"run_index": 0, "ablation_arm": "off", "execute_ms": 10.0}),
+			serde_json::json!({"run_index": 1, "ablation_arm": "off", "execute_ms": 14.0}),
+		];
+		assert!(paired_ablation_differences(&wrong_arm).is_err());
+	}
+
+	#[test]
+	fn adr449_gate_zero_expectation_is_oracle_derived() {
+		let small = q05_reservoir_full_input_cardinality(0.01);
+		let sf1 = q05_reservoir_full_input_cardinality(1.0);
+		let sf10 = q05_reservoir_full_input_cardinality(10.0);
+		assert!(small < sf1 && sf1 < sf10);
+		assert_ne!(small, 59_986_052);
+		assert_ne!(sf1, 59_986_052);
+		assert_eq!(sf10, 59_986_052);
+		assert!(adr449_gate_zero_passes(sf1 - 1, sf1, sf1));
+		assert!(!adr449_gate_zero_passes(sf1, sf1, sf1));
+	}
+
+	#[test]
+	fn adr449_gate_zero_rejects_multiple_profiles() {
+		let directory =
+			std::env::temp_dir().join(format!("toron-adr449-profile-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		std::fs::create_dir_all(&directory).unwrap();
+		std::fs::write(
+			directory.join("grouped_chain_0000.json"),
+			r#"{"reservoir_build_rows": 1}"#,
+		)
+		.unwrap();
+		std::fs::write(
+			directory.join("grouped_chain_0001.json"),
+			r#"{"reservoir_build_rows": 2}"#,
+		)
+		.unwrap();
+		assert!(profiled_reservoir_build_rows(&directory).is_err());
+		std::fs::remove_dir_all(directory).unwrap();
 	}
 	use super::*;
 	use toron_tpch::Q17_CORRECTNESS_SCALE;
