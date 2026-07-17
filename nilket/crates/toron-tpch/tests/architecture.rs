@@ -18,6 +18,34 @@ fn adr261_tpch_helper_is_not_a_toron_library_dependency() {
 }
 
 #[test]
+fn adr448_filtered_path_projects_exactly_once() {
+	let lib = source("src/lib.rs");
+	assert!(
+		!lib.contains("append_projection_to_pbc"),
+		"projection must not be injected into PBC on only one filter arm"
+	);
+	let production = lib
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production harness source");
+	assert_eq!(
+		production.matches("filtered.project(").count(),
+		2,
+		"ledger and streaming paths must each have one post-filter projection"
+	);
+}
+
+#[test]
+fn adr448_paired_driver_probes_capability_and_records_arms() {
+	let main = source("src/main.rs");
+	assert!(main.contains("\"adr448-capability\""));
+	assert!(main.contains("ADR448_HARNESS_CAPABILITY"));
+	assert!(main.contains("TORON_ABLATE_LOCAL_RUNTIME_FILTER"));
+	assert!(main.contains("ablation_arm"));
+	assert!(main.contains("paired_ablation_arm"));
+}
+
+#[test]
 fn adr261_no_official_tpc_tooling_in_tree() {
 	for relative in [
 		"Cargo.toml",

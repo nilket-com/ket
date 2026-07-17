@@ -84,6 +84,10 @@ async fn main() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"adr448-capability" => {
+			println!("adr448-harness-capability-v1");
+			ExitCode::SUCCESS
+		}
 		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
@@ -403,8 +407,13 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		for engine in &engines {
 			match engine {
 				PerfEngine::Toron => {
+					if flag_present(args, "--paired-ablation") {
+						if let Err(message) = require_adr448_harness_capability() {
+							return harness_error(&message);
+						}
+					}
 					for warmup_index in 0..warmup {
-						match run_perf_child(
+						match run_perf_child_with_ablation(
 							PerfEngine::Toron,
 							query_id,
 							mode,
@@ -413,13 +422,18 @@ async fn perf_command(args: &[String]) -> ExitCode {
 							true,
 							data_source,
 							&data_dir,
+							if flag_present(args, "--paired-ablation") {
+								Some(false)
+							} else {
+								None
+							},
 						) {
 							Ok(row) => raw_rows.push(row),
 							Err(message) => return harness_error(&message),
 						}
 					}
 					for run_index in 0..runs {
-						match run_perf_child(
+						match run_perf_child_with_ablation(
 							PerfEngine::Toron,
 							query_id,
 							mode,
@@ -428,6 +442,11 @@ async fn perf_command(args: &[String]) -> ExitCode {
 							false,
 							data_source,
 							&data_dir,
+							if flag_present(args, "--paired-ablation") {
+								Some(paired_ablation_arm(run_index as u32))
+							} else {
+								None
+							},
 						) {
 							Ok(row) => raw_rows.push(row),
 							Err(message) => return harness_error(&message),
@@ -855,6 +874,30 @@ fn run_perf_child(
 	data_source: &str,
 	data_dir: &Path,
 ) -> Result<serde_json::Value, String> {
+	run_perf_child_with_ablation(
+		engine,
+		query,
+		mode,
+		sf,
+		run_index,
+		warmup,
+		data_source,
+		data_dir,
+		None,
+	)
+}
+
+fn run_perf_child_with_ablation(
+	engine: PerfEngine,
+	query: &str,
+	mode: &str,
+	sf: f64,
+	run_index: u32,
+	warmup: bool,
+	data_source: &str,
+	data_dir: &Path,
+	ablate_filter: Option<bool>,
+) -> Result<serde_json::Value, String> {
 	let mut args = vec![
 		"perf-run-one".to_string(),
 		"--engine".to_string(),
@@ -875,7 +918,20 @@ fn run_perf_child(
 	if warmup {
 		args.push("--warmup-run".to_string());
 	}
-	run_perf_child_args(&args)
+	let mut row = match ablate_filter {
+		Some(ablate) => run_perf_child_args_with_env(
+			&args,
+			Some((
+				"TORON_ABLATE_LOCAL_RUNTIME_FILTER",
+				if ablate { "1" } else { "0" },
+			)),
+		)?,
+		None => run_perf_child_args(&args)?,
+	};
+	if let Some(ablate) = ablate_filter {
+		row["ablation_arm"] = serde_json::json!(if ablate { "off" } else { "on" });
+	}
+	Ok(row)
 }
 
 fn run_duckdb_perf_rows(
@@ -969,6 +1025,25 @@ fn toron_binary_from_override(
 	current: std::path::PathBuf,
 ) -> std::path::PathBuf {
 	candidate.map(Into::into).unwrap_or(current)
+}
+
+const ADR448_HARNESS_CAPABILITY: &str = "adr448-harness-capability-v1";
+
+fn require_adr448_harness_capability() -> Result<(), String> {
+	let binary = toron_binary()?;
+	let output = Command::new(&binary)
+		.arg("adr448-capability")
+		.output()
+		.map_err(|error| format!("probe ADR 448 harness capability: {error}"))?;
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	if output.status.success() && stdout.trim() == ADR448_HARNESS_CAPABILITY {
+		Ok(())
+	} else {
+		Err(format!(
+			"comparison binary {} lacks ADR 448 harness capability",
+			binary.display()
+		))
+	}
 }
 
 fn duckdb_cli_version(duckdb_bin: &str) -> Result<Option<String>, String> {
@@ -2241,10 +2316,22 @@ fn push_row_flag(row: &mut serde_json::Value, flag: &str) {
 
 #[cfg(unix)]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
+	run_perf_child_args_with_env(args, None)
+}
+
+#[cfg(unix)]
+fn run_perf_child_args_with_env(
+	args: &[String],
+	env: Option<(&str, &str)>,
+) -> Result<serde_json::Value, String> {
 	let exe = toron_binary()?;
 	let start = Instant::now();
-	let mut child = Command::new(exe)
-		.args(args)
+	let mut command = Command::new(exe);
+	command.args(args);
+	if let Some((key, value)) = env {
+		command.env(key, value);
+	}
+	let mut child = command
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.spawn()
@@ -2312,10 +2399,22 @@ fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
 
 #[cfg(not(unix))]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
+	run_perf_child_args_with_env(args, None)
+}
+
+#[cfg(not(unix))]
+fn run_perf_child_args_with_env(
+	args: &[String],
+	env: Option<(&str, &str)>,
+) -> Result<serde_json::Value, String> {
 	let exe = toron_binary()?;
 	let start = Instant::now();
-	let output = Command::new(exe)
-		.args(args)
+	let mut command = Command::new(exe);
+	command.args(args);
+	if let Some((key, value)) = env {
+		command.env(key, value);
+	}
+	let output = command
 		.output()
 		.map_err(|error| format!("spawn perf child: {error}"))?;
 	let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2396,10 +2495,14 @@ fn summarize_query_rows(
 	let raw_execute_samples = rows
 		.iter()
 		.filter_map(|row| {
-			Some(serde_json::json!({
+			let mut sample = serde_json::json!({
 				"run_index": row.get("run_index")?.as_u64()?,
 				"execute_ms": row.get("execute_ms")?.as_f64()?,
-			}))
+			});
+			if let Some(arm) = row.get("ablation_arm").and_then(serde_json::Value::as_str) {
+				sample["ablation_arm"] = serde_json::json!(arm);
+			}
+			Some(sample)
 		})
 		.collect::<Vec<_>>();
 	let peak_rss_kib_max = rows
@@ -2533,6 +2636,7 @@ fn summarize_query_rows(
 		"execute_ms_samples": raw_execute_samples,
 		"peak_rss_kib_max": peak_rss_kib_max,
 		"spill_bytes_max": spill_bytes_max,
+		"spill_scope": "whole_query_total",
 		"plan_fingerprint": plan_fingerprint,
 		"digest": digest,
 		"output_row_count": output_row_count,
@@ -2565,6 +2669,28 @@ fn median(values: &mut [f64]) -> f64 {
 	} else {
 		values[mid]
 	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillScope {
+	WholeQuery,
+	GroupedRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedSpill {
+	pub bytes: u64,
+	pub scope: SpillScope,
+}
+
+pub fn spill_ratio(numerator: ScopedSpill, denominator: ScopedSpill) -> Result<f64, String> {
+	if numerator.scope != denominator.scope {
+		return Err("spill ratio requires matching scopes".to_string());
+	}
+	if denominator.bytes == 0 {
+		return Err("spill ratio denominator is zero".to_string());
+	}
+	Ok(numerator.bytes as f64 / denominator.bytes as f64)
 }
 
 pub const MATERIALITY_FLOOR: f64 = 0.10;
@@ -2774,6 +2900,14 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 		.map(String::as_str)
 }
 
+fn flag_present(args: &[String], flag: &str) -> bool {
+	args.iter().any(|arg| arg == flag)
+}
+
+fn paired_ablation_arm(run_index: u32) -> bool {
+	run_index % 2 == 1
+}
+
 fn parse_usize_flag(args: &[String], flag: &str, default: usize) -> Result<usize, String> {
 	match flag_value(args, flag) {
 		None => Ok(default),
@@ -2816,13 +2950,20 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn adr448_driver_alternates_arms_per_child() {
+		assert_eq!(
+			(0..6).map(paired_ablation_arm).collect::<Vec<_>>(),
+			vec![false, true, false, true, false, true]
+		);
+	}
 	use super::*;
 	use toron_tpch::Q17_CORRECTNESS_SCALE;
 
@@ -2935,6 +3076,7 @@ mod tests {
 		assert_eq!(samples[6]["execute_ms"], 106.0);
 		assert_eq!(summary[0]["execute_ms_min"], 100.0);
 		assert_eq!(summary[0]["execute_ms_max"], 106.0);
+		assert_eq!(summary[0]["spill_scope"], "whole_query_total");
 	}
 
 	#[test]
@@ -2973,6 +3115,21 @@ mod tests {
 			(concentrated.lower, concentrated.upper),
 			(dispersed.lower, dispersed.upper)
 		);
+	}
+
+	#[test]
+	fn adr448_ratio_across_mismatched_scopes_is_refused() {
+		let result = spill_ratio(
+			ScopedSpill {
+				bytes: 10,
+				scope: SpillScope::GroupedRoot,
+			},
+			ScopedSpill {
+				bytes: 100,
+				scope: SpillScope::WholeQuery,
+			},
+		);
+		assert!(result.is_err());
 	}
 
 	#[test]

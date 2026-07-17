@@ -516,6 +516,28 @@ pub(crate) fn adr447_materiality_floor_is_not_the_regression_threshold() {
 }
 
 #[test]
+pub(crate) fn adr448_runtime_filter_kill_switch_is_default_on_ablation_only() {
+	let streaming = std::fs::read_to_string(manifest_dir().join("src/exec/join/streaming.rs"))
+		.expect("read streaming source");
+	assert!(streaming.contains("LOCAL_RUNTIME_FILTER_ABLATION_ENV"));
+	assert!(streaming.contains("fn local_runtime_filter_enabled_from_env"));
+	assert!(streaming.contains("local_runtime_filter_enabled()"));
+	assert!(
+		streaming.contains(
+			"Some(value) if matches!(value.as_str(), \"1\" | \"true\" | \"yes\" | \"on\")"
+		)
+	);
+	assert!(streaming.contains("&& local_runtime_filter_shape_is_admitted"));
+	assert_eq!(
+		streaming
+			.matches("TORON_ABLATE_LOCAL_RUNTIME_FILTER")
+			.count(),
+		1,
+		"the live ablation variable must be read only through its named constant"
+	);
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 

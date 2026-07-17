@@ -17,6 +17,22 @@ const INT64_PRESENCE_INITIAL_ENTRY_CAPACITY: usize = 1024;
 const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
 const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident state";
 const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort input accumulator";
+const LOCAL_RUNTIME_FILTER_ABLATION_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
+
+fn local_runtime_filter_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(
+		value.map(|value| value.trim().to_ascii_lowercase()),
+		Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+	)
+}
+
+fn local_runtime_filter_enabled() -> bool {
+	local_runtime_filter_enabled_from_env(
+		std::env::var(LOCAL_RUNTIME_FILTER_ABLATION_ENV)
+			.ok()
+			.as_deref(),
+	)
+}
 
 fn build_local_terminal_runtime_filter(
 	executor: &Executor,
@@ -12414,12 +12430,13 @@ impl Executor {
 		if let Some(profile) = grouped_chain_profile {
 			profile.record_reservoir_dispatch(runtime.replay_id, partition_count, group_count)?;
 		}
-		let local_runtime_filter = if local_runtime_filter_shape_is_admitted(
-			null_safe_keys,
-			key_plan,
-			&partition_build_keys,
-			&runtime.probe_keys,
-		) {
+		let local_runtime_filter = if local_runtime_filter_enabled()
+			&& local_runtime_filter_shape_is_admitted(
+				null_safe_keys,
+				key_plan,
+				&partition_build_keys,
+				&runtime.probe_keys,
+			) {
 			build_local_terminal_runtime_filter(
 				self,
 				base_batches,
@@ -17765,6 +17782,15 @@ mod tests {
 			&[ColumnOrdinal(0), ColumnOrdinal(1)],
 			&[ColumnOrdinal(0)],
 		));
+	}
+
+	#[test]
+	fn adr448_kill_switch_defaults_to_filter_on() {
+		assert!(local_runtime_filter_enabled_from_env(None));
+		assert!(local_runtime_filter_enabled_from_env(Some("0")));
+		assert!(!local_runtime_filter_enabled_from_env(Some("1")));
+		assert!(!local_runtime_filter_enabled_from_env(Some("true")));
+		assert!(!local_runtime_filter_enabled_from_env(Some(" on ")));
 	}
 
 	#[test]

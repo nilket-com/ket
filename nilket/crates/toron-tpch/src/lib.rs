@@ -61,8 +61,7 @@ use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	RuntimeFilterDescriptor, SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
-	build_runtime_filter_mask_for_batch,
-	pbc::{OP_PROJECT, Program},
+	build_runtime_filter_mask_for_batch, pbc::Program,
 };
 
 use telemetry::{
@@ -1631,22 +1630,6 @@ fn record_batch_bytes(batch: &RecordBatch) -> usize {
 	batch.get_array_memory_size()
 }
 
-fn append_projection_to_pbc(
-	bytecode: &mut Vec<u8>,
-	projected_columns: &[toron::ir::ColumnOrdinal],
-) -> Result<(), StorageError> {
-	let projection_len =
-		u16::try_from(projected_columns.len()).map_err(|_| StorageError::InvalidPbcProgram {
-			message: "projection column count exceeds u16::MAX".to_string(),
-		})?;
-	bytecode.push(OP_PROJECT);
-	bytecode.extend_from_slice(&projection_len.to_le_bytes());
-	for column in projected_columns {
-		bytecode.extend_from_slice(&column.0.to_le_bytes());
-	}
-	Ok(())
-}
-
 #[async_trait]
 impl StorageScan for ParquetHarnessScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
@@ -1685,11 +1668,6 @@ impl StorageScan for ParquetHarnessScan {
 			columns.dedup();
 			pbc_referenced_columns.sort_unstable();
 			pbc_referenced_columns.dedup();
-			if let Some(projected) = &projected_columns {
-				if !runtime_filter_present {
-					append_projection_to_pbc(program, projected)?;
-				}
-			}
 			Some(columns)
 		} else {
 			None
@@ -1714,6 +1692,16 @@ impl StorageScan for ParquetHarnessScan {
 			columns.sort_unstable();
 			columns.dedup();
 			pbc_projection = Some(columns);
+		}
+		if pbc_projection.is_none() {
+			// Keep the control arm on the same source-column/projection pipeline
+			// even when there is no PBC program.
+			pbc_projection = projected_columns.as_ref().map(|columns| {
+				columns
+					.iter()
+					.map(|column| column.0 as usize)
+					.collect::<Vec<_>>()
+			});
 		}
 		let output_schema = if let Some(columns) = &projected_columns {
 			let indices = columns
@@ -1831,23 +1819,26 @@ impl StorageScan for ParquetHarnessScan {
 							.map_err(|error| StorageError::InvalidPbcProgram {
 								message: format!("{error:?}"),
 							})?;
-						if runtime_filter_present {
-							let columns = projected_columns
-								.as_ref()
-								.expect("projection when filtering");
-							filtered.project(
-								&columns
-									.iter()
-									.map(|column| column.0 as usize)
-									.collect::<Vec<_>>(),
-							)?
-						} else {
-							filtered
-						}
+						let columns = projected_columns
+							.as_ref()
+							.expect("projection for persisted scan");
+						filtered.project(
+							&columns
+								.iter()
+								.map(|column| column.0 as usize)
+								.collect::<Vec<_>>(),
+						)?
 					} else if runtime_filter_present {
 						let columns = projected_columns
 							.as_ref()
 							.expect("projection when filtering");
+						source_batch.project(
+							&columns
+								.iter()
+								.map(|column| column.0 as usize)
+								.collect::<Vec<_>>(),
+						)?
+					} else if let Some(columns) = &projected_columns {
 						source_batch.project(
 							&columns
 								.iter()
@@ -1923,29 +1914,27 @@ impl StorageScan for ParquetHarnessScan {
 							message: format!("{error:?}"),
 						}
 					})?;
-				if runtime_filter_present {
-					let columns = projected_columns
-						.as_ref()
-						.expect("projection when filtering");
-					filtered.project(
-						&columns
-							.iter()
-							.map(|column| column.0 as usize)
-							.collect::<Vec<_>>(),
-					)?
-				} else {
-					filtered
-				}
+				let columns = projected_columns
+					.as_ref()
+					.expect("projection for persisted scan");
+				filtered.project(
+					&columns
+						.iter()
+						.map(|column| column.0 as usize)
+						.collect::<Vec<_>>(),
+				)?
 			} else {
+				let batch = if let Some(columns) = &pbc_projection {
+					inflate_projected_parquet_batch(batch, full_schema.clone(), columns)?
+				} else {
+					batch
+				};
 				let batch = if let Some(descriptor) = request.runtime_filter.as_ref() {
 					apply_harness_runtime_filter(batch, descriptor)?
 				} else {
 					batch
 				};
-				if runtime_filter_present {
-					let columns = projected_columns
-						.as_ref()
-						.expect("projection when filtering");
+				if let Some(columns) = &projected_columns {
 					batch.project(
 						&columns
 							.iter()
