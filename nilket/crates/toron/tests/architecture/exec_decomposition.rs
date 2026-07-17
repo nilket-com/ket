@@ -438,6 +438,49 @@ pub(crate) fn adr445_page_cache_bypass_is_fenced_to_resident_arm() {
 }
 
 #[test]
+pub(crate) fn adr446_local_runtime_filter_is_fenced_to_terminal_reservoir() {
+	let manifest = manifest_dir();
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let owners = brace_blocks_after_marker(
+		&streaming,
+		"async fn try_process_reoriented_inner_chain_grouped_partitioned_scan_reservoir",
+	);
+	let [(_, owner)] = owners.as_slice() else {
+		panic!("expected exactly one local runtime-filter owner");
+	};
+	let fence = owner
+		.find("local_runtime_filter_shape_is_admitted(")
+		.expect("local filter must use the shape admission fence");
+	let build = owner[fence..]
+		.find("build_local_terminal_runtime_filter(")
+		.map(|offset| fence + offset)
+		.expect("local filter must be built in the terminal owner");
+	let reservoir = owner[build..]
+		.find("build_partitioned_streaming_scan_inner_build_reservoir(")
+		.map(|offset| build + offset)
+		.expect("terminal reservoir build must follow local filter construction");
+	let assignment = owner[reservoir..]
+		.find("local_runtime_filter,")
+		.map(|offset| reservoir + offset)
+		.expect("local filter must be threaded into the terminal reservoir");
+	assert!(fence < build && build < reservoir && reservoir < assignment);
+	assert!(owner.contains("runtime.probe_keys.first().copied()"));
+	assert!(owner.contains("partition_build_keys.first().copied()"));
+	assert!(streaming.contains("!null_safe_keys"));
+
+	let runtime_filter = std::fs::read_to_string(manifest.join("src/exec/runtime_filter.rs"))
+		.expect("read runtime filter source");
+	assert!(runtime_filter.contains("build_runtime_filter_fragment_for_ordinal"));
+	assert!(
+		runtime_filter
+			.contains("build_runtime_filter_fragment_for_ordinal(batches, ordinal, key_type)")
+	);
+	assert!(streaming.contains("req.runtime_filter.is_none()"));
+	assert!(!streaming.contains("self.context.runtime_filter ="));
+}
+
+#[test]
 pub(crate) fn adr354_exec_root_declares_expr_module() {
 	let root = exec_root_source();
 

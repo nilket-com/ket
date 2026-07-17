@@ -2,6 +2,9 @@ use super::residency_profile::{
 	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
 };
 use super::*;
+use crate::exec::runtime_filter::{
+	build_runtime_filter_fragment_for_ordinal, descriptor_from_fragment, runtime_filter_key_type,
+};
 use ahash::RandomState;
 
 const STREAMED_INNER_LOADED_BUILD_ESTIMATE_SAFETY_MULTIPLIER: u64 = 64;
@@ -14,6 +17,72 @@ const INT64_PRESENCE_INITIAL_ENTRY_CAPACITY: usize = 1024;
 const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
 const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident state";
 const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort input accumulator";
+
+fn build_local_terminal_runtime_filter(
+	executor: &Executor,
+	base_batches: &[RecordBatch],
+	base_key: Option<crate::ir::ColumnOrdinal>,
+	scan: &ExecutionPlan,
+	probe_key: Option<crate::ir::ColumnOrdinal>,
+	morsel: Option<(MorselId, u32)>,
+) -> Option<RuntimeFilterDescriptor> {
+	if executor.context.runtime_filter.is_some() {
+		return None;
+	}
+	let base_key = base_key?;
+	let probe_key = probe_key?;
+	let base_schema = base_batches.first()?.schema();
+	let base_field = base_schema.fields().get(base_key.0 as usize)?;
+	let scan_schema = match scan {
+		ExecutionPlan::Scan { schema, .. } => schema,
+		_ => return None,
+	};
+	let source_probe_key = scan_source_ordinal(scan, probe_key)?;
+	// `ExecutionPlan::Scan::schema` is the scan's projected output schema.  The
+	// source ordinal is recovered from `projection`, while type eligibility is
+	// checked against the projected field that actually carries that source
+	// column.  The physical descriptor fingerprint on the request authenticates
+	// the source schema at the storage boundary.
+	let probe_field = scan_schema.fields().get(probe_key.0 as usize)?;
+	let key_type = runtime_filter_key_type(base_field.data_type())?;
+	if runtime_filter_key_type(probe_field.data_type())? != key_type {
+		return None;
+	}
+	let fragment =
+		build_runtime_filter_fragment_for_ordinal(base_batches, base_key, key_type).ok()??;
+	let request = executor.bound_scan_request(scan, morsel)?;
+	Some(descriptor_from_fragment(
+		&fragment,
+		vec![source_probe_key.0],
+		request.physical_descriptor_fingerprint,
+	))
+}
+
+fn scan_source_ordinal(
+	scan: &ExecutionPlan,
+	projected_ordinal: crate::ir::ColumnOrdinal,
+) -> Option<crate::ir::ColumnOrdinal> {
+	let ExecutionPlan::Scan { projection, .. } = scan else {
+		return None;
+	};
+	projection
+		.as_ref()
+		.map_or(Some(projected_ordinal), |columns| {
+			columns.get(projected_ordinal.0 as usize).copied()
+		})
+}
+
+fn local_runtime_filter_shape_is_admitted(
+	null_safe_keys: bool,
+	key_plan: JoinKeyPlan,
+	partition_build_keys: &[crate::ir::ColumnOrdinal],
+	probe_keys: &[crate::ir::ColumnOrdinal],
+) -> bool {
+	!null_safe_keys
+		&& matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64)
+		&& partition_build_keys.len() == 1
+		&& probe_keys.len() == 1
+}
 
 fn account_streamed_correlated_sort_input(
 	accumulated_bytes: u64,
@@ -5068,6 +5137,7 @@ impl Executor {
 					None,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -5854,17 +5924,21 @@ impl Executor {
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
 		membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
 		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
+		local_runtime_filter: Option<RuntimeFilterDescriptor>,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
 				message: "partitioned streamed inner build count exceeds u32".to_string(),
 			})?;
 		if let Some(exchange) = scan_input.exchange {
-			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			let Some(mut req) = self.bound_scan_request(scan_input.scan, morsel) else {
 				return Err(ExecutionError::InvalidExpression {
 					message: "streaming scan build expected a scan input".to_string(),
 				});
 			};
+			if req.runtime_filter.is_none() {
+				req.runtime_filter = local_runtime_filter.clone();
+			}
 			let mut remaining = req.row_limit;
 			let span = crate::telemetry::storage_scan_span(&req);
 			let mut stream = self
@@ -5969,11 +6043,14 @@ impl Executor {
 				}
 			}
 		} else {
-			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			let Some(mut req) = self.bound_scan_request(scan_input.scan, morsel) else {
 				return Err(ExecutionError::InvalidExpression {
 					message: "streaming scan build expected a scan input".to_string(),
 				});
 			};
+			if req.runtime_filter.is_none() {
+				req.runtime_filter = local_runtime_filter;
+			}
 			let mut remaining = req.row_limit;
 			let span = crate::telemetry::storage_scan_span(&req);
 			let mut stream = self
@@ -11349,6 +11426,7 @@ impl Executor {
 					)
 				}),
 				None,
+				None,
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -11877,6 +11955,7 @@ impl Executor {
 						None,
 						profile.map(|profile| (profile, MembershipChainPhase::TerminalBuild)),
 						None,
+						None,
 					)
 					.await?;
 					terminal_spill_bytes = terminal_spill_bytes.saturating_add(group_spill_bytes);
@@ -12335,6 +12414,23 @@ impl Executor {
 		if let Some(profile) = grouped_chain_profile {
 			profile.record_reservoir_dispatch(runtime.replay_id, partition_count, group_count)?;
 		}
+		let local_runtime_filter = if local_runtime_filter_shape_is_admitted(
+			null_safe_keys,
+			key_plan,
+			&partition_build_keys,
+			&runtime.probe_keys,
+		) {
+			build_local_terminal_runtime_filter(
+				self,
+				base_batches,
+				runtime.probe_keys.first().copied(),
+				scan_input.scan,
+				partition_build_keys.first().copied(),
+				build_morsel.or(morsel),
+			)
+		} else {
+			None
+		};
 		let grouped_chain_observer = grouped_chain_profile.map(GroupedChainProfile::spill_observer);
 
 		let reservoir_write_timer = grouped_chain_profile
@@ -12357,6 +12453,7 @@ impl Executor {
 				residency_profile.as_deref_mut(),
 				None,
 				grouped_chain_observer.as_ref(),
+				local_runtime_filter,
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
@@ -13055,6 +13152,7 @@ impl Executor {
 				spec.projection.as_ref(),
 				runtime_baseline_bytes,
 				true,
+				None,
 				None,
 				None,
 				None,
@@ -15323,6 +15421,7 @@ impl Executor {
 					None,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -15433,6 +15532,7 @@ impl Executor {
 			MembershipSpillRole,
 		)>,
 		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
+		local_runtime_filter: Option<RuntimeFilterDescriptor>,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -15493,6 +15593,7 @@ impl Executor {
 				residency_profile.as_deref_mut(),
 				membership_profile.map(|(profile, phase, _)| (profile, phase)),
 				grouped_chain_observer,
+				local_runtime_filter,
 			)
 			.await;
 		if let Err(error) = build_result {
@@ -15891,6 +15992,7 @@ impl Executor {
 					group_range.start,
 					group_range.end,
 					true,
+					None,
 					None,
 					None,
 					None,
@@ -17590,6 +17692,170 @@ mod tests {
 		));
 	}
 
+	#[test]
+	fn local_terminal_runtime_filter_preserves_source_ordinal_and_context_filter() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("join_key", DataType::Int64, false),
+			Field::new("sibling_key", DataType::Int64, false),
+		]));
+		let base = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+			],
+		)
+		.expect("base batch");
+		let scan = test_scan_plan_with_first_field_key(TableId(47), schema, 47);
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test(),
+		);
+		let descriptor = build_local_terminal_runtime_filter(
+			&executor,
+			std::slice::from_ref(&base),
+			Some(ColumnOrdinal(0)),
+			&scan,
+			Some(ColumnOrdinal(0)),
+			None,
+		)
+		.expect("supported local filter");
+		assert_eq!(descriptor.probe_key_columns, vec![0]);
+
+		let with_context_filter = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_runtime_filter(Some(descriptor)),
+		);
+		assert!(
+			build_local_terminal_runtime_filter(
+				&with_context_filter,
+				std::slice::from_ref(&base),
+				Some(ColumnOrdinal(0)),
+				&scan,
+				Some(ColumnOrdinal(0)),
+				None,
+			)
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn adr446_null_safe_and_unsupported_shapes_decline() {
+		assert!(!local_runtime_filter_shape_is_admitted(
+			true,
+			JoinKeyPlan::Int64,
+			&[ColumnOrdinal(0)],
+			&[ColumnOrdinal(0)],
+		));
+		assert!(!local_runtime_filter_shape_is_admitted(
+			false,
+			JoinKeyPlan::Generic,
+			&[ColumnOrdinal(0)],
+			&[ColumnOrdinal(0)],
+		));
+		assert!(!local_runtime_filter_shape_is_admitted(
+			false,
+			JoinKeyPlan::Int64,
+			&[ColumnOrdinal(0), ColumnOrdinal(1)],
+			&[ColumnOrdinal(0)],
+		));
+	}
+
+	#[test]
+	fn adr446_descriptor_uses_source_ordinal_after_projection_reordering() {
+		let base_schema = Arc::new(Schema::new(vec![
+			Field::new("l_orderkey", DataType::Int64, false),
+			Field::new("l_suppkey", DataType::Int64, false),
+		]));
+		let base = RecordBatch::try_new(
+			base_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+			],
+		)
+		.expect("base batch");
+		let reordered_schema = Arc::new(Schema::new(vec![
+			Field::new("l_suppkey", DataType::Int64, false),
+			Field::new("l_orderkey", DataType::Int64, false),
+		]));
+		let scan = test_scan_plan_with_first_field_key(TableId(48), reordered_schema, 48);
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test(),
+		);
+		let descriptor = build_local_terminal_runtime_filter(
+			&executor,
+			std::slice::from_ref(&base),
+			Some(ColumnOrdinal(0)),
+			&scan,
+			Some(ColumnOrdinal(1)),
+			None,
+		)
+		.expect("source-ordinal filter");
+		assert_eq!(descriptor.probe_key_columns, vec![1]);
+	}
+
+	#[test]
+	fn adr446_descriptor_maps_projected_key_to_source_ordinal() {
+		let base_schema = Arc::new(Schema::new(vec![Field::new(
+			"o_orderkey",
+			DataType::Int64,
+			false,
+		)]));
+		let base = RecordBatch::try_new(
+			base_schema,
+			vec![Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef],
+		)
+		.expect("base batch");
+		let scan_schema = Arc::new(Schema::new(
+			(0..6)
+				.map(|ordinal| {
+					Field::new(
+						match ordinal {
+							4 => "l_orderkey",
+							5 => "l_suppkey",
+							_ => "lineitem_payload",
+						},
+						DataType::Int64,
+						false,
+					)
+				})
+				.collect::<Vec<_>>(),
+		));
+		let mut scan = test_scan_plan_with_first_field_key(TableId(49), scan_schema, 49);
+		let ExecutionPlan::Scan { projection, .. } = &mut scan else {
+			panic!("expected scan plan");
+		};
+		*projection = Some(vec![ColumnOrdinal(0), ColumnOrdinal(1), ColumnOrdinal(4)]);
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test(),
+		);
+		let descriptor = build_local_terminal_runtime_filter(
+			&executor,
+			std::slice::from_ref(&base),
+			Some(ColumnOrdinal(0)),
+			&scan,
+			Some(ColumnOrdinal(2)),
+			None,
+		)
+		.expect("projected source-ordinal filter");
+		assert_eq!(descriptor.probe_key_columns, vec![4]);
+	}
+
 	#[tokio::test]
 	async fn partition_reservoir_scans_source_once_and_matches_group_rescan_path() {
 		let build_schema = Arc::new(Schema::new(vec![
@@ -17671,6 +17937,7 @@ mod tests {
 				None,
 				None,
 				None,
+				None,
 			)
 			.await
 			.expect("reservoir build")
@@ -17739,6 +18006,7 @@ mod tests {
 				0,
 				false,
 				Some(&mut residency_profile),
+				None,
 				None,
 				None,
 			)
@@ -17896,6 +18164,7 @@ mod tests {
 				None,
 				join_spill_retained_footprint_memory_cap(budget.memory.get()),
 				true,
+				None,
 				None,
 				None,
 				None,

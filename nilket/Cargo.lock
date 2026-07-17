@@ -5436,6 +5436,7 @@ dependencies = [
  "parquet",
  "polars",
  "polars-sql",
+ "postcard",
  "serde",
  "serde_json",
  "tokio",

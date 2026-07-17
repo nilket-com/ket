@@ -31,6 +31,7 @@ use arrow::array::{
 	Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
 	StringArray, new_null_array,
 };
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -59,7 +60,8 @@ use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
+	RuntimeFilterDescriptor, SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
+	build_runtime_filter_mask_for_batch,
 	pbc::{OP_PROJECT, Program},
 };
 
@@ -1475,6 +1477,10 @@ impl StorageScan for HarnessScan {
 					table: request.table_id,
 				})?;
 
+		if let Some(runtime_filter) = request.runtime_filter.as_ref() {
+			batch = apply_harness_runtime_filter(batch, runtime_filter)?;
+		}
+
 		if let Some(pbc) = request.pbc_predicate {
 			batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
 				StorageError::InvalidPbcProgram {
@@ -1498,6 +1504,18 @@ impl StorageScan for HarnessScan {
 			vec![batch],
 		))
 	}
+}
+
+/// Apply a runtime filter in the harness at the same source-schema boundary as the storage ring.
+/// Invalid descriptors fail open: a filter is an optimization and declining it must preserve rows.
+fn apply_harness_runtime_filter(
+	batch: RecordBatch,
+	descriptor: &RuntimeFilterDescriptor,
+) -> Result<RecordBatch, StorageError> {
+	let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, descriptor) else {
+		return Ok(batch);
+	};
+	filter_record_batch(&batch, &mask).map_err(StorageError::from)
 }
 
 #[derive(Debug, Clone)]
@@ -1645,7 +1663,7 @@ impl StorageScan for ParquetHarnessScan {
 		let mut pbc = request.pbc_predicate.clone();
 		let full_column_count = source.schema.fields().len();
 		let mut pbc_referenced_columns = Vec::new();
-		let pbc_projection = if let Some(program) = &mut pbc {
+		let mut pbc_projection = if let Some(program) = &mut pbc {
 			let compiled =
 				Program::compile(program).map_err(|error| StorageError::InvalidPbcProgram {
 					message: format!("{error:?}"),
@@ -1673,6 +1691,12 @@ impl StorageScan for ParquetHarnessScan {
 		} else {
 			None
 		};
+		let runtime_filter_present = request.runtime_filter.is_some();
+		if runtime_filter_present {
+			// Runtime-filter ordinals are source-schema ordinals. Read the complete source
+			// batch so filtering precedes PBC/projection, matching the storage-ring path.
+			pbc_projection = Some((0..full_column_count).collect());
+		}
 		let output_schema = if let Some(columns) = &projected_columns {
 			let indices = columns
 				.iter()
@@ -1691,7 +1715,9 @@ impl StorageScan for ParquetHarnessScan {
 				message: format!("read parquet metadata {}: {error}", source.path.display()),
 			}
 		})?;
-		if let Some(columns) = &pbc_projection {
+		if runtime_filter_present {
+			// Keep the full source schema for runtime-filter evaluation below.
+		} else if let Some(columns) = &pbc_projection {
 			if columns.len() < full_column_count {
 				let mask = ProjectionMask::leaves(builder.parquet_schema(), columns.clone());
 				builder = builder.with_projection(mask);
@@ -1763,25 +1789,41 @@ impl StorageScan for ParquetHarnessScan {
 				let raw_columns = raw_batch.num_columns();
 				let raw_bytes = record_batch_bytes(&raw_batch);
 				let mut inflated_bytes = None;
-				let output_batch = if let Some(program) = &pbc {
-					let pbc_batch = if let Some(columns) = &pbc_projection {
+				let output_batch = {
+					let source_batch = if let Some(columns) = &pbc_projection {
 						let inflated = inflate_projected_parquet_batch(
 							raw_batch,
 							full_schema.clone(),
 							columns,
 						)?;
-						inflated_bytes = Some(record_batch_bytes(&inflated));
+						if columns.len() < full_column_count {
+							inflated_bytes = Some(record_batch_bytes(&inflated));
+						}
 						inflated
 					} else {
 						raw_batch
 					};
-					wendelon::schema::pbc::execute(program, &pbc_batch).map_err(|error| {
-						StorageError::InvalidPbcProgram {
-							message: format!("{error:?}"),
-						}
-					})?
-				} else {
-					raw_batch
+					let source_batch = if let Some(descriptor) = request.runtime_filter.as_ref() {
+						apply_harness_runtime_filter(source_batch, descriptor)?
+					} else {
+						source_batch
+					};
+					if let Some(program) = &pbc {
+						wendelon::schema::pbc::execute(program, &source_batch).map_err(|error| {
+							StorageError::InvalidPbcProgram {
+								message: format!("{error:?}"),
+							}
+						})?
+					} else if let Some(columns) = &projected_columns {
+						source_batch.project(
+							&columns
+								.iter()
+								.map(|column| column.0 as usize)
+								.collect::<Vec<_>>(),
+						)?
+					} else {
+						source_batch
+					}
 				};
 				ledger.batches.push(ParquetScanBatchLedger {
 					raw_rows,
@@ -1837,13 +1879,32 @@ impl StorageScan for ParquetHarnessScan {
 				} else {
 					batch
 				};
+				let batch = if let Some(descriptor) = request.runtime_filter.as_ref() {
+					apply_harness_runtime_filter(batch, descriptor)?
+				} else {
+					batch
+				};
 				wendelon::schema::pbc::execute(program, &batch).map_err(|error| {
 					StorageError::InvalidPbcProgram {
 						message: format!("{error:?}"),
 					}
 				})
 			} else {
-				Ok(batch)
+				let batch = if let Some(descriptor) = request.runtime_filter.as_ref() {
+					apply_harness_runtime_filter(batch, descriptor)?
+				} else {
+					batch
+				};
+				if let Some(columns) = &projected_columns {
+					Ok(batch.project(
+						&columns
+							.iter()
+							.map(|column| column.0 as usize)
+							.collect::<Vec<_>>(),
+					)?)
+				} else {
+					Ok(batch)
+				}
 			}?;
 			record_parquet_scan_progress(&serde_json::json!({
 				"event": "batch",
@@ -14837,6 +14898,11 @@ mod adr331_q08_scale_probe {
 #[cfg(test)]
 mod parquet_scan_projection_tests {
 	use super::*;
+	use wendelon::schema::{
+		RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION, RuntimeFilterBloom,
+		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
+		encode_runtime_filter_key, insert_runtime_filter_encoded_key,
+	};
 
 	#[test]
 	fn physical_plan_fingerprint_shape_ignores_scan_size_routing_hint() {
@@ -14868,6 +14934,57 @@ mod parquet_scan_projection_tests {
 		assert!(!inflated.schema().field(0).is_nullable());
 		assert!(inflated.schema().field(1).is_nullable());
 		assert_eq!(inflated.column(1).null_count(), 2);
+	}
+
+	#[test]
+	fn adr446_harness_filter_uses_source_ordinal_before_projection() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("sibling", DataType::Int64, false),
+			Field::new("join_key", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+				Arc::new(Int64Array::from(vec![7_i64, 8, 7])),
+			],
+		)
+		.expect("source batch");
+		let bit_count = 64;
+		let hash_count = 3;
+		let mut payload = vec![0_u8; 8];
+		let key = encode_runtime_filter_key(batch.column(1), 0)
+			.expect("encode")
+			.expect("non-null");
+		insert_runtime_filter_encoded_key(
+			&mut payload,
+			bit_count,
+			hash_count,
+			RUNTIME_FILTER_HASH_SEED,
+			&key,
+		);
+		let descriptor = RuntimeFilterDescriptor {
+			key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![1],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: RUNTIME_FILTER_HASH_SEED,
+				bit_count,
+				hash_count,
+				byte_budget: 8,
+				target_fp_rate_bp: 100,
+				payload,
+			}),
+			probe_descriptor_fingerprint: postcard::from_bytes(&[0_u8; 32]).expect("fingerprint"),
+		};
+		let filtered = apply_harness_runtime_filter(batch, &descriptor).expect("filter");
+		let projected = filtered.project(&[0]).expect("project after filter");
+		let values = projected
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("int64 projection");
+		assert_eq!(values.values(), &[10, 30]);
 	}
 }
 

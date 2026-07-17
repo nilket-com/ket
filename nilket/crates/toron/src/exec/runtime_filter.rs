@@ -29,6 +29,14 @@ pub(crate) fn build_runtime_filter_fragment(
 	let Some((ordinal, key_type)) = single_supported_key(key) else {
 		return Ok(None);
 	};
+	build_runtime_filter_fragment_for_ordinal(batches, ordinal, key_type)
+}
+
+pub(crate) fn build_runtime_filter_fragment_for_ordinal(
+	batches: &[RecordBatch],
+	ordinal: ColumnOrdinal,
+	key_type: RuntimeFilterKeyType,
+) -> Result<Option<RuntimeFilterFragment>, ExecutionError> {
 	let non_null_count = non_null_key_count(batches, ordinal)?;
 	let exact_byte_budget =
 		u32::try_from(EXACT_FILTER_MAX_BYTES).expect("exact filter byte budget fits u32");
@@ -536,6 +544,42 @@ mod tests {
 		}
 
 		assert_eq!(builder.finish().unwrap(), Some(expected));
+	}
+
+	#[test]
+	fn runtime_filter_ordinal_builder_matches_program_builder() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("join_key", DataType::Int64, false),
+			Field::new("sibling_key", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+			],
+		)
+		.unwrap();
+		let key = key_expr(DataType::Int64, true);
+		let program_fragment = build_runtime_filter_fragment(std::slice::from_ref(&batch), &key)
+			.unwrap()
+			.expect("program fragment");
+		let ordinal_fragment = build_runtime_filter_fragment_for_ordinal(
+			std::slice::from_ref(&batch),
+			ColumnOrdinal(0),
+			RuntimeFilterKeyType::Int64,
+		)
+		.unwrap()
+		.expect("ordinal fragment");
+		assert_eq!(program_fragment, ordinal_fragment);
+		let sibling_fragment = build_runtime_filter_fragment_for_ordinal(
+			std::slice::from_ref(&batch),
+			ColumnOrdinal(1),
+			RuntimeFilterKeyType::Int64,
+		)
+		.unwrap()
+		.expect("sibling fragment");
+		assert_ne!(program_fragment, sibling_fragment);
 	}
 
 	#[test]

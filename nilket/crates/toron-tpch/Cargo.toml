@@ -25,6 +25,7 @@ async-trait = "0.1"
 futures = "0.3"
 libc = "0.2"
 parquet = "58.3.0"
+postcard.workspace = true
 polars = { workspace = true, optional = true, features = ["lazy", "dtype-decimal", "temporal", "strings", "streaming"] }
 polars-sql = { workspace = true, optional = true, features = ["parquet", "dtype-decimal", "semi_anti_join"] }
 serde = { version = "1.0", features = ["derive"] }
