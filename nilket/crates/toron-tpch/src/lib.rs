@@ -6,7 +6,15 @@
 //! execute`. A `pass` here means *reachability* (the shape ran and produced a digest), not TPC-H
 //! correctness — dev data is synthetic and explicitly NOT a TPC-H result.
 
+mod adr444_profile_eval;
 pub mod telemetry;
+
+pub use adr444_profile_eval::{
+	ADR444_ABSOLUTE_SPREAD_LIMIT, ADR444_CHILDREN, ADR444_MECHANISM_ENVELOPE,
+	ADR444_MEDIAN_SEPARATION, ADR444_SHARE_SPREAD_LIMIT, Adr444ChildSample, Adr444Evaluation,
+	Adr444Gate, Adr444VarianceEvaluation, Adr444VarianceVerdict, evaluate_adr444_cohort,
+	evaluate_adr444_variance,
+};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

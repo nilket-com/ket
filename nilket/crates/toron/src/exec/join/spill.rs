@@ -760,6 +760,7 @@ impl SpilledJoinBuild {
 			page.offset,
 			page.ciphertext_len,
 			None,
+			None,
 		)
 		.await?;
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
@@ -1185,6 +1186,21 @@ impl PinDecodedPagesOutcome {
 	}
 }
 
+fn record_grouped_chain_pin_outcome(
+	observer: Option<&GroupedChainSpillObserver<'_>>,
+	outcome: PinDecodedPagesOutcome,
+) -> Result<(), ExecutionError> {
+	let Some(observer) = observer else {
+		return Ok(());
+	};
+	let outcome = match outcome {
+		PinDecodedPagesOutcome::Admitted => GroupedChainPinOutcome::Admitted,
+		PinDecodedPagesOutcome::RejectedPreflight => GroupedChainPinOutcome::RejectedPreflight,
+		PinDecodedPagesOutcome::RejectedMidDecode => GroupedChainPinOutcome::RejectedMidDecode,
+	};
+	observer.record_pin_outcome(outcome)
+}
+
 pub(in crate::exec) struct SpilledInnerJoinBuild {
 	spill_id: u64,
 	path: PathBuf,
@@ -1461,6 +1477,26 @@ impl SpilledInnerJoinBuild {
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		self.write_batch_chunks_unindexed_profiled(
+			batch,
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			task_budget,
+			None,
+		)
+		.await
+	}
+
+	pub(in crate::exec) async fn write_batch_chunks_unindexed_profiled(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -1477,6 +1513,7 @@ impl SpilledInnerJoinBuild {
 				false,
 				false,
 				task_budget,
+				observer,
 			)
 			.await?;
 		}
@@ -1543,7 +1580,8 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
-	pub(in crate::exec) async fn write_projected_batch_chunks_unindexed(
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn write_projected_batch_chunks_unindexed_profiled(
 		&mut self,
 		batch: &RecordBatch,
 		retained_columns: &[ColumnOrdinal],
@@ -1551,6 +1589,7 @@ impl SpilledInnerJoinBuild {
 		projected_build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
@@ -1569,6 +1608,7 @@ impl SpilledInnerJoinBuild {
 				false,
 				false,
 				task_budget,
+				observer,
 			)
 			.await?;
 		}
@@ -1623,6 +1663,7 @@ impl SpilledInnerJoinBuild {
 			retain_unkeyed_rows,
 			true,
 			task_budget,
+			None,
 		)
 		.await
 	}
@@ -1636,10 +1677,14 @@ impl SpilledInnerJoinBuild {
 		retain_unkeyed_rows: bool,
 		index_rows: bool,
 		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
+		let key_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+			.transpose()?;
 		let key_arrays = key_arrays(batch, build_keys)?;
 		let mut refs = std::mem::take(&mut self.scratch_refs);
 		refs.clear();
@@ -1651,13 +1696,29 @@ impl SpilledInnerJoinBuild {
 			refs.push((key, join_build_row_index(row)?));
 		}
 		if refs.is_empty() && !retain_unkeyed_rows {
+			if let Some(timer) = key_timer {
+				timer.finish_with(batch.num_rows() as u64, 0, 0)?;
+			}
 			self.scratch_refs = refs;
 			return Ok(());
+		}
+		if let Some(timer) = key_timer {
+			timer.finish_with(batch.num_rows() as u64, 0, 0)?;
 		}
 
 		let page_index = self.pages.len();
 		self.scratch_plaintext.clear();
+		let encode_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::WriteIpcEncode))
+			.transpose()?;
 		encode_record_batch_ipc_into(&mut self.scratch_plaintext, batch)?;
+		if let Some(timer) = encode_timer {
+			timer.finish_with(
+				batch.num_rows() as u64,
+				self.scratch_plaintext.len() as u64,
+				1,
+			)?;
+		}
 		let plaintext = std::mem::take(&mut self.scratch_plaintext);
 		let (page, mut plaintext) = write_join_spill_plaintext_page_returning_buffer(
 			self.file_ops.as_ref(),
@@ -1667,6 +1728,7 @@ impl SpilledInnerJoinBuild {
 			page_index,
 			self.next_offset,
 			plaintext,
+			observer,
 		)
 		.await?;
 		plaintext.clear();
@@ -1743,6 +1805,24 @@ impl SpilledInnerJoinBuild {
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		self.rebuild_index_from_pages_profiled(
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			task_budget,
+			None,
+		)
+		.await
+	}
+
+	pub(in crate::exec) async fn rebuild_index_from_pages_profiled(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
 		self.index.clear();
 		self.compact_index = if self.compact_index_enabled {
 			Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys))
@@ -1752,7 +1832,10 @@ impl SpilledInnerJoinBuild {
 		self.resident_index_bytes = 0;
 		self.rows = 0;
 		for page_index in 0..self.pages.len() {
-			let batch = self.read_batch_page(page_index).await?;
+			let batch = self.read_batch_page_profiled(page_index, observer).await?;
+			let cpu_timer = observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadIndexRebuildCpu))
+				.transpose()?;
 			let key_arrays = key_arrays(&batch, build_keys)?;
 			for row in 0..batch.num_rows() {
 				let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
@@ -1786,6 +1869,9 @@ impl SpilledInnerJoinBuild {
 				task_budget.memory.get(),
 				SpillResidentGuardSite::RebuildIndex,
 			)?;
+			if let Some(timer) = cpu_timer {
+				timer.finish_with(batch.num_rows() as u64, self.resident_index_bytes, 1)?;
+			}
 		}
 		Ok(())
 	}
@@ -1867,9 +1953,23 @@ impl SpilledInnerJoinBuild {
 	pub(in crate::exec) async fn read_all_batch_pages(
 		&mut self,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		self.read_all_batch_pages_profiled(None).await
+	}
+
+	pub(in crate::exec) async fn read_all_batch_pages_profiled(
+		&mut self,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let mut pages = Vec::with_capacity(self.pages.len());
 		for page_index in 0..self.pages.len() {
-			pages.push(self.read_batch_page(page_index).await?);
+			let page = self.read_batch_page_profiled(page_index, observer).await?;
+			let handoff_timer = observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
+				.transpose()?;
+			pages.push(page);
+			if let Some(timer) = handoff_timer {
+				timer.finish_with(0, 0, 1)?;
+			}
 		}
 		Ok(pages)
 	}
@@ -1878,10 +1978,21 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		memory_cap: u64,
 	) -> Result<PinDecodedPagesOutcome, ExecutionError> {
+		self.try_pin_decoded_pages_profiled(memory_cap, None).await
+	}
+
+	pub(in crate::exec) async fn try_pin_decoded_pages_profiled(
+		&mut self,
+		memory_cap: u64,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<PinDecodedPagesOutcome, ExecutionError> {
 		if self.pinned_decoded_pages.is_some() {
-			return Ok(PinDecodedPagesOutcome::Admitted);
+			let outcome = PinDecodedPagesOutcome::Admitted;
+			record_grouped_chain_pin_outcome(observer, outcome)?;
+			return Ok(outcome);
 		}
 		if let Some(outcome) = self.pin_decoded_outcome {
+			record_grouped_chain_pin_outcome(observer, outcome)?;
 			return Ok(outcome);
 		}
 		if let Some(profile) = &mut self.throughput_profile {
@@ -1907,6 +2018,7 @@ impl SpilledInnerJoinBuild {
 				0,
 				outcome,
 			);
+			record_grouped_chain_pin_outcome(observer, outcome)?;
 			return Ok(outcome);
 		}
 
@@ -1922,7 +2034,7 @@ impl SpilledInnerJoinBuild {
 						message: "streamed inner join pin attempted-page count overflow"
 							.to_string(),
 					})?;
-			let batch = self.read_batch_page(page_index).await?;
+			let batch = self.read_batch_page_profiled(page_index, observer).await?;
 			pages_completed =
 				pages_completed
 					.checked_add(1)
@@ -1949,6 +2061,7 @@ impl SpilledInnerJoinBuild {
 					pages_completed,
 					outcome,
 				);
+				record_grouped_chain_pin_outcome(observer, outcome)?;
 				return Ok(outcome);
 			}
 			pages.push(batch);
@@ -1970,6 +2083,7 @@ impl SpilledInnerJoinBuild {
 			pages_completed,
 			outcome,
 		);
+		record_grouped_chain_pin_outcome(observer, outcome)?;
 		Ok(outcome)
 	}
 
@@ -2192,12 +2306,29 @@ impl SpilledInnerJoinBuild {
 		&mut self,
 		page_index: usize,
 	) -> Result<RecordBatch, ExecutionError> {
+		self.read_batch_page_profiled(page_index, None).await
+	}
+
+	pub(in crate::exec) async fn read_batch_page_profiled(
+		&mut self,
+		page_index: usize,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<RecordBatch, ExecutionError> {
+		let mut cache_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadCacheLru))
+			.transpose()?;
 		if let Some(batch) = self
 			.pinned_decoded_pages
 			.as_ref()
 			.and_then(|pages| pages.get(page_index))
 			.cloned()
 		{
+			if let Some(observer) = observer {
+				observer.record_decoded_cache(true)?;
+			}
+			if let Some(timer) = cache_timer.take() {
+				timer.finish()?;
+			}
 			return Ok(batch);
 		}
 		if let Some(batch) = self
@@ -2209,14 +2340,39 @@ impl SpilledInnerJoinBuild {
 				profile.record_decoded_hit();
 			}
 			self.touch_cache_entry(page_index);
+			if let Some(observer) = observer {
+				observer.record_decoded_cache(true)?;
+			}
+			if let Some(timer) = cache_timer.take() {
+				timer.finish()?;
+			}
 			return Ok(batch);
+		}
+		if let Some(observer) = observer {
+			observer.record_decoded_cache(false)?;
+		}
+		if let Some(timer) = cache_timer.take() {
+			timer.finish()?;
 		}
 		if let Some(profile) = &mut self.throughput_profile {
 			profile.record_decoded_miss();
 		}
-		let bytes = self.read_page(page_index).await?;
+		let bytes = self.read_page_profiled(page_index, observer).await?;
 		let decode_started = self.throughput_profile.as_ref().map(|_| Instant::now());
+		let decode_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadIpcDecode))
+			.transpose()?;
 		let batch = decode_record_batch_ipc(&bytes)?;
+		if let Some(observer) = observer {
+			observer.record_decode()?;
+		}
+		if let Some(timer) = decode_timer {
+			timer.finish_with(
+				batch.num_rows() as u64,
+				record_batch_memory_bytes(&batch),
+				1,
+			)?;
+		}
 		if let (Some(profile), Some(decode_started)) =
 			(&mut self.throughput_profile, decode_started)
 		{
@@ -2230,14 +2386,24 @@ impl SpilledInnerJoinBuild {
 		{
 			self.page_decode_count = self.page_decode_count.saturating_add(1);
 		}
+		let cache_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadCacheLru))
+			.transpose()?;
 		self.insert_decoded_cache_entry(page_index, batch.clone());
+		if let Some(timer) = cache_timer {
+			timer.finish()?;
+		}
 		Ok(batch)
 	}
 
-	pub(in crate::exec) async fn read_page(
+	async fn read_page_profiled(
 		&mut self,
 		page_index: usize,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<Vec<u8>, ExecutionError> {
+		let mut cache_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadCacheLru))
+			.transpose()?;
 		if let Some(cached) = self
 			.cache
 			.get(&page_index)
@@ -2248,12 +2414,27 @@ impl SpilledInnerJoinBuild {
 			}
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
+			if let Some(observer) = observer {
+				observer.record_plaintext_cache(true)?;
+			}
+			if let Some(timer) = cache_timer.take() {
+				timer.finish()?;
+			}
 			return Ok(bytes);
+		}
+		if let Some(observer) = observer {
+			observer.record_plaintext_cache(false)?;
+		}
+		if let Some(timer) = cache_timer.take() {
+			timer.finish()?;
 		}
 		if let Some(profile) = &mut self.throughput_profile {
 			profile.record_plaintext_miss();
 		}
 
+		let read_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadPhysicalRead))
+			.transpose()?;
 		let page = self
 			.pages
 			.get(page_index)
@@ -2267,9 +2448,16 @@ impl SpilledInnerJoinBuild {
 			page.offset,
 			page.ciphertext_len,
 			self.throughput_profile.as_deref_mut(),
+			observer,
 		)
 		.await?;
+		if let Some(timer) = read_timer {
+			timer.finish_with(0, ciphertext.len() as u64, 1)?;
+		}
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
+		let decrypt_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadDecrypt))
+			.transpose()?;
 		let plaintext = self
 			.key
 			.open_in_place(nonce, Aad::empty(), &mut ciphertext)
@@ -2277,7 +2465,16 @@ impl SpilledInnerJoinBuild {
 				message: format!("inner join batch spill decrypt failed: {error:?}"),
 			})?
 			.to_vec();
+		if let Some(timer) = decrypt_timer {
+			timer.finish_with(0, plaintext.len() as u64, 1)?;
+		}
+		let cache_timer = observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadCacheLru))
+			.transpose()?;
 		self.insert_cache_entry(page_index, plaintext.clone());
+		if let Some(timer) = cache_timer {
+			timer.finish()?;
+		}
 		Ok(plaintext)
 	}
 
@@ -3112,6 +3309,7 @@ impl SpilledSemiAntiExistenceBuild {
 			page.offset,
 			page.ciphertext_len,
 			None,
+			None,
 		)
 		.await?;
 		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
@@ -3184,7 +3382,7 @@ async fn write_join_spill_plaintext_page(
 	plaintext: Vec<u8>,
 ) -> Result<JoinSpillPage, ExecutionError> {
 	let (page, _) = write_join_spill_plaintext_page_returning_buffer(
-		file_ops, file, key, spill_id, page_index, offset, plaintext,
+		file_ops, file, key, spill_id, page_index, offset, plaintext, None,
 	)
 	.await?;
 	Ok(page)
@@ -3198,15 +3396,32 @@ async fn write_join_spill_plaintext_page_returning_buffer(
 	page_index: usize,
 	offset: u64,
 	mut plaintext: Vec<u8>,
+	observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<(JoinSpillPage, Vec<u8>), ExecutionError> {
 	let plaintext_len = plaintext.len();
 	let nonce = Nonce::assume_unique_for_key(join_spill_nonce(spill_id, page_index));
+	let encryption_timer = observer
+		.map(|observer| observer.begin(GroupedChainSubLeaf::WriteEncryption))
+		.transpose()?;
 	key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
 		.map_err(|error| ExecutionError::Kernel {
 			message: format!("join spill encrypt failed: {error:?}"),
 		})?;
+	if let Some(timer) = encryption_timer {
+		timer.finish_with(0, plaintext.len() as u64, 1)?;
+	}
 	let ciphertext_len = plaintext.len();
-	let plaintext = write_plain_all_returning_buffer(file_ops, file, offset, plaintext).await?;
+	let write_timer = observer
+		.map(|observer| observer.begin(GroupedChainSubLeaf::WritePhysicalWrite))
+		.transpose()?;
+	let plaintext =
+		write_plain_all_returning_buffer(file_ops, file, offset, plaintext, observer).await?;
+	if let Some(observer) = observer {
+		observer.record_written_page(spill_id, page_index, ciphertext_len)?;
+	}
+	if let Some(timer) = write_timer {
+		timer.finish_with(0, ciphertext_len as u64, 1)?;
+	}
 	Ok((
 		JoinSpillPage {
 			offset,
@@ -3222,6 +3437,7 @@ async fn write_plain_all_returning_buffer(
 	file: &FileHandle,
 	offset: u64,
 	bytes: Vec<u8>,
+	observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<Vec<u8>, ExecutionError> {
 	let mut written_total = 0usize;
 	while written_total < bytes.len() {
@@ -3233,6 +3449,9 @@ async fn write_plain_all_returning_buffer(
 			)
 			.await
 			.map_err(|error| join_spill_io_error("write", error))?;
+		if let Some(observer) = observer {
+			observer.record_physical_write(written)?;
+		}
 		if written == 0 {
 			return Err(join_spill_io_error(
 				"write",
@@ -3253,6 +3472,7 @@ async fn read_plain_exact(
 	offset: u64,
 	len: usize,
 	mut profile: Option<&mut StreamedSpilledLeftOuterProfile>,
+	observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<Vec<u8>, ExecutionError> {
 	let mut out = Vec::with_capacity(len);
 	while out.len() < len {
@@ -3279,6 +3499,9 @@ async fn read_plain_exact(
 				.await
 				.map_err(|error| join_spill_io_error("read", error))?
 		};
+		if let Some(observer) = observer {
+			observer.record_physical_read(chunk.len())?;
+		}
 		if chunk.is_empty() {
 			return Err(join_spill_io_error(
 				"read",

@@ -2143,6 +2143,7 @@ async fn visit_projected_streamed_spilled_inner_join_chunks<F>(
 	retained_columns: &[ColumnOrdinal],
 	output_schema: &SchemaRef,
 	memory_cap: u64,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2155,6 +2156,9 @@ where
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let probe_chunk = batch.slice(offset, len);
 			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
+			let lookup_timer = grouped_chain_observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadLookup))
+				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
 			for row in 0..probe_chunk.num_rows() {
@@ -2169,8 +2173,15 @@ where
 					});
 				}
 			}
-			let page_map = load_streamed_inner_match_pages(spilled, &matches).await?;
+			if let Some(timer) = lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0, 0)?;
+			}
+			let page_map =
+				load_streamed_inner_match_pages(spilled, &matches, grouped_chain_observer).await?;
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
+					.transpose()?;
 				let batch = materialize_projected_streamed_spilled_inner_matches(
 					&page_map,
 					&probe_chunk,
@@ -2180,6 +2191,13 @@ where
 					output_schema,
 					memory_cap,
 				)?;
+				if let Some(timer) = materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
+				}
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
 			}
@@ -2191,6 +2209,7 @@ where
 pub(super) async fn load_streamed_inner_match_pages(
 	spilled: &mut SpilledInnerJoinBuild,
 	matches: &[SpilledInnerJoinMatch],
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<BTreeMap<usize, RecordBatch>, ExecutionError> {
 	let mut page_sources = BTreeMap::new();
 	for row in matches {
@@ -2200,7 +2219,12 @@ pub(super) async fn load_streamed_inner_match_pages(
 	}
 	let mut pages = BTreeMap::new();
 	for page_index in page_sources.keys().copied() {
-		pages.insert(page_index, spilled.read_batch_page(page_index).await?);
+		pages.insert(
+			page_index,
+			spilled
+				.read_batch_page_profiled(page_index, grouped_chain_observer)
+				.await?,
+		);
 	}
 	Ok(pages)
 }
@@ -2228,6 +2252,7 @@ where
 		output_schema,
 		memory_cap,
 		None,
+		None,
 		&mut visit_batch,
 	)
 	.await
@@ -2243,6 +2268,7 @@ pub(super) async fn visit_streamed_spilled_inner_join_chunks_profiled<F>(
 	output_schema: &arrow::datatypes::SchemaRef,
 	memory_cap: u64,
 	profile: Option<&GlobalFoldJoinFilterProfile>,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2253,7 +2279,9 @@ where
 	let pin_timer = profile
 		.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
 		.transpose()?;
-	let pin = spilled.try_pin_decoded_pages(memory_cap).await;
+	let pin = spilled
+		.try_pin_decoded_pages_profiled(memory_cap, grouped_chain_observer)
+		.await;
 	if let Some(timer) = pin_timer {
 		timer.finish()?;
 	}
@@ -2265,6 +2293,9 @@ where
 			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
 			let selection_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ProbeLookupSelect))
+				.transpose()?;
+			let grouped_lookup_timer = grouped_chain_observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadLookup))
 				.transpose()?;
 			let selection = async {
 				let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
@@ -2287,11 +2318,15 @@ where
 			if let Some(timer) = selection_timer {
 				timer.finish()?;
 			}
+			if let Some(timer) = grouped_lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0, 0)?;
+			}
 			let matches = selection?;
 			let page_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
 				.transpose()?;
-			let page_map = load_streamed_inner_match_pages(spilled, &matches).await;
+			let page_map =
+				load_streamed_inner_match_pages(spilled, &matches, grouped_chain_observer).await;
 			if let Some(timer) = page_timer {
 				timer.finish()?;
 			}
@@ -2299,6 +2334,9 @@ where
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 				let materialize_timer = profile
 					.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ArrowMaterialize))
+					.transpose()?;
+				let grouped_materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
 					.transpose()?;
 				let materialized = materialize_streamed_spilled_inner_matches(
 					&page_map,
@@ -2309,6 +2347,13 @@ where
 				);
 				if let Some(timer) = materialize_timer {
 					timer.finish()?;
+				}
+				if let Some(timer) = grouped_materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
 				}
 				let batch = materialized?;
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
@@ -2435,6 +2480,7 @@ fn materialize_projected_streamed_spilled_inner_matches(
 fn run_loaded_partition_work(
 	work: LoadedPartitionWork,
 	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<LoadedPartitionResult, ExecutionError> {
 	let LoadedPartitionWork {
 		partition,
@@ -2455,6 +2501,9 @@ fn run_loaded_partition_work(
 	let index_timer = membership_profile
 		.map(|(profile, phase)| profile.begin_leaf(phase, MembershipChainOperation::IndexBuild))
 		.transpose()?;
+	let grouped_index_timer = grouped_chain_observer
+		.map(|observer| observer.begin(GroupedChainSubLeaf::ReadIndexRebuildCpu))
+		.transpose()?;
 	let loaded = LoadedSpilledInnerBuild::new(
 		build_pages,
 		key_plan,
@@ -2465,6 +2514,9 @@ fn run_loaded_partition_work(
 	)?;
 	if let Some(timer) = index_timer {
 		timer.finish_with(loaded.index.len() as u64, loaded.resident_bytes())?;
+	}
+	if let Some(timer) = grouped_index_timer {
+		timer.finish_with(loaded.index.len() as u64, loaded.resident_bytes(), 1)?;
 	}
 	visit_loaded_partition_work(
 		&loaded,
@@ -2480,6 +2532,7 @@ fn run_loaded_partition_work(
 		projection.as_ref(),
 		memory_cap,
 		membership_profile,
+		grouped_chain_observer,
 	)
 }
 
@@ -2498,6 +2551,7 @@ fn visit_loaded_partition_work(
 	projection: Option<&ProjectedInnerBuildProjection>,
 	memory_cap: u64,
 	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 ) -> Result<LoadedPartitionResult, ExecutionError> {
 	let mut output = Vec::new();
 	let (probe_rows, output_rows) = if let Some(projection) = projection {
@@ -2512,7 +2566,11 @@ fn visit_loaded_partition_work(
 			materialized_output_schema,
 			memory_cap,
 			membership_profile,
+			grouped_chain_observer,
 			|batch| {
+				let materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
+					.transpose()?;
 				let batch = if probe_columns_first {
 					reorder_spilled_inner_probe_before_build(
 						batch,
@@ -2522,6 +2580,13 @@ fn visit_loaded_partition_work(
 				} else {
 					batch
 				};
+				if let Some(timer) = materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
+				}
 				if batch.num_rows() > 0 {
 					output.push(batch);
 				}
@@ -2538,7 +2603,11 @@ fn visit_loaded_partition_work(
 			materialized_output_schema,
 			memory_cap,
 			membership_profile,
+			grouped_chain_observer,
 			|batch| {
+				let materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
+					.transpose()?;
 				let batch = if probe_columns_first {
 					reorder_spilled_inner_probe_before_build(
 						batch,
@@ -2548,6 +2617,13 @@ fn visit_loaded_partition_work(
 				} else {
 					batch
 				};
+				if let Some(timer) = materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
+				}
 				if batch.num_rows() > 0 {
 					output.push(batch);
 				}
@@ -2678,6 +2754,7 @@ fn visit_loaded_projected_streamed_spilled_inner_join_chunks<F>(
 	output_schema: &SchemaRef,
 	memory_cap: u64,
 	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2694,6 +2771,9 @@ where
 				.map(|(profile, phase)| {
 					profile.begin_leaf(phase, MembershipChainOperation::LookupSelection)
 				})
+				.transpose()?;
+			let grouped_lookup_timer = grouped_chain_observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadLookup))
 				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
@@ -2712,11 +2792,17 @@ where
 			if let Some(timer) = lookup_timer {
 				timer.finish_with(probe_chunk.num_rows() as u64, 0)?;
 			}
+			if let Some(timer) = grouped_lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0, 0)?;
+			}
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 				let materialize_timer = membership_profile
 					.map(|(profile, phase)| {
 						profile.begin_leaf(phase, MembershipChainOperation::ArrowMaterialize)
 					})
+					.transpose()?;
+				let grouped_materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
 					.transpose()?;
 				let batch = materialize_loaded_projected_streamed_spilled_inner_matches(
 					loaded,
@@ -2730,6 +2816,13 @@ where
 				if let Some(timer) = materialize_timer {
 					timer
 						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
+				if let Some(timer) = grouped_materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
 				}
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
@@ -2749,6 +2842,7 @@ fn visit_loaded_streamed_spilled_inner_join_chunks<F>(
 	output_schema: &SchemaRef,
 	memory_cap: u64,
 	membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+	grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	mut visit_batch: F,
 ) -> Result<(u64, u64), ExecutionError>
 where
@@ -2765,6 +2859,9 @@ where
 				.map(|(profile, phase)| {
 					profile.begin_leaf(phase, MembershipChainOperation::LookupSelection)
 				})
+				.transpose()?;
+			let grouped_lookup_timer = grouped_chain_observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadLookup))
 				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
@@ -2783,11 +2880,17 @@ where
 			if let Some(timer) = lookup_timer {
 				timer.finish_with(probe_chunk.num_rows() as u64, 0)?;
 			}
+			if let Some(timer) = grouped_lookup_timer {
+				timer.finish_with(probe_chunk.num_rows() as u64, 0, 0)?;
+			}
 			for chunk in matches.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 				let materialize_timer = membership_profile
 					.map(|(profile, phase)| {
 						profile.begin_leaf(phase, MembershipChainOperation::ArrowMaterialize)
 					})
+					.transpose()?;
+				let grouped_materialize_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
 					.transpose()?;
 				let batch = materialize_loaded_streamed_spilled_inner_matches(
 					loaded,
@@ -2799,6 +2902,13 @@ where
 				if let Some(timer) = materialize_timer {
 					timer
 						.finish_with(batch.num_rows() as u64, record_batch_memory_bytes(&batch))?;
+				}
+				if let Some(timer) = grouped_materialize_timer {
+					timer.finish_with(
+						batch.num_rows() as u64,
+						record_batch_memory_bytes(&batch),
+						1,
+					)?;
 				}
 				output_rows = output_rows.saturating_add(batch.num_rows() as u64);
 				visit_batch(batch)?;
@@ -4957,6 +5067,7 @@ impl Executor {
 					None,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -5289,6 +5400,7 @@ impl Executor {
 							filter_predicate,
 							false,
 							build_schema.fields().len(),
+							None,
 							None,
 							None,
 							visit_batch,
@@ -5741,6 +5853,7 @@ impl Executor {
 		combined_resident_baseline_bytes: Option<u64>,
 		mut residency_profile: Option<&mut GroupedReservoirResidencyProfile>,
 		membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
 		let partition_count =
 			u32::try_from(partitioned_builds.len()).map_err(|_| ExecutionError::Kernel {
@@ -5761,12 +5874,25 @@ impl Executor {
 				.await?
 				.into_batches();
 			loop {
+				let grouped_scan_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::WriteScanDecode))
+					.transpose()?;
 				let scan_timer = membership_profile
 					.map(|(profile, phase)| {
 						profile.begin_leaf(phase, MembershipChainOperation::StorageScanDecode)
 					})
 					.transpose()?;
 				let next_batch = stream.next().await;
+				if let Some(timer) = grouped_scan_timer {
+					timer.finish_with(
+						next_batch
+							.as_ref()
+							.and_then(|batch| batch.as_ref().ok())
+							.map_or(0, |batch| batch.num_rows() as u64),
+						0,
+						0,
+					)?;
+				}
 				if let Some(timer) = scan_timer {
 					timer.finish_with(
 						next_batch
@@ -5800,9 +5926,18 @@ impl Executor {
 						profile.begin_leaf(phase, MembershipChainOperation::PartitionSpillWrite)
 					})
 					.transpose()?;
-				for (_, partitioned) in
-					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
-				{
+				let exchange_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+					.transpose()?;
+				let exchange_batches = self.repartition_exchange_batch(
+					&batch,
+					exchange.partition_count,
+					exchange.key,
+				)?;
+				if let Some(timer) = exchange_timer {
+					timer.finish_with(batch.num_rows() as u64, 0, 0)?;
+				}
+				for (_, partitioned) in exchange_batches {
 					if let Some(profile) = residency_profile.as_deref_mut() {
 						profile.before_reservoir_batch(partitioned_builds, &partitioned)?;
 					}
@@ -5820,6 +5955,7 @@ impl Executor {
 						partition_end,
 						enforce_group_spill_budget,
 						combined_resident_baseline_bytes,
+						grouped_chain_observer,
 					)
 					.await?;
 					if let Some(profile) = residency_profile.as_deref_mut() {
@@ -5847,12 +5983,25 @@ impl Executor {
 				.await?
 				.into_batches();
 			loop {
+				let grouped_scan_timer = grouped_chain_observer
+					.map(|observer| observer.begin(GroupedChainSubLeaf::WriteScanDecode))
+					.transpose()?;
 				let scan_timer = membership_profile
 					.map(|(profile, phase)| {
 						profile.begin_leaf(phase, MembershipChainOperation::StorageScanDecode)
 					})
 					.transpose()?;
 				let next_batch = stream.next().await;
+				if let Some(timer) = grouped_scan_timer {
+					timer.finish_with(
+						next_batch
+							.as_ref()
+							.and_then(|batch| batch.as_ref().ok())
+							.map_or(0, |batch| batch.num_rows() as u64),
+						0,
+						0,
+					)?;
+				}
 				if let Some(timer) = scan_timer {
 					timer.finish_with(
 						next_batch
@@ -5900,6 +6049,7 @@ impl Executor {
 					partition_end,
 					enforce_group_spill_budget,
 					combined_resident_baseline_bytes,
+					grouped_chain_observer,
 				)
 				.await?;
 				if let Some(timer) = write_timer {
@@ -5930,7 +6080,11 @@ impl Executor {
 		partition_end: usize,
 		enforce_group_spill_budget: bool,
 		combined_resident_baseline_bytes: Option<u64>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
+		let routing_timer = grouped_chain_observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+			.transpose()?;
 		let buckets = precompute_join_partition_buckets(
 			batch,
 			partition_build_keys,
@@ -5938,13 +6092,17 @@ impl Executor {
 			null_safe_keys,
 			false,
 		)?;
-		for (partition, partitioned) in partition_streaming_join_batch_active_group_with_buckets(
+		let partitioned_batches = partition_streaming_join_batch_active_group_with_buckets(
 			batch,
 			&buckets,
 			partition_count,
 			partition_start,
 			partition_end,
-		)? {
+		)?;
+		if let Some(timer) = routing_timer {
+			timer.finish_with(batch.num_rows() as u64, 0, 0)?;
+		}
+		for (partition, partitioned) in partitioned_batches {
 			let Some(spilled) = partitioned_builds
 				.get_mut(partition)
 				.and_then(Option::as_mut)
@@ -5954,23 +6112,25 @@ impl Executor {
 			let before = spilled.spill_bytes();
 			if let Some(retained_columns) = retained_columns {
 				spilled
-					.write_projected_batch_chunks_unindexed(
+					.write_projected_batch_chunks_unindexed_profiled(
 						&partitioned,
 						retained_columns,
 						key_plan,
 						write_build_keys,
 						null_safe_keys,
 						self.context.task_budget,
+						grouped_chain_observer,
 					)
 					.await?;
 			} else {
 				spilled
-					.write_batch_chunks_unindexed(
+					.write_batch_chunks_unindexed_profiled(
 						&partitioned,
 						key_plan,
 						write_build_keys,
 						null_safe_keys,
 						self.context.task_budget,
+						grouped_chain_observer,
 					)
 					.await?;
 			}
@@ -6456,6 +6616,7 @@ impl Executor {
 							build_column_count,
 							None,
 							profile,
+							None,
 							&mut *visit_batch,
 						)
 						.await?;
@@ -6515,6 +6676,7 @@ impl Executor {
 						build_column_count,
 						None,
 						profile,
+						None,
 						&mut *visit_batch,
 					)
 					.await?;
@@ -6800,6 +6962,7 @@ impl Executor {
 					build_column_count,
 					None,
 					profile,
+					None,
 					visit_batch,
 				)
 				.await?;
@@ -6824,12 +6987,16 @@ impl Executor {
 		build_column_count: usize,
 		projection: Option<&ProjectedInnerBuildProjection>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
 		let mut visit_output = |batch: RecordBatch| -> Result<(), ExecutionError> {
+			let grouped_materialize_timer = grouped_chain_observer
+				.map(|observer| observer.begin(GroupedChainSubLeaf::ReadMaterialization))
+				.transpose()?;
 			let materialize_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::ArrowMaterialize))
 				.transpose()?;
@@ -6842,6 +7009,13 @@ impl Executor {
 				timer.finish()?;
 			}
 			let batch = reordered?;
+			if let Some(timer) = grouped_materialize_timer {
+				timer.finish_with(
+					batch.num_rows() as u64,
+					record_batch_memory_bytes(&batch),
+					1,
+				)?;
+			}
 			let predicate_input_rows = batch.num_rows();
 			let predicate_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::PredicateEvalFilter))
@@ -6867,7 +7041,10 @@ impl Executor {
 			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::SpillPageRead))
 			.transpose()?;
 		let pin = spilled
-			.try_pin_decoded_pages(self.context.task_budget.memory.get())
+			.try_pin_decoded_pages_profiled(
+				self.context.task_budget.memory.get(),
+				grouped_chain_observer,
+			)
 			.await;
 		if let Some(timer) = pin_timer {
 			timer.finish()?;
@@ -6884,6 +7061,7 @@ impl Executor {
 				&projection.retained_columns,
 				materialized_output_schema,
 				self.context.task_budget.memory.get(),
+				grouped_chain_observer,
 				&mut visit_output,
 			)
 			.await
@@ -6897,6 +7075,7 @@ impl Executor {
 				materialized_output_schema,
 				self.context.task_budget.memory.get(),
 				profile,
+				grouped_chain_observer,
 				&mut visit_output,
 			)
 			.await
@@ -11169,6 +11348,7 @@ impl Executor {
 						MembershipSpillRole::BaseBuild,
 					)
 				}),
+				None,
 			)
 			.await;
 		let (mut base_reservoir, base_build_rows) = match base_build_result {
@@ -11472,6 +11652,7 @@ impl Executor {
 						base_projection.as_ref(),
 						resident_baseline_bytes,
 						profile.map(|profile| (profile, MembershipChainPhase::BaseJoin)),
+						None,
 					)
 					.await;
 				let build_partition = base_reservoir.get_mut(partition).and_then(Option::take);
@@ -11695,6 +11876,7 @@ impl Executor {
 						None,
 						None,
 						profile.map(|profile| (profile, MembershipChainPhase::TerminalBuild)),
+						None,
 					)
 					.await?;
 					terminal_spill_bytes = terminal_spill_bytes.saturating_add(group_spill_bytes);
@@ -11771,6 +11953,7 @@ impl Executor {
 								resident_baseline_bytes,
 								profile
 									.map(|profile| (profile, MembershipChainPhase::TerminalJoin)),
+								None,
 							)
 							.await;
 						let terminal_partition = terminal_partitions
@@ -12152,6 +12335,7 @@ impl Executor {
 		if let Some(profile) = grouped_chain_profile {
 			profile.record_reservoir_dispatch(runtime.replay_id, partition_count, group_count)?;
 		}
+		let grouped_chain_observer = grouped_chain_profile.map(GroupedChainProfile::spill_observer);
 
 		let reservoir_write_timer = grouped_chain_profile
 			.map(|profile| {
@@ -12172,6 +12356,7 @@ impl Executor {
 				false,
 				residency_profile.as_deref_mut(),
 				None,
+				grouped_chain_observer.as_ref(),
 			)
 			.await;
 		let (mut reservoir, build_rows) = match build_result {
@@ -12249,6 +12434,7 @@ impl Executor {
 					projection.as_ref(),
 					0,
 					None,
+					grouped_chain_observer.as_ref(),
 				)
 				.await?;
 			if let Some(profile) = residency_profile.as_deref_mut() {
@@ -12871,6 +13057,7 @@ impl Executor {
 				true,
 				None,
 				None,
+				None,
 			)
 			.await?;
 		let Some((build, build_rows)) = build_result else {
@@ -12949,6 +13136,7 @@ impl Executor {
 			probe_partition_count,
 			false,
 			Some(runtime_baseline_bytes.saturating_add(build_resident_bytes)),
+			None,
 		)
 		.await?;
 		Ok(())
@@ -13082,6 +13270,7 @@ impl Executor {
 							spec.probe_columns_first,
 							spec.build_column_count,
 							spec.projection.as_ref(),
+							None,
 							None,
 							&mut |batch| {
 								batches.push(batch);
@@ -14970,6 +15159,7 @@ impl Executor {
 							*build_column_count,
 							projection.as_ref(),
 							None,
+							None,
 							&mut |batch| {
 								output.push(batch);
 								Ok(())
@@ -15132,6 +15322,7 @@ impl Executor {
 					None,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -15241,6 +15432,7 @@ impl Executor {
 			MembershipChainPhase,
 			MembershipSpillRole,
 		)>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<Option<(Vec<Option<SpilledInnerJoinBuild>>, u64)>, ExecutionError> {
 		let partition_count_usize =
 			usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
@@ -15249,6 +15441,9 @@ impl Executor {
 		if let Some(profile) = residency_profile.as_deref_mut() {
 			profile.writer_set_intent(writer_set_collection_bytes(partition_count)?)?;
 		}
+		let writer_setup_timer = grouped_chain_observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::WriterSetup))
+			.transpose()?;
 		let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
 			(0..partition_count_usize).map(|_| None).collect();
 		for partition in 0..partition_count_usize {
@@ -15274,6 +15469,9 @@ impl Executor {
 		if let Some(profile) = residency_profile.as_deref_mut() {
 			profile.writer_set_ready(&partitioned_builds)?;
 		}
+		if let Some(timer) = writer_setup_timer {
+			timer.finish_with(0, 0, partition_count as u64)?;
+		}
 
 		let build_started = Instant::now();
 		let mut total_spill_bytes = 0u64;
@@ -15294,6 +15492,7 @@ impl Executor {
 				committed_owner_path.then_some(resident_baseline_bytes),
 				residency_profile.as_deref_mut(),
 				membership_profile.map(|(profile, phase, _)| (profile, phase)),
+				grouped_chain_observer,
 			)
 			.await;
 		if let Err(error) = build_result {
@@ -15314,6 +15513,9 @@ impl Executor {
 			)?;
 		}
 
+		let finish_timer = grouped_chain_observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::WriteFinishFsync))
+			.transpose()?;
 		let mut total_build_rows = 0u64;
 		for partition in 0..partition_count_usize {
 			let Some(spilled) = partitioned_builds
@@ -15345,6 +15547,9 @@ impl Executor {
 				&partitioned_builds,
 				"reservoir_finish_complete",
 			)?;
+		}
+		if let Some(timer) = finish_timer {
+			timer.finish_with(total_build_rows, total_spill_bytes, partition_count as u64)?;
 		}
 
 		record_task_telemetry(&self.context.task_telemetry, |task| {
@@ -15412,6 +15617,7 @@ impl Executor {
 				projection,
 				self.context.task_budget.memory.get(),
 				None,
+				None,
 			)?;
 			total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
 			total_output_rows = total_output_rows.saturating_add(result.output_rows);
@@ -15438,10 +15644,14 @@ impl Executor {
 		projection: Option<&ProjectedInnerBuildProjection>,
 		resident_baseline_bytes: u64,
 		membership_profile: Option<(&MembershipChainProfile, MembershipChainPhase)>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
 		let mut output = Vec::new();
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
+		let partition_timer = grouped_chain_observer
+			.map(|observer| observer.begin(GroupedChainSubLeaf::ReadProbePartitioning))
+			.transpose()?;
 		let probe_partition_buckets = precompute_join_partition_buckets(
 			probe_batch,
 			probe_keys,
@@ -15454,6 +15664,9 @@ impl Executor {
 			&probe_partition_buckets,
 			partition_count,
 		)?;
+		if let Some(timer) = partition_timer {
+			timer.finish_with(probe_batch.num_rows() as u64, 0, 0)?;
+		}
 		if partitioned_probe_batches.is_empty() {
 			return Ok((output, 0, 0));
 		}
@@ -15478,12 +15691,17 @@ impl Executor {
 					estimate_parallel_partition_resident(spilled, partitioned_probe, key_plan);
 				let loaded_cap = join_spill_retained_footprint_memory_cap(memory_cap);
 				if resident_baseline_bytes.saturating_add(loaded_resident) <= loaded_cap {
+					if let Some(observer) = grouped_chain_observer {
+						observer.record_branch(true)?;
+					}
 					let read_timer = membership_profile
 						.map(|(profile, phase)| {
 							profile.begin_leaf(phase, MembershipChainOperation::SpillReadDecode)
 						})
 						.transpose()?;
-					let build_pages = spilled.read_all_batch_pages().await?;
+					let build_pages = spilled
+						.read_all_batch_pages_profiled(grouped_chain_observer)
+						.await?;
 					if let Some(timer) = read_timer {
 						timer.finish_with(
 							build_pages
@@ -15509,22 +15727,30 @@ impl Executor {
 						memory_cap,
 						resident_baseline_bytes,
 					};
-					let result = run_loaded_partition_work(work, membership_profile)?;
+					let result = run_loaded_partition_work(
+						work,
+						membership_profile,
+						grouped_chain_observer,
+					)?;
 					total_probe_rows = total_probe_rows.saturating_add(result.probe_rows);
 					total_output_rows = total_output_rows.saturating_add(result.output_rows);
 					output.extend(result.output);
 				} else {
+					if let Some(observer) = grouped_chain_observer {
+						observer.record_branch(false)?;
+					}
 					let index_timer = membership_profile
 						.map(|(profile, phase)| {
 							profile.begin_leaf(phase, MembershipChainOperation::IndexBuild)
 						})
 						.transpose()?;
 					if let Err(error) = spilled
-						.rebuild_index_from_pages(
+						.rebuild_index_from_pages_profiled(
 							key_plan,
 							write_build_keys,
 							null_safe_keys,
 							self.context.task_budget,
+							grouped_chain_observer,
 						)
 						.await
 					{
@@ -15553,6 +15779,7 @@ impl Executor {
 							build_column_count,
 							projection,
 							None,
+							grouped_chain_observer,
 							&mut |batch| {
 								partition_output.push(batch);
 								Ok(())
@@ -15666,6 +15893,7 @@ impl Executor {
 					None,
 					None,
 					None,
+					None,
 				)
 				.await;
 			if let Err(error) = build_result {
@@ -15754,7 +15982,7 @@ impl Executor {
 					};
 					handles.push(tokio::task::spawn_blocking(move || {
 						let _permit = permit;
-						run_loaded_partition_work(work, None)
+						run_loaded_partition_work(work, None, None)
 					}));
 				}
 				let mut slots: Vec<Option<LoadedPartitionResult>> =
@@ -15869,7 +16097,7 @@ impl Executor {
 							memory_cap,
 							resident_baseline_bytes: 0,
 						};
-						let result = match run_loaded_partition_work(work, None) {
+						let result = match run_loaded_partition_work(work, None, None) {
 							Ok(result) => result,
 							Err(error) => {
 								Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds)
@@ -15910,6 +16138,7 @@ impl Executor {
 								probe_columns_first,
 								build_column_count,
 								projection,
+								None,
 								None,
 								&mut |batch| {
 									partition_output.push(batch);
@@ -17440,6 +17669,7 @@ mod tests {
 				false,
 				None,
 				None,
+				None,
 			)
 			.await
 			.expect("reservoir build")
@@ -17475,6 +17705,7 @@ mod tests {
 				None,
 				0,
 				None,
+				None,
 			)
 			.await;
 		Executor::cleanup_partitioned_streamed_inner_builds(reservoir).await;
@@ -17508,6 +17739,7 @@ mod tests {
 				false,
 				Some(&mut residency_profile),
 				None,
+				None,
 			)
 			.await
 			.expect("enabled reservoir build")
@@ -17528,6 +17760,7 @@ mod tests {
 				build_schema.fields().len(),
 				None,
 				0,
+				None,
 				None,
 			)
 			.await
@@ -17662,6 +17895,7 @@ mod tests {
 				None,
 				join_spill_retained_footprint_memory_cap(budget.memory.get()),
 				true,
+				None,
 				None,
 				None,
 			)

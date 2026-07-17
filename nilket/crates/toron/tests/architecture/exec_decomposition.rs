@@ -247,6 +247,90 @@ pub(crate) fn adr443_grouped_chain_profile_covers_the_top_owner_and_preserves_re
 }
 
 #[test]
+pub(crate) fn adr444_grouped_chain_refinement_is_nested_scoped_and_harness_evaluated() {
+	let manifest = manifest_dir();
+	let join =
+		std::fs::read_to_string(manifest.join("src/exec/join.rs")).expect("read exec join source");
+	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
+		.expect("read exec streaming source");
+	let spill = std::fs::read_to_string(manifest.join("src/exec/join/spill.rs"))
+		.expect("read exec spill source");
+	let profile = std::fs::read_to_string(manifest.join("src/exec/join/grouped_chain_profile.rs"))
+		.expect("read grouped-chain profile source");
+	let residency = std::fs::read_to_string(manifest.join("src/exec/join/residency_profile.rs"))
+		.expect("read ADR 429 residency source");
+	let evaluator = std::fs::read_to_string(
+		manifest
+			.parent()
+			.expect("workspace crates directory")
+			.join("toron-tpch/src/adr444_profile_eval.rs"),
+	)
+	.expect("read harness evaluator");
+
+	assert!(join.contains("GroupedChainSpillObserver"));
+	assert!(join.contains("GroupedChainSubLeaf"));
+	assert!(profile.contains("const PROFILE_SCHEMA_VERSION: u32 = 2;"));
+	assert!(profile.contains("active_sub_leaf: Option<GroupedChainSubLeaf>"));
+	assert!(profile.contains("sub-leaf micros"));
+	assert!(profile.contains("ParentRefinementSnapshot"));
+	assert!(profile.contains("gap_within_ceiling: gap_ratio <= 0.10"));
+	assert!(profile.contains("page_inventory: BTreeMap<(u64, u64), u64>"));
+	assert!(profile.contains("ciphertext page inventory mismatch"));
+	assert!(profile.contains("physical write byte mismatch"));
+	assert!(profile.contains("read_amplification"));
+	assert!(streaming.contains("let grouped_chain_observer = grouped_chain_profile.map"));
+	assert!(streaming.contains("grouped_chain_observer.as_ref()"));
+	let spilled_builds =
+		brace_blocks_after_marker(&spill, "pub(in crate::exec) struct SpilledInnerJoinBuild");
+	let [(_, spilled_build)] = spilled_builds.as_slice() else {
+		panic!("expected exactly one spilled inner-join build owner");
+	};
+	assert!(
+		!spilled_build.contains("GroupedChainSpillObserver")
+			&& !spilled_build.contains("GroupedChainProfile"),
+		"ADR 444 observer must not become ordinary spilled-build state"
+	);
+	assert!(spill.contains("write_batch_chunks_unindexed_profiled"));
+	assert!(spill.contains("read_batch_page_profiled"));
+	assert!(spill.contains("rebuild_index_from_pages_profiled"));
+	assert!(spill.contains("try_pin_decoded_pages_profiled"));
+	for leaf in [
+		"WriterSetup",
+		"WriteScanDecode",
+		"WritePartitionRouting",
+		"WriteIpcEncode",
+		"WriteEncryption",
+		"WritePhysicalWrite",
+		"WriteFinishFsync",
+		"ReadProbePartitioning",
+		"ReadPhysicalRead",
+		"ReadDecrypt",
+		"ReadIpcDecode",
+		"ReadCacheLru",
+		"ReadIndexRebuildCpu",
+		"ReadLookup",
+		"ReadMaterialization",
+	] {
+		assert!(
+			profile.contains(&format!("GroupedChainSubLeaf::{leaf}"))
+				|| spill.contains(&format!("GroupedChainSubLeaf::{leaf}"))
+				|| streaming.contains(&format!("GroupedChainSubLeaf::{leaf}")),
+			"missing ADR 444 sub-leaf {leaf}"
+		);
+	}
+	assert!(evaluator.contains("pub fn evaluate_adr444_cohort"));
+	assert!(evaluator.contains("pub fn evaluate_adr444_variance"));
+	assert!(evaluator.contains("if median == 0.0"));
+	assert!(evaluator.contains("unique_largest_index"));
+	assert!(evaluator.contains("Adr444Gate::G4"));
+	assert!(evaluator.contains("positive_total"));
+	assert!(residency.contains("TORON_GROUPED_RESERVOIR_RESIDENCY_PROFILE_PATH"));
+	assert!(residency.contains("const GROUPED_RESERVOIR_PROFILE_SCHEMA_VERSION: u32 = 1;"));
+	assert!(!profile.contains("q05") && !profile.contains("TPC-H"));
+	assert!(!spill.contains("TORON_Q05") && !streaming.contains("TORON_Q05"));
+}
+
+#[test]
 pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_rebuild() {
 	let manifest = manifest_dir();
 	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))

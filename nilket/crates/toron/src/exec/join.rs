@@ -24,7 +24,8 @@ pub(in crate::exec) use self::global_fold_profile::{
 	GlobalFoldJoinFilterProfile, GlobalFoldProfileLeaf,
 };
 pub(in crate::exec) use self::grouped_chain_profile::{
-	GroupedChainProfile, GroupedChainProfileLeaf,
+	GroupedChainPinOutcome, GroupedChainProfile, GroupedChainProfileLeaf,
+	GroupedChainSpillObserver, GroupedChainSubLeaf,
 };
 pub(in crate::exec) use self::membership_chain_profile::{
 	MembershipChainOperation, MembershipChainPhase, MembershipChainProfile, MembershipSpillRole,
