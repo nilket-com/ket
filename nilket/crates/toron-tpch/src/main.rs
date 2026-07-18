@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -425,7 +426,30 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	} else {
 		None
 	};
-	let mut raw_rows = Vec::new();
+	let paired_journal = if flag_present(args, "--paired-ablation") {
+		if runs % 2 != 0 {
+			return harness_error("--paired-ablation requires an even --runs count");
+		}
+		match prepare_paired_ablation_journal(
+			&output_dir,
+			query,
+			mode,
+			sf,
+			data_source,
+			&data_dir,
+			runs,
+			warmup,
+		) {
+			Ok(journal) => Some(journal),
+			Err(message) => return harness_error(&message),
+		}
+	} else {
+		None
+	};
+	let mut raw_rows = paired_journal
+		.as_ref()
+		.map(|journal| journal.rows.clone())
+		.unwrap_or_default();
 	for query_id in queries {
 		for engine in &engines {
 			match engine {
@@ -436,6 +460,11 @@ async fn perf_command(args: &[String]) -> ExitCode {
 						}
 					}
 					for warmup_index in 0..warmup {
+						if paired_journal.as_ref().is_some_and(|journal| {
+							journal.contains(query_id, engine.as_str(), warmup_index as u32, true)
+						}) {
+							continue;
+						}
 						match run_perf_child_with_ablation(
 							PerfEngine::Toron,
 							query_id,
@@ -451,11 +480,23 @@ async fn perf_command(args: &[String]) -> ExitCode {
 								None
 							},
 						) {
-							Ok(row) => raw_rows.push(row),
+							Ok(row) => {
+								if let Some(journal) = &paired_journal {
+									if let Err(message) = journal.append(&row) {
+										return harness_error(&message);
+									}
+								}
+								raw_rows.push(row);
+							}
 							Err(message) => return harness_error(&message),
 						}
 					}
 					for run_index in 0..runs {
+						if paired_journal.as_ref().is_some_and(|journal| {
+							journal.contains(query_id, engine.as_str(), run_index as u32, false)
+						}) {
+							continue;
+						}
 						match run_perf_child_with_ablation(
 							PerfEngine::Toron,
 							query_id,
@@ -471,7 +512,14 @@ async fn perf_command(args: &[String]) -> ExitCode {
 								None
 							},
 						) {
-							Ok(row) => raw_rows.push(row),
+							Ok(row) => {
+								if let Some(journal) = &paired_journal {
+									if let Err(message) = journal.append(&row) {
+										return harness_error(&message);
+									}
+								}
+								raw_rows.push(row);
+							}
 							Err(message) => return harness_error(&message),
 						}
 					}
@@ -1395,6 +1443,23 @@ fn attach_paired_ablation_receipt(
 			.ok_or("paired summary lacks execute_ms_samples")?;
 		let diffs = paired_ablation_differences(samples)?;
 		let shift = paired_median_shift(&diffs)?;
+		let mut off_values = samples
+			.iter()
+			.filter(|sample| {
+				sample
+					.get("ablation_arm")
+					.and_then(serde_json::Value::as_str)
+					== Some("off")
+			})
+			.filter_map(|sample| sample.get("execute_ms").and_then(serde_json::Value::as_f64))
+			.collect::<Vec<_>>();
+		if off_values.is_empty() {
+			return Err("paired summary lacks off-arm samples for the baseline median".to_string());
+		}
+		// The materiality baseline is the OFF/control arm's median, not the pooled
+		// cohort median: the pool mixes both arms and shrinks the floor by the very
+		// effect under test.
+		let baseline_off_median = median(&mut off_values);
 		summary["gate_zero"] = gate_zero.clone();
 		summary["paired_ablation"] = serde_json::json!({
 			"differences_off_minus_on_ms": diffs,
@@ -1402,7 +1467,9 @@ fn attach_paired_ablation_receipt(
 			"lower_ms": shift.lower,
 			"upper_ms": shift.upper,
 			"pairs": shift.pairs,
-			"material": material_effect(shift.point, summary["execute_ms_median"].as_f64().unwrap_or(0.0)),
+			"baseline_off_median_ms": baseline_off_median,
+			"materiality_floor_ms": MATERIALITY_FLOOR * baseline_off_median.abs(),
+			"material": material_effect(shift.point, baseline_off_median),
 		});
 	}
 	Ok(summaries)
@@ -3350,6 +3417,129 @@ fn write_perf_outputs(
 	Ok(())
 }
 
+const ADR449_PAIRED_JOURNAL: &str = "adr449_paired_samples.jsonl";
+const ADR449_PAIRED_MANIFEST: &str = "adr449_paired_run.json";
+
+#[derive(Debug, Clone)]
+struct PairedAblationJournal {
+	path: PathBuf,
+	rows: Vec<serde_json::Value>,
+}
+
+impl PairedAblationJournal {
+	fn contains(&self, query: &str, engine: &str, run_index: u32, warmup: bool) -> bool {
+		self.rows.iter().any(|row| {
+			row.get("query").and_then(serde_json::Value::as_str) == Some(query)
+				&& row.get("engine").and_then(serde_json::Value::as_str) == Some(engine)
+				&& row.get("run_index").and_then(serde_json::Value::as_u64)
+					== Some(u64::from(run_index))
+				&& row.get("warmup").and_then(serde_json::Value::as_bool) == Some(warmup)
+		})
+	}
+
+	fn append(&self, row: &serde_json::Value) -> Result<(), String> {
+		let mut file = OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(&self.path)
+			.map_err(|error| {
+				format!(
+					"open paired-ablation journal {}: {error}",
+					self.path.display()
+				)
+			})?;
+		serde_json::to_writer(&mut file, row)
+			.map_err(|error| format!("encode paired-ablation sample: {error}"))?;
+		file.write_all(b"\n")
+			.map_err(|error| format!("append paired-ablation sample: {error}"))?;
+		file.sync_data()
+			.map_err(|error| format!("sync paired-ablation sample: {error}"))
+	}
+}
+
+fn prepare_paired_ablation_journal(
+	output_dir: &Path,
+	query: &str,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	runs: usize,
+	warmup: usize,
+) -> Result<PairedAblationJournal, String> {
+	std::fs::create_dir_all(output_dir)
+		.map_err(|error| format!("create paired-ablation output directory: {error}"))?;
+	let journal_path = output_dir.join(ADR449_PAIRED_JOURNAL);
+	let manifest_path = output_dir.join(ADR449_PAIRED_MANIFEST);
+	let expected = serde_json::json!({
+		"suite": "adr449_paired_ablation",
+		"query": query,
+		"mode": mode,
+		"scale_factor": sf,
+		"data_source": data_source,
+		"data_dir": data_dir.display().to_string(),
+		"runs": runs,
+		"warmup": warmup,
+	});
+	if manifest_path.exists() {
+		let bytes = std::fs::read(&manifest_path)
+			.map_err(|error| format!("read paired-ablation manifest: {error}"))?;
+		let observed: serde_json::Value = serde_json::from_slice(&bytes)
+			.map_err(|error| format!("parse paired-ablation manifest: {error}"))?;
+		if observed != expected {
+			return Err(format!(
+				"paired-ablation manifest mismatch at {}; use a fresh output directory rather than mixing cohorts",
+				manifest_path.display()
+			));
+		}
+	} else {
+		if journal_path.exists() {
+			return Err(format!(
+				"paired-ablation journal {} exists without its manifest; refuse to resume ambiguous samples",
+				journal_path.display()
+			));
+		}
+		write_json_atomically(&manifest_path, &expected)?;
+	}
+	let rows = if journal_path.exists() {
+		let body = std::fs::read_to_string(&journal_path)
+			.map_err(|error| format!("read paired-ablation journal: {error}"))?;
+		body.lines()
+			.enumerate()
+			.map(|(line_number, line)| {
+				serde_json::from_str(line).map_err(|error| {
+					format!(
+						"parse paired-ablation journal {} line {}: {error}",
+						journal_path.display(),
+						line_number + 1
+					)
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?
+	} else {
+		Vec::new()
+	};
+	Ok(PairedAblationJournal {
+		path: journal_path,
+		rows,
+	})
+}
+
+fn write_json_atomically(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+	let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+	let body = serde_json::to_string_pretty(value)
+		.map_err(|error| format!("encode {}: {error}", path.display()))?;
+	std::fs::write(&temporary, format!("{body}\n"))
+		.map_err(|error| format!("write {}: {error}", temporary.display()))?;
+	std::fs::rename(&temporary, path).map_err(|error| {
+		format!(
+			"rename {} to {}: {error}",
+			temporary.display(),
+			path.display()
+		)
+	})
+}
+
 fn perf_baseline_is_recordable(summary_rows: &[serde_json::Value]) -> bool {
 	!summary_rows.is_empty()
 		&& summary_rows.iter().all(|row| {
@@ -3522,6 +3712,74 @@ mod tests {
 			serde_json::json!({"run_index": 1, "ablation_arm": "off", "execute_ms": 14.0}),
 		];
 		assert!(paired_ablation_differences(&wrong_arm).is_err());
+	}
+
+	#[test]
+	fn adr449_paired_journal_is_durable_and_resume_config_locked() {
+		let directory =
+			std::env::temp_dir().join(format!("toron-adr449-journal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		let data_dir = Path::new("/tmp/adr449-data");
+		let journal = prepare_paired_ablation_journal(
+			&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1,
+		)
+		.unwrap();
+		journal
+			.append(&serde_json::json!({
+				"engine": "toron",
+				"query": "q05",
+				"run_index": 0,
+				"warmup": false,
+				"ablation_arm": "on",
+				"execute_ms": 100.0,
+			}))
+			.unwrap();
+		let resumed = prepare_paired_ablation_journal(
+			&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1,
+		)
+		.unwrap();
+		assert_eq!(resumed.rows.len(), 1);
+		assert!(resumed.contains("q05", "toron", 0, false));
+		assert!(
+			prepare_paired_ablation_journal(
+				&directory, "q05", "strict", 2.0, "parquet", data_dir, 20, 1,
+			)
+			.is_err()
+		);
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn adr451_materiality_baseline_is_off_arm_median_not_pooled() {
+		// HL shift 108 sits between 10% of the pooled median (105.4) and 10% of
+		// the OFF median (110.8): material under a pooled baseline, immaterial
+		// under the OFF/control baseline. Fails if the pooled rule returns.
+		let samples = (0..12u64)
+			.map(|index| {
+				let on = index % 2 == 0;
+				serde_json::json!({
+					"run_index": index,
+					"ablation_arm": if on { "on" } else { "off" },
+					"execute_ms": if on { 1000.0 } else { 1108.0 },
+				})
+			})
+			.collect::<Vec<_>>();
+		let summary = serde_json::json!({
+			"execute_ms_samples": samples,
+			"execute_ms_median": 1054.0,
+		});
+		let receipts =
+			attach_paired_ablation_receipt(vec![summary], 12, serde_json::json!({"passed": true}))
+				.unwrap();
+		let paired = &receipts[0]["paired_ablation"];
+		assert_eq!(paired["point_ms"].as_f64().unwrap(), 108.0);
+		assert_eq!(paired["baseline_off_median_ms"].as_f64().unwrap(), 1108.0);
+		assert!((paired["materiality_floor_ms"].as_f64().unwrap() - 110.8).abs() < 1e-9);
+		assert_eq!(paired["material"].as_bool().unwrap(), false);
+		assert!(
+			material_effect(108.0, 1054.0),
+			"fixture must discriminate: the pooled rule would call this material"
+		);
 	}
 
 	#[test]
