@@ -6,6 +6,13 @@ resolver = "3"
 authors = ["Joel Bondurant"]
 description = "A strong coupling of data and visualization."
 
+[package.metadata.deb]
+maintainer = "Joel Bondurant"
+copyright = "2026, Joel Bondurant"
+license-file = ["../baryon/LICENSE", "0"]
+assets = [
+	["target/release/polariton", "/usr/bin/polariton", "755"],
+]
 
 [dependencies]
 argon2 = "0.5.3"

@@ -2,6 +2,14 @@
 
 A strong coupling of data and visualization.
 
+#### Installing:
+
+If `cargo deb --install` is configured in your environment, Polariton can be installed directly:
+
+```bash
+cargo deb -p polariton --install
+```
+
 #### Features:
  - Query 10M rows into local memory in milliseconds.
  - Memory model is polars::frame::DataFrame for blazing fast analytics.
