@@ -2,7 +2,7 @@ use crate::adapters::{
 	common::{AdapterFieldType, AdapterStage},
 	driver::{fields_for, AdapterSelection, AdapterState},
 };
-use crate::editor::CodeEditor;
+use crate::baryon_editor::BaryonEditor;
 use crate::gui::dashboard::{self, DashboardState};
 use crate::gui::messages::Message;
 use crate::gui::pane_grid::{PaneGrid, PaneId, State as PaneState};
@@ -166,7 +166,7 @@ pub fn main_screen<'a>(
 	pane_content: &'a HashMap<PaneId, PaneType>,
 	dashboard: &'a DashboardState,
 	menu_state: &'a MenuState,
-	code_editor: &'a CodeEditor,
+	code_editor: &'a BaryonEditor,
 	data_frame: &'a DataFrame,
 	status_msg: &'a str,
 	status_error: &'a str,

@@ -62,10 +62,15 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    `Viewport::document_text` reply — this is how polariton's `content()` reads
    the SQL back out. Engine-level tests cover the SQL replace → edit → query
    round-trip and the file-association reset.
-2. **Minimal iced bridge in polariton** (behind a flag or side-by-side pane):
-   engine spawn/shutdown, subscription over the viewport receiver, fixed-font
-   monospace text rendering of `PaneViewport` tokens, resize, keyboard input,
-   and the run/save/load string round-trip.
+2. **Minimal iced bridge in polariton.** ✅ Foundation done (2026-07-18):
+   `polariton/src/baryon_editor.rs` owns one long-lived engine, drains the
+   viewport receiver on a non-blocking 16 ms iced tick (coalescing projections),
+   translates keyboard input, renders focused-pane tokens in a fixed-width Iced
+   scrollable, and maps window pixels to the engine cell grid. Polariton's
+   run/save/load paths now use the bridge's replace/query text round-trip. The
+   bridge-level SQL round-trip test passes. Mouse input, pane-accurate resize,
+   syntax spans, cursor/selection painting, and all remaining visual parity are
+   intentionally deferred to the visual layers below.
 3. **Visual layers, incrementally:** syntax colors + gutter → selection + cursor
    → scrolling + wrap → minimap, folds, diagnostics.
 4. **Parity gate, then removal.** Parity tests for SQL editing and the

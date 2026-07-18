@@ -1,5 +1,5 @@
 use super::menu;
-use crate::editor::EditorMsg;
+use crate::baryon_editor::EditorMsg;
 use crate::adapters::{
 	common::{DatabaseAdapter, ExecutionResult},
 	driver::AdapterSelection,
@@ -40,6 +40,8 @@ pub enum Message {
 	CloseSettings,
 	CloseWindow,
 	CodeEditEvent(EditorMsg),
+	CodeEditPoll,
+	CodeEditResize(iced::Size),
 	Connect,
 	ConnectionNameChanged(String),
 	ConnectionSaved(Vec<SavedConnection>),

@@ -1,5 +1,5 @@
-use crate::editor::highlight::SyntaxLanguage;
-use crate::editor::{CodeEditor, DEJAVU_SANS_MONO};
+use crate::baryon_editor::BaryonEditor;
+use crate::editor::DEJAVU_SANS_MONO;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::{AdapterConfiguration, AdapterSelection, AdapterState},
@@ -25,7 +25,7 @@ struct AppState {
 	pane_content: HashMap<PaneId, PaneType>,
 	dashboard: DashboardState,
 	menu_state: MenuState,
-	code_editor: CodeEditor,
+	code_editor: BaryonEditor,
 	data_frame: DataFrame,
 	status_msg: String,
 	status_error: String,
@@ -90,6 +90,8 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		events,
 		resize_tick,
 		state.code_editor.subscription().map(Message::CodeEditEvent),
+		time::every(Duration::from_millis(16)).map(|_| Message::CodeEditPoll),
+		window::resize_events().map(|(_, size)| Message::CodeEditResize(size)),
 	])
 }
 
@@ -156,7 +158,7 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 	let (_, dashboard_pane) = panes.split(Axis::Vertical, editor_pane).unwrap();
 	pane_content.insert(dashboard_pane, PaneType::Dashboard);
 
-	let code_editor = CodeEditor::new("", SyntaxLanguage::Sql);
+	let code_editor = BaryonEditor::new("");
 	let is_password_protected = startup_data.is_password_protected;
 	let salt = startup_data.salt.clone();
 	let state = AppState {
@@ -265,10 +267,13 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return window::latest().and_then(window::drag);
 		}
 		Message::CodeEditEvent(edit_event) => {
-			return app_state
-				.code_editor
-				.update(edit_event)
-				.map(Message::CodeEditEvent);
+			app_state.code_editor.update(edit_event);
+		}
+		Message::CodeEditPoll => {
+			app_state.code_editor.poll();
+		}
+		Message::CodeEditResize(size) => {
+			app_state.code_editor.resize(size.width, size.height);
 		}
 		Message::MaximizeWindow => {
 			app_state.is_maximized = !app_state.is_maximized;
@@ -343,7 +348,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::Run => match &mut app_state.adapter_state.connection {
 			None => {}
 			Some(db) => {
-				let code = app_state.code_editor.content();
+				let code = app_state.code_editor.cached_content().to_owned();
 				let db = db.clone();
 				app_state.status_msg = "Code running...".into();
 				app_state.status_error = "".to_string();
@@ -610,7 +615,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if name.is_empty() {
 				return Task::none();
 			}
-			let code = app_state.code_editor.content();
+			let code = app_state.code_editor.cached_content().to_owned();
 			let Some(db) = app_state.private_db.clone() else {
 				app_state.status_error = "Database not unlocked.".to_string();
 				return Task::none();
@@ -637,8 +642,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::LoadSavedStatement(id) => {
 			if let Some(stmt) = app_state.saved_statements.iter().find(|s| s.id == id) {
-				let new_editor = CodeEditor::new(&stmt.code, SyntaxLanguage::Sql);
-				app_state.code_editor = new_editor;
+				app_state.code_editor.replace_content(&stmt.code);
 				app_state.status_msg = format!("Statement '{}' loaded.", stmt.name);
 			}
 		}

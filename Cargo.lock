@@ -5978,6 +5978,7 @@ dependencies = [
  "gcloud-googleapis",
  "iced",
  "kurbo 0.13.1",
+ "libaryon",
  "mysql_async",
  "png",
  "polars",
