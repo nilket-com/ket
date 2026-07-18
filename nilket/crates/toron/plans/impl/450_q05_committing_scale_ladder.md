@@ -17,6 +17,7 @@ change; reuses 448's profiling and 449's gate-zero machinery.
 | profile filename | `grouped_chain_profile.rs:1191` | `grouped_chain_{profile_id:04}.json` |
 | scale acceptance | `lib.rs:453,10562` | q05 unconstrained; any finite positive sf |
 | dataset prep | `lib.rs:2442` | `prepare_persisted_tpch_dataset(scale_factor, …)` |
+| runtime-filter projection repair | `lib.rs:1724-1725,1799-1804,1908-1939` | full-reader batches must bypass reduced-column inflation |
 | 449 gate-zero fixture scale | (449 impl) | the literal this cut replaces with the selected rung |
 
 ## Grounding steps before the diff
@@ -69,7 +70,12 @@ prior qualitative divergence does not set `trusted`.
 constant or a small emitted record) that 449's gate-zero fixture reads. Replace the 449
 literal.
 
-**Nothing else.** No engine change, no paired cohort, no filter-effect measurement.
+**Harness completion.** The runtime-filter persisted scan uses the same source-column union as the
+control arm, including filter keys, and both arms inflate that reduced batch to the source schema
+before filtering/output projection. This keeps source ordinals addressable without reading all
+columns in one arm. The repair travels with the ladder because the earlier full-reader/reduced-
+inflater mismatch blocked the first committing-region rung. No engine change, no paired cohort, no
+filter-effect measurement.
 
 ## Tests
 

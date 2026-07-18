@@ -85,6 +85,7 @@ async fn main() -> ExitCode {
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
 		"adr449-gate-zero" => adr449_gate_zero_command(&args),
+		"adr450-scale-ladder" => adr450_scale_ladder_command(&args),
 		"adr448-capability" => {
 			println!("adr448-harness-capability-v1");
 			ExitCode::SUCCESS
@@ -157,10 +158,11 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
 	let data_dir = data_dir_from_args(args);
-	let sf = match explicit_sf(args) {
-		Ok(explicit) => explicit.unwrap_or(1.0),
+	let explicit_scale = match explicit_sf(args) {
+		Ok(explicit) => explicit,
 		Err(message) => return harness_error(&message),
 	};
+	let sf = explicit_scale.unwrap_or(1.0);
 	let run_index = match parse_u32_flag(args, "--run-index", 0) {
 		Ok(run_index) => run_index,
 		Err(message) => return harness_error(&message),
@@ -378,8 +380,8 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
 	let data_dir = data_dir_from_args(args);
-	let sf = match explicit_sf(args) {
-		Ok(explicit) => explicit.unwrap_or(1.0),
+	let explicit_scale = match explicit_sf(args) {
+		Ok(explicit) => explicit,
 		Err(message) => return harness_error(&message),
 	};
 	let runs = match parse_usize_flag(args, "--runs", 7) {
@@ -392,6 +394,14 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Err(message) => return harness_error(&message),
 	};
 	let output_dir = PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/perf"));
+	let sf = match if flag_present(args, "--paired-ablation") {
+		selected_scale_or_default(explicit_scale, &output_dir)
+	} else {
+		Ok(explicit_scale.unwrap_or(1.0))
+	} {
+		Ok(sf) => sf,
+		Err(message) => return harness_error(&message),
+	};
 	let baseline_path = flag_value(args, "--baseline")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| output_dir.join(default_baseline_name(sf, mode)));
@@ -571,7 +581,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 }
 
 fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
-	let scale_factor = match resolved_sf(args) {
+	let explicit_scale = match explicit_sf(args) {
 		Ok(value) => value,
 		Err(message) => return harness_error(&message),
 	};
@@ -579,6 +589,10 @@ fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	let data_dir = data_dir_from_args(args);
 	let output_dir = PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/perf"));
+	let scale_factor = match selected_scale_or_default(explicit_scale, &output_dir) {
+		Ok(value) => value,
+		Err(message) => return harness_error(&message),
+	};
 	match run_adr449_gate_zero(scale_factor, mode, data_source, &data_dir, &output_dir) {
 		Ok(record) if record["passed"] == true => ExitCode::SUCCESS,
 		Ok(record) => {
@@ -587,6 +601,240 @@ fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
 		}
 		Err(message) => harness_error(&message),
 	}
+}
+
+fn selected_scale_or_default(explicit: Option<f64>, output_dir: &Path) -> Result<f64, String> {
+	if let Some(scale) = explicit {
+		return Ok(scale);
+	}
+	let selected = output_dir.join("adr450_selected_scale.json");
+	if !selected.exists() {
+		return Ok(1.0);
+	}
+	let bytes = std::fs::read(&selected)
+		.map_err(|error| format!("read selected ADR 450 scale: {error}"))?;
+	let value: serde_json::Value = serde_json::from_slice(&bytes)
+		.map_err(|error| format!("parse selected ADR 450 scale: {error}"))?;
+	value
+		.get("selected_scale")
+		.and_then(serde_json::Value::as_f64)
+		.ok_or_else(|| format!("selected ADR 450 scale missing from {}", selected.display()))
+}
+
+const ADR450_GUARD_A: &str = "admitted chain did not commit the generic grouped reservoir path";
+const ADR450_GUARD_B: &str = "generic grouped path did not commit the partitioned-scan reservoir";
+
+#[derive(Debug, Clone, PartialEq)]
+enum Adr450RungOutcome {
+	Committed {
+		reservoir_build_rows: u64,
+		execute_ms: f64,
+	},
+	NonCommitting {
+		diagnostic: &'static str,
+		execute_ms: f64,
+	},
+}
+
+fn adr450_classify_rung(
+	row: &serde_json::Value,
+	profile_dir: &Path,
+) -> Result<Adr450RungOutcome, String> {
+	let execute_ms = row
+		.get("execute_ms")
+		.and_then(serde_json::Value::as_f64)
+		.ok_or("scale rung row lacks execute_ms")?;
+	let status = row
+		.get("status")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("fail");
+	if status == "pass" {
+		return Ok(Adr450RungOutcome::Committed {
+			reservoir_build_rows: profiled_reservoir_build_rows(profile_dir)?,
+			execute_ms,
+		});
+	}
+	let diagnostic = row
+		.get("diagnostic_message")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("");
+	if diagnostic.contains(ADR450_GUARD_A) {
+		return Ok(Adr450RungOutcome::NonCommitting {
+			diagnostic: ADR450_GUARD_A,
+			execute_ms,
+		});
+	}
+	if diagnostic.contains(ADR450_GUARD_B) {
+		return Ok(Adr450RungOutcome::NonCommitting {
+			diagnostic: ADR450_GUARD_B,
+			execute_ms,
+		});
+	}
+	Err(format!("ADR 450 scale rung hard failure: {row}"))
+}
+
+fn adr450_scale_rungs(args: &[String]) -> Result<Vec<f64>, String> {
+	if let Some(raw) = flag_value(args, "--scales") {
+		let mut values = raw
+			.split(',')
+			.map(parse_scale_factor)
+			.collect::<Result<Vec<_>, _>>()?;
+		values.sort_by(f64::total_cmp);
+		values.dedup_by(|left, right| left == right);
+		if values.is_empty() {
+			return Err("--scales must contain at least one scale".to_string());
+		}
+		return Ok(values);
+	}
+	Ok((1..=10).map(f64::from).collect())
+}
+
+fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let output_dir = PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/perf"));
+	let scales = match adr450_scale_rungs(args) {
+		Ok(scales) => scales,
+		Err(message) => return harness_error(&message),
+	};
+	match run_adr450_scale_ladder(&scales, mode, data_source, &data_dir, &output_dir) {
+		Ok(record) => {
+			println!("{record}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+fn run_adr450_scale_ladder(
+	scales: &[f64],
+	mode: &str,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	if data_source != "parquet" && data_source != "persisted" {
+		return Err("ADR 450 requires --data-source parquet".to_string());
+	}
+	let ladder_dir = output_dir.join("adr450_scale_ladder");
+	if ladder_dir.exists() {
+		std::fs::remove_dir_all(&ladder_dir)
+			.map_err(|error| format!("clear ladder directory: {error}"))?;
+	}
+	std::fs::create_dir_all(&ladder_dir)
+		.map_err(|error| format!("create ladder directory: {error}"))?;
+	let mut rungs = Vec::new();
+	let write_ladder_record = |record: &serde_json::Value| -> Result<(), String> {
+		std::fs::write(
+			output_dir.join("adr450_scale_ladder.json"),
+			serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?,
+		)
+		.map_err(|error| format!("write ladder record: {error}"))
+	};
+	for scale in scales {
+		let rung_dir = ladder_dir.join(format!("sf_{scale}"));
+		let profile_dir = rung_dir.join("profile");
+		if rung_dir.exists() {
+			return Err(format!(
+				"ladder rung directory already exists: {}",
+				rung_dir.display()
+			));
+		}
+		std::fs::create_dir_all(&profile_dir)
+			.map_err(|error| format!("create rung profile directory: {error}"))?;
+		let spill_dir = Path::new("target/tpch/join_spill");
+		if spill_dir.exists() {
+			std::fs::remove_dir_all(spill_dir)
+				.map_err(|error| format!("clear rung spill directory: {error}"))?;
+		}
+		let dataset = prepare_persisted_tpch_dataset(mode, *scale, data_dir)
+			.map_err(|error| format!("prepare sf={scale} dataset: {error}"))?;
+		let row = run_perf_child_with_envs(
+			"q05",
+			mode,
+			*scale,
+			0,
+			data_source,
+			data_dir,
+			&[
+				("TORON_ABLATE_LOCAL_RUNTIME_FILTER", "0"),
+				(
+					"TORON_GROUPED_CHAIN_PROFILE_DIR",
+					profile_dir.to_str().ok_or("invalid profile path")?,
+				),
+			],
+		)?;
+		let outcome = match adr450_classify_rung(&row, &profile_dir) {
+			Ok(outcome) => outcome,
+			Err(error) => {
+				let record = serde_json::json!({
+					"suite": "adr450_scale_ladder",
+					"outcome": "hard_error",
+					"error": error,
+					"rungs": rungs,
+					"failed_scale": scale,
+				});
+				write_ladder_record(&record)?;
+				return Err(format!(
+					"ADR 450 scale ladder hard failure at sf={scale}: {record}"
+				));
+			}
+		};
+		let (outcome_name, diagnostic, reservoir_build_rows, execute_ms) = match &outcome {
+			Adr450RungOutcome::Committed {
+				reservoir_build_rows,
+				execute_ms,
+			} => (
+				"committed",
+				serde_json::Value::Null,
+				Some(*reservoir_build_rows),
+				*execute_ms,
+			),
+			Adr450RungOutcome::NonCommitting {
+				diagnostic,
+				execute_ms,
+			} => (
+				"non_committing",
+				serde_json::json!(diagnostic),
+				None,
+				*execute_ms,
+			),
+		};
+		let record = serde_json::json!({
+			"scale": scale,
+			"outcome": outcome_name,
+			"diagnostic": diagnostic,
+			"execute_ms": execute_ms,
+			"reservoir_build_rows": reservoir_build_rows,
+			"manifest_fingerprint": dataset.manifest_fingerprint,
+			"trusted": *scale == 10.0 && outcome_name == "committed",
+		});
+		rungs.push(record);
+		if outcome_name == "committed" {
+			let selected = serde_json::json!({
+				"suite": "adr450_scale_ladder",
+				"selected_scale": scale,
+				"rungs": rungs,
+				"outcome": "committed",
+			});
+			write_ladder_record(&selected)?;
+			std::fs::write(
+				output_dir.join("adr450_selected_scale.json"),
+				serde_json::to_vec_pretty(&selected).map_err(|error| error.to_string())?,
+			)
+			.map_err(|error| format!("write selected scale: {error}"))?;
+			return Ok(selected);
+		}
+	}
+	let no_commit = serde_json::json!({
+		"suite": "adr450_scale_ladder",
+		"outcome": "no_commit",
+		"selected_scale": null,
+		"rungs": rungs,
+	});
+	write_ladder_record(&no_commit)?;
+	Ok(no_commit)
 }
 
 /// Answer-check a query against its independent oracle and record a correctness row. Unsupported queries are a
@@ -2587,6 +2835,13 @@ fn push_row_flag(row: &mut serde_json::Value, flag: &str) {
 	}
 }
 
+fn structured_perf_failure(row: &serde_json::Value) -> bool {
+	matches!(
+		row.get("status").and_then(serde_json::Value::as_str),
+		Some("fail" | "blocked" | "not_attempted")
+	)
+}
+
 #[cfg(unix)]
 fn run_perf_child_args(args: &[String]) -> Result<serde_json::Value, String> {
 	run_perf_child_args_with_envs(args, &[])
@@ -2651,7 +2906,9 @@ fn run_perf_child_args_with_envs(
 			"perf child emitted invalid JSON (status={status}, stderr={stderr:?}, stdout={stdout_trimmed:?}): {error}"
 		)
 	})?;
-	if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+	if (!libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0)
+		&& !structured_perf_failure(&row)
+	{
 		return Err(format!(
 			"perf child failed status={status} stderr={stderr:?} stdout={stdout_trimmed:?}"
 		));
@@ -2699,7 +2956,7 @@ fn run_perf_child_args_with_envs(
 			output.status
 		)
 	})?;
-	if !output.status.success() {
+	if !output.status.success() && !structured_perf_failure(&row) {
 		return Err(format!(
 			"perf child failed status={} stderr={stderr:?} stdout={stdout_trimmed:?}",
 			output.status
@@ -3298,6 +3555,32 @@ mod tests {
 		.unwrap();
 		assert!(profiled_reservoir_build_rows(&directory).is_err());
 		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn adr450_classifier_guard_b_is_non_committing_not_hard_error() {
+		let row = serde_json::json!({
+			"status": "fail",
+			"diagnostic_message": "Kernel { message: \"generic grouped path did not commit the partitioned-scan reservoir\" }",
+			"execute_ms": 12.0,
+		});
+		assert!(matches!(
+			adr450_classify_rung(&row, Path::new("/nonexistent")),
+			Ok(Adr450RungOutcome::NonCommitting {
+				diagnostic: ADR450_GUARD_B,
+				..
+			})
+		));
+	}
+
+	#[test]
+	fn adr450_classifier_unknown_failure_is_hard_error() {
+		let row = serde_json::json!({
+			"status": "fail",
+			"diagnostic_message": "Kernel { message: \"unexpected failure\" }",
+			"execute_ms": 12.0,
+		});
+		assert!(adr450_classify_rung(&row, Path::new("/nonexistent")).is_err());
 	}
 	use super::*;
 	use toron_tpch::Q17_CORRECTNESS_SCALE;

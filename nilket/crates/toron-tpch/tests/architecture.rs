@@ -255,3 +255,36 @@ fn adr449_pairing_is_parity_checked_and_gate_zero_admissible() {
 	assert!(main.contains("ablation arm parity mismatch"));
 	assert!(main.contains("paired_ablation"));
 }
+
+#[test]
+fn adr450_scale_ladder_classifies_only_known_non_commits() {
+	let main = source("src/main.rs");
+	assert!(main.contains("adr450-scale-ladder"));
+	assert!(main.contains("ADR450_GUARD_A"));
+	assert!(main.contains("ADR450_GUARD_B"));
+	assert!(main.contains("ADR450_GUARD_A") && main.contains("ADR450_GUARD_B"));
+	assert!(main.contains("scale rung hard failure"));
+	assert!(main.contains("adr450_selected_scale.json"));
+	assert!(main.contains("selected_scale_or_default"));
+}
+
+#[test]
+fn adr450_ablation_arms_share_the_same_parquet_projection_union() {
+	let lib = source("src/lib.rs");
+	let projection = lib
+		.find("let Some(columns) = &pbc_projection")
+		.expect("shared projection union");
+	let with_projection = lib[projection..]
+		.find("builder = builder.with_projection(mask)")
+		.map(|offset| projection + offset)
+		.expect("shared Parquet projection");
+	let inflater = lib[with_projection..]
+		.find("inflate_projected_parquet_batch(")
+		.map(|offset| with_projection + offset)
+		.expect("projected-batch inflater");
+	assert!(
+		with_projection < inflater,
+		"both arms must use the same projected union before inflation"
+	);
+	assert!(lib.matches("inflate_projected_parquet_batch(").count() >= 3);
+}

@@ -1721,9 +1721,7 @@ impl StorageScan for ParquetHarnessScan {
 				message: format!("read parquet metadata {}: {error}", source.path.display()),
 			}
 		})?;
-		if runtime_filter_present {
-			// Keep the full source schema for runtime-filter evaluation below.
-		} else if let Some(columns) = &pbc_projection {
+		if let Some(columns) = &pbc_projection {
 			if columns.len() < full_column_count {
 				let mask = ProjectionMask::leaves(builder.parquet_schema(), columns.clone());
 				builder = builder.with_projection(mask);

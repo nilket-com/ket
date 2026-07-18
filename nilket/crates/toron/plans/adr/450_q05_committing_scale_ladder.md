@@ -48,6 +48,7 @@ Taxonomy, per rung:
 | **committed** | exactly one `grouped_chain_*.json` with the reservoir profile present | **stop — this is the answer** |
 | **non-committing** | child exits with `:10038` **or** `:12222`, recorded by which | climb higher |
 | **hard error** | anything else — spawn failure, panic, missing/duplicate profile, any other `Kernel` message, non-zero exit without a known diagnostic | **abort the probe** — never silently "resident" |
+| **inconclusive** | a known harness/runtime-filter execution defect blocks a rung before reservoir resolution | **stop and repair the measuring path** — neither commit nor no-commit |
 
 Recording *which* non-commit diagnostic fired is diagnostically load-bearing: a rung that
 reaches `:12222` (reservoir declined despite entering the generic grouped path) is evidence
@@ -101,7 +102,7 @@ Predeclaring all three keeps the probe from being run hoping for a cheap commit.
 - Per rung: own scale-matched dataset, fresh empty profile+spill dirs (asserted empty
   first), one profiled ON child.
 - Outcome classified into exactly {committed, non-committing(`:10038`|`:12222`), hard
-  error}; **any non-known-diagnostic failure is a hard error, never "resident"**. A test
+  error, inconclusive}; **any non-known-diagnostic failure is a hard error, never "resident"**. A test
   asserts a fabricated unknown error is not classified non-committing.
 - A test asserts `:12222` classifies as non-committing (climb), not hard error — pins the
   correction.
@@ -109,6 +110,8 @@ Predeclaring all three keeps the probe from being run hoping for a cheap commit.
 - The selected scale is emitted once and consumed by 449; a test asserts 449's fixture
   scale reads from this source, not a literal.
 - No paired cohort, no filter-effect measurement, no wall/spill/materiality claim.
+- If a runtime-filter harness defect blocks a rung before reservoir resolution, record an
+  inconclusive outcome and repair the harness in this cut before rerunning the ladder.
 
 ## Guardrails and risks
 
