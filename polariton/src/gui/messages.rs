@@ -1,5 +1,5 @@
 use super::menu;
-use crate::baryon_editor::EditorMsg;
+use crate::editor::EditorMsg;
 use crate::adapters::{
 	common::{DatabaseAdapter, ExecutionResult},
 	driver::AdapterSelection,

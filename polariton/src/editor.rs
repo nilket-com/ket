@@ -8,9 +8,11 @@
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{Space, button, column, container, mouse_area, rich_text, row, span, text};
-use iced::{Background, Color, Element, Event, Length, Subscription, event};
+use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, Rgb};
-use libaryon::engine::{EditorCommand, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers};
+use libaryon::engine::{
+	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers,
+};
 use libaryon::engine::{MinimapSnapshot, UiPalette};
 use libaryon::uast::Viewport;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -34,6 +36,7 @@ mod metrics {
 #[derive(Debug, Clone)]
 pub enum EditorMsg {
 	Input(InputEvent),
+	Paste(String),
 	Scroll(i32),
 	MinimapGoto(DocLine),
 	PointerMoved(iced::Point),
@@ -41,7 +44,7 @@ pub enum EditorMsg {
 }
 
 /// Long-lived owner of Polariton's libaryon session.
-pub struct BaryonEditor {
+pub struct CodeEditor {
 	engine: Option<EngineHandle>,
 	commands: libaryon::engine::CommandSender,
 	input: libaryon::engine::InputSender,
@@ -55,7 +58,7 @@ pub struct BaryonEditor {
 	last_pointer: Option<iced::Point>,
 }
 
-impl BaryonEditor {
+impl CodeEditor {
 	pub fn new(text: &str) -> Self {
 		let mut engine = EngineHandle::spawn(EngineConfig::default());
 		let commands = engine.command_sender();
@@ -119,8 +122,9 @@ impl BaryonEditor {
 	/// Translate the code pane's pixel size into the engine's cell grid.
 	/// Callers pass the actual pane rectangle (see `sync_code_editor_viewport`).
 	pub fn resize(&self, width: f32, height: f32) {
-		let columns =
-			(width / metrics::CELL_WIDTH).floor().clamp(1.0, u16::MAX as f32) as u16;
+		let columns = (width / metrics::CELL_WIDTH)
+			.floor()
+			.clamp(1.0, u16::MAX as f32) as u16;
 		let rows = (height / metrics::LINE_HEIGHT)
 			.floor()
 			.clamp(1.0, u16::MAX as f32) as u16;
@@ -169,12 +173,26 @@ impl BaryonEditor {
 		}
 	}
 
-	pub fn update(&mut self, message: EditorMsg) {
+	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
 		match message {
+			EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Char('v'),
+				modifiers,
+			}) if modifiers.contains(Modifiers::CONTROL) && self.is_insert_mode() => {
+				return iced::clipboard::read()
+					.map(|text| EditorMsg::Paste(text.unwrap_or_default()));
+			}
 			EditorMsg::Input(input) => {
 				if let Err(error) = self.input.try_send(input) {
 					eprintln!("Editor engine rejected input: {error}");
-					return;
+					return Task::none();
+				}
+				self.request_content();
+			}
+			EditorMsg::Paste(text) => {
+				if let Err(error) = self.input.try_send(InputEvent::Paste(text)) {
+					eprintln!("Editor engine rejected paste: {error}");
+					return Task::none();
 				}
 				self.request_content();
 			}
@@ -189,6 +207,7 @@ impl BaryonEditor {
 			}
 			EditorMsg::Click => self.click_at_pointer(),
 		}
+		Task::none()
 	}
 
 	pub fn view(&self) -> Element<'_, EditorMsg> {
@@ -343,9 +362,15 @@ impl BaryonEditor {
 		);
 		self.send(EditorCommand::ClickCursor(target));
 	}
+
+	fn is_insert_mode(&self) -> bool {
+		self.viewport
+			.as_ref()
+			.is_some_and(|viewport| viewport.input.mode == EditorMode::Insert)
+	}
 }
 
-impl Drop for BaryonEditor {
+impl Drop for CodeEditor {
 	fn drop(&mut self) {
 		self.shutdown();
 	}
@@ -713,11 +738,11 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 
 #[cfg(test)]
 mod tests {
-	use super::BaryonEditor;
+	use super::{CodeEditor, EditorMsg, InputEvent, KeyCode, Modifiers};
 	use std::thread;
 	use std::time::{Duration, Instant};
 
-	fn wait_for_content(editor: &mut BaryonEditor, expected: &str) {
+	fn wait_for_content(editor: &mut CodeEditor, expected: &str) {
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor.cached_content() != expected && Instant::now() < deadline {
 			editor.poll();
@@ -726,9 +751,18 @@ mod tests {
 		assert_eq!(editor.cached_content(), expected);
 	}
 
+	fn send_keys(editor: &mut CodeEditor, keys: impl IntoIterator<Item = char>) {
+		for key in keys {
+			let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Char(key),
+				modifiers: Modifiers::NONE,
+			}));
+		}
+	}
+
 	#[test]
 	fn in_memory_content_round_trips_through_the_engine() {
-		let mut editor = BaryonEditor::new("select 1;");
+		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
 		editor.replace_content("select 2;");
 		wait_for_content(&mut editor, "select 2;");
@@ -736,16 +770,13 @@ mod tests {
 
 	#[test]
 	fn rapid_input_still_converges_the_cached_content() {
-		use super::EditorMsg;
-		use libaryon::engine::{InputEvent, KeyCode, Modifiers};
-
-		let mut editor = BaryonEditor::new("select 1;");
+		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
 		// Enter insert mode, then type without polling in between: the second
 		// key lands while the first key's text query is in flight, so the
 		// cache only converges if the stale reply is chased with a re-query.
 		for ch in ['i', 'x'] {
-			editor.update(EditorMsg::Input(InputEvent::Key {
+			let _ = editor.update(EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char(ch),
 				modifiers: Modifiers::NONE,
 			}));
@@ -761,7 +792,7 @@ mod tests {
 		let text = (0..80)
 			.map(|line| format!("select {line};\n"))
 			.collect::<String>();
-		let mut editor = BaryonEditor::new(&text);
+		let mut editor = CodeEditor::new(&text);
 		editor.resize(960.0, 110.0);
 		wait_for_content(&mut editor, &text);
 
@@ -784,7 +815,7 @@ mod tests {
 				.is_some_and(|pane| pane.minimap.is_some())
 		);
 
-		editor.update(EditorMsg::Scroll(3));
+		let _ = editor.update(EditorMsg::Scroll(3));
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
 			.viewport
@@ -804,7 +835,7 @@ mod tests {
 				.is_some_and(|pane| pane.viewport_start_line > DocLine::ZERO)
 		);
 
-		editor.update(EditorMsg::MinimapGoto(DocLine::new(40)));
+		let _ = editor.update(EditorMsg::MinimapGoto(DocLine::new(40)));
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
 			.viewport
@@ -880,13 +911,13 @@ mod tests {
 		use super::EditorMsg;
 		use iced::Point;
 
-		let mut editor = BaryonEditor::new("select 1;\nselect 2;\nselect 3;");
+		let mut editor = CodeEditor::new("select 1;\nselect 2;\nselect 3;");
 		wait_for_content(&mut editor, "select 1;\nselect 2;\nselect 3;");
-		editor.update(EditorMsg::PointerMoved(Point::new(
+		let _ = editor.update(EditorMsg::PointerMoved(Point::new(
 			54.0 + 9.6 * 3.0,
 			8.0 + 22.0,
 		)));
-		editor.update(EditorMsg::Click);
+		let _ = editor.update(EditorMsg::Click);
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
 			.viewport
@@ -907,5 +938,62 @@ mod tests {
 				.is_some_and(|pane| pane.cursor_abs_pos.line.get() == 1
 					&& pane.cursor_abs_pos.col.get() >= 3)
 		);
+	}
+
+	#[test]
+	fn insert_mode_paste_uses_the_engine_paste_protocol() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Char('i'),
+			modifiers: Modifiers::NONE,
+		}));
+		let _ = editor.update(EditorMsg::Paste("-- pasted\n".to_owned()));
+		wait_for_content(&mut editor, "-- pasted\nselect 1;");
+	}
+
+	#[test]
+	fn modal_sql_editing_preserves_operator_undo_and_linewise_put_behavior() {
+		let original = "one two\nthree\n";
+		let mut editor = CodeEditor::new(original);
+		wait_for_content(&mut editor, original);
+
+		send_keys(&mut editor, ['d', 'w']);
+		wait_for_content(&mut editor, "two\nthree\n");
+
+		send_keys(&mut editor, ['u']);
+		wait_for_content(&mut editor, original);
+
+		send_keys(&mut editor, ['y', 'y', 'p']);
+		wait_for_content(&mut editor, "one two\none two\nthree\n");
+	}
+
+	#[test]
+	fn ctrl_v_keeps_normal_mode_visual_block_binding_while_insert_paste_is_separate() {
+		use libaryon::engine::EditorMode;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Char('v'),
+			modifiers: Modifiers::CONTROL,
+		}));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| !matches!(viewport.input.mode, EditorMode::Visual { .. }))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.is_some_and(|viewport| matches!(viewport.input.mode, EditorMode::Visual { .. }))
+		);
+		assert_eq!(editor.cached_content(), "select 1;");
 	}
 }

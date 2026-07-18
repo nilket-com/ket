@@ -1,5 +1,4 @@
 mod adapters;
-mod baryon_editor;
 mod core;
 mod editor;
 mod fonts;

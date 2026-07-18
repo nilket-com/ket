@@ -63,7 +63,7 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    the SQL back out. Engine-level tests cover the SQL replace → edit → query
    round-trip and the file-association reset.
 2. **Minimal iced bridge in polariton.** ✅ Foundation done (2026-07-18):
-   `polariton/src/baryon_editor.rs` owns one long-lived engine, drains the
+   `polariton/src/editor.rs` owns one long-lived engine, drains the
    viewport receiver on a non-blocking 16 ms iced tick (coalescing projections),
    translates keyboard input, renders focused-pane tokens in a fixed-width Iced
    scrollable, and maps window pixels to the engine cell grid. Polariton's
@@ -71,7 +71,7 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    bridge-level SQL round-trip test passes. Mouse input, pane-accurate resize,
    syntax spans, cursor/selection painting, and all remaining visual parity are
    intentionally deferred to the visual layers below.
-3. **Visual layers.** ✅ Done (2026-07-18): `baryon_editor` maps
+3. **Visual layers.** ✅ Done (2026-07-18): `editor` maps
    `PaneViewport` highlight spans and the engine UI palette to iced rich-text
    fragments, renders engine-projected line numbers, selections, diagnostics,
    folded placeholders, and the primary cursor. The engine remains authoritative
@@ -82,17 +82,14 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
 3a. **Upstream follow-up:** `UiPalette` has no selection color, so the bridge
    hardcodes the selection background; add a `selection` field to libaryon's
    `UiPalette`/`UiColorOverrides` and consume it in polariton.
-4. **Parity gate, then removal and rename.** Parity tests for SQL editing and the
-   saved-statement flows (create, load, swap, run), plus the vim-binding and
-   clipboard checks from the Risk section. Once passed, in one commit:
-   - delete `polariton/src/editor/`;
-   - move `DEJAVU_SANS_MONO` (app-level font registration, currently imported
-     from the old editor module by `gui/state.rs`) into `fonts.rs`;
-   - rename `baryon_editor.rs` → `editor.rs` and `BaryonEditor` → `CodeEditor`,
-     keeping the app-facing API engine-agnostic (also keeps a later
-     `baryon-iced` extraction possible as a dependency of `editor.rs`).
-   The rename must wait for the deletion: `editor.rs` and the old `editor/`
-   directory cannot coexist as one module name.
+4. **Parity gate, removal, and rename.** ✅ Done (2026-07-18): bridge tests cover
+   in-memory SQL replace/query, rapid typing convergence, modal `dw`/undo/`yy`/
+   put editing, Insert-mode system paste, Normal-mode `Ctrl+V` block selection,
+   scrolling, minimap navigation, wrapping, and mouse cursor placement. The old
+   `polariton/src/editor/` has been deleted; `DEJAVU_SANS_MONO` now lives in
+   `fonts`, and the bridge is the app-facing `polariton/src/editor.rs` with
+   `CodeEditor`, preserving an engine-agnostic surface for a later
+   `baryon-iced` extraction.
 
 ## Risk
 

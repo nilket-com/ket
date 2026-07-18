@@ -2,8 +2,8 @@ use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::{AdapterConfiguration, AdapterSelection, AdapterState},
 };
-use crate::baryon_editor::BaryonEditor;
-use crate::editor::DEJAVU_SANS_MONO;
+use crate::editor::CodeEditor;
+use crate::fonts::DEJAVU_SANS_MONO;
 use crate::gui::{
 	components::{self, PaneType},
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -25,7 +25,7 @@ struct AppState {
 	pane_content: HashMap<PaneId, PaneType>,
 	dashboard: DashboardState,
 	menu_state: MenuState,
-	code_editor: BaryonEditor,
+	code_editor: CodeEditor,
 	data_frame: DataFrame,
 	status_msg: String,
 	status_error: String,
@@ -172,7 +172,7 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 	let (_, dashboard_pane) = panes.split(Axis::Vertical, editor_pane).unwrap();
 	pane_content.insert(dashboard_pane, PaneType::Dashboard);
 
-	let code_editor = BaryonEditor::new("");
+	let code_editor = CodeEditor::new("");
 	let is_password_protected = startup_data.is_password_protected;
 	let salt = startup_data.salt.clone();
 	let mut state = AppState {
@@ -282,7 +282,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return window::latest().and_then(window::drag);
 		}
 		Message::CodeEditEvent(edit_event) => {
-			app_state.code_editor.update(edit_event);
+			return app_state
+				.code_editor
+				.update(edit_event)
+				.map(Message::CodeEditEvent);
 		}
 		Message::CodeEditPoll => {
 			app_state.code_editor.poll();
