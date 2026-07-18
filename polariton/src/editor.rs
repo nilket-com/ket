@@ -7,13 +7,15 @@
 
 use iced::keyboard::{self, Key};
 use iced::mouse;
-use iced::widget::{Space, button, column, container, mouse_area, rich_text, row, span, text};
+use iced::widget::{
+	Space, button, column, container, mouse_area, rich_text, row, span, stack, text,
+};
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, Rgb};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers,
 };
-use libaryon::engine::{MinimapSnapshot, UiPalette};
+use libaryon::engine::{MinimapSnapshot, UiPalette, VisualKind};
 use libaryon::uast::Viewport;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -142,14 +144,33 @@ impl CodeEditor {
 			// into a text_input (connection name, statement title, …) and must
 			// not also edit the SQL document.
 			(
-				Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }),
-				event::Status::Ignored,
-			) => key_code(&key).map(|code| {
-				EditorMsg::Input(InputEvent::Key {
-					code,
-					modifiers: map_modifiers(modifiers),
+				// `modified_key`, not `key`: iced's `key` is the unshifted
+				// layout key (Shift+; arrives as ';'), while the engine's
+				// keymap expects the produced character (':', 'A', '"', …)
+				// with Ctrl kept as a modifier flag — which is exactly
+				// `modified_key`'s contract.
+				Event::Keyboard(keyboard::Event::KeyPressed {
+					modified_key,
+					modifiers,
+					..
+				}),
+				status,
+			) => {
+				if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
+					eprintln!(
+						"[input-trace] modified_key={modified_key:?} modifiers={modifiers:?} status={status:?}"
+					);
+				}
+				if status != event::Status::Ignored {
+					return None;
+				}
+				key_code(&modified_key).map(|code| {
+					EditorMsg::Input(InputEvent::Key {
+						code,
+						modifiers: map_modifiers(modifiers),
+					})
 				})
-			}),
+			}
 			_ => None,
 		})
 	}
@@ -188,6 +209,9 @@ impl CodeEditor {
 					.map(|text| EditorMsg::Paste(text.unwrap_or_default()));
 			}
 			EditorMsg::Input(input) => {
+				if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
+					eprintln!("[input-trace] forwarding to engine: {input:?}");
+				}
 				if let Err(error) = self.input.try_send(input) {
 					eprintln!("Editor engine rejected input: {error}");
 					return Task::none();
@@ -283,6 +307,10 @@ impl CodeEditor {
 						.color(number_color)
 				)
 				.width(Length::Fixed(metrics::GUTTER_WIDTH))
+				// `container` makes its child fluid by default. Pinning this
+				// prevents the enclosing column from distributing the pane's
+				// spare height across every projected editor row.
+				.height(Length::Fixed(metrics::LINE_HEIGHT))
 				.padding([0, 8])
 				.style(move |_| container::Style {
 					background: Some(Background::Color(gutter_background)),
@@ -291,12 +319,19 @@ impl CodeEditor {
 				rich_text(fragments)
 					.font(EDITOR_FONT)
 					.size(metrics::TEXT_SIZE)
-					.line_height(metrics::LINE_HEIGHT),
+					.height(Length::Fixed(metrics::LINE_HEIGHT))
+					// `Pixels`, not a bare f32: `From<f32> for LineHeight` is
+					// Relative (a multiplier of the font size), which made
+					// every line 22× tall and clipped all glyphs out of the
+					// fixed-height row.
+					.line_height(iced::Pixels(metrics::LINE_HEIGHT)),
 			]
 			.spacing(0)
+			.height(Length::Fixed(metrics::LINE_HEIGHT))
 			.into()
 		}))
-		.width(Length::Fill);
+		.width(Length::Fill)
+		.height(Length::Shrink);
 		let editor_rows = mouse_area(
 			container(rows)
 				.padding([metrics::VERTICAL_PADDING, 0.0])
@@ -312,12 +347,48 @@ impl CodeEditor {
 			};
 			EditorMsg::Scroll(-lines)
 		});
-		let content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
+		let editor_content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
 			row![editor_rows, minimap_view(minimap, palette)]
 				.height(Length::Fill)
 				.into()
 		} else {
 			editor_rows.into()
+		};
+		// Mirror baryon's status-bar prompt: `:` command, `/` search, and
+		// pending confirm questions all use the same bottom bar. Non-Normal
+		// modes without a prompt still announce themselves vim-style, since
+		// the block cursor is otherwise the only modal feedback.
+		let prompt = match viewport.input.mode {
+			EditorMode::Command => Some(format!(":{}", viewport.input.prompt_buffer)),
+			EditorMode::Search => Some(format!("/{}", viewport.input.prompt_buffer)),
+			EditorMode::Confirm => Some(
+				viewport
+					.confirm_prompt
+					.clone()
+					.unwrap_or_else(|| "Confirm? [y/n]".to_owned()),
+			),
+			EditorMode::Insert => Some("-- INSERT --".to_owned()),
+			EditorMode::Visual { kind, .. } => Some(
+				match kind {
+					VisualKind::Char => "-- VISUAL --",
+					VisualKind::Line => "-- VISUAL LINE --",
+					VisualKind::Block => "-- VISUAL BLOCK --",
+				}
+				.to_owned(),
+			),
+			EditorMode::Normal => None,
+		};
+		let content: Element<'_, EditorMsg> = if let Some(prompt) = prompt {
+			stack![
+				editor_content,
+				container(command_bar(prompt, palette))
+					.width(Length::Fill)
+					.height(Length::Fill)
+					.align_y(iced::alignment::Vertical::Bottom),
+			]
+			.into()
+		} else {
+			editor_content
 		};
 		container(content)
 			.style(move |_| container::Style {
@@ -484,6 +555,15 @@ fn project_lines(
 	if let Some(line) = current {
 		lines.push(line);
 	}
+	// The placeholder must exist before the cursor fallback runs: an empty
+	// document has no tokens, and the cursor still needs a line to land on.
+	if lines.is_empty() {
+		lines.push(ProjectedLine {
+			doc_line: pane.viewport_start_line.get(),
+			fragments: Vec::new(),
+			show_gutter: true,
+		});
+	}
 	if !cursor_rendered {
 		let cursor_line = pane.cursor_abs_pos.line.get();
 		if let Some(line) = lines.iter_mut().find(|line| line.doc_line == cursor_line) {
@@ -495,13 +575,6 @@ fn project_lines(
 				false,
 			);
 		}
-	}
-	if lines.is_empty() {
-		lines.push(ProjectedLine {
-			doc_line: pane.viewport_start_line.get(),
-			fragments: Vec::new(),
-			show_gutter: true,
-		});
 	}
 	lines
 }
@@ -610,6 +683,27 @@ fn gutter_number(pane: &libaryon::uast::projection::PaneViewport, line: u64) -> 
 
 fn color(color: Rgb) -> Color {
 	Color::from_rgb8(color.r, color.g, color.b)
+}
+
+/// Project libaryon's prompt line (`:` command, `/` search, or a confirm
+/// question). The engine remains responsible for editing and executing the
+/// buffer; this is intentionally display-only so its modal key handling
+/// continues to flow through the normal subscription.
+fn command_bar(prompt: String, palette: UiPalette) -> Element<'static, EditorMsg> {
+	container(
+		text(prompt)
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(palette.editor_text)),
+	)
+	.width(Length::Fill)
+	.height(Length::Fixed(metrics::LINE_HEIGHT))
+	.padding([0, 8])
+	.style(move |_| container::Style {
+		background: Some(Background::Color(color(palette.gutter_surface))),
+		..Default::default()
+	})
+	.into()
 }
 
 const MINIMAP_BANDS: usize = 96;
@@ -723,6 +817,7 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 	use iced::keyboard::key::Named;
 	Some(match key.as_ref() {
 		Key::Character(value) => KeyCode::Char(value.chars().next()?),
+		Key::Named(Named::Space) => KeyCode::Char(' '),
 		Key::Named(Named::Backspace) => KeyCode::Backspace,
 		Key::Named(Named::Enter) => KeyCode::Enter,
 		Key::Named(Named::ArrowLeft) => KeyCode::Left,
@@ -763,6 +858,78 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	#[test]
+	fn empty_document_still_renders_a_cursor_block() {
+		use super::project_lines;
+
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none() && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		let pane = viewport.focused_pane().expect("focused pane");
+		let palette = viewport.ui_palette;
+		let lines = project_lines(pane, palette.editor_text, palette.accent);
+		assert!(
+			lines
+				.iter()
+				.any(|line| line.fragments.iter().any(|f| f.background.is_some())),
+			"an empty document must still project a cursor block"
+		);
+	}
+
+	/// Replicates `view`'s projection pipeline (project + wrap) and returns the
+	/// concatenated visible text per line, so tests can assert what the widget
+	/// tree would actually display.
+	fn rendered_lines(editor: &CodeEditor) -> Vec<String> {
+		use super::{project_lines, wrap_projected_lines};
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		let pane = viewport.focused_pane().expect("focused pane");
+		let palette = viewport.ui_palette;
+		wrap_projected_lines(
+			project_lines(pane, palette.editor_text, palette.accent),
+			pane,
+		)
+		.into_iter()
+		.map(|line| {
+			line.fragments
+				.into_iter()
+				.map(|fragment| fragment.text)
+				.collect::<String>()
+		})
+		.collect()
+	}
+
+	#[test]
+	fn typed_text_survives_the_full_render_pipeline() {
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		send_keys(&mut editor, ['i', 'a', 'b']);
+		wait_for_content(&mut editor, "ab");
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !rendered_lines(&editor)
+			.iter()
+			.any(|line| line.contains("ab"))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let lines = rendered_lines(&editor);
+		assert!(
+			lines.iter().any(|line| line.contains("ab")),
+			"typed text must reach the rendered projection, got: {lines:?}"
+		);
 	}
 
 	#[test]
