@@ -1150,6 +1150,7 @@ fn read_only_virtual_blocks_command(command: &EditorCommand) -> bool {
 			| EditorCommand::VisualChange { .. }
 			| EditorCommand::DeleteAroundFunction { .. }
 			| EditorCommand::ChangeAroundFunction
+			| EditorCommand::ReplaceDocument { .. }
 			| EditorCommand::WriteFile
 			| EditorCommand::WriteFileAs(_)
 			| EditorCommand::WriteAndQuit
@@ -1234,6 +1235,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::VisualDelete { .. }
 		| EditorCommand::VisualChange { .. }
 		| EditorCommand::LoadFile(_)
+		| EditorCommand::ReplaceDocument { .. }
 		| EditorCommand::ReloadFile { .. }
 		| EditorCommand::SearchStart(_)
 		| EditorCommand::SearchNext
@@ -1307,6 +1309,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::GitStatus
 		| EditorCommand::OpenGitStatusEntry(_)
 		| EditorCommand::MouseIntent { .. }
+		| EditorCommand::QueryDocumentText
 		| EditorCommand::Quit => Preserve,
 	}
 }
@@ -2092,6 +2095,75 @@ fn dispatch_command(
 			needs_render |= load_file_into_pane(runtime, session, pane_id, path)
 				.effect
 				.needs_render;
+		}
+		replace_cmd @ EditorCommand::ReplaceDocument { .. } => {
+			let EditorSession {
+				buffers,
+				layout,
+				events,
+				focused_pane_id,
+				ui,
+				next_dynamic_device_id,
+				persistent_settings,
+				..
+			} = session;
+			let doctab = focused_doctab(layout, *focused_pane_id);
+			let view_id = doctab.id;
+			let buffer_id = doctab.buffer_id;
+			if let Some((effect, language_id, replaced)) =
+				with_text_buffer_mut(registry, buffers, layout, events, view_id, |tab| {
+					let effect = handle_file_doctab_command(
+						runtime,
+						tab,
+						ui,
+						next_dynamic_device_id,
+						persistent_settings.save_durability,
+						replace_cmd,
+					);
+					(
+						effect,
+						tab.document.active_language_id,
+						tab.document.file_path.is_none(),
+					)
+				}) {
+				if replaced {
+					// The buffer no longer represents its former file, so its
+					// canonical-path claim must not block reopening that file.
+					buffers.detach_path(buffer_id);
+				}
+				let view = layout.find_view_mut(view_id).expect("replaced view");
+				if let Err(err) = apply_resolved_theme_to_tab(view, language_id, persistent_settings)
+				{
+					ui.status_message = Some(err);
+				}
+				needs_render |= effect.needs_render;
+			}
+		}
+		query_cmd @ EditorCommand::QueryDocumentText => {
+			let EditorSession {
+				buffers,
+				layout,
+				events,
+				focused_pane_id,
+				ui,
+				next_dynamic_device_id,
+				persistent_settings,
+				..
+			} = session;
+			let view_id = focused_doctab(layout, *focused_pane_id).id;
+			if let Some((effect, _)) = handle_file_command_for_view(
+				runtime,
+				buffers,
+				layout,
+				events,
+				view_id,
+				ui,
+				next_dynamic_device_id,
+				persistent_settings.save_durability,
+				query_cmd,
+			) {
+				needs_render |= effect.needs_render;
+			}
 		}
 		EditorCommand::ReloadFile { force } => {
 			let focused_buffer_id =

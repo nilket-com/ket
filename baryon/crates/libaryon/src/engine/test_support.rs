@@ -515,6 +515,44 @@ pub(crate) fn spawn_test_engine_with_csv(
 	(tx_cmd, rx_view, handle)
 }
 
+pub(crate) fn spawn_test_engine_with_sql() -> (
+	CommandSender,
+	mpsc::Receiver<Viewport>,
+	thread::JoinHandle<()>,
+) {
+	use crate::svp::sql_provider::SqlProvider;
+
+	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
+	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
+	let registry = Arc::new(UastRegistry::new(1_000_000));
+	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
+	let mut lang_registry = LanguageRegistry::new();
+	lang_registry.register(FsProvider);
+	lang_registry.register(SqlProvider);
+	let lang_registry = Arc::new(lang_registry);
+	let engine = Engine::new(
+		registry,
+		resolver,
+		rx_request,
+		tx_internal,
+		tx_view,
+		lang_registry,
+		"onedark".to_string(),
+		false,
+		false,
+		true,
+		false,
+		true,
+		true,
+		SaveDurability::default(),
+		UiColorOverrides::default(),
+		BTreeMap::new(),
+	);
+	let handle = thread::spawn(move || engine.run());
+	(tx_cmd, rx_view, handle)
+}
+
 pub(crate) fn spawn_test_engine_with_python_and_rune() -> (
 	CommandSender,
 	mpsc::Receiver<Viewport>,

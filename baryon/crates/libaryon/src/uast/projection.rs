@@ -219,6 +219,12 @@ pub struct Viewport {
 	/// Checked-out branch for the focused document's repository, when available.
 	pub git_branch: Option<String>,
 	pub status_message: Option<String>,
+	/// One-shot reply to [`EditorCommand::QueryDocumentText`]: the focused
+	/// document's full text, present only on the projection that answers the
+	/// query.
+	///
+	/// [`EditorCommand::QueryDocumentText`]: crate::engine::EditorCommand::QueryDocumentText
+	pub document_text: Option<String>,
 	/// Whether foreground I/O or semantic analysis is still in progress.
 	///
 	/// Frontends can animate this state without asking the engine to render

@@ -1,5 +1,6 @@
 use super::super::document::io::{
-	SaveMethod, SaveOutcome, rebind_document_spans_to_saved_file, save_document,
+	SaveMethod, SaveOutcome, read_document_snapshot, rebind_document_spans_to_saved_file,
+	save_document,
 };
 use super::super::folding::{
 	FoldSet, resolve_fold_boundary_at_cursor_tracked, set_subtree_fold_state,
@@ -234,31 +235,28 @@ fn save_document_with_fresh_backing(
 }
 
 fn create_empty_document(registry: &UastRegistry) -> Result<(NodeId, NodeId), String> {
+	create_document_from_bytes(registry, Vec::new())
+}
+
+fn create_document_from_bytes(
+	registry: &UastRegistry,
+	bytes: Vec<u8>,
+) -> Result<(NodeId, NodeId), String> {
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
 
+	let metrics = SpanMetrics {
+		byte_length: bytes.len() as u64,
+		newlines: bytes.iter().filter(|byte| **byte == b'\n').count() as u64,
+	};
 	let mut chunk = registry.reserve_chunk(2).ok_or_else(|| {
 		"Not enough document-node capacity to create an empty document".to_string()
 	})?;
-	let rid = chunk.spawn_node(
-		SemanticKind::RelationalTable,
-		None,
-		SpanMetrics {
-			byte_length: 0,
-			newlines: 0,
-		},
-	);
-	let leaf = chunk.spawn_node(
-		SemanticKind::Token,
-		None,
-		SpanMetrics {
-			byte_length: 0,
-			newlines: 0,
-		},
-	);
+	let rid = chunk.spawn_node(SemanticKind::RelationalTable, None, metrics);
+	let leaf = chunk.spawn_node(SemanticKind::Token, None, metrics);
 	chunk.append_local_child(rid, leaf);
 	unsafe {
-		*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
+		*registry.virtual_data[leaf.index()].get() = Some(bytes);
 	}
 	Ok((rid, leaf))
 }
@@ -305,7 +303,7 @@ fn initialize_loaded_document(
 	active_visual: &mut Option<(DocByte, VisualKind)>,
 	scroll_y: &mut u64,
 	scroll_row_offset: &mut DisplayRow,
-	path: String,
+	path: Option<String>,
 	backing: Option<String>,
 	language_id: Option<&'static str>,
 	shadow_session: Option<ShadowSession>,
@@ -320,8 +318,8 @@ fn initialize_loaded_document(
 		ctx.registry.cancel_metric_scan(old_root);
 	}
 	*active_language_id = language_id;
-	*file_stamp = file_stamp_for_path(&path);
-	*file_path = Some(path);
+	*file_stamp = path.as_deref().and_then(file_stamp_for_path);
+	*file_path = path;
 	*backing_path = backing;
 	*shadow = shadow_session;
 	*root_id = Some(new_root);
@@ -394,7 +392,7 @@ fn reload_loaded_document(
 		active_visual,
 		scroll_y,
 		scroll_row_offset,
-		path.clone(),
+		Some(path.clone()),
 		Some(path),
 		language_id,
 		None,
@@ -759,9 +757,24 @@ pub(super) fn handle_file_doctab_command(
 	save_durability: SaveDurability,
 	command: EditorCommand,
 ) -> CommandEffect {
+	if matches!(&command, EditorCommand::QueryDocumentText) {
+		match read_document_snapshot(
+			ctx.registry,
+			tab.document.root_id,
+			tab.document.backing_path.as_deref().map(Path::new),
+		) {
+			Ok(bytes) => {
+				ui.document_text_response = Some(String::from_utf8_lossy(&bytes).into_owned());
+			}
+			Err(msg) => ui.status_message = Some(msg),
+		}
+		return CommandEffect::render();
+	}
 	let resets_search_results = matches!(
 		&command,
-		EditorCommand::LoadFile(_) | EditorCommand::ReloadFile { .. }
+		EditorCommand::LoadFile(_)
+			| EditorCommand::ReloadFile { .. }
+			| EditorCommand::ReplaceDocument { .. }
 	);
 	let state_before = tab.document.ledger.current_state_id;
 	if resets_search_results {
@@ -1075,7 +1088,7 @@ pub(super) fn handle_file_command(
 									active_visual,
 									scroll_y,
 									scroll_row_offset,
-									path.clone(),
+									Some(path.clone()),
 									Some(current_generation.path.clone()),
 									language_id,
 									Some(recovered_shadow),
@@ -1117,7 +1130,7 @@ pub(super) fn handle_file_command(
 								active_visual,
 								scroll_y,
 								scroll_row_offset,
-								path.clone(),
+								Some(path.clone()),
 								Some(path.clone()),
 								language_id,
 								None,
@@ -1145,7 +1158,7 @@ pub(super) fn handle_file_command(
 								active_visual,
 								scroll_y,
 								scroll_row_offset,
-								path,
+								Some(path),
 								None,
 								language_id,
 								None,
@@ -1295,6 +1308,56 @@ pub(super) fn handle_file_command(
 				*status_message = Some("No file to write".to_string());
 			}
 		}
+		EditorCommand::ReplaceDocument { text, language } => {
+			let language_id = match language.as_deref() {
+				Some(name_or_extension) => {
+					match ctx
+						.lang_registry
+						.resolve_supported_language_provider(name_or_extension)
+					{
+						Some(provider) => Some(provider.language_id()),
+						None => {
+							*status_message =
+								Some(format!("Unknown language: {}", name_or_extension));
+							return CommandEffect::render();
+						}
+					}
+				}
+				None => None,
+			};
+			match create_document_from_bytes(ctx.registry, text.into_bytes()) {
+				Ok((rid, leaf)) => {
+					if let Some(existing_shadow) = shadow.take() {
+						let _ = discard_shadow_session(&existing_shadow);
+					}
+					initialize_loaded_document(
+						ctx,
+						root_id,
+						file_path,
+						backing_path,
+						backing_device_id,
+						file_stamp,
+						active_language_id,
+						shadow,
+						ledger,
+						folds,
+						caret,
+						active_visual,
+						scroll_y,
+						scroll_row_offset,
+						None,
+						None,
+						language_id,
+						None,
+						rid,
+						leaf,
+						None,
+						semantic,
+					);
+				}
+				Err(msg) => *status_message = Some(msg),
+			}
+		}
 		_ => unreachable!(),
 	}
 
@@ -1349,7 +1412,7 @@ mod tests {
 		recv_view, spawn_test_engine, spawn_test_engine_with_csv, spawn_test_engine_with_input,
 		spawn_test_engine_with_markdown, spawn_test_engine_with_python_and_rune,
 		spawn_test_engine_with_rust, spawn_test_engine_with_rust_and_language_themes,
-		temp_test_path,
+		spawn_test_engine_with_sql, temp_test_path,
 	};
 	use crate::engine::undo::TextDelta;
 	use crate::engine::{EditorMode, GutterNumbering, MouseIntent, Theme};
@@ -1656,6 +1719,7 @@ mod tests {
 		let mut tab = fixture.editor_mut();
 		let mut ui = UiState {
 			status_message: None,
+			document_text_response: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -1753,6 +1817,7 @@ mod tests {
 		assert!(tab.document.ledger.is_dirty());
 		let mut ui = UiState {
 			status_message: None,
+			document_text_response: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -4040,6 +4105,147 @@ mod tests {
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
 		let _ = std::fs::remove_file(source_path);
+	}
+
+	/// Send `QueryDocumentText` and return the one-shot reply from whichever
+	/// viewport carries it. `send_cmd_and_recv` coalesces to the last viewport,
+	/// which can drop the one-shot field, so this scans every projection.
+	fn query_document_text(
+		tx_cmd: &crate::engine::CommandSender,
+		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+	) -> String {
+		use std::time::Duration;
+		while rx_view.try_recv().is_ok() {}
+		tx_cmd
+			.send(EditorCommand::QueryDocumentText)
+			.expect("send query");
+		tx_cmd.refresh_for_test().expect("send refresh");
+		for _ in 0..100 {
+			let view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after query");
+			if let Some(text) = view.document_text {
+				return text;
+			}
+		}
+		panic!("no viewport carried the document text reply");
+	}
+
+	#[test]
+	fn replace_document_sets_in_memory_text_language_and_round_trips() {
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+
+		let sql = "select 1;\nselect 2;\n";
+		let replaced = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: sql.to_string(),
+				language: Some("sql".to_string()),
+			},
+		);
+		let visible = pane_text(&replaced, replaced.focused_pane_id);
+		assert!(visible.contains("select 1;"), "visible text: {visible:?}");
+		assert!(visible.contains("select 2;"), "visible text: {visible:?}");
+		assert_eq!(query_document_text(&tx_cmd, &rx_view), sql);
+
+		// The caret sits at byte zero after a replace, so an insert lands at
+		// the document head; read the edited text back through the query.
+		send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::InsertText("-- edited\n".to_string()),
+		);
+		assert_eq!(
+			query_document_text(&tx_cmd, &rx_view),
+			format!("-- edited\n{sql}")
+		);
+
+		// An unknown language rejects the command and keeps the document.
+		let unknown = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: "clobbered".to_string(),
+				language: Some("doesnotexist".to_string()),
+			},
+		);
+		assert_eq!(
+			unknown.status_message.as_deref(),
+			Some("Unknown language: doesnotexist")
+		);
+		assert_eq!(
+			query_document_text(&tx_cmd, &rx_view),
+			format!("-- edited\n{sql}")
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	/// Load a file and wait until its source-backed bytes are DMA-inflated, so
+	/// `pane_text` can see them.
+	fn load_and_wait_for_dma(
+		tx_cmd: &crate::engine::CommandSender,
+		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		path: &str,
+	) -> crate::uast::Viewport {
+		use std::time::Duration;
+		let mut view = send_cmd_and_recv(tx_cmd, rx_view, EditorCommand::LoadFile(path.to_string()));
+		for _ in 0..50 {
+			if !view.dma_pending {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(20));
+			tx_cmd.refresh_for_test().expect("refresh");
+			view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after refresh");
+		}
+		assert!(!view.dma_pending, "DMA must complete");
+		view
+	}
+
+	#[test]
+	fn replace_document_clears_the_file_association() {
+		let scratch_path = temp_test_path("replace-document-clears-file").with_extension("txt");
+		std::fs::write(&scratch_path, "on disk\n").expect("write fixture");
+		let scratch_name = scratch_path.to_string_lossy().to_string();
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+
+		let loaded = load_and_wait_for_dma(&tx_cmd, &rx_view, &scratch_name);
+		let visible = pane_text(&loaded, loaded.focused_pane_id);
+		assert!(visible.contains("on disk"), "visible text: {visible:?}");
+
+		let replaced = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: "in memory\n".to_string(),
+				language: None,
+			},
+		);
+		let visible = pane_text(&replaced, replaced.focused_pane_id);
+		assert!(visible.contains("in memory"), "visible text: {visible:?}");
+
+		// The replaced document no longer names a file, so a plain write must
+		// refuse rather than clobber the previously loaded path.
+		let write = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::WriteFile);
+		assert_eq!(write.status_message.as_deref(), Some("No file name"));
+		assert_eq!(
+			std::fs::read_to_string(&scratch_path).expect("fixture intact"),
+			"on disk\n"
+		);
+
+		// The stale canonical-path claim is released: the same file can be
+		// loaded again into this session.
+		let reloaded = load_and_wait_for_dma(&tx_cmd, &rx_view, &scratch_name);
+		let visible = pane_text(&reloaded, reloaded.focused_pane_id);
+		assert!(visible.contains("on disk"), "visible text: {visible:?}");
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(&scratch_path);
 	}
 
 	#[test]

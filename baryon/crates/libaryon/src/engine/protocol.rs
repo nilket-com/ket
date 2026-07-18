@@ -211,6 +211,20 @@ pub enum EditorCommand {
 		kind: VisualKind,
 	},
 	LoadFile(String),
+	/// Atomically replace the focused document with in-memory text.
+	///
+	/// Clears the file association and resets undo history, selection, search
+	/// results, folds, caret, and scroll. `language` is a language id or
+	/// extension resolved as in [`EditorCommand::SetLanguage`]; `None` selects
+	/// plain text. An unknown language rejects the command, leaving the
+	/// current document untouched.
+	ReplaceDocument {
+		text: String,
+		language: Option<String>,
+	},
+	/// Request the focused document's full text, delivered once via
+	/// `Viewport::document_text` on the next projection.
+	QueryDocumentText,
 	ReloadFile {
 		force: bool,
 	},

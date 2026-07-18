@@ -253,6 +253,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 			.map(|_| "Replace? [y/n/a/q]".to_string())
 	};
 	let status_message = ui.status_message.take();
+	let document_text = ui.document_text_response.take();
 	let io_busy = ui.busy;
 	let should_quit = ui.pending_quit;
 	let yank_flash = ui.yank_flash;
@@ -306,6 +307,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		focused_pane_id: *focused_pane_id,
 		git_branch,
 		status_message,
+		document_text,
 		busy: viewport_is_busy(io_busy, semantic_busy),
 		should_quit,
 		search_pattern: search_pattern.clone(),

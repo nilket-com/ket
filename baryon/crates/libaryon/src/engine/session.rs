@@ -447,6 +447,23 @@ impl BufferStore {
 		);
 	}
 
+	/// Drop a buffer's canonical-path claim after its document stops
+	/// representing that file (e.g. `ReplaceDocument`), so the path can be
+	/// reopened into another buffer.
+	pub(crate) fn detach_path(&mut self, buffer_id: BufferId) {
+		let Some(buffer) = self.by_id.get_mut(&buffer_id) else {
+			return;
+		};
+		let Some(document) = buffer.text_mut() else {
+			return;
+		};
+		if let Some(path) = document.canonical_path.take()
+			&& self.by_path.get(&path) == Some(&buffer_id)
+		{
+			self.by_path.remove(&path);
+		}
+	}
+
 	pub(crate) fn remove(&mut self, id: BufferId) -> Option<Buffer> {
 		let buffer = self.by_id.remove(&id)?;
 		if let BufferContent::Text(document) = &buffer.content
@@ -1262,6 +1279,8 @@ impl CommonViewState {
 
 pub(crate) struct UiState {
 	pub(crate) status_message: Option<String>,
+	/// One-shot `QueryDocumentText` reply, drained into the next viewport.
+	pub(crate) document_text_response: Option<String>,
 	pub(crate) busy: bool,
 	pub(crate) pending_quit: bool,
 	pub(crate) mode_override: Option<EditorMode>,
@@ -3268,6 +3287,7 @@ impl EditorSession {
 			git_branch_cache: super::git::GitBranchCache::default(),
 			ui: UiState {
 				status_message: startup_status,
+				document_text_response: None,
 				busy: false,
 				pending_quit: false,
 				mode_override: None,

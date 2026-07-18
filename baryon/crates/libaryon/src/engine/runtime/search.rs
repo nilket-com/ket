@@ -1068,6 +1068,7 @@ mod tests {
 		let cursors_before = tab.cursor.snapshot();
 		let mut ui = UiState {
 			status_message: None,
+			document_text_response: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -1246,6 +1247,7 @@ mod tests {
 			);
 			let mut ui = UiState {
 				status_message: None,
+				document_text_response: None,
 				busy: false,
 				pending_quit: false,
 				mode_override: None,
@@ -1286,6 +1288,7 @@ mod tests {
 		let mut tab = fixture.editor_mut();
 		let mut ui = UiState {
 			status_message: None,
+			document_text_response: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,

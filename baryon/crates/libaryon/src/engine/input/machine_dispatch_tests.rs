@@ -80,6 +80,7 @@ fn test_viewport() -> Viewport {
 		git_branch: None,
 		git_refresh_seconds: 7,
 		status_message: None,
+		document_text: None,
 		busy: false,
 		should_quit: false,
 		search_pattern: None,
