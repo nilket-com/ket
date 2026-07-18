@@ -1,0 +1,177 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="1290" viewBox="0 0 1480 1290" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .bg      { fill: #0f1115; }
+      .title   { fill: #e6e9ef; font-size: 30px; font-weight: 700; }
+      .sub     { fill: #9aa3b2; font-size: 15px; }
+      .band-fe { fill: #171522; stroke: #4b3f6b; stroke-width: 1.5; rx: 14; }
+      .band-en { fill: #131a1d; stroke: #2f5a55; stroke-width: 1.5; rx: 14; }
+      .band-ex { fill: #1a1519; stroke: #5c3a3f; stroke-width: 1.5; rx: 14; }
+      .bandhdr { font-size: 17px; font-weight: 700; }
+      .hdr-fe  { fill: #a78bfa; }
+      .hdr-en  { fill: #5ccfc0; }
+      .hdr-ex  { fill: #f2777a; }
+      .note    { fill: #6f7788; font-size: 13px; }
+      .box-fe  { fill: #201c2e; stroke: #4a3f6a; stroke-width: 1.25; rx: 9; }
+      .grp     { fill: #101719; stroke: #2b4a47; stroke-width: 1.25; rx: 10; }
+      .btitle  { fill: #e6e9ef; font-size: 15px; font-weight: 700; }
+      .gtitle  { fill: #86c06c; font-size: 14.5px; font-weight: 700; letter-spacing: .05em; }
+      .mono    { font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace; font-size: 12.5px; fill: #8b93a3; }
+      .monok   { font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace; font-size: 12.5px; fill: #d6dae3; }
+      .body    { fill: #9aa3b2; font-size: 13px; }
+      .seam    { fill: #12181c; stroke: #f0b45f; stroke-width: 1.5; rx: 10; }
+      .seamt   { fill: #f0b45f; font-size: 16px; font-weight: 700; }
+      .flowT   { stroke: #5ccfc0; stroke-width: 2.5; fill: none; }
+      .flowV   { stroke: #a78bfa; stroke-width: 2.5; fill: none; }
+      .flowA   { stroke: #f0b45f; stroke-width: 2; fill: none; stroke-dasharray: 6 4; }
+      .flowD   { stroke: #f2777a; stroke-width: 2; fill: none; }
+      .elabel  { font-size: 12.5px; font-weight: 700; }
+      .thread  { fill: #f0b45f; font-size: 11.5px; font-weight: 700; letter-spacing: .04em; }
+    </style>
+    <marker id="aT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ccfc0"/></marker>
+    <marker id="aV" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
+    <marker id="aA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f0b45f"/></marker>
+    <marker id="aD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f2777a"/></marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1480" height="1290"/>
+
+  <text class="title" x="48" y="52">Baryon — Architecture</text>
+  <text class="sub"   x="48" y="80">Two crates, one seam. The engine runs on its own thread and has no terminal types in it at all.</text>
+
+  <!-- ===================== FRONTEND ===================== -->
+  <rect class="band-fe" x="40" y="106" width="1400" height="248"/>
+  <text class="bandhdr hdr-fe" x="64" y="136">crates/baryon — modal terminal frontend</text>
+  <text class="note" x="1416" y="136" text-anchor="end">ratatui · crossterm · ratatui-image</text>
+
+  <rect class="box-fe" x="64"  y="152" width="322" height="96"/>
+  <text class="btitle" x="80" y="176">Terminal I/O</text>
+  <text class="mono"   x="80" y="196">crossterm</text>
+  <text class="body"   x="80" y="216">keys · mouse · resize</text>
+  <text class="body"   x="80" y="236">bracketed paste</text>
+
+  <rect class="box-fe" x="402" y="152" width="322" height="96"/>
+  <text class="btitle" x="418" y="176">Frontend&lt;B&gt; — event loop</text>
+  <text class="mono"   x="418" y="196">ui/core.rs · ui/dispatch.rs</text>
+  <text class="body"   x="418" y="216">InputState state machine</text>
+  <text class="body"   x="418" y="236">Normal · Insert · Visual · Command</text>
+
+  <rect class="box-fe" x="740" y="152" width="356" height="96"/>
+  <text class="btitle" x="756" y="176">Registry tables</text>
+  <text class="mono"   x="756" y="196">KEYMAP · COMMANDS · BOOL/VALUE_OPTIONS</text>
+  <text class="body"   x="756" y="216">declarative statics — dispatch, completion,</text>
+  <text class="body"   x="756" y="236">did-you-mean, and help all read from these</text>
+
+  <rect class="box-fe" x="1112" y="152" width="304" height="96"/>
+  <text class="btitle" x="1128" y="176">Renderer</text>
+  <text class="mono"   x="1128" y="196">ui/draw.rs</text>
+  <text class="body"   x="1128" y="216">Viewport → ratatui cells</text>
+  <text class="body"   x="1128" y="236">one PaneViewport per pane</text>
+
+  <rect class="box-fe" x="64" y="262" width="1352" height="76"/>
+  <text class="thread" x="80" y="284">WORKER THREADS (frontend)</text>
+  <text class="body"   x="80" y="306">
+    <tspan class="monok">MinimapController</tspan> · <tspan class="monok">MarkdownPreviewController</tspan> · <tspan class="monok">DiffBridgeController</tspan> — each renders off-thread into a <tspan class="monok">ratatui_image::Protocol</tspan>
+  </text>
+  <text class="note" x="80" y="326">help.rs derives <tspan class="monok">:help</tspan> and <tspan class="monok">baryon --help</tspan> from the registry tables, so documentation cannot drift from behavior.</text>
+
+  <!-- ===================== SEAM ===================== -->
+  <path class="flowV" d="M 240 354 L 240 500" marker-end="url(#aV)"/>
+  <text class="elabel" fill="#a78bfa" x="256" y="408">EditorCommand</text>
+  <text class="mono"   x="256" y="426">~120 variants — Insert,</text>
+  <text class="mono"   x="256" y="443">SplitPane, SubstituteAll</text>
+
+  <path class="flowT" d="M 1240 500 L 1240 354" marker-end="url(#aT)"/>
+  <text class="elabel" fill="#5ccfc0" x="1224" y="408" text-anchor="end">Viewport</text>
+  <text class="mono"   x="1224" y="426" text-anchor="end">panes · RenderToken</text>
+  <text class="mono"   x="1224" y="443" text-anchor="end">tokens and RGB, never cells</text>
+
+  <rect class="seam" x="520" y="378" width="440" height="92"/>
+  <text class="seamt" x="740" y="408" text-anchor="middle">EngineHandle — the only seam</text>
+  <text class="mono"  x="740" y="432" text-anchor="middle">Sender&lt;EditorCommand&gt;   ↓        ↑   Receiver&lt;Viewport&gt;</text>
+  <text class="note"  x="740" y="454" text-anchor="middle">no ratatui, no crossterm, no terminal cell below this line</text>
+
+  <!-- ===================== ENGINE ===================== -->
+  <rect class="band-en" x="40" y="500" width="1400" height="604"/>
+  <text class="bandhdr hdr-en" x="64" y="530">crates/libaryon — headless engine</text>
+  <text class="thread" x="1416" y="530" text-anchor="end">ENGINE THREAD — run_engine() in engine/runtime.rs</text>
+
+  <!-- G1 -->
+  <rect class="grp" x="64" y="548" width="664" height="256"/>
+  <text class="gtitle" x="84" y="574">COMMAND LOOP &amp; SESSION STATE</text>
+  <text class="monok" x="84" y="602">engine/runtime.rs — run_engine()</text>
+  <text class="body"  x="84" y="620">recv → multicursor policy → domain handler → render_frame</text>
+  <text class="monok" x="84" y="648">engine/session.rs — EditorSession</text>
+  <text class="body"  x="84" y="666">LayoutNode → EditorPane → DocTab → DocumentSession</text>
+  <text class="body"  x="84" y="684">CursorState (up to 1024 carets) · ViewState · UiState</text>
+  <text class="monok" x="84" y="712">engine/undo.rs · engine/shadow.rs</text>
+  <text class="body"  x="84" y="730">UndoLedger — undo/redo stacks, StateId version stamps</text>
+  <text class="body"  x="84" y="748">ShadowSession — on-disk generations for huge files</text>
+  <text class="monok" x="84" y="776">engine/settings.rs · theme.rs · ui_colors.rs</text>
+  <text class="body"  x="84" y="794">THEME_SPECS · UI_COLOR_SPECS · UiPalette</text>
+
+  <!-- G2 -->
+  <rect class="grp" x="752" y="548" width="664" height="256"/>
+  <text class="gtitle" x="772" y="574">DOCUMENT MODEL — ECS + UAST</text>
+  <text class="monok" x="772" y="602">ecs/registry.rs — Arc&lt;UastRegistry&gt;</text>
+  <text class="body"  x="772" y="620">lock-free structure-of-arrays: kinds · spans · metrics · edges</text>
+  <text class="body"  x="772" y="638">PagedArray&lt;T&gt; columns · NodeId · resident-byte LRU</text>
+  <text class="monok" x="772" y="666">uast/topology.rs — TreeEdges</text>
+  <text class="body"  x="772" y="684">left-child / right-sibling, exactly 12 bytes per node</text>
+  <text class="body"  x="772" y="702">the leaf chain IS the text buffer — no rope, no piece table</text>
+  <text class="monok" x="772" y="730">engine/index.rs · uast/root_line_index.rs</text>
+  <text class="body"  x="772" y="748">SumTree (B+tree) · RootChildLineIndex (treap) · Group spine</text>
+  <text class="monok" x="772" y="776">uast/projection.rs — query_viewport</text>
+  <text class="body"  x="772" y="794">walks the tree into a flat Vec&lt;RenderToken&gt;</text>
+
+  <!-- G3 -->
+  <rect class="grp" x="64" y="824" width="664" height="256"/>
+  <text class="gtitle" x="84" y="850">LANGUAGE PIPELINE — one trait, eleven languages</text>
+  <text class="monok" x="84" y="878">engine/language.rs — LanguageProvider · LanguageRegistry</text>
+  <text class="body"  x="84" y="898">rust · python · bash · rune · sql · toml · markdown</text>
+  <text class="body"  x="84" y="916">html · json · csv · tsv   (+ an internal fs provider)</text>
+  <text class="monok" x="84" y="944">phase 1 — lexical_baseline()</text>
+  <text class="body"  x="84" y="962">synchronous, viewport bytes only, error-resilient</text>
+  <text class="monok" x="84" y="990">phase 2 — semantic_reactor() + parse_structural_topology()</text>
+  <text class="body"  x="84" y="1008">asynchronous, whole document, returns a GreenNode tree</text>
+  <text class="monok" x="84" y="1036">engine/structural_graft.rs — apply_graft()</text>
+  <text class="body"  x="84" y="1054">splices GreenNode into the LCRS, grouping wide sibling chains</text>
+
+  <!-- G4 -->
+  <rect class="grp" x="752" y="824" width="664" height="256"/>
+  <text class="gtitle" x="772" y="850">SPARSE VIRTUAL PROJECTION — STORAGE &amp; I/O</text>
+  <text class="monok" x="772" y="878">svp/pointer.rs — SvpPointer</text>
+  <text class="body"  x="772" y="898">{ lba, byte_length, device_id } — a node's on-disk extent</text>
+  <text class="monok" x="772" y="926">svp/resolver.rs — SvpResolver</text>
+  <text class="body"  x="772" y="944">two-lane priority queue → LinuxUringBackend | BlockingBackend</text>
+  <text class="body"  x="772" y="962">resolves cold extents into resident bytes on demand</text>
+  <text class="monok" x="772" y="990">svp/ingest.rs · svp/line_index.rs</text>
+  <text class="body"  x="772" y="1008">1 MiB extents · background newline scan · cached line index</text>
+  <text class="monok" x="772" y="1036">core/atomic_file.rs</text>
+  <text class="body"  x="772" y="1054">streaming save to temp file, then sparse rebind</text>
+
+  <!-- async back edges: the two lower groups feed the two upper ones -->
+  <path class="flowA" d="M 300 824 L 300 806" marker-end="url(#aA)"/>
+  <text class="mono" fill="#f0b45f" x="316" y="820">semantic response, applied by the loop</text>
+
+  <path class="flowA" d="M 988 824 L 988 806" marker-end="url(#aA)"/>
+  <text class="mono" fill="#f0b45f" x="1004" y="820">faulted-in extents fill the nodes</text>
+
+  <!-- ===================== EXTERNAL / THREADS ===================== -->
+  <rect class="band-ex" x="40" y="1122" width="1400" height="120"/>
+  <text class="bandhdr hdr-ex" x="64" y="1150">Off-thread work and the outside world</text>
+
+  <text class="thread" x="64" y="1178">ASYNC BACK-EDGES — why nothing blocks the keystroke</text>
+  <text class="body" x="64" y="1200">
+    <tspan class="monok">SemanticReactor</tspan> thread parses the whole document (rust-analyzer · ruff · sqlparser · rune) and returns highlights, diagnostics, and a
+  </text>
+  <text class="body" x="64" y="1220">
+    <tspan class="monok">GreenNode</tspan> tree. The <tspan class="monok">SvpResolver</tspan> backend faults cold extents in over <tspan class="monok">io_uring</tspan>. Both wake the loop via an <tspan class="monok">InternalRefresh</tspan> command, which re-renders.
+  </text>
+
+  <path class="flowD" d="M 1180 1122 L 1180 1080" marker-end="url(#aD)"/>
+  <text class="note" x="1416" y="1178" text-anchor="end">disk — source file · .baryon/ generations</text>
+  <text class="note" x="1416" y="1198" text-anchor="end">cached sparse line index</text>
+
+  <text class="note" x="48" y="1272">Adding a language means implementing one trait. Adding a command, setting, or keybinding means adding a row to a table. Neither touches the core engine.</text>
+</svg>

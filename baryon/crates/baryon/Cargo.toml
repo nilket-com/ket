@@ -1,0 +1,30 @@
+[package]
+name = "baryon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The terminal frontend for Baryon."
+
+[[bin]]
+name = "baryon"
+path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "Joel Bondurant"
+copyright = "2026, Joel Bondurant"
+license-file = ["../../LICENSE", "0"]
+assets = [
+	["target/release/baryon", "/usr/bin/baryon", "755"],
+]
+
+[dependencies]
+libaryon = { path = "../libaryon" }
+crossterm.workspace = true
+font8x8.workspace = true
+fontdb.workspace = true
+fontdue.workspace = true
+image.workspace = true
+pulldown-cmark.workspace = true
+ratatui.workspace = true
+ratatui-image.workspace = true
+regex-automata.workspace = true

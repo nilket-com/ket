@@ -1,0 +1,2711 @@
+use crate::core::{BufferId, Rgb};
+use crate::core::{
+	CursorPosition, DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, NodeByteOffset,
+	PaneId, PaneLocalCol, PaneLocalRow, PaneRect, TAB_SIZE, ViewId, ViewportId,
+};
+use crate::ecs::{NodeId, UastRegistry};
+use crate::engine::UiPalette;
+use crate::engine::{GutterNumbering, MinimapSnapshot, VisibleRow};
+use crate::svp::diagnostic::DiagnosticSpan;
+use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
+use crate::uast::kind::SemanticKind;
+pub use crate::uast::root_line_index::RootChildLineIndex;
+use crate::uast::root_line_index::{KnownLineMetric, RootChildLineIndexEntry};
+use std::sync::atomic::Ordering;
+
+#[derive(Debug)]
+pub struct RenderToken {
+	pub node_id: NodeId,
+	pub kind: SemanticKind,
+	pub text: Vec<u8>,
+	pub physical_byte_len: u32,
+	#[allow(dead_code)]
+	pub absolute_start_line: DocLine,
+	pub absolute_start_byte: DocByte,
+	pub is_virtual: bool,
+	pub is_folded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeCursorTarget {
+	pub node_id: NodeId,
+	pub node_byte: NodeByteOffset,
+	pub display_col: DocDisplayCol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeByteTarget {
+	pub node_id: NodeId,
+	pub node_start_byte: DocByte,
+	pub node_end_byte: DocByte,
+	pub node_byte: NodeByteOffset,
+	/// Absolute line at the start of `node_id`, when every preceding newline
+	/// metric encountered by the byte descent is exact.
+	pub node_start_line: Option<DocLine>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineLookupState {
+	Ready,
+	Pending {
+		indexed_through_line: DocLine,
+		indexed_through_byte: DocByte,
+	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeLineLookup {
+	Ready(NodeCursorTarget),
+	Pending {
+		indexed_through_line: DocLine,
+		indexed_through_byte: DocByte,
+		/// The cold extent whose bytes are required to finish the projection.
+		/// `None` means the background prefix scan has not reached the line yet.
+		required_node: Option<NodeId>,
+	},
+}
+
+impl NodeLineLookup {
+	pub fn ready(self) -> Option<NodeCursorTarget> {
+		match self {
+			Self::Ready(target) => Some(target),
+			Self::Pending { .. } => None,
+		}
+	}
+
+	pub fn required_node(self) -> Option<NodeId> {
+		match self {
+			Self::Pending { required_node, .. } => required_node,
+			Self::Ready(_) => None,
+		}
+	}
+}
+
+#[cfg(test)]
+impl std::ops::Deref for NodeLineLookup {
+	type Target = NodeCursorTarget;
+
+	fn deref(&self) -> &Self::Target {
+		match self {
+			Self::Ready(target) => target,
+			Self::Pending { .. } => panic!("line lookup should be ready"),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiffKind {
+	Added,
+	Removed,
+	Modified,
+	Moved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntraLineDiffKind {
+	Added,
+	Removed,
+	Modified,
+}
+
+// Sub-line, token-level change produced by Layer 3 of the diff engine. Fields
+// describe this pane's ranges; `partner_*` describe the matching ranges on the
+// opposing pane so the bridge layer can connect them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IntraLineDiff {
+	pub line: DocLine,
+	pub col_start: u32,
+	pub col_end: u32,
+	pub partner_line: DocLine,
+	pub partner_col_start: u32,
+	pub partner_col_end: u32,
+	pub kind: IntraLineDiffKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiffBlock {
+	pub range: (DocLine, DocLine),
+	pub kind: DiffKind,
+	pub partner_range: (DocLine, DocLine),
+	pub intra_line_diffs: Option<Vec<IntraLineDiff>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPair {
+	pub partner_pane_id: PaneId,
+	pub blocks: Vec<DiffBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownPreviewSnapshot {
+	pub source_buffer_id: BufferId,
+	pub source_view_id: ViewId,
+	pub serif: bool,
+	pub source_path: Option<String>,
+	pub source_text: String,
+	pub source_scroll_line: DocLine,
+	pub source_viewport_line_count: u32,
+}
+
+pub struct PaneViewport {
+	pub pane_id: PaneId,
+	/// Identity of the active view projected in this pane.
+	pub view_id: ViewId,
+	pub rect: PaneRect,
+	pub tokens: Vec<RenderToken>,
+	pub scroll_y: u64,
+	pub viewport_start_line: DocLine,
+	pub viewport_row_offset: DisplayRow,
+	pub viewport_line_count: u32,
+	pub wrap_enabled: bool,
+	pub visible_whitespace: bool,
+	pub gutter_numbering: Option<GutterNumbering>,
+	pub gutter_line_numbers: Vec<GutterLineNumber>,
+	pub cursor_lines: Vec<DocLine>,
+	pub cursor_pane_row: PaneLocalRow,
+	pub cursor_abs_pos: CursorPosition,
+	pub cursor_pane_col: PaneLocalCol,
+	pub cursor_abs_byte: DocByte,
+	pub cursor_line_start_byte: DocByte,
+	pub secondary_carets: Vec<ProjectedCaret>,
+	pub cursor_count: usize,
+	pub max_doc_line: DocLine,
+	pub file_name: Option<String>,
+	pub file_size: u64,
+	pub line_count: Option<u64>,
+	pub is_dirty: bool,
+	pub search_match_info: Option<String>,
+	pub global_start_byte: DocByte,
+	pub highlights: Vec<HighlightSpan>,
+	pub diagnostics: Vec<DiagnosticSpan>,
+	pub selection_ranges: Vec<(DocByte, DocByte)>,
+	pub yank_flash: Option<(DocByte, DocByte)>,
+	pub minimap: Option<MinimapSnapshot>,
+	pub markdown_preview: Option<MarkdownPreviewSnapshot>,
+	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],
+	pub render_rows: Vec<VisibleRow>,
+	pub visible_rows: Vec<VisibleRow>,
+	pub visible_line_starts: Vec<DocLine>,
+	pub dma_pending: bool,
+	pub language_label: &'static str,
+	pub is_file_browser: bool,
+	pub is_output_panel: bool,
+	pub is_git_status_panel: bool,
+	pub background_override: Option<Rgb>,
+	pub tabs: Vec<DocTabSummary>,
+	pub active_doctab_index: usize,
+	pub diff_pair: Option<DiffPair>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GutterLineNumber {
+	pub line: DocLine,
+	pub number: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectedCaret {
+	pub pane_row: PaneLocalRow,
+	pub pane_col: PaneLocalCol,
+	pub abs_pos: CursorPosition,
+	pub abs_byte: DocByte,
+}
+
+/// Immutable render projection sent from the engine to a frontend.
+pub struct Viewport {
+	pub viewport_id: ViewportId,
+	pub panes: Vec<PaneViewport>,
+	pub focused_pane_id: PaneId,
+	/// Checked-out branch for the focused document's repository, when available.
+	pub git_branch: Option<String>,
+	pub status_message: Option<String>,
+	/// Whether foreground I/O or semantic analysis is still in progress.
+	///
+	/// Frontends can animate this state without asking the engine to render
+	/// intermediate frames while it is blocked on synchronous work.
+	pub busy: bool,
+	pub should_quit: bool,
+	pub search_pattern: Option<String>,
+	pub search_case_insensitive: bool,
+	pub ui_palette: UiPalette,
+	pub git_refresh_seconds: u64,
+	pub confirm_prompt: Option<String>,
+	pub input: crate::engine::InputProjection,
+	pub language_completion_candidates: Vec<String>,
+}
+
+impl Viewport {
+	pub fn pane(&self, pane_id: PaneId) -> Option<&PaneViewport> {
+		self.panes.iter().find(|pane| pane.pane_id == pane_id)
+	}
+
+	pub fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneViewport> {
+		self.panes.iter_mut().find(|pane| pane.pane_id == pane_id)
+	}
+
+	/// Find a view that is active and therefore present in this projection.
+	pub fn view(&self, view_id: ViewId) -> Option<&PaneViewport> {
+		self.panes.iter().find(|pane| pane.view_id == view_id)
+	}
+
+	/// Find a mutable active-view projection by stable view identity.
+	pub fn view_mut(&mut self, view_id: ViewId) -> Option<&mut PaneViewport> {
+		self.panes.iter_mut().find(|pane| pane.view_id == view_id)
+	}
+
+	pub fn focused_pane(&self) -> Option<&PaneViewport> {
+		self.pane(self.focused_pane_id)
+	}
+
+	pub fn focused_pane_mut(&mut self) -> Option<&mut PaneViewport> {
+		self.pane_mut(self.focused_pane_id)
+	}
+}
+
+impl std::ops::Deref for Viewport {
+	type Target = PaneViewport;
+
+	fn deref(&self) -> &Self::Target {
+		self.focused_pane()
+			.expect("viewport must include the focused pane")
+	}
+}
+
+impl std::ops::DerefMut for Viewport {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		self.focused_pane_mut()
+			.expect("viewport must include the focused pane")
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocTabSummary {
+	/// Stable identity of this tab's view, including inactive tabs.
+	pub view_id: ViewId,
+	pub title: String,
+	pub is_dirty: bool,
+}
+
+const FOLDED_TOKEN_TEXT: &str = "❯❯❯";
+
+fn advance_visual_col(col: &mut DocDisplayCol, byte: u8) {
+	if byte == b'\t' {
+		*col = col.saturating_add(TAB_SIZE - (col.get() % TAB_SIZE));
+	} else {
+		*col = col.saturating_add(1);
+	}
+}
+
+fn line_start_offset(text: &[u8], target_line_in_node: DocLine) -> Option<usize> {
+	if target_line_in_node == DocLine::ZERO {
+		return Some(0);
+	}
+
+	let mut line = DocLine::ZERO;
+	for (i, &b) in text.iter().enumerate() {
+		if b == b'\n' {
+			line = line.saturating_add(1);
+			if line == target_line_in_node {
+				return Some(i + 1);
+			}
+		}
+	}
+
+	None
+}
+
+fn line_starts_at_node_end(text: &[u8], target_line_in_node: DocLine) -> bool {
+	matches!(
+		line_start_offset(text, target_line_in_node),
+		Some(offset) if offset == text.len()
+	)
+}
+
+fn offset_for_visual_col(
+	line_bytes: &[u8],
+	target_col: DocDisplayCol,
+) -> (NodeByteOffset, DocDisplayCol) {
+	let mut display_col = DocDisplayCol::ZERO;
+	let mut byte_offset = 0usize;
+
+	for (i, &b) in line_bytes.iter().enumerate() {
+		if b == b'\n' || display_col >= target_col {
+			break;
+		}
+
+		byte_offset = i + 1;
+		let mut next_col = display_col;
+		advance_visual_col(&mut next_col, b);
+
+		if target_col <= next_col {
+			return (NodeByteOffset::new(byte_offset as u32), next_col);
+		}
+
+		display_col = next_col;
+	}
+
+	(NodeByteOffset::new(byte_offset as u32), display_col)
+}
+
+fn visual_width_for_line_bytes(line_bytes: &[u8]) -> DocDisplayCol {
+	let mut display_col = DocDisplayCol::ZERO;
+	for &b in line_bytes {
+		if b == b'\n' {
+			break;
+		}
+		advance_visual_col(&mut display_col, b);
+	}
+	display_col
+}
+
+/// Opaque fold membership used by projection and coordinate lookup.
+///
+/// The hot walks are generic over this policy so a view-owned implementation is
+/// monomorphized without exposing its storage representation or paying dynamic
+/// dispatch per visited node.
+pub trait FoldPolicy {
+	fn is_folded(&self, node: NodeId) -> bool;
+
+	fn has_folds(&self) -> bool {
+		true
+	}
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoFolds;
+
+impl FoldPolicy for NoFolds {
+	#[inline(always)]
+	fn is_folded(&self, _node: NodeId) -> bool {
+		false
+	}
+
+	#[inline(always)]
+	fn has_folds(&self) -> bool {
+		false
+	}
+}
+
+pub trait UastProjection {
+	fn query_viewport<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		line_count: u32,
+	) -> Vec<RenderToken>;
+	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId>;
+	fn find_node_at_line_col<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+	) -> NodeLineLookup;
+	fn find_node_at_doc_byte<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_byte: DocByte,
+	) -> NodeByteTarget;
+	fn doc_byte_for_node_offset(
+		&self,
+		root: NodeId,
+		node: NodeId,
+		node_offset: NodeByteOffset,
+	) -> DocByte;
+	fn read_loaded_slice(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+	) -> Result<Vec<u8>, &'static str>;
+}
+
+/// An extent's line summary is known only when both its newline count has been
+/// inflated and its terminal-newline state has been observed. This is the single
+/// place that rule is applied, so no caller can build a half-known entry.
+fn known_line_metric(
+	newline_known: bool,
+	newline_count: u64,
+	ends_with_newline: Option<bool>,
+) -> Option<KnownLineMetric> {
+	if !newline_known {
+		return None;
+	}
+	ends_with_newline.map(|ends_with_newline| KnownLineMetric {
+		newline_count,
+		ends_with_newline,
+	})
+}
+
+impl UastRegistry {
+	fn indexed_terminal_newline(&self, node: NodeId) -> Option<bool> {
+		let mut leaf = node;
+		while let Some(child) = self.get_first_child(leaf) {
+			let mut last = child;
+			while let Some(next) = self.get_next_sibling(last) {
+				last = next;
+			}
+			leaf = last;
+		}
+		if let Some(bytes) = unsafe { (&*self.virtual_data[leaf.index()].get()).as_deref() } {
+			return Some(bytes.last() == Some(&b'\n'));
+		}
+		self.terminal_newline(leaf)
+	}
+
+	pub fn line_lookup_state(&self, root: NodeId, target_line: DocLine) -> LineLookupState {
+		let indexes = self.root_child_line_indexes.read().unwrap();
+		let Some(index) = indexes.get(&root) else {
+			return LineLookupState::Ready;
+		};
+		if index.known_prefix_len() == index.len() || target_line == DocLine::ZERO {
+			return LineLookupState::Ready;
+		}
+		let (indexed_through_line, indexed_through_byte, indexed_ends_with_newline) =
+			if index.known_prefix_len() == 0 {
+				(DocLine::ZERO, DocByte::ZERO, true)
+			} else {
+				let location = index
+					.known_prefix_boundary()
+					.expect("non-empty known prefix has a boundary");
+				(
+					location.end_line().expect("known prefix end"),
+					location.end_byte(),
+					location
+						.entry
+						.ends_with_newline()
+						.expect("known prefix terminal state"),
+				)
+			};
+		if target_line > indexed_through_line
+			|| (target_line == indexed_through_line && indexed_ends_with_newline)
+		{
+			LineLookupState::Pending {
+				indexed_through_line,
+				indexed_through_byte,
+			}
+		} else {
+			LineLookupState::Ready
+		}
+	}
+
+	pub(crate) fn build_root_child_line_index(&self, root: NodeId) -> RootChildLineIndex {
+		let _resident_read = self.resident_data_guard();
+		let mut entries = Vec::new();
+		let metrics_pending = self.exact_line_count(root).is_none();
+		let mut child = self.get_first_child(root);
+
+		while let Some(node) = child {
+			let metrics = unsafe { &*self.metrics[node.index()].get() };
+			let is_physical = unsafe { (*self.spans[node.index()].get()).is_some() };
+			let newline_known = !metrics_pending
+				|| !is_physical
+				|| self.metrics_inflated[node.index()].load(Ordering::Acquire);
+			entries.push(RootChildLineIndexEntry::new(
+				node,
+				metrics.byte_length,
+				known_line_metric(
+					newline_known,
+					metrics.newlines,
+					self.indexed_terminal_newline(node),
+				),
+			));
+			child = self.get_next_sibling(node);
+		}
+
+		RootChildLineIndex::from_entries(entries)
+	}
+
+	pub(crate) fn install_root_child_line_index(&self, root: NodeId) {
+		let index = self.build_root_child_line_index(root);
+		self.root_child_line_index_full_builds
+			.fetch_add(1, Ordering::Relaxed);
+		self.root_child_line_indexes
+			.write()
+			.unwrap()
+			.insert(root, index);
+	}
+
+	pub(crate) fn remove_root_child_line_index(&self, root: NodeId) {
+		self.root_child_line_indexes.write().unwrap().remove(&root);
+	}
+
+	pub(crate) fn refresh_installed_root_child_line_index_for_node(&self, node: NodeId) {
+		let root = self.document_root_for_node(node);
+		let mut root_child = node;
+		while let Some(parent) = unsafe { (*self.edges[root_child.index()].get()).parent } {
+			if parent == root {
+				break;
+			}
+			root_child = parent;
+		}
+
+		let _resident_read = self.resident_data_guard();
+		let mut indexes = self.root_child_line_indexes.write().unwrap();
+		let Some(index) = indexes.get_mut(&root) else {
+			return;
+		};
+		if !index.contains(root_child) {
+			// New direct children are normally reconciled from their existing
+			// predecessor by the mutation path. Keep a bounded fallback for a new
+			// tail by anchoring at the last indexed child.
+			let mut next_known = Some(root_child);
+			while let Some(candidate) = next_known {
+				if index.contains(candidate) {
+					break;
+				}
+				next_known = self.get_next_sibling(candidate);
+			}
+			let anchor = next_known
+				.and_then(|next| index.location_for_node(next))
+				.and_then(|next| {
+					next.rank
+						.checked_sub(1)
+						.and_then(|rank| index.node_at(rank))
+				});
+			self.reconcile_root_child_index_after_locked(root, anchor, index);
+			return;
+		}
+
+		index.update(self.root_child_index_entry(root, root_child));
+		if unsafe { (*self.edges[root_child.index()].get()).parent } == Some(root) {
+			self.reconcile_root_child_index_after_locked(root, Some(root_child), index);
+		}
+	}
+
+	pub(crate) fn reconcile_installed_root_child_line_index_after(
+		&self,
+		root: NodeId,
+		anchor: Option<NodeId>,
+	) {
+		let _resident_read = self.resident_data_guard();
+		let mut indexes = self.root_child_line_indexes.write().unwrap();
+		let Some(index) = indexes.get_mut(&root) else {
+			return;
+		};
+		self.reconcile_root_child_index_after_locked(root, anchor, index);
+	}
+
+	fn reconcile_root_child_index_after_locked(
+		&self,
+		root: NodeId,
+		anchor: Option<NodeId>,
+		index: &mut RootChildLineIndex,
+	) {
+		let mut anchor = anchor.filter(|node| index.contains(*node));
+		let mut desired = anchor
+			.and_then(|node| self.get_next_sibling(node))
+			.or_else(|| {
+				anchor
+					.is_none()
+					.then(|| self.get_first_child(root))
+					.flatten()
+			});
+
+		loop {
+			let indexed_next = match anchor {
+				Some(node) => index.successor(node),
+				None => index.first().map(|location| location.entry.node_id),
+			};
+			if desired == indexed_next {
+				break;
+			}
+			match desired {
+				Some(node) if index.contains(node) => {
+					let Some(stale) = indexed_next else {
+						break;
+					};
+					index.remove(stale);
+				}
+				Some(node) => {
+					index.insert_after(anchor, self.root_child_index_entry(root, node));
+					anchor = Some(node);
+					desired = self.get_next_sibling(node);
+				}
+				None => {
+					let Some(stale) = indexed_next else {
+						break;
+					};
+					index.remove(stale);
+				}
+			}
+		}
+	}
+
+	fn root_child_index_entry(&self, root: NodeId, node: NodeId) -> RootChildLineIndexEntry {
+		let metrics = unsafe { &*self.metrics[node.index()].get() };
+		let is_physical = unsafe { (*self.spans[node.index()].get()).is_some() };
+		let newline_known = self.exact_line_count(root).is_some()
+			|| !is_physical
+			|| self.metrics_inflated[node.index()].load(Ordering::Acquire);
+		RootChildLineIndexEntry::new(
+			node,
+			metrics.byte_length,
+			known_line_metric(
+				newline_known,
+				metrics.newlines,
+				self.indexed_terminal_newline(node),
+			),
+		)
+	}
+
+	pub(crate) fn update_root_child_line_index_metric(
+		&self,
+		node: NodeId,
+		_newline_count: u64,
+		_ends_with_newline: bool,
+	) {
+		let root = self.document_root_for_node(node);
+		let mut root_child = node;
+		while let Some(parent) = unsafe { (*self.edges[root_child.index()].get()).parent } {
+			if parent == root {
+				break;
+			}
+			root_child = parent;
+		}
+		let _resident_read = self.resident_data_guard();
+		let mut indexes = self.root_child_line_indexes.write().unwrap();
+		let Some(index) = indexes.get_mut(&root) else {
+			return;
+		};
+		index.update(self.root_child_index_entry(root, root_child));
+	}
+
+	pub(crate) fn next_node_skipping_children(&self, node: NodeId) -> Option<NodeId> {
+		unsafe {
+			let mut curr = node;
+			loop {
+				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
+					return Some(sib);
+				}
+				if let Some(parent) = (*self.edges[curr.index()].get()).parent {
+					curr = parent;
+				} else {
+					return None;
+				}
+			}
+		}
+	}
+
+	fn find_node_at_line_col_internal<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+		line_index: Option<&RootChildLineIndex>,
+	) -> NodeLineLookup {
+		let _resident_read = self.resident_data_guard();
+		let (mut curr, mut line_accumulator, _) =
+			seek_root_child_for_line(self, root, target_line, line_index);
+		let mut last_effective_leaf: Option<NodeCursorTarget> = None;
+		let mut target_line_visual_prefix = DocDisplayCol::ZERO;
+
+		while let Some(node) = curr {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && folds.is_folded(node);
+
+			let metrics = unsafe { &*self.metrics[idx].get() };
+
+			let node_end_line = line_accumulator.saturating_add(metrics.newlines);
+			let contains_target_line = target_line < node_end_line
+				|| (target_line == node_end_line
+					&& (!is_folded || self.next_node_skipping_children(node).is_none()));
+
+			if !contains_target_line {
+				// Branch metrics can lag behind their children until leaves inflate and
+				// propagate newline deltas upward. When that happens, descend instead of
+				// trusting the stale aggregate and skipping the whole subtree.
+				if has_children && !is_folded && !self.metrics_inflated[idx].load(Ordering::Acquire)
+				{
+					curr = self.get_first_child(node);
+					continue;
+				}
+
+				line_accumulator = node_end_line;
+				curr = self.next_node_skipping_children(node);
+				continue;
+			}
+
+			if has_children && !is_folded {
+				curr = self.get_first_child(node);
+				continue;
+			}
+
+			last_effective_leaf = Some(if is_folded {
+				NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::ZERO,
+					display_col: DocDisplayCol::ZERO,
+				}
+			} else {
+				let local_byte_length = u32::try_from(metrics.byte_length)
+					.expect("effective leaf length fits NodeByteOffset");
+				NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::new(local_byte_length),
+					display_col: DocDisplayCol::ZERO,
+				}
+			});
+
+			if contains_target_line {
+				if is_folded {
+					return NodeLineLookup::Ready(NodeCursorTarget {
+						node_id: node,
+						node_byte: NodeByteOffset::ZERO,
+						display_col: DocDisplayCol::ZERO,
+					});
+				}
+
+				let Some(bytes) = (unsafe { (&*self.virtual_data[idx].get()).as_deref() }) else {
+					if target_line == line_accumulator
+						&& target_col == DocDisplayCol::ZERO
+						&& target_line_visual_prefix == DocDisplayCol::ZERO
+					{
+						return NodeLineLookup::Ready(NodeCursorTarget {
+							node_id: node,
+							node_byte: NodeByteOffset::ZERO,
+							display_col: DocDisplayCol::ZERO,
+						});
+					}
+					// Interactive coordinate lookup must never read the backing store.
+					// The extent is known, but its node-local line offset is not. Publishing
+					// offset zero as a ready answer would let an edit land at the start of
+					// the extent before hydration completes.
+					return NodeLineLookup::Pending {
+						indexed_through_line: target_line,
+						indexed_through_byte: DocByte::ZERO,
+						required_node: Some(node),
+					};
+				};
+				let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
+				if line_starts_at_node_end(bytes, target_line_in_node)
+					&& self.next_node_skipping_children(node).is_some()
+				{
+					line_accumulator = node_end_line;
+					curr = self.next_node_skipping_children(node);
+					continue;
+				}
+				if let Some(line_start) = line_start_offset(bytes, target_line_in_node) {
+					let line_bytes = &bytes[line_start..];
+					let segment_width = visual_width_for_line_bytes(line_bytes);
+					let local_target_col =
+						target_col.saturating_sub(target_line_visual_prefix.get());
+					let line_ends_in_node = line_bytes.contains(&b'\n');
+					let line_start_line = if target_line_in_node > DocLine::ZERO {
+						target_line
+					} else {
+						line_accumulator
+					};
+
+					if !line_ends_in_node && local_target_col > segment_width {
+						target_line_visual_prefix = target_line_visual_prefix
+							.checked_add(segment_width.get())
+							.expect("DocDisplayCol addition overflow");
+						line_accumulator = line_start_line;
+						curr = self.next_node_skipping_children(node);
+						continue;
+					}
+
+					let (line_offset, clamped_col) =
+						offset_for_visual_col(line_bytes, local_target_col.min(segment_width));
+					return NodeLineLookup::Ready(NodeCursorTarget {
+						node_id: node,
+						node_byte: NodeByteOffset::new(line_start as u32 + line_offset.get()),
+						display_col: target_line_visual_prefix
+							.checked_add(clamped_col.get())
+							.expect("DocDisplayCol addition overflow"),
+					});
+				}
+
+				return NodeLineLookup::Ready(NodeCursorTarget {
+					node_id: node,
+					node_byte: NodeByteOffset::new(bytes.len() as u32),
+					display_col: DocDisplayCol::ZERO,
+				});
+			}
+
+			line_accumulator = node_end_line;
+			curr = self.next_node_skipping_children(node);
+		}
+
+		NodeLineLookup::Ready(last_effective_leaf.unwrap_or(NodeCursorTarget {
+			node_id: root,
+			node_byte: NodeByteOffset::ZERO,
+			display_col: DocDisplayCol::ZERO,
+		}))
+	}
+
+	fn find_node_at_doc_byte_internal<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_byte: DocByte,
+		max_nodes: Option<usize>,
+	) -> Result<(NodeByteTarget, usize), ()> {
+		let root_len = unsafe { (*self.metrics[root.index()].get()).byte_length };
+		let clamped_target = target_byte.get().min(root_len);
+		let mut root_metrics_exact = None;
+		let indexed_start = {
+			let indexes = self.root_child_line_indexes.read().unwrap();
+			indexes
+				.get(&root)
+				.and_then(|index| index.seek_byte(DocByte::new(clamped_target)))
+		};
+
+		// The root-child index remains an optional seek accelerator for very wide,
+		// flat sparse documents. It seeds the same topology descent rather than
+		// returning early, so indexed branches and post-graft nested trees share one
+		// byte/newline accumulation path.
+		let (mut curr, mut byte_accumulator, mut line_accumulator) = indexed_start
+			.map(|entry| {
+				(
+					Some(entry.entry.node_id),
+					entry.start_byte,
+					entry.start_line,
+				)
+			})
+			.unwrap_or((Some(root), DocByte::ZERO, Some(DocLine::ZERO)));
+		let mut last_effective_leaf: Option<NodeByteTarget> = None;
+		let mut visited = 0usize;
+
+		while let Some(node) = curr {
+			visited = visited.saturating_add(1);
+			if max_nodes.is_some_and(|maximum| visited > maximum) {
+				return Err(());
+			}
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && folds.is_folded(node);
+			let metrics = unsafe { &*self.metrics[idx].get() };
+			let node_start = byte_accumulator;
+			let node_end = node_start.saturating_add(metrics.byte_length);
+
+			if clamped_target < node_end.get()
+				|| (clamped_target == root_len && node_end.get() == root_len)
+			{
+				if has_children && !is_folded {
+					curr = self.get_first_child(node);
+					continue;
+				}
+
+				let local_byte_length = u32::try_from(metrics.byte_length)
+					.expect("effective leaf length fits NodeByteOffset");
+				let local_offset = if is_folded {
+					0
+				} else {
+					u32::try_from(clamped_target.saturating_sub(node_start.get()))
+						.expect("target offset fits effective leaf")
+				};
+				return Ok((
+					NodeByteTarget {
+						node_id: node,
+						node_start_byte: node_start,
+						node_end_byte: node_end,
+						node_byte: NodeByteOffset::new(local_offset.min(local_byte_length)),
+						node_start_line: line_accumulator,
+					},
+					visited,
+				));
+			}
+
+			let local_byte_length = u32::try_from(metrics.byte_length)
+				.expect("effective leaf length fits NodeByteOffset");
+			last_effective_leaf = Some(NodeByteTarget {
+				node_id: node,
+				node_start_byte: node_start,
+				node_end_byte: node_end,
+				node_byte: NodeByteOffset::new(if is_folded { 0 } else { local_byte_length }),
+				node_start_line: line_accumulator,
+			});
+
+			if let Some(line) = line_accumulator {
+				let locally_exact_leaf = !has_children
+					&& (unsafe { (*self.spans[idx].get()).is_none() }
+						|| self.metrics_inflated[idx].load(Ordering::Acquire));
+				let newline_metric_exact = locally_exact_leaf
+					|| *root_metrics_exact
+						.get_or_insert_with(|| self.exact_line_count(root).is_some());
+				line_accumulator =
+					newline_metric_exact.then(|| line.saturating_add(metrics.newlines));
+			}
+			byte_accumulator = node_end;
+			curr = self.next_node_skipping_children(node);
+		}
+
+		Ok((
+			last_effective_leaf.unwrap_or(NodeByteTarget {
+				node_id: root,
+				node_start_byte: DocByte::ZERO,
+				node_end_byte: DocByte::ZERO,
+				node_byte: NodeByteOffset::ZERO,
+				node_start_line: Some(DocLine::ZERO),
+			}),
+			visited,
+		))
+	}
+
+	pub(crate) fn find_node_at_line_col_raw(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+	) -> NodeLineLookup {
+		if let LineLookupState::Pending {
+			indexed_through_line,
+			indexed_through_byte,
+		} = self.line_lookup_state(root, target_line)
+		{
+			return NodeLineLookup::Pending {
+				indexed_through_line,
+				indexed_through_byte,
+				required_node: None,
+			};
+		}
+		self.find_node_at_line_col_internal(root, &NoFolds, target_line, target_col, None)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn find_node_at_line_col_raw_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+		line_index: &RootChildLineIndex,
+	) -> NodeLineLookup {
+		self.find_node_at_line_col_internal(
+			root,
+			&NoFolds,
+			target_line,
+			target_col,
+			Some(line_index),
+		)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn find_node_at_line_col_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+		line_index: &RootChildLineIndex,
+	) -> NodeCursorTarget {
+		self.find_node_at_line_col_internal(
+			root,
+			&NoFolds,
+			target_line,
+			target_col,
+			Some(line_index),
+		)
+		.ready()
+		.expect("test line lookup should be resident")
+	}
+
+	pub(crate) fn find_node_at_doc_byte_raw(
+		&self,
+		root: NodeId,
+		target_byte: DocByte,
+	) -> NodeByteTarget {
+		self.find_node_at_doc_byte_internal(root, &NoFolds, target_byte, None)
+			.map(|(target, _)| target)
+			.expect("unbounded byte lookup cannot exhaust a node budget")
+	}
+
+	#[allow(dead_code)] // Consumed by bounded native buffer operations.
+	pub(crate) fn find_node_at_doc_byte_raw_bounded(
+		&self,
+		root: NodeId,
+		target_byte: DocByte,
+		max_nodes: usize,
+	) -> Result<(NodeByteTarget, usize), ()> {
+		self.find_node_at_doc_byte_internal(root, &NoFolds, target_byte, Some(max_nodes))
+	}
+
+	pub fn for_each_loaded_slice_fragment<F>(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+		mut callback: F,
+	) -> Result<(), &'static str>
+	where
+		F: FnMut(&[u8]),
+	{
+		let _resident_read = self.resident_data_guard();
+		let root_len = self.get_total_bytes(root);
+		let start = start.get().min(root_len);
+		let end = end.get().min(root_len);
+		if start >= end {
+			return Ok(());
+		}
+
+		let start_target = self.find_node_at_doc_byte_raw(root, DocByte::new(start));
+		let mut visit = Some(start_target.node_id);
+		let mut local_start = start_target.node_byte.get() as usize;
+		let mut absolute_start = start_target.node_start_byte;
+		let mut remaining = (end - start) as usize;
+
+		while let Some(node) = visit {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			if has_children {
+				visit = self.get_first_child(node);
+				continue;
+			}
+
+			let node_len = unsafe { (*self.metrics[idx].get()).byte_length as usize };
+			if node_len > 0 && absolute_start.get() < end {
+				let bytes = unsafe {
+					if let Some(v_data) = &*self.virtual_data[idx].get() {
+						v_data.as_slice()
+					} else if (*self.spans[idx].get()).is_some() {
+						return Err("File still loading, cannot read slice yet");
+					} else {
+						return Err("Leaf text unavailable");
+					}
+				};
+
+				let take_len = (node_len.saturating_sub(local_start)).min(remaining);
+				if take_len > 0 {
+					callback(&bytes[local_start..local_start + take_len]);
+					remaining -= take_len;
+					if remaining == 0 {
+						return Ok(());
+					}
+				}
+			}
+
+			absolute_start = absolute_start.saturating_add(node_len as u64);
+			local_start = 0;
+			visit = self.get_next_node_in_walk(node);
+		}
+
+		if remaining == 0 {
+			Ok(())
+		} else {
+			Err("Slice exceeded loaded document bounds")
+		}
+	}
+}
+
+fn seek_root_child_for_line(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_line: DocLine,
+	line_index: Option<&RootChildLineIndex>,
+) -> (Option<NodeId>, DocLine, DocByte) {
+	fn seek(
+		line_index: &RootChildLineIndex,
+		target_line: DocLine,
+	) -> (Option<NodeId>, DocLine, DocByte) {
+		if line_index.is_empty() {
+			return (None, DocLine::ZERO, DocByte::ZERO);
+		}
+		if target_line == DocLine::ZERO {
+			let entry = line_index.first().expect("non-empty line index");
+			return (Some(entry.entry.node_id), DocLine::ZERO, entry.start_byte);
+		}
+
+		if line_index.known_prefix_len() == 0 {
+			return (None, DocLine::ZERO, DocByte::ZERO);
+		}
+		let last_known = line_index
+			.known_prefix_boundary()
+			.expect("known prefix boundary");
+		let last_known_line = last_known.end_line().expect("known prefix end");
+		let last_known_ends_with_newline = last_known
+			.entry
+			.ends_with_newline()
+			.expect("known prefix terminal state");
+		if line_index.known_prefix_len() < line_index.len()
+			&& (target_line > last_known_line
+				|| (target_line == last_known_line && last_known_ends_with_newline))
+		{
+			return (None, last_known_line, last_known.end_byte());
+		}
+
+		let entry = line_index
+			.seek_line(target_line)
+			.expect("ready target line has an indexed extent");
+		(
+			Some(entry.entry.node_id),
+			entry.start_line.expect("known prefix start"),
+			entry.start_byte,
+		)
+	}
+
+	if let Some(line_index) = line_index {
+		return seek(line_index, target_line);
+	}
+	let indexes = registry.root_child_line_indexes.read().unwrap();
+	let Some(line_index) = indexes.get(&root) else {
+		return (Some(root), DocLine::ZERO, DocByte::ZERO);
+	};
+	seek(line_index, target_line)
+}
+
+impl UastProjection for UastRegistry {
+	fn query_viewport<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		line_count: u32,
+	) -> Vec<RenderToken> {
+		let (start_node, start_line, start_byte) =
+			seek_root_child_for_line(self, root, target_line, None);
+		self.query_viewport_internal(
+			root,
+			folds,
+			target_line,
+			line_count,
+			start_node,
+			start_line,
+			start_byte,
+		)
+	}
+
+	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId> {
+		unsafe {
+			if let Some(child) = (*self.edges[node.index()].get()).first_child {
+				return Some(child);
+			}
+
+			let mut curr = node;
+			loop {
+				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
+					return Some(sib);
+				}
+				if let Some(p) = (*self.edges[curr.index()].get()).parent {
+					curr = p;
+				} else {
+					return None;
+				}
+			}
+		}
+	}
+
+	fn find_node_at_line_col<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+	) -> NodeLineLookup {
+		if let LineLookupState::Pending {
+			indexed_through_line,
+			indexed_through_byte,
+		} = self.line_lookup_state(root, target_line)
+		{
+			return NodeLineLookup::Pending {
+				indexed_through_line,
+				indexed_through_byte,
+				required_node: None,
+			};
+		}
+		self.find_node_at_line_col_internal(root, folds, target_line, target_col, None)
+	}
+
+	fn doc_byte_for_node_offset(
+		&self,
+		root: NodeId,
+		node: NodeId,
+		node_offset: NodeByteOffset,
+	) -> DocByte {
+		if let Some(start_byte) = {
+			let indexes = self.root_child_line_indexes.read().unwrap();
+			indexes
+				.get(&root)
+				.and_then(|index| index.location_for_node(node))
+				.map(|location| location.start_byte)
+		} {
+			return start_byte.saturating_add(u64::from(node_offset.get()));
+		}
+
+		let mut absolute = DocByte::new(u64::from(node_offset.get()));
+		let mut curr = node;
+
+		while curr != root {
+			let Some(parent) = (unsafe { (*self.edges[curr.index()].get()).parent }) else {
+				break;
+			};
+
+			let mut sibling = unsafe { (*self.edges[parent.index()].get()).first_child };
+			while let Some(candidate) = sibling {
+				if candidate == curr {
+					break;
+				}
+
+				let sibling_len = unsafe { (*self.metrics[candidate.index()].get()).byte_length };
+				absolute = absolute.saturating_add(sibling_len);
+				sibling = unsafe { (*self.edges[candidate.index()].get()).next_sibling };
+			}
+
+			curr = parent;
+		}
+
+		absolute
+	}
+
+	fn read_loaded_slice(
+		&self,
+		root: NodeId,
+		start: DocByte,
+		end: DocByte,
+	) -> Result<Vec<u8>, &'static str> {
+		let root_len = self.get_total_bytes(root);
+		let start = start.get().min(root_len);
+		let end = end.get().min(root_len);
+		let requested = usize::try_from(end.saturating_sub(start))
+			.map_err(|_| "Loaded slice does not fit this platform's address space")?;
+		if requested > 256 * 1024 * 1024 {
+			return Err("Loaded slice exceeds the bounded operation limit");
+		}
+		let mut result = Vec::new();
+		result
+			.try_reserve_exact(requested)
+			.map_err(|_| "Unable to reserve memory for loaded slice")?;
+		self.for_each_loaded_slice_fragment(
+			root,
+			DocByte::new(start),
+			DocByte::new(end),
+			|fragment| {
+				result.extend_from_slice(fragment);
+			},
+		)?;
+		Ok(result)
+	}
+
+	fn find_node_at_doc_byte<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_byte: DocByte,
+	) -> NodeByteTarget {
+		self.find_node_at_doc_byte_internal(root, folds, target_byte, None)
+			.map(|(target, _)| target)
+			.expect("unbounded byte lookup cannot exhaust a node budget")
+	}
+}
+
+impl UastRegistry {
+	#[cfg(test)]
+	pub(crate) fn query_viewport_with_root_line_index(
+		&self,
+		root: NodeId,
+		target_line: DocLine,
+		line_count: u32,
+		line_index: Option<&RootChildLineIndex>,
+	) -> Vec<RenderToken> {
+		let (curr, line_accumulator, byte_accumulator) =
+			seek_root_child_for_line(self, root, target_line, line_index);
+		self.query_viewport_internal(
+			root,
+			&NoFolds,
+			target_line,
+			line_count,
+			curr,
+			line_accumulator,
+			byte_accumulator,
+		)
+	}
+
+	fn query_viewport_internal<F: FoldPolicy + ?Sized>(
+		&self,
+		_root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		line_count: u32,
+		start_node: Option<NodeId>,
+		start_line: DocLine,
+		start_byte: DocByte,
+	) -> Vec<RenderToken> {
+		let mut tokens = Vec::new();
+		let (mut curr, mut line_accumulator, mut byte_accumulator) =
+			(start_node, start_line, start_byte);
+		let line_count = line_count.max(1);
+
+		// PHASE 1: DESCENT. Subtree metrics skip whole siblings, but the
+		// sibling search itself is linear unless an index supplied start_node.
+		let mut descent_node_visits = 0u64;
+		while let Some(node) = curr {
+			descent_node_visits = descent_node_visits.saturating_add(1);
+			let idx = node.index();
+			let m = unsafe { &*self.metrics[idx].get() };
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && folds.is_folded(node);
+			let node_end_line = line_accumulator.saturating_add(m.newlines);
+			let contains_target_line = target_line < node_end_line
+				|| (target_line == node_end_line
+					&& (!is_folded || self.next_node_skipping_children(node).is_none()));
+
+			if contains_target_line {
+				if !has_children && !is_folded && target_line == node_end_line {
+					let text = self.resolve_physical_bytes(node);
+					let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
+					if line_starts_at_node_end(&text, target_line_in_node)
+						&& self.next_node_skipping_children(node).is_some()
+					{
+						line_accumulator = node_end_line;
+						byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+						curr = self.next_node_skipping_children(node);
+						continue;
+					}
+				}
+				if has_children && !is_folded {
+					let first_child = unsafe { (*self.edges[idx].get()).first_child };
+					if let Some(child) = first_child {
+						curr = Some(child);
+						continue;
+					}
+				} else {
+					break;
+				}
+			} else {
+				line_accumulator = line_accumulator.saturating_add(m.newlines);
+				byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+				let next_sibling = unsafe { (*self.edges[idx].get()).next_sibling };
+				curr = next_sibling;
+			}
+		}
+		if descent_node_visits != 0 {
+			// Keep instrumentation off the per-node hot path: one relaxed update
+			// records the local work total after the seek completes.
+			self.viewport_descent_node_visits
+				.fetch_add(descent_node_visits, Ordering::Relaxed);
+		}
+
+		// PHASE 2: ITERATION
+		let mut collected_lines = 0;
+		let mut visit = curr;
+
+		while let Some(node) = visit {
+			let idx = node.index();
+			let has_children = unsafe { (*self.edges[idx].get()).first_child.is_some() };
+			let is_folded = has_children && folds.is_folded(node);
+
+			if has_children && !is_folded {
+				visit = self.get_first_child(node);
+				continue;
+			}
+
+			let m = unsafe { &*self.metrics[idx].get() };
+			let node_end_line = line_accumulator.saturating_add(m.newlines);
+
+			if m.byte_length == 0 && m.newlines == 0 {
+				visit = self.next_node_skipping_children(node);
+				continue;
+			}
+
+			let text = if is_folded {
+				FOLDED_TOKEN_TEXT.as_bytes().to_vec()
+			} else {
+				self.resolve_physical_bytes(node)
+			};
+
+			let is_virtual = is_folded || unsafe { (*self.spans[idx].get()).is_none() };
+			let kind = unsafe { *self.kinds[idx].get() };
+
+			let mut display_text = text.clone();
+			let mut token_start_line = line_accumulator;
+			let mut token_start_byte = byte_accumulator;
+
+			if is_folded && line_accumulator < target_line {
+				let skip_fold = node_end_line < target_line
+					|| (node_end_line == target_line
+						&& self.next_node_skipping_children(node).is_some());
+				if skip_fold {
+					line_accumulator = node_end_line;
+					byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+					visit = self.next_node_skipping_children(node);
+					continue;
+				}
+			}
+
+			if !is_folded && line_accumulator < target_line {
+				if line_accumulator + DocLineCount::new(m.newlines) < target_line {
+					line_accumulator = node_end_line;
+					byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+					visit = self.next_node_skipping_children(node);
+					continue;
+				}
+
+				if !text.is_empty() {
+					let to_skip = target_line.saturating_sub(line_accumulator.get());
+					let byte_offset = line_start_offset(&text, to_skip).unwrap_or(text.len());
+					if byte_offset == text.len() && self.next_node_skipping_children(node).is_some()
+					{
+						line_accumulator = node_end_line;
+						byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+						visit = self.next_node_skipping_children(node);
+						continue;
+					}
+					display_text = text.get(byte_offset..).unwrap_or(&[]).to_vec();
+					token_start_byte = token_start_byte.saturating_add(byte_offset as u64);
+				}
+				line_accumulator = target_line;
+				token_start_line = target_line;
+			}
+
+			tokens.push(RenderToken {
+				node_id: node,
+				kind,
+				text: display_text,
+				physical_byte_len: u32::try_from(m.byte_length)
+					.expect("render leaf length fits physical token"),
+				absolute_start_line: token_start_line,
+				absolute_start_byte: token_start_byte,
+				is_virtual,
+				is_folded,
+			});
+
+			if is_folded {
+				line_accumulator = line_accumulator.saturating_add(m.newlines);
+				collected_lines += 1;
+			} else if text.is_empty() {
+				line_accumulator = line_accumulator.saturating_add(m.newlines);
+				collected_lines += m.newlines;
+			} else {
+				let lines_shown = tokens
+					.last()
+					.unwrap()
+					.text
+					.iter()
+					.filter(|&&b| b == b'\n')
+					.count() as u64;
+				line_accumulator = line_accumulator.saturating_add(lines_shown);
+				collected_lines += lines_shown;
+			}
+
+			byte_accumulator = byte_accumulator.saturating_add(m.byte_length);
+
+			if collected_lines >= u64::from(line_count) {
+				break;
+			}
+
+			visit = self.next_node_skipping_children(node);
+		}
+
+		tokens
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{FoldPolicy, LineLookupState, NodeLineLookup, UastProjection};
+	use crate::core::{DocByte, DocDisplayCol, DocLine, NodeByteOffset, TAB_SIZE};
+	use crate::ecs::UastRegistry;
+	use crate::engine::MAX_SEMANTIC_BYTES;
+	use crate::engine::language::GreenNode;
+	use crate::engine::structural_graft::apply_graft;
+	use crate::svp::csv_parse::CSV_DELIMITER;
+	use crate::svp::csv_semantic::build_csv_topology;
+	use crate::svp::pointer::SvpPointer;
+	use crate::uast::UastMutation;
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+	use crate::uast::topology::TARGET_TREE_FANOUT;
+	use std::collections::HashSet;
+	use std::sync::Arc;
+	use std::sync::atomic::Ordering;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	impl FoldPolicy for HashSet<crate::ecs::NodeId> {
+		fn is_folded(&self, node: crate::ecs::NodeId) -> bool {
+			self.contains(&node)
+		}
+
+		fn has_folds(&self) -> bool {
+			!self.is_empty()
+		}
+	}
+
+	fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let newlines = text.bytes().filter(|&b| b == b'\n').count() as u64;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u64,
+				newlines,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: text.len() as u64,
+				newlines,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
+		}
+		(registry, root)
+	}
+
+	fn build_document_bytes(bytes: &[u8]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: bytes.len() as u64,
+				newlines,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: bytes.len() as u64,
+				newlines,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
+		}
+		(registry, root)
+	}
+
+	fn build_document_with_leaves(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let full_text: String = chunks.concat();
+		let newlines = full_text.bytes().filter(|&b| b == b'\n').count() as u64;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: full_text.len() as u64,
+				newlines,
+			},
+		);
+		for part in chunks {
+			let bytes = part.as_bytes();
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				None,
+				SpanMetrics {
+					byte_length: bytes.len() as u64,
+					newlines: bytes.iter().filter(|&&b| b == b'\n').count() as u64,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			unsafe {
+				*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
+			}
+		}
+		(registry, root)
+	}
+
+	fn csv_source(rows: usize) -> Vec<u8> {
+		const ROW: &[u8] = b"a,b,c\n";
+		let mut source = Vec::with_capacity(rows.saturating_mul(ROW.len()));
+		for _ in 0..rows {
+			source.extend_from_slice(ROW);
+		}
+		source
+	}
+
+	fn csv_source_with_size(rows: usize, total_bytes: usize) -> Vec<u8> {
+		assert!(rows > 0 && total_bytes >= rows * 2);
+		let payload_bytes = total_bytes - rows;
+		let payload_per_row = payload_bytes / rows;
+		let extra_payload_rows = payload_bytes % rows;
+		let mut source = Vec::with_capacity(total_bytes);
+		for row in 0..rows {
+			let payload = payload_per_row + usize::from(row < extra_payload_rows);
+			source.resize(source.len() + payload, b'a');
+			source.push(b'\n');
+		}
+		assert_eq!(source.len(), total_bytes);
+		source
+	}
+
+	fn build_indexed_flat_csv_document(rows: usize) -> (UastRegistry, crate::ecs::NodeId, Vec<u8>) {
+		const ROW: &[u8] = b"a,b,c\n";
+		let capacity = rows
+			.checked_mul(3)
+			.and_then(|count| count.checked_add(8))
+			.and_then(|count| u32::try_from(count).ok())
+			.expect("test document fits registry capacity");
+		let registry = UastRegistry::new(capacity);
+		let node_count = u32::try_from(rows + 1).expect("test row count fits u32");
+		let mut chunk = registry.reserve_chunk(node_count).expect("OOM");
+		let source = csv_source(rows);
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: source.len() as u64,
+				newlines: rows as u64,
+			},
+		);
+		for _ in 0..rows {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				None,
+				SpanMetrics {
+					byte_length: ROW.len() as u64,
+					newlines: 1,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			unsafe {
+				*registry.virtual_data[leaf.index()].get() = Some(ROW.to_vec());
+			}
+		}
+		registry.install_root_child_line_index(root);
+		(registry, root, source)
+	}
+
+	fn viewport_descent_visits(
+		registry: &UastRegistry,
+		root: crate::ecs::NodeId,
+		line: usize,
+	) -> u64 {
+		let before = registry.stats().viewport_descent_node_visits;
+		let tokens =
+			registry.query_viewport(root, &crate::uast::NoFolds, DocLine::new(line as u64), 1);
+		assert!(
+			!tokens.is_empty(),
+			"query for line {line} should render a token"
+		);
+		registry
+			.stats()
+			.viewport_descent_node_visits
+			.saturating_sub(before)
+	}
+
+	fn green_node_count(node: &GreenNode) -> usize {
+		1 + node.children.iter().map(green_node_count).sum::<usize>()
+	}
+
+	fn graft_topology(source: &[u8], green: &GreenNode) -> (UastRegistry, crate::ecs::NodeId) {
+		let capacity = green_node_count(green)
+			.checked_mul(2)
+			.and_then(|count| count.checked_add(4))
+			.and_then(|count| u32::try_from(count).ok())
+			.expect("test topology fits registry capacity");
+		let registry = UastRegistry::new(capacity);
+		let root = registry.alloc_node_internal();
+		unsafe {
+			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
+			*registry.metrics[root.index()].get() = SpanMetrics {
+				byte_length: source.len() as u64,
+				newlines: source.iter().filter(|&&byte| byte == b'\n').count() as u64,
+			};
+		}
+		apply_graft(&registry, root, green, source).expect("test graft is byte-identical");
+		(registry, root)
+	}
+
+	fn bounded_descent_visit_limit(item_count: usize) -> u64 {
+		let mut sibling_levels = 1usize;
+		let mut bounded_capacity = TARGET_TREE_FANOUT;
+		while item_count > bounded_capacity {
+			sibling_levels += 1;
+			bounded_capacity = bounded_capacity.saturating_mul(TARGET_TREE_FANOUT);
+		}
+		(sibling_levels * TARGET_TREE_FANOUT + 8) as u64
+	}
+
+	fn build_foldable_document() -> (UastRegistry, crate::ecs::NodeId, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(6).expect("OOM");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 17,
+				newlines: 3,
+			},
+		);
+		let head = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 5,
+				newlines: 1,
+			},
+		);
+		let folded = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 8,
+				newlines: 2,
+			},
+		);
+		let folded_a = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let folded_b = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 1,
+			},
+		);
+		let tail = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, head);
+		chunk.append_local_child(root, folded);
+		chunk.append_local_child(root, tail);
+		chunk.append_local_child(folded, folded_a);
+		chunk.append_local_child(folded, folded_b);
+		unsafe {
+			*registry.virtual_data[head.index()].get() = Some(b"head\n".to_vec());
+			*registry.virtual_data[folded_a.index()].get() = Some(b"one\n".to_vec());
+			*registry.virtual_data[folded_b.index()].get() = Some(b"two\n".to_vec());
+			*registry.virtual_data[tail.index()].get() = Some(b"tail".to_vec());
+		}
+		(registry, root, folded)
+	}
+
+	fn temp_test_path(name: &str) -> std::path::PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("time should move forward")
+			.as_nanos();
+		std::env::temp_dir().join(format!("baryon-{}-{}-{}", name, std::process::id(), nanos))
+	}
+
+	fn build_uninflated_physical_document(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let total_len = chunks.iter().map(|part| part.len() as u64).sum();
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_len,
+				newlines: 0,
+			},
+		);
+
+		let mut byte_offset = 0u64;
+		for part in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length: part.len() as u32,
+					device_id: 77,
+					head_trim: (byte_offset % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: part.len() as u64,
+					newlines: 0,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			byte_offset += part.len() as u64;
+		}
+
+		(registry, root)
+	}
+
+	fn build_exact_metric_physical_document(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
+		let mut chunk = registry
+			.reserve_chunk((chunks.len() + 1) as u32)
+			.expect("OOM");
+		let total_len = chunks.iter().map(|part| part.len() as u64).sum();
+		let total_newlines = chunks
+			.iter()
+			.map(|part| part.bytes().filter(|&b| b == b'\n').count() as u64)
+			.sum();
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: total_len,
+				newlines: total_newlines,
+			},
+		);
+
+		let mut byte_offset = 0u64;
+		for part in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: byte_offset / 512,
+					byte_length: part.len() as u32,
+					device_id: 77,
+					head_trim: (byte_offset % 512) as u16,
+				}),
+				SpanMetrics {
+					byte_length: part.len() as u64,
+					newlines: part.bytes().filter(|&b| b == b'\n').count() as u64,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			registry.set_terminal_newline(leaf, part.as_bytes().last() == Some(&b'\n'));
+			byte_offset += part.len() as u64;
+		}
+
+		(registry, root)
+	}
+
+	fn inflated_leaf_count(registry: &UastRegistry, root: crate::ecs::NodeId) -> usize {
+		let mut count = 0usize;
+		let mut leaf = registry.get_first_child(root);
+		while let Some(node) = leaf {
+			if registry.metrics_inflated[node.index()].load(Ordering::Acquire) {
+				count += 1;
+			}
+			leaf = registry.get_next_sibling(node);
+		}
+		count
+	}
+
+	fn visual_boundaries_for_line(text: &str) -> Vec<DocDisplayCol> {
+		let mut boundaries = vec![DocDisplayCol::ZERO];
+		let mut col = DocDisplayCol::ZERO;
+
+		for &b in text.as_bytes() {
+			if b == b'\n' {
+				break;
+			}
+			if b == b'\t' {
+				col = col
+					.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
+					.expect("DocDisplayCol addition overflow");
+			} else {
+				col = col.checked_add(1).expect("DocDisplayCol addition overflow");
+			}
+			boundaries.push(col);
+		}
+
+		boundaries
+	}
+
+	#[test]
+	fn find_node_at_line_col_clamps_to_visual_width_with_tabs() {
+		let (registry, root) = build_document("\t\tlet x = 1;\n");
+		let target = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::ZERO,
+			DocDisplayCol::new(30),
+		);
+
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::new(12));
+		assert_eq!(target.display_col, DocDisplayCol::new(18));
+	}
+
+	#[test]
+	fn find_node_at_line_col_only_returns_character_boundaries_for_tabbed_lines() {
+		let (registry, root) = build_document("\tfoo\n");
+		let valid_boundaries = visual_boundaries_for_line("\tfoo\n");
+
+		for clicked_col in 0..=7 {
+			let target = registry.find_node_at_line_col(
+				root,
+				&crate::uast::NoFolds,
+				DocLine::ZERO,
+				DocDisplayCol::new(clicked_col),
+			);
+			assert!(
+				valid_boundaries.contains(&target.display_col),
+				"clicked visual col {} landed at invalid boundary {:?}",
+				clicked_col,
+				target.display_col,
+			);
+		}
+	}
+
+	#[test]
+	fn find_node_at_line_col_snaps_tab_clicks_to_tab_boundary() {
+		let (registry, root) = build_document("\tfoo\n");
+
+		for clicked_col in 1..=3 {
+			let target = registry.find_node_at_line_col(
+				root,
+				&crate::uast::NoFolds,
+				DocLine::ZERO,
+				DocDisplayCol::new(clicked_col),
+			);
+			assert_eq!(target.node_byte, crate::core::NodeByteOffset::new(1));
+			assert_eq!(target.display_col, DocDisplayCol::new(4));
+		}
+	}
+
+	#[test]
+	fn find_node_at_line_col_only_returns_character_boundaries_for_mixed_indent() {
+		let (registry, root) = build_document(" \tfoo\n");
+		let valid_boundaries = visual_boundaries_for_line(" \tfoo\n");
+
+		for clicked_col in 0..=7 {
+			let target = registry.find_node_at_line_col(
+				root,
+				&crate::uast::NoFolds,
+				DocLine::ZERO,
+				DocDisplayCol::new(clicked_col),
+			);
+			assert!(
+				valid_boundaries.contains(&target.display_col),
+				"clicked visual col {} landed at invalid boundary {:?}",
+				clicked_col,
+				target.display_col,
+			);
+		}
+	}
+
+	#[test]
+	fn find_node_at_doc_byte_tracks_leaf_start_and_local_offset() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+
+		let at_start_of_second =
+			registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(5));
+		assert_eq!(at_start_of_second.node_start_byte, DocByte::new(5));
+		assert_eq!(at_start_of_second.node_end_byte, DocByte::new(9));
+		assert_eq!(
+			at_start_of_second.node_byte,
+			crate::core::NodeByteOffset::ZERO
+		);
+
+		let inside_third =
+			registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(11));
+		assert_eq!(inside_third.node_start_byte, DocByte::new(9));
+		assert_eq!(inside_third.node_end_byte, DocByte::new(14));
+		assert_eq!(inside_third.node_byte, crate::core::NodeByteOffset::new(2),);
+
+		let eof = registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(14));
+		assert_eq!(eof.node_start_byte, DocByte::new(9));
+		assert_eq!(eof.node_end_byte, DocByte::new(14));
+		assert_eq!(eof.node_byte, crate::core::NodeByteOffset::new(5));
+	}
+
+	#[test]
+	fn byte_descent_uses_the_right_leaf_and_line_at_a_boundary() {
+		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
+		registry.install_root_child_line_index(root);
+		let second = registry
+			.get_next_sibling(registry.get_first_child(root).expect("first leaf"))
+			.expect("second leaf");
+
+		let target = registry.find_node_at_doc_byte_raw(root, DocByte::new(5));
+
+		assert_eq!(target.node_id, second);
+		assert_eq!(target.node_byte, NodeByteOffset::ZERO);
+		assert_eq!(target.node_start_line, Some(DocLine::new(1)));
+	}
+
+	#[test]
+	fn byte_descent_accumulates_lines_through_grouped_graft_topology() {
+		const ROWS: usize = 128;
+		const TARGET_ROW: usize = 93;
+		const ROW: &[u8] = b"a,b,c\n";
+		let source = csv_source(ROWS);
+		let green = build_csv_topology(&source, CSV_DELIMITER);
+		let (registry, root) = graft_topology(&source, &green);
+		let byte = TARGET_ROW * ROW.len() + 2;
+
+		let target = registry.find_node_at_doc_byte_raw(root, DocByte::new(byte as u64));
+
+		assert_eq!(
+			target.node_start_line,
+			Some(DocLine::new(TARGET_ROW as u64))
+		);
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte),
+			DocByte::new(byte as u64)
+		);
+	}
+
+	#[test]
+	fn doc_byte_for_node_offset_reconstructs_absolute_positions() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+
+		let second = registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(6));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, second.node_id, second.node_byte),
+			DocByte::new(6)
+		);
+
+		let third = registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(11));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, third.node_id, third.node_byte),
+			DocByte::new(11)
+		);
+	}
+
+	#[test]
+	fn find_node_at_line_col_prefers_next_leaf_at_trailing_newline_boundary() {
+		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
+		let second = registry
+			.get_next_sibling(registry.get_first_child(root).unwrap())
+			.unwrap();
+
+		let target = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(1),
+			DocDisplayCol::ZERO,
+		);
+
+		assert_eq!(target.node_id, second);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+	}
+
+	#[test]
+	fn find_node_at_line_col_reaches_across_split_leaf_line_fragments() {
+		let (registry, root) = build_document_with_leaves(&["ab", "cd", "ef\n"]);
+
+		let target = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::ZERO,
+			DocDisplayCol::new(4),
+		);
+
+		assert_eq!(target.display_col, DocDisplayCol::new(4));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, target.node_id, target.node_byte),
+			DocByte::new(4)
+		);
+	}
+
+	#[test]
+	fn production_index_keeps_a_straddling_line_with_its_starting_extent() {
+		let chunks = ["aaa\nbbb", "ccc\n"];
+		let (registry, root) = build_exact_metric_physical_document(&chunks);
+		registry.install_root_child_line_index(root);
+		let first = registry.get_first_child(root).unwrap();
+		let second = registry.get_next_sibling(first).unwrap();
+
+		let cold = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(1),
+			DocDisplayCol::ZERO,
+		);
+		assert_eq!(
+			cold,
+			NodeLineLookup::Pending {
+				indexed_through_line: DocLine::new(1),
+				indexed_through_byte: DocByte::ZERO,
+				required_node: Some(first),
+			}
+		);
+		assert_ne!(Some(second), cold.required_node());
+
+		registry.hot_swap_virtual_data(first, chunks[0].as_bytes().to_vec());
+		let ready = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(1),
+			DocDisplayCol::ZERO,
+		);
+		assert_eq!(ready.node_id, first);
+		assert_eq!(ready.node_byte, NodeByteOffset::new(4));
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, ready.node_id, ready.node_byte),
+			DocByte::new(4)
+		);
+	}
+
+	#[test]
+	fn production_index_moves_a_newline_aligned_line_to_the_next_extent() {
+		let chunks = ["aaa\n", "bbb"];
+		let (registry, root) = build_exact_metric_physical_document(&chunks);
+		registry.install_root_child_line_index(root);
+		let first = registry.get_first_child(root).unwrap();
+		let second = registry.get_next_sibling(first).unwrap();
+
+		let target = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(1),
+			DocDisplayCol::ZERO,
+		);
+		assert_eq!(target.node_id, second);
+		assert_eq!(target.node_byte, NodeByteOffset::ZERO);
+	}
+
+	#[test]
+	fn query_viewport_starts_with_next_leaf_after_trailing_newline_boundary() {
+		let (registry, root) = build_document_with_leaves(&["head\n", "tail"]);
+		let second = registry
+			.get_next_sibling(registry.get_first_child(root).unwrap())
+			.unwrap();
+
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::new(1), 1);
+
+		assert_eq!(tokens.len(), 1);
+		assert_eq!(tokens[0].node_id, second);
+		assert_eq!(tokens[0].text, b"tail".to_vec());
+	}
+
+	#[test]
+	fn for_each_loaded_slice_fragment_yields_disjoint_leaf_slices_in_order() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+		let mut fragments = Vec::new();
+
+		registry
+			.for_each_loaded_slice_fragment(root, DocByte::new(3), DocByte::new(11), |fragment| {
+				fragments.push(String::from_utf8_lossy(fragment).into_owned());
+			})
+			.expect("slice fragments");
+
+		assert_eq!(
+			fragments,
+			vec!["ha".to_string(), "beta".to_string(), "ga".to_string()]
+		);
+	}
+
+	#[test]
+	fn read_loaded_slice_collects_fragments_from_the_fragment_visitor() {
+		let (registry, root) = build_document_with_leaves(&["alpha", "beta", "gamma"]);
+		let slice = registry
+			.read_loaded_slice(root, DocByte::new(3), DocByte::new(11))
+			.expect("loaded slice");
+
+		assert_eq!(String::from_utf8(slice).expect("utf8"), "habetaga");
+	}
+
+	#[test]
+	fn query_viewport_preserves_invalid_utf8_bytes_when_skipping_lines() {
+		let (registry, root) = build_document_bytes(b"aa\n\xffbb\ncc");
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::new(1), 2);
+
+		assert_eq!(tokens.len(), 1);
+		assert_eq!(tokens[0].absolute_start_byte, DocByte::new(3));
+		assert_eq!(tokens[0].text, b"\xffbb\ncc".to_vec());
+	}
+
+	#[test]
+	fn query_viewport_does_not_truncate_dense_leaf_streams() {
+		let mut parts = Vec::new();
+		for _ in 0..80 {
+			parts.push("a".to_string());
+		}
+		parts.push("\n".to_string());
+		for _ in 0..80 {
+			parts.push("b".to_string());
+		}
+		parts.push("\n".to_string());
+		for _ in 0..80 {
+			parts.push("c".to_string());
+		}
+		parts.push("\n".to_string());
+		parts.push("tail".to_string());
+
+		let expected = parts.concat().into_bytes();
+		let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+		let (registry, root) = build_document_with_leaves(&refs);
+
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::ZERO, 4);
+		let mut rendered = Vec::new();
+		for token in tokens {
+			rendered.extend_from_slice(&token.text);
+		}
+
+		assert_eq!(rendered, expected);
+	}
+
+	#[test]
+	fn root_line_indexed_query_viewport_matches_plain_query_near_eof() {
+		let parts = ["head\n", "alpha\nbeta\n", "gamma\ndelta\n", "tail"];
+		let (registry, root) = build_document_with_leaves(&parts);
+		let line_index = registry.build_root_child_line_index(root);
+
+		let plain = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::new(4), 2);
+		let indexed = registry.query_viewport_with_root_line_index(
+			root,
+			DocLine::new(4),
+			2,
+			Some(&line_index),
+		);
+
+		assert_eq!(indexed.len(), plain.len());
+		for (left, right) in indexed.iter().zip(plain.iter()) {
+			assert_eq!(left.node_id, right.node_id);
+			assert_eq!(left.text, right.text);
+			assert_eq!(left.absolute_start_line, right.absolute_start_line);
+			assert_eq!(left.absolute_start_byte, right.absolute_start_byte);
+		}
+	}
+
+	#[test]
+	fn root_index_and_grouped_csv_graft_both_bound_seek_cost() {
+		const ROWS: usize = 20_000;
+		let (registry, root, source) = build_indexed_flat_csv_document(ROWS);
+		let positions = [0, ROWS / 2, ROWS - 1];
+		let indexed_visits = positions.map(|line| viewport_descent_visits(&registry, root, line));
+
+		assert!(
+			indexed_visits.iter().all(|&visits| visits <= 2),
+			"the root index should make flat-tree seek work independent of position: {indexed_visits:?}"
+		);
+
+		let green = build_csv_topology(&source, CSV_DELIMITER);
+		assert_eq!(green.children.len(), ROWS, "one CSV row per sibling");
+		apply_graft(&registry, root, &green, &source).expect("test graft is byte-identical");
+		assert!(
+			!registry
+				.root_child_line_indexes
+				.read()
+				.unwrap()
+				.contains_key(&root),
+			"the current graft path removes the flat-root index"
+		);
+
+		let grafted_visits = positions.map(|line| viewport_descent_visits(&registry, root, line));
+		let visit_limit = bounded_descent_visit_limit(ROWS);
+		assert!(
+			grafted_visits.iter().all(|&visits| visits <= visit_limit),
+			"grafted seek should remain bounded by fan-out at every position: visits={grafted_visits:?}, limit={visit_limit}"
+		);
+	}
+
+	#[test]
+	fn grafted_descent_cost_tracks_fan_out_at_constant_document_size() {
+		const ROWS: usize = 4_096;
+		let source = csv_source(ROWS);
+		let (wide_registry, wide_root, _) = build_indexed_flat_csv_document(ROWS);
+		wide_registry.remove_root_child_line_index(wide_root);
+		let grouped = build_csv_topology(&source, CSV_DELIMITER);
+		let (grouped_registry, grouped_root) = graft_topology(&source, &grouped);
+
+		let wide_visits = viewport_descent_visits(&wide_registry, wide_root, ROWS - 1);
+		let grouped_visits = viewport_descent_visits(&grouped_registry, grouped_root, ROWS - 1);
+
+		assert!(
+			wide_visits >= ROWS as u64,
+			"wide topology should scan its row siblings: {wide_visits}"
+		);
+		assert!(
+			grouped_visits <= bounded_descent_visit_limit(ROWS),
+			"two bounded sibling levels should cap descent work: {grouped_visits}"
+		);
+		assert!(
+			wide_visits > grouped_visits.saturating_mul(20),
+			"same bytes and lines should be cheaper with bounded fan-out: wide={wide_visits}, grouped={grouped_visits}"
+		);
+	}
+
+	#[test]
+	fn grouped_graft_stays_exact_and_seekable_after_growing_past_semantic_limit() {
+		const ROWS: usize = TARGET_TREE_FANOUT * TARGET_TREE_FANOUT;
+		let before_len = usize::try_from(MAX_SEMANTIC_BYTES - 1).expect("limit fits usize");
+		let source = csv_source_with_size(ROWS, before_len);
+		let green = build_csv_topology(&source, CSV_DELIMITER);
+		let (registry, root) = graft_topology(&source, &green);
+		let module = registry.get_first_child(root).expect("grafted module");
+		let first_bucket = registry.get_first_child(module).expect("group bucket");
+		assert_eq!(
+			unsafe { *registry.kinds[first_bucket.index()].get() },
+			SemanticKind::Group
+		);
+		assert!(
+			!registry
+				.root_child_line_indexes
+				.read()
+				.unwrap()
+				.contains_key(&root),
+			"a complete-source graft should not retain the sparse extent treap"
+		);
+
+		let eof = registry.find_node_at_doc_byte(
+			root,
+			&crate::uast::NoFolds,
+			DocByte::new(before_len as u64),
+		);
+		registry.insert_text(eof.node_id, eof.node_byte.get(), b"x\n");
+
+		let after_len = MAX_SEMANTIC_BYTES + 1;
+		assert_eq!(registry.get_total_bytes(root), after_len);
+		assert_eq!(registry.get_total_bytes(module), after_len);
+		assert_eq!(registry.get_total_newlines(root), ROWS as u64 + 1);
+		assert_eq!(registry.exact_line_count(root), Some(ROWS as u64 + 2));
+		assert!(
+			!registry
+				.root_child_line_indexes
+				.read()
+				.unwrap()
+				.contains_key(&root),
+			"crossing the semantic limit must not require rebuilding a treap"
+		);
+
+		let last_content_line = ROWS;
+		let visits = viewport_descent_visits(&registry, root, last_content_line);
+		assert!(
+			visits <= bounded_descent_visit_limit(ROWS),
+			"the retained grouping spine should keep post-threshold seeks bounded: {visits}"
+		);
+		let rendered = registry
+			.query_viewport(
+				root,
+				&crate::uast::NoFolds,
+				DocLine::new(last_content_line as u64),
+				1,
+			)
+			.into_iter()
+			.flat_map(|token| token.text)
+			.collect::<Vec<_>>();
+		assert_eq!(rendered, b"x\n");
+	}
+
+	#[test]
+	#[ignore = "visit-count benchmark; run with --ignored --nocapture"]
+	fn benchmark_grouped_csv_graft_descent_visits() {
+		for rows in [4_096usize, 20_000, 200_000] {
+			let source = csv_source(rows);
+			let green = build_csv_topology(&source, CSV_DELIMITER);
+			let (registry, root) = graft_topology(&source, &green);
+			let positions = [0, rows / 2, rows - 1];
+			let visits = positions.map(|line| viewport_descent_visits(&registry, root, line));
+			let limit = bounded_descent_visit_limit(rows);
+			println!("grouped_csv rows={rows} visits={visits:?} limit={limit}");
+			assert!(
+				visits.iter().all(|&count| count <= limit),
+				"graft exceeded its bounded-fan-out visit budget"
+			);
+		}
+	}
+
+	#[test]
+	fn root_line_indexed_cursor_lookup_matches_plain_lookup_near_eof() {
+		let parts = ["head\n", "alpha\nbeta\n", "gamma\ndelta\n", "tail"];
+		let (registry, root) = build_document_with_leaves(&parts);
+		let line_index = registry.build_root_child_line_index(root);
+
+		let plain = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(4),
+			DocDisplayCol::new(2),
+		);
+		let indexed = registry.find_node_at_line_col_with_root_line_index(
+			root,
+			DocLine::new(4),
+			DocDisplayCol::new(2),
+			&line_index,
+		);
+
+		assert_eq!(indexed.node_id, plain.node_id);
+		assert_eq!(indexed.node_byte, plain.node_byte);
+		assert_eq!(indexed.display_col, plain.display_col);
+	}
+
+	#[test]
+	fn query_viewport_emits_fold_placeholder_and_skips_descendants() {
+		let (registry, root, folded) = build_foldable_document();
+		let folds = HashSet::from([folded]);
+
+		let tokens = registry.query_viewport(root, &folds, DocLine::ZERO, 4);
+
+		assert_eq!(tokens.len(), 3);
+		assert_eq!(tokens[0].text, b"head\n".to_vec());
+		assert!(tokens[1].is_folded);
+		assert_eq!(tokens[1].node_id, folded);
+		assert_eq!(tokens[1].text, "❯❯❯".as_bytes().to_vec());
+		assert_eq!(tokens[1].absolute_start_line, DocLine::new(1));
+		assert_eq!(tokens[1].absolute_start_byte, DocByte::new(5));
+		assert_eq!(tokens[1].physical_byte_len, 8);
+		assert_eq!(tokens[2].text, b"tail".to_vec());
+		assert_eq!(tokens[2].absolute_start_line, DocLine::new(3));
+		assert_eq!(tokens[2].absolute_start_byte, DocByte::new(13));
+	}
+
+	#[test]
+	fn query_viewport_starts_on_fold_placeholder_when_target_line_is_hidden() {
+		let (registry, root, folded) = build_foldable_document();
+		let folds = HashSet::from([folded]);
+
+		let tokens = registry.query_viewport(root, &folds, DocLine::new(2), 2);
+
+		assert_eq!(tokens.len(), 2);
+		assert_eq!(tokens[0].node_id, folded);
+		assert!(tokens[0].is_folded);
+		assert_eq!(tokens[0].absolute_start_line, DocLine::new(1));
+		assert_eq!(tokens[1].text, b"tail".to_vec());
+	}
+
+	#[test]
+	fn find_node_at_line_col_can_reach_the_line_after_a_folded_block() {
+		let (registry, root, folded) = build_foldable_document();
+		let folds = HashSet::from([folded]);
+
+		let target =
+			registry.find_node_at_line_col(root, &folds, DocLine::new(3), DocDisplayCol::ZERO);
+
+		assert_ne!(target.node_id, folded);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+	}
+
+	#[test]
+	fn find_node_at_line_col_returns_fold_boundary_for_hidden_lines() {
+		let (registry, root, folded) = build_foldable_document();
+		let folds = HashSet::from([folded]);
+
+		let target =
+			registry.find_node_at_line_col(root, &folds, DocLine::new(2), DocDisplayCol::new(3));
+		let raw = registry.find_node_at_line_col_raw(root, DocLine::new(2), DocDisplayCol::new(3));
+
+		assert_eq!(target.node_id, folded);
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+		assert_eq!(target.display_col, DocDisplayCol::ZERO);
+		assert_ne!(raw.node_id, folded);
+	}
+
+	#[test]
+	fn find_node_at_doc_byte_returns_fold_boundary_for_hidden_bytes() {
+		let (registry, root, folded) = build_foldable_document();
+		let folds = HashSet::from([folded]);
+
+		let target = registry.find_node_at_doc_byte(root, &folds, DocByte::new(10));
+		let raw = registry.find_node_at_doc_byte_raw(root, DocByte::new(10));
+
+		assert_eq!(target.node_id, folded);
+		assert_eq!(target.node_start_byte, DocByte::new(5));
+		assert_eq!(target.node_end_byte, DocByte::new(13));
+		assert_eq!(target.node_byte, crate::core::NodeByteOffset::ZERO);
+		assert_eq!(target.node_start_line, Some(DocLine::new(1)));
+		assert_ne!(raw.node_id, folded);
+		assert_eq!(raw.node_start_line, Some(DocLine::new(2)));
+	}
+
+	#[test]
+	fn cold_line_lookup_does_not_inflate_metrics_or_read_synchronously() {
+		let path = temp_test_path("projection-uninflated");
+		std::fs::write(&path, "aa\nbb\ncc\ndd").expect("write temp file");
+
+		let (registry, root) = build_uninflated_physical_document(&["aa\nbb\n", "cc\ndd"]);
+		registry
+			.register_device_path(77, path.to_str().expect("utf8 path"))
+			.expect("register backing");
+
+		let first_leaf = registry.get_first_child(root).expect("first leaf");
+		let second_leaf = registry.get_next_sibling(first_leaf).expect("second leaf");
+		registry.begin_metric_scan(root, first_leaf, second_leaf);
+		registry.install_root_child_line_index(root);
+		assert_eq!(
+			registry.line_lookup_state(root, DocLine::new(3)),
+			LineLookupState::Pending {
+				indexed_through_line: DocLine::ZERO,
+				indexed_through_byte: DocByte::ZERO,
+			}
+		);
+		let target = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(3),
+			DocDisplayCol::ZERO,
+		);
+
+		assert_eq!(
+			target,
+			NodeLineLookup::Pending {
+				indexed_through_line: DocLine::ZERO,
+				indexed_through_byte: DocByte::ZERO,
+				required_node: None,
+			}
+		);
+		assert_eq!(
+			unsafe { (*registry.metrics[root.index()].get()).newlines },
+			0
+		);
+		assert!(!registry.metrics_inflated[first_leaf.index()].load(Ordering::Acquire));
+		assert!(!registry.metrics_inflated[second_leaf.index()].load(Ordering::Acquire));
+
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn byte_descent_exposes_only_the_known_newline_prefix() {
+		let (registry, root) = build_uninflated_physical_document(&["aa\nbb\n", "cc\ndd"]);
+		let first_leaf = registry.get_first_child(root).expect("first leaf");
+		let second_leaf = registry.get_next_sibling(first_leaf).expect("second leaf");
+		registry.begin_metric_scan(root, first_leaf, second_leaf);
+		assert!(
+			!registry
+				.root_child_line_indexes
+				.read()
+				.unwrap()
+				.contains_key(&root)
+		);
+
+		let first_target = registry.find_node_at_doc_byte_raw(root, DocByte::new(2));
+		assert_eq!(first_target.node_id, first_leaf);
+		assert_eq!(first_target.node_start_line, Some(DocLine::ZERO));
+
+		let second_target = registry.find_node_at_doc_byte_raw(root, DocByte::new(7));
+		assert_eq!(second_target.node_id, second_leaf);
+		assert_eq!(second_target.node_start_line, None);
+
+		assert!(!registry.try_complete_metric_scan_block(root, first_leaf, 2, true));
+		let second_target = registry.find_node_at_doc_byte_raw(root, DocByte::new(7));
+		assert_eq!(second_target.node_start_line, Some(DocLine::new(2)));
+	}
+
+	#[test]
+	fn indexed_raw_line_lookup_near_eof_avoids_inflating_prefix_leaves() {
+		let path = temp_test_path("projection-indexed-raw");
+		let chunk_count = 128usize;
+		let mut chunks = vec!["x\n"; chunk_count];
+		chunks[chunk_count - 1] = "x";
+		let content = chunks.concat();
+		std::fs::write(&path, &content).expect("write temp file");
+
+		let (registry, root) = build_exact_metric_physical_document(&chunks);
+		registry
+			.register_device_path(77, path.to_str().expect("utf8 path"))
+			.expect("register backing");
+		let line_index = registry.build_root_child_line_index(root);
+		let target_line = DocLine::new((chunk_count - 2) as u64);
+
+		let target = registry.find_node_at_line_col_raw_with_root_line_index(
+			root,
+			target_line,
+			DocDisplayCol::ZERO,
+			&line_index,
+		);
+
+		assert_eq!(target.node_id.index(), chunk_count - 1);
+		assert!(
+			inflated_leaf_count(&registry, root) <= 2,
+			"indexed raw lookup should only inflate the target chunk and, at most, one boundary predecessor"
+		);
+
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn production_index_addresses_a_generated_200_gib_document_sparsely() {
+		use crate::svp::backing_store::{BackingStore, GeneratedBackingStore};
+
+		const GIB: u64 = 1024 * 1024 * 1024;
+		const EXTENT_BYTES: u64 = 1024 * 1024;
+		const EXTENT_COUNT: u64 = 200 * GIB / EXTENT_BYTES;
+		let document_bytes = EXTENT_BYTES * EXTENT_COUNT;
+		let lines_per_extent = EXTENT_BYTES / 2;
+		let document_newlines = lines_per_extent * EXTENT_COUNT;
+		let registry = UastRegistry::new(EXTENT_COUNT as u32 + 1);
+		let mut chunk = registry
+			.reserve_chunk(EXTENT_COUNT as u32 + 1)
+			.expect("registry chunk");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: document_bytes,
+				newlines: document_newlines,
+			},
+		);
+		for extent in 0..EXTENT_COUNT {
+			let offset = extent * EXTENT_BYTES;
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				Some(SvpPointer {
+					lba: offset / 512,
+					byte_length: EXTENT_BYTES as u32,
+					device_id: 99,
+					head_trim: 0,
+				}),
+				SpanMetrics {
+					byte_length: EXTENT_BYTES,
+					newlines: lines_per_extent,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			registry.metrics_inflated[leaf.index()].store(true, Ordering::Release);
+			registry.set_terminal_newline(leaf, true);
+		}
+		registry.install_root_child_line_index(root);
+
+		let generated = Arc::new(GeneratedBackingStore::new(document_bytes, |offset| {
+			if offset % 2 == 1 { b'\n' } else { b'x' }
+		}));
+		registry.register_backing_store(99, generated.clone());
+
+		for offset in [0, 4 * GIB - 1, 4 * GIB, 100 * GIB, document_bytes - 32] {
+			let mut marker = [0u8; 32];
+			generated
+				.read_exact_at(offset, &mut marker)
+				.expect("generated marker read");
+			assert_eq!(marker[0], if offset % 2 == 1 { b'\n' } else { b'x' });
+		}
+
+		let byte_target = document_bytes - 17;
+		let selected =
+			registry.find_node_at_doc_byte(root, &crate::uast::NoFolds, DocByte::new(byte_target));
+		assert_eq!(
+			selected.node_start_byte.get(),
+			(EXTENT_COUNT - 1) * EXTENT_BYTES
+		);
+		assert_eq!(
+			registry.doc_byte_for_node_offset(root, selected.node_id, selected.node_byte),
+			DocByte::new(byte_target)
+		);
+
+		let line_target = u64::from(u32::MAX) + 123;
+		let pending_line = registry.find_node_at_line_col(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::new(line_target),
+			DocDisplayCol::ZERO,
+		);
+		let expected_extent = line_target / lines_per_extent;
+		let required = pending_line
+			.required_node()
+			.expect("cold line lookup must request its selected extent");
+		assert_eq!(required.index() as u64, expected_extent + 1);
+		let bytes = registry
+			.read_node_bytes_sync(required)
+			.expect("hydrate selected generated extent");
+		registry.hot_swap_virtual_data(required, bytes);
+		let index_builds = registry
+			.root_child_line_index_full_builds
+			.load(Ordering::Acquire);
+		registry.refresh_installed_root_child_line_index_for_node(required);
+		assert_eq!(
+			registry
+				.root_child_line_index_full_builds
+				.load(Ordering::Acquire),
+			index_builds,
+			"refreshing one extent in a 200 GiB index must not rebuild all siblings"
+		);
+		let selected_line = registry
+			.find_node_at_line_col(
+				root,
+				&crate::uast::NoFolds,
+				DocLine::new(line_target),
+				DocDisplayCol::ZERO,
+			)
+			.ready()
+			.expect("hydrated line lookup");
+		assert_eq!(selected_line.node_id.index() as u64, expected_extent + 1);
+		assert!(generated.bytes_read() <= 16 * 1024 * 1024);
+		assert_eq!(registry.stats().allocated_nodes, EXTENT_COUNT + 1);
+	}
+}

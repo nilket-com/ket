@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="1360" viewBox="0 0 1480 1360" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .bg     { fill: #0f1115; }
+      .title  { fill: #e6e9ef; font-size: 30px; font-weight: 700; }
+      .sub    { fill: #9aa3b2; font-size: 15px; }
+      .note   { fill: #6f7788; font-size: 13px; }
+      .body   { fill: #9aa3b2; font-size: 13px; }
+      .mono   { font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace; font-size: 12.5px; fill: #8b93a3; }
+      .monok  { font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace; font-size: 12.5px; fill: #d6dae3; }
+      .btitle { fill: #e6e9ef; font-size: 16px; font-weight: 700; }
+      .tag    { font-size: 11px; font-weight: 700; letter-spacing: .08em; }
+
+      .src    { fill: #1d1a26; stroke: #6b5ba8; stroke-width: 1.4; rx: 10; }
+      .tsrc   { fill: #a78bfa; }
+      .trunk  { fill: #121c1a; stroke: #4a9c8e; stroke-width: 2; rx: 14; }
+      .ttrunk { fill: #5ccfc0; }
+      .der    { fill: #1a1c14; stroke: #7f9c4e; stroke-width: 1.4; rx: 10; }
+      .tder   { fill: #9dc46a; }
+      .out    { fill: #241d16; stroke: #b08040; stroke-width: 1.4; rx: 10; }
+      .tout   { fill: #f0b45f; }
+      .neg    { fill: #1e1518; stroke: #7a4148; stroke-width: 1.4; rx: 10; }
+      .tneg   { fill: #f2777a; }
+
+      .eV { stroke: #a78bfa; stroke-width: 2.5; fill: none; }
+      .eT { stroke: #5ccfc0; stroke-width: 2.5; fill: none; }
+      .eG { stroke: #9dc46a; stroke-width: 2.5; fill: none; }
+      .eO { stroke: #f0b45f; stroke-width: 2.5; fill: none; }
+      .elab  { font-size: 12.5px; font-weight: 700; }
+      .elabm { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; fill: #7d8595; }
+
+      .tw   { stroke: #5ccfc0; stroke-width: 1.4; fill: none; opacity: .75; }
+      .tn   { fill: #5ccfc0; }
+      .tnl  { fill: #2f5a55; stroke: #5ccfc0; stroke-width: 1.2; }
+    </style>
+    <marker id="mV" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
+    <marker id="mT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ccfc0"/></marker>
+    <marker id="mG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#9dc46a"/></marker>
+    <marker id="mO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f0b45f"/></marker>
+
+    <g id="minitree">
+      <path class="tw" d="M0,0 L-26,26 M0,0 L26,26 M-26,26 L-40,52 M-26,26 L-12,52 M26,26 L12,52 M26,26 L40,52"/>
+      <circle class="tn" cx="0" cy="0" r="5.5"/>
+      <circle class="tnl" cx="-26" cy="26" r="4.5"/>
+      <circle class="tnl" cx="26"  cy="26" r="4.5"/>
+      <circle class="tnl" cx="-40" cy="52" r="3.5"/>
+      <circle class="tnl" cx="-12" cy="52" r="3.5"/>
+      <circle class="tnl" cx="12"  cy="52" r="3.5"/>
+      <circle class="tnl" cx="40"  cy="52" r="3.5"/>
+    </g>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1480" height="1360"/>
+
+  <text class="title" x="48" y="52">Baryon — The Forest of Trees</text>
+  <text class="sub"   x="48" y="80">One trunk holds every document. Everything else either grows into it, or is derived from it.</text>
+
+  <!-- ============ ROW A: TREES THAT GROW INTO THE TRUNK ============ -->
+  <rect class="src" x="60"  y="112" width="430" height="188"/>
+  <text class="tag tsrc" x="78" y="136">DIRECTORY TREE</text>
+  <text class="btitle"   x="78" y="160">The file browser — <tspan class="monok" font-size="14">:tree</tspan></text>
+  <text class="mono"     x="78" y="182">engine/file_browser.rs</text>
+  <text class="body"     x="78" y="206">The real filesystem tree, expanded lazily.</text>
+  <text class="body"     x="78" y="226">State is just a root path plus a set of</text>
+  <text class="body"     x="78" y="246">expanded directories; <tspan class="monok">scan_directory()</tspan></text>
+  <text class="body"     x="78" y="266">recurses only into those, flattening the</text>
+  <text class="body"     x="78" y="286">result into depth-tagged rows.</text>
+
+  <rect class="src" x="525" y="112" width="430" height="188"/>
+  <text class="tag tsrc" x="543" y="136">LANGUAGE SYNTAX TREES</text>
+  <text class="btitle"   x="543" y="160">Eleven languages, one shape</text>
+  <text class="mono"     x="543" y="182">engine/language.rs — GreenNode</text>
+  <text class="body"     x="543" y="206">rowan red/green (rust-analyzer) · ruff AST</text>
+  <text class="body"     x="543" y="226">(python) · rune · sqlparser · RangeNode</text>
+  <text class="body"     x="543" y="246">Those that parse structurally normalize to:</text>
+  <text class="monok"    x="543" y="268">GreenNode { kind, byte_len, children }</text>
+  <text class="note"     x="543" y="288">json, html, markdown and bash stay lexical: no tree.</text>
+
+  <rect class="src" x="990" y="112" width="430" height="188"/>
+  <text class="tag tsrc" x="1008" y="136">PANE SPLIT TREE</text>
+  <text class="btitle"   x="1008" y="160">Window layout</text>
+  <text class="mono"     x="1008" y="182">engine/session.rs — LayoutNode</text>
+  <text class="monok"    x="1008" y="206">Split { direction, children, ratios }</text>
+  <text class="monok"    x="1008" y="226">Leaf(LayoutLeaf { pane_id, EditorPane })</text>
+  <text class="body"     x="1008" y="250">A leaf owns tabs; each tab owns a document.</text>
+  <text class="body"     x="1008" y="270">Flattened to a list of rects for rendering,</text>
+  <text class="body"     x="1008" y="290">and recursed for divider resize.</text>
+
+  <!-- edges A -> trunk: three trees feed the arena -->
+  <path class="eV" d="M 275 300 L 275 382" marker-end="url(#mV)"/>
+  <text class="elab" fill="#a78bfa" x="291" y="344">opens a document</text>
+
+  <path class="eV" d="M 740 300 L 740 382" marker-end="url(#mV)"/>
+  <text class="elab"  fill="#a78bfa" x="756" y="326">apply_graft()</text>
+  <text class="elabm" x="756" y="344">deepens the flat chain, and groups wide fan-out</text>
+
+  <path class="eV" d="M 1205 300 L 1205 382" marker-end="url(#mV)"/>
+  <text class="elab" fill="#a78bfa" x="1189" y="344" text-anchor="end">names a root</text>
+
+  <!-- ============ TRUNK ============ -->
+  <rect class="trunk" x="60" y="382" width="1360" height="286"/>
+  <text class="tag ttrunk" x="82" y="410">THE TRUNK</text>
+  <text class="btitle" x="82" y="436" font-size="19">UastRegistry — one arena, many roots</text>
+  <text class="mono"   x="82" y="458">ecs/registry.rs · uast/topology.rs</text>
+
+  <text class="monok" x="82" y="492">TreeEdges { parent, first_child, next_sibling }</text>
+  <text class="body"  x="82" y="512">A left-child / right-sibling tree: every node's topology is</text>
+  <text class="body"  x="82" y="532">exactly 12 bytes, whatever its fan-out.</text>
+
+  <text class="monok" x="82" y="564">SemanticKind</text>
+  <text class="body"  x="82" y="584">RelationalTable (a scope) · RelationalRow (a statement) · Token (a leaf)</text>
+  <text class="body"  x="82" y="602">Group — a synthetic spine node, bounding sibling fan-out at 64</text>
+
+  <text class="body"  x="82" y="626">A leaf holds <tspan class="monok">SvpPointer</tspan> if cold on disk, or resident bytes if hot.</text>
+  <text class="ttrunk" x="82" y="650" font-size="14" font-weight="700">The leaf chain IS the text buffer. There is no rope and no piece table.</text>
+
+  <!-- the forest glyphs -->
+  <use href="#minitree" x="920"  y="500"/>
+  <use href="#minitree" x="1105" y="500"/>
+  <use href="#minitree" x="1290" y="500"/>
+  <text class="mono" x="920"  y="578" text-anchor="middle">src/main.rs</text>
+  <text class="mono" x="1105" y="578" text-anchor="middle">README.md</text>
+  <text class="mono" x="1290" y="578" text-anchor="middle">:tree browser</text>
+  <text class="note" x="1105" y="600" text-anchor="middle">One shared <tspan class="monok">Arc&lt;UastRegistry&gt;</tspan>. Each document's <tspan class="monok">root_id</tspan></text>
+  <text class="note" x="1105" y="618" text-anchor="middle">is one tree in it — the arena is literally a forest.</text>
+  <text class="note" x="1105" y="638" text-anchor="middle">Even the file browser is materialized as a document,</text>
+  <text class="note" x="1105" y="656" text-anchor="middle">so it gets cursor movement and search for free.</text>
+
+  <!-- edges trunk -> derived -->
+  <path class="eG" d="M 275 668 L 275 736" marker-end="url(#mG)"/>
+  <text class="elab" fill="#9dc46a" x="291" y="700">built from the leaf chain</text>
+
+  <path class="eG" d="M 740 668 L 740 736" marker-end="url(#mG)"/>
+  <text class="elab" fill="#9dc46a" x="756" y="700">seeks flat documents</text>
+
+  <path class="eG" d="M 1205 668 L 1205 736" marker-end="url(#mG)"/>
+  <text class="elab" fill="#9dc46a" x="1221" y="700">marks nodes in place</text>
+
+  <!-- ============ ROW C: DERIVED ============ -->
+  <rect class="der" x="60"  y="736" width="430" height="218"/>
+  <text class="tag tder" x="78" y="760">B+TREE</text>
+  <text class="btitle"   x="78" y="784">SumTree — the line index</text>
+  <text class="mono"     x="78" y="806">engine/index.rs</text>
+  <text class="monok"    x="78" y="830">Interior { children: [u32; 64], summary }</text>
+  <text class="monok"    x="78" y="850">Leaf { entries: [LineMetric; 64], next_leaf }</text>
+  <text class="body"     x="78" y="874">Branching factor 64, leaves threaded into a</text>
+  <text class="body"     x="78" y="894">list. Each node caches a monoid summary of</text>
+  <text class="body"     x="78" y="914">bytes, doc lines and wrapped visual rows, so</text>
+  <text class="body"     x="78" y="934">line ↔ byte ↔ row costs O(log n).</text>
+
+  <rect class="der" x="525" y="736" width="430" height="218"/>
+  <text class="tag tder" x="543" y="760">TREAP — FLAT DOCUMENTS ONLY</text>
+  <text class="btitle"   x="543" y="784">RootChildLineIndex</text>
+  <text class="mono"     x="543" y="806">uast/root_line_index.rs</text>
+  <text class="body"     x="543" y="830">A randomized BST ordered by rank, not key: the</text>
+  <text class="body"     x="543" y="850">priority is a hash of the NodeId. One entry per</text>
+  <text class="body"     x="543" y="870">1 MiB extent of a still-flat document.</text>
+  <text class="body"     x="543" y="894">Its summaries carry a <tspan class="monok">known prefix</tspan>, so an 80 GiB</text>
+  <text class="body"     x="543" y="914">file seeks a line the newline scan has not yet</text>
+  <text class="body"     x="543" y="934">reached. Grafted documents don't need it.</text>
+
+  <rect class="der" x="990" y="736" width="430" height="218"/>
+  <text class="tag tder" x="1008" y="760">A TREE THAT ISN'T STORED</text>
+  <text class="btitle"   x="1008" y="784">Fold state</text>
+  <text class="mono"     x="1008" y="806">engine/folding/</text>
+  <text class="body"     x="1008" y="830">No structure of its own — just one atomic bit</text>
+  <text class="body"     x="1008" y="850">per node in the trunk.</text>
+  <text class="body"     x="1008" y="874">A node is foldable when it has children and is</text>
+  <text class="body"     x="1008" y="894">neither a Token nor a Group; a folded subtree</text>
+  <text class="body"     x="1008" y="914">collapses to a single visual row in the walk.</text>
+  <text class="note"     x="1008" y="938">This works only because the graft deepened the trunk.</text>
+
+  <!-- edges -> output: the three derived views merge into one projection -->
+  <path class="eO" d="M 275 954 L 275 992"/>
+  <path class="eO" d="M 740 954 L 740 992"/>
+  <path class="eO" d="M 1205 954 L 1205 992"/>
+  <path class="eO" d="M 275 992 L 1205 992"/>
+  <path class="eO" d="M 390 992 L 390 1032" marker-end="url(#mO)"/>
+  <text class="elabm" x="410" y="1018">the trunk, the index, and the fold bits are walked together</text>
+
+  <path class="eO" d="M 720 1123 L 760 1123" marker-end="url(#mO)"/>
+
+  <!-- ============ ROW D: OUTPUT ============ -->
+  <rect class="out" x="60" y="1032" width="660" height="182"/>
+  <text class="tag tout" x="78" y="1056">WHERE THE TREES END</text>
+  <text class="btitle"   x="78" y="1080">The projection</text>
+  <text class="mono"     x="78" y="1102">uast/projection.rs — query_viewport()</text>
+  <text class="body"     x="78" y="1126">Walks the trunk, guided by the SumTree and the</text>
+  <text class="body"     x="78" y="1146">fold bits, and emits a flat token stream:</text>
+  <text class="monok"    x="78" y="1170">Viewport { panes: Vec&lt;PaneViewport&gt; }</text>
+  <text class="tout"     x="78" y="1196" font-size="13.5" font-weight="700">No tree ever crosses the channel to the frontend.</text>
+
+  <rect class="out" x="760" y="1032" width="660" height="182"/>
+  <text class="tag tout" x="778" y="1056">TREES ON THE FAR SIDE</text>
+  <text class="btitle"   x="778" y="1080">Rebuilt in the frontend</text>
+  <text class="body"     x="778" y="1106"><tspan class="monok">ui/draw.rs</tspan> builds a ratatui widget tree from the</text>
+  <text class="body"     x="778" y="1126">flat viewport — one subtree per pane rect.</text>
+  <text class="body"     x="778" y="1152"><tspan class="monok">ui/markdown_preview.rs</tspan> rebuilds a block tree from</text>
+  <text class="body"     x="778" y="1172">pulldown-cmark's event stream with an open-element</text>
+  <text class="body"     x="778" y="1192">stack, then renders it to an image.</text>
+
+  <!-- ============ NOT TREES ============ -->
+  <rect class="neg" x="60" y="1240" width="1360" height="96"/>
+  <text class="tag tneg" x="82" y="1264">DELIBERATELY NOT TREES</text>
+  <text class="body" x="82" y="1290">
+    <tspan class="monok">UndoLedger</tspan> is two stacks, not an undo tree — redo is cleared on every edit, exactly like vim. <tspan class="monok">ShadowSession</tspan> is a linear chain of whole-file
+  </text>
+  <text class="body" x="82" y="1312">
+    generations on disk. Highlights use a sorted vector and a binary search rather than an interval tree. And there is no tree-sitter anywhere.
+  </text>
+</svg>

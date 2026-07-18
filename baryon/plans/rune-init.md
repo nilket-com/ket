@@ -1,0 +1,164 @@
+# Specification: Rune-only configuration
+
+Baryon is pre-release: Rune becomes the sole user configuration mechanism and the TOML
+settings file is removed outright — no compatibility layer, no dual-source precedence
+rules. This plan covers the replacement API, the startup semantics, the fate of engine
+persistence, the deletion, and the worked migration of the existing dotfile.
+
+## 1. What settings.toml is today (two roles, one file)
+
+1. **User-authored startup preferences**: theme, six booleans (`minimap`, `wrap`,
+   `line_numbers`, `relative_line_numbers`, `visible_whitespace`, `reload`), `savedurability`,
+   `[ui.colors.*]` overrides, and `[theme.languages]` per-language themes. Parsed by the
+   hand-rolled TOML reader in `engine/settings.rs` into `EngineSettings`, threaded into
+   `EditorSession::new`.
+2. **Machine-written state**: `persist_ui_settings` re-renders and rewrites the whole file
+   whenever a persist-flavored command runs (`PersistLangTheme`, persistent `:set` variants
+   via `persist_view_settings` in `runtime/system.rs`). `BOOLEAN_SETTING_KEYS` couples the
+   option registry's names to the TOML keys.
+
+Role 1 moves to Rune. Role 2 cannot: a user's init script is code, and ordinary engine
+operations must never rewrite it. The explicit `:set initwrite` export is the narrow
+exception: it writes only an absent file or one carrying the generator marker, while
+`:set initwrite!` is the deliberate replacement escape hatch.
+
+## 2. Decision: engine persistence is dropped (Option A)
+
+Persist-flavored operations become session-scoped. `PersistLangTheme` and the persistent
+`:set` variants either disappear or degrade to their session-scoped equivalents plus a
+status hint naming the Rune call to add to the init script. Durable preferences are
+whatever `init.rn` sets on the next startup — configuration as code, one source of truth.
+
+Rejected alternative (Option B, recorded for the future): a machine-owned state file in
+the XDG state dir, applied after `init.rn` with documented precedence. This preserves the
+persist UX but reintroduces two config sources and an ordering contract. If session-only
+`:set` proves annoying in practice, B can be layered on later without disturbing the API
+below — the setters are the same either way.
+
+## 3. Rune API: one authority, the option registry
+
+No parallel settings surface. Built-in options are set through the same option-registry
+names `:set` already uses (`option_registry.rs` is the single authority; its test already
+asserts registry keys == `BOOLEAN_SETTING_KEYS`):
+
+```rune
+pub fn main(editor) {
+    baryon::set(editor, "theme", "purples")?;
+    baryon::set(editor, "minimap", false)?;
+    baryon::set(editor, "wrap", true)?;
+    baryon::set(editor, "savedurability", "atomic")?;
+
+    baryon::ui_color(editor, "accent", "#FFFFFF")?;
+    baryon::ui_color(editor, "gutter.surface", "#080808")?;
+
+    baryon::language_theme(editor, "rust", "viridis_cs8")?;
+}
+```
+
+- `baryon::set(editor, name, value) -> Result<(), OptionError>`: routes through the option
+  registry exactly as `:set name=value` does — same names, same validation, same typed
+  errors (unknown option, invalid value). Value is a Rune string/bool/int; conversion
+  errors are expected `Err`, never a VM panic.
+- `baryon::ui_color(editor, key, hex)` and `baryon::language_theme(editor, lang, theme)`:
+  colors and language themes are structured maps, not flat options, so they get dedicated
+  typed calls. Keys use the dotted paths from the old `[ui.colors]` tables; hex parsing and
+  theme-name validation reuse the existing `UiColorOverrides` / `Theme::try_new` checks and
+  return the same diagnostics `settings.rs` produced as startup warnings.
+- All three are ordinary stateful host calls: they charge the HostBudget, are valid during
+  source evaluation (`main`) *and* inside any callback — unlike `spawn`, which stays
+  callback-only. Setting an option from a callback behaves exactly like `:set` at that
+  moment (render effects included, via `HostEffects.needs_render`).
+- **Error ergonomics**: `?` on every line is the intended style, so `main`'s return value
+  becomes meaningful: publication inspects it, and a returned `Err` is reported through the
+  startup status (naming the option and value) exactly like a script diagnostic. Today the
+  return value is ignored, which would make `?` silently swallow config typos — closing
+  that hole is part of this plan, and it applies to every callback ABI uniformly (a
+  callback returning `Err` reports like a thrown error).
+
+## 4. Startup semantics
+
+- The engine starts from compiled-in defaults (`EngineSettings::default()` minus the file
+  load). `init.rn` runs at its existing point in startup under `STARTUP_INSTRUCTION_BUDGET`;
+  because that happens before the first viewport is rendered, a theme set in `main` is the
+  first frame's theme — matching today's TOML behavior with no new sequencing.
+- Script errors keep the existing contract: compile/eval failure reports through the
+  startup status; the editor comes up on defaults. Partial application stands (settings set
+  before the error stick) — same as any failed callback's committed edits, and simpler than
+  transactional config.
+- `EngineSettings` survives as the internal defaults+current-state struct; only its TOML
+  ingress/egress dies.
+
+## 5. Deletion
+
+- `engine/settings.rs`: TOML parser (`parse_settings`, `strip_toml_comment`,
+  `parse_toml_*`), renderer (`render_settings`, `render_ui_colors`, `escape_toml_*`),
+  `load_settings*`, `persist_ui_settings`, and the settings-path platform resolution
+  (`default_settings_path*`, `SettingsPathEnv`, XDG/AppData probing) — all removed with
+  their tests. `SaveDurability` and `EngineSettings` (sans `settings_path`) remain.
+  Platform-aware config-directory probing is retained in a smaller `init.rn` path
+  resolver; only the TOML settings-file path and persistence plumbing disappear.
+- `runtime/system.rs`: `persist_view_settings` / `persist_view_status` and the
+  `PersistLangTheme` command path per §2; their tests convert to session-scoped assertions.
+- `RuntimeContext.settings_path` and every plumbing thread of it disappears.
+- `BOOLEAN_SETTING_KEYS` moves to (or is re-derived in) `option_registry.rs`, which becomes
+  the sole owner of option names.
+
+## 6. Worked migration (the author's dotfile)
+
+`~/.config/baryon/settings.toml` translates to `~/.config/baryon/init.rn` (the path the
+host already loads):
+
+```rune
+pub fn main(editor) {
+    baryon::set(editor, "theme", "purples")?;
+    baryon::set(editor, "minimap", false)?;
+    baryon::set(editor, "wrap", true)?;
+    baryon::set(editor, "line_numbers", true)?;
+    baryon::set(editor, "relative_line_numbers", false)?;
+    baryon::set(editor, "visible_whitespace", true)?;
+    baryon::set(editor, "reload", false)?;
+    baryon::set(editor, "savedurability", "atomic")?;
+
+    baryon::ui_color(editor, "accent", "#FFFFFF")?;
+    baryon::ui_color(editor, "surface", "#220033")?;
+    baryon::ui_color(editor, "editor.background", "#000008")?;
+    baryon::ui_color(editor, "search.highlight", "#9900FF")?;
+    baryon::ui_color(editor, "minimap.surface", "#000002")?;
+    baryon::ui_color(editor, "gutter.accent", "#FFFFFF")?;
+    baryon::ui_color(editor, "gutter.surface", "#080808")?;
+    baryon::ui_color(editor, "gutter.text", "#8844AA")?;
+    baryon::ui_color(editor, "preview.surface", "#000000")?;
+
+    baryon::language_theme(editor, "markdown", "purples_rcC")?;
+    baryon::language_theme(editor, "md", "onedark_s3")?;
+    baryon::language_theme(editor, "rust", "viridis_cs8")?;
+}
+```
+
+This file doubles as the first repo example. An `examples/` directory follows as its own
+small phase: `config.rn` (the above, genericized), `jobs.rn`, `autocmds.rn`, `commands.rn`
+— each a runnable, commented script exercising one API family.
+
+## 7. Acceptance and regression tests
+
+1. A startup script setting theme + colors + toggles produces a first frame with all of
+   them applied (full-engine test, like the existing host.rs integration tests).
+2. `baryon::set` matches `:set` byte-for-byte on names, validation, and error text; unknown
+   options and malformed values are typed `Err`s, and a quota-exhausted script still panics
+   the VM per the `baryon::*` contract.
+3. Setting options from a command/autocmd/job-completion callback takes effect and renders,
+   identically to interactive `:set`.
+4. `ui_color` and `language_theme` reject the same invalid inputs the TOML loader warned on
+   (bad hex, unknown theme), as expected errors.
+5. Persist-flavored commands are session-scoped; only explicit `:set initwrite` / `:set initwrite!`
+   export may write `init.rn`, with the marker guard and existing-mode preservation tested.
+6. Startup script failure lands on defaults with the existing startup-status diagnostic.
+7. Full lib suite serial in default and blocking-SVP modes, clippy `--all-targets`,
+   formatting.
+
+## 8. Non-goals
+
+- No TOML reading, migration shim, or auto-translation of existing files.
+- No Option B state file in this cut (§2 records the seam for later).
+- No new option kinds beyond what `:set` supports today plus colors/language themes.
+- No hot-reload of `init.rn` beyond the existing `:source`/reload machinery.

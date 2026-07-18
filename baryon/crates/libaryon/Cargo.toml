@@ -1,0 +1,33 @@
+[package]
+name = "libaryon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The headless Baryon editor engine."
+
+[dependencies]
+arboard.workspace = true
+bitflags.workspace = true
+imara-diff.workspace = true
+memchr.workspace = true
+libc.workspace = true
+ra_ap_base_db.workspace = true
+ra_ap_cfg.workspace = true
+ra_ap_ide.workspace = true
+ra_ap_ide_db.workspace = true
+ra_ap_paths.workspace = true
+ra_ap_project_model.workspace = true
+ra_ap_syntax.workspace = true
+ra_ap_vfs.workspace = true
+regex-automata.workspace = true
+ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
+ruff_python_semantic.workspace = true
+ruff_text_size.workspace = true
+rune.workspace = true
+rustc-hash.workspace = true
+sqlparser.workspace = true
+triomphe.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.11"

@@ -1,0 +1,58 @@
+pub mod backing_store;
+pub mod bash_highlight;
+pub mod bash_parse;
+pub mod bash_provider;
+pub mod csv_highlight;
+pub mod csv_parse;
+pub mod csv_provider;
+pub mod csv_semantic;
+pub mod diagnostic;
+pub mod fs_provider;
+pub mod html_highlight;
+pub mod html_parse;
+pub mod html_provider;
+pub mod ingest;
+pub mod json_highlight;
+pub mod json_parse;
+pub mod json_provider;
+pub mod line_index;
+pub mod markdown_highlight;
+pub mod markdown_parse;
+pub mod markdown_provider;
+pub mod pipeline;
+#[allow(unused_imports)]
+pub mod pointer;
+pub mod projector;
+pub mod python_ast;
+pub mod python_highlight;
+pub mod python_parse;
+pub mod python_provider;
+pub mod python_semantic;
+pub mod resolver;
+pub mod rune_ast;
+pub mod rune_highlight;
+pub mod rune_parse;
+pub mod rune_provider;
+pub mod rune_semantic;
+pub mod rust_highlight;
+pub mod rust_parse;
+pub mod rust_provider;
+pub mod semantic;
+pub mod sql_highlight;
+pub mod sql_parse;
+pub mod sql_provider;
+pub mod sql_semantic;
+pub mod sync;
+pub mod toml_highlight;
+pub mod toml_parse;
+pub mod toml_provider;
+pub mod toml_semantic;
+
+#[cfg(test)]
+mod tests;
+
+pub use backing_store::{BackingIdentity, BackingStore, GeneratedBackingStore};
+pub use ingest::ingest_svp_file;
+#[allow(unused_imports)]
+pub use pointer::SvpPointer;
+pub use resolver::{RequestPriority, SvpResolver};
