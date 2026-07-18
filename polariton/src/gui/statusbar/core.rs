@@ -46,7 +46,10 @@ pub(crate) enum SegmentWidth {
 	#[default]
 	Compact,
 	Fixed(u16),
-	Chars { chars: u16, slot: SlotKind },
+	Chars {
+		chars: u16,
+		slot: SlotKind,
+	},
 	FillPortion(u16),
 }
 
@@ -136,11 +139,7 @@ impl Segment {
 		}
 	}
 
-	pub fn label_value(
-		label: impl Into<String>,
-		value: impl Into<String>,
-		tone: Tone,
-	) -> Self {
+	pub fn label_value(label: impl Into<String>, value: impl Into<String>, tone: Tone) -> Self {
 		Self::LabelValue {
 			label: label.into(),
 			value: value.into(),
@@ -177,9 +176,15 @@ impl Segment {
 
 	pub fn max_chars(mut self, max_chars: usize) -> Self {
 		match &mut self {
-			Self::Text { max_chars: slot, .. }
-			| Self::LabelValue { max_chars: slot, .. }
-			| Self::Spinner { max_chars: slot, .. } => *slot = Some(max_chars.max(1)),
+			Self::Text {
+				max_chars: slot, ..
+			}
+			| Self::LabelValue {
+				max_chars: slot, ..
+			}
+			| Self::Spinner {
+				max_chars: slot, ..
+			} => *slot = Some(max_chars.max(1)),
 			Self::Progress { .. } => {}
 		}
 		self
@@ -241,20 +246,9 @@ impl StatusBar {
 		self
 	}
 
-	pub fn inset(mut self, inset_x: f32, bottom_gap: f32) -> Self {
-		self.layout.inset_x = inset_x.max(0.0);
-		self.layout.bottom_gap = bottom_gap.max(0.0);
-		self
-	}
-
 	pub fn lane_split(mut self, left_portion: u16, right_portion: u16) -> Self {
 		self.layout.left_portion = left_portion.max(1);
 		self.layout.right_portion = right_portion.max(1);
-		self
-	}
-
-	pub fn style(mut self, style: StatusBarStyle) -> Self {
-		self.style = style;
 		self
 	}
 
@@ -314,7 +308,10 @@ fn lane<Message: 'static>(
 	for segment in segments.iter().cloned() {
 		content = content.push(segment_view(segment, *style));
 	}
-	content.height(Length::Fixed(SEGMENT_HEIGHT)).clip(true).into()
+	content
+		.height(Length::Fixed(SEGMENT_HEIGHT))
+		.clip(true)
+		.into()
 }
 
 fn segment_view<Message: 'static>(
@@ -479,7 +476,10 @@ fn ellipsize_pair(label: &str, value: &str, max_chars: Option<usize>) -> (String
 	};
 	let label_chars = label.chars().count();
 	if label_chars + 1 >= limit {
-		return (ellipsize_to_limit(label, limit.saturating_sub(1)), String::new());
+		return (
+			ellipsize_to_limit(label, limit.saturating_sub(1)),
+			String::new(),
+		);
 	}
 	let value_limit = limit.saturating_sub(label_chars + 1);
 	(label.to_owned(), ellipsize_to_limit(value, value_limit))
@@ -525,9 +525,7 @@ impl Segment {
 		let chrome = match slot.resolve(self) {
 			SlotKind::Auto | SlotKind::Text => SEGMENT_HORIZONTAL_PADDING,
 			SlotKind::LabelValue => SEGMENT_HORIZONTAL_PADDING + LABEL_VALUE_GAP,
-			SlotKind::Spinner => {
-				SEGMENT_HORIZONTAL_PADDING + SPINNER_SIZE_HINT + SPINNER_LABEL_GAP
-			}
+			SlotKind::Spinner => SEGMENT_HORIZONTAL_PADDING + SPINNER_SIZE_HINT + SPINNER_LABEL_GAP,
 			SlotKind::Progress => {
 				SEGMENT_HORIZONTAL_PADDING + PROGRESS_WIDTH + (PROGRESS_GAP * 2.0)
 			}
