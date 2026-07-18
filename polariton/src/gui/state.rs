@@ -1,21 +1,21 @@
-use crate::baryon_editor::BaryonEditor;
-use crate::editor::DEJAVU_SANS_MONO;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::{AdapterConfiguration, AdapterSelection, AdapterState},
 };
-use crate::persistence::{self, SavedConnection, SavedStatement, StartupData};
+use crate::baryon_editor::BaryonEditor;
+use crate::editor::DEJAVU_SANS_MONO;
 use crate::gui::{
+	components::{self, PaneType},
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
 	menu::MenuState,
-	components::{self, PaneType},
 	messages::{ExportFormat, Message},
-	pane_grid::{self, Action, Axis, PaneId, State as PaneState},
+	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
+use crate::persistence::{self, SavedConnection, SavedStatement, StartupData};
+use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
-use crate::plot::composition::PlotComposition;
-use iced::{application, event, keyboard, time, window, Element, Size, Subscription, Task};
+use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use polars::frame::DataFrame;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -51,6 +51,7 @@ struct AppState {
 	settings_confirm_password: String,
 	settings_error: String,
 	show_column_types: bool,
+	window_size: Size,
 }
 
 pub type Result = iced::Result;
@@ -59,8 +60,8 @@ fn build_plot_task(
 	df: DataFrame,
 	composition: PlotComposition,
 	on_ready: impl FnOnce(std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>) -> Message
-		+ Send
-		+ 'static,
+	+ Send
+	+ 'static,
 ) -> Task<Message> {
 	Task::perform(
 		async move {
@@ -82,7 +83,8 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		_ => None,
 	});
 	let resize_tick = if state.dashboard.resize_freeze_until().is_some() {
-		time::every(Duration::from_millis(75)).map(|_| Message::Dashboard(DashboardMsg::ResizeSettled))
+		time::every(Duration::from_millis(75))
+			.map(|_| Message::Dashboard(DashboardMsg::ResizeSettled))
 	} else {
 		Subscription::none()
 	};
@@ -101,24 +103,32 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 		DashboardEffect::BuildNewPlot { composition } => {
 			app_state.status_msg =
 				format!("Generating {} plot...", composition.primary_plot_type());
-			build_plot_task(app_state.data_frame.clone(), composition.clone(), move |kernel| {
-				Message::Dashboard(DashboardMsg::PlotKernelReady {
-					pane: None,
-					composition,
-					kernel,
-				})
-			})
+			build_plot_task(
+				app_state.data_frame.clone(),
+				composition.clone(),
+				move |kernel| {
+					Message::Dashboard(DashboardMsg::PlotKernelReady {
+						pane: None,
+						composition,
+						kernel,
+					})
+				},
+			)
 		}
 		DashboardEffect::RebuildPlot { pane, composition } => {
 			app_state.status_msg =
 				format!("Generating {} plot...", composition.primary_plot_type());
-			build_plot_task(app_state.data_frame.clone(), composition.clone(), move |kernel| {
-				Message::Dashboard(DashboardMsg::PlotKernelReady {
-					pane: Some(pane),
-					composition,
-					kernel,
-				})
-			})
+			build_plot_task(
+				app_state.data_frame.clone(),
+				composition.clone(),
+				move |kernel| {
+					Message::Dashboard(DashboardMsg::PlotKernelReady {
+						pane: Some(pane),
+						composition,
+						kernel,
+					})
+				},
+			)
 		}
 	}
 }
@@ -147,6 +157,10 @@ pub fn run(startup_data: StartupData) -> Result {
 }
 
 fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
+	let window_size = startup_data
+		.window_size
+		.map(|(width, height)| Size::new(width, height))
+		.unwrap_or(Size::new(1920.0, 1080.0));
 	let data_frame = DataFrame::default();
 	let (mut panes, editor_pane) = PaneState::with_initial_pane();
 	let mut pane_content = HashMap::new();
@@ -161,7 +175,7 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 	let code_editor = BaryonEditor::new("");
 	let is_password_protected = startup_data.is_password_protected;
 	let salt = startup_data.salt.clone();
-	let state = AppState {
+	let mut state = AppState {
 		panes,
 		pane_content,
 		dashboard: DashboardState::default(),
@@ -192,7 +206,9 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		settings_confirm_password: String::new(),
 		settings_error: String::new(),
 		show_column_types: startup_data.show_column_types,
+		window_size,
 	};
+	sync_code_editor_viewport(&mut state);
 	let task = if !is_password_protected {
 		Task::perform(
 			async move { persistence::PrivateDb::open(&salt, "").await },
@@ -243,9 +259,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return run_dashboard_message(app_state, message);
 		}
 		Message::CloseWindow => {
-			return window::latest().and_then(|id| {
-				window::size(id).map(Message::SaveWindowSizeAndClose)
-			});
+			return window::latest()
+				.and_then(|id| window::size(id).map(Message::SaveWindowSizeAndClose));
 		}
 		Message::SaveWindowSizeAndClose(size) => {
 			return Task::perform(
@@ -273,7 +288,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.code_editor.poll();
 		}
 		Message::CodeEditResize(size) => {
-			app_state.code_editor.resize(size.width, size.height);
+			app_state.window_size = size;
+			sync_code_editor_viewport(app_state);
 		}
 		Message::MaximizeWindow => {
 			app_state.is_maximized = !app_state.is_maximized;
@@ -287,11 +303,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return window::latest().and_then(move |id| window::drag_resize(id, direction));
 		}
 		Message::PaneAction(action) => {
-			let is_resize = matches!(action, Action::DragMoved(..));
 			app_state.panes.apply(action);
-			if is_resize {
-				// No special handling needed for outer pane resize
-			}
+			sync_code_editor_viewport(app_state);
 		}
 		Message::Connect => match app_state.adapter_state.stage {
 			AdapterStage::None => {
@@ -405,17 +418,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::ExportWithWindowSize(format, window_size) => {
 			if app_state.dashboard.panes.is_some() {
 				let size = window_size.unwrap_or(Size::new(1920.0, 1080.0));
-				let main_grid_width = size.width - 20.0;
-				let main_grid_height = size.height - 113.0;
-				let main_grid_bounds = iced::Rectangle {
-					x: 10.0,
-					y: 71.0,
-					width: main_grid_width,
-					height: main_grid_height,
-				};
+				let main_grid_bounds = main_grid_bounds(size);
 				let dashboard_pane_bounds = get_pane_rects(&app_state.panes, main_grid_bounds)
 					.into_iter()
-					.find(|(pane, _)| app_state.pane_content.get(pane) == Some(&PaneType::Dashboard))
+					.find(|(pane, _)| {
+						app_state.pane_content.get(pane) == Some(&PaneType::Dashboard)
+					})
 					.map(|(_, rect)| rect)
 					.unwrap_or(main_grid_bounds);
 				let dashboard = app_state.dashboard.panes.as_ref().unwrap();
@@ -524,7 +532,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					Message::ConnectionSaved,
 				);
 			}
-			let adapter_type = app_state.adapter_state.selection.adapter_type_str().to_string();
+			let adapter_type = app_state
+				.adapter_state
+				.selection
+				.adapter_type_str()
+				.to_string();
 			return Task::perform(
 				async move { db.save_connection(name, adapter_type, config_value).await },
 				Message::ConnectionSaved,
@@ -539,7 +551,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::LoadSavedConnection(id) => {
 			if let Some(saved) = app_state.saved_connections.iter().find(|c| c.id == id) {
-				let config = AdapterConfiguration::from_saved(&saved.adapter_type, &saved.config_value);
+				let config =
+					AdapterConfiguration::from_saved(&saved.adapter_type, &saved.config_value);
 				app_state.status_msg = format!("Connecting to {}...", saved.name);
 				app_state.adapter_state.stage = crate::adapters::common::AdapterStage::Configured;
 				return Task::perform(
@@ -713,7 +726,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.settings_error = "Database not available.".to_string();
 				return Task::none();
 			};
-			let new_key = persistence::derive_key(&app_state.settings_new_password, &app_state.salt);
+			let new_key =
+				persistence::derive_key(&app_state.settings_new_password, &app_state.salt);
 			return Task::perform(
 				async move { db.rekey(new_key).await },
 				|result| match result {
@@ -841,14 +855,35 @@ fn parse_export_format(format: &str) -> Option<ExportFormat> {
 	}
 }
 
-fn get_pane_rects(
-	state: &PaneState,
-	bounds: iced::Rectangle,
-) -> Vec<(PaneId, iced::Rectangle)> {
+fn get_pane_rects(state: &PaneState, bounds: iced::Rectangle) -> Vec<(PaneId, iced::Rectangle)> {
 	let Some(root) = state.root() else {
 		return vec![];
 	};
 	get_node_rects(state, root, bounds)
+}
+
+/// The window rectangle occupied by the outer pane grid: the window minus the
+/// menu/toolbar chrome above and the status bar below. Shared by dashboard
+/// export hit-testing and editor viewport sizing so the two cannot drift.
+fn main_grid_bounds(size: Size) -> iced::Rectangle {
+	iced::Rectangle {
+		x: 10.0,
+		y: 71.0,
+		width: (size.width - 20.0).max(1.0),
+		height: (size.height - 113.0).max(1.0),
+	}
+}
+
+/// Keep libaryon's terminal-cell viewport aligned with the actual Polariton
+/// code pane, including outer pane-grid splitter changes.
+fn sync_code_editor_viewport(app_state: &mut AppState) {
+	let bounds = main_grid_bounds(app_state.window_size);
+	if let Some((_, pane)) = get_pane_rects(&app_state.panes, bounds)
+		.into_iter()
+		.find(|(id, _)| app_state.pane_content.get(id) == Some(&PaneType::CodeEditor))
+	{
+		app_state.code_editor.resize(pane.width, pane.height);
+	}
 }
 
 fn get_node_rects(
@@ -874,7 +909,10 @@ fn get_node_rects(
 					let width_a = (bounds.width - spacing) * ratio;
 					let width_b = bounds.width - spacing - width_a;
 					(
-						iced::Rectangle { width: width_a, ..bounds },
+						iced::Rectangle {
+							width: width_a,
+							..bounds
+						},
 						iced::Rectangle {
 							x: bounds.x + width_a + spacing,
 							width: width_b,
@@ -886,7 +924,10 @@ fn get_node_rects(
 					let height_a = (bounds.height - spacing) * ratio;
 					let height_b = bounds.height - spacing - height_a;
 					(
-						iced::Rectangle { height: height_a, ..bounds },
+						iced::Rectangle {
+							height: height_a,
+							..bounds
+						},
 						iced::Rectangle {
 							y: bounds.y + height_a + spacing,
 							height: height_b,

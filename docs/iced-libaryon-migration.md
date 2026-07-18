@@ -71,13 +71,28 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    bridge-level SQL round-trip test passes. Mouse input, pane-accurate resize,
    syntax spans, cursor/selection painting, and all remaining visual parity are
    intentionally deferred to the visual layers below.
-3. **Visual layers, incrementally:** syntax colors + gutter → selection + cursor
-   → scrolling + wrap → minimap, folds, diagnostics.
-4. **Parity gate, then removal.** Parity tests for SQL editing and the
-   saved-statement flows (create, load, swap, run). Only then delete
-   `polariton/src/editor/` and rewire the remaining call sites to the new facade
-   (`new/content/set_content/view/update/subscription`-shaped shim keeps the app
-   diff small).
+3. **Visual layers.** ✅ Done (2026-07-18): `baryon_editor` maps
+   `PaneViewport` highlight spans and the engine UI palette to iced rich-text
+   fragments, renders engine-projected line numbers, selections, diagnostics,
+   folded placeholders, and the primary cursor. The engine remains authoritative
+   for wrap rows, wheel scrolling, minimap navigation, and click-to-cursor
+   placement. `AppState` derives the code viewport from Polariton's actual pane
+   grid after window and splitter changes, so libaryon's wrapping geometry tracks
+   the rendered code pane.
+3a. **Upstream follow-up:** `UiPalette` has no selection color, so the bridge
+   hardcodes the selection background; add a `selection` field to libaryon's
+   `UiPalette`/`UiColorOverrides` and consume it in polariton.
+4. **Parity gate, then removal and rename.** Parity tests for SQL editing and the
+   saved-statement flows (create, load, swap, run), plus the vim-binding and
+   clipboard checks from the Risk section. Once passed, in one commit:
+   - delete `polariton/src/editor/`;
+   - move `DEJAVU_SANS_MONO` (app-level font registration, currently imported
+     from the old editor module by `gui/state.rs`) into `fonts.rs`;
+   - rename `baryon_editor.rs` → `editor.rs` and `BaryonEditor` → `CodeEditor`,
+     keeping the app-facing API engine-agnostic (also keeps a later
+     `baryon-iced` extraction possible as a dependency of `editor.rs`).
+   The rename must wait for the deletion: `editor.rs` and the old `editor/`
+   directory cannot coexist as one module name.
 
 ## Risk
 

@@ -2,24 +2,42 @@
 //!
 //! This deliberately owns no document state. The engine is authoritative; this
 //! module only forwards portable input, coalesces projected viewports, and
-//! renders the focused pane's currently visible tokens. Rich visual layers are
-//! added after this minimal bridge is proven in Polariton.
+//! renders the focused pane's projection: syntax, gutter, cursor, selection,
+//! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
 use iced::keyboard::{self, Key};
-use iced::widget::{container, scrollable, text};
-use iced::{Color, Element, Event, Length, Subscription, event};
-use libaryon::engine::{
-	EditorCommand, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers,
-};
+use iced::mouse;
+use iced::widget::{Space, button, column, container, mouse_area, rich_text, row, span, text};
+use iced::{Background, Color, Element, Event, Length, Subscription, event};
+use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, Rgb};
+use libaryon::engine::{EditorCommand, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers};
+use libaryon::engine::{MinimapSnapshot, UiPalette};
 use libaryon::uast::Viewport;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
 
+/// Shared text geometry. Layout (`view`), click mapping, scroll conversion,
+/// and cell-grid sizing must all agree on these values, so they live in one
+/// place. `CELL_WIDTH` is an estimate of `Font::MONOSPACE`'s advance at
+/// `TEXT_SIZE`; exact per-glyph metrics arrive with the custom
+/// `advanced::Widget`, until then click columns can drift on very long lines.
+mod metrics {
+	pub const TEXT_SIZE: f32 = 15.0;
+	pub const CELL_WIDTH: f32 = 9.6;
+	pub const LINE_HEIGHT: f32 = 22.0;
+	pub const GUTTER_WIDTH: f32 = 54.0;
+	pub const VERTICAL_PADDING: f32 = 8.0;
+}
+
 #[derive(Debug, Clone)]
 pub enum EditorMsg {
 	Input(InputEvent),
+	Scroll(i32),
+	MinimapGoto(DocLine),
+	PointerMoved(iced::Point),
+	Click,
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -34,6 +52,7 @@ pub struct BaryonEditor {
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
+	last_pointer: Option<iced::Point>,
 }
 
 impl BaryonEditor {
@@ -41,7 +60,9 @@ impl BaryonEditor {
 		let mut engine = EngineHandle::spawn(EngineConfig::default());
 		let commands = engine.command_sender();
 		let input = engine.input_sender();
-		let viewports = engine.take_viewports().expect("new engine owns viewport receiver");
+		let viewports = engine
+			.take_viewports()
+			.expect("new engine owns viewport receiver");
 		let mut editor = Self {
 			engine: Some(engine),
 			commands,
@@ -51,6 +72,7 @@ impl BaryonEditor {
 			document_text: String::new(),
 			text_query_pending: false,
 			content_dirty: false,
+			last_pointer: None,
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -94,11 +116,14 @@ impl BaryonEditor {
 		self.request_content();
 	}
 
-	/// Translate the available Iced window size into the engine's cell grid.
-	/// Pane-accurate sizing follows with the custom renderer in the next layer.
+	/// Translate the code pane's pixel size into the engine's cell grid.
+	/// Callers pass the actual pane rectangle (see `sync_code_editor_viewport`).
 	pub fn resize(&self, width: f32, height: f32) {
-		let columns = (width / 9.6).floor().clamp(1.0, u16::MAX as f32) as u16;
-		let rows = (height / 22.0).floor().clamp(1.0, u16::MAX as f32) as u16;
+		let columns =
+			(width / metrics::CELL_WIDTH).floor().clamp(1.0, u16::MAX as f32) as u16;
+		let rows = (height / metrics::LINE_HEIGHT)
+			.floor()
+			.clamp(1.0, u16::MAX as f32) as u16;
 		self.send(EditorCommand::Resize(columns, rows));
 	}
 
@@ -153,29 +178,131 @@ impl BaryonEditor {
 				}
 				self.request_content();
 			}
+			EditorMsg::Scroll(delta) => {
+				self.send(EditorCommand::ScrollViewport(delta));
+			}
+			EditorMsg::MinimapGoto(line) => {
+				self.send(EditorCommand::ScrollViewportToLine(line));
+			}
+			EditorMsg::PointerMoved(position) => {
+				self.last_pointer = Some(position);
+			}
+			EditorMsg::Click => self.click_at_pointer(),
 		}
 	}
 
 	pub fn view(&self) -> Element<'_, EditorMsg> {
-		let content = self
-			.viewport
-			.as_ref()
-			.and_then(Viewport::focused_pane)
-			.map(projected_text)
-			.unwrap_or_else(|| "Starting editor…".to_owned());
-		scrollable(
-			container(
-				text(content)
+		let Some(viewport) = self.viewport.as_ref() else {
+			return container(
+				text("Starting editor…")
 					.font(iced::Font::MONOSPACE)
-					.size(15)
-					.color(Color::from_rgb8(220, 220, 220)),
+					.size(metrics::TEXT_SIZE),
 			)
 			.padding(12)
-			.width(Length::Fill),
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.into();
+		};
+		let Some(pane) = viewport.focused_pane() else {
+			return container(text("Editor has no focused pane."))
+				.width(Length::Fill)
+				.height(Length::Fill)
+				.into();
+		};
+		let palette = viewport.ui_palette;
+		let lines = wrap_projected_lines(
+			project_lines(pane, palette.editor_text, palette.accent),
+			pane,
+		);
+		let editor_background = color(palette.editor_background);
+		let gutter_background = color(palette.gutter_surface);
+		let gutter_text = color(palette.gutter_text);
+		let cursor_lines = &pane.cursor_lines;
+		let rows = column(lines.into_iter().map(|line| {
+			let number = if line.show_gutter {
+				gutter_number(pane, line.doc_line)
+			} else {
+				String::new()
+			};
+			let number_color = if cursor_lines
+				.iter()
+				.any(|cursor| cursor.get() == line.doc_line)
+			{
+				color(palette.gutter_accent)
+			} else {
+				gutter_text
+			};
+			let fragments = line
+				.fragments
+				.into_iter()
+				.map(|fragment| {
+					let StyledFragment {
+						text,
+						foreground,
+						background,
+						underline,
+					} = fragment;
+					let fragment = span::<(), iced::Font>(text)
+						.color(foreground)
+						.underline(underline);
+					match background {
+						Some(background) => fragment.background(Background::Color(background)),
+						None => fragment,
+					}
+				})
+				.collect::<Vec<_>>();
+			row![
+				container(
+					text(number)
+						.font(iced::Font::MONOSPACE)
+						.size(metrics::TEXT_SIZE)
+						.color(number_color)
+				)
+				.width(Length::Fixed(metrics::GUTTER_WIDTH))
+				.padding([0, 8])
+				.style(move |_| container::Style {
+					background: Some(Background::Color(gutter_background)),
+					..Default::default()
+				}),
+				rich_text(fragments)
+					.font(iced::Font::MONOSPACE)
+					.size(metrics::TEXT_SIZE)
+					.line_height(metrics::LINE_HEIGHT),
+			]
+			.spacing(0)
+			.into()
+		}))
+		.width(Length::Fill);
+		let editor_rows = mouse_area(
+			container(rows)
+				.padding([metrics::VERTICAL_PADDING, 0.0])
+				.width(Length::Fill)
+				.height(Length::Fill),
 		)
-		.width(Length::Fill)
-		.height(Length::Fill)
-		.into()
+		.on_move(EditorMsg::PointerMoved)
+		.on_press(EditorMsg::Click)
+		.on_scroll(|delta| {
+			let lines = match delta {
+				mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
+				mouse::ScrollDelta::Pixels { y, .. } => (y / metrics::LINE_HEIGHT).round() as i32,
+			};
+			EditorMsg::Scroll(-lines)
+		});
+		let content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
+			row![editor_rows, minimap_view(minimap, palette)]
+				.height(Length::Fill)
+				.into()
+		} else {
+			editor_rows.into()
+		};
+		container(content)
+			.style(move |_| container::Style {
+				background: Some(Background::Color(editor_background)),
+				..Default::default()
+			})
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.into()
 	}
 
 	pub fn shutdown(&mut self) {
@@ -193,6 +320,29 @@ impl BaryonEditor {
 			}
 		}
 	}
+
+	fn click_at_pointer(&self) {
+		let Some(pointer) = self.last_pointer else {
+			return;
+		};
+		let Some(pane) = self.viewport.as_ref().and_then(Viewport::focused_pane) else {
+			return;
+		};
+		let row = ((pointer.y - metrics::VERTICAL_PADDING).max(0.0) / metrics::LINE_HEIGHT).floor()
+			as usize;
+		// `visible_rows` is `render_rows` minus the wrapped rows scrolled off
+		// above the viewport, matching what `view` actually laid out.
+		let Some(visible_row) = pane.visible_rows.get(row) else {
+			return;
+		};
+		let column =
+			((pointer.x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
+		let target = CursorPosition::new(
+			visible_row.line,
+			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
+		);
+		self.send(EditorCommand::ClickCursor(target));
+	}
 }
 
 impl Drop for BaryonEditor {
@@ -201,23 +351,341 @@ impl Drop for BaryonEditor {
 	}
 }
 
-fn projected_text(pane: &libaryon::uast::projection::PaneViewport) -> String {
-	String::from_utf8_lossy(
-		&pane
-			.tokens
+struct ProjectedLine {
+	doc_line: u64,
+	fragments: Vec<StyledFragment>,
+	show_gutter: bool,
+}
+
+#[derive(Clone)]
+struct StyledFragment {
+	text: String,
+	foreground: Color,
+	background: Option<Color>,
+	underline: bool,
+}
+
+fn project_lines(
+	pane: &libaryon::uast::projection::PaneViewport,
+	default_foreground: Rgb,
+	cursor_color: Rgb,
+) -> Vec<ProjectedLine> {
+	let mut lines = Vec::new();
+	let mut current: Option<ProjectedLine> = None;
+	let mut cursor_rendered = false;
+	for token in &pane.tokens {
+		if token.text.is_empty() {
+			continue;
+		}
+		let token_line = token.absolute_start_line.get();
+		if current
+			.as_ref()
+			.is_none_or(|line| line.doc_line != token_line)
+		{
+			if let Some(line) = current.take() {
+				lines.push(line);
+			}
+			current = Some(ProjectedLine {
+				doc_line: token_line,
+				fragments: Vec::new(),
+				show_gutter: true,
+			});
+		}
+		let mut byte = token.absolute_start_byte.get();
+		let mut line_number = token_line;
+		for ch in String::from_utf8_lossy(&token.text).chars() {
+			if ch == '\n' {
+				if let Some(line) = current.take() {
+					lines.push(line);
+				}
+				line_number = line_number.saturating_add(1);
+				current = Some(ProjectedLine {
+					doc_line: line_number,
+					fragments: Vec::new(),
+					show_gutter: true,
+				});
+				byte = byte.saturating_add(1);
+				continue;
+			}
+			let byte_len = ch.len_utf8() as u64;
+			let foreground = pane
+				.highlights
+				.iter()
+				.rev()
+				.find(|highlight| highlight.start.get() <= byte && byte < highlight.end.get())
+				.and_then(|highlight| pane.theme_colors[highlight.category as usize])
+				.unwrap_or(default_foreground);
+			let foreground = if token.is_folded {
+				cursor_color
+			} else {
+				foreground
+			};
+			let selected = pane.selection_ranges.iter().any(|(start, end)| {
+				start.get() <= byte.saturating_add(byte_len).saturating_sub(1) && end.get() >= byte
+			});
+			let cursor = pane.cursor_abs_byte.get() == byte;
+			cursor_rendered |= cursor;
+			let underline = pane.diagnostics.iter().any(|diagnostic| {
+				diagnostic.start.get() < byte.saturating_add(byte_len)
+					&& diagnostic.end.get() > byte
+			});
+			let background = if cursor {
+				Some(color(cursor_color))
+			} else if selected {
+				Some(Color::from_rgb8(55, 78, 104))
+			} else if token.is_folded {
+				Some(Color {
+					a: 0.22,
+					..color(cursor_color)
+				})
+			} else {
+				None
+			};
+			push_fragment(
+				current.as_mut().expect("line initialized"),
+				ch.to_string(),
+				color(foreground),
+				background,
+				underline,
+			);
+			byte = byte.saturating_add(byte_len);
+		}
+	}
+	if let Some(line) = current {
+		lines.push(line);
+	}
+	if !cursor_rendered {
+		let cursor_line = pane.cursor_abs_pos.line.get();
+		if let Some(line) = lines.iter_mut().find(|line| line.doc_line == cursor_line) {
+			push_fragment(
+				line,
+				" ".to_owned(),
+				color(default_foreground),
+				Some(color(cursor_color)),
+				false,
+			);
+		}
+	}
+	if lines.is_empty() {
+		lines.push(ProjectedLine {
+			doc_line: pane.viewport_start_line.get(),
+			fragments: Vec::new(),
+			show_gutter: true,
+		});
+	}
+	lines
+}
+
+/// Split physical lines using the engine's visual-row projection. This keeps
+/// Iced's text output aligned with libaryon's wrapping and scroll anchor rather
+/// than letting the frontend independently decide where a line wraps.
+///
+/// `visible_rows` (not `render_rows`) drives the split: when the viewport
+/// starts partway through a wrapped line, that line's scrolled-off rows are
+/// absent and their characters must be dropped, not rendered.
+fn wrap_projected_lines(
+	lines: Vec<ProjectedLine>,
+	pane: &libaryon::uast::projection::PaneViewport,
+) -> Vec<ProjectedLine> {
+	lines
+		.into_iter()
+		.flat_map(|line| {
+			let mut starts = pane
+				.visible_rows
+				.iter()
+				.filter(|row| row.line.get() == line.doc_line)
+				.map(|row| row.start_col.get())
+				.collect::<Vec<_>>();
+			starts.sort_unstable();
+			starts.dedup();
+			wrap_line_at_starts(line, &starts)
+		})
+		.collect()
+}
+
+fn wrap_line_at_starts(line: ProjectedLine, starts: &[u32]) -> Vec<ProjectedLine> {
+	if starts.is_empty() {
+		return vec![line];
+	}
+	let mut wrapped = starts
+		.iter()
+		.map(|start| ProjectedLine {
+			doc_line: line.doc_line,
+			fragments: Vec::new(),
+			// A row starting mid-line is a wrap continuation (or a scrolled
+			// partial line); only the physical line start carries the number.
+			show_gutter: line.show_gutter && *start == 0,
+		})
+		.collect::<Vec<_>>();
+	let mut column = 0u32;
+	for fragment in line.fragments {
+		for ch in fragment.text.chars() {
+			let index = starts.partition_point(|start| *start <= column);
+			if let Some(index) = index.checked_sub(1) {
+				push_fragment(
+					&mut wrapped[index],
+					ch.to_string(),
+					fragment.foreground,
+					fragment.background,
+					fragment.underline,
+				);
+			}
+			// Columns before the first visible row are scrolled off above the
+			// viewport; skip them without emitting anything.
+			column = advance_display_column(column, ch);
+		}
+	}
+	wrapped
+}
+
+fn advance_display_column(column: u32, ch: char) -> u32 {
+	use libaryon::core::TAB_SIZE;
+	if ch == '\t' {
+		column.saturating_add(TAB_SIZE - (column % TAB_SIZE))
+	} else {
+		column.saturating_add(1)
+	}
+}
+
+fn push_fragment(
+	line: &mut ProjectedLine,
+	text: String,
+	foreground: Color,
+	background: Option<Color>,
+	underline: bool,
+) {
+	if let Some(previous) = line.fragments.last_mut()
+		&& previous.foreground == foreground
+		&& previous.background == background
+		&& previous.underline == underline
+	{
+		previous.text.push_str(&text);
+	} else {
+		line.fragments.push(StyledFragment {
+			text,
+			foreground,
+			background,
+			underline,
+		});
+	}
+}
+
+fn gutter_number(pane: &libaryon::uast::projection::PaneViewport, line: u64) -> String {
+	pane.gutter_line_numbers
+		.iter()
+		.find(|entry| entry.line.get() == line)
+		.map(|entry| entry.number.to_string())
+		.unwrap_or_else(|| (line + 1).to_string())
+}
+
+fn color(color: Rgb) -> Color {
+	Color::from_rgb8(color.r, color.g, color.b)
+}
+
+const MINIMAP_BANDS: usize = 96;
+
+fn minimap_view(snapshot: &MinimapSnapshot, palette: UiPalette) -> Element<'static, EditorMsg> {
+	let overlay = snapshot.overlay();
+	let density = minimap_density(snapshot);
+	let document_lines = overlay.doc_line_count.get().max(1);
+	let viewport_start = overlay.viewport_start_line.get();
+	let viewport_end = overlay.viewport_end_line.get();
+	let search_bands = &overlay.search_bands;
+	let rows = column(density.into_iter().enumerate().map(|(index, density)| {
+		let line = ((index as u128 * document_lines as u128) / MINIMAP_BANDS as u128) as u64;
+		let next_line =
+			(((index + 1) as u128 * document_lines as u128) / MINIMAP_BANDS as u128) as u64;
+		let in_viewport = line < viewport_end && next_line.max(line + 1) > viewport_start;
+		let search_index = ((index * search_bands.len()) / MINIMAP_BANDS)
+			.min(search_bands.len().saturating_sub(1));
+		let has_search = search_bands.get(search_index).copied().unwrap_or_default() > 0;
+		let shade = if has_search {
+			palette.search_highlight
+		} else {
+			palette.minimap_accent
+		};
+		let alpha = if density == 0 {
+			0.0
+		} else {
+			0.15 + (density as f32 / 255.0) * 0.85
+		};
+		let background = if in_viewport {
+			Color {
+				a: 0.45,
+				..color(palette.accent)
+			}
+		} else {
+			Color {
+				a: alpha,
+				..color(shade)
+			}
+		};
+		button(Space::new().height(Length::Fixed(2.0)))
+			.padding(0)
+			.width(Length::Fixed(72.0))
+			.on_press(EditorMsg::MinimapGoto(DocLine::new(line)))
+			.style(move |_, _| button::Style {
+				background: Some(Background::Color(background)),
+				..Default::default()
+			})
+			.into()
+	}))
+	.spacing(0);
+	container(rows)
+		.padding([8, 4])
+		.width(Length::Fixed(80.0))
+		.height(Length::Fill)
+		.style(move |_| container::Style {
+			background: Some(Background::Color(color(palette.minimap_surface))),
+			..Default::default()
+		})
+		.into()
+}
+
+fn minimap_density(snapshot: &MinimapSnapshot) -> Vec<u8> {
+	let source = match snapshot {
+		MinimapSnapshot::Preview(preview) => preview
+			.rows
 			.iter()
-			.flat_map(|token| token.text.iter().copied())
+			.map(|row| {
+				((u32::from(row.logical_width) * 255) / u32::from(preview.max_columns.max(1))) as u8
+			})
 			.collect::<Vec<_>>(),
-	)
-	.into_owned()
+		MinimapSnapshot::Overview(overview) | MinimapSnapshot::ByteFallback(overview) => {
+			overview.bands.clone()
+		}
+	};
+	(0..MINIMAP_BANDS)
+		.map(|index| {
+			let start = (index * source.len()) / MINIMAP_BANDS;
+			let end = (((index + 1) * source.len()) / MINIMAP_BANDS)
+				.max(start + 1)
+				.min(source.len());
+			source
+				.get(start..end)
+				.unwrap_or_default()
+				.iter()
+				.copied()
+				.max()
+				.unwrap_or(0)
+		})
+		.collect()
 }
 
 fn map_modifiers(modifiers: keyboard::Modifiers) -> Modifiers {
 	let mut mapped = Modifiers::NONE;
-	if modifiers.shift() { mapped |= Modifiers::SHIFT; }
-	if modifiers.control() { mapped |= Modifiers::CONTROL; }
-	if modifiers.alt() { mapped |= Modifiers::ALT; }
-	if modifiers.logo() { mapped |= Modifiers::SUPER; }
+	if modifiers.shift() {
+		mapped |= Modifiers::SHIFT;
+	}
+	if modifiers.control() {
+		mapped |= Modifiers::CONTROL;
+	}
+	if modifiers.alt() {
+		mapped |= Modifiers::ALT;
+	}
+	if modifiers.logo() {
+		mapped |= Modifiers::SUPER;
+	}
 	mapped
 }
 
@@ -283,5 +751,161 @@ mod tests {
 			}));
 		}
 		wait_for_content(&mut editor, "xselect 1;");
+	}
+
+	#[test]
+	fn viewport_scroll_and_minimap_navigation_stay_engine_owned() {
+		use super::EditorMsg;
+		use libaryon::core::DocLine;
+
+		let text = (0..80)
+			.map(|line| format!("select {line};\n"))
+			.collect::<String>();
+		let mut editor = BaryonEditor::new(&text);
+		editor.resize(960.0, 110.0);
+		wait_for_content(&mut editor, &text);
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.minimap.is_none())
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.and_then(|viewport| viewport.focused_pane())
+				.is_some_and(|pane| pane.minimap.is_some())
+		);
+
+		editor.update(EditorMsg::Scroll(3));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.viewport_start_line == DocLine::ZERO)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.and_then(|viewport| viewport.focused_pane())
+				.is_some_and(|pane| pane.viewport_start_line > DocLine::ZERO)
+		);
+
+		editor.update(EditorMsg::MinimapGoto(DocLine::new(40)));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.viewport_start_line.get() < 35)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.and_then(|viewport| viewport.focused_pane())
+				.is_some_and(|pane| pane.viewport_start_line.get() >= 35)
+		);
+	}
+
+	#[test]
+	fn engine_visual_rows_split_wrapped_text_without_repeating_the_gutter() {
+		use super::{Color, ProjectedLine, StyledFragment, wrap_line_at_starts};
+
+		let line = ProjectedLine {
+			doc_line: 8,
+			fragments: vec![StyledFragment {
+				text: "select 123".to_owned(),
+				foreground: Color::WHITE,
+				background: None,
+				underline: false,
+			}],
+			show_gutter: true,
+		};
+		let wrapped = wrap_line_at_starts(line, &[0, 4, 8]);
+		assert_eq!(wrapped.len(), 3);
+		assert_eq!(wrapped[0].fragments[0].text, "sele");
+		assert_eq!(wrapped[1].fragments[0].text, "ct 1");
+		assert_eq!(wrapped[2].fragments[0].text, "23");
+		assert!(wrapped[0].show_gutter);
+		assert!(!wrapped[1].show_gutter);
+		assert!(!wrapped[2].show_gutter);
+	}
+
+	#[test]
+	fn columns_scrolled_off_above_the_viewport_are_dropped_not_prepended() {
+		use super::{Color, ProjectedLine, StyledFragment, wrap_line_at_starts};
+
+		// The viewport starts partway through this wrapped line: its first two
+		// visual rows (cols 0..4) are scrolled off, so `visible_rows` only
+		// carries starts 4 and 8.
+		let line = ProjectedLine {
+			doc_line: 8,
+			fragments: vec![StyledFragment {
+				text: "select 123".to_owned(),
+				foreground: Color::WHITE,
+				background: None,
+				underline: false,
+			}],
+			show_gutter: true,
+		};
+		let wrapped = wrap_line_at_starts(line, &[4, 8]);
+		assert_eq!(wrapped.len(), 2);
+		assert_eq!(wrapped[0].fragments[0].text, "ct 1");
+		assert_eq!(wrapped[1].fragments[0].text, "23");
+		// A mid-line row is never the physical line start, so no gutter number.
+		assert!(!wrapped[0].show_gutter);
+		assert!(!wrapped[1].show_gutter);
+	}
+
+	#[test]
+	fn local_mouse_coordinates_become_engine_cursor_positions() {
+		use super::EditorMsg;
+		use iced::Point;
+
+		let mut editor = BaryonEditor::new("select 1;\nselect 2;\nselect 3;");
+		wait_for_content(&mut editor, "select 1;\nselect 2;\nselect 3;");
+		editor.update(EditorMsg::PointerMoved(Point::new(
+			54.0 + 9.6 * 3.0,
+			8.0 + 22.0,
+		)));
+		editor.update(EditorMsg::Click);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| {
+				pane.cursor_abs_pos.line.get() != 1 || pane.cursor_abs_pos.col.get() < 3
+			}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.and_then(|viewport| viewport.focused_pane())
+				.is_some_and(|pane| pane.cursor_abs_pos.line.get() == 1
+					&& pane.cursor_abs_pos.col.get() >= 3)
+		);
 	}
 }
