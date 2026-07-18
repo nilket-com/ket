@@ -55,6 +55,7 @@ impl LanguageProvider for RuneProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 

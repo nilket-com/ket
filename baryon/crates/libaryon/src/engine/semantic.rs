@@ -34,6 +34,7 @@ pub(crate) fn invalidate_minimap_cache(view: &mut CommonViewState) {
 fn clear_for_unavailable_inputs(semantic: &mut SemanticState) {
 	semantic.highlights.clear();
 	semantic.diagnostics.clear();
+	semantic.inline_annotations.clear();
 	semantic.last_semantic_state = None;
 	semantic.last_semantic_len = usize::MAX;
 	semantic.last_semantic_path = None;
@@ -58,6 +59,7 @@ fn apply_semantic_response(
 		request_id,
 		highlights,
 		diagnostics,
+		inline_annotations,
 		structural_topology,
 	} = response;
 	let document = &mut doctab.document;
@@ -71,6 +73,7 @@ fn apply_semantic_response(
 
 	document.semantic.highlights = highlights;
 	document.semantic.diagnostics = diagnostics;
+	document.semantic.inline_annotations = inline_annotations;
 	document.semantic.view_revision = document.semantic.view_revision.wrapping_add(1);
 	document.semantic.pending_semantic_request_id = None;
 	invalidate_minimap_cache(&mut doctab.view.common);
@@ -153,6 +156,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 						if live_len_wide == 0 || live_len_wide >= MAX_SEMANTIC_BYTES {
 							semantic.highlights.clear();
 							semantic.diagnostics.clear();
+							semantic.inline_annotations.clear();
 							semantic.last_semantic_state = Some(state_id);
 							semantic.last_semantic_len = live_len;
 							semantic.last_semantic_path = Some(path.to_string());
@@ -180,6 +184,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 			} else {
 				semantic.highlights.clear();
 				semantic.diagnostics.clear();
+				semantic.inline_annotations.clear();
 				semantic.last_semantic_state = Some(state_id);
 				semantic.last_semantic_len = 0;
 				semantic.last_semantic_path = Some(path.to_string());
@@ -358,6 +363,7 @@ mod tests {
 				request_id: RequestId::new(101),
 				highlights: Vec::new(),
 				diagnostics: Vec::new(),
+				inline_annotations: Vec::new(),
 				structural_topology: Some((
 					flat_green_node("amber_body\n"),
 					b"amber_body\n".to_vec(),
@@ -423,6 +429,7 @@ mod tests {
 				request_id: RequestId::new(7),
 				highlights: Vec::new(),
 				diagnostics: Vec::new(),
+				inline_annotations: Vec::new(),
 				structural_topology: Some((
 					flat_green_node("fn fresh() {}\n"),
 					b"fn fresh() {}\n".to_vec(),
@@ -486,6 +493,7 @@ mod tests {
 					request_id: RequestId::new(303),
 					highlights: Vec::new(),
 					diagnostics: Vec::new(),
+					inline_annotations: Vec::new(),
 					structural_topology: Some((flat_green_node(text), text.as_bytes().to_vec())),
 				},
 			));
@@ -524,6 +532,7 @@ mod tests {
 					request_id: RequestId::new(404),
 					highlights: Vec::new(),
 					diagnostics: Vec::new(),
+					inline_annotations: Vec::new(),
 					structural_topology: Some((
 						foldable_green_node(),
 						b"head\none\ntwo\ntail".to_vec(),

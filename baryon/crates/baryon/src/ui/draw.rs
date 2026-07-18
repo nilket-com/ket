@@ -4,7 +4,7 @@ use super::minimap::render_minimap_snapshot;
 use crate::ui::*;
 use libaryon::core::{DOCTAB_BAR_ROWS, PaneLocalRow, PaneRect, Rgb, STATUS_BAR_ROWS, TAB_SIZE};
 use libaryon::engine::{
-	EditorMode, MinimapSnapshot, UiPalette, VisualKind,
+	EditorMode, InlineAnnotationKind, MinimapSnapshot, UiPalette, VisualKind,
 	viewport_geometry_for_viewport_with_numbering,
 };
 use libaryon::svp::diagnostic::DiagnosticSeverity;
@@ -1089,6 +1089,15 @@ fn draw_pane(
 		text_area_top.get() as u16,
 		text_area_height.get() as u16,
 	);
+	paint_inline_annotations(
+		buf,
+		pane,
+		text_left,
+		text_right,
+		text_area_top.get() as usize,
+		render_height,
+		skip_rows,
+	);
 
 	let cursor_to_set = if is_focused {
 		let visual_cursor_y = pane.cursor_pane_row.get();
@@ -1116,6 +1125,91 @@ fn draw_pane(
 		},
 		markdown_preview_area: None,
 	}
+}
+
+fn paint_inline_annotations(
+	buf: &mut Buffer,
+	pane: &PaneViewport,
+	text_left: usize,
+	text_right: usize,
+	text_top: usize,
+	render_height: usize,
+	skip_rows: usize,
+) {
+	for annotation in &pane.inline_annotations {
+		let Some(row) = pane
+			.render_rows
+			.iter()
+			.enumerate()
+			.rev()
+			.find_map(|(row, visible)| (visible.line == annotation.line).then_some(row))
+		else {
+			continue;
+		};
+		let Some(screen_row) = row.checked_sub(skip_rows) else { continue };
+		if screen_row >= render_height {
+			continue;
+		}
+		let width = annotation.text.chars().count();
+		if width == 0 || width.saturating_add(2) > text_right.saturating_sub(text_left) {
+			continue;
+		}
+		let Some(end_column) = annotation_end_column(pane, annotation.line) else {
+			continue;
+		};
+		// Keep the hint visually associated with its dependency rather than with
+		// the far edge of a wide monitor. Two tab stops leave a readable gap.
+		let preferred_x = text_left.saturating_add(next_tab_stop(next_tab_stop(end_column)));
+		let x = preferred_x.min(text_right.saturating_sub(width));
+		let y = text_top.saturating_add(screen_row);
+		let color = match annotation.kind {
+			InlineAnnotationKind::Current => Color::Green,
+			InlineAnnotationKind::Upgrade => Color::Yellow,
+			InlineAnnotationKind::Info => Color::DarkGray,
+		};
+		for (offset, ch) in annotation.text.chars().enumerate() {
+			if let Some(cell) = buf.cell_mut(((x + offset) as u16, y as u16)) {
+				cell.set_char(ch);
+				cell.set_fg(color);
+			}
+		}
+	}
+}
+
+fn next_tab_stop(column: usize) -> usize {
+	let tab = TAB_SIZE as usize;
+	column.saturating_add(tab - column % tab)
+}
+
+fn annotation_end_column(pane: &PaneViewport, annotation_line: libaryon::core::DocLine) -> Option<usize> {
+	let mut current_line = pane.tokens.first()?.absolute_start_line;
+	let mut column = 0usize;
+	let mut seen_line = false;
+
+	for token in &pane.tokens {
+		if token.absolute_start_line > current_line {
+			current_line = token.absolute_start_line;
+			column = 0;
+		}
+		for &byte in &token.text {
+			if current_line == annotation_line {
+				seen_line = true;
+			}
+			if byte == b'\n' {
+				if current_line == annotation_line {
+					return Some(column);
+				}
+				current_line = current_line.saturating_add(1);
+				column = 0;
+			} else if byte == b'\t' {
+				column = next_tab_stop(column);
+			} else if current_line == annotation_line {
+				column = column.saturating_add(1);
+			}
+		}
+	}
+
+	seen_line.then_some(column)
 }
 
 impl<B: Backend + io::Write> Frontend<B> {

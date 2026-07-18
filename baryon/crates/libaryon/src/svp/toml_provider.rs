@@ -5,6 +5,7 @@ use crate::engine::language::{GreenNode, LanguageProvider, SemanticOutput};
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::svp::toml_highlight::highlight_toml;
 use crate::svp::toml_semantic::build_toml_topology;
+use crate::svp::cargo_annotations;
 
 pub struct TomlProvider;
 
@@ -33,7 +34,7 @@ impl LanguageProvider for TomlProvider {
 		&self,
 		full_source: Arc<String>,
 		global_offset: DocByte,
-		_file_path: &str,
+		file_path: &str,
 	) -> SemanticOutput {
 		// The lexical pass is already context-aware (bracket/brace depth,
 		// key vs. value mode), so the reactor just re-runs it over the
@@ -43,6 +44,7 @@ impl LanguageProvider for TomlProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: cargo_annotations::annotations(&full_source, file_path),
 		}
 	}
 

@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::core::{BufferId, DocByte, RequestId, StateId};
-use crate::engine::language::{GreenNode, LanguageRegistry};
+use crate::engine::language::{GreenNode, InlineAnnotation, LanguageRegistry};
 use crate::engine::request::{InternalEvent, InternalSender};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
@@ -29,6 +29,7 @@ pub struct SemanticResponse {
 	pub request_id: RequestId,
 	pub highlights: Vec<HighlightSpan>,
 	pub diagnostics: Vec<DiagnosticSpan>,
+	pub inline_annotations: Vec<InlineAnnotation>,
 	/// Structural AST topology for deep graft, paired with the source bytes
 	/// needed to distribute virtual_data on leaf nodes.
 	pub structural_topology: Option<(GreenNode, Vec<u8>)>,
@@ -80,7 +81,7 @@ impl SemanticReactor {
 		while let Ok(request) = rx.recv() {
 			let provider = registry.get_provider(&request.language_id);
 
-			let (highlights, diagnostics, structural_topology) = match provider {
+			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider {
 				Some(p) => {
 					let source_bytes = request.content;
 
@@ -94,21 +95,21 @@ impl SemanticReactor {
 					// Deep semantic analysis is string-oriented. A document that is not
 					// valid UTF-8 forgoes it rather than being rewritten to suit it; it
 					// still gets topology and lexical highlighting.
-					let (highlights, diagnostics) = match std::str::from_utf8(&source_bytes) {
+					let (highlights, diagnostics, inline_annotations) = match std::str::from_utf8(&source_bytes) {
 						Ok(text) => {
 							let output = p.semantic_reactor(
 								Arc::new(text.to_owned()),
 								request.global_offset,
 								&request.file_path,
 							);
-							(output.highlights, output.diagnostics)
+							(output.highlights, output.diagnostics, output.inline_annotations)
 						}
-						Err(_) => (Vec::new(), Vec::new()),
+						Err(_) => (Vec::new(), Vec::new(), Vec::new()),
 					};
 
-					(highlights, diagnostics, topology)
+					(highlights, diagnostics, inline_annotations, topology)
 				}
-				None => (Vec::new(), Vec::new(), None),
+				None => (Vec::new(), Vec::new(), Vec::new(), None),
 			};
 
 			let _ = tx.send(SemanticResponse {
@@ -117,6 +118,7 @@ impl SemanticReactor {
 				request_id: request.request_id,
 				highlights,
 				diagnostics,
+				inline_annotations,
 				structural_topology,
 			});
 			let _ = tx_internal.send(InternalEvent::Refresh);

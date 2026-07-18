@@ -54,6 +54,7 @@ impl LanguageProvider for PythonProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 

@@ -210,6 +210,7 @@ fn analyze_workspace_file(
 				})
 				.collect(),
 			diagnostics,
+			inline_annotations: Vec::new(),
 		},
 		_ => SemanticOutput::default(),
 	}

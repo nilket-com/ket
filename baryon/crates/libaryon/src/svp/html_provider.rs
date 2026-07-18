@@ -39,6 +39,7 @@ impl LanguageProvider for HtmlProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 }

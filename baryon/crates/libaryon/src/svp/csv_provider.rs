@@ -42,6 +42,7 @@ impl LanguageProvider for CsvProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 
@@ -82,6 +83,7 @@ impl LanguageProvider for TsvProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 

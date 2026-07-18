@@ -423,6 +423,7 @@ fn render_pane_viewport(
 		global_start_byte,
 		highlights,
 		diagnostics,
+		inline_annotations,
 		selection_ranges,
 		minimap,
 		markdown_preview,
@@ -476,6 +477,7 @@ fn render_pane_viewport(
 				false,
 				None,
 				DocByte::ZERO,
+				Vec::new(),
 				Vec::new(),
 				Vec::new(),
 				Vec::new(),
@@ -1037,6 +1039,9 @@ fn render_pane_viewport(
 			tab.semantic
 				.as_deref()
 				.map_or_else(Vec::new, |semantic| semantic.diagnostics.clone()),
+			tab.semantic
+				.as_deref()
+				.map_or_else(Vec::new, |semantic| semantic.inline_annotations.clone()),
 			selection_ranges,
 			minimap,
 			markdown_preview,
@@ -1150,6 +1155,7 @@ fn render_pane_viewport(
 		global_start_byte,
 		highlights,
 		diagnostics,
+		inline_annotations,
 		selection_ranges,
 		yank_flash,
 		minimap,

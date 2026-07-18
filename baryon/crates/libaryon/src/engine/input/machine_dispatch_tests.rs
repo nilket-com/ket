@@ -54,6 +54,7 @@ fn test_viewport() -> Viewport {
 			global_start_byte: DocByte::ZERO,
 			highlights: Vec::new(),
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 			selection_ranges: Vec::new(),
 			yank_flash: None,
 			minimap: None,

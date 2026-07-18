@@ -178,6 +178,7 @@ pub struct PaneViewport {
 	pub global_start_byte: DocByte,
 	pub highlights: Vec<HighlightSpan>,
 	pub diagnostics: Vec<DiagnosticSpan>,
+	pub inline_annotations: Vec<crate::engine::language::InlineAnnotation>,
 	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,

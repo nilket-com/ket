@@ -5,6 +5,7 @@ pub mod bash_provider;
 pub mod csv_highlight;
 pub mod csv_parse;
 pub mod csv_provider;
+pub mod cargo_annotations;
 pub mod csv_semantic;
 pub mod diagnostic;
 pub mod fs_provider;

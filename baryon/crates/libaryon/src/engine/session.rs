@@ -1290,6 +1290,7 @@ pub(crate) struct UiState {
 pub(crate) struct SemanticState {
 	pub(crate) highlights: Vec<HighlightSpan>,
 	pub(crate) diagnostics: Vec<DiagnosticSpan>,
+	pub(crate) inline_annotations: Vec<super::language::InlineAnnotation>,
 	pub(crate) last_semantic_state: Option<StateId>,
 	pub(crate) last_semantic_len: usize,
 	pub(crate) last_semantic_path: Option<String>,
@@ -1303,6 +1304,7 @@ impl SemanticState {
 		Self {
 			highlights: Vec::new(),
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 			last_semantic_state: None,
 			last_semantic_len: usize::MAX,
 			last_semantic_path: None,
@@ -1315,6 +1317,7 @@ impl SemanticState {
 	pub(crate) fn reset_pipeline(&mut self) {
 		self.highlights.clear();
 		self.diagnostics.clear();
+		self.inline_annotations.clear();
 		self.last_semantic_state = None;
 		self.last_semantic_len = usize::MAX;
 		self.last_semantic_path = None;

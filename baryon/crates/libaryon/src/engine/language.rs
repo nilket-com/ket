@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::core::DocByte;
+use crate::core::{DocByte, DocLine};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::kind::SemanticKind;
@@ -15,6 +15,22 @@ use crate::uast::kind::SemanticKind;
 pub struct SemanticOutput {
 	pub highlights: Vec<HighlightSpan>,
 	pub diagnostics: Vec<DiagnosticSpan>,
+	pub inline_annotations: Vec<InlineAnnotation>,
+}
+
+/// Non-editable text projected at the end of a source line by a frontend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAnnotation {
+	pub line: DocLine,
+	pub text: String,
+	pub kind: InlineAnnotationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineAnnotationKind {
+	Info,
+	Current,
+	Upgrade,
 }
 
 // ============================================================

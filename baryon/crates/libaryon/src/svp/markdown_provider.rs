@@ -39,6 +39,7 @@ impl LanguageProvider for MarkdownProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 }

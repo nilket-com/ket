@@ -106,6 +106,7 @@ impl LanguageProvider for SqlProvider {
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),
+			inline_annotations: Vec::new(),
 		}
 	}
 
