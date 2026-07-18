@@ -20,9 +20,14 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
 
+/// The registered application monospace font. Named explicitly (rather than
+/// `Font::MONOSPACE`, which resolves to the platform default) so
+/// `metrics::CELL_WIDTH` describes the same glyphs on every machine.
+const EDITOR_FONT: iced::Font = iced::Font::with_name("DejaVu Sans Mono");
+
 /// Shared text geometry. Layout (`view`), click mapping, scroll conversion,
 /// and cell-grid sizing must all agree on these values, so they live in one
-/// place. `CELL_WIDTH` is an estimate of `Font::MONOSPACE`'s advance at
+/// place. `CELL_WIDTH` is an estimate of `EDITOR_FONT`'s advance at
 /// `TEXT_SIZE`; exact per-glyph metrics arrive with the custom
 /// `advanced::Widget`, until then click columns can drift on very long lines.
 mod metrics {
@@ -214,7 +219,7 @@ impl CodeEditor {
 		let Some(viewport) = self.viewport.as_ref() else {
 			return container(
 				text("Starting editor…")
-					.font(iced::Font::MONOSPACE)
+					.font(EDITOR_FONT)
 					.size(metrics::TEXT_SIZE),
 			)
 			.padding(12)
@@ -273,7 +278,7 @@ impl CodeEditor {
 			row![
 				container(
 					text(number)
-						.font(iced::Font::MONOSPACE)
+						.font(EDITOR_FONT)
 						.size(metrics::TEXT_SIZE)
 						.color(number_color)
 				)
@@ -284,7 +289,7 @@ impl CodeEditor {
 					..Default::default()
 				}),
 				rich_text(fragments)
-					.font(iced::Font::MONOSPACE)
+					.font(EDITOR_FONT)
 					.size(metrics::TEXT_SIZE)
 					.line_height(metrics::LINE_HEIGHT),
 			]

@@ -29,12 +29,9 @@ rand_distr = "0.6.0"
 ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
 regex = "1.12.3"
 resvg = "0.47.0"
-ropey = "1.6.1"
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
 sqlparser = "0.61.0"
 svg_fmt = "0.4.5"
-tree-sitter = "0.26.7"
-tree-sitter-rust = "0.24.1"
 tiny-skia = "0.12.0"
 tokio = { version = "1.50.0", features = ["full"] }
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
