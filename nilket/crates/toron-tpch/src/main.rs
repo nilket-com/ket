@@ -3569,6 +3569,8 @@ fn prepare_paired_ablation_journal(
 	if dataset_fingerprint.is_empty() {
 		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
 	}
+	let (memory_per_task, _) = gauge_memory_per_task()?;
+	let (spill_bytes_reserved, _) = gauge_spill_bytes_reserved()?;
 	std::fs::create_dir_all(output_dir)
 		.map_err(|error| format!("create paired-ablation output directory: {error}"))?;
 	let journal_path = output_dir.join(ADR449_PAIRED_JOURNAL);
@@ -3587,6 +3589,11 @@ fn prepare_paired_ablation_journal(
 		"runs": runs,
 		"warmup": warmup,
 		"dataset_fingerprint": dataset_fingerprint,
+		// A cohort's budget regime is part of its identity (ADR 454/455): a
+		// resume across different budget coordinates would mix regimes exactly
+		// like a resume across datasets.
+		"memory_per_task": memory_per_task,
+		"spill_bytes_reserved": spill_bytes_reserved,
 	});
 	if manifest_path.exists() {
 		let bytes = std::fs::read(&manifest_path)
@@ -3877,6 +3884,25 @@ mod tests {
 			)
 			.is_err()
 		);
+		// ADR 456: a resume across different budget coordinates is a regime mix
+		// and must refuse exactly like a scale or dataset mismatch.
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "134217728") };
+		assert!(
+			prepare_paired_ablation_journal(
+				&directory,
+				"q05",
+				"strict",
+				4.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"fnv1a64:cohort",
+			)
+			.is_err()
+		);
+		unsafe { std::env::remove_var("TORON_TPCH_MEMORY_PER_TASK") };
 		// ADR 452: a regenerated dataset at the same path must refuse to resume,
 		// and an empty fingerprint (no verified dataset) must never launch.
 		assert!(
