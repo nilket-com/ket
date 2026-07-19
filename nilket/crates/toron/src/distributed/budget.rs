@@ -104,12 +104,6 @@ impl QueryBudget {
 	}
 }
 
-impl Default for QueryBudget {
-	fn default() -> Self {
-		Self::test_default()
-	}
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantBudget {
 	pub memory_per_task: ByteCount,
@@ -247,7 +241,7 @@ pub struct TenantBudgetPolicy {
 
 impl TenantBudgetPolicy {
 	pub fn omitted_config(worker_memory_budget: ByteCount) -> Self {
-		let base = QueryBudget::default();
+		let base = QueryBudget::test_default();
 		let aggregate_memory = worker_memory_budget.max(base.memory_per_task);
 		Self {
 			default: TenantBudget::new(base.memory_per_task, aggregate_memory),
@@ -297,7 +291,7 @@ impl TenantBudgetPolicy {
 	}
 
 	pub fn query_budget_for(&self, tenant_id: TenantId) -> QueryBudget {
-		self.query_budget_for_base(tenant_id, QueryBudget::default())
+		self.query_budget_for_base(tenant_id, QueryBudget::test_default())
 	}
 
 	pub fn query_budget_for_base(&self, tenant_id: TenantId, mut base: QueryBudget) -> QueryBudget {

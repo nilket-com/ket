@@ -3917,14 +3917,14 @@ mod tests {
 	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
 
 	fn test_task_budget() -> TaskBudget {
-		let mut query_budget = QueryBudget::default();
+		let mut query_budget = QueryBudget::test_default();
 		query_budget.memory_per_task = ByteCount::new(64 * 1024 * 1024);
 		query_budget.spill_bytes_reserved_per_query = ByteCount::new(512 * 1024 * 1024);
 		TaskBudget::from_query_budget(query_budget)
 	}
 
 	fn test_task_budget_with_memory(memory: u64) -> TaskBudget {
-		let mut query_budget = QueryBudget::default();
+		let mut query_budget = QueryBudget::test_default();
 		query_budget.memory_per_task = ByteCount::new(memory);
 		query_budget.spill_bytes_reserved_per_query = ByteCount::new(512 * 1024 * 1024);
 		TaskBudget::from_query_budget(query_budget)

@@ -2562,7 +2562,9 @@ fn same_descriptor_identity(existing: &TableBinding, candidate: &TableBinding) -
 fn default_descriptor_sync_flights() -> Arc<DescriptorSyncFlights> {
 	Arc::new(DescriptorSyncFlights::new(
 		TenantDescriptorSyncAccountant::new(TenantBudgetPolicy::from_query_budget(
-			QueryBudget::default(),
+			// Explicit test constant (ADR 462); config-derived budgets are the
+			// named follow-on.
+			QueryBudget::test_default(),
 		)),
 	))
 }
@@ -2629,7 +2631,7 @@ impl WendelonCatalog {
 			tenant_id,
 			registry,
 			TenantDescriptorSyncAccountant::new(TenantBudgetPolicy::from_query_budget(
-				QueryBudget::default(),
+				QueryBudget::test_default(),
 			)),
 		)
 	}

@@ -114,7 +114,7 @@ fn toron_example_config_loads() {
 	assert!(config.tls.is_none());
 	assert_eq!(
 		config.tenant_budgets.default.memory_per_task,
-		QueryBudget::default().memory_per_task
+		QueryBudget::test_default().memory_per_task
 	);
 	assert_eq!(
 		config.tenant_budgets.default.aggregate_memory,

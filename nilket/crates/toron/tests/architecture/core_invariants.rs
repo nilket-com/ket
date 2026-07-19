@@ -487,3 +487,13 @@ pub(crate) fn adr077_leaf_names_conserved_after_subbucketing() {
 	let adr077_marker = ["fn", "adr077_"].join(" ");
 	assert_eq!(architecture.matches(&adr077_marker).count(), 5);
 }
+
+#[test]
+pub(crate) fn adr462_query_budget_has_no_silent_default() {
+	// The 64 MiB unit-test budget must be an explicit choice at every site:
+	// a Default impl let it reach production silently (measured by ADR 454-461).
+	assert_toron_sources_do_not_contain(&[
+		"impl Default for QueryBudget",
+		"QueryBudget::default()",
+	]);
+}

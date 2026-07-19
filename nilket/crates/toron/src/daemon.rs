@@ -285,7 +285,10 @@ impl ToronDaemon {
 				Arc::clone(&memory),
 				transport,
 				planner_config,
-				QueryBudget::default(),
+				// Explicit test constant (ADR 462): deriving a production budget
+				// from config.worker.memory_budget_bytes is the named follow-on;
+				// this call site is its wiring point.
+				QueryBudget::test_default(),
 				coordinator_writer,
 				coordinator_deleter,
 				coordinator_admin,

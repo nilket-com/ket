@@ -279,6 +279,11 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/pbc.rs",
 				// ADR 399: executor-internal join build maps use a private keyed fast hasher.
 				"crates/toron/Cargo.toml",
+				// ADR 462: the silent QueryBudget default was removed; these sites
+				// became explicit test_default() choices.
+				"crates/toron/src/catalog.rs",
+				"crates/toron/src/distributed/budget.rs",
+				"crates/toron/tests/config_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

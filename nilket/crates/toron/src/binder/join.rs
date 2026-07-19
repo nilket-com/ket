@@ -1107,7 +1107,8 @@ pub(super) fn effective_auto_broadcast_threshold(config: &PlannerConfig) -> Opti
 }
 
 pub(super) fn default_auto_broadcast_cap_ceiling() -> ByteCount {
-	ByteCount::new(QueryBudget::default().broadcast_build_bytes_per_task.get() / 4)
+	let budget = QueryBudget::test_default();
+	ByteCount::new(budget.broadcast_build_bytes_per_task.get() / 4)
 }
 
 pub(super) fn restore_declared_join_order_project(
