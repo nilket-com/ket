@@ -404,6 +404,9 @@ pub(super) fn suggest_setting_from_candidates(
 	let mut best: Option<(usize, String)> = None;
 	let mut tied = false;
 	for candidate in candidates {
+		if candidate == token {
+			continue;
+		}
 		let distance = setting_edit_distance(token, &candidate);
 		if distance > max_distance || distance >= token.chars().count() {
 			continue;
@@ -652,6 +655,14 @@ mod tests {
 		assert_eq!(
 			parse_set_command("nolangtheme").unwrap_err(),
 			"Usage: set nolangtheme LANG"
+		);
+	}
+
+	#[test]
+	fn setting_suggestions_never_repeat_the_unknown_token() {
+		assert_eq!(
+			suggest_setting_from_candidates("initw", vec!["initw".to_string()]),
+			None
 		);
 	}
 

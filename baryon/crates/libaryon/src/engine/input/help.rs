@@ -144,6 +144,13 @@ pub(super) fn resolve_topic(name: &str) -> Result<HelpTopic, String> {
 		return Ok(HelpTopic::General(spec));
 	}
 	let token = name.strip_prefix(':').unwrap_or(name);
+	if matches!(token, "initwrite" | "initw" | "initwrite!" | "initw!") {
+		let settings = GENERAL_HELP_TOPICS
+			.iter()
+			.find(|spec| spec.name == "set")
+			.expect("the settings help topic must be registered");
+		return Ok(HelpTopic::General(settings));
+	}
 	for spec in COMMANDS {
 		if token == spec.name || spec.aliases.contains(&token) {
 			return Ok(HelpTopic::Command(spec));
@@ -998,7 +1005,8 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 		push_line(
 			&mut out,
 			"`:set OPTION [VALUE]` changes an option for this session. Put startup \
-			 configuration in `init.rn`. \
+			 configuration in `init.rn`; `:set initwrite` (or `:set initw`) atomically \
+			 exports the current builtin settings there. \
 			 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 			 prefixing the option with `no` turns it off, e.g. `:set nowrap`. \
 			 The bare forms (`:wrap`, `:nowrap`, ...) change this session only.",
@@ -1007,7 +1015,8 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 		push_line(
 			&mut out,
 			"`:set OPTION [VALUE]` changes a named option for this session. Builtin and \
-			 extension startup configuration belongs in `init.rn`. \
+			 extension startup configuration belongs in `init.rn`; `:set initwrite` exports \
+			 the current builtin settings there. \
 			 Boolean VALUE is on or off (also true/false, yes/no); omitting VALUE means \
 			 on, and prefixing the option with `no` turns it off.",
 		);
@@ -1354,7 +1363,8 @@ fn render_set() -> String {
 	push_line(&mut out, "");
 	push_wrapped(
 		&mut out,
-		"':set OPTION [VALUE]' changes an option for this session. Put startup configuration in init.rn. \
+		"':set OPTION [VALUE]' changes an option for this session. Use ':set initwrite' (or \
+		 ':set initw') to atomically export the current builtin settings to init.rn; put other startup configuration there. \
 		 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 		 prefixing the option with 'no' turns it off, e.g. ':set nowrap'.",
 	);
@@ -1617,6 +1627,18 @@ mod tests {
 				assert!(std::ptr::eq(spec, resolved));
 			}
 		}
+	}
+
+	#[test]
+	fn initwrite_help_aliases_resolve_to_settings() {
+		for name in ["initwrite", "initw", "initwrite!", "initw!"] {
+			let HelpTopic::General(spec) = topic(name) else {
+				panic!("{name} should resolve to the settings help page");
+			};
+			assert_eq!(spec.name, "set");
+		}
+		let rendered = render_markdown(&topic("initw"));
+		assert!(rendered.contains(":set initwrite"));
 	}
 
 	#[test]
