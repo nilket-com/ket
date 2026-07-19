@@ -621,7 +621,10 @@ pub(crate) fn adr181_uniform_strategy_recognizer() {
 	assert!(uniform.contains("JoinPhysicalPlacement::SwappedRightBuild"));
 	assert!(uniform.contains("StarOrderStrategy::Broadcast"));
 	assert!(uniform.contains("JoinStrategy::HashPartitioned"));
-	assert!(uniform.contains("JoinPhysicalPlacement::Natural"));
+	// ADR 467: hash uniformity is strategy uniformity; placement rides the
+	// per-dimension fingerprint, so the hash arm no longer matches on placement.
+	assert!(uniform.contains("ADR 467"));
+	assert!(!uniform.contains("placement == JoinPhysicalPlacement::Natural"));
 	assert!(uniform.contains("StarOrderStrategy::HashPartitioned"));
 }
 

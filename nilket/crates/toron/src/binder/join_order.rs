@@ -3520,8 +3520,9 @@ pub(super) fn uniform_star_order_strategy(
 		return Some(StarOrderStrategy::Broadcast);
 	}
 	if decisions.iter().all(|decision| {
+		// ADR 467: hash uniformity is strategy uniformity; the per-dimension
+		// placement rides the fingerprint (192's relaxation, hash tier).
 		decision.strategy == JoinStrategy::HashPartitioned
-			&& decision.placement == JoinPhysicalPlacement::Natural
 	}) {
 		return Some(StarOrderStrategy::HashPartitioned);
 	}
@@ -3552,8 +3553,9 @@ pub(super) fn uniform_snowflake_order_strategy(
 		return Some(StarOrderStrategy::Broadcast);
 	}
 	if decisions.iter().all(|decision| {
+		// ADR 467: hash uniformity is strategy uniformity; the per-dimension
+		// placement rides the fingerprint (192's relaxation, hash tier).
 		decision.strategy == JoinStrategy::HashPartitioned
-			&& decision.placement == JoinPhysicalPlacement::Natural
 	}) {
 		return Some(StarOrderStrategy::HashPartitioned);
 	}
@@ -3590,7 +3592,10 @@ fn order_strategy_fingerprint(
 			(JoinStrategy::Broadcast, JoinPhysicalPlacement::Natural) => {
 				composite_build_positions.contains(&position)
 			}
-			(JoinStrategy::HashPartitioned, JoinPhysicalPlacement::Natural) => true,
+			// ADR 467: hash placement is order-dependent information the
+			// fingerprint carries, not a validity constraint — the 192 relaxation,
+			// applied to the hash tier.
+			(JoinStrategy::HashPartitioned, _) => true,
 			_ => false,
 		};
 		if !valid {
@@ -3615,7 +3620,10 @@ fn preserved_outer_order_strategy_fingerprint(
 			(JoinStrategy::Broadcast, JoinPhysicalPlacement::Natural) => {
 				composite_build_positions.contains(&position)
 			}
-			(JoinStrategy::HashPartitioned, JoinPhysicalPlacement::Natural) => true,
+			// ADR 467: hash placement is order-dependent information the
+			// fingerprint carries, not a validity constraint — the 192 relaxation,
+			// applied to the hash tier.
+			(JoinStrategy::HashPartitioned, _) => true,
 			_ => false,
 		};
 		if !valid {

@@ -25729,3 +25729,36 @@ async fn adr466_hash_swapped_placement_swaps_physical_build_and_restores_order()
 	assert!(matches!(terminal_exchange(left), Some((count, _)) if count > 1));
 	assert!(matches!(terminal_exchange(right), Some((count, _)) if count > 1));
 }
+
+#[test]
+fn adr467_hash_tier_uniformity_is_strategy_uniform_with_placement_in_fingerprint() {
+	let hash_receipt = |placement| DecisionReceipt {
+		target: JoinTraceTarget { join_index: 0 },
+		strategy: JoinStrategy::HashPartitioned,
+		placement,
+		reason: JoinStrategyDecisionReason::HashByDefault {
+			reason: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
+		},
+	};
+	// Mixed hash placements are one uniform hash tier (467, the 192 relaxation
+	// applied to hash). Fails under the pre-467 placement-strict recognizer.
+	assert_eq!(
+		join_order::uniform_star_order_strategy(&[
+			hash_receipt(JoinPhysicalPlacement::Natural),
+			hash_receipt(JoinPhysicalPlacement::SwappedRightBuild),
+		]),
+		Some(join_order::StarOrderStrategy::HashPartitioned)
+	);
+	// The broadcast tier's authentication rule is untouched: unauthenticated
+	// Broadcast + Natural still declines the uniform tier.
+	let broadcast_natural = DecisionReceipt {
+		target: JoinTraceTarget { join_index: 0 },
+		strategy: JoinStrategy::Broadcast,
+		placement: JoinPhysicalPlacement::Natural,
+		reason: JoinStrategyDecisionReason::PinnedByAuthor,
+	};
+	assert_eq!(
+		join_order::uniform_star_order_strategy(&[broadcast_natural]),
+		None
+	);
+}
