@@ -249,7 +249,13 @@ fn prune_empty_ancestors(registry: &UastRegistry, start: NodeId) -> (NodeId, u32
 		if is_only_root_child {
 			// Keep one zero-length effective leaf attached to every empty document.
 			// Text anchors can then resolve byte zero without ever treating the root
-			// itself as a leaf or manufacturing a placeholder NodeId.
+			// itself as a leaf or manufacturing a placeholder NodeId. A structural
+			// graft can leave this survivor without leaf data; normalize it to a
+			// writable virtual leaf so the next insertion cannot advance metrics
+			// without storing its bytes.
+			registry.hot_swap_virtual_data(curr, Vec::new());
+			registry.metrics_inflated[curr.index()].store(true, Ordering::Release);
+			registry.set_terminal_newline(curr, false);
 			return (curr, 0);
 		}
 		let previous = previous_leaf_in_document(registry, curr);

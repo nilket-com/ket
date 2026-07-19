@@ -987,6 +987,26 @@ mod tests {
 	}
 
 	#[test]
+	fn backspacing_an_in_memory_document_to_empty_keeps_it_editable() {
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		send_keys(&mut editor, ['i', 's', 'e', 'l', 'e', 'c', 't']);
+		wait_for_content(&mut editor, "select");
+
+		for _ in 0..6 {
+			let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Backspace,
+				modifiers: Modifiers::NONE,
+			}));
+		}
+		wait_for_content(&mut editor, "");
+		assert_ne!(editor.status_message(), Some("Loading cursor extent"));
+
+		send_keys(&mut editor, ['x']);
+		wait_for_content(&mut editor, "x");
+	}
+
+	#[test]
 	fn in_memory_content_round_trips_through_the_engine() {
 		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
