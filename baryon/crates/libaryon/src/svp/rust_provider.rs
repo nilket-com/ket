@@ -9,9 +9,9 @@ use ra_ap_base_db::{CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Env, Sou
 use ra_ap_cfg::CfgOptions;
 use ra_ap_ide::{
 	Analysis, AnalysisHost, AssistResolveStrategy, Cancellable, DiagnosticsConfig, Highlight,
-	HighlightConfig, HlMod, HlTag, SymbolKind,
+	HighlightConfig, HlMod, HlTag, RaFixtureConfig, SymbolKind,
 };
-use ra_ap_ide_db::{ChangeWithProcMacros, MiniCore, Severity};
+use ra_ap_ide_db::{ChangeWithProcMacros, Severity};
 use ra_ap_paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{
 	CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
@@ -734,7 +734,7 @@ pub(crate) fn highlight_config() -> HighlightConfig<'static> {
 		inject_doc_comment: false,
 		macro_bang: true,
 		syntactic_name_ref_highlighting: true,
-		minicore: MiniCore::default(),
+		ra_fixture: RaFixtureConfig::default(),
 	}
 }
 

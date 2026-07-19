@@ -236,7 +236,8 @@ fn collect_set_expr_nodes(
 			for projection in &select.projection {
 				match projection {
 					ast::SelectItem::UnnamedExpr(expr)
-					| ast::SelectItem::ExprWithAlias { expr, .. } => {
+					| ast::SelectItem::ExprWithAlias { expr, .. }
+					| ast::SelectItem::ExprWithAliases { expr, .. } => {
 						collect_expr_subqueries(expr, line_index, out);
 					}
 					ast::SelectItem::QualifiedWildcard(_, _) | ast::SelectItem::Wildcard(_) => {}
@@ -257,7 +258,7 @@ fn collect_set_expr_nodes(
 		}
 		ast::SetExpr::Values(values) => {
 			for row in &values.rows {
-				for expr in row {
+				for expr in &row.content {
 					collect_expr_subqueries(expr, line_index, out);
 				}
 			}
@@ -299,7 +300,11 @@ fn collect_table_with_joins_subqueries(
 				collect_expr_subqueries(match_condition, line_index, out);
 				collect_join_constraint_subqueries(constraint, line_index, out);
 			}
-			ast::JoinOperator::CrossApply | ast::JoinOperator::OuterApply => {}
+			ast::JoinOperator::CrossApply
+			| ast::JoinOperator::OuterApply
+			| ast::JoinOperator::ArrayJoin
+			| ast::JoinOperator::LeftArrayJoin
+			| ast::JoinOperator::InnerArrayJoin => {}
 		}
 	}
 }
@@ -702,7 +707,7 @@ fn visit_statement(
 			visit_table_object(&insert.table, line_index, global_offset, out);
 			if let Some(alias) = &insert.table_alias {
 				emit_ident(
-					alias,
+					&alias.alias,
 					TokenCategory::Variable,
 					line_index,
 					global_offset,
@@ -710,7 +715,7 @@ fn visit_statement(
 				);
 			}
 			for column in &insert.columns {
-				emit_ident(
+				emit_object_name(
 					column,
 					TokenCategory::Variable,
 					line_index,
@@ -844,7 +849,7 @@ fn visit_set_expr(
 		}
 		ast::SetExpr::Values(values) => {
 			for row in &values.rows {
-				for expr in row {
+				for expr in &row.content {
 					visit_expr(expr, line_index, global_offset, out);
 				}
 			}
@@ -871,6 +876,12 @@ fn visit_select(
 					global_offset,
 					out,
 				);
+			}
+			ast::SelectItem::ExprWithAliases { expr, aliases } => {
+				visit_expr(expr, line_index, global_offset, out);
+				for alias in aliases {
+					emit_ident(alias, TokenCategory::Variable, line_index, global_offset, out);
+				}
 			}
 			ast::SelectItem::QualifiedWildcard(kind, _) => match kind {
 				ast::SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
@@ -1014,7 +1025,11 @@ fn visit_table_with_joins(
 				visit_expr(match_condition, line_index, global_offset, out);
 				visit_join_constraint(constraint, line_index, global_offset, out);
 			}
-			ast::JoinOperator::CrossApply | ast::JoinOperator::OuterApply => {}
+			ast::JoinOperator::CrossApply
+			| ast::JoinOperator::OuterApply
+			| ast::JoinOperator::ArrayJoin
+			| ast::JoinOperator::LeftArrayJoin
+			| ast::JoinOperator::InnerArrayJoin => {}
 		}
 	}
 }
@@ -1254,6 +1269,7 @@ fn visit_table_object(
 		ast::TableObject::TableFunction(function) => {
 			visit_function(function, line_index, global_offset, out)
 		}
+		ast::TableObject::TableQuery(query) => visit_query(query, line_index, global_offset, out),
 	}
 }
 
@@ -1301,7 +1317,7 @@ fn visit_function_arg_expr(
 				out,
 			);
 		}
-		ast::FunctionArgExpr::Wildcard => {}
+		ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::WildcardWithOptions(_) => {}
 	}
 }
 
@@ -1633,7 +1649,7 @@ fn visit_expr(
 		ast::Expr::Lambda(lambda) => {
 			for ident in &lambda.params {
 				emit_ident(
-					ident,
+					&ident.name,
 					TokenCategory::Variable,
 					line_index,
 					global_offset,
