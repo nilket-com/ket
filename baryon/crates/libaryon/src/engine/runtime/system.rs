@@ -1160,6 +1160,14 @@ pub(super) fn handle_file_doctab_command(
 			| EditorCommand::ReloadFile { .. }
 			| EditorCommand::ReplaceDocument { .. }
 	);
+	// A newly installed document always starts at byte zero. Keep that known,
+	// exact position instead of immediately asking the sparse resolver to
+	// rediscover it: in-memory embedders such as Polariton have no backing I/O
+	// to wait for, and a replacement must be editable as soon as it is visible.
+	let installs_new_document = matches!(
+		&command,
+		EditorCommand::LoadFile(_) | EditorCommand::ReplaceDocument { .. }
+	);
 	let state_before = tab.document.ledger.current_state_id;
 	if resets_search_results {
 		tab.document.bump_topology_rev();
@@ -1215,13 +1223,25 @@ pub(super) fn handle_file_doctab_command(
 		tab.view.common.reset_minimap_cache();
 	}
 	tab.document.root_id = root_id.expect("text file command must retain a root");
-	tab.cursor.primary_mut().resolve(
-		ctx.registry,
-		tab.document.root_id,
-		&mut tab.view.folds,
-		tab.document.topology_rev,
-		tab.document.ledger.current_state_id,
-	);
+	if installs_new_document {
+		let initial_leaf = ctx
+			.registry
+			.find_node_at_doc_byte_raw(tab.document.root_id, DocByte::ZERO)
+			.node_id;
+		tab.cursor.primary_mut().reset_to_start(
+			initial_leaf,
+			tab.document.topology_rev,
+			tab.document.ledger.current_state_id,
+		);
+	} else {
+		tab.cursor.primary_mut().resolve(
+			ctx.registry,
+			tab.document.root_id,
+			&mut tab.view.folds,
+			tab.document.topology_rev,
+			tab.document.ledger.current_state_id,
+		);
+	}
 	if resets_search_results && tab.document.ledger.current_state_id != state_before {
 		tab.document.search_matches.clear();
 		*tab.match_index = None;

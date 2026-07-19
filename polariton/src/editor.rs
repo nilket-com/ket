@@ -1011,6 +1011,26 @@ mod tests {
 	}
 
 	#[test]
+	fn immediate_typing_after_replacing_an_in_memory_document_never_waits_for_extent() {
+		let mut editor = CodeEditor::new("");
+		for index in 0..32 {
+			let statement = format!("select {index};");
+			editor.replace_content(&statement);
+			send_keys(&mut editor, ['i', 'x']);
+			wait_for_content(&mut editor, &format!("x{statement}"));
+			let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Esc,
+				modifiers: Modifiers::NONE,
+			}));
+			assert_ne!(
+				editor.status_message(),
+				Some("Loading cursor extent"),
+				"replacement {index} left the in-memory cursor unresolved"
+			);
+		}
+	}
+
+	#[test]
 	fn viewport_scroll_and_minimap_navigation_stay_engine_owned() {
 		use super::EditorMsg;
 		use libaryon::core::DocLine;
