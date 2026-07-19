@@ -1543,6 +1543,11 @@ fn select_git_status_target_pane(
 	session: &EditorSession,
 	source_pane_id: PaneId,
 ) -> Option<PaneId> {
+	if let Some(pane_id) = session.navigation_target_pane_id()
+		&& pane_id != source_pane_id
+	{
+		return Some(pane_id);
+	}
 	let source_rect = session
 		.pane_layouts()
 		.into_iter()

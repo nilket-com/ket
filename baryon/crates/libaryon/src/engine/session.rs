@@ -3528,17 +3528,8 @@ impl EditorSession {
 	}
 
 	pub(crate) fn focus_pane(&mut self, pane_id: PaneId) -> bool {
-		if let Some(pane) = self.layout.find_pane(pane_id) {
-			if pane.active_tab().is_file_browser() {
-				if self.focused_pane_id != pane_id
-					&& self
-						.layout
-						.find_pane(self.focused_pane_id)
-						.is_some_and(|focused| !focused.active_tab().is_file_browser())
-				{
-					self.browser_target_pane_id = Some(self.focused_pane_id);
-				}
-			} else {
+		if self.layout.find_pane(pane_id).is_some() {
+			if self.is_navigation_target_pane(pane_id) {
 				self.browser_target_pane_id = Some(pane_id);
 			}
 			self.focused_pane_id = pane_id;
@@ -3546,6 +3537,24 @@ impl EditorSession {
 		} else {
 			false
 		}
+	}
+
+	/// Last focused editable pane. Navigation panes (file browser and output
+	/// panels) deliberately do not replace it, so they can open entries where
+	/// the user was reading before navigating.
+	pub(crate) fn navigation_target_pane_id(&self) -> Option<PaneId> {
+		let pane_id = self.browser_target_pane_id?;
+		self.is_navigation_target_pane(pane_id).then_some(pane_id)
+	}
+
+	fn is_navigation_target_pane(&self, pane_id: PaneId) -> bool {
+		let Some(pane) = self.layout.find_pane(pane_id) else {
+			return false;
+		};
+		let Some(buffer) = self.buffers.get(pane.active_tab().buffer_id) else {
+			return false;
+		};
+		!buffer.is_output_panel() && !buffer.is_file_browser() && !buffer.is_markdown_preview()
 	}
 
 	pub(crate) fn focus_pane_in_direction(&mut self, direction: PaneFocusDirection) -> bool {
