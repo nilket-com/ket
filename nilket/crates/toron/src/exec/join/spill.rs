@@ -8,6 +8,24 @@ const COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES: u64 = 1024 * 1024;
 const COMPACT_SPILL_INDEX_MAX_INPUT_ROWS: u64 = 20_000_000;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Preserve the direct unindexed writer's empty-page behavior before a fragment
+/// enters the coalescing buffer. A fragment containing no joinable keys was
+/// previously skipped rather than spilled.
+fn batch_has_spillable_join_key(
+	batch: &RecordBatch,
+	key_plan: JoinKeyPlan,
+	build_keys: &[crate::ir::ColumnOrdinal],
+	null_safe_keys: bool,
+) -> Result<bool, ExecutionError> {
+	let arrays = key_arrays(batch, build_keys)?;
+	for row in 0..batch.num_rows() {
+		if join_key_at(key_plan, &arrays, row, null_safe_keys)?.is_some() {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
 pub(crate) fn partition_bucket(
 	key_arrays: &[ArrayRef],
 	row: usize,
@@ -1221,6 +1239,12 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	pin_decoded_outcome: Option<PinDecodedPagesOutcome>,
 	spill_bytes: u64,
 	writer_peak: u64,
+	// Only the unindexed reservoir writer uses this buffer. Indexed writers publish
+	// page references as they write, so changing their page boundaries would change
+	// the meaning of already-recorded row references.
+	pending_unindexed_batches: Vec<RecordBatch>,
+	pending_unindexed_rows: usize,
+	pending_unindexed_bytes: u64,
 	rows: u64,
 	input_rows: u64,
 	input_batches_written: u64,
@@ -1370,6 +1394,9 @@ impl SpilledInnerJoinBuild {
 			pin_decoded_outcome: None,
 			spill_bytes: 0,
 			writer_peak: 0,
+			pending_unindexed_batches: Vec::new(),
+			pending_unindexed_rows: 0,
+			pending_unindexed_bytes: 0,
 			rows: 0,
 			input_rows: 0,
 			input_batches_written: 0,
@@ -1494,7 +1521,12 @@ impl SpilledInnerJoinBuild {
 			task_budget,
 			None,
 		)
-		.await
+		.await?;
+		// This direct API has historically sealed each call. Keep that contract for
+		// non-reservoir callers and unit tests; the streaming reservoir owns the
+		// cross-batch flush barrier through the profiled path below.
+		self.flush_unindexed_page_buffer(key_plan, build_keys, null_safe_keys, task_budget, None)
+			.await
 	}
 
 	pub(in crate::exec) async fn write_batch_chunks_unindexed_profiled(
@@ -1514,13 +1546,11 @@ impl SpilledInnerJoinBuild {
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let chunk = batch.slice(offset, len);
-			self.write_page_batch_inner(
+			self.buffer_unindexed_page_batch(
 				&chunk,
 				key_plan,
 				build_keys,
 				null_safe_keys,
-				false,
-				false,
 				task_budget,
 				observer,
 			)
@@ -1609,19 +1639,122 @@ impl SpilledInnerJoinBuild {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let chunk = batch.slice(offset, len);
 			let projected = project_batch_columns(&chunk, retained_columns)?;
-			self.write_page_batch_inner(
+			self.buffer_unindexed_page_batch(
 				&projected,
 				key_plan,
 				projected_build_keys,
 				null_safe_keys,
-				false,
-				false,
 				task_budget,
 				observer,
 			)
 			.await?;
 		}
 		Ok(())
+	}
+
+	/// Buffer the unindexed reservoir writer up to the existing output chunk cap.
+	///
+	/// The grouped reservoir rebuilds its index from finished pages, so it is safe to
+	/// compose fragments here.  Indexed writers deliberately stay on the direct path:
+	/// they expose page indices as they write.
+	#[allow(clippy::too_many_arguments)]
+	async fn buffer_unindexed_page_batch(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
+		if batch.num_rows() == 0
+			|| !batch_has_spillable_join_key(batch, key_plan, build_keys, null_safe_keys)?
+		{
+			return Ok(());
+		}
+		if self.pending_unindexed_rows > 0
+			&& self.pending_unindexed_rows.saturating_add(batch.num_rows())
+				> CROSS_JOIN_OUTPUT_CHUNK_ROWS
+		{
+			self.flush_unindexed_page_buffer(
+				key_plan,
+				build_keys,
+				null_safe_keys,
+				task_budget,
+				observer,
+			)
+			.await?;
+		}
+		if self.pending_unindexed_rows == 0 && batch.num_rows() >= CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+			return self
+				.write_page_batch_inner(
+					batch,
+					key_plan,
+					build_keys,
+					null_safe_keys,
+					false,
+					false,
+					task_budget,
+					observer,
+				)
+				.await;
+		}
+
+		self.pending_unindexed_rows = self.pending_unindexed_rows.saturating_add(batch.num_rows());
+		self.pending_unindexed_bytes = self
+			.pending_unindexed_bytes
+			.saturating_add(record_batch_memory_bytes(batch));
+		self.pending_unindexed_batches.push(batch.clone());
+		// This is deliberately a high-water value: the retained-footprint guard
+		// must see the live buffer, and keeping its peak preserves the existing
+		// preflight accounting after a flush.
+		self.writer_peak = self.writer_peak.max(self.pending_unindexed_bytes);
+		self.guard_resident_state(task_budget.memory.get(), SpillResidentGuardSite::Write)?;
+
+		if self.pending_unindexed_rows >= CROSS_JOIN_OUTPUT_CHUNK_ROWS {
+			self.flush_unindexed_page_buffer(
+				key_plan,
+				build_keys,
+				null_safe_keys,
+				task_budget,
+				observer,
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn flush_unindexed_page_buffer(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
+		if self.pending_unindexed_batches.is_empty() {
+			return Ok(());
+		}
+		let pending = std::mem::take(&mut self.pending_unindexed_batches);
+		self.pending_unindexed_rows = 0;
+		self.pending_unindexed_bytes = 0;
+		let batch = if pending.len() == 1 {
+			pending.into_iter().next().expect("one pending spill batch")
+		} else {
+			arrow::compute::concat_batches(&pending[0].schema(), pending.iter())?
+		};
+		self.write_page_batch_inner(
+			&batch,
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			false,
+			false,
+			task_budget,
+			observer,
+		)
+		.await
 	}
 
 	pub(in crate::exec) async fn write_projected_preserved_batch_chunks(
@@ -2138,6 +2271,12 @@ impl SpilledInnerJoinBuild {
 		&self,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		if !self.pending_unindexed_batches.is_empty() {
+			return Err(ExecutionError::Kernel {
+				message: "inner join spill finish reached with an unflushed unindexed page buffer"
+					.to_string(),
+			});
+		}
 		self.file_ops
 			.set_len(&self.file, self.next_offset)
 			.await
@@ -4695,6 +4834,53 @@ mod tests {
 		encode_record_batch_ipc_into(&mut scratch, &second).expect("scratch second encode");
 		assert_eq!(scratch, second_fresh);
 		assert!(scratch.capacity() >= first_capacity.min(second_fresh.len()));
+	}
+
+	#[tokio::test]
+	async fn unindexed_spill_coalesces_fragments_and_flushes_the_partial_page() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("unindexed_page_coalescing");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		let keys = [ColumnOrdinal(0)];
+		let first = batch_with_keys(&[1, 2, 3]);
+		let second = batch_with_keys(&[4, 5]);
+
+		for batch in [&first, &second] {
+			build
+				.write_batch_chunks_unindexed_profiled(
+					batch,
+					JoinKeyPlan::Int64,
+					&keys,
+					false,
+					budget,
+					None,
+				)
+				.await
+				.expect("buffer fragment");
+		}
+		assert_eq!(build.page_count(), 0, "small fragments stay buffered");
+		assert!(
+			build.finish(budget).await.is_err(),
+			"a caller cannot seal an unflushed partial page"
+		);
+		build
+			.flush_unindexed_page_buffer(JoinKeyPlan::Int64, &keys, false, budget, None)
+			.await
+			.expect("flush partial page");
+		assert_eq!(build.page_count(), 1, "two fragments compose one page");
+		build.finish(budget).await.expect("finish flushed spill");
+		let decoded = build.read_batch_page(0).await.expect("read coalesced page");
+		assert_record_batch_equal(
+			&decoded,
+			&arrow::compute::concat_batches(&first.schema(), [&first, &second]).expect("concat"),
+		);
+		assert_eq!(build.input_row_count(), 5);
+
+		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 
 	#[tokio::test]

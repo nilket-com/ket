@@ -6155,6 +6155,47 @@ impl Executor {
 				}
 			}
 		}
+		// The unindexed reservoir writer deliberately delays partial pages until
+		// the scan is complete. Flush every partition at this existing all-builds
+		// barrier so later index rebuilds see only complete, self-describing IPC
+		// pages.
+		for spilled in partitioned_builds.iter_mut().filter_map(Option::as_mut) {
+			let before = spilled.spill_bytes();
+			spilled
+				.flush_unindexed_page_buffer(
+					key_plan,
+					write_build_keys,
+					null_safe_keys,
+					self.context.task_budget,
+					grouped_chain_observer,
+				)
+				.await?;
+			*total_spill_bytes =
+				total_spill_bytes.saturating_add(spilled.spill_bytes().saturating_sub(before));
+		}
+		let group_spill_budget =
+			streamed_inner_build_group_spill_budget(self.context.task_budget.spill_bytes.get());
+		if enforce_group_spill_budget && *total_spill_bytes > group_spill_budget {
+			return Err(budget_exhausted(
+				BudgetDimension::SpillBytes,
+				"partitioned streamed inner join build spill writer",
+				*total_spill_bytes,
+				group_spill_budget,
+			));
+		}
+		if let Some(baseline_bytes) = combined_resident_baseline_bytes {
+			guard_partition_replay_owner_resident(
+				baseline_bytes,
+				partition_replay_reservoir_bytes(partitioned_builds, partitioned_builds.len()),
+				0,
+				0,
+				0,
+				0,
+				0,
+				0,
+				self.context.task_budget.memory.get(),
+			)?;
+		}
 		Ok(())
 	}
 
