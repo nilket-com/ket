@@ -152,8 +152,22 @@ fn parse_set_operation(name: &str, value: Value) -> Result<ConfigOperation, Stri
 			Ok(value) => OptionValue::Bool(value),
 			Err(_) => return Err(expected(name, "boolean")),
 		},
-		"theme" | "savedurability" => match string_value(&value, name) {
-			Ok(value) => OptionValue::String(value),
+		// Value validity is checked here, not only at apply time: a deferred
+		// handle promises call-site errors, so `?` in user scripts must be
+		// able to observe an unknown theme or durability mode.
+		"theme" => match string_value(&value, name) {
+			Ok(value) => {
+				Theme::try_new(&value).map_err(|error| error.to_string())?;
+				OptionValue::String(value)
+			}
+			Err(error) => return Err(error),
+		},
+		"savedurability" => match string_value(&value, name) {
+			Ok(value) => {
+				crate::engine::settings::SaveDurability::parse(&value)
+					.ok_or_else(|| "Usage: set savedurability atomic|bounded".to_string())?;
+				OptionValue::String(value)
+			}
 			Err(error) => return Err(error),
 		},
 		"gitrefresh" => match value.as_integer::<i64>() {

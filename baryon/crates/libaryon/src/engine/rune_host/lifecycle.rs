@@ -2875,6 +2875,39 @@ pub fn main(editor) {
 	}
 
 	#[test]
+	fn config_handle_reports_invalid_theme_values_at_the_call_site() {
+		// The deferred handle promises eager validation: a script's own `?` or
+		// match must observe an unknown theme when `set` is called, not as a
+		// whole-script failure after `main` returns.
+		let harness = publish_entry_harness(
+			r##"
+pub fn main(editor) {
+    let config = editor.config();
+    match config.set("theme", "no-such-theme-xyz") {
+        Ok(_) => Err("expected a call-site error for an unknown theme")?,
+        Err(_) => {}
+    }
+    match config.set("savedurability", "granite") {
+        Ok(_) => Err("expected a call-site error for an unknown durability")?,
+        Err(_) => {}
+    }
+    config.set("wrap", false)?;
+    Ok(())
+}
+"##,
+		);
+		assert!(
+			!harness.editor.session.persistent_settings.wrap_enabled,
+			"valid settings after a rejected one must still apply"
+		);
+		assert_eq!(
+			harness.editor.session.persistent_settings.theme_name,
+			"onedark",
+			"a rejected theme must not reach the persistent settings"
+		);
+	}
+
+	#[test]
 	fn init_config_api_applies_builtin_options() {
 		let harness = publish_entry_harness(
 			r##"
