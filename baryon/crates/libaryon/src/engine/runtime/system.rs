@@ -3090,6 +3090,38 @@ mod tests {
 	}
 
 	#[test]
+	fn closing_the_last_ordinary_tab_in_a_split_closes_its_pane() {
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+		let initial = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::SplitPane(crate::engine::SplitDirection::Vertical),
+		);
+		assert_eq!(initial.panes.len(), 2);
+		let closing_pane_id = initial.focused_pane_id;
+		let closing_view_id = initial
+			.focused_pane()
+			.expect("split pane focused")
+			.tabs[0]
+			.view_id;
+
+		let closed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::CloseDocTab {
+				pane_id: closing_pane_id,
+				view_id: closing_view_id,
+			},
+		);
+		assert!(!closed.should_quit);
+		assert_eq!(closed.panes.len(), 1);
+		assert!(closed.pane(closing_pane_id).is_none());
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+	}
+
+	#[test]
 	fn split_views_share_edits_and_undo() {
 		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
 		let initial = send_cmd_and_recv(

@@ -1808,6 +1808,11 @@ fn dispatch_command(
 				reset_global_transients(session);
 				let active_buffer_id =
 					focused_doctab(&session.layout, session.focused_pane_id).buffer_id;
+				let closes_last_tab_in_split_pane = session
+					.layout
+					.find_pane(session.focused_pane_id)
+					.is_some_and(|pane| pane.tabs.len() == 1)
+					&& session.layout.pane_count() > 1;
 				let closes_own_pane = session
 					.buffers
 					.get(active_buffer_id)
@@ -1816,7 +1821,7 @@ fn dispatch_command(
 							|| buffer.is_output_panel()
 							|| buffer.is_markdown_preview()
 					});
-				if closes_own_pane {
+				if closes_own_pane || closes_last_tab_in_split_pane {
 					close_focused_pane(session, runtime);
 				} else {
 					close_active_doctab(session, runtime);
