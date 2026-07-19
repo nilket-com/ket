@@ -19,7 +19,10 @@ use crate::ir::{BoundExprProgram, ColumnOrdinal};
 
 const TARGET_FP_RATE_BP: u16 = 100;
 const MIN_FILTER_BYTES: usize = 16 * 1024;
-const MAX_FILTER_BYTES: usize = 1024 * 1024;
+// 4 MiB clears the optimal (9.585 bits/key) allocation for the largest measured
+// build-side key counts (~2.63M keys want ~3.15 MiB); below the cap the sizing
+// formula still allocates only the optimal bytes, so smaller filters are unchanged.
+const MAX_FILTER_BYTES: usize = 4 * 1024 * 1024;
 const EXACT_FILTER_MAX_BYTES: usize = MIN_FILTER_BYTES;
 
 pub(crate) fn build_runtime_filter_fragment(
@@ -484,6 +487,29 @@ mod tests {
 		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	#[test]
+	fn adr461_bloom_cap_covers_measured_key_counts_without_small_filter_drift() {
+		// 2.63M keys sat in the clamped band under the 1 MiB cap (~3.19 bits/key);
+		// the raised cap must give them the designed allocation. Fails under the
+		// old cap: 2_630_000 * 9.585 bits ≈ 3.15 MiB > 1 MiB.
+		let large = bloom_sizing(2_630_000);
+		assert!(
+			(large.bit_count as f64) / 2_630_000.0 >= 9.0,
+			"large filters must reach ~9.585 bits/key, got {} bits for 2.63M keys",
+			large.bit_count
+		);
+		assert!(large.byte_budget <= MAX_FILTER_BYTES);
+		// Below the old threshold, sizing is byte-identical to the pre-raise
+		// formula: optimal bits, unclamped.
+		let small = bloom_sizing(500_000);
+		assert_eq!(
+			small.byte_budget,
+			((500_000.0f64 * 9.585_058).ceil() as usize).div_ceil(8)
+		);
+		// The minimum clamp is untouched.
+		assert_eq!(bloom_sizing(0).byte_budget, MIN_FILTER_BYTES);
+	}
 
 	#[test]
 	fn runtime_filter_generation_preserves_type_tag() {
