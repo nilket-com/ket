@@ -81,7 +81,7 @@ impl PreviewSearch {
 struct PreviewResponse {
 	view_id: ViewId,
 	fingerprint: PreviewFingerprint,
-	area: Rect,
+	size: (u16, u16),
 	protocol: Option<Protocol>,
 }
 
@@ -89,7 +89,7 @@ struct ViewEntry {
 	requested_fingerprint: Option<PreviewFingerprint>,
 	pending_fingerprint: Option<PreviewFingerprint>,
 	current_fingerprint: Option<PreviewFingerprint>,
-	current_area: Option<Rect>,
+	current_size: Option<(u16, u16)>,
 	current_protocol: Option<Protocol>,
 }
 
@@ -99,7 +99,7 @@ impl ViewEntry {
 			requested_fingerprint: None,
 			pending_fingerprint: None,
 			current_fingerprint: None,
-			current_area: None,
+			current_size: None,
 			current_protocol: None,
 		}
 	}
@@ -116,6 +116,7 @@ impl MarkdownPreviewController {
 	pub fn new() -> Self {
 		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 		let font_size = picker.font_size();
+		let font_size = (font_size.width, font_size.height);
 		let (tx_request, rx_request) = mpsc::channel::<PreviewRequest>();
 		let (tx_ready, rx_ready) = mpsc::channel::<PreviewResponse>();
 
@@ -136,13 +137,13 @@ impl MarkdownPreviewController {
 					&text_renderer,
 				);
 				let protocol = picker
-					.new_protocol(image, request.area, Resize::Fit(None))
+					.new_protocol(image, request.area.into(), Resize::Fit(None))
 					.ok();
 				if tx_ready
 					.send(PreviewResponse {
 						view_id: request.view_id,
 						fingerprint: request.fingerprint,
-						area: request.area,
+						size: (request.area.width, request.area.height),
 						protocol,
 					})
 					.is_err()
@@ -218,7 +219,7 @@ impl MarkdownPreviewController {
 			};
 			if entry.requested_fingerprint == Some(response.fingerprint) {
 				entry.current_fingerprint = Some(response.fingerprint);
-				entry.current_area = Some(response.area);
+				entry.current_size = Some(response.size);
 				entry.current_protocol = response.protocol;
 				entry.pending_fingerprint = None;
 				updated = true;
@@ -234,7 +235,7 @@ impl MarkdownPreviewController {
 		let Some(entry) = self.views.get(&view_id) else {
 			return false;
 		};
-		if entry.current_area != Some(area) {
+		if entry.current_size != Some((area.width, area.height)) {
 			return false;
 		}
 		let Some(protocol) = &entry.current_protocol else {
@@ -304,8 +305,6 @@ fn preview_request_fingerprint(
 	ui_palette: UiPalette,
 ) -> PreviewFingerprint {
 	let mut hasher = DefaultHasher::new();
-	area.x.hash(&mut hasher);
-	area.y.hash(&mut hasher);
 	area.width.hash(&mut hasher);
 	area.height.hash(&mut hasher);
 	font_size.hash(&mut hasher);
@@ -3433,6 +3432,43 @@ mod tests {
 					accent: Rgb::new(7, 8, 9),
 					..ui_palette
 				},
+			)
+		);
+
+		let moved_area = Rect {
+			x: 17,
+			y: 9,
+			..area
+		};
+		let resized_area = Rect { width: 81, ..area };
+		let fingerprint = preview_request_fingerprint(
+			&snapshot,
+			area,
+			(8, 16),
+			&base_theme,
+			&no_search,
+			ui_palette,
+		);
+		assert_eq!(
+			fingerprint,
+			preview_request_fingerprint(
+				&snapshot,
+				moved_area,
+				(8, 16),
+				&base_theme,
+				&no_search,
+				ui_palette,
+			)
+		);
+		assert_ne!(
+			fingerprint,
+			preview_request_fingerprint(
+				&snapshot,
+				resized_area,
+				(8, 16),
+				&base_theme,
+				&no_search,
+				ui_palette,
 			)
 		);
 	}

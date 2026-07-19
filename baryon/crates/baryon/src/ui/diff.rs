@@ -150,8 +150,8 @@ fn bridge_request_fingerprint(
 
 fn render_bridge_protocol(picker: &Picker, request: &BridgeRequest) -> Option<Protocol> {
 	let font_size = picker.font_size();
-	let font_w = PixelWidth::new(font_size.0.max(1) as u32);
-	let font_h = PixelHeight::new(font_size.1.max(1) as u32);
+	let font_w = PixelWidth::new(font_size.width.max(1) as u32);
+	let font_h = PixelHeight::new(font_size.height.max(1) as u32);
 	let width_px = font_w * u32::from(request.area.width);
 	let height_px = font_h * u32::from(request.area.height);
 
@@ -189,7 +189,7 @@ fn render_bridge_protocol(picker: &Picker, request: &BridgeRequest) -> Option<Pr
 	picker
 		.new_protocol(
 			image::DynamicImage::ImageRgba8(image),
-			request.area,
+			request.area.into(),
 			Resize::Fit(None),
 		)
 		.ok()

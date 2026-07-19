@@ -75,6 +75,7 @@ impl MinimapController {
 	pub fn new() -> Self {
 		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 		let font_size = picker.font_size();
+		let font_size = (font_size.width, font_size.height);
 		let (tx_request, rx_request) = mpsc::channel::<PreviewRequest>();
 		let (tx_ready, rx_ready) = mpsc::channel::<PreviewResponse>();
 
@@ -216,8 +217,15 @@ fn render_preview_protocol(
 	theme_colors: &[Option<Rgb>; CATEGORY_COUNT],
 	ui_palette: UiPalette,
 ) -> Option<Protocol> {
-	let image = render_preview_image(snapshot, area, theme_colors, ui_palette, picker.font_size());
-	picker.new_protocol(image, area, Resize::Fit(None)).ok()
+	let font_size = picker.font_size();
+	let image = render_preview_image(
+		snapshot,
+		area,
+		theme_colors,
+		ui_palette,
+		(font_size.width, font_size.height),
+	);
+	picker.new_protocol(image, area.into(), Resize::Fit(None)).ok()
 }
 
 fn preview_request_fingerprint(

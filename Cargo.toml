@@ -28,7 +28,7 @@ ra_ap_project_model = "0.0.342"
 ra_ap_syntax = "0.0.342"
 ra_ap_vfs = "0.0.342"
 ratatui = "0.30.0"
-ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 regex-automata = { version = "0.4.14", default-features = true, features = ["meta", "perf"] }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", tag = "v0.4.9" }
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "v0.4.9" }
