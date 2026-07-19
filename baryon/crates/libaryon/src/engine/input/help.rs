@@ -1223,7 +1223,7 @@ fn markdown_bool_option(option: &BoolOptionSpec) -> String {
 	push_wrapped(
 		&mut out,
 		&format!(
-			"- **Configured at startup with:** `baryon::set(editor, \"{}\", value)` in `init.rn`",
+			"- **Configured at startup with:** `let config = editor.config(); config.set(\"{}\", value)?` in `init.rn`",
 			option.key
 		),
 	);
@@ -1508,7 +1508,7 @@ fn render_bool_option(option: &BoolOptionSpec) -> String {
 	push_wrapped(
 		&mut out,
 		&format!(
-			"Configure at startup with baryon::set(editor, '{}', value) in init.rn.",
+			"Configure at startup with `let config = editor.config(); config.set('{}', value)?` in init.rn.",
 			option.key
 		),
 	);

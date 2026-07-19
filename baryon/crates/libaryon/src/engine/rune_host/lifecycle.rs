@@ -349,13 +349,23 @@ impl RuneHost {
 					.expect("callback was validated before VM entry");
 				budget::with(CALLBACK_INSTRUCTION_BUDGET, || call(callback, editor)).call()
 			};
+			let config_result = if result.is_ok() {
+				editor
+					.finish_config_scope()
+					.and_then(|operations| config_api::apply_operations(editor, operations))
+			} else {
+				let _ = editor.finish_config_scope();
+				Ok(())
+			};
+			let commit_deferred = result.is_ok() && config_result.is_ok();
+			let result = result.and_then(|value| config_result.map(|_| value));
 			let (lifecycle, deferred_jobs) = editor.finish_callback();
 			let finalization = Self::finalize_deferred_jobs(
 				editor,
 				&mut generation,
 				owner,
 				deferred_jobs,
-				result.is_ok(),
+				commit_deferred,
 			);
 			let remaining_after = limit::get();
 			(
@@ -636,7 +646,7 @@ impl RuneHost {
 					.discard_unpublished_empty_owner(owner);
 			})?;
 		let unit = Arc::new(compiled.unit);
-		let (result, evaluation_delta) = limit::with(allowance, || {
+		let (mut result, evaluation_delta) = limit::with(allowance, || {
 			let remaining_before = limit::get();
 			let mut vm = Vm::new(self.runtime.clone(), unit.clone());
 			let result = budget::with(instruction_budget, || vm.call(["main"], (&mut *editor,)))
@@ -648,6 +658,15 @@ impl RuneHost {
 			(result, signed_delta(remaining_before, remaining_after))
 		})
 		.call();
+		let config_result = if result.is_ok() {
+			editor
+				.finish_config_scope()
+				.and_then(|operations| config_api::apply_operations(editor, operations))
+		} else {
+			let _ = editor.finish_config_scope();
+			Ok(())
+		};
+		result = result.and(config_result);
 		let staging = editor.staging.take();
 		let cleanup = |editor: &mut EditorHost| {
 			let _ = editor
@@ -2860,14 +2879,19 @@ pub fn main(editor) {
 		let harness = publish_entry_harness(
 			r##"
 pub fn main(editor) {
-    baryon::set(editor, "wrap", false)?;
-    baryon::set(editor, "theme", "gruvbox")?;
-			baryon::ui_color(editor, "accent", "#123456")?;
-			baryon::language_theme(editor, "rs", "viridis_cs8")?;
+			baryon::set(editor, "minimap", true)?;
+			editor.config().set("reload", false)?;
+    let config = editor.config();
+    config.set("wrap", false)?;
+    config.set("theme", "gruvbox")?;
+			config.ui_color("accent", "#123456")?;
+			config.language_theme("markdown", "viridis_cs8")?;
     Ok(())
 }
 "##,
 		);
+		assert!(harness.editor.session.persistent_settings.minimap_enabled);
+		assert!(!harness.editor.session.persistent_settings.reload_enabled);
 		assert!(!harness.editor.session.persistent_settings.wrap_enabled);
 		assert_eq!(
 			harness.editor.session.persistent_settings.theme_name,
@@ -2890,7 +2914,7 @@ pub fn main(editor) {
 				.session
 				.persistent_settings
 				.language_themes
-				.get("rust")
+				.get("markdown")
 				.map(String::as_str),
 			Some("viridis_cs8")
 		);

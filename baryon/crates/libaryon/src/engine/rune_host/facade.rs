@@ -1,3 +1,4 @@
+use super::config_api::{ConfigOperation, ConfigQueue};
 use super::message::MessageLog;
 use super::registration::SourceStaging;
 use crate::core::RegistryOwnerId;
@@ -189,6 +190,7 @@ pub(crate) struct EditorHost {
 	deferred_jobs: Vec<DeferredRuneJob>,
 	deferred_job_metadata_bytes: usize,
 	deferred_lifecycle: Vec<DeferredRuneLifecycle>,
+	config_queue: Option<Arc<Mutex<ConfigQueue>>>,
 	deferred_path_bytes: usize,
 }
 
@@ -215,6 +217,7 @@ impl EditorHost {
 			deferred_jobs: Vec::new(),
 			deferred_job_metadata_bytes: 0,
 			deferred_lifecycle: Vec::new(),
+			config_queue: None,
 			deferred_path_bytes: 0,
 		}
 	}
@@ -251,6 +254,22 @@ impl EditorHost {
 			std::mem::take(&mut self.deferred_lifecycle),
 			std::mem::take(&mut self.deferred_jobs),
 		)
+	}
+
+	pub(super) fn config_queue(&mut self) -> Arc<Mutex<ConfigQueue>> {
+		self.config_queue
+			.get_or_insert_with(|| Arc::new(Mutex::new(ConfigQueue::default())))
+			.clone()
+	}
+
+	pub(super) fn finish_config_scope(&mut self) -> Result<Vec<ConfigOperation>, String> {
+		let Some(queue) = self.config_queue.take() else {
+			return Ok(Vec::new());
+		};
+		let mut queue = queue
+			.lock()
+			.map_err(|_| "Rune config queue lock was poisoned".to_string())?;
+		queue.finish()
 	}
 
 	pub(crate) fn active_callback_owner(&self) -> Option<RegistryOwnerId> {
