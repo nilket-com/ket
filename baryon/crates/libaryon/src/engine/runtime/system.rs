@@ -147,19 +147,13 @@ fn update_init_file(
 					.expect("key was checked in the remaining config operations");
 				patches.push((range, replacement));
 			} else {
-				patches.push((range, String::new()));
+				patches.push((tombstone_range(source, range), String::new()));
 			}
 		}
 	}
 
 	if !remaining.is_empty() {
-		let (prefix, indent) = insertion_layout(source, insertion);
-		let mut additions = String::new();
-		additions.push_str(prefix);
-		for operation in remaining.into_values() {
-			writeln!(&mut additions, "{indent}{operation}")
-				.expect("writing to String cannot fail");
-		}
+		let additions = render_inserted_operations(source, insertion, remaining.into_values());
 		patches.push((insertion..insertion, additions));
 	}
 
@@ -315,13 +309,52 @@ fn parse_rune_string(source: &str) -> Option<String> {
 	Some(decoded)
 }
 
+fn render_inserted_operations(
+	source: &str,
+	offset: usize,
+	operations: impl IntoIterator<Item = String>,
+) -> String {
+	let (first_prefix, indent) = insertion_layout(source, offset);
+	let mut rendered = String::from(first_prefix);
+	for (index, operation) in operations.into_iter().enumerate() {
+		if index > 0 {
+			rendered.push('\n');
+			rendered.push_str(indent);
+		}
+		rendered.push_str(&operation);
+	}
+	rendered.push('\n');
+	rendered.push_str(indent);
+	rendered
+}
+
 fn insertion_layout(source: &str, offset: usize) -> (&str, &str) {
 	let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
 	let prefix = &source[line_start..offset];
 	if prefix.chars().all(char::is_whitespace) {
 		("", prefix)
 	} else {
-		("\n", "\t")
+		("\n\t", "\t")
+	}
+}
+
+fn tombstone_range(source: &str, range: Range<usize>) -> Range<usize> {
+	let line_start = source[..range.start]
+		.rfind('\n')
+		.map_or(0, |index| index + 1);
+	let line_end = source[range.end..]
+		.find('\n')
+		.map_or(source.len(), |index| range.end + index);
+	if source[line_start..range.start]
+		.chars()
+		.all(char::is_whitespace)
+		&& source[range.end..line_end]
+			.chars()
+			.all(char::is_whitespace)
+	{
+		line_start..line_end.saturating_add(usize::from(line_end < source.len()))
+	} else {
+		range
 	}
 }
 
@@ -1903,6 +1936,8 @@ mod tests {
 		assert!(updated.contains("config.language_theme(\"markdown\", \"tab20c_s1\")?;"));
 		assert!(updated.contains("config.ui_color(\"colors.accent\", \"#123456\")?;"));
 		assert!(updated.contains("config.set(\"wrap\", false)?;"));
+		assert!(!updated.contains("\n\t\tconfig."));
+		assert!(updated.contains("\n\tOk(())\n}"));
 		write_test_init_file_at(&path, &settings, false)
 			.expect("a second update is idempotent");
 		let updated_twice = std::fs::read_to_string(&path).expect("read second update");
@@ -1976,6 +2011,8 @@ mod tests {
 		let updated = std::fs::read_to_string(&path).expect("read updated init");
 		assert_eq!(updated.matches("let x = 1;").count(), 1);
 		assert!(updated.contains("let x = 1; \n\tconfig.set("));
+		assert!(!updated.contains("\n\t\tconfig."));
+		assert!(updated.contains("\n\tOk(()) }"));
 		assert!(
 			rune::parse::parse_all::<rune::ast::File>(&updated, rune::SourceId::EMPTY, false)
 				.is_ok()
@@ -2023,6 +2060,7 @@ mod tests {
 			1
 		);
 		assert!(updated.contains("config.language_theme(\"markdown\", \"tab20c_s1\")?;"));
+		assert!(!updated.contains("\n\t\n"));
 		let _ = std::fs::remove_file(path);
 	}
 
