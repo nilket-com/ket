@@ -1662,7 +1662,7 @@ fn dispatch_command(
 	let mut needs_render = false;
 	if let EditorCommand::WriteInit { force } = cmd {
 		session.ui.status_message = Some(
-			match system::write_init_file(&session.persistent_settings, force) {
+			match system::write_init_file(&session.persistent_settings, lang_registry, force) {
 				Ok(path) => format!("Wrote Rune configuration to {}", path.display()),
 				Err(error) => format!("Could not write init.rn: {error}"),
 			},
