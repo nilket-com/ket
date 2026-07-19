@@ -4001,6 +4001,37 @@ mod tests {
 	}
 
 	#[test]
+	fn closing_a_help_tab_closes_its_pane_not_the_session() {
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_markdown(None);
+		let opened = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ShowMarkdownDocument {
+				title: "Baryon Help".to_string(),
+				markdown: "# Baryon Help\n".to_string(),
+			},
+		);
+		let help_pane = opened.focused_pane().expect("help pane focused");
+		let help_pane_id = help_pane.pane_id;
+		let help_view_id = help_pane.tabs[help_pane.active_doctab_index].view_id;
+
+		let closed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::CloseDocTab {
+				pane_id: help_pane_id,
+				view_id: help_view_id,
+			},
+		);
+		assert!(!closed.should_quit);
+		assert_eq!(closed.panes.len(), 1);
+		assert!(closed.pane(help_pane_id).is_none());
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
 	fn theme_command_from_markdown_preview_focus_updates_source_pane() {
 		let scratch_path = temp_test_path("markdown-preview-theme").with_extension("md");
 		std::fs::write(&scratch_path, "# Title\n\nPlain text\n").expect("write markdown");

@@ -1801,7 +1801,11 @@ fn dispatch_command(
 				let closes_own_pane = session
 					.buffers
 					.get(active_buffer_id)
-					.is_some_and(|buffer| buffer.is_file_browser() || buffer.is_output_panel());
+					.is_some_and(|buffer| {
+						buffer.is_file_browser()
+							|| buffer.is_output_panel()
+							|| buffer.is_markdown_preview()
+					});
 				if closes_own_pane {
 					close_focused_pane(session, runtime);
 				} else {
