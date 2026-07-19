@@ -836,6 +836,7 @@ pub(super) fn choose_auto_join_strategy(
 			kind,
 			left_input,
 			right_input,
+			config,
 			HashByDefaultReason::AutoBroadcastDisabled,
 		);
 	};
@@ -931,6 +932,7 @@ pub(super) fn choose_auto_join_strategy(
 			kind,
 			left_input,
 			right_input,
+			config,
 			HashByDefaultReason::ProbeNotScanLinear(fence),
 		);
 	}
@@ -939,6 +941,7 @@ pub(super) fn choose_auto_join_strategy(
 			kind,
 			left_input,
 			right_input,
+			config,
 			HashByDefaultReason::LeftInputNotSingleBaseRelation,
 		);
 	}
@@ -947,6 +950,7 @@ pub(super) fn choose_auto_join_strategy(
 			kind,
 			left_input,
 			right_input,
+			config,
 			HashByDefaultReason::RightInputNotSingleBaseRelation,
 		);
 	}
@@ -955,6 +959,7 @@ pub(super) fn choose_auto_join_strategy(
 			kind,
 			left_input,
 			right_input,
+			config,
 			HashByDefaultReason::MissingBuildByteUpperBound,
 		);
 	}
@@ -962,6 +967,7 @@ pub(super) fn choose_auto_join_strategy(
 		kind,
 		left_input,
 		right_input,
+		config,
 		HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
 	)
 }
@@ -1040,9 +1046,10 @@ pub(super) fn hash_join_decision_with_placement(
 	kind: JoinKind,
 	left_input: JoinInputOptimization,
 	right_input: JoinInputOptimization,
+	config: &PlannerConfig,
 	reason: HashByDefaultReason,
 ) -> JoinStrategyDecision {
-	if kind == JoinKind::Inner {
+	if config.hash_smaller_build_placement && kind == JoinKind::Inner {
 		if let (Some(left), Some(right)) = (
 			unthresholded_build_byte_candidate(left_input.facts),
 			unthresholded_build_byte_candidate(right_input.facts),

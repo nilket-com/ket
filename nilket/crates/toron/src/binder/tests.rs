@@ -25623,7 +25623,9 @@ async fn adr464_hash_fallback_builds_materially_smaller_right_side() {
 	// Both sides exceed the broadcast threshold, so broadcast declines; the
 	// hash fallback must still consult the smaller-build comparator. Fails
 	// under always-left placement.
-	let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
 		.await
 		.expect("bind with trace");
 	assert_eq!(trace.join_decisions.len(), 1);
@@ -25676,4 +25678,54 @@ async fn adr464_hash_fallback_without_both_facts_keeps_natural_placement() {
 	let receipt = trace.join_decisions[0];
 	assert_eq!(receipt.strategy, JoinStrategy::HashPartitioned);
 	assert_eq!(receipt.placement, JoinPhysicalPlacement::Natural);
+}
+
+#[tokio::test]
+async fn adr466_hash_swapped_placement_swaps_physical_build_and_restores_order() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 1_048_576);
+	seed_byte_upper_bound(&mut catalog, "customers", 102_400);
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+		.expect("plan SQL join");
+
+	// Both sides exceed the broadcast threshold; the hash fallback's comparator
+	// chooses SwappedRightBuild. The physical plan must actually swap: the
+	// placement a decision emits and the rewrite the plan performs are one
+	// contract, and 465's q17 falsification was exactly their divergence.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind hash-swapped join");
+	let ExecutionPlan::Project {
+		input,
+		output_schema,
+		..
+	} = plan
+	else {
+		panic!("hash swapped placement must be restored by a declared-order project");
+	};
+	assert_eq!(
+		field_names(&output_schema),
+		vec!["id", "customer_id", "id", "region"]
+	);
+	let ExecutionPlan::Join {
+		left,
+		right,
+		strategy,
+		..
+	} = input.as_ref()
+	else {
+		panic!("restore project must wrap the physical hash join");
+	};
+	assert_eq!(*strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(
+		field_names(&left.schema()),
+		vec!["id", "region"],
+		"physical build (left) must be the materially smaller relation"
+	);
+	assert_eq!(field_names(&right.schema()), vec!["id", "customer_id"]);
+	assert!(matches!(terminal_exchange(left), Some((count, _)) if count > 1));
+	assert!(matches!(terminal_exchange(right), Some((count, _)) if count > 1));
 }

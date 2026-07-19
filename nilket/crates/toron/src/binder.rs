@@ -171,6 +171,11 @@ pub struct PlannerConfig {
 	pub measured_accrual_counter: Arc<AtomicU64>,
 	pub join_order_soft_margin_step: SoftMarginLadderStep,
 	pub join_order_soft_margin_application: JoinOrderSoftMarginApplication,
+	/// ADR 466: smaller-build placement for auto inner hash joins. Default-off:
+	/// a size-sensitive placement varies across join-order preflights and
+	/// violates their uniformity invariant; the join-order design cut owns
+	/// flipping this default.
+	pub hash_smaller_build_placement: bool,
 }
 
 impl Default for PlannerConfig {
@@ -186,6 +191,7 @@ impl Default for PlannerConfig {
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+			hash_smaller_build_placement: false,
 		}
 	}
 }
@@ -3062,6 +3068,16 @@ impl<'a> Binder<'a> {
 		if binder_physicalizes_join {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
+					// ADR 466: the placement a decision emits and the rewrite the plan
+					// performs are one contract. A hash SwappedRightBuild swaps the
+					// operands here, before the exchanges, exactly as broadcast does —
+					// the downstream restore project keys on placement alone and must
+					// never run for a swap that did not happen.
+					if decision.placement == JoinPhysicalPlacement::SwappedRightBuild {
+						std::mem::swap(&mut left_plan, &mut right_plan);
+						std::mem::swap(&mut left_keys, &mut right_keys);
+						std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys);
+					}
 					// ADR 239 (scalar-local Cross): gather both provably-scalar sides to a single
 					// partition and join locally — a partition_count=1 gather, NOT an N-way empty-key
 					// hash repartition (which stays forbidden for partitioned/unbounded Cross inputs).
