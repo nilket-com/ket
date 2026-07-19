@@ -1006,7 +1006,7 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 			&mut out,
 			"`:set OPTION [VALUE]` changes an option for this session. Put startup \
 			 configuration in `init.rn`; `:set initwrite` (or `:set initw`) atomically \
-			 exports the current builtin settings there. \
+			 updates its parsed `config.*` settings while preserving other code. \
 			 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 			 prefixing the option with `no` turns it off, e.g. `:set nowrap`. \
 			 The bare forms (`:wrap`, `:nowrap`, ...) change this session only.",
@@ -1015,8 +1015,8 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 		push_line(
 			&mut out,
 			"`:set OPTION [VALUE]` changes a named option for this session. Builtin and \
-			 extension startup configuration belongs in `init.rn`; `:set initwrite` exports \
-			 the current builtin settings there. \
+			 extension startup configuration belongs in `init.rn`; `:set initwrite` updates \
+			 its parsed builtin settings while preserving other code. \
 			 Boolean VALUE is on or off (also true/false, yes/no); omitting VALUE means \
 			 on, and prefixing the option with `no` turns it off.",
 		);
@@ -1364,7 +1364,7 @@ fn render_set() -> String {
 	push_wrapped(
 		&mut out,
 		"':set OPTION [VALUE]' changes an option for this session. Use ':set initwrite' (or \
-		 ':set initw') to atomically export the current builtin settings to init.rn; put other startup configuration there. \
+		 ':set initw') to atomically update parsed builtin settings in init.rn while preserving other startup code. \
 		 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 		 prefixing the option with 'no' turns it off, e.g. ':set nowrap'.",
 	);

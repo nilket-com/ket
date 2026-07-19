@@ -385,7 +385,7 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		category: CommandCategory::Settings,
 		usage: ":set OPTION [VALUE]",
 		summary: "Change a setting for this session",
-		help: "Changes a named option for this session. Use :set initwrite (or :set initw) to atomically export the current settings to init.rn. Put other startup behavior in init.rn. Bare option commands like :wrap also affect the current session.",
+		help: "Changes a named option for this session. Use :set initwrite (or :set initw) to atomically update parsed config settings in init.rn while preserving other startup behavior; use :set initwrite! to replace the file. Bare option commands like :wrap also affect the current session.",
 		dispatch: DispatchKind::Exact(cmd_set),
 	},
 	CommandSpec {

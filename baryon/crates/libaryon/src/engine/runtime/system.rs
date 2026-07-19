@@ -22,7 +22,11 @@ use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
 use crate::engine::ui_colors::{UiColorSource, parse_ui_rgb};
 use crate::svp::ingest_svp_file;
+use rune::ast::{self, Spanned};
+use rune::SourceId;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::path::Path;
 
 fn detect_language(
@@ -61,15 +65,22 @@ fn write_init_file_at(
 	if path.exists() && !force {
 		let contents = std::fs::read_to_string(path)
 			.map_err(|error| format!("Could not inspect init.rn: {error}"))?;
-		if !contents
+		let source = if contents
 			.lines()
 			.next()
 			.is_some_and(|line| line.starts_with(GENERATED_INIT_MARKER))
 		{
-			return Err(
-				"init.rn contains user code; use :set initwrite! to replace it".to_string(),
-			);
+			render_init_file(settings)
+		} else {
+			update_init_file(&contents, settings)?
+		};
+		if let Some(parent) = path.parent() {
+			std::fs::create_dir_all(parent)
+				.map_err(|error| format!("Failed to create config directory: {error}"))?;
 		}
+		atomic_write(path, source.as_bytes(), AtomicWriteOptions::config())
+			.map_err(|error| format!("Failed to write init.rn: {error}"))?;
+		return Ok(());
 	}
 	if let Some(parent) = path.parent() {
 		std::fs::create_dir_all(parent)
@@ -79,6 +90,209 @@ fn write_init_file_at(
 	atomic_write(path, source.as_bytes(), AtomicWriteOptions::config())
 		.map_err(|error| format!("Failed to write init.rn: {error}"))?;
 	Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum InitConfigKey {
+	Set(String),
+	UiColor(String),
+	LanguageTheme(String),
+}
+
+fn update_init_file(source: &str, settings: &SettingsPersistent) -> Result<String, String> {
+	let file = rune::parse::parse_all::<ast::File>(source, SourceId::EMPTY, false)
+		.map_err(|error| format!("init.rn is not valid Rune: {error}"))?;
+	let main = file
+		.items
+		.iter()
+		.find_map(|(item, _)| match item {
+			ast::Item::Fn(function) if span_text(source, function.name.span) == "main" => {
+				Some(function)
+			}
+			_ => None,
+		})
+		.ok_or_else(|| "init.rn has no `main` function to update".to_string())?;
+	let terminal = main
+		.body
+		.statements
+		.last()
+		.filter(|statement| normalize_rune_source(span_text(source, statement.span())) == "Ok(())")
+		.ok_or_else(|| {
+			"init.rn main must end with `Ok(())` before :set initwrite can update it".to_string()
+		})?;
+	let insertion = span_range(terminal.span()).start;
+	let binding = config_binding(source, main);
+	let desired = init_config_operations(settings, binding.as_deref().unwrap_or("config"));
+	let mut patches = Vec::new();
+	let mut remaining = desired;
+
+	if let Some(binding) = binding.as_deref() {
+		for statement in &main.body.statements {
+			let ast::Stmt::Semi(statement) = statement else {
+				continue;
+			};
+			let Some(key) = config_call_key(source, &statement.expr, binding) else {
+				continue;
+			};
+			let range = span_range(statement.span());
+			if let Some(replacement) = remaining.remove(&key) {
+				patches.push((range, replacement));
+			}
+		}
+	}
+
+	if !remaining.is_empty() {
+		let indent = line_indent_at(source, insertion);
+		let mut additions = String::new();
+		if binding.is_none() {
+			writeln!(&mut additions, "{indent}let config = editor.config();")
+				.expect("writing to String cannot fail");
+		}
+		for operation in remaining.into_values() {
+			writeln!(&mut additions, "{indent}{operation}")
+				.expect("writing to String cannot fail");
+		}
+		patches.push((insertion..insertion, additions));
+	}
+
+	patches.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+	let mut updated = source.to_string();
+	for (range, replacement) in patches {
+		updated.replace_range(range, &replacement);
+	}
+	Ok(updated)
+}
+
+fn config_binding(source: &str, main: &ast::ItemFn) -> Option<String> {
+	main.body.statements.iter().find_map(|statement| {
+		let ast::Stmt::Local(local) = statement else {
+			return None;
+		};
+		let name = span_text(source, local.pat.span());
+		if !is_identifier(name)
+			|| normalize_rune_source(span_text(source, local.expr.span())) != "editor.config()"
+		{
+			return None;
+		}
+		Some(name.to_string())
+	})
+}
+
+fn init_config_operations(
+	settings: &SettingsPersistent,
+	binding: &str,
+) -> BTreeMap<InitConfigKey, String> {
+	let mut operations = BTreeMap::new();
+	let mut set = |name: &str, value: String| {
+		operations.insert(
+			InitConfigKey::Set(name.to_string()),
+			format!("{binding}.set({}, {value})?;", rune_string(name)),
+		);
+	};
+	set("theme", rune_string(&settings.theme_name));
+	set("minimap", settings.minimap_enabled.to_string());
+	set("wrap", settings.wrap_enabled.to_string());
+	set("num", settings.line_numbers_enabled.to_string());
+	set(
+		"relativenumber",
+		settings.relative_line_numbers_enabled.to_string(),
+	);
+	set("vis", settings.visible_whitespace.to_string());
+	set("reload", settings.reload_enabled.to_string());
+	set("savedurability", rune_string(settings.save_durability.as_str()));
+	for key in crate::engine::ui_colors::UiColorKey::ALL {
+		if let Some(color) = settings.ui_colors.get(key) {
+			let name = key.canonical_name().to_string();
+			operations.insert(
+				InitConfigKey::UiColor(name.clone()),
+				format!(
+					"{binding}.ui_color({}, {})?;",
+					rune_string(&name),
+					rune_string(&color.to_hex())
+				),
+			);
+		}
+	}
+	for (language, theme) in &settings.language_themes {
+		operations.insert(
+			InitConfigKey::LanguageTheme(language.clone()),
+			format!(
+				"{binding}.language_theme({}, {})?;",
+				rune_string(language),
+				rune_string(theme)
+			),
+		);
+	}
+	operations
+}
+
+fn config_call_key(source: &str, expression: &ast::Expr, binding: &str) -> Option<InitConfigKey> {
+	let ast::Expr::Try(try_expression) = expression else {
+		return None;
+	};
+	let ast::Expr::Call(call) = try_expression.expr.as_ref() else {
+		return None;
+	};
+	let ast::Expr::FieldAccess(access) = call.expr.as_ref() else {
+		return None;
+	};
+	if span_text(source, access.expr.span()) != binding || call.args.len() != 2 {
+		return None;
+	}
+	let ast::ExprField::Path(method) = &access.expr_field else {
+		return None;
+	};
+	let key = parse_rune_string(span_text(source, call.args.first()?.0.span()))?;
+	match span_text(source, method.span()) {
+		"set" => Some(InitConfigKey::Set(key)),
+		"ui_color" => Some(InitConfigKey::UiColor(key)),
+		"language_theme" => Some(InitConfigKey::LanguageTheme(key)),
+		_ => None,
+	}
+}
+
+fn span_text<'a>(source: &'a str, span: ast::Span) -> &'a str {
+	&source[span_range(span)]
+}
+
+fn span_range(span: ast::Span) -> Range<usize> {
+	span.start.into_usize()..span.end.into_usize()
+}
+
+fn normalize_rune_source(source: &str) -> String {
+	source.chars().filter(|character| !character.is_whitespace()).collect()
+}
+
+fn is_identifier(value: &str) -> bool {
+	let mut characters = value.chars();
+	matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+		&& characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn parse_rune_string(source: &str) -> Option<String> {
+	let value = source.trim().strip_prefix('"')?.strip_suffix('"')?;
+	let mut decoded = String::with_capacity(value.len());
+	let mut characters = value.chars();
+	while let Some(character) = characters.next() {
+		if character != '\\' {
+			decoded.push(character);
+			continue;
+		}
+		match characters.next()? {
+			'\\' => decoded.push('\\'),
+			'"' => decoded.push('"'),
+			'n' => decoded.push('\n'),
+			'r' => decoded.push('\r'),
+			't' => decoded.push('\t'),
+			_ => return None,
+		}
+	}
+	Some(decoded)
+}
+
+fn line_indent_at(source: &str, offset: usize) -> &str {
+	let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+	&source[line_start..offset]
 }
 
 fn render_init_file(settings: &SettingsPersistent) -> String {
@@ -1595,7 +1809,71 @@ mod tests {
 	}
 
 	#[test]
-	fn init_export_guards_user_code_and_allows_marked_or_forced_replacement() {
+	fn init_export_updates_parsed_user_configuration_without_a_marker() {
+		let mut settings = SettingsPersistent {
+			theme_name: "gruvbox".to_string(),
+			minimap_enabled: false,
+			wrap_enabled: false,
+			line_numbers_enabled: true,
+			relative_line_numbers_enabled: false,
+			visible_whitespace: true,
+			reload_enabled: false,
+			save_durability: SaveDurability::Atomic,
+			ui_colors: crate::engine::UiColorOverrides::default(),
+			language_themes: BTreeMap::from([("markdown".to_string(), "tab20c_s1".to_string())]),
+		};
+		settings.ui_colors.set(
+			crate::engine::UiColorKey::Accent,
+			Some(crate::core::Rgb::new(0x12, 0x34, 0x56)),
+		);
+		let path = temp_test_path("init-export-update");
+
+		write_init_file_at(&path, &settings, false).expect("absent init can be created");
+		let generated = std::fs::read_to_string(&path).expect("generated init");
+		assert!(generated.starts_with(super::GENERATED_INIT_MARKER));
+		write_init_file_at(&path, &settings, false).expect("marked init can be refreshed");
+
+		std::fs::write(
+			&path,
+			r##"pub fn main(editor) {
+	let config = editor.config();
+	config.set("theme", "onedark")?;
+	config.set("future_option", true)?;
+	config.language_theme("markdown", "purples")?;
+	println!("keep me");
+	Ok(())
+}
+"##,
+		)
+			.expect("write handwritten init");
+		write_init_file_at(&path, &settings, false).expect("user configuration is updated");
+		let updated = std::fs::read_to_string(&path).expect("read updated init");
+		assert!(updated.contains("println!(\"keep me\");"));
+		assert!(updated.contains("config.set(\"theme\", \"gruvbox\")?;"));
+		assert!(updated.contains("config.set(\"future_option\", true)?;"));
+		assert!(updated.contains("config.language_theme(\"markdown\", \"tab20c_s1\")?;"));
+		assert!(updated.contains("config.ui_color(\"colors.accent\", \"#123456\")?;"));
+		assert!(updated.contains("config.set(\"wrap\", false)?;"));
+		write_init_file_at(&path, &settings, false).expect("a second update is idempotent");
+		let updated_twice = std::fs::read_to_string(&path).expect("read second update");
+		assert_eq!(updated_twice.matches("config.set(\"theme\"").count(), 1);
+		assert_eq!(
+			updated_twice
+				.matches("config.language_theme(\"markdown\"")
+				.count(),
+			1
+		);
+		write_init_file_at(&path, &settings, true).expect("force replaces handwritten init");
+		assert!(
+			std::fs::read_to_string(&path)
+				.expect("read forced init")
+				.starts_with(super::GENERATED_INIT_MARKER)
+		);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn init_export_refuses_to_edit_a_user_main_without_a_result_tail() {
 		let settings = SettingsPersistent {
 			theme_name: "onedark".to_string(),
 			minimap_enabled: true,
@@ -1608,27 +1886,55 @@ mod tests {
 			ui_colors: crate::engine::UiColorOverrides::default(),
 			language_themes: BTreeMap::new(),
 		};
-		let path = temp_test_path("init-export-guard");
-
-		write_init_file_at(&path, &settings, false).expect("absent init can be created");
-		let generated = std::fs::read_to_string(&path).expect("generated init");
-		assert!(generated.starts_with(super::GENERATED_INIT_MARKER));
-		write_init_file_at(&path, &settings, false).expect("marked init can be refreshed");
-
-		std::fs::write(&path, "pub fn main(editor) {\n\t// keep me\n}\n")
+		let path = temp_test_path("init-export-unsafe");
+		std::fs::write(&path, "pub fn main(editor) {\n\tprintln!(\"keep me\");\n}\n")
 			.expect("write handwritten init");
-		let error = write_init_file_at(&path, &settings, false).expect_err("user code is guarded");
-		assert!(error.contains("initwrite!"));
+
+		let error = write_init_file_at(&path, &settings, false).expect_err("unsafe main is refused");
+		assert!(error.contains("must end with `Ok(())`"));
 		assert!(
 			std::fs::read_to_string(&path)
-				.expect("read guarded init")
+				.expect("read refused init")
 				.contains("keep me")
 		);
-		write_init_file_at(&path, &settings, true).expect("force replaces handwritten init");
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn init_export_migrates_legacy_baryon_settings_without_rewriting_user_code() {
+		let settings = SettingsPersistent {
+			theme_name: "gruvbox".to_string(),
+			minimap_enabled: true,
+			wrap_enabled: true,
+			line_numbers_enabled: true,
+			relative_line_numbers_enabled: false,
+			visible_whitespace: true,
+			reload_enabled: true,
+			save_durability: SaveDurability::Atomic,
+			ui_colors: crate::engine::UiColorOverrides::default(),
+			language_themes: BTreeMap::new(),
+		};
+		let path = temp_test_path("init-export-legacy");
+		std::fs::write(
+			&path,
+			r##"pub fn main(editor) {
+	baryon::set(editor, "theme", "onedark")?;
+	println!("keep me");
+	Ok(())
+}
+"##,
+		)
+		.expect("write legacy init");
+
+		write_init_file_at(&path, &settings, false).expect("legacy init is migrated");
+		let updated = std::fs::read_to_string(&path).expect("read migrated init");
+		assert!(updated.contains("baryon::set(editor, \"theme\", \"onedark\")?;"));
+		assert!(updated.contains("println!(\"keep me\");"));
+		assert!(updated.contains("let config = editor.config();"));
+		assert!(updated.contains("config.set(\"theme\", \"gruvbox\")?;"));
 		assert!(
-			std::fs::read_to_string(&path)
-				.expect("read forced init")
-				.starts_with(super::GENERATED_INIT_MARKER)
+			rune::parse::parse_all::<rune::ast::File>(&updated, rune::SourceId::EMPTY, false)
+				.is_ok()
 		);
 		let _ = std::fs::remove_file(path);
 	}
