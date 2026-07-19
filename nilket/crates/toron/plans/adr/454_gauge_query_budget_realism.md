@@ -37,7 +37,7 @@ commit), 256 MiB, and 1 GiB — classified with the 450/452 taxonomy. The commit
 threshold scales with the budget (cap = 16× `memory_per_task`), so the predeclared
 expectation is that commitment recedes as the budget grows. Outcomes, all admissible:
 
-- **q05 stops committing at realistic budgets** → the 446 bridge's materiality is a
+- **q05 stops committing at the probed larger budgets** → the 446 bridge's materiality is a
   small-budget-regime result; the 451 verdict stands as sealed (it states its regime),
   and any claim of general q05 improvement must state its budget. The arc's conclusions
   become explicitly budget-scoped.
@@ -72,7 +72,7 @@ reachability-classification probe only, in the 450 mold.
 ## Forward arc
 
 If commitment recedes with budget, the reservoir arc's next question becomes "at what
-realistic budget/scale frontier does the reservoir regime begin," and the 452
+budget/scale frontier does the reservoir regime begin," and the 452
 instrument measures along that frontier. The engine-side `Default` retarget, the ADR
 446 12x spill-scope gap, `MAX_FILTER_BYTES` cap raise, ADR 132's comparator, q17
 remeasurement, q21 residual, q19 re-diagnosis + 438 widening, q13, Cut A (439 mirror),

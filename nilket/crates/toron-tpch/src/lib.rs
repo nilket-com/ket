@@ -46,7 +46,7 @@ use tpchgen::generators::{
 
 use toron::binder::{PlannerConfig, bind, bind_with_explain_summary};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
-use toron::distributed::budget::ByteCount;
+use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
 use toron::error::StorageError;
@@ -3576,13 +3576,40 @@ async fn execute_logical_with_catalog_timed(
 	})
 }
 
+pub const GAUGE_MEMORY_PER_TASK_ENV: &str = "TORON_TPCH_MEMORY_PER_TASK";
+
+/// The gauge's memory budget and where it came from. `default` means the
+/// engine's 64 MiB test constant; `explicit` means the operator set the env.
+/// Every perf row records this pair — a gauge figure never floats free of the
+/// budget regime it was measured under.
+pub fn gauge_memory_per_task() -> Result<(u64, &'static str), String> {
+	match std::env::var(GAUGE_MEMORY_PER_TASK_ENV) {
+		Ok(raw) => match raw.parse::<u64>() {
+			Ok(bytes) if bytes > 0 => Ok((bytes, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_MEMORY_PER_TASK_ENV} must be a positive byte count, got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => {
+			Ok((QueryBudget::test_default().memory_per_task.get(), "default"))
+		}
+		Err(error) => Err(format!("{GAUGE_MEMORY_PER_TASK_ENV}: {error}")),
+	}
+}
+
 fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> ExecutionContext {
-	ExecutionContext::local_test()
+	let mut context = ExecutionContext::local_test()
 		.with_task_telemetry(task_telemetry)
 		.with_join_spill_store(
 			Arc::new(wendelon::storage::BlockingFileOps),
 			PathBuf::from(CACHE_ROOT).join("join_spill"),
-		)
+		);
+	if let Ok((bytes, "explicit")) = gauge_memory_per_task() {
+		let mut budget = QueryBudget::test_default();
+		budget.memory_per_task = ByteCount::new(bytes);
+		context = context.with_task_budget(TaskBudget::from_query_budget(budget));
+	}
+	context
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
