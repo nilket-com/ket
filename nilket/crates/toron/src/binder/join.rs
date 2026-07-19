@@ -38,13 +38,6 @@ pub(crate) enum JoinStrategyDecisionReason {
 	HashByDefault {
 		reason: HashByDefaultReason,
 	},
-	/// ADR 464: an auto inner hash join whose sides both carry byte facts builds
-	/// the materially smaller side (132's dominance margin) via the same
-	/// swap+restore placement broadcast uses.
-	HashSmallerBuild {
-		build_bytes: ByteCount,
-		rejected_side_bytes: ByteCount,
-	},
 	/// ADR 239 (scalar-local Cross refinement): a CROSS whose inputs are both provably scalar
 	/// (`row_upper_bound <= 1`) binds as a local cartesian gathered to a single partition — never a
 	/// broadcast and never an empty-key hash *repartition* (the single bucket here holds one row).
@@ -832,12 +825,7 @@ pub(super) fn choose_auto_join_strategy(
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	let Some(threshold) = effective_auto_broadcast_threshold(config) else {
-		return hash_join_decision_with_placement(
-			kind,
-			left_input,
-			right_input,
-			HashByDefaultReason::AutoBroadcastDisabled,
-		);
+		return hash_join_decision(HashByDefaultReason::AutoBroadcastDisabled);
 	};
 	let placement_rule = broadcast_physical_placement(kind);
 	if placement_rule == BroadcastPlacementRule::Never {
@@ -927,43 +915,18 @@ pub(super) fn choose_auto_join_strategy(
 		left_input.probe_linearity,
 		right_input.probe_linearity,
 	) {
-		return hash_join_decision_with_placement(
-			kind,
-			left_input,
-			right_input,
-			HashByDefaultReason::ProbeNotScanLinear(fence),
-		);
+		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear(fence));
 	}
 	if left_input.facts.origin != PlanOrigin::SingleBaseRelation {
-		return hash_join_decision_with_placement(
-			kind,
-			left_input,
-			right_input,
-			HashByDefaultReason::LeftInputNotSingleBaseRelation,
-		);
+		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
 	}
 	if right_input.facts.origin != PlanOrigin::SingleBaseRelation {
-		return hash_join_decision_with_placement(
-			kind,
-			left_input,
-			right_input,
-			HashByDefaultReason::RightInputNotSingleBaseRelation,
-		);
+		return hash_join_decision(HashByDefaultReason::RightInputNotSingleBaseRelation);
 	}
 	if !has_build_size_fact(left_input.facts) || !has_build_size_fact(right_input.facts) {
-		return hash_join_decision_with_placement(
-			kind,
-			left_input,
-			right_input,
-			HashByDefaultReason::MissingBuildByteUpperBound,
-		);
+		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
 	}
-	hash_join_decision_with_placement(
-		kind,
-		left_input,
-		right_input,
-		HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
-	)
+	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
 }
 
 pub(super) fn broadcast_physical_placement(kind: JoinKind) -> BroadcastPlacementRule {
@@ -1009,58 +972,6 @@ pub(super) fn mirrored_broadcast_physical_kind(
 }
 
 pub(super) const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2;
-
-/// ADR 464: the hash comparator wants raw sizes; the broadcast threshold is a
-/// broadcast admission concern, not a size-comparison one.
-pub(super) fn unthresholded_build_byte_candidate(
-	facts: PlanOptimizerFacts,
-) -> Option<BuildByteCandidate> {
-	match facts.origin {
-		PlanOrigin::SingleBaseRelation => facts
-			.byte_upper_bound
-			.map(|bytes| BuildByteCandidate {
-				bytes,
-				source: BuildByteSource::Hard,
-			})
-			.or(facts.estimated_byte_size.map(|bytes| BuildByteCandidate {
-				bytes,
-				source: BuildByteSource::Estimated,
-			})),
-		PlanOrigin::Composite => facts.estimated_byte_size.map(|bytes| BuildByteCandidate {
-			bytes,
-			source: BuildByteSource::Estimated,
-		}),
-		PlanOrigin::Unknown => None,
-	}
-}
-
-/// ADR 464: every auto hash fallback consults the smaller-build comparator for
-/// inner joins; anything else keeps the natural (left) build.
-pub(super) fn hash_join_decision_with_placement(
-	kind: JoinKind,
-	left_input: JoinInputOptimization,
-	right_input: JoinInputOptimization,
-	reason: HashByDefaultReason,
-) -> JoinStrategyDecision {
-	if kind == JoinKind::Inner {
-		if let (Some(left), Some(right)) = (
-			unthresholded_build_byte_candidate(left_input.facts),
-			unthresholded_build_byte_candidate(right_input.facts),
-		) {
-			if right_build_materially_smaller(left.bytes, right.bytes) {
-				return JoinStrategyDecision {
-					strategy: JoinStrategy::HashPartitioned,
-					placement: JoinPhysicalPlacement::SwappedRightBuild,
-					reason: JoinStrategyDecisionReason::HashSmallerBuild {
-						build_bytes: right.bytes,
-						rejected_side_bytes: left.bytes,
-					},
-				};
-			}
-		}
-	}
-	hash_join_decision(reason)
-}
 
 pub(super) fn build_byte_candidate(
 	facts: PlanOptimizerFacts,

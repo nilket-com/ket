@@ -2376,18 +2376,6 @@ pub(super) fn optimizer_explain_build_columns(
 			None,
 			None,
 		)),
-		JoinStrategyDecisionReason::HashSmallerBuild {
-			build_bytes,
-			rejected_side_bytes,
-		} => Ok((
-			Some("right"),
-			Some(byte_count_to_i64(build_bytes, "build_bytes")?),
-			None,
-			Some(byte_count_to_i64(
-				rejected_side_bytes,
-				"rejected_side_bytes",
-			)?),
-		)),
 		JoinStrategyDecisionReason::PinnedByAuthor
 		| JoinStrategyDecisionReason::HashByDefault { .. }
 		| JoinStrategyDecisionReason::ScalarLocalCross => Ok((None, None, None, None)),
@@ -2423,7 +2411,6 @@ pub(super) fn join_strategy_decision_reason_label(
 		JoinStrategyDecisionReason::BroadcastInferred { .. } => "broadcast_inferred",
 		JoinStrategyDecisionReason::BroadcastEstimated { .. } => "broadcast_estimated",
 		JoinStrategyDecisionReason::HashByDefault { .. } => "hash_by_default",
-		JoinStrategyDecisionReason::HashSmallerBuild { .. } => "hash_smaller_build",
 		JoinStrategyDecisionReason::ScalarLocalCross => "scalar_local_cross",
 		JoinStrategyDecisionReason::ScalarBroadcastCross => "scalar_broadcast_cross",
 	}
@@ -2439,7 +2426,6 @@ pub(super) fn join_strategy_decision_reason_detail(
 		JoinStrategyDecisionReason::PinnedByAuthor
 		| JoinStrategyDecisionReason::BroadcastInferred { .. }
 		| JoinStrategyDecisionReason::BroadcastEstimated { .. }
-		| JoinStrategyDecisionReason::HashSmallerBuild { .. }
 		| JoinStrategyDecisionReason::ScalarLocalCross
 		| JoinStrategyDecisionReason::ScalarBroadcastCross => None,
 	}
