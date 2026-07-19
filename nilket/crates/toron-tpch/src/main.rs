@@ -16,19 +16,19 @@ use toron_tpch::telemetry::{
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
-	generate_dev_lineitem, generate_strict_lineitem, matrix, normalize_duckdb_type,
-	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
-	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
-	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
-	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
-	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
-	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
-	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
-	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
-	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
-	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
-	stable_fingerprint, status_rows,
+	generate_dev_lineitem, generate_strict_lineitem, load_persisted_tpch_dataset, matrix,
+	normalize_duckdb_type, parse_scale_factor, prepare_persisted_tpch_dataset,
+	q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
+	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
+	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
+	run_dev_q20, run_dev_q21, run_dev_q22, run_perf_query_with_data_source,
+	run_q17_boundary_census_with_data_source, run_rune_perf_query_with_data_source,
+	run_rune_q03_profile_loop_with_data_source, run_strict_q1, run_strict_q02, run_strict_q3,
+	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
+	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
+	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
+	run_strict_q22, rune_q03_isolation_proof_with_data_source,
+	schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -418,8 +418,19 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		if queries != vec!["q05"] {
 			return harness_error("--paired-ablation currently requires --query q05");
 		}
+		let dataset_fingerprint = match load_persisted_tpch_dataset(mode, sf, &data_dir) {
+			Ok(dataset) => dataset.manifest_fingerprint,
+			Err(message) => {
+				return harness_error(&format!(
+					"paired ablation requires a verified persisted dataset: {message}"
+				));
+			}
+		};
 		match run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir) {
-			Ok(record) if record["passed"] == true => Some(record),
+			Ok(mut record) if record["passed"] == true => {
+				record["dataset_fingerprint"] = serde_json::json!(dataset_fingerprint);
+				Some(record)
+			}
 			Ok(record) => return harness_error(&format!("ADR 449 gate zero failed: {record}")),
 			Err(message) => return harness_error(&message),
 		}
@@ -430,6 +441,12 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		if runs % 2 != 0 {
 			return harness_error("--paired-ablation requires an even --runs count");
 		}
+		let gate_fingerprint = gate_zero
+			.as_ref()
+			.and_then(|record| record.get("dataset_fingerprint"))
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default()
+			.to_string();
 		match prepare_paired_ablation_journal(
 			&output_dir,
 			query,
@@ -439,6 +456,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			&data_dir,
 			runs,
 			warmup,
+			&gate_fingerprint,
 		) {
 			Ok(journal) => Some(journal),
 			Err(message) => return harness_error(&message),
@@ -671,6 +689,8 @@ fn selected_scale_or_default(explicit: Option<f64>, output_dir: &Path) -> Result
 
 const ADR450_GUARD_A: &str = "admitted chain did not commit the generic grouped reservoir path";
 const ADR450_GUARD_B: &str = "generic grouped path did not commit the partitioned-scan reservoir";
+const ADR450_NO_CHAIN_PROFILE: &str =
+	"no grouped-chain surface entered (passed with zero profiles)";
 
 #[derive(Debug, Clone, PartialEq)]
 enum Adr450RungOutcome {
@@ -697,6 +717,16 @@ fn adr450_classify_rung(
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("fail");
 	if status == "pass" {
+		// A passing child with an empty profile dir never entered the admitted
+		// grouped-chain surface at all (no commit guard can fire outside it) —
+		// a legitimate non-commit, distinct from Guards A/B. Ambiguity (two or
+		// more profiles) still fails inside profiled_reservoir_build_rows.
+		if count_grouped_chain_profiles(profile_dir)? == 0 {
+			return Ok(Adr450RungOutcome::NonCommitting {
+				diagnostic: ADR450_NO_CHAIN_PROFILE,
+				execute_ms,
+			});
+		}
 		return Ok(Adr450RungOutcome::Committed {
 			reservoir_build_rows: profiled_reservoir_build_rows(profile_dir)?,
 			execute_ms,
@@ -738,6 +768,10 @@ fn adr450_scale_rungs(args: &[String]) -> Result<Vec<f64>, String> {
 }
 
 fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
+	let query = flag_value(args, "--query").unwrap_or("q05");
+	if !ALL_QUERY_IDS.contains(&query) {
+		return harness_error(&format!("unknown ladder query {query:?}"));
+	}
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	let data_dir = data_dir_from_args(args);
@@ -746,7 +780,7 @@ fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
 		Ok(scales) => scales,
 		Err(message) => return harness_error(&message),
 	};
-	match run_adr450_scale_ladder(&scales, mode, data_source, &data_dir, &output_dir) {
+	match run_adr450_scale_ladder(query, &scales, mode, data_source, &data_dir, &output_dir) {
 		Ok(record) => {
 			println!("{record}");
 			ExitCode::SUCCESS
@@ -756,6 +790,7 @@ fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
 }
 
 fn run_adr450_scale_ladder(
+	query: &str,
 	scales: &[f64],
 	mode: &str,
 	data_source: &str,
@@ -765,7 +800,14 @@ fn run_adr450_scale_ladder(
 	if data_source != "parquet" && data_source != "persisted" {
 		return Err("ADR 450 requires --data-source parquet".to_string());
 	}
-	let ladder_dir = output_dir.join("adr450_scale_ladder");
+	// q05 keeps the original artifact names: ADR 449 reads its fixture scale
+	// from `adr450_selected_scale.json` and that contract must not move.
+	let suffix = if query == "q05" {
+		String::new()
+	} else {
+		format!("_{query}")
+	};
+	let ladder_dir = output_dir.join(format!("adr450_scale_ladder{suffix}"));
 	if ladder_dir.exists() {
 		std::fs::remove_dir_all(&ladder_dir)
 			.map_err(|error| format!("clear ladder directory: {error}"))?;
@@ -775,7 +817,7 @@ fn run_adr450_scale_ladder(
 	let mut rungs = Vec::new();
 	let write_ladder_record = |record: &serde_json::Value| -> Result<(), String> {
 		std::fs::write(
-			output_dir.join("adr450_scale_ladder.json"),
+			output_dir.join(format!("adr450_scale_ladder{suffix}.json")),
 			serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?,
 		)
 		.map_err(|error| format!("write ladder record: {error}"))
@@ -799,7 +841,7 @@ fn run_adr450_scale_ladder(
 		let dataset = prepare_persisted_tpch_dataset(mode, *scale, data_dir)
 			.map_err(|error| format!("prepare sf={scale} dataset: {error}"))?;
 		let row = run_perf_child_with_envs(
-			"q05",
+			query,
 			mode,
 			*scale,
 			0,
@@ -850,6 +892,7 @@ fn run_adr450_scale_ladder(
 			),
 		};
 		let record = serde_json::json!({
+			"query": query,
 			"scale": scale,
 			"outcome": outcome_name,
 			"diagnostic": diagnostic,
@@ -862,13 +905,14 @@ fn run_adr450_scale_ladder(
 		if outcome_name == "committed" {
 			let selected = serde_json::json!({
 				"suite": "adr450_scale_ladder",
+				"query": query,
 				"selected_scale": scale,
 				"rungs": rungs,
 				"outcome": "committed",
 			});
 			write_ladder_record(&selected)?;
 			std::fs::write(
-				output_dir.join("adr450_selected_scale.json"),
+				output_dir.join(format!("adr450_selected_scale{suffix}.json")),
 				serde_json::to_vec_pretty(&selected).map_err(|error| error.to_string())?,
 			)
 			.map_err(|error| format!("write selected scale: {error}"))?;
@@ -877,6 +921,7 @@ fn run_adr450_scale_ladder(
 	}
 	let no_commit = serde_json::json!({
 		"suite": "adr450_scale_ladder",
+		"query": query,
 		"outcome": "no_commit",
 		"selected_scale": null,
 		"rungs": rungs,
@@ -1320,6 +1365,10 @@ fn profile_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
 		.collect::<Vec<_>>();
 	files.sort();
 	Ok(files)
+}
+
+fn count_grouped_chain_profiles(directory: &Path) -> Result<usize, String> {
+	Ok(profile_files(directory)?.len())
 }
 
 fn profiled_reservoir_build_rows(directory: &Path) -> Result<u64, String> {
@@ -3466,11 +3515,19 @@ fn prepare_paired_ablation_journal(
 	data_dir: &Path,
 	runs: usize,
 	warmup: usize,
+	dataset_fingerprint: &str,
 ) -> Result<PairedAblationJournal, String> {
+	if dataset_fingerprint.is_empty() {
+		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
+	}
 	std::fs::create_dir_all(output_dir)
 		.map_err(|error| format!("create paired-ablation output directory: {error}"))?;
 	let journal_path = output_dir.join(ADR449_PAIRED_JOURNAL);
 	let manifest_path = output_dir.join(ADR449_PAIRED_MANIFEST);
+	// The fingerprint arrives from the gate-zero record of THIS launch, so a
+	// resume only proceeds when the stored manifest matches the dataset the
+	// live gate zero just revalidated. A pre-fingerprint manifest can never
+	// match and is refused, not grandfathered.
 	let expected = serde_json::json!({
 		"suite": "adr449_paired_ablation",
 		"query": query,
@@ -3480,6 +3537,7 @@ fn prepare_paired_ablation_journal(
 		"data_dir": data_dir.display().to_string(),
 		"runs": runs,
 		"warmup": warmup,
+		"dataset_fingerprint": dataset_fingerprint,
 	});
 	if manifest_path.exists() {
 		let bytes = std::fs::read(&manifest_path)
@@ -3721,7 +3779,15 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&directory);
 		let data_dir = Path::new("/tmp/adr449-data");
 		let journal = prepare_paired_ablation_journal(
-			&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1,
+			&directory,
+			"q05",
+			"strict",
+			4.0,
+			"parquet",
+			data_dir,
+			20,
+			1,
+			"fnv1a64:cohort",
 		)
 		.unwrap();
 		journal
@@ -3735,14 +3801,52 @@ mod tests {
 			}))
 			.unwrap();
 		let resumed = prepare_paired_ablation_journal(
-			&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1,
+			&directory,
+			"q05",
+			"strict",
+			4.0,
+			"parquet",
+			data_dir,
+			20,
+			1,
+			"fnv1a64:cohort",
 		)
 		.unwrap();
 		assert_eq!(resumed.rows.len(), 1);
 		assert!(resumed.contains("q05", "toron", 0, false));
 		assert!(
 			prepare_paired_ablation_journal(
-				&directory, "q05", "strict", 2.0, "parquet", data_dir, 20, 1,
+				&directory,
+				"q05",
+				"strict",
+				2.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"fnv1a64:cohort",
+			)
+			.is_err()
+		);
+		// ADR 452: a regenerated dataset at the same path must refuse to resume,
+		// and an empty fingerprint (no verified dataset) must never launch.
+		assert!(
+			prepare_paired_ablation_journal(
+				&directory,
+				"q05",
+				"strict",
+				4.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"fnv1a64:regenerated",
+			)
+			.is_err()
+		);
+		assert!(
+			prepare_paired_ablation_journal(
+				&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1, "",
 			)
 			.is_err()
 		);
@@ -3829,6 +3933,26 @@ mod tests {
 				..
 			})
 		));
+	}
+
+	#[test]
+	fn adr452_classifier_pass_with_zero_profiles_is_non_committing() {
+		// A passing child that never entered the grouped-chain surface emits no
+		// profile; that is a climb signal, not a hard error. Fails under the
+		// pre-452 classifier, which demanded exactly one profile on pass.
+		let directory =
+			std::env::temp_dir().join(format!("toron-adr452-empty-profile-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		std::fs::create_dir_all(&directory).unwrap();
+		let row = serde_json::json!({"status": "pass", "execute_ms": 12.0});
+		assert!(matches!(
+			adr450_classify_rung(&row, &directory),
+			Ok(Adr450RungOutcome::NonCommitting {
+				diagnostic: ADR450_NO_CHAIN_PROFILE,
+				..
+			})
+		));
+		std::fs::remove_dir_all(directory).unwrap();
 	}
 
 	#[test]
