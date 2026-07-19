@@ -289,6 +289,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::CodeEditPoll => {
 			app_state.code_editor.poll();
+			if app_state.code_editor.take_quit_request() {
+				return update(app_state, Message::CloseWindow);
+			}
 		}
 		Message::CodeEditResize(size) => {
 			app_state.window_size = size;

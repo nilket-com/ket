@@ -495,9 +495,6 @@ impl BufferStore {
 		self.next_buffer_id
 	}
 
-	pub(crate) fn ids(&self) -> Vec<BufferId> {
-		self.by_id.keys().copied().collect()
-	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

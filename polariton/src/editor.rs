@@ -67,6 +67,10 @@ pub struct CodeEditor {
 	/// errors). Retained until the next forwarded input, vim-style: each
 	/// command's outcome replaces the previous one.
 	status_message: Option<String>,
+	/// The engine accepted `:q` and has emitted its final viewport. Further
+	/// editor traffic must stay local while the application closes its window.
+	quit_requested: bool,
+	quit_notified: bool,
 }
 
 impl CodeEditor {
@@ -88,6 +92,8 @@ impl CodeEditor {
 			content_dirty: false,
 			last_pointer: None,
 			status_message: None,
+			quit_requested: false,
+			quit_notified: false,
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -110,6 +116,15 @@ impl CodeEditor {
 	/// Latest engine status line, if one arrived since the last input.
 	pub fn status_message(&self) -> Option<&str> {
 		self.status_message.as_deref()
+	}
+
+	/// Returns the engine's one-shot `:q` request exactly once.
+	pub fn take_quit_request(&mut self) -> bool {
+		if !self.quit_requested || self.quit_notified {
+			return false;
+		}
+		self.quit_notified = true;
+		true
 	}
 
 	/// Request a fresh document snapshot. The next projected `document_text`
@@ -200,6 +215,7 @@ impl CodeEditor {
 		loop {
 			match self.viewports.try_recv() {
 				Ok(viewport) => {
+					self.quit_requested |= viewport.should_quit;
 					if let Some(message) = viewport.status_message.as_ref() {
 						self.status_message = Some(message.clone());
 					}
@@ -221,6 +237,9 @@ impl CodeEditor {
 	}
 
 	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
+		if self.quit_requested {
+			return Task::none();
+		}
 		match message {
 			EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char('v'),
@@ -233,17 +252,25 @@ impl CodeEditor {
 				if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
 					eprintln!("[input-trace] forwarding to engine: {input:?}");
 				}
-				if let Err(error) = self.input.try_send(input) {
-					eprintln!("Editor engine rejected input: {error}");
-					return Task::none();
+				match self.input.try_send(input) {
+					Ok(()) => {}
+					Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Task::none(),
+					Err(error) => {
+						eprintln!("Editor engine rejected input: {error}");
+						return Task::none();
+					}
 				}
 				self.status_message = None;
 				self.request_content();
 			}
 			EditorMsg::Paste(text) => {
-				if let Err(error) = self.input.try_send(InputEvent::Paste(text)) {
-					eprintln!("Editor engine rejected paste: {error}");
-					return Task::none();
+				match self.input.try_send(InputEvent::Paste(text)) {
+					Ok(()) => {}
+					Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Task::none(),
+					Err(error) => {
+						eprintln!("Editor engine rejected paste: {error}");
+						return Task::none();
+					}
 				}
 				self.status_message = None;
 				self.request_content();
@@ -437,8 +464,12 @@ impl CodeEditor {
 	}
 
 	fn send(&self, command: EditorCommand) -> bool {
+		if self.quit_requested {
+			return false;
+		}
 		match self.commands.try_send(command) {
 			Ok(()) => true,
+			Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
 			Err(error) => {
 				eprintln!("Editor engine rejected command: {error}");
 				false
@@ -912,6 +943,33 @@ mod tests {
 		// The next input retires the message, vim-style.
 		send_keys(&mut editor, ['i']);
 		assert_eq!(editor.status_message(), None);
+	}
+
+	#[test]
+	fn quit_request_is_observable_once_and_stops_editor_input() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		send_keys(&mut editor, [':', 'q']);
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Enter,
+			modifiers: Modifiers::NONE,
+		}));
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !editor.take_quit_request() && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(editor.quit_requested, "`:q` must reach the Polariton bridge");
+		assert!(editor.quit_notified, "the close request must be consumed once");
+		assert!(!editor.take_quit_request(), "quit requests are one-shot");
+
+		// The engine has already exited, so this must be ignored locally rather
+		// than attempting to send on its closed input channel.
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Char('x'),
+			modifiers: Modifiers::NONE,
+		}));
 	}
 
 	#[test]

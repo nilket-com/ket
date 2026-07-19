@@ -2762,9 +2762,9 @@ fn dispatch_command(
 			unreachable!("init reset is handled before the main command match");
 		}
 		EditorCommand::Quit => {
-			for buffer_id in session.buffers.ids() {
-				release_buffer(runtime, session, buffer_id);
-			}
+			// Frontends need one final projection to hand the quit request to
+			// their native window lifecycle before this engine thread exits.
+			session.ui.pending_quit = true;
 			return DispatchOutcome::stop();
 		}
 	}
@@ -3104,6 +3104,14 @@ pub(crate) fn run_engine(engine: Engine) {
 			event_tap.as_ref(),
 		);
 		if should_stop {
+			let _ = render_frame(RenderParams {
+				registry: &registry,
+				resolver: &resolver,
+				tx_view: &tx_view,
+				reactor: &reactor,
+				lang_registry: &lang_registry,
+				session: &mut session,
+			});
 			break;
 		}
 		if needs_render
