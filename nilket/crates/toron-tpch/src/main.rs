@@ -16,12 +16,12 @@ use toron_tpch::telemetry::{
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
-	gauge_memory_per_task, generate_dev_lineitem, generate_strict_lineitem,
-	load_persisted_tpch_dataset, matrix, normalize_duckdb_type, parse_scale_factor,
-	prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	gauge_memory_per_task, gauge_spill_bytes_reserved, generate_dev_lineitem,
+	generate_strict_lineitem, load_persisted_tpch_dataset, matrix, normalize_duckdb_type,
+	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
+	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
+	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -160,6 +160,10 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Ok(budget) => budget,
 		Err(message) => return harness_error(&message),
 	};
+	let (spill_bytes_reserved, spill_provenance) = match gauge_spill_bytes_reserved() {
+		Ok(budget) => budget,
+		Err(message) => return harness_error(&message),
+	};
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
@@ -277,6 +281,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	};
 	row["memory_per_task"] = serde_json::json!(memory_per_task);
 	row["memory_per_task_provenance"] = serde_json::json!(memory_provenance);
+	row["spill_bytes_reserved"] = serde_json::json!(spill_bytes_reserved);
+	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
 	println!("{row}");
 	ExitCode::SUCCESS
 }
@@ -811,6 +817,8 @@ fn run_adr450_scale_ladder(
 	if data_source != "parquet" && data_source != "persisted" {
 		return Err("ADR 450 requires --data-source parquet".to_string());
 	}
+	let (memory_per_task, memory_provenance) = gauge_memory_per_task()?;
+	let (spill_bytes_reserved, spill_provenance) = gauge_spill_bytes_reserved()?;
 	// q05 keeps the original artifact names: ADR 449 reads its fixture scale
 	// from `adr450_selected_scale.json` and that contract must not move.
 	let suffix = if query == "q05" {
@@ -871,6 +879,10 @@ fn run_adr450_scale_ladder(
 			Err(error) => {
 				let record = serde_json::json!({
 					"suite": "adr450_scale_ladder",
+					"memory_per_task": memory_per_task,
+					"memory_per_task_provenance": memory_provenance,
+				"spill_bytes_reserved": spill_bytes_reserved,
+				"spill_bytes_reserved_provenance": spill_provenance,
 					"outcome": "hard_error",
 					"error": error,
 					"rungs": rungs,
@@ -917,6 +929,10 @@ fn run_adr450_scale_ladder(
 			let selected = serde_json::json!({
 				"suite": "adr450_scale_ladder",
 				"query": query,
+				"memory_per_task": memory_per_task,
+				"memory_per_task_provenance": memory_provenance,
+			"spill_bytes_reserved": spill_bytes_reserved,
+			"spill_bytes_reserved_provenance": spill_provenance,
 				"selected_scale": scale,
 				"rungs": rungs,
 				"outcome": "committed",
@@ -933,6 +949,10 @@ fn run_adr450_scale_ladder(
 	let no_commit = serde_json::json!({
 		"suite": "adr450_scale_ladder",
 		"query": query,
+		"memory_per_task": memory_per_task,
+		"memory_per_task_provenance": memory_provenance,
+	"spill_bytes_reserved": spill_bytes_reserved,
+	"spill_bytes_reserved_provenance": spill_provenance,
 		"outcome": "no_commit",
 		"selected_scale": null,
 		"rungs": rungs,
@@ -3238,6 +3258,13 @@ fn summarize_query_rows(
 		.and_then(|row| row.get("memory_per_task_provenance"))
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("unrecorded");
+	let spill_bytes_reserved = first
+		.and_then(|row| row.get("spill_bytes_reserved"))
+		.and_then(serde_json::Value::as_u64);
+	let spill_bytes_reserved_provenance = first
+		.and_then(|row| row.get("spill_bytes_reserved_provenance"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("unrecorded");
 	let mut flags = Vec::new();
 	const STABILITY_THRESHOLD: f64 = 0.20;
 	const REGRESSION_THRESHOLD: f64 = 0.10;
@@ -3292,6 +3319,8 @@ fn summarize_query_rows(
 		"profile": profile,
 		"memory_per_task": memory_per_task,
 		"memory_per_task_provenance": memory_per_task_provenance,
+		"spill_bytes_reserved": spill_bytes_reserved,
+		"spill_bytes_reserved_provenance": spill_bytes_reserved_provenance,
 		"status": status,
 		"runs": runs,
 		"warmup": warmup,
@@ -3956,6 +3985,30 @@ mod tests {
 	}
 
 	#[test]
+	fn adr455_ladder_records_carry_budget_provenance() {
+		let directory =
+			std::env::temp_dir().join(format!("toron-adr455-ladder-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		let record = run_adr450_scale_ladder(
+			"q05",
+			&[],
+			"strict",
+			"parquet",
+			Path::new("/tmp/adr455-data"),
+			&directory,
+		)
+		.unwrap();
+		assert_eq!(record["outcome"], "no_commit");
+		assert_eq!(
+			record["memory_per_task"].as_u64(),
+			Some(64 * 1024 * 1024),
+			"ladder record must carry the budget it ran under"
+		);
+		assert_eq!(record["memory_per_task_provenance"], "default");
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
 	fn adr454_gauge_budget_defaults_and_overrides_with_provenance() {
 		// SAFETY: gate suites run single-threaded (--test-threads=1); no other
 		// thread reads the environment while this test mutates it.
@@ -3971,6 +4024,19 @@ mod tests {
 		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "lots") };
 		assert!(gauge_memory_per_task().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_MEMORY_PER_TASK") };
+		unsafe { std::env::remove_var("TORON_TPCH_SPILL_BYTES_RESERVED") };
+		assert_eq!(
+			gauge_spill_bytes_reserved().unwrap(),
+			(512 * 1024 * 1024, "default")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_SPILL_BYTES_RESERVED", "2147483648") };
+		assert_eq!(
+			gauge_spill_bytes_reserved().unwrap(),
+			(2147483648, "explicit")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_SPILL_BYTES_RESERVED", "0") };
+		assert!(gauge_spill_bytes_reserved().is_err());
+		unsafe { std::env::remove_var("TORON_TPCH_SPILL_BYTES_RESERVED") };
 	}
 
 	#[test]

@@ -3597,6 +3597,29 @@ pub fn gauge_memory_per_task() -> Result<(u64, &'static str), String> {
 	}
 }
 
+pub const GAUGE_SPILL_BYTES_RESERVED_ENV: &str = "TORON_TPCH_SPILL_BYTES_RESERVED";
+
+/// The gauge's per-query spill reserve and its provenance, same contract as
+/// [`gauge_memory_per_task`]: a frontier probe must be able to move one budget
+/// dimension while holding the others explicitly, not implicitly.
+pub fn gauge_spill_bytes_reserved() -> Result<(u64, &'static str), String> {
+	match std::env::var(GAUGE_SPILL_BYTES_RESERVED_ENV) {
+		Ok(raw) => match raw.parse::<u64>() {
+			Ok(bytes) if bytes > 0 => Ok((bytes, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_SPILL_BYTES_RESERVED_ENV} must be a positive byte count, got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => Ok((
+			QueryBudget::test_default()
+				.spill_bytes_reserved_per_query
+				.get(),
+			"default",
+		)),
+		Err(error) => Err(format!("{GAUGE_SPILL_BYTES_RESERVED_ENV}: {error}")),
+	}
+}
+
 fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> ExecutionContext {
 	let mut context = ExecutionContext::local_test()
 		.with_task_telemetry(task_telemetry)
@@ -3604,9 +3627,18 @@ fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> Executio
 			Arc::new(wendelon::storage::BlockingFileOps),
 			PathBuf::from(CACHE_ROOT).join("join_spill"),
 		);
-	if let Ok((bytes, "explicit")) = gauge_memory_per_task() {
+	let memory = gauge_memory_per_task();
+	let spill = gauge_spill_bytes_reserved();
+	let explicit =
+		|value: &Result<(u64, &'static str), String>| matches!(value, Ok((_, "explicit")));
+	if explicit(&memory) || explicit(&spill) {
 		let mut budget = QueryBudget::test_default();
-		budget.memory_per_task = ByteCount::new(bytes);
+		if let Ok((bytes, "explicit")) = memory {
+			budget.memory_per_task = ByteCount::new(bytes);
+		}
+		if let Ok((bytes, "explicit")) = spill {
+			budget.spill_bytes_reserved_per_query = ByteCount::new(bytes);
+		}
 		context = context.with_task_budget(TaskBudget::from_query_budget(budget));
 	}
 	context
