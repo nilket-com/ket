@@ -63,6 +63,10 @@ pub struct CodeEditor {
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
 	last_pointer: Option<iced::Point>,
+	/// Latest engine status line (`:w` outcomes, search wraps, command
+	/// errors). Retained until the next forwarded input, vim-style: each
+	/// command's outcome replaces the previous one.
+	status_message: Option<String>,
 }
 
 impl CodeEditor {
@@ -83,6 +87,7 @@ impl CodeEditor {
 			text_query_pending: false,
 			content_dirty: false,
 			last_pointer: None,
+			status_message: None,
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -100,6 +105,11 @@ impl CodeEditor {
 	/// Last complete document text received from the engine.
 	pub fn cached_content(&self) -> &str {
 		&self.document_text
+	}
+
+	/// Latest engine status line, if one arrived since the last input.
+	pub fn status_message(&self) -> Option<&str> {
+		self.status_message.as_deref()
 	}
 
 	/// Request a fresh document snapshot. The next projected `document_text`
@@ -190,6 +200,9 @@ impl CodeEditor {
 		loop {
 			match self.viewports.try_recv() {
 				Ok(viewport) => {
+					if let Some(message) = viewport.status_message.as_ref() {
+						self.status_message = Some(message.clone());
+					}
 					if let Some(document_text) = viewport.document_text.as_ref() {
 						self.document_text = document_text.clone();
 						self.text_query_pending = false;
@@ -224,6 +237,7 @@ impl CodeEditor {
 					eprintln!("Editor engine rejected input: {error}");
 					return Task::none();
 				}
+				self.status_message = None;
 				self.request_content();
 			}
 			EditorMsg::Paste(text) => {
@@ -231,6 +245,7 @@ impl CodeEditor {
 					eprintln!("Editor engine rejected paste: {error}");
 					return Task::none();
 				}
+				self.status_message = None;
 				self.request_content();
 			}
 			EditorMsg::Scroll(delta) => {
@@ -365,7 +380,9 @@ impl CodeEditor {
 		// Mirror baryon's status-bar prompt: `:` command, `/` search, and
 		// pending confirm questions all use the same bottom bar. Non-Normal
 		// modes without a prompt still announce themselves vim-style, since
-		// the block cursor is otherwise the only modal feedback.
+		// the block cursor is otherwise the only modal feedback. An active
+		// prompt outranks the engine's latest status line, which outranks the
+		// mode indicator — the vim cmdline ordering.
 		let prompt = match viewport.input.mode {
 			EditorMode::Command => Some(format!(":{}", viewport.input.prompt_buffer)),
 			EditorMode::Search => Some(format!("/{}", viewport.input.prompt_buffer)),
@@ -375,6 +392,11 @@ impl CodeEditor {
 					.clone()
 					.unwrap_or_else(|| "Confirm? [y/n]".to_owned()),
 			),
+			EditorMode::Insert | EditorMode::Visual { .. } | EditorMode::Normal
+				if self.status_message().is_some() =>
+			{
+				self.status_message().map(str::to_owned)
+			}
 			EditorMode::Insert => Some("-- INSERT --".to_owned()),
 			EditorMode::Visual { kind, .. } => Some(
 				match kind {
@@ -866,6 +888,30 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	#[test]
+	fn engine_status_messages_surface_and_clear_on_the_next_input() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+
+		// `:w` on an in-memory statement is refused by the engine; the refusal
+		// must reach the bridge's status line.
+		send_keys(&mut editor, [':', 'w']);
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Enter,
+			modifiers: Modifiers::NONE,
+		}));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.status_message() != Some("No file name") && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.status_message(), Some("No file name"));
+
+		// The next input retires the message, vim-style.
+		send_keys(&mut editor, ['i']);
+		assert_eq!(editor.status_message(), None);
 	}
 
 	#[test]
