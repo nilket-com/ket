@@ -1276,7 +1276,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::PersistSaveDurability(_)
 		| EditorCommand::SetGitRefresh(_)
 		| EditorCommand::WriteInit { .. }
-		| EditorCommand::WriteDefaultInit
+		| EditorCommand::WriteDefaultInit { .. }
 		| EditorCommand::ClearVisualSelection
 		| EditorCommand::CheckFileReload
 		| EditorCommand::DiffSplit(_)
@@ -1670,9 +1670,9 @@ fn dispatch_command(
 		);
 		return DispatchOutcome::continue_with(true);
 	}
-	if let EditorCommand::WriteDefaultInit = cmd {
+	if let EditorCommand::WriteDefaultInit { force } = cmd {
 		session.ui.status_message = Some(
-			match system::write_default_init_file(lang_registry) {
+			match system::write_default_init_file(lang_registry, force) {
 				Ok(path) => format!("Reset Rune configuration to defaults at {}", path.display()),
 				Err(error) => format!("Could not reset init.rn: {error}"),
 			},
@@ -2753,7 +2753,7 @@ fn dispatch_command(
 		EditorCommand::WriteInit { .. } => {
 			unreachable!("init export is handled before the main command match");
 		}
-		EditorCommand::WriteDefaultInit => {
+		EditorCommand::WriteDefaultInit { .. } => {
 			unreachable!("init reset is handled before the main command match");
 		}
 		EditorCommand::Quit => {

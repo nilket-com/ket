@@ -60,16 +60,25 @@ pub(super) fn write_init_file(
 
 pub(super) fn write_default_init_file(
 	language_registry: &super::super::language::LanguageRegistry,
+	force: bool,
 ) -> Result<std::path::PathBuf, String> {
 	let path = default_init_path().ok_or_else(|| "No config directory available".to_string())?;
-	write_default_init_file_at(&path, language_registry)?;
+	write_default_init_file_at(&path, language_registry, force)?;
 	Ok(path)
 }
 
 fn write_default_init_file_at(
 	path: &std::path::Path,
 	language_registry: &super::super::language::LanguageRegistry,
+	force: bool,
 ) -> Result<(), String> {
+	if path.exists() && !force {
+		let contents = std::fs::read_to_string(path)
+			.map_err(|error| format!("Could not inspect init.rn: {error}"))?;
+		if !is_generated_init(&contents) {
+			return Err("init.rn contains user code; use :init0! to discard it".to_string());
+		}
+	}
 	write_init_file_at(
 		path,
 		&SettingsPersistent::builtin_defaults(),
@@ -84,13 +93,16 @@ fn write_init_file_at(
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<(), String> {
-	let source = if path.exists() && !force {
-		let contents = std::fs::read_to_string(path)
-			.map_err(|error| format!("Could not inspect init.rn: {error}"))?;
-		if contents
-			.lines()
-			.next()
-			.is_some_and(|line| line.starts_with(GENERATED_INIT_MARKER))
+	let contents = if path.exists() {
+		Some(
+			std::fs::read_to_string(path)
+				.map_err(|error| format!("Could not inspect init.rn: {error}"))?,
+		)
+	} else {
+		None
+	};
+	let source = if let Some(contents) = contents.as_deref().filter(|_| !force) {
+		if is_generated_init(contents)
 		{
 			render_init_file(settings)
 		} else {
@@ -100,12 +112,29 @@ fn write_init_file_at(
 		render_init_file(settings)
 	};
 	validate_init_source(&source)?;
+	if force && contents.as_deref().is_some_and(|contents| !is_generated_init(contents)) {
+		write_init_backup(path)?;
+	}
 	if let Some(parent) = path.parent() {
 		std::fs::create_dir_all(parent)
 			.map_err(|error| format!("Failed to create config directory: {error}"))?;
 	}
 	atomic_write(path, source.as_bytes(), AtomicWriteOptions::config())
 		.map_err(|error| format!("Failed to write init.rn: {error}"))?;
+	Ok(())
+}
+
+fn is_generated_init(source: &str) -> bool {
+	source
+		.lines()
+		.next()
+		.is_some_and(|line| line.starts_with(GENERATED_INIT_MARKER))
+}
+
+fn write_init_backup(path: &std::path::Path) -> Result<(), String> {
+	let backup = path.with_extension("rn.bak");
+	std::fs::copy(path, &backup)
+		.map_err(|error| format!("Failed to back up init.rn to {}: {error}", backup.display()))?;
 	Ok(())
 }
 
@@ -1781,9 +1810,9 @@ mod tests {
 		super::write_init_file_at(path, settings, &language_registry, force)
 	}
 
-	fn write_test_default_init_file_at(path: &std::path::Path) -> Result<(), String> {
+	fn write_test_default_init_file_at(path: &std::path::Path, force: bool) -> Result<(), String> {
 		let language_registry = crate::engine::host::build_language_registry();
-		super::write_default_init_file_at(path, &language_registry)
+		super::write_default_init_file_at(path, &language_registry, force)
 	}
 
 	#[test]
@@ -1923,13 +1952,21 @@ mod tests {
 		)
 		.expect("write custom init");
 
-		write_test_default_init_file_at(&path).expect("init0 replaces custom init");
+		let error = write_test_default_init_file_at(&path, false)
+			.expect_err("init0 protects custom init");
+		assert!(error.contains("init0!"));
+		assert!(std::fs::read_to_string(&path).expect("read protected init").contains("gruvbox"));
+
+		write_test_default_init_file_at(&path, true).expect("init0! replaces custom init");
 		let reset = std::fs::read_to_string(&path).expect("read default init");
 		assert!(reset.starts_with(super::GENERATED_INIT_MARKER));
 		assert!(reset.contains("config.set(\"theme\", \"onedark\")?;"));
 		assert!(!reset.contains("gruvbox"));
 		assert!(rune::parse::parse_all::<rune::ast::File>(&reset, rune::SourceId::EMPTY, false).is_ok());
-		let _ = std::fs::remove_file(path);
+		let backup = std::fs::read_to_string(path.with_extension("rn.bak")).expect("read init backup");
+		assert!(backup.contains("gruvbox"));
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(path.with_extension("rn.bak"));
 	}
 
 	#[test]
@@ -1997,7 +2034,13 @@ mod tests {
 				.expect("read forced init")
 				.starts_with(super::GENERATED_INIT_MARKER)
 		);
-		let _ = std::fs::remove_file(path);
+		assert!(
+			std::fs::read_to_string(path.with_extension("rn.bak"))
+				.expect("read forced init backup")
+				.contains("println!(\"keep me\");")
+		);
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(path.with_extension("rn.bak"));
 	}
 
 	#[test]
