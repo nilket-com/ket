@@ -218,18 +218,16 @@ pub(crate) fn read_line_bytes_from_sum_tree(
 	} else {
 		total_bytes
 	};
-	let end = if include_newline {
-		DocByte::new(raw_end)
-	} else {
-		DocByte::new(if raw_end > start.get() && raw_end <= total_bytes {
-			raw_end.saturating_sub(1)
-		} else {
-			raw_end
-		})
-	};
-	registry
-		.read_loaded_slice(root, start, end)
-		.map_err(|msg| msg.to_string())
+	let mut bytes = registry
+		.read_loaded_slice(root, start, DocByte::new(raw_end))
+		.map_err(|msg| msg.to_string())?;
+	// Only a real terminator is stripped: the document's last line has no
+	// trailing newline, and blindly dropping the final byte would chop its
+	// last character (visibly desyncing cursor math from the caret).
+	if !include_newline && bytes.last() == Some(&b'\n') {
+		bytes.pop();
+	}
+	Ok(bytes)
 }
 
 fn is_structural_word_token(kind: SyntaxKind) -> bool {

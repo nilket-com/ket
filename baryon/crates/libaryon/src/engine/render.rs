@@ -60,6 +60,7 @@ struct RenderDocumentState {
 	root_id: Option<NodeId>,
 	topology_rev: crate::core::TopologyRev,
 	file_path: Option<String>,
+	virtual_path: Option<String>,
 	backing_path: Option<String>,
 	active_language_id: Option<&'static str>,
 	ledger: RenderLedgerState,
@@ -525,6 +526,7 @@ fn render_pane_viewport(
 						root_id: Some(document.root_id),
 						topology_rev: document.topology_rev,
 						file_path: document.file_path.clone(),
+						virtual_path: document.virtual_path.clone(),
 						backing_path: document.backing_path.clone(),
 						active_language_id: document.active_language_id,
 						ledger: RenderLedgerState {
@@ -553,6 +555,7 @@ fn render_pane_viewport(
 					root_id: Some(document.root_id),
 					topology_rev: document.topology_rev,
 					file_path: Some(document.file_path.clone()),
+					virtual_path: None,
 					backing_path: None,
 					active_language_id: Some("fs"),
 					ledger: RenderLedgerState {
@@ -827,7 +830,7 @@ fn render_pane_viewport(
 
 		let mut global_start_byte = DocByte::ZERO;
 		let mut highlights = Vec::new();
-		if tab.document.file_path.is_some() {
+		if tab.document.file_path.is_some() || tab.document.virtual_path.is_some() {
 			let active_provider = tab
 				.document
 				.active_language_id
@@ -847,7 +850,13 @@ fn render_pane_viewport(
 				next_request_id: next_semantic_request_id,
 				buffer_id: tab.document.buffer_id,
 				root_id: tab.document.root_id.expect("text buffer has a root"),
-				file_path: tab.document.file_path.as_deref(),
+				// In-memory documents carry a virtual identity so language
+				// services still receive a file-path-shaped context.
+				file_path: tab
+					.document
+					.file_path
+					.as_deref()
+					.or(tab.document.virtual_path.as_deref()),
 				backing_path: tab.document.backing_path.as_deref(),
 				active_language_id: tab.document.active_language_id,
 				state_id: tab.document.ledger.current_state_id,

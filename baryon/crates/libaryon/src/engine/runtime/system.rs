@@ -292,6 +292,7 @@ fn initialize_loaded_document(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
 	file_path: &mut Option<String>,
+	virtual_path: &mut Option<String>,
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
@@ -304,6 +305,7 @@ fn initialize_loaded_document(
 	scroll_y: &mut u64,
 	scroll_row_offset: &mut DisplayRow,
 	path: Option<String>,
+	new_virtual_path: Option<String>,
 	backing: Option<String>,
 	language_id: Option<&'static str>,
 	shadow_session: Option<ShadowSession>,
@@ -320,6 +322,7 @@ fn initialize_loaded_document(
 	*active_language_id = language_id;
 	*file_stamp = path.as_deref().and_then(file_stamp_for_path);
 	*file_path = path;
+	*virtual_path = new_virtual_path;
 	*backing_path = backing;
 	*shadow = shadow_session;
 	*root_id = Some(new_root);
@@ -342,6 +345,7 @@ fn reload_loaded_document(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
 	file_path: &mut Option<String>,
+	virtual_path: &mut Option<String>,
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
@@ -381,6 +385,7 @@ fn reload_loaded_document(
 		ctx,
 		root_id,
 		file_path,
+		virtual_path,
 		backing_path,
 		backing_device_id,
 		file_stamp,
@@ -393,6 +398,7 @@ fn reload_loaded_document(
 		scroll_y,
 		scroll_row_offset,
 		Some(path.clone()),
+		None,
 		Some(path),
 		language_id,
 		None,
@@ -805,6 +811,7 @@ pub(super) fn handle_file_doctab_command(
 				ctx,
 				&mut root_id,
 				&mut tab.document.file_path,
+				&mut tab.document.virtual_path,
 				&mut tab.document.backing_path,
 				&mut tab.document.backing_device_id,
 				&mut tab.document.file_stamp,
@@ -906,6 +913,7 @@ pub(super) fn handle_auto_reload_doctab_command(
 				ctx,
 				&mut root_id,
 				&mut tab.document.file_path,
+				&mut tab.document.virtual_path,
 				&mut tab.document.backing_path,
 				&mut tab.document.backing_device_id,
 				&mut tab.document.file_stamp,
@@ -966,6 +974,8 @@ pub(super) fn handle_language_doctab_command(
 		let effect = handle_language_command(
 			lang_registry,
 			&mut tab.document.active_language_id,
+			tab.document.file_path.is_some(),
+			&mut tab.document.virtual_path,
 			&mut semantic,
 			status_message,
 			lang_id,
@@ -1039,6 +1049,7 @@ pub(super) fn handle_file_command(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
 	file_path: &mut Option<String>,
+	virtual_path: &mut Option<String>,
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
@@ -1077,6 +1088,7 @@ pub(super) fn handle_file_command(
 									ctx,
 									root_id,
 									file_path,
+									virtual_path,
 									backing_path,
 									backing_device_id,
 									file_stamp,
@@ -1089,6 +1101,7 @@ pub(super) fn handle_file_command(
 									scroll_y,
 									scroll_row_offset,
 									Some(path.clone()),
+									None,
 									Some(current_generation.path.clone()),
 									language_id,
 									Some(recovered_shadow),
@@ -1119,6 +1132,7 @@ pub(super) fn handle_file_command(
 								ctx,
 								root_id,
 								file_path,
+								virtual_path,
 								backing_path,
 								backing_device_id,
 								file_stamp,
@@ -1131,6 +1145,7 @@ pub(super) fn handle_file_command(
 								scroll_y,
 								scroll_row_offset,
 								Some(path.clone()),
+								None,
 								Some(path.clone()),
 								language_id,
 								None,
@@ -1147,6 +1162,7 @@ pub(super) fn handle_file_command(
 								ctx,
 								root_id,
 								file_path,
+								virtual_path,
 								backing_path,
 								backing_device_id,
 								file_stamp,
@@ -1159,6 +1175,7 @@ pub(super) fn handle_file_command(
 								scroll_y,
 								scroll_row_offset,
 								Some(path),
+								None,
 								None,
 								language_id,
 								None,
@@ -1182,6 +1199,7 @@ pub(super) fn handle_file_command(
 					ctx,
 					root_id,
 					file_path,
+					virtual_path,
 					backing_path,
 					backing_device_id,
 					file_stamp,
@@ -1263,6 +1281,9 @@ pub(super) fn handle_file_command(
 						*active_language_id = detect_language(ctx.lang_registry, &path);
 						semantic.reset_semantic_state();
 						*file_path = Some(path);
+						// The document now has a real file identity; only a
+						// successful write may retire the virtual one.
+						*virtual_path = None;
 						if let Some(existing_shadow) = shadow.take() {
 							let _ = discard_shadow_session(&existing_shadow);
 						}
@@ -1308,14 +1329,24 @@ pub(super) fn handle_file_command(
 				*status_message = Some("No file to write".to_string());
 			}
 		}
-		EditorCommand::ReplaceDocument { text, language } => {
-			let language_id = match language.as_deref() {
+		EditorCommand::ReplaceDocument {
+			text,
+			language,
+			virtual_path: requested_virtual_path,
+		} => {
+			let (language_id, derived_virtual_path) = match language.as_deref() {
 				Some(name_or_extension) => {
 					match ctx
 						.lang_registry
 						.resolve_supported_language_provider(name_or_extension)
 					{
-						Some(provider) => Some(provider.language_id()),
+						Some(provider) => (
+							Some(provider.language_id()),
+							provider
+								.extensions()
+								.first()
+								.map(|extension| format!("untitled.{extension}")),
+						),
 						None => {
 							*status_message =
 								Some(format!("Unknown language: {}", name_or_extension));
@@ -1323,7 +1354,7 @@ pub(super) fn handle_file_command(
 						}
 					}
 				}
-				None => None,
+				None => (None, None),
 			};
 			match create_document_from_bytes(ctx.registry, text.into_bytes()) {
 				Ok((rid, leaf)) => {
@@ -1334,6 +1365,7 @@ pub(super) fn handle_file_command(
 						ctx,
 						root_id,
 						file_path,
+						virtual_path,
 						backing_path,
 						backing_device_id,
 						file_stamp,
@@ -1346,6 +1378,7 @@ pub(super) fn handle_file_command(
 						scroll_y,
 						scroll_row_offset,
 						None,
+						requested_virtual_path.or(derived_virtual_path),
 						None,
 						language_id,
 						None,
@@ -1367,16 +1400,24 @@ pub(super) fn handle_file_command(
 pub(super) fn handle_language_command(
 	lang_registry: &super::super::language::LanguageRegistry,
 	active_language_id: &mut Option<&'static str>,
+	has_file_path: bool,
+	virtual_path: &mut Option<String>,
 	semantic: &mut SemanticRuntime<'_>,
 	status_message: &mut Option<String>,
 	lang_id: Option<String>,
 ) -> CommandEffect {
-	let language_id = match lang_id.as_deref() {
+	let (language_id, derived_virtual_path) = match lang_id.as_deref() {
 		Some(name_or_extension) => {
 			match lang_registry.resolve_supported_language_provider(name_or_extension) {
 				Some(provider) => {
 					*status_message = Some(format!("Language set to {}", provider.label()));
-					Some(provider.language_id())
+					(
+						Some(provider.language_id()),
+						provider
+							.extensions()
+							.first()
+							.map(|extension| format!("untitled.{extension}")),
+					)
 				}
 				None => {
 					*status_message = Some(format!("Unknown language: {}", name_or_extension));
@@ -1386,10 +1427,15 @@ pub(super) fn handle_language_command(
 		}
 		None => {
 			*status_message = Some("Language set to plaintext".to_string());
-			None
+			(None, None)
 		}
 	};
 	*active_language_id = language_id;
+	// A pathless buffer needs a file-path-shaped identity for the language
+	// services the new language enables; a real file keeps its own identity.
+	if !has_file_path {
+		*virtual_path = derived_virtual_path;
+	}
 	semantic.reset_semantic_state();
 	CommandEffect::render()
 }
@@ -4142,6 +4188,7 @@ mod tests {
 			EditorCommand::ReplaceDocument {
 				text: sql.to_string(),
 				language: Some("sql".to_string()),
+				virtual_path: None,
 			},
 		);
 		let visible = pane_text(&replaced, replaced.focused_pane_id);
@@ -4168,6 +4215,7 @@ mod tests {
 			EditorCommand::ReplaceDocument {
 				text: "clobbered".to_string(),
 				language: Some("doesnotexist".to_string()),
+				virtual_path: None,
 			},
 		);
 		assert_eq!(
@@ -4207,6 +4255,187 @@ mod tests {
 	}
 
 	#[test]
+	fn replace_document_gives_in_memory_documents_semantic_highlighting() {
+		use std::time::Duration;
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+
+		// No explicit identity: one is derived from the language provider, so
+		// the semantic pipeline (which requires a file-path-shaped context)
+		// still runs for a purely in-memory document.
+		let mut view = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: "select id, name from users where id = 7;\n".to_string(),
+				language: Some("sql".to_string()),
+				virtual_path: None,
+			},
+		);
+		for _ in 0..100 {
+			if !view.highlights.is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(30));
+			tx_cmd.refresh_for_test().expect("refresh");
+			view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after semantic");
+		}
+		assert!(
+			!view.highlights.is_empty(),
+			"in-memory sql document must receive semantic highlights"
+		);
+
+		// The virtual identity must not make the document writable.
+		let write = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::WriteFile);
+		assert_eq!(write.status_message.as_deref(), Some("No file name"));
+
+		// Failed file operations must not strip the surviving in-memory
+		// document of its identity: highlighting persists after a refused
+		// reload (no file name) and a failed write-as (unwritable path).
+		let reload = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReloadFile { force: true },
+		);
+		assert_eq!(reload.status_message.as_deref(), Some("No file name"));
+		let after_reload = send_refresh_and_recv(&tx_cmd, &rx_view);
+		assert!(
+			!after_reload.highlights.is_empty(),
+			"refused reload must preserve virtual-identity highlighting"
+		);
+		let failed_write = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::WriteFileAs("/nonexistent-dir-for-test/out.sql".to_string()),
+		);
+		assert!(
+			failed_write.status_message.is_some(),
+			"write into a missing directory must fail"
+		);
+		let after_write = send_refresh_and_recv(&tx_cmd, &rx_view);
+		assert!(
+			!after_write.highlights.is_empty(),
+			"failed write-as must preserve virtual-identity highlighting"
+		);
+
+		// An explicit identity is honored the same way.
+		let mut view = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: "select count(*) as total from orders where total > 10;\n".to_string(),
+				language: Some("sql".to_string()),
+				virtual_path: Some("statement.sql".to_string()),
+			},
+		);
+		for _ in 0..100 {
+			if !view.highlights.is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(30));
+			tx_cmd.refresh_for_test().expect("refresh");
+			view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after semantic");
+		}
+		assert!(
+			!view.highlights.is_empty(),
+			"explicit virtual identity must also produce highlights"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
+	fn insert_typing_on_the_last_line_keeps_pane_cursor_at_the_caret() {
+		use crate::engine::{InputEvent, KeyCode, Modifiers};
+		use std::time::Duration;
+
+		let (tx_cmd, input, rx_view, handle) = spawn_test_engine_with_input(false, true, None);
+		let _ = send_refresh_and_recv(&tx_cmd, &rx_view);
+		// Type on the document's last line (no trailing newline): the wrap
+		// model reads the line's bytes, and dropping the final character made
+		// the projected pane cursor clamp one cell short of the caret.
+		for ch in ['i', 'a', 'b', 'c'] {
+			input
+				.send(InputEvent::Key {
+					code: KeyCode::Char(ch),
+					modifiers: Modifiers::NONE,
+				})
+				.expect("send key");
+		}
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		let mut view = send_refresh_and_recv(&tx_cmd, &rx_view);
+		while (view.cursor_abs_pos.col.get() != 3
+			|| view.cursor_pane_col.get() != view.cursor_abs_pos.col.get())
+			&& std::time::Instant::now() < deadline
+		{
+			view = send_refresh_and_recv(&tx_cmd, &rx_view);
+		}
+		assert_eq!(view.cursor_abs_pos.col.get(), 3, "caret sits after 'abc'");
+		assert_eq!(
+			view.cursor_pane_col.get(),
+			view.cursor_abs_pos.col.get(),
+			"pane-projected cursor must sit at the caret, not on the last glyph"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
+	fn set_language_gives_a_pathless_scratch_buffer_semantic_highlighting() {
+		use std::time::Duration;
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+
+		// Plain text in a buffer with no file and no virtual identity — the
+		// scratch-buffer scenario a terminal user reaches with `[No Name]`.
+		let plain = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: "select id, name from users where id = 7;\n".to_string(),
+				language: None,
+				virtual_path: None,
+			},
+		);
+		assert!(plain.highlights.is_empty());
+
+		// Setting the language must derive a file-path-shaped identity so the
+		// semantic pipeline runs.
+		let mut view = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::SetLanguage(Some("sql".to_string())),
+		);
+		for _ in 0..100 {
+			if !view.highlights.is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(30));
+			tx_cmd.refresh_for_test().expect("refresh");
+			view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after semantic");
+		}
+		assert!(
+			!view.highlights.is_empty(),
+			"set-language on a pathless buffer must produce semantic highlights"
+		);
+
+		// The derived identity still does not make the buffer writable.
+		let write = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::WriteFile);
+		assert_eq!(write.status_message.as_deref(), Some("No file name"));
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
 	fn replace_document_clears_the_file_association() {
 		let scratch_path = temp_test_path("replace-document-clears-file").with_extension("txt");
 		std::fs::write(&scratch_path, "on disk\n").expect("write fixture");
@@ -4223,6 +4452,7 @@ mod tests {
 			EditorCommand::ReplaceDocument {
 				text: "in memory\n".to_string(),
 				language: None,
+				virtual_path: None,
 			},
 		);
 		let visible = pane_text(&replaced, replaced.focused_pane_id);

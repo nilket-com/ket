@@ -221,6 +221,13 @@ pub enum EditorCommand {
 	ReplaceDocument {
 		text: String,
 		language: Option<String>,
+		/// File-path-shaped identity for the in-memory document (e.g.
+		/// `statement.sql`). Language services that expect a path (semantic
+		/// highlighting, diagnostics) receive it; the document still has no
+		/// file: writes refuse and no canonical path is claimed. When `None`
+		/// and `language` resolves, an identity is derived from the
+		/// provider's first extension (`untitled.<ext>`).
+		virtual_path: Option<String>,
 	},
 	/// Request the focused document's full text, delivered once via
 	/// `Viewport::document_text` on the next projection.

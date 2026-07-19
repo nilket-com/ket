@@ -88,6 +88,10 @@ impl CodeEditor {
 		editor.send(EditorCommand::ReplaceDocument {
 			text: text.to_owned(),
 			language: Some("sql".to_owned()),
+			// File-path-shaped identity so libaryon's language services
+			// (semantic highlighting, diagnostics) run for this unsaved
+			// in-memory document.
+			virtual_path: Some("statement.sql".to_owned()),
 		});
 		editor.request_content();
 		editor
@@ -122,6 +126,10 @@ impl CodeEditor {
 		self.send(EditorCommand::ReplaceDocument {
 			text: text.to_owned(),
 			language: Some("sql".to_owned()),
+			// File-path-shaped identity so libaryon's language services
+			// (semantic highlighting, diagnostics) run for this unsaved
+			// in-memory document.
+			virtual_path: Some("statement.sql".to_owned()),
 		});
 		self.request_content();
 	}

@@ -91,6 +91,10 @@ pub(crate) struct TextBuffer {
 	pub(crate) root_id: NodeId,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: Option<String>,
+	/// File-path-shaped identity for an unsaved in-memory document (e.g.
+	/// `statement.sql`). Feeds language services that expect a path without
+	/// claiming persistence: `file_path` stays `None` and writes still refuse.
+	pub(crate) virtual_path: Option<String>,
 	canonical_path: Option<CanonicalPath>,
 	pub(crate) backing_path: Option<String>,
 	/// Resolver device owned by the current reachable document root.
@@ -138,6 +142,7 @@ impl TextBuffer {
 				root_id: root,
 				topology_rev: TopologyRev::ZERO,
 				file_path: None,
+				virtual_path: None,
 				canonical_path: None,
 				backing_path: None,
 				backing_device_id: None,
@@ -1769,6 +1774,7 @@ impl TestTextEditor {
 					root_id: root,
 					topology_rev: TopologyRev::ZERO,
 					file_path: None,
+					virtual_path: None,
 					canonical_path: None,
 					backing_path: None,
 					backing_device_id: None,
