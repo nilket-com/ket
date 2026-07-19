@@ -17,7 +17,7 @@ use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
 	gauge_memory_per_task, gauge_spill_bytes_reserved, generate_dev_lineitem,
-	generate_strict_lineitem, load_persisted_tpch_dataset, matrix, normalize_duckdb_type,
+	load_persisted_tpch_dataset, matrix, normalize_duckdb_type,
 	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
 	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
 	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
@@ -29,7 +29,7 @@ use toron_tpch::{
 	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
 	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
 	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
-	stable_fingerprint, status_rows,
+	stable_fingerprint, status_rows, strict_lineitem_row_count,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -1376,7 +1376,7 @@ fn run_perf_child_with_envs(
 }
 
 fn q05_reservoir_full_input_cardinality(scale_factor: f64) -> u64 {
-	generate_strict_lineitem(scale_factor).num_rows() as u64
+	strict_lineitem_row_count(scale_factor)
 }
 
 fn adr449_gate_zero_passes(on_rows: u64, off_rows: u64, expected_off: u64) -> bool {
@@ -3966,6 +3966,11 @@ mod tests {
 		let small = q05_reservoir_full_input_cardinality(0.01);
 		let sf1 = q05_reservoir_full_input_cardinality(1.0);
 		let sf10 = q05_reservoir_full_input_cardinality(10.0);
+		assert_eq!(
+			small,
+			toron_tpch::generate_strict_lineitem(0.01).num_rows() as u64,
+			"the streaming cardinality oracle matches the materialized strict batch"
+		);
 		assert!(small < sf1 && sf1 < sf10);
 		assert_ne!(small, 59_986_052);
 		assert_ne!(sf1, 59_986_052);

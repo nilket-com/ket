@@ -904,6 +904,10 @@ fn strict_lineitem_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 
 /// Generate the strict `LINEITEM` reachability subset at `scale_factor` as official `Decimal128(15,2)` Arrow.
 /// `TPCHDecimal::into_inner()` is already the scale-2 raw value; whole-number quantity is scaled by 100.
+///
+/// Use [`strict_lineitem_row_count`] when only the source cardinality is needed;
+/// materializing this complete batch solely to call `num_rows()` is needlessly expensive
+/// at large scales.
 pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 	let generator = LineItemGenerator::new(scale_factor, 1, 1);
 	let mut quantity = Vec::new();
@@ -963,6 +967,14 @@ pub fn generate_strict_lineitem(scale_factor: f64) -> RecordBatch {
 		],
 	)
 	.expect("strict lineitem batch")
+}
+
+/// Exact strict `LINEITEM` source cardinality without materializing its Arrow columns.
+///
+/// This traverses the same strict generator as [`generate_strict_lineitem`], so it is
+/// scale-parametric and remains the authoritative q05 gate-zero OFF expectation.
+pub fn strict_lineitem_row_count(scale_factor: f64) -> u64 {
+	LineItemGenerator::new(scale_factor, 1, 1).iter().count() as u64
 }
 
 /// The q14 `PART` fixture: the join key + the type string q14's CASE matches. Same in dev and strict (no
