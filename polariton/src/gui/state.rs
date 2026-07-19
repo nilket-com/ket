@@ -79,7 +79,13 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 			key: keyboard::Key::Named(keyboard::key::Named::Enter),
 			modifiers,
 			..
-		}) if modifiers.control() => Some(Message::Run),
+		}) if modifiers.shift() || modifiers.control() => {
+			if modifiers.shift() {
+				Some(Message::RunSnippet)
+			} else {
+				Some(Message::Run)
+			}
+		}
 		_ => None,
 	});
 	let resize_tick = if state.dashboard.resize_freeze_until().is_some() {
@@ -253,6 +259,28 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 	)
 }
 
+fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
+	let Some(db) = app_state.adapter_state.connection.as_ref() else {
+		return Task::none();
+	};
+	if code.trim().is_empty() {
+		app_state.status_msg = "Nothing to run on the current line.".into();
+		return Task::none();
+	}
+	let db = db.clone();
+	app_state.status_msg = "Code running...".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	Task::perform(
+		async move {
+			let mut guard = db.write().await;
+			guard.dispatch(&code).await
+		},
+		Message::RunResult,
+	)
+}
+
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	match message {
 		Message::Dashboard(message) => {
@@ -364,24 +392,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				"Adapter connection failed.".into()
 			};
 		}
-		Message::Run => match &mut app_state.adapter_state.connection {
-			None => {}
-			Some(db) => {
-				let code = app_state.code_editor.cached_content().to_owned();
-				let db = db.clone();
-				app_state.status_msg = "Code running...".into();
-				app_state.status_error = "".to_string();
-				app_state.status_time_elapsed = None;
-				app_state.code_started = Instant::now();
-				return Task::perform(
-					async move {
-						let mut guard = db.write().await;
-						guard.dispatch(&code).await
-					},
-					Message::RunResult,
-				);
-			}
-		},
+		Message::Run => return run_code(app_state, app_state.code_editor.cached_content().to_owned()),
+		Message::RunSnippet => {
+			let Some(code) = app_state.code_editor.selected_or_current_line() else {
+				app_state.status_msg = "No editor text is available to run.".into();
+				return Task::none();
+			};
+			return run_code(app_state, code);
+		}
 		Message::RunResult(er) => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
@@ -791,6 +809,7 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"noop" => None,
 		"connect:new" => Some(Message::Connect),
 		"code:run" => Some(Message::Run),
+		"code:run-snippet" => Some(Message::RunSnippet),
 		"code:save" => Some(Message::OpenSaveStatementDialog),
 		"settings:preferences" => Some(Message::OpenSettings),
 		_ => {

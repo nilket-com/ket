@@ -341,7 +341,11 @@ fn build_menu_roots(
 			items: vec![
 				MenuItem::Action {
 					id: "code:run".into(),
-					label: "Run  (Ctrl+Enter)".into(),
+					label: "Run all  (Ctrl+Enter)".into(),
+				},
+				MenuItem::Action {
+					id: "code:run-snippet".into(),
+					label: "Run selection / line  (Shift+Enter)".into(),
 				},
 				MenuItem::Action {
 					id: "code:save".into(),

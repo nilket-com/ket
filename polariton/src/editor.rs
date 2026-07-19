@@ -113,6 +113,27 @@ impl CodeEditor {
 		&self.document_text
 	}
 
+	/// SQL to run from the focused editor context: an active visual selection,
+	/// or the cursor's logical line when no selection exists.
+	pub fn selected_or_current_line(&self) -> Option<String> {
+		let pane = self.viewport.as_ref()?.focused_pane()?;
+		let source = self.document_text.as_bytes();
+		if !pane.selection_ranges.is_empty() {
+			let mut fragments = Vec::with_capacity(pane.selection_ranges.len());
+			for (start, end) in &pane.selection_ranges {
+				let start = usize::try_from(start.get()).ok()?;
+				let end = usize::try_from(end.get()).ok()?.saturating_add(1);
+				let fragment = std::str::from_utf8(source.get(start..end)?).ok()?;
+				fragments.push(fragment);
+			}
+			return Some(fragments.join("\n"));
+		}
+
+		let start = usize::try_from(pane.cursor_line_start_byte.get()).ok()?;
+		let tail = std::str::from_utf8(source.get(start..)?).ok()?;
+		Some(tail.split_once('\n').map_or(tail, |(line, _)| line).to_owned())
+	}
+
 	/// Latest engine status line, if one arrived since the last input.
 	pub fn status_message(&self) -> Option<&str> {
 		self.status_message.as_deref()
@@ -195,6 +216,13 @@ impl CodeEditor {
 					);
 				}
 				if status != event::Status::Ignored {
+					return None;
+				}
+				// The application owns these execution shortcuts. Do not also send
+				// their Enter key through libaryon's insert-mode keymap.
+				if matches!(modified_key.as_ref(), Key::Named(keyboard::key::Named::Enter))
+					&& (modifiers.shift() || modifiers.control())
+				{
 					return None;
 				}
 				key_code(&modified_key).map(|code| {
@@ -1262,6 +1290,41 @@ mod tests {
 				.is_some_and(|pane| pane.cursor_abs_pos.line.get() == 1
 					&& pane.cursor_abs_pos.col.get() >= 3)
 		);
+	}
+
+	#[test]
+	fn execution_text_uses_the_current_line_or_visual_selection() {
+		let mut editor = CodeEditor::new("select 1;\nselect 2;");
+		wait_for_content(&mut editor, "select 1;\nselect 2;");
+		assert_eq!(editor.selected_or_current_line().as_deref(), Some("select 1;"));
+
+		send_keys(&mut editor, ['j']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.cursor_abs_pos.line.get() != 1)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.selected_or_current_line().as_deref(), Some("select 2;"));
+
+		send_keys(&mut editor, ['v', 'l']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.selection_ranges.is_empty())
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.selected_or_current_line().as_deref(), Some("se"));
 	}
 
 	#[test]

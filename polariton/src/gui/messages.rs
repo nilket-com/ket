@@ -70,6 +70,7 @@ pub enum Message {
 	PrivateDbRekeyed(PrivateDb),
 	ResizeWindow(window::Direction),
 	Run,
+	RunSnippet,
 	RunResult(ExecutionResult),
 	SaveConnection,
 	SaveStatement,
