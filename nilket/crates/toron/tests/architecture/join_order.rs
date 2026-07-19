@@ -641,12 +641,13 @@ pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 	assert!(local_actuator.contains("&declared_indices"));
 	assert!(local_actuator.contains("let Some(selected) = self.preflight_star_order_strategy("));
 	assert!(local_actuator.contains("&selected_indices"));
-	// The uniform declared == selected invariant survives as the per-dimension fingerprint match.
-	// ADR 193 adds a selected-Mixed exception separately.
-	assert!(
-		local_actuator
-			.contains("declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint)")
-	);
+	// The uniform declared == selected invariant survives as the per-dimension fingerprint match —
+	// on the STRATEGY component only since ADR 468: placement is order-dependent information
+	// (ADR 467), so cross-order stability must not compare it. ADR 193's selected-Mixed
+	// exception stands separately.
+	assert!(local_actuator.contains("strategy_fingerprint(&d.fingerprint))"));
+	assert!(local_actuator.contains("== Some(strategy_fingerprint(&selected.fingerprint))"));
+	assert!(!local_actuator.contains("== Some(&selected.fingerprint)"));
 	assert!(local_actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
 	assert!(local_actuator.contains("selected_strategy,"));
 	assert!(preflight.contains("let mut preflight_trace = base_trace.clone();"));

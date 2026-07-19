@@ -192,7 +192,7 @@ impl Default for PlannerConfig {
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
-			hash_smaller_build_placement: false,
+			hash_smaller_build_placement: true,
 		}
 	}
 }

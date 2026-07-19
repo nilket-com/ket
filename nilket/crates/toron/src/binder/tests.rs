@@ -2874,11 +2874,15 @@ fn hash_join_probe_not_scan_linear_uses_carried_input_cause() {
 	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
-	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+	// ADR 468: the comparator swaps the materially smaller right build, and the
+	// carried input cause rides the receipt instead of being erased by it.
+	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
 	assert_eq!(
 		decision.reason,
-		JoinStrategyDecisionReason::HashByDefault {
-			reason: HashByDefaultReason::ProbeNotScanLinear(ProbeLinearityFence::Sort),
+		JoinStrategyDecisionReason::HashSmallerBuild {
+			build_bytes: ByteCount::new(1_024),
+			rejected_side_bytes: ByteCount::new(64 * 1024 * 1024),
+			fallback: HashByDefaultReason::ProbeNotScanLinear(ProbeLinearityFence::Sort),
 		}
 	);
 }
@@ -4969,6 +4973,9 @@ async fn sql_join_projected_derived_dim_broadcasts_where_full_column_hashes() {
 		full_trace.join_decisions[0].reason,
 		JoinStrategyDecisionReason::HashByDefault {
 			reason: HashByDefaultReason::BuildByteUpperBoundAboveThreshold
+		} | JoinStrategyDecisionReason::HashSmallerBuild {
+			fallback: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
+			..
 		}
 	));
 	match first_join_plan(&projected_plan) {
@@ -11125,10 +11132,14 @@ async fn hash_star_reorder_preserves_hash_strategy() {
 			.expect("bind hash star with trace");
 
 	assert_eq!(trace.join_decisions.len(), 3);
-	assert!(trace.join_decisions.iter().all(|receipt| {
-		receipt.strategy == JoinStrategy::HashPartitioned
-			&& receipt.placement == JoinPhysicalPlacement::Natural
-	}));
+	// ADR 467/468: hash uniformity is strategy uniformity; placement is the
+	// comparator's per-edge call and rides the receipt.
+	assert!(
+		trace
+			.join_decisions
+			.iter()
+			.all(|receipt| receipt.strategy == JoinStrategy::HashPartitioned)
+	);
 	assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 3);
 	let JoinOrderRenderState::StarReceipts(receipts) = &render_trace.join_order else {
 		panic!("expected star-order receipt");
@@ -25637,6 +25648,7 @@ async fn adr464_hash_fallback_builds_materially_smaller_right_side() {
 		JoinStrategyDecisionReason::HashSmallerBuild {
 			build_bytes: ByteCount::new(102_400),
 			rejected_side_bytes: ByteCount::new(1_048_576),
+			fallback: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
 		}
 	);
 }

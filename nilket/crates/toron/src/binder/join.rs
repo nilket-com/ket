@@ -44,6 +44,9 @@ pub(crate) enum JoinStrategyDecisionReason {
 	HashSmallerBuild {
 		build_bytes: ByteCount,
 		rejected_side_bytes: ByteCount,
+		/// ADR 468: the hash-fallback cause the comparator fired on top of —
+		/// swapping the build must not erase why the join hashed.
+		fallback: HashByDefaultReason,
 	},
 	/// ADR 239 (scalar-local Cross refinement): a CROSS whose inputs are both provably scalar
 	/// (`row_upper_bound <= 1`) binds as a local cartesian gathered to a single partition — never a
@@ -1061,6 +1064,7 @@ pub(super) fn hash_join_decision_with_placement(
 					reason: JoinStrategyDecisionReason::HashSmallerBuild {
 						build_bytes: right.bytes,
 						rejected_side_bytes: left.bytes,
+						fallback: reason,
 					},
 				};
 			}

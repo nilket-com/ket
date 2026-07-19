@@ -3596,7 +3596,6 @@ fn order_strategy_fingerprint(
 			// fingerprint carries, not a validity constraint — the 192 relaxation,
 			// applied to the hash tier.
 			(JoinStrategy::HashPartitioned, _) => true,
-			_ => false,
 		};
 		if !valid {
 			return None;
@@ -3624,7 +3623,6 @@ fn preserved_outer_order_strategy_fingerprint(
 			// fingerprint carries, not a validity constraint — the 192 relaxation,
 			// applied to the hash tier.
 			(JoinStrategy::HashPartitioned, _) => true,
-			_ => false,
 		};
 		if !valid {
 			return None;
@@ -4130,8 +4128,21 @@ impl<'a> Binder<'a> {
 		else {
 			return Ok(StarOrderActuationResult::NotCandidate);
 		};
-		let fingerprint_match =
-			declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint);
+		// ADR 467/468: placement is order-dependent information (the smaller side
+		// depends on the order), so cross-order stability compares the strategy
+		// component only. A placement-inclusive comparison here spuriously
+		// declined hash stars whose builds swap, cascading into sub-star
+		// actuation with lost dimensions (the ADR 468 diagnosis).
+		let strategy_fingerprint = |fingerprint: &StrategyFingerprint| {
+			fingerprint
+				.iter()
+				.map(|(label, (strategy, _))| (label.clone(), *strategy))
+				.collect::<BTreeMap<_, _>>()
+		};
+		let fingerprint_match = declared
+			.as_ref()
+			.map(|d| strategy_fingerprint(&d.fingerprint))
+			== Some(strategy_fingerprint(&selected.fingerprint));
 		if selected.summary != StarOrderStrategy::Mixed && !fingerprint_match {
 			return Ok(StarOrderActuationResult::NotCandidate);
 		}
@@ -4996,8 +5007,21 @@ impl<'a> Binder<'a> {
 		// declared order preflighted to all-hash. So a clean selected-order `Mixed` actuates, just like
 		// ADR 192's selected-order `Broadcast` upgrade. The fingerprint is no longer an authorization
 		// gate (it would block exactly this reorder); it is retained for receipt honesty.
-		let fingerprint_match =
-			declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint);
+		// ADR 467/468: placement is order-dependent information (the smaller side
+		// depends on the order), so cross-order stability compares the strategy
+		// component only. A placement-inclusive comparison here spuriously
+		// declined hash stars whose builds swap, cascading into sub-star
+		// actuation with lost dimensions (the ADR 468 diagnosis).
+		let strategy_fingerprint = |fingerprint: &StrategyFingerprint| {
+			fingerprint
+				.iter()
+				.map(|(label, (strategy, _))| (label.clone(), *strategy))
+				.collect::<BTreeMap<_, _>>()
+		};
+		let fingerprint_match = declared
+			.as_ref()
+			.map(|d| strategy_fingerprint(&d.fingerprint))
+			== Some(strategy_fingerprint(&selected.fingerprint));
 		// Typed authorization decides what is actuatable:
 		// - `AnyUniform` (flat-star root): uniform (order-invariant, fingerprint matches) OR a clean
 		//   selected `Mixed`.

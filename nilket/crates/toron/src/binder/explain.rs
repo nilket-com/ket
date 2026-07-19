@@ -2379,6 +2379,7 @@ pub(super) fn optimizer_explain_build_columns(
 		JoinStrategyDecisionReason::HashSmallerBuild {
 			build_bytes,
 			rejected_side_bytes,
+			..
 		} => Ok((
 			Some("right"),
 			Some(byte_count_to_i64(build_bytes, "build_bytes")?),
@@ -2436,10 +2437,12 @@ pub(super) fn join_strategy_decision_reason_detail(
 		JoinStrategyDecisionReason::HashByDefault { reason } => {
 			Some(hash_by_default_reason_label(*reason))
 		}
+		JoinStrategyDecisionReason::HashSmallerBuild { fallback, .. } => {
+			Some(hash_by_default_reason_label(*fallback))
+		}
 		JoinStrategyDecisionReason::PinnedByAuthor
 		| JoinStrategyDecisionReason::BroadcastInferred { .. }
 		| JoinStrategyDecisionReason::BroadcastEstimated { .. }
-		| JoinStrategyDecisionReason::HashSmallerBuild { .. }
 		| JoinStrategyDecisionReason::ScalarLocalCross
 		| JoinStrategyDecisionReason::ScalarBroadcastCross => None,
 	}
