@@ -1198,6 +1198,7 @@ fn guard_partition_replay_owner_resident(
 	Ok(())
 }
 
+#[derive(Clone)]
 pub(in crate::exec) struct ReorientedInnerJoinStage<'a> {
 	replay_id: JoinReplayId,
 	probe_schema: SchemaRef,
@@ -9244,7 +9245,7 @@ impl Executor {
 				.transpose()?;
 			let prepared_runtime = self
 				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline(
-					stage,
+					stage.clone(),
 					morsel,
 					presence_bytes,
 				)
@@ -9281,6 +9282,7 @@ impl Executor {
 			let drive_result = self
 				.try_streaming_reoriented_inner_chain_scan_probe_base_to_sink(
 					base,
+					&stage,
 					&mut runtime,
 					&mut sink,
 					morsel,
@@ -11123,10 +11125,11 @@ impl Executor {
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	async fn try_streaming_reoriented_inner_chain_scan_probe_base_to_sink(
+	async fn try_streaming_reoriented_inner_chain_scan_probe_base_to_sink<'p>(
 		&self,
 		base: &ExecutionPlan,
-		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		terminal_stage: &ReorientedInnerJoinStage<'p>,
+		runtime: &mut ReorientedInnerJoinRuntime<'p>,
 		sink: &mut ReorientedChainOutputSink<'_>,
 		morsel: Option<(MorselId, u32)>,
 		resident_baseline_bytes: u64,
@@ -11212,9 +11215,32 @@ impl Executor {
 		let Some(mut base_runtime) = prepared_base_runtime else {
 			return Ok(None);
 		};
+		// A spilled base cannot use the partitioned-scan machinery below, and a
+		// partitioned-scan terminal inside the streaming loop would re-scan its
+		// build for every probe batch. Re-prepare the terminal in materialized
+		// form (InMemory or Spilled — both probe without re-scanning) so the
+		// mixed pair streams through the same loop as the spilled terminal.
 		if matches!(base_runtime.build, ReorientedInnerJoinBuild::Spilled { .. })
-			&& matches!(runtime.build, ReorientedInnerJoinBuild::Spilled { .. })
-		{
+			&& matches!(
+				runtime.build,
+				ReorientedInnerJoinBuild::PartitionedScan { .. }
+			) {
+			let reprepared = self
+				.prepare_reoriented_inner_join_runtime_with_scan_build(
+					terminal_stage.clone(),
+					morsel,
+					false,
+					resident_baseline_bytes,
+				)
+				.await?;
+			let Some(materialized) = reprepared else {
+				base_runtime.cleanup().await;
+				return Ok(None);
+			};
+			let stale = std::mem::replace(runtime, materialized);
+			stale.cleanup().await;
+		}
+		if matches!(base_runtime.build, ReorientedInnerJoinBuild::Spilled { .. }) {
 			let base_post_filter = base_runtime.post_filter;
 			let terminal_post_filter = runtime.post_filter;
 			let result = async {
