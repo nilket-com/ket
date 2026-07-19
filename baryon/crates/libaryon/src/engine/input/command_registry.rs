@@ -389,6 +389,18 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_set),
 	},
 	CommandSpec {
+		name: "init0",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Settings,
+		usage: ":init0",
+		summary: "Replace init.rn with built-in defaults",
+		help: "Replaces init.rn with Baryon's generated built-in default configuration. This is an explicit hard reset and does not change the current session.",
+		dispatch: DispatchKind::Exact(cmd_init0),
+	},
+	CommandSpec {
 		name: "help",
 		aliases: &["h"],
 		bang: false,
@@ -774,6 +786,10 @@ fn cmd_set(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	}
 }
 
+fn cmd_init0(ctx: &mut CommandCtx<'_>, _: Invocation<'_>) {
+	ctx.send(EditorCommand::WriteDefaultInit);
+}
+
 fn cmd_help(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	if let Some(registries) = ctx.runtime_registries {
 		match super::help::resolve_topic_with_runtime(inv.args, registries) {
@@ -1069,6 +1085,14 @@ mod tests {
 				"{buffer} must dispatch WriteInit {{ force: {force} }}, got {commands:?}"
 			);
 		}
+	}
+
+	#[test]
+	fn init0_dispatches_the_explicit_default_configuration_reset() {
+		let (result, commands, status, _) = dispatch("init0", None);
+		assert_eq!(result, DispatchResult::Dispatched);
+		assert_eq!(status, None);
+		assert!(matches!(commands.as_slice(), [EditorCommand::WriteDefaultInit]));
 	}
 
 	#[test]

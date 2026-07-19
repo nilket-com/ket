@@ -25,7 +25,7 @@ use crate::core::{
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
-use crate::engine::settings::SaveDurability;
+use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
@@ -1346,6 +1346,33 @@ pub(crate) struct SettingsPersistent {
 }
 
 impl SettingsPersistent {
+	pub(crate) fn builtin_defaults() -> Self {
+		let EngineSettings {
+			theme_name,
+			minimap_enabled,
+			wrap_enabled,
+			line_numbers_enabled,
+			relative_line_numbers_enabled,
+			visible_whitespace,
+			reload_enabled,
+			save_durability,
+			ui_colors,
+			language_themes,
+		} = EngineSettings::default();
+		Self {
+			theme_name,
+			minimap_enabled,
+			wrap_enabled,
+			line_numbers_enabled,
+			relative_line_numbers_enabled,
+			visible_whitespace,
+			reload_enabled,
+			save_durability,
+			ui_colors,
+			language_themes,
+		}
+	}
+
 	fn resolved_theme(&self) -> (String, Theme) {
 		match Theme::try_new(&self.theme_name) {
 			Ok(theme) => (self.theme_name.clone(), theme),

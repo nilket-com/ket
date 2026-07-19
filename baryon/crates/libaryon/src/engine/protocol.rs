@@ -164,6 +164,8 @@ pub enum EditorCommand {
 	WriteInit {
 		force: bool,
 	},
+	/// Replace `init.rn` with Baryon's built-in default configuration.
+	WriteDefaultInit,
 	MoveCursor(MoveDirection),
 	MatchDelimiter,
 	ClickCursor(CursorPosition),

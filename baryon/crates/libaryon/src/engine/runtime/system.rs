@@ -58,6 +58,26 @@ pub(super) fn write_init_file(
 	Ok(path)
 }
 
+pub(super) fn write_default_init_file(
+	language_registry: &super::super::language::LanguageRegistry,
+) -> Result<std::path::PathBuf, String> {
+	let path = default_init_path().ok_or_else(|| "No config directory available".to_string())?;
+	write_default_init_file_at(&path, language_registry)?;
+	Ok(path)
+}
+
+fn write_default_init_file_at(
+	path: &std::path::Path,
+	language_registry: &super::super::language::LanguageRegistry,
+) -> Result<(), String> {
+	write_init_file_at(
+		path,
+		&SettingsPersistent::builtin_defaults(),
+		language_registry,
+		true,
+	)
+}
+
 fn write_init_file_at(
 	path: &std::path::Path,
 	settings: &SettingsPersistent,
@@ -1761,6 +1781,11 @@ mod tests {
 		super::write_init_file_at(path, settings, &language_registry, force)
 	}
 
+	fn write_test_default_init_file_at(path: &std::path::Path) -> Result<(), String> {
+		let language_registry = crate::engine::host::build_language_registry();
+		super::write_default_init_file_at(path, &language_registry)
+	}
+
 	#[test]
 	fn engine_input_owns_modal_state_and_rejects_stale_click_intents() {
 		use crate::core::ViewportId;
@@ -1887,6 +1912,24 @@ mod tests {
 				.skip(3)
 				.all(|line| { line.is_empty() || line.starts_with('\t') || line == "}" })
 		);
+	}
+
+	#[test]
+	fn init0_replaces_user_configuration_with_builtin_defaults() {
+		let path = temp_test_path("init0");
+		std::fs::write(
+			&path,
+			"pub fn main(editor) { let config = editor.config(); config.set(\"theme\", \"gruvbox\")?; Ok(()) }\n",
+		)
+		.expect("write custom init");
+
+		write_test_default_init_file_at(&path).expect("init0 replaces custom init");
+		let reset = std::fs::read_to_string(&path).expect("read default init");
+		assert!(reset.starts_with(super::GENERATED_INIT_MARKER));
+		assert!(reset.contains("config.set(\"theme\", \"onedark\")?;"));
+		assert!(!reset.contains("gruvbox"));
+		assert!(rune::parse::parse_all::<rune::ast::File>(&reset, rune::SourceId::EMPTY, false).is_ok());
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
