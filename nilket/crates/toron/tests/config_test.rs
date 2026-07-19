@@ -1348,3 +1348,49 @@ fn write_descriptor_bootstrap_json(tag: &str, value: serde_json::Value) -> PathB
 		.expect("write descriptor bootstrap");
 	path
 }
+
+#[test]
+fn adr463_worker_query_budget_knobs_parse_override_and_reject_zero() {
+	let dir = fresh_dir("adr463-query-budget");
+	let path = dir.join("toron.toml");
+
+	// Absent knobs: the example config leaves them commented out; the budget is
+	// the explicit test constant.
+	std::fs::write(&path, render_example_config()).expect("write example config");
+	let config = load_toron_bootstrap_config(&path).expect("load example config");
+	assert_eq!(config.worker.query_memory_per_task_bytes, None);
+	assert_eq!(config.worker.query_spill_bytes_reserved_bytes, None);
+	assert_eq!(
+		config.worker.query_budget(),
+		toron::distributed::budget::QueryBudget::test_default()
+	);
+
+	// Present knobs override exactly their coordinates.
+	let with_knobs = render_example_config()
+		.replace(
+			"# query_memory_per_task_bytes = 268435456",
+			"query_memory_per_task_bytes = 268435456",
+		)
+		.replace(
+			"# query_spill_bytes_reserved_bytes = 2147483648",
+			"query_spill_bytes_reserved_bytes = 2147483648",
+		);
+	std::fs::write(&path, with_knobs).expect("write knob config");
+	let config = load_toron_bootstrap_config(&path).expect("load knob config");
+	let budget = config.worker.query_budget();
+	assert_eq!(budget.memory_per_task.get(), 268435456);
+	assert_eq!(budget.spill_bytes_reserved_per_query.get(), 2147483648);
+	let mut expected = toron::distributed::budget::QueryBudget::test_default();
+	expected.memory_per_task = toron::distributed::budget::ByteCount::new(268435456);
+	expected.spill_bytes_reserved_per_query =
+		toron::distributed::budget::ByteCount::new(2147483648);
+	assert_eq!(budget, expected, "only the two knob coordinates may change");
+
+	// Zero is a loud config error, matching the gauge knob contract.
+	let zeroed = render_example_config().replace(
+		"# query_memory_per_task_bytes = 268435456",
+		"query_memory_per_task_bytes = 0",
+	);
+	std::fs::write(&path, zeroed).expect("write zero config");
+	assert!(load_toron_bootstrap_config(&path).is_err());
+}

@@ -504,6 +504,8 @@ fn tls_config(
 		worker: ToronWorkerConfig {
 			task_listener_bind: worker_bind,
 			advertised_endpoint: None,
+			query_memory_per_task_bytes: None,
+			query_spill_bytes_reserved_bytes: None,
 			memory_budget_bytes: 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),

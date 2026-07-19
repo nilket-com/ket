@@ -1139,6 +1139,8 @@ fn toron_config_with_descriptor_for_tenant(
 		worker: ToronWorkerConfig {
 			task_listener_bind: "127.0.0.1:0".parse().expect("task bind"),
 			advertised_endpoint: None,
+			query_memory_per_task_bytes: None,
+			query_spill_bytes_reserved_bytes: None,
 			memory_budget_bytes: 64 * 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(64 * 1024 * 1024)),

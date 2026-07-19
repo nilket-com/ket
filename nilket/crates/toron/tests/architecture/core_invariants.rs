@@ -497,3 +497,14 @@ pub(crate) fn adr462_query_budget_has_no_silent_default() {
 		"QueryBudget::default()",
 	]);
 }
+
+#[test]
+pub(crate) fn adr463_daemon_coordinator_budget_is_config_owned() {
+	// The coordinator budget must flow through the config-owned constructor;
+	// a bare constant at the daemon site would silently orphan the knobs.
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("daemon");
+	assert!(
+		daemon.contains("config.worker.query_budget()"),
+		"daemon coordinator budget must come from ToronWorkerConfig::query_budget()"
+	);
+}

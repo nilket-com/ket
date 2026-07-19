@@ -1396,6 +1396,8 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 		worker: ToronWorkerConfig {
 			task_listener_bind: "127.0.0.1:0".parse().expect("worker bind"),
 			advertised_endpoint: None,
+			query_memory_per_task_bytes: None,
+			query_spill_bytes_reserved_bytes: None,
 			memory_budget_bytes: 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),

@@ -16,7 +16,7 @@ use crate::audit::{
 };
 use crate::catalog::DescriptorOptimizerFacts;
 use crate::distributed::budget::{
-	AdmissionPolicy, ByteCount, DurationMillis, TenantBudget, TenantBudgetPolicy,
+	AdmissionPolicy, ByteCount, DurationMillis, QueryBudget, TenantBudget, TenantBudgetPolicy,
 	derive_max_concurrent_descriptor_syncs, derive_max_concurrent_queries,
 };
 use crate::distributed::identity::WorkerId;
@@ -65,6 +65,11 @@ drain_timeout_seconds = 30
 task_listener_bind = "127.0.0.1:0"
 memory_budget_bytes = 67108864
 # advertised_endpoint = "127.0.0.1:0"
+# Per-query budget coordinates (ADR 463); absent means the engine's explicit
+# 64 MiB test constant. See plans/adr/455 for what memory_per_task means for
+# reservoir behavior.
+# query_memory_per_task_bytes = 268435456
+# query_spill_bytes_reserved_bytes = 2147483648
 
 # [tenant_budgets.default]
 # memory_per_task_bytes = 67108864
@@ -213,6 +218,25 @@ pub struct ToronWorkerConfig {
 	pub task_listener_bind: SocketAddr,
 	pub advertised_endpoint: Option<WorkerEndpoint>,
 	pub memory_budget_bytes: u64,
+	pub query_memory_per_task_bytes: Option<u64>,
+	pub query_spill_bytes_reserved_bytes: Option<u64>,
+}
+
+impl ToronWorkerConfig {
+	/// The coordinator's per-query budget: the explicit test constant with any
+	/// operator-configured coordinate overriding it. The two knobs are the
+	/// coordinates the ADR 454-461 measurements defined; a derivation formula is
+	/// deliberately absent until evidence prices one.
+	pub fn query_budget(&self) -> QueryBudget {
+		let mut budget = QueryBudget::test_default();
+		if let Some(bytes) = self.query_memory_per_task_bytes {
+			budget.memory_per_task = ByteCount::new(bytes);
+		}
+		if let Some(bytes) = self.query_spill_bytes_reserved_bytes {
+			budget.spill_bytes_reserved_per_query = ByteCount::new(bytes);
+		}
+		budget
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +439,8 @@ struct RawToronWorkerConfig {
 	advertised_endpoint: Option<String>,
 	#[serde(default = "default_memory_budget_bytes")]
 	memory_budget_bytes: u64,
+	query_memory_per_task_bytes: Option<u64>,
+	query_spill_bytes_reserved_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,6 +649,8 @@ impl Default for RawToronWorkerConfig {
 			task_listener_bind: default_task_listener_bind(),
 			advertised_endpoint: None,
 			memory_budget_bytes: default_memory_budget_bytes(),
+			query_memory_per_task_bytes: None,
+			query_spill_bytes_reserved_bytes: None,
 		}
 	}
 }
@@ -801,6 +829,14 @@ fn normalize_config(
 			task_listener_bind,
 			advertised_endpoint: raw.worker.advertised_endpoint.map(WorkerEndpoint::new),
 			memory_budget_bytes: raw.worker.memory_budget_bytes,
+			query_memory_per_task_bytes: validate_optional_budget_bytes(
+				raw.worker.query_memory_per_task_bytes,
+				"worker.query_memory_per_task_bytes",
+			)?,
+			query_spill_bytes_reserved_bytes: validate_optional_budget_bytes(
+				raw.worker.query_spill_bytes_reserved_bytes,
+				"worker.query_spill_bytes_reserved_bytes",
+			)?,
 		},
 		tenant_budgets,
 		admission,
@@ -1369,6 +1405,18 @@ fn normalize_tls_config(raw: RawTlsConfig, base_dir: &Path) -> Result<TlsConfig,
 		peer_ca,
 		cluster_domain: raw.cluster_domain,
 	})
+}
+
+fn validate_optional_budget_bytes(
+	value: Option<u64>,
+	field: &str,
+) -> Result<Option<u64>, ToronConfigError> {
+	match value {
+		Some(0) => Err(ToronConfigError::Invalid {
+			message: format!("{field} must be greater than zero"),
+		}),
+		other => Ok(other),
+	}
 }
 
 fn resolve_config_path(path: PathBuf, base_dir: &Path) -> PathBuf {

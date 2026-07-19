@@ -284,6 +284,12 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/catalog.rs",
 				"crates/toron/src/distributed/budget.rs",
 				"crates/toron/tests/config_test.rs",
+				// ADR 463: the worker config owns the coordinator query budget;
+				// listener fixtures construct the widened worker config.
+				"crates/toron/src/config.rs",
+				"crates/toron/tests/daemon_test.rs",
+				"crates/toron/tests/sql_listener_test.rs",
+				"crates/toron/tests/tls_listener_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")
