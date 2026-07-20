@@ -206,11 +206,14 @@ pub enum EditorCommand {
 	},
 	/// Open a host-rendered panel in a split beside the focused pane. The
 	/// engine owns its identity, geometry, focus, and tab membership; the
-	/// frontend draws its contents and owns its backing state.
+	/// frontend draws its contents and owns its backing state. `focus` makes
+	/// focus transfer explicit: query results can appear without interrupting
+	/// typing in their source pane.
 	OpenHostPanel {
 		panel_id: crate::engine::HostPanelId,
 		kind: String,
 		title: String,
+		focus: bool,
 	},
 	/// Rebind a live panel to a new revision of its source, so the frontend can
 	/// mark or replace stale output.

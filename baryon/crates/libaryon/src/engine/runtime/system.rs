@@ -5064,7 +5064,7 @@ mod tests {
 
 	#[test]
 	fn host_panels_project_identity_dividers_and_refcounted_disposal() {
-		use crate::engine::{HostEvent, HostPanelId, PanelRevision};
+		use crate::engine::{HostPanelId, PanelRevision};
 
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
 		let panel_id = HostPanelId::new(42);
@@ -5076,6 +5076,7 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Trip distribution".to_string(),
+				focus: true,
 			},
 		);
 		let panel = opened
@@ -5163,6 +5164,7 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Results".to_string(),
+				focus: false,
 			})
 			.expect("open panel");
 		std::thread::sleep(Duration::from_millis(300));
@@ -5237,6 +5239,7 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Results".to_string(),
+				focus: true,
 			})
 			.expect("open panel");
 		commands
@@ -5292,6 +5295,7 @@ mod tests {
 				panel_id,
 				kind: "dashboard".to_string(),
 				title: "Dashboard".to_string(),
+				focus: true,
 			})
 			.expect("open panel");
 		commands

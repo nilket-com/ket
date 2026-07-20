@@ -172,13 +172,11 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 	let mut pane_content = HashMap::new();
 	pane_content.insert(editor_pane, PaneType::CodeEditor);
 
-	let (_, data_pane) = panes.split(Axis::Horizontal, editor_pane).unwrap();
-	pane_content.insert(data_pane, PaneType::DataTable);
-
 	let (_, dashboard_pane) = panes.split(Axis::Vertical, editor_pane).unwrap();
 	pane_content.insert(dashboard_pane, PaneType::Dashboard);
 
-	let code_editor = CodeEditor::new("");
+	let mut code_editor = CodeEditor::new("");
+	code_editor.set_show_column_types(startup_data.show_column_types);
 	let is_password_protected = startup_data.is_password_protected;
 	let salt = startup_data.salt.clone();
 	let mut state = AppState {
@@ -236,7 +234,6 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		&app_state.dashboard,
 		&app_state.menu_state,
 		&app_state.code_editor,
-		&app_state.data_frame,
 		&app_state.status_msg,
 		&app_state.status_error,
 		app_state.status_df_size,
@@ -801,6 +798,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::ToggleShowColumnTypes(val) => {
 			app_state.show_column_types = val;
+			app_state.code_editor.set_show_column_types(val);
 			return Task::perform(
 				async move { persistence::save_show_column_types(val).await },
 				|()| Message::ShowColumnTypesSaved,

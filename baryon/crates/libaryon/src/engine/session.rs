@@ -3333,6 +3333,10 @@ impl EditorSession {
 				document,
 				view: &mut preview_view.state,
 			}),
+			// Host panels have no engine-owned mutable document state. Callers
+			// probing synthetic-buffer capabilities must treat them as inert,
+			// rather than assuming every non-text buffer is browser/preview data.
+			(BufferContent::HostPanel(_), ViewContent::HostPanel(_)) => return None,
 			_ => panic!("view content must match its buffer content"),
 		};
 		Some(mutate(target))
@@ -3991,6 +3995,7 @@ mod tests {
 	use crate::engine::event_subscribers::BaselineBuilder;
 	use crate::engine::file_browser::create_file_browser_buffer;
 	use crate::engine::folding::FoldSet;
+	use crate::engine::{HostPanelDescriptor, HostPanelId};
 	use crate::engine::jobs::{JobSpawnError, JobSpec};
 	use crate::engine::runtime_registry::{ActionLease, RegistrationBatch};
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
@@ -4084,6 +4089,34 @@ mod tests {
 			0,
 			"synthetic views retain independent viewport state"
 		);
+	}
+
+	#[test]
+	fn synthetic_mutation_ignores_host_panels() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view = session.create_host_panel_view(
+			HostPanelId::new(1),
+			HostPanelDescriptor {
+				kind: "result-table".to_string(),
+				title: "Results".to_string(),
+			},
+			DEFAULT_VIEWPORT_WIDTH,
+			DEFAULT_VIEWPORT_LINES,
+		);
+		let view_id = view.id;
+		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			pane_id: session.focused_pane_id,
+			pane: EditorPane::from_view(view),
+		});
+
+		let result = with_file_browser_buffer_mut(
+			&mut session.buffers,
+			&mut session.layout,
+			view_id,
+			|_| unreachable!("host panels must not expose browser mutation"),
+		);
+		assert!(result.is_none(), "host panels are inert at synthetic mutation boundaries");
 	}
 
 	#[test]

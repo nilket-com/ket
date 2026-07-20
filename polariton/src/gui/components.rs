@@ -9,7 +9,6 @@ use crate::gui::pane_grid::{PaneGrid, PaneId, State as PaneState};
 use crate::gui::{
 	colors,
 	menu::{MenuBar, MenuFontPolicy, MenuItem, MenuRoot, MenuState},
-	table::Table,
 };
 use crate::persistence::{SavedConnection, SavedStatement};
 use crate::gui::statusbar::{Segment, StatusBar, Tone};
@@ -23,7 +22,6 @@ use iced::{
 	window::Direction,
 	Alignment, Background, Center, Color, Element, Fill, FillPortion, Font, Length,
 };
-use polars::frame::DataFrame;
 use std::collections::HashMap;
 
 pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
@@ -31,7 +29,6 @@ pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneType {
 	CodeEditor,
-	DataTable,
 	Dashboard,
 }
 
@@ -167,7 +164,6 @@ pub fn main_screen<'a>(
 	dashboard: &'a DashboardState,
 	menu_state: &'a MenuState,
 	code_editor: &'a CodeEditor,
-	data_frame: &'a DataFrame,
 	status_msg: &'a str,
 	status_error: &'a str,
 	status_df_size: Option<(usize, usize)>,
@@ -205,10 +201,6 @@ pub fn main_screen<'a>(
 							},
 							..Default::default()
 						}),
-				)
-				.into(),
-				PaneType::DataTable => center(
-					Table::new(data_frame, 0).show_column_types(show_column_types),
 				)
 				.into(),
 				PaneType::Dashboard => dashboard::view(dashboard).map(Message::Dashboard),

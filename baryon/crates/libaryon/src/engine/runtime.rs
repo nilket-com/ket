@@ -1802,11 +1802,12 @@ fn dispatch_command(
 			panel_id,
 			kind,
 			title,
+			focus,
 		} => {
-			// Reopening an existing identity focuses it rather than creating a
-			// second panel for the same host object.
+			// Reopening an existing identity never duplicates its host object.
 			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id) {
-				if let Some(pane_id) = session
+				if focus
+					&& let Some(pane_id) = session
 					.layout
 					.view_id_for_buffer(buffer_id)
 					.and_then(|view_id| session.layout.pane_id_for_view(view_id))
@@ -1836,6 +1837,8 @@ fn dispatch_command(
 					release_buffer(runtime, session, buffer_id);
 					session.ui.status_message =
 						Some("No room to open a host panel".to_string());
+				} else if !focus {
+					session.focus_pane(focused_pane_id);
 				}
 			}
 			needs_render = true;

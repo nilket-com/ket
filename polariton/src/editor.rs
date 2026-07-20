@@ -81,6 +81,9 @@ pub struct CodeEditor {
 	/// editor traffic must stay local while the application closes its window.
 	quit_requested: bool,
 	quit_notified: bool,
+	/// Table presentation remains Polariton-owned even when the table lives in
+	/// a Baryon-managed HostPanel.
+	show_column_types: bool,
 	/// Ordered engine events; drained every poll, never coalesced.
 	host_events: Option<Receiver<HostEvent>>,
 	panels: PanelRegistry,
@@ -123,6 +126,7 @@ impl CodeEditor {
 			status_message: None,
 			quit_requested: false,
 			quit_notified: false,
+			show_column_types: false,
 			host_events,
 			panels: PanelRegistry::default(),
 			result_revision: 0,
@@ -194,6 +198,7 @@ impl CodeEditor {
 				panel_id: RESULT_PANEL,
 				kind: "result-table".to_owned(),
 				title: "Results".to_owned(),
+				focus: false,
 			});
 		}
 		self.panels.set_content(RESULT_PANEL, PanelContent::Running);
@@ -210,6 +215,10 @@ impl CodeEditor {
 	pub fn set_query_error(&mut self, message: String) {
 		self.panels
 			.set_content(RESULT_PANEL, PanelContent::Failed(message));
+	}
+
+	pub fn set_show_column_types(&mut self, show_column_types: bool) {
+		self.show_column_types = show_column_types;
 	}
 
 	/// Latest engine status line, if one arrived since the last input.
@@ -402,7 +411,9 @@ impl CodeEditor {
 		for pane in &viewport.panes {
 			let focused = pane.pane_id == viewport.focused_pane_id;
 			let content = match pane.host_panel.as_ref() {
-				Some(panel) => self.panels.surface(panel, focused, palette),
+				Some(panel) => self
+					.panels
+					.surface(panel, focused, palette, self.show_column_types),
 				None => text_pane_surface(pane, palette),
 			};
 			layers.push(positioned(
@@ -953,6 +964,7 @@ impl PanelRegistry {
 		panel: &'a libaryon::uast::projection::HostPanelViewport,
 		focused: bool,
 		palette: UiPalette,
+		show_column_types: bool,
 	) -> Element<'a, EditorMsg> {
 		let content = self
 			.panels
@@ -962,6 +974,7 @@ impl PanelRegistry {
 
 		let inner: Element<'a, EditorMsg> = match content {
 			PanelContent::Table(frame) => Table::new(frame, 0)
+				.show_column_types(show_column_types)
 				.scroll_request(
 					self.panels
 						.get(&panel.panel_id)
@@ -1456,6 +1469,7 @@ mod tests {
 			panel_id: HostPanelId::new(1),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
+			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
 
@@ -1491,6 +1505,7 @@ mod tests {
 			panel_id,
 			kind: "dashboard".to_string(),
 			title: "Dashboard".to_string(),
+			focus: true,
 		});
 		wait_for_host_panel(&mut editor);
 		assert!(editor.panels.panels.contains_key(&panel_id));
@@ -1571,6 +1586,26 @@ mod tests {
 	}
 
 	#[test]
+	fn opening_query_results_keeps_workspace_focus_in_the_source_pane() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let source_pane = editor
+			.viewport
+			.as_ref()
+			.expect("initial viewport")
+			.focused_pane_id;
+
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+
+		assert_eq!(
+			editor.viewport.as_ref().expect("result viewport").focused_pane_id,
+			source_pane,
+			"running a query must not make the source editor stop accepting text"
+		);
+	}
+
+	#[test]
 	fn divider_drag_uses_engine_published_hit_rects() {
 		use libaryon::engine::HostPanelId;
 
@@ -1580,6 +1615,7 @@ mod tests {
 			panel_id: HostPanelId::new(3),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
+			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
 
