@@ -104,6 +104,11 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 }
 
 fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Task<Message> {
+	if matches!(&message, DashboardMsg::AddPlot(_)) {
+		// Plot creation is the user-facing entry point for the nested dashboard.
+		// Its pixels remain Polariton's, while Baryon owns the workspace pane.
+		app_state.code_editor.open_dashboard();
+	}
 	match app_state.dashboard.update(message) {
 		DashboardEffect::None => Task::none(),
 		DashboardEffect::BuildNewPlot { composition } => {
@@ -168,12 +173,9 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		.map(|(width, height)| Size::new(width, height))
 		.unwrap_or(Size::new(1920.0, 1080.0));
 	let data_frame = DataFrame::default();
-	let (mut panes, editor_pane) = PaneState::with_initial_pane();
+	let (panes, editor_pane) = PaneState::with_initial_pane();
 	let mut pane_content = HashMap::new();
 	pane_content.insert(editor_pane, PaneType::CodeEditor);
-
-	let (_, dashboard_pane) = panes.split(Axis::Vertical, editor_pane).unwrap();
-	pane_content.insert(dashboard_pane, PaneType::Dashboard);
 
 	let mut code_editor = CodeEditor::new("");
 	code_editor.set_show_column_types(startup_data.show_column_types);
@@ -308,6 +310,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::DragWindow => {
 			return window::latest().and_then(window::drag);
+		}
+		Message::CodeEditEvent(crate::editor::EditorMsg::Dashboard(message)) => {
+			return run_dashboard_message(app_state, message);
 		}
 		Message::CodeEditEvent(edit_event) => {
 			return app_state
@@ -447,12 +452,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.dashboard.panes.is_some() {
 				let size = window_size.unwrap_or(Size::new(1920.0, 1080.0));
 				let main_grid_bounds = main_grid_bounds(size);
-				let dashboard_pane_bounds = get_pane_rects(&app_state.panes, main_grid_bounds)
-					.into_iter()
-					.find(|(pane, _)| {
-						app_state.pane_content.get(pane) == Some(&PaneType::Dashboard)
+				let dashboard_pane_bounds = app_state
+					.code_editor
+					.dashboard_bounds()
+					.map(|rect| iced::Rectangle {
+						x: 0.0,
+						y: 0.0,
+						width: rect.width,
+						height: rect.height,
 					})
-					.map(|(_, rect)| rect)
 					.unwrap_or(main_grid_bounds);
 				let dashboard = app_state.dashboard.panes.as_ref().unwrap();
 				let mut export_jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();

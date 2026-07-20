@@ -3,7 +3,7 @@ use crate::adapters::{
 	driver::{fields_for, AdapterSelection, AdapterState},
 };
 use crate::editor::CodeEditor;
-use crate::gui::dashboard::{self, DashboardState};
+use crate::gui::dashboard::DashboardState;
 use crate::gui::messages::Message;
 use crate::gui::pane_grid::{PaneGrid, PaneId, State as PaneState};
 use crate::gui::{
@@ -29,7 +29,6 @@ pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneType {
 	CodeEditor,
-	Dashboard,
 }
 
 pub fn theme() -> Theme {
@@ -191,7 +190,7 @@ pub fn main_screen<'a>(
 			let pane_type = pane_content.get(&id)?;
 			let element: Element<'a, Message> = match pane_type {
 				PaneType::CodeEditor => center(
-					container(code_editor.view().map(Message::CodeEditEvent))
+					container(code_editor.view(dashboard).map(Message::CodeEditEvent))
 						.padding(1)
 						.style(|_| container::Style {
 							border: border::Border {
@@ -203,7 +202,6 @@ pub fn main_screen<'a>(
 						}),
 				)
 				.into(),
-				PaneType::Dashboard => dashboard::view(dashboard).map(Message::Dashboard),
 			};
 			Some((id, element))
 		})

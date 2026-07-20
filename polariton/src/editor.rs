@@ -5,7 +5,10 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
-use crate::gui::table::{Table, TableScroll};
+use crate::gui::{
+	dashboard::{self, DashboardMsg, DashboardState},
+	table::{Table, TableScroll},
+};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
@@ -26,6 +29,7 @@ use std::sync::mpsc::Receiver;
 /// The single query-results surface. One stable identity reused for every run,
 /// so results replace in place instead of opening a pane per query.
 const RESULT_PANEL: HostPanelId = HostPanelId::new(1);
+const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
 
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
@@ -48,8 +52,9 @@ mod metrics {
 	pub const VERTICAL_PADDING: f32 = 8.0;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum EditorMsg {
+	Dashboard(DashboardMsg),
 	Input(InputEvent),
 	Paste(String),
 	Scroll(i32),
@@ -204,6 +209,31 @@ impl CodeEditor {
 		self.panels.set_content(RESULT_PANEL, PanelContent::Running);
 	}
 
+	/// Open (or focus) Polariton's nested dashboard inside the Baryon workspace.
+	pub fn open_dashboard(&mut self) {
+		self.send(EditorCommand::OpenHostPanel {
+			panel_id: DASHBOARD_PANEL,
+			kind: "dashboard".to_owned(),
+			title: "Dashboard".to_owned(),
+			focus: true,
+		});
+	}
+
+	/// Pixel bounds relative to the Baryon workspace, for dashboard export.
+	pub fn dashboard_bounds(&self) -> Option<iced::Rectangle> {
+		let pane = self.viewport.as_ref()?.panes.iter().find(|pane| {
+			pane.host_panel
+				.as_ref()
+				.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
+		})?;
+		Some(iced::Rectangle {
+			x: pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
+			y: pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
+			width: pane.rect.width.get() as f32 * metrics::CELL_WIDTH,
+			height: pane.rect.height.get() as f32 * metrics::LINE_HEIGHT,
+		})
+	}
+
 	/// Attach a completed result set to the panel.
 	pub fn set_query_result(&mut self, frame: DataFrame) {
 		self.panels
@@ -323,6 +353,7 @@ impl CodeEditor {
 			return Task::none();
 		}
 		match message {
+			EditorMsg::Dashboard(_) => {}
 			EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char('v'),
 				modifiers,
@@ -381,7 +412,7 @@ impl CodeEditor {
 		Task::none()
 	}
 
-	pub fn view(&self) -> Element<'_, EditorMsg> {
+	pub fn view<'a>(&'a self, dashboard: &'a DashboardState) -> Element<'a, EditorMsg> {
 		let Some(viewport) = self.viewport.as_ref() else {
 			return container(
 				text("Starting editor…")
@@ -413,7 +444,7 @@ impl CodeEditor {
 			let content = match pane.host_panel.as_ref() {
 				Some(panel) => self
 					.panels
-					.surface(panel, focused, palette, self.show_column_types),
+					.surface(panel, focused, palette, self.show_column_types, dashboard),
 				None => text_pane_surface(pane, palette),
 			};
 			layers.push(positioned(
@@ -535,18 +566,33 @@ impl CodeEditor {
 		let Some(pointer) = self.last_pointer else {
 			return;
 		};
-		let Some(pane) = self.viewport.as_ref().and_then(Viewport::focused_pane) else {
+		let Some(viewport) = self.viewport.as_ref() else {
 			return;
 		};
-		let row = ((pointer.y - metrics::VERTICAL_PADDING).max(0.0) / metrics::LINE_HEIGHT).floor()
+		let (column, row) = Self::cell_at(pointer);
+		let Some(pane) = viewport.panes.iter().find(|pane| {
+			column >= pane.rect.screen_col.get()
+				&& column < pane.rect.right().get()
+				&& row >= pane.rect.screen_row.get()
+				&& row < pane.rect.bottom().get()
+		}) else {
+			return;
+		};
+		self.send(EditorCommand::FocusPane(pane.pane_id));
+		if pane.host_panel.is_some() {
+			return;
+		}
+		let local_y = pointer.y - pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+		let local_x = pointer.x - pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH;
+		let row = ((local_y - metrics::VERTICAL_PADDING).max(0.0) / metrics::LINE_HEIGHT).floor()
 			as usize;
 		// `visible_rows` is `render_rows` minus the wrapped rows scrolled off
 		// above the viewport, matching what `view` actually laid out.
 		let Some(visible_row) = pane.visible_rows.get(row) else {
 			return;
 		};
-		let column =
-			((pointer.x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
+		let column = ((local_x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor()
+			as u32;
 		let target = CursorPosition::new(
 			visible_row.line,
 			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
@@ -965,6 +1011,7 @@ impl PanelRegistry {
 		focused: bool,
 		palette: UiPalette,
 		show_column_types: bool,
+		dashboard: &'a DashboardState,
 	) -> Element<'a, EditorMsg> {
 		let content = self
 			.panels
@@ -972,7 +1019,10 @@ impl PanelRegistry {
 			.map(|entry| &entry.content)
 			.unwrap_or(&PanelContent::Unresolved);
 
-		let inner: Element<'a, EditorMsg> = match content {
+		let inner: Element<'a, EditorMsg> = if panel.panel_id == DASHBOARD_PANEL {
+			dashboard::view(dashboard).map(EditorMsg::Dashboard)
+		} else {
+			match content {
 			PanelContent::Table(frame) => Table::new(frame, 0)
 				.show_column_types(show_column_types)
 				.scroll_request(
@@ -998,6 +1048,7 @@ impl PanelRegistry {
 				),
 				color(palette.preview_text),
 			),
+			}
 		};
 		let surface = color(palette.preview_surface);
 		let border = if focused {
@@ -1391,7 +1442,10 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 
 #[cfg(test)]
 mod tests {
-	use super::{CodeEditor, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers, metrics};
+	use super::{
+		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
+		metrics,
+	};
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -1602,6 +1656,80 @@ mod tests {
 			editor.viewport.as_ref().expect("result viewport").focused_pane_id,
 			source_pane,
 			"running a query must not make the source editor stop accepting text"
+		);
+	}
+
+	#[test]
+	fn clicking_a_host_panel_moves_workspace_focus_to_its_pane() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		let panel = editor
+			.viewport
+			.as_ref()
+			.expect("result viewport")
+			.panes
+			.iter()
+			.find(|pane| pane.host_panel.is_some())
+			.expect("result pane");
+		let panel_id = panel.pane_id;
+		let point = iced::Point::new(
+			(panel.rect.screen_col.get() + 1) as f32 * metrics::CELL_WIDTH,
+			(panel.rect.screen_row.get() + 1) as f32 * metrics::LINE_HEIGHT,
+		);
+		let _ = editor.update(EditorMsg::PointerMoved(point));
+		let _ = editor.update(EditorMsg::Click);
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| viewport.focused_pane_id != panel_id)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(
+			editor.viewport.as_ref().expect("focused viewport").focused_pane_id,
+			panel_id,
+			"a host-panel click must update Baryon's workspace focus"
+		);
+	}
+
+	#[test]
+	fn opening_dashboard_creates_and_focuses_its_host_panel() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.open_dashboard();
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			!viewport.panes.iter().any(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
+			})
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("dashboard viewport");
+		assert_eq!(
+			viewport.focused_pane_id,
+			viewport
+				.panes
+				.iter()
+				.find(|pane| {
+					pane.host_panel
+						.as_ref()
+						.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
+				})
+				.expect("dashboard pane")
+				.pane_id,
+			"opening the dashboard intentionally transfers workspace focus"
 		);
 	}
 
