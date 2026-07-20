@@ -4711,7 +4711,7 @@ mod adr469_tests {
 	fn adr469_hash_smaller_build_knob_contract() {
 		// SAFETY: gate suites run single-threaded; no concurrent env readers.
 		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
-		assert_eq!(gauge_hash_smaller_build().unwrap(), (true, "default"));
+		assert_eq!(gauge_hash_smaller_build().unwrap(), (false, "default"));
 		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "0") };
 		assert_eq!(gauge_hash_smaller_build().unwrap(), (false, "explicit"));
 		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "1") };

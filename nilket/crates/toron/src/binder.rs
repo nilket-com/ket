@@ -171,11 +171,10 @@ pub struct PlannerConfig {
 	pub measured_accrual_counter: Arc<AtomicU64>,
 	pub join_order_soft_margin_step: SoftMarginLadderStep,
 	pub join_order_soft_margin_application: JoinOrderSoftMarginApplication,
-	/// ADR 466/467: smaller-build placement for auto inner hash joins. The
-	/// join-order fingerprint carries hash placement per dimension (467), but the
-	/// default stays off: star/snowflake extraction does not yet see through the
-	/// swap-restore Project, so actuation shapes degrade (dimension loss) when
-	/// hash edges swap. The extractor cut owns flipping this default.
+	/// ADR 466-470: smaller-build placement for auto inner hash joins. Fully
+	/// plumbed and contract-coherent, but default-off on ADR 469's six-cell price
+	/// evidence (material regressions to -195% vs wins to +22.5%); ADR 470's
+	/// regression diagnosis and placement costing own re-activation.
 	pub hash_smaller_build_placement: bool,
 }
 
@@ -192,7 +191,7 @@ impl Default for PlannerConfig {
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
-			hash_smaller_build_placement: true,
+			hash_smaller_build_placement: false,
 		}
 	}
 }

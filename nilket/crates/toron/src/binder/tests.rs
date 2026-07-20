@@ -2847,7 +2847,8 @@ fn both_sides_eligible_near_tie_keeps_left_build() {
 
 #[test]
 fn hash_join_probe_not_scan_linear_uses_carried_input_cause() {
-	let config = auto_broadcast_config(4_096);
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
 	let decision = choose_join_strategy(
 		JoinReplayId::SYNTHETIC,
 		JoinStrategyIntent::Auto,
