@@ -39,6 +39,7 @@ marks calls still owned by Joel.
 | 8 | Dashboard nested as one HostPanel initially | **Ratified by Joel 2026-07-20** | Preserves dashboard-as-object (coordinated plots, export); flattening trades real semantics for uniformity |
 | 9 | Notebook: explicit run + visible staleness, not reactive | Agreed (all) | 31s queries over 265M rows argue for deliberate control |
 | 10 | Divider geometry is the engine's, not inferred by the host | Agreed (Codex, Claude) | Stage A copies baryon's 4-col/1-row gap math; Stage B must project divider metadata or own the hit test so engine layout changes cannot silently drift host behavior |
+| 12 | Stage B lands on the `host-pane-seam` integration branch | Agreed (Codex, Claude) | Cross-cutting, compiler-led refactor; merge when the engine cut is coherent, not when the first seam exists |
 | 11 | Divider geometry ships as **projected metadata**, not a hit-test API | Agreed (Codex, Claude) | A hit-test call would put mouse-down and hover behind an async round trip — the exact interaction that must feel immediate. Metadata is state, so normal viewport coalescing is correct (consistent with #5) |
 
 ## What all three of us converged on
@@ -430,6 +431,14 @@ Staging this way means the expensive engine work is only undertaken after the
 one question that can't be answered on paper — *does Baryon-mediated,
 cell-quantized, asynchronous layout feel right for big visual panes?* — has
 already been answered yes.
+
+### Stage B merge criteria
+
+Work continues on the `host-pane-seam` branch (`95d143f`, `283a155`,
+`24fc3c5`). Merge to `main` once items 1–4 and 6 form **one coherent engine
+cut** — `HostPanel` variants, projection including dividers, and the terminal
+placeholder — not merely because the event seam exists. Item 7 (deleting the
+Stage A probe) can follow once the real path replaces it.
 
 ### Stage B work breakdown
 
