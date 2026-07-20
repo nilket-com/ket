@@ -775,16 +775,19 @@ impl Executor {
 				}
 				AggregateFunction::Sum => {
 					let arr = self.evaluate_bound_single_root(&call.args, batch, "SUM arg")?;
+					// ADR 475: resolve the array type once, not once per row.
+					let reader = numeric_array_reader(&arr)?;
 					for row in 0..batch.num_rows() {
-						if let Some(value) = numeric_value(&arr, row)? {
+						if let Some(value) = reader.value(row) {
 							add_sum_value(state, value)?;
 						}
 					}
 				}
 				AggregateFunction::Avg => {
 					let arr = self.evaluate_bound_single_root(&call.args, batch, "AVG arg")?;
+					let reader = numeric_array_reader(&arr)?;
 					for row in 0..batch.num_rows() {
-						if let Some(value) = numeric_value(&arr, row)? {
+						if let Some(value) = reader.value(row) {
 							add_avg_value(state, value)?;
 						}
 					}
@@ -843,8 +846,9 @@ impl Executor {
 
 		let fold_timer = profile.begin_leaf(super::join::GlobalFoldProfileLeaf::NumericFold)?;
 		let folded = (|| {
+			let reader = numeric_array_reader(&arr)?;
 			for row in 0..batch.num_rows() {
-				if let Some(value) = numeric_value(&arr, row)? {
+				if let Some(value) = reader.value(row) {
 					add_sum_value(state, value)?;
 				}
 			}
@@ -1213,6 +1217,17 @@ impl Executor {
 				}
 			}
 
+			// ADR 475: resolve each numeric input's concrete type once per batch.
+			// Non-numeric inputs (Count/Min/Max over other types) stay `None` and
+			// keep the original per-row path, error text included.
+			let readers = aggr_arrays
+				.iter()
+				.map(|input| {
+					input
+						.as_ref()
+						.and_then(|array| numeric_array_reader(array).ok())
+				})
+				.collect::<Vec<_>>();
 			for row in 0..batch.num_rows() {
 				let key = group_arrays
 					.iter()
@@ -1221,7 +1236,11 @@ impl Executor {
 				let states = groups.entry_or_init(key, aggr_expr.len(), || {
 					init_states(aggr_expr, &aggr_arrays)
 				})?;
-				for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
+				for ((state, input), reader) in states
+					.iter_mut()
+					.zip(aggr_arrays.iter())
+					.zip(readers.iter())
+				{
 					match input {
 						None => {
 							if let AggState::Count(total) = state {
@@ -1235,14 +1254,22 @@ impl Executor {
 								}
 							}
 							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-								if let Some(value) = numeric_value(array, row)? {
+								let value = match reader {
+									Some(reader) => reader.value(row),
+									None => numeric_value(array, row)?,
+								};
+								if let Some(value) = value {
 									add_sum_value(state, value)?;
 								}
 							}
 							AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. }
 							| AggState::AvgDecimal { .. } => {
-								if let Some(value) = numeric_value(array, row)? {
+								let value = match reader {
+									Some(reader) => reader.value(row),
+									None => numeric_value(array, row)?,
+								};
+								if let Some(value) = value {
 									add_avg_value(state, value)?;
 								}
 							}
@@ -1423,6 +1450,15 @@ impl Executor {
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 
+		// ADR 475: one type resolution per input array, not per row.
+		let readers = aggr_arrays
+			.iter()
+			.map(|input| {
+				input
+					.as_ref()
+					.and_then(|array| numeric_array_reader(array).ok())
+			})
+			.collect::<Vec<_>>();
 		for row in 0..batch.num_rows() {
 			let key = group_arrays
 				.iter()
@@ -1430,7 +1466,11 @@ impl Executor {
 				.collect::<Result<Vec<_>, _>>()?;
 			let states =
 				groups.entry_or_init(key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
-			for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
+			for ((state, input), reader) in states
+				.iter_mut()
+				.zip(aggr_arrays.iter())
+				.zip(readers.iter())
+			{
 				match input {
 					None => {
 						if let AggState::Count(total) = state {
@@ -1444,14 +1484,22 @@ impl Executor {
 							}
 						}
 						AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-							if let Some(value) = numeric_value(array, row)? {
+							let value = match reader {
+								Some(reader) => reader.value(row),
+								None => numeric_value(array, row)?,
+							};
+							if let Some(value) = value {
 								add_sum_value(state, value)?;
 							}
 						}
 						AggState::AvgInt { .. }
 						| AggState::AvgFloat { .. }
 						| AggState::AvgDecimal { .. } => {
-							if let Some(value) = numeric_value(array, row)? {
+							let value = match reader {
+								Some(reader) => reader.value(row),
+								None => numeric_value(array, row)?,
+							};
+							if let Some(value) = value {
 								add_avg_value(state, value)?;
 							}
 						}
@@ -2597,6 +2645,108 @@ pub(in crate::exec) fn aggregate_state_output_name(function: &AggregateFunction)
 		| AggregateFunction::Max
 		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 	}
+}
+
+/// ADR 475: the array's concrete type resolved **once**, so accumulation loops stop
+/// paying an eleven-branch `as_any().downcast_ref()` chain per row (ADR 474 named
+/// that chain as the owner of the m02 gap). The type set, conversions, and error
+/// text mirror [`numeric_value`] exactly — the two resolve through this one place
+/// so they cannot drift.
+pub(in crate::exec) enum NumericArrayReader<'a> {
+	Int8(&'a Int8Array),
+	Int16(&'a Int16Array),
+	Int32(&'a Int32Array),
+	Int64(&'a Int64Array),
+	UInt8(&'a UInt8Array),
+	UInt16(&'a UInt16Array),
+	UInt32(&'a UInt32Array),
+	UInt64(&'a UInt64Array),
+	Float32(&'a Float32Array),
+	Float64(&'a Float64Array),
+	/// ADR 263: raw (unscaled) integer into the accumulator; SUM finalize
+	/// re-applies the column's (precision, scale).
+	Decimal128(&'a Decimal128Array),
+}
+
+impl NumericArrayReader<'_> {
+	/// The value at `row`, or `None` when the slot is null — the same
+	/// null contract [`numeric_value`] has always had.
+	pub(in crate::exec) fn value(&self, row: usize) -> Option<NumericValue> {
+		let null = match self {
+			Self::Int8(array) => array.is_null(row),
+			Self::Int16(array) => array.is_null(row),
+			Self::Int32(array) => array.is_null(row),
+			Self::Int64(array) => array.is_null(row),
+			Self::UInt8(array) => array.is_null(row),
+			Self::UInt16(array) => array.is_null(row),
+			Self::UInt32(array) => array.is_null(row),
+			Self::UInt64(array) => array.is_null(row),
+			Self::Float32(array) => array.is_null(row),
+			Self::Float64(array) => array.is_null(row),
+			Self::Decimal128(array) => array.is_null(row),
+		};
+		if null {
+			return None;
+		}
+		Some(match self {
+			Self::Int8(array) => NumericValue::Int(array.value(row) as i128),
+			Self::Int16(array) => NumericValue::Int(array.value(row) as i128),
+			Self::Int32(array) => NumericValue::Int(array.value(row) as i128),
+			Self::Int64(array) => NumericValue::Int(array.value(row) as i128),
+			Self::UInt8(array) => NumericValue::Int(array.value(row) as i128),
+			Self::UInt16(array) => NumericValue::Int(array.value(row) as i128),
+			Self::UInt32(array) => NumericValue::Int(array.value(row) as i128),
+			Self::UInt64(array) => NumericValue::Int(array.value(row) as i128),
+			Self::Float32(array) => NumericValue::Float(array.value(row) as f64),
+			Self::Float64(array) => NumericValue::Float(array.value(row)),
+			Self::Decimal128(array) => NumericValue::Int(array.value(row)),
+		})
+	}
+}
+
+pub(in crate::exec) fn numeric_array_reader(
+	array: &ArrayRef,
+) -> Result<NumericArrayReader<'_>, ExecutionError> {
+	let any = array.as_any();
+	if let Some(array) = any.downcast_ref::<Int8Array>() {
+		return Ok(NumericArrayReader::Int8(array));
+	}
+	if let Some(array) = any.downcast_ref::<Int16Array>() {
+		return Ok(NumericArrayReader::Int16(array));
+	}
+	if let Some(array) = any.downcast_ref::<Int32Array>() {
+		return Ok(NumericArrayReader::Int32(array));
+	}
+	if let Some(array) = any.downcast_ref::<Int64Array>() {
+		return Ok(NumericArrayReader::Int64(array));
+	}
+	if let Some(array) = any.downcast_ref::<UInt8Array>() {
+		return Ok(NumericArrayReader::UInt8(array));
+	}
+	if let Some(array) = any.downcast_ref::<UInt16Array>() {
+		return Ok(NumericArrayReader::UInt16(array));
+	}
+	if let Some(array) = any.downcast_ref::<UInt32Array>() {
+		return Ok(NumericArrayReader::UInt32(array));
+	}
+	if let Some(array) = any.downcast_ref::<UInt64Array>() {
+		return Ok(NumericArrayReader::UInt64(array));
+	}
+	if let Some(array) = any.downcast_ref::<Float32Array>() {
+		return Ok(NumericArrayReader::Float32(array));
+	}
+	if let Some(array) = any.downcast_ref::<Float64Array>() {
+		return Ok(NumericArrayReader::Float64(array));
+	}
+	if let Some(array) = any.downcast_ref::<Decimal128Array>() {
+		return Ok(NumericArrayReader::Decimal128(array));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"aggregate expects numeric input, got {:?}",
+			array.data_type()
+		),
+	})
 }
 
 pub(in crate::exec) fn numeric_value(
