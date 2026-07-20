@@ -1,8 +1,11 @@
 # Notebook with panes — Polariton as a Baryon-centered workspace
 
-Status: **Stage A probe passed 2026-07-20 — go.** Direction and the host-pane
-seam are agreed; Stage B (the real `HostPanel` engine change) is justified and
-has a concrete target. Captured from a design discussion between Joel, Codex,
+Status: **Shipped to `main` 2026-07-20.** The host-pane seam and its first
+vertical slice — run SQL into a Baryon-owned result pane — are the baseline, so
+remaining work lands as independent product iterations rather than on a
+long-lived branch. Sequencing steps 1–3 are complete; the notebook document
+model (step 5) and Polariton's Rune runtime (step 2 of the revised order) are
+the open ones. Captured from a design discussion between Joel, Codex,
 and Claude. Where reviewers converged it is noted as such; ⚑ marks calls still
 owned by Joel (none open).
 
