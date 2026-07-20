@@ -1542,59 +1542,27 @@ mod probe {
 		)
 	}
 
-	/// Port of baryon's `divider_under_mouse_in_rects` (ui/mouse.rs): find the
-	/// split boundary the cursor sits in, by looking for a pane-sized gap.
+	/// The engine publishes every draggable boundary with its own grab
+	/// rectangle, so adjacency and gap width are never inferred here
+	/// (`plans/wip/notebook-with-panes.md`, decision #10). Hit-testing is a
+	/// containment check against `hit_rect`, which the engine may widen beyond
+	/// what it paints.
 	fn divider_at(viewport: &Viewport, column: u32, row: u32) -> Option<Divider> {
-		let rects = viewport
-			.panes
+		viewport
+			.dividers
 			.iter()
-			.map(|pane| (pane.pane_id, pane.rect))
-			.collect::<Vec<_>>();
-
-		let spans_row = |rect: &libaryon::core::PaneRect| {
-			row >= rect.screen_row.get() && row < rect.bottom().get()
-		};
-		let left = rects
-			.iter()
-			.filter(|(_, rect)| spans_row(rect) && rect.right().get() <= column)
-			.max_by_key(|(_, rect)| rect.right().get());
-		let right = rects
-			.iter()
-			.filter(|(_, rect)| spans_row(rect) && rect.screen_col.get() > column)
-			.min_by_key(|(_, rect)| rect.screen_col.get());
-		if let (Some((before, left)), Some((after, right))) = (left, right)
-			&& right.screen_col.get().saturating_sub(left.right().get())
-				== libaryon::core::SPLIT_DIVIDER_COLS
-		{
-			return Some(Divider {
-				before: *before,
-				after: *after,
-				axis: SplitDirection::Vertical,
-			});
-		}
-
-		let spans_column = |rect: &libaryon::core::PaneRect| {
-			column >= rect.screen_col.get() && column < rect.right().get()
-		};
-		let above = rects
-			.iter()
-			.filter(|(_, rect)| spans_column(rect) && rect.bottom().get() <= row)
-			.max_by_key(|(_, rect)| rect.bottom().get());
-		let below = rects
-			.iter()
-			.filter(|(_, rect)| spans_column(rect) && rect.screen_row.get() > row)
-			.min_by_key(|(_, rect)| rect.screen_row.get());
-		if let (Some((before, above)), Some((after, below))) = (above, below)
-			&& below.screen_row.get().saturating_sub(above.bottom().get())
-				== libaryon::core::SPLIT_DIVIDER_ROWS
-		{
-			return Some(Divider {
-				before: *before,
-				after: *after,
-				axis: SplitDirection::Horizontal,
-			});
-		}
-		None
+			.find(|divider| {
+				let rect = divider.hit_rect;
+				column >= rect.screen_col.get()
+					&& column < rect.right().get()
+					&& row >= rect.screen_row.get()
+					&& row < rect.bottom().get()
+			})
+			.map(|divider| Divider {
+				before: divider.before,
+				after: divider.after,
+				axis: divider.axis,
+			})
 	}
 
 	impl State {
@@ -1873,24 +1841,24 @@ mod probe_verify {
 			std::thread::sleep(Duration::from_millis(5));
 		}
 
+		// Take the boundary from the engine's own divider metadata rather than
+		// deriving it from pane adjacency: the host must not know how wide a
+		// split gap is (decision #10).
 		let (left_id, right_id, gap_column, row) = {
 			let viewport = editor.viewport.as_ref().expect("viewport");
-			let mut panes = viewport.panes.iter().collect::<Vec<_>>();
-			panes.sort_by_key(|pane| pane.rect.screen_col.get());
-			let left = panes[0];
-			let right = panes[1];
-			// The engine leaves a divider-sized gap between split panes.
-			let gap = right.rect.screen_col.get() - left.rect.right().get();
-			assert_eq!(
-				gap,
-				libaryon::core::SPLIT_DIVIDER_COLS,
-				"vertical divider gap"
+			let divider = viewport
+				.dividers
+				.first()
+				.expect("a split projects a divider");
+			assert!(
+				divider.hit_rect.width.get() >= divider.visual_rect.width.get(),
+				"the grab area is never smaller than what is painted"
 			);
 			(
-				left.pane_id,
-				right.pane_id,
-				left.rect.right().get() + 1,
-				left.rect.screen_row.get() + 2,
+				divider.before,
+				divider.after,
+				divider.hit_rect.screen_col.get(),
+				divider.hit_rect.screen_row.get() + 1,
 			)
 		};
 
