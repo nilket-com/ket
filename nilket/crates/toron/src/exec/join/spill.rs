@@ -18,10 +18,8 @@ fn batch_has_spillable_join_key(
 	null_safe_keys: bool,
 ) -> Result<bool, ExecutionError> {
 	let arrays = key_arrays(batch, build_keys)?;
-	// ADR 478: resolve the key arrays once per loop, not per row.
-	let __jk_reader = JoinKeyReader::new(key_plan, &arrays, null_safe_keys)?;
 	for row in 0..batch.num_rows() {
-		if __jk_reader.key(row)?.is_some() {
+		if join_key_at(key_plan, &arrays, row, null_safe_keys)?.is_some() {
 			return Ok(true);
 		}
 	}
@@ -1833,10 +1831,8 @@ impl SpilledInnerJoinBuild {
 		let mut refs = std::mem::take(&mut self.scratch_refs);
 		refs.clear();
 		refs.reserve(batch.num_rows());
-		// ADR 478: resolve the key arrays once per loop, not per row.
-		let __jk_reader = JoinKeyReader::new(key_plan, &key_arrays, null_safe_keys)?;
 		for row in 0..batch.num_rows() {
-			let Some(key) = __jk_reader.key(row)? else {
+			let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
 				continue;
 			};
 			refs.push((key, join_build_row_index(row)?));
@@ -3187,10 +3183,8 @@ impl SpilledSemiAntiExistenceBuild {
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
 		let key_arrays = key_arrays(batch, existence_keys)?;
-		// ADR 478: resolve the key arrays once per loop, not per row.
-		let __jk_reader = JoinKeyReader::new(key_plan, &key_arrays, false)?;
 		for row in 0..batch.num_rows() {
-			let Some(key) = __jk_reader.key(row)? else {
+			let Some(key) = join_key_at(key_plan, &key_arrays, row, false)? else {
 				continue;
 			};
 			index_membership_key(&mut self.index, &mut self.resident_index_bytes, key);
@@ -3211,10 +3205,8 @@ impl SpilledSemiAntiExistenceBuild {
 		}
 		let key_arrays = key_arrays(batch, existence_keys)?;
 		let mut refs = Vec::new();
-		// ADR 478: resolve the key arrays once per loop, not per row.
-		let __jk_reader = JoinKeyReader::new(key_plan, &key_arrays, false)?;
 		for row in 0..batch.num_rows() {
-			let Some(key) = __jk_reader.key(row)? else {
+			let Some(key) = join_key_at(key_plan, &key_arrays, row, false)? else {
 				continue;
 			};
 			refs.push((key, join_build_row_index(row)?));

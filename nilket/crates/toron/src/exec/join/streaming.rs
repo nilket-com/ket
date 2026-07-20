@@ -2247,10 +2247,9 @@ where
 				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
-			// ADR 478: resolve the key arrays once per loop, not per row.
-			let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = __jk_reader.key(row)? else {
+				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
 					continue;
 				};
 				for build in spilled.lookup(&key).await? {
@@ -2387,10 +2386,9 @@ where
 			let selection = async {
 				let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 				let mut matches = Vec::new();
-				// ADR 478: resolve the key arrays once per loop, not per row.
-				let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 				for row in 0..probe_chunk.num_rows() {
-					let Some(key) = __jk_reader.key(row)? else {
+					let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+					else {
 						continue;
 					};
 					for build in spilled.lookup(&key).await? {
@@ -2748,10 +2746,8 @@ impl LoadedSpilledInnerBuild {
 		let loaded_page_bytes = pages_loaded_bytes(&pages);
 		for (page_index, page) in pages.iter().enumerate() {
 			let key_arrays = key_arrays(page, build_keys)?;
-			// ADR 478: resolve the key arrays once per loop, not per row.
-			let __jk_reader = JoinKeyReader::new(key_plan, &key_arrays, null_safe_keys)?;
 			for row in 0..page.num_rows() {
-				let Some(key) = __jk_reader.key(row)? else {
+				let Some(key) = join_key_at(key_plan, &key_arrays, row, null_safe_keys)? else {
 					continue;
 				};
 				append_loaded_spilled_batch_row_ref(
@@ -2867,10 +2863,9 @@ where
 				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
-			// ADR 478: resolve the key arrays once per loop, not per row.
-			let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = __jk_reader.key(row)? else {
+				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
 					continue;
 				};
 				for build in loaded.lookup(&key) {
@@ -2956,10 +2951,9 @@ where
 				.transpose()?;
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
-			// ADR 478: resolve the key arrays once per loop, not per row.
-			let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = __jk_reader.key(row)? else {
+				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
 					continue;
 				};
 				for build in loaded.lookup(&key) {
@@ -8218,10 +8212,9 @@ impl Executor {
 			let probe_chunk = right_batch.slice(offset, len);
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
 			let mut matches = Vec::new();
-			// ADR 478: resolve the key arrays once per loop, not per row.
-			let __jk_reader = JoinKeyReader::new(join_key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = __jk_reader.key(row)? else {
+				let Some(key) = join_key_at(join_key_plan, &right_key_arrays, row, null_safe_keys)?
+				else {
 					continue;
 				};
 				for build in spilled.lookup(&key).await? {
@@ -9588,10 +9581,9 @@ impl Executor {
 				let probe_chunk = batch.slice(offset, len);
 				probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
 				let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
-				// ADR 478: resolve the key arrays once per loop, not per row.
-				let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 				for row in 0..probe_chunk.num_rows() {
-					let Some(key) = __jk_reader.key(row)? else {
+					let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
+					else {
 						continue;
 					};
 					for build in spilled.lookup(&key).await? {
@@ -15167,10 +15159,8 @@ impl Executor {
 		});
 
 		let mut preserved_by_key: HashMap<JoinKey, Vec<u32>> = HashMap::new();
-		// ADR 478: resolve the key arrays once per loop, not per row.
-		let __jk_reader = JoinKeyReader::new(runtime.key_plan, &preserved_key_arrays, false)?;
 		for row in 0..preserved_batch.num_rows() {
-			if let Some(key) = __jk_reader.key(row)? {
+			if let Some(key) = join_key_at(runtime.key_plan, &preserved_key_arrays, row, false)? {
 				preserved_by_key
 					.entry(key)
 					.or_default()
@@ -15259,15 +15249,14 @@ impl Executor {
 		let mut selection = Vec::new();
 		let mut residual =
 			JoinMatchResidual::new(runtime.match_filter, preserved_batch, &runtime.scalar_batch);
-		// ADR 478: resolve the key arrays once per loop, not per row.
-		let __jk_reader = JoinKeyReader::new(
-			runtime.key_plan,
-			&preserved_key_arrays,
-			runtime.null_safe_keys,
-		)?;
 		for row in 0..preserved_batch.num_rows() {
 			let left = join_build_row_index(row)?;
-			let matched = if let Some(key) = __jk_reader.key(row)? {
+			let matched = if let Some(key) = join_key_at(
+				runtime.key_plan,
+				&preserved_key_arrays,
+				row,
+				runtime.null_safe_keys,
+			)? {
 				if let Some(matches) = runtime.scalar_rows.get(&key) {
 					let mut matched = false;
 					for right in matches.rows() {
