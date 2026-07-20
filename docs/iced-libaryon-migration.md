@@ -45,9 +45,12 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    (`input-contract.md`/`keymap.md` are future work); polariton translates iced
    keyboard/mouse events to `InputEvent`/`EditorCommand` directly, including
    pixel→row/column mapping for mouse and resize.
-7. **Platform.** libaryon's SVP layer uses Linux `io_uring`; polariton inherits
-   Linux-only builds until `platforms.md`'s resolver-backend split lands.
-   Accepted for now.
+7. **Platform.** ~~libaryon is Linux-only.~~ Corrected 2026-07-20: the SVP
+   resolver has a `BlockingBackend` selected under
+   `cfg(not(target_os = "linux"))`, and `io-uring` is declared under
+   `[target.'cfg(target_os = "linux")'.dependencies]`, so non-Linux builds have
+   a real path. Linux gets the io_uring backend; other platforms fall back to
+   blocking I/O.
 8. **Compile weight.** libaryon pulls rust-analyzer and ruff crates; per-language
    feature gates are flagged in `headless-baryon.md` as follow-up work.
 
