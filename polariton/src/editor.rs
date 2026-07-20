@@ -271,49 +271,7 @@ impl CodeEditor {
 	}
 
 	pub fn subscription(&self) -> Subscription<EditorMsg> {
-		event::listen_with(|event, status, _window| match (event, status) {
-			// Only keys no other widget consumed: a captured key was typed
-			// into a text_input (connection name, statement title, …) and must
-			// not also edit the SQL document.
-			(
-				// `modified_key`, not `key`: iced's `key` is the unshifted
-				// layout key (Shift+; arrives as ';'), while the engine's
-				// keymap expects the produced character (':', 'A', '"', …)
-				// with Ctrl kept as a modifier flag — which is exactly
-				// `modified_key`'s contract.
-				Event::Keyboard(keyboard::Event::KeyPressed {
-					modified_key,
-					modifiers,
-					..
-				}),
-				status,
-			) => {
-				if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
-					eprintln!(
-						"[input-trace] modified_key={modified_key:?} modifiers={modifiers:?} status={status:?}"
-					);
-				}
-				if status != event::Status::Ignored {
-					return None;
-				}
-				// The application owns these execution shortcuts. Do not also send
-				// their Enter key through libaryon's insert-mode keymap.
-				if matches!(
-					modified_key.as_ref(),
-					Key::Named(keyboard::key::Named::Enter)
-				) && (modifiers.shift() || modifiers.control())
-				{
-					return None;
-				}
-				key_code(&modified_key).map(|code| {
-					EditorMsg::Input(InputEvent::Key {
-						code,
-						modifiers: map_modifiers(modifiers),
-					})
-				})
-			}
-			_ => None,
-		})
+		event::listen_with(|event, status, _window| editor_input_for(&event, status))
 	}
 
 	/// Drain every available projection and retain only the latest one.
@@ -1186,6 +1144,53 @@ fn positioned<'a>(
 	.into()
 }
 
+/// Which window events become editor input.
+///
+/// **Ordering invariant.** Iced dispatches events to the widget tree first and
+/// only then broadcasts them to subscriptions, tagged with whether a widget
+/// consumed them. Captured keys are dropped here so typing into app chrome — a
+/// connection name, a statement title — does not also edit the SQL document.
+///
+/// The consequence, which is a real constraint rather than an accident: a
+/// native host panel **must not capture keyboard events**, or it would swallow
+/// `:` and pane navigation before Baryon ever sees them and the workspace would
+/// stop responding while that panel had focus. The result table is safe because
+/// it handles only pointer input; keyboard scrolling reaches it the correct way,
+/// as `HostEvent::UnhandledInput` that the engine declined.
+///
+/// A panel that genuinely needs keyboard capture — a Rune console, a native text
+/// input — cannot simply capture: it needs a root-level arbiter that forwards to
+/// Baryon before children see the key, which is a deliberate architectural
+/// change and not a local one. See `plans/wip/notebook-with-panes.md`.
+fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
+	let Event::Keyboard(keyboard::Event::KeyPressed {
+		modified_key,
+		modifiers,
+		..
+	}) = event
+	else {
+		return None;
+	};
+	if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
+		eprintln!(
+			"[input-trace] modified_key={modified_key:?} modifiers={modifiers:?} status={status:?}"
+		);
+	}
+	if status != event::Status::Ignored {
+		return None;
+	}
+	// `modified_key`, not `key`: iced's `key` is the unshifted layout key
+	// (Shift+; arrives as ';'), while the engine's keymap expects the produced
+	// character (':', 'A', '"', …) with Ctrl kept as a modifier flag — which is
+	// exactly `modified_key`'s contract.
+	key_code(modified_key).map(|code| {
+		EditorMsg::Input(InputEvent::Key {
+			code,
+			modifiers: map_modifiers(*modifiers),
+		})
+	})
+}
+
 /// The bottom-bar text for the current engine state: `:` command, `/` search,
 /// and pending confirm questions all use the same line. Non-Normal modes
 /// without a prompt still announce themselves vim-style, since the block cursor
@@ -1806,6 +1811,56 @@ mod tests {
 		editor.panels.reconcile(&[key(KeyCode::Char('j'))], None);
 		let (fourth, _) = editor.panels.panels[&RESULT_PANEL].scroll.expect("scroll");
 		assert_eq!(fourth, third, "input is inert while the panel has no table");
+	}
+
+	#[test]
+	fn a_capturing_widget_would_hide_workspace_keys_from_baryon() {
+		use super::editor_input_for;
+		use iced::keyboard::key::Named;
+		use iced::{Event, event, keyboard};
+
+		let colon = Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Character(";".into()),
+			modified_key: keyboard::Key::Character(":".into()),
+			physical_key: keyboard::key::Physical::Unidentified(
+				keyboard::key::NativeCode::Unidentified,
+			),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::SHIFT,
+			text: Some(":".into()),
+			repeat: false,
+		});
+
+		// Unconsumed keys reach the engine, which is how `:` opens the prompt.
+		assert!(
+			editor_input_for(&colon, event::Status::Ignored).is_some(),
+			"an unconsumed key reaches Baryon"
+		);
+
+		// Consumed keys are dropped so app chrome (connection name, statement
+		// title) does not also edit the SQL document. The same rule means a
+		// host panel that captured keyboard input would swallow `:` and pane
+		// navigation before Baryon saw them — so native panels must not
+		// capture, and adding one that must needs a root-level arbiter rather
+		// than a local change. This assertion exists to make that trade-off
+		// impossible to change silently.
+		assert!(
+			editor_input_for(&colon, event::Status::Captured).is_none(),
+			"a captured key never reaches Baryon: host panels must not capture"
+		);
+
+		let arrow = Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Named(Named::ArrowDown),
+			modified_key: keyboard::Key::Named(Named::ArrowDown),
+			physical_key: keyboard::key::Physical::Unidentified(
+				keyboard::key::NativeCode::Unidentified,
+			),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::empty(),
+			text: None,
+			repeat: false,
+		});
+		assert!(editor_input_for(&arrow, event::Status::Ignored).is_some());
 	}
 
 	#[test]

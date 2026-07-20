@@ -39,6 +39,7 @@ marks calls still owned by Joel.
 | 8 | Dashboard nested as one HostPanel initially | **Ratified by Joel 2026-07-20** | Preserves dashboard-as-object (coordinated plots, export); flattening trades real semantics for uniformity |
 | 9 | Notebook: explicit run + visible staleness, not reactive | Agreed (all) | 31s queries over 265M rows argue for deliberate control |
 | 10 | Divider geometry is the engine's, not inferred by the host | Agreed (Codex, Claude) | Stage A copies baryon's 4-col/1-row gap math; Stage B must project divider metadata or own the hit test so engine layout changes cannot silently drift host behavior |
+| 13 | Host panels must not capture keyboard input (engine-first) | Agreed (Codex, Claude) | Iced dispatches to widgets *before* subscriptions, so a capturing panel would swallow `:` and pane navigation before Baryon saw them. A panel that genuinely needs capture requires a root-level arbiter, not a local change |
 | 12 | Stage B lands on the `host-pane-seam` integration branch | Agreed (Codex, Claude) | Cross-cutting, compiler-led refactor; merge when the engine cut is coherent, not when the first seam exists |
 | 11 | Divider geometry ships as **projected metadata**, not a hit-test API | Agreed (Codex, Claude) | A hit-test call would put mouse-down and hover behind an async round trip — the exact interaction that must feel immediate. Metadata is state, so normal viewport coalescing is correct (consistent with #5) |
 
@@ -105,6 +106,24 @@ onto it.
 ## Three design decisions
 
 ### 1. Input: engine-declines, with a pointer exception (proposed, agreed)
+
+**Correction (2026-07-20).** An earlier claim that Polariton's key ordering was
+"structural — a focused widget can never swallow `:`" was **wrong**. Iced
+dispatches events to the widget tree first and only then broadcasts them to
+subscriptions tagged with whether a widget consumed them; Polariton forwards
+only `Status::Ignored` keys, precisely so typing in app chrome does not also
+edit the SQL document. A host panel that captured keyboard input would
+therefore hide workspace keys from Baryon entirely.
+
+The result table is safe because it handles only pointer input, and its
+keyboard scrolling arrives the correct way — as `UnhandledInput` the engine
+declined. But this is a *constraint being honoured*, not an invariant being
+enforced. Decision #13 records the rule; `editor_input_for` carries it in
+prose and `a_capturing_widget_would_hide_workspace_keys_from_baryon` pins it,
+so the trade-off cannot be changed silently. Before a Rune console or native
+text input lands, either keep panels capture-free or build a root-level focus
+arbiter that forwards host-panel keys to Baryon ahead of child widgets while
+excluding app-chrome forms.
 
 Grounded in a real constraint: libaryon's keymap dispatches by *content-type
 context* (`NormalContext::FileBrowser`), so the engine interprets keys
