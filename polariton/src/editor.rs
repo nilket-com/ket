@@ -5,7 +5,7 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
-use crate::gui::table::Table;
+use crate::gui::table::{Table, TableScroll};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
@@ -847,11 +847,16 @@ pub struct PanelRegistry {
 	/// immediately would blank the pane for a frame whenever the event arrives
 	/// before the viewport that stops referencing it.
 	pending_disposal: std::collections::HashSet<HostPanelId>,
+	/// Monotonic across all panels, so each declined key applies exactly once.
+	scroll_sequence: u64,
 }
 
 struct PanelEntry {
 	revision: PanelRevision,
 	content: PanelContent,
+	/// Latest keyboard-driven scroll, with a sequence the widget uses to apply
+	/// it exactly once rather than on every frame.
+	scroll: Option<(u64, TableScroll)>,
 }
 
 /// Host-owned backing state for a panel. None of this is representable in
@@ -880,6 +885,7 @@ impl PanelRegistry {
 						.or_insert(PanelEntry {
 							revision: *revision,
 							content: PanelContent::Unresolved,
+							scroll: None,
 						})
 						.revision = *revision;
 				}
@@ -895,10 +901,15 @@ impl PanelRegistry {
 						PanelEntry {
 							revision: PanelRevision::new(0),
 							content: PanelContent::Unresolved,
+							scroll: None,
 						},
 					);
 				}
-				HostEvent::UnhandledInput { .. } => {}
+				HostEvent::UnhandledInput { panel_id, input } => {
+					// Baryon already decided this is not workspace control, so
+					// the panel interprets it however its content sees fit.
+					self.handle_panel_input(*panel_id, input);
+				}
 			}
 		}
 
@@ -930,8 +941,41 @@ impl PanelRegistry {
 				self.panels.entry(panel.panel_id).or_insert(PanelEntry {
 					revision: panel.revision,
 					content: PanelContent::Unresolved,
+					scroll: None,
 				});
 			}
+		}
+	}
+
+	/// Route input the engine declined to the panel that has workspace focus.
+	/// What a key means is Polariton's business — the engine has only said it
+	/// is not a workspace command.
+	fn handle_panel_input(&mut self, panel_id: HostPanelId, input: &InputEvent) {
+		let InputEvent::Key { code, modifiers } = input else {
+			return;
+		};
+		if !modifiers.is_empty() {
+			return;
+		}
+		let Some(entry) = self.panels.get_mut(&panel_id) else {
+			return;
+		};
+		if !matches!(entry.content, PanelContent::Table(_)) {
+			return;
+		}
+		let action = match code {
+			KeyCode::Char('j') | KeyCode::Down => TableScroll::LineDown,
+			KeyCode::Char('k') | KeyCode::Up => TableScroll::LineUp,
+			KeyCode::PageDown => TableScroll::PageDown,
+			KeyCode::PageUp => TableScroll::PageUp,
+			KeyCode::Home => TableScroll::Top,
+			KeyCode::End => TableScroll::Bottom,
+			_ => return,
+		};
+		self.scroll_sequence = self.scroll_sequence.saturating_add(1);
+		let sequence = self.scroll_sequence;
+		if let Some(entry) = self.panels.get_mut(&panel_id) {
+			entry.scroll = Some((sequence, action));
 		}
 	}
 
@@ -939,6 +983,7 @@ impl PanelRegistry {
 		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
 			revision: PanelRevision::new(0),
 			content: PanelContent::Unresolved,
+			scroll: None,
 		});
 		entry.content = content;
 	}
@@ -958,7 +1003,13 @@ impl PanelRegistry {
 			.unwrap_or(&PanelContent::Unresolved);
 
 		let inner: Element<'a, EditorMsg> = match content {
-			PanelContent::Table(frame) => Table::new(frame, 0).into(),
+			PanelContent::Table(frame) => Table::new(frame, 0)
+				.scroll_request(
+					self.panels
+						.get(&panel.panel_id)
+						.and_then(|entry| entry.scroll),
+				)
+				.into(),
 			PanelContent::Running => panel_message(
 				format!("{}\n\nrunning…", panel.title),
 				color(palette.preview_text),
@@ -1698,6 +1749,63 @@ mod tests {
 			editor.panels.panels[&RESULT_PANEL].content,
 			PanelContent::Running
 		));
+	}
+
+	#[test]
+	fn declined_keys_scroll_the_focused_result_table() {
+		use super::{PanelContent, RESULT_PANEL};
+		use crate::gui::table::TableScroll;
+		use libaryon::engine::HostEvent;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		editor.set_query_result(polars::df!("n" => [1i64, 2, 3]).expect("frame"));
+
+		let key = |code| HostEvent::UnhandledInput {
+			panel_id: RESULT_PANEL,
+			input: InputEvent::Key {
+				code,
+				modifiers: Modifiers::NONE,
+			},
+		};
+		// Baryon has already decided these are not workspace commands; what
+		// they mean inside the panel is Polariton's business.
+		for (code, expected) in [
+			(KeyCode::Char('j'), TableScroll::LineDown),
+			(KeyCode::Char('k'), TableScroll::LineUp),
+			(KeyCode::Down, TableScroll::LineDown),
+			(KeyCode::PageDown, TableScroll::PageDown),
+			(KeyCode::Home, TableScroll::Top),
+			(KeyCode::End, TableScroll::Bottom),
+		] {
+			editor.panels.reconcile(&[key(code)], None);
+			let (_, action) = editor.panels.panels[&RESULT_PANEL]
+				.scroll
+				.expect("a declined key produces a scroll action");
+			assert_eq!(action, expected, "{code:?} scrolls the table");
+		}
+
+		// Each key applies once: the sequence advances so the widget cannot
+		// re-apply a stale request every frame.
+		let (first, _) = editor.panels.panels[&RESULT_PANEL].scroll.expect("scroll");
+		editor.panels.reconcile(&[key(KeyCode::Char('j'))], None);
+		let (second, _) = editor.panels.panels[&RESULT_PANEL].scroll.expect("scroll");
+		assert!(second > first, "each declined key gets a fresh sequence");
+
+		// Keys the table has no meaning for are ignored rather than guessed at.
+		editor.panels.reconcile(&[key(KeyCode::Char('z'))], None);
+		let (third, _) = editor.panels.panels[&RESULT_PANEL].scroll.expect("scroll");
+		assert_eq!(third, second, "an unmapped key leaves the panel untouched");
+
+		// A panel with no table ignores input entirely.
+		editor
+			.panels
+			.set_content(RESULT_PANEL, PanelContent::Running);
+		editor.panels.reconcile(&[key(KeyCode::Char('j'))], None);
+		let (fourth, _) = editor.panels.panels[&RESULT_PANEL].scroll.expect("scroll");
+		assert_eq!(fourth, third, "input is inert while the panel has no table");
 	}
 
 	#[test]

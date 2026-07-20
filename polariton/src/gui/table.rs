@@ -1,21 +1,22 @@
 use crate::gui::colors;
 use iced::{
+	Color, Element, Event,
+	Length::{self, Fill},
+	Pixels, Point, Rectangle, Size,
 	advanced::{
+		Clipboard, Layout, Shell, Widget,
 		layout::{Limits, Node},
 		mouse::{self, Cursor, Interaction, ScrollDelta},
 		renderer::{self, Style},
 		text::{self, Renderer as TextRenderer, Text},
-		widget::{tree, Tree},
-		Clipboard, Layout, Shell, Widget,
+		widget::{Tree, tree},
 	},
 	alignment::{Horizontal, Vertical},
-	border, keyboard, Color, Element, Event,
-	Length::{self, Fill},
-	Pixels, Point, Rectangle, Size,
+	border, keyboard,
 };
 use polars::{
 	datatypes::AnyValue,
-	frame::{column::Column, DataFrame},
+	frame::{DataFrame, column::Column},
 };
 
 const ROW_HEIGHT: f32 = 28.0;
@@ -30,9 +31,25 @@ const V_SCROLLBAR_WIDTH: f32 = 12.0;
 const H_SCROLLBAR_HEIGHT: f32 = 12.0;
 const COL_RESIZE_GRAB_ZONE: f32 = 4.0;
 
+/// A scroll action requested from outside the widget — currently keyboard
+/// input routed from a focused host panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableScroll {
+	LineUp,
+	LineDown,
+	PageUp,
+	PageDown,
+	Top,
+	Bottom,
+}
+
 pub struct Table<'a> {
 	data_frame: &'a DataFrame,
 	row_offset: usize,
+	/// `(sequence, action)`. The widget applies an action only when the
+	/// sequence advances, so a value that stays set across frames does not
+	/// override the user's own scrolling.
+	scroll_request: Option<(u64, TableScroll)>,
 	col_width: Option<f32>,
 	show_column_types: bool,
 }
@@ -42,6 +59,7 @@ impl<'a> Table<'a> {
 		Self {
 			data_frame,
 			row_offset,
+			scroll_request: None,
 			col_width: None,
 			show_column_types: false,
 		}
@@ -55,6 +73,36 @@ impl<'a> Table<'a> {
 	pub fn show_column_types(mut self, show: bool) -> Self {
 		self.show_column_types = show;
 		self
+	}
+
+	/// Drive scrolling from outside the widget. Keyboard input reaches a host
+	/// panel only after Baryon has declined it, so this never competes with
+	/// workspace bindings.
+	pub fn scroll_request(mut self, request: Option<(u64, TableScroll)>) -> Self {
+		self.scroll_request = request;
+		self
+	}
+
+	fn apply_scroll_request(&self, state: &mut TableState, bounds: Rectangle) {
+		let Some((sequence, action)) = self.scroll_request else {
+			return;
+		};
+		if sequence == state.last_scroll_sequence {
+			return;
+		}
+		state.last_scroll_sequence = sequence;
+		let viewport_height = (bounds.height - self.header_height()).max(0.0) as f64;
+		let max_scroll = (self.total_content_height() as f64 - viewport_height).max(0.0);
+		let page = viewport_height.max(ROW_HEIGHT as f64);
+		let target = match action {
+			TableScroll::LineUp => state.v_scroll_offset - ROW_HEIGHT as f64,
+			TableScroll::LineDown => state.v_scroll_offset + ROW_HEIGHT as f64,
+			TableScroll::PageUp => state.v_scroll_offset - page,
+			TableScroll::PageDown => state.v_scroll_offset + page,
+			TableScroll::Top => 0.0,
+			TableScroll::Bottom => max_scroll,
+		};
+		state.v_scroll_offset = target.clamp(0.0, max_scroll);
 	}
 
 	fn header_height(&self) -> f32 {
@@ -149,7 +197,8 @@ impl<'a> Table<'a> {
 
 	fn row_num_width(&self, bounds: Rectangle, v_scroll: f64) -> f32 {
 		let first_visible = (v_scroll / ROW_HEIGHT as f64).floor() as usize;
-		let visible_count = ((bounds.height - self.header_height()) / ROW_HEIGHT).ceil() as usize + 1;
+		let visible_count =
+			((bounds.height - self.header_height()) / ROW_HEIGHT).ceil() as usize + 1;
 		let max_idx = self.row_offset + first_visible + visible_count + 1;
 		let digits = if max_idx > 0 {
 			(max_idx as f64).log10().floor() as f32 + 1.0
@@ -296,6 +345,7 @@ pub struct TableState {
 	v_drag_start_y: f32,
 	v_dragging_scrollbar: bool,
 	v_scroll_offset: f64,
+	last_scroll_sequence: u64,
 	selection: Option<TableSelection>,
 	is_selecting: bool,
 	modifiers: keyboard::Modifiers,
@@ -338,9 +388,11 @@ where
 		if state.resizing_col.is_some() {
 			return Interaction::ResizingHorizontally;
 		}
-		if let Some(pos) = cursor.position() && self
+		if let Some(pos) = cursor.position()
+			&& self
 				.divider_at_cursor(state, bounds, pos.x, pos.y, row_num_w)
-				.is_some() {
+				.is_some()
+		{
 			return Interaction::ResizingHorizontally;
 		}
 		Interaction::default()
@@ -359,6 +411,7 @@ where
 	) {
 		let bounds = layout.bounds();
 		let state = tree.state.downcast_mut::<TableState>();
+		self.apply_scroll_request(state, bounds);
 		let row_num_w = self.row_num_width(bounds, state.v_scroll_offset);
 		let viewport_w = bounds.width - V_SCROLLBAR_WIDTH - row_num_w;
 		self.col_widths(state, viewport_w);
@@ -391,9 +444,7 @@ where
 						state.h_drag_start_x = pos.x;
 						state.h_drag_start_offset = state.h_scroll_offset;
 						shell.request_redraw();
-					} else if let Some(cell) =
-						self.hit_test_cell(state, bounds, pos, row_num_w)
-					{
+					} else if let Some(cell) = self.hit_test_cell(state, bounds, pos, row_num_w) {
 						let extend = state.modifiers.shift();
 						if extend && let Some(sel) = &mut state.selection {
 							sel.active = cell;
@@ -406,8 +457,8 @@ where
 						state.is_selecting = true;
 						shell.request_redraw();
 					} else if state.selection.is_some() {
-							state.selection = None;
-							shell.request_redraw();
+						state.selection = None;
+						shell.request_redraw();
 					}
 				}
 			}
@@ -441,9 +492,10 @@ where
 				} else if state.is_selecting
 					&& let Some(cell) = self.hit_test_cell(state, bounds, *position, row_num_w)
 					&& let Some(sel) = &mut state.selection
-					&& sel.active != cell {
-							sel.active = cell;
-							shell.request_redraw();
+					&& sel.active != cell
+				{
+					sel.active = cell;
+					shell.request_redraw();
 				}
 			}
 			Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -518,9 +570,7 @@ where
 						state.h_scroll_offset =
 							(state.h_scroll_offset - MIN_COL_WIDTH as f64).clamp(0.0, max_h_scroll);
 					}
-					keyboard::Key::Character(c)
-						if c.as_str() == "c" && modifiers.control() =>
-					{
+					keyboard::Key::Character(c) if c.as_str() == "c" && modifiers.control() => {
 						if let Some(sel) = &state.selection {
 							let (min_col, max_col, min_row, max_row) = sel.range();
 							let mut out = String::new();
@@ -669,22 +719,23 @@ where
 							Horizontal::Center,
 						);
 						if self.show_column_types
-							&& let Some(col) = self.data_frame.columns().get(col_idx) {
-								let dtype_label = format!("{}", col.dtype());
-								draw_text_sized(
-									renderer,
-									&dtype_label,
-									Rectangle {
-										x: cell_x + CELL_PADDING_X,
-										y: bounds.y + HEADER_HEIGHT,
-										width: col_w - CELL_PADDING_X,
-										height: header_h - HEADER_HEIGHT,
-									},
-									colors::TABLE_TYPE_LABEL,
-									TYPE_LABEL_FONT_SIZE,
-									Horizontal::Center,
-								);
-							}
+							&& let Some(col) = self.data_frame.columns().get(col_idx)
+						{
+							let dtype_label = format!("{}", col.dtype());
+							draw_text_sized(
+								renderer,
+								&dtype_label,
+								Rectangle {
+									x: cell_x + CELL_PADDING_X,
+									y: bounds.y + HEADER_HEIGHT,
+									width: col_w - CELL_PADDING_X,
+									height: header_h - HEADER_HEIGHT,
+								},
+								colors::TABLE_TYPE_LABEL,
+								TYPE_LABEL_FONT_SIZE,
+								Horizontal::Center,
+							);
+						}
 					}
 					cell_x += col_w;
 				}
@@ -716,9 +767,8 @@ where
 			let first_visible = (v_scroll / ROW_HEIGHT as f64).floor() as usize;
 			let visible_count = ((bounds.height - header_h) / ROW_HEIGHT).ceil() as usize + 1;
 			let loaded = self.loaded_row_count();
-			let first_visible_y = bounds.y
-				+ header_h
-				+ (first_visible as f64 * ROW_HEIGHT as f64 - v_scroll) as f32;
+			let first_visible_y =
+				bounds.y + header_h + (first_visible as f64 * ROW_HEIGHT as f64 - v_scroll) as f32;
 			let row_num_clip = Rectangle {
 				x: bounds.x,
 				y: bounds.y + header_h,
