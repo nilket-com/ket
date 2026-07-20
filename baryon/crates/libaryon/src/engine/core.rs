@@ -216,6 +216,8 @@ pub(crate) struct Engine {
 	pub(super) rx_request: mpsc::Receiver<EngineRequest>,
 	pub(super) tx_internal: InternalSender,
 	pub(super) tx_view: mpsc::Sender<Viewport>,
+	/// Ordered, non-coalescing frontend stream; absent when no host attached.
+	pub(super) host_events: Option<super::host_event::HostEventSender>,
 	pub(super) reactor: SemanticReactor,
 	pub(super) lang_registry: Arc<LanguageRegistry>,
 	pub(super) initial_theme_name: String,
@@ -267,6 +269,7 @@ impl Engine {
 			rx_request,
 			tx_internal,
 			tx_view,
+			host_events: None,
 			reactor,
 			lang_registry,
 			initial_theme_name,
@@ -313,6 +316,23 @@ impl Engine {
 	pub(crate) fn with_initial_file(mut self, initial_file: Option<String>) -> Self {
 		self.initial_file = initial_file;
 		self
+	}
+
+	pub(crate) fn with_host_events(
+		mut self,
+		host_events: super::host_event::HostEventSender,
+	) -> Self {
+		self.host_events = Some(host_events);
+		self
+	}
+
+	/// Emit an ordered frontend event. A departed frontend is an ordinary
+	/// shutdown condition, so delivery failure is deliberately ignored.
+	#[allow(dead_code)]
+	pub(super) fn emit_host_event(&self, event: super::host_event::HostEvent) {
+		if let Some(sender) = self.host_events.as_ref() {
+			let _ = sender.send(event);
+		}
 	}
 
 	pub(crate) fn with_rune_host_config(

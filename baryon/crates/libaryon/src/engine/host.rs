@@ -52,6 +52,7 @@ pub struct EngineHandle {
 	input: InputSender,
 	internal: InternalSender,
 	viewports: Option<mpsc::Receiver<Viewport>>,
+	host_events: Option<mpsc::Receiver<super::host_event::HostEvent>>,
 	engine_thread: Option<thread::JoinHandle<()>>,
 	bridge_thread: Option<thread::JoinHandle<()>>,
 	terminate: Arc<AtomicBool>,
@@ -62,6 +63,7 @@ impl EngineHandle {
 	pub fn spawn(config: EngineConfig) -> Self {
 		let (commands, input, internal, rx_request) = super::request::channel();
 		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+		let (tx_host_events, rx_host_events) = super::host_event::channel();
 		let (tx_io_notify, rx_io_notify) =
 			mpsc::channel::<crate::svp::resolver::ResolverNotification>();
 
@@ -128,6 +130,7 @@ impl EngineHandle {
 			settings.language_themes,
 		)
 		.with_initial_file(initial_file)
+		.with_host_events(tx_host_events)
 		.with_rune_host_config(init_script.map(super::rune_host::RuneHostConfig::new));
 		let terminate = engine.termination_handle();
 		let engine_thread = thread::spawn(move || engine.run());
@@ -137,6 +140,7 @@ impl EngineHandle {
 			input,
 			internal,
 			viewports: Some(rx_view),
+			host_events: Some(rx_host_events),
 			engine_thread: Some(engine_thread),
 			bridge_thread: Some(bridge_thread),
 			terminate,
@@ -154,6 +158,16 @@ impl EngineHandle {
 
 	pub fn take_viewports(&mut self) -> Option<mpsc::Receiver<Viewport>> {
 		self.viewports.take()
+	}
+
+	/// Ordered, non-coalescing engine-to-frontend events. Unlike
+	/// [`Self::take_viewports`], this stream must not be coalesced: it carries
+	/// occurrences that must be observed exactly once and in order. Drain it
+	/// frequently. Has one consumer, so it transfers on first call.
+	pub fn take_host_events(
+		&mut self,
+	) -> Option<mpsc::Receiver<super::host_event::HostEvent>> {
+		self.host_events.take()
 	}
 
 	pub fn shutdown(mut self) -> thread::Result<()> {
@@ -218,6 +232,23 @@ pub fn supported_languages() -> Vec<LanguageInfo> {
 #[cfg(test)]
 mod tests {
 	use super::{EngineConfig, EngineHandle, build_language_registry, supported_languages};
+
+	#[test]
+	fn host_event_stream_transfers_to_a_single_consumer() {
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		// The stream is exposed alongside viewports and, like them, has one
+		// consumer: it transfers on first call and is absent afterwards.
+		let events = handle.take_host_events();
+		assert!(events.is_some(), "engine exposes a host-event stream");
+		assert!(
+			handle.take_host_events().is_none(),
+			"host-event stream has a single consumer"
+		);
+		// No producer exists yet, so an idle engine emits nothing.
+		let events = events.expect("host event receiver");
+		assert!(events.try_recv().is_err(), "idle engine emits no host events");
+		handle.shutdown().expect("engine thread");
+	}
 	use crate::core::DocLine;
 	use crate::engine::shadow::{discard_shadow_session, load_shadow_session, shadow_dir_for_path};
 	use crate::engine::{

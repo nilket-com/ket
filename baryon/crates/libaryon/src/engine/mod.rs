@@ -8,6 +8,7 @@ mod file_browser;
 mod folding;
 mod git;
 mod host;
+mod host_event;
 pub mod index;
 mod input;
 // The engine-level job substrate is intentionally wired before the Rune jobs
@@ -44,6 +45,7 @@ pub mod undo;
 pub(crate) use self::core::MAX_SEMANTIC_BYTES;
 pub use self::document::selection::resolve_visual_ranges;
 pub use self::host::{EngineConfig, EngineHandle, supported_languages};
+pub use self::host_event::{HostEvent, HostPanelDescriptor, HostPanelId, PanelRevision};
 pub use self::input::{InputCompletionStatus, InputEvent, InputProjection, KeyCode, Modifiers};
 pub use self::input::{help_topic_hint, render_cli_help};
 pub use self::layout::{GutterNumbering, VisibleRow};
