@@ -69,6 +69,10 @@ pub enum EditorMsg {
 	Click,
 	/// Pointer released; ends a divider drag.
 	Release,
+	/// A pane header captured the press. Header-local handling is important:
+	/// native table/dashboard widgets may capture pointer events before the
+	/// workspace-wide mouse area sees them.
+	PaneDragStarted(libaryon::core::PaneId),
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -428,6 +432,10 @@ impl CodeEditor {
 					self.begin_pane_drag();
 				}
 			}
+			EditorMsg::PaneDragStarted(pane_id) => {
+				self.send(EditorCommand::FocusPane(pane_id));
+				self.begin_pane_drag_for(pane_id);
+			}
 			EditorMsg::Release => {
 				self.drag = None;
 				self.finish_pane_drag();
@@ -476,7 +484,7 @@ impl CodeEditor {
 				.host_panel
 				.as_ref()
 				.map_or("SQL", |panel| panel.title.as_str());
-			let content = pane_surface(title, focused, palette, content);
+			let content = pane_surface(pane.pane_id, title, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
@@ -628,12 +636,19 @@ impl CodeEditor {
 			rect.contains(pointer) && pointer.y < rect.y + PANE_HEADER_HEIGHT
 		});
 		if let Some(pane) = pane {
-			self.pane_drag = Some(PaneDrag {
-				source: pane.pane_id,
-				origin: pointer,
-				target: None,
-			});
+			self.begin_pane_drag_for(pane.pane_id);
 		}
+	}
+
+	fn begin_pane_drag_for(&mut self, source: libaryon::core::PaneId) {
+		let Some(origin) = self.last_pointer else {
+			return;
+		};
+		self.pane_drag = Some(PaneDrag {
+			source,
+			origin,
+			target: None,
+		});
 	}
 
 	/// Recompute the drop target from the current projected pane rectangles.
@@ -1208,6 +1223,7 @@ fn panel_message<'a>(body: String, tint: Color) -> Element<'a, EditorMsg> {
 /// Common workspace chrome. Its header is intentionally simple: a stable drag
 /// handle now, and the future home of pane tabs and close controls.
 fn pane_surface<'a>(
+	pane_id: libaryon::core::PaneId,
 	title: &str,
 	focused: bool,
 	palette: UiPalette,
@@ -1225,19 +1241,23 @@ fn pane_surface<'a>(
 	});
 	container(
 		column![
-			container(
-				text(format!("⠿⠿  {title}"))
-					.font(EDITOR_FONT)
-					.size(13.0)
-					.color(color(palette.tab_text)),
+			mouse_area(
+				container(
+					text(format!("⠿⠿  {title}"))
+						.font(EDITOR_FONT)
+						.size(13.0)
+						.color(color(palette.tab_text)),
+				)
+				.padding([2, 7])
+				.width(Length::Fill)
+				.height(Length::Fixed(PANE_HEADER_HEIGHT))
+				.style(move |_| container::Style {
+					background: Some(Background::Color(header_background)),
+					..Default::default()
+				}),
 			)
-			.padding([2, 7])
-			.width(Length::Fill)
-			.height(Length::Fixed(PANE_HEADER_HEIGHT))
-			.style(move |_| container::Style {
-				background: Some(Background::Color(header_background)),
-				..Default::default()
-			}),
+			.on_press(EditorMsg::PaneDragStarted(pane_id))
+			.on_release(EditorMsg::Release),
 			content,
 		]
 		.width(Length::Fill)
@@ -1455,6 +1475,19 @@ fn positioned<'a>(
 /// Baryon before children see the key, which is a deliberate architectural
 /// change and not a local one. See `plans/wip/notebook-with-panes.md`.
 fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
+	// Pointer motion/release is observed at the root so a workspace pane drag
+	// begun in a header continues while the cursor crosses native table or
+	// dashboard widgets that capture their own pointer events. These messages
+	// are inert unless the editor has an active drag.
+	match event {
+		Event::Mouse(mouse::Event::CursorMoved { position }) => {
+			return Some(EditorMsg::PointerMoved(*position));
+		}
+		Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+			return Some(EditorMsg::Release);
+		}
+		_ => {}
+	}
 	let Event::Keyboard(keyboard::Event::KeyPressed {
 		modified_key,
 		modifiers,
