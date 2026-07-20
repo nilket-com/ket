@@ -48,6 +48,12 @@ pub enum EditorMsg {
 	MinimapGoto(DocLine),
 	PointerMoved(iced::Point),
 	Click,
+	/// DISPOSABLE: host-pane probe click. See `mod probe`.
+	Probe(libaryon::core::PaneId),
+	/// DISPOSABLE: host-pane probe divider drag. See `mod probe`.
+	ProbePointer(iced::Point),
+	ProbePress,
+	ProbeRelease,
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -71,6 +77,8 @@ pub struct CodeEditor {
 	/// editor traffic must stay local while the application closes its window.
 	quit_requested: bool,
 	quit_notified: bool,
+	/// DISPOSABLE: host-pane probe state. See `mod probe`.
+	probe: probe::State,
 }
 
 impl CodeEditor {
@@ -94,6 +102,7 @@ impl CodeEditor {
 			status_message: None,
 			quit_requested: false,
 			quit_notified: false,
+			probe: probe::State::default(),
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -105,6 +114,9 @@ impl CodeEditor {
 			virtual_path: Some("statement.sql".to_owned()),
 		});
 		editor.request_content();
+		if probe::enabled() {
+			editor.send(probe::open_command());
+		}
 		editor
 	}
 
@@ -131,7 +143,11 @@ impl CodeEditor {
 
 		let start = usize::try_from(pane.cursor_line_start_byte.get()).ok()?;
 		let tail = std::str::from_utf8(source.get(start..)?).ok()?;
-		Some(tail.split_once('\n').map_or(tail, |(line, _)| line).to_owned())
+		Some(
+			tail.split_once('\n')
+				.map_or(tail, |(line, _)| line)
+				.to_owned(),
+		)
 	}
 
 	/// Latest engine status line, if one arrived since the last input.
@@ -220,8 +236,10 @@ impl CodeEditor {
 				}
 				// The application owns these execution shortcuts. Do not also send
 				// their Enter key through libaryon's insert-mode keymap.
-				if matches!(modified_key.as_ref(), Key::Named(keyboard::key::Named::Enter))
-					&& (modifiers.shift() || modifiers.control())
+				if matches!(
+					modified_key.as_ref(),
+					Key::Named(keyboard::key::Named::Enter)
+				) && (modifiers.shift() || modifiers.control())
 				{
 					return None;
 				}
@@ -313,11 +331,31 @@ impl CodeEditor {
 				self.last_pointer = Some(position);
 			}
 			EditorMsg::Click => self.click_at_pointer(),
+			EditorMsg::Probe(pane_id) => {
+				self.probe.clicks = self.probe.clicks.saturating_add(1);
+				self.send(probe::focus_command(pane_id));
+			}
+			EditorMsg::ProbePointer(point) => {
+				self.probe.pointer_moved(point);
+				// Continuous resize: every pointer sample while a divider is
+				// held becomes a boundary target, so the split tracks the
+				// cursor exactly as a native drag would.
+				if let Some(command) = self.probe.drag_command() {
+					self.send(command);
+				}
+			}
+			EditorMsg::ProbePress => {
+				self.probe.press(self.viewport.as_ref());
+			}
+			EditorMsg::ProbeRelease => self.probe.release(),
 		}
 		Task::none()
 	}
 
 	pub fn view(&self) -> Element<'_, EditorMsg> {
+		if probe::enabled() {
+			return probe::view(self.viewport.as_ref(), &self.probe, self.status_message());
+		}
 		let Some(viewport) = self.viewport.as_ref() else {
 			return container(
 				text("Starting editor…")
@@ -432,37 +470,7 @@ impl CodeEditor {
 		} else {
 			editor_rows.into()
 		};
-		// Mirror baryon's status-bar prompt: `:` command, `/` search, and
-		// pending confirm questions all use the same bottom bar. Non-Normal
-		// modes without a prompt still announce themselves vim-style, since
-		// the block cursor is otherwise the only modal feedback. An active
-		// prompt outranks the engine's latest status line, which outranks the
-		// mode indicator — the vim cmdline ordering.
-		let prompt = match viewport.input.mode {
-			EditorMode::Command => Some(format!(":{}", viewport.input.prompt_buffer)),
-			EditorMode::Search => Some(format!("/{}", viewport.input.prompt_buffer)),
-			EditorMode::Confirm => Some(
-				viewport
-					.confirm_prompt
-					.clone()
-					.unwrap_or_else(|| "Confirm? [y/n]".to_owned()),
-			),
-			EditorMode::Insert | EditorMode::Visual { .. } | EditorMode::Normal
-				if self.status_message().is_some() =>
-			{
-				self.status_message().map(str::to_owned)
-			}
-			EditorMode::Insert => Some("-- INSERT --".to_owned()),
-			EditorMode::Visual { kind, .. } => Some(
-				match kind {
-					VisualKind::Char => "-- VISUAL --",
-					VisualKind::Line => "-- VISUAL LINE --",
-					VisualKind::Block => "-- VISUAL BLOCK --",
-				}
-				.to_owned(),
-			),
-			EditorMode::Normal => None,
-		};
+		let prompt = prompt_line(viewport, self.status_message());
 		let content: Element<'_, EditorMsg> = if let Some(prompt) = prompt {
 			stack![
 				editor_content,
@@ -774,6 +782,40 @@ fn color(color: Rgb) -> Color {
 	Color::from_rgb8(color.r, color.g, color.b)
 }
 
+/// The bottom-bar text for the current engine state: `:` command, `/` search,
+/// and pending confirm questions all use the same line. Non-Normal modes
+/// without a prompt still announce themselves vim-style, since the block cursor
+/// is otherwise the only modal feedback. An active prompt outranks the engine's
+/// latest status line, which outranks the mode indicator — the vim cmdline
+/// ordering.
+fn prompt_line(viewport: &Viewport, status_message: Option<&str>) -> Option<String> {
+	match viewport.input.mode {
+		EditorMode::Command => Some(format!(":{}", viewport.input.prompt_buffer)),
+		EditorMode::Search => Some(format!("/{}", viewport.input.prompt_buffer)),
+		EditorMode::Confirm => Some(
+			viewport
+				.confirm_prompt
+				.clone()
+				.unwrap_or_else(|| "Confirm? [y/n]".to_owned()),
+		),
+		EditorMode::Insert | EditorMode::Visual { .. } | EditorMode::Normal
+			if status_message.is_some() =>
+		{
+			status_message.map(str::to_owned)
+		}
+		EditorMode::Insert => Some("-- INSERT --".to_owned()),
+		EditorMode::Visual { kind, .. } => Some(
+			match kind {
+				VisualKind::Char => "-- VISUAL --",
+				VisualKind::Line => "-- VISUAL LINE --",
+				VisualKind::Block => "-- VISUAL BLOCK --",
+			}
+			.to_owned(),
+		),
+		EditorMode::Normal => None,
+	}
+}
+
 /// Project libaryon's prompt line (`:` command, `/` search, or a confirm
 /// question). The engine remains responsible for editing and executing the
 /// buffer; this is intentionally display-only so its modal key handling
@@ -950,6 +992,38 @@ mod tests {
 	}
 
 	#[test]
+	fn prompt_line_orders_prompt_above_status_above_mode() {
+		use super::prompt_line;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let viewport = editor.viewport.as_ref().expect("viewport");
+
+		// Normal mode, no status: nothing to show.
+		assert_eq!(prompt_line(viewport, None), None);
+		// A status line outranks the (absent) mode indicator.
+		assert_eq!(
+			prompt_line(viewport, Some("No file name")).as_deref(),
+			Some("No file name")
+		);
+
+		// An active `:` prompt outranks a pending status message.
+		send_keys(&mut editor, [':', 'w']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|v| prompt_line(v, Some("stale")).as_deref() != Some(":w"))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		assert_eq!(prompt_line(viewport, Some("stale")).as_deref(), Some(":w"));
+	}
+
+	#[test]
 	fn engine_status_messages_surface_and_clear_on_the_next_input() {
 		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
@@ -988,8 +1062,14 @@ mod tests {
 			editor.poll();
 			thread::sleep(Duration::from_millis(5));
 		}
-		assert!(editor.quit_requested, "`:q` must reach the Polariton bridge");
-		assert!(editor.quit_notified, "the close request must be consumed once");
+		assert!(
+			editor.quit_requested,
+			"`:q` must reach the Polariton bridge"
+		);
+		assert!(
+			editor.quit_notified,
+			"the close request must be consumed once"
+		);
 		assert!(!editor.take_quit_request(), "quit requests are one-shot");
 
 		// The engine has already exited, so this must be ignored locally rather
@@ -1011,7 +1091,8 @@ mod tests {
 			.viewport
 			.as_ref()
 			.and_then(|viewport| viewport.focused_pane())
-			.is_none() && Instant::now() < deadline
+			.is_none()
+			&& Instant::now() < deadline
 		{
 			editor.poll();
 			thread::sleep(Duration::from_millis(5));
@@ -1296,7 +1377,10 @@ mod tests {
 	fn execution_text_uses_the_current_line_or_visual_selection() {
 		let mut editor = CodeEditor::new("select 1;\nselect 2;");
 		wait_for_content(&mut editor, "select 1;\nselect 2;");
-		assert_eq!(editor.selected_or_current_line().as_deref(), Some("select 1;"));
+		assert_eq!(
+			editor.selected_or_current_line().as_deref(),
+			Some("select 1;")
+		);
 
 		send_keys(&mut editor, ['j']);
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -1310,7 +1394,10 @@ mod tests {
 			editor.poll();
 			thread::sleep(Duration::from_millis(5));
 		}
-		assert_eq!(editor.selected_or_current_line().as_deref(), Some("select 2;"));
+		assert_eq!(
+			editor.selected_or_current_line().as_deref(),
+			Some("select 2;")
+		);
 
 		send_keys(&mut editor, ['v', 'l']);
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -1382,5 +1469,502 @@ mod tests {
 				.is_some_and(|viewport| matches!(viewport.input.mode, EditorMode::Visual { .. }))
 		);
 		assert_eq!(editor.cached_content(), "select 1;");
+	}
+}
+
+// ============================================================================
+// DISPOSABLE: Stage A host-pane feel probe.
+//
+// Purpose and acceptance criteria: plans/wip/notebook-with-panes.md.
+// This answers "does Baryon-mediated, cell-quantized, asynchronous layout feel
+// right for big visual panes?" WITHOUT the ~60-site `HostPanel` engine change.
+// It binds a native interactive surface to a real engine-managed pane (a pinned
+// markdown preview opened via `ShowMarkdownDocument`), so splits, tabs, close,
+// focus, and resize are genuinely Baryon's — not a mock layout.
+//
+// It deliberately teaches production rendering nothing: the whole probe lives in
+// this module behind `POLARITON_HOST_PANE_PROBE=1`, and the pane rendering here
+// is intentionally crude. Delete this module and its three call sites
+// (`probe::enabled()` in `new`, `view`, and the `EditorMsg::Probe` arm) to
+// remove the probe entirely.
+// ============================================================================
+mod probe {
+	use super::{EditorMsg, metrics};
+	use iced::widget::{Space, column, container, mouse_area, row, stack, text};
+	use iced::{Background, Color, Element, Length};
+	use libaryon::core::PaneId;
+	use libaryon::engine::{EditorCommand, SplitDirection};
+	use libaryon::uast::Viewport;
+	use libaryon::uast::projection::PaneViewport;
+
+	const TITLE: &str = "host-pane-probe";
+	/// Sentinel body used to recognize the probe's pane in the projection.
+	const MARKER: &str = "<!-- polariton host-pane probe -->";
+
+	pub(super) fn enabled() -> bool {
+		std::env::var_os("POLARITON_HOST_PANE_PROBE").is_some()
+	}
+
+	pub(super) fn open_command() -> EditorCommand {
+		EditorCommand::ShowMarkdownDocument {
+			title: TITLE.to_owned(),
+			markdown: MARKER.to_owned(),
+		}
+	}
+
+	#[derive(Default)]
+	pub(super) struct State {
+		pub(super) clicks: u32,
+		pointer: Option<iced::Point>,
+		drag: Option<Drag>,
+	}
+
+	#[derive(Clone, Copy)]
+	struct Divider {
+		before: PaneId,
+		after: PaneId,
+		axis: SplitDirection,
+	}
+
+	#[derive(Clone, Copy)]
+	struct Drag {
+		divider: Divider,
+		/// Distance from the grabbed point to the boundary, so the divider
+		/// tracks the cursor instead of jumping to it.
+		grab_offset: u32,
+	}
+
+	/// Pointer pixel position -> engine cell coordinates.
+	fn cell_at(point: iced::Point) -> (u32, u32) {
+		(
+			(point.x.max(0.0) / metrics::CELL_WIDTH) as u32,
+			(point.y.max(0.0) / metrics::LINE_HEIGHT) as u32,
+		)
+	}
+
+	/// Port of baryon's `divider_under_mouse_in_rects` (ui/mouse.rs): find the
+	/// split boundary the cursor sits in, by looking for a pane-sized gap.
+	fn divider_at(viewport: &Viewport, column: u32, row: u32) -> Option<Divider> {
+		let rects = viewport
+			.panes
+			.iter()
+			.map(|pane| (pane.pane_id, pane.rect))
+			.collect::<Vec<_>>();
+
+		let spans_row = |rect: &libaryon::core::PaneRect| {
+			row >= rect.screen_row.get() && row < rect.bottom().get()
+		};
+		let left = rects
+			.iter()
+			.filter(|(_, rect)| spans_row(rect) && rect.right().get() <= column)
+			.max_by_key(|(_, rect)| rect.right().get());
+		let right = rects
+			.iter()
+			.filter(|(_, rect)| spans_row(rect) && rect.screen_col.get() > column)
+			.min_by_key(|(_, rect)| rect.screen_col.get());
+		if let (Some((before, left)), Some((after, right))) = (left, right)
+			&& right.screen_col.get().saturating_sub(left.right().get())
+				== libaryon::core::SPLIT_DIVIDER_COLS
+		{
+			return Some(Divider {
+				before: *before,
+				after: *after,
+				axis: SplitDirection::Vertical,
+			});
+		}
+
+		let spans_column = |rect: &libaryon::core::PaneRect| {
+			column >= rect.screen_col.get() && column < rect.right().get()
+		};
+		let above = rects
+			.iter()
+			.filter(|(_, rect)| spans_column(rect) && rect.bottom().get() <= row)
+			.max_by_key(|(_, rect)| rect.bottom().get());
+		let below = rects
+			.iter()
+			.filter(|(_, rect)| spans_column(rect) && rect.screen_row.get() > row)
+			.min_by_key(|(_, rect)| rect.screen_row.get());
+		if let (Some((before, above)), Some((after, below))) = (above, below)
+			&& below.screen_row.get().saturating_sub(above.bottom().get())
+				== libaryon::core::SPLIT_DIVIDER_ROWS
+		{
+			return Some(Divider {
+				before: *before,
+				after: *after,
+				axis: SplitDirection::Horizontal,
+			});
+		}
+		None
+	}
+
+	impl State {
+		pub(super) fn pointer_moved(&mut self, point: iced::Point) {
+			self.pointer = Some(point);
+		}
+
+		/// Begin a drag if the press landed in a divider gap. Returns false
+		/// when the press was not on a divider, so nothing else changes.
+		pub(super) fn press(&mut self, viewport: Option<&Viewport>) -> bool {
+			let (Some(viewport), Some(point)) = (viewport, self.pointer) else {
+				return false;
+			};
+			let (column, row) = cell_at(point);
+			let Some(divider) = divider_at(viewport, column, row) else {
+				return false;
+			};
+			let boundary = viewport
+				.panes
+				.iter()
+				.find(|pane| pane.pane_id == divider.before)
+				.map(|pane| match divider.axis {
+					SplitDirection::Vertical => pane.rect.right().get(),
+					SplitDirection::Horizontal => pane.rect.bottom().get(),
+				})
+				.unwrap_or_default();
+			let position = match divider.axis {
+				SplitDirection::Vertical => column,
+				SplitDirection::Horizontal => row,
+			};
+			self.drag = Some(Drag {
+				divider,
+				grab_offset: position.saturating_sub(boundary),
+			});
+			true
+		}
+
+		pub(super) fn release(&mut self) {
+			self.drag = None;
+		}
+
+		/// The resize command for the current pointer position, if dragging.
+		pub(super) fn drag_command(&self) -> Option<EditorCommand> {
+			let drag = self.drag?;
+			let point = self.pointer?;
+			let (column, row) = cell_at(point);
+			let position = match drag.divider.axis {
+				SplitDirection::Vertical => column,
+				SplitDirection::Horizontal => row,
+			};
+			Some(EditorCommand::ResizePaneBoundary {
+				before: drag.divider.before,
+				after: drag.divider.after,
+				axis: drag.divider.axis,
+				target: position.saturating_sub(drag.grab_offset),
+			})
+		}
+	}
+
+	fn is_probe_pane(pane: &PaneViewport) -> bool {
+		pane.markdown_preview
+			.as_ref()
+			.is_some_and(|preview| preview.source_text.trim() == MARKER)
+	}
+
+	/// Place a fixed-size element at a pixel offset. Spacers rather than
+	/// absolute positioning keep this dependency-free and obviously temporary.
+	fn positioned<'a>(
+		x: f32,
+		y: f32,
+		width: f32,
+		height: f32,
+		content: Element<'a, EditorMsg>,
+	) -> Element<'a, EditorMsg> {
+		column![
+			Space::new().height(Length::Fixed(y)),
+			row![
+				Space::new().width(Length::Fixed(x)),
+				container(content)
+					.width(Length::Fixed(width))
+					.height(Length::Fixed(height)),
+			],
+		]
+		.into()
+	}
+
+	/// The native interactive surface. Clicking it both performs a local
+	/// interaction (the counter) and requests workspace focus from Baryon —
+	/// acceptance criterion 1, focus handoff.
+	fn probe_surface<'a>(
+		pane: &PaneViewport,
+		focused: bool,
+		state: &State,
+	) -> Element<'a, EditorMsg> {
+		let pane_id = pane.pane_id;
+		let body = format!(
+			"HOST PANE PROBE\n\nworkspace focus: {}\nlocal clicks: {}\n\npane {:?}  view {:?}\ncells {}x{} at ({}, {})\npixels {:.0}x{:.0}\n\nclick to take focus\n:vsplit  :split  gt  :q  resize window",
+			if focused { "YES" } else { "no" },
+			state.clicks,
+			pane.pane_id,
+			pane.view_id,
+			pane.rect.width.get(),
+			pane.rect.height.get(),
+			pane.rect.screen_col.get(),
+			pane.rect.screen_row.get(),
+			pane.rect.width.get() as f32 * metrics::CELL_WIDTH,
+			pane.rect.height.get() as f32 * metrics::LINE_HEIGHT,
+		);
+		let fill = if focused {
+			Color::from_rgb8(0x2a, 0x1a, 0x4a)
+		} else {
+			Color::from_rgb8(0x16, 0x12, 0x22)
+		};
+		let border = if focused {
+			Color::from_rgb8(0xc0, 0x6c, 0xff)
+		} else {
+			Color::from_rgb8(0x44, 0x3a, 0x55)
+		};
+		mouse_area(
+			container(
+				text(body)
+					.font(super::EDITOR_FONT)
+					.size(metrics::TEXT_SIZE)
+					.color(Color::from_rgb8(0xe8, 0xe0, 0xf5)),
+			)
+			.padding(12)
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.style(move |_| container::Style {
+				background: Some(Background::Color(fill)),
+				border: iced::Border {
+					color: border,
+					width: 2.0,
+					radius: 0.0.into(),
+				},
+				..Default::default()
+			}),
+		)
+		.on_press(EditorMsg::Probe(pane_id))
+		.into()
+	}
+
+	/// Deliberately crude stand-in for non-probe panes: enough to see geometry
+	/// and focus, nothing that production rendering should learn from.
+	fn pane_stub<'a>(pane: &PaneViewport, focused: bool) -> Element<'a, EditorMsg> {
+		let sample = String::from_utf8_lossy(
+			&pane
+				.tokens
+				.iter()
+				.flat_map(|token| token.text.iter().copied())
+				.take(160)
+				.collect::<Vec<_>>(),
+		)
+		.into_owned();
+		let body = format!(
+			"[{}] pane {:?} view {:?}  {}x{} at ({}, {})\n\n{sample}",
+			if focused { "focused" } else { "        " },
+			pane.pane_id,
+			pane.view_id,
+			pane.rect.width.get(),
+			pane.rect.height.get(),
+			pane.rect.screen_col.get(),
+			pane.rect.screen_row.get(),
+		);
+		container(
+			text(body)
+				.font(super::EDITOR_FONT)
+				.size(metrics::TEXT_SIZE)
+				.color(Color::from_rgb8(0x9a, 0x93, 0xa8)),
+		)
+		.padding(6)
+		.width(Length::Fill)
+		.height(Length::Fill)
+		.style(move |_| container::Style {
+			background: Some(Background::Color(if focused {
+				Color::from_rgb8(0x14, 0x14, 0x18)
+			} else {
+				Color::from_rgb8(0x0c, 0x0c, 0x10)
+			})),
+			border: iced::Border {
+				color: Color::from_rgb8(0x33, 0x33, 0x3d),
+				width: 1.0,
+				radius: 0.0.into(),
+			},
+			..Default::default()
+		})
+		.into()
+	}
+
+	/// Render *every* projected pane at its engine-assigned rect. This is the
+	/// point of the probe: layout topology is Baryon's, pixels are Polariton's.
+	pub(super) fn view<'a>(
+		viewport: Option<&'a Viewport>,
+		state: &'a State,
+		status_message: Option<&'a str>,
+	) -> Element<'a, EditorMsg> {
+		let Some(viewport) = viewport else {
+			return container(text("host-pane probe: waiting for first viewport"))
+				.width(Length::Fill)
+				.height(Length::Fill)
+				.into();
+		};
+		let mut layers: Vec<Element<'a, EditorMsg>> = Vec::with_capacity(viewport.panes.len() + 1);
+		layers.push(
+			container(Space::new())
+				.width(Length::Fill)
+				.height(Length::Fill)
+				.style(|_| container::Style {
+					background: Some(Background::Color(Color::from_rgb8(0x06, 0x06, 0x08))),
+					..Default::default()
+				})
+				.into(),
+		);
+		for pane in &viewport.panes {
+			let focused = pane.pane_id == viewport.focused_pane_id;
+			let content = if is_probe_pane(pane) {
+				probe_surface(pane, focused, state)
+			} else {
+				pane_stub(pane, focused)
+			};
+			layers.push(positioned(
+				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
+				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
+				pane.rect.width.get() as f32 * metrics::CELL_WIDTH,
+				pane.rect.height.get() as f32 * metrics::LINE_HEIGHT,
+				content,
+			));
+		}
+		// The probe bypasses the production view, so it must re-supply the
+		// command/status line itself — otherwise `:vsplit` is invisible while
+		// being typed and keyboard workflow cannot be judged. Same helper and
+		// same widget as production, so behavior matches exactly.
+		// Divider gaps are not covered by any pane widget, so a surrounding
+		// mouse_area receives those presses; the panes' own mouse_areas still
+		// capture clicks inside their bounds.
+		let panes = mouse_area(stack(layers).width(Length::Fill).height(Length::Fill))
+			.on_move(EditorMsg::ProbePointer)
+			.on_press(EditorMsg::ProbePress)
+			.on_release(EditorMsg::ProbeRelease);
+		match super::prompt_line(viewport, status_message) {
+			Some(prompt) => stack![
+				panes,
+				container(super::command_bar(prompt, viewport.ui_palette))
+					.width(Length::Fill)
+					.height(Length::Fill)
+					.align_y(iced::alignment::Vertical::Bottom),
+			]
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.into(),
+			None => panes.into(),
+		}
+	}
+
+	pub(super) fn focus_command(pane_id: PaneId) -> EditorCommand {
+		EditorCommand::FocusPane(pane_id)
+	}
+}
+
+#[cfg(test)]
+mod probe_verify {
+	use super::{CodeEditor, probe};
+	use std::time::{Duration, Instant};
+
+	#[test]
+	fn divider_drag_targets_the_boundary_between_the_split_panes() {
+		use super::metrics;
+
+		let mut editor = CodeEditor::new("select 1;");
+		editor.send(probe::open_command());
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|v| v.panes.len() < 2)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			std::thread::sleep(Duration::from_millis(5));
+		}
+
+		let (left_id, right_id, gap_column, row) = {
+			let viewport = editor.viewport.as_ref().expect("viewport");
+			let mut panes = viewport.panes.iter().collect::<Vec<_>>();
+			panes.sort_by_key(|pane| pane.rect.screen_col.get());
+			let left = panes[0];
+			let right = panes[1];
+			// The engine leaves a divider-sized gap between split panes.
+			let gap = right.rect.screen_col.get() - left.rect.right().get();
+			assert_eq!(
+				gap,
+				libaryon::core::SPLIT_DIVIDER_COLS,
+				"vertical divider gap"
+			);
+			(
+				left.pane_id,
+				right.pane_id,
+				left.rect.right().get() + 1,
+				left.rect.screen_row.get() + 2,
+			)
+		};
+
+		// Press inside the divider gap starts a drag on that boundary.
+		let point = |column: u32, row: u32| {
+			iced::Point::new(
+				column as f32 * metrics::CELL_WIDTH,
+				row as f32 * metrics::LINE_HEIGHT,
+			)
+		};
+		editor.probe.pointer_moved(point(gap_column, row));
+		assert!(
+			editor.probe.press(editor.viewport.as_ref()),
+			"press inside the divider gap must start a drag"
+		);
+
+		let libaryon::engine::EditorCommand::ResizePaneBoundary {
+			before,
+			after,
+			target,
+			..
+		} = editor.probe.drag_command().expect("dragging")
+		else {
+			panic!("divider drag must produce a boundary resize");
+		};
+		assert_eq!((before, after), (left_id, right_id));
+
+		// Dragging left moves the boundary left by the same number of cells,
+		// and the grab offset keeps the divider under the cursor.
+		editor.probe.pointer_moved(point(gap_column - 10, row));
+		let libaryon::engine::EditorCommand::ResizePaneBoundary { target: moved, .. } =
+			editor.probe.drag_command().expect("still dragging")
+		else {
+			panic!("divider drag must produce a boundary resize");
+		};
+		assert_eq!(moved, target - 10);
+
+		// A press outside any gap must not start a drag.
+		editor.probe.release();
+		editor.probe.pointer_moved(point(2, row));
+		assert!(!editor.probe.press(editor.viewport.as_ref()));
+		assert!(editor.probe.drag_command().is_none());
+	}
+
+	#[test]
+	fn probe_pane_appears_with_its_own_rect() {
+		let mut editor = CodeEditor::new("select 1;");
+		editor.send(probe::open_command());
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|v| v.panes.len() < 2)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		eprintln!("panes = {}", viewport.panes.len());
+		for pane in &viewport.panes {
+			eprintln!(
+				"  pane {:?} view {:?} rect {}x{} at ({},{}) preview={} focused={}",
+				pane.pane_id,
+				pane.view_id,
+				pane.rect.width.get(),
+				pane.rect.height.get(),
+				pane.rect.screen_col.get(),
+				pane.rect.screen_row.get(),
+				pane.markdown_preview.is_some(),
+				pane.pane_id == viewport.focused_pane_id,
+			);
+		}
+		assert!(viewport.panes.len() >= 2, "probe must open a second pane");
+		assert!(
+			viewport.panes.iter().any(|p| p.markdown_preview.is_some()),
+			"one pane must be the probe preview"
+		);
 	}
 }
