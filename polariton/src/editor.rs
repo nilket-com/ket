@@ -175,7 +175,13 @@ impl CodeEditor {
 	/// on later runs reuse the same identity with a fresh revision so results
 	/// replace in place rather than multiplying panes.
 	pub fn begin_query(&mut self) {
-		let known = self.panels.panels.contains_key(&RESULT_PANEL);
+		// A panel awaiting disposal is already gone from the engine even though
+		// the registry still holds it until a projection agrees, so refreshing
+		// it would address a pane that no longer exists. Reopening is correct
+		// in that window; unconditional reopening is not, because the engine
+		// focuses an existing panel and every rerun would steal focus.
+		let known = self.panels.panels.contains_key(&RESULT_PANEL)
+			&& !self.panels.pending_disposal.contains(&RESULT_PANEL);
 		let revision = PanelRevision::new(self.result_revision.saturating_add(1));
 		self.result_revision = revision.get();
 		if known {
@@ -1460,6 +1466,55 @@ mod tests {
 	}
 
 	#[test]
+	fn a_rerun_during_pending_disposal_reopens_rather_than_refreshing() {
+		use super::{PanelContent, RESULT_PANEL};
+		use libaryon::engine::HostEvent;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+
+		// Reproduce the window the deferred-release rule opens: the disposal
+		// event has been drained, but the projection still shows the panel, so
+		// the registry still holds it.
+		let viewport = editor.viewport.take().expect("viewport");
+		editor.panels.reconcile(
+			&[HostEvent::PanelDisposed {
+				panel_id: RESULT_PANEL,
+			}],
+			Some(&viewport),
+		);
+		editor.viewport = Some(viewport);
+		assert!(editor.panels.panels.contains_key(&RESULT_PANEL));
+		assert!(editor.panels.pending_disposal.contains(&RESULT_PANEL));
+
+		// A rerun here must reopen, not refresh a pane the engine has dropped.
+		editor.begin_query();
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|v| !v.panes.iter().any(|pane| pane.host_panel.is_some()))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.is_some_and(|v| v.panes.iter().any(|pane| pane.host_panel.is_some())),
+			"the results panel exists after a rerun during pending disposal"
+		);
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Running
+		));
+	}
+
+	#[test]
 	fn divider_drag_uses_engine_published_hit_rects() {
 		use libaryon::engine::HostPanelId;
 
@@ -1571,6 +1626,78 @@ mod tests {
 			panic!("a failed query retains its panel");
 		};
 		assert!(message.contains("slect"));
+	}
+
+	#[test]
+	fn running_again_after_closing_the_result_pane_recreates_it() {
+		use super::{PanelContent, RESULT_PANEL};
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		editor.set_query_result(polars::df!("n" => [1i64]).expect("frame"));
+
+		// Close the results pane specifically — `ClosePane` acts on the focused
+		// pane, and opening a panel does not steal focus, so focus it first or
+		// this closes the editor instead and proves nothing.
+		let panel_pane = editor
+			.viewport
+			.as_ref()
+			.and_then(|v| {
+				v.panes
+					.iter()
+					.find(|pane| pane.host_panel.is_some())
+					.map(|pane| pane.pane_id)
+			})
+			.expect("panel pane");
+		editor.send(EditorCommand::FocusPane(panel_pane));
+		editor.send(EditorCommand::ClosePane);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|v| v.panes.iter().any(|pane| pane.host_panel.is_some()))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.is_some_and(|v| !v.panes.iter().any(|pane| pane.host_panel.is_some())),
+			"the results pane is actually closed"
+		);
+
+		// Disposal is deferred until a projection agrees, so a rerun issued
+		// before reconciliation may still see the panel in the registry — the
+		// case where a naive "refresh if known" would address a pane the engine
+		// has already dropped.
+		editor.begin_query();
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|v| !v.panes.iter().any(|pane| pane.host_panel.is_some()))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.is_some_and(|v| v.panes.iter().any(|pane| pane.host_panel.is_some())),
+			"a rerun after closing the pane must recreate it"
+		);
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Running
+		));
 	}
 
 	#[test]
