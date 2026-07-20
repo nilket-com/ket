@@ -178,8 +178,8 @@ pub const M04_SQL: &str = "SELECT l_returnflag, COUNT(1) AS row_count FROM linei
 	GROUP BY l_returnflag";
 pub const M05_SQL: &str = "SELECT l_orderkey, COUNT(1) AS row_count FROM lineitem \
 	GROUP BY l_orderkey";
-pub const M06_SQL: &str = "SELECT COUNT(1) AS row_count FROM lineitem, orders \
-	WHERE l_orderkey = o_orderkey";
+pub const M06_SQL: &str = "SELECT COUNT(l_orderkey) AS row_count FROM lineitem \
+	INNER JOIN orders ON l_orderkey = o_orderkey";
 
 /// strict q14 — identical shape to the dev proxy; the `lineitem` fixture carries official
 /// `Decimal128(15,2)` types instead of `Float64`.

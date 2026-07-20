@@ -4787,7 +4787,45 @@ async fn ladder_command(args: &[String]) -> ExitCode {
 			let mut samples = Vec::new();
 			let mut last: Option<serde_json::Value> = None;
 			let mut failure = None;
+			// DuckDB has no perf-run-one child; it runs through its own rail,
+			// which already produces one row per run over the same parquet views.
+			if *engine == PerfEngine::DuckDb {
+				match run_duckdb_perf_rows(
+					primitive,
+					mode,
+					sf,
+					runs,
+					warmup,
+					&output_dir,
+					data_source,
+					&data_dir,
+				) {
+					Ok(duck_rows) => {
+						for row in &duck_rows {
+							if row.get("warmup").and_then(serde_json::Value::as_bool) == Some(true)
+							{
+								continue;
+							}
+							if row.get("status").and_then(serde_json::Value::as_str) != Some("pass")
+							{
+								failure = Some(row.to_string());
+								break;
+							}
+							if let Some(value) =
+								row.get("execute_ms").and_then(serde_json::Value::as_f64)
+							{
+								samples.push(value);
+							}
+							last = Some(row.clone());
+						}
+					}
+					Err(message) => failure = Some(message),
+				}
+			}
 			for index in 0..(warmup + runs) {
+				if *engine == PerfEngine::DuckDb {
+					break;
+				}
 				let warm = index < warmup;
 				match run_perf_child(
 					*engine,
