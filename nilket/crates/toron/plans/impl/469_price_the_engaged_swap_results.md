@@ -48,3 +48,20 @@ stays as 468 set it — the regression is immaterial under the sealed rule and t
 is one cell of six — but the first price is negative, and the five unpriced engaged
 cells (q02, q11, q14, q19, q20) are now each one cheap cohort away. Flipping the
 default is a decision for that fuller picture, not this receipt.
+
+## Batch addendum: the five remaining engaged cells (protocol runs, no new ADR)
+
+Same protocol, same coordinates, one serial detached batch. All gates passed
+(plans distinct, digests equal), all journals 21/21, zero walls.
+
+| cell (sf=1) | HL OFF−ON | 95% interval | rel. of OFF median | verdict |
+|---|---:|---:|---:|---|
+| q02 | +103.9 ms | [90.9, 116.2] | +17.1% | material win |
+| q11 | +104.2 ms | [95.6, 112.5] | +22.5% | material win |
+| q14 | −619.1 ms | [−634.7, −600.5] | −195.0% | material regression |
+| q17 (prior) | −47.4 ms | [−90.8, −27.7] | −2.4% | detectable regression, immaterial |
+| q19 | −669.0 ms | [−694.1, −644.5] | −77.5% | material regression |
+| q20 | +3.0 ms | [−6.7, 26.8] | +0.2% | undetectable |
+
+The combined evidence forces a default-policy decision (two material wins, two
+material regressions with the worst at 3× slower): taken up as ADR 470.
