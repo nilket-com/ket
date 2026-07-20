@@ -1230,11 +1230,16 @@ impl Executor {
 				.collect::<Vec<_>>();
 			// ADR 476: one reusable key buffer for the whole batch — a probe that
 			// hits an existing group now allocates nothing.
+			// ADR 477: one reader per group column per batch.
+			let group_readers = group_arrays
+				.iter()
+				.map(group_array_reader)
+				.collect::<Result<Vec<_>, _>>()?;
 			let mut key = Vec::with_capacity(group_arrays.len());
 			for row in 0..batch.num_rows() {
 				key.clear();
-				for array in group_arrays.iter() {
-					key.push(group_value(array, row)?);
+				for reader in group_readers.iter() {
+					key.push(reader.value(row));
 				}
 				let states = groups.entry_or_init(&key, aggr_expr.len(), || {
 					init_states(aggr_expr, &aggr_arrays)
@@ -1462,11 +1467,15 @@ impl Executor {
 					.and_then(|array| numeric_array_reader(array).ok())
 			})
 			.collect::<Vec<_>>();
+		let group_readers = group_arrays
+			.iter()
+			.map(group_array_reader)
+			.collect::<Result<Vec<_>, _>>()?;
 		let mut key = Vec::with_capacity(group_arrays.len());
 		for row in 0..batch.num_rows() {
 			key.clear();
-			for array in group_arrays.iter() {
-				key.push(group_value(array, row)?);
+			for reader in group_readers.iter() {
+				key.push(reader.value(row));
 			}
 			let states =
 				groups.entry_or_init(&key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
@@ -1795,6 +1804,109 @@ fn first_arg_type(call: &BoundAggregateCall) -> Result<&DataType, ExecutionError
 		.ok_or_else(|| ExecutionError::InvalidExpression {
 			message: format!("{:?} requires one argument", call.function),
 		})
+}
+
+/// ADR 477: a group column's concrete type resolved **once per batch**, so key
+/// extraction stops paying a twelve-branch `as_any().downcast_ref()` chain per row
+/// (ADR 476 isolated that chain as grouping's remaining per-row cost). The variant
+/// set, conversions, canonicalisation, null contract, and error text mirror
+/// [`group_value`] exactly — both resolve through this one place so they cannot
+/// drift. `GroupValue` ownership is deliberately unchanged: a Utf8 key still owns
+/// its `String` (ADR 477 scope note).
+pub(in crate::exec) enum GroupArrayReader<'a> {
+	Boolean(&'a BooleanArray),
+	Int32(&'a Int32Array),
+	Int64(&'a Int64Array),
+	Float32(&'a Float32Array),
+	Float64(&'a Float64Array),
+	Date32(&'a Date32Array),
+	TimestampMillisecond(&'a TimestampMillisecondArray),
+	TimestampMicrosecond(&'a TimestampMicrosecondArray),
+	TimestampNanosecond(&'a TimestampNanosecondArray),
+	Utf8(&'a StringArray),
+	Decimal128(&'a Decimal128Array),
+}
+
+impl GroupArrayReader<'_> {
+	pub(in crate::exec) fn value(&self, row: usize) -> GroupValue {
+		let null = match self {
+			Self::Boolean(array) => array.is_null(row),
+			Self::Int32(array) => array.is_null(row),
+			Self::Int64(array) => array.is_null(row),
+			Self::Float32(array) => array.is_null(row),
+			Self::Float64(array) => array.is_null(row),
+			Self::Date32(array) => array.is_null(row),
+			Self::TimestampMillisecond(array) => array.is_null(row),
+			Self::TimestampMicrosecond(array) => array.is_null(row),
+			Self::TimestampNanosecond(array) => array.is_null(row),
+			Self::Utf8(array) => array.is_null(row),
+			Self::Decimal128(array) => array.is_null(row),
+		};
+		if null {
+			return GroupValue::Null;
+		}
+		match self {
+			Self::Boolean(array) => GroupValue::Boolean(array.value(row)),
+			Self::Int32(array) => GroupValue::Int32(array.value(row)),
+			Self::Int64(array) => GroupValue::Int64(array.value(row)),
+			Self::Float32(array) => GroupValue::Float32(canonical_group_f32_bits(array.value(row))),
+			Self::Float64(array) => GroupValue::Float64(canonical_group_f64_bits(array.value(row))),
+			Self::Date32(array) => GroupValue::Date32(array.value(row)),
+			Self::TimestampMillisecond(array) => {
+				GroupValue::Timestamp(TimeUnit::Millisecond, array.value(row))
+			}
+			Self::TimestampMicrosecond(array) => {
+				GroupValue::Timestamp(TimeUnit::Microsecond, array.value(row))
+			}
+			Self::TimestampNanosecond(array) => {
+				GroupValue::Timestamp(TimeUnit::Nanosecond, array.value(row))
+			}
+			Self::Utf8(array) => GroupValue::Utf8(array.value(row).to_string()),
+			Self::Decimal128(array) => GroupValue::Decimal128(array.value(row)),
+		}
+	}
+}
+
+pub(in crate::exec) fn group_array_reader(
+	array: &ArrayRef,
+) -> Result<GroupArrayReader<'_>, ExecutionError> {
+	let any = array.as_any();
+	if let Some(array) = any.downcast_ref::<BooleanArray>() {
+		return Ok(GroupArrayReader::Boolean(array));
+	}
+	if let Some(array) = any.downcast_ref::<Int32Array>() {
+		return Ok(GroupArrayReader::Int32(array));
+	}
+	if let Some(array) = any.downcast_ref::<Int64Array>() {
+		return Ok(GroupArrayReader::Int64(array));
+	}
+	if let Some(array) = any.downcast_ref::<Float32Array>() {
+		return Ok(GroupArrayReader::Float32(array));
+	}
+	if let Some(array) = any.downcast_ref::<Float64Array>() {
+		return Ok(GroupArrayReader::Float64(array));
+	}
+	if let Some(array) = any.downcast_ref::<Date32Array>() {
+		return Ok(GroupArrayReader::Date32(array));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMillisecondArray>() {
+		return Ok(GroupArrayReader::TimestampMillisecond(array));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMicrosecondArray>() {
+		return Ok(GroupArrayReader::TimestampMicrosecond(array));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampNanosecondArray>() {
+		return Ok(GroupArrayReader::TimestampNanosecond(array));
+	}
+	if let Some(array) = any.downcast_ref::<StringArray>() {
+		return Ok(GroupArrayReader::Utf8(array));
+	}
+	if let Some(array) = any.downcast_ref::<Decimal128Array>() {
+		return Ok(GroupArrayReader::Decimal128(array));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("unsupported GROUP BY type: {:?}", array.data_type()),
+	})
 }
 
 pub(in crate::exec) fn group_value(
@@ -3401,6 +3513,47 @@ mod tests {
 		);
 	}
 	// ADR 275: group_value reads a Decimal128 key as the raw i128 (NULL handled by the leading null-check).
+	#[test]
+	fn adr477_reader_matches_group_value_for_every_supported_type() {
+		use arrow::array::{
+			BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+			TimestampMillisecondArray,
+		};
+		// Parity across the whole variant set, nulls included: the reader and the
+		// per-row path must resolve identically or grouping silently diverges.
+		let arrays: Vec<ArrayRef> = vec![
+			Arc::new(BooleanArray::from(vec![Some(true), None])),
+			Arc::new(Int64Array::from(vec![Some(7), None])),
+			Arc::new(Float64Array::from(vec![Some(-0.0), None])),
+			Arc::new(Date32Array::from(vec![Some(19_000), None])),
+			Arc::new(TimestampMillisecondArray::from(vec![Some(1_700_000), None])),
+			Arc::new(StringArray::from(vec![Some("R"), None])),
+			Arc::new(
+				Decimal128Array::from(vec![Some(12_345i128), None])
+					.with_precision_and_scale(15, 2)
+					.expect("decimal array"),
+			),
+		];
+		for array in arrays {
+			let reader = group_array_reader(&array).expect("reader");
+			for row in 0..array.len() {
+				assert_eq!(
+					reader.value(row),
+					group_value(&array, row).expect("group value"),
+					"reader/group_value parity at row {row}"
+				);
+			}
+		}
+		// Unsupported types keep the identical error text.
+		let unsupported: ArrayRef = Arc::new(arrow::array::UInt8Array::from(vec![1u8]));
+		let reader_err = match group_array_reader(&unsupported) {
+			Err(error) => error.to_string(),
+			Ok(_) => panic!("unsupported GROUP BY type must not resolve"),
+		};
+		let value_err = group_value(&unsupported, 0).unwrap_err().to_string();
+		assert_eq!(reader_err, value_err);
+	}
+
 	#[test]
 	fn group_value_reads_decimal128_raw_i128() {
 		let array: ArrayRef = Arc::new(
