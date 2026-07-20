@@ -138,13 +138,18 @@ impl BoundGroupedAggregateGroups {
 		}
 	}
 
+	/// ADR 476: the probe key is borrowed. Every lookup path below already works
+	/// on `&[GroupValue]`; only insertion needs an owned key, so a hit costs no
+	/// allocation at all (48M rows finding three groups previously allocated 48M
+	/// vectors). Resident accounting is unchanged: the guard still charges the
+	/// owned key it actually stores.
 	pub(in crate::exec) fn entry_or_init(
 		&mut self,
-		key: Vec<GroupValue>,
+		key: &[GroupValue],
 		state_count: usize,
 		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
 	) -> Result<&mut Vec<AggState>, ExecutionError> {
-		let lookup = self.state.lookup_entry(&key)?;
+		let lookup = self.state.lookup_entry(key)?;
 		if let Some(profile) = self.state.profile.as_mut() {
 			profile.record_lookup(lookup.probes, lookup.entry.is_some());
 			if lookup.probes > 0 {
@@ -171,7 +176,7 @@ impl BoundGroupedAggregateGroups {
 		if self.state.keys.len() == self.state.entry_limit {
 			self.state.grow()?;
 		}
-		let vacant = self.state.find_bucket(&key)?;
+		let vacant = self.state.find_bucket(key)?;
 		if vacant.entry.is_some() {
 			return Err(table_error("vacant grouped-fold lookup became occupied"));
 		}
@@ -183,6 +188,10 @@ impl BoundGroupedAggregateGroups {
 				self.state.entry_limit,
 			);
 		}
+		// Own the key only now, on the insert path. `to_vec()` yields
+		// capacity == len exactly as the previous `collect()` did, so the
+		// charged bytes are identical.
+		let key = key.to_vec();
 		let key_bytes = group_key_resident_bytes(&key);
 		let requested_state_bytes = capacity_bytes::<AggState>(state_count);
 		self.state.guard(
@@ -1092,7 +1101,7 @@ mod tests {
 		for (key, count) in [(3, 30), (1, 10), (2, 20), (1, 11), (4, 40)] {
 			for groups in [&mut disabled, &mut enabled] {
 				let states = groups
-					.entry_or_init(vec![GroupValue::Int64(key)], 1, || Ok(count_state(count)))
+					.entry_or_init(&[GroupValue::Int64(key)], 1, || Ok(count_state(count)))
 					.expect("fold group");
 				if let AggState::Count(value) = &mut states[0] {
 					*value += 1;
@@ -1128,10 +1137,10 @@ mod tests {
 			Some(directory.clone().into_os_string())
 		});
 		groups
-			.entry_or_init(vec![GroupValue::Int64(1)], 1, || Ok(count_state(10)))
+			.entry_or_init(&[GroupValue::Int64(1)], 1, || Ok(count_state(10)))
 			.expect("first vacant insert");
 		groups
-			.entry_or_init(vec![GroupValue::Int64(1)], 1, || Ok(count_state(11)))
+			.entry_or_init(&[GroupValue::Int64(1)], 1, || Ok(count_state(11)))
 			.expect("occupied lookup");
 
 		let mask = groups.state.buckets.len() - 1;
@@ -1150,15 +1159,13 @@ mod tests {
 			})
 			.expect("find a colliding test key");
 		groups
-			.entry_or_init(vec![GroupValue::Int64(collision)], 1, || {
-				Ok(count_state(20))
-			})
+			.entry_or_init(&[GroupValue::Int64(collision)], 1, || Ok(count_state(20)))
 			.expect("colliding vacant insert");
 		let third = (2..10_000)
 			.find(|candidate| *candidate != collision)
 			.expect("third test key");
 		groups
-			.entry_or_init(vec![GroupValue::Int64(third)], 1, || Ok(count_state(30)))
+			.entry_or_init(&[GroupValue::Int64(third)], 1, || Ok(count_state(30)))
 			.expect("growth and rehash insert");
 
 		let profile = groups.state.profile.as_ref().expect("enabled profile");
@@ -1245,7 +1252,7 @@ mod tests {
 		});
 		for (key, count) in [(3, 30), (1, 10), (2, 20)] {
 			groups
-				.entry_or_init(vec![GroupValue::Int64(key)], 1, || Ok(count_state(count)))
+				.entry_or_init(&[GroupValue::Int64(key)], 1, || Ok(count_state(count)))
 				.expect("insert group");
 		}
 		let entries = groups.finalize_sorted().expect("sorted entries");
@@ -1291,7 +1298,7 @@ mod tests {
 			Some(sink.clone().into_os_string())
 		});
 		groups
-			.entry_or_init(vec![GroupValue::Int64(1)], 1, || Ok(count_state(1)))
+			.entry_or_init(&[GroupValue::Int64(1)], 1, || Ok(count_state(1)))
 			.expect("insert group");
 		let entries = groups.finalize_sorted().expect("finalize groups");
 		drop(entries);
@@ -1311,7 +1318,7 @@ mod tests {
 		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
 		for key in [1, 2] {
 			groups
-				.entry_or_init(vec![GroupValue::Int64(key)], 1, || Ok(count_state(key)))
+				.entry_or_init(&[GroupValue::Int64(key)], 1, || Ok(count_state(key)))
 				.expect("initial insert");
 		}
 		let current = groups.current_resident_bytes();
@@ -1322,7 +1329,7 @@ mod tests {
 		groups.set_growth_budget_bytes(Some(projected - 1));
 		let mut init_called = false;
 		let error = groups
-			.entry_or_init(vec![GroupValue::Int64(3)], 1, || {
+			.entry_or_init(&[GroupValue::Int64(3)], 1, || {
 				init_called = true;
 				Ok(count_state(3))
 			})
@@ -1361,7 +1368,7 @@ mod tests {
 
 		groups.set_growth_budget_bytes(Some(projected));
 		groups
-			.entry_or_init(vec![GroupValue::Int64(3)], 1, || Ok(count_state(3)))
+			.entry_or_init(&[GroupValue::Int64(3)], 1, || Ok(count_state(3)))
 			.expect("exact projected peak admits growth");
 		assert_eq!(groups.len(), 3);
 		assert_eq!(

@@ -1228,12 +1228,15 @@ impl Executor {
 						.and_then(|array| numeric_array_reader(array).ok())
 				})
 				.collect::<Vec<_>>();
+			// ADR 476: one reusable key buffer for the whole batch — a probe that
+			// hits an existing group now allocates nothing.
+			let mut key = Vec::with_capacity(group_arrays.len());
 			for row in 0..batch.num_rows() {
-				let key = group_arrays
-					.iter()
-					.map(|array| group_value(array, row))
-					.collect::<Result<Vec<_>, _>>()?;
-				let states = groups.entry_or_init(key, aggr_expr.len(), || {
+				key.clear();
+				for array in group_arrays.iter() {
+					key.push(group_value(array, row)?);
+				}
+				let states = groups.entry_or_init(&key, aggr_expr.len(), || {
 					init_states(aggr_expr, &aggr_arrays)
 				})?;
 				for ((state, input), reader) in states
@@ -1459,13 +1462,14 @@ impl Executor {
 					.and_then(|array| numeric_array_reader(array).ok())
 			})
 			.collect::<Vec<_>>();
+		let mut key = Vec::with_capacity(group_arrays.len());
 		for row in 0..batch.num_rows() {
-			let key = group_arrays
-				.iter()
-				.map(|array| group_value(array, row))
-				.collect::<Result<Vec<_>, _>>()?;
+			key.clear();
+			for array in group_arrays.iter() {
+				key.push(group_value(array, row)?);
+			}
 			let states =
-				groups.entry_or_init(key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
+				groups.entry_or_init(&key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
 			for ((state, input), reader) in states
 				.iter_mut()
 				.zip(aggr_arrays.iter())
