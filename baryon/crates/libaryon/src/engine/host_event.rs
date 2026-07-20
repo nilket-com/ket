@@ -83,6 +83,8 @@ pub enum HostEvent {
 	///
 	/// Emitted once per panel identity, not once per visible reference, so a
 	/// panel restored into two splits announces itself a single time.
+	///
+	/// No producer yet: this arrives with layout persistence for host panels.
 	PanelRestored {
 		panel_id: HostPanelId,
 		descriptor: HostPanelDescriptor,

@@ -2950,8 +2950,8 @@ pub(crate) struct EditorSession {
 	pub(crate) persistent_settings: SettingsPersistent,
 	pub(crate) next_pane_id: PaneId,
 	pub(crate) next_view_id: ViewId,
-	/// Panels whose last workspace reference disappeared since the last drain.
-	disposed_panels: Vec<HostPanelId>,
+	/// Ordered frontend events queued since the last drain.
+	pending_host_events: Vec<crate::engine::HostEvent>,
 	pub(crate) next_semantic_request_id: RequestId,
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
@@ -3417,7 +3417,7 @@ impl EditorSession {
 			persistent_settings,
 			next_pane_id: PaneId::new(2),
 			next_view_id: initial_view_id.next(),
-			disposed_panels: Vec::new(),
+			pending_host_events: Vec::new(),
 			next_semantic_request_id: RequestId::new(1),
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
@@ -3468,15 +3468,15 @@ impl EditorSession {
 		self.buffers.host_panel_buffer_id(panel_id)
 	}
 
-	/// Record that a panel's last workspace reference is gone. Drained by the
-	/// run loop into `HostEvent::PanelDisposed`; accumulated here so buffer
-	/// release does not need the event sender threaded into it.
-	pub(crate) fn note_panel_disposed(&mut self, panel_id: HostPanelId) {
-		self.disposed_panels.push(panel_id);
+	/// Queue an ordered frontend event. Accumulated on the session so producers
+	/// scattered through command dispatch and buffer release do not each need
+	/// the event sender threaded into them; the run loop drains in order.
+	pub(crate) fn queue_host_event(&mut self, event: crate::engine::HostEvent) {
+		self.pending_host_events.push(event);
 	}
 
-	pub(crate) fn take_disposed_panels(&mut self) -> Vec<HostPanelId> {
-		std::mem::take(&mut self.disposed_panels)
+	pub(crate) fn take_host_events(&mut self) -> Vec<crate::engine::HostEvent> {
+		std::mem::take(&mut self.pending_host_events)
 	}
 
 	pub(crate) fn create_unnamed_text_view(

@@ -742,7 +742,7 @@ fn release_buffer(
 	// the panel's last workspace reference disappearing.
 	if let Some(panel) = buffer.host_panel() {
 		let panel_id = panel.panel_id;
-		session.note_panel_disposed(panel_id);
+		session.queue_host_event(crate::engine::HostEvent::PanelDisposed { panel_id });
 	}
 	if let BufferContent::Text(document) = &mut buffer.content {
 		if let Some(shadow) = document.shadow.take() {
@@ -1840,6 +1840,10 @@ fn dispatch_command(
 					.and_then(|buffer| buffer.host_panel_mut())
 			{
 				panel.revision = revision;
+				session.queue_host_event(crate::engine::HostEvent::PanelRebound {
+					panel_id,
+					revision,
+				});
 				needs_render = true;
 			}
 		}
@@ -3158,9 +3162,9 @@ pub(crate) fn run_engine(engine: Engine) {
 			session.emit_text_lifecycle_since(lifecycle_before);
 			// Ordered, non-coalescing: panel disposals must reach the frontend
 			// exactly once, so they never ride the viewport projection.
-			for panel_id in session.take_disposed_panels() {
+			for event in session.take_host_events() {
 				if let Some(sender) = host_events.as_ref() {
-					let _ = sender.send(super::host_event::HostEvent::PanelDisposed { panel_id });
+					let _ = sender.send(event);
 				}
 			}
 			needs_render |= dispatch.needs_render;

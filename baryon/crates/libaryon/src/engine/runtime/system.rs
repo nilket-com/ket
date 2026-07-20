@@ -5145,6 +5145,63 @@ mod tests {
 	}
 
 	#[test]
+	fn host_panel_lifecycle_reaches_the_frontend_in_order() {
+		use crate::engine::{
+			EngineConfig, EngineHandle, HostEvent, HostPanelId, PanelRevision,
+		};
+		use std::time::Duration;
+
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		let commands = handle.command_sender();
+		let events = handle.take_host_events().expect("host event stream");
+		let panel_id = HostPanelId::new(11);
+
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id,
+				kind: "result-table".to_string(),
+				title: "Results".to_string(),
+			})
+			.expect("open panel");
+		commands
+			.send(EditorCommand::RefreshHostPanel {
+				panel_id,
+				revision: PanelRevision::new(3),
+			})
+			.expect("rebind panel");
+		commands
+			.send(EditorCommand::ClosePane)
+			.expect("close the panel pane");
+		std::thread::sleep(Duration::from_millis(300));
+
+		// Real Stage B producers, drained in emission order off the
+		// non-coalescing stream — not merely the sender's unit tests.
+		let observed = events
+			.try_iter()
+			.filter(|event| {
+				matches!(
+					event,
+					HostEvent::PanelRebound { panel_id: id, .. }
+						| HostEvent::PanelDisposed { panel_id: id }
+					if *id == panel_id
+				)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			observed,
+			vec![
+				HostEvent::PanelRebound {
+					panel_id,
+					revision: PanelRevision::new(3)
+				},
+				HostEvent::PanelDisposed { panel_id },
+			]
+		);
+
+		handle.shutdown().expect("engine thread");
+	}
+
+	#[test]
 	fn closing_a_host_panel_emits_exactly_one_disposal() {
 		use crate::engine::{EngineConfig, EngineHandle, HostEvent, HostPanelId};
 		use std::time::Duration;
