@@ -16,12 +16,12 @@ use toron_tpch::telemetry::{
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
 	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
-	gauge_memory_per_task, gauge_spill_bytes_reserved, generate_dev_lineitem,
-	load_persisted_tpch_dataset, matrix, normalize_duckdb_type, parse_scale_factor,
-	prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	gauge_hash_smaller_build, gauge_memory_per_task, gauge_spill_bytes_reserved,
+	generate_dev_lineitem, load_persisted_tpch_dataset, matrix, normalize_duckdb_type,
+	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
+	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
+	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -164,6 +164,10 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Ok(budget) => budget,
 		Err(message) => return harness_error(&message),
 	};
+	let (hash_smaller_build, hash_smaller_build_provenance) = match gauge_hash_smaller_build() {
+		Ok(setting) => setting,
+		Err(message) => return harness_error(&message),
+	};
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
@@ -283,6 +287,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["memory_per_task_provenance"] = serde_json::json!(memory_provenance);
 	row["spill_bytes_reserved"] = serde_json::json!(spill_bytes_reserved);
 	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
+	row["hash_smaller_build"] = serde_json::json!(hash_smaller_build);
+	row["hash_smaller_build_provenance"] = serde_json::json!(hash_smaller_build_provenance);
 	println!("{row}");
 	ExitCode::SUCCESS
 }
@@ -431,9 +437,14 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Ok(queries) => queries,
 		Err(message) => return harness_error(&message),
 	};
+	let paired_switch = paired_switch_from_args(args);
 	let gate_zero = if flag_present(args, "--paired-ablation") {
-		if queries != vec!["q05"] {
+		let default_switch = paired_switch.env == PAIRED_DEFAULT_ENV;
+		if default_switch && queries != vec!["q05"] {
 			return harness_error("--paired-ablation currently requires --query q05");
+		}
+		if !default_switch && queries.len() != 1 {
+			return harness_error("--paired-ablation with --paired-env requires a single query");
 		}
 		let dataset_fingerprint = match load_persisted_tpch_dataset(mode, sf, &data_dir) {
 			Ok(dataset) => dataset.manifest_fingerprint,
@@ -443,12 +454,19 @@ async fn perf_command(args: &[String]) -> ExitCode {
 				));
 			}
 		};
-		match run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir) {
+		let gate = if default_switch {
+			run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir)
+		} else {
+			run_adr469_plan_gate(queries[0], mode, sf, data_source, &data_dir, &paired_switch)
+		};
+		match gate {
 			Ok(mut record) if record["passed"] == true => {
 				record["dataset_fingerprint"] = serde_json::json!(dataset_fingerprint);
 				Some(record)
 			}
-			Ok(record) => return harness_error(&format!("ADR 449 gate zero failed: {record}")),
+			Ok(record) => {
+				return harness_error(&format!("paired ablation gate failed: {record}"));
+			}
 			Err(message) => return harness_error(&message),
 		}
 	} else {
@@ -474,6 +492,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			runs,
 			warmup,
 			&gate_fingerprint,
+			&paired_switch,
 		) {
 			Ok(journal) => Some(journal),
 			Err(message) => return harness_error(&message),
@@ -510,7 +529,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 							data_source,
 							&data_dir,
 							if flag_present(args, "--paired-ablation") {
-								Some(false)
+								Some((&paired_switch, false))
 							} else {
 								None
 							},
@@ -542,7 +561,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 							data_source,
 							&data_dir,
 							if flag_present(args, "--paired-ablation") {
-								Some(paired_ablation_arm(run_index as u32))
+								Some((&paired_switch, paired_ablation_arm(run_index as u32)))
 							} else {
 								None
 							},
@@ -1308,7 +1327,7 @@ fn run_perf_child_with_ablation(
 	warmup: bool,
 	data_source: &str,
 	data_dir: &Path,
-	ablate_filter: Option<bool>,
+	ablate_filter: Option<(&PairedSwitch, bool)>,
 ) -> Result<serde_json::Value, String> {
 	let mut args = vec![
 		"perf-run-one".to_string(),
@@ -1331,17 +1350,21 @@ fn run_perf_child_with_ablation(
 		args.push("--warmup-run".to_string());
 	}
 	let mut row = match ablate_filter {
-		Some(ablate) => run_perf_child_args_with_envs(
+		Some((switch, off_arm)) => run_perf_child_args_with_envs(
 			&args,
 			&[(
-				"TORON_ABLATE_LOCAL_RUNTIME_FILTER",
-				if ablate { "1" } else { "0" },
+				switch.env.as_str(),
+				if off_arm {
+					switch.off_value.as_str()
+				} else {
+					switch.on_value.as_str()
+				},
 			)],
 		)?,
 		None => run_perf_child_args(&args)?,
 	};
-	if let Some(ablate) = ablate_filter {
-		row["ablation_arm"] = serde_json::json!(if ablate { "off" } else { "on" });
+	if let Some((_, off_arm)) = ablate_filter {
+		row["ablation_arm"] = serde_json::json!(if off_arm { "off" } else { "on" });
 	}
 	Ok(row)
 }
@@ -3565,6 +3588,7 @@ fn prepare_paired_ablation_journal(
 	runs: usize,
 	warmup: usize,
 	dataset_fingerprint: &str,
+	switch: &PairedSwitch,
 ) -> Result<PairedAblationJournal, String> {
 	if dataset_fingerprint.is_empty() {
 		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
@@ -3594,6 +3618,9 @@ fn prepare_paired_ablation_journal(
 		// like a resume across datasets.
 		"memory_per_task": memory_per_task,
 		"spill_bytes_reserved": spill_bytes_reserved,
+		"switch_env": switch.env,
+		"switch_on_value": switch.on_value,
+		"switch_off_value": switch.off_value,
 	});
 	if manifest_path.exists() {
 		let bytes = std::fs::read(&manifest_path)
@@ -3738,6 +3765,77 @@ fn flag_present(args: &[String], flag: &str) -> bool {
 	args.iter().any(|arg| arg == flag)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PairedSwitch {
+	env: String,
+	on_value: String,
+	off_value: String,
+}
+
+const PAIRED_DEFAULT_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
+
+fn paired_switch_from_args(args: &[String]) -> PairedSwitch {
+	PairedSwitch {
+		env: flag_value(args, "--paired-env")
+			.unwrap_or(PAIRED_DEFAULT_ENV)
+			.to_string(),
+		// The filter's ON arm disables ablation, hence the inverted defaults.
+		on_value: flag_value(args, "--paired-on").unwrap_or("0").to_string(),
+		off_value: flag_value(args, "--paired-off").unwrap_or("1").to_string(),
+	}
+}
+
+/// ADR 469: the plan-distinctness gate — a non-reservoir switch's analog of gate
+/// zero. Arms must differ in plan fingerprint (the switch does something) and
+/// agree in output digest (it changes shape, never answers).
+fn adr469_plan_gate_passes(on_row: &serde_json::Value, off_row: &serde_json::Value) -> bool {
+	let field = |row: &serde_json::Value, key: &str| {
+		row.get(key)
+			.and_then(serde_json::Value::as_str)
+			.map(ToOwned::to_owned)
+	};
+	on_row.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+		&& off_row.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+		&& field(on_row, "plan_fingerprint").is_some()
+		&& field(on_row, "plan_fingerprint") != field(off_row, "plan_fingerprint")
+		&& field(on_row, "digest").is_some()
+		&& field(on_row, "digest") == field(off_row, "digest")
+}
+
+fn run_adr469_plan_gate(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	switch: &PairedSwitch,
+) -> Result<serde_json::Value, String> {
+	let arm = |value: &str| {
+		run_perf_child_with_envs(
+			query,
+			mode,
+			sf,
+			0,
+			data_source,
+			data_dir,
+			&[(switch.env.as_str(), value)],
+		)
+	};
+	let on_row = arm(&switch.on_value)?;
+	let off_row = arm(&switch.off_value)?;
+	let passed = adr469_plan_gate_passes(&on_row, &off_row);
+	Ok(serde_json::json!({
+		"suite": "adr469_plan_gate",
+		"switch_env": switch.env,
+		"on_value": switch.on_value,
+		"off_value": switch.off_value,
+		"on_plan": on_row.get("plan_fingerprint"),
+		"off_plan": off_row.get("plan_fingerprint"),
+		"digests_match": on_row.get("digest") == off_row.get("digest"),
+		"passed": passed,
+	}))
+}
+
 fn paired_ablation_arm(run_index: u32) -> bool {
 	run_index % 2 == 1
 }
@@ -3828,6 +3926,38 @@ mod tests {
 		assert!(paired_ablation_differences(&wrong_arm).is_err());
 	}
 
+	fn test_paired_switch() -> PairedSwitch {
+		PairedSwitch {
+			env: PAIRED_DEFAULT_ENV.to_string(),
+			on_value: "0".to_string(),
+			off_value: "1".to_string(),
+		}
+	}
+
+	#[test]
+	fn adr469_plan_gate_requires_distinct_plans_and_equal_digests() {
+		let row = |plan: &str, digest: &str, status: &str| serde_json::json!({"plan_fingerprint": plan, "digest": digest, "status": status});
+		// The gate's whole point: arms must differ in plan and agree in answer.
+		assert!(adr469_plan_gate_passes(
+			&row("aaaa", "d1", "pass"),
+			&row("bbbb", "d1", "pass")
+		));
+		// Same plan = the switch did nothing at this cell: refuse.
+		assert!(!adr469_plan_gate_passes(
+			&row("aaaa", "d1", "pass"),
+			&row("aaaa", "d1", "pass")
+		));
+		// Digest mismatch = a correctness defect, never a cohort: refuse.
+		assert!(!adr469_plan_gate_passes(
+			&row("aaaa", "d1", "pass"),
+			&row("bbbb", "d2", "pass")
+		));
+		assert!(!adr469_plan_gate_passes(
+			&row("aaaa", "d1", "fail"),
+			&row("bbbb", "d1", "pass")
+		));
+	}
+
 	#[test]
 	fn adr449_paired_journal_is_durable_and_resume_config_locked() {
 		let directory =
@@ -3844,6 +3974,7 @@ mod tests {
 			20,
 			1,
 			"fnv1a64:cohort",
+			&test_paired_switch(),
 		)
 		.unwrap();
 		journal
@@ -3866,6 +3997,7 @@ mod tests {
 			20,
 			1,
 			"fnv1a64:cohort",
+			&test_paired_switch(),
 		)
 		.unwrap();
 		assert_eq!(resumed.rows.len(), 1);
@@ -3881,6 +4013,7 @@ mod tests {
 				20,
 				1,
 				"fnv1a64:cohort",
+				&test_paired_switch(),
 			)
 			.is_err()
 		);
@@ -3899,6 +4032,7 @@ mod tests {
 				20,
 				1,
 				"fnv1a64:cohort",
+				&test_paired_switch(),
 			)
 			.is_err()
 		);
@@ -3916,12 +4050,22 @@ mod tests {
 				20,
 				1,
 				"fnv1a64:regenerated",
+				&test_paired_switch(),
 			)
 			.is_err()
 		);
 		assert!(
 			prepare_paired_ablation_journal(
-				&directory, "q05", "strict", 4.0, "parquet", data_dir, 20, 1, "",
+				&directory,
+				"q05",
+				"strict",
+				4.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"",
+				&test_paired_switch(),
 			)
 			.is_err()
 		);
@@ -4557,5 +4701,23 @@ mod tests {
 			"output_schema_fingerprint": "schema",
 			"flags": flags,
 		})
+	}
+}
+#[cfg(test)]
+mod adr469_tests {
+	use super::*;
+
+	#[test]
+	fn adr469_hash_smaller_build_knob_contract() {
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
+		assert_eq!(gauge_hash_smaller_build().unwrap(), (true, "default"));
+		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "0") };
+		assert_eq!(gauge_hash_smaller_build().unwrap(), (false, "explicit"));
+		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "1") };
+		assert_eq!(gauge_hash_smaller_build().unwrap(), (true, "explicit"));
+		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "yes") };
+		assert!(gauge_hash_smaller_build().is_err());
+		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
 	}
 }

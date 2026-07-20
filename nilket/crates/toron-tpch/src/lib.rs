@@ -3534,7 +3534,7 @@ async fn execute_logical_with_catalog_timed(
 	let mut plan_fingerprint = None;
 	let mut spill_bytes = 0;
 	let bind_start = Instant::now();
-	let bound = match bind(&logical, &catalog, &PlannerConfig::default()).await {
+	let bound = match bind(&logical, &catalog, &gauge_planner_config()).await {
 		Ok(bound) => bound,
 		Err(error) => {
 			timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
@@ -3610,6 +3610,37 @@ pub fn gauge_memory_per_task() -> Result<(u64, &'static str), String> {
 }
 
 pub const GAUGE_SPILL_BYTES_RESERVED_ENV: &str = "TORON_TPCH_SPILL_BYTES_RESERVED";
+pub const GAUGE_HASH_SMALLER_BUILD_ENV: &str = "TORON_TPCH_HASH_SMALLER_BUILD";
+
+/// The gauge's smaller-build placement setting and its provenance: unset means
+/// the engine default; "0"/"1" are explicit arms. Same loud contract as the
+/// budget knobs.
+pub fn gauge_hash_smaller_build() -> Result<(bool, &'static str), String> {
+	match std::env::var(GAUGE_HASH_SMALLER_BUILD_ENV) {
+		Ok(raw) => match raw.as_str() {
+			"0" => Ok((false, "explicit")),
+			"1" => Ok((true, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_HASH_SMALLER_BUILD_ENV} must be \"0\" or \"1\", got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => Ok((
+			PlannerConfig::default().hash_smaller_build_placement,
+			"default",
+		)),
+		Err(error) => Err(format!("{GAUGE_HASH_SMALLER_BUILD_ENV}: {error}")),
+	}
+}
+
+/// Every gauge bind flows through this constructor so the knob cannot be
+/// silently bypassed.
+pub fn gauge_planner_config() -> PlannerConfig {
+	let mut config = PlannerConfig::default();
+	if let Ok((value, "explicit")) = gauge_hash_smaller_build() {
+		config.hash_smaller_build_placement = value;
+	}
+	config
+}
 
 /// The gauge's per-query spill reserve and its provenance, same contract as
 /// [`gauge_memory_per_task`]: a frontier probe must be able to move one budget
@@ -3867,11 +3898,11 @@ pub async fn rune_q03_isolation_proof_with_data_source(
 		)
 	})?;
 	let (sql_bound, sql_join_decisions, sql_join_order_edges) =
-		bind_with_explain_summary(&sql_logical, &catalog, &PlannerConfig::default())
+		bind_with_explain_summary(&sql_logical, &catalog, &gauge_planner_config())
 			.await
 			.map_err(|error| format!("bind SQL q03 for rune isolation proof failed: {error:?}"))?;
 	let (rune_bound, rune_join_decisions, rune_join_order_edges) =
-		bind_with_explain_summary(&rune_logical, &catalog, &PlannerConfig::default())
+		bind_with_explain_summary(&rune_logical, &catalog, &gauge_planner_config())
 			.await
 			.map_err(|error| format!("bind Rune q03 for rune isolation proof failed: {error:?}"))?;
 	let optimizer_evidence_gap =
@@ -4111,7 +4142,7 @@ pub async fn run_rune_q03_profile_loop_with_data_source(
 	let logical = rune_q03_logical_plan()
 		.await
 		.map_err(|error| format!("plan Rune q03 for profile loop failed: {}", error.message))?;
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+	let bound = bind(&logical, &catalog, &gauge_planner_config())
 		.await
 		.map_err(|error| format!("bind Rune q03 for profile loop failed: {error:?}"))?;
 	let plan_fingerprint = physical_plan_fingerprint(&bound);
@@ -10780,7 +10811,7 @@ pub async fn q18_grouped_membership_join_is_keyed(
 	let logical = SqlPlanner::new()
 		.plan(sql)
 		.map_err(|error| format!("plan q18: {error}"))?;
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+	let bound = bind(&logical, &catalog, &gauge_planner_config())
 		.await
 		.map_err(|error| format!("bind q18: {error:?}"))?;
 	if has_q18_grouped_membership_keyed_join(&bound) {
@@ -11564,7 +11595,7 @@ pub async fn q19_lineitem_part_join_is_keyed(
 	let logical = SqlPlanner::new()
 		.plan(sql)
 		.map_err(|error| format!("plan q19: {error}"))?;
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+	let bound = bind(&logical, &catalog, &gauge_planner_config())
 		.await
 		.map_err(|error| format!("bind q19: {error:?}"))?;
 	if has_q19_lineitem_part_keyed_join(&bound) {
@@ -11893,7 +11924,7 @@ pub async fn q15_supplier_revenue_join_is_keyed(
 	let logical = SqlPlanner::new()
 		.plan(sql)
 		.map_err(|error| format!("plan q15: {error}"))?;
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+	let bound = bind(&logical, &catalog, &gauge_planner_config())
 		.await
 		.map_err(|error| format!("bind q15: {error:?}"))?;
 	if has_q15_supplier_revenue_keyed_join(&bound) {
