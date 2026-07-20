@@ -153,7 +153,9 @@ pub const Q14_DEV_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%
 /// composite results have a denominator. All read `lineitem` except `m06`.
 /// ADR 473: the primitive ladder's members, in cost order. `m01` is retained but
 /// is NOT a scan floor — engines answer `COUNT(1)` from parquet metadata.
-pub const PRIMITIVE_LADDER_IDS: [&str; 7] = ["m00", "m01", "m02", "m03", "m04", "m05", "m06"];
+pub const PRIMITIVE_LADDER_IDS: [&str; 11] = [
+	"m00", "m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10",
+];
 
 /// What each primitive isolates, for the ladder receipt.
 pub fn primitive_ladder_intent(id: &str) -> &'static str {
@@ -165,6 +167,10 @@ pub fn primitive_ladder_intent(id: &str) -> &'static str {
 		"m04" => "low-cardinality grouping (3 groups)",
 		"m05" => "high-cardinality grouping (~12M groups at sf=8)",
 		"m06" => "one equi-join with orders",
+		"m07" => "decimal column decode + null-check (no arithmetic)",
+		"m08" => "Int64 column decode + null-check (no arithmetic)",
+		"m09" => "Int64 decode + integer arithmetic",
+		"m10" => "two-column decimal decode + arithmetic (per-row dispatch width)",
 		_ => "unknown",
 	}
 }
@@ -178,6 +184,11 @@ pub const M04_SQL: &str = "SELECT l_returnflag, COUNT(1) AS row_count FROM linei
 	GROUP BY l_returnflag";
 pub const M05_SQL: &str = "SELECT l_orderkey, COUNT(1) AS row_count FROM lineitem \
 	GROUP BY l_orderkey";
+pub const M07_SQL: &str = "SELECT COUNT(l_quantity) AS decoded FROM lineitem";
+pub const M08_SQL: &str = "SELECT COUNT(l_orderkey) AS decoded FROM lineitem";
+pub const M09_SQL: &str = "SELECT SUM(l_orderkey) AS total FROM lineitem";
+pub const M10_SQL: &str = "SELECT SUM(l_extendedprice * l_discount) AS total FROM lineitem";
+
 pub const M06_SQL: &str = "SELECT COUNT(l_orderkey) AS row_count FROM lineitem \
 	INNER JOIN orders ON l_orderkey = o_orderkey";
 
@@ -2367,7 +2378,9 @@ fn persisted_query_tables(
 
 fn persisted_query_table_names(query: &str) -> Result<Vec<(u64, &'static str)>, String> {
 	let tables = match query {
-		"m00" | "m01" | "m02" | "m03" | "m04" | "m05" => vec![(1, "lineitem")],
+		"m00" | "m01" | "m02" | "m03" | "m04" | "m05" | "m07" | "m08" | "m09" | "m10" => {
+			vec![(1, "lineitem")]
+		}
 		"m06" => vec![(1, "lineitem"), (2, "orders")],
 		"q01" | "q1" | "q06" | "q6" => vec![(1, "lineitem")],
 		"q02" | "q2" => vec![
@@ -5211,6 +5224,10 @@ fn perf_query_sql(
 		"m04" => ("m04", Cow::Borrowed(M04_SQL)),
 		"m05" => ("m05", Cow::Borrowed(M05_SQL)),
 		"m06" => ("m06", Cow::Borrowed(M06_SQL)),
+		"m07" => ("m07", Cow::Borrowed(M07_SQL)),
+		"m08" => ("m08", Cow::Borrowed(M08_SQL)),
+		"m09" => ("m09", Cow::Borrowed(M09_SQL)),
+		"m10" => ("m10", Cow::Borrowed(M10_SQL)),
 		"q01" | "q1" => (
 			"q01",
 			Cow::Borrowed(if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),

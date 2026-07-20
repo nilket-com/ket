@@ -1300,6 +1300,10 @@ fn perf_query_list(query: &str) -> Result<Vec<&'static str>, String> {
 		"m04" => "m04",
 		"m05" => "m05",
 		"m06" => "m06",
+		"m07" => "m07",
+		"m08" => "m08",
+		"m09" => "m09",
+		"m10" => "m10",
 		other => return Err(format!("perf --query {other} is not supported")),
 	};
 	Ok(vec![normalized])
