@@ -1019,6 +1019,21 @@ pub(super) fn mirrored_broadcast_physical_kind(
 
 pub(super) const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2;
 
+/// ADR 471: filter-aware comparison bytes. A byte bound is valid as a bound and
+/// wrong as a size proxy above a filter — filters discount only
+/// `estimated_row_count`, never the byte fields — so the comparison basis scales
+/// by the row-estimate discount when one exists. Admission paths keep raw bounds.
+fn comparison_scaled_bytes(facts: PlanOptimizerFacts, bytes: ByteCount) -> ByteCount {
+	let (Some(estimate), Some(upper)) = (facts.estimated_row_count, facts.row_upper_bound) else {
+		return bytes;
+	};
+	if estimate.get() >= upper.get() || upper.get() == 0 {
+		return bytes;
+	}
+	let scaled = (u128::from(bytes.get()) * u128::from(estimate.get())) / u128::from(upper.get());
+	ByteCount::new(u64::try_from(scaled.max(1)).unwrap_or(u64::MAX))
+}
+
 /// ADR 464: the hash comparator wants raw sizes; the broadcast threshold is a
 /// broadcast admission concern, not a size-comparison one.
 pub(super) fn unthresholded_build_byte_candidate(
@@ -1057,13 +1072,15 @@ pub(super) fn hash_join_decision_with_placement(
 			unthresholded_build_byte_candidate(left_input.facts),
 			unthresholded_build_byte_candidate(right_input.facts),
 		) {
-			if right_build_materially_smaller(left.bytes, right.bytes) {
+			let left_bytes = comparison_scaled_bytes(left_input.facts, left.bytes);
+			let right_bytes = comparison_scaled_bytes(right_input.facts, right.bytes);
+			if right_build_materially_smaller(left_bytes, right_bytes) {
 				return JoinStrategyDecision {
 					strategy: JoinStrategy::HashPartitioned,
 					placement: JoinPhysicalPlacement::SwappedRightBuild,
 					reason: JoinStrategyDecisionReason::HashSmallerBuild {
-						build_bytes: right.bytes,
-						rejected_side_bytes: left.bytes,
+						build_bytes: right_bytes,
+						rejected_side_bytes: left_bytes,
 						fallback: reason,
 					},
 				};

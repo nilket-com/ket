@@ -2175,8 +2175,133 @@ fn table_facts_from_manifest(table: &TpchPersistedTable) -> TableOptimizerFacts 
 	TableOptimizerFacts {
 		row_upper_bound: Some(RowCount::new(table.row_count)),
 		byte_upper_bound: Some(ByteCount::new(table.logical_bytes)),
+		// ADR 471: footer-derived column ranges feed filter selectivity, which
+		// the placement comparison scales by. Metadata-only; ranges that fail to
+		// derive are simply absent (an absent range means an unscaled bound,
+		// never a guess).
+		column_range: column_ranges_from_parquet_footer(&table.path),
 		..Default::default()
 	}
+}
+
+/// Column min/max facts from parquet row-group footer statistics — no data
+/// scan. Only types the selectivity decoder understands are emitted
+/// (INT32/INT64/DATE32/FLOAT32/FLOAT64); everything else is skipped.
+fn column_ranges_from_parquet_footer(
+	path: &std::path::Path,
+) -> BTreeMap<toron::ir::ColumnOrdinal, toron::catalog::RangeFact> {
+	use parquet::file::statistics::Statistics;
+	use wendelon::storage::stats::{
+		ARROW_STATS_TAG_DATE32, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64,
+		ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
+	};
+	use wendelon::storage::stats::{
+		encode_float32_stat_value, encode_float64_stat_value, encode_signed_stat_value,
+	};
+	let Ok(file) = std::fs::File::open(path) else {
+		return BTreeMap::new();
+	};
+	let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) else {
+		return BTreeMap::new();
+	};
+	let arrow_schema = builder.schema().clone();
+	let metadata = builder.metadata().clone();
+	let mut facts = BTreeMap::new();
+	for (ordinal, field) in arrow_schema.fields().iter().enumerate() {
+		let tag = match field.data_type() {
+			DataType::Int32 => ARROW_STATS_TAG_INT32,
+			DataType::Int64 => ARROW_STATS_TAG_INT64,
+			DataType::Date32 => ARROW_STATS_TAG_DATE32,
+			DataType::Float32 => ARROW_STATS_TAG_FLOAT32,
+			DataType::Float64 => ARROW_STATS_TAG_FLOAT64,
+			_ => continue,
+		};
+		let mut min_i: Option<i64> = None;
+		let mut max_i: Option<i64> = None;
+		let mut min_f: Option<f64> = None;
+		let mut max_f: Option<f64> = None;
+		let mut null_count = 0u64;
+		let mut rows = 0u64;
+		let mut complete = true;
+		for group in metadata.row_groups() {
+			rows = rows.saturating_add(group.num_rows().max(0) as u64);
+			let column = group.column(ordinal);
+			let Some(stats) = column.statistics() else {
+				complete = false;
+				break;
+			};
+			null_count = null_count.saturating_add(stats.null_count_opt().unwrap_or(0));
+			match stats {
+				Statistics::Int32(typed) => {
+					let (Some(lo), Some(hi)) = (typed.min_opt(), typed.max_opt()) else {
+						complete = false;
+						break;
+					};
+					min_i = Some(min_i.map_or(*lo as i64, |m| m.min(*lo as i64)));
+					max_i = Some(max_i.map_or(*hi as i64, |m| m.max(*hi as i64)));
+				}
+				Statistics::Int64(typed) => {
+					let (Some(lo), Some(hi)) = (typed.min_opt(), typed.max_opt()) else {
+						complete = false;
+						break;
+					};
+					min_i = Some(min_i.map_or(*lo, |m| m.min(*lo)));
+					max_i = Some(max_i.map_or(*hi, |m| m.max(*hi)));
+				}
+				Statistics::Float(typed) => {
+					let (Some(lo), Some(hi)) = (typed.min_opt(), typed.max_opt()) else {
+						complete = false;
+						break;
+					};
+					min_f = Some(min_f.map_or(*lo as f64, |m| m.min(*lo as f64)));
+					max_f = Some(max_f.map_or(*hi as f64, |m| m.max(*hi as f64)));
+				}
+				Statistics::Double(typed) => {
+					let (Some(lo), Some(hi)) = (typed.min_opt(), typed.max_opt()) else {
+						complete = false;
+						break;
+					};
+					min_f = Some(min_f.map_or(*lo, |m| m.min(*lo)));
+					max_f = Some(max_f.map_or(*hi, |m| m.max(*hi)));
+				}
+				_ => {
+					complete = false;
+					break;
+				}
+			}
+		}
+		if !complete {
+			continue;
+		}
+		let width = if tag == ARROW_STATS_TAG_INT64 || tag == ARROW_STATS_TAG_FLOAT64 {
+			8
+		} else {
+			4
+		};
+		let encoded = |i: Option<i64>, f: Option<f64>| -> Option<Vec<u8>> {
+			if tag == ARROW_STATS_TAG_FLOAT32 {
+				encode_float32_stat_value(f? as f32).ok()
+			} else if tag == ARROW_STATS_TAG_FLOAT64 {
+				encode_float64_stat_value(f?).ok()
+			} else {
+				encode_signed_stat_value(i?, width).ok()
+			}
+		};
+		let (Some(min), Some(max)) = (encoded(min_i, min_f), encoded(max_i, max_f)) else {
+			continue;
+		};
+		facts.insert(
+			toron::ir::ColumnOrdinal(ordinal as u32),
+			toron::catalog::RangeFact {
+				arrow_type_tag: tag,
+				null_count,
+				non_null_count: rows.saturating_sub(null_count),
+				min: Some(min),
+				max: Some(max),
+			},
+		);
+	}
+	facts
 }
 
 fn persisted_table_metadata(
@@ -15203,5 +15328,38 @@ mod adr275_decimal_join_probe {
 				panic!("explicit Decimal equi-join walled at {phase:?}: {reason}");
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr471_probe {
+	use super::*;
+	use std::time::Instant;
+
+	#[tokio::test]
+	async fn adr471_q14_binds_natural_with_flag_on() {
+		let spec = build_persisted_perf_query_spec(
+			"q14",
+			"strict",
+			1.0,
+			std::path::Path::new("target/tpch/data"),
+		)
+		.expect("q14 persisted spec");
+		let mut timings = PerfPhaseTimings::default();
+		let catalog =
+			load_catalog_from_metadata(spec.tables, &mut timings, Instant::now()).expect("catalog");
+		let logical = SqlPlanner::new().plan(&spec.sql).expect("plan q14");
+		// ADR 471: the filter-aware comparison must keep q14 natural even with the
+		// capability on — the regression fixture of the 469 price table, pinned.
+		let mut config = gauge_planner_config();
+		config.hash_smaller_build_placement = true;
+		let (_plan, joins, _edges) = bind_with_explain_summary(&logical, &catalog, &config)
+			.await
+			.expect("bind q14");
+		assert!(
+			joins.contains("natural"),
+			"q14 flag-on must bind natural under filter-aware comparison: {joins}"
+		);
+		assert!(!joins.contains("swapped_right_build"), "{joins}");
 	}
 }

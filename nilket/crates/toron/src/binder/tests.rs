@@ -25693,6 +25693,40 @@ async fn adr464_hash_fallback_without_both_facts_keeps_natural_placement() {
 	assert_eq!(receipt.placement, JoinPhysicalPlacement::Natural);
 }
 
+#[test]
+fn adr471_filtered_side_scales_comparison_and_keeps_natural_build() {
+	// q14's shape: the left byte bound is huge but a filter discounts its rows
+	// to a fraction; scaled comparison must keep the natural (left) build. Fails
+	// under bound-only comparison, which swaps toward the "smaller" right.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	let filtered_left = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(700 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: Some(RowCount::new(72_000)),
+		row_upper_bound: Some(RowCount::new(6_000_000)),
+	};
+	let unfiltered_right = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(30 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(200_000)),
+	};
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(filtered_left),
+		join_input(unfiltered_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+}
+
 #[tokio::test]
 async fn adr466_hash_swapped_placement_swaps_physical_build_and_restores_order() {
 	let mut catalog = join_catalog();
