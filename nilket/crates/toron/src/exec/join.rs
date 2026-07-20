@@ -1267,34 +1267,68 @@ impl JoinKeyPlan {
 	}
 }
 
+/// ADR 478: the join key arrays resolved **once** per array set. `JoinKeyPlan` is
+/// a plan-time typed decision, but [`join_key_at`] re-derived the concrete array
+/// through `as_any().downcast_ref()` on every call — per row, from 19 call sites.
+/// The null contract, null-safe handling, generic-bytes path, and error text mirror
+/// [`join_key_at`] exactly; both resolve through this one construction so they
+/// cannot drift. Key representation, hashing, and build layout are untouched.
+pub(super) enum JoinKeyReader<'a> {
+	Int32(&'a Int32Array),
+	Int64(&'a Int64Array),
+	Generic {
+		arrays: &'a [ArrayRef],
+		null_safe: bool,
+	},
+}
+
+impl<'a> JoinKeyReader<'a> {
+	pub(super) fn new(
+		join_key_plan: JoinKeyPlan,
+		key_arrays: &'a [ArrayRef],
+		null_safe_keys: bool,
+	) -> Result<Self, ExecutionError> {
+		Ok(match join_key_plan {
+			JoinKeyPlan::Int32 => {
+				Self::Int32(single_join_key_array::<Int32Array>(key_arrays, "Int32")?)
+			}
+			JoinKeyPlan::Int64 => {
+				Self::Int64(single_join_key_array::<Int64Array>(key_arrays, "Int64")?)
+			}
+			JoinKeyPlan::Generic => Self::Generic {
+				arrays: key_arrays,
+				null_safe: null_safe_keys,
+			},
+		})
+	}
+
+	pub(super) fn key(&self, row: usize) -> Result<Option<JoinKey>, ExecutionError> {
+		Ok(match self {
+			Self::Int32(values) => {
+				(!values.is_null(row)).then(|| JoinKey::Int32(values.value(row)))
+			}
+			Self::Int64(values) => {
+				(!values.is_null(row)).then(|| JoinKey::Int64(values.value(row)))
+			}
+			Self::Generic {
+				arrays,
+				null_safe: true,
+			} => Some(JoinKey::Generic(join_key_bytes_null_safe(arrays, row)?)),
+			Self::Generic {
+				arrays,
+				null_safe: false,
+			} => join_key_bytes(arrays, row)?.map(JoinKey::Generic),
+		})
+	}
+}
+
 pub(super) fn join_key_at(
 	join_key_plan: JoinKeyPlan,
 	key_arrays: &[ArrayRef],
 	row: usize,
 	null_safe_keys: bool,
 ) -> Result<Option<JoinKey>, ExecutionError> {
-	Ok(match join_key_plan {
-		JoinKeyPlan::Int32 => {
-			let values = single_join_key_array::<Int32Array>(key_arrays, "Int32")?;
-			if values.is_null(row) {
-				None
-			} else {
-				Some(JoinKey::Int32(values.value(row)))
-			}
-		}
-		JoinKeyPlan::Int64 => {
-			let values = single_join_key_array::<Int64Array>(key_arrays, "Int64")?;
-			if values.is_null(row) {
-				None
-			} else {
-				Some(JoinKey::Int64(values.value(row)))
-			}
-		}
-		JoinKeyPlan::Generic if null_safe_keys => {
-			Some(JoinKey::Generic(join_key_bytes_null_safe(key_arrays, row)?))
-		}
-		JoinKeyPlan::Generic => join_key_bytes(key_arrays, row)?.map(JoinKey::Generic),
-	})
+	JoinKeyReader::new(join_key_plan, key_arrays, null_safe_keys)?.key(row)
 }
 
 pub(super) fn build_in_memory_join_rows(
@@ -1873,9 +1907,10 @@ pub(super) async fn probe_streamed_spilled_left_semi_join(
 			let probe_chunk = batch.slice(offset, len);
 			probe_rows = probe_rows.saturating_add(probe_chunk.num_rows() as u64);
 			let right_key_arrays = key_arrays(&probe_chunk, right_keys)?;
+			// ADR 478: resolve the key arrays once per loop, not per row.
+			let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
-				else {
+				let Some(key) = __jk_reader.key(row)? else {
 					continue;
 				};
 				for build in spilled.lookup(&key).await? {
@@ -2266,9 +2301,10 @@ where
 				.map(|array| array.slice(offset, len))
 				.collect::<Vec<_>>();
 			let mut matches = Vec::new();
+			// ADR 478: resolve the key arrays once per loop, not per row.
+			let __jk_reader = JoinKeyReader::new(key_plan, &right_key_arrays, null_safe_keys)?;
 			for row in 0..probe_chunk.num_rows() {
-				let Some(key) = join_key_at(key_plan, &right_key_arrays, row, null_safe_keys)?
-				else {
+				let Some(key) = __jk_reader.key(row)? else {
 					continue;
 				};
 				for build in spilled.lookup(&key).await? {
@@ -3718,5 +3754,51 @@ pub(super) fn budget_exhausted_with_detail(
 		requested: ByteCount::new(requested),
 		available: ByteCount::new(available),
 		detail,
+	}
+}
+
+#[cfg(test)]
+mod adr478_tests {
+	use super::*;
+	use arrow::array::{Int32Array, Int64Array, StringArray};
+
+	#[test]
+	fn adr478_reader_matches_join_key_at_across_plans_and_nulls() {
+		let int32: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![Some(5), None]))];
+		let int64: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(9), None]))];
+		let generic: Vec<ArrayRef> = vec![
+			Arc::new(StringArray::from(vec![Some("a"), None])),
+			Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+		];
+		let cases: Vec<(JoinKeyPlan, &Vec<ArrayRef>, bool)> = vec![
+			(JoinKeyPlan::Int32, &int32, false),
+			(JoinKeyPlan::Int64, &int64, false),
+			(JoinKeyPlan::Generic, &generic, false),
+			(JoinKeyPlan::Generic, &generic, true),
+		];
+		for (plan, arrays, null_safe) in cases {
+			let reader = JoinKeyReader::new(plan, arrays, null_safe).expect("reader");
+			for row in 0..2 {
+				let via_reader = reader.key(row).expect("reader key");
+				let via_fn = join_key_at(plan, arrays, row, null_safe).expect("join_key_at");
+				assert_eq!(
+					via_reader, via_fn,
+					"plan {plan:?} null_safe={null_safe} row {row}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn adr478_reader_rejects_mistyped_key_array_like_join_key_at() {
+		let wrong: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1i64]))];
+		let reader_err = match JoinKeyReader::new(JoinKeyPlan::Int32, &wrong, false) {
+			Err(error) => error.to_string(),
+			Ok(_) => panic!("Int32 plan must reject an Int64 key array"),
+		};
+		let fn_err = join_key_at(JoinKeyPlan::Int32, &wrong, 0, false)
+			.expect_err("join_key_at must reject too")
+			.to_string();
+		assert_eq!(reader_err, fn_err);
 	}
 }

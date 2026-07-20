@@ -4,7 +4,9 @@ const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
 const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_500;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_800;
+// ADR 478 added JoinKeyReader (key-type resolution hoisted out of per-row loops)
+// and its parity tests to the join root: a real mechanism, not streaming drift.
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_850;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
