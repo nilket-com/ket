@@ -171,10 +171,10 @@ pub struct PlannerConfig {
 	pub measured_accrual_counter: Arc<AtomicU64>,
 	pub join_order_soft_margin_step: SoftMarginLadderStep,
 	pub join_order_soft_margin_application: JoinOrderSoftMarginApplication,
-	/// ADR 466-470: smaller-build placement for auto inner hash joins. Fully
-	/// plumbed and contract-coherent, but default-off on ADR 469's six-cell price
-	/// evidence (material regressions to -195% vs wins to +22.5%); ADR 470's
-	/// regression diagnosis and placement costing own re-activation.
+	/// ADR 466-472: smaller-build placement for auto inner hash joins. Default-on
+	/// since ADR 472: filter-aware comparison (471) plus the unknown-size guard
+	/// (472) left three engaged cells, all material wins (+17.7%/+34.6%/+23.1%),
+	/// and no regression. Retained as an operator off-switch.
 	pub hash_smaller_build_placement: bool,
 }
 
@@ -191,7 +191,7 @@ impl Default for PlannerConfig {
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
-			hash_smaller_build_placement: false,
+			hash_smaller_build_placement: true,
 		}
 	}
 }
@@ -625,6 +625,10 @@ struct PlanOptimizerFacts {
 	estimated_byte_size: Option<ByteCount>,
 	estimated_row_count: Option<RowCount>,
 	row_upper_bound: Option<RowCount>,
+	/// ADR 472: a filter narrowed this side but no estimator could say by how
+	/// much, so its byte bound is stale as a size proxy. Size-comparison
+	/// consumers must treat the side as unknown-size rather than trust the bound.
+	filtered_without_estimate: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -643,6 +647,7 @@ impl PlanOptimizerFacts {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: facts.row_upper_bound,
+			filtered_without_estimate: false,
 		}
 	}
 
@@ -653,6 +658,7 @@ impl PlanOptimizerFacts {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}
 	}
 
@@ -667,6 +673,7 @@ impl PlanOptimizerFacts {
 				.and_then(|rows| estimate_materialized_byte_size(rows, output_schema)),
 			estimated_row_count,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}
 	}
 
@@ -677,6 +684,7 @@ impl PlanOptimizerFacts {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound,
+			filtered_without_estimate: false,
 		}
 	}
 
@@ -690,6 +698,7 @@ impl PlanOptimizerFacts {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound,
+			filtered_without_estimate: false,
 		}
 	}
 
@@ -699,6 +708,15 @@ impl PlanOptimizerFacts {
 
 	fn preserve_volume_non_increasing(self) -> Self {
 		self
+	}
+
+	/// ADR 472: a filter narrowed this side but no estimator could size it, so
+	/// the byte bound is stale as a size proxy.
+	fn mark_filtered_without_estimate(self) -> Self {
+		Self {
+			filtered_without_estimate: true,
+			..self
+		}
 	}
 
 	fn preserve_through_project(self, exprs: &BoundExprProgram, output_schema: &Schema) -> Self {
@@ -714,6 +732,7 @@ impl PlanOptimizerFacts {
 			estimated_byte_size: None,
 			estimated_row_count: self.estimated_row_count,
 			row_upper_bound: self.row_upper_bound,
+			filtered_without_estimate: self.filtered_without_estimate,
 		}
 	}
 
@@ -1129,7 +1148,7 @@ impl<'a> Binder<'a> {
 					let facts = if let Some(estimated_row_count) = estimated_row_count {
 						facts.with_estimated_row_count(estimated_row_count)
 					} else {
-						facts
+						facts.mark_filtered_without_estimate()
 					}
 					.derive_estimated_byte_size(plan.schema().as_ref());
 					let join_order_sources = update_single_source_join_order_rows(

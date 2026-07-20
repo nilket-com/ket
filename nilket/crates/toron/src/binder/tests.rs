@@ -2662,6 +2662,7 @@ async fn both_sides_eligible_right_materially_smaller_prefers_right_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -2669,6 +2670,7 @@ async fn both_sides_eligible_right_materially_smaller_prefers_right_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&auto_broadcast_config(4_096),
 	)
@@ -2784,6 +2786,7 @@ async fn both_sides_tiny_equal_keeps_left_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -2791,6 +2794,7 @@ async fn both_sides_tiny_equal_keeps_left_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&auto_broadcast_config(4_096),
 	)
@@ -2820,6 +2824,7 @@ fn both_sides_eligible_near_tie_keeps_left_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -2827,6 +2832,7 @@ fn both_sides_eligible_near_tie_keeps_left_build() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -2860,6 +2866,7 @@ fn hash_join_probe_not_scan_linear_uses_carried_input_cause() {
 				estimated_byte_size: None,
 				estimated_row_count: None,
 				row_upper_bound: None,
+				filtered_without_estimate: false,
 			},
 			ProbeLinearity::Blocked(ProbeLinearityFence::Sort),
 		),
@@ -2869,6 +2876,7 @@ fn hash_join_probe_not_scan_linear_uses_carried_input_cause() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -9101,6 +9109,7 @@ fn composite_hard_bound_build_side_still_rejected() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: Some(RowCount::new(1)),
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -9108,6 +9117,7 @@ fn composite_hard_bound_build_side_still_rejected() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&auto_broadcast_config(4_096),
 	)
@@ -9134,6 +9144,7 @@ fn composite_estimate_channel_broadcasts_without_hard_bound_authority() {
 			estimated_byte_size: Some(ByteCount::new(1_024)),
 			estimated_row_count: Some(RowCount::new(10)),
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -9141,6 +9152,7 @@ fn composite_estimate_channel_broadcasts_without_hard_bound_authority() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&auto_broadcast_config(4_096),
 	)
@@ -19590,6 +19602,7 @@ fn inferred_broadcast_carries_reason_receipt() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -19597,6 +19610,7 @@ fn inferred_broadcast_carries_reason_receipt() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -19624,6 +19638,7 @@ fn inferred_broadcast_carries_reason_receipt() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -19631,6 +19646,7 @@ fn inferred_broadcast_carries_reason_receipt() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -19675,6 +19691,7 @@ fn sole_eligible_side_reports_no_rejected_bytes() {
 				estimated_byte_size: None,
 				estimated_row_count: None,
 				row_upper_bound: None,
+				filtered_without_estimate: false,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
@@ -19682,6 +19699,7 @@ fn sole_eligible_side_reports_no_rejected_bytes() {
 				estimated_byte_size: None,
 				estimated_row_count: None,
 				row_upper_bound: None,
+				filtered_without_estimate: false,
 			}),
 			&config,
 		)
@@ -19719,6 +19737,7 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			estimated_byte_size: Some(ByteCount::new(1_024)),
 			estimated_row_count: None,
 			row_upper_bound: Some(RowCount::new(1)),
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -19726,6 +19745,7 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -19749,6 +19769,7 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			estimated_byte_size: Some(ByteCount::new(512)),
 			estimated_row_count: None,
 			row_upper_bound: Some(RowCount::new(1)),
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -19756,6 +19777,7 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			estimated_byte_size: None,
 			estimated_row_count: None,
 			row_upper_bound: None,
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -19784,6 +19806,7 @@ fn estimate_above_effective_threshold_hashes() {
 			estimated_byte_size: Some(ByteCount::new(8_192)),
 			estimated_row_count: None,
 			row_upper_bound: Some(RowCount::new(100)),
+			filtered_without_estimate: false,
 		}),
 		join_input(PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
@@ -19791,6 +19814,7 @@ fn estimate_above_effective_threshold_hashes() {
 			estimated_byte_size: Some(ByteCount::new(8_192)),
 			estimated_row_count: None,
 			row_upper_bound: Some(RowCount::new(100)),
+			filtered_without_estimate: false,
 		}),
 		&config,
 	)
@@ -25706,6 +25730,7 @@ fn adr471_filtered_side_scales_comparison_and_keeps_natural_build() {
 		estimated_byte_size: None,
 		estimated_row_count: Some(RowCount::new(72_000)),
 		row_upper_bound: Some(RowCount::new(6_000_000)),
+		filtered_without_estimate: false,
 	};
 	let unfiltered_right = PlanOptimizerFacts {
 		origin: PlanOrigin::SingleBaseRelation,
@@ -25713,6 +25738,7 @@ fn adr471_filtered_side_scales_comparison_and_keeps_natural_build() {
 		estimated_byte_size: None,
 		estimated_row_count: None,
 		row_upper_bound: Some(RowCount::new(200_000)),
+		filtered_without_estimate: false,
 	};
 	let decision = choose_join_strategy(
 		JoinReplayId::SYNTHETIC,
@@ -25725,6 +25751,58 @@ fn adr471_filtered_side_scales_comparison_and_keeps_natural_build() {
 	.expect("choose join strategy");
 	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
 	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+}
+
+#[test]
+fn adr472_unknown_size_side_declines_the_swap() {
+	// Sizes that would swap under 464/471, but the left side carries a filter no
+	// estimator could size: unknown size must decline. Fails without the guard.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	let unknown_left = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(700 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(6_000_000)),
+		filtered_without_estimate: true,
+	};
+	// Both sides stay above the broadcast threshold so the decision reaches the
+	// hash fallback — a broadcast-eligible side would be decided elsewhere.
+	let sizable_right = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(100 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(1_000_000)),
+		filtered_without_estimate: false,
+	};
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(unknown_left),
+		join_input(sizable_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+	// The same shape without the unknown-size marker swaps: the guard is the only
+	// thing declining here.
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(PlanOptimizerFacts {
+			filtered_without_estimate: false,
+			..unknown_left
+		}),
+		join_input(sizable_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
 }
 
 #[tokio::test]

@@ -1067,7 +1067,12 @@ pub(super) fn hash_join_decision_with_placement(
 	config: &PlannerConfig,
 	reason: HashByDefaultReason,
 ) -> JoinStrategyDecision {
-	if config.hash_smaller_build_placement && kind == JoinKind::Inner {
+	// ADR 472: a side narrowed by an unestimated filter has unknown size — its
+	// byte bound is stale — so decline rather than compare against it. Declining
+	// is the pre-464 placement: never a correctness risk, only a foregone swap.
+	let unknown_size =
+		left_input.facts.filtered_without_estimate || right_input.facts.filtered_without_estimate;
+	if config.hash_smaller_build_placement && kind == JoinKind::Inner && !unknown_size {
 		if let (Some(left), Some(right)) = (
 			unthresholded_build_byte_candidate(left_input.facts),
 			unthresholded_build_byte_candidate(right_input.facts),

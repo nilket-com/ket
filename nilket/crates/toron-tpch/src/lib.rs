@@ -15337,28 +15337,38 @@ mod adr471_probe {
 	use std::time::Instant;
 
 	#[tokio::test]
+	async fn adr472_q19_binds_natural_with_flag_on() {
+		// ADR 472's residual fixture: q19's filters (Decimal quantity, string
+		// categoricals) are unestimated, so the unknown-size guard must decline
+		// the swap that priced -75% in the ADR 471 table.
+		assert_natural_with_flag_on("q19").await;
+	}
+
+	#[tokio::test]
 	async fn adr471_q14_binds_natural_with_flag_on() {
+		assert_natural_with_flag_on("q14").await;
+	}
+
+	async fn assert_natural_with_flag_on(query: &str) {
 		let spec = build_persisted_perf_query_spec(
-			"q14",
+			query,
 			"strict",
 			1.0,
 			std::path::Path::new("target/tpch/data"),
 		)
-		.expect("q14 persisted spec");
+		.expect("persisted spec");
 		let mut timings = PerfPhaseTimings::default();
 		let catalog =
 			load_catalog_from_metadata(spec.tables, &mut timings, Instant::now()).expect("catalog");
-		let logical = SqlPlanner::new().plan(&spec.sql).expect("plan q14");
-		// ADR 471: the filter-aware comparison must keep q14 natural even with the
-		// capability on — the regression fixture of the 469 price table, pinned.
+		let logical = SqlPlanner::new().plan(&spec.sql).expect("plan query");
 		let mut config = gauge_planner_config();
 		config.hash_smaller_build_placement = true;
 		let (_plan, joins, _edges) = bind_with_explain_summary(&logical, &catalog, &config)
 			.await
-			.expect("bind q14");
+			.expect("bind query");
 		assert!(
 			joins.contains("natural"),
-			"q14 flag-on must bind natural under filter-aware comparison: {joins}"
+			"{query} flag-on must bind natural: {joins}"
 		);
 		assert!(!joins.contains("swapped_right_build"), "{joins}");
 	}
