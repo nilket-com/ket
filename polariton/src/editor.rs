@@ -5,6 +5,7 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
+use crate::gui::table::Table;
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
@@ -19,7 +20,12 @@ use libaryon::engine::{
 	HostEvent, HostPanelId, MinimapSnapshot, PanelRevision, SplitDirection, UiPalette, VisualKind,
 };
 use libaryon::uast::Viewport;
+use polars::frame::DataFrame;
 use std::sync::mpsc::Receiver;
+
+/// The single query-results surface. One stable identity reused for every run,
+/// so results replace in place instead of opening a pane per query.
+const RESULT_PANEL: HostPanelId = HostPanelId::new(1);
 
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
@@ -78,6 +84,9 @@ pub struct CodeEditor {
 	/// Ordered engine events; drained every poll, never coalesced.
 	host_events: Option<Receiver<HostEvent>>,
 	panels: PanelRegistry,
+	/// Monotonic revision for the results panel, so each run supersedes the
+	/// last.
+	result_revision: u64,
 	/// Divider drag in progress, if any.
 	drag: Option<DividerDrag>,
 }
@@ -116,6 +125,7 @@ impl CodeEditor {
 			quit_notified: false,
 			host_events,
 			panels: PanelRegistry::default(),
+			result_revision: 0,
 			drag: None,
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
@@ -159,6 +169,41 @@ impl CodeEditor {
 				.map_or(tail, |(line, _)| line)
 				.to_owned(),
 		)
+	}
+
+	/// Announce that a query started: open the results panel on first run, and
+	/// on later runs reuse the same identity with a fresh revision so results
+	/// replace in place rather than multiplying panes.
+	pub fn begin_query(&mut self) {
+		let known = self.panels.panels.contains_key(&RESULT_PANEL);
+		let revision = PanelRevision::new(self.result_revision.saturating_add(1));
+		self.result_revision = revision.get();
+		if known {
+			self.send(EditorCommand::RefreshHostPanel {
+				panel_id: RESULT_PANEL,
+				revision,
+			});
+		} else {
+			self.send(EditorCommand::OpenHostPanel {
+				panel_id: RESULT_PANEL,
+				kind: "result-table".to_owned(),
+				title: "Results".to_owned(),
+			});
+		}
+		self.panels.set_content(RESULT_PANEL, PanelContent::Running);
+	}
+
+	/// Attach a completed result set to the panel.
+	pub fn set_query_result(&mut self, frame: DataFrame) {
+		self.panels
+			.set_content(RESULT_PANEL, PanelContent::Table(Box::new(frame)));
+	}
+
+	/// A failed query keeps its panel: the error belongs where the results
+	/// would have been, not only in the status bar.
+	pub fn set_query_error(&mut self, message: String) {
+		self.panels
+			.set_content(RESULT_PANEL, PanelContent::Failed(message));
 	}
 
 	/// Latest engine status line, if one arrived since the last input.
@@ -800,10 +845,18 @@ pub struct PanelRegistry {
 
 struct PanelEntry {
 	revision: PanelRevision,
-	/// True until the frontend supplies real content — either a panel restored
-	/// from a persisted layout, or one projected before its backing object
-	/// exists.
-	unresolved: bool,
+	content: PanelContent,
+}
+
+/// Host-owned backing state for a panel. None of this is representable in
+/// libaryon: the engine only knows the panel exists.
+enum PanelContent {
+	/// Projected or restored, but the frontend has no content for it — either
+	/// a panel from a persisted layout or one seen before its object exists.
+	Unresolved,
+	Running,
+	Table(Box<DataFrame>),
+	Failed(String),
 }
 
 impl PanelRegistry {
@@ -813,16 +866,16 @@ impl PanelRegistry {
 		for event in events {
 			match event {
 				HostEvent::PanelRebound { panel_id, revision } => {
-					// A rebind means the output is stale until the frontend
-					// supplies content for the new revision.
-					let entry = self.panels.entry(*panel_id).or_insert(PanelEntry {
-						revision: *revision,
-						unresolved: true,
-					});
-					if entry.revision != *revision {
-						entry.revision = *revision;
-						entry.unresolved = true;
-					}
+					// Only the revision syncs here. Polariton is the sole
+					// producer of RefreshHostPanel and sets the new content
+					// itself, so clobbering it would race its own request.
+					self.panels
+						.entry(*panel_id)
+						.or_insert(PanelEntry {
+							revision: *revision,
+							content: PanelContent::Unresolved,
+						})
+						.revision = *revision;
 				}
 				HostEvent::PanelDisposed { panel_id } => {
 					self.pending_disposal.insert(*panel_id);
@@ -835,7 +888,7 @@ impl PanelRegistry {
 						*panel_id,
 						PanelEntry {
 							revision: PanelRevision::new(0),
-							unresolved: true,
+							content: PanelContent::Unresolved,
 						},
 					);
 				}
@@ -870,36 +923,53 @@ impl PanelRegistry {
 			if let Some(panel) = pane.host_panel.as_ref() {
 				self.panels.entry(panel.panel_id).or_insert(PanelEntry {
 					revision: panel.revision,
-					unresolved: true,
+					content: PanelContent::Unresolved,
 				});
 			}
 		}
 	}
 
-	fn is_unresolved(&self, panel_id: HostPanelId) -> bool {
-		self.panels
-			.get(&panel_id)
-			.is_none_or(|entry| entry.unresolved)
+	fn set_content(&mut self, panel_id: HostPanelId, content: PanelContent) {
+		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
+			revision: PanelRevision::new(0),
+			content: PanelContent::Unresolved,
+		});
+		entry.content = content;
 	}
 
 	/// Native surface for a host panel. Backing objects will replace the
 	/// placeholder without touching the topology seam.
 	fn surface<'a>(
-		&self,
+		&'a self,
 		panel: &'a libaryon::uast::projection::HostPanelViewport,
 		focused: bool,
 		palette: UiPalette,
 	) -> Element<'a, EditorMsg> {
-		let unresolved = self.is_unresolved(panel.panel_id);
-		let body = if unresolved {
-			format!(
-				"{}\n\n{} unavailable\nrevision {}\n\nrerun to populate",
-				panel.title,
-				panel.kind,
-				panel.revision.get()
-			)
-		} else {
-			format!("{}\n\n{}", panel.title, panel.kind)
+		let content = self
+			.panels
+			.get(&panel.panel_id)
+			.map(|entry| &entry.content)
+			.unwrap_or(&PanelContent::Unresolved);
+
+		let inner: Element<'a, EditorMsg> = match content {
+			PanelContent::Table(frame) => Table::new(frame, 0).into(),
+			PanelContent::Running => panel_message(
+				format!("{}\n\nrunning…", panel.title),
+				color(palette.preview_text),
+			),
+			PanelContent::Failed(message) => panel_message(
+				format!("{}\n\n{message}", panel.title),
+				color(palette.status_text),
+			),
+			PanelContent::Unresolved => panel_message(
+				format!(
+					"{}\n\n{} unavailable (revision {})\nrerun to populate",
+					panel.title,
+					panel.kind,
+					panel.revision.get()
+				),
+				color(palette.preview_text),
+			),
 		};
 		let surface = color(palette.preview_surface);
 		let border = if focused {
@@ -907,26 +977,32 @@ impl PanelRegistry {
 		} else {
 			color(palette.divider_surface)
 		};
-		container(
-			text(body)
-				.font(EDITOR_FONT)
-				.size(metrics::TEXT_SIZE)
-				.color(color(palette.preview_text)),
-		)
-		.padding(12)
-		.width(Length::Fill)
-		.height(Length::Fill)
-		.style(move |_| container::Style {
-			background: Some(Background::Color(surface)),
-			border: iced::Border {
-				color: border,
-				width: if focused { 2.0 } else { 1.0 },
-				radius: 0.0.into(),
-			},
-			..Default::default()
-		})
-		.into()
+		container(inner)
+			.padding(4)
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.style(move |_| container::Style {
+				background: Some(Background::Color(surface)),
+				border: iced::Border {
+					color: border,
+					width: if focused { 2.0 } else { 1.0 },
+					radius: 0.0.into(),
+				},
+				..Default::default()
+			})
+			.into()
 	}
+}
+
+fn panel_message<'a>(body: String, tint: Color) -> Element<'a, EditorMsg> {
+	container(
+		text(body)
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(tint),
+	)
+	.padding(8)
+	.into()
 }
 
 /// One text pane's surface: gutter, styled rows, and minimap. Positioned by the
@@ -1309,6 +1385,7 @@ mod tests {
 
 	#[test]
 	fn host_panels_render_as_unresolved_until_content_arrives() {
+		use super::PanelContent;
 		use libaryon::engine::HostPanelId;
 
 		let mut editor = CodeEditor::new("select 1;");
@@ -1328,7 +1405,10 @@ mod tests {
 			editor.panels.panels.contains_key(&HostPanelId::new(1)),
 			"the registry adopts an unknown projected panel"
 		);
-		assert!(editor.panels.is_unresolved(HostPanelId::new(1)));
+		assert!(matches!(
+			editor.panels.panels[&HostPanelId::new(1)].content,
+			PanelContent::Unresolved
+		));
 		let viewport = editor.viewport.as_ref().expect("viewport");
 		let panel = viewport
 			.panes
@@ -1436,6 +1516,61 @@ mod tests {
 		editor.drag = None;
 		editor.last_pointer = Some(point(2, row));
 		assert!(!editor.begin_divider_drag());
+	}
+
+	#[test]
+	fn repeated_runs_reuse_one_result_panel_and_replace_its_contents() {
+		use super::{PanelContent, RESULT_PANEL};
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+
+		// First run opens the panel and shows it running.
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		let panes_after_first = editor
+			.viewport
+			.as_ref()
+			.map(|v| v.panes.len())
+			.expect("viewport");
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Running
+		));
+
+		// Completion attaches the table.
+		let frame = polars::df!("n" => [1i64, 2, 3]).expect("frame");
+		editor.set_query_result(frame);
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Table(_)
+		));
+
+		// A second run reuses the identity: revision advances, no pane
+		// explosion, and the surface returns to running.
+		let first_revision = editor.result_revision;
+		editor.begin_query();
+		for _ in 0..40 {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(editor.result_revision > first_revision);
+		assert_eq!(
+			editor.viewport.as_ref().map(|v| v.panes.len()),
+			Some(panes_after_first),
+			"reusing the panel identity must not open another pane"
+		);
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Running
+		));
+
+		// A failure keeps the panel and shows the error in place.
+		editor.set_query_error("syntax error at or near \"slect\"".to_owned());
+		let PanelContent::Failed(message) = &editor.panels.panels[&RESULT_PANEL].content else {
+			panic!("a failed query retains its panel");
+		};
+		assert!(message.contains("slect"));
 	}
 
 	#[test]

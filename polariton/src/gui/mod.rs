@@ -7,7 +7,7 @@ pub mod pane_grid;
 pub mod plot_pane;
 pub mod statusbar;
 mod state;
-mod table;
+pub mod table;
 
 pub use state::run;
 pub use state::Result;

@@ -272,6 +272,9 @@ fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
+	// The results surface is a Baryon-owned pane whose contents Polariton
+	// draws: open or refresh it now so the run is visible while it executes.
+	app_state.code_editor.begin_query();
 	Task::perform(
 		async move {
 			let mut guard = db.write().await;
@@ -392,7 +395,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				"Adapter connection failed.".into()
 			};
 		}
-		Message::Run => return run_code(app_state, app_state.code_editor.cached_content().to_owned()),
+		Message::Run => {
+			return run_code(app_state, app_state.code_editor.cached_content().to_owned());
+		}
 		Message::RunSnippet => {
 			let Some(code) = app_state.code_editor.selected_or_current_line() else {
 				app_state.status_msg = "No editor text is available to run.".into();
@@ -421,10 +426,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				ExecutionResult::Err(msg) => {
 					app_state.status_error = format!("Error: {msg}");
 					app_state.status_msg = "".to_string();
+					app_state.code_editor.set_query_error(msg);
 				}
 				ExecutionResult::Rows(df) => {
 					let rows = df.height();
 					let cols = df.width();
+					app_state.code_editor.set_query_result(df.clone());
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
 					app_state.status_msg = "Code finished.".to_string();
