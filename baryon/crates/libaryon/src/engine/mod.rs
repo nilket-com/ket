@@ -63,7 +63,7 @@ pub use self::minimap::{
 };
 pub use self::protocol::{
 	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,
-	PaneFocusDirection, PaneResizeDirection, SplitDirection, SubstituteFlags, VerticalDirection,
+	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SplitDirection, SubstituteFlags, VerticalDirection,
 	VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};

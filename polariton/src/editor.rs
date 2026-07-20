@@ -15,12 +15,13 @@ use iced::widget::{
 	Space, button, column, container, mouse_area, rich_text, row, span, stack, text,
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
-use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, Rgb};
+use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers,
 };
 use libaryon::engine::{
-	HostEvent, HostPanelId, MinimapSnapshot, PanelRevision, SplitDirection, UiPalette, VisualKind,
+	HostEvent, HostPanelId, MinimapSnapshot, PaneDropEdge, PanelRevision, SplitDirection,
+	UiPalette, VisualKind,
 };
 use libaryon::uast::Viewport;
 use polars::frame::DataFrame;
@@ -33,6 +34,11 @@ const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
 
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
+/// A visible, low-friction workspace drag handle. It also establishes the
+/// natural home for pane titles and close buttons; those can grow here without
+/// leaking pane chrome back into Polariton's old outer grid.
+const PANE_HEADER_HEIGHT: f32 = 22.0;
+const PANE_DRAG_DEADBAND: f32 = 8.0;
 
 /// The registered application monospace font. Named explicitly (rather than
 /// `Font::MONOSPACE`, which resolves to the platform default) so
@@ -97,6 +103,9 @@ pub struct CodeEditor {
 	result_revision: u64,
 	/// Divider drag in progress, if any.
 	drag: Option<DividerDrag>,
+	/// Workspace pane rearrangement in progress. The engine receives one drop
+	/// command on release; it remains the sole owner of the split tree.
+	pane_drag: Option<PaneDrag>,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +116,13 @@ struct DividerDrag {
 	/// Distance from the grabbed point to the boundary, so the divider tracks
 	/// the cursor instead of jumping to it.
 	grab_offset: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PaneDrag {
+	source: libaryon::core::PaneId,
+	origin: iced::Point,
+	target: Option<(libaryon::core::PaneId, PaneDropEdge)>,
 }
 
 impl CodeEditor {
@@ -136,6 +152,7 @@ impl CodeEditor {
 			panels: PanelRegistry::default(),
 			result_revision: 0,
 			drag: None,
+			pane_drag: None,
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -396,6 +413,9 @@ impl CodeEditor {
 			}
 			EditorMsg::PointerMoved(position) => {
 				self.last_pointer = Some(position);
+				if self.update_pane_drag() {
+					return Task::none();
+				}
 				// Continuous resize: every sample while a divider is held
 				// becomes a boundary target, so the split tracks the cursor.
 				if let Some(command) = self.divider_drag_command() {
@@ -405,9 +425,13 @@ impl CodeEditor {
 			EditorMsg::Click => {
 				if !self.begin_divider_drag() {
 					self.click_at_pointer();
+					self.begin_pane_drag();
 				}
 			}
-			EditorMsg::Release => self.drag = None,
+			EditorMsg::Release => {
+				self.drag = None;
+				self.finish_pane_drag();
+			}
 		}
 		Task::none()
 	}
@@ -442,17 +466,50 @@ impl CodeEditor {
 		for pane in &viewport.panes {
 			let focused = pane.pane_id == viewport.focused_pane_id;
 			let content = match pane.host_panel.as_ref() {
-				Some(panel) => self
-					.panels
-					.surface(panel, focused, palette, self.show_column_types, dashboard),
-				None => text_pane_surface(pane, palette),
+				Some(panel) => {
+					self.panels
+						.surface(panel, focused, palette, self.show_column_types, dashboard)
+				}
+				None => text_pane_surface(pane, palette, focused),
 			};
+			let title = pane
+				.host_panel
+				.as_ref()
+				.map_or("SQL", |panel| panel.title.as_str());
+			let content = pane_surface(title, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
 				pane.rect.width.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.height.get() as f32 * metrics::LINE_HEIGHT,
 				content,
+			));
+		}
+		if let Some(drag) = self.pane_drag
+			&& let Some((target, edge)) = drag.target
+			&& let Some(pane) = viewport.panes.iter().find(|pane| pane.pane_id == target)
+		{
+			let bounds = pane_pixel_rect(pane.rect);
+			let overlay = drop_overlay_rect(bounds, edge);
+			let accent = color(palette.accent);
+			layers.push(positioned(
+				overlay.x,
+				overlay.y,
+				overlay.width,
+				overlay.height,
+				container(Space::new())
+					.width(Length::Fill)
+					.height(Length::Fill)
+					.style(move |_| container::Style {
+						background: Some(Background::Color(Color { a: 0.18, ..accent })),
+						border: iced::Border {
+							color: accent,
+							width: 2.0,
+							radius: 0.0.into(),
+						},
+						..Default::default()
+					})
+					.into(),
 			));
 		}
 		let panes = mouse_area(stack(layers).width(Length::Fill).height(Length::Fill))
@@ -562,6 +619,68 @@ impl CodeEditor {
 		})
 	}
 
+	fn begin_pane_drag(&mut self) {
+		let (Some(viewport), Some(pointer)) = (self.viewport.as_ref(), self.last_pointer) else {
+			return;
+		};
+		let pane = viewport.panes.iter().find(|pane| {
+			let rect = pane_pixel_rect(pane.rect);
+			rect.contains(pointer) && pointer.y < rect.y + PANE_HEADER_HEIGHT
+		});
+		if let Some(pane) = pane {
+			self.pane_drag = Some(PaneDrag {
+				source: pane.pane_id,
+				origin: pointer,
+				target: None,
+			});
+		}
+	}
+
+	/// Recompute the drop target from the current projected pane rectangles.
+	/// Polariton describes only a geometric intention; the engine owns the
+	/// topology mutation that happens when the mouse is released.
+	fn update_pane_drag(&mut self) -> bool {
+		let Some(mut drag) = self.pane_drag else {
+			return false;
+		};
+		let Some(pointer) = self.last_pointer else {
+			return true;
+		};
+		if (pointer.x - drag.origin.x).hypot(pointer.y - drag.origin.y) < PANE_DRAG_DEADBAND {
+			return true;
+		}
+		let Some(viewport) = self.viewport.as_ref() else {
+			return true;
+		};
+		drag.target = viewport
+			.panes
+			.iter()
+			.filter(|pane| pane.pane_id != drag.source)
+			.find(|pane| pane_pixel_rect(pane.rect).contains(pointer))
+			.map(|pane| (pane.pane_id, drop_edge(pane_pixel_rect(pane.rect), pointer)));
+		self.pane_drag = Some(drag);
+		true
+	}
+
+	fn finish_pane_drag(&mut self) {
+		let Some(drag) = self.pane_drag.take() else {
+			return;
+		};
+		let Some(pointer) = self.last_pointer else {
+			return;
+		};
+		if (pointer.x - drag.origin.x).hypot(pointer.y - drag.origin.y) < PANE_DRAG_DEADBAND {
+			return;
+		}
+		if let Some((target, edge)) = drag.target {
+			self.send(EditorCommand::MovePane {
+				source: drag.source,
+				target,
+				edge,
+			});
+		}
+	}
+
 	fn click_at_pointer(&self) {
 		let Some(pointer) = self.last_pointer else {
 			return;
@@ -579,10 +698,11 @@ impl CodeEditor {
 			return;
 		};
 		self.send(EditorCommand::FocusPane(pane.pane_id));
-		if pane.host_panel.is_some() {
+		let pane_top = pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+		if pane.host_panel.is_some() || pointer.y < pane_top + PANE_HEADER_HEIGHT {
 			return;
 		}
-		let local_y = pointer.y - pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+		let local_y = pointer.y - pane_top - PANE_HEADER_HEIGHT;
 		let local_x = pointer.x - pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH;
 		let row = ((local_y - metrics::VERTICAL_PADDING).max(0.0) / metrics::LINE_HEIGHT).floor()
 			as usize;
@@ -591,8 +711,8 @@ impl CodeEditor {
 		let Some(visible_row) = pane.visible_rows.get(row) else {
 			return;
 		};
-		let column = ((local_x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor()
-			as u32;
+		let column =
+			((local_x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
 		let target = CursorPosition::new(
 			visible_row.line,
 			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
@@ -631,6 +751,7 @@ fn project_lines(
 	pane: &libaryon::uast::projection::PaneViewport,
 	default_foreground: Rgb,
 	cursor_color: Rgb,
+	show_cursor: bool,
 ) -> Vec<ProjectedLine> {
 	let mut lines = Vec::new();
 	let mut current: Option<ProjectedLine> = None;
@@ -685,7 +806,7 @@ fn project_lines(
 			let selected = pane.selection_ranges.iter().any(|(start, end)| {
 				start.get() <= byte.saturating_add(byte_len).saturating_sub(1) && end.get() >= byte
 			});
-			let cursor = pane.cursor_abs_byte.get() == byte;
+			let cursor = show_cursor && pane.cursor_abs_byte.get() == byte;
 			cursor_rendered |= cursor;
 			let underline = pane.diagnostics.iter().any(|diagnostic| {
 				diagnostic.start.get() < byte.saturating_add(byte_len)
@@ -725,7 +846,7 @@ fn project_lines(
 			show_gutter: true,
 		});
 	}
-	if !cursor_rendered {
+	if show_cursor && !cursor_rendered {
 		let cursor_line = pane.cursor_abs_pos.line.get();
 		if let Some(line) = lines.iter_mut().find(|line| line.doc_line == cursor_line) {
 			push_fragment(
@@ -1023,31 +1144,31 @@ impl PanelRegistry {
 			dashboard::view(dashboard).map(EditorMsg::Dashboard)
 		} else {
 			match content {
-			PanelContent::Table(frame) => Table::new(frame, 0)
-				.show_column_types(show_column_types)
-				.scroll_request(
-					self.panels
-						.get(&panel.panel_id)
-						.and_then(|entry| entry.scroll),
-				)
-				.into(),
-			PanelContent::Running => panel_message(
-				format!("{}\n\nrunning…", panel.title),
-				color(palette.preview_text),
-			),
-			PanelContent::Failed(message) => panel_message(
-				format!("{}\n\n{message}", panel.title),
-				color(palette.status_text),
-			),
-			PanelContent::Unresolved => panel_message(
-				format!(
-					"{}\n\n{} unavailable (revision {})\nrerun to populate",
-					panel.title,
-					panel.kind,
-					panel.revision.get()
+				PanelContent::Table(frame) => Table::new(frame, 0)
+					.show_column_types(show_column_types)
+					.scroll_request(
+						self.panels
+							.get(&panel.panel_id)
+							.and_then(|entry| entry.scroll),
+					)
+					.into(),
+				PanelContent::Running => panel_message(
+					format!("{}\n\nrunning…", panel.title),
+					color(palette.preview_text),
 				),
-				color(palette.preview_text),
-			),
+				PanelContent::Failed(message) => panel_message(
+					format!("{}\n\n{message}", panel.title),
+					color(palette.status_text),
+				),
+				PanelContent::Unresolved => panel_message(
+					format!(
+						"{}\n\n{} unavailable (revision {})\nrerun to populate",
+						panel.title,
+						panel.kind,
+						panel.revision.get()
+					),
+					color(palette.preview_text),
+				),
 			}
 		};
 		let surface = color(palette.preview_surface);
@@ -1084,14 +1205,121 @@ fn panel_message<'a>(body: String, tint: Color) -> Element<'a, EditorMsg> {
 	.into()
 }
 
+/// Common workspace chrome. Its header is intentionally simple: a stable drag
+/// handle now, and the future home of pane tabs and close controls.
+fn pane_surface<'a>(
+	title: &str,
+	focused: bool,
+	palette: UiPalette,
+	content: Element<'a, EditorMsg>,
+) -> Element<'a, EditorMsg> {
+	let header_background = color(if focused {
+		palette.tab_active_surface
+	} else {
+		palette.tab_surface
+	});
+	let border = color(if focused {
+		palette.accent
+	} else {
+		palette.divider_surface
+	});
+	container(
+		column![
+			container(
+				text(format!("⠿⠿  {title}"))
+					.font(EDITOR_FONT)
+					.size(13.0)
+					.color(color(palette.tab_text)),
+			)
+			.padding([2, 7])
+			.width(Length::Fill)
+			.height(Length::Fixed(PANE_HEADER_HEIGHT))
+			.style(move |_| container::Style {
+				background: Some(Background::Color(header_background)),
+				..Default::default()
+			}),
+			content,
+		]
+		.width(Length::Fill)
+		.height(Length::Fill),
+	)
+	.width(Length::Fill)
+	.height(Length::Fill)
+	.style(move |_| container::Style {
+		border: iced::Border {
+			color: border,
+			width: if focused { 2.0 } else { 1.0 },
+			radius: 0.0.into(),
+		},
+		..Default::default()
+	})
+	.into()
+}
+
+fn pane_pixel_rect(rect: PaneRect) -> iced::Rectangle {
+	iced::Rectangle {
+		x: rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
+		y: rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
+		width: rect.width.get() as f32 * metrics::CELL_WIDTH,
+		height: rect.height.get() as f32 * metrics::LINE_HEIGHT,
+	}
+}
+
+fn drop_edge(bounds: iced::Rectangle, pointer: iced::Point) -> PaneDropEdge {
+	let x = (pointer.x - bounds.x) / bounds.width;
+	let y = (pointer.y - bounds.y) / bounds.height;
+	if (0.3..0.7).contains(&x) && (0.3..0.7).contains(&y) {
+		return PaneDropEdge::Center;
+	}
+	let left = x;
+	let right = 1.0 - x;
+	let top = y;
+	let bottom = 1.0 - y;
+	let nearest = left.min(right).min(top).min(bottom);
+	if nearest == left {
+		PaneDropEdge::Left
+	} else if nearest == right {
+		PaneDropEdge::Right
+	} else if nearest == top {
+		PaneDropEdge::Top
+	} else {
+		PaneDropEdge::Bottom
+	}
+}
+
+fn drop_overlay_rect(bounds: iced::Rectangle, edge: PaneDropEdge) -> iced::Rectangle {
+	match edge {
+		PaneDropEdge::Center => bounds,
+		PaneDropEdge::Left => iced::Rectangle {
+			width: bounds.width / 2.0,
+			..bounds
+		},
+		PaneDropEdge::Right => iced::Rectangle {
+			x: bounds.x + bounds.width / 2.0,
+			width: bounds.width / 2.0,
+			..bounds
+		},
+		PaneDropEdge::Top => iced::Rectangle {
+			height: bounds.height / 2.0,
+			..bounds
+		},
+		PaneDropEdge::Bottom => iced::Rectangle {
+			y: bounds.y + bounds.height / 2.0,
+			height: bounds.height / 2.0,
+			..bounds
+		},
+	}
+}
+
 /// One text pane's surface: gutter, styled rows, and minimap. Positioned by the
 /// caller at the engine's rect.
 fn text_pane_surface<'a>(
 	pane: &'a libaryon::uast::projection::PaneViewport,
 	palette: UiPalette,
+	focused: bool,
 ) -> Element<'a, EditorMsg> {
 	let lines = wrap_projected_lines(
-		project_lines(pane, palette.editor_text, palette.accent),
+		project_lines(pane, palette.editor_text, palette.accent, focused),
 		pane,
 	);
 	let gutter_background = color(palette.gutter_surface);
@@ -1499,6 +1727,37 @@ mod tests {
 		assert_eq!(prompt_line(viewport, Some("stale")).as_deref(), Some(":w"));
 	}
 
+	#[test]
+	fn pane_drop_edges_make_center_a_swap_and_edges_a_split_intent() {
+		use super::{PaneDropEdge, drop_edge};
+		let bounds = iced::Rectangle {
+			x: 100.0,
+			y: 200.0,
+			width: 400.0,
+			height: 300.0,
+		};
+		assert_eq!(
+			drop_edge(bounds, iced::Point::new(300.0, 350.0)),
+			PaneDropEdge::Center
+		);
+		assert_eq!(
+			drop_edge(bounds, iced::Point::new(105.0, 350.0)),
+			PaneDropEdge::Left
+		);
+		assert_eq!(
+			drop_edge(bounds, iced::Point::new(495.0, 350.0)),
+			PaneDropEdge::Right
+		);
+		assert_eq!(
+			drop_edge(bounds, iced::Point::new(300.0, 205.0)),
+			PaneDropEdge::Top
+		);
+		assert_eq!(
+			drop_edge(bounds, iced::Point::new(300.0, 495.0)),
+			PaneDropEdge::Bottom
+		);
+	}
+
 	fn wait_for_host_panel(editor: &mut CodeEditor) {
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
@@ -1653,7 +1912,11 @@ mod tests {
 		wait_for_host_panel(&mut editor);
 
 		assert_eq!(
-			editor.viewport.as_ref().expect("result viewport").focused_pane_id,
+			editor
+				.viewport
+				.as_ref()
+				.expect("result viewport")
+				.focused_pane_id,
 			source_pane,
 			"running a query must not make the source editor stop accepting text"
 		);
@@ -1692,7 +1955,11 @@ mod tests {
 			thread::sleep(Duration::from_millis(5));
 		}
 		assert_eq!(
-			editor.viewport.as_ref().expect("focused viewport").focused_pane_id,
+			editor
+				.viewport
+				.as_ref()
+				.expect("focused viewport")
+				.focused_pane_id,
 			panel_id,
 			"a host-panel click must update Baryon's workspace focus"
 		);
@@ -2104,7 +2371,7 @@ mod tests {
 		let viewport = editor.viewport.as_ref().expect("viewport");
 		let pane = viewport.focused_pane().expect("focused pane");
 		let palette = viewport.ui_palette;
-		let lines = project_lines(pane, palette.editor_text, palette.accent);
+		let lines = project_lines(pane, palette.editor_text, palette.accent, true);
 		assert!(
 			lines
 				.iter()
@@ -2122,7 +2389,7 @@ mod tests {
 		let pane = viewport.focused_pane().expect("focused pane");
 		let palette = viewport.ui_palette;
 		wrap_projected_lines(
-			project_lines(pane, palette.editor_text, palette.accent),
+			project_lines(pane, palette.editor_text, palette.accent, true),
 			pane,
 		)
 		.into_iter()
@@ -2345,14 +2612,14 @@ mod tests {
 
 	#[test]
 	fn local_mouse_coordinates_become_engine_cursor_positions() {
-		use super::EditorMsg;
+		use super::{EditorMsg, PANE_HEADER_HEIGHT};
 		use iced::Point;
 
 		let mut editor = CodeEditor::new("select 1;\nselect 2;\nselect 3;");
 		wait_for_content(&mut editor, "select 1;\nselect 2;\nselect 3;");
 		let _ = editor.update(EditorMsg::PointerMoved(Point::new(
 			54.0 + 9.6 * 3.0,
-			8.0 + 22.0,
+			PANE_HEADER_HEIGHT + 8.0 + 22.0,
 		)));
 		let _ = editor.update(EditorMsg::Click);
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -2409,8 +2676,11 @@ mod tests {
 			.viewport
 			.as_ref()
 			.and_then(|viewport| viewport.focused_pane())
-			.is_none_or(|pane| pane.selection_ranges.is_empty())
-			&& Instant::now() < deadline
+			.is_none_or(|pane| {
+				pane.selection_ranges
+					.first()
+					.is_none_or(|(start, end)| end.get().saturating_sub(start.get()) < 1)
+			}) && Instant::now() < deadline
 		{
 			editor.poll();
 			thread::sleep(Duration::from_millis(5));

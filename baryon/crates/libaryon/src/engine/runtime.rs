@@ -1279,6 +1279,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::ClosePane
 		| EditorCommand::ResizePane(_, _)
 		| EditorCommand::ResizePaneBoundary { .. }
+		| EditorCommand::MovePane { .. }
 		| EditorCommand::Scroll(_)
 		| EditorCommand::ScrollViewport(_)
 		| EditorCommand::ScrollViewportToLine(_)
@@ -1950,6 +1951,16 @@ fn dispatch_command(
 			target,
 		} => {
 			if session.resize_pane_boundary(before, after, axis, target) {
+				needs_render = true;
+			}
+		}
+		EditorCommand::MovePane {
+			source,
+			target,
+			edge,
+		} => {
+			reset_global_transients(session);
+			if session.move_pane(source, target, edge) {
 				needs_render = true;
 			}
 		}

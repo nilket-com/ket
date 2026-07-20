@@ -11,8 +11,8 @@ use super::jobs::{JobRuntime, JobSpawnError, JobSpec};
 use super::layout::GutterNumbering;
 use super::minimap::MinimapSnapshot;
 use super::protocol::{
-	CommandRange, EditorMode, PaneFocusDirection, PaneResizeDirection, SearchMatch, SplitDirection,
-	SubstituteFlags, VisualKind,
+	CommandRange, EditorMode, PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch,
+	SplitDirection, SubstituteFlags, VisualKind,
 };
 use super::runtime_registry::{RegistrationBatch, RegistryError, RuntimeRegistries};
 use super::shadow::ShadowSession;
@@ -550,7 +550,6 @@ impl BufferStore {
 	pub(crate) fn next_id(&self) -> BufferId {
 		self.next_buffer_id
 	}
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2030,6 +2029,40 @@ impl LayoutNode {
 		}
 	}
 
+	fn take_leaf_contents(&mut self, target: PaneId) -> Option<EditorPane> {
+		match self {
+			Self::Leaf(leaf) if leaf.pane_id == target => Some(std::mem::replace(
+				&mut leaf.pane,
+				EditorPane {
+					tabs: Vec::new(),
+					active_tab_index: 0,
+				},
+			)),
+			Self::Leaf(_) => None,
+			Self::Split { children, .. } => children
+				.iter_mut()
+				.find_map(|child| child.take_leaf_contents(target)),
+		}
+	}
+
+	fn set_leaf_contents(&mut self, target: PaneId, pane: EditorPane) -> bool {
+		match self {
+			Self::Leaf(leaf) if leaf.pane_id == target => {
+				leaf.pane = pane;
+				true
+			}
+			Self::Leaf(_) => false,
+			Self::Split { children, .. } => {
+				for child in children {
+					if child.contains_pane(target) {
+						return child.set_leaf_contents(target, pane);
+					}
+				}
+				false
+			}
+		}
+	}
+
 	pub(crate) fn find_view(&self, target: ViewId) -> Option<&View> {
 		match self {
 			Self::Leaf(leaf) => leaf.pane.tabs.iter().find(|tab| tab.id == target),
@@ -2085,6 +2118,42 @@ impl LayoutNode {
 	) -> bool {
 		let mut new_pane = Some(new_pane);
 		self.split_leaf_inner_with_order(target, direction, new_pane_id, &mut new_pane, new_first)
+	}
+
+	/// Insert an already-existing pane beside `target`. Unlike a normal split,
+	/// this preserves the pane identity and all of its tabs/view state.
+	pub(crate) fn split_leaf_with_existing_pane_order(
+		&mut self,
+		target: PaneId,
+		direction: SplitDirection,
+		pane_id: PaneId,
+		pane: EditorPane,
+		new_first: bool,
+	) -> bool {
+		let mut pane = Some(pane);
+		self.split_leaf_inner_with_order(target, direction, pane_id, &mut pane, new_first)
+	}
+
+	/// Exchange the contents of two leaf positions while leaving the layout
+	/// shape intact. Pane ids name positions in the tree; views/buffers (and
+	/// therefore host-panel identities) travel with the dragged content.
+	pub(crate) fn swap_leaf_contents(&mut self, first: PaneId, second: PaneId) -> bool {
+		if first == second || !self.contains_pane(first) || !self.contains_pane(second) {
+			return false;
+		}
+		let Some(first_pane) = self.take_leaf_contents(first) else {
+			return false;
+		};
+		let Some(second_pane) = self.take_leaf_contents(second) else {
+			return false;
+		};
+		let first_set = self.set_leaf_contents(first, second_pane);
+		let second_set = self.set_leaf_contents(second, first_pane);
+		debug_assert!(
+			first_set && second_set,
+			"prechecked leaves must still exist"
+		);
+		first_set && second_set
 	}
 
 	pub(crate) fn for_each_doctab_mut(&mut self, visit: &mut impl FnMut(&mut View)) {
@@ -3947,6 +4016,46 @@ impl EditorSession {
 			.resize_boundary(before, after, axis, target, self.editor_rect())
 	}
 
+	/// Move an existing pane by exchanging it with a target or by inserting it
+	/// beside that target. This is deliberately a session operation: GUI hosts
+	/// describe a drop, while the engine alone mutates the split tree.
+	pub(crate) fn move_pane(&mut self, source: PaneId, target: PaneId, edge: PaneDropEdge) -> bool {
+		if source == target
+			|| !self.layout.contains_pane(source)
+			|| !self.layout.contains_pane(target)
+		{
+			return false;
+		}
+		let moved = match edge {
+			PaneDropEdge::Center => self.layout.swap_leaf_contents(source, target),
+			edge => {
+				let (direction, new_first) = match edge {
+					PaneDropEdge::Left => (SplitDirection::Vertical, true),
+					PaneDropEdge::Right => (SplitDirection::Vertical, false),
+					PaneDropEdge::Top => (SplitDirection::Horizontal, true),
+					PaneDropEdge::Bottom => (SplitDirection::Horizontal, false),
+					PaneDropEdge::Center => unreachable!("handled above"),
+				};
+				let Some(pane) = self.layout.take_leaf(source) else {
+					return false;
+				};
+				self.layout
+					.split_leaf_with_existing_pane_order(target, direction, source, pane, new_first)
+			}
+		};
+		if moved {
+			// Center swaps content into the target position; edge drops preserve
+			// the source id. Focusing the target for center drops keeps the
+			// dragged content visibly active in both cases.
+			self.focused_pane_id = if edge == PaneDropEdge::Center {
+				target
+			} else {
+				source
+			};
+		}
+		moved
+	}
+
 	pub(crate) fn close_focused_pane(&mut self) -> Option<EditorPane> {
 		if self.layout.pane_count() <= 1 {
 			return None;
@@ -4449,6 +4558,54 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	#[test]
+	fn moving_panes_swaps_contents_or_reinserts_the_existing_leaf() {
+		use super::PaneDropEdge;
+
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let left = session.focused_pane_id;
+		let left_view = session
+			.layout
+			.find_pane(left)
+			.expect("left pane")
+			.active_tab()
+			.id;
+		assert!(session.split_focused_pane(&registry, SplitDirection::Vertical));
+		let right = session.focused_pane_id;
+		let right_view = session
+			.layout
+			.find_pane(right)
+			.expect("right pane")
+			.active_tab()
+			.id;
+
+		assert!(session.move_pane(right, left, PaneDropEdge::Center));
+		assert_eq!(session.focused_pane_id, left);
+		assert_eq!(
+			session.layout.find_pane(left).unwrap().active_tab().id,
+			right_view
+		);
+		assert_eq!(
+			session.layout.find_pane(right).unwrap().active_tab().id,
+			left_view
+		);
+
+		// Edge drops preserve the source pane id (and all content it owns), but
+		// replace the target's old split relationship with a new sibling split.
+		assert!(session.move_pane(right, left, PaneDropEdge::Top));
+		assert_eq!(session.focused_pane_id, right);
+		assert_eq!(
+			session.layout.find_pane(right).unwrap().active_tab().id,
+			left_view
+		);
+		assert_eq!(
+			session.layout.find_pane(left).unwrap().active_tab().id,
+			right_view
+		);
+		assert_eq!(session.layout.pane_count(), 2);
 	}
 
 	#[test]

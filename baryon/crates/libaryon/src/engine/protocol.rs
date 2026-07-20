@@ -80,6 +80,19 @@ pub enum PaneResizeDirection {
 	Decrease,
 }
 
+/// Where a dragged pane lands relative to its drop target.
+///
+/// `Center` exchanges the two panes; the four edges detach the source pane
+/// and insert it as a sibling of the target in the requested direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneDropEdge {
+	Center,
+	Left,
+	Right,
+	Top,
+	Bottom,
+}
+
 #[derive(Debug, Clone)]
 pub enum CommandRange {
 	WholeFile,
@@ -114,6 +127,7 @@ impl EditorCommand {
 				| Self::ClosePane
 				| Self::ResizePane(_, _)
 				| Self::ResizePaneBoundary { .. }
+				| Self::MovePane { .. }
 				| Self::DocTabNew
 				| Self::DocTabEdit(_)
 				| Self::DocTabNext
@@ -177,6 +191,13 @@ pub enum EditorCommand {
 		after: PaneId,
 		axis: SplitDirection,
 		target: u32,
+	},
+	/// Rearrange two existing workspace panes. The engine owns this topology
+	/// mutation so GUI hosts never need a parallel split tree.
+	MovePane {
+		source: PaneId,
+		target: PaneId,
+		edge: PaneDropEdge,
 	},
 	Scroll(i32),
 	ScrollViewport(i32),
