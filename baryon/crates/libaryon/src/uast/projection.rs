@@ -5,7 +5,9 @@ use crate::core::{
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::UiPalette;
-use crate::engine::{GutterNumbering, MinimapSnapshot, VisibleRow};
+use crate::engine::{
+	GutterNumbering, HostPanelId, MinimapSnapshot, PanelRevision, SplitDirection, VisibleRow,
+};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
@@ -147,6 +149,32 @@ pub struct MarkdownPreviewSnapshot {
 	pub source_viewport_line_count: u32,
 }
 
+/// A draggable split boundary, authored by the engine so frontends never infer
+/// gap geometry for themselves.
+///
+/// `visual_rect` is what to paint; `hit_rect` is what to grab, and may be
+/// larger. Keeping them separate lets a divider stay visually thin while
+/// remaining comfortably clickable — a 1-row horizontal divider is a poor
+/// pointer target at its painted size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneDividerViewport {
+	pub before: PaneId,
+	pub after: PaneId,
+	pub axis: SplitDirection,
+	pub visual_rect: PaneRect,
+	pub hit_rect: PaneRect,
+}
+
+/// Presentation identity of a host-rendered pane. Carries no host data: the
+/// frontend maps `panel_id` to whatever it is drawing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPanelViewport {
+	pub panel_id: HostPanelId,
+	pub kind: String,
+	pub title: String,
+	pub revision: PanelRevision,
+}
+
 pub struct PaneViewport {
 	pub pane_id: PaneId,
 	/// Identity of the active view projected in this pane.
@@ -183,6 +211,8 @@ pub struct PaneViewport {
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
 	pub markdown_preview: Option<MarkdownPreviewSnapshot>,
+	/// Present when this pane is host-rendered; the frontend draws its rect.
+	pub host_panel: Option<HostPanelViewport>,
 	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],
 	pub render_rows: Vec<VisibleRow>,
 	pub visible_rows: Vec<VisibleRow>,
@@ -220,6 +250,9 @@ pub struct Viewport {
 	/// Checked-out branch for the focused document's repository, when available.
 	pub git_branch: Option<String>,
 	pub status_message: Option<String>,
+	/// Draggable split boundaries for this layout, engine-authored so the host
+	/// never infers gap geometry (see `plans/wip/notebook-with-panes.md`).
+	pub dividers: Vec<PaneDividerViewport>,
 	/// One-shot reply to [`EditorCommand::QueryDocumentText`]: the focused
 	/// document's full text, present only on the projection that answers the
 	/// query.

@@ -21,14 +21,17 @@ use super::session::{
 };
 use super::support::line_start_byte_sparse;
 use crate::core::{
-	BufferId, CursorPosition, DOCTAB_BAR_ROWS, DisplayRow, DocByte, DocLine, DocLineCount, PaneId,
-	PaneLocalCol, PaneLocalRow, Rgb,
+	BufferId, CursorPosition, DOCTAB_BAR_ROWS, DisplayRow, DocByte, DocLine, DocLineCount, PaneCol,
+	PaneId, PaneLocalCol, PaneLocalRow, PaneRect, PaneRow, Rgb, ScreenCol, ScreenRow,
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::SvpResolver;
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
-use crate::uast::projection::{GutterLineNumber, ProjectedCaret};
+use crate::engine::SplitDirection;
+use crate::uast::projection::{
+	GutterLineNumber, HostPanelViewport, PaneDividerViewport, ProjectedCaret,
+};
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -221,7 +224,8 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 				.source_path
 				.as_deref()
 				.and_then(|path| git_branch_cache.cached_branch_for_path(Path::new(path))),
-			Some(BufferContent::MarkdownPreview(_)) | None => None,
+			// A host panel has no path of its own, so it contributes no branch.
+			Some(BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_)) | None => None,
 		}
 	};
 
@@ -302,12 +306,14 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		*hit_test_fingerprint = Some(next_hit_test_fingerprint);
 	}
 
+	let dividers = dividers_for(&panes);
 	let _ = tx_view.send(Viewport {
 		viewport_id: *viewport_id,
 		panes,
 		focused_pane_id: *focused_pane_id,
 		git_branch,
 		status_message,
+		dividers,
 		document_text,
 		busy: viewport_is_busy(io_busy, semantic_busy),
 		should_quit,
@@ -326,6 +332,86 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	registry.enforce_resident_budget(None);
 
 	should_quit
+}
+
+/// Widen a divider's grab area beyond its painted size. A 1-row horizontal
+/// divider is a poor pointer target, so the engine publishes a usable hit
+/// rectangle rather than leaving every frontend to invent one.
+const DIVIDER_HIT_PADDING: u32 = 1;
+
+/// Derive draggable boundaries from the projected pane rectangles. Adjacency
+/// is decided here, once, so no frontend has to know how wide a split gap is.
+fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
+	let mut dividers = Vec::new();
+	for before in panes {
+		for after in panes {
+			if before.pane_id == after.pane_id {
+				continue;
+			}
+			// Vertical divider: `after` begins one gap to the right of
+			// `before`, and the two share vertical extent.
+			let shares_rows = before.rect.screen_row.get() < after.rect.bottom().get()
+				&& after.rect.screen_row.get() < before.rect.bottom().get();
+			if shares_rows
+				&& after.rect.screen_col.get()
+					== before.rect.right().get() + crate::core::SPLIT_DIVIDER_COLS
+			{
+				let top = before.rect.screen_row.get().max(after.rect.screen_row.get());
+				let bottom = before.rect.bottom().get().min(after.rect.bottom().get());
+				let visual = PaneRect::new(
+					ScreenCol::new(before.rect.right().get()),
+					ScreenRow::new(top),
+					PaneCol::new(crate::core::SPLIT_DIVIDER_COLS),
+					PaneRow::new(bottom.saturating_sub(top)),
+				);
+				dividers.push(PaneDividerViewport {
+					before: before.pane_id,
+					after: after.pane_id,
+					axis: SplitDirection::Vertical,
+					visual_rect: visual,
+					hit_rect: visual,
+				});
+			}
+
+			let shares_columns = before.rect.screen_col.get() < after.rect.right().get()
+				&& after.rect.screen_col.get() < before.rect.right().get();
+			if shares_columns
+				&& after.rect.screen_row.get()
+					== before.rect.bottom().get() + crate::core::SPLIT_DIVIDER_ROWS
+			{
+				let left = before.rect.screen_col.get().max(after.rect.screen_col.get());
+				let right = before.rect.right().get().min(after.rect.right().get());
+				let visual = PaneRect::new(
+					ScreenCol::new(left),
+					ScreenRow::new(before.rect.bottom().get()),
+					PaneCol::new(right.saturating_sub(left)),
+					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS),
+				);
+				// Horizontal gaps are a single row; grow the grab area upward
+				// and downward so the boundary is comfortably clickable.
+				let hit = PaneRect::new(
+					ScreenCol::new(left),
+					ScreenRow::new(
+						before
+							.rect
+							.bottom()
+							.get()
+							.saturating_sub(DIVIDER_HIT_PADDING),
+					),
+					PaneCol::new(right.saturating_sub(left)),
+					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS + DIVIDER_HIT_PADDING * 2),
+				);
+				dividers.push(PaneDividerViewport {
+					before: before.pane_id,
+					after: after.pane_id,
+					axis: SplitDirection::Horizontal,
+					visual_rect: visual,
+					hit_rect: hit,
+				});
+			}
+		}
+	}
+	dividers
 }
 
 fn hit_test_fingerprint_for(panes: &[PaneViewport]) -> u64 {
@@ -396,6 +482,17 @@ fn render_pane_viewport(
 		.saturating_sub(DOCTAB_BAR_ROWS as u32);
 	let active_doctab_index = pane.active_tab_index;
 	let active_view_id = pane.active_tab().id;
+	// Read before the mutable render borrow below: a host panel projects only
+	// presentation identity, so nothing here depends on render state.
+	let host_panel = buffers
+		.get(pane.active_tab().buffer_id)
+		.and_then(|buffer| buffer.host_panel())
+		.map(|panel| HostPanelViewport {
+			panel_id: panel.panel_id,
+			kind: panel.descriptor.kind.clone(),
+			title: panel.descriptor.title.clone(),
+			revision: panel.revision,
+		});
 
 	let (
 		tokens,
@@ -493,6 +590,58 @@ fn render_pane_viewport(
 				false,
 				false,
 				preview_view
+					.state
+					.background_hex
+					.as_deref()
+					.and_then(Rgb::from_hex),
+				false,
+			);
+		}
+		if let (BufferContent::HostPanel(document), ViewContent::HostPanel(panel_view)) =
+			(&buffer.content, &mut view.content)
+		{
+			// A host panel projects geometry and identity only: no tokens, no
+			// caret, nothing text-shaped. The frontend paints the rect.
+			break 'render_active_view (
+				Vec::new(),
+				panel_view.state.scroll_y,
+				DocLine::ZERO,
+				panel_view.state.scroll_row_offset,
+				panel_view.state.viewport_lines,
+				false,
+				false,
+				None,
+				Vec::new(),
+				Vec::new(),
+				PaneLocalRow::ZERO,
+				CursorPosition::new(DocLine::ZERO, crate::core::DocDisplayCol::ZERO),
+				PaneLocalCol::ZERO,
+				DocByte::ZERO,
+				DocByte::ZERO,
+				Vec::new(),
+				0,
+				0,
+				Some(document.descriptor.title.clone()),
+				0,
+				Some(1),
+				false,
+				None,
+				DocByte::ZERO,
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				None,
+				None,
+				panel_view.state.current_theme.syntax_colors,
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				false,
+				"Host Panel",
+				false,
+				false,
+				panel_view
 					.state
 					.background_hex
 					.as_deref()
@@ -1137,6 +1286,7 @@ fn render_pane_viewport(
 	PaneViewport {
 		pane_id: pane_layout.pane_id,
 		view_id: active_view_id,
+		host_panel,
 		rect: pane_layout.rect,
 		tokens,
 		scroll_y,

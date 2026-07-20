@@ -164,6 +164,20 @@ pub enum EditorCommand {
 	WriteInit {
 		force: bool,
 	},
+	/// Open a host-rendered panel in a split beside the focused pane. The
+	/// engine owns its identity, geometry, focus, and tab membership; the
+	/// frontend draws its contents and owns its backing state.
+	OpenHostPanel {
+		panel_id: crate::engine::HostPanelId,
+		kind: String,
+		title: String,
+	},
+	/// Rebind a live panel to a new revision of its source, so the frontend can
+	/// mark or replace stale output.
+	RefreshHostPanel {
+		panel_id: crate::engine::HostPanelId,
+		revision: crate::engine::PanelRevision,
+	},
 	/// Replace `init.rn` with Baryon's built-in default configuration.
 	WriteDefaultInit {
 		force: bool,

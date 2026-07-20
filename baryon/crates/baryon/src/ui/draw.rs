@@ -442,6 +442,43 @@ fn draw_pane(
 		return PaneDrawArtifacts::default();
 	}
 
+	if let Some(panel) = pane.host_panel.as_ref() {
+		// Baryon cannot draw a host panel's contents — by design, that belongs
+		// to the embedding frontend. Render an honest placeholder so the pane
+		// is visible and identifiable standalone rather than blank.
+		let area = Rect {
+			x: pane_area.x,
+			y: text_area_top.get() as u16,
+			width: pane_area.width,
+			height: text_area_height.get() as u16,
+		};
+		let surface = ratatui_color(palette.preview_surface);
+		let fill = Style::default().bg(surface).fg(surface);
+		for row in 0..area.height {
+			for col in 0..area.width {
+				if let Some(cell) = buf.cell_mut((area.x + col, area.y + row)) {
+					cell.set_char(' ').set_style(fill);
+				}
+			}
+		}
+		let label = format!("[{}: {}]", panel.kind, panel.title);
+		let label_style = Style::default().bg(surface).fg(ratatui_color(palette.preview_text));
+		let label_row = area.y + area.height / 2;
+		let label_col = area
+			.x
+			.saturating_add(area.width.saturating_sub(label.chars().count() as u16) / 2);
+		for (offset, character) in label.chars().enumerate() {
+			let x = label_col.saturating_add(offset as u16);
+			if x >= area.x.saturating_add(area.width) {
+				break;
+			}
+			if let Some(cell) = buf.cell_mut((x, label_row)) {
+				cell.set_char(character).set_style(label_style);
+			}
+		}
+		return PaneDrawArtifacts::default();
+	}
+
 	if pane.markdown_preview.is_some() {
 		let preview_area = Rect {
 			x: pane_area.x,

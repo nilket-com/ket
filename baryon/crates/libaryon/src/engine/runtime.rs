@@ -324,7 +324,10 @@ fn current_input_context(registry: &UastRegistry, session: &EditorSession) -> In
 			browser.cursor.primary().abs_line(),
 			browser.cursor.len(),
 		),
-		ViewContent::MarkdownPreview(_) => (DocByte::ZERO, DocLine::ZERO, 0),
+		// Neither has a caret: nothing text-shaped is focused.
+		ViewContent::MarkdownPreview(_) | ViewContent::HostPanel(_) => {
+			(DocByte::ZERO, DocLine::ZERO, 0)
+		}
 	};
 	let cursor_line_start_byte = session
 		.buffers
@@ -493,6 +496,7 @@ fn focused_git_path(session: &EditorSession) -> Option<PathBuf> {
 			BufferContent::MarkdownPreview(document) => {
 				document.state.source_path.clone().map(PathBuf::from)
 			}
+			BufferContent::HostPanel(_) => None,
 		})
 		.or_else(|| std::env::current_dir().ok())
 }
@@ -734,6 +738,12 @@ fn release_buffer(
 	let Some(mut buffer) = session.buffers.remove(buffer_id) else {
 		return;
 	};
+	// Callers reach here only once no view references the buffer, so this is
+	// the panel's last workspace reference disappearing.
+	if let Some(panel) = buffer.host_panel() {
+		let panel_id = panel.panel_id;
+		session.note_panel_disposed(panel_id);
+	}
 	if let BufferContent::Text(document) = &mut buffer.content {
 		if let Some(shadow) = document.shadow.take() {
 			let _ = discard_shadow_session(&shadow);
@@ -1277,6 +1287,8 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::SetGitRefresh(_)
 		| EditorCommand::WriteInit { .. }
 		| EditorCommand::WriteDefaultInit { .. }
+		| EditorCommand::OpenHostPanel { .. }
+		| EditorCommand::RefreshHostPanel { .. }
 		| EditorCommand::ClearVisualSelection
 		| EditorCommand::CheckFileReload
 		| EditorCommand::DiffSplit(_)
@@ -1774,6 +1786,62 @@ fn dispatch_command(
 		EditorCommand::Resize(width, height) => {
 			session.update_terminal_size(width, height);
 			needs_render = true;
+		}
+		EditorCommand::OpenHostPanel {
+			panel_id,
+			kind,
+			title,
+		} => {
+			// Reopening an existing identity focuses it rather than creating a
+			// second panel for the same host object.
+			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id) {
+				if let Some(pane_id) = session
+					.layout
+					.view_id_for_buffer(buffer_id)
+					.and_then(|view_id| session.layout.pane_id_for_view(view_id))
+				{
+					session.focus_pane(pane_id);
+				}
+			} else {
+				let focused_pane_id = session.focused_pane_id;
+				let (viewport_width, viewport_lines) = new_doctab_viewport(session);
+				let view = session.create_host_panel_view(
+					panel_id,
+					crate::engine::HostPanelDescriptor { kind, title },
+					viewport_width,
+					viewport_lines,
+				);
+				let buffer_id = view.buffer_id;
+				let pane = EditorPane::from_view(view);
+				if session
+					.split_pane_with_new_pane_order(
+						focused_pane_id,
+						SplitDirection::Vertical,
+						pane,
+						false,
+					)
+					.is_none()
+				{
+					release_buffer(runtime, session, buffer_id);
+					session.ui.status_message =
+						Some("No room to open a host panel".to_string());
+				}
+			}
+			needs_render = true;
+		}
+		EditorCommand::RefreshHostPanel {
+			panel_id,
+			revision,
+		} => {
+			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id)
+				&& let Some(panel) = session
+					.buffers
+					.get_mut(buffer_id)
+					.and_then(|buffer| buffer.host_panel_mut())
+			{
+				panel.revision = revision;
+				needs_render = true;
+			}
 		}
 		EditorCommand::FocusPane(pane_id) => {
 			if session.focus_pane(pane_id) {
@@ -2778,6 +2846,7 @@ pub(crate) fn run_engine(engine: Engine) {
 	let rx_request = engine.rx_request;
 	let tx_internal = engine.tx_internal;
 	let tx_view = engine.tx_view;
+	let host_events = engine.host_events;
 	let reactor = engine.reactor;
 	let lang_registry = engine.lang_registry;
 	let initial_theme_name = engine.initial_theme_name;
@@ -3087,6 +3156,13 @@ pub(crate) fn run_engine(engine: Engine) {
 				command,
 			);
 			session.emit_text_lifecycle_since(lifecycle_before);
+			// Ordered, non-coalescing: panel disposals must reach the frontend
+			// exactly once, so they never ride the viewport projection.
+			for panel_id in session.take_disposed_panels() {
+				if let Some(sender) = host_events.as_ref() {
+					let _ = sender.send(super::host_event::HostEvent::PanelDisposed { panel_id });
+				}
+			}
 			needs_render |= dispatch.needs_render;
 			needs_render |= apply_input_mode_override(&mut session);
 			if dispatch.should_stop {

@@ -25,6 +25,7 @@ use crate::core::{
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
+use crate::engine::host_event::{HostPanelDescriptor, HostPanelId, PanelRevision};
 use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
 use crate::svp::diagnostic::DiagnosticSpan;
@@ -200,10 +201,20 @@ pub(crate) struct MarkdownPreviewBuffer {
 	pub(crate) state: MarkdownImagePreviewState,
 }
 
+/// A pane whose pixels the frontend draws. The engine owns its identity,
+/// geometry, focus, and tab membership, and knows nothing about its contents:
+/// no host data is representable here, only presentation metadata.
+pub(crate) struct HostPanelBuffer {
+	pub(crate) panel_id: HostPanelId,
+	pub(crate) descriptor: HostPanelDescriptor,
+	pub(crate) revision: PanelRevision,
+}
+
 pub(crate) enum BufferContent {
 	Text(TextBuffer),
 	FileBrowser(FileBrowserBuffer),
 	MarkdownPreview(MarkdownPreviewBuffer),
+	HostPanel(HostPanelBuffer),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +238,11 @@ impl Buffer {
 		matches!(self.content, BufferContent::MarkdownPreview(_))
 	}
 
+	#[allow(dead_code, reason = "used by host-panel input routing, next cut")]
+	pub(crate) fn is_host_panel(&self) -> bool {
+		matches!(self.content, BufferContent::HostPanel(_))
+	}
+
 	pub(crate) fn is_output_panel(&self) -> bool {
 		self.role == BufferRole::OutputPanel
 	}
@@ -239,7 +255,7 @@ impl Buffer {
 		match &self.content {
 			BufferContent::Text(buffer) => Some(buffer.root_id),
 			BufferContent::FileBrowser(buffer) => Some(buffer.root_id),
-			BufferContent::MarkdownPreview(_) => None,
+			BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_) => None,
 		}
 	}
 
@@ -248,34 +264,62 @@ impl Buffer {
 			BufferContent::Text(buffer) => buffer.file_path.as_deref(),
 			BufferContent::FileBrowser(buffer) => Some(&buffer.file_path),
 			BufferContent::MarkdownPreview(buffer) => Some(&buffer.title),
+			// A host panel is never file-backed: it has a title, not a path.
+			BufferContent::HostPanel(_) => None,
 		}
 	}
 
 	pub(crate) fn text(&self) -> Option<&TextBuffer> {
 		match &self.content {
 			BufferContent::Text(buffer) => Some(buffer),
-			BufferContent::FileBrowser(_) | BufferContent::MarkdownPreview(_) => None,
+			BufferContent::FileBrowser(_)
+			| BufferContent::MarkdownPreview(_)
+			| BufferContent::HostPanel(_) => None,
 		}
 	}
 
 	pub(crate) fn text_mut(&mut self) -> Option<&mut TextBuffer> {
 		match &mut self.content {
 			BufferContent::Text(buffer) => Some(buffer),
-			BufferContent::FileBrowser(_) | BufferContent::MarkdownPreview(_) => None,
+			BufferContent::FileBrowser(_)
+			| BufferContent::MarkdownPreview(_)
+			| BufferContent::HostPanel(_) => None,
 		}
 	}
 
 	pub(crate) fn file_browser(&self) -> Option<&FileBrowserBuffer> {
 		match &self.content {
 			BufferContent::FileBrowser(buffer) => Some(buffer),
-			BufferContent::Text(_) | BufferContent::MarkdownPreview(_) => None,
+			BufferContent::Text(_)
+			| BufferContent::MarkdownPreview(_)
+			| BufferContent::HostPanel(_) => None,
 		}
 	}
 
 	pub(crate) fn markdown_preview(&self) -> Option<&MarkdownPreviewBuffer> {
 		match &self.content {
 			BufferContent::MarkdownPreview(buffer) => Some(buffer),
-			BufferContent::Text(_) | BufferContent::FileBrowser(_) => None,
+			BufferContent::Text(_)
+			| BufferContent::FileBrowser(_)
+			| BufferContent::HostPanel(_) => None,
+		}
+	}
+
+	pub(crate) fn host_panel(&self) -> Option<&HostPanelBuffer> {
+		match &self.content {
+			BufferContent::HostPanel(buffer) => Some(buffer),
+			BufferContent::Text(_)
+			| BufferContent::FileBrowser(_)
+			| BufferContent::MarkdownPreview(_) => None,
+		}
+	}
+
+	pub(crate) fn host_panel_mut(&mut self) -> Option<&mut HostPanelBuffer> {
+		match &mut self.content {
+			BufferContent::HostPanel(buffer) => Some(buffer),
+			BufferContent::Text(_)
+			| BufferContent::FileBrowser(_)
+			| BufferContent::MarkdownPreview(_) => None,
 		}
 	}
 }
@@ -455,6 +499,18 @@ impl BufferStore {
 	/// Drop a buffer's canonical-path claim after its document stops
 	/// representing that file (e.g. `ReplaceDocument`), so the path can be
 	/// reopened into another buffer.
+	/// Find the buffer backing a host panel identity, if one is live.
+	pub(crate) fn host_panel_buffer_id(&self, panel_id: HostPanelId) -> Option<BufferId> {
+		self.by_id
+			.iter()
+			.find(|(_, buffer)| {
+				buffer
+					.host_panel()
+					.is_some_and(|panel| panel.panel_id == panel_id)
+			})
+			.map(|(id, _)| *id)
+	}
+
 	pub(crate) fn detach_path(&mut self, buffer_id: BufferId) {
 		let Some(buffer) = self.by_id.get_mut(&buffer_id) else {
 			return;
@@ -1462,10 +1518,17 @@ pub(crate) struct MarkdownPreviewView {
 	pub(crate) state: CommonViewState,
 }
 
+/// View-local state for a host panel: geometry only, since the frontend owns
+/// everything drawn inside it.
+pub(crate) struct HostPanelView {
+	pub(crate) state: CommonViewState,
+}
+
 pub(crate) enum ViewContent {
 	Text(TextView),
 	FileBrowser(FileBrowserView),
 	MarkdownPreview(MarkdownPreviewView),
+	HostPanel(HostPanelView),
 }
 
 pub(crate) struct View {
@@ -1552,6 +1615,27 @@ impl View {
 		}
 	}
 
+	pub(crate) fn new_host_panel(
+		id: ViewId,
+		buffer_id: BufferId,
+		persistent_settings: &SettingsPersistent,
+		viewport_width: u16,
+		viewport_lines: u32,
+	) -> Self {
+		Self {
+			id,
+			buffer_id,
+			content: ViewContent::HostPanel(HostPanelView {
+				state: new_common_view_state(persistent_settings, viewport_width, viewport_lines),
+			}),
+		}
+	}
+
+	#[allow(dead_code, reason = "used by host-panel input routing, next cut")]
+	pub(crate) fn is_host_panel(&self) -> bool {
+		matches!(self.content, ViewContent::HostPanel(_))
+	}
+
 	pub(crate) fn is_file_browser(&self) -> bool {
 		matches!(self.content, ViewContent::FileBrowser(_))
 	}
@@ -1565,6 +1649,7 @@ impl View {
 			ViewContent::Text(view) => &view.state.common,
 			ViewContent::FileBrowser(view) => &view.state.common,
 			ViewContent::MarkdownPreview(view) => &view.state,
+			ViewContent::HostPanel(view) => &view.state,
 		}
 	}
 
@@ -1573,6 +1658,7 @@ impl View {
 			ViewContent::Text(view) => &mut view.state.common,
 			ViewContent::FileBrowser(view) => &mut view.state.common,
 			ViewContent::MarkdownPreview(view) => &mut view.state,
+			ViewContent::HostPanel(view) => &mut view.state,
 		}
 	}
 
@@ -2864,6 +2950,8 @@ pub(crate) struct EditorSession {
 	pub(crate) persistent_settings: SettingsPersistent,
 	pub(crate) next_pane_id: PaneId,
 	pub(crate) next_view_id: ViewId,
+	/// Panels whose last workspace reference disappeared since the last drain.
+	disposed_panels: Vec<HostPanelId>,
 	pub(crate) next_semantic_request_id: RequestId,
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
@@ -3329,6 +3417,7 @@ impl EditorSession {
 			persistent_settings,
 			next_pane_id: PaneId::new(2),
 			next_view_id: initial_view_id.next(),
+			disposed_panels: Vec::new(),
 			next_semantic_request_id: RequestId::new(1),
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
@@ -3346,6 +3435,48 @@ impl EditorSession {
 		let id = self.next_view_id;
 		self.next_view_id = self.next_view_id.next();
 		id
+	}
+
+	/// Create the buffer and view for a host-rendered panel. The engine holds
+	/// only presentation metadata; the frontend owns whatever is drawn inside.
+	pub(crate) fn create_host_panel_view(
+		&mut self,
+		panel_id: HostPanelId,
+		descriptor: HostPanelDescriptor,
+		viewport_width: u16,
+		viewport_lines: u32,
+	) -> View {
+		let buffer_id = self.buffers.insert(BufferContent::HostPanel(HostPanelBuffer {
+			panel_id,
+			descriptor,
+			revision: PanelRevision::new(0),
+		}));
+		let view_id = self.allocate_view_id();
+		View::new_host_panel(
+			view_id,
+			buffer_id,
+			&self.persistent_settings,
+			viewport_width,
+			viewport_lines,
+		)
+	}
+
+	/// Buffer backing a panel identity. Disposal is refcounted like buffer
+	/// release: the frontend may only drop backing state once no workspace
+	/// view references this buffer.
+	pub(crate) fn host_panel_buffer_id(&self, panel_id: HostPanelId) -> Option<BufferId> {
+		self.buffers.host_panel_buffer_id(panel_id)
+	}
+
+	/// Record that a panel's last workspace reference is gone. Drained by the
+	/// run loop into `HostEvent::PanelDisposed`; accumulated here so buffer
+	/// release does not need the event sender threaded into it.
+	pub(crate) fn note_panel_disposed(&mut self, panel_id: HostPanelId) {
+		self.disposed_panels.push(panel_id);
+	}
+
+	pub(crate) fn take_disposed_panels(&mut self) -> Vec<HostPanelId> {
+		std::mem::take(&mut self.disposed_panels)
 	}
 
 	pub(crate) fn create_unnamed_text_view(

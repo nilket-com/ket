@@ -5063,6 +5063,122 @@ mod tests {
 	}
 
 	#[test]
+	fn host_panels_project_identity_dividers_and_refcounted_disposal() {
+		use crate::engine::{HostEvent, HostPanelId, PanelRevision};
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+		let panel_id = HostPanelId::new(42);
+
+		let opened = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id,
+				kind: "result-table".to_string(),
+				title: "Trip distribution".to_string(),
+			},
+		);
+		let panel = opened
+			.panes
+			.iter()
+			.find_map(|pane| pane.host_panel.as_ref())
+			.expect("host panel is projected");
+		assert_eq!(panel.panel_id, panel_id);
+		assert_eq!(panel.kind, "result-table");
+		assert_eq!(panel.title, "Trip distribution");
+		assert_eq!(panel.revision, PanelRevision::new(0));
+
+		// The panel is a pane like any other, so the engine publishes the
+		// boundary between it and the editor — the host never infers geometry.
+		assert!(
+			!opened.dividers.is_empty(),
+			"a split must project a draggable divider"
+		);
+		let divider = opened.dividers.first().expect("divider");
+		assert!(
+			divider.hit_rect.width.get() >= divider.visual_rect.width.get()
+				&& divider.hit_rect.height.get() >= divider.visual_rect.height.get(),
+			"the grab area is never smaller than what is painted"
+		);
+
+		// Rebinding to a new revision is how stale output is signalled.
+		let refreshed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::RefreshHostPanel {
+				panel_id,
+				revision: PanelRevision::new(3),
+			},
+		);
+		assert_eq!(
+			refreshed
+				.panes
+				.iter()
+				.find_map(|pane| pane.host_panel.as_ref())
+				.map(|panel| panel.revision),
+			Some(PanelRevision::new(3))
+		);
+
+		// A host panel is not a document. Text commands are inert on it rather
+		// than reaching a document path: no write is attempted and no text
+		// status is produced, and typing cannot damage anything because the
+		// pane projects no text at all.
+		let write = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::WriteFile);
+		assert_eq!(write.status_message, None, "write is inert on a host panel");
+		let typed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::InsertText("clobber".to_string()),
+		);
+		let panel_pane = typed
+			.panes
+			.iter()
+			.find(|pane| pane.host_panel.is_some())
+			.expect("panel survives document commands");
+		assert!(
+			panel_pane.tokens.is_empty(),
+			"a host panel projects no text"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
+	fn closing_a_host_panel_emits_exactly_one_disposal() {
+		use crate::engine::{EngineConfig, EngineHandle, HostEvent, HostPanelId};
+		use std::time::Duration;
+
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		let commands = handle.command_sender();
+		let events = handle.take_host_events().expect("host event stream");
+		let panel_id = HostPanelId::new(7);
+
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id,
+				kind: "dashboard".to_string(),
+				title: "Dashboard".to_string(),
+			})
+			.expect("open panel");
+		commands
+			.send(EditorCommand::ClosePane)
+			.expect("close the panel pane");
+		std::thread::sleep(Duration::from_millis(300));
+
+		let disposals = events
+			.try_iter()
+			.filter(|event| matches!(event, HostEvent::PanelDisposed { panel_id: id } if *id == panel_id))
+			.count();
+		assert_eq!(
+			disposals, 1,
+			"the last workspace reference disappearing disposes the panel exactly once"
+		);
+
+		handle.shutdown().expect("engine thread");
+	}
+
+	#[test]
 	fn set_language_gives_a_pathless_scratch_buffer_semantic_highlighting() {
 		use std::time::Duration;
 
