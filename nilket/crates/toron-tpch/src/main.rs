@@ -14,14 +14,15 @@ use toron_tpch::telemetry::{
 	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status,
 };
 use toron_tpch::{
-	ALL_QUERY_IDS, CACHE_ROOT, Q17BoundaryCensusOutcome, check_strict_query_with_data_source,
-	correctness_matrix, export_perf_query_parquet, export_persisted_perf_query_parquet,
-	gauge_hash_smaller_build, gauge_memory_per_task, gauge_spill_bytes_reserved,
-	generate_dev_lineitem, load_persisted_tpch_dataset, matrix, normalize_duckdb_type,
-	parse_scale_factor, prepare_persisted_tpch_dataset, q17_correctness_scale, run_dev_q1,
-	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
-	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	ALL_QUERY_IDS, CACHE_ROOT, PRIMITIVE_LADDER_IDS, Q17BoundaryCensusOutcome,
+	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
+	export_persisted_perf_query_parquet, gauge_hash_smaller_build, gauge_memory_per_task,
+	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
+	normalize_duckdb_type, parse_scale_factor, prepare_persisted_tpch_dataset,
+	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -92,6 +93,7 @@ async fn main() -> ExitCode {
 			println!("adr448-harness-capability-v1");
 			ExitCode::SUCCESS
 		}
+		"ladder" => ladder_command(&args).await,
 		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
@@ -1290,6 +1292,14 @@ fn perf_query_list(query: &str) -> Result<Vec<&'static str>, String> {
 		"q20" => "q20",
 		"q21" => "q21",
 		"q22" => "q22",
+		// ADR 473: the primitive ladder rides the same perf rail as the board.
+		"m00" => "m00",
+		"m01" => "m01",
+		"m02" => "m02",
+		"m03" => "m03",
+		"m04" => "m04",
+		"m05" => "m05",
+		"m06" => "m06",
 		other => return Err(format!("perf --query {other} is not supported")),
 	};
 	Ok(vec![normalized])
@@ -1916,8 +1926,19 @@ fn polars_not_attempted_row(
 	.json_value()
 }
 
+/// ADR 473: engine thread count is a first-class ladder condition — a comparison
+/// that does not record it is not a roofline.
+fn duckdb_thread_setting() -> Option<String> {
+	std::env::var("TORON_TPCH_DUCKDB_THREADS")
+		.ok()
+		.filter(|value| !value.is_empty())
+}
+
 fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
-	export
+	let threads = duckdb_thread_setting()
+		.map(|threads| format!("SET threads={threads};\n"))
+		.unwrap_or_default();
+	let views = export
 		.tables
 		.iter()
 		.map(|table| {
@@ -1928,7 +1949,8 @@ fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
 			)
 		})
 		.collect::<Vec<_>>()
-		.join("\n")
+		.join("\n");
+	format!("{threads}{views}")
 }
 
 fn duckdb_query_statement(sql: &str) -> String {
@@ -4720,4 +4742,159 @@ mod adr469_tests {
 		assert!(gauge_hash_smaller_build().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
 	}
+}
+
+/// ADR 473: the primitive ladder — run the cost primitives across engines and
+/// record every condition that makes the comparison meaningful. Emits one JSONL
+/// row per (engine, primitive) plus a rendered ratio table. Conditions recorded:
+/// data source and path, engine version, thread setting, budget coordinates,
+/// rows/groups/output rows, spill bytes, and per-run samples.
+async fn ladder_command(args: &[String]) -> ExitCode {
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let sf = match explicit_sf(args) {
+		Ok(explicit) => explicit.unwrap_or(1.0),
+		Err(message) => return harness_error(&message),
+	};
+	let runs = match parse_usize_flag(args, "--runs", 5) {
+		Ok(runs) if runs > 0 => runs,
+		Ok(_) => return harness_error("--runs must be greater than zero"),
+		Err(message) => return harness_error(&message),
+	};
+	let warmup = match parse_usize_flag(args, "--warmup", 1) {
+		Ok(warmup) => warmup,
+		Err(message) => return harness_error(&message),
+	};
+	let engines = match parse_perf_engines(flag_value(args, "--engines").unwrap_or("toron,duckdb"))
+	{
+		Ok(engines) => engines,
+		Err(message) => return harness_error(&message),
+	};
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/ladder"));
+	if let Err(error) = std::fs::create_dir_all(&output_dir) {
+		return harness_error(&format!("create ladder output directory: {error}"));
+	}
+	let (memory_per_task, memory_provenance) = match gauge_memory_per_task() {
+		Ok(value) => value,
+		Err(message) => return harness_error(&message),
+	};
+	let mut rows = Vec::new();
+	let mut medians: BTreeMap<(String, String), f64> = BTreeMap::new();
+	for primitive in PRIMITIVE_LADDER_IDS {
+		for engine in &engines {
+			let mut samples = Vec::new();
+			let mut last: Option<serde_json::Value> = None;
+			let mut failure = None;
+			for index in 0..(warmup + runs) {
+				let warm = index < warmup;
+				match run_perf_child(
+					*engine,
+					primitive,
+					mode,
+					sf,
+					index as u32,
+					warm,
+					data_source,
+					&data_dir,
+				) {
+					Ok(row) => {
+						if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+							failure = Some(row.to_string());
+							break;
+						}
+						if !warm {
+							if let Some(value) =
+								row.get("execute_ms").and_then(serde_json::Value::as_f64)
+							{
+								samples.push(value);
+							}
+						}
+						last = Some(row);
+					}
+					Err(message) => {
+						failure = Some(message);
+						break;
+					}
+				}
+			}
+			let mut sorted = samples.clone();
+			let median = if sorted.is_empty() {
+				None
+			} else {
+				Some(median(&mut sorted))
+			};
+			if let (Some(median), None) = (median, failure.as_ref()) {
+				medians.insert((primitive.to_string(), engine.as_str().to_string()), median);
+			}
+			let row = serde_json::json!({
+				"suite": "adr473_primitive_ladder",
+				"primitive": primitive,
+				"isolates": primitive_ladder_intent(primitive),
+				"engine": engine.as_str(),
+				"engine_version": last.as_ref().and_then(|row| row.get("engine_version").cloned()),
+				"duckdb_threads": duckdb_thread_setting(),
+				"polars_max_threads": std::env::var("POLARS_MAX_THREADS").ok(),
+				"mode": mode,
+				"scale_factor": sf,
+				"data_source": data_source,
+				"data_dir": data_dir.display().to_string(),
+				"memory_per_task": memory_per_task,
+				"memory_per_task_provenance": memory_provenance,
+				"runs": runs,
+				"warmup": warmup,
+				"execute_ms_samples": samples,
+				"execute_ms_median": median,
+				"output_row_count": last.as_ref().and_then(|row| row.get("output_row_count").cloned()),
+				"digest": last.as_ref().and_then(|row| row.get("digest").cloned()),
+				"spill_bytes": last.as_ref().and_then(|row| row.get("spill_bytes").cloned()),
+				"peak_rss_kib": last.as_ref().and_then(|row| row.get("peak_rss_kib").cloned()),
+				"plan_fingerprint": last.as_ref().and_then(|row| row.get("plan_fingerprint").cloned()),
+				"failure": failure,
+			});
+			println!("{row}");
+			rows.push(row);
+		}
+	}
+	let artifact = output_dir.join("ladder.jsonl");
+	let body = rows
+		.iter()
+		.map(ToString::to_string)
+		.collect::<Vec<_>>()
+		.join("\n");
+	if let Err(error) = std::fs::write(&artifact, format!("{body}\n")) {
+		return harness_error(&format!("write ladder artifact: {error}"));
+	}
+	// The ratio table: every engine against the best observed reference for that
+	// primitive. Digest equality across engines is asserted where all engines
+	// produced one — a ratio between different answers is meaningless.
+	for primitive in PRIMITIVE_LADDER_IDS {
+		let mut cells = Vec::new();
+		for engine in &engines {
+			if let Some(value) = medians.get(&(primitive.to_string(), engine.as_str().to_string()))
+			{
+				cells.push((engine.as_str(), *value));
+			}
+		}
+		let Some(best) = cells
+			.iter()
+			.map(|(_, value)| *value)
+			.fold(None::<f64>, |acc, value| {
+				Some(acc.map_or(value, |current: f64| current.min(value)))
+			})
+		else {
+			continue;
+		};
+		let rendered = cells
+			.iter()
+			.map(|(engine, value)| format!("{engine}={value:.1}ms({:.1}x)", value / best))
+			.collect::<Vec<_>>()
+			.join(" ");
+		println!(
+			"ladder_ratio primitive={primitive} best={best:.1}ms {rendered} isolates=\"{}\"",
+			primitive_ladder_intent(primitive)
+		);
+	}
+	ExitCode::SUCCESS
 }

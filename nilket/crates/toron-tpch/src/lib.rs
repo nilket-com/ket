@@ -149,6 +149,38 @@ pub const Q14_DEV_SQL: &str = "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%
 	WHERE l_partkey = p_partkey \
 	  AND l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'";
 
+/// ADR 473: the primitive ladder — six shapes that isolate one cost each, so
+/// composite results have a denominator. All read `lineitem` except `m06`.
+/// ADR 473: the primitive ladder's members, in cost order. `m01` is retained but
+/// is NOT a scan floor — engines answer `COUNT(1)` from parquet metadata.
+pub const PRIMITIVE_LADDER_IDS: [&str; 7] = ["m00", "m01", "m02", "m03", "m04", "m05", "m06"];
+
+/// What each primitive isolates, for the ladder receipt.
+pub fn primitive_ladder_intent(id: &str) -> &'static str {
+	match id {
+		"m00" => "scan proof (sum of literal; no metadata shortcut)",
+		"m01" => "count shortcut candidate (NOT a scan floor)",
+		"m02" => "one decimal column decode + sum",
+		"m03" => "predicate + second column (selectivity)",
+		"m04" => "low-cardinality grouping (3 groups)",
+		"m05" => "high-cardinality grouping (~12M groups at sf=8)",
+		"m06" => "one equi-join with orders",
+		_ => "unknown",
+	}
+}
+
+pub const M00_SQL: &str = "SELECT SUM(1) AS scanned_rows FROM lineitem";
+pub const M01_SQL: &str = "SELECT COUNT(1) AS row_count FROM lineitem";
+pub const M02_SQL: &str = "SELECT SUM(l_quantity) AS total_quantity FROM lineitem";
+pub const M03_SQL: &str = "SELECT SUM(l_extendedprice) AS total_price FROM lineitem \
+	WHERE l_shipdate >= DATE '1995-09-01'";
+pub const M04_SQL: &str = "SELECT l_returnflag, COUNT(1) AS row_count FROM lineitem \
+	GROUP BY l_returnflag";
+pub const M05_SQL: &str = "SELECT l_orderkey, COUNT(1) AS row_count FROM lineitem \
+	GROUP BY l_orderkey";
+pub const M06_SQL: &str = "SELECT COUNT(1) AS row_count FROM lineitem, orders \
+	WHERE l_orderkey = o_orderkey";
+
 /// strict q14 — identical shape to the dev proxy; the `lineitem` fixture carries official
 /// `Decimal128(15,2)` types instead of `Float64`.
 pub const STRICT_Q14_SQL: &str = Q14_DEV_SQL;
@@ -2335,6 +2367,8 @@ fn persisted_query_tables(
 
 fn persisted_query_table_names(query: &str) -> Result<Vec<(u64, &'static str)>, String> {
 	let tables = match query {
+		"m00" | "m01" | "m02" | "m03" | "m04" | "m05" => vec![(1, "lineitem")],
+		"m06" => vec![(1, "lineitem"), (2, "orders")],
 		"q01" | "q1" | "q06" | "q6" => vec![(1, "lineitem")],
 		"q02" | "q2" => vec![
 			(1, "part"),
@@ -5168,6 +5202,15 @@ fn perf_query_sql(
 	scale_factor: f64,
 ) -> Result<(&'static str, Cow<'static, str>), String> {
 	let query_sql = match query {
+		// m00 proves m01 actually scans: a metadata/count shortcut would make m01
+		// far cheaper than the summing form over the same rows.
+		"m00" => ("m00", Cow::Borrowed(M00_SQL)),
+		"m01" => ("m01", Cow::Borrowed(M01_SQL)),
+		"m02" => ("m02", Cow::Borrowed(M02_SQL)),
+		"m03" => ("m03", Cow::Borrowed(M03_SQL)),
+		"m04" => ("m04", Cow::Borrowed(M04_SQL)),
+		"m05" => ("m05", Cow::Borrowed(M05_SQL)),
+		"m06" => ("m06", Cow::Borrowed(M06_SQL)),
 		"q01" | "q1" => (
 			"q01",
 			Cow::Borrowed(if strict { STRICT_Q1_SQL } else { Q1_DEV_SQL }),
