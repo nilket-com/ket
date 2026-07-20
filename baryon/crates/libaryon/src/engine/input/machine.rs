@@ -24,6 +24,9 @@ use crate::engine::{InputCompletionStatus, InputProjection};
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InputContext {
 	pub(crate) is_file_browser: bool,
+	/// The focused pane is host-rendered, so document-shaped input is declined
+	/// rather than acted on.
+	pub(crate) is_host_panel: bool,
 	pub(crate) cursor_available: bool,
 	pub(crate) viewport_line_count: u32,
 	pub(crate) viewport_start_line: DocLine,
@@ -41,6 +44,9 @@ pub(crate) struct InputDispatch {
 	pub(crate) status_message: Option<String>,
 	pub(crate) clear_status: bool,
 	pub(crate) needs_render: bool,
+	/// A key the engine declined while a host panel held focus. The runtime
+	/// forwards it to the frontend as an ordered host event.
+	pub(crate) declined_input: Option<(KeyCode, Modifiers)>,
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +191,7 @@ impl InputRuntime {
 		self.dynamic_invocations.clear();
 		self.status_message = None;
 		self.needs_render = true;
+		let mode_before = self.editor_mode();
 		let mut should_quit = false;
 		let runtime_handled =
 			self.dispatch_runtime_mapping_key(code, modifiers, registries, &mut should_quit);
@@ -204,12 +211,30 @@ impl InputRuntime {
 		if should_quit {
 			self.send_command(EditorCommand::Quit);
 		}
+		// Engine-declines: with a host panel focused, Baryon keeps whatever its
+		// own resolver treated as workspace control — including any mode change,
+		// so `:` and `/` still open their prompts — and declines the rest. The
+		// frontend never sees a key list; it just receives what was declined.
+		let declined_input = if self.context.is_host_panel
+			&& matches!(mode_before, EditorMode::Normal)
+			&& matches!(self.editor_mode(), EditorMode::Normal)
+			&& !self
+				.commands
+				.iter()
+				.any(EditorCommand::is_workspace_scoped)
+		{
+			self.commands.clear();
+			Some((code, modifiers))
+		} else {
+			None
+		};
 		InputDispatch {
 			commands: std::mem::take(&mut self.commands),
 			dynamic_invocations: std::mem::take(&mut self.dynamic_invocations),
 			status_message: self.status_message.take(),
 			clear_status: true,
 			needs_render: self.needs_render,
+			declined_input,
 		}
 	}
 
@@ -226,6 +251,7 @@ impl InputRuntime {
 			status_message: self.status_message.take(),
 			clear_status: false,
 			needs_render: self.needs_render,
+			declined_input: None,
 		}
 	}
 

@@ -68,6 +68,7 @@ impl TestFrontend {
 			return InputContext::default();
 		};
 		InputContext {
+			is_host_panel: false,
 			is_file_browser: pane.is_file_browser,
 			cursor_available: true,
 			viewport_line_count: pane.viewport_line_count,

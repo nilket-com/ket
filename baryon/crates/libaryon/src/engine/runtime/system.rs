@@ -5145,6 +5145,82 @@ mod tests {
 	}
 
 	#[test]
+	fn a_focused_host_panel_declines_document_keys_but_keeps_workspace_control() {
+		use crate::engine::{
+			EngineConfig, EngineHandle, HostEvent, HostPanelId, InputEvent, KeyCode, Modifiers,
+		};
+		use std::time::Duration;
+
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		let commands = handle.command_sender();
+		let input = handle.input_sender();
+		let events = handle.take_host_events().expect("host event stream");
+		let viewports = handle.take_viewports().expect("viewports");
+		let panel_id = HostPanelId::new(5);
+
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id,
+				kind: "result-table".to_string(),
+				title: "Results".to_string(),
+			})
+			.expect("open panel");
+		std::thread::sleep(Duration::from_millis(300));
+		// Opening does not steal focus, so focus the panel explicitly — its
+		// pane id comes from the projection rather than a guess.
+		let panel_pane = viewports
+			.try_iter()
+			.filter_map(|view| {
+				view.panes
+					.iter()
+					.find(|pane| pane.host_panel.is_some())
+					.map(|pane| pane.pane_id)
+			})
+			.last()
+			.expect("panel pane is projected");
+		commands
+			.send(EditorCommand::FocusPane(panel_pane))
+			.expect("focus panel");
+		std::thread::sleep(Duration::from_millis(200));
+		let _ = events.try_iter().count();
+
+		let key = |code| InputEvent::Key {
+			code,
+			modifiers: Modifiers::NONE,
+		};
+		// Document-shaped keys are declined and forwarded verbatim: the engine
+		// cannot know that `j` scrolls a table.
+		for code in [KeyCode::Char('j'), KeyCode::Down, KeyCode::PageDown] {
+			input.send(key(code)).expect("send key");
+		}
+		// `:` is workspace control and stays with Baryon.
+		input.send(key(KeyCode::Char(':'))).expect("send colon");
+		std::thread::sleep(Duration::from_millis(300));
+
+		let forwarded = events
+			.try_iter()
+			.filter_map(|event| match event {
+				HostEvent::UnhandledInput {
+					panel_id: id,
+					input: InputEvent::Key { code, .. },
+				} if id == panel_id => Some(code),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			forwarded,
+			vec![KeyCode::Char('j'), KeyCode::Down, KeyCode::PageDown],
+			"document keys reach the frontend in order"
+		);
+		assert!(
+			!forwarded.contains(&KeyCode::Char(':')),
+			"the command prompt stays with the engine"
+		);
+
+		handle.shutdown().expect("engine thread");
+	}
+
+	#[test]
 	fn host_panel_lifecycle_reaches_the_frontend_in_order() {
 		use crate::engine::{
 			EngineConfig, EngineHandle, HostEvent, HostPanelId, PanelRevision,

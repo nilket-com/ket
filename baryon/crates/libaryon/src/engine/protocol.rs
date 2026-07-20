@@ -92,6 +92,46 @@ pub enum CommandRange {
 	},
 }
 
+impl EditorCommand {
+	/// Whether this acts on the workspace rather than a document.
+	///
+	/// Baryon keeps workspace control while a host panel holds focus — pane and
+	/// tab navigation, splits, quit, prompts, resize — and declines everything
+	/// document-shaped, which the frontend receives as
+	/// [`HostEvent::UnhandledInput`](crate::engine::HostEvent::UnhandledInput).
+	/// Classifying commands rather than keys means user mappings and future
+	/// bindings are covered automatically, and no frontend maintains a key
+	/// allowlist.
+	pub(crate) fn is_workspace_scoped(&self) -> bool {
+		matches!(
+			self,
+			Self::Resize(_, _)
+				| Self::FocusPane(_)
+				| Self::FocusPaneDirection(_)
+				| Self::ActivateDocTab { .. }
+				| Self::CloseDocTab { .. }
+				| Self::SplitPane(_)
+				| Self::ClosePane
+				| Self::ResizePane(_, _)
+				| Self::ResizePaneBoundary { .. }
+				| Self::DocTabNew
+				| Self::DocTabEdit(_)
+				| Self::DocTabNext
+				| Self::DocTabPrev
+				| Self::DocTabClose
+				| Self::OpenHostPanel { .. }
+				| Self::RefreshHostPanel { .. }
+				| Self::OpenFileBrowser
+				| Self::OpenFileBrowserAt(_)
+				| Self::Quit
+				| Self::WriteAndQuit
+				| Self::SetTheme(_)
+				| Self::SetBackground(_)
+				| Self::MouseIntent { .. }
+		)
+	}
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubstituteFlags {
 	pub global: bool,

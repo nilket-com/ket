@@ -310,6 +310,16 @@ fn should_rearm_event_drain(allocation_failed: bool, events_pending: bool) -> bo
 	events_pending && !allocation_failed
 }
 
+/// Panel identity of the focused pane, when it is host-rendered.
+fn focused_host_panel_id(session: &EditorSession) -> Option<crate::engine::HostPanelId> {
+	let view = focused_doctab(&session.layout, session.focused_pane_id);
+	session
+		.buffers
+		.get(view.buffer_id)
+		.and_then(|buffer| buffer.host_panel())
+		.map(|panel| panel.panel_id)
+}
+
 fn current_input_context(registry: &UastRegistry, session: &EditorSession) -> InputContext {
 	let view = focused_doctab(&session.layout, session.focused_pane_id);
 	let common = view.common();
@@ -337,6 +347,7 @@ fn current_input_context(registry: &UastRegistry, session: &EditorSession) -> In
 		.unwrap_or(cursor_abs_byte);
 	InputContext {
 		is_file_browser: view.is_file_browser(),
+		is_host_panel: view.is_host_panel(),
 		cursor_available: !matches!(view.content, ViewContent::MarkdownPreview(_)),
 		viewport_line_count: common.viewport_lines,
 		viewport_start_line: DocLine::new(common.scroll_y),
@@ -3083,7 +3094,18 @@ pub(crate) fn run_engine(engine: Engine) {
 			status_message,
 			clear_status,
 			mut needs_render,
+			declined_input,
 		} = input_dispatch;
+		// Declined while a host panel had focus: hand the key to the frontend
+		// in order, so a table can scroll without the engine knowing how.
+		if let Some((code, modifiers)) = declined_input
+			&& let Some(panel_id) = focused_host_panel_id(&session)
+		{
+			session.queue_host_event(crate::engine::HostEvent::UnhandledInput {
+				panel_id,
+				input: crate::engine::InputEvent::Key { code, modifiers },
+			});
+		}
 		if clear_status {
 			session.ui.status_message = None;
 		}
@@ -3160,18 +3182,19 @@ pub(crate) fn run_engine(engine: Engine) {
 				command,
 			);
 			session.emit_text_lifecycle_since(lifecycle_before);
-			// Ordered, non-coalescing: panel disposals must reach the frontend
-			// exactly once, so they never ride the viewport projection.
-			for event in session.take_host_events() {
-				if let Some(sender) = host_events.as_ref() {
-					let _ = sender.send(event);
-				}
-			}
 			needs_render |= dispatch.needs_render;
 			needs_render |= apply_input_mode_override(&mut session);
 			if dispatch.should_stop {
 				should_stop = true;
 				break;
+			}
+		}
+		// Ordered, non-coalescing frontend events. Drained once per request
+		// rather than per command: a declined key yields no commands, so a
+		// per-command drain would never deliver its UnhandledInput.
+		if let Some(sender) = host_events.as_ref() {
+			for event in session.take_host_events() {
+				let _ = sender.send(event);
 			}
 		}
 		needs_render |= drain_run_loop_deliveries(

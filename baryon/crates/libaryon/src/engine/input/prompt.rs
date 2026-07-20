@@ -348,6 +348,7 @@ impl InputRuntime {
 			status_message: self.status_message.take(),
 			clear_status: true,
 			needs_render: true,
+			declined_input: None,
 		})
 	}
 
