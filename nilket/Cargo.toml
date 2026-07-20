@@ -13,6 +13,13 @@ polars = { version = "0.54.4", default-features = false }
 polars-sql = { version = "0.54.4", default-features = false }
 tokio = { version = "1.37", features = ["full"] }
 
+# ADR 474: profiling needs symbols; `release` is stripped for shipping, so the
+# ladder's profiling runs use this profile (identical codegen, symbols kept).
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
