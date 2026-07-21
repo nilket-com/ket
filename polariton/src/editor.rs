@@ -461,6 +461,14 @@ impl CodeEditor {
 			.set_content(RESULT_PANEL, PanelContent::Failed(message));
 	}
 
+	/// Complete a non-row SQL command in the results pane. A pane-targeted
+	/// `CREATE` or `INSERT` has no table to attach, but it must still replace
+	/// the panel's transient `running…` state.
+	pub fn set_query_message(&mut self, message: String) {
+		self.panels
+			.set_content(RESULT_PANEL, PanelContent::Message(message));
+	}
+
 	pub fn set_show_column_types(&mut self, show_column_types: bool) {
 		self.show_column_types = show_column_types;
 	}
@@ -1301,6 +1309,7 @@ enum PanelContent {
 	Unresolved,
 	Running,
 	Table(Box<DataFrame>),
+	Message(String),
 	Failed(String),
 }
 
@@ -1452,6 +1461,10 @@ impl PanelRegistry {
 					.into(),
 				PanelContent::Running => panel_message(
 					format!("{}\n\nrunning…", panel.title),
+					color(palette.preview_text),
+				),
+				PanelContent::Message(message) => panel_message(
+					format!("{}\n\n{message}", panel.title),
 					color(palette.preview_text),
 				),
 				PanelContent::Failed(message) => panel_message(
@@ -2799,6 +2812,15 @@ mod tests {
 			panic!("a failed query retains its panel");
 		};
 		assert!(message.contains("slect"));
+
+		// Non-row commands must complete the pane too; otherwise a notebook
+		// `output=pane` CREATE/INSERT would leave it stuck on `running…`.
+		editor.begin_query();
+		editor.set_query_message("Rows affected: 3".to_owned());
+		let PanelContent::Message(message) = &editor.panels.panels[&RESULT_PANEL].content else {
+			panic!("a completed non-row query replaces the running panel state");
+		};
+		assert_eq!(message, "Rows affected: 3");
 	}
 
 	#[test]

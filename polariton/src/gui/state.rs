@@ -387,6 +387,27 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	)
 }
 
+/// Deliver a successful non-tabular cell result to its declared surface.
+///
+/// `output=pane` still owns a native panel even when there is no DataFrame to
+/// display. Replacing `running…` with the completion message keeps schema and
+/// setup cells honest instead of making the panel look hung.
+fn finish_markdown_cell_message(
+	app_state: &mut AppState,
+	identity: libaryon::uast::projection::MarkdownCellIdentity,
+	presentation: libaryon::uast::projection::MarkdownCellPresentation,
+	message: String,
+) {
+	match presentation.output {
+		MarkdownCellOutputTarget::Inline => app_state
+			.code_editor
+			.set_markdown_cell_message(identity, message.clone()),
+		MarkdownCellOutputTarget::Pane => app_state.code_editor.set_query_message(message.clone()),
+		MarkdownCellOutputTarget::None => {}
+	}
+	app_state.status_msg = message;
+}
+
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	match message {
 		Message::Dashboard(message) => {
@@ -600,37 +621,31 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					}
 				}
 				ExecutionResult::Affected(rows) => {
-					if presentation.output == MarkdownCellOutputTarget::Inline {
-						app_state
-							.code_editor
-							.set_markdown_cell_message(identity, format!("Rows affected: {rows}"));
-					}
-					app_state.status_msg = format!("Rows affected: {rows}");
+					finish_markdown_cell_message(
+						app_state,
+						identity,
+						presentation,
+						format!("Rows affected: {rows}"),
+					);
 				}
 				ExecutionResult::CommandCompleted(message) => {
-					if presentation.output == MarkdownCellOutputTarget::Inline {
-						app_state
-							.code_editor
-							.set_markdown_cell_message(identity, message.clone());
-					}
-					app_state.status_msg = message;
+					finish_markdown_cell_message(app_state, identity, presentation, message);
 				}
 				ExecutionResult::Batch(results) => {
-					let message = format!("Batch complete: {results:?}");
-					if presentation.output == MarkdownCellOutputTarget::Inline {
-						app_state
-							.code_editor
-							.set_markdown_cell_message(identity, message.clone());
-					}
-					app_state.status_msg = message;
+					finish_markdown_cell_message(
+						app_state,
+						identity,
+						presentation,
+						format!("Batch complete: {results:?}"),
+					);
 				}
 				ExecutionResult::None => {
-					if presentation.output == MarkdownCellOutputTarget::Inline {
-						app_state
-							.code_editor
-							.set_markdown_cell_message(identity, "Done.".to_owned());
-					}
-					app_state.status_msg = "Cell finished.".to_owned();
+					finish_markdown_cell_message(
+						app_state,
+						identity,
+						presentation,
+						"Cell finished.".to_owned(),
+					);
 				}
 			}
 		}
