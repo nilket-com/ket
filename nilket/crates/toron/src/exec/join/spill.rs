@@ -67,11 +67,47 @@ pub(in crate::exec) fn partition_bucket_if_non_null_with_scratch(
 		.map(|hash| hash.map(|hash| (hash % u64::from(partition_count)) as usize))
 }
 
+/// ADR 479: a single fixed-width integer key column is the common case (m06 joins
+/// on Int64 order keys). Serializing a tag byte + LE bytes into a scratch `Vec<u8>`
+/// only to hash the 9-byte buffer is redundant; hash the raw value directly. The
+/// encoding is stable and lives in this one place, so build and probe rows — which
+/// both route through the partition hash functions below — stay consistent by
+/// construction. Returns `None` for any shape that is not the fast case, falling
+/// back to the generic serialize-then-hash path.
+fn fixed_width_partition_hash(key_arrays: &[ArrayRef], row: usize) -> Option<u64> {
+	if key_arrays.len() != 1 {
+		return None;
+	}
+	let array = key_arrays[0].as_ref();
+	match array.data_type() {
+		arrow::datatypes::DataType::Int32 => {
+			let values = array.as_any().downcast_ref::<Int32Array>()?;
+			// Tag byte mirrors encode_partition_key_value's Int32 discriminant (4)
+			// so the fast path is a faithful shortcut of the generic encoding.
+			let mut buf = [0u8; 5];
+			buf[0] = 4;
+			buf[1..].copy_from_slice(&values.value(row).to_le_bytes());
+			Some(XxHash3_64::oneshot(&buf))
+		}
+		arrow::datatypes::DataType::Int64 => {
+			let values = array.as_any().downcast_ref::<Int64Array>()?;
+			let mut buf = [0u8; 9];
+			buf[0] = 5;
+			buf[1..].copy_from_slice(&values.value(row).to_le_bytes());
+			Some(XxHash3_64::oneshot(&buf))
+		}
+		_ => None,
+	}
+}
+
 fn partition_key_hash_with_scratch(
 	key_arrays: &[ArrayRef],
 	row: usize,
 	encoded: &mut Vec<u8>,
 ) -> Result<u64, ExecutionError> {
+	if let Some(hash) = fixed_width_partition_hash(key_arrays, row) {
+		return Ok(hash);
+	}
 	encoded.clear();
 	for array in key_arrays {
 		encode_partition_key_value(array.as_ref(), row, encoded)?;
@@ -84,6 +120,11 @@ fn partition_key_hash_if_non_null_with_scratch(
 	row: usize,
 	encoded: &mut Vec<u8>,
 ) -> Result<Option<u64>, ExecutionError> {
+	if key_arrays.len() == 1 && !key_arrays[0].is_null(row) {
+		if let Some(hash) = fixed_width_partition_hash(key_arrays, row) {
+			return Ok(Some(hash));
+		}
+	}
 	encoded.clear();
 	for array in key_arrays {
 		if array.is_null(row) {
@@ -4656,6 +4697,35 @@ mod tests {
 			],
 		)
 		.expect("partition test batch")
+	}
+
+	#[test]
+	fn adr479_fixed_width_fast_path_matches_generic_encoding() {
+		use arrow::array::{Int32Array, Int64Array};
+		// The fast path must hash identically to the generic serialize-then-hash
+		// path for every value — else build and probe rows partition differently
+		// and the join silently loses matches.
+		let i32vals = vec![i32::MIN, -7, -1, 0, 1, 42, i32::MAX];
+		let i64vals = vec![i64::MIN, -7, -1, 0, 1, 42, 12_000_000, i64::MAX];
+		let int32: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(i32vals.clone()))];
+		let int64: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(i64vals.clone()))];
+		let mut scratch = Vec::new();
+		for (arrays, len) in [(&int32, i32vals.len()), (&int64, i64vals.len())] {
+			for row in 0..len {
+				let fast = fixed_width_partition_hash(arrays, row).expect("fast path applies");
+				scratch.clear();
+				encode_partition_key_value(arrays[0].as_ref(), row, &mut scratch)
+					.expect("generic encode");
+				let generic = XxHash3_64::oneshot(scratch.as_slice());
+				assert_eq!(fast, generic, "fast/generic hash mismatch at row {row}");
+			}
+		}
+		// Multi-column and non-fixed-width keys decline the fast path.
+		let two: Vec<ArrayRef> = vec![
+			Arc::new(Int64Array::from(vec![1i64])),
+			Arc::new(Int64Array::from(vec![2i64])),
+		];
+		assert!(fixed_width_partition_hash(&two, 0).is_none());
 	}
 
 	#[test]
