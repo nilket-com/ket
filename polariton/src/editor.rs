@@ -224,17 +224,28 @@ impl CodeEditor {
 	/// paired Markdown preview. The fence ranges and identities are projected by
 	/// libaryon; Polariton only slices the authoritative source bytes.
 	pub fn selected_markdown_cell(&self) -> Option<MarkdownCellExecution> {
-		let viewport = self.viewport.as_ref()?;
-		let source = viewport.focused_pane()?;
-		if !source.selection_ranges.is_empty() {
+		// A snippet run wants exactly the selected text, so a live selection
+		// suppresses whole-cell dispatch. Cursor-in-cell with no selection runs
+		// the cell.
+		if self
+			.viewport
+			.as_ref()
+			.and_then(Viewport::focused_pane)
+			.is_some_and(|pane| !pane.selection_ranges.is_empty())
+		{
 			return None;
 		}
+		self.markdown_cell_at_cursor()
+	}
+
+	/// The SQL fence containing the focused cursor, ignoring any selection.
+	/// `Run` uses this so pressing it mid-selection still runs the cell rather
+	/// than falling through to dispatching the whole Markdown document as SQL.
+	pub fn markdown_cell_at_cursor(&self) -> Option<MarkdownCellExecution> {
+		let viewport = self.viewport.as_ref()?;
+		let source = viewport.focused_pane()?;
 		let cursor = source.cursor_abs_byte;
-		let preview = viewport.panes.iter().find_map(|pane| {
-			pane.markdown_preview
-				.as_ref()
-				.filter(|preview| preview.source_view_id == source.view_id)
-		})?;
+		let preview = self.paired_preview(viewport, source)?;
 		let cell = preview.cells.iter().find(|cell| {
 			cell.language_id == "sql"
 				&& cell.body_range.start <= cursor
@@ -247,6 +258,31 @@ impl CodeEditor {
 		Some(MarkdownCellExecution {
 			identity: cell.identity.clone(),
 			code,
+		})
+	}
+
+	/// Whether the focused source is a notebook — i.e. it has a paired Markdown
+	/// preview. `Run` uses this to refuse dispatching raw Markdown as SQL when
+	/// the cursor is not inside a cell.
+	pub fn is_notebook(&self) -> bool {
+		self.viewport
+			.as_ref()
+			.and_then(|viewport| {
+				let source = viewport.focused_pane()?;
+				self.paired_preview(viewport, source)
+			})
+			.is_some()
+	}
+
+	fn paired_preview<'a>(
+		&self,
+		viewport: &'a Viewport,
+		source: &libaryon::uast::projection::PaneViewport,
+	) -> Option<&'a libaryon::uast::projection::MarkdownPreviewSnapshot> {
+		viewport.panes.iter().find_map(|pane| {
+			pane.markdown_preview
+				.as_ref()
+				.filter(|preview| preview.source_view_id == source.view_id)
 		})
 	}
 
@@ -3004,6 +3040,142 @@ mod tests {
 			thread::sleep(Duration::from_millis(5));
 		}
 		assert_eq!(editor.selected_or_current_line().as_deref(), Some("se"));
+	}
+
+	/// Build a notebook editor with a Markdown preview and wait for its cells.
+	fn notebook_with_preview(markdown: &str) -> CodeEditor {
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		editor.send(EditorCommand::ReplaceDocument {
+			text: markdown.to_owned(),
+			language: Some("markdown".to_owned()),
+			virtual_path: Some("notebook.md".to_owned()),
+		});
+		editor.request_content();
+		wait_for_content(&mut editor, markdown);
+		editor.send(EditorCommand::MarkdownPreview { serif: false });
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|v| {
+			!v.panes.iter().any(|p| {
+				p.markdown_preview
+					.as_ref()
+					.is_some_and(|preview| !preview.cells.is_empty())
+			})
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		editor
+	}
+
+	#[test]
+	fn cell_extraction_is_exact_across_implicit_and_explicit_fences() {
+		// The last cell reproduces the shape that once looked like a `test` ->
+		// `tes` truncation. Extraction must be byte-exact, never dropping the
+		// final character of the fence body, on both identity tiers.
+		let markdown = concat!(
+			"# Notebook\n\n",
+			"```sql\n",
+			"create table if not exists test (x int32);\n",
+			"```\n\n",
+			"```sql {#trips}\n",
+			"select y, z from test;\n",
+			"```\n",
+		);
+		let editor = notebook_with_preview(markdown);
+		let preview = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.panes
+			.iter()
+			.find_map(|p| p.markdown_preview.as_ref())
+			.expect("preview");
+		let codes: Vec<String> = preview
+			.cells
+			.iter()
+			.map(|cell| {
+				editor
+					.document_text
+					.get(
+						cell.body_range.start.get() as usize
+							..cell.body_range.end.get() as usize,
+					)
+					.expect("cell range in bounds")
+					.to_owned()
+			})
+			.collect();
+		assert_eq!(
+			codes,
+			vec![
+				"create table if not exists test (x int32);\n".to_owned(),
+				"select y, z from test;\n".to_owned(),
+			],
+			"fence bodies extract byte-exact on both identity tiers"
+		);
+		// Identity tiers: bare fence is Implicit, `{#trips}` is Explicit.
+		use libaryon::uast::projection::MarkdownCellIdentity;
+		assert!(matches!(
+			preview.cells[0].identity,
+			MarkdownCellIdentity::Implicit { .. }
+		));
+		assert!(matches!(
+			&preview.cells[1].identity,
+			MarkdownCellIdentity::Explicit { id } if id == "trips"
+		));
+	}
+
+	#[test]
+	fn run_targets_the_cell_at_the_cursor_even_mid_selection() {
+		let markdown = concat!(
+			"# Notebook\n\n",
+			"```sql\n",
+			"select y, z from test;\n",
+			"```\n",
+		);
+		let mut editor = notebook_with_preview(markdown);
+
+		// Cursor into the fence body: down past heading, blank, and fence open.
+		send_keys(&mut editor, ['g', 'g', 'j', 'j', 'j']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.markdown_cell_at_cursor().is_none() && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let cell = editor
+			.markdown_cell_at_cursor()
+			.expect("cursor is inside the SQL fence");
+		assert_eq!(cell.code, "select y, z from test;\n");
+
+		// A visual-line selection suppresses whole-cell dispatch for a snippet
+		// run, but Run (markdown_cell_at_cursor) must still resolve the cell —
+		// this is the fix for Run sending the whole Markdown document as SQL.
+		send_keys(&mut editor, ['V']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|v| v.focused_pane())
+			.is_none_or(|pane| pane.selection_ranges.is_empty())
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor.selected_markdown_cell().is_none(),
+			"a live selection suppresses whole-cell snippet dispatch"
+		);
+		assert_eq!(
+			editor
+				.markdown_cell_at_cursor()
+				.map(|cell| cell.code)
+				.as_deref(),
+			Some("select y, z from test;\n"),
+			"Run resolves the cell at the cursor regardless of selection"
+		);
+		assert!(editor.is_notebook(), "a document with a preview is a notebook");
 	}
 
 	#[test]

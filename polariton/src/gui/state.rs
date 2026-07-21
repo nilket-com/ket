@@ -407,8 +407,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			};
 		}
 		Message::Run => {
-			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
+			// In a notebook, Run always means "run the cell at the cursor",
+			// even mid-selection — otherwise a selection would fall through to
+			// dispatching the whole Markdown document as one SQL string.
+			if let Some(cell) = app_state.code_editor.markdown_cell_at_cursor() {
 				return run_markdown_cell(app_state, cell);
+			}
+			if app_state.code_editor.is_notebook() {
+				app_state.status_msg = "Place the cursor in a SQL cell to run it.".into();
+				return Task::none();
 			}
 			return run_code(app_state, app_state.code_editor.cached_content().to_owned());
 		}
