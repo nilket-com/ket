@@ -11,8 +11,9 @@ use super::session::{
 	MarkdownPreviewEditorMut, View, text_editor, with_markdown_preview_buffer_mut,
 	with_text_buffer_mut,
 };
-use crate::core::{BufferId, DisplayRow, DocLine, PaneId, StateId, ViewId};
+use crate::core::{BufferId, DisplayRow, DocLine, PaneId, Rgb, StateId, ViewId};
 use crate::ecs::UastRegistry;
+use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::projection::MarkdownPreviewSnapshot;
 use std::path::Path;
 
@@ -22,6 +23,9 @@ struct MarkdownSourceSnapshot {
 	path: Option<String>,
 	state_id: StateId,
 	text: String,
+	highlights: Vec<HighlightSpan>,
+	theme_colors: [Option<Rgb>; CATEGORY_COUNT],
+	semantic_revision: u64,
 	scroll_line: DocLine,
 	viewport_line_count: u32,
 }
@@ -157,6 +161,9 @@ pub(crate) fn open_static_markdown_preview(
 		path: Some(title.clone()),
 		state_id,
 		text: markdown,
+		highlights: Vec::new(),
+		theme_colors: [None; CATEGORY_COUNT],
+		semantic_revision: 0,
 		scroll_line: DocLine::ZERO,
 		viewport_line_count,
 	};
@@ -272,6 +279,7 @@ pub(crate) fn refresh_markdown_image_previews(
 		if state.source_buffer_id == source.buffer_id
 			&& state.source_path == source.path
 			&& state.source_state_id == source.state_id
+			&& state.source_semantic_revision == source.semantic_revision
 			&& state.source_scroll_line == source.scroll_line
 			&& state.source_viewport_line_count == source.viewport_line_count
 		{
@@ -434,6 +442,8 @@ pub(crate) fn markdown_image_preview_snapshot(
 		serif: state.serif,
 		source_path: state.source_path.clone(),
 		source_text: state.source_text.clone(),
+		code_highlights: state.source_highlights.clone(),
+		theme_colors: state.source_theme_colors,
 		source_scroll_line: state.source_scroll_line,
 		source_viewport_line_count: state.source_viewport_line_count,
 	}
@@ -464,6 +474,9 @@ fn create_markdown_preview_view(
 				source_path: source.path.clone(),
 				source_state_id: source.state_id,
 				source_text: source.text.clone(),
+				source_highlights: source.highlights.clone(),
+				source_theme_colors: source.theme_colors,
+				source_semantic_revision: source.semantic_revision,
 				source_scroll_line: source.scroll_line,
 				source_viewport_line_count: source.viewport_line_count,
 				pinned,
@@ -516,6 +529,9 @@ fn markdown_source_snapshot(
 		path: tab.document.file_path.clone(),
 		state_id: tab.document.ledger.current_state_id,
 		text,
+		highlights: tab.document.semantic.highlights.clone(),
+		theme_colors: tab.view.current_theme.syntax_colors,
+		semantic_revision: tab.document.semantic.view_revision,
 		scroll_line: DocLine::new(tab.view.scroll_y),
 		viewport_line_count: tab.view.viewport_lines,
 	})
@@ -530,6 +546,9 @@ fn update_markdown_image_preview(
 	state.source_path = source.path.clone();
 	state.source_state_id = source.state_id;
 	state.source_text = source.text.clone();
+	state.source_highlights = source.highlights.clone();
+	state.source_theme_colors = source.theme_colors;
+	state.source_semantic_revision = source.semantic_revision;
 	state.source_scroll_line = source.scroll_line;
 	state.source_viewport_line_count = source.viewport_line_count;
 	tab.document.title = preview_title(source.path.as_deref());

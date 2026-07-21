@@ -3247,6 +3247,8 @@ mod tests {
 			serif: false,
 			source_path: Some("README.md".to_string()),
 			source_text: "# Title\n\n- item\n\n```rust\nfn main() {}\n```\n".to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3272,6 +3274,8 @@ mod tests {
 			serif: false,
 			source_path: Some("README.md".to_string()),
 			source_text: "Alpha needle omega\n\n- another NEEDLE\n".to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3343,6 +3347,8 @@ mod tests {
 			serif: false,
 			source_path: Some("README.md".to_string()),
 			source_text: "plain body text\n".to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3481,6 +3487,8 @@ mod tests {
 			serif: false,
 			source_path: None,
 			source_text: String::new(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 3,
 		};
@@ -3569,6 +3577,8 @@ mod tests {
 			source_path: Some("results.md".to_string()),
 			source_text: "| Key | Value |\n| --- | --- |\n| first | 1 |\n| second | 2 |\n"
 				.to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3595,6 +3605,8 @@ mod tests {
 			serif: false,
 			source_path: Some("README.md".to_string()),
 			source_text: "plain body text\n".to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3629,6 +3641,8 @@ mod tests {
 			serif: false,
 			source_path: Some("README.md".to_string()),
 			source_text: "- item `code`\n1. next\n".to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};

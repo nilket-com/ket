@@ -145,6 +145,10 @@ pub struct MarkdownPreviewSnapshot {
 	pub serif: bool,
 	pub source_path: Option<String>,
 	pub source_text: String,
+	/// Unresolved source-coordinate categories. Frontends map these through
+	/// `theme_colors`, exactly as they do for text-pane highlighting.
+	pub code_highlights: Vec<HighlightSpan>,
+	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],
 	pub source_scroll_line: DocLine,
 	pub source_viewport_line_count: u32,
 }

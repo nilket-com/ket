@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::core::{BufferId, DocByte, RequestId, StateId};
+use crate::core::{BufferId, ByteLen, DocByte, RequestId, StateId};
 use crate::engine::language::{GreenNode, InlineAnnotation, LanguageRegistry};
 use crate::engine::request::{InternalEvent, InternalSender};
 use crate::svp::diagnostic::DiagnosticSpan;
@@ -81,7 +81,8 @@ impl SemanticReactor {
 		while let Ok(request) = rx.recv() {
 			let provider = registry.get_provider(&request.language_id);
 
-			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider {
+			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider
+			{
 				Some(p) => {
 					let source_bytes = request.content;
 
@@ -95,17 +96,63 @@ impl SemanticReactor {
 					// Deep semantic analysis is string-oriented. A document that is not
 					// valid UTF-8 forgoes it rather than being rewritten to suit it; it
 					// still gets topology and lexical highlighting.
-					let (highlights, diagnostics, inline_annotations) = match std::str::from_utf8(&source_bytes) {
-						Ok(text) => {
-							let output = p.semantic_reactor(
-								Arc::new(text.to_owned()),
-								request.global_offset,
-								&request.file_path,
-							);
-							(output.highlights, output.diagnostics, output.inline_annotations)
-						}
-						Err(_) => (Vec::new(), Vec::new(), Vec::new()),
-					};
+					let (highlights, diagnostics, inline_annotations) =
+						match std::str::from_utf8(&source_bytes) {
+							Ok(text) => {
+								let mut output = p.semantic_reactor(
+									Arc::new(text.to_owned()),
+									request.global_offset,
+									&request.file_path,
+								);
+								// Only the parent describes injections. Calling this method on
+								// injected providers would turn a syntax highlighter into an
+								// unbounded recursive embedding system.
+								for injection in p.injections(text) {
+									let Some(fragment) = text.get(injection.range.clone()) else {
+										continue;
+									};
+									let Some(embedded) = registry
+										.resolve_supported_language_provider(
+											&injection.language_id,
+										)
+									else {
+										continue;
+									};
+									let embedded_offset = request.global_offset
+										+ ByteLen::new(injection.range.start as u64);
+									// A provider's semantic pass enriches its lexical baseline; it
+									// does not necessarily repeat keywords and punctuation. Run both
+									// here so a fenced block gets the same complete coloring as a
+									// top-level document.
+									output.highlights.extend(embedded.lexical_baseline(
+										fragment.as_bytes(),
+										&[(0, embedded_offset)],
+									));
+									let embedded_output = embedded.semantic_reactor(
+										Arc::new(fragment.to_owned()),
+										embedded_offset,
+										&format!(
+											"embedded.{}",
+											embedded.extensions().first().copied().unwrap_or("txt")
+										),
+									);
+									// Appending gives the embedded span precedence where a parent
+									// Markdown span overlaps it; the frontend already resolves
+									// overlapping categories from the end of this list.
+									output.highlights.extend(embedded_output.highlights);
+									output.diagnostics.extend(embedded_output.diagnostics);
+									output
+										.inline_annotations
+										.extend(embedded_output.inline_annotations);
+								}
+								(
+									output.highlights,
+									output.diagnostics,
+									output.inline_annotations,
+								)
+							}
+							Err(_) => (Vec::new(), Vec::new(), Vec::new()),
+						};
 
 					(highlights, diagnostics, inline_annotations, topology)
 				}
@@ -218,6 +265,42 @@ mod tests {
 				(BufferId::new(2), RequestId::new(2)),
 			]
 		);
+	}
+
+	#[test]
+	fn reactor_merges_fenced_sql_highlights_in_parent_coordinates() {
+		use crate::svp::markdown_provider::MarkdownProvider;
+		use crate::svp::rust_highlight::TokenCategory;
+		use crate::svp::sql_provider::SqlProvider;
+
+		let source = "# Query\n\n```sql {#trips}\nselect id from trips;\n```\n";
+		let sql_start = source.find("select").expect("SQL body") as u64;
+		let (_commands, _input, tx_internal, _requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(MarkdownProvider);
+		registry.register(SqlProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		reactor.send(SemanticRequest {
+			buffer_id: BufferId::new(1),
+			content: source.as_bytes().to_vec(),
+			global_offset: DocByte::new(500),
+			file_path: "notebook.md".to_owned(),
+			language_id: "markdown".to_owned(),
+			state_id: StateId::new(1),
+			request_id: RequestId::new(1),
+		});
+
+		let deadline = Instant::now() + Duration::from_secs(2);
+		let response = loop {
+			if let Some(response) = reactor.try_recv() {
+				break response;
+			}
+			assert!(Instant::now() < deadline, "semantic response timed out");
+			std::thread::sleep(Duration::from_millis(5));
+		};
+		assert!(response.highlights.iter().any(|span| {
+			span.start == DocByte::new(500 + sql_start) && span.category == TokenCategory::Keyword
+		}));
 	}
 
 	/// The reactor must return topology whose source bytes are exactly what it was

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::core::{DocByte, DocLine};
@@ -16,6 +17,19 @@ pub struct SemanticOutput {
 	pub highlights: Vec<HighlightSpan>,
 	pub diagnostics: Vec<DiagnosticSpan>,
 	pub inline_annotations: Vec<InlineAnnotation>,
+}
+
+/// A language-shaped subrange embedded in a parent document.
+///
+/// The range is measured in the parent's UTF-8 bytes. The semantic reactor
+/// invokes the referenced provider once with this range's start as its global
+/// offset, then merges the resulting parent-coordinate spans. Injected
+/// providers are deliberately not asked for further injections: this is a
+/// one-level highlighter, not a recursive embedding runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageInjection {
+	pub language_id: String,
+	pub range: Range<usize>,
 }
 
 /// Non-editable text projected at the end of a source line by a frontend.
@@ -106,6 +120,12 @@ pub trait LanguageProvider: Send + Sync {
 		global_offset: DocByte,
 		file_path: &str,
 	) -> SemanticOutput;
+
+	/// Describe language regions embedded in this document. The default keeps
+	/// providers flat; Markdown opts in for fenced code blocks.
+	fn injections(&self, _source: &str) -> Vec<LanguageInjection> {
+		Vec::new()
+	}
 
 	// -----------------------------------------------------------------
 	// PHASE 3: STRUCTURAL MAPPING

@@ -35,7 +35,7 @@ pub enum TokenCategory {
 
 pub const CATEGORY_COUNT: usize = TokenCategory::GitRename as usize + 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HighlightSpan {
 	pub start: DocByte,
 	pub end: DocByte,

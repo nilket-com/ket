@@ -473,17 +473,28 @@ impl CodeEditor {
 		);
 		for pane in &viewport.panes {
 			let focused = pane.pane_id == viewport.focused_pane_id;
-			let content = match pane.host_panel.as_ref() {
-				Some(panel) => {
-					self.panels
-						.surface(panel, focused, palette, self.show_column_types, dashboard)
+			let content = if let Some(preview) = pane.markdown_preview.as_ref() {
+				markdown_preview_surface(preview, palette)
+			} else {
+				match pane.host_panel.as_ref() {
+					Some(panel) => self.panels.surface(
+						panel,
+						focused,
+						palette,
+						self.show_column_types,
+						dashboard,
+					),
+					None => text_pane_surface(pane, palette, focused),
 				}
-				None => text_pane_surface(pane, palette, focused),
 			};
-			let title = pane
-				.host_panel
-				.as_ref()
-				.map_or("SQL", |panel| panel.title.as_str());
+			let title = pane.markdown_preview.as_ref().map_or_else(
+				|| {
+					pane.host_panel
+						.as_ref()
+						.map_or("SQL", |panel| panel.title.as_str())
+				},
+				|preview| preview.source_path.as_deref().unwrap_or("Markdown Preview"),
+			);
 			let content = pane_surface(pane.pane_id, title, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
@@ -1436,6 +1447,105 @@ fn text_pane_surface<'a>(
 	editor_content
 }
 
+/// Native, read-only Markdown projection. The engine owns both parsing and
+/// highlighting: this surface receives source-coordinate categories plus the
+/// same palette a text pane receives, then only paints those pixels.
+fn markdown_preview_surface<'a>(
+	preview: &'a libaryon::uast::projection::MarkdownPreviewSnapshot,
+	palette: UiPalette,
+) -> Element<'a, EditorMsg> {
+	let mut rows: Vec<Element<'_, EditorMsg>> = Vec::new();
+	let mut byte_offset = 0u64;
+	let mut in_code_block = false;
+	let first_line = preview.source_scroll_line.get();
+
+	for (line_number, source_line) in preview.source_text.split_inclusive('\n').enumerate() {
+		let content = source_line.strip_suffix('\n').unwrap_or(source_line);
+		let trimmed = content.trim_start();
+		let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+		if fence {
+			in_code_block = !in_code_block;
+			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
+			continue;
+		}
+		if line_number as u64 >= first_line {
+			let row: Element<'_, EditorMsg> = if in_code_block {
+				container(
+					rich_text(markdown_code_fragments(
+						content,
+						byte_offset,
+						&preview.code_highlights,
+						preview.theme_colors,
+						palette.editor_text,
+					))
+					.font(EDITOR_FONT)
+					.size(metrics::TEXT_SIZE)
+					.line_height(iced::Pixels(metrics::LINE_HEIGHT)),
+				)
+				.padding([0, 12])
+				.width(Length::Fill)
+				.style(move |_| container::Style {
+					background: Some(Background::Color(color(palette.gutter_surface))),
+					..Default::default()
+				})
+				.into()
+			} else if let Some(heading) = trimmed.strip_prefix("# ") {
+				text(heading)
+					.font(iced::Font::DEFAULT)
+					.size(28)
+					.color(color(palette.editor_text))
+					.into()
+			} else if let Some(heading) = trimmed.strip_prefix("## ") {
+				text(heading)
+					.font(iced::Font::DEFAULT)
+					.size(22)
+					.color(color(palette.editor_text))
+					.into()
+			} else if content.is_empty() {
+				Space::new()
+					.height(Length::Fixed(metrics::LINE_HEIGHT / 2.0))
+					.into()
+			} else {
+				text(content)
+					.font(iced::Font::DEFAULT)
+					.size(17)
+					.color(color(palette.editor_text))
+					.into()
+			};
+			rows.push(row);
+		}
+		byte_offset = byte_offset.saturating_add(source_line.len() as u64);
+	}
+
+	container(column(rows).spacing(8))
+		.padding(20)
+		.width(Length::Fill)
+		.height(Length::Fill)
+		.into()
+}
+
+fn markdown_code_fragments(
+	line: &str,
+	line_start: u64,
+	highlights: &[libaryon::svp::rust_highlight::HighlightSpan],
+	theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
+	default_foreground: Rgb,
+) -> Vec<iced::widget::text::Span<'static, EditorMsg, iced::Font>> {
+	let mut fragments = Vec::new();
+	let mut byte = line_start;
+	for ch in line.chars() {
+		let foreground = highlights
+			.iter()
+			.rev()
+			.find(|highlight| highlight.start.get() <= byte && byte < highlight.end.get())
+			.and_then(|highlight| theme_colors[highlight.category as usize])
+			.unwrap_or(default_foreground);
+		fragments.push(span::<EditorMsg, iced::Font>(ch.to_string()).color(color(foreground)));
+		byte = byte.saturating_add(ch.len_utf8() as u64);
+	}
+	fragments
+}
+
 /// Place a fixed-size element at a pixel offset within the workspace.
 fn positioned<'a>(
 	x: f32,
@@ -1705,7 +1815,7 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
-		metrics,
+		markdown_code_fragments, metrics,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -1726,6 +1836,36 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	#[test]
+	fn markdown_fence_fragments_resolve_engine_categories_through_its_palette() {
+		use libaryon::core::{DocByte, Rgb};
+		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan, TokenCategory};
+
+		let mut palette = [None; CATEGORY_COUNT];
+		palette[TokenCategory::Keyword as usize] = Some(Rgb::new(153, 0, 255));
+		let fragments = markdown_code_fragments(
+			"select 1",
+			100,
+			&[HighlightSpan::new(
+				DocByte::new(100),
+				DocByte::new(106),
+				TokenCategory::Keyword,
+			)],
+			palette,
+			Rgb::new(255, 255, 255),
+		);
+
+		assert_eq!(fragments.len(), 8);
+		assert_eq!(
+			fragments[0].color,
+			Some(iced::Color::from_rgb8(153, 0, 255))
+		);
+		assert_eq!(
+			fragments[6].color,
+			Some(iced::Color::from_rgb8(255, 255, 255))
+		);
 	}
 
 	#[test]
