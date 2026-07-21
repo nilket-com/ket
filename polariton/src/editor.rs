@@ -626,6 +626,28 @@ impl CodeEditor {
 				content,
 			));
 		}
+		// The engine deliberately publishes horizontal divider hit rects wider
+		// than their one-row visual gap. Put those rectangles above pane content:
+		// otherwise a child editor/table captures presses in the expanded rows
+		// and makes the promised grab area unreachable.
+		for divider in &viewport.dividers {
+			let hit = pane_pixel_rect(divider.hit_rect);
+			layers.push(positioned(
+				hit.x,
+				hit.y,
+				hit.width,
+				hit.height,
+				mouse_area(
+					container(Space::new())
+						.width(Length::Fill)
+						.height(Length::Fill),
+				)
+				.on_move(EditorMsg::PointerMoved)
+				.on_press(EditorMsg::Click)
+				.on_release(EditorMsg::Release)
+				.into(),
+			));
+		}
 		if let Some(drag) = self.pane_drag
 			&& let Some((target, edge)) = drag.target
 			&& let Some(pane) = viewport.panes.iter().find(|pane| pane.pane_id == target)
