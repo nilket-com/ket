@@ -302,6 +302,27 @@ pub struct PerfAttempt {
 	pub engine_version: Option<String>,
 	pub duckdb_version: Option<String>,
 	pub debug_build: bool,
+	/// ADR 490: one compact admission receipt per binder-physicalized hash join,
+	/// in bind order — toron rows only.
+	pub local_join_admissions: Option<Vec<String>>,
+}
+
+/// The commit this gauge binary was built from, stamped at compile time
+/// (`<short-sha>` or `<short-sha>-dirty`; `unknown` when git was unavailable).
+pub fn build_commit() -> &'static str {
+	env!("TORON_TPCH_BUILD_COMMIT")
+}
+
+/// Modification time (unix seconds) of the executable actually running — the
+/// runtime half of build identity: it distinguishes a stale on-disk binary from
+/// the code the row claims to measure.
+pub fn binary_modified_unix() -> Option<u64> {
+	let exe = std::env::current_exe().ok()?;
+	let modified = std::fs::metadata(exe).ok()?.modified().ok()?;
+	modified
+		.duration_since(std::time::UNIX_EPOCH)
+		.ok()
+		.map(|d| d.as_secs())
 }
 
 impl PerfAttempt {
@@ -328,6 +349,9 @@ impl PerfAttempt {
 			"output_schema_fingerprint": self.output_schema_fingerprint,
 			"engine_version": self.engine_version,
 			"duckdb_version": self.duckdb_version,
+			"build_commit": build_commit(),
+			"binary_modified_unix": binary_modified_unix(),
+			"local_join_admissions": self.local_join_admissions,
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

@@ -1890,6 +1890,7 @@ fn duckdb_not_attempted_row(
 		engine_version: duckdb_version.clone(),
 		duckdb_version,
 		debug_build: false,
+		local_join_admissions: None,
 	}
 	.json_value()
 }
@@ -1926,6 +1927,7 @@ fn polars_not_attempted_row(
 		engine_version,
 		duckdb_version: None,
 		debug_build: false,
+		local_join_admissions: None,
 	}
 	.json_value()
 }
@@ -2063,6 +2065,7 @@ fn run_polars_perf_export(
 		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 
@@ -2182,6 +2185,7 @@ fn run_polars_perf_export(
 		engine_version,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 
@@ -2530,6 +2534,7 @@ fn polars_unsupported_attempt(
 		engine_version,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 
@@ -2573,6 +2578,7 @@ fn polars_fail_attempt(
 		engine_version,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 
@@ -2709,6 +2715,7 @@ fn run_duckdb_perf_child(
 			engine_version: Some(duckdb_version.to_string()),
 			duckdb_version: Some(duckdb_version.to_string()),
 			debug_build: false,
+			local_join_admissions: None,
 		}
 		.json_value());
 	}
@@ -2748,6 +2755,7 @@ fn run_duckdb_perf_child(
 		engine_version: Some(duckdb_version.to_string()),
 		duckdb_version: Some(duckdb_version.to_string()),
 		debug_build: false,
+		local_join_admissions: None,
 	}
 	.json_value())
 }
@@ -3387,6 +3395,15 @@ fn summarize_query_rows(
 		"output_schema_fingerprint": output_schema_fingerprint,
 		"engine_version": engine_version,
 		"duckdb_version": duckdb_version,
+		"build_commit": rows.last().and_then(|row| row.get("build_commit")).cloned(),
+		"binary_modified_unix": rows
+			.last()
+			.and_then(|row| row.get("binary_modified_unix"))
+			.cloned(),
+		"local_join_admissions": rows
+			.last()
+			.and_then(|row| row.get("local_join_admissions"))
+			.cloned(),
 		"baseline_execute_ms_median": baseline_execute_ms_median,
 		"flags": flags,
 	})

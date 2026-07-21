@@ -99,9 +99,12 @@ async fn adr490_single_node_raw_policy_emits_only_the_local_hash_shape() {
 		local_hash_join_memory_per_task: Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
 		..PlannerConfig::default()
 	};
-	let local = bind(&logical, &catalog, &local_config)
+	let (local, admissions) = bind_with_local_join_admissions(&logical, &catalog, &local_config)
 		.await
 		.expect("bind local hash candidate");
+	assert_eq!(admissions.len(), 1, "one hash join, one admission receipt");
+	assert!(admissions[0].admitted());
+	assert!(admissions[0].describe().starts_with("admitted("));
 	let ExecutionPlan::Project { input, .. } = local else {
 		panic!("right-build local hash must restore declared order");
 	};
@@ -118,7 +121,7 @@ async fn adr490_single_node_raw_policy_emits_only_the_local_hash_shape() {
 	assert!(terminal_exchange(left).is_none());
 	assert!(terminal_exchange(right).is_none());
 
-	let distributed = bind(
+	let (distributed, admissions) = bind_with_local_join_admissions(
 		&logical,
 		&catalog,
 		&PlannerConfig {
@@ -129,6 +132,10 @@ async fn adr490_single_node_raw_policy_emits_only_the_local_hash_shape() {
 	)
 	.await
 	.expect("bind distributed-shaped hash candidate");
+	assert_eq!(
+		admissions[0].describe(),
+		"declined(not_single_partition_execution)"
+	);
 	let ExecutionPlan::Project { input, .. } = distributed else {
 		panic!("right-build hash must restore declared order");
 	};

@@ -63,10 +63,40 @@ pub(super) struct ScanFilterPushdownEvidence {
 	pub(super) table_id: Option<TableId>,
 }
 
+/// ADR 490: one local hash-join admission outcome per binder-physicalized hash
+/// join, in bind order. Recorded whether or not the join admits, so a live cell
+/// can name the exact declining precondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalHashJoinAdmissionReceipt {
+	pub(crate) target: JoinTraceTarget,
+	pub(crate) admission: LocalHashJoinAdmission,
+}
+
+/// ADR 490: bind and surface each binder-physicalized hash join's local-admission
+/// receipt, in bind order. The gauge threads these into perf rows so a live cell
+/// always names the exact admission outcome instead of inferring it from a
+/// fingerprint.
+pub async fn bind_with_local_join_admissions(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, Vec<LocalHashJoinAdmission>), BindingError> {
+	let (plan, trace) = bind_with_trace(plan, catalog, config).await?;
+	Ok((
+		plan,
+		trace
+			.local_hash_join_admissions
+			.iter()
+			.map(|receipt| receipt.admission)
+			.collect(),
+	))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OptimizerTrace {
 	pub(crate) join_decisions: Vec<DecisionReceipt>,
 	pub(crate) scan_filter_decisions: Vec<ScanFilterReceipt>,
+	pub(crate) local_hash_join_admissions: Vec<LocalHashJoinAdmissionReceipt>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

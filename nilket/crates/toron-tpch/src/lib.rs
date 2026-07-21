@@ -44,7 +44,9 @@ use tpchgen::generators::{
 	PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 
-use toron::binder::{PlannerConfig, bind, bind_with_explain_summary};
+use toron::binder::{
+	PlannerConfig, bind, bind_with_explain_summary, bind_with_local_join_admissions,
+};
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -3577,6 +3579,7 @@ struct QueryExecution {
 	timings: PerfPhaseTimings,
 	plan_fingerprint: String,
 	spill_bytes: u64,
+	local_join_admissions: Vec<String>,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -3706,18 +3709,19 @@ async fn execute_logical_with_catalog_timed(
 	let mut plan_fingerprint = None;
 	let mut spill_bytes = 0;
 	let bind_start = Instant::now();
-	let bound = match bind(&logical, &catalog, &gauge_planner_config()).await {
-		Ok(bound) => bound,
-		Err(error) => {
-			timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
-			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-			return Err(StageError::from_debug(Phase::Bind, error).with_perf(
-				timings,
-				plan_fingerprint,
-				spill_bytes,
-			));
-		}
-	};
+	let (bound, local_join_admissions) =
+		match bind_with_local_join_admissions(&logical, &catalog, &gauge_planner_config()).await {
+			Ok(bound) => bound,
+			Err(error) => {
+				timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
+				timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+				return Err(StageError::from_debug(Phase::Bind, error).with_perf(
+					timings,
+					plan_fingerprint,
+					spill_bytes,
+				));
+			}
+		};
 	timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
 	plan_fingerprint = Some(physical_plan_fingerprint(&bound));
 
@@ -3757,6 +3761,10 @@ async fn execute_logical_with_catalog_timed(
 		timings,
 		plan_fingerprint: plan_fingerprint.expect("bound plan has a fingerprint"),
 		spill_bytes,
+		local_join_admissions: local_join_admissions
+			.iter()
+			.map(|admission| admission.describe())
+			.collect(),
 	})
 }
 
@@ -3807,10 +3815,12 @@ pub fn gauge_hash_smaller_build() -> Result<(bool, &'static str), String> {
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
 pub fn gauge_planner_config() -> PlannerConfig {
-	let memory_per_task = gauge_memory_per_task()
-		.ok()
-		.map(|(bytes, _)| ByteCount::new(bytes));
-	gauge_planner_config_with_task_memory(memory_per_task)
+	// The budget env is validated loudly at row emission; a malformed value must
+	// abort the bind too, never degrade to a silent None (which would flip the
+	// local-admission policy off while the row still reports an explicit budget).
+	let (bytes, _provenance) =
+		gauge_memory_per_task().unwrap_or_else(|error| panic!("gauge planner config: {error}"));
+	gauge_planner_config_with_task_memory(Some(ByteCount::new(bytes)))
 }
 
 fn gauge_planner_config_with_task_memory(
@@ -4474,6 +4484,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4508,6 +4519,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4541,6 +4553,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			engine_version: None,
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
+			local_join_admissions: None,
 		};
 	}
 
@@ -4567,6 +4580,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			engine_version: None,
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
+			local_join_admissions: None,
 		};
 	}
 
@@ -4592,6 +4606,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 
@@ -4636,6 +4651,7 @@ async fn run_perf_query_with_tables(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4670,6 +4686,7 @@ async fn run_perf_query_with_tables(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4700,6 +4717,7 @@ async fn run_perf_query_with_tables(
 		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: Some(execution.local_join_admissions),
 	}
 }
 
@@ -4745,6 +4763,7 @@ async fn run_perf_query_with_metadata(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4779,6 +4798,7 @@ async fn run_perf_query_with_metadata(
 				engine_version: None,
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
+				local_join_admissions: None,
 			};
 		}
 	};
@@ -4809,6 +4829,7 @@ async fn run_perf_query_with_metadata(
 		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
 	}
 }
 

@@ -167,9 +167,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// rewrite-pass change. ADR 472 added the unknown-size fact and its shared helper. ADR 490 adds
 	// the single-node raw-memory local-hash admission branch; it is a real physical-shape decision
 	// guarded by the coordinator/fragmenter distributed rails, so it remains at this root boundary.
+	// The admission decision also records a per-join receipt on the optimizer trace (the bare bool
+	// proved unauditable in the first live cell), which is the small remainder of this bound.
 	assert!(
-		lines <= 6_105,
-		"binder root has {lines} lines; expected <= 6,105 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_120,
+		"binder root has {lines} lines; expected <= 6,120 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

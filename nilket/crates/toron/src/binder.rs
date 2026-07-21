@@ -83,7 +83,9 @@ use self::set_ops::{
 
 pub use self::decision_log::OptimizerDecisionLog;
 pub use self::explain::bind_with_explain_summary;
+pub use self::explain::bind_with_local_join_admissions;
 pub(crate) use self::join::JoinStrategyDecisionReason;
+pub use self::join::LocalHashJoinAdmission;
 pub use self::join::join_schema;
 pub use self::join_order::SoftMarginLadderStep;
 pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
@@ -3107,10 +3109,16 @@ impl<'a> Binder<'a> {
 					// operands here, before the exchanges, exactly as broadcast does —
 					// the downstream restore project keys on placement alone and must
 					// never run for a swap that did not happen.
+					// After this swap, `left_*` names the physical build side and
+					// `right_*`/`physical_probe_linearity` the physical probe side.
+					let physical_probe_linearity;
 					if decision.placement == JoinPhysicalPlacement::SwappedRightBuild {
 						std::mem::swap(&mut left_plan, &mut right_plan);
 						std::mem::swap(&mut left_keys, &mut right_keys);
 						std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys);
+						physical_probe_linearity = left_probe_linearity;
+					} else {
+						physical_probe_linearity = right_probe_linearity;
 					}
 					// ADR 490: a direct executor can retain a qualifying hash build in memory,
 					// but only when its caller proves this bind will never be fragmented. The
@@ -3118,17 +3126,24 @@ impl<'a> Binder<'a> {
 					// the fragmenter still rejects an exchange-free hash shape loudly as a
 					// backstop. Keep pinned strategies and non-inner joins on the established
 					// exchanged path.
-					local_hash_join = matches!(strategy_intent, JoinStrategyIntent::Auto)
-						&& kind == JoinKind::Inner
-						&& right_probe_linearity.is_linear()
-						&& local_hash_join_memory_policy_admits(
-							self.config,
-							left_plan.facts.row_upper_bound,
-							&left_resolved_keys
-								.iter()
-								.map(|key| key.column.data_type.clone())
-								.collect::<Vec<_>>(),
-						);
+					let admission = local_hash_join_admission(
+						self.config,
+						matches!(strategy_intent, JoinStrategyIntent::Auto),
+						kind,
+						physical_probe_linearity,
+						left_plan.facts.row_upper_bound,
+						&left_resolved_keys
+							.iter()
+							.map(|key| key.column.data_type.clone())
+							.collect::<Vec<_>>(),
+					);
+					trace
+						.local_hash_join_admissions
+						.push(LocalHashJoinAdmissionReceipt {
+							target: JoinTraceTarget { join_index },
+							admission,
+						});
+					local_hash_join = admission.admitted();
 					if local_hash_join {
 						// The no-exchange shape is intentionally accepted only by the local
 						// validator branch below. It is structurally illegal to fragment.

@@ -77,32 +77,125 @@ pub(super) struct JoinInputOptimization {
 	pub(super) probe_linearity: ProbeLinearity,
 }
 
-/// ADR 490's raw-memory policy predicate. This is deliberately pure and unwired:
-/// the admission cut must first prove its boundary before a binder branch can emit a
-/// no-exchange local shape. Both the task coordinate and a conservative row bound are
-/// required; absent evidence declines.
-pub(super) fn local_hash_join_memory_policy_admits(
+/// ADR 490: the outcome of local hash-join admission, one variant per declining
+/// precondition. A bare bool proved unauditable — a live cell could not say
+/// which gate declined — so admission always produces this receipt and the
+/// binder records it on the optimizer trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalHashJoinAdmission {
+	Admitted {
+		estimated_build_bytes: u64,
+		memory_per_task: u64,
+	},
+	PinnedStrategy,
+	NotInner,
+	ProbeNotScanLinear,
+	NotSinglePartitionExecution,
+	NoMemoryBudget,
+	NoBuildRowBound,
+	EstimateExceedsBudget {
+		estimated_build_bytes: u64,
+		memory_per_task: u64,
+	},
+}
+
+impl LocalHashJoinAdmission {
+	pub fn admitted(&self) -> bool {
+		matches!(self, Self::Admitted { .. })
+	}
+
+	/// Compact single-token receipt form for perf/telemetry rows.
+	pub fn describe(&self) -> String {
+		match self {
+			Self::Admitted {
+				estimated_build_bytes,
+				memory_per_task,
+			} => format!("admitted(estimate={estimated_build_bytes},budget={memory_per_task})"),
+			Self::PinnedStrategy => "declined(pinned_strategy)".to_string(),
+			Self::NotInner => "declined(not_inner)".to_string(),
+			Self::ProbeNotScanLinear => "declined(probe_not_scan_linear)".to_string(),
+			Self::NotSinglePartitionExecution => {
+				"declined(not_single_partition_execution)".to_string()
+			}
+			Self::NoMemoryBudget => "declined(no_memory_budget)".to_string(),
+			Self::NoBuildRowBound => "declined(no_build_row_bound)".to_string(),
+			Self::EstimateExceedsBudget {
+				estimated_build_bytes,
+				memory_per_task,
+			} => format!(
+				"declined(estimate_exceeds_budget,estimate={estimated_build_bytes},budget={memory_per_task})"
+			),
+		}
+	}
+}
+
+/// ADR 490's full admission gate: shape preconditions first, then the raw-memory
+/// policy. Both the task coordinate and a conservative row bound are required;
+/// absent evidence declines.
+pub(super) fn local_hash_join_admission(
+	config: &PlannerConfig,
+	strategy_intent_is_auto: bool,
+	kind: JoinKind,
+	physical_probe_linearity: ProbeLinearity,
+	build_rows: Option<RowCount>,
+	build_key_types: &[DataType],
+) -> LocalHashJoinAdmission {
+	if !strategy_intent_is_auto {
+		return LocalHashJoinAdmission::PinnedStrategy;
+	}
+	if kind != JoinKind::Inner {
+		return LocalHashJoinAdmission::NotInner;
+	}
+	if !physical_probe_linearity.is_linear() {
+		return LocalHashJoinAdmission::ProbeNotScanLinear;
+	}
+	local_hash_join_memory_policy(config, build_rows, build_key_types)
+}
+
+/// ADR 490's raw-memory policy predicate, receipt form.
+fn local_hash_join_memory_policy(
 	config: &PlannerConfig,
 	build_rows: Option<RowCount>,
 	build_key_types: &[DataType],
-) -> bool {
+) -> LocalHashJoinAdmission {
 	if !config.single_partition_execution {
-		return false;
+		return LocalHashJoinAdmission::NotSinglePartitionExecution;
 	}
 	let Some(memory_per_task) = config.local_hash_join_memory_per_task else {
-		return false;
+		return LocalHashJoinAdmission::NoMemoryBudget;
 	};
 	let Some(build_rows) = build_rows else {
-		return false;
+		return LocalHashJoinAdmission::NoBuildRowBound;
 	};
 	let key_width = build_key_types
 		.iter()
 		.map(crate::ir::hash_join_build_key_width)
 		.sum::<usize>();
-	crate::ir::estimated_hash_join_build_bytes(
+	let estimated_build_bytes = crate::ir::estimated_hash_join_build_bytes(
 		usize::try_from(build_rows.get()).unwrap_or(usize::MAX),
 		key_width,
-	) <= memory_per_task.get()
+	);
+	if estimated_build_bytes <= memory_per_task.get() {
+		LocalHashJoinAdmission::Admitted {
+			estimated_build_bytes,
+			memory_per_task: memory_per_task.get(),
+		}
+	} else {
+		LocalHashJoinAdmission::EstimateExceedsBudget {
+			estimated_build_bytes,
+			memory_per_task: memory_per_task.get(),
+		}
+	}
+}
+
+/// Boundary-test predicate form of the raw-memory policy.
+#[cfg(test)]
+pub(super) fn local_hash_join_memory_policy_admits(
+	config: &PlannerConfig,
+	build_rows: Option<RowCount>,
+	build_key_types: &[DataType],
+) -> bool {
+	local_hash_join_memory_policy(config, build_rows, build_key_types).admitted()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
