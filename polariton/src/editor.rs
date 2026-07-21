@@ -24,7 +24,9 @@ use libaryon::engine::{
 	UiPalette, VisualKind,
 };
 use libaryon::uast::Viewport;
+use libaryon::uast::projection::MarkdownCellIdentity;
 use polars::frame::DataFrame;
+use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 
 /// The single query-results surface. One stable identity reused for every run,
@@ -110,6 +112,22 @@ pub struct CodeEditor {
 	/// Workspace pane rearrangement in progress. The engine receives one drop
 	/// command on release; it remains the sole owner of the split tree.
 	pane_drag: Option<PaneDrag>,
+	/// Output state belongs to the native notebook preview, keyed by the
+	/// engine-projected identity of its Markdown fence.
+	notebook_outputs: HashMap<MarkdownCellIdentity, NotebookCellOutput>,
+}
+
+/// A runnable fenced SQL cell selected by the engine's cursor projection.
+pub struct MarkdownCellExecution {
+	pub identity: MarkdownCellIdentity,
+	pub code: String,
+}
+
+enum NotebookCellOutput {
+	Running,
+	Table(Box<DataFrame>),
+	Failed(String),
+	Message(String),
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +175,7 @@ impl CodeEditor {
 			result_revision: 0,
 			drag: None,
 			pane_drag: None,
+			notebook_outputs: HashMap::new(),
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -199,6 +218,56 @@ impl CodeEditor {
 				.map_or(tail, |(line, _)| line)
 				.to_owned(),
 		)
+	}
+
+	/// The SQL fence containing the focused source cursor, if that source has a
+	/// paired Markdown preview. The fence ranges and identities are projected by
+	/// libaryon; Polariton only slices the authoritative source bytes.
+	pub fn selected_markdown_cell(&self) -> Option<MarkdownCellExecution> {
+		let viewport = self.viewport.as_ref()?;
+		let source = viewport.focused_pane()?;
+		if !source.selection_ranges.is_empty() {
+			return None;
+		}
+		let cursor = source.cursor_abs_byte;
+		let preview = viewport.panes.iter().find_map(|pane| {
+			pane.markdown_preview
+				.as_ref()
+				.filter(|preview| preview.source_view_id == source.view_id)
+		})?;
+		let cell = preview.cells.iter().find(|cell| {
+			cell.language_id == "sql"
+				&& cell.body_range.start <= cursor
+				&& cursor < cell.body_range.end
+		})?;
+		let code = self
+			.document_text
+			.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)?
+			.to_owned();
+		Some(MarkdownCellExecution {
+			identity: cell.identity.clone(),
+			code,
+		})
+	}
+
+	pub fn begin_markdown_cell(&mut self, identity: MarkdownCellIdentity) {
+		self.notebook_outputs
+			.insert(identity, NotebookCellOutput::Running);
+	}
+
+	pub fn set_markdown_cell_table(&mut self, identity: MarkdownCellIdentity, frame: DataFrame) {
+		self.notebook_outputs
+			.insert(identity, NotebookCellOutput::Table(Box::new(frame)));
+	}
+
+	pub fn set_markdown_cell_error(&mut self, identity: MarkdownCellIdentity, message: String) {
+		self.notebook_outputs
+			.insert(identity, NotebookCellOutput::Failed(message));
+	}
+
+	pub fn set_markdown_cell_message(&mut self, identity: MarkdownCellIdentity, message: String) {
+		self.notebook_outputs
+			.insert(identity, NotebookCellOutput::Message(message));
 	}
 
 	/// Announce that a query started: open the results panel on first run, and
@@ -352,6 +421,7 @@ impl CodeEditor {
 					self.request_content();
 				}
 			}
+			self.reconcile_notebook_outputs(&viewport);
 			self.viewport = Some(viewport);
 			changed = true;
 		}
@@ -367,6 +437,17 @@ impl CodeEditor {
 		changed |= !events.is_empty();
 		self.panels.reconcile(&events, self.viewport.as_ref());
 		changed
+	}
+
+	fn reconcile_notebook_outputs(&mut self, viewport: &Viewport) {
+		let live = viewport
+			.panes
+			.iter()
+			.filter_map(|pane| pane.markdown_preview.as_ref())
+			.flat_map(|preview| preview.cells.iter().map(|cell| cell.identity.clone()))
+			.collect::<std::collections::HashSet<_>>();
+		self.notebook_outputs
+			.retain(|identity, _| live.contains(identity));
 	}
 
 	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
@@ -474,7 +555,12 @@ impl CodeEditor {
 		for pane in &viewport.panes {
 			let focused = pane.pane_id == viewport.focused_pane_id;
 			let content = if let Some(preview) = pane.markdown_preview.as_ref() {
-				markdown_preview_surface(preview, palette)
+				markdown_preview_surface(
+					preview,
+					palette,
+					&self.notebook_outputs,
+					self.show_column_types,
+				)
 			} else {
 				match pane.host_panel.as_ref() {
 					Some(panel) => self.panels.surface(
@@ -1453,6 +1539,8 @@ fn text_pane_surface<'a>(
 fn markdown_preview_surface<'a>(
 	preview: &'a libaryon::uast::projection::MarkdownPreviewSnapshot,
 	palette: UiPalette,
+	outputs: &'a HashMap<MarkdownCellIdentity, NotebookCellOutput>,
+	show_column_types: bool,
 ) -> Element<'a, EditorMsg> {
 	let mut rows: Vec<Element<'_, EditorMsg>> = Vec::new();
 	let mut byte_offset = 0u64;
@@ -1464,7 +1552,23 @@ fn markdown_preview_surface<'a>(
 		let trimmed = content.trim_start();
 		let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
 		if fence {
+			let closing = in_code_block;
 			in_code_block = !in_code_block;
+			if closing {
+				let body_end = byte_offset;
+				if let Some(cell) = preview
+					.cells
+					.iter()
+					.find(|cell| cell.body_range.end.get() == body_end)
+					&& let Some(output) = outputs.get(&cell.identity)
+				{
+					rows.push(markdown_cell_output_surface(
+						output,
+						palette,
+						show_column_types,
+					));
+				}
+			}
 			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
 			continue;
 		}
@@ -1521,6 +1625,47 @@ fn markdown_preview_surface<'a>(
 		.padding(20)
 		.width(Length::Fill)
 		.height(Length::Fill)
+		.into()
+}
+
+fn markdown_cell_output_surface<'a>(
+	output: &'a NotebookCellOutput,
+	palette: UiPalette,
+	show_column_types: bool,
+) -> Element<'a, EditorMsg> {
+	let content: Element<'a, EditorMsg> = match output {
+		NotebookCellOutput::Running => text("running…")
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(palette.preview_text))
+			.into(),
+		NotebookCellOutput::Table(frame) => Table::new(frame, 0)
+			.show_column_types(show_column_types)
+			.into(),
+		NotebookCellOutput::Failed(message) => text(message)
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(palette.status_text))
+			.into(),
+		NotebookCellOutput::Message(message) => text(message)
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(palette.preview_text))
+			.into(),
+	};
+	container(content)
+		.padding(8)
+		.width(Length::Fill)
+		.height(Length::Fixed(260.0))
+		.style(move |_| container::Style {
+			background: Some(Background::Color(color(palette.preview_surface))),
+			border: iced::Border {
+				color: color(palette.divider_surface),
+				width: 1.0,
+				radius: 0.0.into(),
+			},
+			..Default::default()
+		})
 		.into()
 }
 
@@ -2859,6 +3004,65 @@ mod tests {
 			thread::sleep(Duration::from_millis(5));
 		}
 		assert_eq!(editor.selected_or_current_line().as_deref(), Some("se"));
+	}
+
+	#[test]
+	fn markdown_sql_fence_runs_as_one_cell() {
+		let markdown = "# Notebook\n\n```sql {#trips}\nselect id\nfrom trips;\n```\n";
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		editor.send(EditorCommand::ReplaceDocument {
+			text: markdown.to_owned(),
+			language: Some("markdown".to_owned()),
+			virtual_path: Some("notebook.md".to_owned()),
+		});
+		editor.request_content();
+		wait_for_content(&mut editor, markdown);
+		editor.send(EditorCommand::MarkdownPreview { serif: false });
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			!viewport
+				.panes
+				.iter()
+				.any(|pane| pane.markdown_preview.is_some())
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(editor.viewport.as_ref().is_some_and(|viewport| {
+			viewport
+				.panes
+				.iter()
+				.any(|pane| pane.markdown_preview.is_some())
+		}));
+
+		send_keys(&mut editor, ['j', 'j', 'j']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.selected_markdown_cell().is_none() && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let cell = editor
+			.selected_markdown_cell()
+			.expect("cursor is in SQL fence");
+		assert_eq!(cell.code, "select id\nfrom trips;\n");
+		assert!(matches!(
+			cell.identity,
+			libaryon::uast::projection::MarkdownCellIdentity::Explicit { ref id } if id == "trips"
+		));
+		let identity = cell.identity.clone();
+		editor.begin_markdown_cell(identity.clone());
+		assert!(matches!(
+			editor.notebook_outputs.get(&identity),
+			Some(super::NotebookCellOutput::Running)
+		));
+		editor.set_markdown_cell_message(identity.clone(), "Rows affected: 3".to_owned());
+		assert!(matches!(
+			editor.notebook_outputs.get(&identity),
+			Some(super::NotebookCellOutput::Message(message)) if message == "Rows affected: 3"
+		));
 	}
 
 	#[test]

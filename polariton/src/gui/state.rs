@@ -2,7 +2,7 @@ use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::{AdapterConfiguration, AdapterSelection, AdapterState},
 };
-use crate::editor::CodeEditor;
+use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 use crate::gui::{
 	components::{self, PaneType},
@@ -283,6 +283,30 @@ fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
 	)
 }
 
+fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
+	let Some(db) = app_state.adapter_state.connection.as_ref() else {
+		return Task::none();
+	};
+	if cell.code.trim().is_empty() {
+		app_state.status_msg = "Nothing to run in this cell.".into();
+		return Task::none();
+	}
+	let db = db.clone();
+	let identity = cell.identity.clone();
+	app_state.status_msg = "Code running…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	app_state.code_editor.begin_markdown_cell(cell.identity);
+	Task::perform(
+		async move {
+			let mut guard = db.write().await;
+			guard.dispatch(&cell.code).await
+		},
+		move |result| Message::RunMarkdownCellResult { identity, result },
+	)
+}
+
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	match message {
 		Message::Dashboard(message) => {
@@ -398,9 +422,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			};
 		}
 		Message::Run => {
+			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
+				return run_markdown_cell(app_state, cell);
+			}
 			return run_code(app_state, app_state.code_editor.cached_content().to_owned());
 		}
 		Message::RunSnippet => {
+			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
+				return run_markdown_cell(app_state, cell);
+			}
 			let Some(code) = app_state.code_editor.selected_or_current_line() else {
 				app_state.status_msg = "No editor text is available to run.".into();
 				return Task::none();
@@ -440,6 +470,55 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 				ExecutionResult::None => {
 					app_state.status_msg = "Noop finished.".to_string();
+				}
+			}
+		}
+		Message::RunMarkdownCellResult { identity, result } => {
+			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
+			app_state.status_time_elapsed = Some(time_elapsed);
+			app_state.status_error.clear();
+			match result {
+				ExecutionResult::Rows(df) => {
+					let rows = df.height();
+					let cols = df.width();
+					app_state
+						.code_editor
+						.set_markdown_cell_table(identity, df.clone());
+					app_state.data_frame = df;
+					app_state.status_df_size = Some((rows, cols));
+					app_state.status_msg = "Cell finished.".to_owned();
+				}
+				ExecutionResult::Err(message) => {
+					app_state.status_error = format!("Error: {message}");
+					app_state.status_msg.clear();
+					app_state
+						.code_editor
+						.set_markdown_cell_error(identity, message);
+				}
+				ExecutionResult::Affected(rows) => {
+					app_state
+						.code_editor
+						.set_markdown_cell_message(identity, format!("Rows affected: {rows}"));
+					app_state.status_msg = format!("Rows affected: {rows}");
+				}
+				ExecutionResult::CommandCompleted(message) => {
+					app_state
+						.code_editor
+						.set_markdown_cell_message(identity, message.clone());
+					app_state.status_msg = message;
+				}
+				ExecutionResult::Batch(results) => {
+					let message = format!("Batch complete: {results:?}");
+					app_state
+						.code_editor
+						.set_markdown_cell_message(identity, message.clone());
+					app_state.status_msg = message;
+				}
+				ExecutionResult::None => {
+					app_state
+						.code_editor
+						.set_markdown_cell_message(identity, "Done.".to_owned());
+					app_state.status_msg = "Cell finished.".to_owned();
 				}
 			}
 		}

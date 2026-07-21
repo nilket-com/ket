@@ -1,12 +1,12 @@
 use super::menu;
-use crate::editor::EditorMsg;
 use crate::adapters::{
 	common::{DatabaseAdapter, ExecutionResult},
 	driver::AdapterSelection,
 };
+use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
-use crate::persistence::{PrivateDb, SavedConnection, SavedStatement};
 use crate::gui::pane_grid::Action;
+use crate::persistence::{PrivateDb, SavedConnection, SavedStatement};
 use iced::window;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -72,6 +72,10 @@ pub enum Message {
 	Run,
 	RunSnippet,
 	RunResult(ExecutionResult),
+	RunMarkdownCellResult {
+		identity: libaryon::uast::projection::MarkdownCellIdentity,
+		result: ExecutionResult,
+	},
 	SaveConnection,
 	SaveStatement,
 	SaveStatementNameChanged(String),
