@@ -5810,6 +5810,7 @@ dependencies = [
  "ravif",
  "regex",
  "resvg",
+ "rune",
  "rustls",
  "sqlparser 0.61.0",
  "svg_fmt",

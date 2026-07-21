@@ -36,6 +36,7 @@ rand_distr = "0.6.0"
 ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
 regex = "1.12.3"
 resvg = "0.47.0"
+rune.workspace = true
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
 sqlparser = "0.61.0"
 svg_fmt = "0.4.5"

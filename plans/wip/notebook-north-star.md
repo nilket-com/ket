@@ -128,7 +128,7 @@ following cut attaches that already-proven output to a `rune` fence.
       ```
 
       ```rune {#trips-plot, output=inline, code=hide}
-      viz.plot(workspace.cell("trips")).scatter("x", "y").line("x", "y").show();
+      viz.plot(workspace.cell("trips")).scatter().line().show();
       ```
       ````
 
