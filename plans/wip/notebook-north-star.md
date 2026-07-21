@@ -48,6 +48,11 @@ split/tab/maximize gives the "fold back the covers" interaction for free.
   snapshots even with `output=none`; `workspace.cell("name")` resolves one and
   `viz.plot(...).scatter().line().show()?` builds the existing plot kernel off
   the UI thread. An inline Rune cell receives the resulting native plot.
+- **Milestone 5 — inline plot surface shipped.** Each inline plot has local
+  state keyed by its Markdown cell identity, renders native hover feedback,
+  and uses a plot-sized document block whose width follows the preview. The
+  existing canvas has no zoom gesture yet, so zoom remains future work rather
+  than a falsely advertised property of this surface.
 
 ## Cell presentation contract
 
@@ -90,11 +95,11 @@ document's declared layout.
 
 ### Next cut
 
-Build the plot surface cut from step 4. The initial inline plot uses the
-existing canvas and kernel but deliberately discards its interaction messages.
-Give preview plots their own hover/zoom state and sensible responsive sizing;
-then refine the already-working `output=pane` dashboard-host-panel surface to
-share that interaction model.
+Extend the plot surface only when there is a concrete gesture to support. The
+current canvas exposes hover and double-click messages; preview hover is now
+stateful, while a real zoom/pan model has not been designed or implemented.
+Keep `output=pane` and inline plots on the same kernel/composition path as new
+interaction capabilities arrive.
 
 ## Sequence
 
@@ -139,10 +144,13 @@ share that interaction model.
 
       The existing `NotebookCellOutput` gains a native plot variant and the
       preview renders the existing plot kernel beneath the Rune fence.
-   3. *Plot-surface cut.* Preserve interactive hover/zoom and sensible inline
-      sizing; then make `output=pane` publish the same plot into a host panel.
-      Dialog edits come only after this surface works, and use managed Rune
-      source edits rather than bidirectional general-program synchronization.
+   3. *Plot-surface cut — shipped for hover and sizing.* Inline plots retain
+      per-cell hover state and use responsive width with a plot-sized document
+      block. Future zoom/pan must begin with a real canvas gesture, not an
+      empty promise; `output=pane` already publishes through the dashboard
+      host panel. Dialog edits come only after this surface works, and use
+      managed Rune source edits rather than bidirectional general-program
+      synchronization.
 5. **Direct manipulation as managed source edits.** The dialog edits *recognized*
    Rune calls via the `:initw` writer's machinery (`update_init_file` /
    `config_call_key`); hand-authored or too-complex Rune stays authoritative and

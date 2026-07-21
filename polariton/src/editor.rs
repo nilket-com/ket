@@ -45,6 +45,9 @@ const INITIAL_ROWS: u16 = 40;
 /// leaking pane chrome back into Polariton's old outer grid.
 const PANE_HEADER_HEIGHT: f32 = 22.0;
 const PANE_DRAG_DEADBAND: f32 = 8.0;
+/// A plot needs more room than a tabular result, but remains a document block
+/// rather than a workspace pane. Width stays responsive to the preview.
+const NOTEBOOK_PLOT_HEIGHT: f32 = 360.0;
 
 /// The registered application monospace font. Named explicitly (rather than
 /// `Font::MONOSPACE`, which resolves to the platform default) so
@@ -84,9 +87,12 @@ pub enum EditorMsg {
 	/// native table/dashboard widgets may capture pointer events before the
 	/// workspace-wide mouse area sees them.
 	PaneDragStarted(libaryon::core::PaneId),
-	/// Cut 2 paints Rune plots with the existing kernel. Interactive plot
-	/// controls are wired in the following plot-surface cut.
-	NotebookPlot(crate::gui::messages::PlotMessage),
+	/// A message from one inline notebook plot. Identity keeps interactive
+	/// state local to its cell rather than leaking through the dashboard.
+	NotebookPlot {
+		identity: MarkdownCellIdentity,
+		message: crate::gui::messages::PlotMessage,
+	},
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -150,12 +156,38 @@ pub struct MarkdownCellExecution {
 enum NotebookCellOutput {
 	Running,
 	Table(Box<DataFrame>),
-	Plot {
-		composition: PlotComposition,
-		kernel: Arc<dyn PlotKernel + Send + Sync>,
-	},
+	Plot { surface: NotebookPlotSurface },
 	Failed(String),
 	Message(String),
+}
+
+/// Native interaction state for a plot embedded in the Markdown preview.
+/// It deliberately shares the existing plot kernel and settings model with
+/// dashboard plots, but has its own identity and hover state.
+struct NotebookPlotSurface {
+	composition: PlotComposition,
+	kernel: Arc<dyn PlotKernel + Send + Sync>,
+	settings: PlotSettings,
+	hovered_info: Option<String>,
+	render_revision: u64,
+}
+
+impl NotebookPlotSurface {
+	fn new(composition: PlotComposition, kernel: Arc<dyn PlotKernel + Send + Sync>) -> Self {
+		Self {
+			composition,
+			kernel,
+			settings: PlotSettings::default(),
+			hovered_info: None,
+			render_revision: 0,
+		}
+	}
+
+	fn update(&mut self, message: crate::gui::messages::PlotMessage) {
+		if let crate::gui::messages::PlotMessage::UpdateHover(hover) = message {
+			self.hovered_info = hover;
+		}
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -371,8 +403,7 @@ impl CodeEditor {
 		self.notebook_outputs.insert(
 			identity,
 			NotebookCellOutput::Plot {
-				composition,
-				kernel,
+				surface: NotebookPlotSurface::new(composition, kernel),
 			},
 		);
 	}
@@ -595,12 +626,12 @@ impl CodeEditor {
 		}
 		match message {
 			EditorMsg::Dashboard(_) => {}
-			EditorMsg::NotebookPlot(plot_message) => {
-				// The canvas emits the existing plot interaction vocabulary already.
-				// Cut 3 gives this preview-owned state (hover, zoom, settings) a
-				// durable home; for now retaining the message makes the surface
-				// explicit rather than pretending it is a static image.
-				let _ = plot_message;
+			EditorMsg::NotebookPlot { identity, message } => {
+				if let Some(NotebookCellOutput::Plot { surface }) =
+					self.notebook_outputs.get_mut(&identity)
+				{
+					surface.update(message);
+				}
 			}
 			EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char('v'),
@@ -1772,6 +1803,7 @@ fn markdown_preview_surface<'a>(
 							== libaryon::uast::projection::MarkdownCellOutputTarget::Inline
 					{
 						rows.push(markdown_cell_output_surface(
+							cell.identity.clone(),
 							output,
 							palette,
 							show_column_types,
@@ -1852,6 +1884,7 @@ fn markdown_preview_surface<'a>(
 }
 
 fn markdown_cell_output_surface<'a>(
+	identity: MarkdownCellIdentity,
 	output: &'a NotebookCellOutput,
 	palette: UiPalette,
 	show_column_types: bool,
@@ -1865,23 +1898,49 @@ fn markdown_cell_output_surface<'a>(
 		NotebookCellOutput::Table(frame) => Table::new(frame, 0)
 			.show_column_types(show_column_types)
 			.into(),
-		NotebookCellOutput::Plot {
-			composition,
-			kernel,
-		} => {
+		NotebookCellOutput::Plot { surface } => {
 			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget {
-				kernel: kernel.as_ref(),
-				title: composition.title(),
+				kernel: surface.kernel.as_ref(),
+				title: surface.composition.title(),
 				padding: 20.0,
-				settings: PlotSettings::default(),
-				render_revision: 0,
+				settings: surface.settings.clone(),
+				render_revision: surface.render_revision,
 				resize_render_suspended: false,
 				layer: PlotRenderLayer::Full,
 			})
 			.width(Length::Fill)
 			.height(Length::Fill)
 			.into();
-			plot.map(EditorMsg::NotebookPlot)
+			let mut layers = stack![plot.map({
+				let identity = identity.clone();
+				move |message| EditorMsg::NotebookPlot {
+					identity: identity.clone(),
+					message,
+				}
+			})];
+			if let Some(info) = surface.hovered_info.as_deref() {
+				layers = layers.push(
+					container(text(info).size(metrics::TEXT_SIZE))
+						.padding(6)
+						.style(move |_| container::Style {
+							background: Some(Background::Color(Color {
+								a: 0.85,
+								..surface.settings.background_color
+							})),
+							border: iced::Border {
+								color: surface.settings.decoration_color,
+								width: 1.0,
+								radius: 2.0.into(),
+							},
+							text_color: Some(surface.settings.decoration_color),
+							..Default::default()
+						}),
+				);
+			}
+			container(layers)
+				.width(Length::Fill)
+				.height(Length::Fixed(NOTEBOOK_PLOT_HEIGHT))
+				.into()
 		}
 		NotebookCellOutput::Failed(message) => text(message)
 			.font(EDITOR_FONT)
@@ -1897,7 +1956,11 @@ fn markdown_cell_output_surface<'a>(
 	container(content)
 		.padding(8)
 		.width(Length::Fill)
-		.height(Length::Fixed(260.0))
+		.height(if matches!(output, NotebookCellOutput::Plot { .. }) {
+			Length::Fixed(NOTEBOOK_PLOT_HEIGHT)
+		} else {
+			Length::Fixed(260.0)
+		})
 		.style(move |_| container::Style {
 			background: Some(Background::Color(color(palette.preview_surface))),
 			border: iced::Border {
@@ -3555,6 +3618,33 @@ mod tests {
 				.map(|cell| cell.language_id),
 			Some("rune".to_owned())
 		);
+	}
+
+	#[test]
+	fn inline_plot_hover_is_scoped_to_its_cell_identity() {
+		use crate::gui::messages::PlotMessage;
+		use crate::plot::{composition::PlotComposition, core::PlotType, factory::create_plot};
+		use libaryon::uast::projection::MarkdownCellIdentity;
+
+		let frame = polars::df!("x" => [1_i32, 2], "y" => [2_i32, 4]).expect("frame");
+		let composition = PlotComposition::single(PlotType::Scatter);
+		let kernel = create_plot(&composition, &frame, 600, 360);
+		let identity = MarkdownCellIdentity::Explicit {
+			id: "trips-plot".to_owned(),
+		};
+		let mut editor = CodeEditor::new("");
+		editor.set_markdown_cell_plot(identity.clone(), composition, kernel);
+		let _ = editor.update(EditorMsg::NotebookPlot {
+			identity: identity.clone(),
+			message: PlotMessage::UpdateHover(Some("x: 1, y: 2".to_owned())),
+		});
+
+		let Some(super::NotebookCellOutput::Plot { surface }) =
+			editor.notebook_outputs.get(&identity)
+		else {
+			panic!("the inline plot remains attached to its source cell");
+		};
+		assert_eq!(surface.hovered_info.as_deref(), Some("x: 1, y: 2"));
 	}
 
 	#[test]
