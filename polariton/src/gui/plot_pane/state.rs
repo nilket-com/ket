@@ -171,7 +171,9 @@ impl PlotPaneState {
 				self.plot_settings.max_legend_rows = rows;
 				self.max_legend_rows_input = rows.to_string();
 			}
-			PlotPaneMsg::SetScatterRenderMode(mode) => self.plot_settings.scatter_render_mode = mode,
+			PlotPaneMsg::SetScatterRenderMode(mode) => {
+				self.plot_settings.scatter_render_mode = mode
+			}
 			PlotPaneMsg::SetScatterMaxVectorPoints(points) => {
 				self.plot_settings.scatter_max_vector_points = points.max(1);
 				self.scatter_max_vector_points_input = points.to_string();

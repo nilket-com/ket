@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::core::DocByte;
 use crate::engine::language::{GreenNode, LanguageProvider, SemanticOutput};
+use crate::svp::cargo_annotations;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::svp::toml_highlight::highlight_toml;
 use crate::svp::toml_semantic::build_toml_topology;
-use crate::svp::cargo_annotations;
 
 pub struct TomlProvider;
 

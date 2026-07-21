@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	format_label, AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel,
-	PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
+	PlotSettings, format_label,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};

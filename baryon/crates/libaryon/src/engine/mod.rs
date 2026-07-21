@@ -48,8 +48,8 @@ pub use self::host::{EngineConfig, EngineHandle, supported_languages};
 pub use self::host_event::{HostEvent, HostPanelDescriptor, HostPanelId, PanelRevision};
 pub use self::input::{InputCompletionStatus, InputEvent, InputProjection, KeyCode, Modifiers};
 pub use self::input::{help_topic_hint, render_cli_help};
-pub use self::layout::{GutterNumbering, VisibleRow};
 pub use self::language::{InlineAnnotation, InlineAnnotationKind};
+pub use self::layout::{GutterNumbering, VisibleRow};
 pub use self::layout::{
 	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
 	gutter_width_for_max_line, pan_viewport_anchor_to_keep_cursor_visible, scroll_viewport_anchor,
@@ -63,8 +63,8 @@ pub use self::minimap::{
 };
 pub use self::protocol::{
 	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,
-	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SplitDirection, SubstituteFlags, VerticalDirection,
-	VisualKind, WordMotion,
+	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SplitDirection, SubstituteFlags,
+	VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};

@@ -143,21 +143,35 @@ pub fn draw_handle<Renderer>(
 
 	draw_dots(renderer, bounds, zone.axis, style);
 
-	let first_color = if hovered_arrow == Some(true) || zone.collapse == CollapseState::FirstCollapsed {
-		style.arrow_hover_color
-	} else {
-		style.arrow_color
-	};
-	let second_color = if hovered_arrow == Some(false) || zone.collapse == CollapseState::SecondCollapsed {
-		style.arrow_hover_color
-	} else {
-		style.arrow_color
-	};
+	let first_color =
+		if hovered_arrow == Some(true) || zone.collapse == CollapseState::FirstCollapsed {
+			style.arrow_hover_color
+		} else {
+			style.arrow_color
+		};
+	let second_color =
+		if hovered_arrow == Some(false) || zone.collapse == CollapseState::SecondCollapsed {
+			style.arrow_hover_color
+		} else {
+			style.arrow_color
+		};
 
 	let (first_glyph, second_glyph) = arrow_glyphs(zone.axis, zone.collapse);
 
-	draw_arrow_text(renderer, zone.first_arrow, first_glyph, first_color, ARROW_FONT_SIZE);
-	draw_arrow_text(renderer, zone.second_arrow, second_glyph, second_color, ARROW_FONT_SIZE);
+	draw_arrow_text(
+		renderer,
+		zone.first_arrow,
+		first_glyph,
+		first_color,
+		ARROW_FONT_SIZE,
+	);
+	draw_arrow_text(
+		renderer,
+		zone.second_arrow,
+		second_glyph,
+		second_color,
+		ARROW_FONT_SIZE,
+	);
 }
 
 fn arrow_glyphs(axis: Axis, collapse: CollapseState) -> (&'static str, &'static str) {
@@ -326,11 +340,7 @@ pub fn draw_drag_handle<Renderer>(
 	let cx = bounds.x + bounds.width / 2.0;
 	let cy = bounds.y + bounds.height / 2.0;
 
-	let offsets: [f32; 3] = [
-		-GRIP_DOT_SPACING,
-		0.0,
-		GRIP_DOT_SPACING,
-	];
+	let offsets: [f32; 3] = [-GRIP_DOT_SPACING, 0.0, GRIP_DOT_SPACING];
 
 	for &dx in &offsets {
 		let x = cx + dx;

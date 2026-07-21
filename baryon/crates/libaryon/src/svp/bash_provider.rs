@@ -37,7 +37,7 @@ impl LanguageProvider for BashProvider {
 		let offset_map = [(0usize, global_offset)];
 		SemanticOutput {
 			highlights: highlight_bash(full_source.as_bytes(), &offset_map),
-			 diagnostics: Vec::new(),
+			diagnostics: Vec::new(),
 			inline_annotations: Vec::new(),
 		}
 	}

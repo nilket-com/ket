@@ -1,9 +1,9 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
 use async_trait::async_trait;
-use mysql_async::{prelude::Queryable, Pool, Value as MySqlValue};
+use mysql_async::{Pool, Value as MySqlValue, prelude::Queryable};
 use polars::{
 	datatypes::AnyValue,
-	frame::{column::Column, DataFrame},
+	frame::{DataFrame, column::Column},
 	series::Series,
 };
 use sqlparser::{ast::Statement, dialect::MySqlDialect, parser::Parser};

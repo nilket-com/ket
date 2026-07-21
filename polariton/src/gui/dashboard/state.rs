@@ -25,8 +25,13 @@ impl Default for DashboardState {
 
 pub enum DashboardEffect {
 	None,
-	BuildNewPlot { composition: PlotComposition },
-	RebuildPlot { pane: PaneId, composition: PlotComposition },
+	BuildNewPlot {
+		composition: PlotComposition,
+	},
+	RebuildPlot {
+		pane: PaneId,
+		composition: PlotComposition,
+	},
 }
 
 impl DashboardState {

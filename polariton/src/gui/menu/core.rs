@@ -11,8 +11,6 @@ use iced::keyboard;
 use iced::window;
 use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Shadow, Size, Vector};
 
-use crate::fonts::MENU_FONT;
-use crate::gui::colors::{BG_PRIMARY, BORDER_PRIMARY, TEXT_PRIMARY};
 use super::geometry::{
 	ARROW_GUTTER, ARROW_TEXT_GAP, BAR_HEIGHT, BAR_ITEM_PADDING_X, Hit, ItemKind, LABEL_SIZE,
 	MenuGeometry, PANEL_TEXT_OFFSET,
@@ -22,6 +20,8 @@ use super::interaction::{
 	panel_items, selectable_item,
 };
 use super::{MenuItem, MenuRoot, MenuState};
+use crate::fonts::MENU_FONT;
+use crate::gui::colors::{BG_PRIMARY, BORDER_PRIMARY, TEXT_PRIMARY};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuMessage {
@@ -422,7 +422,8 @@ where
 							}
 							ItemKind::Submenu { id, .. } => {
 								widget_state.sync(&self.roots, self.state);
-								if let Some(items) = panel_items(&self.roots, self.state, item.depth)
+								if let Some(items) =
+									panel_items(&self.roots, self.state, item.depth)
 								{
 									widget_state.focus_submenu(items, item.depth, id);
 								}
@@ -497,7 +498,11 @@ where
 							if widget_state.focus_path.is_empty() {
 								widget_state.focus_root_panel(&self.roots, open_root);
 							} else {
-								widget_state.focus_current_panel(&self.roots, self.state, direction);
+								widget_state.focus_current_panel(
+									&self.roots,
+									self.state,
+									direction,
+								);
 							}
 
 							shell.request_redraw();
@@ -518,7 +523,10 @@ where
 									selectable_item(items, focused_id)
 							{
 								widget_state.focus_submenu(items, depth, id);
-								shell.publish(MenuMessage::OpenSubmenu { depth, id: id.clone() });
+								shell.publish(MenuMessage::OpenSubmenu {
+									depth,
+									id: id.clone(),
+								});
 							} else if let Some(next_root) = adjacent_root(&self.roots, open_root, 1)
 							{
 								widget_state.focus_root_panel(&self.roots, &next_root.id);
@@ -569,7 +577,10 @@ where
 									}
 									Some(MenuItem::Submenu { id, .. }) => {
 										widget_state.focus_submenu(items, depth, id);
-										shell.publish(MenuMessage::OpenSubmenu { depth, id: id.clone() });
+										shell.publish(MenuMessage::OpenSubmenu {
+											depth,
+											id: id.clone(),
+										});
 									}
 									_ => {}
 								}

@@ -2,8 +2,8 @@ use super::{DashboardMsg, DashboardState};
 use crate::gui::pane_grid::{ChromeVisibility, PaneGrid, Style as PaneStyle};
 use crate::gui::plot_pane;
 use iced::{
-	widget::{center, text},
 	Element,
+	widget::{center, text},
 };
 
 pub fn view(state: &DashboardState) -> Element<'_, DashboardMsg> {

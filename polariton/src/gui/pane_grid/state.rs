@@ -193,11 +193,17 @@ impl State {
 	}
 
 	pub fn get_split(&self, id: SplitId) -> Option<&Split> {
-		self.splits.iter().find(|(sid, _)| *sid == id).map(|(_, s)| s)
+		self.splits
+			.iter()
+			.find(|(sid, _)| *sid == id)
+			.map(|(_, s)| s)
 	}
 
 	pub fn get_split_mut(&mut self, id: SplitId) -> Option<&mut Split> {
-		self.splits.iter_mut().find(|(sid, _)| *sid == id).map(|(_, s)| s)
+		self.splits
+			.iter_mut()
+			.find(|(sid, _)| *sid == id)
+			.map(|(_, s)| s)
 	}
 
 	pub fn root(&self) -> Option<NodeId> {
@@ -260,7 +266,8 @@ impl State {
 
 	pub fn resize(&mut self, split_id: SplitId, ratio: f32) {
 		if let Some(split) = self.get_split_mut(split_id)
-		&& split.collapse == CollapseState::Expanded {
+			&& split.collapse == CollapseState::Expanded
+		{
 			split.ratio = ratio.clamp(0.05, 0.95);
 			split.saved_ratio = split.ratio;
 		}
@@ -297,19 +304,31 @@ impl State {
 			let first_is_b = split.first == node_b;
 			let second_is_a = split.second == node_a;
 			let second_is_b = split.second == node_b;
-			if first_is_a { split.first = node_b; }
-			else if first_is_b { split.first = node_a; }
-			if second_is_a { split.second = node_b; }
-			else if second_is_b { split.second = node_a; }
+			if first_is_a {
+				split.first = node_b;
+			} else if first_is_b {
+				split.first = node_a;
+			}
+			if second_is_a {
+				split.second = node_b;
+			} else if second_is_b {
+				split.second = node_a;
+			}
 		}
 	}
 
 	pub fn detach_pane(&mut self, pane: PaneId) -> bool {
 		let pane_node = NodeId::Pane(pane);
-		let found = self.splits.iter()
+		let found = self
+			.splits
+			.iter()
 			.find(|(_, s)| s.first == pane_node || s.second == pane_node)
 			.map(|(id, s)| {
-				let sibling = if s.first == pane_node { s.second } else { s.first };
+				let sibling = if s.first == pane_node {
+					s.second
+				} else {
+					s.first
+				};
 				(*id, sibling)
 			});
 		let (parent_id, sibling) = match found {

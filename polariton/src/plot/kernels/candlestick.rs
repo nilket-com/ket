@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	format_label, polars_type_to_axis_type, AxisType, CoordinateTransformer,
-	PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -104,20 +104,32 @@ impl PlotKernel for CandlestickPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, _y)) = transform.pixel_to_cartesian(cursor_pos) {
+			&& let Some((x, _y)) = transform.pixel_to_cartesian(cursor_pos)
+		{
 			let xs = &self.prepared_data.x;
-			if xs.is_empty() { return None; }
+			if xs.is_empty() {
+				return None;
+			}
 			let idx = match xs.binary_search_by(|val| val.partial_cmp(&x).unwrap()) {
 				Ok(i) => i,
 				Err(i) => {
-					if i == 0 { 0 }
-					else if i == xs.len() { xs.len() - 1 }
-					else if (xs[i] - x).abs() < (xs[i-1] - x).abs() { i } else { i - 1 }
+					if i == 0 {
+						0
+					} else if i == xs.len() {
+						xs.len() - 1
+					} else if (xs[i] - x).abs() < (xs[i - 1] - x).abs() {
+						i
+					} else {
+						i - 1
+					}
 				}
 			};
-			let x_scale = transform.bounds.width as f64 / (self.prepared_data.x_range.1 - self.prepared_data.x_range.0);
+			let x_scale = transform.bounds.width as f64
+				/ (self.prepared_data.x_range.1 - self.prepared_data.x_range.0);
 			let dist_px = (xs[idx] - x).abs() * x_scale;
-			if dist_px > 10.0 { return None; }
+			if dist_px > 10.0 {
+				return None;
+			}
 			return Some(format!(
 				"X: {}\nOpen: {:.2}\nHigh: {:.2}\nLow: {:.2}\nClose: {:.2}",
 				format_label(xs[idx], self.prepared_data.x_axis_type),
@@ -176,34 +188,88 @@ pub fn prepare_candlestick_data(
 			y_label: "Value".to_string(),
 		};
 	}
-	let x_dtype = df.column(x_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
+	let x_dtype = df
+		.column(x_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = AxisType::Linear;
 	let x = match df.column(x_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))).as_materialized_series().f64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64)))
+			.as_materialized_series()
+			.f64()
+			.unwrap()
+			.into_no_null_iter()
+			.collect::<Vec<_>>(),
 		Err(_) => vec![],
 	};
-	let open = if open_col.is_empty() { vec![] } else {
+	let open = if open_col.is_empty() {
+		vec![]
+	} else {
 		match df.column(open_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(open_col.into(), &DataType::Float64))).as_materialized_series().f64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+			Ok(c) => c
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| {
+					Column::from(Series::new_empty(open_col.into(), &DataType::Float64))
+				})
+				.as_materialized_series()
+				.f64()
+				.unwrap()
+				.into_no_null_iter()
+				.collect::<Vec<_>>(),
 			Err(_) => vec![],
 		}
 	};
-	let high = if high_col.is_empty() { vec![] } else {
+	let high = if high_col.is_empty() {
+		vec![]
+	} else {
 		match df.column(high_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(high_col.into(), &DataType::Float64))).as_materialized_series().f64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+			Ok(c) => c
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| {
+					Column::from(Series::new_empty(high_col.into(), &DataType::Float64))
+				})
+				.as_materialized_series()
+				.f64()
+				.unwrap()
+				.into_no_null_iter()
+				.collect::<Vec<_>>(),
 			Err(_) => vec![],
 		}
 	};
-	let low = if low_col.is_empty() { vec![] } else {
+	let low = if low_col.is_empty() {
+		vec![]
+	} else {
 		match df.column(low_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(low_col.into(), &DataType::Float64))).as_materialized_series().f64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+			Ok(c) => c
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| {
+					Column::from(Series::new_empty(low_col.into(), &DataType::Float64))
+				})
+				.as_materialized_series()
+				.f64()
+				.unwrap()
+				.into_no_null_iter()
+				.collect::<Vec<_>>(),
 			Err(_) => vec![],
 		}
 	};
-	let close = if close_col.is_empty() { vec![] } else {
+	let close = if close_col.is_empty() {
+		vec![]
+	} else {
 		match df.column(close_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(close_col.into(), &DataType::Float64))).as_materialized_series().f64().unwrap().into_no_null_iter().collect::<Vec<_>>(),
+			Ok(c) => c
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| {
+					Column::from(Series::new_empty(close_col.into(), &DataType::Float64))
+				})
+				.as_materialized_series()
+				.f64()
+				.unwrap()
+				.into_no_null_iter()
+				.collect::<Vec<_>>(),
 			Err(_) => vec![],
 		}
 	};
@@ -211,8 +277,16 @@ pub fn prepare_candlestick_data(
 	let x_max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 	let y_min = low.iter().copied().fold(f64::INFINITY, f64::min);
 	let y_max = high.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-	let (x_min, x_max) = if x_min.is_infinite() { (0.0, 1.0) } else { (x_min, x_max) };
-	let (y_min, y_max) = if y_min.is_infinite() { (0.0, 1.0) } else { (y_min, y_max) };
+	let (x_min, x_max) = if x_min.is_infinite() {
+		(0.0, 1.0)
+	} else {
+		(x_min, x_max)
+	};
+	let (y_min, y_max) = if y_min.is_infinite() {
+		(0.0, 1.0)
+	} else {
+		(y_min, y_max)
+	};
 	let x_pad = (x_max - x_min).max(0.1) * 0.05;
 	let y_pad = (y_max - y_min).max(0.1) * 0.05;
 	CandlestickPreparedData {

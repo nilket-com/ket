@@ -37,7 +37,11 @@ struct CrateMetadata {
 
 /// Return update hints for direct registry dependencies in a Cargo manifest.
 pub fn annotations(source: &str, file_path: &str) -> Vec<InlineAnnotation> {
-	if Path::new(file_path).file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
+	if Path::new(file_path)
+		.file_name()
+		.and_then(|name| name.to_str())
+		!= Some("Cargo.toml")
+	{
 		return Vec::new();
 	}
 
@@ -52,7 +56,10 @@ pub fn annotations(source: &str, file_path: &str) -> Vec<InlineAnnotation> {
 		.collect()
 }
 
-fn annotate_dependency(agent: &ureq::Agent, dependency: Dependency<'_>) -> Option<InlineAnnotation> {
+fn annotate_dependency(
+	agent: &ureq::Agent,
+	dependency: Dependency<'_>,
+) -> Option<InlineAnnotation> {
 	let latest = cached_or_fetch(agent, dependency.name)?;
 	let latest_version = Version::parse(&latest).ok()?;
 	let requirement = VersionReq::parse(dependency.version_requirement).ok()?;
@@ -73,19 +80,30 @@ fn extract_dependencies(source: &str) -> Vec<Dependency<'_>> {
 	let mut dependencies = Vec::new();
 	for (line, raw) in source.lines().enumerate() {
 		let trimmed = raw.trim();
-		if let Some(header) = trimmed.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+		if let Some(header) = trimmed
+			.strip_prefix('[')
+			.and_then(|rest| rest.strip_suffix(']'))
+		{
 			in_dependencies = dependency_table(header);
 			continue;
 		}
 		if !in_dependencies || trimmed.starts_with('#') {
 			continue;
 		}
-		let Some((name, value)) = trimmed.split_once('=') else { continue };
+		let Some((name, value)) = trimmed.split_once('=') else {
+			continue;
+		};
 		let name = name.trim().trim_matches('"');
 		let value = value.trim();
 		let version = quoted_value(value).or_else(|| inline_version(value));
-		if !name.is_empty() && let Some(version_requirement) = version {
-			dependencies.push(Dependency { name, version_requirement, line });
+		if !name.is_empty()
+			&& let Some(version_requirement) = version
+		{
+			dependencies.push(Dependency {
+				name,
+				version_requirement,
+				line,
+			});
 		}
 	}
 	dependencies
@@ -93,12 +111,18 @@ fn extract_dependencies(source: &str) -> Vec<Dependency<'_>> {
 
 fn dependency_table(header: &str) -> bool {
 	let final_segment = header.rsplit('.').next().unwrap_or(header);
-	matches!(final_segment, "dependencies" | "dev-dependencies" | "build-dependencies")
+	matches!(
+		final_segment,
+		"dependencies" | "dev-dependencies" | "build-dependencies"
+	)
 }
 
 fn quoted_value(value: &str) -> Option<&str> {
 	let value = value.trim();
-	value.strip_prefix('"')?.split_once('"').map(|(version, _)| version)
+	value
+		.strip_prefix('"')?
+		.split_once('"')
+		.map(|(version, _)| version)
 }
 
 fn inline_version(value: &str) -> Option<&str> {
@@ -114,7 +138,13 @@ fn cached_or_fetch(agent: &ureq::Agent, crate_name: &str) -> Option<String> {
 		return Some(version);
 	}
 	let url = format!("https://crates.io/api/v1/crates/{crate_name}");
-	let body = agent.get(&url).call().ok()?.body_mut().read_to_string().ok()?;
+	let body = agent
+		.get(&url)
+		.call()
+		.ok()?
+		.body_mut()
+		.read_to_string()
+		.ok()?;
 	let response: CrateResponse = serde_json::from_str(&body).ok()?;
 	write_cache(&path, &response.krate.max_version);
 	Some(response.krate.max_version)
@@ -131,14 +161,20 @@ fn read_fresh_cache(path: &Path) -> Option<String> {
 	let content = fs::read_to_string(path).ok()?;
 	let (timestamp, version) = content.trim().split_once('\n')?;
 	let timestamp = timestamp.parse::<u64>().ok()?;
-	let age = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs().saturating_sub(timestamp);
+	let age = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.ok()?
+		.as_secs()
+		.saturating_sub(timestamp);
 	(age <= CACHE_TTL.as_secs()).then(|| version.to_owned())
 }
 
 fn write_cache(path: &Path, version: &str) {
 	let Some(parent) = path.parent() else { return };
 	if fs::create_dir_all(parent).is_ok() {
-		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs());
+		let timestamp = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_or(0, |time| time.as_secs());
 		let _ = fs::write(path, format!("{timestamp}\n{version}\n"));
 	}
 }

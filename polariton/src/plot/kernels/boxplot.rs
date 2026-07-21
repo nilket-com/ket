@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	format_label, polars_type_to_axis_type, AxisType, CoordinateTransformer,
-	PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -126,8 +126,8 @@ impl PlotKernel for BoxPlotKernel {
 				if cursor_pos.x >= left && cursor_pos.x <= right {
 					let stats = &self.prepared_data.stats[i];
 					let y_scale = transform.bounds.height as f64 / (y_range.1 - y_range.0);
-					let data_y = y_range.0
-						+ (transform.bounds.height - cursor_pos.y) as f64 / y_scale;
+					let data_y =
+						y_range.0 + (transform.bounds.height - cursor_pos.y) as f64 / y_scale;
 					if data_y >= stats.min && data_y <= stats.max {
 						let yt = self.prepared_data.y_axis_type;
 						return Some(format!(
@@ -229,11 +229,7 @@ pub struct BoxPlotPreparedData {
 	pub y_label: String,
 }
 
-pub fn prepare_box_plot_data(
-	df: &DataFrame,
-	cat_col: &str,
-	val_col: &str,
-) -> BoxPlotPreparedData {
+pub fn prepare_box_plot_data(df: &DataFrame, cat_col: &str, val_col: &str) -> BoxPlotPreparedData {
 	if df.height() == 0 || val_col.is_empty() {
 		return BoxPlotPreparedData {
 			categories: vec!["No Data".to_string()],
@@ -250,14 +246,24 @@ pub fn prepare_box_plot_data(
 			y_label: val_col.to_string(),
 		};
 	}
-	let y_dtype = df.column(val_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
+	let y_dtype = df
+		.column(val_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
 	let (categories, categories_series) = if cat_col.is_empty() {
-		(vec!["All Data".to_string()], Series::new("dummy".into(), &["All Data"]))
+		(
+			vec!["All Data".to_string()],
+			Series::new("dummy".into(), &["All Data"]),
+		)
 	} else {
 		match df.column(cat_col) {
 			Ok(c) => {
-				let series = c.unique().unwrap_or_else(|_| c.clone()).sort(Default::default()).unwrap_or_else(|_| c.clone());
+				let series = c
+					.unique()
+					.unwrap_or_else(|_| c.clone())
+					.sort(Default::default())
+					.unwrap_or_else(|_| c.clone());
 				let cats = series
 					.as_materialized_series()
 					.iter()
@@ -271,7 +277,10 @@ pub fn prepare_box_plot_data(
 					.collect();
 				(cats, series.as_materialized_series().clone())
 			}
-			Err(_) => (vec!["All Data".to_string()], Series::new("dummy".into(), &["All Data"])),
+			Err(_) => (
+				vec!["All Data".to_string()],
+				Series::new("dummy".into(), &["All Data"]),
+			),
 		}
 	};
 	let num_cats = categories.len();
@@ -296,7 +305,9 @@ pub fn prepare_box_plot_data(
 				.unwrap_or_else(|_| df.head(Some(0)))
 		};
 		let vals = match group_df.column(val_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(val_col.into(), &DataType::Float64))),
+			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+				Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
+			}),
 			Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
 		};
 		let v = vals.f64().unwrap();

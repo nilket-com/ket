@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings, format_label, polars_type_to_axis_type,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Rectangle};
@@ -154,7 +154,8 @@ impl PlotKernel for HistogramPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos) {
+			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
+		{
 			let num_bins = self.prepared_data.bin_counts.len();
 			let (x_min, x_max) = self.prepared_data.x_range;
 			let bin_width = (x_max - x_min) / num_bins as f64;
@@ -172,7 +173,8 @@ impl PlotKernel for HistogramPlotKernel {
 					"Range: [{}, {}]\nCount: {}\nY-Value: {:.2}",
 					format_label(bin_start, self.prepared_data.x_axis_type),
 					format_label(bin_end, self.prepared_data.x_axis_type),
-					count, y
+					count,
+					y
 				));
 			}
 		}
@@ -199,7 +201,11 @@ pub struct HistogramPreparedData {
 	pub y_label: String,
 }
 
-pub fn prepare_histogram_data(df: &DataFrame, val_col: &str, num_bins: usize) -> HistogramPreparedData {
+pub fn prepare_histogram_data(
+	df: &DataFrame,
+	val_col: &str,
+	num_bins: usize,
+) -> HistogramPreparedData {
 	if df.height() == 0 || val_col.is_empty() {
 		return HistogramPreparedData {
 			bin_counts: vec![0; num_bins],
@@ -212,11 +218,16 @@ pub fn prepare_histogram_data(df: &DataFrame, val_col: &str, num_bins: usize) ->
 			y_label: "Frequency".to_string(),
 		};
 	}
-	let val_dtype = df.column(val_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
+	let val_dtype = df
+		.column(val_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&val_dtype);
 	let y_axis_type = AxisType::Linear;
 	let vals = match df.column(val_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(val_col.into(), &DataType::Float64))),
+		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
+		}),
 		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
 	};
 	let v = vals.f64().unwrap();

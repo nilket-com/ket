@@ -462,7 +462,9 @@ fn draw_pane(
 			}
 		}
 		let label = format!("[{}: {}]", panel.kind, panel.title);
-		let label_style = Style::default().bg(surface).fg(ratatui_color(palette.preview_text));
+		let label_style = Style::default()
+			.bg(surface)
+			.fg(ratatui_color(palette.preview_text));
 		let label_row = area.y + area.height / 2;
 		let label_col = area
 			.x
@@ -1183,7 +1185,9 @@ fn paint_inline_annotations(
 		else {
 			continue;
 		};
-		let Some(screen_row) = row.checked_sub(skip_rows) else { continue };
+		let Some(screen_row) = row.checked_sub(skip_rows) else {
+			continue;
+		};
 		if screen_row >= render_height {
 			continue;
 		}
@@ -1218,7 +1222,10 @@ fn next_tab_stop(column: usize) -> usize {
 	column.saturating_add(tab - column % tab)
 }
 
-fn annotation_end_column(pane: &PaneViewport, annotation_line: libaryon::core::DocLine) -> Option<usize> {
+fn annotation_end_column(
+	pane: &PaneViewport,
+	annotation_line: libaryon::core::DocLine,
+) -> Option<usize> {
 	let mut current_line = pane.tokens.first()?.absolute_start_line;
 	let mut column = 0usize;
 	let mut seen_line = false;

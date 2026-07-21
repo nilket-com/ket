@@ -1,25 +1,25 @@
 use crate::adapters::{
 	common::{AdapterFieldType, AdapterStage},
-	driver::{fields_for, AdapterSelection, AdapterState},
+	driver::{AdapterSelection, AdapterState, fields_for},
 };
 use crate::editor::CodeEditor;
 use crate::gui::dashboard::DashboardState;
 use crate::gui::messages::Message;
+use crate::gui::statusbar::{Segment, StatusBar, Tone};
 use crate::gui::{
 	colors,
 	menu::{MenuBar, MenuFontPolicy, MenuItem, MenuRoot, MenuState},
 };
 use crate::persistence::{SavedConnection, SavedStatement};
-use crate::gui::statusbar::{Segment, StatusBar, Tone};
 use iced::widget::{
-	button, center, checkbox, column, container, mouse_area, row, space, stack, text,
-	text_input, TextInput,
+	TextInput, button, center, checkbox, column, container, mouse_area, row, space, stack, text,
+	text_input,
 };
 use iced::{
-	border, font, mouse,
+	Alignment, Background, Center, Color, Element, Fill, FillPortion, Font, Length, border, font,
+	mouse,
 	theme::{Palette, Theme},
 	window::Direction,
-	Alignment, Background, Center, Color, Element, Fill, FillPortion, Font, Length,
 };
 
 pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
@@ -224,7 +224,14 @@ pub fn main_screen<'a>(
 	} else {
 		container(text("")).into()
 	};
-	stack![main_window, adapter_modal, password_modal, settings_modal, save_statement_modal].into()
+	stack![
+		main_window,
+		adapter_modal,
+		password_modal,
+		settings_modal,
+		save_statement_modal
+	]
+	.into()
 }
 
 fn app_status_bar(
@@ -275,11 +282,13 @@ pub fn menu_bar<'a>(
 	saved_connections: &'a [SavedConnection],
 	saved_statements: &'a [SavedStatement],
 ) -> Element<'a, Message> {
-	Element::from(MenuBar::new(
-		build_menu_roots(saved_connections, saved_statements),
-		menu_state,
+	Element::from(
+		MenuBar::new(
+			build_menu_roots(saved_connections, saved_statements),
+			menu_state,
+		)
+		.font_policy(MenuFontPolicy::SystemWithFallback),
 	)
-	.font_policy(MenuFontPolicy::SystemWithFallback))
 	.map(Message::Menu)
 }
 
@@ -504,10 +513,7 @@ fn window_decorations<'a>(
 			column![
 				row![title_bar()],
 				stack![
-					column![
-						space::vertical().height(32),
-						underlay.into(),
-					],
+					column![space::vertical().height(32), underlay.into(),],
 					row![menu_bar(menu_state, saved_connections, saved_statements)],
 				],
 				row![
@@ -768,7 +774,11 @@ fn password_prompt_view<'a>(password_entry: &'a str, error: &'a str) -> Element<
 }
 
 fn save_statement_dialog_view<'a>(name: &'a str, is_editing: bool) -> Element<'a, Message> {
-	let title = if is_editing { "Update Statement" } else { "Save Statement" };
+	let title = if is_editing {
+		"Update Statement"
+	} else {
+		"Save Statement"
+	};
 	let btn_label = if is_editing { "Update" } else { "Save" };
 	let dialog: Element<Message> = container(
 		column![

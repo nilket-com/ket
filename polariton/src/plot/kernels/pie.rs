@@ -175,7 +175,10 @@ pub fn prepare_pie_data(df: &DataFrame, cat_col: &str, val_col: &str) -> PiePrep
 	}
 	let (categories, categories_series) = if cat_col.is_empty() {
 		let cats: Vec<String> = (0..df.height()).map(|i| format!("Row {}", i + 1)).collect();
-		(cats, Series::new_empty("dummy_cat".into(), &DataType::String))
+		(
+			cats,
+			Series::new_empty("dummy_cat".into(), &DataType::String),
+		)
 	} else {
 		match df.column(cat_col) {
 			Ok(c) => {
@@ -198,8 +201,12 @@ pub fn prepare_pie_data(df: &DataFrame, cat_col: &str, val_col: &str) -> PiePrep
 				(cats, series.as_materialized_series().clone())
 			}
 			Err(_) => {
-				let cats: Vec<String> = (0..df.height()).map(|i| format!("Row {}", i + 1)).collect();
-				(cats, Series::new_empty("dummy_cat".into(), &DataType::String))
+				let cats: Vec<String> =
+					(0..df.height()).map(|i| format!("Row {}", i + 1)).collect();
+				(
+					cats,
+					Series::new_empty("dummy_cat".into(), &DataType::String),
+				)
 			}
 		}
 	};
@@ -207,7 +214,8 @@ pub fn prepare_pie_data(df: &DataFrame, cat_col: &str, val_col: &str) -> PiePrep
 	let mut total_sum = 0.0f64;
 	if cat_col.is_empty() || df.column(cat_col).is_err() {
 		if let Ok(c) = df.column(val_col)
-			&& let Ok(c_f64) = c.cast(&DataType::Float64) {
+			&& let Ok(c_f64) = c.cast(&DataType::Float64)
+		{
 			let series = c_f64.f64().unwrap();
 			for i in 0..df.height() {
 				let val = series.get(i).unwrap_or(0.0);
@@ -224,7 +232,8 @@ pub fn prepare_pie_data(df: &DataFrame, cat_col: &str, val_col: &str) -> PiePrep
 				AnyValue::Int64(i) => lit(i),
 				_ => lit(cat_val.to_string()),
 			};
-			let filtered = df.clone()
+			let filtered = df
+				.clone()
 				.lazy()
 				.filter(col(cat_col).eq(lit_val))
 				.select([col(val_col).sum()])

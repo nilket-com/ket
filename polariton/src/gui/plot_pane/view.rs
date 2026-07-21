@@ -7,11 +7,11 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, PlotRenderLayer, PlotWidget, ScatterRenderMode};
 use crate::plot::core::PlotType;
 use iced::widget::{
-	button, canvas, checkbox, column, container, opaque, pick_list, row, scrollable, space,
-	stack, text, text_input,
+	button, canvas, checkbox, column, container, opaque, pick_list, row, scrollable, space, stack,
+	text, text_input,
 };
 use iced::{
-	border, font, Alignment, Background, Center, Color, Element, Fill, Font, Length, Theme,
+	Alignment, Background, Center, Color, Element, Fill, Font, Length, Theme, border, font,
 };
 
 pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMsg> {
@@ -76,26 +76,27 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 	.align_x(iced::alignment::Horizontal::Right);
 	let mut main_stack = stack![plot_content, close_button];
 	if let Some(info) = &state.hovered_info {
-		main_stack = main_stack.push(
-			container(text(info))
-				.padding(6)
-				.style(|_| container::Style {
-					background: Some(iced::Background::Color(iced::Color {
-						a: 0.85,
-						..state.plot_settings.background_color
-					})),
-					border: iced::Border {
-						color: iced::Color {
-							a: 0.2,
-							..state.plot_settings.decoration_color
+		main_stack =
+			main_stack.push(
+				container(text(info))
+					.padding(6)
+					.style(|_| container::Style {
+						background: Some(iced::Background::Color(iced::Color {
+							a: 0.85,
+							..state.plot_settings.background_color
+						})),
+						border: iced::Border {
+							color: iced::Color {
+								a: 0.2,
+								..state.plot_settings.decoration_color
+							},
+							width: 1.0,
+							radius: 2.0.into(),
 						},
-						width: 1.0,
-						radius: 2.0.into(),
-					},
-					text_color: Some(state.plot_settings.decoration_color),
-					..Default::default()
-				}),
-		);
+						text_color: Some(state.plot_settings.decoration_color),
+						..Default::default()
+					}),
+			);
 	}
 	if state.settings_open {
 		let settings_panel = plot_settings_panel(id, state);
@@ -872,7 +873,8 @@ fn layer_section<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, Dashbo
 		rows = rows.push(
 			row![
 				space::horizontal().width(Length::Fixed(76.0)),
-				button("Add Line Overlay").on_press(plot_event(PlotMessage::AddLayer(PlotType::Line))),
+				button("Add Line Overlay")
+					.on_press(plot_event(PlotMessage::AddLayer(PlotType::Line))),
 			]
 			.align_y(Alignment::Center),
 		);

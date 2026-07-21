@@ -7,12 +7,12 @@ use iced::mouse;
 use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
 
 use crate::gui::pane_grid::handle::{
-	self, DragHandleZone, HandleAction, HandleZone,
-	collapsed_strip_thickness, handle_thickness, PANE_DRAG_HANDLE_THICKNESS,
+	self, DragHandleZone, HandleAction, HandleZone, PANE_DRAG_HANDLE_THICKNESS,
+	collapsed_strip_thickness, handle_thickness,
 };
 use crate::gui::pane_grid::state::{
-	Action, Axis, CollapseState, DropEdge, DropTarget, MaximizeState, NodeId,
-	PaneId, SplitId, State,
+	Action, Axis, CollapseState, DropEdge, DropTarget, MaximizeState, NodeId, PaneId, SplitId,
+	State,
 };
 use crate::gui::pane_grid::style::{ChromeVisibility, Style};
 
@@ -81,21 +81,17 @@ where
 	}
 
 	fn children(&self) -> Vec<widget::Tree> {
-		self.content.iter().map(|(_, elem)| Tree::new(elem)).collect()
+		self.content
+			.iter()
+			.map(|(_, elem)| Tree::new(elem))
+			.collect()
 	}
 
 	fn diff(&self, tree: &mut Tree) {
-		tree.diff_children(
-			&self.content.iter().map(|(_, e)| e).collect::<Vec<_>>(),
-		);
+		tree.diff_children(&self.content.iter().map(|(_, e)| e).collect::<Vec<_>>());
 	}
 
-	fn layout(
-		&mut self,
-		tree: &mut Tree,
-		renderer: &Renderer,
-		limits: &layout::Limits,
-	) -> Node {
+	fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> Node {
 		let size = limits.max();
 
 		let mut handle_zones = Vec::new();
@@ -111,19 +107,15 @@ where
 					pane_bounds.push((pane, full_bounds));
 					drag_handle_zones.push(DragHandleZone::new(pane, full_bounds));
 
-					let content_bounds = Size::new(
-						size.width,
-						size.height - PANE_DRAG_HANDLE_THICKNESS,
-					);
+					let content_bounds =
+						Size::new(size.width, size.height - PANE_DRAG_HANDLE_THICKNESS);
 					let child_node = self.content[idx].1.as_widget_mut().layout(
 						&mut tree.children[idx],
 						renderer,
 						&layout::Limits::new(Size::ZERO, content_bounds),
 					);
-					let child_node = child_node.move_to(Point::new(
-						0.0,
-						PANE_DRAG_HANDLE_THICKNESS,
-					));
+					let child_node =
+						child_node.move_to(Point::new(0.0, PANE_DRAG_HANDLE_THICKNESS));
 					children.push(child_node);
 					child_order.push(idx);
 				}
@@ -228,7 +220,8 @@ where
 					second_arrow: zone.second_arrow + offset,
 					..*zone
 				};
-				let hovered = widget_state.hovered_arrow
+				let hovered = widget_state
+					.hovered_arrow
 					.filter(|(sid, _)| *sid == zone.split_id)
 					.map(|(_, is_first)| is_first);
 				handle::draw_handle(renderer, &offset_zone, &self.style.handle, hovered);
@@ -241,7 +234,8 @@ where
 			.sqrt();
 			if dist > PANE_DRAG_DEADBAND {
 				if let Some(target) = &widget_state.drop_target {
-					if let Some(&(_, bounds)) = widget_state.pane_bounds
+					if let Some(&(_, bounds)) = widget_state
+						.pane_bounds
 						.iter()
 						.find(|(id, _)| *id == target.pane)
 					{
@@ -315,15 +309,9 @@ where
 					for zone in &widget_state.handle_zones {
 						if let Some(action) = zone.hit_test(local) {
 							let msg = match action {
-								HandleAction::CollapseFirst(id) => {
-									Action::CollapseFirst(id)
-								}
-								HandleAction::CollapseSecond(id) => {
-									Action::CollapseSecond(id)
-								}
-								HandleAction::Expand(id) => {
-									Action::Expand(id)
-								}
+								HandleAction::CollapseFirst(id) => Action::CollapseFirst(id),
+								HandleAction::CollapseSecond(id) => Action::CollapseSecond(id),
+								HandleAction::Expand(id) => Action::Expand(id),
 							};
 							shell.publish((self.on_action)(msg));
 							widget_state.hovered_arrow = None;
@@ -332,17 +320,14 @@ where
 					}
 					for zone in &widget_state.drag_handle_zones {
 						if zone.contains(local) {
-							shell.publish((self.on_action)(
-								Action::PaneDragStarted(zone.pane, pos),
-							));
+							shell
+								.publish((self.on_action)(Action::PaneDragStarted(zone.pane, pos)));
 							return;
 						}
 					}
 					for zone in &widget_state.handle_zones {
 						if zone.contains(local) {
-							shell.publish((self.on_action)(
-								Action::DragStarted(zone.split_id),
-							));
+							shell.publish((self.on_action)(Action::DragStarted(zone.split_id)));
 							return;
 						}
 					}
@@ -352,9 +337,7 @@ where
 				if let Some(pos) = cursor.position() {
 					let local = Point::new(pos.x - origin.x, pos.y - origin.y);
 					if self.state.pane_dragging().is_some() {
-						shell.publish((self.on_action)(
-							Action::PaneDragMoved(pos),
-						));
+						shell.publish((self.on_action)(Action::PaneDragMoved(pos)));
 						let source = self.state.pane_dragging().unwrap().pane;
 						let mut new_target = None;
 						for &(pane, bounds) in &widget_state.pane_bounds {
@@ -371,7 +354,8 @@ where
 						return;
 					}
 					if let Some(split_id) = self.state.dragging() {
-						if let Some(zone) = widget_state.handle_zones
+						if let Some(zone) = widget_state
+							.handle_zones
 							.iter()
 							.find(|z| z.split_id == split_id)
 						{
@@ -395,9 +379,7 @@ where
 								}
 							};
 							let ratio = ratio.clamp(0.05, 0.95);
-							shell.publish((self.on_action)(
-								Action::DragMoved(split_id, ratio),
-							));
+							shell.publish((self.on_action)(Action::DragMoved(split_id, ratio)));
 						}
 						return;
 					}
@@ -418,13 +400,9 @@ where
 			Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
 				if self.state.pane_dragging().is_some() {
 					if let Some(target) = widget_state.drop_target.take() {
-						shell.publish((self.on_action)(
-							Action::PaneDragDropped(target),
-						));
+						shell.publish((self.on_action)(Action::PaneDragDropped(target)));
 					} else {
-						shell.publish((self.on_action)(
-							Action::PaneDragCancelled,
-						));
+						shell.publish((self.on_action)(Action::PaneDragCancelled));
 					}
 					return;
 				}
@@ -518,19 +496,15 @@ fn layout_node<Message, Theme, Renderer>(
 				drag_handle_zones.push(DragHandleZone::new(pane, region));
 
 				let content_height = (region.height - PANE_DRAG_HANDLE_THICKNESS).max(0.0);
-				let limits = layout::Limits::new(
-					Size::ZERO,
-					Size::new(region.width, content_height),
-				);
+				let limits =
+					layout::Limits::new(Size::ZERO, Size::new(region.width, content_height));
 				let child_node = content[idx].1.as_widget_mut().layout(
 					&mut tree_children[idx],
 					renderer,
 					&limits,
 				);
-				let child_node = child_node.move_to(Point::new(
-					region.x,
-					region.y + PANE_DRAG_HANDLE_THICKNESS,
-				));
+				let child_node =
+					child_node.move_to(Point::new(region.x, region.y + PANE_DRAG_HANDLE_THICKNESS));
 				child_order.push(idx);
 				children.push(child_node);
 			}
@@ -550,17 +524,35 @@ fn layout_node<Message, Theme, Renderer>(
 
 				if collapse != CollapseState::FirstCollapsed {
 					layout_node(
-						content, state, style, tree_children, renderer,
-						first, first_region, handle_zones, drag_handle_zones,
-						pane_bounds, child_order, children,
+						content,
+						state,
+						style,
+						tree_children,
+						renderer,
+						first,
+						first_region,
+						handle_zones,
+						drag_handle_zones,
+						pane_bounds,
+						child_order,
+						children,
 					);
 				}
 
 				if collapse != CollapseState::SecondCollapsed {
 					layout_node(
-						content, state, style, tree_children, renderer,
-						second, second_region, handle_zones, drag_handle_zones,
-						pane_bounds, child_order, children,
+						content,
+						state,
+						style,
+						tree_children,
+						renderer,
+						second,
+						second_region,
+						handle_zones,
+						drag_handle_zones,
+						pane_bounds,
+						child_order,
+						children,
 					);
 				}
 
@@ -662,54 +654,52 @@ fn split_regions(
 			};
 			(first, handle, second)
 		}
-		CollapseState::Expanded => {
-			match axis {
-				Axis::Horizontal => {
-					let first_w = (region.width - handle_thickness) * ratio;
-					let first = Rectangle {
-						x: region.x,
-						y: region.y,
-						width: first_w,
-						height: region.height,
-					};
-					let handle = Rectangle {
-						x: region.x + first_w,
-						y: region.y,
-						width: handle_thickness,
-						height: region.height,
-					};
-					let second = Rectangle {
-						x: region.x + first_w + handle_thickness,
-						y: region.y,
-						width: region.width - first_w - handle_thickness,
-						height: region.height,
-					};
-					(first, handle, second)
-				}
-				Axis::Vertical => {
-					let first_h = (region.height - handle_thickness) * ratio;
-					let first = Rectangle {
-						x: region.x,
-						y: region.y,
-						width: region.width,
-						height: first_h,
-					};
-					let handle = Rectangle {
-						x: region.x,
-						y: region.y + first_h,
-						width: region.width,
-						height: handle_thickness,
-					};
-					let second = Rectangle {
-						x: region.x,
-						y: region.y + first_h + handle_thickness,
-						width: region.width,
-						height: region.height - first_h - handle_thickness,
-					};
-					(first, handle, second)
-				}
+		CollapseState::Expanded => match axis {
+			Axis::Horizontal => {
+				let first_w = (region.width - handle_thickness) * ratio;
+				let first = Rectangle {
+					x: region.x,
+					y: region.y,
+					width: first_w,
+					height: region.height,
+				};
+				let handle = Rectangle {
+					x: region.x + first_w,
+					y: region.y,
+					width: handle_thickness,
+					height: region.height,
+				};
+				let second = Rectangle {
+					x: region.x + first_w + handle_thickness,
+					y: region.y,
+					width: region.width - first_w - handle_thickness,
+					height: region.height,
+				};
+				(first, handle, second)
 			}
-		}
+			Axis::Vertical => {
+				let first_h = (region.height - handle_thickness) * ratio;
+				let first = Rectangle {
+					x: region.x,
+					y: region.y,
+					width: region.width,
+					height: first_h,
+				};
+				let handle = Rectangle {
+					x: region.x,
+					y: region.y + first_h,
+					width: region.width,
+					height: handle_thickness,
+				};
+				let second = Rectangle {
+					x: region.x,
+					y: region.y + first_h + handle_thickness,
+					width: region.width,
+					height: region.height - first_h - handle_thickness,
+				};
+				(first, handle, second)
+			}
+		},
 	}
 }
 
@@ -724,7 +714,6 @@ where
 		Element::new(pane_grid)
 	}
 }
-
 
 fn compute_drop_edge(bounds: Rectangle, pos: Point) -> DropEdge {
 	let rel_x = (pos.x - bounds.x) / bounds.width;

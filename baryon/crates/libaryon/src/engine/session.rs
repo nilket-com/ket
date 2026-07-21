@@ -3524,11 +3524,13 @@ impl EditorSession {
 		viewport_width: u16,
 		viewport_lines: u32,
 	) -> View {
-		let buffer_id = self.buffers.insert(BufferContent::HostPanel(HostPanelBuffer {
-			panel_id,
-			descriptor,
-			revision: PanelRevision::new(0),
-		}));
+		let buffer_id = self
+			.buffers
+			.insert(BufferContent::HostPanel(HostPanelBuffer {
+				panel_id,
+				descriptor,
+				revision: PanelRevision::new(0),
+			}));
 		let view_id = self.allocate_view_id();
 		View::new_host_panel(
 			view_id,
@@ -4109,10 +4111,10 @@ mod tests {
 	use crate::engine::event_subscribers::BaselineBuilder;
 	use crate::engine::file_browser::create_file_browser_buffer;
 	use crate::engine::folding::FoldSet;
-	use crate::engine::{HostPanelDescriptor, HostPanelId};
 	use crate::engine::jobs::{JobSpawnError, JobSpec};
 	use crate::engine::runtime_registry::{ActionLease, RegistrationBatch};
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
+	use crate::engine::{HostPanelDescriptor, HostPanelId};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use std::collections::BTreeMap;
 	use std::ffi::OsString;
@@ -4230,7 +4232,10 @@ mod tests {
 			view_id,
 			|_| unreachable!("host panels must not expose browser mutation"),
 		);
-		assert!(result.is_none(), "host panels are inert at synthetic mutation boundaries");
+		assert!(
+			result.is_none(),
+			"host panels are inert at synthetic mutation boundaries"
+		);
 	}
 
 	#[test]

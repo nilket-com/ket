@@ -41,10 +41,7 @@ pub fn create_plot(
 	create_single_plot(composition.primary_plot_type(), df)
 }
 
-fn create_single_plot(
-	plot_type: PlotType,
-	df: &DataFrame,
-) -> Arc<dyn PlotKernel + Send + Sync> {
+fn create_single_plot(plot_type: PlotType, df: &DataFrame) -> Arc<dyn PlotKernel + Send + Sync> {
 	let string_cols: Vec<&str> = df
 		.columns()
 		.iter()
@@ -174,8 +171,11 @@ fn create_single_plot(
 		}
 		PlotType::Parallel => {
 			let dims: Vec<String> = numeric_cols.iter().map(|col| (*col).to_string()).collect();
-			let prepared =
-				parallel::prepare_parallel_data(df, &dims, string_cols.first().copied().unwrap_or(""));
+			let prepared = parallel::prepare_parallel_data(
+				df,
+				&dims,
+				string_cols.first().copied().unwrap_or(""),
+			);
 			Arc::new(ParallelPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
@@ -230,8 +230,7 @@ fn create_single_plot(
 			let y_mid = numeric_cols.get(1).copied().unwrap_or(x);
 			let y_lower = numeric_cols.get(2).copied().unwrap_or(y_mid);
 			let y_upper = numeric_cols.get(3).copied().unwrap_or(y_lower);
-			let prepared =
-				fill_between::prepare_fill_between_data(df, x, y_mid, y_lower, y_upper);
+			let prepared = fill_between::prepare_fill_between_data(df, x, y_mid, y_lower, y_upper);
 			Arc::new(FillBetweenPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
@@ -271,8 +270,9 @@ fn create_fill_between_line_plot(df: &DataFrame) -> Arc<dyn PlotKernel + Send + 
 	let y_mid = numeric_cols.get(1).copied().unwrap_or(x);
 	let y_lower = numeric_cols.get(2).copied().unwrap_or(y_mid);
 	let y_upper = numeric_cols.get(3).copied().unwrap_or(y_lower);
-	let fill_between_data =
-		Arc::new(fill_between::prepare_fill_between_data(df, x, y_mid, y_lower, y_upper));
+	let fill_between_data = Arc::new(fill_between::prepare_fill_between_data(
+		df, x, y_mid, y_lower, y_upper,
+	));
 	let line_data = Arc::new(line::prepare_line_data(df, "", x, y_mid));
 	Arc::new(FillBetweenLinePlotKernel::new(fill_between_data, line_data))
 }

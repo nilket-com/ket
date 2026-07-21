@@ -143,7 +143,11 @@ impl WidgetState {
 	}
 
 	pub fn focused(&self, id: &str, depth: usize) -> bool {
-		self.keyboard_navigation && self.focus_path.get(depth).is_some_and(|focused| focused == id)
+		self.keyboard_navigation
+			&& self
+				.focus_path
+				.get(depth)
+				.is_some_and(|focused| focused == id)
 	}
 }
 
@@ -226,11 +230,7 @@ fn previous_selectable<'a>(items: &'a [MenuItem], current: &str) -> Option<&'a s
 	cycle_selectable(items, current, -1)
 }
 
-fn cycle_selectable<'a>(
-	items: &'a [MenuItem],
-	current: &str,
-	step: isize,
-) -> Option<&'a str> {
+fn cycle_selectable<'a>(items: &'a [MenuItem], current: &str, step: isize) -> Option<&'a str> {
 	let ids: Vec<_> = items.iter().filter_map(item_id).collect();
 	let current_index = ids.iter().position(|id| *id == current)?;
 

@@ -164,9 +164,7 @@ impl EngineHandle {
 	/// [`Self::take_viewports`], this stream must not be coalesced: it carries
 	/// occurrences that must be observed exactly once and in order. Drain it
 	/// frequently. Has one consumer, so it transfers on first call.
-	pub fn take_host_events(
-		&mut self,
-	) -> Option<mpsc::Receiver<super::host_event::HostEvent>> {
+	pub fn take_host_events(&mut self) -> Option<mpsc::Receiver<super::host_event::HostEvent>> {
 		self.host_events.take()
 	}
 
@@ -246,7 +244,10 @@ mod tests {
 		);
 		// No producer exists yet, so an idle engine emits nothing.
 		let events = events.expect("host event receiver");
-		assert!(events.try_recv().is_err(), "idle engine emits no host events");
+		assert!(
+			events.try_recv().is_err(),
+			"idle engine emits no host events"
+		);
 		handle.shutdown().expect("engine thread");
 	}
 	use crate::core::DocLine;

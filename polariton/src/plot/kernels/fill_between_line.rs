@@ -3,8 +3,8 @@ use crate::plot::common::{
 };
 use crate::plot::kernels::fill_between::{FillBetweenPlotKernel, FillBetweenPreparedData};
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
-use iced::advanced::mouse::Cursor;
 use iced::Rectangle;
+use iced::advanced::mouse::Cursor;
 use std::sync::Arc;
 
 pub struct FillBetweenLinePlotKernel {

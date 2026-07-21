@@ -2,13 +2,13 @@ use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, E
 use async_trait::async_trait;
 use polars::{
 	datatypes::AnyValue,
-	frame::{column::Column, DataFrame},
+	frame::{DataFrame, column::Column},
 	series::Series,
 };
 use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
 use tokio_rusqlite::{
-	rusqlite::{types::ValueRef, Connection as SyncConnection},
 	Connection as AsyncConnection,
+	rusqlite::{Connection as SyncConnection, types::ValueRef},
 };
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {

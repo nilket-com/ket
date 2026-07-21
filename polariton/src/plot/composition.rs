@@ -26,10 +26,14 @@ impl PlotComposition {
 
 	pub fn can_add_layer_type(&self, plot_type: PlotType) -> bool {
 		match (self.primary_plot_type(), plot_type) {
-			(PlotType::Line, PlotType::FillBetween) => {
-				!self.layers.iter().any(|layer| layer.plot_type == PlotType::FillBetween)
-			}
-			(PlotType::Line, PlotType::Scatter) => !self.layers.iter().any(|layer| layer.plot_type == PlotType::Scatter),
+			(PlotType::Line, PlotType::FillBetween) => !self
+				.layers
+				.iter()
+				.any(|layer| layer.plot_type == PlotType::FillBetween),
+			(PlotType::Line, PlotType::Scatter) => !self
+				.layers
+				.iter()
+				.any(|layer| layer.plot_type == PlotType::Scatter),
 			(PlotType::FillBetween, PlotType::Line) => !self.has_line_overlay(),
 			(PlotType::Scatter, PlotType::Line) => !self.has_line_overlay(),
 			_ => false,

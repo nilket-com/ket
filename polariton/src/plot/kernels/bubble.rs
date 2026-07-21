@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	format_label, polars_type_to_axis_type, AxisType, CoordinateTransformer,
-	PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style, Text};
@@ -269,23 +269,35 @@ pub fn prepare_bubble_data(
 		};
 	}
 
-	let x_dtype = df.column(x_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
-	let y_dtype = df.column(y_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
+	let x_dtype = df
+		.column(x_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
+	let y_dtype = df
+		.column(y_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
 	let xs = match df.column(x_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
 	};
 	let ys = match df.column(y_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
 	};
 	let sizes = if size_col.is_empty() {
 		Column::from(Series::new("dummy_size".into(), vec![1.0f64; df.height()]))
 	} else {
 		match df.column(size_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(size_col.into(), &DataType::Float64))),
+			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+				Column::from(Series::new_empty(size_col.into(), &DataType::Float64))
+			}),
 			Err(_) => Column::from(Series::new_empty(size_col.into(), &DataType::Float64)),
 		}
 	};
@@ -293,7 +305,13 @@ pub fn prepare_bubble_data(
 		Series::new("dummy_color".into(), vec![0.0f64; df.height()])
 	} else {
 		match df.column(color_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(color_col.into(), &DataType::Float64))).as_materialized_series().clone(),
+			Ok(c) => c
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| {
+					Column::from(Series::new_empty(color_col.into(), &DataType::Float64))
+				})
+				.as_materialized_series()
+				.clone(),
 			Err(_) => Series::new_empty(color_col.into(), &DataType::Float64),
 		}
 	};
@@ -310,9 +328,12 @@ pub fn prepare_bubble_data(
 	);
 	let x_pad = (x_range.1 - x_range.0).max(0.1) * 0.1;
 	let y_pad = (y_range.1 - y_range.0).max(0.1) * 0.1;
-	let labels: Vec<String> = if let Some(l_col) = label_col && !l_col.is_empty() {
+	let labels: Vec<String> = if let Some(l_col) = label_col
+		&& !l_col.is_empty()
+	{
 		match df.column(l_col) {
-			Ok(c) => c.as_materialized_series()
+			Ok(c) => c
+				.as_materialized_series()
 				.iter()
 				.map(|v| {
 					if let AnyValue::String(s) = v {
@@ -334,7 +355,10 @@ pub fn prepare_bubble_data(
 			y: y_f64.get(i).unwrap_or(0.0),
 			size_val: size_f64.get(i).unwrap_or(1.0),
 			color_val: color_f64.get(i).unwrap_or(0.0),
-			label: labels.get(i).cloned().unwrap_or_else(|| format!("Point {}", i)),
+			label: labels
+				.get(i)
+				.cloned()
+				.unwrap_or_else(|| format!("Point {}", i)),
 		});
 	}
 	BubblePreparedData {

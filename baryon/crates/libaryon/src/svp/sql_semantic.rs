@@ -880,7 +880,13 @@ fn visit_select(
 			ast::SelectItem::ExprWithAliases { expr, aliases } => {
 				visit_expr(expr, line_index, global_offset, out);
 				for alias in aliases {
-					emit_ident(alias, TokenCategory::Variable, line_index, global_offset, out);
+					emit_ident(
+						alias,
+						TokenCategory::Variable,
+						line_index,
+						global_offset,
+						out,
+					);
 				}
 			}
 			ast::SelectItem::QualifiedWildcard(kind, _) => match kind {

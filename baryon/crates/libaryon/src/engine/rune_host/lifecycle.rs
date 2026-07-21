@@ -2901,8 +2901,7 @@ pub fn main(editor) {
 			"valid settings after a rejected one must still apply"
 		);
 		assert_eq!(
-			harness.editor.session.persistent_settings.theme_name,
-			"onedark",
+			harness.editor.session.persistent_settings.theme_name, "onedark",
 			"a rejected theme must not reach the persistent settings"
 		);
 	}

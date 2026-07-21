@@ -3,8 +3,8 @@ use crate::plot::common::{
 };
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
 use crate::plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData};
-use iced::advanced::mouse::Cursor;
 use iced::Rectangle;
+use iced::advanced::mouse::Cursor;
 use std::sync::Arc;
 
 pub struct ScatterLinePlotKernel {
@@ -19,10 +19,7 @@ pub struct ScatterLinePlotKernel {
 }
 
 impl ScatterLinePlotKernel {
-	pub fn new(
-		scatter_data: Arc<ScatterPreparedData>,
-		line_data: Arc<LinePreparedData>,
-	) -> Self {
+	pub fn new(scatter_data: Arc<ScatterPreparedData>, line_data: Arc<LinePreparedData>) -> Self {
 		let x_range = (
 			scatter_data.x_range.0.min(line_data.x_range.0),
 			scatter_data.x_range.1.max(line_data.x_range.1),

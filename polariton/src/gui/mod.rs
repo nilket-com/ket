@@ -5,9 +5,9 @@ mod menu;
 pub mod messages;
 pub mod pane_grid;
 pub mod plot_pane;
-pub mod statusbar;
 mod state;
+pub mod statusbar;
 pub mod table;
 
-pub use state::run;
 pub use state::Result;
+pub use state::run;

@@ -1,6 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -157,7 +156,8 @@ impl PlotKernel for HexbinPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos) {
+			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
+		{
 			let radius = self.prepared_data.radius as f64;
 			let sqrt_3 = 3.0f64.sqrt();
 			let q_frac = (sqrt_3 / 3.0 * x - 1.0 / 3.0 * y) / radius;
@@ -174,7 +174,10 @@ impl PlotKernel for HexbinPlotKernel {
 				r = -q - s;
 			}
 			if let Some(&count) = self.prepared_data.bins.get(&(q as i32, r as i32)) {
-				return Some(format!("Bin: ({}, {})\nCount: {}\nPos: ({:.2}, {:.2})", q, r, count, x, y));
+				return Some(format!(
+					"Bin: ({}, {})\nCount: {}\nPos: ({:.2}, {:.2})",
+					q, r, count, x, y
+				));
 			}
 		}
 		None
@@ -261,11 +264,15 @@ pub fn prepare_hexbin_data(df: &DataFrame, radius: f32) -> HexbinPreparedData {
 		};
 	}
 	let x_col_series = match df.column("x") {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty("x".into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty("x".into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty("x".into(), &DataType::Float64)),
 	};
 	let y_col_series = match df.column("y") {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty("y".into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty("y".into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty("y".into(), &DataType::Float64)),
 	};
 	let x_col = x_col_series.f64().unwrap();
@@ -286,9 +293,18 @@ pub fn prepare_hexbin_data(df: &DataFrame, radius: f32) -> HexbinPreparedData {
 			};
 		}
 	};
-	let q_col = binned.column("q").and_then(|c| c.i32()).expect("q column not found");
-	let r_col = binned.column("r").and_then(|c| c.i32()).expect("r column not found");
-	let count_col = binned.column("count").and_then(|c| c.u32()).expect("count column not found");
+	let q_col = binned
+		.column("q")
+		.and_then(|c| c.i32())
+		.expect("q column not found");
+	let r_col = binned
+		.column("r")
+		.and_then(|c| c.i32())
+		.expect("r column not found");
+	let count_col = binned
+		.column("count")
+		.and_then(|c| c.u32())
+		.expect("count column not found");
 	let mut bins = std::collections::HashMap::new();
 	let mut max_count = 0;
 	for i in 0..binned.height() {

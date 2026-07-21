@@ -225,7 +225,9 @@ fn render_preview_protocol(
 		ui_palette,
 		(font_size.width, font_size.height),
 	);
-	picker.new_protocol(image, area.into(), Resize::Fit(None)).ok()
+	picker
+		.new_protocol(image, area.into(), Resize::Fit(None))
+		.ok()
 }
 
 fn preview_request_fingerprint(

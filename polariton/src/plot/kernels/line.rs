@@ -1,10 +1,10 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings, format_label, polars_type_to_axis_type,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	format_label, polars_type_to_axis_type,
 };
+use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use iced::Rectangle;
 use polars::prelude::*;
 use std::sync::Arc;
 
@@ -167,15 +167,25 @@ pub fn prepare_line_data(
 	y_col: &str,
 ) -> LinePreparedData {
 	let x_col_series = match df.column(x_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
 	};
 	let y_col_series = match df.column(y_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
 	};
-	let x_dtype = df.column(x_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
-	let y_dtype = df.column(y_col).map(|c| c.dtype().clone()).unwrap_or(DataType::Float64);
+	let x_dtype = df
+		.column(x_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
+	let y_dtype = df
+		.column(y_col)
+		.map(|c| c.dtype().clone())
+		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
 	let x_series = x_col_series.f64().unwrap();
@@ -203,14 +213,18 @@ pub fn prepare_line_data(
 	let partitions = if cat_col.is_empty() {
 		vec![df.clone()]
 	} else {
-		df.partition_by([cat_col], true).unwrap_or_else(|_| vec![df.clone()])
+		df.partition_by([cat_col], true)
+			.unwrap_or_else(|_| vec![df.clone()])
 	};
 	let num_partitions = partitions.len();
 	for (i, group_df) in partitions.into_iter().enumerate() {
 		let cat_name = if cat_col.is_empty() {
 			"All Data".to_string()
 		} else {
-			let cat_val = group_df.column(cat_col).and_then(|c| c.get(0)).unwrap_or(AnyValue::Null);
+			let cat_val = group_df
+				.column(cat_col)
+				.and_then(|c| c.get(0))
+				.unwrap_or(AnyValue::Null);
 			if let AnyValue::String(s) = cat_val {
 				s.to_string()
 			} else if cat_val.is_null() {
@@ -220,11 +234,15 @@ pub fn prepare_line_data(
 			}
 		};
 		let xs_col = match group_df.column(x_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
+			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+				Column::from(Series::new_empty(x_col.into(), &DataType::Float64))
+			}),
 			Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
 		};
 		let ys_col = match group_df.column(y_col) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
+			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+				Column::from(Series::new_empty(y_col.into(), &DataType::Float64))
+			}),
 			Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
 		};
 		let xs = xs_col.f64().unwrap();

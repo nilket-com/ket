@@ -10,8 +10,8 @@ use gcloud_bigquery::http::job::{JobReference, JobType};
 use gcloud_bigquery::http::table::TableReference;
 use gcloud_gax::conn::{ConnectionManager, ConnectionOptions, Environment};
 use gcloud_googleapis::cloud::bigquery::storage::v1::{
-	big_query_read_client::BigQueryReadClient, read_rows_response, read_session,
 	CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadSession,
+	big_query_read_client::BigQueryReadClient, read_rows_response, read_session,
 };
 use polars::frame::DataFrame;
 use polars::io::SerReader;
@@ -59,7 +59,11 @@ impl DatabaseAdapter for BigQueryAdapter {
 	}
 }
 
-async fn bq_query_to_df(client: &Client, project_id: &str, sql: &str) -> Result<DataFrame, BoxError> {
+async fn bq_query_to_df(
+	client: &Client,
+	project_id: &str,
+	sql: &str,
+) -> Result<DataFrame, BoxError> {
 	let request = QueryRequest {
 		query: sql.to_string(),
 		use_legacy_sql: false,
@@ -72,10 +76,19 @@ async fn bq_query_to_df(client: &Client, project_id: &str, sql: &str) -> Result<
 	}
 	let job = client
 		.job()
-		.get(&job_ref.project_id, &job_ref.job_id, &GetJobRequest { location: job_ref.location.clone() })
+		.get(
+			&job_ref.project_id,
+			&job_ref.job_id,
+			&GetJobRequest {
+				location: job_ref.location.clone(),
+			},
+		)
 		.await?;
 	let dest_table = match &job.configuration.job {
-		JobType::Query(q) => q.destination_table.clone().ok_or("No destination table in query job")?,
+		JobType::Query(q) => q
+			.destination_table
+			.clone()
+			.ok_or("No destination table in query job")?,
 		_ => return Err("Not a query job".into()),
 	};
 	storage_read_to_df(project_id, &dest_table).await
@@ -99,9 +112,14 @@ async fn poll_until_complete(client: &Client, job_ref: &JobReference) -> Result<
 	}
 }
 
-async fn storage_read_to_df(project_id: &str, table: &TableReference) -> Result<DataFrame, BoxError> {
+async fn storage_read_to_df(
+	project_id: &str,
+	table: &TableReference,
+) -> Result<DataFrame, BoxError> {
 	let ts = DefaultTokenSourceProvider::new(
-		AuthConfig::default().with_audience(STORAGE_AUDIENCE).with_scopes(STORAGE_SCOPES),
+		AuthConfig::default()
+			.with_audience(STORAGE_AUDIENCE)
+			.with_scopes(STORAGE_SCOPES),
 	)
 	.await?;
 	let conn_options = ConnectionOptions::default();

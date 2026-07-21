@@ -1,7 +1,7 @@
 use crate::plot::common::{PathBuilder, PlotBackend};
 use base64::Engine;
 use iced::widget::canvas::{Stroke, Text};
-use iced::{advanced::text::Alignment, alignment::Vertical, Color, Point, Rectangle};
+use iced::{Color, Point, Rectangle, advanced::text::Alignment, alignment::Vertical};
 use kurbo::Affine;
 use png::{BitDepth, ColorType, Encoder};
 use std::io::Cursor;
@@ -187,7 +187,9 @@ impl PlotBackend for SvgBackend {
 		self.svg.push('\n');
 	}
 
-	fn supports_embedded_raster(&self) -> bool { true }
+	fn supports_embedded_raster(&self) -> bool {
+		true
+	}
 
 	fn draw_image_rgba(
 		&mut self,
@@ -312,16 +314,30 @@ impl AvifBackend {
 		let w = rtree.size().width() as u32;
 		let h = rtree.size().height() as u32;
 		let mut pixmap = tiny_skia::Pixmap::new(w, h).unwrap();
-		resvg::render(&rtree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+		resvg::render(
+			&rtree,
+			tiny_skia::Transform::identity(),
+			&mut pixmap.as_mut(),
+		);
 		let pixels: Vec<ravif::RGBA8> = pixmap
 			.pixels()
 			.iter()
 			.map(|p| {
 				let a = p.alpha();
 				if a == 0 {
-					ravif::RGBA8 { r: 0, g: 0, b: 0, a: 0 }
+					ravif::RGBA8 {
+						r: 0,
+						g: 0,
+						b: 0,
+						a: 0,
+					}
 				} else if a == 255 {
-					ravif::RGBA8 { r: p.red(), g: p.green(), b: p.blue(), a: 255 }
+					ravif::RGBA8 {
+						r: p.red(),
+						g: p.green(),
+						b: p.blue(),
+						a: 255,
+					}
 				} else {
 					let factor = 255.0 / a as f32;
 					ravif::RGBA8 {

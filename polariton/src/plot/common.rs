@@ -77,8 +77,7 @@ impl<'a> CoordinateTransformer<'a> {
 			let x_scale = self.bounds.width as f64 / x_delta;
 			let y_scale = self.bounds.height as f64 / y_delta;
 			let pixel_x = ((data_x - x_range.0) * x_scale) as f32;
-			let pixel_y =
-				self.bounds.height - ((data_y - y_range.0) * y_scale) as f32;
+			let pixel_y = self.bounds.height - ((data_y - y_range.0) * y_scale) as f32;
 			Point::new(pixel_x, pixel_y)
 		} else {
 			Point::ORIGIN
@@ -93,12 +92,10 @@ impl<'a> CoordinateTransformer<'a> {
 			} => {
 				let num_cats = categories.len().max(1) as f32;
 				let band_width = self.bounds.width / num_cats;
-				let center_x =
-					(category_index as f32 * band_width) + (band_width / 2.0);
+				let center_x = (category_index as f32 * band_width) + (band_width / 2.0);
 				let y_delta = (y_range.1 - y_range.0).abs().max(f64::EPSILON);
 				let y_scale = self.bounds.height as f64 / y_delta;
-				let pixel_y =
-					self.bounds.height - ((data_val - y_range.0) * y_scale) as f32;
+				let pixel_y = self.bounds.height - ((data_val - y_range.0) * y_scale) as f32;
 				(Point::new(center_x, pixel_y), band_width)
 			}
 			PlotLayout::CategoricalY {
@@ -122,8 +119,7 @@ impl<'a> CoordinateTransformer<'a> {
 				let range = ranges.get(category_index).copied().unwrap_or((0.0, 1.0));
 				let y_delta = (range.1 - range.0).abs().max(f64::EPSILON);
 				let y_scale = self.bounds.height as f64 / y_delta;
-				let pixel_y =
-					self.bounds.height - ((data_val - range.0) * y_scale) as f32;
+				let pixel_y = self.bounds.height - ((data_val - range.0) * y_scale) as f32;
 				(Point::new(axis_x, pixel_y), 0.0)
 			}
 			_ => (Point::ORIGIN, 0.0),
@@ -141,9 +137,8 @@ impl<'a> CoordinateTransformer<'a> {
 				let band_width = self.bounds.width / num_x;
 				let band_height = self.bounds.height / num_y;
 				let center_x = (x_index as f32 * band_width) + (band_width / 2.0);
-				let center_y = self.bounds.height
-					- (y_index as f32 * band_height)
-					- (band_height / 2.0);
+				let center_y =
+					self.bounds.height - (y_index as f32 * band_height) - (band_height / 2.0);
 				(Point::new(center_x, center_y), band_width, band_height)
 			}
 			_ => (Point::ORIGIN, 0.0, 0.0),
@@ -161,8 +156,7 @@ impl<'a> CoordinateTransformer<'a> {
 			let x_scale = x_delta / self.bounds.width as f64;
 			let y_scale = y_delta / self.bounds.height as f64;
 			let data_x = x_range.0 + (cursor_pos.x as f64 * x_scale);
-			let data_y =
-				y_range.0 + ((self.bounds.height - cursor_pos.y) as f64 * y_scale);
+			let data_y = y_range.0 + ((self.bounds.height - cursor_pos.y) as f64 * y_scale);
 			Some((data_x, data_y))
 		} else {
 			None
@@ -207,7 +201,11 @@ impl std::fmt::Display for ScatterRenderMode {
 }
 
 impl GridLineStyle {
-	pub const ALL: [GridLineStyle; 3] = [GridLineStyle::Solid, GridLineStyle::Dashed, GridLineStyle::Dotted];
+	pub const ALL: [GridLineStyle; 3] = [
+		GridLineStyle::Solid,
+		GridLineStyle::Dashed,
+		GridLineStyle::Dotted,
+	];
 }
 
 impl std::fmt::Display for GridLineStyle {
@@ -351,15 +349,13 @@ pub trait PlotBackend {
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color);
 	fn fill_text(&mut self, text: Text);
-	fn supports_embedded_raster(&self) -> bool { false }
-	fn supports_native_image_handle(&self) -> bool { false }
-	fn draw_image_handle(
-		&mut self,
-		_top_left: Point,
-		_size: iced::Size,
-		_handle: &image::Handle,
-	) {
+	fn supports_embedded_raster(&self) -> bool {
+		false
 	}
+	fn supports_native_image_handle(&self) -> bool {
+		false
+	}
+	fn draw_image_handle(&mut self, _top_left: Point, _size: iced::Size, _handle: &image::Handle) {}
 	fn draw_image_rgba(
 		&mut self,
 		_top_left: Point,
@@ -384,19 +380,29 @@ struct IcedPathBuilder<'a> {
 }
 
 impl<'a> PathBuilder for IcedPathBuilder<'a> {
-	fn move_to(&mut self, point: Point) { self.builder.move_to(point); }
-	fn line_to(&mut self, point: Point) { self.builder.line_to(point); }
-	fn arc_to(&mut self, center: Point, radius: f32, start: f32, end: f32) { 
-		self.builder.arc(canvas::path::Arc { 
-			center, 
-			radius, 
-			start_angle: iced::Radians(start), 
-			end_angle: iced::Radians(end) 
-		}); 
+	fn move_to(&mut self, point: Point) {
+		self.builder.move_to(point);
 	}
-	fn circle(&mut self, center: Point, radius: f32) { self.builder.circle(center, radius); }
-	fn rectangle(&mut self, top_left: Point, size: iced::Size) { self.builder.rectangle(top_left, size); }
-	fn close(&mut self) { self.builder.close(); }
+	fn line_to(&mut self, point: Point) {
+		self.builder.line_to(point);
+	}
+	fn arc_to(&mut self, center: Point, radius: f32, start: f32, end: f32) {
+		self.builder.arc(canvas::path::Arc {
+			center,
+			radius,
+			start_angle: iced::Radians(start),
+			end_angle: iced::Radians(end),
+		});
+	}
+	fn circle(&mut self, center: Point, radius: f32) {
+		self.builder.circle(center, radius);
+	}
+	fn rectangle(&mut self, top_left: Point, size: iced::Size) {
+		self.builder.rectangle(top_left, size);
+	}
+	fn close(&mut self) {
+		self.builder.close();
+	}
 }
 
 impl<'a> PlotBackend for IcedBackend<'a> {
@@ -415,21 +421,23 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 		self.frame.fill(&path, color);
 	}
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color) {
-		self.fill_path(&|builder| {
-			builder.rectangle(top_left, size);
-		}, color);
+		self.fill_path(
+			&|builder| {
+				builder.rectangle(top_left, size);
+			},
+			color,
+		);
 	}
 	fn fill_text(&mut self, text: Text) {
 		self.frame.fill_text(text);
 	}
-	fn supports_embedded_raster(&self) -> bool { true }
-	fn supports_native_image_handle(&self) -> bool { true }
-	fn draw_image_handle(
-		&mut self,
-		top_left: Point,
-		size: iced::Size,
-		handle: &image::Handle,
-	) {
+	fn supports_embedded_raster(&self) -> bool {
+		true
+	}
+	fn supports_native_image_handle(&self) -> bool {
+		true
+	}
+	fn draw_image_handle(&mut self, top_left: Point, size: iced::Size, handle: &image::Handle) {
 		self.frame.draw_image(
 			Rectangle {
 				x: top_left.x,
@@ -491,7 +499,13 @@ pub trait PlotKernel: Send + Sync {
 		settings: PlotSettings,
 	);
 
-	fn draw_legend(&self, _backend: &mut dyn PlotBackend, _bounds: Rectangle, _settings: PlotSettings) {}
+	fn draw_legend(
+		&self,
+		_backend: &mut dyn PlotBackend,
+		_bounds: Rectangle,
+		_settings: PlotSettings,
+	) {
+	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String>;
 
@@ -583,7 +597,9 @@ impl<'a> PlotWidget<'a> {
 					categories,
 					y_range,
 				} => {
-					self.draw_categorical_grid(backend, plot_area, &transform, categories, *y_range);
+					self.draw_categorical_grid(
+						backend, plot_area, &transform, categories, *y_range,
+					);
 				}
 				PlotLayout::CategoricalY {
 					categories,
@@ -627,7 +643,9 @@ impl<'a> PlotWidget<'a> {
 					categories,
 					y_range,
 				} => {
-					self.draw_categorical_axes(backend, plot_area, &transform, categories, *y_range);
+					self.draw_categorical_axes(
+						backend, plot_area, &transform, categories, *y_range,
+					);
 				}
 				PlotLayout::CategoricalY {
 					categories,
@@ -656,11 +674,31 @@ impl<'a> PlotWidget<'a> {
 			}
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		self.kernel.draw_legend(backend, size_only_bounds, self.settings.clone());
-		let title = self.settings.title.as_ref().map(|s: &Arc<String>| s.to_string()).unwrap_or(self.title.clone());
-		let subtitle = self.settings.subtitle.as_ref().map(|s| s.as_ref().to_string());
-		let x_label = self.settings.x_label.as_ref().map(|s: &Arc<String>| s.to_string()).unwrap_or(self.kernel.x_label());
-		let y_label = self.settings.y_label.as_ref().map(|s: &Arc<String>| s.to_string()).unwrap_or(self.kernel.y_label());
+		self.kernel
+			.draw_legend(backend, size_only_bounds, self.settings.clone());
+		let title = self
+			.settings
+			.title
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.title.clone());
+		let subtitle = self
+			.settings
+			.subtitle
+			.as_ref()
+			.map(|s| s.as_ref().to_string());
+		let x_label = self
+			.settings
+			.x_label
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.kernel.x_label());
+		let y_label = self
+			.settings
+			.y_label
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.kernel.y_label());
 		backend.fill_text(Text {
 			content: title,
 			position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
@@ -740,30 +778,40 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 		}
 		match self.layer {
 			PlotRenderLayer::Data => {
-				let plot_geometry = state.plot_cache.draw(renderer, effective_bounds.size(), |frame| {
-					let mut backend = IcedBackend { frame };
-					self.render_plot_layer(&mut backend, effective_bounds);
-				});
+				let plot_geometry =
+					state
+						.plot_cache
+						.draw(renderer, effective_bounds.size(), |frame| {
+							let mut backend = IcedBackend { frame };
+							self.render_plot_layer(&mut backend, effective_bounds);
+						});
 				vec![plot_geometry]
 			}
 			PlotRenderLayer::OverlayInteractive => {
 				let overlay_geometry =
-					state.overlay_cache.draw(renderer, effective_bounds.size(), |frame| {
-						let mut backend = IcedBackend { frame };
-						self.render_overlay_layer(&mut backend, effective_bounds);
-					});
+					state
+						.overlay_cache
+						.draw(renderer, effective_bounds.size(), |frame| {
+							let mut backend = IcedBackend { frame };
+							self.render_overlay_layer(&mut backend, effective_bounds);
+						});
 				vec![overlay_geometry]
 			}
 			PlotRenderLayer::Full => {
-				let plot_geometry = state.plot_cache.draw(renderer, effective_bounds.size(), |frame| {
-					let mut backend = IcedBackend { frame };
-					self.render_plot_layer(&mut backend, effective_bounds);
-				});
+				let plot_geometry =
+					state
+						.plot_cache
+						.draw(renderer, effective_bounds.size(), |frame| {
+							let mut backend = IcedBackend { frame };
+							self.render_plot_layer(&mut backend, effective_bounds);
+						});
 				let overlay_geometry =
-					state.overlay_cache.draw(renderer, effective_bounds.size(), |frame| {
-						let mut backend = IcedBackend { frame };
-						self.render_overlay_layer(&mut backend, effective_bounds);
-					});
+					state
+						.overlay_cache
+						.draw(renderer, effective_bounds.size(), |frame| {
+							let mut backend = IcedBackend { frame };
+							self.render_overlay_layer(&mut backend, effective_bounds);
+						});
 				vec![plot_geometry, overlay_geometry]
 			}
 		}
@@ -798,7 +846,9 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					None => Cursor::Unavailable,
 				};
 				let plot_cursor = match relative_cursor.position() {
-					Some(pos) => Cursor::Available(Point::new(pos.x - plot_area.x, pos.y - plot_area.y)),
+					Some(pos) => {
+						Cursor::Available(Point::new(pos.x - plot_area.x, pos.y - plot_area.y))
+					}
 					None => Cursor::Unavailable,
 				};
 				let hover = self.kernel.hover(&transform, plot_cursor);
@@ -813,10 +863,11 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				if cursor.is_over(bounds) {
 					let now = std::time::Instant::now();
 					if let Some(last_click) = state.last_click
-						&& now.duration_since(last_click) < std::time::Duration::from_millis(500) {
-							state.last_click = None;
-							return Some(canvas::Action::publish(PlotMessage::ToggleSettings));
-						}
+						&& now.duration_since(last_click) < std::time::Duration::from_millis(500)
+					{
+						state.last_click = None;
+						return Some(canvas::Action::publish(PlotMessage::ToggleSettings));
+					}
 					state.last_click = Some(now);
 				}
 				None
@@ -846,8 +897,18 @@ impl<'a> PlotWidget<'a> {
 			};
 			match style {
 				GridLineStyle::Solid => {}
-				GridLineStyle::Dashed => s.line_dash = canvas::LineDash { segments: &[10.0, 5.0], offset: 0 },
-				GridLineStyle::Dotted => s.line_dash = canvas::LineDash { segments: &[2.0, 2.0], offset: 0 },
+				GridLineStyle::Dashed => {
+					s.line_dash = canvas::LineDash {
+						segments: &[10.0, 5.0],
+						offset: 0,
+					}
+				}
+				GridLineStyle::Dotted => {
+					s.line_dash = canvas::LineDash {
+						segments: &[2.0, 2.0],
+						offset: 0,
+					}
+				}
 			}
 			s
 		};
@@ -861,41 +922,79 @@ impl<'a> PlotWidget<'a> {
 			);
 		};
 		if self.settings.show_y_minor_grid && self.settings.y_minor_ticks > 0 {
-			let stroke = grid_stroke(self.settings.y_minor_grid_width, self.settings.y_minor_grid_style);
+			let stroke = grid_stroke(
+				self.settings.y_minor_grid_width,
+				self.settings.y_minor_grid_style,
+			);
 			for i in 0..self.settings.y_ticks {
 				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64) / self.settings.y_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
+						/ self.settings.y_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
-					draw_line(backend, transform.cartesian(x_range.0, data_y), transform.cartesian(x_range.1, data_y), stroke);
+					draw_line(
+						backend,
+						transform.cartesian(x_range.0, data_y),
+						transform.cartesian(x_range.1, data_y),
+						stroke,
+					);
 				}
 			}
 		}
 		if self.settings.show_x_minor_grid && self.settings.x_minor_ticks > 0 {
-			let stroke = grid_stroke(self.settings.x_minor_grid_width, self.settings.x_minor_grid_style);
+			let stroke = grid_stroke(
+				self.settings.x_minor_grid_width,
+				self.settings.x_minor_grid_style,
+			);
 			for i in 0..self.settings.x_ticks {
 				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64) / self.settings.x_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
+						/ self.settings.x_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
-					draw_line(backend, transform.cartesian(data_x, y_range.0), transform.cartesian(data_x, y_range.1), stroke);
+					draw_line(
+						backend,
+						transform.cartesian(data_x, y_range.0),
+						transform.cartesian(data_x, y_range.1),
+						stroke,
+					);
 				}
 			}
 		}
 		if self.settings.show_y_major_grid {
-			let stroke = grid_stroke(self.settings.y_major_grid_width, self.settings.y_major_grid_style);
+			let stroke = grid_stroke(
+				self.settings.y_major_grid_width,
+				self.settings.y_major_grid_style,
+			);
 			for i in 0..=self.settings.y_ticks {
 				let t = i as f64 / self.settings.y_ticks as f64;
 				let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
-				draw_line(backend, transform.cartesian(x_range.0, data_y), transform.cartesian(x_range.1, data_y), stroke);
+				draw_line(
+					backend,
+					transform.cartesian(x_range.0, data_y),
+					transform.cartesian(x_range.1, data_y),
+					stroke,
+				);
 			}
 		}
 		if self.settings.show_x_major_grid {
-			let stroke = grid_stroke(self.settings.x_major_grid_width, self.settings.x_major_grid_style);
+			let stroke = grid_stroke(
+				self.settings.x_major_grid_width,
+				self.settings.x_major_grid_style,
+			);
 			for i in 0..=self.settings.x_ticks {
 				let t = i as f64 / self.settings.x_ticks as f64;
 				let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
-				draw_line(backend, transform.cartesian(data_x, y_range.0), transform.cartesian(data_x, y_range.1), stroke);
+				draw_line(
+					backend,
+					transform.cartesian(data_x, y_range.0),
+					transform.cartesian(data_x, y_range.1),
+					stroke,
+				);
 			}
 		}
 	}
@@ -962,8 +1061,11 @@ impl<'a> PlotWidget<'a> {
 		if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
 			for i in 0..self.settings.y_ticks {
 				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64) / self.settings.y_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
+						/ self.settings.y_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
 					let p_left = transform.cartesian(x_range.0, data_y);
 					backend.stroke_path(
@@ -1006,8 +1108,11 @@ impl<'a> PlotWidget<'a> {
 		if self.settings.show_x_minor_ticks && self.settings.x_minor_ticks > 0 {
 			for i in 0..self.settings.x_ticks {
 				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64) / self.settings.x_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
+						/ self.settings.x_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
 					let p_bottom = transform.cartesian(data_x, y_range.0);
 					backend.stroke_path(
@@ -1041,8 +1146,18 @@ impl<'a> PlotWidget<'a> {
 			};
 			match style {
 				GridLineStyle::Solid => {}
-				GridLineStyle::Dashed => s.line_dash = canvas::LineDash { segments: &[10.0, 5.0], offset: 0 },
-				GridLineStyle::Dotted => s.line_dash = canvas::LineDash { segments: &[2.0, 2.0], offset: 0 },
+				GridLineStyle::Dashed => {
+					s.line_dash = canvas::LineDash {
+						segments: &[10.0, 5.0],
+						offset: 0,
+					}
+				}
+				GridLineStyle::Dotted => {
+					s.line_dash = canvas::LineDash {
+						segments: &[2.0, 2.0],
+						offset: 0,
+					}
+				}
 			}
 			s
 		};
@@ -1060,11 +1175,17 @@ impl<'a> PlotWidget<'a> {
 		let (last_cat_center, _) = transform.categorical(categories.len() - 1, y_range.0);
 		let right_edge = last_cat_center.x + (band_width / 2.0);
 		if self.settings.show_y_minor_grid && self.settings.y_minor_ticks > 0 {
-			let stroke = grid_stroke(self.settings.y_minor_grid_width, self.settings.y_minor_grid_style);
+			let stroke = grid_stroke(
+				self.settings.y_minor_grid_width,
+				self.settings.y_minor_grid_style,
+			);
 			for i in 0..self.settings.y_ticks {
 				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64) / self.settings.y_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
+						/ self.settings.y_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
 					let p1 = Point::new(left_edge, transform.categorical(0, data_y).0.y);
 					let p2 = Point::new(right_edge, p1.y);
@@ -1073,7 +1194,10 @@ impl<'a> PlotWidget<'a> {
 			}
 		}
 		if self.settings.show_y_major_grid {
-			let stroke = grid_stroke(self.settings.y_major_grid_width, self.settings.y_major_grid_style);
+			let stroke = grid_stroke(
+				self.settings.y_major_grid_width,
+				self.settings.y_major_grid_style,
+			);
 			for i in 0..=self.settings.y_ticks {
 				let t = i as f64 / self.settings.y_ticks as f64;
 				let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
@@ -1184,8 +1308,18 @@ impl<'a> PlotWidget<'a> {
 			};
 			match style {
 				GridLineStyle::Solid => {}
-				GridLineStyle::Dashed => s.line_dash = canvas::LineDash { segments: &[10.0, 5.0], offset: 0 },
-				GridLineStyle::Dotted => s.line_dash = canvas::LineDash { segments: &[2.0, 2.0], offset: 0 },
+				GridLineStyle::Dashed => {
+					s.line_dash = canvas::LineDash {
+						segments: &[10.0, 5.0],
+						offset: 0,
+					}
+				}
+				GridLineStyle::Dotted => {
+					s.line_dash = canvas::LineDash {
+						segments: &[2.0, 2.0],
+						offset: 0,
+					}
+				}
 			}
 			s
 		};
@@ -1203,24 +1337,43 @@ impl<'a> PlotWidget<'a> {
 		let (last_cat_center, _) = transform.categorical(categories.len() - 1, x_range.1);
 		let top_edge = last_cat_center.y - (band_height / 2.0);
 		if self.settings.show_x_minor_grid && self.settings.x_minor_ticks > 0 {
-			let stroke = grid_stroke(self.settings.x_minor_grid_width, self.settings.x_minor_grid_style);
+			let stroke = grid_stroke(
+				self.settings.x_minor_grid_width,
+				self.settings.x_minor_grid_style,
+			);
 			for i in 0..self.settings.x_ticks {
 				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64) / self.settings.x_ticks as f64;
-					if t > 1.0 { continue; }
+					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
+						/ self.settings.x_ticks as f64;
+					if t > 1.0 {
+						continue;
+					}
 					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
 					let x = transform.categorical(0, data_x).0.x;
-					draw_line(backend, Point::new(x, top_edge), Point::new(x, bottom_edge), stroke);
+					draw_line(
+						backend,
+						Point::new(x, top_edge),
+						Point::new(x, bottom_edge),
+						stroke,
+					);
 				}
 			}
 		}
 		if self.settings.show_x_major_grid {
-			let stroke = grid_stroke(self.settings.x_major_grid_width, self.settings.x_major_grid_style);
+			let stroke = grid_stroke(
+				self.settings.x_major_grid_width,
+				self.settings.x_major_grid_style,
+			);
 			for i in 0..=self.settings.x_ticks {
 				let t = i as f64 / self.settings.x_ticks as f64;
 				let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
 				let x = transform.categorical(0, data_x).0.x;
-				draw_line(backend, Point::new(x, top_edge), Point::new(x, bottom_edge), stroke);
+				draw_line(
+					backend,
+					Point::new(x, top_edge),
+					Point::new(x, bottom_edge),
+					stroke,
+				);
 			}
 		}
 	}
@@ -1441,8 +1594,11 @@ impl<'a> PlotWidget<'a> {
 			if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
 				for j in 0..self.settings.y_ticks {
 					for k in 1..=self.settings.y_minor_ticks {
-						let t = (j as f64 + k as f64 / (self.settings.y_minor_ticks + 1) as f64) / self.settings.y_ticks as f64;
-						if t > 1.0 { continue; }
+						let t = (j as f64 + k as f64 / (self.settings.y_minor_ticks + 1) as f64)
+							/ self.settings.y_ticks as f64;
+						if t > 1.0 {
+							continue;
+						}
 						let data_y = range.0 + (range.1 - range.0) * t;
 						let (p, _) = transform.categorical(i, data_y);
 						backend.stroke_path(

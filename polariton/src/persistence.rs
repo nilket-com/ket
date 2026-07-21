@@ -1,4 +1,4 @@
-use tokio_rusqlite::{rusqlite, Connection};
+use tokio_rusqlite::{Connection, rusqlite};
 
 #[derive(Clone, Debug)]
 pub struct SavedConnection {
@@ -44,8 +44,8 @@ pub fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LEN] {
 
 fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Vec<u8> {
 	use chacha20poly1305::{
-		aead::{Aead, KeyInit},
 		ChaCha20Poly1305, Key, Nonce,
+		aead::{Aead, KeyInit},
 	};
 	let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
 	let nonce_bytes = random_bytes::<NONCE_LEN>();
@@ -59,8 +59,8 @@ fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Vec<u8> {
 
 fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> Result<Vec<u8>, String> {
 	use chacha20poly1305::{
-		aead::{Aead, KeyInit},
 		ChaCha20Poly1305, Key, Nonce,
+		aead::{Aead, KeyInit},
 	};
 	if data.len() < NONCE_LEN {
 		return Err("ciphertext too short".to_string());
@@ -198,7 +198,12 @@ pub async fn load_startup_data() -> StartupData {
 			let show_column_types = get("show_column_types")
 				.and_then(|s| s.parse::<bool>().ok())
 				.unwrap_or(false);
-			Ok::<_, rusqlite::Error>((window_size, salt_hex, is_password_protected, show_column_types))
+			Ok::<_, rusqlite::Error>((
+				window_size,
+				salt_hex,
+				is_password_protected,
+				show_column_types,
+			))
 		})
 		.await
 		.unwrap_or_default();
@@ -457,7 +462,12 @@ impl PrivateDb {
 		self.load_statements().await
 	}
 
-	pub async fn update_statement(&self, id: i64, name: String, code: String) -> Vec<SavedStatement> {
+	pub async fn update_statement(
+		&self,
+		id: i64,
+		name: String,
+		code: String,
+	) -> Vec<SavedStatement> {
 		self.conn
 			.call(move |db| {
 				db.execute(

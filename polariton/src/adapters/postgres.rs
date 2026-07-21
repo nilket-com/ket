@@ -3,12 +3,12 @@ use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use polars::{
 	datatypes::AnyValue,
-	frame::{column::Column, DataFrame},
+	frame::{DataFrame, column::Column},
 	series::Series,
 };
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 use std::pin::pin;
-use tokio_postgres::{types::Type, Client};
+use tokio_postgres::{Client, types::Type};
 use tokio_stream::StreamExt;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {

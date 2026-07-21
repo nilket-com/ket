@@ -218,10 +218,7 @@ impl InputRuntime {
 		let declined_input = if self.context.is_host_panel
 			&& matches!(mode_before, EditorMode::Normal)
 			&& matches!(self.editor_mode(), EditorMode::Normal)
-			&& !self
-				.commands
-				.iter()
-				.any(EditorCommand::is_workspace_scoped)
+			&& !self.commands.iter().any(EditorCommand::is_workspace_scoped)
 		{
 			self.commands.clear();
 			Some((code, modifiers))

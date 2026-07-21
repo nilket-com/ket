@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings, ScatterRenderMode, format_label, polars_type_to_axis_type,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -138,7 +138,8 @@ impl PlotKernel for ScatterPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos) {
+			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
+		{
 			return Some(format!(
 				"X: {}, Y: {}",
 				format_label(x, self.prepared_data.x_axis_type),
@@ -198,12 +199,7 @@ impl ScatterPlotKernel {
 			.max(1);
 
 		for series in &self.prepared_data.series {
-			let sampled = downsample_series(
-				series,
-				bounds,
-				transform,
-				per_series_target,
-			);
+			let sampled = downsample_series(series, bounds, transform, per_series_target);
 			let color = settings.color_theme.get_color(series.color_t);
 			backend.fill_path(
 				&|builder| {
@@ -260,9 +256,14 @@ impl ScatterPlotKernel {
 				.collect(),
 		};
 
-		if let Some(existing) = self.raster_cache.lock().unwrap().as_ref()
+		if let Some(existing) = self
+			.raster_cache
+			.lock()
+			.unwrap()
+			.as_ref()
 			.filter(|cache| cache.key == key)
-			.cloned() {
+			.cloned()
+		{
 			return existing;
 		}
 
@@ -477,15 +478,15 @@ pub fn prepare_scatter_data(
 	point_size_px: f32,
 ) -> ScatterPreparedData {
 	let x_col_series = match df.column(x_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-			Column::from(Series::new_empty(x_col.into(), &DataType::Float64))
-		}),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
 	};
 	let y_col_series = match df.column(y_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-			Column::from(Series::new_empty(y_col.into(), &DataType::Float64))
-		}),
+		Ok(c) => c
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
 		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
 	};
 	let x_dtype = df
@@ -522,7 +523,8 @@ pub fn prepare_scatter_data(
 	let partitions = if cat_col.is_empty() {
 		vec![df.clone()]
 	} else {
-		df.partition_by([cat_col], true).unwrap_or_else(|_| vec![df.clone()])
+		df.partition_by([cat_col], true)
+			.unwrap_or_else(|_| vec![df.clone()])
 	};
 	let num_partitions = partitions.len();
 	let mut series_list = Vec::with_capacity(num_partitions);

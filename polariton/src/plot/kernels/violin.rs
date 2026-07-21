@@ -37,7 +37,11 @@ impl PlotKernel for ViolinPlotKernel {
 		for i in 0..num_violins {
 			let (_center, band_width) = transform.categorical(i, 0.0);
 			let width_scale = band_width * 0.4;
-			let t = if num_violins > 1 { i as f32 / (num_violins - 1) as f32 } else { 0.5 };
+			let t = if num_violins > 1 {
+				i as f32 / (num_violins - 1) as f32
+			} else {
+				0.5
+			};
 			let color = settings.color_theme.get_color(t);
 			let mut first_bin = 0;
 			for bin in 0..tex_height_bins {
@@ -53,7 +57,9 @@ impl PlotKernel for ViolinPlotKernel {
 					break;
 				}
 			}
-			if first_bin >= last_bin { continue; }
+			if first_bin >= last_bin {
+				continue;
+			}
 			let violin_path_closure = |builder: &mut dyn PathBuilder| {
 				for bin in first_bin..=last_bin {
 					let data_y = y_min + bin as f64 * y_step;
@@ -82,15 +88,18 @@ impl PlotKernel for ViolinPlotKernel {
 			backend.stroke_path(&violin_path_closure, border_stroke);
 			if let Some(&median_val) = self.prepared_data.medians.get(i) {
 				let (median_px, _) = transform.categorical(i, median_val);
-				let bin_idx = (((median_val - y_min) / (y_max - y_min)) * (tex_height_bins as f64 - 1.0))
+				let bin_idx = (((median_val - y_min) / (y_max - y_min))
+					* (tex_height_bins as f64 - 1.0))
 					.floor() as usize;
 				let bin_idx = bin_idx.min(tex_height_bins - 1);
 				let density = self.prepared_data.kde_data[i * tex_height_bins + bin_idx];
 				let line_half_width = density * width_scale;
 				backend.stroke_path(
 					&|builder| {
-						builder.move_to(iced::Point::new(median_px.x - line_half_width, median_px.y));
-						builder.line_to(iced::Point::new(median_px.x + line_half_width, median_px.y));
+						builder
+							.move_to(iced::Point::new(median_px.x - line_half_width, median_px.y));
+						builder
+							.line_to(iced::Point::new(median_px.x + line_half_width, median_px.y));
 					},
 					Stroke {
 						style: Style::Solid(settings.decoration_color),
@@ -132,7 +141,9 @@ impl PlotKernel for ViolinPlotKernel {
 		settings: PlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
-		if num_cats == 0 { return; }
+		if num_cats == 0 {
+			return;
+		}
 		let max_rows = settings.max_legend_rows.max(1) as usize;
 		let num_cols = num_cats.div_ceil(max_rows);
 		let actual_rows = num_cats.min(max_rows);
@@ -147,10 +158,17 @@ impl PlotKernel for ViolinPlotKernel {
 		backend.fill_rectangle(
 			iced::Point::new(x, y),
 			iced::Size::new(legend_width, legend_height),
-			Color { a: 0.6, ..settings.background_color }
+			Color {
+				a: 0.6,
+				..settings.background_color
+			},
 		);
 		for (i, name) in self.prepared_data.categories.iter().enumerate() {
-			let t = if num_cats > 1 { i as f32 / (num_cats - 1) as f32 } else { 0.5 };
+			let t = if num_cats > 1 {
+				i as f32 / (num_cats - 1) as f32
+			} else {
+				0.5
+			};
 			let color = settings.color_theme.get_color(t);
 			let col = i / max_rows;
 			let row = i % max_rows;
@@ -159,7 +177,7 @@ impl PlotKernel for ViolinPlotKernel {
 			backend.fill_rectangle(
 				iced::Point::new(item_x, item_y + (item_height - rect_size) / 2.0),
 				iced::Size::new(rect_size, rect_size),
-				color
+				color,
 			);
 			backend.fill_text(iced::widget::canvas::Text {
 				content: name.clone(),
@@ -175,13 +193,16 @@ impl PlotKernel for ViolinPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
-			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout {
+			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
+		{
 			for (i, cat) in categories.iter().enumerate() {
 				let (center_point, band_width) = transform.categorical(i, 0.0);
 				let left_edge = center_point.x - (band_width / 2.0);
 				let right_edge = center_point.x + (band_width / 2.0);
-				if cursor_pos.x >= left_edge && cursor_pos.x <= right_edge
-					&& let Some(&median_val) = self.prepared_data.medians.get(i) {
+				if cursor_pos.x >= left_edge
+					&& cursor_pos.x <= right_edge
+					&& let Some(&median_val) = self.prepared_data.medians.get(i)
+				{
 					return Some(format!("{}: Median {:.2}", cat, median_val));
 				}
 			}
@@ -257,13 +278,17 @@ pub fn prepare_violin_data(
 	let (y_min, y_max) = match manual_range {
 		Some(r) => r,
 		None => {
-			let col_res = df.column(val_col)
-				.map(|c| c.as_materialized_series().cast(&DataType::Float64).unwrap_or_else(|_| Series::new_empty(val_col.into(), &DataType::Float64)));
-			
+			let col_res = df.column(val_col).map(|c| {
+				c.as_materialized_series()
+					.cast(&DataType::Float64)
+					.unwrap_or_else(|_| Series::new_empty(val_col.into(), &DataType::Float64))
+			});
+
 			match col_res {
 				Ok(col) => {
 					let col_f64 = col.f64().unwrap();
-					let (y_min, y_max) = (col_f64.min().unwrap_or(0.0), col_f64.max().unwrap_or(1.0));
+					let (y_min, y_max) =
+						(col_f64.min().unwrap_or(0.0), col_f64.max().unwrap_or(1.0));
 					let pad = (y_max - y_min).max(0.001) * 0.1;
 					(y_min - pad, y_max + pad)
 				}
@@ -305,22 +330,53 @@ pub fn prepare_violin_data(
 			};
 		}
 	};
-	let actual_cat_col = if cat_col.is_empty() || !group_data.get_column_names().iter().any(|name| name.as_str() == cat_col) { "dummy_cat" } else { cat_col };
+	let actual_cat_col = if cat_col.is_empty()
+		|| !group_data
+			.get_column_names()
+			.iter()
+			.any(|name| name.as_str() == cat_col)
+	{
+		"dummy_cat"
+	} else {
+		cat_col
+	};
 	let num_violins = group_data.height();
 	let medians_series = group_data
 		.column("median")
-		.map(|c| c.as_materialized_series().cast(&DataType::Float64).unwrap_or_else(|_| Series::new_empty("median".into(), &DataType::Float64)))
+		.map(|c| {
+			c.as_materialized_series()
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| Series::new_empty("median".into(), &DataType::Float64))
+		})
 		.unwrap_or_else(|_| Series::new_empty("median".into(), &DataType::Float64));
 	let medians_f64 = medians_series.f64().unwrap();
-	let values_list_series = group_data.column("values").map(|c| c.as_materialized_series().clone()).unwrap_or_else(|_| Series::new_empty("values".into(), &DataType::List(Box::new(DataType::Float64))));
+	let values_list_series = group_data
+		.column("values")
+		.map(|c| c.as_materialized_series().clone())
+		.unwrap_or_else(|_| {
+			Series::new_empty(
+				"values".into(),
+				&DataType::List(Box::new(DataType::Float64)),
+			)
+		});
 	let values_list = values_list_series.list().unwrap();
-	let categories_series = group_data.column(actual_cat_col).map(|c| c.as_materialized_series().clone()).unwrap_or_else(|_| Series::new("dummy_cat".into(), &["All Data"]));
+	let categories_series = group_data
+		.column(actual_cat_col)
+		.map(|c| c.as_materialized_series().clone())
+		.unwrap_or_else(|_| Series::new("dummy_cat".into(), &["All Data"]));
 	let categories: Vec<String> = if let Ok(ca) = categories_series.i32() {
 		ca.into_no_null_iter().map(|i| i.to_string()).collect()
 	} else {
-		categories_series.iter().map(|v| {
-			if let AnyValue::String(s) = v { s.to_string() } else { v.to_string().replace("\"", "") }
-		}).collect()
+		categories_series
+			.iter()
+			.map(|v| {
+				if let AnyValue::String(s) = v {
+					s.to_string()
+				} else {
+					v.to_string().replace("\"", "")
+				}
+			})
+			.collect()
 	};
 	let tex_height_bins = 256;
 	let mut kde_data = vec![0.0f32; num_violins * tex_height_bins];
@@ -329,7 +385,13 @@ pub fn prepare_violin_data(
 		medians.push(medians_f64.get(i).unwrap_or(0.0));
 		let series_opt = values_list.get_as_series(i);
 		if let Some(series) = series_opt {
-			let y_slice: Vec<f64> = series.cast(&DataType::Float64).unwrap_or_else(|_| Series::new_empty("values".into(), &DataType::Float64)).f64().unwrap().into_no_null_iter().collect();
+			let y_slice: Vec<f64> = series
+				.cast(&DataType::Float64)
+				.unwrap_or_else(|_| Series::new_empty("values".into(), &DataType::Float64))
+				.f64()
+				.unwrap()
+				.into_no_null_iter()
+				.collect();
 			let bandwidth = (y_max - y_min).max(0.001) * 0.03;
 			let density = compute_kde(&y_slice, tex_height_bins, y_min, y_max, bandwidth);
 			for bin in 0..tex_height_bins {

@@ -14,7 +14,7 @@ pub mod pie;
 pub mod radar;
 pub mod radial_dial;
 pub mod scatter;
+pub mod scatter_line;
 pub mod stacked_area;
 pub mod stacked_bar;
-pub mod scatter_line;
 pub mod violin;
