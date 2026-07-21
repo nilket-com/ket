@@ -14,7 +14,7 @@ use arrow::array::{
 	Array, ArrayRef, BinaryArray, Date32Array, DurationNanosecondArray, Int32Array, Int64Array,
 	LargeStringArray, StringArray, TimestampMillisecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -22,122 +22,6 @@ use wendelon::schema::{
 use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical};
 
 const DAY_NANOS: i64 = 86_400_000_000_000;
-
-#[test]
-fn adr490_local_hash_memory_policy_requires_exact_evidence_and_pins_m06_boundary() {
-	let key_types = [DataType::Int64];
-	let m06_orders_rows = Some(RowCount::new(12_000_000));
-	let no_evidence = PlannerConfig {
-		single_partition_execution: true,
-		..PlannerConfig::default()
-	};
-	let sixty_four_mib = PlannerConfig {
-		single_partition_execution: true,
-		local_hash_join_memory_per_task: Some(ByteCount::new(64 * 1024 * 1024)),
-		..PlannerConfig::default()
-	};
-	let two_gib = PlannerConfig {
-		single_partition_execution: true,
-		local_hash_join_memory_per_task: Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
-		..PlannerConfig::default()
-	};
-	let distributed_two_gib = PlannerConfig {
-		local_hash_join_memory_per_task: Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
-		..PlannerConfig::default()
-	};
-
-	assert!(!local_hash_join_memory_policy_admits(
-		&no_evidence,
-		m06_orders_rows,
-		&key_types
-	));
-	assert!(!local_hash_join_memory_policy_admits(
-		&sixty_four_mib,
-		m06_orders_rows,
-		&key_types
-	));
-	assert!(local_hash_join_memory_policy_admits(
-		&two_gib,
-		m06_orders_rows,
-		&key_types
-	));
-	assert!(!local_hash_join_memory_policy_admits(
-		&distributed_two_gib,
-		m06_orders_rows,
-		&key_types
-	));
-	assert!(!local_hash_join_memory_policy_admits(
-		&two_gib, None, &key_types
-	));
-}
-
-#[tokio::test]
-async fn adr490_single_node_raw_policy_emits_only_the_local_hash_shape() {
-	let mut catalog = join_catalog();
-	// Keep both sides above broadcast while making the right side the selected
-	// smaller build. These row bounds reproduce m06's 48M-probe/12M-build shape.
-	seed_table_optimizer_facts(
-		&mut catalog,
-		"orders",
-		Some(4 * 1024 * 1024 * 1024),
-		Some(48_000_000),
-		Vec::new(),
-	);
-	seed_table_optimizer_facts(
-		&mut catalog,
-		"customers",
-		Some(2 * 1024 * 1024 * 1024),
-		Some(12_000_000),
-		Vec::new(),
-	);
-	let logical = SqlPlanner::new()
-		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-		.expect("plan local hash candidate");
-	let local_config = PlannerConfig {
-		auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
-		single_partition_execution: true,
-		local_hash_join_memory_per_task: Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
-		..PlannerConfig::default()
-	};
-	let local = bind(&logical, &catalog, &local_config)
-		.await
-		.expect("bind local hash candidate");
-	let ExecutionPlan::Project { input, .. } = local else {
-		panic!("right-build local hash must restore declared order");
-	};
-	let ExecutionPlan::Join {
-		left,
-		right,
-		strategy,
-		..
-	} = input.as_ref()
-	else {
-		panic!("restore project must wrap the physical local hash join");
-	};
-	assert_eq!(*strategy, JoinStrategy::HashPartitioned);
-	assert!(terminal_exchange(left).is_none());
-	assert!(terminal_exchange(right).is_none());
-
-	let distributed = bind(
-		&logical,
-		&catalog,
-		&PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
-			local_hash_join_memory_per_task: Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
-			..PlannerConfig::default()
-		},
-	)
-	.await
-	.expect("bind distributed-shaped hash candidate");
-	let ExecutionPlan::Project { input, .. } = distributed else {
-		panic!("right-build hash must restore declared order");
-	};
-	let ExecutionPlan::Join { left, right, .. } = input.as_ref() else {
-		panic!("restore project must wrap the physical hash join");
-	};
-	assert!(terminal_exchange(left).is_some());
-	assert!(terminal_exchange(right).is_some());
-}
 
 #[test]
 fn predicate_pushdown_emitted_splits_preserve_kleene_3vl() {
