@@ -137,8 +137,7 @@ impl EditorCommand {
 				| Self::RefreshHostPanel { .. }
 				| Self::OpenFileBrowser
 				| Self::OpenFileBrowserAt(_)
-				| Self::Quit
-				| Self::WriteAndQuit
+				| Self::Quit | Self::WriteAndQuit
 				| Self::SetTheme(_)
 				| Self::SetBackground(_)
 				| Self::MouseIntent { .. }
@@ -234,6 +233,8 @@ pub enum EditorCommand {
 		panel_id: crate::engine::HostPanelId,
 		kind: String,
 		title: String,
+		/// Direction of the initial split when this identity is first opened.
+		split_direction: SplitDirection,
 		focus: bool,
 	},
 	/// Rebind a live panel to a new revision of its source, so the frontend can

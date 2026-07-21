@@ -25,10 +25,10 @@ use crate::core::{
 	PaneId, PaneLocalCol, PaneLocalRow, PaneRect, PaneRow, Rgb, ScreenCol, ScreenRow,
 };
 use crate::ecs::{NodeId, UastRegistry};
+use crate::engine::SplitDirection;
 use crate::svp::SvpResolver;
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
-use crate::engine::SplitDirection;
 use crate::uast::projection::{
 	GutterLineNumber, HostPanelViewport, PaneDividerViewport, ProjectedCaret,
 };
@@ -356,7 +356,11 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 				&& after.rect.screen_col.get()
 					== before.rect.right().get() + crate::core::SPLIT_DIVIDER_COLS
 			{
-				let top = before.rect.screen_row.get().max(after.rect.screen_row.get());
+				let top = before
+					.rect
+					.screen_row
+					.get()
+					.max(after.rect.screen_row.get());
 				let bottom = before.rect.bottom().get().min(after.rect.bottom().get());
 				let visual = PaneRect::new(
 					ScreenCol::new(before.rect.right().get()),
@@ -379,7 +383,11 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 				&& after.rect.screen_row.get()
 					== before.rect.bottom().get() + crate::core::SPLIT_DIVIDER_ROWS
 			{
-				let left = before.rect.screen_col.get().max(after.rect.screen_col.get());
+				let left = before
+					.rect
+					.screen_col
+					.get()
+					.max(after.rect.screen_col.get());
 				let right = before.rect.right().get().min(after.rect.right().get());
 				let visual = PaneRect::new(
 					ScreenCol::new(left),
@@ -524,6 +532,7 @@ fn render_pane_viewport(
 		inline_annotations,
 		selection_ranges,
 		minimap,
+		markdown_cells,
 		markdown_preview,
 		theme_colors,
 		render_rows,
@@ -580,6 +589,7 @@ fn render_pane_viewport(
 				Vec::new(),
 				Vec::new(),
 				None,
+				Vec::new(),
 				Some(super::markdown_image_preview::markdown_image_preview_snapshot(document)),
 				preview_view.state.current_theme.syntax_colors,
 				Vec::new(),
@@ -632,6 +642,7 @@ fn render_pane_viewport(
 				Vec::new(),
 				Vec::new(),
 				None,
+				Vec::new(),
 				None,
 				panel_view.state.current_theme.syntax_colors,
 				Vec::new(),
@@ -1150,6 +1161,29 @@ fn render_pane_viewport(
 			None
 		};
 		let markdown_preview = None;
+		// Fenced execution cells belong to the Markdown source, not to an
+		// optional preview pane. Keep them projected when the preview is closed
+		// so notebook commands never fall back to dispatching raw Markdown.
+		let markdown_cells = tab
+			.document
+			.active_language_id
+			.and_then(|id| lang_registry.get_provider(id))
+			.filter(|provider| provider.label() == "Markdown")
+			.and_then(|_| tab.document.root_id)
+			.and_then(|root_id| {
+				read_document_snapshot(
+					registry,
+					root_id,
+					tab.document.backing_path.as_deref().map(Path::new),
+				)
+				.ok()
+			})
+			.map(|bytes| {
+				crate::engine::markdown_image_preview::markdown_cells(
+					String::from_utf8_lossy(&bytes).as_ref(),
+				)
+			})
+			.unwrap_or_default();
 		let dma_pending = tokens
 			.iter()
 			.any(|token| token.text.is_empty() && !token.is_folded);
@@ -1202,6 +1236,7 @@ fn render_pane_viewport(
 				.map_or_else(Vec::new, |semantic| semantic.inline_annotations.clone()),
 			selection_ranges,
 			minimap,
+			markdown_cells,
 			markdown_preview,
 			{
 				let mut theme_colors = tab.view.current_theme.syntax_colors;
@@ -1318,6 +1353,7 @@ fn render_pane_viewport(
 		selection_ranges,
 		yank_flash,
 		minimap,
+		markdown_cells,
 		markdown_preview,
 		theme_colors,
 		render_rows,

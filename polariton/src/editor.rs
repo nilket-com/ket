@@ -260,10 +260,9 @@ impl CodeEditor {
 	/// than falling through to dispatching the whole Markdown document as SQL.
 	pub fn markdown_cell_at_cursor(&self) -> Option<MarkdownCellExecution> {
 		let viewport = self.viewport.as_ref()?;
-		let source = viewport.focused_pane()?;
+		let source = self.notebook_source(viewport)?;
 		let cursor = source.cursor_abs_byte;
-		let preview = self.paired_preview(viewport, source)?;
-		let cell = preview.cells.iter().find(|cell| {
+		let cell = source.markdown_cells.iter().find(|cell| {
 			cell.language_id == "sql"
 				&& cell.body_range.start <= cursor
 				&& cursor < cell.body_range.end
@@ -285,23 +284,35 @@ impl CodeEditor {
 	pub fn is_notebook(&self) -> bool {
 		self.viewport
 			.as_ref()
-			.and_then(|viewport| {
-				let source = viewport.focused_pane()?;
-				self.paired_preview(viewport, source)
-			})
+			.and_then(|viewport| self.notebook_source(viewport))
 			.is_some()
 	}
 
-	fn paired_preview<'a>(
+	/// Resolve the Markdown source that owns notebook execution.
+	/// Workspace focus can be on a result or dashboard host panel while the
+	/// source retains the cursor that identifies the executable cell.
+	fn notebook_source<'a>(
 		&self,
 		viewport: &'a Viewport,
-		source: &libaryon::uast::projection::PaneViewport,
-	) -> Option<&'a libaryon::uast::projection::MarkdownPreviewSnapshot> {
-		viewport.panes.iter().find_map(|pane| {
-			pane.markdown_preview
-				.as_ref()
-				.filter(|preview| preview.source_view_id == source.view_id)
-		})
+	) -> Option<&'a libaryon::uast::projection::PaneViewport> {
+		let focused = viewport.focused_pane()?;
+		if !focused.markdown_cells.is_empty() {
+			return Some(focused);
+		}
+		if let Some(preview) = focused.markdown_preview.as_ref() {
+			let source = viewport
+				.panes
+				.iter()
+				.find(|pane| pane.view_id == preview.source_view_id)?;
+			return (!source.markdown_cells.is_empty()).then_some(source);
+		}
+
+		// Native output panes have no document identity. The Markdown source
+		// remains the execution context even when its preview is closed.
+		viewport
+			.panes
+			.iter()
+			.find(|pane| !pane.markdown_cells.is_empty())
 	}
 
 	pub fn begin_markdown_cell(&mut self, identity: MarkdownCellIdentity) {
@@ -347,6 +358,7 @@ impl CodeEditor {
 				panel_id: RESULT_PANEL,
 				kind: "result-table".to_owned(),
 				title: "Results".to_owned(),
+				split_direction: SplitDirection::Horizontal,
 				focus: false,
 			});
 		}
@@ -359,6 +371,7 @@ impl CodeEditor {
 			panel_id: DASHBOARD_PANEL,
 			kind: "dashboard".to_owned(),
 			title: "Dashboard".to_owned(),
+			split_direction: SplitDirection::Vertical,
 			focus: true,
 		});
 	}
@@ -2086,7 +2099,7 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
-		markdown_code_fragments, metrics,
+		SplitDirection, markdown_code_fragments, metrics,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -2226,6 +2239,7 @@ mod tests {
 			panel_id: HostPanelId::new(1),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
+			split_direction: SplitDirection::Vertical,
 			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
@@ -2262,6 +2276,7 @@ mod tests {
 			panel_id,
 			kind: "dashboard".to_string(),
 			title: "Dashboard".to_string(),
+			split_direction: SplitDirection::Vertical,
 			focus: true,
 		});
 		wait_for_host_panel(&mut editor);
@@ -2363,6 +2378,21 @@ mod tests {
 				.focused_pane_id,
 			source_pane,
 			"running a query must not make the source editor stop accepting text"
+		);
+		let viewport = editor.viewport.as_ref().expect("result viewport");
+		let source = viewport.pane(source_pane).expect("source pane");
+		let results = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.host_panel.is_some())
+			.expect("result pane");
+		assert_eq!(
+			results.rect.screen_col, source.rect.screen_col,
+			"results retain the source column"
+		);
+		assert!(
+			results.rect.screen_row > source.rect.screen_row,
+			"results open below their source rather than in a right-hand split"
 		);
 	}
 
@@ -2576,6 +2606,7 @@ mod tests {
 			panel_id: HostPanelId::new(3),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
+			split_direction: SplitDirection::Vertical,
 			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
@@ -3385,6 +3416,11 @@ mod tests {
 			"a live selection suppresses whole-cell snippet dispatch"
 		);
 		assert_eq!(
+			editor.selected_or_current_line().as_deref(),
+			Some("select y, z from test;\n"),
+			"a visual-line snippet inside a cell excludes the fence metadata"
+		);
+		assert_eq!(
 			editor
 				.markdown_cell_at_cursor()
 				.map(|cell| cell.code)
@@ -3395,6 +3431,78 @@ mod tests {
 		assert!(
 			editor.is_notebook(),
 			"a document with a preview is a notebook"
+		);
+	}
+
+	#[test]
+	fn notebook_run_keeps_the_source_context_when_an_output_pane_is_focused() {
+		use libaryon::engine::HostPanelId;
+
+		let markdown = "```sql\nselect y, z from test;\n```\n";
+		let mut editor = notebook_with_preview(markdown);
+		send_keys(&mut editor, ['j']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.markdown_cell_at_cursor().is_none() && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor.markdown_cell_at_cursor().is_some(),
+			"the source cursor starts inside the SQL cell"
+		);
+
+		editor.send(EditorCommand::OpenHostPanel {
+			panel_id: HostPanelId::new(99),
+			kind: "result-table".to_owned(),
+			title: "Results".to_owned(),
+			split_direction: SplitDirection::Vertical,
+			focus: true,
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport
+				.focused_pane()
+				.and_then(|pane| pane.host_panel.as_ref())
+				.is_none()
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		assert_eq!(
+			editor.markdown_cell_at_cursor().map(|cell| cell.code),
+			Some("select y, z from test;\n".to_owned()),
+			"an output pane cannot make Run fall back to the raw Markdown document"
+		);
+	}
+
+	#[test]
+	fn markdown_cells_remain_runnable_without_a_preview_pane() {
+		let markdown = "```sql {#create, output=none}\ncreate table test (x int32);\n```\n";
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		editor.send(EditorCommand::ReplaceDocument {
+			text: markdown.to_owned(),
+			language: Some("markdown".to_owned()),
+			virtual_path: Some("notebook.md".to_owned()),
+		});
+		editor.request_content();
+		wait_for_content(&mut editor, markdown);
+		send_keys(&mut editor, ['j']);
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.markdown_cell_at_cursor().is_none() && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let cell = editor
+			.markdown_cell_at_cursor()
+			.expect("fenced SQL remains executable without a preview pane");
+		assert_eq!(cell.code, "create table test (x int32);\n");
+		assert_eq!(
+			cell.presentation.output,
+			libaryon::uast::projection::MarkdownCellOutputTarget::None
 		);
 	}
 

@@ -269,6 +269,10 @@ pub struct PaneViewport {
 	pub selection_ranges: Vec<(DocByte, DocByte)>,
 	pub yank_flash: Option<(DocByte, DocByte)>,
 	pub minimap: Option<MinimapSnapshot>,
+	/// Executable fenced cells belonging to this Markdown source document.
+	/// This is source metadata, not preview metadata: cells remain runnable
+	/// after every paired preview pane is closed.
+	pub markdown_cells: Vec<MarkdownCellSnapshot>,
 	pub markdown_preview: Option<MarkdownPreviewSnapshot>,
 	/// Present when this pane is host-rendered; the frontend draws its rect.
 	pub host_panel: Option<HostPanelViewport>,

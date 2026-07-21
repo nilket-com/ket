@@ -1803,15 +1803,16 @@ fn dispatch_command(
 			panel_id,
 			kind,
 			title,
+			split_direction,
 			focus,
 		} => {
 			// Reopening an existing identity never duplicates its host object.
 			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id) {
 				if focus
 					&& let Some(pane_id) = session
-					.layout
-					.view_id_for_buffer(buffer_id)
-					.and_then(|view_id| session.layout.pane_id_for_view(view_id))
+						.layout
+						.view_id_for_buffer(buffer_id)
+						.and_then(|view_id| session.layout.pane_id_for_view(view_id))
 				{
 					session.focus_pane(pane_id);
 				}
@@ -1827,27 +1828,18 @@ fn dispatch_command(
 				let buffer_id = view.buffer_id;
 				let pane = EditorPane::from_view(view);
 				if session
-					.split_pane_with_new_pane_order(
-						focused_pane_id,
-						SplitDirection::Vertical,
-						pane,
-						false,
-					)
+					.split_pane_with_new_pane_order(focused_pane_id, split_direction, pane, false)
 					.is_none()
 				{
 					release_buffer(runtime, session, buffer_id);
-					session.ui.status_message =
-						Some("No room to open a host panel".to_string());
+					session.ui.status_message = Some("No room to open a host panel".to_string());
 				} else if !focus {
 					session.focus_pane(focused_pane_id);
 				}
 			}
 			needs_render = true;
 		}
-		EditorCommand::RefreshHostPanel {
-			panel_id,
-			revision,
-		} => {
+		EditorCommand::RefreshHostPanel { panel_id, revision } => {
 			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id)
 				&& let Some(panel) = session
 					.buffers
@@ -1900,14 +1892,11 @@ fn dispatch_command(
 					.find_pane(session.focused_pane_id)
 					.is_some_and(|pane| pane.tabs.len() == 1)
 					&& session.layout.pane_count() > 1;
-				let closes_own_pane = session
-					.buffers
-					.get(active_buffer_id)
-					.is_some_and(|buffer| {
-						buffer.is_file_browser()
-							|| buffer.is_output_panel()
-							|| buffer.is_markdown_preview()
-					});
+				let closes_own_pane = session.buffers.get(active_buffer_id).is_some_and(|buffer| {
+					buffer.is_file_browser()
+						|| buffer.is_output_panel()
+						|| buffer.is_markdown_preview()
+				});
 				if closes_own_pane || closes_last_tab_in_split_pane {
 					close_focused_pane(session, runtime);
 				} else {
@@ -2253,7 +2242,8 @@ fn dispatch_command(
 					buffers.detach_path(buffer_id);
 				}
 				let view = layout.find_view_mut(view_id).expect("replaced view");
-				if let Err(err) = apply_resolved_theme_to_tab(view, language_id, persistent_settings)
+				if let Err(err) =
+					apply_resolved_theme_to_tab(view, language_id, persistent_settings)
 				{
 					ui.status_message = Some(err);
 				}

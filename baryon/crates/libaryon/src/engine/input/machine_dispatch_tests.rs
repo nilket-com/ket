@@ -58,6 +58,7 @@ fn test_viewport() -> Viewport {
 			selection_ranges: Vec::new(),
 			yank_flash: None,
 			minimap: None,
+			markdown_cells: Vec::new(),
 			markdown_preview: None,
 			host_panel: None,
 			theme_colors: Default::default(),
