@@ -183,6 +183,11 @@ pub struct PlannerConfig {
 	/// fragmenter's `JoinInputNotExchanged` is the loud-fail backstop. No reader yet —
 	/// this increment only establishes the provability signal.
 	pub single_partition_execution: bool,
+	/// ADR 490: the raw task-memory coordinate supplied by a caller that also proves
+	/// single-partition execution. `None` is conservative: local hash admission has no
+	/// budget evidence and must stay off. This is policy input only; no binder reader
+	/// consumes it in the rail-first increment.
+	pub local_hash_join_memory_per_task: Option<ByteCount>,
 }
 
 impl Default for PlannerConfig {
@@ -197,6 +202,7 @@ impl Default for PlannerConfig {
 			measured_accrual_sample_rate: 0,
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			single_partition_execution: false,
+			local_hash_join_memory_per_task: None,
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,

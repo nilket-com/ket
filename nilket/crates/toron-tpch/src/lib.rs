@@ -3807,11 +3807,47 @@ pub fn gauge_hash_smaller_build() -> Result<(bool, &'static str), String> {
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
 pub fn gauge_planner_config() -> PlannerConfig {
+	let memory_per_task = gauge_memory_per_task()
+		.ok()
+		.map(|(bytes, _)| ByteCount::new(bytes));
+	gauge_planner_config_with_task_memory(memory_per_task)
+}
+
+fn gauge_planner_config_with_task_memory(
+	local_hash_join_memory_per_task: Option<ByteCount>,
+) -> PlannerConfig {
 	let mut config = PlannerConfig::default();
 	if let Ok((value, "explicit")) = gauge_hash_smaller_build() {
 		config.hash_smaller_build_placement = value;
 	}
+	// The gauge binds and immediately runs through `Executor::with_context`; it is
+	// the caller that can prove this plan will not be fragmented. ADR 489's
+	// distributed coordinator forcibly clears the corresponding signal.
+	config.single_partition_execution = true;
+	config.local_hash_join_memory_per_task = local_hash_join_memory_per_task;
 	config
+}
+
+#[cfg(test)]
+#[test]
+fn adr490_single_node_gauge_config_carries_exact_raw_budget_without_admission() {
+	let configured =
+		gauge_planner_config_with_task_memory(Some(ByteCount::new(2 * 1024 * 1024 * 1024)));
+	assert!(
+		configured.single_partition_execution,
+		"the direct gauge path proves this bind will not be fragmented"
+	);
+	assert_eq!(
+		configured.local_hash_join_memory_per_task,
+		Some(ByteCount::new(2 * 1024 * 1024 * 1024)),
+		"the binder policy input must equal the execution coordinate"
+	);
+	assert!(
+		PlannerConfig::default()
+			.local_hash_join_memory_per_task
+			.is_none(),
+		"non-gauge callers remain conservative until they supply budget evidence"
+	);
 }
 
 /// The gauge's per-query spill reserve and its provenance, same contract as
