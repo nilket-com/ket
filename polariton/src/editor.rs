@@ -67,7 +67,12 @@ pub enum EditorMsg {
 	Paste(String),
 	Scroll(i32),
 	MinimapGoto(DocLine),
+	/// Editor-local pointer motion from the workspace mouse_area.
 	PointerMoved(iced::Point),
+	/// Raw window-space pointer motion from the root subscription. Reaches us
+	/// even while a table/dashboard widget captures its own move events, but in
+	/// window coordinates — converted to editor-local via `pointer_offset`.
+	RawCursorMoved(iced::Point),
 	Click,
 	/// Pointer released; ends a divider drag.
 	Release,
@@ -90,6 +95,13 @@ pub struct CodeEditor {
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
 	last_pointer: Option<iced::Point>,
+	/// Latest raw window-space cursor, from the root subscription.
+	last_raw_window: Option<iced::Point>,
+	/// window_coord - editor_local_coord, learned whenever both the mouse_area
+	/// and the subscription report the same move. Lets subscription-only motion
+	/// (over a capturing widget) be converted back to editor-local space, so
+	/// `last_pointer` is always one coordinate system.
+	pointer_offset: Option<iced::Vector>,
 	/// Latest engine status line (`:w` outcomes, search wraps, command
 	/// errors). Retained until the next forwarded input, vim-style: each
 	/// command's outcome replaces the previous one.
@@ -166,6 +178,8 @@ impl CodeEditor {
 			text_query_pending: false,
 			content_dirty: false,
 			last_pointer: None,
+			last_raw_window: None,
+			pointer_offset: None,
 			status_message: None,
 			quit_requested: false,
 			quit_notified: false,
@@ -533,14 +547,24 @@ impl CodeEditor {
 				self.send(EditorCommand::ScrollViewportToLine(line));
 			}
 			EditorMsg::PointerMoved(position) => {
-				self.last_pointer = Some(position);
-				if self.update_pane_drag() {
-					return Task::none();
+				// The mouse_area is anchored at the editor origin, so this is
+				// authoritative editor-local space. Learn the window offset from
+				// it while we can.
+				if let Some(raw) = self.last_raw_window {
+					self.pointer_offset =
+						Some(iced::Vector::new(raw.x - position.x, raw.y - position.y));
 				}
-				// Continuous resize: every sample while a divider is held
-				// becomes a boundary target, so the split tracks the cursor.
-				if let Some(command) = self.divider_drag_command() {
-					self.send(command);
+				self.apply_pointer(position);
+			}
+			EditorMsg::RawCursorMoved(window) => {
+				self.last_raw_window = Some(window);
+				// Only useful once the offset is known; until then the
+				// mouse_area is the source of truth.
+				if let Some(offset) = self.pointer_offset {
+					self.apply_pointer(iced::Point::new(
+						window.x - offset.x,
+						window.y - offset.y,
+					));
 				}
 			}
 			EditorMsg::Click => {
@@ -637,14 +661,18 @@ impl CodeEditor {
 				hit.y,
 				hit.width,
 				hit.height,
+				// Capture the press only. `mouse_area::on_move` reports
+				// coordinates relative to *this* overlay's bounds, which sit at
+				// the divider's offset — publishing them would corrupt
+				// `last_pointer` into the wrong coordinate space. The outer
+				// mouse_area, anchored at the editor origin, owns pointer
+				// tracking and reports correct cell-space coordinates.
 				mouse_area(
 					container(Space::new())
 						.width(Length::Fill)
 						.height(Length::Fill),
 				)
-				.on_move(EditorMsg::PointerMoved)
 				.on_press(EditorMsg::Click)
-				.on_release(EditorMsg::Release)
 				.into(),
 			));
 		}
@@ -736,6 +764,21 @@ impl CodeEditor {
 	/// Start a drag when the press lands in an engine-published divider hit
 	/// rectangle. Returns false when it did not, so the press falls through to
 	/// cursor placement.
+	/// Route an editor-local pointer position into any active drag. Shared by
+	/// the mouse_area (editor-local) and the subscription (window, converted),
+	/// so `last_pointer` only ever holds editor-local coordinates.
+	fn apply_pointer(&mut self, position: iced::Point) {
+		self.last_pointer = Some(position);
+		if self.update_pane_drag() {
+			return;
+		}
+		// Continuous resize: every sample while a divider is held becomes a
+		// boundary target, so the split tracks the cursor.
+		if let Some(command) = self.divider_drag_command() {
+			self.send(command);
+		}
+	}
+
 	fn begin_divider_drag(&mut self) -> bool {
 		let (Some(viewport), Some(point)) = (self.viewport.as_ref(), self.last_pointer) else {
 			return false;
@@ -1566,13 +1609,19 @@ fn text_pane_surface<'a>(
 	}))
 	.width(Length::Fill)
 	.height(Length::Shrink);
+	// No `on_move` here: pointer tracking must have exactly one owner. A
+	// per-pane mouse_area reports coordinates relative to *its* bounds (the
+	// pane's offset), so publishing PointerMoved from here would corrupt
+	// `last_pointer` into pane-local space whenever the cursor is over pane
+	// content — which is precisely the horizontal-divider grab band. The outer
+	// wrapper, anchored at the editor origin, owns pointer tracking; this pane
+	// mouse_area only claims clicks and scrolls over its own content.
 	let editor_rows = mouse_area(
 		container(rows)
 			.padding([metrics::VERTICAL_PADDING, 0.0])
 			.width(Length::Fill)
 			.height(Length::Fill),
 	)
-	.on_move(EditorMsg::PointerMoved)
 	.on_press(EditorMsg::Click)
 	.on_scroll(|delta| {
 		let lines = match delta {
@@ -1794,7 +1843,7 @@ fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
 	// are inert unless the editor has an active drag.
 	match event {
 		Event::Mouse(mouse::Event::CursorMoved { position }) => {
-			return Some(EditorMsg::PointerMoved(*position));
+			return Some(EditorMsg::RawCursorMoved(*position));
 		}
 		Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
 			return Some(EditorMsg::Release);
@@ -2374,6 +2423,125 @@ mod tests {
 				.pane_id,
 			"opening the dashboard intentionally transfers workspace focus"
 		);
+	}
+
+	#[test]
+	fn subscription_window_coords_convert_to_editor_local() {
+		use iced::Point;
+		use libaryon::engine::SplitDirection;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|v| {
+			!v.dividers
+				.iter()
+				.any(|d| d.axis == SplitDirection::Horizontal)
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let divider = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.dividers
+			.iter()
+			.find(|d| d.axis == SplitDirection::Horizontal)
+			.expect("horizontal divider")
+			.clone();
+		// A point squarely inside the hit band, in editor-local pixels.
+		let band_row = divider.hit_rect.screen_row.get();
+		let local_y = (band_row as f32 + 0.5) * metrics::LINE_HEIGHT;
+		let local = Point::new(300.0, local_y);
+
+		// Simulate the workspace chrome: the subscription reports window
+		// coordinates offset from editor-local by 69px (menu bar + header).
+		const CHROME: f32 = 69.0;
+		let window = Point::new(local.x, local.y + CHROME);
+
+		// The offset is learned when both sources report the same move.
+		let _ = editor.update(EditorMsg::RawCursorMoved(window));
+		let _ = editor.update(EditorMsg::PointerMoved(local));
+		assert_eq!(editor.last_pointer, Some(local));
+
+		// A subscription-only move (as when the cursor is over a capturing
+		// table) must convert back to editor-local, not corrupt last_pointer
+		// with the window value.
+		editor.drag = None;
+		let _ = editor.update(EditorMsg::RawCursorMoved(window));
+		let lp = editor.last_pointer.expect("last pointer");
+        assert!(
+			(lp.y - local.y).abs() < 1.0,
+			"subscription window coords convert to editor-local: got {lp:?}, want ~{local:?}"
+		);
+		assert!(
+			editor.begin_divider_drag(),
+			"the converted point still resolves the divider"
+		);
+		assert_eq!(editor.drag.map(|d| d.axis), Some(SplitDirection::Horizontal));
+	}
+
+	#[test]
+	fn horizontal_divider_grab_band_spans_beyond_its_one_row_gap() {
+		use libaryon::engine::SplitDirection;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|v| {
+			!v.dividers
+				.iter()
+				.any(|d| d.axis == SplitDirection::Horizontal)
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		let divider = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.dividers
+			.iter()
+			.find(|d| d.axis == SplitDirection::Horizontal)
+			.expect("a horizontal split projects a horizontal divider")
+			.clone();
+
+		// The one-row visual gap would be a ~22px grab target — nearly
+		// unusable. The engine must widen the hit rect above and below it.
+		assert_eq!(divider.visual_rect.height.get(), 1);
+		assert!(
+			divider.hit_rect.height.get() >= 3,
+			"horizontal grab band must extend past its single-row gap, got {}",
+			divider.hit_rect.height.get()
+		);
+		assert!(divider.hit_rect.screen_row.get() < divider.visual_rect.screen_row.get());
+
+		// Every pixel row across the widened band resolves to the drag — the
+		// gap itself and the padding rows above (top pane) and below (bottom
+		// pane's title bar), which pane content would otherwise capture.
+		let top = divider.hit_rect.screen_row.get();
+		let bottom = divider.hit_rect.bottom().get();
+		for row in top..bottom {
+			let y = (row as f32 + 0.5) * metrics::LINE_HEIGHT;
+			editor.last_pointer = Some(iced::Point::new(300.0, y));
+			editor.drag = None;
+			assert!(
+				editor.begin_divider_drag(),
+				"row {row} inside the hit band must start a drag"
+			);
+			assert_eq!(
+				editor.drag.map(|d| d.axis),
+				Some(SplitDirection::Horizontal)
+			);
+		}
 	}
 
 	#[test]
