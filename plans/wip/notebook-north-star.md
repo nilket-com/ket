@@ -39,10 +39,11 @@ split/tab/maximize gives the "fold back the covers" interaction for free.
   the projected palette.
 - **Milestone 2 — shipped.** Fences have implicit session-local identities and
   optional explicit `{#name}` identities.
-- **Milestone 3 — partly shipped.** `Ctrl+Enter` runs the SQL fence at the
-  cursor and a native table, error, or completion message can render beneath
-  that fence in the preview. The existing plot path has not yet been attached
-  inline.
+- **Milestone 3 — shipped for tabular output.** `Ctrl+Enter` runs the SQL
+  fence at the cursor and a native table, error, or completion message can
+  render beneath that fence in the preview. Cell metadata belongs to the
+  Markdown source projection, so execution remains available after the
+  preview is closed.
 
 ## Cell presentation contract
 
@@ -85,11 +86,10 @@ document's declared layout.
 
 ### Next cut
 
-Project structured presentation metadata from the existing fence parser into
-`MarkdownCellSnapshot`, then make `Ctrl+Enter` and the native preview honor
-`output` and `code`. Preserve today's behavior as the default. Do not add
-arbitrary CSS-like attributes or inline plots in this cut; the resulting
-output-routing seam is what gives plots an unambiguous home next.
+Build the Rune capability cut from step 4. Keep it independent of Markdown
+dispatch and rendering: prove that a Rune script can name an explicit SQL-cell
+result and publish a layered `PlotComposition` through a deferred effect. The
+following cut attaches that already-proven output to a `rune` fence.
 
 ## Sequence
 
@@ -108,12 +108,36 @@ output-routing seam is what gives plots an unambiguous home next.
 3. **Execute SQL cells in the preview.** Shipped for table output; the cell
    presentation contract above is the remaining routing refinement. Large
    table/plot can still detach into a Baryon HostPanel (the shipped seam).
-4. **Inline existing plots, then Rune plot cells.** First attach the existing
-   `PlotComposition` path to the chosen output target. Then Rune builds the
-   same `PlotComposition { layers }`;
-   layered scatter-plus-line becomes ordered layers, not dialog state. Pulls in
-   the Polariton Rune runtime (deferred-handle + backing-object registry
-   patterns, per `baryon-rune-config`), and requires explicit cell ids.
+4. **Inline Rune plot cells — three earned cuts.** Markdown names cells and
+   declares placement; Rune builds the existing `PlotComposition { layers }`.
+   Do not invent a Markdown plotting DSL.
+
+   1. *Rune capability cut.* Embed a Polariton-owned Rune runtime with a
+      deliberately small deferred capability: `workspace.cell("trips")`
+      reads an explicitly named SQL-cell result and `viz` builds/publishes a
+      `PlotComposition`. It returns an owned data snapshot / queued effect;
+      it never borrows `AppState` across the VM boundary. Unit-test a layered
+      scatter-plus-line composition without Markdown or Iced.
+   2. *Notebook dispatch cut.* Generalize `Ctrl+Enter` from `sql` to `sql` and
+      `rune` fences. A Rune cell's own `output=inline|pane|none` controls the
+      plot it publishes. Its source may look like:
+
+      ````markdown
+      ```sql {#trips, output=none}
+      select x, y from trips_source;
+      ```
+
+      ```rune {#trips-plot, output=inline, code=hide}
+      viz.plot(workspace.cell("trips")).scatter("x", "y").line("x", "y").show();
+      ```
+      ````
+
+      The existing `NotebookCellOutput` gains a native plot variant and the
+      preview renders the existing plot kernel beneath the Rune fence.
+   3. *Plot-surface cut.* Preserve interactive hover/zoom and sensible inline
+      sizing; then make `output=pane` publish the same plot into a host panel.
+      Dialog edits come only after this surface works, and use managed Rune
+      source edits rather than bidirectional general-program synchronization.
 5. **Direct manipulation as managed source edits.** The dialog edits *recognized*
    Rune calls via the `:initw` writer's machinery (`update_init_file` /
    `config_call_key`); hand-authored or too-complex Rune stays authoritative and
