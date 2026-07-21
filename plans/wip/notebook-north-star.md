@@ -17,11 +17,10 @@ Two scope pins, deliberately:
   changes to Baryon's text model. Inline outputs between source lines — row-
   quantized foreign blocks reserving space in the editor's cell grid — are the
   deepest engine surgery and stay out of scope until earned.
-- **Existing plot path, not Rune-authored plots, for v1.** SQL works, the table
-  widget works, `PlotComposition { layers }` already drives the renderer. A
-  preview that runs a SQL fence and renders table + existing-machinery plot is
-  reachable now. Rune plots are a later enrichment of a working surface, not a
-  prerequisite.
+- **Existing plot path, not a new plot model.** SQL works, the table widget
+  works, and `PlotComposition { layers }` already drives the renderer. Rune
+  authors that existing composition; it does not invent a Markdown plotting
+  DSL or a second rendering path.
 
 ```
 Markdown source  ⇄  rich notebook preview
@@ -44,6 +43,11 @@ split/tab/maximize gives the "fold back the covers" interaction for free.
   render beneath that fence in the preview. Cell metadata belongs to the
   Markdown source projection, so execution remains available after the
   preview is closed.
+- **Milestone 4 — Rune notebook dispatch shipped.** `Ctrl+Enter` now runs a
+  `rune` fence too. Explicitly named SQL results are retained as owned
+  snapshots even with `output=none`; `workspace.cell("name")` resolves one and
+  `viz.plot(...).scatter().line().show()?` builds the existing plot kernel off
+  the UI thread. An inline Rune cell receives the resulting native plot.
 
 ## Cell presentation contract
 
@@ -86,10 +90,11 @@ document's declared layout.
 
 ### Next cut
 
-Build the Rune capability cut from step 4. Keep it independent of Markdown
-dispatch and rendering: prove that a Rune script can name an explicit SQL-cell
-result and publish a layered `PlotComposition` through a deferred effect. The
-following cut attaches that already-proven output to a `rune` fence.
+Build the plot surface cut from step 4. The initial inline plot uses the
+existing canvas and kernel but deliberately discards its interaction messages.
+Give preview plots their own hover/zoom state and sensible responsive sizing;
+then refine the already-working `output=pane` dashboard-host-panel surface to
+share that interaction model.
 
 ## Sequence
 
@@ -112,13 +117,13 @@ following cut attaches that already-proven output to a `rune` fence.
    declares placement; Rune builds the existing `PlotComposition { layers }`.
    Do not invent a Markdown plotting DSL.
 
-   1. *Rune capability cut.* Embed a Polariton-owned Rune runtime with a
+   1. *Rune capability cut — shipped.* Embed a Polariton-owned Rune runtime with a
       deliberately small deferred capability: `workspace.cell("trips")`
       reads an explicitly named SQL-cell result and `viz` builds/publishes a
       `PlotComposition`. It returns an owned data snapshot / queued effect;
       it never borrows `AppState` across the VM boundary. Unit-test a layered
       scatter-plus-line composition without Markdown or Iced.
-   2. *Notebook dispatch cut.* Generalize `Ctrl+Enter` from `sql` to `sql` and
+   2. *Notebook dispatch cut — shipped.* Generalize `Ctrl+Enter` from `sql` to `sql` and
       `rune` fences. A Rune cell's own `output=inline|pane|none` controls the
       plot it publishes. Its source may look like:
 

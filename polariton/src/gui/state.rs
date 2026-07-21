@@ -11,6 +11,7 @@ use crate::gui::{
 	messages::{ExportFormat, Message},
 	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
+use crate::notebook_rune::{self, PlotEffect};
 use crate::persistence::{self, SavedConnection, SavedStatement, StartupData};
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
@@ -68,6 +69,32 @@ fn build_plot_task(
 				.expect("plot build task panicked")
 		},
 		on_ready,
+	)
+}
+
+/// Build a Rune-published plot without blocking Iced's update loop. Keeping
+/// the effect intact through the task lets the ready message attach the exact
+/// composition and source snapshot that the VM produced.
+fn build_notebook_plot_task(
+	effect: PlotEffect,
+	on_ready: impl FnOnce(
+		PlotEffect,
+		std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+	) -> Message
+	+ Send
+	+ 'static,
+) -> Task<Message> {
+	Task::perform(
+		async move {
+			let composition = effect.composition.clone();
+			let data = effect.data.as_ref().clone();
+			let kernel =
+				tokio::task::spawn_blocking(move || create_plot(&composition, &data, 1200, 720))
+					.await
+					.expect("notebook plot build task panicked");
+			(effect, kernel)
+		},
+		move |(effect, kernel)| on_ready(effect, kernel),
 	)
 }
 
@@ -274,6 +301,17 @@ fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
 }
 
 fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
+	match cell.language_id.as_str() {
+		"sql" => run_sql_markdown_cell(app_state, cell),
+		"rune" => run_rune_markdown_cell(app_state, cell),
+		language => {
+			app_state.status_msg = format!("Unsupported notebook cell language: {language}");
+			Task::none()
+		}
+	}
+}
+
+fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
 	let Some(db) = app_state.adapter_state.connection.as_ref() else {
 		return Task::none();
 	};
@@ -288,10 +326,12 @@ fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> T
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
+	// Starting any SQL cell retires its prior named snapshot immediately.
+	// Presentation only decides where the new result appears; it must not let a
+	// Rune cell observe stale data while this query is in flight.
+	app_state.code_editor.begin_markdown_cell(cell.identity);
 	match presentation.output {
-		MarkdownCellOutputTarget::Inline => {
-			app_state.code_editor.begin_markdown_cell(cell.identity)
-		}
+		MarkdownCellOutputTarget::Inline => {}
 		MarkdownCellOutputTarget::Pane => app_state.code_editor.begin_query(),
 		MarkdownCellOutputTarget::None => {}
 	}
@@ -301,6 +341,45 @@ fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> T
 			guard.dispatch(&cell.code).await
 		},
 		move |result| Message::RunMarkdownCellResult {
+			identity,
+			presentation,
+			result,
+		},
+	)
+}
+
+fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
+	if cell.code.trim().is_empty() {
+		app_state.status_msg = "Nothing to run in this Rune cell.".into();
+		return Task::none();
+	}
+	let snapshots = app_state.code_editor.named_notebook_cell_data();
+	let identity = cell.identity.clone();
+	let presentation = cell.presentation;
+	app_state.status_msg = "Building notebook plot…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	if presentation.output == MarkdownCellOutputTarget::Inline {
+		app_state.code_editor.begin_markdown_cell(identity.clone());
+	}
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				let mut effects = notebook_rune::execute_cell(&cell.code, snapshots)?;
+				match effects.len() {
+					1 => Ok(effects.remove(0)),
+					0 => Err("Rune cell did not publish a plot; call `.show()?`.".to_owned()),
+					_ => Err(
+						"Rune cell published multiple plots; one cell currently owns one output."
+							.to_owned(),
+					),
+				}
+			})
+			.await
+			.map_err(|error| format!("Rune notebook task panicked: {error}"))?
+		},
+		move |result| Message::RunRuneCellResult {
 			identity,
 			presentation,
 			result,
@@ -489,6 +568,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				ExecutionResult::Rows(df) => {
 					let rows = df.height();
 					let cols = df.width();
+					// Presentation never decides data availability: a named SQL cell
+					// remains a Rune input even when it renders in a pane or nowhere.
+					app_state
+						.code_editor
+						.retain_markdown_cell_table(identity.clone(), &df);
 					match presentation.output {
 						MarkdownCellOutputTarget::Inline => app_state
 							.code_editor
@@ -549,6 +633,62 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					app_state.status_msg = "Cell finished.".to_owned();
 				}
 			}
+		}
+		Message::RunRuneCellResult {
+			identity,
+			presentation,
+			result,
+		} => {
+			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
+			app_state.status_time_elapsed = Some(time_elapsed);
+			match result {
+				Ok(effect) => {
+					app_state.status_error.clear();
+					app_state.status_msg = format!("Building plot from {}…", effect.source_cell);
+					return build_notebook_plot_task(effect, move |effect, kernel| {
+						Message::NotebookPlotReady {
+							identity,
+							presentation,
+							effect,
+							kernel,
+						}
+					});
+				}
+				Err(message) => {
+					app_state.status_error = format!("Error: {message}");
+					app_state.status_msg.clear();
+					if presentation.output == MarkdownCellOutputTarget::Inline {
+						app_state
+							.code_editor
+							.set_markdown_cell_error(identity, message);
+					}
+				}
+			}
+		}
+		Message::NotebookPlotReady {
+			identity,
+			presentation,
+			effect,
+			kernel,
+		} => {
+			match presentation.output {
+				MarkdownCellOutputTarget::Inline => app_state.code_editor.set_markdown_cell_plot(
+					identity,
+					effect.composition,
+					kernel,
+				),
+				MarkdownCellOutputTarget::Pane => {
+					app_state.code_editor.open_dashboard();
+					let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
+						pane: None,
+						composition: effect.composition,
+						kernel,
+					});
+				}
+				MarkdownCellOutputTarget::None => {}
+			}
+			app_state.status_error.clear();
+			app_state.status_msg = "Plot cell finished.".to_owned();
 		}
 		Message::Export(format) => {
 			return window::latest().and_then(move |id| {

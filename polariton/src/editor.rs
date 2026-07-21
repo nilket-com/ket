@@ -9,10 +9,12 @@ use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
 };
+use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotSettings, PlotWidget};
+use crate::plot::composition::PlotComposition;
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
-	Space, button, column, container, mouse_area, rich_text, row, span, stack, text,
+	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
@@ -29,7 +31,7 @@ use libaryon::uast::projection::{
 };
 use polars::frame::DataFrame;
 use std::collections::HashMap;
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, mpsc::Receiver};
 
 /// The single query-results surface. One stable identity reused for every run,
 /// so results replace in place instead of opening a pane per query.
@@ -82,6 +84,9 @@ pub enum EditorMsg {
 	/// native table/dashboard widgets may capture pointer events before the
 	/// workspace-wide mouse area sees them.
 	PaneDragStarted(libaryon::core::PaneId),
+	/// Cut 2 paints Rune plots with the existing kernel. Interactive plot
+	/// controls are wired in the following plot-surface cut.
+	NotebookPlot(crate::gui::messages::PlotMessage),
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -129,18 +134,26 @@ pub struct CodeEditor {
 	/// Output state belongs to the native notebook preview, keyed by the
 	/// engine-projected identity of its Markdown fence.
 	notebook_outputs: HashMap<MarkdownCellIdentity, NotebookCellOutput>,
+	/// Successful SQL results are execution state, not presentation state.
+	/// A cell with `output=none` must still be addressable by a later Rune cell.
+	notebook_cell_data: HashMap<MarkdownCellIdentity, Arc<DataFrame>>,
 }
 
 /// A runnable fenced SQL cell selected by the engine's cursor projection.
 pub struct MarkdownCellExecution {
 	pub identity: MarkdownCellIdentity,
 	pub presentation: MarkdownCellPresentation,
+	pub language_id: String,
 	pub code: String,
 }
 
 enum NotebookCellOutput {
 	Running,
 	Table(Box<DataFrame>),
+	Plot {
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	},
 	Failed(String),
 	Message(String),
 }
@@ -193,6 +206,7 @@ impl CodeEditor {
 			drag: None,
 			pane_drag: None,
 			notebook_outputs: HashMap::new(),
+			notebook_cell_data: HashMap::new(),
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		editor.send(EditorCommand::ReplaceDocument {
@@ -237,7 +251,7 @@ impl CodeEditor {
 		)
 	}
 
-	/// The SQL fence containing the focused source cursor, if that source has a
+	/// The executable fenced cell containing the focused source cursor, if that source has a
 	/// paired Markdown preview. The fence ranges and identities are projected by
 	/// libaryon; Polariton only slices the authoritative source bytes.
 	pub fn selected_markdown_cell(&self) -> Option<MarkdownCellExecution> {
@@ -263,7 +277,7 @@ impl CodeEditor {
 		let source = self.notebook_source(viewport)?;
 		let cursor = source.cursor_abs_byte;
 		let cell = source.markdown_cells.iter().find(|cell| {
-			cell.language_id == "sql"
+			matches!(cell.language_id.as_str(), "sql" | "rune")
 				&& cell.body_range.start <= cursor
 				&& cursor < cell.body_range.end
 		})?;
@@ -274,6 +288,7 @@ impl CodeEditor {
 		Some(MarkdownCellExecution {
 			identity: cell.identity.clone(),
 			presentation: cell.presentation,
+			language_id: cell.language_id.clone(),
 			code,
 		})
 	}
@@ -316,16 +331,28 @@ impl CodeEditor {
 	}
 
 	pub fn begin_markdown_cell(&mut self, identity: MarkdownCellIdentity) {
+		self.notebook_cell_data.remove(&identity);
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Running);
 	}
 
 	pub fn set_markdown_cell_table(&mut self, identity: MarkdownCellIdentity, frame: DataFrame) {
+		self.retain_markdown_cell_table(identity.clone(), &frame);
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Table(Box::new(frame)));
 	}
 
+	pub fn retain_markdown_cell_table(
+		&mut self,
+		identity: MarkdownCellIdentity,
+		frame: &DataFrame,
+	) {
+		self.notebook_cell_data
+			.insert(identity, Arc::new(frame.clone()));
+	}
+
 	pub fn set_markdown_cell_error(&mut self, identity: MarkdownCellIdentity, message: String) {
+		self.notebook_cell_data.remove(&identity);
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Failed(message));
 	}
@@ -333,6 +360,36 @@ impl CodeEditor {
 	pub fn set_markdown_cell_message(&mut self, identity: MarkdownCellIdentity, message: String) {
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Message(message));
+	}
+
+	pub fn set_markdown_cell_plot(
+		&mut self,
+		identity: MarkdownCellIdentity,
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	) {
+		self.notebook_outputs.insert(
+			identity,
+			NotebookCellOutput::Plot {
+				composition,
+				kernel,
+			},
+		);
+	}
+
+	/// Explicit SQL-cell snapshots available to a Rune notebook cell.
+	///
+	/// Values are owned `Arc`s, so the Rune VM never borrows editor state. An
+	/// unnamed SQL fence remains useful for presentation, but cannot be named
+	/// from Rune; that is precisely the purpose of `{#cell-name}`.
+	pub fn named_notebook_cell_data(&self) -> HashMap<String, Arc<DataFrame>> {
+		self.notebook_cell_data
+			.iter()
+			.filter_map(|(identity, frame)| match identity {
+				MarkdownCellIdentity::Explicit { id } => Some((id.clone(), frame.clone())),
+				MarkdownCellIdentity::Implicit { .. } => None,
+			})
+			.collect()
 	}
 
 	/// Announce that a query started: open the results panel on first run, and
@@ -507,14 +564,21 @@ impl CodeEditor {
 	}
 
 	fn reconcile_notebook_outputs(&mut self, viewport: &Viewport) {
-		let live = viewport
+		let preview_cells = viewport
 			.panes
 			.iter()
 			.filter_map(|pane| pane.markdown_preview.as_ref())
 			.flat_map(|preview| preview.cells.iter().map(|cell| cell.identity.clone()))
 			.collect::<std::collections::HashSet<_>>();
 		self.notebook_outputs
-			.retain(|identity, _| live.contains(identity));
+			.retain(|identity, _| preview_cells.contains(identity));
+		let source_cells = viewport
+			.panes
+			.iter()
+			.flat_map(|pane| pane.markdown_cells.iter().map(|cell| cell.identity.clone()))
+			.collect::<std::collections::HashSet<_>>();
+		self.notebook_cell_data
+			.retain(|identity, _| source_cells.contains(identity));
 	}
 
 	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
@@ -523,6 +587,13 @@ impl CodeEditor {
 		}
 		match message {
 			EditorMsg::Dashboard(_) => {}
+			EditorMsg::NotebookPlot(plot_message) => {
+				// The canvas emits the existing plot interaction vocabulary already.
+				// Cut 3 gives this preview-owned state (hover, zoom, settings) a
+				// durable home; for now retaining the message makes the surface
+				// explicit rather than pretending it is a static image.
+				let _ = plot_message;
+			}
 			EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char('v'),
 				modifiers,
@@ -1781,6 +1852,24 @@ fn markdown_cell_output_surface<'a>(
 		NotebookCellOutput::Table(frame) => Table::new(frame, 0)
 			.show_column_types(show_column_types)
 			.into(),
+		NotebookCellOutput::Plot {
+			composition,
+			kernel,
+		} => {
+			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget {
+				kernel: kernel.as_ref(),
+				title: composition.title(),
+				padding: 20.0,
+				settings: PlotSettings::default(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			})
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.into();
+			plot.map(EditorMsg::NotebookPlot)
+		}
 		NotebookCellOutput::Failed(message) => text(message)
 			.font(EDITOR_FONT)
 			.size(metrics::TEXT_SIZE)
@@ -3371,6 +3460,78 @@ mod tests {
 		assert_eq!(
 			preview.cells[1].presentation.code,
 			libaryon::uast::projection::MarkdownCellCodeVisibility::Hide
+		);
+	}
+
+	#[test]
+	fn rune_cells_dispatch_and_named_sql_results_ignore_presentation() {
+		let markdown = concat!(
+			"```sql {#trips, output=none}\n",
+			"select x, y from trips;\n",
+			"```\n\n",
+			"```rune {#trips-plot, output=inline, code=hide}\n",
+			"viz.plot(workspace.cell(\"trips\")?).scatter().line().show()?;\n",
+			"```\n",
+		);
+		let mut editor = notebook_with_preview(markdown);
+		let source = editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| editor.notebook_source(viewport))
+			.expect("Markdown source projection");
+		let sql = source
+			.markdown_cells
+			.iter()
+			.find(|cell| cell.language_id == "sql")
+			.expect("SQL cell");
+		let rune = source
+			.markdown_cells
+			.iter()
+			.find(|cell| cell.language_id == "rune")
+			.expect("Rune cell");
+		assert!(matches!(
+			sql.presentation.output,
+			libaryon::uast::projection::MarkdownCellOutputTarget::None
+		));
+		assert!(matches!(
+			rune.presentation.output,
+			libaryon::uast::projection::MarkdownCellOutputTarget::Inline
+		));
+		let sql_identity = sql.identity.clone();
+
+		let frame = polars::df!("x" => [1_i32], "y" => [2_i32]).expect("frame");
+		editor.retain_markdown_cell_table(sql_identity.clone(), &frame);
+		assert_eq!(
+			editor
+				.named_notebook_cell_data()
+				.get("trips")
+				.map(|snapshot| snapshot.height()),
+			Some(1),
+			"output=none controls presentation, not Rune data availability"
+		);
+		editor.begin_markdown_cell(sql_identity);
+		assert!(
+			editor.named_notebook_cell_data().get("trips").is_none(),
+			"rerunning a SQL cell retires its prior snapshot before Rune can read stale data"
+		);
+
+		// Ctrl+Enter dispatch resolves the language structurally from the
+		// engine-projected fence, never by re-parsing Markdown in Polariton.
+		send_keys(&mut editor, ['g', 'g', 'j', 'j', 'j', 'j', 'j']);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.markdown_cell_at_cursor()
+			.is_none_or(|cell| cell.language_id != "rune")
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(
+			editor
+				.markdown_cell_at_cursor()
+				.map(|cell| cell.language_id),
+			Some("rune".to_owned())
 		);
 	}
 

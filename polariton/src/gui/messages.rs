@@ -5,7 +5,9 @@ use crate::adapters::{
 };
 use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
+use crate::notebook_rune::PlotEffect;
 use crate::persistence::{PrivateDb, SavedConnection, SavedStatement};
+use crate::plot::common::PlotKernel;
 use iced::window;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -74,6 +76,17 @@ pub enum Message {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
 		result: ExecutionResult,
+	},
+	RunRuneCellResult {
+		identity: libaryon::uast::projection::MarkdownCellIdentity,
+		presentation: libaryon::uast::projection::MarkdownCellPresentation,
+		result: std::result::Result<PlotEffect, String>,
+	},
+	NotebookPlotReady {
+		identity: libaryon::uast::projection::MarkdownCellIdentity,
+		presentation: libaryon::uast::projection::MarkdownCellPresentation,
+		effect: PlotEffect,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
 	SaveConnection,
 	SaveStatement,

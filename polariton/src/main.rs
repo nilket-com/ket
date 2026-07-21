@@ -3,8 +3,6 @@ mod core;
 mod editor;
 mod fonts;
 mod gui;
-// Cut 1 is a headless capability surface. Markdown dispatch wires it in next.
-#[allow(dead_code)]
 mod notebook_rune;
 mod persistence;
 mod plot;

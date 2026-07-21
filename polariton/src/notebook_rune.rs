@@ -115,6 +115,21 @@ pub fn execute(
 	result.map(|_| effects)
 }
 
+/// Execute the body of a fenced notebook Rune cell.
+///
+/// Notebook authors write the useful part — `viz.plot(...).show()?;` — rather
+/// than ceremony around a VM entry point. The explicit [`execute`] entry point
+/// remains available for unit tests and future multi-function modules.
+pub fn execute_cell(
+	source: &str,
+	cells: HashMap<String, Arc<DataFrame>>,
+) -> Result<Vec<PlotEffect>, String> {
+	execute(
+		&format!("pub fn main(workspace, viz) {{\n{source}\n}}\n"),
+		cells,
+	)
+}
+
 fn decode_cell_return(value: Value) -> Result<(), String> {
 	let original = value.clone();
 	match value.downcast::<Result<Value, Value>>() {
@@ -251,5 +266,19 @@ mod tests {
 		)
 		.expect_err("missing cell is a script error");
 		assert!(error.contains("Unknown notebook cell: missing"));
+	}
+
+	#[test]
+	fn fenced_cell_body_needs_no_main_boilerplate() {
+		let data = Arc::new(df!("x" => [1_i32], "y" => [2_i32]).expect("frame"));
+		let effects = execute_cell(
+			r#"
+let trips = workspace.cell("trips")?;
+viz.plot(trips).scatter().line().show()?;
+"#,
+			HashMap::from([("trips".to_owned(), data)]),
+		)
+		.expect("direct fenced cell body executes");
+		assert_eq!(effects.len(), 1);
 	}
 }
