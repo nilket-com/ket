@@ -1860,6 +1860,17 @@ fn markdown_preview_surface<'a>(
 					.size(22)
 					.color(color(palette.editor_text))
 					.into()
+			} else if is_markdown_thematic_break(content) {
+				container(Space::new().height(Length::Fixed(1.0)))
+					.width(Length::Fill)
+					.style(move |_| container::Style {
+						background: Some(Background::Color(Color {
+							a: 0.35,
+							..color(palette.editor_text)
+						})),
+						..Default::default()
+					})
+					.into()
 			} else if content.is_empty() {
 				Space::new()
 					.height(Length::Fixed(metrics::LINE_HEIGHT / 2.0))
@@ -1881,6 +1892,18 @@ fn markdown_preview_surface<'a>(
 		.width(Length::Fill)
 		.height(Length::Fill)
 		.into()
+}
+
+/// Markdown's thematic-break syntax: at least three matching `-`, `_`, or
+/// `*` characters, with optional whitespace between them.
+fn is_markdown_thematic_break(line: &str) -> bool {
+	let marks: Vec<char> = line
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect();
+	matches!(marks.as_slice(), [first, rest @ ..] if marks.len() >= 3
+		&& matches!(first, '-' | '_' | '*')
+		&& rest.iter().all(|character| character == first))
 }
 
 fn markdown_cell_output_surface<'a>(
@@ -2264,7 +2287,7 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
-		SplitDirection, markdown_code_fragments, metrics,
+		SplitDirection, is_markdown_thematic_break, markdown_code_fragments, metrics,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -2284,6 +2307,16 @@ mod tests {
 				code: KeyCode::Char(key),
 				modifiers: Modifiers::NONE,
 			}));
+		}
+	}
+
+	#[test]
+	fn markdown_thematic_breaks_accept_standard_markers() {
+		for line in ["---", "***", "___", "- - -", " *  * * "] {
+			assert!(is_markdown_thematic_break(line), "{line:?}");
+		}
+		for line in ["--", "--- text", "-_*", "```"] {
+			assert!(!is_markdown_thematic_break(line), "{line:?}");
 		}
 	}
 
