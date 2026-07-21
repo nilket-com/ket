@@ -5,7 +5,6 @@ use crate::adapters::{
 };
 use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
-use crate::gui::pane_grid::Action;
 use crate::persistence::{PrivateDb, SavedConnection, SavedStatement};
 use iced::window;
 use std::sync::Arc;
@@ -61,7 +60,6 @@ pub enum Message {
 	MinimizeWindow,
 	OpenSaveStatementDialog,
 	OpenSettings,
-	PaneAction(Action),
 	PasswordDecryptFailed,
 	PasswordEntryChanged(String),
 	PasswordEntrySubmit,

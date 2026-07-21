@@ -5,7 +5,6 @@ use crate::adapters::{
 use crate::editor::CodeEditor;
 use crate::gui::dashboard::DashboardState;
 use crate::gui::messages::Message;
-use crate::gui::pane_grid::{PaneGrid, PaneId, State as PaneState};
 use crate::gui::{
 	colors,
 	menu::{MenuBar, MenuFontPolicy, MenuItem, MenuRoot, MenuState},
@@ -22,14 +21,8 @@ use iced::{
 	window::Direction,
 	Alignment, Background, Center, Color, Element, Fill, FillPortion, Font, Length,
 };
-use std::collections::HashMap;
 
 pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneType {
-	CodeEditor,
-}
 
 pub fn theme() -> Theme {
 	Theme::custom(
@@ -158,8 +151,6 @@ pub fn title_bar<'a>() -> Element<'a, Message> {
 }
 
 pub fn main_screen<'a>(
-	panes: &'a PaneState,
-	pane_content: &'a HashMap<PaneId, PaneType>,
 	dashboard: &'a DashboardState,
 	menu_state: &'a MenuState,
 	code_editor: &'a CodeEditor,
@@ -183,32 +174,20 @@ pub fn main_screen<'a>(
 	save_statement_name: &'a str,
 	editing_statement_id: Option<i64>,
 ) -> Element<'a, Message> {
-	let content: Vec<(PaneId, Element<'a, Message>)> = panes
-		.panes()
-		.iter()
-		.filter_map(|&id| {
-			let pane_type = pane_content.get(&id)?;
-			let element: Element<'a, Message> = match pane_type {
-				PaneType::CodeEditor => center(
-					container(code_editor.view(dashboard).map(Message::CodeEditEvent))
-						.padding(1)
-						.style(|_| container::Style {
-							border: border::Border {
-								color: colors::BORDER_PRIMARY,
-								width: 1.0,
-								radius: 5.0.into(),
-							},
-							..Default::default()
-						}),
-				)
-				.into(),
-			};
-			Some((id, element))
-		})
-		.collect();
-	let main_pane: Element<'a, Message> =
-		PaneGrid::new(panes, content, Message::PaneAction).into();
-	let main_content = container(main_pane).padding(4).width(Fill);
+	// Baryon's workspace is the sole top-level layout owner. The nested
+	// dashboard still owns its own pixel-space grid inside its host panel.
+	let main_content = container(code_editor.view(dashboard).map(Message::CodeEditEvent))
+		.padding(4)
+		.width(Fill)
+		.height(Fill)
+		.style(|_| container::Style {
+			border: border::Border {
+				color: colors::BORDER_PRIMARY,
+				width: 1.0,
+				radius: 5.0.into(),
+			},
+			..Default::default()
+		});
 	let status_bar = app_status_bar(
 		status_msg,
 		status_error,

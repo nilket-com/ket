@@ -388,7 +388,7 @@ impl CodeEditor {
 	}
 
 	/// Translate the code pane's pixel size into the engine's cell grid.
-	/// Callers pass the actual pane rectangle (see `sync_code_editor_viewport`).
+	/// Callers pass the actual workspace rectangle (see `sync_workspace_viewport`).
 	pub fn resize(&self, width: f32, height: f32) {
 		let columns = (width / metrics::CELL_WIDTH)
 			.floor()

@@ -5,7 +5,7 @@ use crate::adapters::{
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 use crate::gui::{
-	components::{self, PaneType},
+	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
 	menu::MenuState,
 	messages::{ExportFormat, Message},
@@ -17,12 +17,9 @@ use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use polars::frame::DataFrame;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 struct AppState {
-	panes: PaneState,
-	pane_content: HashMap<PaneId, PaneType>,
 	dashboard: DashboardState,
 	menu_state: MenuState,
 	code_editor: CodeEditor,
@@ -173,17 +170,11 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		.map(|(width, height)| Size::new(width, height))
 		.unwrap_or(Size::new(1920.0, 1080.0));
 	let data_frame = DataFrame::default();
-	let (panes, editor_pane) = PaneState::with_initial_pane();
-	let mut pane_content = HashMap::new();
-	pane_content.insert(editor_pane, PaneType::CodeEditor);
-
 	let mut code_editor = CodeEditor::new("");
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let is_password_protected = startup_data.is_password_protected;
 	let salt = startup_data.salt.clone();
 	let mut state = AppState {
-		panes,
-		pane_content,
 		dashboard: DashboardState::default(),
 		menu_state: MenuState::default(),
 		code_editor,
@@ -214,7 +205,7 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		show_column_types: startup_data.show_column_types,
 		window_size,
 	};
-	sync_code_editor_viewport(&mut state);
+	sync_workspace_viewport(&mut state);
 	let task = if !is_password_protected {
 		Task::perform(
 			async move { persistence::PrivateDb::open(&salt, "").await },
@@ -231,8 +222,6 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 
 fn view(app_state: &AppState) -> Element<'_, Message> {
 	components::main_screen(
-		&app_state.panes,
-		&app_state.pane_content,
 		&app_state.dashboard,
 		&app_state.menu_state,
 		&app_state.code_editor,
@@ -352,7 +341,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::CodeEditResize(size) => {
 			app_state.window_size = size;
-			sync_code_editor_viewport(app_state);
+			sync_workspace_viewport(app_state);
 		}
 		Message::MaximizeWindow => {
 			app_state.is_maximized = !app_state.is_maximized;
@@ -364,10 +353,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::ResizeWindow(direction) => {
 			return window::latest().and_then(move |id| window::drag_resize(id, direction));
-		}
-		Message::PaneAction(action) => {
-			app_state.panes.apply(action);
-			sync_code_editor_viewport(app_state);
 		}
 		Message::Connect => match app_state.adapter_state.stage {
 			AdapterStage::None => {
@@ -530,7 +515,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::ExportWithWindowSize(format, window_size) => {
 			if app_state.dashboard.panes.is_some() {
 				let size = window_size.unwrap_or(Size::new(1920.0, 1080.0));
-				let main_grid_bounds = main_grid_bounds(size);
+				let workspace_bounds = workspace_bounds(size);
 				let dashboard_pane_bounds = app_state
 					.code_editor
 					.dashboard_bounds()
@@ -540,7 +525,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						width: rect.width,
 						height: rect.height,
 					})
-					.unwrap_or(main_grid_bounds);
+					.unwrap_or(workspace_bounds);
 				let dashboard = app_state.dashboard.panes.as_ref().unwrap();
 				let mut export_jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
 				for (id, rect) in get_pane_rects(dashboard, dashboard_pane_bounds) {
@@ -979,10 +964,10 @@ fn get_pane_rects(state: &PaneState, bounds: iced::Rectangle) -> Vec<(PaneId, ic
 	get_node_rects(state, root, bounds)
 }
 
-/// The window rectangle occupied by the outer pane grid: the window minus the
-/// menu/toolbar chrome above and the status bar below. Shared by dashboard
-/// export hit-testing and editor viewport sizing so the two cannot drift.
-fn main_grid_bounds(size: Size) -> iced::Rectangle {
+/// The window rectangle occupied by Baryon's workspace: the window minus the
+/// application chrome and status bar. Shared by dashboard export hit-testing
+/// and editor viewport sizing so the two cannot drift.
+fn workspace_bounds(size: Size) -> iced::Rectangle {
 	iced::Rectangle {
 		x: 10.0,
 		y: 71.0,
@@ -991,16 +976,11 @@ fn main_grid_bounds(size: Size) -> iced::Rectangle {
 	}
 }
 
-/// Keep libaryon's terminal-cell viewport aligned with the actual Polariton
-/// code pane, including outer pane-grid splitter changes.
-fn sync_code_editor_viewport(app_state: &mut AppState) {
-	let bounds = main_grid_bounds(app_state.window_size);
-	if let Some((_, pane)) = get_pane_rects(&app_state.panes, bounds)
-		.into_iter()
-		.find(|(id, _)| app_state.pane_content.get(id) == Some(&PaneType::CodeEditor))
-	{
-		app_state.code_editor.resize(pane.width, pane.height);
-	}
+/// Keep libaryon's terminal-cell viewport aligned with its direct workspace
+/// surface. There is no Polariton-owned outer split layout to reconcile.
+fn sync_workspace_viewport(app_state: &mut AppState) {
+	let bounds = workspace_bounds(app_state.window_size);
+	app_state.code_editor.resize(bounds.width, bounds.height);
 }
 
 fn get_node_rects(
