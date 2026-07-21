@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::core::DocByte;
@@ -6,6 +7,17 @@ use crate::svp::markdown_highlight::highlight_markdown;
 use crate::svp::rust_highlight::HighlightSpan;
 
 pub struct MarkdownProvider;
+
+/// One complete fenced block in a Markdown document. Attributes are parsed
+/// once here and reused by highlighting, preview projection, and later cell
+/// execution; consumers must not each invent their own fence parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FencedCodeBlock {
+	pub(crate) language_id: String,
+	pub(crate) body_range: Range<usize>,
+	pub(crate) explicit_id: Option<String>,
+	pub(crate) occurrence: u32,
+}
 
 impl LanguageProvider for MarkdownProvider {
 	fn language_id(&self) -> &'static str {
@@ -48,14 +60,13 @@ impl LanguageProvider for MarkdownProvider {
 	}
 }
 
-/// Parse fenced code bodies without interpreting their contents. Fence info is
-/// intentionally structured as `language` plus ignored trailing attributes,
-/// so `sql {#trips}` works today and gives notebook cell identity a compatible
-/// home later.
-pub(crate) fn fenced_code_injections(source: &str) -> Vec<LanguageInjection> {
-	let mut injections = Vec::new();
+/// Parse fenced code blocks without interpreting their contents. The info
+/// string is structured as `language` followed by attributes; `{#trips}` is
+/// retained as an explicit cell identity while unknown attributes remain inert.
+pub(crate) fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
+	let mut blocks = Vec::new();
 	let mut offset = 0usize;
-	let mut open: Option<(u8, usize, String, usize)> = None;
+	let mut open: Option<(u8, usize, String, Option<String>, usize)> = None;
 	for line in source.split_inclusive('\n') {
 		let line_start = offset;
 		offset = offset.saturating_add(line.len());
@@ -69,25 +80,52 @@ pub(crate) fn fenced_code_injections(source: &str) -> Vec<LanguageInjection> {
 			continue;
 		}
 		let marker = marker.expect("count proves marker");
-		if let Some((open_marker, open_count, language_id, body_start)) = open.take() {
+		if let Some((open_marker, open_count, language_id, explicit_id, body_start)) = open.take() {
 			if marker == open_marker && count >= open_count {
-				injections.push(LanguageInjection {
+				blocks.push(FencedCodeBlock {
 					language_id,
-					range: body_start..line_start,
+					body_range: body_start..line_start,
+					explicit_id,
+					occurrence: blocks.len() as u32,
 				});
 			} else {
-				open = Some((open_marker, open_count, language_id, body_start));
+				open = Some((
+					open_marker,
+					open_count,
+					language_id,
+					explicit_id,
+					body_start,
+				));
 			}
 			continue;
 		}
 
 		let info = trimmed[count..].trim();
-		let Some(language_id) = info.split_whitespace().next().filter(|id| !id.is_empty()) else {
+		let mut fields = info.split_whitespace();
+		let Some(language_id) = fields.next().filter(|id| !id.is_empty()) else {
 			continue;
 		};
-		open = Some((marker, count, language_id.to_owned(), offset));
+		let explicit_id = fields.find_map(|attribute| {
+			attribute
+				.strip_prefix("{#")
+				.and_then(|id| id.strip_suffix('}'))
+				.filter(|id| !id.is_empty())
+				.map(str::to_owned)
+		});
+		open = Some((marker, count, language_id.to_owned(), explicit_id, offset));
 	}
-	injections
+	blocks
+}
+
+/// Adapt structured fenced blocks to the generic language-injection contract.
+pub(crate) fn fenced_code_injections(source: &str) -> Vec<LanguageInjection> {
+	fenced_code_blocks(source)
+		.into_iter()
+		.map(|block| LanguageInjection {
+			language_id: block.language_id,
+			range: block.body_range,
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -139,10 +177,24 @@ mod tests {
 
 	#[test]
 	fn fenced_blocks_expose_language_and_body_byte_range() {
-		let source = "# Query\n\n```sql {#trips}\nselect 42;\n```\n";
+		let source = "# Query\n\n```sql {#trips} {.wide}\nselect 42;\n```\n\n```rune\n1 + 1\n```\n";
+		let blocks = fenced_code_blocks(source);
+		assert_eq!(blocks.len(), 2);
+		assert_eq!(blocks[0].language_id, "sql");
+		assert_eq!(blocks[0].explicit_id.as_deref(), Some("trips"));
+		assert_eq!(blocks[0].occurrence, 0);
+		assert_eq!(&source[blocks[0].body_range.clone()], "select 42;\n");
+		assert_eq!(blocks[1].language_id, "rune");
+		assert_eq!(blocks[1].explicit_id, None);
+		assert_eq!(blocks[1].occurrence, 1);
+
 		let injections = fenced_code_injections(source);
-		assert_eq!(injections.len(), 1);
-		assert_eq!(injections[0].language_id, "sql");
-		assert_eq!(&source[injections[0].range.clone()], "select 42;\n");
+		assert_eq!(
+			injections
+				.iter()
+				.map(|injection| injection.language_id.as_str())
+				.collect::<Vec<_>>(),
+			vec!["sql", "rune"]
+		);
 	}
 }

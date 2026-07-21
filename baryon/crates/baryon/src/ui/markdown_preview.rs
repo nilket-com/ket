@@ -3249,6 +3249,7 @@ mod tests {
 			source_text: "# Title\n\n- item\n\n```rust\nfn main() {}\n```\n".to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3276,6 +3277,7 @@ mod tests {
 			source_text: "Alpha needle omega\n\n- another NEEDLE\n".to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3349,6 +3351,7 @@ mod tests {
 			source_text: "plain body text\n".to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3489,6 +3492,7 @@ mod tests {
 			source_text: String::new(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 3,
 		};
@@ -3579,6 +3583,7 @@ mod tests {
 				.to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3607,6 +3612,7 @@ mod tests {
 			source_text: "plain body text\n".to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
@@ -3643,6 +3649,7 @@ mod tests {
 			source_text: "- item `code`\n1. next\n".to_string(),
 			code_highlights: Vec::new(),
 			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};

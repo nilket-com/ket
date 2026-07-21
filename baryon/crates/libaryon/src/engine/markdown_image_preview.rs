@@ -11,10 +11,13 @@ use super::session::{
 	MarkdownPreviewEditorMut, View, text_editor, with_markdown_preview_buffer_mut,
 	with_text_buffer_mut,
 };
-use crate::core::{BufferId, DisplayRow, DocLine, PaneId, Rgb, StateId, ViewId};
+use crate::core::{BufferId, DisplayRow, DocByte, DocLine, PaneId, Rgb, StateId, ViewId};
 use crate::ecs::UastRegistry;
+use crate::svp::markdown_provider::fenced_code_blocks;
 use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
-use crate::uast::projection::MarkdownPreviewSnapshot;
+use crate::uast::projection::{
+	MarkdownCellIdentity, MarkdownCellSnapshot, MarkdownPreviewSnapshot,
+};
 use std::path::Path;
 
 struct MarkdownSourceSnapshot {
@@ -26,6 +29,7 @@ struct MarkdownSourceSnapshot {
 	highlights: Vec<HighlightSpan>,
 	theme_colors: [Option<Rgb>; CATEGORY_COUNT],
 	semantic_revision: u64,
+	cells: Vec<MarkdownCellSnapshot>,
 	scroll_line: DocLine,
 	viewport_line_count: u32,
 }
@@ -124,6 +128,7 @@ pub(crate) fn open_static_markdown_preview(
 				&mut session.layout,
 				view_id,
 				|preview| {
+					preview.document.state.source_cells = markdown_cells(&markdown);
 					preview.document.state.source_text = markdown;
 					preview.document.state.source_scroll_line = DocLine::ZERO;
 					preview.view.scroll_y = 0;
@@ -155,6 +160,7 @@ pub(crate) fn open_static_markdown_preview(
 			view.common().viewport_lines,
 		)
 	};
+	let cells = markdown_cells(&markdown);
 	let source = MarkdownSourceSnapshot {
 		buffer_id: source_buffer_id,
 		view_id: source_view_id,
@@ -164,6 +170,7 @@ pub(crate) fn open_static_markdown_preview(
 		highlights: Vec::new(),
 		theme_colors: [None; CATEGORY_COUNT],
 		semantic_revision: 0,
+		cells,
 		scroll_line: DocLine::ZERO,
 		viewport_line_count,
 	};
@@ -444,6 +451,7 @@ pub(crate) fn markdown_image_preview_snapshot(
 		source_text: state.source_text.clone(),
 		code_highlights: state.source_highlights.clone(),
 		theme_colors: state.source_theme_colors,
+		cells: state.source_cells.clone(),
 		source_scroll_line: state.source_scroll_line,
 		source_viewport_line_count: state.source_viewport_line_count,
 	}
@@ -477,6 +485,7 @@ fn create_markdown_preview_view(
 				source_highlights: source.highlights.clone(),
 				source_theme_colors: source.theme_colors,
 				source_semantic_revision: source.semantic_revision,
+				source_cells: source.cells.clone(),
 				source_scroll_line: source.scroll_line,
 				source_viewport_line_count: source.viewport_line_count,
 				pinned,
@@ -523,6 +532,7 @@ fn markdown_source_snapshot(
 		tab.document.backing_path.as_deref().map(Path::new),
 	)?;
 	let text = String::from_utf8_lossy(&bytes).into_owned();
+	let cells = markdown_cells(&text);
 	Ok(MarkdownSourceSnapshot {
 		buffer_id: buffer.id,
 		view_id: source_view_id,
@@ -532,6 +542,7 @@ fn markdown_source_snapshot(
 		highlights: tab.document.semantic.highlights.clone(),
 		theme_colors: tab.view.current_theme.syntax_colors,
 		semantic_revision: tab.document.semantic.view_revision,
+		cells,
 		scroll_line: DocLine::new(tab.view.scroll_y),
 		viewport_line_count: tab.view.viewport_lines,
 	})
@@ -549,11 +560,34 @@ fn update_markdown_image_preview(
 	state.source_highlights = source.highlights.clone();
 	state.source_theme_colors = source.theme_colors;
 	state.source_semantic_revision = source.semantic_revision;
+	state.source_cells = source.cells.clone();
 	state.source_scroll_line = source.scroll_line;
 	state.source_viewport_line_count = source.viewport_line_count;
 	tab.document.title = preview_title(source.path.as_deref());
 	tab.view.scroll_y = source.scroll_line.get();
 	tab.view.scroll_row_offset = DisplayRow::ZERO;
+}
+
+fn markdown_cells(source: &str) -> Vec<MarkdownCellSnapshot> {
+	fenced_code_blocks(source)
+		.into_iter()
+		.map(|block| {
+			let body_range = DocByte::new(block.body_range.start as u64)
+				..DocByte::new(block.body_range.end as u64);
+			let identity = match block.explicit_id {
+				Some(id) => MarkdownCellIdentity::Explicit { id },
+				None => MarkdownCellIdentity::Implicit {
+					occurrence: block.occurrence,
+					body_range: body_range.clone(),
+				},
+			};
+			MarkdownCellSnapshot {
+				language_id: block.language_id,
+				body_range,
+				identity,
+			}
+		})
+		.collect()
 }
 
 fn rebuild_markdown_image_preview_error(tab: &mut MarkdownPreviewEditorMut<'_>, error: &str) {

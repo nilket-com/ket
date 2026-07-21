@@ -4527,6 +4527,17 @@ mod tests {
 		assert!(snapshot.source_text.contains("# Title"));
 		assert!(snapshot.source_text.contains("- [x] done"));
 		assert!(snapshot.source_text.contains("fn main() {}"));
+		assert_eq!(snapshot.cells.len(), 1);
+		assert_eq!(snapshot.cells[0].language_id, "rust");
+		assert!(matches!(
+			snapshot.cells[0].identity,
+			crate::uast::projection::MarkdownCellIdentity::Implicit { occurrence: 0, .. }
+		));
+		assert_eq!(
+			&snapshot.source_text[snapshot.cells[0].body_range.start.get() as usize
+				..snapshot.cells[0].body_range.end.get() as usize],
+			"fn main() {}\n"
+		);
 		assert!(opened.view(snapshot.source_view_id).is_some());
 
 		let serif = send_cmd_and_recv(

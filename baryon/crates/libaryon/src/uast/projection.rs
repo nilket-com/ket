@@ -13,6 +13,7 @@ use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
 pub use crate::uast::root_line_index::RootChildLineIndex;
 use crate::uast::root_line_index::{KnownLineMetric, RootChildLineIndexEntry};
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
@@ -139,6 +140,27 @@ pub struct DiffPair {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MarkdownCellIdentity {
+	/// Free, session-local identity for an ordinary fence. Moving text above the
+	/// fence changes its range, deliberately: durable references require an
+	/// explicit id instead.
+	Implicit {
+		occurrence: u32,
+		body_range: Range<DocByte>,
+	},
+	/// A user-authored `{#name}` attribute. This is the stable handle Rune and
+	/// durable output association will use once those features arrive.
+	Explicit { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownCellSnapshot {
+	pub language_id: String,
+	pub body_range: Range<DocByte>,
+	pub identity: MarkdownCellIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownPreviewSnapshot {
 	pub source_buffer_id: BufferId,
 	pub source_view_id: ViewId,
@@ -149,6 +171,9 @@ pub struct MarkdownPreviewSnapshot {
 	/// `theme_colors`, exactly as they do for text-pane highlighting.
 	pub code_highlights: Vec<HighlightSpan>,
 	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],
+	/// Fenced executable-shaped blocks, parsed structurally by libaryon. The
+	/// frontend receives identities and ranges but never reparses Markdown.
+	pub cells: Vec<MarkdownCellSnapshot>,
 	pub source_scroll_line: DocLine,
 	pub source_viewport_line_count: u32,
 }

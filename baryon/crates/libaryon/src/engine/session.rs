@@ -77,6 +77,7 @@ pub(crate) struct MarkdownImagePreviewState {
 	pub(crate) source_theme_colors:
 		[Option<crate::core::Rgb>; crate::svp::rust_highlight::CATEGORY_COUNT],
 	pub(crate) source_semantic_revision: u64,
+	pub(crate) source_cells: Vec<crate::uast::projection::MarkdownCellSnapshot>,
 	pub(crate) source_scroll_line: DocLine,
 	pub(crate) source_viewport_line_count: u32,
 	/// A pinned preview renders a fixed in-memory document (e.g. :help): it is
