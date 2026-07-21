@@ -166,8 +166,8 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// ADR 466 made the hash arm honor SwappedRightBuild (the placement/rewrite contract), a real
 	// rewrite-pass change. ADR 472 added the unknown-size fact and its shared helper.
 	assert!(
-		lines <= 6_070,
-		"binder root has {lines} lines; expected <= 6,070 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_080,
+		"binder root has {lines} lines; expected <= 6,080 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

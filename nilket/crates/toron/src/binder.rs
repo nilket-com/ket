@@ -176,6 +176,13 @@ pub struct PlannerConfig {
 	/// (472) left three engaged cells, all material wins (+17.7%/+34.6%/+23.1%),
 	/// and no regression. Retained as an operator off-switch.
 	pub hash_smaller_build_placement: bool,
+	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
+	/// the binder may admit a local no-exchange inner join. Default **false**
+	/// (conservative): only an execution entry that knows the plan will not be
+	/// fragmented sets it true. The distributed coordinator leaves it false, and the
+	/// fragmenter's `JoinInputNotExchanged` is the loud-fail backstop. No reader yet —
+	/// this increment only establishes the provability signal.
+	pub single_partition_execution: bool,
 }
 
 impl Default for PlannerConfig {
@@ -189,6 +196,7 @@ impl Default for PlannerConfig {
 			runtime_evidence: Arc::new(OptimizerRuntimeEvidence::local_only()),
 			measured_accrual_sample_rate: 0,
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
+			single_partition_execution: false,
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,
