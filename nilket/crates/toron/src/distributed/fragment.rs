@@ -2110,6 +2110,24 @@ mod tests {
 	}
 
 	#[test]
+	fn adr489_multiworker_fragmenter_rejects_a_local_hash_shape_loudly() {
+		// ADR 489's local form deliberately has no terminal exchanges. It is valid only
+		// for a direct single-partition executor; a distributed fragment must refuse it
+		// rather than silently running each worker's local subset of the join.
+		let plan = join_plan(
+			scan_plan_with_table(TableId(1), 1),
+			scan_plan_with_table(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		);
+
+		assert_eq!(
+			fragment_plan(plan, config().with_worker_count(3))
+				.expect_err("a local hash join must never survive multi-worker fragmentation"),
+			FragmentError::JoinInputNotExchanged
+		);
+	}
+
+	#[test]
 	fn hash_join_runtime_filter_disabled_preserves_parallel_producers() {
 		let plan = join_plan(
 			exchanged_scan(TableId(1), 2),

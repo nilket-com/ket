@@ -233,7 +233,11 @@ pub(crate) fn adr179_explain_analyze_is_implemented_not_rejected() {
 	assert!(lower_explain.contains("LogicalPlan::ExplainAnalyze"));
 	assert!(!planner.contains("EXPLAIN ANALYZE is not supported"));
 	assert!(local.contains("bind_explain_analyze(input, catalog, &self.config).await?"));
-	assert!(distributed.contains("bind_explain_analyze(input, catalog, planner_config).await?"));
+	assert!(
+		distributed
+			.contains("let planner_config = distributed_planner_config(planner_config.clone());")
+	);
+	assert!(distributed.contains("bind_explain_analyze(input, catalog, &planner_config).await?"));
 	assert!(exec.contains("unbound EXPLAIN ANALYZE execution"));
 }
 

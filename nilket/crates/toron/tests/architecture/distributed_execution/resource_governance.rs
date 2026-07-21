@@ -127,7 +127,11 @@ pub(crate) fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
 
 	assert!(execute_query.contains("let admitted = self.admit_query(&context).await?;"));
 	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget,"));
-	assert!(helper.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(
+		helper.contains("let planner_config = distributed_planner_config(self.config.clone());"),
+		"distributed admission derives its binding config after admission"
+	);
+	assert!(helper.contains("bind(plan, catalog.as_ref(), &planner_config).await?"));
 }
 
 #[test]

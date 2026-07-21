@@ -702,7 +702,8 @@ where
 		active_query: Option<ActiveQueryHandle>,
 		planner_config: &PlannerConfig,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let binding = bind_explain_analyze(input, catalog, planner_config).await?;
+		let planner_config = distributed_planner_config(planner_config.clone());
+		let binding = bind_explain_analyze(input, catalog, &planner_config).await?;
 		let context = context
 			.clone()
 			.with_join_runtime_observation_mode(analyze_observation_mode(
@@ -730,6 +731,7 @@ where
 		query_budget: QueryBudget,
 		active_query: Option<ActiveQueryHandle>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		let planner_config = distributed_planner_config(self.config.clone());
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
 		if let LogicalPlan::ExplainAnalyze { input } = plan {
 			return self
@@ -739,7 +741,7 @@ where
 					&context,
 					query_budget,
 					active_query,
-					&self.config,
+					&planner_config,
 				)
 				.await;
 		}
@@ -749,12 +751,12 @@ where
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
 			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
 				.await;
 		}
 		if matches!(plan, LogicalPlan::Insert { .. }) {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -783,7 +785,7 @@ where
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -806,7 +808,7 @@ where
 			return result;
 		}
 
-		let mut planner_config = self.config.clone();
+		let mut planner_config = planner_config;
 		let mut retried_broadcast_replay = false;
 		let mut fragment_id_namespace = 0;
 		let mut retried_descriptor_evolution = false;
@@ -887,6 +889,7 @@ where
 		active_query: Option<ActiveQueryHandle>,
 		planner_config: PlannerConfig,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		let planner_config = distributed_planner_config(planner_config);
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
 		if let LogicalPlan::ExplainAnalyze { input } = plan {
 			return self
@@ -1242,7 +1245,10 @@ where
 	Registry: WorkerRegistry + ?Sized + 'static,
 	Transport: ToronTransport + ?Sized + 'static,
 {
-	let mut config = config;
+	// ADR 489: this entry always fragments the bound plan. A caller may tune planner
+	// policy here, but it may not assert the local-only admission signal across the
+	// distributed boundary.
+	let mut config = distributed_planner_config(config);
 	let measure_runtime_verdict = should_measure_runtime_verdict(
 		config.measured_accrual_sample_rate,
 		&config.measured_accrual_counter,
@@ -1352,6 +1358,14 @@ where
 			}
 		}
 	}
+}
+
+/// The distributed coordinator is never evidence that a join will execute in one
+/// partition. Keep the local-only admission signal false even for callers that supply
+/// an otherwise-custom planner configuration.
+fn distributed_planner_config(mut config: PlannerConfig) -> PlannerConfig {
+	config.single_partition_execution = false;
+	config
 }
 
 fn spawn_remote_cancel_fanout_task<Transport>(
@@ -2547,6 +2561,24 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn adr489_distributed_planner_config_refuses_local_only_admission() {
+		let config = PlannerConfig {
+			single_partition_execution: true,
+			..PlannerConfig::default()
+		};
+
+		assert!(
+			config.single_partition_execution,
+			"fixture arms the local-only signal"
+		);
+		assert!(
+			!distributed_planner_config(config).single_partition_execution,
+			"the distributed entry must clear the local-only signal before binding"
+		);
+	}
+
 	use crate::catalog::{DescriptorRefreshMetrics, MockCatalog, TableBinding, TableRef};
 	use crate::distributed::budget::{BudgetDimension, ByteCount, DurationMillis, TenantBudget};
 	use crate::distributed::identity::{

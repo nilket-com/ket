@@ -1240,7 +1240,7 @@ pub(crate) fn adr139_mutation_paths_return_before_broadcast_replay() {
 	let coordinator = coordinator_source();
 	let execute = source_block(&coordinator, "async fn execute_query_with_admission");
 	let replay_state = execute
-		.find("let mut planner_config = self.config.clone()")
+		.find("let mut planner_config = planner_config")
 		.expect("broadcast replay state in read path");
 
 	assert!(execute[..replay_state].contains("LogicalPlan::Insert { .. }"));
