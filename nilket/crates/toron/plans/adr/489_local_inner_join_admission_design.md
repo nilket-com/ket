@@ -40,18 +40,36 @@ local only in a context the caller proves non-distributed.
 Layers 2-3 are what make this safe: the wrong-answer path (local join executed
 distributed) is impossible to reach silently — it errors at the fragmenter.
 
-## The representation question (for the code increment)
+## The representation decision (grounded during the first implementation increment)
 
-The local shape must pass **both** `validate_strategy_shape` and the fragmenter's
-exchanged-input contract as a *legitimately non-exchanged* inner join — today both
-reject a `HashPartitioned` join without exchanges (ADR 486 probe 2). Options, decided
-in the code cut with the JoinKind-variant-guard-checklist in view:
-- A minimal marker on the existing `Join` (e.g. a `local: bool` / partition_count=0
-  sentinel) that both the validator and fragmenter accept as non-exchanged-by-design,
-  routing to `execute_hash_join`'s in-memory path.
-- A new `JoinStrategy::LocalHash` variant (cleaner semantics, but trips ~6
-  source-scanning guards and needs fragmenter handling — larger).
-The marker is likely smaller; the code cut picks with the guard surface measured.
+The local shape is the existing `HashPartitioned` inner join **without terminal
+exchanges**, admitted only behind the caller-set single-partition signal. This is not
+a line-count choice: its absence of exchanges is already structural data at the
+fragmentation boundary. `fragment_hash_join_plan` requires exchanges and returns
+`JoinInputNotExchanged` otherwise, so a local shape cannot be silently fragmented.
+No new serialized `JoinStrategy` variant or separately-maintained fragmenter exception
+is warranted.
+
+The first implementation increment adds the corresponding rails before admission:
+the distributed coordinator forcibly clears `single_partition_execution`, and a
+three-worker fragment test proves an exchange-free hash join fails loudly with
+`JoinInputNotExchanged`.
+
+## Admission correction — local shape is not enough at the 64 MiB m06 cell
+
+The boundary trace also falsified an assumption in the original acceptance text.
+The direct in-memory executor does not admit against the retained spill cap: both
+`try_create_streamed_spilled_inner_build` and `build_in_memory_join_rows` compare the
+estimated build against the **raw** task-memory budget. m06's already-smaller orders
+build estimates at roughly 1.44 GiB, so it cannot become an in-memory join at the
+64 MiB ladder budget merely by removing its exchanges (and it does not fit the 1 GiB
+16× retained cap either).
+
+Therefore the safe rails and representation are kept, but binder admission is
+**deferred**. A successor must first choose and measure an explicit memory policy:
+either a larger, coordinate-stamped task budget where the raw in-memory guard admits
+the build, or a separately designed retained-cap admission with peak-residency proof.
+Neither policy is smuggled into this shape/safety increment.
 
 ## The two rails (mandatory for the code cut)
 
@@ -65,16 +83,19 @@ The marker is likely smaller; the code cut picks with the guard surface measured
 
 ## Acceptance (for the code increment)
 
-- `single_partition_execution` threaded from both executor entries; default false.
-- m06 single-node admits the local shape (orders build, in-memory, no exchange);
-  digest identical; peak residency within budget; spill eliminated; matched A/B win.
-- The multi-worker negative test green (local never leaks to distributed).
+- `single_partition_execution` defaults false and the distributed coordinator clears
+  it before every bind, including caller-supplied planner configuration.
+- The multi-worker negative test is green: an exchange-free hash join fails loudly in
+  a three-worker fragment instead of running local subsets.
+- A successor picks an explicit memory-policy admission before m06 can emit the local
+  shape; only then do digest, peak-residency, spill-elimination, and matched A/B become
+  applicable acceptance checks.
 - Full engine suite + armed 22-query sweep green; JoinKind guards handled.
 
 ## Disposition
 
-Read-only design step complete: single-partition is not provable at bind without a
-caller-set signal, and the three-layer safety (binder gate, distributed-non-local,
-fragmenter loud-fail) makes the local shape correct-by-construction. The code
-increment starts with the flag + its wiring (a safe no-op until the binder reads it),
-then the admission + representation + the two rails.
+The implementation grounding resolved the representation and installed the distributed
+rails, but also corrected the admission premise: the current m06 coordinate cannot use
+the local in-memory path under its raw 64 MiB budget. The local-shape capability remains
+deferred behind an explicit, measured memory-policy decision rather than being forced
+through a retained-cap assumption the executor does not implement.
