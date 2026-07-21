@@ -3624,17 +3624,9 @@ pub(super) fn join_key_bytes_null_safe(
 pub(super) fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
 	let key_width = key_arrays
 		.iter()
-		.map(|array| match array.data_type() {
-			DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
-			DataType::Int16 | DataType::UInt16 => 2,
-			DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
-			DataType::Date32 => 4,
-			DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => 8,
-			DataType::Utf8 => 32,
-			_ => 16,
-		})
+		.map(|array| crate::ir::hash_join_build_key_width(array.data_type()))
 		.sum::<usize>();
-	u64::try_from(rows.saturating_mul(112 + key_width)).unwrap_or(u64::MAX)
+	crate::ir::estimated_hash_join_build_bytes(rows, key_width)
 }
 
 pub(super) fn estimate_spill_retained_entry_bytes(

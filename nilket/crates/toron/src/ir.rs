@@ -15,6 +15,33 @@ pub mod execution;
 
 pub use execution::*;
 
+/// Fixed hash-table bookkeeping charged by the direct in-memory join guard for each
+/// build row. Keep this estimate in IR: both binder admission and execution must use
+/// the same boundary when deciding whether a local hash build fits a task budget.
+pub(crate) const HASH_JOIN_BUILD_ROW_OVERHEAD_BYTES: usize = 112;
+
+/// The direct hash-build guard's conservative key-width estimate.
+pub(crate) fn hash_join_build_key_width(data_type: &DataType) -> usize {
+	match data_type {
+		DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+		DataType::Int16 | DataType::UInt16 => 2,
+		DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
+		DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => 8,
+		DataType::Utf8 => 32,
+		_ => 16,
+	}
+}
+
+/// The raw task-memory admission estimate for an in-memory hash join build.
+///
+/// This must remain the single source of truth for binder-side local admission and
+/// executor-side spill fallback. It deliberately estimates hash-table state, not the
+/// physical size of an input batch or a spill artifact.
+pub(crate) fn estimated_hash_join_build_bytes(rows: usize, key_width: usize) -> u64 {
+	u64::try_from(rows.saturating_mul(HASH_JOIN_BUILD_ROW_OVERHEAD_BYTES + key_width))
+		.unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogicalTypeId(pub u32);
 
@@ -1287,6 +1314,18 @@ pub fn project_plan(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn adr490_hash_build_estimate_pins_m06_raw_budget_boundary() {
+		let m06_rows = 12_000_000;
+		let int64_width = hash_join_build_key_width(&DataType::Int64);
+		let estimate = estimated_hash_join_build_bytes(m06_rows, int64_width);
+
+		assert_eq!(int64_width, 8);
+		assert_eq!(estimate, 1_440_000_000);
+		assert!(estimate > 64 * 1024 * 1024);
+		assert!(estimate <= 2 * 1024 * 1024 * 1024);
+	}
 
 	#[test]
 	fn try_cast_is_not_pbc_pushdown_eligible() {
