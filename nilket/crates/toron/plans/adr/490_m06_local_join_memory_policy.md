@@ -49,6 +49,16 @@ Candidate (b), retained-cap admission, is rejected for this cell because it cann
 cross the executor's raw-budget gate. No global `QueryBudget` default, operator policy,
 or retained-cap semantics change in this ADR.
 
+### Bind-time visibility is explicit, not inferred
+
+The binder does not otherwise receive `TaskBudget`, so it cannot infer the raw executor
+budget from a physical byte fact or from the spill reserve. The direct single-node gauge
+therefore supplies an optional `PlannerConfig.local_hash_join_memory_per_task` from the
+same `TORON_TPCH_MEMORY_PER_TASK` value used to construct its `ExecutionContext`. The
+field defaults to `None`, is a policy input rather than an admission reader, and has no
+effect until the successor consumes it. Distributed coordinator binds retain neither the
+single-partition proof nor a local admission path.
+
 ## Rail before binder admission
 
 The local-shape reader stays absent until the following rail exists and is green on the
@@ -108,6 +118,7 @@ shape exists.
 ## Forward
 
 The next increment adds the shared admission-estimate rail and the fresh-process
-policy-proof surface before it reads `single_partition_execution`. Only after those are
-green may it emit the no-exchange local shape, already protected by ADR 489's
+policy-proof surface before it reads `single_partition_execution`. The direct gauge
+also carries its exact raw budget to the binder as an unused policy input. Only after
+those are green may it emit the no-exchange local shape, already protected by ADR 489's
 coordinator and fragmenter rails.
