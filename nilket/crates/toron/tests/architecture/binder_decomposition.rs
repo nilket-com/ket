@@ -164,10 +164,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// literal preservation plus the literal-only Decimal→Float compatibility rewrites for pre-existing float
 	// expression contexts. ADR 409 threads scan-size metadata from binder facts into the execution scan node.
 	// ADR 466 made the hash arm honor SwappedRightBuild (the placement/rewrite contract), a real
-	// rewrite-pass change. ADR 472 added the unknown-size fact and its shared helper.
+	// rewrite-pass change. ADR 472 added the unknown-size fact and its shared helper. ADR 490 adds
+	// the single-node raw-memory local-hash admission branch; it is a real physical-shape decision
+	// guarded by the coordinator/fragmenter distributed rails, so it remains at this root boundary.
 	assert!(
-		lines <= 6_080,
-		"binder root has {lines} lines; expected <= 6,080 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_105,
+		"binder root has {lines} lines; expected <= 6,105 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
