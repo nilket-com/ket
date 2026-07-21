@@ -585,6 +585,7 @@ fn markdown_cells(source: &str) -> Vec<MarkdownCellSnapshot> {
 				language_id: block.language_id,
 				body_range,
 				identity,
+				presentation: block.presentation,
 			}
 		})
 		.collect()

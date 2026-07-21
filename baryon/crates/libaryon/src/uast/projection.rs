@@ -153,11 +153,41 @@ pub enum MarkdownCellIdentity {
 	Explicit { id: String },
 }
 
+/// Where a notebook cell presents its execution result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MarkdownCellOutputTarget {
+	/// Render beneath the fence in Polariton's native Markdown preview.
+	#[default]
+	Inline,
+	/// Open or refresh a Baryon-managed native result pane.
+	Pane,
+	/// Keep execution feedback in the status line only.
+	None,
+}
+
+/// Whether the rich preview renders a cell's fenced source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MarkdownCellCodeVisibility {
+	#[default]
+	Show,
+	Hide,
+}
+
+/// Bounded presentation metadata authored on a fenced executable cell.
+/// Parsing lives with Markdown fence parsing; frontends receive this typed
+/// projection rather than interpreting fence strings themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct MarkdownCellPresentation {
+	pub output: MarkdownCellOutputTarget,
+	pub code: MarkdownCellCodeVisibility,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MarkdownCellSnapshot {
 	pub language_id: String,
 	pub body_range: Range<DocByte>,
 	pub identity: MarkdownCellIdentity,
+	pub presentation: MarkdownCellPresentation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

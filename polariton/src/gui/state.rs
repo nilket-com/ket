@@ -16,6 +16,7 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
+use libaryon::uast::projection::MarkdownCellOutputTarget;
 use polars::frame::DataFrame;
 use std::time::{Duration, Instant};
 
@@ -282,17 +283,28 @@ fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> T
 	}
 	let db = db.clone();
 	let identity = cell.identity.clone();
+	let presentation = cell.presentation;
 	app_state.status_msg = "Code running…".into();
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	app_state.code_editor.begin_markdown_cell(cell.identity);
+	match presentation.output {
+		MarkdownCellOutputTarget::Inline => {
+			app_state.code_editor.begin_markdown_cell(cell.identity)
+		}
+		MarkdownCellOutputTarget::Pane => app_state.code_editor.begin_query(),
+		MarkdownCellOutputTarget::None => {}
+	}
 	Task::perform(
 		async move {
 			let mut guard = db.write().await;
 			guard.dispatch(&cell.code).await
 		},
-		move |result| Message::RunMarkdownCellResult { identity, result },
+		move |result| Message::RunMarkdownCellResult {
+			identity,
+			presentation,
+			result,
+		},
 	)
 }
 
@@ -465,7 +477,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 			}
 		}
-		Message::RunMarkdownCellResult { identity, result } => {
+		Message::RunMarkdownCellResult {
+			identity,
+			presentation,
+			result,
+		} => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
 			app_state.status_error.clear();
@@ -473,9 +489,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				ExecutionResult::Rows(df) => {
 					let rows = df.height();
 					let cols = df.width();
-					app_state
-						.code_editor
-						.set_markdown_cell_table(identity, df.clone());
+					match presentation.output {
+						MarkdownCellOutputTarget::Inline => app_state
+							.code_editor
+							.set_markdown_cell_table(identity, df.clone()),
+						MarkdownCellOutputTarget::Pane => {
+							app_state.code_editor.set_query_result(df.clone())
+						}
+						MarkdownCellOutputTarget::None => {}
+					}
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
 					app_state.status_msg = "Cell finished.".to_owned();
@@ -483,33 +505,47 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				ExecutionResult::Err(message) => {
 					app_state.status_error = format!("Error: {message}");
 					app_state.status_msg.clear();
-					app_state
-						.code_editor
-						.set_markdown_cell_error(identity, message);
+					match presentation.output {
+						MarkdownCellOutputTarget::Inline => app_state
+							.code_editor
+							.set_markdown_cell_error(identity, message),
+						MarkdownCellOutputTarget::Pane => {
+							app_state.code_editor.set_query_error(message)
+						}
+						MarkdownCellOutputTarget::None => {}
+					}
 				}
 				ExecutionResult::Affected(rows) => {
-					app_state
-						.code_editor
-						.set_markdown_cell_message(identity, format!("Rows affected: {rows}"));
+					if presentation.output == MarkdownCellOutputTarget::Inline {
+						app_state
+							.code_editor
+							.set_markdown_cell_message(identity, format!("Rows affected: {rows}"));
+					}
 					app_state.status_msg = format!("Rows affected: {rows}");
 				}
 				ExecutionResult::CommandCompleted(message) => {
-					app_state
-						.code_editor
-						.set_markdown_cell_message(identity, message.clone());
+					if presentation.output == MarkdownCellOutputTarget::Inline {
+						app_state
+							.code_editor
+							.set_markdown_cell_message(identity, message.clone());
+					}
 					app_state.status_msg = message;
 				}
 				ExecutionResult::Batch(results) => {
 					let message = format!("Batch complete: {results:?}");
-					app_state
-						.code_editor
-						.set_markdown_cell_message(identity, message.clone());
+					if presentation.output == MarkdownCellOutputTarget::Inline {
+						app_state
+							.code_editor
+							.set_markdown_cell_message(identity, message.clone());
+					}
 					app_state.status_msg = message;
 				}
 				ExecutionResult::None => {
-					app_state
-						.code_editor
-						.set_markdown_cell_message(identity, "Done.".to_owned());
+					if presentation.output == MarkdownCellOutputTarget::Inline {
+						app_state
+							.code_editor
+							.set_markdown_cell_message(identity, "Done.".to_owned());
+					}
 					app_state.status_msg = "Cell finished.".to_owned();
 				}
 			}

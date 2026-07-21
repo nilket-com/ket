@@ -24,7 +24,9 @@ use libaryon::engine::{
 	UiPalette, VisualKind,
 };
 use libaryon::uast::Viewport;
-use libaryon::uast::projection::MarkdownCellIdentity;
+use libaryon::uast::projection::{
+	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
+};
 use polars::frame::DataFrame;
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
@@ -132,6 +134,7 @@ pub struct CodeEditor {
 /// A runnable fenced SQL cell selected by the engine's cursor projection.
 pub struct MarkdownCellExecution {
 	pub identity: MarkdownCellIdentity,
+	pub presentation: MarkdownCellPresentation,
 	pub code: String,
 }
 
@@ -271,6 +274,7 @@ impl CodeEditor {
 			.to_owned();
 		Some(MarkdownCellExecution {
 			identity: cell.identity.clone(),
+			presentation: cell.presentation,
 			code,
 		})
 	}
@@ -561,10 +565,7 @@ impl CodeEditor {
 				// Only useful once the offset is known; until then the
 				// mouse_area is the source of truth.
 				if let Some(offset) = self.pointer_offset {
-					self.apply_pointer(iced::Point::new(
-						window.x - offset.x,
-						window.y - offset.y,
-					));
+					self.apply_pointer(iced::Point::new(window.x - offset.x, window.y - offset.y));
 				}
 			}
 			EditorMsg::Click => {
@@ -1651,7 +1652,10 @@ fn markdown_preview_surface<'a>(
 ) -> Element<'a, EditorMsg> {
 	let mut rows: Vec<Element<'_, EditorMsg>> = Vec::new();
 	let mut byte_offset = 0u64;
+	// Every fenced block retains Markdown's normal code rendering. A cell is
+	// the subset of a fence with an engine-projected identity and presentation.
 	let mut in_code_block = false;
+	let mut active_code_cell: Option<&libaryon::uast::projection::MarkdownCellSnapshot> = None;
 	let first_line = preview.source_scroll_line.get();
 
 	for (line_number, source_line) in preview.source_text.split_inclusive('\n').enumerate() {
@@ -1659,23 +1663,38 @@ fn markdown_preview_surface<'a>(
 		let trimmed = content.trim_start();
 		let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
 		if fence {
-			let closing = in_code_block;
-			in_code_block = !in_code_block;
-			if closing {
-				let body_end = byte_offset;
-				if let Some(cell) = preview
+			if in_code_block {
+				in_code_block = false;
+				if let Some(cell) = active_code_cell.take() {
+					let body_end = byte_offset;
+					if let Some(cell) = preview.cells.iter().find(|candidate| {
+						candidate.identity == cell.identity
+							&& candidate.body_range.end.get() == body_end
+					}) && let Some(output) = outputs.get(&cell.identity)
+						&& cell.presentation.output
+							== libaryon::uast::projection::MarkdownCellOutputTarget::Inline
+					{
+						rows.push(markdown_cell_output_surface(
+							output,
+							palette,
+							show_column_types,
+						));
+					}
+				}
+			} else {
+				in_code_block = true;
+				let body_start = byte_offset.saturating_add(source_line.len() as u64);
+				active_code_cell = preview
 					.cells
 					.iter()
-					.find(|cell| cell.body_range.end.get() == body_end)
-					&& let Some(output) = outputs.get(&cell.identity)
-				{
-					rows.push(markdown_cell_output_surface(
-						output,
-						palette,
-						show_column_types,
-					));
-				}
+					.find(|cell| cell.body_range.start.get() == body_start);
 			}
+			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
+			continue;
+		}
+		if active_code_cell
+			.is_some_and(|cell| cell.presentation.code == MarkdownCellCodeVisibility::Hide)
+		{
 			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
 			continue;
 		}
@@ -2474,7 +2493,7 @@ mod tests {
 		editor.drag = None;
 		let _ = editor.update(EditorMsg::RawCursorMoved(window));
 		let lp = editor.last_pointer.expect("last pointer");
-        assert!(
+		assert!(
 			(lp.y - local.y).abs() < 1.0,
 			"subscription window coords convert to editor-local: got {lp:?}, want ~{local:?}"
 		);
@@ -2482,7 +2501,10 @@ mod tests {
 			editor.begin_divider_drag(),
 			"the converted point still resolves the divider"
 		);
-		assert_eq!(editor.drag.map(|d| d.axis), Some(SplitDirection::Horizontal));
+		assert_eq!(
+			editor.drag.map(|d| d.axis),
+			Some(SplitDirection::Horizontal)
+		);
 	}
 
 	#[test]
@@ -3269,7 +3291,7 @@ mod tests {
 			"```sql\n",
 			"create table if not exists test (x int32);\n",
 			"```\n\n",
-			"```sql {#trips}\n",
+			"```sql {#trips, output=pane, code=hide}\n",
 			"select y, z from test;\n",
 			"```\n",
 		);
@@ -3288,10 +3310,7 @@ mod tests {
 			.map(|cell| {
 				editor
 					.document_text
-					.get(
-						cell.body_range.start.get() as usize
-							..cell.body_range.end.get() as usize,
-					)
+					.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)
 					.expect("cell range in bounds")
 					.to_owned()
 			})
@@ -3314,6 +3333,14 @@ mod tests {
 			&preview.cells[1].identity,
 			MarkdownCellIdentity::Explicit { id } if id == "trips"
 		));
+		assert_eq!(
+			preview.cells[1].presentation.output,
+			libaryon::uast::projection::MarkdownCellOutputTarget::Pane
+		);
+		assert_eq!(
+			preview.cells[1].presentation.code,
+			libaryon::uast::projection::MarkdownCellCodeVisibility::Hide
+		);
 	}
 
 	#[test]
@@ -3365,7 +3392,10 @@ mod tests {
 			Some("select y, z from test;\n"),
 			"Run resolves the cell at the cursor regardless of selection"
 		);
-		assert!(editor.is_notebook(), "a document with a preview is a notebook");
+		assert!(
+			editor.is_notebook(),
+			"a document with a preview is a notebook"
+		);
 	}
 
 	#[test]

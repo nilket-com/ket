@@ -72,6 +72,7 @@ pub enum Message {
 	RunResult(ExecutionResult),
 	RunMarkdownCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
+		presentation: libaryon::uast::projection::MarkdownCellPresentation,
 		result: ExecutionResult,
 	},
 	SaveConnection,

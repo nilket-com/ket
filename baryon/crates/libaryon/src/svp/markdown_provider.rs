@@ -5,6 +5,9 @@ use crate::core::DocByte;
 use crate::engine::language::{LanguageInjection, LanguageProvider, SemanticOutput};
 use crate::svp::markdown_highlight::highlight_markdown;
 use crate::svp::rust_highlight::HighlightSpan;
+use crate::uast::projection::{
+	MarkdownCellCodeVisibility, MarkdownCellOutputTarget, MarkdownCellPresentation,
+};
 
 pub struct MarkdownProvider;
 
@@ -16,6 +19,7 @@ pub(crate) struct FencedCodeBlock {
 	pub(crate) language_id: String,
 	pub(crate) body_range: Range<usize>,
 	pub(crate) explicit_id: Option<String>,
+	pub(crate) presentation: MarkdownCellPresentation,
 	pub(crate) occurrence: u32,
 }
 
@@ -66,7 +70,14 @@ impl LanguageProvider for MarkdownProvider {
 pub(crate) fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
 	let mut blocks = Vec::new();
 	let mut offset = 0usize;
-	let mut open: Option<(u8, usize, String, Option<String>, usize)> = None;
+	let mut open: Option<(
+		u8,
+		usize,
+		String,
+		Option<String>,
+		MarkdownCellPresentation,
+		usize,
+	)> = None;
 	for line in source.split_inclusive('\n') {
 		let line_start = offset;
 		offset = offset.saturating_add(line.len());
@@ -80,12 +91,15 @@ pub(crate) fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
 			continue;
 		}
 		let marker = marker.expect("count proves marker");
-		if let Some((open_marker, open_count, language_id, explicit_id, body_start)) = open.take() {
+		if let Some((open_marker, open_count, language_id, explicit_id, presentation, body_start)) =
+			open.take()
+		{
 			if marker == open_marker && count >= open_count {
 				blocks.push(FencedCodeBlock {
 					language_id,
 					body_range: body_start..line_start,
 					explicit_id,
+					presentation,
 					occurrence: blocks.len() as u32,
 				});
 			} else {
@@ -94,6 +108,7 @@ pub(crate) fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
 					open_count,
 					language_id,
 					explicit_id,
+					presentation,
 					body_start,
 				));
 			}
@@ -101,20 +116,54 @@ pub(crate) fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
 		}
 
 		let info = trimmed[count..].trim();
-		let mut fields = info.split_whitespace();
-		let Some(language_id) = fields.next().filter(|id| !id.is_empty()) else {
+		let Some(language_id) = info.split_whitespace().next().filter(|id| !id.is_empty()) else {
 			continue;
 		};
-		let explicit_id = fields.find_map(|attribute| {
-			attribute
-				.strip_prefix("{#")
-				.and_then(|id| id.strip_suffix('}'))
-				.filter(|id| !id.is_empty())
-				.map(str::to_owned)
-		});
-		open = Some((marker, count, language_id.to_owned(), explicit_id, offset));
+		let (explicit_id, presentation) = parse_fence_attributes(&info[language_id.len()..]);
+		open = Some((
+			marker,
+			count,
+			language_id.to_owned(),
+			explicit_id,
+			presentation,
+			offset,
+		));
 	}
 	blocks
+}
+
+/// Parse comma-delimited attributes inside one or more `{...}` groups.
+/// Unknown entries remain inert so the grammar can grow without changing the
+/// highlighter or breaking documents written by newer Polariton versions.
+fn parse_fence_attributes(info: &str) -> (Option<String>, MarkdownCellPresentation) {
+	let mut explicit_id = None;
+	let mut presentation = MarkdownCellPresentation::default();
+	let mut remaining = info;
+	while let Some(start) = remaining.find('{') {
+		let Some(end) = remaining[start + 1..].find('}') else {
+			break;
+		};
+		let attributes = &remaining[start + 1..start + 1 + end];
+		for attribute in attributes.split(',').map(str::trim) {
+			if let Some(id) = attribute.strip_prefix('#').filter(|id| !id.is_empty()) {
+				explicit_id = Some(id.to_owned());
+				continue;
+			}
+			let Some((key, value)) = attribute.split_once('=') else {
+				continue;
+			};
+			match (key.trim(), value.trim()) {
+				("output", "inline") => presentation.output = MarkdownCellOutputTarget::Inline,
+				("output", "pane") => presentation.output = MarkdownCellOutputTarget::Pane,
+				("output", "none") => presentation.output = MarkdownCellOutputTarget::None,
+				("code", "show") => presentation.code = MarkdownCellCodeVisibility::Show,
+				("code", "hide") => presentation.code = MarkdownCellCodeVisibility::Hide,
+				_ => {}
+			}
+		}
+		remaining = &remaining[start + 1 + end + 1..];
+	}
+	(explicit_id, presentation)
 }
 
 /// Adapt structured fenced blocks to the generic language-injection contract.
@@ -195,6 +244,24 @@ mod tests {
 				.map(|injection| injection.language_id.as_str())
 				.collect::<Vec<_>>(),
 			vec!["sql", "rune"]
+		);
+	}
+
+	#[test]
+	fn fenced_blocks_parse_comma_delimited_cell_presentation() {
+		let source = "```sql {#sales, output=pane, code=hide}\nselect 42;\n```\n";
+		let blocks = fenced_code_blocks(source);
+		let block = blocks.first().expect("one fence");
+		assert_eq!(block.explicit_id.as_deref(), Some("sales"));
+		assert_eq!(block.presentation.output, MarkdownCellOutputTarget::Pane);
+		assert_eq!(block.presentation.code, MarkdownCellCodeVisibility::Hide);
+
+		// Unknown attributes are deliberately inert and bare fences retain the
+		// notebook defaults rather than requiring annotations.
+		let defaults = fenced_code_blocks("```sql {future=whatever}\nselect 1;\n```\n");
+		assert_eq!(
+			defaults[0].presentation,
+			MarkdownCellPresentation::default()
 		);
 	}
 }
