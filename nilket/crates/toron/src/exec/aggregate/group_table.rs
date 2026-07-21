@@ -33,7 +33,7 @@ pub(in crate::exec) struct BoundGroupedAggregateGroups {
 
 struct BoundGroupedAggregateGroupState {
 	buckets: Vec<u32>,
-	keys: Vec<Vec<GroupValue>>,
+	keys: GroupKeyStorage,
 	states: Vec<Vec<AggState>>,
 	entry_limit: usize,
 	initial_entry_capacity: usize,
@@ -44,6 +44,134 @@ struct BoundGroupedAggregateGroupState {
 	maximum_projected_growth_peak_bytes: u64,
 	maximum_finalize_sort_scratch_bytes: u64,
 	profile: Option<Box<GenericGroupedFoldProfile>>,
+}
+
+/// Key ownership selected once from the bound grouping schema.  The compact arm
+/// keeps m05's one fixed-width key inline with its neighbours instead of giving
+/// every key its own heap `Vec`.
+enum GroupKeyStorage {
+	Generic(Vec<Vec<GroupValue>>),
+	SingleInt64(Vec<[GroupValue; 1]>),
+}
+
+impl GroupKeyStorage {
+	fn generic() -> Self {
+		Self::Generic(Vec::new())
+	}
+
+	fn len(&self) -> usize {
+		match self {
+			Self::Generic(keys) => keys.len(),
+			Self::SingleInt64(keys) => keys.len(),
+		}
+	}
+
+	fn outer_capacity_bytes(&self) -> u64 {
+		match self {
+			Self::Generic(keys) => capacity_bytes::<Vec<GroupValue>>(keys.capacity()),
+			Self::SingleInt64(keys) => capacity_bytes::<[GroupValue; 1]>(keys.capacity()),
+		}
+	}
+
+	fn outer_bytes_for_capacity(&self, capacity: usize) -> u64 {
+		match self {
+			Self::Generic(_) => capacity_bytes::<Vec<GroupValue>>(capacity),
+			Self::SingleInt64(_) => capacity_bytes::<[GroupValue; 1]>(capacity),
+		}
+	}
+
+	fn key_at(&self, entry: usize) -> Option<&[GroupValue]> {
+		match self {
+			Self::Generic(keys) => keys.get(entry).map(Vec::as_slice),
+			Self::SingleInt64(keys) => keys.get(entry).map(<[GroupValue; 1]>::as_slice),
+		}
+	}
+
+	fn matches_key(&self, entry: usize, key: &[GroupValue]) -> bool {
+		self.key_at(entry).is_some_and(|candidate| candidate == key)
+	}
+
+	fn key_resident_bytes(&self, key: &[GroupValue]) -> Result<u64, ExecutionError> {
+		match self {
+			Self::Generic(_) => Ok(group_key_resident_bytes(key)),
+			Self::SingleInt64(_) => {
+				if matches!(key, [GroupValue::Int64(_) | GroupValue::Null]) {
+					Ok(0)
+				} else {
+					Err(table_error(
+						"single-Int64 key store received a non-Int64 key",
+					))
+				}
+			}
+		}
+	}
+
+	fn push(&mut self, key: &[GroupValue]) -> Result<(), ExecutionError> {
+		match self {
+			Self::Generic(keys) => keys.push(key.to_vec()),
+			Self::SingleInt64(keys) => match key {
+				[GroupValue::Int64(_) | GroupValue::Null] => keys.push([key[0].clone()]),
+				_ => {
+					return Err(table_error(
+						"single-Int64 key store received a non-Int64 key",
+					));
+				}
+			},
+		}
+		Ok(())
+	}
+
+	fn empty_with_capacity(&self, capacity: usize) -> Result<Self, ExecutionError> {
+		match self {
+			Self::Generic(_) => {
+				let mut keys = Vec::new();
+				keys.try_reserve_exact(capacity).map_err(|error| {
+					table_error(format!("key-table allocation failed: {error}"))
+				})?;
+				Ok(Self::Generic(keys))
+			}
+			Self::SingleInt64(_) => {
+				let mut keys = Vec::new();
+				keys.try_reserve_exact(capacity).map_err(|error| {
+					table_error(format!("single-Int64 key-table allocation failed: {error}"))
+				})?;
+				Ok(Self::SingleInt64(keys))
+			}
+		}
+	}
+
+	fn drain_into(&mut self, destination: &mut Self) -> Result<(), ExecutionError> {
+		match (self, destination) {
+			(Self::Generic(source), Self::Generic(destination)) => {
+				destination.extend(source.drain(..));
+			}
+			(Self::SingleInt64(source), Self::SingleInt64(destination)) => {
+				destination.extend(source.drain(..));
+			}
+			_ => {
+				return Err(table_error(
+					"grouped-fold key storage changed during growth",
+				));
+			}
+		}
+		Ok(())
+	}
+
+	fn inner_resident_bytes(&self) -> u64 {
+		match self {
+			Self::Generic(keys) => keys
+				.iter()
+				.map(|key| group_key_resident_bytes(key))
+				.fold(0u64, u64::saturating_add),
+			Self::SingleInt64(_) => 0,
+		}
+	}
+
+	fn select_single_int64(&mut self) {
+		if matches!(self, Self::Generic(keys) if keys.is_empty()) {
+			*self = Self::SingleInt64(Vec::new());
+		}
+	}
 }
 
 impl BoundGroupedAggregateGroups {
@@ -58,7 +186,7 @@ impl BoundGroupedAggregateGroups {
 		let profile = GenericGroupedFoldProfile::from_lookup(lookup).map(Box::new);
 		let state = BoundGroupedAggregateGroupState {
 			buckets: Vec::new(),
-			keys: Vec::new(),
+			keys: GroupKeyStorage::generic(),
 			states: Vec::new(),
 			entry_limit: 0,
 			initial_entry_capacity: initial_entry_capacity.max(1).next_power_of_two(),
@@ -90,6 +218,18 @@ impl BoundGroupedAggregateGroups {
 
 	pub(in crate::exec) fn len(&self) -> usize {
 		self.state.keys.len()
+	}
+
+	/// ADR 482: m05's bound schema is one Int64 group column. Select its
+	/// contiguous key representation before the first insert; every other shape
+	/// retains the generic `Vec<Vec<GroupValue>>` representation.
+	pub(in crate::exec) fn configure_key_storage(
+		&mut self,
+		group_types: &[arrow::datatypes::DataType],
+	) {
+		if matches!(group_types, [arrow::datatypes::DataType::Int64]) {
+			self.state.keys.select_single_int64();
+		}
 	}
 
 	pub(in crate::exec) fn profile_enabled(&self) -> bool {
@@ -188,11 +328,10 @@ impl BoundGroupedAggregateGroups {
 				self.state.entry_limit,
 			);
 		}
-		// Own the key only now, on the insert path. `to_vec()` yields
-		// capacity == len exactly as the previous `collect()` did, so the
-		// charged bytes are identical.
-		let key = key.to_vec();
-		let key_bytes = group_key_resident_bytes(&key);
+		// Own the key only now, on the insert path. The generic arm retains
+		// ADR 476's accounting; the compact arm stores its one fixed-width key
+		// inside the already-accounted outer key buffer.
+		let key_bytes = self.state.keys.key_resident_bytes(key)?;
 		let requested_state_bytes = capacity_bytes::<AggState>(state_count);
 		self.state.guard(
 			self.state
@@ -216,11 +355,9 @@ impl BoundGroupedAggregateGroups {
 				"generic grouped-fold hash table exhausted the u32 entry domain",
 			));
 		}
-		let key_capacity = self.state.keys.capacity();
 		let state_capacity = self.state.states.capacity();
-		self.state.keys.push(key);
+		self.state.keys.push(key)?;
 		self.state.states.push(states);
-		debug_assert_eq!(self.state.keys.capacity(), key_capacity);
 		debug_assert_eq!(self.state.states.capacity(), state_capacity);
 		self.state.buckets[vacant.bucket] = entry;
 		self.state.current_resident_bytes = self
@@ -260,12 +397,16 @@ impl BoundGroupedAggregateGroups {
 			.max(actual_scratch);
 		self.state
 			.guard(self.current_resident_bytes().saturating_add(actual_scratch))?;
-		entries.extend(self.state.keys.iter().zip(self.state.states.iter()).map(
-			|(key, states)| BoundGroupedAggregateEntry {
-				key: key.as_slice(),
-				states: states.as_slice(),
-			},
-		));
+		entries.extend((0..self.len()).map(|entry| {
+			BoundGroupedAggregateEntry {
+				key: self
+					.state
+					.keys
+					.key_at(entry)
+					.expect("group key index is valid"),
+				states: self.state.states[entry].as_slice(),
+			}
+		}));
 		entries.sort_unstable_by(|left, right| left.key.cmp(right.key));
 		if let (Some(profile), Some(started)) = (self.state.profile.as_mut(), started) {
 			profile.record_finalize_sort(entries.len(), actual_scratch, started.elapsed());
@@ -317,18 +458,11 @@ impl BoundGroupedAggregateGroups {
 		let outer = u64::try_from(std::mem::size_of::<BoundGroupedAggregateGroupState>())
 			.unwrap_or(u64::MAX)
 			.saturating_add(capacity_bytes::<u32>(self.state.buckets.capacity()))
-			.saturating_add(capacity_bytes::<Vec<GroupValue>>(
-				self.state.keys.capacity(),
-			))
+			.saturating_add(self.state.keys.outer_capacity_bytes())
 			.saturating_add(capacity_bytes::<Vec<AggState>>(
 				self.state.states.capacity(),
 			));
-		let keys = self
-			.state
-			.keys
-			.iter()
-			.map(group_key_resident_bytes)
-			.fold(0u64, u64::saturating_add);
+		let keys = self.state.keys.inner_resident_bytes();
 		let states = self
 			.state
 			.states
@@ -538,9 +672,11 @@ impl BoundGroupedAggregateGroupState {
 			.checked_mul(2)
 			.ok_or_else(|| table_error("grouped-fold bucket capacity overflow"))?;
 		let old_outer_buffers = capacity_bytes::<u32>(self.buckets.capacity())
-			.saturating_add(capacity_bytes::<Vec<GroupValue>>(self.keys.capacity()))
+			.saturating_add(self.keys.outer_capacity_bytes())
 			.saturating_add(capacity_bytes::<Vec<AggState>>(self.states.capacity()));
-		let requested_new_buffers = capacity_bytes::<Vec<GroupValue>>(target)
+		let requested_new_buffers = self
+			.keys
+			.outer_bytes_for_capacity(target)
 			.saturating_add(capacity_bytes::<Vec<AggState>>(target))
 			.saturating_add(capacity_bytes::<u32>(bucket_count));
 		let projected_peak = self
@@ -553,9 +689,7 @@ impl BoundGroupedAggregateGroupState {
 		}
 		self.guard(projected_peak)?;
 
-		let mut keys = Vec::new();
-		keys.try_reserve_exact(target)
-			.map_err(|error| table_error(format!("key-table allocation failed: {error}")))?;
+		let mut keys = self.keys.empty_with_capacity(target)?;
 		let mut states = Vec::new();
 		states
 			.try_reserve_exact(target)
@@ -564,7 +698,8 @@ impl BoundGroupedAggregateGroupState {
 		buckets
 			.try_reserve_exact(bucket_count)
 			.map_err(|error| table_error(format!("bucket-table allocation failed: {error}")))?;
-		let actual_new_buffers = capacity_bytes::<Vec<GroupValue>>(keys.capacity())
+		let actual_new_buffers = keys
+			.outer_capacity_bytes()
 			.saturating_add(capacity_bytes::<Vec<AggState>>(states.capacity()))
 			.saturating_add(capacity_bytes::<u32>(buckets.capacity()));
 		let actual_peak = self
@@ -575,7 +710,8 @@ impl BoundGroupedAggregateGroupState {
 		self.guard(actual_peak)?;
 
 		buckets.resize(bucket_count, EMPTY_BUCKET);
-		for (entry, key) in self.keys.iter().enumerate() {
+		for entry in 0..self.keys.len() {
+			let key = self.keys.key_at(entry).expect("group key index is valid");
 			let lookup = find_bucket_in(&self.hasher, &buckets, &self.keys, key)?;
 			if lookup.entry.is_some() {
 				return Err(table_error(
@@ -589,7 +725,7 @@ impl BoundGroupedAggregateGroupState {
 				.map_err(|_| table_error("grouped-fold entry index exceeds u32"))?;
 		}
 
-		keys.extend(self.keys.drain(..));
+		self.keys.drain_into(&mut keys)?;
 		states.extend(self.states.drain(..));
 		self.keys = keys;
 		self.states = states;
@@ -634,7 +770,7 @@ impl BoundGroupedAggregateGroupState {
 fn find_bucket_in(
 	hasher: &RandomState,
 	buckets: &[u32],
-	keys: &[Vec<GroupValue>],
+	keys: &GroupKeyStorage,
 	key: &[GroupValue],
 ) -> Result<HashLookup, ExecutionError> {
 	if buckets.is_empty() || !buckets.len().is_power_of_two() {
@@ -653,7 +789,7 @@ fn find_bucket_in(
 			});
 		}
 		let entry = entry as usize;
-		if keys.get(entry).is_some_and(|candidate| candidate == key) {
+		if keys.matches_key(entry, key) {
 			return Ok(HashLookup {
 				bucket,
 				entry: Some(entry),
@@ -693,8 +829,8 @@ fn occupied_cluster_run_histogram(buckets: &[u32]) -> ProbeHistogram {
 	histogram
 }
 
-fn group_key_resident_bytes(key: &Vec<GroupValue>) -> u64 {
-	capacity_bytes::<GroupValue>(key.capacity()).saturating_add(
+fn group_key_resident_bytes(key: &[GroupValue]) -> u64 {
+	capacity_bytes::<GroupValue>(key.len()).saturating_add(
 		key.iter()
 			.map(|value| match value {
 				GroupValue::Utf8(value) => u64::try_from(value.capacity()).unwrap_or(u64::MAX),
@@ -1081,6 +1217,64 @@ mod tests {
 				other => panic!("unexpected entry {other:?}"),
 			})
 			.collect()
+	}
+
+	#[test]
+	fn single_int64_store_is_contiguous_and_preserves_null_and_sorted_output() {
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		groups.configure_key_storage(&[arrow::datatypes::DataType::Int64]);
+		assert!(matches!(groups.state.keys, GroupKeyStorage::SingleInt64(_)));
+
+		for (key, count) in [
+			(GroupValue::Int64(3), 30),
+			(GroupValue::Null, 5),
+			(GroupValue::Int64(1), 10),
+			(GroupValue::Int64(3), 31),
+		] {
+			let states = groups
+				.entry_or_init(&[key], 1, || Ok(count_state(count)))
+				.expect("fold compact group");
+			if let AggState::Count(value) = &mut states[0] {
+				*value += 1;
+			}
+		}
+
+		let entries = groups.finalize_sorted().expect("finalize compact groups");
+		let observed = entries
+			.iter()
+			.map(|entry| match entry.states[0] {
+				AggState::Count(count) => (entry.key[0].clone(), count),
+				other => panic!("unexpected compact state {other:?}"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			observed,
+			vec![
+				(GroupValue::Null, 6),
+				(GroupValue::Int64(1), 11),
+				(GroupValue::Int64(3), 32),
+			]
+		);
+		drop(entries);
+		assert_eq!(
+			groups.current_resident_bytes(),
+			groups.recomputed_resident_bytes_for_test(),
+			"the resident guard must charge the compact outer key store"
+		);
+	}
+
+	#[test]
+	fn non_int64_or_multi_column_grouping_keeps_generic_key_store() {
+		let mut utf8 = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		utf8.configure_key_storage(&[arrow::datatypes::DataType::Utf8]);
+		assert!(matches!(utf8.state.keys, GroupKeyStorage::Generic(_)));
+
+		let mut compound = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		compound.configure_key_storage(&[
+			arrow::datatypes::DataType::Int64,
+			arrow::datatypes::DataType::Int64,
+		]);
+		assert!(matches!(compound.state.keys, GroupKeyStorage::Generic(_)));
 	}
 
 	#[test]

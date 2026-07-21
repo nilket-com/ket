@@ -1188,6 +1188,7 @@ impl Executor {
 					.iter()
 					.map(|array| array.data_type().clone())
 					.collect();
+				groups.configure_key_storage(&group_types);
 			}
 
 			let aggr_arrays = aggr_expr
@@ -1435,6 +1436,7 @@ impl Executor {
 				.iter()
 				.map(|array| array.data_type().clone())
 				.collect();
+			groups.configure_key_storage(group_types);
 		}
 
 		let aggr_arrays = aggr_expr
