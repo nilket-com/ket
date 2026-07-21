@@ -3098,6 +3098,7 @@ impl<'a> Binder<'a> {
 					..
 				}
 			);
+		let mut local_hash_join = false;
 		if binder_physicalizes_join {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
@@ -3111,27 +3112,49 @@ impl<'a> Binder<'a> {
 						std::mem::swap(&mut left_keys, &mut right_keys);
 						std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys);
 					}
-					// ADR 239 (scalar-local Cross): gather both provably-scalar sides to a single
-					// partition and join locally — a partition_count=1 gather, NOT an N-way empty-key
-					// hash repartition (which stays forbidden for partitioned/unbounded Cross inputs).
-					let partition_count = if matches!(
-						decision.reason,
-						JoinStrategyDecisionReason::ScalarLocalCross
-					) {
-						1
+					// ADR 490: a direct executor can retain a qualifying hash build in memory,
+					// but only when its caller proves this bind will never be fragmented. The
+					// coordinator clears that proof on every distributed bind (ADR 489), and
+					// the fragmenter still rejects an exchange-free hash shape loudly as a
+					// backstop. Keep pinned strategies and non-inner joins on the established
+					// exchanged path.
+					local_hash_join = matches!(strategy_intent, JoinStrategyIntent::Auto)
+						&& kind == JoinKind::Inner
+						&& right_probe_linearity.is_linear()
+						&& local_hash_join_memory_policy_admits(
+							self.config,
+							left_plan.facts.row_upper_bound,
+							&left_resolved_keys
+								.iter()
+								.map(|key| key.column.data_type.clone())
+								.collect::<Vec<_>>(),
+						);
+					if local_hash_join {
+						// The no-exchange shape is intentionally accepted only by the local
+						// validator branch below. It is structurally illegal to fragment.
 					} else {
-						DEFAULT_AUTO_JOIN_PARTITION_COUNT
-					};
-					left_plan.plan = exchange_for_join_keys(
-						left_plan.plan,
-						&left_resolved_keys,
-						partition_count,
-					)?;
-					right_plan.plan = exchange_for_join_keys(
-						right_plan.plan,
-						&right_resolved_keys,
-						partition_count,
-					)?;
+						// ADR 239 (scalar-local Cross): gather both provably-scalar sides to a single
+						// partition and join locally — a partition_count=1 gather, NOT an N-way empty-key
+						// hash repartition (which stays forbidden for partitioned/unbounded Cross inputs).
+						let partition_count = if matches!(
+							decision.reason,
+							JoinStrategyDecisionReason::ScalarLocalCross
+						) {
+							1
+						} else {
+							DEFAULT_AUTO_JOIN_PARTITION_COUNT
+						};
+						left_plan.plan = exchange_for_join_keys(
+							left_plan.plan,
+							&left_resolved_keys,
+							partition_count,
+						)?;
+						right_plan.plan = exchange_for_join_keys(
+							right_plan.plan,
+							&right_resolved_keys,
+							partition_count,
+						)?;
+					}
 				}
 				JoinStrategy::Broadcast => match decision.placement {
 					JoinPhysicalPlacement::Natural => {
@@ -3152,6 +3175,7 @@ impl<'a> Binder<'a> {
 		validate_strategy_shape(
 			mirrored_broadcast_physical_kind(kind, decision.placement),
 			decision.strategy,
+			local_hash_join,
 			&left_plan.plan,
 			&right_plan.plan,
 			&left_keys,

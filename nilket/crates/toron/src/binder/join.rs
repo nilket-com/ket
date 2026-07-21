@@ -77,6 +77,34 @@ pub(super) struct JoinInputOptimization {
 	pub(super) probe_linearity: ProbeLinearity,
 }
 
+/// ADR 490's raw-memory policy predicate. This is deliberately pure and unwired:
+/// the admission cut must first prove its boundary before a binder branch can emit a
+/// no-exchange local shape. Both the task coordinate and a conservative row bound are
+/// required; absent evidence declines.
+pub(super) fn local_hash_join_memory_policy_admits(
+	config: &PlannerConfig,
+	build_rows: Option<RowCount>,
+	build_key_types: &[DataType],
+) -> bool {
+	if !config.single_partition_execution {
+		return false;
+	}
+	let Some(memory_per_task) = config.local_hash_join_memory_per_task else {
+		return false;
+	};
+	let Some(build_rows) = build_rows else {
+		return false;
+	};
+	let key_width = build_key_types
+		.iter()
+		.map(crate::ir::hash_join_build_key_width)
+		.sum::<usize>();
+	crate::ir::estimated_hash_join_build_bytes(
+		usize::try_from(build_rows.get()).unwrap_or(usize::MAX),
+		key_width,
+	) <= memory_per_task.get()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeLinearity {
 	Linear,
@@ -1518,6 +1546,7 @@ pub(super) fn validate_join_key_types(
 pub(super) fn validate_strategy_shape(
 	kind: JoinKind,
 	strategy: JoinStrategy,
+	local_hash_join: bool,
 	left: &ExecutionPlan,
 	right: &ExecutionPlan,
 	left_keys: &[ColumnOrdinal],
@@ -1525,6 +1554,15 @@ pub(super) fn validate_strategy_shape(
 ) -> Result<(), BindingError> {
 	match strategy {
 		JoinStrategy::HashPartitioned => {
+			if local_hash_join {
+				if kind != JoinKind::Inner
+					|| terminal_exchange(left).is_some()
+					|| terminal_exchange(right).is_some()
+				{
+					return Err(BindingError::JoinKeyExchangeMismatch);
+				}
+				return Ok(());
+			}
 			let Some((left_count, left_exchange_keys)) = terminal_exchange(left) else {
 				return Err(BindingError::JoinKeyExchangeMismatch);
 			};
