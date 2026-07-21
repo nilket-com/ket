@@ -35,6 +35,21 @@ pub(crate) fn partition_bucket(
 	partition_bucket_with_scratch(key_arrays, row, partition_count, &mut encoded)
 }
 
+/// ADR 484: reduce a partition hash to a bucket. For a power-of-two partition
+/// count, `hash % count == hash & (count - 1)` **exactly**, so bucket identity and
+/// the ADR 480 partition contract are preserved — only a runtime u64 division
+/// becomes an AND. Non-power-of-two counts keep the modulo unchanged. The hash
+/// input (XxHash3 bytes) is untouched; this is purely the post-hash reduction.
+#[inline]
+fn partition_index_for_hash(hash: u64, partition_count: u32) -> usize {
+	let count = u64::from(partition_count);
+	if partition_count.is_power_of_two() {
+		(hash & (count - 1)) as usize
+	} else {
+		(hash % count) as usize
+	}
+}
+
 pub(crate) fn partition_bucket_with_scratch(
 	key_arrays: &[ArrayRef],
 	row: usize,
@@ -46,10 +61,10 @@ pub(crate) fn partition_bucket_with_scratch(
 			message: "exchange partition_count must be greater than zero".to_string(),
 		});
 	}
-	Ok(
-		(partition_key_hash_with_scratch(key_arrays, row, encoded)? % u64::from(partition_count))
-			as usize,
-	)
+	Ok(partition_index_for_hash(
+		partition_key_hash_with_scratch(key_arrays, row, encoded)?,
+		partition_count,
+	))
 }
 
 pub(in crate::exec) fn partition_bucket_if_non_null_with_scratch(
@@ -64,7 +79,7 @@ pub(in crate::exec) fn partition_bucket_if_non_null_with_scratch(
 		});
 	}
 	partition_key_hash_if_non_null_with_scratch(key_arrays, row, encoded)
-		.map(|hash| hash.map(|hash| (hash % u64::from(partition_count)) as usize))
+		.map(|hash| hash.map(|hash| partition_index_for_hash(hash, partition_count)))
 }
 
 /// ADR 479: a single fixed-width integer key column is the common case (m06 joins
@@ -4697,6 +4712,45 @@ mod tests {
 			],
 		)
 		.expect("partition test batch")
+	}
+
+	#[test]
+	fn adr484_mask_equals_modulo_for_power_of_two_and_preserves_bucket_identity() {
+		// For power-of-two counts the mask must equal the modulo for every hash,
+		// so bucket identity (and the ADR 480 partition contract) is unchanged.
+		let hashes = [
+			0u64,
+			1,
+			2,
+			15,
+			16,
+			17,
+			u64::MAX,
+			u64::MAX - 1,
+			0x9E37_79B9_7F4A_7C15,
+			12_000_000,
+			47_989_007,
+		];
+		for &count in &[1u32, 2, 4, 8, 16, 64, 256] {
+			assert!(count.is_power_of_two());
+			for &h in &hashes {
+				assert_eq!(
+					partition_index_for_hash(h, count),
+					(h % u64::from(count)) as usize,
+					"mask != modulo at count {count} hash {h}"
+				);
+			}
+		}
+		// Non-power-of-two counts keep the modulo unchanged.
+		for &count in &[3u32, 5, 7, 17, 100] {
+			assert!(!count.is_power_of_two());
+			for &h in &hashes {
+				assert_eq!(
+					partition_index_for_hash(h, count),
+					(h % u64::from(count)) as usize
+				);
+			}
+		}
 	}
 
 	#[test]
