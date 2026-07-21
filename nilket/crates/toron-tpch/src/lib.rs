@@ -3814,13 +3814,25 @@ pub fn gauge_hash_smaller_build() -> Result<(bool, &'static str), String> {
 
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
+pub const GAUGE_LOCAL_JOIN_ADMISSION_ENV: &str = "TORON_TPCH_LOCAL_JOIN_ADMISSION";
+
 pub fn gauge_planner_config() -> PlannerConfig {
 	// The budget env is validated loudly at row emission; a malformed value must
 	// abort the bind too, never degrade to a silent None (which would flip the
 	// local-admission policy off while the row still reports an explicit budget).
 	let (bytes, _provenance) =
 		gauge_memory_per_task().unwrap_or_else(|error| panic!("gauge planner config: {error}"));
-	gauge_planner_config_with_task_memory(Some(ByteCount::new(bytes)))
+	// A/B control arm: "0" withholds the planner's policy input (admission
+	// declines with an explicit no_memory_budget receipt) while the execution
+	// budget itself is untouched, so both arms run the identical coordinate.
+	let policy_input = match std::env::var(GAUGE_LOCAL_JOIN_ADMISSION_ENV) {
+		Ok(raw) if raw == "0" => None,
+		Ok(raw) if raw == "1" => Some(ByteCount::new(bytes)),
+		Ok(raw) => panic!("{GAUGE_LOCAL_JOIN_ADMISSION_ENV} must be \"0\" or \"1\", got {raw:?}"),
+		Err(std::env::VarError::NotPresent) => Some(ByteCount::new(bytes)),
+		Err(error) => panic!("{GAUGE_LOCAL_JOIN_ADMISSION_ENV}: {error}"),
+	};
+	gauge_planner_config_with_task_memory(policy_input)
 }
 
 fn gauge_planner_config_with_task_memory(
@@ -4829,7 +4841,7 @@ async fn run_perf_query_with_metadata(
 		engine_version: None,
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
-		local_join_admissions: None,
+		local_join_admissions: Some(execution.local_join_admissions),
 	}
 }
 
