@@ -14,7 +14,7 @@ use crate::plot::composition::PlotComposition;
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
-	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
+	Space, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
@@ -31,7 +31,8 @@ use libaryon::uast::projection::{
 };
 use polars::frame::DataFrame;
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc::Receiver};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 /// The single query-results surface. One stable identity reused for every run,
 /// so results replace in place instead of opening a pane per query.
@@ -69,6 +70,7 @@ mod metrics {
 
 #[derive(Clone)]
 pub enum EditorMsg {
+	EngineReady,
 	Dashboard(DashboardMsg),
 	Input(InputEvent),
 	Paste(String),
@@ -95,12 +97,50 @@ pub enum EditorMsg {
 	},
 }
 
+enum EngineOutput {
+	Viewport(Box<Viewport>),
+	HostEvent(HostEvent),
+}
+
+#[derive(Clone)]
+struct EngineWake {
+	id: usize,
+	receiver: Arc<Mutex<Option<iced::futures::channel::mpsc::UnboundedReceiver<()>>>>,
+}
+
+impl PartialEq for EngineWake {
+	fn eq(&self, other: &Self) -> bool {
+		self.id == other.id
+	}
+}
+
+impl Eq for EngineWake {}
+
+impl Hash for EngineWake {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.id.hash(state);
+	}
+}
+
+fn engine_wake_stream(wake: &EngineWake) -> iced::futures::stream::BoxStream<'static, ()> {
+	use iced::futures::StreamExt;
+	wake.receiver
+		.lock()
+		.expect("engine wake receiver mutex poisoned")
+		.take()
+		.map_or_else(
+			|| iced::futures::stream::pending().boxed(),
+			iced::futures::StreamExt::boxed,
+		)
+}
+
 /// Long-lived owner of Polariton's libaryon session.
 pub struct CodeEditor {
 	engine: Option<EngineHandle>,
 	commands: libaryon::engine::CommandSender,
 	input: libaryon::engine::InputSender,
-	viewports: Receiver<Viewport>,
+	engine_outputs: Receiver<EngineOutput>,
+	engine_wake: EngineWake,
 	viewport: Option<Viewport>,
 	document_text: String,
 	text_query_pending: bool,
@@ -126,8 +166,6 @@ pub struct CodeEditor {
 	/// Table presentation remains Polariton-owned even when the table lives in
 	/// a Baryon-managed HostPanel.
 	show_column_types: bool,
-	/// Ordered engine events; drained every poll, never coalesced.
-	host_events: Option<Receiver<HostEvent>>,
 	panels: PanelRegistry,
 	/// Monotonic revision for the results panel, so each run supersedes the
 	/// last.
@@ -215,12 +253,43 @@ impl CodeEditor {
 		let viewports = engine
 			.take_viewports()
 			.expect("new engine owns viewport receiver");
-		let host_events = engine.take_host_events();
+		let host_events = engine
+			.take_host_events()
+			.expect("new engine owns host event receiver");
+		let (output_tx, engine_outputs) = std::sync::mpsc::channel();
+		let (wake_tx, wake_rx) = iced::futures::channel::mpsc::unbounded();
+		let viewport_output_tx = output_tx.clone();
+		let viewport_wake_tx = wake_tx.clone();
+		std::thread::spawn(move || {
+			while let Ok(viewport) = viewports.recv() {
+				if viewport_output_tx
+					.send(EngineOutput::Viewport(Box::new(viewport)))
+					.is_err()
+				{
+					break;
+				}
+				let _ = viewport_wake_tx.unbounded_send(());
+			}
+		});
+		std::thread::spawn(move || {
+			while let Ok(event) = host_events.recv() {
+				if output_tx.send(EngineOutput::HostEvent(event)).is_err() {
+					break;
+				}
+				let _ = wake_tx.unbounded_send(());
+			}
+		});
+		let wake_receiver = Arc::new(Mutex::new(Some(wake_rx)));
+		let engine_wake = EngineWake {
+			id: Arc::as_ptr(&wake_receiver) as usize,
+			receiver: wake_receiver,
+		};
 		let mut editor = Self {
 			engine: Some(engine),
 			commands,
 			input,
-			viewports,
+			engine_outputs,
+			engine_wake,
 			viewport: None,
 			document_text: String::new(),
 			text_query_pending: false,
@@ -232,7 +301,6 @@ impl CodeEditor {
 			quit_requested: false,
 			quit_notified: false,
 			show_column_types: false,
-			host_events,
 			panels: PanelRegistry::default(),
 			result_revision: 0,
 			drag: None,
@@ -564,14 +632,26 @@ impl CodeEditor {
 	}
 
 	pub fn subscription(&self) -> Subscription<EditorMsg> {
-		event::listen_with(|event, status, _window| editor_input_for(&event, status))
+		Subscription::batch([
+			event::listen_with(|event, status, _window| editor_input_for(&event, status)),
+			Subscription::run_with(self.engine_wake.clone(), engine_wake_stream)
+				.map(|()| EditorMsg::EngineReady),
+		])
 	}
 
 	/// Drain every available projection and retain only the latest one.
 	/// This is deliberately called from Iced's update path, never blocking it.
 	pub fn poll(&mut self) -> bool {
 		let mut changed = false;
-		while let Ok(viewport) = self.viewports.try_recv() {
+		let mut events = Vec::new();
+		while let Ok(output) = self.engine_outputs.try_recv() {
+			let EngineOutput::Viewport(viewport) = output else {
+				if let EngineOutput::HostEvent(event) = output {
+					events.push(event);
+				}
+				continue;
+			};
+			let viewport = *viewport;
 			self.quit_requested |= viewport.should_quit;
 			if let Some(message) = viewport.status_message.as_ref() {
 				self.status_message = Some(message.clone());
@@ -593,11 +673,6 @@ impl CodeEditor {
 		// must never be coalesced. Reconciliation runs after the viewport above
 		// is current, so a disposal that outruns its projection cannot blank a
 		// pane that is still on screen.
-		let events = self
-			.host_events
-			.as_ref()
-			.map(|events| events.try_iter().collect::<Vec<_>>())
-			.unwrap_or_default();
 		changed |= !events.is_empty();
 		self.panels.reconcile(&events, self.viewport.as_ref());
 		changed
@@ -626,6 +701,9 @@ impl CodeEditor {
 			return Task::none();
 		}
 		match message {
+			EditorMsg::EngineReady => {
+				self.poll();
+			}
 			EditorMsg::Dashboard(_) => {}
 			EditorMsg::NotebookPlot { identity, message } => {
 				if let Some(NotebookCellOutput::Plot { surface }) =
@@ -1769,9 +1847,12 @@ fn text_pane_surface<'a>(
 		EditorMsg::Scroll(-lines)
 	});
 	let editor_content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
-		row![editor_rows, minimap_view(minimap, palette)]
-			.height(Length::Fill)
-			.into()
+		row![
+			editor_rows,
+			minimap_view(minimap, pane.theme_colors, palette)
+		]
+		.height(Length::Fill)
+		.into()
 	} else {
 		editor_rows.into()
 	};
@@ -2171,94 +2252,422 @@ fn command_bar(prompt: String, palette: UiPalette) -> Element<'static, EditorMsg
 	.into()
 }
 
-const MINIMAP_BANDS: usize = 96;
+const MINIMAP_WIDTH: f32 = 80.0;
+/// Search-marker gutter on the minimap's right edge, in logical pixels.
+const MINIMAP_MARKER_WIDTH: u32 = 3;
+/// Oversampling factor: the ink image is rendered at this multiple of the
+/// canvas's logical size so hidpi surfaces get sharp per-column detail.
+const MINIMAP_SCALE: u32 = 2;
 
-fn minimap_view(snapshot: &MinimapSnapshot, palette: UiPalette) -> Element<'static, EditorMsg> {
-	let overlay = snapshot.overlay();
-	let density = minimap_density(snapshot);
-	let document_lines = overlay.doc_line_count.get().max(1);
-	let viewport_start = overlay.viewport_start_line.get();
-	let viewport_end = overlay.viewport_end_line.get();
-	let search_bands = &overlay.search_bands;
-	let rows = column(density.into_iter().enumerate().map(|(index, density)| {
-		let line = ((index as u128 * document_lines as u128) / MINIMAP_BANDS as u128) as u64;
-		let next_line =
-			(((index + 1) as u128 * document_lines as u128) / MINIMAP_BANDS as u128) as u64;
-		let in_viewport = line < viewport_end && next_line.max(line + 1) > viewport_start;
-		let search_index = ((index * search_bands.len()) / MINIMAP_BANDS)
-			.min(search_bands.len().saturating_sub(1));
-		let has_search = search_bands.get(search_index).copied().unwrap_or_default() > 0;
-		let shade = if has_search {
-			palette.search_highlight
-		} else {
-			palette.minimap_accent
-		};
-		let alpha = if density == 0 {
-			0.0
-		} else {
-			0.15 + (density as f32 / 255.0) * 0.85
-		};
-		let background = if in_viewport {
-			Color {
-				a: 0.45,
-				..color(palette.accent)
-			}
-		} else {
-			Color {
-				a: alpha,
-				..color(shade)
-			}
-		};
-		button(Space::new().height(Length::Fixed(2.0)))
-			.padding(0)
-			.width(Length::Fixed(72.0))
-			.on_press(EditorMsg::MinimapGoto(DocLine::new(line)))
-			.style(move |_, _| button::Style {
-				background: Some(Background::Color(background)),
-				..Default::default()
-			})
-			.into()
-	}))
-	.spacing(0);
-	container(rows)
-		.padding([8, 4])
-		.width(Length::Fixed(80.0))
-		.height(Length::Fill)
-		.style(move |_| container::Style {
-			background: Some(Background::Color(color(palette.minimap_surface))),
-			..Default::default()
-		})
-		.into()
+/// Canvas-backed minimap. The engine's `PreviewSnapshot` carries per-column
+/// token bins for every source row; this widget projects them through the same
+/// shared samplers baryon uses (`sample_preview_bin_range` /
+/// `dominant_preview_bin_for_rows`) into a syntax-colored pixel image, then
+/// draws the viewport frame, cursor line, and search markers on top.
+struct MinimapWidget<'a> {
+	snapshot: &'a MinimapSnapshot,
+	theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
+	palette: UiPalette,
 }
 
-fn minimap_density(snapshot: &MinimapSnapshot) -> Vec<u8> {
-	let source = match snapshot {
-		MinimapSnapshot::Preview(preview) => preview
-			.rows
-			.iter()
-			.map(|row| {
-				((u32::from(row.logical_width) * 255) / u32::from(preview.max_columns.max(1))) as u8
-			})
-			.collect::<Vec<_>>(),
-		MinimapSnapshot::Overview(overview) | MinimapSnapshot::ByteFallback(overview) => {
-			overview.bands.clone()
-		}
+fn minimap_view<'a>(
+	snapshot: &'a MinimapSnapshot,
+	theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
+	palette: UiPalette,
+) -> Element<'a, EditorMsg> {
+	canvas(MinimapWidget {
+		snapshot,
+		theme_colors,
+		palette,
+	})
+	.width(Length::Fixed(MINIMAP_WIDTH))
+	.height(Length::Fill)
+	.into()
+}
+
+fn minimap_blend(base: Rgb, accent: Rgb, accent_weight: u32, total_weight: u32) -> Rgb {
+	let base_weight = total_weight - accent_weight;
+	let channel = |base: u8, accent: u8| {
+		((u32::from(base) * base_weight + u32::from(accent) * accent_weight) / total_weight) as u8
 	};
-	(0..MINIMAP_BANDS)
-		.map(|index| {
-			let start = (index * source.len()) / MINIMAP_BANDS;
-			let end = (((index + 1) * source.len()) / MINIMAP_BANDS)
-				.max(start + 1)
-				.min(source.len());
-			source
-				.get(start..end)
-				.unwrap_or_default()
-				.iter()
-				.copied()
-				.max()
-				.unwrap_or(0)
-		})
-		.collect()
+	Rgb::new(
+		channel(base.r, accent.r),
+		channel(base.g, accent.g),
+		channel(base.b, accent.b),
+	)
+}
+
+struct MinimapPixels {
+	width: u32,
+	height: u32,
+	rgba: Vec<u8>,
+}
+
+impl MinimapPixels {
+	fn new(width: u32, height: u32, base: Rgb) -> Self {
+		let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+		for _ in 0..width * height {
+			rgba.extend_from_slice(&[base.r, base.g, base.b, 255]);
+		}
+		Self {
+			width,
+			height,
+			rgba,
+		}
+	}
+
+	fn put(&mut self, x: u32, y: u32, color: Rgb) {
+		if x >= self.width || y >= self.height {
+			return;
+		}
+		let idx = ((y * self.width + x) * 4) as usize;
+		self.rgba[idx..idx + 3].copy_from_slice(&[color.r, color.g, color.b]);
+	}
+
+	fn fill(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, color: Rgb) {
+		for y in y0..y1.min(self.height) {
+			for x in x0..x1.min(self.width) {
+				self.put(x, y, color);
+			}
+		}
+	}
+}
+
+impl MinimapWidget<'_> {
+	fn token_color(&self, bin: libaryon::core::TokenBin, base: Rgb) -> Option<Rgb> {
+		use libaryon::engine::EMPTY_PREVIEW_BIN;
+		if bin == EMPTY_PREVIEW_BIN {
+			return None;
+		}
+		let accent = self
+			.theme_colors
+			.get(bin.index())
+			.and_then(|color| *color)
+			.unwrap_or(self.palette.editor_text);
+		Some(minimap_blend(base, accent, 5, 6))
+	}
+
+	/// Vertical pixels of image actually covered by document content. Short
+	/// files top-align at 2px per line instead of stretching to fill.
+	fn content_height(&self, image_height: u32) -> u32 {
+		let total_rows = self.total_rows();
+		if total_rows == 0 {
+			return 0;
+		}
+		let line_px = self.sparse_line_px();
+		(total_rows as u32)
+			.saturating_mul(line_px)
+			.min(image_height)
+	}
+
+	fn total_rows(&self) -> usize {
+		match self.snapshot {
+			MinimapSnapshot::Preview(preview) => preview.rows.len(),
+			MinimapSnapshot::Overview(_) | MinimapSnapshot::ByteFallback(_) => {
+				usize::try_from(self.snapshot.overlay().doc_line_count.get()).unwrap_or(usize::MAX)
+			}
+		}
+	}
+
+	fn sparse_line_px(&self) -> u32 {
+		if self.total_rows() <= 64 {
+			2 * MINIMAP_SCALE
+		} else {
+			MINIMAP_SCALE
+		}
+	}
+
+	fn render_ink(&self, image: &mut MinimapPixels, content_width: u32, content_height: u32) {
+		let base = self.palette.minimap_surface;
+		match self.snapshot {
+			MinimapSnapshot::Preview(preview) => {
+				use libaryon::engine::{dominant_preview_bin_for_rows, sample_preview_bin_range};
+				let total_rows = preview.rows.len();
+				if total_rows == 0 {
+					return;
+				}
+				let line_px = self.sparse_line_px();
+				if (total_rows as u32).saturating_mul(line_px) <= image.height {
+					// Sparse: one band per source line, width from the line's
+					// logical width, per-column dominant token color.
+					let max_columns = u32::from(preview.max_columns.max(1));
+					for (row_idx, row) in preview.rows.iter().enumerate() {
+						if row.logical_width == 0 {
+							continue;
+						}
+						let row_width = (u32::from(row.logical_width)
+							.saturating_mul(content_width))
+						.div_ceil(max_columns)
+						.clamp(1, content_width);
+						let y0 = row_idx as u32 * line_px;
+						let y1 = (y0 + line_px).min(image.height);
+						let ink_top = if line_px > 2 { y0 + 1 } else { y0 };
+						let ink_bottom = if line_px > 2 {
+							y1.saturating_sub(1)
+						} else {
+							y1
+						};
+						for x in 0..row_width {
+							let bin = sample_preview_bin_range(
+								row,
+								x.saturating_sub(1) as usize,
+								(x + 2).min(row_width) as usize,
+								row_width as usize,
+							);
+							let Some(color) = self.token_color(bin, base) else {
+								continue;
+							};
+							image.fill(x, ink_top, x + 1, ink_bottom.max(ink_top + 1), color);
+						}
+					}
+				} else {
+					// Dense: each pixel row aggregates a slice of source rows;
+					// coverage modulates how far the token color leans off the
+					// surface so sparse regions read lighter.
+					for y in 0..content_height {
+						let row_start = (y as usize * total_rows) / content_height.max(1) as usize;
+						let row_end = ((y as usize + 1) * total_rows)
+							.div_ceil(content_height.max(1) as usize)
+							.max(row_start + 1)
+							.min(total_rows);
+						let rows = &preview.rows[row_start.min(total_rows - 1)..row_end];
+						for x in 0..content_width {
+							let Some((bin, non_empty, sampled)) = dominant_preview_bin_for_rows(
+								rows,
+								x as usize,
+								x as usize + 1,
+								content_width as usize,
+							) else {
+								continue;
+							};
+							let Some(token) = self.token_color(bin, base) else {
+								continue;
+							};
+							let coverage =
+								(2 + (u32::from(non_empty) * 6) / u32::from(sampled.max(1))).min(8);
+							image.put(x, y, minimap_blend(base, token, coverage, 8));
+						}
+					}
+				}
+			}
+			MinimapSnapshot::Overview(overview) | MinimapSnapshot::ByteFallback(overview) => {
+				if overview.bands.is_empty() {
+					return;
+				}
+				let accent = self.palette.minimap_accent;
+				for y in 0..content_height {
+					let band = (y as usize * overview.bands.len()) / content_height.max(1) as usize;
+					let density = overview.bands[band.min(overview.bands.len() - 1)];
+					if density == 0 {
+						continue;
+					}
+					let line_width = (u32::from(density) * content_width / 255).max(1);
+					image.fill(0, y, line_width.min(content_width), y + 1, accent);
+				}
+			}
+		}
+	}
+
+	fn render_search_markers(&self, image: &mut MinimapPixels, content_height: u32) {
+		let overlay = self.snapshot.overlay();
+		if content_height == 0 || overlay.search_bands.is_empty() {
+			return;
+		}
+		let active = self.palette.search_highlight;
+		let inactive = minimap_blend(self.palette.minimap_surface, active, 3, 5);
+		let marker_x = image
+			.width
+			.saturating_sub(MINIMAP_MARKER_WIDTH * MINIMAP_SCALE);
+		let bands = overlay.search_bands.len() as u32;
+		for (band_idx, intensity) in overlay.search_bands.iter().copied().enumerate() {
+			if intensity == 0 {
+				continue;
+			}
+			let y0 = (band_idx as u32 * content_height) / bands;
+			let y1 = (((band_idx as u32 + 1) * content_height) / bands).max(y0 + 1);
+			let color = if overlay.active_search_band == Some(band_idx) {
+				active
+			} else {
+				inactive
+			};
+			image.fill(marker_x, y0, image.width, y1, color);
+		}
+	}
+}
+
+/// Cached ink image. The app polls the engine on a 16ms tick, so `draw` runs
+/// at frame rate; regenerating the pixel buffer (and minting a fresh
+/// `image::Handle`, which defeats iced's texture cache) every frame pins a
+/// core. The ink only changes on edits, theme swaps, or resizes — everything
+/// else (viewport frame, cursor, hover) is drawn as vector overlays — so the
+/// handle is reused until the fingerprint of its actual inputs changes.
+#[derive(Default)]
+struct MinimapInkCache(std::cell::RefCell<Option<(u64, iced::advanced::image::Handle)>>);
+
+impl MinimapWidget<'_> {
+	/// Hash of everything `render_ink` + `render_search_markers` read. Preview
+	/// rows are immutable for the lifetime of a projected viewport, so their
+	/// allocation identity is the content revision here. A replacement
+	/// projection is allocated before the current one is dropped, which keeps
+	/// the identity unambiguous while avoiding an O(document size) scan on every
+	/// 16ms Iced redraw.
+	///
+	/// The overlay's viewport/cursor fields are deliberately excluded: they
+	/// change on every scroll and keystroke but never touch the ink image.
+	fn ink_fingerprint(&self, width: u32, height: u32) -> u64 {
+		use std::hash::{Hash, Hasher};
+		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		width.hash(&mut hasher);
+		height.hash(&mut hasher);
+		match self.snapshot {
+			MinimapSnapshot::Preview(preview) => {
+				0u8.hash(&mut hasher);
+				preview.max_columns.hash(&mut hasher);
+				preview.rows.len().hash(&mut hasher);
+				(preview.rows.as_ptr() as usize).hash(&mut hasher);
+			}
+			MinimapSnapshot::Overview(overview) | MinimapSnapshot::ByteFallback(overview) => {
+				1u8.hash(&mut hasher);
+				overview.bands.hash(&mut hasher);
+			}
+		}
+		let overlay = self.snapshot.overlay();
+		overlay.search_bands.hash(&mut hasher);
+		overlay.active_search_band.hash(&mut hasher);
+		for color in self.theme_colors.iter().flatten().chain([
+			&self.palette.minimap_surface,
+			&self.palette.minimap_accent,
+			&self.palette.search_highlight,
+			&self.palette.editor_text,
+		]) {
+			(color.r, color.g, color.b).hash(&mut hasher);
+		}
+		hasher.finish()
+	}
+
+	fn ink_handle(
+		&self,
+		cache: &MinimapInkCache,
+		width: u32,
+		height: u32,
+	) -> iced::advanced::image::Handle {
+		let fingerprint = self.ink_fingerprint(width, height);
+		let mut slot = cache.0.borrow_mut();
+		if let Some((cached_fingerprint, handle)) = slot.as_ref()
+			&& *cached_fingerprint == fingerprint
+		{
+			return handle.clone();
+		}
+		let mut image = MinimapPixels::new(width, height, self.palette.minimap_surface);
+		let content_width = width.saturating_sub(MINIMAP_MARKER_WIDTH * MINIMAP_SCALE);
+		let content_height = self.content_height(height);
+		self.render_ink(&mut image, content_width, content_height);
+		self.render_search_markers(&mut image, content_height);
+		let handle =
+			iced::advanced::image::Handle::from_rgba(image.width, image.height, image.rgba);
+		*slot = Some((fingerprint, handle.clone()));
+		handle
+	}
+}
+
+impl canvas::Program<EditorMsg> for MinimapWidget<'_> {
+	type State = MinimapInkCache;
+
+	fn draw(
+		&self,
+		state: &Self::State,
+		renderer: &iced::Renderer,
+		_theme: &iced::Theme,
+		bounds: iced::Rectangle,
+		_cursor: mouse::Cursor,
+	) -> Vec<canvas::Geometry> {
+		let mut frame = canvas::Frame::new(renderer, bounds.size());
+		let width = (bounds.width.max(1.0) as u32) * MINIMAP_SCALE;
+		let height = (bounds.height.max(1.0) as u32) * MINIMAP_SCALE;
+		let content_height = self.content_height(height);
+		frame.draw_image(
+			iced::Rectangle::new(iced::Point::ORIGIN, bounds.size()),
+			iced::advanced::image::Image::new(self.ink_handle(state, width, height)),
+		);
+
+		// Viewport frame and cursor line as vector overlays on top of the ink.
+		let overlay = self.snapshot.overlay();
+		let doc_lines = overlay.doc_line_count.get().max(1);
+		let content_height_logical = content_height as f32 / MINIMAP_SCALE as f32;
+		let y_of = |line: u64| (line as f32 / doc_lines as f32) * content_height_logical;
+		if content_height > 0 {
+			let top = y_of(overlay.viewport_start_line.get());
+			let bottom = y_of(overlay.viewport_end_line.get()).max(top + 1.0);
+			let accent = color(self.palette.minimap_accent);
+			let frame_color = Color { a: 0.85, ..accent };
+			let size = bounds.size();
+			frame.fill_rectangle(
+				iced::Point::new(0.0, top),
+				iced::Size::new(size.width, 1.0),
+				frame_color,
+			);
+			frame.fill_rectangle(
+				iced::Point::new(0.0, bottom - 1.0),
+				iced::Size::new(size.width, 1.0),
+				frame_color,
+			);
+			frame.fill_rectangle(
+				iced::Point::new(0.0, top),
+				iced::Size::new(1.0, bottom - top),
+				frame_color,
+			);
+			frame.fill_rectangle(
+				iced::Point::new(size.width - 1.0, top),
+				iced::Size::new(1.0, bottom - top),
+				frame_color,
+			);
+			let cursor_y = y_of(overlay.cursor_line.get());
+			frame.fill_rectangle(
+				iced::Point::new(0.0, cursor_y),
+				iced::Size::new(size.width, 1.0),
+				accent,
+			);
+		}
+		vec![frame.into_geometry()]
+	}
+
+	fn update(
+		&self,
+		_state: &mut Self::State,
+		event: &Event,
+		bounds: iced::Rectangle,
+		cursor: mouse::Cursor,
+	) -> Option<canvas::Action<EditorMsg>> {
+		let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+			return None;
+		};
+		let position = cursor.position_in(bounds)?;
+		let overlay = self.snapshot.overlay();
+		let content_height = self.content_height((bounds.height.max(1.0) as u32) * MINIMAP_SCALE)
+			as f32 / MINIMAP_SCALE as f32;
+		if content_height <= 0.0 {
+			return None;
+		}
+		let fraction = (position.y / content_height).clamp(0.0, 1.0);
+		let line = ((fraction as f64) * overlay.doc_line_count.get().max(1) as f64) as u64;
+		let line = line.min(overlay.doc_line_count.get().saturating_sub(1));
+		Some(canvas::Action::publish(EditorMsg::MinimapGoto(
+			DocLine::new(line),
+		)))
+	}
+
+	fn mouse_interaction(
+		&self,
+		_state: &Self::State,
+		bounds: iced::Rectangle,
+		cursor: mouse::Cursor,
+	) -> mouse::Interaction {
+		if cursor.is_over(bounds) {
+			mouse::Interaction::Pointer
+		} else {
+			mouse::Interaction::default()
+		}
+	}
 }
 
 fn map_modifiers(modifiers: keyboard::Modifiers) -> Modifiers {
@@ -2327,6 +2736,112 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	#[test]
+	fn minimap_ink_handle_is_cached_until_content_changes() {
+		use super::{MinimapInkCache, MinimapWidget};
+		use libaryon::core::{DocLine, TokenBin};
+		use libaryon::engine::{
+			MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot,
+			UiPalette,
+		};
+		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+
+		let make_snapshot = |category: TokenCategory| {
+			MinimapSnapshot::Preview(PreviewSnapshot {
+				overlay: MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
+				max_columns: 8,
+				rows: vec![PreviewRow {
+					logical_width: 8,
+					bins: vec![TokenBin::new(category as u8); PREVIEW_BIN_COLUMNS]
+						.into_boxed_slice(),
+				}],
+			})
+		};
+		let snapshot = make_snapshot(TokenCategory::Keyword);
+		let widget = MinimapWidget {
+			snapshot: &snapshot,
+			theme_colors: [None; CATEGORY_COUNT],
+			palette: UiPalette::default(),
+		};
+		let cache = MinimapInkCache::default();
+		let first = widget.ink_handle(&cache, 64, 64);
+		let second = widget.ink_handle(&cache, 64, 64);
+		assert_eq!(
+			first.id(),
+			second.id(),
+			"unchanged content must reuse the handle"
+		);
+
+		let edited = make_snapshot(TokenCategory::Function);
+		let widget = MinimapWidget {
+			snapshot: &edited,
+			..widget
+		};
+		let third = widget.ink_handle(&cache, 64, 64);
+		assert_ne!(first.id(), third.id(), "edits must rebuild the ink image");
+	}
+
+	#[test]
+	fn minimap_ink_uses_per_column_token_colors() {
+		use super::{MinimapPixels, MinimapWidget};
+		use libaryon::core::DocLine;
+		use libaryon::core::Rgb;
+		use libaryon::engine::{
+			EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS, PreviewRow,
+			PreviewSnapshot, UiPalette,
+		};
+		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+
+		let keyword = libaryon::core::TokenBin::new(TokenCategory::Keyword as u8);
+		let function = libaryon::core::TokenBin::new(TokenCategory::Function as u8);
+		// Row 0: left half keywords, right half functions. Row 1: empty.
+		let mut bins = vec![keyword; PREVIEW_BIN_COLUMNS];
+		for bin in bins.iter_mut().skip(PREVIEW_BIN_COLUMNS / 2) {
+			*bin = function;
+		}
+		let rows = vec![
+			PreviewRow {
+				logical_width: 8,
+				bins: bins.into_boxed_slice(),
+			},
+			PreviewRow {
+				logical_width: 0,
+				bins: vec![EMPTY_PREVIEW_BIN; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+			},
+		];
+		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot {
+			overlay: MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
+			max_columns: 8,
+			rows,
+		});
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
+		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 255, 0));
+		let widget = MinimapWidget {
+			snapshot: &snapshot,
+			theme_colors,
+			palette: UiPalette::default(),
+		};
+
+		let base = widget.palette.minimap_surface;
+		let mut image = MinimapPixels::new(64, 64, base);
+		let content_height = widget.content_height(64);
+		widget.render_ink(&mut image, 64, content_height);
+
+		let pixel = |x: u32, y: u32| {
+			let idx = ((y * 64 + x) * 4) as usize;
+			(image.rgba[idx], image.rgba[idx + 1], image.rgba[idx + 2])
+		};
+		// Row 0 spans the top band: left ink leans red, right ink leans green.
+		let (lr, lg, _) = pixel(8, 1);
+		let (rr, rg, _) = pixel(56, 1);
+		assert!(lr > lg, "left half should carry the keyword color");
+		assert!(rg > rr, "right half should carry the function color");
+		// The empty row leaves the surface untouched.
+		let empty_y = widget.sparse_line_px() + 1;
+		assert_eq!(pixel(8, empty_y), (base.r, base.g, base.b));
 	}
 
 	#[test]

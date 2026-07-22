@@ -59,7 +59,7 @@ pub use self::layout::{
 };
 pub use self::minimap::{
 	EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PREVIEW_BIN_COLUMNS,
-	PreviewRow, PreviewSnapshot,
+	PreviewRow, PreviewSnapshot, dominant_preview_bin_for_rows, sample_preview_bin_range,
 };
 pub use self::protocol::{
 	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,

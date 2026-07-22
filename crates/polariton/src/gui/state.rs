@@ -108,7 +108,6 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		events,
 		resize_tick,
 		state.code_editor.subscription().map(Message::CodeEditEvent),
-		time::every(Duration::from_millis(16)).map(|_| Message::CodeEditPoll),
 		window::resize_events().map(|(_, size)| Message::CodeEditResize(size)),
 	])
 }
@@ -385,16 +384,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return run_dashboard_message(app_state, message);
 		}
 		Message::CodeEditEvent(edit_event) => {
-			return app_state
+			let task = app_state
 				.code_editor
 				.update(edit_event)
 				.map(Message::CodeEditEvent);
-		}
-		Message::CodeEditPoll => {
-			app_state.code_editor.poll();
 			if app_state.code_editor.take_quit_request() {
 				return update(app_state, Message::CloseWindow);
 			}
+			return task;
 		}
 		Message::CodeEditResize(size) => {
 			app_state.window_size = size;

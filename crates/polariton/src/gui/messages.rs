@@ -39,7 +39,6 @@ pub enum Message {
 	CloseSettings,
 	CloseWindow,
 	CodeEditEvent(EditorMsg),
-	CodeEditPoll,
 	CodeEditResize(iced::Size),
 	Connect,
 	ConnectionNameChanged(String),

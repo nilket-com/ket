@@ -4,10 +4,12 @@ use libaryon::core::{
 	Rgb, TokenBin, ViewId,
 };
 use libaryon::engine::{
-	EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PREVIEW_BIN_COLUMNS,
-	PreviewRow, PreviewSnapshot, UiPalette,
+	EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PreviewRow,
+	PreviewSnapshot, UiPalette, dominant_preview_bin_for_rows, sample_preview_bin_range,
 };
-use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+use libaryon::svp::rust_highlight::CATEGORY_COUNT;
+#[cfg(test)]
+use libaryon::svp::rust_highlight::TokenCategory;
 use ratatui::{
 	Frame,
 	buffer::Buffer,
@@ -60,6 +62,7 @@ impl ViewEntry {
 	}
 }
 
+#[cfg(test)]
 fn token_bin(category: TokenCategory) -> TokenBin {
 	TokenBin::new(category as u8)
 }
@@ -794,56 +797,6 @@ fn sample_preview_half_bin(
 	)
 }
 
-fn sample_preview_bin_range(
-	row: &PreviewRow,
-	range_start: usize,
-	range_end: usize,
-	total_columns: usize,
-) -> TokenBin {
-	if total_columns == 0 || row.logical_width == 0 {
-		return EMPTY_PREVIEW_BIN;
-	}
-
-	let start_bin = (range_start * PREVIEW_BIN_COLUMNS) / total_columns;
-	let end_bin = (range_end * PREVIEW_BIN_COLUMNS).div_ceil(total_columns);
-	let start_bin = start_bin.min(PREVIEW_BIN_COLUMNS - 1);
-	let end_bin = end_bin.max(start_bin + 1).min(PREVIEW_BIN_COLUMNS);
-	let mut counts = [0u16; CATEGORY_COUNT];
-	let mut saw_unclassified = false;
-
-	for &bin in &row.bins[start_bin..end_bin] {
-		if bin == EMPTY_PREVIEW_BIN {
-			continue;
-		}
-		if bin.index() >= CATEGORY_COUNT {
-			continue;
-		}
-		counts[bin.index()] = counts[bin.index()].saturating_add(1);
-		if bin.index() == TokenCategory::Unclassified as usize {
-			saw_unclassified = true;
-		}
-	}
-
-	let mut best: Option<(usize, u16)> = None;
-	for (idx, &count) in counts.iter().enumerate() {
-		if count == 0 {
-			continue;
-		}
-		match best {
-			Some((_, best_count)) if best_count >= count => {}
-			_ => best = Some((idx, count)),
-		}
-	}
-
-	if let Some((idx, _)) = best {
-		TokenBin::new(idx as u8)
-	} else if saw_unclassified {
-		token_bin(TokenCategory::Unclassified)
-	} else {
-		EMPTY_PREVIEW_BIN
-	}
-}
-
 fn preview_braille_glyph(left_active: bool, right_active: bool) -> Option<char> {
 	let mut mask = 0u8;
 	if left_active {
@@ -890,51 +843,6 @@ fn preview_bin_rgba(
 		base_bg,
 		Rgba([r, g, b, 255]),
 		BlendRatio::new(5, 6),
-	))
-}
-
-fn dominant_preview_bin_for_rows(
-	rows: &[PreviewRow],
-	x_start: usize,
-	x_end: usize,
-	total_columns: usize,
-) -> Option<(TokenBin, u16, u16)> {
-	if rows.is_empty() || total_columns == 0 {
-		return None;
-	}
-
-	let mut counts = [0u16; CATEGORY_COUNT];
-	let mut non_empty = 0u16;
-	for row in rows {
-		let bin = sample_preview_bin_range(row, x_start, x_end, total_columns);
-		if bin == EMPTY_PREVIEW_BIN {
-			continue;
-		}
-		let idx = bin.index();
-		if idx >= CATEGORY_COUNT {
-			continue;
-		}
-		counts[idx] = counts[idx].saturating_add(1);
-		non_empty = non_empty.saturating_add(1);
-	}
-
-	if non_empty == 0 {
-		return None;
-	}
-
-	let mut best_idx = TokenCategory::Unclassified as usize;
-	let mut best_count = 0u16;
-	for (idx, &count) in counts.iter().enumerate() {
-		if count > best_count {
-			best_idx = idx;
-			best_count = count;
-		}
-	}
-
-	Some((
-		TokenBin::new(best_idx as u8),
-		non_empty,
-		rows.len().min(u16::MAX as usize) as u16,
 	))
 }
 
@@ -1240,16 +1148,19 @@ fn render_preview_snapshot(
 #[cfg(test)]
 mod tests {
 	use super::{
-		PREVIEW_BIN_COLUMNS, preview_image_content_height_rows, preview_request_fingerprint,
-		render_minimap_snapshot, render_preview_image, rgb_rgba, token_bin,
+		preview_image_content_height_rows, preview_request_fingerprint, render_minimap_snapshot,
+		render_preview_image, rgb_rgba, token_bin,
 	};
 	use libaryon::core::{DocLine, DocLineCount, PixelHeight, Rgb};
+	use libaryon::engine::PREVIEW_BIN_COLUMNS;
 	use libaryon::engine::UiPalette;
 	use libaryon::engine::{
 		EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PreviewRow,
 		PreviewSnapshot,
 	};
-	use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+	use libaryon::svp::rust_highlight::CATEGORY_COUNT;
+	#[cfg(test)]
+	use libaryon::svp::rust_highlight::TokenCategory;
 	use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 	fn palette_with_search(search_highlight: Rgb) -> UiPalette {
