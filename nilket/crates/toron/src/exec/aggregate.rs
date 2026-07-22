@@ -9,6 +9,22 @@ pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
 const EMPTY_PRIMITIVE_INT64_SUM_BUCKET: u32 = u32::MAX;
 const PRIMITIVE_INT64_SUM_INITIAL_CAPACITY: usize = 1024;
 const PRIMITIVE_INT64_SUM_PRODUCER: &str = "primitive Int64 grouped SUM resident state";
+const BORROW_SINGLE_UTF8_GROUP_KEY_ENV: &str = "TORON_TPCH_BORROW_SINGLE_UTF8_GROUP_KEY";
+
+fn borrow_single_utf8_group_key_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+fn borrow_single_utf8_group_key_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		borrow_single_utf8_group_key_enabled_from_env(
+			std::env::var(BORROW_SINGLE_UTF8_GROUP_KEY_ENV)
+				.ok()
+				.as_deref(),
+		)
+	})
+}
 
 #[derive(Clone, Copy)]
 struct StreamingScanGlobalInput<'a> {
@@ -1236,15 +1252,26 @@ impl Executor {
 				.iter()
 				.map(group_array_reader)
 				.collect::<Result<Vec<_>, _>>()?;
+			let borrow_single_utf8_group_key = borrow_single_utf8_group_key_enabled();
 			let mut key = Vec::with_capacity(group_arrays.len());
 			for row in 0..batch.num_rows() {
-				key.clear();
-				for reader in group_readers.iter() {
-					key.push(reader.value(row));
-				}
-				let states = groups.entry_or_init(&key, aggr_expr.len(), || {
-					init_states(aggr_expr, &aggr_arrays)
-				})?;
+				let states = if borrow_single_utf8_group_key
+					&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
+				{
+					groups.entry_or_init_single_utf8(
+						(!array.is_null(row)).then(|| array.value(row)),
+						aggr_expr.len(),
+						|| init_states(aggr_expr, &aggr_arrays),
+					)?
+				} else {
+					key.clear();
+					for reader in group_readers.iter() {
+						key.push(reader.value(row));
+					}
+					groups.entry_or_init(&key, aggr_expr.len(), || {
+						init_states(aggr_expr, &aggr_arrays)
+					})?
+				};
 				for ((state, input), reader) in states
 					.iter_mut()
 					.zip(aggr_arrays.iter())
@@ -1473,14 +1500,24 @@ impl Executor {
 			.iter()
 			.map(group_array_reader)
 			.collect::<Result<Vec<_>, _>>()?;
+		let borrow_single_utf8_group_key = borrow_single_utf8_group_key_enabled();
 		let mut key = Vec::with_capacity(group_arrays.len());
 		for row in 0..batch.num_rows() {
-			key.clear();
-			for reader in group_readers.iter() {
-				key.push(reader.value(row));
-			}
-			let states =
-				groups.entry_or_init(&key, aggr_expr.len(), || init_bound_states(aggr_expr))?;
+			let states = if borrow_single_utf8_group_key
+				&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
+			{
+				groups.entry_or_init_single_utf8(
+					(!array.is_null(row)).then(|| array.value(row)),
+					aggr_expr.len(),
+					|| init_bound_states(aggr_expr),
+				)?
+			} else {
+				key.clear();
+				for reader in group_readers.iter() {
+					key.push(reader.value(row));
+				}
+				groups.entry_or_init(&key, aggr_expr.len(), || init_bound_states(aggr_expr))?
+			};
 			for ((state, input), reader) in states
 				.iter_mut()
 				.zip(aggr_arrays.iter())
@@ -3601,4 +3638,10 @@ mod tests {
 		assert_eq!(decimals.value(1), -67_800);
 		assert!(decimals.is_null(2));
 	}
+}
+#[test]
+fn adr494_borrow_single_utf8_group_key_ablation_defaults_on() {
+	assert!(borrow_single_utf8_group_key_enabled_from_env(None));
+	assert!(borrow_single_utf8_group_key_enabled_from_env(Some("1")));
+	assert!(!borrow_single_utf8_group_key_enabled_from_env(Some("0")));
 }

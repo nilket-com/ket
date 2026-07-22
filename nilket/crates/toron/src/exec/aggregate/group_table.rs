@@ -372,6 +372,40 @@ impl BoundGroupedAggregateGroups {
 			.ok_or_else(|| table_error("inserted aggregate state is missing"))
 	}
 
+	/// Probe a single UTF-8 group key without allocating an owned `String` on
+	/// every row. The cold insertion path delegates to `entry_or_init`, which
+	/// retains the established ownership and resident-accounting contract.
+	pub(in crate::exec) fn entry_or_init_single_utf8(
+		&mut self,
+		value: Option<&str>,
+		state_count: usize,
+		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
+		let lookup = self.state.lookup_single_utf8(value)?;
+		if let Some(entry) = lookup.entry {
+			if let Some(profile) = self.state.profile.as_mut() {
+				profile.record_lookup(lookup.probes, true);
+				profile.record_probe(
+					ProbePhase::PrimaryOccupied,
+					&lookup,
+					self.state.buckets.len(),
+					self.state.entry_limit,
+				);
+			}
+			return self
+				.state
+				.states
+				.get_mut(entry)
+				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
+		}
+
+		let owned = [match value {
+			Some(value) => GroupValue::Utf8(value.to_owned()),
+			None => GroupValue::Null,
+		}];
+		self.entry_or_init(&owned, state_count, init)
+	}
+
 	pub(in crate::exec) fn finalize_sorted(
 		&mut self,
 	) -> Result<Vec<BoundGroupedAggregateEntry<'_>>, ExecutionError> {
@@ -655,6 +689,17 @@ impl BoundGroupedAggregateGroupState {
 		find_bucket_in(&self.hasher, &self.buckets, &self.keys, key)
 	}
 
+	fn lookup_single_utf8(&self, value: Option<&str>) -> Result<HashLookup, ExecutionError> {
+		if self.buckets.is_empty() {
+			return Ok(HashLookup {
+				bucket: 0,
+				entry: None,
+				probes: 0,
+			});
+		}
+		find_single_utf8_bucket_in(&self.hasher, &self.buckets, &self.keys, value)
+	}
+
 	fn grow(&mut self) -> Result<(), ExecutionError> {
 		let target = if self.entry_limit == 0 {
 			self.initial_entry_capacity
@@ -801,6 +846,64 @@ fn find_bucket_in(
 	Err(table_error(
 		"generic grouped-fold hash table has no free bucket",
 	))
+}
+
+fn find_single_utf8_bucket_in(
+	hasher: &RandomState,
+	buckets: &[u32],
+	keys: &GroupKeyStorage,
+	value: Option<&str>,
+) -> Result<HashLookup, ExecutionError> {
+	if buckets.is_empty() || !buckets.len().is_power_of_two() {
+		return Err(table_error(
+			"grouped-fold hash table has invalid bucket capacity",
+		));
+	}
+	let mut bucket = (hash_single_utf8_key(hasher, value) as usize) & (buckets.len() - 1);
+	for probes in 1..=buckets.len() {
+		let entry = buckets[bucket];
+		if entry == EMPTY_BUCKET {
+			return Ok(HashLookup {
+				bucket,
+				entry: None,
+				probes,
+			});
+		}
+		let entry = entry as usize;
+		let matches = match (keys.key_at(entry), value) {
+			(Some([GroupValue::Utf8(stored)]), Some(value)) => stored == value,
+			(Some([GroupValue::Null]), None) => true,
+			_ => false,
+		};
+		if matches {
+			return Ok(HashLookup {
+				bucket,
+				entry: Some(entry),
+				probes,
+			});
+		}
+		bucket = (bucket + 1) & (buckets.len() - 1);
+	}
+	Err(table_error(
+		"generic grouped-fold hash table has no free bucket",
+	))
+}
+
+fn hash_single_utf8_key(hasher: &RandomState, value: Option<&str>) -> u64 {
+	use std::hash::{BuildHasher, Hash, Hasher};
+
+	let mut state = hasher.build_hasher();
+	// Match `[GroupValue; 1]`'s derived hash exactly without constructing its
+	// owned UTF-8 payload: slice length, enum discriminant, then string bytes.
+	1usize.hash(&mut state);
+	match value {
+		Some(value) => {
+			std::mem::discriminant(&GroupValue::Utf8(String::new())).hash(&mut state);
+			value.hash(&mut state);
+		}
+		None => std::mem::discriminant(&GroupValue::Null).hash(&mut state),
+	}
+	state.finish()
 }
 
 fn occupied_cluster_run_histogram(buckets: &[u32]) -> ProbeHistogram {
@@ -1322,6 +1425,37 @@ mod tests {
 			)
 		);
 		assert!(!directory.exists(), "receipt is published only at finalize");
+	}
+
+	#[test]
+	fn adr494_borrowed_single_utf8_probe_matches_owned_hash_and_allocates_only_on_insert() {
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let owned = [GroupValue::Utf8("R".to_string())];
+		assert_eq!(
+			groups.state.hasher.hash_one(owned.as_slice()),
+			hash_single_utf8_key(&groups.state.hasher, Some("R"))
+		);
+		assert_eq!(
+			groups.state.hasher.hash_one([GroupValue::Null].as_slice()),
+			hash_single_utf8_key(&groups.state.hasher, None)
+		);
+
+		groups
+			.entry_or_init_single_utf8(Some("R"), 1, || Ok(count_state(1)))
+			.expect("insert UTF-8 group");
+		let resident_after_insert = groups.current_resident_bytes();
+		let states = groups
+			.entry_or_init_single_utf8(Some("R"), 1, || panic!("hit must not initialize"))
+			.expect("probe UTF-8 group");
+		assert!(matches!(states.as_slice(), [AggState::Count(1)]));
+		assert_eq!(groups.current_resident_bytes(), resident_after_insert);
+
+		groups
+			.entry_or_init_single_utf8(None, 1, || Ok(count_state(2)))
+			.expect("insert null group");
+		let entries = groups.finalize_sorted().expect("sorted UTF-8 groups");
+		assert!(matches!(entries[0].key, [GroupValue::Null]));
+		assert!(matches!(entries[1].key, [GroupValue::Utf8(value)] if value == "R"));
 	}
 
 	#[test]
