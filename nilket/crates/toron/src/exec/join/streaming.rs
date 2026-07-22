@@ -19,6 +19,7 @@ const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident sta
 const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort input accumulator";
 const LOCAL_RUNTIME_FILTER_ABLATION_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
 const PHYSICAL_SCAN_BUILD_ENV: &str = "TORON_TPCH_PHYSICAL_SCAN_BUILD";
+const RETAIN_FITTING_SCAN_BUILD_ENV: &str = "TORON_TPCH_RETAIN_FITTING_SCAN_BUILD";
 
 fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -26,6 +27,16 @@ fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 
 fn physical_scan_build_enabled() -> bool {
 	physical_scan_build_enabled_from_env(std::env::var(PHYSICAL_SCAN_BUILD_ENV).ok().as_deref())
+}
+
+fn retain_fitting_scan_build_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+fn retain_fitting_scan_build_enabled() -> bool {
+	retain_fitting_scan_build_enabled_from_env(
+		std::env::var(RETAIN_FITTING_SCAN_BUILD_ENV).ok().as_deref(),
+	)
 }
 
 fn local_runtime_filter_enabled_from_env(value: Option<&str>) -> bool {
@@ -4703,32 +4714,51 @@ impl Executor {
 		} else {
 			filter_predicate
 		};
+		let retain_fitting_scan_build = retain_fitting_scan_build_enabled();
+		let mut resident_scan_build = None;
 		let scan_build_estimate = if build_batches.is_none() {
-			Some(
-				self.estimate_streaming_scan_inner_build_bytes(
-					decompose_streaming_scan_probe_input(build_plan)
-						.expect("scan build was established above"),
+			let scan_input = decompose_streaming_scan_probe_input(build_plan)
+				.expect("scan build was established above");
+			let (estimated, batches) = if retain_fitting_scan_build {
+				self.load_or_estimate_streaming_scan_inner_build(
+					scan_input,
 					None,
 					build_keys,
 					null_safe_keys,
 					morsel,
+					self.context.task_budget.memory.get(),
 				)
-				.await?,
-			)
+				.await?
+			} else {
+				(
+					self.estimate_streaming_scan_inner_build_bytes(
+						scan_input,
+						None,
+						build_keys,
+						null_safe_keys,
+						morsel,
+					)
+					.await?,
+					None,
+				)
+			};
+			resident_scan_build = batches;
+			Some(estimated)
 		} else {
 			None
 		};
-		if matches!(
-			scan_build_estimate,
-			Some(estimated) if estimated <= self.context.task_budget.memory.get()
-		) {
-			// Let the caller materialize this proven-fitting physical build, then
-			// re-enter with `build_batches` and stream only the probe scan.
+		if !retain_fitting_scan_build
+			&& matches!(
+				scan_build_estimate,
+				Some(estimated) if estimated <= self.context.task_budget.memory.get()
+			) {
+			// ADR 493 control: preserve the prior estimate-then-materialize behavior.
 			return Ok(None);
 		}
 
 		let build_started = Instant::now();
 		if let Some(estimated_build_bytes) = scan_build_estimate
+			&& resident_scan_build.is_none()
 			&& let Some((build_rows, probe_rows, output_rows)) = self
 				.try_visit_partitioned_streamed_inner_scan_build_scan_probe_chunks(
 					build_plan,
@@ -4764,6 +4794,7 @@ impl Executor {
 			return Ok(Some(()));
 		}
 		if scan_build_estimate.is_some()
+			&& resident_scan_build.is_none()
 			&& let Some((mut spilled, key_plan)) = self
 				.try_create_streamed_spilled_inner_scan_build(
 					build_plan,
@@ -4855,6 +4886,7 @@ impl Executor {
 			return Ok(Some(()));
 		}
 
+		let build_batches = build_batches.or(resident_scan_build.as_deref());
 		let Some(build_batches) = build_batches else {
 			return Ok(None);
 		};
@@ -6344,6 +6376,66 @@ impl Executor {
 			}
 		}
 		Ok(())
+	}
+
+	async fn load_or_estimate_streaming_scan_inner_build(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+		memory_cap: u64,
+	) -> Result<(u64, Option<Vec<RecordBatch>>), ExecutionError> {
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming scan build expected a scan input".to_string(),
+			});
+		};
+		let mut remaining = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let mut stream = self
+			.storage
+			.scan(req)
+			.instrument(span)
+			.await?
+			.into_batches();
+		let mut estimated = 0u64;
+		let mut resident = Some(Vec::new());
+		while let Some(batch) = stream.next().await {
+			let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
+				break;
+			};
+			if let Some(predicate) = scan_input.filter_predicate {
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+				if batch.num_rows() == 0 {
+					continue;
+				}
+			}
+			let batches = if let Some(exchange) = scan_input.exchange {
+				self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
+					.into_iter()
+					.map(|(_, partitioned)| partitioned)
+					.collect::<Vec<_>>()
+			} else {
+				vec![batch]
+			};
+			for batch in batches {
+				estimated = estimated.saturating_add(estimate_streaming_scan_build_batch_bytes(
+					&batch,
+					retained_columns,
+					build_keys,
+					null_safe_keys,
+				)?);
+				if estimated > memory_cap {
+					resident = None;
+				} else if let Some(resident) = resident.as_mut() {
+					resident.push(batch);
+				}
+			}
+		}
+		Ok((estimated, resident))
 	}
 
 	async fn estimate_streaming_scan_inner_build_bytes(
@@ -17922,6 +18014,13 @@ mod tests {
 	}
 
 	#[test]
+	fn adr493_retain_fitting_scan_build_ablation_defaults_on() {
+		assert!(retain_fitting_scan_build_enabled_from_env(None));
+		assert!(retain_fitting_scan_build_enabled_from_env(Some("1")));
+		assert!(!retain_fitting_scan_build_enabled_from_env(Some("0")));
+	}
+
+	#[test]
 	fn adr446_descriptor_uses_source_ordinal_after_projection_reordering() {
 		let base_schema = Arc::new(Schema::new(vec![
 			Field::new("l_orderkey", DataType::Int64, false),
@@ -19043,7 +19142,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn streaming_inner_join_scan_probe_visits_probe_batches_without_materializing_scan() {
+	async fn adr493_streaming_inner_join_scans_fitting_physical_build_once() {
 		let left_schema = Arc::new(Schema::new(vec![
 			Field::new("k", DataType::Int64, false),
 			Field::new("left_value", DataType::Int64, false),
@@ -19138,7 +19237,7 @@ mod tests {
 				.lock()
 				.expect("requested tables")
 				.as_slice(),
-			&[TableId(1), TableId(1), TableId(2)]
+			&[TableId(1), TableId(2)]
 		);
 		let telemetry = telemetry.lock().expect("telemetry");
 		assert_eq!(telemetry.counters.spill_bytes, 0);
@@ -19179,6 +19278,51 @@ mod tests {
 			canonical_arrow_ipc_digest(&materialized, SortPolicy::None)
 				.expect("materialized digest"),
 			"streamed scan left-semi grouped aggregate must match materialized output"
+		);
+	}
+
+	#[tokio::test]
+	async fn adr493_scan_build_accumulator_drops_batches_above_memory_cap() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("k", DataType::Int64, false),
+			Field::new("value", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+			],
+		)
+		.expect("build batch");
+		let requested_tables = Arc::new(Mutex::new(Vec::new()));
+		let executor = Executor::new(Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([(TableId(1), vec![batch])]),
+			requested_tables: requested_tables.clone(),
+		}));
+		let plan = test_scan_plan_with_first_field_key(TableId(1), schema, 1);
+		let scan_input = decompose_streaming_scan_probe_input(&plan).expect("scan input");
+
+		let (estimated, resident) = executor
+			.load_or_estimate_streaming_scan_inner_build(
+				scan_input,
+				None,
+				&[ColumnOrdinal(0)],
+				false,
+				None,
+				1,
+			)
+			.await
+			.expect("scan build estimate");
+
+		assert!(estimated > 1);
+		assert!(resident.is_none());
+		assert_eq!(
+			requested_tables
+				.lock()
+				.expect("requested tables")
+				.as_slice(),
+			&[TableId(1)]
 		);
 	}
 
@@ -19275,7 +19419,7 @@ mod tests {
 				.lock()
 				.expect("requested tables")
 				.as_slice(),
-			&[TableId(1), TableId(1), TableId(2)]
+			&[TableId(1), TableId(2)]
 		);
 	}
 
