@@ -555,6 +555,194 @@ impl ChainStageProfiler {
 	}
 }
 
+// Non-semantic diagnostic instrumentation for the fused streaming inner-join + global (ungrouped)
+// aggregate path (`try_streaming_collapsing_global_aggregate` → scan-probe chunks). It splits the
+// single fused pass into build / probe-scan / probe-key / output-materialize / aggregate-fold and
+// always publishes attributed-vs-total so any un-timed span (e.g. the build-side scan branch or
+// framework overhead) surfaces as an explicit residual rather than false precision. It writes no
+// wire/cluster struct.
+//
+// The phases straddle three functions in one fused pass (collapsing driver → scan-probe chunks →
+// selection materialize/fold), so a local profiler cannot thread through the `visit_batch` closure
+// chain. Instead a process-global accumulator is begun/finished by the driver and written by the
+// leaf call sites. This is sound for the diagnostic contract only: the accumulator is active for at
+// most one fused inner-join-global-aggregate at a time, which holds for the single-query perf child
+// the ledger is read from (each ladder rung runs in its own process). Everything is gated on the
+// env path: when it is unset `local_join_phase_enabled()` is false, no `Instant` is sampled and no
+// lock is taken, so a disabled run is byte-identical and pays no timing cost.
+const LOCAL_JOIN_PHASE_PROFILE_ENV: &str = "TORON_LOCAL_JOIN_PHASE_PROFILE_PATH";
+const LOCAL_JOIN_PHASE_COUNT: usize = 5;
+
+#[derive(Clone, Copy)]
+enum LocalJoinPhase {
+	Build = 0,
+	ProbeScan = 1,
+	ProbeKey = 2,
+	OutputMaterialize = 3,
+	AggregateFold = 4,
+}
+
+impl LocalJoinPhase {
+	const ALL: [Self; LOCAL_JOIN_PHASE_COUNT] = [
+		Self::Build,
+		Self::ProbeScan,
+		Self::ProbeKey,
+		Self::OutputMaterialize,
+		Self::AggregateFold,
+	];
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Build => "build",
+			Self::ProbeScan => "probe_scan",
+			Self::ProbeKey => "probe_key",
+			Self::OutputMaterialize => "output_materialize",
+			Self::AggregateFold => "aggregate_fold",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Default)]
+struct LocalJoinPhaseMeasurement {
+	micros: u64,
+	batches: u64,
+	input_rows: u64,
+	output_rows: u64,
+}
+
+struct LocalJoinPhaseAccumulator {
+	started: Instant,
+	build_rows: u64,
+	probe_rows: u64,
+	matched_rows: u64,
+	phases: [LocalJoinPhaseMeasurement; LOCAL_JOIN_PHASE_COUNT],
+}
+
+static LOCAL_JOIN_PHASE_LEDGER: Mutex<Option<LocalJoinPhaseAccumulator>> = Mutex::new(None);
+
+fn local_join_phase_path() -> Option<&'static PathBuf> {
+	static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+	PATH.get_or_init(|| std::env::var_os(LOCAL_JOIN_PHASE_PROFILE_ENV).map(PathBuf::from))
+		.as_ref()
+}
+
+fn local_join_phase_enabled() -> bool {
+	local_join_phase_path().is_some()
+}
+
+/// Arm the accumulator for one fused inner-join global aggregate. No-op unless the env path is set.
+fn local_join_phase_begin() {
+	if !local_join_phase_enabled() {
+		return;
+	}
+	if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
+		*slot = Some(LocalJoinPhaseAccumulator {
+			started: Instant::now(),
+			build_rows: 0,
+			probe_rows: 0,
+			matched_rows: 0,
+			phases: [LocalJoinPhaseMeasurement::default(); LOCAL_JOIN_PHASE_COUNT],
+		});
+	}
+}
+
+fn local_join_phase_record_elapsed(phase: LocalJoinPhase, started: Instant) {
+	if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
+		if let Some(accumulator) = slot.as_mut() {
+			let measurement = &mut accumulator.phases[phase as usize];
+			measurement.micros = measurement.micros.saturating_add(duration_micros(started));
+		}
+	}
+}
+
+fn local_join_phase_record_flow(
+	phase: LocalJoinPhase,
+	batches: u64,
+	input_rows: u64,
+	output_rows: u64,
+) {
+	if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
+		if let Some(accumulator) = slot.as_mut() {
+			let measurement = &mut accumulator.phases[phase as usize];
+			measurement.batches = measurement.batches.saturating_add(batches);
+			measurement.input_rows = measurement.input_rows.saturating_add(input_rows);
+			measurement.output_rows = measurement.output_rows.saturating_add(output_rows);
+		}
+	}
+}
+
+fn local_join_phase_set_counts(build_rows: u64, probe_rows: u64, matched_rows: u64) {
+	if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
+		if let Some(accumulator) = slot.as_mut() {
+			accumulator.build_rows = accumulator.build_rows.saturating_add(build_rows);
+			accumulator.probe_rows = accumulator.probe_rows.saturating_add(probe_rows);
+			accumulator.matched_rows = accumulator.matched_rows.saturating_add(matched_rows);
+		}
+	}
+}
+
+/// Disarm the accumulator and write the ledger. `drive_completed` records whether the fused
+/// dispatch actually ran to finalize, so a declined dispatch is never read as a full attribution.
+fn local_join_phase_finish(drive_completed: bool) -> Result<(), ExecutionError> {
+	if !local_join_phase_enabled() {
+		return Ok(());
+	}
+	let accumulator = match LOCAL_JOIN_PHASE_LEDGER.lock() {
+		Ok(mut slot) => slot.take(),
+		Err(_) => return Ok(()),
+	};
+	let Some(accumulator) = accumulator else {
+		return Ok(());
+	};
+	let Some(path) = local_join_phase_path() else {
+		return Ok(());
+	};
+	let total_micros = duration_micros(accumulator.started);
+	let attributed_micros = accumulator
+		.phases
+		.iter()
+		.fold(0u64, |total, phase| total.saturating_add(phase.micros));
+	// saturating_sub, never checked_sub: the fused sub-intervals sit at or below the drive total,
+	// but Instant granularity could nudge the sum over — clamp to zero and always publish both
+	// figures so any overlap or un-timed span reads as an honest residual, never false precision.
+	let unattributed_residual_micros = total_micros.saturating_sub(attributed_micros);
+	let phases = LocalJoinPhase::ALL
+		.iter()
+		.map(|phase| {
+			let measurement = accumulator.phases[*phase as usize];
+			serde_json::json!({
+				"phase": phase.name(),
+				"micros": measurement.micros,
+				"batches": measurement.batches,
+				"input_rows": measurement.input_rows,
+				"output_rows": measurement.output_rows,
+			})
+		})
+		.collect::<Vec<_>>();
+	let value = serde_json::json!({
+		"suite": "local_join_phase_ledger",
+		"drive_completed": drive_completed,
+		"build_rows": accumulator.build_rows,
+		"probe_rows": accumulator.probe_rows,
+		"matched_rows": accumulator.matched_rows,
+		"total_execute_micros": total_micros,
+		"attributed_micros": attributed_micros,
+		"unattributed_residual_micros": unattributed_residual_micros,
+		"phases": phases,
+	});
+	let temporary = path.with_extension("tmp");
+	let contents = serde_json::to_vec_pretty(&value).map_err(|error| ExecutionError::Kernel {
+		message: format!("local join phase profile serialization failed: {error}"),
+	})?;
+	std::fs::write(&temporary, contents).map_err(|error| ExecutionError::Kernel {
+		message: format!("local join phase profile snapshot write failed: {error}"),
+	})?;
+	std::fs::rename(&temporary, path).map_err(|error| ExecutionError::Kernel {
+		message: format!("local join phase profile snapshot rename failed: {error}"),
+	})?;
+	Ok(())
+}
+
 struct Int64PresenceSet {
 	buckets: Vec<u32>,
 	entries: Vec<i64>,
@@ -5050,6 +5238,19 @@ impl Executor {
 				.build_rows
 				.saturating_add(build_batch.num_rows() as u64);
 		});
+		if local_join_phase_enabled() {
+			// Hash-build only (concat + key_arrays + table). The build-side scan that produced
+			// `build_batches` is timed at its `execute_bound` call sites, or falls to the residual
+			// on the physical-scan-build branch.
+			local_join_phase_record_elapsed(LocalJoinPhase::Build, build_started);
+			local_join_phase_record_flow(
+				LocalJoinPhase::Build,
+				1,
+				build_batch.num_rows() as u64,
+				0,
+			);
+			local_join_phase_set_counts(build_batch.num_rows() as u64, 0, 0);
+		}
 
 		let probe_started = Instant::now();
 		let result = self
@@ -5080,6 +5281,11 @@ impl Executor {
 					task.counters.matched_rows.saturating_add(*output_rows);
 			}
 		});
+		if local_join_phase_enabled() {
+			if let Ok((probe_rows, output_rows)) = &result {
+				local_join_phase_set_counts(0, *probe_rows, *output_rows);
+			}
+		}
 		let (probe_rows, output_rows) = result?;
 		record_join_runtime_observation(
 			&self.context.task_telemetry,
@@ -7381,6 +7587,7 @@ impl Executor {
 		let mut output_rows = 0u64;
 		let mut process_probe_batch = |right_batch: RecordBatch| -> Result<(), ExecutionError> {
 			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+			let key_started = local_join_phase_enabled().then(Instant::now);
 			let right_key_arrays = key_arrays(&right_batch, probe_keys)?;
 			let selection = probe_in_memory_join_rows(
 				JoinKind::Inner,
@@ -7394,6 +7601,15 @@ impl Executor {
 				&right_batch,
 				null_safe_keys,
 			)?;
+			if let Some(started) = key_started {
+				local_join_phase_record_elapsed(LocalJoinPhase::ProbeKey, started);
+				local_join_phase_record_flow(
+					LocalJoinPhase::ProbeKey,
+					1,
+					right_batch.num_rows() as u64,
+					selection.len() as u64,
+				);
+			}
 			output_rows = output_rows.saturating_add(selection.len() as u64);
 			self.visit_reoriented_inner_selection_filtered_chunks(
 				build_batch,
@@ -7420,7 +7636,13 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
+			// `loop` (not `while let`) so the probe-scan timer can bracket `stream.next().await`
+			// (the decode); break conditions are identical to the prior `while let`.
+			loop {
+				let scan_started = local_join_phase_enabled().then(Instant::now);
+				let Some(batch) = stream.next().await else {
+					break;
+				};
 				let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining)
 				else {
 					break;
@@ -7444,6 +7666,15 @@ impl Executor {
 					if right_batch.num_rows() == 0 {
 						continue;
 					}
+				}
+				if let Some(started) = scan_started {
+					local_join_phase_record_elapsed(LocalJoinPhase::ProbeScan, started);
+					local_join_phase_record_flow(
+						LocalJoinPhase::ProbeScan,
+						1,
+						right_batch.num_rows() as u64,
+						right_batch.num_rows() as u64,
+					);
 				}
 				for (_, partitioned) in self.repartition_exchange_batch(
 					&right_batch,
@@ -7467,7 +7698,13 @@ impl Executor {
 				.instrument(span)
 				.await?
 				.into_batches();
-			while let Some(batch) = stream.next().await {
+			// `loop` (not `while let`) so the probe-scan timer can bracket `stream.next().await`
+			// (the decode); break conditions are identical to the prior `while let`.
+			loop {
+				let scan_started = local_join_phase_enabled().then(Instant::now);
+				let Some(batch) = stream.next().await else {
+					break;
+				};
 				let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining)
 				else {
 					break;
@@ -7492,6 +7729,15 @@ impl Executor {
 						continue;
 					}
 				}
+				if let Some(started) = scan_started {
+					local_join_phase_record_elapsed(LocalJoinPhase::ProbeScan, started);
+					local_join_phase_record_flow(
+						LocalJoinPhase::ProbeScan,
+						1,
+						right_batch.num_rows() as u64,
+						right_batch.num_rows() as u64,
+					);
+				}
 				process_probe_batch(right_batch)?;
 			}
 		}
@@ -7512,6 +7758,7 @@ impl Executor {
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
 		for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let materialize_started = local_join_phase_enabled().then(Instant::now);
 			let batch = materialize_reoriented_inner_selection(
 				probe_batch,
 				build_batch,
@@ -7525,8 +7772,25 @@ impl Executor {
 			} else {
 				batch
 			};
+			if let Some(started) = materialize_started {
+				local_join_phase_record_elapsed(LocalJoinPhase::OutputMaterialize, started);
+				local_join_phase_record_flow(
+					LocalJoinPhase::OutputMaterialize,
+					1,
+					chunk.len() as u64,
+					batch.num_rows() as u64,
+				);
+			}
 			if batch.num_rows() > 0 {
+				// For the fused ungrouped-count path `visit_batch` is the global fold; timing it
+				// here isolates aggregate-fold from output-materialize (the load-bearing split).
+				let fold_started = local_join_phase_enabled().then(Instant::now);
+				let fold_rows = batch.num_rows() as u64;
 				visit_batch(batch)?;
+				if let Some(started) = fold_started {
+					local_join_phase_record_elapsed(LocalJoinPhase::AggregateFold, started);
+					local_join_phase_record_flow(LocalJoinPhase::AggregateFold, 1, fold_rows, 0);
+				}
 			}
 		}
 		Ok(())
@@ -7598,7 +7862,11 @@ impl Executor {
 			{
 				return Ok(Some(()));
 			}
+			let build_scan_started = local_join_phase_enabled().then(Instant::now);
 			let build_batches = self.execute_bound(right, morsel).await?;
+			if let Some(started) = build_scan_started {
+				local_join_phase_record_elapsed(LocalJoinPhase::Build, started);
+			}
 			if self
 				.try_visit_streaming_inner_join_scan_probe_chunks(
 					right,
@@ -7649,10 +7917,14 @@ impl Executor {
 			{
 				return Ok(Some(()));
 			}
+			let build_scan_started = local_join_phase_enabled().then(Instant::now);
 			let build_batches = match left_batches.take() {
 				Some(batches) => batches,
 				None => self.execute_bound(left, morsel).await?,
 			};
+			if let Some(started) = build_scan_started {
+				local_join_phase_record_elapsed(LocalJoinPhase::Build, started);
+			}
 			if self
 				.try_visit_streaming_inner_join_scan_probe_chunks(
 					left,
@@ -8977,6 +9249,10 @@ impl Executor {
 		let root_started = profile_ref
 			.map(GlobalFoldJoinFilterProfile::begin_root)
 			.transpose()?;
+		// Arm the phase ledger for this fused inner-join global aggregate (no-op unless the env path
+		// is set). The leaf scan-probe/materialize/fold sites accumulate into it; it is disarmed and
+		// written below once the fused dispatch resolves.
+		local_join_phase_begin();
 		// ADR 438: the profiled visitor carries several timer-bearing join futures. Keep this parent
 		// aggregate future pointer-sized so deep reoriented plan chains do not stack every child state
 		// machine inline (the same bounded-future discipline as the boxed profile state itself).
@@ -9018,8 +9294,12 @@ impl Executor {
 			if let Some(profile) = profile_ref {
 				profile.persist()?;
 			}
+			local_join_phase_finish(true)?;
 			return Ok(Some(output));
 		}
+		// Fused dispatch declined; disarm the ledger (drive_completed=false) so a partial attribution
+		// is never mistaken for a full one, and so the generic fallback below does not inherit it.
+		local_join_phase_finish(false)?;
 		if profile.is_some() {
 			return Err(ExecutionError::Kernel {
 				message:

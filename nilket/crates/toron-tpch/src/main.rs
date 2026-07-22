@@ -291,6 +291,24 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
 	row["hash_smaller_build"] = serde_json::json!(hash_smaller_build);
 	row["hash_smaller_build_provenance"] = serde_json::json!(hash_smaller_build_provenance);
+	// Diagnostic: when TORON_LOCAL_JOIN_PHASE_PROFILE_PATH is set the engine writes one phase
+	// ledger for the local in-memory inner-join drive loop. Fold it into this row so the buckets
+	// travel alongside the identity/receipt fields (build_commit, plan_fingerprint, digest,
+	// output_row_count, local_join_admissions, spill_bytes, join_spill_observations) already here.
+	if let Some(path) = std::env::var_os("TORON_LOCAL_JOIN_PHASE_PROFILE_PATH") {
+		match std::fs::read_to_string(&path) {
+			Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+				Ok(ledger) => row["local_join_phase_ledger"] = ledger,
+				Err(error) => {
+					row["local_join_phase_ledger_error"] =
+						serde_json::json!(format!("parse: {error}"));
+				}
+			},
+			Err(error) => {
+				row["local_join_phase_ledger_error"] = serde_json::json!(format!("read: {error}"));
+			}
+		}
+	}
 	println!("{row}");
 	ExitCode::SUCCESS
 }
