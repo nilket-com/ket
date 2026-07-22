@@ -239,6 +239,19 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			return ExitCode::SUCCESS;
 		}
 	}
+	// Clear any prior phase ledger before the run so the row can only ever attach THIS run's file
+	// (or none). The engine's scope guard always rewrites it when the fused path is armed, but an
+	// unarmed shape writes nothing — without this removal that would attach a stale prior run's
+	// identity-bearing ledger.
+	if let Some(path) = std::env::var_os("TORON_LOCAL_JOIN_PHASE_PROFILE_PATH") {
+		match std::fs::remove_file(&path) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				return harness_error(&format!("clear local join phase ledger {path:?}: {error}"));
+			}
+		}
+	}
 	let attempt_result = match engine {
 		PerfEngine::Toron => {
 			run_perf_query_with_data_source(
@@ -304,6 +317,9 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 						serde_json::json!(format!("parse: {error}"));
 				}
 			},
+			// The path was cleared before the run; an absent file simply means this query shape did
+			// not arm the ledger — not an error. Only surface genuine read failures on a real file.
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
 			Err(error) => {
 				row["local_join_phase_ledger_error"] = serde_json::json!(format!("read: {error}"));
 			}

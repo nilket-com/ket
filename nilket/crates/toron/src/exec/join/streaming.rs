@@ -630,20 +630,37 @@ fn local_join_phase_enabled() -> bool {
 	local_join_phase_path().is_some()
 }
 
-/// Arm the accumulator for one fused inner-join global aggregate. No-op unless the env path is set.
-fn local_join_phase_begin() {
-	if !local_join_phase_enabled() {
-		return;
+/// Dropping this disarms the accumulator on any path that did not already finish it, writing
+/// `drive_completed=false`. This makes the write unconditional across every exit — error, early
+/// return, or panic — so a later run can never read a stale file left by an aborted run. On the
+/// success path `local_join_phase_finish(true)` has already taken the accumulator, so the guard's
+/// disarm finds nothing and is a no-op.
+struct LocalJoinPhaseGuard;
+
+impl Drop for LocalJoinPhaseGuard {
+	fn drop(&mut self) {
+		// Best-effort: Drop cannot surface a Result, and a failed diagnostic write must never mask
+		// the real execution outcome.
+		let _ = local_join_phase_finish(false);
 	}
-	if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
-		*slot = Some(LocalJoinPhaseAccumulator {
-			started: Instant::now(),
-			build_rows: 0,
-			probe_rows: 0,
-			matched_rows: 0,
-			phases: [LocalJoinPhaseMeasurement::default(); LOCAL_JOIN_PHASE_COUNT],
-		});
+}
+
+/// Arm the accumulator for one fused inner-join global aggregate and return a guard that guarantees
+/// it is disarmed and persisted on every exit. No-op (still returns a guard) unless the env path is
+/// set.
+fn local_join_phase_begin() -> LocalJoinPhaseGuard {
+	if local_join_phase_enabled() {
+		if let Ok(mut slot) = LOCAL_JOIN_PHASE_LEDGER.lock() {
+			*slot = Some(LocalJoinPhaseAccumulator {
+				started: Instant::now(),
+				build_rows: 0,
+				probe_rows: 0,
+				matched_rows: 0,
+				phases: [LocalJoinPhaseMeasurement::default(); LOCAL_JOIN_PHASE_COUNT],
+			});
+		}
 	}
+	LocalJoinPhaseGuard
 }
 
 fn local_join_phase_record_elapsed(phase: LocalJoinPhase, started: Instant) {
@@ -9250,9 +9267,10 @@ impl Executor {
 			.map(GlobalFoldJoinFilterProfile::begin_root)
 			.transpose()?;
 		// Arm the phase ledger for this fused inner-join global aggregate (no-op unless the env path
-		// is set). The leaf scan-probe/materialize/fold sites accumulate into it; it is disarmed and
-		// written below once the fused dispatch resolves.
-		local_join_phase_begin();
+		// is set). The leaf scan-probe/materialize/fold sites accumulate into it; the guard disarms
+		// and persists it on every exit (writing drive_completed=false on any path that does not
+		// reach the success finish below).
+		let _phase_guard = local_join_phase_begin();
 		// ADR 438: the profiled visitor carries several timer-bearing join futures. Keep this parent
 		// aggregate future pointer-sized so deep reoriented plan chains do not stack every child state
 		// machine inline (the same bounded-future discipline as the boxed profile state itself).
@@ -9297,9 +9315,9 @@ impl Executor {
 			local_join_phase_finish(true)?;
 			return Ok(Some(output));
 		}
-		// Fused dispatch declined; disarm the ledger (drive_completed=false) so a partial attribution
-		// is never mistaken for a full one, and so the generic fallback below does not inherit it.
-		local_join_phase_finish(false)?;
+		// Every non-success exit (declined dispatch, error via `?`, or panic) is handled by
+		// `_phase_guard`, which writes drive_completed=false — so a partial attribution is never
+		// mistaken for a full one, and the generic fallback below never inherits a stale ledger.
 		if profile.is_some() {
 			return Err(ExecutionError::Kernel {
 				message:
