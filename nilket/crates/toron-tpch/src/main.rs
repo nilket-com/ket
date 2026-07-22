@@ -2189,6 +2189,7 @@ fn run_polars_perf_export(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 }
 
@@ -2538,6 +2539,7 @@ fn polars_unsupported_attempt(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 }
 
@@ -2582,6 +2584,7 @@ fn polars_fail_attempt(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 }
 
