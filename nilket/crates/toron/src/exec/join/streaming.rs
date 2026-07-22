@@ -18,6 +18,15 @@ const INT64_PRESENCE_PRODUCER: &str = "membership presence set resident state";
 const PARTITION_REPLAY_PRODUCER: &str = "partition-at-a-time replay resident state";
 const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort input accumulator";
 const LOCAL_RUNTIME_FILTER_ABLATION_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
+const PHYSICAL_SCAN_BUILD_ENV: &str = "TORON_TPCH_PHYSICAL_SCAN_BUILD";
+
+fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+fn physical_scan_build_enabled() -> bool {
+	physical_scan_build_enabled_from_env(std::env::var(PHYSICAL_SCAN_BUILD_ENV).ok().as_deref())
+}
 
 fn local_runtime_filter_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(
@@ -4694,27 +4703,52 @@ impl Executor {
 		} else {
 			filter_predicate
 		};
+		let scan_build_estimate = if build_batches.is_none() {
+			Some(
+				self.estimate_streaming_scan_inner_build_bytes(
+					decompose_streaming_scan_probe_input(build_plan)
+						.expect("scan build was established above"),
+					None,
+					build_keys,
+					null_safe_keys,
+					morsel,
+				)
+				.await?,
+			)
+		} else {
+			None
+		};
+		if matches!(
+			scan_build_estimate,
+			Some(estimated) if estimated <= self.context.task_budget.memory.get()
+		) {
+			// Let the caller materialize this proven-fitting physical build, then
+			// re-enter with `build_batches` and stream only the probe scan.
+			return Ok(None);
+		}
 
 		let build_started = Instant::now();
-		if let Some((build_rows, probe_rows, output_rows)) = self
-			.try_visit_partitioned_streamed_inner_scan_build_scan_probe_chunks(
-				build_plan,
-				probe_plan,
-				scan_input,
-				build_keys,
-				probe_keys,
-				match_filter,
-				null_safe_keys,
-				output_schema,
-				probe_prefilter_predicate,
-				join_filter_predicate,
-				probe_columns_first,
-				morsel,
-				replay_id,
-				profile,
-				&mut *visit_batch,
-			)
-			.await?
+		if let Some(estimated_build_bytes) = scan_build_estimate
+			&& let Some((build_rows, probe_rows, output_rows)) = self
+				.try_visit_partitioned_streamed_inner_scan_build_scan_probe_chunks(
+					build_plan,
+					probe_plan,
+					scan_input,
+					build_keys,
+					probe_keys,
+					match_filter,
+					null_safe_keys,
+					output_schema,
+					probe_prefilter_predicate,
+					join_filter_predicate,
+					probe_columns_first,
+					morsel,
+					replay_id,
+					estimated_build_bytes,
+					profile,
+					&mut *visit_batch,
+				)
+				.await?
 		{
 			record_join_runtime_observation(
 				&self.context.task_telemetry,
@@ -4729,17 +4763,18 @@ impl Executor {
 			);
 			return Ok(Some(()));
 		}
-		if let Some((mut spilled, key_plan)) = self
-			.try_create_streamed_spilled_inner_scan_build(
-				build_plan,
-				probe_plan,
-				build_keys,
-				probe_keys,
-				match_filter,
-				null_safe_keys,
-				morsel,
-			)
-			.await?
+		if scan_build_estimate.is_some()
+			&& let Some((mut spilled, key_plan)) = self
+				.try_create_streamed_spilled_inner_scan_build(
+					build_plan,
+					probe_plan,
+					build_keys,
+					probe_keys,
+					match_filter,
+					null_safe_keys,
+					morsel,
+				)
+				.await?
 		{
 			let attributed_spill_bytes = spilled.spill_bytes();
 			let materialized_output_schema = if probe_columns_first {
@@ -5025,6 +5060,12 @@ impl Executor {
 				output_rows: RowCount::new(output_rows),
 			},
 		);
+		record_join_spill_observation(
+			&self.context.task_telemetry,
+			replay_id,
+			crate::distributed::task::JoinSpillPath::InMemory,
+			0,
+		);
 		Ok(Some(()))
 	}
 
@@ -5044,6 +5085,7 @@ impl Executor {
 		probe_columns_first: bool,
 		morsel: Option<(MorselId, u32)>,
 		replay_id: JoinReplayId,
+		estimated_build_bytes: u64,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
 		visit_batch: &mut F,
 	) -> Result<Option<(u64, u64, u64)>, ExecutionError>
@@ -5056,22 +5098,6 @@ impl Executor {
 		let Some(build_scan_input) = decompose_streaming_scan_probe_input(build_plan) else {
 			return Ok(None);
 		};
-		let estimate_timer = profile
-			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
-			.transpose()?;
-		let estimated_build_bytes = self
-			.estimate_streaming_scan_inner_build_bytes(
-				build_scan_input,
-				None,
-				build_keys,
-				null_safe_keys,
-				morsel,
-			)
-			.await;
-		if let Some(timer) = estimate_timer {
-			timer.finish()?;
-		}
-		let estimated_build_bytes = estimated_build_bytes?;
 		if estimated_build_bytes <= self.context.task_budget.memory.get() {
 			return Ok(None);
 		}
@@ -7447,10 +7473,16 @@ impl Executor {
 
 		let left_is_scan_probe = decompose_streaming_scan_probe_input(left).is_some();
 		let right_is_scan_probe = decompose_streaming_scan_probe_input(right).is_some();
+		let physical_scan_build = physical_scan_build_enabled();
 		let mut left_batches = None;
 		let mut right_batches = None;
-		if left_is_scan_probe {
+		// Both scan inputs still obey the physical join contract: left builds and
+		// right probes. In particular, SwappedRightBuild has already moved the
+		// selected smaller build to the left. Trying the symmetric scan route first
+		// silently undoes that placement and can spill the larger declared probe.
+		if left_is_scan_probe && (!right_is_scan_probe || !physical_scan_build) {
 			if right_is_scan_probe
+				&& !physical_scan_build
 				&& self
 					.try_visit_streaming_inner_join_scan_probe_chunks(
 						right,
@@ -17883,6 +17915,13 @@ mod tests {
 	}
 
 	#[test]
+	fn adr492_physical_scan_build_ablation_defaults_on() {
+		assert!(physical_scan_build_enabled_from_env(None));
+		assert!(physical_scan_build_enabled_from_env(Some("1")));
+		assert!(!physical_scan_build_enabled_from_env(Some("0")));
+	}
+
+	#[test]
 	fn adr446_descriptor_uses_source_ordinal_after_projection_reordering() {
 		let base_schema = Arc::new(Schema::new(vec![
 			Field::new("l_orderkey", DataType::Int64, false),
@@ -19045,13 +19084,16 @@ mod tests {
 			]),
 			requested_tables: requested_tables.clone(),
 		});
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 		let executor = Executor::with_context(
 			storage,
-			ExecutionContext::local_test().with_task_budget(TaskBudget {
-				memory: ByteCount::new(256 * 1024 * 1024),
-				spill_bytes: ByteCount::new(256 * 1024 * 1024),
-				..TaskBudget::from_query_budget(QueryBudget::test_default())
-			}),
+			ExecutionContext::local_test()
+				.with_task_budget(TaskBudget {
+					memory: ByteCount::new(256 * 1024 * 1024),
+					spill_bytes: ByteCount::new(256 * 1024 * 1024),
+					..TaskBudget::from_query_budget(QueryBudget::test_default())
+				})
+				.with_task_telemetry(telemetry.clone()),
 		);
 		let join = inner_join_plan(
 			test_scan_plan_with_first_field_key(TableId(1), left_schema.clone(), 1),
@@ -19073,8 +19115,8 @@ mod tests {
 		assert!(matched.is_some());
 		assert_eq!(
 			visited.len(),
-			1,
-			"the scan-probe side should be joined and visited without first materializing it"
+			2,
+			"the physical right probe should stream its two scan batches"
 		);
 		let joined =
 			concat_or_empty(join.schema(), &visited).expect("joined scan-probe output batches");
@@ -19096,7 +19138,17 @@ mod tests {
 				.lock()
 				.expect("requested tables")
 				.as_slice(),
-			&[TableId(2), TableId(2), TableId(1)]
+			&[TableId(1), TableId(1), TableId(2)]
+		);
+		let telemetry = telemetry.lock().expect("telemetry");
+		assert_eq!(telemetry.counters.spill_bytes, 0);
+		assert_eq!(
+			telemetry.join_spill_observations,
+			vec![crate::distributed::task::JoinSpillObservation {
+				replay_id: JoinReplayId(0),
+				path: crate::distributed::task::JoinSpillPath::InMemory,
+				spill_bytes: 0,
+			}]
 		);
 	}
 
@@ -19200,8 +19252,8 @@ mod tests {
 		assert!(matched.is_some());
 		assert_eq!(
 			visited.len(),
-			2,
-			"left scan probe should stream each scan batch after building the right side"
+			1,
+			"the physical right probe should stream after building the left side"
 		);
 		let joined =
 			concat_or_empty(join.schema(), &visited).expect("joined scan-probe output batches");
@@ -19223,7 +19275,7 @@ mod tests {
 				.lock()
 				.expect("requested tables")
 				.as_slice(),
-			&[TableId(2), TableId(2), TableId(1)]
+			&[TableId(1), TableId(1), TableId(2)]
 		);
 	}
 
