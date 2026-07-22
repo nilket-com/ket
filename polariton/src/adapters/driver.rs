@@ -68,6 +68,7 @@ impl AdapterConfiguration {
 	/// Rebuild an adapter configuration after libaryon has decrypted an opaque
 	/// saved connection profile. Keeping this mapping here prevents a frontend
 	/// from needing to know the adapter-specific configuration shape.
+	#[allow(dead_code)] // The encrypted-profile reader is the next consumer.
 	pub fn from_saved(adapter_type: &str, config_value: &str) -> Self {
 		match adapter_type {
 			"BigQuery" => AdapterConfiguration::BigQuery {
