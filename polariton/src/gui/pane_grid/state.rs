@@ -364,6 +364,7 @@ impl State {
 	pub fn apply(&mut self, action: Action) {
 		match action {
 			Action::DragStarted(split_id) => {
+				self.clear_pane_dragging();
 				self.set_dragging(Some(split_id));
 			}
 			Action::DragMoved(split_id, ratio) => {
@@ -385,6 +386,7 @@ impl State {
 				self.toggle_maximize(pane);
 			}
 			Action::PaneDragStarted(pane, origin) => {
+				self.set_dragging(None);
 				self.set_pane_dragging(PaneDrag {
 					pane,
 					origin,
@@ -430,5 +432,31 @@ impl State {
 				self.clear_pane_dragging();
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn split_resize_and_pane_reorder_drags_are_mutually_exclusive() {
+		let (mut state, first_pane) = State::with_initial_pane();
+		let (split, _) = state.split(Axis::Vertical, first_pane).unwrap();
+		let origin = Point::new(10.0, 10.0);
+
+		state.apply(Action::DragStarted(split));
+		assert_eq!(state.dragging(), Some(split));
+
+		state.apply(Action::PaneDragStarted(first_pane, origin));
+		assert_eq!(state.dragging(), None);
+		assert_eq!(
+			state.pane_dragging().map(|drag| drag.pane),
+			Some(first_pane)
+		);
+
+		state.apply(Action::DragStarted(split));
+		assert_eq!(state.dragging(), Some(split));
+		assert!(state.pane_dragging().is_none());
 	}
 }

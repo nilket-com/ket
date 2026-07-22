@@ -395,8 +395,9 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 					PaneCol::new(right.saturating_sub(left)),
 					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS),
 				);
-				// Horizontal gaps are a single row; grow the grab area upward
-				// and downward so the boundary is comfortably clickable.
+				// Horizontal gaps are a single row. Grow the grab area into the
+				// pane above, but never into the lower pane's header: that header is
+				// the pane-reordering handle and must own its entire hit area.
 				let hit = PaneRect::new(
 					ScreenCol::new(left),
 					ScreenRow::new(
@@ -407,7 +408,7 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 							.saturating_sub(DIVIDER_HIT_PADDING),
 					),
 					PaneCol::new(right.saturating_sub(left)),
-					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS + DIVIDER_HIT_PADDING * 2),
+					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS + DIVIDER_HIT_PADDING),
 				);
 				dividers.push(PaneDividerViewport {
 					before: before.pane_id,
@@ -1467,30 +1468,33 @@ pub(crate) fn merge_highlights(
 	let mut merged = Vec::with_capacity(lexical.len() + semantic.len());
 
 	for &lex_span in lexical {
-		let search = semantic.partition_point(|span| span.end <= lex_span.start);
-		let mut overwritten = false;
-		if let Some(sem_span) = semantic[search..].first()
-			&& sem_span.start < lex_span.end
-		{
-			overwritten = true;
-		}
+		// Semantic providers may layer a parent-language span with injected
+		// language spans. Do not use `partition_point` here: nested spans are not
+		// ordered by end, so its monotonic predicate requirement does not hold.
+		let overwritten = semantic
+			.iter()
+			.any(|span| span.start < lex_span.end && span.end > lex_span.start);
 		if !overwritten {
 			merged.push(lex_span);
 		}
 	}
 
 	merged.extend_from_slice(semantic);
-	merged.sort_unstable_by_key(|span| span.start);
+	// Rendering searches this list from the end. A stable sort preserves the
+	// provider's layer order for equal starts, so injected spans appended after
+	// their parent language deterministically win.
+	merged.sort_by_key(|span| span.start);
 	merged
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{project_gutter_line_numbers, viewport_is_busy};
-	use crate::core::DocLine;
+	use super::{merge_highlights, project_gutter_line_numbers, viewport_is_busy};
+	use crate::core::{DocByte, DocLine};
 	use crate::engine::GutterNumbering;
 	use crate::engine::folding::FoldSet;
 	use crate::engine::test_support::build_foldable_document;
+	use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 
 	fn number_for(numbers: &[crate::uast::projection::GutterLineNumber], line: u64) -> u64 {
 		numbers
@@ -1549,5 +1553,31 @@ mod tests {
 		assert!(viewport_is_busy(false, true));
 		assert!(viewport_is_busy(true, false));
 		assert!(!viewport_is_busy(false, false));
+	}
+
+	#[test]
+	fn injected_highlights_consistently_override_parent_markdown_spans() {
+		let span = |start, end, category| {
+			HighlightSpan::new(DocByte::new(start), DocByte::new(end), category)
+		};
+		let lexical = [span(0, 30, TokenCategory::String)];
+		// The Markdown provider emits its parent span first. Injected SQL spans
+		// are appended afterward, including one tied at the parent's start.
+		let semantic = [
+			span(0, 30, TokenCategory::String),
+			span(0, 6, TokenCategory::Keyword),
+			span(10, 16, TokenCategory::Keyword),
+			span(20, 26, TokenCategory::Keyword),
+		];
+		let merged = merge_highlights(&lexical, &semantic);
+
+		for byte in [0, 10, 20] {
+			let category = merged
+				.iter()
+				.rev()
+				.find(|span| span.start.get() <= byte && byte < span.end.get())
+				.map(|span| span.category);
+			assert_eq!(category, Some(TokenCategory::Keyword));
+		}
 	}
 }

@@ -692,12 +692,16 @@ impl CodeEditor {
 				}
 			}
 			EditorMsg::Click => {
-				if !self.begin_divider_drag() {
+				// A pane header may publish its more specific press before the
+				// workspace-wide mouse area publishes this generic click. Do not let
+				// the divider hit band steal a drag the header already owns.
+				if self.pane_drag.is_none() && !self.begin_divider_drag() {
 					self.click_at_pointer();
 					self.begin_pane_drag();
 				}
 			}
 			EditorMsg::PaneDragStarted(pane_id) => {
+				self.drag = None;
 				self.send(EditorCommand::FocusPane(pane_id));
 				self.begin_pane_drag_for(pane_id);
 			}
@@ -757,14 +761,7 @@ impl CodeEditor {
 					None => text_pane_surface(pane, palette, focused),
 				}
 			};
-			let title = pane.markdown_preview.as_ref().map_or_else(
-				|| {
-					pane.host_panel
-						.as_ref()
-						.map_or("SQL", |panel| panel.title.as_str())
-				},
-				|preview| preview.source_path.as_deref().unwrap_or("Markdown Preview"),
-			);
+			let title = pane_title(pane);
 			let content = pane_surface(pane.pane_id, title, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
@@ -1547,6 +1544,17 @@ fn panel_message<'a>(body: String, tint: Color) -> Element<'a, EditorMsg> {
 	.into()
 }
 
+fn pane_title(pane: &libaryon::uast::projection::PaneViewport) -> &str {
+	pane.markdown_preview.as_ref().map_or_else(
+		|| {
+			pane.host_panel
+				.as_ref()
+				.map_or(pane.language_label, |panel| panel.title.as_str())
+		},
+		|preview| preview.source_path.as_deref().unwrap_or("Markdown Preview"),
+	)
+}
+
 /// Common workspace chrome. Its header is intentionally simple: a stable drag
 /// handle now, and the future home of pane tabs and close controls.
 fn pane_surface<'a>(
@@ -2287,7 +2295,8 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
-		SplitDirection, is_markdown_thematic_break, markdown_code_fragments, metrics,
+		PANE_HEADER_HEIGHT, SplitDirection, is_markdown_thematic_break, markdown_code_fragments,
+		metrics, pane_title,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -2308,6 +2317,33 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	#[test]
+	fn text_pane_title_tracks_the_active_language() {
+		let mut editor = CodeEditor::new("# Markdown\n");
+		wait_for_content(&mut editor, "# Markdown\n");
+		editor.send(EditorCommand::SetLanguage(Some("markdown".to_owned())));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport
+				.panes
+				.iter()
+				.find(|pane| pane.pane_id == viewport.focused_pane_id)
+				.is_none_or(|pane| pane.language_label != "Markdown")
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		let pane = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == viewport.focused_pane_id)
+			.expect("focused pane");
+		assert_eq!(pane_title(pane), "Markdown");
 	}
 
 	#[test]
@@ -2764,19 +2800,20 @@ mod tests {
 			.expect("a horizontal split projects a horizontal divider")
 			.clone();
 
-		// The one-row visual gap would be a ~22px grab target — nearly
-		// unusable. The engine must widen the hit rect above and below it.
+		// The one-row visual gap would be a ~22px grab target. The engine widens
+		// it upward, while leaving the lower pane's title bar exclusively for
+		// pane reordering.
 		assert_eq!(divider.visual_rect.height.get(), 1);
 		assert!(
-			divider.hit_rect.height.get() >= 3,
+			divider.hit_rect.height.get() >= 2,
 			"horizontal grab band must extend past its single-row gap, got {}",
 			divider.hit_rect.height.get()
 		);
 		assert!(divider.hit_rect.screen_row.get() < divider.visual_rect.screen_row.get());
+		assert_eq!(divider.hit_rect.bottom(), divider.visual_rect.bottom());
 
 		// Every pixel row across the widened band resolves to the drag — the
-		// gap itself and the padding rows above (top pane) and below (bottom
-		// pane's title bar), which pane content would otherwise capture.
+		// gap itself and the padding row above it, but not the bottom pane header.
 		let top = divider.hit_rect.screen_row.get();
 		let bottom = divider.hit_rect.bottom().get();
 		for row in top..bottom {
@@ -2792,6 +2829,32 @@ mod tests {
 				Some(SplitDirection::Horizontal)
 			);
 		}
+
+		let lower_pane = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == divider.after)
+			.expect("lower pane");
+		let header_point = iced::Point::new(
+			300.0,
+			lower_pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT
+				+ PANE_HEADER_HEIGHT / 2.0,
+		);
+		editor.last_pointer = Some(header_point);
+		editor.drag = None;
+		assert!(
+			!editor.begin_divider_drag(),
+			"the lower pane header must not start divider resizing"
+		);
+		editor.begin_pane_drag();
+		assert_eq!(
+			editor.pane_drag.map(|drag| drag.source),
+			Some(divider.after),
+			"the lower pane header starts pane reordering"
+		);
 	}
 
 	#[test]

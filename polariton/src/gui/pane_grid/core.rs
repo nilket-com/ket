@@ -287,6 +287,16 @@ where
 			}
 		}
 
+		// Content gets the first opportunity to claim ordinary pointer events. Once
+		// the grid owns a drag, however, it must keep receiving moves and releases
+		// even when the cursor passes over pane content.
+		if shell.is_event_captured()
+			&& self.state.pane_dragging().is_none()
+			&& self.state.dragging().is_none()
+		{
+			return;
+		}
+
 		let origin = layout.bounds().position();
 		let widget_bounds = layout.bounds();
 
@@ -314,6 +324,7 @@ where
 								HandleAction::Expand(id) => Action::Expand(id),
 							};
 							shell.publish((self.on_action)(msg));
+							shell.capture_event();
 							widget_state.hovered_arrow = None;
 							return;
 						}
@@ -322,12 +333,14 @@ where
 						if zone.contains(local) {
 							shell
 								.publish((self.on_action)(Action::PaneDragStarted(zone.pane, pos)));
+							shell.capture_event();
 							return;
 						}
 					}
 					for zone in &widget_state.handle_zones {
 						if zone.contains(local) {
 							shell.publish((self.on_action)(Action::DragStarted(zone.split_id)));
+							shell.capture_event();
 							return;
 						}
 					}
@@ -338,6 +351,7 @@ where
 					let local = Point::new(pos.x - origin.x, pos.y - origin.y);
 					if self.state.pane_dragging().is_some() {
 						shell.publish((self.on_action)(Action::PaneDragMoved(pos)));
+						shell.capture_event();
 						let source = self.state.pane_dragging().unwrap().pane;
 						let mut new_target = None;
 						for &(pane, bounds) in &widget_state.pane_bounds {
@@ -354,6 +368,7 @@ where
 						return;
 					}
 					if let Some(split_id) = self.state.dragging() {
+						shell.capture_event();
 						if let Some(zone) = widget_state
 							.handle_zones
 							.iter()
@@ -399,6 +414,7 @@ where
 			}
 			Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
 				if self.state.pane_dragging().is_some() {
+					shell.capture_event();
 					if let Some(target) = widget_state.drop_target.take() {
 						shell.publish((self.on_action)(Action::PaneDragDropped(target)));
 					} else {
@@ -408,6 +424,7 @@ where
 				}
 				if self.state.dragging().is_some() {
 					shell.publish((self.on_action)(Action::DragEnded));
+					shell.capture_event();
 				}
 			}
 			_ => {}
