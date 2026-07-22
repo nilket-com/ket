@@ -1755,6 +1755,8 @@ fn dispatch_command(
 		command => command,
 	};
 
+	// Every plaintext write path must pass through this guard before the main
+	// file-command dispatch. Add future bulk-write commands here as well.
 	if matches!(cmd, EditorCommand::WriteFile | EditorCommand::WriteAndQuit)
 		&& encrypted_backing_path(session).is_some()
 	{
