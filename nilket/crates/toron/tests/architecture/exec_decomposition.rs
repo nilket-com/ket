@@ -88,9 +88,11 @@ pub(crate) fn adr435_generic_bound_grouped_fold_has_one_table_owner() {
 		+ streaming
 			.matches("finalize_bound_grouped_aggregate(")
 			.count();
+	// ADR 499 centralizes the streaming scan's three branches through one timed
+	// helper; ownership remains singular while the syntactic caller count drops.
 	assert_eq!(
-		fold_sites, 19,
-		"expected one definition plus 18 fold callers"
+		fold_sites, 17,
+		"expected one definition plus 16 fold callers"
 	);
 	assert_eq!(
 		finalize_sites, 11,

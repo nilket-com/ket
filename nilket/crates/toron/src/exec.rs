@@ -1165,37 +1165,7 @@ impl Executor {
 		partition_count: u32,
 		key: &BoundExprProgram,
 	) -> Result<Vec<(usize, RecordBatch)>, ExecutionError> {
-		let num_rows = batch.num_rows();
-		if num_rows == 0 {
-			return Ok(Vec::new());
-		}
-
-		let key_arrays = self.evaluate_bound_program(key, batch)?;
-
-		let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
-		let mut partition_scratch = Vec::new();
-		for row in 0..num_rows {
-			let bucket = partition_bucket_with_scratch(
-				&key_arrays,
-				row,
-				partition_count,
-				&mut partition_scratch,
-			)?;
-			builders[bucket].push(row as u32);
-		}
-
-		let mut partitioned = Vec::new();
-		for (partition, indices) in builders.into_iter().enumerate() {
-			if !indices.is_empty() {
-				let indices_arr = arrow::array::UInt32Array::from(indices);
-				let mut cols = Vec::new();
-				for col in batch.columns() {
-					cols.push(arrow::compute::take(col, &indices_arr, None)?);
-				}
-				partitioned.push((partition, RecordBatch::try_new(batch.schema(), cols)?));
-			}
-		}
-		Ok(partitioned)
+		self.repartition_exchange_batch_profiled(batch, partition_count, key, None)
 	}
 }
 

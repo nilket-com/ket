@@ -30,7 +30,7 @@ use toron_tpch::{
 	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
 	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
 	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
-	stable_fingerprint, status_rows, strict_lineitem_row_count,
+	stable_fingerprint, status_rows, strict_lineitem_row_count, take_parquet_scan_ledger,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -252,6 +252,15 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			}
 		}
 	}
+	if let Some(path) = std::env::var_os("TORON_LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH") {
+		match std::fs::remove_file(&path) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				return harness_error(&format!("clear local grouped exchange receipt: {error}"));
+			}
+		}
+	}
 	let attempt_result = match engine {
 		PerfEngine::Toron => {
 			run_perf_query_with_data_source(
@@ -304,6 +313,25 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
 	row["hash_smaller_build"] = serde_json::json!(hash_smaller_build);
 	row["hash_smaller_build_provenance"] = serde_json::json!(hash_smaller_build_provenance);
+	if std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some() {
+		let ledger = take_parquet_scan_ledger();
+		let batches = ledger.iter().flat_map(|scan| scan.batches.iter());
+		let (batches, rows, decode_micros, raw_bytes) = batches.fold(
+			(0u64, 0u64, 0u64, 0u64),
+			|(batches, rows, decode_micros, raw_bytes), batch| {
+				(
+					batches.saturating_add(1),
+					rows.saturating_add(u64::try_from(batch.raw_rows).unwrap_or(u64::MAX)),
+					decode_micros.saturating_add(batch.parquet_decode_micros),
+					raw_bytes.saturating_add(u64::try_from(batch.raw_bytes).unwrap_or(u64::MAX)),
+				)
+			},
+		);
+		row["parquet_scan_receipt"] = serde_json::json!({
+			"scans": ledger.len(), "batches": batches, "rows": rows,
+			"decode_micros": decode_micros, "raw_bytes": raw_bytes,
+		});
+	}
 	// Diagnostic: when TORON_LOCAL_JOIN_PHASE_PROFILE_PATH is set the engine writes one phase
 	// ledger for the local in-memory inner-join drive loop. Fold it into this row so the buckets
 	// travel alongside the identity/receipt fields (build_commit, plan_fingerprint, digest,
@@ -322,6 +350,22 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
 			Err(error) => {
 				row["local_join_phase_ledger_error"] = serde_json::json!(format!("read: {error}"));
+			}
+		}
+	}
+	if let Some(path) = std::env::var_os("TORON_LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH") {
+		match std::fs::read_to_string(&path) {
+			Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+				Ok(receipt) => row["local_grouped_exchange_receipt"] = receipt,
+				Err(error) => {
+					row["local_grouped_exchange_receipt_error"] =
+						serde_json::json!(format!("parse: {error}"))
+				}
+			},
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				row["local_grouped_exchange_receipt_error"] =
+					serde_json::json!(format!("read: {error}"))
 			}
 		}
 	}

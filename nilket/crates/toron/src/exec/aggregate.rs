@@ -11,6 +11,154 @@ const PRIMITIVE_INT64_INITIAL_CAPACITY: usize = 1024;
 const PRIMITIVE_INT64_PRODUCER: &str = "primitive Int64 grouped aggregate resident state";
 const BORROW_SINGLE_UTF8_GROUP_KEY_ENV: &str = "TORON_TPCH_BORROW_SINGLE_UTF8_GROUP_KEY";
 const PRIMITIVE_INT64_COUNT_ENV: &str = "TORON_EXEC_PRIMITIVE_INT64_COUNT";
+const GROUPED_FOLD_RECEIPT_PATH_ENV: &str = "TORON_GROUPED_FOLD_RECEIPT_PATH";
+
+#[derive(Default)]
+struct GroupedFoldReceipt {
+	source_batches: u64,
+	fold_batches: u64,
+	fold_rows: u64,
+	fold_micros: u64,
+}
+
+const LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH_ENV: &str = "TORON_LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH";
+const LOCAL_GROUPED_EXCHANGE_BYPASS_ENV: &str = "TORON_LOCAL_GROUPED_EXCHANGE_BYPASS";
+
+fn local_grouped_exchange_bypass_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+fn local_grouped_exchange_bypass_enabled() -> bool {
+	local_grouped_exchange_bypass_enabled_from_env(
+		std::env::var(LOCAL_GROUPED_EXCHANGE_BYPASS_ENV)
+			.ok()
+			.as_deref(),
+	)
+}
+
+fn persist_local_grouped_exchange_receipt(
+	path: std::path::PathBuf,
+	receipt: serde_json::Value,
+) -> Result<(), ExecutionError> {
+	std::fs::write(
+		path,
+		serde_json::to_vec(&receipt).map_err(|error| ExecutionError::Kernel {
+			message: error.to_string(),
+		})?,
+	)
+	.map_err(|error| ExecutionError::Kernel {
+		message: format!("local grouped exchange receipt write failed: {error}"),
+	})
+}
+
+#[derive(Default)]
+pub(in crate::exec) struct LocalGroupedExchangeReceipt {
+	pub source_batches: u64,
+	pub source_rows: u64,
+	pub partition_batches: u64,
+	pub partition_rows: u64,
+	pub key_eval_micros: u64,
+	pub routing_index_micros: u64,
+	pub take_micros: u64,
+	pub index_bytes: u64,
+	pub take_columns: u64,
+	pub take_bytes: u64,
+}
+
+impl Executor {
+	pub(in crate::exec) fn repartition_exchange_batch_profiled(
+		&self,
+		batch: &RecordBatch,
+		partition_count: u32,
+		key: &BoundExprProgram,
+		mut receipt: Option<&mut LocalGroupedExchangeReceipt>,
+	) -> Result<Vec<(usize, RecordBatch)>, ExecutionError> {
+		let rows = batch.num_rows();
+		if rows == 0 {
+			return Ok(Vec::new());
+		}
+		if let Some(r) = receipt.as_deref_mut() {
+			r.source_batches = r.source_batches.saturating_add(1);
+			r.source_rows = r
+				.source_rows
+				.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+		}
+		let started = receipt.as_ref().map(|_| Instant::now());
+		let keys = self.evaluate_bound_program(key, batch)?;
+		if let (Some(r), Some(t)) = (receipt.as_deref_mut(), started) {
+			r.key_eval_micros = r
+				.key_eval_micros
+				.saturating_add(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
+		}
+		let started = receipt.as_ref().map(|_| Instant::now());
+		let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
+		let mut scratch = Vec::new();
+		for row in 0..rows {
+			let bucket = partition_bucket_with_scratch(&keys, row, partition_count, &mut scratch)?;
+			builders[bucket].push(row as u32);
+		}
+		if let (Some(r), Some(t)) = (receipt.as_deref_mut(), started) {
+			r.routing_index_micros = r
+				.routing_index_micros
+				.saturating_add(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
+			r.index_bytes = r
+				.index_bytes
+				.saturating_add(builders.iter().fold(0u64, |n, v| {
+					n.saturating_add(
+						u64::try_from(v.capacity().saturating_mul(std::mem::size_of::<u32>()))
+							.unwrap_or(u64::MAX),
+					)
+				}));
+		}
+		let mut output = Vec::new();
+		for (partition, indices) in builders.into_iter().enumerate() {
+			if indices.is_empty() {
+				continue;
+			}
+			let indices = arrow::array::UInt32Array::from(indices);
+			let mut columns = Vec::new();
+			for column in batch.columns() {
+				let started = receipt.as_ref().map(|_| Instant::now());
+				let taken = arrow::compute::take(column, &indices, None)?;
+				if let (Some(r), Some(t)) = (receipt.as_deref_mut(), started) {
+					r.take_micros = r
+						.take_micros
+						.saturating_add(u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX));
+					r.take_columns = r.take_columns.saturating_add(1);
+					r.take_bytes = r.take_bytes.saturating_add(
+						u64::try_from(taken.get_buffer_memory_size()).unwrap_or(u64::MAX),
+					);
+				}
+				columns.push(taken);
+			}
+			let partitioned = RecordBatch::try_new(batch.schema(), columns)?;
+			if let Some(r) = receipt.as_deref_mut() {
+				r.partition_batches = r.partition_batches.saturating_add(1);
+				r.partition_rows = r
+					.partition_rows
+					.saturating_add(u64::try_from(partitioned.num_rows()).unwrap_or(u64::MAX));
+			}
+			output.push((partition, partitioned));
+		}
+		Ok(output)
+	}
+}
+
+impl GroupedFoldReceipt {
+	fn record_source_batch(&mut self) {
+		self.source_batches = self.source_batches.saturating_add(1);
+	}
+
+	fn record_fold_batch(&mut self, rows: usize, elapsed: std::time::Duration) {
+		self.fold_batches = self.fold_batches.saturating_add(1);
+		self.fold_rows = self
+			.fold_rows
+			.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+		self.fold_micros = self
+			.fold_micros
+			.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+	}
+}
 
 fn borrow_single_utf8_group_key_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -553,15 +701,26 @@ impl Executor {
 		if let Some(spec) =
 			primitive_int64_count_spec(&streaming_input, group_expr, aggr_expr, output_schema)
 		{
-			return self
+			let output = self
 				.execute_primitive_int64_count_grouped_scan(
 					&streaming_input,
 					spec,
 					output_schema,
 					morsel,
 				)
-				.await
-				.map(Some);
+				.await?;
+			if let Some(path) = std::env::var_os(LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH_ENV) {
+				persist_local_grouped_exchange_receipt(
+					std::path::PathBuf::from(path),
+					serde_json::json!({
+						"route": "primitive_int64_count",
+						"admission": "primitive_int64_count_admitted",
+						"exchange_bypassed": true,
+						"exchange_micros": 0,
+					}),
+				)?;
+			}
+			return Ok(Some(output));
 		}
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
@@ -574,6 +733,28 @@ impl Executor {
 		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut folded_input = false;
+		let receipt_path =
+			std::env::var_os(GROUPED_FOLD_RECEIPT_PATH_ENV).map(std::path::PathBuf::from);
+		let mut fold_receipt = receipt_path.as_ref().map(|_| GroupedFoldReceipt::default());
+		let exchange_receipt_path =
+			std::env::var_os(LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH_ENV).map(std::path::PathBuf::from);
+		// ADR 499: this executor owns one shared group table and serially folds every
+		// input batch. The SQL planner's exchange therefore supplies no local parallelism;
+		// retain it only for the explicit control arm or for distributed execution outside
+		// this local streaming route.
+		let bypass_exchange =
+			streaming_input.exchange.is_some() && local_grouped_exchange_bypass_enabled();
+		let fold_streaming_input = StreamingScanGroupedInput {
+			scan_input: streaming_input.scan_input,
+			exchange: if bypass_exchange {
+				None
+			} else {
+				streaming_input.exchange
+			},
+		};
+		let mut exchange_receipt = exchange_receipt_path
+			.as_ref()
+			.map(|_| LocalGroupedExchangeReceipt::default());
 
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
 			let Some(batch) = stream.next().await else {
@@ -593,14 +774,19 @@ impl Executor {
 			rows = rows.saturating_add(batch.num_rows());
 
 			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			if let Some(receipt) = fold_receipt.as_mut() {
+				receipt.record_source_batch();
+			}
 			self.fold_streaming_grouped_scan_batch(
-				&streaming_input,
+				&fold_streaming_input,
 				batch,
 				group_expr,
 				aggr_expr,
 				&mut groups,
 				&mut group_types,
 				&mut folded_input,
+				fold_receipt.as_mut(),
+				exchange_receipt.as_mut(),
 			)?;
 		}
 
@@ -615,8 +801,50 @@ impl Executor {
 			)?;
 		}
 
-		self.finalize_bound_grouped_aggregate(&mut groups, &group_types, aggr_expr, output_schema)
-			.map(Some)
+		let output = self.finalize_bound_grouped_aggregate(
+			&mut groups,
+			&group_types,
+			aggr_expr,
+			output_schema,
+		)?;
+		if let (Some(path), Some(receipt)) = (receipt_path, fold_receipt) {
+			let receipt = serde_json::json!({
+				"source_batches": receipt.source_batches,
+				"fold_batches": receipt.fold_batches,
+				"fold_rows": receipt.fold_rows,
+				"fold_micros": receipt.fold_micros,
+			});
+			std::fs::write(
+				path,
+				serde_json::to_vec(&receipt).map_err(|error| ExecutionError::Kernel {
+					message: error.to_string(),
+				})?,
+			)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("grouped fold receipt write failed: {error}"),
+			})?;
+		}
+		if let (Some(path), Some(receipt)) = (exchange_receipt_path, exchange_receipt) {
+			persist_local_grouped_exchange_receipt(
+				path,
+				serde_json::json!({
+					"route": "generic_local_serial_shared_table",
+				"admission": if bypass_exchange { "generic_local_serial_shared_table_bypassed" } else { "generic_local_exchange_bypass_disabled" },
+				"exchange_bypassed": bypass_exchange,
+					"source_batches": receipt.source_batches,
+					"source_rows": receipt.source_rows,
+					"partition_batches": receipt.partition_batches,
+					"partition_rows": receipt.partition_rows,
+					"key_eval_micros": receipt.key_eval_micros,
+					"routing_index_micros": receipt.routing_index_micros,
+					"take_micros": receipt.take_micros,
+					"index_bytes": receipt.index_bytes,
+					"take_columns": receipt.take_columns,
+					"take_bytes": receipt.take_bytes,
+				}),
+			)?;
+		}
+		Ok(Some(output))
 	}
 
 	async fn execute_primitive_int64_sum_grouped_scan(
@@ -796,34 +1024,12 @@ impl Executor {
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		folded_input: &mut bool,
+		mut receipt: Option<&mut GroupedFoldReceipt>,
+		mut exchange_receipt: Option<&mut LocalGroupedExchangeReceipt>,
 	) -> Result<(), ExecutionError> {
-		if batch.num_rows() == 0 {
-			if !*folded_input {
-				self.fold_bound_grouped_aggregate_batch(
-					groups,
-					group_types,
-					group_expr,
-					aggr_expr,
-					&batch,
-				)?;
-				*folded_input = true;
-			}
-			return Ok(());
-		}
-		if let Some((partition_count, exchange_key)) = streaming_input.exchange {
-			for (_partition, partitioned) in
-				self.repartition_exchange_batch(&batch, partition_count, exchange_key)?
-			{
-				self.fold_bound_grouped_aggregate_batch(
-					groups,
-					group_types,
-					group_expr,
-					aggr_expr,
-					&partitioned,
-				)?;
-				*folded_input = true;
-			}
-		} else {
+		let mut fold_batch = |batch: RecordBatch| {
+			let rows = batch.num_rows();
+			let started = receipt.as_ref().map(|_| Instant::now());
 			self.fold_bound_grouped_aggregate_batch(
 				groups,
 				group_types,
@@ -831,6 +1037,30 @@ impl Executor {
 				aggr_expr,
 				&batch,
 			)?;
+			if let (Some(receipt), Some(started)) = (receipt.as_deref_mut(), started) {
+				receipt.record_fold_batch(rows, started.elapsed());
+			}
+			Ok::<(), ExecutionError>(())
+		};
+		if batch.num_rows() == 0 {
+			if !*folded_input {
+				fold_batch(batch)?;
+				*folded_input = true;
+			}
+			return Ok(());
+		}
+		if let Some((partition_count, exchange_key)) = streaming_input.exchange {
+			for (_partition, partitioned) in self.repartition_exchange_batch_profiled(
+				&batch,
+				partition_count,
+				exchange_key,
+				exchange_receipt.as_deref_mut(),
+			)? {
+				fold_batch(partitioned)?;
+				*folded_input = true;
+			}
+		} else {
+			fold_batch(batch)?;
 			*folded_input = true;
 		}
 		Ok(())
@@ -3917,4 +4147,11 @@ fn adr494_borrow_single_utf8_group_key_ablation_defaults_on() {
 	assert!(borrow_single_utf8_group_key_enabled_from_env(None));
 	assert!(borrow_single_utf8_group_key_enabled_from_env(Some("1")));
 	assert!(!borrow_single_utf8_group_key_enabled_from_env(Some("0")));
+}
+
+#[test]
+fn adr499_local_grouped_exchange_bypass_defaults_on_with_faithful_control() {
+	assert!(local_grouped_exchange_bypass_enabled_from_env(None));
+	assert!(local_grouped_exchange_bypass_enabled_from_env(Some("1")));
+	assert!(!local_grouped_exchange_bypass_enabled_from_env(Some("0")));
 }

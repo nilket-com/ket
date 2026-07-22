@@ -1588,6 +1588,7 @@ pub struct ParquetHarnessScan {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ParquetScanBatchLedger {
+	pub parquet_decode_micros: u64,
 	pub raw_rows: usize,
 	pub raw_columns: usize,
 	pub raw_bytes: usize,
@@ -1630,7 +1631,7 @@ fn clear_parquet_scan_ledger() {
 	}
 }
 
-fn take_parquet_scan_ledger() -> Vec<ParquetScanLedger> {
+pub fn take_parquet_scan_ledger() -> Vec<ParquetScanLedger> {
 	if !parquet_scan_ledger_enabled() {
 		return Vec::new();
 	}
@@ -1825,7 +1826,12 @@ impl StorageScan for ParquetHarnessScan {
 					.as_ref()
 					.is_some_and(|columns| columns.len() < full_column_count),
 		}));
-		if parquet_scan_ledger_enabled() {
+		// The original detailed ledger materializes every batch before returning a stream. Keep that
+		// forensic mode explicit; ordinary timing uses the lazy stream below so profiling cannot
+		// change the scan's execution model.
+		if parquet_scan_ledger_enabled()
+			&& std::env::var_os("TORON_TPCH_PARQUET_SCAN_EAGER_LEDGER").is_some()
+		{
 			let mut ledger = ParquetScanLedger {
 				table_id,
 				table_name: source.name.clone(),
@@ -1842,10 +1848,17 @@ impl StorageScan for ParquetHarnessScan {
 				batches: Vec::new(),
 			};
 			let mut batches = Vec::new();
-			for batch in reader {
+			let mut reader = reader;
+			loop {
+				let decode_started = Instant::now();
+				let Some(batch) = reader.next() else {
+					break;
+				};
 				let raw_batch = batch.map_err(|error| StorageError::Internal {
 					message: format!("read parquet batch {}: {error}", source.path.display()),
 				})?;
+				let parquet_decode_micros =
+					u64::try_from(decode_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 				let raw_rows = raw_batch.num_rows();
 				let raw_columns = raw_batch.num_columns();
 				let raw_bytes = record_batch_bytes(&raw_batch);
@@ -1905,6 +1918,7 @@ impl StorageScan for ParquetHarnessScan {
 					}
 				};
 				ledger.batches.push(ParquetScanBatchLedger {
+					parquet_decode_micros,
 					raw_rows,
 					raw_columns,
 					raw_bytes,
@@ -1945,7 +1959,23 @@ impl StorageScan for ParquetHarnessScan {
 			));
 		}
 		let mut batch_index = 0usize;
-		let stream = stream::iter(reader.map(move |batch| {
+		let lazy_ledger_enabled = parquet_scan_ledger_enabled();
+		let lazy_output_column_count = output_schema.fields().len();
+		// `Iterator::map` invokes the parquet reader before it enters its closure. Wrap `next()`
+		// instead, so the lazy receipt measures the real decode boundary without materializing.
+		let mut reader = reader;
+		let timed_reader = std::iter::from_fn(move || {
+			let started = lazy_ledger_enabled.then(Instant::now);
+			reader.next().map(|batch| {
+				(
+					started.map(|started| {
+						u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+					}),
+					batch,
+				)
+			})
+		});
+		let stream = stream::iter(timed_reader.map(move |(parquet_decode_micros, batch)| {
 			let batch = batch.map_err(|error| StorageError::Internal {
 				message: format!("read parquet batch {}: {error}", source.path.display()),
 			})?;
@@ -2015,6 +2045,29 @@ impl StorageScan for ParquetHarnessScan {
 				"output_bytes": record_batch_bytes(&batch),
 			}));
 			batch_index += 1;
+			if let Some(parquet_decode_micros) = parquet_decode_micros {
+				record_parquet_scan_ledger(ParquetScanLedger {
+					table_id,
+					table_name: source.name.clone(),
+					full_column_count,
+					requested_projected_columns: requested_projected_columns.clone(),
+					pbc_predicate_bytes: pbc.as_ref().map(Vec::len),
+					pbc_referenced_columns: pbc_referenced_columns.clone(),
+					parquet_read_columns: parquet_read_columns.clone(),
+					output_column_count: lazy_output_column_count,
+					inflated_to_full_schema: false,
+					batches: vec![ParquetScanBatchLedger {
+						parquet_decode_micros,
+						raw_rows,
+						raw_columns,
+						raw_bytes,
+						inflated_bytes: None,
+						output_rows: batch.num_rows(),
+						output_columns: batch.num_columns(),
+						output_bytes: record_batch_bytes(&batch),
+					}],
+				});
+			}
 			Ok(batch)
 		}))
 		.boxed();
