@@ -2226,11 +2226,11 @@ fn first_arg_type(call: &BoundAggregateCall) -> Result<&DataType, ExecutionError
 
 /// ADR 477: a group column's concrete type resolved **once per batch**, so key
 /// extraction stops paying a twelve-branch `as_any().downcast_ref()` chain per row
-/// (ADR 476 isolated that chain as grouping's remaining per-row cost). The variant
-/// set, conversions, canonicalisation, null contract, and error text mirror
-/// [`group_value`] exactly — both resolve through this one place so they cannot
-/// drift. `GroupValue` ownership is deliberately unchanged: a Utf8 key still owns
-/// its `String` (ADR 477 scope note).
+/// (ADR 476 isolated that chain as grouping's remaining per-row cost). This is the
+/// **single canonical** row → `GroupValue` conversion — the variant set, canonicalisation,
+/// null contract, and error text all live here, and the test-only [`group_value`]
+/// delegates to it so the two cannot drift. `GroupValue` ownership is deliberately
+/// unchanged: a Utf8 key still owns its `String` (ADR 477 scope note).
 pub(in crate::exec) enum GroupArrayReader<'a> {
 	Boolean(&'a BooleanArray),
 	Int32(&'a Int32Array),
@@ -2327,63 +2327,16 @@ pub(in crate::exec) fn group_array_reader(
 	})
 }
 
+/// Test-only reference extractor. Production key extraction resolves the column type
+/// once per batch through [`GroupArrayReader`] (ADR 477); this delegates to that same
+/// canonical conversion so the two paths cannot drift, and it is gated to test builds
+/// because no production caller remains after ADR 499's exchange bypass.
+#[cfg(test)]
 pub(in crate::exec) fn group_value(
 	array: &ArrayRef,
 	row: usize,
 ) -> Result<GroupValue, ExecutionError> {
-	if array.is_null(row) {
-		return Ok(GroupValue::Null);
-	}
-	if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
-		return Ok(GroupValue::Boolean(array.value(row)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
-		return Ok(GroupValue::Int32(array.value(row)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-		return Ok(GroupValue::Int64(array.value(row)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
-		return Ok(GroupValue::Float32(canonical_group_f32_bits(
-			array.value(row),
-		)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-		return Ok(GroupValue::Float64(canonical_group_f64_bits(
-			array.value(row),
-		)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
-		return Ok(GroupValue::Date32(array.value(row)));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
-		return Ok(GroupValue::Timestamp(
-			TimeUnit::Millisecond,
-			array.value(row),
-		));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-		return Ok(GroupValue::Timestamp(
-			TimeUnit::Microsecond,
-			array.value(row),
-		));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-		return Ok(GroupValue::Timestamp(
-			TimeUnit::Nanosecond,
-			array.value(row),
-		));
-	}
-	if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-		return Ok(GroupValue::Utf8(array.value(row).to_string()));
-	}
-	// ADR 275: Decimal128 group key — the raw i128 keys the group exactly.
-	if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
-		return Ok(GroupValue::Decimal128(array.value(row)));
-	}
-	Err(ExecutionError::InvalidExpression {
-		message: format!("unsupported GROUP BY type: {:?}", array.data_type()),
-	})
+	Ok(group_array_reader(array)?.value(row))
 }
 
 fn canonical_group_f32_bits(value: f32) -> u32 {
