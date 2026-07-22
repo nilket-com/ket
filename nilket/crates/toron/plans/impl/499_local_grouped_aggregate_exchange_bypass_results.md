@@ -28,7 +28,12 @@ rows, and zero spill.
 ## Gates
 
 - Focused default/control parser test passed.
-- Full `cargo test -p toron --test architecture_test --quiet`: 2093 passed.
+- Full `cargo test -p toron --test architecture_test`: 2093 passed (positively confirmed).
+- Full `cargo test --workspace --no-fail-fast`: **exit 0** — under `--no-fail-fast` this is the
+  runner's explicit all-pass verdict (it runs past failures but still exits non-zero if any failed).
+  Captured output showed 0 failed, no panics, no compile errors. The aggregate `N passed` total is
+  not quoted here: the run was piped through `tail -40`, so only the final suites' result lines were
+  retained; green rests on the exit-0 verdict plus the clean tail, not on a summed count.
 - The earlier Phase 1 receipt remains the attribution baseline; the named non-exchange residual is a
   separate follow-up target.
 
