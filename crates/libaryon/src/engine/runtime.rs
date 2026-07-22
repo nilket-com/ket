@@ -1093,7 +1093,7 @@ fn handle_file_command_for_view(
 	next_dynamic_device_id: &mut u16,
 	save_durability: SaveDurability,
 	command: EditorCommand,
-) -> Option<(CommandEffect, Option<&'static str>)> {
+) -> Option<(CommandEffect, Option<super::language::LanguageId>)> {
 	with_text_buffer_mut(runtime.registry, buffers, layout, events, view_id, |tab| {
 		let effect = handle_file_doctab_command(
 			runtime,

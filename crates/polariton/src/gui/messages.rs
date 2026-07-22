@@ -55,6 +55,7 @@ pub enum Message {
 	Run,
 	RunSnippet,
 	RunResult(ExecutionResult),
+	RunLanguageResult(std::result::Result<String, String>),
 	RunMarkdownCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,

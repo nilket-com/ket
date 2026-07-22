@@ -112,7 +112,7 @@ pub(crate) struct TextBuffer {
 	/// must never be read after this device is retired.
 	pub(crate) backing_device_id: Option<u16>,
 	pub(crate) file_stamp: Option<FileStamp>,
-	pub(crate) active_language_id: Option<&'static str>,
+	pub(crate) active_language_id: Option<super::language::LanguageId>,
 	pub(crate) shadow: Option<ShadowSession>,
 	pub(crate) ledger: UndoLedger,
 	pub(crate) search_matches: Vec<SearchMatch>,
@@ -1470,15 +1470,15 @@ fn new_common_view_state(
 }
 
 pub(crate) fn resolve_theme_name(
-	active_language_id: Option<&str>,
+	active_language_id: Option<super::language::LanguageId>,
 	theme_override: Option<&str>,
 	settings: &SettingsPersistent,
 ) -> String {
 	if let Some(theme_override) = theme_override {
 		return theme_override.to_string();
 	}
-	if let Some(language_theme) =
-		active_language_id.and_then(|language_id| settings.language_themes.get(language_id))
+	if let Some(language_theme) = active_language_id
+		.and_then(|language_id| settings.language_themes.get(language_id.as_str()))
 	{
 		return language_theme.clone();
 	}
@@ -5005,7 +5005,11 @@ mod tests {
 		)]));
 
 		assert_eq!(
-			resolve_theme_name(Some("rust"), Some("turbo"), &settings),
+			resolve_theme_name(
+				Some(crate::engine::language::LanguageId::from_registered("rust")),
+				Some("turbo"),
+				&settings
+			),
 			"turbo"
 		);
 	}
@@ -5017,7 +5021,14 @@ mod tests {
 			"glowmax".to_string(),
 		)]));
 
-		assert_eq!(resolve_theme_name(Some("rust"), None, &settings), "glowmax");
+		assert_eq!(
+			resolve_theme_name(
+				Some(crate::engine::language::LanguageId::from_registered("rust")),
+				None,
+				&settings
+			),
+			"glowmax"
+		);
 	}
 
 	#[test]
@@ -5028,7 +5039,13 @@ mod tests {
 		)]));
 
 		assert_eq!(
-			resolve_theme_name(Some("python"), None, &settings),
+			resolve_theme_name(
+				Some(crate::engine::language::LanguageId::from_registered(
+					"python"
+				)),
+				None,
+				&settings
+			),
 			"onedark"
 		);
 	}

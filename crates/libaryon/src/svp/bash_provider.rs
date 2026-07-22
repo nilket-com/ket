@@ -46,7 +46,7 @@ impl LanguageProvider for BashProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::engine::language::LanguageRegistry;
+	use crate::engine::language::{LanguageId, LanguageRegistry};
 	use crate::svp::rust_highlight::TokenCategory;
 
 	#[test]
@@ -61,7 +61,10 @@ mod tests {
 		let mut registry = LanguageRegistry::new();
 		registry.register(BashProvider);
 		for name in ["bash", "sh", "bats"] {
-			assert_eq!(registry.resolve_language_id(name), Some("bash"));
+			assert_eq!(
+				registry.resolve_language_id(name).map(LanguageId::as_str),
+				Some("bash")
+			);
 		}
 		assert_eq!(registry.completion_candidates(), vec!["bash", "bats", "sh"]);
 	}

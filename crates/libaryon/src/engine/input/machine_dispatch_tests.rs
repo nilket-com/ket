@@ -66,6 +66,7 @@ fn test_viewport() -> Viewport {
 			visible_rows: Vec::new(),
 			visible_line_starts: Vec::new(),
 			dma_pending: false,
+			language_id: Some(crate::engine::language::LanguageId::from_registered("rust")),
 			language_label: "Rust",
 			is_file_browser: false,
 			is_output_panel: false,

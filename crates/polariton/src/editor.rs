@@ -19,7 +19,8 @@ use iced::widget::{
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
 use libaryon::engine::{
-	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, Modifiers,
+	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
+	Modifiers,
 };
 use libaryon::engine::{
 	HostEvent, HostPanelId, MinimapSnapshot, PaneDropEdge, PanelRevision, SplitDirection,
@@ -326,7 +327,12 @@ impl CodeEditor {
 		&self.document_text
 	}
 
-	/// SQL to run from the focused editor context: an active visual selection,
+	/// Stable execution language of the focused text buffer.
+	pub fn active_language_id(&self) -> Option<LanguageId> {
+		self.viewport.as_ref()?.focused_pane()?.language_id
+	}
+
+	/// Code to run from the focused editor context: an active visual selection,
 	/// or the cursor's logical line when no selection exists.
 	pub fn selected_or_current_line(&self) -> Option<String> {
 		let pane = self.viewport.as_ref()?.focused_pane()?;
@@ -1566,22 +1572,18 @@ impl PanelRegistry {
 							.and_then(|entry| entry.scroll),
 					)
 					.into(),
-				PanelContent::Running => panel_message(
-					format!("{}\n\nrunning…", panel.title),
-					color(palette.preview_text),
-				),
-				PanelContent::Message(message) => panel_message(
-					format!("{}\n\n{message}", panel.title),
-					color(palette.preview_text),
-				),
-				PanelContent::Failed(message) => panel_message(
-					format!("{}\n\n{message}", panel.title),
-					color(palette.status_text),
-				),
+				PanelContent::Running => {
+					panel_message("running…".to_owned(), color(palette.preview_text))
+				}
+				PanelContent::Message(message) => {
+					panel_message(message.clone(), color(palette.preview_text))
+				}
+				PanelContent::Failed(message) => {
+					panel_message(message.clone(), color(palette.status_text))
+				}
 				PanelContent::Unresolved => panel_message(
 					format!(
-						"{}\n\n{} unavailable (revision {})\nrerun to populate",
-						panel.title,
+						"{} unavailable (revision {})\nrerun to populate",
 						panel.kind,
 						panel.revision.get()
 					),
@@ -2713,9 +2715,9 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, Modifiers,
-		PANE_HEADER_HEIGHT, SplitDirection, is_markdown_thematic_break, markdown_code_fragments,
-		metrics, pane_title,
+		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
+		Modifiers, PANE_HEADER_HEIGHT, SplitDirection, is_markdown_thematic_break,
+		markdown_code_fragments, metrics, pane_title,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -2869,6 +2871,10 @@ mod tests {
 			.find(|pane| pane.pane_id == viewport.focused_pane_id)
 			.expect("focused pane");
 		assert_eq!(pane_title(pane), "Markdown");
+		assert_eq!(
+			editor.active_language_id().map(LanguageId::as_str),
+			Some("markdown")
+		);
 	}
 
 	#[test]

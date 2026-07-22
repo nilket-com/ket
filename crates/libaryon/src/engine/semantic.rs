@@ -1,7 +1,7 @@
 use super::core::MAX_SEMANTIC_BYTES;
 use super::document::io::read_document_snapshot;
 use super::event_bus::EngineEventQueue;
-use super::language::LanguageRegistry;
+use super::language::{LanguageId, LanguageRegistry};
 use super::session::{
 	BufferStore, CommonViewState, LayoutNode, SemanticState, TextEditorMut, with_text_buffer_mut,
 };
@@ -21,7 +21,7 @@ pub(crate) struct SemanticPipelineParams<'a> {
 	pub(crate) root_id: crate::ecs::NodeId,
 	pub(crate) file_path: Option<&'a str>,
 	pub(crate) backing_path: Option<&'a str>,
-	pub(crate) active_language_id: Option<&'static str>,
+	pub(crate) active_language_id: Option<LanguageId>,
 	pub(crate) state_id: crate::core::StateId,
 	pub(crate) semantic: &'a mut SemanticState,
 	pub(crate) has_virtual_tokens: bool,
@@ -170,7 +170,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 								content: live_bytes,
 								global_offset: DocByte::ZERO,
 								file_path: path.to_string(),
-								language_id: active_language_id.unwrap_or("").to_string(),
+								language_id: active_language_id.expect("active provider"),
 								state_id,
 								request_id,
 							});

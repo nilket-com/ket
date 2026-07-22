@@ -47,7 +47,7 @@ impl LanguageProvider for JsonProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::engine::language::LanguageRegistry;
+	use crate::engine::language::{LanguageId, LanguageRegistry};
 	use crate::svp::rust_highlight::TokenCategory;
 
 	#[test]
@@ -62,7 +62,12 @@ mod tests {
 		let mut registry = LanguageRegistry::new();
 		registry.register(JsonProvider);
 
-		assert_eq!(registry.resolve_language_id("ipynb"), Some("json"));
+		assert_eq!(
+			registry
+				.resolve_language_id("ipynb")
+				.map(LanguageId::as_str),
+			Some("json")
+		);
 	}
 
 	#[test]

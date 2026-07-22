@@ -65,7 +65,7 @@ struct RenderDocumentState {
 	file_path: Option<String>,
 	virtual_path: Option<String>,
 	backing_path: Option<String>,
-	active_language_id: Option<&'static str>,
+	active_language_id: Option<super::language::LanguageId>,
 	ledger: RenderLedgerState,
 }
 
@@ -540,6 +540,7 @@ fn render_pane_viewport(
 		visible_rows,
 		visible_line_starts,
 		dma_pending,
+		language_id,
 		language_label,
 		is_file_browser,
 		is_output_panel,
@@ -597,6 +598,7 @@ fn render_pane_viewport(
 				Vec::new(),
 				Vec::new(),
 				false,
+				lang_registry.resolve_language_id("markdown"),
 				"Markdown Preview",
 				false,
 				false,
@@ -650,6 +652,7 @@ fn render_pane_viewport(
 				Vec::new(),
 				Vec::new(),
 				false,
+				None,
 				"Host Panel",
 				false,
 				false,
@@ -718,7 +721,7 @@ fn render_pane_viewport(
 					file_path: Some(document.file_path.clone()),
 					virtual_path: None,
 					backing_path: None,
-					active_language_id: Some("fs"),
+					active_language_id: lang_registry.resolve_language_id("fs"),
 					ledger: RenderLedgerState {
 						current_state_id: crate::core::StateId::ZERO,
 						dirty: false,
@@ -1253,6 +1256,7 @@ fn render_pane_viewport(
 			visible_rows,
 			visible_line_starts,
 			dma_pending,
+			tab.document.active_language_id,
 			tab.document
 				.active_language_id
 				.and_then(|id| lang_registry.get_provider(id))
@@ -1361,6 +1365,7 @@ fn render_pane_viewport(
 		visible_rows,
 		visible_line_starts,
 		dma_pending,
+		language_id,
 		language_label,
 		is_file_browser,
 		is_output_panel,

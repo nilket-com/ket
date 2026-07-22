@@ -48,7 +48,7 @@ pub use self::host::{EngineConfig, EngineHandle, supported_languages};
 pub use self::host_event::{HostEvent, HostPanelDescriptor, HostPanelId, PanelRevision};
 pub use self::input::{InputCompletionStatus, InputEvent, InputProjection, KeyCode, Modifiers};
 pub use self::input::{help_topic_hint, render_cli_help};
-pub use self::language::{InlineAnnotation, InlineAnnotationKind};
+pub use self::language::{InlineAnnotation, InlineAnnotationKind, LanguageId};
 pub use self::layout::{GutterNumbering, VisibleRow};
 pub use self::layout::{
 	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,

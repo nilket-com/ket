@@ -281,6 +281,9 @@ pub struct PaneViewport {
 	pub visible_rows: Vec<VisibleRow>,
 	pub visible_line_starts: Vec<DocLine>,
 	pub dma_pending: bool,
+	/// Stable language provider identifier used by frontends for behavior such
+	/// as execution dispatch. Unlike `language_label`, this is not presentation.
+	pub language_id: Option<crate::engine::LanguageId>,
 	pub language_label: &'static str,
 	pub is_file_browser: bool,
 	pub is_output_panel: bool,

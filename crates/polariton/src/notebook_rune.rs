@@ -130,6 +130,61 @@ pub fn execute_cell(
 	)
 }
 
+/// Execute a plain Rune buffer as an expression-oriented script.
+///
+/// This is the non-notebook execution surface: it does not require a database
+/// connection or notebook `workspace`/`viz` parameters. The buffer becomes the
+/// body of `main`, so a trailing expression is reported in the results pane.
+pub fn execute_buffer(source: &str) -> Result<String, String> {
+	let context = build_context()?;
+	let runtime = Arc::new(
+		context
+			.runtime()
+			.map_err(|error| format!("Rune runtime context error: {error}"))?,
+	);
+	let mut sources = Sources::new();
+	sources
+		.insert(
+			Source::new("buffer.rn", format!("pub fn main() {{\n{source}\n}}\n"))
+				.map_err(|error| error.to_string())?,
+		)
+		.map_err(|error| error.to_string())?;
+	let unit = rune::prepare(&mut sources)
+		.with_context(&context)
+		.build()
+		.map_err(|error| format!("Rune compile error: {error}"))?;
+	let mut vm = Vm::new(runtime, Arc::new(unit));
+	let value = vm
+		.call(["main"], ())
+		.map_err(|error| format!("Rune runtime error: {error}"))?;
+	format_buffer_value(value)
+}
+
+fn format_buffer_value(value: Value) -> Result<String, String> {
+	if value.clone().into_unit().is_ok() {
+		return Ok("()".to_owned());
+	}
+	if let Ok(value) = value.as_signed() {
+		return Ok(value.to_string());
+	}
+	if let Ok(value) = value.as_unsigned() {
+		return Ok(value.to_string());
+	}
+	if let Ok(value) = value.as_float() {
+		return Ok(value.to_string());
+	}
+	if let Ok(value) = value.as_bool() {
+		return Ok(value.to_string());
+	}
+	if let Ok(value) = value.as_char() {
+		return Ok(value.to_string());
+	}
+	if let Ok(value) = value.into_string() {
+		return Ok(value.to_string());
+	}
+	Err("Rune buffer returned a value that Polariton cannot display yet".to_owned())
+}
+
 fn decode_cell_return(value: Value) -> Result<(), String> {
 	let original = value.clone();
 	match value.downcast::<Result<Value, Value>>() {
@@ -149,6 +204,27 @@ fn decode_cell_return(value: Value) -> Result<(), String> {
 fn build_context() -> Result<Context, String> {
 	let mut context =
 		Context::with_config(false).map_err(|error| format!("Rune context error: {error}"))?;
+	// Rune 0.14's default `std::f64` module intentionally exposes basic
+	// arithmetic, powers, roots, rounding, and constants, but not trigonometry.
+	// Extend that same namespace so ordinary compute buffers do not need a
+	// Polariton-specific math spelling.
+	let mut f64_module = Module::with_crate_item("std", ["f64"])
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	f64_module
+		.function("sin", rune_f64_sin)
+		.build()
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	f64_module
+		.function("cos", rune_f64_cos)
+		.build()
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	f64_module
+		.function("tan", rune_f64_tan)
+		.build()
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	context
+		.install(f64_module)
+		.map_err(|error| format!("Rune context error: {error}"))?;
 	let mut module =
 		Module::with_crate("polariton").map_err(|error| format!("Rune module error: {error}"))?;
 	module
@@ -182,6 +258,34 @@ fn build_context() -> Result<Context, String> {
 		.install(module)
 		.map_err(|error| format!("Rune context error: {error}"))?;
 	Ok(context)
+}
+
+fn rune_number(value: Value) -> VmResult<f64> {
+	if let Ok(value) = value.as_float() {
+		return VmResult::Ok(value);
+	}
+	if let Ok(value) = value.as_signed() {
+		return VmResult::Ok(value as f64);
+	}
+	if let Ok(value) = value.as_unsigned() {
+		return VmResult::Ok(value as f64);
+	}
+	VmResult::panic("std::f64 trigonometry expects a numeric argument")
+}
+
+fn rune_f64_sin(value: Value) -> VmResult<f64> {
+	let value = rune::vm_try!(rune_number(value));
+	VmResult::Ok(value.sin())
+}
+
+fn rune_f64_cos(value: Value) -> VmResult<f64> {
+	let value = rune::vm_try!(rune_number(value));
+	VmResult::Ok(value.cos())
+}
+
+fn rune_f64_tan(value: Value) -> VmResult<f64> {
+	let value = rune::vm_try!(rune_number(value));
+	VmResult::Ok(value.tan())
 }
 
 fn workspace_cell(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<RuneCell, String>> {
@@ -233,6 +337,18 @@ fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 mod tests {
 	use super::*;
 	use polars::df;
+
+	#[test]
+	fn plain_rune_buffer_reports_its_trailing_expression() {
+		assert_eq!(execute_buffer("9 * 9").as_deref(), Ok("81"));
+	}
+
+	#[test]
+	fn plain_rune_buffer_has_trigonometry_in_std_f64() {
+		let output = execute_buffer("std::f64::sin(2)").expect("trigonometry executes");
+		let value = output.parse::<f64>().expect("displayed float");
+		assert!((value - 2.0_f64.sin()).abs() < f64::EPSILON);
+	}
 
 	#[test]
 	fn rune_cell_publishes_a_layered_plot_effect() {

@@ -327,7 +327,12 @@ mod tests {
 	fn default_registry_includes_bash_names() {
 		let registry = build_language_registry();
 		for name in ["bash", "sh", "bats"] {
-			assert_eq!(registry.resolve_language_id(name), Some("bash"));
+			assert_eq!(
+				registry
+					.resolve_language_id(name)
+					.map(crate::engine::LanguageId::as_str),
+				Some("bash")
+			);
 			assert!(registry.completion_candidates().contains(&name.to_string()));
 		}
 	}
@@ -581,9 +586,21 @@ mod tests {
 	#[test]
 	fn default_registry_exposes_only_document_languages() {
 		let languages = supported_languages();
-		assert!(languages.iter().any(|language| language.id == "rust"));
-		assert!(languages.iter().any(|language| language.id == "markdown"));
-		assert!(!languages.iter().any(|language| language.id == "fs"));
+		assert!(
+			languages
+				.iter()
+				.any(|language| language.id.as_str() == "rust")
+		);
+		assert!(
+			languages
+				.iter()
+				.any(|language| language.id.as_str() == "markdown")
+		);
+		assert!(
+			!languages
+				.iter()
+				.any(|language| language.id.as_str() == "fs")
+		);
 	}
 
 	#[test]

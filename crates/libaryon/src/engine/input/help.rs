@@ -1899,7 +1899,11 @@ mod tests {
 		assert!(!languages.is_empty());
 		for language in languages {
 			for rendered in [&plain, &markdown] {
-				assert!(rendered.contains(language.id), "missing id {}", language.id);
+				assert!(
+					rendered.contains(language.id.as_str()),
+					"missing id {}",
+					language.id
+				);
 				assert!(
 					rendered.contains(language.label),
 					"missing label {}",

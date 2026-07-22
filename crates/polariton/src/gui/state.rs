@@ -244,6 +244,39 @@ fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
 	)
 }
 
+fn run_language_code(
+	app_state: &mut AppState,
+	language_id: libaryon::engine::LanguageId,
+	code: String,
+) -> Task<Message> {
+	match language_id.as_str() {
+		"sql" => run_code(app_state, code),
+		"rune" => {
+			if code.trim().is_empty() {
+				app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
+				return Task::none();
+			}
+			app_state.status_msg = "Rune running…".into();
+			app_state.status_error.clear();
+			app_state.status_time_elapsed = None;
+			app_state.code_started = Instant::now();
+			app_state.code_editor.begin_query();
+			Task::perform(
+				async move {
+					tokio::task::spawn_blocking(move || notebook_rune::execute_buffer(&code))
+						.await
+						.map_err(|error| format!("Rune task panicked: {error}"))?
+				},
+				Message::RunLanguageResult,
+			)
+		}
+		language => {
+			app_state.status_msg = format!("No executor is registered for language: {language}");
+			Task::none()
+		}
+	}
+}
+
 fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
 	match cell.language_id.as_str() {
 		"sql" => run_sql_markdown_cell(app_state, cell),
@@ -471,7 +504,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "Place the cursor in a SQL cell to run it.".into();
 				return Task::none();
 			}
-			return run_code(app_state, app_state.code_editor.cached_content().to_owned());
+			let Some(language_id) = app_state.code_editor.active_language_id() else {
+				app_state.status_msg = "The focused pane has no executable language.".into();
+				return Task::none();
+			};
+			return run_language_code(
+				app_state,
+				language_id,
+				app_state.code_editor.cached_content().to_owned(),
+			);
 		}
 		Message::RunSnippet => {
 			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
@@ -481,7 +522,26 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "No editor text is available to run.".into();
 				return Task::none();
 			};
-			return run_code(app_state, code);
+			let Some(language_id) = app_state.code_editor.active_language_id() else {
+				app_state.status_msg = "The focused pane has no executable language.".into();
+				return Task::none();
+			};
+			return run_language_code(app_state, language_id, code);
+		}
+		Message::RunLanguageResult(result) => {
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
+			match result {
+				Ok(value) => {
+					app_state.status_error.clear();
+					app_state.status_msg = "Rune finished.".into();
+					app_state.code_editor.set_query_message(value);
+				}
+				Err(message) => {
+					app_state.status_error = format!("Error: {message}");
+					app_state.status_msg.clear();
+					app_state.code_editor.set_query_error(message);
+				}
+			}
 		}
 		Message::RunResult(er) => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;

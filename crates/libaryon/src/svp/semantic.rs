@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::core::{BufferId, ByteLen, DocByte, RequestId, StateId};
-use crate::engine::language::{GreenNode, InlineAnnotation, LanguageRegistry};
+use crate::engine::language::{GreenNode, InlineAnnotation, LanguageId, LanguageRegistry};
 use crate::engine::request::{InternalEvent, InternalSender};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
@@ -17,7 +17,7 @@ pub struct SemanticRequest {
 	pub content: Vec<u8>,
 	pub global_offset: DocByte,
 	pub file_path: String,
-	pub language_id: String,
+	pub language_id: LanguageId,
 	pub state_id: StateId,
 	pub request_id: RequestId,
 }
@@ -79,7 +79,7 @@ impl SemanticReactor {
 		registry: Arc<LanguageRegistry>,
 	) {
 		while let Ok(request) = rx.recv() {
-			let provider = registry.get_provider(&request.language_id);
+			let provider = registry.get_provider(request.language_id);
 
 			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider
 			{
@@ -234,7 +234,7 @@ mod tests {
 			content: b"first".to_vec(),
 			global_offset: DocByte::ZERO,
 			file_path: "first.slow".to_string(),
-			language_id: "slowtest".to_string(),
+			language_id: LanguageId::from_registered("slowtest"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
 		});
@@ -243,7 +243,7 @@ mod tests {
 			content: b"second".to_vec(),
 			global_offset: DocByte::ZERO,
 			file_path: "second.slow".to_string(),
-			language_id: "slowtest".to_string(),
+			language_id: LanguageId::from_registered("slowtest"),
 			state_id: StateId::new(2),
 			request_id: RequestId::new(2),
 		});
@@ -285,7 +285,7 @@ mod tests {
 			content: source.as_bytes().to_vec(),
 			global_offset: DocByte::new(500),
 			file_path: "notebook.md".to_owned(),
-			language_id: "markdown".to_owned(),
+			language_id: LanguageId::from_registered("markdown"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
 		});
@@ -323,7 +323,7 @@ mod tests {
 			content: raw.clone(),
 			global_offset: DocByte::ZERO,
 			file_path: "data.csv".to_string(),
-			language_id: "csv".to_string(),
+			language_id: LanguageId::from_registered("csv"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
 		});

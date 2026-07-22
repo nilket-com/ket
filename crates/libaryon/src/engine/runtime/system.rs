@@ -32,12 +32,11 @@ use std::path::Path;
 fn detect_language(
 	lang_registry: &super::super::language::LanguageRegistry,
 	path: &str,
-) -> Option<&'static str> {
+) -> Option<super::super::language::LanguageId> {
 	Path::new(path)
 		.extension()
 		.and_then(|ext| ext.to_str())
-		.and_then(|ext| lang_registry.provider_for_extension(ext))
-		.map(|provider| provider.language_id())
+		.and_then(|ext| lang_registry.resolve_language_id(ext))
 }
 
 fn file_stamp_for_path(path: &str) -> Option<FileStamp> {
@@ -347,7 +346,7 @@ fn config_call_key(
 		"language_theme" => Some(InitConfigKey::LanguageTheme(
 			language_registry
 				.resolve_supported_language_id(&key)
-				.map_or(key, str::to_string),
+				.map_or(key, |id| id.as_str().to_string()),
 		)),
 		_ => None,
 	}
@@ -685,7 +684,7 @@ fn initialize_loaded_document(
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
-	active_language_id: &mut Option<&'static str>,
+	active_language_id: &mut Option<super::super::language::LanguageId>,
 	shadow: &mut Option<ShadowSession>,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
@@ -696,7 +695,7 @@ fn initialize_loaded_document(
 	path: Option<String>,
 	new_virtual_path: Option<String>,
 	backing: Option<String>,
-	language_id: Option<&'static str>,
+	language_id: Option<super::super::language::LanguageId>,
 	shadow_session: Option<ShadowSession>,
 	new_root: NodeId,
 	_new_cursor_node: NodeId,
@@ -738,7 +737,7 @@ fn reload_loaded_document(
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
-	active_language_id: &mut Option<&'static str>,
+	active_language_id: &mut Option<super::super::language::LanguageId>,
 	shadow: &mut Option<ShadowSession>,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
@@ -869,7 +868,7 @@ fn apply_theme_name_to_tab(tab: &mut View, name: String) -> Result<(), String> {
 
 pub(super) fn apply_resolved_theme_to_tab(
 	tab: &mut View,
-	active_language_id: Option<&str>,
+	active_language_id: Option<super::super::language::LanguageId>,
 	persistent_settings: &SettingsPersistent,
 ) -> Result<(), String> {
 	let theme_name = resolve_theme_name(
@@ -1058,7 +1057,7 @@ pub(super) fn handle_persist_view_doctab_command(
 			};
 			let success = if persistent_settings
 				.language_themes
-				.remove(language_id)
+				.remove(language_id.as_str())
 				.is_some()
 			{
 				format!("Theme for {} removed", language_id)
@@ -1462,7 +1461,7 @@ pub(super) fn handle_file_command(
 	backing_path: &mut Option<String>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
-	active_language_id: &mut Option<&'static str>,
+	active_language_id: &mut Option<super::super::language::LanguageId>,
 	shadow: &mut Option<ShadowSession>,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
@@ -1750,7 +1749,8 @@ pub(super) fn handle_file_command(
 						.resolve_supported_language_provider(name_or_extension)
 					{
 						Some(provider) => (
-							Some(provider.language_id()),
+							ctx.lang_registry
+								.resolve_supported_language_id(name_or_extension),
 							provider
 								.extensions()
 								.first()
@@ -1808,7 +1808,7 @@ pub(super) fn handle_file_command(
 
 pub(super) fn handle_language_command(
 	lang_registry: &super::super::language::LanguageRegistry,
-	active_language_id: &mut Option<&'static str>,
+	active_language_id: &mut Option<super::super::language::LanguageId>,
 	has_file_path: bool,
 	virtual_path: &mut Option<String>,
 	semantic: &mut SemanticRuntime<'_>,
@@ -1821,7 +1821,7 @@ pub(super) fn handle_language_command(
 				Some(provider) => {
 					*status_message = Some(format!("Language set to {}", provider.label()));
 					(
-						Some(provider.language_id()),
+						lang_registry.resolve_supported_language_id(name_or_extension),
 						provider
 							.extensions()
 							.first()

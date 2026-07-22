@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -6,6 +7,34 @@ use crate::core::{DocByte, DocLine};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::kind::SemanticKind;
+
+/// Canonical identity of a language registered with the engine.
+///
+/// Raw command arguments, extensions, and Markdown fence tags remain strings
+/// until a [`LanguageRegistry`] resolves them. Engine state uses this type so
+/// an unresolved alias cannot masquerade as a registered language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LanguageId(&'static str);
+
+impl LanguageId {
+	pub(crate) fn from_registered(id: &'static str) -> Self {
+		assert!(
+			!id.is_empty(),
+			"language providers must have a non-empty id"
+		);
+		Self(id)
+	}
+
+	pub const fn as_str(self) -> &'static str {
+		self.0
+	}
+}
+
+impl fmt::Display for LanguageId {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.0)
+	}
+}
 
 // ============================================================
 // SemanticOutput — Reactor result bundle
@@ -145,7 +174,7 @@ pub trait LanguageProvider: Send + Sync {
 /// User-facing metadata for a registered document language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageInfo {
-	pub id: &'static str,
+	pub id: LanguageId,
 	pub label: &'static str,
 	pub extensions: &'static [&'static str],
 }
@@ -200,27 +229,30 @@ impl LanguageRegistry {
 		self.providers.insert(id, Box::new(provider));
 	}
 
-	pub fn get_provider(&self, language_id: &str) -> Option<&dyn LanguageProvider> {
-		self.providers.get(language_id).map(|p| p.as_ref())
+	pub fn get_provider(&self, language_id: LanguageId) -> Option<&dyn LanguageProvider> {
+		self.providers.get(language_id.as_str()).map(|p| p.as_ref())
 	}
 
 	pub fn provider_for_extension(&self, ext: &str) -> Option<&dyn LanguageProvider> {
 		self.extension_map
 			.get(ext)
-			.and_then(|id| self.get_provider(id))
+			.and_then(|id| self.providers.get(id))
+			.map(|provider| provider.as_ref())
 	}
 
 	pub fn resolve_language_provider(
 		&self,
 		name_or_extension: &str,
 	) -> Option<&dyn LanguageProvider> {
-		self.get_provider(name_or_extension)
+		self.providers
+			.get(name_or_extension)
+			.map(|provider| provider.as_ref())
 			.or_else(|| self.provider_for_extension(name_or_extension))
 	}
 
-	pub fn resolve_language_id(&self, name_or_extension: &str) -> Option<&'static str> {
+	pub fn resolve_language_id(&self, name_or_extension: &str) -> Option<LanguageId> {
 		self.resolve_language_provider(name_or_extension)
-			.map(|provider| provider.language_id())
+			.map(|provider| LanguageId::from_registered(provider.language_id()))
 	}
 
 	/// Resolve a language exposed to user documents, excluding providers used
@@ -233,9 +265,9 @@ impl LanguageRegistry {
 			.filter(|provider| !self.internal_provider_ids.contains(provider.language_id()))
 	}
 
-	pub fn resolve_supported_language_id(&self, name_or_extension: &str) -> Option<&'static str> {
+	pub fn resolve_supported_language_id(&self, name_or_extension: &str) -> Option<LanguageId> {
 		self.resolve_supported_language_provider(name_or_extension)
-			.map(|provider| provider.language_id())
+			.map(|provider| LanguageId::from_registered(provider.language_id()))
 	}
 
 	pub fn completion_candidates(&self) -> Vec<String> {
@@ -264,7 +296,7 @@ impl LanguageRegistry {
 			.iter()
 			.filter(|(id, _)| !self.internal_provider_ids.contains(*id))
 			.map(|(_, provider)| LanguageInfo {
-				id: provider.language_id(),
+				id: LanguageId::from_registered(provider.language_id()),
 				label: provider.label(),
 				extensions: provider.extensions(),
 			})
@@ -273,14 +305,22 @@ impl LanguageRegistry {
 		languages
 	}
 
-	pub fn language_ids(&self) -> impl Iterator<Item = &str> {
-		self.providers.keys().map(|s| s.as_str())
+	pub fn language_ids(&self) -> impl Iterator<Item = LanguageId> + '_ {
+		self.providers
+			.values()
+			.map(|provider| LanguageId::from_registered(provider.language_id()))
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	#[should_panic(expected = "non-empty id")]
+	fn canonical_language_ids_reject_empty_provider_ids() {
+		LanguageId::from_registered("");
+	}
 
 	struct DummyProvider;
 
@@ -315,8 +355,9 @@ mod tests {
 	fn registry_lookup_by_id() {
 		let mut reg = LanguageRegistry::new();
 		reg.register(DummyProvider);
-		assert!(reg.get_provider("dummy").is_some());
-		assert!(reg.get_provider("nonexistent").is_none());
+		let id = reg.resolve_language_id("dummy").expect("registered id");
+		assert!(reg.get_provider(id).is_some());
+		assert!(reg.resolve_language_id("nonexistent").is_none());
 	}
 
 	#[test]
@@ -342,9 +383,18 @@ mod tests {
 	fn resolve_language_id_accepts_provider_id_or_extension() {
 		let mut reg = LanguageRegistry::new();
 		reg.register(DummyProvider);
-		assert_eq!(reg.resolve_language_id("dummy"), Some("dummy"));
-		assert_eq!(reg.resolve_language_id("dum"), Some("dummy"));
-		assert_eq!(reg.resolve_language_id("dmy"), Some("dummy"));
+		assert_eq!(
+			reg.resolve_language_id("dummy").map(LanguageId::as_str),
+			Some("dummy")
+		);
+		assert_eq!(
+			reg.resolve_language_id("dum").map(LanguageId::as_str),
+			Some("dummy")
+		);
+		assert_eq!(
+			reg.resolve_language_id("dmy").map(LanguageId::as_str),
+			Some("dummy")
+		);
 		assert_eq!(reg.resolve_language_id("xyz"), None);
 	}
 
@@ -359,7 +409,10 @@ mod tests {
 	fn internal_providers_are_hidden_from_user_facing_catalogs() {
 		let mut reg = LanguageRegistry::new();
 		reg.register_internal(DummyProvider);
-		assert!(reg.get_provider("dummy").is_some());
+		assert!(
+			reg.get_provider(reg.resolve_language_id("dummy").unwrap())
+				.is_some()
+		);
 		assert!(reg.resolve_supported_language_id("dummy").is_none());
 		assert!(reg.resolve_supported_language_id("dum").is_none());
 		assert!(reg.completion_candidates().is_empty());
@@ -373,7 +426,7 @@ mod tests {
 		assert_eq!(
 			reg.supported_languages(),
 			vec![LanguageInfo {
-				id: "dummy",
+				id: LanguageId::from_registered("dummy"),
 				label: "Dummy",
 				extensions: &["dum", "dmy"],
 			}]
