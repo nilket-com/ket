@@ -1435,6 +1435,61 @@ pub(super) fn build_in_memory_join_rows(
 	Ok(Some(build_rows))
 }
 
+/// ADR 497: drive one primitive-key probe arm through the staged batch window
+/// (or the historical one-key-at-a-time lookup under the ablation), leaving
+/// per-row match handling identical to the scalar loop it replaces.
+fn probe_primitive_key_rows<'table, K: Copy>(
+	kind: JoinKind,
+	rows: usize,
+	key_at: impl Fn(usize) -> Option<K>,
+	lookup_scalar: impl Fn(K) -> Option<&'table BuildRowList>,
+	lookup_window: impl Fn(&[Option<K>], &mut Vec<Option<&'table BuildRowList>>),
+	matched_build_rows: &mut Option<Vec<u64>>,
+	selection: &mut Vec<JoinOutputRow>,
+	residual: &mut JoinMatchResidual,
+) -> Result<(), ExecutionError> {
+	let batched = build_rows::batched_probe_prefetch_enabled();
+	let window = if batched {
+		build_rows::PROBE_BATCH_WINDOW
+	} else {
+		1
+	};
+	let mut window_keys = Vec::with_capacity(window);
+	let mut window_lookups = Vec::with_capacity(window);
+	let mut row = 0usize;
+	while row < rows {
+		let end = (row + window).min(rows);
+		window_lookups.clear();
+		if batched {
+			window_keys.clear();
+			window_keys.extend((row..end).map(&key_at));
+			lookup_window(&window_keys, &mut window_lookups);
+		} else {
+			window_lookups.push(key_at(row).and_then(&lookup_scalar));
+		}
+		for (offset, lookup) in window_lookups.iter().enumerate() {
+			let row = row + offset;
+			let matched = if let Some(matches) = lookup {
+				append_join_matches_for_kind(
+					kind,
+					row,
+					matches.rows(),
+					matched_build_rows.as_deref_mut(),
+					selection,
+					residual,
+				)?
+			} else {
+				false
+			};
+			if !matched {
+				append_unmatched_probe_row(kind, row, selection)?;
+			}
+		}
+		row = end;
+	}
+	Ok(())
+}
+
 pub(super) fn probe_in_memory_join_rows(
 	kind: JoinKind,
 	join_key_plan: JoinKeyPlan,
@@ -1454,51 +1509,29 @@ pub(super) fn probe_in_memory_join_rows(
 	match join_key_plan {
 		JoinKeyPlan::Int32 => {
 			let values = single_join_key_array::<Int32Array>(right_key_arrays, "Int32")?;
-			for row in 0..rows {
-				if values.is_null(row) {
-					append_unmatched_probe_row(kind, row, &mut selection)?;
-				} else {
-					let matched = if let Some(matches) = build_rows.get_int32(values.value(row)) {
-						append_join_matches_for_kind(
-							kind,
-							row,
-							matches.rows(),
-							matched_build_rows.as_deref_mut(),
-							&mut selection,
-							&mut residual,
-						)?
-					} else {
-						false
-					};
-					if !matched {
-						append_unmatched_probe_row(kind, row, &mut selection)?;
-					}
-				}
-			}
+			probe_primitive_key_rows(
+				kind,
+				rows,
+				|row| (!values.is_null(row)).then(|| values.value(row)),
+				|key| build_rows.get_int32(key),
+				|keys, out| build_rows.get_int32_batch(keys, out),
+				&mut matched_build_rows,
+				&mut selection,
+				&mut residual,
+			)?;
 		}
 		JoinKeyPlan::Int64 => {
 			let values = single_join_key_array::<Int64Array>(right_key_arrays, "Int64")?;
-			for row in 0..rows {
-				if values.is_null(row) {
-					append_unmatched_probe_row(kind, row, &mut selection)?;
-				} else {
-					let matched = if let Some(matches) = build_rows.get_int64(values.value(row)) {
-						append_join_matches_for_kind(
-							kind,
-							row,
-							matches.rows(),
-							matched_build_rows.as_deref_mut(),
-							&mut selection,
-							&mut residual,
-						)?
-					} else {
-						false
-					};
-					if !matched {
-						append_unmatched_probe_row(kind, row, &mut selection)?;
-					}
-				}
-			}
+			probe_primitive_key_rows(
+				kind,
+				rows,
+				|row| (!values.is_null(row)).then(|| values.value(row)),
+				|key| build_rows.get_int64(key),
+				|keys, out| build_rows.get_int64_batch(keys, out),
+				&mut matched_build_rows,
+				&mut selection,
+				&mut residual,
+			)?;
 		}
 		JoinKeyPlan::Generic => {
 			for row in 0..rows {

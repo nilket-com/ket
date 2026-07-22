@@ -49,6 +49,42 @@ struct PrimitiveBuildEntry<K> {
 
 const EMPTY_PRIMITIVE_BUCKET: usize = usize::MAX;
 
+/// ADR 497: how many probe keys are staged together so their bucket/entry
+/// loads are in flight concurrently instead of each probe paying its two
+/// dependent misses serially.
+pub(in crate::exec) const PROBE_BATCH_WINDOW: usize = 64;
+
+const BATCHED_PROBE_PREFETCH_ENV: &str = "TORON_BATCHED_PROBE_PREFETCH";
+
+pub(super) fn batched_probe_prefetch_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+/// ADR 497 ablation: `=0` restores the one-key-at-a-time probe. Default on.
+pub(super) fn batched_probe_prefetch_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		batched_probe_prefetch_enabled_from_env(
+			std::env::var(BATCHED_PROBE_PREFETCH_ENV).ok().as_deref(),
+		)
+	})
+}
+
+/// Best-effort prefetch of the cache line holding `value`. Additive over the
+/// batching itself; on non-x86_64 targets the staged loads alone provide the
+/// memory-level parallelism and results are byte-identical.
+#[inline(always)]
+fn prefetch_read<T>(value: *const T) {
+	#[cfg(target_arch = "x86_64")]
+	// SAFETY: prefetch is a hint; it has no effect on program semantics and
+	// tolerates any address.
+	unsafe {
+		core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(value as *const i8);
+	}
+	#[cfg(not(target_arch = "x86_64"))]
+	let _ = value;
+}
+
 impl JoinBuildRows {
 	fn new_hash(capacity: usize) -> Self {
 		Self {
@@ -118,6 +154,37 @@ impl JoinBuildRows {
 			JoinBuildRowsInner::Int64(table) => table.get(key),
 			JoinBuildRowsInner::Hash(rows) => rows.get(&JoinKey::Int64(key)),
 			JoinBuildRowsInner::Int32(_) => None,
+		}
+	}
+
+	/// ADR 497: batched Int64 probe window (≤ [`PROBE_BATCH_WINDOW`] keys).
+	/// Falls back to per-key lookups on non-Int64 tables.
+	pub(in crate::exec) fn get_int64_batch<'table>(
+		&'table self,
+		keys: &[Option<i64>],
+		out: &mut Vec<Option<&'table BuildRowList>>,
+	) {
+		match &self.inner {
+			JoinBuildRowsInner::Int64(table) => table.get_batch(keys, out),
+			_ => out.extend(
+				keys.iter()
+					.map(|key| key.and_then(|key| self.get_int64(key))),
+			),
+		}
+	}
+
+	/// ADR 497: batched Int32 probe window (≤ [`PROBE_BATCH_WINDOW`] keys).
+	pub(in crate::exec) fn get_int32_batch<'table>(
+		&'table self,
+		keys: &[Option<i32>],
+		out: &mut Vec<Option<&'table BuildRowList>>,
+	) {
+		match &self.inner {
+			JoinBuildRowsInner::Int32(table) => table.get_batch(keys, out),
+			_ => out.extend(
+				keys.iter()
+					.map(|key| key.and_then(|key| self.get_int32(key))),
+			),
 		}
 	}
 
@@ -239,6 +306,64 @@ where
 			None
 		} else {
 			Some(&self.entries[entry_index].rows)
+		}
+	}
+
+	/// ADR 497: batched probe. Stages a window of keys — hash + bucket-slot
+	/// prefetch, then entry prefetch, then resolution — so the two dependent
+	/// out-of-cache loads of independent probes overlap. A key whose first
+	/// probed slot neither hits nor is empty falls to the scalar linear-probe
+	/// tail, so every key resolves to exactly the bucket `find_bucket` would
+	/// have chosen. `out[i]` corresponds to `keys[i]`; `None` keys are probe
+	/// nulls and resolve to `None`.
+	fn get_batch<'table>(
+		&'table self,
+		keys: &[Option<K>],
+		out: &mut Vec<Option<&'table BuildRowList>>,
+	) {
+		debug_assert!(keys.len() <= PROBE_BATCH_WINDOW);
+		let mut staged_buckets = [0usize; PROBE_BATCH_WINDOW];
+		for (slot, key) in keys.iter().enumerate() {
+			if let Some(key) = key {
+				let bucket = self.bucket_for_key(*key);
+				staged_buckets[slot] = bucket;
+				prefetch_read(&self.buckets[bucket]);
+			}
+		}
+		let mut staged_entries = [EMPTY_PRIMITIVE_BUCKET; PROBE_BATCH_WINDOW];
+		for (slot, key) in keys.iter().enumerate() {
+			if key.is_some() {
+				let entry_index = self.buckets[staged_buckets[slot]];
+				staged_entries[slot] = entry_index;
+				if entry_index != EMPTY_PRIMITIVE_BUCKET {
+					prefetch_read(&self.entries[entry_index]);
+				}
+			}
+		}
+		for (slot, key) in keys.iter().enumerate() {
+			out.push(key.and_then(|key| {
+				let entry_index = staged_entries[slot];
+				if entry_index == EMPTY_PRIMITIVE_BUCKET {
+					return None;
+				}
+				if self.entries[entry_index].key == key {
+					return Some(&self.entries[entry_index].rows);
+				}
+				// Collision: continue the scalar linear probe from the next
+				// slot, exactly as the unbatched path would.
+				let mask = self.buckets.len() - 1;
+				let mut bucket = (staged_buckets[slot] + 1) & mask;
+				loop {
+					let entry_index = self.buckets[bucket];
+					if entry_index == EMPTY_PRIMITIVE_BUCKET {
+						return None;
+					}
+					if self.entries[entry_index].key == key {
+						return Some(&self.entries[entry_index].rows);
+					}
+					bucket = (bucket + 1) & mask;
+				}
+			}));
 		}
 	}
 
@@ -445,6 +570,46 @@ mod tests {
 		probe_in_memory_join_rows,
 	};
 	use crate::ir::JoinKind;
+
+	#[test]
+	fn adr497_batched_probe_ablation_defaults_on() {
+		use super::batched_probe_prefetch_enabled_from_env;
+		assert!(batched_probe_prefetch_enabled_from_env(None));
+		assert!(batched_probe_prefetch_enabled_from_env(Some("1")));
+		assert!(!batched_probe_prefetch_enabled_from_env(Some("0")));
+	}
+
+	#[test]
+	fn adr497_batched_probe_matches_scalar_across_collisions_nulls_and_misses() {
+		use crate::exec::join::new_int64_join_build_rows;
+
+		// Small table → few buckets → dense collision chains; keys straddle
+		// multiple windows and include duplicates, absent keys, and nulls.
+		let mut rows = new_int64_join_build_rows(8);
+		for (row, key) in [3i64, 11, 19, 27, 35, 43, 51, 59, 3, 27].iter().enumerate() {
+			insert_join_build_row(&mut rows, JoinKey::Int64(*key), row as u32);
+		}
+		let probes: Vec<Option<i64>> = (0..(super::PROBE_BATCH_WINDOW as i64 * 2 + 7))
+			.map(|i| match i % 5 {
+				0 => None,
+				1 => Some(i % 64),
+				_ => Some((i * 8) % 64 + 3),
+			})
+			.collect();
+		for window in probes.chunks(super::PROBE_BATCH_WINDOW) {
+			let mut batched = Vec::new();
+			rows.get_int64_batch(window, &mut batched);
+			assert_eq!(batched.len(), window.len());
+			for (key, lookup) in window.iter().zip(batched) {
+				let scalar = key.and_then(|key| rows.get_int64(key));
+				assert_eq!(
+					scalar.map(|list| list.rows().collect::<Vec<_>>()),
+					lookup.map(|list| list.rows().collect::<Vec<_>>()),
+					"batched lookup diverged from scalar for key {key:?}"
+				);
+			}
+		}
+	}
 
 	#[test]
 	fn join_build_row_list_stores_unique_row_inline() {
