@@ -13,7 +13,7 @@
 
 ❯ polariton
 
-thread '<unnamed>' (808754) panicked at baryon/crates/libaryon/src/engine/session.rs:3336:18:
+thread '<unnamed>' (808754) panicked at crates/libaryon/src/engine/session.rs:3336:18:
 view content must match its buffer content
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 [1]    808716 IOT instruction (core dumped)  polariton

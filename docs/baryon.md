@@ -222,4 +222,4 @@ Languages plug in through a `LanguageProvider` trait: a provider declares its ex
 Baryon currently targets a Linux-style terminal workflow and includes `io_uring` in its storage/ingestion layer. It is being developed primarily as a systems-oriented editor experiment, so the implementation is optimized for clarity of internal boundaries more than broad platform polish at this stage.
 
 ### Screenshots
-![Baryon](https://github.com/JoelBondurant/baryon/blob/main/img/screenshot_1.png?raw=true)
+![Baryon](img/baryon/screenshot_1.png)

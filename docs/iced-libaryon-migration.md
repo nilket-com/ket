@@ -9,7 +9,7 @@ Related: `baryon/plans/headless-baryon.md`, `baryon/plans/input-contract.md`,
 This is an editor-engine migration plus a new iced renderer, not a widget swap.
 libaryon is headless: it exposes `EngineHandle::spawn(EngineConfig)`, command and
 input senders, and immutable `Viewport` projections
-(`baryon/crates/libaryon/src/engine/host.rs`, `src/uast/projection.rs`). Its only
+(`crates/libaryon/src/engine/host.rs`, `src/uast/projection.rs`). Its only
 existing renderer is baryon's ratatui frontend. Per `headless-baryon.md`, the iced
 frontend is born inside polariton; a `baryon-iced` crate is extracted only if a
 second iced consumer appears.
@@ -17,7 +17,7 @@ second iced consumer appears.
 Polariton's app-side coupling is small — one `CodeEditor` in `gui/state.rs:28`,
 rendered in one pane, consumed as a `String` for run/save/load, with ~a dozen call
 sites funnelled through `CodeEditor` + `EditorMsg`. The in-house editor to retire
-is `polariton/src/editor/` (custom `iced::advanced` widget, ropey buffer,
+is `crates/polariton/src/editor/` (custom `iced::advanced` widget, ropey buffer,
 tree-sitter highlighting, vim layer, folding, search, undo, minimap).
 
 ## Known blockers and decisions
@@ -66,7 +66,7 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    the SQL back out. Engine-level tests cover the SQL replace → edit → query
    round-trip and the file-association reset.
 2. **Minimal iced bridge in polariton.** ✅ Foundation done (2026-07-18):
-   `polariton/src/editor.rs` owns one long-lived engine, drains the
+   `crates/polariton/src/editor.rs` owns one long-lived engine, drains the
    viewport receiver on a non-blocking 16 ms iced tick (coalescing projections),
    translates keyboard input, renders focused-pane tokens in a fixed-width Iced
    scrollable, and maps window pixels to the engine cell grid. Polariton's
@@ -89,8 +89,8 @@ tree-sitter highlighting, vim layer, folding, search, undo, minimap).
    in-memory SQL replace/query, rapid typing convergence, modal `dw`/undo/`yy`/
    put editing, Insert-mode system paste, Normal-mode `Ctrl+V` block selection,
    scrolling, minimap navigation, wrapping, and mouse cursor placement. The old
-   `polariton/src/editor/` has been deleted; `DEJAVU_SANS_MONO` now lives in
-   `fonts`, and the bridge is the app-facing `polariton/src/editor.rs` with
+   `crates/polariton/src/editor/` has been deleted; `DEJAVU_SANS_MONO` now lives in
+   `fonts`, and the bridge is the app-facing `crates/polariton/src/editor.rs` with
    `CodeEditor`, preserving an engine-agnostic surface for a later
    `baryon-iced` extraction.
 
