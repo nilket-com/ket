@@ -31,3 +31,25 @@ rows, and zero spill.
 - Full `cargo test -p toron --test architecture_test --quiet`: 2093 passed.
 - The earlier Phase 1 receipt remains the attribution baseline; the named non-exchange residual is a
   separate follow-up target.
+
+## Surplus attribution (why −51% exceeds the ~855 ms exchange bucket)
+
+The recovery is larger than the exchange bucket alone; the armed-receipt reconcile (sf=8, decode is
+upstream of the exchange and cancels) attributes every millisecond:
+
+| bucket | control (`=0`) | bypass | Δ |
+|---|---:|---:|---:|
+| parquet decode | ~156 ms | 155.5 ms | ~0 |
+| exchange (routing/index 759 + take 96) | 854.7 ms | 0 | −854.7 |
+| fold | 456.2 ms | 437.7 ms | −18.5 |
+| residual | ~497.7 ms | ~374.7 ms | −123.0 |
+| execute | 1,964.6 ms | 967.9 ms | −996.7 |
+
+The surplus over the ~855 ms exchange bucket is **not** a cheaper fold — `fold_micros` is flat
+(456 → 438 ms), which refutes the "fold no longer re-hashes partitioned input" guess; the fold does
+the same per-row work. It is the **residual** (~123 ms), driven by batch count: the bypass folds the
+**46,865 source batches** directly instead of the exchange's **93,730 partition batches** (exact 2×),
+halving the downstream per-batch framework/dispatch/projection overhead that lives in the residual,
+not in the fold timer. Recovery = exchange 855 + residual 123 + fold 18 ≈ 997 ms.
+
+The remaining ~375 ms bypass residual is the named non-exchange target carried forward from Phase 1.
