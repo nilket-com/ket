@@ -305,6 +305,8 @@ pub struct PerfAttempt {
 	/// ADR 490: one compact admission receipt per binder-physicalized hash join,
 	/// in bind order — toron rows only.
 	pub local_join_admissions: Option<Vec<String>>,
+	/// Runtime hash-join path and attributed spill bytes, keyed by replay id.
+	pub join_spill_observations: Option<Vec<toron::distributed::task::JoinSpillObservation>>,
 }
 
 /// The commit this gauge binary was built from, stamped at compile time
@@ -352,6 +354,7 @@ impl PerfAttempt {
 			"build_commit": build_commit(),
 			"binary_modified_unix": binary_modified_unix(),
 			"local_join_admissions": self.local_join_admissions,
+			"join_spill_observations": self.join_spill_observations,
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

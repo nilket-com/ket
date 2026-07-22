@@ -50,7 +50,7 @@ use toron::binder::{
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::task::{JoinBuildProfile, RowCount, TaskTelemetry};
+use toron::distributed::task::{JoinBuildProfile, JoinSpillObservation, RowCount, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -3580,6 +3580,7 @@ struct QueryExecution {
 	plan_fingerprint: String,
 	spill_bytes: u64,
 	local_join_admissions: Vec<String>,
+	join_spill_observations: Vec<JoinSpillObservation>,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -3750,11 +3751,10 @@ async fn execute_logical_with_catalog_timed(
 	};
 	timings.execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 	timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-	spill_bytes = task_telemetry
-		.lock()
-		.expect("task telemetry lock")
-		.counters
-		.spill_bytes;
+	let telemetry = task_telemetry.lock().expect("task telemetry lock");
+	spill_bytes = telemetry.counters.spill_bytes;
+	let join_spill_observations = telemetry.join_spill_observations.clone();
+	drop(telemetry);
 
 	Ok(QueryExecution {
 		batches,
@@ -3765,6 +3765,7 @@ async fn execute_logical_with_catalog_timed(
 			.iter()
 			.map(|admission| admission.describe())
 			.collect(),
+		join_spill_observations,
 	})
 }
 
@@ -4497,6 +4498,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4532,6 +4534,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4566,6 +4569,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
+			join_spill_observations: None,
 		};
 	}
 
@@ -4593,6 +4597,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
+			join_spill_observations: None,
 		};
 	}
 
@@ -4619,6 +4624,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 }
 
@@ -4664,6 +4670,7 @@ async fn run_perf_query_with_tables(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4699,6 +4706,7 @@ async fn run_perf_query_with_tables(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4730,6 +4738,7 @@ async fn run_perf_query_with_tables(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
+		join_spill_observations: Some(execution.join_spill_observations),
 	}
 }
 
@@ -4776,6 +4785,7 @@ async fn run_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4811,6 +4821,7 @@ async fn run_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				join_spill_observations: None,
 			};
 		}
 	};
@@ -4842,6 +4853,7 @@ async fn run_perf_query_with_metadata(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
+		join_spill_observations: Some(execution.join_spill_observations),
 	}
 }
 

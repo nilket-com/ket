@@ -4741,6 +4741,7 @@ impl Executor {
 			)
 			.await?
 		{
+			let attributed_spill_bytes = spilled.spill_bytes();
 			let materialized_output_schema = if probe_columns_first {
 				concat_join_schema(&build_plan.schema(), &probe_plan.schema())
 			} else {
@@ -4808,6 +4809,12 @@ impl Executor {
 					},
 				);
 			}
+			record_join_spill_observation(
+				&self.context.task_telemetry,
+				replay_id,
+				crate::distributed::task::JoinSpillPath::StreamingScanBuild,
+				attributed_spill_bytes,
+			);
 			spilled.cleanup().await;
 			result?;
 			return Ok(Some(()));
@@ -4863,6 +4870,7 @@ impl Executor {
 		)
 		.await?
 		{
+			let attributed_spill_bytes = spilled.spill_bytes();
 			let materialized_output_schema = if probe_columns_first {
 				concat_join_schema(&build_plan.schema(), &probe_plan.schema())
 			} else {
@@ -4930,6 +4938,12 @@ impl Executor {
 					},
 				);
 			}
+			record_join_spill_observation(
+				&self.context.task_telemetry,
+				replay_id,
+				crate::distributed::task::JoinSpillPath::StreamedSpilledBuild,
+				attributed_spill_bytes,
+			);
 			spilled.cleanup().await;
 			result?;
 			return Ok(Some(()));
@@ -5110,6 +5124,7 @@ impl Executor {
 		let mut total_build_rows = 0u64;
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
+		let mut total_spill_bytes = 0u64;
 		for group in 0..group_count {
 			let group_build_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
@@ -5195,6 +5210,7 @@ impl Executor {
 				}
 			}
 			total_build_rows = total_build_rows.saturating_add(group_build_rows);
+			total_spill_bytes = total_spill_bytes.saturating_add(group_spill_bytes);
 			record_task_telemetry(&self.context.task_telemetry, |task| {
 				task.phases.build_micros = task
 					.phases
@@ -5260,6 +5276,12 @@ impl Executor {
 				timer.finish()?;
 			}
 		}
+		record_join_spill_observation(
+			&self.context.task_telemetry,
+			replay_id,
+			crate::distributed::task::JoinSpillPath::PartitionedStreamingScanBuild,
+			total_spill_bytes,
+		);
 		Ok(Some((
 			total_build_rows,
 			total_probe_rows,

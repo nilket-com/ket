@@ -185,6 +185,30 @@ pub(super) fn record_join_runtime_observation(
 	});
 }
 
+pub(super) fn record_join_spill_observation(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	replay_id: JoinReplayId,
+	path: crate::distributed::task::JoinSpillPath,
+	spill_bytes: u64,
+) {
+	record_task_telemetry(telemetry, |task| {
+		task.join_spill_observations
+			.push(crate::distributed::task::JoinSpillObservation {
+				replay_id,
+				path,
+				spill_bytes,
+			});
+	});
+}
+
+fn task_spill_bytes(telemetry: &Option<Arc<Mutex<TaskTelemetry>>>) -> u64 {
+	telemetry
+		.as_ref()
+		.and_then(|telemetry| telemetry.lock().ok())
+		.map(|telemetry| telemetry.counters.spill_bytes)
+		.unwrap_or(0)
+}
+
 pub(super) fn record_batch_row_count(batches: &[RecordBatch]) -> u64 {
 	batches
 		.iter()
@@ -509,6 +533,7 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 	)
 	.await?
 	{
+		let attributed_spill_bytes = spilled.spill_bytes();
 		record_task_telemetry(&telemetry, |task| {
 			task.phases.build_micros = task
 				.phases
@@ -567,6 +592,12 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 				},
 			);
 		}
+		record_join_spill_observation(
+			&telemetry,
+			replay_id,
+			crate::distributed::task::JoinSpillPath::StreamedSpilledBuild,
+			attributed_spill_bytes,
+		);
 		spilled.cleanup().await;
 		result?;
 		return Ok(());
@@ -590,6 +621,7 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 	if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
 		> task_budget.memory.get()
 	{
+		let spill_before = task_spill_bytes(&telemetry);
 		let result = execute_spilled_hash_join_into_global_aggregate(
 			executor,
 			kind,
@@ -609,6 +641,12 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 			spill_dir,
 		)
 		.await;
+		record_join_spill_observation(
+			&telemetry,
+			replay_id,
+			crate::distributed::task::JoinSpillPath::EstimateSpillFallback,
+			task_spill_bytes(&telemetry).saturating_sub(spill_before),
+		);
 		if let Ok(output_rows) = &result {
 			record_join_runtime_observation(
 				&telemetry,
@@ -637,6 +675,7 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 		null_safe_keys,
 	)?
 	else {
+		let spill_before = task_spill_bytes(&telemetry);
 		let result = execute_spilled_hash_join_into_global_aggregate(
 			executor,
 			kind,
@@ -656,6 +695,12 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 			spill_dir,
 		)
 		.await;
+		record_join_spill_observation(
+			&telemetry,
+			replay_id,
+			crate::distributed::task::JoinSpillPath::BuildSpillFallback,
+			task_spill_bytes(&telemetry).saturating_sub(spill_before),
+		);
 		if let Ok(output_rows) = &result {
 			record_join_runtime_observation(
 				&telemetry,
@@ -730,6 +775,12 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 			probe_rows: RowCount::new(right_batch.num_rows() as u64),
 			output_rows: RowCount::new(selection.len() as u64),
 		},
+	);
+	record_join_spill_observation(
+		&telemetry,
+		replay_id,
+		crate::distributed::task::JoinSpillPath::InMemory,
+		0,
 	);
 	Ok(())
 }

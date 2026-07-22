@@ -85,6 +85,29 @@ pub struct TaskTelemetry {
 	pub join_build_profiles: Vec<JoinBuildProfile>,
 	#[serde(default)]
 	pub existence_summary_profiles: Vec<ExistenceSummaryProfile>,
+	/// Per-join attribution for the global-aggregate hash-join execution path.
+	/// This is separate from the task-wide spill counter so a stable total cannot
+	/// conceal a change in the runtime path that produced it.
+	#[serde(default)]
+	pub join_spill_observations: Vec<JoinSpillObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinSpillPath {
+	PartitionedStreamingScanBuild,
+	StreamingScanBuild,
+	StreamedSpilledBuild,
+	EstimateSpillFallback,
+	BuildSpillFallback,
+	InMemory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSpillObservation {
+	pub replay_id: JoinReplayId,
+	pub path: JoinSpillPath,
+	pub spill_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +209,29 @@ pub struct TaskTelemetryPhases {
 	pub dispatch_wait_micros: u64,
 	pub telemetry_lock_micros: u64,
 	pub framework_overhead_micros: u64,
+}
+
+#[cfg(test)]
+mod join_spill_observation_tests {
+	use super::*;
+
+	#[test]
+	fn join_spill_observations_are_typed_and_backward_compatible() {
+		let legacy: TaskTelemetry = serde_json::from_str(
+			r#"{"labels":{"strategy":null,"stage_role":"","operator_kind":"","worker_count":null},"counters":{"pulled_shuffle_bytes":0,"left_shuffle_bytes":0,"right_shuffle_bytes":0,"published_shuffle_bytes":0,"build_rows":0,"probe_rows":0,"matched_rows":0,"emitted_rows":0,"emitted_batches":0,"spill_bytes":0},"phases":{"task_wall_micros":0,"shuffle_pull_decode_micros":0,"build_micros":0,"probe_micros":0,"spill_micros":0,"output_publish_micros":0,"task_setup_micros":0,"batch_encode_micros":0,"batch_send_micros":0,"batch_decode_micros":0,"dispatch_wait_micros":0,"telemetry_lock_micros":0,"framework_overhead_micros":0},"join_observations":[],"join_build_profiles":[],"existence_summary_profiles":[]}"#,
+		)
+		.expect("legacy telemetry remains readable");
+		assert!(legacy.join_spill_observations.is_empty());
+
+		let observation = JoinSpillObservation {
+			replay_id: JoinReplayId(0),
+			path: JoinSpillPath::PartitionedStreamingScanBuild,
+			spill_bytes: 88_559_536,
+		};
+		let value = serde_json::to_value(&observation).expect("serialize observation");
+		assert_eq!(value["path"], "partitioned_streaming_scan_build");
+		assert_eq!(value["spill_bytes"], 88_559_536);
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

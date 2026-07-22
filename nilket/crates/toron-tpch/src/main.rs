@@ -1891,6 +1891,7 @@ fn duckdb_not_attempted_row(
 		duckdb_version,
 		debug_build: false,
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 	.json_value()
 }
@@ -1928,6 +1929,7 @@ fn polars_not_attempted_row(
 		duckdb_version: None,
 		debug_build: false,
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 	.json_value()
 }
@@ -2066,6 +2068,7 @@ fn run_polars_perf_export(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 }
 
@@ -2716,6 +2719,7 @@ fn run_duckdb_perf_child(
 			duckdb_version: Some(duckdb_version.to_string()),
 			debug_build: false,
 			local_join_admissions: None,
+			join_spill_observations: None,
 		}
 		.json_value());
 	}
@@ -2756,6 +2760,7 @@ fn run_duckdb_perf_child(
 		duckdb_version: Some(duckdb_version.to_string()),
 		debug_build: false,
 		local_join_admissions: None,
+		join_spill_observations: None,
 	}
 	.json_value())
 }
