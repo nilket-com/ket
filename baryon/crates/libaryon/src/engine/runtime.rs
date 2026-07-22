@@ -1755,8 +1755,15 @@ fn dispatch_command(
 		command => command,
 	};
 
-	if matches!(cmd, EditorCommand::WriteFile) && encrypted_backing_path(session).is_some() {
-		return write_encrypted_focused(registry, session, None);
+	if matches!(cmd, EditorCommand::WriteFile | EditorCommand::WriteAndQuit)
+		&& encrypted_backing_path(session).is_some()
+	{
+		return write_encrypted_focused(
+			registry,
+			session,
+			None,
+			matches!(cmd, EditorCommand::WriteAndQuit),
+		);
 	}
 	if matches!(cmd, EditorCommand::WriteFileAs(_)) && encrypted_backing_path(session).is_some() {
 		session.ui.status_message =
@@ -1777,10 +1784,10 @@ fn dispatch_command(
 			);
 		}
 		EditorCommand::WriteEncryptedFile => {
-			return write_encrypted_focused(registry, session, None);
+			return write_encrypted_focused(registry, session, None, false);
 		}
 		EditorCommand::WriteEncryptedFileAs(path) => {
-			return write_encrypted_focused(registry, session, Some(path));
+			return write_encrypted_focused(registry, session, Some(path), false);
 		}
 		_ => {}
 	}
@@ -2944,6 +2951,7 @@ fn write_encrypted_focused(
 	registry: &UastRegistry,
 	session: &mut EditorSession,
 	requested_path: Option<String>,
+	quit_after_write: bool,
 ) -> DispatchOutcome {
 	let view = focused_doctab(&session.layout, session.focused_pane_id);
 	let Some(document) = session
@@ -2977,6 +2985,9 @@ fn write_encrypted_focused(
 				text.ledger.mark_saved();
 			}
 			session.ui.status_message = Some(format!("\"{}\" encrypted", path));
+			if quit_after_write {
+				session.ui.pending_quit = true;
+			}
 		}
 		Err(error) => session.ui.status_message = Some(error),
 	}
@@ -3001,14 +3012,14 @@ fn load_encrypted_focused(
 			return DispatchOutcome::continue_with(true);
 		}
 	};
-	let plaintext = match session.secrets.open(&encrypted) {
+	let mut plaintext = match session.secrets.open(&encrypted) {
 		Ok(contents) => contents,
 		Err(error) => {
 			session.ui.status_message = Some(error);
 			return DispatchOutcome::continue_with(true);
 		}
 	};
-	let text = match String::from_utf8(plaintext.to_vec()) {
+	let text = match String::from_utf8(std::mem::take(&mut *plaintext)) {
 		Ok(text) => text,
 		Err(_) => {
 			session.ui.status_message = Some("Encrypted document is not valid UTF-8".to_owned());

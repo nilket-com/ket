@@ -171,8 +171,6 @@ pub fn file_salt(contents: &[u8]) -> Result<[u8; SALT_LEN], String> {
 	Ok(salt)
 }
 
-/// Encrypt and atomically persist a document with owner-only permissions for
-/// newly created files.
 fn random_bytes<const N: usize>() -> [u8; N] {
 	rand::random()
 }

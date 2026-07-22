@@ -458,8 +458,124 @@ mod tests {
 		recv_viewport_until(&viewports, "locked write refusal", |viewport| {
 			viewport.status_message.as_deref() == Some("encrypted files are locked; use :unlock")
 		});
+		// :eenc has no plaintext file_path, so :wq must still save the encrypted
+		// backing and request quit instead of reporting "No file name".
+		type_ex_command(&input, "password");
+		recv_viewport_until(&viewports, "second password prompt", |viewport| {
+			matches!(viewport.input.mode, EditorMode::Password)
+		});
+		for code in "correct horse battery staple"
+			.chars()
+			.map(KeyCode::Char)
+			.chain(std::iter::once(KeyCode::Enter))
+		{
+			input
+				.send(InputEvent::Key {
+					code,
+					modifiers: Modifiers::NONE,
+				})
+				.expect("second password key");
+		}
+		recv_viewport_until(&viewports, "second unlock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session unlocked")
+		});
+		commands
+			.send(EditorCommand::WriteAndQuit)
+			.expect("encrypted write and quit");
+		recv_viewport_until(&viewports, "encrypted write and quit", |viewport| {
+			viewport.should_quit
+				&& viewport
+					.status_message
+					.as_deref()
+					.is_some_and(|message| message == format!("\"{}\" encrypted", path_name))
+		});
 		engine.shutdown().expect("engine shutdown");
 		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn write_and_quit_keeps_an_encrypted_backing_encrypted() {
+		let plaintext_path = temp_path("encrypted-write-and-quit-source", "sql");
+		let encrypted_path = temp_path("encrypted-write-and-quit-target", "sql.enc");
+		let original = "select 'old value';\n";
+		let updated = "select 'new secret value';\n";
+		std::fs::write(&plaintext_path, original).expect("write plaintext fixture");
+		let plaintext_name = plaintext_path.to_string_lossy().into_owned();
+		let encrypted_name = encrypted_path.to_string_lossy().into_owned();
+		let mut engine = EngineHandle::spawn(EngineConfig {
+			initial_file: Some(plaintext_name.clone()),
+			..EngineConfig::default()
+		});
+		let commands = engine.command_sender();
+		let input = engine.input_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		recv_viewport_until(&viewports, "plaintext fixture loaded", |viewport| {
+			viewport.file_name.as_deref() == Some(plaintext_name.as_str())
+				&& visible_text(viewport) == original.as_bytes()
+		});
+
+		type_ex_command(&input, "password");
+		recv_viewport_until(&viewports, "password prompt", |viewport| {
+			matches!(viewport.input.mode, EditorMode::Password)
+		});
+		for code in "correct horse battery staple"
+			.chars()
+			.map(KeyCode::Char)
+			.chain(std::iter::once(KeyCode::Enter))
+		{
+			input
+				.send(InputEvent::Key {
+					code,
+					modifiers: Modifiers::NONE,
+				})
+				.expect("password key");
+		}
+		recv_viewport_until(&viewports, "unlock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session unlocked")
+		});
+		commands
+			.send(EditorCommand::WriteEncryptedFileAs(encrypted_name.clone()))
+			.expect("write encrypted fixture");
+		recv_viewport_until(&viewports, "encrypted fixture", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message == format!("\"{}\" encrypted", encrypted_name))
+		});
+
+		commands
+			.send(EditorCommand::InsertText(updated.to_owned()))
+			.expect("update encrypted document");
+		recv_viewport_until(&viewports, "encrypted document updated", |viewport| {
+			visible_text(viewport)
+				.windows(updated.len())
+				.any(|window| window == updated.as_bytes())
+		});
+		commands
+			.send(EditorCommand::WriteAndQuit)
+			.expect("write encrypted document and quit");
+		recv_viewport_until(&viewports, "encrypted write and quit", |viewport| {
+			viewport.should_quit
+				&& viewport
+					.status_message
+					.as_deref()
+					.is_some_and(|message| message == format!("\"{}\" encrypted", encrypted_name))
+		});
+		assert_eq!(
+			std::fs::read_to_string(&plaintext_path).expect("read original plaintext fixture"),
+			original,
+			"write-and-quit must not update the plaintext source after :wenc"
+		);
+		let encrypted = std::fs::read(&encrypted_path).expect("read encrypted fixture");
+		assert!(
+			!encrypted
+				.windows(updated.len())
+				.any(|window| window == updated.as_bytes()),
+			"encrypted backing must never contain the edited plaintext"
+		);
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_file(plaintext_path);
+		let _ = std::fs::remove_file(encrypted_path);
 	}
 
 	#[test]
