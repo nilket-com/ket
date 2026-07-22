@@ -97,6 +97,9 @@ pub(crate) struct TextBuffer {
 	pub(crate) root_id: NodeId,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: Option<String>,
+	/// Encrypted-at-rest backing owned by libaryon. This is intentionally
+	/// distinct from `file_path`: the latter always means plaintext I/O.
+	pub(crate) encrypted_backing: Option<String>,
 	/// File-path-shaped identity for an unsaved in-memory document (e.g.
 	/// `statement.sql`). Feeds language services that expect a path without
 	/// claiming persistence: `file_path` stays `None` and writes still refuse.
@@ -148,6 +151,7 @@ impl TextBuffer {
 				root_id: root,
 				topology_rev: TopologyRev::ZERO,
 				file_path: None,
+				encrypted_backing: None,
 				virtual_path: None,
 				canonical_path: None,
 				backing_path: None,
@@ -1888,6 +1892,7 @@ impl TestTextEditor {
 					root_id: root,
 					topology_rev: TopologyRev::ZERO,
 					file_path: None,
+					encrypted_backing: None,
 					virtual_path: None,
 					canonical_path: None,
 					backing_path: None,
@@ -2998,6 +3003,9 @@ pub(crate) struct TextLifecycleSnapshot {
 
 pub(crate) struct EditorSession {
 	pub(crate) input: InputRuntime,
+	/// The sole session owner of passphrases used by encrypted files and opaque
+	/// application records. Frontends never receive this value.
+	pub(crate) secrets: crate::secrets::SecretSession,
 	pub(crate) events: EngineEventQueue,
 	pub(crate) subscribers: SubscriberRuntime,
 	pub(crate) jobs: JobRuntime,
@@ -3451,6 +3459,7 @@ impl EditorSession {
 
 		Self {
 			input: InputRuntime::new(),
+			secrets: crate::secrets::SecretSession::default(),
 			events: EngineEventQueue::default(),
 			subscribers: SubscriberRuntime::default(),
 			jobs: JobRuntime::new(),

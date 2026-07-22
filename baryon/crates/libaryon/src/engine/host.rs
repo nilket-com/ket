@@ -253,7 +253,7 @@ mod tests {
 	use crate::core::DocLine;
 	use crate::engine::shadow::{discard_shadow_session, load_shadow_session, shadow_dir_for_path};
 	use crate::engine::{
-		CommandRange, EditorCommand, InputEvent, KeyCode, Modifiers, SubstituteFlags,
+		CommandRange, EditorCommand, EditorMode, InputEvent, KeyCode, Modifiers, SubstituteFlags,
 	};
 	use crate::uast::projection::Viewport;
 	use std::fmt::Write as _;
@@ -330,6 +330,136 @@ mod tests {
 			assert_eq!(registry.resolve_language_id(name), Some("bash"));
 			assert!(registry.completion_candidates().contains(&name.to_string()));
 		}
+	}
+
+	#[test]
+	fn password_prompt_is_masked_and_lock_is_session_scoped() {
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let input = engine.input_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		type_ex_command(&input, "password");
+		let prompt = recv_viewport_until(&viewports, "password prompt", |viewport| {
+			matches!(viewport.input.mode, EditorMode::Password)
+		});
+		assert_eq!(
+			prompt.input.prompt_label.as_deref(),
+			Some("New session password:")
+		);
+		assert!(prompt.input.prompt_masked);
+		assert!(prompt.input.prompt_buffer.is_empty());
+
+		for code in "not-in-history"
+			.chars()
+			.map(KeyCode::Char)
+			.chain(std::iter::once(KeyCode::Enter))
+		{
+			input
+				.send(InputEvent::Key {
+					code,
+					modifiers: Modifiers::NONE,
+				})
+				.expect("password key");
+		}
+		let unlocked = recv_viewport_until(&viewports, "unlock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session unlocked")
+		});
+		assert!(!unlocked.input.prompt_buffer.contains("not-in-history"));
+		type_ex_command(&input, "lock");
+		recv_viewport_until(&viewports, "lock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session locked")
+		});
+		engine.shutdown().expect("engine shutdown");
+	}
+
+	#[test]
+	fn encrypted_ex_commands_keep_plaintext_out_of_the_filesystem() {
+		let path = temp_path("encrypted-ex-command", "sql.enc");
+		let path_name = path.to_string_lossy().into_owned();
+		let plaintext = "select * from payroll;";
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let commands = engine.command_sender();
+		let input = engine.input_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: plaintext.to_owned(),
+				language: Some("sql".to_owned()),
+				virtual_path: Some("statement.sql".to_owned()),
+			})
+			.expect("replace document");
+		recv_viewport_until(&viewports, "initial document", |viewport| {
+			visible_text(viewport) == plaintext.as_bytes()
+		});
+
+		type_ex_command(&input, "password");
+		recv_viewport_until(&viewports, "password prompt", |viewport| {
+			matches!(viewport.input.mode, EditorMode::Password)
+		});
+		for code in "correct horse battery staple"
+			.chars()
+			.map(KeyCode::Char)
+			.chain(std::iter::once(KeyCode::Enter))
+		{
+			input
+				.send(InputEvent::Key {
+					code,
+					modifiers: Modifiers::NONE,
+				})
+				.expect("password key");
+		}
+		recv_viewport_until(&viewports, "unlock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session unlocked")
+		});
+		type_ex_command(&input, &format!("wenc {path_name}"));
+		recv_viewport_until(&viewports, "encrypted write", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message == format!("\"{}\" encrypted", path_name))
+		});
+		let encrypted = std::fs::read(&path).expect("encrypted file");
+		assert!(
+			!encrypted
+				.windows(plaintext.len())
+				.any(|window| window == plaintext.as_bytes())
+		);
+
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: String::new(),
+				language: Some("sql".to_owned()),
+				virtual_path: Some("blank.sql".to_owned()),
+			})
+			.expect("clear document");
+		type_ex_command(&input, &format!("eenc {path_name}"));
+		recv_viewport_until(&viewports, "encrypted load", |viewport| {
+			visible_text(viewport) == plaintext.as_bytes()
+		});
+		// Once a buffer is encrypted-backed, ordinary :w must remain encrypted;
+		// it is never allowed to downgrade the file to plaintext.
+		type_ex_command(&input, "w");
+		recv_viewport_until(&viewports, "encrypted ordinary write", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message == format!("\"{}\" encrypted", path_name))
+		});
+		let rewritten = std::fs::read(&path).expect("rewritten encrypted file");
+		assert!(
+			!rewritten
+				.windows(plaintext.len())
+				.any(|window| window == plaintext.as_bytes())
+		);
+		type_ex_command(&input, "lock");
+		recv_viewport_until(&viewports, "lock", |viewport| {
+			viewport.status_message.as_deref() == Some("Encryption session locked")
+		});
+		type_ex_command(&input, "w");
+		recv_viewport_until(&viewports, "locked write refusal", |viewport| {
+			viewport.status_message.as_deref() == Some("encrypted files are locked; use :unlock")
+		});
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]

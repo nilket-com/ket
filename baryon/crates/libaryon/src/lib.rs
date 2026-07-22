@@ -8,5 +8,6 @@
 pub mod core;
 mod ecs;
 pub mod engine;
+pub mod secrets;
 pub mod svp;
 pub mod uast;

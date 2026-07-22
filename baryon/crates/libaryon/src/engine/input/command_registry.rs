@@ -161,6 +161,66 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_edit),
 	},
 	CommandSpec {
+		name: "eenc",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::Required,
+		completion: ArgCompletion::Path,
+		category: CommandCategory::File,
+		usage: ":eenc PATH",
+		summary: "Open an encrypted document",
+		help: "Decrypts PATH using libaryon's unlocked session. Use :unlock first.",
+		dispatch: DispatchKind::Exact(cmd_edit_encrypted),
+	},
+	CommandSpec {
+		name: "wenc",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::Path,
+		category: CommandCategory::File,
+		usage: ":wenc [PATH]",
+		summary: "Write an encrypted document",
+		help: "Writes the focused document using the unlocked libaryon session.",
+		dispatch: DispatchKind::Exact(cmd_write_encrypted),
+	},
+	CommandSpec {
+		name: "password",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Session,
+		usage: ":password",
+		summary: "Set the encryption password for this session",
+		help: "Opens a masked, non-history password prompt. The password remains in libaryon only for this session.",
+		dispatch: DispatchKind::Exact(cmd_password),
+	},
+	CommandSpec {
+		name: "unlock",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Session,
+		usage: ":unlock",
+		summary: "Unlock encrypted files for this session",
+		help: "Opens a masked password prompt. Passwords are not stored in command history.",
+		dispatch: DispatchKind::Exact(cmd_unlock),
+	},
+	CommandSpec {
+		name: "lock",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Session,
+		usage: ":lock",
+		summary: "Forget the encryption password",
+		help: "Zeroizes libaryon's session password. Open encrypted buffers will be handled by :eenc/:wenc work.",
+		dispatch: DispatchKind::Exact(cmd_lock),
+	},
+	CommandSpec {
 		name: "source",
 		aliases: &[],
 		bang: true,
@@ -666,6 +726,36 @@ fn cmd_edit(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	} else {
 		ctx.send(EditorCommand::LoadFile(expand_path_arg(inv.args)));
 	}
+}
+
+fn cmd_edit_encrypted(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::LoadEncryptedFile(expand_path_arg(inv.args)));
+}
+
+fn cmd_write_encrypted(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	if inv.args.is_empty() {
+		ctx.send(EditorCommand::WriteEncryptedFile);
+	} else {
+		ctx.send(EditorCommand::WriteEncryptedFileAs(expand_path_arg(
+			inv.args,
+		)));
+	}
+}
+
+fn cmd_password(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
+	ctx.send(EditorCommand::BeginPasswordPrompt {
+		label: "New session password:".to_owned(),
+	});
+}
+
+fn cmd_unlock(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
+	ctx.send(EditorCommand::BeginPasswordPrompt {
+		label: "Encryption password:".to_owned(),
+	});
+}
+
+fn cmd_lock(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
+	ctx.send(EditorCommand::LockSecrets);
 }
 
 fn cmd_source(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {

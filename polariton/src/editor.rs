@@ -535,6 +535,7 @@ impl CodeEditor {
 		}
 	}
 
+	#[cfg(test)]
 	pub fn replace_content(&mut self, text: &str) {
 		// Optimistic: the engine confirms via the queued query, but Run/Save
 		// must never observe a cleared document in the interim.
@@ -2116,6 +2117,15 @@ fn prompt_line(viewport: &Viewport, status_message: Option<&str>) -> Option<Stri
 	match viewport.input.mode {
 		EditorMode::Command => Some(format!(":{}", viewport.input.prompt_buffer)),
 		EditorMode::Search => Some(format!("/{}", viewport.input.prompt_buffer)),
+		EditorMode::Password => Some(format!(
+			"{} {}",
+			viewport
+				.input
+				.prompt_label
+				.as_deref()
+				.unwrap_or("Encryption password:"),
+			viewport.input.prompt_buffer
+		)),
 		EditorMode::Confirm => Some(
 			viewport
 				.confirm_prompt

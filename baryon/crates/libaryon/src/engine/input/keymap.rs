@@ -15,6 +15,7 @@ pub(super) enum InputState {
 	Insert,
 	Command,
 	Search,
+	Password,
 	Confirm,
 }
 
@@ -30,6 +31,7 @@ impl InputState {
 			Self::Insert => EditorMode::Insert,
 			Self::Command => EditorMode::Command,
 			Self::Search => EditorMode::Search,
+			Self::Password => EditorMode::Password,
 			Self::Confirm => EditorMode::Confirm,
 		}
 	}
@@ -45,6 +47,7 @@ impl InputState {
 			EditorMode::Insert => Self::Insert,
 			EditorMode::Command => Self::Command,
 			EditorMode::Search => Self::Search,
+			EditorMode::Password => Self::Password,
 			EditorMode::Confirm => Self::Confirm,
 		}
 	}

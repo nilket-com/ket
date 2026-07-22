@@ -4029,7 +4029,9 @@ name = "libaryon"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "argon2",
  "bitflags 2.13.1",
+ "chacha20poly1305",
  "imara-diff",
  "io-uring",
  "libc",
@@ -4042,6 +4044,7 @@ dependencies = [
  "ra_ap_project_model",
  "ra_ap_syntax",
  "ra_ap_vfs",
+ "rand 0.10.2",
  "regex-automata",
  "ruff_python_ast",
  "ruff_python_parser",
@@ -4055,6 +4058,7 @@ dependencies = [
  "sqlparser 0.62.0",
  "triomphe",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -5788,11 +5792,9 @@ dependencies = [
 name = "polariton"
 version = "0.1.0"
 dependencies = [
- "argon2",
  "async-trait",
  "base64",
  "bytes",
- "chacha20poly1305",
  "chrono",
  "fontdb",
  "gcloud-auth",
@@ -5805,7 +5807,6 @@ dependencies = [
  "mysql_async",
  "png",
  "polars",
- "rand 0.10.2",
  "rand_distr 0.6.0",
  "ravif",
  "regex",

@@ -10,8 +10,32 @@ pub enum EditorMode {
 	Insert,
 	Command,
 	Search,
+	/// A masked, non-history prompt owned by the engine for session secrets.
+	Password,
 	Confirm,
-	Visual { anchor: DocByte, kind: VisualKind },
+	Visual {
+		anchor: DocByte,
+		kind: VisualKind,
+	},
+}
+
+#[derive(Clone)]
+pub struct SecretInput(pub(crate) zeroize::Zeroizing<Vec<u8>>);
+
+impl SecretInput {
+	pub(crate) fn new(bytes: Vec<u8>) -> Self {
+		Self(zeroize::Zeroizing::new(bytes))
+	}
+
+	pub(crate) fn into_bytes(self) -> zeroize::Zeroizing<Vec<u8>> {
+		self.0
+	}
+}
+
+impl std::fmt::Debug for SecretInput {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("SecretInput(REDACTED)")
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +179,18 @@ pub struct SubstituteFlags {
 #[derive(Debug, Clone)]
 /// A frontend-to-engine request.
 pub enum EditorCommand {
+	/// Open libaryon's masked password prompt. The resulting secret never enters
+	/// command history or a frontend-visible projection.
+	BeginPasswordPrompt {
+		label: String,
+	},
+	/// Internal result of the masked prompt. Debug output is redacted and the
+	/// bytes are moved directly into libaryon's secret session.
+	SubmitPassword(SecretInput),
+	LockSecrets,
+	LoadEncryptedFile(String),
+	WriteEncryptedFile,
+	WriteEncryptedFileAs(String),
 	InsertChar(char),
 	InsertText(String),
 	/// Compile and evaluate a Rune source as a replaceable source generation.

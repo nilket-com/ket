@@ -63,8 +63,8 @@ pub use self::minimap::{
 };
 pub use self::protocol::{
 	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,
-	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SplitDirection, SubstituteFlags,
-	VerticalDirection, VisualKind, WordMotion,
+	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SecretInput, SplitDirection,
+	SubstituteFlags, VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};

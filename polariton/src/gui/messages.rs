@@ -6,7 +6,6 @@ use crate::adapters::{
 use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
 use crate::notebook_rune::PlotEffect;
-use crate::persistence::{PrivateDb, SavedConnection, SavedStatement};
 use crate::plot::common::PlotKernel;
 use iced::window;
 use std::sync::Arc;
@@ -37,7 +36,6 @@ pub enum Message {
 	AdapterConnected(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),
 	Dashboard(DashboardMsg),
-	CloseSaveStatementDialog,
 	CloseSettings,
 	CloseWindow,
 	CodeEditEvent(EditorMsg),
@@ -45,29 +43,15 @@ pub enum Message {
 	CodeEditResize(iced::Size),
 	Connect,
 	ConnectionNameChanged(String),
-	ConnectionSaved(Vec<SavedConnection>),
-	DeleteConnection(i64),
-	DeleteStatement(i64),
 	DoCloseWindow,
 	DragWindow,
-	EditConnection(i64),
-	EditStatement(i64),
 	Export(ExportFormat),
 	ExportDone(usize, ExportFormat),
 	ExportWithWindowSize(ExportFormat, Option<iced::Size>),
-	LoadSavedConnection(i64),
-	LoadSavedStatement(i64),
 	MaximizeWindow,
 	Menu(menu::MenuMessage),
 	MinimizeWindow,
-	OpenSaveStatementDialog,
 	OpenSettings,
-	PasswordDecryptFailed,
-	PasswordEntryChanged(String),
-	PasswordEntrySubmit,
-	PrivateDbError(String),
-	PrivateDbReady(PrivateDb),
-	PrivateDbRekeyed(PrivateDb),
 	ResizeWindow(window::Direction),
 	Run,
 	RunSnippet,
@@ -88,19 +72,8 @@ pub enum Message {
 		effect: PlotEffect,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
-	SaveConnection,
-	SaveStatement,
-	SaveStatementNameChanged(String),
 	SaveWindowSizeAndClose(iced::Size),
-	SavedConnectionsLoaded(Vec<SavedConnection>),
-	SavedStatementsLoaded(Vec<SavedStatement>),
-	SettingsApplyPassword,
-	SettingsConfirmPasswordChanged(String),
-	SettingsNewPasswordChanged(String),
-	SettingsPasswordSaved,
-	SettingsRemovePassword,
 	ShowColumnTypesSaved,
-	StatementSaved(Vec<SavedStatement>),
 	ToggleShowColumnTypes(bool),
 }
 

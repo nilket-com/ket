@@ -19,6 +19,7 @@ pub(crate) use self::system::{
 	set_relative_line_numbers_local, set_visible_whitespace_local, set_wrap_local,
 };
 use super::core::Engine;
+use super::document::io::read_document_snapshot;
 use super::event_bus::{EngineEvent, EngineEventQueue};
 use super::event_subscribers::{
 	BaselineContributor, BoundedStatus, SubscriberBaseline, SubscriberDispatcher,
@@ -58,7 +59,7 @@ use crate::ecs::UastRegistry;
 use crate::svp::SvpResolver;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -1335,6 +1336,12 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::OpenGitStatusEntry(_)
 		| EditorCommand::MouseIntent { .. }
 		| EditorCommand::QueryDocumentText
+		| EditorCommand::BeginPasswordPrompt { .. }
+		| EditorCommand::SubmitPassword(_)
+		| EditorCommand::LockSecrets
+		| EditorCommand::LoadEncryptedFile(_)
+		| EditorCommand::WriteEncryptedFile
+		| EditorCommand::WriteEncryptedFileAs(_)
 		| EditorCommand::Quit => Preserve,
 	}
 }
@@ -1748,6 +1755,36 @@ fn dispatch_command(
 		command => command,
 	};
 
+	if matches!(cmd, EditorCommand::WriteFile) && encrypted_backing_path(session).is_some() {
+		return write_encrypted_focused(registry, session, None);
+	}
+	if matches!(cmd, EditorCommand::WriteFileAs(_)) && encrypted_backing_path(session).is_some() {
+		session.ui.status_message =
+			Some("Encrypted document: use :wenc PATH to choose an encrypted target".to_owned());
+		return DispatchOutcome::continue_with(true);
+	}
+	match cmd {
+		EditorCommand::LoadEncryptedFile(path) => {
+			return load_encrypted_focused(
+				runtime,
+				tx_internal,
+				tx_view,
+				reactor,
+				resolver,
+				lang_registry,
+				session,
+				path,
+			);
+		}
+		EditorCommand::WriteEncryptedFile => {
+			return write_encrypted_focused(registry, session, None);
+		}
+		EditorCommand::WriteEncryptedFileAs(path) => {
+			return write_encrypted_focused(registry, session, Some(path));
+		}
+		_ => {}
+	}
+
 	if let Some(effect) = handle_browser_command(runtime, session, cmd.clone()) {
 		return DispatchOutcome::continue_with(effect.needs_render);
 	}
@@ -1795,6 +1832,24 @@ fn dispatch_command(
 	}
 
 	match cmd {
+		EditorCommand::BeginPasswordPrompt { label } => {
+			session.input.begin_password_prompt(label);
+			needs_render = true;
+		}
+		EditorCommand::SubmitPassword(secret) => {
+			match session.secrets.unlock(secret.into_bytes()) {
+				Ok(()) => {
+					session.ui.status_message = Some("Encryption session unlocked".to_owned())
+				}
+				Err(error) => session.ui.status_message = Some(error),
+			}
+			needs_render = true;
+		}
+		EditorCommand::LockSecrets => {
+			session.secrets.lock();
+			session.ui.status_message = Some("Encryption session locked".to_owned());
+			needs_render = true;
+		}
 		EditorCommand::Resize(width, height) => {
 			session.update_terminal_size(width, height);
 			needs_render = true;
@@ -2205,6 +2260,14 @@ fn dispatch_command(
 			needs_render |= load_file_into_pane(runtime, session, pane_id, path)
 				.effect
 				.needs_render;
+			let view = focused_doctab(&session.layout, session.focused_pane_id);
+			if let Some(document) = session
+				.buffers
+				.get_mut(view.buffer_id)
+				.and_then(|buffer| buffer.text_mut())
+			{
+				document.encrypted_backing = None;
+			}
 		}
 		replace_cmd @ EditorCommand::ReplaceDocument { .. } => {
 			let EditorSession {
@@ -2222,6 +2285,10 @@ fn dispatch_command(
 			let buffer_id = doctab.buffer_id;
 			if let Some((effect, language_id, replaced)) =
 				with_text_buffer_mut(registry, buffers, layout, events, view_id, |tab| {
+					// Any ordinary replacement discards encrypted-document identity.
+					// `:eenc` reinstates it only after its decrypted replacement has
+					// completed successfully.
+					tab.document.encrypted_backing = None;
 					let effect = handle_file_doctab_command(
 						runtime,
 						tab,
@@ -2848,6 +2915,11 @@ fn dispatch_command(
 		EditorCommand::WriteDefaultInit { .. } => {
 			unreachable!("init reset is handled before the main command match");
 		}
+		EditorCommand::LoadEncryptedFile(_)
+		| EditorCommand::WriteEncryptedFile
+		| EditorCommand::WriteEncryptedFileAs(_) => {
+			unreachable!("encrypted file commands are handled before the main command match");
+		}
 		EditorCommand::Quit => {
 			// Frontends need one final projection to hand the quit request to
 			// their native window lifecycle before this engine thread exits.
@@ -2857,6 +2929,126 @@ fn dispatch_command(
 	}
 
 	DispatchOutcome::continue_with(needs_render)
+}
+
+fn encrypted_backing_path(session: &EditorSession) -> Option<String> {
+	let view = focused_doctab(&session.layout, session.focused_pane_id);
+	session
+		.buffers
+		.get(view.buffer_id)
+		.and_then(|buffer| buffer.text())
+		.and_then(|document| document.encrypted_backing.clone())
+}
+
+fn write_encrypted_focused(
+	registry: &UastRegistry,
+	session: &mut EditorSession,
+	requested_path: Option<String>,
+) -> DispatchOutcome {
+	let view = focused_doctab(&session.layout, session.focused_pane_id);
+	let Some(document) = session
+		.buffers
+		.get(view.buffer_id)
+		.and_then(|buffer| buffer.text())
+	else {
+		session.ui.status_message = Some("No document to encrypt".to_owned());
+		return DispatchOutcome::continue_with(true);
+	};
+	let path = requested_path.or_else(|| document.encrypted_backing.clone());
+	let Some(path) = path else {
+		session.ui.status_message = Some("No encrypted file name; use :wenc PATH".to_owned());
+		return DispatchOutcome::continue_with(true);
+	};
+	let snapshot = match read_document_snapshot(registry, document.root_id, None) {
+		Ok(snapshot) => snapshot,
+		Err(error) => {
+			session.ui.status_message = Some(error);
+			return DispatchOutcome::continue_with(true);
+		}
+	};
+	match session.secrets.write(Path::new(&path), &snapshot) {
+		Ok(()) => {
+			if let Some(text) = session
+				.buffers
+				.get_mut(view.buffer_id)
+				.and_then(|buffer| buffer.text_mut())
+			{
+				text.encrypted_backing = Some(path.clone());
+				text.ledger.mark_saved();
+			}
+			session.ui.status_message = Some(format!("\"{}\" encrypted", path));
+		}
+		Err(error) => session.ui.status_message = Some(error),
+	}
+	DispatchOutcome::continue_with(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_encrypted_focused(
+	runtime: &RuntimeContext<'_>,
+	tx_internal: &super::request::InternalSender,
+	tx_view: &std::sync::mpsc::Sender<crate::uast::Viewport>,
+	reactor: &crate::svp::semantic::SemanticReactor,
+	resolver: &std::sync::Arc<SvpResolver>,
+	lang_registry: &std::sync::Arc<super::language::LanguageRegistry>,
+	session: &mut EditorSession,
+	path: String,
+) -> DispatchOutcome {
+	let encrypted = match std::fs::read(&path) {
+		Ok(contents) => contents,
+		Err(error) => {
+			session.ui.status_message = Some(format!("Could not read encrypted file: {error}"));
+			return DispatchOutcome::continue_with(true);
+		}
+	};
+	let plaintext = match session.secrets.open(&encrypted) {
+		Ok(contents) => contents,
+		Err(error) => {
+			session.ui.status_message = Some(error);
+			return DispatchOutcome::continue_with(true);
+		}
+	};
+	let text = match String::from_utf8(plaintext.to_vec()) {
+		Ok(text) => text,
+		Err(_) => {
+			session.ui.status_message = Some("Encrypted document is not valid UTF-8".to_owned());
+			return DispatchOutcome::continue_with(true);
+		}
+	};
+	let virtual_path = path.strip_suffix(".enc").unwrap_or(&path).to_owned();
+	let language = Path::new(&virtual_path)
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.map(str::to_owned);
+	let outcome = dispatch_command(
+		DispatchContext {
+			runtime,
+			tx_internal,
+			tx_view,
+			reactor,
+			resolver,
+			lang_registry,
+		},
+		session,
+		EditorCommand::ReplaceDocument {
+			text,
+			language,
+			virtual_path: Some(virtual_path),
+		},
+	);
+	if !outcome.should_stop {
+		let view = focused_doctab(&session.layout, session.focused_pane_id);
+		if let Some(document) = session
+			.buffers
+			.get_mut(view.buffer_id)
+			.and_then(|buffer| buffer.text_mut())
+		{
+			document.encrypted_backing = Some(path.clone());
+			document.ledger.mark_saved();
+		}
+		session.ui.status_message = Some(format!("\"{}\" decrypted", path));
+	}
+	outcome
 }
 
 pub(crate) fn run_engine(engine: Engine) {

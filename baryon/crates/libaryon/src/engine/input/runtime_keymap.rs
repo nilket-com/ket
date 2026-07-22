@@ -164,6 +164,7 @@ pub(super) fn mapping_mode_for(mode: crate::engine::EditorMode, browser: bool) -
 		crate::engine::EditorMode::Insert => MappingMode::Insert,
 		crate::engine::EditorMode::Command => MappingMode::CommandLine,
 		crate::engine::EditorMode::Search => MappingMode::Search,
+		crate::engine::EditorMode::Password => MappingMode::Normal,
 		crate::engine::EditorMode::Confirm => MappingMode::Confirm,
 	}
 }

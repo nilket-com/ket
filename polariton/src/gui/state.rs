@@ -1,6 +1,6 @@
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
-	driver::{AdapterConfiguration, AdapterSelection, AdapterState},
+	driver::AdapterState,
 };
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
@@ -12,7 +12,7 @@ use crate::gui::{
 	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
 use crate::notebook_rune::{self, PlotEffect};
-use crate::persistence::{self, SavedConnection, SavedStatement, StartupData};
+use crate::persistence::{self, StartupData};
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
@@ -33,22 +33,7 @@ struct AppState {
 	adapter_state: AdapterState,
 	code_started: Instant,
 	is_maximized: bool,
-	saved_connections: Vec<SavedConnection>,
-	editing_connection_id: Option<i64>,
-	saved_statements: Vec<SavedStatement>,
-	showing_save_statement_dialog: bool,
-	save_statement_name: String,
-	editing_statement_id: Option<i64>,
-	private_db: Option<persistence::PrivateDb>,
-	salt: Vec<u8>,
-	is_password_protected: bool,
-	showing_password_prompt: bool,
-	password_entry: String,
-	password_entry_error: String,
 	showing_settings: bool,
-	settings_new_password: String,
-	settings_confirm_password: String,
-	settings_error: String,
 	show_column_types: bool,
 	window_size: Size,
 }
@@ -200,8 +185,6 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 	let data_frame = DataFrame::default();
 	let mut code_editor = CodeEditor::new("");
 	code_editor.set_show_column_types(startup_data.show_column_types);
-	let is_password_protected = startup_data.is_password_protected;
-	let salt = startup_data.salt.clone();
 	let mut state = AppState {
 		dashboard: DashboardState::default(),
 		menu_state: MenuState::default(),
@@ -214,38 +197,12 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		adapter_state: AdapterState::default(),
 		code_started: Instant::now(),
 		is_maximized: false,
-		saved_connections: vec![],
-		editing_connection_id: None,
-		saved_statements: vec![],
-		showing_save_statement_dialog: false,
-		save_statement_name: String::new(),
-		editing_statement_id: None,
-		private_db: None,
-		salt: startup_data.salt,
-		is_password_protected,
-		showing_password_prompt: is_password_protected,
-		password_entry: String::new(),
-		password_entry_error: String::new(),
 		showing_settings: false,
-		settings_new_password: String::new(),
-		settings_confirm_password: String::new(),
-		settings_error: String::new(),
 		show_column_types: startup_data.show_column_types,
 		window_size,
 	};
 	sync_workspace_viewport(&mut state);
-	let task = if !is_password_protected {
-		Task::perform(
-			async move { persistence::PrivateDb::open(&salt, "").await },
-			|result| match result {
-				Ok(db) => Message::PrivateDbReady(db),
-				Err(e) => Message::PrivateDbError(e),
-			},
-		)
-	} else {
-		Task::none()
-	};
-	(state, task)
+	(state, Task::none())
 }
 
 fn view(app_state: &AppState) -> Element<'_, Message> {
@@ -258,20 +215,8 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.status_df_size,
 		app_state.status_time_elapsed,
 		&app_state.adapter_state,
-		&app_state.saved_connections,
-		&app_state.saved_statements,
-		app_state.showing_password_prompt,
-		&app_state.password_entry,
-		&app_state.password_entry_error,
 		app_state.showing_settings,
-		&app_state.settings_new_password,
-		&app_state.settings_confirm_password,
-		&app_state.settings_error,
-		app_state.is_password_protected,
 		app_state.show_column_types,
-		app_state.showing_save_statement_dialog,
-		&app_state.save_statement_name,
-		app_state.editing_statement_id,
 	)
 }
 
@@ -797,274 +742,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::ConnectionNameChanged(name) => {
 			app_state.adapter_state.name = name;
 		}
-		Message::SaveConnection => {
-			let name = app_state.adapter_state.name.trim().to_string();
-			if name.is_empty() {
-				app_state.status_error = "Connection name is required.".to_string();
-				return Task::none();
-			}
-			let fields = crate::adapters::driver::fields_for(&app_state.adapter_state.selection);
-			let has_empty = fields.iter().any(|f| {
-				app_state
-					.adapter_state
-					.fields
-					.get(f.key)
-					.is_none_or(|v| v.trim().is_empty())
-			});
-			if has_empty {
-				app_state.status_error = "All connection fields are required.".to_string();
-				return Task::none();
-			}
-			let config_value = fields
-				.first()
-				.and_then(|f| app_state.adapter_state.fields.get(f.key))
-				.cloned()
-				.unwrap_or_default();
-			let Some(db) = app_state.private_db.clone() else {
-				app_state.status_error = "Database not unlocked.".to_string();
-				return Task::none();
-			};
-			if let Some(edit_id) = app_state.editing_connection_id.take() {
-				return Task::perform(
-					async move { db.update_connection(edit_id, name, config_value).await },
-					Message::ConnectionSaved,
-				);
-			}
-			let adapter_type = app_state
-				.adapter_state
-				.selection
-				.adapter_type_str()
-				.to_string();
-			return Task::perform(
-				async move { db.save_connection(name, adapter_type, config_value).await },
-				Message::ConnectionSaved,
-			);
-		}
-		Message::ConnectionSaved(connections) => {
-			app_state.saved_connections = connections;
-			app_state.status_msg = "Connection saved.".to_string();
-		}
-		Message::SavedConnectionsLoaded(connections) => {
-			app_state.saved_connections = connections;
-		}
-		Message::LoadSavedConnection(id) => {
-			if let Some(saved) = app_state.saved_connections.iter().find(|c| c.id == id) {
-				let config =
-					AdapterConfiguration::from_saved(&saved.adapter_type, &saved.config_value);
-				app_state.status_msg = format!("Connecting to {}...", saved.name);
-				app_state.adapter_state.stage = crate::adapters::common::AdapterStage::Configured;
-				return Task::perform(
-					async move { AdapterState::connect(config).await },
-					Message::AdapterConnected,
-				);
-			}
-		}
-		Message::EditConnection(id) => {
-			if let Some(saved) = app_state.saved_connections.iter().find(|c| c.id == id) {
-				let selection = match saved.adapter_type.as_str() {
-					"Parquet" => AdapterSelection::Parquet,
-					"Postgres" => AdapterSelection::Postgres,
-					"SQLite" => AdapterSelection::SQLite,
-					_ => AdapterSelection::None,
-				};
-				let field_key = match saved.adapter_type.as_str() {
-					"Parquet" => "input_path",
-					_ => "connection_string",
-				};
-				app_state.adapter_state.name = saved.name.clone();
-				app_state.adapter_state.selection = selection;
-				app_state.adapter_state.fields.clear();
-				app_state
-					.adapter_state
-					.fields
-					.insert(field_key.to_string(), saved.config_value.clone());
-				app_state.adapter_state.stage = crate::adapters::common::AdapterStage::Unconfigured;
-				app_state.editing_connection_id = Some(id);
-			}
-		}
-		Message::DeleteConnection(id) => {
-			let Some(db) = app_state.private_db.clone() else {
-				return Task::none();
-			};
-			return Task::perform(
-				async move { db.delete_connection(id).await },
-				Message::SavedConnectionsLoaded,
-			);
-		}
-		Message::PrivateDbReady(db) => {
-			let db_clone = db.clone();
-			let db_clone2 = db.clone();
-			app_state.private_db = Some(db);
-			app_state.showing_password_prompt = false;
-			app_state.password_entry_error.clear();
-			return Task::batch([
-				Task::perform(
-					async move { db_clone.load_connections().await },
-					Message::SavedConnectionsLoaded,
-				),
-				Task::perform(
-					async move { db_clone2.load_statements().await },
-					Message::SavedStatementsLoaded,
-				),
-			]);
-		}
-		Message::OpenSaveStatementDialog => {
-			app_state.showing_save_statement_dialog = true;
-			app_state.save_statement_name.clear();
-			app_state.editing_statement_id = None;
-		}
-		Message::CloseSaveStatementDialog => {
-			app_state.showing_save_statement_dialog = false;
-			app_state.save_statement_name.clear();
-			app_state.editing_statement_id = None;
-		}
-		Message::SaveStatementNameChanged(val) => {
-			app_state.save_statement_name = val;
-		}
-		Message::SaveStatement => {
-			let name = app_state.save_statement_name.trim().to_string();
-			if name.is_empty() {
-				return Task::none();
-			}
-			let code = app_state.code_editor.cached_content().to_owned();
-			let Some(db) = app_state.private_db.clone() else {
-				app_state.status_error = "Database not unlocked.".to_string();
-				return Task::none();
-			};
-			app_state.showing_save_statement_dialog = false;
-			if let Some(id) = app_state.editing_statement_id.take() {
-				return Task::perform(
-					async move { db.update_statement(id, name, code).await },
-					Message::StatementSaved,
-				);
-			}
-			return Task::perform(
-				async move { db.save_statement(name, code).await },
-				Message::StatementSaved,
-			);
-		}
-		Message::StatementSaved(statements) => {
-			app_state.saved_statements = statements;
-			app_state.save_statement_name.clear();
-			app_state.status_msg = "Statement saved.".to_string();
-		}
-		Message::SavedStatementsLoaded(statements) => {
-			app_state.saved_statements = statements;
-		}
-		Message::LoadSavedStatement(id) => {
-			if let Some(stmt) = app_state.saved_statements.iter().find(|s| s.id == id) {
-				app_state.code_editor.replace_content(&stmt.code);
-				app_state.status_msg = format!("Statement '{}' loaded.", stmt.name);
-			}
-		}
-		Message::EditStatement(id) => {
-			if let Some(stmt) = app_state.saved_statements.iter().find(|s| s.id == id) {
-				app_state.editing_statement_id = Some(id);
-				app_state.save_statement_name = stmt.name.clone();
-				app_state.showing_save_statement_dialog = true;
-			}
-		}
-		Message::DeleteStatement(id) => {
-			let Some(db) = app_state.private_db.clone() else {
-				return Task::none();
-			};
-			return Task::perform(
-				async move { db.delete_statement(id).await },
-				Message::SavedStatementsLoaded,
-			);
-		}
-		Message::PrivateDbError(e) => {
-			app_state.status_error = format!("Database error: {e}");
-		}
-		Message::PasswordEntryChanged(val) => {
-			app_state.password_entry = val;
-			app_state.password_entry_error.clear();
-		}
-		Message::PasswordEntrySubmit => {
-			let salt = app_state.salt.clone();
-			let password = app_state.password_entry.clone();
-			return Task::perform(
-				async move { persistence::PrivateDb::open(&salt, &password).await },
-				|result| match result {
-					Ok(db) => Message::PrivateDbReady(db),
-					Err(_) => Message::PasswordDecryptFailed,
-				},
-			);
-		}
-		Message::PasswordDecryptFailed => {
-			app_state.password_entry_error = "Incorrect password.".to_string();
-			app_state.password_entry.clear();
-		}
 		Message::OpenSettings => {
 			app_state.showing_settings = true;
-			app_state.settings_new_password.clear();
-			app_state.settings_confirm_password.clear();
-			app_state.settings_error.clear();
 		}
 		Message::CloseSettings => {
 			app_state.showing_settings = false;
-			app_state.settings_new_password.clear();
-			app_state.settings_confirm_password.clear();
-			app_state.settings_error.clear();
-		}
-		Message::SettingsNewPasswordChanged(val) => {
-			app_state.settings_new_password = val;
-			app_state.settings_error.clear();
-		}
-		Message::SettingsConfirmPasswordChanged(val) => {
-			app_state.settings_confirm_password = val;
-			app_state.settings_error.clear();
-		}
-		Message::SettingsApplyPassword => {
-			if app_state.settings_new_password != app_state.settings_confirm_password {
-				app_state.settings_error = "Passwords do not match.".to_string();
-				return Task::none();
-			}
-			let Some(db) = app_state.private_db.take() else {
-				app_state.settings_error = "Database not available.".to_string();
-				return Task::none();
-			};
-			let new_key =
-				persistence::derive_key(&app_state.settings_new_password, &app_state.salt);
-			return Task::perform(
-				async move { db.rekey(new_key).await },
-				|result| match result {
-					Ok(new_db) => Message::PrivateDbRekeyed(new_db),
-					Err(e) => Message::PrivateDbError(e),
-				},
-			);
-		}
-		Message::SettingsRemovePassword => {
-			let Some(db) = app_state.private_db.take() else {
-				app_state.settings_error = "Database not available.".to_string();
-				return Task::none();
-			};
-			let empty_key = persistence::derive_key("", &app_state.salt);
-			return Task::perform(
-				async move { db.rekey(empty_key).await },
-				|result| match result {
-					Ok(new_db) => Message::PrivateDbRekeyed(new_db),
-					Err(e) => Message::PrivateDbError(e),
-				},
-			);
-		}
-		Message::PrivateDbRekeyed(new_db) => {
-			let was_remove = app_state.settings_new_password.is_empty()
-				&& app_state.settings_confirm_password.is_empty();
-			let new_is_protected = !was_remove;
-			app_state.private_db = Some(new_db);
-			app_state.is_password_protected = new_is_protected;
-			app_state.showing_settings = false;
-			app_state.settings_new_password.clear();
-			app_state.settings_confirm_password.clear();
-			app_state.settings_error.clear();
-			return Task::perform(
-				async move { persistence::save_is_password_protected(new_is_protected).await },
-				|()| Message::SettingsPasswordSaved,
-			);
-		}
-		Message::SettingsPasswordSaved => {
-			app_state.status_msg = "Password settings saved.".to_string();
 		}
 		Message::ToggleShowColumnTypes(val) => {
 			app_state.show_column_types = val;
@@ -1081,31 +763,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 
 fn menu_action_to_message(action: &str) -> Option<Message> {
 	match action {
-		"noop" => None,
 		"connect:new" => Some(Message::Connect),
 		"code:run" => Some(Message::Run),
 		"code:run-snippet" => Some(Message::RunSnippet),
-		"code:save" => Some(Message::OpenSaveStatementDialog),
 		"settings:preferences" => Some(Message::OpenSettings),
 		_ => {
-			if let Some(id) = action.strip_prefix("connect:load:") {
-				return id.parse().ok().map(Message::LoadSavedConnection);
-			}
-			if let Some(id) = action.strip_prefix("connect:edit:") {
-				return id.parse().ok().map(Message::EditConnection);
-			}
-			if let Some(id) = action.strip_prefix("connect:delete:") {
-				return id.parse().ok().map(Message::DeleteConnection);
-			}
-			if let Some(id) = action.strip_prefix("code:load:") {
-				return id.parse().ok().map(Message::LoadSavedStatement);
-			}
-			if let Some(id) = action.strip_prefix("code:edit:") {
-				return id.parse().ok().map(Message::EditStatement);
-			}
-			if let Some(id) = action.strip_prefix("code:delete:") {
-				return id.parse().ok().map(Message::DeleteStatement);
-			}
 			if let Some(kind) = action.strip_prefix("plot:new:") {
 				return parse_plot_type(kind)
 					.map(|plot_type| Message::Dashboard(DashboardMsg::AddPlot(plot_type)));

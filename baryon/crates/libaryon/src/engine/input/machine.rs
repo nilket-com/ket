@@ -20,6 +20,7 @@ use crate::engine::runtime_registry::{
 };
 use crate::engine::{EditorCommand, EditorMode, KeyCode, Modifiers, MoveDirection, VisualKind};
 use crate::engine::{InputCompletionStatus, InputProjection};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InputContext {
@@ -72,6 +73,10 @@ pub(crate) struct InputRuntime {
 	pub(super) search_cursor: usize,
 	pub(super) search_history: Vec<String>,
 	pub(super) search_history_index: Option<usize>,
+	/// Kept separate from command/search buffers so it can never be added to
+	/// history or surfaced in the viewport projection.
+	pub(super) password_buffer: Zeroizing<String>,
+	pub(super) password_label: Option<String>,
 	pub(super) context: InputContext,
 	pub(super) commands: Vec<EditorCommand>,
 	pub(super) dynamic_invocations: Vec<InvocationSnapshot>,
@@ -121,6 +126,8 @@ impl InputRuntime {
 			search_cursor: 0,
 			search_history: history.search_history,
 			search_history_index: None,
+			password_buffer: Zeroizing::new(String::new()),
+			password_label: None,
 			context: InputContext::default(),
 			commands: Vec::new(),
 			dynamic_invocations: Vec::new(),
@@ -148,13 +155,26 @@ impl InputRuntime {
 	}
 
 	pub(crate) fn projection(&self) -> InputProjection {
-		let (prompt_buffer, prompt_cursor) = match self.state {
-			InputState::Command => (self.command_buffer.clone(), self.command_cursor),
-			InputState::Search => (self.search_buffer.clone(), self.search_cursor),
-			_ => (String::new(), 0),
+		let (prompt_buffer, prompt_cursor, prompt_label, prompt_masked) = match self.state {
+			InputState::Command => (
+				self.command_buffer.clone(),
+				self.command_cursor,
+				None,
+				false,
+			),
+			InputState::Search => (self.search_buffer.clone(), self.search_cursor, None, false),
+			InputState::Password => (
+				"•".repeat(self.password_buffer.chars().count()),
+				self.password_buffer.chars().count(),
+				self.password_label.clone(),
+				true,
+			),
+			_ => (String::new(), 0, None, false),
 		};
 		InputProjection {
 			mode: self.editor_mode(),
+			prompt_label,
+			prompt_masked,
 			prompt_buffer,
 			prompt_cursor,
 			pending_sequence: self
@@ -193,14 +213,20 @@ impl InputRuntime {
 		self.needs_render = true;
 		let mode_before = self.editor_mode();
 		let mut should_quit = false;
-		let runtime_handled =
-			self.dispatch_runtime_mapping_key(code, modifiers, registries, &mut should_quit);
+		// Password input is never eligible for user mappings: a mapping can
+		// persist, log, or reroute keystrokes outside libaryon's secret boundary.
+		let runtime_handled = !matches!(self.editor_mode(), EditorMode::Password)
+			&& self.dispatch_runtime_mapping_key(code, modifiers, registries, &mut should_quit);
 		if !runtime_handled {
 			match self.editor_mode() {
 				EditorMode::Normal => self.dispatch_normal_key(code, modifiers, &mut should_quit),
 				EditorMode::Insert => self.dispatch_insert_key(code, modifiers, &mut should_quit),
 				EditorMode::Command | EditorMode::Search => {
 					self.dispatch_prompt_key(code, modifiers, &mut should_quit, registries)
+				}
+				EditorMode::Password => {
+					self.dispatch_password_key(code, modifiers);
+					true
 				}
 				EditorMode::Confirm => self.dispatch_confirm_key(code, modifiers, &mut should_quit),
 				EditorMode::Visual { .. } => {
@@ -233,6 +259,51 @@ impl InputRuntime {
 			needs_render: self.needs_render,
 			declined_input,
 		}
+	}
+
+	pub(crate) fn begin_password_prompt(&mut self, label: String) {
+		self.password_buffer.zeroize();
+		self.password_buffer = Zeroizing::new(String::new());
+		self.password_label = Some(label);
+		self.state = InputState::Password;
+		self.clear_runtime_mapping_pending();
+		self.needs_render = true;
+	}
+
+	fn dispatch_password_key(&mut self, code: KeyCode, modifiers: Modifiers) {
+		match code {
+			KeyCode::Esc => {
+				self.clear_password_prompt();
+			}
+			KeyCode::Backspace => {
+				self.password_buffer.pop();
+			}
+			KeyCode::Enter => {
+				let buffer =
+					std::mem::replace(&mut self.password_buffer, Zeroizing::new(String::new()));
+				self.password_label = None;
+				self.state = InputState::normal();
+				let secret = crate::engine::SecretInput::new(buffer.as_bytes().to_vec());
+				// `buffer` zeroizes its allocation on drop after the deliberately
+				// isolated copy above moves into the redacted command payload.
+				drop(buffer);
+				self.send_command(EditorCommand::SubmitPassword(secret));
+			}
+			KeyCode::Char(ch)
+				if !modifiers
+					.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER) =>
+			{
+				self.password_buffer.push(ch);
+			}
+			_ => {}
+		}
+	}
+
+	fn clear_password_prompt(&mut self) {
+		self.password_buffer.zeroize();
+		self.password_buffer = Zeroizing::new(String::new());
+		self.password_label = None;
+		self.state = InputState::normal();
 	}
 
 	pub(crate) fn dispatch_paste(&mut self, context: InputContext, data: String) -> InputDispatch {
@@ -329,6 +400,7 @@ impl InputRuntime {
 			| InputState::Insert
 			| InputState::Command
 			| InputState::Search
+			| InputState::Password
 			| InputState::Confirm => true,
 			InputState::Normal(_) => {
 				let Some(context) = normal_context(self.state, self.is_file_browser_view()) else {

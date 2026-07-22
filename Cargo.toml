@@ -9,7 +9,9 @@ authors = ["Joel Bondurant"]
 
 [workspace.dependencies]
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+argon2 = "0.5.3"
 bitflags = "2.11.0"
+chacha20poly1305 = "0.10.1"
 crossterm = "0.29.0"
 font8x8 = "0.3.1"
 fontdb = "0.23.0"
@@ -19,6 +21,7 @@ imara-diff = "0.2.0"
 memchr = "2.8.0"
 libc = "0.2.177"
 pulldown-cmark = { version = "0.13.4", default-features = false }
+rand = "0.10.0"
 ra_ap_base_db = "0.0.342"
 ra_ap_cfg = "0.0.342"
 ra_ap_ide = "0.0.342"
@@ -39,6 +42,7 @@ rustc-hash = "2.1.2"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+zeroize = "1.8.2"
 sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
 triomphe = "0.1.15"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }

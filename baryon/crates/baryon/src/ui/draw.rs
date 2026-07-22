@@ -1504,6 +1504,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						EditorMode::Insert => "INS".to_string(),
 						EditorMode::Command => "CMD".to_string(),
 						EditorMode::Search => "FIND".to_string(),
+						EditorMode::Password => "PASS".to_string(),
 						EditorMode::Confirm => "Y/N".to_string(),
 						EditorMode::Visual { kind, .. } => match kind {
 							VisualKind::Char => "VIS".to_string(),
@@ -1516,6 +1517,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 						EditorMode::Insert => MODE_INSERT_BG,
 						EditorMode::Command => MODE_COMMAND_BG,
 						EditorMode::Search => MODE_SEARCH_BG,
+						EditorMode::Password => MODE_COMMAND_BG,
 						EditorMode::Confirm => MODE_CONFIRM_BG,
 						EditorMode::Visual { .. } => MODE_VISUAL_BG,
 					});

@@ -18,6 +18,11 @@ pub enum InputCompletionStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputProjection {
 	pub mode: crate::engine::EditorMode,
+	/// Label supplied by the engine for a masked password prompt. It contains
+	/// no secret material.
+	pub prompt_label: Option<String>,
+	/// The prompt buffer has been redacted to display-safe bullets.
+	pub prompt_masked: bool,
 	pub prompt_buffer: String,
 	pub prompt_cursor: usize,
 	pub pending_sequence: Option<String>,
@@ -28,6 +33,8 @@ impl Default for InputProjection {
 	fn default() -> Self {
 		Self {
 			mode: crate::engine::EditorMode::Normal,
+			prompt_label: None,
+			prompt_masked: false,
 			prompt_buffer: String::new(),
 			prompt_cursor: 0,
 			pending_sequence: None,

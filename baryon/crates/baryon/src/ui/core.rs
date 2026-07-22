@@ -322,6 +322,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			EditorMode::Normal
 			| EditorMode::Command
 			| EditorMode::Search
+			| EditorMode::Password
 			| EditorMode::Confirm
 			| EditorMode::Visual { .. } => SetCursorStyle::SteadyBlock,
 			EditorMode::Insert => SetCursorStyle::SteadyBar,

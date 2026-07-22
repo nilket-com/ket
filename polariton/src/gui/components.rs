@@ -10,7 +10,6 @@ use crate::gui::{
 	colors,
 	menu::{MenuBar, MenuFontPolicy, MenuItem, MenuRoot, MenuState},
 };
-use crate::persistence::{SavedConnection, SavedStatement};
 use iced::widget::{
 	TextInput, button, center, checkbox, column, container, mouse_area, row, space, stack, text,
 	text_input,
@@ -159,20 +158,8 @@ pub fn main_screen<'a>(
 	status_df_size: Option<(usize, usize)>,
 	status_time_elapsed: Option<f64>,
 	adapter_state: &'a AdapterState,
-	saved_connections: &'a [SavedConnection],
-	saved_statements: &'a [SavedStatement],
-	showing_password_prompt: bool,
-	password_entry: &'a str,
-	password_entry_error: &'a str,
 	showing_settings: bool,
-	settings_new_password: &'a str,
-	settings_confirm_password: &'a str,
-	settings_error: &'a str,
-	is_password_protected: bool,
 	show_column_types: bool,
-	showing_save_statement_dialog: bool,
-	save_statement_name: &'a str,
-	editing_statement_id: Option<i64>,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner. The nested
 	// dashboard still owns its own pixel-space grid inside its host panel.
@@ -196,42 +183,14 @@ pub fn main_screen<'a>(
 		adapter_state,
 	)
 	.view();
-	let main_window = window_decorations(
-		column![main_content, status_bar],
-		menu_state,
-		saved_connections,
-		saved_statements,
-	);
+	let main_window = window_decorations(column![main_content, status_bar], menu_state);
 	let adapter_modal = adapter_view(adapter_state);
-	let password_modal: Element<Message> = if showing_password_prompt {
-		password_prompt_view(password_entry, password_entry_error)
-	} else {
-		container(text("")).into()
-	};
 	let settings_modal: Element<Message> = if showing_settings {
-		settings_dialog_view(
-			settings_new_password,
-			settings_confirm_password,
-			settings_error,
-			is_password_protected,
-			show_column_types,
-		)
+		settings_dialog_view(show_column_types)
 	} else {
 		container(text("")).into()
 	};
-	let save_statement_modal: Element<Message> = if showing_save_statement_dialog {
-		save_statement_dialog_view(save_statement_name, editing_statement_id.is_some())
-	} else {
-		container(text("")).into()
-	};
-	stack![
-		main_window,
-		adapter_modal,
-		password_modal,
-		settings_modal,
-		save_statement_modal
-	]
-	.into()
+	stack![main_window, adapter_modal, settings_modal].into()
 }
 
 fn app_status_bar(
@@ -277,41 +236,23 @@ fn app_status_bar(
 	bar
 }
 
-pub fn menu_bar<'a>(
-	menu_state: &'a MenuState,
-	saved_connections: &'a [SavedConnection],
-	saved_statements: &'a [SavedStatement],
-) -> Element<'a, Message> {
+pub fn menu_bar<'a>(menu_state: &'a MenuState) -> Element<'a, Message> {
 	Element::from(
-		MenuBar::new(
-			build_menu_roots(saved_connections, saved_statements),
-			menu_state,
-		)
-		.font_policy(MenuFontPolicy::SystemWithFallback),
+		MenuBar::new(build_menu_roots(), menu_state)
+			.font_policy(MenuFontPolicy::SystemWithFallback),
 	)
 	.map(Message::Menu)
 }
 
-fn build_menu_roots(
-	saved_connections: &[SavedConnection],
-	saved_statements: &[SavedStatement],
-) -> Vec<MenuRoot> {
+fn build_menu_roots() -> Vec<MenuRoot> {
 	vec![
 		MenuRoot {
 			id: "connect".into(),
 			label: "Connect".into(),
-			items: vec![
-				MenuItem::Action {
-					id: "connect:new".into(),
-					label: "New".into(),
-				},
-				MenuItem::Separator,
-				MenuItem::Submenu {
-					id: "connect:saved".into(),
-					label: "Saved".into(),
-					items: build_saved_connection_items(saved_connections),
-				},
-			],
+			items: vec![MenuItem::Action {
+				id: "connect:new".into(),
+				label: "New".into(),
+			}],
 		},
 		MenuRoot {
 			id: "code".into(),
@@ -324,16 +265,6 @@ fn build_menu_roots(
 				MenuItem::Action {
 					id: "code:run-snippet".into(),
 					label: "Run selection / line  (Shift+Enter)".into(),
-				},
-				MenuItem::Action {
-					id: "code:save".into(),
-					label: "Save...".into(),
-				},
-				MenuItem::Separator,
-				MenuItem::Submenu {
-					id: "code:saved".into(),
-					label: "Saved".into(),
-					items: build_saved_statement_items(saved_statements),
 				},
 			],
 		},
@@ -380,68 +311,6 @@ fn build_menu_roots(
 	]
 }
 
-fn build_saved_connection_items(saved_connections: &[SavedConnection]) -> Vec<MenuItem> {
-	if saved_connections.is_empty() {
-		return vec![MenuItem::Action {
-			id: "noop".into(),
-			label: "None saved".into(),
-		}];
-	}
-
-	saved_connections
-		.iter()
-		.map(|conn| MenuItem::Submenu {
-			id: format!("connect:saved:{}", conn.id),
-			label: conn.name.clone(),
-			items: vec![
-				MenuItem::Action {
-					id: format!("connect:load:{}", conn.id),
-					label: "Load".into(),
-				},
-				MenuItem::Action {
-					id: format!("connect:edit:{}", conn.id),
-					label: "Edit".into(),
-				},
-				MenuItem::Action {
-					id: format!("connect:delete:{}", conn.id),
-					label: "Delete".into(),
-				},
-			],
-		})
-		.collect()
-}
-
-fn build_saved_statement_items(saved_statements: &[SavedStatement]) -> Vec<MenuItem> {
-	if saved_statements.is_empty() {
-		return vec![MenuItem::Action {
-			id: "noop".into(),
-			label: "None saved".into(),
-		}];
-	}
-
-	saved_statements
-		.iter()
-		.map(|stmt| MenuItem::Submenu {
-			id: format!("code:saved:{}", stmt.id),
-			label: stmt.name.clone(),
-			items: vec![
-				MenuItem::Action {
-					id: format!("code:load:{}", stmt.id),
-					label: "Load".into(),
-				},
-				MenuItem::Action {
-					id: format!("code:edit:{}", stmt.id),
-					label: "Edit".into(),
-				},
-				MenuItem::Action {
-					id: format!("code:delete:{}", stmt.id),
-					label: "Delete".into(),
-				},
-			],
-		})
-		.collect()
-}
-
 fn section<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
 	column![
 		text(title).size(18),
@@ -473,8 +342,6 @@ fn field<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element
 fn window_decorations<'a>(
 	underlay: impl Into<Element<'a, Message>>,
 	menu_state: &'a MenuState,
-	saved_connections: &'a [SavedConnection],
-	saved_statements: &'a [SavedStatement],
 ) -> Element<'a, Message> {
 	let resize_thin = 6;
 	let resize_thick = 60;
@@ -514,7 +381,7 @@ fn window_decorations<'a>(
 				row![title_bar()],
 				stack![
 					column![space::vertical().height(32), underlay.into(),],
-					row![menu_bar(menu_state, saved_connections, saved_statements)],
+					row![menu_bar(menu_state)],
 				],
 				row![
 					resize_area_southwest_bottom,
@@ -723,138 +590,7 @@ fn adapter_gallery_view() -> Element<'static, Message> {
 	.into()
 }
 
-fn password_prompt_view<'a>(password_entry: &'a str, error: &'a str) -> Element<'a, Message> {
-	let error_el: Element<Message> = if error.is_empty() {
-		space::vertical().height(24).into()
-	} else {
-		container(text(error).color(colors::DANGER).size(14))
-			.height(24)
-			.into()
-	};
-	let dialog: Element<Message> = container(
-		column![
-			row![text("Enter Password").size(24), space::horizontal()].align_y(Alignment::Center),
-			section(
-				"Password",
-				column![
-					styled_text_input("Enter password", password_entry)
-						.secure(true)
-						.on_input(Message::PasswordEntryChanged)
-						.on_submit(Message::PasswordEntrySubmit),
-					error_el,
-				]
-				.spacing(4),
-			),
-			row![
-				space::horizontal(),
-				styled_button("Unlock", Message::PasswordEntrySubmit, BUTTON_SIZE_DEFAULT),
-			]
-			.align_y(Alignment::Center),
-		]
-		.spacing(20)
-		.padding(20),
-	)
-	.width(Length::Fixed(480.0))
-	.style(|_| container::Style {
-		background: Some(colors::BG_MODAL.into()),
-		border: border::Border {
-			color: colors::BORDER_PRIMARY,
-			width: 1.0,
-			radius: 5.0.into(),
-		},
-		..Default::default()
-	})
-	.into();
-	column![
-		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
-		row![space::horizontal(), dialog, space::horizontal()],
-		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
-	]
-	.into()
-}
-
-fn save_statement_dialog_view<'a>(name: &'a str, is_editing: bool) -> Element<'a, Message> {
-	let title = if is_editing {
-		"Update Statement"
-	} else {
-		"Save Statement"
-	};
-	let btn_label = if is_editing { "Update" } else { "Save" };
-	let dialog: Element<Message> = container(
-		column![
-			row![text(title).size(24), space::horizontal()].align_y(Alignment::Center),
-			section(
-				"Name",
-				styled_text_input("Statement name", name)
-					.on_input(Message::SaveStatementNameChanged)
-					.on_submit(Message::SaveStatement),
-			),
-			row![
-				space::horizontal(),
-				styled_button("Cancel", Message::CloseSaveStatementDialog, (100, 40)),
-				styled_button(btn_label, Message::SaveStatement, BUTTON_SIZE_DEFAULT),
-			]
-			.spacing(8)
-			.align_y(Alignment::Center),
-		]
-		.spacing(20)
-		.padding(20),
-	)
-	.width(Length::Fixed(480.0))
-	.style(|_| container::Style {
-		background: Some(colors::BG_MODAL.into()),
-		border: border::Border {
-			color: colors::BORDER_PRIMARY,
-			width: 1.0,
-			radius: 5.0.into(),
-		},
-		..Default::default()
-	})
-	.into();
-	column![
-		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
-		row![space::horizontal(), dialog, space::horizontal()],
-		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
-	]
-	.into()
-}
-
-fn settings_dialog_view<'a>(
-	new_password: &'a str,
-	confirm_password: &'a str,
-	error: &'a str,
-	is_password_protected: bool,
-	show_column_types: bool,
-) -> Element<'a, Message> {
-	let error_el: Element<Message> = if error.is_empty() {
-		space::vertical().height(24).into()
-	} else {
-		container(text(error).color(colors::DANGER).size(14))
-			.height(24)
-			.into()
-	};
-	let apply_label = if is_password_protected {
-		"Change"
-	} else {
-		"Set"
-	};
-	let mut action_row = row![
-		space::horizontal(),
-		styled_button(
-			apply_label,
-			Message::SettingsApplyPassword,
-			BUTTON_SIZE_DEFAULT
-		),
-	]
-	.spacing(10)
-	.align_y(Alignment::Center);
-	if is_password_protected {
-		action_row = action_row.push(styled_button(
-			"Remove",
-			Message::SettingsRemovePassword,
-			BUTTON_SIZE_DEFAULT,
-		));
-	}
+fn settings_dialog_view<'a>(show_column_types: bool) -> Element<'a, Message> {
 	let dialog: Element<Message> = container(
 		column![
 			row![
@@ -869,22 +605,6 @@ fn settings_dialog_view<'a>(
 					.label("Show column types in header")
 					.on_toggle(Message::ToggleShowColumnTypes),
 			),
-			section(
-				"Security",
-				column![
-					styled_text_input("New password", new_password)
-						.secure(true)
-						.on_input(Message::SettingsNewPasswordChanged)
-						.on_submit(Message::SettingsApplyPassword),
-					styled_text_input("Confirm password", confirm_password)
-						.secure(true)
-						.on_input(Message::SettingsConfirmPasswordChanged)
-						.on_submit(Message::SettingsApplyPassword),
-					error_el,
-				]
-				.spacing(8),
-			),
-			action_row,
 		]
 		.spacing(20)
 		.padding(20),
@@ -966,7 +686,6 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 			fields_section,
 			row![
 				space::horizontal(),
-				styled_button("Save", Message::SaveConnection, BUTTON_SIZE_DEFAULT),
 				styled_button(
 					"Connect",
 					Message::AdapterConfigurationSubmitted,
