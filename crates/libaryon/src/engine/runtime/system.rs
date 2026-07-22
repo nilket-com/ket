@@ -6675,13 +6675,15 @@ pub struct Foo {
 	fn scroll_full_page_back_moves_viewport_anchor_on_real_engine_file() {
 		use crate::core::DocLine;
 
-		let path = format!(
-			"{}/src/engine/runtime/navigation.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
+		let path = temp_test_path("scroll-full-page-back").with_extension("rs");
+		let source = (0..260)
+			.map(|line| format!("fn line_{line}() {{}}\n"))
+			.collect::<String>();
+		std::fs::write(&path, source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::Resize(80, 11));
 		let seeded = send_cmd_and_recv(
 			&tx_cmd,
@@ -6704,20 +6706,22 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
 	fn viewport_top_middle_bottom_sequence_on_real_engine_file_lands_on_first_non_whitespace() {
 		use crate::core::{CursorPosition, DocLine};
 
-		let path = format!(
-			"{}/src/engine/runtime/search.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
-		let source = std::fs::read_to_string(&path).expect("read search.rs");
+		let path = temp_test_path("viewport-top-middle-bottom").with_extension("rs");
+		let source = (0..100)
+			.map(|line| format!("fn function_{line}() {{\n    let value_{line} = {line};\n}}\n"))
+			.collect::<String>();
+		std::fs::write(&path, &source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::Resize(80, 11));
 		let seeded = send_cmd_and_recv(
 			&tx_cmd,
@@ -6758,6 +6762,7 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
@@ -6960,11 +6965,10 @@ pub struct Foo {
 	fn clear_search_clears_active_search_state_on_real_engine_file() {
 		use crate::core::{CursorPosition, DocByte};
 
-		let path = format!(
-			"{}/src/engine/runtime/search.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
-		let source = std::fs::read_to_string(&path).expect("read search.rs");
+		let path = temp_test_path("clear-search").with_extension("rs");
+		let source = "fn main() {\n    let pattern = 1;\n    let search_pattern = pattern;\n    let pattern = 2;\n}\n".to_owned();
+		std::fs::write(&path, &source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let bytes = source.as_bytes();
 		let mut offsets = Vec::new();
 		let mut start = 0usize;
@@ -6991,7 +6995,7 @@ pub struct Foo {
 		);
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,
@@ -7020,6 +7024,7 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
