@@ -64,6 +64,32 @@ pub struct AdapterState {
 	pub connection: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
 }
 
+impl AdapterConfiguration {
+	/// Rebuild an adapter configuration after libaryon has decrypted an opaque
+	/// saved connection profile. Keeping this mapping here prevents a frontend
+	/// from needing to know the adapter-specific configuration shape.
+	pub fn from_saved(adapter_type: &str, config_value: &str) -> Self {
+		match adapter_type {
+			"BigQuery" => AdapterConfiguration::BigQuery {
+				project_id: config_value.to_string(),
+			},
+			"MySQL" => AdapterConfiguration::MySQL {
+				connection_string: config_value.to_string(),
+			},
+			"Parquet" => AdapterConfiguration::Parquet {
+				input_path: config_value.to_string(),
+			},
+			"Postgres" => AdapterConfiguration::Postgres {
+				connection_string: config_value.to_string(),
+			},
+			"SQLite" => AdapterConfiguration::SQLite {
+				connection_string: config_value.to_string(),
+			},
+			_ => AdapterConfiguration::None,
+		}
+	}
+}
+
 impl AdapterState {
 	pub fn configure(&mut self) {
 		match &self.selection {
@@ -218,5 +244,26 @@ pub fn fields_for(selection: &AdapterSelection) -> &'static [AdapterField] {
 		AdapterSelection::Parquet => parquet::FIELDS,
 		AdapterSelection::Postgres => postgres::FIELDS,
 		AdapterSelection::SQLite => sqlite::FIELDS,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::AdapterConfiguration;
+
+	#[test]
+	fn saved_configuration_keeps_adapter_specific_field_names() {
+		assert!(matches!(
+			AdapterConfiguration::from_saved("BigQuery", "warehouse"),
+			AdapterConfiguration::BigQuery { project_id } if project_id == "warehouse"
+		));
+		assert!(matches!(
+			AdapterConfiguration::from_saved("Postgres", "postgres://db"),
+			AdapterConfiguration::Postgres { connection_string } if connection_string == "postgres://db"
+		));
+		assert!(matches!(
+			AdapterConfiguration::from_saved("unknown", "ignored"),
+			AdapterConfiguration::None
+		));
 	}
 }
