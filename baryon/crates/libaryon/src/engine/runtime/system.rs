@@ -4146,7 +4146,10 @@ mod tests {
 			let timeout = if last.is_some() {
 				Duration::from_millis(150)
 			} else {
-				Duration::from_secs(2)
+				// Rust workspace hydration can legitimately hold the engine's
+				// single run loop beyond the old two-second budget on a cold cache.
+				// This helper is an ordering fence, not a responsiveness assertion.
+				Duration::from_secs(10)
 			};
 			match rx_view.recv_timeout(timeout) {
 				Ok(mut view) => {
@@ -6636,13 +6639,18 @@ pub struct Foo {
 	fn scroll_half_page_moves_viewport_anchor_on_real_engine_file() {
 		use crate::core::DocLine;
 
-		let path = format!(
-			"{}/src/engine/runtime/navigation.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
+		// Keep the viewport test independent of rust-analyzer's workspace load.
+		// The behavior under test is document scrolling after a Rust graft, not
+		// Cargo workspace diagnostics (which has a separate integration test).
+		let path = temp_test_path("scroll-anchor").with_extension("rs");
+		let source = (0..80)
+			.map(|line| format!("fn line_{line}() {{}}\n"))
+			.collect::<String>();
+		std::fs::write(&path, source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let resized = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::Resize(80, 11));
 		assert_eq!(resized.viewport_line_count, 9);
 		assert_eq!(resized.viewport_start_line, DocLine::ZERO);
@@ -6660,6 +6668,7 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
@@ -6755,11 +6764,10 @@ pub struct Foo {
 	fn search_word_under_cursor_forward_uses_whole_word_matches_in_real_engine_file() {
 		use crate::core::{CursorPosition, DocByte};
 
-		let path = format!(
-			"{}/src/engine/runtime/search.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
-		let source = std::fs::read_to_string(&path).expect("read search.rs");
+		let path = temp_test_path("whole-word-backward").with_extension("rs");
+		let source = "fn main() {\n    let pattern = 1;\n    let search_pattern = pattern;\n    let pattern = 2;\n}\n".to_owned();
+		std::fs::write(&path, &source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let bytes = source.as_bytes();
 		let mut offsets = Vec::new();
 		let mut start = 0usize;
@@ -6788,7 +6796,7 @@ pub struct Foo {
 			crate::engine::undo::line_col_from_byte_offset(bytes, DocByte::new(offsets[1] as u64));
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,
@@ -6814,17 +6822,17 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
 	fn search_word_under_cursor_backward_moves_to_previous_occurrence_in_real_engine_file() {
 		use crate::core::{CursorPosition, DocByte};
 
-		let path = format!(
-			"{}/src/engine/runtime/search.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
-		let source = std::fs::read_to_string(&path).expect("read search.rs");
+		let path = temp_test_path("whole-word-wrap").with_extension("rs");
+		let source = "fn main() {\n    let pattern = 1;\n    let search_pattern = pattern;\n    let pattern = 2;\n}\n".to_owned();
+		std::fs::write(&path, &source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let bytes = source.as_bytes();
 		let mut offsets = Vec::new();
 		let mut start = 0usize;
@@ -6853,7 +6861,7 @@ pub struct Foo {
 			crate::engine::undo::line_col_from_byte_offset(bytes, DocByte::new(offsets[0] as u64));
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,
@@ -6879,17 +6887,17 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
 	fn search_word_under_cursor_backward_wraps_from_first_occurrence_in_real_engine_file() {
 		use crate::core::{CursorPosition, DocByte};
 
-		let path = format!(
-			"{}/src/engine/runtime/search.rs",
-			env!("CARGO_MANIFEST_DIR")
-		);
-		let source = std::fs::read_to_string(&path).expect("read search.rs");
+		let path = temp_test_path("whole-word-wrap").with_extension("rs");
+		let source = "fn main() {\n    let pattern = 1;\n    let search_pattern = pattern;\n    let pattern = 2;\n}\n".to_owned();
+		std::fs::write(&path, &source).expect("write Rust fixture");
+		let path_name = path.to_string_lossy().into_owned();
 		let bytes = source.as_bytes();
 		let mut offsets = Vec::new();
 		let mut start = 0usize;
@@ -6919,7 +6927,7 @@ pub struct Foo {
 			crate::engine::undo::line_col_from_byte_offset(bytes, DocByte::new(last as u64));
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
 
-		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path);
+		let _view = load_rs_and_wait_for_graft(&tx_cmd, &rx_view, &path_name);
 		let _ = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,
@@ -6945,6 +6953,7 @@ pub struct Foo {
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");
 		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
