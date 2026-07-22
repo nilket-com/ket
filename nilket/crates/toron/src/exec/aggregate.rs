@@ -19,6 +19,13 @@ struct GroupedFoldReceipt {
 	fold_batches: u64,
 	fold_rows: u64,
 	fold_micros: u64,
+	// ADR 500 residual decomposition (all batch-level, gated on the receipt being Some):
+	// the per-batch scan-stream pull (decode + async framework — subtract the parquet decode
+	// receipt to isolate framework), the per-batch projection, and the one-time finalize. These
+	// bracket exactly the loop body OUTSIDE fold_micros, so they reconcile the residual.
+	stream_pull_micros: u64,
+	projection_micros: u64,
+	finalize_micros: u64,
 }
 
 const LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH_ENV: &str = "TORON_LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH";
@@ -156,6 +163,24 @@ impl GroupedFoldReceipt {
 			.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
 		self.fold_micros = self
 			.fold_micros
+			.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+	}
+
+	fn record_stream_pull(&mut self, elapsed: std::time::Duration) {
+		self.stream_pull_micros = self
+			.stream_pull_micros
+			.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+	}
+
+	fn record_projection(&mut self, elapsed: std::time::Duration) {
+		self.projection_micros = self
+			.projection_micros
+			.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+	}
+
+	fn record_finalize(&mut self, elapsed: std::time::Duration) {
+		self.finalize_micros = self
+			.finalize_micros
 			.saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
 	}
 }
@@ -757,10 +782,16 @@ impl Executor {
 			.map(|_| LocalGroupedExchangeReceipt::default());
 
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			// stream_pull brackets the awaited scan pull: it includes the parquet decode measured
+			// separately by the scan ledger, so async framework = stream_pull − decode.
+			let pull_started = fold_receipt.as_ref().map(|_| Instant::now());
 			let Some(batch) = stream.next().await else {
 				break;
 			};
 			let batch = batch?;
+			if let (Some(receipt), Some(started)) = (fold_receipt.as_mut(), pull_started) {
+				receipt.record_stream_pull(started.elapsed());
+			}
 			let batch = if let Some(limit) = row_limit {
 				let remaining = limit - rows;
 				if batch.num_rows() > remaining {
@@ -773,8 +804,12 @@ impl Executor {
 			};
 			rows = rows.saturating_add(batch.num_rows());
 
+			let projection_started = fold_receipt.as_ref().map(|_| Instant::now());
 			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
 			if let Some(receipt) = fold_receipt.as_mut() {
+				if let Some(started) = projection_started {
+					receipt.record_projection(started.elapsed());
+				}
 				receipt.record_source_batch();
 			}
 			self.fold_streaming_grouped_scan_batch(
@@ -801,18 +836,25 @@ impl Executor {
 			)?;
 		}
 
+		let finalize_started = fold_receipt.as_ref().map(|_| Instant::now());
 		let output = self.finalize_bound_grouped_aggregate(
 			&mut groups,
 			&group_types,
 			aggr_expr,
 			output_schema,
 		)?;
+		if let (Some(receipt), Some(started)) = (fold_receipt.as_mut(), finalize_started) {
+			receipt.record_finalize(started.elapsed());
+		}
 		if let (Some(path), Some(receipt)) = (receipt_path, fold_receipt) {
 			let receipt = serde_json::json!({
 				"source_batches": receipt.source_batches,
 				"fold_batches": receipt.fold_batches,
 				"fold_rows": receipt.fold_rows,
 				"fold_micros": receipt.fold_micros,
+				"stream_pull_micros": receipt.stream_pull_micros,
+				"projection_micros": receipt.projection_micros,
+				"finalize_micros": receipt.finalize_micros,
 			});
 			std::fs::write(
 				path,
