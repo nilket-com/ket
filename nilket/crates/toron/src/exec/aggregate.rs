@@ -1056,11 +1056,14 @@ fn primitive_int64_count_spec(
 	output_schema: &SchemaRef,
 ) -> Option<PrimitiveInt64CountSpec> {
 	if !primitive_int64_count_enabled()
-		|| input.exchange.is_none()
 		|| input.scan_input.scan_filter_predicate.is_some()
 		|| input.scan_input.project.is_some()
 		|| input.scan_input.project_filter_predicate.is_some()
 	{
+		return None;
+	}
+	let (_, exchange_key) = input.exchange?;
+	if exchange_key != group_expr {
 		return None;
 	}
 	let group = group_expr.single_column_root()?;
@@ -3753,6 +3756,27 @@ mod tests {
 		assert!(
 			primitive_int64_count_spec(&input, &group_expr, &column_count, &output_schema)
 				.is_none()
+		);
+
+		// The compact fold assumes the exchange co-locates every group's rows on one node. An
+		// exchange that repartitions on a different key would split a group across partitions and
+		// undercount; reject it exactly as the SUM path does.
+		let other_key = column_program("other_key", ColumnOrdinal(1), DataType::Int64, false);
+		let mismatched_exchange = StreamingScanGroupedInput {
+			scan_input: input.scan_input,
+			exchange: Some((4, &other_key)),
+		};
+		assert!(
+			primitive_int64_count_spec(&mismatched_exchange, &group_expr, &count, &output_schema)
+				.is_none()
+		);
+
+		let no_exchange = StreamingScanGroupedInput {
+			scan_input: input.scan_input,
+			exchange: None,
+		};
+		assert!(
+			primitive_int64_count_spec(&no_exchange, &group_expr, &count, &output_schema).is_none()
 		);
 	}
 
