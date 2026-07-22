@@ -6,10 +6,11 @@ mod group_table;
 use self::group_table::BoundGroupedAggregateEntry;
 pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
 
-const EMPTY_PRIMITIVE_INT64_SUM_BUCKET: u32 = u32::MAX;
-const PRIMITIVE_INT64_SUM_INITIAL_CAPACITY: usize = 1024;
-const PRIMITIVE_INT64_SUM_PRODUCER: &str = "primitive Int64 grouped SUM resident state";
+const EMPTY_PRIMITIVE_INT64_BUCKET: u32 = u32::MAX;
+const PRIMITIVE_INT64_INITIAL_CAPACITY: usize = 1024;
+const PRIMITIVE_INT64_PRODUCER: &str = "primitive Int64 grouped aggregate resident state";
 const BORROW_SINGLE_UTF8_GROUP_KEY_ENV: &str = "TORON_TPCH_BORROW_SINGLE_UTF8_GROUP_KEY";
+const PRIMITIVE_INT64_COUNT_ENV: &str = "TORON_EXEC_PRIMITIVE_INT64_COUNT";
 
 fn borrow_single_utf8_group_key_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -22,6 +23,19 @@ fn borrow_single_utf8_group_key_enabled() -> bool {
 			std::env::var(BORROW_SINGLE_UTF8_GROUP_KEY_ENV)
 				.ok()
 				.as_deref(),
+		)
+	})
+}
+
+fn primitive_int64_count_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+fn primitive_int64_count_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		primitive_int64_count_enabled_from_env(
+			std::env::var(PRIMITIVE_INT64_COUNT_ENV).ok().as_deref(),
 		)
 	})
 }
@@ -61,7 +75,12 @@ struct PrimitiveInt64SumSpec {
 	input: PrimitiveInt64SumInput,
 }
 
-struct PrimitiveInt64SumGroups {
+#[derive(Debug, Clone, Copy)]
+struct PrimitiveInt64CountSpec {
+	group_column: ColumnOrdinal,
+}
+
+struct PrimitiveInt64Groups {
 	buckets: Vec<u32>,
 	keys: Vec<i64>,
 	totals: Vec<i128>,
@@ -73,7 +92,7 @@ struct PrimitiveInt64SumGroups {
 	growth_count: u64,
 }
 
-impl PrimitiveInt64SumGroups {
+impl PrimitiveInt64Groups {
 	fn new() -> Self {
 		Self {
 			buckets: Vec::new(),
@@ -95,7 +114,7 @@ impl PrimitiveInt64SumGroups {
 				self.totals[entry]
 					.checked_add(value)
 					.ok_or_else(|| ExecutionError::Kernel {
-						message: "primitive Int64 grouped SUM overflow".to_string(),
+						message: "primitive Int64 grouped accumulator overflow".to_string(),
 					})?;
 			return Ok(());
 		}
@@ -103,11 +122,12 @@ impl PrimitiveInt64SumGroups {
 			self.grow(cap)?;
 		}
 		let entry = u32::try_from(self.keys.len()).map_err(|_| ExecutionError::Kernel {
-			message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+			message: "primitive Int64 grouped aggregate exceeds u32 entry range".to_string(),
 		})?;
-		if entry == EMPTY_PRIMITIVE_INT64_SUM_BUCKET {
+		if entry == EMPTY_PRIMITIVE_INT64_BUCKET {
 			return Err(ExecutionError::Kernel {
-				message: "primitive Int64 grouped SUM exhausted the u32 entry domain".to_string(),
+				message: "primitive Int64 grouped aggregate exhausted the u32 entry domain"
+					.to_string(),
 			});
 		}
 		let bucket = Self::find_bucket_in(&self.hasher, &self.buckets, &self.keys, key)?;
@@ -123,23 +143,23 @@ impl PrimitiveInt64SumGroups {
 
 	fn grow(&mut self, cap: u64) -> Result<(), ExecutionError> {
 		let target = if self.entry_limit == 0 {
-			PRIMITIVE_INT64_SUM_INITIAL_CAPACITY
+			PRIMITIVE_INT64_INITIAL_CAPACITY
 		} else {
 			self.entry_limit
 				.checked_mul(2)
 				.ok_or_else(|| ExecutionError::Kernel {
-					message: "primitive Int64 grouped SUM capacity overflow".to_string(),
+					message: "primitive Int64 grouped aggregate capacity overflow".to_string(),
 				})?
 		};
-		if target >= EMPTY_PRIMITIVE_INT64_SUM_BUCKET as usize {
+		if target >= EMPTY_PRIMITIVE_INT64_BUCKET as usize {
 			return Err(ExecutionError::Kernel {
-				message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+				message: "primitive Int64 grouped aggregate exceeds u32 entry range".to_string(),
 			});
 		}
 		let bucket_count = target
 			.checked_mul(2)
 			.ok_or_else(|| ExecutionError::Kernel {
-				message: "primitive Int64 grouped SUM bucket capacity overflow".to_string(),
+				message: "primitive Int64 grouped aggregate bucket capacity overflow".to_string(),
 			})?;
 
 		let old_bytes = self.accounted_bytes();
@@ -148,7 +168,7 @@ impl PrimitiveInt64SumGroups {
 		let mut keys = Vec::new();
 		keys.try_reserve_exact(target)
 			.map_err(|error| ExecutionError::Kernel {
-				message: format!("primitive Int64 grouped SUM key allocation failed: {error}"),
+				message: format!("primitive Int64 grouped key allocation failed: {error}"),
 			})?;
 		let key_bytes = primitive_capacity_bytes::<i64>(keys.capacity());
 		self.guard_peak(old_bytes.saturating_add(key_bytes), cap)?;
@@ -165,7 +185,7 @@ impl PrimitiveInt64SumGroups {
 		totals
 			.try_reserve_exact(target)
 			.map_err(|error| ExecutionError::Kernel {
-				message: format!("primitive Int64 grouped SUM state allocation failed: {error}"),
+				message: format!("primitive Int64 grouped state allocation failed: {error}"),
 			})?;
 		let total_bytes = primitive_capacity_bytes::<i128>(totals.capacity());
 		self.guard_peak(
@@ -188,7 +208,7 @@ impl PrimitiveInt64SumGroups {
 		buckets
 			.try_reserve_exact(bucket_count)
 			.map_err(|error| ExecutionError::Kernel {
-				message: format!("primitive Int64 grouped SUM bucket allocation failed: {error}"),
+				message: format!("primitive Int64 grouped bucket allocation failed: {error}"),
 			})?;
 		let bucket_bytes = primitive_capacity_bytes::<u32>(buckets.capacity());
 		let peak = old_bytes
@@ -196,11 +216,11 @@ impl PrimitiveInt64SumGroups {
 			.saturating_add(total_bytes)
 			.saturating_add(bucket_bytes);
 		self.guard_peak(peak, cap)?;
-		buckets.resize(bucket_count, EMPTY_PRIMITIVE_INT64_SUM_BUCKET);
+		buckets.resize(bucket_count, EMPTY_PRIMITIVE_INT64_BUCKET);
 		for (entry, key) in keys.iter().copied().enumerate() {
 			let bucket = Self::find_bucket_in(&self.hasher, &buckets, &keys, key)?;
 			buckets[bucket] = u32::try_from(entry).map_err(|_| ExecutionError::Kernel {
-				message: "primitive Int64 grouped SUM exceeds u32 entry range".to_string(),
+				message: "primitive Int64 grouped aggregate exceeds u32 entry range".to_string(),
 			})?;
 		}
 
@@ -222,7 +242,7 @@ impl PrimitiveInt64SumGroups {
 		}
 		let bucket = Self::find_bucket_in(&self.hasher, &self.buckets, &self.keys, key)?;
 		let entry = self.buckets[bucket];
-		Ok((entry != EMPTY_PRIMITIVE_INT64_SUM_BUCKET).then_some(entry as usize))
+		Ok((entry != EMPTY_PRIMITIVE_INT64_BUCKET).then_some(entry as usize))
 	}
 
 	fn find_bucket_in(
@@ -233,13 +253,14 @@ impl PrimitiveInt64SumGroups {
 	) -> Result<usize, ExecutionError> {
 		if buckets.is_empty() || !buckets.len().is_power_of_two() {
 			return Err(ExecutionError::Kernel {
-				message: "primitive Int64 grouped SUM has invalid bucket capacity".to_string(),
+				message: "primitive Int64 grouped aggregate has invalid bucket capacity"
+					.to_string(),
 			});
 		}
 		let mut bucket = (hasher.hash_one(key) as usize) & (buckets.len() - 1);
 		for _ in 0..buckets.len() {
 			let entry = buckets[bucket];
-			if entry == EMPTY_PRIMITIVE_INT64_SUM_BUCKET
+			if entry == EMPTY_PRIMITIVE_INT64_BUCKET
 				|| keys
 					.get(entry as usize)
 					.is_some_and(|candidate| *candidate == key)
@@ -249,7 +270,7 @@ impl PrimitiveInt64SumGroups {
 			bucket = (bucket + 1) & (buckets.len() - 1);
 		}
 		Err(ExecutionError::Kernel {
-			message: "primitive Int64 grouped SUM has no free bucket".to_string(),
+			message: "primitive Int64 grouped aggregate has no free bucket".to_string(),
 		})
 	}
 
@@ -257,7 +278,7 @@ impl PrimitiveInt64SumGroups {
 		if requested > cap {
 			return Err(super::join::budget_exhausted(
 				BudgetDimension::Memory,
-				PRIMITIVE_INT64_SUM_PRODUCER,
+				PRIMITIVE_INT64_PRODUCER,
 				requested,
 				cap,
 			));
@@ -276,6 +297,16 @@ impl PrimitiveInt64SumGroups {
 		output_schema: &SchemaRef,
 		memory_cap: u64,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let retained_cap = super::join::join_spill_retained_footprint_memory_cap(memory_cap);
+		self.finish_with_retained_cap(output_schema, memory_cap, retained_cap)
+	}
+
+	fn finish_with_retained_cap(
+		self,
+		output_schema: &SchemaRef,
+		memory_cap: u64,
+		retained_cap: u64,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let output_cap = super::join::join_output_materialization_memory_cap(memory_cap);
 		let output_bytes = primitive_capacity_bytes::<i64>(self.keys.len()).saturating_add(
 			match output_schema.field(1).data_type() {
@@ -287,7 +318,7 @@ impl PrimitiveInt64SumGroups {
 		if output_bytes > output_cap {
 			return Err(super::join::budget_exhausted(
 				BudgetDimension::Memory,
-				"primitive Int64 grouped SUM output",
+				"primitive Int64 grouped aggregate output",
 				output_bytes,
 				output_cap,
 			));
@@ -296,12 +327,9 @@ impl PrimitiveInt64SumGroups {
 			let conversion_peak = self
 				.accounted_bytes()
 				.saturating_add(primitive_capacity_bytes::<i64>(self.totals.len()));
-			self.guard_peak(
-				conversion_peak,
-				super::join::join_spill_retained_footprint_memory_cap(memory_cap),
-			)?;
+			self.guard_peak(conversion_peak, retained_cap)?;
 		}
-		let PrimitiveInt64SumGroups {
+		let PrimitiveInt64Groups {
 			buckets,
 			keys,
 			totals,
@@ -330,7 +358,9 @@ impl PrimitiveInt64SumGroups {
 			) as ArrayRef,
 			data_type => {
 				return Err(ExecutionError::InvalidExpression {
-					message: format!("primitive Int64 grouped SUM cannot produce {data_type:?}"),
+					message: format!(
+						"primitive Int64 grouped aggregate cannot produce {data_type:?}"
+					),
 				});
 			}
 		};
@@ -520,6 +550,19 @@ impl Executor {
 				.await
 				.map(Some);
 		}
+		if let Some(spec) =
+			primitive_int64_count_spec(&streaming_input, group_expr, aggr_expr, output_schema)
+		{
+			return self
+				.execute_primitive_int64_count_grouped_scan(
+					&streaming_input,
+					spec,
+					output_schema,
+					morsel,
+				)
+				.await
+				.map(Some);
+		}
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.expect("streaming scan grouped aggregate input should build a ScanRequest");
@@ -597,7 +640,7 @@ impl Executor {
 		);
 		let started = Instant::now();
 		let mut rows = 0usize;
-		let mut groups = PrimitiveInt64SumGroups::new();
+		let mut groups = PrimitiveInt64Groups::new();
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
 			let Some(batch) = stream.next().await else {
 				break;
@@ -666,6 +709,63 @@ impl Executor {
 		}
 		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
 		groups.finish(output_schema, self.context.task_budget.memory.get())
+	}
+
+	async fn execute_primitive_int64_count_grouped_scan(
+		&self,
+		streaming_input: &StreamingScanGroupedInput<'_>,
+		spec: PrimitiveInt64CountSpec,
+		output_schema: &SchemaRef,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let req = self
+			.bound_scan_request(streaming_input.scan_input.scan, morsel)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "primitive Int64 grouped COUNT lost its scan request".to_string(),
+			})?;
+		let row_limit = req.row_limit;
+		let span = crate::telemetry::storage_scan_span(&req);
+		let stream = self.storage.scan(req).instrument(span).await?;
+		let mut stream = stream.into_batches();
+		let cap = self.context.task_budget.memory.get();
+		let started = Instant::now();
+		let mut rows = 0usize;
+		let mut groups = PrimitiveInt64Groups::new();
+		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
+			let Some(batch) = stream.next().await else {
+				break;
+			};
+			let batch = batch?;
+			let batch = if let Some(limit) = row_limit {
+				let remaining = limit - rows;
+				if batch.num_rows() > remaining {
+					batch.slice(0, remaining)
+				} else {
+					batch
+				}
+			} else {
+				batch
+			};
+			rows = rows.saturating_add(batch.num_rows());
+			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			let keys = batch
+				.column(spec.group_column.0 as usize)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "primitive grouped COUNT key must be Int64".to_string(),
+				})?;
+			if keys.null_count() != 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: "primitive grouped COUNT received a null key".to_string(),
+				});
+			}
+			for row in 0..batch.num_rows() {
+				groups.insert(keys.value(row), 1, cap)?;
+			}
+		}
+		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
+		groups.finish_with_retained_cap(output_schema, self.context.task_budget.memory.get(), cap)
 	}
 
 	fn apply_streaming_scan_input_ops(
@@ -949,8 +1049,54 @@ fn primitive_int64_sum_spec(
 	})
 }
 
+fn primitive_int64_count_spec(
+	input: &StreamingScanGroupedInput<'_>,
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	output_schema: &SchemaRef,
+) -> Option<PrimitiveInt64CountSpec> {
+	if !primitive_int64_count_enabled()
+		|| input.exchange.is_none()
+		|| input.scan_input.scan_filter_predicate.is_some()
+		|| input.scan_input.project.is_some()
+		|| input.scan_input.project_filter_predicate.is_some()
+	{
+		return None;
+	}
+	let group = group_expr.single_column_root()?;
+	let input_schema = input.scan_input.output_schema();
+	let group_field = input_schema.fields().get(group.ordinal.0 as usize)?;
+	let [call] = aggr_expr else {
+		return None;
+	};
+	let count_rows = matches!(call.function, AggregateFunction::CountAll)
+		|| (matches!(call.function, AggregateFunction::Count)
+			&& matches!(
+				call.args
+					.single_root()
+					.and_then(|root| call.args.node(root)),
+				Some(BoundExprNode::Literal(_))
+			) && call.args.root_nullable(0) == Some(false));
+	if !count_rows
+		|| group.data_type != DataType::Int64
+		|| group.nullable
+		|| group_field.data_type() != &DataType::Int64
+		|| group_field.is_nullable()
+		|| output_schema.fields().len() != 2
+		|| output_schema.field(0).data_type() != &DataType::Int64
+		|| output_schema.field(0).is_nullable()
+		|| output_schema.field(1).data_type() != &DataType::Int64
+		|| output_schema.field(1).is_nullable()
+	{
+		return None;
+	}
+	Some(PrimitiveInt64CountSpec {
+		group_column: group.ordinal,
+	})
+}
+
 fn record_primitive_int64_sum_profile(
-	groups: &PrimitiveInt64SumGroups,
+	groups: &PrimitiveInt64Groups,
 	cap: u64,
 	elapsed: std::time::Duration,
 ) {
@@ -3292,7 +3438,7 @@ mod tests {
 
 	#[test]
 	fn primitive_int64_sum_groups_are_compact_guarded_and_exact() {
-		let mut groups = PrimitiveInt64SumGroups::new();
+		let mut groups = PrimitiveInt64Groups::new();
 		let cap = 1024 * 1024;
 		for key in 0..1_025i64 {
 			groups.insert(key, i128::from(key), cap).expect("insert");
@@ -3317,7 +3463,7 @@ mod tests {
 
 	#[test]
 	fn primitive_int64_sum_growth_guard_is_preallocation() {
-		let mut groups = PrimitiveInt64SumGroups::new();
+		let mut groups = PrimitiveInt64Groups::new();
 		let initial_bytes = primitive_capacity_bytes::<i64>(1024)
 			.saturating_add(primitive_capacity_bytes::<i128>(1024))
 			.saturating_add(primitive_capacity_bytes::<u32>(2048));
@@ -3328,7 +3474,7 @@ mod tests {
 			error,
 			ExecutionError::BudgetExhausted {
 				dimension: BudgetDimension::Memory,
-				producer: PRIMITIVE_INT64_SUM_PRODUCER,
+				producer: PRIMITIVE_INT64_PRODUCER,
 				..
 			}
 		));
@@ -3374,7 +3520,7 @@ mod tests {
 		let generic = executor
 			.bound_grouped_aggregate(&[batch.clone()], &group_expr, &aggr_expr, &output_schema)
 			.expect("generic grouped fold");
-		let mut primitive = PrimitiveInt64SumGroups::new();
+		let mut primitive = PrimitiveInt64Groups::new();
 		let keys = batch
 			.column(0)
 			.as_any()
@@ -3401,12 +3547,60 @@ mod tests {
 	}
 
 	#[test]
+	fn adr495_primitive_int64_count_matches_generic_grouped_fold() {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"order_key",
+			DataType::Int64,
+			false,
+		)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(Int64Array::from(vec![2, 1, 2, i64::MIN]))],
+		)
+		.expect("input batch");
+		let group_expr = column_program("order_key", ColumnOrdinal(0), DataType::Int64, false);
+		let aggr_expr = vec![BoundAggregateCall {
+			function: AggregateFunction::CountAll,
+			args: BoundExprProgram::empty(),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("row_count", DataType::Int64, false),
+		]));
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let generic = executor
+			.bound_grouped_aggregate(&[batch.clone()], &group_expr, &aggr_expr, &output_schema)
+			.expect("generic grouped count");
+		let keys = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 keys");
+		let mut primitive = PrimitiveInt64Groups::new();
+		for key in keys.values() {
+			primitive
+				.insert(*key, 1, 1024 * 1024)
+				.expect("primitive count insert");
+		}
+		let primitive = primitive
+			.finish(&output_schema, 64 * 1024 * 1024)
+			.expect("primitive count finish");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&primitive, SortPolicy::FullRowLex)
+				.expect("primitive digest"),
+			canonical_arrow_ipc_digest(&generic, SortPolicy::FullRowLex).expect("generic digest")
+		);
+	}
+
+	#[test]
 	fn primitive_int64_sum_int64_finalize_checks_output_range() {
 		let output_schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Int64, false),
 			Field::new("sum", DataType::Int64, true),
 		]));
-		let mut valid = PrimitiveInt64SumGroups::new();
+		let mut valid = PrimitiveInt64Groups::new();
 		valid.insert(1, 10, 1024 * 1024).expect("first value");
 		valid.insert(1, -3, 1024 * 1024).expect("second value");
 		let output = valid
@@ -3419,7 +3613,7 @@ mod tests {
 			.expect("Int64 sum");
 		assert_eq!(sums.value(0), 7);
 
-		let mut overflow = PrimitiveInt64SumGroups::new();
+		let mut overflow = PrimitiveInt64Groups::new();
 		overflow
 			.insert(1, i128::from(i64::MAX) + 1, 1024 * 1024)
 			.expect("i128 accumulator accepts value");
@@ -3503,6 +3697,61 @@ mod tests {
 		};
 		assert!(
 			primitive_int64_sum_spec(&no_exchange, &group_expr, &aggr_expr, &output_schema)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn adr495_primitive_int64_count_selection_is_structural_and_budgeted_by_default() {
+		assert!(primitive_int64_count_enabled_from_env(None));
+		assert!(primitive_int64_count_enabled_from_env(Some("1")));
+		assert!(!primitive_int64_count_enabled_from_env(Some("0")));
+
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"order_key",
+			DataType::Int64,
+			false,
+		)]));
+		let scan = ExecutionPlan::EmptyRelation {
+			schema: schema.clone(),
+		};
+		let group_expr = column_program("order_key", ColumnOrdinal(0), DataType::Int64, false);
+		let mut literal = BoundExprProgramBuilder::new();
+		let one = literal.append_literal(ScalarValue::Int64(Some(1)));
+		literal.push_root(one);
+		let count = vec![BoundAggregateCall {
+			function: AggregateFunction::Count,
+			args: literal.build(),
+		}];
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("order_key", DataType::Int64, false),
+			Field::new("row_count", DataType::Int64, false),
+		]));
+		let input = StreamingScanGroupedInput {
+			scan_input: StreamingScanGlobalInput {
+				scan: &scan,
+				scan_filter_predicate: None,
+				project: None,
+				project_filter_predicate: None,
+			},
+			exchange: Some((4, &group_expr)),
+		};
+		assert!(primitive_int64_count_spec(&input, &group_expr, &count, &output_schema).is_some());
+
+		let count_all = vec![BoundAggregateCall {
+			function: AggregateFunction::CountAll,
+			args: BoundExprProgram::empty(),
+		}];
+		assert!(
+			primitive_int64_count_spec(&input, &group_expr, &count_all, &output_schema).is_some()
+		);
+
+		let column_count = vec![BoundAggregateCall {
+			function: AggregateFunction::Count,
+			args: group_expr.clone(),
+		}];
+		assert!(
+			primitive_int64_count_spec(&input, &group_expr, &column_count, &output_schema)
 				.is_none()
 		);
 	}
