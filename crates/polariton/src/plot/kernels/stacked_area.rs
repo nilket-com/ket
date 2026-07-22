@@ -381,8 +381,8 @@ pub fn prepare_stacked_area_data(
 	let mut max_sum = 0.0f64;
 	for x_idx in 0..num_xs {
 		let mut current_sum = 0.0f64;
-		for cat_idx in 0..num_cats {
-			current_sum += category_values[cat_idx][x_idx];
+		for values in category_values.iter().take(num_cats) {
+			current_sum += values[x_idx];
 		}
 		if current_sum > max_sum {
 			max_sum = current_sum;

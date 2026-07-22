@@ -232,28 +232,26 @@ where
 			let dist = ((drag.current.x - drag.origin.x).powi(2)
 				+ (drag.current.y - drag.origin.y).powi(2))
 			.sqrt();
-			if dist > PANE_DRAG_DEADBAND {
-				if let Some(target) = &widget_state.drop_target {
-					if let Some(&(_, bounds)) = widget_state
-						.pane_bounds
-						.iter()
-						.find(|(id, _)| *id == target.pane)
-					{
-						let overlay_bounds = drop_overlay_bounds(bounds, target.edge) + offset;
-						renderer.fill_quad(
-							renderer::Quad {
-								bounds: overlay_bounds,
-								border: iced::Border {
-									color: self.style.handle.border_color,
-									width: 1.0,
-									radius: 0.0.into(),
-								},
-								..renderer::Quad::default()
-							},
-							self.style.drop_overlay_color,
-						);
-					}
-				}
+			if dist > PANE_DRAG_DEADBAND
+				&& let Some(target) = &widget_state.drop_target
+				&& let Some(&(_, bounds)) = widget_state
+					.pane_bounds
+					.iter()
+					.find(|(id, _)| *id == target.pane)
+			{
+				let overlay_bounds = drop_overlay_bounds(bounds, target.edge) + offset;
+				renderer.fill_quad(
+					renderer::Quad {
+						bounds: overlay_bounds,
+						border: iced::Border {
+							color: self.style.handle.border_color,
+							width: 1.0,
+							radius: 0.0.into(),
+						},
+						..renderer::Quad::default()
+					},
+					self.style.drop_overlay_color,
+				);
 			}
 		}
 	}
@@ -300,15 +298,15 @@ where
 		let origin = layout.bounds().position();
 		let widget_bounds = layout.bounds();
 
-		if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
-			if self.style.chrome == ChromeVisibility::OnHover {
-				let inside = cursor
-					.position()
-					.is_some_and(|pos| widget_bounds.contains(pos));
-				if inside != widget_state.cursor_inside {
-					widget_state.cursor_inside = inside;
-					shell.request_redraw();
-				}
+		if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event
+			&& self.style.chrome == ChromeVisibility::OnHover
+		{
+			let inside = cursor
+				.position()
+				.is_some_and(|pos| widget_bounds.contains(pos));
+			if inside != widget_state.cursor_inside {
+				widget_state.cursor_inside = inside;
+				shell.request_redraw();
 			}
 		}
 

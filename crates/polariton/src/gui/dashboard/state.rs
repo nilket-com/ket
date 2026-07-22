@@ -7,20 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
 pub struct DashboardState {
 	pub panes: Option<PaneState>,
 	pub content: HashMap<PaneId, PlotPaneState>,
 	resize_freeze_until: Option<Instant>,
-}
-
-impl Default for DashboardState {
-	fn default() -> Self {
-		Self {
-			panes: None,
-			content: HashMap::new(),
-			resize_freeze_until: None,
-		}
-	}
 }
 
 pub enum DashboardEffect {

@@ -1170,7 +1170,7 @@ fn render_pane_viewport(
 			.active_language_id
 			.and_then(|id| lang_registry.get_provider(id))
 			.filter(|provider| provider.label() == "Markdown")
-			.and_then(|_| tab.document.root_id)
+			.and(tab.document.root_id)
 			.and_then(|root_id| {
 				read_document_snapshot(
 					registry,

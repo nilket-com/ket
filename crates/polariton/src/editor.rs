@@ -156,7 +156,7 @@ pub struct MarkdownCellExecution {
 enum NotebookCellOutput {
 	Running,
 	Table(Box<DataFrame>),
-	Plot { surface: NotebookPlotSurface },
+	Plot { surface: Box<NotebookPlotSurface> },
 	Failed(String),
 	Message(String),
 }
@@ -403,7 +403,7 @@ impl CodeEditor {
 		self.notebook_outputs.insert(
 			identity,
 			NotebookCellOutput::Plot {
-				surface: NotebookPlotSurface::new(composition, kernel),
+				surface: Box::new(NotebookPlotSurface::new(composition, kernel)),
 			},
 		);
 	}
@@ -2745,7 +2745,7 @@ mod tests {
 			.iter()
 			.find(|d| d.axis == SplitDirection::Horizontal)
 			.expect("horizontal divider")
-			.clone();
+			.to_owned();
 		// A point squarely inside the hit band, in editor-local pixels.
 		let band_row = divider.hit_rect.screen_row.get();
 		let local_y = (band_row as f32 + 0.5) * metrics::LINE_HEIGHT;
@@ -2808,7 +2808,7 @@ mod tests {
 			.iter()
 			.find(|d| d.axis == SplitDirection::Horizontal)
 			.expect("a horizontal split projects a horizontal divider")
-			.clone();
+			.to_owned();
 
 		// The one-row visual gap would be a ~22px grab target. The engine widens
 		// it upward, while leaving the lower pane's title bar exclusively for
@@ -3702,7 +3702,7 @@ mod tests {
 		);
 		editor.begin_markdown_cell(sql_identity);
 		assert!(
-			editor.named_notebook_cell_data().get("trips").is_none(),
+			!editor.named_notebook_cell_data().contains_key("trips"),
 			"rerunning a SQL cell retires its prior snapshot before Rune can read stale data"
 		);
 

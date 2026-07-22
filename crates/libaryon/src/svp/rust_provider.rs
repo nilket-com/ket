@@ -284,15 +284,15 @@ impl LanguageProvider for RustProvider {
 			return analyze_workspace_file(fallback, file_id, content, global_offset);
 		}
 
-		if let Some(path) = canonical_path {
-			if let Some(initialized) = initialize_workspace(path.clone()) {
-				let key = initialized.key.clone();
-				state.install_workspace(initialized);
-				if let Some(workspace) = state.workspaces.get_mut(&key)
-					&& let Some(file_id) = workspace.file_ids.get(&VfsPath::from(path)).copied()
-				{
-					return analyze_workspace_file(workspace, file_id, content, global_offset);
-				}
+		if let Some(path) = canonical_path
+			&& let Some(initialized) = initialize_workspace(path.clone())
+		{
+			let key = initialized.key.clone();
+			state.install_workspace(initialized);
+			if let Some(workspace) = state.workspaces.get_mut(&key)
+				&& let Some(file_id) = workspace.file_ids.get(&VfsPath::from(path)).copied()
+			{
+				return analyze_workspace_file(workspace, file_id, content, global_offset);
 			}
 		}
 

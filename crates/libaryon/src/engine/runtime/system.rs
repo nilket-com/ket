@@ -103,7 +103,7 @@ fn write_init_file_at(
 		if is_generated_init(contents) {
 			render_init_file(settings)
 		} else {
-			update_init_file(&contents, settings, language_registry)?
+			update_init_file(contents, settings, language_registry)?
 		}
 	} else {
 		render_init_file(settings)
@@ -379,7 +379,7 @@ fn is_config_operation(source: &str, expression: &ast::Expr, binding: &str) -> b
 	.is_some()
 }
 
-fn span_text<'a>(source: &'a str, span: ast::Span) -> &'a str {
+fn span_text(source: &str, span: ast::Span) -> &str {
 	&source[span_range(span)]
 }
 

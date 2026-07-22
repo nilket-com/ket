@@ -656,7 +656,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			});
 		}
 		Message::ExportWithWindowSize(format, window_size) => {
-			if app_state.dashboard.panes.is_some() {
+			if let Some(dashboard) = app_state.dashboard.panes.as_ref() {
 				let size = window_size.unwrap_or(Size::new(1920.0, 1080.0));
 				let workspace_bounds = workspace_bounds(size);
 				let dashboard_pane_bounds = app_state
@@ -669,7 +669,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						height: rect.height,
 					})
 					.unwrap_or(workspace_bounds);
-				let dashboard = app_state.dashboard.panes.as_ref().unwrap();
 				let mut export_jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
 				for (id, rect) in get_pane_rects(dashboard, dashboard_pane_bounds) {
 					if let Some(plot_state) = app_state.dashboard.content.get(&id) {

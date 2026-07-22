@@ -155,21 +155,17 @@ fn parse_set_operation(name: &str, value: Value) -> Result<ConfigOperation, Stri
 		// Value validity is checked here, not only at apply time: a deferred
 		// handle promises call-site errors, so `?` in user scripts must be
 		// able to observe an unknown theme or durability mode.
-		"theme" => match string_value(&value, name) {
-			Ok(value) => {
-				Theme::try_new(&value).map_err(|error| error.to_string())?;
-				OptionValue::String(value)
-			}
-			Err(error) => return Err(error),
-		},
-		"savedurability" => match string_value(&value, name) {
-			Ok(value) => {
-				crate::engine::settings::SaveDurability::parse(&value)
-					.ok_or_else(|| "Usage: set savedurability atomic|bounded".to_string())?;
-				OptionValue::String(value)
-			}
-			Err(error) => return Err(error),
-		},
+		"theme" => {
+			let value = string_value(&value, name)?;
+			Theme::try_new(&value).map_err(|error| error.to_string())?;
+			OptionValue::String(value)
+		}
+		"savedurability" => {
+			let value = string_value(&value, name)?;
+			crate::engine::settings::SaveDurability::parse(&value)
+				.ok_or_else(|| "Usage: set savedurability atomic|bounded".to_string())?;
+			OptionValue::String(value)
+		}
 		"gitrefresh" => match value.as_integer::<i64>() {
 			Ok(value) if (0..=86_400).contains(&value) => OptionValue::Integer(value),
 			Ok(_) => return Err(expected(name, "integer from 0 to 86400")),

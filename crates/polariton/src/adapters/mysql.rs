@@ -79,9 +79,9 @@ async fn mysql_to_df(mut conn: mysql_async::Conn, query: &str) -> Result<DataFra
 	let mut column_data: Vec<Vec<AnyValue>> = vec![Vec::new(); width];
 	let rows: Vec<mysql_async::Row> = conn.exec(stmt, ()).await?;
 	for mut row in rows {
-		for i in 0..width {
+		for (i, values) in column_data.iter_mut().enumerate().take(width) {
 			let val = row.take::<MySqlValue, usize>(i).unwrap_or(MySqlValue::NULL);
-			column_data[i].push(mysql_value_to_any(val));
+			values.push(mysql_value_to_any(val));
 		}
 	}
 	let polars_columns: Vec<Column> = col_names

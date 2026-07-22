@@ -449,9 +449,10 @@ where
 			}
 			Event::Window(window::Event::RedrawRequested(now)) => {
 				if let Some(close_at) = widget_state.pending_close_at {
-					if widget_state.keyboard_navigation || self.state.open_root().is_none() {
-						widget_state.pending_close_at = None;
-					} else if geometry.contains(cursor) {
+					if widget_state.keyboard_navigation
+						|| self.state.open_root().is_none()
+						|| geometry.contains(cursor)
+					{
 						widget_state.pending_close_at = None;
 					} else if *now >= close_at {
 						widget_state.clear();
@@ -559,36 +560,36 @@ where
 							shell.capture_event();
 						}
 					}
-					keyboard::key::Key::Named(keyboard::key::Named::Enter) => {
-						if self.state.open_root().is_some() {
-							self.cancel_pending_close(widget_state, shell);
-							widget_state.keyboard_navigation = true;
-							widget_state.sync(&self.roots, self.state);
+					keyboard::key::Key::Named(keyboard::key::Named::Enter)
+						if self.state.open_root().is_some() =>
+					{
+						self.cancel_pending_close(widget_state, shell);
+						widget_state.keyboard_navigation = true;
+						widget_state.sync(&self.roots, self.state);
 
-							if let Some((depth, items)) =
-								focused_panel_items(&self.roots, self.state, widget_state)
-								&& let Some(focused_id) =
-									widget_state.focus_path.get(depth).map(String::as_str)
-							{
-								match selectable_item(items, focused_id) {
-									Some(MenuItem::Action { id, .. }) => {
-										shell.publish(MenuMessage::Invoke(id.clone()));
-										widget_state.clear();
-									}
-									Some(MenuItem::Submenu { id, .. }) => {
-										widget_state.focus_submenu(items, depth, id);
-										shell.publish(MenuMessage::OpenSubmenu {
-											depth,
-											id: id.clone(),
-										});
-									}
-									_ => {}
+						if let Some((depth, items)) =
+							focused_panel_items(&self.roots, self.state, widget_state)
+							&& let Some(focused_id) =
+								widget_state.focus_path.get(depth).map(String::as_str)
+						{
+							match selectable_item(items, focused_id) {
+								Some(MenuItem::Action { id, .. }) => {
+									shell.publish(MenuMessage::Invoke(id.clone()));
+									widget_state.clear();
 								}
+								Some(MenuItem::Submenu { id, .. }) => {
+									widget_state.focus_submenu(items, depth, id);
+									shell.publish(MenuMessage::OpenSubmenu {
+										depth,
+										id: id.clone(),
+									});
+								}
+								_ => {}
 							}
-
-							shell.request_redraw();
-							shell.capture_event();
 						}
+
+						shell.request_redraw();
+						shell.capture_event();
 					}
 					_ => {}
 				}

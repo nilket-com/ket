@@ -587,11 +587,11 @@ where
 							_clipboard.write(Kind::Standard, out);
 						}
 					}
-					keyboard::Key::Named(keyboard::key::Named::Escape) => {
-						if state.selection.is_some() {
-							state.selection = None;
-							shell.request_redraw();
-						}
+					keyboard::Key::Named(keyboard::key::Named::Escape)
+						if state.selection.is_some() =>
+					{
+						state.selection = None;
+						shell.request_redraw();
 					}
 					_ => {}
 				}

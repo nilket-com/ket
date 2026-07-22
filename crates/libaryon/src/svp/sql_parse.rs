@@ -44,9 +44,9 @@ pub fn shadow_mask_sql(bytes: &[u8]) -> ShadowMask {
 		}
 
 		let (kind, close) = match bytes[i + 1] {
-			b'{' => (MacroKind::Expression, [b'}', b'}']),
-			b'%' => (MacroKind::Block, [b'%', b'}']),
-			b'#' => (MacroKind::Comment, [b'#', b'}']),
+			b'{' => (MacroKind::Expression, *b"}}"),
+			b'%' => (MacroKind::Block, *b"%}"),
+			b'#' => (MacroKind::Comment, *b"#}"),
 			_ => {
 				i += 1;
 				continue;

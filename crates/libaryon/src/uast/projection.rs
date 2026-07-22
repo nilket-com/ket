@@ -783,11 +783,7 @@ impl UastRegistry {
 				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
 					return Some(sib);
 				}
-				if let Some(parent) = (*self.edges[curr.index()].get()).parent {
-					curr = parent;
-				} else {
-					return None;
-				}
+				curr = (*self.edges[curr.index()].get()).parent?;
 			}
 		}
 	}
@@ -1282,11 +1278,7 @@ impl UastProjection for UastRegistry {
 				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
 					return Some(sib);
 				}
-				if let Some(p) = (*self.edges[curr.index()].get()).parent {
-					curr = p;
-				} else {
-					return None;
-				}
+				curr = (*self.edges[curr.index()].get()).parent?;
 			}
 		}
 	}

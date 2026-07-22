@@ -373,6 +373,9 @@ pub fn prepare_stacked_bar_data(
 			),
 		}
 	};
+	// Polars values are immutable snapshots here; the map is local to this
+	// preparation pass and is never shared with a mutating categorical mapping.
+	#[allow(clippy::mutable_key_type)]
 	let group_idx_map: HashMap<AnyValue, usize> = groups_series
 		.iter()
 		.enumerate()
