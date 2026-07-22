@@ -5,8 +5,9 @@ on the ADR 501 corrected coordinate so the build target is measured there, not i
 
 ## Batch-size validation (m06-specific, robust)
 
-The ADR 500 single-run sweep had a 65,536 = 1,200 ms point that looked like a hidden optimum. A robust
-3-run median sweep refutes it — that point was noise:
+This is an **m06-specific** robust sweep (3-run medians). It stands on its own — it does not speak to
+the ADR 500 65,536 = 1,200 ms point, which was an **m04** single-run value from the residual
+decomposition, a different query (whether that m04 point was noise is untested here):
 
 | batch | median ms |
 |---:|---:|
@@ -18,9 +19,10 @@ The ADR 500 single-run sweep had a 65,536 = 1,200 ms point that looked like a hi
 | 131,072 | 2,293.0 |
 
 m06 is **flat 4k–16k then rises**: framework savings saturate by ~4k (m06 is framework-light, −5.5%
-total from the ADR 501 correction), and parquet decode penalizes large batches past 16k. 8,192 is on
-m06's optimum plateau; the ADR 501 "16,384 beat 8,192 for m06" was within-noise. So 8,192 is a valid
-coordinate for m06, and its wall is mostly **real engine cost**, not gauge artifact.
+total from the ADR 501 correction), and parquet decode penalizes large batches past 16k (m06's own
+65,536 is 2,125 ms — worse than 8,192, not a hidden optimum; the 56k hypothesis is rejected for m06).
+8,192 is on m06's optimum plateau; the ADR 501 "16,384 beat 8,192 for m06" was within-noise. So 8,192
+is a valid coordinate for m06, and its wall is mostly **real engine cost**, not gauge artifact.
 
 ## Phase ledger @ 8,192 (ledger observer-clean; enabled ≈ disabled)
 
