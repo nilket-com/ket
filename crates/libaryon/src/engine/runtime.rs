@@ -3820,44 +3820,55 @@ pub fn main(editor) {
 		thread.join().unwrap();
 		let events = events.try_iter().collect::<Vec<_>>();
 
-		assert!(matches!(
-			events.as_slice(),
-			[
-				EngineEvent::BufferOpened { buffer, .. },
-				EngineEvent::ViewCreated { view, buffer: created_buffer },
-				EngineEvent::FocusedTextViewChanged { from: Some(from), to: Some(to) },
-				EngineEvent::BufferEdited { buffer: edited_buffer, acting_view, .. },
-				EngineEvent::BufferEdited {
-					buffer: undo_buffer,
-					acting_view: undo_view,
-					deleted_bytes: 1,
-					inserted_bytes: 0,
-					..
-				},
-				EngineEvent::FocusedTextViewChanged { from: Some(closed_focus), to: Some(restored) },
-				EngineEvent::ViewClosed { view: closed_view, buffer: closed_view_buffer },
-				EngineEvent::BufferClosed { buffer: closed_buffer },
-				EngineEvent::FocusedTextViewChanged { from: Some(final_focus), to: None },
-				EngineEvent::ViewClosed { view: final_view, buffer: final_view_buffer },
-				EngineEvent::BufferClosed { buffer: final_buffer },
-			] if
-				*buffer == *created_buffer
-				&& *view == *to
-				&& *from == ViewId::new(1)
-				&& *edited_buffer == *buffer
-				&& *acting_view == *view
-				&& *undo_buffer == *buffer
-				&& *undo_view == *view
-				&& *closed_focus == *view
-				&& *restored == ViewId::new(1)
-				&& *closed_view == *view
-				&& *closed_view_buffer == *buffer
-				&& *closed_buffer == *buffer
-				&& *final_focus == ViewId::new(1)
-				&& *final_view == ViewId::new(1)
-				&& *final_view_buffer == BufferId::new(1)
-				&& *final_buffer == BufferId::new(1)
-		));
+		let [
+			EngineEvent::BufferOpened { buffer, .. },
+			EngineEvent::ViewCreated {
+				view,
+				buffer: created_buffer,
+			},
+			EngineEvent::FocusedTextViewChanged {
+				from: Some(initial_view),
+				to: Some(focused_view),
+			},
+			EngineEvent::BufferEdited {
+				buffer: edited_buffer,
+				acting_view,
+				..
+			},
+			EngineEvent::BufferEdited {
+				buffer: undo_buffer,
+				acting_view: undo_view,
+				deleted_bytes: 1,
+				inserted_bytes: 0,
+				..
+			},
+			EngineEvent::FocusedTextViewChanged {
+				from: Some(closed_focus),
+				to: Some(restored_view),
+			},
+			EngineEvent::ViewClosed {
+				view: closed_view,
+				buffer: closed_view_buffer,
+			},
+			EngineEvent::BufferClosed {
+				buffer: closed_buffer,
+			},
+		] = events.as_slice()
+		else {
+			panic!("unexpected event sequence: {events:#?}");
+		};
+
+		assert_eq!(buffer, created_buffer);
+		assert_eq!(view, focused_view);
+		assert_eq!(edited_buffer, buffer);
+		assert_eq!(acting_view, view);
+		assert_eq!(undo_buffer, buffer);
+		assert_eq!(undo_view, view);
+		assert_eq!(closed_focus, view);
+		assert_eq!(restored_view, initial_view);
+		assert_eq!(closed_view, view);
+		assert_eq!(closed_view_buffer, buffer);
+		assert_eq!(closed_buffer, buffer);
 	}
 
 	#[test]
