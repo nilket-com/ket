@@ -3939,7 +3939,8 @@ impl EditorSession {
 			.layout
 			.split_leaf(self.focused_pane_id, direction, new_pane_id, new_pane)
 		{
-			self.focused_pane_id = new_pane_id;
+			let focused = self.focus_pane(new_pane_id);
+			debug_assert!(focused);
 			true
 		} else {
 			if self.layout.view_count_for_buffer(buffer_id) == 0 {
@@ -3965,7 +3966,8 @@ impl EditorSession {
 			new_pane,
 			new_first,
 		) {
-			self.focused_pane_id = new_pane_id;
+			let focused = self.focus_pane(new_pane_id);
+			debug_assert!(focused);
 			Some(new_pane_id)
 		} else {
 			None
