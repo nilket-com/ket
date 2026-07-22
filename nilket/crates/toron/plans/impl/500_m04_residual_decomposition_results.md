@@ -54,10 +54,52 @@ per-poll tracing span is the other suspect) — **not** projection elision.
 
 ## Forward
 
-- Decide the kernel only after splitting the ~254 ms framework into its components (batch size vs
-  per-poll tracing span vs stream-adapter layers), so the fix targets the dominant one — the same
-  decompose-before-kernel discipline that has repeatedly overturned the intuitive target in this arc.
+- The ~254 ms framework was split (batch size vs per-poll span/adapter) — see "Framework-internal
+  split — RESOLVED" below. Outcome: it is a **gauge artifact, not an engine cut**; the
+  decompose-before-kernel discipline stopped an optimization aimed at a parquet-batch-size artifact.
 - **Parquet-ledger observer-effect note:** the ledger is now +6.7% on bypassed m04 (was +1.3% on the
   pre-bypass ~2 s control) — the bypass halved the wall but not the ledger's absolute per-batch push
   cost. Future m04 paired runs must not arm it without accounting; the O(1)-accumulation rewrite is the
   cleanup that restores it (a diagnostic-harness cut, not engine).
+
+## Framework-internal split — RESOLVED: gauge artifact, no engine cut
+
+A `TORON_TPCH_PARQUET_BATCH_SIZE` probe (diagnostic-only, uncommitted→preserved) swept the tpch
+parquet reader batch size. Using `execute` as ground truth with `fold_micros` as the per-row control:
+
+| batch size | source batches | execute | fold_micros |
+|---:|---:|---:|---:|
+| 1024 (parquet default) | 46,865 | 915.7 ms | 441.4 |
+| 4096 | 11,717 | 697.4 ms | 413.7 |
+| 8192 | 5,859 | 669.2 ms | 402.4 |
+| 16384 | 2,930 | 687.8 ms | 402.0 |
+| 65536 | 733 | 1,200.3 ms | 395.4 |
+
+`fold_micros` is flat (per-row control holds); execute drops **−246 ms (−27%)** from 1,024- to
+8,192-row batches, then rises (U-curve: 65,536 is parquet decode degradation, not a fold effect). So
+the residual is **batch-count-driven** per-batch poll/span/adapter machinery — confirmed.
+
+**But the batch count is a gauge artifact, not an engine property.** Production scan contract (all
+`StorageScan` implementors): the production backends `InMemoryStorageScan` / `InMemoryTableStorage`
+emit **one whole morsel-sliced batch** per scan (`scan_in_memory_batch` → `ScanStream::from_batches(
+…, vec![batch])`, storage.rs:699), and the distributed `TaskInputStorageScan` / `LiveInputStorageScan`
+inherit upstream (in-memory) batch shape. **No production scan path emits ~1K-row batches** — only the
+tpch `ParquetHarnessScan` does, via the parquet reader default. A production m04-shaped scan folds a
+few large in-memory batches and pays ~0 per-batch framework.
+
+Therefore the ~254 ms framework residual is a **gauge-fidelity artifact** (same class as the
+thread-count confound and `stable_file_hash`), and the "engine floor" (~100 ms at 8,192) is itself
+per-batch and would also vanish at production batch sizes. **No engine cut; the span-vs-adapter
+ablation is not warranted** (it would optimize a floor production doesn't pay). The substantive m04
+engine win was the ADR 499 exchange bypass (−51%); this residual is measurement overhead.
+
+## Forward (updated)
+
+- **No m04 engine cut.** The residual is a gauge artifact; m04 is resolved as an engine target.
+- Any adoption of ~8,192 batches must be a **dedicated full-ladder gauge-coordinate change** (ADR 501),
+  explicitly labeled a *Parquet-optimal proxy for production's large-batch contract* — not
+  production-equal (parquet can't emit production's one-giant-batch without its own U-curve decode
+  cost) — with a before/after ladder comparison before any ranking movement is treated as real.
+- The `TORON_TPCH_PARQUET_BATCH_SIZE` env probe is preserved as diagnostic evidence.
+- **Parquet-ledger observer-effect note** stands: +6.7% on bypassed m04; keep it out of decisive pairs
+  until the O(1)-accumulation rewrite.

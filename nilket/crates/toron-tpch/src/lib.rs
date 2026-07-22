@@ -1792,6 +1792,15 @@ impl StorageScan for ParquetHarnessScan {
 			let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves);
 			builder = builder.with_projection(mask);
 		}
+		// ADR 500 framework-split probe: sweep the parquet reader batch size (default 1024) to
+		// isolate per-batch poll/span/adapter cost from per-row cost.
+		if let Some(size) = std::env::var("TORON_TPCH_PARQUET_BATCH_SIZE")
+			.ok()
+			.and_then(|raw| raw.parse::<usize>().ok())
+			.filter(|size| *size > 0)
+		{
+			builder = builder.with_batch_size(size);
+		}
 		let reader = builder.build().map_err(|error| StorageError::Internal {
 			message: format!("open parquet reader {}: {error}", source.path.display()),
 		})?;
