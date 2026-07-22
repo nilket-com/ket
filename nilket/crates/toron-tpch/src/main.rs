@@ -1976,6 +1976,29 @@ fn duckdb_thread_setting() -> Option<String> {
 		.filter(|value| !value.is_empty())
 }
 
+/// A primitive-ladder row compares Toron's one-task coordinate against a one-thread reference.
+/// Do not silently fall back to DuckDB's machine-dependent default parallelism: the recorded
+/// provenance must be the literal single-thread setting before a ladder can run its DuckDB arm.
+fn require_single_thread_duckdb_reference(engines: &[PerfEngine]) -> Result<(), String> {
+	if !engines.contains(&PerfEngine::DuckDb) {
+		return Ok(());
+	}
+	require_single_thread_duckdb_setting(duckdb_thread_setting().as_deref())
+}
+
+fn require_single_thread_duckdb_setting(setting: Option<&str>) -> Result<(), String> {
+	match setting {
+		Some("1") => Ok(()),
+		Some(value) => Err(format!(
+			"primitive ladder requires TORON_TPCH_DUCKDB_THREADS=1 for its DuckDB reference; found {value:?}"
+		)),
+		None => Err(
+			"primitive ladder requires TORON_TPCH_DUCKDB_THREADS=1 for its DuckDB reference; it is unset"
+				.to_string(),
+		),
+	}
+}
+
 fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
 	let threads = duckdb_thread_setting()
 		.map(|threads| format!("SET threads={threads};\n"))
@@ -4687,6 +4710,21 @@ mod tests {
 	}
 
 	#[test]
+	fn primitive_ladder_requires_explicit_single_thread_duckdb() {
+		assert!(require_single_thread_duckdb_setting(Some("1")).is_ok());
+		assert!(
+			require_single_thread_duckdb_setting(None)
+				.expect_err("unset DuckDB thread count must reject")
+				.contains("TORON_TPCH_DUCKDB_THREADS=1")
+		);
+		assert!(
+			require_single_thread_duckdb_setting(Some("16"))
+				.expect_err("parallel DuckDB thread count must reject")
+				.contains("found \"16\"")
+		);
+	}
+
+	#[test]
 	fn perf_summary_deduplicates_row_flags() {
 		let mut first = perf_row_for_engine("duckdb", "q06", 80.0, "duckdb-plan", true);
 		first["flags"] = serde_json::json!(["schema_mismatch"]);
@@ -4834,6 +4872,9 @@ async fn ladder_command(args: &[String]) -> ExitCode {
 		Ok(engines) => engines,
 		Err(message) => return harness_error(&message),
 	};
+	if let Err(message) = require_single_thread_duckdb_reference(&engines) {
+		return harness_error(&message);
+	}
 	let output_dir =
 		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/ladder"));
 	if let Err(error) = std::fs::create_dir_all(&output_dir) {
