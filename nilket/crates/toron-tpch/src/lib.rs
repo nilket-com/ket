@@ -2238,6 +2238,17 @@ fn stable_file_hash(path: &Path) -> Result<String, String> {
 	Ok(format!("fnv1a64:{hash:016x}"))
 }
 
+const SKIP_DATASET_HASH_VERIFY_ENV: &str = "TORON_TPCH_SKIP_DATASET_HASH_VERIFY";
+
+/// Opt-in fast path for measurement sessions. `stable_file_hash` re-reads every (multi-GB) parquet
+/// file in full on each dataset load to verify it against the manifest — ~41% of the load window on
+/// a repeated gauge run. When this env is set, the manifest hash check is skipped (the cheap
+/// path-exists check is kept). Default off: correctness runs keep the full verification. Set it only
+/// when the dataset is known-stable within a measurement session.
+fn skip_dataset_hash_verify() -> bool {
+	std::env::var_os(SKIP_DATASET_HASH_VERIFY_ENV).is_some()
+}
+
 fn dataset_sf_dir_name(scale_factor: f64) -> String {
 	format!("sf{}", scale_factor.to_string().replace('.', "_"))
 }
@@ -2644,11 +2655,13 @@ pub fn load_persisted_tpch_dataset(
 				path.display()
 			));
 		}
-		let observed_hash = stable_file_hash(&path)?;
-		if observed_hash != file_hash {
-			return Err(format!(
-				"manifest table {name} hash mismatch: manifest={file_hash} observed={observed_hash}"
-			));
+		if !skip_dataset_hash_verify() {
+			let observed_hash = stable_file_hash(&path)?;
+			if observed_hash != file_hash {
+				return Err(format!(
+					"manifest table {name} hash mismatch: manifest={file_hash} observed={observed_hash}"
+				));
+			}
 		}
 		tables.insert(
 			name.clone(),
