@@ -16,7 +16,7 @@ use iced::mouse;
 use iced::widget::{
 	Space, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
-use iced::{Background, Color, Element, Event, Length, Subscription, Task, event};
+use iced::{Background, Color, Element, Event, Length, Subscription, Task, event, time};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
@@ -72,6 +72,8 @@ mod metrics {
 #[derive(Clone)]
 pub enum EditorMsg {
 	EngineReady,
+	CursorBlinkTick(time::Instant),
+	WindowFocused(bool),
 	Dashboard(DashboardMsg),
 	Input(InputEvent),
 	Paste(String),
@@ -150,6 +152,51 @@ enum TextQuery {
 	Execution(u64),
 }
 
+const CURSOR_BLINK_INTERVAL: time::Duration = time::Duration::from_millis(500);
+const CURSOR_BLINK_TICK: time::Duration = time::Duration::from_millis(125);
+
+struct CursorBlink {
+	last_activity: time::Instant,
+	now: time::Instant,
+	window_focused: bool,
+}
+
+impl CursorBlink {
+	fn new() -> Self {
+		let now = time::Instant::now();
+		Self {
+			last_activity: now,
+			now,
+			window_focused: true,
+		}
+	}
+
+	fn note_activity(&mut self, now: time::Instant) {
+		self.last_activity = now;
+		self.now = now;
+	}
+
+	fn advance(&mut self, now: time::Instant) {
+		self.now = now;
+	}
+
+	fn set_window_focused(&mut self, focused: bool, now: time::Instant) {
+		self.window_focused = focused;
+		self.note_activity(now);
+	}
+
+	fn visible(&self) -> bool {
+		if !self.window_focused {
+			return true;
+		}
+		let elapsed = self
+			.now
+			.checked_duration_since(self.last_activity)
+			.unwrap_or_default();
+		(elapsed.as_millis() / CURSOR_BLINK_INTERVAL.as_millis()).is_multiple_of(2)
+	}
+}
+
 /// Long-lived owner of Polariton's libaryon session.
 pub struct CodeEditor {
 	engine: Option<EngineHandle>,
@@ -167,6 +214,7 @@ pub struct CodeEditor {
 	text_queries: VecDeque<TextQuery>,
 	next_execution_query: u64,
 	execution_snapshots: HashMap<u64, ExecutionSnapshot>,
+	cursor_blink: CursorBlink,
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
@@ -318,6 +366,7 @@ impl CodeEditor {
 			text_queries: VecDeque::new(),
 			next_execution_query: 0,
 			execution_snapshots: HashMap::new(),
+			cursor_blink: CursorBlink::new(),
 			content_dirty: false,
 			last_pointer: None,
 			last_raw_window: None,
@@ -694,10 +743,21 @@ impl CodeEditor {
 	}
 
 	pub fn subscription(&self) -> Subscription<EditorMsg> {
+		let blink = if self.cursor_blink.window_focused
+			&& self.viewport.as_ref().is_some_and(|viewport| {
+				viewport.focused_pane().is_some_and(|pane| {
+					pane.host_panel.is_none() && pane.markdown_preview.is_none()
+				})
+			}) {
+			time::every(CURSOR_BLINK_TICK).map(EditorMsg::CursorBlinkTick)
+		} else {
+			Subscription::none()
+		};
 		Subscription::batch([
 			event::listen_with(|event, status, _window| editor_input_for(&event, status)),
 			Subscription::run_with(self.engine_wake.clone(), engine_wake_stream)
 				.map(|()| EditorMsg::EngineReady),
+			blink,
 		])
 	}
 
@@ -784,6 +844,13 @@ impl CodeEditor {
 			EditorMsg::EngineReady => {
 				self.poll();
 			}
+			EditorMsg::CursorBlinkTick(now) => {
+				self.cursor_blink.advance(now);
+			}
+			EditorMsg::WindowFocused(focused) => {
+				self.cursor_blink
+					.set_window_focused(focused, time::Instant::now());
+			}
 			EditorMsg::Dashboard(_) => {}
 			EditorMsg::NotebookPlot { identity, message } => {
 				if let Some(NotebookCellOutput::Plot { surface }) =
@@ -796,10 +863,12 @@ impl CodeEditor {
 				code: KeyCode::Char('v'),
 				modifiers,
 			}) if modifiers.contains(Modifiers::CONTROL) && self.is_insert_mode() => {
+				self.cursor_blink.note_activity(time::Instant::now());
 				return iced::clipboard::read()
 					.map(|text| EditorMsg::Paste(text.unwrap_or_default()));
 			}
 			EditorMsg::Input(input) => {
+				self.cursor_blink.note_activity(time::Instant::now());
 				if std::env::var_os("POLARITON_INPUT_TRACE").is_some() {
 					eprintln!("[input-trace] forwarding to engine: {input:?}");
 				}
@@ -815,6 +884,7 @@ impl CodeEditor {
 				self.request_content();
 			}
 			EditorMsg::Paste(text) => {
+				self.cursor_blink.note_activity(time::Instant::now());
 				match self.input.try_send(InputEvent::Paste(text)) {
 					Ok(()) => {}
 					Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Task::none(),
@@ -851,6 +921,7 @@ impl CodeEditor {
 				}
 			}
 			EditorMsg::Click => {
+				self.cursor_blink.note_activity(time::Instant::now());
 				// A pane header may publish its more specific press before the
 				// workspace-wide mouse area publishes this generic click. Do not let
 				// the divider hit band steal a drag the header already owns.
@@ -860,6 +931,7 @@ impl CodeEditor {
 				}
 			}
 			EditorMsg::PaneDragStarted(pane_id) => {
+				self.cursor_blink.note_activity(time::Instant::now());
 				self.drag = None;
 				self.send(EditorCommand::FocusPane(pane_id));
 				self.request_content();
@@ -915,7 +987,9 @@ impl CodeEditor {
 						self.panels
 							.surface(panel, palette, self.show_column_types, dashboard)
 					}
-					None => text_pane_surface(pane, palette, focused),
+					None => {
+						text_pane_surface(pane, palette, focused && self.cursor_blink.visible())
+					}
 				}
 			};
 			let title = pane_title(pane);
@@ -1852,10 +1926,10 @@ fn drop_overlay_rect(bounds: iced::Rectangle, edge: PaneDropEdge) -> iced::Recta
 fn text_pane_surface<'a>(
 	pane: &'a libaryon::uast::projection::PaneViewport,
 	palette: UiPalette,
-	focused: bool,
+	show_cursor: bool,
 ) -> Element<'a, EditorMsg> {
 	let lines = wrap_projected_lines(
-		project_lines(pane, palette.editor_text, palette.accent, focused),
+		project_lines(pane, palette.editor_text, palette.accent, show_cursor),
 		pane,
 	);
 	let gutter_background = color(palette.gutter_surface);
@@ -2254,6 +2328,12 @@ fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
 	// dashboard widgets that capture their own pointer events. These messages
 	// are inert unless the editor has an active drag.
 	match event {
+		Event::Window(iced::window::Event::Focused) => {
+			return Some(EditorMsg::WindowFocused(true));
+		}
+		Event::Window(iced::window::Event::Unfocused) => {
+			return Some(EditorMsg::WindowFocused(false));
+		}
 		Event::Mouse(mouse::Event::CursorMoved { position }) => {
 			return Some(EditorMsg::RawCursorMoved(*position));
 		}
@@ -2893,6 +2973,45 @@ mod tests {
 		let border = focused_pane_border(palette);
 		assert_eq!(border.width, 1.0);
 		assert_eq!(border.color, super::color(palette.accent));
+	}
+
+	#[test]
+	fn cursor_blink_stays_solid_after_activity_and_while_unfocused() {
+		use super::{CURSOR_BLINK_INTERVAL, CursorBlink};
+
+		let start = iced::time::Instant::now();
+		let mut blink = CursorBlink {
+			last_activity: start,
+			now: start,
+			window_focused: true,
+		};
+		assert!(blink.visible());
+
+		blink.advance(start + CURSOR_BLINK_INTERVAL);
+		assert!(!blink.visible(), "the first idle phase hides the cursor");
+		blink.advance(start + CURSOR_BLINK_INTERVAL * 2);
+		assert!(blink.visible(), "the next phase restores the cursor");
+
+		let activity = start + CURSOR_BLINK_INTERVAL * 3;
+		blink.note_activity(activity);
+		assert!(
+			blink.visible(),
+			"activity immediately restores a solid cursor"
+		);
+		blink.advance(activity + CURSOR_BLINK_INTERVAL - iced::time::Duration::from_millis(1));
+		assert!(
+			blink.visible(),
+			"the cursor stays solid for a complete interval after activity"
+		);
+
+		blink.set_window_focused(false, activity + CURSOR_BLINK_INTERVAL);
+		blink.advance(activity + CURSOR_BLINK_INTERVAL * 2);
+		assert!(
+			blink.visible(),
+			"an unfocused window keeps a steady location marker"
+		);
+		blink.set_window_focused(true, activity + CURSOR_BLINK_INTERVAL * 2);
+		assert!(blink.visible(), "refocusing restarts the solid phase");
 	}
 
 	#[test]
