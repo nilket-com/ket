@@ -911,13 +911,10 @@ impl CodeEditor {
 				)
 			} else {
 				match pane.host_panel.as_ref() {
-					Some(panel) => self.panels.surface(
-						panel,
-						focused,
-						palette,
-						self.show_column_types,
-						dashboard,
-					),
+					Some(panel) => {
+						self.panels
+							.surface(panel, palette, self.show_column_types, dashboard)
+					}
 					None => text_pane_surface(pane, palette, focused),
 				}
 			};
@@ -1626,7 +1623,6 @@ impl PanelRegistry {
 	fn surface<'a>(
 		&'a self,
 		panel: &'a libaryon::uast::projection::HostPanelViewport,
-		focused: bool,
 		palette: UiPalette,
 		show_column_types: bool,
 		dashboard: &'a DashboardState,
@@ -1669,11 +1665,6 @@ impl PanelRegistry {
 			}
 		};
 		let surface = color(palette.preview_surface);
-		let border = if focused {
-			color(palette.accent)
-		} else {
-			color(palette.divider_surface)
-		};
 		container(inner)
 			.padding(4)
 			.width(Length::Fill)
@@ -1681,8 +1672,8 @@ impl PanelRegistry {
 			.style(move |_| container::Style {
 				background: Some(Background::Color(surface)),
 				border: iced::Border {
-					color: border,
-					width: if focused { 2.0 } else { 1.0 },
+					color: color(palette.divider_surface),
+					width: 1.0,
 					radius: 0.0.into(),
 				},
 				..Default::default()
@@ -1727,11 +1718,7 @@ fn pane_surface<'a>(
 	} else {
 		palette.tab_surface
 	});
-	let border = color(if focused {
-		palette.accent
-	} else {
-		palette.divider_surface
-	});
+	let content = pane_content_frame(content, focused, palette);
 	container(
 		column![
 			mouse_area(
@@ -1760,12 +1747,48 @@ fn pane_surface<'a>(
 	.height(Length::Fill)
 	.style(move |_| container::Style {
 		border: iced::Border {
-			color: border,
-			width: if focused { 2.0 } else { 1.0 },
+			color: color(palette.divider_surface),
+			width: 1.0,
 			radius: 0.0.into(),
 		},
 		..Default::default()
 	})
+	.into()
+}
+
+const FOCUSED_PANE_BORDER_WIDTH: f32 = 1.0;
+
+fn focused_pane_border(palette: UiPalette) -> iced::Border {
+	iced::Border {
+		color: color(palette.accent),
+		width: FOCUSED_PANE_BORDER_WIDTH,
+		radius: 0.0.into(),
+	}
+}
+
+/// Paint focus after the pane body so opaque gutter, editor, table, and
+/// minimap surfaces cannot clip it. The overlay intentionally consumes the
+/// outermost content pixel instead of changing engine-authored pane geometry.
+fn pane_content_frame<'a>(
+	content: Element<'a, EditorMsg>,
+	focused: bool,
+	palette: UiPalette,
+) -> Element<'a, EditorMsg> {
+	if !focused {
+		return content;
+	}
+	stack![
+		content,
+		container(Space::new())
+			.width(Length::Fill)
+			.height(Length::Fill)
+			.style(move |_| container::Style {
+				border: focused_pane_border(palette),
+				..Default::default()
+			}),
+	]
+	.width(Length::Fill)
+	.height(Length::Fill)
 	.into()
 }
 
@@ -2860,6 +2883,16 @@ mod tests {
 		};
 		let third = widget.ink_handle(&cache, 64, 64);
 		assert_ne!(first.id(), third.id(), "edits must rebuild the ink image");
+	}
+
+	#[test]
+	fn focused_pane_frame_is_a_single_accent_pixel() {
+		use super::focused_pane_border;
+
+		let palette = libaryon::engine::UiPalette::default();
+		let border = focused_pane_border(palette);
+		assert_eq!(border.width, 1.0);
+		assert_eq!(border.color, super::color(palette.accent));
 	}
 
 	#[test]

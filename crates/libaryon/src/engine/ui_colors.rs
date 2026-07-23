@@ -47,7 +47,8 @@ pub struct UiColorSpec {
 	pub summary: &'static str,
 }
 
-const ACCENT: Rgb = Rgb::new(76, 255, 0);
+const ACCENT: Rgb = Rgb::new(255, 255, 255);
+const SEARCH_HIGHLIGHT: Rgb = Rgb::new(76, 255, 0);
 const SURFACE: Rgb = Rgb::new(18, 18, 18);
 const TEXT: Rgb = Rgb::new(218, 218, 218);
 const GIT_GREEN: Rgb = Rgb::new(80, 200, 120);
@@ -101,7 +102,7 @@ pub const UI_COLOR_SPECS: [UiColorSpec; UI_COLOR_COUNT] = [
 		name: "colors.search.highlight",
 		aliases: &["searchhighlight"],
 		parent: None,
-		default: UiColorDefault::Value(ACCENT),
+		default: UiColorDefault::Value(SEARCH_HIGHLIGHT),
 		summary: "Search-match highlight",
 	},
 	UiColorSpec {
@@ -525,7 +526,7 @@ mod tests {
 	#[test]
 	fn built_in_palette_preserves_semantic_differences() {
 		let palette = UiPalette::default();
-		assert_eq!(palette.accent, Rgb::new(76, 255, 0));
+		assert_eq!(palette.accent, Rgb::new(255, 255, 255));
 		assert_eq!(palette.minimap_accent, palette.accent);
 		assert_eq!(palette.surface, Rgb::new(18, 18, 18));
 		assert_eq!(palette.minimap_surface, Rgb::new(16, 20, 28));

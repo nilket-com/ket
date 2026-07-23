@@ -130,20 +130,20 @@ built-in defaults, help text, and completion.
 
 | Canonical key | Legacy alias | Parent | Built-in | Initial consumers |
 |---|---|---|---|---|
-| `colors.accent` | — | — | `#4CFF00` | Unscoped accent uses, including the folded placeholder and busy indicator |
+| `colors.accent` | — | — | `#FFFFFF` | Unscoped accent uses, including the folded placeholder and busy indicator |
 | `colors.surface` | — | — | `#121212` | Shared override for secondary UI surfaces |
 | `colors.text` | — | — | `#DADADA` | Shared override for ordinary chrome text |
 | `colors.editor.background` | `background` | — | `#121212` | Editor content background when no pane-local override applies |
 | `colors.editor.text` | — | — | `#DADADA` | Plain editor text not assigned a UAST syntax color |
 | `colors.search.highlight` | `searchhighlight` | — | `#4CFF00` | Search matches and minimap search markers |
-| `colors.minimap.accent` | — | `colors.accent` | `#4CFF00` | Viewport frame and cursor-line marker in terminal and image renderers |
+| `colors.minimap.accent` | — | `colors.accent` | `#FFFFFF` | Viewport frame and cursor-line marker in terminal and image renderers |
 | `colors.minimap.surface` | — | `colors.surface` | `#10141C` | Minimap background in terminal and image renderers |
-| `colors.gutter.accent` | — | `colors.accent` | `#4CFF00` | Current-line number and other location indicators in the gutter |
+| `colors.gutter.accent` | — | `colors.accent` | `#FFFFFF` | Current-line number and other location indicators in the gutter |
 | `colors.gutter.surface` | — | `colors.surface` | `#121212` | Line-number gutter background |
 | `colors.gutter.text` | — | `colors.text` | `#6C6C6C` | Non-current line numbers and gutter text |
 | `colors.status.surface` | — | `colors.surface` | `#121212` | Status bar background |
 | `colors.status.text` | — | `colors.text` | `#FFFFFF` | Ordinary status text |
-| `colors.tab.accent` | — | `colors.accent` | `#4CFF00` | Active document-tab foreground |
+| `colors.tab.accent` | — | `colors.accent` | `#FFFFFF` | Active document-tab foreground |
 | `colors.tab.surface` | — | `colors.surface` | `#0C0E12` | Document-tab bar background |
 | `colors.tab.active.surface` | — | — | `#20262E` | Contrasting tab surface; used as the active-tab background in focused panes and the bar background in unfocused panes |
 | `colors.tab.text` | — | `colors.text` | `#949494` | Inactive document-tab text |
@@ -186,7 +186,7 @@ scoped user value
 For example:
 
 ```text
-colors.minimap.accent -> colors.accent -> #4CFF00
+colors.minimap.accent -> colors.accent -> #FFFFFF
 colors.preview.surface -> colors.surface -> #121212
 colors.gutter.text -> colors.text -> #6C6C6C -> #DADADA
 ```
@@ -219,7 +219,7 @@ The value `default` removes an explicit value and resumes fallback:
 
 ```text
 :set colors.minimap.accent default  # follows colors.accent again
-:set colors.accent default          # returns to built-in #4CFF00
+:set colors.accent default          # returns to built-in #FFFFFF
 ```
 
 `default` is a state transition, not a stored color literal. The settings writer omits cleared
@@ -238,8 +238,8 @@ Append `?` to a canonical key or alias to query it without changing settings:
 The result reports both the resolved value and why it has that value:
 
 ```text
-colors.accent = #4CFF00 (built-in default)
-colors.minimap.accent = #4CFF00 (inherited from colors.accent)
+colors.accent = #FFFFFF (built-in default)
+colors.minimap.accent = #FFFFFF (inherited from colors.accent)
 colors.gutter.text = #6C6C6C (scoped built-in default)
 colors.editor.background = #101010 (explicit; queried as background)
 ```
@@ -269,8 +269,8 @@ calling it.
 
 ## Search Highlight and Accent Are Independent
 
-Search highlight and UI accent both default to `#4CFF00` today, but this is a shared default value,
-not an inheritance relationship.
+Search highlight defaults to `#4CFF00`, while the more conservative UI accent defaults to
+`#FFFFFF`. They remain independent settings with no inheritance relationship.
 
 ```text
 colors.search.highlight  - content match visibility
