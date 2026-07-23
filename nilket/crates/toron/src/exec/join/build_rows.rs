@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
 use ahash::RandomState;
+use arrow::array::ArrayRef;
+
+use crate::error::ExecutionError;
 
 use super::JoinKey;
 
@@ -70,6 +73,22 @@ pub(super) fn batched_probe_prefetch_enabled() -> bool {
 	})
 }
 
+const BATCHED_BUILD_PREFETCH_ENV: &str = "TORON_BATCHED_BUILD_PREFETCH";
+
+pub(super) fn batched_build_prefetch_enabled_from_env(value: Option<&str>) -> bool {
+	!matches!(value, Some("0"))
+}
+
+/// ADR 503 ablation: `=0` restores the one-key-at-a-time insert. Default on.
+pub(super) fn batched_build_prefetch_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		batched_build_prefetch_enabled_from_env(
+			std::env::var(BATCHED_BUILD_PREFETCH_ENV).ok().as_deref(),
+		)
+	})
+}
+
 /// Best-effort prefetch of the cache line holding `value`. Additive over the
 /// batching itself; on non-x86_64 targets the staged loads alone provide the
 /// memory-level parallelism and results are byte-identical.
@@ -83,6 +102,57 @@ fn prefetch_read<T>(value: *const T) {
 	}
 	#[cfg(not(target_arch = "x86_64"))]
 	let _ = value;
+}
+
+/// ADR 503: windows primitive build keys through the batched-prefetch insert, mirroring
+/// `probe_primitive_key_rows`. `TORON_BATCHED_BUILD_PREFETCH=0` (window=1, scalar insert)
+/// restores the true one-key-at-a-time path. Returns `Ok(None)` on the memory bail so the
+/// caller can propagate it.
+pub(in crate::exec) fn build_primitive_key_rows<K: Copy>(
+	build_rows: &mut JoinBuildRows,
+	rows: usize,
+	memory_cap: u64,
+	left_key_arrays: &[ArrayRef],
+	inserted_rows: &mut usize,
+	key_at: impl Fn(usize) -> Option<K>,
+	insert_window: impl Fn(&mut JoinBuildRows, &[K], &[u32]),
+	insert_scalar: impl Fn(&mut JoinBuildRows, K, u32),
+) -> Result<Option<()>, ExecutionError> {
+	let batched = batched_build_prefetch_enabled();
+	let window = if batched { PROBE_BATCH_WINDOW } else { 1 };
+	let mut key_window: Vec<K> = Vec::with_capacity(window);
+	let mut row_window: Vec<u32> = Vec::with_capacity(window);
+	for row in 0..rows {
+		let Some(key) = key_at(row) else {
+			continue;
+		};
+		if !super::join_build_memory_fits(
+			left_key_arrays,
+			inserted_rows.saturating_add(1),
+			memory_cap,
+		) {
+			// The pending (un-flushed) window is intentionally dropped: every caller discards the
+			// partial table on `None` (build_in_memory_join_rows → streaming.rs `let Some(..) else`
+			// fallbacks), so the counted-but-uninserted rows are never observed.
+			return Ok(None);
+		}
+		key_window.push(key);
+		row_window.push(super::join_build_row_index(row)?);
+		*inserted_rows = inserted_rows.saturating_add(1);
+		if key_window.len() == window {
+			if batched {
+				insert_window(build_rows, &key_window, &row_window);
+			} else {
+				insert_scalar(build_rows, key_window[0], row_window[0]);
+			}
+			key_window.clear();
+			row_window.clear();
+		}
+	}
+	if !key_window.is_empty() {
+		insert_window(build_rows, &key_window, &row_window);
+	}
+	Ok(Some(()))
 }
 
 impl JoinBuildRows {
@@ -185,6 +255,28 @@ impl JoinBuildRows {
 				keys.iter()
 					.map(|key| key.and_then(|key| self.get_int32(key))),
 			),
+		}
+	}
+
+	/// ADR 503: batched Int64 insert window. Per-key insert on non-Int64 tables.
+	pub(in crate::exec) fn insert_int64_batch(&mut self, keys: &[i64], rows: &[u32]) {
+		if let JoinBuildRowsInner::Int64(table) = &mut self.inner {
+			table.insert_batch(keys, rows);
+		} else {
+			for (key, row) in keys.iter().zip(rows) {
+				self.insert(JoinKey::Int64(*key), *row);
+			}
+		}
+	}
+
+	/// ADR 503: batched Int32 insert window. Per-key insert on non-Int32 tables.
+	pub(in crate::exec) fn insert_int32_batch(&mut self, keys: &[i32], rows: &[u32]) {
+		if let JoinBuildRowsInner::Int32(table) = &mut self.inner {
+			table.insert_batch(keys, rows);
+		} else {
+			for (key, row) in keys.iter().zip(rows) {
+				self.insert(JoinKey::Int32(*key), *row);
+			}
 		}
 	}
 
@@ -296,6 +388,51 @@ where
 			self.buckets[bucket] = entry_index;
 		} else {
 			self.entries[entry_index].rows.push(row);
+		}
+	}
+
+	/// ADR 503: batched insert, the mirror of [`Self::get_batch`]. Stages a window —
+	/// hash + bucket-slot prefetch, then entry-line prefetch for occupied slots — then
+	/// runs the *serial* insert-resolve, re-walking `buckets[]` fresh from each key's
+	/// home slot. The prefetch is only a hint; the resolve reads the live table and
+	/// processes keys in slot order, so a within-window key that collides with an
+	/// earlier same-window insert resolves to exactly the slot `find_bucket` + `insert`
+	/// would choose. Output is byte-identical to the one-key-at-a-time path.
+	fn insert_batch(&mut self, keys: &[K], rows: &[u32]) {
+		debug_assert!(keys.len() <= PROBE_BATCH_WINDOW);
+		debug_assert_eq!(keys.len(), rows.len());
+		let mut staged_buckets = [0usize; PROBE_BATCH_WINDOW];
+		for (slot, key) in keys.iter().enumerate() {
+			let bucket = self.bucket_for_key(*key);
+			staged_buckets[slot] = bucket;
+			prefetch_read(&self.buckets[bucket]);
+		}
+		for slot in 0..keys.len() {
+			let entry_index = self.buckets[staged_buckets[slot]];
+			if entry_index != EMPTY_PRIMITIVE_BUCKET {
+				prefetch_read(&self.entries[entry_index]);
+			}
+		}
+		let mask = self.buckets.len() - 1;
+		for (slot, (key, row)) in keys.iter().zip(rows).enumerate() {
+			let mut bucket = staged_buckets[slot];
+			loop {
+				let entry_index = self.buckets[bucket];
+				if entry_index == EMPTY_PRIMITIVE_BUCKET {
+					let entry_index = self.entries.len();
+					self.entries.push(PrimitiveBuildEntry {
+						key: *key,
+						rows: BuildRowList::new(*row),
+					});
+					self.buckets[bucket] = entry_index;
+					break;
+				}
+				if self.entries[entry_index].key == *key {
+					self.entries[entry_index].rows.push(*row);
+					break;
+				}
+				bucket = (bucket + 1) & mask;
+			}
 		}
 	}
 
@@ -609,6 +746,52 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn adr503_batched_insert_ablation_defaults_on() {
+		use super::batched_build_prefetch_enabled_from_env;
+		assert!(batched_build_prefetch_enabled_from_env(None));
+		assert!(batched_build_prefetch_enabled_from_env(Some("1")));
+		assert!(!batched_build_prefetch_enabled_from_env(Some("0")));
+	}
+
+	#[test]
+	fn adr503_batched_insert_matches_scalar_across_collisions_and_duplicates() {
+		use crate::exec::join::new_int64_join_build_rows;
+
+		// 40 distinct keys sized into 128 buckets (capacity 64) — the open-addressing table
+		// is pre-sized with no resize, so it must hold every distinct key with headroom.
+		// 40/128 ≈ 31% occupancy (near production's 37.5%) gives real hash collisions; keys
+		// span multiple windows with duplicates and within-window repeats, so the batched
+		// insert must re-walk the live table and preserve insertion order in every row list.
+		let n = super::PROBE_BATCH_WINDOW * 2 + 7;
+		let keys: Vec<i64> = (0..n as i64).map(|i| (i * 13) % 40).collect();
+		let row_ids: Vec<u32> = (0..n as u32).collect();
+
+		let mut scalar = new_int64_join_build_rows(64);
+		for (key, row) in keys.iter().zip(&row_ids) {
+			insert_join_build_row(&mut scalar, JoinKey::Int64(*key), *row);
+		}
+
+		let mut batched = new_int64_join_build_rows(64);
+		for (kw, rw) in keys
+			.chunks(super::PROBE_BATCH_WINDOW)
+			.zip(row_ids.chunks(super::PROBE_BATCH_WINDOW))
+		{
+			batched.insert_int64_batch(kw, rw);
+		}
+
+		let mut distinct = keys.clone();
+		distinct.sort_unstable();
+		distinct.dedup();
+		for key in distinct {
+			let s = scalar.get_int64(key).map(|l| l.rows().collect::<Vec<_>>());
+			let b = batched.get_int64(key).map(|l| l.rows().collect::<Vec<_>>());
+			assert_eq!(s, b, "batched insert diverged from scalar for key {key}");
+		}
+		assert!(scalar.get_int64(9_999).is_none());
+		assert!(batched.get_int64(9_999).is_none());
 	}
 
 	#[test]
