@@ -496,7 +496,10 @@ pub fn q11_sql(scale: Q11Scale) -> String {
 	Q11_SQL_TEMPLATE.replace("[FRACTION]", scale.fraction_sql())
 }
 
-fn validate_query_scale(query: &str, scale_factor: f64) -> Result<(), String> {
+/// Whether a query's fixture is defined at this scale. q11's HAVING threshold is a scale-specific
+/// constant, so it is only defined at the scales that have one. Public so the perf sweep can record
+/// an out-of-scope cell as `not_attempted` instead of discovering it as a fatal child error.
+pub fn validate_query_scale(query: &str, scale_factor: f64) -> Result<(), String> {
 	if query == "q11" {
 		Q11Scale::try_from_f64(scale_factor)?;
 	}

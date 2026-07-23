@@ -31,6 +31,7 @@ use toron_tpch::{
 	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
 	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
 	stable_fingerprint, status_rows, strict_lineitem_row_count, take_parquet_scan_ledger,
+	validate_query_scale,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -558,7 +559,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	} else {
 		None
 	};
-	let paired_journal = if flag_present(args, "--paired-ablation") {
+	let sample_journal = if flag_present(args, "--paired-ablation") {
 		if runs % 2 != 0 {
 			return harness_error("--paired-ablation requires an even --runs count");
 		}
@@ -584,164 +585,249 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			Err(message) => return harness_error(&message),
 		}
 	} else {
-		None
+		// Un-paired runs get the same durability without the paired manifest's config lock. They
+		// start clean rather than resuming: replaying rows across runs is only safe behind the lock
+		// that gate zero establishes, and a silently-mixed board is worse than a re-run.
+		match prepare_perf_sample_journal(&output_dir) {
+			Ok(journal) => Some(journal),
+			Err(message) => return harness_error(&message),
+		}
 	};
-	let mut raw_rows = paired_journal
+	let mut raw_rows = sample_journal
 		.as_ref()
 		.map(|journal| journal.rows.clone())
 		.unwrap_or_default();
 	for query_id in queries {
-		for engine in &engines {
-			match engine {
-				PerfEngine::Toron => {
-					if flag_present(args, "--paired-ablation") {
-						if let Err(message) = require_adr448_harness_capability() {
-							return harness_error(&message);
+		// A query that cannot run at this scale is out of scope for the board, not a failure of it:
+		// q11's HAVING threshold is scale-specific, so it is pinned to {0.01, 1, 10}. Record the cell
+		// and keep going — aborting here would discard every query already measured.
+		if let Err(reason) = validate_query_scale(query_id, sf) {
+			for engine in &engines {
+				raw_rows.push(perf_stub_row(PerfStubRow {
+					engine: engine.as_str(),
+					query: query_id,
+					mode,
+					scale_factor: sf,
+					status: Status::NotAttempted,
+					reason: "unsupported_scale",
+					message: Some(reason.clone()),
+				}));
+			}
+			continue;
+		}
+
+		// Each cell's children are run inside a labelled block so a child that dies is recorded as a
+		// failed row and the sweep continues. The exit code below still reflects it, so a contained
+		// failure is an honest red cell rather than a silently-missing one.
+		let cell_outcome: Result<Vec<serde_json::Value>, String> = 'cell: {
+			let mut cell_rows: Vec<serde_json::Value> = Vec::new();
+			for engine in &engines {
+				match engine {
+					PerfEngine::Toron => {
+						if flag_present(args, "--paired-ablation") {
+							if let Err(message) = require_adr448_harness_capability() {
+								break 'cell Err(message);
+							}
+						}
+						for warmup_index in 0..warmup {
+							if sample_journal.as_ref().is_some_and(|journal| {
+								journal.contains(
+									query_id,
+									engine.as_str(),
+									warmup_index as u32,
+									true,
+								)
+							}) {
+								continue;
+							}
+							match run_perf_child_with_ablation(
+								PerfEngine::Toron,
+								query_id,
+								mode,
+								sf,
+								warmup_index as u32,
+								true,
+								data_source,
+								&data_dir,
+								if flag_present(args, "--paired-ablation") {
+									Some((&paired_switch, false))
+								} else {
+									None
+								},
+							) {
+								Ok(row) => {
+									if let Some(journal) = &sample_journal {
+										if let Err(message) = journal.append(&row) {
+											break 'cell Err(message);
+										}
+									}
+									cell_rows.push(row);
+								}
+								Err(message) => break 'cell Err(message),
+							}
+						}
+						for run_index in 0..runs {
+							if sample_journal.as_ref().is_some_and(|journal| {
+								journal.contains(query_id, engine.as_str(), run_index as u32, false)
+							}) {
+								continue;
+							}
+							match run_perf_child_with_ablation(
+								PerfEngine::Toron,
+								query_id,
+								mode,
+								sf,
+								run_index as u32,
+								false,
+								data_source,
+								&data_dir,
+								if flag_present(args, "--paired-ablation") {
+									Some((&paired_switch, paired_ablation_arm(run_index as u32)))
+								} else {
+									None
+								},
+							) {
+								Ok(row) => {
+									if let Some(journal) = &sample_journal {
+										if let Err(message) = journal.append(&row) {
+											break 'cell Err(message);
+										}
+									}
+									cell_rows.push(row);
+								}
+								Err(message) => break 'cell Err(message),
+							}
 						}
 					}
-					for warmup_index in 0..warmup {
-						if paired_journal.as_ref().is_some_and(|journal| {
-							journal.contains(query_id, engine.as_str(), warmup_index as u32, true)
-						}) {
-							continue;
+					PerfEngine::Rune => {
+						for warmup_index in 0..warmup {
+							match run_perf_child(
+								PerfEngine::Rune,
+								query_id,
+								mode,
+								sf,
+								warmup_index as u32,
+								true,
+								data_source,
+								&data_dir,
+							) {
+								Ok(row) => {
+									if let Err(message) =
+										journal_and_collect(&sample_journal, &mut cell_rows, row)
+									{
+										break 'cell Err(message);
+									}
+								}
+								Err(message) => break 'cell Err(message),
+							}
 						}
-						match run_perf_child_with_ablation(
-							PerfEngine::Toron,
+						for run_index in 0..runs {
+							match run_perf_child(
+								PerfEngine::Rune,
+								query_id,
+								mode,
+								sf,
+								run_index as u32,
+								false,
+								data_source,
+								&data_dir,
+							) {
+								Ok(row) => {
+									if let Err(message) =
+										journal_and_collect(&sample_journal, &mut cell_rows, row)
+									{
+										break 'cell Err(message);
+									}
+								}
+								Err(message) => break 'cell Err(message),
+							}
+						}
+					}
+					PerfEngine::DuckDb => {
+						match run_duckdb_perf_rows(
 							query_id,
 							mode,
 							sf,
-							warmup_index as u32,
-							true,
+							runs,
+							warmup,
+							&output_dir,
 							data_source,
 							&data_dir,
-							if flag_present(args, "--paired-ablation") {
-								Some((&paired_switch, false))
-							} else {
-								None
-							},
 						) {
-							Ok(row) => {
-								if let Some(journal) = &paired_journal {
-									if let Err(message) = journal.append(&row) {
-										return harness_error(&message);
+							Ok(rows) => {
+								for row in rows {
+									if let Err(message) =
+										journal_and_collect(&sample_journal, &mut cell_rows, row)
+									{
+										break 'cell Err(message);
 									}
 								}
-								raw_rows.push(row);
 							}
-							Err(message) => return harness_error(&message),
+							Err(message) => break 'cell Err(message),
 						}
 					}
-					for run_index in 0..runs {
-						if paired_journal.as_ref().is_some_and(|journal| {
-							journal.contains(query_id, engine.as_str(), run_index as u32, false)
-						}) {
-							continue;
-						}
-						match run_perf_child_with_ablation(
-							PerfEngine::Toron,
-							query_id,
-							mode,
-							sf,
-							run_index as u32,
-							false,
-							data_source,
-							&data_dir,
-							if flag_present(args, "--paired-ablation") {
-								Some((&paired_switch, paired_ablation_arm(run_index as u32)))
-							} else {
-								None
-							},
-						) {
-							Ok(row) => {
-								if let Some(journal) = &paired_journal {
-									if let Err(message) = journal.append(&row) {
-										return harness_error(&message);
+					PerfEngine::PolarsSql => {
+						for warmup_index in 0..warmup {
+							match run_perf_child(
+								PerfEngine::PolarsSql,
+								query_id,
+								mode,
+								sf,
+								warmup_index as u32,
+								true,
+								data_source,
+								&data_dir,
+							) {
+								Ok(row) => {
+									if let Err(message) =
+										journal_and_collect(&sample_journal, &mut cell_rows, row)
+									{
+										break 'cell Err(message);
 									}
 								}
-								raw_rows.push(row);
+								Err(message) => break 'cell Err(message),
 							}
-							Err(message) => return harness_error(&message),
+						}
+						for run_index in 0..runs {
+							match run_perf_child(
+								PerfEngine::PolarsSql,
+								query_id,
+								mode,
+								sf,
+								run_index as u32,
+								false,
+								data_source,
+								&data_dir,
+							) {
+								Ok(row) => {
+									if let Err(message) =
+										journal_and_collect(&sample_journal, &mut cell_rows, row)
+									{
+										break 'cell Err(message);
+									}
+								}
+								Err(message) => break 'cell Err(message),
+							}
 						}
 					}
 				}
-				PerfEngine::Rune => {
-					for warmup_index in 0..warmup {
-						match run_perf_child(
-							PerfEngine::Rune,
-							query_id,
-							mode,
-							sf,
-							warmup_index as u32,
-							true,
-							data_source,
-							&data_dir,
-						) {
-							Ok(row) => raw_rows.push(row),
-							Err(message) => return harness_error(&message),
-						}
-					}
-					for run_index in 0..runs {
-						match run_perf_child(
-							PerfEngine::Rune,
-							query_id,
-							mode,
-							sf,
-							run_index as u32,
-							false,
-							data_source,
-							&data_dir,
-						) {
-							Ok(row) => raw_rows.push(row),
-							Err(message) => return harness_error(&message),
-						}
-					}
-				}
-				PerfEngine::DuckDb => {
-					match run_duckdb_perf_rows(
-						query_id,
+			}
+			Ok(cell_rows)
+		};
+		match cell_outcome {
+			Ok(rows) => raw_rows.extend(rows),
+			Err(message) => {
+				eprintln!("perf cell {query_id} failed: {message}");
+				for engine in &engines {
+					raw_rows.push(perf_stub_row(PerfStubRow {
+						engine: engine.as_str(),
+						query: query_id,
 						mode,
-						sf,
-						runs,
-						warmup,
-						&output_dir,
-						data_source,
-						&data_dir,
-					) {
-						Ok(rows) => raw_rows.extend(rows),
-						Err(message) => return harness_error(&message),
-					}
-				}
-				PerfEngine::PolarsSql => {
-					for warmup_index in 0..warmup {
-						match run_perf_child(
-							PerfEngine::PolarsSql,
-							query_id,
-							mode,
-							sf,
-							warmup_index as u32,
-							true,
-							data_source,
-							&data_dir,
-						) {
-							Ok(row) => raw_rows.push(row),
-							Err(message) => return harness_error(&message),
-						}
-					}
-					for run_index in 0..runs {
-						match run_perf_child(
-							PerfEngine::PolarsSql,
-							query_id,
-							mode,
-							sf,
-							run_index as u32,
-							false,
-							data_source,
-							&data_dir,
-						) {
-							Ok(row) => raw_rows.push(row),
-							Err(message) => return harness_error(&message),
-						}
-					}
+						scale_factor: sf,
+						status: Status::Fail,
+						reason: "perf_child_failed",
+						message: Some(message.clone()),
+					}));
 				}
 			}
 		}
@@ -765,7 +851,19 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	for row in &summary_rows {
 		print_perf_summary(row);
 	}
-	ExitCode::SUCCESS
+	// Containing a failed cell keeps the rest of the board; it must not also make the board look
+	// clean. `not_attempted` (out-of-scope at this scale) is not a failure — `fail` is.
+	let failed = summary_rows
+		.iter()
+		.filter(|row| row.get("status").and_then(serde_json::Value::as_str) == Some("fail"))
+		.filter_map(|row| row.get("query").and_then(serde_json::Value::as_str))
+		.collect::<Vec<_>>();
+	if failed.is_empty() {
+		ExitCode::SUCCESS
+	} else {
+		eprintln!("perf completed with failed cells: {}", failed.join(", "));
+		ExitCode::FAILURE
+	}
 }
 
 fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
@@ -2020,6 +2118,66 @@ fn polars_not_attempted_row(
 	.json_value()
 }
 
+/// Push a measured row into the cell and fsync it to the journal first, so the row survives a
+/// process that dies before the sweep can write its artifacts.
+fn journal_and_collect(
+	journal: &Option<PerfSampleJournal>,
+	cell_rows: &mut Vec<serde_json::Value>,
+	row: serde_json::Value,
+) -> Result<(), String> {
+	if let Some(journal) = journal {
+		journal.append(&row)?;
+	}
+	cell_rows.push(row);
+	Ok(())
+}
+
+/// A cell that produced no measurement, recorded as a row rather than aborting the sweep.
+///
+/// `--query all` has to survive both a query that cannot run at this scale and one whose child
+/// died. Discarding every other cell's work to report one bad cell is the opposite of what a board
+/// is for, and it is what pushes measurement back out into shell loops. The status carries the
+/// distinction: `not_attempted` for out-of-scope, `fail` for a cell that should have run and did not.
+struct PerfStubRow<'a> {
+	engine: &'a str,
+	query: &'a str,
+	mode: &'a str,
+	scale_factor: f64,
+	status: Status,
+	reason: &'a str,
+	message: Option<String>,
+}
+
+fn perf_stub_row(stub: PerfStubRow<'_>) -> serde_json::Value {
+	PerfAttempt {
+		engine: stub.engine.to_string(),
+		query: stub.query.to_string(),
+		scale_factor: stub.scale_factor,
+		mode: stub.mode.to_string(),
+		run_index: 0,
+		warmup: false,
+		phase: Phase::Generate,
+		status: stub.status,
+		reason: Some(stub.reason.to_string()),
+		diagnostic_message: stub.message,
+		timings: PerfPhaseTimings::default(),
+		parent_wall_ms: None,
+		peak_rss_kib: None,
+		spill_bytes: 0,
+		plan_fingerprint: None,
+		digest: None,
+		output_row_count: None,
+		output_schema_fingerprint: None,
+		engine_version: None,
+		duckdb_version: None,
+		debug_build: cfg!(debug_assertions),
+		local_join_admissions: None,
+		join_spill_observations: None,
+		dataset_verification: None,
+	}
+	.json_value()
+}
+
 /// ADR 473: engine thread count is a first-class ladder condition — a comparison
 /// that does not record it is not a roofline.
 fn duckdb_thread_setting() -> Option<String> {
@@ -2655,11 +2813,15 @@ fn polars_unsupported_attempt(
 	}
 }
 
-#[cfg(feature = "polars-sql-reference")]
+#[cfg(any(feature = "polars-sql-reference", test))]
 fn polars_error_is_known_unsupported(message: &str) -> bool {
 	matches!(
 		classify_polars_error(message),
-		"correlated_subquery" | "interval_syntax" | "join_constraint" | "index_limit"
+		"correlated_subquery"
+			| "interval_syntax"
+			| "join_constraint"
+			| "from_clause_dialect"
+			| "index_limit"
 	)
 }
 
@@ -2707,7 +2869,12 @@ fn classify_polars_error(message: &str) -> &'static str {
 	if lower.contains("panic") || lower.contains("panicked") {
 		return "other";
 	}
-	let explicitly_unsupported = lower.contains("not supported") || lower.contains("unsupported");
+	// Polars hedges its capability messages — "not *currently* supported" does not contain the
+	// substring "not supported", which is why whole classes of dialect gap were landing as engine
+	// failures rather than as cells the peer cannot express.
+	let explicitly_unsupported = lower.contains("not supported")
+		|| lower.contains("unsupported")
+		|| lower.contains("not currently supported");
 	if explicitly_unsupported
 		&& (lower.contains("subquer") || lower.contains("correlated") || lower.contains("exists"))
 	{
@@ -2718,8 +2885,13 @@ fn classify_polars_error(message: &str) -> &'static str {
 		&& (lower.contains("not like")
 			|| lower.contains("join constraint")
 			|| lower.contains("non-equi join"))
+		// Stated as a positive limit rather than a negation, so it needs its own pattern.
+		|| lower.contains("only equi-join constraints")
 	{
 		"join_constraint"
+	} else if explicitly_unsupported && lower.contains("multiple tables in from clause") {
+		// The comma-join form the TPC-H texts use. A dialect gap in the peer, not a failed run.
+		"from_clause_dialect"
 	} else if lower.contains("2^32") || lower.contains("2**32") || lower.contains("index limit") {
 		"index_limit"
 	} else {
@@ -3734,14 +3906,35 @@ fn write_perf_outputs(
 
 const ADR449_PAIRED_JOURNAL: &str = "adr449_paired_samples.jsonl";
 const ADR449_PAIRED_MANIFEST: &str = "adr449_paired_run.json";
+const PERF_SAMPLE_JOURNAL: &str = "samples.jsonl";
 
+/// Every measured row, fsynced as it is produced.
+///
+/// The summary and raw artifacts are only written once the whole sweep finishes, so without this a
+/// run that dies partway through leaves nothing at all behind — hours of measurement held in memory
+/// and lost. ADR 449 built this durability for the paired-ablation rail; it is not paired-specific,
+/// and every perf run gets it.
 #[derive(Debug, Clone)]
-struct PairedAblationJournal {
+struct PerfSampleJournal {
 	path: PathBuf,
 	rows: Vec<serde_json::Value>,
 }
 
-impl PairedAblationJournal {
+/// A fresh journal for an ordinary perf run. Truncated up front so its rows always describe this
+/// run: resume belongs to the paired rail, which locks the config it would be resuming into.
+fn prepare_perf_sample_journal(output_dir: &Path) -> Result<PerfSampleJournal, String> {
+	std::fs::create_dir_all(output_dir)
+		.map_err(|error| format!("create {}: {error}", output_dir.display()))?;
+	let path = output_dir.join(PERF_SAMPLE_JOURNAL);
+	std::fs::write(&path, "")
+		.map_err(|error| format!("truncate perf sample journal {}: {error}", path.display()))?;
+	Ok(PerfSampleJournal {
+		path,
+		rows: Vec::new(),
+	})
+}
+
+impl PerfSampleJournal {
 	fn contains(&self, query: &str, engine: &str, run_index: u32, warmup: bool) -> bool {
 		self.rows.iter().any(|row| {
 			row.get("query").and_then(serde_json::Value::as_str) == Some(query)
@@ -3783,7 +3976,7 @@ fn prepare_paired_ablation_journal(
 	warmup: usize,
 	dataset_fingerprint: &str,
 	switch: &PairedSwitch,
-) -> Result<PairedAblationJournal, String> {
+) -> Result<PerfSampleJournal, String> {
 	if dataset_fingerprint.is_empty() {
 		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
 	}
@@ -3854,7 +4047,7 @@ fn prepare_paired_ablation_journal(
 	} else {
 		Vec::new()
 	};
-	Ok(PairedAblationJournal {
+	Ok(PerfSampleJournal {
 		path: journal_path,
 		rows,
 	})
@@ -4158,7 +4351,7 @@ mod tests {
 	}
 
 	#[test]
-	fn adr449_paired_journal_is_durable_and_resume_config_locked() {
+	fn adr449_sample_journal_is_durable_and_resume_config_locked() {
 		let directory =
 			std::env::temp_dir().join(format!("toron-adr449-journal-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&directory);
@@ -4666,6 +4859,87 @@ mod tests {
 		}));
 	}
 
+	/// A board must survive its worst cell. q11's threshold constant is scale-specific, so at any
+	/// other scale it is out of scope — `not_attempted`, not a failure, and above all not a reason to
+	/// discard every query already measured.
+	#[test]
+	fn a_scale_unsupported_query_is_out_of_scope_not_a_board_failure() {
+		assert!(validate_query_scale("q11", 8.0).is_err());
+		assert!(validate_query_scale("q11", 10.0).is_ok());
+		assert!(
+			validate_query_scale("q06", 8.0).is_ok(),
+			"only the scale-pinned query is constrained"
+		);
+
+		let stub = perf_stub_row(PerfStubRow {
+			engine: "toron",
+			query: "q11",
+			mode: "strict",
+			scale_factor: 8.0,
+			status: Status::NotAttempted,
+			reason: "unsupported_scale",
+			message: Some("q11 requires an exactly supported scale".to_string()),
+		});
+		assert_eq!(stub["status"], "not_attempted");
+		assert_eq!(stub["query"], "q11");
+
+		// `not_attempted` keeps the board green; a cell that should have run and did not does not.
+		let summary = summarize_perf_rows(&[stub], 1, 0, &BTreeMap::new());
+		assert_eq!(summary[0]["status"], "not_attempted");
+
+		let failed = perf_stub_row(PerfStubRow {
+			engine: "toron",
+			query: "q05",
+			mode: "strict",
+			scale_factor: 8.0,
+			status: Status::Fail,
+			reason: "perf_child_failed",
+			message: Some("child died".to_string()),
+		});
+		let summary = summarize_perf_rows(&[failed], 1, 0, &BTreeMap::new());
+		assert_eq!(
+			summary[0]["status"], "fail",
+			"a contained failure stays visible as a red cell"
+		);
+	}
+
+	/// The artifacts are written once, at the end. The journal is what makes a run that dies partway
+	/// through leave its measurements behind instead of nothing at all.
+	#[test]
+	fn measured_rows_are_durable_before_the_sweep_finishes() {
+		let dir = std::env::temp_dir().join(format!("toron_tpch_journal_{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let journal = prepare_perf_sample_journal(&dir).expect("journal");
+		let mut cell_rows = Vec::new();
+		let journal = Some(journal);
+
+		journal_and_collect(
+			&journal,
+			&mut cell_rows,
+			perf_row("q06", 100.0, "plan-a", true),
+		)
+		.expect("journal the row");
+
+		// Read from disk, not from `cell_rows`: the point is that nothing is held only in memory.
+		let on_disk = std::fs::read_to_string(dir.join(PERF_SAMPLE_JOURNAL)).expect("read journal");
+		let persisted: Vec<serde_json::Value> = on_disk
+			.lines()
+			.map(|line| serde_json::from_str(line).expect("journal line is JSON"))
+			.collect();
+		assert_eq!(persisted.len(), 1, "the row is on disk before the run ends");
+		assert_eq!(persisted[0]["query"], "q06");
+
+		// A fresh journal for the same directory starts clean rather than replaying a prior run.
+		let reopened = prepare_perf_sample_journal(&dir).expect("reopen");
+		assert!(reopened.rows.is_empty());
+		assert!(
+			std::fs::read_to_string(dir.join(PERF_SAMPLE_JOURNAL))
+				.expect("read")
+				.is_empty()
+		);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
 	/// `latest_summary.jsonl` and the recorded baseline are what a board is read from, so the
 	/// verification has to survive the reduction from raw rows — otherwise only `latest_raw.jsonl`
 	/// is auditable and the artifact everyone actually reads is not.
@@ -4816,6 +5090,38 @@ mod tests {
 			classify_polars_error("planning failed: outer relation join interval exists"),
 			"other"
 		);
+
+		// A control engine is only usable if a dialect gap reads as "cannot express this", not as a
+		// red cell. These are the verbatim Polars 0.54 messages behind 14 of the 22 TPC-H texts;
+		// both hedge ("not currently supported") or state the limit positively, so neither was
+		// recognised and every board run reported them as failures.
+		assert_eq!(
+			classify_polars_error(
+				"polars SQL execute failed: SQLInterface(ErrString(\"multiple tables in FROM clause are not currently supported\"))"
+			),
+			"from_clause_dialect"
+		);
+		assert_eq!(
+			classify_polars_error(
+				"polars SQL execute failed: SQLInterface(ErrString(\"only equi-join constraints are currently supported; found e\"))"
+			),
+			"join_constraint"
+		);
+		assert!(polars_error_is_known_unsupported(
+			"multiple tables in FROM clause are not currently supported"
+		));
+		assert!(polars_error_is_known_unsupported(
+			"only equi-join constraints are currently supported"
+		));
+
+		// The widened phrase must not swallow a genuine execution failure.
+		assert_eq!(
+			classify_polars_error("polars collect failed: out of memory"),
+			"other"
+		);
+		assert!(!polars_error_is_known_unsupported(
+			"polars collect failed: out of memory"
+		));
 	}
 
 	#[cfg(all(feature = "polars-sql-reference", unix))]
