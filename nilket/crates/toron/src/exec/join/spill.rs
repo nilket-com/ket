@@ -2323,6 +2323,28 @@ impl SpilledInnerJoinBuild {
 		self.writer_peak = 0;
 	}
 
+	/// Seal one reservoir partition: flush the partial page the buffering writer holds back, then
+	/// finish and drop the write scratch.
+	///
+	/// Named as one operation because the flush is a caller obligation, not something `finish` may
+	/// do for itself — `finish` stays fail-loud so a barrier that goes missing is a hard error
+	/// rather than a silently truncated spill file. Every reservoir that writes through
+	/// `write_*_unindexed_profiled` seals through here.
+	pub(in crate::exec) async fn seal_unindexed_reservoir_partition(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
+		self.flush_unindexed_page_buffer(key_plan, keys, null_safe_keys, task_budget, observer)
+			.await?;
+		self.finish(task_budget).await?;
+		self.release_write_scratch();
+		Ok(())
+	}
+
 	pub(in crate::exec) async fn finish(
 		&self,
 		task_budget: TaskBudget,
@@ -5004,6 +5026,58 @@ mod tests {
 		assert_eq!(build.input_row_count(), 5);
 
 		build.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	/// The caller-side half of the contract above. The partition-at-a-time replay reservoir wrote
+	/// probe batches through the buffering writer and then called `finish` directly, so any
+	/// partition whose final page was partial died on the fail-loud check — deterministically, for
+	/// the whole query. Sealing is one named operation so the flush cannot be omitted at a barrier
+	/// again.
+	#[tokio::test]
+	async fn sealing_a_reservoir_partition_flushes_its_partial_page() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("seal_reservoir_partition");
+		let keys = [ColumnOrdinal(0)];
+		// Fewer rows than CROSS_JOIN_OUTPUT_CHUNK_ROWS, so the writer holds the page back: this is
+		// the partial-final-page shape every partition ends on.
+		let partial = batch_with_keys(&[7, 8, 9]);
+
+		let mut partition =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		partition
+			.write_batch_chunks_unindexed_profiled(
+				&partial,
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+				None,
+			)
+			.await
+			.expect("buffer the partial page");
+		assert_eq!(
+			partition.page_count(),
+			0,
+			"the fixture must leave a page pending, or it cannot regress the barrier"
+		);
+
+		partition
+			.seal_unindexed_reservoir_partition(JoinKeyPlan::Int64, &keys, false, budget, None)
+			.await
+			.expect("sealing flushes before it finishes");
+
+		assert_eq!(partition.page_count(), 1, "the held page reached the file");
+		let decoded = partition
+			.read_batch_page(0)
+			.await
+			.expect("read sealed page");
+		assert_record_batch_equal(&decoded, &partial);
+		assert_eq!(partition.input_row_count(), 3);
+
+		partition.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
 	}
 

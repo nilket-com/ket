@@ -13770,13 +13770,25 @@ impl Executor {
 
 	async fn finish_partition_at_a_time_probe_reservoir(
 		&self,
+		spec: &PartitionAtATimeReplaySpec<'_>,
 		state: &mut PartitionAtATimeReplayReservoir,
 		runtime_baseline_bytes: u64,
 	) -> Result<(), ExecutionError> {
 		for partition_index in 0..state.probe.len() {
 			if let Some(partition) = state.probe[partition_index].as_mut() {
-				partition.finish(self.context.task_budget).await?;
-				partition.release_write_scratch();
+				// This is the probe reservoir's all-writes-complete barrier, the analogue of the
+				// build side's in `write_partitioned_streaming_scan_inner_build_batches`. Probe
+				// batches arrive through the buffering writer, which holds a partial final page
+				// back until a caller seals it.
+				partition
+					.seal_unindexed_reservoir_partition(
+						spec.key_plan,
+						&spec.probe_keys,
+						false,
+						self.context.task_budget,
+						None,
+					)
+					.await?;
 			}
 			guard_partition_replay_owner_resident(
 				runtime_baseline_bytes,
@@ -14678,7 +14690,16 @@ impl Executor {
 			}
 			if let Some(mut state) = partition_replay_state.take() {
 				let deferred_result = async {
+					// Resolved before sealing: the probe reservoir's flush needs the same key plan
+					// its writes used.
+					let spec = partition_replay_spec.as_ref().ok_or_else(|| {
+						ExecutionError::InvalidExpression {
+							message: "committed partition replay lost its admitted spec"
+								.to_string(),
+						}
+					})?;
 					Box::pin(self.finish_partition_at_a_time_probe_reservoir(
+						spec,
 						&mut state,
 						runtime_baseline_bytes,
 					))
@@ -14690,12 +14711,6 @@ impl Executor {
 									.to_string(),
 							}
 						})?;
-					let spec = partition_replay_spec.as_ref().ok_or_else(|| {
-						ExecutionError::InvalidExpression {
-							message: "committed partition replay lost its admitted spec"
-								.to_string(),
-						}
-					})?;
 					Box::pin(self.drain_partition_at_a_time_replay(
 						spec,
 						&mut state,
