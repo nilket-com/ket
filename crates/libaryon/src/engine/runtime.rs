@@ -2405,7 +2405,9 @@ fn dispatch_command(
 				persistent_settings,
 				..
 			} = session;
-			let view_id = focused_doctab(layout, *focused_pane_id).id;
+			let doctab = focused_doctab(layout, *focused_pane_id);
+			let view_id = doctab.id;
+			let buffer_id = doctab.buffer_id;
 			if let Some((effect, _)) = handle_file_command_for_view(
 				runtime,
 				buffers,
@@ -2417,6 +2419,9 @@ fn dispatch_command(
 				persistent_settings.save_durability,
 				query_cmd,
 			) {
+				if ui.document_text_response.is_some() {
+					ui.document_text_response_buffer_id = Some(buffer_id);
+				}
 				needs_render |= effect.needs_render;
 			}
 		}

@@ -329,6 +329,10 @@ pub struct Viewport {
 	///
 	/// [`EditorCommand::QueryDocumentText`]: crate::engine::EditorCommand::QueryDocumentText
 	pub document_text: Option<String>,
+	/// Buffer that [`Self::document_text`] was read from. This is attributed
+	/// independently of the viewport's current focus because a queued focus
+	/// command may be rendered immediately after the text query.
+	pub document_text_buffer_id: Option<BufferId>,
 	/// Whether foreground I/O or semantic analysis is still in progress.
 	///
 	/// Frontends can animate this state without asking the engine to render
@@ -390,6 +394,8 @@ impl std::ops::DerefMut for Viewport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocTabSummary {
+	/// Stable identity of the document behind this tab.
+	pub buffer_id: BufferId,
 	/// Stable identity of this tab's view, including inactive tabs.
 	pub view_id: ViewId,
 	pub title: String,

@@ -430,6 +430,7 @@ mod tests {
 				is_git_status_panel: false,
 				background_override: None,
 				tabs: vec![crate::uast::projection::DocTabSummary {
+					buffer_id: crate::core::BufferId::new(1),
 					view_id,
 					title: "test.rs".to_string(),
 					is_dirty: false,
@@ -442,6 +443,7 @@ mod tests {
 			git_refresh_seconds: 7,
 			status_message: None,
 			document_text: None,
+			document_text_buffer_id: None,
 			dividers: Vec::new(),
 			busy: false,
 			should_quit: false,

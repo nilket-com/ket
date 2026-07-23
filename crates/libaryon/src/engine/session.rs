@@ -1347,6 +1347,8 @@ pub(crate) struct UiState {
 	pub(crate) status_message: Option<String>,
 	/// One-shot `QueryDocumentText` reply, drained into the next viewport.
 	pub(crate) document_text_response: Option<String>,
+	/// Buffer that produced `document_text_response`.
+	pub(crate) document_text_response_buffer_id: Option<BufferId>,
 	pub(crate) busy: bool,
 	pub(crate) pending_quit: bool,
 	pub(crate) mode_override: Option<EditorMode>,
@@ -3496,6 +3498,7 @@ impl EditorSession {
 			ui: UiState {
 				status_message: startup_status,
 				document_text_response: None,
+				document_text_response_buffer_id: None,
 				busy: false,
 				pending_quit: false,
 				mode_override: None,

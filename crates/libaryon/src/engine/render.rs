@@ -259,6 +259,12 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	};
 	let status_message = ui.status_message.take();
 	let document_text = ui.document_text_response.take();
+	let document_text_buffer_id = ui.document_text_response_buffer_id.take();
+	debug_assert_eq!(
+		document_text.is_some(),
+		document_text_buffer_id.is_some(),
+		"document text replies must carry their source buffer"
+	);
 	let io_busy = ui.busy;
 	let should_quit = ui.pending_quit;
 	let yank_flash = ui.yank_flash;
@@ -315,6 +321,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		status_message,
 		dividers,
 		document_text,
+		document_text_buffer_id,
 		busy: viewport_is_busy(io_busy, semantic_busy),
 		should_quit,
 		search_pattern: search_pattern.clone(),
@@ -1381,6 +1388,7 @@ fn render_pane_viewport(
 					.get(view.buffer_id)
 					.expect("tab summary view must reference a live buffer");
 				crate::uast::projection::DocTabSummary {
+					buffer_id: view.buffer_id,
 					view_id: view.id,
 					title: if git_status_buffer_id == Some(view.buffer_id) {
 						"git".to_string()

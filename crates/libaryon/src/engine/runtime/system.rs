@@ -2398,6 +2398,7 @@ mod tests {
 		let mut ui = UiState {
 			status_message: None,
 			document_text_response: None,
+			document_text_response_buffer_id: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -2496,6 +2497,7 @@ mod tests {
 		let mut ui = UiState {
 			status_message: None,
 			document_text_response: None,
+			document_text_response_buffer_id: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -4925,8 +4927,13 @@ mod tests {
 			let view = rx_view
 				.recv_timeout(Duration::from_secs(2))
 				.expect("viewport after query");
-			if let Some(text) = view.document_text {
-				return text;
+			if view.document_text.is_some() {
+				assert_eq!(
+					view.document_text_buffer_id,
+					Some(view.focused_pane().expect("focused pane").buffer_id),
+					"document text must identify the buffer it was read from"
+				);
+				return view.document_text.expect("checked document text");
 			}
 		}
 		panic!("no viewport carried the document text reply");

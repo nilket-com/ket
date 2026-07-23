@@ -143,7 +143,10 @@ pub struct CodeEditor {
 	engine_outputs: Receiver<EngineOutput>,
 	engine_wake: EngineWake,
 	viewport: Option<Viewport>,
-	document_text: String,
+	/// Latest complete text snapshot for each buffer the host has observed.
+	/// Keeping these attributed prevents a focus projection for one pane from
+	/// being paired with a still-in-flight text reply from another.
+	document_texts: HashMap<libaryon::core::BufferId, String>,
 	text_query_pending: bool,
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
@@ -292,7 +295,7 @@ impl CodeEditor {
 			engine_outputs,
 			engine_wake,
 			viewport: None,
-			document_text: String::new(),
+			document_texts: HashMap::new(),
 			text_query_pending: false,
 			content_dirty: false,
 			last_pointer: None,
@@ -324,7 +327,9 @@ impl CodeEditor {
 
 	/// Last complete document text received from the engine.
 	pub fn cached_content(&self) -> &str {
-		&self.document_text
+		self.active_buffer_id()
+			.and_then(|buffer_id| self.document_texts.get(&buffer_id))
+			.map_or("", String::as_str)
 	}
 
 	/// Stable execution language of the focused text buffer.
@@ -343,7 +348,7 @@ impl CodeEditor {
 	/// or the cursor's logical line when no selection exists.
 	pub fn selected_or_current_line(&self) -> Option<String> {
 		let pane = self.viewport.as_ref()?.focused_pane()?;
-		let source = self.document_text.as_bytes();
+		let source = self.document_texts.get(&pane.buffer_id)?.as_bytes();
 		if !pane.selection_ranges.is_empty() {
 			let mut fragments = Vec::with_capacity(pane.selection_ranges.len());
 			for (start, end) in &pane.selection_ranges {
@@ -395,7 +400,8 @@ impl CodeEditor {
 				&& cursor < cell.body_range.end
 		})?;
 		let code = self
-			.document_text
+			.document_texts
+			.get(&source.buffer_id)?
 			.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)?
 			.to_owned();
 		Some(MarkdownCellExecution {
@@ -620,7 +626,9 @@ impl CodeEditor {
 	pub fn replace_content(&mut self, text: &str) {
 		// Optimistic: the engine confirms via the queued query, but Run/Save
 		// must never observe a cleared document in the interim.
-		self.document_text = text.to_owned();
+		if let Some(buffer_id) = self.active_buffer_id() {
+			self.document_texts.insert(buffer_id, text.to_owned());
+		}
 		self.send(EditorCommand::ReplaceDocument {
 			text: text.to_owned(),
 			language: Some("sql".to_owned()),
@@ -669,8 +677,11 @@ impl CodeEditor {
 			if let Some(message) = viewport.status_message.as_ref() {
 				self.status_message = Some(message.clone());
 			}
-			if let Some(document_text) = viewport.document_text.as_ref() {
-				self.document_text = document_text.clone();
+			if let (Some(document_text), Some(buffer_id)) = (
+				viewport.document_text.as_ref(),
+				viewport.document_text_buffer_id,
+			) {
+				self.document_texts.insert(buffer_id, document_text.clone());
 				self.text_query_pending = false;
 				if self.content_dirty {
 					// Input landed after this query was issued; chase
@@ -678,6 +689,13 @@ impl CodeEditor {
 					self.request_content();
 				}
 			}
+			let live_buffers = viewport
+				.panes
+				.iter()
+				.flat_map(|pane| pane.tabs.iter().map(|tab| tab.buffer_id))
+				.collect::<std::collections::HashSet<_>>();
+			self.document_texts
+				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
 			self.reconcile_notebook_outputs(&viewport);
 			self.viewport = Some(viewport);
 			changed = true;
@@ -795,6 +813,7 @@ impl CodeEditor {
 			EditorMsg::PaneDragStarted(pane_id) => {
 				self.drag = None;
 				self.send(EditorCommand::FocusPane(pane_id));
+				self.request_content();
 				self.begin_pane_drag_for(pane_id);
 			}
 			EditorMsg::Release => {
@@ -1107,7 +1126,7 @@ impl CodeEditor {
 		}
 	}
 
-	fn click_at_pointer(&self) {
+	fn click_at_pointer(&mut self) {
 		let Some(pointer) = self.last_pointer else {
 			return;
 		};
@@ -1126,6 +1145,7 @@ impl CodeEditor {
 		self.send(EditorCommand::FocusPane(pane.pane_id));
 		let pane_top = pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
 		if pane.host_panel.is_some() || pointer.y < pane_top + PANE_HEADER_HEIGHT {
+			self.request_content();
 			return;
 		}
 		let local_y = pointer.y - pane_top - PANE_HEADER_HEIGHT;
@@ -1144,6 +1164,7 @@ impl CodeEditor {
 			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
 		);
 		self.send(EditorCommand::ClickCursor(target));
+		self.request_content();
 	}
 
 	fn is_insert_mode(&self) -> bool {
@@ -2913,6 +2934,61 @@ mod tests {
 	}
 
 	#[test]
+	fn cached_content_stays_attributed_when_focus_changes_between_languages() {
+		let sql = "select 1 as x, 2 as y";
+		let mut editor = CodeEditor::new(sql);
+		wait_for_content(&mut editor, sql);
+		let sql_pane = editor.viewport.as_ref().unwrap().focused_pane_id;
+		let sql_buffer = editor.active_buffer_id().expect("SQL buffer");
+
+		send_keys(&mut editor, ":pv rune".chars());
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Enter,
+			modifiers: Modifiers::NONE,
+		}));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.active_language_id().map(LanguageId::as_str) != Some("rune")
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let rune_pane = editor.viewport.as_ref().unwrap().focused_pane_id;
+		let rune_buffer = editor.active_buffer_id().expect("Rune buffer");
+		assert_ne!(sql_buffer, rune_buffer);
+
+		send_keys(&mut editor, "i40 + 2".chars());
+		wait_for_content(&mut editor, "40 + 2");
+
+		// Reproduce the GUI race: focus changes and its viewport is consumed,
+		// but no new document-text query has completed yet. Language and text
+		// must still come from the same SQL buffer.
+		editor.send(EditorCommand::FocusPane(sql_pane));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.active_buffer_id() != Some(sql_buffer) && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(
+			editor.active_language_id().map(LanguageId::as_str),
+			Some("sql")
+		);
+		assert_eq!(editor.cached_content(), sql);
+
+		editor.send(EditorCommand::FocusPane(rune_pane));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.active_buffer_id() != Some(rune_buffer) && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(
+			editor.active_language_id().map(LanguageId::as_str),
+			Some("rune")
+		);
+		assert_eq!(editor.cached_content(), "40 + 2");
+	}
+
+	#[test]
 	fn text_pane_title_tracks_the_active_language() {
 		let mut editor = CodeEditor::new("# Markdown\n");
 		wait_for_content(&mut editor, "# Markdown\n");
@@ -4207,7 +4283,9 @@ mod tests {
 			.iter()
 			.map(|cell| {
 				editor
-					.document_text
+					.document_texts
+					.get(&preview.source_buffer_id)
+					.expect("source text cached")
 					.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)
 					.expect("cell range in bounds")
 					.to_owned()

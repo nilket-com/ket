@@ -1918,11 +1918,13 @@ mod tests {
 		};
 		let tabs = [
 			DocTabSummary {
+				buffer_id: libaryon::core::BufferId::new(1),
 				view_id: libaryon::core::ViewId::new(1),
 				title: "a".to_string(),
 				is_dirty: false,
 			},
 			DocTabSummary {
+				buffer_id: libaryon::core::BufferId::new(2),
 				view_id: libaryon::core::ViewId::new(2),
 				title: "b".to_string(),
 				is_dirty: false,
