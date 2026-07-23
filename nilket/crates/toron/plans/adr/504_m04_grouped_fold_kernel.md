@@ -50,3 +50,32 @@ fold cut is grounded and gated; no kernel is pre-authorized.
 The kernel is chosen by the annotate split + the contract check, not here. The m06 layout kernels stay
 held. Whichever fold arm lands, its acceptance rail is the standing one: ledger/annotate shows the
 targeted fold component shrink, digest / 3 rows / zero spill invariant, on the 8,192 coordinate.
+
+## Measured baseline + scope refinements (post-grounding, ADR 504 addendum)
+
+Contract check resolved to **arm #2 (vectorized fold over the borrowed `StringArray`)** — no
+`DictionaryArray` producer exists anywhere in the engine (only `binder.rs:896`, a size-estimation
+fallthrough). Borrow A/B priced ADR 494's already-banked win at **−534 ms** (938→404 ms fold); the
+receipt baseline is the **404 ms borrow-on fold**, not the raw ladder gap.
+
+Loop-mode annotate (28k samples) splits the 404 ms fold: **probe ~72% (~290 ms)** (hash ~70 ms +
+bucket-load + key-compare), **count-update ~24% (~97 ms)** (`aggregate.rs:1953` per-row `AggState`
+enum-match + `Vec::get_mut`), loop ~4%. Precision ±a few points (decode-dilution). **The dict arm's
+forward value is bounded at ~70 ms** — the hash-share a group-by-code fold would delete over the
+vectorized win — recorded as a producer-gated capability, not built.
+
+Two scope-honesty refinements to the kernel build:
+
+1. **Batched key-resolution mutates.** Unlike the join probe, `entry_or_init_single_utf8` cold-inserts
+   groups, so a within-window first occurrence can insert a group that later same-window rows hit. The
+   window resolve must re-walk the live table per key (same argument as `insert_batch`), with a
+   collision-dense equivalence test (the ADR 494 borrowed-hash-identity pattern extended).
+2. **Scope this cut to COUNT-class aggregates.** Vectorized count-update (scan resolved group-index
+   window, bump per-group counters) is clean for COUNT; SUM/AVG need per-group accumulator vectors and
+   per-aggregate kernels — a bigger surface. The batched *window resolution* is shared by all
+   aggregates; the *vectorized update* lands for COUNT-class now, with general-aggregate extension on
+   the forward arc (ADR 495 precedent: the name matches the delivery).
+
+Acceptance rail: **sub-component shrink** (probe and count-update, not just `fold_micros`), digest / 3
+rows / zero spill invariant, borrow A/B not double-counted (baseline = 404 ms borrow-on), **MLP check
+on the resolve path**, full workspace `--no-fail-fast` claimed explicitly.
