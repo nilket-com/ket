@@ -15,10 +15,7 @@ mod throughput_profile;
 pub(in crate::exec) use self::build_profile::{
 	record_existence_summary_profile, record_join_build_profile,
 };
-pub(super) use self::build_rows::{
-	BuildRowList, JoinBuildRows, build_primitive_key_rows, new_int32_join_build_rows,
-	new_int64_join_build_rows, new_join_build_rows,
-};
+pub(super) use self::build_rows::{BuildRowList, JoinBuildRows, build_in_memory_join_rows};
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 pub(in crate::exec) use self::global_fold_profile::{
 	GlobalFoldJoinFilterProfile, GlobalFoldProfileLeaf,
@@ -1346,85 +1343,6 @@ pub(super) fn join_key_at(
 		}
 		JoinKeyPlan::Generic => join_key_bytes(key_arrays, row)?.map(JoinKey::Generic),
 	})
-}
-
-pub(super) fn build_in_memory_join_rows(
-	join_key_plan: JoinKeyPlan,
-	left_key_arrays: &[ArrayRef],
-	rows: usize,
-	memory_cap: u64,
-	null_safe_keys: bool,
-) -> Result<Option<JoinBuildRows>, ExecutionError> {
-	let mut build_rows = match (join_key_plan, null_safe_keys) {
-		(JoinKeyPlan::Int32, false) => new_int32_join_build_rows(rows),
-		(JoinKeyPlan::Int64, false) => new_int64_join_build_rows(rows),
-		_ => new_join_build_rows(rows),
-	};
-	let mut inserted_rows = 0usize;
-
-	match join_key_plan {
-		JoinKeyPlan::Int32 => {
-			let values = single_join_key_array::<Int32Array>(left_key_arrays, "Int32")?;
-			if build_primitive_key_rows(
-				&mut build_rows,
-				rows,
-				memory_cap,
-				left_key_arrays,
-				&mut inserted_rows,
-				|row| (!values.is_null(row)).then(|| values.value(row)),
-				|build_rows, keys, rows| build_rows.insert_int32_batch(keys, rows),
-				|build_rows, key, row| insert_join_build_row(build_rows, JoinKey::Int32(key), row),
-			)?
-			.is_none()
-			{
-				return Ok(None);
-			}
-		}
-		JoinKeyPlan::Int64 => {
-			let values = single_join_key_array::<Int64Array>(left_key_arrays, "Int64")?;
-			if build_primitive_key_rows(
-				&mut build_rows,
-				rows,
-				memory_cap,
-				left_key_arrays,
-				&mut inserted_rows,
-				|row| (!values.is_null(row)).then(|| values.value(row)),
-				|build_rows, keys, rows| build_rows.insert_int64_batch(keys, rows),
-				|build_rows, key, row| insert_join_build_row(build_rows, JoinKey::Int64(key), row),
-			)?
-			.is_none()
-			{
-				return Ok(None);
-			}
-		}
-		JoinKeyPlan::Generic => {
-			for row in 0..rows {
-				let key = if null_safe_keys {
-					join_key_bytes_null_safe(left_key_arrays, row)?
-				} else {
-					let Some(key) = join_key_bytes(left_key_arrays, row)? else {
-						continue;
-					};
-					key
-				};
-				if !join_build_memory_fits(
-					left_key_arrays,
-					inserted_rows.saturating_add(1),
-					memory_cap,
-				) {
-					return Ok(None);
-				}
-				insert_join_build_row(
-					&mut build_rows,
-					JoinKey::Generic(key),
-					join_build_row_index(row)?,
-				);
-				inserted_rows = inserted_rows.saturating_add(1);
-			}
-		}
-	}
-
-	Ok(Some(build_rows))
 }
 
 /// ADR 497: drive one primitive-key probe arm through the staged batch window

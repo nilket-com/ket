@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use ahash::RandomState;
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
 
 use crate::error::ExecutionError;
 
-use super::JoinKey;
+use super::{JoinKey, JoinKeyPlan};
 
 #[derive(Debug, Clone)]
 pub(in crate::exec) struct BuildRowList {
@@ -89,6 +89,36 @@ pub(super) fn batched_build_prefetch_enabled() -> bool {
 	})
 }
 
+/// How a primitive build feeds its keys to the table: staged through a prefetch window, or one key
+/// at a time. Passed into the driver rather than read inside it because the environment answer is
+/// latched in a `OnceLock` — a process can only ever observe one arm, which would leave the ablation
+/// path permanently unexercisable from a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) enum BuildInsertMode {
+	Windowed,
+	Scalar,
+}
+
+impl BuildInsertMode {
+	/// How many keys are staged before a flush. `Scalar` is window 1, which is what makes it the
+	/// true one-key-at-a-time path rather than a smaller batch.
+	fn window(self) -> usize {
+		match self {
+			BuildInsertMode::Windowed => PROBE_BATCH_WINDOW,
+			BuildInsertMode::Scalar => 1,
+		}
+	}
+}
+
+/// The mode production runs in, from the latched ablation env.
+pub(in crate::exec) fn build_insert_mode() -> BuildInsertMode {
+	if batched_build_prefetch_enabled() {
+		BuildInsertMode::Windowed
+	} else {
+		BuildInsertMode::Scalar
+	}
+}
+
 /// Best-effort prefetch of the cache line holding `value`. Additive over the
 /// batching itself; on non-x86_64 targets the staged loads alone provide the
 /// memory-level parallelism and results are byte-identical.
@@ -114,14 +144,18 @@ pub(in crate::exec) fn build_primitive_key_rows<K: Copy>(
 	memory_cap: u64,
 	left_key_arrays: &[ArrayRef],
 	inserted_rows: &mut usize,
+	mode: BuildInsertMode,
 	key_at: impl Fn(usize) -> Option<K>,
 	insert_window: impl Fn(&mut JoinBuildRows, &[K], &[u32]),
 	insert_scalar: impl Fn(&mut JoinBuildRows, K, u32),
 ) -> Result<Option<()>, ExecutionError> {
-	let batched = batched_build_prefetch_enabled();
-	let window = if batched { PROBE_BATCH_WINDOW } else { 1 };
+	let window = mode.window();
 	let mut key_window: Vec<K> = Vec::with_capacity(window);
 	let mut row_window: Vec<u32> = Vec::with_capacity(window);
+	let flush = |build_rows: &mut JoinBuildRows, keys: &[K], row_ids: &[u32]| match mode {
+		BuildInsertMode::Windowed => insert_window(build_rows, keys, row_ids),
+		BuildInsertMode::Scalar => insert_scalar(build_rows, keys[0], row_ids[0]),
+	};
 	for row in 0..rows {
 		let Some(key) = key_at(row) else {
 			continue;
@@ -140,19 +174,123 @@ pub(in crate::exec) fn build_primitive_key_rows<K: Copy>(
 		row_window.push(super::join_build_row_index(row)?);
 		*inserted_rows = inserted_rows.saturating_add(1);
 		if key_window.len() == window {
-			if batched {
-				insert_window(build_rows, &key_window, &row_window);
-			} else {
-				insert_scalar(build_rows, key_window[0], row_window[0]);
-			}
+			flush(build_rows, &key_window, &row_window);
 			key_window.clear();
 			row_window.clear();
 		}
 	}
+	// The tail is only ever non-empty in `Windowed` mode — `Scalar` flushes on every key — but it
+	// dispatches on the mode anyway so there is exactly one notion of "flush" in this driver.
 	if !key_window.is_empty() {
-		insert_window(build_rows, &key_window, &row_window);
+		flush(build_rows, &key_window, &row_window);
 	}
 	Ok(Some(()))
+}
+
+pub(in crate::exec) fn build_in_memory_join_rows(
+	join_key_plan: JoinKeyPlan,
+	left_key_arrays: &[ArrayRef],
+	rows: usize,
+	memory_cap: u64,
+	null_safe_keys: bool,
+) -> Result<Option<JoinBuildRows>, ExecutionError> {
+	build_in_memory_join_rows_with_insert_mode(
+		join_key_plan,
+		left_key_arrays,
+		rows,
+		memory_cap,
+		null_safe_keys,
+		build_insert_mode(),
+	)
+}
+
+/// The build with its insert mode named by the caller. Production goes through
+/// [`build_in_memory_join_rows`], which supplies the latched ablation answer; naming the mode here
+/// is what lets a test drive both arms of ADR 503 in one process and compare their tables.
+pub(in crate::exec) fn build_in_memory_join_rows_with_insert_mode(
+	join_key_plan: JoinKeyPlan,
+	left_key_arrays: &[ArrayRef],
+	rows: usize,
+	memory_cap: u64,
+	null_safe_keys: bool,
+	insert_mode: BuildInsertMode,
+) -> Result<Option<JoinBuildRows>, ExecutionError> {
+	let mut build_rows = match (join_key_plan, null_safe_keys) {
+		(JoinKeyPlan::Int32, false) => new_int32_join_build_rows(rows),
+		(JoinKeyPlan::Int64, false) => new_int64_join_build_rows(rows),
+		_ => new_join_build_rows(rows),
+	};
+	let mut inserted_rows = 0usize;
+
+	match join_key_plan {
+		JoinKeyPlan::Int32 => {
+			let values = super::single_join_key_array::<Int32Array>(left_key_arrays, "Int32")?;
+			if build_primitive_key_rows(
+				&mut build_rows,
+				rows,
+				memory_cap,
+				left_key_arrays,
+				&mut inserted_rows,
+				insert_mode,
+				|row| (!values.is_null(row)).then(|| values.value(row)),
+				|build_rows, keys, rows| build_rows.insert_int32_batch(keys, rows),
+				|build_rows, key, row| {
+					super::insert_join_build_row(build_rows, JoinKey::Int32(key), row)
+				},
+			)?
+			.is_none()
+			{
+				return Ok(None);
+			}
+		}
+		JoinKeyPlan::Int64 => {
+			let values = super::single_join_key_array::<Int64Array>(left_key_arrays, "Int64")?;
+			if build_primitive_key_rows(
+				&mut build_rows,
+				rows,
+				memory_cap,
+				left_key_arrays,
+				&mut inserted_rows,
+				insert_mode,
+				|row| (!values.is_null(row)).then(|| values.value(row)),
+				|build_rows, keys, rows| build_rows.insert_int64_batch(keys, rows),
+				|build_rows, key, row| {
+					super::insert_join_build_row(build_rows, JoinKey::Int64(key), row)
+				},
+			)?
+			.is_none()
+			{
+				return Ok(None);
+			}
+		}
+		JoinKeyPlan::Generic => {
+			for row in 0..rows {
+				let key = if null_safe_keys {
+					super::join_key_bytes_null_safe(left_key_arrays, row)?
+				} else {
+					let Some(key) = super::join_key_bytes(left_key_arrays, row)? else {
+						continue;
+					};
+					key
+				};
+				if !super::join_build_memory_fits(
+					left_key_arrays,
+					inserted_rows.saturating_add(1),
+					memory_cap,
+				) {
+					return Ok(None);
+				}
+				super::insert_join_build_row(
+					&mut build_rows,
+					JoinKey::Generic(key),
+					super::join_build_row_index(row)?,
+				);
+				inserted_rows = inserted_rows.saturating_add(1);
+			}
+		}
+	}
+
+	Ok(Some(build_rows))
 }
 
 impl JoinBuildRows {
@@ -701,9 +839,10 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
 
+	use crate::exec::join::build_rows::new_join_build_rows;
 	use crate::exec::join::{
 		JoinBuildRows, JoinKey, JoinKeyPlan, JoinOutputRow, build_in_memory_join_rows,
-		estimated_build_hash_bytes, insert_join_build_row, join_key_bytes, new_join_build_rows,
+		estimated_build_hash_bytes, insert_join_build_row, join_key_bytes,
 		probe_in_memory_join_rows,
 	};
 	use crate::ir::JoinKind;
@@ -718,7 +857,7 @@ mod tests {
 
 	#[test]
 	fn adr497_batched_probe_matches_scalar_across_collisions_nulls_and_misses() {
-		use crate::exec::join::new_int64_join_build_rows;
+		use crate::exec::join::build_rows::new_int64_join_build_rows;
 
 		// Small table → few buckets → dense collision chains; keys straddle
 		// multiple windows and include duplicates, absent keys, and nulls.
@@ -758,7 +897,7 @@ mod tests {
 
 	#[test]
 	fn adr503_batched_insert_matches_scalar_across_collisions_and_duplicates() {
-		use crate::exec::join::new_int64_join_build_rows;
+		use crate::exec::join::build_rows::new_int64_join_build_rows;
 
 		// 40 distinct keys sized into 128 buckets (capacity 64) — the open-addressing table
 		// is pre-sized with no resize, so it must hold every distinct key with headroom.
@@ -792,6 +931,251 @@ mod tests {
 		}
 		assert!(scalar.get_int64(9_999).is_none());
 		assert!(batched.get_int64(9_999).is_none());
+	}
+
+	/// ADR 503's driver — the windowing, null-skip and bail logic in `build_primitive_key_rows` —
+	/// as opposed to `insert_int64_batch`, which the ablation test above drives with hand-chunked
+	/// keys and so never enters the driver at all. Every case here crosses a window boundary; the
+	/// pre-existing `build_in_memory_join_rows` tests all pass fewer than `PROBE_BATCH_WINDOW` rows,
+	/// so the full-window flush had no coverage.
+	mod adr503_driver {
+		use super::*;
+		use crate::exec::join::build_rows::{
+			BuildInsertMode, PROBE_BATCH_WINDOW, build_in_memory_join_rows_with_insert_mode,
+		};
+		use crate::exec::join::{estimated_build_hash_bytes, join_build_memory_fits};
+
+		/// Keys spanning two full windows plus a partial tail, with nulls at an interval coprime to
+		/// the window so null-skipping desynchronizes window packing from the row index — the case
+		/// where a driver that staged by row rather than by admitted key would drift.
+		fn keys_across_windows() -> Vec<Option<i64>> {
+			(0..(PROBE_BATCH_WINDOW * 2 + 7))
+				.map(|row| {
+					if row % 7 == 3 {
+						None
+					} else {
+						Some((row as i64 * 13) % 40)
+					}
+				})
+				.collect()
+		}
+
+		fn int64_key_arrays(keys: &[Option<i64>]) -> Vec<ArrayRef> {
+			vec![Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef]
+		}
+
+		fn table_by_key(rows: &JoinBuildRows, keys: &[Option<i64>]) -> Vec<(i64, Vec<u32>)> {
+			let mut distinct: Vec<i64> = keys.iter().flatten().copied().collect();
+			distinct.sort_unstable();
+			distinct.dedup();
+			distinct
+				.into_iter()
+				.map(|key| {
+					let list = rows
+						.get(&JoinKey::Int64(key))
+						.unwrap_or_else(|| panic!("key {key} absent from build table"));
+					(key, list.rows().collect::<Vec<_>>())
+				})
+				.collect()
+		}
+
+		#[test]
+		fn windowed_and_scalar_agree_across_boundaries_nulls_and_tail() {
+			let keys = keys_across_windows();
+			let key_arrays = int64_key_arrays(&keys);
+			let rows = keys.len();
+			assert!(
+				rows > PROBE_BATCH_WINDOW * 2,
+				"the fixture must cross more than one full window flush"
+			);
+			assert!(
+				rows % PROBE_BATCH_WINDOW != 0,
+				"the fixture must leave a partial tail to flush"
+			);
+
+			let windowed = build_in_memory_join_rows_with_insert_mode(
+				JoinKeyPlan::Int64,
+				&key_arrays,
+				rows,
+				u64::MAX,
+				false,
+				BuildInsertMode::Windowed,
+			)
+			.expect("windowed build")
+			.expect("windowed build fits in memory");
+			let scalar = build_in_memory_join_rows_with_insert_mode(
+				JoinKeyPlan::Int64,
+				&key_arrays,
+				rows,
+				u64::MAX,
+				false,
+				BuildInsertMode::Scalar,
+			)
+			.expect("scalar build")
+			.expect("scalar build fits in memory");
+
+			assert_eq!(
+				table_by_key(&windowed, &keys),
+				table_by_key(&scalar, &keys),
+				"windowed insert diverged from the one-key-at-a-time path"
+			);
+			assert_eq!(windowed.len(), scalar.len());
+
+			// The row ids are the *source* row indices, so a null-skip that shifted packing would
+			// show up here as an off-by-one even though both arms agreed with each other.
+			let expected_rows_for_first_key: Vec<u32> = keys
+				.iter()
+				.enumerate()
+				.filter(|(_, key)| **key == keys.iter().flatten().next().copied())
+				.map(|(row, _)| row as u32)
+				.collect();
+			let first_key = keys.iter().flatten().next().copied().expect("a live key");
+			assert_eq!(
+				windowed
+					.get(&JoinKey::Int64(first_key))
+					.expect("first key present")
+					.rows()
+					.collect::<Vec<_>>(),
+				expected_rows_for_first_key,
+				"row ids must index source rows, skipping nulls rather than renumbering"
+			);
+		}
+
+		#[test]
+		fn nulls_are_skipped_not_inserted() {
+			let keys = keys_across_windows();
+			let key_arrays = int64_key_arrays(&keys);
+			let live = keys.iter().flatten().count();
+			assert!(keys.len() > live, "the fixture must contain nulls");
+
+			let rows = build_in_memory_join_rows_with_insert_mode(
+				JoinKeyPlan::Int64,
+				&key_arrays,
+				keys.len(),
+				u64::MAX,
+				false,
+				BuildInsertMode::Windowed,
+			)
+			.expect("build")
+			.expect("fits in memory");
+
+			let inserted: usize = table_by_key(&rows, &keys)
+				.iter()
+				.map(|(_, row_ids)| row_ids.len())
+				.sum();
+			assert_eq!(
+				inserted, live,
+				"exactly the non-null rows are inserted; nulls never reach the table"
+			);
+		}
+
+		/// The bail is checked before the key is staged, so a cap that admits `admitted` rows must
+		/// refuse the next one — landing mid-window, with staged-but-unflushed keys pending.
+		#[test]
+		fn mid_window_memory_bail_discards_the_partial_table() {
+			let keys: Vec<Option<i64>> = (0..(PROBE_BATCH_WINDOW as i64 * 3))
+				.map(|row| Some(row % 40))
+				.collect();
+			let key_arrays = int64_key_arrays(&keys);
+			let admitted = PROBE_BATCH_WINDOW + PROBE_BATCH_WINDOW / 2;
+			let cap = estimated_build_hash_bytes(&key_arrays, admitted);
+
+			// Pin the boundary the driver is being held to, so a change in the estimator surfaces
+			// here rather than silently turning this into a test that never bails.
+			assert!(join_build_memory_fits(&key_arrays, admitted, cap));
+			assert!(!join_build_memory_fits(&key_arrays, admitted + 1, cap));
+			assert!(
+				admitted % PROBE_BATCH_WINDOW != 0,
+				"the bail must land mid-window, with keys staged but not yet flushed"
+			);
+
+			for mode in [BuildInsertMode::Windowed, BuildInsertMode::Scalar] {
+				let bailed = build_in_memory_join_rows_with_insert_mode(
+					JoinKeyPlan::Int64,
+					&key_arrays,
+					keys.len(),
+					cap,
+					false,
+					mode,
+				)
+				.expect("bail is not an error");
+				assert!(
+					bailed.is_none(),
+					"{mode:?} must hand the caller None, never a partially-built table"
+				);
+			}
+		}
+
+		#[test]
+		fn a_cap_that_admits_every_row_builds_the_whole_table() {
+			let keys: Vec<Option<i64>> = (0..(PROBE_BATCH_WINDOW as i64 * 3))
+				.map(|row| Some(row % 40))
+				.collect();
+			let key_arrays = int64_key_arrays(&keys);
+			let cap = estimated_build_hash_bytes(&key_arrays, keys.len());
+
+			let rows = build_in_memory_join_rows_with_insert_mode(
+				JoinKeyPlan::Int64,
+				&key_arrays,
+				keys.len(),
+				cap,
+				false,
+				BuildInsertMode::Windowed,
+			)
+			.expect("build")
+			.expect("a cap sized for every row must not bail");
+
+			let inserted: usize = table_by_key(&rows, &keys)
+				.iter()
+				.map(|(_, row_ids)| row_ids.len())
+				.sum();
+			assert_eq!(inserted, keys.len());
+		}
+
+		/// Answer-level parity: the two arms must not merely build equal tables, they must produce
+		/// the same join output when probed.
+		#[test]
+		fn probing_both_arms_yields_identical_join_output() {
+			let keys = keys_across_windows();
+			let left_batch = int64_batch(keys.clone());
+			let key_arrays = key_arrays(&left_batch);
+			let right_batch = int64_batch(
+				(0..(PROBE_BATCH_WINDOW as i64 + 11))
+					.map(|row| match row % 6 {
+						0 => None,
+						1 => Some(row % 97),
+						_ => Some((row * 13) % 40),
+					})
+					.collect(),
+			);
+
+			let mut outputs = Vec::new();
+			for mode in [BuildInsertMode::Windowed, BuildInsertMode::Scalar] {
+				let rows = build_in_memory_join_rows_with_insert_mode(
+					JoinKeyPlan::Int64,
+					&key_arrays,
+					keys.len(),
+					u64::MAX,
+					false,
+					mode,
+				)
+				.expect("build")
+				.expect("fits in memory");
+				outputs.push(probe_int64(
+					JoinKind::Inner,
+					&rows,
+					left_batch.num_rows(),
+					&left_batch,
+					&right_batch,
+				));
+			}
+
+			assert!(!outputs[0].is_empty(), "the fixture must produce matches");
+			assert_eq!(
+				outputs[0], outputs[1],
+				"windowed and scalar builds answered the same probe differently"
+			);
+		}
 	}
 
 	#[test]
