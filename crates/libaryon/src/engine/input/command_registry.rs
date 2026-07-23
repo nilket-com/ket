@@ -306,7 +306,7 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 	},
 	CommandSpec {
 		name: "panehsplit",
-		aliases: &["paneh", "ph"],
+		aliases: &["phs"],
 		bang: false,
 		args: ArgSpec::None,
 		completion: ArgCompletion::None,
@@ -317,8 +317,20 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_pane_hsplit),
 	},
 	CommandSpec {
+		name: "panehnew",
+		aliases: &["paneh", "ph", "new"],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Panes,
+		usage: ":ph [LANGUAGE]",
+		summary: "Open a new empty horizontal pane",
+		help: "Splits the focused pane into top and bottom halves with a new empty document, optionally selecting its language.",
+		dispatch: DispatchKind::Exact(cmd_pane_hnew),
+	},
+	CommandSpec {
 		name: "panevsplit",
-		aliases: &["panev", "pv"],
+		aliases: &["pvs"],
 		bang: false,
 		args: ArgSpec::None,
 		completion: ArgCompletion::None,
@@ -327,6 +339,18 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		summary: "Split the focused pane vertically",
 		help: "Splits the focused pane into left and right halves showing the same document.",
 		dispatch: DispatchKind::Exact(cmd_pane_vsplit),
+	},
+	CommandSpec {
+		name: "panevnew",
+		aliases: &["panev", "pv", "vnew"],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Panes,
+		usage: ":pv [LANGUAGE]",
+		summary: "Open a new empty vertical pane",
+		help: "Splits the focused pane into left and right halves with a new empty document, optionally selecting its language.",
+		dispatch: DispatchKind::Exact(cmd_pane_vnew),
 	},
 	CommandSpec {
 		name: "paneclose",
@@ -795,8 +819,22 @@ fn cmd_pane_hsplit(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
 	ctx.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
 }
 
+fn cmd_pane_hnew(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::NewPane {
+		direction: SplitDirection::Horizontal,
+		language: (!inv.args.is_empty()).then(|| inv.args.to_string()),
+	});
+}
+
 fn cmd_pane_vsplit(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
 	ctx.send(EditorCommand::SplitPane(SplitDirection::Vertical));
+}
+
+fn cmd_pane_vnew(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::NewPane {
+		direction: SplitDirection::Vertical,
+		language: (!inv.args.is_empty()).then(|| inv.args.to_string()),
+	});
 }
 
 fn cmd_pane_close(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {

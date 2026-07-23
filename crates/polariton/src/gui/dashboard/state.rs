@@ -169,10 +169,30 @@ impl DashboardState {
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	) {
 		if let Some(pane) = pane {
+			// A rebuild for a pane the user closed mid-flight stays a no-op
+			// rather than resurrecting the pane.
 			if let Some(plot_state) = self.content.get_mut(&pane) {
 				plot_state.set_kernel(composition, kernel);
 			}
 			return;
+		}
+		let _ = self.apply_plot_replacing(None, composition, kernel);
+	}
+
+	/// Deliver a plot to `pane` when it still exists, otherwise to a new pane.
+	/// Returns the pane actually used so callers that own a stable plot
+	/// surface — the plain Rune buffer's — can keep replacing in place.
+	pub fn apply_plot_replacing(
+		&mut self,
+		pane: Option<PaneId>,
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	) -> PaneId {
+		if let Some(pane) = pane
+			&& let Some(plot_state) = self.content.get_mut(&pane)
+		{
+			plot_state.set_kernel(composition, kernel);
+			return pane;
 		}
 
 		let new_plot = PlotPaneState::with_kernel(composition, kernel, 1200, 1200);
@@ -185,10 +205,12 @@ impl DashboardState {
 				.split(Axis::Horizontal, first_pane)
 				.expect("dashboard split failed");
 			self.content.insert(new_pane, new_plot);
+			new_pane
 		} else {
 			let (dashboard, pane) = PaneState::with_initial_pane();
 			self.panes = Some(dashboard);
 			self.content.insert(pane, new_plot);
+			pane
 		}
 	}
 }

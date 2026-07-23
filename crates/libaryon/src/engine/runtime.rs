@@ -1277,6 +1277,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::ActivateDocTab { .. }
 		| EditorCommand::CloseDocTab { .. }
 		| EditorCommand::SplitPane(_)
+		| EditorCommand::NewPane { .. }
 		| EditorCommand::ClosePane
 		| EditorCommand::ResizePane(_, _)
 		| EditorCommand::ResizePaneBoundary { .. }
@@ -1973,6 +1974,73 @@ fn dispatch_command(
 			if split_target_pane(runtime.registry, session, direction) {
 				reset_global_transients(session);
 				needs_render = true;
+			}
+		}
+		EditorCommand::NewPane {
+			direction,
+			language,
+		} => {
+			let target_pane_id = if session
+				.layout
+				.find_pane(session.focused_pane_id)
+				.is_some_and(|pane| pane.active_tab().is_file_browser())
+			{
+				select_browser_target_pane(session, session.focused_pane_id)
+					.unwrap_or(session.focused_pane_id)
+			} else {
+				session.focused_pane_id
+			};
+			let view = session.create_unnamed_text_view(
+				runtime.registry,
+				crate::core::DEFAULT_VIEWPORT_WIDTH,
+				crate::core::DEFAULT_VIEWPORT_LINES,
+			);
+			if let Ok(view) = view {
+				let buffer_id = view.buffer_id;
+				let new_pane = EditorPane::from_view(view);
+				if session
+					.split_pane_with_new_pane_order(target_pane_id, direction, new_pane, false)
+					.is_some()
+				{
+					reset_global_transients(session);
+					needs_render = true;
+					if let Some(language) = language {
+						let EditorSession {
+							buffers,
+							layout,
+							events,
+							focused_pane_id,
+							ui,
+							persistent_settings,
+							..
+						} = session;
+						let view_id = focused_doctab(layout, *focused_pane_id).id;
+						if let Some(effect) = with_text_buffer_mut(
+							runtime.registry,
+							buffers,
+							layout,
+							events,
+							view_id,
+							|tab| {
+								handle_language_doctab_command(
+									runtime.lang_registry,
+									tab,
+									&mut ui.status_message,
+									Some(language),
+								)
+							},
+						) {
+							if let Err(err) =
+								re_resolve_auto_themes(buffers, layout, persistent_settings)
+							{
+								ui.status_message = Some(err);
+							}
+							needs_render |= effect.needs_render;
+						}
+					}
+				} else {
+					session.buffers.remove(buffer_id);
+				}
 			}
 		}
 		EditorCommand::ClosePane => {

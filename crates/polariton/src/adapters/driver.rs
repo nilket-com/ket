@@ -62,6 +62,41 @@ pub struct AdapterState {
 	pub fields: BTreeMap<String, String>,
 	pub configuration: AdapterConfiguration,
 	pub connection: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
+	/// Session-local in-memory SQLite scratch database. Always the SQL target
+	/// when no external adapter is connected, so SQL panes and notebook cells
+	/// work out of the box and share tables. Never persisted; disconnecting an
+	/// external adapter falls back here instead of leaving SQL unusable. The
+	/// `Arc` lives for the whole session, so scratch tables survive a round
+	/// trip through an external connection.
+	pub scratch: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
+}
+
+impl AdapterState {
+	/// The connection SQL executes against: the external adapter when one is
+	/// connected, otherwise the session scratch database.
+	pub fn sql_connection(&self) -> Option<&Arc<RwLock<dyn DatabaseAdapter>>> {
+		self.connection.as_ref().or(self.scratch.as_ref())
+	}
+
+	pub fn scratch_is_active(&self) -> bool {
+		self.connection.is_none() && self.scratch.is_some()
+	}
+
+	/// Dispatch-time identity recorded in result provenance.
+	pub fn connection_identity(&self) -> String {
+		if self.scratch_is_active() {
+			return "scratch".to_owned();
+		}
+		if !self.name.trim().is_empty() {
+			return self.name.clone();
+		}
+		self.selection.adapter_type_str().to_owned()
+	}
+
+	pub async fn open_scratch() -> Option<Arc<RwLock<dyn DatabaseAdapter>>> {
+		let aconn = AsyncConnection::open_in_memory().await.ok()?;
+		Some(Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })))
+	}
 }
 
 impl AdapterConfiguration {
@@ -250,7 +285,43 @@ pub fn fields_for(selection: &AdapterSelection) -> &'static [AdapterField] {
 
 #[cfg(test)]
 mod tests {
-	use super::AdapterConfiguration;
+	use super::{AdapterConfiguration, AdapterState};
+
+	#[test]
+	fn sql_connection_prefers_external_and_falls_back_to_scratch() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let mut state = AdapterState::default();
+		assert!(state.sql_connection().is_none());
+		assert!(!state.scratch_is_active());
+
+		state.scratch = runtime.block_on(AdapterState::open_scratch());
+		assert!(state.scratch.is_some());
+		assert!(state.scratch_is_active());
+		let scratch = state.sql_connection().expect("scratch target").clone();
+		assert!(std::sync::Arc::ptr_eq(
+			&scratch,
+			state.scratch.as_ref().unwrap()
+		));
+
+		// An external connection takes over; disconnecting falls back to the
+		// same scratch instance, so its tables survive the round trip.
+		let external = runtime
+			.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
+				connection_string: "memory".into(),
+			}))
+			.expect("external sqlite");
+		state.connection = Some(external.clone());
+		assert!(!state.scratch_is_active());
+		assert!(std::sync::Arc::ptr_eq(
+			state.sql_connection().expect("external target"),
+			&external
+		));
+		state.connection = None;
+		assert!(std::sync::Arc::ptr_eq(
+			state.sql_connection().expect("scratch target"),
+			&scratch
+		));
+	}
 
 	#[test]
 	fn saved_configuration_keeps_adapter_specific_field_names() {
@@ -266,5 +337,22 @@ mod tests {
 			AdapterConfiguration::from_saved("unknown", "ignored"),
 			AdapterConfiguration::None
 		));
+	}
+
+	#[test]
+	fn provenance_identity_distinguishes_scratch_named_and_typed_connections() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let mut state = AdapterState::default();
+		state.scratch = runtime.block_on(AdapterState::open_scratch());
+		assert_eq!(state.connection_identity(), "scratch");
+
+		state.connection = runtime.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
+			connection_string: "memory".into(),
+		}));
+		state.selection = super::AdapterSelection::SQLite;
+		assert_eq!(state.connection_identity(), "SQLite");
+
+		state.name = "local-dev".to_owned();
+		assert_eq!(state.connection_identity(), "local-dev");
 	}
 }

@@ -332,6 +332,13 @@ impl CodeEditor {
 		self.viewport.as_ref()?.focused_pane()?.language_id
 	}
 
+	/// Stable identity of the focused document, independent of which view is
+	/// showing it. Async SQL publications and Rune plot surfaces capture this
+	/// before dispatch so later focus changes cannot reroute their output.
+	pub fn active_buffer_id(&self) -> Option<libaryon::core::BufferId> {
+		Some(self.viewport.as_ref()?.focused_pane()?.buffer_id)
+	}
+
 	/// Code to run from the focused editor context: an active visual selection,
 	/// or the cursor's logical line when no selection exists.
 	pub fn selected_or_current_line(&self) -> Option<String> {
@@ -2844,6 +2851,65 @@ mod tests {
 		// The empty row leaves the surface untouched.
 		let empty_y = widget.sparse_line_px() + 1;
 		assert_eq!(pixel(8, empty_y), (base.r, base.g, base.b));
+	}
+
+	#[test]
+	fn cached_content_converges_via_engine_wake_alone() {
+		let mut editor = CodeEditor::new("");
+		// Simulate the GUI: typing forwards input + requests content; the wake
+		// subscription then delivers EngineReady, which polls.
+		send_keys(&mut editor, "i".chars());
+		send_keys(&mut editor, "select 1 as x".chars());
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		while std::time::Instant::now() < deadline {
+			let _ = editor.update(EditorMsg::EngineReady);
+			if editor.cached_content().contains("select 1 as x") {
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		assert!(
+			editor.cached_content().contains("select 1 as x"),
+			"cached_content: {:?}",
+			editor.cached_content()
+		);
+	}
+	#[test]
+	fn cached_content_tracks_typing_in_new_independent_pane() {
+		let mut editor = CodeEditor::new("");
+		let pump = |editor: &mut CodeEditor| {
+			let deadline = std::time::Instant::now() + Duration::from_millis(500);
+			while std::time::Instant::now() < deadline {
+				let _ = editor.update(EditorMsg::EngineReady);
+				thread::sleep(Duration::from_millis(5));
+			}
+		};
+		// Open an independent vertical pane, then type into it.
+		send_keys(&mut editor, ":pv".chars());
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Enter,
+			modifiers: Modifiers::NONE,
+		}));
+		pump(&mut editor);
+		send_keys(&mut editor, "i".chars());
+		send_keys(&mut editor, "select 1 as x".chars());
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		while std::time::Instant::now() < deadline {
+			let _ = editor.update(EditorMsg::EngineReady);
+			if editor.cached_content().contains("select 1 as x") {
+				break;
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		assert!(
+			editor.cached_content().contains("select 1 as x"),
+			"cached_content after :pv: {:?}",
+			editor.cached_content()
+		);
+		assert_eq!(
+			editor.selected_or_current_line().as_deref(),
+			Some("select 1 as x")
+		);
 	}
 
 	#[test]

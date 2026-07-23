@@ -3129,6 +3129,50 @@ mod tests {
 	}
 
 	#[test]
+	fn new_pane_owns_an_independent_empty_buffer() {
+		let scratch_path = temp_test_path("new-pane").with_extension("txt");
+		std::fs::write(&scratch_path, "plain text\n").expect("write new-pane file");
+		let scratch_name = scratch_path.to_string_lossy().to_string();
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+
+		let original = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(scratch_name.clone()),
+		);
+		let original_pane_id = original.focused_pane_id;
+
+		let new_pane = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::NewPane {
+				direction: crate::engine::SplitDirection::Horizontal,
+				language: Some("sql".to_string()),
+			},
+		);
+		assert_eq!(new_pane.panes.len(), 2);
+		assert_ne!(new_pane.focused_pane_id, original_pane_id);
+		assert_eq!(new_pane.file_name, None);
+
+		assert_eq!(
+			new_pane.language_id.as_ref().map(|id| id.as_str()),
+			Some("sql")
+		);
+
+		let original = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::FocusPane(original_pane_id),
+		);
+		assert_eq!(original.file_name.as_deref(), Some(scratch_name.as_str()));
+		assert_eq!(original.language_id, None);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+		let _ = std::fs::remove_file(scratch_path);
+	}
+
+	#[test]
 	fn closing_the_last_ordinary_tab_in_a_split_closes_its_pane() {
 		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
 		let initial = send_cmd_and_recv(
@@ -4153,10 +4197,16 @@ mod tests {
 			};
 			match rx_view.recv_timeout(timeout) {
 				Ok(mut view) => {
+					// Busy views are not settled results, but they may carry the
+					// command's status message (e.g. a language switch renders
+					// its status while workspace hydration is already running).
+					// Harvest the status from every view; only settled views
+					// become the returned viewport.
+					if view.status_message.is_some() {
+						status_message = view.status_message.clone();
+					}
 					if !view.busy {
-						if view.status_message.is_some() {
-							status_message = view.status_message.clone();
-						} else if status_message.is_some() {
+						if status_message.is_some() {
 							view.status_message = status_message.clone();
 						}
 						last = Some(view);

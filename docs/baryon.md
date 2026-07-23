@@ -167,7 +167,7 @@ Command mode:
 - `:q`, `:exit`, or `:quit` quit
 - `:e path` open another file; bare `:e` reloads from disk (`:e!` discards changes)
 - `:tab`, `:tabedit path` (`:te`), `:tabnext` (`:tn`), `:tabprev` (`:tp`), `:tabclose` (`:tc`) manage tabs
-- `:panehsplit` (`:paneh`, `:ph`), `:panevsplit` (`:panev`, `:pv`), and `:paneclose` (`:panec`, `:pc`) manage panes; `:panediff path` (`:paned`, `:pd`) diffs against another file
+- `:panehnew [language]` (`:paneh`, `:ph`, `:new`) and `:panevnew [language]` (`:panev`, `:pv`, `:vnew`) open an independent empty document; `:panehsplit` (`:phs`) and `:panevsplit` (`:pvs`) open another view of the current document; `:paneclose` (`:panec`, `:pc`) closes a pane; `:panediff path` (`:paned`, `:pd`) diffs against another file
 - `:tree` opens the file browser
 - `:mdpreview` opens a live markdown preview
 - `:theme name` switches the color theme; `:language lang` overrides syntax detection

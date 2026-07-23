@@ -236,6 +236,10 @@ pub struct HostPanelViewport {
 
 pub struct PaneViewport {
 	pub pane_id: PaneId,
+	/// Stable identity of the active buffer. A buffer can have multiple views;
+	/// hosts use this identity when an asynchronous product belongs to the
+	/// document rather than to one particular view of it.
+	pub buffer_id: BufferId,
 	/// Identity of the active view projected in this pane.
 	pub view_id: ViewId,
 	pub rect: PaneRect,

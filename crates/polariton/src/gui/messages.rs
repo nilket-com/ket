@@ -5,9 +5,11 @@ use crate::adapters::{
 };
 use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
-use crate::notebook_rune::PlotEffect;
 use crate::plot::common::PlotKernel;
+use crate::plot::request::ResolvedPlot;
+use crate::result_registry::PendingPublication;
 use iced::window;
+use libaryon::core::BufferId;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -34,6 +36,8 @@ pub enum Message {
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,
 	AdapterConnected(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
+	/// The session's in-memory scratch database finished opening at startup.
+	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),
 	Dashboard(DashboardMsg),
 	CloseSettings,
@@ -54,27 +58,51 @@ pub enum Message {
 	ResizeWindow(window::Direction),
 	Run,
 	RunSnippet,
-	RunResult(ExecutionResult),
-	RunLanguageResult(std::result::Result<String, String>),
+	RunResult {
+		result: ExecutionResult,
+		/// A `-- @result name` claim made at dispatch, redeemed against the
+		/// session registry when the execution concludes.
+		publish: Option<PendingPublication>,
+	},
 	RunMarkdownCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
 		result: ExecutionResult,
 	},
+	/// A plain Rune buffer finished: its trailing-expression display plus at
+	/// most one planned plot, per the one-buffer-one-plot-pane rule.
+	RunRuneBufferResult {
+		source_buffer: BufferId,
+		revision: u64,
+		result: std::result::Result<RuneBufferOutcome, String>,
+	},
+	RuneBufferPlotReady {
+		source_buffer: BufferId,
+		revision: u64,
+		resolved: ResolvedPlot,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	},
 	RunRuneCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
-		result: std::result::Result<PlotEffect, String>,
+		result: std::result::Result<ResolvedPlot, String>,
 	},
 	NotebookPlotReady {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
-		effect: PlotEffect,
+		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
 	SaveWindowSizeAndClose(iced::Size),
 	ShowColumnTypesSaved,
 	ToggleShowColumnTypes(bool),
+}
+
+/// What a plain Rune buffer run delivers back to the update loop.
+#[derive(Clone)]
+pub struct RuneBufferOutcome {
+	pub display: Option<String>,
+	pub plot: Option<ResolvedPlot>,
 }
 
 pub use crate::gui::plot_pane::PlotPaneMsg as PlotMessage;

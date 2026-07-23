@@ -377,6 +377,7 @@ mod tests {
 			viewport_id: crate::core::ViewportId::new(1),
 			panes: vec![PaneViewport {
 				pane_id,
+				buffer_id: crate::core::BufferId::new(1),
 				view_id,
 				rect: PaneRect::new(
 					ScreenCol::ZERO,

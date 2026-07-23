@@ -148,6 +148,7 @@ impl EditorCommand {
 				| Self::ActivateDocTab { .. }
 				| Self::CloseDocTab { .. }
 				| Self::SplitPane(_)
+				| Self::NewPane { .. }
 				| Self::ClosePane
 				| Self::ResizePane(_, _)
 				| Self::ResizePaneBoundary { .. }
@@ -219,6 +220,10 @@ pub enum EditorCommand {
 		view_id: ViewId,
 	},
 	SplitPane(SplitDirection),
+	NewPane {
+		direction: SplitDirection,
+		language: Option<String>,
+	},
 	ClosePane,
 	ResizePane(SplitDirection, PaneResizeDirection),
 	ResizePaneBoundary {

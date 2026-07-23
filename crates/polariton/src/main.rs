@@ -3,9 +3,10 @@ mod core;
 mod editor;
 mod fonts;
 mod gui;
-mod notebook_rune;
 mod persistence;
 mod plot;
+mod result_registry;
+mod rune_host;
 
 fn main() -> gui::Result {
 	let _ = rustls::crypto::ring::default_provider().install_default();

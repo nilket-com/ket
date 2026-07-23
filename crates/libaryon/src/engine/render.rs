@@ -490,6 +490,7 @@ fn render_pane_viewport(
 		.get()
 		.saturating_sub(DOCTAB_BAR_ROWS as u32);
 	let active_doctab_index = pane.active_tab_index;
+	let active_buffer_id = pane.active_tab().buffer_id;
 	let active_view_id = pane.active_tab().id;
 	// Read before the mutable render borrow below: a host panel projects only
 	// presentation identity, so nothing here depends on render state.
@@ -1325,6 +1326,7 @@ fn render_pane_viewport(
 
 	PaneViewport {
 		pane_id: pane_layout.pane_id,
+		buffer_id: active_buffer_id,
 		view_id: active_view_id,
 		host_panel,
 		rect: pane_layout.rect,

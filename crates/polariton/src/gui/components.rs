@@ -207,10 +207,21 @@ fn app_status_bar(
 		AdapterStage::Unselected => ("select adapter", Tone::Warning),
 		AdapterStage::None => ("disconnected", Tone::Danger),
 	};
+	// The session scratch database answers SQL whenever no external adapter
+	// is connected: report that target instead of a scary "disconnected".
+	let (connection_label, connection_tone, target_label) = if adapter_state.scratch_is_active() {
+		("scratch", Tone::Accent, "SQLite :memory:")
+	} else {
+		(
+			connection_label,
+			connection_tone,
+			adapter_state.selection.adapter_type_str(),
+		)
+	};
 	let mut bar = StatusBar::new()
 		.lane_split(2, 5)
 		.left(Segment::toned_text(connection_label, connection_tone))
-		.left(Segment::text(adapter_state.selection.adapter_type_str()))
+		.left(Segment::text(target_label))
 		.right(
 			Segment::toned_text(status_error, Tone::Danger)
 				.max_chars(42)

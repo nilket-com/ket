@@ -2483,6 +2483,36 @@ mod tests {
 	}
 
 	#[test]
+	fn pane_new_commands_create_independent_empty_panes() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.set_editor_mode_for_test(EditorMode::Command);
+		frontend.command_buffer = "new".to_string();
+
+		assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":new should send a command"),
+			EditorCommand::NewPane {
+				direction: crate::engine::SplitDirection::Horizontal,
+				language: None
+			}
+		));
+
+		let (mut frontend, rx_cmd) = build_frontend();
+		frontend.set_editor_mode_for_test(EditorMode::Command);
+		frontend.command_buffer = "vnew".to_string();
+
+		assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
+		assert!(matches!(
+			rx_cmd.try_recv().expect(":vnew should send a command"),
+			EditorCommand::NewPane {
+				direction: crate::engine::SplitDirection::Vertical,
+				language: None
+			}
+		));
+	}
+
+	#[test]
 	fn paneclose_command_closes_the_focused_pane() {
 		let (mut frontend, rx_cmd) = build_frontend();
 		let mut should_quit = false;
@@ -2562,12 +2592,15 @@ mod tests {
 		let (mut frontend, rx_cmd) = build_frontend();
 		let mut should_quit = false;
 		frontend.set_editor_mode_for_test(EditorMode::Command);
-		frontend.command_buffer = "ph".to_string();
+		frontend.command_buffer = "ph rune".to_string();
 
 		assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
 		assert!(matches!(
 			rx_cmd.try_recv().expect(":ph should send a command"),
-			EditorCommand::SplitPane(crate::engine::SplitDirection::Horizontal)
+			EditorCommand::NewPane {
+				direction: crate::engine::SplitDirection::Horizontal,
+				language: Some(ref language)
+			} if language == "rune"
 		));
 
 		let (mut frontend, rx_cmd) = build_frontend();
@@ -2578,7 +2611,10 @@ mod tests {
 		assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
 		assert!(matches!(
 			rx_cmd.try_recv().expect(":pv should send a command"),
-			EditorCommand::SplitPane(crate::engine::SplitDirection::Vertical)
+			EditorCommand::NewPane {
+				direction: crate::engine::SplitDirection::Vertical,
+				language: None
+			}
 		));
 
 		let (mut frontend, rx_cmd) = build_frontend();

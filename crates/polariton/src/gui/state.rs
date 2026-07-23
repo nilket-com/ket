@@ -11,14 +11,18 @@ use crate::gui::{
 	messages::{ExportFormat, Message},
 	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
-use crate::notebook_rune::{self, PlotEffect};
 use crate::persistence::{self, StartupData};
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
+use crate::plot::request::{ResolvedPlot, plan};
+use crate::result_registry::{ResultRegistry, parse_result_annotation};
+use crate::rune_host::{self, RuneCapabilities};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
+use libaryon::core::BufferId;
 use libaryon::uast::projection::MarkdownCellOutputTarget;
 use polars::frame::DataFrame;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 struct AppState {
@@ -36,6 +40,9 @@ struct AppState {
 	showing_settings: bool,
 	show_column_types: bool,
 	window_size: Size,
+	result_registry: ResultRegistry,
+	rune_plot_panes: HashMap<BufferId, PaneId>,
+	rune_buffer_revisions: HashMap<BufferId, u64>,
 }
 
 pub type Result = iced::Result;
@@ -57,13 +64,14 @@ fn build_plot_task(
 	)
 }
 
-/// Build a Rune-published plot without blocking Iced's update loop. Keeping
-/// the effect intact through the task lets the ready message attach the exact
-/// composition and source snapshot that the VM produced.
-fn build_notebook_plot_task(
-	effect: PlotEffect,
+/// Build a planned Rune plot without blocking Iced's update loop. Keeping the
+/// resolved product intact through the task preserves its composition and
+/// owned snapshot until the destination surface receives it.
+fn build_resolved_plot_task(
+	resolved: ResolvedPlot,
+	height: u32,
 	on_ready: impl FnOnce(
-		PlotEffect,
+		ResolvedPlot,
 		std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
 	) -> Message
 	+ Send
@@ -71,15 +79,15 @@ fn build_notebook_plot_task(
 ) -> Task<Message> {
 	Task::perform(
 		async move {
-			let composition = effect.composition.clone();
-			let data = effect.data.as_ref().clone();
+			let composition = resolved.composition.clone();
+			let data = resolved.data.as_ref().clone();
 			let kernel =
-				tokio::task::spawn_blocking(move || create_plot(&composition, &data, 1200, 720))
+				tokio::task::spawn_blocking(move || create_plot(&composition, &data, 1200, height))
 					.await
-					.expect("notebook plot build task panicked");
-			(effect, kernel)
+					.expect("Rune plot build task panicked");
+			(resolved, kernel)
 		},
-		move |(effect, kernel)| on_ready(effect, kernel),
+		move |(resolved, kernel)| on_ready(resolved, kernel),
 	)
 }
 
@@ -199,9 +207,15 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		showing_settings: false,
 		show_column_types: startup_data.show_column_types,
 		window_size,
+		result_registry: ResultRegistry::default(),
+		rune_plot_panes: HashMap::new(),
+		rune_buffer_revisions: HashMap::new(),
 	};
 	sync_workspace_viewport(&mut state);
-	(state, Task::none())
+	// Eagerly open the session scratch database so SQL always has a target;
+	// an in-memory SQLite open is effectively instant.
+	let scratch = Task::perform(AdapterState::open_scratch(), Message::ScratchReady);
+	(state, scratch)
 }
 
 fn view(app_state: &AppState) -> Element<'_, Message> {
@@ -219,15 +233,36 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 	)
 }
 
-fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
-	let Some(db) = app_state.adapter_state.connection.as_ref() else {
+fn run_code(app_state: &mut AppState, code: String, annotation_source: &str) -> Task<Message> {
+	let Some(db) = app_state.adapter_state.sql_connection() else {
+		app_state.status_error = "No SQL target: scratch database unavailable.".to_string();
 		return Task::none();
 	};
 	if code.trim().is_empty() {
 		app_state.status_msg = "Nothing to run on the current line.".into();
 		return Task::none();
 	}
+	let Some(source_buffer) = app_state.code_editor.active_buffer_id() else {
+		app_state.status_error = "The focused SQL source has no buffer identity.".to_owned();
+		return Task::none();
+	};
+	let publish_name = match parse_result_annotation(annotation_source) {
+		Ok(name) => name,
+		Err(message) => {
+			app_state.status_error = format!("Error: {message}");
+			app_state.status_msg.clear();
+			app_state.code_editor.begin_query();
+			app_state.code_editor.set_query_error(message);
+			return Task::none();
+		}
+	};
 	let db = db.clone();
+	let connection = app_state.adapter_state.connection_identity();
+	let publish = publish_name.map(|name| {
+		app_state
+			.result_registry
+			.begin(&name, source_buffer, connection)
+	});
 	app_state.status_msg = "Code running...".into();
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
@@ -240,7 +275,7 @@ fn run_code(app_state: &mut AppState, code: String) -> Task<Message> {
 			let mut guard = db.write().await;
 			guard.dispatch(&code).await
 		},
-		Message::RunResult,
+		move |result| Message::RunResult { result, publish },
 	)
 }
 
@@ -248,14 +283,29 @@ fn run_language_code(
 	app_state: &mut AppState,
 	language_id: libaryon::engine::LanguageId,
 	code: String,
+	annotation_source: &str,
 ) -> Task<Message> {
 	match language_id.as_str() {
-		"sql" => run_code(app_state, code),
+		"sql" => run_code(app_state, code, annotation_source),
 		"rune" => {
 			if code.trim().is_empty() {
 				app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
 				return Task::none();
 			}
+			let Some(source_buffer) = app_state.code_editor.active_buffer_id() else {
+				app_state.status_error =
+					"The focused Rune source has no buffer identity.".to_owned();
+				return Task::none();
+			};
+			let capabilities = RuneCapabilities {
+				results: app_state.result_registry.snapshot(),
+				..RuneCapabilities::default()
+			};
+			let revision = *app_state
+				.rune_buffer_revisions
+				.entry(source_buffer)
+				.and_modify(|revision| *revision = revision.saturating_add(1))
+				.or_insert(1);
 			app_state.status_msg = "Rune running…".into();
 			app_state.status_error.clear();
 			app_state.status_time_elapsed = None;
@@ -263,11 +313,30 @@ fn run_language_code(
 			app_state.code_editor.begin_query();
 			Task::perform(
 				async move {
-					tokio::task::spawn_blocking(move || notebook_rune::execute_buffer(&code))
-						.await
-						.map_err(|error| format!("Rune task panicked: {error}"))?
+					tokio::task::spawn_blocking(move || {
+						let mut execution = rune_host::execute_body(&code, capabilities)?;
+						let plot = match execution.requests.len() {
+							0 => None,
+							1 => Some(plan(execution.requests.remove(0))?),
+							count => {
+								return Err(format!(
+									"Rune buffer published {count} plots; one buffer currently owns one plot pane."
+								));
+							}
+						};
+						Ok(crate::gui::messages::RuneBufferOutcome {
+							display: execution.display,
+							plot,
+						})
+					})
+					.await
+					.map_err(|error| format!("Rune task panicked: {error}"))?
 				},
-				Message::RunLanguageResult,
+				move |result| Message::RunRuneBufferResult {
+					source_buffer,
+					revision,
+					result,
+				},
 			)
 		}
 		language => {
@@ -289,7 +358,8 @@ fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> T
 }
 
 fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
-	let Some(db) = app_state.adapter_state.connection.as_ref() else {
+	let Some(db) = app_state.adapter_state.sql_connection() else {
+		app_state.status_error = "No SQL target: scratch database unavailable.".to_string();
 		return Task::none();
 	};
 	if cell.code.trim().is_empty() {
@@ -343,9 +413,15 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	Task::perform(
 		async move {
 			tokio::task::spawn_blocking(move || {
-				let mut effects = notebook_rune::execute_cell(&cell.code, snapshots)?;
-				match effects.len() {
-					1 => Ok(effects.remove(0)),
+				let mut execution = rune_host::execute_body(
+					&cell.code,
+					RuneCapabilities {
+						cells: snapshots,
+						..RuneCapabilities::default()
+					},
+				)?;
+				match execution.requests.len() {
+					1 => plan(execution.requests.remove(0)),
 					0 => Err("Rune cell did not publish a plot; call `.show()?`.".to_owned()),
 					_ => Err(
 						"Rune cell published multiple plots; one cell currently owns one output."
@@ -486,12 +562,24 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::AdapterConnected(dba) => {
 			let ok = dba.is_some();
 			app_state.adapter_state.connection = dba;
-			app_state.adapter_state.stage = AdapterStage::Connected;
+			app_state.adapter_state.stage = if ok {
+				AdapterStage::Connected
+			} else {
+				// A failed connect keeps the scratch database as the SQL
+				// target rather than reporting a connection that isn't there.
+				AdapterStage::Configured
+			};
 			app_state.status_msg = if ok {
 				"Adapter connected.".into()
 			} else {
 				"Adapter connection failed.".into()
 			};
+		}
+		Message::ScratchReady(scratch) => {
+			if scratch.is_none() {
+				app_state.status_error = "Scratch database failed to open.".to_string();
+			}
+			app_state.adapter_state.scratch = scratch;
 		}
 		Message::Run => {
 			// In a notebook, Run always means "run the cell at the cursor",
@@ -508,11 +596,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "The focused pane has no executable language.".into();
 				return Task::none();
 			};
-			return run_language_code(
-				app_state,
-				language_id,
-				app_state.code_editor.cached_content().to_owned(),
-			);
+			let source = app_state.code_editor.cached_content().to_owned();
+			return run_language_code(app_state, language_id, source.clone(), &source);
 		}
 		Message::RunSnippet => {
 			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
@@ -526,27 +611,28 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "The focused pane has no executable language.".into();
 				return Task::none();
 			};
-			return run_language_code(app_state, language_id, code);
+			let annotation_source = app_state.code_editor.cached_content().to_owned();
+			return run_language_code(app_state, language_id, code, &annotation_source);
 		}
-		Message::RunLanguageResult(result) => {
-			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
-			match result {
-				Ok(value) => {
-					app_state.status_error.clear();
-					app_state.status_msg = "Rune finished.".into();
-					app_state.code_editor.set_query_message(value);
-				}
-				Err(message) => {
-					app_state.status_error = format!("Error: {message}");
-					app_state.status_msg.clear();
-					app_state.code_editor.set_query_error(message);
-				}
-			}
-		}
-		Message::RunResult(er) => {
+		Message::RunResult {
+			result: er,
+			publish,
+		} => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
 			app_state.status_error = "".to_string();
+			if let Some(claim) = publish.as_ref() {
+				match &er {
+					ExecutionResult::Rows(frame) => {
+						let _ = app_state
+							.result_registry
+							.publish(claim, std::sync::Arc::new(frame.clone()));
+					}
+					_ => {
+						let _ = app_state.result_registry.conclude_unbound(claim);
+					}
+				}
+			}
 			match er {
 				ExecutionResult::Affected(rows_affected) => {
 					app_state.status_msg = format!("Rows affected: {rows_affected}");
@@ -578,6 +664,65 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					app_state.status_msg = "Noop finished.".to_string();
 				}
 			}
+		}
+		Message::RunRuneBufferResult {
+			source_buffer,
+			revision,
+			result,
+		} => {
+			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
+				return Task::none();
+			}
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
+			match result {
+				Ok(outcome) => {
+					app_state.status_error.clear();
+					app_state.code_editor.set_query_message(
+						outcome
+							.display
+							.unwrap_or_else(|| "Rune finished.".to_owned()),
+					);
+					if let Some(resolved) = outcome.plot {
+						app_state.status_msg =
+							format!("Building plot from {}…", resolved.source_name);
+						return build_resolved_plot_task(
+							resolved,
+							1200,
+							move |resolved, kernel| Message::RuneBufferPlotReady {
+								source_buffer,
+								revision,
+								resolved,
+								kernel,
+							},
+						);
+					}
+					app_state.status_msg = "Rune finished.".to_owned();
+				}
+				Err(message) => {
+					app_state.status_error = format!("Error: {message}");
+					app_state.status_msg.clear();
+					app_state.code_editor.set_query_error(message);
+				}
+			}
+		}
+		Message::RuneBufferPlotReady {
+			source_buffer,
+			revision,
+			resolved,
+			kernel,
+		} => {
+			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
+				return Task::none();
+			}
+			app_state.code_editor.open_dashboard();
+			let previous = app_state.rune_plot_panes.get(&source_buffer).copied();
+			let pane =
+				app_state
+					.dashboard
+					.apply_plot_replacing(previous, resolved.composition, kernel);
+			app_state.rune_plot_panes.insert(source_buffer, pane);
+			app_state.status_error.clear();
+			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
 		Message::RunMarkdownCellResult {
 			identity,
@@ -659,14 +804,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
 			match result {
-				Ok(effect) => {
+				Ok(resolved) => {
 					app_state.status_error.clear();
-					app_state.status_msg = format!("Building plot from {}…", effect.source_cell);
-					return build_notebook_plot_task(effect, move |effect, kernel| {
+					app_state.status_msg = format!("Building plot from {}…", resolved.source_name);
+					return build_resolved_plot_task(resolved, 720, move |resolved, kernel| {
 						Message::NotebookPlotReady {
 							identity,
 							presentation,
-							effect,
+							resolved,
 							kernel,
 						}
 					});
@@ -685,20 +830,20 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::NotebookPlotReady {
 			identity,
 			presentation,
-			effect,
+			resolved,
 			kernel,
 		} => {
 			match presentation.output {
 				MarkdownCellOutputTarget::Inline => app_state.code_editor.set_markdown_cell_plot(
 					identity,
-					effect.composition,
+					resolved.composition,
 					kernel,
 				),
 				MarkdownCellOutputTarget::Pane => {
 					app_state.code_editor.open_dashboard();
 					let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
 						pane: None,
-						composition: effect.composition,
+						composition: resolved.composition,
 						kernel,
 					});
 				}
