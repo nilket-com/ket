@@ -22,8 +22,10 @@ composed gap that the saturated ladder (ADR 506) could not see.
 separately after its correctness fix and carries its own dirty stamp. A clean labelled baseline
 requires a re-run from a committed tree.
 
-q11 is out of scope at this scale: its HAVING threshold is a scale-specific constant, defined only at
-sf ∈ {0.01, 1, 10}. 21 measured cells, not 22.
+q11 is **not yet enumerated at sf=8**: the harness renders its HAVING fraction from a table of exact
+decimal literals (`Q11Scale`) that lists only sf ∈ {0.01, 1, 10}. This is an enumeration gap, not a
+spec or arithmetic limit — sf=8 is exactly representable (`0.0001 / 8 = 0.0000125`, and the oracle's
+`SF x 100` integer is 800). 21 measured cells, not 22; enabling q11 here is deferred, not blocked.
 
 ## Board
 
