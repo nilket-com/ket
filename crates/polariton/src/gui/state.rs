@@ -22,7 +22,7 @@ use iced::{Element, Size, Subscription, Task, application, event, keyboard, time
 use libaryon::core::BufferId;
 use libaryon::uast::projection::MarkdownCellOutputTarget;
 use polars::frame::DataFrame;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 struct AppState {
@@ -43,6 +43,20 @@ struct AppState {
 	result_registry: ResultRegistry,
 	rune_plot_panes: HashMap<BufferId, PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
+	pending_runs: VecDeque<PendingRun>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingRunKind {
+	Buffer,
+	Snippet,
+}
+
+struct PendingRun {
+	snapshot_request: u64,
+	source_buffer: BufferId,
+	language_id: libaryon::engine::LanguageId,
+	kind: PendingRunKind,
 }
 
 pub type Result = iced::Result;
@@ -210,6 +224,7 @@ fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
 		result_registry: ResultRegistry::default(),
 		rune_plot_panes: HashMap::new(),
 		rune_buffer_revisions: HashMap::new(),
+		pending_runs: VecDeque::new(),
 	};
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
@@ -233,7 +248,12 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 	)
 }
 
-fn run_code(app_state: &mut AppState, code: String, annotation_source: &str) -> Task<Message> {
+fn run_code(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	code: String,
+	annotation_source: &str,
+) -> Task<Message> {
 	let Some(db) = app_state.adapter_state.sql_connection() else {
 		app_state.status_error = "No SQL target: scratch database unavailable.".to_string();
 		return Task::none();
@@ -242,10 +262,6 @@ fn run_code(app_state: &mut AppState, code: String, annotation_source: &str) -> 
 		app_state.status_msg = "Nothing to run on the current line.".into();
 		return Task::none();
 	}
-	let Some(source_buffer) = app_state.code_editor.active_buffer_id() else {
-		app_state.status_error = "The focused SQL source has no buffer identity.".to_owned();
-		return Task::none();
-	};
 	let publish_name = match parse_result_annotation(annotation_source) {
 		Ok(name) => name,
 		Err(message) => {
@@ -281,22 +297,18 @@ fn run_code(app_state: &mut AppState, code: String, annotation_source: &str) -> 
 
 fn run_language_code(
 	app_state: &mut AppState,
+	source_buffer: BufferId,
 	language_id: libaryon::engine::LanguageId,
 	code: String,
 	annotation_source: &str,
 ) -> Task<Message> {
 	match language_id.as_str() {
-		"sql" => run_code(app_state, code, annotation_source),
+		"sql" => run_code(app_state, source_buffer, code, annotation_source),
 		"rune" => {
 			if code.trim().is_empty() {
 				app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
 				return Task::none();
 			}
-			let Some(source_buffer) = app_state.code_editor.active_buffer_id() else {
-				app_state.status_error =
-					"The focused Rune source has no buffer identity.".to_owned();
-				return Task::none();
-			};
 			let capabilities = RuneCapabilities {
 				results: app_state.result_registry.snapshot(),
 				..RuneCapabilities::default()
@@ -344,6 +356,72 @@ fn run_language_code(
 			Task::none()
 		}
 	}
+}
+
+fn queue_plain_run(
+	app_state: &mut AppState,
+	language_id: libaryon::engine::LanguageId,
+	kind: PendingRunKind,
+) -> Task<Message> {
+	let Some(source_buffer) = app_state.code_editor.active_buffer_id() else {
+		app_state.status_error = "The focused source has no buffer identity.".to_owned();
+		return Task::none();
+	};
+	let Some(snapshot_request) = app_state.code_editor.request_execution_snapshot() else {
+		app_state.status_error = "The editor could not snapshot the focused source.".to_owned();
+		return Task::none();
+	};
+	app_state.pending_runs.push_back(PendingRun {
+		snapshot_request,
+		source_buffer,
+		language_id,
+		kind,
+	});
+	app_state.status_msg = "Preparing code…".into();
+	Task::none()
+}
+
+fn finish_pending_runs(app_state: &mut AppState) -> Task<Message> {
+	let mut tasks = Vec::new();
+	while let Some(snapshot_request) = app_state
+		.pending_runs
+		.front()
+		.map(|pending| pending.snapshot_request)
+	{
+		let Some(snapshot) = app_state
+			.code_editor
+			.take_execution_snapshot(snapshot_request)
+		else {
+			break;
+		};
+		let pending = app_state
+			.pending_runs
+			.pop_front()
+			.expect("pending run disappeared");
+		if snapshot.buffer_id != pending.source_buffer {
+			app_state.status_error =
+				"The source pane changed before its execution snapshot completed.".to_owned();
+			continue;
+		}
+		let code = match pending.kind {
+			PendingRunKind::Buffer => snapshot.text.clone(),
+			PendingRunKind::Snippet => {
+				let Some(code) = app_state.code_editor.selected_or_current_line() else {
+					app_state.status_msg = "No editor text is available to run.".into();
+					continue;
+				};
+				code
+			}
+		};
+		tasks.push(run_language_code(
+			app_state,
+			pending.source_buffer,
+			pending.language_id,
+			code,
+			&snapshot.text,
+		));
+	}
+	Task::batch(tasks)
 }
 
 fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
@@ -500,7 +578,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.code_editor.take_quit_request() {
 				return update(app_state, Message::CloseWindow);
 			}
-			return task;
+			let run_task = finish_pending_runs(app_state);
+			return Task::batch([task, run_task]);
 		}
 		Message::CodeEditResize(size) => {
 			app_state.window_size = size;
@@ -596,23 +675,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "The focused pane has no executable language.".into();
 				return Task::none();
 			};
-			let source = app_state.code_editor.cached_content().to_owned();
-			return run_language_code(app_state, language_id, source.clone(), &source);
+			return queue_plain_run(app_state, language_id, PendingRunKind::Buffer);
 		}
 		Message::RunSnippet => {
 			if let Some(cell) = app_state.code_editor.selected_markdown_cell() {
 				return run_markdown_cell(app_state, cell);
 			}
-			let Some(code) = app_state.code_editor.selected_or_current_line() else {
-				app_state.status_msg = "No editor text is available to run.".into();
-				return Task::none();
-			};
 			let Some(language_id) = app_state.code_editor.active_language_id() else {
 				app_state.status_msg = "The focused pane has no executable language.".into();
 				return Task::none();
 			};
-			let annotation_source = app_state.code_editor.cached_content().to_owned();
-			return run_language_code(app_state, language_id, code, &annotation_source);
+			return queue_plain_run(app_state, language_id, PendingRunKind::Snippet);
 		}
 		Message::RunResult {
 			result: er,

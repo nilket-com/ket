@@ -31,7 +31,7 @@ use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
 };
 use polars::frame::DataFrame;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, mpsc::Receiver};
 
@@ -135,6 +135,21 @@ fn engine_wake_stream(wake: &EngineWake) -> iced::futures::stream::BoxStream<'st
 		)
 }
 
+/// An authoritative document snapshot requested specifically for execution.
+///
+/// Unlike [`CodeEditor::cached_content`], this text was read by the engine
+/// after every input event that preceded the user's Run command.
+pub struct ExecutionSnapshot {
+	pub buffer_id: libaryon::core::BufferId,
+	pub text: String,
+}
+
+#[derive(Clone, Copy)]
+enum TextQuery {
+	Cache,
+	Execution(u64),
+}
+
 /// Long-lived owner of Polariton's libaryon session.
 pub struct CodeEditor {
 	engine: Option<EngineHandle>,
@@ -147,7 +162,11 @@ pub struct CodeEditor {
 	/// Keeping these attributed prevents a focus projection for one pane from
 	/// being paired with a still-in-flight text reply from another.
 	document_texts: HashMap<libaryon::core::BufferId, String>,
-	text_query_pending: bool,
+	/// Queries and input share one engine FIFO. Retaining the matching host
+	/// intent lets a Run-specific reply bypass the eventually-consistent cache.
+	text_queries: VecDeque<TextQuery>,
+	next_execution_query: u64,
+	execution_snapshots: HashMap<u64, ExecutionSnapshot>,
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
@@ -296,7 +315,9 @@ impl CodeEditor {
 			engine_wake,
 			viewport: None,
 			document_texts: HashMap::new(),
-			text_query_pending: false,
+			text_queries: VecDeque::new(),
+			next_execution_query: 0,
+			execution_snapshots: HashMap::new(),
 			content_dirty: false,
 			last_pointer: None,
 			last_raw_window: None,
@@ -348,7 +369,7 @@ impl CodeEditor {
 	/// or the cursor's logical line when no selection exists.
 	pub fn selected_or_current_line(&self) -> Option<String> {
 		let pane = self.viewport.as_ref()?.focused_pane()?;
-		let source = self.document_texts.get(&pane.buffer_id)?.as_bytes();
+		let source = self.cached_content().as_bytes();
 		if !pane.selection_ranges.is_empty() {
 			let mut fragments = Vec::with_capacity(pane.selection_ranges.len());
 			for (start, end) in &pane.selection_ranges {
@@ -611,15 +632,35 @@ impl CodeEditor {
 	/// [`Self::poll`] immediately re-queries — the cache always converges on
 	/// the state after the last forwarded input.
 	pub fn request_content(&mut self) {
-		if self.text_query_pending {
+		if !self.text_queries.is_empty() {
 			self.content_dirty = true;
 		} else if self.send(EditorCommand::QueryDocumentText) {
-			self.text_query_pending = true;
+			self.text_queries.push_back(TextQuery::Cache);
 			self.content_dirty = false;
 		} else {
 			// The query never left; retry from the next request or reply.
 			self.content_dirty = true;
 		}
+	}
+
+	/// Queue an execution barrier after all input already forwarded to the
+	/// engine. This deliberately does not coalesce with ordinary cache queries:
+	/// its own reply is the proof that Run has crossed the last edit.
+	pub fn request_execution_snapshot(&mut self) -> Option<u64> {
+		self.active_buffer_id()?;
+		self.next_execution_query = self.next_execution_query.saturating_add(1);
+		let request = self.next_execution_query;
+		if !self.send(EditorCommand::QueryDocumentText) {
+			return None;
+		}
+		self.text_queries.push_back(TextQuery::Execution(request));
+		Some(request)
+	}
+
+	/// Take a completed execution snapshot. Until this returns `Some`, Run must
+	/// remain queued rather than falling back to [`Self::cached_content`].
+	pub fn take_execution_snapshot(&mut self, request: u64) -> Option<ExecutionSnapshot> {
+		self.execution_snapshots.remove(&request)
 	}
 
 	#[cfg(test)]
@@ -682,8 +723,16 @@ impl CodeEditor {
 				viewport.document_text_buffer_id,
 			) {
 				self.document_texts.insert(buffer_id, document_text.clone());
-				self.text_query_pending = false;
-				if self.content_dirty {
+				if let Some(TextQuery::Execution(request)) = self.text_queries.pop_front() {
+					self.execution_snapshots.insert(
+						request,
+						ExecutionSnapshot {
+							buffer_id,
+							text: document_text.clone(),
+						},
+					);
+				}
+				if self.text_queries.is_empty() && self.content_dirty {
 					// Input landed after this query was issued; chase
 					// it so the cache converges on the latest state.
 					self.request_content();
@@ -2895,6 +2944,38 @@ mod tests {
 			editor.cached_content()
 		);
 	}
+
+	#[test]
+	fn execution_snapshot_crosses_edits_still_waiting_on_the_display_cache() {
+		let original = "select 1 as x";
+		let expected = "select 1 as x union all select 2";
+		let mut editor = CodeEditor::new(original);
+		wait_for_content(&mut editor, original);
+
+		// Each inserted character asks for an eventually-consistent display
+		// snapshot. Request Run immediately, before pumping any of those
+		// replies, to reproduce edit-then-Ctrl-Enter.
+		send_keys(&mut editor, "A union all select 2".chars());
+		let request = editor
+			.request_execution_snapshot()
+			.expect("execution snapshot request");
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let snapshot = loop {
+			editor.poll();
+			if let Some(snapshot) = editor.take_execution_snapshot(request) {
+				break snapshot;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"execution snapshot did not complete"
+			);
+			thread::sleep(Duration::from_millis(5));
+		};
+
+		assert_eq!(snapshot.buffer_id, editor.active_buffer_id().unwrap());
+		assert_eq!(snapshot.text, expected);
+	}
+
 	#[test]
 	fn cached_content_tracks_typing_in_new_independent_pane() {
 		let mut editor = CodeEditor::new("");
