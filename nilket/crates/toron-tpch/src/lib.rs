@@ -18,6 +18,7 @@ pub use adr444_profile_eval::{
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -67,8 +68,8 @@ use wendelon::schema::{
 };
 
 use telemetry::{
-	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status, reason_for_error,
-	status_for_reason,
+	Attempt, CorrectnessAttempt, DatasetVerification, PerfAttempt, PerfPhaseTimings, Phase, Status,
+	reason_for_error, status_for_reason,
 };
 
 /// Default cache / output root — always under `target/`, never a tracked path.
@@ -2161,6 +2162,10 @@ pub struct TpchParquetExport {
 	pub manifest_path: PathBuf,
 	pub manifest_fingerprint: String,
 	pub tables: Vec<TpchParquetTableExport>,
+	/// Set when this export *is* the shared persisted dataset, so a peer-engine row reading these
+	/// files reports the same verification the toron row does. `None` for the in-memory export,
+	/// which writes throwaway parquet from fixtures rather than reading a persisted dataset.
+	pub dataset_verification: Option<DatasetVerification>,
 }
 
 #[derive(Debug, Clone)]
@@ -2182,6 +2187,10 @@ pub struct TpchPersistedDataset {
 	pub manifest_path: PathBuf,
 	pub manifest_fingerprint: String,
 	pub tables: BTreeMap<String, TpchPersistedTable>,
+	/// What this load actually proved about the files on disk. Travels with the dataset so every
+	/// consumer — perf row, correctness gate, ablation gate — reads the same fact rather than
+	/// re-deriving it from the environment at a later, possibly different, point.
+	pub verification: DatasetVerification,
 }
 
 /// A query table registration decoupled from the in-memory fixture batch. Persisted scans seed the same
@@ -2200,6 +2209,9 @@ pub struct PersistedPerfQuerySpec {
 	pub tables: Vec<HarnessTableMetadata>,
 	pub storage: Arc<ParquetHarnessScan>,
 	pub export: TpchParquetExport,
+	/// Carried from the dataset this spec was built against, so the row it produces reports the
+	/// verification that actually happened rather than re-reading the environment after the fact.
+	pub dataset_verification: DatasetVerification,
 }
 
 pub fn stable_fingerprint(text: &str) -> String {
@@ -2243,10 +2255,65 @@ const SKIP_DATASET_HASH_VERIFY_ENV: &str = "TORON_TPCH_SKIP_DATASET_HASH_VERIFY"
 /// Opt-in fast path for measurement sessions. `stable_file_hash` re-reads every (multi-GB) parquet
 /// file in full on each dataset load to verify it against the manifest — ~41% of the load window on
 /// a repeated gauge run. When this env is set, the manifest hash check is skipped (the cheap
-/// path-exists check is kept). Default off: correctness runs keep the full verification. Set it only
-/// when the dataset is known-stable within a measurement session.
-fn skip_dataset_hash_verify() -> bool {
-	std::env::var_os(SKIP_DATASET_HASH_VERIFY_ENV).is_some()
+/// path-exists check is kept). Default off, and the mode lands on every perf row it produced, so a
+/// weakened load can never be read back as a full one. Set it only when the dataset is known-stable
+/// within a measurement session.
+///
+/// Split from the env read so the mode and its gates are testable without mutating process env.
+fn dataset_verification_from_env(value: Option<&OsStr>) -> DatasetVerification {
+	match value {
+		Some(_) => DatasetVerification::ManifestOnly,
+		None => DatasetVerification::FullHash,
+	}
+}
+
+fn dataset_verification_mode() -> DatasetVerification {
+	dataset_verification_from_env(std::env::var_os(SKIP_DATASET_HASH_VERIFY_ENV).as_deref())
+}
+
+/// The shared refusal text for a rail that may not run manifest-only. Named once so the rails cannot
+/// drift into describing the same weakened state differently, and so each names the env var to unset.
+fn manifest_only_dataset_rejection(rail: &str) -> String {
+	format!(
+		"{rail} requires full dataset hash verification; unset {SKIP_DATASET_HASH_VERIFY_ENV} \
+		 (it is a measurement-only fast path and leaves the dataset manifest-only)"
+	)
+}
+
+/// Rails that make a pass/fail claim about *answers* — correctness, and the paired-ablation gate that
+/// admits a measurement pair — may not run against a dataset whose bytes were never checked. They
+/// refuse rather than downgrade: a green from an unverified dataset is exactly the lying green the
+/// harness exists to prevent.
+fn require_full_dataset_verification_from_env(
+	value: Option<&OsStr>,
+	rail: &str,
+) -> Result<(), String> {
+	match dataset_verification_from_env(value) {
+		DatasetVerification::FullHash => Ok(()),
+		DatasetVerification::ManifestOnly => Err(manifest_only_dataset_rejection(rail)),
+	}
+}
+
+fn require_full_dataset_verification(rail: &str) -> Result<(), String> {
+	require_full_dataset_verification_from_env(
+		std::env::var_os(SKIP_DATASET_HASH_VERIFY_ENV).as_deref(),
+		rail,
+	)
+}
+
+/// The paired-ablation admission gate: yield the fingerprint both arms will be held to, but only if
+/// the dataset it names was proved byte-for-byte. Kept a function over the *loaded dataset* — rather
+/// than an env check at the call site — so the gate tests the fact that was established, and so a
+/// future non-env source of manifest-only loads is caught by the same rail.
+pub fn paired_ablation_dataset_fingerprint(
+	dataset: &TpchPersistedDataset,
+) -> Result<String, String> {
+	match dataset.verification {
+		DatasetVerification::FullHash => Ok(dataset.manifest_fingerprint.clone()),
+		DatasetVerification::ManifestOnly => {
+			Err(manifest_only_dataset_rejection("paired ablation"))
+		}
+	}
 }
 
 fn dataset_sf_dir_name(scale_factor: f64) -> String {
@@ -2562,6 +2629,9 @@ pub fn load_persisted_tpch_dataset(
 	scale_factor: f64,
 	root: &Path,
 ) -> Result<TpchPersistedDataset, String> {
+	// Resolved once for the whole load so every table in this dataset is reconciled the same way and
+	// the returned dataset can state, as a fact, what was proved about it.
+	let verification = dataset_verification_mode();
 	let root_dir = persisted_dataset_dir(root, mode, scale_factor);
 	let manifest_path = root_dir.join("manifest.json");
 	let body = std::fs::read_to_string(&manifest_path)
@@ -2655,7 +2725,7 @@ pub fn load_persisted_tpch_dataset(
 				path.display()
 			));
 		}
-		if !skip_dataset_hash_verify() {
+		if verification == DatasetVerification::FullHash {
 			let observed_hash = stable_file_hash(&path)?;
 			if observed_hash != file_hash {
 				return Err(format!(
@@ -2694,6 +2764,7 @@ pub fn load_persisted_tpch_dataset(
 		manifest_path,
 		manifest_fingerprint,
 		tables,
+		verification,
 	})
 }
 
@@ -2766,6 +2837,10 @@ pub fn prepare_persisted_tpch_dataset(
 	std::fs::write(&manifest_path, format!("{body}\n"))
 		.map_err(|error| format!("write {}: {error}", manifest_path.display()))?;
 	Ok(TpchPersistedDataset {
+		// Written here, this pass: every table's manifest hash is the one `stable_file_hash` just
+		// computed over the bytes on disk, so a freshly-generated dataset is full-hash by
+		// construction regardless of the skip env, which only ever short-circuits a *re-read*.
+		verification: DatasetVerification::FullHash,
 		mode: mode.to_string(),
 		scale_factor,
 		root_dir,
@@ -3573,6 +3648,7 @@ pub fn export_perf_query_parquet(
 		manifest_path,
 		manifest_fingerprint,
 		tables: table_exports,
+		dataset_verification: None,
 	})
 }
 
@@ -4573,6 +4649,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4609,6 +4686,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4644,6 +4722,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
 			join_spill_observations: None,
+			dataset_verification: None,
 		};
 	}
 
@@ -4672,6 +4751,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
 			join_spill_observations: None,
+			dataset_verification: None,
 		};
 	}
 
@@ -4699,6 +4779,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: None,
 	}
 }
 
@@ -4745,6 +4826,7 @@ async fn run_perf_query_with_tables(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4781,6 +4863,7 @@ async fn run_perf_query_with_tables(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4813,6 +4896,7 @@ async fn run_perf_query_with_tables(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
 		join_spill_observations: Some(execution.join_spill_observations),
+		dataset_verification: None,
 	}
 }
 
@@ -4860,6 +4944,7 @@ async fn run_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4896,6 +4981,7 @@ async fn run_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				dataset_verification: None,
 			};
 		}
 	};
@@ -4928,6 +5014,7 @@ async fn run_perf_query_with_metadata(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
 		join_spill_observations: Some(execution.join_spill_observations),
+		dataset_verification: None,
 	}
 }
 
@@ -4967,7 +5054,8 @@ pub async fn run_perf_query_with_data_source(
 		"memory" => run_perf_query(query, mode, scale_factor, run_index, warmup).await,
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
-			Ok(run_perf_query_with_metadata(
+			let dataset_verification = spec.dataset_verification;
+			let mut attempt = run_perf_query_with_metadata(
 				spec.query_id,
 				mode,
 				scale_factor,
@@ -4977,7 +5065,9 @@ pub async fn run_perf_query_with_data_source(
 				spec.tables,
 				spec.storage,
 			)
-			.await)
+			.await;
+			attempt.dataset_verification = Some(dataset_verification);
+			Ok(attempt)
 		}
 		other => Err(format!("perf --data-source {other:?} is not supported")),
 	}
@@ -5014,7 +5104,8 @@ pub async fn run_rune_perf_query_with_data_source(
 		}
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
-			Ok(run_rune_q03_perf_query_with_metadata(
+			let dataset_verification = spec.dataset_verification;
+			let mut attempt = run_rune_q03_perf_query_with_metadata(
 				spec.query_id,
 				mode,
 				scale_factor,
@@ -5023,7 +5114,9 @@ pub async fn run_rune_perf_query_with_data_source(
 				spec.tables,
 				spec.storage,
 			)
-			.await)
+			.await;
+			attempt.dataset_verification = Some(dataset_verification);
+			Ok(attempt)
 		}
 		other => Err(format!("perf --data-source {other:?} is not supported")),
 	}
@@ -5035,6 +5128,10 @@ pub async fn check_strict_query_with_data_source(
 	data_source: &str,
 	data_root: &Path,
 ) -> Result<CorrectnessAttempt, String> {
+	// Gated at the rail entry, not just the persisted arm: a correctness sweep that sets the skip env
+	// should fail loudly and uniformly rather than silently producing a mix of fully-verified and
+	// manifest-only answers depending on which `--data-source` each cell happened to use.
+	require_full_dataset_verification("correctness")?;
 	validate_query_scale(query, scale_factor)?;
 	if query == "q17" {
 		q17_correctness_scale(Some(scale_factor))?;
@@ -5324,6 +5421,7 @@ pub fn build_persisted_perf_query_spec(
 				.join(",")
 		)),
 		tables: export_tables,
+		dataset_verification: Some(dataset.verification),
 	};
 	Ok(PersistedPerfQuerySpec {
 		query_id,
@@ -5333,6 +5431,7 @@ pub fn build_persisted_perf_query_spec(
 			tables: scan_tables,
 		}),
 		export,
+		dataset_verification: dataset.verification,
 	})
 }
 
@@ -14876,6 +14975,194 @@ mod adr360_persisted_data_surface {
 		);
 		assert_eq!(export.manifest_path, export.root_dir.join("manifest.json"));
 		assert!(export.manifest_fingerprint.starts_with("fnv1a64:"));
+		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+/// The dataset-verification provenance rail: which reconciliation a persisted dataset actually got,
+/// that it reaches the row, and that the rails making answer claims refuse the weakened one.
+#[cfg(test)]
+mod dataset_verification_provenance {
+	use super::*;
+	use serde_json::Value;
+
+	fn temp_root(label: &str) -> PathBuf {
+		let root = std::env::temp_dir().join(format!(
+			"toron_tpch_dataset_verification_{label}_{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&root);
+		root
+	}
+
+	fn dataset_with(verification: DatasetVerification) -> TpchPersistedDataset {
+		TpchPersistedDataset {
+			mode: "strict".to_string(),
+			scale_factor: 0.01,
+			root_dir: PathBuf::from("/nonexistent"),
+			manifest_path: PathBuf::from("/nonexistent/manifest.json"),
+			manifest_fingerprint: "fnv1a64:0123456789abcdef".to_string(),
+			tables: BTreeMap::new(),
+			verification,
+		}
+	}
+
+	#[test]
+	fn any_value_of_the_skip_env_weakens_verification() {
+		assert_eq!(
+			dataset_verification_from_env(None),
+			DatasetVerification::FullHash
+		);
+		assert_eq!(
+			dataset_verification_from_env(Some(OsStr::new("1"))),
+			DatasetVerification::ManifestOnly
+		);
+		// The footgun worth pinning: the gate is presence-based, so `=0` does NOT re-enable full
+		// verification. A reader who assumes otherwise would ship a manifest-only measurement
+		// believing it was full-hash.
+		assert_eq!(
+			dataset_verification_from_env(Some(OsStr::new("0"))),
+			DatasetVerification::ManifestOnly
+		);
+		assert_eq!(
+			dataset_verification_from_env(Some(OsStr::new(""))),
+			DatasetVerification::ManifestOnly
+		);
+	}
+
+	#[test]
+	fn answer_claiming_rails_refuse_a_manifest_only_dataset() {
+		assert!(require_full_dataset_verification_from_env(None, "correctness").is_ok());
+
+		let error =
+			require_full_dataset_verification_from_env(Some(OsStr::new("1")), "correctness")
+				.expect_err("correctness must refuse a manifest-only dataset");
+		assert!(error.contains("correctness"), "names the rail: {error}");
+		assert!(
+			error.contains(SKIP_DATASET_HASH_VERIFY_ENV),
+			"names the env var to unset: {error}"
+		);
+	}
+
+	#[test]
+	fn paired_ablation_admits_full_hash_and_rejects_manifest_only() {
+		let admitted =
+			paired_ablation_dataset_fingerprint(&dataset_with(DatasetVerification::FullHash))
+				.expect("full-hash dataset is admitted");
+		assert_eq!(admitted, "fnv1a64:0123456789abcdef");
+
+		let error =
+			paired_ablation_dataset_fingerprint(&dataset_with(DatasetVerification::ManifestOnly))
+				.expect_err("manifest-only dataset is refused");
+		assert!(error.contains("paired ablation"), "names the rail: {error}");
+		assert!(
+			error.contains(SKIP_DATASET_HASH_VERIFY_ENV),
+			"names the env var to unset: {error}"
+		);
+	}
+
+	#[test]
+	fn perf_row_reports_each_verification_state_distinctly() {
+		let mut attempt = PerfAttempt {
+			engine: "toron".to_string(),
+			query: "q06".to_string(),
+			scale_factor: 0.01,
+			mode: "strict".to_string(),
+			run_index: 0,
+			warmup: false,
+			phase: Phase::Execute,
+			status: Status::Pass,
+			reason: None,
+			diagnostic_message: None,
+			timings: PerfPhaseTimings::default(),
+			parent_wall_ms: None,
+			peak_rss_kib: None,
+			spill_bytes: 0,
+			plan_fingerprint: None,
+			digest: None,
+			output_row_count: None,
+			output_schema_fingerprint: None,
+			engine_version: None,
+			duckdb_version: None,
+			debug_build: cfg!(debug_assertions),
+			local_join_admissions: None,
+			join_spill_observations: None,
+			dataset_verification: None,
+		};
+
+		assert_eq!(attempt.json_value()["dataset_verification"], Value::Null);
+
+		attempt.dataset_verification = Some(DatasetVerification::FullHash);
+		assert_eq!(
+			attempt.json_value()["dataset_verification"],
+			Value::from("full_hash")
+		);
+
+		attempt.dataset_verification = Some(DatasetVerification::ManifestOnly);
+		assert_eq!(
+			attempt.json_value()["dataset_verification"],
+			Value::from("manifest_only")
+		);
+	}
+
+	#[test]
+	fn a_freshly_prepared_dataset_is_full_hash_and_survives_reload() {
+		let root = temp_root("prepare_reload");
+		let prepared = prepare_persisted_tpch_dataset("strict", 0.01, &root).expect("prepare");
+		assert_eq!(
+			prepared.verification,
+			DatasetVerification::FullHash,
+			"a dataset whose manifest hashes were just computed over the written bytes is full-hash"
+		);
+
+		let reloaded = load_persisted_tpch_dataset("strict", 0.01, &root).expect("reload");
+		assert_eq!(reloaded.verification, DatasetVerification::FullHash);
+		assert_eq!(prepared.manifest_fingerprint, reloaded.manifest_fingerprint);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// The peer-engine arm reads the same persisted files through the export, so a `toron,duckdb`
+	/// board must not be half-audited: the export carries the same verification the toron row states.
+	#[test]
+	fn the_persisted_export_carries_verification_for_peer_engine_rows() {
+		let root = temp_root("export_provenance");
+		let persisted =
+			export_persisted_perf_query_parquet("q06", "strict", 0.01, &root).expect("export");
+		assert_eq!(
+			persisted.dataset_verification,
+			Some(DatasetVerification::FullHash)
+		);
+
+		// The in-memory export writes throwaway parquet from fixtures; no persisted dataset backed
+		// it, so it claims nothing rather than inheriting a verification it never performed.
+		let from_memory = export_perf_query_parquet("q06", "strict", 0.01, &root).expect("export");
+		assert_eq!(from_memory.dataset_verification, None);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn persisted_rows_carry_verification_and_memory_rows_do_not() {
+		let root = temp_root("row_provenance");
+		let persisted =
+			run_perf_query_with_data_source("q06", "strict", 0.01, 0, false, "parquet", &root)
+				.await
+				.expect("persisted perf");
+		assert_eq!(persisted.status, Status::Pass);
+		assert_eq!(
+			persisted.json_value()["dataset_verification"],
+			Value::from("full_hash"),
+			"a persisted row states what its dataset load proved"
+		);
+
+		let memory =
+			run_perf_query_with_data_source("q06", "strict", 0.01, 0, false, "memory", &root)
+				.await
+				.expect("memory perf");
+		assert_eq!(
+			memory.json_value()["dataset_verification"],
+			Value::Null,
+			"an in-memory row loaded no dataset, so it claims no verification"
+		);
 		let _ = std::fs::remove_dir_all(&root);
 	}
 }

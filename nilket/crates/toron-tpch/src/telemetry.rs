@@ -277,6 +277,29 @@ impl PerfPhaseTimings {
 	}
 }
 
+/// How a persisted dataset was reconciled against its manifest before it backed a run.
+///
+/// The distinction is a chain-of-custody one and belongs on the row: `FullHash` re-read every table
+/// file and compared its byte hash to the manifest, so the bytes that were measured are the bytes the
+/// manifest names. `ManifestOnly` checked that the manifest is internally consistent with its own
+/// recorded hashes and that the paths exist — it can not detect a file whose contents changed
+/// underneath it. Without this field a reader cannot tell the two apart, and a `manifest_only` row
+/// silently carries a weaker claim than a `full_hash` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetVerification {
+	FullHash,
+	ManifestOnly,
+}
+
+impl DatasetVerification {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			DatasetVerification::FullHash => "full_hash",
+			DatasetVerification::ManifestOnly => "manifest_only",
+		}
+	}
+}
+
 /// One performance-run record. The parent process augments child records with RSS and parent-observed wall
 /// time before writing raw JSONL and summary rows.
 #[derive(Debug, Clone)]
@@ -307,6 +330,9 @@ pub struct PerfAttempt {
 	pub local_join_admissions: Option<Vec<String>>,
 	/// Runtime hash-join path and attributed spill bytes, keyed by replay id.
 	pub join_spill_observations: Option<Vec<toron::distributed::task::JoinSpillObservation>>,
+	/// How the persisted dataset behind this row was verified. `None` means no persisted dataset
+	/// backed the run — an in-memory fixture, or a peer engine row the harness did not load data for.
+	pub dataset_verification: Option<DatasetVerification>,
 }
 
 /// The commit this gauge binary was built from, stamped at compile time
@@ -355,6 +381,7 @@ impl PerfAttempt {
 			"binary_modified_unix": binary_modified_unix(),
 			"local_join_admissions": self.local_join_admissions,
 			"join_spill_observations": self.join_spill_observations,
+			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

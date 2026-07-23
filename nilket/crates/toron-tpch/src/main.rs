@@ -18,11 +18,11 @@ use toron_tpch::{
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
 	export_persisted_perf_query_parquet, gauge_hash_smaller_build, gauge_memory_per_task,
 	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
-	normalize_duckdb_type, parse_scale_factor, prepare_persisted_tpch_dataset,
-	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	normalize_duckdb_type, paired_ablation_dataset_fingerprint, parse_scale_factor,
+	prepare_persisted_tpch_dataset, primitive_ladder_intent, q17_correctness_scale, run_dev_q1,
+	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
+	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -526,13 +526,19 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		if !default_switch && queries.len() != 1 {
 			return harness_error("--paired-ablation with --paired-env requires a single query");
 		}
-		let dataset_fingerprint = match load_persisted_tpch_dataset(mode, sf, &data_dir) {
-			Ok(dataset) => dataset.manifest_fingerprint,
-			Err(message) => {
-				return harness_error(&format!(
-					"paired ablation requires a verified persisted dataset: {message}"
-				));
-			}
+		// The gate's whole claim is that both arms saw identical bytes, so it admits only a full-hash
+		// load. Under the skip env the load still succeeds; its fingerprint just proves manifest
+		// self-consistency, which is why the admission asks the dataset what was actually proved.
+		let dataset_fingerprint = match load_persisted_tpch_dataset(mode, sf, &data_dir)
+			.map_err(|message| {
+				format!(
+					"paired ablation requires a full-hash verified persisted dataset: {message}"
+				)
+			})
+			.and_then(|dataset| paired_ablation_dataset_fingerprint(&dataset))
+		{
+			Ok(fingerprint) => fingerprint,
+			Err(message) => return harness_error(&message),
 		};
 		let gate = if default_switch {
 			run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir)
@@ -1970,6 +1976,7 @@ fn duckdb_not_attempted_row(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: None,
 	}
 	.json_value()
 }
@@ -2008,6 +2015,7 @@ fn polars_not_attempted_row(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: None,
 	}
 	.json_value()
 }
@@ -2170,6 +2178,7 @@ fn run_polars_perf_export(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: None,
 	}
 }
 
@@ -2291,6 +2300,7 @@ fn run_polars_perf_export(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: export.dataset_verification,
 	}
 }
 
@@ -2641,6 +2651,7 @@ fn polars_unsupported_attempt(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: export.dataset_verification,
 	}
 }
 
@@ -2686,6 +2697,7 @@ fn polars_fail_attempt(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: export.dataset_verification,
 	}
 }
 
@@ -2824,6 +2836,7 @@ fn run_duckdb_perf_child(
 			debug_build: false,
 			local_join_admissions: None,
 			join_spill_observations: None,
+			dataset_verification: export.dataset_verification,
 		}
 		.json_value());
 	}
@@ -2865,6 +2878,7 @@ fn run_duckdb_perf_child(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		dataset_verification: export.dataset_verification,
 	}
 	.json_value())
 }
@@ -3431,11 +3445,15 @@ fn summarize_query_rows(
 		.and_then(|row| row.get("spill_bytes_reserved_provenance"))
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("unrecorded");
+	let (dataset_verification, dataset_verification_changed) = summary_dataset_verification(&rows);
 	let mut flags = Vec::new();
 	const STABILITY_THRESHOLD: f64 = 0.20;
 	const REGRESSION_THRESHOLD: f64 = 0.10;
 	if spread_ratio > STABILITY_THRESHOLD {
 		push_summary_flag(&mut flags, "unstable");
+	}
+	if dataset_verification_changed {
+		push_summary_flag(&mut flags, "dataset_verification_changed");
 	}
 	if profile != "release" {
 		push_summary_flag(&mut flags, "debug_build");
@@ -3504,6 +3522,7 @@ fn summarize_query_rows(
 		"output_schema_fingerprint": output_schema_fingerprint,
 		"engine_version": engine_version,
 		"duckdb_version": duckdb_version,
+		"dataset_verification": dataset_verification,
 		"build_commit": rows.last().and_then(|row| row.get("build_commit")).cloned(),
 		"binary_modified_unix": rows
 			.last()
@@ -3516,6 +3535,28 @@ fn summarize_query_rows(
 		"baseline_execute_ms_median": baseline_execute_ms_median,
 		"flags": flags,
 	})
+}
+
+/// The verification the whole summary cell rests on, and whether the measured rows disagreed.
+///
+/// Unlike the other provenance fields here, this one is not taken from the first row. A summary is
+/// one median over several runs, so a cell that mixed a full-hash run with a manifest-only one has no
+/// single chain of custody to report — taking either would overstate one of them. Disagreement
+/// therefore yields `null` plus a flag rather than a plausible-looking value. Agreement on *absent*
+/// (in-memory runs, which load no dataset) is agreement, not disagreement.
+fn summary_dataset_verification(rows: &[&serde_json::Value]) -> (serde_json::Value, bool) {
+	let mut observed = rows.iter().map(|row| {
+		row.get("dataset_verification")
+			.unwrap_or(&serde_json::Value::Null)
+	});
+	let Some(first) = observed.next() else {
+		return (serde_json::Value::Null, false);
+	};
+	if observed.all(|value| value == first) {
+		(first.clone(), false)
+	} else {
+		(serde_json::Value::Null, true)
+	}
 }
 
 fn perf_summary_key(engine: &str, query: &str) -> String {
@@ -3683,7 +3724,8 @@ fn write_perf_outputs(
 			std::fs::write(baseline_path, format!("{summary}\n"))?;
 		} else {
 			eprintln!(
-				"perf baseline not recorded: summary rows must be release, passing, and stable"
+				"perf baseline not recorded: summary rows must be release, passing, stable, and \
+				 agree on dataset verification"
 			);
 		}
 	}
@@ -3844,7 +3886,12 @@ fn perf_baseline_is_recordable(summary_rows: &[serde_json::Value]) -> bool {
 					.into_iter()
 					.flatten()
 					.filter_map(serde_json::Value::as_str)
-					.any(|flag| flag == "debug_build" || flag == "unstable")
+					// A baseline is what later runs are measured against, so it may not rest on a
+					// cell whose dataset identity moved between runs.
+					.any(|flag| {
+						flag == "debug_build"
+							|| flag == "unstable" || flag == "dataset_verification_changed"
+					})
 		})
 }
 
@@ -4619,6 +4666,71 @@ mod tests {
 		}));
 	}
 
+	/// `latest_summary.jsonl` and the recorded baseline are what a board is read from, so the
+	/// verification has to survive the reduction from raw rows — otherwise only `latest_raw.jsonl`
+	/// is auditable and the artifact everyone actually reads is not.
+	#[test]
+	fn summary_carries_dataset_verification_when_measured_rows_agree() {
+		for verification in ["full_hash", "manifest_only"] {
+			let rows = vec![
+				perf_row_with_verification(0, Some(verification)),
+				perf_row_with_verification(1, Some(verification)),
+			];
+			let summary = summarize_perf_rows(&rows, 2, 0, &BTreeMap::new());
+			assert_eq!(summary.len(), 1);
+			assert_eq!(summary[0]["dataset_verification"], verification);
+			assert!(!summary_flags(&summary[0]).contains(&"dataset_verification_changed"));
+			assert!(
+				perf_baseline_is_recordable(&summary),
+				"{verification} agreement must stay recordable"
+			);
+		}
+	}
+
+	/// Agreement on *absent* is agreement: in-memory runs load no dataset, so a null cell is honest
+	/// rather than a disagreement, and it must not block a baseline.
+	#[test]
+	fn summary_reports_null_when_no_row_claims_verification() {
+		let rows = vec![
+			perf_row_with_verification(0, None),
+			perf_row_with_verification(1, None),
+		];
+		let summary = summarize_perf_rows(&rows, 2, 0, &BTreeMap::new());
+		assert_eq!(summary[0]["dataset_verification"], serde_json::Value::Null);
+		assert!(!summary_flags(&summary[0]).contains(&"dataset_verification_changed"));
+		assert!(perf_baseline_is_recordable(&summary));
+	}
+
+	#[test]
+	fn a_cell_whose_verification_moved_reports_null_flags_it_and_blocks_the_baseline() {
+		// full_hash vs manifest_only: one median over runs that did not share a chain of custody.
+		let mixed_modes = vec![
+			perf_row_with_verification(0, Some("full_hash")),
+			perf_row_with_verification(1, Some("manifest_only")),
+		];
+		let summary = summarize_perf_rows(&mixed_modes, 2, 0, &BTreeMap::new());
+		assert_eq!(
+			summary[0]["dataset_verification"],
+			serde_json::Value::Null,
+			"neither arm may be reported as if it covered the whole cell"
+		);
+		assert!(summary_flags(&summary[0]).contains(&"dataset_verification_changed"));
+		assert!(
+			!perf_baseline_is_recordable(&summary),
+			"a baseline may not rest on a cell whose dataset identity moved"
+		);
+
+		// A row that claims nothing mixed with one that does is equally a disagreement.
+		let mixed_presence = vec![
+			perf_row_with_verification(0, Some("full_hash")),
+			perf_row_with_verification(1, None),
+		];
+		let summary = summarize_perf_rows(&mixed_presence, 2, 0, &BTreeMap::new());
+		assert_eq!(summary[0]["dataset_verification"], serde_json::Value::Null);
+		assert!(summary_flags(&summary[0]).contains(&"dataset_verification_changed"));
+		assert!(!perf_baseline_is_recordable(&summary));
+	}
+
 	#[test]
 	fn duckdb_absent_rows_summarize_as_not_attempted() {
 		let rows = vec![duckdb_not_attempted_row(
@@ -4807,6 +4919,7 @@ mod tests {
 			manifest_path: PathBuf::from("target/tpch/data/strict/sf1/manifest.json"),
 			manifest_fingerprint: "manifest".to_string(),
 			tables: Vec::new(),
+			dataset_verification: None,
 		}
 	}
 
@@ -4845,6 +4958,26 @@ mod tests {
 			"output_row_count": 1,
 			"output_schema_fingerprint": "schema",
 		})
+	}
+
+	/// One measured toron q06 row, differing only in run index and its verification claim.
+	fn perf_row_with_verification(run_index: u32, verification: Option<&str>) -> serde_json::Value {
+		let mut row = perf_row("q06", 100.0, "plan-a", true);
+		row["run_index"] = serde_json::json!(run_index);
+		row["dataset_verification"] = match verification {
+			Some(value) => serde_json::json!(value),
+			None => serde_json::Value::Null,
+		};
+		row
+	}
+
+	fn summary_flags(row: &serde_json::Value) -> Vec<&str> {
+		row.get("flags")
+			.and_then(serde_json::Value::as_array)
+			.into_iter()
+			.flatten()
+			.filter_map(serde_json::Value::as_str)
+			.collect()
 	}
 
 	fn perf_summary_row(status: &str, profile: &str, flags: &[&str]) -> serde_json::Value {
