@@ -113,7 +113,7 @@ mod tests {
 	#[test]
 	fn csv_lexical_baseline_alternates_columns() {
 		let provider = CsvProvider;
-		let src = b"name,age\njoel,38\n";
+		let src = b"name,age\ntest,38\n";
 		let spans = provider.lexical_baseline(src, &[(0, DocByte::ZERO)]);
 		assert!(spans.iter().any(|s| s.category == TokenCategory::Function));
 		assert!(spans.iter().any(|s| s.category == TokenCategory::Type));
@@ -123,7 +123,7 @@ mod tests {
 	#[test]
 	fn tsv_lexical_baseline_uses_tab_delimiter() {
 		let provider = TsvProvider;
-		let src = b"name\tage\njoel\t38\n";
+		let src = b"name\tage\ntest\t38\n";
 		let spans = provider.lexical_baseline(src, &[(0, DocByte::ZERO)]);
 		let puncts = spans
 			.iter()

@@ -145,7 +145,7 @@ mod tests {
 	#[test]
 	fn invariant_holds_for_diverse_inputs() {
 		let sources: &[&[u8]] = &[
-			b"name,age\njoel,38\n",
+			b"name,age\ntest,38\n",
 			b"a,b,c\nd,e,f\n",
 			b"single line no newline",
 			b"\"quoted\",plain\n",
@@ -153,7 +153,7 @@ mod tests {
 			b"a,,b\n,,\n",
 			b"a\tb\tc\nd\te\tf\n",
 			b"\r\n\r\na,b\r\nc,d\r\n",
-			b"\n\nname,age\n\njoel,38\n",
+			b"\n\nname,age\n\ntest,38\n",
 		];
 		for src in sources {
 			for delim in &[CSV_DELIMITER, TSV_DELIMITER] {

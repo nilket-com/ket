@@ -102,7 +102,7 @@ mod tests {
 
 	#[test]
 	fn numeric_fields_render_as_number_regardless_of_column() {
-		let src = b"name,age,score\njoel,38,3.14\n";
+		let src = b"name,age,score\ntest,38,3.14\n";
 		let h = spans(src, CSV_DELIMITER);
 		let numbers = h
 			.iter()

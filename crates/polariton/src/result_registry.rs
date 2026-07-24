@@ -1,6 +1,6 @@
 //! Session registry of results published by plain SQL buffers.
 //!
-//! `-- @result joel` names exactly the tabular result displayed by that buffer
+//! `-- @result test` names exactly the tabular result displayed by that buffer
 //! execution. Bindings follow latest-dispatch-wins: a revision is assigned when
 //! execution starts, so an older slow query cannot overwrite a newer
 //! publication merely because it finishes later. Failure, or completion
@@ -150,7 +150,7 @@ pub fn parse_result_annotation(sql: &str) -> Result<Option<String>, String> {
 		}
 		let mut tokens = rest.split_whitespace();
 		let Some(name) = tokens.next() else {
-			return Err("`-- @result` needs a name, e.g. `-- @result joel`".to_owned());
+			return Err("`-- @result` needs a name, e.g. `-- @result test`".to_owned());
 		};
 		if tokens.next().is_some() {
 			return Err(format!(
@@ -198,10 +198,10 @@ mod tests {
 	#[test]
 	fn publish_binds_data_and_provenance() {
 		let mut registry = ResultRegistry::default();
-		let claim = begin(&mut registry, "joel");
+		let claim = begin(&mut registry, "test");
 		assert!(registry.publish(&claim, frame(1)));
 		assert_eq!(registry.snapshot().len(), 1);
-		let provenance = registry.provenance("joel").expect("provenance recorded");
+		let provenance = registry.provenance("test").expect("provenance recorded");
 		assert_eq!(provenance.source_buffer, BufferId::new(7));
 		assert_eq!(provenance.rows, 1);
 		assert_eq!(provenance.cols, 1);
@@ -212,9 +212,9 @@ mod tests {
 	#[test]
 	fn dispatch_retires_the_previous_binding_immediately() {
 		let mut registry = ResultRegistry::default();
-		let claim = begin(&mut registry, "joel");
+		let claim = begin(&mut registry, "test");
 		assert!(registry.publish(&claim, frame(1)));
-		let _running = begin(&mut registry, "joel");
+		let _running = begin(&mut registry, "test");
 		assert!(
 			registry.snapshot().is_empty(),
 			"stale data must not be observable while a newer query runs"
@@ -224,12 +224,12 @@ mod tests {
 	#[test]
 	fn an_older_dispatch_cannot_overwrite_a_newer_one() {
 		let mut registry = ResultRegistry::default();
-		let old = begin(&mut registry, "joel");
-		let new = begin(&mut registry, "joel");
+		let old = begin(&mut registry, "test");
+		let new = begin(&mut registry, "test");
 		assert!(registry.publish(&new, frame(2)));
 		assert!(!registry.publish(&old, frame(1)));
 		let snapshot = registry.snapshot();
-		let bound = snapshot.get("joel").expect("newer publication bound");
+		let bound = snapshot.get("test").expect("newer publication bound");
 		assert_eq!(
 			bound.column("x").unwrap().i32().unwrap().get(0),
 			Some(2),
@@ -240,9 +240,9 @@ mod tests {
 	#[test]
 	fn failure_leaves_the_name_unbound() {
 		let mut registry = ResultRegistry::default();
-		let first = begin(&mut registry, "joel");
+		let first = begin(&mut registry, "test");
 		assert!(registry.publish(&first, frame(1)));
-		let failed = begin(&mut registry, "joel");
+		let failed = begin(&mut registry, "test");
 		assert!(registry.conclude_unbound(&failed));
 		assert!(registry.snapshot().is_empty());
 	}
@@ -250,26 +250,26 @@ mod tests {
 	#[test]
 	fn annotation_parses_a_single_name() {
 		assert_eq!(
-			parse_result_annotation("-- @result joel\nselect 1 as x"),
-			Ok(Some("joel".to_owned()))
+			parse_result_annotation("-- @result test\nselect 1 as x"),
+			Ok(Some("test".to_owned()))
 		);
 		assert_eq!(parse_result_annotation("select 1 as x"), Ok(None));
 	}
 
 	#[test]
 	fn annotation_ignores_lookalike_words() {
-		assert_eq!(parse_result_annotation("-- @results joel"), Ok(None));
+		assert_eq!(parse_result_annotation("-- @results test"), Ok(None));
 	}
 
 	#[test]
 	fn annotation_rejects_missing_and_conflicting_names() {
 		assert!(parse_result_annotation("-- @result").is_err());
-		assert!(parse_result_annotation("-- @result joel extra").is_err());
+		assert!(parse_result_annotation("-- @result test extra").is_err());
 		assert!(parse_result_annotation("-- @result a\n-- @result b").is_err());
 		assert!(parse_result_annotation("-- @result 9lives").is_err());
 		assert_eq!(
-			parse_result_annotation("-- @result joel\n-- @result joel"),
-			Ok(Some("joel".to_owned()))
+			parse_result_annotation("-- @result test\n-- @result test"),
+			Ok(Some("test".to_owned()))
 		);
 	}
 }

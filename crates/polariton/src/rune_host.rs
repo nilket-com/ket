@@ -474,24 +474,24 @@ viz.plot(trips).scatter().line().show()?;
 	fn published_results_resolve_through_workspace_result() {
 		let data = df!("x" => [1_i32, 3], "y" => [2_i32, 4]).expect("frame");
 		let execution = execute_body(
-			r#"viz.plot(workspace.result("joel")?).scatter().show()?;"#,
-			results("joel", data),
+			r#"viz.plot(workspace.result("test")?).scatter().show()?;"#,
+			results("test", data),
 		)
 		.expect("published result plots");
 		assert_eq!(execution.requests.len(), 1);
 		let PlotSource::Materialized { name, .. } = &execution.requests[0].source;
-		assert_eq!(name, "joel");
+		assert_eq!(name, "test");
 	}
 
 	#[test]
 	fn missing_result_names_the_publishing_annotation() {
 		let error = execute_body(
-			r#"viz.plot(workspace.result("joel")?).show()?;"#,
+			r#"viz.plot(workspace.result("test")?).show()?;"#,
 			RuneCapabilities::default(),
 		)
 		.expect_err("missing result is a script error");
 		assert!(
-			error.contains("-- @result joel"),
+			error.contains("-- @result test"),
 			"unhelpful error: {error}"
 		);
 	}
@@ -500,8 +500,8 @@ viz.plot(trips).scatter().line().show()?;
 	fn explicit_scatter_columns_become_the_projection() {
 		let data = df!("x" => [1_i32], "y" => [2_i32], "z" => [3_i32]).expect("frame");
 		let execution = execute_body(
-			r#"viz.plot(workspace.result("joel")?).scatter("z", "y").show()?;"#,
-			results("joel", data),
+			r#"viz.plot(workspace.result("test")?).scatter("z", "y").show()?;"#,
+			results("test", data),
 		)
 		.expect("explicit columns execute");
 		assert_eq!(
@@ -514,8 +514,8 @@ viz.plot(trips).scatter().line().show()?;
 	fn zero_argument_scatter_keeps_column_inference() {
 		let data = df!("x" => [1_i32], "y" => [2_i32]).expect("frame");
 		let execution = execute_body(
-			r#"viz.plot(workspace.result("joel")?).scatter().show()?;"#,
-			results("joel", data),
+			r#"viz.plot(workspace.result("test")?).scatter().show()?;"#,
+			results("test", data),
 		)
 		.expect("bare scatter executes");
 		assert_eq!(execution.requests[0].projection, None);
@@ -524,8 +524,8 @@ viz.plot(trips).scatter().line().show()?;
 	#[test]
 	fn one_argument_scatter_is_a_precise_error() {
 		let error = execute_body(
-			r#"viz.plot(workspace.result("joel")?).scatter("x").show()?;"#,
-			results("joel", df!("x" => [1_i32]).expect("frame")),
+			r#"viz.plot(workspace.result("test")?).scatter("x").show()?;"#,
+			results("test", df!("x" => [1_i32]).expect("frame")),
 		)
 		.expect_err("one-argument scatter is rejected");
 		assert!(
@@ -539,13 +539,13 @@ viz.plot(trips).scatter().line().show()?;
 		let data = df!("x" => [1_i32], "y" => [2_i32]).expect("frame");
 		let execution = execute_body(
 			r#"
-viz.plot(workspace.result("joel")?).scatter().show()?;
-"plotted joel"
+viz.plot(workspace.result("test")?).scatter().show()?;
+"plotted test"
 "#,
-			results("joel", data),
+			results("test", data),
 		)
 		.expect("plot plus trailing expression executes");
-		assert_eq!(execution.display.as_deref(), Some("plotted joel"));
+		assert_eq!(execution.display.as_deref(), Some("plotted test"));
 		assert_eq!(execution.requests.len(), 1);
 	}
 }

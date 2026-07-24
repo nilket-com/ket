@@ -82,12 +82,12 @@ mod tests {
 	fn plan_without_projection_keeps_the_full_frame() {
 		let frame = df!("x" => [1_i32], "y" => [2_i32], "z" => [3_i32]).expect("frame");
 		let resolved = plan(PlotRequest {
-			source: materialized("joel", frame),
+			source: materialized("test", frame),
 			composition: PlotComposition::single(PlotType::Scatter),
 			projection: None,
 		})
 		.expect("plan succeeds");
-		assert_eq!(resolved.source_name, "joel");
+		assert_eq!(resolved.source_name, "test");
 		assert_eq!(resolved.data.width(), 3);
 	}
 
@@ -95,7 +95,7 @@ mod tests {
 	fn plan_applies_an_explicit_projection_in_order() {
 		let frame = df!("x" => [1_i32], "y" => [2_i32], "z" => [3_i32]).expect("frame");
 		let resolved = plan(PlotRequest {
-			source: materialized("joel", frame),
+			source: materialized("test", frame),
 			composition: PlotComposition::single(PlotType::Scatter),
 			projection: Some(("z".to_owned(), "x".to_owned())),
 		})
@@ -113,14 +113,14 @@ mod tests {
 	fn plan_reports_a_missing_projection_column() {
 		let frame = df!("x" => [1_i32]).expect("frame");
 		let error = plan(PlotRequest {
-			source: materialized("joel", frame),
+			source: materialized("test", frame),
 			composition: PlotComposition::single(PlotType::Scatter),
 			projection: Some(("x".to_owned(), "missing".to_owned())),
 		})
 		.expect_err("missing column fails planning");
 		assert!(error.contains("missing"), "unhelpful error: {error}");
 		assert!(
-			error.contains("joel"),
+			error.contains("test"),
 			"error must name the source: {error}"
 		);
 	}
