@@ -7,9 +7,12 @@ use libaryon::core::{
 	Coverage, PixelDelta, PixelHeight, PixelWidth, PixelX, PixelY, PreviewFingerprint, Rgb, ViewId,
 };
 use libaryon::engine::UiPalette;
+use libaryon::svp::markdown_blocks::{
+	ListMarker, MarkdownBlock, MarkdownInlineStyle, MarkdownInlineText, line_start_byte,
+	parse_markdown_blocks, source_line_count, source_line_for_byte,
+};
 use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
 use libaryon::uast::projection::MarkdownPreviewSnapshot;
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
 use regex_automata::{meta::Regex, util::syntax};
@@ -17,7 +20,6 @@ use std::{
 	collections::HashMap,
 	collections::hash_map::DefaultHasher,
 	hash::{Hash, Hasher},
-	ops::Range,
 	sync::mpsc,
 	thread,
 };
@@ -627,670 +629,6 @@ fn preview_anchor_y_for_source_line(
 	layouts.last().map(|layout| layout.y_end.start_position())
 }
 
-fn source_line_count(source: &str) -> u64 {
-	if source.is_empty() {
-		return 1;
-	}
-	source
-		.as_bytes()
-		.iter()
-		.filter(|byte| **byte == b'\n')
-		.count()
-		.saturating_add(1) as u64
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MarkdownInlineText {
-	spans: Vec<MarkdownInlineSpan>,
-}
-
-impl MarkdownInlineText {
-	fn new() -> Self {
-		Self { spans: Vec::new() }
-	}
-
-	fn push(&mut self, role: MarkdownInlineRole, text: &str) {
-		if text.is_empty() {
-			return;
-		}
-		if let Some(last) = self.spans.last_mut().filter(|span| span.role == role) {
-			last.text.push_str(text);
-			return;
-		}
-		self.spans.push(MarkdownInlineSpan {
-			role,
-			text: text.to_string(),
-		});
-	}
-
-	fn append_block_text(&mut self, text: &MarkdownInlineText) {
-		let text = text.trimmed();
-		if text.is_empty() {
-			return;
-		}
-		if !self.is_empty() {
-			self.push(MarkdownInlineRole::Text, "\n");
-		}
-		for span in text.spans {
-			self.push(span.role, &span.text);
-		}
-	}
-
-	fn trimmed(&self) -> Self {
-		let mut trimmed = self.clone();
-		trimmed.trim();
-		trimmed
-	}
-
-	fn trim(&mut self) {
-		while let Some(first) = self.spans.first_mut() {
-			let trimmed = first.text.trim_start();
-			if trimmed.len() == first.text.len() {
-				break;
-			}
-			first.text = trimmed.to_string();
-			if !first.text.is_empty() {
-				break;
-			}
-			self.spans.remove(0);
-		}
-		while let Some(last) = self.spans.last_mut() {
-			let trimmed = last.text.trim_end();
-			if trimmed.len() == last.text.len() {
-				break;
-			}
-			last.text = trimmed.to_string();
-			if !last.text.is_empty() {
-				break;
-			}
-			self.spans.pop();
-		}
-	}
-
-	fn is_empty(&self) -> bool {
-		self.spans.iter().all(|span| span.text.is_empty())
-	}
-
-	#[cfg(test)]
-	fn plain_text(&self) -> String {
-		self.spans
-			.iter()
-			.map(|span| span.text.as_str())
-			.collect::<String>()
-	}
-
-	fn char_count(&self) -> usize {
-		self.spans
-			.iter()
-			.map(|span| span.text.chars().count())
-			.sum()
-	}
-}
-
-impl Default for MarkdownInlineText {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MarkdownInlineSpan {
-	role: MarkdownInlineRole,
-	text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarkdownInlineRole {
-	Text,
-	InlineCode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MarkdownBlock {
-	Heading {
-		level: u8,
-		text: String,
-		source_range: Range<usize>,
-	},
-	Paragraph {
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	CodeBlock {
-		info: Option<String>,
-		language: Option<String>,
-		text: String,
-		source_range: Range<usize>,
-	},
-	Quote {
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	ListItem {
-		depth: u16,
-		marker: ListMarker,
-		checked: Option<bool>,
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	Rule {
-		source_range: Range<usize>,
-	},
-	Table {
-		rows: Vec<Vec<MarkdownInlineText>>,
-		source_range: Range<usize>,
-	},
-	Html {
-		text: String,
-		source_range: Range<usize>,
-	},
-}
-
-impl MarkdownBlock {
-	fn source_range(&self) -> &Range<usize> {
-		match self {
-			Self::Heading { source_range, .. }
-			| Self::Paragraph { source_range, .. }
-			| Self::CodeBlock { source_range, .. }
-			| Self::Quote { source_range, .. }
-			| Self::ListItem { source_range, .. }
-			| Self::Rule { source_range }
-			| Self::Table { source_range, .. }
-			| Self::Html { source_range, .. } => source_range,
-		}
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ListMarker {
-	Unordered,
-	Ordered(u64),
-}
-
-enum ActiveBlock {
-	Paragraph {
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	Heading {
-		level: u8,
-		text: String,
-		source_range: Range<usize>,
-	},
-	CodeBlock {
-		info: Option<String>,
-		language: Option<String>,
-		text: String,
-		source_range: Range<usize>,
-	},
-	Quote {
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	List {
-		next_number: Option<u64>,
-	},
-	Item {
-		depth: u16,
-		marker: ListMarker,
-		checked: Option<bool>,
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	Table {
-		rows: Vec<Vec<MarkdownInlineText>>,
-		source_range: Range<usize>,
-	},
-	TableRow {
-		cells: Vec<MarkdownInlineText>,
-		source_range: Range<usize>,
-	},
-	TableCell {
-		text: MarkdownInlineText,
-		source_range: Range<usize>,
-	},
-	Html {
-		text: String,
-		source_range: Range<usize>,
-	},
-}
-
-fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
-	let mut options = Options::empty();
-	options.insert(Options::ENABLE_TABLES);
-	options.insert(Options::ENABLE_TASKLISTS);
-	options.insert(Options::ENABLE_STRIKETHROUGH);
-	options.insert(Options::ENABLE_GFM);
-
-	let mut stack: Vec<ActiveBlock> = Vec::new();
-	let mut blocks = Vec::new();
-	for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
-		match event {
-			Event::Start(Tag::Paragraph) => stack.push(ActiveBlock::Paragraph {
-				text: MarkdownInlineText::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::Paragraph) => {
-				let Some(ActiveBlock::Paragraph { text, source_range }) = stack.pop() else {
-					continue;
-				};
-				let text = text.trimmed();
-				if text.is_empty() {
-					continue;
-				}
-				let source_range = source_range.start..range.end.max(source_range.end);
-				if !append_inline_text_to_parent(&mut stack, &text) {
-					blocks.push(MarkdownBlock::Paragraph { text, source_range });
-				}
-			}
-			Event::Start(Tag::Heading { level, .. }) => stack.push(ActiveBlock::Heading {
-				level: heading_level_u8(level),
-				text: String::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::Heading(_)) => {
-				let Some(ActiveBlock::Heading {
-					level,
-					text,
-					source_range,
-				}) = stack.pop()
-				else {
-					continue;
-				};
-				let text = text.trim().to_string();
-				if !text.is_empty() {
-					blocks.push(MarkdownBlock::Heading {
-						level,
-						text,
-						source_range: source_range.start..range.end.max(source_range.end),
-					});
-				}
-			}
-			Event::Start(Tag::CodeBlock(kind)) => {
-				let info = code_block_info(kind);
-				stack.push(ActiveBlock::CodeBlock {
-					language: code_block_language(info.as_deref()),
-					info,
-					text: String::new(),
-					source_range: range,
-				});
-			}
-			Event::End(TagEnd::CodeBlock) => {
-				let Some(ActiveBlock::CodeBlock {
-					info,
-					language,
-					text,
-					source_range,
-				}) = stack.pop()
-				else {
-					continue;
-				};
-				blocks.push(MarkdownBlock::CodeBlock {
-					info,
-					language,
-					text: text.trim_end_matches('\n').to_string(),
-					source_range: source_range.start..range.end.max(source_range.end),
-				});
-			}
-			Event::Start(Tag::BlockQuote(_)) => stack.push(ActiveBlock::Quote {
-				text: MarkdownInlineText::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::BlockQuote(_)) => {
-				let Some(ActiveBlock::Quote { text, source_range }) = stack.pop() else {
-					continue;
-				};
-				let text = text.trimmed();
-				if !text.is_empty() {
-					blocks.push(MarkdownBlock::Quote {
-						text,
-						source_range: source_range.start..range.end.max(source_range.end),
-					});
-				}
-			}
-			Event::Start(Tag::List(start)) => stack.push(ActiveBlock::List { next_number: start }),
-			Event::End(TagEnd::List(_)) => {
-				if matches!(stack.last(), Some(ActiveBlock::List { .. })) {
-					let _ = stack.pop();
-				}
-			}
-			Event::Start(Tag::Item) => {
-				let marker = next_list_marker(&mut stack);
-				let depth = current_list_depth(&stack);
-				stack.push(ActiveBlock::Item {
-					depth,
-					marker,
-					checked: None,
-					text: MarkdownInlineText::new(),
-					source_range: range,
-				});
-			}
-			Event::End(TagEnd::Item) => {
-				let Some(ActiveBlock::Item {
-					depth,
-					marker,
-					checked,
-					text,
-					source_range,
-				}) = stack.pop()
-				else {
-					continue;
-				};
-				let text = text.trimmed();
-				blocks.push(MarkdownBlock::ListItem {
-					depth,
-					marker,
-					checked,
-					text,
-					source_range: source_range.start..range.end.max(source_range.end),
-				});
-			}
-			Event::Start(Tag::Table(_)) => stack.push(ActiveBlock::Table {
-				rows: Vec::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::Table) => {
-				let Some(ActiveBlock::Table { rows, source_range }) = stack.pop() else {
-					continue;
-				};
-				if !rows.is_empty() {
-					blocks.push(MarkdownBlock::Table {
-						rows,
-						source_range: source_range.start..range.end.max(source_range.end),
-					});
-				}
-			}
-			Event::Start(Tag::TableHead) => stack.push(ActiveBlock::TableRow {
-				cells: Vec::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::TableHead) => {
-				let Some(ActiveBlock::TableRow {
-					cells,
-					source_range,
-				}) = stack.pop()
-				else {
-					continue;
-				};
-				if let Some(ActiveBlock::Table {
-					rows,
-					source_range: table_range,
-				}) = stack
-					.iter_mut()
-					.rev()
-					.find(|ctx| matches!(ctx, ActiveBlock::Table { .. }))
-				{
-					table_range.end = table_range.end.max(source_range.end).max(range.end);
-					rows.push(cells);
-				}
-			}
-			Event::Start(Tag::TableRow) => stack.push(ActiveBlock::TableRow {
-				cells: Vec::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::TableRow) => {
-				let Some(ActiveBlock::TableRow {
-					cells,
-					source_range,
-				}) = stack.pop()
-				else {
-					continue;
-				};
-				if let Some(ActiveBlock::Table {
-					rows,
-					source_range: table_range,
-				}) = stack
-					.iter_mut()
-					.rev()
-					.find(|ctx| matches!(ctx, ActiveBlock::Table { .. }))
-				{
-					table_range.end = table_range.end.max(source_range.end).max(range.end);
-					rows.push(cells);
-				}
-			}
-			Event::Start(Tag::TableCell) => stack.push(ActiveBlock::TableCell {
-				text: MarkdownInlineText::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::TableCell) => {
-				let Some(ActiveBlock::TableCell { text, source_range }) = stack.pop() else {
-					continue;
-				};
-				if let Some(ActiveBlock::TableRow {
-					cells,
-					source_range: row_range,
-				}) = stack
-					.iter_mut()
-					.rev()
-					.find(|ctx| matches!(ctx, ActiveBlock::TableRow { .. }))
-				{
-					row_range.end = row_range.end.max(source_range.end).max(range.end);
-					cells.push(text.trimmed());
-				}
-			}
-			Event::Start(Tag::HtmlBlock) => stack.push(ActiveBlock::Html {
-				text: String::new(),
-				source_range: range,
-			}),
-			Event::End(TagEnd::HtmlBlock) => {
-				let Some(ActiveBlock::Html { text, source_range }) = stack.pop() else {
-					continue;
-				};
-				let text = text.trim().to_string();
-				if !text.is_empty() {
-					blocks.push(MarkdownBlock::Html {
-						text,
-						source_range: source_range.start..range.end.max(source_range.end),
-					});
-				}
-			}
-			Event::Text(text) | Event::InlineMath(text) => {
-				append_text(&mut stack, MarkdownInlineRole::Text, text.as_ref());
-			}
-			Event::Code(text) => {
-				append_text(&mut stack, MarkdownInlineRole::InlineCode, text.as_ref());
-			}
-			Event::Html(text) | Event::InlineHtml(text) => {
-				append_text(&mut stack, MarkdownInlineRole::Text, text.as_ref());
-			}
-			Event::DisplayMath(text) => {
-				append_text(&mut stack, MarkdownInlineRole::Text, text.as_ref());
-			}
-			Event::SoftBreak => append_text(&mut stack, MarkdownInlineRole::Text, " "),
-			Event::HardBreak => append_text(&mut stack, MarkdownInlineRole::Text, "\n"),
-			Event::Rule => blocks.push(MarkdownBlock::Rule {
-				source_range: range,
-			}),
-			Event::TaskListMarker(checked) => {
-				if !set_task_marker(&mut stack, checked) {
-					append_text(
-						&mut stack,
-						MarkdownInlineRole::Text,
-						if checked { "[x] " } else { "[ ] " },
-					);
-				}
-			}
-			Event::FootnoteReference(label) => {
-				append_text(
-					&mut stack,
-					MarkdownInlineRole::Text,
-					&format!("[{}]", label),
-				);
-			}
-			Event::Start(
-				Tag::Emphasis
-				| Tag::Strong
-				| Tag::Strikethrough
-				| Tag::Superscript
-				| Tag::Subscript
-				| Tag::Link { .. }
-				| Tag::Image { .. }
-				| Tag::MetadataBlock(_)
-				| Tag::FootnoteDefinition(_)
-				| Tag::DefinitionList
-				| Tag::DefinitionListTitle
-				| Tag::DefinitionListDefinition,
-			)
-			| Event::End(
-				TagEnd::Emphasis
-				| TagEnd::Strong
-				| TagEnd::Strikethrough
-				| TagEnd::Superscript
-				| TagEnd::Subscript
-				| TagEnd::Link
-				| TagEnd::Image
-				| TagEnd::MetadataBlock(_)
-				| TagEnd::FootnoteDefinition
-				| TagEnd::DefinitionList
-				| TagEnd::DefinitionListTitle
-				| TagEnd::DefinitionListDefinition,
-			) => {}
-		}
-	}
-	blocks.sort_by_key(|block| block.source_range().start);
-	blocks
-}
-
-fn append_text(stack: &mut [ActiveBlock], role: MarkdownInlineRole, text: &str) {
-	if text.is_empty() {
-		return;
-	}
-	for ctx in stack.iter_mut().rev() {
-		match ctx {
-			ActiveBlock::Paragraph { text: target, .. }
-			| ActiveBlock::Quote { text: target, .. }
-			| ActiveBlock::Item { text: target, .. }
-			| ActiveBlock::TableCell { text: target, .. } => {
-				target.push(role, text);
-				return;
-			}
-			ActiveBlock::Heading { text: target, .. }
-			| ActiveBlock::CodeBlock { text: target, .. }
-			| ActiveBlock::Html { text: target, .. } => {
-				target.push_str(text);
-				return;
-			}
-			ActiveBlock::List { .. } | ActiveBlock::Table { .. } | ActiveBlock::TableRow { .. } => {
-			}
-		}
-	}
-}
-
-fn append_inline_text_to_parent(stack: &mut [ActiveBlock], text: &MarkdownInlineText) -> bool {
-	for ctx in stack.iter_mut().rev() {
-		match ctx {
-			ActiveBlock::Quote { text: target, .. }
-			| ActiveBlock::Item { text: target, .. }
-			| ActiveBlock::TableCell { text: target, .. } => {
-				target.append_block_text(text);
-				return true;
-			}
-			_ => {}
-		}
-	}
-	false
-}
-
-fn next_list_marker(stack: &mut [ActiveBlock]) -> ListMarker {
-	for ctx in stack.iter_mut().rev() {
-		if let ActiveBlock::List { next_number } = ctx {
-			if let Some(number) = next_number {
-				let marker = ListMarker::Ordered(*number);
-				*number = number.saturating_add(1);
-				return marker;
-			}
-			return ListMarker::Unordered;
-		}
-	}
-	ListMarker::Unordered
-}
-
-fn current_list_depth(stack: &[ActiveBlock]) -> u16 {
-	stack
-		.iter()
-		.filter(|ctx| matches!(ctx, ActiveBlock::List { .. }))
-		.count()
-		.saturating_sub(1)
-		.min(u16::MAX as usize) as u16
-}
-
-fn set_task_marker(stack: &mut [ActiveBlock], checked: bool) -> bool {
-	for ctx in stack.iter_mut().rev() {
-		if let ActiveBlock::Item { checked: state, .. } = ctx {
-			*state = Some(checked);
-			return true;
-		}
-	}
-	false
-}
-
-fn heading_level_u8(level: HeadingLevel) -> u8 {
-	match level {
-		HeadingLevel::H1 => 1,
-		HeadingLevel::H2 => 2,
-		HeadingLevel::H3 => 3,
-		HeadingLevel::H4 => 4,
-		HeadingLevel::H5 => 5,
-		HeadingLevel::H6 => 6,
-	}
-}
-
-fn code_block_info(kind: CodeBlockKind<'_>) -> Option<String> {
-	match kind {
-		CodeBlockKind::Fenced(info) => {
-			let info = info.trim();
-			(!info.is_empty()).then(|| info.to_string())
-		}
-		CodeBlockKind::Indented => None,
-	}
-}
-
-fn code_block_language(info: Option<&str>) -> Option<String> {
-	let info = info?.trim();
-	if info.is_empty() {
-		return None;
-	}
-	code_block_attribute_language(info)
-		.or_else(|| info.split_whitespace().next().map(str::to_string))
-}
-
-fn code_block_attribute_language(info: &str) -> Option<String> {
-	let attrs = info.strip_prefix('{')?;
-	let attrs = attrs.strip_suffix('}').unwrap_or(attrs);
-	attrs.split_whitespace().find_map(|attr| {
-		let attr = attr.trim_matches(|ch| ch == '{' || ch == '}');
-		let language = attr
-			.strip_prefix(".language-")
-			.or_else(|| attr.strip_prefix('.'))?;
-		(!language.is_empty()).then(|| language.to_string())
-	})
-}
-
-fn line_start_byte(source: &str, target_line: u64) -> usize {
-	if target_line == 0 {
-		return 0;
-	}
-	let mut current_line = 0u64;
-	for (idx, ch) in source.char_indices() {
-		if ch == '\n' {
-			current_line = current_line.saturating_add(1);
-			if current_line == target_line {
-				return idx.saturating_add(1);
-			}
-		}
-	}
-	source.len()
-}
-
-fn source_line_for_byte(source: &str, byte: usize) -> u64 {
-	source
-		.as_bytes()
-		.iter()
-		.take(byte.min(source.len()))
-		.filter(|byte| **byte == b'\n')
-		.count() as u64
-}
-
 #[derive(Clone, Copy)]
 struct FontMetrics {
 	cell_w: PixelWidth,
@@ -1443,7 +781,7 @@ fn load_preview_font(
 	.flatten()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FontRole {
 	Sans,
 	Serif,
@@ -2272,7 +1610,7 @@ fn table_row_background(row_idx: usize, palette: &MarkdownPreviewPalette) -> Opt
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MarkdownInlineWord {
-	role: MarkdownInlineRole,
+	style: MarkdownInlineStyle,
 	text: String,
 	leading_space: bool,
 }
@@ -2280,13 +1618,13 @@ struct MarkdownInlineWord {
 fn inline_words(text: &MarkdownInlineText) -> Vec<MarkdownInlineWord> {
 	let mut words = Vec::new();
 	let mut pending_space = false;
-	for span in &text.spans {
+	for span in text.spans() {
 		let mut word = String::new();
 		for ch in span.text.chars() {
 			if ch.is_whitespace() {
 				if !word.is_empty() {
 					words.push(MarkdownInlineWord {
-						role: span.role,
+						style: span.style,
 						text: std::mem::take(&mut word),
 						leading_space: pending_space && !words.is_empty(),
 					});
@@ -2298,7 +1636,7 @@ fn inline_words(text: &MarkdownInlineText) -> Vec<MarkdownInlineWord> {
 		}
 		if !word.is_empty() {
 			words.push(MarkdownInlineWord {
-				role: span.role,
+				style: span.style,
 				text: word,
 				leading_space: pending_space && !words.is_empty(),
 			});
@@ -2315,16 +1653,16 @@ fn clipped_inline_chars(text: &MarkdownInlineText, max_chars: usize) -> Markdown
 	let keep = max_chars.saturating_sub(1).max(1);
 	let mut remaining = keep;
 	let mut clipped = MarkdownInlineText::new();
-	for span in &text.spans {
+	for span in text.spans() {
 		if remaining == 0 {
 			break;
 		}
 		let span_chars = span.text.chars().count();
 		let take = remaining.min(span_chars);
-		clipped.push(span.role, &take_chars(&span.text, take));
+		clipped.push(span.style, &take_chars(&span.text, take));
 		remaining = remaining.saturating_sub(take);
 	}
-	clipped.push(MarkdownInlineRole::Text, "~");
+	clipped.push(MarkdownInlineStyle::TEXT, "~");
 	clipped
 }
 
@@ -2354,7 +1692,7 @@ fn draw_wrapped_inline_text(
 	let mut line_len = 0usize;
 
 	for word in inline_words(text) {
-		let role = word.role;
+		let style = word.style;
 		let mut remaining = word.text;
 		let mut leading_space = word.leading_space;
 		while !remaining.is_empty() {
@@ -2391,7 +1729,7 @@ fn draw_wrapped_inline_text(
 				line_len += space_len;
 				line_len += remaining_len;
 				line.push(MarkdownInlineWord {
-					role,
+					style,
 					text: remaining,
 					leading_space: space_len > 0,
 				});
@@ -2400,7 +1738,7 @@ fn draw_wrapped_inline_text(
 
 			let chunk = take_chars(&remaining, available);
 			line.push(MarkdownInlineWord {
-				role,
+				style,
 				text: chunk,
 				leading_space: space_len > 0,
 			});
@@ -2454,7 +1792,7 @@ fn draw_inline_words(
 			cursor =
 				cursor.saturating_add(draw_text(text_renderer, canvas, cursor, y, " ", body_spec));
 		}
-		let spec = inline_text_spec(word.role, body_spec, inline_code_spec);
+		let spec = inline_text_spec(word.style, body_spec, inline_code_spec);
 		cursor = cursor.saturating_add(draw_text(
 			text_renderer,
 			canvas,
@@ -2476,8 +1814,8 @@ fn draw_inline_text(
 	inline_code_spec: TextSpec,
 ) {
 	let mut cursor = x;
-	for span in &text.spans {
-		let spec = inline_text_spec(span.role, body_spec, inline_code_spec);
+	for span in text.spans() {
+		let spec = inline_text_spec(span.style, body_spec, inline_code_spec);
 		cursor = cursor.saturating_add(draw_text(
 			text_renderer,
 			canvas,
@@ -2489,14 +1827,24 @@ fn draw_inline_text(
 	}
 }
 
+/// Emphasis is not expressed here yet: the rasterizer loads regular and bold
+/// faces only, so `MarkdownInlineStyle::emphasis` renders as body text until
+/// italic faces join `TextRenderer`. Strong maps onto the bold face headings
+/// already use.
 fn inline_text_spec(
-	role: MarkdownInlineRole,
+	style: MarkdownInlineStyle,
 	body_spec: TextSpec,
 	inline_code_spec: TextSpec,
 ) -> TextSpec {
-	match role {
-		MarkdownInlineRole::Text => body_spec,
-		MarkdownInlineRole::InlineCode => inline_code_spec,
+	let spec = if style.code {
+		inline_code_spec
+	} else {
+		body_spec
+	};
+	if style.strong {
+		TextSpec { bold: true, ..spec }
+	} else {
+		spec
 	}
 }
 
@@ -2898,15 +2246,8 @@ mod tests {
 
 	fn inline_text(text: &str) -> MarkdownInlineText {
 		let mut inline = MarkdownInlineText::new();
-		inline.push(MarkdownInlineRole::Text, text);
+		inline.push(MarkdownInlineStyle::TEXT, text);
 		inline
-	}
-
-	fn inline_parts(text: &MarkdownInlineText) -> Vec<(MarkdownInlineRole, String)> {
-		text.spans
-			.iter()
-			.map(|span| (span.role, span.text.clone()))
-			.collect()
 	}
 
 	fn row_plain_text(row: &[MarkdownInlineText]) -> Vec<String> {
@@ -3003,135 +2344,27 @@ mod tests {
 	}
 
 	#[test]
-	fn parser_preserves_nested_list_depth_and_source_order() {
-		let blocks = parse_markdown_blocks("- parent\n  - child\n    - grandchild\n- sibling\n");
-		let items = blocks
-			.iter()
-			.filter_map(|block| match block {
-				MarkdownBlock::ListItem { depth, text, .. } => Some((text.plain_text(), *depth)),
-				_ => None,
-			})
-			.collect::<Vec<_>>();
-
-		assert_eq!(
-			items,
-			vec![
-				("parent".to_string(), 0),
-				("child".to_string(), 1),
-				("grandchild".to_string(), 2),
-				("sibling".to_string(), 0)
-			]
-		);
-	}
-
-	#[test]
-	fn parser_preserves_inline_code_spans() {
-		let blocks = parse_markdown_blocks(
-			"plain `code` text\n\n- item `code`\n\n| A | B |\n| --- | --- |\n| `x` | y |\n",
-		);
-
-		let paragraph = blocks
-			.iter()
-			.find_map(|block| match block {
-				MarkdownBlock::Paragraph { text, .. } => Some(text),
-				_ => None,
-			})
-			.expect("paragraph");
-		assert_eq!(
-			inline_parts(paragraph),
-			vec![
-				(MarkdownInlineRole::Text, "plain ".to_string()),
-				(MarkdownInlineRole::InlineCode, "code".to_string()),
-				(MarkdownInlineRole::Text, " text".to_string())
-			]
-		);
-
-		let list_item = blocks
-			.iter()
-			.find_map(|block| match block {
-				MarkdownBlock::ListItem { text, .. } => Some(text),
-				_ => None,
-			})
-			.expect("list item");
-		assert_eq!(
-			inline_parts(list_item),
-			vec![
-				(MarkdownInlineRole::Text, "item ".to_string()),
-				(MarkdownInlineRole::InlineCode, "code".to_string())
-			]
-		);
-
-		let table_code_cell = blocks
-			.iter()
-			.find_map(|block| match block {
-				MarkdownBlock::Table { rows, .. } => rows.get(1).and_then(|row| row.first()),
-				_ => None,
-			})
-			.expect("table code cell");
-		assert_eq!(
-			inline_parts(table_code_cell),
-			vec![(MarkdownInlineRole::InlineCode, "x".to_string())]
-		);
-	}
-
-	#[test]
-	fn parser_preserves_quote_inline_code_spans() {
-		let blocks = parse_markdown_blocks("> quote `code`\n");
-		let quote = blocks
-			.iter()
-			.find_map(|block| match block {
-				MarkdownBlock::Quote { text, .. } => Some(text),
-				_ => None,
-			})
-			.expect("quote");
-
-		assert_eq!(
-			inline_parts(quote),
-			vec![
-				(MarkdownInlineRole::Text, "quote ".to_string()),
-				(MarkdownInlineRole::InlineCode, "code".to_string())
-			]
-		);
-	}
-
-	#[test]
-	fn parser_extracts_attribute_form_code_block_language() {
-		let blocks = parse_markdown_blocks("```{#example .rust .numberLines}\nfn main() {}\n```\n");
-		assert!(blocks.iter().any(|block| matches!(
-			block,
-			MarkdownBlock::CodeBlock {
-				info: Some(info),
-				language: Some(language),
-				text,
-				..
-			} if info == "{#example .rust .numberLines}"
-				&& language == "rust"
-				&& text.contains("fn main")
-		)));
-	}
-
-	#[test]
 	fn inline_words_preserve_adjacent_span_boundaries_without_extra_spaces() {
 		let mut text = MarkdownInlineText::new();
-		text.push(MarkdownInlineRole::Text, "a");
-		text.push(MarkdownInlineRole::InlineCode, "b");
-		text.push(MarkdownInlineRole::Text, " c");
+		text.push(MarkdownInlineStyle::TEXT, "a");
+		text.push(MarkdownInlineStyle::CODE, "b");
+		text.push(MarkdownInlineStyle::TEXT, " c");
 
 		assert_eq!(
 			inline_words(&text),
 			vec![
 				MarkdownInlineWord {
-					role: MarkdownInlineRole::Text,
+					style: MarkdownInlineStyle::TEXT,
 					text: "a".to_string(),
 					leading_space: false,
 				},
 				MarkdownInlineWord {
-					role: MarkdownInlineRole::InlineCode,
+					style: MarkdownInlineStyle::CODE,
 					text: "b".to_string(),
 					leading_space: false,
 				},
 				MarkdownInlineWord {
-					role: MarkdownInlineRole::Text,
+					style: MarkdownInlineStyle::TEXT,
 					text: "c".to_string(),
 					leading_space: true,
 				}
@@ -3140,10 +2373,66 @@ mod tests {
 	}
 
 	#[test]
+	fn strong_selects_the_bold_face_and_code_keeps_the_mono_face() {
+		let metrics = FontMetrics {
+			cell_w: PixelWidth::new(8),
+			cell_h: PixelHeight::new(16),
+			body_scale_x: 1,
+			body_scale_y: 2,
+			body_role: FontRole::Sans,
+		};
+		let body = TextSpec::body(&metrics, TEXT_RGBA);
+		let code = TextSpec::code(&metrics, CODE_TEXT_RGBA);
+
+		let plain = inline_text_spec(MarkdownInlineStyle::TEXT, body, code);
+		assert!(!plain.bold);
+		assert_eq!(plain.role, FontRole::Sans);
+
+		let strong = inline_text_spec(
+			MarkdownInlineStyle {
+				strong: true,
+				..MarkdownInlineStyle::TEXT
+			},
+			body,
+			code,
+		);
+		assert!(strong.bold, "strong text renders in the bold face");
+		assert_eq!(strong.role, FontRole::Sans);
+
+		let strong_code = inline_text_spec(
+			MarkdownInlineStyle {
+				strong: true,
+				..MarkdownInlineStyle::CODE
+			},
+			body,
+			code,
+		);
+		assert!(strong_code.bold);
+		assert_eq!(
+			strong_code.role,
+			FontRole::Mono,
+			"a bold inline-code run stays monospaced"
+		);
+
+		// Emphasis has no face of its own yet, so it must at least not change
+		// the one it is drawn in.
+		let emphasis = inline_text_spec(
+			MarkdownInlineStyle {
+				emphasis: true,
+				..MarkdownInlineStyle::TEXT
+			},
+			body,
+			code,
+		);
+		assert!(!emphasis.bold);
+		assert_eq!(emphasis.role, FontRole::Sans);
+	}
+
+	#[test]
 	fn inline_wrap_does_not_inject_space_between_adjacent_spans() {
 		let mut text = MarkdownInlineText::new();
-		text.push(MarkdownInlineRole::Text, "a");
-		text.push(MarkdownInlineRole::InlineCode, "b");
+		text.push(MarkdownInlineStyle::TEXT, "a");
+		text.push(MarkdownInlineStyle::CODE, "b");
 		let metrics = FontMetrics {
 			cell_w: PixelWidth::new(8),
 			cell_h: PixelHeight::new(16),

@@ -13,6 +13,7 @@ chacha20poly1305.workspace = true
 imara-diff.workspace = true
 memchr.workspace = true
 libc.workspace = true
+pulldown-cmark.workspace = true
 ra_ap_base_db.workspace = true
 ra_ap_cfg.workspace = true
 ra_ap_ide.workspace = true

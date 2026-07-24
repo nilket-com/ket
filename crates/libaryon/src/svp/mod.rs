@@ -17,6 +17,7 @@ pub mod json_highlight;
 pub mod json_parse;
 pub mod json_provider;
 pub mod line_index;
+pub mod markdown_blocks;
 pub mod markdown_highlight;
 pub mod markdown_parse;
 pub mod markdown_provider;

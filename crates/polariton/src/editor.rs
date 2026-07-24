@@ -26,6 +26,10 @@ use libaryon::engine::{
 	HostEvent, HostPanelId, MinimapSnapshot, PaneDropEdge, PanelRevision, SplitDirection,
 	UiPalette, VisualKind, minimap_click_viewport_start_line,
 };
+use libaryon::svp::markdown_blocks::{
+	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
+};
+use libaryon::svp::rust_highlight::TokenCategory;
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
@@ -52,6 +56,16 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// A plot needs more room than a tabular result, but remains a document block
 /// rather than a workspace pane. Width stays responsive to the preview.
 const NOTEBOOK_PLOT_HEIGHT: f32 = 360.0;
+/// Proportional face for prose. Markdown preview is the one surface that is not
+/// a grid of cells, so it does not use the editor's monospace font.
+const HEADING_FONT: iced::Font = iced::Font {
+	weight: iced::font::Weight::Bold,
+	..iced::Font::DEFAULT
+};
+const MARKDOWN_BODY_SIZE: f32 = 17.0;
+const MARKDOWN_BODY_LINE_HEIGHT: f32 = 24.0;
+/// Horizontal step per list nesting level.
+const MARKDOWN_LIST_INDENT: f32 = 20.0;
 
 /// The registered application monospace font. Named explicitly (rather than
 /// `Font::MONOSPACE`, which resolves to the platform default) so
@@ -267,6 +281,15 @@ pub struct CodeEditor {
 	/// Successful SQL results are execution state, not presentation state.
 	/// A cell with `output=none` must still be addressable by a later Rune cell.
 	notebook_cell_data: HashMap<MarkdownCellIdentity, Arc<DataFrame>>,
+	/// Parsed Markdown structure per previewed source buffer. `view` runs on
+	/// every frame while the source text only changes with a projection, so
+	/// parsing happens when a viewport arrives and the result is reused.
+	preview_blocks: HashMap<libaryon::core::BufferId, CachedPreviewBlocks>,
+}
+
+struct CachedPreviewBlocks {
+	source_digest: u64,
+	blocks: Vec<MarkdownBlock>,
 }
 
 /// A runnable fenced SQL cell selected by the engine's cursor projection.
@@ -430,6 +453,7 @@ impl CodeEditor {
 			pane_drag: None,
 			notebook_outputs: HashMap::new(),
 			notebook_cell_data: HashMap::new(),
+			preview_blocks: HashMap::new(),
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		if let Some(text) = replacement {
@@ -873,6 +897,7 @@ impl CodeEditor {
 			self.document_texts
 				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
 			self.reconcile_notebook_outputs(&viewport);
+			self.reconcile_preview_blocks(&viewport);
 			self.viewport = Some(viewport);
 			changed = true;
 		}
@@ -901,6 +926,40 @@ impl CodeEditor {
 			.collect::<std::collections::HashSet<_>>();
 		self.notebook_cell_data
 			.retain(|identity, _| source_cells.contains(identity));
+	}
+
+	/// Reparse each previewed document whose text actually changed, and forget
+	/// the previews that closed.
+	fn reconcile_preview_blocks(&mut self, viewport: &Viewport) {
+		let previews: Vec<&libaryon::uast::projection::MarkdownPreviewSnapshot> = viewport
+			.panes
+			.iter()
+			.filter_map(|pane| pane.markdown_preview.as_ref())
+			.collect();
+		let live: std::collections::HashSet<libaryon::core::BufferId> = previews
+			.iter()
+			.map(|preview| preview.source_buffer_id)
+			.collect();
+		self.preview_blocks
+			.retain(|buffer_id, _| live.contains(buffer_id));
+		for preview in previews {
+			let digest = {
+				let mut hasher = std::collections::hash_map::DefaultHasher::new();
+				preview.source_text.hash(&mut hasher);
+				hasher.finish()
+			};
+			let entry = self.preview_blocks.get(&preview.source_buffer_id);
+			if entry.is_some_and(|cached| cached.source_digest == digest) {
+				continue;
+			}
+			self.preview_blocks.insert(
+				preview.source_buffer_id,
+				CachedPreviewBlocks {
+					source_digest: digest,
+					blocks: parse_markdown_blocks(&preview.source_text),
+				},
+			);
+		}
 	}
 
 	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
@@ -1055,6 +1114,9 @@ impl CodeEditor {
 			let content = if let Some(preview) = pane.markdown_preview.as_ref() {
 				markdown_preview_surface(
 					preview,
+					self.preview_blocks
+						.get(&preview.source_buffer_id)
+						.map_or(&[][..], |cached| cached.blocks.as_slice()),
 					palette,
 					&self.notebook_outputs,
 					self.show_column_types,
@@ -2347,135 +2409,43 @@ fn text_pane_surface<'a>(
 	editor_content
 }
 
-/// Native, read-only Markdown projection. The engine owns both parsing and
-/// highlighting: this surface receives source-coordinate categories plus the
-/// same palette a text pane receives, then only paints those pixels.
+/// Native, read-only Markdown projection. The engine owns parsing, cell
+/// identity, and code highlighting: this surface receives blocks plus the same
+/// palette a text pane receives, then only paints those pixels.
+///
+/// The window is anchored on the source line the preview mirrors and bounded by
+/// [`preview_row_budget`], so a long document costs the same as a short one.
 fn markdown_preview_surface<'a>(
 	preview: &'a libaryon::uast::projection::MarkdownPreviewSnapshot,
+	blocks: &'a [MarkdownBlock],
 	palette: UiPalette,
 	outputs: &'a HashMap<MarkdownCellIdentity, NotebookCellOutput>,
 	show_column_types: bool,
 ) -> Element<'a, EditorMsg> {
-	let mut rows: Vec<Element<'_, EditorMsg>> = Vec::new();
-	let mut byte_offset = 0u64;
-	// Every fenced block retains Markdown's normal code rendering. A cell is
-	// the subset of a fence with an engine-projected identity and presentation.
-	let mut in_code_block = false;
-	let mut active_code_cell: Option<&libaryon::uast::projection::MarkdownCellSnapshot> = None;
-	let first_line = preview.source_scroll_line.get();
-	let last_line = first_line.saturating_add(preview_row_budget(preview.source_viewport_line_count));
+	let source = preview.source_text.as_str();
+	let colors = MarkdownPreviewColors::new(preview.theme_colors, palette);
+	let window = preview_source_window(
+		source,
+		preview.source_scroll_line.get(),
+		preview.source_viewport_line_count,
+	);
 
-	for (line_number, source_line) in preview.source_text.split_inclusive('\n').enumerate() {
-		let content = source_line.strip_suffix('\n').unwrap_or(source_line);
-		let trimmed = content.trim_start();
-		let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-		if fence {
-			if in_code_block {
-				in_code_block = false;
-				if let Some(cell) = active_code_cell.take() {
-					let body_end = byte_offset;
-					if (first_line..last_line).contains(&(line_number as u64))
-						&& let Some(cell) = preview.cells.iter().find(|candidate| {
-							candidate.identity == cell.identity
-								&& candidate.body_range.end.get() == body_end
-						}) && let Some(output) = outputs.get(&cell.identity)
-						&& cell.presentation.output
-							== libaryon::uast::projection::MarkdownCellOutputTarget::Inline
-					{
-						rows.push(markdown_cell_output_surface(
-							cell.identity.clone(),
-							output,
-							palette,
-							show_column_types,
-						));
-					}
-				}
-			} else {
-				in_code_block = true;
-				let body_start = byte_offset.saturating_add(source_line.len() as u64);
-				active_code_cell = preview
-					.cells
-					.iter()
-					.find(|cell| cell.body_range.start.get() == body_start);
-			}
-			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
+	let mut rows: Vec<Element<'_, EditorMsg>> = Vec::new();
+	for block in visible_blocks(blocks, window) {
+		let range = block.source_range();
+		if let MarkdownBlock::CodeBlock { text, .. } = block {
+			rows.extend(markdown_code_block_rows(
+				preview,
+				source,
+				range,
+				text,
+				palette,
+				outputs,
+				show_column_types,
+			));
 			continue;
 		}
-		if active_code_cell
-			.is_some_and(|cell| cell.presentation.code == MarkdownCellCodeVisibility::Hide)
-		{
-			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
-			continue;
-		}
-		if (first_line..last_line).contains(&(line_number as u64)) {
-			let row: Element<'_, EditorMsg> = if in_code_block {
-				container(
-					rich_text(markdown_code_fragments(
-						content,
-						byte_offset,
-						&preview.code_highlights,
-						preview.theme_colors,
-						palette.editor_text,
-					))
-					.font(EDITOR_FONT)
-					.size(metrics::TEXT_SIZE)
-					.line_height(iced::Pixels(metrics::LINE_HEIGHT)),
-				)
-				.padding([0, 12])
-				.width(Length::Fill)
-				.style(move |_| container::Style {
-					background: Some(Background::Color(color(palette.gutter_surface))),
-					..Default::default()
-				})
-				.into()
-			} else if let Some(heading) = trimmed.strip_prefix("# ") {
-				text(heading)
-					.font(iced::Font::DEFAULT)
-					.size(28)
-					.color(color(palette.editor_text))
-					.into()
-			} else if let Some(heading) = trimmed.strip_prefix("## ") {
-				text(heading)
-					.font(iced::Font::DEFAULT)
-					.size(22)
-					.color(color(palette.editor_text))
-					.into()
-			} else if is_markdown_thematic_break(content) {
-				container(Space::new().height(Length::Fixed(1.0)))
-					.width(Length::Fill)
-					.style(move |_| container::Style {
-						background: Some(Background::Color(Color {
-							a: 0.35,
-							..color(palette.editor_text)
-						})),
-						..Default::default()
-					})
-					.into()
-			} else if content.is_empty() {
-				Space::new()
-					.height(Length::Fixed(metrics::LINE_HEIGHT / 2.0))
-					.into()
-			} else {
-				text(content)
-					.font(iced::Font::DEFAULT)
-					.size(17)
-					.color(color(palette.editor_text))
-					.into()
-			};
-			// The gap between rows is each row's own bottom padding rather than
-			// column spacing. Iced subtracts a column's entire spacing budget
-			// from the available height *before* laying out any child, so with
-			// enough rows the first child is measured against a negative height
-			// and every row collapses to nothing. Padding is measured per row,
-			// so rows that do fit always render.
-			rows.push(
-				container(row)
-					.padding(iced::padding::bottom(PREVIEW_ROW_GAP))
-					.width(Length::Fill)
-					.into(),
-			);
-		}
-		byte_offset = byte_offset.saturating_add(source_line.len() as u64);
+		rows.push(preview_row(markdown_block_surface(block, colors)));
 	}
 
 	container(column(rows))
@@ -2483,6 +2453,83 @@ fn markdown_preview_surface<'a>(
 		.width(Length::Fill)
 		.height(Length::Fill)
 		.into()
+}
+
+/// The colors the preview draws Markdown in.
+///
+/// These are the *same* theme entries the source pane colors its Markdown
+/// tokens with, read straight from the snapshot: a heading is `Type` on both
+/// sides, inline code is `String` on both sides. Reading the categories
+/// directly keeps the two panes in agreement under any theme without a
+/// preview-specific palette to maintain.
+/// Body text included: `Punctuation` is the neutral foreground every theme
+/// defines, so prose follows the theme rather than sitting at UI white. Bold
+/// and italic take categories of their own — the preview draws no `**`, so the
+/// color is what has to carry the emphasis the markers would have shown.
+#[derive(Clone, Copy)]
+struct MarkdownPreviewColors {
+	body: Rgb,
+	heading: Rgb,
+	inline_code: Rgb,
+	strong: Rgb,
+	emphasis: Rgb,
+	bullet: Rgb,
+	ordered_marker: Rgb,
+	quote: Rgb,
+	rule: Rgb,
+	muted: Rgb,
+	row_alt: Rgb,
+}
+
+impl MarkdownPreviewColors {
+	fn new(
+		theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
+		palette: UiPalette,
+	) -> Self {
+		let themed = |category: TokenCategory, fallback: Rgb| -> Rgb {
+			theme_colors[category as usize].unwrap_or(fallback)
+		};
+		let body = themed(TokenCategory::Punctuation, palette.editor_text);
+		Self {
+			body,
+			heading: themed(TokenCategory::Type, palette.editor_text),
+			inline_code: themed(TokenCategory::String, palette.gutter_accent),
+			// Emphasis markers are `Operator` on the left, so italic keeps that
+			// color; bold takes `Keyword` to stay distinct from it, since weight
+			// alone reads weakly against colored prose.
+			strong: themed(TokenCategory::Keyword, body),
+			emphasis: themed(TokenCategory::Operator, body),
+			bullet: themed(TokenCategory::Operator, palette.gutter_accent),
+			ordered_marker: themed(TokenCategory::Number, palette.gutter_accent),
+			quote: themed(TokenCategory::Comment, palette.preview_text),
+			rule: themed(TokenCategory::Punctuation, palette.editor_text),
+			muted: themed(TokenCategory::Comment, palette.preview_text),
+			row_alt: palette.preview_surface,
+		}
+	}
+}
+
+/// Byte range of the source the preview draws: the window its source pane
+/// shows, anchored on the line the two panes share.
+fn preview_source_window(
+	source: &str,
+	first_line: u64,
+	source_viewport_line_count: u32,
+) -> std::ops::Range<usize> {
+	let last_line = first_line.saturating_add(preview_row_budget(source_viewport_line_count));
+	line_start_byte(source, first_line)..line_start_byte(source, last_line)
+}
+
+/// Blocks overlapping the window. A block that merely straddles an edge is
+/// drawn: a paragraph half in view is still half in view.
+fn visible_blocks(
+	blocks: &[MarkdownBlock],
+	window: std::ops::Range<usize>,
+) -> impl Iterator<Item = &MarkdownBlock> {
+	blocks.iter().filter(move |block| {
+		let range = block.source_range();
+		range.end > window.start && range.start < window.end
+	})
 }
 
 /// Vertical gap between preview rows, in pixels.
@@ -2493,23 +2540,294 @@ const PREVIEW_ROW_GAP: f32 = 8.0;
 /// The preview mirrors the source pane's window, but its rows are not a fixed
 /// height — a blank line is half a row, a heading or an inline cell output is
 /// several — so the count that fills the pane is not the source's line count.
-/// Overshooting is what keeps the pane full when short rows dominate; rows past
-/// the bottom edge cost a measure and draw nothing. It stays proportional to the
-/// pane so the budget cannot outgrow the space that has to absorb it.
+/// Overshooting is what keeps the pane full when short rows dominate; blocks
+/// past the bottom edge cost a measure and draw nothing. It stays proportional
+/// to the pane so the budget cannot outgrow the space that has to absorb it.
 fn preview_row_budget(source_viewport_line_count: u32) -> u64 {
 	u64::from(source_viewport_line_count).saturating_mul(2)
 }
 
-/// Markdown's thematic-break syntax: at least three matching `-`, `_`, or
-/// `*` characters, with optional whitespace between them.
-fn is_markdown_thematic_break(line: &str) -> bool {
-	let marks: Vec<char> = line
-		.chars()
-		.filter(|character| !character.is_whitespace())
-		.collect();
-	matches!(marks.as_slice(), [first, rest @ ..] if marks.len() >= 3
-		&& matches!(first, '-' | '_' | '*')
-		&& rest.iter().all(|character| character == first))
+/// Wrap a preview row in its own bottom padding.
+///
+/// The gap between rows is deliberately not column spacing: iced subtracts a
+/// column's entire spacing budget from the available height *before* laying out
+/// any child, so with enough rows the first child is measured against a
+/// negative height and every row collapses to nothing. Padding is measured per
+/// row, so rows that do fit always render.
+fn preview_row<'a>(content: Element<'a, EditorMsg>) -> Element<'a, EditorMsg> {
+	container(content)
+		.padding(iced::padding::bottom(PREVIEW_ROW_GAP))
+		.width(Length::Fill)
+		.into()
+}
+
+fn markdown_block_surface<'a>(
+	block: &'a MarkdownBlock,
+	colors: MarkdownPreviewColors,
+) -> Element<'a, EditorMsg> {
+	match block {
+		MarkdownBlock::Heading {
+			level, text: title, ..
+		} => {
+			let heading = text(title.as_str())
+				.font(HEADING_FONT)
+				.size(heading_text_size(*level))
+				.color(color(colors.heading));
+			// A rule under the top two levels is the document's own sectioning,
+			// which is why it is drawn for those levels and no others.
+			if *level <= 2 {
+				column![heading, markdown_rule(colors.rule, 0.45)]
+					.spacing(4)
+					.into()
+			} else {
+				heading.into()
+			}
+		}
+		MarkdownBlock::Paragraph { text: body, .. } => {
+			markdown_inline_surface(body, colors, colors.body)
+		}
+		MarkdownBlock::Quote { text: body, .. } => {
+			container(markdown_inline_surface(body, colors, colors.quote))
+				.padding([2, 12])
+				.width(Length::Fill)
+				.into()
+		}
+		MarkdownBlock::ListItem {
+			depth,
+			marker,
+			checked,
+			text: body,
+			..
+		} => {
+			let marker_color = match marker {
+				ListMarker::Ordered(_) => colors.ordered_marker,
+				ListMarker::Unordered => colors.bullet,
+			};
+			row![
+				text(list_item_marker(*marker, *checked))
+					.font(iced::Font::DEFAULT)
+					.size(MARKDOWN_BODY_SIZE)
+					.color(color(marker_color)),
+				markdown_inline_surface(body, colors, colors.body),
+			]
+			.spacing(8)
+			.padding(iced::padding::left(
+				MARKDOWN_LIST_INDENT * f32::from(*depth),
+			))
+			.into()
+		}
+		MarkdownBlock::Rule { .. } => markdown_rule(colors.rule, 0.35),
+		MarkdownBlock::Table { rows: cells, .. } => markdown_table_surface(cells, colors),
+		MarkdownBlock::Html { text: raw, .. } => text(raw.as_str())
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(colors.muted))
+			.into(),
+		// Fences are rendered by `markdown_code_block_rows`, which needs source
+		// coordinates this function does not carry.
+		MarkdownBlock::CodeBlock { text: code, .. } => text(code.as_str())
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
+			.color(color(colors.body))
+			.into(),
+	}
+}
+
+/// Inline runs, styled by the shared model: bold, italic, and inline code are
+/// document semantics, so they are honored rather than shown as their markers.
+///
+/// Weight and slant are joined by color, because the markers that would have
+/// carried the emphasis on the left are not drawn here. Inline code wins over
+/// emphasis when a run is both — a bold `identifier` is still an identifier.
+fn markdown_inline_surface<'a>(
+	inline: &'a MarkdownInlineText,
+	colors: MarkdownPreviewColors,
+	foreground: Rgb,
+) -> Element<'a, EditorMsg> {
+	let spans = inline
+		.spans()
+		.iter()
+		.map(|inline_span| {
+			let style = inline_span.style;
+			let mut font = if style.code {
+				EDITOR_FONT
+			} else {
+				iced::Font::DEFAULT
+			};
+			if style.strong {
+				font.weight = iced::font::Weight::Bold;
+			}
+			if style.emphasis {
+				font.style = iced::font::Style::Italic;
+			}
+			let span_color = if style.code {
+				colors.inline_code
+			} else if style.strong {
+				colors.strong
+			} else if style.emphasis {
+				colors.emphasis
+			} else {
+				foreground
+			};
+			span::<EditorMsg, iced::Font>(inline_span.text.as_str())
+				.font(font)
+				.color(color(span_color))
+		})
+		.collect::<Vec<_>>();
+	rich_text(spans)
+		.size(MARKDOWN_BODY_SIZE)
+		.line_height(iced::Pixels(MARKDOWN_BODY_LINE_HEIGHT))
+		.into()
+}
+
+fn markdown_table_surface<'a>(
+	rows: &'a [Vec<MarkdownInlineText>],
+	colors: MarkdownPreviewColors,
+) -> Element<'a, EditorMsg> {
+	let mut laid_out: Vec<Element<'_, EditorMsg>> = Vec::with_capacity(rows.len());
+	for (index, cells) in rows.iter().enumerate() {
+		let foreground = if index == 0 {
+			colors.heading
+		} else {
+			colors.body
+		};
+		let row_cells = cells
+			.iter()
+			.map(|cell| {
+				container(markdown_inline_surface(cell, colors, foreground))
+					.padding([2, 8])
+					.width(Length::Fill)
+					.into()
+			})
+			.collect::<Vec<Element<'_, EditorMsg>>>();
+		// Banding is what makes a wide row readable across; it is chrome, so it
+		// comes from the UI palette rather than a syntax category.
+		let row_alt = colors.row_alt;
+		laid_out.push(
+			container(row(row_cells))
+				.width(Length::Fill)
+				.style(move |_| container::Style {
+					background: (index % 2 == 1).then(|| Background::Color(color(row_alt))),
+					..Default::default()
+				})
+				.into(),
+		);
+		if index == 0 {
+			laid_out.push(markdown_rule(colors.rule, 0.45));
+		}
+	}
+	column(laid_out).into()
+}
+
+fn markdown_rule<'a>(rule_color: Rgb, alpha: f32) -> Element<'a, EditorMsg> {
+	container(Space::new().height(Length::Fixed(1.0)))
+		.width(Length::Fill)
+		.style(move |_| container::Style {
+			background: Some(Background::Color(Color {
+				a: alpha,
+				..color(rule_color)
+			})),
+			..Default::default()
+		})
+		.into()
+}
+
+fn list_item_marker(marker: ListMarker, checked: Option<bool>) -> String {
+	match (checked, marker) {
+		(Some(true), _) => "\u{2611}".to_string(),
+		(Some(false), _) => "\u{2610}".to_string(),
+		(None, ListMarker::Unordered) => "\u{25aa}".to_string(),
+		(None, ListMarker::Ordered(number)) => format!("{number}."),
+	}
+}
+
+fn heading_text_size(level: u8) -> f32 {
+	match level {
+		1 => 28.0,
+		2 => 22.0,
+		3 => 18.0,
+		_ => MARKDOWN_BODY_SIZE,
+	}
+}
+
+/// Render one fence: its highlighted body, then its output when the engine
+/// gave the fence a cell identity and the host has run it.
+///
+/// Highlight spans are in source coordinates, so the body's own byte offset is
+/// recovered from the fence's source range rather than tracked line by line.
+fn markdown_code_block_rows<'a>(
+	preview: &'a libaryon::uast::projection::MarkdownPreviewSnapshot,
+	source: &'a str,
+	range: &std::ops::Range<usize>,
+	body: &'a str,
+	palette: UiPalette,
+	outputs: &'a HashMap<MarkdownCellIdentity, NotebookCellOutput>,
+	show_column_types: bool,
+) -> Vec<Element<'a, EditorMsg>> {
+	let mut produced = Vec::new();
+	let body_start = fence_body_start(source, range);
+	let cell = preview
+		.cells
+		.iter()
+		.find(|cell| cell.body_range.start.get() == body_start as u64);
+	let hidden =
+		cell.is_some_and(|cell| cell.presentation.code == MarkdownCellCodeVisibility::Hide);
+
+	if !hidden {
+		let mut lines: Vec<Element<'_, EditorMsg>> = Vec::new();
+		let mut byte = body_start as u64;
+		for line in body.split('\n') {
+			lines.push(
+				rich_text(markdown_code_fragments(
+					line,
+					byte,
+					&preview.code_highlights,
+					preview.theme_colors,
+					palette.editor_text,
+				))
+				.font(EDITOR_FONT)
+				.size(metrics::TEXT_SIZE)
+				.line_height(iced::Pixels(metrics::LINE_HEIGHT))
+				.into(),
+			);
+			byte = byte.saturating_add(line.len() as u64).saturating_add(1);
+		}
+		produced.push(preview_row(
+			container(column(lines))
+				.padding([6, 12])
+				.width(Length::Fill)
+				.style(move |_| container::Style {
+					background: Some(Background::Color(color(palette.gutter_surface))),
+					..Default::default()
+				})
+				.into(),
+		));
+	}
+
+	if let Some(cell) = cell
+		&& let Some(output) = outputs.get(&cell.identity)
+		&& cell.presentation.output == libaryon::uast::projection::MarkdownCellOutputTarget::Inline
+	{
+		produced.push(preview_row(markdown_cell_output_surface(
+			cell.identity.clone(),
+			output,
+			palette,
+			show_column_types,
+		)));
+	}
+	produced
+}
+
+/// Byte offset of a fence body: the line after the opening fence. An indented
+/// code block has no info line, so its body starts where the block does.
+fn fence_body_start(source: &str, range: &std::ops::Range<usize>) -> usize {
+	let opening = &source[range.clone()];
+	if !opening.starts_with("```") && !opening.starts_with("~~~") {
+		return range.start;
+	}
+	opening
+		.find('\n')
+		.map_or(range.end, |newline| range.start + newline + 1)
 }
 
 fn markdown_cell_output_surface<'a>(
@@ -3315,9 +3633,10 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
-		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, SplitDirection,
-		is_markdown_thematic_break, markdown_code_fragments, metrics, pane_gutter_width, pane_title,
-		preview_row_budget,
+		MarkdownBlock, MarkdownPreviewColors, Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb,
+		SplitDirection, TokenCategory, UiPalette, fence_body_start, markdown_code_fragments,
+		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
+		preview_source_window, visible_blocks,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -4034,16 +4353,6 @@ mod tests {
 		let pane = editor.viewport.as_ref().unwrap().focused_pane().unwrap();
 		assert_eq!(pane.tabs.len(), 1);
 		assert_eq!(pane.tabs[0].view_id, first_view);
-	}
-
-	#[test]
-	fn markdown_thematic_breaks_accept_standard_markers() {
-		for line in ["---", "***", "___", "- - -", " *  * * "] {
-			assert!(is_markdown_thematic_break(line), "{line:?}");
-		}
-		for line in ["--", "--- text", "-_*", "```"] {
-			assert!(!is_markdown_thematic_break(line), "{line:?}");
-		}
 	}
 
 	#[test]
@@ -5702,6 +6011,161 @@ mod tests {
 			"the preview must not show fewer lines than the source pane"
 		);
 		assert_eq!(preview_row_budget(0), 0, "an empty pane renders no rows");
+	}
+
+	/// The preview draws the window its source pane shows. A block that begins
+	/// above the anchor but reaches into view is part of that window.
+	#[test]
+	fn the_visible_window_follows_the_source_anchor() {
+		let source = "# One\n\npara one\n\n# Two\n\npara two\n\n# Three\n\npara three\n";
+		let blocks = parse_markdown_blocks(source);
+		let headings = |window: std::ops::Range<usize>| -> Vec<String> {
+			visible_blocks(&blocks, window)
+				.filter_map(|block| match block {
+					MarkdownBlock::Heading { text, .. } => Some(text.clone()),
+					_ => None,
+				})
+				.collect()
+		};
+
+		// Two source lines of budget: one viewport line, doubled.
+		assert_eq!(headings(preview_source_window(source, 0, 1)), vec!["One"]);
+		assert_eq!(headings(preview_source_window(source, 4, 1)), vec!["Two"]);
+		assert_eq!(
+			headings(preview_source_window(source, 0, 100)),
+			vec!["One", "Two", "Three"],
+			"a budget past the end of the document still stops at the end"
+		);
+	}
+
+	/// Scrolling into the middle of a long paragraph must not blank it: the
+	/// block starts above the anchor but is still on screen.
+	#[test]
+	fn a_block_straddling_the_window_start_is_drawn() {
+		let source = "first line of a paragraph\nsecond line of it\nthird line of it\n\nlater\n";
+		let blocks = parse_markdown_blocks(source);
+
+		let visible: Vec<String> = visible_blocks(&blocks, preview_source_window(source, 1, 1))
+			.map(|block| match block {
+				MarkdownBlock::Paragraph { text, .. } => text.plain_text(),
+				other => panic!("expected paragraphs, got {other:?}"),
+			})
+			.collect();
+		assert_eq!(
+			visible,
+			vec!["first line of a paragraph second line of it third line of it".to_string()],
+			"the paragraph the anchor sits inside must still be drawn"
+		);
+	}
+
+	/// The preview and the source pane must color the same construct the same
+	/// way, which they do by reading the same theme category rather than by
+	/// keeping a second palette in sync.
+	#[test]
+	fn preview_colors_come_from_the_panes_own_theme_categories() {
+		let mut theme_colors = [None; libaryon::svp::rust_highlight::CATEGORY_COUNT];
+		let heading = Rgb::new(10, 20, 30);
+		let string = Rgb::new(40, 50, 60);
+		let operator = Rgb::new(70, 80, 90);
+		let number = Rgb::new(100, 110, 120);
+		let comment = Rgb::new(130, 140, 150);
+		let punctuation = Rgb::new(160, 170, 180);
+		let keyword = Rgb::new(190, 200, 210);
+		theme_colors[TokenCategory::Type as usize] = Some(heading);
+		theme_colors[TokenCategory::String as usize] = Some(string);
+		theme_colors[TokenCategory::Operator as usize] = Some(operator);
+		theme_colors[TokenCategory::Number as usize] = Some(number);
+		theme_colors[TokenCategory::Comment as usize] = Some(comment);
+		theme_colors[TokenCategory::Punctuation as usize] = Some(punctuation);
+		theme_colors[TokenCategory::Keyword as usize] = Some(keyword);
+		let palette = UiPalette::default();
+
+		let colors = MarkdownPreviewColors::new(theme_colors, palette);
+
+		assert_eq!(colors.heading, heading, "headings are Type, as on the left");
+		assert_eq!(colors.inline_code, string);
+		assert_eq!(colors.bullet, operator);
+		assert_eq!(colors.ordered_marker, number);
+		assert_eq!(colors.quote, comment);
+		assert_eq!(colors.rule, punctuation);
+		assert_eq!(
+			colors.body, punctuation,
+			"prose follows the theme's neutral foreground, not UI white"
+		);
+		assert_eq!(colors.emphasis, operator, "italic keeps the marker color");
+		assert_eq!(
+			colors.strong, keyword,
+			"bold stays distinct from italic and from prose"
+		);
+		assert_ne!(colors.strong, colors.body);
+	}
+
+	/// A theme that leaves a category unset must not black out the text that
+	/// would have used it.
+	#[test]
+	fn preview_colors_fall_back_to_the_ui_palette() {
+		let palette = UiPalette::default();
+
+		let colors = MarkdownPreviewColors::new(
+			[None; libaryon::svp::rust_highlight::CATEGORY_COUNT],
+			palette,
+		);
+
+		assert_eq!(colors.heading, palette.editor_text);
+		assert_eq!(colors.inline_code, palette.gutter_accent);
+		assert_eq!(colors.quote, palette.preview_text);
+		assert_eq!(colors.rule, palette.editor_text);
+		assert_eq!(colors.body, palette.editor_text);
+		// Emphasis with no category of its own must fall back to prose rather
+		// than to an unrelated UI color.
+		assert_eq!(colors.strong, palette.editor_text);
+		assert_eq!(colors.emphasis, palette.editor_text);
+	}
+
+	#[test]
+	fn fence_bodies_start_after_their_info_line() {
+		let backticks = "```rust\nfn main() {}\n```\n";
+		assert_eq!(fence_body_start(backticks, &(0..backticks.len())), 8);
+
+		let tildes = "~~~\ncode\n~~~\n";
+		assert_eq!(fence_body_start(tildes, &(0..tildes.len())), 4);
+
+		// An indented block has no info line, so its body is where it starts.
+		let indented = "    code\n";
+		assert_eq!(fence_body_start(indented, &(0..indented.len())), 0);
+	}
+
+	/// Parsing happens when a projection arrives, not per frame, so the cache
+	/// must actually be populated for the preview to have anything to draw.
+	#[test]
+	fn preview_blocks_are_parsed_when_the_projection_arrives() {
+		let markdown = "# Title\n\nsome **bold** text\n";
+		let editor = notebook_with_preview(markdown);
+		let preview = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.panes
+			.iter()
+			.find_map(|pane| pane.markdown_preview.as_ref())
+			.expect("preview");
+
+		let cached = editor
+			.preview_blocks
+			.get(&preview.source_buffer_id)
+			.expect("blocks parsed for the previewed buffer");
+		assert!(matches!(
+			cached.blocks.first(),
+			Some(MarkdownBlock::Heading { level: 1, .. })
+		));
+		assert!(
+			cached.blocks.iter().any(|block| matches!(
+				block,
+				MarkdownBlock::Paragraph { text, .. }
+					if text.spans().iter().any(|span| span.style.strong)
+			)),
+			"emphasis reaches the host as style, not as literal asterisks"
+		);
 	}
 
 	#[test]

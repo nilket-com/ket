@@ -4036,6 +4036,7 @@ dependencies = [
  "io-uring",
  "libc",
  "memchr",
+ "pulldown-cmark 0.13.4",
  "ra_ap_base_db",
  "ra_ap_cfg",
  "ra_ap_ide",
