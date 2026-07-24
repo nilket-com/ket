@@ -262,21 +262,34 @@ pub fn sample_preview_bin_range(
 
 /// Dominant token category across a vertical slice of rows for one output
 /// column range, plus how many of the rows had ink there (for coverage-based
-/// alpha). Returns `None` when every sampled row is empty.
+/// alpha). Each row occupies `logical_width / max_columns` of `content_width`,
+/// preserving the document's horizontal silhouette in dense minimaps. Returns
+/// `None` when every sampled row is empty.
 pub fn dominant_preview_bin_for_rows(
 	rows: &[PreviewRow],
 	x_start: usize,
 	x_end: usize,
-	total_columns: usize,
+	content_width: usize,
+	max_columns: u16,
 ) -> Option<(TokenBin, u16, u16)> {
-	if rows.is_empty() || total_columns == 0 {
+	if rows.is_empty() || content_width == 0 {
 		return None;
 	}
 
 	let mut counts = [0u16; crate::svp::rust_highlight::CATEGORY_COUNT];
 	let mut non_empty = 0u16;
 	for row in rows {
-		let bin = sample_preview_bin_range(row, x_start, x_end, total_columns);
+		if row.logical_width == 0 {
+			continue;
+		}
+		let row_width = usize::from(row.logical_width)
+			.saturating_mul(content_width)
+			.div_ceil(usize::from(max_columns.max(1)))
+			.clamp(1, content_width);
+		if x_start >= row_width {
+			continue;
+		}
+		let bin = sample_preview_bin_range(row, x_start, x_end.min(row_width), row_width);
 		if bin == EMPTY_PREVIEW_BIN {
 			continue;
 		}
@@ -600,7 +613,8 @@ mod tests {
 		BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP, EMPTY_PREVIEW_BIN, MAX_PREVIEW_MINIMAP_LINES,
 		MINIMAP_BANDS, MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewSnapshot,
 		PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot, build_byte_fallback_minimap_snapshot,
-		build_search_minimap_bands, build_text_minimap_snapshot, normalize_line_density, token_bin,
+		build_search_minimap_bands, build_text_minimap_snapshot, dominant_preview_bin_for_rows,
+		normalize_line_density, token_bin,
 	};
 	use crate::core::{DocLine, DocLineCount};
 	use crate::ecs::UastRegistry;
@@ -753,5 +767,26 @@ mod tests {
 		);
 		let overview_clone = overview.clone();
 		assert!(Arc::ptr_eq(&overview.content, &overview_clone.content));
+	}
+
+	#[test]
+	fn dense_sampling_respects_each_rows_relative_width() {
+		let row = |logical_width| PreviewRow {
+			logical_width,
+			bins: vec![token_bin(TokenCategory::Keyword); PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+		};
+		let short = row(8);
+		let long = row(32);
+
+		assert_eq!(
+			dominant_preview_bin_for_rows(std::slice::from_ref(&short), 20, 21, 40, 32),
+			None,
+			"a quarter-width row must not paint the right half"
+		);
+		assert_eq!(
+			dominant_preview_bin_for_rows(&[short, long], 20, 21, 40, 32),
+			Some((token_bin(TokenCategory::Keyword), 1, 2)),
+			"only the long row contributes ink at the right-half sample"
+		);
 	}
 }

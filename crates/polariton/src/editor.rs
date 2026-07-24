@@ -2943,6 +2943,7 @@ impl MinimapWidget<'_> {
 								x as usize,
 								x as usize + 1,
 								content_width as usize,
+								preview.max_columns,
 							) else {
 								continue;
 							};
@@ -3624,6 +3625,54 @@ mod tests {
 		// The empty row leaves the surface untouched.
 		let empty_y = widget.sparse_line_px() + 1;
 		assert_eq!(pixel(8, empty_y), (base.r, base.g, base.b));
+	}
+
+	#[test]
+	fn minimap_dense_ink_preserves_short_line_widths() {
+		use super::{MinimapPixels, MinimapWidget};
+		use libaryon::core::{DocLine, Rgb};
+		use libaryon::engine::{
+			MinimapContentRevision, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS,
+			PreviewRow, PreviewSnapshot, UiPalette,
+		};
+		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+
+		let keyword = libaryon::core::TokenBin::new(TokenCategory::Keyword as u8);
+		let rows = (0..400)
+			.map(|_| PreviewRow {
+				logical_width: 8,
+				bins: vec![keyword; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+			})
+			.collect();
+		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot::new(
+			MinimapOverlay::new(DocLine::ZERO, 20, DocLine::ZERO),
+			MinimapContentRevision::ZERO,
+			32,
+			rows,
+		));
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
+		let widget = MinimapWidget {
+			pane_id: libaryon::core::PaneId::new(1),
+			snapshot: &snapshot,
+			theme_colors,
+			palette: UiPalette::default(),
+		};
+
+		let base = widget.palette.minimap_surface;
+		let mut image = MinimapPixels::new(64, 64, base);
+		widget.render_ink(&mut image, 64, widget.content_height(64));
+		let pixel = |x: u32, y: u32| {
+			let idx = ((y * 64 + x) * 4) as usize;
+			(image.rgba[idx], image.rgba[idx + 1], image.rgba[idx + 2])
+		};
+
+		assert_ne!(pixel(8, 32), (base.r, base.g, base.b));
+		assert_eq!(
+			pixel(32, 32),
+			(base.r, base.g, base.b),
+			"quarter-width rows must not become full-width rainbow bands"
+		);
 	}
 
 	#[test]

@@ -946,7 +946,6 @@ fn render_preview_image(
 			}
 		}
 	} else {
-		let total_columns = content_width_px.get() as usize;
 		let dense_x_pad = 0u32;
 		for y in 0..used_height_px.get() {
 			let row_start = ((y as usize) * total_rows) / used_height_px.get().max(1) as usize;
@@ -966,7 +965,8 @@ fn render_preview_image(
 					row_slice,
 					x as usize,
 					(x as usize).saturating_add(1),
-					total_columns,
+					content_width_px.get() as usize,
+					snapshot.max_columns,
 				) else {
 					continue;
 				};
