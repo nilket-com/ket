@@ -2,7 +2,7 @@ use super::protocol::SearchMatch;
 use crate::core::{BufferId, DocByte, DocLine, DocLineCount, StateId, TAB_SIZE, TokenBin};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::language::LanguageProvider;
-use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -447,7 +447,7 @@ fn build_preview_snapshot(
 		Some(p) => p.lexical_baseline(bytes, &[(0, DocByte::ZERO)]),
 		None => Vec::new(),
 	};
-	let merged_highlights = merge_highlights(&lexical_highlights, semantic_highlights);
+	let merged_highlights = HighlightSpanIndex::merged(&lexical_highlights, semantic_highlights);
 	let mut rows = Vec::with_capacity(
 		usize::try_from(overlay.doc_line_count.get())
 			.expect("preview line count is size-gated and fits usize"),
@@ -484,7 +484,7 @@ fn build_preview_snapshot(
 fn build_preview_row(
 	line_bytes: &[u8],
 	line_start_byte: usize,
-	highlights: &[HighlightSpan],
+	highlights: &HighlightSpanIndex,
 ) -> PreviewRow {
 	let trimmed_len = trim_preview_line_len(line_bytes);
 	let logical_width = preview_logical_width(&line_bytes[..trimmed_len]);
@@ -514,10 +514,8 @@ fn build_preview_row(
 			_ => {
 				let start_col = col;
 				col = col.saturating_add(1);
-				let category = token_bin(category_for_byte(
-					highlights,
-					DocByte::new((line_start_byte + idx) as u64),
-				));
+				let category =
+					token_bin(highlights.category_at(DocByte::new((line_start_byte + idx) as u64)));
 				paint_preview_bins(&mut bins, logical_width, start_col, col, category);
 				idx += preview_char_len(&line_bytes[idx..trimmed_len]);
 			}
@@ -571,17 +569,6 @@ fn preview_char_len(bytes: &[u8]) -> usize {
 	1
 }
 
-fn category_for_byte(highlights: &[HighlightSpan], byte_offset: DocByte) -> TokenCategory {
-	let idx = highlights.partition_point(|span| span.start <= byte_offset);
-	if idx > 0 {
-		let span = &highlights[idx - 1];
-		if byte_offset < span.end {
-			return span.category;
-		}
-	}
-	TokenCategory::Unclassified
-}
-
 fn paint_preview_bins(
 	bins: &mut [TokenBin],
 	logical_width: u16,
@@ -604,29 +591,6 @@ fn paint_preview_bins(
 			*existing = category;
 		}
 	}
-}
-
-fn merge_highlights(lexical: &[HighlightSpan], semantic: &[HighlightSpan]) -> Vec<HighlightSpan> {
-	if semantic.is_empty() {
-		return lexical.to_vec();
-	}
-
-	let mut merged = Vec::with_capacity(lexical.len() + semantic.len());
-	for &lex_span in lexical {
-		let search = semantic.partition_point(|span| span.end <= lex_span.start);
-		let mut overwritten = false;
-		if let Some(sem_span) = semantic[search..].first()
-			&& sem_span.start < lex_span.end
-		{
-			overwritten = true;
-		}
-		if !overwritten {
-			merged.push(lex_span);
-		}
-	}
-	merged.extend_from_slice(semantic);
-	merged.sort_unstable_by_key(|span| span.start);
-	merged
 }
 
 #[cfg(test)]

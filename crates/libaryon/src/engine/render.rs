@@ -27,7 +27,7 @@ use crate::core::{
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::SplitDirection;
 use crate::svp::SvpResolver;
-use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
 use crate::uast::projection::{
 	GutterLineNumber, HostPanelViewport, PaneDividerViewport, ProjectedCaret,
@@ -1505,26 +1505,7 @@ pub(crate) fn merge_highlights(
 	lexical: &[HighlightSpan],
 	semantic: &[HighlightSpan],
 ) -> Vec<HighlightSpan> {
-	let mut merged = Vec::with_capacity(lexical.len() + semantic.len());
-
-	for &lex_span in lexical {
-		// Semantic providers may layer a parent-language span with injected
-		// language spans. Do not use `partition_point` here: nested spans are not
-		// ordered by end, so its monotonic predicate requirement does not hold.
-		let overwritten = semantic
-			.iter()
-			.any(|span| span.start < lex_span.end && span.end > lex_span.start);
-		if !overwritten {
-			merged.push(lex_span);
-		}
-	}
-
-	merged.extend_from_slice(semantic);
-	// Rendering searches this list from the end. A stable sort preserves the
-	// provider's layer order for equal starts, so injected spans appended after
-	// their parent language deterministically win.
-	merged.sort_by_key(|span| span.start);
-	merged
+	HighlightSpanIndex::merged(lexical, semantic).into_spans()
 }
 
 #[cfg(test)]
@@ -1619,5 +1600,23 @@ mod tests {
 				.map(|span| span.category);
 			assert_eq!(category, Some(TokenCategory::Keyword));
 		}
+	}
+
+	#[test]
+	fn nested_semantic_parent_overwrites_lexical_after_inner_span_ends() {
+		let span = |start, end, category| {
+			HighlightSpan::new(DocByte::new(start), DocByte::new(end), category)
+		};
+		let lexical = [
+			span(15, 18, TokenCategory::Variable),
+			span(50, 60, TokenCategory::Variable),
+		];
+		let semantic = [
+			span(0, 100, TokenCategory::String),
+			span(10, 20, TokenCategory::Keyword),
+		];
+
+		let merged = merge_highlights(&lexical, &semantic);
+		assert_eq!(merged, semantic);
 	}
 }
