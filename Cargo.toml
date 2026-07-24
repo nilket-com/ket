@@ -55,5 +55,13 @@ panic = "abort"
 strip = true
 debug = 0
 
+# Workspace debuginfo stays out of the linked binary; dependencies keep their
+# optimization but drop debuginfo entirely. Optimized deps with full debuginfo
+# produced a 3.7 GB polariton binary whose per-run link and page-in stalled the
+# whole desktop.
+[profile.dev]
+split-debuginfo = "unpacked"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
