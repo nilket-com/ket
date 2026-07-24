@@ -762,6 +762,10 @@ fn render_pane_viewport(
 		} else {
 			tab.gutter_numbering()
 		};
+		// A file tree is navigation chrome, not an editable source document.
+		// Keep its full width available for paths regardless of the session's
+		// normal editor minimap setting.
+		let minimap_enabled = tab.view.minimap_enabled && !is_file_browser;
 		let visible_whitespace = tab.view.visible_whitespace && !is_file_browser;
 
 		let (
@@ -811,7 +815,7 @@ fn render_pane_viewport(
 				tab.view.viewport_lines,
 				max_doc_line,
 				tab.view.viewport_width,
-				tab.view.minimap_enabled,
+				minimap_enabled,
 				gutter_numbering,
 			);
 			let viewport_anchor = if tab.view.wrap_enabled {
@@ -838,7 +842,7 @@ fn render_pane_viewport(
 						tab.view.viewport_lines,
 						max_doc_line,
 						tab.view.viewport_width,
-						tab.view.minimap_enabled,
+						minimap_enabled,
 						gutter_numbering,
 					);
 					if adjusted_geometry.gutter_width == geometry.gutter_width {
@@ -865,7 +869,7 @@ fn render_pane_viewport(
 					tab.view.viewport_lines,
 					max_doc_line,
 					tab.view.viewport_width,
-					tab.view.minimap_enabled,
+					minimap_enabled,
 					gutter_numbering,
 				);
 				anchor
@@ -1103,7 +1107,7 @@ fn render_pane_viewport(
 			.map(|row| row.line)
 			.unwrap_or(viewport_start_line)
 			.boundary_after();
-		let minimap = if tab.view.minimap_enabled {
+		let minimap = if minimap_enabled {
 			if let Some(rid) = tab.document.root_id {
 				let overlay = MinimapOverlay::new(
 					viewport_start_line,

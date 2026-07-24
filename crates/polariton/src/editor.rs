@@ -34,6 +34,7 @@ use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::time::Duration;
 
 /// The single query-results surface. One stable identity reused for every run,
 /// so results replace in place instead of opening a pane per query.
@@ -47,6 +48,7 @@ const INITIAL_ROWS: u16 = 40;
 /// leaking pane chrome back into Polariton's old outer grid.
 const PANE_HEADER_HEIGHT: f32 = 22.0;
 const PANE_DRAG_DEADBAND: f32 = 8.0;
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// A plot needs more room than a tabular result, but remains a document block
 /// rather than a workspace pane. Width stays responsive to the preview.
 const NOTEBOOK_PLOT_HEIGHT: f32 = 360.0;
@@ -226,6 +228,9 @@ pub struct CodeEditor {
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
 	last_pointer: Option<iced::Point>,
+	/// Last file-tree row pressed, used to reproduce Baryon's deliberate
+	/// same-pane, same-row double-click contract.
+	last_browser_click: Option<(libaryon::core::PaneId, DocLine, time::Instant)>,
 	/// Latest raw window-space cursor, from the root subscription.
 	last_raw_window: Option<iced::Point>,
 	/// window_coord - editor_local_coord, learned whenever both the mouse_area
@@ -394,6 +399,7 @@ impl CodeEditor {
 			cursor_blink: CursorBlink::new(),
 			content_dirty: false,
 			last_pointer: None,
+			last_browser_click: None,
 			last_raw_window: None,
 			pointer_offset: None,
 			status_message: None,
@@ -1341,8 +1347,27 @@ impl CodeEditor {
 		let Some(visible_row) = pane.visible_rows.get(row) else {
 			return;
 		};
+		if pane.is_file_browser {
+			let now = time::Instant::now();
+			let double_click = self.last_browser_click.is_some_and(
+				|(previous_pane, previous_line, previous_at)| {
+					previous_pane == pane.pane_id
+						&& previous_line == visible_row.line
+						&& now.saturating_duration_since(previous_at) <= DOUBLE_CLICK_INTERVAL
+				},
+			);
+			if !double_click {
+				self.last_browser_click = Some((pane.pane_id, visible_row.line, now));
+			}
+			self.send(EditorCommand::ClickBrowserEntry {
+				line: visible_row.line,
+				double_click,
+			});
+			self.request_content();
+			return;
+		}
 		let column =
-			((local_x - metrics::GUTTER_WIDTH).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
+			((local_x - pane_gutter_width(pane)).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
 		let target = CursorPosition::new(
 			visible_row.line,
 			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
@@ -1680,6 +1705,14 @@ fn gutter_number(pane: &libaryon::uast::projection::PaneViewport, line: u64) -> 
 		.find(|entry| entry.line.get() == line)
 		.map(|entry| entry.number.to_string())
 		.unwrap_or_else(|| (line + 1).to_string())
+}
+
+fn pane_gutter_width(pane: &libaryon::uast::projection::PaneViewport) -> f32 {
+	if pane.gutter_numbering.is_some() {
+		metrics::GUTTER_WIDTH
+	} else {
+		0.0
+	}
 }
 
 fn color(color: Rgb) -> Color {
@@ -2175,6 +2208,7 @@ fn text_pane_surface<'a>(
 	let gutter_background = color(palette.gutter_surface);
 	let gutter_text = color(palette.gutter_text);
 	let cursor_lines = &pane.cursor_lines;
+	let show_gutter = pane.gutter_numbering.is_some();
 	let rows = column(lines.into_iter().map(|line| {
 		let number = if line.show_gutter {
 			gutter_number(pane, line.doc_line)
@@ -2208,36 +2242,42 @@ fn text_pane_surface<'a>(
 				}
 			})
 			.collect::<Vec<_>>();
-		row![
-			container(
-				text(number)
-					.font(EDITOR_FONT)
-					.size(metrics::TEXT_SIZE)
-					.color(number_color)
-			)
-			.width(Length::Fixed(metrics::GUTTER_WIDTH))
-			// `container` makes its child fluid by default. Pinning this
-			// prevents the enclosing column from distributing the pane's
-			// spare height across every projected editor row.
+		let editor_text = rich_text(fragments)
+			.font(EDITOR_FONT)
+			.size(metrics::TEXT_SIZE)
 			.height(Length::Fixed(metrics::LINE_HEIGHT))
-			.padding([0, 8])
-			.style(move |_| container::Style {
-				background: Some(Background::Color(gutter_background)),
-				..Default::default()
-			}),
-			rich_text(fragments)
-				.font(EDITOR_FONT)
-				.size(metrics::TEXT_SIZE)
+			// `Pixels`, not a bare f32: `From<f32> for LineHeight` is
+			// Relative (a multiplier of the font size), which made every
+			// line 22× tall and clipped all glyphs out of the fixed row.
+			.line_height(iced::Pixels(metrics::LINE_HEIGHT));
+		if show_gutter {
+			row![
+				container(
+					text(number)
+						.font(EDITOR_FONT)
+						.size(metrics::TEXT_SIZE)
+						.color(number_color)
+				)
+				.width(Length::Fixed(metrics::GUTTER_WIDTH))
+				// `container` makes its child fluid by default. Pinning this
+				// prevents the enclosing column from distributing the pane's
+				// spare height across every projected editor row.
 				.height(Length::Fixed(metrics::LINE_HEIGHT))
-				// `Pixels`, not a bare f32: `From<f32> for LineHeight` is
-				// Relative (a multiplier of the font size), which made
-				// every line 22× tall and clipped all glyphs out of the
-				// fixed-height row.
-				.line_height(iced::Pixels(metrics::LINE_HEIGHT)),
-		]
-		.spacing(0)
-		.height(Length::Fixed(metrics::LINE_HEIGHT))
-		.into()
+				.padding([0, 8])
+				.style(move |_| container::Style {
+					background: Some(Background::Color(gutter_background)),
+					..Default::default()
+				}),
+				editor_text,
+			]
+			.spacing(0)
+			.height(Length::Fixed(metrics::LINE_HEIGHT))
+			.into()
+		} else {
+			row![editor_text]
+				.height(Length::Fixed(metrics::LINE_HEIGHT))
+				.into()
+		}
 	}))
 	.width(Length::Fill)
 	.height(Length::Shrink);
@@ -3202,7 +3242,7 @@ mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
 		Modifiers, PANE_HEADER_HEIGHT, SplitDirection, is_markdown_thematic_break,
-		markdown_code_fragments, metrics, pane_title,
+		markdown_code_fragments, metrics, pane_gutter_width, pane_title,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -3223,6 +3263,37 @@ mod tests {
 				modifiers: Modifiers::NONE,
 			}));
 		}
+	}
+
+	fn file_browser_fixture(label: &str) -> std::path::PathBuf {
+		let nonce = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("time should move forward")
+			.as_nanos();
+		std::env::temp_dir().join(format!(
+			"polariton-file-browser-{label}-{}-{nonce}",
+			std::process::id()
+		))
+	}
+
+	fn wait_for_file_browser(editor: &mut CodeEditor) {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| !viewport.panes.iter().any(|pane| pane.is_file_browser))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			editor
+				.viewport
+				.as_ref()
+				.is_some_and(|viewport| viewport.panes.iter().any(|pane| pane.is_file_browser)),
+			"file browser should be projected"
+		);
 	}
 
 	#[test]
@@ -4970,6 +5041,105 @@ mod tests {
 		// A mid-line row is never the physical line start, so no gutter number.
 		assert!(!wrapped[0].show_gutter);
 		assert!(!wrapped[1].show_gutter);
+	}
+
+	#[test]
+	fn file_browser_omits_editor_gutter_and_minimap() {
+		let root = file_browser_fixture("chrome");
+		std::fs::create_dir_all(&root).expect("create browser fixture");
+		std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("write browser fixture");
+
+		{
+			let mut editor = CodeEditor::new("select 1;");
+			wait_for_content(&mut editor, "select 1;");
+			editor.send(EditorCommand::OpenFileBrowserAt(
+				root.to_string_lossy().into_owned(),
+			));
+			wait_for_file_browser(&mut editor);
+
+			let browser = editor
+				.viewport
+				.as_ref()
+				.expect("browser viewport")
+				.panes
+				.iter()
+				.find(|pane| pane.is_file_browser)
+				.expect("browser pane");
+			assert!(browser.gutter_numbering.is_none());
+			assert!(browser.gutter_line_numbers.is_empty());
+			assert_eq!(pane_gutter_width(browser), 0.0);
+			assert!(
+				browser.minimap.is_none(),
+				"file tree keeps its width for paths even when editor minimaps are enabled"
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn double_clicking_file_browser_row_opens_the_file() {
+		let root = file_browser_fixture("double-click");
+		std::fs::create_dir_all(&root).expect("create browser fixture");
+		let file = root.join("main.rs");
+		std::fs::write(&file, "fn main() {}\n").expect("write browser fixture");
+		let expected = file.to_string_lossy().into_owned();
+
+		{
+			let mut editor = CodeEditor::new("select 1;");
+			wait_for_content(&mut editor, "select 1;");
+			editor.send(EditorCommand::OpenFileBrowserAt(
+				root.to_string_lossy().into_owned(),
+			));
+			wait_for_file_browser(&mut editor);
+
+			let (browser_pane, point) = {
+				let browser = editor
+					.viewport
+					.as_ref()
+					.expect("browser viewport")
+					.panes
+					.iter()
+					.find(|pane| pane.is_file_browser)
+					.expect("browser pane");
+				(
+					browser.pane_id,
+					iced::Point::new(
+						browser.rect.screen_col.get() as f32 * metrics::CELL_WIDTH
+							+ metrics::CELL_WIDTH / 2.0,
+						browser.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT
+							+ PANE_HEADER_HEIGHT + metrics::LINE_HEIGHT / 2.0,
+					),
+				)
+			};
+			let _ = editor.update(EditorMsg::PointerMoved(point));
+			let _ = editor.update(EditorMsg::Click);
+			let _ = editor.update(EditorMsg::Click);
+
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor.viewport.as_ref().is_none_or(|viewport| {
+				let focused = viewport.focused_pane();
+				focused.is_none_or(|pane| {
+					pane.is_file_browser || pane.file_name.as_deref() != Some(expected.as_str())
+				})
+			}) && Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			let viewport = editor.viewport.as_ref().expect("opened file viewport");
+			let focused = viewport.focused_pane().expect("focused editor pane");
+			assert!(!focused.is_file_browser);
+			assert_eq!(focused.file_name.as_deref(), Some(expected.as_str()));
+			assert!(
+				viewport
+					.pane(browser_pane)
+					.is_some_and(|pane| pane.is_file_browser),
+				"opening a tree entry keeps the browser sidebar alive"
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(root);
 	}
 
 	#[test]
