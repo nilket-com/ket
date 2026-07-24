@@ -20,7 +20,10 @@ impl DatabaseAdapter for ParquetAdapter {
 		let mut ctx = self.context.clone();
 		let result = tokio::task::spawn_blocking(move || match ctx.execute(&code) {
 			Ok(lazy_df) => match lazy_df.collect() {
-				Ok(df) => ExecutionResult::Rows(df),
+				Ok(frame) => ExecutionResult::Rows {
+					frame,
+					statements: 1,
+				},
 				Err(err) => ExecutionResult::Err(format!("Error: {err}")),
 			},
 			Err(err) => ExecutionResult::Err(format!("Error: {err}")),

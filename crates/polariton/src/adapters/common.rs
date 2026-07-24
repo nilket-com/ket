@@ -44,7 +44,10 @@ pub enum ExecutionResult {
 	},
 	CommandCompleted(String),
 	Err(String),
-	Rows(DataFrame),
+	Rows {
+		frame: DataFrame,
+		statements: usize,
+	},
 }
 
 #[async_trait]

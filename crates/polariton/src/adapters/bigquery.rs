@@ -1,4 +1,5 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
+use crate::adapters::sql_compound::{CompoundTail, plan};
 use async_trait::async_trait;
 use gcloud_auth::project::Config as AuthConfig;
 use gcloud_auth::token::DefaultTokenSourceProvider;
@@ -16,7 +17,7 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::{
 use polars::frame::DataFrame;
 use polars::io::SerReader;
 use polars::io::ipc::IpcStreamReader;
-use sqlparser::{ast::Statement, dialect::BigQueryDialect, parser::Parser};
+use sqlparser::dialect::BigQueryDialect;
 use std::io::Cursor;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
@@ -44,19 +45,53 @@ const STORAGE_SCOPES: &[&str] = &[
 #[async_trait]
 impl DatabaseAdapter for BigQueryAdapter {
 	async fn dispatch(&mut self, code: &str) -> ExecutionResult {
-		let ast = match Parser::parse_sql(&DIALECT, code) {
-			Ok(nodes) => nodes,
+		let planned = match plan(&DIALECT, code) {
+			Ok(planned) => planned,
 			Err(err) => return ExecutionResult::Err(format!("BigQuery parse error: {}", err)),
 		};
-		match ast.as_slice() {
-			[Statement::Query(_)] => bq_query_to_df(&self.client, &self.project_id, code)
+		match planned.tail {
+			CompoundTail::Empty => ExecutionResult::None,
+			CompoundTail::Command(code) => bq_execute(&self.client, &self.project_id, code)
 				.await
-				.map(ExecutionResult::Rows)
-				.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
-			[] => ExecutionResult::None,
-			_ => ExecutionResult::None,
+				.map(|()| {
+					if planned.statements > 1 {
+						ExecutionResult::Batch {
+							statements: planned.statements,
+						}
+					} else {
+						ExecutionResult::CommandCompleted("Command completed.".to_owned())
+					}
+				})
+				.unwrap_or_else(|error| ExecutionResult::Err(error.to_string())),
+			CompoundTail::Query { prefix, query } => {
+				if planned.statements > 1
+					&& let Err(error) = bq_execute(&self.client, &self.project_id, prefix).await
+				{
+					return ExecutionResult::Err(error.to_string());
+				}
+				bq_query_to_df(&self.client, &self.project_id, query)
+					.await
+					.map(|frame| ExecutionResult::Rows {
+						frame,
+						statements: planned.statements,
+					})
+					.unwrap_or_else(|error| ExecutionResult::Err(error.to_string()))
+			}
 		}
 	}
+}
+
+async fn bq_execute(client: &Client, project_id: &str, sql: &str) -> Result<(), BoxError> {
+	let request = QueryRequest {
+		query: sql.to_owned(),
+		use_legacy_sql: false,
+		..Default::default()
+	};
+	let response = client.job().query(project_id, &request).await?;
+	if !response.job_complete {
+		poll_until_complete(client, &response.job_reference).await?;
+	}
+	Ok(())
 }
 
 async fn bq_query_to_df(

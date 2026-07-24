@@ -835,7 +835,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_time_elapsed = Some(time_elapsed);
 			if let Some(claim) = publish.as_ref() {
 				match &er {
-					ExecutionResult::Rows(frame) => {
+					ExecutionResult::Rows { frame, .. } => {
 						let _ = app_state
 							.result_registry
 							.publish(claim, std::sync::Arc::new(frame.clone()));
@@ -870,14 +870,24 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				ExecutionResult::Err(msg) => {
 					set_sql_error(app_state, msg, None);
 				}
-				ExecutionResult::Rows(df) => {
+				ExecutionResult::Rows {
+					frame: df,
+					statements,
+				} => {
 					let rows = df.height();
 					let cols = df.width();
 					app_state.code_editor.begin_query();
 					app_state.code_editor.set_query_result(df.clone());
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
-					set_sql_status(app_state, "SQL · query completed");
+					set_sql_status(
+						app_state,
+						if statements > 1 {
+							format!("SQL · {statements} statements completed")
+						} else {
+							"SQL · query completed".to_owned()
+						},
+					);
 				}
 				ExecutionResult::None => {
 					set_sql_status(app_state, "SQL · no statements executed");
@@ -952,7 +962,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
 			match result {
-				ExecutionResult::Rows(df) => {
+				ExecutionResult::Rows {
+					frame: df,
+					statements,
+				} => {
 					let rows = df.height();
 					let cols = df.width();
 					// Presentation never decides data availability: a named SQL cell
@@ -972,7 +985,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					}
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
-					set_sql_status(app_state, "SQL · cell query completed");
+					set_sql_status(
+						app_state,
+						if statements > 1 {
+							format!("SQL · {statements} statements completed")
+						} else {
+							"SQL · cell query completed".to_owned()
+						},
+					);
 				}
 				ExecutionResult::Err(message) => {
 					set_sql_error(app_state, message, Some(source_start_line));
@@ -1361,12 +1381,15 @@ mod tests {
 		let _ = update(
 			&mut state,
 			Message::RunResult {
-				result: ExecutionResult::Rows(frame),
+				result: ExecutionResult::Rows {
+					frame,
+					statements: 3,
+				},
 				publish: None,
 			},
 		);
 
-		assert_eq!(state.status_msg, "SQL · query completed");
+		assert_eq!(state.status_msg, "SQL · 3 statements completed");
 		assert!(
 			state.code_editor.has_query_surface(),
 			"a DataFrame is an artifact and must own a result surface"

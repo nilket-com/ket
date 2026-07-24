@@ -1,4 +1,5 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
+use crate::adapters::sql_compound::{CompoundTail, plan};
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use polars::{
@@ -6,7 +7,7 @@ use polars::{
 	frame::{DataFrame, column::Column},
 	series::Series,
 };
-use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::dialect::PostgreSqlDialect;
 use std::pin::pin;
 use tokio_postgres::{Client, types::Type};
 use tokio_stream::StreamExt;
@@ -28,20 +29,42 @@ pub const DIALECT: PostgreSqlDialect = PostgreSqlDialect {};
 #[async_trait]
 impl DatabaseAdapter for PostgresAdapter {
 	async fn dispatch(&mut self, code: &str) -> ExecutionResult {
-		let code = code.to_string();
-		let ast = match Parser::parse_sql(&DIALECT, &code) {
-			Ok(nodes) => nodes,
+		let planned = match plan(&DIALECT, code) {
+			Ok(planned) => planned,
 			Err(err) => {
 				return ExecutionResult::Err(format!("Postgres parse error: {}", err));
 			}
 		};
-		match ast.as_slice() {
-			[Statement::Query(_)] => pg_to_df(&self.client, &code)
+		match planned.tail {
+			CompoundTail::Empty => ExecutionResult::None,
+			CompoundTail::Command(code) => self
+				.client
+				.batch_execute(code)
 				.await
-				.map(ExecutionResult::Rows)
-				.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
-			[] => ExecutionResult::None,
-			_ => ExecutionResult::None,
+				.map(|()| {
+					if planned.statements > 1 {
+						ExecutionResult::Batch {
+							statements: planned.statements,
+						}
+					} else {
+						ExecutionResult::CommandCompleted("Command completed.".to_owned())
+					}
+				})
+				.unwrap_or_else(|error| ExecutionResult::Err(error.to_string())),
+			CompoundTail::Query { prefix, query } => {
+				if planned.statements > 1
+					&& let Err(error) = self.client.batch_execute(prefix).await
+				{
+					return ExecutionResult::Err(error.to_string());
+				}
+				pg_to_df(&self.client, query)
+					.await
+					.map(|frame| ExecutionResult::Rows {
+						frame,
+						statements: planned.statements,
+					})
+					.unwrap_or_else(|error| ExecutionResult::Err(error.to_string()))
+			}
 		}
 	}
 }

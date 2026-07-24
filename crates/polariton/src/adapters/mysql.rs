@@ -1,4 +1,5 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
+use crate::adapters::sql_compound::{CompoundTail, plan};
 use async_trait::async_trait;
 use mysql_async::{Pool, Value as MySqlValue, prelude::Queryable};
 use polars::{
@@ -6,7 +7,7 @@ use polars::{
 	frame::{DataFrame, column::Column},
 	series::Series,
 };
-use sqlparser::{ast::Statement, dialect::MySqlDialect, parser::Parser};
+use sqlparser::dialect::MySqlDialect;
 use std::time::Duration;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
@@ -26,9 +27,8 @@ const DIALECT: MySqlDialect = MySqlDialect {};
 #[async_trait]
 impl DatabaseAdapter for MySQLAdapter {
 	async fn dispatch(&mut self, code: &str) -> ExecutionResult {
-		let code = code.to_string();
-		let ast = match Parser::parse_sql(&DIALECT, &code) {
-			Ok(nodes) => nodes,
+		let planned = match plan(&DIALECT, code) {
+			Ok(planned) => planned,
 			Err(err) => return ExecutionResult::Err(format!("MySQL parse error: {}", err)),
 		};
 		let mut conn = match tokio::time::timeout(Duration::from_secs(30), self.pool.get_conn())
@@ -38,22 +38,16 @@ impl DatabaseAdapter for MySQLAdapter {
 			Ok(Err(err)) => return ExecutionResult::Err(format!("MySQL connection error: {err}")),
 			Err(_) => return ExecutionResult::Err("MySQL connection timed out".to_string()),
 		};
-		match ast.as_slice() {
-			[_, _, ..] => {
-				let statements = ast.len();
-				conn.query_drop(&code)
-					.await
-					.map(|_| ExecutionResult::Batch { statements })
-					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))
-			}
-			[Statement::Query(_)] => mysql_to_df(conn, &code)
+		match planned.tail {
+			CompoundTail::Empty => ExecutionResult::None,
+			CompoundTail::Command(code) if planned.statements > 1 => conn
+				.query_drop(code)
 				.await
-				.map(ExecutionResult::Rows)
+				.map(|_| ExecutionResult::Batch {
+					statements: planned.statements,
+				})
 				.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
-			[Statement::Insert { .. }]
-			| [Statement::Update { .. }]
-			| [Statement::Delete { .. }]
-			| [_] => match conn.prep(&code).await {
+			CompoundTail::Command(code) => match conn.prep(code).await {
 				Err(err) => ExecutionResult::Err(err.to_string()),
 				Ok(stmt) => conn
 					.exec_drop(stmt, ())
@@ -61,7 +55,20 @@ impl DatabaseAdapter for MySQLAdapter {
 					.map(|_| ExecutionResult::Affected(conn.affected_rows()))
 					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
 			},
-			[] => ExecutionResult::None,
+			CompoundTail::Query { prefix, query } => {
+				if planned.statements > 1
+					&& let Err(error) = conn.query_drop(prefix).await
+				{
+					return ExecutionResult::Err(error.to_string());
+				}
+				mysql_to_df(conn, query)
+					.await
+					.map(|frame| ExecutionResult::Rows {
+						frame,
+						statements: planned.statements,
+					})
+					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))
+			}
 		}
 	}
 }
