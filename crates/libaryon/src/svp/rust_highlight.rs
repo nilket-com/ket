@@ -31,9 +31,22 @@ pub enum TokenCategory {
 	GitUnstaged,
 	GitUntracked,
 	GitRename,
+	/// Plain prose and any text a highlighter does not classify: the color a
+	/// pane paints when nothing more specific applies. A theme that sets it
+	/// moves body text off the UI's default foreground; one that leaves it
+	/// unset keeps that default.
+	BodyText,
 }
 
-pub const CATEGORY_COUNT: usize = TokenCategory::GitRename as usize + 1;
+pub const CATEGORY_COUNT: usize = TokenCategory::BodyText as usize + 1;
+
+/// The foreground for text no highlighter claimed.
+pub fn default_text_color(
+	theme_colors: &[Option<crate::core::Rgb>; CATEGORY_COUNT],
+	fallback: crate::core::Rgb,
+) -> crate::core::Rgb {
+	theme_colors[TokenCategory::BodyText as usize].unwrap_or(fallback)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HighlightSpan {

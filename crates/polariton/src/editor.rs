@@ -30,6 +30,7 @@ use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
 };
 use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_color};
+use libaryon::svp::rust_highlight::default_text_color;
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
@@ -2300,8 +2301,15 @@ fn text_pane_surface<'a>(
 	palette: UiPalette,
 	show_cursor: bool,
 ) -> Element<'a, EditorMsg> {
+	// Text no highlighter claimed is `BodyText`, the same value the Markdown
+	// preview paints prose with, so a themed body color reaches both panes.
 	let lines = wrap_projected_lines(
-		project_lines(pane, palette.editor_text, palette.accent, show_cursor),
+		project_lines(
+			pane,
+			default_text_color(&pane.theme_colors, palette.editor_text),
+			palette.accent,
+			show_cursor,
+		),
 		pane,
 	);
 	let gutter_background = color(palette.gutter_surface);

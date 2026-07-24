@@ -21,9 +21,9 @@ pub fn highlight_markdown(
 /// same question — what color is a heading? — and get one answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownConstruct {
-	/// Prose. Deliberately uncategorized: the source pane draws body text in
-	/// the editor's default foreground, so a preview that colors it would be
-	/// showing the reader something the document does not say.
+	/// Prose. Colored by `BodyText`, which is also what a pane paints text no
+	/// highlighter claimed — so themed prose reaches the document and its
+	/// preview through the same value.
 	Body,
 	Heading,
 	InlineCode,
@@ -46,7 +46,7 @@ pub enum MarkdownConstruct {
 /// means the surface's default foreground.
 pub const fn markdown_category(construct: MarkdownConstruct) -> Option<TokenCategory> {
 	match construct {
-		MarkdownConstruct::Body => None,
+		MarkdownConstruct::Body => Some(TokenCategory::BodyText),
 		MarkdownConstruct::Heading => Some(TokenCategory::Type),
 		MarkdownConstruct::InlineCode | MarkdownConstruct::CodeText => Some(TokenCategory::String),
 		MarkdownConstruct::Emphasis | MarkdownConstruct::BulletMarker => {
@@ -201,16 +201,50 @@ mod tests {
 		}
 	}
 
-	/// Prose is the one construct with no category, on either side.
-
+	/// Prose reaches a pane as its default foreground rather than as a span, so
+	/// the construct and that default must resolve to the same color — else a
+	/// themed body color would appear in the preview but not in the document.
 	#[test]
-	fn body_text_stays_uncolored() {
-		assert_eq!(markdown_category(MarkdownConstruct::Body), None);
+	fn prose_and_unclaimed_text_resolve_to_one_color() {
+		use crate::svp::rust_highlight::default_text_color;
+
+		let fallback = Rgb::new(1, 2, 3);
+		let prose = Rgb::new(9, 9, 9);
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::BodyText as usize] = Some(prose);
+
+		assert_eq!(
+			markdown_construct_color(MarkdownConstruct::Body, &theme_colors, fallback),
+			default_text_color(&theme_colors, fallback),
+		);
+		assert_eq!(
+			markdown_construct_color(MarkdownConstruct::Body, &theme_colors, fallback),
+			prose,
+		);
+
+		let unset = [None; CATEGORY_COUNT];
+		assert_eq!(
+			markdown_construct_color(MarkdownConstruct::Body, &unset, fallback),
+			default_text_color(&unset, fallback),
+			"a theme that sets no body color leaves both at the pane default"
+		);
+
+		// The tokenizer emits nothing for prose: the color arrives as the
+		// pane's default foreground, never as a highlight span.
+		assert!(spans(b"just prose\n").is_empty());
+	}
+
+	/// The text inside `*emphasis*` is prose too — only the markers are spans —
+	/// so it takes the body color on both sides.
+	#[test]
+	fn emphasized_text_is_colored_as_prose() {
+		let emphasized = spans(b"a *emph* b\n");
+
 		assert!(
-			spans(b"just prose\n")
+			!emphasized
 				.iter()
-				.all(|span| span.category != TokenCategory::Unclassified),
-			"prose produces no span at all, rather than an unclassified one"
+				.any(|span| span.start <= DocByte::new(4) && span.end > DocByte::new(4)),
+			"the text between the markers carries no span of its own"
 		);
 	}
 

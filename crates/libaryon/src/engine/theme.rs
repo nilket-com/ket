@@ -164,6 +164,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, yellow);
 		set_color(map, TokenCategory::Number, purple);
 		set_color(map, TokenCategory::Punctuation, fg);
+		set_color(map, TokenCategory::BodyText, fg);
 		set_color(map, TokenCategory::Variable, fg);
 		set_color(map, TokenCategory::Constant, purple);
 		set_color(map, TokenCategory::Macro, aqua);
@@ -199,6 +200,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, aurora_yellow);
 		set_color(map, TokenCategory::Number, aurora_purple);
 		set_color(map, TokenCategory::Punctuation, snow_storm_1);
+		set_color(map, TokenCategory::BodyText, snow_storm_1);
 		set_color(map, TokenCategory::Variable, snow_storm_1);
 		set_color(map, TokenCategory::Constant, aurora_purple);
 		set_color(map, TokenCategory::Macro, frost_4);
@@ -233,6 +235,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, blue);
 		set_color(map, TokenCategory::Number, magenta);
 		set_color(map, TokenCategory::Punctuation, base0);
+		set_color(map, TokenCategory::BodyText, base0);
 		set_color(map, TokenCategory::Variable, base0);
 		set_color(map, TokenCategory::Constant, magenta);
 		set_color(map, TokenCategory::Macro, blue);
@@ -265,6 +268,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, function);
 		set_color(map, TokenCategory::Number, number);
 		set_color(map, TokenCategory::Punctuation, fg);
+		set_color(map, TokenCategory::BodyText, fg);
 		set_color(map, TokenCategory::Variable, type_col);
 		set_color(map, TokenCategory::Constant, constant);
 		set_color(map, TokenCategory::Macro, function);
@@ -297,6 +301,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, function);
 		set_color(map, TokenCategory::Number, number);
 		set_color(map, TokenCategory::Punctuation, fg);
+		set_color(map, TokenCategory::BodyText, fg);
 		set_color(map, TokenCategory::Variable, type_col);
 		set_color(map, TokenCategory::Constant, constant);
 		set_color(map, TokenCategory::Macro, function);
@@ -341,6 +346,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c04);
 		set_color(map, TokenCategory::Number, c05);
 		set_color(map, TokenCategory::Punctuation, c16);
+		set_color(map, TokenCategory::BodyText, c16);
 		set_color(map, TokenCategory::Variable, c06);
 		set_color(map, TokenCategory::Constant, c07);
 		set_color(map, TokenCategory::Macro, c08);
@@ -385,6 +391,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c06);
 		set_color(map, TokenCategory::Number, c09);
 		set_color(map, TokenCategory::Punctuation, c12);
+		set_color(map, TokenCategory::BodyText, c12);
 		set_color(map, TokenCategory::Variable, c07);
 		set_color(map, TokenCategory::Constant, c13);
 		set_color(map, TokenCategory::Macro, c14);
@@ -429,6 +436,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c10);
 		set_color(map, TokenCategory::Number, c05);
 		set_color(map, TokenCategory::Punctuation, c16);
+		set_color(map, TokenCategory::BodyText, c16);
 		set_color(map, TokenCategory::Variable, c11);
 		set_color(map, TokenCategory::Constant, c17);
 		set_color(map, TokenCategory::Macro, c06);
@@ -473,6 +481,7 @@ impl Theme {
 		set_color(map, TokenCategory::Attribute, brown);
 		set_color(map, TokenCategory::Comment, gray);
 		set_color(map, TokenCategory::Punctuation, gray);
+		set_color(map, TokenCategory::BodyText, gray);
 		set_color(map, TokenCategory::Whitespace, Rgb::new(60, 60, 60));
 	}
 
@@ -495,6 +504,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, green);
 		set_color(map, TokenCategory::Number, purple);
 		set_color(map, TokenCategory::Punctuation, fg);
+		set_color(map, TokenCategory::BodyText, fg);
 		set_color(map, TokenCategory::Variable, fg);
 		set_color(map, TokenCategory::Constant, purple);
 		set_color(map, TokenCategory::Macro, cyan);
@@ -528,6 +538,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, blue);
 		set_color(map, TokenCategory::Number, orange);
 		set_color(map, TokenCategory::Punctuation, white);
+		set_color(map, TokenCategory::BodyText, white);
 		set_color(map, TokenCategory::Variable, red);
 		set_color(map, TokenCategory::Constant, orange);
 		set_color(map, TokenCategory::Macro, cyan);
@@ -561,6 +572,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, blue);
 		set_color(map, TokenCategory::Number, orange);
 		set_color(map, TokenCategory::Punctuation, fg);
+		set_color(map, TokenCategory::BodyText, fg);
 		set_color(map, TokenCategory::Variable, fg);
 		set_color(map, TokenCategory::Constant, orange);
 		set_color(map, TokenCategory::Macro, blue);
@@ -595,6 +607,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, crystal_blue);
 		set_color(map, TokenCategory::Number, sakura_pink);
 		set_color(map, TokenCategory::Punctuation, sumi_ink);
+		set_color(map, TokenCategory::BodyText, sumi_ink);
 		set_color(map, TokenCategory::Variable, fuji_white);
 		set_color(map, TokenCategory::Constant, surimi_orange);
 		set_color(map, TokenCategory::Macro, oni_violet);
@@ -639,6 +652,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -683,6 +697,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -727,6 +742,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -771,6 +787,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -815,6 +832,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -859,6 +877,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -903,6 +922,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);
@@ -947,6 +967,7 @@ impl Theme {
 		set_color(map, TokenCategory::Function, c05);
 		set_color(map, TokenCategory::Number, c06);
 		set_color(map, TokenCategory::Punctuation, c07);
+		set_color(map, TokenCategory::BodyText, c07);
 		set_color(map, TokenCategory::Variable, c08);
 		set_color(map, TokenCategory::Constant, c09);
 		set_color(map, TokenCategory::Macro, c10);

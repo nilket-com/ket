@@ -9,7 +9,7 @@ use libaryon::engine::{
 };
 use libaryon::svp::diagnostic::DiagnosticSeverity;
 use libaryon::svp::projector::{DiagnosticProjector, HighlightProjector};
-use libaryon::uast::kind::SemanticKind;
+use libaryon::svp::rust_highlight::default_text_color;
 use libaryon::uast::projection::{DocTabSummary, PaneViewport, ProjectedCaret};
 use ratatui::{
 	backend::Backend,
@@ -731,10 +731,12 @@ fn draw_pane(
 			}
 		}
 
-		let base_style = match token.kind {
-			SemanticKind::Token => Style::default().fg(ratatui_color(palette.editor_text)),
-			_ => Style::default().fg(ratatui_color(palette.editor_text)),
-		};
+		// Text no highlighter claimed is `BodyText`, the same value the Markdown
+		// preview paints prose with, so a themed body color reaches both panes.
+		let base_style = Style::default().fg(ratatui_color(default_text_color(
+			&pane.theme_colors,
+			palette.editor_text,
+		)));
 		let virtual_style = base_style;
 		let has_physical_bytes = !token.text.is_empty() && !token.is_folded;
 		if !token.is_folded && !has_physical_bytes {
