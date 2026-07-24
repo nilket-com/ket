@@ -1,6 +1,7 @@
 use super::residency_profile::{
 	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
 };
+use super::stage_attribution;
 use super::*;
 use crate::exec::runtime_filter::{
 	build_runtime_filter_fragment_for_ordinal, descriptor_from_fragment, runtime_filter_key_type,
@@ -481,13 +482,24 @@ impl ChainStageProfiler {
 					message: "chain stage profile duration sum overflow".to_string(),
 				})
 		})?;
-		let unattributed_residual_micros = total_drive_micros
-			.checked_sub(stage_micros)
-			.ok_or_else(|| ExecutionError::Kernel {
-				message: format!(
-					"chain stage profile timers exceed total: stages={stage_micros} total={total_drive_micros}"
-				),
-			})?;
+		// ADR 507: the in-drive residual comes from the attribution contract, not a hand-rolled
+		// subtraction, so this profile's time reconciliation means exactly what every other profile's
+		// does and an inverted band is a typed error rather than a silent underflow.
+		let unattributed_residual_micros =
+			stage_attribution::reconcile_stage_within_drive(stage_micros, total_drive_micros)
+				.map_err(|error| ExecutionError::Kernel {
+					message: format!("chain stage profile time reconciliation failed: {error}"),
+				})?;
+		// The replay-1 residency high-waters are a peak domain: the footprint is their max, never
+		// their sum. Reconciling through the contract emits that as a checked object beside the raw
+		// maxima, so a reader cannot add two peaks into a footprint that never existed at once.
+		let residency_peak = stage_attribution::reconcile_peak_domain(
+			"replay1_residency_peak",
+			&[
+				("index", self.deferred_max_index_bytes),
+				("pinned_build", self.deferred_max_pinned_build_bytes),
+			],
+		);
 		let stages = ChainStage::ALL
 			.iter()
 			.map(|stage| {
@@ -525,6 +537,7 @@ impl ChainStageProfiler {
 				"probe_spill_bytes": self.deferred_probe_spill_bytes,
 				"max_index_bytes": self.deferred_max_index_bytes,
 				"max_pinned_build_bytes": self.deferred_max_pinned_build_bytes,
+				"residency_peak": residency_peak,
 			},
 		}))
 	}
@@ -21793,10 +21806,17 @@ mod tests {
 			20
 		);
 
+		// ADR 507: the inverted-band rejection now flows through the attribution contract, so the
+		// message is the contract's typed one. The invariant it guards is unchanged — stages that
+		// exceed the drive total are refused loudly, never clamped.
 		let error = profile
 			.snapshot_value(11)
 			.expect_err("stage timers greater than total must fail");
-		assert!(error.to_string().contains("timers exceed total"));
+		assert!(
+			error.to_string().contains("time reconciliation failed")
+				&& error.to_string().contains("time band inverted"),
+			"unexpected error: {error}"
+		);
 		let _ = std::fs::remove_file(path);
 		let _ = std::fs::remove_file(temporary);
 	}

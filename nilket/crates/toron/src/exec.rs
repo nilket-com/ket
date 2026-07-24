@@ -75,6 +75,7 @@ const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 mod aggregate;
 mod expr;
 mod join;
+mod node_attribution;
 
 pub(in crate::exec) use self::aggregate::{
 	AggState, BoundGroupedAggregateGroups, add_avg_value, add_sum_value, avg_state_array,
@@ -838,6 +839,14 @@ impl Executor {
 		Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>,
 	> {
 		Box::pin(async move {
+			// ADR 507: attribute this plan node's exclusive time and spill across the executor tree.
+			// A Drop-guard held for the whole body records on every exit (including an arm's early
+			// `return`), so the node match below is untouched — same shape, same indentation. Zero
+			// cost when the profile env is unset: `enter` takes no lock and samples no clock.
+			let _node_span = node_attribution::enter(
+				node_attribution::node_kind_of(plan),
+				&self.context.task_telemetry,
+			);
 			match plan {
 				ExecutionPlan::EmptyRelation { schema } => {
 					Ok(vec![RecordBatch::new_empty(schema.clone())])

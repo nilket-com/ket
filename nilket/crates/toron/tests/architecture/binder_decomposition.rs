@@ -227,6 +227,12 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec/join/membership_chain_profile.rs",
 				// ADR 351: join spill storage submodule inside the semantic executor split.
 				"crates/toron/src/exec/join/spill.rs",
+				// ADR 507: the query-neutral composed-gap attribution contract stays inside the
+				// semantic join executor split; it is pure reconciliation arithmetic, no wire surface.
+				"crates/toron/src/exec/join/stage_attribution.rs",
+				// ADR 507: per-plan-node executor attribution — a query-neutral diagnostic keyed by
+				// node kind, gated on an env path, emitting no wire/cluster struct.
+				"crates/toron/src/exec/node_attribution.rs",
 				// ADR 430: join spill placement policy stays inside the semantic join executor split.
 				"crates/toron/src/exec/join/spill_placement.rs",
 				// ADR 429: query-neutral grouped-reservoir diagnostics stay inside the semantic join

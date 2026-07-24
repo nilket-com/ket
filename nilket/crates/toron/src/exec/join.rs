@@ -9,6 +9,7 @@ mod membership_chain_profile;
 mod residency_profile;
 mod spill;
 mod spill_placement;
+pub(in crate::exec) mod stage_attribution;
 mod streaming;
 mod throughput_profile;
 

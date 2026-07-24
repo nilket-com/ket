@@ -18,11 +18,12 @@ use toron_tpch::{
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
 	export_persisted_perf_query_parquet, gauge_hash_smaller_build, gauge_memory_per_task,
 	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
-	normalize_duckdb_type, paired_ablation_dataset_fingerprint, parse_scale_factor,
-	prepare_persisted_tpch_dataset, primitive_ladder_intent, q17_correctness_scale, run_dev_q1,
-	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
-	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	node_attribution_outer_reconciliation, normalize_duckdb_type,
+	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
+	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -262,6 +263,19 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			}
 		}
 	}
+	// Same removal for the node-attribution profile, and for the same reason with an extra edge: the
+	// profiler's write is best-effort (its errors are swallowed so a diagnostic failure cannot mask a
+	// query result), so a run that failed to emit would otherwise attach the previous run's profile.
+	// A stale same-query profile would even reconcile inside the boundary — a silent false pass.
+	if let Some(path) = std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH") {
+		match std::fs::remove_file(&path) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				return harness_error(&format!("clear node attribution profile {path:?}: {error}"));
+			}
+		}
+	}
 	let attempt_result = match engine {
 		PerfEngine::Toron => {
 			run_perf_query_with_data_source(
@@ -367,6 +381,34 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			Err(error) => {
 				row["local_grouped_exchange_receipt_error"] =
 					serde_json::json!(format!("read: {error}"))
+			}
+		}
+	}
+	// ADR 507: join the node-attribution profile to this perf row. The profiler emitted the in-tree
+	// reconciliation; here — the one place holding both the profile and execute_ms — the outer band
+	// (root span ⊆ execute_ms) is reconciled against its declared boundary and folded in beside the
+	// profile, so the row carries a complete two-band attribution.
+	if let Some(path) = std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH") {
+		match std::fs::read_to_string(&path) {
+			Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+				Ok(profile) => {
+					// NaN, not 0.0, when the row carries no execute_ms: the reconciliation must fail
+					// closed naming its real cause, not default to a zero that reads as an inverted band.
+					let execute_ms = row
+						.get("execute_ms")
+						.and_then(serde_json::Value::as_f64)
+						.unwrap_or(f64::NAN);
+					row["node_attribution_outer_reconciliation"] =
+						node_attribution_outer_reconciliation(&profile, execute_ms);
+					row["node_attribution"] = profile;
+				}
+				Err(error) => {
+					row["node_attribution_error"] = serde_json::json!(format!("parse: {error}"));
+				}
+			},
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				row["node_attribution_error"] = serde_json::json!(format!("read: {error}"));
 			}
 		}
 	}

@@ -2217,6 +2217,68 @@ pub struct PersistedPerfQuerySpec {
 	pub dataset_verification: DatasetVerification,
 }
 
+/// ADR 507 step 4/5: the reader-side outer time reconciliation.
+///
+/// The node-attribution profiler measures the `execute_bound` root span and reconciles node stages to
+/// it in-tree (a near-zero, telescoping residual). The outer band — root span ⊆ the query's
+/// `execute_ms` — needs a number the profiler cannot see: `execute_ms` is a harness measurement. This
+/// is where profile meets perf row.
+///
+/// The boundary is declared here, before any run. `execute_ms` starts immediately before
+/// `execute_bound` and stops immediately after, so this residual is *not* binding — binding completes
+/// before the timer starts. It is executor construction (building and entering the boxed future
+/// before the root node's span opens) plus timer-edge framework at both ends: fixed, sub-millisecond,
+/// and independent of cell size. A residual over 10 ms therefore means the node tree failed to
+/// account for the query, not tolerable overhead.
+pub const NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS: u64 = 10_000;
+
+/// Reconcile a node profile against its row's `execute_ms`. **Fails closed**: any input it cannot
+/// trust — an absent span, a non-finite or negative `execute_ms`, or an inverted band where the span
+/// exceeds `execute_ms` — reports `within_boundary: false` with a reason. A reconciliation that cannot
+/// be computed must never read as a pass, and an inverted band is a broken measurement rather than a
+/// zero residual, so the subtraction is checked, not saturating.
+pub fn node_attribution_outer_reconciliation(
+	profile: &serde_json::Value,
+	execute_ms: f64,
+) -> serde_json::Value {
+	let Some(span_micros) = profile
+		.get("execute_bound_span_micros")
+		.and_then(serde_json::Value::as_u64)
+	else {
+		return serde_json::json!({
+			"error": "profile is missing a numeric execute_bound_span_micros",
+			"boundary_micros": NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS,
+			"within_boundary": false,
+		});
+	};
+	if !execute_ms.is_finite() || execute_ms < 0.0 {
+		return serde_json::json!({
+			"error": format!("row execute_ms is not a finite non-negative value: {execute_ms}"),
+			"execute_bound_span_micros": span_micros,
+			"boundary_micros": NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS,
+			"within_boundary": false,
+		});
+	}
+	// execute_ms is milliseconds with sub-microsecond noise; round to whole micros for the residual.
+	let execute_micros = (execute_ms * 1000.0).round() as u64;
+	let Some(outer_residual_micros) = execute_micros.checked_sub(span_micros) else {
+		return serde_json::json!({
+			"error": "inverted band: execute_bound span exceeds the row's execute_ms",
+			"execute_bound_span_micros": span_micros,
+			"execute_micros": execute_micros,
+			"boundary_micros": NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS,
+			"within_boundary": false,
+		});
+	};
+	serde_json::json!({
+		"execute_bound_span_micros": span_micros,
+		"execute_micros": execute_micros,
+		"outer_residual_micros": outer_residual_micros,
+		"boundary_micros": NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS,
+		"within_boundary": outer_residual_micros <= NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS,
+	})
+}
+
 pub fn stable_fingerprint(text: &str) -> String {
 	let mut hash = FNV_OFFSET;
 	for byte in text.as_bytes() {
@@ -15141,6 +15203,87 @@ mod dataset_verification_provenance {
 		let from_memory = export_perf_query_parquet("q06", "strict", 0.01, &root).expect("export");
 		assert_eq!(from_memory.dataset_verification, None);
 		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn node_attribution_outer_reconciliation_computes_residual_and_boundary() {
+		use super::{
+			NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS, node_attribution_outer_reconciliation,
+		};
+
+		// A profile whose root span is 149 us short of execute_ms — the real q17 shape. The outer
+		// residual is that gap, and it is well within the declared 10 ms boundary.
+		let profile = serde_json::json!({ "execute_bound_span_micros": 34_897_625u64 });
+		let reconciliation = node_attribution_outer_reconciliation(&profile, 34_897.774);
+		assert_eq!(reconciliation["outer_residual_micros"], 149);
+		assert_eq!(
+			reconciliation["boundary_micros"],
+			NODE_ATTRIBUTION_OUTER_BOUNDARY_MICROS
+		);
+		assert_eq!(reconciliation["within_boundary"], true);
+
+		// A span that accounts for only half of execute_ms — a profiler that missed whole operators.
+		// The residual blows the boundary; the join reports the failure rather than hiding it.
+		let broken = serde_json::json!({ "execute_bound_span_micros": 5_000_000u64 });
+		let reconciliation = node_attribution_outer_reconciliation(&broken, 10_000.0);
+		assert_eq!(reconciliation["outer_residual_micros"], 5_000_000);
+		assert_eq!(reconciliation["within_boundary"], false);
+	}
+
+	/// The reader must fail closed. Every input it cannot trust has to report `within_boundary: false`
+	/// with a reason — an unusable reconciliation that read as a pass would be worse than none, since
+	/// the whole point of the outer band is to catch a profile that did not account for its query.
+	#[test]
+	fn node_attribution_outer_reconciliation_fails_closed_on_untrustworthy_input() {
+		use super::node_attribution_outer_reconciliation;
+
+		// An inverted band — span longer than execute_ms — is physically impossible and means the
+		// measurement is broken. It must not saturate to a zero residual and pass.
+		let profile = serde_json::json!({ "execute_bound_span_micros": 2_000_000u64 });
+		let inverted = node_attribution_outer_reconciliation(&profile, 1_000.0);
+		assert_eq!(inverted["within_boundary"], false);
+		assert!(
+			inverted["error"]
+				.as_str()
+				.expect("reason")
+				.contains("inverted band"),
+			"inverted band names its cause: {inverted}"
+		);
+		assert!(
+			inverted.get("outer_residual_micros").is_none(),
+			"no residual is published for a band that cannot be reconciled"
+		);
+
+		// A missing execute_ms (the caller passes NaN) is not a zero-length query.
+		let missing_execute = node_attribution_outer_reconciliation(&profile, f64::NAN);
+		assert_eq!(missing_execute["within_boundary"], false);
+		assert!(
+			missing_execute["error"]
+				.as_str()
+				.expect("reason")
+				.contains("execute_ms")
+		);
+		// A negative execute_ms is equally untrustworthy.
+		assert_eq!(
+			node_attribution_outer_reconciliation(&profile, -1.0)["within_boundary"],
+			false
+		);
+
+		// A profile with no span field at all — e.g. a truncated or foreign JSON document.
+		let no_span = node_attribution_outer_reconciliation(&serde_json::json!({}), 1_000.0);
+		assert_eq!(no_span["within_boundary"], false);
+		assert!(
+			no_span["error"]
+				.as_str()
+				.expect("reason")
+				.contains("execute_bound_span_micros")
+		);
+		// A span present but not a number must fail the same way, not coerce to zero.
+		let bad_span = node_attribution_outer_reconciliation(
+			&serde_json::json!({ "execute_bound_span_micros": "1000" }),
+			1_000.0,
+		);
+		assert_eq!(bad_span["within_boundary"], false);
 	}
 
 	#[tokio::test]
