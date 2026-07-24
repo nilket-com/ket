@@ -2797,10 +2797,7 @@ struct MinimapPixels {
 
 impl MinimapPixels {
 	fn new(width: u32, height: u32, base: Rgb) -> Self {
-		let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-		for _ in 0..width * height {
-			rgba.extend_from_slice(&[base.r, base.g, base.b, 255]);
-		}
+		let rgba = [base.r, base.g, base.b, 255].repeat((width * height) as usize);
 		Self {
 			width,
 			height,
@@ -3131,6 +3128,7 @@ impl MinimapWidget<'_> {
 		{
 			return handle.clone();
 		}
+		let trace_started = std::env::var_os("KET_MINIMAP_TRACE").map(|_| time::Instant::now());
 		let mut image = MinimapPixels::new(width, height, self.palette.minimap_surface);
 		let content_width = width.saturating_sub(MINIMAP_MARKER_WIDTH * MINIMAP_SCALE);
 		let content_height = self.content_height(height);
@@ -3138,6 +3136,13 @@ impl MinimapWidget<'_> {
 		self.render_search_markers(&mut image, content_height);
 		let handle =
 			iced::advanced::image::Handle::from_rgba(image.width, image.height, image.rgba);
+		if let Some(started) = trace_started {
+			eprintln!(
+				"[minimap] polariton-raster width={width} height={height} revision={:?} elapsed={:?}",
+				self.snapshot.revision(),
+				started.elapsed(),
+			);
+		}
 		*slot = Some((fingerprint, handle.clone()));
 		handle
 	}
@@ -3673,6 +3678,44 @@ mod tests {
 			(base.r, base.g, base.b),
 			"quarter-width rows must not become full-width rainbow bands"
 		);
+	}
+
+	#[test]
+	fn minimap_realistic_dense_raster_reuses_its_handle() {
+		use super::{MinimapInkCache, MinimapWidget};
+		use libaryon::core::{DocLine, Rgb};
+		use libaryon::engine::{
+			MinimapContentRevision, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS,
+			PreviewRow, PreviewSnapshot, UiPalette,
+		};
+		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+
+		let keyword = libaryon::core::TokenBin::new(TokenCategory::Keyword as u8);
+		let rows = (0..5_900)
+			.map(|_| PreviewRow {
+				logical_width: 80,
+				bins: vec![keyword; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+			})
+			.collect();
+		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot::new(
+			MinimapOverlay::new(DocLine::ZERO, 40, DocLine::ZERO),
+			MinimapContentRevision::ZERO,
+			120,
+			rows,
+		));
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
+		let widget = MinimapWidget {
+			pane_id: libaryon::core::PaneId::new(1),
+			snapshot: &snapshot,
+			theme_colors,
+			palette: UiPalette::default(),
+		};
+		let cache = MinimapInkCache::default();
+
+		let first = widget.ink_handle(&cache, 160, 4_000);
+		let second = widget.ink_handle(&cache, 160, 4_000);
+		assert_eq!(first.id(), second.id());
 	}
 
 	#[test]

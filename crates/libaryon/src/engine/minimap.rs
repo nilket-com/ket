@@ -328,6 +328,7 @@ pub(super) fn build_text_minimap_snapshot(
 	provider: Option<&dyn LanguageProvider>,
 	revision: MinimapContentRevision,
 ) -> MinimapSnapshot {
+	let trace_started = std::env::var_os("KET_MINIMAP_TRACE").map(|_| std::time::Instant::now());
 	let doc_line_count = DocLineCount::new(
 		u64::try_from(memchr::memchr_iter(b'\n', bytes).count())
 			.expect("in-memory newline count fits u64")
@@ -335,7 +336,7 @@ pub(super) fn build_text_minimap_snapshot(
 	);
 	overlay.doc_line_count = doc_line_count;
 
-	if bytes.len() as u64 <= MAX_PREVIEW_MINIMAP_BYTES
+	let snapshot = if bytes.len() as u64 <= MAX_PREVIEW_MINIMAP_BYTES
 		&& doc_line_count.get() <= MAX_PREVIEW_MINIMAP_LINES
 	{
 		MinimapSnapshot::Preview(build_preview_snapshot(
@@ -347,7 +348,22 @@ pub(super) fn build_text_minimap_snapshot(
 		))
 	} else {
 		MinimapSnapshot::Overview(build_overview_snapshot(bytes, overlay, revision))
+	};
+	if let Some(started) = trace_started {
+		let kind = match &snapshot {
+			MinimapSnapshot::Preview(_) => "preview",
+			MinimapSnapshot::Overview(_) => "overview",
+			MinimapSnapshot::ByteFallback(_) => "byte-fallback",
+		};
+		eprintln!(
+			"[minimap] snapshot kind={kind} bytes={} lines={} semantic_spans={} elapsed={:?}",
+			bytes.len(),
+			doc_line_count.get(),
+			semantic_highlights.len(),
+			started.elapsed(),
+		);
 	}
+	snapshot
 }
 
 pub(super) fn build_byte_fallback_minimap_snapshot(
@@ -616,9 +632,9 @@ mod tests {
 		build_search_minimap_bands, build_text_minimap_snapshot, dominant_preview_bin_for_rows,
 		normalize_line_density, token_bin,
 	};
-	use crate::core::{DocLine, DocLineCount};
+	use crate::core::{DocByte, DocLine, DocLineCount};
 	use crate::ecs::UastRegistry;
-	use crate::svp::rust_highlight::TokenCategory;
+	use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 	use crate::svp::rust_provider::RustProvider;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
@@ -673,6 +689,61 @@ mod tests {
 		);
 
 		assert!(matches!(snapshot, MinimapSnapshot::Overview(_)));
+	}
+
+	#[test]
+	fn large_preview_handles_nested_semantic_highlights() {
+		let mut bytes = Vec::new();
+		let mut semantic = Vec::new();
+		for line_number in 0..5_900 {
+			let start = bytes.len();
+			let line = format!("fn function_{line_number}() {{ let value = {line_number}; }}\n");
+			bytes.extend_from_slice(line.as_bytes());
+			let end = bytes.len();
+			let function_start = start + 3;
+			let function_end = function_start + format!("function_{line_number}").len();
+			semantic.extend([
+				HighlightSpan::new(
+					DocByte::new(start as u64),
+					DocByte::new(end as u64),
+					TokenCategory::String,
+				),
+				HighlightSpan::new(
+					DocByte::new(start as u64),
+					DocByte::new((start + 2) as u64),
+					TokenCategory::Keyword,
+				),
+				HighlightSpan::new(
+					DocByte::new(function_start as u64),
+					DocByte::new(function_end as u64),
+					TokenCategory::Function,
+				),
+			]);
+		}
+
+		let snapshot = build_text_minimap_snapshot(
+			&bytes,
+			&semantic,
+			MinimapOverlay::new(DocLine::ZERO, 40, DocLine::ZERO),
+			Some(&RustProvider::new()),
+			MinimapContentRevision::ZERO,
+		);
+		let MinimapSnapshot::Preview(preview) = snapshot else {
+			panic!("5,900 lines should exercise the Preview path");
+		};
+		assert_eq!(preview.rows.len(), 5_901);
+		assert!(
+			preview.rows[0]
+				.bins
+				.iter()
+				.any(|&bin| bin == token_bin(TokenCategory::Keyword))
+		);
+		assert!(
+			preview.rows[0]
+				.bins
+				.iter()
+				.any(|&bin| bin == token_bin(TokenCategory::Function))
+		);
 	}
 
 	#[test]
