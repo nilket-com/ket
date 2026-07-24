@@ -12,7 +12,6 @@ use super::super::session::{
 	UiState, View, resolve_theme_name,
 };
 use super::super::settings::SaveDurability;
-use super::super::settings::default_init_path;
 use super::super::shadow::{ShadowSession, discard_shadow_session, load_shadow_session};
 use super::super::undo::UndoLedger;
 use super::{CommandEffect, RuntimeContext, SemanticRuntime};
@@ -46,45 +45,54 @@ fn file_stamp_for_path(path: &str) -> Option<FileStamp> {
 }
 
 pub(super) fn write_init_file(
+	path: &Path,
+	entrypoint: &str,
 	settings: &SettingsPersistent,
 	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<std::path::PathBuf, String> {
-	let path = default_init_path().ok_or_else(|| "No config directory available".to_string())?;
 	write_init_file_at(
-		&path,
+		path,
+		entrypoint,
 		settings,
 		git_refresh_seconds,
 		language_registry,
 		force,
 	)?;
-	Ok(path)
+	Ok(path.to_path_buf())
 }
 
 pub(super) fn write_default_init_file(
+	path: &Path,
+	entrypoint: &str,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<std::path::PathBuf, String> {
-	let path = default_init_path().ok_or_else(|| "No config directory available".to_string())?;
-	write_default_init_file_at(&path, language_registry, force)?;
-	Ok(path)
+	write_default_init_file_at(path, entrypoint, language_registry, force)?;
+	Ok(path.to_path_buf())
 }
 
 fn write_default_init_file_at(
 	path: &std::path::Path,
+	entrypoint: &str,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<(), String> {
 	if path.exists() && !force {
 		let contents = std::fs::read_to_string(path)
 			.map_err(|error| format!("Could not inspect init.rn: {error}"))?;
-		if !is_generated_init(&contents) {
-			return Err("init.rn contains user code; use :init0! to discard it".to_string());
+		if has_init_function(&contents, entrypoint)?
+			&& !is_generated_entrypoint(&contents, entrypoint)
+		{
+			return Err(format!(
+				"init.rn `{entrypoint}` contains user code; use :init0! to replace it"
+			));
 		}
 	}
 	write_init_file_at(
 		path,
+		entrypoint,
 		&SettingsPersistent::builtin_defaults(),
 		super::super::session::DEFAULT_GIT_REFRESH_SECONDS,
 		language_registry,
@@ -94,6 +102,7 @@ fn write_default_init_file_at(
 
 fn write_init_file_at(
 	path: &std::path::Path,
+	entrypoint: &str,
 	settings: &SettingsPersistent,
 	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
@@ -107,21 +116,35 @@ fn write_init_file_at(
 	} else {
 		None
 	};
-	let source = if let Some(contents) = contents.as_deref().filter(|_| !force) {
-		if is_generated_init(contents) {
-			render_init_file(settings, git_refresh_seconds)
+	let rendered = render_init_function(entrypoint, settings, git_refresh_seconds);
+	let source = if let Some(contents) = contents.as_deref() {
+		let target_exists = has_init_function(contents, entrypoint)?;
+		if entrypoint == "main" && force {
+			rendered
+		} else if !target_exists || force || is_generated_entrypoint(contents, entrypoint) {
+			replace_init_function(contents, entrypoint, &rendered)?
 		} else {
-			update_init_file(contents, settings, git_refresh_seconds, language_registry)?
+			update_init_file(
+				contents,
+				entrypoint,
+				settings,
+				git_refresh_seconds,
+				language_registry,
+			)?
 		}
 	} else {
-		render_init_file(settings, git_refresh_seconds)
+		rendered
 	};
 	validate_init_source(&source)?;
 	if force
-		&& contents
-			.as_deref()
-			.is_some_and(|contents| !is_generated_init(contents))
-	{
+		&& contents.as_deref().is_some_and(|contents| {
+			if entrypoint == "main" {
+				!is_generated_init(contents)
+			} else {
+				has_init_function(contents, entrypoint).unwrap_or(false)
+					&& !is_generated_entrypoint(contents, entrypoint)
+			}
+		}) {
 		write_init_backup(path)?;
 	}
 	if let Some(parent) = path.parent() {
@@ -146,6 +169,18 @@ fn is_generated_init(source: &str) -> bool {
 	if span_text(source, main.name.span) != "main" {
 		return false;
 	}
+	is_generated_function(source, main)
+}
+
+fn is_generated_entrypoint(source: &str, entrypoint: &str) -> bool {
+	let Ok(file) = parse_init_source(source) else {
+		return false;
+	};
+	find_init_function(source, &file, entrypoint)
+		.is_some_and(|function| is_generated_function(source, function))
+}
+
+fn is_generated_function(source: &str, main: &ast::ItemFn) -> bool {
 	let Some(binding) = config_binding(source, main) else {
 		return false;
 	};
@@ -258,6 +293,7 @@ pub(super) fn init_setting_edit(
 
 pub(super) fn persist_init_setting_at(
 	path: &Path,
+	entrypoint: &str,
 	expected_source: Option<&str>,
 	edit: &InitSettingEdit,
 	language_registry: &super::super::language::LanguageRegistry,
@@ -277,10 +313,16 @@ pub(super) fn persist_init_setting_at(
 			.map_err(|_| "init.rn is not valid UTF-8".to_string())?
 			.to_string(),
 		None if edit.value.is_none() => return Ok(false),
-		None => render_minimal_init_file(edit),
+		None => render_minimal_init_function(entrypoint, edit),
 	};
 	let updated = if original.is_some() {
-		update_init_setting(&source, edit, language_registry)?
+		if has_init_function(&source, entrypoint)? {
+			update_init_setting(&source, entrypoint, edit, language_registry)?
+		} else if edit.value.is_none() {
+			return Ok(false);
+		} else {
+			append_init_function(&source, &render_minimal_init_function(entrypoint, edit))
+		}
 	} else {
 		source.clone()
 	};
@@ -311,42 +353,37 @@ pub(super) fn persist_init_setting_at(
 	Ok(true)
 }
 
-fn render_minimal_init_file(edit: &InitSettingEdit) -> String {
+fn render_minimal_init_function(entrypoint: &str, edit: &InitSettingEdit) -> String {
 	let operation = edit
 		.operation("config")
 		.expect("a removal never creates an absent init file");
 	format!(
-		"pub fn main(editor) {{\n\tlet config = editor.config();\n\t{operation}\n\tOk(())\n}}\n"
+		"pub fn {entrypoint}(editor) {{\n\tlet config = editor.config();\n\t{operation}\n\tOk(())\n}}\n"
 	)
 }
 
 fn update_init_setting(
 	source: &str,
+	entrypoint: &str,
 	edit: &InitSettingEdit,
 	language_registry: &super::super::language::LanguageRegistry,
 ) -> Result<String, String> {
 	let file = parse_init_source(source)?;
-	let main = file
-		.items
-		.iter()
-		.find_map(|(item, _)| match item {
-			ast::Item::Fn(function) if span_text(source, function.name.span) == "main" => {
-				Some(function)
-			}
-			_ => None,
-		})
-		.ok_or_else(|| "init.rn has no `main` function to update".to_string())?;
+	let main = find_init_function(source, &file, entrypoint)
+		.ok_or_else(|| format!("init.rn has no `{entrypoint}` function to update"))?;
 	let terminal = main
 		.body
 		.statements
 		.last()
 		.filter(|statement| normalize_rune_source(span_text(source, statement.span())) == "Ok(())")
 		.ok_or_else(|| {
-			"init.rn main must end with `Ok(())` before :set can update it".to_string()
+			format!("init.rn `{entrypoint}` must end with `Ok(())` before :set can update it")
 		})?;
 	let insertion = span_range(terminal.span()).start;
 	let binding = config_binding(source, main).ok_or_else(|| {
-		"init.rn main has no `let config = editor.config();` binding for :set to update".to_string()
+		format!(
+			"init.rn `{entrypoint}` has no `let config = editor.config();` binding for :set to update"
+		)
 	})?;
 	let mut patches = Vec::new();
 	let mut found = false;
@@ -395,33 +432,27 @@ fn apply_init_patches(
 
 fn update_init_file(
 	source: &str,
+	entrypoint: &str,
 	settings: &SettingsPersistent,
 	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
 ) -> Result<String, String> {
 	let file = parse_init_source(source)?;
-	let main = file
-		.items
-		.iter()
-		.find_map(|(item, _)| match item {
-			ast::Item::Fn(function) if span_text(source, function.name.span) == "main" => {
-				Some(function)
-			}
-			_ => None,
-		})
-		.ok_or_else(|| "init.rn has no `main` function to update".to_string())?;
+	let main = find_init_function(source, &file, entrypoint)
+		.ok_or_else(|| format!("init.rn has no `{entrypoint}` function to update"))?;
 	let terminal = main
 		.body
 		.statements
 		.last()
 		.filter(|statement| normalize_rune_source(span_text(source, statement.span())) == "Ok(())")
 		.ok_or_else(|| {
-			"init.rn main must end with `Ok(())` before :set initwrite can update it".to_string()
+			format!("init.rn `{entrypoint}` must end with `Ok(())` before :set init can update it")
 		})?;
 	let insertion = span_range(terminal.span()).start;
 	let binding = config_binding(source, main).ok_or_else(|| {
-		"init.rn main has no `let config = editor.config();` binding for :set initwrite to update; use :set initwrite! to replace it"
-			.to_string()
+		format!(
+			"init.rn `{entrypoint}` has no `let config = editor.config();` binding for :set init to update; use :set init! to replace it"
+		)
 	})?;
 	let desired = init_config_operations(settings, git_refresh_seconds, &binding);
 	let mut patches = Vec::new();
@@ -699,12 +730,64 @@ fn parse_init_source(source: &str) -> Result<ast::File, String> {
 		.map_err(|error| format!("init.rn is not valid Rune: {error}"))
 }
 
+fn append_init_function(source: &str, function: &str) -> String {
+	let mut updated = source.to_string();
+	if !updated.is_empty() && !updated.ends_with('\n') {
+		updated.push('\n');
+	}
+	if !updated.is_empty() && !updated.ends_with("\n\n") {
+		updated.push('\n');
+	}
+	updated.push_str(function);
+	updated
+}
+
+fn replace_init_function(
+	source: &str,
+	entrypoint: &str,
+	replacement: &str,
+) -> Result<String, String> {
+	let file = parse_init_source(source)?;
+	let Some(function) = find_init_function(source, &file, entrypoint) else {
+		return Ok(append_init_function(source, replacement));
+	};
+	apply_init_patches(
+		source,
+		vec![(
+			span_range(function.span()),
+			replacement.trim_end().to_string(),
+		)],
+	)
+}
+
+fn find_init_function<'a>(
+	source: &str,
+	file: &'a ast::File,
+	entrypoint: &str,
+) -> Option<&'a ast::ItemFn> {
+	file.items.iter().find_map(|(item, _)| match item {
+		ast::Item::Fn(function) if span_text(source, function.name.span) == entrypoint => {
+			Some(function)
+		}
+		_ => None,
+	})
+}
+
+fn has_init_function(source: &str, entrypoint: &str) -> Result<bool, String> {
+	let file = parse_init_source(source)?;
+	Ok(find_init_function(source, &file, entrypoint).is_some())
+}
+
 fn validate_init_source(source: &str) -> Result<(), String> {
 	parse_init_source(source).map(|_| ())
 }
 
-fn render_init_file(settings: &SettingsPersistent, git_refresh_seconds: u64) -> String {
-	let mut source = "pub fn main(editor) {\n".to_string();
+fn render_init_function(
+	entrypoint: &str,
+	settings: &SettingsPersistent,
+	git_refresh_seconds: u64,
+) -> String {
+	let mut source = format!("pub fn {entrypoint}(editor) {{\n");
 	source.push_str("\tlet config = editor.config();\n");
 	write_set(&mut source, "theme", &settings.theme_name);
 	write_bool_set(&mut source, "minimap", settings.minimap_enabled);
@@ -2119,6 +2202,7 @@ mod tests {
 		let language_registry = crate::engine::host::build_language_registry();
 		super::write_init_file_at(
 			path,
+			"main",
 			settings,
 			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
 			&language_registry,
@@ -2128,7 +2212,7 @@ mod tests {
 
 	fn write_test_default_init_file_at(path: &std::path::Path, force: bool) -> Result<(), String> {
 		let language_registry = crate::engine::host::build_language_registry();
-		super::write_default_init_file_at(path, &language_registry, force)
+		super::write_default_init_file_at(path, "main", &language_registry, force)
 	}
 
 	fn persist_test_setting(
@@ -2138,7 +2222,7 @@ mod tests {
 		let language_registry = crate::engine::host::build_language_registry();
 		let edit = super::init_setting_edit(&command, &language_registry)
 			.expect("test command must map to an init setting");
-		super::persist_init_setting_at(path, None, &edit, &language_registry)
+		super::persist_init_setting_at(path, "main", None, &edit, &language_registry)
 	}
 
 	#[test]
@@ -2256,7 +2340,8 @@ mod tests {
 			Some(crate::core::Rgb::new(0x12, 0x34, 0x56)),
 		);
 
-		let source = super::render_init_file(
+		let source = super::render_init_function(
+			"main",
 			&settings,
 			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
 		);
@@ -2347,8 +2432,9 @@ mod tests {
 		let edit = super::init_setting_edit(&EditorCommand::PersistWrap(true), &languages)
 			.expect("wrap edit");
 
-		let error = super::persist_init_setting_at(&path, Some(expected), &edit, &languages)
-			.expect_err("stale snapshot must be refused");
+		let error =
+			super::persist_init_setting_at(&path, "main", Some(expected), &edit, &languages)
+				.expect_err("stale snapshot must be refused");
 		assert!(error.contains("changed on disk"));
 		assert_eq!(
 			std::fs::read_to_string(&path).expect("read preserved init"),
@@ -2389,6 +2475,39 @@ mod tests {
 		assert!(backup.contains("gruvbox"));
 		let _ = std::fs::remove_file(&path);
 		let _ = std::fs::remove_file(path.with_extension("rn.bak"));
+	}
+
+	#[test]
+	fn embedded_editor_init_updates_preserve_the_application_entrypoint() {
+		let path = temp_test_path("embedded-editor-init");
+		let application = r#"pub fn main(config) {
+	config.window_size(1600, 900)?;
+}
+"#;
+		std::fs::write(&path, application).expect("write application init");
+		let languages = crate::engine::host::build_language_registry();
+		let edit = super::init_setting_edit(&EditorCommand::PersistWrap(false), &languages)
+			.expect("wrap edit");
+
+		super::persist_init_setting_at(&path, "editor", None, &edit, &languages)
+			.expect("append editor entrypoint");
+		let updated = std::fs::read_to_string(&path).expect("read compound init");
+		assert!(updated.contains(application));
+		assert!(updated.contains("pub fn editor(editor)"));
+		assert!(updated.contains("config.set(\"wrap\", false)?;"));
+
+		super::write_default_init_file_at(&path, "editor", &languages, false)
+			.expect("reset generated editor entrypoint");
+		let reset = std::fs::read_to_string(&path).expect("read reset compound init");
+		assert!(reset.contains(application));
+		assert!(reset.contains("pub fn editor(editor)"));
+		assert!(reset.contains("config.set(\"theme\", \"onedark\")?;"));
+		assert_eq!(reset.matches("pub fn editor(editor)").count(), 1);
+		assert!(
+			rune::parse::parse_all::<rune::ast::File>(&reset, rune::SourceId::EMPTY, false,)
+				.is_ok()
+		);
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
@@ -2654,6 +2773,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &languages,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let mut next_device_id = u16::MAX;
 		let mut backing_device_id = None;
@@ -2691,6 +2811,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &languages,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let mut next_device_id = crate::engine::core::FILE_DEVICE_ID + 1;
 		let mut backing_device_id = None;
@@ -2729,6 +2850,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &languages,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let settings = SettingsPersistent {
 			theme_name: "onedark".to_string(),
@@ -2810,6 +2932,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &languages,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let settings = SettingsPersistent {
 			theme_name: "onedark".to_string(),

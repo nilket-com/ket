@@ -235,15 +235,15 @@ pub(super) fn protected_setting_tokens() -> Vec<String> {
 		tokens.push(spec.name.to_string());
 		tokens.extend(spec.aliases.iter().map(|alias| (*alias).to_string()));
 	}
-	tokens.extend(["initwrite".to_string(), "initw".to_string()]);
+	tokens.push("init".to_string());
 	tokens
 }
 
 /// Parse the arguments of `:set` into a persistent settings command.
 pub(super) fn parse_set_command(rest: &str) -> Result<EditorCommand, String> {
 	match rest.trim() {
-		"initwrite" | "initw" => return Ok(EditorCommand::WriteInit { force: false }),
-		"initwrite!" | "initw!" => return Ok(EditorCommand::WriteInit { force: true }),
+		"init" => return Ok(EditorCommand::WriteInit { force: false }),
+		"init!" => return Ok(EditorCommand::WriteInit { force: true }),
 		_ => {}
 	}
 	let (key, value) = match rest.find(char::is_whitespace) {
@@ -556,21 +556,15 @@ mod tests {
 	#[test]
 	fn set_value_options_parse_and_validate() {
 		assert!(matches!(
-			parse_set_command("initwrite"),
+			parse_set_command("init"),
 			Ok(EditorCommand::WriteInit { force: false })
 		));
 		assert!(matches!(
-			parse_set_command("initw"),
-			Ok(EditorCommand::WriteInit { force: false })
-		));
-		assert!(matches!(
-			parse_set_command("initwrite!"),
+			parse_set_command("init!"),
 			Ok(EditorCommand::WriteInit { force: true })
 		));
-		assert!(matches!(
-			parse_set_command("initw!"),
-			Ok(EditorCommand::WriteInit { force: true })
-		));
+		assert!(parse_set_command("initw").is_err());
+		assert!(parse_set_command("initwrite").is_err());
 		assert!(matches!(
 			parse_set_command("theme onedark"),
 			Ok(EditorCommand::PersistTheme(name)) if name == "onedark"
@@ -661,7 +655,7 @@ mod tests {
 	#[test]
 	fn setting_suggestions_never_repeat_the_unknown_token() {
 		assert_eq!(
-			suggest_setting_from_candidates("initw", vec!["initw".to_string()]),
+			suggest_setting_from_candidates("mystery", vec!["mystery".to_string()]),
 			None
 		);
 	}

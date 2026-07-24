@@ -323,6 +323,33 @@ pub fn main(config) {
 	}
 
 	#[test]
+	fn app_configuration_ignores_the_embedded_editor_entrypoint() {
+		let path = temp_path("shared-init");
+		std::fs::write(
+			&path,
+			r#"
+pub fn main(config) {
+    config.window_size(1440, 900)?;
+    config.show_column_types(true)?;
+}
+
+pub fn editor(editor) {
+    let config = editor.config();
+    config.set("wrap", false)?;
+    Ok(())
+}
+"#,
+		)
+		.expect("write shared init");
+
+		let startup = load_from_path(&path);
+		assert_eq!(startup.window_size, (1440.0, 900.0));
+		assert!(startup.show_column_types);
+		assert_eq!(startup.init_error, None);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
 	fn runtime_error_keeps_operations_that_already_completed() {
 		let path = temp_path("partial-init");
 		std::fs::write(

@@ -19,8 +19,8 @@ persistence, the deletion, and the worked migration of the existing dotfile.
 
 Role 1 moves to Rune. Role 2 becomes a syntax-aware source edit rather than a generated
 snapshot: ordinary `:set` operations may replace only the literal configuration call for
-the one canonical key they own. The explicit `:set initwrite` export remains the bulk
-reconciliation tool, while `:set initwrite!` is the deliberate replacement escape hatch.
+the one canonical key they own. The explicit `:set init` export remains the bulk
+reconciliation tool, while `:set init!` is the deliberate replacement escape hatch.
 
 ## 2. Decision: `:set` performs a targeted Rune edit
 
@@ -43,7 +43,7 @@ Persist-flavored operations update the live session first, then edit the configu
 - Embedders which do not configure an init script remain session-only. This prevents a
   library engine or test from discovering and mutating the Baryon user's default path.
 
-`:set initwrite` remains a bulk snapshot/reconciliation command for recovery and explicit
+`:set init` remains a bulk snapshot/reconciliation command for recovery and explicit
 export. It uses the same AST key recognition, removes cleared built-in color/language
 overrides, and preserves unknown configuration calls and other user statements.
 
@@ -169,7 +169,7 @@ small phase: `config.rn` (the above, genericized), `jobs.rn`, `autocmds.rn`, `co
    (bad hex, unknown theme), as expected errors.
 5. Persist-flavored commands edit only their canonical literal call in `init.rn`; unrelated
    Rune code is byte-preserved, stale or dirty sources are refused, clean open buffers
-   reload, and `:set initwrite` / `:set initwrite!` retain their bulk export behavior.
+   reload, and `:set init` / `:set init!` retain their bulk export behavior.
 6. Startup script failure lands on defaults with the existing startup-status diagnostic.
 7. Full lib suite serial in default and blocking-SVP modes, clippy `--all-targets`,
    formatting.

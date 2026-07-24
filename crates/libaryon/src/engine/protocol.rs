@@ -284,7 +284,7 @@ pub enum EditorCommand {
 		panel_id: crate::engine::HostPanelId,
 		revision: crate::engine::PanelRevision,
 	},
-	/// Replace `init.rn` with Baryon's built-in default configuration.
+	/// Replace this editor host's init entrypoint with built-in defaults.
 	WriteDefaultInit {
 		force: bool,
 	},

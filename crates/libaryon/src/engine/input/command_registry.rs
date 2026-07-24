@@ -469,8 +469,20 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		category: CommandCategory::Settings,
 		usage: ":set OPTION [VALUE]",
 		summary: "Change a setting for this session",
-		help: "Changes a named option for this session. Use :set initwrite (or :set initw) to atomically update parsed config settings in init.rn while preserving other startup behavior; use :set initwrite! to replace the file. Bare option commands like :wrap also affect the current session.",
+		help: "Changes a named option for this session. Use :set init to atomically update parsed config settings in init.rn while preserving other startup behavior; use :set init! to replace the editor entrypoint. Bare option commands like :wrap also affect the current session.",
 		dispatch: DispatchKind::Exact(cmd_set),
+	},
+	CommandSpec {
+		name: "init",
+		aliases: &[],
+		bang: true,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Settings,
+		usage: ":init",
+		summary: "Write editor settings",
+		help: "Atomically updates the editor configuration entrypoint in this host's init.rn while preserving other startup code. Use :init! to replace a handwritten editor entrypoint after saving init.rn.bak.",
+		dispatch: DispatchKind::Exact(cmd_init),
 	},
 	CommandSpec {
 		name: "init0",
@@ -481,7 +493,7 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		category: CommandCategory::Settings,
 		usage: ":init0",
 		summary: "Replace init.rn with built-in defaults",
-		help: "Replaces a generated init.rn with Baryon's built-in default configuration without changing the current session. It refuses to discard handwritten init.rn code; use :init0! to replace it after saving init.rn.bak.",
+		help: "Replaces this editor host's generated init.rn entrypoint with Libaryon's built-in defaults without changing the current session. Other host entrypoints are preserved. It refuses to discard handwritten editor configuration; use :init0! to replace it after saving init.rn.bak.",
 		dispatch: DispatchKind::Exact(cmd_init0),
 	},
 	CommandSpec {
@@ -892,7 +904,7 @@ fn cmd_language(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 
 fn cmd_set(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	let trimmed = inv.args.trim();
-	if matches!(trimmed, "initwrite" | "initw" | "initwrite!" | "initw!") {
+	if matches!(trimmed, "init" | "init!") {
 		ctx.send(EditorCommand::WriteInit {
 			force: inv.bang || trimmed.ends_with('!'),
 		});
@@ -912,6 +924,10 @@ fn cmd_set(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 		}
 		Err(message) => ctx.error(message),
 	}
+}
+
+fn cmd_init(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::WriteInit { force: inv.bang });
 }
 
 fn cmd_init0(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
@@ -1190,17 +1206,13 @@ mod tests {
 	}
 
 	#[test]
-	fn set_initwrite_spellings_dispatch_with_the_advertised_force_semantics() {
-		// End-to-end over the ex-command layer: the guard's error message
-		// tells the user to run `:set initwrite!`, so that exact spelling
-		// (and every documented variant) must produce the matching command.
+	fn init_spellings_dispatch_with_the_advertised_force_semantics() {
 		for (buffer, force) in [
-			("set initwrite", false),
-			("set initw", false),
-			("set initwrite!", true),
-			("set initw!", true),
-			("set! initwrite", true),
-			("set! initw", true),
+			("set init", false),
+			("set init!", true),
+			("init", false),
+			("init!", true),
+			("set! init", true),
 		] {
 			let (result, commands, status, _) = dispatch(buffer, None);
 			assert_eq!(result, DispatchResult::Dispatched, "{buffer} not consumed");
@@ -1212,6 +1224,19 @@ mod tests {
 				),
 				"{buffer} must dispatch WriteInit {{ force: {force} }}, got {commands:?}"
 			);
+		}
+	}
+
+	#[test]
+	fn removed_init_writer_names_are_unknown() {
+		for buffer in ["initw", "initwrite"] {
+			let (result, commands, _, _) = dispatch(buffer, None);
+			assert_eq!(
+				result,
+				DispatchResult::Unknown,
+				"{buffer} should be removed"
+			);
+			assert!(commands.is_empty());
 		}
 	}
 

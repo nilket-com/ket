@@ -330,13 +330,21 @@ struct PaneDrag {
 }
 
 impl CodeEditor {
+	#[cfg(test)]
 	pub fn new(text: &str) -> Self {
 		Self::spawn(EngineConfig::default(), Some(text))
+	}
+
+	/// Start an embedded editor whose durable settings live alongside the
+	/// Polariton application configuration.
+	pub fn new_with_init(text: &str, init_script: Option<std::path::PathBuf>) -> Self {
+		Self::spawn(polariton_engine_config(None, init_script), Some(text))
 	}
 
 	/// Start directly on a real file. Unlike [`Self::new`], this leaves
 	/// Libaryon's startup document intact so it retains path identity,
 	/// language detection, reload, save, and recovery behavior.
+	#[cfg(test)]
 	pub fn open_initial_file(path: String) -> Self {
 		Self::spawn(
 			EngineConfig {
@@ -345,6 +353,13 @@ impl CodeEditor {
 			},
 			None,
 		)
+	}
+
+	pub fn open_initial_file_with_init(
+		path: String,
+		init_script: Option<std::path::PathBuf>,
+	) -> Self {
+		Self::spawn(polariton_engine_config(Some(path), init_script), None)
 	}
 
 	fn spawn(config: EngineConfig, replacement: Option<&str>) -> Self {
@@ -1386,6 +1401,18 @@ impl CodeEditor {
 		self.viewport
 			.as_ref()
 			.is_some_and(|viewport| viewport.input.mode == EditorMode::Insert)
+	}
+}
+
+fn polariton_engine_config(
+	initial_file: Option<String>,
+	init_script: Option<std::path::PathBuf>,
+) -> EngineConfig {
+	EngineConfig {
+		initial_file,
+		init_script,
+		init_entrypoint: "editor".to_string(),
+		..EngineConfig::default()
 	}
 }
 

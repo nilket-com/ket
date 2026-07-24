@@ -55,15 +55,28 @@ pub(crate) const MAX_AUTOCMD_CONSECUTIVE_FAILURES: u8 = 8;
 #[derive(Debug, Clone)]
 pub(crate) struct RuneHostConfig {
 	init_script: PathBuf,
+	init_entrypoint: String,
 }
 
 impl RuneHostConfig {
+	#[cfg(test)]
 	pub(crate) fn new(init_script: PathBuf) -> Self {
-		Self { init_script }
+		Self::with_entrypoint(init_script, "main".to_string())
+	}
+
+	pub(crate) fn with_entrypoint(init_script: PathBuf, init_entrypoint: String) -> Self {
+		Self {
+			init_script,
+			init_entrypoint,
+		}
 	}
 
 	pub(crate) fn init_script(&self) -> &Path {
 		&self.init_script
+	}
+
+	pub(crate) fn init_entrypoint(&self) -> &str {
+		&self.init_entrypoint
 	}
 }
 
@@ -308,6 +321,18 @@ struct VmEntryRun<R> {
 	effects: HostEffects,
 }
 
+fn source_defines_entrypoint(source: &str, entrypoint: &str) -> Option<bool> {
+	let file =
+		rune::parse::parse_all::<rune::ast::File>(source, rune::SourceId::EMPTY, false).ok()?;
+	Some(file.items.iter().any(|(item, _)| {
+		let rune::ast::Item::Fn(function) = item else {
+			return false;
+		};
+		let range = function.name.span.start.into_usize()..function.name.span.end.into_usize();
+		source.get(range) == Some(entrypoint)
+	}))
+}
+
 impl RuneHost {
 	/// The shared VM-entry scaffold: remove the generation for the duration
 	/// of the callback, gate on callback validity and retained-memory
@@ -538,6 +563,14 @@ impl RuneHost {
 			Ok(None) => return StartupScriptReport::default(),
 			Err(error) => return self.report_error(error),
 		};
+		if self.config.init_entrypoint != "main"
+			&& source_defines_entrypoint(&source, &self.config.init_entrypoint) == Some(false)
+		{
+			// A custom entrypoint lets an embedder share its application
+			// init.rn with Libaryon. Until the user persists an editor setting,
+			// the absent editor function is a clean no-op.
+			return StartupScriptReport::default();
+		}
 		let request = match self.allocate_source_request() {
 			Ok(request) => request,
 			Err(error) => return self.report_error(error),
@@ -653,10 +686,12 @@ impl RuneHost {
 		let (mut result, evaluation_delta) = limit::with(allowance, || {
 			let remaining_before = limit::get();
 			let mut vm = Vm::new(self.runtime.clone(), unit.clone());
-			let result = budget::with(instruction_budget, || vm.call(["main"], (&mut *editor,)))
-				.call()
-				.map_err(|error| render_error("Rune runtime error", &error))
-				.and_then(decode_startup_return);
+			let result = budget::with(instruction_budget, || {
+				vm.call([self.config.init_entrypoint.as_str()], (&mut *editor,))
+			})
+			.call()
+			.map_err(|error| render_error("Rune runtime error", &error))
+			.and_then(decode_startup_return);
 			drop(vm);
 			let remaining_after = limit::get();
 			(result, signed_delta(remaining_before, remaining_after))

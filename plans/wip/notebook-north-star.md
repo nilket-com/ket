@@ -152,7 +152,7 @@ interaction capabilities arrive.
       managed Rune source edits rather than bidirectional general-program
       synchronization.
 5. **Direct manipulation as managed source edits.** The dialog edits *recognized*
-   Rune calls via the `:initw` writer's machinery (`update_init_file` /
+   Rune calls via the `:init` writer's machinery (`update_init_file` /
    `config_call_key`); hand-authored or too-complex Rune stays authoritative and
    the dialog steps back to read-only for it — the same managed-calls /
    unmanaged-program boundary that already ships for `init.rn`.

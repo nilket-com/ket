@@ -1038,6 +1038,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &lang_registry,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let fixture_backing_count = resolver.registered_device_counts().0;
 		let mut next_dynamic_device_id = FILE_DEVICE_ID + 1;
@@ -1229,6 +1230,7 @@ mod tests {
 				resolver: &resolver,
 				lang_registry: &lang_registry,
 				init_script: None,
+				init_entrypoint: None,
 			};
 			let mut next_dynamic_device_id = FILE_DEVICE_ID + 1;
 			let (root, first_leaf, backing_device_id) = load_root_from_path(
@@ -1288,6 +1290,7 @@ mod tests {
 			resolver: &resolver,
 			lang_registry: &lang_registry,
 			init_script: None,
+			init_entrypoint: None,
 		};
 		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 120, 40);
 		let mut tab = fixture.editor_mut();

@@ -425,6 +425,7 @@ struct RuntimeContext<'a> {
 	resolver: &'a SvpResolver,
 	lang_registry: &'a super::language::LanguageRegistry,
 	init_script: Option<&'a Path>,
+	init_entrypoint: Option<&'a str>,
 }
 
 struct SemanticRuntime<'a> {
@@ -1734,6 +1735,7 @@ fn persist_setting_to_init(
 	};
 	let changed = system::persist_init_setting_at(
 		path,
+		runtime.init_entrypoint.unwrap_or("main"),
 		expected_source.as_deref(),
 		edit,
 		runtime.lang_registry,
@@ -1789,12 +1791,19 @@ fn dispatch_command(
 	let mut needs_render = false;
 	if let EditorCommand::WriteInit { force } = cmd {
 		session.ui.status_message = Some(
-			match system::write_init_file(
-				&session.persistent_settings,
-				session.git_refresh_seconds,
-				lang_registry,
-				force,
-			) {
+			match runtime
+				.init_script
+				.ok_or_else(|| "No init.rn is configured for this editor host".to_string())
+				.and_then(|path| {
+					system::write_init_file(
+						path,
+						runtime.init_entrypoint.unwrap_or("main"),
+						&session.persistent_settings,
+						session.git_refresh_seconds,
+						lang_registry,
+						force,
+					)
+				}) {
 				Ok(path) => format!("Wrote Rune configuration to {}", path.display()),
 				Err(error) => format!("Could not write init.rn: {error}"),
 			},
@@ -1803,7 +1812,17 @@ fn dispatch_command(
 	}
 	if let EditorCommand::WriteDefaultInit { force } = cmd {
 		session.ui.status_message = Some(
-			match system::write_default_init_file(lang_registry, force) {
+			match runtime
+				.init_script
+				.ok_or_else(|| "No init.rn is configured for this editor host".to_string())
+				.and_then(|path| {
+					system::write_default_init_file(
+						path,
+						runtime.init_entrypoint.unwrap_or("main"),
+						lang_registry,
+						force,
+					)
+				}) {
 				Ok(path) => format!("Reset Rune configuration to defaults at {}", path.display()),
 				Err(error) => format!("Could not reset init.rn: {error}"),
 			},
@@ -3274,6 +3293,9 @@ pub(crate) fn run_engine(engine: Engine) {
 	let configured_init_path = rune_host_config
 		.as_ref()
 		.map(|config| config.init_script().to_path_buf());
+	let configured_init_entrypoint = rune_host_config
+		.as_ref()
+		.map(|config| config.init_entrypoint().to_string());
 	let terminate = engine.terminate;
 	let mut dynamic_action_executor = engine.dynamic_action_executor;
 	let mut subscriber_dispatcher = engine.subscriber_dispatcher;
@@ -3290,6 +3312,7 @@ pub(crate) fn run_engine(engine: Engine) {
 		resolver: &resolver,
 		lang_registry: &lang_registry,
 		init_script: configured_init_path.as_deref(),
+		init_entrypoint: configured_init_entrypoint.as_deref(),
 	};
 	let services = Arc::new(Mutex::new(HostServices::default()));
 	let session = EditorSession::new(

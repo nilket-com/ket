@@ -2,7 +2,7 @@ use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
 };
-use crate::configuration::StartupData;
+use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 use crate::gui::{
@@ -233,8 +233,11 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		.unwrap_or_default();
 	let init_detail = init_error.map(|error| StatusDetail::new(init_summary.clone(), error));
 	let data_frame = DataFrame::default();
-	let mut code_editor =
-		initial_file.map_or_else(|| CodeEditor::new(""), CodeEditor::open_initial_file);
+	let init_script = configuration::default_init_path();
+	let mut code_editor = match initial_file {
+		Some(path) => CodeEditor::open_initial_file_with_init(path, init_script),
+		None => CodeEditor::new_with_init("", init_script),
+	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
 		dashboard: DashboardState::default(),

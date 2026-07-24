@@ -23,13 +23,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Settings and optional initial document used to start an engine instance.
 pub struct EngineConfig {
 	pub settings: EngineSettings,
 	pub initial_file: Option<String>,
 	/// Optional Rune startup script. Library embedders must opt in explicitly.
 	pub init_script: Option<PathBuf>,
+	/// Function within `init_script` that configures the editor host.
+	///
+	/// Embedders may share one Rune file with their own application
+	/// configuration by giving Libaryon a separate entrypoint.
+	pub init_entrypoint: String,
+}
+
+impl Default for EngineConfig {
+	fn default() -> Self {
+		Self::from(EngineSettings::default())
+	}
 }
 
 impl From<EngineSettings> for EngineConfig {
@@ -38,6 +49,7 @@ impl From<EngineSettings> for EngineConfig {
 			settings,
 			initial_file: None,
 			init_script: None,
+			init_entrypoint: "main".to_string(),
 		}
 	}
 }
@@ -106,32 +118,36 @@ impl EngineHandle {
 			settings,
 			initial_file,
 			init_script,
+			init_entrypoint,
 		} = config;
 		let initial_file = initial_file.map(|path| {
 			let expanded = expand_path(&path);
 			expanded.to_string_lossy().into_owned()
 		});
-		let engine = Engine::new(
-			registry,
-			resolver,
-			rx_request,
-			internal.clone(),
-			tx_view,
-			lang_registry,
-			settings.theme_name,
-			settings.minimap_enabled,
-			settings.wrap_enabled,
-			settings.line_numbers_enabled,
-			settings.relative_line_numbers_enabled,
-			settings.visible_whitespace,
-			settings.reload_enabled,
-			settings.save_durability,
-			settings.ui_colors,
-			settings.language_themes,
-		)
-		.with_initial_file(initial_file)
-		.with_host_events(tx_host_events)
-		.with_rune_host_config(init_script.map(super::rune_host::RuneHostConfig::new));
+		let engine =
+			Engine::new(
+				registry,
+				resolver,
+				rx_request,
+				internal.clone(),
+				tx_view,
+				lang_registry,
+				settings.theme_name,
+				settings.minimap_enabled,
+				settings.wrap_enabled,
+				settings.line_numbers_enabled,
+				settings.relative_line_numbers_enabled,
+				settings.visible_whitespace,
+				settings.reload_enabled,
+				settings.save_durability,
+				settings.ui_colors,
+				settings.language_themes,
+			)
+			.with_initial_file(initial_file)
+			.with_host_events(tx_host_events)
+			.with_rune_host_config(init_script.map(|path| {
+				super::rune_host::RuneHostConfig::with_entrypoint(path, init_entrypoint)
+			}));
 		let terminate = engine.termination_handle();
 		let engine_thread = thread::spawn(move || engine.run());
 
@@ -627,6 +643,111 @@ mod tests {
 			viewport.status_message.as_deref(),
 			Some("hello from init.rn")
 		);
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
+	fn embedder_can_select_an_editor_entrypoint_in_a_shared_init_script() {
+		let init = temp_path("shared-rune-init", "rn");
+		fs::write(
+			&init,
+			r#"pub fn main(config) {
+	config.window_size(1600, 900)?;
+}
+
+pub fn editor(editor) {
+	println!("editor entrypoint");
+	Ok(())
+}
+"#,
+		)
+		.expect("write shared Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			init_script: Some(init.clone()),
+			init_entrypoint: "editor".to_string(),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::Resize(80, 24))
+			.expect("render initialized engine");
+		let viewport = viewports
+			.recv_timeout(Duration::from_secs(10))
+			.expect("initialized viewport");
+		assert_eq!(
+			viewport.status_message.as_deref(),
+			Some("editor entrypoint")
+		);
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
+	fn absent_custom_entrypoint_is_a_clean_no_op() {
+		let init = temp_path("app-only-rune-init", "rn");
+		fs::write(
+			&init,
+			r#"pub fn main(config) {
+	config.window_size(1600, 900)?;
+}
+"#,
+		)
+		.expect("write application-only Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			init_script: Some(init.clone()),
+			init_entrypoint: "editor".to_string(),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::Resize(80, 24))
+			.expect("render initialized engine");
+		let viewport = viewports
+			.recv_timeout(Duration::from_secs(10))
+			.expect("initialized viewport");
+		assert_eq!(viewport.status_message, None);
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
+	fn init_reset_uses_the_embedder_path_and_preserves_other_entrypoints() {
+		let init = temp_path("embedded-init-reset", "rn");
+		let application = r#"pub fn main(config) {
+	config.window_size(1600, 900)?;
+}
+"#;
+		fs::write(
+			&init,
+			format!(
+				"{application}\npub fn editor(editor) {{\n\tlet config = editor.config();\n\tconfig.set(\"theme\", \"gruvbox\")?;\n\tOk(())\n}}\n"
+			),
+		)
+		.expect("write shared Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			init_script: Some(init.clone()),
+			init_entrypoint: "editor".to_string(),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::WriteDefaultInit { force: false })
+			.expect("reset embedded editor init");
+		recv_viewport_until(&viewports, "embedded init reset", |viewport| {
+			viewport.status_message.as_deref().is_some_and(|status| {
+				status.contains("Reset Rune configuration to defaults")
+					&& status.contains(init.to_string_lossy().as_ref())
+			})
+		});
+		let reset = fs::read_to_string(&init).expect("read reset shared init");
+		assert!(reset.contains(application));
+		assert!(reset.contains("pub fn editor(editor)"));
+		assert!(reset.contains("config.set(\"theme\", \"onedark\")?;"));
+		assert!(!reset.contains("gruvbox"));
 		handle.shutdown().expect("join engine");
 		let _ = fs::remove_file(init);
 	}

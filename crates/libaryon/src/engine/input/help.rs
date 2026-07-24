@@ -144,13 +144,7 @@ pub(super) fn resolve_topic(name: &str) -> Result<HelpTopic, String> {
 		return Ok(HelpTopic::General(spec));
 	}
 	let token = name.strip_prefix(':').unwrap_or(name);
-	if matches!(token, "initwrite" | "initw" | "initwrite!" | "initw!") {
-		let settings = GENERAL_HELP_TOPICS
-			.iter()
-			.find(|spec| spec.name == "set")
-			.expect("the settings help topic must be registered");
-		return Ok(HelpTopic::General(settings));
-	}
+	let token = token.strip_suffix('!').unwrap_or(token);
 	for spec in COMMANDS {
 		if token == spec.name || spec.aliases.contains(&token) {
 			return Ok(HelpTopic::Command(spec));
@@ -1005,7 +999,7 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 		push_line(
 			&mut out,
 			"`:set OPTION [VALUE]` changes an option for this session. Put startup \
-			 configuration in `init.rn`; `:set initwrite` (or `:set initw`) atomically \
+			 configuration in `init.rn`; `:set init` atomically \
 			 updates its parsed `config.*` settings while preserving other code. \
 			 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 			 prefixing the option with `no` turns it off, e.g. `:set nowrap`. \
@@ -1015,7 +1009,7 @@ fn markdown_set_with_runtime(runtime_options: &[EffectiveOptionInfo]) -> String 
 		push_line(
 			&mut out,
 			"`:set OPTION [VALUE]` changes a named option for this session. Builtin and \
-			 extension startup configuration belongs in `init.rn`; `:set initwrite` updates \
+			 extension startup configuration belongs in `init.rn`; `:set init` updates \
 			 its parsed builtin settings while preserving other code. \
 			 Boolean VALUE is on or off (also true/false, yes/no); omitting VALUE means \
 			 on, and prefixing the option with `no` turns it off.",
@@ -1363,8 +1357,8 @@ fn render_set() -> String {
 	push_line(&mut out, "");
 	push_wrapped(
 		&mut out,
-		"':set OPTION [VALUE]' changes an option for this session. Use ':set initwrite' (or \
-		 ':set initw') to atomically update parsed builtin settings in init.rn while preserving other startup code. \
+		"':set OPTION [VALUE]' changes an option for this session. Use ':set init' to \
+		 atomically update parsed builtin settings in init.rn while preserving other startup code. \
 		 VALUE is on or off (also true/false, yes/no); omitting VALUE means on, and \
 		 prefixing the option with 'no' turns it off, e.g. ':set nowrap'.",
 	);
@@ -1630,15 +1624,15 @@ mod tests {
 	}
 
 	#[test]
-	fn initwrite_help_aliases_resolve_to_settings() {
-		for name in ["initwrite", "initw", "initwrite!", "initw!"] {
-			let HelpTopic::General(spec) = topic(name) else {
-				panic!("{name} should resolve to the settings help page");
+	fn init_help_resolves_to_the_init_command() {
+		for name in ["init", "init!"] {
+			let HelpTopic::Command(spec) = topic(name) else {
+				panic!("{name} should resolve to the init command");
 			};
-			assert_eq!(spec.name, "set");
+			assert_eq!(spec.name, "init");
 		}
-		let rendered = render_markdown(&topic("initw"));
-		assert!(rendered.contains(":set initwrite"));
+		let rendered = render_markdown(&topic("init"));
+		assert!(rendered.contains(":init"));
 	}
 
 	#[test]

@@ -23,8 +23,8 @@ cargo deb -p polariton --install
 
 #### Configuration:
 
-Polariton reads user-authored configuration from `init.rn` and never rewrites
-it. On Linux, the default path is `~/.config/polariton/init.rn` (or
+Polariton reads user-authored configuration from `init.rn`. On Linux, the
+default path is `~/.config/polariton/init.rn` (or
 `$XDG_CONFIG_HOME/polariton/init.rn`). macOS and Windows use their standard
 application configuration directories.
 
@@ -38,10 +38,14 @@ pub fn main(config) {
 }
 ```
 
+Libaryon's editor settings live in a separate `editor` function in the same
+file. Persistent `:set` commands update only this function; Polariton's
+application-owned `main` function and all other Rune code are preserved.
+`:set init` or `:init` writes a full snapshot of the current editor settings,
+while `:init0` restores the editor defaults.
+
 Missing configuration is a clean no-op. A broken script is reported in the
-status bar while Polariton still opens with compiled defaults. Settings changed
-through the UI last only for the current session; durable preferences belong in
-`init.rn`.
+status bar while Polariton still opens with compiled defaults.
 
 #### Adapters:
  - SQLite (file or memory)
