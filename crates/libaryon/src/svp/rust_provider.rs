@@ -145,6 +145,15 @@ impl ProviderState {
 	}
 }
 
+/// Name a fallback file inside the provider's virtual root. The caller's path is
+/// whatever the document carries — a relative path, or a synthesized name like
+/// `embedded.rs` for a fenced code block — and `new_virtual_path` panics on
+/// anything that does not start with `/`. Identity for the fallback cache lives
+/// in the `single_files` key, so this only has to be stable, not round-trippable.
+fn single_file_vfs_path(file_path: &str) -> VfsPath {
+	VfsPath::new_virtual_path(format!("/baryon/{}", file_path.trim_start_matches('/')))
+}
+
 fn canonical_path(file_path: &str) -> Option<AbsPathBuf> {
 	let canonical = PathBuf::from(file_path).canonicalize().ok()?;
 	let utf8 = Utf8PathBuf::try_from(canonical).ok()?;
@@ -302,7 +311,7 @@ impl LanguageProvider for RustProvider {
 			.or_insert_with(|| {
 				let (host, file_id) = init_single_file(content);
 				let mut file_ids = HashMap::new();
-				file_ids.insert(VfsPath::new_virtual_path(file_path.into()), file_id);
+				file_ids.insert(single_file_vfs_path(file_path), file_id);
 				WorkspaceState {
 					host,
 					file_ids,
@@ -984,6 +993,58 @@ mod tests {
 			DiagnosticCollectionMode::SyntaxOnly
 		);
 		assert!(state.workspaces.is_empty());
+	}
+
+	/// A fenced ```rust block in Markdown reaches this provider under the
+	/// synthesized name `embedded.rs`, which never resolves to a workspace file.
+	#[test]
+	fn an_embedded_fragment_name_highlights_instead_of_panicking() {
+		let provider = RustProvider::new();
+
+		let output = provider.semantic_reactor(
+			Arc::new("fn fenced() -> u32 { 7 }\n".to_owned()),
+			DocByte::ZERO,
+			"embedded.rs",
+		);
+
+		assert!(!output.highlights.is_empty());
+	}
+
+	/// A relative path names a real file, so it may canonicalize, but nothing
+	/// guarantees a cargo workspace around it; the fallback still sees the
+	/// relative string.
+	#[test]
+	fn a_relative_path_outside_a_workspace_highlights_instead_of_panicking() {
+		let provider = RustProvider::new();
+
+		let output = provider.semantic_reactor(
+			Arc::new("fn loose() -> u32 { 7 }\n".to_owned()),
+			DocByte::ZERO,
+			"scratch/loose.rs",
+		);
+
+		assert!(!output.highlights.is_empty());
+	}
+
+	/// Two fallback documents must not collapse into one cache entry just
+	/// because their virtual paths share a root.
+	#[test]
+	fn fallback_documents_keep_separate_hosts() {
+		let provider = RustProvider::new();
+
+		provider.semantic_reactor(
+			Arc::new("fn first() {}\n".to_owned()),
+			DocByte::ZERO,
+			"embedded.rs",
+		);
+		provider.semantic_reactor(
+			Arc::new("fn second() {}\n".to_owned()),
+			DocByte::ZERO,
+			"scratch/loose.rs",
+		);
+
+		let state = provider.state.lock().expect("provider state");
+		assert_eq!(state.single_files.len(), 2);
 	}
 
 	#[test]
