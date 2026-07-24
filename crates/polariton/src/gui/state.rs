@@ -175,12 +175,13 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 	}
 }
 
-pub fn run(startup_data: StartupData) -> Result {
+pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
 	let size = startup_data
 		.window_size
 		.map(|(w, h)| Size::new(w, h))
 		.unwrap_or(Size::new(1920.0, 1080.0));
-	application(move || new(startup_data.clone()), update, view)
+	let initialize = move || new(startup_data.clone(), initial_file.clone());
+	application(initialize, update, view)
 		.subscription(subscription)
 		.theme(components::theme())
 		.title("Polariton")
@@ -198,13 +199,14 @@ pub fn run(startup_data: StartupData) -> Result {
 		.run()
 }
 
-fn new(startup_data: StartupData) -> (AppState, Task<Message>) {
+fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Task<Message>) {
 	let window_size = startup_data
 		.window_size
 		.map(|(width, height)| Size::new(width, height))
 		.unwrap_or(Size::new(1920.0, 1080.0));
 	let data_frame = DataFrame::default();
-	let mut code_editor = CodeEditor::new("");
+	let mut code_editor =
+		initial_file.map_or_else(|| CodeEditor::new(""), CodeEditor::open_initial_file);
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
 		dashboard: DashboardState::default(),

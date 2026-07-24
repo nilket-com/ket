@@ -325,7 +325,24 @@ struct PaneDrag {
 
 impl CodeEditor {
 	pub fn new(text: &str) -> Self {
-		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		Self::spawn(EngineConfig::default(), Some(text))
+	}
+
+	/// Start directly on a real file. Unlike [`Self::new`], this leaves
+	/// Libaryon's startup document intact so it retains path identity,
+	/// language detection, reload, save, and recovery behavior.
+	pub fn open_initial_file(path: String) -> Self {
+		Self::spawn(
+			EngineConfig {
+				initial_file: Some(path),
+				..EngineConfig::default()
+			},
+			None,
+		)
+	}
+
+	fn spawn(config: EngineConfig, replacement: Option<&str>) -> Self {
+		let mut engine = EngineHandle::spawn(config);
 		let commands = engine.command_sender();
 		let input = engine.input_sender();
 		let viewports = engine
@@ -390,14 +407,16 @@ impl CodeEditor {
 			notebook_cell_data: HashMap::new(),
 		};
 		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
-		editor.send(EditorCommand::ReplaceDocument {
-			text: text.to_owned(),
-			language: Some("sql".to_owned()),
-			// File-path-shaped identity so libaryon's language services
-			// (semantic highlighting, diagnostics) run for this unsaved
-			// in-memory document.
-			virtual_path: Some("statement.sql".to_owned()),
-		});
+		if let Some(text) = replacement {
+			editor.send(EditorCommand::ReplaceDocument {
+				text: text.to_owned(),
+				language: Some("sql".to_owned()),
+				// File-path-shaped identity so libaryon's language services
+				// (semantic highlighting, diagnostics) run for this unsaved
+				// in-memory document.
+				virtual_path: Some("statement.sql".to_owned()),
+			});
+		}
 		editor.request_content();
 		editor
 	}
@@ -4588,6 +4607,44 @@ mod tests {
 		wait_for_content(&mut editor, "select 1;");
 		editor.replace_content("select 2;");
 		wait_for_content(&mut editor, "select 2;");
+	}
+
+	#[test]
+	fn initial_file_keeps_real_path_content_and_detected_language() {
+		let path = std::env::temp_dir().join(format!(
+			"polariton-initial-file-{}-{}.rs",
+			std::process::id(),
+			std::thread::current().name().unwrap_or("test")
+		));
+		let source = "pub fn opened_from_cli() -> bool { true }\n";
+		std::fs::write(&path, source).expect("write initial file fixture");
+
+		let mut editor = CodeEditor::open_initial_file(path.to_string_lossy().into_owned());
+		wait_for_content(&mut editor, source);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.active_language_id().map(LanguageId::as_str) != Some("rust")
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.cached_content(), source);
+		assert_eq!(
+			editor.active_language_id().map(LanguageId::as_str),
+			Some("rust")
+		);
+		let pane = editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.expect("focused initial-file pane");
+		assert_eq!(
+			pane.file_name.as_deref(),
+			Some(path.to_string_lossy().as_ref())
+		);
+
+		editor.shutdown();
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
