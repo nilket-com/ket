@@ -65,6 +65,12 @@ fn load_from_path(path: &Path) -> StartupData {
 			return startup;
 		}
 	};
+	// A shared init.rn may hold only the engine's `editor` entrypoint — the
+	// shape `:set init` persists. Application config is then a clean no-op,
+	// matching how the engine treats an absent `editor` function.
+	if source_defines_main(&source) == Some(false) {
+		return startup;
+	}
 	let shared = Arc::new(Mutex::new(startup));
 	let result = execute_init(path, source, shared.clone());
 	let mut startup = shared
@@ -98,6 +104,20 @@ fn read_source(path: &Path) -> Result<Option<String>, String> {
 	String::from_utf8(bytes)
 		.map(Some)
 		.map_err(|_| format!("{} is not valid UTF-8", path.display()))
+}
+
+/// Whether the script's items include `pub fn main`. `None` means the source
+/// does not parse; compilation proceeds so the real diagnostic is reported.
+fn source_defines_main(source: &str) -> Option<bool> {
+	let file =
+		rune::parse::parse_all::<rune::ast::File>(source, rune::SourceId::EMPTY, false).ok()?;
+	Some(file.items.iter().any(|(item, _)| {
+		let rune::ast::Item::Fn(function) = item else {
+			return false;
+		};
+		let range = function.name.span.start.into_usize()..function.name.span.end.into_usize();
+		source.get(range) == Some("main")
+	}))
 }
 
 fn execute_init(
@@ -345,6 +365,27 @@ pub fn editor(editor) {
 		let startup = load_from_path(&path);
 		assert_eq!(startup.window_size, (1440.0, 900.0));
 		assert!(startup.show_column_types);
+		assert_eq!(startup.init_error, None);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn editor_only_init_is_a_clean_no_op() {
+		let path = temp_path("editor-only-init");
+		std::fs::write(
+			&path,
+			r#"
+pub fn editor(editor) {
+    let config = editor.config();
+    config.set("theme", "onedark")?;
+    Ok(())
+}
+"#,
+		)
+		.expect("write editor-only init");
+
+		let startup = load_from_path(&path);
+		assert_eq!(startup, StartupData::default());
 		assert_eq!(startup.init_error, None);
 		let _ = std::fs::remove_file(path);
 	}
