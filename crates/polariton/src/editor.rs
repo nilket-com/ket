@@ -66,7 +66,6 @@ mod metrics {
 	pub const CELL_WIDTH: f32 = 9.6;
 	pub const LINE_HEIGHT: f32 = 22.0;
 	pub const GUTTER_WIDTH: f32 = 54.0;
-	pub const VERTICAL_PADDING: f32 = 8.0;
 }
 
 #[derive(Clone)]
@@ -1287,8 +1286,7 @@ impl CodeEditor {
 		}
 		let local_y = pointer.y - pane_top - PANE_HEADER_HEIGHT;
 		let local_x = pointer.x - pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH;
-		let row = ((local_y - metrics::VERTICAL_PADDING).max(0.0) / metrics::LINE_HEIGHT).floor()
-			as usize;
+		let row = (local_y.max(0.0) / metrics::LINE_HEIGHT).floor() as usize;
 		// `visible_rows` is `render_rows` minus the wrapped rows scrolled off
 		// above the viewport, matching what `view` actually laid out.
 		let Some(visible_row) = pane.visible_rows.get(row) else {
@@ -1331,15 +1329,24 @@ struct StyledFragment {
 	underline: bool,
 }
 
+/// Match Baryon's deliberately theme-independent whitespace ink. Whitespace
+/// must remain visible even when a syntax theme maps its whitespace token to
+/// the editor background.
+const VISIBLE_WHITESPACE_COLOR: Rgb = Rgb::new(76, 86, 106);
+
 fn project_lines(
 	pane: &libaryon::uast::projection::PaneViewport,
 	default_foreground: Rgb,
 	cursor_color: Rgb,
 	show_cursor: bool,
 ) -> Vec<ProjectedLine> {
+	use libaryon::core::TAB_SIZE;
+
 	let mut lines = Vec::new();
 	let mut current: Option<ProjectedLine> = None;
 	let mut cursor_rendered = false;
+	let mut display_column = 0u32;
+	let mut line_has_content = false;
 	for token in &pane.tokens {
 		if token.text.is_empty() {
 			continue;
@@ -1360,20 +1367,8 @@ fn project_lines(
 		}
 		let mut byte = token.absolute_start_byte.get();
 		let mut line_number = token_line;
-		for ch in String::from_utf8_lossy(&token.text).chars() {
-			if ch == '\n' {
-				if let Some(line) = current.take() {
-					lines.push(line);
-				}
-				line_number = line_number.saturating_add(1);
-				current = Some(ProjectedLine {
-					doc_line: line_number,
-					fragments: Vec::new(),
-					show_gutter: true,
-				});
-				byte = byte.saturating_add(1);
-				continue;
-			}
+		let token_text = String::from_utf8_lossy(&token.text);
+		for (offset, ch) in token_text.char_indices() {
 			let byte_len = ch.len_utf8() as u64;
 			let foreground = pane
 				.highlights
@@ -1396,9 +1391,7 @@ fn project_lines(
 				diagnostic.start.get() < byte.saturating_add(byte_len)
 					&& diagnostic.end.get() > byte
 			});
-			let background = if cursor {
-				Some(color(cursor_color))
-			} else if selected {
+			let content_background = if selected {
 				Some(Color::from_rgb8(55, 78, 104))
 			} else if token.is_folded {
 				Some(Color {
@@ -1408,13 +1401,106 @@ fn project_lines(
 			} else {
 				None
 			};
-			push_fragment(
-				current.as_mut().expect("line initialized"),
-				ch.to_string(),
-				color(foreground),
-				background,
-				underline,
-			);
+			let background = if cursor {
+				Some(color(cursor_color))
+			} else {
+				content_background
+			};
+			if ch == '\n' {
+				if pane.visible_whitespace {
+					push_fragment(
+						current.as_mut().expect("line initialized"),
+						"¬".to_owned(),
+						color(VISIBLE_WHITESPACE_COLOR),
+						background,
+						underline,
+					);
+				}
+				if let Some(line) = current.take() {
+					lines.push(line);
+				}
+				line_number = line_number.saturating_add(1);
+				current = Some(ProjectedLine {
+					doc_line: line_number,
+					fragments: Vec::new(),
+					show_gutter: true,
+				});
+				byte = byte.saturating_add(1);
+				display_column = 0;
+				line_has_content = false;
+				continue;
+			}
+
+			let trailing = line_has_content
+				&& token_text[offset + ch.len_utf8()..]
+					.split_once('\n')
+					.is_some_and(|(rest, _)| {
+						rest.chars()
+							.all(|character| matches!(character, ' ' | '\t'))
+					});
+			let (text, foreground) = match ch {
+				'\t' => {
+					let width = TAB_SIZE - (display_column % TAB_SIZE);
+					let head = if pane.visible_whitespace {
+						if trailing { '~' } else { '▸' }
+					} else {
+						' '
+					};
+					let mut text = String::with_capacity(width as usize);
+					text.push(head);
+					text.extend(std::iter::repeat_n(' ', width.saturating_sub(1) as usize));
+					(
+						text,
+						if pane.visible_whitespace {
+							VISIBLE_WHITESPACE_COLOR
+						} else {
+							foreground
+						},
+					)
+				}
+				' ' if pane.visible_whitespace => (
+					if trailing { "~" } else { "␣" }.to_owned(),
+					VISIBLE_WHITESPACE_COLOR,
+				),
+				'\u{00a0}' if pane.visible_whitespace => ("⍽".to_owned(), VISIBLE_WHITESPACE_COLOR),
+				character if pane.visible_whitespace && character.is_whitespace() => {
+					("␣".to_owned(), VISIBLE_WHITESPACE_COLOR)
+				}
+				_ => (ch.to_string(), foreground),
+			};
+			if !ch.is_whitespace() {
+				line_has_content = true;
+			}
+			let line = current.as_mut().expect("line initialized");
+			if cursor && ch == '\t' {
+				let first_end = text
+					.char_indices()
+					.nth(1)
+					.map_or(text.len(), |(offset, _)| offset);
+				push_fragment(
+					line,
+					text[..first_end].to_owned(),
+					color(foreground),
+					background,
+					underline,
+				);
+				if first_end < text.len() {
+					push_fragment(
+						line,
+						text[first_end..].to_owned(),
+						color(foreground),
+						content_background,
+						underline,
+					);
+				}
+			} else {
+				push_fragment(line, text, color(foreground), background, underline);
+			}
+			display_column = if ch == '\t' {
+				display_column.saturating_add(TAB_SIZE - (display_column % TAB_SIZE))
+			} else {
+				display_column.saturating_add(1)
+			};
 			byte = byte.saturating_add(byte_len);
 		}
 	}
@@ -1916,8 +2002,7 @@ fn pane_surface<'a>(
 	palette: UiPalette,
 	content: Element<'a, EditorMsg>,
 ) -> Element<'a, EditorMsg> {
-	let content = pane_content_frame(content, focused, palette);
-	container(
+	let surface: Element<'a, EditorMsg> = container(
 		column![pane_tab_bar(pane, focused, palette), content,]
 			.width(Length::Fill)
 			.height(Length::Fill),
@@ -1932,7 +2017,8 @@ fn pane_surface<'a>(
 		},
 		..Default::default()
 	})
-	.into()
+	.into();
+	pane_focus_frame(surface, focused, palette)
 }
 
 const FOCUSED_PANE_BORDER_WIDTH: f32 = 1.0;
@@ -1945,19 +2031,19 @@ fn focused_pane_border(palette: UiPalette) -> iced::Border {
 	}
 }
 
-/// Paint focus after the pane body so opaque gutter, editor, table, and
-/// minimap surfaces cannot clip it. The overlay intentionally consumes the
-/// outermost content pixel instead of changing engine-authored pane geometry.
-fn pane_content_frame<'a>(
-	content: Element<'a, EditorMsg>,
+/// Paint focus over the complete pane, after its header and body. Keeping the
+/// overlay at this fixed-size boundary prevents a shrink-sized editor body
+/// from placing its bottom edge through the final rendered text row.
+fn pane_focus_frame<'a>(
+	pane: Element<'a, EditorMsg>,
 	focused: bool,
 	palette: UiPalette,
 ) -> Element<'a, EditorMsg> {
 	if !focused {
-		return content;
+		return pane;
 	}
 	stack![
-		content,
+		pane,
 		container(Space::new())
 			.width(Length::Fill)
 			.height(Length::Fill)
@@ -2113,20 +2199,15 @@ fn text_pane_surface<'a>(
 	// content — which is precisely the horizontal-divider grab band. The outer
 	// wrapper, anchored at the editor origin, owns pointer tracking; this pane
 	// mouse_area only claims clicks and scrolls over its own content.
-	let editor_rows = mouse_area(
-		container(rows)
-			.padding([metrics::VERTICAL_PADDING, 0.0])
-			.width(Length::Fill)
-			.height(Length::Fill),
-	)
-	.on_press(EditorMsg::Click)
-	.on_scroll(|delta| {
-		let lines = match delta {
-			mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
-			mouse::ScrollDelta::Pixels { y, .. } => (y / metrics::LINE_HEIGHT).round() as i32,
-		};
-		EditorMsg::Scroll(-lines)
-	});
+	let editor_rows = mouse_area(container(rows).width(Length::Fill).height(Length::Fill))
+		.on_press(EditorMsg::Click)
+		.on_scroll(|delta| {
+			let lines = match delta {
+				mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round() as i32,
+				mouse::ScrollDelta::Pixels { y, .. } => (y / metrics::LINE_HEIGHT).round() as i32,
+			};
+			EditorMsg::Scroll(-lines)
+		});
 	let editor_content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
 		row![
 			editor_rows,
@@ -4393,6 +4474,73 @@ mod tests {
 	}
 
 	#[test]
+	fn viz_and_noviz_project_distinct_whitespace_without_changing_text() {
+		let source = "\tlet value = 1; \t\n\u{00a0}";
+		let mut editor = CodeEditor::new(source);
+		wait_for_content(&mut editor, source);
+
+		editor.send(EditorCommand::SetVisibleWhitespace(false));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.status_message() != Some("Whitespace hidden") && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.status_message(), Some("Whitespace hidden"));
+		let hidden = rendered_lines(&editor);
+		assert!(hidden[0].starts_with("    let value = 1;"));
+		assert!(
+			hidden
+				.iter()
+				.all(|line| !line.contains(['▸', '␣', '~', '¬', '⍽']))
+		);
+
+		editor.send(EditorCommand::SetVisibleWhitespace(true));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.status_message() != Some("Whitespace visible") && Instant::now() < deadline {
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(editor.status_message(), Some("Whitespace visible"));
+		let visible = rendered_lines(&editor);
+		assert!(
+			visible[0].starts_with("▸   let␣value␣=␣1;"),
+			"leading tabs and interior spaces should be distinct: {visible:?}"
+		);
+		assert!(
+			visible[0].contains('~'),
+			"trailing spaces and tabs should be unmistakable: {visible:?}"
+		);
+		assert!(visible[0].ends_with('¬'), "line endings should be visible");
+		assert!(
+			visible[1].contains('⍽'),
+			"NBSP must not masquerade as an ordinary space"
+		);
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		let pane = viewport.focused_pane().expect("focused pane");
+		let cursor_color = super::color(viewport.ui_palette.accent);
+		let cursor_cells = super::project_lines(
+			pane,
+			viewport.ui_palette.editor_text,
+			viewport.ui_palette.accent,
+			true,
+		)
+		.iter()
+		.flat_map(|line| &line.fragments)
+		.filter(|fragment| fragment.background == Some(cursor_color))
+		.map(|fragment| fragment.text.chars().count())
+		.sum::<usize>();
+		assert_eq!(
+			cursor_cells, 1,
+			"a tab keeps its visual width but the cursor paints one cell"
+		);
+		assert_eq!(
+			editor.cached_content(),
+			source,
+			"projection is display-only"
+		);
+	}
+
+	#[test]
 	fn typed_text_survives_the_full_render_pipeline() {
 		let mut editor = CodeEditor::new("");
 		wait_for_content(&mut editor, "");
@@ -4609,7 +4757,7 @@ mod tests {
 		wait_for_content(&mut editor, "select 1;\nselect 2;\nselect 3;");
 		let _ = editor.update(EditorMsg::PointerMoved(Point::new(
 			54.0 + 9.6 * 3.0,
-			PANE_HEADER_HEIGHT + 8.0 + 22.0,
+			PANE_HEADER_HEIGHT + 22.0,
 		)));
 		let _ = editor.update(EditorMsg::Click);
 		let deadline = Instant::now() + Duration::from_secs(10);
