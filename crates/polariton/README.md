@@ -19,6 +19,29 @@ cargo deb -p polariton --install
  - Generic SQL syntax highlighting.
  - Supports both DDL and DML.
  - Resizable & Rearrangeable ui panels.
+ - Rune-only startup configuration.
+
+#### Configuration:
+
+Polariton reads user-authored configuration from `init.rn` and never rewrites
+it. On Linux, the default path is `~/.config/polariton/init.rn` (or
+`$XDG_CONFIG_HOME/polariton/init.rn`). macOS and Windows use their standard
+application configuration directories.
+
+```rune
+pub fn main(config) {
+    config.window_size(
+        1920,
+        1080,
+    )?;
+    config.show_column_types(true)?;
+}
+```
+
+Missing configuration is a clean no-op. A broken script is reported in the
+status bar while Polariton still opens with compiled defaults. Settings changed
+through the UI last only for the current session; durable preferences belong in
+`init.rn`.
 
 #### Adapters:
  - SQLite (file or memory)
@@ -32,7 +55,6 @@ cargo deb -p polariton --install
  - Shift+Enter to run code
  - Tab/Shift+Tab gui navigation
  - Improved status bar
- - Encrypted persistent settings (window size, adapter configurations)
  - Column type labels
  - Sort / Filter by column
  - Run selected code, not the entire code editor.

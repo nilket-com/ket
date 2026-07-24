@@ -2,6 +2,7 @@ use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
 };
+use crate::configuration::StartupData;
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 use crate::gui::{
@@ -11,7 +12,6 @@ use crate::gui::{
 	messages::{ExportFormat, Message},
 	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
-use crate::persistence::{self, StartupData};
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
@@ -204,10 +204,7 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 }
 
 pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
-	let size = startup_data
-		.window_size
-		.map(|(w, h)| Size::new(w, h))
-		.unwrap_or(Size::new(1920.0, 1080.0));
+	let size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
 	let initialize = move || new(startup_data.clone(), initial_file.clone());
 	application(initialize, update, view)
 		.subscription(subscription)
@@ -228,10 +225,13 @@ pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
 }
 
 fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Task<Message>) {
-	let window_size = startup_data
-		.window_size
-		.map(|(width, height)| Size::new(width, height))
-		.unwrap_or(Size::new(1920.0, 1080.0));
+	let window_size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
+	let init_error = startup_data.init_error.clone();
+	let init_summary = init_error
+		.as_ref()
+		.map(|_| "init.rn · configuration failed".to_owned())
+		.unwrap_or_default();
+	let init_detail = init_error.map(|error| StatusDetail::new(init_summary.clone(), error));
 	let data_frame = DataFrame::default();
 	let mut code_editor =
 		initial_file.map_or_else(|| CodeEditor::new(""), CodeEditor::open_initial_file);
@@ -242,10 +242,10 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		code_editor,
 		data_frame,
 		status_msg: "".to_string(),
-		status_error: "".to_string(),
+		status_error: init_summary,
 		status_df_size: None,
 		status_time_elapsed: None,
-		status_detail: None,
+		status_detail: init_detail,
 		status_detail_open: false,
 		adapter_state: AdapterState::default(),
 		code_started: Instant::now(),
@@ -684,16 +684,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 		}
 		Message::CloseWindow => {
-			return window::latest()
-				.and_then(|id| window::size(id).map(Message::SaveWindowSizeAndClose));
-		}
-		Message::SaveWindowSizeAndClose(size) => {
-			return Task::perform(
-				async move { persistence::save_window_size(size.width, size.height).await },
-				|()| Message::DoCloseWindow,
-			);
-		}
-		Message::DoCloseWindow => {
 			return window::latest().and_then(window::close);
 		}
 		Message::Menu(menu_message) => {
@@ -1179,12 +1169,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::ToggleShowColumnTypes(val) => {
 			app_state.show_column_types = val;
 			app_state.code_editor.set_show_column_types(val);
-			return Task::perform(
-				async move { persistence::save_show_column_types(val).await },
-				|()| Message::ShowColumnTypesSaved,
+			app_state.status_msg = format!(
+				"Settings · column types {} for this session",
+				if val { "shown" } else { "hidden" },
 			);
 		}
-		Message::ShowColumnTypesSaved => {}
 	}
 	Task::none()
 }
@@ -1335,8 +1324,8 @@ mod tests {
 		update,
 	};
 	use crate::adapters::common::ExecutionResult;
+	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
-	use crate::persistence::StartupData;
 
 	#[test]
 	fn fenced_sql_diagnostics_report_document_coordinates() {
@@ -1349,6 +1338,26 @@ mod tests {
 		);
 		assert!(full.starts_with(&summary));
 		assert!(full.contains(raw));
+	}
+
+	#[test]
+	fn rune_configuration_failure_is_projected_without_blocking_startup() {
+		let startup_data = StartupData {
+			init_error: Some("init.rn compile error: broken fixture".to_owned()),
+			..StartupData::default()
+		};
+		let (mut state, startup) = new(startup_data, None);
+		drop(startup);
+
+		assert_eq!(state.status_error, "init.rn · configuration failed");
+		assert_eq!(
+			state
+				.status_detail
+				.as_ref()
+				.map(|detail| detail.full.as_str()),
+			Some("init.rn compile error: broken fixture"),
+		);
+		state.code_editor.shutdown();
 	}
 
 	#[test]

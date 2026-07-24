@@ -1,9 +1,9 @@
 mod adapters;
+mod configuration;
 mod core;
 mod editor;
 mod fonts;
 mod gui;
-mod persistence;
 mod plot;
 mod result_registry;
 mod rune_host;
@@ -11,9 +11,7 @@ mod rune_host;
 fn main() -> gui::Result {
 	let _ = rustls::crypto::ring::default_provider().install_default();
 	let initial_file = initial_file_from_args(std::env::args());
-	let startup_data = tokio::runtime::Runtime::new()
-		.map(|rt| rt.block_on(persistence::load_startup_data()))
-		.unwrap_or_default();
+	let startup_data = configuration::load_startup_data();
 	gui::run(startup_data, initial_file)
 }
 
