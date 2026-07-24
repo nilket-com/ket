@@ -1,8 +1,10 @@
 use super::protocol::SearchMatch;
-use crate::core::{DocByte, DocLine, DocLineCount, TAB_SIZE, TokenBin};
+use crate::core::{BufferId, DocByte, DocLine, DocLineCount, StateId, TAB_SIZE, TokenBin};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::language::LanguageProvider;
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub(super) const MAX_PREVIEW_MINIMAP_BYTES: u64 = 2 * 1024 * 1024;
@@ -78,17 +80,100 @@ pub struct PreviewRow {
 	pub bins: Box<[TokenBin]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewSnapshot {
-	pub overlay: MinimapOverlay,
+/// Identity of the immutable minimap ink for one document revision.
+///
+/// Buffer identity prevents equal per-buffer state counters from colliding
+/// when a pane switches tabs. Semantic revision makes language-server token
+/// arrival rebuild and recolor the payload without requiring a text edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MinimapContentRevision {
+	pub buffer_id: BufferId,
+	pub state_id: StateId,
+	pub semantic_revision: u64,
+}
+
+impl MinimapContentRevision {
+	pub const ZERO: Self = Self {
+		buffer_id: BufferId::ZERO,
+		state_id: StateId::ZERO,
+		semantic_revision: 0,
+	};
+
+	pub const fn new(buffer_id: BufferId, state_id: StateId, semantic_revision: u64) -> Self {
+		Self {
+			buffer_id,
+			state_id,
+			semantic_revision,
+		}
+	}
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreviewContent {
+	pub revision: MinimapContentRevision,
 	pub max_columns: u16,
 	pub rows: Vec<PreviewRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSnapshot {
+	pub overlay: MinimapOverlay,
+	pub content: Arc<PreviewContent>,
+}
+
+impl PreviewSnapshot {
+	pub fn new(
+		overlay: MinimapOverlay,
+		revision: MinimapContentRevision,
+		max_columns: u16,
+		rows: Vec<PreviewRow>,
+	) -> Self {
+		Self {
+			overlay,
+			content: Arc::new(PreviewContent {
+				revision,
+				max_columns,
+				rows,
+			}),
+		}
+	}
+}
+
+impl Deref for PreviewSnapshot {
+	type Target = PreviewContent;
+
+	fn deref(&self) -> &Self::Target {
+		&self.content
+	}
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OverviewContent {
+	pub revision: MinimapContentRevision,
+	pub bands: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewSnapshot {
 	pub overlay: MinimapOverlay,
-	pub bands: Vec<u8>,
+	pub content: Arc<OverviewContent>,
+}
+
+impl OverviewSnapshot {
+	pub fn new(overlay: MinimapOverlay, revision: MinimapContentRevision, bands: Vec<u8>) -> Self {
+		Self {
+			overlay,
+			content: Arc::new(OverviewContent { revision, bands }),
+		}
+	}
+}
+
+impl Deref for OverviewSnapshot {
+	type Target = OverviewContent;
+
+	fn deref(&self) -> &Self::Target {
+		&self.content
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +195,13 @@ impl MinimapSnapshot {
 		match self {
 			Self::Preview(snapshot) => &mut snapshot.overlay,
 			Self::Overview(snapshot) | Self::ByteFallback(snapshot) => &mut snapshot.overlay,
+		}
+	}
+
+	pub fn revision(&self) -> MinimapContentRevision {
+		match self {
+			Self::Preview(snapshot) => snapshot.revision,
+			Self::Overview(snapshot) | Self::ByteFallback(snapshot) => snapshot.revision,
 		}
 	}
 }
@@ -221,6 +313,7 @@ pub(super) fn build_text_minimap_snapshot(
 	semantic_highlights: &[HighlightSpan],
 	mut overlay: MinimapOverlay,
 	provider: Option<&dyn LanguageProvider>,
+	revision: MinimapContentRevision,
 ) -> MinimapSnapshot {
 	let doc_line_count = DocLineCount::new(
 		u64::try_from(memchr::memchr_iter(b'\n', bytes).count())
@@ -237,9 +330,10 @@ pub(super) fn build_text_minimap_snapshot(
 			semantic_highlights,
 			overlay,
 			provider,
+			revision,
 		))
 	} else {
-		MinimapSnapshot::Overview(build_overview_snapshot(bytes, overlay))
+		MinimapSnapshot::Overview(build_overview_snapshot(bytes, overlay, revision))
 	}
 }
 
@@ -247,6 +341,7 @@ pub(super) fn build_byte_fallback_minimap_snapshot(
 	registry: &UastRegistry,
 	root: NodeId,
 	mut overlay: MinimapOverlay,
+	revision: MinimapContentRevision,
 ) -> MinimapSnapshot {
 	let file_size = registry.get_total_bytes(root).max(1);
 	let doc_line_count = DocLineCount::new(registry.get_total_newlines(root).saturating_add(1));
@@ -260,7 +355,7 @@ pub(super) fn build_byte_fallback_minimap_snapshot(
 	}
 
 	overlay.doc_line_count = doc_line_count;
-	MinimapSnapshot::ByteFallback(OverviewSnapshot { overlay, bands })
+	MinimapSnapshot::ByteFallback(OverviewSnapshot::new(overlay, revision, bands))
 }
 
 pub(crate) fn build_search_minimap_bands(
@@ -305,7 +400,11 @@ fn normalize_line_density(byte_len: usize) -> u8 {
 	((capped * 255) / 160) as u8
 }
 
-fn build_overview_snapshot(bytes: &[u8], overlay: MinimapOverlay) -> OverviewSnapshot {
+fn build_overview_snapshot(
+	bytes: &[u8],
+	overlay: MinimapOverlay,
+	revision: MinimapContentRevision,
+) -> OverviewSnapshot {
 	let doc_line_count = overlay.doc_line_count.get().max(1);
 	let mut sums = vec![0u32; MINIMAP_BANDS];
 	let mut counts = vec![0u32; MINIMAP_BANDS];
@@ -334,7 +433,7 @@ fn build_overview_snapshot(bytes: &[u8], overlay: MinimapOverlay) -> OverviewSna
 		.map(|(sum, count)| sum.checked_div(count).unwrap_or(0) as u8)
 		.collect();
 
-	OverviewSnapshot { overlay, bands }
+	OverviewSnapshot::new(overlay, revision, bands)
 }
 
 fn build_preview_snapshot(
@@ -342,6 +441,7 @@ fn build_preview_snapshot(
 	semantic_highlights: &[HighlightSpan],
 	overlay: MinimapOverlay,
 	provider: Option<&dyn LanguageProvider>,
+	revision: MinimapContentRevision,
 ) -> PreviewSnapshot {
 	let lexical_highlights = match provider {
 		Some(p) => p.lexical_baseline(bytes, &[(0, DocByte::ZERO)]),
@@ -378,11 +478,7 @@ fn build_preview_snapshot(
 		}
 	}
 
-	PreviewSnapshot {
-		overlay,
-		max_columns: max_columns.max(1),
-		rows,
-	}
+	PreviewSnapshot::new(overlay, revision, max_columns.max(1), rows)
 }
 
 fn build_preview_row(
@@ -538,9 +634,9 @@ mod tests {
 	use super::super::protocol::SearchMatch;
 	use super::{
 		BYTE_FALLBACK_NO_NEWLINE_AVG_LINE_CAP, EMPTY_PREVIEW_BIN, MAX_PREVIEW_MINIMAP_LINES,
-		MINIMAP_BANDS, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS,
-		build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
-		build_text_minimap_snapshot, normalize_line_density, token_bin,
+		MINIMAP_BANDS, MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewSnapshot,
+		PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot, build_byte_fallback_minimap_snapshot,
+		build_search_minimap_bands, build_text_minimap_snapshot, normalize_line_density, token_bin,
 	};
 	use crate::core::{DocLine, DocLineCount};
 	use crate::ecs::UastRegistry;
@@ -548,6 +644,7 @@ mod tests {
 	use crate::svp::rust_provider::RustProvider;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use std::sync::Arc;
 
 	#[test]
 	fn small_rust_documents_use_preview_snapshot() {
@@ -558,6 +655,7 @@ mod tests {
 			&[],
 			overlay,
 			Some(&provider),
+			MinimapContentRevision::ZERO,
 		);
 
 		let MinimapSnapshot::Preview(preview) = snapshot else {
@@ -588,7 +686,13 @@ mod tests {
 
 		let overlay = MinimapOverlay::new(DocLine::ZERO, 20, DocLine::ZERO);
 		let provider = RustProvider::new();
-		let snapshot = build_text_minimap_snapshot(&bytes, &[], overlay, Some(&provider));
+		let snapshot = build_text_minimap_snapshot(
+			&bytes,
+			&[],
+			overlay,
+			Some(&provider),
+			MinimapContentRevision::ZERO,
+		);
 
 		assert!(matches!(snapshot, MinimapSnapshot::Overview(_)));
 	}
@@ -636,7 +740,12 @@ mod tests {
 		chunk.append_local_child(root, leaf);
 
 		let overlay = MinimapOverlay::new(DocLine::ZERO, 40, DocLine::ZERO);
-		let snapshot = build_byte_fallback_minimap_snapshot(&registry, root, overlay);
+		let snapshot = build_byte_fallback_minimap_snapshot(
+			&registry,
+			root,
+			overlay,
+			MinimapContentRevision::ZERO,
+		);
 		let MinimapSnapshot::ByteFallback(snapshot) = snapshot else {
 			panic!("expected byte fallback minimap");
 		};
@@ -649,11 +758,36 @@ mod tests {
 	#[test]
 	fn preview_rows_use_fixed_bin_budget() {
 		let overlay = MinimapOverlay::new(DocLine::ZERO, 20, DocLine::ZERO);
-		let snapshot = build_text_minimap_snapshot(b"abc\n", &[], overlay, None);
+		let snapshot =
+			build_text_minimap_snapshot(b"abc\n", &[], overlay, None, MinimapContentRevision::ZERO);
 		let MinimapSnapshot::Preview(preview) = snapshot else {
 			panic!("expected preview minimap");
 		};
 
 		assert_eq!(preview.rows[0].bins.len(), PREVIEW_BIN_COLUMNS);
+	}
+
+	#[test]
+	fn projected_minimap_clones_share_immutable_ink_payloads() {
+		let overlay = MinimapOverlay::new(DocLine::ZERO, 20, DocLine::ZERO);
+		let preview = PreviewSnapshot::new(
+			overlay.clone(),
+			MinimapContentRevision::ZERO,
+			8,
+			vec![PreviewRow {
+				logical_width: 8,
+				bins: vec![EMPTY_PREVIEW_BIN; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
+			}],
+		);
+		let preview_clone = preview.clone();
+		assert!(Arc::ptr_eq(&preview.content, &preview_clone.content));
+
+		let overview = OverviewSnapshot::new(
+			overlay,
+			MinimapContentRevision::ZERO,
+			vec![127; MINIMAP_BANDS],
+		);
+		let overview_clone = overview.clone();
+		assert!(Arc::ptr_eq(&overview.content, &overview_clone.content));
 	}
 }

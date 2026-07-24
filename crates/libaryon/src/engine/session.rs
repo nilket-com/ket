@@ -1318,6 +1318,7 @@ pub(crate) struct CommonViewState {
 	pub(crate) background_hex: Option<String>,
 	pub(crate) cached_minimap: Option<MinimapSnapshot>,
 	pub(crate) last_minimap_state: Option<StateId>,
+	pub(crate) last_minimap_semantic_revision: u64,
 	pub(crate) last_minimap_total_lines: u64,
 	pub(crate) last_minimap_path: Option<String>,
 }
@@ -1338,6 +1339,7 @@ impl CommonViewState {
 	pub(crate) fn reset_minimap_cache(&mut self) {
 		self.cached_minimap = None;
 		self.last_minimap_state = None;
+		self.last_minimap_semantic_revision = u64::MAX;
 		self.last_minimap_total_lines = u64::MAX;
 		self.last_minimap_path = None;
 	}
@@ -1466,6 +1468,7 @@ fn new_common_view_state(
 		background_hex: None,
 		cached_minimap: None,
 		last_minimap_state: None,
+		last_minimap_semantic_revision: u64::MAX,
 		last_minimap_total_lines: u64::MAX,
 		last_minimap_path: None,
 	}

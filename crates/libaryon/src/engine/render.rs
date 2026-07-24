@@ -9,8 +9,8 @@ use super::layout::{
 	viewport_geometry_for_viewport_with_numbering,
 };
 use super::minimap::{
-	MinimapOverlay, build_byte_fallback_minimap_snapshot, build_search_minimap_bands,
-	build_text_minimap_snapshot,
+	MinimapContentRevision, MinimapOverlay, build_byte_fallback_minimap_snapshot,
+	build_search_minimap_bands, build_text_minimap_snapshot,
 };
 use super::semantic::{
 	SemanticPipelineParams, dispatch_semantic_responses_in_layout, drive_semantic_pipeline,
@@ -1118,9 +1118,20 @@ fn render_pane_viewport(
 					tab.view.last_minimap_path.as_deref() != tab.document.file_path.as_deref();
 				let state_changed =
 					tab.view.last_minimap_state != Some(tab.document.ledger.current_state_id);
+				let semantic_revision = tab
+					.semantic
+					.as_deref()
+					.map_or(0, |semantic| semantic.view_revision);
+				let semantic_changed = tab.view.last_minimap_semantic_revision != semantic_revision;
 				let total_lines_changed = tab.view.last_minimap_total_lines != total_lines;
+				let content_revision = MinimapContentRevision::new(
+					tab.document.buffer_id,
+					tab.document.ledger.current_state_id,
+					semantic_revision,
+				);
 				if tab.view.cached_minimap.is_none()
 					|| path_changed || state_changed
+					|| semantic_changed
 					|| total_lines_changed
 				{
 					tab.view.cached_minimap =
@@ -1139,15 +1150,25 @@ fn render_pane_viewport(
 									tab.document
 										.active_language_id
 										.and_then(|id| lang_registry.get_provider(id)),
+									content_revision,
 								),
-								Err(_) => {
-									build_byte_fallback_minimap_snapshot(registry, rid, overlay)
-								}
+								Err(_) => build_byte_fallback_minimap_snapshot(
+									registry,
+									rid,
+									overlay,
+									content_revision,
+								),
 							}
 						} else {
-							build_byte_fallback_minimap_snapshot(registry, rid, overlay)
+							build_byte_fallback_minimap_snapshot(
+								registry,
+								rid,
+								overlay,
+								content_revision,
+							)
 						});
 					tab.view.last_minimap_state = Some(tab.document.ledger.current_state_id);
+					tab.view.last_minimap_semantic_revision = semantic_revision;
 					tab.view.last_minimap_total_lines = total_lines;
 					tab.view.last_minimap_path = tab.document.file_path.clone();
 				}

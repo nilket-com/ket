@@ -251,12 +251,7 @@ fn preview_request_fingerprint(
 	snapshot.overlay.cursor_line.get().hash(&mut hasher);
 	snapshot.overlay.search_bands.hash(&mut hasher);
 	snapshot.overlay.active_search_band.hash(&mut hasher);
-	snapshot.max_columns.hash(&mut hasher);
-	snapshot.rows.len().hash(&mut hasher);
-	for row in &snapshot.rows {
-		row.logical_width.hash(&mut hasher);
-		hasher.write(TokenBin::as_bytes(&row.bins));
-	}
+	snapshot.revision.hash(&mut hasher);
 	for color in theme_colors {
 		match color {
 			Some(color) => {
@@ -1155,8 +1150,8 @@ mod tests {
 	use libaryon::engine::PREVIEW_BIN_COLUMNS;
 	use libaryon::engine::UiPalette;
 	use libaryon::engine::{
-		EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PreviewRow,
-		PreviewSnapshot,
+		EMPTY_PREVIEW_BIN, MinimapContentRevision, MinimapOverlay, MinimapSnapshot,
+		OverviewSnapshot, PreviewRow, PreviewSnapshot,
 	};
 	use libaryon::svp::rust_highlight::CATEGORY_COUNT;
 	#[cfg(test)]
@@ -1170,12 +1165,24 @@ mod tests {
 		}
 	}
 
+	fn preview_snapshot(
+		overlay: MinimapOverlay,
+		max_columns: u16,
+		rows: Vec<PreviewRow>,
+	) -> PreviewSnapshot {
+		PreviewSnapshot::new(overlay, MinimapContentRevision::ZERO, max_columns, rows)
+	}
+
+	fn overview_snapshot(overlay: MinimapOverlay, bands: Vec<u8>) -> OverviewSnapshot {
+		OverviewSnapshot::new(overlay, MinimapContentRevision::ZERO, bands)
+	}
+
 	#[test]
 	fn overview_renderer_keeps_uniform_width_for_uniform_bands() {
 		let area = Rect::new(0, 0, 14, 20);
 		let mut buf = Buffer::empty(area);
-		let snapshot = MinimapSnapshot::ByteFallback(OverviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = MinimapSnapshot::ByteFallback(overview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(1_000),
 				viewport_start_line: DocLine::new(500),
 				viewport_end_line: DocLineCount::new(501),
@@ -1184,8 +1191,8 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			bands: vec![127; 256],
-		});
+			vec![127; 256],
+		));
 
 		render_minimap_snapshot(
 			&mut buf,
@@ -1214,8 +1221,8 @@ mod tests {
 		let mut buf = Buffer::empty(area);
 		let mut search_bands = vec![0; 256];
 		search_bands[128] = 255;
-		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = MinimapSnapshot::Overview(overview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(1_000),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(20),
@@ -1224,8 +1231,8 @@ mod tests {
 				search_bands,
 				active_search_band: Some(128),
 			},
-			bands: vec![127; 256],
-		});
+			vec![127; 256],
+		));
 		let custom = Rgb::new(12, 200, 240);
 
 		render_minimap_snapshot(
@@ -1247,8 +1254,8 @@ mod tests {
 		let area = Rect::new(0, 0, 12, 10);
 		let mut search_bands = vec![0; 256];
 		search_bands[128] = 255;
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(100),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(20),
@@ -1257,15 +1264,15 @@ mod tests {
 				search_bands,
 				active_search_band: Some(128),
 			},
-			max_columns: 8,
-			rows: (0..100)
+			8,
+			(0..100)
 				.map(|_| PreviewRow {
 					logical_width: 8,
 					bins: vec![token_bin(TokenCategory::Keyword); PREVIEW_BIN_COLUMNS]
 						.into_boxed_slice(),
 				})
 				.collect(),
-		};
+		);
 		let custom = Rgb::new(12, 200, 240);
 		let image = render_preview_image(
 			&snapshot,
@@ -1287,8 +1294,8 @@ mod tests {
 	#[test]
 	fn preview_image_and_fingerprint_use_custom_surface_and_accent() {
 		let area = Rect::new(0, 0, 4, 3);
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::ZERO,
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::ZERO,
@@ -1297,9 +1304,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 0,
-			rows: Vec::new(),
-		};
+			0,
+			Vec::new(),
+		);
 		let default = UiPalette::default();
 		let custom = UiPalette {
 			minimap_surface: Rgb::new(1, 2, 3),
@@ -1349,8 +1356,8 @@ mod tests {
 				},
 			},
 		];
-		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = MinimapSnapshot::Preview(preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(2),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(2),
@@ -1359,9 +1366,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
+			8,
 			rows,
-		});
+		));
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 255, 0));
@@ -1382,8 +1389,8 @@ mod tests {
 	#[test]
 	fn preview_image_top_aligns_short_files() {
 		let area = Rect::new(0, 0, 12, 10);
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(2),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(2),
@@ -1392,8 +1399,8 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
-			rows: vec![
+			8,
+			vec![
 				PreviewRow {
 					logical_width: 8,
 					bins: {
@@ -1411,7 +1418,7 @@ mod tests {
 					},
 				},
 			],
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 255, 0));
@@ -1448,8 +1455,8 @@ mod tests {
 				},
 			});
 		}
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(rows.len() as u64),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(20),
@@ -1458,9 +1465,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
+			8,
 			rows,
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1489,8 +1496,8 @@ mod tests {
 					.into_boxed_slice(),
 			})
 			.collect();
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(400),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(20),
@@ -1499,9 +1506,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
+			8,
 			rows,
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1532,8 +1539,8 @@ mod tests {
 					.into_boxed_slice(),
 			})
 			.collect();
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(100),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(20),
@@ -1542,9 +1549,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
+			8,
 			rows,
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1584,8 +1591,8 @@ mod tests {
 					.into_boxed_slice(),
 			})
 			.collect();
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(8),
 				viewport_start_line: DocLine::ZERO,
 				viewport_end_line: DocLineCount::new(8),
@@ -1594,9 +1601,9 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
+			8,
 			rows,
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1631,8 +1638,8 @@ mod tests {
 	#[test]
 	fn preview_image_sparse_files_respect_relative_line_widths() {
 		let area = Rect::new(0, 0, 12, 10);
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(100),
 				viewport_start_line: DocLine::new(90),
 				viewport_end_line: DocLineCount::new(95),
@@ -1641,8 +1648,8 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 32,
-			rows: vec![
+			32,
+			vec![
 				PreviewRow {
 					logical_width: 8,
 					bins: vec![token_bin(TokenCategory::Keyword); PREVIEW_BIN_COLUMNS]
@@ -1654,7 +1661,7 @@ mod tests {
 						.into_boxed_slice(),
 				},
 			],
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1679,8 +1686,8 @@ mod tests {
 	#[test]
 	fn preview_image_uses_the_minimap_accent_for_the_viewport_frame() {
 		let area = Rect::new(0, 0, 12, 10);
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(20),
 				viewport_start_line: DocLine::new(4),
 				viewport_end_line: DocLineCount::new(10),
@@ -1689,15 +1696,15 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
-			rows: (0..20)
+			8,
+			(0..20)
 				.map(|_| PreviewRow {
 					logical_width: 8,
 					bins: vec![token_bin(TokenCategory::Keyword); PREVIEW_BIN_COLUMNS]
 						.into_boxed_slice(),
 				})
 				.collect(),
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -1730,8 +1737,8 @@ mod tests {
 	#[test]
 	fn preview_image_uses_the_minimap_accent_for_the_cursor_line() {
 		let area = Rect::new(0, 0, 12, 10);
-		let snapshot = PreviewSnapshot {
-			overlay: MinimapOverlay {
+		let snapshot = preview_snapshot(
+			MinimapOverlay {
 				doc_line_count: DocLineCount::new(20),
 				viewport_start_line: DocLine::new(4),
 				viewport_end_line: DocLineCount::new(10),
@@ -1740,15 +1747,15 @@ mod tests {
 				search_bands: vec![0; 256],
 				active_search_band: None,
 			},
-			max_columns: 8,
-			rows: (0..20)
+			8,
+			(0..20)
 				.map(|_| PreviewRow {
 					logical_width: 8,
 					bins: vec![token_bin(TokenCategory::Keyword); PREVIEW_BIN_COLUMNS]
 						.into_boxed_slice(),
 				})
 				.collect(),
-		};
+		);
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 

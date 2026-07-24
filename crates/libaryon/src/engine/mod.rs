@@ -58,9 +58,9 @@ pub use self::layout::{
 	viewport_geometry_with_options, viewport_max_line_on_screen,
 };
 pub use self::minimap::{
-	EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, PREVIEW_BIN_COLUMNS,
-	PreviewRow, PreviewSnapshot, dominant_preview_bin_for_rows, minimap_click_viewport_start_line,
-	sample_preview_bin_range,
+	EMPTY_PREVIEW_BIN, MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewContent,
+	OverviewSnapshot, PREVIEW_BIN_COLUMNS, PreviewContent, PreviewRow, PreviewSnapshot,
+	dominant_preview_bin_for_rows, minimap_click_viewport_start_line, sample_preview_bin_range,
 };
 pub use self::protocol::{
 	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,

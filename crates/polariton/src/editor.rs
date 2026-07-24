@@ -3086,12 +3086,9 @@ fn minimap_live_overlays(
 }
 
 impl MinimapWidget<'_> {
-	/// Hash of everything `render_ink` + `render_search_markers` read. Preview
-	/// rows are immutable for the lifetime of a projected viewport, so their
-	/// allocation identity is the content revision here. A replacement
-	/// projection is allocated before the current one is dropped, which keeps
-	/// the identity unambiguous while avoiding an O(document size) scan on every
-	/// 16ms Iced redraw.
+	/// Hash of everything `render_ink` + `render_search_markers` read. The
+	/// engine's content revision names the shared immutable rows/bands without
+	/// rescanning them on every 16ms Iced redraw.
 	///
 	/// The overlay's viewport/cursor fields are deliberately excluded: they
 	/// change on every scroll and keystroke but never touch the ink image.
@@ -3101,17 +3098,11 @@ impl MinimapWidget<'_> {
 		width.hash(&mut hasher);
 		height.hash(&mut hasher);
 		match self.snapshot {
-			MinimapSnapshot::Preview(preview) => {
-				0u8.hash(&mut hasher);
-				preview.max_columns.hash(&mut hasher);
-				preview.rows.len().hash(&mut hasher);
-				(preview.rows.as_ptr() as usize).hash(&mut hasher);
-			}
-			MinimapSnapshot::Overview(overview) | MinimapSnapshot::ByteFallback(overview) => {
-				1u8.hash(&mut hasher);
-				overview.bands.hash(&mut hasher);
-			}
+			MinimapSnapshot::Preview(_) => 0u8.hash(&mut hasher),
+			MinimapSnapshot::Overview(_) => 1u8.hash(&mut hasher),
+			MinimapSnapshot::ByteFallback(_) => 2u8.hash(&mut hasher),
 		}
+		self.snapshot.revision().hash(&mut hasher);
 		let overlay = self.snapshot.overlay();
 		overlay.search_bands.hash(&mut hasher);
 		overlay.active_search_band.hash(&mut hasher);
@@ -3350,21 +3341,26 @@ mod tests {
 		use super::{MinimapInkCache, MinimapWidget};
 		use libaryon::core::{DocLine, PaneId, TokenBin};
 		use libaryon::engine::{
-			MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot,
-			UiPalette,
+			MinimapContentRevision, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS,
+			PreviewRow, PreviewSnapshot, UiPalette,
 		};
 		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
 
 		let make_snapshot = |category: TokenCategory| {
-			MinimapSnapshot::Preview(PreviewSnapshot {
-				overlay: MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
-				max_columns: 8,
-				rows: vec![PreviewRow {
+			MinimapSnapshot::Preview(PreviewSnapshot::new(
+				MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
+				MinimapContentRevision::new(
+					libaryon::core::BufferId::ZERO,
+					libaryon::core::StateId::ZERO,
+					category as u64,
+				),
+				8,
+				vec![PreviewRow {
 					logical_width: 8,
 					bins: vec![TokenBin::new(category as u8); PREVIEW_BIN_COLUMNS]
 						.into_boxed_slice(),
 				}],
-			})
+			))
 		};
 		let snapshot = make_snapshot(TokenCategory::Keyword);
 		let widget = MinimapWidget {
@@ -3382,10 +3378,27 @@ mod tests {
 			"unchanged content must reuse the handle"
 		);
 
+		let mut searched = snapshot.clone();
+		searched.overlay_mut().search_bands[0] = 255;
+		let searched_widget = MinimapWidget {
+			pane_id: PaneId::new(1),
+			snapshot: &searched,
+			theme_colors: [None; CATEGORY_COUNT],
+			palette: UiPalette::default(),
+		};
+		let searched_handle = searched_widget.ink_handle(&cache, 64, 64);
+		assert_ne!(
+			first.id(),
+			searched_handle.id(),
+			"search bands must invalidate ink independently of content revision"
+		);
+
 		let edited = make_snapshot(TokenCategory::Function);
 		let widget = MinimapWidget {
+			pane_id: PaneId::new(1),
 			snapshot: &edited,
-			..widget
+			theme_colors: [None; CATEGORY_COUNT],
+			palette: UiPalette::default(),
 		};
 		let third = widget.ink_handle(&cache, 64, 64);
 		assert_ne!(first.id(), third.id(), "edits must rebuild the ink image");
@@ -3397,15 +3410,18 @@ mod tests {
 		use iced::widget::canvas::{self, Program as _};
 		use iced::{Point, Rectangle, Size, event, mouse};
 		use libaryon::core::{DocLine, DocLineCount, PaneId};
-		use libaryon::engine::{MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette};
+		use libaryon::engine::{
+			MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette,
+		};
 		use libaryon::svp::rust_highlight::CATEGORY_COUNT;
 
 		let mut overlay = MinimapOverlay::new(DocLine::ZERO, 40, DocLine::ZERO);
 		overlay.doc_line_count = DocLineCount::new(10_001);
-		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot {
+		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot::new(
 			overlay,
-			bands: vec![1],
-		});
+			MinimapContentRevision::ZERO,
+			vec![1],
+		));
 		let pane_id = PaneId::new(1);
 		let widget = MinimapWidget {
 			pane_id,
@@ -3454,7 +3470,9 @@ mod tests {
 	fn minimap_live_images_finish_with_cursor_over_viewport_frame() {
 		use super::{MinimapInkCache, MinimapOverlayTone, MinimapWidget, minimap_live_overlays};
 		use libaryon::core::{DocLine, DocLineCount};
-		use libaryon::engine::{MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette};
+		use libaryon::engine::{
+			MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette,
+		};
 		use libaryon::svp::rust_highlight::CATEGORY_COUNT;
 
 		let mut overlay = MinimapOverlay::new(DocLine::new(20), 10, DocLine::new(20));
@@ -3478,10 +3496,11 @@ mod tests {
 			"the cursor must own the final pixel where it meets the frame"
 		);
 
-		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot {
+		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot::new(
 			overlay,
-			bands: vec![1],
-		});
+			MinimapContentRevision::ZERO,
+			vec![1],
+		));
 		let widget = MinimapWidget {
 			pane_id: libaryon::core::PaneId::new(1),
 			snapshot: &snapshot,
@@ -3550,8 +3569,8 @@ mod tests {
 		use libaryon::core::DocLine;
 		use libaryon::core::Rgb;
 		use libaryon::engine::{
-			EMPTY_PREVIEW_BIN, MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS, PreviewRow,
-			PreviewSnapshot, UiPalette,
+			EMPTY_PREVIEW_BIN, MinimapContentRevision, MinimapOverlay, MinimapSnapshot,
+			PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot, UiPalette,
 		};
 		use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
 
@@ -3572,11 +3591,12 @@ mod tests {
 				bins: vec![EMPTY_PREVIEW_BIN; PREVIEW_BIN_COLUMNS].into_boxed_slice(),
 			},
 		];
-		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot {
-			overlay: MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
-			max_columns: 8,
+		let snapshot = MinimapSnapshot::Preview(PreviewSnapshot::new(
+			MinimapOverlay::new(DocLine::ZERO, 2, DocLine::ZERO),
+			MinimapContentRevision::ZERO,
+			8,
 			rows,
-		});
+		));
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 255, 0));
