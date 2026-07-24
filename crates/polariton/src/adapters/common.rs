@@ -39,7 +39,9 @@ pub enum ExecutionResult {
 	#[default]
 	None,
 	Affected(u64),
-	Batch(Vec<ExecutionResult>),
+	Batch {
+		statements: usize,
+	},
 	CommandCompleted(String),
 	Err(String),
 	Rows(DataFrame),

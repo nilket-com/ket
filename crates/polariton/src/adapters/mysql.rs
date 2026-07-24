@@ -39,15 +39,13 @@ impl DatabaseAdapter for MySQLAdapter {
 			Err(_) => return ExecutionResult::Err("MySQL connection timed out".to_string()),
 		};
 		match ast.as_slice() {
-			[_, _, ..] => conn
-				.query_drop(&code)
-				.await
-				.map(|_| {
-					ExecutionResult::Batch(vec![ExecutionResult::CommandCompleted(
-						"Batch complete.".to_string(),
-					)])
-				})
-				.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
+			[_, _, ..] => {
+				let statements = ast.len();
+				conn.query_drop(&code)
+					.await
+					.map(|_| ExecutionResult::Batch { statements })
+					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))
+			}
 			[Statement::Query(_)] => mysql_to_df(conn, &code)
 				.await
 				.map(ExecutionResult::Rows)

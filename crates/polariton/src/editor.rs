@@ -267,6 +267,8 @@ pub struct MarkdownCellExecution {
 	pub presentation: MarkdownCellPresentation,
 	pub language_id: String,
 	pub code: String,
+	/// One-based source-document line where `code` begins.
+	pub source_start_line: usize,
 }
 
 enum NotebookCellOutput {
@@ -274,7 +276,6 @@ enum NotebookCellOutput {
 	Table(Box<DataFrame>),
 	Plot { surface: Box<NotebookPlotSurface> },
 	Failed(String),
-	Message(String),
 }
 
 /// Native interaction state for a plot embedded in the Markdown preview.
@@ -500,11 +501,19 @@ impl CodeEditor {
 			.get(&source.buffer_id)?
 			.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)?
 			.to_owned();
+		let source_start_line = self
+			.document_texts
+			.get(&source.buffer_id)?
+			.get(..cell.body_range.start.get() as usize)?
+			.bytes()
+			.filter(|byte| *byte == b'\n')
+			.count() + 1;
 		Some(MarkdownCellExecution {
 			identity: cell.identity.clone(),
 			presentation: cell.presentation,
 			language_id: cell.language_id.clone(),
 			code,
+			source_start_line,
 		})
 	}
 
@@ -551,6 +560,14 @@ impl CodeEditor {
 			.insert(identity, NotebookCellOutput::Running);
 	}
 
+	/// Retire a SQL cell's prior data product without replacing it with
+	/// operational UI. A later table may claim the output surface; completion
+	/// messages and diagnostics belong to the application status channel.
+	pub fn clear_markdown_cell_artifact(&mut self, identity: &MarkdownCellIdentity) {
+		self.notebook_cell_data.remove(identity);
+		self.notebook_outputs.remove(identity);
+	}
+
 	pub fn set_markdown_cell_table(&mut self, identity: MarkdownCellIdentity, frame: DataFrame) {
 		self.retain_markdown_cell_table(identity.clone(), &frame);
 		self.notebook_outputs
@@ -570,11 +587,6 @@ impl CodeEditor {
 		self.notebook_cell_data.remove(&identity);
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Failed(message));
-	}
-
-	pub fn set_markdown_cell_message(&mut self, identity: MarkdownCellIdentity, message: String) {
-		self.notebook_outputs
-			.insert(identity, NotebookCellOutput::Message(message));
 	}
 
 	pub fn set_markdown_cell_plot(
@@ -634,6 +646,11 @@ impl CodeEditor {
 			});
 		}
 		self.panels.set_content(RESULT_PANEL, PanelContent::Running);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn has_query_surface(&self) -> bool {
+		self.panels.panels.contains_key(&RESULT_PANEL)
 	}
 
 	/// Open (or focus) Polariton's nested dashboard inside the Baryon workspace.
@@ -2453,11 +2470,6 @@ fn markdown_cell_output_surface<'a>(
 			.font(EDITOR_FONT)
 			.size(metrics::TEXT_SIZE)
 			.color(color(palette.status_text))
-			.into(),
-		NotebookCellOutput::Message(message) => text(message)
-			.font(EDITOR_FONT)
-			.size(metrics::TEXT_SIZE)
-			.color(color(palette.preview_text))
 			.into(),
 	};
 	container(content)
@@ -5402,21 +5414,17 @@ mod tests {
 			.selected_markdown_cell()
 			.expect("cursor is in SQL fence");
 		assert_eq!(cell.code, "select id\nfrom trips;\n");
+		assert_eq!(cell.source_start_line, 4);
 		assert!(matches!(
 			cell.identity,
 			libaryon::uast::projection::MarkdownCellIdentity::Explicit { ref id } if id == "trips"
 		));
 		let identity = cell.identity.clone();
-		editor.begin_markdown_cell(identity.clone());
-		assert!(matches!(
-			editor.notebook_outputs.get(&identity),
-			Some(super::NotebookCellOutput::Running)
-		));
-		editor.set_markdown_cell_message(identity.clone(), "Rows affected: 3".to_owned());
-		assert!(matches!(
-			editor.notebook_outputs.get(&identity),
-			Some(super::NotebookCellOutput::Message(message)) if message == "Rows affected: 3"
-		));
+		editor.clear_markdown_cell_artifact(&identity);
+		assert!(
+			!editor.notebook_outputs.contains_key(&identity),
+			"SQL operational state belongs to the status bar, not inline output"
+		);
 	}
 
 	#[test]

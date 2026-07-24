@@ -11,8 +11,8 @@ use crate::gui::{
 	menu::{MenuBar, MenuFontPolicy, MenuItem, MenuRoot, MenuState},
 };
 use iced::widget::{
-	TextInput, button, center, checkbox, column, container, mouse_area, row, space, stack, text,
-	text_input,
+	TextInput, button, center, checkbox, column, container, mouse_area, opaque, row, space, stack,
+	text, text_editor, text_input, tooltip,
 };
 use iced::{
 	Alignment, Background, Center, Color, Element, Fill, FillPortion, Font, Length, border, font,
@@ -160,6 +160,8 @@ pub fn main_screen<'a>(
 	adapter_state: &'a AdapterState,
 	showing_settings: bool,
 	show_column_types: bool,
+	status_detail: Option<(&'a str, &'a text_editor::Content)>,
+	status_detail_open: bool,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner. The nested
 	// dashboard still owns its own pixel-space grid inside its host panel.
@@ -175,7 +177,7 @@ pub fn main_screen<'a>(
 			},
 			..Default::default()
 		});
-	let status_bar = app_status_bar(
+	let status_bar: Element<'a, Message> = app_status_bar(
 		status_msg,
 		status_error,
 		status_df_size,
@@ -183,6 +185,26 @@ pub fn main_screen<'a>(
 		adapter_state,
 	)
 	.view();
+	let status_bar: Element<'a, Message> = if let Some((detail, _)) = status_detail {
+		tooltip(
+			mouse_area(status_bar).on_press(Message::ToggleStatusDetail),
+			container(
+				text(detail)
+					.size(13)
+					.font(Font::MONOSPACE)
+					.wrapping(text::Wrapping::Word),
+			)
+			.width(Length::Fixed(720.0))
+			.padding(10)
+			.style(status_detail_card_style),
+			tooltip::Position::Top,
+		)
+		.gap(6)
+		.delay(std::time::Duration::from_millis(350))
+		.into()
+	} else {
+		status_bar
+	};
 	let main_window = window_decorations(column![main_content, status_bar], menu_state);
 	let adapter_modal = adapter_view(adapter_state);
 	let settings_modal: Element<Message> = if showing_settings {
@@ -190,7 +212,75 @@ pub fn main_screen<'a>(
 	} else {
 		container(text("")).into()
 	};
-	stack![main_window, adapter_modal, settings_modal].into()
+	let detail_overlay = if status_detail_open {
+		status_detail
+			.map(|(_, content)| status_detail_overlay(content))
+			.unwrap_or_else(|| container(text("")).into())
+	} else {
+		container(text("")).into()
+	};
+	stack![main_window, adapter_modal, settings_modal, detail_overlay].into()
+}
+
+fn status_detail_overlay(content: &text_editor::Content) -> Element<'_, Message> {
+	let header = row![
+		text("SQL diagnostic")
+			.size(14)
+			.font(Font {
+				weight: font::Weight::Bold,
+				..Font::MONOSPACE
+			})
+			.color(colors::TEXT_PRIMARY),
+		space::horizontal(),
+		button(text("Copy").size(12))
+			.padding([3, 9])
+			.on_press(Message::CopyStatusDetail),
+		button(text("×").size(14))
+			.padding([2, 8])
+			.on_press(Message::CloseStatusDetail),
+	]
+	.spacing(6)
+	.align_y(Alignment::Center);
+	let diagnostic = text_editor(content)
+		.on_action(Message::StatusDetailAction)
+		.font(Font::MONOSPACE)
+		.size(13)
+		.wrapping(text::Wrapping::Word)
+		.height(Length::Fill);
+	let card = container(column![header, diagnostic].spacing(8))
+		.width(Length::Fixed(720.0))
+		.height(Length::Fixed(190.0))
+		.padding(12)
+		.style(status_detail_card_style);
+	container(opaque(card))
+		.width(Fill)
+		.height(Fill)
+		.padding(iced::Padding {
+			top: 0.0,
+			right: 12.0,
+			bottom: 38.0,
+			left: 0.0,
+		})
+		.align_x(Alignment::End)
+		.align_y(Alignment::End)
+		.into()
+}
+
+fn status_detail_card_style(_theme: &Theme) -> container::Style {
+	container::Style {
+		background: Some(Background::Color(colors::BG_SECONDARY)),
+		border: border::Border {
+			color: colors::WHITE,
+			width: 1.0,
+			radius: 3.0.into(),
+		},
+		shadow: iced::Shadow {
+			color: Color::BLACK.scale_alpha(0.65),
+			offset: iced::Vector::new(0.0, 4.0),
+			blur_radius: 12.0,
+		},
+		..Default::default()
+	}
 }
 
 fn app_status_bar(
@@ -221,17 +311,21 @@ fn app_status_bar(
 	let mut bar = StatusBar::new()
 		.lane_split(2, 5)
 		.left(Segment::toned_text(connection_label, connection_tone))
-		.left(Segment::text(target_label))
-		.right(
+		.left(Segment::text(target_label));
+	if !status_error.is_empty() {
+		bar = bar.right(
 			Segment::toned_text(status_error, Tone::Danger)
-				.max_chars(42)
-				.fill_portion(1),
-		)
-		.right(
-			Segment::toned_text(status_msg, Tone::Accent)
-				.max_chars(56)
-				.fill_portion(2),
+				.max_chars(112)
+				.fill_portion(if status_msg.is_empty() { 1 } else { 2 }),
 		);
+	}
+	if !status_msg.is_empty() {
+		bar = bar.right(
+			Segment::toned_text(status_msg, Tone::Accent)
+				.max_chars(112)
+				.fill_portion(1),
+		);
+	}
 	if let Some((rows, cols)) = status_df_size {
 		bar = bar.right(
 			Segment::label_value("table", format!("{rows} x {cols}"), Tone::Normal)

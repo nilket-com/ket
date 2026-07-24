@@ -34,6 +34,8 @@ struct AppState {
 	status_error: String,
 	status_df_size: Option<(usize, usize)>,
 	status_time_elapsed: Option<f64>,
+	status_detail: Option<StatusDetail>,
+	status_detail_open: bool,
 	adapter_state: AdapterState,
 	code_started: Instant,
 	is_maximized: bool,
@@ -44,6 +46,23 @@ struct AppState {
 	rune_plot_panes: HashMap<BufferId, PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	pending_runs: VecDeque<PendingRun>,
+}
+
+struct StatusDetail {
+	summary: String,
+	full: String,
+	content: iced::widget::text_editor::Content,
+}
+
+impl StatusDetail {
+	fn new(summary: String, full: String) -> Self {
+		let content = iced::widget::text_editor::Content::with_text(&full);
+		Self {
+			summary,
+			full,
+			content,
+		}
+	}
 }
 
 impl Drop for AppState {
@@ -226,6 +245,8 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		status_error: "".to_string(),
 		status_df_size: None,
 		status_time_elapsed: None,
+		status_detail: None,
+		status_detail_open: false,
 		adapter_state: AdapterState::default(),
 		code_started: Instant::now(),
 		is_maximized: false,
@@ -245,6 +266,14 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 }
 
 fn view(app_state: &AppState) -> Element<'_, Message> {
+	let status_detail = app_state.status_detail.as_ref().and_then(|detail| {
+		let visible_summary = if app_state.status_error.is_empty() {
+			&app_state.status_msg
+		} else {
+			&app_state.status_error
+		};
+		(detail.summary == *visible_summary).then_some(detail)
+	});
 	components::main_screen(
 		&app_state.dashboard,
 		&app_state.menu_state,
@@ -256,7 +285,108 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		&app_state.adapter_state,
 		app_state.showing_settings,
 		app_state.show_column_types,
+		status_detail.map(|detail| (detail.full.as_str(), &detail.content)),
+		app_state.status_detail_open,
 	)
+}
+
+fn compact_sql_diagnostic(message: &str, source_start_line: Option<usize>) -> (String, String) {
+	let mut body = message.trim();
+	if let Some((prefix, rest)) = body.split_once(" parse error: ")
+		&& !prefix.contains('\n')
+	{
+		body = rest;
+	}
+	if let Some(rest) = body.strip_prefix("sql parser error: ") {
+		body = rest;
+	}
+
+	let mut parser_line = None;
+	let mut parser_column = None;
+	let mut core = body;
+	if let Some((before, location)) = body.rsplit_once(" at Line: ")
+		&& let Some((line, column)) = location.split_once(", Column: ")
+	{
+		parser_line = line.trim().parse::<usize>().ok();
+		parser_column = column
+			.split_whitespace()
+			.next()
+			.and_then(|column| column.parse::<usize>().ok());
+		core = before;
+	}
+
+	let core = core.split_whitespace().collect::<Vec<_>>().join(" ");
+	let core = if let Some(rest) = core.strip_prefix("Expected: ") {
+		if let Some((expected, found)) = rest.split_once(", found: ") {
+			format!("expected {expected}, found '{}'", found.trim_matches('\''))
+		} else {
+			format!("expected {rest}")
+		}
+	} else {
+		core
+	};
+	let location = match (parser_line, parser_column) {
+		(Some(line), Some(column)) => {
+			let line = source_start_line
+				.map(|source| source.saturating_add(line.saturating_sub(1)))
+				.unwrap_or(line);
+			format!("line {line}, col {column} · ")
+		}
+		(Some(line), None) => {
+			let line = source_start_line
+				.map(|source| source.saturating_add(line.saturating_sub(1)))
+				.unwrap_or(line);
+			format!("line {line} · ")
+		}
+		_ => String::new(),
+	};
+	let summary = format!("SQL · {location}{core}");
+	let full = if source_start_line.is_some() && parser_line.is_some() {
+		format!("{summary}\n\nAdapter diagnostic:\n{message}")
+	} else {
+		message.to_owned()
+	};
+	(summary, full)
+}
+
+fn set_sql_status(app_state: &mut AppState, summary: impl Into<String>) {
+	app_state.status_msg = summary.into();
+	app_state.status_error.clear();
+	app_state.status_detail = None;
+	app_state.status_detail_open = false;
+}
+
+fn set_sql_error(app_state: &mut AppState, message: String, source_start_line: Option<usize>) {
+	let (summary, full) = compact_sql_diagnostic(&message, source_start_line);
+	app_state.status_msg.clear();
+	app_state.status_error = summary.clone();
+	app_state.status_detail = Some(StatusDetail::new(summary, full));
+	app_state.status_detail_open = false;
+}
+
+fn clear_transient_sql_status_on_editor_activity(
+	app_state: &mut AppState,
+	message: &crate::editor::EditorMsg,
+) {
+	let is_activity = matches!(
+		message,
+		crate::editor::EditorMsg::ActivateDocTab { .. }
+			| crate::editor::EditorMsg::Click
+			| crate::editor::EditorMsg::CloseDocTab { .. }
+			| crate::editor::EditorMsg::Input(_)
+			| crate::editor::EditorMsg::MinimapGoto(_)
+			| crate::editor::EditorMsg::Paste(_)
+			| crate::editor::EditorMsg::Scroll(_)
+	);
+	if is_activity
+		&& (app_state.status_msg.starts_with("SQL · ")
+			|| app_state.status_error.starts_with("SQL · "))
+	{
+		app_state.status_msg.clear();
+		app_state.status_error.clear();
+		app_state.status_detail = None;
+		app_state.status_detail_open = false;
+	}
 }
 
 fn run_code(
@@ -266,20 +396,21 @@ fn run_code(
 	annotation_source: &str,
 ) -> Task<Message> {
 	let Some(db) = app_state.adapter_state.sql_connection() else {
-		app_state.status_error = "No SQL target: scratch database unavailable.".to_string();
+		set_sql_error(
+			app_state,
+			"No SQL target: scratch database unavailable.".to_owned(),
+			None,
+		);
 		return Task::none();
 	};
 	if code.trim().is_empty() {
-		app_state.status_msg = "Nothing to run on the current line.".into();
+		set_sql_status(app_state, "SQL · nothing to run on the current line");
 		return Task::none();
 	}
 	let publish_name = match parse_result_annotation(annotation_source) {
 		Ok(name) => name,
 		Err(message) => {
-			app_state.status_error = format!("Error: {message}");
-			app_state.status_msg.clear();
-			app_state.code_editor.begin_query();
-			app_state.code_editor.set_query_error(message);
+			set_sql_error(app_state, message, None);
 			return Task::none();
 		}
 	};
@@ -290,13 +421,9 @@ fn run_code(
 			.result_registry
 			.begin(&name, source_buffer, connection)
 	});
-	app_state.status_msg = "Code running...".into();
-	app_state.status_error.clear();
+	set_sql_status(app_state, "SQL · running…");
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	// The results surface is a Baryon-owned pane whose contents Polariton
-	// draws: open or refresh it now so the run is visible while it executes.
-	app_state.code_editor.begin_query();
 	Task::perform(
 		async move {
 			let mut guard = db.write().await;
@@ -448,29 +575,30 @@ fn run_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> T
 
 fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
 	let Some(db) = app_state.adapter_state.sql_connection() else {
-		app_state.status_error = "No SQL target: scratch database unavailable.".to_string();
+		set_sql_error(
+			app_state,
+			"No SQL target: scratch database unavailable.".to_owned(),
+			Some(cell.source_start_line),
+		);
 		return Task::none();
 	};
 	if cell.code.trim().is_empty() {
-		app_state.status_msg = "Nothing to run in this cell.".into();
+		set_sql_status(app_state, "SQL · nothing to run in this cell");
 		return Task::none();
 	}
 	let db = db.clone();
 	let identity = cell.identity.clone();
 	let presentation = cell.presentation;
-	app_state.status_msg = "Code running…".into();
-	app_state.status_error.clear();
+	let source_start_line = cell.source_start_line;
+	set_sql_status(app_state, "SQL · running…");
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
 	// Starting any SQL cell retires its prior named snapshot immediately.
 	// Presentation only decides where the new result appears; it must not let a
 	// Rune cell observe stale data while this query is in flight.
-	app_state.code_editor.begin_markdown_cell(cell.identity);
-	match presentation.output {
-		MarkdownCellOutputTarget::Inline => {}
-		MarkdownCellOutputTarget::Pane => app_state.code_editor.begin_query(),
-		MarkdownCellOutputTarget::None => {}
-	}
+	app_state
+		.code_editor
+		.clear_markdown_cell_artifact(&cell.identity);
 	Task::perform(
 		async move {
 			let mut guard = db.write().await;
@@ -479,6 +607,7 @@ fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) 
 		move |result| Message::RunMarkdownCellResult {
 			identity,
 			presentation,
+			source_start_line,
 			result,
 		},
 	)
@@ -529,31 +658,30 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	)
 }
 
-/// Deliver a successful non-tabular cell result to its declared surface.
-///
-/// `output=pane` still owns a native panel even when there is no DataFrame to
-/// display. Replacing `running…` with the completion message keeps schema and
-/// setup cells honest instead of making the panel look hung.
-fn finish_markdown_cell_message(
-	app_state: &mut AppState,
-	identity: libaryon::uast::projection::MarkdownCellIdentity,
-	presentation: libaryon::uast::projection::MarkdownCellPresentation,
-	message: String,
-) {
-	match presentation.output {
-		MarkdownCellOutputTarget::Inline => app_state
-			.code_editor
-			.set_markdown_cell_message(identity, message.clone()),
-		MarkdownCellOutputTarget::Pane => app_state.code_editor.set_query_message(message.clone()),
-		MarkdownCellOutputTarget::None => {}
-	}
-	app_state.status_msg = message;
-}
-
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	match message {
 		Message::Dashboard(message) => {
 			return run_dashboard_message(app_state, message);
+		}
+		Message::ToggleStatusDetail => {
+			if app_state.status_detail.is_some() {
+				app_state.status_detail_open = !app_state.status_detail_open;
+			}
+		}
+		Message::CloseStatusDetail => {
+			app_state.status_detail_open = false;
+		}
+		Message::CopyStatusDetail => {
+			if let Some(detail) = app_state.status_detail.as_ref() {
+				return iced::clipboard::write(detail.full.clone());
+			}
+		}
+		Message::StatusDetailAction(action) => {
+			if !action.is_edit()
+				&& let Some(detail) = app_state.status_detail.as_mut()
+			{
+				detail.content.perform(action);
+			}
 		}
 		Message::CloseWindow => {
 			return window::latest()
@@ -582,6 +710,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return run_dashboard_message(app_state, message);
 		}
 		Message::CodeEditEvent(edit_event) => {
+			clear_transient_sql_status_on_editor_activity(app_state, &edit_event);
 			let task = app_state
 				.code_editor
 				.update(edit_event)
@@ -704,7 +833,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		} => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
-			app_state.status_error = "".to_string();
 			if let Some(claim) = publish.as_ref() {
 				match &er {
 					ExecutionResult::Rows(frame) => {
@@ -719,33 +847,40 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 			match er {
 				ExecutionResult::Affected(rows_affected) => {
-					app_state.status_msg = format!("Rows affected: {rows_affected}");
+					set_sql_status(
+						app_state,
+						format!(
+							"SQL · {rows_affected} row{} affected",
+							if rows_affected == 1 { "" } else { "s" }
+						),
+					);
 				}
-				ExecutionResult::Batch(ver) => {
-					let msg = ver
-						.into_iter()
-						.map(|er| format!("{:?}", er))
-						.collect::<String>();
-					app_state.status_msg = format!("Batch complete: {msg}");
+				ExecutionResult::Batch { statements } => {
+					set_sql_status(
+						app_state,
+						format!(
+							"SQL · {statements} statement{} completed",
+							if statements == 1 { "" } else { "s" }
+						),
+					);
 				}
-				ExecutionResult::CommandCompleted(msg) => {
-					app_state.status_msg = format!("Command complete: {msg}");
+				ExecutionResult::CommandCompleted(_) => {
+					set_sql_status(app_state, "SQL · command completed");
 				}
 				ExecutionResult::Err(msg) => {
-					app_state.status_error = format!("Error: {msg}");
-					app_state.status_msg = "".to_string();
-					app_state.code_editor.set_query_error(msg);
+					set_sql_error(app_state, msg, None);
 				}
 				ExecutionResult::Rows(df) => {
 					let rows = df.height();
 					let cols = df.width();
+					app_state.code_editor.begin_query();
 					app_state.code_editor.set_query_result(df.clone());
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
-					app_state.status_msg = "Code finished.".to_string();
+					set_sql_status(app_state, "SQL · query completed");
 				}
 				ExecutionResult::None => {
-					app_state.status_msg = "Noop finished.".to_string();
+					set_sql_status(app_state, "SQL · no statements executed");
 				}
 			}
 		}
@@ -811,11 +946,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RunMarkdownCellResult {
 			identity,
 			presentation,
+			source_start_line,
 			result,
 		} => {
 			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
 			app_state.status_time_elapsed = Some(time_elapsed);
-			app_state.status_error.clear();
 			match result {
 				ExecutionResult::Rows(df) => {
 					let rows = df.height();
@@ -830,53 +965,41 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.code_editor
 							.set_markdown_cell_table(identity, df.clone()),
 						MarkdownCellOutputTarget::Pane => {
+							app_state.code_editor.begin_query();
 							app_state.code_editor.set_query_result(df.clone())
 						}
 						MarkdownCellOutputTarget::None => {}
 					}
 					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
-					app_state.status_msg = "Cell finished.".to_owned();
+					set_sql_status(app_state, "SQL · cell query completed");
 				}
 				ExecutionResult::Err(message) => {
-					app_state.status_error = format!("Error: {message}");
-					app_state.status_msg.clear();
-					match presentation.output {
-						MarkdownCellOutputTarget::Inline => app_state
-							.code_editor
-							.set_markdown_cell_error(identity, message),
-						MarkdownCellOutputTarget::Pane => {
-							app_state.code_editor.set_query_error(message)
-						}
-						MarkdownCellOutputTarget::None => {}
-					}
+					set_sql_error(app_state, message, Some(source_start_line));
 				}
 				ExecutionResult::Affected(rows) => {
-					finish_markdown_cell_message(
+					set_sql_status(
 						app_state,
-						identity,
-						presentation,
-						format!("Rows affected: {rows}"),
+						format!(
+							"SQL · {rows} row{} affected",
+							if rows == 1 { "" } else { "s" }
+						),
 					);
 				}
-				ExecutionResult::CommandCompleted(message) => {
-					finish_markdown_cell_message(app_state, identity, presentation, message);
+				ExecutionResult::CommandCompleted(_) => {
+					set_sql_status(app_state, "SQL · command completed");
 				}
-				ExecutionResult::Batch(results) => {
-					finish_markdown_cell_message(
+				ExecutionResult::Batch { statements } => {
+					set_sql_status(
 						app_state,
-						identity,
-						presentation,
-						format!("Batch complete: {results:?}"),
+						format!(
+							"SQL · {statements} statement{} completed",
+							if statements == 1 { "" } else { "s" }
+						),
 					);
 				}
 				ExecutionResult::None => {
-					finish_markdown_cell_message(
-						app_state,
-						identity,
-						presentation,
-						"Cell finished.".to_owned(),
-					);
+					set_sql_status(app_state, "SQL · no statements executed");
 				}
 			}
 		}
@@ -1182,5 +1305,162 @@ fn get_node_rects(
 			rects.extend(get_node_rects(state, second, rect_b));
 			rects
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		clear_transient_sql_status_on_editor_activity, compact_sql_diagnostic, new, set_sql_error,
+		update,
+	};
+	use crate::adapters::common::ExecutionResult;
+	use crate::gui::messages::Message;
+	use crate::persistence::StartupData;
+
+	#[test]
+	fn fenced_sql_diagnostics_report_document_coordinates() {
+		let raw = "SQLite parse error: sql parser error: Expected: column name or constraint definition, found: ) at Line: 4, Column: 1";
+		let (summary, full) = compact_sql_diagnostic(raw, Some(6));
+
+		assert_eq!(
+			summary,
+			"SQL · line 9, col 1 · expected column name or constraint definition, found ')'"
+		);
+		assert!(full.starts_with(&summary));
+		assert!(full.contains(raw));
+	}
+
+	#[test]
+	fn non_tabular_sql_completion_stays_out_of_result_surfaces() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+
+		let _ = update(
+			&mut state,
+			Message::RunResult {
+				result: ExecutionResult::Batch { statements: 3 },
+				publish: None,
+			},
+		);
+
+		assert_eq!(state.status_msg, "SQL · 3 statements completed");
+		assert!(
+			!state.code_editor.has_query_surface(),
+			"a successful command batch must not manufacture a result pane"
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn tabular_sql_completion_claims_the_result_surface() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let frame = polars::df!("x" => [1_i64, 2]).expect("frame");
+
+		let _ = update(
+			&mut state,
+			Message::RunResult {
+				result: ExecutionResult::Rows(frame),
+				publish: None,
+			},
+		);
+
+		assert_eq!(state.status_msg, "SQL · query completed");
+		assert!(
+			state.code_editor.has_query_surface(),
+			"a DataFrame is an artifact and must own a result surface"
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn sql_error_keeps_full_detail_without_manufacturing_a_result_pane() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let raw = "SQLite parse error: sql parser error: Expected: an SQL statement, found: viz at Line: 1, Column: 1";
+
+		let _ = update(
+			&mut state,
+			Message::RunResult {
+				result: ExecutionResult::Err(raw.to_owned()),
+				publish: None,
+			},
+		);
+
+		assert_eq!(
+			state.status_error,
+			"SQL · line 1, col 1 · expected an SQL statement, found 'viz'"
+		);
+		assert_eq!(
+			state
+				.status_detail
+				.as_ref()
+				.map(|detail| detail.full.as_str()),
+			Some(raw)
+		);
+		assert!(!state.code_editor.has_query_surface());
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn diagnostic_popover_content_is_selectable_but_read_only() {
+		use iced::widget::text_editor::{Action, Edit};
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let raw = "database refused the statement";
+		let _ = update(
+			&mut state,
+			Message::RunResult {
+				result: ExecutionResult::Err(raw.to_owned()),
+				publish: None,
+			},
+		);
+		let _ = update(&mut state, Message::ToggleStatusDetail);
+		assert!(state.status_detail_open);
+
+		let _ = update(&mut state, Message::StatusDetailAction(Action::SelectAll));
+		assert_eq!(
+			state
+				.status_detail
+				.as_ref()
+				.and_then(|detail| detail.content.selection()),
+			Some(raw.to_owned())
+		);
+		let _ = update(
+			&mut state,
+			Message::StatusDetailAction(Action::Edit(Edit::Insert('x'))),
+		);
+		assert_eq!(
+			state
+				.status_detail
+				.as_ref()
+				.map(|detail| detail.content.text()),
+			Some(raw.to_owned())
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn editor_activity_retires_transient_sql_feedback() {
+		use crate::editor::EditorMsg;
+		use libaryon::engine::{InputEvent, KeyCode, Modifiers};
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		set_sql_error(&mut state, "syntax error".to_owned(), None);
+
+		clear_transient_sql_status_on_editor_activity(
+			&mut state,
+			&EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Char('j'),
+				modifiers: Modifiers::NONE,
+			}),
+		);
+
+		assert!(state.status_error.is_empty());
+		assert!(state.status_detail.is_none());
+		state.code_editor.shutdown();
 	}
 }

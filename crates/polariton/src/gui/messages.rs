@@ -67,6 +67,10 @@ pub enum Message {
 	RunMarkdownCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
+		/// One-based document line containing the first byte of the fenced
+		/// body. Adapter diagnostics are cell-relative; the host maps them back
+		/// through this origin before presenting them.
+		source_start_line: usize,
 		result: ExecutionResult,
 	},
 	/// A plain Rune buffer finished: its trailing-expression display plus at
@@ -95,6 +99,10 @@ pub enum Message {
 	},
 	SaveWindowSizeAndClose(iced::Size),
 	ShowColumnTypesSaved,
+	CloseStatusDetail,
+	CopyStatusDetail,
+	StatusDetailAction(iced::widget::text_editor::Action),
+	ToggleStatusDetail,
 	ToggleShowColumnTypes(bool),
 }
 

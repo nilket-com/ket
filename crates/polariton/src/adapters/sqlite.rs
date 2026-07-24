@@ -36,16 +36,14 @@ impl DatabaseAdapter for SQLiteAdapter {
 			}
 		};
 		match ast.as_slice() {
-			[_, _, ..] => self
-				.aconn
-				.call(move |conn| conn.execute_batch(&code))
-				.await
-				.map(|_| {
-					ExecutionResult::Batch(vec![ExecutionResult::CommandCompleted(
-						"Batch complete.".to_string(),
-					)])
-				})
-				.unwrap_or_else(|err| ExecutionResult::Err(err.to_string())),
+			[_, _, ..] => {
+				let statements = ast.len();
+				self.aconn
+					.call(move |conn| conn.execute_batch(&code))
+					.await
+					.map(|_| ExecutionResult::Batch { statements })
+					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))
+			}
 			[Statement::Query(_)] => self
 				.aconn
 				.call(move |conn| sqlite_to_df(conn, &code))
