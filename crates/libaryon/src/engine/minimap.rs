@@ -49,6 +49,29 @@ impl MinimapOverlay {
 	}
 }
 
+/// Convert a minimap row into the viewport start line used by every frontend.
+///
+/// The hit identifies a document line, then that line is placed halfway down
+/// the viewport. With an even viewport height this leaves one more visible row
+/// above the hit than below it, preserving a small amount of leading context.
+/// The engine performs the final fold-, wrap-, and EOF-aware clamp.
+pub fn minimap_click_viewport_start_line(
+	local_row: u32,
+	max_doc_line: DocLine,
+	content_height: u32,
+	viewport_line_count: u32,
+) -> Option<DocLine> {
+	if content_height == 0 {
+		return None;
+	}
+	let denominator = u64::from(content_height.saturating_sub(1)).max(1);
+	let clicked_line = u64::from(local_row).saturating_mul(max_doc_line.get()) / denominator;
+	Some(
+		DocLine::new(clicked_line.min(max_doc_line.get()))
+			.saturating_sub(u64::from(viewport_line_count / 2)),
+	)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewRow {
 	pub logical_width: u16,

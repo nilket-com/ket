@@ -377,7 +377,7 @@ fn clear_transient_sql_status_on_editor_activity(
 			| crate::editor::EditorMsg::Click
 			| crate::editor::EditorMsg::CloseDocTab { .. }
 			| crate::editor::EditorMsg::Input(_)
-			| crate::editor::EditorMsg::MinimapGoto(_)
+			| crate::editor::EditorMsg::MinimapGoto { .. }
 			| crate::editor::EditorMsg::Paste(_)
 			| crate::editor::EditorMsg::Scroll(_)
 	);

@@ -5,7 +5,7 @@ use libaryon::core::{
 	SPLIT_DIVIDER_ROWS, ScreenCol, ScreenRow, ViewportId,
 };
 use libaryon::engine::{
-	EditorCommand, MinimapSnapshot, MouseIntent, SplitDirection,
+	EditorCommand, MinimapSnapshot, MouseIntent, SplitDirection, minimap_click_viewport_start_line,
 	viewport_geometry_for_viewport_with_numbering,
 };
 use libaryon::uast::projection::{DocTabSummary, PaneViewport, Viewport};
@@ -190,25 +190,6 @@ fn minimap_click_content_height(full_content_height: u32, preview_row_count: Opt
 			full_content_height.min(rows).max(1)
 		}
 	}
-}
-
-fn minimap_click_viewport_start_line(
-	local_text_row: u16,
-	max_doc_line: DocLine,
-	content_height: u32,
-	viewport_line_count: u32,
-) -> Option<DocLine> {
-	if content_height == 0 {
-		return None;
-	}
-	// Interpolate the clicked document line, then place it approximately halfway
-	// down the viewport. The engine applies the final wrap/fold-aware EOF clamp.
-	let denom = u64::from(content_height.saturating_sub(1)).max(1);
-	let clicked_line = u64::from(local_text_row).saturating_mul(max_doc_line.get()) / denom;
-	Some(
-		DocLine::new(clicked_line.min(max_doc_line.get()))
-			.saturating_sub(u64::from(viewport_line_count / 2)),
-	)
 }
 
 fn cursor_click_command(
@@ -400,7 +381,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 								minimap_click_content_height(content_height, preview_row_count)
 							});
 							if let Some(target) = minimap_click_viewport_start_line(
-								local_text_row,
+								u32::from(local_text_row),
 								pane.max_doc_line,
 								content_height,
 								pane.viewport_line_count,

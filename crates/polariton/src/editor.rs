@@ -24,7 +24,7 @@ use libaryon::engine::{
 };
 use libaryon::engine::{
 	HostEvent, HostPanelId, MinimapSnapshot, PaneDropEdge, PanelRevision, SplitDirection,
-	UiPalette, VisualKind,
+	UiPalette, VisualKind, minimap_click_viewport_start_line,
 };
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
@@ -87,7 +87,10 @@ pub enum EditorMsg {
 	Input(InputEvent),
 	Paste(String),
 	Scroll(i32),
-	MinimapGoto(DocLine),
+	MinimapGoto {
+		pane_id: libaryon::core::PaneId,
+		line: DocLine,
+	},
 	/// Editor-local pointer motion from the workspace mouse_area.
 	PointerMoved(iced::Point),
 	/// Raw window-space pointer motion from the root subscription. Reaches us
@@ -973,7 +976,8 @@ impl CodeEditor {
 			EditorMsg::Scroll(delta) => {
 				self.send(EditorCommand::ScrollViewport(delta));
 			}
-			EditorMsg::MinimapGoto(line) => {
+			EditorMsg::MinimapGoto { pane_id, line } => {
+				self.send(EditorCommand::FocusPane(pane_id));
 				self.send(EditorCommand::ScrollViewportToLine(line));
 			}
 			EditorMsg::PointerMoved(position) => {
@@ -2333,7 +2337,7 @@ fn text_pane_surface<'a>(
 	let editor_content: Element<'_, EditorMsg> = if let Some(minimap) = pane.minimap.as_ref() {
 		row![
 			editor_rows,
-			minimap_view(minimap, pane.theme_colors, palette)
+			minimap_view(pane.pane_id, minimap, pane.theme_colors, palette)
 		]
 		.height(Length::Fill)
 		.into()
@@ -2750,17 +2754,20 @@ const MINIMAP_SCALE: u32 = 2;
 /// `dominant_preview_bin_for_rows`) into a syntax-colored pixel image, then
 /// draws the viewport frame, cursor line, and search markers on top.
 struct MinimapWidget<'a> {
+	pane_id: libaryon::core::PaneId,
 	snapshot: &'a MinimapSnapshot,
 	theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
 	palette: UiPalette,
 }
 
 fn minimap_view<'a>(
+	pane_id: libaryon::core::PaneId,
 	snapshot: &'a MinimapSnapshot,
 	theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
 	palette: UiPalette,
 ) -> Element<'a, EditorMsg> {
 	canvas(MinimapWidget {
+		pane_id,
 		snapshot,
 		theme_colors,
 		palette,
@@ -2860,6 +2867,20 @@ impl MinimapWidget<'_> {
 		} else {
 			MINIMAP_SCALE
 		}
+	}
+
+	fn click_target(&self, position_y: f32, bounds_height: f32) -> Option<DocLine> {
+		let image_height = (bounds_height.max(1.0) as u32) * MINIMAP_SCALE;
+		let content_height = self.content_height(image_height);
+		let local_row = (position_y.max(0.0) * MINIMAP_SCALE as f32) as u32;
+		let overlay = self.snapshot.overlay();
+		let max_doc_line = DocLine::new(overlay.doc_line_count.get().saturating_sub(1));
+		minimap_click_viewport_start_line(
+			local_row,
+			max_doc_line,
+			content_height,
+			overlay.viewport_line_count,
+		)
 	}
 
 	fn render_ink(&self, image: &mut MinimapPixels, content_width: u32, content_height: u32) {
@@ -3202,18 +3223,13 @@ impl canvas::Program<EditorMsg> for MinimapWidget<'_> {
 			return None;
 		};
 		let position = cursor.position_in(bounds)?;
-		let overlay = self.snapshot.overlay();
-		let content_height = self.content_height((bounds.height.max(1.0) as u32) * MINIMAP_SCALE)
-			as f32 / MINIMAP_SCALE as f32;
-		if content_height <= 0.0 {
-			return None;
-		}
-		let fraction = (position.y / content_height).clamp(0.0, 1.0);
-		let line = ((fraction as f64) * overlay.doc_line_count.get().max(1) as f64) as u64;
-		let line = line.min(overlay.doc_line_count.get().saturating_sub(1));
-		Some(canvas::Action::publish(EditorMsg::MinimapGoto(
-			DocLine::new(line),
-		)))
+		Some(
+			canvas::Action::publish(EditorMsg::MinimapGoto {
+				pane_id: self.pane_id,
+				line: self.click_target(position.y, bounds.height)?,
+			})
+			.and_capture(),
+		)
 	}
 
 	fn mouse_interaction(
@@ -3332,7 +3348,7 @@ mod tests {
 	#[test]
 	fn minimap_ink_handle_is_cached_until_content_changes() {
 		use super::{MinimapInkCache, MinimapWidget};
-		use libaryon::core::{DocLine, TokenBin};
+		use libaryon::core::{DocLine, PaneId, TokenBin};
 		use libaryon::engine::{
 			MinimapOverlay, MinimapSnapshot, PREVIEW_BIN_COLUMNS, PreviewRow, PreviewSnapshot,
 			UiPalette,
@@ -3352,6 +3368,7 @@ mod tests {
 		};
 		let snapshot = make_snapshot(TokenCategory::Keyword);
 		let widget = MinimapWidget {
+			pane_id: PaneId::new(1),
 			snapshot: &snapshot,
 			theme_colors: [None; CATEGORY_COUNT],
 			palette: UiPalette::default(),
@@ -3372,6 +3389,65 @@ mod tests {
 		};
 		let third = widget.ink_handle(&cache, 64, 64);
 		assert_ne!(first.id(), third.id(), "edits must rebuild the ink image");
+	}
+
+	#[test]
+	fn minimap_click_centers_the_hit_with_leading_context() {
+		use super::{EditorMsg, MinimapInkCache, MinimapWidget};
+		use iced::widget::canvas::{self, Program as _};
+		use iced::{Point, Rectangle, Size, event, mouse};
+		use libaryon::core::{DocLine, DocLineCount, PaneId};
+		use libaryon::engine::{MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette};
+		use libaryon::svp::rust_highlight::CATEGORY_COUNT;
+
+		let mut overlay = MinimapOverlay::new(DocLine::ZERO, 40, DocLine::ZERO);
+		overlay.doc_line_count = DocLineCount::new(10_001);
+		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot {
+			overlay,
+			bands: vec![1],
+		});
+		let pane_id = PaneId::new(1);
+		let widget = MinimapWidget {
+			pane_id,
+			snapshot: &snapshot,
+			theme_colors: [None; CATEGORY_COUNT],
+			palette: UiPalette::default(),
+		};
+
+		assert_eq!(widget.click_target(0.0, 80.0), Some(DocLine::ZERO));
+		assert_eq!(
+			widget.click_target(40.0, 80.0),
+			Some(DocLine::new(5_011)),
+			"the interpolated line is shifted up by half the 40-line viewport"
+		);
+		assert_eq!(
+			widget.click_target(79.5, 80.0),
+			Some(DocLine::new(9_980)),
+			"the bottom of a 10k-line minimap must request the document tail"
+		);
+
+		let bounds = Rectangle::new(Point::new(100.0, 200.0), Size::new(80.0, 80.0));
+		let action = widget
+			.update(
+				&mut MinimapInkCache::default(),
+				&canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+				bounds,
+				mouse::Cursor::Available(Point::new(140.0, 279.5)),
+			)
+			.expect("minimap press action");
+		let (message, _, status) = action.into_inner();
+		assert_eq!(
+			status,
+			event::Status::Captured,
+			"the editor surface must not reinterpret the minimap press as a text click"
+		);
+		assert!(matches!(
+			message,
+			Some(EditorMsg::MinimapGoto {
+				pane_id: clicked_pane,
+				line,
+			}) if clicked_pane == pane_id && line == DocLine::new(9_980)
+		));
 	}
 
 	#[test]
@@ -3407,6 +3483,7 @@ mod tests {
 			bands: vec![1],
 		});
 		let widget = MinimapWidget {
+			pane_id: libaryon::core::PaneId::new(1),
 			snapshot: &snapshot,
 			theme_colors: [None; CATEGORY_COUNT],
 			palette: UiPalette::default(),
@@ -3504,6 +3581,7 @@ mod tests {
 		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(255, 0, 0));
 		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 255, 0));
 		let widget = MinimapWidget {
+			pane_id: libaryon::core::PaneId::new(1),
 			snapshot: &snapshot,
 			theme_colors,
 			palette: UiPalette::default(),
@@ -5005,7 +5083,16 @@ mod tests {
 				.is_some_and(|pane| pane.viewport_start_line > DocLine::ZERO)
 		);
 
-		let _ = editor.update(EditorMsg::MinimapGoto(DocLine::new(40)));
+		let pane_id = editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.map(|pane| pane.pane_id)
+			.expect("focused minimap pane");
+		let _ = editor.update(EditorMsg::MinimapGoto {
+			pane_id,
+			line: DocLine::new(40),
+		});
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
 			.viewport
@@ -5023,6 +5110,58 @@ mod tests {
 				.as_ref()
 				.and_then(|viewport| viewport.focused_pane())
 				.is_some_and(|pane| pane.viewport_start_line.get() >= 35)
+		);
+
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| viewport.panes.len() < 2 || viewport.focused_pane_id == pane_id)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_ne!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("split viewport")
+				.focused_pane_id,
+			pane_id,
+			"the split should leave another pane focused before the minimap click"
+		);
+
+		let _ = editor.update(EditorMsg::MinimapGoto {
+			pane_id,
+			line: DocLine::new(10),
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport.focused_pane_id != pane_id
+				|| viewport
+					.panes
+					.iter()
+					.find(|pane| pane.pane_id == pane_id)
+					.is_none_or(|pane| pane.viewport_start_line.get() > 15)
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("minimap viewport");
+		assert_eq!(
+			viewport.focused_pane_id, pane_id,
+			"a minimap click must focus the pane that owns the minimap"
+		);
+		assert!(
+			viewport
+				.panes
+				.iter()
+				.find(|pane| pane.pane_id == pane_id)
+				.is_some_and(|pane| pane.viewport_start_line.get() <= 15),
+			"the scroll command must be applied to the clicked pane"
 		);
 	}
 
