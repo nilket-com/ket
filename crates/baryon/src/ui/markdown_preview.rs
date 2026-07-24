@@ -665,13 +665,107 @@ impl<'a> PreviewCanvas<'a> {
 	}
 }
 
+/// The four faces of one family. A configured font need not have all of them,
+/// which is why selection is a fallback chain rather than a lookup.
+struct FontFaces {
+	regular: Option<Font>,
+	bold: Option<Font>,
+	italic: Option<Font>,
+	bold_italic: Option<Font>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaceChoice {
+	Regular,
+	Bold,
+	Italic,
+	BoldItalic,
+}
+
+/// Which faces a family actually provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaceAvailability {
+	regular: bool,
+	bold: bool,
+	italic: bool,
+	bold_italic: bool,
+}
+
+impl FontFaces {
+	fn load(db: &fontdb::Database, families: &[fontdb::Family<'_>]) -> Self {
+		Self {
+			regular: load_preview_font(db, families, fontdb::Weight::NORMAL, fontdb::Style::Normal),
+			bold: load_preview_font(db, families, fontdb::Weight::BOLD, fontdb::Style::Normal),
+			italic: load_preview_font(db, families, fontdb::Weight::NORMAL, fontdb::Style::Italic),
+			bold_italic: load_preview_font(
+				db,
+				families,
+				fontdb::Weight::BOLD,
+				fontdb::Style::Italic,
+			),
+		}
+	}
+
+	fn availability(&self) -> FaceAvailability {
+		FaceAvailability {
+			regular: self.regular.is_some(),
+			bold: self.bold.is_some(),
+			italic: self.italic.is_some(),
+			bold_italic: self.bold_italic.is_some(),
+		}
+	}
+
+	fn face(&self, choice: FaceChoice) -> Option<&Font> {
+		match choice {
+			FaceChoice::Regular => self.regular.as_ref(),
+			FaceChoice::Bold => self.bold.as_ref(),
+			FaceChoice::Italic => self.italic.as_ref(),
+			FaceChoice::BoldItalic => self.bold_italic.as_ref(),
+		}
+	}
+
+	/// The face to draw with, and whether the rasterizer must embolden it.
+	fn pick(&self, bold: bool, italic: bool) -> Option<(&Font, bool)> {
+		let (choice, synthesize_bold) = choose_face(bold, italic, self.availability())?;
+		self.face(choice).map(|font| (font, synthesize_bold))
+	}
+}
+
+/// Face selection, kept free of font data so the policy can be tested.
+///
+/// Weight can be synthesized by emboldening; slant cannot, so a missing italic
+/// costs the slant while a missing bold does not cost the weight. Bold italic
+/// therefore prefers a real italic it can embolden over a real bold it cannot
+/// slant.
+fn choose_face(
+	bold: bool,
+	italic: bool,
+	available: FaceAvailability,
+) -> Option<(FaceChoice, bool)> {
+	let regular = available.regular.then_some((FaceChoice::Regular, false));
+	match (bold, italic) {
+		(true, true) => available
+			.bold_italic
+			.then_some((FaceChoice::BoldItalic, false))
+			.or_else(|| available.italic.then_some((FaceChoice::Italic, true)))
+			.or_else(|| available.bold.then_some((FaceChoice::Bold, false)))
+			.or_else(|| available.regular.then_some((FaceChoice::Regular, true))),
+		(true, false) => available
+			.bold
+			.then_some((FaceChoice::Bold, false))
+			.or_else(|| available.regular.then_some((FaceChoice::Regular, true))),
+		(false, true) => available
+			.italic
+			.then_some((FaceChoice::Italic, false))
+			.or(regular),
+		(false, false) => regular,
+	}
+}
+
 struct TextRenderer {
-	sans_regular: Option<Font>,
-	sans_bold: Option<Font>,
-	serif_regular: Option<Font>,
-	serif_bold: Option<Font>,
-	mono_regular: Option<Font>,
-	mono_bold: Option<Font>,
+	sans: FontFaces,
+	serif: FontFaces,
+	mono: FontFaces,
 }
 
 impl TextRenderer {
@@ -709,48 +803,23 @@ impl TextRenderer {
 		];
 
 		Self {
-			sans_regular: load_preview_font(&db, &sans_families, fontdb::Weight::NORMAL),
-			sans_bold: load_preview_font(&db, &sans_families, fontdb::Weight::BOLD),
-			serif_regular: load_preview_font(&db, &serif_families, fontdb::Weight::NORMAL),
-			serif_bold: load_preview_font(&db, &serif_families, fontdb::Weight::BOLD),
-			mono_regular: load_preview_font(&db, &mono_families, fontdb::Weight::NORMAL),
-			mono_bold: load_preview_font(&db, &mono_families, fontdb::Weight::BOLD),
+			sans: FontFaces::load(&db, &sans_families),
+			serif: FontFaces::load(&db, &serif_families),
+			mono: FontFaces::load(&db, &mono_families),
 		}
 	}
 
+	/// Sans is the last resort for every role: a missing serif or mono family
+	/// should cost the typeface, not the text.
 	fn font_for(&self, spec: TextSpec) -> Option<(&Font, bool)> {
-		match (spec.role, spec.bold) {
-			(FontRole::Sans, true) => self
-				.sans_bold
-				.as_ref()
-				.map(|font| (font, false))
-				.or_else(|| self.sans_regular.as_ref().map(|font| (font, true))),
-			(FontRole::Sans, false) => self.sans_regular.as_ref().map(|font| (font, false)),
-			(FontRole::Serif, true) => self
-				.serif_bold
-				.as_ref()
-				.map(|font| (font, false))
-				.or_else(|| self.serif_regular.as_ref().map(|font| (font, true)))
-				.or_else(|| self.sans_bold.as_ref().map(|font| (font, false)))
-				.or_else(|| self.sans_regular.as_ref().map(|font| (font, true))),
-			(FontRole::Serif, false) => self
-				.serif_regular
-				.as_ref()
-				.map(|font| (font, false))
-				.or_else(|| self.sans_regular.as_ref().map(|font| (font, false))),
-			(FontRole::Mono, true) => self
-				.mono_bold
-				.as_ref()
-				.map(|font| (font, false))
-				.or_else(|| self.mono_regular.as_ref().map(|font| (font, true)))
-				.or_else(|| self.sans_bold.as_ref().map(|font| (font, false)))
-				.or_else(|| self.sans_regular.as_ref().map(|font| (font, true))),
-			(FontRole::Mono, false) => self
-				.mono_regular
-				.as_ref()
-				.map(|font| (font, false))
-				.or_else(|| self.sans_regular.as_ref().map(|font| (font, false))),
-		}
+		let primary = match spec.role {
+			FontRole::Sans => &self.sans,
+			FontRole::Serif => &self.serif,
+			FontRole::Mono => &self.mono,
+		};
+		primary
+			.pick(spec.bold, spec.italic)
+			.or_else(|| self.sans.pick(spec.bold, spec.italic))
 	}
 }
 
@@ -758,10 +827,12 @@ fn load_preview_font(
 	db: &fontdb::Database,
 	families: &[fontdb::Family<'_>],
 	weight: fontdb::Weight,
+	style: fontdb::Style,
 ) -> Option<Font> {
 	let query = fontdb::Query {
 		families,
 		weight,
+		style,
 		..fontdb::Query::default()
 	};
 	let id = db.query(&query)?;
@@ -793,6 +864,7 @@ struct TextSpec {
 	line_gap: u32,
 	color: Rgba<u8>,
 	bold: bool,
+	italic: bool,
 	role: FontRole,
 	fallback_scale_x: u32,
 	fallback_scale_y: u32,
@@ -807,6 +879,7 @@ impl TextSpec {
 			line_gap: (metrics.cell_h.get() / 4).max(2),
 			color,
 			bold: false,
+			italic: false,
 			role: metrics.body_role,
 			fallback_scale_x: metrics.body_scale_x,
 			fallback_scale_y: metrics.body_scale_y,
@@ -850,6 +923,7 @@ impl TextSpec {
 			line_gap: (metrics.cell_h.get() / 3).max(3),
 			color,
 			bold: true,
+			italic: false,
 			role: metrics.body_role,
 			fallback_scale_x: metrics.body_scale_x.saturating_mul(fallback_scale_x).max(1),
 			fallback_scale_y: metrics.body_scale_y.saturating_mul(fallback_scale_y).max(1),
@@ -1824,10 +1898,9 @@ fn draw_inline_text(
 	}
 }
 
-/// Emphasis is not expressed here yet: the rasterizer loads regular and bold
-/// faces only, so `MarkdownInlineStyle::emphasis` renders as body text until
-/// italic faces join `TextRenderer`. Strong maps onto the bold face headings
-/// already use.
+/// Inline style selects the face: strong is weight, emphasis is slant, and a
+/// run that is both asks for both. `TextRenderer` resolves that against what
+/// the configured family actually provides.
 fn inline_text_spec(
 	style: MarkdownInlineStyle,
 	body_spec: TextSpec,
@@ -1838,10 +1911,10 @@ fn inline_text_spec(
 	} else {
 		body_spec
 	};
-	if style.strong {
-		TextSpec { bold: true, ..spec }
-	} else {
-		spec
+	TextSpec {
+		bold: spec.bold || style.strong,
+		italic: spec.italic || style.emphasis,
+		..spec
 	}
 }
 
@@ -2368,6 +2441,146 @@ mod tests {
 				}
 			]
 		);
+	}
+
+	fn all_faces() -> FaceAvailability {
+		FaceAvailability {
+			regular: true,
+			bold: true,
+			italic: true,
+			bold_italic: true,
+		}
+	}
+
+	#[test]
+	fn each_inline_style_selects_its_own_face() {
+		let available = all_faces();
+
+		assert_eq!(
+			choose_face(false, false, available),
+			Some((FaceChoice::Regular, false)),
+			"body text"
+		);
+		assert_eq!(
+			choose_face(true, false, available),
+			Some((FaceChoice::Bold, false)),
+			"strong"
+		);
+		assert_eq!(
+			choose_face(false, true, available),
+			Some((FaceChoice::Italic, false)),
+			"emphasis"
+		);
+		assert_eq!(
+			choose_face(true, true, available),
+			Some((FaceChoice::BoldItalic, false)),
+			"strong emphasis"
+		);
+	}
+
+	/// Weight can be synthesized, slant cannot. A family missing a face should
+	/// cost as little as possible, and never cost the text itself.
+	#[test]
+	fn missing_faces_fall_back_without_losing_the_text() {
+		let regular_only = FaceAvailability {
+			regular: true,
+			bold: false,
+			italic: false,
+			bold_italic: false,
+		};
+		assert_eq!(
+			choose_face(true, false, regular_only),
+			Some((FaceChoice::Regular, true)),
+			"a missing bold is emboldened from regular"
+		);
+		assert_eq!(
+			choose_face(false, true, regular_only),
+			Some((FaceChoice::Regular, false)),
+			"a missing italic renders upright rather than not at all, and is \
+			 never faked by emboldening"
+		);
+		assert_eq!(
+			choose_face(true, true, regular_only),
+			Some((FaceChoice::Regular, true)),
+			"both missing: keep the weight, lose the slant"
+		);
+
+		let no_bold_italic = FaceAvailability {
+			regular: true,
+			bold: true,
+			italic: true,
+			bold_italic: false,
+		};
+		assert_eq!(
+			choose_face(true, true, no_bold_italic),
+			Some((FaceChoice::Italic, true)),
+			"embolden a real italic rather than drop the slant"
+		);
+
+		let bold_only_upright = FaceAvailability {
+			regular: true,
+			bold: true,
+			italic: false,
+			bold_italic: false,
+		};
+		assert_eq!(
+			choose_face(true, true, bold_only_upright),
+			Some((FaceChoice::Bold, false)),
+			"with no italic at all, a real bold beats an emboldened regular"
+		);
+
+		let nothing = FaceAvailability {
+			regular: false,
+			bold: false,
+			italic: false,
+			bold_italic: false,
+		};
+		assert_eq!(
+			choose_face(false, false, nothing),
+			None,
+			"no faces at all falls through to the bitmap renderer"
+		);
+	}
+
+	#[test]
+	fn inline_style_reaches_the_face_selection() {
+		let metrics = FontMetrics {
+			cell_w: PixelWidth::new(8),
+			cell_h: PixelHeight::new(16),
+			body_scale_x: 1,
+			body_scale_y: 2,
+			body_role: FontRole::Sans,
+		};
+		let body = TextSpec::body(&metrics, TEXT_RGBA);
+		let code = TextSpec::code(&metrics, CODE_TEXT_RGBA);
+		let spec_for = |style| inline_text_spec(style, body, code);
+
+		let emphasis = spec_for(MarkdownInlineStyle {
+			emphasis: true,
+			..MarkdownInlineStyle::TEXT
+		});
+		assert!(emphasis.italic && !emphasis.bold);
+
+		let strong_emphasis = spec_for(MarkdownInlineStyle {
+			strong: true,
+			emphasis: true,
+			..MarkdownInlineStyle::TEXT
+		});
+		assert!(strong_emphasis.bold && strong_emphasis.italic);
+
+		let emphasized_code = spec_for(MarkdownInlineStyle {
+			emphasis: true,
+			..MarkdownInlineStyle::CODE
+		});
+		assert!(emphasized_code.italic);
+		assert_eq!(
+			emphasized_code.role,
+			FontRole::Mono,
+			"emphasis does not cost inline code its face"
+		);
+
+		let plain = spec_for(MarkdownInlineStyle::TEXT);
+		assert!(!plain.bold && !plain.italic);
 	}
 
 	#[test]
