@@ -11,7 +11,8 @@ use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineStyle, MarkdownInlineText, line_start_byte,
 	parse_markdown_blocks, source_line_count, source_line_for_byte,
 };
-use libaryon::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
+use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_color};
+use libaryon::svp::rust_highlight::CATEGORY_COUNT;
 use libaryon::uast::projection::MarkdownPreviewSnapshot;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
@@ -363,43 +364,39 @@ struct MarkdownPreviewPalette {
 }
 
 impl MarkdownPreviewPalette {
+	/// Every text color resolves through [`markdown_construct_color`], the same
+	/// table the Markdown source highlighter classifies its tokens with, so a
+	/// construct is one color in a document, in its preview, and in Polariton.
+	/// Backgrounds are chrome — no construct produces them.
 	fn from_theme(
 		theme_colors: &[Option<Rgb>; CATEGORY_COUNT],
 		preview_text: Rgb,
 		accent: Rgb,
 	) -> Self {
-		let accent = color_rgba(accent);
+		let resolved = |construct: MarkdownConstruct, fallback: Rgb| -> Rgba<u8> {
+			color_rgba(markdown_construct_color(construct, theme_colors, fallback))
+		};
 		Self {
-			body_text: themed_rgba(
-				theme_colors,
-				TokenCategory::String,
-				color_rgba(preview_text),
-			),
-			muted: themed_rgba(theme_colors, TokenCategory::Comment, MUTED_RGBA),
-			heading: themed_rgba(theme_colors, TokenCategory::Type, HEADING_RGBA),
-			bullet_marker: themed_rgba(theme_colors, TokenCategory::Operator, accent),
-			ordered_marker: themed_rgba(theme_colors, TokenCategory::Number, accent),
-			task_marker: themed_rgba(theme_colors, TokenCategory::Attribute, accent),
-			quote: themed_rgba(theme_colors, TokenCategory::Comment, QUOTE_RGBA),
-			inline_code: themed_rgba(theme_colors, TokenCategory::Constant, CODE_TEXT_RGBA),
-			code_block: themed_rgba(theme_colors, TokenCategory::Function, CODE_TEXT_RGBA),
+			body_text: resolved(MarkdownConstruct::Body, preview_text),
+			muted: resolved(MarkdownConstruct::Quote, rgba_color(MUTED_RGBA)),
+			heading: resolved(MarkdownConstruct::Heading, rgba_color(HEADING_RGBA)),
+			bullet_marker: resolved(MarkdownConstruct::BulletMarker, accent),
+			ordered_marker: resolved(MarkdownConstruct::OrderedMarker, accent),
+			// A task box is the item's own marker on the left, not a construct
+			// of its own, so it follows the bullet rather than inventing a color.
+			task_marker: resolved(MarkdownConstruct::BulletMarker, accent),
+			quote: resolved(MarkdownConstruct::Quote, rgba_color(QUOTE_RGBA)),
+			inline_code: resolved(MarkdownConstruct::InlineCode, rgba_color(CODE_TEXT_RGBA)),
+			code_block: resolved(MarkdownConstruct::CodeText, rgba_color(CODE_TEXT_RGBA)),
 			code_bg: CODE_BG_RGBA,
 			table_row_alt: TABLE_ROW_ALT_RGBA,
-			rule: themed_rgba(theme_colors, TokenCategory::Punctuation, RULE_RGBA),
+			rule: resolved(MarkdownConstruct::Rule, rgba_color(RULE_RGBA)),
 		}
 	}
 }
 
-fn themed_rgba(
-	theme_colors: &[Option<Rgb>; CATEGORY_COUNT],
-	category: TokenCategory,
-	fallback: Rgba<u8>,
-) -> Rgba<u8> {
-	theme_colors
-		.get(category as usize)
-		.and_then(|color| *color)
-		.map(color_rgba)
-		.unwrap_or(fallback)
+fn rgba_color(color: Rgba<u8>) -> Rgb {
+	Rgb::new(color.0[0], color.0[1], color.0[2])
 }
 
 fn color_rgba(color: Rgb) -> Rgba<u8> {
@@ -2243,6 +2240,7 @@ fn display_char(ch: char) -> char {
 mod tests {
 	use super::*;
 	use libaryon::core::DocLine;
+	use libaryon::svp::rust_highlight::TokenCategory;
 
 	fn inline_text(text: &str) -> MarkdownInlineText {
 		let mut inline = MarkdownInlineText::new();
@@ -2616,16 +2614,54 @@ mod tests {
 			ui_palette.accent,
 		);
 
-		assert_eq!(palette.body_text, Rgba([11, 22, 33, 255]));
-		assert_eq!(palette.muted, Rgba([44, 55, 66, 255]));
-		assert_eq!(palette.quote, Rgba([44, 55, 66, 255]));
-		assert_eq!(palette.heading, Rgba([77, 88, 99, 255]));
-		assert_eq!(palette.bullet_marker, Rgba([111, 122, 133, 255]));
-		assert_eq!(palette.ordered_marker, Rgba([122, 133, 144, 255]));
-		assert_eq!(palette.task_marker, Rgba([144, 155, 166, 255]));
-		assert_eq!(palette.inline_code, Rgba([133, 144, 155, 255]));
-		assert_eq!(palette.code_block, Rgba([155, 166, 177, 255]));
-		assert_eq!(palette.rule, Rgba([166, 177, 188, 255]));
+		// Asserted against the shared table rather than against literals: the
+		// point is that this preview cannot drift from the source highlighter
+		// or from Polariton, not that a heading is any particular color.
+		let expect = |construct, fallback| {
+			color_rgba(markdown_construct_color(construct, &theme_colors, fallback))
+		};
+		assert_eq!(
+			palette.body_text,
+			color_rgba(ui_palette.preview_text),
+			"prose has no category on either side, so it stays default"
+		);
+		assert_eq!(
+			palette.heading,
+			expect(MarkdownConstruct::Heading, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.quote,
+			expect(MarkdownConstruct::Quote, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.muted,
+			expect(MarkdownConstruct::Quote, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.bullet_marker,
+			expect(MarkdownConstruct::BulletMarker, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.ordered_marker,
+			expect(MarkdownConstruct::OrderedMarker, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.task_marker, palette.bullet_marker,
+			"a task box follows its item's marker"
+		);
+		assert_eq!(
+			palette.inline_code,
+			expect(MarkdownConstruct::InlineCode, ui_palette.accent),
+			"inline code is String here exactly as it is in the document"
+		);
+		assert_eq!(
+			palette.code_block,
+			expect(MarkdownConstruct::CodeText, ui_palette.accent)
+		);
+		assert_eq!(
+			palette.rule,
+			expect(MarkdownConstruct::Rule, ui_palette.accent)
+		);
 		assert_eq!(palette.code_bg, CODE_BG_RGBA);
 		assert_eq!(palette.table_row_alt, TABLE_ROW_ALT_RGBA);
 	}
@@ -2892,7 +2928,7 @@ mod tests {
 	}
 
 	#[test]
-	fn render_image_uses_theme_color_for_body_text() {
+	fn render_image_draws_body_text_in_the_default_foreground() {
 		let snapshot = MarkdownPreviewSnapshot {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
@@ -2905,6 +2941,8 @@ mod tests {
 			source_scroll_line: DocLine::ZERO,
 			source_viewport_line_count: 24,
 		};
+		// A loud String color must not leak onto prose: the document does not
+		// color its own body text, so neither does the preview.
 		let mut theme_colors = [None; CATEGORY_COUNT];
 		theme_colors[TokenCategory::String as usize] = Some(Rgb::new(255, 0, 0));
 
@@ -2921,11 +2959,18 @@ mod tests {
 		)
 		.to_rgba8();
 
-		assert!(image.pixels().any(|pixel| {
-			*pixel != BG_RGBA
-				&& pixel[0] > pixel[1].saturating_add(8)
-				&& pixel[0] > pixel[2].saturating_add(8)
-		}));
+		assert!(
+			image.pixels().any(|pixel| *pixel != BG_RGBA),
+			"body text is drawn"
+		);
+		assert!(
+			!image.pixels().any(|pixel| {
+				*pixel != BG_RGBA
+					&& pixel[0] > pixel[1].saturating_add(8)
+					&& pixel[0] > pixel[2].saturating_add(8)
+			}),
+			"prose must not pick up the String color"
+		);
 	}
 
 	#[test]
@@ -2943,10 +2988,10 @@ mod tests {
 			source_viewport_line_count: 24,
 		};
 		let mut theme_colors = [None; CATEGORY_COUNT];
+		// Inline code takes String, the category the document gives it.
 		theme_colors[TokenCategory::String as usize] = Some(Rgb::new(255, 0, 0));
 		theme_colors[TokenCategory::Operator as usize] = Some(Rgb::new(0, 0, 255));
 		theme_colors[TokenCategory::Number as usize] = Some(Rgb::new(255, 0, 255));
-		theme_colors[TokenCategory::Constant as usize] = Some(Rgb::new(0, 255, 0));
 
 		let image = render_markdown_preview_image_with_theme(
 			&snapshot,
@@ -2970,11 +3015,6 @@ mod tests {
 			*pixel != BG_RGBA
 				&& pixel[2] > pixel[0].saturating_add(8)
 				&& pixel[2] > pixel[1].saturating_add(8)
-		}));
-		assert!(image.pixels().any(|pixel| {
-			*pixel != BG_RGBA
-				&& pixel[1] > pixel[0].saturating_add(8)
-				&& pixel[1] > pixel[2].saturating_add(8)
 		}));
 		assert!(image.pixels().any(|pixel| {
 			*pixel != BG_RGBA

@@ -1,6 +1,6 @@
-use crate::core::DocByte;
+use crate::core::{DocByte, Rgb};
 use crate::svp::markdown_parse::{MarkdownToken, MarkdownTokenKind, tokenize, translate_offset};
-use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan, TokenCategory};
 
 pub fn highlight_markdown(
 	viewport_bytes: &[u8],
@@ -14,23 +14,87 @@ pub fn highlight_markdown(
 	out
 }
 
+/// A Markdown construct, named independently of how it appears in source.
+///
+/// A preview renders a heading with no `#` and a bold run with no `**`, so it
+/// cannot classify by token. Naming the construct lets every surface ask the
+/// same question — what color is a heading? — and get one answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownConstruct {
+	/// Prose. Deliberately uncategorized: the source pane draws body text in
+	/// the editor's default foreground, so a preview that colors it would be
+	/// showing the reader something the document does not say.
+	Body,
+	Heading,
+	InlineCode,
+	CodeText,
+	/// The `*`/`**` runs, and by extension the text they wrap.
+	Emphasis,
+	BulletMarker,
+	OrderedMarker,
+	Quote,
+	Rule,
+	FenceInfo,
+	Link,
+}
+
+/// The one mapping from Markdown construct to theme category.
+///
+/// Both the source highlighter below and the preview renderers in each head
+/// read this, so a construct cannot end up one color in a document and another
+/// in its preview, or one color in Baryon and another in Polariton. `None`
+/// means the surface's default foreground.
+pub const fn markdown_category(construct: MarkdownConstruct) -> Option<TokenCategory> {
+	match construct {
+		MarkdownConstruct::Body => None,
+		MarkdownConstruct::Heading => Some(TokenCategory::Type),
+		MarkdownConstruct::InlineCode | MarkdownConstruct::CodeText => Some(TokenCategory::String),
+		MarkdownConstruct::Emphasis | MarkdownConstruct::BulletMarker => {
+			Some(TokenCategory::Operator)
+		}
+		MarkdownConstruct::OrderedMarker => Some(TokenCategory::Number),
+		MarkdownConstruct::Quote => Some(TokenCategory::Comment),
+		MarkdownConstruct::Rule => Some(TokenCategory::Punctuation),
+		MarkdownConstruct::FenceInfo | MarkdownConstruct::Link => Some(TokenCategory::Function),
+	}
+}
+
+/// Resolve a construct against a theme, falling back to a default foreground.
+pub fn markdown_construct_color(
+	construct: MarkdownConstruct,
+	theme_colors: &[Option<Rgb>; CATEGORY_COUNT],
+	default_foreground: Rgb,
+) -> Rgb {
+	markdown_category(construct)
+		.and_then(|category| theme_colors[category as usize])
+		.unwrap_or(default_foreground)
+}
+
 fn classify(token: MarkdownToken, src: &[u8]) -> TokenCategory {
-	match token.kind {
-		MarkdownTokenKind::HeadingMarker | MarkdownTokenKind::HeadingText => TokenCategory::Type,
+	let construct = match token.kind {
+		MarkdownTokenKind::HeadingMarker | MarkdownTokenKind::HeadingText => {
+			MarkdownConstruct::Heading
+		}
 		MarkdownTokenKind::Fence
 		| MarkdownTokenKind::HorizontalRule
-		| MarkdownTokenKind::Punctuation => TokenCategory::Punctuation,
-		MarkdownTokenKind::ListMarker if src[token.start].is_ascii_digit() => TokenCategory::Number,
-		MarkdownTokenKind::ListMarker => TokenCategory::Operator,
-		MarkdownTokenKind::FenceInfo | MarkdownTokenKind::LinkLabel => TokenCategory::Function,
-		MarkdownTokenKind::CodeBlockText
-		| MarkdownTokenKind::InlineCode
-		| MarkdownTokenKind::LinkDestination => TokenCategory::String,
-		MarkdownTokenKind::BlockQuoteMarker | MarkdownTokenKind::HtmlComment => {
-			TokenCategory::Comment
+		| MarkdownTokenKind::Punctuation => MarkdownConstruct::Rule,
+		MarkdownTokenKind::ListMarker if src[token.start].is_ascii_digit() => {
+			MarkdownConstruct::OrderedMarker
 		}
-		MarkdownTokenKind::Emphasis => TokenCategory::Operator,
-	}
+		MarkdownTokenKind::ListMarker => MarkdownConstruct::BulletMarker,
+		MarkdownTokenKind::FenceInfo => MarkdownConstruct::FenceInfo,
+		MarkdownTokenKind::LinkLabel => MarkdownConstruct::Link,
+		MarkdownTokenKind::CodeBlockText => MarkdownConstruct::CodeText,
+		MarkdownTokenKind::InlineCode => MarkdownConstruct::InlineCode,
+		MarkdownTokenKind::LinkDestination => MarkdownConstruct::CodeText,
+		MarkdownTokenKind::BlockQuoteMarker | MarkdownTokenKind::HtmlComment => {
+			MarkdownConstruct::Quote
+		}
+		MarkdownTokenKind::Emphasis => MarkdownConstruct::Emphasis,
+	};
+	// Every token kind names a construct, so body text — which has no token —
+	// is the only case the map leaves uncolored.
+	markdown_category(construct).unwrap_or(TokenCategory::Unclassified)
 }
 
 fn push(
@@ -97,6 +161,57 @@ mod tests {
 		assert!(h.iter().any(|span| span.category == TokenCategory::Number
 			&& span.start == DocByte::new(7)
 			&& span.end == DocByte::new(10)));
+	}
+
+	/// The table and the highlighter must not drift apart: what the source pane
+	/// paints a construct is what a preview asks the table for.
+	#[test]
+	fn highlighter_categories_agree_with_the_construct_table() {
+		let cases: &[(&[u8], MarkdownConstruct, DocByte)] = &[
+			(b"# Title\n", MarkdownConstruct::Heading, DocByte::new(2)),
+			(b"- item\n", MarkdownConstruct::BulletMarker, DocByte::ZERO),
+			(
+				b"12. item\n",
+				MarkdownConstruct::OrderedMarker,
+				DocByte::ZERO,
+			),
+			(b"> quote\n", MarkdownConstruct::Quote, DocByte::ZERO),
+			(b"---\n", MarkdownConstruct::Rule, DocByte::ZERO),
+			(
+				b"a `code` b\n",
+				MarkdownConstruct::InlineCode,
+				DocByte::new(2),
+			),
+			(
+				b"a *emph* b\n",
+				MarkdownConstruct::Emphasis,
+				DocByte::new(2),
+			),
+		];
+
+		for (source, construct, at) in cases {
+			let expected = markdown_category(*construct).expect("construct is colored");
+			assert!(
+				spans(source)
+					.iter()
+					.any(|span| span.start == *at && span.category == expected),
+				"{construct:?} in {:?} must be {expected:?}",
+				std::str::from_utf8(source).unwrap()
+			);
+		}
+	}
+
+	/// Prose is the one construct with no category, on either side.
+
+	#[test]
+	fn body_text_stays_uncolored() {
+		assert_eq!(markdown_category(MarkdownConstruct::Body), None);
+		assert!(
+			spans(b"just prose\n")
+				.iter()
+				.all(|span| span.category != TokenCategory::Unclassified),
+			"prose produces no span at all, rather than an unclassified one"
+		);
 	}
 
 	#[test]

@@ -29,7 +29,7 @@ use libaryon::engine::{
 use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
 };
-use libaryon::svp::rust_highlight::TokenCategory;
+use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_color};
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
@@ -2457,27 +2457,24 @@ fn markdown_preview_surface<'a>(
 
 /// The colors the preview draws Markdown in.
 ///
-/// These are the *same* theme entries the source pane colors its Markdown
-/// tokens with, read straight from the snapshot: a heading is `Type` on both
-/// sides, inline code is `String` on both sides. Reading the categories
-/// directly keeps the two panes in agreement under any theme without a
-/// preview-specific palette to maintain.
-/// Body text included: `Punctuation` is the neutral foreground every theme
-/// defines, so prose follows the theme rather than sitting at UI white. Bold
-/// and italic take categories of their own — the preview draws no `**`, so the
-/// color is what has to carry the emphasis the markers would have shown.
+/// Every entry comes from [`markdown_construct_color`], the same table the
+/// source highlighter classifies its tokens with. A construct therefore cannot
+/// be one color in a document and another in its preview — and Baryon, reading
+/// the same table, cannot disagree with either.
+///
+/// Bold and italic are not in the table's gift: on the left only the `*`
+/// markers take the emphasis color, and the preview draws no markers, so an
+/// emphasized run stays prose-colored and lets weight and slant carry it.
+/// Coloring the run here would show more than the document says.
 #[derive(Clone, Copy)]
 struct MarkdownPreviewColors {
 	body: Rgb,
 	heading: Rgb,
 	inline_code: Rgb,
-	strong: Rgb,
-	emphasis: Rgb,
 	bullet: Rgb,
 	ordered_marker: Rgb,
 	quote: Rgb,
 	rule: Rgb,
-	muted: Rgb,
 	row_alt: Rgb,
 }
 
@@ -2486,24 +2483,18 @@ impl MarkdownPreviewColors {
 		theme_colors: [Option<Rgb>; libaryon::svp::rust_highlight::CATEGORY_COUNT],
 		palette: UiPalette,
 	) -> Self {
-		let themed = |category: TokenCategory, fallback: Rgb| -> Rgb {
-			theme_colors[category as usize].unwrap_or(fallback)
+		let resolved = |construct: MarkdownConstruct| -> Rgb {
+			markdown_construct_color(construct, &theme_colors, palette.editor_text)
 		};
-		let body = themed(TokenCategory::Punctuation, palette.editor_text);
 		Self {
-			body,
-			heading: themed(TokenCategory::Type, palette.editor_text),
-			inline_code: themed(TokenCategory::String, palette.gutter_accent),
-			// Emphasis markers are `Operator` on the left, so italic keeps that
-			// color; bold takes `Keyword` to stay distinct from it, since weight
-			// alone reads weakly against colored prose.
-			strong: themed(TokenCategory::Keyword, body),
-			emphasis: themed(TokenCategory::Operator, body),
-			bullet: themed(TokenCategory::Operator, palette.gutter_accent),
-			ordered_marker: themed(TokenCategory::Number, palette.gutter_accent),
-			quote: themed(TokenCategory::Comment, palette.preview_text),
-			rule: themed(TokenCategory::Punctuation, palette.editor_text),
-			muted: themed(TokenCategory::Comment, palette.preview_text),
+			body: resolved(MarkdownConstruct::Body),
+			heading: resolved(MarkdownConstruct::Heading),
+			inline_code: resolved(MarkdownConstruct::InlineCode),
+			bullet: resolved(MarkdownConstruct::BulletMarker),
+			ordered_marker: resolved(MarkdownConstruct::OrderedMarker),
+			quote: resolved(MarkdownConstruct::Quote),
+			rule: resolved(MarkdownConstruct::Rule),
+			// Banding is chrome, not syntax: no construct produces it.
 			row_alt: palette.preview_surface,
 		}
 	}
@@ -2621,7 +2612,7 @@ fn markdown_block_surface<'a>(
 		MarkdownBlock::Html { text: raw, .. } => text(raw.as_str())
 			.font(EDITOR_FONT)
 			.size(metrics::TEXT_SIZE)
-			.color(color(colors.muted))
+			.color(color(colors.quote))
 			.into(),
 		// Fences are rendered by `markdown_code_block_rows`, which needs source
 		// coordinates this function does not carry.
@@ -2636,9 +2627,9 @@ fn markdown_block_surface<'a>(
 /// Inline runs, styled by the shared model: bold, italic, and inline code are
 /// document semantics, so they are honored rather than shown as their markers.
 ///
-/// Weight and slant are joined by color, because the markers that would have
-/// carried the emphasis on the left are not drawn here. Inline code wins over
-/// emphasis when a run is both — a bold `identifier` is still an identifier.
+/// Emphasis carries weight and slant only, matching what the source pane shows
+/// for the same text; see [`MarkdownPreviewColors`]. Inline code keeps its
+/// color when a run is both — a bold `identifier` is still an identifier.
 fn markdown_inline_surface<'a>(
 	inline: &'a MarkdownInlineText,
 	colors: MarkdownPreviewColors,
@@ -2662,10 +2653,6 @@ fn markdown_inline_surface<'a>(
 			}
 			let span_color = if style.code {
 				colors.inline_code
-			} else if style.strong {
-				colors.strong
-			} else if style.emphasis {
-				colors.emphasis
 			} else {
 				foreground
 			};
@@ -3634,10 +3621,12 @@ mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
 		MarkdownBlock, MarkdownPreviewColors, Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb,
-		SplitDirection, TokenCategory, UiPalette, fence_body_start, markdown_code_fragments,
-		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
+		SplitDirection, UiPalette, fence_body_start, markdown_code_fragments, metrics,
+		pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
 		preview_source_window, visible_blocks,
 	};
+	use libaryon::svp::markdown_highlight::MarkdownConstruct;
+	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -6070,14 +6059,12 @@ mod tests {
 		let number = Rgb::new(100, 110, 120);
 		let comment = Rgb::new(130, 140, 150);
 		let punctuation = Rgb::new(160, 170, 180);
-		let keyword = Rgb::new(190, 200, 210);
 		theme_colors[TokenCategory::Type as usize] = Some(heading);
 		theme_colors[TokenCategory::String as usize] = Some(string);
 		theme_colors[TokenCategory::Operator as usize] = Some(operator);
 		theme_colors[TokenCategory::Number as usize] = Some(number);
 		theme_colors[TokenCategory::Comment as usize] = Some(comment);
 		theme_colors[TokenCategory::Punctuation as usize] = Some(punctuation);
-		theme_colors[TokenCategory::Keyword as usize] = Some(keyword);
 		let palette = UiPalette::default();
 
 		let colors = MarkdownPreviewColors::new(theme_colors, palette);
@@ -6088,22 +6075,50 @@ mod tests {
 		assert_eq!(colors.ordered_marker, number);
 		assert_eq!(colors.quote, comment);
 		assert_eq!(colors.rule, punctuation);
+		// Prose has no category on either side, so it stays at the default
+		// foreground rather than picking up a color the document lacks.
+		assert_eq!(colors.body, palette.editor_text);
+	}
+
+	/// The preview must not invent a color the source pane does not show for
+	/// the same construct, in either direction.
+	#[test]
+	fn preview_colors_match_the_source_highlighter_category_for_category() {
+		let mut theme_colors = [None; libaryon::svp::rust_highlight::CATEGORY_COUNT];
+		for (index, slot) in theme_colors.iter_mut().enumerate() {
+			*slot = Some(Rgb::new(index as u8, 0, 0));
+		}
+		let palette = UiPalette::default();
+
+		let colors = MarkdownPreviewColors::new(theme_colors, palette);
+		let source_color = |construct| {
+			libaryon::svp::markdown_highlight::markdown_construct_color(
+				construct,
+				&theme_colors,
+				palette.editor_text,
+			)
+		};
+
+		assert_eq!(colors.heading, source_color(MarkdownConstruct::Heading));
 		assert_eq!(
-			colors.body, punctuation,
-			"prose follows the theme's neutral foreground, not UI white"
+			colors.inline_code,
+			source_color(MarkdownConstruct::InlineCode)
 		);
-		assert_eq!(colors.emphasis, operator, "italic keeps the marker color");
+		assert_eq!(colors.bullet, source_color(MarkdownConstruct::BulletMarker));
 		assert_eq!(
-			colors.strong, keyword,
-			"bold stays distinct from italic and from prose"
+			colors.ordered_marker,
+			source_color(MarkdownConstruct::OrderedMarker)
 		);
-		assert_ne!(colors.strong, colors.body);
+		assert_eq!(colors.quote, source_color(MarkdownConstruct::Quote));
+		assert_eq!(colors.rule, source_color(MarkdownConstruct::Rule));
+		assert_eq!(colors.body, source_color(MarkdownConstruct::Body));
 	}
 
 	/// A theme that leaves a category unset must not black out the text that
-	/// would have used it.
+	/// would have used it. Everything falls back to the one default foreground
+	/// the source pane also falls back to.
 	#[test]
-	fn preview_colors_fall_back_to_the_ui_palette() {
+	fn preview_colors_fall_back_to_the_default_foreground() {
 		let palette = UiPalette::default();
 
 		let colors = MarkdownPreviewColors::new(
@@ -6111,15 +6126,17 @@ mod tests {
 			palette,
 		);
 
-		assert_eq!(colors.heading, palette.editor_text);
-		assert_eq!(colors.inline_code, palette.gutter_accent);
-		assert_eq!(colors.quote, palette.preview_text);
-		assert_eq!(colors.rule, palette.editor_text);
-		assert_eq!(colors.body, palette.editor_text);
-		// Emphasis with no category of its own must fall back to prose rather
-		// than to an unrelated UI color.
-		assert_eq!(colors.strong, palette.editor_text);
-		assert_eq!(colors.emphasis, palette.editor_text);
+		for resolved in [
+			colors.heading,
+			colors.inline_code,
+			colors.bullet,
+			colors.ordered_marker,
+			colors.quote,
+			colors.rule,
+			colors.body,
+		] {
+			assert_eq!(resolved, palette.editor_text);
+		}
 	}
 
 	#[test]
