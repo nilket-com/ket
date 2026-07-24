@@ -14,10 +14,10 @@ use crate::plot::composition::PlotComposition;
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
-	Space, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
+	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
-use iced::{Background, Color, Element, Event, Length, Subscription, Task, event, time};
-use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb};
+use iced::{Background, Color, Element, Event, Length, Subscription, Task, Theme, event, time};
+use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, ViewId};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
 	Modifiers,
@@ -74,6 +74,14 @@ pub enum EditorMsg {
 	EngineReady,
 	CursorBlinkTick(time::Instant),
 	WindowFocused(bool),
+	ActivateDocTab {
+		pane_id: libaryon::core::PaneId,
+		view_id: ViewId,
+	},
+	CloseDocTab {
+		pane_id: libaryon::core::PaneId,
+		view_id: ViewId,
+	},
 	Dashboard(DashboardMsg),
 	Input(InputEvent),
 	Paste(String),
@@ -851,6 +859,16 @@ impl CodeEditor {
 				self.cursor_blink
 					.set_window_focused(focused, time::Instant::now());
 			}
+			EditorMsg::ActivateDocTab { pane_id, view_id } => {
+				self.cursor_blink.note_activity(time::Instant::now());
+				self.send(EditorCommand::ActivateDocTab { pane_id, view_id });
+				self.request_content();
+			}
+			EditorMsg::CloseDocTab { pane_id, view_id } => {
+				self.cursor_blink.note_activity(time::Instant::now());
+				self.send(EditorCommand::CloseDocTab { pane_id, view_id });
+				self.request_content();
+			}
 			EditorMsg::Dashboard(_) => {}
 			EditorMsg::NotebookPlot { identity, message } => {
 				if let Some(NotebookCellOutput::Plot { surface }) =
@@ -992,8 +1010,7 @@ impl CodeEditor {
 					}
 				}
 			};
-			let title = pane_title(pane);
-			let content = pane_surface(pane.pane_id, title, focused, palette, content);
+			let content = pane_surface(pane, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
@@ -1778,44 +1795,132 @@ fn pane_title(pane: &libaryon::uast::projection::PaneViewport) -> &str {
 	)
 }
 
-/// Common workspace chrome. Its header is intentionally simple: a stable drag
-/// handle now, and the future home of pane tabs and close controls.
+fn tab_label(
+	tab: &libaryon::uast::projection::DocTabSummary,
+	active_fallback: Option<&str>,
+) -> String {
+	let title = if tab.title == "[No Name]" {
+		active_fallback.unwrap_or(tab.title.as_str())
+	} else {
+		tab.title.as_str()
+	};
+	format!("{}{}", title, if tab.is_dirty { " +" } else { "" })
+}
+
+fn tab_button_style(
+	active: bool,
+	pane_focused: bool,
+	palette: UiPalette,
+	status: button::Status,
+) -> button::Style {
+	let base_surface = if pane_focused {
+		palette.tab_surface
+	} else {
+		palette.tab_active_surface
+	};
+	let active_surface = if pane_focused {
+		palette.tab_active_surface
+	} else {
+		palette.tab_surface
+	};
+	let background =
+		if active || matches!(status, button::Status::Hovered | button::Status::Pressed) {
+			active_surface
+		} else {
+			base_surface
+		};
+	button::Style {
+		background: Some(Background::Color(color(background))),
+		text_color: color(if active {
+			palette.tab_accent
+		} else {
+			palette.tab_text
+		}),
+		..button::Style::default()
+	}
+}
+
+fn pane_tab_bar<'a>(
+	pane: &'a libaryon::uast::projection::PaneViewport,
+	focused: bool,
+	palette: UiPalette,
+) -> Element<'a, EditorMsg> {
+	let header_background = color(if focused {
+		palette.tab_surface
+	} else {
+		palette.tab_active_surface
+	});
+	let drag_handle = mouse_area(
+		container(
+			text("⠿⠿")
+				.font(EDITOR_FONT)
+				.size(13.0)
+				.color(color(palette.tab_text)),
+		)
+		.padding([2, 7])
+		.height(Length::Fixed(PANE_HEADER_HEIGHT)),
+	)
+	.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
+	.on_release(EditorMsg::Release);
+
+	let mut tabs = row![drag_handle]
+		.spacing(1)
+		.height(Length::Fixed(PANE_HEADER_HEIGHT));
+	for (index, tab) in pane.tabs.iter().enumerate() {
+		let active = index == pane.active_doctab_index;
+		let fallback = active.then(|| pane_title(pane));
+		let label = tab_label(tab, fallback);
+		let font = iced::Font {
+			weight: if active {
+				iced::font::Weight::Bold
+			} else {
+				iced::font::Weight::Normal
+			},
+			..EDITOR_FONT
+		};
+		let pane_id = pane.pane_id;
+		let view_id = tab.view_id;
+		let title = button(text(label).font(font).size(13.0))
+			.padding([2, 6])
+			.height(Length::Fixed(PANE_HEADER_HEIGHT))
+			.style(move |_theme: &Theme, status| tab_button_style(active, focused, palette, status))
+			.on_press(EditorMsg::ActivateDocTab { pane_id, view_id });
+		let close = button(text("x").font(font).size(13.0))
+			.padding([2, 5])
+			.height(Length::Fixed(PANE_HEADER_HEIGHT))
+			.style(move |_theme: &Theme, status| tab_button_style(active, focused, palette, status))
+			.on_press(EditorMsg::CloseDocTab { pane_id, view_id });
+		tabs = tabs.push(row![title, close].spacing(0));
+	}
+	tabs = tabs.push(
+		mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+			.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
+			.on_release(EditorMsg::Release),
+	);
+
+	container(tabs)
+		.width(Length::Fill)
+		.height(Length::Fixed(PANE_HEADER_HEIGHT))
+		.style(move |_| container::Style {
+			background: Some(Background::Color(header_background)),
+			..Default::default()
+		})
+		.into()
+}
+
+/// Common workspace chrome. Libaryon owns tab order, active identity, titles,
+/// and dirty state; Polariton renders those projections as compact controls.
 fn pane_surface<'a>(
-	pane_id: libaryon::core::PaneId,
-	title: &str,
+	pane: &'a libaryon::uast::projection::PaneViewport,
 	focused: bool,
 	palette: UiPalette,
 	content: Element<'a, EditorMsg>,
 ) -> Element<'a, EditorMsg> {
-	let header_background = color(if focused {
-		palette.tab_active_surface
-	} else {
-		palette.tab_surface
-	});
 	let content = pane_content_frame(content, focused, palette);
 	container(
-		column![
-			mouse_area(
-				container(
-					text(format!("⠿⠿  {title}"))
-						.font(EDITOR_FONT)
-						.size(13.0)
-						.color(color(palette.tab_text)),
-				)
-				.padding([2, 7])
-				.width(Length::Fill)
-				.height(Length::Fixed(PANE_HEADER_HEIGHT))
-				.style(move |_| container::Style {
-					background: Some(Background::Color(header_background)),
-					..Default::default()
-				}),
-			)
-			.on_press(EditorMsg::PaneDragStarted(pane_id))
-			.on_release(EditorMsg::Release),
-			content,
-		]
-		.width(Length::Fill)
-		.height(Length::Fill),
+		column![pane_tab_bar(pane, focused, palette), content,]
+			.width(Length::Fill)
+			.height(Length::Fill),
 	)
 	.width(Length::Fill)
 	.height(Length::Fill)
@@ -3250,6 +3355,118 @@ mod tests {
 			editor.active_language_id().map(LanguageId::as_str),
 			Some("markdown")
 		);
+	}
+
+	#[test]
+	fn projected_tabs_keep_compact_labels_and_distinct_active_style() {
+		use super::{tab_button_style, tab_label};
+		use iced::widget::button;
+		use libaryon::core::{BufferId, ViewId};
+		use libaryon::uast::projection::DocTabSummary;
+
+		let clean = DocTabSummary {
+			buffer_id: BufferId::new(1),
+			view_id: ViewId::new(1),
+			title: "query.sql".to_owned(),
+			is_dirty: false,
+		};
+		let dirty = DocTabSummary {
+			is_dirty: true,
+			..clean.clone()
+		};
+		let unnamed = DocTabSummary {
+			title: "[No Name]".to_owned(),
+			..clean.clone()
+		};
+		assert_eq!(tab_label(&clean, None), "query.sql");
+		assert_eq!(tab_label(&dirty, None), "query.sql +");
+		assert_eq!(tab_label(&unnamed, Some("SQL")), "SQL");
+
+		let palette = libaryon::engine::UiPalette::default();
+		let active = tab_button_style(true, true, palette, button::Status::Active);
+		let inactive = tab_button_style(false, true, palette, button::Status::Active);
+		assert_eq!(active.text_color, super::color(palette.tab_accent));
+		assert_eq!(
+			active.background,
+			Some(iced::Background::Color(super::color(
+				palette.tab_active_surface
+			)))
+		);
+		assert_eq!(inactive.text_color, super::color(palette.tab_text));
+		assert_eq!(
+			inactive.background,
+			Some(iced::Background::Color(super::color(palette.tab_surface)))
+		);
+	}
+
+	#[test]
+	fn projected_tab_controls_activate_and_close_exact_views() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let pane_id = editor.viewport.as_ref().unwrap().focused_pane_id;
+		let first_view = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.focused_pane()
+			.unwrap()
+			.tabs[0]
+			.view_id;
+
+		editor.send(EditorCommand::DocTabNew);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.tabs.len() != 2)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let second_view = {
+			let pane = editor.viewport.as_ref().unwrap().focused_pane().unwrap();
+			assert_eq!(pane.active_doctab_index, 1);
+			pane.tabs[1].view_id
+		};
+
+		let _ = editor.update(EditorMsg::ActivateDocTab {
+			pane_id,
+			view_id: first_view,
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.tabs[pane.active_doctab_index].view_id != first_view)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let pane = editor.viewport.as_ref().unwrap().focused_pane().unwrap();
+		assert_eq!(pane.tabs[pane.active_doctab_index].view_id, first_view);
+
+		let _ = editor.update(EditorMsg::CloseDocTab {
+			pane_id,
+			view_id: second_view,
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.is_none_or(|pane| pane.tabs.len() != 1)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let pane = editor.viewport.as_ref().unwrap().focused_pane().unwrap();
+		assert_eq!(pane.tabs.len(), 1);
+		assert_eq!(pane.tabs[0].view_id, first_view);
 	}
 
 	#[test]
