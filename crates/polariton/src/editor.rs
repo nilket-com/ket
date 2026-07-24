@@ -1126,6 +1126,19 @@ impl CodeEditor {
 		}
 	}
 
+	/// Relinquish the engine when the owning GUI process is already exiting.
+	///
+	/// Joining here can make language-worker teardown part of the user's
+	/// perceived close latency. Baryon's frontend deliberately uses the same
+	/// process-owned lifetime: the engine has either accepted `:q`, or process
+	/// termination is about to reclaim it. Ordinary `CodeEditor` drops still
+	/// use [`Self::shutdown`] so tests and non-process owners remain tidy.
+	pub fn detach_for_process_exit(&mut self) {
+		if let Some(engine) = self.engine.take() {
+			engine.detach();
+		}
+	}
+
 	fn send(&self, command: EditorCommand) -> bool {
 		if self.quit_requested {
 			return false;
@@ -4558,6 +4571,29 @@ mod tests {
 			code: KeyCode::Char('x'),
 			modifiers: Modifiers::NONE,
 		}));
+	}
+
+	#[test]
+	fn process_exit_detach_never_joins_the_engine() {
+		let mut editor = CodeEditor::new("select 1;");
+		let commands = editor.commands.clone();
+		let started = Instant::now();
+
+		editor.detach_for_process_exit();
+
+		assert!(
+			started.elapsed() < Duration::from_millis(100),
+			"process-final teardown must not wait for engine workers"
+		);
+		assert!(
+			editor.engine.is_none(),
+			"the ordinary Drop path must have no engine left to join"
+		);
+
+		// This test process continues after the GUI-style detach, unlike the
+		// real application process. Retire its engine asynchronously so it does
+		// not leave a live worker behind for the rest of the suite.
+		let _ = commands.send(EditorCommand::Quit);
 	}
 
 	#[test]

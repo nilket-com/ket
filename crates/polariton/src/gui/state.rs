@@ -46,6 +46,15 @@ struct AppState {
 	pending_runs: VecDeque<PendingRun>,
 }
 
+impl Drop for AppState {
+	fn drop(&mut self) {
+		// The application state is process-final. Do not turn teardown of
+		// rust-analyzer or another language worker into visible shutdown
+		// latency; Baryon's terminal frontend follows the same ownership rule.
+		self.code_editor.detach_for_process_exit();
+	}
+}
+
 #[derive(Clone, Copy)]
 enum PendingRunKind {
 	Buffer,
