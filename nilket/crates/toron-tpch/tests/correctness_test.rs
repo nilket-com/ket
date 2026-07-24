@@ -2190,6 +2190,7 @@ fn q11_scale_table_is_bit_exact_and_carries_its_sql_literal() {
 	for (scale_factor, hundredths_n, literal) in [
 		(0.01, 1, "0.01"),
 		(1.0, 100, "0.0001"),
+		(8.0, 800, "0.0000125"),
 		(10.0, 1_000, "0.00001"),
 	] {
 		let scale = Q11Scale::try_from_f64(scale_factor).expect("supported q11 scale");
@@ -2264,7 +2265,7 @@ fn q11_exact_threshold_is_integer_comparison() {
 
 #[test]
 fn q11_scaled_threshold_is_reduced_checked_and_strict() {
-	for scale_factor in [0.01, 1.0, 10.0] {
+	for scale_factor in [0.01, 1.0, 8.0, 10.0] {
 		let scale = Q11Scale::try_from_f64(scale_factor).expect("supported q11 scale");
 		let boundary = 100 * scale.hundredths_n();
 		assert!(
@@ -2301,7 +2302,7 @@ fn q11_empty_oracle_reaches_and_trips_non_vacuity_guard() {
 #[test]
 #[ignore = "ADR 422 scale census includes the persisted-board sf=10 volume"]
 fn q11_scaled_oracles_are_selective_at_every_admitted_scale() {
-	for scale_factor in [0.01, 1.0, 10.0] {
+	for scale_factor in [0.01, 1.0, 8.0, 10.0] {
 		let oracle = strict_q11_oracle(scale_factor).expect("supported q11 oracle scale");
 		assert!(!oracle.rows.is_empty(), "sf={scale_factor}: {oracle:?}");
 		assert!(

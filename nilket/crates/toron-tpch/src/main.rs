@@ -641,7 +641,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		.unwrap_or_default();
 	for query_id in queries {
 		// A query that cannot run at this scale is out of scope for the board, not a failure of it:
-		// q11's HAVING threshold is scale-specific, so it is pinned to {0.01, 1, 10}. Record the cell
+		// q11's HAVING threshold is scale-specific, so unsupported scales are recorded as cells
 		// and keep going — aborting here would discard every query already measured.
 		if let Err(reason) = validate_query_scale(query_id, sf) {
 			for engine in &engines {
@@ -4906,7 +4906,8 @@ mod tests {
 	/// discard every query already measured.
 	#[test]
 	fn a_scale_unsupported_query_is_out_of_scope_not_a_board_failure() {
-		assert!(validate_query_scale("q11", 8.0).is_err());
+		assert!(validate_query_scale("q11", 3.0).is_err());
+		assert!(validate_query_scale("q11", 8.0).is_ok());
 		assert!(validate_query_scale("q11", 10.0).is_ok());
 		assert!(
 			validate_query_scale("q06", 8.0).is_ok(),
@@ -4917,7 +4918,7 @@ mod tests {
 			engine: "toron",
 			query: "q11",
 			mode: "strict",
-			scale_factor: 8.0,
+			scale_factor: 3.0,
 			status: Status::NotAttempted,
 			reason: "unsupported_scale",
 			message: Some("q11 requires an exactly supported scale".to_string()),

@@ -468,13 +468,17 @@ impl Q11Scale {
 				hundredths_n: 100,
 				fraction_sql: "0.0001",
 			},
+			bits if bits == 8.0_f64.to_bits() => Self {
+				hundredths_n: 800,
+				fraction_sql: "0.0000125",
+			},
 			bits if bits == 10.0_f64.to_bits() => Self {
 				hundredths_n: 1_000,
 				fraction_sql: "0.00001",
 			},
 			_ => {
 				return Err(format!(
-					"q11 requires an exactly supported scale (0.01, 1, or 10); got {scale_factor:?}"
+					"q11 requires an exactly supported scale (0.01, 1, 8, or 10); got {scale_factor:?}"
 				));
 			}
 		};
@@ -8076,6 +8080,42 @@ pub fn q11_oracle_from_rows(
 		threshold_fail_groups,
 		threshold_failed_partkeys,
 	})
+}
+
+#[cfg(test)]
+mod adr508_q11_sf8_scale {
+	use super::*;
+
+	#[test]
+	fn sf8_uses_one_exact_scale_contract_for_sql_and_oracle() {
+		let scale = Q11Scale::try_from_f64(8.0).expect("sf=8 is exactly supported");
+		assert_eq!(scale.hundredths_n(), 800);
+		assert_eq!(scale.fraction_sql(), "0.0000125");
+
+		let sql = q11_sql(scale);
+		assert_eq!(sql.matches("0.0000125").count(), 1);
+		assert!(!sql.contains("[FRACTION]"));
+
+		// At sf=8 the threshold is global / 80,000. A value exactly on that
+		// boundary must fail because TPC-H q11 uses a strict comparison.
+		let oracle = q11_oracle_from_rows(
+			[(1, 1, 1, 1), (2, 1, 1, 79_999)],
+			[(1, 1)],
+			[(1, "GERMANY".to_string())],
+			scale,
+		)
+		.expect("sf=8 oracle");
+		assert_eq!(oracle.global_value_raw, 80_000);
+		assert_eq!(
+			oracle.rows,
+			vec![Q11Row {
+				ps_partkey: 2,
+				value_raw: 79_999,
+			}]
+		);
+		assert_eq!(oracle.threshold_fail_groups, 1);
+		assert_eq!(oracle.threshold_failed_partkeys, BTreeSet::from([1]));
+	}
 }
 
 pub fn strict_q11_oracle(scale_factor: f64) -> Result<Q11Oracle, String> {

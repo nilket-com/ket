@@ -115,9 +115,11 @@ acquired its `-dirty` stamp. So the baseline is **two cohesive deliverables, in 
   receipt plus a reusable instrument, independently valuable and revertible, not a review pivot. Its
   own measurements are routing facts and may be taken from a working tree, provided the receipt says
   so; they are never baseline numbers.
-- **Seal and push** the cumulative step-2 inner attribution and the q11 harness change as one
-  implementation commit. **That** commit is the build identity of record: pushed, and never amended
-  afterwards.
+- **Seal and push** the cumulative step-2 inner attribution, then enable q11 at sf=8 before measuring.
+  Step 2 sealed at `3d48890e` without the q11 change; rewriting that pushed seal would destroy the
+  immutable boundary this rule exists to create. The q11 harness support therefore lands as a
+  separate, independently valuable follow-up. The pushed q11-supporting descendant — not
+  `3d48890e` — is the build identity of record and is never amended afterwards.
 - **Then measure** the 22/22 board from that exact pushed commit, and land the numbers as a **separate
   perf receipt** citing it.
 
