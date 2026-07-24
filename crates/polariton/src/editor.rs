@@ -2363,6 +2363,7 @@ fn markdown_preview_surface<'a>(
 	let mut in_code_block = false;
 	let mut active_code_cell: Option<&libaryon::uast::projection::MarkdownCellSnapshot> = None;
 	let first_line = preview.source_scroll_line.get();
+	let last_line = first_line.saturating_add(preview_row_budget(preview.source_viewport_line_count));
 
 	for (line_number, source_line) in preview.source_text.split_inclusive('\n').enumerate() {
 		let content = source_line.strip_suffix('\n').unwrap_or(source_line);
@@ -2373,10 +2374,11 @@ fn markdown_preview_surface<'a>(
 				in_code_block = false;
 				if let Some(cell) = active_code_cell.take() {
 					let body_end = byte_offset;
-					if let Some(cell) = preview.cells.iter().find(|candidate| {
-						candidate.identity == cell.identity
-							&& candidate.body_range.end.get() == body_end
-					}) && let Some(output) = outputs.get(&cell.identity)
+					if (first_line..last_line).contains(&(line_number as u64))
+						&& let Some(cell) = preview.cells.iter().find(|candidate| {
+							candidate.identity == cell.identity
+								&& candidate.body_range.end.get() == body_end
+						}) && let Some(output) = outputs.get(&cell.identity)
 						&& cell.presentation.output
 							== libaryon::uast::projection::MarkdownCellOutputTarget::Inline
 					{
@@ -2405,7 +2407,7 @@ fn markdown_preview_surface<'a>(
 			byte_offset = byte_offset.saturating_add(source_line.len() as u64);
 			continue;
 		}
-		if line_number as u64 >= first_line {
+		if (first_line..last_line).contains(&(line_number as u64)) {
 			let row: Element<'_, EditorMsg> = if in_code_block {
 				container(
 					rich_text(markdown_code_fragments(
@@ -2460,16 +2462,42 @@ fn markdown_preview_surface<'a>(
 					.color(color(palette.editor_text))
 					.into()
 			};
-			rows.push(row);
+			// The gap between rows is each row's own bottom padding rather than
+			// column spacing. Iced subtracts a column's entire spacing budget
+			// from the available height *before* laying out any child, so with
+			// enough rows the first child is measured against a negative height
+			// and every row collapses to nothing. Padding is measured per row,
+			// so rows that do fit always render.
+			rows.push(
+				container(row)
+					.padding(iced::padding::bottom(PREVIEW_ROW_GAP))
+					.width(Length::Fill)
+					.into(),
+			);
 		}
 		byte_offset = byte_offset.saturating_add(source_line.len() as u64);
 	}
 
-	container(column(rows).spacing(8))
+	container(column(rows))
 		.padding(20)
 		.width(Length::Fill)
 		.height(Length::Fill)
 		.into()
+}
+
+/// Vertical gap between preview rows, in pixels.
+const PREVIEW_ROW_GAP: f32 = 8.0;
+
+/// How many source lines the preview renders below its anchor line.
+///
+/// The preview mirrors the source pane's window, but its rows are not a fixed
+/// height — a blank line is half a row, a heading or an inline cell output is
+/// several — so the count that fills the pane is not the source's line count.
+/// Overshooting is what keeps the pane full when short rows dominate; rows past
+/// the bottom edge cost a measure and draw nothing. It stays proportional to the
+/// pane so the budget cannot outgrow the space that has to absorb it.
+fn preview_row_budget(source_viewport_line_count: u32) -> u64 {
+	u64::from(source_viewport_line_count).saturating_mul(2)
 }
 
 /// Markdown's thematic-break syntax: at least three matching `-`, `_`, or
@@ -3287,8 +3315,9 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
-		Modifiers, PANE_HEADER_HEIGHT, SplitDirection, is_markdown_thematic_break,
-		markdown_code_fragments, metrics, pane_gutter_width, pane_title,
+		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, SplitDirection,
+		is_markdown_thematic_break, markdown_code_fragments, metrics, pane_gutter_width, pane_title,
+		preview_row_budget,
 	};
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -5642,6 +5671,37 @@ mod tests {
 			thread::sleep(Duration::from_millis(5));
 		}
 		editor
+	}
+
+	/// Iced charges a column's whole inter-row gap budget against the available
+	/// height before it measures a single row, so a budget that can reach the
+	/// pane's height leaves nothing to lay out in and the preview renders
+	/// empty. Row gaps are per-row padding now, but the row budget must stay
+	/// proportional to the pane for the same reason: gap total below pane
+	/// height, at every pane size.
+	#[test]
+	fn preview_row_gaps_never_consume_the_pane_height() {
+		for viewport_lines in [1_u32, 8, 40, 120, 400] {
+			let gap_total = preview_row_budget(viewport_lines) as f32 * PREVIEW_ROW_GAP;
+			let pane_height = viewport_lines as f32 * metrics::LINE_HEIGHT;
+			assert!(
+				gap_total < pane_height,
+				"{viewport_lines} lines: {gap_total}px of gaps in a {pane_height}px pane"
+			);
+		}
+	}
+
+	/// A long document must still render its visible window: the budget is
+	/// counted from the anchor line, not from the top of the document.
+	#[test]
+	fn preview_row_budget_covers_more_than_the_source_window() {
+		let viewport_lines = 40_u32;
+		let budget = preview_row_budget(viewport_lines);
+		assert!(
+			budget >= u64::from(viewport_lines),
+			"the preview must not show fewer lines than the source pane"
+		);
+		assert_eq!(preview_row_budget(0), 0, "an empty pane renders no rows");
 	}
 
 	#[test]
