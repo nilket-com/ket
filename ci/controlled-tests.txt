@@ -1,0 +1,25 @@
+# Tests in this manifest run one-at-a-time in cargo-ctrl's controlled CPU lane.
+#
+# Keep exact libtest names here. cargo-ctrl validates every selected name before
+# launching either lane, and excludes these tests from the general test process.
+# Add a test only when parallel resource contention can violate one of its
+# timing/projection assertions; ordinary slow tests belong in the general lane.
+
+engine::runtime::system::tests::split_view_resolves_the_shared_buffers_language_theme
+engine::runtime::system::tests::write_file_as_redetects_language_and_re_resolves_theme
+engine::runtime::system::tests::set_language_re_resolves_auto_theme
+engine::runtime::system::tests::set_language_resolves_registered_extensions_and_rejects_unknown_names
+engine::runtime::system::tests::local_theme_override_survives_language_and_file_changes
+engine::runtime::system::tests::persist_langtheme_re_resolves_matching_auto_tabs_without_file_write
+engine::runtime::system::tests::persist_langtheme_rejects_invalid_theme_without_file_write
+engine::runtime::system::tests::persist_nolangtheme_reverts_matching_auto_tabs_without_file_write
+engine::runtime::system::tests::persist_langtheme_does_not_override_local_theme
+engine::runtime::system::tests::scroll_viewport_to_line_positions_viewport_at_target
+engine::runtime::system::tests::scroll_viewport_to_line_reaches_end_of_wrapped_document
+engine::runtime::system::tests::scroll_down_full_engine_grafted_rust_file
+engine::runtime::system::tests::scroll_half_page_moves_viewport_anchor_on_real_engine_file
+engine::runtime::system::tests::scroll_full_page_back_moves_viewport_anchor_on_real_engine_file
+engine::runtime::system::tests::viewport_top_middle_bottom_sequence_on_real_engine_file_lands_on_first_non_whitespace
+engine::runtime::system::tests::search_word_under_cursor_forward_uses_whole_word_matches_in_real_engine_file
+engine::runtime::system::tests::search_word_under_cursor_backward_moves_to_previous_occurrence_in_real_engine_file
+engine::runtime::system::tests::search_word_under_cursor_backward_wraps_from_first_occurrence_in_real_engine_file

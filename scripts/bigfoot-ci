@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE_HOST="${KET_CI_HOST:-bigfoot}"
+REMOTE_DIR="${KET_CI_REMOTE_DIR:-work/ket}"
+BOOTSTRAP=0
+FULL_CHECK=0
+runner_args=()
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/bigfoot-ci [OPTIONS] [-- CARGO_CTRL_OPTIONS]
+
+Synchronize the current working tree directly to Bigfoot over SSH, preserving
+the remote target/ build cache, then run cargo-ctrl there. No GitHub checkout or
+hosted CI service participates.
+
+Options:
+  --bootstrap   Install a minimal stable Rust toolchain for the remote user when absent.
+  --full        Run ci/check.sh instead of only scripts/cargo-ctrl --locked.
+  -h, --help    Show this help.
+
+Environment:
+  KET_CI_HOST        SSH destination (default: bigfoot).
+  KET_CI_REMOTE_DIR  Remote checkout relative to the SSH user's home
+                     (default: work/ket).
+EOF
+}
+
+while (($# > 0)); do
+	case "$1" in
+		--bootstrap)
+			BOOTSTRAP=1
+			shift
+			;;
+		--full)
+			FULL_CHECK=1
+			shift
+			;;
+		--)
+			shift
+			runner_args=("$@")
+			break
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			runner_args+=("$1")
+			shift
+			;;
+	esac
+done
+
+[[ "$REMOTE_DIR" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] \
+	&& [[ "$REMOTE_DIR" != /* ]] \
+	&& [[ "$REMOTE_DIR" != *".."* ]] \
+	&& [[ "$REMOTE_DIR" != *"//"* ]] \
+	&& [[ "$REMOTE_DIR" != */ ]] \
+	&& [[ "$REMOTE_DIR" != *"/./"* ]] \
+	&& [[ "$REMOTE_DIR" != */. ]] || {
+	echo "KET_CI_REMOTE_DIR must name a specific, normalized directory below the remote home" >&2
+	exit 2
+}
+
+run_remote() {
+	local invocation
+	printf -v invocation '%q ' "$@"
+	ssh "$REMOTE_HOST" "$invocation"
+}
+
+if ((BOOTSTRAP == 1)); then
+	ssh "$REMOTE_HOST" '
+		if ! command -v cargo >/dev/null 2>&1 && [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+			curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs |
+				sh -s -- -y --profile minimal --default-toolchain stable
+		fi
+	'
+fi
+
+ssh "$REMOTE_HOST" "mkdir -p -- '$REMOTE_DIR'"
+rsync \
+	--archive \
+	--compress \
+	--delete \
+	--exclude '/.git/' \
+	--exclude '/target/' \
+	"$ROOT_DIR/" "$REMOTE_HOST:$REMOTE_DIR/"
+
+remote_command='source "$HOME/.cargo/env" 2>/dev/null || true; cd "$1"; shift; exec "$@"'
+if ((FULL_CHECK == 1)); then
+	run_remote bash -lc "$remote_command" bash "$REMOTE_DIR" ci/check.sh
+else
+	((${#runner_args[@]} > 0)) || runner_args=(--locked)
+	run_remote bash -lc "$remote_command" \
+		bash "$REMOTE_DIR" scripts/cargo-ctrl "${runner_args[@]}"
+fi

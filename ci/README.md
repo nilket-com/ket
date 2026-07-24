@@ -1,16 +1,53 @@
-# Home-Rolled CI
+# Local CI
 
 Baryon's repository-owned CI entrypoint is `ci/check.sh`. It is designed for a
 Linux machine controlled by the project, not for a hosted provider workflow.
+There are deliberately no `.github` workflows or provider-specific control
+files.
 
-The script installs missing Rust std targets with `rustup`, then runs the local
-Linux test gate, the forced blocking resolver gate, the architecture test, and
-Windows/macOS cross-target `cargo check`.
+The script installs missing Rust std targets with `rustup`, then uses
+`scripts/cargo-ctrl` for the local Linux test gate and forced blocking-resolver
+gate, followed by the architecture test and Windows/macOS cross-target
+`cargo check`.
+
+`cargo-ctrl` divides the CPUs available to its process into two concurrent
+lanes. The general lane receives 80% and uses that many libtest workers. The
+remaining CPUs are reserved for the tests listed in `controlled-tests.txt`,
+which run one-at-a-time. On Linux, `taskset` gives both lanes disjoint CPU sets,
+including every Cargo, rust-analyzer, and test thread they spawn. On other
+platforms the same thread limits apply without CPU affinity.
+
+Use the scheduler directly during development:
+
+```bash
+scripts/cargo-ctrl
+scripts/cargo-ctrl --filter ordinary_set
+BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
+```
+
+Set `CARGO_CTRL_MAIN_PERCENT` to tune the split or
+`CARGO_CTRL_NO_AFFINITY=1` to diagnose affinity-specific behavior.
 
 Use this from whichever local runner is convenient: a shell session, a git hook,
-a cron job, a systemd timer, or a small private build service. Provider-specific
-workflow files such as `.github/workflows/*` should not be added unless the
-project explicitly chooses that direction later.
+a cron job, a systemd timer, or a small private build service. `.github` and
+provider-specific workflow files are intentionally outside this repository's
+CI model and must not be added.
+
+## Bigfoot
+
+`scripts/bigfoot-ci` synchronizes the current working tree straight to
+`~/work/ket` on the `bigfoot` SSH host, preserves that checkout's `.git` and
+`target/` directories, and runs `cargo-ctrl` there:
+
+```bash
+scripts/bigfoot-ci --bootstrap
+scripts/bigfoot-ci -- --filter ordinary_set
+scripts/bigfoot-ci --full
+```
+
+The bootstrap is opt-in and installs a minimal stable Rust toolchain in the
+remote user's home. Source transport is `rsync` over SSH; Bigfoot never needs a
+GitHub checkout, token, runner agent, or webhook.
 
 Set `BARYON_CI_SKIP_TARGET_INSTALL=1` when the runner image already has the
 required Rust targets installed and should not mutate its toolchain.

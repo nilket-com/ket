@@ -30,8 +30,8 @@ run() {
 ensure_targets
 
 run cargo fmt --check
-run cargo test --locked --lib -- --test-threads=1
-run env BARYON_SVP_BACKEND=blocking cargo test --locked --lib -- --test-threads=1
+run scripts/cargo-ctrl --locked
+run env BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
 run cargo test --locked --test architecture_test
 
 for target in "${TARGETS[@]}"; do

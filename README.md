@@ -14,7 +14,11 @@ The repository is a single Cargo workspace. Run checks and tests from the root:
 ```bash
 cargo check --workspace --all-targets
 cargo test --workspace
+scripts/cargo-ctrl
 ```
+
+For the resource-isolated local test gate and the SSH-backed Bigfoot worker, see
+[`ci/README.md`](ci/README.md).
 
 ## Direction
 

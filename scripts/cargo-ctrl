@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST="${CARGO_CTRL_MANIFEST:-$ROOT_DIR/ci/controlled-tests.txt}"
+MAIN_PERCENT="${CARGO_CTRL_MAIN_PERCENT:-80}"
+FILTER=""
+LOCKED=0
+DRY_RUN=0
+NO_AFFINITY="${CARGO_CTRL_NO_AFFINITY:-0}"
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/cargo-ctrl [OPTIONS]
+
+Run workspace library tests in two concurrent resource lanes:
+  general     parallel libtest workers on 80% of available CPUs
+  controlled  timing-sensitive libaryon tests, queued one at a time
+
+Options:
+  --locked          Pass --locked to Cargo.
+  --filter FILTER   Run only tests containing FILTER.
+  --manifest PATH   Use a different controlled-test manifest.
+  --no-affinity     Keep thread limits but do not partition CPUs with taskset.
+  --dry-run         Print the resolved lanes and commands without running them.
+  -h, --help        Show this help.
+
+Environment:
+  CARGO_CTRL_MAIN_PERCENT  General-lane CPU percentage (default: 80).
+  CARGO_CTRL_MANIFEST      Default controlled-test manifest path.
+  CARGO_CTRL_NO_AFFINITY   Set to 1 to disable taskset partitioning.
+
+Other environment variables, including BARYON_SVP_BACKEND and CARGO_TARGET_DIR,
+are inherited by every Cargo and test process.
+EOF
+}
+
+while (($# > 0)); do
+	case "$1" in
+		--locked)
+			LOCKED=1
+			shift
+			;;
+		--filter)
+			[[ $# -ge 2 ]] || {
+				echo "--filter requires a value" >&2
+				exit 2
+			}
+			FILTER="$2"
+			shift 2
+			;;
+		--manifest)
+			[[ $# -ge 2 ]] || {
+				echo "--manifest requires a path" >&2
+				exit 2
+			}
+			MANIFEST="$2"
+			shift 2
+			;;
+		--no-affinity)
+			NO_AFFINITY=1
+			shift
+			;;
+		--dry-run)
+			DRY_RUN=1
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			usage >&2
+			exit 2
+			;;
+	esac
+done
+
+[[ "$MAIN_PERCENT" =~ ^[0-9]+$ ]] && ((MAIN_PERCENT >= 1 && MAIN_PERCENT <= 99)) || {
+	echo "CARGO_CTRL_MAIN_PERCENT must be an integer from 1 through 99" >&2
+	exit 2
+}
+[[ -f "$MANIFEST" ]] || {
+	echo "Controlled-test manifest not found: $MANIFEST" >&2
+	exit 2
+}
+
+controlled_tests=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+	line="${line#"${line%%[![:space:]]*}"}"
+	line="${line%"${line##*[![:space:]]}"}"
+	case "$line" in
+		"" | \#*) continue ;;
+	esac
+	controlled_tests+=("$line")
+done <"$MANIFEST"
+
+((${#controlled_tests[@]} > 0)) || {
+	echo "Controlled-test manifest is empty: $MANIFEST" >&2
+	exit 2
+}
+
+cpu_count() {
+	if command -v nproc >/dev/null 2>&1; then
+		nproc
+	elif command -v getconf >/dev/null 2>&1; then
+		getconf _NPROCESSORS_ONLN
+	elif command -v sysctl >/dev/null 2>&1; then
+		sysctl -n hw.logicalcpu
+	else
+		printf '1\n'
+	fi
+}
+
+expand_cpu_list() {
+	awk -F, '
+		{
+			for (field = 1; field <= NF; field++) {
+				count = split($field, bounds, "-")
+				if (count == 1) {
+					print bounds[1]
+				} else {
+					for (cpu = bounds[1]; cpu <= bounds[2]; cpu++) {
+						print cpu
+					}
+				}
+			}
+		}
+	'
+}
+
+available_cpus=()
+if [[ "$NO_AFFINITY" != "1" ]] && command -v taskset >/dev/null 2>&1; then
+	affinity="$(taskset -pc $$ 2>/dev/null || true)"
+	affinity="${affinity##*: }"
+	if [[ -n "$affinity" ]]; then
+		mapfile -t available_cpus < <(printf '%s\n' "$affinity" | expand_cpu_list)
+	fi
+fi
+
+total_cpus="$(cpu_count)"
+if ((${#available_cpus[@]} > 0)); then
+	total_cpus="${#available_cpus[@]}"
+fi
+[[ "$total_cpus" =~ ^[0-9]+$ ]] && ((total_cpus >= 1)) || total_cpus=1
+
+main_threads=$((total_cpus * MAIN_PERCENT / 100))
+((main_threads >= 1)) || main_threads=1
+if ((total_cpus > 1 && main_threads >= total_cpus)); then
+	main_threads=$((total_cpus - 1))
+fi
+controlled_cpu_count=$((total_cpus - main_threads))
+((controlled_cpu_count >= 1)) || controlled_cpu_count=1
+
+main_prefix=()
+controlled_prefix=()
+main_cpu_list=""
+controlled_cpu_list=""
+if ((${#available_cpus[@]} >= 2)); then
+	main_slice=("${available_cpus[@]:0:main_threads}")
+	controlled_slice=("${available_cpus[@]:main_threads}")
+	main_cpu_list="$(IFS=,; printf '%s' "${main_slice[*]}")"
+	controlled_cpu_list="$(IFS=,; printf '%s' "${controlled_slice[*]}")"
+	main_prefix=(taskset --cpu-list "$main_cpu_list")
+	controlled_prefix=(taskset --cpu-list "$controlled_cpu_list")
+fi
+
+cargo_base=(cargo test)
+((LOCKED == 0)) || cargo_base+=(--locked)
+
+prebuild_cmd=("${cargo_base[@]}" --workspace --lib --no-run)
+general_cmd=("${cargo_base[@]}" --workspace --lib)
+[[ -z "$FILTER" ]] || general_cmd+=("$FILTER")
+general_cmd+=(-- --test-threads="$main_threads")
+for test_name in "${controlled_tests[@]}"; do
+	general_cmd+=(--skip "$test_name")
+done
+
+selected_controlled_tests=()
+for test_name in "${controlled_tests[@]}"; do
+	if [[ -z "$FILTER" || "$test_name" == *"$FILTER"* ]]; then
+		selected_controlled_tests+=("$test_name")
+	fi
+done
+
+print_command() {
+	printf '  '
+	printf '%q ' "$@"
+	printf '\n'
+}
+
+printf 'cargo-ctrl: %s CPUs, general=%s, controlled=%s\n' \
+	"$total_cpus" "$main_threads" "$controlled_cpu_count"
+if ((${#main_prefix[@]} > 0)); then
+	printf 'cargo-ctrl: CPU affinity general=%s controlled=%s\n' \
+		"$main_cpu_list" "$controlled_cpu_list"
+else
+	printf 'cargo-ctrl: CPU affinity unavailable or disabled; enforcing thread counts only\n'
+fi
+printf 'cargo-ctrl: controlled tests selected=%s/%s\n' \
+	"${#selected_controlled_tests[@]}" "${#controlled_tests[@]}"
+
+if ((DRY_RUN == 1)); then
+	printf '\n[prebuild]\n'
+	print_command "${prebuild_cmd[@]}"
+	printf '[general]\n'
+	print_command "${main_prefix[@]}" "${general_cmd[@]}"
+	for test_name in "${selected_controlled_tests[@]}"; do
+		controlled_cmd=("${cargo_base[@]}" --workspace --lib "$test_name" -- --exact --test-threads=1)
+		printf '[controlled] %s\n' "$test_name"
+		print_command "${controlled_prefix[@]}" "${controlled_cmd[@]}"
+	done
+	exit 0
+fi
+
+cd "$ROOT_DIR"
+
+printf '\n==> prebuilding workspace library tests\n'
+"${prebuild_cmd[@]}"
+
+if ((${#selected_controlled_tests[@]} > 0)); then
+	printf '\n==> validating controlled-test manifest\n'
+	test_inventory="$("${cargo_base[@]}" --workspace --lib -- --list)"
+	for test_name in "${selected_controlled_tests[@]}"; do
+		if ! grep -Fqx "$test_name: test" <<<"$test_inventory"; then
+			echo "Controlled test is missing or no longer exact: $test_name" >&2
+			exit 2
+		fi
+	done
+fi
+
+printf '\n==> starting general lane (%s workers)\n' "$main_threads"
+"${main_prefix[@]}" "${general_cmd[@]}" &
+general_pid=$!
+
+stop_general() {
+	if kill -0 "$general_pid" 2>/dev/null; then
+		kill "$general_pid" 2>/dev/null || true
+	fi
+}
+trap stop_general INT TERM
+
+controlled_status=0
+for test_name in "${selected_controlled_tests[@]}"; do
+	printf '\n==> controlled: %s\n' "$test_name"
+	controlled_cmd=("${cargo_base[@]}" --workspace --lib "$test_name" -- --exact --test-threads=1)
+	if ! "${controlled_prefix[@]}" "${controlled_cmd[@]}"; then
+		controlled_status=1
+		break
+	fi
+done
+
+general_status=0
+if ! wait "$general_pid"; then
+	general_status=1
+fi
+trap - INT TERM
+
+if ((general_status != 0 || controlled_status != 0)); then
+	printf '\ncargo-ctrl: failed (general=%s controlled=%s)\n' \
+		"$general_status" "$controlled_status" >&2
+	exit 1
+fi
+
+printf '\ncargo-ctrl: both lanes passed\n'
