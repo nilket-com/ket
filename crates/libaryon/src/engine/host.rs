@@ -632,6 +632,92 @@ mod tests {
 	}
 
 	#[test]
+	fn persistent_set_updates_the_configured_init_script() {
+		let init = temp_path("persistent-set-init", "rn");
+		fs::write(
+			&init,
+			r#"pub fn main(editor) {
+	let config = editor.config();
+	config.set("wrap", false)?;
+	println!("keep me");
+	Ok(())
+}
+"#,
+		)
+		.expect("write Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			initial_file: Some(init.to_string_lossy().into_owned()),
+			init_script: Some(init.clone()),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::PersistWrap(true))
+			.expect("set persistent wrap");
+		let viewport = recv_viewport_until(&viewports, "persistent setting status", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|status| status.contains("init.rn updated"))
+		});
+		assert!(
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|status| status.contains("Wrap enabled"))
+		);
+		let pane = viewport.focused_pane().expect("open init pane");
+		assert!(!pane.is_dirty);
+		let updated = fs::read_to_string(&init).expect("read updated init");
+		assert_eq!(pane.file_size, updated.len() as u64);
+		assert!(updated.contains("config.set(\"wrap\", true)?;"));
+		assert!(updated.contains("println!(\"keep me\");"));
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
+	fn persistent_set_does_not_overwrite_dirty_open_init_script() {
+		let init = temp_path("persistent-set-dirty-init", "rn");
+		let original = r#"pub fn main(editor) {
+	let config = editor.config();
+	config.set("wrap", false)?;
+	Ok(())
+}
+"#;
+		fs::write(&init, original).expect("write Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			initial_file: Some(init.to_string_lossy().into_owned()),
+			init_script: Some(init.clone()),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::InsertChar('/'))
+			.expect("dirty init");
+		recv_viewport_until(&viewports, "dirty init buffer", |viewport| {
+			viewport.focused_pane().is_some_and(|pane| pane.is_dirty)
+		});
+		commands
+			.send(EditorCommand::PersistWrap(true))
+			.expect("set persistent wrap");
+		recv_viewport_until(&viewports, "session-only setting status", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|status| status.contains("session only: init.rn has unsaved edits"))
+		});
+		assert_eq!(
+			fs::read_to_string(&init).expect("read protected init"),
+			original
+		);
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
 	fn rune_init_runs_before_the_initial_file_load() {
 		let init = temp_path("rune-init-order", "rn");
 		let initial_file = temp_path("rune-init-order-target", "txt");

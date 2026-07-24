@@ -61,6 +61,10 @@ impl RuneHostConfig {
 	pub(crate) fn new(init_script: PathBuf) -> Self {
 		Self { init_script }
 	}
+
+	pub(crate) fn init_script(&self) -> &Path {
+		&self.init_script
+	}
 }
 
 #[derive(Debug, Default)]

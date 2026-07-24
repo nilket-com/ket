@@ -424,6 +424,7 @@ struct RuntimeContext<'a> {
 	registry: &'a std::sync::Arc<UastRegistry>,
 	resolver: &'a SvpResolver,
 	lang_registry: &'a super::language::LanguageRegistry,
+	init_script: Option<&'a Path>,
 }
 
 struct SemanticRuntime<'a> {
@@ -1678,6 +1679,99 @@ fn sync_diff_scroll(
 	true
 }
 
+fn append_init_persistence_status(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	edit: &system::InitSettingEdit,
+) {
+	let Some(path) = runtime.init_script else {
+		return;
+	};
+	let current = session.ui.status_message.take().unwrap_or_default();
+	let suffix = match persist_setting_to_init(runtime, session, path, edit) {
+		Ok(true) => "init.rn updated".to_string(),
+		Ok(false) => "init.rn already current".to_string(),
+		Err(error) => format!("session only: {error}"),
+	};
+	session.ui.status_message = Some(if current.is_empty() {
+		suffix
+	} else {
+		format!("{current} · {suffix}")
+	});
+}
+
+fn persist_setting_to_init(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	path: &Path,
+	edit: &system::InitSettingEdit,
+) -> Result<bool, String> {
+	let canonical = CanonicalPath::resolve(path)?;
+	let open_buffer = session.buffers.buffer_for_path(&canonical);
+	let expected_source = if let Some(buffer_id) = open_buffer {
+		let buffer = session
+			.buffers
+			.get(buffer_id)
+			.ok_or_else(|| "the open init.rn buffer disappeared".to_string())?;
+		if buffer.is_dirty() {
+			return Err("init.rn has unsaved edits".to_string());
+		}
+		let document = buffer
+			.text()
+			.ok_or_else(|| "init.rn is not open as a text buffer".to_string())?;
+		let source_path = document
+			.backing_path
+			.as_deref()
+			.or(document.file_path.as_deref())
+			.map(Path::new);
+		let bytes = read_document_snapshot(runtime.registry, document.root_id, source_path)?;
+		Some(
+			String::from_utf8(bytes)
+				.map_err(|_| "the open init.rn buffer is not valid UTF-8".to_string())?,
+		)
+	} else {
+		None
+	};
+	let changed = system::persist_init_setting_at(
+		path,
+		expected_source.as_deref(),
+		edit,
+		runtime.lang_registry,
+	)?;
+	if !changed {
+		return Ok(false);
+	}
+
+	if let Some(buffer_id) = open_buffer {
+		let view_id = session
+			.layout
+			.view_id_for_buffer(buffer_id)
+			.ok_or_else(|| "init.rn is open without a live view".to_string())?;
+		let EditorSession {
+			buffers,
+			layout,
+			events,
+			ui,
+			next_dynamic_device_id,
+			..
+		} = session;
+		with_text_buffer_mut(runtime.registry, buffers, layout, events, view_id, |tab| {
+			// Force the ordinary external-change path even when a filesystem
+			// has coarse timestamps and the replacement is the same length.
+			tab.document.file_stamp = None;
+			handle_auto_reload_doctab_command(runtime, tab, ui, next_dynamic_device_id)
+		})
+		.ok_or_else(|| "init.rn was written, but its open buffer could not reload".to_string())?;
+		if buffers
+			.get(buffer_id)
+			.is_some_and(|buffer| buffer.is_dirty())
+		{
+			return Err("init.rn was written, but its open buffer did not reload".to_string());
+		}
+	}
+	Ok(true)
+}
+
 fn dispatch_command(
 	context: DispatchContext<'_, '_>,
 	session: &mut EditorSession,
@@ -1695,7 +1789,12 @@ fn dispatch_command(
 	let mut needs_render = false;
 	if let EditorCommand::WriteInit { force } = cmd {
 		session.ui.status_message = Some(
-			match system::write_init_file(&session.persistent_settings, lang_registry, force) {
+			match system::write_init_file(
+				&session.persistent_settings,
+				session.git_refresh_seconds,
+				lang_registry,
+				force,
+			) {
 				Ok(path) => format!("Wrote Rune configuration to {}", path.display()),
 				Err(error) => format!("Could not write init.rn: {error}"),
 			},
@@ -2288,6 +2387,7 @@ fn dispatch_command(
 		| EditorCommand::PersistNoLangTheme(_)
 		| EditorCommand::PersistUiColor { .. }
 		| EditorCommand::QueryUiColor(_)) => {
+			let init_edit = system::init_setting_edit(&view_cmd, lang_registry);
 			let should_re_resolve_themes = matches!(
 				&view_cmd,
 				EditorCommand::PersistTheme(_)
@@ -2329,6 +2429,9 @@ fn dispatch_command(
 				&& let Err(err) = re_resolve_auto_themes(buffers, layout, persistent_settings)
 			{
 				ui.status_message = Some(err);
+			}
+			if let Some(edit) = init_edit {
+				append_init_persistence_status(runtime, session, &edit);
 			}
 			needs_render |= effect.needs_render;
 		}
@@ -2901,6 +3004,16 @@ fn dispatch_command(
 		}
 		EditorCommand::SetGitRefresh(seconds) => {
 			session.git_refresh_seconds = seconds;
+			session.ui.status_message = Some(if seconds == 0 {
+				"Git refresh disabled".to_string()
+			} else {
+				format!("Git refresh set to {seconds}s")
+			});
+			if let Some(edit) =
+				system::init_setting_edit(&EditorCommand::SetGitRefresh(seconds), lang_registry)
+			{
+				append_init_persistence_status(runtime, session, &edit);
+			}
 			needs_render = true;
 		}
 		EditorCommand::GitStatus => {
@@ -3158,6 +3271,9 @@ pub(crate) fn run_engine(engine: Engine) {
 	let initial_language_themes = engine.initial_language_themes;
 	let initial_file = engine.initial_file;
 	let rune_host_config = engine.rune_host;
+	let configured_init_path = rune_host_config
+		.as_ref()
+		.map(|config| config.init_script().to_path_buf());
 	let terminate = engine.terminate;
 	let mut dynamic_action_executor = engine.dynamic_action_executor;
 	let mut subscriber_dispatcher = engine.subscriber_dispatcher;
@@ -3173,6 +3289,7 @@ pub(crate) fn run_engine(engine: Engine) {
 		registry: &registry,
 		resolver: &resolver,
 		lang_registry: &lang_registry,
+		init_script: configured_init_path.as_deref(),
 	};
 	let services = Arc::new(Mutex::new(HostServices::default()));
 	let session = EditorSession::new(

@@ -47,11 +47,18 @@ fn file_stamp_for_path(path: &str) -> Option<FileStamp> {
 
 pub(super) fn write_init_file(
 	settings: &SettingsPersistent,
+	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<std::path::PathBuf, String> {
 	let path = default_init_path().ok_or_else(|| "No config directory available".to_string())?;
-	write_init_file_at(&path, settings, language_registry, force)?;
+	write_init_file_at(
+		&path,
+		settings,
+		git_refresh_seconds,
+		language_registry,
+		force,
+	)?;
 	Ok(path)
 }
 
@@ -79,6 +86,7 @@ fn write_default_init_file_at(
 	write_init_file_at(
 		path,
 		&SettingsPersistent::builtin_defaults(),
+		super::super::session::DEFAULT_GIT_REFRESH_SECONDS,
 		language_registry,
 		true,
 	)
@@ -87,6 +95,7 @@ fn write_default_init_file_at(
 fn write_init_file_at(
 	path: &std::path::Path,
 	settings: &SettingsPersistent,
+	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<(), String> {
@@ -100,12 +109,12 @@ fn write_init_file_at(
 	};
 	let source = if let Some(contents) = contents.as_deref().filter(|_| !force) {
 		if is_generated_init(contents) {
-			render_init_file(settings)
+			render_init_file(settings, git_refresh_seconds)
 		} else {
-			update_init_file(contents, settings, language_registry)?
+			update_init_file(contents, settings, git_refresh_seconds, language_registry)?
 		}
 	} else {
-		render_init_file(settings)
+		render_init_file(settings, git_refresh_seconds)
 	};
 	validate_init_source(&source)?;
 	if force
@@ -174,9 +183,220 @@ enum InitConfigKey {
 	LanguageTheme(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InitSettingEdit {
+	key: InitConfigKey,
+	value: Option<String>,
+}
+
+impl InitSettingEdit {
+	fn operation(&self, binding: &str) -> Option<String> {
+		let value = self.value.as_deref()?;
+		Some(match &self.key {
+			InitConfigKey::Set(name) => {
+				format!("{binding}.set({}, {value})?;", rune_string(name))
+			}
+			InitConfigKey::UiColor(name) => format!(
+				"{binding}.ui_color({}, {})?;",
+				rune_string(name),
+				rune_string(value)
+			),
+			InitConfigKey::LanguageTheme(language) => format!(
+				"{binding}.language_theme({}, {})?;",
+				rune_string(language),
+				rune_string(value)
+			),
+		})
+	}
+}
+
+pub(super) fn init_setting_edit(
+	command: &EditorCommand,
+	language_registry: &super::super::language::LanguageRegistry,
+) -> Option<InitSettingEdit> {
+	let set = |name: &str, value: String| InitSettingEdit {
+		key: InitConfigKey::Set(name.to_string()),
+		value: Some(value),
+	};
+	match command {
+		EditorCommand::PersistWrap(value) => Some(set("wrap", value.to_string())),
+		EditorCommand::PersistMinimap(value) => Some(set("minimap", value.to_string())),
+		EditorCommand::PersistLineNumbers(value) => Some(set("num", value.to_string())),
+		EditorCommand::PersistRelativeLineNumbers(value) => {
+			Some(set("relativenumber", value.to_string()))
+		}
+		EditorCommand::PersistVisibleWhitespace(value) => Some(set("vis", value.to_string())),
+		EditorCommand::PersistReload(value) => Some(set("reload", value.to_string())),
+		EditorCommand::PersistSaveDurability(value) => {
+			Some(set("savedurability", rune_string(value.as_str())))
+		}
+		EditorCommand::PersistTheme(value) if Theme::try_new(value).is_ok() => {
+			Some(set("theme", rune_string(value)))
+		}
+		EditorCommand::PersistLangTheme { language, theme } if Theme::try_new(theme).is_ok() => {
+			let language = language_registry.resolve_supported_language_id(language)?;
+			Some(InitSettingEdit {
+				key: InitConfigKey::LanguageTheme(language.to_string()),
+				value: Some(theme.clone()),
+			})
+		}
+		EditorCommand::PersistNoLangTheme(language) => {
+			let language = language_registry.resolve_supported_language_id(language)?;
+			Some(InitSettingEdit {
+				key: InitConfigKey::LanguageTheme(language.to_string()),
+				value: None,
+			})
+		}
+		EditorCommand::PersistUiColor { key, value } => Some(InitSettingEdit {
+			key: InitConfigKey::UiColor(key.canonical_name().to_string()),
+			value: value.map(|color| color.to_hex()),
+		}),
+		EditorCommand::SetGitRefresh(seconds) => Some(set("gitrefresh", seconds.to_string())),
+		_ => None,
+	}
+}
+
+pub(super) fn persist_init_setting_at(
+	path: &Path,
+	expected_source: Option<&str>,
+	edit: &InitSettingEdit,
+	language_registry: &super::super::language::LanguageRegistry,
+) -> Result<bool, String> {
+	let original = match std::fs::read(path) {
+		Ok(bytes) => Some(bytes),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+		Err(error) => return Err(format!("Could not inspect init.rn: {error}")),
+	};
+	if let Some(expected) = expected_source
+		&& original.as_deref() != Some(expected.as_bytes())
+	{
+		return Err("init.rn changed on disk; no configuration was written".to_string());
+	}
+	let source = match original.as_deref() {
+		Some(bytes) => std::str::from_utf8(bytes)
+			.map_err(|_| "init.rn is not valid UTF-8".to_string())?
+			.to_string(),
+		None if edit.value.is_none() => return Ok(false),
+		None => render_minimal_init_file(edit),
+	};
+	let updated = if original.is_some() {
+		update_init_setting(&source, edit, language_registry)?
+	} else {
+		source.clone()
+	};
+	validate_init_source(&updated)?;
+	if updated == source && original.is_some() {
+		return Ok(false);
+	}
+
+	// The parse and render happen before the write. Recheck the exact bytes so
+	// an editor or another Baryon process cannot be overwritten in that gap.
+	let current = match std::fs::read(path) {
+		Ok(bytes) => Some(bytes),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+		Err(error) => return Err(format!("Could not recheck init.rn: {error}")),
+	};
+	if current != original {
+		return Err(
+			"init.rn changed while the setting was being prepared; no configuration was written"
+				.to_string(),
+		);
+	}
+	if let Some(parent) = path.parent() {
+		std::fs::create_dir_all(parent)
+			.map_err(|error| format!("Failed to create config directory: {error}"))?;
+	}
+	atomic_write(path, updated.as_bytes(), AtomicWriteOptions::config())
+		.map_err(|error| format!("Failed to write init.rn: {error}"))?;
+	Ok(true)
+}
+
+fn render_minimal_init_file(edit: &InitSettingEdit) -> String {
+	let operation = edit
+		.operation("config")
+		.expect("a removal never creates an absent init file");
+	format!(
+		"pub fn main(editor) {{\n\tlet config = editor.config();\n\t{operation}\n\tOk(())\n}}\n"
+	)
+}
+
+fn update_init_setting(
+	source: &str,
+	edit: &InitSettingEdit,
+	language_registry: &super::super::language::LanguageRegistry,
+) -> Result<String, String> {
+	let file = parse_init_source(source)?;
+	let main = file
+		.items
+		.iter()
+		.find_map(|(item, _)| match item {
+			ast::Item::Fn(function) if span_text(source, function.name.span) == "main" => {
+				Some(function)
+			}
+			_ => None,
+		})
+		.ok_or_else(|| "init.rn has no `main` function to update".to_string())?;
+	let terminal = main
+		.body
+		.statements
+		.last()
+		.filter(|statement| normalize_rune_source(span_text(source, statement.span())) == "Ok(())")
+		.ok_or_else(|| {
+			"init.rn main must end with `Ok(())` before :set can update it".to_string()
+		})?;
+	let insertion = span_range(terminal.span()).start;
+	let binding = config_binding(source, main).ok_or_else(|| {
+		"init.rn main has no `let config = editor.config();` binding for :set to update".to_string()
+	})?;
+	let mut patches = Vec::new();
+	let mut found = false;
+	for statement in &main.body.statements {
+		let ast::Stmt::Semi(statement) = statement else {
+			continue;
+		};
+		if config_call_key(source, &statement.expr, &binding, language_registry).as_ref()
+			!= Some(&edit.key)
+		{
+			continue;
+		}
+		let range = span_range(statement.span());
+		if !found {
+			found = true;
+			if let Some(replacement) = edit.operation(&binding) {
+				patches.push((range, replacement));
+			} else {
+				patches.push((tombstone_range(source, range), String::new()));
+			}
+		} else {
+			patches.push((tombstone_range(source, range), String::new()));
+		}
+	}
+	if !found && let Some(operation) = edit.operation(&binding) {
+		patches.push((
+			insertion..insertion,
+			render_inserted_operations(source, insertion, [operation]),
+		));
+	}
+	apply_init_patches(source, patches)
+}
+
+fn apply_init_patches(
+	source: &str,
+	mut patches: Vec<(Range<usize>, String)>,
+) -> Result<String, String> {
+	patches.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+	let mut updated = source.to_string();
+	for (range, replacement) in patches {
+		updated.replace_range(range, &replacement);
+	}
+	validate_init_source(&updated)?;
+	Ok(updated)
+}
+
 fn update_init_file(
 	source: &str,
 	settings: &SettingsPersistent,
+	git_refresh_seconds: u64,
 	language_registry: &super::super::language::LanguageRegistry,
 ) -> Result<String, String> {
 	let file = parse_init_source(source)?;
@@ -203,8 +423,7 @@ fn update_init_file(
 		"init.rn main has no `let config = editor.config();` binding for :set initwrite to update; use :set initwrite! to replace it"
 			.to_string()
 	})?;
-	let desired = init_config_operations(settings, &binding);
-	let configured_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
+	let desired = init_config_operations(settings, git_refresh_seconds, &binding);
 	let mut patches = Vec::new();
 	let mut remaining = desired;
 
@@ -218,12 +437,23 @@ fn update_init_file(
 			continue;
 		};
 		let range = span_range(statement.span());
-		if configured_keys.contains(&key) {
+		let managed = remaining.contains_key(&key)
+			|| match &key {
+				InitConfigKey::Set(_) => false,
+				InitConfigKey::UiColor(name) => {
+					crate::engine::ui_colors::UiColorKey::from_canonical_name(name).is_some()
+				}
+				InitConfigKey::LanguageTheme(language) => language_registry
+					.resolve_supported_language_id(language)
+					.is_some(),
+			};
+		if managed {
 			if seen.insert(key.clone()) {
-				let replacement = remaining
-					.remove(&key)
-					.expect("key was checked in the remaining config operations");
-				patches.push((range, replacement));
+				if let Some(replacement) = remaining.remove(&key) {
+					patches.push((range, replacement));
+				} else {
+					patches.push((tombstone_range(source, range), String::new()));
+				}
 			} else {
 				patches.push((tombstone_range(source, range), String::new()));
 			}
@@ -235,12 +465,7 @@ fn update_init_file(
 		patches.push((insertion..insertion, additions));
 	}
 
-	patches.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-	let mut updated = source.to_string();
-	for (range, replacement) in patches {
-		updated.replace_range(range, &replacement);
-	}
-	Ok(updated)
+	apply_init_patches(source, patches)
 }
 
 fn config_binding(source: &str, main: &ast::ItemFn) -> Option<String> {
@@ -260,6 +485,7 @@ fn config_binding(source: &str, main: &ast::ItemFn) -> Option<String> {
 
 fn init_config_operations(
 	settings: &SettingsPersistent,
+	git_refresh_seconds: u64,
 	binding: &str,
 ) -> BTreeMap<InitConfigKey, String> {
 	let mut operations = BTreeMap::new();
@@ -283,6 +509,7 @@ fn init_config_operations(
 		"savedurability",
 		rune_string(settings.save_durability.as_str()),
 	);
+	set("gitrefresh", git_refresh_seconds.to_string());
 	for key in crate::engine::ui_colors::UiColorKey::ALL {
 		if let Some(color) = settings.ui_colors.get(key) {
 			let name = key.canonical_name().to_string();
@@ -476,7 +703,7 @@ fn validate_init_source(source: &str) -> Result<(), String> {
 	parse_init_source(source).map(|_| ())
 }
 
-fn render_init_file(settings: &SettingsPersistent) -> String {
+fn render_init_file(settings: &SettingsPersistent, git_refresh_seconds: u64) -> String {
 	let mut source = "pub fn main(editor) {\n".to_string();
 	source.push_str("\tlet config = editor.config();\n");
 	write_set(&mut source, "theme", &settings.theme_name);
@@ -495,6 +722,11 @@ fn render_init_file(settings: &SettingsPersistent) -> String {
 		"savedurability",
 		settings.save_durability.as_str(),
 	);
+	writeln!(
+		&mut source,
+		"\tconfig.set(\"gitrefresh\", {git_refresh_seconds})?;"
+	)
+	.expect("writing to String cannot fail");
 	for key in crate::engine::ui_colors::UiColorKey::ALL {
 		if let Some(color) = settings.ui_colors.get(key) {
 			write_color_set(&mut source, key.canonical_name(), &color.to_hex());
@@ -1885,12 +2117,28 @@ mod tests {
 		force: bool,
 	) -> Result<(), String> {
 		let language_registry = crate::engine::host::build_language_registry();
-		super::write_init_file_at(path, settings, &language_registry, force)
+		super::write_init_file_at(
+			path,
+			settings,
+			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
+			&language_registry,
+			force,
+		)
 	}
 
 	fn write_test_default_init_file_at(path: &std::path::Path, force: bool) -> Result<(), String> {
 		let language_registry = crate::engine::host::build_language_registry();
 		super::write_default_init_file_at(path, &language_registry, force)
+	}
+
+	fn persist_test_setting(
+		path: &std::path::Path,
+		command: EditorCommand,
+	) -> Result<bool, String> {
+		let language_registry = crate::engine::host::build_language_registry();
+		let edit = super::init_setting_edit(&command, &language_registry)
+			.expect("test command must map to an init setting");
+		super::persist_init_setting_at(path, None, &edit, &language_registry)
 	}
 
 	#[test]
@@ -2008,9 +2256,13 @@ mod tests {
 			Some(crate::core::Rgb::new(0x12, 0x34, 0x56)),
 		);
 
-		let source = super::render_init_file(&settings);
+		let source = super::render_init_file(
+			&settings,
+			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
+		);
 		assert!(source.contains("\tlet config = editor.config();"));
 		assert!(source.contains("\tconfig.set(\"theme\", \"gruvbox\")?;"));
+		assert!(source.contains("\tconfig.set(\"gitrefresh\", 7)?;"));
 		assert!(source.contains("\tconfig.ui_color(\"colors.accent\", \"#123456\")?;"));
 		assert!(source.contains("\tconfig.language_theme(\"rust\", \"viridis_cs8\")?;"));
 		assert!(
@@ -2019,6 +2271,90 @@ mod tests {
 				.skip(3)
 				.all(|line| { line.is_empty() || line.starts_with('\t') || line == "}" })
 		);
+	}
+
+	#[test]
+	fn ordinary_set_updates_only_its_canonical_init_statement() {
+		let path = temp_test_path("init-single-setting");
+		std::fs::write(
+			&path,
+			r#"pub fn main(editor) {
+	let config = editor.config();
+	let chosen = if env::var("LIGHT")? { "light" } else { "onedark" };
+	config.set("theme", chosen)?;
+	config.set("line_numbers", false)?;
+	config.set("num", false)?;
+	println!("keep me");
+	Ok(())
+}
+"#,
+		)
+		.expect("write custom init");
+
+		assert!(
+			persist_test_setting(&path, EditorCommand::PersistLineNumbers(true))
+				.expect("persist line numbers")
+		);
+		let updated = std::fs::read_to_string(&path).expect("read updated init");
+		assert!(updated.contains("let chosen = if env::var(\"LIGHT\")?"));
+		assert!(updated.contains("config.set(\"theme\", chosen)?;"));
+		assert!(updated.contains("println!(\"keep me\");"));
+		assert_eq!(updated.matches(".set(\"num\"").count(), 1);
+		assert!(updated.contains("config.set(\"num\", true)?;"));
+		assert!(!updated.contains("line_numbers"));
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn ordinary_set_removes_a_reset_override_without_touching_user_code() {
+		let path = temp_test_path("init-single-reset");
+		std::fs::write(
+			&path,
+			r##"pub fn main(editor) {
+	let config = editor.config();
+	config.ui_color("accent", "#123456")?;
+	println!("keep me");
+	Ok(())
+}
+"##,
+		)
+		.expect("write custom init");
+
+		assert!(
+			persist_test_setting(
+				&path,
+				EditorCommand::PersistUiColor {
+					key: crate::engine::UiColorKey::Accent,
+					value: None,
+				},
+			)
+			.expect("reset accent")
+		);
+		let updated = std::fs::read_to_string(&path).expect("read updated init");
+		assert!(!updated.contains("ui_color"));
+		assert!(updated.contains("println!(\"keep me\");"));
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn ordinary_set_refuses_to_overwrite_a_source_changed_after_snapshot() {
+		let path = temp_test_path("init-single-conflict");
+		let expected = "pub fn main(editor) {\n\tlet config = editor.config();\n\tOk(())\n}\n";
+		std::fs::write(&path, expected).expect("write initial init");
+		let changed = expected.replace("\tOk(())", "\tprintln!(\"new\");\n\tOk(())");
+		std::fs::write(&path, &changed).expect("change init");
+		let languages = crate::engine::host::build_language_registry();
+		let edit = super::init_setting_edit(&EditorCommand::PersistWrap(true), &languages)
+			.expect("wrap edit");
+
+		let error = super::persist_init_setting_at(&path, Some(expected), &edit, &languages)
+			.expect_err("stale snapshot must be refused");
+		assert!(error.contains("changed on disk"));
+		assert_eq!(
+			std::fs::read_to_string(&path).expect("read preserved init"),
+			changed
+		);
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
@@ -2113,6 +2449,16 @@ mod tests {
 				.count(),
 			1
 		);
+		settings
+			.ui_colors
+			.set(crate::engine::UiColorKey::Accent, None);
+		settings.language_themes.clear();
+		write_test_init_file_at(&path, &settings, false)
+			.expect("bulk update removes reset overrides");
+		let reset = std::fs::read_to_string(&path).expect("read reset update");
+		assert!(!reset.contains("config.ui_color(\"colors.accent\""));
+		assert!(!reset.contains("config.language_theme(\"markdown\""));
+		assert!(reset.contains("println!(\"keep me\");"));
 		write_test_init_file_at(&path, &settings, true).expect("force replaces handwritten init");
 		assert!(super::is_generated_init(
 			&std::fs::read_to_string(&path).expect("read forced init")
@@ -2307,6 +2653,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let mut next_device_id = u16::MAX;
 		let mut backing_device_id = None;
@@ -2343,6 +2690,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let mut next_device_id = crate::engine::core::FILE_DEVICE_ID + 1;
 		let mut backing_device_id = None;
@@ -2380,6 +2728,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let settings = SettingsPersistent {
 			theme_name: "onedark".to_string(),
@@ -2460,6 +2809,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let settings = SettingsPersistent {
 			theme_name: "onedark".to_string(),

@@ -17,23 +17,39 @@ persistence, the deletion, and the worked migration of the existing dotfile.
    via `persist_view_settings` in `runtime/system.rs`). `BOOLEAN_SETTING_KEYS` couples the
    option registry's names to the TOML keys.
 
-Role 1 moves to Rune. Role 2 cannot: a user's init script is code, and ordinary engine
-operations must never rewrite it. The explicit `:set initwrite` export is the narrow
-exception: it writes only an absent file or one carrying the generator marker, while
-`:set initwrite!` is the deliberate replacement escape hatch.
+Role 1 moves to Rune. Role 2 becomes a syntax-aware source edit rather than a generated
+snapshot: ordinary `:set` operations may replace only the literal configuration call for
+the one canonical key they own. The explicit `:set initwrite` export remains the bulk
+reconciliation tool, while `:set initwrite!` is the deliberate replacement escape hatch.
 
-## 2. Decision: engine persistence is dropped (Option A)
+## 2. Decision: `:set` performs a targeted Rune edit
 
-Persist-flavored operations become session-scoped. `PersistLangTheme` and the persistent
-`:set` variants either disappear or degrade to their session-scoped equivalents plus a
-status hint naming the Rune call to add to the init script. Durable preferences are
-whatever `init.rn` sets on the next startup — configuration as code, one source of truth.
+Persist-flavored operations update the live session first, then edit the configured
+`init.rn` when the source has a structurally safe update point:
 
-Rejected alternative (Option B, recorded for the future): a machine-owned state file in
-the XDG state dir, applied after `init.rn` with documented precedence. This preserves the
-persist UX but reintroduces two config sources and an ordering contract. If session-only
-`:set` proves annoying in practice, B can be layered on later without disturbing the API
-below — the setters are the same either way.
+- Parse with Rune's AST and recognize a top-level `let config = editor.config();` binding,
+  a terminal `Ok(())`, and literal `config.set`, `config.ui_color`, or
+  `config.language_theme` calls.
+- Replace, insert, or remove only the statement for the command's canonical key. Preserve
+  every unrelated byte of user code. Canonical aliases and duplicate calls collapse to
+  one statement.
+- Reparse the candidate before writing, compare the exact source bytes again immediately
+  before the atomic replacement, and refuse a stale source instead of merging blindly.
+- If `init.rn` is open and clean, compare its UAST snapshot with disk and reload the
+  resulting file through the normal document pipeline. If it is dirty, keep the session
+  change but report `session only`; never save or discard the user's edits.
+- Create an absent file as a minimal one-setting program. A reset against an absent file is
+  already satisfied and creates nothing.
+- Embedders which do not configure an init script remain session-only. This prevents a
+  library engine or test from discovering and mutating the Baryon user's default path.
+
+`:set initwrite` remains a bulk snapshot/reconciliation command for recovery and explicit
+export. It uses the same AST key recognition, removes cleared built-in color/language
+overrides, and preserves unknown configuration calls and other user statements.
+
+Rejected alternative: a machine-owned state file in the XDG state dir applied after
+`init.rn`. It would preserve the UX but reintroduce two config sources and an ordering
+contract; targeted Rune edits keep one source of truth.
 
 ## 3. Rune API: one authority, the option registry
 
@@ -97,8 +113,9 @@ pub fn main(editor) {
   their tests. `SaveDurability` and `EngineSettings` (sans `settings_path`) remain.
   Platform-aware config-directory probing is retained in a smaller `init.rn` path
   resolver; only the TOML settings-file path and persistence plumbing disappear.
-- `runtime/system.rs`: `persist_view_settings` / `persist_view_status` and the
-  `PersistLangTheme` command path per §2; their tests convert to session-scoped assertions.
+- `runtime/system.rs`: TOML persistence disappears. Persist-flavored commands retain their
+  session state transition and route the corresponding canonical single-key edit to
+  `init.rn` per §2.
 - `RuntimeContext.settings_path` and every plumbing thread of it disappears.
 - `BOOLEAN_SETTING_KEYS` moves to (or is re-derived in) `option_registry.rs`, which becomes
   the sole owner of option names.
@@ -150,8 +167,9 @@ small phase: `config.rn` (the above, genericized), `jobs.rn`, `autocmds.rn`, `co
    identically to interactive `:set`.
 4. `ui_color` and `language_theme` reject the same invalid inputs the TOML loader warned on
    (bad hex, unknown theme), as expected errors.
-5. Persist-flavored commands are session-scoped; only explicit `:set initwrite` / `:set initwrite!`
-   export may write `init.rn`, with the marker guard and existing-mode preservation tested.
+5. Persist-flavored commands edit only their canonical literal call in `init.rn`; unrelated
+   Rune code is byte-preserved, stale or dirty sources are refused, clean open buffers
+   reload, and `:set initwrite` / `:set initwrite!` retain their bulk export behavior.
 6. Startup script failure lands on defaults with the existing startup-status diagnostic.
 7. Full lib suite serial in default and blocking-SVP modes, clippy `--all-targets`,
    formatting.
@@ -161,4 +179,5 @@ small phase: `config.rn` (the above, genericized), `jobs.rn`, `autocmds.rn`, `co
 - No TOML reading, migration shim, or auto-translation of existing files.
 - No Option B state file in this cut (§2 records the seam for later).
 - No new option kinds beyond what `:set` supports today plus colors/language themes.
-- No hot-reload of `init.rn` beyond the existing `:source`/reload machinery.
+- No filesystem watcher or arbitrary hot-reload of `init.rn`. Reloading a clean open buffer
+  immediately after Baryon's own targeted write uses the existing reload machinery.

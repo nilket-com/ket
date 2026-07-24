@@ -3046,6 +3046,8 @@ pub(crate) struct EditorSession {
 	pub(crate) git_refresh_seconds: u64,
 }
 
+pub(crate) const DEFAULT_GIT_REFRESH_SECONDS: u64 = 7;
+
 impl EditorSession {
 	#[allow(dead_code)] // first production caller lands in the Rune jobs binding
 	pub(crate) fn spawn_job(
@@ -3515,7 +3517,7 @@ impl EditorSession {
 			git_status_job: None,
 			git_status_branch: None,
 			git_status_repo_root: None,
-			git_refresh_seconds: 7,
+			git_refresh_seconds: DEFAULT_GIT_REFRESH_SECONDS,
 		}
 	}
 

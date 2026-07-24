@@ -2255,6 +2255,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 80, 24);
 		let mut tab = fixture.editor_mut();
@@ -2317,6 +2318,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 80, 24);
 		let mut tab = fixture.editor_mut();
@@ -2369,6 +2371,7 @@ mod tests {
 			registry: &registry,
 			resolver: &resolver,
 			lang_registry: &languages,
+			init_script: None,
 		};
 		let missing = temp_test_path("missing-undo-generation");
 		let _ = std::fs::remove_file(&missing);
