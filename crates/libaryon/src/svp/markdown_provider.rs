@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::core::DocByte;
 use crate::engine::language::{LanguageInjection, LanguageProvider, SemanticOutput};
 use crate::svp::markdown_highlight::highlight_markdown;
+use crate::svp::markdown_semantic::markdown_semantic_highlights;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellOutputTarget, MarkdownCellPresentation,
@@ -50,8 +51,9 @@ impl LanguageProvider for MarkdownProvider {
 		global_offset: DocByte,
 		_file_path: &str,
 	) -> SemanticOutput {
-		let offset_map = [(0usize, global_offset)];
-		let highlights = highlight_markdown(full_source.as_bytes(), &offset_map);
+		// Authoritative, whole-document: this pass overrules the viewport
+		// lexer's guesses, including its false emphasis inside `snake_case`.
+		let highlights = markdown_semantic_highlights(&full_source, global_offset);
 		SemanticOutput {
 			highlights,
 			diagnostics: Vec::new(),

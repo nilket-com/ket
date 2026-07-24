@@ -303,6 +303,54 @@ mod tests {
 		}));
 	}
 
+	/// The Markdown pass classifies a fence body as code; the language inside it
+	/// must still win. Existence of the embedded span is not enough — it has to
+	/// resolve on top of the enclosing one, which is what span order buys.
+	#[test]
+	fn embedded_spans_outrank_the_enclosing_markdown_code_block() {
+		use crate::svp::markdown_provider::MarkdownProvider;
+		use crate::svp::rust_highlight::{HighlightSpanIndex, TokenCategory};
+		use crate::svp::sql_provider::SqlProvider;
+
+		let source = "# Query\n\n```sql\nselect id from trips;\n```\n";
+		let sql_start = source.find("select").expect("SQL body") as u64;
+		let (_commands, _input, tx_internal, _requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(MarkdownProvider);
+		registry.register(SqlProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		reactor.send(SemanticRequest {
+			buffer_id: BufferId::new(1),
+			content: source.as_bytes().to_vec(),
+			global_offset: DocByte::ZERO,
+			file_path: "notebook.md".to_owned(),
+			language_id: LanguageId::from_registered("markdown"),
+			state_id: StateId::new(1),
+			request_id: RequestId::new(1),
+		});
+
+		let deadline = Instant::now() + Duration::from_secs(2);
+		let response = loop {
+			if let Some(response) = reactor.try_recv() {
+				break response;
+			}
+			assert!(Instant::now() < deadline, "semantic response timed out");
+			std::thread::sleep(Duration::from_millis(5));
+		};
+
+		let index = HighlightSpanIndex::new(response.highlights);
+		assert_eq!(
+			index.category_at(DocByte::new(sql_start)),
+			TokenCategory::Keyword,
+			"SQL decides the color inside its own fence"
+		);
+		assert_eq!(
+			index.category_at(DocByte::new(2)),
+			TokenCategory::Type,
+			"and the Markdown around it is unaffected"
+		);
+	}
+
 	/// The reactor must return topology whose source bytes are exactly what it was
 	/// sent, even when those bytes are not valid UTF-8. It previously received a
 	/// `String` and handed back that string's (lossy) bytes.

@@ -21,6 +21,7 @@ pub mod markdown_blocks;
 pub mod markdown_highlight;
 pub mod markdown_parse;
 pub mod markdown_provider;
+pub mod markdown_semantic;
 pub mod pipeline;
 #[allow(unused_imports)]
 pub mod pointer;
