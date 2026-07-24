@@ -44,6 +44,26 @@ struct BoundGroupedAggregateGroupState {
 	maximum_projected_growth_peak_bytes: u64,
 	maximum_finalize_sort_scratch_bytes: u64,
 	profile: Option<Box<GenericGroupedFoldProfile>>,
+	/// Present only while the growth census is armed.
+	growth_census: Option<Box<GrowthCensus>>,
+}
+
+/// Growth is censused, never sampled: it is rare and large enough that row sampling would miss it
+/// entirely, which is precisely the cost an insertion-dominated fold needs explained. Nanoseconds are
+/// local to this census — the exact stage contract keeps its microseconds.
+#[derive(Debug, Default, Clone, Copy)]
+struct GrowthCensus {
+	events: u64,
+	nanos: u64,
+}
+
+impl GrowthCensus {
+	fn record(&mut self, elapsed: Duration) {
+		self.events = self.events.saturating_add(1);
+		self.nanos = self
+			.nanos
+			.saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+	}
 }
 
 /// Key ownership selected once from the bound grouping schema.  The compact arm
@@ -175,6 +195,31 @@ impl GroupKeyStorage {
 }
 
 impl BoundGroupedAggregateGroups {
+	/// Census every growth event for this fold. The row loop itself is untouched: an earlier sampled
+	/// estimator that bracketed individual rows was rejected — it measured each row's latency while
+	/// the exact stage measures the loop's throughput, and its components summed to 119% and 203% of
+	/// the span they claimed to decompose. The lookup/update split is measured from outside instead,
+	/// by CPU sampling (`scripts/classify_fold_perf.py`).
+	pub(in crate::exec) fn arm_growth_census(&mut self) {
+		self.state.growth_census = Some(Box::default());
+	}
+
+	/// The growth census, with the exact stage span it sits inside so the share is computable from
+	/// the artifact alone.
+	pub(in crate::exec) fn growth_census_json(
+		&self,
+		row_loop_micros: u64,
+	) -> Option<serde_json::Value> {
+		let census = self.state.growth_census.as_ref()?;
+		Some(serde_json::json!({
+			"method": "growth_census",
+			"units": "nanoseconds",
+			"growth_events": census.events,
+			"growth_nanos": census.nanos,
+			"row_lookup_update_micros": row_loop_micros,
+		}))
+	}
+
 	pub(in crate::exec) fn new() -> Self {
 		Self::from_lookup(|name| std::env::var_os(name), INITIAL_ENTRY_CAPACITY)
 	}
@@ -197,6 +242,7 @@ impl BoundGroupedAggregateGroups {
 			maximum_projected_growth_peak_bytes: 0,
 			maximum_finalize_sort_scratch_bytes: 0,
 			profile,
+			growth_census: None,
 		};
 		let mut groups = Self {
 			state: Box::new(state),
@@ -700,7 +746,21 @@ impl BoundGroupedAggregateGroupState {
 		find_single_utf8_bucket_in(&self.hasher, &self.buckets, &self.keys, value)
 	}
 
+	/// Census wrapper: every growth event is timed in full, none are sampled.
 	fn grow(&mut self) -> Result<(), ExecutionError> {
+		if self.growth_census.is_none() {
+			return self.grow_table();
+		}
+		let started = Instant::now();
+		let outcome = self.grow_table();
+		let elapsed = started.elapsed();
+		if let Some(census) = self.growth_census.as_mut() {
+			census.record(elapsed);
+		}
+		outcome
+	}
+
+	fn grow_table(&mut self) -> Result<(), ExecutionError> {
 		let target = if self.entry_limit == 0 {
 			self.initial_entry_capacity
 		} else {

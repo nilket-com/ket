@@ -257,6 +257,12 @@ struct ProfileState {
 	active_leaf: Option<GroupedChainProfileLeaf>,
 	active_sub_leaf: Option<GroupedChainSubLeaf>,
 	root_started: bool,
+	/// Set once the chain is known to have committed through a branch this vocabulary does not
+	/// describe. Every required-field assertion below belongs to the generic grouped-reservoir
+	/// lifecycle, so once this is set the profile must stop asserting them and stop persisting: it has
+	/// already published an explicit unsupported-path receipt, and a diagnostic must not decide
+	/// whether the query succeeds.
+	unsupported_path: bool,
 	root_span_micros: Option<u64>,
 	leaf_micros: [u64; LEAF_COUNT],
 	leaf_calls: [u64; LEAF_COUNT],
@@ -733,6 +739,9 @@ impl GroupedChainProfile {
 
 	pub(in crate::exec) fn persist(&self) -> Result<(), ExecutionError> {
 		let state = self.lock_state()?;
+		if state.unsupported_path {
+			return Ok(());
+		}
 		if state.active_leaf.is_some() || state.active_sub_leaf.is_some() {
 			return Err(profile_error(
 				"cannot persist while an exclusive leaf or sub-leaf is active",
@@ -1179,6 +1188,55 @@ fn ratio(value: u64, root: u64) -> f64 {
 	}
 }
 
+impl GroupedChainProfile {
+	/// Publish an explicit "this vocabulary does not describe the path that ran" receipt.
+	///
+	/// The nine leaves below are the generic grouped-reservoir lifecycle. A chain that commits
+	/// through one of the earlier branches never reaches them, and the profile has nothing truthful
+	/// to say about it. Saying so in a receipt is the correct outcome; failing the query is not — a
+	/// diagnostic that can turn a passing cell into a failing one is worse than no diagnostic, because
+	/// it changes the result it was added to observe.
+	/// Best-effort by construction: it returns nothing and swallows its own I/O failures. If the
+	/// invariant is that a diagnostic never decides whether the query succeeds, then the write that
+	/// *reports* inapplicability cannot be the thing that fails the query either.
+	///
+	/// `committed_branch` is a routing fact — which branch took the chain — and is the only positive
+	/// content published here. No timing is emitted: an inapplicable vocabulary must not leave a
+	/// payload that reads as a valid decomposition.
+	pub(in crate::exec) fn record_unsupported_path(&self, committed_branch: Option<&'static str>) {
+		if let Ok(mut state) = self.lock_state() {
+			state.unsupported_path = true;
+		}
+		let receipt = serde_json::json!({
+			"suite": "grouped_chain_profile",
+			"status": "unsupported_path",
+			"inapplicable_vocabulary": "generic_grouped_reservoir",
+			"committed_branch": committed_branch,
+			"profile_id": self.profile_id,
+			"structural_stage_count": self.structural_stage_count,
+			"timings_published": false,
+		});
+		let Ok(bytes) = serde_json::to_vec_pretty(&receipt) else {
+			return;
+		};
+		if std::fs::create_dir_all(&self.directory).is_err() {
+			return;
+		}
+		let final_path = self.directory.join(format!(
+			"grouped_chain_{:04}_unsupported.json",
+			self.profile_id
+		));
+		let temporary = self.directory.join(format!(
+			"grouped_chain_{:04}_unsupported.tmp",
+			self.profile_id
+		));
+		if std::fs::write(&temporary, bytes).is_err() {
+			return;
+		}
+		let _ = std::fs::rename(&temporary, final_path);
+	}
+}
+
 fn write_snapshot(
 	directory: &Path,
 	profile_id: u64,
@@ -1204,6 +1262,100 @@ fn profile_error(message: impl Into<String>) -> ExecutionError {
 
 #[cfg(test)]
 mod tests {
+	// A diagnostic must never decide whether the query succeeds. This vocabulary describes the generic
+	// grouped-reservoir lifecycle, so every required-field assertion in `persist` belongs to that path;
+	// a chain that commits earlier leaves them unset. Before this, enabling the profile turned a
+	// passing cell into a failing one with no digest — the profile asserted its own coverage as a
+	// correctness invariant of execution.
+	#[test]
+	fn an_unsupported_path_publishes_a_receipt_and_never_fails_the_query() {
+		let directory = std::env::temp_dir().join(format!(
+			"toron-grouped-chain-unsupported-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&directory);
+		let profile = super::GroupedChainProfile::from_lookup(6, |_| {
+			Some(std::ffi::OsString::from(
+				directory.to_string_lossy().to_string(),
+			))
+		})
+		.expect("profile builds")
+		.expect("profile is enabled");
+		let started = profile.begin_root(0).expect("root begins");
+		profile.record_unsupported_path(Some("scan_probe_base"));
+
+		// The whole caller-shaped tail, with not one required field ever recorded. Each of these
+		// asserts the generic grouped-reservoir lifecycle and could otherwise fail a passing query.
+		profile
+			.record_final_group_rows(7)
+			.expect("final group rows must not fail an unsupported path");
+		profile
+			.begin_leaf(super::GroupedChainProfileLeaf::Finalization)
+			.expect("finalization timer opens")
+			.finish()
+			.expect("finalization timer closes");
+		profile
+			.begin_leaf(super::GroupedChainProfileLeaf::Cleanup)
+			.expect("cleanup timer opens")
+			.finish()
+			.expect("cleanup timer closes");
+		profile
+			.finish_root(started, 0)
+			.expect("finish_root must not fail an unsupported path");
+		profile
+			.persist()
+			.expect("persist must not assert a vocabulary it already disclaimed");
+
+		let entry = std::fs::read_dir(&directory)
+			.expect("profile directory exists")
+			.filter_map(Result::ok)
+			.find(|entry| entry.file_name().to_string_lossy().contains("unsupported"))
+			.expect("an unsupported receipt was written");
+		let receipt: serde_json::Value =
+			serde_json::from_slice(&std::fs::read(entry.path()).expect("read receipt"))
+				.expect("receipt parses");
+		assert_eq!(receipt["status"], "unsupported_path");
+		assert_eq!(receipt["committed_branch"], "scan_probe_base");
+		// Fail-closed for attribution: an inapplicable vocabulary publishes no timing payload, and no
+		// snapshot that a reader could mistake for a valid decomposition.
+		assert_eq!(receipt["timings_published"], false);
+		assert!(
+			std::fs::read_dir(&directory)
+				.expect("profile directory exists")
+				.filter_map(Result::ok)
+				.all(|entry| entry.file_name().to_string_lossy().contains("unsupported")),
+			"an unsupported path must not also emit a stage snapshot"
+		);
+		let _ = std::fs::remove_dir_all(&directory);
+	}
+
+	// The receipt write itself must be best-effort. If a diagnostic never decides whether the query
+	// succeeds, then the write that *reports* inapplicability cannot fail the query either.
+	#[test]
+	fn a_receipt_that_cannot_be_written_still_does_not_fail_the_query() {
+		let blocker = std::env::temp_dir().join(format!(
+			"toron-grouped-chain-blocked-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&blocker);
+		// A regular file where the profile directory should be: `create_dir_all` cannot succeed.
+		std::fs::write(&blocker, b"not a directory").expect("write blocker");
+		let profile = super::GroupedChainProfile::from_lookup(6, |_| {
+			Some(std::ffi::OsString::from(
+				blocker.to_string_lossy().to_string(),
+			))
+		})
+		.expect("profile builds")
+		.expect("profile is enabled");
+		let started = profile.begin_root(0).expect("root begins");
+		profile.record_unsupported_path(None);
+		profile
+			.finish_root(started, 0)
+			.expect("an unwritable receipt must not fail the query");
+		profile.persist().expect("persist stays silent");
+		let _ = std::fs::remove_file(&blocker);
+	}
+
 	use super::*;
 
 	fn test_directory(label: &str) -> PathBuf {

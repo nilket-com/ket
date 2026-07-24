@@ -18,11 +18,32 @@ Per cell, exclusive share of the dominant node:
 |---|---:|---|---:|---|
 | q17 | 35,693 | aggregate 100% | 623 MB | spill-replay + compute-fold (see below) |
 | q21 | 17,935 | aggregate 100% | 898 MB | spill-replay |
-| q09 | 13,032 | aggregate 95% | 0 | compute-fold |
+| q09 | 13,032 | aggregate 95% | 0 | **withdrawn — see below** |
 | q20 | 9,476 | aggregate 61%, join 33% | 0 | compute-fold |
-| q08 | 7,982 | aggregate 96% | 0 | compute-fold |
+| q08 | 7,982 | aggregate 96% | 0 | **reassigned — join-probe, see below** |
 | q18 | 19,430 | join 65%, exchange 17% | 990 MB | join/sort (parked) |
 | q02 | 2,675 | sort 41%, join 31% | 0 | join/sort (parked) |
+
+**q09's row above is invalidated.** Step-2 grounding measured q09 at **83.2 MB of aggregate-exclusive
+spill and 14,939 ms**, against the zero spill and 13,032 ms recorded here. The bytes are byte-identical
+with profiling on and off, so they are not an instrumentation artifact; both the spill and the time
+moved between that tree and this one. The zero-spill premise that assigned q09 to the compute-fold
+front is therefore gone, and one working-tree measurement cannot promote it to the spill front in its
+place. **q09 is front-unassigned until the clean 22/22 baseline of step 3 re-establishes it.** Nothing
+in steps 4 or 5 may rank it in the meantime.
+
+**q08's row is reassigned, and the trap below is why.** Step-2 inner attribution decomposed the
+`reoriented_inner_chain_grouped` handler on both q08 and q09 (`impl/508_inner_attribution.md`). Inside
+the aggregate node the **grouped fold is 0.7% (q08) and 1.8% (q09)**; join work is **87.7% and 86.7%**,
+with suffix probing alone at ~50% on both. So q08's compute-fold assignment rested on exactly the
+inference the next section forbids — "aggregate 96%" read as "the fold kernel". **q08 moves to a
+join-probe premise**, and the compute-fold front's step-4 decomposition covers q20 and q17 inv 0 only.
+q09 stays front-unassigned; this refines *which mechanism* its aggregate time is, not whether the cell
+is placeable. Whether a join-probe premise earns its own front is step 4's call against the clean
+baseline, not a promotion this note makes.
+
+That the guard below caught a real case is the point of having written it down: the per-node layer was
+correct and the front *name* was one layer too coarse.
 
 **Fronts are a property of an invocation, not a query.** The step-1 handler map
 (`impl/508_handler_map.md`) measured q17's dominant node as *two* invocations on different handlers:
@@ -106,8 +127,10 @@ not a fixed count. What is fixed is that the baseline's identity is a clean, pus
 While touching the baseline harness, **enable q11 at sf=8** — an enumeration gap, not a spec limit
 (`0.0001 / 8 = 0.0000125` is exact and the oracle integer is 800) — making the clean board 22/22.
 
-**4. Compute-fold front — decompose and rank the premises.** q08 inv 0, q09 inv 0, q20 inv 0, and
-q17 inv 0: zero spill, so the cost is compute inside a fused join+aggregate. Instrumenting
+**4. Compute-fold front — decompose and rank the premises.** q20 inv 0 and q17 inv 0. (This step was
+written naming q08 inv 0 and q09 inv 0 as well; step-2 inner attribution reassigned q08 to a
+join-probe premise and q09 remains front-unassigned — see the front table above.) Zero spill, so the
+cost is compute inside a fused join+aggregate. Instrumenting
 `scan_grouped` also yields a profile for q18's invocation because they share a handler — that is an
 incidental by-product held for the parked front, and is **excluded** when ranking this front's premise;
 q18 is join-dominated and stays parked. Split it join-half vs fold-half vs exchange and produce the

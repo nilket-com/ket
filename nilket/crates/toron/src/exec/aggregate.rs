@@ -31,6 +31,17 @@ struct GroupedFoldReceipt {
 const LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH_ENV: &str = "TORON_LOCAL_GROUPED_EXCHANGE_RECEIPT_PATH";
 const LOCAL_GROUPED_EXCHANGE_BYPASS_ENV: &str = "TORON_LOCAL_GROUPED_EXCHANGE_BYPASS";
 
+const FOLD_GROWTH_CENSUS_ENV: &str = "TORON_FOLD_GROWTH_CENSUS";
+
+/// Opt-in, and taken with the heavier counter profiler off: the census times every growth event
+/// inside the hottest loop in the engine, so a run that is not asking for it should not pay for it.
+fn fold_growth_census_enabled() -> bool {
+	matches!(
+		std::env::var(FOLD_GROWTH_CENSUS_ENV).ok().as_deref(),
+		Some("1")
+	)
+}
+
 fn local_grouped_exchange_bypass_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
 }
@@ -222,6 +233,15 @@ struct StreamingScanGlobalInput<'a> {
 }
 
 impl StreamingScanGlobalInput<'_> {
+	/// Whether `apply_streaming_scan_input_ops` has anything to do. ADR 508: a shape with no ops
+	/// performs no projection, so the projection phase does not exist for it and must not be listed
+	/// as a required stage — absence is not coverage.
+	fn has_ops(&self) -> bool {
+		self.scan_filter_predicate.is_some()
+			|| self.project.is_some()
+			|| self.project_filter_predicate.is_some()
+	}
+
 	fn output_schema(&self) -> SchemaRef {
 		self.project
 			.map(|(_, schema)| schema.clone())
@@ -557,6 +577,8 @@ impl Executor {
 		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_scan_grouped_aggregate(
 				input,
@@ -567,9 +589,17 @@ impl Executor {
 			)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("scan_grouped");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_left_outer_grouped_aggregate(
 				input,
@@ -580,9 +610,17 @@ impl Executor {
 			)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("left_outer_grouped");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_projected_left_semi_grouped_aggregate(
 				input,
@@ -593,9 +631,17 @@ impl Executor {
 			)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("projected_left_semi_grouped");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = Box::pin(self.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
 			input,
 			group_expr,
@@ -605,9 +651,17 @@ impl Executor {
 		))
 		.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("inner_prefix_semi_anti_grouped");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_reoriented_inner_chain_grouped_aggregate(
 				input,
@@ -618,6 +672,12 @@ impl Executor {
 			)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("reoriented_inner_chain_grouped");
 			return Ok(Some(output));
 		}
@@ -631,13 +691,23 @@ impl Executor {
 		output_schema: &arrow::datatypes::SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<Vec<RecordBatch>>, ExecutionError> {
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_scan_global_aggregate(input, aggr_expr, output_schema, morsel)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("scan_global");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_correlated_scalar_left_outer_global_aggregate(
 				input,
@@ -647,13 +717,27 @@ impl Executor {
 			)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("correlated_scalar_left_outer_global");
 			return Ok(Some(output));
 		}
+		let handler_span =
+			crate::exec::node_attribution::open_handler_span(&self.context.task_telemetry);
 		if let Some(output) = self
 			.try_streaming_collapsing_global_aggregate(input, aggr_expr, output_schema, morsel)
 			.await?
 		{
+			if let Some(handler_span) = handler_span {
+				crate::exec::node_attribution::close_handler_span(
+					handler_span,
+					&self.context.task_telemetry,
+				);
+			}
 			crate::exec::node_attribution::record_route("collapsing_global");
 			return Ok(Some(output));
 		}
@@ -755,6 +839,54 @@ impl Executor {
 			}
 			return Ok(Some(output));
 		}
+		// ADR 508 step 2: the generic-loop lifecycle. Declared only here — *after* both primitive
+		// admissions declined — because the primitive paths above have their own lifecycles and no
+		// stage instrumentation. A cell that takes one will report missing attribution until it gets
+		// a vocabulary of its own, which is the honest state rather than a borrowed one.
+		//
+		// The required set is applicability-driven, not a fixed list: a shape with no scan-input ops
+		// never performs projection, and letting a phase that does not exist satisfy a required name
+		// would turn absence into false coverage. The exchange variant is likewise distinct — with the
+		// ADR 499 bypass off, repartition is real work that must be a named stage rather than residual.
+		let projection_applies = streaming_input.scan_input.has_ops();
+		let exchange_active =
+			streaming_input.exchange.is_some() && !local_grouped_exchange_bypass_enabled();
+		let (vocabulary_name, required_stages): (&'static str, &'static [&'static str]) =
+			match (projection_applies, exchange_active) {
+				(true, false) => (
+					"scan_grouped_generic",
+					&["stream_pull", "projection", "fold", "finalize"],
+				),
+				(false, false) => (
+					"scan_grouped_generic_no_projection",
+					&["stream_pull", "fold", "finalize"],
+				),
+				(true, true) => (
+					"scan_grouped_generic_exchange",
+					&[
+						"stream_pull",
+						"projection",
+						"repartition",
+						"fold",
+						"finalize",
+					],
+				),
+				(false, true) => (
+					"scan_grouped_generic_exchange_no_projection",
+					&["stream_pull", "repartition", "fold", "finalize"],
+				),
+			};
+		// Predeclared from ADR 508 step-1 grounding with the pre-existing fold receipt: the largest
+		// unexplained remainder observed was 202 ms (per-batch loop overhead, scan setup, receipt
+		// write), so ~2.5x that. It is deliberately NOT derived from this instrument's own output.
+		const SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS: u64 = 500_000;
+		let vocabulary = node_attribution::declare_stage_vocabulary(
+			vocabulary_name,
+			node_attribution::SpillCounterKind::Flow,
+			required_stages,
+			SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS,
+		);
+		let telemetry = self.context.task_telemetry.clone();
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.expect("streaming scan grouped aggregate input should build a ScanRequest");
@@ -764,6 +896,12 @@ impl Executor {
 		let mut stream = stream.into_batches();
 		let mut rows = 0usize;
 		let mut groups = BoundGroupedAggregateGroups::new();
+		// ADR 508 step 2: the sampled component estimator that splits the exact `row_lookup_update`
+		// stage into key preparation, lookup/insertion and state update. Off unless asked for, and
+		// keyed to this invocation so the sample set is reproducible for this plan.
+		if fold_growth_census_enabled() && vocabulary.is_some() {
+			groups.arm_growth_census();
+		}
 		let mut group_types = Vec::new();
 		let mut folded_input = false;
 		let receipt_path =
@@ -793,7 +931,14 @@ impl Executor {
 			// stream_pull brackets the awaited scan pull: it includes the parquet decode measured
 			// separately by the scan ledger, so async framework = stream_pull − decode.
 			let pull_started = fold_receipt.as_ref().map(|_| Instant::now());
-			let Some(batch) = stream.next().await else {
+			let pull_stage = vocabulary
+				.as_ref()
+				.and_then(|v| node_attribution::open_stage(v, "stream_pull", &telemetry));
+			let next = stream.next().await;
+			if let Some(stage) = pull_stage {
+				node_attribution::close_stage(stage, &telemetry);
+			}
+			let Some(batch) = next else {
 				break;
 			};
 			let batch = batch?;
@@ -813,14 +958,27 @@ impl Executor {
 			rows = rows.saturating_add(batch.num_rows());
 
 			let projection_started = fold_receipt.as_ref().map(|_| Instant::now());
+			let projection_stage = (projection_applies)
+				.then(|| {
+					vocabulary
+						.as_ref()
+						.and_then(|v| node_attribution::open_stage(v, "projection", &telemetry))
+				})
+				.flatten();
 			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			if let Some(stage) = projection_stage {
+				node_attribution::close_stage(stage, &telemetry);
+			}
 			if let Some(receipt) = fold_receipt.as_mut() {
 				if let Some(started) = projection_started {
 					receipt.record_projection(started.elapsed());
 				}
 				receipt.record_source_batch();
 			}
-			self.fold_streaming_grouped_scan_batch(
+			let fold_stage = vocabulary
+				.as_ref()
+				.and_then(|v| node_attribution::open_stage(v, "fold", &telemetry));
+			let fold_result = self.fold_streaming_grouped_scan_batch(
 				&fold_streaming_input,
 				batch,
 				group_expr,
@@ -830,7 +988,11 @@ impl Executor {
 				&mut folded_input,
 				fold_receipt.as_mut(),
 				exchange_receipt.as_mut(),
-			)?;
+			);
+			if let Some(stage) = fold_stage {
+				node_attribution::close_stage(stage, &telemetry);
+			}
+			fold_result?;
 		}
 
 		if !folded_input {
@@ -845,12 +1007,28 @@ impl Executor {
 		}
 
 		let finalize_started = fold_receipt.as_ref().map(|_| Instant::now());
+		let finalize_stage = vocabulary
+			.as_ref()
+			.and_then(|v| node_attribution::open_stage(v, "finalize", &telemetry));
 		let output = self.finalize_bound_grouped_aggregate(
 			&mut groups,
 			&group_types,
 			aggr_expr,
 			output_schema,
-		)?;
+		);
+		if let Some(stage) = finalize_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
+		if let Some(handle) = vocabulary.as_ref()
+			&& let Some(parent_micros) = node_attribution::accumulated_stage_micros(
+				handle,
+				"row_lookup_update",
+				Some("fold"),
+			) && let Some(census) = groups.growth_census_json(parent_micros)
+		{
+			node_attribution::record_growth_census(handle, census);
+		}
+		let output = output?;
 		if let (Some(receipt), Some(started)) = (fold_receipt.as_mut(), finalize_started) {
 			receipt.record_finalize(started.elapsed());
 		}
@@ -1878,8 +2056,19 @@ impl Executor {
 		batch: &RecordBatch,
 	) -> Result<(), ExecutionError> {
 		let fold_started = groups.profile_enabled().then(Instant::now);
+		// ADR 508 step 2 fold refinement: three batch-level sub-stages inside the `fold` phase, each
+		// reconciling to `fold` rather than to the handler. No per-row locks — probe and growth
+		// evidence comes from the existing grouped-table profile, which already counts them.
+		let refine = node_attribution::current_handle();
+		let telemetry = self.context.task_telemetry.clone();
+		let group_expr_stage = refine.as_ref().and_then(|h| {
+			node_attribution::open_substage(h, "fold", "group_expr_eval", &telemetry)
+		});
 		let group_expression_started = groups.profile_enabled().then(Instant::now);
 		let group_arrays = self.evaluate_bound_program(group_expr, batch)?;
+		if let Some(stage) = group_expr_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
 		if let Some(started) = group_expression_started {
 			groups.record_group_expression_evaluation(
 				batch.num_rows(),
@@ -1895,6 +2084,9 @@ impl Executor {
 			groups.configure_key_storage(group_types);
 		}
 
+		let arg_stage = refine.as_ref().and_then(|h| {
+			node_attribution::open_substage(h, "fold", "arg_eval_and_readers", &telemetry)
+		});
 		let aggr_arrays = aggr_expr
 			.iter()
 			.map(|call| match call.function {
@@ -1930,6 +2122,14 @@ impl Executor {
 			.map(group_array_reader)
 			.collect::<Result<Vec<_>, _>>()?;
 		let borrow_single_utf8_group_key = borrow_single_utf8_group_key_enabled();
+		if let Some(stage) = arg_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
+		// One bracket around the whole row loop: per-row stage tokens would cost a lock per row and
+		// swamp the very arithmetic they measure.
+		let row_stage = refine.as_ref().and_then(|h| {
+			node_attribution::open_substage(h, "fold", "row_lookup_update", &telemetry)
+		});
 		let mut key = Vec::with_capacity(group_arrays.len());
 		for row in 0..batch.num_rows() {
 			let states = if borrow_single_utf8_group_key
@@ -2003,6 +2203,9 @@ impl Executor {
 			}
 		}
 
+		if let Some(stage) = row_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
 		if let Some(started) = fold_started {
 			groups.record_fold_batch(batch.num_rows(), aggr_arrays.len(), started.elapsed());
 		}

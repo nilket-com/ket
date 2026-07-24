@@ -3,6 +3,7 @@ use super::residency_profile::{
 };
 use super::stage_attribution;
 use super::*;
+use crate::exec::node_attribution;
 use crate::exec::runtime_filter::{
 	build_runtime_filter_fragment_for_ordinal, descriptor_from_fragment, runtime_filter_key_type,
 };
@@ -1463,6 +1464,175 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+/// Which leaf route committed a join0 chunk drive.
+///
+/// Returned **synchronously** by the dispatcher, because the caller needs it to commit a stage
+/// vocabulary against the route that actually ran. The pre-existing `JoinSpillPath` telemetry cannot
+/// serve that purpose: five of these nine leaves never record one, `EstimateSpillFallback` and
+/// `BuildSpillFallback` are emitted by a different join path entirely, and
+/// `record_join_spill_observation` appends to a shared task-telemetry vector and returns nothing — so
+/// reading a route back out is both incomplete and ambiguous when one task holds several observations
+/// for the same replay. The two mechanisms answer different questions and both are kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) enum Join0ChunkRoute {
+	/// Partitioned streamed scan build, scan probe. Spills per completed partition group.
+	PartitionedScanBuild,
+	/// Monolithic spilled scan build inside the scan-probe helper.
+	SpilledScanBuild,
+	/// Partitioned materialized build, scan probe. Spills per completed partition group.
+	PartitionedMaterializedScanProbe,
+	/// Monolithic spilled build inside the scan-probe helper.
+	SpilledBuildScanProbe,
+	/// Scan-probe helper's in-memory tail: no spill writer on this path.
+	ScanProbeInMemory,
+	/// Partitioned materialized build, materialized probe. Spills per completed partition group.
+	PartitionedMaterializedProbe,
+	/// Monolithic spilled build, the dispatcher's own fallback.
+	SpilledBuild,
+	/// Build estimate over cap: spills through `visit_spilled_hash_join_filtered_chunks`.
+	EstimateSpillFallback,
+	/// The dispatcher's in-memory tail: no spill writer on this path.
+	InMemory,
+}
+
+/// How a route's spill reaches the task counter — the property a stage vocabulary must respect, since
+/// it decides the finest granularity at which bytes can honestly be attributed.
+///
+/// Not yet read by production code: the correlated-scalar stage vocabulary that consumes it is the
+/// next cut, and the route is threaded out of the dispatcher first so the commit value exists before
+/// anything is declared against it. The cadence mapping is pinned by test regardless, so a new leaf
+/// cannot be added without choosing one.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::exec) enum Join0SpillCadence {
+	/// One increment per completed partition group: a group-enclosing stage may attribute its bytes,
+	/// a stage drawn inside a group reads a structural zero.
+	PerGroup,
+	/// One increment after the whole build: no sub-build stage can attribute spill.
+	WholeBuild,
+	/// No spill writer on this route.
+	None,
+}
+
+/// The `correlated_scalar_left_outer_global` stage contract, one variant per join0 leaf.
+///
+/// Predeclared before the scalar side executes, so scalar preparation is measured under a declaration
+/// that has not yet chosen a lifecycle, and committed against the leaf the dispatcher returns. Every
+/// variant is `Flow` at boundary zero: the bytes close exactly or the invocation fails and names the
+/// gap.
+///
+/// `join0_build` and `join0_probe` are **envelopes, not components**: the build stage spans scanning
+/// and partitioning the build input, page serialization and writes, per-partition `finish`, scratch
+/// release and index reconstruction, and owns the route's spill bytes; the probe stage spans the whole
+/// probe-side lifecycle. A share of either bounds where cost sits, never what the cost is.
+///
+/// `join0_probe` is required on every route except `estimate_spill_fallback`, whose single
+/// `visit_spilled_hash_join_filtered_chunks` call writes the spill and probes it in one span with no
+/// boundary between them to bracket.
+fn correlated_scalar_variants() -> Vec<node_attribution::VocabularyVariant> {
+	use node_attribution::{RequiredStage, RequiredStages, SpillCounterKind, VocabularyVariant};
+	// Derived from this handler's own grounding, not inherited. The first profile declared the 500 ms
+	// boundary the other vocabularies use and overran it at 4,886 ms; that failure named three
+	// unattributed regions — partition planning, per-group build creation, per-group teardown — which
+	// are now stages. With them the largest observed unexplained remainder is 1,061 ms, and this is
+	// ~2.8x that, the same rule the `scan_grouped` boundary uses.
+	//
+	// The remainder is genuinely unattributed rather than explained: diffuse per-group and per-batch
+	// scaffolding across 16 groups and ~1,500 batch visits. It is an absolute figure, so on a much
+	// smaller query using this handler it is a proportionally weaker check.
+	const RESIDUAL_BOUNDARY_MICROS: u64 = 3_000_000;
+	const COMMON: &[&str] = &[
+		"scalar_prep",
+		"scalar_hash_build",
+		"join0_build",
+		"repartition_accum",
+		"recombine_probe",
+		"recombine_filter",
+		"global_fold",
+		"finalize",
+	];
+	// Only the partitioned routes open and tear down per-group spill builds and choose a partitioning
+	// up front; naming these on a monolithic route would report absence as missing coverage.
+	const PARTITIONED_ONLY: &[&str] = &[
+		"join0_partition_plan",
+		"join0_group_open",
+		"join0_group_cleanup",
+	];
+	[
+		Join0ChunkRoute::PartitionedScanBuild,
+		Join0ChunkRoute::SpilledScanBuild,
+		Join0ChunkRoute::PartitionedMaterializedScanProbe,
+		Join0ChunkRoute::SpilledBuildScanProbe,
+		Join0ChunkRoute::ScanProbeInMemory,
+		Join0ChunkRoute::PartitionedMaterializedProbe,
+		Join0ChunkRoute::SpilledBuild,
+		Join0ChunkRoute::EstimateSpillFallback,
+		Join0ChunkRoute::InMemory,
+	]
+	.into_iter()
+	.map(|route| {
+		let mut required: Vec<RequiredStage> = COMMON
+			.iter()
+			.map(|name| RequiredStage { name, replay: None })
+			.collect();
+		if route != Join0ChunkRoute::EstimateSpillFallback {
+			required.push(RequiredStage {
+				name: "join0_probe",
+				replay: None,
+			});
+		}
+		if route.spill_cadence() == Join0SpillCadence::PerGroup {
+			required.extend(
+				PARTITIONED_ONLY
+					.iter()
+					.map(|name| RequiredStage { name, replay: None }),
+			);
+		}
+		VocabularyVariant {
+			name: route.vocabulary_name(),
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Owned(required),
+			residual_boundary_micros: RESIDUAL_BOUNDARY_MICROS,
+		}
+	})
+	.collect()
+}
+
+impl Join0ChunkRoute {
+	pub(in crate::exec) fn spill_cadence(self) -> Join0SpillCadence {
+		match self {
+			Self::PartitionedScanBuild
+			| Self::PartitionedMaterializedScanProbe
+			| Self::PartitionedMaterializedProbe => Join0SpillCadence::PerGroup,
+			Self::SpilledScanBuild
+			| Self::SpilledBuildScanProbe
+			| Self::SpilledBuild
+			| Self::EstimateSpillFallback => Join0SpillCadence::WholeBuild,
+			Self::ScanProbeInMemory | Self::InMemory => Join0SpillCadence::None,
+		}
+	}
+
+	/// The vocabulary variant name this route commits, namespaced by handler so a profile reader is
+	/// never left guessing which handler a bare route name belongs to.
+	fn vocabulary_name(self) -> &'static str {
+		match self {
+			Self::PartitionedScanBuild => "correlated_scalar_partitioned_scan_build",
+			Self::SpilledScanBuild => "correlated_scalar_spilled_scan_build",
+			Self::PartitionedMaterializedScanProbe => {
+				"correlated_scalar_partitioned_materialized_scan_probe"
+			}
+			Self::SpilledBuildScanProbe => "correlated_scalar_spilled_build_scan_probe",
+			Self::ScanProbeInMemory => "correlated_scalar_scan_probe_in_memory",
+			Self::PartitionedMaterializedProbe => {
+				"correlated_scalar_partitioned_materialized_probe"
+			}
+			Self::SpilledBuild => "correlated_scalar_spilled_build",
+			Self::EstimateSpillFallback => "correlated_scalar_estimate_spill_fallback",
+			Self::InMemory => "correlated_scalar_in_memory",
+		}
+	}
+}
+
 enum ReorientedStageScanBuildDecision {
 	Stream,
 	StreamMaterializedBatches(Vec<RecordBatch>),
@@ -1881,6 +2051,82 @@ fn partition_streaming_join_batch_active_group_with_buckets(
 		));
 	}
 	Ok(partitioned)
+}
+
+/// The scan_probe_base stage contract, built at predeclaration — before runtime preparation is
+/// measured. The suffix requirements are replay-scoped runtime data read from the extracted chain:
+/// one `suffix_probe` per replay identity, plus `suffix_filter` where that stage carries a
+/// post-filter. The four variants differ only in which structurally-present base filters they
+/// require; the branch commits the one it observed on the bindings it executed. Chain length is
+/// repeated replay-bound stages within one vocabulary, not a separate vocabulary — it does not
+/// change the lifecycle. Spill is one Flow domain across every stage, replayed or not, so the
+/// profile can say whether bytes are preparation or suffix probing.
+fn scan_probe_base_variants(
+	stages: &[ReorientedInnerJoinStage<'_>],
+) -> Vec<node_attribution::VocabularyVariant> {
+	use node_attribution::{RequiredStage, RequiredStages, SpillCounterKind, VocabularyVariant};
+	const COMMON: &[&str] = &[
+		"runtime_prep",
+		"base_prep",
+		"base_hash_build",
+		"scan_open",
+		"scan_pull",
+		"base_probe",
+		"base_materialize",
+		"repartition",
+		"fold",
+		"finalize",
+		"cleanup",
+	];
+	// Provisional boundary, disclosed on every profile: no grounded residual exists for this handler
+	// yet, so this reuses the scan_grouped declaration. The first measured profile checks it; if the
+	// un-staged remainder (structural probes, batch scaffolding, the declined adaptive attempt)
+	// exceeds it, the profile fails honestly and the boundary is re-derived from that grounding.
+	const RESIDUAL_BOUNDARY_MICROS: u64 = 500_000;
+	let mut required: Vec<RequiredStage> = COMMON
+		.iter()
+		.map(|name| RequiredStage { name, replay: None })
+		.collect();
+	for stage in stages {
+		let replay = Some(u64::from(stage.replay_id.0));
+		required.push(RequiredStage {
+			name: "suffix_probe",
+			replay,
+		});
+		if stage.post_filter.is_some() {
+			required.push(RequiredStage {
+				name: "suffix_filter",
+				replay,
+			});
+		}
+	}
+	let with = |extra: &[&'static str]| {
+		let mut list = required.clone();
+		list.extend(
+			extra
+				.iter()
+				.map(|name| RequiredStage { name, replay: None }),
+		);
+		RequiredStages::Owned(list)
+	};
+	let variants: [(&'static str, &[&'static str]); 4] = [
+		("scan_probe_base", &[]),
+		("scan_probe_base_scan_filter", &["base_scan_filter"]),
+		("scan_probe_base_join0_filter", &["join0_filter"]),
+		(
+			"scan_probe_base_scan_and_join0_filter",
+			&["base_scan_filter", "join0_filter"],
+		),
+	];
+	variants
+		.into_iter()
+		.map(|(name, extra)| VocabularyVariant {
+			name,
+			spill: SpillCounterKind::Flow,
+			required_stages: with(extra),
+			residual_boundary_micros: RESIDUAL_BOUNDARY_MICROS,
+		})
+		.collect()
 }
 
 pub(in crate::exec) fn extract_reoriented_inner_chain(
@@ -4514,6 +4760,20 @@ impl Executor {
 			});
 		}
 
+		// ADR 508 step 2: predeclare every join0 leaf variant *before* the scalar side executes, so
+		// scalar preparation is measured under a declaration that has not yet chosen a lifecycle.
+		// Commit happens only once the dispatcher returns the leaf that actually ran.
+		let attribution_telemetry = self.context.task_telemetry.clone();
+		let stage_handle =
+			node_attribution::predeclare_stage_vocabulary(correlated_scalar_variants);
+
+		// scalar_prep drives a nested `execute_bound`: the correlated scalar side is frequently a
+		// grouped aggregate in its own right and can dominate wall time. The token subtracts that
+		// child, so this stage's exclusive value is much smaller than its wall span — correct, and
+		// worth stating because the gap otherwise reads as a lost measurement.
+		let prep_stage = stage_handle
+			.as_ref()
+			.and_then(|h| node_attribution::open_stage(h, "scalar_prep", &attribution_telemetry));
 		let scalar_batches = self.execute_bound(right, morsel).await?;
 		let scalar_batch = concat_or_empty(right.schema(), &scalar_batches)?;
 		let scalar_key_arrays = key_arrays(&scalar_batch, right_keys)?;
@@ -4527,6 +4787,9 @@ impl Executor {
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
 		let estimated_build_bytes =
 			estimated_build_hash_bytes(&scalar_key_arrays, scalar_batch.num_rows());
+		if let Some(stage) = prep_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 		if estimated_build_bytes > build_cap {
 			return Err(budget_exhausted(
 				BudgetDimension::Memory,
@@ -4535,6 +4798,9 @@ impl Executor {
 				build_cap,
 			));
 		}
+		let hash_stage = stage_handle.as_ref().and_then(|h| {
+			node_attribution::open_stage(h, "scalar_hash_build", &attribution_telemetry)
+		});
 		let Some(scalar_rows) = build_in_memory_join_rows(
 			key_plan,
 			&scalar_key_arrays,
@@ -4550,6 +4816,9 @@ impl Executor {
 				build_cap,
 			));
 		};
+		if let Some(stage) = hash_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.counters.build_rows = task
 				.counters
@@ -4582,47 +4851,81 @@ impl Executor {
 			preserved_filter,
 			morsel,
 			None,
+			stage_handle.as_ref(),
 			|batch| {
-				for (partition, partitioned) in self.repartition_exchange_batch(
-					&batch,
-					*partition_count,
-					preserved_exchange_key,
-				)? {
-					accumulated_bytes =
-						accumulated_bytes.saturating_add(record_batch_memory_bytes(&partitioned));
-					if accumulated_bytes > accumulator_cap {
-						return Err(budget_exhausted(
-							BudgetDimension::Memory,
-							"correlated scalar preserved-side exchange accumulator",
-							accumulated_bytes,
-							accumulator_cap,
-						));
+				let accum_stage = stage_handle.as_ref().and_then(|h| {
+					node_attribution::open_stage(h, "repartition_accum", &attribution_telemetry)
+				});
+				let result = (|| {
+					for (partition, partitioned) in self.repartition_exchange_batch(
+						&batch,
+						*partition_count,
+						preserved_exchange_key,
+					)? {
+						accumulated_bytes = accumulated_bytes
+							.saturating_add(record_batch_memory_bytes(&partitioned));
+						if accumulated_bytes > accumulator_cap {
+							return Err(budget_exhausted(
+								BudgetDimension::Memory,
+								"correlated scalar preserved-side exchange accumulator",
+								accumulated_bytes,
+								accumulator_cap,
+							));
+						}
+						if partitioned.num_rows() > 0 {
+							partition_batches[partition].push(partitioned);
+						}
 					}
-					if partitioned.num_rows() > 0 {
-						partition_batches[partition].push(partitioned);
-					}
+					Ok(())
+				})();
+				if let Some(stage) = accum_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
 				}
-				Ok(())
+				result
 			},
 		))
 		.await?;
-		if matched.is_none() {
+		// Commit only the leaf the dispatcher returned. A decline leaves the declaration pending, so
+		// every stage recorded above is discarded with it rather than published under a lifecycle the
+		// query did not execute.
+		let Some(join0_route) = matched else {
 			return Ok(None);
+		};
+		if let Some(handle) = stage_handle.as_ref() {
+			node_attribution::commit_stage_vocabulary(handle, join0_route.vocabulary_name());
 		}
 
 		let mut state = init_global_aggregate_state(aggr_expr)?;
 		for partition in partition_batches {
 			for preserved_batch in partition {
+				let probe_stage = stage_handle.as_ref().and_then(|h| {
+					node_attribution::open_stage(h, "recombine_probe", &attribution_telemetry)
+				});
 				let recombined_batches =
 					self.probe_streaming_left_outer_recombine(&mut runtime, &preserved_batch)?;
+				if let Some(stage) = probe_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 				for recombined in recombined_batches {
+					let filter_stage = stage_handle.as_ref().and_then(|h| {
+						node_attribution::open_stage(h, "recombine_filter", &attribution_telemetry)
+					});
 					let filtered = self.filter_batch_with_bound_predicate(
 						recombine_filter,
 						recombined,
 						"filter predicate",
 					)?;
+					if let Some(stage) = filter_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
+					}
 					if filtered.num_rows() > 0 {
+						let fold_stage = stage_handle.as_ref().and_then(|h| {
+							node_attribution::open_stage(h, "global_fold", &attribution_telemetry)
+						});
 						self.fold_global_aggregate_state(&mut state, aggr_expr, &filtered)?;
+						if let Some(stage) = fold_stage {
+							node_attribution::close_stage(stage, &attribution_telemetry);
+						}
 					}
 				}
 			}
@@ -4639,7 +4942,14 @@ impl Executor {
 			},
 		);
 
-		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
+		let finalize_stage = stage_handle
+			.as_ref()
+			.and_then(|h| node_attribution::open_stage(h, "finalize", &attribution_telemetry));
+		let output = finalize_global_aggregate_state(&state, aggr_expr, output_schema);
+		if let Some(stage) = finalize_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
+		output.map(Some)
 	}
 
 	pub(in crate::exec) async fn bound_sort(
@@ -4879,14 +5189,18 @@ impl Executor {
 		if disposition == FilterDisposition::FullyPushed {
 			return Ok(None);
 		}
+		// This entry point has no stage vocabulary to commit, so it discards the leaf route rather
+		// than widening its own signature for a value none of its callers use.
 		Box::pin(self.try_visit_streaming_join0_chunks(
 			input,
 			Some(predicate),
 			morsel,
 			None,
+			None,
 			visit_filtered_batch,
 		))
 		.await
+		.map(|route| route.map(|_| ()))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -4906,8 +5220,9 @@ impl Executor {
 		probe_columns_first: bool,
 		morsel: Option<(MorselId, u32)>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 		visit_batch: &mut F,
-	) -> Result<Option<()>, ExecutionError>
+	) -> Result<Option<Join0ChunkRoute>, ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
@@ -4994,6 +5309,7 @@ impl Executor {
 					replay_id,
 					estimated_build_bytes,
 					profile,
+					stage_handle,
 					&mut *visit_batch,
 				)
 				.await?
@@ -5009,7 +5325,7 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::PartitionedScanBuild));
 		}
 		if scan_build_estimate.is_some()
 			&& resident_scan_build.is_none()
@@ -5101,7 +5417,7 @@ impl Executor {
 			);
 			spilled.cleanup().await;
 			result?;
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::SpilledScanBuild));
 		}
 
 		let build_batches = build_batches.or(resident_scan_build.as_deref());
@@ -5138,7 +5454,7 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::PartitionedMaterializedScanProbe));
 		}
 		if let Some((mut spilled, key_plan)) = try_create_streamed_spilled_inner_build(
 			build_plan.schema(),
@@ -5231,7 +5547,7 @@ impl Executor {
 			);
 			spilled.cleanup().await;
 			result?;
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::SpilledBuildScanProbe));
 		}
 
 		let build_batch = concat_or_empty(build_plan.schema(), build_batches)?;
@@ -5334,7 +5650,7 @@ impl Executor {
 			crate::distributed::task::JoinSpillPath::InMemory,
 			0,
 		);
-		Ok(Some(()))
+		Ok(Some(Join0ChunkRoute::ScanProbeInMemory))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -5355,11 +5671,13 @@ impl Executor {
 		replay_id: JoinReplayId,
 		estimated_build_bytes: u64,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 		visit_batch: &mut F,
 	) -> Result<Option<(u64, u64, u64)>, ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
+		let stage_telemetry = self.context.task_telemetry.clone();
 		if match_filter.is_some() {
 			return Ok(None);
 		}
@@ -5372,6 +5690,9 @@ impl Executor {
 		let partition_timer = profile
 			.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
 			.transpose()?;
+		let plan_stage = stage_handle.and_then(|h| {
+			node_attribution::open_stage(h, "join0_partition_plan", &stage_telemetry)
+		});
 		let partitioning = self
 			.choose_streaming_scan_inner_build_partitioning(
 				estimated_build_bytes,
@@ -5385,6 +5706,9 @@ impl Executor {
 			.await;
 		if let Some(timer) = partition_timer {
 			timer.finish()?;
+		}
+		if let Some(stage) = plan_stage {
+			node_attribution::close_stage(stage, &stage_telemetry);
 		}
 		let (partition_count, group_count, _max_group_spill) = partitioning?;
 		if partition_count <= 1 {
@@ -5426,6 +5750,9 @@ impl Executor {
 			let group_range = partition_group_bounds(partition_count, group_count, group)?;
 			let mut partitioned_builds: Vec<Option<SpilledInnerJoinBuild>> =
 				(0..partition_count).map(|_| None).collect();
+			let open_stage_tok = stage_handle.and_then(|h| {
+				node_attribution::open_stage(h, "join0_group_open", &stage_telemetry)
+			});
 			for partition in group_range.clone() {
 				let created = SpilledInnerJoinBuild::create(
 					self.context.task_budget,
@@ -5442,7 +5769,12 @@ impl Executor {
 				};
 				partitioned_builds[partition] = Some(created);
 			}
+			if let Some(stage) = open_stage_tok {
+				node_attribution::close_stage(stage, &stage_telemetry);
+			}
 
+			let build_stage = stage_handle
+				.and_then(|h| node_attribution::open_stage(h, "join0_build", &stage_telemetry));
 			let build_started = Instant::now();
 			let mut group_spill_bytes = 0u64;
 			let build_result = self
@@ -5519,10 +5851,15 @@ impl Executor {
 				task.counters.spill_bytes =
 					task.counters.spill_bytes.saturating_add(group_spill_bytes);
 			});
+			if let Some(stage) = build_stage {
+				node_attribution::close_stage(stage, &stage_telemetry);
+			}
 			if let Some(timer) = group_build_timer {
 				timer.finish()?;
 			}
 
+			let probe_stage = stage_handle
+				.and_then(|h| node_attribution::open_stage(h, "join0_probe", &stage_telemetry));
 			let probe_started = Instant::now();
 			let result = self
 				.visit_partitioned_streaming_scan_probe_group_chunks(
@@ -5562,10 +5899,19 @@ impl Executor {
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 				task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 			});
+			if let Some(stage) = probe_stage {
+				node_attribution::close_stage(stage, &stage_telemetry);
+			}
 			let cleanup_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
 				.transpose()?;
+			let cleanup_stage = stage_handle.and_then(|h| {
+				node_attribution::open_stage(h, "join0_group_cleanup", &stage_telemetry)
+			});
 			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+			if let Some(stage) = cleanup_stage {
+				node_attribution::close_stage(stage, &stage_telemetry);
+			}
 			if let Some(timer) = cleanup_timer {
 				timer.finish()?;
 			}
@@ -7832,8 +8178,9 @@ impl Executor {
 		filter_predicate: Option<&BoundExprProgram>,
 		morsel: Option<(MorselId, u32)>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 		mut visit_batch: F,
-	) -> Result<Option<()>, ExecutionError>
+	) -> Result<Option<Join0ChunkRoute>, ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
@@ -7869,7 +8216,7 @@ impl Executor {
 		if left_is_scan_probe && (!right_is_scan_probe || !physical_scan_build) {
 			if right_is_scan_probe
 				&& !physical_scan_build
-				&& self
+				&& let Some(route) = self
 					.try_visit_streaming_inner_join_scan_probe_chunks(
 						right,
 						left,
@@ -7885,19 +8232,19 @@ impl Executor {
 						true,
 						morsel,
 						profile,
+						stage_handle,
 						&mut visit_batch,
 					)
 					.await?
-					.is_some()
 			{
-				return Ok(Some(()));
+				return Ok(Some(route));
 			}
 			let build_scan_started = local_join_phase_enabled().then(Instant::now);
 			let build_batches = self.execute_bound(right, morsel).await?;
 			if let Some(started) = build_scan_started {
 				local_join_phase_record_elapsed(LocalJoinPhase::Build, started);
 			}
-			if self
+			if let Some(route) = self
 				.try_visit_streaming_inner_join_scan_probe_chunks(
 					right,
 					left,
@@ -7913,18 +8260,18 @@ impl Executor {
 					true,
 					morsel,
 					profile,
+					stage_handle,
 					&mut visit_batch,
 				)
 				.await?
-				.is_some()
 			{
-				return Ok(Some(()));
+				return Ok(Some(route));
 			}
 			right_batches = Some(build_batches);
 		}
 		if right_is_scan_probe {
 			if left_is_scan_probe
-				&& self
+				&& let Some(route) = self
 					.try_visit_streaming_inner_join_scan_probe_chunks(
 						left,
 						right,
@@ -7940,12 +8287,12 @@ impl Executor {
 						false,
 						morsel,
 						profile,
+						stage_handle,
 						&mut visit_batch,
 					)
 					.await?
-					.is_some()
 			{
-				return Ok(Some(()));
+				return Ok(Some(route));
 			}
 			let build_scan_started = local_join_phase_enabled().then(Instant::now);
 			let build_batches = match left_batches.take() {
@@ -7955,7 +8302,7 @@ impl Executor {
 			if let Some(started) = build_scan_started {
 				local_join_phase_record_elapsed(LocalJoinPhase::Build, started);
 			}
-			if self
+			if let Some(route) = self
 				.try_visit_streaming_inner_join_scan_probe_chunks(
 					left,
 					right,
@@ -7971,12 +8318,12 @@ impl Executor {
 					false,
 					morsel,
 					profile,
+					stage_handle,
 					&mut visit_batch,
 				)
 				.await?
-				.is_some()
 			{
-				return Ok(Some(()));
+				return Ok(Some(route));
 			}
 			left_batches = Some(build_batches);
 		}
@@ -8017,7 +8364,7 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::PartitionedMaterializedProbe));
 		}
 		if let Some((mut spilled, key_plan)) = try_create_streamed_spilled_inner_build(
 			left.schema(),
@@ -8107,7 +8454,7 @@ impl Executor {
 			}
 			spilled.cleanup().await;
 			result?;
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::SpilledBuild));
 		}
 
 		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
@@ -8156,7 +8503,7 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			return Ok(Some(()));
+			return Ok(Some(Join0ChunkRoute::EstimateSpillFallback));
 		}
 		let join_key_plan =
 			JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays, *null_safe_keys);
@@ -8222,7 +8569,7 @@ impl Executor {
 				output_rows: RowCount::new(selection.len() as u64),
 			},
 		);
-		Ok(Some(()))
+		Ok(Some(Join0ChunkRoute::InMemory))
 	}
 
 	pub(in crate::exec) async fn try_streaming_left_outer_grouped_aggregate(
@@ -9292,6 +9639,7 @@ impl Executor {
 			join_filter_predicate,
 			morsel,
 			profile_ref,
+			None,
 			|batch| {
 				let batch = if let Some((exprs, project_schema)) = project {
 					let cols = self.evaluate_bound_program(exprs, &batch)?;
@@ -10319,7 +10667,15 @@ impl Executor {
 			outer_predicate,
 		);
 		mark_reoriented_inner_stage_projections(&mut stages, required_output)?;
-		let grouped_chain_profile = GroupedChainProfile::from_env(stages.len())?;
+		// ADR 508 step 2: predeclare the scan_probe_base stage contract before anything is measured.
+		// The suffix replay requirements are runtime data read from the extracted chain, and every
+		// filter-combination variant a later commit may select is fixed here — runtime preparation
+		// below is measured while the declaration is pending, buffered, and published only if the
+		// scan_probe_base branch commits. A declining branch publishes nothing.
+		let attribution_telemetry = self.context.task_telemetry.clone();
+		let stage_handle =
+			node_attribution::predeclare_stage_vocabulary(|| scan_probe_base_variants(&stages));
+		let mut grouped_chain_profile = GroupedChainProfile::from_env(stages.len())?;
 		let grouped_chain_root = if let Some(profile) = grouped_chain_profile.as_deref() {
 			let spill = GroupedChainProfile::task_spill_bytes(&self.context.task_telemetry)?;
 			Some(profile.begin_root(spill)?)
@@ -10340,6 +10696,9 @@ impl Executor {
 		let stage_count = stages.len();
 		let mut runtimes = Vec::with_capacity(stage_count);
 		let mut deferred_stream_stage = None;
+		let prep_stage = stage_handle
+			.as_ref()
+			.and_then(|h| node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry));
 		for (stage_index, stage) in stages.into_iter().enumerate() {
 			if stage_index + 1 == stage_count
 				&& self.reoriented_terminal_scan_build_estimated_over_cap(&stage, morsel)
@@ -10406,15 +10765,23 @@ impl Executor {
 			};
 			runtimes.push(runtime);
 		}
+		if let Some(stage) = prep_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 
 		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 		let mut matched = None;
+		// A routing fact, not a lifecycle: which branch committed the chain. Stamped so the
+		// unsupported-path receipt can name it without borrowing stage names from a vocabulary that
+		// does not describe it.
+		let mut committed_branch: Option<&'static str> = None;
 		if let Some((stage, scan_probe_batches, needs_decision_fallback)) = deferred_stream_stage {
 			if let Some(candidate) =
 				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel)?
 			{
 				runtimes.push(candidate);
+				committed_branch = Some("adaptive_last_stage");
 				matched = self
 					.try_streaming_reoriented_inner_chain_adaptive_last_stage_grouped(
 						base,
@@ -10435,6 +10802,11 @@ impl Executor {
 				}
 			}
 			if matched.is_none() {
+				// The deferred terminal stage is prepared here, after the adaptive attempt declined —
+				// still runtime preparation, merged into the same stage as the loop above.
+				let prep_stage = stage_handle.as_ref().and_then(|h| {
+					node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry)
+				});
 				let runtime = if needs_decision_fallback {
 					let scan_build_decision = if force_stream_projected_filtered_base
 						&& matches!(
@@ -10490,9 +10862,13 @@ impl Executor {
 					return Ok(None);
 				};
 				runtimes.push(runtime);
+				if let Some(stage) = prep_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 			}
 		}
 		if matched.is_none() {
+			committed_branch = Some("scan_probe_base");
 			matched = self
 				.try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
 					base,
@@ -10505,6 +10881,7 @@ impl Executor {
 					&mut groups,
 					&mut group_types,
 					morsel,
+					stage_handle.as_ref(),
 				)
 				.await?;
 		}
@@ -10517,6 +10894,7 @@ impl Executor {
 					&self.context.task_telemetry,
 				)?)?;
 			}
+			committed_branch = Some("generic_base_reservoir");
 			matched = self
 				.try_streaming_reoriented_inner_chain_generic_base_grouped(
 					base,
@@ -10533,11 +10911,25 @@ impl Executor {
 				)
 				.await?;
 		}
-		if runtime_prep_timer.is_some() && grouped_chain_profile.is_some() {
-			return Err(ExecutionError::Kernel {
-				message: "grouped-chain profile: admitted chain did not commit the generic grouped reservoir path"
-					.to_string(),
-			});
+		// An unconsumed runtime-prep timer means this chain committed through a branch the generic
+		// grouped-reservoir vocabulary does not describe. Record that as an explicit unsupported-path
+		// receipt and carry on: the profile is a diagnostic, and it must never decide whether the
+		// query succeeds.
+		// The timer borrows the profile, so it must be dropped before the profile can be taken out.
+		let vocabulary_is_inapplicable = runtime_prep_timer.is_some();
+		drop(runtime_prep_timer);
+		if vocabulary_is_inapplicable {
+			// Fail-open for execution, fail-closed for attribution: publish a receipt saying this
+			// vocabulary does not describe the path that ran, then **take the profiler out of the
+			// handler entirely**. Every later call — stage records, finalization and cleanup timers,
+			// final group rows, `finish_root`, `persist` — asserts the generic grouped-reservoir
+			// lifecycle and would otherwise still be able to fail a passing query. Dropping it here
+			// is what makes that unreachable, rather than relying on each site to check a flag. No
+			// timing is retained: an inapplicable vocabulary must publish no timing payload at all.
+			if let Some(profile) = grouped_chain_profile.as_deref() {
+				profile.record_unsupported_path(committed_branch);
+			}
+			grouped_chain_profile = None;
 		}
 		if matched.is_none() {
 			for runtime in runtimes {
@@ -10572,12 +10964,20 @@ impl Executor {
 			.as_deref()
 			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::Finalization))
 			.transpose()?;
+		// If the scan_probe_base branch committed, these land on the frame; under any other branch
+		// the declaration is still pending, so they are buffered and discarded — no conditional needed.
+		let finalize_stage = stage_handle
+			.as_ref()
+			.and_then(|h| node_attribution::open_stage(h, "finalize", &attribution_telemetry));
 		let output = self.finalize_bound_grouped_aggregate(
 			&mut groups,
 			&group_types,
 			aggr_expr,
 			output_schema,
 		);
+		if let Some(stage) = finalize_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 		if let Some(timer) = finalization_timer {
 			timer.finish()?;
 		}
@@ -10588,8 +10988,14 @@ impl Executor {
 			.as_deref()
 			.map(|profile| profile.begin_leaf(GroupedChainProfileLeaf::Cleanup))
 			.transpose()?;
+		let cleanup_stage = stage_handle
+			.as_ref()
+			.and_then(|h| node_attribution::open_stage(h, "cleanup", &attribution_telemetry));
 		for runtime in runtimes {
 			runtime.cleanup().await;
+		}
+		if let Some(stage) = cleanup_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
 		}
 		if let Some(timer) = cleanup_timer {
 			timer.finish()?;
@@ -11288,6 +11694,7 @@ impl Executor {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::too_many_arguments)]
 	async fn try_streaming_reoriented_inner_chain_scan_probe_base_grouped(
 		&self,
 		base: &ExecutionPlan,
@@ -11300,6 +11707,7 @@ impl Executor {
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 	) -> Result<Option<()>, ExecutionError> {
 		let mut visit_batch = |batch| {
 			self.fold_reoriented_grouped_output_batch(
@@ -11314,22 +11722,34 @@ impl Executor {
 				None,
 			)
 		};
-		self.try_visit_streaming_reoriented_inner_chain_scan_probe_base(
-			base,
-			inner_runtimes,
-			morsel,
-			&mut visit_batch,
-		)
-		.await
+		let observed = self
+			.try_visit_streaming_reoriented_inner_chain_scan_probe_base(
+				base,
+				inner_runtimes,
+				morsel,
+				&mut visit_batch,
+				stage_handle,
+			)
+			.await?;
+		// Commit only after the branch has won: a declined attempt never names a lifecycle, and the
+		// stages it buffered are discarded with the pending declaration.
+		if let (Some(handle), Some(variant)) = (stage_handle, observed) {
+			node_attribution::commit_stage_vocabulary(handle, variant);
+		}
+		Ok(observed.map(|_| ()))
 	}
 
+	/// On success returns the observed vocabulary variant name — the commit token for the stage
+	/// contract the grouped dispatcher predeclared. Callers without a declaration pass `None` and
+	/// ignore the name.
 	async fn try_visit_streaming_reoriented_inner_chain_scan_probe_base<F>(
 		&self,
 		base: &ExecutionPlan,
 		inner_runtimes: &mut [ReorientedInnerJoinRuntime<'_>],
 		morsel: Option<(MorselId, u32)>,
 		visit_batch: &mut F,
-	) -> Result<Option<()>, ExecutionError>
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
+	) -> Result<Option<&'static str>, ExecutionError>
 	where
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
@@ -11371,7 +11791,24 @@ impl Executor {
 		let Some(scan_input) = decompose_streaming_scan_probe_input(right.as_ref()) else {
 			return Ok(None);
 		};
+		// The observed lifecycle variant, named from the same bindings the loop below executes on —
+		// commit may only select among the predeclared definitions.
+		let observed_variant = match (
+			scan_input.filter_predicate.is_some(),
+			join0_filter.is_some(),
+		) {
+			(false, false) => "scan_probe_base",
+			(true, false) => "scan_probe_base_scan_filter",
+			(false, true) => "scan_probe_base_join0_filter",
+			(true, true) => "scan_probe_base_scan_and_join0_filter",
+		};
+		let telemetry = self.context.task_telemetry.clone();
 
+		// base_prep: concat, key extraction, sizing and key-plan construction — everything the
+		// task-ledger `build_micros` envelope excludes. The left child's execution is a nested
+		// `execute_bound` frame and is subtracted by the token itself.
+		let prep_stage =
+			stage_handle.and_then(|h| node_attribution::open_stage(h, "base_prep", &telemetry));
 		let left_batches = self.execute_bound(left.as_ref(), morsel).await?;
 		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
@@ -11387,6 +11824,13 @@ impl Executor {
 			right_keys,
 			*null_safe_keys,
 		)?;
+		if let Some(stage) = prep_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
+		// base_hash_build brackets exactly `build_in_memory_join_rows`, the same span the ledger's
+		// `build_micros` increment covers — the cross-check the two are reconciled by.
+		let hash_stage = stage_handle
+			.and_then(|h| node_attribution::open_stage(h, "base_hash_build", &telemetry));
 		let build_started = Instant::now();
 		let Some(build_rows) = build_in_memory_join_rows(
 			join_key_plan,
@@ -11398,6 +11842,9 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
+		if let Some(stage) = hash_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.counters.build_rows = task
 				.counters
@@ -11408,6 +11855,10 @@ impl Executor {
 				.build_micros
 				.saturating_add(duration_micros(build_started));
 		});
+		// scan_open sits outside the ledger's `probe_micros` envelope, which starts only after the
+		// stream exists — it is excluded from that cross-check rather than counted into it.
+		let open_stage =
+			stage_handle.and_then(|h| node_attribution::open_stage(h, "scan_open", &telemetry));
 		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
 			return Ok(None);
 		};
@@ -11419,24 +11870,43 @@ impl Executor {
 			.instrument(span)
 			.await?
 			.into_batches();
+		if let Some(stage) = open_stage {
+			node_attribution::close_stage(stage, &telemetry);
+		}
 		let probe_started = Instant::now();
 		let mut probe_rows = 0u64;
 		let mut output_rows = 0u64;
-		while let Some(batch) = stream.next().await {
+		loop {
+			let pull_stage =
+				stage_handle.and_then(|h| node_attribution::open_stage(h, "scan_pull", &telemetry));
+			let next = stream.next().await;
+			if let Some(stage) = pull_stage {
+				node_attribution::close_stage(stage, &telemetry);
+			}
+			let Some(batch) = next else {
+				break;
+			};
 			let Some(mut right_batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
 				break;
 			};
 			if let Some(predicate) = scan_input.filter_predicate {
+				let filter_stage = stage_handle
+					.and_then(|h| node_attribution::open_stage(h, "base_scan_filter", &telemetry));
 				right_batch = self.filter_batch_with_bound_predicate(
 					predicate,
 					right_batch,
 					"filter predicate",
 				)?;
+				if let Some(stage) = filter_stage {
+					node_attribution::close_stage(stage, &telemetry);
+				}
 				if right_batch.num_rows() == 0 {
 					continue;
 				}
 			}
 			probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+			let probe_stage = stage_handle
+				.and_then(|h| node_attribution::open_stage(h, "base_probe", &telemetry));
 			let right_key_arrays = key_arrays(&right_batch, right_keys)?;
 			let selection = probe_in_memory_join_rows(
 				JoinKind::Inner,
@@ -11450,9 +11920,14 @@ impl Executor {
 				&right_batch,
 				*null_safe_keys,
 			)?;
+			if let Some(stage) = probe_stage {
+				node_attribution::close_stage(stage, &telemetry);
+			}
 			output_rows = output_rows.saturating_add(selection.len() as u64);
 
 			for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+				let materialize_stage = stage_handle
+					.and_then(|h| node_attribution::open_stage(h, "base_materialize", &telemetry));
 				let batch = materialize_join_selection(
 					JoinKind::Inner,
 					&left_batch,
@@ -11461,22 +11936,51 @@ impl Executor {
 					join0_output_schema,
 					self.context.task_budget.memory.get(),
 				)?;
+				if let Some(stage) = materialize_stage {
+					node_attribution::close_stage(stage, &telemetry);
+				}
 				let batch = if let Some(join0_filter) = join0_filter {
-					self.filter_batch_with_bound_predicate(join0_filter, batch, "filter predicate")?
+					let filter_stage = stage_handle
+						.and_then(|h| node_attribution::open_stage(h, "join0_filter", &telemetry));
+					let batch = self.filter_batch_with_bound_predicate(
+						join0_filter,
+						batch,
+						"filter predicate",
+					)?;
+					if let Some(stage) = filter_stage {
+						node_attribution::close_stage(stage, &telemetry);
+					}
+					batch
 				} else {
 					batch
 				};
 				if batch.num_rows() == 0 {
 					continue;
 				}
-				for (_partition, partitioned) in
-					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?
-				{
+				let repartition_stage = stage_handle
+					.and_then(|h| node_attribution::open_stage(h, "repartition", &telemetry));
+				let partitioned_batches =
+					self.repartition_exchange_batch(&batch, *partition_count, base_exchange_key)?;
+				if let Some(stage) = repartition_stage {
+					node_attribution::close_stage(stage, &telemetry);
+				}
+				for (_partition, partitioned) in partitioned_batches {
 					if partitioned.num_rows() == 0 {
 						continue;
 					}
 					let mut batches = vec![partitioned];
 					for runtime in inner_runtimes.iter_mut() {
+						// One stage instance per replay identity: the chain's Nth probe records
+						// under its own id and merges only with itself across batches.
+						let replay = u64::from(runtime.replay_id.0);
+						let suffix_stage = stage_handle.and_then(|h| {
+							node_attribution::open_replay_stage(
+								h,
+								"suffix_probe",
+								replay,
+								&telemetry,
+							)
+						});
 						let mut next = Vec::new();
 						for batch in batches {
 							next.extend(
@@ -11485,7 +11989,18 @@ impl Executor {
 							);
 						}
 						batches = next;
+						if let Some(stage) = suffix_stage {
+							node_attribution::close_stage(stage, &telemetry);
+						}
 						if let Some(predicate) = runtime.post_filter {
+							let filter_stage = stage_handle.and_then(|h| {
+								node_attribution::open_replay_stage(
+									h,
+									"suffix_filter",
+									replay,
+									&telemetry,
+								)
+							});
 							let mut filtered = Vec::new();
 							for batch in batches {
 								let batch = self.filter_batch_with_bound_predicate(
@@ -11498,14 +12013,22 @@ impl Executor {
 								}
 							}
 							batches = filtered;
+							if let Some(stage) = filter_stage {
+								node_attribution::close_stage(stage, &telemetry);
+							}
 						}
 						if batches.is_empty() {
 							break;
 						}
 					}
 
+					let fold_stage = stage_handle
+						.and_then(|h| node_attribution::open_stage(h, "fold", &telemetry));
 					for batch in batches {
 						visit_batch(batch)?;
+					}
+					if let Some(stage) = fold_stage {
+						node_attribution::close_stage(stage, &telemetry);
 					}
 				}
 			}
@@ -11529,7 +12052,7 @@ impl Executor {
 				output_rows: RowCount::new(output_rows),
 			},
 		);
-		Ok(Some(()))
+		Ok(Some(observed_variant))
 	}
 
 	async fn try_visit_streaming_reoriented_inner_chain<F>(
@@ -11601,6 +12124,7 @@ impl Executor {
 				&mut runtimes,
 				morsel,
 				visit_batch,
+				None,
 			)
 			.await;
 		for runtime in &runtimes {
@@ -11619,7 +12143,7 @@ impl Executor {
 		for runtime in runtimes {
 			runtime.cleanup().await;
 		}
-		result
+		result.map(|committed| committed.map(|_| ()))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -15593,6 +16117,7 @@ impl Executor {
 			filter_predicate,
 			morsel,
 			None,
+			None,
 			|batch| {
 				for (_partition, partitioned) in
 					self.repartition_exchange_batch(&batch, *partition_count, key)?
@@ -19530,7 +20055,7 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, None, |batch| {
+			.try_visit_streaming_join0_chunks(&join, None, None, None, None, |batch| {
 				visited.push(batch);
 				Ok(())
 			})
@@ -19712,7 +20237,7 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, None, |batch| {
+			.try_visit_streaming_join0_chunks(&join, None, None, None, None, |batch| {
 				visited.push(batch);
 				Ok(())
 			})
@@ -22020,5 +22545,69 @@ mod tests {
 				.contains("chain stage profile snapshot rename failed")
 		);
 		let _ = std::fs::remove_dir_all(parent);
+	}
+
+	// ADR 508 step 2: every join0 leaf route must declare a spill cadence, because the cadence — not
+	// the enclosing dispatcher's name — is what bounds the granularity at which a stage vocabulary may
+	// attribute bytes. A partitioned route increments the task counter once per completed group, so a
+	// group-enclosing stage can attribute honestly; a monolithic route increments once after the whole
+	// build, so no sub-build stage can. Getting this mapping wrong would publish a structural zero as
+	// a measured zero, which is the exact failure the resolution floor exists to prevent on the time
+	// axis. Pinned here so a new leaf cannot be added without choosing its cadence deliberately.
+	#[test]
+	fn every_join0_leaf_route_declares_its_spill_cadence() {
+		use Join0ChunkRoute::*;
+		let all = [
+			PartitionedScanBuild,
+			SpilledScanBuild,
+			PartitionedMaterializedScanProbe,
+			SpilledBuildScanProbe,
+			ScanProbeInMemory,
+			PartitionedMaterializedProbe,
+			SpilledBuild,
+			EstimateSpillFallback,
+			InMemory,
+		];
+		// Names are the stage-vocabulary variant keys, so they must be distinct.
+		let mut names: Vec<&str> = all.iter().map(|route| route.vocabulary_name()).collect();
+		names.sort_unstable();
+		let unique = names.len();
+		names.dedup();
+		assert_eq!(names.len(), unique, "leaf route names must be distinct");
+
+		let cadence_of = |route: Join0ChunkRoute| route.spill_cadence();
+		for route in [
+			PartitionedScanBuild,
+			PartitionedMaterializedScanProbe,
+			PartitionedMaterializedProbe,
+		] {
+			assert_eq!(
+				cadence_of(route),
+				Join0SpillCadence::PerGroup,
+				"{} increments once per completed partition group",
+				route.vocabulary_name()
+			);
+		}
+		for route in [
+			SpilledScanBuild,
+			SpilledBuildScanProbe,
+			SpilledBuild,
+			EstimateSpillFallback,
+		] {
+			assert_eq!(
+				cadence_of(route),
+				Join0SpillCadence::WholeBuild,
+				"{} increments once after the whole build",
+				route.vocabulary_name()
+			);
+		}
+		for route in [ScanProbeInMemory, InMemory] {
+			assert_eq!(
+				cadence_of(route),
+				Join0SpillCadence::None,
+				"{} has no spill writer",
+				route.vocabulary_name()
+			);
+		}
 	}
 }
