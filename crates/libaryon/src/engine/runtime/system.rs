@@ -4602,7 +4602,7 @@ mod tests {
 		let file = repo.join("main.rs");
 		fs::write(&file, "fn main() {}\n").expect("write source fixture");
 
-		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(true, false, None);
 		let _loaded = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,
@@ -4624,6 +4624,10 @@ mod tests {
 			.find(|pane| pane.is_output_panel)
 			.expect("GitStatus must create an output panel");
 		assert_eq!(panel_pane.gutter_numbering, None);
+		assert!(
+			panel_pane.minimap.is_none(),
+			"Git navigation pane must not inherit the editor minimap"
+		);
 		let panel_text = pane_text(&panel, panel_pane.pane_id);
 		assert!(
 			panel_text.contains("?? untracked.txt"),

@@ -228,9 +228,9 @@ pub struct CodeEditor {
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
 	last_pointer: Option<iced::Point>,
-	/// Last file-tree row pressed, used to reproduce Baryon's deliberate
-	/// same-pane, same-row double-click contract.
-	last_browser_click: Option<(libaryon::core::PaneId, DocLine, time::Instant)>,
+	/// Last file-tree or Git-status row pressed, used to reproduce Baryon's
+	/// deliberate same-pane, same-row double-click contract.
+	last_navigation_click: Option<(libaryon::core::PaneId, DocLine, time::Instant)>,
 	/// Latest raw window-space cursor, from the root subscription.
 	last_raw_window: Option<iced::Point>,
 	/// window_coord - editor_local_coord, learned whenever both the mouse_area
@@ -399,7 +399,7 @@ impl CodeEditor {
 			cursor_blink: CursorBlink::new(),
 			content_dirty: false,
 			last_pointer: None,
-			last_browser_click: None,
+			last_navigation_click: None,
 			last_raw_window: None,
 			pointer_offset: None,
 			status_message: None,
@@ -1347,9 +1347,15 @@ impl CodeEditor {
 		let Some(visible_row) = pane.visible_rows.get(row) else {
 			return;
 		};
-		if pane.is_file_browser {
+		let column =
+			((local_x - pane_gutter_width(pane)).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
+		let target = CursorPosition::new(
+			visible_row.line,
+			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
+		);
+		if pane.is_file_browser || pane.is_git_status_panel {
 			let now = time::Instant::now();
-			let double_click = self.last_browser_click.is_some_and(
+			let double_click = self.last_navigation_click.is_some_and(
 				|(previous_pane, previous_line, previous_at)| {
 					previous_pane == pane.pane_id
 						&& previous_line == visible_row.line
@@ -1357,21 +1363,21 @@ impl CodeEditor {
 				},
 			);
 			if !double_click {
-				self.last_browser_click = Some((pane.pane_id, visible_row.line, now));
+				self.last_navigation_click = Some((pane.pane_id, visible_row.line, now));
 			}
-			self.send(EditorCommand::ClickBrowserEntry {
-				line: visible_row.line,
-				double_click,
-			});
+			if pane.is_file_browser {
+				self.send(EditorCommand::ClickBrowserEntry {
+					line: visible_row.line,
+					double_click,
+				});
+			} else if double_click {
+				self.send(EditorCommand::OpenGitStatusEntry(visible_row.line));
+			} else {
+				self.send(EditorCommand::ClickCursor(target));
+			}
 			self.request_content();
 			return;
 		}
-		let column =
-			((local_x - pane_gutter_width(pane)).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
-		let target = CursorPosition::new(
-			visible_row.line,
-			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
-		);
 		self.send(EditorCommand::ClickCursor(target));
 		self.request_content();
 	}
@@ -3265,7 +3271,7 @@ mod tests {
 		}
 	}
 
-	fn file_browser_fixture(label: &str) -> std::path::PathBuf {
+	fn navigation_fixture(label: &str) -> std::path::PathBuf {
 		let nonce = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.expect("time should move forward")
@@ -5045,7 +5051,7 @@ mod tests {
 
 	#[test]
 	fn file_browser_omits_editor_gutter_and_minimap() {
-		let root = file_browser_fixture("chrome");
+		let root = navigation_fixture("file-browser-chrome");
 		std::fs::create_dir_all(&root).expect("create browser fixture");
 		std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("write browser fixture");
 
@@ -5079,7 +5085,7 @@ mod tests {
 
 	#[test]
 	fn double_clicking_file_browser_row_opens_the_file() {
-		let root = file_browser_fixture("double-click");
+		let root = navigation_fixture("file-browser-double-click");
 		std::fs::create_dir_all(&root).expect("create browser fixture");
 		let file = root.join("main.rs");
 		std::fs::write(&file, "fn main() {}\n").expect("write browser fixture");
@@ -5140,6 +5146,119 @@ mod tests {
 		}
 
 		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn git_status_omits_editor_chrome_and_double_click_opens_the_file() {
+		let repo = navigation_fixture("git-status");
+		std::fs::create_dir_all(&repo).expect("create Git fixture");
+		let initialized = std::process::Command::new("git")
+			.args(["init", "--quiet"])
+			.current_dir(&repo)
+			.status()
+			.expect("run git init");
+		assert!(initialized.success(), "git init failed");
+		let file = repo.join("untracked.txt");
+		std::fs::write(&file, "untracked\n").expect("write Git fixture");
+		let source = repo.join("main.rs");
+		std::fs::write(&source, "fn main() {}\n").expect("write source fixture");
+		let expected = file.to_string_lossy().into_owned();
+
+		{
+			let mut editor = CodeEditor::open_initial_file(source.to_string_lossy().into_owned());
+			wait_for_content(&mut editor, "fn main() {}\n");
+			editor.send(EditorCommand::GitStatus);
+
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor.viewport.as_ref().is_none_or(|viewport| {
+				!viewport.panes.iter().any(|pane| {
+					pane.is_git_status_panel
+						&& String::from_utf8_lossy(
+							&pane
+								.tokens
+								.iter()
+								.flat_map(|token| token.text.iter().copied())
+								.collect::<Vec<_>>(),
+						)
+						.contains("?? untracked.txt")
+				})
+			}) && Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+
+			let (git_pane, point) = {
+				let pane = editor
+					.viewport
+					.as_ref()
+					.expect("Git status viewport")
+					.panes
+					.iter()
+					.find(|pane| pane.is_git_status_panel)
+					.expect("Git status pane");
+				let text = String::from_utf8_lossy(
+					&pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>(),
+				)
+				.into_owned();
+				let line = text
+					.lines()
+					.position(|line| line == "?? untracked.txt")
+					.expect("untracked Git row") as u64;
+				let visible_row = pane
+					.visible_rows
+					.iter()
+					.position(|row| row.line.get() == line)
+					.expect("visible untracked Git row");
+				assert!(pane.gutter_numbering.is_none());
+				assert_eq!(pane_gutter_width(pane), 0.0);
+				assert!(pane.minimap.is_none());
+				(
+					pane.pane_id,
+					iced::Point::new(
+						pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH
+							+ metrics::CELL_WIDTH / 2.0,
+						pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT
+							+ PANE_HEADER_HEIGHT + (visible_row as f32 + 0.5) * metrics::LINE_HEIGHT,
+					),
+				)
+			};
+			let _ = editor.update(EditorMsg::PointerMoved(point));
+			let _ = editor.update(EditorMsg::Click);
+			let _ = editor.update(EditorMsg::Click);
+
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor.viewport.as_ref().is_none_or(|viewport| {
+				viewport.focused_pane().is_none_or(|pane| {
+					pane.is_git_status_panel || pane.file_name.as_deref() != Some(expected.as_str())
+				})
+			}) && Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			let viewport = editor.viewport.as_ref().expect("opened Git entry viewport");
+			assert_eq!(
+				viewport
+					.focused_pane()
+					.expect("focused editor pane")
+					.file_name
+					.as_deref(),
+				Some(expected.as_str())
+			);
+			assert!(
+				viewport
+					.pane(git_pane)
+					.is_some_and(|pane| pane.is_git_status_panel),
+				"opening a Git entry keeps the status pane alive"
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(repo);
 	}
 
 	#[test]

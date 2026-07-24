@@ -762,10 +762,10 @@ fn render_pane_viewport(
 		} else {
 			tab.gutter_numbering()
 		};
-		// A file tree is navigation chrome, not an editable source document.
-		// Keep its full width available for paths regardless of the session's
-		// normal editor minimap setting.
-		let minimap_enabled = tab.view.minimap_enabled && !is_file_browser;
+		// File trees and Git status are navigation chrome, not editable source
+		// documents. Keep their full width available for paths regardless of
+		// the session's normal editor minimap setting.
+		let minimap_enabled = tab.view.minimap_enabled && !is_file_browser && !is_git_status_panel;
 		let visible_whitespace = tab.view.visible_whitespace && !is_file_browser;
 
 		let (
