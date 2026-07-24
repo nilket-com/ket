@@ -567,6 +567,7 @@ impl Executor {
 			)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("scan_grouped");
 			return Ok(Some(output));
 		}
 		if let Some(output) = self
@@ -579,6 +580,7 @@ impl Executor {
 			)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("left_outer_grouped");
 			return Ok(Some(output));
 		}
 		if let Some(output) = self
@@ -591,6 +593,7 @@ impl Executor {
 			)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("projected_left_semi_grouped");
 			return Ok(Some(output));
 		}
 		if let Some(output) = Box::pin(self.try_streaming_inner_prefix_semi_anti_grouped_aggregate(
@@ -602,6 +605,7 @@ impl Executor {
 		))
 		.await?
 		{
+			crate::exec::node_attribution::record_route("inner_prefix_semi_anti_grouped");
 			return Ok(Some(output));
 		}
 		if let Some(output) = self
@@ -614,6 +618,7 @@ impl Executor {
 			)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("reoriented_inner_chain_grouped");
 			return Ok(Some(output));
 		}
 		Ok(None)
@@ -630,6 +635,7 @@ impl Executor {
 			.try_streaming_scan_global_aggregate(input, aggr_expr, output_schema, morsel)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("scan_global");
 			return Ok(Some(output));
 		}
 		if let Some(output) = self
@@ -641,12 +647,14 @@ impl Executor {
 			)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("correlated_scalar_left_outer_global");
 			return Ok(Some(output));
 		}
 		if let Some(output) = self
 			.try_streaming_collapsing_global_aggregate(input, aggr_expr, output_schema, morsel)
 			.await?
 		{
+			crate::exec::node_attribution::record_route("collapsing_global");
 			return Ok(Some(output));
 		}
 		Ok(None)

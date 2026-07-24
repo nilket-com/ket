@@ -114,6 +114,21 @@ struct NodeMeasurement {
 struct Frame {
 	children_micros: u64,
 	children_spill: u64,
+	/// ADR 508 step 1: which streaming handler took this node, stamped by the dispatcher while the
+	/// frame is open. Per frame, not per query, because a query can invoke the same node kind more
+	/// than once and each invocation may route differently.
+	route: Option<&'static str>,
+}
+
+/// One `Aggregate` node invocation: its route and its own exclusive cost. The unit ADR 508 requires,
+/// because a cell's dominant `aggregate` share can be a sum across several invocations — matching a
+/// handler profile to the right one is impossible from a per-kind total alone.
+#[derive(Clone, Copy)]
+struct AggregateInvocation {
+	index: u64,
+	route: Option<&'static str>,
+	exclusive_micros: u64,
+	exclusive_spill_bytes: u64,
 }
 
 /// The pure stack accounting. Given, per node, its measured inclusive time and inclusive spill, it
@@ -129,11 +144,21 @@ struct NodeAccounting {
 	root_span_micros: u64,
 	root_spill_delta: u64,
 	root_spill_before: u64,
+	aggregate_invocations: Vec<AggregateInvocation>,
 }
 
 impl NodeAccounting {
 	fn enter(&mut self) {
 		self.stack.push(Frame::default());
+	}
+
+	/// Stamp the open node with the handler that took it. Called by the aggregate dispatcher at the
+	/// point an arm wins, when that arm's own children have already popped — so the top of the stack
+	/// is the `Aggregate` frame being routed, not one of its descendants.
+	fn set_route(&mut self, route: &'static str) {
+		if let Some(frame) = self.stack.last_mut() {
+			frame.route = Some(route);
+		}
 	}
 
 	/// Close the current node with its measured inclusive span and spill. Returns whether this pop
@@ -166,6 +191,17 @@ impl NodeAccounting {
 		measurement.exclusive_spill_bytes = measurement
 			.exclusive_spill_bytes
 			.saturating_add(exclusive_spill);
+		if kind == NodeKind::Aggregate {
+			// One record per invocation, in completion order. An invocation with no route means every
+			// streaming arm declined and the generic fold ran — uncovered, and named as such.
+			let index = self.aggregate_invocations.len() as u64;
+			self.aggregate_invocations.push(AggregateInvocation {
+				index,
+				route: frame.route,
+				exclusive_micros,
+				exclusive_spill_bytes: exclusive_spill,
+			});
+		}
 		if let Some(parent) = self.stack.last_mut() {
 			parent.children_micros = parent.children_micros.saturating_add(inclusive_micros);
 			parent.children_spill = parent.children_spill.saturating_add(inclusive_spill);
@@ -231,6 +267,23 @@ pub(in crate::exec) fn enter(
 		spill_before,
 		telemetry: telemetry.clone(),
 		active: true,
+	}
+}
+
+/// ADR 508 step 1: stamp the currently-open node with the streaming handler that took it.
+///
+/// Called from the aggregate dispatcher at the point an arm wins. This is the routing evidence the
+/// handler-map receipt rests on: durable and per invocation, rather than a throwaway trace, so a cell
+/// with several `Aggregate` invocations can have each one matched to its handler. No-op when
+/// profiling is off.
+pub(in crate::exec) fn record_route(route: &'static str) {
+	if !enabled() {
+		return;
+	}
+	if let Ok(mut slot) = NODE_LEDGER.lock() {
+		if let Some(accounting) = slot.as_mut() {
+			accounting.set_route(route);
+		}
 	}
 }
 
@@ -325,8 +378,23 @@ fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
 			})
 		})
 		.collect::<Vec<_>>();
+	// One record per Aggregate invocation, with its route and its own exclusive cost — the unit the
+	// handler map is keyed on, and the span a step-2 inner profile must close against.
+	let aggregate_invocations = accounting
+		.aggregate_invocations
+		.iter()
+		.map(|invocation| {
+			serde_json::json!({
+				"index": invocation.index,
+				"route": invocation.route.unwrap_or("uncovered_generic_fold"),
+				"exclusive_micros": invocation.exclusive_micros,
+				"exclusive_spill_bytes": invocation.exclusive_spill_bytes,
+			})
+		})
+		.collect::<Vec<_>>();
 	let value = serde_json::json!({
 		"suite": "node_attribution",
+		"aggregate_invocations": aggregate_invocations,
 		// The span this profiler measures — begins inside `execute_bound`, ends at the root pop. It is
 		// a subset of the perf row's `execute_ms`; reconciling to `execute_ms` is the reader's step.
 		"execute_bound_span_micros": accounting.root_span_micros,
@@ -474,6 +542,67 @@ mod tests {
 			domain.reconcile().expect("reconciles").unattributed_bytes,
 			0
 		);
+	}
+
+	// ADR 508 step 1: a query with several Aggregate invocations must yield one routed record per
+	// invocation, each carrying its own exclusive cost. A per-kind total cannot be matched to a
+	// handler profile; this is the unit that can. An invocation no streaming arm claimed is named
+	// uncovered rather than silently attributed.
+	#[test]
+	fn each_aggregate_invocation_records_its_own_route_and_cost() {
+		let mut acc = NodeAccounting::default();
+		// Root Aggregate routed to a streaming handler, with a child Aggregate under it that no arm
+		// claimed — the shape that would otherwise let one profile stand in for two invocations.
+		acc.enter();
+		acc.enter();
+		// Inner aggregate: never routed, so it fell through to the generic fold.
+		assert!(!acc.exit(NodeKind::Aggregate, 400, 100, 100));
+		// Outer aggregate: the dispatcher stamped it while its frame was the open one.
+		acc.set_route("reoriented_inner_chain_grouped");
+		assert!(acc.exit(NodeKind::Aggregate, 1000, 250, 250));
+
+		assert_eq!(
+			acc.aggregate_invocations.len(),
+			2,
+			"one record per invocation"
+		);
+		let inner = acc.aggregate_invocations[0];
+		assert_eq!(inner.index, 0);
+		assert_eq!(
+			inner.route, None,
+			"an unclaimed invocation carries no route"
+		);
+		assert_eq!(inner.exclusive_micros, 400);
+		let outer = acc.aggregate_invocations[1];
+		assert_eq!(outer.index, 1);
+		assert_eq!(outer.route, Some("reoriented_inner_chain_grouped"));
+		// Outer exclusive subtracts the inner child, so invocation costs do not double-count.
+		assert_eq!(outer.exclusive_micros, 600);
+		assert_eq!(outer.exclusive_spill_bytes, 150);
+		// And the invocations sum to the Aggregate node-kind total the per-node layer reports.
+		assert_eq!(
+			acc.aggregate_invocations
+				.iter()
+				.map(|i| i.exclusive_micros)
+				.sum::<u64>(),
+			acc.nodes[NodeKind::Aggregate.index()].exclusive_micros
+		);
+	}
+
+	// A route stamped while a descendant frame is open must not land on the descendant. The
+	// dispatcher stamps only after its arm's children have popped, so the top frame is the routed
+	// node; this pins that the stamp follows the stack rather than the most recent call.
+	#[test]
+	fn a_route_lands_on_the_open_frame_not_a_completed_child() {
+		let mut acc = NodeAccounting::default();
+		acc.enter();
+		acc.enter();
+		assert!(!acc.exit(NodeKind::Scan, 100, 0, 0));
+		// Child popped; the Aggregate frame is open again and is what gets stamped.
+		acc.set_route("scan_grouped");
+		assert!(acc.exit(NodeKind::Aggregate, 500, 0, 0));
+		assert_eq!(acc.aggregate_invocations.len(), 1);
+		assert_eq!(acc.aggregate_invocations[0].route, Some("scan_grouped"));
 	}
 
 	// Interleaved (concurrent) children would drive an exclusive figure negative. The accounting

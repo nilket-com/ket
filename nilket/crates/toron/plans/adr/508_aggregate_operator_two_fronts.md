@@ -16,13 +16,19 @@ Per cell, exclusive share of the dominant node:
 
 | cell | execute ms | dominant | spill | front |
 |---|---:|---|---:|---|
-| q17 | 35,693 | aggregate 100% | 623 MB | spill-replay |
+| q17 | 35,693 | aggregate 100% | 623 MB | spill-replay + compute-fold (see below) |
 | q21 | 17,935 | aggregate 100% | 898 MB | spill-replay |
 | q09 | 13,032 | aggregate 95% | 0 | compute-fold |
 | q20 | 9,476 | aggregate 61%, join 33% | 0 | compute-fold |
 | q08 | 7,982 | aggregate 96% | 0 | compute-fold |
 | q18 | 19,430 | join 65%, exchange 17% | 990 MB | join/sort (parked) |
 | q02 | 2,675 | sort 41%, join 31% | 0 | join/sort (parked) |
+
+**Fronts are a property of an invocation, not a query.** The step-1 handler map
+(`impl/508_handler_map.md`) measured q17's dominant node as *two* invocations on different handlers:
+one `scan_grouped` at 31% with zero spill (compute-fold) and one `correlated_scalar_left_outer_global`
+at 69% carrying all 623 MB (spill-replay). The cell column above is therefore a summary; the ranked
+premises in steps 4 and 5 are built per invocation. A cell may contribute to both fronts.
 
 **The trap this ADR exists to avoid.** "Aggregate" here is a *plan node*, and for most of these cells
 that node is a **fused streaming operator** — a handler that internally does a join, a fold, and
@@ -84,19 +90,27 @@ board cannot be measured from the same commit that is still being edited — a b
 that is later squashed or amended has no recoverable identity, which is exactly how the 507 board
 acquired its `-dirty` stamp. So the baseline is **two cohesive deliverables, in order**:
 
-- **Seal and push** the step-1 handler map, the step-2 inner attribution, and the q11 harness change as
-  one implementation commit. That commit is the build identity of record.
+- Step 1 (the handler map and its routing instrument) **may seal independently** — it is a durable
+  receipt plus a reusable instrument, independently valuable and revertible, not a review pivot. Its
+  own measurements are routing facts and may be taken from a working tree, provided the receipt says
+  so; they are never baseline numbers.
+- **Seal and push** the cumulative step-2 inner attribution and the q11 harness change as one
+  implementation commit. **That** commit is the build identity of record: pushed, and never amended
+  afterwards.
 - **Then measure** the 22/22 board from that exact pushed commit, and land the numbers as a **separate
-  perf receipt**. The receipt cites the commit; the commit is never amended afterwards.
+  perf receipt** citing it.
 
-Two commits, not nano-history: an implementation seal and a measurement receipt are independently
-valuable and independently revertible, which is the test for when a second commit earns its place.
+The test for whether a commit earns its place is whether it is independently valuable and revertible —
+not a fixed count. What is fixed is that the baseline's identity is a clean, pushed, unamended commit.
 
 While touching the baseline harness, **enable q11 at sf=8** — an enumeration gap, not a spec limit
 (`0.0001 / 8 = 0.0000125` is exact and the oracle integer is 800) — making the clean board 22/22.
 
-**4. Compute-fold front — decompose and rank the premises.** q08, q09, q20: zero spill, so the cost is
-compute inside a fused join+aggregate. Split it join-half vs fold-half vs exchange and produce the
+**4. Compute-fold front — decompose and rank the premises.** q08 inv 0, q09 inv 0, q20 inv 0, and
+q17 inv 0: zero spill, so the cost is compute inside a fused join+aggregate. Instrumenting
+`scan_grouped` also yields a profile for q18's invocation because they share a handler — that is an
+incidental by-product held for the parked front, and is **excluded** when ranking this front's premise;
+q18 is join-dominated and stays parked. Split it join-half vs fold-half vs exchange and produce the
 front's **ranked premise**: which sub-component holds the share, how much, and what would have to be
 true for a remedy to reach it. Selecting and building that remedy is the successor ADR's decision, not
 this one's. Note what is already closed: the primitive ladder took m04's grouped fold to a producer
@@ -104,12 +118,13 @@ boundary (ADR 505) and m05 is already ahead of the reference. If the composed fo
 fold, that is a finding that redirects the premise to the join half — exactly the sort of thing only
 the decomposition can say.
 
-**5. Spill-replay front — separately, and ranked separately.** q17 and q21: hundreds of MB inside a
-single node. Do **not** assume this front shares the compute front's premise or its remedy; the
-mechanism here is spill and replay machinery, not fold arithmetic, and the two fronts hand the
-successor two independent premises rather than one blended one. q21 already has inner attribution;
-q17 has none and is the single largest recoverable item on the board (100% of a 35.7 s cell, across
-two invocations), so it is the front's first instrumentation target.
+**5. Spill-replay front — separately, and ranked separately.** q17 inv 1 (623 MB) and q21 inv 0
+(898 MB): hundreds of MB inside a single invocation. Do **not** assume this front shares the compute
+front's premise or its remedy; the mechanism here is spill and replay machinery, not fold arithmetic,
+and the two fronts hand the successor two independent premises rather than one blended one. q21's
+invocation already has inner attribution; q17's `correlated_scalar_left_outer_global` invocation has
+none and is the largest single uncovered item on the board (69% of a 35.7 s cell), so it is the
+front's first instrumentation target.
 
 **6. Park the join/sort front.** q18 (join 65%) and q02 (sort 41%, join 31%) are a real, measured
 second front. They stay parked so this cycle stays one decision wide; re-open them from the same
