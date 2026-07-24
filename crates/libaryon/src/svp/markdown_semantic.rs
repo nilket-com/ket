@@ -30,6 +30,7 @@ enum TextContext {
 	Emphasis,
 	Code,
 	Link,
+	Quote,
 	TableHeader,
 }
 
@@ -42,6 +43,7 @@ impl TextContext {
 			Self::Emphasis => MarkdownConstruct::Emphasis,
 			Self::Code => MarkdownConstruct::CodeText,
 			Self::Link => MarkdownConstruct::Link,
+			Self::Quote => MarkdownConstruct::Quote,
 		}
 	}
 }
@@ -104,6 +106,12 @@ pub fn markdown_semantic_highlights(source: &str, global_offset: DocByte) -> Vec
 				for marker in quote_markers(source, &range) {
 					emit(marker, MarkdownConstruct::Quote);
 				}
+				// The quote's prose is quoted too, not just its `>`: both
+				// previews color the whole block, and the document must agree.
+				context.push(TextContext::Quote);
+			}
+			Event::End(TagEnd::BlockQuote(_)) => {
+				context.pop();
 			}
 			Event::Start(Tag::Item) => {
 				if let Some((marker, construct)) = list_marker(source, &range) {
@@ -328,6 +336,38 @@ mod tests {
 			category_at(source, 0),
 			TokenCategory::BodyText,
 			"the prose around it is untouched"
+		);
+	}
+
+	/// A quote colors its prose, not only its `>`. Inline styling nested inside
+	/// keeps its own category, since it pushes over the quote's context.
+	#[test]
+	fn blockquote_prose_is_quoted_and_nested_styles_survive() {
+		let source = "> quoted `code` and *emph*\n\nafter\n";
+		let quote = markdown_category(MarkdownConstruct::Quote).expect("quotes are colored");
+		let code = markdown_category(MarkdownConstruct::InlineCode).expect("code is colored");
+		let emphasis = markdown_category(MarkdownConstruct::Emphasis).expect("emphasis is colored");
+
+		assert_eq!(category_at(source, 0), quote, "the marker");
+		assert_eq!(
+			category_at(source, source.find("quoted").expect("prose")),
+			quote,
+			"the quoted prose"
+		);
+		assert_eq!(
+			category_at(source, source.find("code").expect("inline code")),
+			code,
+			"inline code inside a quote is still code"
+		);
+		assert_eq!(
+			category_at(source, source.find("emph").expect("emphasis")),
+			emphasis,
+			"emphasis inside a quote is still emphasis"
+		);
+		assert_eq!(
+			category_at(source, source.find("after").expect("paragraph")),
+			TokenCategory::BodyText,
+			"and the quote's context does not leak past its end"
 		);
 	}
 
