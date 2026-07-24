@@ -2889,7 +2889,82 @@ impl MinimapWidget<'_> {
 /// else (viewport frame, cursor, hover) is drawn as vector overlays — so the
 /// handle is reused until the fingerprint of its actual inputs changes.
 #[derive(Default)]
-struct MinimapInkCache(std::cell::RefCell<Option<(u64, iced::advanced::image::Handle)>>);
+struct MinimapInkCache {
+	ink: std::cell::RefCell<Option<(u64, iced::advanced::image::Handle)>>,
+	swatches: std::cell::RefCell<
+		Option<(
+			Rgb,
+			iced::advanced::image::Handle,
+			iced::advanced::image::Handle,
+		)>,
+	>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinimapOverlayTone {
+	Frame,
+	Cursor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MinimapOverlayImage {
+	bounds: iced::Rectangle,
+	tone: MinimapOverlayTone,
+}
+
+fn minimap_live_overlays(
+	overlay: &libaryon::engine::MinimapOverlay,
+	content_height: f32,
+	size: iced::Size,
+) -> Vec<MinimapOverlayImage> {
+	if content_height <= 0.0 {
+		return Vec::new();
+	}
+	let doc_lines = overlay.doc_line_count.get().max(1);
+	let y_of = |line: u64| (line as f32 / doc_lines as f32) * content_height;
+	let top = y_of(overlay.viewport_start_line.get());
+	let bottom = y_of(overlay.viewport_end_line.get()).max(top + 1.0);
+	let cursor_y = y_of(overlay.cursor_line.get());
+	vec![
+		MinimapOverlayImage {
+			bounds: iced::Rectangle::new(
+				iced::Point::new(0.0, top),
+				iced::Size::new(size.width, 1.0),
+			),
+			tone: MinimapOverlayTone::Frame,
+		},
+		MinimapOverlayImage {
+			bounds: iced::Rectangle::new(
+				iced::Point::new(0.0, bottom - 1.0),
+				iced::Size::new(size.width, 1.0),
+			),
+			tone: MinimapOverlayTone::Frame,
+		},
+		MinimapOverlayImage {
+			bounds: iced::Rectangle::new(
+				iced::Point::new(0.0, top),
+				iced::Size::new(1.0, bottom - top),
+			),
+			tone: MinimapOverlayTone::Frame,
+		},
+		MinimapOverlayImage {
+			bounds: iced::Rectangle::new(
+				iced::Point::new(size.width - 1.0, top),
+				iced::Size::new(1.0, bottom - top),
+			),
+			tone: MinimapOverlayTone::Frame,
+		},
+		// Cursor comes last so it remains the final pixel at intersections with
+		// the viewport frame.
+		MinimapOverlayImage {
+			bounds: iced::Rectangle::new(
+				iced::Point::new(0.0, cursor_y),
+				iced::Size::new(size.width, 1.0),
+			),
+			tone: MinimapOverlayTone::Cursor,
+		},
+	]
+}
 
 impl MinimapWidget<'_> {
 	/// Hash of everything `render_ink` + `render_search_markers` read. Preview
@@ -2939,7 +3014,7 @@ impl MinimapWidget<'_> {
 		height: u32,
 	) -> iced::advanced::image::Handle {
 		let fingerprint = self.ink_fingerprint(width, height);
-		let mut slot = cache.0.borrow_mut();
+		let mut slot = cache.ink.borrow_mut();
 		if let Some((cached_fingerprint, handle)) = slot.as_ref()
 			&& *cached_fingerprint == fingerprint
 		{
@@ -2954,6 +3029,30 @@ impl MinimapWidget<'_> {
 			iced::advanced::image::Handle::from_rgba(image.width, image.height, image.rgba);
 		*slot = Some((fingerprint, handle.clone()));
 		handle
+	}
+
+	fn overlay_swatches(
+		&self,
+		cache: &MinimapInkCache,
+	) -> (iced::advanced::image::Handle, iced::advanced::image::Handle) {
+		let accent = self.palette.minimap_accent;
+		let mut slot = cache.swatches.borrow_mut();
+		if let Some((cached_accent, frame, cursor)) = slot.as_ref()
+			&& *cached_accent == accent
+		{
+			return (frame.clone(), cursor.clone());
+		}
+		let pixel = |alpha| {
+			iced::advanced::image::Handle::from_rgba(
+				1,
+				1,
+				vec![accent.r, accent.g, accent.b, alpha],
+			)
+		};
+		let frame = pixel(217);
+		let cursor = pixel(255);
+		*slot = Some((accent, frame.clone(), cursor.clone()));
+		(frame, cursor)
 	}
 }
 
@@ -2977,43 +3076,19 @@ impl canvas::Program<EditorMsg> for MinimapWidget<'_> {
 			iced::advanced::image::Image::new(self.ink_handle(state, width, height)),
 		);
 
-		// Viewport frame and cursor line as vector overlays on top of the ink.
+		// Iced's WGPU canvas batches meshes before images regardless of call
+		// order. These live marks therefore use cached 1×1 raster swatches:
+		// ink and overlays stay in one image batch, whose insertion order is
+		// preserved in both debug and release builds.
 		let overlay = self.snapshot.overlay();
-		let doc_lines = overlay.doc_line_count.get().max(1);
 		let content_height_logical = content_height as f32 / MINIMAP_SCALE as f32;
-		let y_of = |line: u64| (line as f32 / doc_lines as f32) * content_height_logical;
-		if content_height > 0 {
-			let top = y_of(overlay.viewport_start_line.get());
-			let bottom = y_of(overlay.viewport_end_line.get()).max(top + 1.0);
-			let accent = color(self.palette.minimap_accent);
-			let frame_color = Color { a: 0.85, ..accent };
-			let size = bounds.size();
-			frame.fill_rectangle(
-				iced::Point::new(0.0, top),
-				iced::Size::new(size.width, 1.0),
-				frame_color,
-			);
-			frame.fill_rectangle(
-				iced::Point::new(0.0, bottom - 1.0),
-				iced::Size::new(size.width, 1.0),
-				frame_color,
-			);
-			frame.fill_rectangle(
-				iced::Point::new(0.0, top),
-				iced::Size::new(1.0, bottom - top),
-				frame_color,
-			);
-			frame.fill_rectangle(
-				iced::Point::new(size.width - 1.0, top),
-				iced::Size::new(1.0, bottom - top),
-				frame_color,
-			);
-			let cursor_y = y_of(overlay.cursor_line.get());
-			frame.fill_rectangle(
-				iced::Point::new(0.0, cursor_y),
-				iced::Size::new(size.width, 1.0),
-				accent,
-			);
+		let (frame_swatch, cursor_swatch) = self.overlay_swatches(state);
+		for live in minimap_live_overlays(overlay, content_height_logical, bounds.size()) {
+			let swatch = match live.tone {
+				MinimapOverlayTone::Frame => frame_swatch.clone(),
+				MinimapOverlayTone::Cursor => cursor_swatch.clone(),
+			};
+			frame.draw_image(live.bounds, iced::advanced::image::Image::new(swatch));
 		}
 		vec![frame.into_geometry()]
 	}
@@ -3168,6 +3243,50 @@ mod tests {
 		};
 		let third = widget.ink_handle(&cache, 64, 64);
 		assert_ne!(first.id(), third.id(), "edits must rebuild the ink image");
+	}
+
+	#[test]
+	fn minimap_live_images_finish_with_cursor_over_viewport_frame() {
+		use super::{MinimapInkCache, MinimapOverlayTone, MinimapWidget, minimap_live_overlays};
+		use libaryon::core::{DocLine, DocLineCount};
+		use libaryon::engine::{MinimapOverlay, MinimapSnapshot, OverviewSnapshot, UiPalette};
+		use libaryon::svp::rust_highlight::CATEGORY_COUNT;
+
+		let mut overlay = MinimapOverlay::new(DocLine::new(20), 10, DocLine::new(20));
+		overlay.doc_line_count = DocLineCount::new(100);
+		let layers = minimap_live_overlays(&overlay, 100.0, iced::Size::new(80.0, 100.0));
+		assert_eq!(layers.len(), 5);
+		assert!(
+			layers[..4]
+				.iter()
+				.all(|layer| layer.tone == MinimapOverlayTone::Frame)
+		);
+		assert_eq!(layers[4].tone, MinimapOverlayTone::Cursor);
+		let intersection = iced::Point::new(40.0, 20.5);
+		assert_eq!(
+			layers
+				.iter()
+				.filter(|layer| layer.bounds.contains(intersection))
+				.next_back()
+				.map(|layer| layer.tone),
+			Some(MinimapOverlayTone::Cursor),
+			"the cursor must own the final pixel where it meets the frame"
+		);
+
+		let snapshot = MinimapSnapshot::Overview(OverviewSnapshot {
+			overlay,
+			bands: vec![1],
+		});
+		let widget = MinimapWidget {
+			snapshot: &snapshot,
+			theme_colors: [None; CATEGORY_COUNT],
+			palette: UiPalette::default(),
+		};
+		let cache = MinimapInkCache::default();
+		let first = widget.overlay_swatches(&cache);
+		let second = widget.overlay_swatches(&cache);
+		assert_eq!(first.0.id(), second.0.id());
+		assert_eq!(first.1.id(), second.1.id());
 	}
 
 	#[test]
