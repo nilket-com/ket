@@ -692,6 +692,45 @@ mod tests {
 	}
 
 	#[test]
+	fn rune_init_file_tree_theme_survives_into_a_new_browser() {
+		let init = temp_path("file-tree-theme", "rn");
+		fs::write(
+			&init,
+			r#"pub fn main(editor) {
+	let config = editor.config();
+	config.language_theme("files", "glowmax")?;
+	Ok(())
+}
+"#,
+		)
+		.expect("write Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			init_script: Some(init.clone()),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+
+		commands
+			.send(EditorCommand::OpenFileBrowser)
+			.expect("open file browser");
+		let viewport = recv_viewport_until(&viewports, "themed file browser", |viewport| {
+			viewport
+				.focused_pane()
+				.is_some_and(|pane| pane.is_file_browser)
+		});
+		assert_eq!(
+			viewport.focused_pane().expect("browser").theme_colors,
+			crate::engine::Theme::try_new("glowmax")
+				.expect("theme")
+				.syntax_colors
+		);
+
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
 	fn embedder_can_select_an_editor_entrypoint_in_a_shared_init_script() {
 		let init = temp_path("shared-rune-init", "rn");
 		fs::write(

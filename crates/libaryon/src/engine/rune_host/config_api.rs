@@ -221,7 +221,7 @@ fn parse_language_theme_operation(
 	theme: &str,
 ) -> Result<ConfigOperation, String> {
 	let Some(language) =
-		language_registry.and_then(|registry| registry.resolve_supported_language_id(language))
+		language_registry.and_then(|registry| registry.resolve_theme_target_id(language))
 	else {
 		return Err(format!("Unknown language: {language}"));
 	};

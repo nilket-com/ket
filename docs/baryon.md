@@ -187,8 +187,10 @@ Command mode:
 Syntax themes and UI colors are intentionally independent. A syntax theme belongs to a document's
 UAST and can vary by pane or language; the UI palette belongs to the editor session. Use
 `:set language.theme LANG THEME` (or the `langtheme` alias) for syntax and `:set colors.*` for
-chrome. The legacy `background` and `searchhighlight` setting names remain accepted as aliases for
-`colors.editor.background` and `colors.search.highlight`. On the next settings save, legacy
+chrome. Use `tree` (or its `files` alias) as the language-theme target to give the file tree its
+own persistent syntax colors. The legacy `background` and `searchhighlight` setting names remain
+accepted as aliases for `colors.editor.background` and `colors.search.highlight`. On the next
+settings save, legacy
 `[ui]` color keys are rewritten into canonical nested `[ui.colors...]` sections; older Baryon
 versions will not understand those sections.
 

@@ -26,6 +26,7 @@ use crate::core::{
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
 use crate::engine::host_event::{HostPanelDescriptor, HostPanelId, PanelRevision};
+use crate::engine::language::FILE_BROWSER_THEME_ID;
 use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
 use crate::svp::diagnostic::DiagnosticSpan;
@@ -1490,6 +1491,16 @@ pub(crate) fn resolve_theme_name(
 	settings.theme_name.clone()
 }
 
+pub(crate) fn resolve_file_browser_theme_name(
+	theme_override: Option<&str>,
+	settings: &SettingsPersistent,
+) -> String {
+	theme_override
+		.map(str::to_owned)
+		.or_else(|| settings.language_themes.get(FILE_BROWSER_THEME_ID).cloned())
+		.unwrap_or_else(|| settings.theme_name.clone())
+}
+
 pub(crate) struct TextViewState {
 	pub(crate) folds: FoldSet,
 	pub(crate) common: CommonViewState,
@@ -1595,6 +1606,14 @@ impl View {
 		cursor
 			.primary_mut()
 			.reset_to_start(initial_leaf, TopologyRev::ZERO, StateId::ZERO);
+		let mut common = new_common_view_state(persistent_settings, viewport_width, viewport_lines);
+		let theme_name = resolve_file_browser_theme_name(None, persistent_settings);
+		if theme_name != common.current_theme_name
+			&& let Ok(theme) = Theme::try_new(&theme_name)
+		{
+			common.current_theme_name = theme_name;
+			common.current_theme = theme;
+		}
 		Self {
 			id,
 			buffer_id,
@@ -1602,11 +1621,7 @@ impl View {
 				cursor,
 				state: TextViewState {
 					folds: FoldSet::default(),
-					common: new_common_view_state(
-						persistent_settings,
-						viewport_width,
-						viewport_lines,
-					),
+					common,
 				},
 			}),
 		}

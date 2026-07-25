@@ -9,7 +9,7 @@ use super::super::folding::{
 use super::super::protocol::{EditorCommand, VisualKind};
 use super::super::session::{
 	Affinity, BufferStore, Caret, FileStamp, LayoutNode, SettingsPersistent, TextEditorMut,
-	UiState, View, resolve_theme_name,
+	UiState, View, resolve_file_browser_theme_name, resolve_theme_name,
 };
 use super::super::settings::SaveDurability;
 use super::super::shadow::{ShadowSession, discard_shadow_session, load_shadow_session};
@@ -19,6 +19,7 @@ use crate::core::atomic_file::{AtomicWriteOptions, atomic_write};
 use crate::core::{DisplayRow, DocByte, DocDisplayCol};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
+use crate::engine::language::theme_target_name;
 use crate::engine::ui_colors::{UiColorSource, parse_ui_rgb};
 use crate::svp::ingest_svp_file;
 use rune::SourceId;
@@ -238,7 +239,7 @@ impl InitSettingEdit {
 			),
 			InitConfigKey::LanguageTheme(language) => format!(
 				"{binding}.language_theme({}, {})?;",
-				rune_string(language),
+				rune_string(theme_target_name(language)),
 				rune_string(value)
 			),
 		})
@@ -269,14 +270,14 @@ pub(super) fn init_setting_edit(
 			Some(set("theme", rune_string(value)))
 		}
 		EditorCommand::PersistLangTheme { language, theme } if Theme::try_new(theme).is_ok() => {
-			let language = language_registry.resolve_supported_language_id(language)?;
+			let language = language_registry.resolve_theme_target_id(language)?;
 			Some(InitSettingEdit {
 				key: InitConfigKey::LanguageTheme(language.to_string()),
 				value: Some(theme.clone()),
 			})
 		}
 		EditorCommand::PersistNoLangTheme(language) => {
-			let language = language_registry.resolve_supported_language_id(language)?;
+			let language = language_registry.resolve_theme_target_id(language)?;
 			Some(InitSettingEdit {
 				key: InitConfigKey::LanguageTheme(language.to_string()),
 				value: None,
@@ -559,7 +560,7 @@ fn init_config_operations(
 			InitConfigKey::LanguageTheme(language.clone()),
 			format!(
 				"{binding}.language_theme({}, {})?;",
-				rune_string(language),
+				rune_string(theme_target_name(language)),
 				rune_string(theme)
 			),
 		);
@@ -603,7 +604,7 @@ fn config_call_key(
 		)),
 		"language_theme" => Some(InitConfigKey::LanguageTheme(
 			language_registry
-				.resolve_supported_language_id(&key)
+				.resolve_theme_target_id(&key)
 				.map_or(key, |id| id.as_str().to_string()),
 		)),
 		_ => None,
@@ -819,7 +820,7 @@ fn render_init_function(
 		writeln!(
 			&mut source,
 			"\tconfig.language_theme({}, {})?;",
-			rune_string(language),
+			rune_string(theme_target_name(language)),
 			rune_string(theme)
 		)
 		.expect("writing to String cannot fail");
@@ -1204,11 +1205,23 @@ pub(crate) fn re_resolve_auto_themes(
 		if result.is_err() || tab.common().theme_override.is_some() {
 			return;
 		}
-		let language_id = buffers
-			.get(tab.buffer_id)
-			.and_then(|buffer| buffer.text())
-			.and_then(|buffer| buffer.active_language_id);
-		result = apply_resolved_theme_to_tab(tab, language_id, persistent_settings);
+		let buffer = buffers.get(tab.buffer_id);
+		let theme_name = if buffer.is_some_and(|buffer| buffer.is_file_browser()) {
+			resolve_file_browser_theme_name(
+				tab.common().theme_override.as_deref(),
+				persistent_settings,
+			)
+		} else {
+			let language_id = buffer
+				.and_then(|buffer| buffer.text())
+				.and_then(|buffer| buffer.active_language_id);
+			resolve_theme_name(
+				language_id,
+				tab.common().theme_override.as_deref(),
+				persistent_settings,
+			)
+		};
+		result = apply_theme_name_to_tab(tab, theme_name);
 	});
 	result
 }
@@ -1346,8 +1359,7 @@ pub(super) fn handle_persist_view_doctab_command(
 			}
 		},
 		EditorCommand::PersistLangTheme { language, theme } => {
-			let Some(language_id) = ctx.lang_registry.resolve_supported_language_id(&language)
-			else {
+			let Some(language_id) = ctx.lang_registry.resolve_theme_target_id(&language) else {
 				ui.status_message = Some(format!("Unknown language: {language}"));
 				return CommandEffect::render();
 			};
@@ -1356,7 +1368,11 @@ pub(super) fn handle_persist_view_doctab_command(
 					persistent_settings
 						.language_themes
 						.insert(language_id.to_string(), theme.clone());
-					let success = format!("Theme for {} set to {}", language_id, theme);
+					let success = format!(
+						"Theme for {} set to {}",
+						theme_target_name(language_id.as_str()),
+						theme
+					);
 					ui.status_message = Some(success);
 				}
 				Err(err) => {
@@ -1365,19 +1381,19 @@ pub(super) fn handle_persist_view_doctab_command(
 			}
 		}
 		EditorCommand::PersistNoLangTheme(language) => {
-			let Some(language_id) = ctx.lang_registry.resolve_supported_language_id(&language)
-			else {
+			let Some(language_id) = ctx.lang_registry.resolve_theme_target_id(&language) else {
 				ui.status_message = Some(format!("Unknown language: {language}"));
 				return CommandEffect::render();
 			};
+			let target = theme_target_name(language_id.as_str());
 			let success = if persistent_settings
 				.language_themes
 				.remove(language_id.as_str())
 				.is_some()
 			{
-				format!("Theme for {} removed", language_id)
+				format!("Theme for {target} removed")
 			} else {
-				format!("No theme was set for {}", language_id)
+				format!("No theme was set for {target}")
 			};
 			ui.status_message = Some(success);
 		}
@@ -2333,7 +2349,10 @@ mod tests {
 			reload_enabled: false,
 			save_durability: SaveDurability::Atomic,
 			ui_colors: crate::engine::UiColorOverrides::default(),
-			language_themes: BTreeMap::from([("rust".to_string(), "viridis_cs8".to_string())]),
+			language_themes: BTreeMap::from([
+				("rust".to_string(), "viridis_cs8".to_string()),
+				("fs".to_string(), "glowmax".to_string()),
+			]),
 		};
 		settings.ui_colors.set(
 			crate::engine::UiColorKey::Accent,
@@ -2350,6 +2369,7 @@ mod tests {
 		assert!(source.contains("\tconfig.set(\"gitrefresh\", 7)?;"));
 		assert!(source.contains("\tconfig.ui_color(\"colors.accent\", \"#123456\")?;"));
 		assert!(source.contains("\tconfig.language_theme(\"rust\", \"viridis_cs8\")?;"));
+		assert!(source.contains("\tconfig.language_theme(\"tree\", \"glowmax\")?;"));
 		assert!(
 			source
 				.lines()
@@ -2387,6 +2407,46 @@ mod tests {
 		assert_eq!(updated.matches(".set(\"num\"").count(), 1);
 		assert!(updated.contains("config.set(\"num\", true)?;"));
 		assert!(!updated.contains("line_numbers"));
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn file_tree_theme_persists_with_tree_spelling_and_replaces_files_alias() {
+		let path = temp_test_path("init-tree-theme");
+		std::fs::write(
+			&path,
+			r#"pub fn main(editor) {
+	let config = editor.config();
+	config.language_theme("files", "onedark")?;
+	Ok(())
+}
+"#,
+		)
+		.expect("write custom init");
+
+		assert!(
+			persist_test_setting(
+				&path,
+				EditorCommand::PersistLangTheme {
+					language: "tree".to_string(),
+					theme: "glowmax".to_string(),
+				},
+			)
+			.expect("persist tree theme")
+		);
+		let updated = std::fs::read_to_string(&path).expect("read updated init");
+		assert_eq!(updated.matches("language_theme").count(), 1);
+		assert!(updated.contains("config.language_theme(\"tree\", \"glowmax\")?;"));
+
+		assert!(
+			persist_test_setting(
+				&path,
+				EditorCommand::PersistNoLangTheme("files".to_string()),
+			)
+			.expect("remove tree theme")
+		);
+		let removed = std::fs::read_to_string(&path).expect("read reset init");
+		assert!(!removed.contains("language_theme"));
 		let _ = std::fs::remove_file(path);
 	}
 
@@ -6201,6 +6261,51 @@ mod tests {
 		handle.join().expect("engine thread");
 		let _ = std::fs::remove_file(settings_path);
 		let _ = std::fs::remove_file(rust_path);
+	}
+
+	#[test]
+	fn persist_langtheme_colors_the_file_tree_through_tree_and_files_targets() {
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_rust(None);
+
+		let opened = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::OpenFileBrowser);
+		assert!(
+			opened
+				.focused_pane()
+				.is_some_and(|pane| pane.is_file_browser)
+		);
+		assert_focused_theme(&opened, "onedark");
+
+		let themed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::PersistLangTheme {
+				language: "files".to_string(),
+				theme: "glowmax".to_string(),
+			},
+		);
+		assert_focused_theme(&themed, "glowmax");
+		assert_eq!(
+			themed.status_message.as_deref(),
+			Some("Theme for tree set to glowmax")
+		);
+
+		let _closed = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::ClosePane);
+		let reopened = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::OpenFileBrowser);
+		assert_focused_theme(&reopened, "glowmax");
+
+		let removed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::PersistNoLangTheme("tree".to_string()),
+		);
+		assert_focused_theme(&removed, "onedark");
+		assert_eq!(
+			removed.status_message.as_deref(),
+			Some("Theme for tree removed")
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
 	}
 
 	#[test]

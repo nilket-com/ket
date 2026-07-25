@@ -8,6 +8,19 @@ use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::kind::SemanticKind;
 
+/// Internal provider used to color the synthetic file-browser document.
+pub(crate) const FILE_BROWSER_THEME_ID: &str = "fs";
+/// User-facing canonical target accepted by `langtheme`.
+pub(crate) const FILE_BROWSER_THEME_TARGET: &str = "tree";
+
+pub(crate) fn theme_target_name(id: &str) -> &str {
+	if id == FILE_BROWSER_THEME_ID {
+		FILE_BROWSER_THEME_TARGET
+	} else {
+		id
+	}
+}
+
 /// Canonical identity of a language registered with the engine.
 ///
 /// Raw command arguments, extensions, and Markdown fence tags remain strings
@@ -268,6 +281,16 @@ impl LanguageRegistry {
 	pub fn resolve_supported_language_id(&self, name_or_extension: &str) -> Option<LanguageId> {
 		self.resolve_supported_language_provider(name_or_extension)
 			.map(|provider| LanguageId::from_registered(provider.language_id()))
+	}
+
+	/// Resolve document languages plus the synthetic file tree. `tree` is the
+	/// durable spelling; `files` is a convenience alias.
+	pub(crate) fn resolve_theme_target_id(&self, name_or_extension: &str) -> Option<LanguageId> {
+		if matches!(name_or_extension, "tree" | "files") {
+			self.resolve_language_id(FILE_BROWSER_THEME_ID)
+		} else {
+			self.resolve_supported_language_id(name_or_extension)
+		}
 	}
 
 	pub fn completion_candidates(&self) -> Vec<String> {

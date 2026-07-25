@@ -716,7 +716,7 @@ fn render_languages() -> String {
 	);
 	push_wrapped(
 		&mut out,
-		"Use ':set language.theme ID THEME' to persist a language-specific syntax theme. The 'langtheme' alias remains accepted; extensions are stored under the canonical ID.",
+		"Use ':set language.theme ID THEME' to persist a language-specific syntax theme. The 'langtheme' alias remains accepted; target 'tree' (alias 'files') to color the file tree.",
 	);
 	push_line(&mut out, "");
 	push_line(&mut out, "Language (canonical ID) and accepted extensions:");
@@ -749,7 +749,7 @@ fn markdown_languages() -> String {
 	push_line(&mut out, "");
 	push_line(
 		&mut out,
-		"Use `:set language.theme ID THEME` to persist a language-specific syntax theme. The `langtheme` alias remains accepted; extensions are stored under the canonical ID. Remove it with `:set language.theme ID default` or the compatibility form `:set nolangtheme ID`.",
+		"Use `:set language.theme ID THEME` to persist a language-specific syntax theme. The `langtheme` alias remains accepted; target `tree` (alias `files`) to color the file tree. Remove an override with `:set language.theme ID default` or `:set nolangtheme ID`.",
 	);
 	push_line(&mut out, "");
 	push_line(&mut out, "| Language | Canonical ID | Extensions |");

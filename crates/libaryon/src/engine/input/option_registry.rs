@@ -144,16 +144,16 @@ pub(super) static VALUE_OPTIONS: &[ValueOptionSpec] = &[
 	ValueOptionSpec {
 		key: "language.theme",
 		aliases: &["langtheme"],
-		usage: ":set language.theme LANG THEME|default",
-		summary: "Syntax theme override for one language",
+		usage: ":set language.theme LANG|tree THEME|default",
+		summary: "Language or file-tree theme",
 		completion: ValueCompletion::None,
 		parse: parse_language_theme,
 	},
 	ValueOptionSpec {
 		key: "nolangtheme",
 		aliases: &[],
-		usage: ":set nolangtheme LANG",
-		summary: "Remove one language theme override",
+		usage: ":set nolangtheme LANG|tree",
+		summary: "Remove a theme override",
 		completion: ValueCompletion::None,
 		parse: parse_nolangtheme,
 	},
@@ -600,6 +600,11 @@ mod tests {
 			Ok(EditorCommand::PersistLangTheme { language, theme })
 				if language == "rust" && theme == "glowmax"
 		));
+		assert!(matches!(
+			parse_set_command("langtheme files glowmax"),
+			Ok(EditorCommand::PersistLangTheme { language, theme })
+				if language == "files" && theme == "glowmax"
+		));
 		assert_eq!(
 			parse_set_command("langtheme rust").unwrap_err(),
 			"Missing theme name"
@@ -645,6 +650,10 @@ mod tests {
 		assert!(matches!(
 			parse_set_command("nolangtheme rust"),
 			Ok(EditorCommand::PersistNoLangTheme(language)) if language == "rust"
+		));
+		assert!(matches!(
+			parse_set_command("nolangtheme tree"),
+			Ok(EditorCommand::PersistNoLangTheme(language)) if language == "tree"
 		));
 		assert_eq!(
 			parse_set_command("nolangtheme").unwrap_err(),
