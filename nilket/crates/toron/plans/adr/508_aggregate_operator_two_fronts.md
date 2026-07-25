@@ -1,4 +1,4 @@
-# ADR 508 - the aggregate operator: two fronts, inner attribution before any remedy
+# ADR 508 - the aggregate operator: inner attribution before any remedy
 
 ADR 507 measured where the composed gap actually is. Across the seven candidate cells at strict sf=8,
 exclusive time by node kind: **aggregate ~76%, join ~15%, exchange ~5%, sort ~1%, scan ~1%.** That
@@ -6,9 +6,9 @@ retires the encoded-column premise the campaign had leaned on since ADR 505 — 
 of the gap — and makes the aggregate operator the first optimization target on measured share rather
 than on a presumed mechanism.
 
-This ADR opens that cycle. It authorizes no kernel. Its job is to split the target into the two fronts
-the attribution actually shows, give each its own attribution and acceptance path, and gate any remedy
-on knowing what is inside the operator.
+This ADR opens that cycle. It authorizes no kernel. Its job is to split the target into the
+invocation-level premises the attribution actually shows, give each its own attribution and acceptance
+path, and gate any remedy on knowing what is inside the operator.
 
 ## What the ranking does and does not say
 
@@ -30,18 +30,18 @@ step-2 run that measured 83.2 MB and 14,939 ms used the harness defaults — 64 
 re-grounding at the ladder coordinate records q09 at zero spill (13,421.8 ms in the attribution run;
 13,349.9 ms median on the first clean board attempt) and preserves the join-probe-dominated inner
 shape. The 83.2 MB result remains a valid low-budget fact but cannot invalidate a 2 GiB premise.
-**q09 is provisionally restored to the join-probe premise, subject to the final clean 22/22 rerun
-after the q21 attribution correction.** It is not promoted to the spill front.
+The final clean 22/22 rerun from `63277790` records q09 at 13,192 ms median and zero spill, so **q09
+is restored to the join-probe premise**. It is not promoted to the spill front.
 
 **q08's row is reassigned, and the trap below is why.** Step-2 inner attribution decomposed the
 `reoriented_inner_chain_grouped` handler on both q08 and q09 (`impl/508_inner_attribution.md`). Inside
-the aggregate node the **grouped fold is 0.7% (q08) and 1.8% (q09)**; join work is **87.7% and 86.7%**,
+the aggregate node the final-coordinate **grouped fold is 0.65% (q08) and 1.91% (q09)**; the
+join-associated lower bound is **87.9% and 85.1%**,
 with suffix probing alone at ~50% on both. So q08's compute-fold assignment rested on exactly the
 inference the next section forbids — "aggregate 96%" read as "the fold kernel". **q08 moves to a
 join-probe premise**, and the compute-fold front's step-4 decomposition covers q20 and q17 inv 0 only.
-q09 joins that same premise at the corrected memory coordinate. Whether join-probe earns its own
-successor front is step 4's call against the final clean baseline, not a mechanism selection this note
-makes.
+q09 joins that same premise at the corrected memory coordinate. The final clean baseline confirms
+that join-probe is an independently ranked successor premise; this note still selects no mechanism.
 
 That the guard below caught a real case is the point of having written it down: the per-node layer was
 correct and the front *name* was one layer too coarse.
@@ -133,31 +133,34 @@ not a fixed count. What is fixed is that the baseline's identity is a clean, pus
 While touching the baseline harness, **enable q11 at sf=8** — an enumeration gap, not a spec limit
 (`0.0001 / 8 = 0.0000125` is exact and the oracle integer is 800) — making the clean board 22/22.
 
-**4. Compute-fold front — decompose and rank the premises.** q20 inv 0 and q17 inv 0. (This step was
+**4. Compute-fold and join-probe classes — decompose and rank the premises.** q20 inv 0 and q17 inv
+0 form the compute-fold class. (This step was
 written naming q08 inv 0 and q09 inv 0 as well; step-2 inner attribution reassigned both to a
 join-probe premise — see the front table above.) Zero spill, so the
 cost is compute inside a fused join+aggregate. Instrumenting
 `scan_grouped` also yields a profile for q18's invocation because they share a handler — that is an
 incidental by-product held for the parked front, and is **excluded** when ranking this front's premise;
 q18 is join-dominated and stays parked. Split it join-half vs fold-half vs exchange and produce the
-front's **ranked premise**: which sub-component holds the share, how much, and what would have to be
+compute-fold class's **ranked premise**: which sub-component holds the share, how much, and what would
+have to be
 true for a remedy to reach it. Selecting and building that remedy is the successor ADR's decision, not
 this one's. Note what is already closed: the primitive ladder took m04's grouped fold to a producer
 boundary (ADR 505) and m05 is already ahead of the reference. If the composed fold cost is the same
 fold, that is a finding that redirects the premise to the join half — exactly the sort of thing only
-the decomposition can say.
+the decomposition can say. Rank q08/q09's join-probe premise separately rather than letting the
+shared aggregate-node label merge it into compute-fold.
 
 **5. Spill-replay front — separately, and ranked separately.** q17 inv 1 (623 MB) and q21 inv 0
 (898 MB): hundreds of MB inside a single invocation. Do **not** assume this front shares the compute
 front's premise or its remedy; the mechanism here is spill and replay machinery, not fold arithmetic,
-and the two fronts hand the successor two independent premises rather than one blended one. q21's
+and the invocation classes hand the successor independent premises rather than one blended one. q21's
 invocation already has inner attribution; q17's `correlated_scalar_left_outer_global` invocation has
 none and is the largest single uncovered item on the board (69% of a 35.7 s cell), so it is the
 front's first instrumentation target. The corrective q21 vocabulary now also closes its full
 invocation-level chain; the old separate chain profile alone did not satisfy that acceptance link.
-At the 2 GiB coordinate q21 splits into runtime preparation (33.1%) and a deferred replay envelope
-(54.3%); inside that envelope reservoir buffering is 42.2% and replay-1 read/probe is 46.3%, with
-72.7 ms residual. The task spill counter advances by 24.3 MB during buffering and by 873.4 MB at
+At the 2 GiB coordinate q21 splits into runtime preparation (33.0%) and a deferred replay envelope
+(54.3%); inside that envelope reservoir buffering is 42.9% and replay-1 read/probe is 45.3%, with
+65.9 ms residual. The task spill counter advances by 24.3 MB during buffering and by 873.4 MB at
 release/accounting, so byte ownership remains a write-accounting fact rather than a timing claim.
 
 **6. Park the join/sort front.** q18 (join 65%) and q02 (sort 41%, join 31%) are a real, measured
@@ -169,7 +172,8 @@ attribution once the aggregate fronts land or stall.
 This ADR is done when the successor can be opened on measured premises — not when anything is faster.
 
 - The handler map exists as a receipt, not a memory of a trace.
-- Every dominant aggregate node in the two fronts has inner attribution that closes the full chain —
+- Every dominant aggregate node in the active invocation classes has inner attribution that closes
+  the full chain —
   inner stages ⊆ handler span ⊆ matched node exclusive span ⊆ `execute_bound` span — through the ADR
   507 contract, on both axes, failing closed on untrustworthy input, with the residual at each link
   explicit.
@@ -178,9 +182,9 @@ This ADR is done when the successor can be opened on measured premises — not w
   uncovered rather than folded into a coverage claim.
 - The implementation is sealed and pushed as one commit, and the clean 22/22 sf=8 board is measured
   from that exact commit and landed as a separate perf receipt citing it. No `-dirty` build identity.
-- Each front hands the successor its own **ranked premise** — sub-component, measured share, and the
-  condition a remedy would have to satisfy. The two premises stand independently; neither inherits the
-  other's justification.
+- Each invocation class hands the successor its own **ranked premise** — sub-component, measured
+  share, and the condition a remedy would have to satisfy. The premises stand independently; none
+  inherits another's justification.
 - A front whose decomposition shows no reachable premise is recorded as an honest close, as m10 was.
 
 Remedy selection, ablation pairs, and movement claims are the successor ADR's acceptance, not this
@@ -203,14 +207,25 @@ one's.
   granularity the lifecycle actually has, rather than inventing a boundary to report against.
 - **Instrumenting three handler families is most of the cycle's cost.** Mitigated by step 1 naming the
   minimum set and by reusing q21's existing decomposition rather than rebuilding it.
-- **The compute front may already be closed.** If the composed fold cost is the m04 fold the ladder
+- **The compute-fold class may already be closed.** If the composed fold cost is the m04 fold the ladder
   already took to its producer boundary, the front's remaining lever is the join half or nothing —
   worth knowing early, and cheaper to learn from the split than from a failed kernel.
 
-## Forward
+## Outcome and forward
 
-The cycle produces two independently ranked premises and a clean 22/22 baseline measured from a pushed
-commit. The successor ADR opens on those premises and is where a mechanism is chosen, built, ablated,
-and priced for movement against that baseline — or where a front is closed as having no reachable cut.
-The join/sort front (q18, q02) is the measured successor either way. The sf=10 publication board on the
-ADR 356 coordinate remains the last step before any external result, after the composed work lands.
+The cycle is complete. `impl/508_clean_sf8_baseline.md` records the clean 22/22 board measured from
+pushed, unamended `632777908780f17bf15d1d7d43125b6e28f67d99`, plus the final-coordinate attribution
+that closes every active invocation on both axes.
+
+The decomposition produces **three independently ranked premises**, none of them a remedy:
+
+- q08/q09 are join-probe dominated, with an 87.9%/85.1% join-associated lower bound;
+- q20 and q17's inner invocation are compute-fold dominated at 49.0%/91.3% of their handlers, with
+  more than 99.5% of each fold inside the still-combined row lookup/update loop;
+- q17's outer invocation is 79.4% partitioned-build envelope, while q21's spilling work divides
+  between runtime preparation and a deferred reservoir/replay envelope.
+
+The successor ADR opens on those premises and is where a mechanism is chosen, built, ablated, and
+priced for movement against the clean baseline — or where a premise is closed as having no reachable
+cut. The join/sort class (q18, q02) remains parked. The sf=10 publication board on the ADR 356
+coordinate remains the last step before any external result, after the composed work lands.

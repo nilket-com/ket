@@ -1024,15 +1024,15 @@ The exercised partition-at-a-time route now closes:
   suffix/semi/anti/fold 688.7 ms, and release/accounting below timer resolution. The 873,395,520 B
   carried by the release/accounting stage is where the task counter advances, not a claim that the
   bytes were written in its measured microsecond;
-- shared grouped-
-  fold refinements now open only when the committed vocabulary promises a top-level `fold` parent,
+- shared grouped-fold refinements now open only when the committed vocabulary promises a top-level
+  `fold` parent,
   preventing a helper from publishing children under another handler's lifecycle.
 
 The validation artifact is working-tree grounding (`b6e37cf9fe60-dirty`, full hash, exact 2 GiB /
-2 GiB budgets) under `target/tpch/adr508_q21_stage_wip3/`. The corrective implementation changes the
-binary after the first clean board, so that board remains useful grounding but is not the ADR's final
-baseline. The implementation must be sealed and pushed, and the 22/22 board rerun from that new
-immutable identity.
+2 GiB budgets) under `target/tpch/adr508_q21_stage_wip3/`. The correction subsequently sealed and
+pushed at `632777908780f17bf15d1d7d43125b6e28f67d99`. The final clean 22/22 board and five-cell
+attribution set were rerun from that immutable identity and are recorded in
+`impl/508_clean_sf8_baseline.md`; they supersede the WIP timing figures above.
 
 ## Forward
 
@@ -1042,14 +1042,20 @@ q17 both aggregate invocations pass in one profile: the first multi-invocation c
 complete. The fourth is `inner_prefix_semi_anti_grouped`: its pre-existing chain profile remains a
 diagnostic, while the new token vocabulary closes the invocation-level contract.
 
-**Three premises are handed to the successor, none of them a remedy.** q08/q09 are join-probe
-dominated (fold 0.7%/1.8% at the original profiling coordinate); q17's
-`partitioned_scan_build` route is build-envelope dominated (86.2% there, 81.3% when re-grounded at
-2 GiB) with a small probe envelope; and q09's **64 MiB-only** spill writes localize to runtime
-preparation. Each names *where* the cost is, and each still needs its dominant component split before
-a mechanism can be chosen —
-`join0_build` into scan/partition/serialize/write/finish/index-rebuild, `suffix_probe` into
-lookup/materialize/read-back. Selecting remedies is the successor ADR's decision.
+**Three premises are handed to the successor, none of them a remedy.** On the final 2 GiB coordinate:
+
+- q08/q09 are join-probe dominated, with an 87.9%/85.1% join-associated lower bound and only
+  0.65%/1.91% in grouped fold;
+- q20 and q17's inner `scan_grouped` invocation put 49.0%/91.3% of their handlers in grouped fold,
+  and more than 99.5% of each fold in the still-combined row lookup/update loop;
+- q17's outer `partitioned_scan_build` route puts 79.4% in `join0_build`, while q21 splits between
+  runtime preparation and the deferred reservoir/replay envelope.
+
+Each names *where* the cost is, and each still needs its dominant component split before a mechanism
+can be chosen — `join0_build` into scan/partition/serialize/write/finish/index-rebuild,
+`suffix_probe` into lookup/materialize/read-back, and the grouped row loop into lookup versus state
+update. q09's 83.2 MB runtime-preparation spill remains a **64 MiB-only** fact; the clean board and
+attribution run both record zero spill. Selecting remedies is the successor ADR's decision.
 
 What remains on this handler is coverage of the other eight leaf routes: only
 `partitioned_scan_build` is exercised, and the monolithic and remaining partitioned routes have no
@@ -1073,5 +1079,5 @@ materialization from spilled-runtime read-back — the last of which this write-
 at all. That refinement is replay-scoped by construction (`open_replay_substage` exists and is
 deliberately unused), so it does not need another contract change.
 
-Step 3's final clean 22/22 sf=8 baseline is measured only after the corrective q21 bridge seals and
-pushes, per the ADR's commit-boundary rule.
+Step 3 is complete: the final clean 22/22 sf=8 baseline was measured only after the corrective q21
+bridge sealed and pushed, per the ADR's commit-boundary rule.

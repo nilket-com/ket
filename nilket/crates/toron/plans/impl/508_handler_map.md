@@ -90,7 +90,7 @@ So step 2 builds **three** inner instruments, not five: `reoriented_inner_chain_
 vocabulary is the starting reference. The generic fold accounts for 12% of one small cell (q02, 2.7 s)
 and is not worth an instrument at this ranking — recorded as a known, named gap rather than covered.
 
-## The fronts are invocation-level, not query-level
+## The step-1 front hypothesis was invocation-level, not query-level
 
 ADR 508 assigned whole cells to fronts because that was the granularity available. The per-invocation
 map supersedes that: **q17 belongs to both fronts, in different invocations**, and a cell's front is a
@@ -112,10 +112,19 @@ parked, and its scan_grouped invocation is 13% of a cell that is not on this fro
 profile that falls out of step 2 as evidence held for the parked front's eventual re-opening, and
 exclude it when ranking the compute premise.
 
-## Forward
+## Post-step-2 correction and outcome
 
-Step 2 instruments those three handlers, each closing the full chain — inner stages ⊆ handler span ⊆
-matched invocation exclusive span ⊆ `execute_bound` span — through the ADR 507 contract on both axes.
-The invocation records this step added are the matched span that chain closes against, so the bridge
-has a measured anchor per invocation rather than a per-kind total. Step 3's clean 22/22 baseline is
-sealed and measured after step 2, per the ADR's commit-boundary rule.
+The table above is the hypothesis this routing receipt handed to step 2, not the final assignment.
+Inner attribution falsified two parts of it:
+
+- q08/q09's `reoriented_inner_chain_grouped` invocations are **join-probe**, not compute-fold; their
+  final-coordinate join-associated lower bounds are 87.9%/85.1%, while grouped fold is only
+  0.65%/1.91%;
+- q21's legacy chain profile decomposed a drive but did not close the invocation-bound
+  handler-to-node bridge. The corrective `StageToken` vocabulary now closes it on time and Flow
+  bytes.
+
+Step 2 ultimately instrumented all four handlers, each closing the full chain — inner stages ⊆
+handler span ⊆ matched invocation exclusive span ⊆ `execute_bound` span — through the ADR 507
+contract on both axes. The clean 22/22 baseline and final assignments are recorded in
+`impl/508_clean_sf8_baseline.md`.
