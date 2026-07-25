@@ -3289,6 +3289,7 @@ pub(crate) fn run_engine(engine: Engine) {
 	let initial_ui_colors = engine.initial_ui_colors;
 	let initial_language_themes = engine.initial_language_themes;
 	let initial_file = engine.initial_file;
+	let initial_viewport = engine.initial_viewport;
 	let rune_host_config = engine.rune_host;
 	let configured_init_path = rune_host_config
 		.as_ref()
@@ -3315,7 +3316,7 @@ pub(crate) fn run_engine(engine: Engine) {
 		init_entrypoint: configured_init_entrypoint.as_deref(),
 	};
 	let services = Arc::new(Mutex::new(HostServices::default()));
-	let session = EditorSession::new(
+	let mut session = EditorSession::new(
 		&registry,
 		initial_theme_name,
 		initial_minimap_enabled,
@@ -3329,8 +3330,9 @@ pub(crate) fn run_engine(engine: Engine) {
 		initial_language_themes,
 		None,
 	);
-	#[cfg(test)]
-	let mut session = session;
+	if let Some((width, height)) = initial_viewport {
+		session.update_terminal_size(width.max(1), height.max(1));
+	}
 	#[cfg(test)]
 	session.jobs.attach_internal_sender(tx_internal.clone());
 	#[cfg(test)]

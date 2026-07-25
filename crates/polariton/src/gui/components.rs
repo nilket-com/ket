@@ -157,6 +157,7 @@ pub fn main_screen<'a>(
 	status_error: &'a str,
 	status_df_size: Option<(usize, usize)>,
 	status_time_elapsed: Option<f64>,
+	editor_spinner_phase: Option<usize>,
 	adapter_state: &'a AdapterState,
 	showing_settings: bool,
 	show_column_types: bool,
@@ -182,6 +183,7 @@ pub fn main_screen<'a>(
 		status_error,
 		status_df_size,
 		status_time_elapsed,
+		editor_spinner_phase,
 		adapter_state,
 	)
 	.view();
@@ -288,6 +290,7 @@ fn app_status_bar(
 	status_error: &str,
 	status_df_size: Option<(usize, usize)>,
 	status_time_elapsed: Option<f64>,
+	editor_spinner_phase: Option<usize>,
 	adapter_state: &AdapterState,
 ) -> StatusBar {
 	let (connection_label, connection_tone) = match adapter_state.stage {
@@ -312,6 +315,9 @@ fn app_status_bar(
 		.lane_split(2, 5)
 		.left(Segment::toned_text(connection_label, connection_tone))
 		.left(Segment::text(target_label));
+	if let Some(phase) = editor_spinner_phase {
+		bar = bar.left(Segment::spinner("editor", phase, Tone::Accent));
+	}
 	if !status_error.is_empty() {
 		bar = bar.right(
 			Segment::toned_text(status_error, Tone::Danger)

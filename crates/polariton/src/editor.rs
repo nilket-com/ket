@@ -30,7 +30,7 @@ use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
 };
 use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_color};
-use libaryon::svp::rust_highlight::default_text_color;
+use libaryon::svp::rust_highlight::{HighlightSpan, default_text_color};
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
@@ -85,10 +85,21 @@ mod metrics {
 	pub const GUTTER_WIDTH: f32 = 54.0;
 }
 
+fn viewport_cells(size: iced::Size) -> (u16, u16) {
+	let columns = (size.width / metrics::CELL_WIDTH)
+		.floor()
+		.clamp(1.0, u16::MAX as f32) as u16;
+	let rows = (size.height / metrics::LINE_HEIGHT)
+		.floor()
+		.clamp(1.0, u16::MAX as f32) as u16;
+	(columns, rows)
+}
+
 #[derive(Clone)]
 pub enum EditorMsg {
 	EngineReady,
 	CursorBlinkTick(time::Instant),
+	BusySpinnerTick(time::Instant),
 	WindowFocused(bool),
 	ActivateDocTab {
 		pane_id: libaryon::core::PaneId,
@@ -181,6 +192,7 @@ enum TextQuery {
 
 const CURSOR_BLINK_INTERVAL: time::Duration = time::Duration::from_millis(500);
 const CURSOR_BLINK_TICK: time::Duration = time::Duration::from_millis(125);
+const BUSY_SPINNER_INTERVAL: time::Duration = time::Duration::from_millis(80);
 
 struct CursorBlink {
 	last_activity: time::Instant,
@@ -224,6 +236,36 @@ impl CursorBlink {
 	}
 }
 
+struct BusySpinner {
+	phase: usize,
+	last_tick: time::Instant,
+}
+
+impl BusySpinner {
+	fn new() -> Self {
+		Self {
+			phase: 0,
+			last_tick: time::Instant::now(),
+		}
+	}
+
+	fn restart(&mut self, now: time::Instant) {
+		self.phase = 0;
+		self.last_tick = now;
+	}
+
+	fn advance(&mut self, now: time::Instant) {
+		let elapsed = now
+			.checked_duration_since(self.last_tick)
+			.unwrap_or_default();
+		let steps = elapsed.as_millis() / BUSY_SPINNER_INTERVAL.as_millis();
+		if steps > 0 {
+			self.phase = self.phase.wrapping_add(steps as usize);
+			self.last_tick = now;
+		}
+	}
+}
+
 /// Long-lived owner of Polariton's libaryon session.
 pub struct CodeEditor {
 	engine: Option<EngineHandle>,
@@ -242,6 +284,7 @@ pub struct CodeEditor {
 	next_execution_query: u64,
 	execution_snapshots: HashMap<u64, ExecutionSnapshot>,
 	cursor_blink: CursorBlink,
+	busy_spinner: BusySpinner,
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
@@ -364,8 +407,15 @@ impl CodeEditor {
 
 	/// Start an embedded editor whose durable settings live alongside the
 	/// Polariton application configuration.
-	pub fn new_with_init(text: &str, init_script: Option<std::path::PathBuf>) -> Self {
-		Self::spawn(polariton_engine_config(None, init_script), Some(text))
+	pub fn new_with_init(
+		text: &str,
+		init_script: Option<std::path::PathBuf>,
+		viewport: iced::Size,
+	) -> Self {
+		Self::spawn(
+			polariton_engine_config(None, init_script, Some(viewport_cells(viewport))),
+			Some(text),
+		)
 	}
 
 	/// Start directly on a real file. Unlike [`Self::new`], this leaves
@@ -385,11 +435,18 @@ impl CodeEditor {
 	pub fn open_initial_file_with_init(
 		path: String,
 		init_script: Option<std::path::PathBuf>,
+		viewport: iced::Size,
 	) -> Self {
-		Self::spawn(polariton_engine_config(Some(path), init_script), None)
+		Self::spawn(
+			polariton_engine_config(Some(path), init_script, Some(viewport_cells(viewport))),
+			None,
+		)
 	}
 
-	fn spawn(config: EngineConfig, replacement: Option<&str>) -> Self {
+	fn spawn(mut config: EngineConfig, replacement: Option<&str>) -> Self {
+		config
+			.initial_viewport
+			.get_or_insert((INITIAL_COLUMNS, INITIAL_ROWS));
 		let mut engine = EngineHandle::spawn(config);
 		let commands = engine.command_sender();
 		let input = engine.input_sender();
@@ -439,6 +496,7 @@ impl CodeEditor {
 			next_execution_query: 0,
 			execution_snapshots: HashMap::new(),
 			cursor_blink: CursorBlink::new(),
+			busy_spinner: BusySpinner::new(),
 			content_dirty: false,
 			last_pointer: None,
 			last_navigation_click: None,
@@ -456,7 +514,6 @@ impl CodeEditor {
 			notebook_cell_data: HashMap::new(),
 			preview_blocks: HashMap::new(),
 		};
-		editor.send(EditorCommand::Resize(INITIAL_COLUMNS, INITIAL_ROWS));
 		if let Some(text) = replacement {
 			editor.send(EditorCommand::ReplaceDocument {
 				text: text.to_owned(),
@@ -758,6 +815,15 @@ impl CodeEditor {
 		self.status_message.as_deref()
 	}
 
+	/// Animation phase while libaryon is performing foreground I/O or semantic
+	/// analysis. `None` keeps the application status bar completely idle.
+	pub fn busy_spinner_phase(&self) -> Option<usize> {
+		self.viewport
+			.as_ref()
+			.is_some_and(|viewport| viewport.busy)
+			.then_some(self.busy_spinner.phase)
+	}
+
 	/// Returns the engine's one-shot `:q` request exactly once.
 	pub fn take_quit_request(&mut self) -> bool {
 		if !self.quit_requested || self.quit_notified {
@@ -825,12 +891,7 @@ impl CodeEditor {
 	/// Translate the code pane's pixel size into the engine's cell grid.
 	/// Callers pass the actual workspace rectangle (see `sync_workspace_viewport`).
 	pub fn resize(&self, width: f32, height: f32) {
-		let columns = (width / metrics::CELL_WIDTH)
-			.floor()
-			.clamp(1.0, u16::MAX as f32) as u16;
-		let rows = (height / metrics::LINE_HEIGHT)
-			.floor()
-			.clamp(1.0, u16::MAX as f32) as u16;
+		let (columns, rows) = viewport_cells(iced::Size::new(width, height));
 		self.send(EditorCommand::Resize(columns, rows));
 	}
 
@@ -845,11 +906,17 @@ impl CodeEditor {
 		} else {
 			Subscription::none()
 		};
+		let busy_spinner = if self.busy_spinner_phase().is_some() {
+			time::every(BUSY_SPINNER_INTERVAL).map(EditorMsg::BusySpinnerTick)
+		} else {
+			Subscription::none()
+		};
 		Subscription::batch([
 			event::listen_with(|event, status, _window| editor_input_for(&event, status)),
 			Subscription::run_with(self.engine_wake.clone(), engine_wake_stream)
 				.map(|()| EditorMsg::EngineReady),
 			blink,
+			busy_spinner,
 		])
 	}
 
@@ -866,6 +933,10 @@ impl CodeEditor {
 				continue;
 			};
 			let viewport = *viewport;
+			let was_busy = self.viewport.as_ref().is_some_and(|viewport| viewport.busy);
+			if viewport.busy && !was_busy {
+				self.busy_spinner.restart(time::Instant::now());
+			}
 			self.quit_requested |= viewport.should_quit;
 			if let Some(message) = viewport.status_message.as_ref() {
 				self.status_message = Some(message.clone());
@@ -973,6 +1044,9 @@ impl CodeEditor {
 			}
 			EditorMsg::CursorBlinkTick(now) => {
 				self.cursor_blink.advance(now);
+			}
+			EditorMsg::BusySpinnerTick(now) => {
+				self.busy_spinner.advance(now);
 			}
 			EditorMsg::WindowFocused(focused) => {
 				self.cursor_blink
@@ -1474,9 +1548,11 @@ impl CodeEditor {
 fn polariton_engine_config(
 	initial_file: Option<String>,
 	init_script: Option<std::path::PathBuf>,
+	initial_viewport: Option<(u16, u16)>,
 ) -> EngineConfig {
 	EngineConfig {
 		initial_file,
+		initial_viewport,
 		init_script,
 		init_entrypoint: "editor".to_string(),
 		..EngineConfig::default()
@@ -1508,6 +1584,18 @@ struct StyledFragment {
 /// the editor background.
 const VISIBLE_WHITESPACE_COLOR: Rgb = Rgb::new(76, 86, 106);
 
+fn highlight_span_at(
+	spans: &[HighlightSpan],
+	byte: libaryon::core::DocByte,
+) -> Option<HighlightSpan> {
+	let before = spans.partition_point(|span| span.start <= byte);
+	spans[..before]
+		.iter()
+		.rev()
+		.find(|span| byte < span.end)
+		.copied()
+}
+
 fn project_lines(
 	pane: &libaryon::uast::projection::PaneViewport,
 	default_foreground: Rgb,
@@ -1521,11 +1609,31 @@ fn project_lines(
 	let mut cursor_rendered = false;
 	let mut display_column = 0u32;
 	let mut line_has_content = false;
-	for token in &pane.tokens {
+	let fallback_first_line = pane.viewport_start_line.get();
+	let fallback_last_line = fallback_first_line
+		.saturating_add(u64::from(pane.viewport_line_count.max(1)))
+		.saturating_sub(1);
+	let last_visible_line = pane
+		.visible_rows
+		.iter()
+		.map(|row| row.line.get())
+		.max()
+		.unwrap_or(fallback_last_line);
+	let line_is_visible = |line: u64| {
+		if pane.visible_rows.is_empty() {
+			(fallback_first_line..=fallback_last_line).contains(&line)
+		} else {
+			pane.visible_rows.iter().any(|row| row.line.get() == line)
+		}
+	};
+	'tokens: for token in &pane.tokens {
 		if token.text.is_empty() {
 			continue;
 		}
 		let token_line = token.absolute_start_line.get();
+		if token_line > last_visible_line {
+			break;
+		}
 		if current
 			.as_ref()
 			.is_none_or(|line| line.doc_line != token_line)
@@ -1533,7 +1641,7 @@ fn project_lines(
 			if let Some(line) = current.take() {
 				lines.push(line);
 			}
-			current = Some(ProjectedLine {
+			current = line_is_visible(token_line).then_some(ProjectedLine {
 				doc_line: token_line,
 				fragments: Vec::new(),
 				show_gutter: true,
@@ -1541,16 +1649,32 @@ fn project_lines(
 		}
 		let mut byte = token.absolute_start_byte.get();
 		let mut line_number = token_line;
+		let mut line_visible = line_is_visible(line_number);
 		let token_text = String::from_utf8_lossy(&token.text);
 		for (offset, ch) in token_text.char_indices() {
 			let byte_len = ch.len_utf8() as u64;
-			let foreground = pane
-				.highlights
-				.iter()
-				.rev()
-				.find(|highlight| highlight.start.get() <= byte && byte < highlight.end.get())
-				.and_then(|highlight| pane.theme_colors[highlight.category as usize])
-				.unwrap_or(default_foreground);
+			if line_number > last_visible_line {
+				break 'tokens;
+			}
+			if !line_visible {
+				if ch == '\n' {
+					line_number = line_number.saturating_add(1);
+					line_visible = line_is_visible(line_number);
+					current = line_visible.then_some(ProjectedLine {
+						doc_line: line_number,
+						fragments: Vec::new(),
+						show_gutter: true,
+					});
+					display_column = 0;
+					line_has_content = false;
+				}
+				byte = byte.saturating_add(byte_len);
+				continue;
+			}
+			let foreground =
+				highlight_span_at(&pane.highlights, libaryon::core::DocByte::new(byte))
+					.and_then(|highlight| pane.theme_colors[highlight.category as usize])
+					.unwrap_or(default_foreground);
 			let foreground = if token.is_folded {
 				cursor_color
 			} else {
@@ -1594,7 +1718,8 @@ fn project_lines(
 					lines.push(line);
 				}
 				line_number = line_number.saturating_add(1);
-				current = Some(ProjectedLine {
+				line_visible = line_is_visible(line_number);
+				current = line_visible.then_some(ProjectedLine {
 					doc_line: line_number,
 					fragments: Vec::new(),
 					show_gutter: true,
@@ -3627,16 +3752,57 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg, InputEvent, KeyCode, LanguageId,
-		MarkdownBlock, MarkdownPreviewColors, Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb,
-		SplitDirection, UiPalette, fence_body_start, markdown_code_fragments, metrics,
-		pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
-		preview_source_window, visible_blocks,
+		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
+		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
+		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb, SplitDirection, UiPalette,
+		fence_body_start, highlight_span_at, markdown_code_fragments, metrics, pane_gutter_width,
+		pane_title, parse_markdown_blocks, preview_row_budget, preview_source_window,
+		viewport_cells, visible_blocks,
 	};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
+
+	#[test]
+	fn highlight_lookup_preserves_nested_span_priority() {
+		use libaryon::core::DocByte;
+		use libaryon::svp::rust_highlight::{HighlightSpan, TokenCategory};
+
+		let spans = [
+			HighlightSpan::new(DocByte::new(0), DocByte::new(100), TokenCategory::BodyText),
+			HighlightSpan::new(DocByte::new(20), DocByte::new(30), TokenCategory::Keyword),
+		];
+		assert_eq!(
+			highlight_span_at(&spans, DocByte::new(25)).map(|span| span.category),
+			Some(TokenCategory::Keyword)
+		);
+		assert_eq!(
+			highlight_span_at(&spans, DocByte::new(35)).map(|span| span.category),
+			Some(TokenCategory::BodyText)
+		);
+		assert_eq!(highlight_span_at(&spans, DocByte::new(100)), None);
+	}
+
+	#[test]
+	fn startup_viewport_uses_the_actual_workspace_pixels() {
+		assert_eq!(viewport_cells(iced::Size::new(1900.0, 967.0)), (197, 43));
+	}
+
+	#[test]
+	fn busy_spinner_advances_at_baryons_cadence_and_restarts() {
+		let start = Instant::now();
+		let mut spinner = BusySpinner::new();
+		spinner.restart(start);
+
+		spinner.advance(start + BUSY_SPINNER_INTERVAL - Duration::from_millis(1));
+		assert_eq!(spinner.phase, 0);
+		spinner.advance(start + BUSY_SPINNER_INTERVAL * 3);
+		assert_eq!(spinner.phase, 3);
+
+		spinner.restart(start + Duration::from_secs(1));
+		assert_eq!(spinner.phase, 0);
+	}
 
 	fn wait_for_content(editor: &mut CodeEditor, expected: &str) {
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -5438,6 +5604,50 @@ mod tests {
 			pane.file_name.as_deref(),
 			Some(path.to_string_lossy().as_ref())
 		);
+
+		editor.shutdown();
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn large_extent_projects_only_the_viewports_lines() {
+		let path = std::env::temp_dir().join(format!(
+			"polariton-large-projection-{}-{}.txt",
+			std::process::id(),
+			std::thread::current().name().unwrap_or("test")
+		));
+		let source = (0..500)
+			.map(|line| format!("line{line:03}\n"))
+			.collect::<String>();
+		std::fs::write(&path, &source).expect("write large projection fixture");
+
+		let mut editor = CodeEditor::open_initial_file(path.to_string_lossy().into_owned());
+		wait_for_content(&mut editor, &source);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let rendered = loop {
+			let rendered = rendered_lines(&editor);
+			if rendered
+				.first()
+				.is_some_and(|line| line.contains("line000"))
+				|| Instant::now() >= deadline
+			{
+				break rendered;
+			}
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		};
+		assert!(
+			rendered.len() <= INITIAL_ROWS as usize,
+			"a viewport must not build widgets for all {} document lines",
+			source.lines().count()
+		);
+		assert!(
+			rendered
+				.first()
+				.is_some_and(|line| line.contains("line000")),
+			"unexpected projected viewport: {rendered:?}"
+		);
+		assert!(!rendered.iter().any(|line| line.contains("line499")));
 
 		editor.shutdown();
 		let _ = std::fs::remove_file(path);

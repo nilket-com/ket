@@ -21,9 +21,25 @@ use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::io;
 
-const BUSY_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Three dot-columns rendered across two Braille cells.
+///
+/// A Unicode Braille cell is only two dot-columns wide. The left cell's right
+/// column plus both columns of the right cell form a stable 3×4 canvas; three
+/// adjacent dots chase around its ten-dot perimeter.
+const BUSY_SPINNER_FRAMES: [[char; 2]; 10] = [
+	['⠸', '⠀'],
+	['⠘', '⠁'],
+	['⠈', '⠉'],
+	['⠀', '⠙'],
+	['⠀', '⠸'],
+	['⠀', '⢰'],
+	['⠀', '⣠'],
+	['⢀', '⣀'],
+	['⢠', '⡀'],
+	['⢰', '⠀'],
+];
 
-fn braille_spinner_frame(frame: usize) -> char {
+fn braille_spinner_frame(frame: usize) -> [char; 2] {
 	BUSY_SPINNER_FRAMES[frame % BUSY_SPINNER_FRAMES.len()]
 }
 
@@ -39,9 +55,13 @@ fn paint_busy_spinner(
 	if *x < width {
 		*x += 1;
 	}
-	if *x < width {
+	let frame = braille_spinner_frame(frame);
+	for glyph in frame {
+		if *x >= width {
+			break;
+		}
 		if let Some(cell) = buf.cell_mut((*x as u16, y)) {
-			cell.set_char(braille_spinner_frame(frame))
+			cell.set_char(glyph)
 				.set_style(bar_style.fg(ratatui_color(accent)));
 		}
 		*x += 1;
@@ -1810,11 +1830,11 @@ fn format_line_count(lines: u64) -> String {
 #[cfg(test)]
 mod tests {
 	use super::{
-		apply_diagnostic_style, braille_spinner_frame, cursor_gutter_line_number_style,
-		draw_tab_bar, effective_editor_background, folded_placeholder_style, format_line_count,
-		gutter_fill_style, gutter_line_number_style, paint_busy_spinner, paint_git_branch,
-		paint_secondary_carets, paint_text_segment, prompt_window,
-		should_render_preview_snapshot_fallback, status_right_text,
+		BUSY_SPINNER_FRAMES, apply_diagnostic_style, braille_spinner_frame,
+		cursor_gutter_line_number_style, draw_tab_bar, effective_editor_background,
+		folded_placeholder_style, format_line_count, gutter_fill_style, gutter_line_number_style,
+		paint_busy_spinner, paint_git_branch, paint_secondary_carets, paint_text_segment,
+		prompt_window, should_render_preview_snapshot_fallback, status_right_text,
 	};
 	use crate::ui::{DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, ratatui_color};
 	use libaryon::core::{
@@ -1987,9 +2007,16 @@ mod tests {
 
 	#[test]
 	fn busy_status_uses_a_looping_braille_spinner() {
-		let first_cycle: String = (0..10).map(braille_spinner_frame).collect();
-		assert_eq!(first_cycle, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-		assert_eq!(braille_spinner_frame(10), '⠋');
+		let first_cycle: String = (0..10).flat_map(braille_spinner_frame).collect();
+		assert_eq!(first_cycle, "⠸⠀⠘⠁⠈⠉⠀⠙⠀⠸⠀⢰⠀⣠⢀⣀⢠⡀⢰⠀");
+		assert_eq!(braille_spinner_frame(10), braille_spinner_frame(0));
+		for frame in BUSY_SPINNER_FRAMES {
+			let active_dots: u32 = frame
+				.into_iter()
+				.map(|glyph| (u32::from(glyph) - 0x2800).count_ones())
+				.sum();
+			assert_eq!(active_dots, 3);
+		}
 	}
 
 	#[test]
@@ -2000,9 +2027,11 @@ mod tests {
 		paint_busy_spinner(&mut buffer, &mut x, 12, 0, 0, Style::default(), accent);
 
 		assert_eq!(buffer[(5, 0)].symbol(), " ");
-		assert_eq!(buffer[(6, 0)].symbol(), "⠋");
+		assert_eq!(buffer[(6, 0)].symbol(), "⠸");
+		assert_eq!(buffer[(7, 0)].symbol(), "⠀");
 		assert_eq!(buffer[(6, 0)].fg, ratatui_color(accent));
-		assert_eq!(x, 7);
+		assert_eq!(buffer[(7, 0)].fg, ratatui_color(accent));
+		assert_eq!(x, 8);
 	}
 
 	#[test]

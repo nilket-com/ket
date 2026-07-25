@@ -234,9 +234,10 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 	let init_detail = init_error.map(|error| StatusDetail::new(init_summary.clone(), error));
 	let data_frame = DataFrame::default();
 	let init_script = configuration::default_init_path();
+	let workspace_size = workspace_bounds(window_size).size();
 	let mut code_editor = match initial_file {
-		Some(path) => CodeEditor::open_initial_file_with_init(path, init_script),
-		None => CodeEditor::new_with_init("", init_script),
+		Some(path) => CodeEditor::open_initial_file_with_init(path, init_script, workspace_size),
+		None => CodeEditor::new_with_init("", init_script, workspace_size),
 	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
@@ -285,6 +286,7 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		&app_state.status_error,
 		app_state.status_df_size,
 		app_state.status_time_elapsed,
+		app_state.code_editor.busy_spinner_phase(),
 		&app_state.adapter_state,
 		app_state.showing_settings,
 		app_state.show_column_types,

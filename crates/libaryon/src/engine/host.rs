@@ -28,6 +28,13 @@ use std::thread;
 pub struct EngineConfig {
 	pub settings: EngineSettings,
 	pub initial_file: Option<String>,
+	/// Frontend viewport available during startup, before the command loop can
+	/// receive its first [`EditorCommand::Resize`].
+	///
+	/// Embedders that already know their surface size should set this so an
+	/// init-script or initial-file render never exposes the engine's fallback
+	/// 80-column geometry.
+	pub initial_viewport: Option<(u16, u16)>,
 	/// Optional Rune startup script. Library embedders must opt in explicitly.
 	pub init_script: Option<PathBuf>,
 	/// Function within `init_script` that configures the editor host.
@@ -48,6 +55,7 @@ impl From<EngineSettings> for EngineConfig {
 		Self {
 			settings,
 			initial_file: None,
+			initial_viewport: None,
 			init_script: None,
 			init_entrypoint: "main".to_string(),
 		}
@@ -117,6 +125,7 @@ impl EngineHandle {
 		let EngineConfig {
 			settings,
 			initial_file,
+			initial_viewport,
 			init_script,
 			init_entrypoint,
 		} = config;
@@ -144,6 +153,7 @@ impl EngineHandle {
 				settings.language_themes,
 			)
 			.with_initial_file(initial_file)
+			.with_initial_viewport(initial_viewport)
 			.with_host_events(tx_host_events)
 			.with_rune_host_config(init_script.map(|path| {
 				super::rune_host::RuneHostConfig::with_entrypoint(path, init_entrypoint)
@@ -643,6 +653,40 @@ mod tests {
 			viewport.status_message.as_deref(),
 			Some("hello from init.rn")
 		);
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(init);
+	}
+
+	#[test]
+	fn configured_viewport_sizes_the_first_init_script_projection() {
+		let init = temp_path("initial-viewport", "rn");
+		fs::write(
+			&init,
+			r#"pub fn main(editor) {
+	let config = editor.config();
+	config.set("wrap", false)?;
+	Ok(())
+}
+"#,
+		)
+		.expect("write Rune init");
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			initial_viewport: Some((173, 47)),
+			init_script: Some(init.clone()),
+			..EngineConfig::default()
+		});
+		let viewports = handle.take_viewports().expect("viewport receiver");
+
+		let viewport = viewports
+			.recv_timeout(Duration::from_secs(10))
+			.expect("startup viewport");
+		assert_eq!(viewport.panes.len(), 1);
+		assert_eq!(
+			viewport.panes[0].rect.width.get(),
+			173,
+			"the first frame must not expose the 80-column fallback"
+		);
+
 		handle.shutdown().expect("join engine");
 		let _ = fs::remove_file(init);
 	}

@@ -231,6 +231,7 @@ pub(crate) struct Engine {
 	pub(super) initial_ui_colors: UiColorOverrides,
 	pub(super) initial_language_themes: BTreeMap<String, String>,
 	pub(super) initial_file: Option<String>,
+	pub(super) initial_viewport: Option<(u16, u16)>,
 	pub(super) rune_host: Option<super::rune_host::RuneHostConfig>,
 	pub(super) terminate: Arc<AtomicBool>,
 	pub(super) dynamic_action_executor:
@@ -283,6 +284,7 @@ impl Engine {
 			initial_ui_colors,
 			initial_language_themes,
 			initial_file: None,
+			initial_viewport: None,
 			rune_host: None,
 			terminate: Arc::new(AtomicBool::new(false)),
 			dynamic_action_executor: Box::new(UnavailableActionExecutor),
@@ -315,6 +317,11 @@ impl Engine {
 
 	pub(crate) fn with_initial_file(mut self, initial_file: Option<String>) -> Self {
 		self.initial_file = initial_file;
+		self
+	}
+
+	pub(crate) fn with_initial_viewport(mut self, initial_viewport: Option<(u16, u16)>) -> Self {
+		self.initial_viewport = initial_viewport;
 		self
 	}
 
