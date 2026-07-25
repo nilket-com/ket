@@ -898,9 +898,10 @@ impl CodeEditor {
 	pub fn subscription(&self) -> Subscription<EditorMsg> {
 		let blink = if self.cursor_blink.window_focused
 			&& self.viewport.as_ref().is_some_and(|viewport| {
-				viewport.focused_pane().is_some_and(|pane| {
-					pane.host_panel.is_none() && pane.markdown_preview.is_none()
-				})
+				prompt_has_cursor(&viewport.input.mode)
+					|| viewport.focused_pane().is_some_and(|pane| {
+						pane.host_panel.is_none() && pane.markdown_preview.is_none()
+					})
 			}) {
 			time::every(CURSOR_BLINK_TICK).map(EditorMsg::CursorBlinkTick)
 		} else {
@@ -1285,10 +1286,15 @@ impl CodeEditor {
 		let content: Element<'_, EditorMsg> = match prompt_line(viewport, self.status_message()) {
 			Some(prompt) => stack![
 				panes,
-				container(command_bar(prompt, palette))
-					.width(Length::Fill)
-					.height(Length::Fill)
-					.align_y(iced::alignment::Vertical::Bottom),
+				container(command_bar(
+					prompt,
+					prompt_cursor_byte(viewport),
+					self.cursor_blink.visible(),
+					palette,
+				))
+				.width(Length::Fill)
+				.height(Length::Fill)
+				.align_y(iced::alignment::Vertical::Bottom),
 			]
 			.into(),
 			None => panes.into(),
@@ -3186,16 +3192,125 @@ fn prompt_line(viewport: &Viewport, status_message: Option<&str>) -> Option<Stri
 	}
 }
 
+fn prompt_has_cursor(mode: &EditorMode) -> bool {
+	matches!(
+		mode,
+		EditorMode::Command | EditorMode::Search | EditorMode::Password
+	)
+}
+
+fn clamp_utf8_boundary(text: &str, byte: usize) -> usize {
+	let mut byte = byte.min(text.len());
+	while !text.is_char_boundary(byte) {
+		byte = byte.saturating_sub(1);
+	}
+	byte
+}
+
+/// Translate libaryon's prompt-local insertion index into the displayed
+/// command-bar string, whose `:`/`/`/password label is frontend decoration.
+fn prompt_cursor_byte(viewport: &Viewport) -> Option<usize> {
+	let input = &viewport.input;
+	match input.mode {
+		EditorMode::Command | EditorMode::Search => {
+			Some(1 + clamp_utf8_boundary(&input.prompt_buffer, input.prompt_cursor))
+		}
+		EditorMode::Password => {
+			let label = input
+				.prompt_label
+				.as_deref()
+				.unwrap_or("Encryption password:");
+			let buffer_byte = input
+				.prompt_buffer
+				.char_indices()
+				.nth(input.prompt_cursor)
+				.map_or(input.prompt_buffer.len(), |(byte, _)| byte);
+			Some(label.len() + 1 + buffer_byte)
+		}
+		_ => None,
+	}
+}
+
+fn command_bar_fragments(
+	prompt: String,
+	cursor_byte: Option<usize>,
+	cursor_visible: bool,
+	palette: UiPalette,
+) -> Vec<StyledFragment> {
+	let foreground = color(palette.editor_text);
+	let Some(cursor_byte) = cursor_byte else {
+		return vec![StyledFragment {
+			text: prompt,
+			foreground,
+			background: None,
+			underline: false,
+		}];
+	};
+	let cursor_byte = clamp_utf8_boundary(&prompt, cursor_byte);
+	let cursor_end = prompt[cursor_byte..]
+		.chars()
+		.next()
+		.map_or(cursor_byte, |character| cursor_byte + character.len_utf8());
+	let mut fragments = Vec::with_capacity(3);
+	let mut push = |text: String, cursor: bool| {
+		if text.is_empty() {
+			return;
+		}
+		fragments.push(StyledFragment {
+			text,
+			foreground: if cursor && cursor_visible {
+				color(palette.editor_background)
+			} else {
+				foreground
+			},
+			background: (cursor && cursor_visible).then_some(color(palette.accent)),
+			underline: false,
+		});
+	};
+	push(prompt[..cursor_byte].to_owned(), false);
+	push(
+		if cursor_end == cursor_byte {
+			" ".to_owned()
+		} else {
+			prompt[cursor_byte..cursor_end].to_owned()
+		},
+		true,
+	);
+	push(prompt[cursor_end..].to_owned(), false);
+	fragments
+}
+
 /// Project libaryon's prompt line (`:` command, `/` search, or a confirm
 /// question). The engine remains responsible for editing and executing the
 /// buffer; this is intentionally display-only so its modal key handling
 /// continues to flow through the normal subscription.
-fn command_bar(prompt: String, palette: UiPalette) -> Element<'static, EditorMsg> {
+fn command_bar(
+	prompt: String,
+	cursor_byte: Option<usize>,
+	cursor_visible: bool,
+	palette: UiPalette,
+) -> Element<'static, EditorMsg> {
+	let fragments = command_bar_fragments(prompt, cursor_byte, cursor_visible, palette)
+		.into_iter()
+		.map(|fragment| {
+			let StyledFragment {
+				text,
+				foreground,
+				background,
+				..
+			} = fragment;
+			let text_span = span::<(), iced::Font>(text).color(foreground);
+			match background {
+				Some(background) => text_span.background(Background::Color(background)),
+				None => text_span,
+			}
+		})
+		.collect::<Vec<_>>();
 	container(
-		text(prompt)
+		rich_text(fragments)
 			.font(EDITOR_FONT)
 			.size(metrics::TEXT_SIZE)
-			.color(color(palette.editor_text)),
+			.line_height(iced::Pixels(metrics::LINE_HEIGHT)),
 	)
 	.width(Length::Fill)
 	.height(Length::Fixed(metrics::LINE_HEIGHT))
@@ -3755,9 +3870,9 @@ mod tests {
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
 		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
 		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb, SplitDirection, UiPalette,
-		fence_body_start, highlight_span_at, markdown_code_fragments, metrics, pane_gutter_width,
-		pane_title, parse_markdown_blocks, preview_row_budget, preview_source_window,
-		viewport_cells, visible_blocks,
+		command_bar_fragments, fence_body_start, highlight_span_at, markdown_code_fragments,
+		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
+		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
 	};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
@@ -4578,6 +4693,63 @@ mod tests {
 		}
 		let viewport = editor.viewport.as_ref().expect("viewport");
 		assert_eq!(prompt_line(viewport, Some("stale")).as_deref(), Some(":w"));
+		assert_eq!(
+			prompt_cursor_byte(viewport),
+			Some(2),
+			"the frontend prefix shifts libaryon's command-local insertion index"
+		);
+
+		let _ = editor.update(EditorMsg::Input(InputEvent::Key {
+			code: KeyCode::Left,
+			modifiers: Modifiers::NONE,
+		}));
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| viewport.input.prompt_cursor != 0)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("viewport");
+		assert_eq!(prompt_cursor_byte(viewport), Some(1));
+	}
+
+	#[test]
+	fn command_bar_cursor_marks_unicode_and_preserves_end_width_while_blinking() {
+		let palette = UiPalette::default();
+		let prompt = ":edit café.rs";
+		let cursor_byte = ":edit caf".len();
+		let visible = command_bar_fragments(prompt.to_owned(), Some(cursor_byte), true, palette);
+		assert_eq!(
+			visible
+				.iter()
+				.map(|fragment| fragment.text.as_str())
+				.collect::<String>(),
+			prompt
+		);
+		let cursor = visible
+			.iter()
+			.find(|fragment| fragment.background.is_some())
+			.expect("visible prompt cursor");
+		assert_eq!(cursor.text, "é");
+		assert_eq!(cursor.background, Some(super::color(palette.accent)));
+
+		let hidden = command_bar_fragments(prompt.to_owned(), Some(prompt.len()), false, palette);
+		assert!(
+			hidden.iter().all(|fragment| fragment.background.is_none()),
+			"the hidden blink phase must not paint a cursor"
+		);
+		assert_eq!(
+			hidden
+				.iter()
+				.map(|fragment| fragment.text.as_str())
+				.collect::<String>(),
+			format!("{prompt} "),
+			"an end cursor reserves one cell in both blink phases"
+		);
 	}
 
 	#[test]
