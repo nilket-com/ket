@@ -1290,6 +1290,7 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	lru: VecDeque<usize>,
 	cache_bytes: u64,
 	cache_cap: u64,
+	cache_peak_bytes: u64,
 	pinned_decoded_pages: Option<Vec<RecordBatch>>,
 	pinned_decoded_bytes: u64,
 	pin_decoded_outcome: Option<PinDecodedPagesOutcome>,
@@ -1328,6 +1329,8 @@ pub(in crate::exec) struct SpilledInnerJoinResidencySnapshot {
 	pub(in crate::exec) writer_scratch_peak_bytes: u64,
 	pub(in crate::exec) page_reserve_bytes: u64,
 	pub(in crate::exec) cache_payload_bytes: u64,
+	pub(in crate::exec) cache_cap_bytes: u64,
+	pub(in crate::exec) cache_peak_bytes: u64,
 	pub(in crate::exec) pinned_decoded_bytes: u64,
 	pub(in crate::exec) page_metadata_bytes: Option<u64>,
 	pub(in crate::exec) cache_metadata_bytes: Option<u64>,
@@ -1445,6 +1448,7 @@ impl SpilledInnerJoinBuild {
 			lru: VecDeque::new(),
 			cache_bytes: 0,
 			cache_cap,
+			cache_peak_bytes: 0,
 			pinned_decoded_pages: None,
 			pinned_decoded_bytes: 0,
 			pin_decoded_outcome: None,
@@ -2550,7 +2554,7 @@ impl SpilledInnerJoinBuild {
 			.cloned()
 		{
 			if let Some(observer) = observer {
-				observer.record_decoded_cache(true)?;
+				observer.record_decoded_cache(true, record_batch_memory_bytes(&batch))?;
 			}
 			if let Some(timer) = cache_timer.take() {
 				timer.finish()?;
@@ -2567,7 +2571,7 @@ impl SpilledInnerJoinBuild {
 			}
 			self.touch_cache_entry(page_index);
 			if let Some(observer) = observer {
-				observer.record_decoded_cache(true)?;
+				observer.record_decoded_cache(true, record_batch_memory_bytes(&batch))?;
 			}
 			if let Some(timer) = cache_timer.take() {
 				timer.finish()?;
@@ -2575,7 +2579,7 @@ impl SpilledInnerJoinBuild {
 			return Ok(batch);
 		}
 		if let Some(observer) = observer {
-			observer.record_decoded_cache(false)?;
+			observer.record_decoded_cache(false, 0)?;
 		}
 		if let Some(timer) = cache_timer.take() {
 			timer.finish()?;
@@ -2641,7 +2645,8 @@ impl SpilledInnerJoinBuild {
 			let bytes = cached.bytes.clone();
 			self.touch_cache_entry(page_index);
 			if let Some(observer) = observer {
-				observer.record_plaintext_cache(true)?;
+				observer
+					.record_plaintext_cache(true, u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
 			}
 			if let Some(timer) = cache_timer.take() {
 				timer.finish()?;
@@ -2649,7 +2654,7 @@ impl SpilledInnerJoinBuild {
 			return Ok(bytes);
 		}
 		if let Some(observer) = observer {
-			observer.record_plaintext_cache(false)?;
+			observer.record_plaintext_cache(false, 0)?;
 		}
 		if let Some(timer) = cache_timer.take() {
 			timer.finish()?;
@@ -2728,6 +2733,7 @@ impl SpilledInnerJoinBuild {
 			}
 		}
 		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
+		self.cache_peak_bytes = self.cache_peak_bytes.max(self.cache_bytes);
 		if let Some(profile) = &mut self.throughput_profile {
 			profile.record_plaintext_insert(bytes_len);
 		}
@@ -2775,6 +2781,7 @@ impl SpilledInnerJoinBuild {
 		} else {
 			self.cache_bytes = self.cache_bytes.saturating_sub(old_total - new_total);
 		}
+		self.cache_peak_bytes = self.cache_peak_bytes.max(self.cache_bytes);
 		if let (Some(profile), Some(removed_plaintext_bytes)) =
 			(&mut self.throughput_profile, removed_plaintext_bytes)
 		{
@@ -2956,6 +2963,8 @@ impl SpilledInnerJoinBuild {
 			writer_scratch_peak_bytes: self.writer_peak,
 			page_reserve_bytes: JOIN_SPILL_PAGE_SIZE as u64,
 			cache_payload_bytes: self.cache_bytes,
+			cache_cap_bytes: self.cache_cap,
+			cache_peak_bytes: self.cache_peak_bytes,
 			pinned_decoded_bytes: self.pinned_decoded_bytes,
 			page_metadata_bytes,
 			cache_metadata_bytes,

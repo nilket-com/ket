@@ -6,6 +6,7 @@ mod columns;
 mod global_fold_profile;
 mod grouped_chain_profile;
 mod membership_chain_profile;
+mod partitioned_build_profile;
 mod residency_profile;
 mod spill;
 mod spill_placement;

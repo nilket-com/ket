@@ -365,7 +365,7 @@ pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_reb
 		.map(|offset| guarded_opt_in + offset)
 		.expect("compact resident index opt-in in live owner");
 	let rebuild = owner[opt_in..]
-		.find(".rebuild_index_from_pages(")
+		.find(".rebuild_index_from_pages_profiled(")
 		.map(|offset| opt_in + offset)
 		.expect("adjacent resident index rebuild in live owner");
 

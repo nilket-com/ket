@@ -138,6 +138,12 @@ struct Frame {
 	/// fails by name rather than publishing whichever definition survived the misuse.
 	vocabulary_failure: Option<&'static str>,
 	stages: Vec<HandlerStage>,
+	/// Query-neutral diagnostics attached to this invocation while its frame is open. Kept outside
+	/// stage arithmetic: these are ownership/counter receipts, not additional timed stages.
+	diagnostics: Vec<InvocationDiagnostic>,
+	/// Spill lifecycle counters gathered by the same invocation-bound observer that opens refinement
+	/// stages. One record per parent stage keeps build and probe domains distinct.
+	spill_io: Vec<SpillIoParent>,
 	/// Attached while this frame is still open — a handler publishes its census before its own
 	/// `execute_bound` returns, so the completed record does not exist yet.
 	growth_census: Option<serde_json::Value>,
@@ -227,6 +233,10 @@ impl SpillCounterKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::exec) struct RequiredStage {
 	pub name: &'static str,
+	/// `None` is a top-level stage required against the handler span. A refinement requirement names
+	/// the exact parent it must reconcile beneath; observing the same leaf under another parent does
+	/// not satisfy it.
+	pub parent: Option<&'static str>,
 	pub replay: Option<u64>,
 }
 
@@ -242,22 +252,28 @@ pub(in crate::exec) enum RequiredStages {
 }
 
 impl RequiredStages {
-	fn entries(&self) -> impl Iterator<Item = (&'static str, Option<u64>)> + '_ {
+	fn entries(
+		&self,
+	) -> impl Iterator<Item = (&'static str, Option<&'static str>, Option<u64>)> + '_ {
 		let (fixed, owned) = match self {
 			Self::Static(names) => (Some(names.iter()), None),
 			Self::Owned(entries) => (None, Some(entries.iter())),
 		};
-		fixed.into_iter().flatten().map(|name| (*name, None)).chain(
-			owned
-				.into_iter()
-				.flatten()
-				.map(|entry| (entry.name, entry.replay)),
-		)
+		fixed
+			.into_iter()
+			.flatten()
+			.map(|name| (*name, None, None))
+			.chain(
+				owned
+					.into_iter()
+					.flatten()
+					.map(|entry| (entry.name, entry.parent, entry.replay)),
+			)
 	}
 
 	fn contains_unscoped(&self, required: &'static str) -> bool {
 		self.entries()
-			.any(|(name, replay)| name == required && replay.is_none())
+			.any(|(name, parent, replay)| name == required && parent.is_none() && replay.is_none())
 	}
 }
 
@@ -353,8 +369,38 @@ struct AggregateInvocation {
 	/// Carried off the frame at exit: a declaration misuse fails the completed record too.
 	vocabulary_failure: Option<&'static str>,
 	stages: Vec<HandlerStage>,
+	diagnostics: Vec<InvocationDiagnostic>,
+	spill_io: Vec<SpillIoParent>,
 	/// The fold's growth census, published beside the exact stages. It never enters their arithmetic.
 	growth_census: Option<serde_json::Value>,
+}
+
+#[derive(Clone)]
+struct InvocationDiagnostic {
+	name: &'static str,
+	value: serde_json::Value,
+}
+
+#[derive(Clone, Default)]
+struct SpillIoParent {
+	parent: &'static str,
+	subleaves: Vec<SpillIoSubleaf>,
+	plaintext_cache_hits: u64,
+	plaintext_cache_misses: u64,
+	plaintext_cache_hit_bytes: u64,
+	decoded_cache_hits: u64,
+	decoded_cache_misses: u64,
+	decoded_cache_hit_bytes: u64,
+	error: Option<&'static str>,
+}
+
+#[derive(Clone)]
+struct SpillIoSubleaf {
+	name: &'static str,
+	calls: u64,
+	rows: u64,
+	bytes: u64,
+	pages: u64,
 }
 
 /// The pure stack accounting. Given, per node, its measured inclusive time and inclusive spill, it
@@ -508,6 +554,8 @@ impl NodeAccounting {
 				vocabulary: frame.vocabulary,
 				vocabulary_failure: frame.vocabulary_failure,
 				stages: frame.stages,
+				diagnostics: frame.diagnostics,
+				spill_io: frame.spill_io,
 				growth_census: frame.growth_census,
 			});
 		}
@@ -634,6 +682,126 @@ impl NodeAccounting {
 		}
 	}
 
+	fn attach_diagnostic(&mut self, id: u64, name: &'static str, value: serde_json::Value) {
+		let diagnostics = if let Some(frame) = self.stack.iter_mut().find(|frame| frame.id == id) {
+			&mut frame.diagnostics
+		} else if let Some(invocation) = self
+			.aggregate_invocations
+			.iter_mut()
+			.find(|invocation| invocation.id == id)
+		{
+			&mut invocation.diagnostics
+		} else {
+			return;
+		};
+		if let Some(existing) = diagnostics.iter_mut().find(|entry| entry.name == name) {
+			existing.value = value;
+		} else {
+			diagnostics.push(InvocationDiagnostic { name, value });
+		}
+	}
+
+	fn record_spill_subleaf(
+		&mut self,
+		id: u64,
+		parent: &'static str,
+		name: &'static str,
+		rows: u64,
+		bytes: u64,
+		pages: u64,
+	) -> Result<(), &'static str> {
+		let frame = self
+			.stack
+			.iter_mut()
+			.find(|frame| frame.id == id)
+			.ok_or("spill subleaf recorded after its invocation exited")?;
+		let counters = spill_parent_mut(&mut frame.spill_io, parent);
+		if counters.error.is_some() {
+			return Err("spill lifecycle counter is already failed");
+		}
+		let leaf =
+			if let Some(existing) = counters.subleaves.iter_mut().find(|leaf| leaf.name == name) {
+				existing
+			} else {
+				counters.subleaves.push(SpillIoSubleaf {
+					name,
+					calls: 0,
+					rows: 0,
+					bytes: 0,
+					pages: 0,
+				});
+				counters
+					.subleaves
+					.last_mut()
+					.expect("spill subleaf was just inserted")
+			};
+		let Some(calls) = leaf.calls.checked_add(1) else {
+			counters.error = Some("spill subleaf call count overflowed");
+			return Err("spill subleaf call count overflowed");
+		};
+		let Some(total_rows) = leaf.rows.checked_add(rows) else {
+			counters.error = Some("spill subleaf row count overflowed");
+			return Err("spill subleaf row count overflowed");
+		};
+		let Some(total_bytes) = leaf.bytes.checked_add(bytes) else {
+			counters.error = Some("spill subleaf byte count overflowed");
+			return Err("spill subleaf byte count overflowed");
+		};
+		let Some(total_pages) = leaf.pages.checked_add(pages) else {
+			counters.error = Some("spill subleaf page count overflowed");
+			return Err("spill subleaf page count overflowed");
+		};
+		leaf.calls = calls;
+		leaf.rows = total_rows;
+		leaf.bytes = total_bytes;
+		leaf.pages = total_pages;
+		Ok(())
+	}
+
+	fn record_spill_cache(
+		&mut self,
+		id: u64,
+		parent: &'static str,
+		decoded: bool,
+		hit: bool,
+		bytes: u64,
+	) -> Result<(), &'static str> {
+		let frame = self
+			.stack
+			.iter_mut()
+			.find(|frame| frame.id == id)
+			.ok_or("spill cache event recorded after its invocation exited")?;
+		let counters = spill_parent_mut(&mut frame.spill_io, parent);
+		if counters.error.is_some() {
+			return Err("spill lifecycle counter is already failed");
+		}
+		let (count, hit_bytes) = match (decoded, hit) {
+			(false, false) => (&mut counters.plaintext_cache_misses, None),
+			(false, true) => (
+				&mut counters.plaintext_cache_hits,
+				Some(&mut counters.plaintext_cache_hit_bytes),
+			),
+			(true, false) => (&mut counters.decoded_cache_misses, None),
+			(true, true) => (
+				&mut counters.decoded_cache_hits,
+				Some(&mut counters.decoded_cache_hit_bytes),
+			),
+		};
+		let Some(next) = count.checked_add(1) else {
+			counters.error = Some("spill cache event count overflowed");
+			return Err("spill cache event count overflowed");
+		};
+		*count = next;
+		if let Some(hit_bytes) = hit_bytes {
+			let Some(next) = hit_bytes.checked_add(bytes) else {
+				counters.error = Some("spill cache hit bytes overflowed");
+				return Err("spill cache hit bytes overflowed");
+			};
+			*hit_bytes = next;
+		}
+		Ok(())
+	}
+
 	fn close_stage(
 		&mut self,
 		token: StageToken,
@@ -757,6 +925,20 @@ impl NodeAccounting {
 			total.saturating_add(node.exclusive_micros)
 		})
 	}
+}
+
+fn spill_parent_mut<'a>(
+	parents: &'a mut Vec<SpillIoParent>,
+	parent: &'static str,
+) -> &'a mut SpillIoParent {
+	if let Some(position) = parents.iter().position(|entry| entry.parent == parent) {
+		return &mut parents[position];
+	}
+	parents.push(SpillIoParent {
+		parent,
+		..SpillIoParent::default()
+	});
+	parents.last_mut().expect("spill parent was just inserted")
 }
 
 static NODE_LEDGER: Mutex<Option<NodeAccounting>> = Mutex::new(None);
@@ -1002,6 +1184,76 @@ pub(in crate::exec) fn record_growth_census(
 	{
 		accounting.attach_growth_census(handle.invocation_id, estimate);
 	}
+}
+
+/// Attach a query-neutral ownership or lifecycle receipt to this invocation. Diagnostics are emitted
+/// beside stage arithmetic and never consulted by its reconciliation verdict.
+pub(in crate::exec) fn record_invocation_diagnostic(
+	handle: &VocabularyHandle,
+	name: &'static str,
+	value: serde_json::Value,
+) {
+	if !enabled() {
+		return;
+	}
+	if let Ok(mut slot) = NODE_LEDGER.lock()
+		&& let Some(accounting) = slot.as_mut()
+	{
+		accounting.attach_diagnostic(handle.invocation_id, name, value);
+	}
+}
+
+/// Accumulate observational rows/bytes/pages for one timed spill refinement. The timer remains the
+/// time authority; these counters explain its work without entering stage reconciliation.
+pub(in crate::exec) fn record_spill_subleaf_observation(
+	handle: &VocabularyHandle,
+	parent: &'static str,
+	name: &'static str,
+	rows: u64,
+	bytes: u64,
+	pages: u64,
+) -> Result<(), ExecutionError> {
+	if !enabled() {
+		return Ok(());
+	}
+	let result = NODE_LEDGER
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "node attribution ledger mutex poisoned".to_string(),
+		})?
+		.as_mut()
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "node attribution spill counter has no active ledger".to_string(),
+		})?
+		.record_spill_subleaf(handle.invocation_id, parent, name, rows, bytes, pages);
+	result.map_err(|reason| ExecutionError::Kernel {
+		message: format!("node attribution spill counter failed: {reason}"),
+	})
+}
+
+pub(in crate::exec) fn record_spill_cache_event(
+	handle: &VocabularyHandle,
+	parent: &'static str,
+	decoded: bool,
+	hit: bool,
+	bytes: u64,
+) -> Result<(), ExecutionError> {
+	if !enabled() {
+		return Ok(());
+	}
+	let result = NODE_LEDGER
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "node attribution ledger mutex poisoned".to_string(),
+		})?
+		.as_mut()
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "node attribution spill cache counter has no active ledger".to_string(),
+		})?
+		.record_spill_cache(handle.invocation_id, parent, decoded, hit, bytes);
+	result.map_err(|reason| ExecutionError::Kernel {
+		message: format!("node attribution spill cache counter failed: {reason}"),
+	})
 }
 
 /// Open a refinement stage *inside* an outer stage. It reconciles to `parent`'s micros, giving the
@@ -1381,15 +1633,15 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 		.required_stages
 		.entries()
 		// A failed stage does not satisfy its name: coverage means an observed, reconciled stage.
-		.filter(|(required, replay)| {
+		.filter(|(required, parent, replay)| {
 			!invocation.stages.iter().any(|s| {
 				s.name == *required
-					&& s.parent.is_none()
+					&& s.parent == *parent
 					&& s.replay == *replay
 					&& matches!(s.outcome, StageOutcome::Reconciled { .. })
 			})
 		})
-		.map(|(name, replay)| required_stage_value(name, replay))
+		.map(|(name, parent, replay)| required_stage_value(name, parent, replay))
 		.collect();
 	let within_residual_boundary = stage_residual_micros <= vocabulary.residual_boundary_micros;
 	// A failed stage — or one orphaned by an exited invocation — is an arithmetic failure of this
@@ -1501,7 +1753,7 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 		"required_stages": vocabulary
 			.required_stages
 			.entries()
-			.map(|(name, replay)| required_stage_value(name, replay))
+			.map(|(name, parent, replay)| required_stage_value(name, parent, replay))
 			.collect::<Vec<_>>(),
 		// Stage durations are whole microseconds: `Instant::elapsed().as_micros()` truncates, so a
 		// per-call stage under a microsecond records zero every time. Zero means "below resolution",
@@ -1530,10 +1782,22 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 /// How one required stage is named in the profile. An unscoped requirement stays the bare string the
 /// static vocabularies have always published; a replay-scoped one names its exact id, which is what
 /// makes a missing-replay failure actionable.
-fn required_stage_value(name: &'static str, replay: Option<u64>) -> serde_json::Value {
-	match replay {
-		None => serde_json::json!(name),
-		Some(id) => serde_json::json!({"stage": name, "replay_id": id}),
+fn required_stage_value(
+	name: &'static str,
+	parent: Option<&'static str>,
+	replay: Option<u64>,
+) -> serde_json::Value {
+	match (parent, replay) {
+		(None, None) => serde_json::json!(name),
+		(None, replay) => serde_json::json!({
+			"stage": name,
+			"replay_id": replay,
+		}),
+		(Some(parent), replay) => serde_json::json!({
+			"stage": name,
+			"parent": parent,
+			"replay_id": replay,
+		}),
 	}
 }
 
@@ -1545,6 +1809,40 @@ fn handler_spill_of(invocation: &AggregateInvocation) -> u64 {
 		}) => exclusive_spill_bytes,
 		_ => 0,
 	}
+}
+
+fn spill_io_value(parents: &[SpillIoParent]) -> serde_json::Value {
+	serde_json::Value::Array(
+		parents
+			.iter()
+			.map(|parent| {
+				serde_json::json!({
+					"parent": parent.parent,
+					"error": parent.error,
+					"subleaves": parent.subleaves.iter().map(|leaf| {
+						serde_json::json!({
+							"stage": leaf.name,
+							"calls": leaf.calls,
+							"rows": leaf.rows,
+							"bytes": leaf.bytes,
+							"pages": leaf.pages,
+						})
+					}).collect::<Vec<_>>(),
+					"plaintext_cache": {
+						"hits": parent.plaintext_cache_hits,
+						"misses": parent.plaintext_cache_misses,
+						"hit_bytes": parent.plaintext_cache_hit_bytes,
+					},
+					"decoded_cache": {
+						"hits": parent.decoded_cache_hits,
+						"misses": parent.decoded_cache_misses,
+						"hit_bytes": parent.decoded_cache_hit_bytes,
+					},
+					"passed": parent.error.is_none(),
+				})
+			})
+			.collect(),
+	)
 }
 
 fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
@@ -1621,6 +1919,13 @@ fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
 				"exclusive_spill_bytes": invocation.exclusive_spill_bytes,
 				"bridge": bridge_value(invocation),
 				"stages": stages_value(invocation, &orphaned),
+				"spill_io": spill_io_value(&invocation.spill_io),
+				"diagnostics": invocation.diagnostics.iter().map(|entry| {
+					serde_json::json!({
+						"name": entry.name,
+						"value": entry.value,
+					})
+				}).collect::<Vec<_>>(),
 				// Beside the stages, never inside their arithmetic: `passed` above is computed
 				// without ever consulting this.
 				"growth_census": invocation.growth_census.clone(),
@@ -1979,6 +2284,8 @@ mod tests {
 			vocabulary: None,
 			vocabulary_failure: None,
 			stages: Vec::new(),
+			diagnostics: Vec::new(),
+			spill_io: Vec::new(),
 			growth_census: None,
 		};
 		let value = bridge_value(&inverted);
@@ -2103,6 +2410,8 @@ mod tests {
 			vocabulary,
 			vocabulary_failure: None,
 			stages,
+			diagnostics: Vec::new(),
+			spill_io: Vec::new(),
 			growth_census: None,
 		}
 	}
@@ -2721,6 +3030,98 @@ mod tests {
 		assert_eq!(value["passed"], false);
 	}
 
+	#[test]
+	fn required_refinement_is_satisfied_only_under_its_declared_parent() {
+		let vocabulary = || Vocabulary {
+			invocation_id: 3,
+			name: "partitioned_scan_build",
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Owned(vec![
+				RequiredStage {
+					name: "join0_build",
+					parent: None,
+					replay: None,
+				},
+				RequiredStage {
+					name: "read_physical_read",
+					parent: Some("join0_build"),
+					replay: None,
+				},
+			]),
+			residual_boundary_micros: 100,
+		};
+		let stages = |parent| {
+			vec![
+				HandlerStage {
+					name: "join0_build",
+					calls: 1,
+					parent: None,
+					replay: None,
+					outcome: StageOutcome::Reconciled {
+						micros: 950,
+						spill_bytes: 0,
+					},
+				},
+				HandlerStage {
+					name: "read_physical_read",
+					calls: 1,
+					parent: Some(parent),
+					replay: None,
+					outcome: StageOutcome::Reconciled {
+						micros: 900,
+						spill_bytes: 0,
+					},
+				},
+			]
+		};
+
+		let wrong_parent =
+			invocation_with_stages(1_000, 0, Some(vocabulary()), stages("join0_probe"));
+		let value = stages_value(&wrong_parent, &[]);
+		assert_eq!(
+			value["missing_required_stages"],
+			serde_json::json!([{
+				"stage": "read_physical_read",
+				"parent": "join0_build",
+				"replay_id": null,
+			}])
+		);
+		assert_eq!(value["passed"], false);
+
+		let matched = invocation_with_stages(1_000, 0, Some(vocabulary()), stages("join0_build"));
+		let value = stages_value(&matched, &[]);
+		assert_eq!(value["missing_required_stages"], serde_json::json!([]));
+		assert_eq!(value["refinements"][0]["passed"], true);
+		assert_eq!(value["passed"], true);
+	}
+
+	#[test]
+	fn spill_lifecycle_counters_remain_parent_scoped_and_checked() {
+		let mut acc = NodeAccounting::default();
+		acc.enter();
+		let id = acc.stack.last().expect("frame").id;
+		acc.record_spill_subleaf(id, "join0_build", "read_physical_read", 10, 20, 2)
+			.expect("first build leaf");
+		acc.record_spill_subleaf(id, "join0_build", "read_physical_read", 4, 8, 1)
+			.expect("merged build leaf");
+		acc.record_spill_subleaf(id, "join0_probe", "read_physical_read", 1, 3, 1)
+			.expect("probe leaf");
+		acc.record_spill_cache(id, "join0_build", true, true, 64)
+			.expect("decoded hit");
+		acc.record_spill_cache(id, "join0_build", true, false, 0)
+			.expect("decoded miss");
+		let value = spill_io_value(&acc.stack.last().expect("frame").spill_io);
+		assert_eq!(value[0]["parent"], "join0_build");
+		assert_eq!(value[0]["subleaves"][0]["calls"], 2);
+		assert_eq!(value[0]["subleaves"][0]["rows"], 14);
+		assert_eq!(value[0]["subleaves"][0]["bytes"], 28);
+		assert_eq!(value[0]["subleaves"][0]["pages"], 3);
+		assert_eq!(value[0]["decoded_cache"]["hits"], 1);
+		assert_eq!(value[0]["decoded_cache"]["misses"], 1);
+		assert_eq!(value[0]["decoded_cache"]["hit_bytes"], 64);
+		assert_eq!(value[1]["parent"], "join0_probe");
+	}
+
 	// A route stamped while a descendant frame is open must not land on the descendant. The
 	// dispatcher stamps only after its arm's children have popped, so the top frame is the routed
 	// node; this pins that the stamp follows the stack rather than the most recent call.
@@ -2752,6 +3153,7 @@ mod tests {
 		ids.iter()
 			.map(|id| RequiredStage {
 				name,
+				parent: None,
 				replay: Some(*id),
 			})
 			.collect()
@@ -3105,6 +3507,7 @@ mod tests {
 		assert!(
 			!RequiredStages::Owned(vec![RequiredStage {
 				name: "fold",
+				parent: None,
 				replay: Some(1),
 			}])
 			.contains_unscoped("fold")

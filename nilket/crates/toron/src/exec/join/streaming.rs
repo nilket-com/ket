@@ -1,3 +1,4 @@
+use super::partitioned_build_profile::PartitionedBuildResidencyProfile;
 use super::residency_profile::{
 	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
 };
@@ -22,6 +23,7 @@ const STREAMED_CORRELATED_SORT_INPUT_PRODUCER: &str = "streamed correlated sort 
 const LOCAL_RUNTIME_FILTER_ABLATION_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
 const PHYSICAL_SCAN_BUILD_ENV: &str = "TORON_TPCH_PHYSICAL_SCAN_BUILD";
 const RETAIN_FITTING_SCAN_BUILD_ENV: &str = "TORON_TPCH_RETAIN_FITTING_SCAN_BUILD";
+const PARTITIONED_BUILD_SPILL_PROFILE_ENV: &str = "TORON_PARTITIONED_BUILD_SPILL_PROFILE";
 
 fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -38,6 +40,21 @@ fn retain_fitting_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 fn retain_fitting_scan_build_enabled() -> bool {
 	retain_fitting_scan_build_enabled_from_env(
 		std::env::var(RETAIN_FITTING_SCAN_BUILD_ENV).ok().as_deref(),
+	)
+}
+
+fn partitioned_build_spill_profile_enabled_from_env(value: Option<&str>) -> bool {
+	matches!(
+		value.map(|value| value.trim().to_ascii_lowercase()),
+		Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+	)
+}
+
+fn partitioned_build_spill_profile_enabled() -> bool {
+	partitioned_build_spill_profile_enabled_from_env(
+		std::env::var(PARTITIONED_BUILD_SPILL_PROFILE_ENV)
+			.ok()
+			.as_deref(),
 	)
 }
 
@@ -1529,7 +1546,9 @@ pub(in crate::exec) enum Join0SpillCadence {
 /// `join0_probe` is required on every route except `estimate_spill_fallback`, whose single
 /// `visit_spilled_hash_join_filtered_chunks` call writes the spill and probes it in one span with no
 /// boundary between them to bracket.
-fn correlated_scalar_variants() -> Vec<node_attribution::VocabularyVariant> {
+fn correlated_scalar_variants(
+	partitioned_build_spill_profile: bool,
+) -> Vec<node_attribution::VocabularyVariant> {
 	use node_attribution::{RequiredStage, RequiredStages, SpillCounterKind, VocabularyVariant};
 	// Derived from this handler's own grounding, not inherited. The first profile declared the 500 ms
 	// boundary the other vocabularies use and overran it at 4,886 ms; that failure named three
@@ -1558,6 +1577,19 @@ fn correlated_scalar_variants() -> Vec<node_attribution::VocabularyVariant> {
 		"join0_group_open",
 		"join0_group_cleanup",
 	];
+	const PARTITIONED_SCAN_BUILD_REFINEMENTS: &[&str] = &[
+		"write_scan_decode",
+		"write_partition_routing",
+		"write_ipc_encode",
+		"write_encryption",
+		"write_physical_write",
+		"write_finish_fsync",
+		"read_physical_read",
+		"read_decrypt",
+		"read_ipc_decode",
+		"read_cache_lru",
+		"read_index_rebuild_cpu",
+	];
 	[
 		Join0ChunkRoute::PartitionedScanBuild,
 		Join0ChunkRoute::SpilledScanBuild,
@@ -1573,19 +1605,35 @@ fn correlated_scalar_variants() -> Vec<node_attribution::VocabularyVariant> {
 	.map(|route| {
 		let mut required: Vec<RequiredStage> = COMMON
 			.iter()
-			.map(|name| RequiredStage { name, replay: None })
+			.map(|name| RequiredStage {
+				name,
+				parent: None,
+				replay: None,
+			})
 			.collect();
 		if route != Join0ChunkRoute::EstimateSpillFallback {
 			required.push(RequiredStage {
 				name: "join0_probe",
+				parent: None,
 				replay: None,
 			});
 		}
 		if route.spill_cadence() == Join0SpillCadence::PerGroup {
+			required.extend(PARTITIONED_ONLY.iter().map(|name| RequiredStage {
+				name,
+				parent: None,
+				replay: None,
+			}));
+		}
+		if route == Join0ChunkRoute::PartitionedScanBuild && partitioned_build_spill_profile {
 			required.extend(
-				PARTITIONED_ONLY
+				PARTITIONED_SCAN_BUILD_REFINEMENTS
 					.iter()
-					.map(|name| RequiredStage { name, replay: None }),
+					.map(|name| RequiredStage {
+						name,
+						parent: Some("join0_build"),
+						replay: None,
+					}),
 			);
 		}
 		VocabularyVariant {
@@ -2085,28 +2133,34 @@ fn scan_probe_base_variants(
 	const RESIDUAL_BOUNDARY_MICROS: u64 = 500_000;
 	let mut required: Vec<RequiredStage> = COMMON
 		.iter()
-		.map(|name| RequiredStage { name, replay: None })
+		.map(|name| RequiredStage {
+			name,
+			parent: None,
+			replay: None,
+		})
 		.collect();
 	for stage in stages {
 		let replay = Some(u64::from(stage.replay_id.0));
 		required.push(RequiredStage {
 			name: "suffix_probe",
+			parent: None,
 			replay,
 		});
 		if stage.post_filter.is_some() {
 			required.push(RequiredStage {
 				name: "suffix_filter",
+				parent: None,
 				replay,
 			});
 		}
 	}
 	let with = |extra: &[&'static str]| {
 		let mut list = required.clone();
-		list.extend(
-			extra
-				.iter()
-				.map(|name| RequiredStage { name, replay: None }),
-		);
+		list.extend(extra.iter().map(|name| RequiredStage {
+			name,
+			parent: None,
+			replay: None,
+		}));
 		RequiredStages::Owned(list)
 	};
 	let variants: [(&'static str, &[&'static str]); 4] = [
@@ -4813,8 +4867,10 @@ impl Executor {
 		// scalar preparation is measured under a declaration that has not yet chosen a lifecycle.
 		// Commit happens only once the dispatcher returns the leaf that actually ran.
 		let attribution_telemetry = self.context.task_telemetry.clone();
-		let stage_handle =
-			node_attribution::predeclare_stage_vocabulary(correlated_scalar_variants);
+		let partitioned_build_spill_profile = partitioned_build_spill_profile_enabled();
+		let stage_handle = node_attribution::predeclare_stage_vocabulary(|| {
+			correlated_scalar_variants(partitioned_build_spill_profile)
+		});
 
 		// scalar_prep drives a nested `execute_bound`: the correlated scalar side is frequently a
 		// grouped aggregate in its own right and can dominate wall time. The token subtracts that
@@ -5727,6 +5783,7 @@ impl Executor {
 		F: FnMut(RecordBatch) -> Result<(), ExecutionError>,
 	{
 		let stage_telemetry = self.context.task_telemetry.clone();
+		let partitioned_build_spill_profile = partitioned_build_spill_profile_enabled();
 		if match_filter.is_some() {
 			return Ok(None);
 		}
@@ -5788,6 +5845,19 @@ impl Executor {
 		};
 
 		let group_count = group_count.max(1).min(partition_count);
+		let mut build_residency_profile = partitioned_build_spill_profile
+			.then_some(stage_handle)
+			.flatten()
+			.map(|_| {
+				PartitionedBuildResidencyProfile::new(
+					partition_count,
+					group_count,
+					self.context.task_budget.memory.get(),
+					self.context.task_budget.spill_bytes.get(),
+					0,
+				)
+			})
+			.transpose()?;
 		let mut total_build_rows = 0u64;
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
@@ -5824,6 +5894,16 @@ impl Executor {
 
 			let build_stage = stage_handle
 				.and_then(|h| node_attribution::open_stage(h, "join0_build", &stage_telemetry));
+			let build_observer = partitioned_build_spill_profile
+				.then_some(stage_handle)
+				.flatten()
+				.map(|handle| {
+					GroupedChainSpillObserver::for_node_stage(
+						handle,
+						"join0_build",
+						&stage_telemetry,
+					)
+				});
 			let build_started = Instant::now();
 			let mut group_spill_bytes = 0u64;
 			let build_result = self
@@ -5843,7 +5923,7 @@ impl Executor {
 					None,
 					None,
 					None,
-					None,
+					build_observer.as_ref(),
 					None,
 				)
 				.await;
@@ -5851,6 +5931,17 @@ impl Executor {
 				Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 				return Err(error);
 			}
+			let before_scratch_release = build_residency_profile.as_ref().map(|_| {
+				group_range
+					.clone()
+					.filter_map(|partition| {
+						partitioned_builds
+							.get(partition)
+							.and_then(Option::as_ref)
+							.map(|build| (partition, build.residency_snapshot()))
+					})
+					.collect::<Vec<_>>()
+			});
 
 			let mut group_build_rows = 0u64;
 			for partition in group_range.clone() {
@@ -5860,9 +5951,16 @@ impl Executor {
 				else {
 					continue;
 				};
+				let finish_timer = build_observer
+					.as_ref()
+					.map(|observer| observer.begin(GroupedChainSubLeaf::WriteFinishFsync))
+					.transpose()?;
 				if let Err(error) = spilled.finish(self.context.task_budget).await {
 					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
 					return Err(error);
+				}
+				if let Some(timer) = finish_timer {
+					timer.finish()?;
 				}
 				spilled.release_write_scratch();
 				group_build_rows = group_build_rows.saturating_add(spilled.input_row_count());
@@ -5871,11 +5969,12 @@ impl Executor {
 						spilled.use_compact_resident_index();
 					}
 					if let Err(error) = spilled
-						.rebuild_index_from_pages(
+						.rebuild_index_from_pages_profiled(
 							key_plan,
 							build_keys,
 							null_safe_keys,
 							self.context.task_budget,
+							build_observer.as_ref(),
 						)
 						.await
 					{
@@ -5883,6 +5982,26 @@ impl Executor {
 						return Err(error);
 					}
 				}
+			}
+			if let (Some(residency), Some(before_scratch_release)) =
+				(build_residency_profile.as_mut(), before_scratch_release)
+			{
+				let after_rebuild = group_range
+					.clone()
+					.filter_map(|partition| {
+						partitioned_builds
+							.get(partition)
+							.and_then(Option::as_ref)
+							.map(|build| (partition, build.residency_snapshot()))
+					})
+					.collect::<Vec<_>>();
+				residency.record_group(
+					group,
+					group_range.clone(),
+					summary_bytes::<Option<SpilledInnerJoinBuild>>(partitioned_builds.capacity()),
+					before_scratch_release,
+					after_rebuild,
+				)?;
 			}
 			total_build_rows = total_build_rows.saturating_add(group_build_rows);
 			total_spill_bytes = total_spill_bytes.saturating_add(group_spill_bytes);
@@ -5909,6 +6028,16 @@ impl Executor {
 
 			let probe_stage = stage_handle
 				.and_then(|h| node_attribution::open_stage(h, "join0_probe", &stage_telemetry));
+			let probe_observer = partitioned_build_spill_profile
+				.then_some(stage_handle)
+				.flatten()
+				.map(|handle| {
+					GroupedChainSpillObserver::for_node_stage(
+						handle,
+						"join0_probe",
+						&stage_telemetry,
+					)
+				});
 			let probe_started = Instant::now();
 			let result = self
 				.visit_partitioned_streaming_scan_probe_group_chunks(
@@ -5928,6 +6057,7 @@ impl Executor {
 					build_plan.schema().fields().len(),
 					morsel,
 					profile,
+					probe_observer.as_ref(),
 					visit_batch,
 				)
 				.await;
@@ -5964,6 +6094,13 @@ impl Executor {
 			if let Some(timer) = cleanup_timer {
 				timer.finish()?;
 			}
+		}
+		if let (Some(handle), Some(residency)) = (stage_handle, build_residency_profile.as_ref()) {
+			node_attribution::record_invocation_diagnostic(
+				handle,
+				"partitioned_build_residency",
+				residency.json(),
+			);
 		}
 		record_join_spill_observation(
 			&self.context.task_telemetry,
@@ -6428,6 +6565,7 @@ impl Executor {
 					probe_columns_first,
 					build_plan.schema().fields().len(),
 					morsel,
+					None,
 					None,
 					visit_batch,
 				)
@@ -7612,6 +7750,7 @@ impl Executor {
 		build_column_count: usize,
 		morsel: Option<(MorselId, u32)>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
@@ -7706,6 +7845,7 @@ impl Executor {
 							probe_columns_first,
 							build_column_count,
 							profile,
+							grouped_chain_observer,
 							visit_batch,
 						)
 						.await?;
@@ -7791,6 +7931,7 @@ impl Executor {
 						probe_columns_first,
 						build_column_count,
 						profile,
+						grouped_chain_observer,
 						visit_batch,
 					)
 					.await?;
@@ -7818,6 +7959,7 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
+		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 		visit_batch: &mut F,
 	) -> Result<(u64, u64), ExecutionError>
 	where
@@ -7868,7 +8010,7 @@ impl Executor {
 					build_column_count,
 					None,
 					profile,
-					None,
+					grouped_chain_observer,
 					visit_batch,
 				)
 				.await?;
@@ -19175,6 +19317,39 @@ mod tests {
 		assert!(retain_fitting_scan_build_enabled_from_env(None));
 		assert!(retain_fitting_scan_build_enabled_from_env(Some("1")));
 		assert!(!retain_fitting_scan_build_enabled_from_env(Some("0")));
+	}
+
+	#[test]
+	fn partitioned_build_spill_profile_requires_an_explicit_truthy_value() {
+		assert!(!partitioned_build_spill_profile_enabled_from_env(None));
+		assert!(!partitioned_build_spill_profile_enabled_from_env(Some("0")));
+		assert!(!partitioned_build_spill_profile_enabled_from_env(Some(
+			"false"
+		)));
+		assert!(partitioned_build_spill_profile_enabled_from_env(Some("1")));
+		assert!(partitioned_build_spill_profile_enabled_from_env(Some(
+			" true "
+		)));
+	}
+
+	#[test]
+	fn partitioned_build_spill_refinements_are_required_only_in_the_profile_arm() {
+		let has_build_read = |enabled| {
+			let variant = correlated_scalar_variants(enabled)
+				.into_iter()
+				.find(|variant| variant.name == "correlated_scalar_partitioned_scan_build")
+				.expect("partitioned scan-build variant");
+			let node_attribution::RequiredStages::Owned(required) = variant.required_stages else {
+				panic!("correlated scalar requirements are runtime-owned");
+			};
+			required.iter().any(|stage| {
+				stage.name == "read_physical_read"
+					&& stage.parent == Some("join0_build")
+					&& stage.replay.is_none()
+			})
+		};
+		assert!(!has_build_read(false));
+		assert!(has_build_read(true));
 	}
 
 	#[test]

@@ -1,5 +1,6 @@
 use crate::distributed::task::TaskTelemetry;
 use crate::error::ExecutionError;
+use crate::exec::node_attribution;
 use crate::ir::JoinReplayId;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -327,14 +328,36 @@ pub(in crate::exec) struct GroupedChainProfileTimer<'a> {
 
 #[derive(Clone, Copy)]
 pub(in crate::exec) struct GroupedChainSpillObserver<'a> {
-	profile: &'a GroupedChainProfile,
+	kind: GroupedChainSpillObserverKind<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum GroupedChainSpillObserverKind<'a> {
+	Grouped(&'a GroupedChainProfile),
+	Node {
+		handle: &'a node_attribution::VocabularyHandle,
+		parent: &'static str,
+		telemetry: &'a Option<Arc<Mutex<TaskTelemetry>>>,
+	},
 }
 
 pub(in crate::exec) struct GroupedChainSubLeafTimer<'a> {
-	profile: &'a GroupedChainProfile,
 	leaf: GroupedChainSubLeaf,
-	started: Instant,
+	kind: GroupedChainSubLeafTimerKind<'a>,
 	finished: bool,
+}
+
+enum GroupedChainSubLeafTimerKind<'a> {
+	Grouped {
+		profile: &'a GroupedChainProfile,
+		started: Instant,
+	},
+	Node {
+		handle: &'a node_attribution::VocabularyHandle,
+		parent: &'static str,
+		telemetry: &'a Option<Arc<Mutex<TaskTelemetry>>>,
+		token: Option<node_attribution::StageToken>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -447,7 +470,9 @@ impl GroupedChainProfile {
 	}
 
 	pub(in crate::exec) fn spill_observer(&self) -> GroupedChainSpillObserver<'_> {
-		GroupedChainSpillObserver { profile: self }
+		GroupedChainSpillObserver {
+			kind: GroupedChainSpillObserverKind::Grouped(self),
+		}
 	}
 
 	fn begin_sub_leaf(
@@ -473,9 +498,11 @@ impl GroupedChainProfile {
 		state.active_sub_leaf = Some(leaf);
 		drop(state);
 		Ok(GroupedChainSubLeafTimer {
-			profile: self,
 			leaf,
-			started,
+			kind: GroupedChainSubLeafTimerKind::Grouped {
+				profile: self,
+				started,
+			},
 			finished: false,
 		})
 	}
@@ -1051,11 +1078,50 @@ impl GroupedChainProfileTimer<'_> {
 }
 
 impl GroupedChainSpillObserver<'_> {
+	pub(in crate::exec) fn for_node_stage<'a>(
+		handle: &'a node_attribution::VocabularyHandle,
+		parent: &'static str,
+		telemetry: &'a Option<Arc<Mutex<TaskTelemetry>>>,
+	) -> GroupedChainSpillObserver<'a> {
+		GroupedChainSpillObserver {
+			kind: GroupedChainSpillObserverKind::Node {
+				handle,
+				parent,
+				telemetry,
+			},
+		}
+	}
+
 	pub(in crate::exec) fn begin(
 		&self,
 		leaf: GroupedChainSubLeaf,
 	) -> Result<GroupedChainSubLeafTimer<'_>, ExecutionError> {
-		self.profile.begin_sub_leaf(leaf)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.begin_sub_leaf(leaf),
+			GroupedChainSpillObserverKind::Node {
+				handle,
+				parent,
+				telemetry,
+			} => {
+				let token = node_attribution::open_substage(handle, parent, leaf.name(), telemetry)
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: format!(
+							"node spill refinement {} could not open under {parent}",
+							leaf.name()
+						),
+					})?;
+				Ok(GroupedChainSubLeafTimer {
+					leaf,
+					kind: GroupedChainSubLeafTimerKind::Node {
+						handle,
+						parent,
+						telemetry,
+						token: Some(token),
+					},
+					finished: false,
+				})
+			}
+		}
 	}
 
 	pub(in crate::exec) fn record_written_page(
@@ -1064,42 +1130,83 @@ impl GroupedChainSpillObserver<'_> {
 		page_index: usize,
 		ciphertext_len: usize,
 	) -> Result<(), ExecutionError> {
-		self.profile
-			.record_written_page(spill_id, page_index, ciphertext_len)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => {
+				profile.record_written_page(spill_id, page_index, ciphertext_len)
+			}
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 
 	pub(in crate::exec) fn record_physical_write(
 		&self,
 		bytes: usize,
 	) -> Result<(), ExecutionError> {
-		self.profile.record_physical_write(bytes)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.record_physical_write(bytes),
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 
 	pub(in crate::exec) fn record_physical_read(&self, bytes: usize) -> Result<(), ExecutionError> {
-		self.profile.record_physical_read(bytes)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.record_physical_read(bytes),
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 
-	pub(in crate::exec) fn record_plaintext_cache(&self, hit: bool) -> Result<(), ExecutionError> {
-		self.profile.record_cache_event(true, hit)
+	pub(in crate::exec) fn record_plaintext_cache(
+		&self,
+		hit: bool,
+		bytes: u64,
+	) -> Result<(), ExecutionError> {
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => {
+				profile.record_cache_event(true, hit)
+			}
+			GroupedChainSpillObserverKind::Node { handle, parent, .. } => {
+				node_attribution::record_spill_cache_event(handle, parent, false, hit, bytes)
+			}
+		}
 	}
 
-	pub(in crate::exec) fn record_decoded_cache(&self, hit: bool) -> Result<(), ExecutionError> {
-		self.profile.record_cache_event(false, hit)
+	pub(in crate::exec) fn record_decoded_cache(
+		&self,
+		hit: bool,
+		bytes: u64,
+	) -> Result<(), ExecutionError> {
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => {
+				profile.record_cache_event(false, hit)
+			}
+			GroupedChainSpillObserverKind::Node { handle, parent, .. } => {
+				node_attribution::record_spill_cache_event(handle, parent, true, hit, bytes)
+			}
+		}
 	}
 
 	pub(in crate::exec) fn record_decode(&self) -> Result<(), ExecutionError> {
-		self.profile.record_decode()
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.record_decode(),
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 
 	pub(in crate::exec) fn record_branch(&self, resident: bool) -> Result<(), ExecutionError> {
-		self.profile.record_branch(resident)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.record_branch(resident),
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 
 	pub(in crate::exec) fn record_pin_outcome(
 		&self,
 		outcome: GroupedChainPinOutcome,
 	) -> Result<(), ExecutionError> {
-		self.profile.record_pin_outcome(outcome)
+		match self.kind {
+			GroupedChainSpillObserverKind::Grouped(profile) => profile.record_pin_outcome(outcome),
+			GroupedChainSpillObserverKind::Node { .. } => Ok(()),
+		}
 	}
 }
 
@@ -1114,8 +1221,33 @@ impl GroupedChainSubLeafTimer<'_> {
 		bytes: u64,
 		pages: u64,
 	) -> Result<(), ExecutionError> {
-		self.profile
-			.finish_sub_leaf(self.leaf, self.started, rows, bytes, pages)?;
+		match &mut self.kind {
+			GroupedChainSubLeafTimerKind::Grouped { profile, started } => {
+				profile.finish_sub_leaf(self.leaf, *started, rows, bytes, pages)?;
+			}
+			GroupedChainSubLeafTimerKind::Node {
+				handle,
+				parent,
+				telemetry,
+				token,
+			} => {
+				node_attribution::record_spill_subleaf_observation(
+					handle,
+					parent,
+					self.leaf.name(),
+					rows,
+					bytes,
+					pages,
+				)?;
+				let token = token.take().ok_or_else(|| ExecutionError::Kernel {
+					message: format!(
+						"node spill refinement {} was already closed",
+						self.leaf.name()
+					),
+				})?;
+				node_attribution::close_stage(token, telemetry);
+			}
+		}
 		self.finished = true;
 		Ok(())
 	}
@@ -1140,7 +1272,8 @@ impl Drop for GroupedChainSubLeafTimer<'_> {
 		if self.finished {
 			return;
 		}
-		if let Ok(mut state) = self.profile.state.lock()
+		if let GroupedChainSubLeafTimerKind::Grouped { profile, .. } = &self.kind
+			&& let Ok(mut state) = profile.state.lock()
 			&& state.active_sub_leaf == Some(self.leaf)
 		{
 			state.active_sub_leaf = None;
@@ -1388,8 +1521,12 @@ mod tests {
 			.expect("written page");
 		observer.record_physical_write(20).expect("write bytes");
 		observer.record_physical_read(40).expect("read bytes");
-		observer.record_plaintext_cache(false).expect("plain miss");
-		observer.record_decoded_cache(false).expect("decoded miss");
+		observer
+			.record_plaintext_cache(false, 0)
+			.expect("plain miss");
+		observer
+			.record_decoded_cache(false, 0)
+			.expect("decoded miss");
 		observer.record_decode().expect("decode");
 		observer.record_branch(false).expect("streamed branch");
 		observer

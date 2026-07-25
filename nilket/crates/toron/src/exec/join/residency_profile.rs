@@ -1186,6 +1186,8 @@ mod tests {
 			writer_scratch_peak_bytes: guard,
 			page_reserve_bytes: 0,
 			cache_payload_bytes: 0,
+			cache_cap_bytes: 0,
+			cache_peak_bytes: 0,
 			pinned_decoded_bytes: 0,
 			page_metadata_bytes: Some(0),
 			cache_metadata_bytes: Some(0),

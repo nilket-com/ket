@@ -296,6 +296,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/catalog.rs",
 				"crates/toron/src/distributed/budget.rs",
 				"crates/toron/tests/config_test.rs",
+				// ADR 509: query-neutral ownership accounting for the partitioned build gate.
+				"crates/toron/src/exec/join/partitioned_build_profile.rs",
 				// ADR 463: the worker config owns the coordinator query budget;
 				// listener fixtures construct the widened worker config.
 				"crates/toron/src/config.rs",
