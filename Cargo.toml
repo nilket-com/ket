@@ -20,6 +20,7 @@ image = { version = "0.25.10", default-features = false }
 imara-diff = "0.2.0"
 memchr = "2.8.0"
 libc = "0.2.177"
+notify = "8.2.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10.0"
 ra_ap_base_db = "0.0.342"

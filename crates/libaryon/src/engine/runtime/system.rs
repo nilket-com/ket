@@ -2212,7 +2212,7 @@ mod tests {
 		spawn_test_engine_with_sql, temp_test_path,
 	};
 	use crate::engine::undo::TextDelta;
-	use crate::engine::{EditorMode, GutterNumbering, MouseIntent, Theme};
+	use crate::engine::{EditorMode, GitRefreshMode, GutterNumbering, MouseIntent, Theme};
 	use crate::svp::SvpResolver;
 	use crate::svp::projector::HighlightProjector;
 	use crate::svp::rust_highlight::TokenCategory;
@@ -5002,6 +5002,66 @@ mod tests {
 		handle.join().expect("engine thread exits");
 		let _ = fs::remove_dir_all(repo_a);
 		let _ = fs::remove_dir_all(repo_b);
+	}
+
+	#[test]
+	fn engine_poll_refreshes_without_a_frontend_timer() {
+		use std::time::{Duration, Instant};
+
+		let repo = temp_test_path("git-engine-poll");
+		fs::create_dir_all(&repo).expect("create git fixture");
+		let initialized = Command::new("git")
+			.args(["init", "--quiet"])
+			.current_dir(&repo)
+			.status()
+			.expect("run git init");
+		assert!(initialized.success(), "git init failed");
+		fs::write(repo.join("main.rs"), "fn main() {}\n").expect("write source");
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(true, false, None);
+		let _disabled = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::SetGitRefresh(GitRefreshMode::Disabled),
+		);
+		let _loaded = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(repo.join("main.rs").to_string_lossy().into_owned()),
+		);
+		let _panel = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::GitStatus);
+
+		// Create the change before observation starts. Only the engine-owned
+		// interval can discover it; neither frontend participates in this test.
+		fs::write(repo.join("before-observation.txt"), "dirty\n").expect("write dirty file");
+		let _interval = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::SetGitRefresh(GitRefreshMode::Interval(1)),
+		);
+
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let mut observed = false;
+		while Instant::now() < deadline {
+			let Ok(viewport) = rx_view.recv_timeout(Duration::from_millis(250)) else {
+				continue;
+			};
+			let Some(panel) = viewport.panes.iter().find(|pane| pane.is_git_status_panel) else {
+				continue;
+			};
+			if pane_text(&viewport, panel.pane_id).contains("before-observation.txt") {
+				observed = true;
+				break;
+			}
+		}
+		assert!(
+			observed,
+			"libaryon must poll Git status without a frontend-generated tick"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("engine thread exits");
+		let _ = fs::remove_dir_all(repo);
 	}
 
 	/// Waits until the background metric scan has published an exact line count.

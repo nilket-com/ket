@@ -465,10 +465,10 @@ pub enum EditorCommand {
 pub enum GitRefreshMode {
 	/// No timer and no filesystem observer.
 	Disabled,
-	/// Filesystem observation without a timer. Frontends without observation
-	/// support fall back to the default polling interval.
+	/// Filesystem observation without a regular timer. If native observation
+	/// is unavailable, the engine falls back to the default polling interval.
 	Watch,
-	/// Filesystem observation where supported, plus polling at this interval.
+	/// Filesystem observation where available, plus polling at this interval.
 	Interval(u64),
 }
 

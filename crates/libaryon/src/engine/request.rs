@@ -20,6 +20,8 @@ pub(crate) enum InternalEvent {
 	PathCompletion(super::input::PathCompletionResponse),
 	RuneCompile(Box<super::rune_host::SourceCompileResult>),
 	JobCompleted(JobId),
+	GitObservationChanged,
+	RefreshGitStatus,
 }
 
 /// Typed command ingress for a running editor engine.

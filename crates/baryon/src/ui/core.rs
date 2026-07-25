@@ -74,7 +74,6 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) minimap: MinimapController,
 	pub(super) markdown_preview: MarkdownPreviewController,
 	pub(super) diff_bridge: super::diff::DiffBridgeController,
-	last_git_refresh: Instant,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -101,7 +100,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 			minimap: MinimapController::new(),
 			markdown_preview: MarkdownPreviewController::new(),
 			diff_bridge: super::diff::DiffBridgeController::new(),
-			last_git_refresh: Instant::now(),
 		}
 	}
 
@@ -181,21 +179,6 @@ impl<B: Backend + io::Write> Frontend<B> {
 			{
 				self.send_command(EditorCommand::CheckFileReload);
 				last_reload_check = Instant::now();
-			}
-			if !self.has_pending_requests()
-				&& self
-					.current_viewport
-					.as_ref()
-					.is_some_and(|view| view.panes.iter().any(|pane| pane.is_git_status_panel))
-				&& self.current_viewport.as_ref().is_some_and(|view| {
-					view.git_refresh_mode
-						.poll_seconds(false)
-						.is_some_and(|seconds| {
-							self.last_git_refresh.elapsed() >= Duration::from_secs(seconds)
-						})
-				}) {
-				self.send_command(EditorCommand::RefreshGitStatus);
-				self.last_git_refresh = Instant::now();
 			}
 			if !self.has_pending_requests() && event::poll(Duration::from_millis(16))? {
 				loop {

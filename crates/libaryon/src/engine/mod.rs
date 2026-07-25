@@ -7,6 +7,7 @@ mod event_subscribers;
 mod file_browser;
 mod folding;
 mod git;
+mod git_observer;
 mod host;
 mod host_event;
 pub mod index;

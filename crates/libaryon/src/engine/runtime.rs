@@ -30,6 +30,7 @@ use super::file_browser::{
 	collapse_selected_browser_entry_or_parent, create_file_browser_buffer, initialize_file_browser,
 	refresh_file_browser,
 };
+use super::git_observer::GitRefreshController;
 use super::input::{InputContext, InputDispatch};
 use super::jobs::{JobCompletion, JobDispatcher, JobInvocation, JobSpec, MAX_JOB_DELIVERY_STEPS};
 use super::markdown_image_preview::{
@@ -61,7 +62,7 @@ use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct RunLoopSubscriberDispatcher<'a> {
 	fallback: &'a mut (dyn SubscriberDispatcher<EditorSession> + Send),
@@ -1607,6 +1608,12 @@ fn start_git_status_job(
 		.map_err(|error| error.to_string())?;
 	session.git_status_job = Some(job);
 	Ok(())
+}
+
+fn open_git_status_repo_root(session: &EditorSession) -> Option<PathBuf> {
+	let buffer_id = session.output_panels.get("git-status").copied()?;
+	session.layout.view_id_for_buffer(buffer_id)?;
+	session.git_status_repo_root.clone()
 }
 
 fn select_git_status_target_pane(
@@ -3446,10 +3453,31 @@ pub(crate) fn run_engine(engine: Engine) {
 		}) {
 		return;
 	}
-	while let Ok(request) = rx_request.recv() {
+	let mut git_refresh = GitRefreshController::new(tx_internal.clone());
+	loop {
 		if terminate.load(std::sync::atomic::Ordering::Acquire) {
 			break;
 		}
+		git_refresh.reconcile(
+			open_git_status_repo_root(&session),
+			session.git_refresh_mode,
+		);
+		if git_refresh.queue_poll_if_due(Instant::now()).is_err() {
+			break;
+		}
+		let request = match git_refresh.poll_deadline() {
+			Some(deadline) => {
+				match rx_request.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+					Ok(request) => request,
+					Err(mpsc::RecvTimeoutError::Timeout) => continue,
+					Err(mpsc::RecvTimeoutError::Disconnected) => break,
+				}
+			}
+			None => match rx_request.recv() {
+				Ok(request) => request,
+				Err(_) => break,
+			},
+		};
 		let input_dispatch = match request {
 			EngineRequest::Command(command) => InputDispatch {
 				commands: vec![command],
@@ -3476,10 +3504,25 @@ pub(crate) fn run_engine(engine: Engine) {
 					}
 				}
 			}
+			EngineRequest::Internal(InternalEvent::RefreshGitStatus) => InputDispatch {
+				// Observation and timer events may already be queued when the
+				// pane closes or refresh is disabled. Recheck authoritative
+				// session state before turning the event into a command.
+				commands: (session.git_refresh_mode.watch_enabled()
+					&& open_git_status_repo_root(&session).is_some())
+				.then_some(EditorCommand::RefreshGitStatus)
+				.into_iter()
+				.collect(),
+				..InputDispatch::default()
+			},
 			EngineRequest::Internal(event) => {
 				let mut needs_render = match event {
 					InternalEvent::Refresh => true,
 					InternalEvent::DrainEvents => false,
+					InternalEvent::GitObservationChanged => false,
+					InternalEvent::RefreshGitStatus => {
+						unreachable!("Git refresh events enter the command path")
+					}
 					InternalEvent::HydrationCompleted(buffer) => {
 						handle_hydration_completed(&mut session, buffer)
 					}
