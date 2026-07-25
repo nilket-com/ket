@@ -2,6 +2,7 @@ use super::partitioned_build_profile::PartitionedBuildResidencyProfile;
 use super::residency_profile::{
 	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
 };
+use super::spill::CoalescedPageIndexMode;
 use super::stage_attribution;
 use super::*;
 use crate::exec::node_attribution;
@@ -24,6 +25,9 @@ const LOCAL_RUNTIME_FILTER_ABLATION_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILT
 const PHYSICAL_SCAN_BUILD_ENV: &str = "TORON_TPCH_PHYSICAL_SCAN_BUILD";
 const RETAIN_FITTING_SCAN_BUILD_ENV: &str = "TORON_TPCH_RETAIN_FITTING_SCAN_BUILD";
 const PARTITIONED_BUILD_SPILL_PROFILE_ENV: &str = "TORON_PARTITIONED_BUILD_SPILL_PROFILE";
+const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV: &str =
+	"TORON_PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH";
+const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_DEFAULT: bool = false;
 
 fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -53,6 +57,33 @@ fn partitioned_build_spill_profile_enabled_from_env(value: Option<&str>) -> bool
 fn partitioned_build_spill_profile_enabled() -> bool {
 	partitioned_build_spill_profile_enabled_from_env(
 		std::env::var(PARTITIONED_BUILD_SPILL_PROFILE_ENV)
+			.ok()
+			.as_deref(),
+	)
+}
+
+fn coalesced_page_index_mode_from_env(
+	value: Option<&str>,
+) -> Result<CoalescedPageIndexMode, ExecutionError> {
+	let normalized = value.map(|value| value.trim().to_ascii_lowercase());
+	match normalized.as_deref() {
+		Some("1" | "true" | "yes" | "on") => Ok(CoalescedPageIndexMode::IndexAtFlush),
+		Some("0" | "false" | "no" | "off") => Ok(CoalescedPageIndexMode::RebuildAfterWrite),
+		None if PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_DEFAULT => {
+			Ok(CoalescedPageIndexMode::IndexAtFlush)
+		}
+		None => Ok(CoalescedPageIndexMode::RebuildAfterWrite),
+		Some(value) => Err(ExecutionError::Kernel {
+			message: format!(
+				"{PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV} must be one of 0/false/no/off or 1/true/yes/on, got {value:?}"
+			),
+		}),
+	}
+}
+
+fn coalesced_page_index_mode() -> Result<CoalescedPageIndexMode, ExecutionError> {
+	coalesced_page_index_mode_from_env(
+		std::env::var(PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV)
 			.ok()
 			.as_deref(),
 	)
@@ -1493,7 +1524,7 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::exec) enum Join0ChunkRoute {
 	/// Partitioned streamed scan build, scan probe. Spills per completed partition group.
-	PartitionedScanBuild,
+	PartitionedScanBuild { exchange: bool },
 	/// Monolithic spilled scan build inside the scan-probe helper.
 	SpilledScanBuild,
 	/// Partitioned materialized build, scan probe. Spills per completed partition group.
@@ -1548,6 +1579,7 @@ pub(in crate::exec) enum Join0SpillCadence {
 /// boundary between them to bracket.
 fn correlated_scalar_variants(
 	partitioned_build_spill_profile: bool,
+	index_mode: CoalescedPageIndexMode,
 ) -> Vec<node_attribution::VocabularyVariant> {
 	use node_attribution::{RequiredStage, RequiredStages, SpillCounterKind, VocabularyVariant};
 	// Derived from this handler's own grounding, not inherited. The first profile declared the 500 ms
@@ -1577,13 +1609,16 @@ fn correlated_scalar_variants(
 		"join0_group_open",
 		"join0_group_cleanup",
 	];
-	const PARTITIONED_SCAN_BUILD_REFINEMENTS: &[&str] = &[
+	const PARTITIONED_SCAN_BUILD_WRITE_REFINEMENTS: &[&str] = &[
 		"write_scan_decode",
-		"write_partition_routing",
+		"write_active_group_partitioning",
+		"write_page_key_extraction",
 		"write_ipc_encode",
 		"write_encryption",
 		"write_physical_write",
 		"write_finish_fsync",
+	];
+	const PARTITIONED_SCAN_BUILD_REBUILD_REFINEMENTS: &[&str] = &[
 		"read_physical_read",
 		"read_decrypt",
 		"read_ipc_decode",
@@ -1591,7 +1626,8 @@ fn correlated_scalar_variants(
 		"read_index_rebuild_cpu",
 	];
 	[
-		Join0ChunkRoute::PartitionedScanBuild,
+		Join0ChunkRoute::PartitionedScanBuild { exchange: false },
+		Join0ChunkRoute::PartitionedScanBuild { exchange: true },
 		Join0ChunkRoute::SpilledScanBuild,
 		Join0ChunkRoute::PartitionedMaterializedScanProbe,
 		Join0ChunkRoute::SpilledBuildScanProbe,
@@ -1625,16 +1661,34 @@ fn correlated_scalar_variants(
 				replay: None,
 			}));
 		}
-		if route == Join0ChunkRoute::PartitionedScanBuild && partitioned_build_spill_profile {
-			required.extend(
-				PARTITIONED_SCAN_BUILD_REFINEMENTS
-					.iter()
-					.map(|name| RequiredStage {
-						name,
-						parent: Some("join0_build"),
-						replay: None,
-					}),
-			);
+		if let Join0ChunkRoute::PartitionedScanBuild { exchange } = route
+			&& partitioned_build_spill_profile
+		{
+			required.extend(PARTITIONED_SCAN_BUILD_WRITE_REFINEMENTS.iter().map(|name| {
+				RequiredStage {
+					name,
+					parent: Some("join0_build"),
+					replay: None,
+				}
+			}));
+			if exchange {
+				required.push(RequiredStage {
+					name: "write_exchange_repartition",
+					parent: Some("join0_build"),
+					replay: None,
+				});
+			}
+			if index_mode == CoalescedPageIndexMode::RebuildAfterWrite {
+				required.extend(
+					PARTITIONED_SCAN_BUILD_REBUILD_REFINEMENTS
+						.iter()
+						.map(|name| RequiredStage {
+							name,
+							parent: Some("join0_build"),
+							replay: None,
+						}),
+				);
+			}
 		}
 		VocabularyVariant {
 			name: route.vocabulary_name(),
@@ -1649,7 +1703,7 @@ fn correlated_scalar_variants(
 impl Join0ChunkRoute {
 	pub(in crate::exec) fn spill_cadence(self) -> Join0SpillCadence {
 		match self {
-			Self::PartitionedScanBuild
+			Self::PartitionedScanBuild { .. }
 			| Self::PartitionedMaterializedScanProbe
 			| Self::PartitionedMaterializedProbe => Join0SpillCadence::PerGroup,
 			Self::SpilledScanBuild
@@ -1664,7 +1718,12 @@ impl Join0ChunkRoute {
 	/// never left guessing which handler a bare route name belongs to.
 	fn vocabulary_name(self) -> &'static str {
 		match self {
-			Self::PartitionedScanBuild => "correlated_scalar_partitioned_scan_build",
+			Self::PartitionedScanBuild { exchange: true } => {
+				"correlated_scalar_partitioned_scan_build"
+			}
+			Self::PartitionedScanBuild { exchange: false } => {
+				"correlated_scalar_partitioned_scan_build_no_exchange"
+			}
 			Self::SpilledScanBuild => "correlated_scalar_spilled_scan_build",
 			Self::PartitionedMaterializedScanProbe => {
 				"correlated_scalar_partitioned_materialized_scan_probe"
@@ -4868,8 +4927,9 @@ impl Executor {
 		// Commit happens only once the dispatcher returns the leaf that actually ran.
 		let attribution_telemetry = self.context.task_telemetry.clone();
 		let partitioned_build_spill_profile = partitioned_build_spill_profile_enabled();
+		let coalesced_index_mode = coalesced_page_index_mode()?;
 		let stage_handle = node_attribution::predeclare_stage_vocabulary(|| {
-			correlated_scalar_variants(partitioned_build_spill_profile)
+			correlated_scalar_variants(partitioned_build_spill_profile, coalesced_index_mode)
 		});
 
 		// scalar_prep drives a nested `execute_bound`: the correlated scalar side is frequently a
@@ -4957,6 +5017,7 @@ impl Executor {
 			morsel,
 			None,
 			stage_handle.as_ref(),
+			coalesced_index_mode,
 			|batch| {
 				let accum_stage = stage_handle.as_ref().and_then(|h| {
 					node_attribution::open_stage(h, "repartition_accum", &attribution_telemetry)
@@ -5302,6 +5363,7 @@ impl Executor {
 			morsel,
 			None,
 			None,
+			coalesced_page_index_mode()?,
 			visit_filtered_batch,
 		))
 		.await
@@ -5326,6 +5388,7 @@ impl Executor {
 		morsel: Option<(MorselId, u32)>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
 		stage_handle: Option<&node_attribution::VocabularyHandle>,
+		coalesced_index_mode: CoalescedPageIndexMode,
 		visit_batch: &mut F,
 	) -> Result<Option<Join0ChunkRoute>, ExecutionError>
 	where
@@ -5395,6 +5458,8 @@ impl Executor {
 		}
 
 		let build_started = Instant::now();
+		let partitioned_scan_build_has_exchange = decompose_streaming_scan_probe_input(build_plan)
+			.is_some_and(|input| input.exchange.is_some());
 		if let Some(estimated_build_bytes) = scan_build_estimate
 			&& resident_scan_build.is_none()
 			&& let Some((build_rows, probe_rows, output_rows)) = self
@@ -5415,6 +5480,7 @@ impl Executor {
 					estimated_build_bytes,
 					profile,
 					stage_handle,
+					coalesced_index_mode,
 					&mut *visit_batch,
 				)
 				.await?
@@ -5430,7 +5496,9 @@ impl Executor {
 					output_rows: RowCount::new(output_rows),
 				},
 			);
-			return Ok(Some(Join0ChunkRoute::PartitionedScanBuild));
+			return Ok(Some(Join0ChunkRoute::PartitionedScanBuild {
+				exchange: partitioned_scan_build_has_exchange,
+			}));
 		}
 		if scan_build_estimate.is_some()
 			&& resident_scan_build.is_none()
@@ -5777,6 +5845,7 @@ impl Executor {
 		estimated_build_bytes: u64,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
 		stage_handle: Option<&node_attribution::VocabularyHandle>,
+		coalesced_index_mode: CoalescedPageIndexMode,
 		visit_batch: &mut F,
 	) -> Result<Option<(u64, u64, u64)>, ExecutionError>
 	where
@@ -5836,8 +5905,6 @@ impl Executor {
 			probe_keys,
 			null_safe_keys,
 		)?;
-		let use_primitive_resident_index =
-			!null_safe_keys && matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64);
 		let materialized_output_schema = if probe_columns_first {
 			concat_join_schema(&build_plan.schema(), &probe_plan.schema())
 		} else {
@@ -5862,6 +5929,13 @@ impl Executor {
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
 		let mut total_spill_bytes = 0u64;
+		let lifecycle_enabled = build_residency_profile.is_some();
+		let mut lifecycle_indexed_flush_pages = 0u64;
+		let mut lifecycle_indexed_flush_guard_checks = 0u64;
+		let mut lifecycle_index_rebuild_calls = 0u64;
+		let mut lifecycle_build_physical_read_pages = 0u64;
+		let mut lifecycle_page_rows = Vec::new();
+		let mut lifecycle_page_ciphertext_bytes = Vec::new();
 		for group in 0..group_count {
 			let group_build_timer = profile
 				.map(|profile| profile.begin_leaf(GlobalFoldProfileLeaf::BuildSpillWrite))
@@ -5916,6 +5990,7 @@ impl Executor {
 					build_keys,
 					key_plan,
 					null_safe_keys,
+					coalesced_index_mode,
 					morsel,
 					group_range.start,
 					group_range.end,
@@ -5962,25 +6037,49 @@ impl Executor {
 				if let Some(timer) = finish_timer {
 					timer.finish()?;
 				}
-				spilled.release_write_scratch();
 				group_build_rows = group_build_rows.saturating_add(spilled.input_row_count());
-				if spilled.input_row_count() > 0 {
-					if use_primitive_resident_index {
-						spilled.use_compact_resident_index();
-					}
-					if let Err(error) = spilled
-						.rebuild_index_from_pages_profiled(
-							key_plan,
-							build_keys,
-							null_safe_keys,
-							self.context.task_budget,
-							build_observer.as_ref(),
-						)
-						.await
-					{
-						Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
-						return Err(error);
-					}
+				if let Err(error) = spilled
+					.complete_coalesced_index_after_finish(
+						key_plan,
+						build_keys,
+						null_safe_keys,
+						coalesced_index_mode,
+						self.context.task_budget,
+						build_observer.as_ref(),
+					)
+					.await
+				{
+					Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
+					return Err(error);
+				}
+				if lifecycle_enabled {
+					lifecycle_indexed_flush_pages = lifecycle_indexed_flush_pages
+						.checked_add(spilled.indexed_flush_pages())
+						.ok_or_else(|| ExecutionError::Kernel {
+							message: "partitioned build indexed-flush page total overflowed"
+								.to_string(),
+						})?;
+					lifecycle_indexed_flush_guard_checks = lifecycle_indexed_flush_guard_checks
+						.checked_add(spilled.indexed_flush_guard_checks())
+						.ok_or_else(|| ExecutionError::Kernel {
+							message: "partitioned build indexed-flush guard total overflowed"
+								.to_string(),
+						})?;
+					lifecycle_index_rebuild_calls = lifecycle_index_rebuild_calls
+						.checked_add(spilled.index_rebuild_calls())
+						.ok_or_else(|| ExecutionError::Kernel {
+							message: "partitioned build index-rebuild call total overflowed"
+								.to_string(),
+						})?;
+					lifecycle_build_physical_read_pages = lifecycle_build_physical_read_pages
+						.checked_add(spilled.physical_read_pages())
+						.ok_or_else(|| ExecutionError::Kernel {
+							message: "partitioned build physical-read page total overflowed"
+								.to_string(),
+						})?;
+					let (page_rows, ciphertext_bytes) = spilled.page_geometry();
+					lifecycle_page_rows.extend(page_rows);
+					lifecycle_page_ciphertext_bytes.extend(ciphertext_bytes);
 				}
 			}
 			if let (Some(residency), Some(before_scratch_release)) =
@@ -6100,6 +6199,27 @@ impl Executor {
 				handle,
 				"partitioned_build_residency",
 				residency.json(),
+			);
+			node_attribution::record_invocation_diagnostic(
+				handle,
+				"partitioned_scan_build_index_lifecycle",
+				serde_json::json!({
+					"mode": coalesced_index_mode,
+					"partition_count": partition_count,
+					"group_count": group_count,
+					"indexed_flush_pages": lifecycle_indexed_flush_pages,
+					"indexed_flush_guard_checks": lifecycle_indexed_flush_guard_checks,
+					"index_rebuild_calls": lifecycle_index_rebuild_calls,
+					"build_physical_read_pages": lifecycle_build_physical_read_pages,
+					"page_count": lifecycle_page_rows.len(),
+					"page_rows": lifecycle_page_rows,
+					"page_ciphertext_bytes": lifecycle_page_ciphertext_bytes,
+					"spill_bytes": total_spill_bytes,
+					"live_guard_checked_after_every_indexed_flush":
+						coalesced_index_mode == CoalescedPageIndexMode::IndexAtFlush
+							&& lifecycle_indexed_flush_guard_checks
+								== lifecycle_indexed_flush_pages,
+				}),
 			);
 		}
 		record_join_spill_observation(
@@ -6782,6 +6902,7 @@ impl Executor {
 		write_build_keys: &[crate::ir::ColumnOrdinal],
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
+		coalesced_index_mode: CoalescedPageIndexMode,
 		morsel: Option<(MorselId, u32)>,
 		partition_start: usize,
 		partition_end: usize,
@@ -6867,7 +6988,12 @@ impl Executor {
 					})
 					.transpose()?;
 				let exchange_timer = grouped_chain_observer
-					.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+					.map(|observer| {
+						observer.begin_node_named(
+							GroupedChainSubLeaf::WritePartitionRouting,
+							"write_exchange_repartition",
+						)
+					})
 					.transpose()?;
 				let exchange_batches = self.repartition_exchange_batch(
 					&batch,
@@ -6891,6 +7017,7 @@ impl Executor {
 						partition_count,
 						key_plan,
 						null_safe_keys,
+						coalesced_index_mode,
 						partition_start,
 						partition_end,
 						enforce_group_spill_budget,
@@ -6988,6 +7115,7 @@ impl Executor {
 					partition_count,
 					key_plan,
 					null_safe_keys,
+					coalesced_index_mode,
 					partition_start,
 					partition_end,
 					enforce_group_spill_budget,
@@ -7011,10 +7139,11 @@ impl Executor {
 		for spilled in partitioned_builds.iter_mut().filter_map(Option::as_mut) {
 			let before = spilled.spill_bytes();
 			spilled
-				.flush_unindexed_page_buffer(
+				.flush_coalesced_page_buffer(
 					key_plan,
 					write_build_keys,
 					null_safe_keys,
+					coalesced_index_mode,
 					self.context.task_budget,
 					grouped_chain_observer,
 				)
@@ -7060,6 +7189,7 @@ impl Executor {
 		partition_count: u32,
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
+		coalesced_index_mode: CoalescedPageIndexMode,
 		partition_start: usize,
 		partition_end: usize,
 		enforce_group_spill_budget: bool,
@@ -7067,7 +7197,12 @@ impl Executor {
 		grouped_chain_observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
 		let routing_timer = grouped_chain_observer
-			.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+			.map(|observer| {
+				observer.begin_node_named(
+					GroupedChainSubLeaf::WritePartitionRouting,
+					"write_active_group_partitioning",
+				)
+			})
 			.transpose()?;
 		let buckets = precompute_join_partition_buckets(
 			batch,
@@ -7096,23 +7231,25 @@ impl Executor {
 			let before = spilled.spill_bytes();
 			if let Some(retained_columns) = retained_columns {
 				spilled
-					.write_projected_batch_chunks_unindexed_profiled(
+					.write_projected_batch_chunks_coalesced_profiled(
 						&partitioned,
 						retained_columns,
 						key_plan,
 						write_build_keys,
 						null_safe_keys,
+						coalesced_index_mode,
 						self.context.task_budget,
 						grouped_chain_observer,
 					)
 					.await?;
 			} else {
 				spilled
-					.write_batch_chunks_unindexed_profiled(
+					.write_batch_chunks_coalesced_profiled(
 						&partitioned,
 						key_plan,
 						write_build_keys,
 						null_safe_keys,
+						coalesced_index_mode,
 						self.context.task_budget,
 						grouped_chain_observer,
 					)
@@ -8370,6 +8507,7 @@ impl Executor {
 		morsel: Option<(MorselId, u32)>,
 		profile: Option<&GlobalFoldJoinFilterProfile>,
 		stage_handle: Option<&node_attribution::VocabularyHandle>,
+		coalesced_index_mode: CoalescedPageIndexMode,
 		mut visit_batch: F,
 	) -> Result<Option<Join0ChunkRoute>, ExecutionError>
 	where
@@ -8424,6 +8562,7 @@ impl Executor {
 						morsel,
 						profile,
 						stage_handle,
+						coalesced_index_mode,
 						&mut visit_batch,
 					)
 					.await?
@@ -8452,6 +8591,7 @@ impl Executor {
 					morsel,
 					profile,
 					stage_handle,
+					coalesced_index_mode,
 					&mut visit_batch,
 				)
 				.await?
@@ -8479,6 +8619,7 @@ impl Executor {
 						morsel,
 						profile,
 						stage_handle,
+						coalesced_index_mode,
 						&mut visit_batch,
 					)
 					.await?
@@ -8510,6 +8651,7 @@ impl Executor {
 					morsel,
 					profile,
 					stage_handle,
+					coalesced_index_mode,
 					&mut visit_batch,
 				)
 				.await?
@@ -9831,6 +9973,7 @@ impl Executor {
 			morsel,
 			profile_ref,
 			None,
+			coalesced_page_index_mode()?,
 			|batch| {
 				let batch = if let Some((exprs, project_schema)) = project {
 					let cols = self.evaluate_bound_program(exprs, &batch)?;
@@ -13202,6 +13345,7 @@ impl Executor {
 						&write_build_keys,
 						terminal_key_plan,
 						false,
+						CoalescedPageIndexMode::RebuildAfterWrite,
 						build_morsel.or(morsel),
 						group_range.start,
 						group_range.end,
@@ -14511,6 +14655,7 @@ impl Executor {
 			spec.partition_count,
 			spec.key_plan,
 			false,
+			CoalescedPageIndexMode::RebuildAfterWrite,
 			0,
 			probe_partition_count,
 			false,
@@ -16566,6 +16711,7 @@ impl Executor {
 			morsel,
 			None,
 			None,
+			coalesced_page_index_mode()?,
 			|batch| {
 				for (_partition, partitioned) in
 					self.repartition_exchange_batch(&batch, *partition_count, key)?
@@ -16942,6 +17088,7 @@ impl Executor {
 					write_build_keys,
 					key_plan,
 					null_safe_keys,
+					CoalescedPageIndexMode::RebuildAfterWrite,
 					morsel,
 					group_range.start,
 					group_range.end,
@@ -17114,6 +17261,7 @@ impl Executor {
 				write_build_keys,
 				key_plan,
 				null_safe_keys,
+				CoalescedPageIndexMode::RebuildAfterWrite,
 				morsel,
 				0,
 				partition_count_usize,
@@ -17517,6 +17665,7 @@ impl Executor {
 					write_build_keys,
 					key_plan,
 					null_safe_keys,
+					CoalescedPageIndexMode::RebuildAfterWrite,
 					morsel,
 					group_range.start,
 					group_range.end,
@@ -19333,23 +19482,71 @@ mod tests {
 	}
 
 	#[test]
+	fn coalesced_page_index_mode_is_explicit_and_fails_closed_on_invalid_values() {
+		assert_eq!(
+			coalesced_page_index_mode_from_env(None).expect("compiled default"),
+			CoalescedPageIndexMode::RebuildAfterWrite
+		);
+		for value in ["0", " false ", "NO", "off"] {
+			assert_eq!(
+				coalesced_page_index_mode_from_env(Some(value)).expect("control value"),
+				CoalescedPageIndexMode::RebuildAfterWrite
+			);
+		}
+		for value in ["1", " true ", "YES", "on"] {
+			assert_eq!(
+				coalesced_page_index_mode_from_env(Some(value)).expect("candidate value"),
+				CoalescedPageIndexMode::IndexAtFlush
+			);
+		}
+		assert!(coalesced_page_index_mode_from_env(Some("enable")).is_err());
+		assert!(coalesced_page_index_mode_from_env(Some("")).is_err());
+	}
+
+	#[test]
 	fn partitioned_build_spill_refinements_are_required_only_in_the_profile_arm() {
-		let has_build_read = |enabled| {
-			let variant = correlated_scalar_variants(enabled)
-				.into_iter()
-				.find(|variant| variant.name == "correlated_scalar_partitioned_scan_build")
-				.expect("partitioned scan-build variant");
+		let required_for = |enabled, name| {
+			let variant =
+				correlated_scalar_variants(enabled, CoalescedPageIndexMode::RebuildAfterWrite)
+					.into_iter()
+					.find(|variant| variant.name == name)
+					.expect("partitioned scan-build variant");
 			let node_attribution::RequiredStages::Owned(required) = variant.required_stages else {
 				panic!("correlated scalar requirements are runtime-owned");
 			};
+			required
+		};
+		let has = |required: &[node_attribution::RequiredStage], name| {
 			required.iter().any(|stage| {
-				stage.name == "read_physical_read"
-					&& stage.parent == Some("join0_build")
-					&& stage.replay.is_none()
+				stage.name == name && stage.parent == Some("join0_build") && stage.replay.is_none()
 			})
 		};
-		assert!(!has_build_read(false));
-		assert!(has_build_read(true));
+		let disabled = required_for(false, "correlated_scalar_partitioned_scan_build");
+		assert!(!has(&disabled, "read_physical_read"));
+		let exchange = required_for(true, "correlated_scalar_partitioned_scan_build");
+		assert!(has(&exchange, "read_physical_read"));
+		assert!(has(&exchange, "write_exchange_repartition"));
+		assert!(has(&exchange, "write_active_group_partitioning"));
+		assert!(has(&exchange, "write_page_key_extraction"));
+		assert!(!has(&exchange, "write_partition_routing"));
+
+		let no_exchange =
+			required_for(true, "correlated_scalar_partitioned_scan_build_no_exchange");
+		assert!(!has(&no_exchange, "write_exchange_repartition"));
+		assert!(has(&no_exchange, "write_active_group_partitioning"));
+		assert!(has(&no_exchange, "write_page_key_extraction"));
+
+		let candidate = correlated_scalar_variants(true, CoalescedPageIndexMode::IndexAtFlush)
+			.into_iter()
+			.find(|variant| variant.name == "correlated_scalar_partitioned_scan_build")
+			.expect("candidate partitioned scan-build variant");
+		let node_attribution::RequiredStages::Owned(candidate_required) = candidate.required_stages
+		else {
+			panic!("correlated scalar requirements are runtime-owned");
+		};
+		assert!(has(&candidate_required, "write_page_key_extraction"));
+		assert!(!has(&candidate_required, "read_physical_read"));
+		assert!(!has(&candidate_required, "read_index_rebuild_cpu"));
 	}
 
 	#[test]
@@ -20536,10 +20733,18 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, None, None, |batch| {
-				visited.push(batch);
-				Ok(())
-			})
+			.try_visit_streaming_join0_chunks(
+				&join,
+				None,
+				None,
+				None,
+				None,
+				CoalescedPageIndexMode::RebuildAfterWrite,
+				|batch| {
+					visited.push(batch);
+					Ok(())
+				},
+			)
 			.await
 			.expect("stream scan probe");
 
@@ -20718,10 +20923,18 @@ mod tests {
 		let mut visited = Vec::new();
 
 		let matched = executor
-			.try_visit_streaming_join0_chunks(&join, None, None, None, None, |batch| {
-				visited.push(batch);
-				Ok(())
-			})
+			.try_visit_streaming_join0_chunks(
+				&join,
+				None,
+				None,
+				None,
+				None,
+				CoalescedPageIndexMode::RebuildAfterWrite,
+				|batch| {
+					visited.push(batch);
+					Ok(())
+				},
+			)
 			.await
 			.expect("stream left scan probe");
 
@@ -23078,7 +23291,8 @@ mod tests {
 	fn every_join0_leaf_route_declares_its_spill_cadence() {
 		use Join0ChunkRoute::*;
 		let all = [
-			PartitionedScanBuild,
+			PartitionedScanBuild { exchange: false },
+			PartitionedScanBuild { exchange: true },
 			SpilledScanBuild,
 			PartitionedMaterializedScanProbe,
 			SpilledBuildScanProbe,
@@ -23097,7 +23311,8 @@ mod tests {
 
 		let cadence_of = |route: Join0ChunkRoute| route.spill_cadence();
 		for route in [
-			PartitionedScanBuild,
+			PartitionedScanBuild { exchange: false },
+			PartitionedScanBuild { exchange: true },
 			PartitionedMaterializedScanProbe,
 			PartitionedMaterializedProbe,
 		] {

@@ -337,6 +337,8 @@ pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_reb
 	let manifest = manifest_dir();
 	let streaming = std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs"))
 		.expect("read exec streaming source");
+	let spill = std::fs::read_to_string(manifest.join("src/exec/join/spill.rs"))
+		.expect("read spill source");
 	let owners = brace_blocks_after_marker(
 		&streaming,
 		"async fn try_visit_partitioned_streamed_inner_scan_build_scan_probe_chunks",
@@ -344,39 +346,43 @@ pub(crate) fn adr439_partitioned_scan_build_opts_into_primitive_index_before_reb
 	let [(_, owner)] = owners.as_slice() else {
 		panic!("expected exactly one partitioned streamed scan-build owner");
 	};
-
-	let eligibility = owner
-		.find("let use_primitive_resident_index =")
-		.expect("primitive index eligibility in live owner");
-	let non_null_safe = owner[eligibility..]
+	assert!(
+		owner.contains(".complete_coalesced_index_after_finish("),
+		"partitioned scan-build must delegate index completion to the typed lifecycle owner"
+	);
+	let completions = brace_blocks_after_marker(
+		&spill,
+		"pub(in crate::exec) async fn complete_coalesced_index_after_finish",
+	);
+	let [(_, completion)] = completions.as_slice() else {
+		panic!("expected exactly one coalesced index completion owner");
+	};
+	let control = completion
+		.find("CoalescedPageIndexMode::RebuildAfterWrite")
+		.expect("control lifecycle branch");
+	let non_null_safe = completion[control..]
 		.find("!null_safe_keys")
-		.map(|offset| eligibility + offset)
-		.expect("non-null-safe primitive index fence in live owner");
-	let primitive_variants = owner[non_null_safe..]
+		.map(|offset| control + offset)
+		.expect("non-null-safe primitive index fence in completion owner");
+	let primitive_variants = completion[non_null_safe..]
 		.find("matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64)")
 		.map(|offset| non_null_safe + offset)
-		.expect("primitive key-plan fence in live owner");
-	let guarded_opt_in = owner[primitive_variants..]
-		.find("if use_primitive_resident_index")
+		.expect("primitive key-plan fence in completion owner");
+	let opt_in = completion[primitive_variants..]
+		.find("self.use_compact_resident_index();")
 		.map(|offset| primitive_variants + offset)
-		.expect("guarded primitive index opt-in in live owner");
-	let opt_in = owner[guarded_opt_in..]
-		.find("spilled.use_compact_resident_index();")
-		.map(|offset| guarded_opt_in + offset)
-		.expect("compact resident index opt-in in live owner");
-	let rebuild = owner[opt_in..]
+		.expect("compact resident index opt-in in completion owner");
+	let rebuild = completion[opt_in..]
 		.find(".rebuild_index_from_pages_profiled(")
 		.map(|offset| opt_in + offset)
-		.expect("adjacent resident index rebuild in live owner");
+		.expect("adjacent resident index rebuild in completion owner");
 
-	assert!(eligibility < primitive_variants);
-	assert!(eligibility < non_null_safe);
+	assert!(control < non_null_safe);
 	assert!(non_null_safe < primitive_variants);
-	assert!(primitive_variants < guarded_opt_in);
-	assert!(guarded_opt_in < opt_in);
+	assert!(primitive_variants < opt_in);
 	assert!(opt_in < rebuild, "primitive opt-in must precede rebuild");
 	assert!(
-		!owner[opt_in..rebuild].contains("rebuild_index_from_pages"),
+		!completion[opt_in..rebuild].contains("rebuild_index_from_pages"),
 		"no intervening rebuild may bypass the guarded primitive opt-in"
 	);
 	assert!(

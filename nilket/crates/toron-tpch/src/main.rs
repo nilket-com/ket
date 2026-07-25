@@ -561,6 +561,68 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Err(message) => return harness_error(&message),
 	};
 	let paired_switch = paired_switch_from_args(args);
+	let paired_gate = match paired_gate_from_args(args) {
+		Ok(gate) => gate,
+		Err(message) => return harness_error(&message),
+	};
+	let paired_materiality_floor_ms =
+		match optional_positive_f64_flag(args, "--paired-materiality-floor-ms") {
+			Ok(value) => value,
+			Err(message) => return harness_error(&message),
+		};
+	if flag_present(args, "--paired-ablation")
+		&& paired_gate == PairedGate::ShapePreservingSpillIndex
+		&& paired_materiality_floor_ms.is_none()
+	{
+		return harness_error(
+			"--paired-gate shape-preserving-spill-index requires --paired-materiality-floor-ms",
+		);
+	}
+	if flag_present(args, "--paired-ablation")
+		&& paired_gate == PairedGate::ShapePreservingSpillIndex
+	{
+		if queries != vec!["q17"]
+			|| mode != "strict"
+			|| sf != 8.0
+			|| !matches!(data_source, "parquet" | "persisted")
+			|| paired_switch.env != PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV
+			|| paired_switch.on_value != "1"
+			|| paired_switch.off_value != "0"
+			|| paired_materiality_floor_ms != Some(3_554.0)
+			|| runs != 10
+		{
+			return harness_error(
+				"shape-preserving-spill-index requires q17 strict sf=8 persisted data, 10 pairs, \
+				 TORON_PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH=1/0, and the fixed 3554 ms floor",
+			);
+		}
+		let (memory_per_task, memory_provenance) = match gauge_memory_per_task() {
+			Ok(value) => value,
+			Err(message) => return harness_error(&message),
+		};
+		let (spill_bytes_reserved, spill_provenance) = match gauge_spill_bytes_reserved() {
+			Ok(value) => value,
+			Err(message) => return harness_error(&message),
+		};
+		if memory_per_task != 2_147_483_648
+			|| spill_bytes_reserved != 2_147_483_648
+			|| memory_provenance != "explicit"
+			|| spill_provenance != "explicit"
+		{
+			return harness_error(
+				"shape-preserving-spill-index requires explicit 2 GiB memory and spill budgets",
+			);
+		}
+	}
+	// Existing paired rails define `--runs` as child rows. ADR 510's named gate defines it as
+	// adjacent pairs so the approved `--runs 10` command durably emits 20 measured children.
+	let measured_runs = if flag_present(args, "--paired-ablation")
+		&& paired_gate == PairedGate::ShapePreservingSpillIndex
+	{
+		runs.saturating_mul(2)
+	} else {
+		runs
+	};
 	let gate_zero = if flag_present(args, "--paired-ablation") {
 		let default_switch = paired_switch.env == PAIRED_DEFAULT_ENV;
 		if default_switch && queries != vec!["q05"] {
@@ -586,7 +648,25 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		let gate = if default_switch {
 			run_adr449_gate_zero(sf, mode, data_source, &data_dir, &output_dir)
 		} else {
-			run_adr469_plan_gate(queries[0], mode, sf, data_source, &data_dir, &paired_switch)
+			match paired_gate {
+				PairedGate::PlanDistinct => run_adr469_plan_gate(
+					queries[0],
+					mode,
+					sf,
+					data_source,
+					&data_dir,
+					&paired_switch,
+				),
+				PairedGate::ShapePreservingSpillIndex => run_shape_preserving_spill_index_gate(
+					queries[0],
+					mode,
+					sf,
+					data_source,
+					&data_dir,
+					&output_dir,
+					&paired_switch,
+				),
+			}
 		};
 		match gate {
 			Ok(mut record) if record["passed"] == true => {
@@ -602,7 +682,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		None
 	};
 	let sample_journal = if flag_present(args, "--paired-ablation") {
-		if runs % 2 != 0 {
+		if measured_runs % 2 != 0 {
 			return harness_error("--paired-ablation requires an even --runs count");
 		}
 		let gate_fingerprint = gate_zero
@@ -618,10 +698,12 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			sf,
 			data_source,
 			&data_dir,
-			runs,
+			measured_runs,
 			warmup,
 			&gate_fingerprint,
 			&paired_switch,
+			paired_gate,
+			paired_materiality_floor_ms,
 		) {
 			Ok(journal) => Some(journal),
 			Err(message) => return harness_error(&message),
@@ -708,7 +790,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 								Err(message) => break 'cell Err(message),
 							}
 						}
-						for run_index in 0..runs {
+						for run_index in 0..measured_runs {
 							if sample_journal.as_ref().is_some_and(|journal| {
 								journal.contains(query_id, engine.as_str(), run_index as u32, false)
 							}) {
@@ -763,7 +845,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 								Err(message) => break 'cell Err(message),
 							}
 						}
-						for run_index in 0..runs {
+						for run_index in 0..measured_runs {
 							match run_perf_child(
 								PerfEngine::Rune,
 								query_id,
@@ -790,7 +872,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 							query_id,
 							mode,
 							sf,
-							runs,
+							measured_runs,
 							warmup,
 							&output_dir,
 							data_source,
@@ -830,7 +912,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 								Err(message) => break 'cell Err(message),
 							}
 						}
-						for run_index in 0..runs {
+						for run_index in 0..measured_runs {
 							match run_perf_child(
 								PerfEngine::PolarsSql,
 								query_id,
@@ -877,9 +959,14 @@ async fn perf_command(args: &[String]) -> ExitCode {
 
 	apply_duckdb_output_sanity_flags(&mut raw_rows);
 	let baseline_rows = read_baseline_rows(&baseline_path);
-	let summary_rows = summarize_perf_rows(&raw_rows, runs, warmup, &baseline_rows);
+	let summary_rows = summarize_perf_rows(&raw_rows, measured_runs, warmup, &baseline_rows);
 	let summary_rows = if let Some(gate_zero) = gate_zero {
-		match attach_paired_ablation_receipt(summary_rows, runs, gate_zero) {
+		match attach_paired_ablation_receipt(
+			summary_rows,
+			measured_runs,
+			gate_zero,
+			paired_materiality_floor_ms,
+		) {
 			Ok(rows) => rows,
 			Err(message) => return harness_error(&message),
 		}
@@ -1766,6 +1853,7 @@ fn attach_paired_ablation_receipt(
 	mut summaries: Vec<serde_json::Value>,
 	runs: usize,
 	gate_zero: serde_json::Value,
+	fixed_materiality_floor_ms: Option<f64>,
 ) -> Result<Vec<serde_json::Value>, String> {
 	if !gate_zero
 		.get("passed")
@@ -1801,6 +1889,8 @@ fn attach_paired_ablation_receipt(
 		// cohort median: the pool mixes both arms and shrinks the floor by the very
 		// effect under test.
 		let baseline_off_median = median(&mut off_values);
+		let materiality_floor_ms = fixed_materiality_floor_ms
+			.unwrap_or_else(|| MATERIALITY_FLOOR * baseline_off_median.abs());
 		summary["gate_zero"] = gate_zero.clone();
 		summary["paired_ablation"] = serde_json::json!({
 			"differences_off_minus_on_ms": diffs,
@@ -1809,8 +1899,15 @@ fn attach_paired_ablation_receipt(
 			"upper_ms": shift.upper,
 			"pairs": shift.pairs,
 			"baseline_off_median_ms": baseline_off_median,
-			"materiality_floor_ms": MATERIALITY_FLOOR * baseline_off_median.abs(),
-			"material": material_effect(shift.point, baseline_off_median),
+			"materiality_floor_ms": materiality_floor_ms,
+			"materiality_policy": if fixed_materiality_floor_ms.is_some() {
+				"fixed_predeclared"
+			} else {
+				"cohort_relative_10_percent"
+			},
+			"material": shift.point >= materiality_floor_ms,
+			"improving_interval_excludes_zero": shift.lower > 0.0,
+			"activate": shift.lower > 0.0 && shift.point >= materiality_floor_ms,
 		});
 	}
 	Ok(summaries)
@@ -4018,6 +4115,8 @@ fn prepare_paired_ablation_journal(
 	warmup: usize,
 	dataset_fingerprint: &str,
 	switch: &PairedSwitch,
+	paired_gate: PairedGate,
+	fixed_materiality_floor_ms: Option<f64>,
 ) -> Result<PerfSampleJournal, String> {
 	if dataset_fingerprint.is_empty() {
 		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
@@ -4050,6 +4149,8 @@ fn prepare_paired_ablation_journal(
 		"switch_env": switch.env,
 		"switch_on_value": switch.on_value,
 		"switch_off_value": switch.off_value,
+		"paired_gate": paired_gate.as_str(),
+		"fixed_materiality_floor_ms": fixed_materiality_floor_ms,
 	});
 	if manifest_path.exists() {
 		let bytes = std::fs::read(&manifest_path)
@@ -4206,7 +4307,32 @@ struct PairedSwitch {
 	off_value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairedGate {
+	PlanDistinct,
+	ShapePreservingSpillIndex,
+}
+
+impl PairedGate {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::PlanDistinct => "plan-distinct",
+			Self::ShapePreservingSpillIndex => "shape-preserving-spill-index",
+		}
+	}
+}
+
 const PAIRED_DEFAULT_ENV: &str = "TORON_ABLATE_LOCAL_RUNTIME_FILTER";
+const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV: &str =
+	"TORON_PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH";
+
+fn paired_gate_from_args(args: &[String]) -> Result<PairedGate, String> {
+	match flag_value(args, "--paired-gate").unwrap_or("plan-distinct") {
+		"plan-distinct" => Ok(PairedGate::PlanDistinct),
+		"shape-preserving-spill-index" => Ok(PairedGate::ShapePreservingSpillIndex),
+		other => Err(format!("unsupported --paired-gate {other:?}")),
+	}
+}
 
 fn paired_switch_from_args(args: &[String]) -> PairedSwitch {
 	PairedSwitch {
@@ -4270,6 +4396,306 @@ fn run_adr469_plan_gate(
 	}))
 }
 
+fn invocation_diagnostic<'a>(
+	row: &'a serde_json::Value,
+	name: &str,
+) -> Result<&'a serde_json::Value, String> {
+	let invocations = row
+		.pointer("/node_attribution/aggregate_invocations")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| "shape gate row lacks node-attribution invocations".to_string())?;
+	let matches = invocations
+		.iter()
+		.flat_map(|invocation| {
+			invocation
+				.get("diagnostics")
+				.and_then(serde_json::Value::as_array)
+				.into_iter()
+				.flatten()
+		})
+		.filter(|diagnostic| {
+			diagnostic.get("name").and_then(serde_json::Value::as_str) == Some(name)
+		})
+		.collect::<Vec<_>>();
+	if matches.len() != 1 {
+		return Err(format!(
+			"shape gate expected exactly one {name} diagnostic, found {}",
+			matches.len()
+		));
+	}
+	matches[0]
+		.get("value")
+		.ok_or_else(|| format!("shape gate {name} diagnostic lacks value"))
+}
+
+fn required_u64(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+	value
+		.get(field)
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("shape gate field {field} is missing or nonnumeric"))
+}
+
+fn spill_subleaf_rows(row: &serde_json::Value, stage: &str) -> Result<u64, String> {
+	let invocations = row
+		.pointer("/node_attribution/aggregate_invocations")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| "shape gate row lacks node-attribution invocations".to_string())?;
+	let matches = invocations
+		.iter()
+		.flat_map(|invocation| {
+			invocation
+				.get("spill_io")
+				.and_then(serde_json::Value::as_array)
+				.into_iter()
+				.flatten()
+		})
+		.flat_map(|parent| {
+			parent
+				.get("subleaves")
+				.and_then(serde_json::Value::as_array)
+				.into_iter()
+				.flatten()
+		})
+		.filter(|leaf| leaf.get("stage").and_then(serde_json::Value::as_str) == Some(stage))
+		.collect::<Vec<_>>();
+	if matches.len() != 1 {
+		return Err(format!(
+			"shape gate expected exactly one {stage} spill-I/O leaf, found {}",
+			matches.len()
+		));
+	}
+	matches[0]
+		.get("rows")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("shape gate spill-I/O leaf {stage} has nonnumeric rows"))
+}
+
+fn shape_preserving_spill_index_gate_record(
+	on_row: &serde_json::Value,
+	off_row: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+	for (label, row) in [("candidate", on_row), ("control", off_row)] {
+		if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+			return Err(format!("shape gate {label} row did not pass"));
+		}
+		if row
+			.get("dataset_verification")
+			.and_then(serde_json::Value::as_str)
+			!= Some("full_hash")
+		{
+			return Err(format!("shape gate {label} row was not full-hash verified"));
+		}
+	}
+	let build_commit = on_row
+		.get("build_commit")
+		.and_then(serde_json::Value::as_str)
+		.ok_or_else(|| "shape gate candidate row lacks a string build_commit".to_string())?;
+	if build_commit.contains("dirty") || build_commit.is_empty() {
+		return Err("shape gate requires a clean sealed build identity".to_string());
+	}
+	for field in [
+		"build_commit",
+		"dataset_verification",
+		"plan_fingerprint",
+		"digest",
+		"output_schema_fingerprint",
+		"output_row_count",
+		"join_spill_observations",
+		"spill_bytes",
+		"memory_per_task",
+		"memory_per_task_provenance",
+		"spill_bytes_reserved",
+		"spill_bytes_reserved_provenance",
+	] {
+		let on = on_row
+			.get(field)
+			.ok_or_else(|| format!("shape gate candidate row lacks {field}"))?;
+		let off = off_row
+			.get(field)
+			.ok_or_else(|| format!("shape gate control row lacks {field}"))?;
+		if on != off {
+			return Err(format!("shape gate arms disagree on {field}"));
+		}
+	}
+	if on_row
+		.get("memory_per_task_provenance")
+		.and_then(serde_json::Value::as_str)
+		!= Some("explicit")
+		|| on_row
+			.get("spill_bytes_reserved_provenance")
+			.and_then(serde_json::Value::as_str)
+			!= Some("explicit")
+	{
+		return Err("shape gate requires explicit memory and spill budgets".to_string());
+	}
+	let candidate = invocation_diagnostic(on_row, "partitioned_scan_build_index_lifecycle")?;
+	let control = invocation_diagnostic(off_row, "partitioned_scan_build_index_lifecycle")?;
+	let candidate_residency = invocation_diagnostic(on_row, "partitioned_build_residency")?;
+	let control_residency = invocation_diagnostic(off_row, "partitioned_build_residency")?;
+	for field in [
+		"partition_count",
+		"group_count",
+		"page_count",
+		"page_rows",
+		"page_ciphertext_bytes",
+		"spill_bytes",
+	] {
+		if candidate.get(field) != control.get(field) {
+			return Err(format!("shape gate lifecycle arms disagree on {field}"));
+		}
+	}
+	let partition_count = required_u64(candidate, "partition_count")?;
+	let group_count = required_u64(candidate, "group_count")?;
+	let page_count = required_u64(candidate, "page_count")?;
+	if partition_count != 16 || group_count != 4 || page_count == 0 {
+		return Err(format!(
+			"shape gate expected q17's 16 partitions / 4 groups / nonempty pages, got {partition_count}/{group_count}/{page_count}"
+		));
+	}
+	if candidate.get("mode").and_then(serde_json::Value::as_str) != Some("index_at_flush")
+		|| control.get("mode").and_then(serde_json::Value::as_str) != Some("rebuild_after_write")
+	{
+		return Err("shape gate arms do not report opposite lifecycle modes".to_string());
+	}
+	let candidate_indexed = required_u64(candidate, "indexed_flush_pages")?;
+	let candidate_guard_checks = required_u64(candidate, "indexed_flush_guard_checks")?;
+	let candidate_rebuilds = required_u64(candidate, "index_rebuild_calls")?;
+	let candidate_reads = required_u64(candidate, "build_physical_read_pages")?;
+	let control_indexed = required_u64(control, "indexed_flush_pages")?;
+	let control_rebuilds = required_u64(control, "index_rebuild_calls")?;
+	let control_reads = required_u64(control, "build_physical_read_pages")?;
+	if candidate_indexed != page_count
+		|| candidate_guard_checks != candidate_indexed
+		|| candidate
+			.get("live_guard_checked_after_every_indexed_flush")
+			.and_then(serde_json::Value::as_bool)
+			!= Some(true)
+		|| candidate_rebuilds != 0
+		|| candidate_reads != 0
+		|| control_indexed != 0
+		|| control_rebuilds == 0
+		|| control_reads == 0
+	{
+		return Err("shape gate lifecycle counters are missing, inverted, or same-arm".to_string());
+	}
+	const Q17_BUILD_ROWS: u64 = 47_989_007;
+	for (label, row) in [("candidate", on_row), ("control", off_row)] {
+		let exchange = spill_subleaf_rows(row, "write_exchange_repartition")?;
+		let active_group = spill_subleaf_rows(row, "write_active_group_partitioning")?;
+		let page_key = spill_subleaf_rows(row, "write_page_key_extraction")?;
+		if exchange != 4 * Q17_BUILD_ROWS
+			|| active_group != 4 * Q17_BUILD_ROWS
+			|| page_key != Q17_BUILD_ROWS
+		{
+			return Err(format!(
+				"shape gate {label} write multiplicities are not exactly 4x + 4x + 1x"
+			));
+		}
+	}
+	for (label, residency) in [
+		("candidate", candidate_residency),
+		("control", control_residency),
+	] {
+		if residency.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
+			|| required_u64(residency, "partition_count")? != partition_count
+			|| required_u64(residency, "group_count")? != group_count
+		{
+			return Err(format!(
+				"shape gate {label} residency receipt is incomplete or failed"
+			));
+		}
+	}
+	Ok(serde_json::json!({
+		"suite": "shape_preserving_spill_index_gate",
+		"candidate_mode": candidate["mode"],
+		"control_mode": control["mode"],
+		"partition_count": partition_count,
+		"group_count": group_count,
+		"page_count": page_count,
+		"spill_bytes": candidate["spill_bytes"],
+		"candidate_indexed_flush_pages": candidate_indexed,
+		"candidate_indexed_flush_guard_checks": candidate_guard_checks,
+		"candidate_rebuild_calls": candidate_rebuilds,
+		"candidate_build_physical_read_pages": candidate_reads,
+		"control_indexed_flush_pages": control_indexed,
+		"control_rebuild_calls": control_rebuilds,
+		"control_build_physical_read_pages": control_reads,
+		"write_row_multiplicities": {
+			"exchange": 4 * Q17_BUILD_ROWS,
+			"active_group": 4 * Q17_BUILD_ROWS,
+			"page_key": Q17_BUILD_ROWS,
+		},
+		"passed": true,
+	}))
+}
+
+fn run_shape_preserving_spill_index_gate(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+	switch: &PairedSwitch,
+) -> Result<serde_json::Value, String> {
+	let gate_dir = output_dir.join("shape_preserving_spill_index_gate");
+	std::fs::create_dir_all(&gate_dir)
+		.map_err(|error| format!("create shape-preserving gate directory: {error}"))?;
+	let run_arm = |arm: &str, value: &str| {
+		let spill_dir = PathBuf::from(CACHE_ROOT).join("join_spill");
+		if spill_dir.exists() {
+			std::fs::remove_dir_all(&spill_dir)
+				.map_err(|error| format!("clear shape-gate join spill scratch: {error}"))?;
+		}
+		let profile_path = gate_dir.join(format!("{arm}_node_attribution.json"));
+		let profile = profile_path.display().to_string();
+		let row = run_perf_child_with_envs(
+			query,
+			mode,
+			sf,
+			0,
+			data_source,
+			data_dir,
+			&[
+				(switch.env.as_str(), value),
+				("TORON_PARTITIONED_BUILD_SPILL_PROFILE", "1"),
+				("TORON_NODE_ATTRIBUTION_PROFILE_PATH", profile.as_str()),
+			],
+		)?;
+		if spill_dir.exists()
+			&& std::fs::read_dir(&spill_dir)
+				.map_err(|error| format!("inspect shape-gate join spill scratch: {error}"))?
+				.next()
+				.is_some()
+		{
+			return Err(format!(
+				"shape-gate {arm} child abandoned join spill state in {}",
+				spill_dir.display()
+			));
+		}
+		Ok(row)
+	};
+	let on_row = run_arm("candidate", &switch.on_value)?;
+	let off_row = run_arm("control", &switch.off_value)?;
+	match shape_preserving_spill_index_gate_record(&on_row, &off_row) {
+		Ok(mut record) => {
+			record["switch_env"] = serde_json::json!(switch.env);
+			record["on_value"] = serde_json::json!(switch.on_value);
+			record["off_value"] = serde_json::json!(switch.off_value);
+			record["join_spill_scratch_empty"] = serde_json::json!(true);
+			Ok(record)
+		}
+		Err(reason) => Ok(serde_json::json!({
+			"suite": "shape_preserving_spill_index_gate",
+			"switch_env": switch.env,
+			"on_value": switch.on_value,
+			"off_value": switch.off_value,
+			"reason": reason,
+			"passed": false,
+		})),
+	}
+}
+
 fn paired_ablation_arm(run_index: u32) -> bool {
 	run_index % 2 == 1
 }
@@ -4290,6 +4716,21 @@ fn parse_u32_flag(args: &[String], flag: &str, default: u32) -> Result<u32, Stri
 			.parse::<u32>()
 			.map_err(|_| format!("{flag} must be a non-negative integer (got {raw:?})")),
 	}
+}
+
+fn optional_positive_f64_flag(args: &[String], flag: &str) -> Result<Option<f64>, String> {
+	let Some(raw) = flag_value(args, flag) else {
+		return Ok(None);
+	};
+	let value = raw
+		.parse::<f64>()
+		.map_err(|_| format!("{flag} must be a positive finite number (got {raw:?})"))?;
+	if !value.is_finite() || value <= 0.0 {
+		return Err(format!(
+			"{flag} must be a positive finite number (got {raw:?})"
+		));
+	}
+	Ok(Some(value))
 }
 
 /// The explicitly-passed, validated `--sf`. `Ok(None)` means the flag was absent (use the default);
@@ -4392,6 +4833,100 @@ mod tests {
 		));
 	}
 
+	fn shape_gate_row(candidate: bool) -> serde_json::Value {
+		let page_count = 6_059u64;
+		let mode = if candidate {
+			"index_at_flush"
+		} else {
+			"rebuild_after_write"
+		};
+		let lifecycle = serde_json::json!({
+			"mode": mode,
+			"partition_count": 16,
+			"group_count": 4,
+			"indexed_flush_pages": if candidate { page_count } else { 0 },
+			"indexed_flush_guard_checks": if candidate { page_count } else { 0 },
+			"live_guard_checked_after_every_indexed_flush": candidate,
+			"index_rebuild_calls": if candidate { 0 } else { 16 },
+			"build_physical_read_pages": if candidate { 0 } else { page_count },
+			"page_count": page_count,
+			"page_rows": [8192, 7],
+			"page_ciphertext_bytes": [65536, 128],
+			"spill_bytes": 622_544_968u64,
+		});
+		let residency = serde_json::json!({
+			"partition_count": 16,
+			"group_count": 4,
+			"passed": true,
+		});
+		serde_json::json!({
+			"status": "pass",
+			"dataset_verification": "full_hash",
+			"build_commit": "seal",
+			"plan_fingerprint": "plan",
+			"digest": "digest",
+			"output_schema_fingerprint": "schema",
+			"output_row_count": 1,
+			"join_spill_observations": [{"path": "partitioned_streaming_scan_build"}],
+			"spill_bytes": 622_544_968u64,
+			"memory_per_task": 2_147_483_648u64,
+			"memory_per_task_provenance": "explicit",
+			"spill_bytes_reserved": 2_147_483_648u64,
+			"spill_bytes_reserved_provenance": "explicit",
+			"node_attribution": {
+				"aggregate_invocations": [{
+					"diagnostics": [
+						{"name": "partitioned_scan_build_index_lifecycle", "value": lifecycle},
+						{"name": "partitioned_build_residency", "value": residency},
+					],
+					"spill_io": [{
+						"subleaves": [
+							{"stage": "write_exchange_repartition", "rows": 191_956_028u64},
+							{"stage": "write_active_group_partitioning", "rows": 191_956_028u64},
+							{"stage": "write_page_key_extraction", "rows": 47_989_007u64},
+						],
+					}],
+				}],
+			},
+		})
+	}
+
+	#[test]
+	fn shape_preserving_gate_requires_equal_shape_and_opposite_lifecycle() {
+		let candidate = shape_gate_row(true);
+		let control = shape_gate_row(false);
+		assert_eq!(
+			shape_preserving_spill_index_gate_record(&candidate, &control).unwrap()["passed"],
+			true
+		);
+		assert!(
+			shape_preserving_spill_index_gate_record(&candidate, &candidate).is_err(),
+			"two candidate arms must not pass"
+		);
+		let mut wrong_geometry = control.clone();
+		wrong_geometry
+			.pointer_mut("/node_attribution/aggregate_invocations/0/diagnostics/0/value/page_rows")
+			.expect("page rows")
+			.clone_from(&serde_json::json!([8192, 8]));
+		assert!(shape_preserving_spill_index_gate_record(&candidate, &wrong_geometry).is_err());
+		let mut missing_counter = candidate.clone();
+		missing_counter
+			.pointer_mut(
+				"/node_attribution/aggregate_invocations/0/diagnostics/0/value/indexed_flush_pages",
+			)
+			.expect("counter")
+			.clone_from(&serde_json::Value::Null);
+		assert!(shape_preserving_spill_index_gate_record(&missing_counter, &control).is_err());
+		let mut skipped_guard = candidate.clone();
+		skipped_guard
+			.pointer_mut(
+				"/node_attribution/aggregate_invocations/0/diagnostics/0/value/indexed_flush_guard_checks",
+			)
+			.expect("guard count")
+			.clone_from(&serde_json::json!(6_058));
+		assert!(shape_preserving_spill_index_gate_record(&skipped_guard, &control).is_err());
+	}
+
 	#[test]
 	fn adr449_sample_journal_is_durable_and_resume_config_locked() {
 		let directory =
@@ -4409,6 +4944,8 @@ mod tests {
 			1,
 			"fnv1a64:cohort",
 			&test_paired_switch(),
+			PairedGate::PlanDistinct,
+			None,
 		)
 		.unwrap();
 		journal
@@ -4432,6 +4969,8 @@ mod tests {
 			1,
 			"fnv1a64:cohort",
 			&test_paired_switch(),
+			PairedGate::PlanDistinct,
+			None,
 		)
 		.unwrap();
 		assert_eq!(resumed.rows.len(), 1);
@@ -4448,6 +4987,8 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
+				PairedGate::PlanDistinct,
+				None,
 			)
 			.is_err()
 		);
@@ -4467,6 +5008,8 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
+				PairedGate::PlanDistinct,
+				None,
 			)
 			.is_err()
 		);
@@ -4485,6 +5028,8 @@ mod tests {
 				1,
 				"fnv1a64:regenerated",
 				&test_paired_switch(),
+				PairedGate::PlanDistinct,
+				None,
 			)
 			.is_err()
 		);
@@ -4500,10 +5045,73 @@ mod tests {
 				1,
 				"",
 				&test_paired_switch(),
+				PairedGate::PlanDistinct,
+				None,
 			)
 			.is_err()
 		);
 		std::fs::remove_dir_all(directory).unwrap();
+
+		let shape_directory =
+			std::env::temp_dir().join(format!("toron-adr510-journal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&shape_directory);
+		let shape_switch = PairedSwitch {
+			env: PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV.to_string(),
+			on_value: "1".to_string(),
+			off_value: "0".to_string(),
+		};
+		prepare_paired_ablation_journal(
+			&shape_directory,
+			"q17",
+			"strict",
+			8.0,
+			"parquet",
+			data_dir,
+			20,
+			1,
+			"fnv1a64:shape",
+			&shape_switch,
+			PairedGate::ShapePreservingSpillIndex,
+			Some(3_554.0),
+		)
+		.unwrap();
+		assert!(
+			prepare_paired_ablation_journal(
+				&shape_directory,
+				"q17",
+				"strict",
+				8.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"fnv1a64:shape",
+				&shape_switch,
+				PairedGate::PlanDistinct,
+				None,
+			)
+			.is_err(),
+			"resume must reject a paired-gate mismatch"
+		);
+		assert!(
+			prepare_paired_ablation_journal(
+				&shape_directory,
+				"q17",
+				"strict",
+				8.0,
+				"parquet",
+				data_dir,
+				20,
+				1,
+				"fnv1a64:shape",
+				&shape_switch,
+				PairedGate::ShapePreservingSpillIndex,
+				Some(3_555.0),
+			)
+			.is_err(),
+			"resume must reject a fixed-floor mismatch"
+		);
+		std::fs::remove_dir_all(shape_directory).unwrap();
 	}
 
 	#[test]
@@ -4525,9 +5133,13 @@ mod tests {
 			"execute_ms_samples": samples,
 			"execute_ms_median": 1054.0,
 		});
-		let receipts =
-			attach_paired_ablation_receipt(vec![summary], 12, serde_json::json!({"passed": true}))
-				.unwrap();
+		let receipts = attach_paired_ablation_receipt(
+			vec![summary],
+			12,
+			serde_json::json!({"passed": true}),
+			None,
+		)
+		.unwrap();
 		let paired = &receipts[0]["paired_ablation"];
 		assert_eq!(paired["point_ms"].as_f64().unwrap(), 108.0);
 		assert_eq!(paired["baseline_off_median_ms"].as_f64().unwrap(), 1108.0);
@@ -4537,6 +5149,32 @@ mod tests {
 			material_effect(108.0, 1054.0),
 			"fixture must discriminate: the pooled rule would call this material"
 		);
+	}
+
+	#[test]
+	fn adr510_fixed_materiality_floor_is_not_recomputed_from_the_cohort() {
+		let samples = (0..20u64)
+			.map(|index| {
+				let on = index % 2 == 0;
+				serde_json::json!({
+					"run_index": index,
+					"ablation_arm": if on { "on" } else { "off" },
+					"execute_ms": if on { 31_000.0 } else { 34_500.0 },
+				})
+			})
+			.collect::<Vec<_>>();
+		let summary = serde_json::json!({"execute_ms_samples": samples});
+		let receipt = attach_paired_ablation_receipt(
+			vec![summary],
+			20,
+			serde_json::json!({"passed": true}),
+			Some(3_554.0),
+		)
+		.expect("fixed-floor receipt");
+		let paired = &receipt[0]["paired_ablation"];
+		assert_eq!(paired["materiality_floor_ms"], 3_554.0);
+		assert_eq!(paired["materiality_policy"], "fixed_predeclared");
+		assert_eq!(paired["material"], false);
 	}
 
 	#[test]

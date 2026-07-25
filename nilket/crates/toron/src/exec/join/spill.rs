@@ -966,6 +966,10 @@ impl SpilledBatchRefList {
 		refs
 	}
 
+	fn len(&self) -> usize {
+		1usize.saturating_add(self.overflow.as_ref().map_or(0, |rows| rows.len()))
+	}
+
 	#[cfg(test)]
 	fn heap_bytes(&self) -> u64 {
 		self.overflow
@@ -1047,6 +1051,17 @@ impl SpilledBatchIndex {
 			Self::Int32(index) => index.accounted_bytes(),
 			Self::Int64(index) => index.accounted_bytes(),
 			Self::Hash(index) => spilled_batch_join_hash_index_bytes(index),
+		}
+	}
+
+	fn row_ref_count(&self) -> u64 {
+		match self {
+			Self::Int32(index) => index.row_ref_count(),
+			Self::Int64(index) => index.row_ref_count(),
+			Self::Hash(index) => index
+				.values()
+				.map(|refs| u64::try_from(refs.len()).unwrap_or(u64::MAX))
+				.fold(0u64, u64::saturating_add),
 		}
 	}
 
@@ -1143,6 +1158,13 @@ where
 
 	fn accounted_bytes(&self) -> u64 {
 		self.accounted_bytes
+	}
+
+	fn row_ref_count(&self) -> u64 {
+		self.entries
+			.iter()
+			.map(|entry| u64::try_from(entry.refs.len()).unwrap_or(u64::MAX))
+			.fold(0u64, u64::saturating_add)
 	}
 
 	#[cfg(test)]
@@ -1275,6 +1297,24 @@ fn record_grouped_chain_pin_outcome(
 	observer.record_pin_outcome(outcome)
 }
 
+/// How the partitioned scan-build route constructs its resident page index.
+///
+/// This value is latched at the route boundary and carried through every coalescing flush. The
+/// writer never rereads process state, so one route invocation cannot mix indexed and unindexed
+/// pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::exec) enum CoalescedPageIndexMode {
+	RebuildAfterWrite,
+	IndexAtFlush,
+}
+
+impl CoalescedPageIndexMode {
+	const fn indexes_at_flush(self) -> bool {
+		matches!(self, Self::IndexAtFlush)
+	}
+}
+
 pub(in crate::exec) struct SpilledInnerJoinBuild {
 	spill_id: u64,
 	path: PathBuf,
@@ -1309,6 +1349,15 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	legacy_index_insert_count: u64,
 	#[cfg(test)]
 	page_decode_count: u64,
+	#[cfg(test)]
+	fail_candidate_index_insert_at: Option<u64>,
+	#[cfg(test)]
+	candidate_index_insert_attempts: u64,
+	indexed_flush_pages: u64,
+	indexed_flush_guard_checks: u64,
+	index_rebuild_calls: u64,
+	physical_read_pages: u64,
+	coalesced_index_mode: Option<CoalescedPageIndexMode>,
 	compact_index_enabled: bool,
 	compact_index_rescue_enabled: bool,
 	next_offset: u64,
@@ -1464,6 +1513,15 @@ impl SpilledInnerJoinBuild {
 			legacy_index_insert_count: 0,
 			#[cfg(test)]
 			page_decode_count: 0,
+			#[cfg(test)]
+			fail_candidate_index_insert_at: None,
+			#[cfg(test)]
+			candidate_index_insert_attempts: 0,
+			indexed_flush_pages: 0,
+			indexed_flush_guard_checks: 0,
+			index_rebuild_calls: 0,
+			physical_read_pages: 0,
+			coalesced_index_mode: None,
 			compact_index_enabled: false,
 			compact_index_rescue_enabled: false,
 			next_offset: 0,
@@ -1479,6 +1537,38 @@ impl SpilledInnerJoinBuild {
 		self.index.clear();
 		self.compact_index = None;
 		self.resident_index_bytes = 0;
+	}
+
+	fn prepare_coalesced_index(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
+	) -> Result<(), ExecutionError> {
+		if let Some(latched) = self.coalesced_index_mode {
+			if latched != index_mode {
+				return Err(ExecutionError::Kernel {
+					message: format!(
+						"coalesced spill writer changed index mode mid-build: {latched:?} -> {index_mode:?}"
+					),
+				});
+			}
+			return Ok(());
+		}
+		if !self.pages.is_empty() || self.rows != 0 {
+			return Err(ExecutionError::Kernel {
+				message: "coalesced spill index mode was not selected before the first page"
+					.to_string(),
+			});
+		}
+		if index_mode == CoalescedPageIndexMode::IndexAtFlush
+			&& !null_safe_keys
+			&& matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64)
+		{
+			self.use_compact_resident_index();
+		}
+		self.coalesced_index_mode = Some(index_mode);
+		Ok(())
 	}
 
 	/// Disable caching for a resident single-touch drain. The streamed probe path
@@ -1598,9 +1688,33 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
+		self.write_batch_chunks_coalesced_profiled(
+			batch,
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			CoalescedPageIndexMode::RebuildAfterWrite,
+			task_budget,
+			observer,
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn write_batch_chunks_coalesced_profiled(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
+		self.prepare_coalesced_index(key_plan, null_safe_keys, index_mode)?;
 		self.input_batches_written = self.input_batches_written.saturating_add(1);
 		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
@@ -1611,6 +1725,7 @@ impl SpilledInnerJoinBuild {
 				key_plan,
 				build_keys,
 				null_safe_keys,
+				index_mode,
 				task_budget,
 				observer,
 			)
@@ -1680,19 +1795,21 @@ impl SpilledInnerJoinBuild {
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	pub(in crate::exec) async fn write_projected_batch_chunks_unindexed_profiled(
+	pub(in crate::exec) async fn write_projected_batch_chunks_coalesced_profiled(
 		&mut self,
 		batch: &RecordBatch,
 		retained_columns: &[ColumnOrdinal],
 		key_plan: JoinKeyPlan,
 		projected_build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
+		self.prepare_coalesced_index(key_plan, null_safe_keys, index_mode)?;
 		self.input_batches_written = self.input_batches_written.saturating_add(1);
 		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
@@ -1704,6 +1821,7 @@ impl SpilledInnerJoinBuild {
 				key_plan,
 				projected_build_keys,
 				null_safe_keys,
+				index_mode,
 				task_budget,
 				observer,
 			)
@@ -1712,7 +1830,7 @@ impl SpilledInnerJoinBuild {
 		Ok(())
 	}
 
-	/// Buffer the unindexed reservoir writer up to the existing output chunk cap.
+	/// Buffer the coalesced reservoir writer up to the existing output chunk cap.
 	///
 	/// The grouped reservoir rebuilds its index from finished pages, so it is safe to
 	/// compose fragments here.  Indexed writers deliberately stay on the direct path:
@@ -1724,6 +1842,7 @@ impl SpilledInnerJoinBuild {
 		key_plan: JoinKeyPlan,
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
@@ -1736,10 +1855,11 @@ impl SpilledInnerJoinBuild {
 			&& self.pending_unindexed_rows.saturating_add(batch.num_rows())
 				> CROSS_JOIN_OUTPUT_CHUNK_ROWS
 		{
-			self.flush_unindexed_page_buffer(
+			self.flush_coalesced_page_buffer(
 				key_plan,
 				build_keys,
 				null_safe_keys,
+				index_mode,
 				task_budget,
 				observer,
 			)
@@ -1753,7 +1873,7 @@ impl SpilledInnerJoinBuild {
 					build_keys,
 					null_safe_keys,
 					false,
-					false,
+					index_mode.indexes_at_flush(),
 					task_budget,
 					observer,
 				)
@@ -1772,10 +1892,11 @@ impl SpilledInnerJoinBuild {
 		self.guard_resident_state(task_budget.memory.get(), SpillResidentGuardSite::Write)?;
 
 		if self.pending_unindexed_rows >= CROSS_JOIN_OUTPUT_CHUNK_ROWS {
-			self.flush_unindexed_page_buffer(
+			self.flush_coalesced_page_buffer(
 				key_plan,
 				build_keys,
 				null_safe_keys,
+				index_mode,
 				task_budget,
 				observer,
 			)
@@ -1790,6 +1911,27 @@ impl SpilledInnerJoinBuild {
 		key_plan: JoinKeyPlan,
 		build_keys: &[crate::ir::ColumnOrdinal],
 		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
+		self.flush_coalesced_page_buffer(
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			CoalescedPageIndexMode::RebuildAfterWrite,
+			task_budget,
+			observer,
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn flush_coalesced_page_buffer(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
@@ -1810,7 +1952,7 @@ impl SpilledInnerJoinBuild {
 			build_keys,
 			null_safe_keys,
 			false,
-			false,
+			index_mode.indexes_at_flush(),
 			task_budget,
 			observer,
 		)
@@ -1885,7 +2027,12 @@ impl SpilledInnerJoinBuild {
 			return Ok(());
 		}
 		let key_timer = observer
-			.map(|observer| observer.begin(GroupedChainSubLeaf::WritePartitionRouting))
+			.map(|observer| {
+				observer.begin_node_named(
+					GroupedChainSubLeaf::WritePartitionRouting,
+					"write_page_key_extraction",
+				)
+			})
 			.transpose()?;
 		let key_arrays = key_arrays(batch, build_keys)?;
 		let mut refs = std::mem::take(&mut self.scratch_refs);
@@ -1959,6 +2106,20 @@ impl SpilledInnerJoinBuild {
 				}
 			}
 			for (key, row) in refs.drain(..) {
+				#[cfg(test)]
+				{
+					self.candidate_index_insert_attempts = self
+						.candidate_index_insert_attempts
+						.checked_add(1)
+						.expect("test candidate insertion count");
+					if self.fail_candidate_index_insert_at
+						== Some(self.candidate_index_insert_attempts)
+					{
+						return Err(ExecutionError::Kernel {
+							message: "injected coalesced index insertion failure".to_string(),
+						});
+					}
+				}
 				let row_ref = SpilledBatchRowRef { page_index, row };
 				if let Some(index) = &mut self.compact_index {
 					index.insert(key, row_ref)?;
@@ -1996,7 +2157,23 @@ impl SpilledInnerJoinBuild {
 		self.next_offset = self.next_offset.saturating_add(page.ciphertext_len as u64);
 		self.page_rows.push(join_build_row_index(batch.num_rows())?);
 		self.pages.push(page);
+		if index_rows {
+			self.indexed_flush_pages =
+				self.indexed_flush_pages
+					.checked_add(1)
+					.ok_or_else(|| ExecutionError::Kernel {
+						message: "coalesced indexed-flush page count overflowed".to_string(),
+					})?;
+		}
 		self.guard_resident_state_after_write(task_budget.memory.get())?;
+		if index_rows {
+			self.indexed_flush_guard_checks = self
+				.indexed_flush_guard_checks
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "coalesced indexed-flush guard count overflowed".to_string(),
+				})?;
+		}
 		Ok(())
 	}
 
@@ -2025,6 +2202,12 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
+		self.index_rebuild_calls =
+			self.index_rebuild_calls
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "spill index rebuild call count overflowed".to_string(),
+				})?;
 		self.index.clear();
 		self.compact_index = if self.compact_index_enabled {
 			Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys))
@@ -2325,6 +2508,74 @@ impl SpilledInnerJoinBuild {
 		self.scratch_plaintext = Vec::new();
 		self.scratch_refs = Vec::new();
 		self.writer_peak = 0;
+	}
+
+	/// Proves that every keyed row accepted by the coalesced writer is represented in the resident
+	/// index before the rebuild pass is skipped.
+	pub(in crate::exec) fn assert_coalesced_index_complete(&self) -> Result<(), ExecutionError> {
+		if !self.pending_unindexed_batches.is_empty() {
+			return Err(ExecutionError::Kernel {
+				message: "coalesced index completeness checked before the partial page was flushed"
+					.to_string(),
+			});
+		}
+		let indexed_rows = self.compact_index.as_ref().map_or_else(
+			|| {
+				self.index
+					.values()
+					.map(|refs| u64::try_from(refs.len()).unwrap_or(u64::MAX))
+					.fold(0u64, u64::saturating_add)
+			},
+			SpilledBatchIndex::row_ref_count,
+		);
+		if indexed_rows != self.rows {
+			return Err(ExecutionError::Kernel {
+				message: format!(
+					"coalesced resident spill index is incomplete: indexed_rows={indexed_rows}, expected_rows={}",
+					self.rows
+				),
+			});
+		}
+		Ok(())
+	}
+
+	pub(in crate::exec) async fn complete_coalesced_index_after_finish(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		index_mode: CoalescedPageIndexMode,
+		task_budget: TaskBudget,
+		observer: Option<&GroupedChainSpillObserver<'_>>,
+	) -> Result<(), ExecutionError> {
+		self.release_write_scratch();
+		if self.input_rows == 0 {
+			return Ok(());
+		}
+		if self.coalesced_index_mode != Some(index_mode) {
+			return Err(ExecutionError::Kernel {
+				message: format!(
+					"coalesced spill completion mode disagreed with the writer: writer={:?}, completion={index_mode:?}",
+					self.coalesced_index_mode
+				),
+			});
+		}
+		match index_mode {
+			CoalescedPageIndexMode::IndexAtFlush => self.assert_coalesced_index_complete(),
+			CoalescedPageIndexMode::RebuildAfterWrite => {
+				if !null_safe_keys && matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64) {
+					self.use_compact_resident_index();
+				}
+				self.rebuild_index_from_pages_profiled(
+					key_plan,
+					build_keys,
+					null_safe_keys,
+					task_budget,
+					observer,
+				)
+				.await
+			}
+		}
 	}
 
 	/// Seal one reservoir partition: flush the partial page the buffering writer holds back, then
@@ -2682,6 +2933,12 @@ impl SpilledInnerJoinBuild {
 			observer,
 		)
 		.await?;
+		self.physical_read_pages =
+			self.physical_read_pages
+				.checked_add(1)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "spill physical-read page count overflowed".to_string(),
+				})?;
 		if let Some(timer) = read_timer {
 			timer.finish_with(0, ciphertext.len() as u64, 1)?;
 		}
@@ -2860,6 +3117,32 @@ impl SpilledInnerJoinBuild {
 
 	pub(in crate::exec) fn spill_bytes(&self) -> u64 {
 		self.spill_bytes
+	}
+
+	pub(in crate::exec) fn indexed_flush_pages(&self) -> u64 {
+		self.indexed_flush_pages
+	}
+
+	pub(in crate::exec) fn indexed_flush_guard_checks(&self) -> u64 {
+		self.indexed_flush_guard_checks
+	}
+
+	pub(in crate::exec) fn index_rebuild_calls(&self) -> u64 {
+		self.index_rebuild_calls
+	}
+
+	pub(in crate::exec) fn physical_read_pages(&self) -> u64 {
+		self.physical_read_pages
+	}
+
+	pub(in crate::exec) fn page_geometry(&self) -> (Vec<u32>, Vec<u64>) {
+		(
+			self.page_rows.clone(),
+			self.pages
+				.iter()
+				.map(|page| page.ciphertext_len as u64)
+				.collect(),
+		)
 	}
 
 	pub(in crate::exec) fn retained_resident_bytes(&self) -> u64 {
@@ -4002,6 +4285,137 @@ fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
 mod tests {
 	use super::*;
 	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
+	use std::io::{Error, ErrorKind};
+	use std::path::Path;
+	use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+	use wendelon::storage::{AlignedBuf, DirectoryEntry};
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	enum CoalescedFileFault {
+		Write,
+		Finish,
+		Cleanup,
+	}
+
+	struct CoalescedFaultFileOps {
+		inner: BlockingFileOps,
+		fault: CoalescedFileFault,
+		fired: AtomicBool,
+	}
+
+	impl CoalescedFaultFileOps {
+		fn new(fault: CoalescedFileFault) -> Self {
+			Self {
+				inner: BlockingFileOps,
+				fault,
+				fired: AtomicBool::new(false),
+			}
+		}
+
+		fn should_fail(&self, fault: CoalescedFileFault) -> bool {
+			self.fault == fault && !self.fired.swap(true, AtomicOrdering::SeqCst)
+		}
+
+		fn fired(&self) -> bool {
+			self.fired.load(AtomicOrdering::SeqCst)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl AsyncFileOps for CoalescedFaultFileOps {
+		async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
+			self.inner.open(path, flags).await
+		}
+
+		async fn read_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			len: usize,
+		) -> std::io::Result<Vec<u8>> {
+			self.inner.read_plain_at(handle, offset, len).await
+		}
+
+		async fn write_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			bytes: Vec<u8>,
+		) -> std::io::Result<usize> {
+			if self.should_fail(CoalescedFileFault::Write) {
+				return Err(Error::new(ErrorKind::Other, "injected coalesced write"));
+			}
+			self.inner.write_plain_at(handle, offset, bytes).await
+		}
+
+		async fn read_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.read_at(handle, offset, buf).await
+		}
+
+		async fn write_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.write_at(handle, offset, buf).await
+		}
+
+		async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			self.inner.fsync(handle).await
+		}
+
+		async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			if self.should_fail(CoalescedFileFault::Finish) {
+				return Err(Error::new(ErrorKind::Other, "injected coalesced finish"));
+			}
+			self.inner.fdatasync(handle).await
+		}
+
+		async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+			self.inner.read_all(path).await
+		}
+
+		async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+			self.inner.write_all(path, bytes).await
+		}
+
+		async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
+			self.inner.file_len(path).await
+		}
+
+		async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
+			self.inner.set_len(handle, len).await
+		}
+
+		async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.create_dir_all(path).await
+		}
+
+		async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>> {
+			self.inner.read_dir(path).await
+		}
+
+		async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.fsync_dir(path).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.rename(from, to).await
+		}
+
+		async fn unlink(&self, path: &Path) -> std::io::Result<()> {
+			if self.should_fail(CoalescedFileFault::Cleanup) {
+				return Err(Error::new(ErrorKind::Other, "injected coalesced cleanup"));
+			}
+			self.inner.unlink(path).await
+		}
+	}
 
 	fn test_task_budget() -> TaskBudget {
 		let mut query_budget = QueryBudget::test_default();
@@ -4078,6 +4492,647 @@ mod tests {
 			],
 		)
 		.expect("nullable test batch")
+	}
+
+	fn batch_with_int32_keys(keys: &[Option<i32>]) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			arrow::datatypes::Field::new("k", DataType::Int32, true),
+			arrow::datatypes::Field::new("v", DataType::Int64, false),
+		]));
+		let values = (0..keys.len())
+			.map(|row| i64::try_from(row).unwrap_or(i64::MAX))
+			.collect::<Vec<_>>();
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(arrow::array::Int32Array::from(keys.to_vec())) as ArrayRef,
+				Arc::new(Int64Array::from(values)) as ArrayRef,
+			],
+		)
+		.expect("Int32 test batch")
+	}
+
+	async fn coalesced_test_build(
+		label: &str,
+		batches: &[RecordBatch],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		mode: CoalescedPageIndexMode,
+	) -> (SpilledInnerJoinBuild, PathBuf) {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir(label);
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create coalesced spill");
+		for batch in batches {
+			build
+				.write_batch_chunks_coalesced_profiled(
+					batch,
+					key_plan,
+					&[ColumnOrdinal(0)],
+					null_safe_keys,
+					mode,
+					budget,
+					None,
+				)
+				.await
+				.expect("write coalesced spill batch");
+		}
+		build
+			.flush_coalesced_page_buffer(
+				key_plan,
+				&[ColumnOrdinal(0)],
+				null_safe_keys,
+				mode,
+				budget,
+				None,
+			)
+			.await
+			.expect("flush coalesced spill tail");
+		build.finish(budget).await.expect("finish coalesced spill");
+		build
+			.complete_coalesced_index_after_finish(
+				key_plan,
+				&[ColumnOrdinal(0)],
+				null_safe_keys,
+				mode,
+				budget,
+				None,
+			)
+			.await
+			.expect("complete coalesced index");
+		(build, spill_dir)
+	}
+
+	async fn coalesced_projected_test_build(
+		label: &str,
+		batches: &[RecordBatch],
+		mode: CoalescedPageIndexMode,
+	) -> (SpilledInnerJoinBuild, PathBuf) {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir(label);
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create projected coalesced spill");
+		for batch in batches {
+			build
+				.write_projected_batch_chunks_coalesced_profiled(
+					batch,
+					&[ColumnOrdinal(0), ColumnOrdinal(2)],
+					JoinKeyPlan::Int64,
+					&[ColumnOrdinal(0)],
+					false,
+					mode,
+					budget,
+					None,
+				)
+				.await
+				.expect("write projected coalesced spill");
+		}
+		build
+			.flush_coalesced_page_buffer(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				mode,
+				budget,
+				None,
+			)
+			.await
+			.expect("flush projected coalesced spill");
+		build.finish(budget).await.expect("finish projected spill");
+		build
+			.complete_coalesced_index_after_finish(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				mode,
+				budget,
+				None,
+			)
+			.await
+			.expect("complete projected coalesced index");
+		(build, spill_dir)
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_matches_rebuild_across_full_and_partial_pages() {
+		let mut keys = (0..CROSS_JOIN_OUTPUT_CHUNK_ROWS)
+			.map(|row| match row % 7 {
+				0 => None,
+				1 | 2 => Some(11),
+				_ => Some(i64::try_from(row % 97).expect("small key")),
+			})
+			.collect::<Vec<_>>();
+		keys.extend([
+			Some(11),
+			None,
+			Some(42),
+			Some(42),
+			Some(7),
+			Some(11),
+			None,
+			Some(99),
+			Some(7),
+			Some(42),
+			Some(101),
+			Some(11),
+			Some(99),
+			None,
+			Some(7),
+			Some(42),
+			Some(11),
+			Some(5),
+			Some(5),
+			None,
+			Some(42),
+			Some(7),
+			Some(11),
+		]);
+		let batch = nullable_batch_with_keys(&keys);
+		let batches = [
+			batch.slice(0, CROSS_JOIN_OUTPUT_CHUNK_ROWS),
+			batch.slice(CROSS_JOIN_OUTPUT_CHUNK_ROWS, 7),
+			batch.slice(CROSS_JOIN_OUTPUT_CHUNK_ROWS + 7, 16),
+		];
+		let (mut control, control_dir) = coalesced_test_build(
+			"coalesced_control",
+			&batches,
+			JoinKeyPlan::Int64,
+			false,
+			CoalescedPageIndexMode::RebuildAfterWrite,
+		)
+		.await;
+		let (mut candidate, candidate_dir) = coalesced_test_build(
+			"coalesced_candidate",
+			&batches,
+			JoinKeyPlan::Int64,
+			false,
+			CoalescedPageIndexMode::IndexAtFlush,
+		)
+		.await;
+
+		assert_eq!(control.page_geometry(), candidate.page_geometry());
+		assert_eq!(control.spill_bytes(), candidate.spill_bytes());
+		assert_eq!(control.indexed_flush_pages(), 0);
+		assert_eq!(control.index_rebuild_calls(), 1);
+		assert!(control.physical_read_pages() > 0);
+		assert_eq!(
+			candidate.indexed_flush_pages(),
+			candidate.page_count() as u64
+		);
+		assert_eq!(
+			candidate.indexed_flush_guard_checks(),
+			candidate.indexed_flush_pages()
+		);
+		assert_eq!(candidate.index_rebuild_calls(), 0);
+		assert_eq!(candidate.physical_read_pages(), 0);
+		assert_eq!(control.page_decode_count(), control.page_count() as u64);
+		assert_eq!(candidate.page_decode_count(), 0);
+		assert!(control.uses_compact_int64_index());
+		assert!(candidate.uses_compact_int64_index());
+		assert!(control.scratch_plaintext.is_empty());
+		assert!(control.scratch_refs.is_empty());
+		assert!(candidate.scratch_plaintext.is_empty());
+		assert!(candidate.scratch_refs.is_empty());
+		for key in [5, 7, 11, 42, 99, 101, 10_000] {
+			assert_eq!(
+				control
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("control lookup"),
+				candidate
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("candidate lookup"),
+				"lookup multiset differs for key {key}"
+			);
+		}
+		for page in 0..control.page_count() {
+			let control_page = control.read_batch_page(page).await.expect("control page");
+			let candidate_page = candidate
+				.read_batch_page(page)
+				.await
+				.expect("candidate page");
+			assert_record_batch_equal(&control_page, &candidate_page);
+		}
+		candidate.rows = candidate.rows.saturating_add(1);
+		assert!(
+			candidate
+				.assert_coalesced_index_complete()
+				.expect_err("missing indexed row must fail closed")
+				.to_string()
+				.contains("incomplete")
+		);
+		candidate.rows = candidate.rows.saturating_sub(1);
+
+		control.cleanup().await;
+		candidate.cleanup().await;
+		assert_eq!(std::fs::read_dir(&control_dir).unwrap().count(), 0);
+		assert_eq!(std::fs::read_dir(&candidate_dir).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(control_dir);
+		let _ = std::fs::remove_dir_all(candidate_dir);
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_matches_rebuild_when_fragments_cross_page_capacity() {
+		let keys = (0..(CROSS_JOIN_OUTPUT_CHUNK_ROWS + 808))
+			.map(|row| i64::try_from(row % 31).expect("small key"))
+			.collect::<Vec<_>>();
+		let batch = batch_with_keys(&keys);
+		let batches = [batch.slice(0, 5_000), batch.slice(5_000, 4_000)];
+		let (mut control, control_dir) = coalesced_test_build(
+			"coalesced_crossing_control",
+			&batches,
+			JoinKeyPlan::Int64,
+			false,
+			CoalescedPageIndexMode::RebuildAfterWrite,
+		)
+		.await;
+		let (mut candidate, candidate_dir) = coalesced_test_build(
+			"coalesced_crossing_candidate",
+			&batches,
+			JoinKeyPlan::Int64,
+			false,
+			CoalescedPageIndexMode::IndexAtFlush,
+		)
+		.await;
+		assert_eq!(control.page_count(), 2);
+		assert_eq!(control.page_geometry(), candidate.page_geometry());
+		assert_eq!(control.spill_bytes(), candidate.spill_bytes());
+		for key in 0..31 {
+			assert_eq!(
+				control
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("control crossing lookup"),
+				candidate
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("candidate crossing lookup")
+			);
+		}
+		control.cleanup().await;
+		candidate.cleanup().await;
+		let _ = std::fs::remove_dir_all(control_dir);
+		let _ = std::fs::remove_dir_all(candidate_dir);
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_uses_compact_int32_and_hash_for_null_safe_generic() {
+		let int32_batch =
+			batch_with_int32_keys(&[Some(3), None, Some(3), Some(-1), Some(9), Some(9)]);
+		let (mut int32, int32_dir) = coalesced_test_build(
+			"coalesced_int32",
+			&[int32_batch],
+			JoinKeyPlan::Int32,
+			false,
+			CoalescedPageIndexMode::IndexAtFlush,
+		)
+		.await;
+		assert!(matches!(
+			int32.compact_index,
+			Some(SpilledBatchIndex::Int32(_))
+		));
+		assert_eq!(
+			int32
+				.lookup(&JoinKey::Int32(3))
+				.await
+				.expect("Int32 lookup")
+				.len(),
+			2
+		);
+		assert_eq!(int32.page_decode_count(), 0);
+
+		let generic_batch =
+			nullable_batch_with_keys(&[Some(3), None, Some(3), Some(-1), None, Some(9)]);
+		let (generic, generic_dir) = coalesced_test_build(
+			"coalesced_generic_null_safe",
+			&[generic_batch],
+			JoinKeyPlan::Generic,
+			true,
+			CoalescedPageIndexMode::IndexAtFlush,
+		)
+		.await;
+		assert!(generic.uses_hash_index());
+		assert_eq!(generic.index_rebuild_calls(), 0);
+		assert_eq!(generic.page_decode_count(), 0);
+		generic
+			.assert_coalesced_index_complete()
+			.expect("null-safe hash index is complete");
+
+		int32.cleanup().await;
+		generic.cleanup().await;
+		let _ = std::fs::remove_dir_all(int32_dir);
+		let _ = std::fs::remove_dir_all(generic_dir);
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_preserves_projected_page_and_lookup_geometry() {
+		let batch = batch_with_keys(&[5, 5, 7, 9, 5, 7, 11, 13, 13]);
+		let batches = [batch.slice(0, 4), batch.slice(4, 5)];
+		let (mut control, control_dir) = coalesced_projected_test_build(
+			"coalesced_projected_control",
+			&batches,
+			CoalescedPageIndexMode::RebuildAfterWrite,
+		)
+		.await;
+		let (mut candidate, candidate_dir) = coalesced_projected_test_build(
+			"coalesced_projected_candidate",
+			&batches,
+			CoalescedPageIndexMode::IndexAtFlush,
+		)
+		.await;
+		assert_eq!(control.page_geometry(), candidate.page_geometry());
+		for key in [5, 7, 9, 11, 13] {
+			assert_eq!(
+				control
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("control projected lookup"),
+				candidate
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("candidate projected lookup")
+			);
+		}
+		let page = candidate.read_batch_page(0).await.expect("projected page");
+		assert_eq!(page.num_columns(), 2);
+		assert_eq!(control.index_rebuild_calls(), 1);
+		assert_eq!(candidate.index_rebuild_calls(), 0);
+		control.cleanup().await;
+		candidate.cleanup().await;
+		let _ = std::fs::remove_dir_all(control_dir);
+		let _ = std::fs::remove_dir_all(candidate_dir);
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_rejects_mode_changes_and_tight_live_residency() {
+		let budget = test_task_budget();
+		let spill_dir = test_spill_dir("coalesced_mode_change");
+		let mut build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create mode-change spill");
+		let batch = batch_with_keys(&[1, 2, 3, 4]);
+		build
+			.write_batch_chunks_coalesced_profiled(
+				&batch,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				budget,
+				None,
+			)
+			.await
+			.expect("first mode");
+		let error = build
+			.write_batch_chunks_coalesced_profiled(
+				&batch,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::RebuildAfterWrite,
+				budget,
+				None,
+			)
+			.await
+			.expect_err("mode cannot change after writing starts");
+		assert!(error.to_string().contains("changed index mode mid-build"));
+		build.cleanup().await;
+
+		let tight_dir = test_spill_dir("coalesced_tight_guard");
+		let tight_budget = test_task_budget_with_memory(1);
+		let mut tight = SpilledInnerJoinBuild::create(
+			tight_budget,
+			Arc::new(BlockingFileOps),
+			tight_dir.clone(),
+		)
+		.await
+		.expect("create tight spill");
+		let tight_batch = batch_with_keys(&vec![1; CROSS_JOIN_OUTPUT_CHUNK_ROWS]);
+		let error = tight
+			.write_batch_chunks_coalesced_profiled(
+				&tight_batch,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				tight_budget,
+				None,
+			)
+			.await
+			.expect_err("live index plus writer must respect the checked resident guard");
+		assert!(matches!(error, ExecutionError::BudgetExhausted { .. }));
+		tight.cleanup().await;
+		assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+		assert_eq!(std::fs::read_dir(&tight_dir).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(spill_dir);
+		let _ = std::fs::remove_dir_all(tight_dir);
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_handles_empty_all_null_and_two_partition_builds() {
+		let budget = test_task_budget();
+		let empty_dir = test_spill_dir("coalesced_empty_build");
+		let mut empty =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), empty_dir.clone())
+				.await
+				.expect("create empty spill");
+		empty.finish(budget).await.expect("finish empty spill");
+		empty
+			.complete_coalesced_index_after_finish(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				budget,
+				None,
+			)
+			.await
+			.expect("complete empty candidate");
+		assert_eq!(empty.page_count(), 0);
+		assert_eq!(empty.indexed_flush_pages(), 0);
+		assert_eq!(empty.indexed_flush_guard_checks(), 0);
+		assert_eq!(empty.input_row_count(), 0);
+
+		let all_null = nullable_batch_with_keys(&[None, None, None]);
+		let keyed = nullable_batch_with_keys(&[Some(7), None, Some(7), Some(9)]);
+		let mut builds = Vec::new();
+		let mut dirs = Vec::new();
+		for (partition, batches) in [
+			(0usize, vec![all_null.clone(), keyed.clone()]),
+			(
+				1usize,
+				vec![nullable_batch_with_keys(&[Some(11), Some(11), None])],
+			),
+		] {
+			let (build, dir) = coalesced_test_build(
+				&format!("coalesced_partition_{partition}"),
+				&batches,
+				JoinKeyPlan::Int64,
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+			)
+			.await;
+			assert_eq!(
+				build.indexed_flush_pages(),
+				build.indexed_flush_guard_checks()
+			);
+			builds.push(build);
+			dirs.push(dir);
+		}
+		assert_eq!(
+			builds[0]
+				.lookup(&JoinKey::Int64(7))
+				.await
+				.expect("partition zero lookup")
+				.len(),
+			2
+		);
+		assert_eq!(
+			builds[1]
+				.lookup(&JoinKey::Int64(11))
+				.await
+				.expect("partition one lookup")
+				.len(),
+			2
+		);
+		assert_eq!(builds[0].page_count(), 1);
+		assert_eq!(builds[1].page_count(), 1);
+
+		empty.cleanup().await;
+		for build in builds {
+			build.cleanup().await;
+		}
+		assert_eq!(std::fs::read_dir(&empty_dir).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(empty_dir);
+		for dir in dirs {
+			assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+			let _ = std::fs::remove_dir_all(dir);
+		}
+	}
+
+	#[tokio::test]
+	async fn coalesced_index_at_flush_fails_closed_on_write_finish_insert_and_cleanup_errors() {
+		let budget = test_task_budget();
+		let full_batch = batch_with_keys(&vec![7; CROSS_JOIN_OUTPUT_CHUNK_ROWS]);
+
+		let write_dir = test_spill_dir("coalesced_write_failure");
+		let write_ops = Arc::new(CoalescedFaultFileOps::new(CoalescedFileFault::Write));
+		let mut write_build =
+			SpilledInnerJoinBuild::create(budget, write_ops.clone(), write_dir.clone())
+				.await
+				.expect("create write-failure spill");
+		let error = write_build
+			.write_batch_chunks_coalesced_profiled(
+				&full_batch,
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				budget,
+				None,
+			)
+			.await
+			.expect_err("write failure must propagate");
+		assert!(error.to_string().contains("write"));
+		assert!(write_ops.fired());
+		write_build.release_write_scratch();
+		assert!(write_build.scratch_plaintext.is_empty());
+		assert!(write_build.scratch_refs.is_empty());
+		write_build.cleanup().await;
+
+		let finish_dir = test_spill_dir("coalesced_finish_failure");
+		let finish_ops = Arc::new(CoalescedFaultFileOps::new(CoalescedFileFault::Finish));
+		let mut finish_build =
+			SpilledInnerJoinBuild::create(budget, finish_ops.clone(), finish_dir.clone())
+				.await
+				.expect("create finish-failure spill");
+		finish_build
+			.write_batch_chunks_coalesced_profiled(
+				&batch_with_keys(&[1, 2, 3]),
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				budget,
+				None,
+			)
+			.await
+			.expect("buffer finish-failure rows");
+		finish_build
+			.flush_coalesced_page_buffer(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				false,
+				CoalescedPageIndexMode::IndexAtFlush,
+				budget,
+				None,
+			)
+			.await
+			.expect("flush before finish failure");
+		assert!(
+			finish_build
+				.finish(budget)
+				.await
+				.expect_err("fdatasync failure must propagate")
+				.to_string()
+				.contains("fdatasync")
+		);
+		assert!(finish_ops.fired());
+		finish_build.release_write_scratch();
+		assert!(finish_build.scratch_plaintext.is_empty());
+		assert!(finish_build.scratch_refs.is_empty());
+		finish_build.cleanup().await;
+
+		let insert_dir = test_spill_dir("coalesced_insert_failure");
+		let mut insert_build =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), insert_dir.clone())
+				.await
+				.expect("create insert-failure spill");
+		insert_build.fail_candidate_index_insert_at = Some(1);
+		assert!(
+			insert_build
+				.write_batch_chunks_coalesced_profiled(
+					&full_batch,
+					JoinKeyPlan::Int64,
+					&[ColumnOrdinal(0)],
+					false,
+					CoalescedPageIndexMode::IndexAtFlush,
+					budget,
+					None,
+				)
+				.await
+				.expect_err("index insertion failure must propagate")
+				.to_string()
+				.contains("injected coalesced index insertion")
+		);
+		assert_eq!(
+			insert_build.coalesced_index_mode,
+			Some(CoalescedPageIndexMode::IndexAtFlush)
+		);
+		assert_eq!(insert_build.index_rebuild_calls(), 0);
+		insert_build.release_write_scratch();
+		assert!(insert_build.scratch_plaintext.is_empty());
+		assert!(insert_build.scratch_refs.is_empty());
+		insert_build.cleanup().await;
+
+		let cleanup_dir = test_spill_dir("coalesced_cleanup_failure");
+		let cleanup_ops = Arc::new(CoalescedFaultFileOps::new(CoalescedFileFault::Cleanup));
+		let cleanup_build =
+			SpilledInnerJoinBuild::create(budget, cleanup_ops.clone(), cleanup_dir.clone())
+				.await
+				.expect("create cleanup-failure spill");
+		cleanup_build.cleanup().await;
+		assert!(cleanup_ops.fired());
+
+		for dir in [write_dir, finish_dir, insert_dir, cleanup_dir] {
+			let _ = std::fs::remove_dir_all(dir);
+		}
 	}
 
 	fn encoded_int64_join_key(key: i64) -> Vec<u8> {

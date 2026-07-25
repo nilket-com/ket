@@ -343,6 +343,7 @@ enum GroupedChainSpillObserverKind<'a> {
 
 pub(in crate::exec) struct GroupedChainSubLeafTimer<'a> {
 	leaf: GroupedChainSubLeaf,
+	node_name: &'static str,
 	kind: GroupedChainSubLeafTimerKind<'a>,
 	finished: bool,
 }
@@ -499,6 +500,7 @@ impl GroupedChainProfile {
 		drop(state);
 		Ok(GroupedChainSubLeafTimer {
 			leaf,
+			node_name: leaf.name(),
 			kind: GroupedChainSubLeafTimerKind::Grouped {
 				profile: self,
 				started,
@@ -1096,22 +1098,41 @@ impl GroupedChainSpillObserver<'_> {
 		&self,
 		leaf: GroupedChainSubLeaf,
 	) -> Result<GroupedChainSubLeafTimer<'_>, ExecutionError> {
+		self.begin_node_named(leaf, leaf.name())
+	}
+
+	/// Opens one physical timer while allowing the node-attribution vocabulary to use a more precise
+	/// name than the legacy grouped-chain receipt.
+	///
+	/// The grouped-chain schema is sealed around `GroupedChainSubLeaf::ALL`; its callers continue to
+	/// receive the original leaf. Node attribution is allowed to split a merged legacy envelope
+	/// without silently adding, removing, or renaming a grouped-chain receipt field.
+	pub(in crate::exec) fn begin_node_named(
+		&self,
+		leaf: GroupedChainSubLeaf,
+		node_name: &'static str,
+	) -> Result<GroupedChainSubLeafTimer<'_>, ExecutionError> {
 		match self.kind {
-			GroupedChainSpillObserverKind::Grouped(profile) => profile.begin_sub_leaf(leaf),
+			GroupedChainSpillObserverKind::Grouped(profile) => {
+				let mut timer = profile.begin_sub_leaf(leaf)?;
+				timer.node_name = node_name;
+				Ok(timer)
+			}
 			GroupedChainSpillObserverKind::Node {
 				handle,
 				parent,
 				telemetry,
 			} => {
-				let token = node_attribution::open_substage(handle, parent, leaf.name(), telemetry)
+				let token = node_attribution::open_substage(handle, parent, node_name, telemetry)
 					.ok_or_else(|| ExecutionError::Kernel {
-						message: format!(
-							"node spill refinement {} could not open under {parent}",
-							leaf.name()
-						),
-					})?;
+					message: format!(
+						"node spill refinement {} could not open under {parent}",
+						node_name
+					),
+				})?;
 				Ok(GroupedChainSubLeafTimer {
 					leaf,
+					node_name,
 					kind: GroupedChainSubLeafTimerKind::Node {
 						handle,
 						parent,
@@ -1234,7 +1255,7 @@ impl GroupedChainSubLeafTimer<'_> {
 				node_attribution::record_spill_subleaf_observation(
 					handle,
 					parent,
-					self.leaf.name(),
+					self.node_name,
 					rows,
 					bytes,
 					pages,
@@ -1242,7 +1263,7 @@ impl GroupedChainSubLeafTimer<'_> {
 				let token = token.take().ok_or_else(|| ExecutionError::Kernel {
 					message: format!(
 						"node spill refinement {} was already closed",
-						self.leaf.name()
+						self.node_name
 					),
 				})?;
 				node_attribution::close_stage(token, telemetry);
@@ -1507,8 +1528,13 @@ mod tests {
 				.into_iter()
 				.filter(|sub_leaf| sub_leaf.parent() == leaf)
 			{
-				profile
-					.begin_sub_leaf(sub_leaf)
+				let observer = profile.spill_observer();
+				let timer = if sub_leaf == GroupedChainSubLeaf::WritePartitionRouting {
+					observer.begin_node_named(sub_leaf, "write_page_key_extraction")
+				} else {
+					observer.begin(sub_leaf)
+				};
+				timer
 					.expect("begin sub-leaf")
 					.finish_with(1, 2, 1)
 					.expect("finish sub-leaf");
@@ -1638,6 +1664,21 @@ mod tests {
 		assert_eq!(
 			value["sub_leaves"].as_array().expect("sub leaves").len(),
 			15
+		);
+		assert!(
+			value["sub_leaves"]
+				.as_array()
+				.expect("sub leaves")
+				.iter()
+				.any(|leaf| leaf["name"] == "write_partition_routing")
+		);
+		assert!(
+			!value["sub_leaves"]
+				.as_array()
+				.expect("sub leaves")
+				.iter()
+				.any(|leaf| leaf["name"] == "write_page_key_extraction"),
+			"the node-only split must not rename the sealed grouped-chain field"
 		);
 		assert_eq!(
 			value["parent_refinements"]
