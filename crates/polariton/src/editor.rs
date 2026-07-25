@@ -100,6 +100,7 @@ pub enum EditorMsg {
 	EngineReady,
 	CursorBlinkTick(time::Instant),
 	BusySpinnerTick(time::Instant),
+	GitRefreshTick,
 	WindowFocused(bool),
 	ActivateDocTab {
 		pane_id: libaryon::core::PaneId,
@@ -264,6 +265,12 @@ impl BusySpinner {
 			self.last_tick = now;
 		}
 	}
+}
+
+fn git_refresh_period(viewport: Option<&Viewport>) -> Option<Duration> {
+	let viewport = viewport?;
+	(viewport.git_refresh_seconds > 0 && viewport.panes.iter().any(|pane| pane.is_git_status_panel))
+		.then(|| Duration::from_secs(viewport.git_refresh_seconds))
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -912,12 +919,17 @@ impl CodeEditor {
 		} else {
 			Subscription::none()
 		};
+		let git_refresh = git_refresh_period(self.viewport.as_ref())
+			.map_or_else(Subscription::none, |period| {
+				time::every(period).map(|_| EditorMsg::GitRefreshTick)
+			});
 		Subscription::batch([
 			event::listen_with(|event, status, _window| editor_input_for(&event, status)),
 			Subscription::run_with(self.engine_wake.clone(), engine_wake_stream)
 				.map(|()| EditorMsg::EngineReady),
 			blink,
 			busy_spinner,
+			git_refresh,
 		])
 	}
 
@@ -1048,6 +1060,13 @@ impl CodeEditor {
 			}
 			EditorMsg::BusySpinnerTick(now) => {
 				self.busy_spinner.advance(now);
+			}
+			EditorMsg::GitRefreshTick => {
+				// A final timer event can already be queued when the pane closes
+				// or the interval is disabled. Recheck the latest projection.
+				if git_refresh_period(self.viewport.as_ref()).is_some() {
+					self.send(EditorCommand::GitStatus);
+				}
 			}
 			EditorMsg::WindowFocused(focused) => {
 				self.cursor_blink
@@ -3870,9 +3889,10 @@ mod tests {
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
 		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
 		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb, SplitDirection, UiPalette,
-		command_bar_fragments, fence_body_start, highlight_span_at, markdown_code_fragments,
-		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
-		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
+		command_bar_fragments, fence_body_start, git_refresh_period, highlight_span_at,
+		markdown_code_fragments, metrics, pane_gutter_width, pane_title, parse_markdown_blocks,
+		preview_row_budget, preview_source_window, prompt_cursor_byte, viewport_cells,
+		visible_blocks,
 	};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
@@ -6250,6 +6270,73 @@ mod tests {
 					.pane(git_pane)
 					.is_some_and(|pane| pane.is_git_status_panel),
 				"opening a Git entry keeps the status pane alive"
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(repo);
+	}
+
+	#[test]
+	fn git_refresh_tick_updates_an_open_status_pane() {
+		let repo = navigation_fixture("git-refresh");
+		std::fs::create_dir_all(&repo).expect("create Git fixture");
+		let initialized = std::process::Command::new("git")
+			.args(["init", "--quiet"])
+			.current_dir(&repo)
+			.status()
+			.expect("run git init");
+		assert!(initialized.success(), "git init failed");
+		let source = repo.join("main.rs");
+		std::fs::write(&source, "fn main() {}\n").expect("write source fixture");
+
+		{
+			let mut editor = CodeEditor::open_initial_file(source.to_string_lossy().into_owned());
+			wait_for_content(&mut editor, "fn main() {}\n");
+			editor.send(EditorCommand::GitStatus);
+
+			let pane_text = |editor: &CodeEditor| {
+				editor
+					.viewport
+					.as_ref()
+					.and_then(|viewport| {
+						viewport.panes.iter().find(|pane| pane.is_git_status_panel)
+					})
+					.map(|pane| {
+						String::from_utf8_lossy(
+							&pane
+								.tokens
+								.iter()
+								.flat_map(|token| token.text.iter().copied())
+								.collect::<Vec<_>>(),
+						)
+						.into_owned()
+					})
+			};
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while pane_text(&editor).is_none_or(|text| !text.contains("?? main.rs"))
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert_eq!(
+				git_refresh_period(editor.viewport.as_ref()),
+				Some(Duration::from_secs(7)),
+				"an open Git pane subscribes at the projected refresh cadence"
+			);
+
+			std::fs::write(repo.join("later.txt"), "dirty\n").expect("dirty Git fixture");
+			let _ = editor.update(EditorMsg::GitRefreshTick);
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while pane_text(&editor).is_none_or(|text| !text.contains("?? later.txt"))
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert!(
+				pane_text(&editor).is_some_and(|text| text.contains("?? later.txt")),
+				"timer tick must refresh the existing Git pane"
 			);
 		}
 
