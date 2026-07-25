@@ -329,3 +329,132 @@ through `tail` or a zero-match `grep`.
 
 Repeat the applicable seal gate after any code change made in response. Finish all gates before
 starting measurement.
+
+## Measured outcome
+
+### Immutable seal and artifacts
+
+Steps 1-4 were sealed and pushed as `ac5e870861f4`. All evidence below was produced by the release
+binary built from that clean, unamended identity after the repository gates completed.
+
+| evidence | artifact |
+|---|---|
+| q01-q22 production-route census | `target/tpch/adr510_route_census_ac5e8708/` |
+| m00-m10 ladder census | `target/tpch/adr510_ladder_census_ac5e8708/` |
+| production m06 control/candidate | `target/tpch/adr510_m06_{control,candidate}_ac5e8708/` |
+| reached legacy m06 control/candidate | `target/tpch/adr510_m06_reached_{control,candidate}_ac5e8708/` |
+| q17 gate, diagnostic pair, and cohort | `target/tpch/adr510_q17_paired_ac5e8708/` |
+
+Every persisted row carries `dataset_verification = full_hash`, explicit 2 GiB task and spill
+budgets, release profile, and `build_commit = ac5e870861f4`.
+
+### Reach and correctness
+
+The sf=8 production census completed 22/22 q-series cells. q17 is the only production cell whose
+committed spill observation is `partitioned_streaming_scan_build`; q11, q14, and q19 are the only
+other cells with a stamped join-spill path, and all three are `in_memory`.
+
+The primitive census corrects the plan's inherited reach premise. After ADR 492, production m06
+honors its physical build and commits `in_memory` at the 2 GiB coordinate. It is not a second
+production-reached ADR 510 cell. The m00-m10 ladder nevertheless passed in both Toron and the
+single-thread DuckDB reference. Re-running m06 with ADR 492's documented control
+`TORON_TPCH_PHYSICAL_SCAN_BUILD=0` re-exposes the legacy partitioned shape. Both ADR 510 arms then
+passed with identical digest, schema, one-row count, plan fingerprint, replay-0
+`partitioned_streaming_scan_build` route, and 88,648,880 spill bytes. This is compatibility
+coverage, not an m06 performance claim.
+
+Strict q17 correctness at the supported sf=0.02 oracle coordinate passed in both mechanism arms.
+The exact sf=8 gate below supplies the persisted result, route, geometry, and lifecycle invariants
+that the q17 oracle rail deliberately does not admit.
+
+### Shape-preserving gate
+
+The live gate passed before the first cohort child. Both arms had the same digest, schema, one-row
+count, plan fingerprint, route, 622,544,968 spill bytes, 16 partitions, four groups, 6,059 pages,
+page-row vector, ciphertext-size vector, and explicit budgets.
+
+| lifecycle fact | control | candidate |
+|---|---:|---:|
+| mode | `rebuild_after_write` | `index_at_flush` |
+| indexed flush pages | 0 | 6,059 |
+| checked guards after indexed flush | 0 | 6,059 |
+| index rebuild calls | 16 | 0 |
+| build physical-read pages | 6,059 | 0 |
+| live guard after every indexed flush | n/a | true |
+
+The diagnostic split reproduced exactly 191,956,028 exchange rows, 191,956,028 active-group rows,
+and 47,989,007 page-key rows: `4x + 4x + 1x`. Node time and node spill each reconcile with zero
+residual in both arms, with zero interleaved frames, bridge mismatches, or stage mismatches.
+
+Residency passed in all four groups. The minimum literal task-budget headroom was 1,958,014,137 B
+for control and 1,991,231,697 B for candidate. `target/tpch/join_spill` was empty after the gate and
+after the cohort.
+
+### Diagnostic transfer
+
+The gate pair is explanatory only; its timings do not enter the paired estimator.
+
+| diagnostic | control | candidate | candidate - control |
+|---|---:|---:|---:|
+| `join0_build` | 19,356.351 ms | 18,470.573 ms | -885.778 ms |
+| `join0_probe` | 1,000.475 ms | 1,027.437 ms | +26.962 ms |
+| execute-bound span | 34,844.363 ms | 34,018.714 ms | -825.649 ms |
+| build physical read | 303.612 ms | absent / zero pages | -303.612 ms |
+| build decrypt | 108.819 ms | absent | -108.819 ms |
+| build IPC decode | 636.016 ms | absent | -636.016 ms |
+| build index-rebuild CPU envelope | 6,260.442 ms | absent | -6,260.442 ms |
+
+The removed rebuild leaves do not become a like-sized net saving. The `join0_build` refinement
+residual expands from 468.625 ms in control to 7,260.937 ms in candidate. That residual is an
+envelope, not a component: indexed-at-flush moves retained insertion work into the write lifecycle,
+but the diagnostic does not separately price insertion there. The direct paired result below is
+therefore the authority on net movement.
+
+There is no observed cache-transfer penalty. The control build has 6,059 decoded and plaintext
+cache misses while the candidate build has zero build reads. Both probe arms retain exactly 45,150
+decoded-cache hits, 6,059 decoded-cache misses, and 6,059 plaintext-cache misses. Probe physical
+read, decrypt, and decode times remain close: 129.569/90.512/582.179 ms in control and
+138.491/92.206/591.342 ms in candidate.
+
+### Locked paired cohort
+
+The journal contains one discarded warmup and exactly 20 measured rows: 10 candidate and 10
+control. All 21 rows are passing, full-hash, clean `ac5e870861f4` rows with one shared digest,
+schema, plan, route, spill total, and budget coordinate.
+
+| pair | candidate | control | control - candidate |
+|---:|---:|---:|---:|
+| 1 | 33,850.697 ms | 34,564.042 ms | 713.345 ms |
+| 2 | 33,354.442 ms | 34,962.683 ms | 1,608.241 ms |
+| 3 | 33,660.109 ms | 34,195.269 ms | 535.160 ms |
+| 4 | 33,161.851 ms | 35,124.330 ms | 1,962.479 ms |
+| 5 | 33,768.168 ms | 34,437.300 ms | 669.132 ms |
+| 6 | 33,673.773 ms | 34,585.356 ms | 911.583 ms |
+| 7 | 33,708.523 ms | 34,774.118 ms | 1,065.594 ms |
+| 8 | 33,206.738 ms | 57,522.572 ms | 24,315.834 ms |
+| 9 | 45,591.324 ms | 38,042.522 ms | -7,548.802 ms |
+| 10 | 35,687.826 ms | 36,914.158 ms | 1,226.331 ms |
+
+The predeclared paired result is:
+
+```text
+Hodges-Lehmann point        = 1,068.957 ms
+two-sided 95% interval      = [-2,970.280, 12,425.497] ms
+fixed materiality floor     = 3,554 ms
+interval excludes zero      = false
+point reaches floor         = false
+activate                    = false
+```
+
+The generic unpaired summary pools both mechanisms and flags the resulting 0.706 spread as
+`unstable`, so it correctly refuses to write a normal performance baseline. That flag does not
+replace or invalidate the configuration-locked paired analysis; the two large late-run excursions
+are retained in the predeclared estimator and are why its interval remains unresolved. There is no
+post-hoc sample extension.
+
+### Closure
+
+ADR 510 closes red. Indexed-at-flush is correct, shape-preserving, and comfortably resident, but
+the measured point is below the fixed floor and the interval includes zero. Production therefore
+remains `RebuildAfterWrite`; no default flip or successor-mechanism pivot is included in this
+receipt.
