@@ -49,7 +49,7 @@ pub(super) fn write_init_file(
 	path: &Path,
 	entrypoint: &str,
 	settings: &SettingsPersistent,
-	git_refresh_seconds: u64,
+	git_refresh_mode: crate::engine::GitRefreshMode,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<std::path::PathBuf, String> {
@@ -57,7 +57,7 @@ pub(super) fn write_init_file(
 		path,
 		entrypoint,
 		settings,
-		git_refresh_seconds,
+		git_refresh_mode,
 		language_registry,
 		force,
 	)?;
@@ -95,7 +95,7 @@ fn write_default_init_file_at(
 		path,
 		entrypoint,
 		&SettingsPersistent::builtin_defaults(),
-		super::super::session::DEFAULT_GIT_REFRESH_SECONDS,
+		super::super::session::DEFAULT_GIT_REFRESH_MODE,
 		language_registry,
 		true,
 	)
@@ -105,7 +105,7 @@ fn write_init_file_at(
 	path: &std::path::Path,
 	entrypoint: &str,
 	settings: &SettingsPersistent,
-	git_refresh_seconds: u64,
+	git_refresh_mode: crate::engine::GitRefreshMode,
 	language_registry: &super::super::language::LanguageRegistry,
 	force: bool,
 ) -> Result<(), String> {
@@ -117,7 +117,7 @@ fn write_init_file_at(
 	} else {
 		None
 	};
-	let rendered = render_init_function(entrypoint, settings, git_refresh_seconds);
+	let rendered = render_init_function(entrypoint, settings, git_refresh_mode);
 	let source = if let Some(contents) = contents.as_deref() {
 		let target_exists = has_init_function(contents, entrypoint)?;
 		if entrypoint == "main" && force {
@@ -129,7 +129,7 @@ fn write_init_file_at(
 				contents,
 				entrypoint,
 				settings,
-				git_refresh_seconds,
+				git_refresh_mode,
 				language_registry,
 			)?
 		}
@@ -287,7 +287,9 @@ pub(super) fn init_setting_edit(
 			key: InitConfigKey::UiColor(key.canonical_name().to_string()),
 			value: value.map(|color| color.to_hex()),
 		}),
-		EditorCommand::SetGitRefresh(seconds) => Some(set("gitrefresh", seconds.to_string())),
+		EditorCommand::SetGitRefresh(mode) => {
+			Some(set("gitrefresh", git_refresh_rune_value(*mode)))
+		}
 		_ => None,
 	}
 }
@@ -435,7 +437,7 @@ fn update_init_file(
 	source: &str,
 	entrypoint: &str,
 	settings: &SettingsPersistent,
-	git_refresh_seconds: u64,
+	git_refresh_mode: crate::engine::GitRefreshMode,
 	language_registry: &super::super::language::LanguageRegistry,
 ) -> Result<String, String> {
 	let file = parse_init_source(source)?;
@@ -455,7 +457,7 @@ fn update_init_file(
 			"init.rn `{entrypoint}` has no `let config = editor.config();` binding for :set init to update; use :set init! to replace it"
 		)
 	})?;
-	let desired = init_config_operations(settings, git_refresh_seconds, &binding);
+	let desired = init_config_operations(settings, git_refresh_mode, &binding);
 	let mut patches = Vec::new();
 	let mut remaining = desired;
 
@@ -517,7 +519,7 @@ fn config_binding(source: &str, main: &ast::ItemFn) -> Option<String> {
 
 fn init_config_operations(
 	settings: &SettingsPersistent,
-	git_refresh_seconds: u64,
+	git_refresh_mode: crate::engine::GitRefreshMode,
 	binding: &str,
 ) -> BTreeMap<InitConfigKey, String> {
 	let mut operations = BTreeMap::new();
@@ -541,7 +543,7 @@ fn init_config_operations(
 		"savedurability",
 		rune_string(settings.save_durability.as_str()),
 	);
-	set("gitrefresh", git_refresh_seconds.to_string());
+	set("gitrefresh", git_refresh_rune_value(git_refresh_mode));
 	for key in crate::engine::ui_colors::UiColorKey::ALL {
 		if let Some(color) = settings.ui_colors.get(key) {
 			let name = key.canonical_name().to_string();
@@ -786,7 +788,7 @@ fn validate_init_source(source: &str) -> Result<(), String> {
 fn render_init_function(
 	entrypoint: &str,
 	settings: &SettingsPersistent,
-	git_refresh_seconds: u64,
+	git_refresh_mode: crate::engine::GitRefreshMode,
 ) -> String {
 	let mut source = format!("pub fn {entrypoint}(editor) {{\n");
 	source.push_str("\tlet config = editor.config();\n");
@@ -808,7 +810,8 @@ fn render_init_function(
 	);
 	writeln!(
 		&mut source,
-		"\tconfig.set(\"gitrefresh\", {git_refresh_seconds})?;"
+		"\tconfig.set(\"gitrefresh\", {})?;",
+		git_refresh_rune_value(git_refresh_mode)
 	)
 	.expect("writing to String cannot fail");
 	for key in crate::engine::ui_colors::UiColorKey::ALL {
@@ -869,6 +872,14 @@ fn rune_string(value: &str) -> String {
 	}
 	escaped.push('"');
 	escaped
+}
+
+fn git_refresh_rune_value(mode: crate::engine::GitRefreshMode) -> String {
+	match mode {
+		crate::engine::GitRefreshMode::Disabled => "0".to_string(),
+		crate::engine::GitRefreshMode::Watch => rune_string("watch"),
+		crate::engine::GitRefreshMode::Interval(seconds) => seconds.to_string(),
+	}
 }
 
 pub(super) fn allocate_dynamic_device_id(next_dynamic_device_id: &mut u16) -> Result<u16, String> {
@@ -2220,7 +2231,7 @@ mod tests {
 			path,
 			"main",
 			settings,
-			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
+			crate::engine::session::DEFAULT_GIT_REFRESH_MODE,
 			&language_registry,
 			force,
 		)
@@ -2362,7 +2373,7 @@ mod tests {
 		let source = super::render_init_function(
 			"main",
 			&settings,
-			crate::engine::session::DEFAULT_GIT_REFRESH_SECONDS,
+			crate::engine::session::DEFAULT_GIT_REFRESH_MODE,
 		);
 		assert!(source.contains("\tlet config = editor.config();"));
 		assert!(source.contains("\tconfig.set(\"theme\", \"gruvbox\")?;"));
@@ -2500,6 +2511,29 @@ mod tests {
 			std::fs::read_to_string(&path).expect("read preserved init"),
 			changed
 		);
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn git_refresh_watch_mode_persists_as_an_explicit_string() {
+		let path = temp_test_path("init-git-refresh-watch");
+		std::fs::write(
+			&path,
+			"pub fn main(editor) {\n\tlet config = editor.config();\n\tconfig.set(\"gitrefresh\", 7)?;\n\tOk(())\n}\n",
+		)
+		.expect("write initial init");
+
+		assert!(
+			persist_test_setting(
+				&path,
+				EditorCommand::SetGitRefresh(crate::engine::GitRefreshMode::Watch),
+			)
+			.expect("persist watch-only mode")
+		);
+		let updated = std::fs::read_to_string(&path).expect("read updated init");
+		assert!(updated.contains("config.set(\"gitrefresh\", \"watch\")?;"));
+		assert!(!updated.contains("config.set(\"gitrefresh\", 7)?;"));
+
 		let _ = std::fs::remove_file(path);
 	}
 
@@ -4806,6 +4840,7 @@ mod tests {
 			.iter()
 			.find(|pane| pane.is_output_panel)
 			.expect("GitStatus must create an output panel");
+		assert_eq!(panel.git_status_repo_root.as_deref(), Some(repo.as_path()));
 		assert_eq!(panel_pane.gutter_numbering, None);
 		assert!(
 			panel_pane.minimap.is_none(),
@@ -4883,6 +4918,90 @@ mod tests {
 		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
 		handle.join().expect("engine thread exits");
 		let _ = fs::remove_dir_all(repo);
+	}
+
+	#[test]
+	fn automatic_git_refresh_stays_bound_to_the_open_panels_repository() {
+		let repo_a = temp_test_path("git-refresh-repo-a");
+		let repo_b = temp_test_path("git-refresh-repo-b");
+		for repo in [&repo_a, &repo_b] {
+			fs::create_dir_all(repo).expect("create git fixture");
+			let initialized = Command::new("git")
+				.args(["init", "--quiet"])
+				.current_dir(repo)
+				.status()
+				.expect("run git init");
+			assert!(initialized.success(), "git init failed");
+			fs::write(repo.join("main.rs"), "fn main() {}\n").expect("write source");
+		}
+		fs::write(repo_a.join("only-a.txt"), "a\n").expect("write repo A marker");
+		fs::write(repo_b.join("only-b.txt"), "b\n").expect("write repo B marker");
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(true, false, None);
+		let loaded_a = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(repo_a.join("main.rs").to_string_lossy().into_owned()),
+		);
+		let source_pane_id = loaded_a.focused_pane_id;
+		let mut panel = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::GitStatus);
+		for _ in 0..4 {
+			let Some(panel_pane) = panel.panes.iter().find(|pane| pane.is_git_status_panel) else {
+				break;
+			};
+			if pane_text(&panel, panel_pane.pane_id).contains("?? only-a.txt") {
+				break;
+			}
+			panel = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::RefreshGitStatus);
+		}
+		assert_eq!(
+			panel.git_status_repo_root.as_deref(),
+			Some(repo_a.as_path())
+		);
+
+		let _focused =
+			send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::FocusPane(source_pane_id));
+		let _loaded_b = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(repo_b.join("main.rs").to_string_lossy().into_owned()),
+		);
+		let mut refreshed = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::RefreshGitStatus);
+		for _ in 0..4 {
+			assert_eq!(
+				refreshed.git_status_repo_root.as_deref(),
+				Some(repo_a.as_path()),
+				"automatic refresh must ignore unrelated editor focus"
+			);
+			let Some(panel_pane) = refreshed.panes.iter().find(|pane| pane.is_git_status_panel)
+			else {
+				break;
+			};
+			let text = pane_text(&refreshed, panel_pane.pane_id);
+			if text.contains("?? only-a.txt") && !text.contains("only-b.txt") {
+				break;
+			}
+			refreshed = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::RefreshGitStatus);
+		}
+		let panel_pane = refreshed
+			.panes
+			.iter()
+			.find(|pane| pane.is_git_status_panel)
+			.expect("Git pane remains open");
+		let text = pane_text(&refreshed, panel_pane.pane_id);
+		assert!(
+			text.contains("?? only-a.txt"),
+			"unexpected Git pane: {text:?}"
+		);
+		assert!(
+			!text.contains("only-b.txt"),
+			"Git pane retargeted: {text:?}"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("engine thread exits");
+		let _ = fs::remove_dir_all(repo_a);
+		let _ = fs::remove_dir_all(repo_b);
 	}
 
 	/// Waits until the background metric scan has published an exact line count.

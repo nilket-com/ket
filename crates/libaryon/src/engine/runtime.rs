@@ -54,7 +54,7 @@ use super::session::{
 use super::settings::SaveDurability;
 use super::shadow::discard_shadow_session;
 use super::ui_colors::UiColorKey;
-use crate::core::{DocByte, DocLine, PaneId, RequestId, StateId};
+use crate::core::{BufferId, DocByte, DocLine, PaneId, RequestId, StateId};
 use crate::ecs::UastRegistry;
 use crate::svp::SvpResolver;
 use crate::svp::diagnostic::DiagnosticSpan;
@@ -153,6 +153,7 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 	) -> SubscriberOutcome {
 		if let Some(action) = invocation.action::<super::git::GitStatusAction>() {
 			context.session.git_status_job = None;
+			let refresh_pending = std::mem::take(&mut context.session.git_status_refresh_pending);
 			let mut output = Vec::new();
 			for chunk in completion.stdout.chunks() {
 				output.extend_from_slice(chunk);
@@ -183,6 +184,13 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 				return SubscriberOutcome::failed(BoundedStatus::fixed(
 					"Git status panel is no longer available",
 				));
+			}
+			if refresh_pending
+				&& let Some(repo_root) = context.session.git_status_repo_root.clone()
+				&& let Err(error) =
+					start_git_status_job(&mut context.session, action.buffer_id, repo_root)
+			{
+				context.session.ui.status_message = Some(format!("Git status: {error}"));
 			}
 			return SubscriberOutcome {
 				needs_render: true,
@@ -1336,6 +1344,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::ClearSearch
 		| EditorCommand::SetLanguage(_)
 		| EditorCommand::GitStatus
+		| EditorCommand::RefreshGitStatus
 		| EditorCommand::OpenGitStatusEntry(_)
 		| EditorCommand::MouseIntent { .. }
 		| EditorCommand::QueryDocumentText
@@ -1574,6 +1583,32 @@ fn git_status_entry_path(
 	Ok(path)
 }
 
+fn start_git_status_job(
+	session: &mut EditorSession,
+	buffer_id: BufferId,
+	repo_root: PathBuf,
+) -> Result<(), String> {
+	let spec = JobSpec {
+		program: PathBuf::from("git"),
+		args: vec![
+			"--no-optional-locks".into(),
+			"status".into(),
+			"--porcelain=v2".into(),
+			"--branch".into(),
+		],
+		cwd: Some(repo_root),
+		stdin: None,
+		timeout: Duration::from_secs(10),
+		completion: Some(super::git::git_status_action_lease(buffer_id)),
+	};
+	let job = session
+		.jobs
+		.spawn(super::git::GIT_JOB_OWNER, true, spec)
+		.map_err(|error| error.to_string())?;
+	session.git_status_job = Some(job);
+	Ok(())
+}
+
 fn select_git_status_target_pane(
 	session: &EditorSession,
 	source_pane_id: PaneId,
@@ -1799,7 +1834,7 @@ fn dispatch_command(
 						path,
 						runtime.init_entrypoint.unwrap_or("main"),
 						&session.persistent_settings,
-						session.git_refresh_seconds,
+						session.git_refresh_mode,
 						lang_registry,
 						force,
 					)
@@ -3021,53 +3056,64 @@ fn dispatch_command(
 				}
 			}
 		}
-		EditorCommand::SetGitRefresh(seconds) => {
-			session.git_refresh_seconds = seconds;
-			session.ui.status_message = Some(if seconds == 0 {
-				"Git refresh disabled".to_string()
-			} else {
-				format!("Git refresh set to {seconds}s")
+		EditorCommand::SetGitRefresh(mode) => {
+			session.git_refresh_mode = mode;
+			session.ui.status_message = Some(match mode {
+				super::protocol::GitRefreshMode::Disabled => "Git refresh disabled".to_string(),
+				super::protocol::GitRefreshMode::Watch => {
+					"Git refresh set to watch-preferred mode".to_string()
+				}
+				super::protocol::GitRefreshMode::Interval(seconds) => {
+					format!("Git refresh set to observation + {seconds}s polling")
+				}
 			});
 			if let Some(edit) =
-				system::init_setting_edit(&EditorCommand::SetGitRefresh(seconds), lang_registry)
+				system::init_setting_edit(&EditorCommand::SetGitRefresh(mode), lang_registry)
 			{
 				append_init_persistence_status(runtime, session, &edit);
 			}
 			needs_render = true;
 		}
-		EditorCommand::GitStatus => {
-			let (buffer_id, _) = match session.ensure_output_panel(registry, "git-status") {
-				Ok(result) => result,
-				Err(error) => {
-					session.ui.status_message = Some(error);
-					return DispatchOutcome::continue_with(true);
+		command @ (EditorCommand::GitStatus | EditorCommand::RefreshGitStatus) => {
+			let automatic_refresh = matches!(command, EditorCommand::RefreshGitStatus);
+			let buffer_id = if automatic_refresh {
+				let Some(buffer_id) = session.output_panels.get("git-status").copied() else {
+					return DispatchOutcome::continue_with(false);
+				};
+				if session.layout.view_id_for_buffer(buffer_id).is_none() {
+					return DispatchOutcome::continue_with(false);
+				}
+				buffer_id
+			} else {
+				match session.ensure_output_panel(registry, "git-status") {
+					Ok((buffer_id, _)) => buffer_id,
+					Err(error) => {
+						session.ui.status_message = Some(error);
+						return DispatchOutcome::continue_with(true);
+					}
 				}
 			};
-			if session.git_status_job.is_none() {
+			if session.git_status_job.is_some() {
+				// Observer bursts and polling ticks may arrive while Git is
+				// still running. Preserve one trailing refresh rather than
+				// dropping the newest repository state.
+				session.git_status_refresh_pending = true;
+			} else {
 				let focused_buffer_id =
 					focused_doctab(&session.layout, session.focused_pane_id).buffer_id;
-				let repo_root = if focused_buffer_id == buffer_id {
+				let repo_root = if automatic_refresh || focused_buffer_id == buffer_id {
 					session.git_status_repo_root.clone()
 				} else {
 					focused_git_repo_root(session)
 				};
 				if let Some(repo_root) = repo_root {
 					session.git_status_repo_root = Some(repo_root.clone());
-					let spec = JobSpec {
-						program: PathBuf::from("git"),
-						args: vec!["status".into(), "--porcelain=v2".into(), "--branch".into()],
-						cwd: Some(repo_root),
-						stdin: None,
-						timeout: Duration::from_secs(10),
-						completion: Some(super::git::git_status_action_lease(buffer_id)),
-					};
-					match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
-						Ok(job) => session.git_status_job = Some(job),
-						Err(error) => {
-							session.ui.status_message = Some(format!("Git status: {error}"))
-						}
+					session.git_status_refresh_pending = false;
+					if let Err(error) = start_git_status_job(session, buffer_id, repo_root) {
+						session.ui.status_message = Some(format!("Git status: {error}"));
 					}
 				} else {
+					session.git_status_refresh_pending = false;
 					session.git_status_branch = None;
 					session.git_status_repo_root = None;
 					if let Err(error) = session.replace_output_panel(

@@ -260,7 +260,7 @@ pub enum EditorCommand {
 	PersistVisibleWhitespace(bool),
 	PersistReload(bool),
 	PersistSaveDurability(SaveDurability),
-	SetGitRefresh(u64),
+	SetGitRefresh(GitRefreshMode),
 	/// Atomically export the current persistent settings as `init.rn`.
 	WriteInit {
 		force: bool,
@@ -361,6 +361,11 @@ pub enum EditorCommand {
 	},
 	CheckFileReload,
 	GitStatus,
+	/// Refresh an already-open Git pane in its existing repository.
+	///
+	/// Frontend timers and filesystem observers use this instead of
+	/// [`Self::GitStatus`] so focus changes cannot retarget the pane.
+	RefreshGitStatus,
 	OpenGitStatusEntry(DocLine),
 	DiffSplit(String),
 	MarkdownPreview {
@@ -454,6 +459,52 @@ pub enum EditorCommand {
 	},
 	SetLanguage(Option<String>),
 	Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitRefreshMode {
+	/// No timer and no filesystem observer.
+	Disabled,
+	/// Filesystem observation without a timer. Frontends without observation
+	/// support fall back to the default polling interval.
+	Watch,
+	/// Filesystem observation where supported, plus polling at this interval.
+	Interval(u64),
+}
+
+pub const DEFAULT_GIT_REFRESH_SECONDS: u64 = 7;
+
+impl GitRefreshMode {
+	pub fn poll_seconds(self, observation_available: bool) -> Option<u64> {
+		match self {
+			Self::Interval(seconds) if seconds > 0 => Some(seconds),
+			Self::Watch if !observation_available => Some(DEFAULT_GIT_REFRESH_SECONDS),
+			Self::Disabled | Self::Watch | Self::Interval(_) => None,
+		}
+	}
+
+	pub fn watch_enabled(self) -> bool {
+		match self {
+			Self::Disabled | Self::Interval(0) => false,
+			Self::Watch | Self::Interval(_) => true,
+		}
+	}
+}
+
+#[cfg(test)]
+mod git_refresh_mode_tests {
+	use super::{DEFAULT_GIT_REFRESH_SECONDS, GitRefreshMode};
+
+	#[test]
+	fn watch_only_falls_back_to_polling_without_an_observer() {
+		assert_eq!(GitRefreshMode::Watch.poll_seconds(true), None);
+		assert_eq!(
+			GitRefreshMode::Watch.poll_seconds(false),
+			Some(DEFAULT_GIT_REFRESH_SECONDS)
+		);
+		assert_eq!(GitRefreshMode::Disabled.poll_seconds(false), None);
+		assert_eq!(GitRefreshMode::Interval(11).poll_seconds(true), Some(11));
+	}
 }
 
 /// A mouse action interpreted from one rendered viewport.

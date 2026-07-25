@@ -188,11 +188,13 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.as_ref()
 					.is_some_and(|view| view.panes.iter().any(|pane| pane.is_git_status_panel))
 				&& self.current_viewport.as_ref().is_some_and(|view| {
-					view.git_refresh_seconds > 0
-						&& self.last_git_refresh.elapsed()
-							>= Duration::from_secs(view.git_refresh_seconds)
+					view.git_refresh_mode
+						.poll_seconds(false)
+						.is_some_and(|seconds| {
+							self.last_git_refresh.elapsed() >= Duration::from_secs(seconds)
+						})
 				}) {
-				self.send_command(EditorCommand::GitStatus);
+				self.send_command(EditorCommand::RefreshGitStatus);
 				self.last_git_refresh = Instant::now();
 			}
 			if !self.has_pending_requests() && event::poll(Duration::from_millis(16))? {

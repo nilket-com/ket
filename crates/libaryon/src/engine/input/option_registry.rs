@@ -136,8 +136,8 @@ pub(super) static VALUE_OPTIONS: &[ValueOptionSpec] = &[
 	ValueOptionSpec {
 		key: "gitrefresh",
 		aliases: &[],
-		usage: ":set gitrefresh SECONDS",
-		summary: "Git status refresh (0 disables)",
+		usage: ":set gitrefresh SECONDS|watch",
+		summary: "Git refresh (0 off, prefer watch)",
 		completion: ValueCompletion::None,
 		parse: parse_git_refresh,
 	},
@@ -341,13 +341,22 @@ fn parse_save_durability(value: &str) -> Result<EditorCommand, String> {
 }
 
 fn parse_git_refresh(value: &str) -> Result<EditorCommand, String> {
+	use crate::engine::GitRefreshMode;
+
+	if value == "watch" {
+		return Ok(EditorCommand::SetGitRefresh(GitRefreshMode::Watch));
+	}
 	let seconds = value
 		.parse::<u64>()
-		.map_err(|_| "Usage: set gitrefresh SECONDS (zero disables)".to_string())?;
+		.map_err(|_| "Usage: set gitrefresh SECONDS|watch (zero disables)".to_string())?;
 	if seconds > 86_400 {
 		return Err("Git refresh interval must be between 0 and 86400 seconds".to_string());
 	}
-	Ok(EditorCommand::SetGitRefresh(seconds))
+	Ok(EditorCommand::SetGitRefresh(if seconds == 0 {
+		GitRefreshMode::Disabled
+	} else {
+		GitRefreshMode::Interval(seconds)
+	}))
 }
 
 fn parse_language_theme(value: &str) -> Result<EditorCommand, String> {
@@ -629,11 +638,21 @@ mod tests {
 		));
 		assert!(matches!(
 			parse_set_command("gitrefresh 12"),
-			Ok(EditorCommand::SetGitRefresh(12))
+			Ok(EditorCommand::SetGitRefresh(
+				crate::engine::GitRefreshMode::Interval(12)
+			))
 		));
 		assert!(matches!(
 			parse_set_command("gitrefresh 0"),
-			Ok(EditorCommand::SetGitRefresh(0))
+			Ok(EditorCommand::SetGitRefresh(
+				crate::engine::GitRefreshMode::Disabled
+			))
+		));
+		assert!(matches!(
+			parse_set_command("gitrefresh watch"),
+			Ok(EditorCommand::SetGitRefresh(
+				crate::engine::GitRefreshMode::Watch
+			))
 		));
 		assert!(parse_set_command("gitrefresh -1").is_err());
 		// The bounded path trades away crash safety, so it is never reachable by a

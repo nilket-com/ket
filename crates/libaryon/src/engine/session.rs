@@ -3059,12 +3059,14 @@ pub(crate) struct EditorSession {
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
 	pub(crate) git_status_job: Option<JobId>,
+	pub(crate) git_status_refresh_pending: bool,
 	pub(crate) git_status_branch: Option<String>,
 	pub(crate) git_status_repo_root: Option<PathBuf>,
-	pub(crate) git_refresh_seconds: u64,
+	pub(crate) git_refresh_mode: super::protocol::GitRefreshMode,
 }
 
-pub(crate) const DEFAULT_GIT_REFRESH_SECONDS: u64 = 7;
+pub(crate) const DEFAULT_GIT_REFRESH_MODE: super::protocol::GitRefreshMode =
+	super::protocol::GitRefreshMode::Interval(super::protocol::DEFAULT_GIT_REFRESH_SECONDS);
 
 impl EditorSession {
 	#[allow(dead_code)] // first production caller lands in the Rune jobs binding
@@ -3533,9 +3535,10 @@ impl EditorSession {
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),
 			git_status_job: None,
+			git_status_refresh_pending: false,
 			git_status_branch: None,
 			git_status_repo_root: None,
-			git_refresh_seconds: DEFAULT_GIT_REFRESH_SECONDS,
+			git_refresh_mode: DEFAULT_GIT_REFRESH_MODE,
 		}
 	}
 

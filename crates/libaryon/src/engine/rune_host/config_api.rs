@@ -168,8 +168,14 @@ fn parse_set_operation(name: &str, value: Value) -> Result<ConfigOperation, Stri
 		}
 		"gitrefresh" => match value.as_integer::<i64>() {
 			Ok(value) if (0..=86_400).contains(&value) => OptionValue::Integer(value),
-			Ok(_) => return Err(expected(name, "integer from 0 to 86400")),
-			Err(_) => return Err(expected(name, "integer")),
+			Ok(_) => return Err(expected(name, "integer from 0 to 86400 or \"watch\"")),
+			Err(_) => {
+				let value = string_value(&value, name)?;
+				if value != "watch" {
+					return Err(expected(name, "integer from 0 to 86400 or \"watch\""));
+				}
+				OptionValue::String(value)
+			}
 		},
 		_ => return Err(format!("Unknown setting: {name}")),
 	};
@@ -312,7 +318,15 @@ pub(super) fn apply_option(
 					.ok_or_else(|| "Usage: set savedurability atomic|bounded".to_string())?;
 		}
 		("gitrefresh", OptionValue::Integer(value)) if (0..=86_400).contains(&value) => {
-			editor.session.git_refresh_seconds = value as u64;
+			editor.session.git_refresh_mode = if value == 0 {
+				crate::engine::GitRefreshMode::Disabled
+			} else {
+				crate::engine::GitRefreshMode::Interval(value as u64)
+			};
+			editor.mark_needs_render();
+		}
+		("gitrefresh", OptionValue::String(value)) if value == "watch" => {
+			editor.session.git_refresh_mode = crate::engine::GitRefreshMode::Watch;
 			editor.mark_needs_render();
 		}
 		(_, _) => return Err(format!("Invalid value for setting: {name}")),

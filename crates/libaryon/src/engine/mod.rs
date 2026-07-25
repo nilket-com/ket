@@ -63,9 +63,10 @@ pub use self::minimap::{
 	dominant_preview_bin_for_rows, minimap_click_viewport_start_line, sample_preview_bin_range,
 };
 pub use self::protocol::{
-	CommandRange, ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection,
-	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SecretInput, SplitDirection,
-	SubstituteFlags, VerticalDirection, VisualKind, WordMotion,
+	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
+	GitRefreshMode, MouseIntent, MoveDirection, PaneDropEdge, PaneFocusDirection,
+	PaneResizeDirection, SecretInput, SplitDirection, SubstituteFlags, VerticalDirection,
+	VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};

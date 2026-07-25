@@ -36,9 +36,12 @@ use libaryon::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
 };
 use polars::frame::DataFrame;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// The single query-results surface. One stable identity reused for every run,
@@ -194,6 +197,11 @@ enum TextQuery {
 const CURSOR_BLINK_INTERVAL: time::Duration = time::Duration::from_millis(500);
 const CURSOR_BLINK_TICK: time::Duration = time::Duration::from_millis(125);
 const BUSY_SPINNER_INTERVAL: time::Duration = time::Duration::from_millis(80);
+const GIT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+const GIT_WATCH_MAX_DELAY: Duration = Duration::from_secs(1);
+const GIT_WATCH_RETRY_DELAY: Duration = Duration::from_millis(50);
+const GIT_WATCH_PENDING_PATH_LIMIT: usize = 256;
+const GIT_WATCH_DIRECTORY_LIMIT: usize = 8_192;
 
 struct CursorBlink {
 	last_activity: time::Instant,
@@ -267,10 +275,531 @@ impl BusySpinner {
 	}
 }
 
-fn git_refresh_period(viewport: Option<&Viewport>) -> Option<Duration> {
+fn git_refresh_period(
+	viewport: Option<&Viewport>,
+	observation_available: bool,
+) -> Option<Duration> {
 	let viewport = viewport?;
-	(viewport.git_refresh_seconds > 0 && viewport.panes.iter().any(|pane| pane.is_git_status_panel))
-		.then(|| Duration::from_secs(viewport.git_refresh_seconds))
+	viewport
+		.panes
+		.iter()
+		.any(|pane| pane.is_git_status_panel)
+		.then(|| {
+			viewport
+				.git_refresh_mode
+				.poll_seconds(observation_available)
+		})
+		.flatten()
+		.map(Duration::from_secs)
+}
+
+fn git_watch_root(viewport: &Viewport) -> Option<PathBuf> {
+	(viewport.git_refresh_mode.watch_enabled()
+		&& viewport.panes.iter().any(|pane| pane.is_git_status_panel))
+	.then(|| viewport.git_status_repo_root.clone())
+	.flatten()
+}
+
+enum GitWatchMessage {
+	SetRoot(Option<PathBuf>),
+	Event,
+	Shutdown,
+}
+
+#[derive(Default)]
+struct PendingGitWatchEvents {
+	paths: Vec<PathBuf>,
+	overflowed: bool,
+	topology_changed: bool,
+}
+
+struct GitWatchState {
+	root: PathBuf,
+	git_dir: Option<PathBuf>,
+	watched_directories: BTreeSet<PathBuf>,
+}
+
+struct GitWatcher {
+	requested_root: Option<PathBuf>,
+	messages: std::sync::mpsc::Sender<GitWatchMessage>,
+	observation_available: Arc<AtomicBool>,
+	#[cfg(test)]
+	active_root: Arc<Mutex<Option<PathBuf>>>,
+	thread: Option<JoinHandle<()>>,
+}
+
+impl GitWatcher {
+	fn spawn(commands: libaryon::engine::CommandSender) -> Self {
+		let (messages, message_rx) = std::sync::mpsc::channel();
+		let active_root = Arc::new(Mutex::new(None));
+		let worker_active_root = active_root.clone();
+		let observation_available = Arc::new(AtomicBool::new(false));
+		let worker_observation_available = observation_available.clone();
+		let worker_messages = messages.clone();
+		let thread = std::thread::Builder::new()
+			.name("polariton-git-watch".to_string())
+			.spawn(move || {
+				run_git_watcher(
+					commands,
+					worker_messages,
+					message_rx,
+					worker_active_root,
+					worker_observation_available,
+				);
+			})
+			.ok();
+		Self {
+			requested_root: None,
+			messages,
+			observation_available,
+			#[cfg(test)]
+			active_root,
+			thread,
+		}
+	}
+
+	fn set_root(&mut self, root: Option<PathBuf>) {
+		if self.requested_root == root {
+			return;
+		}
+		self.requested_root = root.clone();
+		let _ = self.messages.send(GitWatchMessage::SetRoot(root));
+	}
+
+	fn observation_available(&self) -> bool {
+		self.observation_available.load(Ordering::Acquire)
+	}
+
+	#[cfg(test)]
+	fn is_watching(&self, root: &std::path::Path) -> bool {
+		self.active_root
+			.lock()
+			.is_ok_and(|active| active.as_deref() == Some(root))
+	}
+
+	#[cfg(test)]
+	fn thread_id(&self) -> Option<std::thread::ThreadId> {
+		self.thread.as_ref().map(|thread| thread.thread().id())
+	}
+
+	fn detach(mut self) {
+		let _ = self.messages.send(GitWatchMessage::Shutdown);
+		self.thread.take();
+	}
+}
+
+impl Drop for GitWatcher {
+	fn drop(&mut self) {
+		let _ = self.messages.send(GitWatchMessage::Shutdown);
+		// The worker can be inside Git or a filesystem call on a slow mount.
+		// Dropping the handle detaches it so closing a pane never blocks the UI.
+		self.thread.take();
+	}
+}
+
+fn git_path_from_bytes(bytes: &[u8]) -> PathBuf {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStringExt;
+		PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+	}
+	#[cfg(not(unix))]
+	{
+		PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+	}
+}
+
+fn git_path_bytes(path: &std::path::Path) -> Vec<u8> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		path.as_os_str().as_bytes().to_vec()
+	}
+	#[cfg(not(unix))]
+	{
+		path.to_string_lossy().as_bytes().to_vec()
+	}
+}
+
+fn git_ignored_paths(root: &std::path::Path, paths: &[PathBuf]) -> Option<BTreeSet<PathBuf>> {
+	use std::io::Write;
+	use std::process::Stdio;
+
+	if paths.is_empty() {
+		return Some(BTreeSet::new());
+	}
+	let mut child = std::process::Command::new("git")
+		.args(["check-ignore", "--stdin", "-z"])
+		.current_dir(root)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.ok()?;
+	let Some(mut stdin) = child.stdin.take() else {
+		let _ = child.kill();
+		let _ = child.wait();
+		return None;
+	};
+	let mut input = Vec::new();
+	for path in paths {
+		input.extend_from_slice(&git_path_bytes(path));
+		input.push(0);
+	}
+	let writer = std::thread::spawn(move || stdin.write_all(&input));
+	let output = child.wait_with_output().ok()?;
+	if writer.join().ok()?.is_err() || (!output.status.success() && output.status.code() != Some(1))
+	{
+		return None;
+	}
+	Some(
+		output
+			.stdout
+			.split(|byte| *byte == 0)
+			.filter(|path| !path.is_empty())
+			.map(git_path_from_bytes)
+			.collect(),
+	)
+}
+
+fn git_directory(root: &std::path::Path) -> Option<PathBuf> {
+	let output = std::process::Command::new("git")
+		.args(["rev-parse", "--git-dir"])
+		.current_dir(root)
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let mut path = output.stdout.as_slice();
+	while path
+		.last()
+		.is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+	{
+		path = &path[..path.len().saturating_sub(1)];
+	}
+	if path.is_empty() {
+		return None;
+	}
+	let path = git_path_from_bytes(path);
+	Some(if path.is_absolute() {
+		path
+	} else {
+		root.join(path)
+	})
+}
+
+fn insert_git_ref_directories(path: &std::path::Path, directories: &mut BTreeSet<PathBuf>) {
+	let mut pending = vec![path.to_path_buf()];
+	while let Some(directory) = pending.pop() {
+		if directories.len() >= GIT_WATCH_DIRECTORY_LIMIT || !directories.insert(directory.clone())
+		{
+			continue;
+		}
+		let Ok(entries) = std::fs::read_dir(directory) else {
+			continue;
+		};
+		for entry in entries.flatten() {
+			if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+				pending.push(entry.path());
+			}
+		}
+	}
+}
+
+fn desired_git_watch_directories(root: &std::path::Path) -> (Option<PathBuf>, BTreeSet<PathBuf>) {
+	let mut directories = BTreeSet::from([root.to_path_buf()]);
+	let git_dir = git_directory(root);
+	if let Some(git_dir) = git_dir.as_deref() {
+		directories.insert(git_dir.to_path_buf());
+		insert_git_ref_directories(&git_dir.join("refs"), &mut directories);
+		directories.insert(git_dir.join("info"));
+	}
+
+	let mut pending = VecDeque::from([root.to_path_buf()]);
+	while !pending.is_empty() {
+		if directories.len() >= GIT_WATCH_DIRECTORY_LIMIT {
+			break;
+		}
+		let mut children = Vec::new();
+		while children.len() < GIT_WATCH_PENDING_PATH_LIMIT {
+			let Some(directory) = pending.pop_front() else {
+				break;
+			};
+			let Ok(entries) = std::fs::read_dir(directory) else {
+				continue;
+			};
+			children.extend(
+				entries
+					.flatten()
+					.filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+					.map(|entry| entry.path())
+					.filter(|path| {
+						path.file_name().is_none_or(|name| name != ".git")
+							&& git_dir.as_ref().is_none_or(|git_dir| path != git_dir)
+					}),
+			);
+		}
+		for batch in children.chunks(GIT_WATCH_PENDING_PATH_LIMIT) {
+			let Some(ignored) = git_ignored_paths(root, batch) else {
+				continue;
+			};
+			for child in batch {
+				if directories.len() >= GIT_WATCH_DIRECTORY_LIMIT {
+					break;
+				}
+				if !ignored.contains(child) && directories.insert(child.clone()) {
+					pending.push_back(child.clone());
+				}
+			}
+		}
+	}
+	(git_dir, directories)
+}
+
+fn reconcile_git_watch_directories(
+	watcher: &mut notify::RecommendedWatcher,
+	state: &mut GitWatchState,
+) {
+	use notify::{RecursiveMode, Watcher};
+
+	let (git_dir, desired) = desired_git_watch_directories(&state.root);
+	for directory in state
+		.watched_directories
+		.difference(&desired)
+		.cloned()
+		.collect::<Vec<_>>()
+	{
+		let _ = watcher.unwatch(&directory);
+		state.watched_directories.remove(&directory);
+	}
+	for directory in desired
+		.difference(&state.watched_directories)
+		.cloned()
+		.collect::<Vec<_>>()
+	{
+		if watcher
+			.watch(&directory, RecursiveMode::NonRecursive)
+			.is_ok()
+		{
+			state.watched_directories.insert(directory);
+		}
+	}
+	state.git_dir = git_dir;
+}
+
+fn git_watch_batch_is_relevant(state: &GitWatchState, batch: &PendingGitWatchEvents) -> bool {
+	if batch.overflowed || batch.paths.is_empty() {
+		return true;
+	}
+	let mut worktree_paths = Vec::new();
+	for path in &batch.paths {
+		if state
+			.git_dir
+			.as_ref()
+			.is_some_and(|git_dir| path.starts_with(git_dir))
+		{
+			return true;
+		}
+		if path.starts_with(&state.root) {
+			worktree_paths.push(path.clone());
+		}
+	}
+	if worktree_paths.is_empty() {
+		return false;
+	}
+	git_ignored_paths(&state.root, &worktree_paths)
+		.is_none_or(|ignored| worktree_paths.iter().any(|path| !ignored.contains(path)))
+}
+
+fn git_watch_batch_changes_topology(state: &GitWatchState, batch: &PendingGitWatchEvents) -> bool {
+	batch.overflowed
+		|| batch.topology_changed
+		|| batch.paths.iter().any(|path| {
+			path.file_name().is_some_and(|name| name == ".gitignore")
+				|| state
+					.git_dir
+					.as_ref()
+					.is_some_and(|git_dir| path == &git_dir.join("info/exclude"))
+		})
+}
+
+fn publish_active_git_watch_root(
+	state: Option<&GitWatchState>,
+	active_root: &Mutex<Option<PathBuf>>,
+) {
+	if let Ok(mut active) = active_root.lock() {
+		*active = state.and_then(|state| {
+			state
+				.watched_directories
+				.contains(&state.root)
+				.then(|| state.root.clone())
+		});
+	}
+}
+
+fn git_watch_deadline(
+	first_event_at: Option<std::time::Instant>,
+	last_event_at: Option<std::time::Instant>,
+	retry_at: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+	retry_at.or_else(|| {
+		Some((last_event_at? + GIT_WATCH_DEBOUNCE).min(first_event_at? + GIT_WATCH_MAX_DELAY))
+	})
+}
+
+fn run_git_watcher(
+	commands: libaryon::engine::CommandSender,
+	messages: std::sync::mpsc::Sender<GitWatchMessage>,
+	message_rx: std::sync::mpsc::Receiver<GitWatchMessage>,
+	active_root: Arc<Mutex<Option<PathBuf>>>,
+	observation_available: Arc<AtomicBool>,
+) {
+	use notify::EventKind;
+
+	let event_queued = Arc::new(AtomicBool::new(false));
+	let pending_events = Arc::new(Mutex::new(PendingGitWatchEvents::default()));
+	let callback_queued = event_queued.clone();
+	let callback_pending = pending_events.clone();
+	let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+		let Ok(event) = event else {
+			return;
+		};
+		let topology_changed = matches!(
+			&event.kind,
+			EventKind::Any
+				| EventKind::Create(
+					notify::event::CreateKind::Any
+						| notify::event::CreateKind::Folder
+						| notify::event::CreateKind::Other
+				) | EventKind::Remove(
+				notify::event::RemoveKind::Any
+					| notify::event::RemoveKind::Folder
+					| notify::event::RemoveKind::Other
+			) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+		);
+		if !matches!(
+			&event.kind,
+			EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+		) {
+			return;
+		}
+		if let Ok(mut pending) = callback_pending.lock() {
+			pending.topology_changed |= topology_changed;
+			for path in event.paths {
+				if pending.paths.len() >= GIT_WATCH_PENDING_PATH_LIMIT {
+					pending.overflowed = true;
+					break;
+				}
+				if !pending.paths.contains(&path) {
+					pending.paths.push(path);
+				}
+			}
+		}
+		if !callback_queued.swap(true, Ordering::AcqRel)
+			&& messages.send(GitWatchMessage::Event).is_err()
+		{
+			callback_queued.store(false, Ordering::Release);
+		}
+	})
+	.ok();
+	observation_available.store(watcher.is_some(), Ordering::Release);
+	let mut state: Option<GitWatchState> = None;
+	let mut first_event_at = None;
+	let mut last_event_at = None;
+	let mut retry_at = None;
+	let mut watch_paths_dirty = false;
+	let mut topology_followup_pending = false;
+
+	loop {
+		let deadline = git_watch_deadline(first_event_at, last_event_at, retry_at);
+		if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+			if watch_paths_dirty
+				&& let (Some(watcher), Some(state)) = (watcher.as_mut(), state.as_mut())
+			{
+				reconcile_git_watch_directories(watcher, state);
+				publish_active_git_watch_root(Some(state), &active_root);
+				topology_followup_pending = true;
+			}
+			watch_paths_dirty = false;
+			match commands.try_send(EditorCommand::RefreshGitStatus) {
+				Ok(()) => {
+					retry_at = None;
+					if std::mem::take(&mut topology_followup_pending) {
+						let now = std::time::Instant::now();
+						first_event_at = Some(now);
+						last_event_at = Some(now);
+					} else {
+						first_event_at = None;
+						last_event_at = None;
+					}
+				}
+				Err(std::sync::mpsc::TrySendError::Full(_)) => {
+					retry_at = Some(std::time::Instant::now() + GIT_WATCH_RETRY_DELAY);
+				}
+				Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+			}
+			continue;
+		}
+		let message = match deadline {
+			Some(deadline) => message_rx
+				.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
+			None => match message_rx.recv() {
+				Ok(message) => Ok(message),
+				Err(_) => return,
+			},
+		};
+		match message {
+			Ok(GitWatchMessage::SetRoot(root)) => {
+				if let (Some(watcher), Some(previous)) = (watcher.as_mut(), state.take()) {
+					use notify::Watcher;
+					for directory in previous.watched_directories {
+						let _ = watcher.unwatch(&directory);
+					}
+				}
+				state = root.map(|root| {
+					let mut state = GitWatchState {
+						root,
+						git_dir: None,
+						watched_directories: BTreeSet::new(),
+					};
+					if let Some(watcher) = watcher.as_mut() {
+						reconcile_git_watch_directories(watcher, &mut state);
+					}
+					state
+				});
+				first_event_at = None;
+				last_event_at = None;
+				retry_at = None;
+				watch_paths_dirty = false;
+				topology_followup_pending = false;
+				event_queued.store(false, Ordering::Release);
+				if let Ok(mut pending) = pending_events.lock() {
+					*pending = PendingGitWatchEvents::default();
+				}
+				publish_active_git_watch_root(state.as_ref(), &active_root);
+			}
+			Ok(GitWatchMessage::Event) => {
+				event_queued.store(false, Ordering::Release);
+				let batch = pending_events
+					.lock()
+					.map(|mut pending| std::mem::take(&mut *pending))
+					.unwrap_or_default();
+				if let Some(state) = state
+					.as_ref()
+					.filter(|state| git_watch_batch_is_relevant(state, &batch))
+				{
+					watch_paths_dirty |= git_watch_batch_changes_topology(state, &batch);
+					let now = std::time::Instant::now();
+					first_event_at.get_or_insert(now);
+					last_event_at = Some(now);
+				}
+			}
+			Ok(GitWatchMessage::Shutdown) => return,
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+		}
+	}
 }
 
 /// Long-lived owner of Polariton's libaryon session.
@@ -292,6 +821,7 @@ pub struct CodeEditor {
 	execution_snapshots: HashMap<u64, ExecutionSnapshot>,
 	cursor_blink: CursorBlink,
 	busy_spinner: BusySpinner,
+	git_watcher: Option<GitWatcher>,
 	/// Input was forwarded after the pending text query was issued, so the
 	/// in-flight reply is already stale and another query must follow it.
 	content_dirty: bool,
@@ -504,6 +1034,7 @@ impl CodeEditor {
 			execution_snapshots: HashMap::new(),
 			cursor_blink: CursorBlink::new(),
 			busy_spinner: BusySpinner::new(),
+			git_watcher: None,
 			content_dirty: false,
 			last_pointer: None,
 			last_navigation_click: None,
@@ -919,10 +1450,11 @@ impl CodeEditor {
 		} else {
 			Subscription::none()
 		};
-		let git_refresh = git_refresh_period(self.viewport.as_ref())
-			.map_or_else(Subscription::none, |period| {
-				time::every(period).map(|_| EditorMsg::GitRefreshTick)
-			});
+		let git_refresh =
+			git_refresh_period(self.viewport.as_ref(), self.git_observation_available())
+				.map_or_else(Subscription::none, |period| {
+					time::every(period).map(|_| EditorMsg::GitRefreshTick)
+				});
 		Subscription::batch([
 			event::listen_with(|event, status, _window| editor_input_for(&event, status)),
 			Subscription::run_with(self.engine_wake.clone(), engine_wake_stream)
@@ -983,6 +1515,7 @@ impl CodeEditor {
 				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
 			self.reconcile_notebook_outputs(&viewport);
 			self.reconcile_preview_blocks(&viewport);
+			self.reconcile_git_watcher(git_watch_root(&viewport));
 			self.viewport = Some(viewport);
 			changed = true;
 		}
@@ -993,6 +1526,22 @@ impl CodeEditor {
 		changed |= !events.is_empty();
 		self.panels.reconcile(&events, self.viewport.as_ref());
 		changed
+	}
+
+	fn reconcile_git_watcher(&mut self, root: Option<PathBuf>) {
+		if let Some(watcher) = self.git_watcher.as_mut() {
+			watcher.set_root(root);
+		} else if let Some(root) = root {
+			let mut watcher = GitWatcher::spawn(self.commands.clone());
+			watcher.set_root(Some(root));
+			self.git_watcher = Some(watcher);
+		}
+	}
+
+	fn git_observation_available(&self) -> bool {
+		self.git_watcher
+			.as_ref()
+			.is_some_and(GitWatcher::observation_available)
 	}
 
 	fn reconcile_notebook_outputs(&mut self, viewport: &Viewport) {
@@ -1063,9 +1612,11 @@ impl CodeEditor {
 			}
 			EditorMsg::GitRefreshTick => {
 				// A final timer event can already be queued when the pane closes
-				// or the interval is disabled. Recheck the latest projection.
-				if git_refresh_period(self.viewport.as_ref()).is_some() {
-					self.send(EditorCommand::GitStatus);
+				// or observation becomes available. Recheck current capability.
+				if git_refresh_period(self.viewport.as_ref(), self.git_observation_available())
+					.is_some()
+				{
+					self.send(EditorCommand::RefreshGitStatus);
 				}
 			}
 			EditorMsg::WindowFocused(focused) => {
@@ -1325,6 +1876,7 @@ impl CodeEditor {
 	}
 
 	pub fn shutdown(&mut self) {
+		self.git_watcher.take();
 		if let Some(engine) = self.engine.take() {
 			let _ = engine.shutdown();
 		}
@@ -1338,6 +1890,9 @@ impl CodeEditor {
 	/// termination is about to reclaim it. Ordinary `CodeEditor` drops still
 	/// use [`Self::shutdown`] so tests and non-process owners remain tidy.
 	pub fn detach_for_process_exit(&mut self) {
+		if let Some(watcher) = self.git_watcher.take() {
+			watcher.detach();
+		}
 		if let Some(engine) = self.engine.take() {
 			engine.detach();
 		}
@@ -3889,10 +4444,10 @@ mod tests {
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
 		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
 		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb, SplitDirection, UiPalette,
-		command_bar_fragments, fence_body_start, git_refresh_period, highlight_span_at,
-		markdown_code_fragments, metrics, pane_gutter_width, pane_title, parse_markdown_blocks,
-		preview_row_budget, preview_source_window, prompt_cursor_byte, viewport_cells,
-		visible_blocks,
+		command_bar_fragments, desired_git_watch_directories, fence_body_start, git_refresh_period,
+		git_watch_deadline, highlight_span_at, markdown_code_fragments, metrics, pane_gutter_width,
+		pane_title, parse_markdown_blocks, preview_row_budget, preview_source_window,
+		prompt_cursor_byte, viewport_cells, visible_blocks,
 	};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
@@ -3922,6 +4477,63 @@ mod tests {
 	#[test]
 	fn startup_viewport_uses_the_actual_workspace_pixels() {
 		assert_eq!(viewport_cells(iced::Size::new(1900.0, 967.0)), (197, 43));
+	}
+
+	#[test]
+	fn git_watch_directories_exclude_ignored_build_trees() {
+		let repo = navigation_fixture("git-watch-directories");
+		std::fs::create_dir_all(repo.join("src/nested")).expect("create source tree");
+		std::fs::create_dir_all(repo.join("target/a/b/c/d/e")).expect("create ignored tree");
+		std::fs::create_dir_all(repo.join("logs")).expect("create all-ignored-content directory");
+		std::fs::create_dir_all(repo.join("empty")).expect("create empty directory");
+		std::fs::write(repo.join(".gitignore"), "target/\n*.log\n").expect("write gitignore");
+		std::fs::write(repo.join("src/nested/main.rs"), "fn main() {}\n").expect("write source");
+		std::fs::write(repo.join("target/a/b/c/d/e/artifact"), "build\n")
+			.expect("write ignored artifact");
+		std::fs::write(repo.join("logs/current.log"), "ignored\n").expect("write ignored log");
+		let initialized = std::process::Command::new("git")
+			.args(["init", "--quiet"])
+			.current_dir(&repo)
+			.status()
+			.expect("run git init");
+		assert!(initialized.success(), "git init failed");
+
+		let (git_dir, directories) = desired_git_watch_directories(&repo);
+		assert!(directories.contains(&repo));
+		assert!(directories.contains(&repo.join("src")));
+		assert!(directories.contains(&repo.join("src/nested")));
+		assert!(
+			directories.contains(&repo.join("logs")),
+			"a directory whose contents are ignored can later gain a relevant file"
+		);
+		assert!(
+			directories.contains(&repo.join("empty")),
+			"the first file created in an empty directory must be observable"
+		);
+		assert!(
+			directories
+				.iter()
+				.all(|directory| !directory.starts_with(repo.join("target"))),
+			"ignored descendants must consume no watch descriptors: {directories:?}"
+		);
+		assert!(
+			git_dir
+				.as_ref()
+				.is_some_and(|git_dir| directories.contains(git_dir)),
+			"Git metadata remains observed"
+		);
+
+		let _ = std::fs::remove_dir_all(repo);
+	}
+
+	#[test]
+	fn git_watch_debounce_has_a_hard_one_second_cap() {
+		let first = Instant::now();
+		let last = first + Duration::from_secs(30);
+		assert_eq!(
+			git_watch_deadline(Some(first), Some(last), None),
+			Some(first + Duration::from_secs(1))
+		);
 	}
 
 	#[test]
@@ -6277,7 +6889,7 @@ mod tests {
 	}
 
 	#[test]
-	fn git_refresh_tick_updates_an_open_status_pane() {
+	fn git_observer_updates_an_open_status_pane() {
 		let repo = navigation_fixture("git-refresh");
 		std::fs::create_dir_all(&repo).expect("create Git fixture");
 		let initialized = std::process::Command::new("git")
@@ -6288,6 +6900,9 @@ mod tests {
 		assert!(initialized.success(), "git init failed");
 		let source = repo.join("main.rs");
 		std::fs::write(&source, "fn main() {}\n").expect("write source fixture");
+		std::fs::create_dir_all(repo.join("logs")).expect("create ignored-content directory");
+		std::fs::write(repo.join(".gitignore"), "*.log\n").expect("write ignore fixture");
+		std::fs::write(repo.join("logs/current.log"), "ignored\n").expect("write ignored fixture");
 
 		{
 			let mut editor = CodeEditor::open_initial_file(source.to_string_lossy().into_owned());
@@ -6320,23 +6935,118 @@ mod tests {
 				thread::sleep(Duration::from_millis(5));
 			}
 			assert_eq!(
-				git_refresh_period(editor.viewport.as_ref()),
+				git_refresh_period(editor.viewport.as_ref(), editor.git_observation_available(),),
 				Some(Duration::from_secs(7)),
 				"an open Git pane subscribes at the projected refresh cadence"
 			);
-
-			std::fs::write(repo.join("later.txt"), "dirty\n").expect("dirty Git fixture");
-			let _ = editor.update(EditorMsg::GitRefreshTick);
 			let deadline = Instant::now() + Duration::from_secs(10);
-			while pane_text(&editor).is_none_or(|text| !text.contains("?? later.txt"))
+			while editor
+				.git_watcher
+				.as_ref()
+				.is_none_or(|watcher| !watcher.is_watching(&repo))
 				&& Instant::now() < deadline
 			{
 				editor.poll();
 				thread::sleep(Duration::from_millis(5));
 			}
 			assert!(
-				pane_text(&editor).is_some_and(|text| text.contains("?? later.txt")),
-				"timer tick must refresh the existing Git pane"
+				editor
+					.git_watcher
+					.as_ref()
+					.is_some_and(|watcher| watcher.is_watching(&repo)),
+				"the Git pane must observe its projected repository root"
+			);
+
+			editor.send(EditorCommand::SetGitRefresh(
+				libaryon::engine::GitRefreshMode::Watch,
+			));
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor.viewport.as_ref().is_none_or(|viewport| {
+				viewport.git_refresh_mode != libaryon::engine::GitRefreshMode::Watch
+			}) && Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			editor.poll();
+			assert_eq!(
+				git_refresh_period(editor.viewport.as_ref(), false),
+				Some(Duration::from_secs(
+					libaryon::engine::DEFAULT_GIT_REFRESH_SECONDS
+				)),
+				"watch mode must fall back to polling when notify is unavailable"
+			);
+			assert_eq!(
+				git_refresh_period(editor.viewport.as_ref(), editor.git_observation_available(),),
+				None
+			);
+			assert!(
+				editor
+					.git_watcher
+					.as_ref()
+					.is_some_and(|watcher| watcher.is_watching(&repo)),
+				"watch mode disables polling without disabling observation"
+			);
+			let watcher_thread = editor
+				.git_watcher
+				.as_ref()
+				.and_then(|watcher| watcher.thread_id())
+				.expect("watcher thread");
+
+			std::fs::write(repo.join("logs/README.md"), "dirty\n").expect("dirty Git fixture");
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while pane_text(&editor).is_none_or(|text| !text.contains("logs/"))
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert!(
+				pane_text(&editor).is_some_and(|text| text.contains("logs/")),
+				"an all-ignored-content directory must observe its first relevant file"
+			);
+
+			editor.send(EditorCommand::SetGitRefresh(
+				libaryon::engine::GitRefreshMode::Disabled,
+			));
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor
+				.git_watcher
+				.as_ref()
+				.is_some_and(|watcher| watcher.is_watching(&repo))
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert!(
+				editor
+					.git_watcher
+					.as_ref()
+					.is_some_and(|watcher| !watcher.is_watching(&repo)),
+				"zero/full-off mode must park observation without retaining descriptors"
+			);
+
+			editor.send(EditorCommand::SetGitRefresh(
+				libaryon::engine::GitRefreshMode::Watch,
+			));
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor
+				.git_watcher
+				.as_ref()
+				.is_none_or(|watcher| !watcher.is_watching(&repo))
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert_eq!(
+				editor
+					.git_watcher
+					.as_ref()
+					.and_then(|watcher| watcher.thread_id()),
+				Some(watcher_thread),
+				"reopening observation must reuse the parked worker"
 			);
 		}
 

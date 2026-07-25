@@ -2955,6 +2955,7 @@ pub fn main(editor) {
     let config = editor.config();
     config.set("wrap", false)?;
     config.set("theme", "gruvbox")?;
+    config.set("gitrefresh", "watch")?;
 			config.ui_color("accent", "#123456")?;
 			config.language_theme("markdown", "viridis_cs8")?;
     Ok(())
@@ -2967,6 +2968,10 @@ pub fn main(editor) {
 		assert_eq!(
 			harness.editor.session.persistent_settings.theme_name,
 			"gruvbox"
+		);
+		assert_eq!(
+			harness.editor.session.git_refresh_mode,
+			crate::engine::GitRefreshMode::Watch
 		);
 		assert_eq!(
 			harness

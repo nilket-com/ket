@@ -319,6 +319,11 @@ pub struct Viewport {
 	pub focused_pane_id: PaneId,
 	/// Checked-out branch for the focused document's repository, when available.
 	pub git_branch: Option<String>,
+	/// Repository backing the open Git-status pane, if one has been resolved.
+	///
+	/// Frontends may observe this path for low-latency refreshes. Interval mode
+	/// also polls as a backstop when observation is unavailable or loses events.
+	pub git_status_repo_root: Option<std::path::PathBuf>,
 	pub status_message: Option<String>,
 	/// Draggable split boundaries for this layout, engine-authored so the host
 	/// never infers gap geometry (see `plans/wip/notebook-with-panes.md`).
@@ -342,7 +347,7 @@ pub struct Viewport {
 	pub search_pattern: Option<String>,
 	pub search_case_insensitive: bool,
 	pub ui_palette: UiPalette,
-	pub git_refresh_seconds: u64,
+	pub git_refresh_mode: crate::engine::GitRefreshMode,
 	pub confirm_prompt: Option<String>,
 	pub input: crate::engine::InputProjection,
 	pub language_completion_candidates: Vec<String>,
