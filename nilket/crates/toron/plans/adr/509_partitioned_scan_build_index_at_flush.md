@@ -251,5 +251,26 @@ opposite. This gate choice is part of the paired journal's configuration identit
 
 ## Outcome
 
-Open. Phase 0 decides whether the mechanism is admitted. A red Phase 0 is a complete ADR outcome, not
-an invitation to broaden the cycle.
+Closed at Phase 0 on `a52b4773f4f7`.
+
+The residency gate passed, but the removable-time gate failed in every valid profiled run:
+
+| Phase 0 gate | measured result | verdict |
+|---|---:|---|
+| gross build reread | 1,064.448-1,123.861 ms; median 1,077.722 ms | red against fixed 3,554 ms |
+| indexed-at-flush overlap | 188,622,572-189,470,823 B | green |
+| minimum literal 2 GiB task-budget headroom | 1,958,012,825 B | green |
+
+All three interleaved profile-on/profile-off pairs preserved digest, schema, row count, plan, route,
+622,544,968 spill bytes, 16 partitions in four groups, both explicit budgets, and `full_hash`
+verification. The instrument reconciled on both axes with no mismatches or unattributed spill.
+
+The gross envelope was only 29.9-31.6% of the predeclared materiality floor. The much larger
+`read_index_rebuild_cpu` envelope is not a rescue: it still combines removable key reconstruction
+with index insertion the candidate must retain, and ADR 508 already rejected the per-row estimator
+needed to split those operations in place.
+
+Per the stop/go rule, indexed-at-flush was not implemented or ablated, production remains
+rebuild-after-write, and ADR 509 does not pivot to another spill mechanism or query. The complete
+measurement receipt is in
+`impl/509_partitioned_scan_build_index_at_flush.md`.

@@ -384,3 +384,120 @@ gate after any code change made in response.
 
 Read the exit status of the asserted command itself. Do not pipe the gate through `tail` or a
 zero-match `grep` whose status changes the meaning of the check.
+
+## Phase 0 measured outcome
+
+### Seal and coordinate
+
+Phase 0 was implemented, sealed, and pushed as
+`a52b4773f4f7`. The release binary was built from that clean, unamended identity after all build and
+test processes had stopped. The cohort used:
+
+```text
+query                    = q17
+mode                     = strict
+scale                    = 8
+data source              = persisted Parquet
+dataset verification     = full_hash
+memory per task          = 2,147,483,648 B (explicit)
+spill reserve            = 2,147,483,648 B (explicit)
+route                    = partitioned_streaming_scan_build
+profile switch           = TORON_PARTITIONED_BUILD_SPILL_PROFILE
+fixed materiality floor  = 3,554 ms
+```
+
+Artifacts are under `target/tpch/adr509/phase0_a52b4773/`. Every child used a unique node-profile
+path, and `target/tpch/join_spill` was empty before it started. The three adjacent pairs alternated
+order:
+
+| pair | order | off `execute_ms` | on `execute_ms` | off - on |
+|---:|---|---:|---:|---:|
+| 1 | off, on | 36,122.636 | 35,174.178 | 948.458 ms |
+| 2 | on, off | 35,711.535 | 34,984.398 | 727.137 ms |
+| 3 | off, on | 35,170.121 | 34,812.718 | 357.403 ms |
+
+The point movement favors the profiled arm in all three pairs, but three pairs at this spread do not
+resolve profiler overhead. No overhead bound or performance improvement is claimed.
+
+All six rows carry:
+
+- `build_commit = a52b4773f4f7`, without `-dirty`;
+- `dataset_verification = full_hash`;
+- identical digest, output schema fingerprint, one-row count, and plan fingerprint;
+- the same `scan_grouped` plus `correlated_scalar_left_outer_global` invocation routes;
+- the same `partitioned_streaming_scan_build` spill observation at replay 0;
+- exactly 622,544,968 B whole-query and invocation spill;
+- explicit 2 GiB task and 2 GiB spill-reserve fields;
+- zero in-tree time residual, zero unattributed node spill, zero interleaved frames, zero bridge
+  mismatches, and zero stage mismatches;
+- a passing outer reconciliation, with 674-707 microseconds outside the node-tree span against the
+  predeclared 10 ms boundary.
+
+The off arm contains no required build refinements, spill-I/O domains, or residency diagnostic. The
+on arm contains 11 required `join0_build` refinements, two parent-scoped spill-I/O domains, and one
+residency diagnostic. Both arms pass their declared contracts, which proves the switch changed the
+measurement lifecycle without changing the query shape or answer.
+
+### Removable-time gate
+
+The gate excludes `read_index_rebuild_cpu` and sums only the parent-scoped build reread:
+
+```text
+read_physical_read + read_decrypt + read_ipc_decode
+```
+
+| on run | physical read | decrypt | IPC decode | gross reread | fixed floor | verdict |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 375.085 ms | 108.680 ms | 640.096 ms | 1,123.861 ms | 3,554 ms | red |
+| 2 | 333.914 ms | 108.292 ms | 635.516 ms | 1,077.722 ms | 3,554 ms | red |
+| 3 | 321.745 ms | 107.460 ms | 635.243 ms | 1,064.448 ms | 3,554 ms | red |
+
+Median gross reread is 1,077.722 ms; the range is 1,064.448-1,123.861 ms. Even the largest run is
+2,430.139 ms short of the fixed floor and reaches only 31.6% of it. Therefore the time gate is red.
+
+The build reread is complete and stable as a byte domain in every on run: 6,059 pages,
+622,544,968 physical bytes, and 1,921,305,272 decoded bytes. Its enclosing `join0_build` is
+19,142.517-19,538.679 ms and its refinement residual is 457.099-466.256 ms. The separately reported
+`read_index_rebuild_cpu` envelope is 6,275.730-6,316.786 ms, but remains inadmissible to the
+removable gate because it combines key reconstruction with required index insertion.
+
+The probe parent independently reports 6,059 physical misses and 45,150 decoded-cache hits, plus a
+second 622,544,968 physical bytes and 1,921,305,272 decoded bytes. These control-path counters make
+future cache-transfer reasoning explicit; without a candidate arm they do not predict net saving.
+
+### Residency gate
+
+Every run reports 16 partitions in four groups of four. All four groups in all three runs pass both
+the production retained-footprint guard and the stricter literal 2 GiB task-budget comparison.
+
+Across all groups and runs:
+
+| resident fact | value |
+|---|---:|
+| candidate complete-owner overlap | 188,622,572-189,470,823 B |
+| minimum literal task-budget headroom | 1,958,012,825 B |
+| minimum production retained-cap headroom | 34,170,267,545 B |
+
+The largest observed group carried four per-object 8 MiB cache caps, a 154,593,408 B summed final
+index, 1,329,152 B summed writer high-water, 262,144 B page reserve, and 80,047 B metadata. Its
+complete candidate overlap was 189,470,823 B. The residency gate is green without changing the task
+budget, spill reserve, group count, partition count, or accounting owner.
+
+### Stop/go verdict
+
+| time gate | residency gate | result |
+|---|---|---|
+| red | green | close: removable envelope too small |
+
+This is the complete ADR 509 result. Phase 1 and Phase 2 were not entered: no indexed-at-flush mode,
+paired shape-preserving rail, route census, mechanism correctness matrix, or production-default
+change was built. Production remains rebuild-after-write. The red result is not used to negotiate a
+lower threshold, add samples, rescue `read_index_rebuild_cpu` with a perturbing per-row estimator,
+or pivot to another mechanism.
+
+The repository seal before measurement was green: `toron` lib 1,416/1,416, architecture
+2,093/2,093, the complete `toron` and `toron-tpch` suites, both formatting legs, telemetry and
+all-target checks, and `polars-sql-reference`. Strict q17 correctness also passed in profiler-off and
+profiler-on arms at its supported sf=0.02 oracle coordinate with explicit 2 GiB / 2 GiB budgets. The
+sf=8 Phase 0 rows themselves provide the persisted-data shape/result invariants; the existing q17
+correctness rail rejects sf=8 rather than silently substituting an oracle coordinate.
