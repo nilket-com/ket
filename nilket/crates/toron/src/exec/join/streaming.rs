@@ -2129,6 +2129,55 @@ fn scan_probe_base_variants(
 		.collect()
 }
 
+/// The inner-prefix semi/anti grouped lifecycle, predeclared before runtime preparation.
+///
+/// The partition-at-a-time route interleaves base scanning with reservoir writes, then drains the
+/// complete reservoir after the scan. Its replay leaves therefore refine one disjoint
+/// `deferred_replay` envelope; the direct route records those leaves as disjoint top-level stages.
+/// Both variants use one Flow domain, so runtime-build and probe-reservoir writes must close exactly
+/// against the handler delta.
+fn inner_prefix_semi_anti_variants() -> Vec<node_attribution::VocabularyVariant> {
+	use node_attribution::{RequiredStages, SpillCounterKind, VocabularyVariant};
+	// The pre-existing chain profile leaves at most 468 ms of its drive unattributed. Runtime
+	// preparation, base preparation, finalization, and cleanup are newly bracketed here, so 1.5 s
+	// preserves roughly 3x headroom without allowing a dominant replay phase to disappear.
+	const RESIDUAL_BOUNDARY_MICROS: u64 = 1_500_000;
+	vec![
+		VocabularyVariant {
+			name: "inner_prefix_semi_anti_deferred_replay",
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Static(&[
+				"runtime_prep",
+				"base_prep",
+				"base_scan",
+				"inner_replay_0",
+				"deferred_replay",
+				"finalize",
+				"cleanup",
+			]),
+			residual_boundary_micros: RESIDUAL_BOUNDARY_MICROS,
+		},
+		VocabularyVariant {
+			name: "inner_prefix_semi_anti_direct_replay",
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Static(&[
+				"runtime_prep",
+				"base_prep",
+				"base_scan",
+				"inner_replay_0",
+				"inner_replay_1",
+				"inner_replay_2",
+				"semi_replay_3",
+				"anti_replay_4",
+				"grouped_fold",
+				"finalize",
+				"cleanup",
+			]),
+			residual_boundary_micros: RESIDUAL_BOUNDARY_MICROS,
+		},
+	]
+}
+
 pub(in crate::exec) fn extract_reoriented_inner_chain(
 	top: &ExecutionPlan,
 ) -> Option<(&ExecutionPlan, Vec<ReorientedInnerJoinStage<'_>>)> {
@@ -13748,6 +13797,15 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
+		// The winning scan-probe lifecycle is known only after runtime preparation. Predeclare both
+		// variants now so preparation is measured under a fixed contract; the fast path may later
+		// select one of them, but cannot change its requirements after seeing the measurements.
+		let attribution_telemetry = self.context.task_telemetry.clone();
+		let stage_handle =
+			node_attribution::predeclare_stage_vocabulary(inner_prefix_semi_anti_variants);
+		let runtime_prep_stage = stage_handle.as_ref().and_then(|handle| {
+			node_attribution::open_stage(handle, "runtime_prep", &attribution_telemetry)
+		});
 		let mut required_output = BTreeSet::new();
 		required_output.extend(chain.semi_stage.preserved_keys.iter().copied());
 		required_output.extend(chain.anti_stage.preserved_keys.iter().copied());
@@ -13879,6 +13937,9 @@ impl Executor {
 			(semi, anti)
 		};
 
+		if let Some(stage) = runtime_prep_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 		let execution_result = async {
 			let mut groups = BoundGroupedAggregateGroups::new();
 			let mut group_types = Vec::new();
@@ -13893,6 +13954,7 @@ impl Executor {
 					&mut groups,
 					&mut group_types,
 					morsel,
+					stage_handle.as_ref(),
 				)
 				.await?
 				.is_none()
@@ -14120,20 +14182,32 @@ impl Executor {
 				);
 			}
 
+			let finalize_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_stage(handle, "finalize", &attribution_telemetry)
+			});
 			let output = self.finalize_bound_grouped_aggregate(
 				&mut groups,
 				&group_types,
 				aggr_expr,
 				output_schema,
 			);
+			if let Some(stage) = finalize_stage {
+				node_attribution::close_stage(stage, &attribution_telemetry);
+			}
 			output.map(Some)
 		}
 		.await;
+		let cleanup_stage = stage_handle.as_ref().and_then(|handle| {
+			node_attribution::open_stage(handle, "cleanup", &attribution_telemetry)
+		});
 		for runtime in inner_runtimes {
 			runtime.cleanup().await;
 		}
 		semi_runtime.cleanup().await;
 		anti_runtime.cleanup().await;
+		if let Some(stage) = cleanup_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
 		execution_result
 	}
 
@@ -14357,7 +14431,9 @@ impl Executor {
 		group_types: &mut Vec<DataType>,
 		stage_profile: &mut Option<ChainStageProfiler>,
 		runtime_baseline_bytes: u64,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 	) -> Result<(), ExecutionError> {
+		let attribution_telemetry = self.context.task_telemetry.clone();
 		let partition_count = state.build.len();
 		let mut total_probe_rows = 0u64;
 		let mut total_output_rows = 0u64;
@@ -14389,6 +14465,14 @@ impl Executor {
 					.saturating_add(active_probe_bytes)
 					.saturating_add(active_build_metadata)
 					.saturating_add(fold_bytes);
+				let index_stage = stage_handle.and_then(|handle| {
+					node_attribution::open_substage(
+						handle,
+						"deferred_replay",
+						"inner_replay_1",
+						&attribution_telemetry,
+					)
+				});
 				let index_started = stage_profile.as_ref().map(|_| Instant::now());
 				let stats = build
 					.rebuild_compact_index_and_pin_pages(
@@ -14404,6 +14488,9 @@ impl Executor {
 					profile.record_deferred_index(stats)?;
 					profile.flush()?;
 				}
+				if let Some(stage) = index_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 				guard_partition_replay_owner_resident(
 					runtime_baseline_bytes,
 					build_reservoir_bytes,
@@ -14417,6 +14504,14 @@ impl Executor {
 				)?;
 
 				for page_index in 0..probe.page_count() {
+					let replay_stage = stage_handle.and_then(|handle| {
+						node_attribution::open_substage(
+							handle,
+							"deferred_replay",
+							"inner_replay_1",
+							&attribution_telemetry,
+						)
+					});
 					let replay_started = stage_profile.as_ref().map(|_| Instant::now());
 					let probe_page = probe.read_batch_page(page_index).await?;
 					let probe_page_bytes = record_batch_memory_bytes(&probe_page);
@@ -14484,6 +14579,9 @@ impl Executor {
 							replay_output_rows,
 						)?;
 					}
+					if let Some(stage) = replay_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
+					}
 					guard_partition_replay_owner_resident(
 						runtime_baseline_bytes,
 						build_reservoir_bytes,
@@ -14504,6 +14602,16 @@ impl Executor {
 							.map(|batch| batch.num_rows() as u64)
 							.fold(0u64, u64::saturating_add);
 						let input_batches = batches.len() as u64;
+						let node_stage = stage.and_then(|_| {
+							stage_handle.and_then(|handle| {
+								node_attribution::open_substage(
+									handle,
+									"deferred_replay",
+									"inner_replay_2",
+									&attribution_telemetry,
+								)
+							})
+						});
 						let started = stage
 							.filter(|_| stage_profile.is_some())
 							.map(|_| Instant::now());
@@ -14545,6 +14653,9 @@ impl Executor {
 								output_rows,
 							)?;
 						}
+						if let Some(stage) = node_stage {
+							node_attribution::close_stage(stage, &attribution_telemetry);
+						}
 						guard_partition_replay_owner_resident(
 							runtime_baseline_bytes,
 							build_reservoir_bytes,
@@ -14566,6 +14677,14 @@ impl Executor {
 						.map(|batch| batch.num_rows() as u64)
 						.fold(0u64, u64::saturating_add);
 					let semi_input_batches = batches.len() as u64;
+					let semi_stage = stage_handle.and_then(|handle| {
+						node_attribution::open_substage(
+							handle,
+							"deferred_replay",
+							"semi_replay_3",
+							&attribution_telemetry,
+						)
+					});
 					let semi_started = stage_profile.as_ref().map(|_| Instant::now());
 					let mut semi_batches = Vec::new();
 					for batch in batches {
@@ -14586,6 +14705,9 @@ impl Executor {
 							rows,
 						)?;
 					}
+					if let Some(stage) = semi_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
+					}
 					guard_partition_replay_owner_resident(
 						runtime_baseline_bytes,
 						build_reservoir_bytes,
@@ -14602,6 +14724,14 @@ impl Executor {
 						.map(|batch| batch.num_rows() as u64)
 						.fold(0u64, u64::saturating_add);
 					let anti_input_batches = semi_batches.len() as u64;
+					let anti_stage = stage_handle.and_then(|handle| {
+						node_attribution::open_substage(
+							handle,
+							"deferred_replay",
+							"anti_replay_4",
+							&attribution_telemetry,
+						)
+					});
 					let anti_started = stage_profile.as_ref().map(|_| Instant::now());
 					let mut anti_batches = Vec::new();
 					for batch in semi_batches {
@@ -14621,6 +14751,9 @@ impl Executor {
 							anti_input_rows,
 							rows,
 						)?;
+					}
+					if let Some(stage) = anti_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
 					}
 					guard_partition_replay_owner_resident(
 						runtime_baseline_bytes,
@@ -14652,6 +14785,14 @@ impl Executor {
 					));
 					for batch in anti_batches {
 						let fold_rows = batch.num_rows() as u64;
+						let fold_stage = stage_handle.and_then(|handle| {
+							node_attribution::open_substage(
+								handle,
+								"deferred_replay",
+								"grouped_fold",
+								&attribution_telemetry,
+							)
+						});
 						let fold_started = stage_profile.as_ref().map(|_| Instant::now());
 						self.fold_bound_grouped_aggregate_batch(
 							groups,
@@ -14671,6 +14812,9 @@ impl Executor {
 								fold_rows,
 								fold_rows,
 							)?;
+						}
+						if let Some(stage) = fold_stage {
+							node_attribution::close_stage(stage, &attribution_telemetry);
 						}
 					}
 					groups.set_growth_budget_bytes(None);
@@ -14732,6 +14876,7 @@ impl Executor {
 		groups: &mut BoundGroupedAggregateGroups,
 		group_types: &mut Vec<DataType>,
 		morsel: Option<(MorselId, u32)>,
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
 	) -> Result<Option<()>, ExecutionError> {
 		let ExecutionPlan::Exchange {
 			input: base_input,
@@ -14768,6 +14913,10 @@ impl Executor {
 			return Ok(None);
 		};
 
+		let attribution_telemetry = self.context.task_telemetry.clone();
+		let base_prep_stage = stage_handle.and_then(|handle| {
+			node_attribution::open_stage(handle, "base_prep", &attribution_telemetry)
+		});
 		let left_batches = self.execute_bound(left, morsel).await?;
 		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
@@ -14853,11 +15002,25 @@ impl Executor {
 				partition_replay_spec = None;
 			}
 		}
+		if let Some(stage) = base_prep_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
+		if let Some(handle) = stage_handle {
+			let observed = if partition_replay_spec.is_some() {
+				"inner_prefix_semi_anti_deferred_replay"
+			} else {
+				"inner_prefix_semi_anti_direct_replay"
+			};
+			node_attribution::commit_stage_vocabulary(handle, observed);
+		}
 		let mut stage_profile = ChainStageProfiler::from_env();
 		let mut partition_replay_state: Option<PartitionAtATimeReplayReservoir> = None;
 		if let Some(profile) = stage_profile.as_mut() {
 			profile.flush()?;
 		}
+		let scan_stage = stage_handle.and_then(|handle| {
+			node_attribution::open_stage(handle, "base_scan", &attribution_telemetry)
+		});
 		let scan_started = stage_profile.as_ref().map(|_| Instant::now());
 		let scan_result: Result<_, ExecutionError> = async {
 			Ok(self
@@ -14870,6 +15033,9 @@ impl Executor {
 		.await;
 		if let (Some(profile), Some(started)) = (stage_profile.as_mut(), scan_started) {
 			profile.add_elapsed(ChainStage::BaseScan, started)?;
+		}
+		if let Some(stage) = scan_stage {
+			node_attribution::close_stage(stage, &attribution_telemetry);
 		}
 		let mut stream = match scan_result {
 			Ok(stream) => stream,
@@ -14886,11 +15052,17 @@ impl Executor {
 		let mut output_rows = 0u64;
 		let drive_result: Result<(), ExecutionError> = async {
 			loop {
+				let base_stage = stage_handle.and_then(|handle| {
+					node_attribution::open_stage(handle, "base_scan", &attribution_telemetry)
+				});
 				let base_started = stage_profile.as_ref().map(|_| Instant::now());
 				let next_batch = stream.next().await;
 				let Some(batch) = next_batch else {
 					if let (Some(profile), Some(started)) = (stage_profile.as_mut(), base_started) {
 						profile.add_elapsed(ChainStage::BaseScan, started)?;
+					}
+					if let Some(stage) = base_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
 					}
 					break;
 				};
@@ -14914,6 +15086,9 @@ impl Executor {
 				if let (Some(profile), Some(started)) = (stage_profile.as_mut(), base_started) {
 					profile.add_elapsed(ChainStage::BaseScan, started)?;
 				}
+				if let Some(stage) = base_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 				let Some((raw_rows, right_batch)) = base_result? else {
 					break;
 				};
@@ -14932,6 +15107,9 @@ impl Executor {
 					continue;
 				}
 				probe_rows = probe_rows.saturating_add(right_batch.num_rows() as u64);
+				let replay0_stage = stage_handle.and_then(|handle| {
+					node_attribution::open_stage(handle, "inner_replay_0", &attribution_telemetry)
+				});
 				let replay0_started = stage_profile.as_ref().map(|_| Instant::now());
 				let selection_result: Result<_, ExecutionError> = (|| {
 					let right_key_arrays = key_arrays(&right_batch, right_keys)?;
@@ -14951,12 +15129,22 @@ impl Executor {
 				if let (Some(profile), Some(started)) = (stage_profile.as_mut(), replay0_started) {
 					profile.add_elapsed(ChainStage::InnerReplay0, started)?;
 				}
+				if let Some(stage) = replay0_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 				let selection = selection_result?;
 				output_rows = output_rows.saturating_add(selection.len() as u64);
 				let mut replay0_output_rows = 0u64;
 				let mut replay0_output_batches = 0u64;
 
 				for chunk in selection.chunks(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+					let replay0_stage = stage_handle.and_then(|handle| {
+						node_attribution::open_stage(
+							handle,
+							"inner_replay_0",
+							&attribution_telemetry,
+						)
+					});
 					let replay0_started = stage_profile.as_ref().map(|_| Instant::now());
 					let partitioned_result: Result<_, ExecutionError> = (|| {
 						let batch = materialize_join_selection(
@@ -14991,6 +15179,9 @@ impl Executor {
 					{
 						profile.add_elapsed(ChainStage::InnerReplay0, started)?;
 					}
+					if let Some(stage) = replay0_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
+					}
 					let partitioned_batches = partitioned_result?;
 
 					for (_partition, partitioned) in partitioned_batches {
@@ -15001,6 +15192,21 @@ impl Executor {
 							replay0_output_rows.saturating_add(partitioned.num_rows() as u64);
 						replay0_output_batches = replay0_output_batches.saturating_add(1);
 						if let Some(spec) = partition_replay_spec.as_ref() {
+							let deferred_stage = stage_handle.and_then(|handle| {
+								node_attribution::open_stage(
+									handle,
+									"deferred_replay",
+									&attribution_telemetry,
+								)
+							});
+							let reservoir_stage = stage_handle.and_then(|handle| {
+								node_attribution::open_substage(
+									handle,
+									"deferred_replay",
+									"reservoir_buffer",
+									&attribution_telemetry,
+								)
+							});
 							let replay1_started = stage_profile.as_ref().map(|_| Instant::now());
 							if partition_replay_state.is_none() {
 								let state =
@@ -15048,6 +15254,12 @@ impl Executor {
 								profile.add_deferred_probe_rows(buffered_rows)?;
 								profile.set_deferred_probe_spill_bytes(probe_spill_bytes);
 							}
+							if let Some(stage) = reservoir_stage {
+								node_attribution::close_stage(stage, &attribution_telemetry);
+							}
+							if let Some(stage) = deferred_stage {
+								node_attribution::close_stage(stage, &attribution_telemetry);
+							}
 							continue;
 						}
 						let mut batches = vec![partitioned];
@@ -15064,6 +15276,20 @@ impl Executor {
 							let input_batches = batches.len() as u64;
 							let mut next = Vec::new();
 							for batch in batches {
+								let node_stage = stage_handle.and_then(|handle| {
+									stage.and_then(|chain_stage| {
+										let name = match chain_stage {
+											ChainStage::InnerReplay1 => "inner_replay_1",
+											ChainStage::InnerReplay2 => "inner_replay_2",
+											_ => return None,
+										};
+										node_attribution::open_stage(
+											handle,
+											name,
+											&attribution_telemetry,
+										)
+									})
+								});
 								let started = stage
 									.filter(|_| stage_profile.is_some())
 									.map(|_| Instant::now());
@@ -15075,10 +15301,27 @@ impl Executor {
 								{
 									profile.add_elapsed(stage, started)?;
 								}
+								if let Some(stage) = node_stage {
+									node_attribution::close_stage(stage, &attribution_telemetry);
+								}
 								next.extend(probe_result?);
 							}
 							batches = next;
 							if let Some(predicate) = runtime.post_filter {
+								let node_stage = stage_handle.and_then(|handle| {
+									stage.and_then(|chain_stage| {
+										let name = match chain_stage {
+											ChainStage::InnerReplay1 => "inner_replay_1",
+											ChainStage::InnerReplay2 => "inner_replay_2",
+											_ => return None,
+										};
+										node_attribution::open_stage(
+											handle,
+											name,
+											&attribution_telemetry,
+										)
+									})
+								});
 								let started = stage
 									.filter(|_| stage_profile.is_some())
 									.map(|_| Instant::now());
@@ -15100,6 +15343,9 @@ impl Executor {
 									(stage_profile.as_mut(), stage, started)
 								{
 									profile.add_elapsed(stage, started)?;
+								}
+								if let Some(stage) = node_stage {
+									node_attribution::close_stage(stage, &attribution_telemetry);
 								}
 								batches = filter_result?;
 							}
@@ -15128,6 +15374,13 @@ impl Executor {
 						let semi_input_batches = batches.len() as u64;
 						let mut semi_batches = Vec::new();
 						for batch in batches {
+							let node_stage = stage_handle.and_then(|handle| {
+								node_attribution::open_stage(
+									handle,
+									"semi_replay_3",
+									&attribution_telemetry,
+								)
+							});
 							let started = stage_profile.as_ref().map(|_| Instant::now());
 							let probe_result =
 								self.probe_streaming_semi_anti(semi_runtime, &batch).await;
@@ -15135,6 +15388,9 @@ impl Executor {
 								(stage_profile.as_mut(), started)
 							{
 								profile.add_elapsed(ChainStage::SemiReplay3, started)?;
+							}
+							if let Some(stage) = node_stage {
+								node_attribution::close_stage(stage, &attribution_telemetry);
 							}
 							semi_batches.extend(probe_result?);
 						}
@@ -15159,6 +15415,13 @@ impl Executor {
 						let anti_input_batches = semi_batches.len() as u64;
 						let mut anti_batches = Vec::new();
 						for batch in semi_batches {
+							let node_stage = stage_handle.and_then(|handle| {
+								node_attribution::open_stage(
+									handle,
+									"anti_replay_4",
+									&attribution_telemetry,
+								)
+							});
 							let started = stage_profile.as_ref().map(|_| Instant::now());
 							let probe_result =
 								self.probe_streaming_semi_anti(anti_runtime, &batch).await;
@@ -15166,6 +15429,9 @@ impl Executor {
 								(stage_profile.as_mut(), started)
 							{
 								profile.add_elapsed(ChainStage::AntiReplay4, started)?;
+							}
+							if let Some(stage) = node_stage {
+								node_attribution::close_stage(stage, &attribution_telemetry);
 							}
 							anti_batches.extend(probe_result?);
 						}
@@ -15185,6 +15451,13 @@ impl Executor {
 
 						for batch in anti_batches {
 							let fold_rows = batch.num_rows() as u64;
+							let node_stage = stage_handle.and_then(|handle| {
+								node_attribution::open_stage(
+									handle,
+									"grouped_fold",
+									&attribution_telemetry,
+								)
+							});
 							let started = stage_profile.as_ref().map(|_| Instant::now());
 							let fold_result = self.fold_bound_grouped_aggregate_batch(
 								groups,
@@ -15197,6 +15470,9 @@ impl Executor {
 								(stage_profile.as_mut(), started)
 							{
 								profile.add_elapsed(ChainStage::GroupedFold, started)?;
+							}
+							if let Some(stage) = node_stage {
+								node_attribution::close_stage(stage, &attribution_telemetry);
 							}
 							fold_result?;
 							if let Some(profile) = stage_profile.as_mut() {
@@ -15226,6 +15502,9 @@ impl Executor {
 				}
 			}
 			if let Some(mut state) = partition_replay_state.take() {
+				let deferred_stage = stage_handle.and_then(|handle| {
+					node_attribution::open_stage(handle, "deferred_replay", &attribution_telemetry)
+				});
 				let deferred_result = async {
 					// Resolved before sealing: the probe reservoir's flush needs the same key plan
 					// its writes used.
@@ -15235,12 +15514,24 @@ impl Executor {
 								.to_string(),
 						}
 					})?;
-					Box::pin(self.finish_partition_at_a_time_probe_reservoir(
+					let finish_stage = stage_handle.and_then(|handle| {
+						node_attribution::open_substage(
+							handle,
+							"deferred_replay",
+							"reservoir_finish",
+							&attribution_telemetry,
+						)
+					});
+					let finish_result = Box::pin(self.finish_partition_at_a_time_probe_reservoir(
 						spec,
 						&mut state,
 						runtime_baseline_bytes,
 					))
-					.await?;
+					.await;
+					if let Some(stage) = finish_stage {
+						node_attribution::close_stage(stage, &attribution_telemetry);
+					}
+					finish_result?;
 					let (runtime, suffix_runtimes) =
 						inner_runtimes.split_first_mut().ok_or_else(|| {
 							ExecutionError::InvalidExpression {
@@ -15261,11 +15552,20 @@ impl Executor {
 						group_types,
 						&mut stage_profile,
 						runtime_baseline_bytes,
+						stage_handle,
 					))
 					.await
 				}
 				.await;
 				let probe_spill_bytes = state.probe_spill_bytes;
+				let cleanup_stage = stage_handle.and_then(|handle| {
+					node_attribution::open_substage(
+						handle,
+						"deferred_replay",
+						"reservoir_release_and_account",
+						&attribution_telemetry,
+					)
+				});
 				Self::cleanup_partitioned_streamed_inner_builds(state.build).await;
 				Self::cleanup_partitioned_streamed_inner_builds(state.probe).await;
 				deferred_result?;
@@ -15273,6 +15573,12 @@ impl Executor {
 					task.counters.spill_bytes =
 						task.counters.spill_bytes.saturating_add(probe_spill_bytes);
 				});
+				if let Some(stage) = cleanup_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
+				if let Some(stage) = deferred_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
 			}
 			Ok(())
 		}
@@ -22545,6 +22851,45 @@ mod tests {
 				.contains("chain stage profile snapshot rename failed")
 		);
 		let _ = std::fs::remove_dir_all(parent);
+	}
+
+	#[test]
+	fn inner_prefix_semi_anti_variants_keep_deferred_replays_disjoint() {
+		use node_attribution::{RequiredStages, SpillCounterKind};
+
+		let variants = inner_prefix_semi_anti_variants();
+		assert_eq!(variants.len(), 2);
+		for variant in &variants {
+			assert_eq!(variant.spill, SpillCounterKind::Flow);
+			assert_eq!(variant.residual_boundary_micros, 1_500_000);
+		}
+		let deferred = variants
+			.iter()
+			.find(|variant| variant.name == "inner_prefix_semi_anti_deferred_replay")
+			.expect("deferred variant");
+		let RequiredStages::Static(required) = &deferred.required_stages else {
+			panic!("fixed-shape deferred lifecycle should keep static requirements");
+		};
+		assert!(required.contains(&"deferred_replay"));
+		assert!(!required.contains(&"inner_replay_1"));
+
+		let direct = variants
+			.iter()
+			.find(|variant| variant.name == "inner_prefix_semi_anti_direct_replay")
+			.expect("direct variant");
+		let RequiredStages::Static(required) = &direct.required_stages else {
+			panic!("fixed-shape direct lifecycle should keep static requirements");
+		};
+		for stage in [
+			"inner_replay_1",
+			"inner_replay_2",
+			"semi_replay_3",
+			"anti_replay_4",
+			"grouped_fold",
+		] {
+			assert!(required.contains(&stage), "direct route requires {stage}");
+		}
+		assert!(!required.contains(&"deferred_replay"));
 	}
 
 	// ADR 508 step 2: every join0 leaf route must declare a spill cadence, because the cadence — not

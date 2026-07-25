@@ -2059,7 +2059,7 @@ impl Executor {
 		// ADR 508 step 2 fold refinement: three batch-level sub-stages inside the `fold` phase, each
 		// reconciling to `fold` rather than to the handler. No per-row locks — probe and growth
 		// evidence comes from the existing grouped-table profile, which already counts them.
-		let refine = node_attribution::current_handle();
+		let refine = node_attribution::current_handle_requiring("fold");
 		let telemetry = self.context.task_telemetry.clone();
 		let group_expr_stage = refine.as_ref().and_then(|h| {
 			node_attribution::open_substage(h, "fold", "group_expr_eval", &telemetry)

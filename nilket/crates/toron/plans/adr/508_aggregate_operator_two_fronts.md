@@ -18,19 +18,20 @@ Per cell, exclusive share of the dominant node:
 |---|---:|---|---:|---|
 | q17 | 35,693 | aggregate 100% | 623 MB | spill-replay + compute-fold (see below) |
 | q21 | 17,935 | aggregate 100% | 898 MB | spill-replay |
-| q09 | 13,032 | aggregate 95% | 0 | **withdrawn — see below** |
+| q09 | 13,032 | aggregate 95% | 0 | **join-probe — coordinate correction below** |
 | q20 | 9,476 | aggregate 61%, join 33% | 0 | compute-fold |
 | q08 | 7,982 | aggregate 96% | 0 | **reassigned — join-probe, see below** |
 | q18 | 19,430 | join 65%, exchange 17% | 990 MB | join/sort (parked) |
 | q02 | 2,675 | sort 41%, join 31% | 0 | join/sort (parked) |
 
-**q09's row above is invalidated.** Step-2 grounding measured q09 at **83.2 MB of aggregate-exclusive
-spill and 14,939 ms**, against the zero spill and 13,032 ms recorded here. The bytes are byte-identical
-with profiling on and off, so they are not an instrumentation artifact; both the spill and the time
-moved between that tree and this one. The zero-spill premise that assigned q09 to the compute-fold
-front is therefore gone, and one working-tree measurement cannot promote it to the spill front in its
-place. **q09 is front-unassigned until the clean 22/22 baseline of step 3 re-establishes it.** Nothing
-in steps 4 or 5 may rank it in the meantime.
+**q09's withdrawal was caused by a coordinate mismatch, not demonstrated tree movement.** The
+step-2 run that measured 83.2 MB and 14,939 ms used the harness defaults — 64 MiB per task and
+512 MiB spill reserve — while this board's ladder coordinate is 2 GiB / 2 GiB. A clean full-hash
+re-grounding at the ladder coordinate records q09 at zero spill (13,421.8 ms in the attribution run;
+13,349.9 ms median on the first clean board attempt) and preserves the join-probe-dominated inner
+shape. The 83.2 MB result remains a valid low-budget fact but cannot invalidate a 2 GiB premise.
+**q09 is provisionally restored to the join-probe premise, subject to the final clean 22/22 rerun
+after the q21 attribution correction.** It is not promoted to the spill front.
 
 **q08's row is reassigned, and the trap below is why.** Step-2 inner attribution decomposed the
 `reoriented_inner_chain_grouped` handler on both q08 and q09 (`impl/508_inner_attribution.md`). Inside
@@ -38,9 +39,9 @@ the aggregate node the **grouped fold is 0.7% (q08) and 1.8% (q09)**; join work 
 with suffix probing alone at ~50% on both. So q08's compute-fold assignment rested on exactly the
 inference the next section forbids — "aggregate 96%" read as "the fold kernel". **q08 moves to a
 join-probe premise**, and the compute-fold front's step-4 decomposition covers q20 and q17 inv 0 only.
-q09 stays front-unassigned; this refines *which mechanism* its aggregate time is, not whether the cell
-is placeable. Whether a join-probe premise earns its own front is step 4's call against the clean
-baseline, not a promotion this note makes.
+q09 joins that same premise at the corrected memory coordinate. Whether join-probe earns its own
+successor front is step 4's call against the final clean baseline, not a mechanism selection this note
+makes.
 
 That the guard below caught a real case is the point of having written it down: the per-node layer was
 correct and the front *name* was one layer too coarse.
@@ -118,8 +119,11 @@ acquired its `-dirty` stamp. So the baseline is **two cohesive deliverables, in 
 - **Seal and push** the cumulative step-2 inner attribution, then enable q11 at sf=8 before measuring.
   Step 2 sealed at `3d48890e` without the q11 change; rewriting that pushed seal would destroy the
   immutable boundary this rule exists to create. The q11 harness support therefore lands as a
-  separate, independently valuable follow-up. The pushed q11-supporting descendant — not
-  `3d48890e` — is the build identity of record and is never amended afterwards.
+  separate, independently valuable follow-up. The first clean-board attempt then exposed that q21's
+  separate chain profiler had never been bridged into the invocation-level stage contract. That
+  corrective implementation also earns its own commit: it closes an acceptance red and changes the
+  binary. The pushed descendant containing both q11 support and the q21 bridge — not `3d48890e` or
+  the pre-correction `b6e37cf9` — is the build identity of record and is never amended afterwards.
 - **Then measure** the 22/22 board from that exact pushed commit, and land the numbers as a **separate
   perf receipt** citing it.
 
@@ -130,8 +134,8 @@ While touching the baseline harness, **enable q11 at sf=8** — an enumeration g
 (`0.0001 / 8 = 0.0000125` is exact and the oracle integer is 800) — making the clean board 22/22.
 
 **4. Compute-fold front — decompose and rank the premises.** q20 inv 0 and q17 inv 0. (This step was
-written naming q08 inv 0 and q09 inv 0 as well; step-2 inner attribution reassigned q08 to a
-join-probe premise and q09 remains front-unassigned — see the front table above.) Zero spill, so the
+written naming q08 inv 0 and q09 inv 0 as well; step-2 inner attribution reassigned both to a
+join-probe premise — see the front table above.) Zero spill, so the
 cost is compute inside a fused join+aggregate. Instrumenting
 `scan_grouped` also yields a profile for q18's invocation because they share a handler — that is an
 incidental by-product held for the parked front, and is **excluded** when ranking this front's premise;
@@ -149,7 +153,12 @@ front's premise or its remedy; the mechanism here is spill and replay machinery,
 and the two fronts hand the successor two independent premises rather than one blended one. q21's
 invocation already has inner attribution; q17's `correlated_scalar_left_outer_global` invocation has
 none and is the largest single uncovered item on the board (69% of a 35.7 s cell), so it is the
-front's first instrumentation target.
+front's first instrumentation target. The corrective q21 vocabulary now also closes its full
+invocation-level chain; the old separate chain profile alone did not satisfy that acceptance link.
+At the 2 GiB coordinate q21 splits into runtime preparation (33.1%) and a deferred replay envelope
+(54.3%); inside that envelope reservoir buffering is 42.2% and replay-1 read/probe is 46.3%, with
+72.7 ms residual. The task spill counter advances by 24.3 MB during buffering and by 873.4 MB at
+release/accounting, so byte ownership remains a write-accounting fact rather than a timing claim.
 
 **6. Park the join/sort front.** q18 (join 65%) and q02 (sort 41%, join 31%) are a real, measured
 second front. They stay parked so this cycle stays one decision wide; re-open them from the same

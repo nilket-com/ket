@@ -254,6 +254,11 @@ impl RequiredStages {
 				.map(|entry| (entry.name, entry.replay)),
 		)
 	}
+
+	fn contains_unscoped(&self, required: &'static str) -> bool {
+		self.entries()
+			.any(|(name, replay)| name == required && replay.is_none())
+	}
 }
 
 /// One candidate stage contract offered at predeclaration. Every definition a commit may select is
@@ -944,18 +949,23 @@ pub(in crate::exec) struct StageToken {
 	spill_before: u64,
 }
 
-/// The vocabulary handle of the invocation currently executing, if it declared one. Lets a refinement
-/// deep inside a handler open sub-stages without threading the handle through every call, while still
-/// binding to the same invocation — `open_substage` re-verifies the id.
-pub(in crate::exec) fn current_handle() -> Option<VocabularyHandle> {
+/// The vocabulary handle of the invocation currently executing, if its committed contract requires
+/// `parent` as an unscoped top-level stage. Lets a refinement deep inside a handler attach without
+/// threading the handle through every call, while preventing a shared helper from publishing children
+/// under a parent that belongs only to another handler's lifecycle.
+pub(in crate::exec) fn current_handle_requiring(parent: &'static str) -> Option<VocabularyHandle> {
 	if !enabled() {
 		return None;
 	}
 	NODE_LEDGER.lock().ok().and_then(|slot| {
 		slot.as_ref().and_then(|a| {
 			a.stack.last().and_then(|f| {
-				f.vocabulary.as_ref().map(|v| VocabularyHandle {
-					invocation_id: v.invocation_id,
+				f.vocabulary.as_ref().and_then(|v| {
+					v.required_stages
+						.contains_unscoped(parent)
+						.then_some(VocabularyHandle {
+							invocation_id: v.invocation_id,
+						})
 				})
 			})
 		})
@@ -3084,6 +3094,21 @@ mod tests {
 			serde_json::json!(["finalize"])
 		);
 		assert_eq!(value["passed"], false);
+	}
+
+	#[test]
+	fn shared_refinements_require_their_unscoped_parent() {
+		assert!(
+			RequiredStages::Static(&["stream_pull", "fold", "finalize"]).contains_unscoped("fold")
+		);
+		assert!(!RequiredStages::Static(&["deferred_replay"]).contains_unscoped("fold"));
+		assert!(
+			!RequiredStages::Owned(vec![RequiredStage {
+				name: "fold",
+				replay: Some(1),
+			}])
+			.contains_unscoped("fold")
+		);
 	}
 
 	// Acceptance 9: a disabled run constructs no requirement lists — the builder must not even run,

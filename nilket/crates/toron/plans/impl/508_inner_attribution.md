@@ -479,7 +479,7 @@ commits before that path, so its stage names describe a lifecycle q08 does not e
 `inapplicable_vocabulary: generic_grouped_reservoir`. It borrows no lifecycle names and times nothing.
 Reading that branch's actual lifecycle is the next step, before any vocabulary is named for it.
 
-### Lifecycle grounding for the `scan_probe_base` branch
+### Lifecycle grounding for the `scan_probe_base` branch (64 MiB task budget)
 
 Both cells commit through `scan_probe_base` (stamped by the receipt), one aggregate invocation each,
 and profile on/off preserves status, digest and route on both.
@@ -516,14 +516,13 @@ happened to be written. Chain length likewise becomes replay-ID-bound repeated s
 vocabulary, unless it changes the lifecycle itself.
 
 **Spill gate.** q09's 83.2 MB is byte-identical with the profile on and off (87,201,312 both arms), so
-it is not a profiling artifact. It does, however, **contradict the ADR 507 board, which recorded q09
-at zero spill and 13,032 ms** against 14,939 ms here. Both the spill and the time moved between that
-tree and this one.
+it is not a profiling artifact **at this coordinate**. The later coordinate audit found that these
+runs used the 64 MiB per-task / 512 MiB reserve defaults, not the board's 2 GiB / 2 GiB ladder
+budgets. It therefore does not contradict the zero-spill board row and does not establish tree
+movement; the exact-coordinate correction is recorded below.
 
-**q09 is therefore front-unassigned until the clean 22/22 baseline.** It is not evidence for the spill
-front — one measurement from a working tree cannot promote a cell — and it is no longer evidence for
-the compute-fold front either, because the zero-spill premise that put it there is invalidated. The
-board's assignment is withdrawn, not replaced.
+The original response was to leave q09 front-unassigned until the clean board. The exact-coordinate
+re-grounding later restores zero spill and assigns it to the join-probe premise, never the spill front.
 
 ### The stage-contract refactor `scan_probe_base` requires first
 
@@ -628,7 +627,7 @@ Per replay, the chain is front-loaded rather than evenly spread — q08's replay
 3,972.0 ms of 6,954.8 (57.1%), then 1,769.7 / 1,072.0 / 141.1. Replay-scoped keys are what make that
 visible: merged on name alone it would have been one `suffix_probe` number.
 
-### q09's 83.2 MB is runtime preparation, not suffix probing
+### At 64 MiB, q09's 83.2 MB is runtime preparation, not suffix probing
 
 **All 87,201,312 bytes are on `runtime_prep`. Every probe stage reads zero.** This is enforced rather
 than observed: the vocabulary declares `Flow`, so the stage spills are reconciled against the
@@ -665,8 +664,8 @@ Whatever remedy these two cells motivate is a **join-probe** remedy, and it is a
 from the `row_lookup_update` finding that the same phrase names on q17 and q20. That is a correction
 to this receipt's own framing, not to the ADR 507 attribution that produced it.
 
-**q09 remains front-unassigned.** This localizes its bytes; it does not promote or rank the cell. The
-ADR gates that on the clean 22/22 baseline from a pushed commit, and these are working-tree runs.
+This localizes the low-budget bytes; it does not promote q09 to the spill front. The later 2 GiB
+re-grounding records zero spill and keeps the join-probe shape.
 
 **Not yet cross-checked against the ledger.** The `probe_micros` envelope comparison the section above
 specifies — loop stages plus residual against the ledger envelope, with `scan_open` excluded — needs
@@ -943,7 +942,10 @@ task-telemetry phases the perf row does not export. It is corroboration, not a g
 ## Provenance and reproduction
 
 Shared by every group: dataset verification `full_hash`; coordinate strict, sf=8, persisted parquet,
-8 GiB cgroup ceiling.
+8 GiB cgroup ceiling. The rows also record the harness defaults
+`memory_per_task = 67,108,864` and `spill_bytes_reserved = 536,870,912`; these are **not** the
+2 GiB / 2 GiB ladder budgets. That omission in the original receipt is corrected by the
+post-seal coordinate audit below.
 
 **Build identity is per artifact group, not per receipt.** This work spans several WIP commits, so one
 blanket identity would let a later group inherit an earlier one — each row below carries the
@@ -988,17 +990,64 @@ scripts/classify_fold_perf.py q17 2165-2168 2173-2226 target/tpch/adr508/perf/q1
 The ranges are line numbers, so they are only valid for this build identity; a later tree must
 re-derive them before re-running the classifier.
 
+## Post-seal coordinate audit and the q21 bridge
+
+The first clean-board attempt exposed two receipt defects before any result was promoted.
+
+**The step-2 inner profiles were not on the ladder memory coordinate.** Their rows record
+`memory_per_task = 67,108,864` and `spill_bytes_reserved = 536,870,912`; the sf=8 board is
+2,147,483,648 / 2,147,483,648. The earlier conclusion that q09's 83.2 MB spill represented tree
+movement was therefore unsupported. A clean, full-hash re-grounding at the ladder coordinate on
+`b6e37cf9fe60` records q09 at 13,421.8 ms and zero spill; the clean 22-query board records a
+13,349.9 ms median and zero spill. The handler remains join-probe dominated at the corrected
+coordinate, but the old 83.2 MB runtime-preparation result is a **64 MiB budget fact**, not a clean
+baseline fact. The same audit applies to the fine scan-grouped census and external CPU classifier:
+their counts and shares are cross-budget grounding until repeated at 2 GiB, not the final
+baseline-coordinate premise.
+
+**q21's existing `ChainStageProfiler` did not close ADR 508's invocation-level chain.** A clean node
+profile correctly emitted `stage_attribution_missing`: the separate profiler explained part of the
+drive, but had no identity-bound vocabulary connecting it to handler-exclusive time and spill. The
+corrective vocabulary is predeclared before runtime preparation, commits either the direct or
+partition-at-a-time lifecycle only after admission, and measures every published duration with
+`StageToken`; it imports none of the legacy profiler's caller-supplied elapsed values.
+
+The exercised partition-at-a-time route now closes:
+
+- handler 17,392.7 ms; top-level attributed 17,351.9 ms; residual 40.8 ms inside a predeclared
+  1,500 ms boundary;
+- stage Flow 897,713,384 B against the same handler delta, residual zero;
+- runtime preparation 5,755.9 ms; base scan 637.1 ms; replay 0 1,479.2 ms; deferred replay
+  9,445.9 ms; finalization plus cleanup 32.9 ms;
+- the deferred envelope's token-measured refinements sum to 9,373.2 ms with 72.7 ms residual:
+  reservoir buffering 3,987.4 ms, reservoir sealing 325.1 ms, replay 1 read/probe 4,371.9 ms,
+  suffix/semi/anti/fold 688.7 ms, and release/accounting below timer resolution. The 873,395,520 B
+  carried by the release/accounting stage is where the task counter advances, not a claim that the
+  bytes were written in its measured microsecond;
+- shared grouped-
+  fold refinements now open only when the committed vocabulary promises a top-level `fold` parent,
+  preventing a helper from publishing children under another handler's lifecycle.
+
+The validation artifact is working-tree grounding (`b6e37cf9fe60-dirty`, full hash, exact 2 GiB /
+2 GiB budgets) under `target/tpch/adr508_q21_stage_wip3/`. The corrective implementation changes the
+binary after the first clean board, so that board remains useful grounding but is not the ADR's final
+baseline. The implementation must be sealed and pushed, and the 22/22 board rerun from that new
+immutable identity.
+
 ## Forward
 
-**All three handlers named by step 2 are now instrumented** — `scan_grouped`, `scan_probe_base`
+**All four dominant-handler lifecycles are now bridged** — `scan_grouped`, `scan_probe_base`
 (`reoriented_inner_chain_grouped` on both its cells), and `correlated_scalar_left_outer_global`. On
 q17 both aggregate invocations pass in one profile: the first multi-invocation cell that is jointly
-complete.
+complete. The fourth is `inner_prefix_semi_anti_grouped`: its pre-existing chain profile remains a
+diagnostic, while the new token vocabulary closes the invocation-level contract.
 
 **Three premises are handed to the successor, none of them a remedy.** q08/q09 are join-probe
-dominated (fold 0.7%/1.8%); q17's `partitioned_scan_build` route is build-envelope dominated at 86.2%
-with a 2.9% probe envelope; and q09's spill writes localize to runtime preparation. Each names *where*
-the cost is, and each still needs its dominant component split before a mechanism can be chosen —
+dominated (fold 0.7%/1.8% at the original profiling coordinate); q17's
+`partitioned_scan_build` route is build-envelope dominated (86.2% there, 81.3% when re-grounded at
+2 GiB) with a small probe envelope; and q09's **64 MiB-only** spill writes localize to runtime
+preparation. Each names *where* the cost is, and each still needs its dominant component split before
+a mechanism can be chosen —
 `join0_build` into scan/partition/serialize/write/finish/index-rebuild, `suffix_probe` into
 lookup/materialize/read-back. Selecting remedies is the successor ADR's decision.
 
@@ -1009,9 +1058,10 @@ committed. Finding a query that commits one is the way to close them; guessing a
 without a cell to verify against is how the first boundary went wrong.
 
 **Start it from `Flow`.** An earlier draft of this section reserved `SpillCounterKind::Subset` for it
-as "the first spilling handler to be decomposed" — that is now stale in both directions. q09 is the
-first decomposed spilling handler, it writes 83.2 MB, and it closed under `Flow` with every byte
-attributed. Spilling does not imply subset semantics. `Subset` is justified only if lifecycle
+as "the first spilling handler to be decomposed" — that was wrong. q09's low-budget run had already
+shown a spilling handler closing under `Flow` with every byte attributed, and the exact-coordinate
+q21 bridge does the same at 897,713,384 B. Spilling does not imply subset semantics. `Subset` is
+justified only if lifecycle
 grounding finds a writer inside the handler span that is *deliberately excluded* from the stage
 vocabulary, and the declaration then has to name where that remainder is accounted. Declaring it
 pre-emptively would substitute a permissive domain for the one measurement that can fail honestly.
@@ -1023,5 +1073,5 @@ materialization from spilled-runtime read-back — the last of which this write-
 at all. That refinement is replay-scoped by construction (`open_replay_substage` exists and is
 deliberately unused), so it does not need another contract change.
 
-Step 3's clean 22/22 sf=8 baseline is measured only after step 2 seals and pushes, per the ADR's
-commit-boundary rule.
+Step 3's final clean 22/22 sf=8 baseline is measured only after the corrective q21 bridge seals and
+pushes, per the ADR's commit-boundary rule.
