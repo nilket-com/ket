@@ -14,6 +14,43 @@ pub(crate) struct GitStatusAction {
 	pub(crate) buffer_id: crate::core::BufferId,
 }
 
+/// Completion payload for a `git cat-file blob <REV>:<relpath>` job started by
+/// `:panediff <REV>`. Carries enough context to verify the diff source is
+/// unchanged before the snapshot pane is created.
+#[derive(Debug, Clone)]
+pub(crate) struct GitDiffAction {
+	pub(crate) left_pane_id: crate::core::PaneId,
+	pub(crate) left_buffer_id: crate::core::BufferId,
+	pub(crate) repo_root: PathBuf,
+	pub(crate) revision: String,
+	pub(crate) rel_path: String,
+}
+
+/// Reject revisions that cannot be spliced into a `<REV>:<relpath>` spec.
+/// Whitespace never appears in a revision, a `:` would shift the path
+/// boundary of the spec, and a leading `-` reads as a Git option (the spec is
+/// additionally fenced behind `--end-of-options` when the job is spawned).
+pub(crate) fn validate_revision(revision: &str) -> Result<(), String> {
+	if revision.is_empty() {
+		return Err("the Git revision is empty".to_string());
+	}
+	if revision.starts_with('-')
+		|| revision.chars().any(|c| c.is_whitespace() || c == ':')
+	{
+		return Err(format!("not a valid Git revision: {revision}"));
+	}
+	Ok(())
+}
+
+/// The focused file's path relative to the repository root, slash-separated
+/// as Git expects in a `<REV>:<relpath>` spec.
+pub(crate) fn repo_relative_path(repo_root: &Path, file: &Path) -> Option<String> {
+	let rel = file.strip_prefix(repo_root).ok()?;
+	let text = rel.to_str()?;
+	(!text.is_empty()).then(|| text.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitStatusEntry {
 	pub(crate) index: char,
@@ -234,6 +271,10 @@ pub(crate) fn git_status_action_lease(buffer_id: crate::core::BufferId) -> Actio
 	ActionLease::new(GIT_JOB_OWNER, GitStatusAction { buffer_id })
 }
 
+pub(crate) fn git_diff_action_lease(action: GitDiffAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
 /// Resolves the context once before repository discovery.
 ///
 /// An unsaved relative path cannot be canonicalized yet. Anchoring it to
@@ -293,7 +334,8 @@ fn parse_branch(head: &str) -> Option<String> {
 mod tests {
 	use super::{
 		GitBranchCache, GitStatusEntry, GitStatusSnapshot, find_git_context,
-		parse_status_porcelain, render_status_snapshot, resolve_context_path,
+		parse_status_porcelain, render_status_snapshot, repo_relative_path,
+		resolve_context_path, validate_revision,
 	};
 	use crate::svp::rust_highlight::TokenCategory;
 	use std::path::Path;
@@ -486,6 +528,37 @@ mod tests {
 		assert_eq!(ancestors.into_iter().find_map(find_git_context), None);
 
 		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn revisions_reject_spec_breaking_characters() {
+		for revision in ["HEAD", "HEAD~3", "main", "v1.0", "abc123", "@{-1}"] {
+			assert_eq!(validate_revision(revision), Ok(()), "{revision}");
+		}
+		// A leading dash would read as a Git option: `:pd --output=...` must
+		// never reach the spawned process as anything but an object spec.
+		for revision in [
+			"",
+			"HEAD:file",
+			"two words",
+			"tab\there",
+			"-",
+			"--output=/tmp/pwned",
+			"-p",
+		] {
+			assert!(validate_revision(revision).is_err(), "{revision:?}");
+		}
+	}
+
+	#[test]
+	fn repo_relative_paths_are_slash_separated_and_non_empty() {
+		let root = Path::new("/repo");
+		assert_eq!(
+			repo_relative_path(root, Path::new("/repo/src/main.rs")).as_deref(),
+			Some("src/main.rs")
+		);
+		assert_eq!(repo_relative_path(root, Path::new("/elsewhere/main.rs")), None);
+		assert_eq!(repo_relative_path(root, Path::new("/repo")), None);
 	}
 
 	#[test]

@@ -199,6 +199,10 @@ impl EditorHost {
 		&self.registry
 	}
 
+	pub(crate) fn resolver(&self) -> &Arc<SvpResolver> {
+		&self.resolver
+	}
+
 	pub(crate) fn new(
 		session: EditorSession,
 		services: SharedHostServices,

@@ -199,6 +199,16 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 				result: super::event_subscribers::SubscriberResult::Delivered,
 			};
 		}
+		if let Some(action) = invocation.action::<super::git::GitDiffAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_diff_job(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
 		if invocation.action::<RuneCallbackRef>().is_some() {
 			return match self.rune_host.as_deref_mut() {
 				Some(host) => host.complete_job(context, invocation, completion),
@@ -213,6 +223,179 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 		self.fallback
 			.complete(&mut context.session, invocation, completion)
 	}
+}
+
+/// Materialize a completed `git cat-file blob <REV>:<relpath>` fetch as the right-hand
+/// pane of a diff pair: a vertical split holding an in-memory virtual document
+/// that carries the left buffer's language and the repo-relative path as its
+/// virtual identity, so the async semantic graft upgrades the diff from the
+/// line-based fallback to the hybrid AST model exactly as file diffs do.
+fn complete_git_diff_job(
+	context: &mut EditorHost,
+	action: super::git::GitDiffAction,
+	completion: &JobCompletion,
+) -> bool {
+	match &completion.outcome {
+		super::jobs::JobOutcome::Exited { status: 0 } => {}
+		super::jobs::JobOutcome::Exited { .. } => {
+			let mut stderr = Vec::new();
+			for chunk in completion.stderr.chunks() {
+				stderr.extend_from_slice(chunk);
+			}
+			let stderr = String::from_utf8_lossy(&stderr);
+			let detail = stderr.lines().next().unwrap_or("git cat-file failed").trim();
+			context.session.ui.status_message =
+				Some(format!("Not a file or Git revision: {detail}"));
+			return true;
+		}
+		_ => {
+			context.session.ui.status_message = Some("Git diff failed".to_string());
+			return true;
+		}
+	}
+	if completion.stdout.truncated {
+		context.session.ui.status_message =
+			Some("Git snapshot is too large to diff".to_string());
+		return true;
+	}
+	let mut stdout = Vec::new();
+	for chunk in completion.stdout.chunks() {
+		stdout.extend_from_slice(chunk);
+	}
+
+	let Some(lang_registry) = context.language_registry.clone() else {
+		context.session.ui.status_message = Some("Language registry is unavailable".to_string());
+		return true;
+	};
+	let registry = context.registry().clone();
+	let resolver = context.resolver().clone();
+	let runtime = RuntimeContext {
+		registry: &registry,
+		resolver: &resolver,
+		lang_registry: &lang_registry,
+		init_script: None,
+		init_entrypoint: None,
+	};
+	let session = &mut context.session;
+
+	// The fetch raced user actions: only pair against the document the diff
+	// was requested for.
+	let left_intact = session
+		.layout
+		.find_pane(action.left_pane_id)
+		.is_some_and(|pane| pane.active_tab().buffer_id == action.left_buffer_id);
+	if !left_intact {
+		session.ui.status_message = Some("Diff source changed; Git diff cancelled".to_string());
+		return true;
+	}
+	let language = session
+		.buffers
+		.get(action.left_buffer_id)
+		.and_then(|buffer| buffer.text())
+		.and_then(|document| document.active_language_id)
+		.map(|id| id.as_str().to_string());
+
+	let Ok(view) = session.create_unnamed_text_view(
+		&registry,
+		crate::core::DEFAULT_VIEWPORT_WIDTH,
+		crate::core::DEFAULT_VIEWPORT_LINES,
+	) else {
+		session.ui.status_message = Some("Unable to open Git diff pane".to_string());
+		return true;
+	};
+	let right_buffer_id = view.buffer_id;
+	let new_pane = EditorPane::from_view(view);
+	let Some(right_pane_id) = session.split_pane_with_new_pane_order(
+		action.left_pane_id,
+		SplitDirection::Vertical,
+		new_pane,
+		false,
+	) else {
+		session.buffers.remove(right_buffer_id);
+		session.ui.status_message = Some("Unable to split for Git diff".to_string());
+		return true;
+	};
+
+	// The snapshot's identity for language services: absolute so it does not
+	// depend on the process working directory, but deliberately NOT the real
+	// file's path — a shared path would map both documents onto one workspace
+	// `FileId` and let the snapshot's old content poison analysis of the live
+	// buffer. This location never exists on disk, so providers fall back to
+	// their stable single-file mode.
+	let virtual_path = action
+		.repo_root
+		.join(".baryon-snapshots")
+		.join(&action.revision)
+		.join(&action.rel_path)
+		.to_string_lossy()
+		.into_owned();
+	let replace_cmd = EditorCommand::ReplaceDocument {
+		text: String::from_utf8_lossy(&stdout).into_owned(),
+		language,
+		virtual_path: Some(virtual_path.clone()),
+	};
+	let view_id = focused_doctab(&session.layout, right_pane_id).id;
+	let materialized = {
+		let EditorSession {
+			buffers,
+			layout,
+			events,
+			ui,
+			next_dynamic_device_id,
+			persistent_settings,
+			..
+		} = &mut *session;
+		with_text_buffer_mut(&registry, buffers, layout, events, view_id, |tab| {
+			handle_file_doctab_command(
+				&runtime,
+				tab,
+				ui,
+				next_dynamic_device_id,
+				persistent_settings.save_durability,
+				replace_cmd,
+			);
+			// ReplaceDocument installs the requested virtual identity only
+			// when document construction succeeded; a fresh unnamed buffer
+			// keeps `None` on every failure path.
+			(tab.document.virtual_path.as_deref() == Some(virtual_path.as_str()))
+				.then_some(tab.document.active_language_id)
+		})
+		.flatten()
+	};
+	let Some(language_id) = materialized else {
+		// Materialization failed (the failure status message is already
+		// set): roll the empty snapshot pane back out rather than pairing a
+		// diff against a blank document.
+		close_focused_pane(session, &runtime);
+		session.focus_pane(action.left_pane_id);
+		return true;
+	};
+	{
+		let EditorSession {
+			layout,
+			persistent_settings,
+			ui,
+			..
+		} = &mut *session;
+		if let Some(view) = layout.find_view_mut(view_id)
+			&& let Err(err) = apply_resolved_theme_to_tab(view, language_id, persistent_settings)
+		{
+			ui.status_message = Some(err);
+		}
+	}
+
+	let provenance = crate::engine::session::SnapshotProvenance::GitRevision {
+		repo_root: action.repo_root.clone(),
+		rel_path: action.rel_path.clone(),
+		revision: action.revision.clone(),
+	};
+	let title = provenance.title();
+	session.snapshot_partners.insert(right_buffer_id, provenance);
+	super::diff::compute_pane_diff(&registry, session, action.left_pane_id, right_pane_id);
+	// Announce the snapshot only when nothing more important (e.g. a theme
+	// error) is already on the status line.
+	session.ui.status_message.get_or_insert(title);
+	true
 }
 
 fn drain_run_loop_deliveries(
@@ -761,6 +944,7 @@ fn release_buffer(
 	let Some(mut buffer) = session.buffers.remove(buffer_id) else {
 		return;
 	};
+	session.snapshot_partners.remove(&buffer_id);
 	// Callers reach here only once no view references the buffer, so this is
 	// the panel's last workspace reference disappearing.
 	if let Some(panel) = buffer.host_panel() {
@@ -1123,6 +1307,21 @@ fn handle_diff_split(
 	session: &mut EditorSession,
 	path: String,
 ) -> bool {
+	// An existing file keeps the original file-vs-file behavior; anything
+	// else — including the empty default, which means HEAD — is a Git
+	// revision of the focused document.
+	let arg = path.trim();
+	if arg.is_empty() || !std::path::Path::new(arg).is_file() {
+		return handle_revision_diff_split(session, arg);
+	}
+	handle_file_diff_split(runtime, session, path)
+}
+
+fn handle_file_diff_split(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	path: String,
+) -> bool {
 	let left_pane_id = session.focused_pane_id;
 	let left_buffer_id = focused_doctab(&session.layout, left_pane_id).buffer_id;
 	let canonical = match CanonicalPath::resolve(&path) {
@@ -1154,6 +1353,77 @@ fn handle_diff_split(
 
 	// Pair them
 	super::diff::compute_pane_diff(runtime.registry, session, left_pane_id, right_pane_id);
+	true
+}
+
+/// Start the async fetch for `:panediff <REV>`: `git cat-file blob
+/// <REV>:<relpath>` of
+/// the focused document. The snapshot pane is created when the job completes.
+fn handle_revision_diff_split(session: &mut EditorSession, arg: &str) -> bool {
+	let revision = if arg.is_empty() { "HEAD" } else { arg };
+	if let Err(err) = super::git::validate_revision(revision) {
+		session.ui.status_message = Some(format!("Not a file, and {err}"));
+		return true;
+	}
+	let left_pane_id = session.focused_pane_id;
+	let left_buffer_id = focused_doctab(&session.layout, left_pane_id).buffer_id;
+	let Some(file_path) = session
+		.buffers
+		.get(left_buffer_id)
+		.and_then(|buffer| buffer.text())
+		.and_then(|document| document.file_path.clone())
+	else {
+		session.ui.status_message =
+			Some("Cannot diff an unnamed buffer against Git history".to_string());
+		return true;
+	};
+	let file = std::path::Path::new(&file_path);
+	let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+	let Some(repo_root) = session.git_branch_cache.repo_root_for_path(&canonical) else {
+		session.ui.status_message = Some(format!("{file_path} is not in a Git repository"));
+		return true;
+	};
+	let Some(rel_path) = super::git::repo_relative_path(&repo_root, &canonical) else {
+		session.ui.status_message = Some(format!("{file_path} is outside its Git repository"));
+		return true;
+	};
+	if session.snapshot_fetch_job.is_some() {
+		session.ui.status_message = Some("A snapshot diff is already in progress".to_string());
+		return true;
+	}
+	// `cat-file blob` prints the object verbatim, and `--end-of-options`
+	// fences the spec so a revision can never be parsed as a Git option.
+	let spec = JobSpec {
+		program: PathBuf::from("git"),
+		args: vec![
+			"--no-optional-locks".into(),
+			"cat-file".into(),
+			"blob".into(),
+			"--end-of-options".into(),
+			format!("{revision}:{rel_path}").into(),
+		],
+		cwd: Some(repo_root.clone()),
+		stdin: None,
+		timeout: Duration::from_secs(10),
+		completion: Some(super::git::git_diff_action_lease(
+			super::git::GitDiffAction {
+				left_pane_id,
+				left_buffer_id,
+				repo_root,
+				revision: revision.to_string(),
+				rel_path,
+			},
+		)),
+	};
+	match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
+		Ok(job) => {
+			session.snapshot_fetch_job = Some(job);
+			session.ui.status_message = Some(format!("Diffing against {revision}…"));
+		}
+		Err(error) => {
+			session.ui.status_message = Some(format!("Git diff: {error}"));
+		}
+	}
 	true
 }
 
@@ -2701,6 +2971,7 @@ fn dispatch_command(
 						ui,
 						next_dynamic_device_id,
 						persistent_settings,
+						snapshot_partners,
 						..
 					} = session;
 					if let Some((effect, _language_id)) = handle_file_command_for_view(
@@ -2723,6 +2994,10 @@ fn dispatch_command(
 								== Some(path)
 						{
 							buffers.commit_path(reservation);
+							// A snapshot written to a real path is an
+							// ordinary file document now; its provenance
+							// identity must not outlive the conversion.
+							snapshot_partners.remove(&buffer_id);
 						}
 						if write_as_path.is_some()
 							&& let Err(err) =

@@ -2630,6 +2630,22 @@ mod tests {
 	}
 
 	#[test]
+	fn panediff_defaults_to_an_empty_target_and_passes_revisions_through() {
+		for (buffer, expected) in [("pd", ""), ("pd HEAD~3", "HEAD~3"), ("pd main", "main")] {
+			let (mut frontend, rx_cmd) = build_frontend();
+			let mut should_quit = false;
+			frontend.set_editor_mode_for_test(EditorMode::Command);
+			frontend.command_buffer = buffer.to_string();
+
+			assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
+			match rx_cmd.try_recv().expect(":pd should send a command") {
+				EditorCommand::DiffSplit(target) => assert_eq!(target, expected, "{buffer}"),
+				other => panic!("Expected DiffSplit, got {other:?}"),
+			}
+		}
+	}
+
+	#[test]
 	fn ambiguous_split_aliases_are_rejected() {
 		for command in ["split", "sp"] {
 			assert_unknown_command(command);

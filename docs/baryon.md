@@ -13,7 +13,7 @@ It is not a full Vim or NeoVim replacement yet, but it is well past toy status. 
 - Normal, Insert, Command, Search, Confirm, and Visual modes, dispatched from an engine-side data-driven keymap
 - Vim-like navigation: `h/j/k/l`, `w/b/e`, `gg`, `G`, `0`, `^`, `$`, `%`, `f/F/t/T` with `;`/`,` repeat, `H/M/L`, `Ctrl-d/u`, `Ctrl-f/b`, `PageUp`/`PageDown`, arrow keys, mouse clicks, and wheel scroll
 - Document tabs (`:tab`, `:tabedit`, `gt`/`gT`) and split panes (`:panehsplit`, `:panevsplit`) with keyboard focus and keyboard/mouse resize
-- Side-by-side diff of the current file against another with `:panediff`
+- Side-by-side diff of the current file against another file or any Git revision of itself with `:panediff`
 - Point multicursor editing with `Alt-j` / `Alt-k` for adjacent lines and Alt-click for arbitrary positions
 - Code folding with `za`/`zc`/`zo`, `zM`/`zR`, and `]m` to jump to the next function
 - Search with `/pattern`, `n`/`N`, `*` for the word under the cursor, and search history recall
@@ -167,7 +167,7 @@ Command mode:
 - `:q`, `:exit`, or `:quit` quit
 - `:e path` open another file; bare `:e` reloads from disk (`:e!` discards changes)
 - `:tab`, `:tabedit path` (`:te`), `:tabnext` (`:tn`), `:tabprev` (`:tp`), `:tabclose` (`:tc`) manage tabs
-- `:panehnew [language]` (`:paneh`, `:ph`, `:new`) and `:panevnew [language]` (`:panev`, `:pv`, `:vnew`) open an independent empty document; `:panehsplit` (`:phs`) and `:panevsplit` (`:pvs`) open another view of the current document; `:paneclose` (`:panec`, `:pc`) closes a pane; `:panediff path` (`:paned`, `:pd`) diffs against another file
+- `:panehnew [language]` (`:paneh`, `:ph`, `:new`) and `:panevnew [language]` (`:panev`, `:pv`, `:vnew`) open an independent empty document; `:panehsplit` (`:phs`) and `:panevsplit` (`:pvs`) open another view of the current document; `:paneclose` (`:panec`, `:pc`) closes a pane; `:panediff [path|rev]` (`:paned`, `:pd`) diffs against another file or a Git revision of the current file (`HEAD` when omitted)
 - `:tree` opens the file browser
 - `:mdpreview` opens a live markdown preview
 - `:theme name` switches the color theme; `:language lang` overrides syntax detection

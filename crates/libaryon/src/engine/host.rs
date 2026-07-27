@@ -349,6 +349,236 @@ mod tests {
 		}
 	}
 
+	/// A throwaway repository whose `file_name` receives one commit per entry
+	/// of `committed`, then `worktree` as the final uncommitted content.
+	fn git_fixture_repo(
+		name: &str,
+		file_name: &str,
+		committed: &[&str],
+		worktree: &str,
+	) -> std::path::PathBuf {
+		let dir = temp_path(name, "d");
+		std::fs::create_dir_all(&dir).expect("create repo dir");
+		let run_git = |args: &[&str]| {
+			let status = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.status()
+				.expect("run git");
+			assert!(status.success(), "git {args:?}");
+		};
+		run_git(&["init", "-q"]);
+		let file = dir.join(file_name);
+		for (index, contents) in committed.iter().enumerate() {
+			fs::write(&file, contents).expect("write committed version");
+			run_git(&["add", file_name]);
+			run_git(&[
+				"-c",
+				"user.email=test@example.com",
+				"-c",
+				"user.name=Test",
+				"commit",
+				"-q",
+				"-m",
+				&format!("v{index}"),
+			]);
+		}
+		fs::write(&file, worktree).expect("write worktree version");
+		dir
+	}
+
+	fn load_fixture_file(
+		engine: &mut EngineHandle,
+		dir: &std::path::Path,
+		file_name: &str,
+		worktree: &[u8],
+	) -> (
+		super::CommandSender,
+		std::sync::mpsc::Receiver<Viewport>,
+	) {
+		let commands = engine.command_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::LoadFile(
+				dir.join(file_name).to_string_lossy().into_owned(),
+			))
+			.expect("load file");
+		recv_viewport_until(&viewports, "worktree document", |viewport| {
+			visible_text(viewport) == worktree
+		});
+		(commands, viewports)
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_diffs_the_focused_file_against_head() {
+		let dir = git_fixture_repo(
+			"panediff-git",
+			"main.rs",
+			&["fn main() { old(); }\n"],
+			"fn main() { new(); }\n",
+		);
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) =
+			load_fixture_file(&mut engine, &dir, "main.rs", b"fn main() { new(); }\n");
+
+		// The empty target means HEAD; the snapshot pane arrives when the
+		// asynchronous fetch completes and takes focus like a file diff.
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot pane", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"fn main() { old(); }\n"
+		});
+		let snapshot_pane = viewport.focused_pane().expect("focused pane");
+		assert_eq!(
+			snapshot_pane.tabs[snapshot_pane.active_doctab_index].title,
+			"main.rs@HEAD"
+		);
+		assert!(
+			snapshot_pane.diff_pair.is_some(),
+			"snapshot pane must be paired with the worktree pane"
+		);
+		// The completion render replaces the taken "Diffing against HEAD…"
+		// progress message with the snapshot title.
+		assert_eq!(viewport.status_message.as_deref(), Some("main.rs@HEAD"));
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_snapshots_plain_text_documents_without_a_language() {
+		// A .txt buffer has no recognized language: materialization success
+		// must not be conflated with having a language id.
+		let dir = git_fixture_repo("panediff-txt", "notes.txt", &["old notes\n"], "new notes\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) =
+			load_fixture_file(&mut engine, &dir, "notes.txt", b"new notes\n");
+
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "plain-text snapshot pane", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"old notes\n"
+		});
+		let snapshot_pane = viewport.focused_pane().expect("focused pane");
+		assert_eq!(
+			snapshot_pane.tabs[snapshot_pane.active_doctab_index].title,
+			"notes.txt@HEAD"
+		);
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_snapshot_identity_clears_on_write_as() {
+		let dir = git_fixture_repo("panediff-writeas", "main.rs", &["old\n"], "new\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"new\n");
+
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("start revision diff");
+		recv_viewport_until(&viewports, "HEAD snapshot pane", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"old\n"
+		});
+
+		// Saving the focused snapshot to a real path converts it into an
+		// ordinary file document: the `name@revision` identity must not stick.
+		let saved = dir.join("saved.rs");
+		commands
+			.send(EditorCommand::WriteFileAs(
+				saved.to_string_lossy().into_owned(),
+			))
+			.expect("write snapshot as file");
+		recv_viewport_until(&viewports, "snapshot converted by write-as", |viewport| {
+			viewport.focused_pane().is_some_and(|pane| {
+				pane.tabs[pane.active_doctab_index].title == "saved.rs"
+			})
+		});
+		assert_eq!(fs::read(&saved).expect("read saved snapshot"), b"old\n");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_diffs_against_an_explicit_revision() {
+		let dir = git_fixture_repo(
+			"panediff-rev",
+			"main.rs",
+			&["first version\n", "second version\n"],
+			"worktree version\n",
+		);
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) =
+			load_fixture_file(&mut engine, &dir, "main.rs", b"worktree version\n");
+
+		commands
+			.send(EditorCommand::DiffSplit("HEAD~1".to_string()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "HEAD~1 snapshot pane", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"first version\n"
+		});
+		let snapshot_pane = viewport.focused_pane().expect("focused pane");
+		assert_eq!(
+			snapshot_pane.tabs[snapshot_pane.active_doctab_index].title,
+			"main.rs@HEAD~1"
+		);
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_reports_unknown_revisions_without_creating_a_pane() {
+		let dir = git_fixture_repo("panediff-unknown", "main.rs", &["content\n"], "content\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"content\n");
+
+		commands
+			.send(EditorCommand::DiffSplit("nosuchref".to_string()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "unknown revision failure", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message.starts_with("Not a file or Git revision"))
+		});
+		assert_eq!(viewport.panes.len(), 1, "no snapshot pane on failure");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_refuses_snapshots_beyond_the_capture_budget() {
+		// One byte past MAX_JOB_CAPTURE_BYTES: the capture truncates and the
+		// snapshot must be refused rather than diffed partially.
+		let oversized = "x".repeat(crate::engine::jobs::MAX_JOB_CAPTURE_BYTES + 1);
+		let dir = git_fixture_repo("panediff-oversized", "main.rs", &[oversized.as_str()], "tiny\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"tiny\n");
+
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "oversized snapshot refusal", |viewport| {
+			viewport.status_message.as_deref() == Some("Git snapshot is too large to diff")
+		});
+		assert_eq!(viewport.panes.len(), 1, "no snapshot pane on refusal");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
 	#[test]
 	fn default_registry_includes_bash_names() {
 		let registry = build_language_registry();

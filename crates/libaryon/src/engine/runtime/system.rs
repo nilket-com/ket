@@ -3978,6 +3978,50 @@ mod tests {
 	}
 
 	#[test]
+	fn revision_diff_refuses_an_unnamed_buffer() {
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+		// The startup buffer has no file, so there is no history to diff.
+		let refused = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::DiffSplit(String::new()));
+		assert_eq!(refused.panes.len(), 1);
+		assert_eq!(
+			refused.status_message.as_deref(),
+			Some("Cannot diff an unnamed buffer against Git history")
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+	}
+
+	#[test]
+	fn revision_diff_reports_files_outside_a_repository() {
+		let dir = temp_test_path("revision-diff-no-repo");
+		std::fs::create_dir_all(&dir).expect("create test directory");
+		// A malformed .git marker is a repository boundary, so the climb stops
+		// here even when the temp directory sits inside some repository.
+		std::fs::write(dir.join(".git"), "not a gitdir pointer\n").expect("write boundary");
+		let file = dir.join("plain.txt");
+		std::fs::write(&file, "content\n").expect("write file");
+		let path = file.to_string_lossy().into_owned();
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+		let _ = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::LoadFile(path));
+		let refused = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::DiffSplit(String::new()));
+		assert_eq!(refused.panes.len(), 1);
+		assert!(
+			refused
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message.ends_with("is not in a Git repository")),
+			"unexpected status: {:?}",
+			refused.status_message
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
 	fn pane_resize_commands_target_the_nearest_matching_ancestor_split() {
 		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
 

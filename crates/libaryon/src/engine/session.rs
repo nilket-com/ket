@@ -3012,6 +3012,37 @@ pub(crate) struct DiffPair {
 	pub(crate) blocks: Vec<DiffBlock>,
 }
 
+/// Where a snapshot diff partner came from.
+///
+/// A snapshot partner is an in-memory virtual document diffed against a live
+/// buffer. The diff engine itself is source-agnostic — it only ever sees two
+/// document roots — so this type, not the engine, is where acquisition
+/// sources accumulate. Git history is the first provider; the working index,
+/// point-in-time copies of arbitrary files, or remote artifacts are all
+/// future variants rather than new diff machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnapshotProvenance {
+	GitRevision {
+		repo_root: PathBuf,
+		rel_path: String,
+		revision: String,
+	},
+}
+
+impl SnapshotProvenance {
+	/// Tab title for a snapshot pane, e.g. `main.rs@HEAD~3`.
+	pub(crate) fn title(&self) -> String {
+		match self {
+			Self::GitRevision {
+				rel_path, revision, ..
+			} => {
+				let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+				format!("{name}@{revision}")
+			}
+		}
+	}
+}
+
 /// Attached text-object state captured around one high-level lifecycle
 /// operation. Detached construction is intentionally absent.
 pub(crate) struct TextLifecycleSnapshot {
@@ -3063,6 +3094,13 @@ pub(crate) struct EditorSession {
 	pub(crate) git_status_branch: Option<String>,
 	pub(crate) git_status_repo_root: Option<PathBuf>,
 	pub(crate) git_refresh_mode: super::protocol::GitRefreshMode,
+	/// The single in-flight snapshot fetch (currently `:panediff <REV>`), if
+	/// any.
+	pub(crate) snapshot_fetch_job: Option<JobId>,
+	/// Provenance of snapshot partner buffers, e.g. the Git revision a
+	/// `:panediff <REV>` pane was cut from. Drives tab titles and, later,
+	/// history navigation. Entries are removed when the buffer is released.
+	pub(crate) snapshot_partners: HashMap<BufferId, SnapshotProvenance>,
 }
 
 pub(crate) const DEFAULT_GIT_REFRESH_MODE: super::protocol::GitRefreshMode =
@@ -3539,6 +3577,8 @@ impl EditorSession {
 			git_status_branch: None,
 			git_status_repo_root: None,
 			git_refresh_mode: DEFAULT_GIT_REFRESH_MODE,
+			snapshot_fetch_job: None,
+			snapshot_partners: HashMap::new(),
 		}
 	}
 
@@ -4135,8 +4175,8 @@ mod tests {
 	use super::{
 		AddCaretResult, Affinity, BufferContent, CanonicalPath, CursorMode, CursorSet, CursorState,
 		DiffPair, EditorPane, EditorSession, LayoutLeaf, LayoutNode, MAX_CURSORS,
-		SettingsPersistent, TextAnchor, View, caret_from_doc_byte, resolve_theme_name,
-		split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
+		SettingsPersistent, SnapshotProvenance, TextAnchor, View, caret_from_doc_byte,
+		resolve_theme_name, split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
 	};
 	use crate::core::{
 		BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DocByte, DocDisplayCol, DocLine,
@@ -4193,6 +4233,22 @@ mod tests {
 			BTreeMap::new(),
 			None,
 		)
+	}
+
+	#[test]
+	fn snapshot_titles_pair_the_basename_with_the_revision() {
+		let provenance = SnapshotProvenance::GitRevision {
+			repo_root: PathBuf::from("/repo"),
+			rel_path: "src/main.rs".to_string(),
+			revision: "HEAD~3".to_string(),
+		};
+		assert_eq!(provenance.title(), "main.rs@HEAD~3");
+		let provenance = SnapshotProvenance::GitRevision {
+			repo_root: PathBuf::from("/repo"),
+			rel_path: "README.md".to_string(),
+			revision: "main".to_string(),
+		};
+		assert_eq!(provenance.title(), "README.md@main");
 	}
 
 	#[test]

@@ -17,7 +17,7 @@ use super::semantic::{
 };
 use super::session::{
 	BufferContent, BufferStore, CachedSumTree, CursorState, DiffPair, EditorPane, EditorSession,
-	PaneLayout, SemanticState, TextViewState, ViewContent,
+	PaneLayout, SemanticState, SnapshotProvenance, TextViewState, ViewContent,
 };
 use super::support::line_start_byte_sparse;
 use crate::core::{
@@ -300,6 +300,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 				.is_some_and(|buffer_id| *buffer_id == pane.active_tab().buffer_id),
 			git_status_buffer_id,
 			git_status_branch,
+			&session.snapshot_partners,
 			git_colors,
 			&mut semantic_busy,
 		));
@@ -488,6 +489,7 @@ fn render_pane_viewport(
 	is_git_status_panel: bool,
 	git_status_buffer_id: Option<BufferId>,
 	_git_status_branch: Option<&str>,
+	snapshot_partners: &HashMap<BufferId, SnapshotProvenance>,
 	git_colors: [Rgb; 4],
 	semantic_busy: &mut bool,
 ) -> PaneViewport {
@@ -1418,6 +1420,15 @@ fn render_pane_viewport(
 					view_id: view.id,
 					title: if git_status_buffer_id == Some(view.buffer_id) {
 						"git".to_string()
+					} else if let Some(provenance) = snapshot_partners
+						.get(&view.buffer_id)
+						// A real file identity outranks stale provenance
+						// (e.g. a snapshot converted by `:w PATH`).
+						.filter(|_| buffer.file_path().is_none())
+					{
+						// A snapshot partner: name it after the version it
+						// was cut from, e.g. `main.rs@HEAD~3`.
+						provenance.title()
 					} else {
 						buffer
 							.file_path()
