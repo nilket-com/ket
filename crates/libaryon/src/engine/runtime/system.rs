@@ -4022,6 +4022,30 @@ mod tests {
 	}
 
 	#[test]
+	fn revision_diff_refuses_paths_containing_newlines() {
+		let dir = temp_test_path("revision-diff-lf-path");
+		// Repository discovery only needs the `.git` directory marker; the
+		// refusal fires before any git process would spawn.
+		std::fs::create_dir_all(dir.join(".git")).expect("create repo marker");
+		let file = dir.join("we\nird.txt");
+		std::fs::write(&file, "content\n").expect("write LF-named file");
+		let path = file.to_string_lossy().into_owned();
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+		let _ = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::LoadFile(path));
+		let refused = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::DiffSplit(String::new()));
+		assert_eq!(refused.panes.len(), 1);
+		assert_eq!(
+			refused.status_message.as_deref(),
+			Some("Cannot diff a path containing a newline against Git history")
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
+		handle.join().expect("join engine");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
 	fn pane_resize_commands_target_the_nearest_matching_ancestor_split() {
 		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
 

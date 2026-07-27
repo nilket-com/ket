@@ -473,6 +473,166 @@ mod tests {
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
+	fn fixture_git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+		let output = std::process::Command::new("git")
+			.args(args)
+			.current_dir(dir)
+			.output()
+			.expect("run git");
+		assert!(output.status.success(), "git {args:?}");
+		String::from_utf8(output.stdout).expect("utf-8 git output")
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_snapshot_identity_survives_the_ref_moving() {
+		// Two commits; `mark` is a movable symbolic ref pinned at the first.
+		let dir = git_fixture_repo(
+			"panediff-refmove",
+			"main.rs",
+			&["version one\n", "version two\n"],
+			"version two\n",
+		);
+		fixture_git_stdout(&dir, &["branch", "mark", "HEAD~1"]);
+		let expected = fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}", "mark:main.rs"]);
+		let mut expected_lines = expected.lines();
+		let expected_commit = expected_lines.next().expect("commit oid").to_string();
+		let expected_blob = expected_lines.next().expect("blob oid").to_string();
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) =
+			load_fixture_file(&mut engine, &dir, "main.rs", b"version two\n");
+		commands
+			.send(EditorCommand::DiffSplit("mark".to_string()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "mark snapshot pane", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"version one\n"
+		});
+		let identity = |viewport: &Viewport| {
+			let pane = viewport.focused_pane().expect("focused pane");
+			pane.tabs[pane.active_doctab_index]
+				.snapshot
+				.clone()
+				.expect("snapshot identity")
+		};
+		let acquired = identity(&viewport);
+		assert_eq!(acquired.revision, "mark");
+		assert_eq!(acquired.commit_oid, expected_commit);
+		assert_eq!(acquired.blob_oid, expected_blob);
+
+		// Move the ref. The open snapshot was acquired as an immutable
+		// object: neither its content nor its recorded identity may follow.
+		fixture_git_stdout(&dir, &["branch", "-f", "mark", "HEAD"]);
+		commands
+			.send(EditorCommand::Resize(121, 40))
+			.expect("force a fresh projection");
+		let viewport = recv_viewport_until(&viewports, "post-move projection", |viewport| {
+			viewport.panes.len() == 2
+		});
+		assert_eq!(visible_text(&viewport), b"version one\n");
+		let retained = identity(&viewport);
+		assert_eq!(retained.commit_oid, expected_commit);
+		assert_eq!(retained.blob_oid, expected_blob);
+		assert_eq!(retained.revision, "mark");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_reacquiring_a_moved_ref_yields_distinct_identities() {
+		let dir = git_fixture_repo(
+			"panediff-reacquire",
+			"main.rs",
+			&["version one\n", "version two\n"],
+			"worktree\n",
+		);
+		fixture_git_stdout(&dir, &["branch", "mark", "HEAD~1"]);
+		let commit_before =
+			fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"]).trim().to_string();
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"worktree\n");
+		commands
+			.send(EditorCommand::DiffSplit("mark".to_string()))
+			.expect("first acquisition");
+		let viewport = recv_viewport_until(&viewports, "first mark snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"version one\n"
+		});
+		let left_pane_id = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != viewport.focused_pane_id)
+			.expect("worktree pane")
+			.pane_id;
+
+		// Move the ref, then acquire the SAME symbolic revision again from
+		// the worktree pane: the two open snapshots hold different blobs and
+		// must carry distinct identities everywhere — provenance and the
+		// provider-facing virtual path alike.
+		fixture_git_stdout(&dir, &["branch", "-f", "mark", "HEAD"]);
+		let commit_after =
+			fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"]).trim().to_string();
+		assert_ne!(commit_before, commit_after);
+		commands
+			.send(EditorCommand::FocusPane(left_pane_id))
+			.expect("refocus worktree pane");
+		commands
+			.send(EditorCommand::DiffSplit("mark".to_string()))
+			.expect("second acquisition");
+		let viewport = recv_viewport_until(&viewports, "second mark snapshot", |viewport| {
+			viewport.panes.len() == 3 && visible_text(viewport) == b"version two\n"
+		});
+
+		let mut snapshot_commits: Vec<String> = viewport
+			.panes
+			.iter()
+			.filter_map(|pane| pane.tabs[pane.active_doctab_index].snapshot.clone())
+			.map(|identity| {
+				assert_eq!(identity.revision, "mark");
+				identity.commit_oid
+			})
+			.collect();
+		snapshot_commits.sort();
+		let mut expected = vec![commit_before, commit_after.clone()];
+		expected.sort();
+		assert_eq!(snapshot_commits, expected);
+
+		// Pairing topology: the worktree pane and the NEW snapshot reference
+		// each other; the abandoned first snapshot stays open but unpaired —
+		// a stale one-way pair would desync scrolling by focused pane.
+		let new_snapshot_pane_id = viewport.focused_pane_id;
+		let old_snapshot_pane = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != left_pane_id && pane.pane_id != new_snapshot_pane_id)
+			.expect("first snapshot pane");
+		let partner_of = |pane_id| {
+			viewport
+				.pane(pane_id)
+				.expect("pane")
+				.diff_pair
+				.as_ref()
+				.map(|pair| pair.partner_pane_id)
+		};
+		assert_eq!(partner_of(left_pane_id), Some(new_snapshot_pane_id));
+		assert_eq!(partner_of(new_snapshot_pane_id), Some(left_pane_id));
+		assert_eq!(
+			partner_of(old_snapshot_pane.pane_id),
+			None,
+			"the abandoned snapshot must not keep a one-way pair"
+		);
+		let old_identity = old_snapshot_pane.tabs[old_snapshot_pane.active_doctab_index]
+			.snapshot
+			.clone()
+			.expect("old snapshot identity");
+		assert_ne!(old_identity.commit_oid, commit_after);
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
 	#[test]
 	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
 	fn panediff_snapshot_identity_clears_on_write_as() {

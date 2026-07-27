@@ -199,6 +199,16 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 				result: super::event_subscribers::SubscriberResult::Delivered,
 			};
 		}
+		if let Some(action) = invocation.action::<super::git::GitResolveAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_resolve_job(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
 		if let Some(action) = invocation.action::<super::git::GitDiffAction>() {
 			let action = action.clone();
 			context.session.snapshot_fetch_job = None;
@@ -225,10 +235,91 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 	}
 }
 
-/// Materialize a completed `git cat-file blob <REV>:<relpath>` fetch as the right-hand
-/// pane of a diff pair: a vertical split holding an in-memory virtual document
-/// that carries the left buffer's language and the repo-relative path as its
-/// virtual identity, so the async semantic graft upgrades the diff from the
+/// Complete the pin phase of a snapshot acquisition: parse the pinned commit
+/// OID, then start the fetch phase, which derives the blob and its content
+/// from that immutable commit. Failures here are the "unknown revision"
+/// surface.
+fn complete_git_resolve_job(
+	context: &mut EditorHost,
+	action: super::git::GitResolveAction,
+	completion: &JobCompletion,
+) -> bool {
+	let session = &mut context.session;
+	match &completion.outcome {
+		super::jobs::JobOutcome::Exited { status: 0 } => {}
+		super::jobs::JobOutcome::Exited { .. } => {
+			let mut stderr = Vec::new();
+			for chunk in completion.stderr.chunks() {
+				stderr.extend_from_slice(chunk);
+			}
+			let stderr = String::from_utf8_lossy(&stderr);
+			let detail = stderr.lines().next().unwrap_or("git rev-parse failed").trim();
+			session.ui.status_message = Some(format!("Not a file or Git revision: {detail}"));
+			return true;
+		}
+		_ => {
+			session.ui.status_message = Some("Git diff failed".to_string());
+			return true;
+		}
+	}
+	let mut stdout = Vec::new();
+	for chunk in completion.stdout.chunks() {
+		stdout.extend_from_slice(chunk);
+	}
+	let Some(commit_oid) = super::git::parse_single_oid(&stdout) else {
+		session.ui.status_message = Some("Git revision resolution was unreadable".to_string());
+		return true;
+	};
+
+	// Skip the fetch when the requesting document already changed.
+	let left_intact = session
+		.layout
+		.find_pane(action.left_pane_id)
+		.is_some_and(|pane| pane.active_tab().buffer_id == action.left_buffer_id);
+	if !left_intact {
+		session.ui.status_message = Some("Diff source changed; Git diff cancelled".to_string());
+		return true;
+	}
+
+	// `--batch` takes its spec on stdin, so nothing here is parsed as an
+	// option; the spec is `<hex-commit>:<relpath>` — fully immutable input.
+	let spec = JobSpec {
+		program: PathBuf::from("git"),
+		args: vec![
+			"--no-optional-locks".into(),
+			"cat-file".into(),
+			"--batch".into(),
+		],
+		cwd: Some(action.repo_root.clone()),
+		stdin: Some(format!("{commit_oid}:{}\n", action.rel_path).into_bytes()),
+		timeout: Duration::from_secs(10),
+		completion: Some(super::git::git_diff_action_lease(
+			super::git::GitDiffAction {
+				left_pane_id: action.left_pane_id,
+				left_buffer_id: action.left_buffer_id,
+				repo_root: action.repo_root,
+				revision: action.revision,
+				rel_path: action.rel_path,
+				commit_oid,
+			},
+		)),
+	};
+	match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
+		Ok(job) => {
+			session.snapshot_fetch_job = Some(job);
+		}
+		Err(error) => {
+			session.ui.status_message = Some(format!("Git diff: {error}"));
+		}
+	}
+	true
+}
+
+/// Materialize a completed `git cat-file --batch` fetch (blob OID + content,
+/// both derived from the pinned commit) as the right-hand pane of a diff
+/// pair: a vertical split holding an in-memory virtual document that carries
+/// the left buffer's language and the repo-relative path as its virtual
+/// identity, so the async semantic graft upgrades the diff from the
 /// line-based fallback to the hybrid AST model exactly as file diffs do.
 fn complete_git_diff_job(
 	context: &mut EditorHost,
@@ -262,6 +353,15 @@ fn complete_git_diff_job(
 	for chunk in completion.stdout.chunks() {
 		stdout.extend_from_slice(chunk);
 	}
+	let (blob_oid, blob_content) =
+		match super::git::parse_batch_blob(&stdout, action.commit_oid.len()) {
+			Ok(parsed) => parsed,
+			Err(detail) => {
+				context.session.ui.status_message =
+					Some(format!("Not a file or Git revision: {detail}"));
+				return true;
+			}
+		};
 
 	let Some(lang_registry) = context.language_registry.clone() else {
 		context.session.ui.status_message = Some("Language registry is unavailable".to_string());
@@ -317,20 +417,15 @@ fn complete_git_diff_job(
 	};
 
 	// The snapshot's identity for language services: absolute so it does not
-	// depend on the process working directory, but deliberately NOT the real
-	// file's path — a shared path would map both documents onto one workspace
-	// `FileId` and let the snapshot's old content poison analysis of the live
-	// buffer. This location never exists on disk, so providers fall back to
-	// their stable single-file mode.
-	let virtual_path = action
-		.repo_root
-		.join(".baryon-snapshots")
-		.join(&action.revision)
-		.join(&action.rel_path)
-		.to_string_lossy()
-		.into_owned();
+	// depend on the process working directory, keyed by the immutable commit
+	// OID so re-acquiring a moved ref never aliases an older snapshot, and
+	// deliberately NOT the real file's path — a shared path would map both
+	// documents onto one workspace `FileId` and let the snapshot's old
+	// content poison analysis of the live buffer.
+	let virtual_path =
+		super::git::snapshot_virtual_path(&action.repo_root, &action.commit_oid, &action.rel_path);
 	let replace_cmd = EditorCommand::ReplaceDocument {
-		text: String::from_utf8_lossy(&stdout).into_owned(),
+		text: String::from_utf8_lossy(&blob_content).into_owned(),
 		language,
 		virtual_path: Some(virtual_path.clone()),
 	};
@@ -388,6 +483,8 @@ fn complete_git_diff_job(
 		repo_root: action.repo_root.clone(),
 		rel_path: action.rel_path.clone(),
 		revision: action.revision.clone(),
+		commit_oid: action.commit_oid.clone(),
+		blob_oid,
 	};
 	let title = provenance.title();
 	session.snapshot_partners.insert(right_buffer_id, provenance);
@@ -1387,26 +1484,40 @@ fn handle_revision_diff_split(session: &mut EditorSession, arg: &str) -> bool {
 		session.ui.status_message = Some(format!("{file_path} is outside its Git repository"));
 		return true;
 	};
+	// Git permits LF in tracked filenames, but the fetch phase's `--batch`
+	// stdin is LF-framed: an embedded newline would smuggle in a second
+	// object spec. Refuse precisely instead of mangling the request.
+	if rel_path.contains('\n') {
+		session.ui.status_message =
+			Some("Cannot diff a path containing a newline against Git history".to_string());
+		return true;
+	}
 	if session.snapshot_fetch_job.is_some() {
 		session.ui.status_message = Some("A snapshot diff is already in progress".to_string());
 		return true;
 	}
-	// `cat-file blob` prints the object verbatim, and `--end-of-options`
-	// fences the spec so a revision can never be parsed as a Git option.
+	// Phase 1 of the two-phase acquisition: pin the symbolic revision to an
+	// immutable commit OID. This is the acquisition's ONLY symbolic
+	// resolution — one spec, one atomic ref read. (Resolving the commit and
+	// blob as two specs of one rev-parse is not atomic: git reads the ref
+	// per spec and a concurrent `branch -f` interleaves.) Phase 2 derives
+	// blob identity and content from the pinned commit. No
+	// `--end-of-options` here: rev-parse echoes it to stdout (it is a
+	// pass-through plumbing command), and the spec is option-safe by
+	// construction — it starts with the validated revision, which cannot
+	// begin with `-`.
 	let spec = JobSpec {
 		program: PathBuf::from("git"),
 		args: vec![
 			"--no-optional-locks".into(),
-			"cat-file".into(),
-			"blob".into(),
-			"--end-of-options".into(),
-			format!("{revision}:{rel_path}").into(),
+			"rev-parse".into(),
+			format!("{revision}^{{commit}}").into(),
 		],
 		cwd: Some(repo_root.clone()),
 		stdin: None,
 		timeout: Duration::from_secs(10),
-		completion: Some(super::git::git_diff_action_lease(
-			super::git::GitDiffAction {
+		completion: Some(super::git::git_resolve_action_lease(
+			super::git::GitResolveAction {
 				left_pane_id,
 				left_buffer_id,
 				repo_root,

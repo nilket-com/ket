@@ -61,6 +61,26 @@ pub(crate) fn compute_pane_diff(
 			});
 		}
 
+		// DiffPair is symmetric one-to-one. Re-pairing a pane (e.g. a second
+		// `:pd` from the same worktree pane) must detach BOTH sides of any
+		// pair it replaces: overwriting only this pane's entry would leave
+		// the abandoned partner holding a stale one-way pair, and scroll
+		// sync / navigation would disagree depending on which pane is
+		// focused. The abandoned partner stays open, just unpaired.
+		for (pane, partner) in [(left_id, right_id), (right_id, left_id)] {
+			if let Some(old) = session.diff_pairs.get(&pane)
+				&& old.partner_pane_id != partner
+			{
+				let abandoned = old.partner_pane_id;
+				if session
+					.diff_pairs
+					.get(&abandoned)
+					.is_some_and(|pair| pair.partner_pane_id == pane)
+				{
+					session.diff_pairs.remove(&abandoned);
+				}
+			}
+		}
 		session.diff_pairs.insert(
 			left_id,
 			crate::engine::session::DiffPair {

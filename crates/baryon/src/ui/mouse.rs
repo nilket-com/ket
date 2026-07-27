@@ -497,6 +497,7 @@ mod tests {
 			view_id: libaryon::core::ViewId::new(view_id),
 			title: title.to_string(),
 			is_dirty,
+			snapshot: None,
 		}
 	}
 

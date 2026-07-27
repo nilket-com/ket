@@ -1415,17 +1415,29 @@ fn render_pane_viewport(
 				let buffer = buffers
 					.get(view.buffer_id)
 					.expect("tab summary view must reference a live buffer");
+				// A real file identity outranks stale provenance (e.g. a
+				// snapshot converted by `:w PATH`).
+				let snapshot_provenance = snapshot_partners
+					.get(&view.buffer_id)
+					.filter(|_| buffer.file_path().is_none());
 				crate::uast::projection::DocTabSummary {
 					buffer_id: view.buffer_id,
 					view_id: view.id,
+					snapshot: snapshot_provenance.map(|provenance| match provenance {
+						SnapshotProvenance::GitRevision {
+							revision,
+							commit_oid,
+							blob_oid,
+							..
+						} => crate::uast::projection::SnapshotIdentity {
+							revision: revision.clone(),
+							commit_oid: commit_oid.clone(),
+							blob_oid: blob_oid.clone(),
+						},
+					}),
 					title: if git_status_buffer_id == Some(view.buffer_id) {
 						"git".to_string()
-					} else if let Some(provenance) = snapshot_partners
-						.get(&view.buffer_id)
-						// A real file identity outranks stale provenance
-						// (e.g. a snapshot converted by `:w PATH`).
-						.filter(|_| buffer.file_path().is_none())
-					{
+					} else if let Some(provenance) = snapshot_provenance {
 						// A snapshot partner: name it after the version it
 						// was cut from, e.g. `main.rs@HEAD~3`.
 						provenance.title()

@@ -4533,6 +4533,7 @@ mod tests {
 			view_id: ViewId::new(1),
 			title: "query.sql".to_owned(),
 			is_dirty: false,
+			snapshot: None,
 		};
 		let dirty = DocTabSummary {
 			is_dirty: true,

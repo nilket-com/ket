@@ -14,11 +14,11 @@ pub(crate) struct GitStatusAction {
 	pub(crate) buffer_id: crate::core::BufferId,
 }
 
-/// Completion payload for a `git cat-file blob <REV>:<relpath>` job started by
-/// `:panediff <REV>`. Carries enough context to verify the diff source is
-/// unchanged before the snapshot pane is created.
+/// Completion payload for the pin phase of `:panediff <REV>`:
+/// `git rev-parse <REV>^{commit}` performs the acquisition's only symbolic
+/// resolution — a single atomic ref read — before any content moves.
 #[derive(Debug, Clone)]
-pub(crate) struct GitDiffAction {
+pub(crate) struct GitResolveAction {
 	pub(crate) left_pane_id: crate::core::PaneId,
 	pub(crate) left_buffer_id: crate::core::BufferId,
 	pub(crate) repo_root: PathBuf,
@@ -26,10 +26,101 @@ pub(crate) struct GitDiffAction {
 	pub(crate) rel_path: String,
 }
 
-/// Reject revisions that cannot be spliced into a `<REV>:<relpath>` spec.
+/// Completion payload for the fetch phase of `:panediff <REV>`:
+/// `git cat-file --batch` fed `<commit_oid>:<relpath>`. Both the blob OID and
+/// the content derive from the immutable pinned commit in one output, so a
+/// ref moving mid-acquisition has nothing left to tear. (Resolving the
+/// commit and blob specs as two arguments of one `rev-parse` is NOT atomic —
+/// git reads the ref independently per spec, and a concurrent `branch -f`
+/// demonstrably interleaves.)
+#[derive(Debug, Clone)]
+pub(crate) struct GitDiffAction {
+	pub(crate) left_pane_id: crate::core::PaneId,
+	pub(crate) left_buffer_id: crate::core::BufferId,
+	pub(crate) repo_root: PathBuf,
+	pub(crate) revision: String,
+	pub(crate) rel_path: String,
+	pub(crate) commit_oid: String,
+}
+
+fn is_hex_oid(oid: &str) -> bool {
+	(oid.len() == 40 || oid.len() == 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parse the pin phase's `git rev-parse` output: exactly one hex object id
+/// (40 bytes in SHA-1 repositories, 64 in SHA-256), with nothing but blank
+/// lines after it.
+pub(crate) fn parse_single_oid(stdout: &[u8]) -> Option<String> {
+	let text = std::str::from_utf8(stdout).ok()?;
+	let mut lines = text.lines().map(str::trim);
+	let oid = lines.next()?;
+	if lines.any(|line| !line.is_empty()) {
+		return None;
+	}
+	is_hex_oid(oid).then(|| oid.to_string())
+}
+
+/// Parse one `git cat-file --batch` record: `<oid> SP <type> SP <size> LF
+/// <content>`. Returns the blob OID and its exact content. `expected_oid_len`
+/// is the pinned commit OID's width — one repository uses one object format,
+/// so a mismatched width is corruption, not a variant.
+pub(crate) fn parse_batch_blob(
+	stdout: &[u8],
+	expected_oid_len: usize,
+) -> Result<(String, Vec<u8>), String> {
+	let header_end = stdout
+		.iter()
+		.position(|&b| b == b'\n')
+		.ok_or_else(|| "object header is missing".to_string())?;
+	let header = std::str::from_utf8(&stdout[..header_end])
+		.map_err(|_| "object header is unreadable".to_string())?;
+	// The missing form echoes the ORIGINAL spec — which may itself contain
+	// spaces (Git permits them in tracked paths) — so it must be recognized
+	// before any field splitting: `<spec with spaces> missing`.
+	if header.strip_suffix(" missing").is_some() {
+		return Err("the file does not exist at that revision".to_string());
+	}
+	let mut fields = header.split(' ');
+	let oid = fields.next().unwrap_or_default();
+	match fields.next() {
+		Some("blob") => {}
+		Some(other) => return Err(format!("the path is a {other} at that revision, not a file")),
+		None => return Err("object header is malformed".to_string()),
+	}
+	if !is_hex_oid(oid) || oid.len() != expected_oid_len {
+		return Err("object id is malformed".to_string());
+	}
+	let size: usize = fields
+		.next()
+		.and_then(|size| size.parse().ok())
+		.ok_or_else(|| "object size is malformed".to_string())?;
+	if fields.next().is_some() {
+		return Err("object header is malformed".to_string());
+	}
+	let content_start = header_end + 1;
+	let content_end = content_start
+		.checked_add(size)
+		.filter(|&end| end <= stdout.len())
+		.ok_or_else(|| "object content is incomplete".to_string())?;
+	// The record ends with exactly one LF after the content — a missing
+	// terminator means the stream was cut short, and anything more means a
+	// second record leaked into the request.
+	let tail = &stdout[content_end..];
+	if tail != b"\n" {
+		return Err("object record has a malformed terminator".to_string());
+	}
+	Ok((
+		oid.to_string(),
+		stdout[content_start..content_end].to_vec(),
+	))
+}
+
+/// Reject revisions that cannot be spliced into a Git object spec.
 /// Whitespace never appears in a revision, a `:` would shift the path
-/// boundary of the spec, and a leading `-` reads as a Git option (the spec is
-/// additionally fenced behind `--end-of-options` when the job is spawned).
+/// boundary of a `<REV>:<relpath>` spec, and a leading `-` reads as a Git
+/// option — this validation is the argv fence for the pin phase, whose
+/// `rev-parse` cannot use `--end-of-options` (it would be echoed to stdout);
+/// the fetch phase passes its spec on stdin and has no argv surface at all.
 pub(crate) fn validate_revision(revision: &str) -> Result<(), String> {
 	if revision.is_empty() {
 		return Err("the Git revision is empty".to_string());
@@ -48,6 +139,28 @@ pub(crate) fn repo_relative_path(repo_root: &Path, file: &Path) -> Option<String
 	let rel = file.strip_prefix(repo_root).ok()?;
 	let text = rel.to_str()?;
 	(!text.is_empty()).then(|| text.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+/// Synthetic identity handed to language services for a snapshot document:
+/// `<repo_root>/.baryon-snapshots/<commit_oid>/<relpath>`.
+///
+/// Keyed by the immutable commit OID, never the symbolic revision — two
+/// snapshots of the same moved ref hold different content and must not alias
+/// each other in provider caches keyed by path. The revision label exists
+/// only for titles. The location never exists on disk, so canonicalization
+/// fails and providers fall back to their stable single-file mode instead of
+/// mapping the snapshot onto the live file's workspace identity.
+pub(crate) fn snapshot_virtual_path(
+	repo_root: &Path,
+	commit_oid: &str,
+	rel_path: &str,
+) -> String {
+	repo_root
+		.join(".baryon-snapshots")
+		.join(commit_oid)
+		.join(rel_path)
+		.to_string_lossy()
+		.into_owned()
 }
 
 
@@ -271,6 +384,10 @@ pub(crate) fn git_status_action_lease(buffer_id: crate::core::BufferId) -> Actio
 	ActionLease::new(GIT_JOB_OWNER, GitStatusAction { buffer_id })
 }
 
+pub(crate) fn git_resolve_action_lease(action: GitResolveAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
 pub(crate) fn git_diff_action_lease(action: GitDiffAction) -> ActionLease {
 	ActionLease::new(GIT_JOB_OWNER, action)
 }
@@ -333,9 +450,9 @@ fn parse_branch(head: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		GitBranchCache, GitStatusEntry, GitStatusSnapshot, find_git_context,
-		parse_status_porcelain, render_status_snapshot, repo_relative_path,
-		resolve_context_path, validate_revision,
+		GitBranchCache, GitStatusEntry, GitStatusSnapshot, find_git_context, parse_batch_blob,
+		parse_single_oid, parse_status_porcelain, render_status_snapshot, repo_relative_path,
+		resolve_context_path, snapshot_virtual_path, validate_revision,
 	};
 	use crate::svp::rust_highlight::TokenCategory;
 	use std::path::Path;
@@ -548,6 +665,89 @@ mod tests {
 		] {
 			assert!(validate_revision(revision).is_err(), "{revision:?}");
 		}
+	}
+
+	#[test]
+	fn single_oids_require_one_hex_id_and_nothing_else() {
+		let sha1 = "a".repeat(40);
+		let sha256 = "f".repeat(64);
+		assert_eq!(parse_single_oid(format!("{sha1}\n").as_bytes()).as_deref(), Some(sha1.as_str()));
+		assert_eq!(
+			parse_single_oid(format!("{sha256}\n").as_bytes()).as_deref(),
+			Some(sha256.as_str())
+		);
+		// Trailing blank lines are fine; junk hidden behind a blank line, a
+		// second value, short ids, and non-hex are not.
+		assert!(parse_single_oid(format!("{sha1}\n\n").as_bytes()).is_some());
+		assert!(parse_single_oid(format!("{sha1}\n\nextra\n").as_bytes()).is_none());
+		assert!(parse_single_oid(format!("{sha1}\n{sha1}\n").as_bytes()).is_none());
+		assert!(parse_single_oid(b"abc123\n").is_none());
+		assert!(parse_single_oid(format!("{}\n", "z".repeat(40)).as_bytes()).is_none());
+		assert!(parse_single_oid(b"").is_none());
+	}
+
+	#[test]
+	fn batch_blob_records_parse_strictly() {
+		let oid = "b".repeat(40);
+		let record = format!("{oid} blob 5\nhello\n");
+		assert_eq!(
+			parse_batch_blob(record.as_bytes(), 40),
+			Ok((oid.clone(), b"hello".to_vec()))
+		);
+		// Content bytes are counted, not line-parsed: embedded newlines and
+		// the exact size boundary must round-trip.
+		let record = format!("{oid} blob 4\na\nb\n\n");
+		assert_eq!(
+			parse_batch_blob(record.as_bytes(), 40),
+			Ok((oid.clone(), b"a\nb\n".to_vec()))
+		);
+
+		// One repository uses one object format: a 64-hex blob id against a
+		// 40-hex commit id is corruption, not a variant.
+		let sha256 = "c".repeat(64);
+		assert!(parse_batch_blob(format!("{sha256} blob 5\nhello\n").as_bytes(), 40).is_err());
+
+		assert!(
+			parse_batch_blob(format!("{oid}:nope.txt missing\n").as_bytes(), 40)
+				.unwrap_err()
+				.contains("does not exist")
+		);
+		// The missing form echoes the original spec, which may contain
+		// spaces; it must not be shredded by field parsing.
+		assert!(
+			parse_batch_blob(format!("{oid}:no such file.txt missing\n").as_bytes(), 40)
+				.unwrap_err()
+				.contains("does not exist")
+		);
+		assert!(
+			parse_batch_blob(format!("{oid} tree 33\n").as_bytes(), 40)
+				.unwrap_err()
+				.contains("not a file")
+		);
+		// Truncated content, trailing data, a missing protocol terminator,
+		// and malformed headers are refused.
+		assert!(parse_batch_blob(format!("{oid} blob 10\nhello\n").as_bytes(), 40).is_err());
+		assert!(parse_batch_blob(format!("{oid} blob 5\nhello\nextra").as_bytes(), 40).is_err());
+		assert!(parse_batch_blob(format!("{oid} blob 5\nhello").as_bytes(), 40).is_err());
+		assert!(parse_batch_blob(format!("{oid} blob\nhello\n").as_bytes(), 40).is_err());
+		assert!(parse_batch_blob(b"no newline", 40).is_err());
+	}
+
+	#[test]
+	fn snapshot_virtual_paths_are_keyed_by_commit_oid_not_revision() {
+		let root = Path::new("/repo");
+		let commit_a = "a".repeat(40);
+		let commit_b = "b".repeat(40);
+		let path_a = snapshot_virtual_path(root, &commit_a, "src/main.rs");
+		let path_b = snapshot_virtual_path(root, &commit_b, "src/main.rs");
+		// The same symbolic revision label resolving to two commits (a moved
+		// ref) must yield distinct provider identities: the label is not a
+		// parameter here by design.
+		assert_ne!(path_a, path_b);
+		assert_eq!(
+			path_a,
+			format!("/repo/.baryon-snapshots/{commit_a}/src/main.rs")
+		);
 	}
 
 	#[test]

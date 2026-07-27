@@ -434,6 +434,7 @@ mod tests {
 					view_id,
 					title: "test.rs".to_string(),
 					is_dirty: false,
+					snapshot: None,
 				}],
 				active_doctab_index: 0,
 				diff_pair: None,

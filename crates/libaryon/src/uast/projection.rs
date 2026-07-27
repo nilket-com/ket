@@ -405,6 +405,19 @@ pub struct DocTabSummary {
 	pub view_id: ViewId,
 	pub title: String,
 	pub is_dirty: bool,
+	/// Present when this tab shows a snapshot partner (e.g. a `:panediff`
+	/// revision pane): the immutable identity it was acquired as.
+	pub snapshot: Option<SnapshotIdentity>,
+}
+
+/// Immutable identity of a snapshot document, pinned at acquisition. The
+/// `revision` is the symbolic label the user asked for; the OIDs are what the
+/// snapshot actually is — a ref moving after acquisition changes neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotIdentity {
+	pub revision: String,
+	pub commit_oid: String,
+	pub blob_oid: String,
 }
 
 const FOLDED_TOKEN_TEXT: &str = "❯❯❯";

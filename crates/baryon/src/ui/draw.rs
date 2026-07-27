@@ -1944,12 +1944,14 @@ mod tests {
 				view_id: libaryon::core::ViewId::new(1),
 				title: "a".to_string(),
 				is_dirty: false,
+				snapshot: None,
 			},
 			DocTabSummary {
 				buffer_id: libaryon::core::BufferId::new(2),
 				view_id: libaryon::core::ViewId::new(2),
 				title: "b".to_string(),
 				is_dirty: false,
+				snapshot: None,
 			},
 		];
 		let area = Rect::new(0, 0, 10, 1);

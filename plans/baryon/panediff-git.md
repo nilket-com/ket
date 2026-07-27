@@ -36,14 +36,33 @@ Follows the `git status` panel pattern (`start_git_status_job`):
 - Revisions are validated up front: no whitespace, no `:` (which would change
   the meaning of the `<REV>:<relpath>` spec), and no leading `-` (which would
   read as a Git option — `:pd --output=x` must never become an argument).
-- Spawn `git --no-optional-locks cat-file blob --end-of-options
-  <REV>:<relpath>` with `cwd` = repo root and a 10s timeout. `cat-file blob`
-  prints the object verbatim (no `git show` pretty-printing surprises), and
-  `--end-of-options` fences the spec as a second layer against option
-  injection. The `GitDiffAction` completion lease carries
-  `{ left_pane_id, left_buffer_id, repo_root, revision, rel_path }`.
-- One in-flight snapshot fetch at a time (`session.snapshot_fetch_job`); a
-  second `:pd` while pending reports it.
+- Acquisition is **two-phase**, pinning identity before content:
+  1. **Pin** (`GitResolveAction`): `git rev-parse <REV>^{commit}` returns the
+     commit OID. This is the acquisition's **only symbolic resolution** — one
+     spec, one atomic ref read — and the "unknown revision" failure surface.
+     (No `--end-of-options` here — rev-parse echoes it to stdout as a
+     pass-through plumbing command; the spec is option-safe by construction
+     since it begins with the validated revision.)
+  2. **Fetch** (`GitDiffAction`): `git cat-file --batch` fed
+     `<commit_oid>:<relpath>` on stdin returns the blob OID and its content
+     in one record, both derived from the immutable pinned commit. A missing
+     path or a tree at that path fails here with a precise message.
+  Both phases run with `cwd` = repo root and a 10s timeout.
+
+  Why not one `rev-parse <REV>^{commit} <REV>:<relpath>`? Git resolves each
+  spec with an **independent ref read** — under concurrent `branch -f` churn
+  the pair measurably tears (27/400 iterations in a loop experiment returned
+  commit A with blob B; the pin-then-batch sequence tore 0/400 under the
+  same churn). The record parser is strict: one hex OID whose width must
+  match the pinned commit's (one repository uses one object format), exact
+  content-length accounting, and exactly one LF terminator — no trailing
+  data, no cut-short stream.
+- Git permits LF in tracked filenames, but `--batch` stdin is LF-framed; a
+  path containing a newline is refused up front with a precise message
+  rather than smuggling a second object spec into the stream. (`--batch -Z`
+  would lift this, but requires Git ≥ 2.42; revisit if such paths matter.)
+- One in-flight acquisition at a time (`session.snapshot_fetch_job`, spanning
+  both phases); a second `:pd` while pending reports it.
 
 ## 3. Completion (`RunLoopJobDispatcher::complete`)
 
@@ -58,7 +77,7 @@ On success:
    `split_target_pane` builds panes.
 3. Fill it through the `ReplaceDocument` doctab mechanics: blob text,
    `language` = the left buffer's `LanguageId::as_str()`, `virtual_path` =
-   `<repo_root>/.baryon-snapshots/<revision>/<relpath>`. A virtual document
+   `<repo_root>/.baryon-snapshots/<commit_oid>/<relpath>`. A virtual document
    (not an output panel — output panels are excluded from the semantic
    pipeline in `render.rs`) gets the full async semantic graft, so the diff
    upgrades from the line-based fallback to the hybrid AST model exactly as
@@ -69,10 +88,13 @@ On success:
    the real file's path** — the Rust provider keys workspace documents by
    canonical path, and a shared path would map the live buffer and the
    snapshot onto one workspace `FileId`, letting the snapshot's old content
-   poison analysis of the live document. The synthetic location never exists
-   on disk, so canonicalization fails and providers use their stable
-   single-file fallback. True workspace-aware snapshot analysis needs a
-   provider-level snapshot overlay (future work).
+   poison analysis of the live document. It is keyed by the **commit OID**,
+   not the symbolic revision, for the same reason at the other end:
+   re-acquiring a moved ref must not alias the older snapshot in provider
+   caches keyed by path. The synthetic location never exists on disk, so
+   canonicalization fails and providers use their stable single-file
+   fallback. True workspace-aware snapshot analysis needs a provider-level
+   snapshot overlay (future work).
 4. Verify materialization: `ReplaceDocument` installs the requested
    `virtual_path` only when document construction succeeded, so its absence is
    the failure signal. On failure the empty snapshot pane is rolled back
@@ -93,10 +115,20 @@ snapshots, so only the fetch plumbing carries Git-specific names.
   file-vs-file flow where both sides are editable.
 - `session.snapshot_partners: HashMap<BufferId, SnapshotProvenance>` records
   where each snapshot came from. `SnapshotProvenance` is an enum
-  (`GitRevision { repo_root, rel_path, revision }` today; the index,
-  point-in-time file copies, or remote artifacts are future variants). It
-  drives the `<basename>@<revision>` tab title and is the seed for history
-  navigation. Entries are removed in `release_buffer`.
+  (`GitRevision { repo_root, rel_path, revision, commit_oid, blob_oid }`
+  today; the index, point-in-time file copies, or remote artifacts are future
+  variants). The `revision` is the user-facing label (`HEAD~3`) and drives
+  the `<basename>@<revision>` tab title; the OIDs are the immutable identity
+  pinned at acquisition — the foundation for caching, deduplication, and
+  timeline movement. Entries are removed in `release_buffer`.
+- The viewport projection exposes the identity as
+  `DocTabSummary::snapshot: Option<SnapshotIdentity>` (revision + OIDs), so
+  frontends can render provenance and tests can observe that a moved ref
+  never rewrites an open snapshot.
+- Pairing is symmetric one-to-one: installing a new pair detaches both sides
+  of any pair it replaces (`compute_pane_diff`), so re-diffing from a pane
+  never leaves its abandoned partner holding a stale one-way pair. The
+  abandoned pane stays open, just unpaired.
 - Identity transitions: `:w PATH` on a snapshot converts it into an ordinary
   file document — the write-as commit removes its provenance entry, and the
   title renderer additionally prefers a real `file_path` over provenance so a
@@ -120,7 +152,9 @@ Gate tests (no `git` binary dependency):
 - Command-layer: `:pd` with no argument dispatches `DiffSplit("")`; argument
   passthrough unchanged (`prompt.rs`).
 - `git.rs`: revision validation (including option-injection shapes like
-  `--output=…`), rel-path computation; `session.rs`: provenance titles.
+  `--output=…`), rel-path computation, strict OID and `--batch` record
+  parsing (mixed widths, hidden trailing junk, size mismatches all refused);
+  `session.rs`: provenance titles.
 - Runtime refusals via the engine harness: an unnamed buffer cannot be diffed
   against history; a file outside any repository reports it; the existing
   path-alias self-diff test proves an existing file wins disambiguation.
@@ -133,6 +167,13 @@ Ignored tests (require a `git` binary; run with `-- --ignored`):
 - A language-less document (`.txt`) snapshots successfully — materialization
   success is independent of having a recognized language.
 - `:w PATH` on a snapshot clears its `name@revision` identity.
+- **Ref-move regression**: acquire a snapshot at a symbolic ref, `git branch
+  -f` the ref elsewhere, and verify the open snapshot retains its original
+  commit/blob OIDs and content.
+- **Re-acquisition regression**: acquire the same symbolic ref on both sides
+  of a ref move and verify the two open snapshots carry distinct identities,
+  the worktree pane pairs with the new snapshot symmetrically, and the
+  abandoned snapshot stays open but unpaired.
 - Unknown revisions fail with git's message and create no pane.
 - Oversized blobs (> 8 MiB) are refused, not partially diffed.
 
@@ -142,9 +183,8 @@ straight-line status+rollback code.
 
 ## Future Work (out of scope here)
 
-- Resolve and store commit + blob OIDs in `SnapshotProvenance` (immutable
-  identities rather than labels) before building timeline stepping; enables
-  caching and dedup of identical snapshots.
+- Snapshot caching and deduplication keyed by blob OID (the identity now
+  exists; the cache does not).
 - Timeline stepping: move the diff partner older/newer through
   `git log --follow` without leaving the pair.
 - Log picker: a `git log` panel for the focused file where selecting a commit

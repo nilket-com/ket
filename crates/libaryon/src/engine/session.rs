@@ -3025,7 +3025,14 @@ pub(crate) enum SnapshotProvenance {
 	GitRevision {
 		repo_root: PathBuf,
 		rel_path: String,
+		/// The revision as the user requested it (`HEAD~3`, a branch, a
+		/// tag): the display label, not the identity.
 		revision: String,
+		/// Immutable identity, pinned at acquisition. A symbolic ref moving
+		/// afterwards never changes what an open snapshot is: these OIDs are
+		/// the foundation for caching, deduplication, and timeline movement.
+		commit_oid: String,
+		blob_oid: String,
 	},
 }
 
@@ -4236,17 +4243,23 @@ mod tests {
 	}
 
 	#[test]
-	fn snapshot_titles_pair_the_basename_with_the_revision() {
+	fn snapshot_titles_pair_the_basename_with_the_requested_revision() {
 		let provenance = SnapshotProvenance::GitRevision {
 			repo_root: PathBuf::from("/repo"),
 			rel_path: "src/main.rs".to_string(),
 			revision: "HEAD~3".to_string(),
+			commit_oid: "c".repeat(40),
+			blob_oid: "b".repeat(40),
 		};
+		// The user-facing label stays symbolic; the OIDs are identity, not
+		// display.
 		assert_eq!(provenance.title(), "main.rs@HEAD~3");
 		let provenance = SnapshotProvenance::GitRevision {
 			repo_root: PathBuf::from("/repo"),
 			rel_path: "README.md".to_string(),
 			revision: "main".to_string(),
+			commit_oid: "c".repeat(40),
+			blob_oid: "b".repeat(40),
 		};
 		assert_eq!(provenance.title(), "README.md@main");
 	}
