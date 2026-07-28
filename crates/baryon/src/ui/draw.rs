@@ -1295,6 +1295,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let minimap = &mut self.minimap;
 		let markdown_preview = &mut self.markdown_preview;
 		let diff_bridge = &mut self.diff_bridge;
+		let uast_graph = &mut self.uast_graph;
 		let ui_palette = current_viewport
 			.as_ref()
 			.map(|view| view.ui_palette)
@@ -1315,6 +1316,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				let mut cursor_to_set = None;
 				let mut pending_minimap_areas: Vec<(usize, Rect)> = Vec::new();
 				let mut pending_markdown_preview_areas: Vec<(usize, Rect)> = Vec::new();
+				let mut pending_uast_graph_areas: Vec<(usize, Rect)> = Vec::new();
 				let max_width = f.area().width;
 				let max_height = f.area().height;
 				let status_bar_height = STATUS_BAR_ROWS;
@@ -1349,6 +1351,27 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 							if let Some(markdown_preview_area) = artifacts.markdown_preview_area {
 								pending_markdown_preview_areas.push((index, markdown_preview_area));
+							}
+							if pane.uast_graph.is_some() {
+								pending_uast_graph_areas.push((
+									index,
+									Rect {
+										x: pane.rect.screen_col.get() as u16,
+										y: pane
+											.rect
+											.screen_row
+											.saturating_add(DOCTAB_BAR_ROWS.into())
+											.get() as u16,
+										width: pane.rect.width.get().min(u16::MAX as u32) as u16,
+										height: pane
+											.rect
+											.height
+											.saturating_sub(DOCTAB_BAR_ROWS.into())
+											.get()
+											.min(u16::MAX as u32)
+											as u16,
+									},
+								));
 							}
 						}
 
@@ -1413,6 +1436,18 @@ impl<B: Backend + io::Write> Frontend<B> {
 						view.panes.iter().map(|p| p.view_id).collect();
 					minimap.retain_views(|view_id| live_view_ids.contains(&view_id));
 					markdown_preview.retain_views(|view_id| live_view_ids.contains(&view_id));
+					uast_graph.retain_views(|view_id| live_view_ids.contains(&view_id));
+
+					for (pane_index, graph_area) in pending_uast_graph_areas {
+						let Some(pane) = view.panes.get(pane_index) else {
+							continue;
+						};
+						let Some(snapshot) = pane.uast_graph.as_ref() else {
+							continue;
+						};
+						uast_graph.request(pane.view_id, snapshot, graph_area);
+						uast_graph.render(pane.view_id, f, graph_area);
+					}
 
 					for (pane_index, preview_area) in pending_markdown_preview_areas {
 						let Some(pane) = view.panes.get(pane_index) else {

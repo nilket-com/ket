@@ -2,8 +2,38 @@ use crate::core::DocByte;
 use crate::engine::language::GreenNode;
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 use crate::svp::sql_parse::{ByteSpan, LineIndex};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 use sqlparser::ast::{self, Spanned};
+
+pub const SQL_DOCUMENT_KIND: ProviderKindId = ProviderKindId::new(1);
+pub const SQL_STATEMENT_KIND: ProviderKindId = ProviderKindId::new(2);
+pub const SQL_QUERY_KIND: ProviderKindId = ProviderKindId::new(3);
+pub const SQL_CTE_KIND: ProviderKindId = ProviderKindId::new(4);
+pub const SQL_CREATE_VIEW_KIND: ProviderKindId = ProviderKindId::new(5);
+pub const SQL_CREATE_TABLE_KIND: ProviderKindId = ProviderKindId::new(6);
+pub const SQL_INSERT_KIND: ProviderKindId = ProviderKindId::new(7);
+pub const SQL_UPDATE_KIND: ProviderKindId = ProviderKindId::new(8);
+pub const SQL_DELETE_KIND: ProviderKindId = ProviderKindId::new(9);
+pub const SQL_TOKEN_KIND: ProviderKindId = ProviderKindId::new(10);
+
+pub fn structural_kind_name(kind: ProviderKindId) -> Option<String> {
+	Some(
+		match kind {
+			SQL_DOCUMENT_KIND => "Document",
+			SQL_STATEMENT_KIND => "Statement",
+			SQL_QUERY_KIND => "Query",
+			SQL_CTE_KIND => "Cte",
+			SQL_CREATE_VIEW_KIND => "CreateView",
+			SQL_CREATE_TABLE_KIND => "CreateTable",
+			SQL_INSERT_KIND => "Insert",
+			SQL_UPDATE_KIND => "Update",
+			SQL_DELETE_KIND => "Delete",
+			SQL_TOKEN_KIND => "Token",
+			_ => return None,
+		}
+		.to_owned(),
+	)
+}
 
 pub fn extract_semantic_highlights(
 	statements: &[ast::Statement],
@@ -51,6 +81,7 @@ pub fn build_structural_topology(
 
 	RangeNode {
 		kind: SemanticKind::RelationalTable,
+		provider_kind: SQL_DOCUMENT_KIND,
 		start: 0,
 		end: total_len,
 		children,
@@ -61,9 +92,11 @@ pub fn build_structural_topology(
 pub fn flat_topology(source_len: u32) -> GreenNode {
 	GreenNode {
 		kind: SemanticKind::RelationalTable,
+		provider_kind: SQL_DOCUMENT_KIND,
 		byte_len: source_len,
 		children: vec![GreenNode {
 			kind: SemanticKind::Token,
+			provider_kind: SQL_TOKEN_KIND,
 			byte_len: source_len,
 			children: Vec::new(),
 		}],
@@ -73,6 +106,7 @@ pub fn flat_topology(source_len: u32) -> GreenNode {
 #[derive(Debug, Clone)]
 struct RangeNode {
 	kind: SemanticKind,
+	provider_kind: ProviderKindId,
 	start: usize,
 	end: usize,
 	children: Vec<RangeNode>,
@@ -82,6 +116,7 @@ impl RangeNode {
 	fn leaf(start: usize, end: usize) -> Self {
 		Self {
 			kind: SemanticKind::Token,
+			provider_kind: SQL_TOKEN_KIND,
 			start,
 			end,
 			children: Vec::new(),
@@ -95,6 +130,7 @@ impl RangeNode {
 	fn to_green(&self) -> GreenNode {
 		GreenNode {
 			kind: self.kind,
+			provider_kind: self.provider_kind,
 			byte_len: self.len(),
 			children: self.children.iter().map(Self::to_green).collect(),
 		}
@@ -118,7 +154,12 @@ fn build_simple_statement_node(
 	line_index: &LineIndex,
 ) -> Option<RangeNode> {
 	let span = line_index.span_to_byte_span(statement.span())?;
-	Some(build_branch(SemanticKind::RelationalRow, span, Vec::new()))
+	Some(build_branch(
+		SemanticKind::RelationalRow,
+		SQL_STATEMENT_KIND,
+		span,
+		Vec::new(),
+	))
 }
 
 fn build_query_node(query: &ast::Query, line_index: &LineIndex) -> Option<RangeNode> {
@@ -134,7 +175,12 @@ fn build_query_node(query: &ast::Query, line_index: &LineIndex) -> Option<RangeN
 	}
 
 	collect_set_expr_nodes(&query.body, line_index, &mut nested);
-	Some(build_branch(SemanticKind::RelationalTable, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalTable,
+		SQL_QUERY_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_cte_node(cte: &ast::Cte, line_index: &LineIndex) -> Option<RangeNode> {
@@ -143,7 +189,12 @@ fn build_cte_node(cte: &ast::Cte, line_index: &LineIndex) -> Option<RangeNode> {
 	if let Some(query_node) = build_query_node(&cte.query, line_index) {
 		nested.push(query_node);
 	}
-	Some(build_branch(SemanticKind::RelationalRow, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalRow,
+		SQL_CTE_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_create_view_node(view: &ast::CreateView, line_index: &LineIndex) -> Option<RangeNode> {
@@ -152,7 +203,12 @@ fn build_create_view_node(view: &ast::CreateView, line_index: &LineIndex) -> Opt
 	if let Some(query_node) = build_query_node(&view.query, line_index) {
 		nested.push(query_node);
 	}
-	Some(build_branch(SemanticKind::RelationalTable, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalTable,
+		SQL_CREATE_VIEW_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_create_table_node(table: &ast::CreateTable, line_index: &LineIndex) -> Option<RangeNode> {
@@ -163,7 +219,12 @@ fn build_create_table_node(table: &ast::CreateTable, line_index: &LineIndex) -> 
 	{
 		nested.push(query_node);
 	}
-	Some(build_branch(SemanticKind::RelationalTable, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalTable,
+		SQL_CREATE_TABLE_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_insert_node(insert: &ast::Insert, line_index: &LineIndex) -> Option<RangeNode> {
@@ -174,7 +235,12 @@ fn build_insert_node(insert: &ast::Insert, line_index: &LineIndex) -> Option<Ran
 	{
 		nested.push(query_node);
 	}
-	Some(build_branch(SemanticKind::RelationalRow, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalRow,
+		SQL_INSERT_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_update_node(update: &ast::Update, line_index: &LineIndex) -> Option<RangeNode> {
@@ -193,7 +259,12 @@ fn build_update_node(update: &ast::Update, line_index: &LineIndex) -> Option<Ran
 		}
 		None => {}
 	}
-	Some(build_branch(SemanticKind::RelationalRow, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalRow,
+		SQL_UPDATE_KIND,
+		span,
+		nested,
+	))
 }
 
 fn build_delete_node(delete: &ast::Delete, line_index: &LineIndex) -> Option<RangeNode> {
@@ -211,7 +282,12 @@ fn build_delete_node(delete: &ast::Delete, line_index: &LineIndex) -> Option<Ran
 			collect_table_with_joins_subqueries(table, line_index, &mut nested);
 		}
 	}
-	Some(build_branch(SemanticKind::RelationalRow, span, nested))
+	Some(build_branch(
+		SemanticKind::RelationalRow,
+		SQL_DELETE_KIND,
+		span,
+		nested,
+	))
 }
 
 fn collect_set_expr_nodes(
@@ -626,7 +702,12 @@ fn collect_function_arguments_subqueries(
 	}
 }
 
-fn build_branch(kind: SemanticKind, span: ByteSpan, nested: Vec<RangeNode>) -> RangeNode {
+fn build_branch(
+	kind: SemanticKind,
+	provider_kind: ProviderKindId,
+	span: ByteSpan,
+	nested: Vec<RangeNode>,
+) -> RangeNode {
 	let mut children = Vec::new();
 	let mut cursor = span.start;
 	let mut nested = nested;
@@ -649,6 +730,7 @@ fn build_branch(kind: SemanticKind, span: ByteSpan, nested: Vec<RangeNode>) -> R
 
 	RangeNode {
 		kind,
+		provider_kind,
 		start: span.start,
 		end: span.end,
 		children,

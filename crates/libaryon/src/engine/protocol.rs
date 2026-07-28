@@ -374,6 +374,21 @@ pub enum EditorCommand {
 	MarkdownPreview {
 		serif: bool,
 	},
+	/// Open or retarget the live UAST storage inspector for the focused source.
+	OpenUastInspector {
+		mode: Option<UastInspectorMode>,
+	},
+	/// Jump from the selected inspector row to its stamped source range.
+	ActivateUastInspectorRow,
+	/// Jump from a frontend-rendered graph node to its stamped source range.
+	ActivateUastGraphNode {
+		inspector_view_id: ViewId,
+		node_id: u32,
+	},
+	/// Render the focused source's bounded UAST snapshot as Graphviz DOT.
+	ExportUastDot {
+		path: Option<String>,
+	},
 	/// Render an in-memory markdown string (e.g. help pages) in a pinned
 	/// preview pane that no source document refreshes or scroll-syncs.
 	ShowMarkdownDocument {
@@ -462,6 +477,13 @@ pub enum EditorCommand {
 	},
 	SetLanguage(Option<String>),
 	Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UastInspectorMode {
+	Semantic,
+	Raw,
+	Graph,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

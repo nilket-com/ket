@@ -1,6 +1,7 @@
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
 use crate::svp::pointer::SvpPointer;
+use crate::uast::ProviderKindId;
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
 use std::num::NonZeroU32;
@@ -44,6 +45,7 @@ impl<'a> RegistryChunk<'a> {
 		// No other thread can access these UnsafeCells.
 		unsafe {
 			*self.registry.kinds[idx].get() = kind;
+			*self.registry.provider_kinds[idx].get() = ProviderKindId::NONE;
 			*self.registry.spans[idx].get() = span;
 			*self.registry.metrics[idx].get() = metric;
 			// edges and child_tails are already zeroed out by default

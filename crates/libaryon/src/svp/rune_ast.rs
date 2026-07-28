@@ -24,7 +24,7 @@
 //! panics and byte length is still preserved.
 
 use crate::ecs::{NodeId, UastRegistry};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 use crate::uast::metrics::SpanMetrics;
 
 use rune::SourceId;
@@ -33,6 +33,7 @@ use rune::ast::{self, Spanned};
 /// Structural kinds for the Rune green tree. Deliberately narrow — just
 /// enough to distinguish tables from rows from trivia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum RuneSyntaxKind {
 	// Table-shaped (scopes / blocks)
 	File,
@@ -54,6 +55,34 @@ pub enum RuneSyntaxKind {
 
 	/// Whitespace, comments, braces, and other trivia the parser drops.
 	Trivia,
+}
+
+impl RuneSyntaxKind {
+	pub fn provider_kind(self) -> ProviderKindId {
+		ProviderKindId::new(self as u16 + 1)
+	}
+
+	pub fn name(id: ProviderKindId) -> Option<String> {
+		const NAMES: &[&str] = &[
+			"File",
+			"ItemFn",
+			"ItemStruct",
+			"ItemEnum",
+			"ItemImpl",
+			"ItemMod",
+			"Block",
+			"ExprBlock",
+			"ItemUse",
+			"ItemConst",
+			"ItemMacroCall",
+			"Local",
+			"Expr",
+			"Stmt",
+			"Trivia",
+		];
+		let index = id.get().checked_sub(1)? as usize;
+		NAMES.get(index).map(|name| (*name).to_owned())
+	}
 }
 
 /// Light syntax-tree node. Stores only kind and byte length.
@@ -348,6 +377,7 @@ pub fn to_trait_green_node(node: &GreenNode) -> crate::engine::language::GreenNo
 	if node.children.is_empty() {
 		crate::engine::language::GreenNode {
 			kind,
+			provider_kind: node.kind.provider_kind(),
 			byte_len: node.text_len(),
 			children: Vec::new(),
 		}
@@ -355,6 +385,7 @@ pub fn to_trait_green_node(node: &GreenNode) -> crate::engine::language::GreenNo
 		let children = node.children.iter().map(to_trait_green_node).collect();
 		crate::engine::language::GreenNode {
 			kind,
+			provider_kind: node.kind.provider_kind(),
 			byte_len: node.text_len(),
 			children,
 		}

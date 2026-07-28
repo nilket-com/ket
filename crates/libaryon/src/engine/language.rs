@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::{DocByte, DocLine};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 
 /// Internal provider used to color the synthetic file-browser document.
 pub(crate) const FILE_BROWSER_THEME_ID: &str = "fs";
@@ -107,6 +107,10 @@ pub struct GreenNode {
 	/// The relational mapping (e.g., RelationalTable, RelationalRow, Token).
 	pub kind: SemanticKind,
 
+	/// Provider-local syntax identity. Zero means that this node has no
+	/// provider-specific identity.
+	pub provider_kind: ProviderKindId,
+
 	/// The EXACT byte length of this node, including all children.
 	pub byte_len: u32,
 
@@ -176,6 +180,12 @@ pub trait LanguageProvider: Send + Sync {
 	// The core engine applies the structural graft on the main thread.
 
 	fn parse_structural_topology(&self, _source: &[u8]) -> Option<GreenNode> {
+		None
+	}
+
+	/// Resolve a non-zero provider-local structural kind for diagnostics and
+	/// inspector presentation.
+	fn structural_kind_name(&self, _kind: ProviderKindId) -> Option<String> {
 		None
 	}
 }

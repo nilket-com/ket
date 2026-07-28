@@ -3,7 +3,7 @@ use crate::ecs::id::NodeId;
 use crate::ecs::paged::PagedArray;
 use crate::svp::backing_store::{BackingIdentity, BackingStore, FileBackingStore};
 use crate::svp::pointer::SvpPointer;
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::projection::RootChildLineIndex;
 use crate::uast::topology::TreeEdges;
@@ -30,6 +30,16 @@ pub struct RegistryStatsSnapshot {
 	pub high_priority_io_count: u64,
 	pub high_priority_io_total_micros: u64,
 	pub high_priority_io_max_micros: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InspectorNodeMetadata {
+	pub has_physical_span: bool,
+	pub has_full_residency: bool,
+	pub has_partial_residency: bool,
+	pub resident_bytes: u64,
+	pub snippet: Option<Vec<u8>>,
+	pub metric_inflated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +102,7 @@ pub struct UastRegistry {
 	// Boxed slices of UnsafeCells.
 	// This allows concurrent mutable writes to disjoint indices without locks.
 	pub kinds: PagedArray<UnsafeCell<SemanticKind>>,
+	pub provider_kinds: PagedArray<UnsafeCell<ProviderKindId>>,
 	pub spans: PagedArray<UnsafeCell<Option<SvpPointer>>>,
 	pub metrics: PagedArray<UnsafeCell<SpanMetrics>>,
 	pub edges: PagedArray<UnsafeCell<TreeEdges>>,
@@ -173,6 +184,7 @@ impl UastRegistry {
 			capacity,
 			next_id: AtomicU32::new(1), // Start at 1 to allow NonZeroU32 for NodeId
 			kinds: PagedArray::new(cap, || UnsafeCell::new(SemanticKind::Token)),
+			provider_kinds: PagedArray::new(cap, || UnsafeCell::new(ProviderKindId::NONE)),
 			spans: PagedArray::new(cap, || UnsafeCell::new(None)),
 			metrics: PagedArray::new(cap, || UnsafeCell::new(SpanMetrics::default())),
 			edges: PagedArray::new(cap, || UnsafeCell::new(TreeEdges::default())),
@@ -697,6 +709,48 @@ impl UastRegistry {
 				.load(Ordering::Acquire),
 			high_priority_io_max_micros: self.high_priority_io_max_micros.load(Ordering::Acquire),
 		}
+	}
+
+	/// Returns only state already present in memory. This is intentionally
+	/// separate from the read APIs so UAST inspection cannot initiate I/O or
+	/// inflate a cold leaf merely by displaying it.
+	pub(crate) fn inspector_node_metadata(
+		&self,
+		node: NodeId,
+		snippet_limit: usize,
+	) -> InspectorNodeMetadata {
+		let _resident_read = self.resident_data_lock.read().unwrap();
+		let idx = node.index();
+		let (has_physical_span, full, partial) = unsafe {
+			(
+				(*self.spans[idx].get()).is_some(),
+				&*self.virtual_data[idx].get(),
+				&*self.partial_residency[idx].get(),
+			)
+		};
+		let snippet = if snippet_limit == 0 {
+			None
+		} else if let Some(bytes) = full.as_deref() {
+			Some(bytes[..bytes.len().min(snippet_limit)].to_vec())
+		} else {
+			partial
+				.first()
+				.filter(|range| range.offset == 0)
+				.map(|range| range.bytes[..range.bytes.len().min(snippet_limit)].to_vec())
+		};
+		InspectorNodeMetadata {
+			has_physical_span,
+			has_full_residency: full.is_some(),
+			has_partial_residency: !partial.is_empty(),
+			resident_bytes: self.resident_accounted_bytes[idx].load(Ordering::Acquire),
+			snippet,
+			metric_inflated: self.metrics_inflated[idx].load(Ordering::Acquire),
+		}
+	}
+
+	pub(crate) fn inspector_root_metrics_incomplete(&self, root: NodeId) -> bool {
+		self.metric_scans.lock().unwrap().contains_key(&root)
+			|| self.incomplete_metric_roots.lock().unwrap().contains(&root)
 	}
 
 	pub(crate) fn record_high_priority_start(&self, node: NodeId) {

@@ -30,7 +30,7 @@ use crate::svp::diagnostic::{DiagnosticSeverity, DiagnosticSpan};
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory, highlight_viewport};
 use crate::svp::rust_parse::parse_fragment;
 use crate::svp::sync::{ViewportChunk, find_safe_parse_boundaries};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 
 // ============================================================
 // Provider
@@ -261,6 +261,11 @@ impl LanguageProvider for RustProvider {
 		Some(build_rust_green_tree(text))
 	}
 
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		let raw = kind.get().checked_sub(1)?;
+		Some(format!("{:?}", SyntaxKind::from(raw)))
+	}
+
 	fn semantic_reactor(
 		&self,
 		full_source: Arc<String>,
@@ -385,6 +390,7 @@ fn build_green_recursive(node: &ra_ap_syntax::SyntaxNode) -> GreenNode {
 				if tok_len > 0 {
 					children.push(GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: ProviderKindId::new(token.kind() as u16 + 1),
 						byte_len: tok_len,
 						children: Vec::new(),
 					});
@@ -395,6 +401,7 @@ fn build_green_recursive(node: &ra_ap_syntax::SyntaxNode) -> GreenNode {
 
 	GreenNode {
 		kind,
+		provider_kind: ProviderKindId::new(node.kind() as u16 + 1),
 		byte_len,
 		children,
 	}

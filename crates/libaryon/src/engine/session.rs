@@ -12,7 +12,7 @@ use super::layout::GutterNumbering;
 use super::minimap::MinimapSnapshot;
 use super::protocol::{
 	CommandRange, EditorMode, PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch,
-	SplitDirection, SubstituteFlags, VisualKind,
+	SplitDirection, SubstituteFlags, UastInspectorMode, VisualKind,
 };
 use super::runtime_registry::{RegistrationBatch, RegistryError, RuntimeRegistries};
 use super::shadow::ShadowSession;
@@ -92,6 +92,33 @@ pub(crate) struct ConfirmState {
 	pub(crate) total_matches: u32,
 	pub(crate) flags: SubstituteFlags,
 	pub(crate) range: CommandRange,
+}
+
+#[derive(Debug, Clone)]
+#[allow(
+	dead_code,
+	reason = "provider ancestry is retained for post-graft identity remapping"
+)]
+pub(crate) struct UastInspectorRow {
+	pub(crate) line: DocLine,
+	pub(crate) node_id: NodeId,
+	pub(crate) start_byte: DocByte,
+	pub(crate) end_byte: DocByte,
+	pub(crate) provider_kind: crate::uast::ProviderKindId,
+	pub(crate) ancestry: Vec<crate::uast::ProviderKindId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UastInspectorPanel {
+	pub(crate) source_buffer_id: BufferId,
+	pub(crate) source_view_id: ViewId,
+	pub(crate) mode: UastInspectorMode,
+	pub(crate) source_root: Option<NodeId>,
+	pub(crate) source_state_id: Option<StateId>,
+	pub(crate) source_topology_rev: Option<TopologyRev>,
+	pub(crate) rows: Vec<UastInspectorRow>,
+	pub(crate) graph: Option<crate::uast::UastGraphSnapshot>,
+	pub(crate) rendered_text: Vec<u8>,
 }
 
 pub(crate) struct TextBuffer {
@@ -1363,6 +1390,9 @@ pub(crate) struct SemanticState {
 	pub(crate) diagnostics: Vec<DiagnosticSpan>,
 	pub(crate) inline_annotations: Vec<super::language::InlineAnnotation>,
 	pub(crate) last_semantic_state: Option<StateId>,
+	/// Content state whose structural topology is currently installed.
+	/// Unlike `last_semantic_state`, this advances only after a graft succeeds.
+	pub(crate) applied_structural_state_id: Option<StateId>,
 	pub(crate) last_semantic_len: usize,
 	pub(crate) last_semantic_path: Option<String>,
 	pub(crate) pending_semantic_request_id: Option<RequestId>,
@@ -1377,6 +1407,7 @@ impl SemanticState {
 			diagnostics: Vec::new(),
 			inline_annotations: Vec::new(),
 			last_semantic_state: None,
+			applied_structural_state_id: None,
 			last_semantic_len: usize::MAX,
 			last_semantic_path: None,
 			pending_semantic_request_id: None,
@@ -1390,6 +1421,7 @@ impl SemanticState {
 		self.diagnostics.clear();
 		self.inline_annotations.clear();
 		self.last_semantic_state = None;
+		self.applied_structural_state_id = None;
 		self.last_semantic_len = usize::MAX;
 		self.last_semantic_path = None;
 		self.pending_semantic_request_id = None;
@@ -3096,6 +3128,7 @@ pub(crate) struct EditorSession {
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
+	pub(crate) uast_inspectors: HashMap<BufferId, UastInspectorPanel>,
 	pub(crate) git_status_job: Option<JobId>,
 	pub(crate) git_status_refresh_pending: bool,
 	pub(crate) git_status_branch: Option<String>,
@@ -3579,6 +3612,7 @@ impl EditorSession {
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),
+			uast_inspectors: HashMap::new(),
 			git_status_job: None,
 			git_status_refresh_pending: false,
 			git_status_branch: None,
@@ -3753,12 +3787,18 @@ impl EditorSession {
 		let mut attached_view_ids = Vec::new();
 		self.layout
 			.collect_view_ids_for_buffer(buffer_id, &mut attached_view_ids, usize::MAX);
-		let old_scroll = attached_view_ids
+		let old_view_state = attached_view_ids
 			.into_iter()
 			.filter_map(|view_id| {
 				self.layout
 					.find_view(view_id)
-					.map(|view| (view_id, view.common().scroll_y))
+					.map(|view| {
+						let cursor = match &view.content {
+							ViewContent::Text(text) => Some(text.cursor.primary().byte()),
+							_ => None,
+						};
+						(view_id, view.common().scroll_y, cursor)
+					})
 			})
 			.collect::<Vec<_>>();
 		let document = self
@@ -3801,9 +3841,17 @@ impl EditorSession {
 					document.topology_rev,
 					document.ledger.current_state_id,
 				);
-				if let Some((_, scroll_y)) = old_scroll.iter().find(|(id, _)| *id == view_id) {
+				if let Some((_, scroll_y, cursor)) =
+					old_view_state.iter().find(|(id, _, _)| *id == view_id)
+				{
 					view.common_mut().scroll_y =
 						(*scroll_y).min(registry.get_total_newlines(root).saturating_sub(1));
+					if let (Some(cursor), ViewContent::Text(text)) = (cursor, &mut view.content) {
+						text.cursor.primary_mut().set_byte(
+							DocByte::new(cursor.get().min(registry.get_total_bytes(root))),
+							Affinity::After,
+						);
+					}
 				}
 			}
 		}

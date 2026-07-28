@@ -8,6 +8,7 @@ use crate::svp::rune_parse::parse_rune_fragment;
 use crate::svp::rune_semantic;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::svp::sync::{ViewportChunk, find_safe_parse_boundaries};
+use crate::uast::kind::ProviderKindId;
 
 pub struct RuneProvider;
 
@@ -63,6 +64,10 @@ impl LanguageProvider for RuneProvider {
 		let text = std::str::from_utf8(source).ok()?;
 		let green = rune_ast::build_green_tree(text, source.len() as u32);
 		Some(rune_ast::to_trait_green_node(&green))
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		rune_ast::RuneSyntaxKind::name(kind)
 	}
 }
 

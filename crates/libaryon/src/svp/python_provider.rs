@@ -8,6 +8,7 @@ use crate::svp::python_parse::parse_python_fragment;
 use crate::svp::python_semantic;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::svp::sync::{ViewportChunk, find_safe_parse_boundaries};
+use crate::uast::kind::ProviderKindId;
 
 pub struct PythonProvider;
 
@@ -63,6 +64,10 @@ impl LanguageProvider for PythonProvider {
 		let parsed = ruff_python_parser::parse_unchecked(text, ruff_python_parser::Mode::Module);
 		let green = python_ast::build_green_tree(&parsed, source.len() as u32);
 		Some(python_ast::to_trait_green_node(&green))
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		python_ast::PySyntaxKind::name(kind)
 	}
 }
 

@@ -278,6 +278,8 @@ pub struct PaneViewport {
 	/// after every paired preview pane is closed.
 	pub markdown_cells: Vec<MarkdownCellSnapshot>,
 	pub markdown_preview: Option<MarkdownPreviewSnapshot>,
+	/// Cursor-scoped UAST graph for frontend-native rendering.
+	pub uast_graph: Option<crate::uast::UastGraphSnapshot>,
 	/// Present when this pane is host-rendered; the frontend draws its rect.
 	pub host_panel: Option<HostPanelViewport>,
 	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],

@@ -70,6 +70,7 @@ impl TestFrontend {
 		InputContext {
 			is_host_panel: false,
 			is_file_browser: pane.is_file_browser,
+			is_uast_inspector: false,
 			cursor_available: true,
 			viewport_line_count: pane.viewport_line_count,
 			viewport_start_line: pane.viewport_start_line,

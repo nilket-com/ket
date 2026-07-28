@@ -1,3 +1,4 @@
+pub mod inspector;
 #[allow(unused_imports)]
 pub mod kind;
 #[allow(unused_imports)]
@@ -8,8 +9,12 @@ mod root_line_index;
 #[allow(unused_imports)]
 pub mod topology;
 
+pub use inspector::{
+	UastGraphNode, UastGraphSnapshot, UastInspectorNode, UastInspectorOptions,
+	UastInspectorSnapshot, UastMetricCertainty, UastStorageKind,
+};
 #[allow(unused_imports)]
-pub use kind::SemanticKind;
+pub use kind::{ProviderKindId, SemanticKind};
 #[allow(unused_imports)]
 pub use metrics::SpanMetrics;
 pub use mutation::UastMutation;

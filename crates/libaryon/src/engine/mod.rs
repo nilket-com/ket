@@ -35,6 +35,7 @@ pub mod settings;
 mod shadow;
 pub mod structural_graft;
 mod support;
+mod uast_inspector;
 #[cfg(test)]
 mod test_support;
 pub mod theme;
@@ -67,7 +68,7 @@ pub use self::protocol::{
 	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
 	GitRefreshMode, MouseIntent, MoveDirection, PaneDropEdge, PaneFocusDirection,
 	PaneResizeDirection, SecretInput, SplitDirection, SubstituteFlags, VerticalDirection,
-	VisualKind, WordMotion,
+	UastInspectorMode, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};

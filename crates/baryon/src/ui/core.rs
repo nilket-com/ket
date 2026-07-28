@@ -74,6 +74,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) minimap: MinimapController,
 	pub(super) markdown_preview: MarkdownPreviewController,
 	pub(super) diff_bridge: super::diff::DiffBridgeController,
+	pub(super) uast_graph: super::uast_graph::UastGraphController,
 }
 
 impl<B: Backend + io::Write> Frontend<B> {
@@ -100,6 +101,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			minimap: MinimapController::new(),
 			markdown_preview: MarkdownPreviewController::new(),
 			diff_bridge: super::diff::DiffBridgeController::new(),
+			uast_graph: super::uast_graph::UastGraphController::new(),
 		}
 	}
 
@@ -122,6 +124,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			got_new_view |= self.minimap.poll();
 			got_new_view |= self.markdown_preview.poll();
 			got_new_view |= self.diff_bridge.poll();
+			got_new_view |= self.uast_graph.poll();
 
 			while let Some(view) = poll_engine_item(&self.rx_view, &self.engine_disconnected) {
 				let completion_finished = self.current_viewport.as_ref().is_some_and(|current| {

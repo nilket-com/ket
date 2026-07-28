@@ -249,26 +249,31 @@ mod tests {
 	fn foldable_green(ambiguous: bool) -> GreenNode {
 		let folded_leaf = GreenNode {
 			kind: SemanticKind::Token,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: 8,
 			children: Vec::new(),
 		};
 		let folded = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: 8,
 			children: vec![folded_leaf],
 		};
 		GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: 17,
 			children: vec![
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 5,
 					children: Vec::new(),
 				},
 				if ambiguous {
 					GreenNode {
 						kind: SemanticKind::RelationalTable,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 8,
 						children: vec![folded],
 					}
@@ -277,6 +282,7 @@ mod tests {
 				},
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 4,
 					children: Vec::new(),
 				},

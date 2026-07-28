@@ -33,7 +33,7 @@ use crate::uast::projection::{
 	GutterLineNumber, HostPanelViewport, PaneDividerViewport, ProjectedCaret,
 };
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, mpsc};
@@ -170,6 +170,22 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		super::diff::recompute_all_diffs(registry, session);
 	}
 	super::markdown_image_preview::refresh_markdown_image_previews(registry, session);
+	super::uast_inspector::refresh_uast_inspectors(registry, lang_registry, session);
+	let uast_inspector_buffer_ids = session
+		.uast_inspectors
+		.keys()
+		.copied()
+		.collect::<HashSet<_>>();
+	let uast_graphs = session
+		.uast_inspectors
+		.iter()
+		.filter_map(|(buffer_id, panel)| {
+			panel
+				.graph
+				.as_ref()
+				.map(|graph| (*buffer_id, graph.clone()))
+		})
+		.collect::<HashMap<_, _>>();
 	let ui_palette = session.persistent_settings.ui_colors.palette();
 	let git_colors = [
 		session
@@ -301,6 +317,8 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 			git_status_buffer_id,
 			git_status_branch,
 			&session.snapshot_partners,
+			&uast_inspector_buffer_ids,
+			&uast_graphs,
 			git_colors,
 			&mut semantic_busy,
 		));
@@ -490,6 +508,8 @@ fn render_pane_viewport(
 	git_status_buffer_id: Option<BufferId>,
 	_git_status_branch: Option<&str>,
 	snapshot_partners: &HashMap<BufferId, SnapshotProvenance>,
+	uast_inspector_buffer_ids: &HashSet<BufferId>,
+	uast_graphs: &HashMap<BufferId, crate::uast::UastGraphSnapshot>,
 	git_colors: [Rgb; 4],
 	semantic_busy: &mut bool,
 ) -> PaneViewport {
@@ -1397,6 +1417,7 @@ fn render_pane_viewport(
 		minimap,
 		markdown_cells,
 		markdown_preview,
+		uast_graph: uast_graphs.get(&active_buffer_id).cloned(),
 		theme_colors,
 		render_rows,
 		visible_rows,
@@ -1437,6 +1458,8 @@ fn render_pane_viewport(
 					}),
 					title: if git_status_buffer_id == Some(view.buffer_id) {
 						"git".to_string()
+					} else if uast_inspector_buffer_ids.contains(&view.buffer_id) {
+						"uast".to_string()
 					} else if let Some(provenance) = snapshot_provenance {
 						// A snapshot partner: name it after the version it
 						// was cut from, e.g. `main.rs@HEAD~3`.

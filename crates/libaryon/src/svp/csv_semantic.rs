@@ -10,7 +10,11 @@
 
 use crate::engine::language::GreenNode;
 use crate::svp::csv_parse::{CsvTokenKind, tokenize};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
+
+pub const CSV_TABLE_KIND: ProviderKindId = ProviderKindId::new(1);
+pub const CSV_ROW_KIND: ProviderKindId = ProviderKindId::new(2);
+pub const CSV_TOKEN_KIND: ProviderKindId = ProviderKindId::new(3);
 
 #[derive(Debug, Clone)]
 struct RangeNode {
@@ -42,6 +46,11 @@ impl RangeNode {
 	fn to_green(&self) -> GreenNode {
 		GreenNode {
 			kind: self.kind,
+			provider_kind: match self.kind {
+				SemanticKind::RelationalTable => CSV_TABLE_KIND,
+				SemanticKind::RelationalRow => CSV_ROW_KIND,
+				SemanticKind::Token | SemanticKind::Group => CSV_TOKEN_KIND,
+			},
 			byte_len: self.end.saturating_sub(self.start) as u32,
 			children: self.children.iter().map(Self::to_green).collect(),
 		}
@@ -53,6 +62,7 @@ pub fn build_csv_topology(source: &[u8], delimiter: u8) -> GreenNode {
 	if total_len == 0 {
 		return GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: CSV_TABLE_KIND,
 			byte_len: 0,
 			children: Vec::new(),
 		};

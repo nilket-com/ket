@@ -1065,6 +1065,7 @@ fn current_input_context(registry: &UastRegistry, session: &EditorSession) -> In
 		.unwrap_or(cursor_abs_byte);
 	InputContext {
 		is_file_browser: view.is_file_browser(),
+		is_uast_inspector: session.uast_inspectors.contains_key(&view.buffer_id),
 		is_host_panel: view.is_host_panel(),
 		cursor_available: !matches!(view.content, ViewContent::MarkdownPreview(_)),
 		viewport_line_count: common.viewport_lines,
@@ -1149,6 +1150,7 @@ struct SemanticRuntime<'a> {
 	highlights: &'a mut Vec<HighlightSpan>,
 	diagnostics: &'a mut Vec<DiagnosticSpan>,
 	last_state: &'a mut Option<StateId>,
+	applied_structural_state_id: &'a mut Option<StateId>,
 	last_len: &'a mut usize,
 	last_path: &'a mut Option<String>,
 	pending_request_id: &'a mut Option<RequestId>,
@@ -1163,6 +1165,7 @@ impl SemanticRuntime<'_> {
 			highlights: &mut semantic.highlights,
 			diagnostics: &mut semantic.diagnostics,
 			last_state: &mut semantic.last_semantic_state,
+			applied_structural_state_id: &mut semantic.applied_structural_state_id,
 			last_len: &mut semantic.last_semantic_len,
 			last_path: &mut semantic.last_semantic_path,
 			pending_request_id: &mut semantic.pending_semantic_request_id,
@@ -1180,6 +1183,7 @@ impl SemanticRuntime<'_> {
 		self.highlights.clear();
 		self.diagnostics.clear();
 		*self.last_state = None;
+		*self.applied_structural_state_id = None;
 		*self.last_len = usize::MAX;
 		*self.last_path = None;
 		*self.pending_request_id = None;
@@ -2286,6 +2290,10 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::DiffSplit(_)
 		| EditorCommand::DiffStep(_)
 		| EditorCommand::MarkdownPreview { .. }
+		| EditorCommand::OpenUastInspector { .. }
+		| EditorCommand::ActivateUastInspectorRow
+		| EditorCommand::ActivateUastGraphNode { .. }
+		| EditorCommand::ExportUastDot { .. }
 		| EditorCommand::ShowMarkdownDocument { .. }
 		| EditorCommand::WriteFile
 		| EditorCommand::WriteFileAs(_)
@@ -3617,6 +3625,47 @@ fn dispatch_command(
 				Err(err) => {
 					session.ui.status_message = Some(err);
 				}
+			}
+			needs_render = true;
+		}
+		EditorCommand::OpenUastInspector { mode } => {
+			if let Err(error) =
+				super::uast_inspector::open_uast_inspector(registry, session, mode)
+			{
+				session.ui.status_message = Some(error);
+			}
+			needs_render = true;
+		}
+		EditorCommand::ActivateUastInspectorRow => {
+			if let Err(error) =
+				super::uast_inspector::activate_selected_row(registry, session)
+			{
+				session.ui.status_message = Some(error);
+			}
+			needs_render = true;
+		}
+		EditorCommand::ActivateUastGraphNode {
+			inspector_view_id,
+			node_id,
+		} => {
+			if let Err(error) = super::uast_inspector::activate_graph_node(
+				registry,
+				session,
+				inspector_view_id,
+				node_id,
+			) {
+				session.ui.status_message = Some(error);
+			}
+			needs_render = true;
+		}
+		EditorCommand::ExportUastDot { path } => {
+			if let Err(error) = super::uast_inspector::export_dot(
+				registry,
+				lang_registry,
+				session,
+				path.as_deref(),
+			) {
+				session.ui.status_message = Some(error);
 			}
 			needs_render = true;
 		}

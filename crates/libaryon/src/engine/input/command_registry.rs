@@ -8,7 +8,9 @@
 
 use crate::core::{DocByte, DocLine, DocLineCount};
 use crate::engine::runtime_registry::{InvocationSnapshot, RuntimeRegistries};
-use crate::engine::{CommandRange, EditorCommand, SplitDirection, SubstituteFlags};
+use crate::engine::{
+	CommandRange, EditorCommand, SplitDirection, SubstituteFlags, UastInspectorMode,
+};
 
 /// Everything a command handler may touch. Handlers deliberately do not get
 /// `&mut Frontend`: dispatch only ever sends engine commands or reports a
@@ -387,6 +389,30 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		summary: "Step a snapshot diff through history",
 		help: "Moves the snapshot partner of the focused diff pair through the file's commit history without leaving the pair: 'older' and 'newer' step one commit, a signed count (-3, +2) steps several. Renames are followed; after stepping, the snapshot is titled with its short commit id.",
 		dispatch: DispatchKind::Exact(cmd_diff_step),
+	},
+	CommandSpec {
+		name: "uast",
+		aliases: &["astview"],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Panes,
+		usage: ":uast [MODE]",
+		summary: "Inspect live UAST storage",
+		help: "Opens a bounded, live split-pane view of libaryon's stored UAST. Semantic mode collapses topology-only groups and trivia; raw mode shows physical and synthetic storage nodes. Inspection never hydrates cold bytes.",
+		dispatch: DispatchKind::Exact(cmd_uast),
+	},
+	CommandSpec {
+		name: "uastdot",
+		aliases: &["astdot"],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::Path,
+		category: CommandCategory::Panes,
+		usage: ":uastdot [PATH]",
+		summary: "Render bounded UAST Graphviz DOT",
+		help: "Opens DOT source for the focused document or writes it atomically to PATH. The graph is bounded by the same no-I/O snapshot contract as :uast.",
+		dispatch: DispatchKind::Exact(cmd_uast_dot),
 	},
 	CommandSpec {
 		name: "mdpreview",
@@ -879,6 +905,26 @@ fn cmd_diff_step(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 		Some(delta) => ctx.send(EditorCommand::DiffStep(delta)),
 		None => ctx.error("Usage: :diffstep older|newer|N (N signed, non-zero)"),
 	}
+}
+
+fn cmd_uast(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	let mode = match inv.args.trim() {
+		"" => None,
+		"semantic" | "sem" => Some(UastInspectorMode::Semantic),
+		"raw" | "storage" => Some(UastInspectorMode::Raw),
+		"graph" | "dotviz" => Some(UastInspectorMode::Graph),
+		_ => {
+			ctx.error("Usage: :uast [semantic|raw|graph]");
+			return;
+		}
+	};
+	ctx.send(EditorCommand::OpenUastInspector { mode });
+}
+
+fn cmd_uast_dot(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::ExportUastDot {
+		path: (!inv.args.trim().is_empty()).then(|| expand_path_arg(inv.args)),
+	});
 }
 
 fn cmd_markdown_preview(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
@@ -1487,6 +1533,35 @@ mod tests {
 		assert!(matches!(
 			commands.as_slice(),
 			[EditorCommand::WriteFileAs(path)] if path.ends_with("notes.md")
+		));
+	}
+
+	#[test]
+	fn uast_commands_preserve_the_storage_and_dot_modes() {
+		let (_, commands, status, _) = dispatch("uast raw", None);
+		assert_eq!(status, None);
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::OpenUastInspector {
+				mode: Some(UastInspectorMode::Raw)
+			}]
+		));
+
+		let (_, commands, status, _) = dispatch("astview semantic", None);
+		assert_eq!(status, None);
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::OpenUastInspector {
+				mode: Some(UastInspectorMode::Semantic)
+			}]
+		));
+
+		let (_, commands, status, _) = dispatch("uastdot tree.dot", None);
+		assert_eq!(status, None);
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::ExportUastDot { path: Some(path) }]
+				if path.ends_with("tree.dot")
 		));
 	}
 

@@ -410,6 +410,79 @@ mod tests {
 	}
 
 	#[test]
+	fn uast_inspector_projects_live_provider_kinds_and_exports_dot() {
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let commands = engine.command_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: "fn main() { let answer = 42; }\n".to_string(),
+				language: Some("rust".to_string()),
+				virtual_path: Some("inspected.rs".to_string()),
+			})
+			.expect("replace source");
+		recv_viewport_until(&viewports, "Rust source", |viewport| {
+			visible_text(viewport) == b"fn main() { let answer = 42; }\n"
+		});
+		commands
+			.send(EditorCommand::OpenUastInspector { mode: None })
+			.expect("open UAST inspector");
+		let viewport = recv_viewport_until(&viewports, "current UAST inspector", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.tabs[pane.active_doctab_index].title == "uast"
+					&& {
+						let text = pane
+							.tokens
+							.iter()
+							.flat_map(|token| token.text.iter().copied())
+							.collect::<Vec<_>>();
+						text.windows(b"current".len()).any(|window| window == b"current")
+							&& text
+								.windows(b"SOURCE_FILE".len())
+								.any(|window| window == b"SOURCE_FILE")
+					}
+			})
+		});
+		assert_eq!(viewport.panes.len(), 2);
+		commands
+			.send(EditorCommand::OpenUastInspector {
+				mode: Some(crate::engine::UastInspectorMode::Graph),
+			})
+			.expect("switch UAST inspector to graph mode");
+		let graph_viewport = recv_viewport_until(&viewports, "UAST graph payload", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.uast_graph.as_ref().is_some_and(|graph| {
+					graph.nodes.iter().any(|node| node.label == "SOURCE_FILE")
+				})
+			})
+		});
+		assert!(graph_viewport.panes.iter().any(|pane| {
+			pane.uast_graph
+				.as_ref()
+				.is_some_and(|graph| graph.nodes.len() <= 96)
+		}));
+
+		let dot_path = temp_path("uast-inspector", "dot");
+		commands
+			.send(EditorCommand::ExportUastDot {
+				path: Some(dot_path.to_string_lossy().into_owned()),
+			})
+			.expect("export DOT");
+		recv_viewport_until(&viewports, "DOT export status", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|message| message.starts_with("Wrote UAST DOT"))
+		});
+		let dot = fs::read_to_string(&dot_path).expect("read DOT");
+		assert!(dot.starts_with("digraph uast"));
+		assert!(dot.contains("SOURCE_FILE"));
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = fs::remove_file(dot_path);
+	}
+
+	#[test]
 	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
 	fn panediff_diffs_the_focused_file_against_head() {
 		let dir = git_fixture_repo(

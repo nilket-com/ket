@@ -5,7 +5,10 @@ use crate::engine::language::{GreenNode, LanguageProvider, SemanticOutput};
 use crate::svp::cargo_annotations;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::svp::toml_highlight::highlight_toml;
-use crate::svp::toml_semantic::build_toml_topology;
+use crate::svp::toml_semantic::{
+	TOML_DOCUMENT_KIND, TOML_ENTRY_KIND, TOML_SECTION_KIND, TOML_TOKEN_KIND, build_toml_topology,
+};
+use crate::uast::ProviderKindId;
 
 pub struct TomlProvider;
 
@@ -50,6 +53,16 @@ impl LanguageProvider for TomlProvider {
 
 	fn parse_structural_topology(&self, source: &[u8]) -> Option<GreenNode> {
 		Some(build_toml_topology(source))
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		match kind {
+			TOML_DOCUMENT_KIND => Some("TomlDocument".to_owned()),
+			TOML_SECTION_KIND => Some("TomlSection".to_owned()),
+			TOML_ENTRY_KIND => Some("TomlEntry".to_owned()),
+			TOML_TOKEN_KIND => Some("TomlToken".to_owned()),
+			_ => None,
+		}
 	}
 }
 

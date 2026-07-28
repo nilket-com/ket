@@ -6,7 +6,12 @@
 
 use crate::engine::language::GreenNode;
 use crate::svp::toml_parse::{TomlToken, TomlTokenKind, tokenize};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
+
+pub const TOML_DOCUMENT_KIND: ProviderKindId = ProviderKindId::new(1);
+pub const TOML_SECTION_KIND: ProviderKindId = ProviderKindId::new(2);
+pub const TOML_ENTRY_KIND: ProviderKindId = ProviderKindId::new(3);
+pub const TOML_TOKEN_KIND: ProviderKindId = ProviderKindId::new(4);
 
 #[derive(Debug, Clone)]
 struct RangeNode {
@@ -38,6 +43,11 @@ impl RangeNode {
 	fn to_green(&self) -> GreenNode {
 		GreenNode {
 			kind: self.kind,
+			provider_kind: match self.kind {
+				SemanticKind::RelationalTable => TOML_SECTION_KIND,
+				SemanticKind::RelationalRow => TOML_ENTRY_KIND,
+				SemanticKind::Token | SemanticKind::Group => TOML_TOKEN_KIND,
+			},
 			byte_len: self.end.saturating_sub(self.start) as u32,
 			children: self.children.iter().map(Self::to_green).collect(),
 		}
@@ -49,6 +59,7 @@ pub fn build_toml_topology(source: &[u8]) -> GreenNode {
 	if total_len == 0 {
 		return GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: TOML_DOCUMENT_KIND,
 			byte_len: 0,
 			children: Vec::new(),
 		};
@@ -76,21 +87,25 @@ pub fn build_toml_topology(source: &[u8]) -> GreenNode {
 		root_children
 	};
 
-	RangeNode {
+	let mut root = RangeNode {
 		kind: SemanticKind::RelationalTable,
 		start: 0,
 		end: total_len,
 		children: root_children,
 	}
-	.to_green()
+	.to_green();
+	root.provider_kind = TOML_DOCUMENT_KIND;
+	root
 }
 
 pub fn flat_topology(source_len: u32) -> GreenNode {
 	GreenNode {
 		kind: SemanticKind::RelationalTable,
+		provider_kind: TOML_DOCUMENT_KIND,
 		byte_len: source_len,
 		children: vec![GreenNode {
 			kind: SemanticKind::Token,
+			provider_kind: TOML_TOKEN_KIND,
 			byte_len: source_len,
 			children: Vec::new(),
 		}],
@@ -324,6 +339,7 @@ mod tests {
 		let tree = build_toml_topology(b"");
 		assert_eq!(tree.byte_len, 0);
 		assert_eq!(tree.kind, SemanticKind::RelationalTable);
+		assert_eq!(tree.provider_kind, TOML_DOCUMENT_KIND);
 	}
 
 	#[test]
@@ -340,6 +356,7 @@ mod tests {
 		];
 		for src in sources {
 			let tree = build_toml_topology(src);
+			assert_eq!(tree.provider_kind, TOML_DOCUMENT_KIND);
 			assert_eq!(
 				tree.byte_len as usize,
 				src.len(),

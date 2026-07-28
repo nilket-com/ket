@@ -12,6 +12,7 @@ use crate::svp::sql_parse::{LineIndex, overlaps_macro, shadow_mask_sql, translat
 use crate::svp::sql_semantic::{
 	build_structural_topology, extract_semantic_highlights, flat_topology,
 };
+use crate::uast::kind::ProviderKindId;
 
 pub struct SqlProvider;
 
@@ -124,6 +125,10 @@ impl LanguageProvider for SqlProvider {
 		};
 
 		Some(green)
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		crate::svp::sql_semantic::structural_kind_name(kind)
 	}
 }
 

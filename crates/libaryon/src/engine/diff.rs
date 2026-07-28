@@ -1417,12 +1417,14 @@ mod tests {
 			.split_inclusive(|&byte| byte == b'\n')
 			.map(|line| GreenNode {
 				kind: SemanticKind::RelationalRow,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: line.len() as u32,
 				children: Vec::new(),
 			})
 			.collect();
 		GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children,
 		}

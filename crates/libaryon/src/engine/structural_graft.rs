@@ -9,7 +9,7 @@
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
 use crate::engine::language::GreenNode;
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 use crate::uast::metrics::SpanMetrics;
 use crate::uast::topology::TARGET_TREE_FANOUT;
 
@@ -168,6 +168,7 @@ fn graft_recursive(
 	let id = allocate_graft_node(
 		registry,
 		node.kind,
+		node.provider_kind,
 		byte_len,
 		u64::from(newlines),
 		parent,
@@ -215,6 +216,7 @@ struct GraftedChildLevel {
 fn allocate_graft_node(
 	registry: &UastRegistry,
 	kind: SemanticKind,
+	provider_kind: ProviderKindId,
 	byte_len: u32,
 	newlines: u64,
 	parent: Option<NodeId>,
@@ -224,6 +226,7 @@ fn allocate_graft_node(
 	let idx = id.index();
 	unsafe {
 		*registry.kinds[idx].get() = kind;
+		*registry.provider_kinds[idx].get() = provider_kind;
 		*registry.spans[idx].get() = None;
 		*registry.metrics[idx].get() = SpanMetrics {
 			byte_length: u64::from(byte_len),
@@ -316,6 +319,7 @@ fn graft_child_level(
 		let group = allocate_graft_node(
 			registry,
 			SemanticKind::Group,
+			ProviderKindId::NONE,
 			byte_len,
 			0,
 			Some(parent),
@@ -475,9 +479,11 @@ mod tests {
 
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![GreenNode {
 				kind: SemanticKind::Token,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: 4, // short of the 12 its parent declares
 				children: Vec::new(),
 			}],
@@ -535,10 +541,12 @@ mod tests {
 		let source = vec![b'x'; ROWS];
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: ROWS as u32,
 			children: (0..ROWS)
 				.map(|_| GreenNode {
 					kind: SemanticKind::RelationalRow,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 1,
 					children: Vec::new(),
 				})
@@ -576,18 +584,22 @@ mod tests {
 		let source = b"def foo():\n    pass\n";
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable, // Module
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![GreenNode {
 				kind: SemanticKind::RelationalTable, // FunctionDef
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: source.len() as u32,
 				children: vec![
 					GreenNode {
 						kind: SemanticKind::Token, // header trivia
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 11,
 						children: Vec::new(),
 					},
 					GreenNode {
 						kind: SemanticKind::RelationalRow, // pass statement, incl. trailing "\n"
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 9,
 						children: Vec::new(),
 					},
@@ -652,20 +664,24 @@ mod tests {
 		let source = b"line1\nline2\nline3\n";
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 6, // "line1\n"
 					children: Vec::new(),
 				},
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 6, // "line2\n"
 					children: Vec::new(),
 				},
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 6, // "line3\n"
 					children: Vec::new(),
 				},
@@ -695,9 +711,11 @@ mod tests {
 		let source = b"line1\nline2\nline3\n";
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![GreenNode {
 				kind: SemanticKind::Token,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: source.len() as u32,
 				children: Vec::new(),
 			}],
@@ -744,18 +762,22 @@ mod tests {
 		let source = b"aaaa\nbbbbbbbbbb\n";
 		let green = GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![
 				GreenNode {
 					kind: SemanticKind::RelationalRow,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 5,
 					children: Vec::new(),
 				},
 				GreenNode {
 					kind: SemanticKind::RelationalTable, // function
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 11,
 					children: vec![GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 11,
 						children: Vec::new(),
 					}],
@@ -791,14 +813,17 @@ mod tests {
 
 		let green = crate::engine::language::GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: vec![
 				// fn a() {}\n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::RelationalTable,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 10,
 					children: vec![crate::engine::language::GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 10,
 						children: Vec::new(),
 					}],
@@ -806,15 +831,18 @@ mod tests {
 				// \n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 1,
 					children: Vec::new(),
 				},
 				// fn b() {\n    x\n}\n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::RelationalTable,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 17,
 					children: vec![crate::engine::language::GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 17,
 						children: Vec::new(),
 					}],
@@ -822,15 +850,18 @@ mod tests {
 				// \n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 1,
 					children: Vec::new(),
 				},
 				// fn c() {\n    y\n}\n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::RelationalTable,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 17,
 					children: vec![crate::engine::language::GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 17,
 						children: Vec::new(),
 					}],
@@ -838,6 +869,7 @@ mod tests {
 				// \n
 				crate::engine::language::GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 1,
 					children: Vec::new(),
 				},

@@ -1,5 +1,5 @@
 use crate::ecs::{NodeId, UastRegistry};
-use crate::uast::kind::SemanticKind;
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 use crate::uast::metrics::SpanMetrics;
 use ruff_python_ast::{Mod, Stmt};
 use ruff_python_parser::Parsed;
@@ -8,6 +8,7 @@ use ruff_text_size::Ranged;
 /// Syntax kind for Python GreenNodes. Covers top-level structural categories.
 /// Deliberately minimal — we only need enough to distinguish structure from trivia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum PySyntaxKind {
 	Module,
 	FunctionDef,
@@ -35,6 +36,43 @@ pub enum PySyntaxKind {
 	Trivia,
 	/// Catch-all for statement types we don't specifically categorize.
 	Statement,
+}
+
+impl PySyntaxKind {
+	pub fn provider_kind(self) -> ProviderKindId {
+		ProviderKindId::new(self as u16 + 1)
+	}
+
+	pub fn name(id: ProviderKindId) -> Option<String> {
+		const NAMES: &[&str] = &[
+			"Module",
+			"FunctionDef",
+			"ClassDef",
+			"Import",
+			"Assign",
+			"Return",
+			"If",
+			"For",
+			"While",
+			"With",
+			"Try",
+			"Match",
+			"Raise",
+			"Assert",
+			"Expr",
+			"Pass",
+			"Break",
+			"Continue",
+			"Delete",
+			"Global",
+			"Nonlocal",
+			"TypeAlias",
+			"Trivia",
+			"Statement",
+		];
+		let index = id.get().checked_sub(1)? as usize;
+		NAMES.get(index).map(|name| (*name).to_owned())
+	}
 }
 
 /// A lightweight syntax tree node. Stores only kind and byte length.
@@ -290,6 +328,7 @@ pub fn to_trait_green_node(node: &GreenNode) -> crate::engine::language::GreenNo
 	if node.children.is_empty() {
 		crate::engine::language::GreenNode {
 			kind,
+			provider_kind: node.kind.provider_kind(),
 			byte_len: node.text_len(),
 			children: Vec::new(),
 		}
@@ -297,6 +336,7 @@ pub fn to_trait_green_node(node: &GreenNode) -> crate::engine::language::GreenNo
 		let children = node.children.iter().map(to_trait_green_node).collect();
 		crate::engine::language::GreenNode {
 			kind,
+			provider_kind: node.kind.provider_kind(),
 			byte_len: node.text_len(),
 			children,
 		}

@@ -95,6 +95,7 @@ fn apply_semantic_response(
 			.folds
 			.restore_exact(registry, rid, fold_snapshot);
 
+		document.semantic.applied_structural_state_id = Some(state_id);
 		document.semantic.cached_sum_tree = None;
 		invalidate_minimap_cache(&mut doctab.view.common);
 		return true;
@@ -238,9 +239,11 @@ mod tests {
 	fn flat_green_node(text: &str) -> super::super::language::GreenNode {
 		super::super::language::GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: text.len() as u32,
 			children: vec![super::super::language::GreenNode {
 				kind: SemanticKind::Token,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: text.len() as u32,
 				children: Vec::new(),
 			}],
@@ -252,24 +255,29 @@ mod tests {
 
 		GreenNode {
 			kind: SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: 17,
 			children: vec![
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 5,
 					children: Vec::new(),
 				},
 				GreenNode {
 					kind: SemanticKind::RelationalTable,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 8,
 					children: vec![GreenNode {
 						kind: SemanticKind::Token,
+						provider_kind: crate::uast::ProviderKindId::NONE,
 						byte_len: 8,
 						children: Vec::new(),
 					}],
 				},
 				GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 4,
 					children: Vec::new(),
 				},
@@ -497,6 +505,10 @@ mod tests {
 					structural_topology: Some((flat_green_node(text), text.as_bytes().to_vec())),
 				},
 			));
+			assert_eq!(
+				editor.document.semantic.applied_structural_state_id,
+				Some(state)
+			);
 			assert_eq!(editor.cursor.snapshot(), cursors_before);
 		}
 	}

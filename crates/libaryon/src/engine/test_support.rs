@@ -88,27 +88,33 @@ pub(crate) fn build_grouped_semantic_document() -> (
 	let source = b"pgggggggggffffffffffffffffffff";
 	let green = GreenNode {
 		kind: SemanticKind::Group,
+		provider_kind: crate::uast::ProviderKindId::NONE,
 		byte_len: source.len() as u32,
 		children: vec![
 			GreenNode {
 				kind: SemanticKind::Token,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: 1,
 				children: Vec::new(),
 			},
 			GreenNode {
 				kind: SemanticKind::Group,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: 9,
 				children: vec![GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 9,
 					children: Vec::new(),
 				}],
 			},
 			GreenNode {
 				kind: SemanticKind::RelationalTable,
+				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: 20,
 				children: vec![GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: 20,
 					children: Vec::new(),
 				}],

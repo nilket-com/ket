@@ -1,6 +1,6 @@
 # UAST Inspector (`:uast`)
 
-Status: planning converged 2026-07-28 (Claude + Codex review rounds). Not implemented.
+Status: implemented 2026-07-28.
 
 Canonical command `:uast` (the panel shows storage truth, not the parser's
 AST); `:astview` retained as a discoverable alias.
@@ -89,6 +89,14 @@ row→node mapping. Highlighting is **producer-owned spans** (the output-panel
 pattern, `session.rs:3746` re-applied highlights) — we generate the rows and
 know their semantics; do not re-lex our own output through a provider.
 
+Implementation note: the first cut uses the existing stable one-root/one-leaf
+output-buffer storage plus a dedicated `UastInspectorPanel` sidecar. The
+sidecar owns source/view identity, mode, stamps, row mappings, and the bounded
+graph snapshot; `BufferRole::OutputPanel` supplies read-only behavior and
+semantic-pipeline exclusion without adding another document-shaped enum
+variant. This preserves the contract above while avoiding duplicated text
+projection machinery.
+
 Refresh: per-frame staleness check in `render_frame` — same pattern as
 `refresh_markdown_image_previews` (`render.rs:172`) and `recompute_all_diffs`
 (`render.rs:169`). The inspector pairs with **both a source BufferId and a
@@ -165,7 +173,9 @@ Metric certainty is exposed explicitly: a sparse node's newline count reports
 2. Textual `:astview` split with raw/semantic modes, stamped row mapping,
    row-select → source jump, cursor → ancestor-path follow, bounded traversal.
 3. Thread per-provider u16 kinds through green node → graft → registry.
-4. Lazily derived resident snippets; richer CSV/SQL kind coverage.
+4. Lazily derived resident snippets; richer SQL kind coverage. CSV remains
+   row-granular (`Table` / `Row` / `Token`) deliberately: introducing a node
+   per field regressed the registry's bounded-fanout and large-row behavior.
 5. DOT export off the same snapshot; cursor-scoped graphical render in Baryon
    via the diff-bridge image pattern (`baryon/src/ui/diff.rs`: snapshot →
    fingerprint → worker thread → Kitty/sixel image; scoped subtree only, never
@@ -173,6 +183,9 @@ Metric certainty is exposed explicitly: a sparse node's newline count reports
 6. Go-to-definition afterward (Rust first, off the already-live
    `ra_ap_ide::AnalysisHost` in `svp/rust_provider.rs` — `goto_definition`
    currently unused).
+
+Stages 1–5 are implemented. Stage 6 remains a separate navigation feature,
+not part of the inspector implementation.
 
 ## Settled questions
 

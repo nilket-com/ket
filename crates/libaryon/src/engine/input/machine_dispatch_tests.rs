@@ -61,6 +61,7 @@ fn test_viewport() -> Viewport {
 			minimap: None,
 			markdown_cells: Vec::new(),
 			markdown_preview: None,
+			uast_graph: None,
 			host_panel: None,
 			theme_colors: Default::default(),
 			render_rows: Vec::new(),

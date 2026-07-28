@@ -25,6 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InputContext {
 	pub(crate) is_file_browser: bool,
+	pub(crate) is_uast_inspector: bool,
 	/// The focused pane is host-rendered, so document-shaped input is declined
 	/// rather than acted on.
 	pub(crate) is_host_panel: bool,
@@ -721,6 +722,14 @@ impl InputRuntime {
 		modifiers: Modifiers,
 		should_quit: &mut bool,
 	) -> bool {
+		if self.context.is_uast_inspector
+			&& code == KeyCode::Enter
+			&& modifiers == Modifiers::NONE
+		{
+			self.send_command(EditorCommand::ActivateUastInspectorRow);
+			self.state = InputState::normal();
+			return true;
+		}
 		let browser = self.is_file_browser_view();
 		let Some(context) = normal_context(self.state, browser) else {
 			return false;

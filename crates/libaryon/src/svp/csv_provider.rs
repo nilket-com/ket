@@ -4,8 +4,18 @@ use crate::core::DocByte;
 use crate::engine::language::{GreenNode, LanguageProvider, SemanticOutput};
 use crate::svp::csv_highlight::highlight_csv;
 use crate::svp::csv_parse::{CSV_DELIMITER, TSV_DELIMITER};
-use crate::svp::csv_semantic::build_csv_topology;
+use crate::svp::csv_semantic::{CSV_ROW_KIND, CSV_TABLE_KIND, CSV_TOKEN_KIND, build_csv_topology};
 use crate::svp::rust_highlight::HighlightSpan;
+use crate::uast::ProviderKindId;
+
+fn csv_kind_name(kind: ProviderKindId) -> Option<String> {
+	match kind {
+		CSV_TABLE_KIND => Some("CsvTable".to_owned()),
+		CSV_ROW_KIND => Some("CsvRow".to_owned()),
+		CSV_TOKEN_KIND => Some("CsvToken".to_owned()),
+		_ => None,
+	}
+}
 
 pub struct CsvProvider;
 pub struct TsvProvider;
@@ -49,6 +59,10 @@ impl LanguageProvider for CsvProvider {
 	fn parse_structural_topology(&self, source: &[u8]) -> Option<GreenNode> {
 		Some(build_csv_topology(source, CSV_DELIMITER))
 	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		csv_kind_name(kind)
+	}
 }
 
 impl LanguageProvider for TsvProvider {
@@ -89,6 +103,10 @@ impl LanguageProvider for TsvProvider {
 
 	fn parse_structural_topology(&self, source: &[u8]) -> Option<GreenNode> {
 		Some(build_csv_topology(source, TSV_DELIMITER))
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		csv_kind_name(kind)
 	}
 }
 

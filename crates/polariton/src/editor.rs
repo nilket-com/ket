@@ -117,6 +117,10 @@ pub enum EditorMsg {
 		pane_id: libaryon::core::PaneId,
 		line: DocLine,
 	},
+	UastGraphNode {
+		inspector_view_id: ViewId,
+		node_id: u32,
+	},
 	/// Editor-local pointer motion from the workspace mouse_area.
 	PointerMoved(iced::Point),
 	/// Raw window-space pointer motion from the root subscription. Reaches us
@@ -1115,6 +1119,15 @@ impl CodeEditor {
 				self.send(EditorCommand::FocusPane(pane_id));
 				self.send(EditorCommand::ScrollViewportToLine(line));
 			}
+			EditorMsg::UastGraphNode {
+				inspector_view_id,
+				node_id,
+			} => {
+				self.send(EditorCommand::ActivateUastGraphNode {
+					inspector_view_id,
+					node_id,
+				});
+			}
 			EditorMsg::PointerMoved(position) => {
 				// The mouse_area is anchored at the editor origin, so this is
 				// authoritative editor-local space. Learn the window offset from
@@ -1187,7 +1200,9 @@ impl CodeEditor {
 		);
 		for pane in &viewport.panes {
 			let focused = pane.pane_id == viewport.focused_pane_id;
-			let content = if let Some(preview) = pane.markdown_preview.as_ref() {
+			let content = if let Some(graph) = pane.uast_graph.as_ref() {
+				uast_graph_surface(graph, pane.view_id, palette)
+			} else if let Some(preview) = pane.markdown_preview.as_ref() {
 				markdown_preview_surface(
 					preview,
 					self.preview_blocks
@@ -2376,6 +2391,196 @@ fn pane_pixel_rect(rect: PaneRect) -> iced::Rectangle {
 		y: rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
 		width: rect.width.get() as f32 * metrics::CELL_WIDTH,
 		height: rect.height.get() as f32 * metrics::LINE_HEIGHT,
+	}
+}
+
+struct UastGraphWidget<'a> {
+	snapshot: &'a libaryon::uast::UastGraphSnapshot,
+	inspector_view_id: ViewId,
+	palette: UiPalette,
+}
+
+fn uast_graph_surface<'a>(
+	snapshot: &'a libaryon::uast::UastGraphSnapshot,
+	inspector_view_id: ViewId,
+	palette: UiPalette,
+) -> Element<'a, EditorMsg> {
+	container(
+		canvas(UastGraphWidget {
+			snapshot,
+			inspector_view_id,
+			palette,
+		})
+		.width(Length::Fill)
+		.height(Length::Fill),
+	)
+	.width(Length::Fill)
+	.height(Length::Fill)
+	.style(move |_| container::Style {
+		background: Some(Background::Color(color(palette.editor_background))),
+		..Default::default()
+	})
+	.into()
+}
+
+fn uast_graph_layout(
+	snapshot: &libaryon::uast::UastGraphSnapshot,
+	size: iced::Size,
+) -> HashMap<u32, iced::Rectangle> {
+	if snapshot.nodes.is_empty() {
+		return HashMap::new();
+	}
+	let min_depth = snapshot.nodes.iter().map(|node| node.depth).min().unwrap_or(0);
+	let max_depth = snapshot
+		.nodes
+		.iter()
+		.map(|node| node.depth)
+		.max()
+		.unwrap_or(min_depth);
+	let level_count = f32::from(max_depth.saturating_sub(min_depth)) + 1.0;
+	let mut levels = HashMap::<u16, Vec<u32>>::new();
+	for node in &snapshot.nodes {
+		levels.entry(node.depth).or_default().push(node.id);
+	}
+	let mut layout = HashMap::new();
+	for (depth, ids) in levels {
+		let count = ids.len().max(1) as f32;
+		let slot_width = size.width / count;
+		let box_width = (slot_width - 12.0).clamp(58.0, 180.0);
+		let slot_height = size.height / level_count.max(1.0);
+		let box_height = (slot_height - 14.0).clamp(34.0, 58.0);
+		let y = f32::from(depth.saturating_sub(min_depth)) * slot_height
+			+ (slot_height - box_height) / 2.0;
+		for (index, id) in ids.into_iter().enumerate() {
+			let x = index as f32 * slot_width + (slot_width - box_width) / 2.0;
+			layout.insert(
+				id,
+				iced::Rectangle::new(
+					iced::Point::new(x.max(0.0), y.max(0.0)),
+					iced::Size::new(box_width.min(size.width), box_height.min(size.height)),
+				),
+			);
+		}
+	}
+	layout
+}
+
+impl canvas::Program<EditorMsg> for UastGraphWidget<'_> {
+	type State = ();
+
+	fn draw(
+		&self,
+		_state: &Self::State,
+		renderer: &iced::Renderer,
+		_theme: &iced::Theme,
+		bounds: iced::Rectangle,
+		_cursor: mouse::Cursor,
+	) -> Vec<canvas::Geometry> {
+		let mut frame = canvas::Frame::new(renderer, bounds.size());
+		let layout = uast_graph_layout(self.snapshot, bounds.size());
+		for node in &self.snapshot.nodes {
+			let (Some(parent), Some(child)) = (
+				node.parent.and_then(|parent| layout.get(&parent)),
+				layout.get(&node.id),
+			) else {
+				continue;
+			};
+			frame.stroke(
+				&canvas::Path::line(
+					iced::Point::new(parent.center_x(), parent.y + parent.height),
+					iced::Point::new(child.center_x(), child.y),
+				),
+				canvas::Stroke::default()
+					.with_width(1.5)
+					.with_color(color(self.palette.divider_surface)),
+			);
+		}
+		for node in &self.snapshot.nodes {
+			let Some(rect) = layout.get(&node.id).copied() else {
+				continue;
+			};
+			let fill = match node.semantic_kind {
+				libaryon::uast::SemanticKind::RelationalTable => self.palette.tab_active_surface,
+				libaryon::uast::SemanticKind::RelationalRow => self.palette.gutter_surface,
+				libaryon::uast::SemanticKind::Group => self.palette.tab_surface,
+				libaryon::uast::SemanticKind::Token => self.palette.editor_background,
+			};
+			let path = canvas::Path::rectangle(rect.position(), rect.size());
+			frame.fill(&path, color(fill));
+			frame.stroke(
+				&path,
+				canvas::Stroke::default()
+					.with_width(if node.selected { 2.5 } else { 1.0 })
+					.with_color(color(if node.selected {
+						self.palette.accent
+					} else {
+						self.palette.tab_text
+					})),
+			);
+			frame.fill_text(canvas::Text {
+				content: node.label.chars().take(22).collect(),
+				position: iced::Point::new(rect.x + 7.0, rect.y + 8.0),
+				color: color(self.palette.editor_text),
+				size: iced::Pixels(13.0),
+				font: EDITOR_FONT,
+				..Default::default()
+			});
+			frame.fill_text(canvas::Text {
+				content: format!("#{} [{}..{})", node.id, node.start_byte, node.end_byte),
+				position: iced::Point::new(rect.x + 7.0, rect.y + 25.0),
+				color: color(self.palette.gutter_text),
+				size: iced::Pixels(10.0),
+				font: EDITOR_FONT,
+				..Default::default()
+			});
+		}
+		vec![frame.into_geometry()]
+	}
+
+	fn update(
+		&self,
+		_state: &mut Self::State,
+		event: &Event,
+		bounds: iced::Rectangle,
+		cursor: mouse::Cursor,
+	) -> Option<canvas::Action<EditorMsg>> {
+		let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+			return None;
+		};
+		let position = cursor.position_in(bounds)?;
+		let layout = uast_graph_layout(self.snapshot, bounds.size());
+		let node = self
+			.snapshot
+			.nodes
+			.iter()
+			.rev()
+			.find(|node| layout.get(&node.id).is_some_and(|rect| rect.contains(position)))?;
+		Some(
+			canvas::Action::publish(EditorMsg::UastGraphNode {
+				inspector_view_id: self.inspector_view_id,
+				node_id: node.id,
+			})
+			.and_capture(),
+		)
+	}
+
+	fn mouse_interaction(
+		&self,
+		_state: &Self::State,
+		bounds: iced::Rectangle,
+		cursor: mouse::Cursor,
+	) -> mouse::Interaction {
+		let Some(position) = cursor.position_in(bounds) else {
+			return mouse::Interaction::default();
+		};
+		if uast_graph_layout(self.snapshot, bounds.size())
+			.values()
+			.any(|rect| rect.contains(position))
+		{
+			mouse::Interaction::Pointer
+		} else {
+			mouse::Interaction::default()
+		}
 	}
 }
 

@@ -28,14 +28,17 @@ fn synthetic_fold_does_not_materialize_inside_topology_group() {
 	let source = parts.concat();
 	let green = GreenNode {
 		kind: SemanticKind::RelationalTable,
+		provider_kind: crate::uast::ProviderKindId::NONE,
 		byte_len: source.len() as u32,
 		children: vec![GreenNode {
 			kind: SemanticKind::Group,
+			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: parts
 				.iter()
 				.map(|part| GreenNode {
 					kind: SemanticKind::Token,
+					provider_kind: crate::uast::ProviderKindId::NONE,
 					byte_len: part.len() as u32,
 					children: Vec::new(),
 				})
