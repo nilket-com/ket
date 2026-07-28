@@ -368,6 +368,9 @@ pub enum EditorCommand {
 	RefreshGitStatus,
 	OpenGitStatusEntry(DocLine),
 	DiffSplit(String),
+	/// Step the focused pair's snapshot partner through the file's commit
+	/// history: negative is older, positive is newer.
+	DiffStep(i64),
 	MarkdownPreview {
 		serif: bool,
 	},

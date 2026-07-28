@@ -473,6 +473,21 @@ mod tests {
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
+	fn pane_text(viewport: &Viewport, pane_id: crate::core::PaneId) -> Vec<u8> {
+		viewport
+			.pane(pane_id)
+			.expect("pane")
+			.tokens
+			.iter()
+			.flat_map(|token| token.text.iter().copied())
+			.collect()
+	}
+
+	fn pane_title(viewport: &Viewport, pane_id: crate::core::PaneId) -> String {
+		let pane = viewport.pane(pane_id).expect("pane");
+		pane.tabs[pane.active_doctab_index].title.clone()
+	}
+
 	fn fixture_git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
 		let output = std::process::Command::new("git")
 			.args(args)
@@ -481,6 +496,471 @@ mod tests {
 			.expect("run git");
 		assert!(output.status.success(), "git {args:?}");
 		String::from_utf8(output.stdout).expect("utf-8 git output")
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_walks_older_and_newer_with_boundaries() {
+		let dir = git_fixture_repo(
+			"diffstep-walk",
+			"main.rs",
+			&["one\n", "two\n", "three\n"],
+			"wt\n",
+		);
+		let short = |rev: &str| {
+			fixture_git_stdout(&dir, &["rev-parse", rev])
+				.trim()
+				.chars()
+				.take(8)
+				.collect::<String>()
+		};
+		let (short_c1, short_c2) = (short("HEAD~2"), short("HEAD~1"));
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"three\n"
+		});
+		let snap = viewport.focused_pane_id;
+		let left = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != snap)
+			.expect("worktree pane")
+			.pane_id;
+
+		// Older twice from the snapshot pane, then hit the oldest boundary.
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step older");
+		let viewport = recv_viewport_until(&viewports, "older step to two", |viewport| {
+			pane_text(viewport, snap) == b"two\n"
+		});
+		assert_eq!(pane_title(&viewport, snap), format!("main.rs@{short_c2}"));
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step older again");
+		let viewport = recv_viewport_until(&viewports, "older step to one", |viewport| {
+			pane_text(viewport, snap) == b"one\n"
+		});
+		assert_eq!(pane_title(&viewport, snap), format!("main.rs@{short_c1}"));
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step past oldest");
+		let viewport = recv_viewport_until(&viewports, "oldest boundary", |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Already at the oldest revision for this file")
+		});
+		assert_eq!(pane_text(&viewport, snap), b"one\n");
+
+		// Newer works from the worktree side of the pair too.
+		commands
+			.send(EditorCommand::FocusPane(left))
+			.expect("focus worktree pane");
+		commands
+			.send(EditorCommand::DiffStep(1))
+			.expect("step newer");
+		recv_viewport_until(&viewports, "newer step to two", |viewport| {
+			pane_text(viewport, snap) == b"two\n"
+		});
+		commands
+			.send(EditorCommand::DiffStep(1))
+			.expect("step newer again");
+		recv_viewport_until(&viewports, "newer step to three", |viewport| {
+			pane_text(viewport, snap) == b"three\n"
+		});
+		commands
+			.send(EditorCommand::DiffStep(1))
+			.expect("step past newest");
+		let viewport = recv_viewport_until(&viewports, "newest boundary", |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Already at the newest revision for this file")
+		});
+		assert_eq!(pane_text(&viewport, snap), b"three\n");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_follows_renames_in_both_directions() {
+		// A large mostly-stable body keeps rename similarity high while the
+		// first line marks each version.
+		let body: String = (2..=50).map(|n| format!("{n}\n")).collect();
+		let dir = temp_path("diffstep-rename", "d");
+		std::fs::create_dir_all(&dir).expect("create repo dir");
+		let run_git = |args: &[&str]| {
+			let status = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.status()
+				.expect("run git");
+			assert!(status.success(), "git {args:?}");
+		};
+		run_git(&["init", "-q"]);
+		let commit = |message: &str| {
+			run_git(&["add", "-A"]);
+			run_git(&[
+				"-c",
+				"user.email=t@t",
+				"-c",
+				"user.name=t",
+				"commit",
+				"-q",
+				"-m",
+				message,
+			]);
+		};
+		// The historical name contains a TAB: the line-oriented log protocol
+		// C-quotes it even under core.quotepath=false, so only the `-z`
+		// framing parses it correctly end to end.
+		fs::write(dir.join("old\tname.txt"), format!("one\n{body}")).expect("v1");
+		commit("c1");
+		fs::write(dir.join("old\tname.txt"), format!("two\n{body}")).expect("v2");
+		commit("c2");
+		run_git(&["mv", "old\tname.txt", "new name.txt"]);
+		fs::write(dir.join("new name.txt"), format!("three\n{body}")).expect("v3");
+		commit("c3-rename");
+		fs::write(dir.join("new name.txt"), format!("four\n{body}")).expect("v4");
+		commit("c4");
+		fs::write(dir.join("new name.txt"), format!("wt\n{body}")).expect("worktree");
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(
+			&mut engine,
+			&dir,
+			"new name.txt",
+			format!("wt\n{body}").as_bytes(),
+		);
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport).starts_with(b"four\n")
+		});
+		let snap = viewport.focused_pane_id;
+
+		// Two older steps cross the rename; the title's basename is the
+		// visible proof that the path followed history.
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("older to rename commit");
+		let viewport = recv_viewport_until(&viewports, "rename commit snapshot", |viewport| {
+			pane_text(viewport, snap).starts_with(b"three\n")
+		});
+		assert!(pane_title(&viewport, snap).starts_with("new name.txt@"));
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("older across the rename");
+		let viewport = recv_viewport_until(&viewports, "pre-rename snapshot", |viewport| {
+			pane_text(viewport, snap).starts_with(b"two\n")
+		});
+		assert!(
+			pane_title(&viewport, snap).starts_with("old\tname.txt@"),
+			"stepping across a rename must adopt the raw historical path: {}",
+			pane_title(&viewport, snap)
+		);
+
+		// Newer crosses the rename upward through the HEAD-rooted walk.
+		commands
+			.send(EditorCommand::DiffStep(1))
+			.expect("newer across the rename");
+		let viewport = recv_viewport_until(&viewports, "post-rename snapshot", |viewport| {
+			pane_text(viewport, snap).starts_with(b"three\n")
+		});
+		assert!(pane_title(&viewport, snap).starts_with("new name.txt@"));
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_skips_deletion_records() {
+		// A → D → A history: stepping older from the newest incarnation must
+		// land on the previous CONTENT, not on the blob-less deletion.
+		let dir = temp_path("diffstep-ada", "d");
+		std::fs::create_dir_all(&dir).expect("create repo dir");
+		let run_git = |args: &[&str]| {
+			let status = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.status()
+				.expect("run git");
+			assert!(status.success(), "git {args:?}");
+		};
+		run_git(&["init", "-q"]);
+		let commit = |message: &str| {
+			run_git(&["add", "-A"]);
+			run_git(&[
+				"-c",
+				"user.email=t@t",
+				"-c",
+				"user.name=t",
+				"commit",
+				"-q",
+				"-m",
+				message,
+			]);
+		};
+		fs::write(dir.join("f.txt"), "first life\n").expect("v1");
+		commit("a1");
+		run_git(&["rm", "-q", "f.txt"]);
+		commit("d1");
+		fs::write(dir.join("f.txt"), "second life\n").expect("v2");
+		commit("a2");
+		fs::write(dir.join("f.txt"), "wt\n").expect("worktree");
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "f.txt", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"second life\n"
+		});
+		let snap = viewport.focused_pane_id;
+
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step over the deletion");
+		recv_viewport_until(&viewports, "pre-deletion snapshot", |viewport| {
+			pane_text(viewport, snap) == b"first life\n"
+		});
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_treats_merges_as_first_parent_timeline_positions() {
+		// A conflict-resolution merge authors content different from both
+		// parents. Default path simplification omits such merges entirely;
+		// the explicit first-parent policy makes the merge a real timeline
+		// position: older lands on the first parent, newer returns to the
+		// merge.
+		let dir = temp_path("diffstep-merge", "d");
+		std::fs::create_dir_all(&dir).expect("create repo dir");
+		let run_git = |args: &[&str]| {
+			let status = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.status()
+				.expect("run git");
+			assert!(status.success(), "git {args:?}");
+		};
+		let git_allow_fail = |args: &[&str]| {
+			let _ = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.output()
+				.expect("run git");
+		};
+		let commit = |message: &str| {
+			run_git(&["add", "-A"]);
+			run_git(&[
+				"-c",
+				"user.email=t@t",
+				"-c",
+				"user.name=t",
+				"commit",
+				"-q",
+				"-m",
+				message,
+			]);
+		};
+		run_git(&["init", "-qb", "main"]);
+		fs::write(dir.join("f.txt"), "base\n").expect("base");
+		commit("A");
+		run_git(&["checkout", "-qb", "feat"]);
+		fs::write(dir.join("f.txt"), "feat-side\n").expect("feat side");
+		commit("C");
+		run_git(&["checkout", "-q", "main"]);
+		fs::write(dir.join("f.txt"), "main-side\n").expect("main side");
+		commit("B");
+		// The merge conflicts; resolve to content unlike either parent.
+		git_allow_fail(&["merge", "-q", "feat"]);
+		fs::write(dir.join("f.txt"), "merged\n").expect("resolution");
+		commit("M");
+		fs::write(dir.join("f.txt"), "wt\n").expect("worktree");
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "f.txt", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire merge snapshot");
+		let viewport = recv_viewport_until(&viewports, "merge snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"merged\n"
+		});
+		let snap = viewport.focused_pane_id;
+
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("older to first parent");
+		recv_viewport_until(&viewports, "first-parent snapshot", |viewport| {
+			pane_text(viewport, snap) == b"main-side\n"
+		});
+		commands
+			.send(EditorCommand::DiffStep(1))
+			.expect("newer back to the merge");
+		recv_viewport_until(&viewports, "merge version again", |viewport| {
+			pane_text(viewport, snap) == b"merged\n"
+		});
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_reaches_across_deletion_heavy_history() {
+		// Eleven incarnations separated by ten deletions: a deep older step
+		// must page past every blob-less record instead of manufacturing a
+		// false oldest boundary from a fixed output cap.
+		let dir = temp_path("diffstep-deep-ada", "d");
+		std::fs::create_dir_all(&dir).expect("create repo dir");
+		let run_git = |args: &[&str]| {
+			let status = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&dir)
+				.status()
+				.expect("run git");
+			assert!(status.success(), "git {args:?}");
+		};
+		run_git(&["init", "-q"]);
+		let commit = |message: &str| {
+			run_git(&["add", "-A"]);
+			run_git(&[
+				"-c",
+				"user.email=t@t",
+				"-c",
+				"user.name=t",
+				"commit",
+				"-q",
+				"-m",
+				message,
+			]);
+		};
+		for incarnation in 1..=11u32 {
+			fs::write(dir.join("f.txt"), format!("life {incarnation}\n")).expect("incarnation");
+			commit(&format!("a{incarnation}"));
+			if incarnation < 11 {
+				run_git(&["rm", "-q", "f.txt"]);
+				commit(&format!("d{incarnation}"));
+			}
+		}
+		fs::write(dir.join("f.txt"), "wt\n").expect("worktree");
+
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "f.txt", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"life 11\n"
+		});
+		let snap = viewport.focused_pane_id;
+
+		commands
+			.send(EditorCommand::DiffStep(-10))
+			.expect("deep older step");
+		recv_viewport_until(&viewports, "first incarnation", |viewport| {
+			pane_text(viewport, snap) == b"life 1\n"
+		});
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step past oldest");
+		recv_viewport_until(&viewports, "true oldest boundary", |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Already at the oldest revision for this file")
+		});
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_cancels_when_the_worktree_identity_changes_mid_step() {
+		let dir = git_fixture_repo("diffstep-witness", "main.rs", &["one\n", "two\n"], "wt\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"two\n"
+		});
+		let snap = viewport.focused_pane_id;
+		let left = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != snap)
+			.expect("worktree pane")
+			.pane_id;
+
+		// The step's walk runs asynchronously; the write-as lands on the
+		// ordered command queue before the completion is delivered, so the
+		// worktree document is renamed mid-step deterministically.
+		let renamed = dir.join("renamed.rs");
+		commands
+			.send(EditorCommand::FocusPane(left))
+			.expect("focus worktree pane");
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("start step");
+		commands
+			.send(EditorCommand::WriteFileAs(
+				renamed.to_string_lossy().into_owned(),
+			))
+			.expect("rename worktree document mid-step");
+		let viewport = recv_viewport_until(&viewports, "mid-step cancellation", |viewport| {
+			viewport.status_message.as_deref() == Some("Diff context changed; step cancelled")
+		});
+		// The snapshot must be untouched: still the HEAD blob, still paired.
+		assert_eq!(pane_text(&viewport, snap), b"two\n");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_refuses_a_dirty_snapshot() {
+		let dir = git_fixture_repo("diffstep-dirty", "main.rs", &["one\n", "two\n"], "wt\n");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"wt\n");
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		recv_viewport_until(&viewports, "HEAD snapshot", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"two\n"
+		});
+
+		// Edit the focused snapshot, then try to step: the in-place
+		// replacement would silently discard the edit, so it must refuse.
+		commands
+			.send(EditorCommand::InsertText("edited ".to_string()))
+			.expect("edit snapshot");
+		recv_viewport_until(&viewports, "edited snapshot", |viewport| {
+			visible_text(viewport) == b"edited two\n"
+		});
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("attempt step");
+		let viewport = recv_viewport_until(&viewports, "dirty refusal", |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Snapshot has unsaved edits; :diffstep would discard them")
+		});
+		assert_eq!(visible_text(&viewport), b"edited two\n");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
 	}
 
 	#[test]

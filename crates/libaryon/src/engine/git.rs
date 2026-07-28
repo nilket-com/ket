@@ -47,6 +47,171 @@ fn is_hex_oid(oid: &str) -> bool {
 	(oid.len() == 40 || oid.len() == 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Abbreviated object id for display labels (`main.rs@a1b2c3d4`). Identity
+/// stays full-width in provenance; this is presentation only.
+pub(crate) fn short_oid(oid: &str) -> &str {
+	oid.get(..8).unwrap_or(oid)
+}
+
+/// One file-touching commit in a `git log --follow --name-status` walk,
+/// carrying the path the file had *at that commit* (renames change it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimelineEntry {
+	pub(crate) commit_oid: String,
+	pub(crate) path: String,
+}
+
+/// Parse `git log -z --format=%H --follow --name-status` output into
+/// timeline entries, newest first.
+///
+/// NUL framing is load-bearing: the line protocol C-quotes paths containing
+/// tabs, quotes, backslashes, or newlines even under `core.quotepath=false`,
+/// which would hand escape sequences to the fetch phase (and let a
+/// historical LF path slip past the LF guard in escaped form). With `-z` the
+/// token stream is `hash NUL "\n"+status NUL path NUL [path2 NUL]` and paths
+/// arrive raw.
+///
+/// Deletion records are skipped — there is no blob at a `D` commit, and
+/// stepping onto one would only manufacture a "missing" fetch. Hash tokens
+/// without a status (path-limited merge listings) and non-UTF-8 paths are
+/// likewise skipped rather than guessed at.
+pub(crate) fn parse_file_timeline(stdout: &[u8]) -> Vec<TimelineEntry> {
+	fn strip_newlines(token: &[u8]) -> &[u8] {
+		let start = token.iter().take_while(|&&b| b == b'\n').count();
+		&token[start..]
+	}
+
+	// Only NUL-terminated tokens are complete: a capture truncated midway
+	// through a path would otherwise surface a partial path as a valid
+	// timeline entry. Everything after the last NUL is an unterminated
+	// fragment and is discarded.
+	let Some(last_nul) = stdout.iter().rposition(|&b| b == 0) else {
+		return Vec::new();
+	};
+	let stdout = &stdout[..=last_nul];
+	let tokens: Vec<&[u8]> = stdout.split(|&b| b == 0).collect();
+	let mut entries = Vec::new();
+	let mut index = 0;
+	while index < tokens.len() {
+		let Ok(head) = std::str::from_utf8(strip_newlines(tokens[index])) else {
+			index += 1;
+			continue;
+		};
+		if !is_hex_oid(head) {
+			index += 1;
+			continue;
+		}
+		let commit_oid = head.to_string();
+		index += 1;
+		let Some(&status_token) = tokens.get(index) else {
+			break;
+		};
+		let Ok(status) = std::str::from_utf8(strip_newlines(status_token)) else {
+			index += 1;
+			continue;
+		};
+		if is_hex_oid(status) {
+			// A hash directly follows: a merge listing without a status
+			// record. Leave the token for the outer loop to classify.
+			continue;
+		}
+		let path_count = match status.chars().next() {
+			// Renames and copies carry source and destination; the
+			// destination is the path at that commit.
+			Some('R' | 'C') => 2,
+			Some('A' | 'M' | 'D' | 'T') => 1,
+			_ => {
+				index += 1;
+				continue;
+			}
+		};
+		let Some(path_token) = tokens.get(index + path_count).copied() else {
+			break;
+		};
+		let deleted = status.starts_with('D');
+		index += 1 + path_count;
+		if deleted {
+			continue;
+		}
+		let Ok(path) = std::str::from_utf8(path_token) else {
+			continue;
+		};
+		if path.is_empty() {
+			continue;
+		}
+		entries.push(TimelineEntry {
+			commit_oid,
+			path: path.to_string(),
+		});
+	}
+	entries
+}
+
+/// Completion payload for the older walk of `:diffstep`: the timeline rooted
+/// at the snapshot's pinned commit, using the snapshot's own path (valid at
+/// that commit by construction).
+#[derive(Debug, Clone)]
+pub(crate) struct GitOlderWalkAction {
+	pub(crate) step: StepContext,
+	/// How many file-touching commits to move back.
+	pub(crate) steps: u64,
+}
+
+/// Completion payload for the newer normalize job: maps the pinned commit to
+/// its file-touching position before the HEAD-rooted walk can search for it.
+#[derive(Debug, Clone)]
+pub(crate) struct GitNewerNormalizeAction {
+	pub(crate) step: StepContext,
+	pub(crate) steps: u64,
+	/// The worktree file's repo-relative path — `--follow` walks renames
+	/// backward only from its starting point, so the HEAD-rooted timeline
+	/// must use the path as it exists now.
+	pub(crate) head_rel_path: String,
+}
+
+/// Completion payload for the newer walk: the HEAD-rooted timeline searched
+/// for the normalized position.
+#[derive(Debug, Clone)]
+pub(crate) struct GitNewerWalkAction {
+	pub(crate) step: StepContext,
+	pub(crate) steps: u64,
+	/// The pinned commit's file-touching position from the normalize job.
+	pub(crate) current_position: String,
+}
+
+/// Completion payload for a step's fetch: identical `cat-file --batch`
+/// mechanics to acquisition, but re-materializing into the existing snapshot
+/// pane instead of splitting a new one.
+#[derive(Debug, Clone)]
+pub(crate) struct GitStepFetchAction {
+	pub(crate) step: StepContext,
+	/// Target commit and the file's path at that commit.
+	pub(crate) commit_oid: String,
+	pub(crate) rel_path: String,
+}
+
+/// The panes, repository, and snapshot identity a `:diffstep` operates on,
+/// re-validated at every phase completion because each phase races user
+/// actions: pane retargeting, snapshot edits, `:w PATH` conversion, and
+/// re-pairing must all cancel the step rather than be overwritten.
+#[derive(Debug, Clone)]
+pub(crate) struct StepContext {
+	pub(crate) snapshot_pane_id: crate::core::PaneId,
+	pub(crate) snapshot_buffer_id: crate::core::BufferId,
+	pub(crate) left_pane_id: crate::core::PaneId,
+	pub(crate) left_buffer_id: crate::core::BufferId,
+	pub(crate) repo_root: PathBuf,
+	/// The snapshot's commit OID when the step was issued. A provenance
+	/// entry that disappeared (write-as) or changed (concurrent
+	/// re-acquisition) invalidates the step.
+	pub(crate) pinned_commit_oid: String,
+	/// The worktree document's file path when the step was issued. A
+	/// concurrent `:w PATH` keeps the buffer and the pair but changes what
+	/// the snapshot would be paired against — and stales the repository
+	/// paths captured at dispatch — so any change invalidates the step.
+	pub(crate) left_file_path: Option<String>,
+}
+
 /// Parse the pin phase's `git rev-parse` output: exactly one hex object id
 /// (40 bytes in SHA-1 repositories, 64 in SHA-256), with nothing but blank
 /// lines after it.
@@ -392,6 +557,22 @@ pub(crate) fn git_diff_action_lease(action: GitDiffAction) -> ActionLease {
 	ActionLease::new(GIT_JOB_OWNER, action)
 }
 
+pub(crate) fn git_older_walk_action_lease(action: GitOlderWalkAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
+pub(crate) fn git_newer_normalize_action_lease(action: GitNewerNormalizeAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
+pub(crate) fn git_newer_walk_action_lease(action: GitNewerWalkAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
+pub(crate) fn git_step_fetch_action_lease(action: GitStepFetchAction) -> ActionLease {
+	ActionLease::new(GIT_JOB_OWNER, action)
+}
+
 /// Resolves the context once before repository discovery.
 ///
 /// An unsaved relative path cannot be canonicalized yet. Anchoring it to
@@ -450,9 +631,10 @@ fn parse_branch(head: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		GitBranchCache, GitStatusEntry, GitStatusSnapshot, find_git_context, parse_batch_blob,
-		parse_single_oid, parse_status_porcelain, render_status_snapshot, repo_relative_path,
-		resolve_context_path, snapshot_virtual_path, validate_revision,
+		GitBranchCache, GitStatusEntry, GitStatusSnapshot, TimelineEntry, find_git_context,
+		parse_batch_blob, parse_file_timeline, parse_single_oid, parse_status_porcelain,
+		render_status_snapshot, repo_relative_path, resolve_context_path, short_oid,
+		snapshot_virtual_path, validate_revision,
 	};
 	use crate::svp::rust_highlight::TokenCategory;
 	use std::path::Path;
@@ -731,6 +913,136 @@ mod tests {
 		assert!(parse_batch_blob(format!("{oid} blob 5\nhello").as_bytes(), 40).is_err());
 		assert!(parse_batch_blob(format!("{oid} blob\nhello\n").as_bytes(), 40).is_err());
 		assert!(parse_batch_blob(b"no newline", 40).is_err());
+	}
+
+	fn timeline_record(commit: &str, status: &str, paths: &[&str]) -> Vec<u8> {
+		// The empirically pinned `-z` token stream: hash NUL, "\n"+status
+		// NUL, then each path NUL — raw, unquoted.
+		let mut record = Vec::new();
+		record.extend_from_slice(commit.as_bytes());
+		record.push(0);
+		record.push(b'\n');
+		record.extend_from_slice(status.as_bytes());
+		record.push(0);
+		for path in paths {
+			record.extend_from_slice(path.as_bytes());
+			record.push(0);
+		}
+		record
+	}
+
+	#[test]
+	fn file_timelines_carry_the_raw_path_at_each_commit() {
+		let c = |n: u8| format!("{:0>40}", n);
+		let mut stdout = Vec::new();
+		stdout.extend(timeline_record(&c(4), "M", &["new name.txt"]));
+		stdout.extend(timeline_record(&c(3), "R097", &["tab\tname.txt", "new name.txt"]));
+		stdout.extend(timeline_record(&c(2), "M", &["tab\tname.txt"]));
+		stdout.extend(timeline_record(&c(1), "A", &["tab\tname.txt"]));
+		let timeline = parse_file_timeline(&stdout);
+		// Renames carry source and destination; the destination is the path
+		// at that commit. Tabs (which the line protocol would C-quote even
+		// under core.quotepath=false) arrive raw under `-z`.
+		assert_eq!(
+			timeline,
+			vec![
+				TimelineEntry { commit_oid: c(4), path: "new name.txt".to_string() },
+				TimelineEntry { commit_oid: c(3), path: "new name.txt".to_string() },
+				TimelineEntry { commit_oid: c(2), path: "tab\tname.txt".to_string() },
+				TimelineEntry { commit_oid: c(1), path: "tab\tname.txt".to_string() },
+			]
+		);
+	}
+
+	#[test]
+	fn file_timelines_skip_deletions_and_merge_listings() {
+		let c = |n: u8| format!("{:0>40}", n);
+		// A → D → A history: the deletion commit has no blob and stepping
+		// onto it would only manufacture a "missing" fetch.
+		let mut stdout = Vec::new();
+		stdout.extend(timeline_record(&c(3), "A", &["f.txt"]));
+		stdout.extend(timeline_record(&c(2), "D", &["f.txt"]));
+		stdout.extend(timeline_record(&c(1), "A", &["f.txt"]));
+		let timeline = parse_file_timeline(&stdout);
+		assert_eq!(
+			timeline,
+			vec![
+				TimelineEntry { commit_oid: c(3), path: "f.txt".to_string() },
+				TimelineEntry { commit_oid: c(1), path: "f.txt".to_string() },
+			]
+		);
+
+		// A hash directly followed by another hash (path-limited merge
+		// listing without a status record) is dropped, not guessed at.
+		let mut stdout = Vec::new();
+		stdout.extend_from_slice(c(9).as_bytes());
+		stdout.push(0);
+		stdout.push(b'\n');
+		stdout.extend(timeline_record(&c(8), "M", &["file.rs"]));
+		let timeline = parse_file_timeline(&stdout);
+		assert_eq!(
+			timeline,
+			vec![TimelineEntry { commit_oid: c(8), path: "file.rs".to_string() }]
+		);
+		assert!(parse_file_timeline(b"not a timeline").is_empty());
+		assert!(parse_file_timeline(&[0xff, 0xfe]).is_empty());
+	}
+
+	#[test]
+	fn file_timelines_discard_unterminated_trailing_fragments() {
+		let c = |n: u8| format!("{:0>40}", n);
+		// A capture truncated midway through a path token must not surface
+		// the partial path as a valid entry — only NUL-terminated tokens
+		// are complete.
+		let mut stdout = timeline_record(&c(2), "M", &["good.txt"]);
+		stdout.extend_from_slice(c(1).as_bytes());
+		stdout.push(0);
+		stdout.extend_from_slice(b"\nM");
+		stdout.push(0);
+		stdout.extend_from_slice(b"parti"); // no terminating NUL
+		assert_eq!(
+			parse_file_timeline(&stdout),
+			vec![TimelineEntry { commit_oid: c(2), path: "good.txt".to_string() }]
+		);
+
+		// Same for a rename cut before its destination path completes.
+		let mut stdout = timeline_record(&c(2), "M", &["good.txt"]);
+		stdout.extend_from_slice(c(1).as_bytes());
+		stdout.push(0);
+		stdout.extend_from_slice(b"\nR097");
+		stdout.push(0);
+		stdout.extend_from_slice(b"old.txt");
+		stdout.push(0);
+		stdout.extend_from_slice(b"new-parti"); // no terminating NUL
+		assert_eq!(
+			parse_file_timeline(&stdout),
+			vec![TimelineEntry { commit_oid: c(2), path: "good.txt".to_string() }]
+		);
+
+		// No NUL at all: nothing is complete.
+		assert!(parse_file_timeline(b"deadbeef fragment without any nul").is_empty());
+	}
+
+	#[test]
+	fn file_timelines_preserve_historical_newline_paths_raw() {
+		let c = |n: u8| format!("{:0>40}", n);
+		// A historical LF-containing filename arrives raw under `-z` (the
+		// line protocol would escape it, sneaking it past the LF guard).
+		// The parser must hand it through verbatim so the fetch boundary
+		// can refuse it precisely.
+		let stdout = timeline_record(&c(1), "A", &["we\nird.txt"]);
+		let timeline = parse_file_timeline(&stdout);
+		assert_eq!(
+			timeline,
+			vec![TimelineEntry { commit_oid: c(1), path: "we\nird.txt".to_string() }]
+		);
+	}
+
+	#[test]
+	fn short_oids_abbreviate_for_display_only() {
+		let oid = "0123456789abcdef0123456789abcdef01234567";
+		assert_eq!(short_oid(oid), "01234567");
+		assert_eq!(short_oid("abc"), "abc");
 	}
 
 	#[test]

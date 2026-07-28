@@ -219,6 +219,46 @@ impl JobDispatcher<EditorHost> for RunLoopJobDispatcher<'_> {
 				result: super::event_subscribers::SubscriberResult::Delivered,
 			};
 		}
+		if let Some(action) = invocation.action::<super::git::GitOlderWalkAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_older_walk(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
+		if let Some(action) = invocation.action::<super::git::GitNewerNormalizeAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_newer_normalize(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
+		if let Some(action) = invocation.action::<super::git::GitNewerWalkAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_newer_walk(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
+		if let Some(action) = invocation.action::<super::git::GitStepFetchAction>() {
+			let action = action.clone();
+			context.session.snapshot_fetch_job = None;
+			let needs_render = complete_git_step_fetch(context, action, completion);
+			return SubscriberOutcome {
+				needs_render,
+				foreground_status: None,
+				result: super::event_subscribers::SubscriberResult::Delivered,
+			};
+		}
 		if invocation.action::<RuneCallbackRef>().is_some() {
 			return match self.rune_host.as_deref_mut() {
 				Some(host) => host.complete_job(context, invocation, completion),
@@ -363,23 +403,9 @@ fn complete_git_diff_job(
 			}
 		};
 
-	let Some(lang_registry) = context.language_registry.clone() else {
-		context.session.ui.status_message = Some("Language registry is unavailable".to_string());
-		return true;
-	};
-	let registry = context.registry().clone();
-	let resolver = context.resolver().clone();
-	let runtime = RuntimeContext {
-		registry: &registry,
-		resolver: &resolver,
-		lang_registry: &lang_registry,
-		init_script: None,
-		init_entrypoint: None,
-	};
-	let session = &mut context.session;
-
 	// The fetch raced user actions: only pair against the document the diff
 	// was requested for.
+	let session = &mut context.session;
 	let left_intact = session
 		.layout
 		.find_pane(action.left_pane_id)
@@ -388,13 +414,9 @@ fn complete_git_diff_job(
 		session.ui.status_message = Some("Diff source changed; Git diff cancelled".to_string());
 		return true;
 	}
-	let language = session
-		.buffers
-		.get(action.left_buffer_id)
-		.and_then(|buffer| buffer.text())
-		.and_then(|document| document.active_language_id)
-		.map(|id| id.as_str().to_string());
 
+	let registry = context.registry().clone();
+	let session = &mut context.session;
 	let Ok(view) = session.create_unnamed_text_view(
 		&registry,
 		crate::core::DEFAULT_VIEWPORT_WIDTH,
@@ -416,6 +438,85 @@ fn complete_git_diff_job(
 		return true;
 	};
 
+	let materialized = materialize_snapshot(
+		context,
+		SnapshotMaterialization {
+			left_pane_id: action.left_pane_id,
+			left_buffer_id: action.left_buffer_id,
+			snapshot_pane_id: right_pane_id,
+			snapshot_buffer_id: right_buffer_id,
+			repo_root: action.repo_root,
+			rel_path: action.rel_path,
+			revision_label: action.revision,
+			commit_oid: action.commit_oid,
+			blob_oid,
+			blob_content,
+		},
+	);
+	if !materialized {
+		// Materialization failed (the failure status message is already
+		// set): roll the empty snapshot pane back out rather than pairing a
+		// diff against a blank document.
+		let registry = context.registry().clone();
+		let resolver = context.resolver().clone();
+		if let Some(lang_registry) = context.language_registry.clone() {
+			let runtime = RuntimeContext {
+				registry: &registry,
+				resolver: &resolver,
+				lang_registry: &lang_registry,
+				init_script: None,
+				init_entrypoint: None,
+			};
+			close_focused_pane(&mut context.session, &runtime);
+		}
+		context.session.focus_pane(action.left_pane_id);
+	}
+	true
+}
+
+/// Everything a fetched blob needs to become (or refresh) the snapshot side
+/// of a diff pair.
+struct SnapshotMaterialization {
+	left_pane_id: PaneId,
+	left_buffer_id: BufferId,
+	snapshot_pane_id: PaneId,
+	snapshot_buffer_id: BufferId,
+	repo_root: PathBuf,
+	rel_path: String,
+	revision_label: String,
+	commit_oid: String,
+	blob_oid: String,
+	blob_content: Vec<u8>,
+}
+
+/// Install blob content into the snapshot pane's document and wire the pair:
+/// `ReplaceDocument` mechanics with the left buffer's language and an
+/// OID-keyed virtual identity, provenance, symmetric pairing, and the
+/// `name@revision` status title. Returns `false` when the document could not
+/// be constructed — the failure status message is already set and the
+/// snapshot pane's previous document (if any) is untouched.
+fn materialize_snapshot(context: &mut EditorHost, m: SnapshotMaterialization) -> bool {
+	let Some(lang_registry) = context.language_registry.clone() else {
+		context.session.ui.status_message = Some("Language registry is unavailable".to_string());
+		return false;
+	};
+	let registry = context.registry().clone();
+	let resolver = context.resolver().clone();
+	let runtime = RuntimeContext {
+		registry: &registry,
+		resolver: &resolver,
+		lang_registry: &lang_registry,
+		init_script: None,
+		init_entrypoint: None,
+	};
+	let session = &mut context.session;
+	let language = session
+		.buffers
+		.get(m.left_buffer_id)
+		.and_then(|buffer| buffer.text())
+		.and_then(|document| document.active_language_id)
+		.map(|id| id.as_str().to_string());
+
 	// The snapshot's identity for language services: absolute so it does not
 	// depend on the process working directory, keyed by the immutable commit
 	// OID so re-acquiring a moved ref never aliases an older snapshot, and
@@ -423,13 +524,13 @@ fn complete_git_diff_job(
 	// documents onto one workspace `FileId` and let the snapshot's old
 	// content poison analysis of the live buffer.
 	let virtual_path =
-		super::git::snapshot_virtual_path(&action.repo_root, &action.commit_oid, &action.rel_path);
+		super::git::snapshot_virtual_path(&m.repo_root, &m.commit_oid, &m.rel_path);
 	let replace_cmd = EditorCommand::ReplaceDocument {
-		text: String::from_utf8_lossy(&blob_content).into_owned(),
+		text: String::from_utf8_lossy(&m.blob_content).into_owned(),
 		language,
 		virtual_path: Some(virtual_path.clone()),
 	};
-	let view_id = focused_doctab(&session.layout, right_pane_id).id;
+	let view_id = focused_doctab(&session.layout, m.snapshot_pane_id).id;
 	let materialized = {
 		let EditorSession {
 			buffers,
@@ -450,20 +551,16 @@ fn complete_git_diff_job(
 				replace_cmd,
 			);
 			// ReplaceDocument installs the requested virtual identity only
-			// when document construction succeeded; a fresh unnamed buffer
-			// keeps `None` on every failure path.
+			// when document construction succeeded; the previous identity
+			// (None for a fresh buffer, the prior OID path for a step)
+			// survives every failure path.
 			(tab.document.virtual_path.as_deref() == Some(virtual_path.as_str()))
 				.then_some(tab.document.active_language_id)
 		})
 		.flatten()
 	};
 	let Some(language_id) = materialized else {
-		// Materialization failed (the failure status message is already
-		// set): roll the empty snapshot pane back out rather than pairing a
-		// diff against a blank document.
-		close_focused_pane(session, &runtime);
-		session.focus_pane(action.left_pane_id);
-		return true;
+		return false;
 	};
 	{
 		let EditorSession {
@@ -480,18 +577,349 @@ fn complete_git_diff_job(
 	}
 
 	let provenance = crate::engine::session::SnapshotProvenance::GitRevision {
-		repo_root: action.repo_root.clone(),
-		rel_path: action.rel_path.clone(),
-		revision: action.revision.clone(),
-		commit_oid: action.commit_oid.clone(),
-		blob_oid,
+		repo_root: m.repo_root,
+		rel_path: m.rel_path,
+		revision: m.revision_label,
+		commit_oid: m.commit_oid,
+		blob_oid: m.blob_oid,
 	};
 	let title = provenance.title();
-	session.snapshot_partners.insert(right_buffer_id, provenance);
-	super::diff::compute_pane_diff(&registry, session, action.left_pane_id, right_pane_id);
+	session
+		.snapshot_partners
+		.insert(m.snapshot_buffer_id, provenance);
+	super::diff::compute_pane_diff(&registry, session, m.left_pane_id, m.snapshot_pane_id);
 	// Announce the snapshot only when nothing more important (e.g. a theme
 	// error) is already on the status line.
 	session.ui.status_message.get_or_insert(title);
+	true
+}
+
+/// The stepping context must be exactly as it was when the step was issued —
+/// every phase completion races user actions. Beyond pane/buffer identity
+/// this demands: the reciprocal pair still links the two panes (no
+/// re-pairing), the snapshot's provenance still names the pinned commit (no
+/// `:w PATH` conversion or concurrent re-acquisition), and the snapshot has
+/// no unsaved edits that an in-place replacement would silently discard.
+fn step_context_intact(session: &EditorSession, step: &super::git::StepContext) -> bool {
+	let pane_shows = |pane_id, buffer_id| {
+		session
+			.layout
+			.find_pane(pane_id)
+			.is_some_and(|pane| pane.active_tab().buffer_id == buffer_id)
+	};
+	let paired = |pane_id, partner_id| {
+		session
+			.diff_pairs
+			.get(&pane_id)
+			.is_some_and(|pair| pair.partner_pane_id == partner_id)
+	};
+	let provenance_pinned = matches!(
+		session.snapshot_partners.get(&step.snapshot_buffer_id),
+		Some(crate::engine::session::SnapshotProvenance::GitRevision { commit_oid, .. })
+			if *commit_oid == step.pinned_commit_oid
+	);
+	let snapshot_clean = session
+		.buffers
+		.get(step.snapshot_buffer_id)
+		.is_some_and(|buffer| !buffer.is_dirty());
+	// A concurrent `:w PATH` on the worktree document keeps its buffer and
+	// pair but changes what the snapshot would be paired against; the file
+	// identity captured at dispatch must still hold.
+	let left_identity_pinned = session
+		.buffers
+		.get(step.left_buffer_id)
+		.and_then(|buffer| buffer.text())
+		.is_some_and(|document| document.file_path == step.left_file_path);
+	pane_shows(step.left_pane_id, step.left_buffer_id)
+		&& pane_shows(step.snapshot_pane_id, step.snapshot_buffer_id)
+		&& paired(step.left_pane_id, step.snapshot_pane_id)
+		&& paired(step.snapshot_pane_id, step.left_pane_id)
+		&& provenance_pinned
+		&& snapshot_clean
+		&& left_identity_pinned
+}
+
+/// Collect stdout and the truncation flag from a step-phase job, or surface
+/// its failure and return `None`. Stepping failures share one status prefix
+/// so the user always knows which operation went wrong.
+fn step_job_raw_stdout(
+	session: &mut EditorSession,
+	completion: &JobCompletion,
+) -> Option<(Vec<u8>, bool)> {
+	match &completion.outcome {
+		super::jobs::JobOutcome::Exited { status: 0 } => {}
+		super::jobs::JobOutcome::Exited { .. } => {
+			let mut stderr = Vec::new();
+			for chunk in completion.stderr.chunks() {
+				stderr.extend_from_slice(chunk);
+			}
+			let stderr = String::from_utf8_lossy(&stderr);
+			let detail = stderr.lines().next().unwrap_or("git failed").trim();
+			session.ui.status_message = Some(format!("Git step failed: {detail}"));
+			return None;
+		}
+		_ => {
+			session.ui.status_message = Some("Git step failed".to_string());
+			return None;
+		}
+	}
+	let mut stdout = Vec::new();
+	for chunk in completion.stdout.chunks() {
+		stdout.extend_from_slice(chunk);
+	}
+	Some((stdout, completion.stdout.truncated))
+}
+
+/// As [`step_job_raw_stdout`], refusing truncated output outright — for
+/// phases whose answer could silently change if the stream was cut short.
+fn step_job_stdout(session: &mut EditorSession, completion: &JobCompletion) -> Option<Vec<u8>> {
+	let (stdout, truncated) = step_job_raw_stdout(session, completion)?;
+	if truncated {
+		session.ui.status_message = Some("File history is too long to step".to_string());
+		return None;
+	}
+	Some(stdout)
+}
+
+/// Launch the shared fetch for a stepped target: identical `cat-file --batch`
+/// mechanics to acquisition, re-materializing in place on completion.
+fn spawn_step_fetch(
+	session: &mut EditorSession,
+	step: super::git::StepContext,
+	target: &super::git::TimelineEntry,
+) {
+	if target.path.contains('\n') {
+		session.ui.status_message =
+			Some("Cannot step into a path containing a newline".to_string());
+		return;
+	}
+	let spec = JobSpec {
+		program: PathBuf::from("git"),
+		args: vec![
+			"--no-optional-locks".into(),
+			"cat-file".into(),
+			"--batch".into(),
+		],
+		cwd: Some(step.repo_root.clone()),
+		stdin: Some(format!("{}:{}\n", target.commit_oid, target.path).into_bytes()),
+		timeout: Duration::from_secs(10),
+		completion: Some(super::git::git_step_fetch_action_lease(
+			super::git::GitStepFetchAction {
+				step,
+				commit_oid: target.commit_oid.clone(),
+				rel_path: target.path.clone(),
+			},
+		)),
+	};
+	match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
+		Ok(job) => {
+			session.snapshot_fetch_job = Some(job);
+		}
+		Err(error) => {
+			session.ui.status_message = Some(format!("Git step: {error}"));
+		}
+	}
+}
+
+/// Complete the older walk: the timeline rooted at the pinned commit, whose
+/// first record is the current content's origin. The target is record `steps`.
+fn complete_git_older_walk(
+	context: &mut EditorHost,
+	action: super::git::GitOlderWalkAction,
+	completion: &JobCompletion,
+) -> bool {
+	let session = &mut context.session;
+	let Some((stdout, truncated)) = step_job_raw_stdout(session, completion) else {
+		return true;
+	};
+	let timeline = super::git::parse_file_timeline(&stdout);
+	let steps = usize::try_from(action.steps).unwrap_or(usize::MAX);
+	// Entries are newest-first, so truncation only cuts the older tail: a
+	// target already in hand is valid regardless. Only a miss must
+	// distinguish "history really ends here" from "the stream was cut".
+	let Some(target) = timeline.get(steps) else {
+		session.ui.status_message = Some(if truncated {
+			"File history is too long to step".to_string()
+		} else {
+			"Already at the oldest revision for this file".to_string()
+		});
+		return true;
+	};
+	if !step_context_intact(session, &action.step) {
+		session.ui.status_message = Some("Diff context changed; step cancelled".to_string());
+		return true;
+	}
+	spawn_step_fetch(session, action.step, target);
+	true
+}
+
+/// Complete the newer normalize job: map the pinned commit to its
+/// file-touching position, then walk the HEAD-rooted timeline to find it.
+fn complete_git_newer_normalize(
+	context: &mut EditorHost,
+	action: super::git::GitNewerNormalizeAction,
+	completion: &JobCompletion,
+) -> bool {
+	let session = &mut context.session;
+	let Some(stdout) = step_job_stdout(session, completion) else {
+		return true;
+	};
+	let Some(current_position) = super::git::parse_single_oid(&stdout) else {
+		session.ui.status_message =
+			Some("Git step failed: history position unreadable".to_string());
+		return true;
+	};
+	if !step_context_intact(session, &action.step) {
+		session.ui.status_message = Some("Diff context changed; step cancelled".to_string());
+		return true;
+	}
+	// `--follow` walks renames backward only from its starting point, so the
+	// HEAD-rooted timeline must use the worktree file's current path.
+	let spec = JobSpec {
+		program: PathBuf::from("git"),
+		args: vec![
+			"--no-optional-locks".into(),
+			"log".into(),
+			"-z".into(),
+			"--first-parent".into(),
+			"--format=%H".into(),
+			"--follow".into(),
+			"--name-status".into(),
+			"HEAD".into(),
+			"--".into(),
+			action.head_rel_path.clone().into(),
+		],
+		cwd: Some(action.step.repo_root.clone()),
+		stdin: None,
+		timeout: Duration::from_secs(10),
+		completion: Some(super::git::git_newer_walk_action_lease(
+			super::git::GitNewerWalkAction {
+				step: action.step,
+				steps: action.steps,
+				current_position,
+			},
+		)),
+	};
+	match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
+		Ok(job) => {
+			session.snapshot_fetch_job = Some(job);
+		}
+		Err(error) => {
+			session.ui.status_message = Some(format!("Git step: {error}"));
+		}
+	}
+	true
+}
+
+/// Complete the newer walk: locate the normalized position in the
+/// HEAD-rooted timeline and step toward its start.
+fn complete_git_newer_walk(
+	context: &mut EditorHost,
+	action: super::git::GitNewerWalkAction,
+	completion: &JobCompletion,
+) -> bool {
+	let session = &mut context.session;
+	let Some((stdout, truncated)) = step_job_raw_stdout(session, completion) else {
+		return true;
+	};
+	let timeline = super::git::parse_file_timeline(&stdout);
+	// This timeline is also newest-first, so a truncated capture is a valid
+	// PREFIX: if the current position is inside it, every newer target is
+	// too — truncation only removed older entries. Only a missing position
+	// must distinguish "not in this history" from "the stream was cut
+	// before reaching it".
+	let Some(index) = timeline
+		.iter()
+		.position(|entry| entry.commit_oid == action.current_position)
+	else {
+		session.ui.status_message = Some(if truncated {
+			"File history is too long to step".to_string()
+		} else {
+			"Snapshot is not in the current file's history".to_string()
+		});
+		return true;
+	};
+	let steps = usize::try_from(action.steps).unwrap_or(usize::MAX);
+	let Some(target_index) = index.checked_sub(steps) else {
+		session.ui.status_message =
+			Some("Already at the newest revision for this file".to_string());
+		return true;
+	};
+	let target = timeline[target_index].clone();
+	if !step_context_intact(session, &action.step) {
+		session.ui.status_message = Some("Diff context changed; step cancelled".to_string());
+		return true;
+	}
+	spawn_step_fetch(session, action.step, &target);
+	true
+}
+
+/// Complete a step's fetch: re-materialize the snapshot pane in place with
+/// the target commit's blob, short-OID label, and refreshed pairing. A
+/// failure leaves the previous snapshot intact — there is no pane to roll
+/// back.
+fn complete_git_step_fetch(
+	context: &mut EditorHost,
+	action: super::git::GitStepFetchAction,
+	completion: &JobCompletion,
+) -> bool {
+	{
+		let session = &mut context.session;
+		match &completion.outcome {
+			super::jobs::JobOutcome::Exited { status: 0 } => {}
+			super::jobs::JobOutcome::Exited { .. } => {
+				let mut stderr = Vec::new();
+				for chunk in completion.stderr.chunks() {
+					stderr.extend_from_slice(chunk);
+				}
+				let stderr = String::from_utf8_lossy(&stderr);
+				let detail = stderr.lines().next().unwrap_or("git cat-file failed").trim();
+				session.ui.status_message = Some(format!("Git step failed: {detail}"));
+				return true;
+			}
+			_ => {
+				session.ui.status_message = Some("Git step failed".to_string());
+				return true;
+			}
+		}
+		if completion.stdout.truncated {
+			session.ui.status_message = Some("Git snapshot is too large to diff".to_string());
+			return true;
+		}
+	}
+	let mut stdout = Vec::new();
+	for chunk in completion.stdout.chunks() {
+		stdout.extend_from_slice(chunk);
+	}
+	let (blob_oid, blob_content) =
+		match super::git::parse_batch_blob(&stdout, action.commit_oid.len()) {
+			Ok(parsed) => parsed,
+			Err(detail) => {
+				context.session.ui.status_message = Some(format!("Git step failed: {detail}"));
+				return true;
+			}
+		};
+	if !step_context_intact(&context.session, &action.step) {
+		context.session.ui.status_message =
+			Some("Diff context changed; step cancelled".to_string());
+		return true;
+	}
+	let revision_label = super::git::short_oid(&action.commit_oid).to_string();
+	materialize_snapshot(
+		context,
+		SnapshotMaterialization {
+			left_pane_id: action.step.left_pane_id,
+			left_buffer_id: action.step.left_buffer_id,
+			snapshot_pane_id: action.step.snapshot_pane_id,
+			snapshot_buffer_id: action.step.snapshot_buffer_id,
+			repo_root: action.step.repo_root,
+			rel_path: action.rel_path,
+			revision_label,
+			commit_oid: action.commit_oid,
+			blob_oid,
+			blob_content,
+		},
+	);
 	true
 }
 
@@ -1538,6 +1966,164 @@ fn handle_revision_diff_split(session: &mut EditorSession, arg: &str) -> bool {
 	true
 }
 
+/// Start a `:diffstep` from either side of the focused snapshot diff pair.
+/// Negative deltas walk older from the pinned commit; positive deltas walk
+/// newer along the HEAD-rooted timeline of the worktree file's current path.
+fn handle_diff_step(session: &mut EditorSession, delta: i64) -> bool {
+	if delta == 0 {
+		session.ui.status_message = Some("Nothing to step: use older, newer, or ±N".to_string());
+		return true;
+	}
+	let focused = session.focused_pane_id;
+	let Some(pair) = session.diff_pairs.get(&focused) else {
+		session.ui.status_message = Some("No diff pair in the focused pane".to_string());
+		return true;
+	};
+	let partner = pair.partner_pane_id;
+	let focused_buffer = focused_doctab(&session.layout, focused).buffer_id;
+	let Some(partner_buffer) = session
+		.layout
+		.find_pane(partner)
+		.map(|pane| pane.active_tab().buffer_id)
+	else {
+		session.ui.status_message = Some("Diff partner pane is gone".to_string());
+		return true;
+	};
+	let (snapshot_pane_id, snapshot_buffer_id, left_pane_id, left_buffer_id) =
+		if session.snapshot_partners.contains_key(&focused_buffer) {
+			(focused, focused_buffer, partner, partner_buffer)
+		} else if session.snapshot_partners.contains_key(&partner_buffer) {
+			(partner, partner_buffer, focused, focused_buffer)
+		} else {
+			session.ui.status_message =
+				Some("The focused diff has no Git snapshot to step".to_string());
+			return true;
+		};
+	let crate::engine::session::SnapshotProvenance::GitRevision {
+		repo_root,
+		rel_path,
+		commit_oid,
+		..
+	} = session
+		.snapshot_partners
+		.get(&snapshot_buffer_id)
+		.expect("snapshot membership checked above")
+		.clone();
+	if session.snapshot_fetch_job.is_some() {
+		session.ui.status_message = Some("A snapshot diff is already in progress".to_string());
+		return true;
+	}
+	// An edited snapshot must not be silently replaced: stepping is a
+	// document swap, and unsaved edits have nowhere to go.
+	if session
+		.buffers
+		.get(snapshot_buffer_id)
+		.is_some_and(|buffer| buffer.is_dirty())
+	{
+		session.ui.status_message =
+			Some("Snapshot has unsaved edits; :diffstep would discard them".to_string());
+		return true;
+	}
+	let step = super::git::StepContext {
+		snapshot_pane_id,
+		snapshot_buffer_id,
+		left_pane_id,
+		left_buffer_id,
+		repo_root: repo_root.clone(),
+		pinned_commit_oid: commit_oid.clone(),
+		left_file_path: session
+			.buffers
+			.get(left_buffer_id)
+			.and_then(|buffer| buffer.text())
+			.and_then(|document| document.file_path.clone()),
+	};
+
+	let spec = if delta < 0 {
+		let steps = delta.unsigned_abs();
+		// Older walk: rooted at the pinned commit with the snapshot's own
+		// path (valid at that commit by construction). Record 0 is the
+		// current content's origin. Uncapped: deletion and merge records
+		// are skipped by the parser in unbounded numbers, so any fixed `-n`
+		// slack manufactures false oldest boundaries; the job capture
+		// budget is the real limit, handled at completion. `-z` framing
+		// keeps exotic paths raw.
+		JobSpec {
+			program: PathBuf::from("git"),
+			args: vec![
+				"--no-optional-locks".into(),
+				"log".into(),
+				"-z".into(),
+				"--first-parent".into(),
+				"--format=%H".into(),
+				"--follow".into(),
+				"--name-status".into(),
+				commit_oid.clone().into(),
+				"--".into(),
+				rel_path.clone().into(),
+			],
+			cwd: Some(repo_root),
+			stdin: None,
+			timeout: Duration::from_secs(10),
+			completion: Some(super::git::git_older_walk_action_lease(
+				super::git::GitOlderWalkAction { step, steps },
+			)),
+		}
+	} else {
+		// Newer walk needs the worktree file's current repo-relative path:
+		// `--follow` walks renames backward only from its starting point.
+		let Some(head_rel_path) = session
+			.buffers
+			.get(left_buffer_id)
+			.and_then(|buffer| buffer.text())
+			.and_then(|document| document.file_path.clone())
+			.and_then(|file_path| {
+				let file = std::path::Path::new(&file_path);
+				let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+				super::git::repo_relative_path(&repo_root, &canonical)
+			})
+		else {
+			session.ui.status_message =
+				Some("The worktree document has no repository path".to_string());
+			return true;
+		};
+		JobSpec {
+			program: PathBuf::from("git"),
+			args: vec![
+				"--no-optional-locks".into(),
+				"log".into(),
+				"--first-parent".into(),
+				"-n".into(),
+				"1".into(),
+				"--format=%H".into(),
+				"--follow".into(),
+				commit_oid.clone().into(),
+				"--".into(),
+				rel_path.clone().into(),
+			],
+			cwd: Some(repo_root),
+			stdin: None,
+			timeout: Duration::from_secs(10),
+			completion: Some(super::git::git_newer_normalize_action_lease(
+				super::git::GitNewerNormalizeAction {
+					step,
+					steps: delta as u64,
+					head_rel_path,
+				},
+			)),
+		}
+	};
+	match session.jobs.spawn(super::git::GIT_JOB_OWNER, true, spec) {
+		Ok(job) => {
+			session.snapshot_fetch_job = Some(job);
+			session.ui.status_message = Some("Stepping through history…".to_string());
+		}
+		Err(error) => {
+			session.ui.status_message = Some(format!("Git step: {error}"));
+		}
+	}
+	true
+}
+
 fn read_only_virtual_blocks_command(command: &EditorCommand) -> bool {
 	matches!(
 		command,
@@ -1698,6 +2284,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::ClearVisualSelection
 		| EditorCommand::CheckFileReload
 		| EditorCommand::DiffSplit(_)
+		| EditorCommand::DiffStep(_)
 		| EditorCommand::MarkdownPreview { .. }
 		| EditorCommand::ShowMarkdownDocument { .. }
 		| EditorCommand::WriteFile
@@ -3020,6 +3607,9 @@ fn dispatch_command(
 		}
 		EditorCommand::DiffSplit(path) => {
 			needs_render = handle_diff_split(runtime, session, path);
+		}
+		EditorCommand::DiffStep(delta) => {
+			needs_render = handle_diff_step(session, delta);
 		}
 		EditorCommand::MarkdownPreview { serif } => {
 			match open_markdown_image_preview(registry, session, serif) {

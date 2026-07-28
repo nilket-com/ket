@@ -2646,6 +2646,50 @@ mod tests {
 	}
 
 	#[test]
+	fn diffstep_parses_directions_and_signed_counts() {
+		for (buffer, expected) in [
+			("diffstep older", -1i64),
+			("dstep newer", 1),
+			("diffstep -3", -3),
+			("diffstep +2", 2),
+		] {
+			let (mut frontend, rx_cmd) = build_frontend();
+			let mut should_quit = false;
+			frontend.set_editor_mode_for_test(EditorMode::Command);
+			frontend.command_buffer = buffer.to_string();
+
+			assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
+			match rx_cmd.try_recv().expect(":diffstep should send a command") {
+				EditorCommand::DiffStep(delta) => assert_eq!(delta, expected, "{buffer}"),
+				other => panic!("Expected DiffStep, got {other:?}"),
+			}
+		}
+		for buffer in ["diffstep 0", "diffstep sideways"] {
+			let (mut frontend, rx_cmd) = build_frontend();
+			let mut should_quit = false;
+			frontend.set_editor_mode_for_test(EditorMode::Command);
+			frontend.command_buffer = buffer.to_string();
+
+			assert!(!frontend.dispatch_key(KeyCode::Enter, Modifiers::NONE, &mut should_quit));
+			// Command-mode Enter emits housekeeping commands regardless;
+			// only a DiffStep dispatch would be wrong here.
+			while let Ok(command) = rx_cmd.try_recv() {
+				assert!(
+					!matches!(command, EditorCommand::DiffStep(_)),
+					"{buffer} must not dispatch a step"
+				);
+			}
+			assert!(
+				frontend
+					.status_message
+					.as_deref()
+					.is_some_and(|message| message.contains("Usage: :diffstep")),
+				"{buffer}"
+			);
+		}
+	}
+
+	#[test]
 	fn ambiguous_split_aliases_are_rejected() {
 		for command in ["split", "sp"] {
 			assert_unknown_command(command);

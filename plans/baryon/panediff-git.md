@@ -174,6 +174,22 @@ Ignored tests (require a `git` binary; run with `-- --ignored`):
   of a ref move and verify the two open snapshots carry distinct identities,
   the worktree pane pairs with the new snapshot symmetrically, and the
   abandoned snapshot stays open but unpaired.
+- **Stepping**: `:diffstep` walks older to the creation boundary and newer to
+  the newest boundary (with their precise refusals), steps from either side
+  of the pair, and follows renames in both directions — the snapshot title
+  adopting the historical basename (a tab-containing one, exercising the
+  `-z` protocol end to end) is the visible proof. An A→D→A history steps
+  between content states, skipping the deletion; a dirty snapshot refuses
+  the step. Gate-side: `:diffstep` argument parsing (directions, signed
+  counts, rejects `0` and junk), the no-pair refusal, and `-z` parser units
+  (tab paths, raw historical-LF paths, deletion and merge-listing skips).
+  A deep step across a deletion-heavy history (11 incarnations, 10
+  deletions, `:dstep -10`) proves the uncapped walk, and the mid-step
+  worktree `:w PATH` race is driven deterministically — the ordered command
+  queue lands the rename before the walk's completion delivery — and
+  asserts cancellation with the snapshot untouched. A conflict-resolution
+  merge whose content matches neither parent steps older to its first
+  parent and newer back to the merge, proving the first-parent policy.
 - Unknown revisions fail with git's message and create no pane.
 - Oversized blobs (> 8 MiB) are refused, not partially diffed.
 
@@ -181,12 +197,100 @@ Untested by automation: mid-fetch pane teardown (stale-source path) and
 materialization failure (needs induced registry exhaustion); both are
 straight-line status+rollback code.
 
+## 6. Timeline Stepping (`:diffstep`)
+
+`:diffstep older|newer|±N` (alias `:dstep`) moves the snapshot partner of the
+focused diff pair through the file's commit history without leaving the pair.
+Negative steps are older, positive newer; `older`/`newer` mean ∓1. Either
+side of the pair may issue the command; the snapshot side is identified by
+its provenance entry, so file-vs-file pairs refuse with a precise message.
+
+### Linear merge policy
+
+All three walks use `--first-parent`: the timeline is the **first-parent
+spine** of history. This is an explicit policy, not a default — Git's default
+path simplification omits merge commits even when a conflict resolution
+authored file content unlike either parent, which would make the actual
+origin of `HEAD:<path>` unreachable by stepping (older would skip it, newer
+could not return to it). Under first-parent, such a merge is a real timeline
+position whose record diffs against its first parent; side-branch commits
+are deliberately not stepping destinations.
+
+### Walk direction and renames
+
+`git log --follow --name-status --format=%H` produces the timeline: one
+record per file-touching commit, whose last tab field is the **path at that
+commit** (`R097 old new` → `new`). Rename traversal is directional:
+
+- **Older** (one job): walk from the snapshot's pinned commit with the
+  snapshot's own `rel_path` — that path is valid at that commit by
+  construction. Position 0 is the first record (the commit that produced the
+  current content, whether or not the pinned commit itself touched the
+  file); the target is record `|N|`. Walking past the terminal `A` record
+  reports `Already at the oldest revision for this file`. The walk is
+  **uncapped**: deletion and merge records are skipped in unbounded numbers,
+  so any fixed `-n` slack manufactures false oldest boundaries. The 8 MiB
+  job capture is the real limit; since records are newest-first, truncation
+  only cuts the older tail — a target already in hand stays valid, and only
+  a miss distinguishes "history ends" from "stream cut" (`File history is
+  too long to step`).
+- **Newer** (two jobs): `--follow` only walks backward from its start, so
+  the timeline is rooted at `HEAD` using the **worktree file's** current
+  repo-relative path, which follows renames back through the snapshot's
+  position. A normalize job (`git log -n1 --follow <pinned> -- <path>`)
+  first maps the pinned commit to its file-touching position; the HEAD
+  timeline is then searched for that position and the target is `index − N`.
+  A position missing from the HEAD timeline reports that the snapshot is not
+  in the current file's history; `index − N < 0` reports already-newest.
+  Truncation here is also prefix-safe: a current position found inside a
+  truncated capture has every newer target present, so only a *missing*
+  position on a truncated stream reports `File history is too long to step`.
+
+The walks use `git log -z`: the line-oriented protocol C-quotes paths
+containing tabs, quotes, backslashes, or newlines even under
+`core.quotepath=false`, which would hand escape sequences to the fetch phase
+and let historical LF paths slip past the LF guard in escaped form. Under
+`-z` the token stream is `hash NUL "\n"+status NUL path NUL [path2 NUL]` and
+paths arrive raw. Bytes after the last NUL are an unterminated fragment
+(a capture cut mid-path) and are discarded rather than surfaced as a partial
+path. The parser additionally skips deletion records (`D` commits
+have no blob — an A→D→A history steps between content states), records
+without a status (path-limited merge listings), and non-UTF-8 paths, rather
+than guessing. Stepped fetches reuse the existing `cat-file --batch` phase
+verbatim with `<target_commit>:<path_at_commit>`; paths containing LF are
+refused at that boundary like acquisition paths.
+
+### Step integrity
+
+Stepping is an in-place document swap, and each phase races user actions, so
+`StepContext` pins the snapshot's commit OID **and the worktree document's
+file path** at issue time, and every phase re-validates the full context:
+both panes still show their buffers, the reciprocal pair still links them
+(no re-pairing), the provenance entry still names the pinned commit (no
+`:w PATH` conversion of the snapshot, no concurrent re-acquisition), the
+worktree document still has the file identity captured at dispatch (a
+`:w PATH` there would re-pair the snapshot against a renamed file using
+stale repository paths), and the snapshot has no unsaved edits. A dirty
+snapshot refuses the step up front — unsaved edits have nowhere to go.
+
+### In-place re-materialization
+
+A step replaces the snapshot pane's document (same buffer, same pane — no
+new split): `ReplaceDocument` mechanics, provider identity from
+`snapshot_virtual_path` with the new commit OID, provenance updated in
+place, and the pair recomputed. A failed step leaves the previous snapshot
+intact — there is no pane to roll back.
+
+After stepping, the revision label becomes the target's **short commit OID**
+(`main.rs@a1b2c3d4`): the original symbolic label no longer describes the
+position. Full OIDs remain in provenance. A title reading
+`old.txt@<short>` after stepping across a rename is the visible proof that
+the path followed history.
+
 ## Future Work (out of scope here)
 
 - Snapshot caching and deduplication keyed by blob OID (the identity now
   exists; the cache does not).
-- Timeline stepping: move the diff partner older/newer through
-  `git log --follow` without leaving the pair.
 - Log picker: a `git log` panel for the focused file where selecting a commit
   opens the diff (the `git-status` panel interaction pattern).
 - Index/worktree three-way: left = HEAD, middle = index, right = worktree.

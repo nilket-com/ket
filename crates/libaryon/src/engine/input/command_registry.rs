@@ -377,6 +377,18 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_pane_diff),
 	},
 	CommandSpec {
+		name: "diffstep",
+		aliases: &["dstep"],
+		bang: false,
+		args: ArgSpec::Required,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Panes,
+		usage: ":diffstep older|newer|N",
+		summary: "Step a snapshot diff through history",
+		help: "Moves the snapshot partner of the focused diff pair through the file's commit history without leaving the pair: 'older' and 'newer' step one commit, a signed count (-3, +2) steps several. Renames are followed; after stepping, the snapshot is titled with its short commit id.",
+		dispatch: DispatchKind::Exact(cmd_diff_step),
+	},
+	CommandSpec {
 		name: "mdpreview",
 		aliases: &["mp"],
 		bang: false,
@@ -855,6 +867,18 @@ fn cmd_pane_close(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
 
 fn cmd_pane_diff(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	ctx.send(EditorCommand::DiffSplit(expand_path_arg(inv.args)));
+}
+
+fn cmd_diff_step(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	let delta = match inv.args.trim() {
+		"older" => Some(-1),
+		"newer" => Some(1),
+		other => other.parse::<i64>().ok().filter(|delta| *delta != 0),
+	};
+	match delta {
+		Some(delta) => ctx.send(EditorCommand::DiffStep(delta)),
+		None => ctx.error("Usage: :diffstep older|newer|N (N signed, non-zero)"),
+	}
 }
 
 fn cmd_markdown_preview(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
