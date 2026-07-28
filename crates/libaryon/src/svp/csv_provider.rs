@@ -63,6 +63,10 @@ impl LanguageProvider for CsvProvider {
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		csv_kind_name(kind)
 	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == crate::svp::csv_semantic::CSV_TOKEN_KIND
+	}
 }
 
 impl LanguageProvider for TsvProvider {
@@ -107,6 +111,10 @@ impl LanguageProvider for TsvProvider {
 
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		csv_kind_name(kind)
+	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == crate::svp::csv_semantic::CSV_TOKEN_KIND
 	}
 }
 

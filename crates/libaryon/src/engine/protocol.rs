@@ -380,10 +380,14 @@ pub enum EditorCommand {
 	},
 	/// Jump from the selected inspector row to its stamped source range.
 	ActivateUastInspectorRow,
+	/// Collapse or expand the selected inspector node.
+	ToggleUastInspectorFold,
+	/// Toggle whether inspector selection follows the paired source cursor.
+	ToggleUastInspectorFollowCursor,
 	/// Jump from a frontend-rendered graph node to its stamped source range.
 	ActivateUastGraphNode {
 		inspector_view_id: ViewId,
-		node_id: u32,
+		selection: crate::uast::UastGraphSelection,
 	},
 	/// Render the focused source's bounded UAST snapshot as Graphviz DOT.
 	ExportUastDot {

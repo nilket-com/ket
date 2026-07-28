@@ -3,7 +3,8 @@ use super::document::io::read_document_snapshot;
 use super::event_bus::EngineEventQueue;
 use super::language::{LanguageId, LanguageRegistry};
 use super::session::{
-	BufferStore, CommonViewState, LayoutNode, SemanticState, TextEditorMut, with_text_buffer_mut,
+	BufferStore, CommonViewState, LayoutNode, SemanticState, StructuralIssue, StructuralIssueKind,
+	TextEditorMut, with_text_buffer_mut,
 };
 use super::structural_graft::apply_graft;
 use crate::core::{BufferId, DocByte, RequestId};
@@ -36,6 +37,7 @@ fn clear_for_unavailable_inputs(semantic: &mut SemanticState) {
 	semantic.diagnostics.clear();
 	semantic.inline_annotations.clear();
 	semantic.last_semantic_state = None;
+	semantic.structural_issue = None;
 	semantic.last_semantic_len = usize::MAX;
 	semantic.last_semantic_path = None;
 	semantic.pending_semantic_request_id = None;
@@ -81,25 +83,33 @@ fn apply_semantic_response(
 	if let Some((green, source_bytes)) = structural_topology {
 		let rid = document.root_id;
 		let fold_snapshot = doctab.view.folds.snapshot(registry, rid);
-		document.bump_topology_rev();
 
 		// A graft that would not reproduce the document's bytes is refused, and the
 		// document keeps the tree it has. The highlights above still stand: they are
 		// offsets into unchanged bytes.
-		if let Err(error) = apply_graft(registry, rid, &green, &source_bytes) {
-			debug_assert!(false, "semantic graft rejected: {error}");
+		if apply_graft(registry, rid, &green, &source_bytes).is_err() {
+			document.semantic.structural_issue = Some(StructuralIssue {
+				state_id,
+				kind: StructuralIssueKind::Rejected,
+			});
 			return false;
 		}
+		document.bump_topology_rev();
 		doctab
 			.view
 			.folds
 			.restore_exact(registry, rid, fold_snapshot);
 
 		document.semantic.applied_structural_state_id = Some(state_id);
+		document.semantic.structural_issue = None;
 		document.semantic.cached_sum_tree = None;
 		invalidate_minimap_cache(&mut doctab.view.common);
 		return true;
 	}
+	document.semantic.structural_issue = Some(StructuralIssue {
+		state_id,
+		kind: StructuralIssueKind::Unavailable,
+	});
 	false
 }
 
@@ -510,6 +520,75 @@ mod tests {
 				Some(state)
 			);
 			assert_eq!(editor.cursor.snapshot(), cursors_before);
+		}
+	}
+
+	#[test]
+	fn semantic_status_records_rejected_and_unavailable_topology() {
+		let registry = Arc::new(UastRegistry::new(8));
+		let (root, leaf) = append_virtual_document(&registry, "alpha");
+		let mut doctab = test_editor(&registry, root, leaf, "src/status.rs");
+		let state = doctab.editor_mut().document.ledger.current_state_id;
+
+		doctab
+			.editor_mut()
+			.document
+			.semantic
+			.pending_semantic_request_id = Some(RequestId::new(501));
+		{
+			let mut editor = doctab.editor_mut();
+			assert!(!apply_semantic_response(
+				&registry,
+				BufferId::new(1),
+				&mut editor,
+				SemanticResponse {
+					buffer_id: BufferId::new(1),
+					state_id: state,
+					request_id: RequestId::new(501),
+					highlights: Vec::new(),
+					diagnostics: Vec::new(),
+					inline_annotations: Vec::new(),
+					structural_topology: Some((flat_green_node("oops"), b"oops".to_vec())),
+				},
+			));
+			assert_eq!(editor.document.topology_rev, crate::core::TopologyRev::ZERO);
+			assert_eq!(
+				editor.document.semantic.structural_issue,
+				Some(StructuralIssue {
+					state_id: state,
+					kind: StructuralIssueKind::Rejected,
+				})
+			);
+		}
+
+		doctab
+			.editor_mut()
+			.document
+			.semantic
+			.pending_semantic_request_id = Some(RequestId::new(502));
+		{
+			let mut editor = doctab.editor_mut();
+			assert!(!apply_semantic_response(
+				&registry,
+				BufferId::new(1),
+				&mut editor,
+				SemanticResponse {
+					buffer_id: BufferId::new(1),
+					state_id: state,
+					request_id: RequestId::new(502),
+					highlights: Vec::new(),
+					diagnostics: Vec::new(),
+					inline_annotations: Vec::new(),
+					structural_topology: None,
+				},
+			));
+			assert_eq!(
+				editor.document.semantic.structural_issue,
+				Some(StructuralIssue {
+					state_id: state,
+					kind: StructuralIssueKind::Unavailable,
+				})
+			);
 		}
 	}
 

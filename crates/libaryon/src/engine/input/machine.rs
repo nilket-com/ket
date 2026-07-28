@@ -722,13 +722,18 @@ impl InputRuntime {
 		modifiers: Modifiers,
 		should_quit: &mut bool,
 	) -> bool {
-		if self.context.is_uast_inspector
-			&& code == KeyCode::Enter
-			&& modifiers == Modifiers::NONE
-		{
-			self.send_command(EditorCommand::ActivateUastInspectorRow);
-			self.state = InputState::normal();
-			return true;
+		if self.context.is_uast_inspector && modifiers == Modifiers::NONE {
+			let command = match code {
+				KeyCode::Enter => Some(EditorCommand::ActivateUastInspectorRow),
+				KeyCode::Char(' ') => Some(EditorCommand::ToggleUastInspectorFold),
+				KeyCode::Char('f') => Some(EditorCommand::ToggleUastInspectorFollowCursor),
+				_ => None,
+			};
+			if let Some(command) = command {
+				self.send_command(command);
+				self.state = InputState::normal();
+				return true;
+			}
 		}
 		let browser = self.is_file_browser_view();
 		let Some(context) = normal_context(self.state, browser) else {

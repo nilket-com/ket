@@ -1151,6 +1151,7 @@ struct SemanticRuntime<'a> {
 	diagnostics: &'a mut Vec<DiagnosticSpan>,
 	last_state: &'a mut Option<StateId>,
 	applied_structural_state_id: &'a mut Option<StateId>,
+	structural_issue: &'a mut Option<super::session::StructuralIssue>,
 	last_len: &'a mut usize,
 	last_path: &'a mut Option<String>,
 	pending_request_id: &'a mut Option<RequestId>,
@@ -1166,6 +1167,7 @@ impl SemanticRuntime<'_> {
 			diagnostics: &mut semantic.diagnostics,
 			last_state: &mut semantic.last_semantic_state,
 			applied_structural_state_id: &mut semantic.applied_structural_state_id,
+			structural_issue: &mut semantic.structural_issue,
 			last_len: &mut semantic.last_semantic_len,
 			last_path: &mut semantic.last_semantic_path,
 			pending_request_id: &mut semantic.pending_semantic_request_id,
@@ -1184,6 +1186,7 @@ impl SemanticRuntime<'_> {
 		self.diagnostics.clear();
 		*self.last_state = None;
 		*self.applied_structural_state_id = None;
+		*self.structural_issue = None;
 		*self.last_len = usize::MAX;
 		*self.last_path = None;
 		*self.pending_request_id = None;
@@ -2292,6 +2295,8 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::MarkdownPreview { .. }
 		| EditorCommand::OpenUastInspector { .. }
 		| EditorCommand::ActivateUastInspectorRow
+		| EditorCommand::ToggleUastInspectorFold
+		| EditorCommand::ToggleUastInspectorFollowCursor
 		| EditorCommand::ActivateUastGraphNode { .. }
 		| EditorCommand::ExportUastDot { .. }
 		| EditorCommand::ShowMarkdownDocument { .. }
@@ -3644,15 +3649,27 @@ fn dispatch_command(
 			}
 			needs_render = true;
 		}
+		EditorCommand::ToggleUastInspectorFold => {
+			if let Err(error) = super::uast_inspector::toggle_selected_fold(session) {
+				session.ui.status_message = Some(error);
+			}
+			needs_render = true;
+		}
+		EditorCommand::ToggleUastInspectorFollowCursor => {
+			if let Err(error) = super::uast_inspector::toggle_follow_cursor(session) {
+				session.ui.status_message = Some(error);
+			}
+			needs_render = true;
+		}
 		EditorCommand::ActivateUastGraphNode {
 			inspector_view_id,
-			node_id,
+			selection,
 		} => {
 			if let Err(error) = super::uast_inspector::activate_graph_node(
 				registry,
 				session,
 				inspector_view_id,
-				node_id,
+				selection,
 			) {
 				session.ui.status_message = Some(error);
 			}

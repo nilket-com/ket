@@ -113,9 +113,8 @@ fn render_protocol(picker: &Picker, request: &GraphRequest) -> Option<Protocol> 
 		return None;
 	}
 	let font = picker.font_size();
-	let width = PixelWidth::new(
-		u32::from(request.area.width).saturating_mul(u32::from(font.width.max(1))),
-	);
+	let width =
+		PixelWidth::new(u32::from(request.area.width).saturating_mul(u32::from(font.width.max(1))));
 	let height = PixelHeight::new(
 		u32::from(request.area.height).saturating_mul(u32::from(font.height.max(1))),
 	);
@@ -159,7 +158,11 @@ fn draw_graph(image: &mut RgbaImage, snapshot: &UastGraphSnapshot) {
 	for node in &snapshot.nodes {
 		levels.entry(node.depth).or_default().push(node.id);
 	}
-	let box_height = 30u32.min((image.height() / level_count.max(1)).saturating_sub(6).max(14));
+	let box_height = 30u32.min(
+		(image.height() / level_count.max(1))
+			.saturating_sub(6)
+			.max(14),
+	);
 	let mut boxes = HashMap::<u32, NodeBox>::new();
 	for (depth, ids) in &levels {
 		let count = ids.len() as u32;
@@ -221,7 +224,11 @@ fn draw_graph(image: &mut RgbaImage, snapshot: &UastGraphSnapshot) {
 		};
 		stroke_rect(image, rect, border);
 		let max_chars = rect.width.saturating_sub(6) as usize / 8;
-		let label = node.label.chars().take(max_chars.max(1)).collect::<String>();
+		let label = node
+			.label
+			.chars()
+			.take(max_chars.max(1))
+			.collect::<String>();
 		draw_text(
 			image,
 			rect.x.saturating_add(4),
@@ -254,7 +261,10 @@ fn stroke_rect(image: &mut RgbaImage, rect: NodeBox, color: Rgba<u8>) {
 		return;
 	}
 	let right = rect.x.saturating_add(rect.width - 1).min(image.width() - 1);
-	let bottom = rect.y.saturating_add(rect.height - 1).min(image.height() - 1);
+	let bottom = rect
+		.y
+		.saturating_add(rect.height - 1)
+		.min(image.height() - 1);
 	for x in rect.x..=right {
 		image.put_pixel(x, rect.y.min(image.height() - 1), color);
 		image.put_pixel(x, bottom, color);
@@ -265,14 +275,7 @@ fn stroke_rect(image: &mut RgbaImage, rect: NodeBox, color: Rgba<u8>) {
 	}
 }
 
-fn draw_line(
-	image: &mut RgbaImage,
-	x0: u32,
-	y0: u32,
-	x1: u32,
-	y1: u32,
-	color: Rgba<u8>,
-) {
+fn draw_line(image: &mut RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32, color: Rgba<u8>) {
 	let (mut x0, mut y0, x1, y1) = (x0 as i32, y0 as i32, x1 as i32, y1 as i32);
 	let dx = (x1 - x0).abs();
 	let sx = if x0 < x1 { 1 } else { -1 };
@@ -280,8 +283,7 @@ fn draw_line(
 	let sy = if y0 < y1 { 1 } else { -1 };
 	let mut error = dx + dy;
 	loop {
-		if x0 >= 0 && y0 >= 0 && (x0 as u32) < image.width() && (y0 as u32) < image.height()
-		{
+		if x0 >= 0 && y0 >= 0 && (x0 as u32) < image.width() && (y0 as u32) < image.height() {
 			image.put_pixel(x0 as u32, y0 as u32, color);
 		}
 		if x0 == x1 && y0 == y1 {
@@ -328,11 +330,18 @@ fn draw_text(image: &mut RgbaImage, x: u32, y: u32, text: &str, color: Rgba<u8>)
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use libaryon::uast::{UastGraphNode, UastStorageKind};
+	use libaryon::core::{BufferId, StateId, TopologyRev};
+	use libaryon::uast::{ProviderKindId, UastGraphNode, UastGraphStamp, UastStorageKind};
 
 	#[test]
 	fn graph_renderer_draws_nodes_and_edges() {
 		let snapshot = UastGraphSnapshot {
+			stamp: UastGraphStamp {
+				source_buffer_id: BufferId::new(1),
+				root_id: 1,
+				state_id: StateId::ZERO,
+				topology_rev: TopologyRev::ZERO,
+			},
 			nodes: vec![
 				UastGraphNode {
 					id: 1,
@@ -343,6 +352,8 @@ mod tests {
 					storage: UastStorageKind::Branch,
 					start_byte: 0,
 					end_byte: 10,
+					provider_kind: ProviderKindId::new(1),
+					ancestry: vec![ProviderKindId::new(1)],
 					selected: true,
 				},
 				UastGraphNode {
@@ -354,6 +365,8 @@ mod tests {
 					storage: UastStorageKind::Branch,
 					start_byte: 0,
 					end_byte: 10,
+					provider_kind: ProviderKindId::new(2),
+					ancestry: vec![ProviderKindId::new(1), ProviderKindId::new(2)],
 					selected: false,
 				},
 			],

@@ -266,6 +266,12 @@ impl LanguageProvider for RustProvider {
 		Some(format!("{:?}", SyntaxKind::from(raw)))
 	}
 
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind.get()
+			.checked_sub(1)
+			.is_some_and(|raw| SyntaxKind::from(raw).is_trivia())
+	}
+
 	fn semantic_reactor(
 		&self,
 		full_source: Arc<String>,

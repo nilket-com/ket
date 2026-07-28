@@ -10,9 +10,9 @@ AST); `:astview` retained as a discoverable alias.
 A live split-pane microscope showing what libaryon *actually stores* for a
 document — not the parser's transient AST. Primary uses: debugging structural
 diff/graft behavior, folding, sparse residency, and answering the architectural
-question of whether the uast is rich enough to hang navigation off of. The
-first truth it will surface is that provider-specific kind vocabulary is
-currently erased at graft time.
+question of whether the uast is rich enough to hang navigation off of. Before
+this work, provider-specific kind vocabulary was erased at graft time; the
+inspector implementation adds the compact identity channel needed to expose it.
 
 ## Two layers, because storage has two regimes
 
@@ -105,13 +105,21 @@ targeting belong to a particular view. Full refresh identity:
 
 ```
 (source BufferId, source ViewId, StateId, TopologyRev,
- source cursor byte, inspector fold/mode revision, pane geometry)
+ source cursor byte, inspector fold/mode revision, pane geometry,
+ registry inspector revision)
 ```
 
-Lifecycle to decide at implementation time: behavior when the source view
-closes or switches tabs, and which cursor to follow when the same buffer is
-visible in multiple panes (likely: last-focused view of that buffer, detach
-gracefully to buffer-only mode if no view remains).
+The registry revision covers residency, metric-certainty, allocation, and
+topology changes that do not otherwise alter the source state stamp. Snapshot
+construction remains metadata-only; the revision lets a per-frame check avoid
+walking the tree when none of those inputs changed.
+
+Implemented lifecycle: while a source view is focused, the inspector follows
+that view. If it closes, another open view of the same buffer is acquired; if
+none remains, the inspector degrades to buffer-only mode with cursor following
+paused. If the source buffer itself closes, the inspector remains open with an
+explicit detached message. `f` toggles cursor following, `Space` folds the
+selected node, and `Enter` jumps to its stamped source range.
 
 Command plumbing: `CommandSpec` in `engine/input/command_registry.rs` +
 `EditorCommand` variant + `split_pane_with_new_pane_order`, per the
@@ -128,8 +136,9 @@ Command plumbing: `CommandSpec` in `engine/input/command_registry.rs` +
   already represented by the universal `SemanticKind`, and the provider
   namespace stays strictly provider-owned (a Group row renders as
   `provider_kind=0 · semantic_kind=Group · origin=synthetic`). Nonzero values
-  interpreted via the buffer's active language provider (`id -> &'static str`
-  mapping on the provider).
+  interpreted via the buffer's active language provider (`id -> display name`
+  mapping on the provider). Display strings are derived transiently for the
+  bounded snapshot; they are never retained in the registry.
 - Per-provider numbering, **not** a shared cross-language namespace — no
   universal enum pretending Rust `FN`, SQL `SELECT`, CSV `Field` are one
   taxonomy. Universal `SemanticKind` remains the cross-language classification
@@ -150,16 +159,12 @@ resident-budget eviction skips data without a physical backing span. Panel
 header exposes: reachable node count, allocated-node high-water mark
 (`next_id`, O(1)), reachable resident bytes.
 
-Reachable count/bytes must not require an unbounded walk — the inspector must
-not freeze to produce its own profiler header. In preference order:
-
-1. **Maintain incrementally, outside snapshot construction**: `apply_graft`
-   already allocates the entire grafted subtree, so it can record the exact
-   subtree node count (and distributed `virtual_data` bytes) at graft time for
-   O(1) reads; in-place mutations adjust by small deltas; hydration/eviction
-   already touch residency accounting.
-2. Otherwise, budgeted scan: exact values only when traversal completed within
-   budget, else `reachable ≥ N (scan truncated)`.
+Reachable count/bytes never require an unbounded walk. The implementation uses
+a viewport-sized budgeted scan. Exact values are shown only when traversal
+completed within that budget; cursor-scoped or truncated results are rendered
+as explicit lower bounds (`reachable >= N`, `resident >= B`). A cheap registry
+revision invalidates cached headers when allocation, residency, metrics, or
+topology changes, so unchanged frames do not repeat even that bounded scan.
 
 Metric certainty is exposed explicitly: a sparse node's newline count reports
 `unknown | partial | exact` — reading it must never trigger metric inflation.
@@ -170,7 +175,7 @@ Metric certainty is exposed explicitly: a sparse node's newline count reports
    parent/depth, universal kind, byte/newline metrics, child count,
    residency/storage state, semantic freshness. Walk-time prefix-sum offsets
    (à la `UastQuery::node_bounds`).
-2. Textual `:astview` split with raw/semantic modes, stamped row mapping,
+2. Textual `:uast` split with raw/semantic modes, stamped row mapping,
    row-select → source jump, cursor → ancestor-path follow, bounded traversal.
 3. Thread per-provider u16 kinds through green node → graft → registry.
 4. Lazily derived resident snippets; richer SQL kind coverage. CSV remains
@@ -195,10 +200,9 @@ not part of the inspector implementation.
 - Polariton transport: **bounded protocol snapshot**. Polariton never
   traverses `UastRegistry` directly — that would undermine libaryon's
   headless boundary (`docs/architecture.md`).
-
-## Remaining open at implementation time
-
-- Source-view lifecycle details (view closes / multi-pane cursor following,
-  see Substrate section).
-- Whether reachable-bytes accounting can fully piggyback on existing residency
-  atomics or needs its own counter.
+- Source-view lifecycle: follow the focused paired view; reacquire a surviving
+  view of the same buffer; degrade to buffer-only mode when only the buffer
+  survives; display a detached state once the source buffer closes.
+- Reachable diagnostics: viewport-budgeted traversal with explicit lower
+  bounds, cached behind the registry inspector revision. No new per-root
+  accounting column or unbounded scan.

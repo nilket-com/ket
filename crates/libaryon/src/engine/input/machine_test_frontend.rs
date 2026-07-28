@@ -10,6 +10,7 @@ pub(super) struct TestFrontend {
 	runtime: InputRuntime,
 	tx_cmd: mpsc::Sender<EditorCommand>,
 	pub(super) current_viewport: Option<Viewport>,
+	uast_inspector: bool,
 }
 
 impl TestFrontend {
@@ -20,6 +21,7 @@ impl TestFrontend {
 				runtime: InputRuntime::new(),
 				tx_cmd,
 				current_viewport: None,
+				uast_inspector: false,
 			},
 			rx_cmd,
 		)
@@ -35,6 +37,10 @@ impl TestFrontend {
 
 	pub(super) fn apply_mode_override(&mut self, mode: EditorMode) {
 		self.runtime.apply_mode_override(mode);
+	}
+
+	pub(super) fn set_uast_inspector_for_test(&mut self, enabled: bool) {
+		self.uast_inspector = enabled;
 	}
 
 	pub(super) fn dispatch_key(
@@ -62,7 +68,10 @@ impl TestFrontend {
 
 	fn context(&self) -> InputContext {
 		let Some(viewport) = self.current_viewport.as_ref() else {
-			return InputContext::default();
+			return InputContext {
+				is_uast_inspector: self.uast_inspector,
+				..InputContext::default()
+			};
 		};
 		let Some(pane) = viewport.pane(viewport.focused_pane_id) else {
 			return InputContext::default();
@@ -70,7 +79,7 @@ impl TestFrontend {
 		InputContext {
 			is_host_panel: false,
 			is_file_browser: pane.is_file_browser,
-			is_uast_inspector: false,
+			is_uast_inspector: self.uast_inspector,
 			cursor_available: true,
 			viewport_line_count: pane.viewport_line_count,
 			viewport_start_line: pane.viewport_start_line,

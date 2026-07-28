@@ -188,6 +188,12 @@ pub trait LanguageProvider: Send + Sync {
 	fn structural_kind_name(&self, _kind: ProviderKindId) -> Option<String> {
 		None
 	}
+
+	/// Whether this provider-local kind is storage-covering trivia that the
+	/// semantic inspector should collapse by default.
+	fn structural_kind_is_trivia(&self, _kind: ProviderKindId) -> bool {
+		false
+	}
 }
 
 // ============================================================

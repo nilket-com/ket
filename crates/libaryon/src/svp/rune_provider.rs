@@ -69,6 +69,10 @@ impl LanguageProvider for RuneProvider {
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		rune_ast::RuneSyntaxKind::name(kind)
 	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == rune_ast::RuneSyntaxKind::Trivia.provider_kind()
+	}
 }
 
 #[cfg(test)]

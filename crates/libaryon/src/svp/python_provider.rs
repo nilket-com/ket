@@ -69,6 +69,10 @@ impl LanguageProvider for PythonProvider {
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		python_ast::PySyntaxKind::name(kind)
 	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == python_ast::PySyntaxKind::Trivia.provider_kind()
+	}
 }
 
 #[cfg(test)]

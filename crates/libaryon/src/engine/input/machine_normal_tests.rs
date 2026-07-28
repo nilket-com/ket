@@ -107,6 +107,32 @@ mod tests {
 	}
 
 	#[test]
+	fn uast_inspector_keys_dispatch_jump_fold_and_follow_actions() {
+		let (mut frontend, rx_cmd) = build_frontend();
+		let mut should_quit = false;
+		frontend.set_editor_mode_for_test(EditorMode::Normal);
+		frontend.set_uast_inspector_for_test(true);
+
+		for (key, expected) in [
+			(KeyCode::Enter, "jump"),
+			(KeyCode::Char(' '), "fold"),
+			(KeyCode::Char('f'), "follow"),
+		] {
+			assert!(!frontend.dispatch_key(key, Modifiers::NONE, &mut should_quit));
+			let command = rx_cmd.try_recv().expect("UAST key should dispatch");
+			assert!(
+				matches!(
+					(expected, command),
+					("jump", EditorCommand::ActivateUastInspectorRow)
+						| ("fold", EditorCommand::ToggleUastInspectorFold)
+						| ("follow", EditorCommand::ToggleUastInspectorFollowCursor)
+				),
+				"wrong UAST command for {expected}"
+			);
+		}
+	}
+
+	#[test]
 	fn x_dispatches_delete() {
 		let (mut frontend, rx_cmd) = build_frontend();
 		let mut should_quit = false;

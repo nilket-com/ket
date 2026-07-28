@@ -130,6 +130,10 @@ impl LanguageProvider for SqlProvider {
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		crate::svp::sql_semantic::structural_kind_name(kind)
 	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == crate::svp::sql_semantic::SQL_TOKEN_KIND
+	}
 }
 
 #[cfg(test)]

@@ -150,6 +150,9 @@ pub struct UastRegistry {
 	pub(crate) scanned_bytes: AtomicU64,
 	pub(crate) pending_scan_blocks: AtomicU64,
 	pub(crate) resident_bytes: AtomicU64,
+	/// Monotonic invalidation token for metadata-only inspector snapshots.
+	/// Residency, metric knowledge, allocation, and topology changes bump it.
+	inspector_revision: AtomicU64,
 	resident_accounted_bytes: PagedArray<AtomicU64>,
 	resident_counted_hot: PagedArray<AtomicBool>,
 	resident_budget_high: AtomicU64,
@@ -208,6 +211,7 @@ impl UastRegistry {
 			scanned_bytes: AtomicU64::new(0),
 			pending_scan_blocks: AtomicU64::new(0),
 			resident_bytes: AtomicU64::new(0),
+			inspector_revision: AtomicU64::new(0),
 			resident_accounted_bytes: PagedArray::new(cap, || AtomicU64::new(0)),
 			resident_counted_hot: PagedArray::new(cap, || AtomicBool::new(false)),
 			resident_budget_high: AtomicU64::new(64 * 1024 * 1024),
@@ -260,7 +264,10 @@ impl UastRegistry {
 				Ordering::Relaxed,
 				Ordering::Relaxed,
 			) {
-				Ok(_) => return Some(start_id),
+				Ok(_) => {
+					self.bump_inspector_revision();
+					return Some(start_id);
+				}
 				Err(observed) => start_id = observed,
 			}
 		}
@@ -365,6 +372,7 @@ impl UastRegistry {
 		}
 		let reconstructible = unsafe { (*self.spans[idx].get()).is_some() };
 		self.touch_resident_lru(node, reconstructible && has_data);
+		self.bump_inspector_revision();
 	}
 
 	pub(crate) fn publish_resolved_data(
@@ -503,6 +511,7 @@ impl UastRegistry {
 			node,
 			reconstructible && self.resident_accounted_bytes[idx].load(Ordering::Acquire) > 0,
 		);
+		self.bump_inspector_revision();
 	}
 
 	pub(crate) fn publish_partial_resident_range(
@@ -551,6 +560,7 @@ impl UastRegistry {
 			self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
 		}
 		self.touch_resident_lru(node, reconstructible && new_accounted > 0);
+		self.bump_inspector_revision();
 	}
 
 	pub fn read_partial_resident_range(
@@ -592,6 +602,7 @@ impl UastRegistry {
 			}
 		}
 		self.touch_resident_lru(node, false);
+		self.bump_inspector_revision();
 	}
 
 	pub fn set_resident_budget(&self, high_water_bytes: u64, low_water_bytes: u64) {
@@ -669,6 +680,7 @@ impl UastRegistry {
 				if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
 					self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
 				}
+				self.bump_inspector_revision();
 			}
 		}
 	}
@@ -709,6 +721,14 @@ impl UastRegistry {
 				.load(Ordering::Acquire),
 			high_priority_io_max_micros: self.high_priority_io_max_micros.load(Ordering::Acquire),
 		}
+	}
+
+	fn bump_inspector_revision(&self) {
+		self.inspector_revision.fetch_add(1, Ordering::Release);
+	}
+
+	pub(crate) fn inspector_revision(&self) -> u64 {
+		self.inspector_revision.load(Ordering::Acquire)
 	}
 
 	/// Returns only state already present in memory. This is intentionally
@@ -863,6 +883,7 @@ impl UastRegistry {
 				*self.child_tails[idx].get() = None;
 			}
 		}
+		self.bump_inspector_revision();
 	}
 
 	fn apply_newline_delta(&self, target: NodeId, added_newlines: i64) {
@@ -913,6 +934,7 @@ impl UastRegistry {
 		);
 		self.pending_scan_blocks
 			.fetch_add(leaf_count, Ordering::Relaxed);
+		self.bump_inspector_revision();
 	}
 
 	/// Claims the next original ingestion extent for a scan worker. The cursor
@@ -956,14 +978,19 @@ impl UastRegistry {
 	}
 
 	pub(crate) fn cancel_metric_scan(&self, root: NodeId) {
+		let mut changed = false;
 		if let Some(scan) = self.metric_scans.lock().unwrap().remove(&root) {
+			changed = true;
 			self.pending_scan_blocks
 				.fetch_sub(scan.pending.len() as u64, Ordering::AcqRel);
 			for node in scan.pending {
 				self.bump_content_generation(node);
 			}
 		}
-		self.incomplete_metric_roots.lock().unwrap().remove(&root);
+		changed |= self.incomplete_metric_roots.lock().unwrap().remove(&root);
+		if changed {
+			self.bump_inspector_revision();
+		}
 	}
 
 	fn record_metric_inflation(&self, node: NodeId, scan_root: Option<NodeId>) -> bool {
@@ -1002,6 +1029,7 @@ impl UastRegistry {
 		if scan.pending.remove(&node) {
 			self.incomplete_metric_roots.lock().unwrap().insert(root);
 			self.pending_scan_blocks.fetch_sub(1, Ordering::Relaxed);
+			self.bump_inspector_revision();
 		}
 		if scan.pending.is_empty() {
 			scans.remove(&root);
@@ -1127,7 +1155,9 @@ impl UastRegistry {
 		self.set_terminal_newline(node, ends_with_newline);
 		self.metric_inflating[idx].store(false, Ordering::Release);
 		self.update_root_child_line_index_metric(node, u64::from(newline_count), ends_with_newline);
-		self.record_metric_inflation(node, scan_root)
+		let completed = self.record_metric_inflation(node, scan_root);
+		self.bump_inspector_revision();
+		completed
 	}
 
 	pub fn complete_metric_inflation(

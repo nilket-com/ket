@@ -399,7 +399,7 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		category: CommandCategory::Panes,
 		usage: ":uast [MODE]",
 		summary: "Inspect live UAST storage",
-		help: "Opens a bounded, live split-pane view of libaryon's stored UAST. Semantic mode collapses topology-only groups and trivia; raw mode shows physical and synthetic storage nodes. Inspection never hydrates cold bytes.",
+		help: "Opens a bounded, live split-pane view of libaryon's stored UAST. Semantic mode collapses topology-only groups and trivia; raw mode shows physical and synthetic storage nodes. The view follows the source cursor by default; press Space to fold the selected node, f to toggle cursor following, and Enter to jump to the source. Inspection never hydrates cold bytes.",
 		dispatch: DispatchKind::Exact(cmd_uast),
 	},
 	CommandSpec {

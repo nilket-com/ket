@@ -119,7 +119,7 @@ pub enum EditorMsg {
 	},
 	UastGraphNode {
 		inspector_view_id: ViewId,
-		node_id: u32,
+		selection: libaryon::uast::UastGraphSelection,
 	},
 	/// Editor-local pointer motion from the workspace mouse_area.
 	PointerMoved(iced::Point),
@@ -1121,11 +1121,11 @@ impl CodeEditor {
 			}
 			EditorMsg::UastGraphNode {
 				inspector_view_id,
-				node_id,
+				selection,
 			} => {
 				self.send(EditorCommand::ActivateUastGraphNode {
 					inspector_view_id,
-					node_id,
+					selection,
 				});
 			}
 			EditorMsg::PointerMoved(position) => {
@@ -2558,7 +2558,7 @@ impl canvas::Program<EditorMsg> for UastGraphWidget<'_> {
 		Some(
 			canvas::Action::publish(EditorMsg::UastGraphNode {
 				inspector_view_id: self.inspector_view_id,
-				node_id: node.id,
+				selection: self.snapshot.selection(node),
 			})
 			.and_capture(),
 		)

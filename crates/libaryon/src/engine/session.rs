@@ -94,29 +94,83 @@ pub(crate) struct ConfirmState {
 	pub(crate) range: CommandRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UastInspectorStamp {
+	pub(crate) source_buffer_id: BufferId,
+	pub(crate) root: NodeId,
+	pub(crate) state_id: StateId,
+	pub(crate) topology_rev: TopologyRev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UastInspectorNodeKey {
+	pub(crate) start_byte: u64,
+	pub(crate) end_byte: u64,
+	pub(crate) provider_kind: crate::uast::ProviderKindId,
+	pub(crate) ancestry: Vec<crate::uast::ProviderKindId>,
+}
+
 #[derive(Debug, Clone)]
-#[allow(
-	dead_code,
-	reason = "provider ancestry is retained for post-graft identity remapping"
-)]
 pub(crate) struct UastInspectorRow {
 	pub(crate) line: DocLine,
+	pub(crate) line_start_byte: DocByte,
 	pub(crate) node_id: NodeId,
 	pub(crate) start_byte: DocByte,
 	pub(crate) end_byte: DocByte,
 	pub(crate) provider_kind: crate::uast::ProviderKindId,
 	pub(crate) ancestry: Vec<crate::uast::ProviderKindId>,
+	pub(crate) depth: u16,
+	pub(crate) child_count: usize,
+	pub(crate) contains_cursor: bool,
+	pub(crate) stamp: UastInspectorStamp,
+}
+
+impl UastInspectorRow {
+	pub(crate) fn key(&self) -> UastInspectorNodeKey {
+		UastInspectorNodeKey {
+			start_byte: self.start_byte.get(),
+			end_byte: self.end_byte.get(),
+			provider_kind: self.provider_kind,
+			ancestry: self.ancestry.clone(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UastInspectorRefreshKey {
+	pub(crate) source_buffer_id: BufferId,
+	pub(crate) source_view_id: Option<ViewId>,
+	pub(crate) source_name: String,
+	pub(crate) root: NodeId,
+	pub(crate) state_id: StateId,
+	pub(crate) topology_rev: TopologyRev,
+	pub(crate) applied_structural_state_id: Option<StateId>,
+	pub(crate) pending_semantic: bool,
+	pub(crate) structural_issue: Option<StructuralIssue>,
+	pub(crate) active_language_id: Option<super::language::LanguageId>,
+	pub(crate) cursor_byte: Option<DocByte>,
+	pub(crate) mode: UastInspectorMode,
+	pub(crate) fold_revision: u64,
+	pub(crate) follow_cursor: bool,
+	pub(crate) pane_width: u16,
+	pub(crate) pane_lines: u32,
+	pub(crate) pane_scroll: u64,
+	pub(crate) registry_revision: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct UastInspectorPanel {
 	pub(crate) source_buffer_id: BufferId,
-	pub(crate) source_view_id: ViewId,
+	pub(crate) source_view_id: Option<ViewId>,
 	pub(crate) mode: UastInspectorMode,
 	pub(crate) source_root: Option<NodeId>,
 	pub(crate) source_state_id: Option<StateId>,
 	pub(crate) source_topology_rev: Option<TopologyRev>,
 	pub(crate) rows: Vec<UastInspectorRow>,
+	pub(crate) folded: HashSet<UastInspectorNodeKey>,
+	pub(crate) fold_revision: u64,
+	pub(crate) follow_cursor: bool,
+	pub(crate) last_refresh_key: Option<UastInspectorRefreshKey>,
 	pub(crate) graph: Option<crate::uast::UastGraphSnapshot>,
 	pub(crate) rendered_text: Vec<u8>,
 }
@@ -1385,6 +1439,18 @@ pub(crate) struct UiState {
 	pub(crate) yank_flash: Option<(DocByte, DocByte)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralIssueKind {
+	Unavailable,
+	Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StructuralIssue {
+	pub(crate) state_id: StateId,
+	pub(crate) kind: StructuralIssueKind,
+}
+
 pub(crate) struct SemanticState {
 	pub(crate) highlights: Vec<HighlightSpan>,
 	pub(crate) diagnostics: Vec<DiagnosticSpan>,
@@ -1393,6 +1459,8 @@ pub(crate) struct SemanticState {
 	/// Content state whose structural topology is currently installed.
 	/// Unlike `last_semantic_state`, this advances only after a graft succeeds.
 	pub(crate) applied_structural_state_id: Option<StateId>,
+	/// Most recent accepted semantic response that could not install topology.
+	pub(crate) structural_issue: Option<StructuralIssue>,
 	pub(crate) last_semantic_len: usize,
 	pub(crate) last_semantic_path: Option<String>,
 	pub(crate) pending_semantic_request_id: Option<RequestId>,
@@ -1408,6 +1476,7 @@ impl SemanticState {
 			inline_annotations: Vec::new(),
 			last_semantic_state: None,
 			applied_structural_state_id: None,
+			structural_issue: None,
 			last_semantic_len: usize::MAX,
 			last_semantic_path: None,
 			pending_semantic_request_id: None,
@@ -1422,6 +1491,7 @@ impl SemanticState {
 		self.inline_annotations.clear();
 		self.last_semantic_state = None;
 		self.applied_structural_state_id = None;
+		self.structural_issue = None;
 		self.last_semantic_len = usize::MAX;
 		self.last_semantic_path = None;
 		self.pending_semantic_request_id = None;

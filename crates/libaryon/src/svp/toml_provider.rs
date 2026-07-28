@@ -64,6 +64,10 @@ impl LanguageProvider for TomlProvider {
 			_ => None,
 		}
 	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		kind == TOML_TOKEN_KIND
+	}
 }
 
 #[cfg(test)]

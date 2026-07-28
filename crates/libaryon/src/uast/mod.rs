@@ -10,8 +10,8 @@ mod root_line_index;
 pub mod topology;
 
 pub use inspector::{
-	UastGraphNode, UastGraphSnapshot, UastInspectorNode, UastInspectorOptions,
-	UastInspectorSnapshot, UastMetricCertainty, UastStorageKind,
+	UastGraphNode, UastGraphSelection, UastGraphSnapshot, UastGraphStamp, UastInspectorNode,
+	UastInspectorOptions, UastInspectorSnapshot, UastMetricCertainty, UastStorageKind,
 };
 #[allow(unused_imports)]
 pub use kind::{ProviderKindId, SemanticKind};

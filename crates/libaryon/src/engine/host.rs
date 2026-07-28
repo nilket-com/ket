@@ -440,10 +440,27 @@ mod tests {
 							&& text
 								.windows(b"SOURCE_FILE".len())
 								.any(|window| window == b"SOURCE_FILE")
+							&& text
+								.windows(b"IDENT".len())
+								.any(|window| window == b"IDENT")
 					}
 			})
 		});
 		assert_eq!(viewport.panes.len(), 2);
+		let inspector_text = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title == "uast")
+			.into_iter()
+			.flat_map(|pane| pane.tokens.iter())
+			.flat_map(|token| token.text.iter().copied())
+			.collect::<Vec<_>>();
+		assert!(
+			!inspector_text
+				.windows(b"WHITESPACE".len())
+				.any(|window| window == b"WHITESPACE"),
+			"semantic mode should collapse Rust trivia without hiding syntax tokens"
+		);
 		commands
 			.send(EditorCommand::OpenUastInspector {
 				mode: Some(crate::engine::UastInspectorMode::Graph),
@@ -480,6 +497,51 @@ mod tests {
 
 		engine.shutdown().expect("engine shutdown");
 		let _ = fs::remove_file(dot_path);
+	}
+
+	#[test]
+	fn uast_inspector_detaches_cleanly_when_its_source_view_closes() {
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let commands = engine.command_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: "fn source() {}\n".to_string(),
+				language: Some("rust".to_string()),
+				virtual_path: Some("detached.rs".to_string()),
+			})
+			.expect("replace source");
+		recv_viewport_until(&viewports, "Rust source", |viewport| {
+			visible_text(viewport) == b"fn source() {}\n"
+		});
+		commands
+			.send(EditorCommand::OpenUastInspector { mode: None })
+			.expect("open UAST inspector");
+		recv_viewport_until(&viewports, "open inspector", |viewport| {
+			viewport
+				.panes
+				.iter()
+				.any(|pane| pane.tabs[pane.active_doctab_index].title == "uast")
+		});
+
+		commands
+			.send(EditorCommand::ClosePane)
+			.expect("close source pane");
+		recv_viewport_until(&viewports, "detached inspector", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				if pane.tabs[pane.active_doctab_index].title != "uast" {
+					return false;
+				}
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				text.windows(b"source buffer has closed".len())
+					.any(|window| window == b"source buffer has closed")
+			})
+		});
+		engine.shutdown().expect("engine shutdown");
 	}
 
 	#[test]
