@@ -185,9 +185,9 @@ Metric certainty is exposed explicitly: a sparse node's newline count reports
    via the diff-bridge image pattern (`baryon/src/ui/diff.rs`: snapshot →
    fingerprint → worker thread → Kitty/sixel image; scoped subtree only, never
    whole-file hairball); Polariton renders the same snapshot interactively.
-6. Go-to-definition afterward (Rust first, off the already-live
-   `ra_ap_ide::AnalysisHost` in `svp/rust_provider.rs` — `goto_definition`
-   currently unused).
+6. Rust-first go-to-definition is specified separately in
+   [`goto-definition.md`](goto-definition.md); it uses the provider's
+   `ra_ap_ide::AnalysisHost`, not UAST node identity.
 
 Stages 1–5 are implemented. Stage 6 remains a separate navigation feature,
 not part of the inspector implementation.
