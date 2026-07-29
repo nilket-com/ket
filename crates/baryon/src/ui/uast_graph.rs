@@ -35,17 +35,26 @@ impl UastGraphController {
 		let (tx_request, rx_request) = mpsc::channel::<GraphRequest>();
 		let (tx_ready, rx_ready) = mpsc::channel::<GraphResponse>();
 		thread::spawn(move || {
-			while let Ok(request) = rx_request.recv() {
-				let protocol = render_protocol(&picker, &request);
-				if tx_ready
-					.send(GraphResponse {
-						view_id: request.view_id,
-						fingerprint: request.fingerprint,
-						protocol,
-					})
-					.is_err()
-				{
-					break;
+			'worker: while let Ok(request) = rx_request.recv() {
+				// Coalesce per view: superseded requests for the same pane are
+				// dropped, while other panes' latest requests are kept.
+				let mut latest = vec![request];
+				while let Ok(next) = rx_request.try_recv() {
+					latest.retain(|queued| queued.view_id != next.view_id);
+					latest.push(next);
+				}
+				for request in latest {
+					let protocol = render_protocol(&picker, &request);
+					if tx_ready
+						.send(GraphResponse {
+							view_id: request.view_id,
+							fingerprint: request.fingerprint,
+							protocol,
+						})
+						.is_err()
+					{
+						break 'worker;
+					}
 				}
 			}
 		});
@@ -63,22 +72,37 @@ impl UastGraphController {
 			return;
 		}
 		self.requested.insert(view_id, fingerprint);
-		let _ = self.tx_request.send(GraphRequest {
-			view_id,
-			fingerprint,
-			area,
-			snapshot: snapshot.clone(),
-		});
+		if self
+			.tx_request
+			.send(GraphRequest {
+				view_id,
+				fingerprint,
+				area,
+				snapshot: snapshot.clone(),
+			})
+			.is_err()
+		{
+			self.requested.remove(&view_id);
+		}
 	}
 
 	pub fn poll(&mut self) -> bool {
 		let mut updated = false;
 		while let Ok(response) = self.rx_ready.try_recv() {
-			if self.requested.get(&response.view_id) == Some(&response.fingerprint)
-				&& let Some(protocol) = response.protocol
-			{
-				self.protocols.insert(response.view_id, protocol);
-				updated = true;
+			if self.requested.get(&response.view_id) != Some(&response.fingerprint) {
+				continue;
+			}
+			match response.protocol {
+				Some(protocol) => {
+					self.protocols.insert(response.view_id, protocol);
+					updated = true;
+				}
+				// A failed render must not stand as satisfied: forgetting the
+				// fingerprint lets a later frame retry, while responses for
+				// newer requests are left untouched by the guard above.
+				None => {
+					self.requested.remove(&response.view_id);
+				}
 			}
 		}
 		updated

@@ -263,13 +263,18 @@ impl LanguageProvider for RustProvider {
 
 	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
 		let raw = kind.get().checked_sub(1)?;
+		// `SyntaxKind::from` asserts on out-of-range values; a foreign or
+		// corrupt id must degrade to the universal name, not a panic.
+		if raw >= SyntaxKind::__LAST as u16 {
+			return None;
+		}
 		Some(format!("{:?}", SyntaxKind::from(raw)))
 	}
 
 	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
 		kind.get()
 			.checked_sub(1)
-			.is_some_and(|raw| SyntaxKind::from(raw).is_trivia())
+			.is_some_and(|raw| raw < SyntaxKind::__LAST as u16 && SyntaxKind::from(raw).is_trivia())
 	}
 
 	fn semantic_reactor(
@@ -1006,6 +1011,26 @@ mod tests {
 			DiagnosticCollectionMode::SyntaxOnly
 		);
 		assert!(state.workspaces.is_empty());
+	}
+
+	/// A provider kind id from another language (or a corrupt one) may exceed
+	/// the RA syntax-kind range; lookups must decline it, never assert.
+	#[test]
+	fn out_of_range_provider_kinds_degrade_instead_of_panicking() {
+		let provider = RustProvider::new();
+		let in_range = ProviderKindId::new(SyntaxKind::FN as u16 + 1);
+		let sentinel = ProviderKindId::new(SyntaxKind::__LAST as u16 + 1);
+		let beyond = ProviderKindId::new(u16::MAX);
+
+		assert_eq!(
+			provider.structural_kind_name(in_range).as_deref(),
+			Some("FN")
+		);
+		assert_eq!(provider.structural_kind_name(ProviderKindId::NONE), None);
+		assert_eq!(provider.structural_kind_name(sentinel), None);
+		assert_eq!(provider.structural_kind_name(beyond), None);
+		assert!(!provider.structural_kind_is_trivia(sentinel));
+		assert!(!provider.structural_kind_is_trivia(beyond));
 	}
 
 	/// A fenced ```rust block in Markdown reaches this provider under the
