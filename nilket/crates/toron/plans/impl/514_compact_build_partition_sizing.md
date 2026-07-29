@@ -155,3 +155,75 @@ and q19 from the flipped tree.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Measured outcome
+
+### Seals and the gate's own red
+
+Steps 1-4 sealed as `bc7a70fb3fcc` after the full gate battery (one guard reconciliation: the
+ADR 350 shape-naming guard caught a query-branded test comment, renamed before sealing). The
+first cohort attempt failed **at the route-distinct gate, fail-closed as designed**: the
+chain-stage profiler emits the deferred block unconditionally, so the candidate's block is
+present but zeroed rather than absent. The gate contract was corrected to require an inert block
+(every route fact zero, field-checked) and sealed as `31d714f6fe22`; all evidence below is from
+that identity, one build, every row `full_hash`, release, clean.
+
+| evidence | artifact |
+|---|---|
+| censuses, both arms | `target/tpch/adr514_{route,ladder}_census_{off,on}_31d714f6/` |
+| route-distinct gate record | `target/tpch/adr514_q21_paired_31d714f6/route_distinct_gate/` |
+| locked 10-pair cohort | `target/tpch/adr514_q21_paired_31d714f6/` |
+
+### Census, correctness, and the gate
+
+Plan fingerprints and digests are identical between arms on all 22 q-cells and 11 ladder cells —
+the switch changes no plans and no results. The only route-fact change on the board is the
+target: q21's whole-row spill drops 897,713,384 → 27,242,808 B (the surviving bytes are the
+build's own coalesced pages; the 873,395,520 B probe reservoir is gone). Strict correctness
+passed in both arms for q21 and the q19 sentinel. The route-distinct gate passed with control
+partition_count 2 and probe reservoir spill 873,395,520 B against a field-verified inert
+candidate block, identical fingerprint, digest, schema, row count, and empty join-spill scratch
+after every child.
+
+### Locked paired cohort
+
+| pair | candidate | control | control - candidate |
+|---:|---:|---:|---:|
+| 1 | 12,535.817 ms | 16,897.126 ms | 4,361.309 ms |
+| 2 | 12,468.397 ms | 16,279.206 ms | 3,810.809 ms |
+| 3 | 12,386.287 ms | 16,210.068 ms | 3,823.781 ms |
+| 4 | 12,352.807 ms | 16,157.676 ms | 3,804.870 ms |
+| 5 | 13,968.223 ms | 16,213.688 ms | 2,245.465 ms |
+| 6 | 12,351.948 ms | 16,196.384 ms | 3,844.437 ms |
+| 7 | 12,346.783 ms | 16,116.355 ms | 3,769.573 ms |
+| 8 | 12,332.303 ms | 16,540.671 ms | 4,208.369 ms |
+| 9 | 12,704.082 ms | 16,182.843 ms | 3,478.761 ms |
+| 10 | 12,825.096 ms | 16,486.239 ms | 3,661.143 ms |
+
+```text
+Hodges-Lehmann point        = 3,804.870 ms
+two-sided 95% interval      = [3,226.917, 4,026.403] ms
+fixed materiality floor     = 3,554 ms
+interval excludes zero      = true
+point reaches floor         = true (1.07x)
+activate                    = true
+```
+
+Stated plainly, not renegotiated in either direction: this is the thinnest activation of the
+511-514 arc — the interval lower bound (3,226.917 ms) sits below the floor while the predeclared
+rule conditions on the point estimate, which clears it. The causal picture is equally honest:
+the deferred envelope the flip removes was ~9.9 s, and the direct route returns ~3.8 s net — the
+direct lifecycle's own probe-side page access through the 8 MiB cache absorbs the difference,
+exactly the residual risk Phase 0 recorded. Both arms run the estimate pre-scan, so no pre-scan
+differential is credited to the flip.
+
+### Activation
+
+Per ADR 472's rule: the verdict is `activate` and no cell beyond q21 changed route facts, plans,
+or digests. This receipt flips `COMPACT_BUILD_PARTITION_SIZING_DEFAULT` to true, retargets the
+env-contract unit test, and re-runs the full seal gate plus default-arm strict correctness
+smokes for q21 and q19. q21's cell moves from ~16.3 s to ~12.4 s with spill 898 MB → 27 MB; the
+remaining envelope is the direct route's probe chain and `runtime_prep` summaries — re-rankable
+against the board. The owner-complete pricing proof, the 13.7% Phase 0 margin, and the
+threshold-edge tests stand as the durable contract for any future compact-eligible build this
+sizing reaches.

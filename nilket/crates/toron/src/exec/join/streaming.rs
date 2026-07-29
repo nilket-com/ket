@@ -29,7 +29,7 @@ const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV: &str =
 	"TORON_PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH";
 const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_DEFAULT: bool = false;
 const COMPACT_BUILD_PARTITION_SIZING_ENV: &str = "TORON_COMPACT_BUILD_PARTITION_SIZING";
-const COMPACT_BUILD_PARTITION_SIZING_DEFAULT: bool = false;
+const COMPACT_BUILD_PARTITION_SIZING_DEFAULT: bool = true;
 
 /// ADR 514: how the streamed scan-build partitioning choice prices the build.
 /// The legacy mode keeps the shared 112-byte-per-row admission estimate; the
@@ -21503,8 +21503,8 @@ mod tests {
 	fn adr514_sizing_mode_env_contract() {
 		assert_eq!(
 			build_partition_sizing_mode_from_env(None).unwrap(),
-			BuildPartitionSizingMode::LegacyRowOverhead,
-			"compiled default is legacy until the ADR 514 receipt"
+			BuildPartitionSizingMode::CompactOwnerBound,
+			"default-on since the ADR 514 receipt"
 		);
 		assert_eq!(
 			build_partition_sizing_mode_from_env(Some("1")).unwrap(),
