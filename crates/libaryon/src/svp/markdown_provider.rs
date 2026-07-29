@@ -2,10 +2,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::core::DocByte;
-use crate::engine::language::{LanguageInjection, LanguageProvider, SemanticOutput};
+use crate::engine::language::{GreenNode, LanguageInjection, LanguageProvider, SemanticOutput};
 use crate::svp::markdown_highlight::highlight_markdown;
 use crate::svp::markdown_semantic::markdown_semantic_highlights;
+use crate::svp::markdown_topology::{
+	build_markdown_topology, markdown_kind_is_trivia, markdown_kind_name,
+};
 use crate::svp::rust_highlight::HighlightSpan;
+use crate::uast::kind::ProviderKindId;
 use crate::uast::projection::{
 	MarkdownCellCodeVisibility, MarkdownCellOutputTarget, MarkdownCellPresentation,
 };
@@ -63,6 +67,18 @@ impl LanguageProvider for MarkdownProvider {
 
 	fn injections(&self, source: &str) -> Vec<LanguageInjection> {
 		fenced_code_injections(source)
+	}
+
+	fn parse_structural_topology(&self, source: &[u8]) -> Option<GreenNode> {
+		build_markdown_topology(std::str::from_utf8(source).ok()?)
+	}
+
+	fn structural_kind_name(&self, kind: ProviderKindId) -> Option<String> {
+		markdown_kind_name(kind).map(str::to_owned)
+	}
+
+	fn structural_kind_is_trivia(&self, kind: ProviderKindId) -> bool {
+		markdown_kind_is_trivia(kind)
 	}
 }
 
@@ -182,6 +198,12 @@ pub(crate) fn fenced_code_injections(source: &str) -> Vec<LanguageInjection> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::svp::markdown_topology::{
+		MARKDOWN_CODE_BLOCK_KIND, MARKDOWN_CONTENT_KIND, MARKDOWN_DOCUMENT_KIND, MARKDOWN_GAP_KIND,
+		MARKDOWN_H1_KIND, MARKDOWN_H2_KIND, MARKDOWN_H3_KIND, MARKDOWN_H4_KIND, MARKDOWN_H5_KIND,
+		MARKDOWN_H6_KIND, MARKDOWN_HEADING_LINE_KIND, MARKDOWN_HTML_KIND, MARKDOWN_LIST_ITEM_KIND,
+		MARKDOWN_PARAGRAPH_KIND, MARKDOWN_QUOTE_KIND, MARKDOWN_RULE_KIND, MARKDOWN_TABLE_KIND,
+	};
 	use crate::svp::rust_highlight::TokenCategory;
 
 	#[test]
@@ -224,6 +246,44 @@ mod tests {
 				.iter()
 				.any(|span| span.start == DocByte::new(1000))
 		);
+	}
+
+	#[test]
+	fn structural_kinds_round_trip_and_only_gap_is_trivia() {
+		let provider = MarkdownProvider;
+		let kinds = [
+			(MARKDOWN_DOCUMENT_KIND, "DOCUMENT"),
+			(MARKDOWN_H1_KIND, "H1"),
+			(MARKDOWN_H2_KIND, "H2"),
+			(MARKDOWN_H3_KIND, "H3"),
+			(MARKDOWN_H4_KIND, "H4"),
+			(MARKDOWN_H5_KIND, "H5"),
+			(MARKDOWN_H6_KIND, "H6"),
+			(MARKDOWN_HEADING_LINE_KIND, "HEADING_LINE"),
+			(MARKDOWN_PARAGRAPH_KIND, "PARAGRAPH"),
+			(MARKDOWN_CODE_BLOCK_KIND, "CODE_BLOCK"),
+			(MARKDOWN_QUOTE_KIND, "QUOTE"),
+			(MARKDOWN_LIST_ITEM_KIND, "LIST_ITEM"),
+			(MARKDOWN_RULE_KIND, "RULE"),
+			(MARKDOWN_TABLE_KIND, "TABLE"),
+			(MARKDOWN_HTML_KIND, "HTML"),
+			(MARKDOWN_GAP_KIND, "GAP"),
+			(MARKDOWN_CONTENT_KIND, "CONTENT"),
+		];
+		for (kind, name) in kinds {
+			assert_eq!(provider.structural_kind_name(kind).as_deref(), Some(name));
+			assert_eq!(
+				provider.structural_kind_is_trivia(kind),
+				kind == MARKDOWN_GAP_KIND
+			);
+		}
+		assert_eq!(provider.structural_kind_name(ProviderKindId::NONE), None);
+		assert_eq!(
+			provider.structural_kind_name(ProviderKindId::new(u16::MAX)),
+			None
+		);
+		assert!(!provider.structural_kind_is_trivia(ProviderKindId::NONE));
+		assert!(!provider.structural_kind_is_trivia(ProviderKindId::new(u16::MAX)));
 	}
 
 	#[test]

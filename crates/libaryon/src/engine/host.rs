@@ -541,6 +541,104 @@ mod tests {
 	}
 
 	#[test]
+	fn markdown_uast_cursor_follows_adr_section_and_list_item() {
+		const ADR: &str = include_str!("../../plans/adr/0001-ecs-memory-reclamation.md");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let commands = engine.command_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: ADR.to_string(),
+				language: Some("markdown".to_string()),
+				virtual_path: Some("0001-ecs-memory-reclamation.md".to_string()),
+			})
+			.expect("replace Markdown source");
+		recv_viewport_until(&viewports, "Markdown ADR source", |viewport| {
+			visible_text(viewport)
+				.windows(b"ADR 0001".len())
+				.any(|window| window == b"ADR 0001")
+		});
+
+		// Line 33 (one-based) is the first numbered item beneath `## Decision`.
+		commands
+			.send(EditorCommand::GotoLine(DocLine::new(32)))
+			.expect("move into Decision list item");
+		commands
+			.send(EditorCommand::OpenUastInspector { mode: None })
+			.expect("open Markdown UAST inspector");
+		let semantic = recv_viewport_until(&viewports, "Markdown Decision ancestry", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				if pane.tabs[pane.active_doctab_index].title != "uast" {
+					return false;
+				}
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				[
+					b"semantic: current".as_slice(),
+					b"scope: cursor".as_slice(),
+					b"DOCUMENT".as_slice(),
+					b"H2".as_slice(),
+					b"LIST_ITEM".as_slice(),
+				]
+				.into_iter()
+				.all(|needle| text.windows(needle.len()).any(|window| window == needle))
+					&& !text.windows(b"GAP".len()).any(|window| window == b"GAP")
+			})
+		});
+		assert_eq!(semantic.panes.len(), 2);
+
+		commands
+			.send(EditorCommand::GotoLine(DocLine::new(8)))
+			.expect("move into Context paragraph");
+		recv_viewport_until(&viewports, "Markdown cursor crosses into Context", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				if pane.tabs[pane.active_doctab_index].title != "uast" {
+					return false;
+				}
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				text.windows(b"PARAGRAPH".len())
+					.any(|window| window == b"PARAGRAPH")
+					&& !text
+						.windows(b"LIST_ITEM".len())
+						.any(|window| window == b"LIST_ITEM")
+			})
+		});
+
+		// Put the source cursor on the blank line immediately before Decision.
+		// Semantic mode hides that GAP; raw mode must expose the exact storage
+		// partition when the cursor scopes the inspector to it.
+		commands
+			.send(EditorCommand::GotoLine(DocLine::new(29)))
+			.expect("move onto inter-section trivia");
+		commands
+			.send(EditorCommand::OpenUastInspector {
+				mode: Some(crate::engine::UastInspectorMode::Raw),
+			})
+			.expect("switch Markdown inspector to raw mode");
+		recv_viewport_until(&viewports, "raw Markdown gap trivia", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.tabs[pane.active_doctab_index].title == "uast"
+					&& pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>()
+						.windows(b"GAP".len())
+						.any(|window| window == b"GAP")
+			})
+		});
+
+		engine.shutdown().expect("engine shutdown");
+	}
+
+	#[test]
 	fn uast_inspector_detaches_cleanly_when_its_source_view_closes() {
 		let mut engine = EngineHandle::spawn(EngineConfig::default());
 		let commands = engine.command_sender();
