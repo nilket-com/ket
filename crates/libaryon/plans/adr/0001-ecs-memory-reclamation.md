@@ -55,19 +55,23 @@ explicitly checked one, and must audit consumers of the current behavior
    (skip the semantic pass, keep the flat tree, surface a status message).
    Must land before any reclamation of stage 5's kind, so reclamation bugs
    manifest as degradation rather than crashes.
-5. **Reclaim dead pages and/or recycle ids.** These are complementary, not
-   alternatives, with separate proof obligations:
+5. **Reuse retired slots and optionally decommit dead pages.** These are
+   complementary, not alternatives, with separate proof obligations.
+   *Amended 2026-07-29: accepted ADR
+   `0002-registry-address-space-reclamation.md` decides the order (bounded,
+   non-repeating generation-checked slot reuse first; page decommit deferred
+   and conditional), its prerequisite stages, and both proofs.*
    - *Page retirement* (drop fully-retired, quarantine-cleared backing pages)
      reclaims **memory** but not address space. It only pays when allocations
      are clustered so pages become wholly dead. Proof obligation: define and
      audit late access before choosing tombstones, inert defaults, or another
      representation.
-   - *Id recycling* (candidate: 24-bit slot + 8-bit generation inside the
-     existing `NonZeroU32`, preserving the `Option<NodeId>` niche and 12-byte
-     `TreeEdges`) reclaims **address space** — `next_id` otherwise still
-     approaches the 16M ceiling. Proof obligation: a rigorous
-     wraparound/lifetime argument (256 generations is a hope, not a proof)
-     plus reset discipline for the atomic residency columns on slot reuse.
+   - *Slot reuse* uses a 24-bit slot + 8-bit non-repeating generation inside
+     the existing `NonZeroU32`, preserving the `Option<NodeId>` niche and
+     12-byte `TreeEdges`. A slot is burned rather than wrapping. It reclaims
+     **address space** — `next_id` otherwise still approaches the 16M ceiling.
+     Proof obligations include checked dereference, I/O quiescence, exact-set
+     reservations, full slot/index reset, and allocation-event accounting.
 
 ## Non-goals
 
