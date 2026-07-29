@@ -1359,6 +1359,7 @@ fn probe_primitive_key_rows<'table, K: Copy>(
 	matched_build_rows: &mut Option<Vec<u64>>,
 	selection: &mut Vec<JoinOutputRow>,
 	residual: &mut JoinMatchResidual,
+	mut profile: Option<&mut InMemoryProbeProfile>,
 ) -> Result<(), ExecutionError> {
 	let batched = build_rows::batched_probe_prefetch_enabled();
 	let window = if batched {
@@ -1372,13 +1373,29 @@ fn probe_primitive_key_rows<'table, K: Copy>(
 	while row < rows {
 		let end = (row + window).min(rows);
 		window_lookups.clear();
+		let scalar_key = (!batched).then(|| key_at(row));
 		if batched {
 			window_keys.clear();
 			window_keys.extend((row..end).map(&key_at));
+		}
+		if let Some(profile) = profile.as_deref_mut() {
+			let keys = if batched {
+				window_keys.iter().filter(|key| key.is_some()).count()
+			} else {
+				usize::from(scalar_key.flatten().is_some())
+			};
+			profile.record_lookup_window(keys);
+		}
+		let lookup_started = profile.as_ref().map(|_| Instant::now());
+		if batched {
 			lookup_window(&window_keys, &mut window_lookups);
 		} else {
-			window_lookups.push(key_at(row).and_then(&lookup_scalar));
+			window_lookups.push(scalar_key.flatten().and_then(&lookup_scalar));
 		}
+		if let (Some(profile), Some(started)) = (profile.as_deref_mut(), lookup_started) {
+			profile.record_lookup_duration(started.elapsed());
+		}
+		let match_started = profile.as_ref().map(|_| Instant::now());
 		for (offset, lookup) in window_lookups.iter().enumerate() {
 			let row = row + offset;
 			let matched = if let Some(matches) = lookup {
@@ -1397,6 +1414,9 @@ fn probe_primitive_key_rows<'table, K: Copy>(
 				append_unmatched_probe_row(kind, row, selection)?;
 			}
 		}
+		if let (Some(profile), Some(started)) = (profile.as_deref_mut(), match_started) {
+			profile.record_match_expand_duration(started.elapsed());
+		}
 		row = end;
 	}
 	Ok(())
@@ -1414,6 +1434,81 @@ pub(super) fn probe_in_memory_join_rows(
 	right_batch: &RecordBatch,
 	null_safe_keys: bool,
 ) -> Result<Vec<JoinOutputRow>, ExecutionError> {
+	probe_in_memory_join_rows_profiled(
+		kind,
+		join_key_plan,
+		build_rows,
+		left_rows,
+		right_key_arrays,
+		rows,
+		match_filter,
+		left_batch,
+		right_batch,
+		null_safe_keys,
+		None,
+	)
+}
+
+#[derive(Default)]
+pub(super) struct InMemoryProbeProfile {
+	pub(super) lookup: std::time::Duration,
+	pub(super) match_expand: std::time::Duration,
+	pub(super) lookup_windows: u64,
+	pub(super) non_null_keys: u64,
+	pub(super) supported: bool,
+	pub(super) error: Option<&'static str>,
+}
+
+impl InMemoryProbeProfile {
+	fn record_lookup_window(&mut self, non_null_keys: usize) {
+		self.supported = true;
+		let Some(lookup_windows) = self.lookup_windows.checked_add(1) else {
+			self.error = Some("suffix lookup-window count overflowed");
+			return;
+		};
+		let Ok(non_null_keys) = u64::try_from(non_null_keys) else {
+			self.error = Some("suffix non-null-key count overflowed");
+			return;
+		};
+		let Some(total_non_null_keys) = self.non_null_keys.checked_add(non_null_keys) else {
+			self.error = Some("suffix non-null-key count overflowed");
+			return;
+		};
+		self.lookup_windows = lookup_windows;
+		self.non_null_keys = total_non_null_keys;
+	}
+
+	fn record_lookup_duration(&mut self, elapsed: std::time::Duration) {
+		let Some(total) = self.lookup.checked_add(elapsed) else {
+			self.error = Some("suffix lookup duration overflowed");
+			return;
+		};
+		self.lookup = total;
+	}
+
+	fn record_match_expand_duration(&mut self, elapsed: std::time::Duration) {
+		let Some(total) = self.match_expand.checked_add(elapsed) else {
+			self.error = Some("suffix match-expand duration overflowed");
+			return;
+		};
+		self.match_expand = total;
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn probe_in_memory_join_rows_profiled(
+	kind: JoinKind,
+	join_key_plan: JoinKeyPlan,
+	build_rows: &JoinBuildRows,
+	left_rows: usize,
+	right_key_arrays: &[ArrayRef],
+	rows: usize,
+	match_filter: Option<&BoundExprProgram>,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	null_safe_keys: bool,
+	mut profile: Option<&mut InMemoryProbeProfile>,
+) -> Result<Vec<JoinOutputRow>, ExecutionError> {
 	let mut selection = Vec::new();
 	let mut matched_build_rows = build_match_bitmap(kind, left_rows);
 	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
@@ -1430,6 +1525,7 @@ pub(super) fn probe_in_memory_join_rows(
 				&mut matched_build_rows,
 				&mut selection,
 				&mut residual,
+				profile.as_deref_mut(),
 			)?;
 		}
 		JoinKeyPlan::Int64 => {
@@ -1443,9 +1539,13 @@ pub(super) fn probe_in_memory_join_rows(
 				&mut matched_build_rows,
 				&mut selection,
 				&mut residual,
+				profile.as_deref_mut(),
 			)?;
 		}
 		JoinKeyPlan::Generic => {
+			if let Some(profile) = profile.as_deref_mut() {
+				profile.supported = false;
+			}
 			for row in 0..rows {
 				let key = if null_safe_keys {
 					join_key_bytes_null_safe(right_key_arrays, row)?

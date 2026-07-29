@@ -33,6 +33,15 @@ pub(in crate::exec) struct JoinBuildRows {
 	inner: JoinBuildRowsInner,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct JoinBuildProfileShape {
+	pub(super) representation: &'static str,
+	pub(super) distinct_keys: u64,
+	pub(super) entry_capacity: u64,
+	pub(super) bucket_capacity: u64,
+	pub(super) index_accounted_bytes: u64,
+}
+
 enum JoinBuildRowsInner {
 	Hash(HashMap<JoinKey, BuildRowList, RandomState>),
 	Int32(PrimitiveBuildTable<i32>),
@@ -465,12 +474,26 @@ impl JoinBuildRows {
 		}
 	}
 
-	#[cfg(test)]
 	pub(super) fn capacity(&self) -> usize {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => rows.capacity(),
 			JoinBuildRowsInner::Int32(table) => table.capacity(),
 			JoinBuildRowsInner::Int64(table) => table.capacity(),
+		}
+	}
+
+	pub(super) fn profile_shape(&self) -> JoinBuildProfileShape {
+		let (representation, bucket_capacity) = match &self.inner {
+			JoinBuildRowsInner::Hash(rows) => ("generic_hash", rows.capacity()),
+			JoinBuildRowsInner::Int32(table) => ("int32_primitive", table.bucket_capacity()),
+			JoinBuildRowsInner::Int64(table) => ("int64_primitive", table.bucket_capacity()),
+		};
+		JoinBuildProfileShape {
+			representation,
+			distinct_keys: u64::try_from(self.len()).unwrap_or(u64::MAX),
+			entry_capacity: u64::try_from(self.capacity()).unwrap_or(u64::MAX),
+			bucket_capacity: u64::try_from(bucket_capacity).unwrap_or(u64::MAX),
+			index_accounted_bytes: self.accounted_bytes(),
 		}
 	}
 
@@ -650,12 +673,10 @@ where
 		self.entries.len()
 	}
 
-	#[cfg(test)]
 	fn capacity(&self) -> usize {
 		self.entries.capacity()
 	}
 
-	#[cfg(test)]
 	fn bucket_capacity(&self) -> usize {
 		self.buckets.len()
 	}
@@ -841,9 +862,9 @@ mod tests {
 
 	use crate::exec::join::build_rows::new_join_build_rows;
 	use crate::exec::join::{
-		JoinBuildRows, JoinKey, JoinKeyPlan, JoinOutputRow, build_in_memory_join_rows,
-		estimated_build_hash_bytes, insert_join_build_row, join_key_bytes,
-		probe_in_memory_join_rows,
+		InMemoryProbeProfile, JoinBuildRows, JoinKey, JoinKeyPlan, JoinOutputRow,
+		build_in_memory_join_rows, estimated_build_hash_bytes, insert_join_build_row,
+		join_key_bytes, probe_in_memory_join_rows, probe_in_memory_join_rows_profiled,
 	};
 	use crate::ir::JoinKind;
 
@@ -885,6 +906,176 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn adr516_primitive_probe_profile_preserves_selection_and_counts_windows() {
+		let build = int64_batch(vec![Some(7), Some(7), Some(9), Some(11)]);
+		let probe_keys: Vec<Option<i64>> = (0..(super::PROBE_BATCH_WINDOW + 5))
+			.map(|row| match row % 4 {
+				0 => None,
+				1 => Some(7),
+				2 => Some(9),
+				_ => Some(404),
+			})
+			.collect();
+		let probe = int64_batch(probe_keys.clone());
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Int64,
+			&key_arrays(&build),
+			build.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build")
+		.expect("in-memory build");
+		let expected = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			JoinKeyPlan::Int64,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+		)
+		.expect("unprofiled probe");
+		let mut profile = InMemoryProbeProfile::default();
+		let observed = probe_in_memory_join_rows_profiled(
+			JoinKind::Inner,
+			JoinKeyPlan::Int64,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+			Some(&mut profile),
+		)
+		.expect("profiled probe");
+
+		assert_eq!(observed, expected, "profiling must not alter the selection");
+		assert!(profile.supported);
+		assert_eq!(profile.lookup_windows, 2, "one full window plus a tail");
+		assert_eq!(
+			profile.non_null_keys,
+			probe_keys.iter().filter(|key| key.is_some()).count() as u64
+		);
+	}
+
+	#[test]
+	fn adr516_int32_probe_profile_preserves_selection_and_exact_counts() {
+		let build = int32_batch(vec![Some(7), Some(7), Some(9)]);
+		let probe = int32_batch(vec![Some(7), None, Some(9), Some(404)]);
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Int32,
+			&key_arrays(&build),
+			build.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build")
+		.expect("in-memory build");
+		let expected = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			JoinKeyPlan::Int32,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+		)
+		.expect("unprofiled probe");
+		let mut profile = InMemoryProbeProfile::default();
+		let observed = probe_in_memory_join_rows_profiled(
+			JoinKind::Inner,
+			JoinKeyPlan::Int32,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+			Some(&mut profile),
+		)
+		.expect("profiled probe");
+
+		assert_eq!(observed, expected, "profiling must not alter the selection");
+		assert!(profile.supported);
+		assert_eq!(profile.lookup_windows, 1);
+		assert_eq!(profile.non_null_keys, 3);
+	}
+
+	#[test]
+	fn adr516_generic_probe_declines_timing_without_changing_selection() {
+		let build = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)])),
+			vec![Arc::new(StringArray::from(vec![
+				Some("a"),
+				Some("a"),
+				Some("b"),
+			]))],
+		)
+		.expect("generic build");
+		let probe = RecordBatch::try_new(
+			build.schema(),
+			vec![Arc::new(StringArray::from(vec![
+				Some("a"),
+				None,
+				Some("z"),
+			]))],
+		)
+		.expect("generic probe");
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Generic,
+			&key_arrays(&build),
+			build.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build")
+		.expect("in-memory build");
+		let mut profile = InMemoryProbeProfile::default();
+		let observed = probe_in_memory_join_rows_profiled(
+			JoinKind::Inner,
+			JoinKeyPlan::Generic,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+			Some(&mut profile),
+		)
+		.expect("profiled generic probe");
+		let expected = probe_in_memory_join_rows(
+			JoinKind::Inner,
+			JoinKeyPlan::Generic,
+			&rows,
+			build.num_rows(),
+			&key_arrays(&probe),
+			probe.num_rows(),
+			None,
+			&build,
+			&probe,
+			false,
+		)
+		.expect("unprofiled generic probe");
+
+		assert_eq!(observed, expected);
+		assert!(!profile.supported);
+		assert_eq!(profile.lookup_windows, 0);
 	}
 
 	#[test]

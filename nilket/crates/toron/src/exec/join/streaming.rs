@@ -1587,6 +1587,122 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+#[derive(Default)]
+struct SuffixProbeCallProfile {
+	probe: InMemoryProbeProfile,
+	payload_take: std::time::Duration,
+	input_probe_rows: u64,
+	matched_references: u64,
+	emitted_rows: u64,
+	output_batches: u64,
+	output_column_values: u64,
+	output_array_bytes: u64,
+	build_shape: Option<super::build_rows::JoinBuildProfileShape>,
+	build_rows: u64,
+	build_batch_bytes: u64,
+	key_width_bytes: u64,
+	unsupported_reason: Option<&'static str>,
+}
+
+impl SuffixProbeCallProfile {
+	fn add_counter(
+		target: &mut u64,
+		value: u64,
+		error: &mut Option<&'static str>,
+		message: &'static str,
+	) {
+		let Some(total) = target.checked_add(value) else {
+			*error = Some(message);
+			return;
+		};
+		*target = total;
+	}
+
+	fn observe_in_memory_build(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		build_batch: &RecordBatch,
+		build_rows: &JoinBuildRows,
+	) {
+		let shape = build_rows.profile_shape();
+		let rows = u64::try_from(build_batch.num_rows()).unwrap_or(u64::MAX);
+		let bytes = record_batch_memory_bytes(build_batch);
+		let key_width_bytes = match key_plan {
+			JoinKeyPlan::Int32 => {
+				self.probe.supported = true;
+				4
+			}
+			JoinKeyPlan::Int64 => {
+				self.probe.supported = true;
+				8
+			}
+			JoinKeyPlan::Generic => {
+				self.unsupported_reason =
+					Some("generic suffix keys have no batch-window timing boundary");
+				0
+			}
+		};
+		if let Some(existing) = self.build_shape {
+			if existing != shape
+				|| self.build_rows != rows
+				|| self.build_batch_bytes != bytes
+				|| self.key_width_bytes != key_width_bytes
+			{
+				self.unsupported_reason = Some("suffix build shape changed within one replay call");
+			}
+		} else {
+			self.build_shape = Some(shape);
+			self.build_rows = rows;
+			self.build_batch_bytes = bytes;
+			self.key_width_bytes = key_width_bytes;
+		}
+	}
+
+	fn mark_unsupported(&mut self, reason: &'static str) {
+		self.unsupported_reason = Some(reason);
+	}
+
+	fn observation(self, replay_id: u64) -> node_attribution::SuffixProbeObservation {
+		let shape = self
+			.build_shape
+			.unwrap_or(super::build_rows::JoinBuildProfileShape {
+				representation: "unsupported",
+				distinct_keys: 0,
+				entry_capacity: 0,
+				bucket_capacity: 0,
+				index_accounted_bytes: 0,
+			});
+		node_attribution::SuffixProbeObservation {
+			replay_id,
+			supported: self.probe.supported
+				&& self.probe.error.is_none()
+				&& self.unsupported_reason.is_none(),
+			unsupported_reason: self.unsupported_reason.or(self.probe.error),
+			lookup_micros: u64::try_from(self.probe.lookup.as_micros()).unwrap_or(u64::MAX),
+			match_expand_micros: u64::try_from(self.probe.match_expand.as_micros())
+				.unwrap_or(u64::MAX),
+			payload_take_micros: u64::try_from(self.payload_take.as_micros()).unwrap_or(u64::MAX),
+			calls: 1,
+			input_probe_rows: self.input_probe_rows,
+			non_null_keys: self.probe.non_null_keys,
+			lookup_windows: self.probe.lookup_windows,
+			matched_references: self.matched_references,
+			emitted_rows: self.emitted_rows,
+			output_batches: self.output_batches,
+			output_column_values: self.output_column_values,
+			output_array_bytes: self.output_array_bytes,
+			build_representation: shape.representation,
+			build_rows: self.build_rows,
+			distinct_keys: shape.distinct_keys,
+			build_batch_bytes: self.build_batch_bytes,
+			index_accounted_bytes: shape.index_accounted_bytes,
+			entry_capacity: shape.entry_capacity,
+			bucket_capacity: shape.bucket_capacity,
+			key_width_bytes: self.key_width_bytes,
+		}
+	}
+}
+
 /// Which leaf route committed a join0 chunk drive.
 ///
 /// Returned **synchronously** by the dispatcher, because the caller needs it to commit a stage
@@ -2280,6 +2396,17 @@ fn scan_probe_base_variants(
 			parent: None,
 			replay,
 		});
+		for name in [
+			"suffix_lookup",
+			"suffix_match_expand",
+			"suffix_payload_take",
+		] {
+			required.push(RequiredStage {
+				name,
+				parent: Some("suffix_probe"),
+				replay,
+			});
+		}
 		if stage.post_filter.is_some() {
 			required.push(RequiredStage {
 				name: "suffix_filter",
@@ -12451,14 +12578,26 @@ impl Executor {
 								&telemetry,
 							)
 						});
+						let mut suffix_profile =
+							stage_handle.map(|_| SuffixProbeCallProfile::default());
 						let mut next = Vec::new();
 						for batch in batches {
 							next.extend(
-								self.probe_reoriented_inner_join_streaming(runtime, &batch)
-									.await?,
+								self.probe_reoriented_inner_join_streaming_with_profile(
+									runtime,
+									&batch,
+									suffix_profile.as_mut(),
+								)
+								.await?,
 							);
 						}
 						batches = next;
+						if let (Some(handle), Some(profile)) = (stage_handle, suffix_profile) {
+							node_attribution::record_suffix_probe_observation(
+								handle,
+								profile.observation(replay),
+							);
+						}
 						if let Some(stage) = suffix_stage {
 							node_attribution::close_stage(stage, &telemetry);
 						}
@@ -17034,6 +17173,16 @@ impl Executor {
 		runtime: &mut ReorientedInnerJoinRuntime<'_>,
 		probe_batch: &RecordBatch,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		self.probe_reoriented_inner_join_streaming_with_profile(runtime, probe_batch, None)
+			.await
+	}
+
+	async fn probe_reoriented_inner_join_streaming_with_profile(
+		&self,
+		runtime: &mut ReorientedInnerJoinRuntime<'_>,
+		probe_batch: &RecordBatch,
+		mut profile: Option<&mut SuffixProbeCallProfile>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let (output, probe_rows, output_rows) = match &mut runtime.build {
 			ReorientedInnerJoinBuild::InMemory { batch, rows } => self
 				.probe_reoriented_inner_join_in_memory(
@@ -17044,6 +17193,7 @@ impl Executor {
 					batch,
 					rows,
 					probe_batch,
+					profile.as_deref_mut(),
 				)?,
 			ReorientedInnerJoinBuild::Spilled {
 				build,
@@ -17051,6 +17201,10 @@ impl Executor {
 				build_column_count,
 				projection,
 			} => {
+				if let Some(profile) = profile.as_deref_mut() {
+					profile
+						.mark_unsupported("spilled suffix build has no primitive in-memory split");
+				}
 				if probe_batch.num_rows() == 0 {
 					(Vec::new(), 0, 0)
 				} else {
@@ -17095,6 +17249,11 @@ impl Executor {
 				loaded_resident_bytes,
 				loaded_build_attempted,
 			} => {
+				if let Some(profile) = profile.as_deref_mut() {
+					profile.mark_unsupported(
+						"partitioned suffix build has no primitive in-memory split",
+					);
+				}
 				if probe_batch.num_rows() == 0 {
 					(Vec::new(), 0, 0)
 				} else {
@@ -18135,12 +18294,26 @@ impl Executor {
 		build_batch: &RecordBatch,
 		build_rows: &JoinBuildRows,
 		probe_batch: &RecordBatch,
+		mut profile: Option<&mut SuffixProbeCallProfile>,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
+		if let Some(profile) = profile.as_deref_mut() {
+			profile.observe_in_memory_build(key_plan, build_batch, build_rows);
+			let probe_rows = u64::try_from(probe_batch.num_rows()).unwrap_or_else(|_| {
+				profile.unsupported_reason = Some("suffix input-row count overflowed");
+				0
+			});
+			SuffixProbeCallProfile::add_counter(
+				&mut profile.input_probe_rows,
+				probe_rows,
+				&mut profile.unsupported_reason,
+				"suffix input-row count overflowed",
+			);
+		}
 		if probe_batch.num_rows() == 0 {
 			return Ok((Vec::new(), 0, 0));
 		}
 		let probe_key_arrays = key_arrays(probe_batch, probe_keys)?;
-		let mut selection = probe_in_memory_join_rows(
+		let mut selection = probe_in_memory_join_rows_profiled(
 			JoinKind::Inner,
 			key_plan,
 			build_rows,
@@ -18151,10 +18324,25 @@ impl Executor {
 			build_batch,
 			probe_batch,
 			false,
+			profile.as_deref_mut().map(|profile| &mut profile.probe),
 		)?;
-		let output_rows = selection.len() as u64;
+		let output_rows = u64::try_from(selection.len()).unwrap_or_else(|_| {
+			if let Some(profile) = profile.as_deref_mut() {
+				profile.unsupported_reason = Some("suffix matched-reference count overflowed");
+			}
+			0
+		});
+		if let Some(profile) = profile.as_deref_mut() {
+			SuffixProbeCallProfile::add_counter(
+				&mut profile.matched_references,
+				output_rows,
+				&mut profile.unsupported_reason,
+				"suffix matched-reference count overflowed",
+			);
+		}
 		let mut output = Vec::new();
 		for chunk in selection.chunks_mut(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
+			let payload_started = profile.as_ref().map(|_| Instant::now());
 			let batch = materialize_reoriented_inner_selection(
 				probe_batch,
 				build_batch,
@@ -18163,6 +18351,45 @@ impl Executor {
 				self.context.task_budget.memory.get(),
 				probe_columns_first,
 			)?;
+			if let (Some(profile), Some(started)) = (profile.as_deref_mut(), payload_started) {
+				let elapsed = started.elapsed();
+				if let Some(total) = profile.payload_take.checked_add(elapsed) {
+					profile.payload_take = total;
+				} else {
+					profile.unsupported_reason = Some("suffix payload-take duration overflowed");
+				}
+				let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+				let columns = u64::try_from(batch.num_columns()).unwrap_or(u64::MAX);
+				SuffixProbeCallProfile::add_counter(
+					&mut profile.emitted_rows,
+					rows,
+					&mut profile.unsupported_reason,
+					"suffix emitted-row count overflowed",
+				);
+				SuffixProbeCallProfile::add_counter(
+					&mut profile.output_batches,
+					1,
+					&mut profile.unsupported_reason,
+					"suffix output-batch count overflowed",
+				);
+				if let Some(column_values) = rows.checked_mul(columns) {
+					SuffixProbeCallProfile::add_counter(
+						&mut profile.output_column_values,
+						column_values,
+						&mut profile.unsupported_reason,
+						"suffix output column-value count overflowed",
+					);
+				} else {
+					profile.unsupported_reason =
+						Some("suffix output column-value count overflowed");
+				}
+				SuffixProbeCallProfile::add_counter(
+					&mut profile.output_array_bytes,
+					record_batch_memory_bytes(&batch),
+					&mut profile.unsupported_reason,
+					"suffix output-array byte count overflowed",
+				);
+			}
 			if batch.num_rows() > 0 {
 				output.push(batch);
 			}
@@ -18267,6 +18494,101 @@ mod tests {
 			self.read_plain_calls
 				.load(std::sync::atomic::Ordering::SeqCst)
 		}
+	}
+
+	#[test]
+	fn adr516_suffix_profile_counts_duplicate_matches_payload_and_empty_batches_exactly() {
+		let build_schema = Arc::new(Schema::new(vec![
+			Field::new("build_key", DataType::Int64, false),
+			Field::new("build_value", DataType::Int64, false),
+		]));
+		let probe_schema = Arc::new(Schema::new(vec![
+			Field::new("probe_key", DataType::Int64, false),
+			Field::new("probe_value", DataType::Int64, false),
+		]));
+		let output_schema = concat_test_schema(&probe_schema, &build_schema);
+		let build = RecordBatch::try_new(
+			build_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 2])),
+				Arc::new(Int64Array::from(vec![10, 11, 20])),
+			],
+		)
+		.expect("build");
+		let matching_probe = RecordBatch::try_new(
+			probe_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 404])),
+				Arc::new(Int64Array::from(vec![100, 400])),
+			],
+		)
+		.expect("matching probe");
+		let empty_probe = RecordBatch::try_new(
+			probe_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![999])),
+				Arc::new(Int64Array::from(vec![900])),
+			],
+		)
+		.expect("empty-match probe");
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Int64,
+			&key_arrays(&build, &[ColumnOrdinal(0)]).expect("build keys"),
+			build.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build rows")
+		.expect("in-memory rows");
+		let executor = Executor::new(Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::new(),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		}));
+		let mut profile = SuffixProbeCallProfile::default();
+		let (output, probe_rows, output_rows) = executor
+			.probe_reoriented_inner_join_in_memory(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				&output_schema,
+				true,
+				&build,
+				&rows,
+				&matching_probe,
+				Some(&mut profile),
+			)
+			.expect("matching profile");
+		let (empty, empty_probe_rows, empty_output_rows) = executor
+			.probe_reoriented_inner_join_in_memory(
+				JoinKeyPlan::Int64,
+				&[ColumnOrdinal(0)],
+				&output_schema,
+				true,
+				&build,
+				&rows,
+				&empty_probe,
+				Some(&mut profile),
+			)
+			.expect("empty profile");
+
+		assert_eq!(record_batch_row_count(&output), 2);
+		assert_eq!((probe_rows, output_rows), (2, 2));
+		assert!(empty.is_empty());
+		assert_eq!((empty_probe_rows, empty_output_rows), (1, 0));
+		let expected_bytes = output.iter().map(record_batch_memory_bytes).sum::<u64>();
+		let observation = profile.observation(7);
+		assert!(observation.supported);
+		assert_eq!(observation.input_probe_rows, 3);
+		assert_eq!(observation.non_null_keys, 3);
+		assert_eq!(observation.lookup_windows, 2);
+		assert_eq!(observation.matched_references, 2);
+		assert_eq!(observation.emitted_rows, 2);
+		assert_eq!(observation.output_batches, 1);
+		assert_eq!(observation.output_column_values, 8);
+		assert_eq!(observation.output_array_bytes, expected_bytes);
+		assert_eq!(observation.build_representation, "int64_primitive");
+		assert_eq!(observation.build_rows, 3);
+		assert_eq!(observation.distinct_keys, 2);
+		assert_eq!(observation.key_width_bytes, 8);
 	}
 
 	#[test]

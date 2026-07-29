@@ -141,6 +141,9 @@ struct Frame {
 	/// Query-neutral diagnostics attached to this invocation while its frame is open. Kept outside
 	/// stage arithmetic: these are ownership/counter receipts, not additional timed stages.
 	diagnostics: Vec<InvocationDiagnostic>,
+	/// ADR 516: exact flow and build-shape facts for each replay-scoped suffix probe. Buffered with
+	/// the pending vocabulary so a declined scan-probe branch cannot leak observations.
+	suffix_probes: Vec<SuffixProbeProfile>,
 	/// Spill lifecycle counters gathered by the same invocation-bound observer that opens refinement
 	/// stages. One record per parent stage keeps build and probe domains distinct.
 	spill_io: Vec<SpillIoParent>,
@@ -310,6 +313,7 @@ struct Vocabulary {
 struct PendingVocabulary {
 	variants: Vec<VocabularyVariant>,
 	stages: Vec<HandlerStage>,
+	suffix_probes: Vec<SuffixProbeProfile>,
 }
 
 /// One stage inside a handler's own work, exclusive of the nested `execute_bound` children it drove.
@@ -370,6 +374,7 @@ struct AggregateInvocation {
 	vocabulary_failure: Option<&'static str>,
 	stages: Vec<HandlerStage>,
 	diagnostics: Vec<InvocationDiagnostic>,
+	suffix_probes: Vec<SuffixProbeProfile>,
 	spill_io: Vec<SpillIoParent>,
 	/// The fold's growth census, published beside the exact stages. It never enters their arithmetic.
 	growth_census: Option<serde_json::Value>,
@@ -379,6 +384,42 @@ struct AggregateInvocation {
 struct InvocationDiagnostic {
 	name: &'static str,
 	value: serde_json::Value,
+}
+
+/// One locally accumulated ADR-516 suffix-probe call. Durations are measured inside the existing
+/// primitive-key windows and output chunks, then published once here; the node ledger is never
+/// locked from the hot loop.
+#[derive(Clone, Debug)]
+pub(in crate::exec) struct SuffixProbeObservation {
+	pub replay_id: u64,
+	pub supported: bool,
+	pub unsupported_reason: Option<&'static str>,
+	pub lookup_micros: u64,
+	pub match_expand_micros: u64,
+	pub payload_take_micros: u64,
+	pub calls: u64,
+	pub input_probe_rows: u64,
+	pub non_null_keys: u64,
+	pub lookup_windows: u64,
+	pub matched_references: u64,
+	pub emitted_rows: u64,
+	pub output_batches: u64,
+	pub output_column_values: u64,
+	pub output_array_bytes: u64,
+	pub build_representation: &'static str,
+	pub build_rows: u64,
+	pub distinct_keys: u64,
+	pub build_batch_bytes: u64,
+	pub index_accounted_bytes: u64,
+	pub entry_capacity: u64,
+	pub bucket_capacity: u64,
+	pub key_width_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SuffixProbeProfile {
+	observation: SuffixProbeObservation,
+	error: Option<&'static str>,
 }
 
 #[derive(Clone, Default)]
@@ -555,6 +596,7 @@ impl NodeAccounting {
 				vocabulary_failure: frame.vocabulary_failure,
 				stages: frame.stages,
 				diagnostics: frame.diagnostics,
+				suffix_probes: frame.suffix_probes,
 				spill_io: frame.spill_io,
 				growth_census: frame.growth_census,
 			});
@@ -617,6 +659,7 @@ impl NodeAccounting {
 		frame.pending = Some(PendingVocabulary {
 			variants,
 			stages: Vec::new(),
+			suffix_probes: Vec::new(),
 		});
 		Some(frame.id)
 	}
@@ -666,6 +709,18 @@ impl NodeAccounting {
 		for stage in pending.stages {
 			Self::merge_stage(&mut frame.stages, stage);
 		}
+		for profile in pending.suffix_probes {
+			let replay_id = profile.observation.replay_id;
+			Self::merge_suffix_probe(&mut frame.suffix_probes, profile.observation);
+			if let Some(error) = profile.error
+				&& let Some(committed) = frame
+					.suffix_probes
+					.iter_mut()
+					.find(|entry| entry.observation.replay_id == replay_id)
+			{
+				committed.error = Some(error);
+			}
+		}
 	}
 
 	fn attach_growth_census(&mut self, id: u64, estimate: serde_json::Value) {
@@ -699,6 +754,94 @@ impl NodeAccounting {
 		} else {
 			diagnostics.push(InvocationDiagnostic { name, value });
 		}
+	}
+
+	fn record_suffix_probe(&mut self, id: u64, observation: SuffixProbeObservation) {
+		let Some(frame) = self.stack.iter_mut().find(|frame| frame.id == id) else {
+			self.stage_mismatches = self.stage_mismatches.saturating_add(1);
+			return;
+		};
+		let (stages, profiles) = match frame.pending.as_mut() {
+			Some(pending) => (&mut pending.stages, &mut pending.suffix_probes),
+			None => (&mut frame.stages, &mut frame.suffix_probes),
+		};
+		if observation.supported {
+			for (name, micros) in [
+				("suffix_lookup", observation.lookup_micros),
+				("suffix_match_expand", observation.match_expand_micros),
+				("suffix_payload_take", observation.payload_take_micros),
+			] {
+				Self::merge_stage(
+					stages,
+					HandlerStage {
+						name,
+						calls: observation.calls,
+						parent: Some("suffix_probe"),
+						replay: Some(observation.replay_id),
+						outcome: StageOutcome::Reconciled {
+							micros,
+							spill_bytes: 0,
+						},
+					},
+				);
+			}
+		}
+		Self::merge_suffix_probe(profiles, observation);
+	}
+
+	fn merge_suffix_probe(
+		profiles: &mut Vec<SuffixProbeProfile>,
+		incoming: SuffixProbeObservation,
+	) {
+		let Some(existing) = profiles
+			.iter_mut()
+			.find(|profile| profile.observation.replay_id == incoming.replay_id)
+		else {
+			profiles.push(SuffixProbeProfile {
+				observation: incoming,
+				error: None,
+			});
+			return;
+		};
+		if existing.error.is_some() {
+			return;
+		}
+		let current = &mut existing.observation;
+		if current.supported != incoming.supported
+			|| current.unsupported_reason != incoming.unsupported_reason
+			|| current.build_representation != incoming.build_representation
+			|| current.build_rows != incoming.build_rows
+			|| current.distinct_keys != incoming.distinct_keys
+			|| current.build_batch_bytes != incoming.build_batch_bytes
+			|| current.index_accounted_bytes != incoming.index_accounted_bytes
+			|| current.entry_capacity != incoming.entry_capacity
+			|| current.bucket_capacity != incoming.bucket_capacity
+			|| current.key_width_bytes != incoming.key_width_bytes
+		{
+			existing.error = Some("suffix probe build shape changed within one replay");
+			return;
+		}
+		macro_rules! checked_add {
+			($field:ident) => {
+				let Some(value) = current.$field.checked_add(incoming.$field) else {
+					existing.error = Some("suffix probe flow counter overflowed");
+					return;
+				};
+				current.$field = value;
+			};
+		}
+		checked_add!(lookup_micros);
+		checked_add!(match_expand_micros);
+		checked_add!(payload_take_micros);
+		checked_add!(calls);
+		checked_add!(input_probe_rows);
+		checked_add!(non_null_keys);
+		checked_add!(lookup_windows);
+		checked_add!(matched_references);
+		checked_add!(emitted_rows);
+		checked_add!(output_batches);
+		checked_add!(output_column_values);
+		checked_add!(output_array_bytes);
 	}
 
 	fn record_spill_subleaf(
@@ -1200,6 +1343,23 @@ pub(in crate::exec) fn record_invocation_diagnostic(
 		&& let Some(accounting) = slot.as_mut()
 	{
 		accounting.attach_diagnostic(handle.invocation_id, name, value);
+	}
+}
+
+/// Publish one locally accumulated primitive suffix-probe observation. The hot probe loop never
+/// locks this ledger: its window/chunk durations and counters arrive here once per enclosing suffix
+/// call, still bound to the vocabulary invocation and replay identity.
+pub(in crate::exec) fn record_suffix_probe_observation(
+	handle: &VocabularyHandle,
+	observation: SuffixProbeObservation,
+) {
+	if !enabled() {
+		return;
+	}
+	if let Ok(mut slot) = NODE_LEDGER.lock()
+		&& let Some(accounting) = slot.as_mut()
+	{
+		accounting.record_suffix_probe(handle.invocation_id, observation);
 	}
 }
 
@@ -1746,6 +1906,10 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 		};
 		refinements.push(entry);
 	}
+	let suffix_profiles_reconciled = invocation
+		.suffix_probes
+		.iter()
+		.all(|profile| profile.error.is_none() && profile.observation.supported);
 	serde_json::json!({
 		"status": "reconciled",
 		"vocabulary": vocabulary.name,
@@ -1775,7 +1939,11 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 		"arithmetic_reconciled": arithmetic_reconciled,
 		"coverage_complete": coverage_complete,
 		"refinements_reconciled": refinements_reconciled,
-		"passed": arithmetic_reconciled && coverage_complete && refinements_reconciled,
+		"suffix_probe_profiles_reconciled": suffix_profiles_reconciled,
+		"passed": arithmetic_reconciled
+			&& coverage_complete
+			&& refinements_reconciled
+			&& suffix_profiles_reconciled,
 	})
 }
 
@@ -1809,6 +1977,68 @@ fn handler_spill_of(invocation: &AggregateInvocation) -> u64 {
 		}) => exclusive_spill_bytes,
 		_ => 0,
 	}
+}
+
+fn suffix_probe_profiles_value(profiles: &[SuffixProbeProfile]) -> serde_json::Value {
+	serde_json::Value::Array(
+		profiles
+			.iter()
+			.map(|profile| {
+				let observation = &profile.observation;
+				serde_json::json!({
+					"replay_id": observation.replay_id,
+					"status": if profile.error.is_some() {
+						"counter_failed"
+					} else if observation.supported {
+						"measured"
+					} else {
+						"unsupported"
+					},
+					"error": profile.error,
+					"unsupported_reason": observation.unsupported_reason,
+					"calls": observation.calls,
+					"timing": {
+						"lookup_micros": observation.lookup_micros,
+						"match_expand_micros": observation.match_expand_micros,
+						"payload_take_micros": observation.payload_take_micros,
+					},
+					"flow": {
+						"input_probe_rows": observation.input_probe_rows,
+						"non_null_keys": observation.non_null_keys,
+						"lookup_windows": observation.lookup_windows,
+						"matched_references": observation.matched_references,
+						"emitted_rows": observation.emitted_rows,
+						"output_batches": observation.output_batches,
+						"output_column_values": observation.output_column_values,
+						"output_array_bytes": observation.output_array_bytes,
+						"multiplicity_per_input": {
+							"numerator": observation.matched_references,
+							"denominator": observation.input_probe_rows,
+						},
+						"multiplicity_per_non_null_key": {
+							"numerator": observation.matched_references,
+							"denominator": observation.non_null_keys,
+						},
+					},
+					"build": {
+						"representation": observation.build_representation,
+						"rows": observation.build_rows,
+						"distinct_keys": observation.distinct_keys,
+						"build_batch_bytes": observation.build_batch_bytes,
+						"index_accounted_bytes": observation.index_accounted_bytes,
+						"entry_capacity": observation.entry_capacity,
+						"bucket_capacity": observation.bucket_capacity,
+						"load": {
+							"numerator": observation.distinct_keys,
+							"denominator": observation.bucket_capacity,
+						},
+						"key_width_bytes": observation.key_width_bytes,
+					},
+					"passed": profile.error.is_none() && observation.supported,
+				})
+			})
+			.collect(),
+	)
 }
 
 fn spill_io_value(parents: &[SpillIoParent]) -> serde_json::Value {
@@ -1919,6 +2149,7 @@ fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
 				"exclusive_spill_bytes": invocation.exclusive_spill_bytes,
 				"bridge": bridge_value(invocation),
 				"stages": stages_value(invocation, &orphaned),
+				"suffix_probe_profiles": suffix_probe_profiles_value(&invocation.suffix_probes),
 				"spill_io": spill_io_value(&invocation.spill_io),
 				"diagnostics": invocation.diagnostics.iter().map(|entry| {
 					serde_json::json!({
@@ -2285,6 +2516,7 @@ mod tests {
 			vocabulary_failure: None,
 			stages: Vec::new(),
 			diagnostics: Vec::new(),
+			suffix_probes: Vec::new(),
 			spill_io: Vec::new(),
 			growth_census: None,
 		};
@@ -2411,6 +2643,7 @@ mod tests {
 			vocabulary_failure: None,
 			stages,
 			diagnostics: Vec::new(),
+			suffix_probes: Vec::new(),
 			spill_io: Vec::new(),
 			growth_census: None,
 		}
@@ -3183,6 +3416,178 @@ mod tests {
 			started: Instant::now(),
 			spill_before: 0,
 		}
+	}
+
+	fn suffix_observation(replay_id: u64, supported: bool) -> SuffixProbeObservation {
+		SuffixProbeObservation {
+			replay_id,
+			supported,
+			unsupported_reason: (!supported).then_some("generic keys unsupported"),
+			lookup_micros: 20,
+			match_expand_micros: 30,
+			payload_take_micros: 40,
+			calls: 1,
+			input_probe_rows: 10,
+			non_null_keys: 8,
+			lookup_windows: 1,
+			matched_references: 16,
+			emitted_rows: 16,
+			output_batches: 1,
+			output_column_values: 64,
+			output_array_bytes: 512,
+			build_representation: if supported {
+				"int64_primitive"
+			} else {
+				"generic_hash"
+			},
+			build_rows: 100,
+			distinct_keys: 80,
+			build_batch_bytes: 1_600,
+			index_accounted_bytes: 3_200,
+			entry_capacity: 100,
+			bucket_capacity: 256,
+			key_width_bytes: if supported { 8 } else { 0 },
+		}
+	}
+
+	#[test]
+	fn adr516_suffix_observations_buffer_and_merge_by_replay_identity() {
+		let mut acc = NodeAccounting::default();
+		acc.enter();
+		let id = acc
+			.predeclare(vec![variant("scan_probe_base")])
+			.expect("predeclared");
+		acc.record_suffix_probe(id, suffix_observation(2, true));
+		acc.record_suffix_probe(id, suffix_observation(1, true));
+		acc.record_suffix_probe(id, suffix_observation(2, true));
+		let pending = acc
+			.stack
+			.last()
+			.expect("frame")
+			.pending
+			.as_ref()
+			.expect("pending");
+		assert_eq!(pending.suffix_probes.len(), 2);
+		assert_eq!(pending.suffix_probes[0].observation.replay_id, 2);
+		assert_eq!(pending.suffix_probes[0].observation.calls, 2);
+		assert_eq!(pending.suffix_probes[0].observation.input_probe_rows, 20);
+		assert_eq!(pending.suffix_probes[1].observation.replay_id, 1);
+
+		acc.commit_vocabulary(id, "scan_probe_base");
+		let frame = acc.stack.last().expect("frame");
+		assert_eq!(frame.suffix_probes.len(), 2);
+		assert_eq!(frame.suffix_probes[0].observation.replay_id, 2);
+		assert_eq!(frame.suffix_probes[1].observation.replay_id, 1);
+		let profiles = suffix_probe_profiles_value(&frame.suffix_probes);
+		assert_eq!(profiles[0]["replay_id"], 2);
+		assert_eq!(profiles[0]["calls"], 2);
+		assert_eq!(
+			profiles[0]["flow"]["multiplicity_per_input"],
+			serde_json::json!({"numerator": 32, "denominator": 20})
+		);
+		assert_eq!(
+			profiles[0]["build"]["load"],
+			serde_json::json!({"numerator": 80, "denominator": 256})
+		);
+		assert!(
+			frame.pending.is_none(),
+			"commit consumes the buffered observations"
+		);
+	}
+
+	#[test]
+	fn adr516_suffix_profile_status_participates_in_the_stage_verdict() {
+		let replay = Some(7);
+		let required_stages = vec![
+			RequiredStage {
+				name: "suffix_probe",
+				parent: None,
+				replay,
+			},
+			RequiredStage {
+				name: "suffix_lookup",
+				parent: Some("suffix_probe"),
+				replay,
+			},
+			RequiredStage {
+				name: "suffix_match_expand",
+				parent: Some("suffix_probe"),
+				replay,
+			},
+			RequiredStage {
+				name: "suffix_payload_take",
+				parent: Some("suffix_probe"),
+				replay,
+			},
+		];
+		let stage = |name, parent, micros| HandlerStage {
+			name,
+			calls: 1,
+			parent,
+			replay,
+			outcome: StageOutcome::Reconciled {
+				micros,
+				spill_bytes: 0,
+			},
+		};
+		let mut invocation = invocation_with_stages(
+			100,
+			0,
+			Some(Vocabulary {
+				invocation_id: 3,
+				name: "scan_probe_base",
+				spill: SpillCounterKind::Flow,
+				required_stages: RequiredStages::Owned(required_stages),
+				residual_boundary_micros: 100,
+			}),
+			vec![
+				stage("suffix_probe", None, 100),
+				stage("suffix_lookup", Some("suffix_probe"), 20),
+				stage("suffix_match_expand", Some("suffix_probe"), 30),
+				stage("suffix_payload_take", Some("suffix_probe"), 40),
+			],
+		);
+		invocation.suffix_probes.push(SuffixProbeProfile {
+			observation: suffix_observation(7, true),
+			error: None,
+		});
+		let value = stages_value(&invocation, &[]);
+		assert_eq!(value["refinements"][0]["residual_micros"], 10);
+		assert_eq!(value["suffix_probe_profiles_reconciled"], true);
+		assert_eq!(value["passed"], true);
+
+		invocation
+			.stages
+			.iter_mut()
+			.find(|stage| stage.name == "suffix_lookup")
+			.expect("lookup refinement")
+			.outcome = StageOutcome::Reconciled {
+			micros: 80,
+			spill_bytes: 0,
+		};
+		let value = stages_value(&invocation, &[]);
+		assert_eq!(
+			value["refinements"][0]["status"],
+			"refinement_exceeds_parent_stage"
+		);
+		assert_eq!(value["suffix_probe_profiles_reconciled"], true);
+		assert_eq!(value["passed"], false);
+
+		invocation
+			.stages
+			.iter_mut()
+			.find(|stage| stage.name == "suffix_lookup")
+			.expect("lookup refinement")
+			.outcome = StageOutcome::Reconciled {
+			micros: 20,
+			spill_bytes: 0,
+		};
+		invocation.suffix_probes[0].observation.supported = false;
+		invocation.suffix_probes[0].observation.unsupported_reason =
+			Some("generic keys unsupported");
+		let value = stages_value(&invocation, &[]);
+		assert_eq!(value["suffix_probe_profiles_reconciled"], false);
+		assert_eq!(value["passed"], false);
 	}
 
 	// Acceptance 1: one observed replay must not satisfy a six-replay requirement, and the failure

@@ -4,7 +4,7 @@ const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
 const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_500;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_800;
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
@@ -776,6 +776,8 @@ pub(crate) fn adr352_exec_join_root_is_bounded_after_streaming_carve() {
 	// ADR 352: streaming orchestration carved from exec/join.rs into exec/join/streaming.rs.
 	// The post-carve join root measured 3,684 lines before fmt; 3,800 leaves import/module
 	// churn slack while failing if streaming logic drifts back into the join root.
+	// ADR 516 raises the bound to 3,825 for the primitive probe-window observer and its tests;
+	// suffix orchestration remains in streaming.rs, so the carve boundary itself is unchanged.
 	assert!(
 		lines <= EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT,
 		"exec/join root has {lines} lines; expected <= {EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT} after ADR 352 streaming carve"
