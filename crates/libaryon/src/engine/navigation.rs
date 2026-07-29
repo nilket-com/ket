@@ -89,6 +89,10 @@ impl JumpHistory {
 		self.back.back().copied()
 	}
 
+	pub(crate) fn newest_forward(&self) -> Option<JumpEntry> {
+		self.forward.last().copied()
+	}
+
 	pub(crate) fn record_back(&mut self, entry: JumpEntry) -> Vec<JumpEntry> {
 		let mut removed = self.clear_forward();
 		self.back.push_back(entry);
@@ -108,8 +112,21 @@ impl JumpHistory {
 		self.back.pop_back()
 	}
 
+	pub(crate) fn pop_forward(&mut self) -> Option<JumpEntry> {
+		self.forward.pop()
+	}
+
+	pub(crate) fn push_back_from_forward(&mut self, entry: JumpEntry) -> Vec<JumpEntry> {
+		self.back.push_back(entry);
+		self.enforce_limit()
+	}
+
 	pub(crate) fn push_forward(&mut self, entry: JumpEntry) -> Vec<JumpEntry> {
 		self.forward.push(entry);
+		self.enforce_limit()
+	}
+
+	fn enforce_limit(&mut self) -> Vec<JumpEntry> {
 		let mut removed = Vec::new();
 		while self.back.len() + self.forward.len() > JUMP_HISTORY_LIMIT {
 			if let Some(evicted) = self.back.pop_front() {

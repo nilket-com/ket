@@ -614,6 +614,7 @@ pub(super) enum NormalAction {
 	ClearPending,
 	GotoDefinition,
 	JumpBack,
+	JumpForward,
 	NextFunction,
 	AddCursor(VerticalDirection),
 }
@@ -790,6 +791,7 @@ pub(super) const fn binding_is_applicable(binding: &BindingSpec) -> bool {
 					| NormalAction::Esc
 					| NormalAction::ClearPending
 					| NormalAction::JumpBack
+					| NormalAction::JumpForward
 					| NormalAction::AddCursor(_)
 			),
 			NormalContext::FileBrowser => matches!(
@@ -973,10 +975,26 @@ pub(super) static KEYMAP: &[KeyGroup] = &[
 				KeyPattern::Char('G'),
 				NormalAction::Motion(NormalMotion::Bottom)
 			),
+		],
+	},
+	KeyGroup {
+		category: Category::Motion,
+		summary: "Jump backward / forward",
+		bindings: &[
 			n!(
 				NormalContext::Ready,
 				KeyPattern::Ctrl('o'),
 				NormalAction::JumpBack
+			),
+			n!(
+				NormalContext::Ready,
+				KeyPattern::Ctrl('i'),
+				NormalAction::JumpForward
+			),
+			n!(
+				NormalContext::Ready,
+				KeyPattern::Special(SpecialKey::Tab),
+				NormalAction::JumpForward
 			),
 		],
 	},

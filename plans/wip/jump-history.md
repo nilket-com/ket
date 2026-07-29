@@ -1,17 +1,18 @@
-# Stamped Jump-Back History (`Ctrl-o`)
+# Stamped Jump History (`Ctrl-o`, `Ctrl-i`)
 
 Status: implemented and validated 2026-07-28. Stage 6.1 of code navigation.
 
 ## Purpose and scope
 
-Add a bounded, meaning-preserving jump-back history for successful go-to-
-definition navigation. `Ctrl-o` returns to the location where `gd` or
-`:definition` was invoked, including across files.
+Add bounded, meaning-preserving backward and forward history for successful
+go-to-definition navigation. `Ctrl-o` returns to the location where `gd` or
+`:definition` was invoked, including across files; `Ctrl-i` reapplies a jump
+after moving backward.
 
 This stage records definition jumps only. It does not turn every cursor motion
-into a jump, expose a jumplist UI, or add forward navigation. The internal
-model retains a forward side so a later `Ctrl-i` can be added without changing
-ownership or invalidation rules.
+into a jump or expose a jumplist UI. `Ctrl-i` and terminal Tab share the
+forward action in normal mode; insert-mode Tab and prompt completion are
+unchanged.
 
 ## Why offsets alone are insufficient
 
@@ -73,15 +74,15 @@ range have passed all validation, immediately before the successful cursor
 move/retarget. Its byte is the stamped invocation cursor, not a cursor that may
 have moved while the asynchronous request was in flight.
 
-`Ctrl-o`:
+`Ctrl-o` and `Ctrl-i` use the same application path in opposite directions:
 
-1. Examine the newest back entry, removing stale entries.
+1. Examine the newest entry in the selected direction, removing stale entries.
 2. Resolve its tracked anchor against the retained target buffer.
 3. Prefer its original `ViewId` when that view still displays the buffer;
    otherwise use any visible view for the buffer.
 4. If the buffer is detached, retarget the currently focused text view after
    applying the dirty-departure rule.
-5. Capture the departure position into forward history, consume the back
+5. Capture the departure position on the opposite stack, consume the selected
    entry, focus/activate the target view, collapse multiple cursors, and place
    the primary cursor at the exact anchor byte.
 
@@ -92,12 +93,15 @@ retargets do not alter history.
 ## Input and tests
 
 - Add `EditorCommand::JumpBack`.
-- Bind normal-mode `Ctrl-o`; it has collapse-multicursor policy.
+- Add `EditorCommand::JumpForward`.
+- Bind normal-mode `Ctrl-o` backward and both `Ctrl-i`/terminal Tab forward;
+  both have collapse-multicursor policy.
 - The command is engine-owned and frontend-neutral.
 
 Tests cover:
 
 - same-file and cross-file definition jump-back;
+- cross-file backward → forward round trip and exhausted-forward status;
 - exact source-buffer retention across a cross-file retarget;
 - insertion/deletion rebasing, including affinity at the anchor;
 - undo/redo rebasing;
@@ -121,5 +125,5 @@ Tests cover:
 All five steps are complete. The shipped implementation keeps tracked anchors
 on text buffers, rebases them through ordinary edit/undo/redo deltas,
 invalidates them on root replacement, and retains zero-view buffers only while
-the bounded back/forward history owns them. `Ctrl-o` is frontend-neutral and
-returns to the exact retained source buffer and rebased byte.
+the bounded back/forward history owns them. `Ctrl-o` and `Ctrl-i` are
+frontend-neutral and return to exact retained buffers and rebased bytes.

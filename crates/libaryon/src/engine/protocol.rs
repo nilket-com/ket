@@ -204,6 +204,8 @@ pub enum EditorCommand {
 	GotoDefinition,
 	/// Return to the newest retained code-navigation origin.
 	JumpBack,
+	/// Reapply the newest retained forward navigation after jumping back.
+	JumpForward,
 	OpenLineBelow,
 	OpenLineAbove,
 	AppendAtLineEnd,

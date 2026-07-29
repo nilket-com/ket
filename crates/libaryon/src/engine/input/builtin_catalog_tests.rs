@@ -478,7 +478,7 @@ fn characterized_catalog_sizes_match_the_planning_inventory() {
 			.iter()
 			.map(|group| group.bindings.len())
 			.sum::<usize>(),
-		265
+		267
 	);
 	assert_eq!(
 		COMMANDS

@@ -1780,6 +1780,30 @@ fn retarget_text_view(
 	view_id: crate::core::ViewId,
 	buffer_id: crate::core::BufferId,
 ) -> Result<(), String> {
+	retarget_text_view_inner(runtime, session, view_id, buffer_id, None)
+}
+
+fn retarget_text_view_preserving_departure(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	view_id: crate::core::ViewId,
+	buffer_id: crate::core::BufferId,
+) -> Result<(), String> {
+	let departure = session
+		.layout
+		.find_view(view_id)
+		.ok_or_else(|| "Target view is unavailable".to_string())?
+		.buffer_id;
+	retarget_text_view_inner(runtime, session, view_id, buffer_id, Some(departure))
+}
+
+fn retarget_text_view_inner(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	view_id: crate::core::ViewId,
+	buffer_id: crate::core::BufferId,
+	preserve_zero_view_buffer: Option<BufferId>,
+) -> Result<(), String> {
 	let old_buffer_id = session
 		.layout
 		.find_view(view_id)
@@ -1809,7 +1833,9 @@ fn retarget_text_view(
 	if let Err(err) = apply_resolved_theme_to_tab(view, language_id, &session.persistent_settings) {
 		session.ui.status_message = Some(err);
 	}
-	if session.layout.view_count_for_buffer(old_buffer_id) == 0 {
+	if session.layout.view_count_for_buffer(old_buffer_id) == 0
+		&& Some(old_buffer_id) != preserve_zero_view_buffer
+	{
 		release_buffer(runtime, session, old_buffer_id);
 	}
 	Ok(())
@@ -1975,10 +2001,28 @@ fn record_definition_origin(
 	discard_jump_entries(runtime, session, removed, protected_buffer);
 }
 
-fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpHistoryDirection {
+	Backward,
+	Forward,
+}
+
+fn navigate_jump_history(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	direction: JumpHistoryDirection,
+) -> bool {
+	let direction_name = match direction {
+		JumpHistoryDirection::Backward => "back",
+		JumpHistoryDirection::Forward => "forward",
+	};
+	let relation_name = match direction {
+		JumpHistoryDirection::Backward => "older",
+		JumpHistoryDirection::Forward => "newer",
+	};
 	let current_view_id = focused_doctab(&session.layout, session.focused_pane_id).id;
 	let Some(current_view) = session.layout.find_view(current_view_id) else {
-		session.ui.status_message = Some("Jump back requires a text view".to_string());
+		session.ui.status_message = Some(format!("Jump {direction_name} requires a text view"));
 		return true;
 	};
 	let current_buffer_id = current_view.buffer_id;
@@ -1997,17 +2041,21 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 			))
 		})
 	else {
-		session.ui.status_message = Some("Jump back requires a text view".to_string());
+		session.ui.status_message = Some(format!("Jump {direction_name} requires a text view"));
 		return true;
 	};
 
 	let mut stale_count = 0usize;
 	let (target_entry, target_byte) = loop {
-		let Some(entry) = session.jump_history.newest_back() else {
+		let newest = match direction {
+			JumpHistoryDirection::Backward => session.jump_history.newest_back(),
+			JumpHistoryDirection::Forward => session.jump_history.newest_forward(),
+		};
+		let Some(entry) = newest else {
 			session.ui.status_message = Some(if stale_count == 0 {
-				"No older jump".to_string()
+				format!("No {relation_name} jump")
 			} else {
-				format!("No older jump ({stale_count} stale entries removed)")
+				format!("No {relation_name} jump ({stale_count} stale entries removed)")
 			});
 			return true;
 		};
@@ -2026,10 +2074,11 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 		if let Some(byte) = resolved {
 			break (entry, byte);
 		}
-		let stale = session
-			.jump_history
-			.pop_back()
-			.expect("newest jump must remain present");
+		let stale = match direction {
+			JumpHistoryDirection::Backward => session.jump_history.pop_back(),
+			JumpHistoryDirection::Forward => session.jump_history.pop_forward(),
+		}
+		.expect("newest jump must remain present");
 		discard_jump_entries(runtime, session, [stale], None);
 		stale_count = stale_count.saturating_add(1);
 	};
@@ -2050,8 +2099,9 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 			.get(current_buffer_id)
 			.is_some_and(|buffer| buffer.is_dirty())
 	{
-		session.ui.status_message =
-			Some("Jump back would hide unsaved changes; write or discard first".to_string());
+		session.ui.status_message = Some(format!(
+			"Jump {direction_name} would hide unsaved changes; write or discard first"
+		));
 		return true;
 	}
 
@@ -2073,7 +2123,12 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 
 	if visible_target.is_none()
 		&& let Err(error) =
-			retarget_text_view(runtime, session, current_view_id, target_entry.buffer_id)
+			retarget_text_view_preserving_departure(
+				runtime,
+				session,
+				current_view_id,
+				target_entry.buffer_id,
+			)
 	{
 		if let Some(document) = session
 			.buffers
@@ -2093,10 +2148,11 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 		}
 		session.focus_pane(pane_id);
 	}
-	let consumed = session
-		.jump_history
-		.pop_back()
-		.expect("applied jump must remain newest");
+	let consumed = match direction {
+		JumpHistoryDirection::Backward => session.jump_history.pop_back(),
+		JumpHistoryDirection::Forward => session.jump_history.pop_forward(),
+	}
+	.expect("applied jump must remain newest");
 	if let Some(document) = session
 		.buffers
 		.get_mut(consumed.buffer_id)
@@ -2104,15 +2160,28 @@ fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool 
 	{
 		document.navigation_anchors.remove(consumed.anchor_id);
 	}
-	let removed = session.jump_history.push_forward(departure);
+	let removed = match direction {
+		JumpHistoryDirection::Backward => session.jump_history.push_forward(departure),
+		JumpHistoryDirection::Forward => {
+			session.jump_history.push_back_from_forward(departure)
+		}
+	};
 	discard_jump_entries(runtime, session, removed, None);
 	session.ui.status_message = Some(if stale_count == 0 {
-		"Jumped back".to_string()
+		format!("Jumped {direction_name}")
 	} else {
-		format!("Jumped back ({stale_count} stale entries skipped)")
+		format!("Jumped {direction_name} ({stale_count} stale entries skipped)")
 	});
 	reset_global_transients(session);
 	true
+}
+
+fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool {
+	navigate_jump_history(runtime, session, JumpHistoryDirection::Backward)
+}
+
+fn jump_forward(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool {
+	navigate_jump_history(runtime, session, JumpHistoryDirection::Forward)
 }
 
 fn apply_navigation_resolved(
@@ -2711,6 +2780,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::MatchDelimiter
 		| EditorCommand::GotoDefinition
 		| EditorCommand::JumpBack
+		| EditorCommand::JumpForward
 		| EditorCommand::ClickCursor(_)
 		| EditorCommand::GotoLine(_)
 		| EditorCommand::MoveCursor(MoveDirection::Top | MoveDirection::Bottom)
@@ -3465,6 +3535,9 @@ fn dispatch_command(
 		}
 		EditorCommand::JumpBack => {
 			needs_render |= jump_back(runtime, session);
+		}
+		EditorCommand::JumpForward => {
+			needs_render |= jump_forward(runtime, session);
 		}
 		EditorCommand::BeginPasswordPrompt { label } => {
 			session.input.begin_password_prompt(label);
@@ -6019,6 +6092,7 @@ pub fn main(editor) {
 				.as_deref()
 				.is_some_and(|name| name.ends_with("other.rs"))
 		);
+		let target_buffer = viewport.panes[0].buffer_id;
 		assert_eq!(viewport.panes[0].cursor_abs_byte, DocByte::new(7));
 		engine
 			.commands
@@ -6029,6 +6103,22 @@ pub fn main(editor) {
 		});
 		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
 		assert_eq!(viewport.panes[0].cursor_abs_byte, target_call);
+		engine
+			.commands
+			.send(EditorCommand::JumpForward)
+			.expect("jump forward to retained target buffer");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped forward")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, target_buffer);
+		assert_eq!(viewport.panes[0].cursor_abs_byte, DocByte::new(7));
+		engine
+			.commands
+			.send(EditorCommand::JumpForward)
+			.expect("exhaust forward history");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("No newer jump")
+		});
 
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();

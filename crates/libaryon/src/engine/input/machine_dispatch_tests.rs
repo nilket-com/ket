@@ -467,6 +467,21 @@ fn ctrl_o_dispatches_jump_back() {
 }
 
 #[test]
+fn ctrl_i_and_terminal_tab_dispatch_jump_forward() {
+	for (code, modifiers) in [
+		(KeyCode::Char('i'), Modifiers::CONTROL),
+		(KeyCode::Tab, Modifiers::NONE),
+	] {
+		let (mut frontend, rx) = build_frontend();
+		with_viewport(&mut frontend);
+
+		press_with(&mut frontend, code, modifiers);
+		assert!(matches!(rx.try_recv(), Ok(EditorCommand::JumpForward)));
+		assert!(rx.try_recv().is_err());
+	}
+}
+
+#[test]
 fn visual_mode_sweep_is_characterized() {
 	for (key, expected_kind) in [
 		(KeyCode::Char('v'), VisualKind::Char),

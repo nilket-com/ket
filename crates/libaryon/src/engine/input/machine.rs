@@ -1073,6 +1073,10 @@ impl InputRuntime {
 				self.send_command(EditorCommand::JumpBack);
 				self.state = InputState::normal();
 			}
+			NormalAction::JumpForward => {
+				self.send_command(EditorCommand::JumpForward);
+				self.state = InputState::normal();
+			}
 			NormalAction::NextFunction => {
 				self.send_command(EditorCommand::NextFunction);
 				self.state = InputState::normal();
