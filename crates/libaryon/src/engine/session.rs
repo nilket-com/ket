@@ -184,6 +184,10 @@ pub(crate) struct UastOwnerAccounting {
 	pub(crate) retired_nodes: u64,
 	pub(crate) current_live_nodes: u64,
 	pub(crate) parked_nodes: u64,
+	pub(crate) payload_added_bytes: u64,
+	pub(crate) payload_removed_bytes: u64,
+	pub(crate) current_live_payload_bytes: u64,
+	pub(crate) parked_payload_bytes: u64,
 	pub(crate) root_generations: u32,
 }
 
@@ -194,6 +198,10 @@ impl UastOwnerAccounting {
 			retired_nodes: 0,
 			current_live_nodes: initial_nodes,
 			parked_nodes: 0,
+			payload_added_bytes: 0,
+			payload_removed_bytes: 0,
+			current_live_payload_bytes: 0,
+			parked_payload_bytes: 0,
 			root_generations: 1,
 		}
 	}
@@ -208,9 +216,25 @@ impl UastOwnerAccounting {
 				.expect("UAST owner live + parked overflow"),
 			"UAST owner allocation algebra diverged"
 		);
+		assert_eq!(
+			self.payload_added_bytes
+				.checked_sub(self.payload_removed_bytes)
+				.expect("UAST owner payload removal exceeds additions"),
+			self.current_live_payload_bytes
+				.checked_add(self.parked_payload_bytes)
+				.expect("UAST owner live + parked payload overflow"),
+			"UAST owner payload algebra diverged"
+		);
 	}
 
-	fn record_transaction(&mut self, allocated: u64, retired: u64) {
+	fn record_transaction(
+		&mut self,
+		allocated: u64,
+		retired: u64,
+		payload_added: u64,
+		payload_physically_removed: u64,
+		payload_orphaned: u64,
+	) {
 		let available = self
 			.current_live_nodes
 			.checked_add(allocated)
@@ -228,10 +252,44 @@ impl UastOwnerAccounting {
 			.checked_add(retired)
 			.expect("UAST owner retired counter overflow");
 		self.current_live_nodes = available - retired;
+		self.record_payload_transaction(
+			payload_added,
+			payload_physically_removed,
+			payload_orphaned,
+		);
 		self.assert_invariant();
 	}
 
-	fn record_parked_retirement(&mut self, retired: u64) {
+	pub(crate) fn record_payload_transaction(
+		&mut self,
+		added: u64,
+		physically_removed: u64,
+		orphaned: u64,
+	) {
+		let available = self
+			.current_live_payload_bytes
+			.checked_add(added)
+			.expect("UAST owner live payload addition overflow");
+		let removed = physically_removed
+			.checked_add(orphaned)
+			.expect("UAST owner payload removal transaction overflow");
+		assert!(
+			removed <= available,
+			"UAST owner payload removal exceeds its live and newly added bytes"
+		);
+		self.payload_added_bytes = self
+			.payload_added_bytes
+			.checked_add(added)
+			.expect("UAST owner payload-added counter overflow");
+		self.payload_removed_bytes = self
+			.payload_removed_bytes
+			.checked_add(removed)
+			.expect("UAST owner payload-removed counter overflow");
+		self.current_live_payload_bytes = available - removed;
+		self.assert_invariant();
+	}
+
+	fn record_parked_retirement(&mut self, retired: u64, payload_retired: u64) {
 		assert!(
 			retired <= self.parked_nodes,
 			"UAST parked retirement exceeds parked nodes"
@@ -241,6 +299,15 @@ impl UastOwnerAccounting {
 			.retired_nodes
 			.checked_add(retired)
 			.expect("UAST owner retired counter overflow");
+		assert!(
+			payload_retired <= self.parked_payload_bytes,
+			"UAST parked payload retirement exceeds parked bytes"
+		);
+		self.parked_payload_bytes -= payload_retired;
+		self.payload_removed_bytes = self
+			.payload_removed_bytes
+			.checked_add(payload_retired)
+			.expect("UAST owner payload-removed counter overflow");
 		self.assert_invariant();
 	}
 
@@ -248,17 +315,36 @@ impl UastOwnerAccounting {
 		&mut self,
 		allocated: u64,
 		ordinary_retired: u64,
+		payload_added: u64,
+		payload_physically_removed: u64,
+		ordinary_orphaned_payload: u64,
 		transition: RootTransition,
 	) {
 		assert_eq!(
 			ordinary_retired, 0,
 			"root replacement mixed ordinary retirement with a typed transition"
 		);
+		assert_eq!(
+			ordinary_orphaned_payload, 0,
+			"root replacement mixed ordinary payload retirement with a typed transition"
+		);
 		self.allocated_nodes = self
 			.allocated_nodes
 			.checked_add(allocated)
 			.expect("UAST owner allocated counter overflow");
+		self.payload_added_bytes = self
+			.payload_added_bytes
+			.checked_add(payload_added)
+			.expect("UAST owner payload-added counter overflow");
+		self.payload_removed_bytes = self
+			.payload_removed_bytes
+			.checked_add(payload_physically_removed)
+			.expect("UAST owner payload-removed counter overflow");
+		let incoming_payload = payload_added
+			.checked_sub(payload_physically_removed)
+			.expect("root replacement physically removed more payload than it added");
 		let old_live = self.current_live_nodes;
+		let old_live_payload = self.current_live_payload_bytes;
 		match transition {
 			RootTransition::Retire => {
 				self.retired_nodes = self
@@ -266,20 +352,42 @@ impl UastOwnerAccounting {
 					.checked_add(old_live)
 					.expect("UAST owner retired counter overflow");
 				self.current_live_nodes = allocated;
+				self.payload_removed_bytes = self
+					.payload_removed_bytes
+					.checked_add(old_live_payload)
+					.expect("UAST owner payload-removed counter overflow");
+				self.current_live_payload_bytes = incoming_payload;
 			}
-			RootTransition::Park { revived_live: None } => {
+			RootTransition::Park {
+				revived_live: None,
+				revived_payload: None,
+			} => {
 				self.parked_nodes = self
 					.parked_nodes
 					.checked_add(old_live)
 					.expect("UAST owner parked counter overflow");
 				self.current_live_nodes = allocated;
+				self.parked_payload_bytes = self
+					.parked_payload_bytes
+					.checked_add(old_live_payload)
+					.expect("UAST owner parked-payload counter overflow");
+				self.current_live_payload_bytes = incoming_payload;
 			}
 			RootTransition::Park {
 				revived_live: Some(revived),
+				revived_payload: Some(revived_payload),
 			} => {
 				assert_eq!(
 					allocated, 0,
 					"reviving a parked generation unexpectedly allocated nodes"
+				);
+				assert_eq!(
+					payload_added, 0,
+					"reviving a parked generation unexpectedly added authoritative payload"
+				);
+				assert_eq!(
+					payload_physically_removed, 0,
+					"reviving a parked generation unexpectedly removed authoritative payload"
 				);
 				assert!(
 					revived <= self.parked_nodes,
@@ -291,6 +399,19 @@ impl UastOwnerAccounting {
 					.and_then(|parked| parked.checked_sub(revived))
 					.expect("UAST parked transition overflow/underflow");
 				self.current_live_nodes = revived;
+				assert!(
+					revived_payload <= self.parked_payload_bytes,
+					"revived generation exceeds parked payload bytes"
+				);
+				self.parked_payload_bytes = self
+					.parked_payload_bytes
+					.checked_add(old_live_payload)
+					.and_then(|parked| parked.checked_sub(revived_payload))
+					.expect("UAST parked-payload transition overflow/underflow");
+				self.current_live_payload_bytes = revived_payload;
+			}
+			RootTransition::Park { .. } => {
+				panic!("parked node and payload revival must be both present or both absent")
 			}
 		}
 		self.root_generations = self
@@ -306,7 +427,10 @@ pub(crate) const GENERATION_PARK_CAP: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootTransition {
 	Retire,
-	Park { revived_live: Option<u64> },
+	Park {
+		revived_live: Option<u64>,
+		revived_payload: Option<u64>,
+	},
 }
 
 #[derive(Debug)]
@@ -315,6 +439,7 @@ pub(crate) struct ParkedGenerationRoot {
 	pub(crate) root: NodeId,
 	pub(crate) device_id: Option<u16>,
 	pub(crate) live_nodes: u64,
+	pub(crate) payload_bytes: u64,
 	pub(crate) file_identity: BackingIdentity,
 }
 
@@ -368,6 +493,7 @@ impl ParkedGenerationCache {
 					root: entry.root,
 					device_id: entry.device_id,
 					live_nodes: entry.live_nodes,
+					payload_bytes: entry.payload_bytes,
 					file_identity: entry.file_identity,
 				});
 			}
@@ -388,6 +514,14 @@ impl ParkedGenerationCache {
 		})
 	}
 
+	pub(crate) fn payload_bytes(&self) -> u64 {
+		self.entries.iter().fold(0u64, |total, entry| {
+			total
+				.checked_add(entry.payload_bytes)
+				.expect("parked generation payload-byte sum overflow")
+		})
+	}
+
 	#[cfg(test)]
 	pub(crate) fn entries(&self) -> &VecDeque<ParkedGenerationRoot> {
 		&self.entries
@@ -400,6 +534,7 @@ pub(crate) struct TextBuffer {
 	pub(crate) parked_generations: ParkedGenerationCache,
 	pub(crate) pending_root_transition: Option<RootTransition>,
 	pub(crate) pending_parked_retirements: u64,
+	pub(crate) pending_parked_payload_retirements: u64,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: Option<String>,
 	/// Encrypted-at-rest backing owned by libaryon. This is intentionally
@@ -449,9 +584,7 @@ impl TextBuffer {
 			},
 		);
 		chunk.append_local_child(root, leaf);
-		unsafe {
-			*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
-		}
+		registry.replace_authoritative_data(leaf, Vec::new());
 		Ok((
 			Self {
 				root_id: root,
@@ -459,6 +592,7 @@ impl TextBuffer {
 				parked_generations: ParkedGenerationCache::default(),
 				pending_root_transition: None,
 				pending_parked_retirements: 0,
+				pending_parked_payload_retirements: 0,
 				topology_rev: TopologyRev::ZERO,
 				file_path: None,
 				encrypted_backing: None,
@@ -504,6 +638,7 @@ impl TextBuffer {
 
 pub(crate) struct FileBrowserBuffer {
 	pub(crate) root_id: NodeId,
+	pub(crate) uast_accounting: UastOwnerAccounting,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: String,
 	pub(crate) state: FileBrowserState,
@@ -2255,6 +2390,7 @@ impl TestTextEditor {
 					parked_generations: ParkedGenerationCache::default(),
 					pending_root_transition: None,
 					pending_parked_retirements: 0,
+					pending_parked_payload_retirements: 0,
 					topology_rev: TopologyRev::ZERO,
 					file_path: None,
 					encrypted_backing: None,
@@ -3638,6 +3774,7 @@ impl EditorSession {
 		let accounting_before = document.uast_accounting;
 		let allocated_before = registry.allocated_node_count();
 		let retired_before = registry.retired_node_count();
+		let payload_before = registry.authoritative_payload_snapshot();
 		let state_before = document.ledger.current_state_id;
 		let topology_before = document.topology_rev;
 		let search_before = document.search_revision;
@@ -3677,17 +3814,37 @@ impl EditorSession {
 		let root_after = document.root_id;
 		let allocated_after = registry.allocated_node_count();
 		let closure_retired_after = registry.retired_node_count();
+		let payload_after = registry.authoritative_payload_snapshot();
 		let allocated_delta = allocated_after.saturating_sub(allocated_before);
 		let closure_retired_delta = closure_retired_after.saturating_sub(retired_before);
+		let payload_added_delta = payload_after
+			.added
+			.checked_sub(payload_before.added)
+			.expect("authoritative payload-added counter regressed");
+		let payload_physically_removed_delta = payload_after
+			.removed
+			.checked_sub(payload_before.removed)
+			.expect("authoritative payload-removed counter regressed");
+		let orphaned_payload_delta = payload_after
+			.orphaned_added
+			.checked_sub(payload_before.orphaned_added)
+			.expect("orphaned payload counter regressed");
 		let parked_retired_delta = std::mem::take(&mut document.pending_parked_retirements);
+		let parked_payload_retired_delta =
+			std::mem::take(&mut document.pending_parked_payload_retirements);
 		assert!(
 			parked_retired_delta <= closure_retired_delta,
 			"typed parked retirement exceeds registry retirement traffic"
 		);
 		let ordinary_retired_delta = closure_retired_delta - parked_retired_delta;
+		assert!(
+			parked_payload_retired_delta <= orphaned_payload_delta,
+			"typed parked payload retirement exceeds orphaned payload traffic"
+		);
+		let ordinary_orphaned_payload = orphaned_payload_delta - parked_payload_retired_delta;
 		document
 			.uast_accounting
-			.record_parked_retirement(parked_retired_delta);
+			.record_parked_retirement(parked_retired_delta, parked_payload_retired_delta);
 		if root_before != root_after {
 			let transition = document
 				.pending_root_transition
@@ -3695,10 +3852,14 @@ impl EditorSession {
 				.unwrap_or(RootTransition::Retire);
 			if transition == RootTransition::Retire {
 				registry.note_nodes_retired(accounting_before.current_live_nodes);
+				registry.note_orphaned_payload(accounting_before.current_live_payload_bytes);
 			}
 			document.uast_accounting.record_root_transition(
 				allocated_delta,
 				ordinary_retired_delta,
+				payload_added_delta,
+				payload_physically_removed_delta,
+				ordinary_orphaned_payload,
 				transition,
 			);
 		} else {
@@ -3708,7 +3869,13 @@ impl EditorSession {
 			);
 			document
 				.uast_accounting
-				.record_transaction(allocated_delta, ordinary_retired_delta);
+				.record_transaction(
+					allocated_delta,
+					ordinary_retired_delta,
+					payload_added_delta,
+					payload_physically_removed_delta,
+					ordinary_orphaned_payload,
+				);
 		}
 		let state_after = document.ledger.current_state_id;
 		let topology_after = document.topology_rev;
@@ -4184,7 +4351,20 @@ impl EditorSession {
 			.output_panel_leaves
 			.get(&buffer_id)
 			.ok_or_else(|| "Output panel leaf is no longer available".to_string())?;
+		let payload_before = registry.authoritative_payload_snapshot();
 		registry.replace_virtual_document_data(root, leaf, text.to_vec());
+		let payload_after = registry.authoritative_payload_snapshot();
+		document.uast_accounting.record_payload_transaction(
+			payload_after
+				.added
+				.checked_sub(payload_before.added)
+				.expect("output-panel payload-added counter regressed"),
+			payload_after
+				.removed
+				.checked_sub(payload_before.removed)
+				.expect("output-panel payload-removed counter regressed"),
+			0,
+		);
 		document.topology_rev = document.topology_rev.next();
 		document.file_path = None;
 		document.canonical_path = None;
@@ -4613,9 +4793,10 @@ mod tests {
 		ViewId,
 	};
 	use crate::ecs::UastRegistry;
+	use crate::uast::UastMutation;
 	use crate::engine::event_bus::EngineEvent;
 	use crate::engine::event_subscribers::BaselineBuilder;
-	use crate::engine::file_browser::create_file_browser_buffer;
+	use crate::engine::file_browser::{create_file_browser_buffer, initialize_file_browser};
 	use crate::engine::folding::FoldSet;
 	use crate::engine::jobs::{JobSpawnError, JobSpec};
 	use crate::engine::runtime_registry::{ActionLease, RegistrationBatch};
@@ -4678,10 +4859,29 @@ mod tests {
 		count
 	}
 
+	fn exact_reachable_authoritative_payload(
+		registry: &UastRegistry,
+		root: crate::ecs::NodeId,
+	) -> u64 {
+		let mut bytes = 0u64;
+		let mut stack = vec![root];
+		while let Some(node) = stack.pop() {
+			bytes = bytes
+				.checked_add(registry.authoritative_payload_len(node))
+				.expect("reachable authoritative payload overflow");
+			let mut child = registry.get_first_child(node);
+			while let Some(current) = child {
+				stack.push(current);
+				child = registry.get_next_sibling(current);
+			}
+		}
+		bytes
+	}
+
 	#[test]
 	fn uast_owner_accounting_preserves_its_live_node_algebra() {
 		let mut accounting = UastOwnerAccounting::new(2);
-		accounting.record_transaction(3, 1);
+		accounting.record_transaction(3, 1, 0, 0, 0);
 		assert_eq!(
 			accounting,
 			UastOwnerAccounting {
@@ -4689,18 +4889,32 @@ mod tests {
 				retired_nodes: 1,
 				current_live_nodes: 4,
 				parked_nodes: 0,
+				payload_added_bytes: 0,
+				payload_removed_bytes: 0,
+				current_live_payload_bytes: 0,
+				parked_payload_bytes: 0,
 				root_generations: 1,
 			}
 		);
 
-		accounting.record_root_transition(6, 0, RootTransition::Retire);
+		accounting.record_root_transition(6, 0, 0, 0, 0, RootTransition::Retire);
 		assert_eq!(accounting.allocated_nodes, 11);
 		assert_eq!(accounting.retired_nodes, 5);
 		assert_eq!(accounting.current_live_nodes, 6);
 		assert_eq!(accounting.parked_nodes, 0);
 		assert_eq!(accounting.root_generations, 2);
 
-		accounting.record_root_transition(3, 0, RootTransition::Park { revived_live: None });
+		accounting.record_root_transition(
+			3,
+			0,
+			0,
+			0,
+			0,
+			RootTransition::Park {
+				revived_live: None,
+				revived_payload: None,
+			},
+		);
 		assert_eq!(accounting.allocated_nodes, 14);
 		assert_eq!(accounting.current_live_nodes, 3);
 		assert_eq!(accounting.parked_nodes, 6);
@@ -4708,15 +4922,19 @@ mod tests {
 		accounting.record_root_transition(
 			0,
 			0,
+			0,
+			0,
+			0,
 			RootTransition::Park {
 				revived_live: Some(6),
+				revived_payload: Some(0),
 			},
 		);
 		assert_eq!(accounting.current_live_nodes, 6);
 		assert_eq!(accounting.parked_nodes, 3);
 		assert_eq!(accounting.root_generations, 4);
 
-		accounting.record_parked_retirement(3);
+		accounting.record_parked_retirement(3, 0);
 		assert_eq!(accounting.retired_nodes, 8);
 		assert_eq!(accounting.current_live_nodes, 6);
 		assert_eq!(accounting.parked_nodes, 0);
@@ -4724,30 +4942,90 @@ mod tests {
 	}
 
 	#[test]
-	fn uast_owner_accounting_shape_defers_payload_bytes_to_adr_stage_three() {
-		// Keep this exhaustive: ADR 0001 deliberately defers owner-attributed
-		// virtual payload until stage 3 establishes an exact ownership seam.
+	fn uast_owner_accounting_shape_excludes_hydrated_residency() {
+		// Keep this exhaustive: owner payload is authoritative-only. Hydrated
+		// residency remains a registry-global diagnostic under ADR 0001.
 		let UastOwnerAccounting {
 			allocated_nodes: _,
 			retired_nodes: _,
 			current_live_nodes: _,
 			parked_nodes: _,
+			payload_added_bytes: _,
+			payload_removed_bytes: _,
+			current_live_payload_bytes: _,
+			parked_payload_bytes: _,
 			root_generations: _,
 		} = UastOwnerAccounting::new(2);
+	}
+
+	#[test]
+	fn uast_owner_payload_accounting_preserves_live_parked_and_retired_algebra() {
+		let mut accounting = UastOwnerAccounting::new(2);
+		accounting.record_payload_transaction(10, 0, 0);
+		accounting.record_payload_transaction(0, 3, 0);
+		assert_eq!(accounting.current_live_payload_bytes, 7);
+
+		accounting.record_root_transition(
+			3,
+			0,
+			4,
+			0,
+			0,
+			RootTransition::Park {
+				revived_live: None,
+				revived_payload: None,
+			},
+		);
+		assert_eq!(accounting.current_live_payload_bytes, 4);
+		assert_eq!(accounting.parked_payload_bytes, 7);
+
+		accounting.record_root_transition(
+			0,
+			0,
+			0,
+			0,
+			0,
+			RootTransition::Park {
+				revived_live: Some(2),
+				revived_payload: Some(7),
+			},
+		);
+		assert_eq!(accounting.current_live_payload_bytes, 7);
+		assert_eq!(accounting.parked_payload_bytes, 4);
+
+		accounting.record_parked_retirement(3, 4);
+		assert_eq!(accounting.payload_added_bytes, 14);
+		assert_eq!(accounting.payload_removed_bytes, 7);
+		assert_eq!(accounting.current_live_payload_bytes, 7);
+		assert_eq!(accounting.parked_payload_bytes, 0);
+
+		accounting.record_root_transition(2, 0, 2, 0, 0, RootTransition::Retire);
+		assert_eq!(accounting.payload_added_bytes, 16);
+		assert_eq!(accounting.payload_removed_bytes, 14);
+		assert_eq!(accounting.current_live_payload_bytes, 2);
+		assert_eq!(accounting.parked_payload_bytes, 0);
+		accounting.assert_invariant();
+	}
+
+	#[test]
+	#[should_panic(expected = "payload removal exceeds")]
+	fn uast_owner_payload_accounting_rejects_underflow() {
+		let mut accounting = UastOwnerAccounting::new(2);
+		accounting.record_payload_transaction(2, 3, 0);
 	}
 
 	#[test]
 	#[should_panic(expected = "UAST owner retirement exceeds")]
 	fn uast_owner_accounting_rejects_retirement_underflow() {
 		let mut accounting = UastOwnerAccounting::new(2);
-		accounting.record_transaction(0, 3);
+		accounting.record_transaction(0, 3, 0, 0, 0);
 	}
 
 	#[test]
 	#[should_panic(expected = "parked retirement exceeds")]
 	fn uast_owner_accounting_rejects_parked_retirement_underflow() {
 		let mut accounting = UastOwnerAccounting::new(2);
-		accounting.record_parked_retirement(1);
+		accounting.record_parked_retirement(1, 0);
 	}
 
 	#[test]
@@ -4761,6 +5039,7 @@ mod tests {
 			root: crate::ecs::NodeId::from_index(generation_id as usize),
 			device_id: Some(generation_id as u16),
 			live_nodes: generation_id,
+			payload_bytes: generation_id,
 			file_identity: crate::svp::BackingIdentity {
 				length: generation_id,
 				modified_nanos: generation_id as u128,
@@ -4895,6 +5174,110 @@ mod tests {
 	}
 
 	#[test]
+	fn repeated_grafts_reconcile_live_and_orphaned_authoritative_payload() {
+		const SOURCE: &[u8] = b"fn measured() {}\n";
+		const GRAFTS: u64 = 3;
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.expect("focused pane")
+			.active_tab()
+			.id;
+		let buffer_id = session.layout.find_view(view_id).unwrap().buffer_id;
+
+		let mut chunk = registry.reserve_chunk(2).expect("physical fixture");
+		let metrics = crate::uast::SpanMetrics {
+			byte_length: SOURCE.len() as u64,
+			newlines: 1,
+		};
+		let root = chunk.spawn_node(crate::uast::SemanticKind::RelationalTable, None, metrics);
+		let leaf = chunk.spawn_node(
+			crate::uast::SemanticKind::Token,
+			Some(crate::svp::SvpPointer {
+				lba: 0,
+				byte_length: SOURCE.len() as u32,
+				device_id: 77,
+				head_trim: 0,
+			}),
+			metrics,
+		);
+		chunk.append_local_child(root, leaf);
+		{
+			let document = session
+				.buffers
+				.get_mut(buffer_id)
+				.and_then(|buffer| buffer.text_mut())
+				.expect("text buffer");
+			registry.note_nodes_retired(document.uast_accounting.current_live_nodes);
+			document.root_id = root;
+			document.uast_accounting = UastOwnerAccounting::new(2);
+		}
+		let baseline = registry.authoritative_payload_snapshot();
+		let green = crate::engine::language::GreenNode {
+			kind: crate::uast::SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
+			byte_len: SOURCE.len() as u32,
+			children: Vec::new(),
+		};
+
+		for _ in 0..GRAFTS {
+			with_text_buffer_mut(
+				&registry,
+				&mut session.buffers,
+				&mut session.layout,
+				&mut session.events,
+				view_id,
+				|editor| {
+					let retired_nodes = editor
+						.document
+						.uast_accounting
+						.current_live_nodes
+						.saturating_sub(1);
+					let retired_payload =
+						editor.document.uast_accounting.current_live_payload_bytes;
+					crate::engine::structural_graft::apply_graft(
+						&registry,
+						editor.document.root_id,
+						&green,
+						SOURCE,
+					)
+					.expect("graft is byte-identical");
+					registry.note_nodes_retired(retired_nodes);
+					registry.note_orphaned_payload(retired_payload);
+					editor.document.bump_topology_rev();
+				},
+			)
+			.expect("graft through owner boundary");
+		}
+
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			SOURCE.len() as u64
+		);
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			exact_reachable_authoritative_payload(&registry, document.root_id)
+		);
+		let payload = registry.authoritative_payload_snapshot();
+		let orphaned_delta = payload.orphaned_added - baseline.orphaned_added;
+		// Stage-3b baseline: the cold physical tree contributes no payload.
+		// The first graft becomes live; each later graft leaves one exact source
+		// copy orphaned.
+		assert_eq!(orphaned_delta, (GRAFTS - 1) * SOURCE.len() as u64);
+		assert_eq!(
+			payload.retained() - baseline.retained(),
+			document.uast_accounting.current_live_payload_bytes + orphaned_delta
+		);
+	}
+
+	#[test]
 	fn abandoned_candidate_allocations_retire_without_becoming_live() {
 		let registry = UastRegistry::new(256);
 		let mut session = test_editor_session(&registry);
@@ -4913,8 +5296,27 @@ mod tests {
 			&mut session.events,
 			view_id,
 			|_| {
-				let _candidate = registry.reserve_chunk(2).expect("candidate nodes");
+				let mut candidate = registry.reserve_chunk(2).expect("candidate nodes");
+				let root = candidate.spawn_node(
+					crate::uast::SemanticKind::RelationalTable,
+					None,
+					crate::uast::SpanMetrics {
+						byte_length: 4,
+						newlines: 0,
+					},
+				);
+				let leaf = candidate.spawn_node(
+					crate::uast::SemanticKind::Token,
+					None,
+					crate::uast::SpanMetrics {
+						byte_length: 4,
+						newlines: 0,
+					},
+				);
+				candidate.append_local_child(root, leaf);
+				registry.replace_authoritative_data(leaf, b"lost".to_vec());
 				registry.note_nodes_retired(2);
+				registry.note_orphaned_payload(4);
 			},
 		);
 
@@ -4926,6 +5328,10 @@ mod tests {
 		assert_eq!(document.uast_accounting.allocated_nodes, 4);
 		assert_eq!(document.uast_accounting.retired_nodes, 2);
 		assert_eq!(document.uast_accounting.current_live_nodes, 2);
+		assert_eq!(document.uast_accounting.payload_added_bytes, 4);
+		assert_eq!(document.uast_accounting.payload_removed_bytes, 4);
+		assert_eq!(document.uast_accounting.current_live_payload_bytes, 0);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 4);
 		assert_eq!(
 			document.uast_accounting.current_live_nodes,
 			exact_reachable_nodes(&registry, document.root_id)
@@ -5000,6 +5406,230 @@ mod tests {
 				.scroll_y,
 			0,
 			"synthetic views retain independent viewport state"
+		);
+	}
+
+	#[test]
+	fn file_browser_payload_has_an_exact_synthetic_owner() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let root_path = std::env::temp_dir().join(format!(
+			"baryon-payload-browser-{}",
+			std::process::id()
+		));
+		std::fs::create_dir_all(&root_path).expect("browser fixture directory");
+		std::fs::write(root_path.join("owned.txt"), b"x").expect("browser fixture file");
+		let (browser, leaf) =
+			create_file_browser_buffer(&registry, root_path.clone()).expect("browser buffer");
+		let root = browser.root_id;
+		let buffer_id = session.buffers.insert(BufferContent::FileBrowser(browser));
+		let view_id = ViewId::new(100);
+		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			pane_id: session.focused_pane_id,
+			pane: EditorPane::from_view(View::new_file_browser(
+				view_id,
+				buffer_id,
+				leaf,
+				&session.persistent_settings,
+				DEFAULT_VIEWPORT_WIDTH,
+				DEFAULT_VIEWPORT_LINES,
+			)),
+		});
+
+		with_file_browser_buffer_mut(
+			&mut session.buffers,
+			&mut session.layout,
+			view_id,
+			|editor| initialize_file_browser(&registry, editor, root_path.clone()),
+		)
+		.expect("browser mutation boundary")
+		.expect("browser rebuild");
+
+		let browser = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.file_browser())
+			.expect("browser buffer");
+		assert!(browser.uast_accounting.current_live_payload_bytes > 0);
+		assert_eq!(
+			browser.uast_accounting.current_live_payload_bytes,
+			exact_reachable_authoritative_payload(&registry, root)
+		);
+		assert_eq!(
+			registry.authoritative_payload_snapshot().retained(),
+			browser.uast_accounting.current_live_payload_bytes
+		);
+		let _ = std::fs::remove_dir_all(root_path);
+	}
+
+	#[test]
+	fn output_panel_replacement_updates_its_payload_owner_without_allocating_nodes() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let (buffer_id, _) = session
+			.ensure_output_panel(&registry, "payload-test")
+			.expect("output panel");
+		let allocated = registry.allocated_node_count();
+		session
+			.replace_output_panel(&registry, buffer_id, b"one\n", Vec::new())
+			.expect("first output");
+		session
+			.replace_output_panel(&registry, buffer_id, b"two\nthree\n", Vec::new())
+			.expect("replacement output");
+
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("output text buffer");
+		assert_eq!(registry.allocated_node_count(), allocated);
+		assert_eq!(document.uast_accounting.current_live_payload_bytes, 10);
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			exact_reachable_authoritative_payload(&registry, document.root_id)
+		);
+		assert_eq!(document.uast_accounting.payload_added_bytes, 10);
+		assert_eq!(document.uast_accounting.payload_removed_bytes, 0);
+	}
+
+	#[test]
+	fn owner_payload_tracks_typing_rebind_hydration_and_promotion() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.expect("focused pane")
+			.active_tab()
+			.id;
+		let buffer_id = session.layout.find_view(view_id).unwrap().buffer_id;
+		let root = session.buffers.get(buffer_id).unwrap().root_id().unwrap();
+		let leaf = registry.get_first_child(root).expect("flat document leaf");
+
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|_| {
+				registry.insert_text(leaf, 0, b"abcdef");
+			},
+		);
+		let document = session.buffers.get(buffer_id).unwrap().text().unwrap();
+		assert_eq!(document.uast_accounting.current_live_payload_bytes, 6);
+
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|_| {
+				crate::engine::document::io::rebind_document_spans_to_saved_file(
+					&registry, root, 9,
+				);
+			},
+		);
+		let after_rebind = session
+			.buffers
+			.get(buffer_id)
+			.unwrap()
+			.text()
+			.unwrap()
+			.uast_accounting;
+		assert_eq!(after_rebind.current_live_payload_bytes, 0);
+		assert_eq!(after_rebind.payload_removed_bytes, 6);
+
+		let counters_before_hydration = registry.authoritative_payload_snapshot();
+		registry.publish_hydrated_data(leaf, b"abcdef".to_vec());
+		assert_eq!(
+			registry.authoritative_payload_snapshot(),
+			counters_before_hydration
+		);
+
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|_| {
+				registry.insert_text(leaf, 6, b"!");
+			},
+		);
+		let document = session.buffers.get(buffer_id).unwrap().text().unwrap();
+		assert_eq!(document.uast_accounting.current_live_payload_bytes, 7);
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			exact_reachable_authoritative_payload(&registry, root)
+		);
+		assert_eq!(document.uast_accounting.payload_added_bytes, 13);
+		assert_eq!(document.uast_accounting.payload_removed_bytes, 6);
+	}
+
+	#[test]
+	fn synthetic_fold_materialization_reconciles_replaced_endpoint_payload() {
+		const SOURCE: &[u8] =
+			b"fn main() {\n    if true {\n        alpha();\n        beta();\n    }\n    gamma();\n}\n";
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.expect("focused pane")
+			.active_tab()
+			.id;
+		let buffer_id = session.layout.find_view(view_id).unwrap().buffer_id;
+		let root = session.buffers.get(buffer_id).unwrap().root_id().unwrap();
+		let leaf = registry.get_first_child(root).expect("flat document leaf");
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|_| {
+				registry.insert_text(leaf, 0, SOURCE);
+			},
+		);
+		let orphaned_before = registry.stats().orphaned_payload_bytes;
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|editor| {
+				let fold = crate::engine::folding::materialize_fold_boundary_at_cursor(
+					&registry,
+					root,
+					DocLine::new(2),
+					DocDisplayCol::new(8),
+				)
+				.expect("nested block fold");
+				editor.view.folds.insert(fold);
+				editor.document.bump_topology_rev();
+			},
+		);
+
+		let document = session.buffers.get(buffer_id).unwrap().text().unwrap();
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			SOURCE.len() as u64
+		);
+		assert_eq!(
+			document.uast_accounting.current_live_payload_bytes,
+			exact_reachable_authoritative_payload(&registry, root)
+		);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, root)
+		);
+		assert_eq!(
+			registry.stats().orphaned_payload_bytes - orphaned_before,
+			SOURCE.len() as u64,
+			"partial materialization replaces and retires the original flat leaf"
 		);
 	}
 

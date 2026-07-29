@@ -198,7 +198,7 @@ fn graft_recursive(
 		let start = base_offset as usize;
 		let end = (start + byte_len as usize).min(source.len());
 		if start < source.len() {
-			registry.hot_swap_virtual_data(id, source[start..end].to_vec());
+			registry.replace_authoritative_data(id, source[start..end].to_vec());
 		}
 	}
 
@@ -389,7 +389,7 @@ mod tests {
 			(*registry.edges[root.index()].get()).first_child = Some(leaf);
 			*registry.child_tails[root.index()].get() = Some(leaf);
 		}
-		registry.hot_swap_virtual_data(leaf, raw.to_vec());
+		registry.replace_authoritative_data(leaf, raw.to_vec());
 		(registry, root)
 	}
 

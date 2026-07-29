@@ -395,19 +395,17 @@ pub(crate) fn rebind_document_spans_to_saved_file(
 		registry.bump_content_generation(node);
 		let local_byte_length =
 			u32::try_from(byte_length).expect("saved physical leaf length fits SvpPointer");
-		unsafe {
-			*registry.spans[idx].get() = if byte_length == 0 {
-				None
-			} else {
-				Some(SvpPointer {
-					lba: byte_offset / 512,
-					byte_length: local_byte_length,
-					device_id,
-					head_trim: (byte_offset % 512) as u16,
-				})
-			};
-		}
-		registry.drop_resident_data(node);
+		let span = if byte_length == 0 {
+			None
+		} else {
+			Some(SvpPointer {
+				lba: byte_offset / 512,
+				byte_length: local_byte_length,
+				device_id,
+				head_trim: (byte_offset % 512) as u16,
+			})
+		};
+		registry.rebind_data_to_saved_span(node, span);
 		registry.dma_in_flight[idx].store(false, Ordering::Relaxed);
 
 		byte_offset += byte_length;
@@ -601,7 +599,7 @@ mod tests {
 			},
 		);
 		chunk.append_local_child(root, leaf);
-		registry.hot_swap_virtual_data(leaf, b"ALPHA".to_vec());
+		registry.replace_authoritative_data(leaf, b"ALPHA".to_vec());
 
 		let declined = try_save_bounded_in_place_suffix(
 			&registry,
@@ -671,7 +669,7 @@ mod tests {
 			}
 		}
 		let tail = tail.expect("tail extent");
-		registry.hot_swap_virtual_data(tail, vec![0; EXTENT_BYTES]);
+		registry.publish_hydrated_data(tail, vec![0; EXTENT_BYTES]);
 		registry.metrics_inflated[tail.index()].store(true, Ordering::Release);
 		registry.set_terminal_newline(tail, false);
 		let (cursor_node, cursor_offset) = registry.insert_text(tail, EXTENT_BYTES as u32, b"TEST");
@@ -750,7 +748,7 @@ mod tests {
 				tail = Some(leaf);
 			}
 		}
-		registry.hot_swap_virtual_data(tail.expect("tail extent"), vec![0; EXTENT_BYTES]);
+		registry.publish_hydrated_data(tail.expect("tail extent"), vec![0; EXTENT_BYTES]);
 
 		let declined = try_save_bounded_in_place_suffix(
 			&registry,
@@ -806,8 +804,8 @@ mod tests {
 		let first = registry.get_first_child(root).expect("first leaf");
 		let middle = registry.get_next_sibling(first).expect("middle leaf");
 		let last = registry.get_next_sibling(middle).expect("last leaf");
-		registry.hot_swap_virtual_data(first, b"alpha".to_vec());
-		registry.hot_swap_virtual_data(last, b"gamma".to_vec());
+		registry.publish_hydrated_data(first, b"alpha".to_vec());
+		registry.publish_hydrated_data(last, b"gamma".to_vec());
 		let registry = Arc::new(registry);
 		let (started_tx, started_rx) = mpsc::channel();
 		let (release_tx, release_rx) = mpsc::channel();
@@ -829,7 +827,7 @@ mod tests {
 		let (published_tx, published_rx) = mpsc::channel();
 		let publish_registry = registry.clone();
 		let publish = std::thread::spawn(move || {
-			publish_registry.hot_swap_virtual_data(first, b"XXXXX".to_vec());
+			publish_registry.publish_hydrated_data(first, b"XXXXX".to_vec());
 			let _ = published_tx.send(());
 		});
 		assert!(

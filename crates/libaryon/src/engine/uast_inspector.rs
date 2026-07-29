@@ -850,7 +850,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={}\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} authoritative-payload={} B orphaned-payload={} B reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -865,6 +865,8 @@ fn render_snapshot(
 		reachable,
 		snapshot.allocated_nodes,
 		snapshot.retired_nodes,
+		snapshot.authoritative_payload_bytes,
+		snapshot.orphaned_payload_bytes,
 		reachable_resident,
 		snapshot.total_bytes,
 		pane_width,
@@ -876,6 +878,10 @@ fn render_snapshot(
 		identity.owner_accounting.retired_nodes,
 		identity.owner_accounting.allocated_nodes,
 		identity.owner_accounting.root_generations,
+		identity.owner_accounting.current_live_payload_bytes,
+		identity.owner_accounting.parked_payload_bytes,
+		identity.owner_accounting.payload_removed_bytes,
+		identity.owner_accounting.payload_added_bytes,
 	);
 	let mut highlights = vec![HighlightSpan::new(
 		DocByte::ZERO,
@@ -1435,6 +1441,8 @@ mod tests {
 			total_bytes: 20,
 			allocated_nodes: 4,
 			retired_nodes: 7,
+			authoritative_payload_bytes: 20,
+			orphaned_payload_bytes: 10,
 			reachable_visited: 4,
 			reachable_complete: true,
 			reachable_resident_bytes: 0,
@@ -1507,6 +1515,10 @@ mod tests {
 				retired_nodes: 7,
 				current_live_nodes: 4,
 				parked_nodes: 0,
+				payload_added_bytes: 20,
+				payload_removed_bytes: 10,
+				current_live_payload_bytes: 10,
+				parked_payload_bytes: 0,
 				root_generations: 2,
 			},
 		};
@@ -1540,8 +1552,9 @@ mod tests {
 			.find(|line| line.starts_with("owner-nodes:"))
 			.expect("owner accounting header");
 		assert_eq!(
-			owner_line, "owner-nodes: live=4 parked=0 retired=7 allocated=11 roots=2",
-			"ADR 0001 defers owner-attributed byte diagnostics until stage 3"
+			owner_line,
+			"owner-nodes: live=4 parked=0 retired=7 allocated=11 roots=2 · owner-payload: live=10 B parked=0 B retired=10 B added=20 B",
+			"owner payload must remain authoritative-only; hydrated residency stays global"
 		);
 		assert!(!text.contains("scroll="));
 		assert!(text.contains("\n▾\t"));

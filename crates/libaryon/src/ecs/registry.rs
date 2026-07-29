@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,12 +27,39 @@ pub struct RegistryStatsSnapshot {
 	pub scanned_bytes: u64,
 	pub pending_scan_blocks: u64,
 	pub resident_bytes: u64,
+	/// Authoritative bytes ever added minus bytes physically removed or
+	/// reclassified as reconstructible.
+	pub authoritative_payload_bytes: u64,
+	/// Authoritative bytes detached from their final owner but not yet freed.
+	pub orphaned_payload_bytes: u64,
 	pub sum_tree_rebuilds: u64,
 	/// UAST nodes examined while viewport queries seek their first visible leaf.
 	pub viewport_descent_node_visits: u64,
 	pub high_priority_io_count: u64,
 	pub high_priority_io_total_micros: u64,
 	pub high_priority_io_max_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AuthoritativePayloadSnapshot {
+	pub(crate) added: u64,
+	pub(crate) removed: u64,
+	pub(crate) orphaned_added: u64,
+	pub(crate) orphaned_removed: u64,
+}
+
+impl AuthoritativePayloadSnapshot {
+	pub(crate) fn retained(self) -> u64 {
+		self.added
+			.checked_sub(self.removed)
+			.expect("authoritative payload removal exceeds additions")
+	}
+
+	pub(crate) fn orphaned(self) -> u64 {
+		self.orphaned_added
+			.checked_sub(self.orphaned_removed)
+			.expect("orphaned payload removal exceeds additions")
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +181,10 @@ pub struct UastRegistry {
 	pub(crate) pending_scan_blocks: AtomicU64,
 	pub(crate) resident_bytes: AtomicU64,
 	retired_nodes: AtomicU64,
+	authoritative_bytes_added: AtomicU64,
+	authoritative_bytes_removed: AtomicU64,
+	orphaned_payload_bytes_added: AtomicU64,
+	orphaned_payload_bytes_removed: AtomicU64,
 	/// Monotonic invalidation token for metadata-only inspector snapshots.
 	/// Residency, metric knowledge, allocation, and topology changes bump it.
 	inspector_revision: AtomicU64,
@@ -216,6 +247,10 @@ impl UastRegistry {
 			pending_scan_blocks: AtomicU64::new(0),
 			resident_bytes: AtomicU64::new(0),
 			retired_nodes: AtomicU64::new(0),
+			authoritative_bytes_added: AtomicU64::new(0),
+			authoritative_bytes_removed: AtomicU64::new(0),
+			orphaned_payload_bytes_added: AtomicU64::new(0),
+			orphaned_payload_bytes_removed: AtomicU64::new(0),
 			inspector_revision: AtomicU64::new(0),
 			resident_accounted_bytes: PagedArray::new(cap, || AtomicU64::new(0)),
 			resident_counted_hot: PagedArray::new(cap, || AtomicBool::new(false)),
@@ -300,10 +335,233 @@ impl UastRegistry {
 		self.bump_inspector_revision();
 	}
 
-	/// ATOMIC HOT-SWAP: Allows the I/O thread to populate virtual_data once DMA completes.
-	pub fn hot_swap_virtual_data(&self, node: NodeId, data: Vec<u8>) {
+	fn checked_monotonic_add(counter: &AtomicU64, delta: u64, message: &'static str) {
+		if delta == 0 {
+			return;
+		}
+		counter
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				current.checked_add(delta)
+			})
+			.expect(message);
+	}
+
+	fn note_authoritative_length_delta(&self, old_len: u64, new_len: u64) {
+		if new_len >= old_len {
+			Self::checked_monotonic_add(
+				&self.authoritative_bytes_added,
+				new_len - old_len,
+				"authoritative payload additions overflow",
+			);
+		} else {
+			Self::checked_monotonic_add(
+				&self.authoritative_bytes_removed,
+				old_len - new_len,
+				"authoritative payload removals overflow",
+			);
+		}
+	}
+
+	pub(crate) fn authoritative_payload_snapshot(&self) -> AuthoritativePayloadSnapshot {
+		AuthoritativePayloadSnapshot {
+			added: self.authoritative_bytes_added.load(Ordering::Acquire),
+			removed: self.authoritative_bytes_removed.load(Ordering::Acquire),
+			orphaned_added: self.orphaned_payload_bytes_added.load(Ordering::Acquire),
+			orphaned_removed: self.orphaned_payload_bytes_removed.load(Ordering::Acquire),
+		}
+	}
+
+	pub(crate) fn authoritative_payload_len(&self, node: NodeId) -> u64 {
+		let _resident_read = self.resident_data_lock.read().unwrap();
+		let idx = node.index();
+		unsafe {
+			if (*self.spans[idx].get()).is_some() {
+				0
+			} else {
+				(&*self.virtual_data[idx].get())
+					.as_ref()
+					.map_or(0, |bytes| bytes.len() as u64)
+			}
+		}
+	}
+
+	pub(crate) fn note_orphaned_payload(&self, bytes: u64) {
+		if bytes == 0 {
+			return;
+		}
+		Self::checked_monotonic_add(
+			&self.orphaned_payload_bytes_added,
+			bytes,
+			"orphaned payload additions overflow",
+		);
+		self.bump_inspector_revision();
+	}
+
+	/// Replace the sole copy of a span-less node's content.
+	///
+	/// Authoritative writes are engine-serialized. The residency lock keeps the
+	/// payload and its byte accounting atomic with respect to resolver threads.
+	pub(crate) fn replace_authoritative_data(&self, node: NodeId, data: Vec<u8>) {
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		self.hot_swap_virtual_data_locked(node, data);
+		let idx = node.index();
+		assert!(
+			unsafe { (*self.spans[idx].get()).is_none() },
+			"authoritative payload requires a span-less node"
+		);
+		let old_len = unsafe {
+			(&*self.virtual_data[idx].get())
+				.as_ref()
+				.map_or(0, |bytes| bytes.len() as u64)
+		};
+		let new_len = data.len() as u64;
+		self.replace_virtual_data_locked(node, data);
+		self.note_authoritative_length_delta(old_len, new_len);
+	}
+
+	/// Mutate a span-less node's authoritative bytes without exposing an
+	/// uncounted raw `Vec` write.
+	pub(crate) fn mutate_authoritative_data<R>(
+		&self,
+		node: NodeId,
+		mutate: impl FnOnce(&mut Vec<u8>) -> R,
+	) -> R {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		let idx = node.index();
+		assert!(
+			unsafe { (*self.spans[idx].get()).is_none() },
+			"authoritative payload mutation requires a span-less node"
+		);
+		let mut data = unsafe {
+			(&mut *self.virtual_data[idx].get())
+				.take()
+				.expect("authoritative leaf must retain its sole payload")
+		};
+		let old_len = data.len() as u64;
+		let result = mutate(&mut data);
+		let new_len = data.len() as u64;
+		self.replace_virtual_data_locked(node, data);
+		self.note_authoritative_length_delta(old_len, new_len);
+		result
+	}
+
+	/// Publish reconstructible full data for a span-backed node.
+	pub(crate) fn publish_hydrated_data(&self, node: NodeId, data: Vec<u8>) {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		assert!(
+			unsafe { (*self.spans[node.index()].get()).is_some() },
+			"hydrated payload requires a physical span"
+		);
+		self.replace_virtual_data_locked(node, data);
+	}
+
+	/// Remove reconstructible full data for a physical split.
+	pub(crate) fn take_hydrated_data(&self, node: NodeId) -> Option<Vec<u8>> {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		let idx = node.index();
+		assert!(
+			unsafe { (*self.spans[idx].get()).is_some() },
+			"hydrated payload take requires a physical span"
+		);
+		let data = unsafe { (&mut *self.virtual_data[idx].get()).take() };
+		unsafe {
+			(&mut *self.partial_residency[idx].get()).clear();
+		}
+		let accounted = self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel);
+		if accounted > 0 {
+			self.resident_bytes.fetch_sub(accounted, Ordering::AcqRel);
+			if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+				self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+			}
+		}
+		self.touch_resident_lru(node, false);
+		self.bump_inspector_revision();
+		data
+	}
+
+	/// Convert a physical node's retained full payload into its sole copy.
+	pub(crate) fn promote_hydrated_data(&self, node: NodeId) {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		let idx = node.index();
+		assert!(
+			unsafe { (*self.spans[idx].get()).is_some() },
+			"promotion requires a physical span"
+		);
+		let authoritative_len = unsafe {
+			*self.spans[idx].get() = None;
+			(&mut *self.partial_residency[idx].get()).clear();
+			(&*self.virtual_data[idx].get())
+				.as_ref()
+				.map_or(0, |bytes| bytes.len() as u64)
+		};
+		let old_accounted =
+			self.resident_accounted_bytes[idx].swap(authoritative_len, Ordering::AcqRel);
+		if authoritative_len >= old_accounted {
+			self.resident_bytes
+				.fetch_add(authoritative_len - old_accounted, Ordering::AcqRel);
+		} else {
+			self.resident_bytes
+				.fetch_sub(old_accounted - authoritative_len, Ordering::AcqRel);
+		}
+		if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+			self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+		}
+		self.touch_resident_lru(node, false);
+		Self::checked_monotonic_add(
+			&self.authoritative_bytes_added,
+			authoritative_len,
+			"authoritative payload additions overflow",
+		);
+		self.bump_inspector_revision();
+	}
+
+	/// Rebind a leaf to the just-saved file generation and discard its resident
+	/// copy. Existing physical leaves change device without entering owner
+	/// accounting; virtual leaves leave it exactly once.
+	pub(crate) fn rebind_data_to_saved_span(
+		&self,
+		node: NodeId,
+		span: Option<SvpPointer>,
+	) {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		let idx = node.index();
+		let was_authoritative = unsafe { (*self.spans[idx].get()).is_none() };
+		let authoritative_len = if was_authoritative {
+			unsafe {
+				(&*self.virtual_data[idx].get())
+					.as_ref()
+					.map_or(0, |bytes| bytes.len() as u64)
+			}
+		} else {
+			0
+		};
+		unsafe {
+			*self.spans[idx].get() = span;
+			let payload = &mut *self.virtual_data[idx].get();
+			if span.is_some() {
+				payload.take();
+			} else {
+				assert_eq!(
+					authoritative_len, 0,
+					"nonempty saved leaf requires a physical span"
+				);
+				*payload = Some(Vec::new());
+			}
+			(&mut *self.partial_residency[idx].get()).clear();
+		}
+		let accounted = self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel);
+		if accounted > 0 {
+			self.resident_bytes.fetch_sub(accounted, Ordering::AcqRel);
+		}
+		if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+			self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+		}
+		self.touch_resident_lru(node, false);
+		Self::checked_monotonic_add(
+			&self.authoritative_bytes_removed,
+			authoritative_len,
+			"authoritative payload removals overflow",
+		);
+		self.bump_inspector_revision();
 	}
 
 	/// Replace the payload and metrics of a stable synthetic one-leaf document.
@@ -315,7 +573,7 @@ impl UastRegistry {
 		let byte_length = data.len() as u64;
 		let newline_count = data.iter().filter(|&&byte| byte == b'\n').count() as u32;
 		let ends_with_newline = data.last() == Some(&b'\n');
-		self.hot_swap_virtual_data(leaf, data);
+		self.replace_authoritative_data(leaf, data);
 		self.complete_metric_inflation(leaf, newline_count, ends_with_newline);
 		unsafe {
 			(*self.metrics[leaf.index()].get()).byte_length = byte_length;
@@ -378,7 +636,7 @@ impl UastRegistry {
 		Some(node)
 	}
 
-	fn hot_swap_virtual_data_locked(&self, node: NodeId, data: Vec<u8>) {
+	fn replace_virtual_data_locked(&self, node: NodeId, data: Vec<u8>) {
 		let idx = node.index();
 		let has_data = !data.is_empty();
 		unsafe {
@@ -412,7 +670,11 @@ impl UastRegistry {
 		if self.content_generation(node) != expected_generation {
 			return false;
 		}
-		self.hot_swap_virtual_data_locked(node, data);
+		assert!(
+			unsafe { (*self.spans[node.index()].get()).is_some() },
+			"resolver hydration requires a physical span"
+		);
+		self.replace_virtual_data_locked(node, data);
 		true
 	}
 
@@ -552,6 +814,10 @@ impl UastRegistry {
 		if self.content_generation(node) != expected_generation {
 			return false;
 		}
+		assert!(
+			unsafe { (*self.spans[node.index()].get()).is_some() },
+			"partial resolver hydration requires a physical span"
+		);
 		self.store_partial_resident_range_locked(node, offset, data);
 		true
 	}
@@ -617,6 +883,19 @@ impl UastRegistry {
 	pub(crate) fn drop_resident_data(&self, node: NodeId) {
 		let _resident_write = self.resident_data_lock.write().unwrap();
 		let idx = node.index();
+		let spanless_payload_len = unsafe {
+			if (*self.spans[idx].get()).is_none() {
+				(&*self.virtual_data[idx].get())
+					.as_ref()
+					.map_or(0, |bytes| bytes.len())
+			} else {
+				0
+			}
+		};
+		assert_eq!(
+			spanless_payload_len, 0,
+			"authoritative payload must not be dropped as evictable residency"
+		);
 		unsafe {
 			(&mut *self.virtual_data[idx].get()).take();
 			(&mut *self.partial_residency[idx].get()).clear();
@@ -716,10 +995,6 @@ impl UastRegistry {
 		self.resident_data_lock.read().unwrap()
 	}
 
-	pub(crate) fn resident_data_write_guard(&self) -> RwLockWriteGuard<'_, ()> {
-		self.resident_data_lock.write().unwrap()
-	}
-
 	#[cfg(test)]
 	pub(crate) fn resident_lru_len(&self) -> usize {
 		self.resident_lru.lock().unwrap().len
@@ -733,6 +1008,7 @@ impl UastRegistry {
 	}
 
 	pub fn stats(&self) -> RegistryStatsSnapshot {
+		let payload = self.authoritative_payload_snapshot();
 		RegistryStatsSnapshot {
 			allocated_nodes: self.allocated_node_count(),
 			retired_nodes: self.retired_node_count(),
@@ -741,6 +1017,8 @@ impl UastRegistry {
 			scanned_bytes: self.scanned_bytes.load(Ordering::Acquire),
 			pending_scan_blocks: self.pending_scan_blocks.load(Ordering::Acquire),
 			resident_bytes: self.resident_bytes.load(Ordering::Acquire),
+			authoritative_payload_bytes: payload.retained(),
+			orphaned_payload_bytes: payload.orphaned(),
 			sum_tree_rebuilds: self.sum_tree_rebuilds.load(Ordering::Acquire),
 			viewport_descent_node_visits: self.viewport_descent_node_visits.load(Ordering::Acquire),
 			high_priority_io_count: self.high_priority_io_count.load(Ordering::Acquire),
@@ -882,6 +1160,11 @@ impl UastRegistry {
 			let e = &*self.edges[idx].get();
 			(e.parent, e.next_sibling)
 		};
+		let orphaned_payload = if parent.is_some() {
+			self.authoritative_payload_len(node)
+		} else {
+			0
+		};
 
 		if let Some(p) = parent {
 			let p_idx = p.index();
@@ -913,6 +1196,7 @@ impl UastRegistry {
 		}
 		if parent.is_some() {
 			self.note_nodes_retired(1);
+			self.note_orphaned_payload(orphaned_payload);
 		} else {
 			self.bump_inspector_revision();
 		}
@@ -1508,14 +1792,21 @@ mod tests {
 		let root = chunk.spawn_node(SemanticKind::RelationalTable, None, SpanMetrics::default());
 		let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		chunk.append_local_child(root, leaf);
+		registry.replace_authoritative_data(leaf, b"sole".to_vec());
 
 		registry.disconnect_node(leaf);
 		assert_eq!(registry.stats().retired_nodes, 1);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 4);
 		registry.disconnect_node(leaf);
 		assert_eq!(
 			registry.stats().retired_nodes,
 			1,
 			"an already-detached node must not retire twice"
+		);
+		assert_eq!(
+			registry.stats().orphaned_payload_bytes,
+			4,
+			"an already-detached payload must not orphan twice"
 		);
 	}
 
@@ -1541,6 +1832,142 @@ mod tests {
 	}
 
 	#[test]
+	fn authoritative_payload_counters_follow_replace_and_in_place_mutation() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+
+		registry.replace_authoritative_data(leaf, b"abc".to_vec());
+		registry.mutate_authoritative_data(leaf, |bytes| bytes.extend_from_slice(b"de"));
+		registry.mutate_authoritative_data(leaf, |bytes| bytes.truncate(1));
+
+		let payload = registry.authoritative_payload_snapshot();
+		assert_eq!(payload.added, 5);
+		assert_eq!(payload.removed, 4);
+		assert_eq!(payload.retained(), 1);
+		assert_eq!(payload.orphaned(), 0);
+		assert_eq!(registry.authoritative_payload_len(leaf), 1);
+	}
+
+	#[test]
+	fn hydration_is_neutral_and_promotion_rebind_is_counted_once() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let span = SvpPointer {
+			lba: 0,
+			byte_length: 4,
+			device_id: 1,
+			head_trim: 0,
+		};
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			Some(span),
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		let before = registry.authoritative_payload_snapshot();
+		registry.publish_hydrated_data(leaf, b"data".to_vec());
+		assert!(registry.publish_partial_resident_range(
+			leaf,
+			registry.content_generation(leaf),
+			1,
+			b"at".to_vec(),
+		));
+		assert_eq!(registry.authoritative_payload_snapshot(), before);
+
+		registry.promote_hydrated_data(leaf);
+		registry.mutate_authoritative_data(leaf, |bytes| bytes.extend_from_slice(b"++"));
+		let promoted = registry.authoritative_payload_snapshot();
+		assert_eq!(promoted.added, 6);
+		assert_eq!(promoted.removed, 0);
+		assert_eq!(promoted.retained(), 6);
+
+		registry.rebind_data_to_saved_span(
+			leaf,
+			Some(SvpPointer {
+				byte_length: 6,
+				..span
+			}),
+		);
+		let rebound = registry.authoritative_payload_snapshot();
+		assert_eq!(rebound.added, 6);
+		assert_eq!(rebound.removed, 6);
+		assert_eq!(rebound.retained(), 0);
+		assert_eq!(registry.stats().resident_bytes, 0);
+	}
+
+	#[test]
+	fn rebinding_an_empty_leaf_keeps_its_writable_authoritative_sentinel() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		registry.replace_authoritative_data(leaf, Vec::new());
+		registry.rebind_data_to_saved_span(leaf, None);
+		registry.mutate_authoritative_data(leaf, |bytes| bytes.extend_from_slice(b"x"));
+		assert_eq!(registry.authoritative_payload_len(leaf), 1);
+		assert_eq!(registry.stats().authoritative_payload_bytes, 1);
+	}
+
+	#[test]
+	#[should_panic(expected = "authoritative payload must not be dropped")]
+	fn authoritative_payload_cannot_use_residency_eviction() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		registry.replace_authoritative_data(leaf, b"data".to_vec());
+		registry.drop_resident_data(leaf);
+	}
+
+	#[test]
+	fn production_payload_writes_use_the_intent_api() {
+		let sources = [
+			("mutation", include_str!("../uast/mutation.rs")),
+			("graft", include_str!("../engine/structural_graft.rs")),
+			("folding", include_str!("../engine/folding/synthetic.rs")),
+			("session", include_str!("../engine/session.rs")),
+			("file-browser", include_str!("../engine/file_browser.rs")),
+			("system", include_str!("../engine/runtime/system.rs")),
+			("document-io", include_str!("../engine/document/io.rs")),
+			("resolver", include_str!("../svp/resolver.rs")),
+			("python", include_str!("../svp/python_ast.rs")),
+			("rune", include_str!("../svp/rune_ast.rs")),
+		];
+		for (label, source) in sources {
+			assert!(
+				!source.contains("hot_swap_virtual_data"),
+				"{label} reintroduced the ambiguous payload writer"
+			);
+			let production = source.split("\nmod tests {").next().unwrap_or(source);
+			for (line_number, line) in production.lines().enumerate() {
+				let trimmed = line.trim_start();
+				let direct_assignment = (trimmed.starts_with("*registry.virtual_data")
+					|| trimmed.starts_with("*self.virtual_data"))
+					&& trimmed.contains('=');
+				let raw_mutation = line.contains("&mut *registry.virtual_data")
+					|| line.contains("&mut *self.virtual_data")
+					|| (line.contains("virtual_data") && line.contains(".take()"));
+				assert!(
+					!direct_assignment && !raw_mutation,
+					"{label}:{} bypasses authoritative payload accounting: {trimmed}",
+					line_number + 1
+				);
+			}
+		}
+		assert!(
+			include_str!("../svp/python_ast.rs")
+				.contains("#[cfg(test)]\npub fn apply_python_semantic_update"),
+			"obsolete Python semantic application must remain test-only"
+		);
+		assert!(
+			include_str!("../svp/rune_ast.rs")
+				.contains("#[cfg(test)]\npub fn apply_rune_semantic_update"),
+			"obsolete Rune semantic application must remain test-only"
+		);
+	}
+
+	#[test]
 	fn resident_budget_demotes_old_clean_physical_data() {
 		let registry = UastRegistry::new(3);
 		let mut chunk = registry.reserve_chunk(3).expect("registry chunk");
@@ -1562,7 +1989,7 @@ mod tests {
 		}
 		registry.set_resident_budget(8, 4);
 		for &leaf in &leaves {
-			registry.hot_swap_virtual_data(leaf, vec![leaf.index() as u8; 4]);
+			registry.publish_hydrated_data(leaf, vec![leaf.index() as u8; 4]);
 		}
 		// Eviction is engine-thread work; the resolver only publishes bytes.
 		registry.enforce_resident_budget(None);
@@ -1571,7 +1998,7 @@ mod tests {
 		assert!(unsafe { (&*registry.virtual_data[leaves[0].index()].get()).is_none() });
 		assert!(unsafe { (&*registry.virtual_data[leaves[2].index()].get()).is_some() });
 
-		registry.hot_swap_virtual_data(leaves[0], vec![9; 4]);
+		registry.publish_hydrated_data(leaves[0], vec![9; 4]);
 		assert_eq!(
 			unsafe { (&*registry.virtual_data[leaves[0].index()].get()).as_deref() },
 			Some(&[9, 9, 9, 9][..])
@@ -1611,12 +2038,12 @@ mod tests {
 		);
 
 		for generation in 0..1_000u16 {
-			registry.hot_swap_virtual_data(first, vec![generation as u8; 4]);
+			registry.publish_hydrated_data(first, vec![generation as u8; 4]);
 		}
 		assert_eq!(registry.resident_lru_len(), 1);
 
 		registry.set_resident_budget(4, 4);
-		registry.hot_swap_virtual_data(second, vec![2; 4]);
+		registry.publish_hydrated_data(second, vec![2; 4]);
 		registry.enforce_resident_budget(None);
 		assert_eq!(registry.resident_lru_len(), 1);
 		assert!(unsafe { (&*registry.virtual_data[first.index()].get()).is_none() });
@@ -1650,7 +2077,7 @@ mod tests {
 		registry.set_resident_budget(budget, budget);
 
 		for &leaf in &leaves {
-			registry.hot_swap_virtual_data(leaf, vec![0; EXTENT_BYTES as usize]);
+			registry.publish_hydrated_data(leaf, vec![0; EXTENT_BYTES as usize]);
 			registry.enforce_resident_budget(None);
 			assert!(registry.stats().resident_bytes <= budget);
 			assert!(registry.resident_lru_len() <= RESIDENT_EXTENTS);
@@ -1713,8 +2140,8 @@ mod tests {
 		);
 		registry.set_resident_budget(4, 0);
 		registry.set_viewport_resident_pins(7, [first]);
-		registry.hot_swap_virtual_data(first, vec![1; 4]);
-		registry.hot_swap_virtual_data(second, vec![2; 4]);
+		registry.publish_hydrated_data(first, vec![1; 4]);
+		registry.publish_hydrated_data(second, vec![2; 4]);
 		assert!(unsafe { (&*registry.virtual_data[first.index()].get()).is_some() });
 
 		registry.set_viewport_resident_pins(7, []);

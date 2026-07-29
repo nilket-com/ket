@@ -23,8 +23,10 @@
 //! a single `Trivia` leaf covering the whole source, so the engine never
 //! panics and byte length is still preserved.
 
-use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::kind::{ProviderKindId, SemanticKind};
+#[cfg(test)]
+use crate::ecs::{NodeId, UastRegistry};
+#[cfg(test)]
 use crate::uast::metrics::SpanMetrics;
 
 use rune::SourceId;
@@ -392,6 +394,7 @@ pub fn to_trait_green_node(node: &GreenNode) -> crate::engine::language::GreenNo
 	}
 }
 
+#[cfg(test)]
 fn count_newlines_in_slice(text: &[u8], offset: u32, len: u32) -> u32 {
 	let start = offset as usize;
 	let end = (offset + len).min(text.len() as u32) as usize;
@@ -401,6 +404,7 @@ fn count_newlines_in_slice(text: &[u8], offset: u32, len: u32) -> u32 {
 	memchr::memchr_iter(b'\n', &text[start..end]).count() as u32
 }
 
+#[cfg(test)]
 fn graft_recursive(
 	registry: &UastRegistry,
 	node: &GreenNode,
@@ -474,6 +478,7 @@ fn graft_recursive(
 	id
 }
 
+#[cfg(test)]
 fn distribute_virtual_data(registry: &UastRegistry, node_id: NodeId, source: &[u8], offset: u32) {
 	let idx = node_id.index();
 	let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
@@ -494,7 +499,7 @@ fn distribute_virtual_data(registry: &UastRegistry, node_id: NodeId, source: &[u
 		let start = offset as usize;
 		let end = (start + byte_len).min(source.len());
 		if start < source.len() {
-			registry.hot_swap_virtual_data(node_id, source[start..end].to_vec());
+			registry.replace_authoritative_data(node_id, source[start..end].to_vec());
 		}
 	}
 }
@@ -505,6 +510,7 @@ fn distribute_virtual_data(registry: &UastRegistry, node_id: NodeId, source: &[u
 /// Mirrors `python_ast::apply_python_semantic_update`: the new root takes
 /// the target's exact position in the LCRS tree, virtual data is pushed to
 /// leaves, and the old target is fully disconnected.
+#[cfg(test)]
 pub fn apply_rune_semantic_update(
 	registry: &UastRegistry,
 	target_node_id: NodeId,

@@ -87,6 +87,12 @@ fn apply_semantic_response(
 			.uast_accounting
 			.current_live_nodes
 			.saturating_sub(1);
+		let retired_payload = document.uast_accounting.current_live_payload_bytes;
+		assert_eq!(
+			registry.authoritative_payload_len(rid),
+			0,
+			"stable document root must not carry authoritative payload"
+		);
 
 		// A graft that would not reproduce the document's bytes is refused, and the
 		// document keeps the tree it has. The highlights above still stand: they are
@@ -99,6 +105,7 @@ fn apply_semantic_response(
 			return false;
 		}
 		registry.note_nodes_retired(retired_descendants);
+		registry.note_orphaned_payload(retired_payload);
 		document.bump_topology_rev();
 		doctab
 			.view

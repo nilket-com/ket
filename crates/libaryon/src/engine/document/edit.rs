@@ -904,7 +904,7 @@ mod tests {
 		let (registry, root) = build_document("abz");
 		let leaf = registry.get_first_child(root).expect("document leaf");
 		let original = b"a\xffz";
-		registry.hot_swap_virtual_data(leaf, original.to_vec());
+		registry.replace_authoritative_data(leaf, original.to_vec());
 
 		let mut root_id = Some(root);
 		let mut ledger = UndoLedger::new();
@@ -1139,7 +1139,7 @@ mod tests {
 		let (registry, root, path) = build_exact_metric_physical_document(&["abc", "def"]);
 		let first = registry.get_first_child(root).expect("first leaf");
 		let second = registry.get_next_sibling(first).expect("second leaf");
-		registry.hot_swap_virtual_data(second, b"def".to_vec());
+		registry.publish_hydrated_data(second, b"def".to_vec());
 
 		let mut root_id = Some(root);
 		let mut ledger = UndoLedger::new();

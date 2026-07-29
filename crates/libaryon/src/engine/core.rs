@@ -524,7 +524,7 @@ mod tests {
 		let mut cache = None;
 		refresh_sum_tree(&mut cache, &registry, root, StateId::ZERO);
 		let initial_rebuilds = registry.stats().sum_tree_rebuilds;
-		registry.hot_swap_virtual_data(leaf, b"a\nb\n".to_vec());
+		registry.publish_hydrated_data(leaf, b"a\nb\n".to_vec());
 		refresh_sum_tree(&mut cache, &registry, root, StateId::ZERO);
 		registry.drop_resident_data(leaf);
 		refresh_sum_tree(&mut cache, &registry, root, StateId::ZERO);
@@ -563,7 +563,7 @@ mod tests {
 		refresh_sum_tree(&mut cache, &registry, root, StateId::ZERO);
 		assert!(cache.as_ref().expect("cold cache").tree.has_cold_extents());
 		let initial_rebuilds = registry.stats().sum_tree_rebuilds;
-		registry.hot_swap_virtual_data(leaf, vec![b'x'; 1024 * 1024]);
+		registry.publish_hydrated_data(leaf, vec![b'x'; 1024 * 1024]);
 		registry.metrics_inflated[leaf.index()].store(true, std::sync::atomic::Ordering::Release);
 		registry.set_terminal_newline(leaf, false);
 		let (cursor_node, cursor_offset) = registry.insert_text(leaf, 1024 * 1024, b"!");

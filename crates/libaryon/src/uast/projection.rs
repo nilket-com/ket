@@ -2246,7 +2246,7 @@ mod tests {
 		);
 		assert_ne!(Some(second), cold.required_node());
 
-		registry.hot_swap_virtual_data(first, chunks[0].as_bytes().to_vec());
+		registry.publish_hydrated_data(first, chunks[0].as_bytes().to_vec());
 		let ready = registry.find_node_at_line_col(
 			root,
 			&crate::uast::NoFolds,
@@ -2811,7 +2811,7 @@ mod tests {
 		let bytes = registry
 			.read_node_bytes_sync(required)
 			.expect("hydrate selected generated extent");
-		registry.hot_swap_virtual_data(required, bytes);
+		registry.publish_hydrated_data(required, bytes);
 		let index_builds = registry
 			.root_child_line_index_full_builds
 			.load(Ordering::Acquire);

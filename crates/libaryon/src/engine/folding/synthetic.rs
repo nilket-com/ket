@@ -39,7 +39,7 @@ fn init_virtual_token_node(
 		};
 		*registry.child_tails[idx].get() = None;
 	}
-	registry.hot_swap_virtual_data(node, bytes.to_vec());
+	registry.replace_authoritative_data(node, bytes.to_vec());
 	registry.dma_in_flight[idx].store(false, Ordering::Relaxed);
 	registry.metric_inflating[idx].store(false, Ordering::Relaxed);
 	registry.metrics_inflated[idx].store(true, Ordering::Relaxed);
@@ -438,6 +438,24 @@ fn materialize_synthetic_fold_plan(
 	let next = registry.get_next_sibling(end_slice.node);
 	let old_was_tail =
 		unsafe { *registry.child_tails[parent.index()].get() == Some(end_slice.node) };
+	let mut retired_originals = Vec::new();
+	if start_slice.node == end_slice.node {
+		if start_offset != 0 || end_offset != start_slice.bytes.len() {
+			retired_originals.push(start_slice.node);
+		}
+	} else {
+		if start_offset != 0 {
+			retired_originals.push(start_slice.node);
+		}
+		if end_offset != end_slice.bytes.len() {
+			retired_originals.push(end_slice.node);
+		}
+	}
+	let retired_payload = retired_originals.iter().fold(0u64, |total, node| {
+		total
+			.checked_add(registry.authoritative_payload_len(*node))
+			.expect("synthetic-fold retired payload overflow")
+	});
 	let fold_node = registry.alloc_node_internal();
 	let prefix = &start_slice.bytes[..start_offset];
 	let suffix = &end_slice.bytes[end_offset..];
@@ -550,7 +568,14 @@ fn materialize_synthetic_fold_plan(
 		if old_was_tail {
 			*registry.child_tails[parent.index()].get() = Some(replacement_end);
 		}
+		for node in &retired_originals {
+			let edges = &mut *registry.edges[node.index()].get();
+			edges.parent = None;
+			edges.next_sibling = None;
+		}
 	}
+	registry.note_nodes_retired(retired_originals.len() as u64);
+	registry.note_orphaned_payload(retired_payload);
 	registry.reconcile_installed_root_child_line_index_after(parent, prev);
 
 	Some(fold_node)
@@ -569,7 +594,7 @@ fn preview_synthetic_fold_plan_at_cursor(
 		}
 		let node = lookup.required_node()?;
 		let bytes = registry.read_node_bytes_sync(node).ok()?;
-		registry.hot_swap_virtual_data(node, bytes);
+		registry.publish_hydrated_data(node, bytes);
 	};
 	let parent = unsafe { (*registry.edges[target.node_id.index()].get()).parent }?;
 	if unsafe { *registry.kinds[parent.index()].get() } == SemanticKind::Group {

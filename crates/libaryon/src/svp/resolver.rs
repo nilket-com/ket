@@ -957,7 +957,8 @@ mod tests {
 		};
 		let meta = CompletionMeta::new(request, 0);
 		registry.bump_content_generation(node);
-		registry.hot_swap_virtual_data(node, b"edited".to_vec());
+		registry.promote_hydrated_data(node);
+		registry.replace_authoritative_data(node, b"edited".to_vec());
 
 		let queue = SvpRequestQueue::new(1);
 		assert!(complete_read(&registry, &queue, meta, b"oldold"));

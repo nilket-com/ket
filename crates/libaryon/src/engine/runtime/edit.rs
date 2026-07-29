@@ -2017,20 +2017,27 @@ fn apply_history_replay(
 				super::retire_parked_generations_in_mutation(
 					ctx,
 					&mut tab.document.pending_parked_retirements,
+					&mut tab.document.pending_parked_payload_retirements,
 					vec![invalid],
 				);
 			}
 
 			let mut fresh = None;
-			let (rid, new_backing_device_id, revived_live) = if let Some(entry) = revived.as_ref() {
-				(entry.root, entry.device_id, Some(entry.live_nodes))
-			} else {
-				let (root, _cursor_leaf, device_id) =
-					load_root_from_path(ctx, &target.path, next_dynamic_device_id)
-						.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
-				fresh = Some((root, device_id));
-				(root, device_id, None)
-			};
+			let (rid, new_backing_device_id, revived_live, revived_payload) =
+				if let Some(entry) = revived.as_ref() {
+					(
+						entry.root,
+						entry.device_id,
+						Some(entry.live_nodes),
+						Some(entry.payload_bytes),
+					)
+				} else {
+					let (root, _cursor_leaf, device_id) =
+						load_root_from_path(ctx, &target.path, next_dynamic_device_id)
+							.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
+					fresh = Some((root, device_id));
+					(root, device_id, None, None)
+				};
 			if revived_live.is_none() && ctx.registry.get_total_bytes(rid) != target.byte_len {
 				ctx.registry.cancel_metric_scan(rid);
 				if let Some(device_id) = new_backing_device_id {
@@ -2073,16 +2080,21 @@ fn apply_history_replay(
 				root: tab.document.root_id,
 				device_id: tab.document.backing_device_id,
 				live_nodes: tab.document.uast_accounting.current_live_nodes,
+				payload_bytes: tab.document.uast_accounting.current_live_payload_bytes,
 				file_identity: outgoing_file_identity,
 			};
 			if let Some(evicted) = tab.document.parked_generations.insert(outgoing) {
 				super::retire_parked_generations_in_mutation(
 					ctx,
 					&mut tab.document.pending_parked_retirements,
+					&mut tab.document.pending_parked_payload_retirements,
 					vec![evicted],
 				);
 			}
-			tab.document.pending_root_transition = Some(RootTransition::Park { revived_live });
+			tab.document.pending_root_transition = Some(RootTransition::Park {
+				revived_live,
+				revived_payload,
+			});
 			tab.document.ledger.commit(direction);
 			tab.document.root_id = rid;
 			tab.view.folds.clear();
@@ -2557,6 +2569,7 @@ mod tests {
 					root: before_root,
 					device_id: before_device,
 					live_nodes: 2,
+					payload_bytes: 0,
 					file_identity: BackingIdentity::for_path(&before_path)
 						.expect("before identity"),
 				})

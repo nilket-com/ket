@@ -77,7 +77,7 @@ fn spawn_physical_tail_chain(
 			edges.next_sibling = None;
 		}
 		if let Some(chunk_data) = resolved_chunk {
-			registry.hot_swap_virtual_data(node, chunk_data);
+			registry.publish_hydrated_data(node, chunk_data);
 			registry.metrics_inflated[idx].store(true, Ordering::Relaxed);
 			registry.set_terminal_newline(
 				node,
@@ -253,7 +253,7 @@ fn prune_empty_ancestors(registry: &UastRegistry, start: NodeId) -> (NodeId, u32
 			// graft can leave this survivor without leaf data; normalize it to a
 			// writable virtual leaf so the next insertion cannot advance metrics
 			// without storing its bytes.
-			registry.hot_swap_virtual_data(curr, Vec::new());
+			registry.replace_authoritative_data(curr, Vec::new());
 			registry.metrics_inflated[curr.index()].store(true, Ordering::Release);
 			registry.set_terminal_newline(curr, false);
 			return (curr, 0);
@@ -311,50 +311,37 @@ impl UastMutation for UastRegistry {
 
 		if is_virtual {
 			self.bump_content_generation(target);
-			{
-				let _resident_write = self.resident_data_write_guard();
-				unsafe {
-					if let Some(v_data) = &mut *self.virtual_data[idx].get() {
-						v_data.splice(
-							(offset_in_node as usize)..(offset_in_node as usize),
-							new_text.iter().copied(),
-						);
-					}
-				}
-			}
-			self.refresh_resident_accounting(target);
+			self.mutate_authoritative_data(target, |v_data| {
+				v_data.splice(
+					(offset_in_node as usize)..(offset_in_node as usize),
+					new_text.iter().copied(),
+				);
+			});
 			self.refresh_terminal_newline_from_resident(target);
 			self.refresh_installed_root_child_line_index_for_node(target);
 			(target, offset_in_node + new_text.len() as u32)
 		} else {
 			self.bump_content_generation(target);
 			let promoted_in_place = {
-				let _resident_write = self.resident_data_write_guard();
+				let _resident_read = self.resident_data_guard();
 				unsafe {
-					if let Some(v_data) = &mut *self.virtual_data[idx].get() {
-						if v_data
+					(&*self.virtual_data[idx].get()).as_ref().is_some_and(|v_data| {
+						v_data
 							.len()
 							.checked_add(new_text.len())
-							.is_none_or(|new_len| new_len > RESOLVER_TRANSFER_SIZE)
-						{
-							false
-						} else {
-							*self.spans[idx].get() = None;
-							v_data.splice(
-								(offset_in_node as usize)..(offset_in_node as usize),
-								new_text.iter().copied(),
-							);
-							self.metrics_inflated[idx]
-								.store(true, std::sync::atomic::Ordering::Relaxed);
-							true
-						}
-					} else {
-						false
-					}
+							.is_some_and(|new_len| new_len <= RESOLVER_TRANSFER_SIZE)
+					})
 				}
 			};
 			if promoted_in_place {
-				self.refresh_resident_accounting(target);
+				self.promote_hydrated_data(target);
+				self.mutate_authoritative_data(target, |v_data| {
+					v_data.splice(
+						(offset_in_node as usize)..(offset_in_node as usize),
+						new_text.iter().copied(),
+					);
+				});
+				self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 				self.refresh_terminal_newline_from_resident(target);
 				self.refresh_installed_root_child_line_index_for_node(target);
 				return (target, offset_in_node + new_text.len() as u32);
@@ -388,10 +375,7 @@ impl UastMutation for UastRegistry {
 		let v_idx = v_id.index();
 
 		let p1_len = offset;
-		let mut resolved_data = {
-			let _resident_write = self.resident_data_write_guard();
-			unsafe { (*self.virtual_data[target_idx].get()).take() }
-		};
+		let mut resolved_data = self.take_hydrated_data(target);
 		if resolved_data.is_none() {
 			resolved_data = self.read_node_bytes_sync(target).ok();
 		}
@@ -416,7 +400,7 @@ impl UastMutation for UastRegistry {
 			m.newlines = u64::from(p1_newlines);
 			if let Some(data) = resolved_data.as_ref() {
 				let p1_data = &data[..offset as usize];
-				self.hot_swap_virtual_data(target, p1_data.to_vec());
+				self.publish_hydrated_data(target, p1_data.to_vec());
 				self.metrics_inflated[target_idx].store(true, Ordering::Release);
 				self.set_terminal_newline(target, p1_data.last() == Some(&b'\n'));
 			} else {
@@ -445,7 +429,7 @@ impl UastMutation for UastRegistry {
 			e.parent = Some(parent);
 			e.next_sibling = old_next_sibling;
 		}
-		self.hot_swap_virtual_data(v_id, new_text.to_vec());
+		self.replace_authoritative_data(v_id, new_text.to_vec());
 		self.metrics_inflated[v_idx].store(true, Ordering::Release);
 		self.set_terminal_newline(v_id, new_text.last() == Some(&b'\n'));
 		// Add virtual node metrics to parent chain
@@ -516,26 +500,20 @@ impl UastMutation for UastRegistry {
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
-			let mut bytes_to_remove = 1;
-			let mut removed_newlines = 0i32;
-			{
-				let _resident_write = self.resident_data_write_guard();
-				unsafe {
-					if let Some(v_data) = &mut *self.virtual_data[idx].get() {
-						let mut start = offset_in_node as usize - 1;
-						while start > 0 && (v_data[start] & 0xC0) == 0x80 {
-							start -= 1;
-						}
-						bytes_to_remove = offset_in_node as usize - start;
-						removed_newlines = v_data[start..offset_in_node as usize]
-							.iter()
-							.filter(|&&b| b == b'\n')
-							.count() as i32;
-						v_data.drain(start..offset_in_node as usize);
+			let (bytes_to_remove, removed_newlines) =
+				self.mutate_authoritative_data(target, |v_data| {
+					let mut start = offset_in_node as usize - 1;
+					while start > 0 && (v_data[start] & 0xC0) == 0x80 {
+						start -= 1;
 					}
-				}
-			}
-			self.refresh_resident_accounting(target);
+					let bytes_to_remove = offset_in_node as usize - start;
+					let removed_newlines = v_data[start..offset_in_node as usize]
+						.iter()
+						.filter(|&&b| b == b'\n')
+						.count() as i32;
+					v_data.drain(start..offset_in_node as usize);
+					(bytes_to_remove, removed_newlines)
+				});
 			self.refresh_terminal_newline_from_resident(target);
 			self.apply_edit(
 				target,
@@ -573,12 +551,10 @@ impl UastMutation for UastRegistry {
 				.count() as i32;
 			data.drain(start..offset_in_node as usize);
 
-			unsafe {
-				*self.spans[idx].get() = None;
-				self.metrics_inflated[idx].store(true, Ordering::Relaxed);
-			}
+			self.promote_hydrated_data(target);
+			self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 			let ends_with_newline = data.last() == Some(&b'\n');
-			self.hot_swap_virtual_data(target, data);
+			self.replace_authoritative_data(target, data);
 			self.set_terminal_newline(target, ends_with_newline);
 
 			self.apply_edit(
@@ -650,12 +626,7 @@ impl UastMutation for UastRegistry {
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
-			let removed_newlines = {
-				let _resident_write = self.resident_data_write_guard();
-				unsafe {
-					let v_data = (&mut *self.virtual_data[idx].get())
-						.as_mut()
-						.expect("virtual leaf must retain resident bytes during exact deletion");
+			let removed_newlines = self.mutate_authoritative_data(target, |v_data| {
 					let range = delete_start as usize..offset_in_node as usize;
 					let removed = v_data[range.clone()]
 						.iter()
@@ -663,9 +634,7 @@ impl UastMutation for UastRegistry {
 						.count();
 					v_data.drain(range);
 					removed
-				}
-			};
-			self.refresh_resident_accounting(target);
+			});
 			self.refresh_terminal_newline_from_resident(target);
 			self.apply_edit(
 				target,
@@ -702,12 +671,10 @@ impl UastMutation for UastRegistry {
 			.count();
 		data.drain(range);
 
-		unsafe {
-			*self.spans[idx].get() = None;
-			self.metrics_inflated[idx].store(true, Ordering::Relaxed);
-		}
+		self.promote_hydrated_data(target);
+		self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 		let ends_with_newline = data.last() == Some(&b'\n');
-		self.hot_swap_virtual_data(target, data);
+		self.replace_authoritative_data(target, data);
 		self.set_terminal_newline(target, ends_with_newline);
 		self.apply_edit(
 			target,
@@ -759,12 +726,7 @@ impl UastMutation for UastRegistry {
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
-			let removed_newlines = {
-				let _resident_write = self.resident_data_write_guard();
-				unsafe {
-					let data = (&mut *self.virtual_data[idx].get())
-						.as_mut()
-						.expect("virtual leaf must retain resident bytes during exact deletion");
+			let removed_newlines = self.mutate_authoritative_data(target, |data| {
 					let range = offset_in_node as usize..delete_end as usize;
 					let removed = data[range.clone()]
 						.iter()
@@ -772,9 +734,7 @@ impl UastMutation for UastRegistry {
 						.count();
 					data.drain(range);
 					removed
-				}
-			};
-			self.refresh_resident_accounting(target);
+			});
 			self.refresh_terminal_newline_from_resident(target);
 			self.apply_edit(
 				target,
@@ -813,12 +773,10 @@ impl UastMutation for UastRegistry {
 			.filter(|&&byte| byte == b'\n')
 			.count();
 		data.drain(range);
-		unsafe {
-			*self.spans[idx].get() = None;
-			self.metrics_inflated[idx].store(true, Ordering::Relaxed);
-		}
+		self.promote_hydrated_data(target);
+		self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 		let ends_with_newline = data.last() == Some(&b'\n');
-		self.hot_swap_virtual_data(target, data);
+		self.replace_authoritative_data(target, data);
 		self.set_terminal_newline(target, ends_with_newline);
 		self.apply_edit(
 			target,
@@ -861,10 +819,7 @@ impl UastMutation for UastRegistry {
 		let v_id = self.alloc_node_internal();
 		let v_idx = v_id.index();
 
-		let mut resolved_data = {
-			let _resident_write = self.resident_data_write_guard();
-			unsafe { (*self.virtual_data[target_idx].get()).take() }
-		};
+		let mut resolved_data = self.take_hydrated_data(target);
 		if resolved_data.is_none() {
 			resolved_data = self.read_node_bytes_sync(target).ok();
 		}
@@ -889,7 +844,7 @@ impl UastMutation for UastRegistry {
 			m.newlines = u64::from(p1_newlines);
 			if let Some(data) = resolved_data.as_ref() {
 				let p1_data = &data[..offset as usize];
-				self.hot_swap_virtual_data(target, p1_data.to_vec());
+				self.publish_hydrated_data(target, p1_data.to_vec());
 				self.metrics_inflated[target_idx].store(true, Ordering::Release);
 				self.set_terminal_newline(target, p1_data.last() == Some(&b'\n'));
 			} else {
@@ -907,7 +862,6 @@ impl UastMutation for UastRegistry {
 		unsafe {
 			*self.kinds[v_idx].get() = SemanticKind::Token;
 			*self.spans[v_idx].get() = None;
-			*self.virtual_data[v_idx].get() = Some(Vec::new());
 			let m = &mut *self.metrics[v_idx].get();
 			m.byte_length = 0;
 			m.newlines = 0;
@@ -915,6 +869,7 @@ impl UastMutation for UastRegistry {
 			e.parent = Some(parent);
 			e.next_sibling = old_next_sibling;
 		}
+		self.replace_authoritative_data(v_id, Vec::new());
 		self.metrics_inflated[v_idx].store(true, Ordering::Release);
 		self.set_terminal_newline(v_id, false);
 
@@ -1015,7 +970,7 @@ mod tests {
 			},
 		);
 		chunk.append_local_child(root, leaf);
-		registry.hot_swap_virtual_data(leaf, b"x".to_vec());
+		registry.replace_authoritative_data(leaf, b"x".to_vec());
 
 		let anchor = registry.delete_backwards(leaf, 1);
 
@@ -1086,7 +1041,7 @@ mod tests {
 			(*registry.metrics[leaf.index()].get()).newlines = 1;
 			(*registry.metrics[root.index()].get()).newlines = 1;
 		}
-		registry.hot_swap_virtual_data(leaf, b"aaa\nbbbb".to_vec());
+		registry.publish_hydrated_data(leaf, b"aaa\nbbbb".to_vec());
 		registry.metrics_inflated[leaf.index()].store(true, Ordering::Release);
 		registry.set_terminal_newline(leaf, false);
 		registry.install_root_child_line_index(root);
@@ -1419,8 +1374,8 @@ mod tests {
 		for leaf in [big_a, big_b, prev, tail] {
 			chunk.append_local_child(root, leaf);
 		}
-		registry.hot_swap_virtual_data(prev, b"abcd".to_vec());
-		registry.hot_swap_virtual_data(tail, b"wxyz".to_vec());
+		registry.replace_authoritative_data(prev, b"abcd".to_vec());
+		registry.replace_authoritative_data(tail, b"wxyz".to_vec());
 
 		// Offset 0 of `tail` sits at document byte 5 GiB + 4. This used to compute a
 		// parent offset via child_byte_offset (which truncates to None past 4 GiB),

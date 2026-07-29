@@ -970,9 +970,7 @@ fn create_document_from_bytes(
 	let rid = chunk.spawn_node(SemanticKind::RelationalTable, None, metrics);
 	let leaf = chunk.spawn_node(SemanticKind::Token, None, metrics);
 	chunk.append_local_child(rid, leaf);
-	unsafe {
-		*registry.virtual_data[leaf.index()].get() = Some(bytes);
-	}
+	registry.replace_authoritative_data(leaf, bytes);
 	Ok((rid, leaf))
 }
 
@@ -1068,6 +1066,7 @@ fn reload_loaded_document(
 	shadow: &mut Option<ShadowSession>,
 	parked_generations: &mut ParkedGenerationCache,
 	pending_parked_retirements: &mut u64,
+	pending_parked_payload_retirements: &mut u64,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
 	caret: &mut Caret,
@@ -1094,7 +1093,13 @@ fn reload_loaded_document(
 	let prior_scroll_row_offset = *scroll_row_offset;
 	let language_id = detect_language(ctx.lang_registry, &path);
 
-	super::discard_attached_shadow(ctx, shadow, parked_generations, pending_parked_retirements);
+	super::discard_attached_shadow(
+		ctx,
+		shadow,
+		parked_generations,
+		pending_parked_retirements,
+		pending_parked_payload_retirements,
+	);
 
 	initialize_loaded_document(
 		ctx,
@@ -1557,6 +1562,7 @@ pub(super) fn handle_file_doctab_command(
 				&mut tab.document.shadow,
 				&mut tab.document.parked_generations,
 				&mut tab.document.pending_parked_retirements,
+				&mut tab.document.pending_parked_payload_retirements,
 				&mut tab.document.ledger,
 				folds,
 				tab.cursor.primary_mut(),
@@ -1673,6 +1679,7 @@ pub(super) fn handle_auto_reload_doctab_command(
 				&mut tab.document.shadow,
 				&mut tab.document.parked_generations,
 				&mut tab.document.pending_parked_retirements,
+				&mut tab.document.pending_parked_payload_retirements,
 				&mut tab.document.ledger,
 				folds,
 				tab.cursor.primary_mut(),
@@ -1811,6 +1818,7 @@ pub(super) fn handle_file_command(
 	shadow: &mut Option<ShadowSession>,
 	parked_generations: &mut ParkedGenerationCache,
 	pending_parked_retirements: &mut u64,
+	pending_parked_payload_retirements: &mut u64,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
 	caret: &mut Caret,
@@ -1831,6 +1839,7 @@ pub(super) fn handle_file_command(
 				shadow,
 				parked_generations,
 				pending_parked_retirements,
+				pending_parked_payload_retirements,
 			);
 			let language_id = detect_language(ctx.lang_registry, &path);
 			match load_shadow_session(Path::new(&path)) {
@@ -1966,6 +1975,7 @@ pub(super) fn handle_file_command(
 					shadow,
 					parked_generations,
 					pending_parked_retirements,
+					pending_parked_payload_retirements,
 					ledger,
 					folds,
 					caret,
@@ -2007,6 +2017,7 @@ pub(super) fn handle_file_command(
 								shadow,
 								parked_generations,
 								pending_parked_retirements,
+								pending_parked_payload_retirements,
 							);
 							*status_message = completion
 								.warning
@@ -2053,6 +2064,7 @@ pub(super) fn handle_file_command(
 							shadow,
 							parked_generations,
 							pending_parked_retirements,
+							pending_parked_payload_retirements,
 						);
 					}
 					Err(msg) => *status_message = Some(msg),
@@ -2084,6 +2096,7 @@ pub(super) fn handle_file_command(
 								shadow,
 								parked_generations,
 								pending_parked_retirements,
+								pending_parked_payload_retirements,
 							);
 							*status_message = completion
 								.warning
@@ -2134,6 +2147,7 @@ pub(super) fn handle_file_command(
 						shadow,
 						parked_generations,
 						pending_parked_retirements,
+						pending_parked_payload_retirements,
 					);
 					initialize_loaded_document(
 						ctx,
@@ -5748,13 +5762,14 @@ mod tests {
 			let view = rx_view
 				.recv_timeout(Duration::from_secs(2))
 				.expect("viewport after query");
-			if view.document_text.is_some() {
+			let focused_buffer_id = view.focused_pane().map(|pane| pane.buffer_id);
+			if let Some(document_text) = view.document_text {
 				assert_eq!(
 					view.document_text_buffer_id,
-					Some(view.focused_pane().expect("focused pane").buffer_id),
+					focused_buffer_id,
 					"document text must identify the buffer it was read from"
 				);
-				return view.document_text.expect("checked document text");
+				return document_text;
 			}
 		}
 		panic!("no viewport carried the document text reply");

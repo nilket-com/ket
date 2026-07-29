@@ -787,12 +787,12 @@ mod tests {
 		chunk.append_local_child(root, first);
 		chunk.append_local_child(root, second);
 		registry.set_resident_budget(8, 4);
-		registry.hot_swap_virtual_data(first, b"a\nb\nc\nq".to_vec());
+		registry.publish_hydrated_data(first, b"a\nb\nc\nq".to_vec());
 		let hot_entries = SumTree::build_from_registry(&registry, root)
 			.iter_leaves_from(DocLine::ZERO)
 			.count();
 
-		registry.hot_swap_virtual_data(second, b"tail".to_vec());
+		registry.publish_hydrated_data(second, b"tail".to_vec());
 		// Eviction is engine-thread work; the resolver only publishes bytes.
 		registry.enforce_resident_budget(None);
 		assert!(unsafe { (&*registry.virtual_data[first.index()].get()).is_none() });

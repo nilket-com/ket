@@ -1491,14 +1491,19 @@ fn release_buffer(
 	}
 	if let BufferContent::Text(document) = &mut buffer.content {
 		let parked_live = document.parked_generations.live_nodes();
+		let parked_payload = document.parked_generations.payload_bytes();
 		assert_eq!(
 			parked_live, document.uast_accounting.parked_nodes,
 			"parked cache and owner accounting diverged before release"
 		);
+		assert_eq!(
+			parked_payload, document.uast_accounting.parked_payload_bytes,
+			"parked payload cache and owner accounting diverged before release"
+		);
 		let parked = document.parked_generations.drain();
 		assert_eq!(
 			retire_parked_generations(runtime, parked),
-			parked_live,
+			(parked_live, parked_payload),
 			"parked release retirement diverged from its cache"
 		);
 		// The attached cache is empty before its shadow directory disappears.
@@ -1509,12 +1514,19 @@ fn release_buffer(
 			runtime.resolver.unregister_device(device_id);
 		}
 	}
-	let retired_nodes = match &buffer.content {
-		BufferContent::Text(document) => document.uast_accounting.current_live_nodes,
-		BufferContent::FileBrowser(_) => 2,
-		BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_) => 0,
+	let (retired_nodes, retired_payload) = match &buffer.content {
+		BufferContent::Text(document) => (
+			document.uast_accounting.current_live_nodes,
+			document.uast_accounting.current_live_payload_bytes,
+		),
+		BufferContent::FileBrowser(document) => (
+			document.uast_accounting.current_live_nodes,
+			document.uast_accounting.current_live_payload_bytes,
+		),
+		BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_) => (0, 0),
 	};
 	runtime.registry.note_nodes_retired(retired_nodes);
+	runtime.registry.note_orphaned_payload(retired_payload);
 	if let Some(root) = buffer.root_id() {
 		runtime.registry.cancel_metric_scan(root);
 	}
@@ -1523,8 +1535,9 @@ fn release_buffer(
 fn retire_parked_generations(
 	runtime: &RuntimeContext<'_>,
 	entries: Vec<ParkedGenerationRoot>,
-) -> u64 {
+) -> (u64, u64) {
 	let mut retired = 0u64;
+	let mut retired_payload = 0u64;
 	for entry in entries {
 		runtime.registry.cancel_metric_scan(entry.root);
 		if let Some(device_id) = entry.device_id {
@@ -1533,20 +1546,28 @@ fn retire_parked_generations(
 		retired = retired
 			.checked_add(entry.live_nodes)
 			.expect("parked generation retirement overflow");
+		retired_payload = retired_payload
+			.checked_add(entry.payload_bytes)
+			.expect("parked generation payload retirement overflow");
 	}
 	runtime.registry.note_nodes_retired(retired);
-	retired
+	runtime.registry.note_orphaned_payload(retired_payload);
+	(retired, retired_payload)
 }
 
 fn retire_parked_generations_in_mutation(
 	runtime: &RuntimeContext<'_>,
 	pending_parked_retirements: &mut u64,
+	pending_parked_payload_retirements: &mut u64,
 	entries: Vec<ParkedGenerationRoot>,
 ) {
-	let retired = retire_parked_generations(runtime, entries);
+	let (retired, retired_payload) = retire_parked_generations(runtime, entries);
 	*pending_parked_retirements = pending_parked_retirements
 		.checked_add(retired)
 		.expect("pending parked retirement overflow");
+	*pending_parked_payload_retirements = pending_parked_payload_retirements
+		.checked_add(retired_payload)
+		.expect("pending parked payload retirement overflow");
 }
 
 fn discard_attached_shadow(
@@ -1554,9 +1575,15 @@ fn discard_attached_shadow(
 	shadow: &mut Option<ShadowSession>,
 	parked_generations: &mut ParkedGenerationCache,
 	pending_parked_retirements: &mut u64,
+	pending_parked_payload_retirements: &mut u64,
 ) {
 	let parked = parked_generations.drain();
-	retire_parked_generations_in_mutation(runtime, pending_parked_retirements, parked);
+	retire_parked_generations_in_mutation(
+		runtime,
+		pending_parked_retirements,
+		pending_parked_payload_retirements,
+		parked,
+	);
 	// This is the sole attached-shadow disposal seam used by file commands.
 	if let Some(existing_shadow) = shadow.take() {
 		let _ = discard_shadow_session(&existing_shadow);
@@ -6711,6 +6738,16 @@ pub fn main(editor) {
 				"cache-hit crossings must not retire either generation"
 			);
 			assert_eq!(
+				stats.authoritative_payload_bytes,
+				after_first_ingest.authoritative_payload_bytes,
+				"cache-hit crossings must not duplicate authoritative payload"
+			);
+			assert_eq!(
+				stats.orphaned_payload_bytes,
+				after_first_ingest.orphaned_payload_bytes,
+				"cache-hit crossings must not orphan either generation's payload"
+			);
+			assert_eq!(
 				engine.resolver.registered_device_counts(),
 				stable_devices,
 				"cache-hit crossings must consume zero backing devices"
@@ -6730,12 +6767,11 @@ pub fn main(editor) {
 			.flat_map(|pane| pane.tokens.iter())
 			.flat_map(|token| token.text.iter().copied())
 			.collect::<Vec<_>>();
+		let expected_owner = b"owner-nodes: live=2 parked=2 retired=2 allocated=6 roots=8 \xC2\xB7 owner-payload: live=0 B parked=0 B retired=0 B added=0 B";
 		assert!(
 			inspector_text
-				.windows(b"owner-nodes: live=2 parked=2 retired=2 allocated=6 roots=8".len())
-				.any(|window| {
-					window == b"owner-nodes: live=2 parked=2 retired=2 allocated=6 roots=8"
-				}),
+				.windows(expected_owner.len())
+				.any(|window| window == expected_owner),
 			"active and parked exact trees must reconcile in the owner header: {}",
 			String::from_utf8_lossy(&inspector_text)
 		);
@@ -6790,7 +6826,7 @@ pub fn main(editor) {
 
 	#[test]
 	fn parked_eviction_cancels_metric_scans_before_device_retirement() {
-		let registry = Arc::new(UastRegistry::new(2));
+		let registry = Arc::new(UastRegistry::new(3));
 		let (notify, _notifications) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
 		let languages = super::super::language::LanguageRegistry::new();
@@ -6801,12 +6837,12 @@ pub fn main(editor) {
 			init_script: None,
 			init_entrypoint: None,
 		};
-		let mut chunk = registry.reserve_chunk(2).expect("metric fixture nodes");
+		let mut chunk = registry.reserve_chunk(3).expect("metric fixture nodes");
 		let root = chunk.spawn_node(
 			crate::uast::SemanticKind::RelationalTable,
 			None,
 			crate::uast::SpanMetrics {
-				byte_length: 1,
+				byte_length: 2,
 				newlines: 0,
 			},
 		);
@@ -6824,6 +6860,16 @@ pub fn main(editor) {
 			},
 		);
 		chunk.append_local_child(root, leaf);
+		let authoritative = chunk.spawn_node(
+			crate::uast::SemanticKind::Token,
+			None,
+			crate::uast::SpanMetrics {
+				byte_length: 1,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, authoritative);
+		registry.replace_authoritative_data(authoritative, b"!".to_vec());
 		registry.register_backing_store(
 			77,
 			Arc::new(crate::svp::GeneratedBackingStore::new(1, |_| b'x')),
@@ -6832,28 +6878,33 @@ pub fn main(editor) {
 		assert!(registry.inspector_root_metrics_incomplete(root));
 		let retired_before = registry.stats().retired_nodes;
 
-		retire_parked_generations(
-			&runtime,
-			vec![ParkedGenerationRoot {
-				target: super::super::undo::GenerationTarget {
-					generation_id: 1,
-					path: "/generation/1".to_string(),
-					byte_len: 1,
-				},
-				root,
-				device_id: Some(77),
-				live_nodes: 2,
-				file_identity: crate::svp::BackingIdentity {
-					length: 1,
-					modified_nanos: 0,
-					file_id: None,
-				},
-			}],
+		assert_eq!(
+			retire_parked_generations(
+				&runtime,
+				vec![ParkedGenerationRoot {
+					target: super::super::undo::GenerationTarget {
+						generation_id: 1,
+						path: "/generation/1".to_string(),
+						byte_len: 2,
+					},
+					root,
+					device_id: Some(77),
+					live_nodes: 3,
+					payload_bytes: 1,
+					file_identity: crate::svp::BackingIdentity {
+						length: 2,
+						modified_nanos: 0,
+						file_id: None,
+					},
+				}],
+			),
+			(3, 1)
 		);
 
 		assert!(!registry.inspector_root_metrics_incomplete(root));
 		assert!(registry.backing_identity(77).is_none());
-		assert_eq!(registry.stats().retired_nodes, retired_before + 2);
+		assert_eq!(registry.stats().retired_nodes, retired_before + 3);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 1);
 	}
 
 	#[test]

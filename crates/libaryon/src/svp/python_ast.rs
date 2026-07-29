@@ -1,5 +1,7 @@
-use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::kind::{ProviderKindId, SemanticKind};
+#[cfg(test)]
+use crate::ecs::{NodeId, UastRegistry};
+#[cfg(test)]
 use crate::uast::metrics::SpanMetrics;
 use ruff_python_ast::{Mod, Stmt};
 use ruff_python_parser::Parsed;
@@ -354,6 +356,7 @@ fn count_nodes(node: &GreenNode) -> u32 {
 }
 
 /// Count newlines in text for a given byte range.
+#[cfg(test)]
 fn count_newlines_in_slice(text: &[u8], offset: u32, len: u32) -> u32 {
 	let start = offset as usize;
 	let end = (offset + len).min(text.len() as u32) as usize;
@@ -368,6 +371,7 @@ fn count_newlines_in_slice(text: &[u8], offset: u32, len: u32) -> u32 {
 ///
 /// `source` is the full source text — used to count newlines per span.
 /// `base_offset` is the byte offset of this node within the source.
+#[cfg(test)]
 fn graft_recursive(
 	registry: &UastRegistry,
 	node: &GreenNode,
@@ -456,6 +460,7 @@ fn graft_recursive(
 /// - Inserts nodes into the registry with proper LCRS topology
 /// - Splices the new root into the target's position in the tree
 /// - Stores the source text as virtual_data on leaf (Token) nodes
+#[cfg(test)]
 pub fn apply_python_semantic_update(
 	registry: &UastRegistry,
 	target_node_id: NodeId,
@@ -526,6 +531,7 @@ pub fn apply_python_semantic_update(
 
 /// Distribute the source text across leaf (Token) nodes as virtual_data.
 /// Each leaf gets the slice of source corresponding to its byte range.
+#[cfg(test)]
 fn distribute_virtual_data(registry: &UastRegistry, node_id: NodeId, source: &[u8], offset: u32) {
 	let idx = node_id.index();
 	let has_children = unsafe { (*registry.edges[idx].get()).first_child.is_some() };
@@ -547,7 +553,7 @@ fn distribute_virtual_data(registry: &UastRegistry, node_id: NodeId, source: &[u
 		let start = offset as usize;
 		let end = (start + byte_len).min(source.len());
 		if start < source.len() {
-			registry.hot_swap_virtual_data(node_id, source[start..end].to_vec());
+			registry.replace_authoritative_data(node_id, source[start..end].to_vec());
 		}
 	}
 }

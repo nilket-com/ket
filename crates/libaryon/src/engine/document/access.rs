@@ -1136,7 +1136,7 @@ mod tests {
 			},
 		);
 		chunk.append_local_child(root, leaf);
-		registry.hot_swap_virtual_data(leaf, bytes.to_vec());
+		registry.replace_authoritative_data(leaf, bytes.to_vec());
 		registry.metrics_inflated[leaf.index()].store(true, std::sync::atomic::Ordering::Release);
 		registry.set_terminal_newline(leaf, bytes.last() == Some(&b'\n'));
 		(registry, root)

@@ -170,6 +170,7 @@ fn handle_generation_substitute_all(
 	super::retire_parked_generations_in_mutation(
 		ctx,
 		&mut tab.document.pending_parked_retirements,
+		&mut tab.document.pending_parked_payload_retirements,
 		invalidated,
 	);
 	let generation_result =

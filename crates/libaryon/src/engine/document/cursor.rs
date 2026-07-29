@@ -568,7 +568,7 @@ mod tests {
 		assert_eq!(caret.abs_col(), DocDisplayCol::ZERO);
 
 		let bytes = registry.read_node_bytes_sync(first).unwrap();
-		registry.hot_swap_virtual_data(first, bytes);
+		registry.publish_hydrated_data(first, bytes);
 		assert!(place_cursor_at_line_col(
 			&registry,
 			root,

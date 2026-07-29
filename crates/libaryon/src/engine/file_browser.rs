@@ -40,12 +40,11 @@ pub(crate) fn create_file_browser_buffer(
 		},
 	);
 	chunk.append_local_child(root, leaf);
-	unsafe {
-		*registry.virtual_data[leaf.index()].get() = Some(Vec::new());
-	}
+	registry.replace_authoritative_data(leaf, Vec::new());
 	Ok((
 		FileBrowserBuffer {
 			root_id: root,
+			uast_accounting: super::session::UastOwnerAccounting::new(2),
 			topology_rev: TopologyRev::ZERO,
 			file_path: root_path.to_string_lossy().into_owned(),
 			state: FileBrowserState {
@@ -231,7 +230,20 @@ fn rebuild_file_browser_document(
 	let leaf = registry
 		.get_first_child(root)
 		.expect("file browser buffer always has its synthetic leaf");
+	let payload_before = registry.authoritative_payload_snapshot();
 	update_browser_document_text(registry, root, leaf, &text);
+	let payload_after = registry.authoritative_payload_snapshot();
+	tab.document.uast_accounting.record_payload_transaction(
+		payload_after
+			.added
+			.checked_sub(payload_before.added)
+			.expect("file-browser payload-added counter regressed"),
+		payload_after
+			.removed
+			.checked_sub(payload_before.removed)
+			.expect("file-browser payload-removed counter regressed"),
+		0,
+	);
 
 	tab.document.state.visible_rows = rows;
 
@@ -280,8 +292,8 @@ fn update_browser_document_text(registry: &UastRegistry, root: NodeId, leaf: Nod
 			newlines,
 		};
 		*registry.spans[leaf.index()].get() = None;
-		*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
 	}
+	registry.replace_authoritative_data(leaf, bytes.to_vec());
 }
 
 fn count_newlines(bytes: &[u8]) -> u64 {
