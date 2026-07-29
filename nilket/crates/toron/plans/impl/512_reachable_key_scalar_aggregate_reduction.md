@@ -51,6 +51,17 @@ Wire the helper into both engagement points **in the binder** (the frontend has 
   direct bind path only — an actuated graph re-bind forgoes the reduction, and the rewrite never
   re-enters the arm, so no shape oscillation with the root-swap passes is possible.
 
+**Semi build placement (added after the first sealed census).** The first census caught the rule
+engaging correctly while losing on wall time: the reduced aggregate's fold collapsed from
+10,614.6 ms to 1.2 ms, but the inserted semi built on the 48 M-row probe side — 11,796.2 ms and
+379,378,656 spilled bytes — because the smaller-build comparator gated on `JoinKind::Inner` and
+the semi's local admission is inner-only. The completing cut widens
+`hash_join_decision_with_placement` to `Inner | LeftSemi`: a semi's build side is pure physical
+placement (the swap is the executor's existing `RightSemi` via
+`mirrored_broadcast_physical_kind`, which the broadcast path already uses), the membership side
+is the natural build, and ADR 511's shrink-only rule applies unchanged. `LeftAnti` is the same
+shape and is deliberately left for a follow-on with a motivating case.
+
 Two path asymmetries are load-bearing and pinned rather than papered over: the deferred frontier
 rejects correlated COUNT (its coalesce does not compose with a wrapper), so COUNT coverage rides
 the qualified path's empty-group coalesce — which composes with the reduction because eliminated

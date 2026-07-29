@@ -26285,8 +26285,9 @@ async fn adr512_q17_shape_inserts_left_semi_under_reduction() {
 		.expect("bind q17 shape, reduction on");
 	let kinds = execution_join_kinds(&plan);
 	assert!(
-		kinds.contains(&JoinKind::LeftSemi),
-		"reduction on must insert a LeftSemi, got {kinds:?}"
+		kinds.contains(&JoinKind::RightSemi) || kinds.contains(&JoinKind::LeftSemi),
+		"reduction on must insert the semi (physically swapped to RightSemi \
+		 when the membership side is the smaller build), got {kinds:?}"
 	);
 
 	config.scalar_aggregate_input_reduction = false;
@@ -26295,8 +26296,8 @@ async fn adr512_q17_shape_inserts_left_semi_under_reduction() {
 		.expect("bind q17 shape, reduction off");
 	let kinds = execution_join_kinds(&plan);
 	assert!(
-		!kinds.contains(&JoinKind::LeftSemi),
-		"reduction off must not insert a LeftSemi, got {kinds:?}"
+		!kinds.contains(&JoinKind::LeftSemi) && !kinds.contains(&JoinKind::RightSemi),
+		"reduction off must not insert a semi, got {kinds:?}"
 	);
 }
 
@@ -26323,7 +26324,7 @@ async fn adr512_unfiltered_source_declines_reduction() {
 		.expect("bind unfiltered q17 shape");
 	let kinds = execution_join_kinds(&plan);
 	assert!(
-		!kinds.contains(&JoinKind::LeftSemi),
+		!kinds.contains(&JoinKind::LeftSemi) && !kinds.contains(&JoinKind::RightSemi),
 		"an unfiltered source must decline the reduction, got {kinds:?}"
 	);
 }
@@ -26363,7 +26364,7 @@ fn adr512_qualified_recombine_inserts_left_semi_under_reduction() {
 					.expect("bind qualified q17 shape, reduction on");
 				let kinds = execution_join_kinds(&plan);
 				assert!(
-					kinds.contains(&JoinKind::LeftSemi),
+					kinds.contains(&JoinKind::RightSemi) || kinds.contains(&JoinKind::LeftSemi),
 					"qualified recombine must engage the reduction, got {kinds:?}"
 				);
 
@@ -26373,7 +26374,7 @@ fn adr512_qualified_recombine_inserts_left_semi_under_reduction() {
 					.expect("bind qualified q17 shape, reduction off");
 				let kinds = execution_join_kinds(&plan);
 				assert!(
-					!kinds.contains(&JoinKind::LeftSemi),
+					!kinds.contains(&JoinKind::LeftSemi) && !kinds.contains(&JoinKind::RightSemi),
 					"reduction off must not engage, got {kinds:?}"
 				);
 			});
@@ -26381,4 +26382,60 @@ fn adr512_qualified_recombine_inserts_left_semi_under_reduction() {
 		.expect("spawn qualified-recombine thread")
 		.join()
 		.expect("qualified-recombine thread panicked");
+}
+
+#[test]
+fn adr512_left_semi_swaps_toward_smaller_filtered_membership_side() {
+	// The reduction emits LeftSemi(inner, filtered source); the smaller-build
+	// comparator must place the membership side as the build (the physical
+	// RightSemi), including under ADR 511's shrink-only rule for a
+	// filtered-without-estimate right side. Fails under the Inner-only gate,
+	// which kept the 48M-row probe as the natural left build on q17.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	let probe_left = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(5_758_680_840)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: None,
+		filtered_without_estimate: false,
+	};
+	let filtered_membership_right = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(240_000_000)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: None,
+		filtered_without_estimate: true,
+	};
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::LeftSemi,
+		join_input(probe_left),
+		join_input(filtered_membership_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
+	// Left staleness still declines for semis, exactly as for inner joins.
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::LeftSemi,
+		join_input(PlanOptimizerFacts {
+			filtered_without_estimate: true,
+			..probe_left
+		}),
+		join_input(PlanOptimizerFacts {
+			filtered_without_estimate: false,
+			..filtered_membership_right
+		}),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
 }

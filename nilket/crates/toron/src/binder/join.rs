@@ -1180,7 +1180,10 @@ pub(super) fn unthresholded_build_byte_candidate(
 }
 
 /// ADR 464: every auto hash fallback consults the smaller-build comparator for
-/// inner joins; anything else keeps the natural (left) build.
+/// inner joins; ADR 512 extends it to `LeftSemi`, whose swap is the existing
+/// physical `RightSemi` (`mirrored_broadcast_physical_kind`) — a semi's build
+/// side is pure placement, and the membership side is the natural build.
+/// Anything else keeps the natural (left) build.
 pub(super) fn hash_join_decision_with_placement(
 	kind: JoinKind,
 	left_input: JoinInputOptimization,
@@ -1199,7 +1202,10 @@ pub(super) fn hash_join_decision_with_placement(
 	} else {
 		left_input.facts.filtered_without_estimate || right_input.facts.filtered_without_estimate
 	};
-	if config.hash_smaller_build_placement && kind == JoinKind::Inner && !unknown_size {
+	if config.hash_smaller_build_placement
+		&& matches!(kind, JoinKind::Inner | JoinKind::LeftSemi)
+		&& !unknown_size
+	{
 		if let (Some(left), Some(right)) = (
 			unthresholded_build_byte_candidate(left_input.facts),
 			unthresholded_build_byte_candidate(right_input.facts),
