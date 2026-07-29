@@ -3820,6 +3820,15 @@ impl EditorSession {
 		registry: &UastRegistry,
 		name: &str,
 	) -> Result<(BufferId, bool), String> {
+		self.ensure_output_panel_split(registry, name, SplitDirection::Horizontal)
+	}
+
+	pub(crate) fn ensure_output_panel_split(
+		&mut self,
+		registry: &UastRegistry,
+		name: &str,
+		direction: SplitDirection,
+	) -> Result<(BufferId, bool), String> {
 		let buffer_id = if let Some(&buffer_id) = self.output_panels.get(name) {
 			if self.buffers.get(buffer_id).is_some() {
 				buffer_id
@@ -3844,7 +3853,7 @@ impl EditorSession {
 		)?;
 		let pane = EditorPane::from_view(view);
 		if self
-			.split_pane_with_new_pane_order(requester, SplitDirection::Horizontal, pane, false)
+			.split_pane_with_new_pane_order(requester, direction, pane, false)
 			.is_none()
 		{
 			return Err("Unable to open output panel".to_string());

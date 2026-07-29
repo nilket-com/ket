@@ -71,7 +71,11 @@ pub(crate) fn open_uast_inspector(
 		.find_map(|(panel_buffer_id, panel)| {
 			(panel.source_buffer_id == focused_buffer_id).then_some(*panel_buffer_id)
 		});
-	let (panel_buffer_id, _) = session.ensure_output_panel(registry, &panel_name)?;
+	let (panel_buffer_id, _) = session.ensure_output_panel_split(
+		registry,
+		&panel_name,
+		super::protocol::SplitDirection::Vertical,
+	)?;
 	let mode = requested_mode.unwrap_or(UastInspectorMode::Semantic);
 	if existing_panel_id == Some(panel_buffer_id)
 		&& let Some(panel) = session.uast_inspectors.get_mut(&panel_buffer_id)

@@ -447,6 +447,19 @@ mod tests {
 			})
 		});
 		assert_eq!(viewport.panes.len(), 2);
+		let inspector_pane = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title == "uast")
+			.expect("UAST inspector pane");
+		let source_pane = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title != "uast")
+			.expect("source pane");
+		assert_eq!(source_pane.rect.screen_row, inspector_pane.rect.screen_row);
+		assert_eq!(source_pane.rect.height, inspector_pane.rect.height);
+		assert!(source_pane.rect.screen_col < inspector_pane.rect.screen_col);
 		let inspector_text = viewport
 			.panes
 			.iter()
