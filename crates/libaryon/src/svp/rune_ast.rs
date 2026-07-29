@@ -872,7 +872,7 @@ mod tests {
 		apply_rune_semantic_update(&registry, target_id, &green, source);
 
 		let mut found_data = false;
-		for i in 0..registry.next_id.load(std::sync::atomic::Ordering::Relaxed) as usize {
+		for i in 0..registry.allocated_node_count() as usize {
 			let vd = unsafe { &*registry.virtual_data[i].get() };
 			if let Some(data) = vd
 				&& !data.is_empty()

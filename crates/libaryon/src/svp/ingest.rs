@@ -42,6 +42,7 @@ pub fn ingest_svp_file(
 
 	let mut first_leaf_id = None;
 	let mut last_leaf_id = None;
+	let mut leaf_ids = Vec::with_capacity(chunk_count as usize);
 
 	for i in 0..chunk_count {
 		let byte_offset = i * COLD_INGEST_EXTENT_SIZE as u64;
@@ -65,6 +66,7 @@ pub fn ingest_svp_file(
 			first_leaf_id = Some(leaf_id);
 		}
 		last_leaf_id = Some(leaf_id);
+		leaf_ids.push(leaf_id);
 
 		chunk.append_local_child(root_id, leaf_id);
 	}
@@ -100,8 +102,8 @@ pub fn ingest_svp_file(
 			let _ = registry.try_complete_metric_inflation(node, newline_count, ends_with_newline);
 			leaf = registry.get_next_sibling(node);
 		}
-	} else if let (Some(first), Some(last)) = (first_leaf_id, last_leaf_id) {
-		registry.begin_metric_scan(root_id, first, last);
+	} else if !leaf_ids.is_empty() {
+		registry.begin_metric_scan(root_id, leaf_ids.iter().copied());
 	}
 	registry.install_root_child_line_index(root_id);
 
@@ -112,6 +114,10 @@ pub fn ingest_svp_file(
 		let _ = (first, last);
 		for _ in 0..super::resolver::METRIC_SCAN_LANES {
 			if let Some(claim) = registry.claim_next_metric_scan(root_id) {
+				let Some(lifetime_lease) = registry.acquire_io_lifetime(claim.node_id) else {
+					registry.return_metric_scan_claim(root_id, claim);
+					break;
+				};
 				let request = SvpRequest {
 					node_id: claim.node_id,
 					pointer: claim.pointer,
@@ -121,9 +127,11 @@ pub fn ingest_svp_file(
 					scan_root: Some(root_id),
 					content_generation: claim.content_generation,
 					hydration_buffer: None,
+					lifetime_lease,
 				};
-				if resolver.request_queue.push(request).is_err() {
+				if let Err(request) = resolver.request_queue.push(request) {
 					registry.return_metric_scan_claim(root_id, claim);
+					drop(request);
 					break;
 				}
 			}
@@ -137,7 +145,7 @@ pub(crate) fn persist_line_index(registry: &UastRegistry, root: NodeId) {
 	let Some(first) = registry.get_first_child(root) else {
 		return;
 	};
-	let Some(span) = (unsafe { *registry.spans[first.index()].get() }) else {
+	let Some(span) = registry.node_span(first) else {
 		return;
 	};
 	let device_id = span.device_id;
@@ -161,7 +169,7 @@ pub(crate) fn persist_line_index(registry: &UastRegistry, root: NodeId) {
 		if registry.get_first_child(extent).is_some() {
 			return;
 		}
-		let Some(extent_span) = (unsafe { *registry.spans[extent.index()].get() }) else {
+		let Some(extent_span) = registry.node_span(extent) else {
 			return;
 		};
 		let span_offset = extent_span.lba * 512 + u64::from(extent_span.head_trim);
@@ -249,7 +257,7 @@ mod tests {
 			.expect_err("root plus extent cannot fit");
 		assert!(error.contains("Loading 1 bytes"));
 		assert!(error.contains("UAST registry"));
-		assert!(error.contains("Restart"));
+		assert!(error.contains("Wait for reclamation"));
 		assert_eq!(registry.stats().allocated_nodes, 0);
 	}
 

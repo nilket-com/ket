@@ -50,8 +50,8 @@ impl std::fmt::Display for GraftError {
 			} => write!(
 				f,
 				"UAST registry node capacity exhausted: graft needs {required} nodes but \
-				 only {remaining} remain; restart the editor (closing buffers does not \
-				 reclaim node IDs yet)"
+				 only {remaining} immediately reusable slots remain; wait for reclamation \
+				 or restart the editor"
 			),
 		}
 	}
@@ -867,7 +867,7 @@ mod tests {
 			},
 		);
 		chunk.append_local_child(root, cold_leaf);
-		registry.begin_metric_scan(root, cold_leaf, cold_leaf);
+		registry.begin_metric_scan(root, [cold_leaf]);
 
 		assert_eq!(registry.exact_line_count(root), None);
 		let module =

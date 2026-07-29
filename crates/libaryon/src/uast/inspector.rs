@@ -122,7 +122,11 @@ pub struct UastInspectorSnapshot {
 	pub root: NodeId,
 	pub total_bytes: u64,
 	pub allocated_nodes: u64,
+	pub allocation_events: u64,
 	pub capacity: u64,
+	pub reusable_slots: u64,
+	pub pending_reuse_slots: u64,
+	pub burned_slots: u64,
 	pub retired_nodes: u64,
 	pub authoritative_payload_bytes: u64,
 	pub orphaned_payload_bytes: u64,
@@ -156,6 +160,28 @@ impl UastRegistry {
 		root: NodeId,
 		options: UastInspectorOptions,
 	) -> UastInspectorSnapshot {
+		if !self.is_current_node(root) {
+			let stats = self.stats();
+			return UastInspectorSnapshot {
+				root,
+				total_bytes: 0,
+				allocated_nodes: stats.allocated_nodes,
+				allocation_events: stats.allocation_events,
+				capacity: stats.capacity,
+				reusable_slots: stats.reusable_slots,
+				pending_reuse_slots: stats.pending_reuse_slots,
+				burned_slots: stats.burned_slots,
+				retired_nodes: stats.retired_nodes,
+				authoritative_payload_bytes: stats.authoritative_payload_bytes,
+				orphaned_payload_bytes: stats.orphaned_payload_bytes,
+				orphaned_payload_bytes_reclaimed: stats.orphaned_payload_bytes_reclaimed,
+				reachable_visited: 0,
+				reachable_complete: false,
+				reachable_resident_bytes: 0,
+				cursor_scoped: false,
+				nodes: Vec::new(),
+			};
+		}
 		let max_nodes = options.max_nodes.max(1);
 		let document_end = self.get_total_bytes(root);
 		let root_metrics_incomplete = self.inspector_root_metrics_incomplete(root);
@@ -237,7 +263,11 @@ impl UastRegistry {
 			root,
 			total_bytes: self.get_total_bytes(root),
 			allocated_nodes: stats.allocated_nodes,
+			allocation_events: stats.allocation_events,
 			capacity: stats.capacity,
+			reusable_slots: stats.reusable_slots,
+			pending_reuse_slots: stats.pending_reuse_slots,
+			burned_slots: stats.burned_slots,
 			retired_nodes: stats.retired_nodes,
 			authoritative_payload_bytes: stats.authoritative_payload_bytes,
 			orphaned_payload_bytes: stats.orphaned_payload_bytes,

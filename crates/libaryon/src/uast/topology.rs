@@ -9,7 +9,7 @@ pub(crate) const TARGET_TREE_FANOUT: usize = 64;
 /// Instead of `Vec<NodeId>` which causes heap fragmentation, we use a
 /// Left-Child / Right-Sibling (LCRS) tree representation.
 /// This guarantees every node's topological footprint is exactly 12 bytes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TreeEdges {
 	pub parent: Option<NodeId>,
 	pub first_child: Option<NodeId>,

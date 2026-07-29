@@ -487,8 +487,8 @@ mod tests {
 		);
 		assert!(
 			inspector_text
-				.windows(b"global-allocated=".len())
-				.any(|window| window == b"global-allocated=")
+			.windows(b"slots=".len())
+			.any(|window| window == b"slots=")
 		);
 		assert!(
 			inspector_text

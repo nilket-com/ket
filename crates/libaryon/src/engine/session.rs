@@ -43,7 +43,7 @@ pub(crate) struct CachedSumTree {
 	pub(crate) state_id: StateId,
 	pub(crate) total_lines: u64,
 	pub(crate) total_bytes: u64,
-	pub(crate) topology_revision: u32,
+	pub(crate) topology_revision: u64,
 	pub(crate) tree: SumTree,
 }
 
@@ -3778,7 +3778,7 @@ impl EditorSession {
 		let document = buffers.get(buffer_id)?.text()?;
 		let root_before = document.root_id;
 		let accounting_before = document.uast_accounting;
-		let allocated_before = registry.allocated_node_count();
+		let allocated_before = registry.allocation_event_count();
 		let retired_before = registry.retired_node_count();
 		let payload_before = registry.authoritative_payload_snapshot();
 		let state_before = document.ledger.current_state_id;
@@ -3818,7 +3818,7 @@ impl EditorSession {
 			.and_then(Buffer::text_mut)
 			.expect("mutated text buffer must remain live");
 		let root_after = document.root_id;
-		let allocated_after = registry.allocated_node_count();
+		let allocated_after = registry.allocation_event_count();
 		let closure_retired_after = registry.retired_node_count();
 		let payload_after = registry.authoritative_payload_snapshot();
 		let allocated_delta = allocated_after.saturating_sub(allocated_before);
@@ -5320,6 +5320,68 @@ mod tests {
 			(GRAFTS - 1) * SOURCE.len() as u64
 		);
 		assert_eq!(reclaimed.retained() - baseline.retained(), live_payload);
+
+		let slot_high_water = registry.stats().allocated_nodes;
+		let allocation_events = registry.allocation_event_count();
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|editor| {
+				let retired_nodes = editor
+					.document
+					.uast_accounting
+					.current_live_nodes
+					.saturating_sub(1);
+				let retired_payload =
+					editor.document.uast_accounting.current_live_payload_bytes;
+				let graft = crate::engine::structural_graft::apply_graft_tracked(
+					&registry,
+					editor.document.root_id,
+					&green,
+					SOURCE,
+				)
+				.expect("recycled graft is byte-identical");
+				registry.retire_orphaned_forest(
+					graft.retired_heads,
+					retired_nodes,
+					retired_payload,
+					crate::ecs::registry::ReclaimFence::AfterPublication,
+				);
+				editor.document.bump_topology_rev();
+			},
+		)
+		.expect("graft through owner boundary");
+
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(
+			registry.stats().allocated_nodes,
+			slot_high_water,
+			"recycled graft must hold the slot high-water flat"
+		);
+		assert_eq!(
+			registry.allocation_event_count(),
+			allocation_events + 1,
+			"recycled publication remains an owner allocation event"
+		);
+		assert_eq!(
+			document.uast_accounting.allocated_nodes
+				- document.uast_accounting.retired_nodes,
+			document.uast_accounting.current_live_nodes
+				+ document.uast_accounting.parked_nodes,
+			"owner lifetime algebra must survive recycled allocation"
+		);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, document.root_id),
+			"owner live nodes must reconcile after recycled allocation"
+		);
 	}
 
 	#[test]
@@ -6908,8 +6970,8 @@ mod tests {
 		};
 		assert!(error.contains("Document creation refused"));
 		assert!(error.contains("UAST registry"));
-		assert!(error.contains("Restart"));
-		assert!(error.contains("closing buffers does not reclaim node IDs yet"));
+		assert!(error.contains("Wait for reclamation"));
+		assert!(error.contains("restart the editor"));
 		assert_eq!(registry.stats().allocated_nodes, 0);
 	}
 }

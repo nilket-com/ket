@@ -446,7 +446,7 @@ fn materialize_fold_boundary_uses_real_projection_trait_impl_methods() {
 		(
 			doc_line_of(
 				text,
-				"if let Some(child) = (*self.edges[node.index()].get()).first_child {",
+				"if let Some(child) = (*self.edges[index].get())",
 			),
 			DocDisplayCol::new(4),
 			"\tfn get_next_node_in_walk(",

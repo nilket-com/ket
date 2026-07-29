@@ -5,7 +5,6 @@ use crate::engine::language::LanguageProvider;
 use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 pub(super) const MAX_PREVIEW_MINIMAP_BYTES: u64 = 2 * 1024 * 1024;
 pub(super) const MAX_PREVIEW_MINIMAP_LINES: u64 = 8 * 1024;
@@ -420,8 +419,8 @@ pub(crate) fn build_search_minimap_bands(
 	(bands, active_search_band)
 }
 
-pub(super) fn next_registry_topology_revision(registry: &UastRegistry) -> u32 {
-	registry.next_id.load(Ordering::Acquire)
+pub(super) fn next_registry_topology_revision(registry: &UastRegistry) -> u64 {
+	registry.topology_revision()
 }
 
 fn normalize_line_density(byte_len: usize) -> u8 {

@@ -476,7 +476,7 @@ mod tests {
 		};
 		assert!(error.contains("File browser creation refused"));
 		assert!(error.contains("UAST registry"));
-		assert!(error.contains("Restart"));
+		assert!(error.contains("Wait for reclamation"));
 		assert_eq!(registry.stats().allocated_nodes, 0);
 		let _ = std::fs::remove_dir_all(root);
 	}

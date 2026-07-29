@@ -41,6 +41,7 @@ pub(crate) fn build_document(text: &str) -> (UastRegistry, crate::ecs::NodeId) {
 	unsafe {
 		*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
 	}
+	drop(chunk);
 	(registry, root)
 }
 
@@ -175,6 +176,7 @@ pub(crate) fn build_split_virtual_document(parts: &[&str]) -> (UastRegistry, cra
 		}
 	}
 
+	drop(chunk);
 	(registry, root)
 }
 
@@ -240,6 +242,7 @@ pub(crate) fn build_foldable_document() -> (UastRegistry, crate::ecs::NodeId, cr
 		*registry.virtual_data[folded_b.index()].get() = Some(b"two\n".to_vec());
 		*registry.virtual_data[tail.index()].get() = Some(b"tail".to_vec());
 	}
+	drop(chunk);
 	(registry, root, folded)
 }
 
@@ -299,6 +302,7 @@ pub(crate) fn build_root_with_rows() -> (
 		*registry.virtual_data[cell_a.index()].get() = Some(b"a\n".to_vec());
 		*registry.virtual_data[cell_b.index()].get() = Some(b"b\n".to_vec());
 	}
+	drop(chunk);
 	(registry, root, row_a, row_b)
 }
 
@@ -365,6 +369,7 @@ pub(crate) fn build_exact_metric_physical_document(
 		.register_device_path(78, path.to_str().expect("utf8 path"))
 		.expect("register backing");
 	registry.install_root_child_line_index(root);
+	drop(chunk);
 	(registry, root, path)
 }
 
@@ -700,5 +705,6 @@ pub(crate) fn build_mixed_save_document() -> (UastRegistry, crate::ecs::NodeId) 
 	}
 	registry.metrics_inflated[middle.index()].store(true, std::sync::atomic::Ordering::Release);
 	registry.set_terminal_newline(middle, false);
+	drop(chunk);
 	(registry, root)
 }

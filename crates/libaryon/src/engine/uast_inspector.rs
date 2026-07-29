@@ -545,13 +545,13 @@ pub(crate) fn activate_graph_node(
 			.ok_or_else(|| "The graph no longer belongs to a UAST inspector".to_string())?;
 		let expected_root = usize::try_from(selection.stamp.root_id)
 			.ok()
-			.and_then(|id| id.checked_sub(1))
-			.map(NodeId::from_index)
+			.and_then(|id| u32::try_from(id).ok())
+			.and_then(NodeId::from_raw)
 			.ok_or_else(|| "The graph carries an invalid root identity".to_string())?;
 		let selected_node = usize::try_from(selection.node_id)
 			.ok()
-			.and_then(|id| id.checked_sub(1))
-			.map(NodeId::from_index)
+			.and_then(|id| u32::try_from(id).ok())
+			.and_then(NodeId::from_raw)
 			.ok_or_else(|| "The graph carries an invalid node identity".to_string())?;
 		if panel.source_buffer_id != selection.stamp.source_buffer_id {
 			return Err("The graph no longer belongs to this source buffer".to_string());
@@ -653,7 +653,7 @@ fn jump_to_row(
 	}
 	session.ui.status_message = Some(format!(
 		"UAST #{} [{}..{}) → byte {}",
-		row.node_id.index() + 1,
+		row.node_id.raw(),
 		row.start_byte,
 		row.end_byte,
 		target
@@ -734,7 +734,7 @@ fn render_dot(
 	dot.push_str("  graph [rankdir=TB, bgcolor=\"transparent\"];\n");
 	dot.push_str("  node [shape=box, fontname=\"monospace\"];\n");
 	dot.push_str(&format!(
-		"  label=\"{} · reachable {}{} / global allocated {} / retired {}\";\n",
+		"  label=\"{} · reachable {}{} / slots {} / events {} / occupied {} / reusable {} / retired {}\";\n",
 		dot_escape(source_name),
 		snapshot.reachable_visited,
 		if snapshot.reachable_complete {
@@ -743,6 +743,11 @@ fn render_dot(
 			"+ (truncated)"
 		},
 		snapshot.allocated_nodes,
+		snapshot.allocation_events,
+		snapshot
+			.allocation_events
+			.saturating_sub(snapshot.retired_nodes),
+		snapshot.reusable_slots,
 		snapshot.retired_nodes,
 	));
 	for node in &snapshot.nodes {
@@ -751,9 +756,9 @@ fn render_dot(
 			.unwrap_or_else(|| semantic_name(node.semantic_kind).to_owned());
 		dot.push_str(&format!(
 			"  n{} [label=\"{}\\n#{} [{}..{})\\n{} · {}\"];\n",
-			node.node_id.index() + 1,
+			node.node_id.raw(),
 			dot_escape(&label),
-			node.node_id.index() + 1,
+			node.node_id.raw(),
 			node.start_byte,
 			node.end_byte,
 			semantic_name(node.semantic_kind),
@@ -762,8 +767,8 @@ fn render_dot(
 		if let Some(parent) = node.parent {
 			dot.push_str(&format!(
 				"  n{} -> n{};\n",
-				parent.index() + 1,
-				node.node_id.index() + 1
+				parent.raw(),
+				node.node_id.raw()
 			));
 		}
 	}
@@ -855,7 +860,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={}/{} global-retired={} authoritative-payload={} B orphaned-payload={} B reclaimed={} B reclaim-heads={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} slots={}/{} events={} occupied={} reusable={} pending={} burned={} global-retired={} authoritative-payload={} B orphaned-payload={} B reclaimed={} B reclaim-heads={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -863,13 +868,20 @@ fn render_snapshot(
 			.applied_structural_state_id
 			.map_or_else(|| "none".to_string(), |state| state.to_string()),
 		identity.topology_rev,
-		snapshot.root.index() + 1,
+		snapshot.root.raw(),
 		identity
 			.view_id
 			.map_or_else(|| "none".to_string(), |view| view.to_string()),
 		reachable,
 		snapshot.allocated_nodes,
 		snapshot.capacity,
+		snapshot.allocation_events,
+		snapshot
+			.allocation_events
+			.saturating_sub(snapshot.retired_nodes),
+		snapshot.reusable_slots,
+		snapshot.pending_reuse_slots,
+		snapshot.burned_slots,
 		snapshot.retired_nodes,
 		snapshot.authoritative_payload_bytes,
 		snapshot.orphaned_payload_bytes,
@@ -974,8 +986,8 @@ fn render_snapshot(
 			.and_then(|provider| provider.structural_kind_name(node.provider_kind))
 			.unwrap_or_else(|| semantic_name(node.semantic_kind).to_owned());
 		graph_nodes.push(UastGraphNode {
-			id: (node.node_id.index() + 1) as u32,
-			parent: graph_parent.map(|parent| (parent.index() + 1) as u32),
+			id: node.node_id.raw(),
+			parent: graph_parent.map(NodeId::raw),
 			depth: display_depth,
 			label: label.clone(),
 			semantic_kind: node.semantic_kind,
@@ -991,7 +1003,7 @@ fn render_snapshot(
 		text.push_str(&format!(
 			" · {} · #{} · [{}..{}) · nl={}{} · children={}{} · {}",
 			semantic_name(node.semantic_kind),
-			node.node_id.index() + 1,
+			node.node_id.raw(),
 			node.start_byte,
 			node.end_byte,
 			node.newlines,
@@ -1043,7 +1055,7 @@ fn render_snapshot(
 		graph: (mode == UastInspectorMode::Graph).then(|| UastGraphSnapshot {
 			stamp: UastGraphStamp {
 				source_buffer_id: stamp.source_buffer_id,
-				root_id: (stamp.root.index() + 1) as u32,
+				root_id: stamp.root.raw(),
 				state_id: stamp.state_id,
 				topology_rev: stamp.topology_rev,
 			},
@@ -1448,7 +1460,11 @@ mod tests {
 			root,
 			total_bytes: 20,
 			allocated_nodes: 4,
+			allocation_events: 4,
 			capacity: 16,
+			reusable_slots: 0,
+			pending_reuse_slots: 0,
+			burned_slots: 0,
 			retired_nodes: 7,
 			authoritative_payload_bytes: 20,
 			orphaned_payload_bytes: 10,
@@ -1557,7 +1573,9 @@ mod tests {
 		let text = String::from_utf8(rendered.text).expect("UTF-8 inspector");
 		assert!(text.contains("semantic: graft rejected"));
 		assert!(text.contains("pane=80x24 shown=4"));
-		assert!(text.contains("global-allocated=4/16 global-retired=7"));
+		assert!(text.contains(
+			"slots=4/16 events=4 occupied=0 reusable=0 pending=0 burned=0 global-retired=7"
+		));
 		let owner_line = text
 			.lines()
 			.find(|line| line.starts_with("owner-nodes:"))

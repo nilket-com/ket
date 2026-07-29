@@ -1,5 +1,5 @@
-use crate::ecs::chunk::RegistryChunk;
-use crate::ecs::id::NodeId;
+use crate::ecs::chunk::{RegistryChunk, ReservedSlot};
+use crate::ecs::id::{NODE_MAX_GENERATION, NODE_SLOT_MASK, NodeId};
 use crate::ecs::paged::PagedArray;
 use crate::svp::backing_store::{BackingIdentity, BackingStore, FileBackingStore};
 use crate::svp::pointer::SvpPointer;
@@ -13,16 +13,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegistryStatsSnapshot {
+	/// Highest bump-tail slot ever committed. This does not count reuse.
 	pub allocated_nodes: u64,
-	/// Fixed node-slot capacity. Slots remain monotonic until ADR 0001 stage 5.
+	/// Published node lifetimes, including recycled slots.
+	pub allocation_events: u64,
+	/// Fixed node-slot capacity. Retired slots can be reused with a new identity.
 	pub capacity: u64,
-	/// Nodes detached from live ownership. Stage-1 accounting does not reclaim
-	/// their slots, so this is retirement traffic rather than free capacity.
+	pub reusable_slots: u64,
+	pub pending_reuse_slots: u64,
+	pub burned_slots: u64,
+	/// Cumulative node-lifetime retirements. This is traffic, not a live gauge.
 	pub retired_nodes: u64,
 	pub cold_extents: u64,
 	pub hot_extents: u64,
@@ -137,6 +142,29 @@ struct PendingMetricInflation {
 	content_generation: u64,
 }
 
+const IO_LIFETIME_RETIRED: u64 = 1 << 63;
+const IO_LIFETIME_COUNT_MASK: u64 = IO_LIFETIME_RETIRED - 1;
+
+#[derive(Debug, Default)]
+struct SlotAllocator {
+	available: Vec<ReservedSlot>,
+	pending_reuse: u64,
+	burned: u64,
+}
+
+/// Keeps one node lifetime unavailable for reuse until a resolver request has
+/// performed its final slot and side-table write.
+pub(crate) struct IoLifetimeLease {
+	registry: Arc<UastRegistry>,
+	node: NodeId,
+}
+
+impl Drop for IoLifetimeLease {
+	fn drop(&mut self) {
+		self.registry.release_io_lifetime(self.node);
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WholeLeafReadOutcome {
 	InFlight,
@@ -148,8 +176,14 @@ pub(crate) enum WholeLeafReadOutcome {
 /// ==========================================
 /// Structure of Arrays (SoA) layout.
 pub struct UastRegistry {
-	pub capacity: u32,
-	pub next_id: AtomicU32,
+	capacity: u32,
+	next_id: AtomicU32,
+	allocator: Mutex<SlotAllocator>,
+	allocation_events: AtomicU64,
+	topology_revision: AtomicU64,
+	object_generation: PagedArray<AtomicU8>,
+	slot_published: PagedArray<AtomicBool>,
+	io_lifetime: PagedArray<AtomicU64>,
 
 	// Boxed slices of UnsafeCells.
 	// This allows concurrent mutable writes to disjoint indices without locks.
@@ -180,6 +214,11 @@ pub struct UastRegistry {
 	/// Ensures physical nodes are only inflated once.
 	pub metrics_inflated: PagedArray<AtomicBool>,
 	content_generation: PagedArray<AtomicU64>,
+	/// Set permanently for a slot when a content-generation increment can no
+	/// longer produce a unique value. The slot remains readable until logical
+	/// retirement, but rejects all resolver admission/publication and burns
+	/// instead of re-entering the allocator.
+	content_generation_exhausted: PagedArray<AtomicBool>,
 
 	/// 0 = unknown, 1 = known not to end in `\n`, 2 = known to end in `\n`.
 	/// This is separate from the newline count because line ownership at an
@@ -238,12 +277,28 @@ unsafe impl Sync for UastRegistry {}
 unsafe impl Send for UastRegistry {}
 
 impl UastRegistry {
+	fn allocator_state(&self) -> std::sync::MutexGuard<'_, SlotAllocator> {
+		self.allocator
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+	}
+
 	/// Pre-allocates the registry. 10GB dataset -> ~200M capacity.
 	pub fn new(capacity: u32) -> Self {
+		assert!(
+			capacity <= NODE_SLOT_MASK,
+			"UAST registry capacity exceeds the 24-bit NodeId slot field"
+		);
 		let cap = capacity as usize;
 		Self {
 			capacity,
 			next_id: AtomicU32::new(1), // Start at 1 to allow NonZeroU32 for NodeId
+			allocator: Mutex::new(SlotAllocator::default()),
+			allocation_events: AtomicU64::new(0),
+			topology_revision: AtomicU64::new(0),
+			object_generation: PagedArray::new(cap, || AtomicU8::new(0)),
+			slot_published: PagedArray::new(cap, || AtomicBool::new(false)),
+			io_lifetime: PagedArray::new(cap, || AtomicU64::new(0)),
 			kinds: PagedArray::new(cap, || UnsafeCell::new(SemanticKind::Token)),
 			provider_kinds: PagedArray::new(cap, || UnsafeCell::new(ProviderKindId::NONE)),
 			spans: PagedArray::new(cap, || UnsafeCell::new(None)),
@@ -257,6 +312,7 @@ impl UastRegistry {
 			metric_inflating: PagedArray::new(cap, || AtomicBool::new(false)),
 			metrics_inflated: PagedArray::new(cap, || AtomicBool::new(false)),
 			content_generation: PagedArray::new(cap, || AtomicU64::new(0)),
+			content_generation_exhausted: PagedArray::new(cap, || AtomicBool::new(false)),
 			terminal_newline_state: PagedArray::new(cap, || AtomicU8::new(0)),
 			metric_scans: Mutex::new(HashMap::new()),
 			incomplete_metric_roots: Mutex::new(HashSet::new()),
@@ -298,8 +354,8 @@ impl UastRegistry {
 
 	#[cfg(test)]
 	pub(crate) fn try_alloc_test_node(&self) -> Option<NodeId> {
-		let id_val = self.reserve_ids(1)?;
-		Some(NodeId::from_index(id_val as usize - 1))
+		let mut reservation = self.reserve_chunk(1)?;
+		Some(reservation.spawn_node(SemanticKind::Token, None, SpanMetrics::default()))
 	}
 
 	#[cfg(test)]
@@ -308,38 +364,291 @@ impl UastRegistry {
 			.expect("test registry node capacity")
 	}
 
-	/// Atomically reserves a chunk of `NodeId`s for a single thread.
-	/// Returns a `RegistryChunk` which grants lock-free write access to those specific indices.
+	/// Atomically reserves an exact ordered set of node slots for one thread.
+	/// Reusable slots are consumed before the bump tail; insufficient mixed
+	/// capacity changes no allocator state.
 	pub fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {
-		let start_id = self.reserve_ids(size)?;
-		Some(RegistryChunk::new(self, start_id, size))
+		let mut allocator = self.allocator_state();
+		let next = self.next_id.load(Ordering::Relaxed);
+		let tail_available = self.capacity.saturating_add(1).saturating_sub(next);
+		let available = u64::try_from(allocator.available.len())
+			.expect("available slot count fits u64")
+			.saturating_add(u64::from(tail_available));
+		if u64::from(size) > available {
+			return None;
+		}
+
+		let reused_count = usize::try_from(size)
+			.expect("reservation size fits usize")
+			.min(allocator.available.len());
+		let mut slots = Vec::with_capacity(size as usize);
+		for _ in 0..reused_count {
+			slots.push(allocator.available.pop().expect("count checked"));
+		}
+		let fresh_count = size - u32::try_from(reused_count).expect("reused count fits u32");
+		for offset in 0..fresh_count {
+			let slot_code = next.checked_add(offset).expect("capacity bounds slot code");
+			let id = NodeId::from_parts((slot_code - 1) as usize, 0)
+				.expect("registry capacity fits NodeId slot field");
+			slots.push(ReservedSlot { id, reused: false });
+		}
+		if fresh_count > 0 {
+			self.next_id.store(next + fresh_count, Ordering::Release);
+		}
+		drop(allocator);
+		self.bump_inspector_revision();
+		Some(RegistryChunk::new(self, slots))
 	}
 
-	fn reserve_ids(&self, size: u32) -> Option<u32> {
-		let limit = self.capacity.saturating_add(1);
-		let mut start_id = self.next_id.load(Ordering::Relaxed);
+	pub(crate) fn return_unpublished_slots(&self, slots: &[ReservedSlot]) {
+		if slots.is_empty() {
+			return;
+		}
+		self.allocator_state().available.extend_from_slice(slots);
+		self.bump_inspector_revision();
+	}
+
+	pub(crate) fn initialize_reserved_node(
+		&self,
+		ticket: ReservedSlot,
+		kind: SemanticKind,
+		provider_kind: ProviderKindId,
+		span: Option<SvpPointer>,
+		metric: SpanMetrics,
+	) -> NodeId {
+		let node = ticket.id;
+		let idx = node.index();
+		assert!(
+			idx < self.capacity as usize,
+			"reserved slot exceeds registry"
+		);
+		if ticket.reused {
+			assert!(
+				!self.content_generation_exhausted[idx].load(Ordering::Acquire),
+				"content-exhausted slots must be burned, never reserved"
+			);
+			assert_eq!(
+				self.object_generation[idx]
+					.load(Ordering::Acquire)
+					.checked_add(1)
+					.expect("generation-255 slots must burn before reservation"),
+				node.generation(),
+				"recycled slot generation must advance exactly once"
+			);
+			assert_eq!(
+				self.io_lifetime[idx].load(Ordering::Acquire),
+				IO_LIFETIME_RETIRED,
+				"recycled slot must be retired and I/O-quiescent"
+			);
+			let _ = self.bump_content_generation_index(idx, node);
+		} else {
+			assert_eq!(node.generation(), 0, "fresh slots start at generation zero");
+		}
+
+		self.scrub_node_side_tables(node);
+		{
+			let _resident_write = self.resident_data_lock.write().unwrap();
+			unsafe {
+				*self.kinds[idx].get() = kind;
+				*self.provider_kinds[idx].get() = provider_kind;
+				*self.spans[idx].get() = span;
+				*self.metrics[idx].get() = metric;
+				*self.edges[idx].get() = TreeEdges::default();
+				*self.child_tails[idx].get() = None;
+				*self.virtual_data[idx].get() = None;
+				(&mut *self.partial_residency[idx].get()).clear();
+				*self.resident_lru_links[idx].get() = ResidentLruLinks::default();
+			}
+			self.dma_in_flight[idx].store(false, Ordering::Release);
+			self.metric_inflating[idx].store(false, Ordering::Release);
+			self.metrics_inflated[idx].store(false, Ordering::Release);
+			self.terminal_newline_state[idx].store(0, Ordering::Release);
+			assert_eq!(
+				self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel),
+				0,
+				"reusable slot retained resident accounting"
+			);
+			assert!(
+				!self.resident_counted_hot[idx].swap(false, Ordering::AcqRel),
+				"reusable slot retained hot-residency accounting"
+			);
+		}
+		self.object_generation[idx].store(node.generation(), Ordering::Release);
+		self.io_lifetime[idx].store(0, Ordering::Release);
+		self.slot_published[idx].store(true, Ordering::Release);
+		Self::checked_monotonic_add(
+			&self.allocation_events,
+			1,
+			"registry allocation-event counter exhausted",
+		);
+		Self::checked_monotonic_add(
+			&self.topology_revision,
+			1,
+			"registry topology revision exhausted",
+		);
+		self.bump_inspector_revision();
+		node
+	}
+
+	pub(crate) fn is_current_node(&self, node: NodeId) -> bool {
+		let idx = node.index();
+		idx < self.capacity as usize
+			&& self.slot_published[idx].load(Ordering::Acquire)
+			&& self.object_generation[idx].load(Ordering::Acquire) == node.generation()
+	}
+
+	pub(crate) fn checked_node_index(&self, node: NodeId) -> Option<usize> {
+		self.is_current_node(node).then(|| node.index())
+	}
+
+	pub(crate) fn acquire_io_lifetime(self: &Arc<Self>, node: NodeId) -> Option<IoLifetimeLease> {
+		// Serialize the validation-to-lease transition with retirement and
+		// free-list publication. Without this lock, an old identity could pass
+		// validation, lose its lifetime, and increment the replacement
+		// object's lease count after first reuse.
+		let _allocator = self.allocator_state();
+		let idx = self.checked_node_index(node)?;
+		if self.content_generation_exhausted[idx].load(Ordering::Acquire) {
+			return None;
+		}
+		let state = &self.io_lifetime[idx];
 		loop {
-			let end_id = start_id.checked_add(size)?;
-			if end_id > limit {
+			let current = state.load(Ordering::Acquire);
+			if current & IO_LIFETIME_RETIRED != 0
+				|| current & IO_LIFETIME_COUNT_MASK == IO_LIFETIME_COUNT_MASK
+			{
 				return None;
 			}
-			match self.next_id.compare_exchange_weak(
-				start_id,
-				end_id,
-				Ordering::Relaxed,
-				Ordering::Relaxed,
-			) {
-				Ok(_) => {
-					self.bump_inspector_revision();
-					return Some(start_id);
-				}
-				Err(observed) => start_id = observed,
+			if state
+				.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+				.is_ok()
+			{
+				return Some(IoLifetimeLease {
+					registry: Arc::clone(self),
+					node,
+				});
 			}
 		}
 	}
 
+	fn release_io_lifetime(&self, node: NodeId) {
+		let idx = node.index();
+		let previous = self.io_lifetime[idx].fetch_sub(1, Ordering::AcqRel);
+		assert!(
+			previous & IO_LIFETIME_COUNT_MASK > 0,
+			"resolver lifetime lease underflow"
+		);
+		if previous == IO_LIFETIME_RETIRED | 1 {
+			self.finalize_reusable_slot(node, true);
+		}
+	}
+
+	fn retire_io_lifetime(&self, node: NodeId) {
+		let idx = node.index();
+		let mut allocator = self.allocator_state();
+		let previous = self.io_lifetime[idx].fetch_or(IO_LIFETIME_RETIRED, Ordering::AcqRel);
+		if previous & IO_LIFETIME_RETIRED != 0 {
+			return;
+		}
+		if previous & IO_LIFETIME_COUNT_MASK == 0 {
+			drop(allocator);
+			self.finalize_reusable_slot(node, false);
+		} else {
+			allocator.pending_reuse += 1;
+			drop(allocator);
+			self.bump_inspector_revision();
+		}
+	}
+
+	fn finalize_reusable_slot(&self, node: NodeId, was_pending: bool) {
+		let idx = node.index();
+		assert_eq!(
+			self.io_lifetime[idx].load(Ordering::Acquire),
+			IO_LIFETIME_RETIRED,
+			"only retired I/O-quiescent slots are reusable"
+		);
+		self.scrub_node_side_tables(node);
+		self.slot_published[idx].store(false, Ordering::Release);
+		let content_exhausted = self.content_generation_exhausted[idx].load(Ordering::Acquire);
+		let mut allocator = self.allocator_state();
+		if was_pending {
+			allocator.pending_reuse = allocator
+				.pending_reuse
+				.checked_sub(1)
+				.expect("pending reuse counter underflow");
+		}
+		if node.generation() == NODE_MAX_GENERATION || content_exhausted {
+			allocator.burned = allocator.burned.saturating_add(1);
+		} else {
+			let id = NodeId::from_parts(idx, node.generation() + 1)
+				.expect("existing slot fits packed NodeId");
+			allocator.available.push(ReservedSlot { id, reused: true });
+		}
+		drop(allocator);
+		self.bump_inspector_revision();
+	}
+
+	fn scrub_node_side_tables(&self, node: NodeId) {
+		let mut removed_pending = 0u64;
+		let mut empty_scans = Vec::new();
+		{
+			let mut scans = self.metric_scans.lock().unwrap();
+			if let Some(scan) = scans.remove(&node) {
+				removed_pending = removed_pending.saturating_add(scan.pending.len() as u64);
+			}
+			for (root, scan) in scans.iter_mut() {
+				if scan.pending.remove(&node) {
+					removed_pending = removed_pending.saturating_add(1);
+				}
+				scan.unclaimed.retain(|claim| claim.node_id != node);
+				if scan.pending.is_empty() && scan.in_flight == 0 {
+					empty_scans.push(*root);
+				}
+			}
+			for root in empty_scans {
+				scans.remove(&root);
+			}
+		}
+		if removed_pending > 0 {
+			let _ = self.pending_scan_blocks.fetch_update(
+				Ordering::AcqRel,
+				Ordering::Acquire,
+				|current| Some(current.saturating_sub(removed_pending)),
+			);
+		}
+		self.whole_leaf_read_outcomes
+			.lock()
+			.unwrap()
+			.retain(|(candidate, _), _| *candidate != node);
+		self.pending_metric_inflations
+			.lock()
+			.unwrap()
+			.retain(|entry| entry.node_id != node && entry.scan_root != Some(node));
+		self.incomplete_metric_roots.lock().unwrap().remove(&node);
+		let mut indexes = self.root_child_line_indexes.write().unwrap();
+		indexes.remove(&node);
+		for index in indexes.values_mut() {
+			index.remove(node);
+		}
+		drop(indexes);
+		for nodes in self.viewport_resident_pins.lock().unwrap().values_mut() {
+			nodes.remove(&node);
+		}
+		self.high_priority_started.lock().unwrap().remove(&node);
+	}
+
+	pub(crate) fn topology_revision(&self) -> u64 {
+		self.topology_revision.load(Ordering::Acquire)
+	}
+
+	/// Highest bump-tail slot ever committed. Recycled allocation does not
+	/// change this value.
 	pub(crate) fn allocated_node_count(&self) -> u64 {
 		u64::from(self.next_id.load(Ordering::Acquire).saturating_sub(1))
+	}
+
+	pub(crate) fn allocation_event_count(&self) -> u64 {
+		self.allocation_events.load(Ordering::Acquire)
 	}
 
 	pub(crate) fn capacity(&self) -> u64 {
@@ -347,14 +656,17 @@ impl UastRegistry {
 	}
 
 	pub(crate) fn remaining_node_capacity(&self) -> u64 {
-		self.capacity().saturating_sub(self.allocated_node_count())
+		let allocator = self.allocator_state();
+		self.capacity()
+			.saturating_sub(self.allocated_node_count())
+			.saturating_add(allocator.available.len() as u64)
 	}
 
 	pub(crate) fn capacity_refusal_message(&self, operation: &str, required: u64) -> String {
 		format!(
 			"{operation} refused: UAST registry node capacity exhausted; needs {required} \
-			 nodes but only {} remain. Restart the editor (closing buffers does not \
-			 reclaim node IDs yet)",
+			 nodes but only {} immediately reusable slots remain. Wait for reclamation \
+			 or restart the editor",
 			self.remaining_node_capacity()
 		)
 	}
@@ -471,16 +783,18 @@ impl UastRegistry {
 		std::mem::take(&mut *self.retired_forest_outbox.lock().unwrap())
 	}
 
-	/// Drop payload from one node in a retired forest without changing its
-	/// identity, topology, metrics, or physical span.
+	/// Drop payload from one node in a retired forest, then retire its object
+	/// lifetime once all resolver leases are quiescent.
 	///
 	/// Reclamation and physical splits are engine-thread serialized. Advancing
 	/// the generation while holding the residency write lock makes every late
 	/// whole/partial resolver publication fail before it can resurrect bytes.
 	pub(crate) fn reclaim_orphaned_payload(&self, node: NodeId) -> ReclaimedPayload {
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
-		let _ = self.bump_content_generation(node);
+		let Some(idx) = self.checked_node_index(node) else {
+			return ReclaimedPayload::default();
+		};
+		let _ = self.bump_content_generation_index(idx, node);
 		let spanless = unsafe { (*self.spans[idx].get()).is_none() };
 		let full_len = unsafe {
 			(&mut *self.virtual_data[idx].get())
@@ -521,6 +835,8 @@ impl UastRegistry {
 			}
 		};
 		self.bump_inspector_revision();
+		drop(_resident_write);
+		self.retire_io_lifetime(node);
 		reclaimed
 	}
 
@@ -529,8 +845,14 @@ impl UastRegistry {
 	/// Authoritative writes are engine-serialized. The residency lock keeps the
 	/// payload and its byte accounting atomic with respect to resolver threads.
 	pub(crate) fn replace_authoritative_data(&self, node: NodeId, data: Vec<u8>) {
+		let idx = self
+			.checked_node_index(node)
+			.expect("authoritative write targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
+		assert!(
+			self.is_current_node(node),
+			"authoritative write raced a retired UAST node"
+		);
 		assert!(
 			unsafe { (*self.spans[idx].get()).is_none() },
 			"authoritative payload requires a span-less node"
@@ -552,8 +874,14 @@ impl UastRegistry {
 		node: NodeId,
 		mutate: impl FnOnce(&mut Vec<u8>) -> R,
 	) -> R {
+		let idx = self
+			.checked_node_index(node)
+			.expect("authoritative mutation targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
+		assert!(
+			self.is_current_node(node),
+			"authoritative mutation raced a retired UAST node"
+		);
 		assert!(
 			unsafe { (*self.spans[idx].get()).is_none() },
 			"authoritative payload mutation requires a span-less node"
@@ -573,9 +901,16 @@ impl UastRegistry {
 
 	/// Publish reconstructible full data for a span-backed node.
 	pub(crate) fn publish_hydrated_data(&self, node: NodeId, data: Vec<u8>) {
+		let idx = self
+			.checked_node_index(node)
+			.expect("hydration targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
 		assert!(
-			unsafe { (*self.spans[node.index()].get()).is_some() },
+			self.is_current_node(node),
+			"hydration raced a retired UAST node"
+		);
+		assert!(
+			unsafe { (*self.spans[idx].get()).is_some() },
 			"hydrated payload requires a physical span"
 		);
 		self.replace_virtual_data_locked(node, data);
@@ -583,8 +918,14 @@ impl UastRegistry {
 
 	/// Remove reconstructible full data for a physical split.
 	pub(crate) fn take_hydrated_data(&self, node: NodeId) -> Option<Vec<u8>> {
+		let idx = self
+			.checked_node_index(node)
+			.expect("hydrated payload take targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
+		assert!(
+			self.is_current_node(node),
+			"hydrated payload take raced a retired UAST node"
+		);
 		assert!(
 			unsafe { (*self.spans[idx].get()).is_some() },
 			"hydrated payload take requires a physical span"
@@ -607,8 +948,14 @@ impl UastRegistry {
 
 	/// Convert a physical node's retained full payload into its sole copy.
 	pub(crate) fn promote_hydrated_data(&self, node: NodeId) {
+		let idx = self
+			.checked_node_index(node)
+			.expect("promotion targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
+		assert!(
+			self.is_current_node(node),
+			"promotion raced a retired UAST node"
+		);
 		assert!(
 			unsafe { (*self.spans[idx].get()).is_some() },
 			"promotion requires a physical span"
@@ -644,13 +991,15 @@ impl UastRegistry {
 	/// Rebind a leaf to the just-saved file generation and discard its resident
 	/// copy. Existing physical leaves change device without entering owner
 	/// accounting; virtual leaves leave it exactly once.
-	pub(crate) fn rebind_data_to_saved_span(
-		&self,
-		node: NodeId,
-		span: Option<SvpPointer>,
-	) {
+	pub(crate) fn rebind_data_to_saved_span(&self, node: NodeId, span: Option<SvpPointer>) {
+		let idx = self
+			.checked_node_index(node)
+			.expect("saved-span rebind targets a stale UAST node");
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		let idx = node.index();
+		assert!(
+			self.is_current_node(node),
+			"saved-span rebind raced a retired UAST node"
+		);
 		let was_authoritative = unsafe { (*self.spans[idx].get()).is_none() };
 		let authoritative_len = if was_authoritative {
 			unsafe {
@@ -794,7 +1143,11 @@ impl UastRegistry {
 		data: Vec<u8>,
 	) -> bool {
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		if self.content_generation(node) != expected_generation {
+		if !self.is_current_node(node)
+			|| self.io_lifetime[node.index()].load(Ordering::Acquire) & IO_LIFETIME_RETIRED != 0
+			|| self.content_generation_exhausted[node.index()].load(Ordering::Acquire)
+			|| self.content_generation(node) != expected_generation
+		{
 			return false;
 		}
 		assert!(
@@ -806,13 +1159,30 @@ impl UastRegistry {
 	}
 
 	pub(crate) fn content_generation(&self, node: NodeId) -> u64 {
-		self.content_generation[node.index()].load(Ordering::Acquire)
+		self.checked_node_index(node).map_or(u64::MAX, |idx| {
+			self.content_generation[idx].load(Ordering::Acquire)
+		})
 	}
 
 	pub(crate) fn bump_content_generation(&self, node: NodeId) -> u64 {
-		let generation = self.content_generation[node.index()]
-			.fetch_add(1, Ordering::AcqRel)
-			.saturating_add(1);
+		let Some(idx) = self.checked_node_index(node) else {
+			return u64::MAX;
+		};
+		self.bump_content_generation_index(idx, node)
+	}
+
+	fn bump_content_generation_index(&self, idx: usize, node: NodeId) -> u64 {
+		let generation = match self.content_generation[idx].fetch_update(
+			Ordering::AcqRel,
+			Ordering::Acquire,
+			|current| current.checked_add(1),
+		) {
+			Ok(previous) => previous + 1,
+			Err(_) => {
+				self.content_generation_exhausted[idx].store(true, Ordering::Release);
+				u64::MAX
+			}
+		};
 		self.whole_leaf_read_outcomes
 			.lock()
 			.unwrap()
@@ -822,7 +1192,26 @@ impl UastRegistry {
 
 	pub(crate) fn whole_leaf_is_resident(&self, node: NodeId) -> bool {
 		let _resident_read = self.resident_data_lock.read().unwrap();
-		unsafe { (&*self.virtual_data[node.index()].get()).is_some() }
+		self.checked_node_index(node)
+			.is_some_and(|idx| unsafe { (&*self.virtual_data[idx].get()).is_some() })
+	}
+
+	pub(crate) fn node_span(&self, node: NodeId) -> Option<SvpPointer> {
+		let idx = self.checked_node_index(node)?;
+		unsafe { *self.spans[idx].get() }
+	}
+
+	pub(crate) fn begin_dma(&self, node: NodeId) -> bool {
+		let Some(idx) = self.checked_node_index(node) else {
+			return false;
+		};
+		!self.dma_in_flight[idx].swap(true, Ordering::AcqRel)
+	}
+
+	pub(crate) fn finish_dma(&self, node: NodeId) {
+		if let Some(idx) = self.checked_node_index(node) {
+			self.dma_in_flight[idx].store(false, Ordering::Release);
+		}
 	}
 
 	pub(crate) fn whole_leaf_read_outcome(
@@ -857,7 +1246,7 @@ impl UastRegistry {
 
 	pub(crate) fn finish_whole_leaf_read(&self, node: NodeId, generation: u64, succeeded: bool) {
 		let mut outcomes = self.whole_leaf_read_outcomes.lock().unwrap();
-		if self.content_generation(node) != generation {
+		if !self.is_current_node(node) || self.content_generation(node) != generation {
 			outcomes.remove(&(node, generation));
 			return;
 		}
@@ -938,7 +1327,11 @@ impl UastRegistry {
 		data: Vec<u8>,
 	) -> bool {
 		let _resident_write = self.resident_data_lock.write().unwrap();
-		if self.content_generation(node) != expected_generation {
+		if !self.is_current_node(node)
+			|| self.io_lifetime[node.index()].load(Ordering::Acquire) & IO_LIFETIME_RETIRED != 0
+			|| self.content_generation_exhausted[node.index()].load(Ordering::Acquire)
+			|| self.content_generation(node) != expected_generation
+		{
 			return false;
 		}
 		assert!(
@@ -1136,9 +1529,14 @@ impl UastRegistry {
 
 	pub fn stats(&self) -> RegistryStatsSnapshot {
 		let payload = self.authoritative_payload_snapshot();
+		let allocator = self.allocator_state();
 		RegistryStatsSnapshot {
 			allocated_nodes: self.allocated_node_count(),
+			allocation_events: self.allocation_event_count(),
 			capacity: self.capacity(),
+			reusable_slots: allocator.available.len() as u64,
+			pending_reuse_slots: allocator.pending_reuse,
+			burned_slots: allocator.burned,
 			retired_nodes: self.retired_node_count(),
 			cold_extents: self.cold_extent_count.load(Ordering::Acquire),
 			hot_extents: self.hot_extent_count.load(Ordering::Acquire),
@@ -1174,6 +1572,16 @@ impl UastRegistry {
 		node: NodeId,
 		snippet_limit: usize,
 	) -> InspectorNodeMetadata {
+		if !self.is_current_node(node) {
+			return InspectorNodeMetadata {
+				has_physical_span: false,
+				has_full_residency: false,
+				has_partial_residency: false,
+				resident_bytes: 0,
+				snippet: None,
+				metric_inflated: false,
+			};
+		}
 		let _resident_read = self.resident_data_lock.read().unwrap();
 		let idx = node.index();
 		let (has_physical_span, full, partial) = unsafe {
@@ -1350,16 +1758,18 @@ impl UastRegistry {
 		}
 	}
 
-	pub fn begin_metric_scan(&self, root: NodeId, first_leaf: NodeId, last_leaf: NodeId) {
+	pub fn begin_metric_scan(&self, root: NodeId, leaves: impl IntoIterator<Item = NodeId>) {
+		assert!(
+			self.is_current_node(root),
+			"metric scan root must be a current UAST node"
+		);
 		self.incomplete_metric_roots.lock().unwrap().remove(&root);
-		let end = last_leaf
-			.index()
-			.checked_add(1)
-			.expect("metric scan extent range overflow");
 		let mut unclaimed = VecDeque::new();
 		let mut pending = HashSet::new();
-		for index in first_leaf.index()..end {
-			let node_id = NodeId::from_index(index);
+		for node_id in leaves {
+			let index = self
+				.checked_node_index(node_id)
+				.expect("metric scan leaf must be a current UAST node");
 			let pointer = unsafe { *self.spans[index].get() }
 				.expect("initial metric scan range contains only physical extents");
 			unclaimed.push_back(MetricScanClaim {
@@ -1486,7 +1896,8 @@ impl UastRegistry {
 	}
 
 	pub(crate) fn terminal_newline(&self, node: NodeId) -> Option<bool> {
-		match self.terminal_newline_state[node.index()].load(Ordering::Acquire) {
+		let idx = self.checked_node_index(node)?;
+		match self.terminal_newline_state[idx].load(Ordering::Acquire) {
 			1 => Some(false),
 			2 => Some(true),
 			_ => None,
@@ -1494,12 +1905,17 @@ impl UastRegistry {
 	}
 
 	pub(crate) fn set_terminal_newline(&self, node: NodeId, ends_with_newline: bool) {
-		self.terminal_newline_state[node.index()]
+		let idx = self
+			.checked_node_index(node)
+			.expect("terminal-newline write targets a stale UAST node");
+		self.terminal_newline_state[idx]
 			.store(if ends_with_newline { 2 } else { 1 }, Ordering::Release);
 	}
 
 	pub(crate) fn clear_terminal_newline(&self, node: NodeId) {
-		self.terminal_newline_state[node.index()].store(0, Ordering::Release);
+		if let Some(idx) = self.checked_node_index(node) {
+			self.terminal_newline_state[idx].store(0, Ordering::Release);
+		}
 	}
 
 	pub(crate) fn queue_metric_inflation(
@@ -1534,7 +1950,9 @@ impl UastRegistry {
 			.collect();
 		let mut completed_roots = Vec::new();
 		for result in pending {
-			if self.content_generation(result.node_id) != result.content_generation {
+			if !self.is_current_node(result.node_id)
+				|| self.content_generation(result.node_id) != result.content_generation
+			{
 				if let Some(root) = result.scan_root {
 					self.record_metric_scan_failure(root, result.node_id);
 				}
@@ -1669,7 +2087,9 @@ impl UastRegistry {
 
 	pub fn read_node_bytes_sync(&self, node: NodeId) -> io::Result<Vec<u8>> {
 		let _resident_read = self.resident_data_lock.read().unwrap();
-		let idx = node.index();
+		let idx = self
+			.checked_node_index(node)
+			.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stale UAST node identity"))?;
 		unsafe {
 			if let Some(v_data) = &*self.virtual_data[idx].get() {
 				return Ok(v_data.clone());
@@ -1688,7 +2108,9 @@ impl UastRegistry {
 	}
 
 	pub fn ensure_metrics_inflated(&self, node: NodeId) {
-		let idx = node.index();
+		let Some(idx) = self.checked_node_index(node) else {
+			return;
+		};
 		loop {
 			if self.metrics_inflated[idx].load(Ordering::Acquire) {
 				return;
@@ -1720,7 +2142,9 @@ impl UastRegistry {
 	/// Resolves either physical SvpPointer or virtual_data into raw bytes.
 	pub fn resolve_physical_bytes(&self, node: NodeId) -> Vec<u8> {
 		let _resident_read = self.resident_data_lock.read().unwrap();
-		let idx = node.index();
+		let Some(idx) = self.checked_node_index(node) else {
+			return Vec::new();
+		};
 		unsafe {
 			if let Some(v_data) = &*self.virtual_data[idx].get() {
 				return v_data.clone();
@@ -1731,26 +2155,35 @@ impl UastRegistry {
 	}
 
 	pub fn get_first_child(&self, node: NodeId) -> Option<NodeId> {
-		unsafe { (*self.edges[node.index()].get()).first_child }
+		let idx = self.checked_node_index(node)?;
+		unsafe { (*self.edges[idx].get()).first_child }.filter(|child| self.is_current_node(*child))
 	}
 
 	pub fn get_total_newlines(&self, node: NodeId) -> u64 {
-		unsafe { (*self.metrics[node.index()].get()).newlines }
+		self.checked_node_index(node)
+			.map_or(0, |idx| unsafe { (*self.metrics[idx].get()).newlines })
 	}
 
 	pub fn get_total_bytes(&self, node: NodeId) -> u64 {
-		unsafe { (*self.metrics[node.index()].get()).byte_length }
+		self.checked_node_index(node)
+			.map_or(0, |idx| unsafe { (*self.metrics[idx].get()).byte_length })
 	}
 
 	pub fn get_prev_sibling(&self, node: NodeId) -> Option<NodeId> {
-		let parent = unsafe { (*self.edges[node.index()].get()).parent }?;
-		let first_child = unsafe { (*self.edges[parent.index()].get()).first_child }?;
+		let idx = self.checked_node_index(node)?;
+		let parent = unsafe { (*self.edges[idx].get()).parent }
+			.filter(|parent| self.is_current_node(*parent))?;
+		let parent_idx = self.checked_node_index(parent)?;
+		let first_child = unsafe { (*self.edges[parent_idx].get()).first_child }
+			.filter(|child| self.is_current_node(*child))?;
 		if first_child == node {
 			return None;
 		}
 		let mut curr = first_child;
 		loop {
-			let next = unsafe { (*self.edges[curr.index()].get()).next_sibling };
+			let curr_idx = self.checked_node_index(curr)?;
+			let next = unsafe { (*self.edges[curr_idx].get()).next_sibling }
+				.filter(|candidate| self.is_current_node(*candidate));
 			if next == Some(node) {
 				return Some(curr);
 			}
@@ -1759,12 +2192,21 @@ impl UastRegistry {
 	}
 
 	pub fn get_next_sibling(&self, node: NodeId) -> Option<NodeId> {
-		unsafe { (*self.edges[node.index()].get()).next_sibling }
+		let idx = self.checked_node_index(node)?;
+		unsafe { (*self.edges[idx].get()).next_sibling }
+			.filter(|sibling| self.is_current_node(*sibling))
 	}
 
 	pub(crate) fn document_root_for_node(&self, node: NodeId) -> NodeId {
+		if !self.is_current_node(node) {
+			return node;
+		}
 		let mut root = node;
-		while let Some(parent) = unsafe { (*self.edges[root.index()].get()).parent } {
+		while let Some(parent) = self
+			.checked_node_index(root)
+			.and_then(|idx| unsafe { (*self.edges[idx].get()).parent })
+			.filter(|parent| self.is_current_node(*parent))
+		{
 			root = parent;
 		}
 		root
@@ -1775,8 +2217,11 @@ impl UastRegistry {
 mod tests {
 	use super::{ReclaimFence, ReclaimedPayload, UastRegistry};
 	use crate::svp::pointer::SvpPointer;
+	use crate::uast::TreeEdges;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+	use std::sync::Arc;
+	use std::sync::atomic::Ordering;
 	use std::time::{SystemTime, UNIX_EPOCH};
 
 	fn temp_backing_path(label: &str) -> std::path::PathBuf {
@@ -1878,7 +2323,7 @@ mod tests {
 		);
 		chunk.append_local_child(root, first);
 		chunk.append_local_child(root, second);
-		registry.begin_metric_scan(root, first, second);
+		registry.begin_metric_scan(root, [first, second]);
 
 		assert_eq!(registry.exact_line_count(root), None);
 		assert!(!registry.try_complete_metric_inflation(first, 2, true));
@@ -1888,6 +2333,41 @@ mod tests {
 
 		assert!(!registry.try_complete_metric_inflation(second, 99, false));
 		assert_eq!(registry.exact_line_count(root), Some(4));
+	}
+
+	#[test]
+	fn metric_scan_uses_explicit_leaf_identity_order_not_slot_adjacency() {
+		let registry = UastRegistry::new(4);
+		let mut chunk = registry.reserve_chunk(4).expect("registry chunk");
+		let root = chunk.spawn_node(SemanticKind::RelationalTable, None, SpanMetrics::default());
+		let leaves = (0..3)
+			.map(|offset| {
+				chunk.spawn_node(
+					SemanticKind::Token,
+					Some(SvpPointer {
+						lba: offset,
+						byte_length: 1,
+						device_id: 1,
+						head_trim: 0,
+					}),
+					SpanMetrics {
+						byte_length: 1,
+						newlines: 0,
+					},
+				)
+			})
+			.collect::<Vec<_>>();
+		let explicit = [leaves[2], leaves[0], leaves[1]];
+		registry.begin_metric_scan(root, explicit);
+		for expected in explicit {
+			assert_eq!(
+				registry
+					.claim_next_metric_scan(root)
+					.map(|claim| claim.node_id),
+				Some(expected)
+			);
+			registry.finish_metric_scan_io(root);
+		}
 	}
 
 	#[test]
@@ -1916,6 +2396,118 @@ mod tests {
 		assert_eq!(registry.stats().allocated_nodes, 0);
 		assert!(registry.reserve_chunk(1).is_some());
 		assert_eq!(registry.stats().allocated_nodes, 1);
+	}
+
+	#[test]
+	fn unused_exact_reservation_slots_return_without_consuming_a_lifetime() {
+		let registry = UastRegistry::new(2);
+		let mut reservation = registry.reserve_chunk(2).expect("two slots");
+		let first = reservation.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		drop(reservation);
+		let after_drop = registry.stats();
+		assert_eq!(
+			after_drop.allocated_nodes, 2,
+			"tail high-water was committed"
+		);
+		assert_eq!(after_drop.allocation_events, 1);
+		assert_eq!(after_drop.reusable_slots, 1);
+
+		let mut returned = registry
+			.reserve_chunk(1)
+			.expect("unpublished ticket returned");
+		let second = returned.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		assert_ne!(first.index(), second.index());
+		assert_eq!(
+			second.generation(),
+			0,
+			"an unpublished generation is not consumed"
+		);
+		assert_eq!(registry.stats().allocation_events, 2);
+	}
+
+	#[test]
+	fn recycled_slot_resets_every_object_class_but_keeps_monotonic_generations() {
+		let registry = UastRegistry::new(1);
+		let mut reservation = registry.reserve_chunk(1).expect("initial slot");
+		let old = reservation.spawn_node(SemanticKind::RelationalRow, None, SpanMetrics::default());
+		drop(reservation);
+		let old_content_generation = registry.content_generation(old);
+		unsafe {
+			*registry.provider_kinds[old.index()].get() =
+				crate::uast::kind::ProviderKindId::new(17);
+			*registry.edges[old.index()].get() = TreeEdges {
+				parent: None,
+				first_child: None,
+				next_sibling: Some(old),
+			};
+			*registry.child_tails[old.index()].get() = Some(old);
+		}
+		registry.metrics_inflated[old.index()].store(true, Ordering::Release);
+		registry.metric_inflating[old.index()].store(true, Ordering::Release);
+		registry.set_terminal_newline(old, true);
+		registry.begin_whole_leaf_read(old, old_content_generation);
+		registry.set_viewport_resident_pins(9, [old]);
+		registry.record_high_priority_start(old);
+
+		registry.retire_orphaned_forest([old], 1, 0, ReclaimFence::NeverPublished);
+		registry.reclaim_orphaned_payload(old);
+		let mut next = registry.reserve_chunk(1).expect("reclaimed slot");
+		let new = next.spawn_node(
+			SemanticKind::Group,
+			None,
+			SpanMetrics {
+				byte_length: 42,
+				newlines: 6,
+			},
+		);
+		assert_eq!(new.index(), old.index());
+		assert_eq!(new.generation(), old.generation() + 1);
+		assert!(registry.content_generation(new) > old_content_generation);
+		assert_eq!(
+			unsafe { *registry.provider_kinds[new.index()].get() },
+			crate::uast::kind::ProviderKindId::NONE
+		);
+		assert_eq!(
+			unsafe { *registry.edges[new.index()].get() },
+			TreeEdges::default()
+		);
+		assert_eq!(unsafe { *registry.child_tails[new.index()].get() }, None);
+		assert!(!registry.metrics_inflated[new.index()].load(Ordering::Acquire));
+		assert!(!registry.metric_inflating[new.index()].load(Ordering::Acquire));
+		assert_eq!(registry.terminal_newline(new), None);
+		assert!(
+			!registry.content_generation_exhausted[new.index()].load(Ordering::Acquire),
+			"a reusable slot cannot carry content-generation exhaustion"
+		);
+		assert_eq!(
+			registry.whole_leaf_read_outcome(old, old_content_generation),
+			None
+		);
+		assert_eq!(registry.get_total_bytes(new), 42);
+		assert_eq!(registry.get_total_newlines(new), 6);
+	}
+
+	#[test]
+	fn exhausted_content_generation_fails_closed_and_burns_the_slot() {
+		let registry = Arc::new(UastRegistry::new(1));
+		let mut reservation = registry.reserve_chunk(1).expect("initial slot");
+		let node = reservation.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		drop(reservation);
+		registry.content_generation[node.index()].store(u64::MAX, Ordering::Release);
+		assert_eq!(registry.bump_content_generation(node), u64::MAX);
+		assert!(
+			registry.acquire_io_lifetime(node).is_none(),
+			"content-generation exhaustion must close resolver admission"
+		);
+		assert!(
+			!registry.publish_resolved_data(node, u64::MAX, b"late".to_vec()),
+			"an old max-generation completion must fail closed"
+		);
+		registry.retire_orphaned_forest([node], 1, 0, ReclaimFence::NeverPublished);
+		registry.reclaim_orphaned_payload(node);
+		assert_eq!(registry.stats().burned_slots, 1);
+		assert_eq!(registry.stats().reusable_slots, 0);
+		assert!(registry.reserve_chunk(1).is_none());
 	}
 
 	#[test]
@@ -2054,7 +2646,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reclaimed_spanless_nodes_keep_inert_identity_topology_and_metrics() {
+	fn allocator_eligible_spanless_nodes_read_as_inert() {
 		let registry = UastRegistry::new(1);
 		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
 		let leaf = chunk.spawn_node(
@@ -2079,7 +2671,7 @@ mod tests {
 			registry.reclaim_orphaned_payload(leaf),
 			ReclaimedPayload::default()
 		);
-		assert_eq!(registry.get_total_bytes(leaf), 4);
+		assert_eq!(registry.get_total_bytes(leaf), 0);
 		assert_eq!(registry.get_first_child(leaf), None);
 		assert!(registry.resolve_physical_bytes(leaf).is_empty());
 		assert_eq!(
@@ -2229,6 +2821,83 @@ mod tests {
 					line_number + 1
 				);
 			}
+		}
+	}
+
+	#[test]
+	fn production_identity_holders_preserve_generation_and_io_lifetime_guards() {
+		let resolver = include_str!("../svp/resolver.rs")
+			.split("\n#[cfg(test)]\nmod tests {")
+			.next()
+			.expect("resolver production section");
+		assert!(
+			resolver.contains("lifetime_lease: IoLifetimeLease"),
+			"resolver requests must own a slot-lifetime lease"
+		);
+		assert!(
+			resolver.contains("_lifetime_lease: IoLifetimeLease"),
+			"resolver completions must retain the lease through final cleanup"
+		);
+		assert!(
+			!resolver.contains(".push(request).is_err()")
+				&& resolver.contains("if let Err(request)")
+				&& resolver.contains("drop(request);"),
+			"queue refusal must retain the request lease through every final cleanup write"
+		);
+		for raw_column in [".spans[", ".dma_in_flight[", ".content_generation["] {
+			assert!(
+				!resolver.contains(raw_column),
+				"resolver must use generation-checked registry entry points, not {raw_column}"
+			);
+		}
+		let lines = resolver.lines().collect::<Vec<_>>();
+		for (line_number, line) in lines.iter().enumerate() {
+			if !line.contains("SvpRequest {") || line.contains("pub struct") {
+				continue;
+			}
+			let window = lines[line_number..lines.len().min(line_number + 16)].join("\n");
+			assert!(
+				window.contains("lifetime_lease"),
+				"resolver:{} constructs an unleased request:\n{window}",
+				line_number + 1
+			);
+		}
+
+		let folds = include_str!("../engine/folding/set.rs")
+			.split("\n#[cfg(test)]")
+			.next()
+			.unwrap_or_default();
+		assert!(
+			folds.contains("binary_search(&node)") && !folds.contains("binary_search_by_key"),
+			"FoldSet membership must compare full packed NodeId identity"
+		);
+		assert!(
+			folds.contains("is_current_node(candidate)"),
+			"fold ancestry must reject stale identities before dereference"
+		);
+
+		let inspector = include_str!("../engine/uast_inspector.rs")
+			.split("\n#[cfg(test)]")
+			.next()
+			.unwrap_or_default();
+		assert!(
+			inspector.contains("id: node.node_id.raw()")
+				&& inspector.contains("root_id: stamp.root.raw()")
+				&& inspector.contains("and_then(NodeId::from_raw)"),
+			"graph transport must preserve packed generations end to end"
+		);
+
+		for (label, source) in [
+			("registry", include_str!("registry.rs")),
+			("resolver", include_str!("../svp/resolver.rs")),
+			("ingest", include_str!("../svp/ingest.rs")),
+			("inspector", include_str!("../engine/uast_inspector.rs")),
+		] {
+			let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+			assert!(
+				!production.contains("NodeId::from_index"),
+				"{label} reconstructs an unqualified generation-zero identity"
+			);
 		}
 	}
 

@@ -57,6 +57,7 @@ pub(super) fn build_source_backed_document(
 		.register_device_path(91, path.to_str().expect("utf8 path"))
 		.expect("register backing");
 	registry.install_root_child_line_index(root);
+	drop(chunk);
 	(registry, root, path)
 }
 

@@ -1301,17 +1301,27 @@ impl UastProjection for UastRegistry {
 	}
 
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId> {
+		let index = self.checked_node_index(node)?;
 		unsafe {
-			if let Some(child) = (*self.edges[node.index()].get()).first_child {
+			if let Some(child) = (*self.edges[index].get())
+				.first_child
+				.filter(|child| self.is_current_node(*child))
+			{
 				return Some(child);
 			}
 
 			let mut curr = node;
 			loop {
-				if let Some(sib) = (*self.edges[curr.index()].get()).next_sibling {
+				let curr_index = self.checked_node_index(curr)?;
+				if let Some(sib) = (*self.edges[curr_index].get())
+					.next_sibling
+					.filter(|sibling| self.is_current_node(*sibling))
+				{
 					return Some(sib);
 				}
-				curr = (*self.edges[curr.index()].get()).parent?;
+				curr = (*self.edges[curr_index].get())
+					.parent
+					.filter(|parent| self.is_current_node(*parent))?;
 			}
 		}
 	}
@@ -1675,6 +1685,7 @@ mod tests {
 		unsafe {
 			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
 		}
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -1702,6 +1713,7 @@ mod tests {
 		unsafe {
 			*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
 		}
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -1735,6 +1747,7 @@ mod tests {
 				*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
 			}
 		}
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -1796,6 +1809,7 @@ mod tests {
 			}
 		}
 		registry.install_root_child_line_index(root);
+		drop(chunk);
 		(registry, root, source)
 	}
 
@@ -1912,6 +1926,7 @@ mod tests {
 			*registry.virtual_data[folded_b.index()].get() = Some(b"two\n".to_vec());
 			*registry.virtual_data[tail.index()].get() = Some(b"tail".to_vec());
 		}
+		drop(chunk);
 		(registry, root, folded)
 	}
 
@@ -1957,6 +1972,7 @@ mod tests {
 			byte_offset += part.len() as u64;
 		}
 
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -1999,6 +2015,7 @@ mod tests {
 			byte_offset += part.len() as u64;
 		}
 
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -2635,7 +2652,7 @@ mod tests {
 
 		let first_leaf = registry.get_first_child(root).expect("first leaf");
 		let second_leaf = registry.get_next_sibling(first_leaf).expect("second leaf");
-		registry.begin_metric_scan(root, first_leaf, second_leaf);
+		registry.begin_metric_scan(root, [first_leaf, second_leaf]);
 		registry.install_root_child_line_index(root);
 		assert_eq!(
 			registry.line_lookup_state(root, DocLine::new(3)),
@@ -2674,7 +2691,7 @@ mod tests {
 		let (registry, root) = build_uninflated_physical_document(&["aa\nbb\n", "cc\ndd"]);
 		let first_leaf = registry.get_first_child(root).expect("first leaf");
 		let second_leaf = registry.get_next_sibling(first_leaf).expect("second leaf");
-		registry.begin_metric_scan(root, first_leaf, second_leaf);
+		registry.begin_metric_scan(root, [first_leaf, second_leaf]);
 		assert!(
 			!registry
 				.root_child_line_indexes

@@ -1,6 +1,6 @@
 use crate::core::BufferId;
 use crate::ecs::id::NodeId;
-use crate::ecs::registry::{UastRegistry, WholeLeafReadOutcome};
+use crate::ecs::registry::{IoLifetimeLease, UastRegistry, WholeLeafReadOutcome};
 use crate::svp::pointer::SvpPointer;
 use memchr::memchr_iter;
 use std::collections::VecDeque;
@@ -58,6 +58,7 @@ pub struct SvpRequest {
 	pub scan_root: Option<NodeId>,
 	pub content_generation: u64,
 	pub(crate) hydration_buffer: Option<BufferId>,
+	pub(crate) lifetime_lease: IoLifetimeLease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,25 +368,28 @@ impl SvpResolver {
 	}
 
 	pub fn request_dma(&self, node_id: NodeId, pointer: SvpPointer, priority: RequestPriority) {
+		let Some(lifetime_lease) = self._registry.acquire_io_lifetime(node_id) else {
+			return;
+		};
 		if priority == RequestPriority::High {
 			self._registry.record_high_priority_start(node_id);
 		}
-		if self
-			.request_queue
-			.push(SvpRequest {
-				node_id,
-				pointer,
-				extent_offset: 0,
-				request_length: pointer.byte_length,
-				priority,
-				scan_root: None,
-				content_generation: self._registry.content_generation(node_id),
-				hydration_buffer: None,
-			})
-			.is_err() && priority == RequestPriority::High
-		{
-			self._registry.record_high_priority_finish(node_id);
-			self._registry.dma_in_flight[node_id.index()].store(false, Ordering::Release);
+		if let Err(request) = self.request_queue.push(SvpRequest {
+			node_id,
+			pointer,
+			extent_offset: 0,
+			request_length: pointer.byte_length,
+			priority,
+			scan_root: None,
+			content_generation: self._registry.content_generation(node_id),
+			hydration_buffer: None,
+			lifetime_lease,
+		}) {
+			if priority == RequestPriority::High {
+				self._registry.record_high_priority_finish(node_id);
+				self._registry.finish_dma(node_id);
+			}
+			drop(request);
 		}
 	}
 
@@ -397,6 +401,10 @@ impl SvpResolver {
 		request_length: u32,
 		priority: RequestPriority,
 	) -> Result<(), String> {
+		let lifetime_lease = self
+			._registry
+			.acquire_io_lifetime(node_id)
+			.ok_or_else(|| "Resolver request targets a retired node".to_string())?;
 		let request = SvpRequest {
 			node_id,
 			pointer,
@@ -406,16 +414,18 @@ impl SvpResolver {
 			scan_root: None,
 			content_generation: self._registry.content_generation(node_id),
 			hydration_buffer: None,
+			lifetime_lease,
 		};
 		request_len(&request).map_err(str::to_string)?;
 		if priority == RequestPriority::High {
 			self._registry.record_high_priority_start(node_id);
 		}
-		if self.request_queue.push(request).is_err() {
+		if let Err(request) = self.request_queue.push(request) {
 			if priority == RequestPriority::High {
 				self._registry.record_high_priority_finish(node_id);
-				self._registry.dma_in_flight[node_id.index()].store(false, Ordering::Release);
+				self._registry.finish_dma(node_id);
 			}
+			drop(request);
 			return Err("Resolver request queue is full".to_string());
 		}
 		Ok(())
@@ -441,6 +451,10 @@ impl SvpResolver {
 		node_id: NodeId,
 		hydration_buffer: Option<BufferId>,
 	) -> Result<WholeLeafHydration, WholeLeafHydrationError> {
+		let lifetime_lease = self
+			._registry
+			.acquire_io_lifetime(node_id)
+			.ok_or(WholeLeafHydrationError::InvalidRequest)?;
 		if self._registry.whole_leaf_is_resident(node_id) {
 			return Ok(WholeLeafHydration::Ready);
 		}
@@ -452,7 +466,9 @@ impl SvpResolver {
 			None => {}
 		}
 
-		let pointer = unsafe { *self._registry.spans[node_id.index()].get() }
+		let pointer = self
+			._registry
+			.node_span(node_id)
 			.ok_or(WholeLeafHydrationError::InvalidRequest)?;
 		let request = SvpRequest {
 			node_id,
@@ -463,10 +479,11 @@ impl SvpResolver {
 			scan_root: None,
 			content_generation: generation,
 			hydration_buffer,
+			lifetime_lease,
 		};
 		request_len(&request).map_err(|_| WholeLeafHydrationError::InvalidRequest)?;
 
-		if self._registry.dma_in_flight[node_id.index()].swap(true, Ordering::AcqRel) {
+		if !self._registry.begin_dma(node_id) {
 			// Another viewport request owns the node. Do not associate this
 			// generation with that request: an edit may have bumped the generation
 			// while an older read was still in flight. Its completion wakes the
@@ -475,16 +492,17 @@ impl SvpResolver {
 		}
 		match self._registry.begin_whole_leaf_read(node_id, generation) {
 			WholeLeafReadOutcome::Failed => {
-				self._registry.dma_in_flight[node_id.index()].store(false, Ordering::Release);
+				self._registry.finish_dma(node_id);
 				return Ok(WholeLeafHydration::Failed);
 			}
 			WholeLeafReadOutcome::InFlight => {}
 		}
 		self._registry.record_high_priority_start(node_id);
-		if self.request_queue.push(request).is_err() {
+		if let Err(request) = self.request_queue.push(request) {
 			self._registry.cancel_whole_leaf_read(node_id, generation);
 			self._registry.record_high_priority_finish(node_id);
-			self._registry.dma_in_flight[node_id.index()].store(false, Ordering::Release);
+			self._registry.finish_dma(node_id);
+			drop(request);
 			return Err(WholeLeafHydrationError::QueueFull);
 		}
 
@@ -513,6 +531,7 @@ pub(super) struct CompletionMeta {
 	pub(super) scan_root: Option<NodeId>,
 	pub(super) content_generation: u64,
 	pub(super) hydration_buffer: Option<BufferId>,
+	_lifetime_lease: IoLifetimeLease,
 	#[cfg(target_os = "linux")]
 	pub(super) buffer_index: usize,
 }
@@ -531,6 +550,7 @@ impl CompletionMeta {
 			scan_root: req.scan_root,
 			content_generation: req.content_generation,
 			hydration_buffer: req.hydration_buffer,
+			_lifetime_lease: req.lifetime_lease,
 			#[cfg(target_os = "linux")]
 			buffer_index,
 		}
@@ -552,7 +572,7 @@ pub(super) fn request_len(req: &SvpRequest) -> Result<u32, &'static str> {
 }
 
 pub(super) fn complete_read(
-	registry: &UastRegistry,
+	registry: &Arc<UastRegistry>,
 	queue: &SvpRequestQueue,
 	meta: CompletionMeta,
 	bytes: &[u8],
@@ -597,7 +617,7 @@ pub(super) fn complete_read(
 		metric_refresh
 	};
 
-	registry.dma_in_flight[meta.node_id.index()].store(false, Ordering::Relaxed);
+	registry.finish_dma(meta.node_id);
 	if let Some(root) = meta.scan_root {
 		registry.finish_metric_scan_io(root);
 	}
@@ -606,7 +626,7 @@ pub(super) fn complete_read(
 }
 
 pub(super) fn complete_failed(
-	registry: &UastRegistry,
+	registry: &Arc<UastRegistry>,
 	queue: &SvpRequestQueue,
 	meta: CompletionMeta,
 ) -> bool {
@@ -617,7 +637,7 @@ pub(super) fn complete_failed(
 			registry.finish_whole_leaf_read(meta.node_id, meta.content_generation, false);
 		}
 	}
-	registry.dma_in_flight[meta.node_id.index()].store(false, Ordering::Relaxed);
+	registry.finish_dma(meta.node_id);
 	if let Some(root) = meta.scan_root {
 		registry.finish_metric_scan_io(root);
 		registry.record_metric_scan_failure(root, meta.node_id);
@@ -627,7 +647,7 @@ pub(super) fn complete_failed(
 }
 
 fn pump_metric_scans(
-	registry: &UastRegistry,
+	registry: &Arc<UastRegistry>,
 	queue: &SvpRequestQueue,
 	preferred_root: Option<NodeId>,
 ) {
@@ -641,11 +661,19 @@ fn pump_metric_scans(
 	}
 }
 
-fn request_next_scan(registry: &UastRegistry, queue: &SvpRequestQueue, scan_root: Option<NodeId>) {
+fn request_next_scan(
+	registry: &Arc<UastRegistry>,
+	queue: &SvpRequestQueue,
+	scan_root: Option<NodeId>,
+) {
 	let Some(root) = scan_root else {
 		return;
 	};
 	let Some(claim) = registry.claim_next_metric_scan(root) else {
+		return;
+	};
+	let Some(lifetime_lease) = registry.acquire_io_lifetime(claim.node_id) else {
+		registry.return_metric_scan_claim(root, claim);
 		return;
 	};
 	let request = SvpRequest {
@@ -657,9 +685,11 @@ fn request_next_scan(registry: &UastRegistry, queue: &SvpRequestQueue, scan_root
 		scan_root: Some(root),
 		content_generation: claim.content_generation,
 		hydration_buffer: None,
+		lifetime_lease,
 	};
-	if queue.push(request).is_err() {
+	if let Err(request) = queue.push(request) {
 		registry.return_metric_scan_claim(root, claim);
+		drop(request);
 	}
 }
 
@@ -667,7 +697,82 @@ fn request_next_scan(registry: &UastRegistry, queue: &SvpRequestQueue, scan_root
 mod tests {
 	use super::*;
 	use crate::svp::backing_store::GeneratedBackingStore;
+	use crate::uast::{SemanticKind, SpanMetrics};
 	use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+	fn published_nodes(count: usize) -> (Arc<UastRegistry>, Vec<NodeId>) {
+		let registry = Arc::new(UastRegistry::new(count as u32));
+		let mut reservation = registry
+			.reserve_chunk(count as u32)
+			.expect("fixture reservation");
+		let nodes = (0..count)
+			.map(|_| reservation.spawn_node(SemanticKind::Token, None, SpanMetrics::default()))
+			.collect();
+		drop(reservation);
+		(registry, nodes)
+	}
+
+	#[test]
+	fn completion_held_across_retirement_finishes_before_slot_reuse() {
+		let (registry, nodes) = published_nodes(1);
+		let old = nodes[0];
+		let pointer = SvpPointer {
+			lba: 0,
+			byte_length: 4,
+			device_id: 1,
+			head_trim: 0,
+		};
+		unsafe {
+			*registry.spans[old.index()].get() = Some(pointer);
+		}
+		assert!(registry.begin_dma(old));
+		let request = SvpRequest {
+			node_id: old,
+			pointer,
+			extent_offset: 0,
+			request_length: 4,
+			priority: RequestPriority::High,
+			scan_root: None,
+			content_generation: registry.content_generation(old),
+			hydration_buffer: None,
+			lifetime_lease: registry.acquire_io_lifetime(old).expect("request lease"),
+		};
+		let meta = CompletionMeta::new(request, 0);
+
+		registry.retire_orphaned_forest(
+			[old],
+			1,
+			0,
+			crate::ecs::registry::ReclaimFence::NeverPublished,
+		);
+		registry.reclaim_orphaned_payload(old);
+		assert_eq!(registry.stats().pending_reuse_slots, 1);
+		assert!(
+			registry.reserve_chunk(1).is_none(),
+			"the old completion must keep the slot unavailable"
+		);
+
+		let queue = SvpRequestQueue::new(1);
+		assert!(complete_failed(&registry, &queue, meta));
+		assert_eq!(registry.stats().pending_reuse_slots, 0);
+		let mut replacement = registry.reserve_chunk(1).expect("completion released slot");
+		let new = replacement.spawn_node(
+			SemanticKind::Group,
+			None,
+			SpanMetrics {
+				byte_length: 9,
+				newlines: 2,
+			},
+		);
+		assert_eq!(new.index(), old.index());
+		assert_ne!(new, old);
+		assert_eq!(registry.get_total_bytes(new), 9);
+		assert!(
+			registry.begin_dma(new),
+			"old completion cleanup must not leave the replacement DMA flag set"
+		);
+		registry.finish_dma(new);
+	}
 
 	#[test]
 	fn completion_batches_preserve_attribution_without_multiplying_legacy_refreshes() {
@@ -728,8 +833,9 @@ mod tests {
 
 	#[test]
 	fn oversized_whole_node_request_is_a_hard_error() {
+		let (registry, nodes) = published_nodes(1);
 		let request = SvpRequest {
-			node_id: NodeId::from_index(0),
+			node_id: nodes[0],
 			pointer: SvpPointer {
 				lba: 0,
 				byte_length: RESOLVER_TRANSFER_SIZE as u32 + 1,
@@ -742,6 +848,7 @@ mod tests {
 			scan_root: None,
 			content_generation: 0,
 			hydration_buffer: None,
+			lifetime_lease: registry.acquire_io_lifetime(nodes[0]).expect("live node"),
 		};
 		assert!(request_len(&request).is_err());
 	}
@@ -749,8 +856,8 @@ mod tests {
 	#[test]
 	fn scan_lanes_cover_each_extent_once_without_overlap() {
 		const EXTENTS: usize = 67;
-		let registry = UastRegistry::new(EXTENTS as u32 + 1);
-		let root = NodeId::from_index(0);
+		let (registry, nodes) = published_nodes(EXTENTS + 1);
+		let root = nodes[0];
 		for extent in 0..EXTENTS {
 			let index = extent + 1;
 			unsafe {
@@ -763,9 +870,8 @@ mod tests {
 				(*registry.edges[index].get()).parent = Some(root);
 			}
 		}
-		let first = NodeId::from_index(1);
-		let last = NodeId::from_index(EXTENTS);
-		registry.begin_metric_scan(root, first, last);
+		let leaves = nodes[1..].to_vec();
+		registry.begin_metric_scan(root, leaves);
 		let queue = SvpRequestQueue::new(EXTENTS * 2);
 		for _ in 0..METRIC_SCAN_LANES.min(EXTENTS) {
 			let claim = registry.claim_next_metric_scan(root).unwrap();
@@ -780,6 +886,9 @@ mod tests {
 						scan_root: Some(root),
 						content_generation: claim.content_generation,
 						hydration_buffer: None,
+						lifetime_lease: registry
+							.acquire_io_lifetime(claim.node_id)
+							.expect("live scan node"),
 					})
 					.is_ok()
 			);
@@ -797,8 +906,8 @@ mod tests {
 	#[test]
 	fn background_metric_scan_does_not_crowd_viewport_io_out_of_the_queue() {
 		const EXTENTS: usize = METRIC_SCAN_LANES + 2;
-		let registry = UastRegistry::new(EXTENTS as u32 + 1);
-		let root = NodeId::from_index(0);
+		let (registry, nodes) = published_nodes(EXTENTS + 1);
+		let root = nodes[0];
 		for index in 1..=EXTENTS {
 			unsafe {
 				*registry.spans[index].get() = Some(SvpPointer {
@@ -810,12 +919,12 @@ mod tests {
 				(*registry.edges[index].get()).parent = Some(root);
 			}
 		}
-		registry.begin_metric_scan(root, NodeId::from_index(1), NodeId::from_index(EXTENTS));
+		registry.begin_metric_scan(root, nodes[1..].iter().copied());
 		let queue = SvpRequestQueue::new(EXTENTS + 2);
 		for _ in 0..METRIC_SCAN_LANES {
 			request_next_scan(&registry, &queue, Some(root));
 		}
-		let viewport_node = NodeId::from_index(EXTENTS);
+		let viewport_node = nodes[EXTENTS];
 		assert!(
 			queue
 				.push(SvpRequest {
@@ -829,6 +938,9 @@ mod tests {
 					scan_root: None,
 					content_generation: 0,
 					hydration_buffer: None,
+					lifetime_lease: registry
+						.acquire_io_lifetime(viewport_node)
+						.expect("live viewport node"),
 				})
 				.is_ok(),
 			"viewport request fits queue"
@@ -855,8 +967,8 @@ mod tests {
 	#[test]
 	fn failed_scan_read_marks_count_incomplete_and_keeps_lane_moving() {
 		const EXTENTS: usize = 5;
-		let registry = UastRegistry::new(EXTENTS as u32 + 1);
-		let root = NodeId::from_index(0);
+		let (registry, nodes) = published_nodes(EXTENTS + 1);
+		let root = nodes[0];
 		for index in 1..=EXTENTS {
 			unsafe {
 				*registry.spans[index].get() = Some(SvpPointer {
@@ -868,7 +980,7 @@ mod tests {
 				(*registry.edges[index].get()).parent = Some(root);
 			}
 		}
-		registry.begin_metric_scan(root, NodeId::from_index(1), NodeId::from_index(EXTENTS));
+		registry.begin_metric_scan(root, nodes[1..].iter().copied());
 		let queue = SvpRequestQueue::new(EXTENTS * 2);
 		request_next_scan(&registry, &queue, Some(root));
 
@@ -885,8 +997,8 @@ mod tests {
 
 	#[test]
 	fn saturated_queue_returns_scan_claim_and_resumes_when_a_slot_opens() {
-		let registry = UastRegistry::new(3);
-		let root = NodeId::from_index(0);
+		let (registry, nodes) = published_nodes(3);
+		let root = nodes[0];
 		for index in 1..=2 {
 			unsafe {
 				*registry.spans[index].get() = Some(SvpPointer {
@@ -898,7 +1010,7 @@ mod tests {
 				(*registry.edges[index].get()).parent = Some(root);
 			}
 		}
-		registry.begin_metric_scan(root, NodeId::from_index(1), NodeId::from_index(2));
+		registry.begin_metric_scan(root, nodes[1..].iter().copied());
 		let queue = SvpRequestQueue::new(1);
 		assert!(
 			queue
@@ -916,6 +1028,7 @@ mod tests {
 					scan_root: None,
 					content_generation: 0,
 					hydration_buffer: None,
+					lifetime_lease: registry.acquire_io_lifetime(root).expect("live root"),
 				})
 				.is_ok()
 		);
@@ -924,18 +1037,18 @@ mod tests {
 		assert_eq!(queue.pop().unwrap().node_id, root);
 		pump_metric_scans(&registry, &queue, None);
 		let first = queue.pop().expect("returned claim is schedulable");
-		assert_eq!(first.node_id, NodeId::from_index(1));
+		assert_eq!(first.node_id, nodes[1]);
 		complete_failed(&registry, &queue, CompletionMeta::new(first, 0));
 		let second = queue.pop().expect("second scan block");
-		assert_eq!(second.node_id, NodeId::from_index(2));
+		assert_eq!(second.node_id, nodes[2]);
 		complete_failed(&registry, &queue, CompletionMeta::new(second, 0));
 		assert_eq!(registry.stats().pending_scan_blocks, 0);
 	}
 
 	#[test]
 	fn stale_dma_completion_cannot_overwrite_edited_resident_data() {
-		let registry = UastRegistry::new(1);
-		let node = NodeId::from_index(0);
+		let (registry, nodes) = published_nodes(1);
+		let node = nodes[0];
 		let pointer = SvpPointer {
 			lba: 0,
 			byte_length: 6,
@@ -954,6 +1067,7 @@ mod tests {
 			scan_root: None,
 			content_generation: registry.content_generation(node),
 			hydration_buffer: None,
+			lifetime_lease: registry.acquire_io_lifetime(node).expect("live node"),
 		};
 		let meta = CompletionMeta::new(request, 0);
 		registry.bump_content_generation(node);
@@ -972,9 +1086,9 @@ mod tests {
 
 	#[test]
 	fn resolver_metric_results_are_applied_only_when_the_engine_drains_them() {
-		let registry = UastRegistry::new(2);
-		let root = NodeId::from_index(0);
-		let leaf = NodeId::from_index(1);
+		let (registry, nodes) = published_nodes(2);
+		let root = nodes[0];
+		let leaf = nodes[1];
 		let pointer = SvpPointer {
 			lba: 0,
 			byte_length: 2,
@@ -988,7 +1102,7 @@ mod tests {
 			(*registry.metrics[root.index()].get()).byte_length = 2;
 			(*registry.metrics[leaf.index()].get()).byte_length = 2;
 		}
-		registry.begin_metric_scan(root, leaf, leaf);
+		registry.begin_metric_scan(root, [leaf]);
 		let claim = registry.claim_next_metric_scan(root).unwrap();
 		let request = SvpRequest {
 			node_id: claim.node_id,
@@ -999,6 +1113,7 @@ mod tests {
 			scan_root: Some(root),
 			content_generation: claim.content_generation,
 			hydration_buffer: None,
+			lifetime_lease: registry.acquire_io_lifetime(leaf).expect("live leaf"),
 		};
 		let queue = SvpRequestQueue::new(2);
 
@@ -1018,7 +1133,8 @@ mod tests {
 
 	#[test]
 	fn blocking_subrange_read_tracks_only_covered_bytes() {
-		let registry = Arc::new(UastRegistry::new(1));
+		let (registry, nodes) = published_nodes(1);
+		let node = nodes[0];
 		let span = SvpPointer {
 			lba: 0,
 			byte_length: 32,
@@ -1032,7 +1148,6 @@ mod tests {
 		registry.register_backing_store(44, store.clone());
 		let (tx, rx) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), tx);
-		let node = NodeId::from_index(0);
 		registry.dma_in_flight[0].store(true, Ordering::Release);
 		resolver
 			.request_dma_range(node, span, 8, 4, RequestPriority::High)
@@ -1051,7 +1166,8 @@ mod tests {
 
 	#[test]
 	fn whole_leaf_hydration_publishes_bytes_and_wakes_the_engine() {
-		let registry = Arc::new(UastRegistry::new(1));
+		let (registry, nodes) = published_nodes(1);
+		let node = nodes[0];
 		let span = SvpPointer {
 			lba: 0,
 			byte_length: 6,
@@ -1068,7 +1184,6 @@ mod tests {
 		);
 		let (tx, rx) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), tx);
-		let node = NodeId::from_index(0);
 
 		assert_eq!(
 			resolver.hydrate_whole_leaf(node),
@@ -1088,7 +1203,8 @@ mod tests {
 
 	#[test]
 	fn failed_whole_leaf_hydration_is_sticky_until_explicit_retry() {
-		let registry = Arc::new(UastRegistry::new(1));
+		let (registry, nodes) = published_nodes(1);
+		let node = nodes[0];
 		let span = SvpPointer {
 			lba: 0,
 			byte_length: 4,
@@ -1101,7 +1217,6 @@ mod tests {
 		}
 		let (tx, rx) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), tx);
-		let node = NodeId::from_index(0);
 
 		assert_eq!(
 			resolver.hydrate_whole_leaf(node),
@@ -1134,7 +1249,8 @@ mod tests {
 	#[test]
 	fn attributed_whole_leaf_success_and_failure_echo_the_admitting_buffer() {
 		for (device_id, succeeds) in [(46_u16, true), (100_u16, false)] {
-			let registry = Arc::new(UastRegistry::new(1));
+			let (registry, nodes) = published_nodes(1);
+			let node = nodes[0];
 			let span = SvpPointer {
 				lba: 0,
 				byte_length: 4,
@@ -1153,7 +1269,6 @@ mod tests {
 			}
 			let (tx, rx) = mpsc::channel();
 			let resolver = SvpResolver::new_blocking_with_notifications_for_tests(registry, tx);
-			let node = NodeId::from_index(0);
 			let buffer = BufferId::new(if succeeds { 7 } else { 8 });
 
 			assert_eq!(
@@ -1177,7 +1292,8 @@ mod tests {
 
 	#[test]
 	fn new_generation_does_not_attach_to_an_older_in_flight_read() {
-		let registry = Arc::new(UastRegistry::new(1));
+		let (registry, nodes) = published_nodes(1);
+		let node = nodes[0];
 		let span = SvpPointer {
 			lba: 0,
 			byte_length: 4,
@@ -1190,7 +1306,6 @@ mod tests {
 		}
 		let (tx, _rx) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), tx);
-		let node = NodeId::from_index(0);
 
 		registry.dma_in_flight[0].store(true, Ordering::Release);
 		let current_generation = registry.bump_content_generation(node);

@@ -967,6 +967,7 @@ mod tests {
 		unsafe {
 			*registry.virtual_data[leaf.index()].get() = Some(text.as_bytes().to_vec());
 		}
+		drop(chunk);
 		(registry, root)
 	}
 
@@ -1024,6 +1025,7 @@ mod tests {
 		registry
 			.register_device_path(77, path.to_str().expect("utf8 path"))
 			.expect("register backing");
+		drop(chunk);
 		(registry, root, path)
 	}
 

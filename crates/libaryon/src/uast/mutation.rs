@@ -48,7 +48,7 @@ impl std::fmt::Display for MutationCapacityError {
 		write!(
 			f,
 			"UAST registry node capacity exhausted: edit needs {} nodes but only {} \
-			 remain; restart the editor (closing buffers does not reclaim node IDs yet)",
+			 immediately reusable slots remain; wait for reclamation or restart the editor",
 			self.required, self.remaining
 		)
 	}
@@ -1523,7 +1523,7 @@ mod tests {
 				b"abc"[offset as usize]
 			})),
 		);
-		registry.begin_metric_scan(root, leaf, leaf);
+		registry.begin_metric_scan(root, [leaf]);
 		let _ = registry.insert_text(leaf, 3, b"\n");
 
 		assert_eq!(registry.exact_line_count(root), Some(2));

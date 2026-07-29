@@ -37,8 +37,7 @@ pub(crate) struct FoldEdit {
 impl FoldSet {
 	#[inline]
 	fn position(&self, node: NodeId) -> Result<usize, usize> {
-		self.nodes
-			.binary_search_by_key(&node.index(), |candidate| candidate.index())
+		self.nodes.binary_search(&node)
 	}
 
 	#[inline]
@@ -116,7 +115,7 @@ impl FoldSet {
 			.into_iter()
 			.filter_map(|record| find_exact_match(registry, root, record))
 			.collect();
-		self.nodes.sort_unstable_by_key(|node| node.index());
+		self.nodes.sort_unstable();
 		self.nodes.dedup();
 	}
 
@@ -163,8 +162,14 @@ fn fold_kind(registry: &UastRegistry, root: NodeId, node: NodeId) -> Option<Sema
 }
 
 fn attached_to_root(registry: &UastRegistry, root: NodeId, node: NodeId) -> bool {
+	if !registry.is_current_node(root) || !registry.is_current_node(node) {
+		return false;
+	}
 	let mut current = Some(node);
 	while let Some(candidate) = current {
+		if !registry.is_current_node(candidate) {
+			return false;
+		}
 		if candidate == root {
 			return true;
 		}

@@ -6742,7 +6742,7 @@ pub fn main(editor) {
 		));
 		let after_first_ingest = engine.registry.stats();
 		assert!(
-			after_first_ingest.allocated_nodes > before_crossing.allocated_nodes,
+			after_first_ingest.allocation_events > before_crossing.allocation_events,
 			"the first visit to the before generation establishes its parked tree"
 		);
 		assert_eq!(
@@ -6765,7 +6765,7 @@ pub fn main(editor) {
 			));
 			let stats = engine.registry.stats();
 			assert_eq!(
-				stats.allocated_nodes, after_first_ingest.allocated_nodes,
+				stats.allocation_events, after_first_ingest.allocation_events,
 				"cache-hit crossings must allocate zero nodes"
 			);
 			assert_eq!(
@@ -6909,7 +6909,7 @@ pub fn main(editor) {
 			77,
 			Arc::new(crate::svp::GeneratedBackingStore::new(1, |_| b'x')),
 		);
-		registry.begin_metric_scan(root, leaf, leaf);
+		registry.begin_metric_scan(root, [leaf]);
 		assert!(registry.inspector_root_metrics_incomplete(root));
 		let retired_before = registry.stats().retired_nodes;
 

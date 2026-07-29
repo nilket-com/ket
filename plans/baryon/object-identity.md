@@ -80,24 +80,34 @@ scroll ⇒ the preview believes it is fresh and skips the rebuild.**
 `CachedSumTree` is immune because it also keys on `root` and `topology_revision`
 (`session.rs:29-37`, `engine/core.rs:165-179`).
 
-### 2.2 `NodeId` is never freed, and the registry is a fixed-capacity bump allocator that panics
+### 2.2 `NodeId` slots are reclaimed with non-repeating packed generations
 
-There is no free list, no despawn, no `next_id` reset anywhere in `ecs/registry.rs`. Reclamation is of
-*bytes* only (`drop_resident_data`, `registry.rs:487-500`), never nodes.
+ADR 0001 stages 1–4 first removed the pathological callers, reclaimed orphaned
+payload, and made capacity exhaustion non-panicking. ADR 0002 then added slot
+reuse: the low 24 `NodeId` bits encode `slot + 1`, while the high 8 bits encode
+a per-slot object generation. A generation is never repeated for one slot;
+generation-255 retirement burns that slot rather than wrapping.
 
-Every root replacement leaks its entire subtree: load, reload, generation substitute, **and every undo
-or redo across a generation swap** (`edit.rs:1947-1953` re-ingests a fresh root *per keystroke*).
-`apply_graft` (`structural_graft.rs:31-38`) orphans the whole previous child tree on every semantic
-response. Closing a tab or pane releases nothing.
+Retirement still passes through the stage-3b publication fence and bounded
+reclaim cursor. A visited slot is not reusable until the old object lifetime
+has zero resolver I/O leases. This prevents a late completion from clearing
+or publishing into a new object after reuse.
 
-Capacity is fixed at `UastRegistry::new(capacity)` (16M, `host.rs:62`), and exhaustion is a hard
-`expect("UastRegistry capacity exceeded during split")` (`registry.rs:216-218`).
+Capacity remains fixed at `UastRegistry::new(capacity)` (16M in production),
+but exact reservations draw from reclaimed slots plus the bump tail and
+refuse atomically when that combined supply is insufficient. Stage 4 keeps
+refusal graceful for genuine live, pending, or burned-slot pressure.
 
-**The upside is load-bearing for identity:** a stale `NodeId` can never denote a *different* object —
-only a dead one. ADR 0001 stage 3b preserves that non-aliasing identity while reclaiming payload
-after a publication fence: topology and metrics remain readable, but a reclaimed node has no stale
-resident content. There is still no reusable slot or generation-tagged id. Any future address-reuse
-scheme must preserve stale-handle safety deliberately rather than inherit it.
+**The load-bearing identity property remains:** a stale `NodeId` never denotes
+a different live object. Checked registry entry points compare the packed
+generation with the slot's current generation. Once a reclaimed slot becomes
+allocator-eligible, stale topology/metric reads are inert; after reuse they
+fail the identity check. Resolver publication additionally checks the separate
+monotonic `content_generation`, because object lifetime and byte lifetime are
+different questions. A failed content-generation increment permanently closes
+resolver admission for that slot and burns it at retirement; it never wraps.
+The validation-to-I/O-lease transition shares the allocator lock with
+retirement, so first reuse cannot occur in the gap between those two operations.
 
 ### 2.3 The existing stale-rejection precedent
 
@@ -112,8 +122,8 @@ Routing first: `find_doctab_with_pending_request_mut` (`session.rs:773-787`) wal
 claiming that `RequestId`; **no claimant ⇒ the response is dropped silently.** Note what the test does
 *not* check: `root_id`.
 
-This is the closest thing to a generation-checked handle that exists today, and it is the model any
-stale-handle rule would extend.
+This remains the content/publication-level stale-rejection model. It now
+complements, rather than substitutes for, `NodeId` object-generation checking.
 
 ## 3. Lifecycle: what happens to identity
 

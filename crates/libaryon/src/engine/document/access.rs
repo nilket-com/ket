@@ -1139,6 +1139,7 @@ mod tests {
 		registry.replace_authoritative_data(leaf, bytes.to_vec());
 		registry.metrics_inflated[leaf.index()].store(true, std::sync::atomic::Ordering::Release);
 		registry.set_terminal_newline(leaf, bytes.last() == Some(&b'\n'));
+		drop(chunk);
 		(registry, root)
 	}
 

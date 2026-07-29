@@ -58,9 +58,9 @@ explicitly checked one, and must audit consumers of the current behavior
 5. **Reuse retired slots and optionally decommit dead pages.** These are
    complementary, not alternatives, with separate proof obligations.
    *Amended 2026-07-29: accepted ADR
-   `0002-registry-address-space-reclamation.md` decides the order (bounded,
-   non-repeating generation-checked slot reuse first; page decommit deferred
-   and conditional), its prerequisite stages, and both proofs.*
+   `0002-registry-address-space-reclamation.md` decides the order and proofs.
+   Its mandatory generation-checked slot reuse is implemented; page decommit
+   remains deferred and conditional.*
    - *Page retirement* (drop fully-retired, quarantine-cleared backing pages)
      reclaims **memory** but not address space. It only pays when allocations
      are clustered so pages become wholly dead. Proof obligation: define and

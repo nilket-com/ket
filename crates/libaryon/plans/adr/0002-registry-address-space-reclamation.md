@@ -1,8 +1,8 @@
 # ADR 0002: registry slot reuse and optional page decommit
 
-Status: accepted 2026-07-29 — the ADR-0001 stage-5 design round. This
-document decides the safety model and sequencing. It is not an implementation
-plan; each numbered delivery stage below gets its own `plan:`/`impl:` pair.
+Status: accepted 2026-07-29; mandatory stages 5a–5c implemented 2026-07-29.
+This document decides the safety model and sequencing. Optional stage 5d
+remains deferred pending the measurements and separate design required below.
 
 Prerequisites now in place (ADR 0001 stages 1–4): exact owner, parked, and
 orphan accounting; publication-fenced payload reclaim that visits every
@@ -256,8 +256,10 @@ reuse.
 4. **Stage 5d — optional page decommit.** Write a new design/implementation
    plan only if measurements justify P1–P4.
 
-Each stage is a separate `plan:`/`impl:` pair. Stage 5c does not begin until
-5a and 5b have soaked with no stale-access findings.
+Stages 5a–5c were sealed as one implementation after their proof boundaries
+were exercised together: exact reservations are the allocator capability, and
+I/O-quiescent reclamation is the sole producer of reusable tickets. Stage 5d
+still requires its own `plan:`/`impl:` pair if measurements ever justify it.
 
 ## Acceptance tests for the eventual implementation
 

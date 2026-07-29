@@ -2003,7 +2003,7 @@ fn apply_history_replay(
 			let outgoing_file_identity =
 				BackingIdentity::for_path(std::path::Path::new(&outgoing_target.path))
 					.map_err(|error| format!("Shadow generation changed: {error}"))?;
-			let allocated_before = ctx.registry.allocated_node_count();
+			let allocated_before = ctx.registry.allocation_event_count();
 			let payload_before = ctx.registry.authoritative_payload_snapshot().retained();
 			let mut revived = tab.document.parked_generations.take(&target);
 			if revived.as_ref().is_some_and(|entry| {
@@ -2046,7 +2046,7 @@ fn apply_history_replay(
 				}
 				let candidate_nodes = ctx
 					.registry
-					.allocated_node_count()
+					.allocation_event_count()
 					.saturating_sub(allocated_before);
 				let candidate_payload = ctx
 					.registry
@@ -2080,7 +2080,7 @@ fn apply_history_replay(
 					}
 					let candidate_nodes = ctx
 						.registry
-						.allocated_node_count()
+						.allocation_event_count()
 						.saturating_sub(allocated_before);
 					let candidate_payload = ctx
 						.registry

@@ -389,9 +389,13 @@ fn take_capacity_warning(
 	stats: crate::ecs::registry::RegistryStatsSnapshot,
 	already_shown: &mut bool,
 ) -> Option<String> {
+	let unavailable = stats
+		.allocated_nodes
+		.saturating_sub(stats.reusable_slots)
+		.min(stats.capacity);
 	if *already_shown
 		|| stats.capacity == 0
-		|| stats.allocated_nodes.saturating_mul(100)
+		|| unavailable.saturating_mul(100)
 			< stats
 				.capacity
 				.saturating_mul(REGISTRY_CAPACITY_WARNING_PERCENT)
@@ -400,11 +404,14 @@ fn take_capacity_warning(
 	}
 	*already_shown = true;
 	Some(format!(
-		"UAST registry node capacity is {}% full ({}/{}); restart the editor before \
-		 exhaustion (closing buffers does not reclaim node IDs yet)",
-		stats.allocated_nodes.saturating_mul(100) / stats.capacity,
+		"UAST registry immediately available capacity is below {}% (slots={}/{} reusable={} \
+		 pending={} burned={}); wait for reclamation or restart before exhaustion",
+		100 - REGISTRY_CAPACITY_WARNING_PERCENT,
 		stats.allocated_nodes,
-		stats.capacity
+		stats.capacity,
+		stats.reusable_slots,
+		stats.pending_reuse_slots,
+		stats.burned_slots,
 	))
 }
 
@@ -1640,7 +1647,7 @@ mod tests {
 		let message = take_capacity_warning(threshold, &mut shown).expect("threshold warning");
 		assert!(message.contains("UAST registry"));
 		assert!(message.contains("restart"));
-		assert!(message.contains("closing buffers does not reclaim node IDs yet"));
+		assert!(message.contains("wait for reclamation"));
 		assert_eq!(take_capacity_warning(threshold, &mut shown), None);
 	}
 

@@ -104,10 +104,7 @@ impl ReclaimQueue {
 		self.maintenance_wake_pending = false;
 	}
 
-	pub(crate) fn schedule_maintenance(
-		&mut self,
-		internal: &super::request::InternalSender,
-	) {
+	pub(crate) fn schedule_maintenance(&mut self, internal: &super::request::InternalSender) {
 		if !self.has_eligible_work() || self.maintenance_wake_pending {
 			return;
 		}
@@ -130,6 +127,7 @@ mod tests {
 	use super::*;
 	use crate::ecs::UastRegistry;
 	use crate::uast::{SemanticKind, SpanMetrics};
+	use std::sync::Arc;
 
 	#[test]
 	fn a_forest_head_does_not_walk_its_detached_root_sibling() {
@@ -184,6 +182,11 @@ mod tests {
 			ReclaimProgress::default(),
 			"same-frame quarantine must not be eligible"
 		);
+		assert_eq!(
+			registry.stats().reusable_slots,
+			0,
+			"publication-quarantined nodes cannot feed the allocator"
+		);
 		assert_eq!(registry.stats().orphaned_payload_bytes, LEAVES as u64);
 
 		queue.finish_frame();
@@ -204,6 +207,11 @@ mod tests {
 		assert_eq!(
 			registry.stats().orphaned_payload_bytes_reclaimed,
 			LEAVES as u64
+		);
+		assert_eq!(
+			registry.stats().reusable_slots,
+			(LEAVES + 1) as u64,
+			"every visited, quiescent node becomes allocator-eligible exactly once"
 		);
 	}
 
@@ -236,7 +244,10 @@ mod tests {
 				crate::engine::request::InternalEvent::Reclaim
 			))
 		));
-		assert!(requests.try_recv().is_err(), "one wake is enough for one queue");
+		assert!(
+			requests.try_recv().is_err(),
+			"one wake is enough for one queue"
+		);
 
 		queue.begin_maintenance_turn();
 		queue.schedule_maintenance(&internal);
@@ -246,5 +257,142 @@ mod tests {
 				crate::engine::request::InternalEvent::Reclaim
 			))
 		));
+	}
+
+	#[test]
+	fn reclaimed_slot_waits_for_its_last_io_lease_then_reuses_with_new_identity() {
+		let registry = Arc::new(UastRegistry::new(1));
+		let mut reservation = registry.reserve_chunk(1).expect("initial slot");
+		let old = reservation.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 7,
+				newlines: 3,
+			},
+		);
+		drop(reservation);
+		let lease = registry.acquire_io_lifetime(old).expect("live node lease");
+		registry.retire_orphaned_forest([old], 1, 0, ReclaimFence::NeverPublished);
+		let mut queue = ReclaimQueue::default();
+		queue.collect_registry_notices(&registry);
+		assert_eq!(queue.drain_eligible(&registry, 1).visited_nodes, 1);
+		assert_eq!(registry.stats().pending_reuse_slots, 1);
+		assert_eq!(registry.stats().reusable_slots, 0);
+		assert!(registry.reserve_chunk(1).is_none());
+
+		drop(lease);
+		assert_eq!(registry.stats().pending_reuse_slots, 0);
+		assert_eq!(registry.stats().reusable_slots, 1);
+		let mut recycled = registry.reserve_chunk(1).expect("quiescent slot");
+		let new = recycled.spawn_node(
+			SemanticKind::Group,
+			None,
+			SpanMetrics {
+				byte_length: 11,
+				newlines: 5,
+			},
+		);
+		assert_eq!(new.index(), old.index());
+		assert_ne!(new, old);
+		assert_eq!(new.generation(), old.generation() + 1);
+		assert!(!registry.is_current_node(old));
+		assert_eq!(registry.get_total_bytes(old), 0);
+		assert_eq!(registry.get_first_child(old), None);
+		assert_eq!(registry.get_total_bytes(new), 11);
+		registry.replace_authoritative_data(new, b"new lifetime".to_vec());
+		let stale_write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			registry.replace_authoritative_data(old, b"stale overwrite".to_vec());
+		}));
+		assert!(
+			stale_write.is_err(),
+			"a stale identity must not mutate its replacement"
+		);
+		assert_eq!(
+			registry.read_node_bytes_sync(new).expect("new payload"),
+			b"new lifetime"
+		);
+	}
+
+	#[test]
+	fn fragmented_reuse_and_tail_slots_form_one_exact_atomic_reservation() {
+		let registry = UastRegistry::new(4);
+		let mut initial = registry.reserve_chunk(2).expect("initial slots");
+		let first = initial.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		let _second = initial.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		drop(initial);
+		registry.retire_orphaned_forest([first], 1, 0, ReclaimFence::NeverPublished);
+		let mut queue = ReclaimQueue::default();
+		queue.collect_registry_notices(&registry);
+		queue.drain_eligible(&registry, 1);
+
+		let before = registry.stats();
+		let mut mixed = registry
+			.reserve_chunk(3)
+			.expect("one free plus two tail slots");
+		let parent = mixed.spawn_node(SemanticKind::Group, None, SpanMetrics::default());
+		let left = mixed.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		let right = mixed.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		mixed.append_local_child(parent, left);
+		mixed.append_local_child(parent, right);
+		assert_eq!(parent.index(), first.index());
+		assert_ne!(parent.generation(), first.generation());
+		assert_eq!(registry.allocated_node_count(), 4);
+		assert_eq!(
+			registry.allocation_event_count(),
+			before.allocation_events + 3
+		);
+		assert_eq!(registry.get_first_child(parent), Some(left));
+		assert_eq!(registry.get_next_sibling(left), Some(right));
+	}
+
+	#[test]
+	fn insufficient_mixed_reservation_changes_neither_free_list_nor_tail() {
+		let registry = UastRegistry::new(3);
+		let mut initial = registry.reserve_chunk(2).expect("initial slots");
+		let retired = initial.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		let _live = initial.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		drop(initial);
+		registry.retire_orphaned_forest([retired], 1, 0, ReclaimFence::NeverPublished);
+		let mut queue = ReclaimQueue::default();
+		queue.collect_registry_notices(&registry);
+		queue.drain_eligible(&registry, 1);
+		let before = registry.stats();
+
+		assert!(registry.reserve_chunk(3).is_none());
+		assert_eq!(registry.stats(), before);
+		assert!(
+			registry.reserve_chunk(2).is_some(),
+			"the failed request must leave one free and one tail slot intact"
+		);
+	}
+
+	#[test]
+	fn generation_255_retires_to_burned_instead_of_wrapping() {
+		let registry = UastRegistry::new(1);
+		let mut reservation = registry.reserve_chunk(1).expect("initial slot");
+		let mut node = reservation.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		drop(reservation);
+		let mut queue = ReclaimQueue::default();
+		for expected in 0..=u8::MAX {
+			assert_eq!(node.generation(), expected);
+			registry.retire_orphaned_forest([node], 1, 0, ReclaimFence::NeverPublished);
+			queue.collect_registry_notices(&registry);
+			queue.drain_eligible(&registry, 1);
+			if expected == u8::MAX {
+				break;
+			}
+			let mut next = registry.reserve_chunk(1).expect("generation remains");
+			node = next.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		}
+		let stats = registry.stats();
+		assert_eq!(stats.burned_slots, 1);
+		assert_eq!(stats.reusable_slots, 0);
+		assert!(registry.reserve_chunk(1).is_none());
+		assert_eq!(stats.allocation_events, 256);
+		assert_eq!(
+			stats.allocated_nodes, 1,
+			"reuse churn must hold high-water flat"
+		);
 	}
 }
