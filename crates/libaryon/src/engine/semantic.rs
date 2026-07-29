@@ -83,6 +83,10 @@ fn apply_semantic_response(
 	if let Some((green, source_bytes)) = structural_topology {
 		let rid = document.root_id;
 		let fold_snapshot = doctab.view.folds.snapshot(registry, rid);
+		let retired_descendants = document
+			.uast_accounting
+			.current_live_nodes
+			.saturating_sub(1);
 
 		// A graft that would not reproduce the document's bytes is refused, and the
 		// document keeps the tree it has. The highlights above still stand: they are
@@ -94,6 +98,7 @@ fn apply_semantic_response(
 			});
 			return false;
 		}
+		registry.note_nodes_retired(retired_descendants);
 		document.bump_topology_rev();
 		doctab
 			.view

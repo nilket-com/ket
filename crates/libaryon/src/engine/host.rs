@@ -474,6 +474,22 @@ mod tests {
 				.any(|window| window == b"WHITESPACE"),
 			"semantic mode should collapse Rust trivia without hiding syntax tokens"
 		);
+		assert!(
+			inspector_text
+				.windows(b"owner-nodes: live=".len())
+				.any(|window| window == b"owner-nodes: live=")
+		);
+		assert!(
+			inspector_text
+				.windows(b"global-allocated=".len())
+				.any(|window| window == b"global-allocated=")
+		);
+		assert!(
+			inspector_text
+				.windows(b"roots=2".len())
+				.any(|window| window == b"roots=2"),
+			"ReplaceDocument should retain the BufferId lineage across its new root"
+		);
 		commands
 			.send(EditorCommand::OpenUastInspector {
 				mode: Some(crate::engine::UastInspectorMode::Graph),

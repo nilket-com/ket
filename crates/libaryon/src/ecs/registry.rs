@@ -19,6 +19,9 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegistryStatsSnapshot {
 	pub allocated_nodes: u64,
+	/// Nodes detached from live ownership. Stage-1 accounting does not reclaim
+	/// their slots, so this is retirement traffic rather than free capacity.
+	pub retired_nodes: u64,
 	pub cold_extents: u64,
 	pub hot_extents: u64,
 	pub scanned_bytes: u64,
@@ -150,6 +153,7 @@ pub struct UastRegistry {
 	pub(crate) scanned_bytes: AtomicU64,
 	pub(crate) pending_scan_blocks: AtomicU64,
 	pub(crate) resident_bytes: AtomicU64,
+	retired_nodes: AtomicU64,
 	/// Monotonic invalidation token for metadata-only inspector snapshots.
 	/// Residency, metric knowledge, allocation, and topology changes bump it.
 	inspector_revision: AtomicU64,
@@ -211,6 +215,7 @@ impl UastRegistry {
 			scanned_bytes: AtomicU64::new(0),
 			pending_scan_blocks: AtomicU64::new(0),
 			resident_bytes: AtomicU64::new(0),
+			retired_nodes: AtomicU64::new(0),
 			inspector_revision: AtomicU64::new(0),
 			resident_accounted_bytes: PagedArray::new(cap, || AtomicU64::new(0)),
 			resident_counted_hot: PagedArray::new(cap, || AtomicBool::new(false)),
@@ -271,6 +276,28 @@ impl UastRegistry {
 				Err(observed) => start_id = observed,
 			}
 		}
+	}
+
+	pub(crate) fn allocated_node_count(&self) -> u64 {
+		u64::from(self.next_id.load(Ordering::Acquire).saturating_sub(1))
+	}
+
+	pub(crate) fn retired_node_count(&self) -> u64 {
+		self.retired_nodes.load(Ordering::Acquire)
+	}
+
+	/// Records a logical retirement without reclaiming the node or changing
+	/// stale-`NodeId` behavior.
+	pub(crate) fn note_nodes_retired(&self, count: u64) {
+		if count == 0 {
+			return;
+		}
+		let _ = self
+			.retired_nodes
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				Some(current.saturating_add(count))
+			});
+		self.bump_inspector_revision();
 	}
 
 	/// ATOMIC HOT-SWAP: Allows the I/O thread to populate virtual_data once DMA completes.
@@ -707,7 +734,8 @@ impl UastRegistry {
 
 	pub fn stats(&self) -> RegistryStatsSnapshot {
 		RegistryStatsSnapshot {
-			allocated_nodes: u64::from(self.next_id.load(Ordering::Acquire).saturating_sub(1)),
+			allocated_nodes: self.allocated_node_count(),
+			retired_nodes: self.retired_node_count(),
 			cold_extents: self.cold_extent_count.load(Ordering::Acquire),
 			hot_extents: self.hot_extent_count.load(Ordering::Acquire),
 			scanned_bytes: self.scanned_bytes.load(Ordering::Acquire),
@@ -883,7 +911,11 @@ impl UastRegistry {
 				*self.child_tails[idx].get() = None;
 			}
 		}
-		self.bump_inspector_revision();
+		if parent.is_some() {
+			self.note_nodes_retired(1);
+		} else {
+			self.bump_inspector_revision();
+		}
 	}
 
 	fn apply_newline_delta(&self, target: NodeId, added_newlines: i64) {
@@ -1467,6 +1499,24 @@ mod tests {
 		assert_eq!(registry.stats().allocated_nodes, 0);
 		assert!(registry.reserve_chunk(1).is_some());
 		assert_eq!(registry.stats().allocated_nodes, 1);
+	}
+
+	#[test]
+	fn disconnect_records_one_retirement_only_for_an_attached_node() {
+		let registry = UastRegistry::new(2);
+		let mut chunk = registry.reserve_chunk(2).expect("registry chunk");
+		let root = chunk.spawn_node(SemanticKind::RelationalTable, None, SpanMetrics::default());
+		let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
+		chunk.append_local_child(root, leaf);
+
+		registry.disconnect_node(leaf);
+		assert_eq!(registry.stats().retired_nodes, 1);
+		registry.disconnect_node(leaf);
+		assert_eq!(
+			registry.stats().retired_nodes,
+			1,
+			"an already-detached node must not retire twice"
+		);
 	}
 
 	#[test]

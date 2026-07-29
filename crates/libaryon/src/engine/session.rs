@@ -152,6 +152,7 @@ pub(crate) struct UastInspectorRefreshKey {
 	pub(crate) mode: UastInspectorMode,
 	pub(crate) fold_revision: u64,
 	pub(crate) follow_cursor: bool,
+	pub(crate) owner_accounting: UastOwnerAccounting,
 	pub(crate) pane_width: u16,
 	pub(crate) pane_lines: u32,
 	pub(crate) snapshot_node_budget: usize,
@@ -176,8 +177,53 @@ pub(crate) struct UastInspectorPanel {
 	pub(crate) snapshot_node_budget: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UastOwnerAccounting {
+	pub(crate) allocated_nodes: u64,
+	pub(crate) retired_nodes: u64,
+	pub(crate) current_live_nodes: u64,
+	pub(crate) root_generations: u32,
+}
+
+impl UastOwnerAccounting {
+	pub(crate) const fn new(initial_nodes: u64) -> Self {
+		Self {
+			allocated_nodes: initial_nodes,
+			retired_nodes: 0,
+			current_live_nodes: initial_nodes,
+			root_generations: 1,
+		}
+	}
+
+	fn record_transaction(&mut self, allocated: u64, retired: u64) {
+		let available = self.current_live_nodes.saturating_add(allocated);
+		debug_assert!(
+			retired <= available,
+			"UAST owner retirement exceeds its live and newly allocated nodes"
+		);
+		let retired = retired.min(available);
+		self.allocated_nodes = self.allocated_nodes.saturating_add(allocated);
+		self.retired_nodes = self.retired_nodes.saturating_add(retired);
+		self.current_live_nodes = available - retired;
+		debug_assert_eq!(
+			self.allocated_nodes.saturating_sub(self.retired_nodes),
+			self.current_live_nodes
+		);
+	}
+
+	fn record_root_replacement(&mut self, allocated: u64, closure_retired: u64) {
+		debug_assert_eq!(
+			closure_retired, 0,
+			"root replacement mixed old-tree disconnects with whole-root retirement"
+		);
+		self.record_transaction(allocated, self.current_live_nodes);
+		self.root_generations = self.root_generations.saturating_add(1);
+	}
+}
+
 pub(crate) struct TextBuffer {
 	pub(crate) root_id: NodeId,
+	pub(crate) uast_accounting: UastOwnerAccounting,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: Option<String>,
 	/// Encrypted-at-rest backing owned by libaryon. This is intentionally
@@ -233,6 +279,7 @@ impl TextBuffer {
 		Ok((
 			Self {
 				root_id: root,
+				uast_accounting: UastOwnerAccounting::new(2),
 				topology_rev: TopologyRev::ZERO,
 				file_path: None,
 				encrypted_backing: None,
@@ -2021,6 +2068,7 @@ impl TestTextEditor {
 				id: buffer_id,
 				content: BufferContent::Text(TextBuffer {
 					root_id: root,
+					uast_accounting: UastOwnerAccounting::new(2),
 					topology_rev: TopologyRev::ZERO,
 					file_path: None,
 					encrypted_backing: None,
@@ -3401,6 +3449,9 @@ impl EditorSession {
 		let buffer_id = layout.find_view(acting_view_id)?.buffer_id;
 		let document = buffers.get(buffer_id)?.text()?;
 		let root_before = document.root_id;
+		let accounting_before = document.uast_accounting;
+		let allocated_before = registry.allocated_node_count();
+		let retired_before = registry.retired_node_count();
 		let state_before = document.ledger.current_state_id;
 		let topology_before = document.topology_rev;
 		let search_before = document.search_revision;
@@ -3438,6 +3489,20 @@ impl EditorSession {
 			.and_then(Buffer::text_mut)
 			.expect("mutated text buffer must remain live");
 		let root_after = document.root_id;
+		let allocated_after = registry.allocated_node_count();
+		let closure_retired_after = registry.retired_node_count();
+		let allocated_delta = allocated_after.saturating_sub(allocated_before);
+		let closure_retired_delta = closure_retired_after.saturating_sub(retired_before);
+		if root_before != root_after {
+			registry.note_nodes_retired(accounting_before.current_live_nodes);
+			document
+				.uast_accounting
+				.record_root_replacement(allocated_delta, closure_retired_delta);
+		} else {
+			document
+				.uast_accounting
+				.record_transaction(allocated_delta, closure_retired_delta);
+		}
 		let state_after = document.ledger.current_state_id;
 		let topology_after = document.topology_rev;
 		let search_invalidated_by_content = (root_before != root_after
@@ -4330,8 +4395,9 @@ mod tests {
 	use super::{
 		AddCaretResult, Affinity, BufferContent, CanonicalPath, CursorMode, CursorSet, CursorState,
 		DiffPair, EditorPane, EditorSession, LayoutLeaf, LayoutNode, MAX_CURSORS,
-		SettingsPersistent, SnapshotProvenance, TextAnchor, TextBuffer, View, caret_from_doc_byte,
-		resolve_theme_name, split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
+		SettingsPersistent, SnapshotProvenance, TextAnchor, TextBuffer, UastOwnerAccounting, View,
+		caret_from_doc_byte, resolve_theme_name, split_child_rects, with_file_browser_buffer_mut,
+		with_text_buffer_mut,
 	};
 	use crate::core::{
 		BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DocByte, DocDisplayCol, DocLine,
@@ -4388,6 +4454,203 @@ mod tests {
 			BTreeMap::new(),
 			None,
 		)
+	}
+
+	fn exact_reachable_nodes(registry: &UastRegistry, root: crate::ecs::NodeId) -> u64 {
+		let mut count = 0u64;
+		let mut stack = vec![root];
+		while let Some(node) = stack.pop() {
+			count += 1;
+			let mut child = registry.get_first_child(node);
+			while let Some(current) = child {
+				stack.push(current);
+				child = registry.get_next_sibling(current);
+			}
+		}
+		count
+	}
+
+	#[test]
+	fn uast_owner_accounting_preserves_its_live_node_algebra() {
+		let mut accounting = UastOwnerAccounting::new(2);
+		accounting.record_transaction(3, 1);
+		assert_eq!(
+			accounting,
+			UastOwnerAccounting {
+				allocated_nodes: 5,
+				retired_nodes: 1,
+				current_live_nodes: 4,
+				root_generations: 1,
+			}
+		);
+
+		accounting.record_root_replacement(6, 0);
+		assert_eq!(accounting.allocated_nodes, 11);
+		assert_eq!(accounting.retired_nodes, 5);
+		assert_eq!(accounting.current_live_nodes, 6);
+		assert_eq!(accounting.root_generations, 2);
+	}
+
+	#[test]
+	fn uast_owner_accounting_shape_defers_payload_bytes_to_adr_stage_three() {
+		// Keep this exhaustive: ADR 0001 deliberately defers owner-attributed
+		// virtual payload until stage 3 establishes an exact ownership seam.
+		let UastOwnerAccounting {
+			allocated_nodes: _,
+			retired_nodes: _,
+			current_live_nodes: _,
+			root_generations: _,
+		} = UastOwnerAccounting::new(2);
+	}
+
+	#[test]
+	#[should_panic(expected = "UAST owner retirement exceeds")]
+	fn uast_owner_accounting_rejects_retirement_underflow() {
+		let mut accounting = UastOwnerAccounting::new(2);
+		accounting.record_transaction(0, 3);
+	}
+
+	#[test]
+	fn graft_accounting_retires_descendants_but_keeps_the_root_live() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.expect("focused pane")
+			.active_tab()
+			.id;
+		let buffer_id = session.layout.find_view(view_id).unwrap().buffer_id;
+		let green = crate::engine::language::GreenNode {
+			kind: crate::uast::SemanticKind::RelationalTable,
+			provider_kind: crate::uast::ProviderKindId::NONE,
+			byte_len: 0,
+			children: Vec::new(),
+		};
+
+		let initial = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(
+			initial.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, initial.root_id)
+		);
+
+		for expected_retired in 1..=2 {
+			with_text_buffer_mut(
+				&registry,
+				&mut session.buffers,
+				&mut session.layout,
+				&mut session.events,
+				view_id,
+				|editor| {
+					let retired_descendants = editor
+						.document
+						.uast_accounting
+						.current_live_nodes
+						.saturating_sub(1);
+					crate::engine::structural_graft::apply_graft(
+						&registry,
+						editor.document.root_id,
+						&green,
+						b"",
+					)
+					.expect("empty graft is byte-identical");
+					registry.note_nodes_retired(retired_descendants);
+					editor.document.bump_topology_rev();
+				},
+			)
+			.expect("graft through text mutation boundary");
+
+			let document = session
+				.buffers
+				.get(buffer_id)
+				.and_then(|buffer| buffer.text())
+				.expect("text buffer");
+			assert_eq!(
+				document.uast_accounting.current_live_nodes,
+				exact_reachable_nodes(&registry, document.root_id)
+			);
+			assert_eq!(document.uast_accounting.current_live_nodes, 2);
+			assert_eq!(document.uast_accounting.retired_nodes, expected_retired);
+			assert_eq!(document.uast_accounting.root_generations, 1);
+		}
+
+		let before = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.unwrap()
+			.uast_accounting;
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|editor| {
+				let mismatched = crate::engine::language::GreenNode {
+					byte_len: 1,
+					..green.clone()
+				};
+				assert!(
+					crate::engine::structural_graft::apply_graft(
+						&registry,
+						editor.document.root_id,
+						&mismatched,
+						b"x",
+					)
+					.is_err()
+				);
+			},
+		);
+		let after = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.unwrap()
+			.uast_accounting;
+		assert_eq!(after, before, "rejected graft must not move accounting");
+	}
+
+	#[test]
+	fn abandoned_candidate_allocations_retire_without_becoming_live() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.unwrap()
+			.active_tab()
+			.id;
+		let buffer_id = session.layout.find_view(view_id).unwrap().buffer_id;
+
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|_| {
+				let _candidate = registry.reserve_chunk(2).expect("candidate nodes");
+				registry.note_nodes_retired(2);
+			},
+		);
+
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.unwrap();
+		assert_eq!(document.uast_accounting.allocated_nodes, 4);
+		assert_eq!(document.uast_accounting.retired_nodes, 2);
+		assert_eq!(document.uast_accounting.current_live_nodes, 2);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, document.root_id)
+		);
 	}
 
 	#[test]
@@ -5198,6 +5461,11 @@ mod tests {
 				.byte,
 			DocByte::new(1)
 		);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, document.root_id),
+			"insert allocation must be attributed to the owning buffer"
+		);
 
 		let undone = with_text_buffer_mut(
 			&registry,
@@ -5257,6 +5525,11 @@ mod tests {
 				.byte,
 			DocByte::ZERO
 		);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, document.root_id),
+			"undo pruning must retire nodes from the owning buffer"
+		);
 	}
 
 	#[test]
@@ -5286,15 +5559,17 @@ mod tests {
 				DocByte::new(99),
 			)
 		};
-		let (replacement, _) = TextBuffer::new_unnamed(&registry).expect("replacement root");
-
 		with_text_buffer_mut(
 			&registry,
 			&mut session.buffers,
 			&mut session.layout,
 			&mut session.events,
 			view_id,
-			|editor| editor.document.root_id = replacement.root_id,
+			|editor| {
+				let (replacement, _) =
+					TextBuffer::new_unnamed(&registry).expect("replacement root");
+				editor.document.root_id = replacement.root_id;
+			},
 		)
 		.expect("replace root");
 
@@ -5304,6 +5579,14 @@ mod tests {
 			.and_then(|buffer| buffer.text())
 			.expect("text buffer");
 		assert_eq!(document.navigation_anchors.get(anchor_id), None);
+		assert_eq!(document.uast_accounting.allocated_nodes, 4);
+		assert_eq!(document.uast_accounting.retired_nodes, 2);
+		assert_eq!(document.uast_accounting.current_live_nodes, 2);
+		assert_eq!(document.uast_accounting.root_generations, 2);
+		assert_eq!(
+			document.uast_accounting.current_live_nodes,
+			exact_reachable_nodes(&registry, document.root_id)
+		);
 	}
 
 	#[test]

@@ -70,9 +70,10 @@ pub fn ingest_svp_file(
 	registry
 		.cold_extent_count
 		.fetch_add(chunk_count, std::sync::atomic::Ordering::Relaxed);
-	resolver
-		.register_device(device_id, &path)
-		.map_err(|error| format!("Open error: {error}"))?;
+	if let Err(error) = resolver.register_device(device_id, &path) {
+		registry.note_nodes_retired(u64::from(node_count));
+		return Err(format!("Open error: {error}"));
+	}
 	let warm_index = registry
 		.backing_identity(device_id)
 		.and_then(|identity| {
@@ -202,11 +203,36 @@ pub(crate) fn persist_line_index(registry: &UastRegistry, root: NodeId) {
 
 #[cfg(test)]
 mod tests {
-	use super::{cache_path_for_backing, persist_line_index};
+	use super::{cache_path_for_backing, ingest_svp_file, persist_line_index};
 	use crate::ecs::UastRegistry;
 	use crate::svp::pointer::SvpPointer;
+	use crate::svp::resolver::SvpResolver;
 	use crate::uast::{SemanticKind, SpanMetrics};
 	use std::sync::atomic::Ordering;
+	use std::sync::{Arc, mpsc};
+
+	#[test]
+	fn failed_post_allocation_device_registration_retires_the_candidate_tree() {
+		let registry = Arc::new(UastRegistry::new(2));
+		let (notify, _notifications) = mpsc::channel();
+		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
+		let missing =
+			std::env::temp_dir().join(format!("baryon-missing-ingest-{}", std::process::id()));
+		let _ = std::fs::remove_file(&missing);
+
+		let error = ingest_svp_file(
+			&resolver,
+			&registry,
+			1,
+			91,
+			missing.to_string_lossy().into_owned(),
+		)
+		.expect_err("missing device path must reject after reservation");
+
+		assert!(error.contains("Open error"));
+		assert_eq!(registry.stats().allocated_nodes, 2);
+		assert_eq!(registry.stats().retired_nodes, 2);
+	}
 
 	#[test]
 	fn edited_variable_extents_are_not_persisted_as_fixed_index_blocks() {

@@ -3,7 +3,8 @@ use super::language::{LanguageProvider, LanguageRegistry};
 use super::protocol::UastInspectorMode;
 use super::session::{
 	Affinity, EditorSession, StructuralIssue, StructuralIssueKind, UastInspectorNodeKey,
-	UastInspectorPanel, UastInspectorRefreshKey, UastInspectorRow, UastInspectorStamp, ViewContent,
+	UastInspectorPanel, UastInspectorRefreshKey, UastInspectorRow, UastInspectorStamp,
+	UastOwnerAccounting, ViewContent,
 };
 use crate::core::{BufferId, DocByte, DocLine, ViewId};
 use crate::ecs::{NodeId, UastRegistry};
@@ -20,7 +21,7 @@ const INSPECTOR_DEPTH_BUDGET: u16 = 32;
 const INSPECTOR_MIN_NODE_BUDGET: usize = 64;
 const INSPECTOR_VIEWPORT_OVERSCAN: usize = 4;
 const INSPECTOR_RENDERED_OVERSCAN: usize = 2;
-const INSPECTOR_HEADER_LINES: u64 = 5;
+const INSPECTOR_HEADER_LINES: u64 = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct SourceIdentity {
@@ -33,6 +34,7 @@ struct SourceIdentity {
 	structural_issue: Option<StructuralIssue>,
 	active_language_id: Option<super::language::LanguageId>,
 	cursor_byte: Option<DocByte>,
+	owner_accounting: UastOwnerAccounting,
 }
 
 pub(crate) fn open_uast_inspector(
@@ -211,6 +213,7 @@ pub(crate) fn refresh_uast_inspectors(
 						structural_issue: document.semantic.structural_issue,
 						active_language_id: document.active_language_id,
 						cursor_byte,
+						owner_accounting: document.uast_accounting,
 					},
 					document
 						.file_path
@@ -278,6 +281,7 @@ pub(crate) fn refresh_uast_inspectors(
 			mode,
 			fold_revision,
 			follow_cursor,
+			owner_accounting: identity.owner_accounting,
 			pane_width: viewport_width,
 			pane_lines: viewport_lines,
 			snapshot_node_budget,
@@ -728,7 +732,7 @@ fn render_dot(
 	dot.push_str("  graph [rankdir=TB, bgcolor=\"transparent\"];\n");
 	dot.push_str("  node [shape=box, fontname=\"monospace\"];\n");
 	dot.push_str(&format!(
-		"  label=\"{} · reachable {}{} / allocated {}\";\n",
+		"  label=\"{} · reachable {}{} / global allocated {} / retired {}\";\n",
 		dot_escape(source_name),
 		snapshot.reachable_visited,
 		if snapshot.reachable_complete {
@@ -737,6 +741,7 @@ fn render_dot(
 			"+ (truncated)"
 		},
 		snapshot.allocated_nodes,
+		snapshot.retired_nodes,
 	));
 	for node in &snapshot.nodes {
 		let label = provider
@@ -845,7 +850,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} allocated={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} retired={} allocated={} roots={}\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -859,12 +864,17 @@ fn render_snapshot(
 			.map_or_else(|| "none".to_string(), |view| view.to_string()),
 		reachable,
 		snapshot.allocated_nodes,
+		snapshot.retired_nodes,
 		reachable_resident,
 		snapshot.total_bytes,
 		pane_width,
 		pane_lines,
 		snapshot.nodes.len(),
 		fold_revision,
+		identity.owner_accounting.current_live_nodes,
+		identity.owner_accounting.retired_nodes,
+		identity.owner_accounting.allocated_nodes,
+		identity.owner_accounting.root_generations,
 	);
 	let mut highlights = vec![HighlightSpan::new(
 		DocByte::ZERO,
@@ -1423,6 +1433,7 @@ mod tests {
 			root,
 			total_bytes: 20,
 			allocated_nodes: 4,
+			retired_nodes: 7,
 			reachable_visited: 4,
 			reachable_complete: true,
 			reachable_resident_bytes: 0,
@@ -1490,6 +1501,12 @@ mod tests {
 			}),
 			active_language_id: None,
 			cursor_byte: None,
+			owner_accounting: UastOwnerAccounting {
+				allocated_nodes: 11,
+				retired_nodes: 7,
+				current_live_nodes: 4,
+				root_generations: 2,
+			},
 		};
 		let rendered = render_snapshot(
 			&snapshot,
@@ -1515,6 +1532,16 @@ mod tests {
 		let text = String::from_utf8(rendered.text).expect("UTF-8 inspector");
 		assert!(text.contains("semantic: graft rejected"));
 		assert!(text.contains("pane=80x24 shown=4"));
+		assert!(text.contains("global-allocated=4 global-retired=7"));
+		let owner_line = text
+			.lines()
+			.find(|line| line.starts_with("owner-nodes:"))
+			.expect("owner accounting header");
+		assert_eq!(
+			owner_line,
+			"owner-nodes: live=4 retired=7 allocated=11 roots=2",
+			"ADR 0001 defers owner-attributed byte diagnostics until stage 3"
+		);
 		assert!(!text.contains("scroll="));
 		assert!(text.contains("\n▾\t"));
 		assert!(text.contains("\n▸\t\t"));

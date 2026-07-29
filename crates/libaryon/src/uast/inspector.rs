@@ -122,6 +122,7 @@ pub struct UastInspectorSnapshot {
 	pub root: NodeId,
 	pub total_bytes: u64,
 	pub allocated_nodes: u64,
+	pub retired_nodes: u64,
 	pub reachable_visited: usize,
 	pub reachable_complete: bool,
 	pub reachable_resident_bytes: u64,
@@ -227,10 +228,12 @@ impl UastRegistry {
 		}
 
 		let reachable_complete = !cursor_scoped && pending.is_empty() && !depth_truncated;
+		let stats = self.stats();
 		UastInspectorSnapshot {
 			root,
 			total_bytes: self.get_total_bytes(root),
-			allocated_nodes: self.stats().allocated_nodes,
+			allocated_nodes: stats.allocated_nodes,
+			retired_nodes: stats.retired_nodes,
 			reachable_visited: nodes.len(),
 			reachable_complete,
 			reachable_resident_bytes,

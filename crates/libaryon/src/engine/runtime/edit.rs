@@ -1992,6 +1992,7 @@ fn apply_history_replay(
 			}
 		}
 		HistoryReplay::SwapGeneration { target, cursors } => {
+			let allocated_before = ctx.registry.allocated_node_count();
 			let (rid, _cursor_leaf, new_backing_device_id) =
 				load_root_from_path(ctx, &target.path, next_dynamic_device_id)
 					.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
@@ -2002,6 +2003,11 @@ fn apply_history_replay(
 				if let Some(device_id) = new_backing_device_id {
 					ctx.resolver.unregister_device(device_id);
 				}
+				let candidate_nodes = ctx
+					.registry
+					.allocated_node_count()
+					.saturating_sub(allocated_before);
+				ctx.registry.note_nodes_retired(candidate_nodes);
 				return Err(msg);
 			}
 			tab.document.ledger.commit(direction);

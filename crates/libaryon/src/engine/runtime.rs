@@ -1496,6 +1496,12 @@ fn release_buffer(
 			runtime.resolver.unregister_device(device_id);
 		}
 	}
+	let retired_nodes = match &buffer.content {
+		BufferContent::Text(document) => document.uast_accounting.current_live_nodes,
+		BufferContent::FileBrowser(_) => 2,
+		BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_) => 0,
+	};
+	runtime.registry.note_nodes_retired(retired_nodes);
 	if let Some(root) = buffer.root_id() {
 		runtime.registry.cancel_metric_scan(root);
 	}
