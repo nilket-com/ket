@@ -200,6 +200,7 @@ pub(crate) struct TextBuffer {
 	pub(crate) search_matches: Vec<SearchMatch>,
 	search_revision: u64,
 	search_pattern_revision: u64,
+	pub(crate) navigation_anchors: super::navigation::NavigationAnchorStore,
 	pub(crate) semantic: Box<SemanticState>,
 }
 
@@ -245,6 +246,7 @@ impl TextBuffer {
 				search_matches: Vec::new(),
 				search_revision: 0,
 				search_pattern_revision: 0,
+				navigation_anchors: super::navigation::NavigationAnchorStore::default(),
 				semantic: Box::new(SemanticState::new()),
 			},
 			leaf,
@@ -1318,13 +1320,11 @@ impl CursorState {
 
 	pub(crate) fn rebase_after_edits(&mut self, edits: &[FoldEdit]) {
 		self.visit_carets_mut(|caret| {
-			caret.set_byte(
-				transform_anchor_byte(caret.byte(), caret.affinity(), edits),
-				caret.affinity(),
-			);
+			let anchor = rebase_text_anchor(TextAnchor::new(caret.byte(), caret.affinity()), edits);
+			caret.set_byte(anchor.byte, anchor.affinity);
 		});
 		if let CursorMode::Visual { anchor, .. } = &mut self.mode {
-			anchor.byte = transform_anchor_byte(anchor.byte, anchor.affinity, edits);
+			*anchor = rebase_text_anchor(*anchor, edits);
 		}
 	}
 
@@ -1336,7 +1336,9 @@ impl CursorState {
 	}
 }
 
-fn transform_anchor_byte(original: DocByte, affinity: Affinity, edits: &[FoldEdit]) -> DocByte {
+pub(crate) fn rebase_text_anchor(anchor: TextAnchor, edits: &[FoldEdit]) -> TextAnchor {
+	let original = anchor.byte;
+	let affinity = anchor.affinity;
 	let mut ordered = edits.to_vec();
 	ordered.sort_unstable_by_key(|edit| edit.start);
 	let mut shift = 0i128;
@@ -1363,11 +1365,17 @@ fn transform_anchor_byte(original: DocByte, affinity: Affinity, edits: &[FoldEdi
 		} else {
 			0
 		};
-		return DocByte::new(
-			((i128::from(start) + shift).max(0) as u64).saturating_add(replacement_offset),
+		return TextAnchor::new(
+			DocByte::new(
+				((i128::from(start) + shift).max(0) as u64).saturating_add(replacement_offset),
+			),
+			affinity,
 		);
 	}
-	DocByte::new((i128::from(original.get()) + shift).max(0) as u64)
+	TextAnchor::new(
+		DocByte::new((i128::from(original.get()) + shift).max(0) as u64),
+		affinity,
+	)
 }
 
 impl std::ops::Deref for CursorState {
@@ -2026,6 +2034,7 @@ impl TestTextEditor {
 					search_matches: Vec::new(),
 					search_revision: 0,
 					search_pattern_revision: 0,
+					navigation_anchors: super::navigation::NavigationAnchorStore::default(),
 					semantic: Box::new(SemanticState::new()),
 				}),
 				role: BufferRole::Document,
@@ -3196,6 +3205,7 @@ pub(crate) struct EditorSession {
 	pending_host_events: Vec<crate::engine::HostEvent>,
 	pub(crate) next_semantic_request_id: RequestId,
 	pub(crate) pending_navigation: Option<super::navigation::NavigationStamp>,
+	pub(crate) jump_history: super::navigation::JumpHistory,
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
@@ -3451,6 +3461,13 @@ impl EditorSession {
 		let root_replaced =
 			root_before != root_after || (state_before != state_after && edits.is_none());
 		let topology_changed = topology_before != topology_after;
+		if root_replaced {
+			document.navigation_anchors.invalidate_all();
+		} else if let Some(edits) = &edits {
+			document
+				.navigation_anchors
+				.rebase_after_edits(root_after, state_after, edits);
+		}
 		let total_bytes = registry.get_total_bytes(root_after);
 		let total_lines = registry.get_total_newlines(root_after);
 		for snapshot in snapshots {
@@ -3681,6 +3698,7 @@ impl EditorSession {
 			pending_host_events: Vec::new(),
 			next_semantic_request_id: RequestId::new(1),
 			pending_navigation: None,
+			jump_history: super::navigation::JumpHistory::default(),
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),
@@ -4302,7 +4320,7 @@ mod tests {
 	use super::{
 		AddCaretResult, Affinity, BufferContent, CanonicalPath, CursorMode, CursorSet, CursorState,
 		DiffPair, EditorPane, EditorSession, LayoutLeaf, LayoutNode, MAX_CURSORS,
-		SettingsPersistent, SnapshotProvenance, TextAnchor, View, caret_from_doc_byte,
+		SettingsPersistent, SnapshotProvenance, TextAnchor, TextBuffer, View, caret_from_doc_byte,
 		resolve_theme_name, split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
 	};
 	use crate::core::{
@@ -5068,6 +5086,18 @@ mod tests {
 			let view = session.layout.find_pane(pane_id).unwrap().active_tab();
 			(view.buffer_id, view.id)
 		};
+		let navigation_anchor = {
+			let document = session
+				.buffers
+				.get_mut(buffer_id)
+				.and_then(|buffer| buffer.text_mut())
+				.expect("text buffer");
+			document.navigation_anchors.insert(
+				document.root_id,
+				document.ledger.current_state_id,
+				DocByte::ZERO,
+			)
+		};
 		let mut second_view = session
 			.create_text_view_for_buffer(
 				&registry,
@@ -5144,6 +5174,20 @@ mod tests {
 			unreachable!();
 		};
 		assert_eq!(second.cursor.byte(), DocByte::new(1));
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(
+			document
+				.navigation_anchors
+				.get(navigation_anchor)
+				.expect("rebased navigation anchor")
+				.anchor
+				.byte,
+			DocByte::new(1)
+		);
 
 		let undone = with_text_buffer_mut(
 			&registry,
@@ -5189,6 +5233,67 @@ mod tests {
 			unreachable!();
 		};
 		assert_eq!(second.cursor.byte(), DocByte::ZERO);
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(
+			document
+				.navigation_anchors
+				.get(navigation_anchor)
+				.expect("undo-rebased navigation anchor")
+				.anchor
+				.byte,
+			DocByte::ZERO
+		);
+	}
+
+	#[test]
+	fn root_replacement_invalidates_navigation_anchors_at_the_mutation_boundary() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let view_id = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.expect("focused pane")
+			.active_tab()
+			.id;
+		let buffer_id = session
+			.layout
+			.find_view(view_id)
+			.expect("text view")
+			.buffer_id;
+		let anchor_id = {
+			let document = session
+				.buffers
+				.get_mut(buffer_id)
+				.and_then(|buffer| buffer.text_mut())
+				.expect("text buffer");
+			document.navigation_anchors.insert(
+				document.root_id,
+				document.ledger.current_state_id,
+				DocByte::new(99),
+			)
+		};
+		let (replacement, _) = TextBuffer::new_unnamed(&registry).expect("replacement root");
+
+		with_text_buffer_mut(
+			&registry,
+			&mut session.buffers,
+			&mut session.layout,
+			&mut session.events,
+			view_id,
+			|editor| editor.document.root_id = replacement.root_id,
+		)
+		.expect("replace root");
+
+		let document = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.expect("text buffer");
+		assert_eq!(document.navigation_anchors.get(anchor_id), None);
 	}
 
 	#[test]

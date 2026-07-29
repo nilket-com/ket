@@ -38,7 +38,7 @@ use super::markdown_image_preview::{
 	open_markdown_image_preview, open_static_markdown_preview, scroll_pinned_preview,
 	scroll_target_view as markdown_preview_source_target, sync_markdown_image_preview_scroll,
 };
-use super::navigation::{GotoDefinitionRequest, NavigationResolved, NavigationStamp};
+use super::navigation::{GotoDefinitionRequest, JumpEntry, NavigationResolved, NavigationStamp};
 use super::protocol::{
 	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, SplitDirection,
 };
@@ -1468,6 +1468,9 @@ fn release_buffer(
 	session: &mut EditorSession,
 	buffer_id: crate::core::BufferId,
 ) {
+	if session.jump_history.references(buffer_id) {
+		return;
+	}
 	if session
 		.buffers
 		.get(buffer_id)
@@ -1899,6 +1902,219 @@ fn set_view_cursor(session: &mut EditorSession, view_id: crate::core::ViewId, by
 	}
 }
 
+fn discard_jump_entries(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	entries: impl IntoIterator<Item = JumpEntry>,
+	protected_buffer: Option<BufferId>,
+) {
+	let entries = entries.into_iter().collect::<Vec<_>>();
+	let mut buffers = std::collections::HashSet::new();
+	for entry in entries {
+		buffers.insert(entry.buffer_id);
+		if let Some(document) = session
+			.buffers
+			.get_mut(entry.buffer_id)
+			.and_then(|buffer| buffer.text_mut())
+		{
+			document.navigation_anchors.remove(entry.anchor_id);
+		}
+	}
+	for buffer_id in buffers {
+		if Some(buffer_id) != protected_buffer
+			&& session.layout.view_count_for_buffer(buffer_id) == 0
+			&& !session.jump_history.references(buffer_id)
+		{
+			release_buffer(runtime, session, buffer_id);
+		}
+	}
+}
+
+fn record_definition_origin(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	stamp: NavigationStamp,
+	protected_buffer: Option<BufferId>,
+) {
+	let duplicate = session
+		.jump_history
+		.newest_back()
+		.filter(|entry| entry.buffer_id == stamp.buffer_id)
+		.and_then(|entry| {
+			session
+				.buffers
+				.get(entry.buffer_id)
+				.and_then(|buffer| buffer.text())
+				.and_then(|document| document.navigation_anchors.get(entry.anchor_id))
+		})
+		.is_some_and(|saved| {
+			saved.root == stamp.root
+				&& saved.state_id == stamp.state_id
+				&& saved.anchor.byte == stamp.cursor
+		});
+	if duplicate {
+		let removed = session.jump_history.clear_forward();
+		discard_jump_entries(runtime, session, removed, protected_buffer);
+		return;
+	}
+	let Some(document) = session
+		.buffers
+		.get_mut(stamp.buffer_id)
+		.and_then(|buffer| buffer.text_mut())
+	else {
+		return;
+	};
+	let anchor_id = document
+		.navigation_anchors
+		.insert(stamp.root, stamp.state_id, stamp.cursor);
+	let removed = session.jump_history.record_back(JumpEntry {
+		buffer_id: stamp.buffer_id,
+		preferred_view_id: stamp.view_id,
+		anchor_id,
+	});
+	discard_jump_entries(runtime, session, removed, protected_buffer);
+}
+
+fn jump_back(runtime: &RuntimeContext<'_>, session: &mut EditorSession) -> bool {
+	let current_view_id = focused_doctab(&session.layout, session.focused_pane_id).id;
+	let Some(current_view) = session.layout.find_view(current_view_id) else {
+		session.ui.status_message = Some("Jump back requires a text view".to_string());
+		return true;
+	};
+	let current_buffer_id = current_view.buffer_id;
+	let Some((current_root, current_state, current_byte)) = session
+		.buffers
+		.get(current_buffer_id)
+		.and_then(|buffer| buffer.text())
+		.and_then(|document| {
+			let ViewContent::Text(text) = &current_view.content else {
+				return None;
+			};
+			Some((
+				document.root_id,
+				document.ledger.current_state_id,
+				text.cursor.primary().byte(),
+			))
+		})
+	else {
+		session.ui.status_message = Some("Jump back requires a text view".to_string());
+		return true;
+	};
+
+	let mut stale_count = 0usize;
+	let (target_entry, target_byte) = loop {
+		let Some(entry) = session.jump_history.newest_back() else {
+			session.ui.status_message = Some(if stale_count == 0 {
+				"No older jump".to_string()
+			} else {
+				format!("No older jump ({stale_count} stale entries removed)")
+			});
+			return true;
+		};
+		let resolved = session
+			.buffers
+			.get(entry.buffer_id)
+			.and_then(|buffer| buffer.text())
+			.and_then(|document| {
+				let saved = document.navigation_anchors.get(entry.anchor_id)?;
+				(saved.root == document.root_id
+					&& saved.state_id == document.ledger.current_state_id
+					&& saved.anchor.byte.get()
+						<= runtime.registry.get_total_bytes(document.root_id))
+				.then_some(saved.anchor.byte)
+			});
+		if let Some(byte) = resolved {
+			break (entry, byte);
+		}
+		let stale = session
+			.jump_history
+			.pop_back()
+			.expect("newest jump must remain present");
+		discard_jump_entries(runtime, session, [stale], None);
+		stale_count = stale_count.saturating_add(1);
+	};
+
+	let preferred_is_live = session
+		.layout
+		.find_view(target_entry.preferred_view_id)
+		.is_some_and(|view| view.buffer_id == target_entry.buffer_id);
+	let visible_target = preferred_is_live
+		.then_some(target_entry.preferred_view_id)
+		.or_else(|| session.layout.view_id_for_buffer(target_entry.buffer_id));
+	let target_view_id = visible_target.unwrap_or(current_view_id);
+	if visible_target.is_none()
+		&& target_entry.buffer_id != current_buffer_id
+		&& session.layout.view_count_for_buffer(current_buffer_id) == 1
+		&& session
+			.buffers
+			.get(current_buffer_id)
+			.is_some_and(|buffer| buffer.is_dirty())
+	{
+		session.ui.status_message =
+			Some("Jump back would hide unsaved changes; write or discard first".to_string());
+		return true;
+	}
+
+	let departure_anchor = {
+		let document = session
+			.buffers
+			.get_mut(current_buffer_id)
+			.and_then(|buffer| buffer.text_mut())
+			.expect("validated departure buffer must remain live");
+		document
+			.navigation_anchors
+			.insert(current_root, current_state, current_byte)
+	};
+	let departure = JumpEntry {
+		buffer_id: current_buffer_id,
+		preferred_view_id: current_view_id,
+		anchor_id: departure_anchor,
+	};
+
+	if visible_target.is_none()
+		&& let Err(error) =
+			retarget_text_view(runtime, session, current_view_id, target_entry.buffer_id)
+	{
+		if let Some(document) = session
+			.buffers
+			.get_mut(current_buffer_id)
+			.and_then(|buffer| buffer.text_mut())
+		{
+			document.navigation_anchors.remove(departure_anchor);
+		}
+		session.ui.status_message = Some(error);
+		return true;
+	}
+
+	set_view_cursor(session, target_view_id, target_byte);
+	if let Some(pane_id) = session.layout.pane_id_for_view(target_view_id) {
+		if let Some(pane) = session.layout.find_pane_mut(pane_id) {
+			pane.activate_view(target_view_id);
+		}
+		session.focus_pane(pane_id);
+	}
+	let consumed = session
+		.jump_history
+		.pop_back()
+		.expect("applied jump must remain newest");
+	if let Some(document) = session
+		.buffers
+		.get_mut(consumed.buffer_id)
+		.and_then(|buffer| buffer.text_mut())
+	{
+		document.navigation_anchors.remove(consumed.anchor_id);
+	}
+	let removed = session.jump_history.push_forward(departure);
+	discard_jump_entries(runtime, session, removed, None);
+	session.ui.status_message = Some(if stale_count == 0 {
+		"Jumped back".to_string()
+	} else {
+		format!("Jumped back ({stale_count} stale entries skipped)")
+	});
+	reset_global_transients(session);
+	true
+}
+
 fn apply_navigation_resolved(
 	runtime: &RuntimeContext<'_>,
 	session: &mut EditorSession,
@@ -1969,6 +2185,7 @@ fn apply_navigation_resolved(
 					Some("Definition target is outside the source document".to_string());
 				return true;
 			}
+			record_definition_origin(runtime, session, stamp, None);
 			set_view_cursor(session, stamp.view_id, target_byte);
 			if let Some(pane_id) = session.layout.pane_id_for_view(stamp.view_id) {
 				session.focus_pane(pane_id);
@@ -1999,6 +2216,7 @@ fn apply_navigation_resolved(
 						Some("Definition target is outside the target document".to_string());
 					return true;
 				}
+				record_definition_origin(runtime, session, stamp, None);
 				set_view_cursor(session, target_view, target_byte);
 				if let Some(pane_id) = session.layout.pane_id_for_view(target_view) {
 					if let Some(pane) = session.layout.find_pane_mut(pane_id) {
@@ -2044,6 +2262,7 @@ fn apply_navigation_resolved(
 						Some("Definition target is outside the target document".to_string());
 					return true;
 				}
+				record_definition_origin(runtime, session, stamp, Some(target_buffer));
 				if let Err(error) =
 					retarget_text_view(runtime, session, stamp.view_id, target_buffer)
 				{
@@ -2491,6 +2710,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::OpenAllFolds
 		| EditorCommand::MatchDelimiter
 		| EditorCommand::GotoDefinition
+		| EditorCommand::JumpBack
 		| EditorCommand::ClickCursor(_)
 		| EditorCommand::GotoLine(_)
 		| EditorCommand::MoveCursor(MoveDirection::Top | MoveDirection::Bottom)
@@ -3242,6 +3462,9 @@ fn dispatch_command(
 	match cmd {
 		EditorCommand::GotoDefinition => {
 			needs_render |= request_goto_definition(runtime, session, reactor);
+		}
+		EditorCommand::JumpBack => {
+			needs_render |= jump_back(runtime, session);
 		}
 		EditorCommand::BeginPasswordPrompt { label } => {
 			session.input.begin_password_prompt(label);
@@ -5693,6 +5916,31 @@ pub fn main(editor) {
 			pane.cursor_abs_byte,
 			DocByte::new(source.rfind("target").expect("definition name") as u64)
 		);
+		engine
+			.commands
+			.send(EditorCommand::MoveCursor(MoveDirection::Top))
+			.expect("move before saved origin");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes[0].cursor_abs_byte == DocByte::ZERO
+		});
+		engine
+			.commands
+			.send(EditorCommand::InsertChar(' '))
+			.expect("edit before saved origin");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes[0].cursor_abs_byte == DocByte::new(1) && viewport.panes[0].is_dirty
+		});
+		engine
+			.commands
+			.send(EditorCommand::JumpBack)
+			.expect("jump back to invocation");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped back")
+		});
+		assert_eq!(
+			viewport.panes[0].cursor_abs_byte,
+			DocByte::new(cursor.get() + 1)
+		);
 
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();
@@ -5721,14 +5969,14 @@ pub fn main(editor) {
 				virtual_path: Some("main.rs".to_string()),
 			})
 			.expect("install live main source");
-		let mut cursor = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+		let initial = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
 			viewport
 				.panes
 				.first()
 				.is_some_and(|pane| !pane.tokens.is_empty())
-		})
-		.panes[0]
-			.cursor_abs_byte;
+		});
+		let source_buffer = initial.panes[0].buffer_id;
+		let mut cursor = initial.panes[0].cursor_abs_byte;
 		let target_call = DocByte::new(source.rfind("target").expect("target call") as u64);
 		while cursor < target_call {
 			engine
@@ -5772,6 +6020,15 @@ pub fn main(editor) {
 				.is_some_and(|name| name.ends_with("other.rs"))
 		);
 		assert_eq!(viewport.panes[0].cursor_abs_byte, DocByte::new(7));
+		engine
+			.commands
+			.send(EditorCommand::JumpBack)
+			.expect("jump back across retained source buffer");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped back")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
+		assert_eq!(viewport.panes[0].cursor_abs_byte, target_call);
 
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();
@@ -5818,6 +6075,14 @@ pub fn main(editor) {
 		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
 			viewport.status_message.as_deref()
 				== Some("Definition is in another file; write or discard source changes first")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
+		engine
+			.commands
+			.send(EditorCommand::JumpBack)
+			.expect("failed definition must not record history");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("No older jump")
 		});
 		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
 

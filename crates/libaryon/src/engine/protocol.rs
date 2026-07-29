@@ -202,6 +202,8 @@ pub enum EditorCommand {
 	ToggleCaseAtCursor,
 	/// Resolve and jump to the symbol definition under the primary cursor.
 	GotoDefinition,
+	/// Return to the newest retained code-navigation origin.
+	JumpBack,
 	OpenLineBelow,
 	OpenLineAbove,
 	AppendAtLineEnd,

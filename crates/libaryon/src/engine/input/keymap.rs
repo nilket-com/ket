@@ -613,6 +613,7 @@ pub(super) enum NormalAction {
 	ReadOnlyStatus,
 	ClearPending,
 	GotoDefinition,
+	JumpBack,
 	NextFunction,
 	AddCursor(VerticalDirection),
 }
@@ -788,6 +789,7 @@ pub(super) const fn binding_is_applicable(binding: &BindingSpec) -> bool {
 					| NormalAction::EnterSearchPrompt
 					| NormalAction::Esc
 					| NormalAction::ClearPending
+					| NormalAction::JumpBack
 					| NormalAction::AddCursor(_)
 			),
 			NormalContext::FileBrowser => matches!(
@@ -949,7 +951,7 @@ pub(super) static KEYMAP: &[KeyGroup] = &[
 	},
 	KeyGroup {
 		category: Category::Motion,
-		summary: "Go to top, bottom, or symbol definition",
+		summary: "Go to top, bottom, definition, or older jump",
 		bindings: &[
 			n!(
 				NormalContext::Ready,
@@ -970,6 +972,11 @@ pub(super) static KEYMAP: &[KeyGroup] = &[
 				NormalContext::Ready,
 				KeyPattern::Char('G'),
 				NormalAction::Motion(NormalMotion::Bottom)
+			),
+			n!(
+				NormalContext::Ready,
+				KeyPattern::Ctrl('o'),
+				NormalAction::JumpBack
 			),
 		],
 	},

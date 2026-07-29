@@ -30,9 +30,9 @@ This stage provides:
 - safe reuse of existing buffers and views.
 
 This stage does **not** provide a target picker, declarations, type
-definitions, references, hover, cross-language definitions, or jump-back
-history. A stamped `Ctrl-o` jumplist is stage 6.1 and requires a separate
-anchor-rebasing/reject-stale design. Bounds-clamping a stale byte is not an
+definitions, references, hover, or cross-language definitions. Stamped
+`Ctrl-o` jump-back is stage 6.1 and is specified separately in
+[`jump-history.md`](jump-history.md). Bounds-clamping a stale byte is not an
 acceptable substitute because it can land on unrelated text.
 
 ## Architectural boundary
@@ -271,9 +271,9 @@ the full request stamp in the engine, and applies the dirty-buffer and
 exact-view policies described above. The production two-file Rust fixture,
 workspace tests, and production Clippy gates pass.
 
-## Deferred stage 6.1
+## Stage 6.1
 
-`Ctrl-o` jump-back history will have its own plan. A future entry will at
-minimum need buffer/root/content identity and a meaning-preserving strategy for
-edits. Until that contract exists, phase 6 records no hidden one-off history
-and makes no stale-position clamping promise.
+`Ctrl-o` jump-back is approved for implementation under the buffer-owned
+tracked-anchor and bounded-retention contract in
+[`jump-history.md`](jump-history.md). Phase 6 itself remains unchanged: only
+successful definition application records an origin.

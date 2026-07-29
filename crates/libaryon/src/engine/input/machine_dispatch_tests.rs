@@ -457,6 +457,16 @@ fn gd_dispatches_go_to_definition_and_clears_the_prefix() {
 }
 
 #[test]
+fn ctrl_o_dispatches_jump_back() {
+	let (mut frontend, rx) = build_frontend();
+	with_viewport(&mut frontend);
+
+	press_with(&mut frontend, KeyCode::Char('o'), Modifiers::CONTROL);
+	assert!(matches!(rx.try_recv(), Ok(EditorCommand::JumpBack)));
+	assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn visual_mode_sweep_is_characterized() {
 	for (key, expected_kind) in [
 		(KeyCode::Char('v'), VisualKind::Char),
