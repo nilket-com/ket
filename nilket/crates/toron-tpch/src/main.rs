@@ -6024,10 +6024,7 @@ mod adr511_tests {
 	fn adr511_filtered_build_side_swap_knob_contract() {
 		// SAFETY: gate suites run single-threaded; no concurrent env readers.
 		unsafe { std::env::remove_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP") };
-		assert_eq!(
-			gauge_filtered_build_side_swap().unwrap(),
-			(false, "default")
-		);
+		assert_eq!(gauge_filtered_build_side_swap().unwrap(), (true, "default"));
 		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "1") };
 		assert_eq!(
 			gauge_filtered_build_side_swap().unwrap(),

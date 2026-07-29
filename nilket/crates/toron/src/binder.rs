@@ -181,7 +181,9 @@ pub struct PlannerConfig {
 	/// ADR 511: allow the smaller-build swap toward a right side narrowed by an
 	/// unestimated filter — its byte bound only overstates it, since filters are
 	/// volume-non-increasing, so the raw-bound comparison stays conservative.
-	/// Left-side staleness still declines. Default false until activation.
+	/// Left-side staleness still declines. Default-on since the ADR 511 receipt:
+	/// q17 pairs improved 21.5-23.5 s against a 3,554 ms floor, q20 was the only
+	/// other engaged cell, and both hold digests with the swap on.
 	pub filtered_build_side_swap: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
@@ -213,7 +215,7 @@ impl Default for PlannerConfig {
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,
-			filtered_build_side_swap: false,
+			filtered_build_side_swap: true,
 		}
 	}
 }

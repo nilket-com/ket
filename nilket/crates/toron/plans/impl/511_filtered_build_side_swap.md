@@ -189,3 +189,114 @@ scripts/cargo-cgroup check -p toron-tpch --features polars-sql-reference --all-t
 
 Repeat the applicable seal gate after any code change made in response. Finish all gates before
 starting measurement.
+
+## Measured outcome
+
+### Immutable seal and artifacts
+
+Steps 1-3 were sealed and pushed as `085704eb18c7`. All evidence below was produced by the release
+binary built from that clean, unamended identity after the repository gates completed with direct
+exit statuses (full `--no-fail-fast` suite exit 0, toron-tpch exit 0, lib 1,428 ok, full
+architecture_test 2,093 ok after two named reconciliations: the adr176 binder-root bound moved
+6,120 → 6,125 for the new placement knob, and the knob comment was worded to keep the adr132
+PlannerConfig ban intact).
+
+| evidence | artifact |
+|---|---|
+| q01-q22 route census, both arms | `target/tpch/adr511_route_census_{off,on}_085704eb/` |
+| m00-m10 ladder census, both arms | `target/tpch/adr511_ladder_census_{off,on}_085704eb/` |
+| diagnostic pair with node attribution | `target/tpch/adr511_q17_diag_{off,on}_085704eb/` |
+| plan-distinct gated 10-pair cohort | `target/tpch/adr511_q17_paired_085704eb/` |
+
+Every persisted row carries `dataset_verification = full_hash`, explicit 2 GiB task and spill
+budgets, release profile, `build_commit = 085704eb18c7`, and the arm's
+`filtered_build_side_swap` value with explicit provenance.
+
+### Census diff and reach
+
+The q-series census engaged exactly two cells; digests and row counts are identical between arms on
+all 22, and the m00-m10 ladder is invariant (0 of 11 fingerprints changed, all digests equal).
+
+| cell | change under the swap |
+|---|---|
+| q17 | fingerprint `0bb3976ddac68006` → `9062c1de21622849`; join0 admission `declined(estimate_exceeds_budget, estimate=5,758,680,840)` → `admitted(estimate=192,000,000)`; spill 622,544,968 → 0 B; single census run execute 32,685.374181 → 11,601.401144 ms |
+| q20 | fingerprint `e92495e248cd91be` → `33294d017f55ba80`; admission estimate 9,600,000 → 3,000 B; zero spill in both arms; execute 8,840 → 8,680 ms (single run, no movement claim) |
+
+Strict correctness passed in both arms for every changed cell and the named sentinel: q17 at its
+supported sf=0.02 oracle coordinate, q20 and q19 at sf=0.01, each with explicit budgets and direct
+exit 0. q19's fingerprint did not change.
+
+### Plan-distinct gate and cohort integrity
+
+The ADR 469 plan-distinct gate ran as gate-zero inside the paired rail over the full-hash dataset
+fingerprint `fnv1a64:60b35fe2a04ed8ec`; a failed gate aborts before any child. The journal holds
+one discarded warmup and exactly 20 measured rows in adjacent pairs: every row passing, full-hash,
+clean `085704eb18c7`, one shared digest across arms, per-arm fingerprints
+`0bb3976ddac68006` (control) / `9062c1de21622849` (candidate), control spill 622,544,968 B and
+candidate spill 0 B on every measured row.
+
+One rail-semantics refinement against the plan text: the plan-distinct rail defines `--runs` as
+child rows (only ADR 510's named gate doubles pairs into children), so the predeclared
+10-pairs/20-rows cohort is `--runs 20`. Ordering, floor, switch, and budgets are unchanged.
+
+### Locked paired cohort
+
+| pair | candidate | control | control - candidate |
+|---:|---:|---:|---:|
+| 1 | 11,671.757 ms | 33,827.374 ms | 22,155.617 ms |
+| 2 | 11,652.836 ms | 33,168.384 ms | 21,515.548 ms |
+| 3 | 11,758.104 ms | 35,225.845 ms | 23,467.741 ms |
+| 4 | 11,739.515 ms | 33,641.615 ms | 21,902.099 ms |
+| 5 | 11,760.838 ms | 33,540.457 ms | 21,779.619 ms |
+| 6 | 12,131.883 ms | 35,050.119 ms | 22,918.236 ms |
+| 7 | 11,987.491 ms | 33,674.875 ms | 21,687.384 ms |
+| 8 | 11,929.875 ms | 33,614.471 ms | 21,684.597 ms |
+| 9 | 11,875.914 ms | 34,626.437 ms | 22,750.522 ms |
+| 10 | 11,946.621 ms | 33,918.449 ms | 21,971.828 ms |
+
+The predeclared paired result, computed from the persisted journal rows:
+
+```text
+Hodges-Lehmann point        = 22,133.035 ms
+two-sided 95% interval      = [21,732.108, 22,684.920] ms
+fixed materiality floor     = 3,554 ms
+interval excludes zero      = true
+point reaches floor         = true (6.2x; the interval lower bound alone is 6.1x)
+activate                    = true
+```
+
+The generic unpaired summary pools both mechanisms, flags the 1.041 pooled spread as `unstable`,
+and refuses to write a normal performance baseline — correct behavior, and no replacement for the
+configuration-locked paired analysis, exactly as in ADR 510.
+
+### Diagnostic transfer
+
+Explanatory only; these timings are not in the primary estimator. Node attribution reconciles in
+both arms with zero bridge, stage, or interleaved-frame mismatches and zero unattributed spill.
+
+| fact | control | candidate |
+|---|---:|---:|
+| execute | 33,454.4 ms | 11,641.6 ms |
+| aggregate node exclusive | 33,422.8 ms | 9,533.9 ms |
+| join node exclusive | 0.0 ms | 1,161.6 ms |
+| scan node exclusive | 0.0 ms | 917.6 ms |
+| `correlated_scalar_left_outer_global` invocation | 23,274.0 ms, 622,544,968 B | not routed |
+| inner `scan_grouped` invocation | 10,148.9 ms | 9,533.8 ms |
+
+The swapped plan no longer matches the monolithic correlated-scalar handler shape: the comma join
+runs as an ordinary in-memory hash join (admitted at 192,000,000 B against the 2 GiB budget) and
+the terminal global fold routes through the generic path at negligible cost. The 23.3-second
+spill-replay invocation collapses to about 2.1 seconds of join and scan work, which matches the
+paired estimate. The surviving cost is the inner per-partkey aggregate over full lineitem
+(9.5 s, now roughly 82% of the cell) — precisely the Remedy B target named in the ADR's forward
+arc.
+
+### Activation
+
+The verdict is `activate` under ADR 472's rule verbatim: the interval excludes zero far above the
+fixed floor, and neither engaged cell prices a regression (q17 improves 2.8x; q20 is flat with an
+identical digest). This receipt flips `PlannerConfig::filtered_build_side_swap` to compiled default
+**true**, retargets the gauge knob-contract test's default arm, and re-runs the full seal gate plus
+default-arm strict correctness smokes for q17, q19, and q20 from the flipped tree. The
+implementation seal `085704eb18c7` remains the measurement identity; this receipt commit is
+independently revertible.
