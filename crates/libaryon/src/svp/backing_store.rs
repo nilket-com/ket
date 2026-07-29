@@ -11,6 +11,33 @@ pub struct BackingIdentity {
 	pub file_id: Option<u128>,
 }
 
+impl BackingIdentity {
+	pub(crate) fn for_path(path: &std::path::Path) -> io::Result<Self> {
+		let metadata = std::fs::metadata(path)?;
+		Ok(Self::from_metadata(&metadata))
+	}
+
+	fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+		let modified_nanos = metadata
+			.modified()
+			.ok()
+			.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+			.map_or(0, |duration| duration.as_nanos());
+		#[cfg(unix)]
+		let file_id = {
+			use std::os::unix::fs::MetadataExt;
+			Some((u128::from(metadata.dev()) << 64) | u128::from(metadata.ino()))
+		};
+		#[cfg(not(unix))]
+		let file_id = None;
+		Self {
+			length: metadata.len(),
+			modified_nanos,
+			file_id,
+		}
+	}
+}
+
 pub trait BackingStore: Send + Sync {
 	fn len(&self) -> u64;
 	fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<()>;
@@ -29,26 +56,10 @@ pub struct FileBackingStore {
 impl FileBackingStore {
 	pub fn open(path: &std::path::Path) -> io::Result<Self> {
 		let file = File::open(path)?;
-		let metadata = file.metadata()?;
-		let modified_nanos = metadata
-			.modified()
-			.ok()
-			.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-			.map_or(0, |duration| duration.as_nanos());
-		#[cfg(unix)]
-		let file_id = {
-			use std::os::unix::fs::MetadataExt;
-			Some((u128::from(metadata.dev()) << 64) | u128::from(metadata.ino()))
-		};
-		#[cfg(not(unix))]
-		let file_id = None;
+		let identity = BackingIdentity::from_metadata(&file.metadata()?);
 		Ok(Self {
 			file: Mutex::new(file),
-			identity: BackingIdentity {
-				length: metadata.len(),
-				modified_nanos,
-				file_id,
-			},
+			identity,
 		})
 	}
 }

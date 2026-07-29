@@ -11,8 +11,8 @@ use super::super::folding::FoldSet;
 use super::super::protocol::{CommandRange, EditorCommand, EditorMode, VisualKind, WordMotion};
 use super::super::session::TextEditorMut;
 use super::super::session::{
-	Affinity, Caret, ClipboardSession, CursorSet, CursorSnapshot, RegisterKind, RegisterValue,
-	TextAnchor, UiState,
+	Affinity, Caret, ClipboardSession, CursorSet, CursorSnapshot, ParkedGenerationRoot,
+	RegisterKind, RegisterValue, RootTransition, TextAnchor, UiState,
 };
 use super::super::shadow::sync_shadow_to_generation;
 use super::super::support::{
@@ -25,6 +25,7 @@ use super::system::load_root_from_path;
 use super::{CommandEffect, RuntimeContext};
 use crate::core::{DocByte, DocDisplayCol, DocLine, DocLineCount, NodeByteOffset, StateId};
 use crate::ecs::{NodeId, UastRegistry};
+use crate::svp::BackingIdentity;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::UastProjection;
@@ -1992,13 +1993,45 @@ fn apply_history_replay(
 			}
 		}
 		HistoryReplay::SwapGeneration { target, cursors } => {
+			let outgoing_target = tab
+				.document
+				.shadow
+				.as_ref()
+				.and_then(|shadow| shadow.current_generation())
+				.cloned()
+				.ok_or_else(|| "Active shadow generation is unavailable".to_string())?;
+			let outgoing_file_identity =
+				BackingIdentity::for_path(std::path::Path::new(&outgoing_target.path))
+					.map_err(|error| format!("Shadow generation changed: {error}"))?;
 			let allocated_before = ctx.registry.allocated_node_count();
-			let (rid, _cursor_leaf, new_backing_device_id) =
-				load_root_from_path(ctx, &target.path, next_dynamic_device_id)
-					.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
-			if let Some(shadow) = tab.document.shadow.as_mut()
-				&& let Err(msg) = sync_shadow_to_generation(shadow, &target)
-			{
+			let mut revived = tab.document.parked_generations.take(&target);
+			if revived.as_ref().is_some_and(|entry| {
+				entry.target.byte_len != target.byte_len
+					|| ctx.registry.get_total_bytes(entry.root) != target.byte_len
+					|| match BackingIdentity::for_path(std::path::Path::new(&target.path)) {
+						Ok(identity) => identity != entry.file_identity,
+						Err(_) => true,
+					}
+			}) {
+				let invalid = revived.take().expect("invalid cache hit");
+				super::retire_parked_generations_in_mutation(
+					ctx,
+					&mut tab.document.pending_parked_retirements,
+					vec![invalid],
+				);
+			}
+
+			let mut fresh = None;
+			let (rid, new_backing_device_id, revived_live) = if let Some(entry) = revived.as_ref() {
+				(entry.root, entry.device_id, Some(entry.live_nodes))
+			} else {
+				let (root, _cursor_leaf, device_id) =
+					load_root_from_path(ctx, &target.path, next_dynamic_device_id)
+						.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
+				fresh = Some((root, device_id));
+				(root, device_id, None)
+			};
+			if revived_live.is_none() && ctx.registry.get_total_bytes(rid) != target.byte_len {
 				ctx.registry.cancel_metric_scan(rid);
 				if let Some(device_id) = new_backing_device_id {
 					ctx.resolver.unregister_device(device_id);
@@ -2008,18 +2041,53 @@ fn apply_history_replay(
 					.allocated_node_count()
 					.saturating_sub(allocated_before);
 				ctx.registry.note_nodes_retired(candidate_nodes);
+				return Err("Shadow generation length no longer matches its manifest".to_string());
+			}
+
+			let sync_result = tab
+				.document
+				.shadow
+				.as_mut()
+				.ok_or_else(|| "Active shadow session is unavailable".to_string())
+				.and_then(|shadow| sync_shadow_to_generation(shadow, &target));
+			if let Err(msg) = sync_result {
+				if let Some(entry) = revived {
+					tab.document.parked_generations.restore(entry);
+				}
+				if let Some((candidate_root, candidate_device_id)) = fresh {
+					ctx.registry.cancel_metric_scan(candidate_root);
+					if let Some(device_id) = candidate_device_id {
+						ctx.resolver.unregister_device(device_id);
+					}
+					let candidate_nodes = ctx
+						.registry
+						.allocated_node_count()
+						.saturating_sub(allocated_before);
+					ctx.registry.note_nodes_retired(candidate_nodes);
+				}
 				return Err(msg);
 			}
+
+			let outgoing = ParkedGenerationRoot {
+				target: outgoing_target,
+				root: tab.document.root_id,
+				device_id: tab.document.backing_device_id,
+				live_nodes: tab.document.uast_accounting.current_live_nodes,
+				file_identity: outgoing_file_identity,
+			};
+			if let Some(evicted) = tab.document.parked_generations.insert(outgoing) {
+				super::retire_parked_generations_in_mutation(
+					ctx,
+					&mut tab.document.pending_parked_retirements,
+					vec![evicted],
+				);
+			}
+			tab.document.pending_root_transition = Some(RootTransition::Park { revived_live });
 			tab.document.ledger.commit(direction);
-			ctx.registry.cancel_metric_scan(tab.document.root_id);
 			tab.document.root_id = rid;
 			tab.view.folds.clear();
 			tab.document.backing_path = Some(target.path.clone());
-			let retired_device_id =
-				std::mem::replace(&mut tab.document.backing_device_id, new_backing_device_id);
-			if let Some(device_id) = retired_device_id {
-				ctx.resolver.unregister_device(device_id);
-			}
+			tab.document.backing_device_id = new_backing_device_id;
 			tab.reset_pipeline();
 			tab.document.search_matches.clear();
 			*tab.match_index = None;
@@ -2078,6 +2146,7 @@ mod tests {
 		ClipboardSession, RegisterKind, RegisterValue, SettingsPersistent, TestTextEditor, UiState,
 	};
 	use crate::engine::settings::SaveDurability;
+	use crate::engine::shadow::ShadowSession;
 	use crate::engine::support::resolve_loaded_node_text;
 	use crate::engine::test_support::temp_test_path;
 	use crate::engine::test_support::{build_document, build_grafted_rust_document};
@@ -2429,8 +2498,122 @@ mod tests {
 		assert!(
 			ui.status_message
 				.as_deref()
-				.is_some_and(|message| { message.contains("Failed to reload shadow generation") })
+				.is_some_and(|message| message.contains("shadow generation"))
 		);
+	}
+
+	#[test]
+	fn failed_generation_sync_restores_a_temporarily_removed_cache_hit() {
+		let registry = Arc::new(UastRegistry::new(32));
+		let (resolver, languages) = test_runtime(&registry);
+		let ctx = RuntimeContext {
+			registry: &registry,
+			resolver: &resolver,
+			lang_registry: &languages,
+			init_script: None,
+			init_entrypoint: None,
+		};
+		let before_path = temp_test_path("cached-generation-before");
+		let after_path = temp_test_path("cached-generation-after");
+		std::fs::write(&before_path, b"before").expect("write before generation");
+		std::fs::write(&after_path, b"after!").expect("write after generation");
+		let before = GenerationTarget {
+			generation_id: 1,
+			path: before_path.to_string_lossy().into_owned(),
+			byte_len: 6,
+		};
+		let after = GenerationTarget {
+			generation_id: 2,
+			path: after_path.to_string_lossy().into_owned(),
+			byte_len: 6,
+		};
+		let mut next_dynamic_device_id = crate::engine::core::FILE_DEVICE_ID + 1;
+		let (before_root, _, before_device) =
+			load_root_from_path(&ctx, &before.path, &mut next_dynamic_device_id)
+				.expect("load cached before generation");
+		let (after_root, after_leaf, after_device) =
+			load_root_from_path(&ctx, &after.path, &mut next_dynamic_device_id)
+				.expect("load active after generation");
+
+		let invalid_dir = temp_test_path("cached-generation-invalid-shadow-dir");
+		std::fs::write(&invalid_dir, b"not a directory").expect("create invalid shadow dir");
+		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 80, 24);
+		let mut tab = fixture.editor_mut();
+		tab.document.root_id = after_root;
+		tab.document.backing_path = Some(after.path.clone());
+		tab.document.backing_device_id = after_device;
+		tab.document.shadow = Some(ShadowSession {
+			dir: invalid_dir.to_string_lossy().into_owned(),
+			original_path: after.path.clone(),
+			generations: vec![before.clone(), after.clone()],
+			current_index: 1,
+			next_generation_id: 3,
+		});
+		assert!(
+			tab.document
+				.parked_generations
+				.insert(ParkedGenerationRoot {
+					target: before.clone(),
+					root: before_root,
+					device_id: before_device,
+					live_nodes: 2,
+					file_identity: BackingIdentity::for_path(&before_path)
+						.expect("before identity"),
+				})
+				.is_none()
+		);
+		let snapshot = tab.cursor.snapshot();
+		tab.document.ledger.push_swap_generation(SwapGeneration {
+			before,
+			after,
+			cursors_before: snapshot.clone(),
+			cursors_after: snapshot,
+			state_before: StateId::ZERO,
+			state_after: StateId::ZERO,
+		});
+		tab.cursor.primary_mut().reset_to_start(
+			after_leaf,
+			tab.document.topology_rev,
+			tab.document.ledger.current_state_id,
+		);
+		let state_before = tab.document.ledger.current_state_id;
+		let allocated_before = registry.stats().allocated_nodes;
+		let devices_before = resolver.registered_device_counts();
+		let mut ui = test_ui();
+
+		handle_history_doctab_command(
+			&ctx,
+			&mut tab,
+			&mut ui,
+			&mut next_dynamic_device_id,
+			EditorCommand::Undo,
+		);
+
+		assert_eq!(tab.document.root_id, after_root);
+		assert_eq!(tab.document.backing_device_id, after_device);
+		assert_eq!(tab.document.ledger.current_state_id, state_before);
+		assert_eq!(tab.document.parked_generations.entries().len(), 1);
+		assert_eq!(
+			tab.document.parked_generations.entries()[0].root,
+			before_root
+		);
+		assert_eq!(registry.stats().allocated_nodes, allocated_before);
+		assert_eq!(resolver.registered_device_counts(), devices_before);
+		assert!(
+			ui.status_message
+				.as_deref()
+				.is_some_and(|message| { message.contains("Failed to create shadow dir") })
+		);
+
+		if let Some(device_id) = before_device {
+			resolver.unregister_device(device_id);
+		}
+		if let Some(device_id) = after_device {
+			resolver.unregister_device(device_id);
+		}
+		let _ = std::fs::remove_file(before_path);
+		let _ = std::fs::remove_file(after_path);
+		let _ = std::fs::remove_file(invalid_dir);
 	}
 
 	#[test]

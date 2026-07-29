@@ -8,11 +8,11 @@ use super::super::folding::{
 };
 use super::super::protocol::{EditorCommand, VisualKind};
 use super::super::session::{
-	Affinity, BufferStore, Caret, FileStamp, LayoutNode, SettingsPersistent, TextEditorMut,
-	UiState, View, resolve_file_browser_theme_name, resolve_theme_name,
+	Affinity, BufferStore, Caret, FileStamp, LayoutNode, ParkedGenerationCache, SettingsPersistent,
+	TextEditorMut, UiState, View, resolve_file_browser_theme_name, resolve_theme_name,
 };
 use super::super::settings::SaveDurability;
-use super::super::shadow::{ShadowSession, discard_shadow_session, load_shadow_session};
+use super::super::shadow::{ShadowSession, load_shadow_session};
 use super::super::undo::UndoLedger;
 use super::{CommandEffect, RuntimeContext, SemanticRuntime};
 use crate::core::atomic_file::{AtomicWriteOptions, atomic_write};
@@ -1066,6 +1066,8 @@ fn reload_loaded_document(
 	file_stamp: &mut Option<FileStamp>,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
 	shadow: &mut Option<ShadowSession>,
+	parked_generations: &mut ParkedGenerationCache,
+	pending_parked_retirements: &mut u64,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
 	caret: &mut Caret,
@@ -1092,9 +1094,7 @@ fn reload_loaded_document(
 	let prior_scroll_row_offset = *scroll_row_offset;
 	let language_id = detect_language(ctx.lang_registry, &path);
 
-	if let Some(existing_shadow) = shadow.take() {
-		let _ = discard_shadow_session(&existing_shadow);
-	}
+	super::discard_attached_shadow(ctx, shadow, parked_generations, pending_parked_retirements);
 
 	initialize_loaded_document(
 		ctx,
@@ -1555,6 +1555,8 @@ pub(super) fn handle_file_doctab_command(
 				&mut tab.document.file_stamp,
 				&mut tab.document.active_language_id,
 				&mut tab.document.shadow,
+				&mut tab.document.parked_generations,
+				&mut tab.document.pending_parked_retirements,
 				&mut tab.document.ledger,
 				folds,
 				tab.cursor.primary_mut(),
@@ -1669,6 +1671,8 @@ pub(super) fn handle_auto_reload_doctab_command(
 				&mut tab.document.file_stamp,
 				&mut tab.document.active_language_id,
 				&mut tab.document.shadow,
+				&mut tab.document.parked_generations,
+				&mut tab.document.pending_parked_retirements,
 				&mut tab.document.ledger,
 				folds,
 				tab.cursor.primary_mut(),
@@ -1805,6 +1809,8 @@ pub(super) fn handle_file_command(
 	file_stamp: &mut Option<FileStamp>,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
 	shadow: &mut Option<ShadowSession>,
+	parked_generations: &mut ParkedGenerationCache,
+	pending_parked_retirements: &mut u64,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
 	caret: &mut Caret,
@@ -1820,9 +1826,12 @@ pub(super) fn handle_file_command(
 ) -> CommandEffect {
 	match command {
 		EditorCommand::LoadFile(path) => {
-			if let Some(existing_shadow) = shadow.take() {
-				let _ = discard_shadow_session(&existing_shadow);
-			}
+			super::discard_attached_shadow(
+				ctx,
+				shadow,
+				parked_generations,
+				pending_parked_retirements,
+			);
 			let language_id = detect_language(ctx.lang_registry, &path);
 			match load_shadow_session(Path::new(&path)) {
 				Ok(Some(recovered_shadow)) => {
@@ -1955,6 +1964,8 @@ pub(super) fn handle_file_command(
 					file_stamp,
 					active_language_id,
 					shadow,
+					parked_generations,
+					pending_parked_retirements,
 					ledger,
 					folds,
 					caret,
@@ -1991,9 +2002,12 @@ pub(super) fn handle_file_command(
 								*backing_path = Some(path.to_string());
 							}
 							*file_stamp = file_stamp_for_path(path);
-							if let Some(existing_shadow) = shadow.take() {
-								let _ = discard_shadow_session(&existing_shadow);
-							}
+							super::discard_attached_shadow(
+								ctx,
+								shadow,
+								parked_generations,
+								pending_parked_retirements,
+							);
 							*status_message = completion
 								.warning
 								.or_else(|| Some(save_status_message(path, completion.outcome)));
@@ -2034,9 +2048,12 @@ pub(super) fn handle_file_command(
 						// The document now has a real file identity; only a
 						// successful write may retire the virtual one.
 						*virtual_path = None;
-						if let Some(existing_shadow) = shadow.take() {
-							let _ = discard_shadow_session(&existing_shadow);
-						}
+						super::discard_attached_shadow(
+							ctx,
+							shadow,
+							parked_generations,
+							pending_parked_retirements,
+						);
 					}
 					Err(msg) => *status_message = Some(msg),
 				}
@@ -2062,9 +2079,12 @@ pub(super) fn handle_file_command(
 								*backing_path = Some(path.to_string());
 							}
 							*file_stamp = file_stamp_for_path(path);
-							if let Some(existing_shadow) = shadow.take() {
-								let _ = discard_shadow_session(&existing_shadow);
-							}
+							super::discard_attached_shadow(
+								ctx,
+								shadow,
+								parked_generations,
+								pending_parked_retirements,
+							);
 							*status_message = completion
 								.warning
 								.or_else(|| Some(save_status_message(path, completion.outcome)));
@@ -2109,9 +2129,12 @@ pub(super) fn handle_file_command(
 			};
 			match create_document_from_bytes(ctx.registry, text.into_bytes()) {
 				Ok((rid, leaf)) => {
-					if let Some(existing_shadow) = shadow.take() {
-						let _ = discard_shadow_session(&existing_shadow);
-					}
+					super::discard_attached_shadow(
+						ctx,
+						shadow,
+						parked_generations,
+						pending_parked_retirements,
+					);
 					initialize_loaded_document(
 						ctx,
 						root_id,

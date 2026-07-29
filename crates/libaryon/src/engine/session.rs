@@ -16,7 +16,7 @@ use super::protocol::{
 };
 use super::runtime_registry::{RegistrationBatch, RegistryError, RuntimeRegistries};
 use super::shadow::ShadowSession;
-use super::undo::UndoLedger;
+use super::undo::{GenerationTarget, UndoLedger};
 use crate::core::{
 	BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DisplayRow, DocByte, DocDisplayCol,
 	DocLine, JobId, PaneCol, PaneId, PaneRect, PaneRow, RegistryOwnerId, RegistryRev, RequestId,
@@ -29,10 +29,11 @@ use crate::engine::host_event::{HostPanelDescriptor, HostPanelId, PanelRevision}
 use crate::engine::language::FILE_BROWSER_THEME_ID;
 use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
+use crate::svp::BackingIdentity;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::UastProjection;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -182,6 +183,7 @@ pub(crate) struct UastOwnerAccounting {
 	pub(crate) allocated_nodes: u64,
 	pub(crate) retired_nodes: u64,
 	pub(crate) current_live_nodes: u64,
+	pub(crate) parked_nodes: u64,
 	pub(crate) root_generations: u32,
 }
 
@@ -191,39 +193,213 @@ impl UastOwnerAccounting {
 			allocated_nodes: initial_nodes,
 			retired_nodes: 0,
 			current_live_nodes: initial_nodes,
+			parked_nodes: 0,
 			root_generations: 1,
 		}
 	}
 
-	fn record_transaction(&mut self, allocated: u64, retired: u64) {
-		let available = self.current_live_nodes.saturating_add(allocated);
-		debug_assert!(
-			retired <= available,
-			"UAST owner retirement exceeds its live and newly allocated nodes"
-		);
-		let retired = retired.min(available);
-		self.allocated_nodes = self.allocated_nodes.saturating_add(allocated);
-		self.retired_nodes = self.retired_nodes.saturating_add(retired);
-		self.current_live_nodes = available - retired;
-		debug_assert_eq!(
-			self.allocated_nodes.saturating_sub(self.retired_nodes),
+	fn assert_invariant(&self) {
+		assert_eq!(
+			self.allocated_nodes
+				.checked_sub(self.retired_nodes)
+				.expect("UAST owner retirement exceeds allocation"),
 			self.current_live_nodes
+				.checked_add(self.parked_nodes)
+				.expect("UAST owner live + parked overflow"),
+			"UAST owner allocation algebra diverged"
 		);
 	}
 
-	fn record_root_replacement(&mut self, allocated: u64, closure_retired: u64) {
-		debug_assert_eq!(
-			closure_retired, 0,
-			"root replacement mixed old-tree disconnects with whole-root retirement"
+	fn record_transaction(&mut self, allocated: u64, retired: u64) {
+		let available = self
+			.current_live_nodes
+			.checked_add(allocated)
+			.expect("UAST owner live allocation overflow");
+		assert!(
+			retired <= available,
+			"UAST owner retirement exceeds its live and newly allocated nodes"
 		);
-		self.record_transaction(allocated, self.current_live_nodes);
-		self.root_generations = self.root_generations.saturating_add(1);
+		self.allocated_nodes = self
+			.allocated_nodes
+			.checked_add(allocated)
+			.expect("UAST owner allocated counter overflow");
+		self.retired_nodes = self
+			.retired_nodes
+			.checked_add(retired)
+			.expect("UAST owner retired counter overflow");
+		self.current_live_nodes = available - retired;
+		self.assert_invariant();
+	}
+
+	fn record_parked_retirement(&mut self, retired: u64) {
+		assert!(
+			retired <= self.parked_nodes,
+			"UAST parked retirement exceeds parked nodes"
+		);
+		self.parked_nodes -= retired;
+		self.retired_nodes = self
+			.retired_nodes
+			.checked_add(retired)
+			.expect("UAST owner retired counter overflow");
+		self.assert_invariant();
+	}
+
+	fn record_root_transition(
+		&mut self,
+		allocated: u64,
+		ordinary_retired: u64,
+		transition: RootTransition,
+	) {
+		assert_eq!(
+			ordinary_retired, 0,
+			"root replacement mixed ordinary retirement with a typed transition"
+		);
+		self.allocated_nodes = self
+			.allocated_nodes
+			.checked_add(allocated)
+			.expect("UAST owner allocated counter overflow");
+		let old_live = self.current_live_nodes;
+		match transition {
+			RootTransition::Retire => {
+				self.retired_nodes = self
+					.retired_nodes
+					.checked_add(old_live)
+					.expect("UAST owner retired counter overflow");
+				self.current_live_nodes = allocated;
+			}
+			RootTransition::Park { revived_live: None } => {
+				self.parked_nodes = self
+					.parked_nodes
+					.checked_add(old_live)
+					.expect("UAST owner parked counter overflow");
+				self.current_live_nodes = allocated;
+			}
+			RootTransition::Park {
+				revived_live: Some(revived),
+			} => {
+				assert_eq!(
+					allocated, 0,
+					"reviving a parked generation unexpectedly allocated nodes"
+				);
+				assert!(
+					revived <= self.parked_nodes,
+					"revived generation exceeds parked nodes"
+				);
+				self.parked_nodes = self
+					.parked_nodes
+					.checked_add(old_live)
+					.and_then(|parked| parked.checked_sub(revived))
+					.expect("UAST parked transition overflow/underflow");
+				self.current_live_nodes = revived;
+			}
+		}
+		self.root_generations = self
+			.root_generations
+			.checked_add(1)
+			.expect("UAST owner root generation overflow");
+		self.assert_invariant();
+	}
+}
+
+pub(crate) const GENERATION_PARK_CAP: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootTransition {
+	Retire,
+	Park { revived_live: Option<u64> },
+}
+
+#[derive(Debug)]
+pub(crate) struct ParkedGenerationRoot {
+	pub(crate) target: GenerationTarget,
+	pub(crate) root: NodeId,
+	pub(crate) device_id: Option<u16>,
+	pub(crate) live_nodes: u64,
+	pub(crate) file_identity: BackingIdentity,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ParkedGenerationCache {
+	entries: VecDeque<ParkedGenerationRoot>,
+}
+
+impl ParkedGenerationCache {
+	pub(crate) fn take(&mut self, target: &GenerationTarget) -> Option<ParkedGenerationRoot> {
+		let index = self.entries.iter().position(|entry| {
+			entry.target.generation_id == target.generation_id && entry.target.path == target.path
+		})?;
+		self.entries.remove(index)
+	}
+
+	pub(crate) fn restore(&mut self, entry: ParkedGenerationRoot) {
+		assert!(
+			self.entries.len() < GENERATION_PARK_CAP,
+			"restoring a removed parked generation must preserve cache capacity"
+		);
+		self.entries.push_back(entry);
+	}
+
+	pub(crate) fn insert(&mut self, entry: ParkedGenerationRoot) -> Option<ParkedGenerationRoot> {
+		assert!(
+			self.entries.iter().all(|cached| {
+				cached.target.generation_id != entry.target.generation_id
+					|| cached.target.path != entry.target.path
+			}),
+			"active generation must not already be parked"
+		);
+		self.entries.push_back(entry);
+		(self.entries.len() > GENERATION_PARK_CAP)
+			.then(|| self.entries.pop_front().expect("overflow has an LRU entry"))
+	}
+
+	pub(crate) fn remove_targets(
+		&mut self,
+		targets: &[GenerationTarget],
+	) -> Vec<ParkedGenerationRoot> {
+		let mut removed = Vec::new();
+		self.entries.retain(|entry| {
+			let matches = targets.iter().any(|target| {
+				target.generation_id == entry.target.generation_id
+					&& target.path == entry.target.path
+			});
+			if matches {
+				removed.push(ParkedGenerationRoot {
+					target: entry.target.clone(),
+					root: entry.root,
+					device_id: entry.device_id,
+					live_nodes: entry.live_nodes,
+					file_identity: entry.file_identity,
+				});
+			}
+			!matches
+		});
+		removed
+	}
+
+	pub(crate) fn drain(&mut self) -> Vec<ParkedGenerationRoot> {
+		self.entries.drain(..).collect()
+	}
+
+	pub(crate) fn live_nodes(&self) -> u64 {
+		self.entries.iter().fold(0u64, |total, entry| {
+			total
+				.checked_add(entry.live_nodes)
+				.expect("parked generation live-node sum overflow")
+		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn entries(&self) -> &VecDeque<ParkedGenerationRoot> {
+		&self.entries
 	}
 }
 
 pub(crate) struct TextBuffer {
 	pub(crate) root_id: NodeId,
 	pub(crate) uast_accounting: UastOwnerAccounting,
+	pub(crate) parked_generations: ParkedGenerationCache,
+	pub(crate) pending_root_transition: Option<RootTransition>,
+	pub(crate) pending_parked_retirements: u64,
 	pub(crate) topology_rev: TopologyRev,
 	pub(crate) file_path: Option<String>,
 	/// Encrypted-at-rest backing owned by libaryon. This is intentionally
@@ -280,6 +456,9 @@ impl TextBuffer {
 			Self {
 				root_id: root,
 				uast_accounting: UastOwnerAccounting::new(2),
+				parked_generations: ParkedGenerationCache::default(),
+				pending_root_transition: None,
+				pending_parked_retirements: 0,
 				topology_rev: TopologyRev::ZERO,
 				file_path: None,
 				encrypted_backing: None,
@@ -351,6 +530,10 @@ pub(crate) struct HostPanelBuffer {
 	pub(crate) revision: PanelRevision,
 }
 
+#[allow(
+	clippy::large_enum_variant,
+	reason = "text buffers own the hot document state; boxing only this variant would add indirection to every edit for a cold-path generation cache"
+)]
 pub(crate) enum BufferContent {
 	Text(TextBuffer),
 	FileBrowser(FileBrowserBuffer),
@@ -2069,6 +2252,9 @@ impl TestTextEditor {
 				content: BufferContent::Text(TextBuffer {
 					root_id: root,
 					uast_accounting: UastOwnerAccounting::new(2),
+					parked_generations: ParkedGenerationCache::default(),
+					pending_root_transition: None,
+					pending_parked_retirements: 0,
 					topology_rev: TopologyRev::ZERO,
 					file_path: None,
 					encrypted_backing: None,
@@ -3493,15 +3679,36 @@ impl EditorSession {
 		let closure_retired_after = registry.retired_node_count();
 		let allocated_delta = allocated_after.saturating_sub(allocated_before);
 		let closure_retired_delta = closure_retired_after.saturating_sub(retired_before);
+		let parked_retired_delta = std::mem::take(&mut document.pending_parked_retirements);
+		assert!(
+			parked_retired_delta <= closure_retired_delta,
+			"typed parked retirement exceeds registry retirement traffic"
+		);
+		let ordinary_retired_delta = closure_retired_delta - parked_retired_delta;
+		document
+			.uast_accounting
+			.record_parked_retirement(parked_retired_delta);
 		if root_before != root_after {
-			registry.note_nodes_retired(accounting_before.current_live_nodes);
-			document
-				.uast_accounting
-				.record_root_replacement(allocated_delta, closure_retired_delta);
+			let transition = document
+				.pending_root_transition
+				.take()
+				.unwrap_or(RootTransition::Retire);
+			if transition == RootTransition::Retire {
+				registry.note_nodes_retired(accounting_before.current_live_nodes);
+			}
+			document.uast_accounting.record_root_transition(
+				allocated_delta,
+				ordinary_retired_delta,
+				transition,
+			);
 		} else {
+			assert!(
+				document.pending_root_transition.take().is_none(),
+				"root transition recorded without replacing the root"
+			);
 			document
 				.uast_accounting
-				.record_transaction(allocated_delta, closure_retired_delta);
+				.record_transaction(allocated_delta, ordinary_retired_delta);
 		}
 		let state_after = document.ledger.current_state_id;
 		let topology_after = document.topology_rev;
@@ -4394,7 +4601,8 @@ impl EditorSession {
 mod tests {
 	use super::{
 		AddCaretResult, Affinity, BufferContent, CanonicalPath, CursorMode, CursorSet, CursorState,
-		DiffPair, EditorPane, EditorSession, LayoutLeaf, LayoutNode, MAX_CURSORS,
+		DiffPair, EditorPane, EditorSession, GENERATION_PARK_CAP, LayoutLeaf, LayoutNode,
+		MAX_CURSORS, ParkedGenerationCache, ParkedGenerationRoot, RootTransition,
 		SettingsPersistent, SnapshotProvenance, TextAnchor, TextBuffer, UastOwnerAccounting, View,
 		caret_from_doc_byte, resolve_theme_name, split_child_rects, with_file_browser_buffer_mut,
 		with_text_buffer_mut,
@@ -4480,15 +4688,39 @@ mod tests {
 				allocated_nodes: 5,
 				retired_nodes: 1,
 				current_live_nodes: 4,
+				parked_nodes: 0,
 				root_generations: 1,
 			}
 		);
 
-		accounting.record_root_replacement(6, 0);
+		accounting.record_root_transition(6, 0, RootTransition::Retire);
 		assert_eq!(accounting.allocated_nodes, 11);
 		assert_eq!(accounting.retired_nodes, 5);
 		assert_eq!(accounting.current_live_nodes, 6);
+		assert_eq!(accounting.parked_nodes, 0);
 		assert_eq!(accounting.root_generations, 2);
+
+		accounting.record_root_transition(3, 0, RootTransition::Park { revived_live: None });
+		assert_eq!(accounting.allocated_nodes, 14);
+		assert_eq!(accounting.current_live_nodes, 3);
+		assert_eq!(accounting.parked_nodes, 6);
+
+		accounting.record_root_transition(
+			0,
+			0,
+			RootTransition::Park {
+				revived_live: Some(6),
+			},
+		);
+		assert_eq!(accounting.current_live_nodes, 6);
+		assert_eq!(accounting.parked_nodes, 3);
+		assert_eq!(accounting.root_generations, 4);
+
+		accounting.record_parked_retirement(3);
+		assert_eq!(accounting.retired_nodes, 8);
+		assert_eq!(accounting.current_live_nodes, 6);
+		assert_eq!(accounting.parked_nodes, 0);
+		accounting.assert_invariant();
 	}
 
 	#[test]
@@ -4499,6 +4731,7 @@ mod tests {
 			allocated_nodes: _,
 			retired_nodes: _,
 			current_live_nodes: _,
+			parked_nodes: _,
 			root_generations: _,
 		} = UastOwnerAccounting::new(2);
 	}
@@ -4508,6 +4741,52 @@ mod tests {
 	fn uast_owner_accounting_rejects_retirement_underflow() {
 		let mut accounting = UastOwnerAccounting::new(2);
 		accounting.record_transaction(0, 3);
+	}
+
+	#[test]
+	#[should_panic(expected = "parked retirement exceeds")]
+	fn uast_owner_accounting_rejects_parked_retirement_underflow() {
+		let mut accounting = UastOwnerAccounting::new(2);
+		accounting.record_parked_retirement(1);
+	}
+
+	#[test]
+	fn parked_generation_cache_evicts_and_touches_in_lru_order() {
+		let entry = |generation_id: u64| ParkedGenerationRoot {
+			target: crate::engine::undo::GenerationTarget {
+				generation_id,
+				path: format!("/generation/{generation_id}"),
+				byte_len: generation_id,
+			},
+			root: crate::ecs::NodeId::from_index(generation_id as usize),
+			device_id: Some(generation_id as u16),
+			live_nodes: generation_id,
+			file_identity: crate::svp::BackingIdentity {
+				length: generation_id,
+				modified_nanos: generation_id as u128,
+				file_id: Some(generation_id as u128),
+			},
+		};
+		let mut cache = ParkedGenerationCache::default();
+		for generation_id in 0..GENERATION_PARK_CAP as u64 {
+			assert!(cache.insert(entry(generation_id)).is_none());
+		}
+		let touched_target = cache.entries()[1].target.clone();
+		let touched = cache.take(&touched_target).expect("cached target");
+		cache.restore(touched);
+
+		let evicted = cache
+			.insert(entry(GENERATION_PARK_CAP as u64))
+			.expect("capacity overflow must evict");
+		assert_eq!(evicted.target.generation_id, 0);
+		assert_eq!(
+			cache
+				.entries()
+				.iter()
+				.map(|entry| entry.target.generation_id)
+				.collect::<Vec<_>>(),
+			vec![2, 3, 1, 4]
+		);
 	}
 
 	#[test]

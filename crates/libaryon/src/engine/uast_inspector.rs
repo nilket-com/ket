@@ -850,7 +850,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} retired={} allocated={} roots={}\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={}\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -872,6 +872,7 @@ fn render_snapshot(
 		snapshot.nodes.len(),
 		fold_revision,
 		identity.owner_accounting.current_live_nodes,
+		identity.owner_accounting.parked_nodes,
 		identity.owner_accounting.retired_nodes,
 		identity.owner_accounting.allocated_nodes,
 		identity.owner_accounting.root_generations,
@@ -1505,6 +1506,7 @@ mod tests {
 				allocated_nodes: 11,
 				retired_nodes: 7,
 				current_live_nodes: 4,
+				parked_nodes: 0,
 				root_generations: 2,
 			},
 		};
@@ -1538,8 +1540,7 @@ mod tests {
 			.find(|line| line.starts_with("owner-nodes:"))
 			.expect("owner accounting header");
 		assert_eq!(
-			owner_line,
-			"owner-nodes: live=4 retired=7 allocated=11 roots=2",
+			owner_line, "owner-nodes: live=4 parked=0 retired=7 allocated=11 roots=2",
 			"ADR 0001 defers owner-attributed byte diagnostics until stage 3"
 		);
 		assert!(!text.contains("scroll="));

@@ -142,6 +142,11 @@ fn handle_generation_substitute_all(
 		}
 	};
 	let byte_range = resolve_byte_range(&range, &bytes, tab.cursor.abs_line());
+	let (match_start, match_end) = byte_range.unwrap_or((0, bytes.len()));
+	if re.find(&bytes[match_start..match_end]).is_none() {
+		*status_message = Some("Pattern not found".to_string());
+		return Some(CommandEffect::render());
+	}
 	let had_shadow = tab.document.shadow.is_some();
 	let mut shadow = match tab.document.shadow.take() {
 		Some(shadow) => shadow,
@@ -153,6 +158,20 @@ fn handle_generation_substitute_all(
 			}
 		},
 	};
+	let invalidated_targets = shadow
+		.generations
+		.get(shadow.current_index.saturating_add(1)..)
+		.unwrap_or_default()
+		.to_vec();
+	let invalidated = tab
+		.document
+		.parked_generations
+		.remove_targets(&invalidated_targets);
+	super::retire_parked_generations_in_mutation(
+		ctx,
+		&mut tab.document.pending_parked_retirements,
+		invalidated,
+	);
 	let generation_result =
 		match checkpoint_substitute_generations(&mut shadow, &bytes, &re, &replacement, byte_range)
 		{
@@ -169,6 +188,8 @@ fn handle_generation_substitute_all(
 		if had_shadow {
 			tab.document.shadow = Some(shadow);
 		} else {
+			// This candidate never became document-owned, so it cannot own
+			// parked roots and does not use the attached-shadow disposal seam.
 			let _ = discard_shadow_session(&shadow);
 		}
 		*status_message = Some("Pattern not found".to_string());
@@ -1156,8 +1177,26 @@ mod tests {
 		);
 		assert_eq!(
 			resolver.registered_device_counts().0,
-			fixture_backing_count + 1,
-			"generation undo must retire the replaced backing"
+			fixture_backing_count + 2,
+			"generation undo must retain the parked replacement backing"
+		);
+		let exact_nodes = |root| {
+			let mut count = 0u64;
+			let mut stack = vec![root];
+			while let Some(node) = stack.pop() {
+				count += 1;
+				let mut child = registry.get_first_child(node);
+				while let Some(current) = child {
+					stack.push(current);
+					child = registry.get_next_sibling(current);
+				}
+			}
+			count
+		};
+		assert_eq!(tab.document.parked_generations.entries().len(), 1);
+		assert_eq!(
+			tab.document.parked_generations.entries()[0].live_nodes,
+			exact_nodes(tab.document.parked_generations.entries()[0].root)
 		);
 
 		let _ = handle_history_doctab_command(
@@ -1183,8 +1222,91 @@ mod tests {
 		);
 		assert_eq!(
 			resolver.registered_device_counts().0,
+			fixture_backing_count + 2,
+			"generation redo must revive without replacing either backing"
+		);
+		assert_eq!(tab.document.parked_generations.entries().len(), 1);
+		assert_eq!(
+			exact_nodes(tab.document.root_id)
+				+ exact_nodes(tab.document.parked_generations.entries()[0].root),
+			4,
+			"the active and parked two-node trees must both remain exact"
+		);
+
+		let cached_target = tab.document.parked_generations.entries()[0].target.clone();
+		let cached_bytes = std::fs::read(&cached_target.path).expect("read cached generation");
+		let replacement = format!("{}.replacement", cached_target.path);
+		std::fs::write(&replacement, &cached_bytes).expect("write replacement generation");
+		std::fs::rename(&replacement, &cached_target.path)
+			.expect("replace generation with a new file identity");
+		let before_invalidation = registry.stats();
+		let _ = handle_history_doctab_command(
+			&ctx,
+			&mut tab,
+			&mut ui,
+			&mut next_dynamic_device_id,
+			EditorCommand::Undo,
+		);
+		assert_eq!(
+			registry.stats().allocated_nodes,
+			before_invalidation.allocated_nodes + 2,
+			"an invalid cached identity must fresh-ingest the target"
+		);
+		assert_eq!(
+			registry.stats().retired_nodes,
+			before_invalidation.retired_nodes + 2,
+			"the invalid two-node cached tree must retire exactly once"
+		);
+		assert_eq!(
+			resolver.registered_device_counts().0,
+			fixture_backing_count + 2,
+			"identity replacement swaps one parked backing without leaking devices"
+		);
+		let before_redo_truncation = registry.stats();
+		handle_search_doctab_command(
+			&ctx,
+			&mut tab,
+			&mut search_pattern,
+			&mut search_case_insensitive,
+			&mut confirm_state,
+			&mut ui,
+			&mut next_dynamic_device_id,
+			EditorCommand::SubstituteAll {
+				pattern: "Chase".to_string(),
+				replacement: "Bank".to_string(),
+				range: CommandRange::WholeFile,
+				flags: SubstituteFlags::default(),
+			},
+		);
+		assert_eq!(ui.status_message.as_deref(), Some("80 substitution(s)"));
+		assert!(
+			tab.document.parked_generations.entries().is_empty(),
+			"branching history must remove parked roots from the truncated redo tail"
+		);
+		assert_eq!(
+			registry.stats().retired_nodes,
+			before_redo_truncation.retired_nodes + 2,
+			"redo-tail truncation must retire the parked two-node generation"
+		);
+		assert_eq!(
+			resolver.registered_device_counts().0,
 			fixture_backing_count + 1,
-			"generation redo must retire the replaced backing"
+			"redo-tail truncation must unregister its parked device"
+		);
+		assert!(
+			String::from_utf8(
+				crate::engine::document::io::read_document_snapshot(
+					&registry,
+					tab.document.root_id,
+					tab.document
+						.backing_path
+						.as_deref()
+						.map(std::path::Path::new),
+				)
+				.expect("read branched generation"),
+			)
+			.expect("utf8")
+			.starts_with("Bank,Account,North\n")
 		);
 
 		let _ = handle_file_doctab_command(

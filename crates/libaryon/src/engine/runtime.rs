@@ -51,11 +51,12 @@ use super::rune_host::{
 use super::runtime_registry::{ActionError, InvocationGate};
 use super::session::{
 	Affinity, BufferContent, BufferStore, CachedSumTree, CanonicalPath, EditorPane, EditorSession,
-	LayoutNode, PaneResizeResult, PendingReload, SemanticState, TextEditorMut, View, ViewContent,
-	text_editor, with_file_browser_buffer_mut, with_text_buffer_mut,
+	LayoutNode, PaneResizeResult, ParkedGenerationCache, ParkedGenerationRoot, PendingReload,
+	SemanticState, TextEditorMut, View, ViewContent, text_editor, with_file_browser_buffer_mut,
+	with_text_buffer_mut,
 };
 use super::settings::SaveDurability;
-use super::shadow::discard_shadow_session;
+use super::shadow::{ShadowSession, discard_shadow_session};
 use super::ui_colors::UiColorKey;
 use crate::core::{BufferId, DocByte, DocLine, PaneId, RequestId, StateId};
 use crate::ecs::UastRegistry;
@@ -1489,6 +1490,18 @@ fn release_buffer(
 		session.queue_host_event(crate::engine::HostEvent::PanelDisposed { panel_id });
 	}
 	if let BufferContent::Text(document) = &mut buffer.content {
+		let parked_live = document.parked_generations.live_nodes();
+		assert_eq!(
+			parked_live, document.uast_accounting.parked_nodes,
+			"parked cache and owner accounting diverged before release"
+		);
+		let parked = document.parked_generations.drain();
+		assert_eq!(
+			retire_parked_generations(runtime, parked),
+			parked_live,
+			"parked release retirement diverged from its cache"
+		);
+		// The attached cache is empty before its shadow directory disappears.
 		if let Some(shadow) = document.shadow.take() {
 			let _ = discard_shadow_session(&shadow);
 		}
@@ -1504,6 +1517,49 @@ fn release_buffer(
 	runtime.registry.note_nodes_retired(retired_nodes);
 	if let Some(root) = buffer.root_id() {
 		runtime.registry.cancel_metric_scan(root);
+	}
+}
+
+fn retire_parked_generations(
+	runtime: &RuntimeContext<'_>,
+	entries: Vec<ParkedGenerationRoot>,
+) -> u64 {
+	let mut retired = 0u64;
+	for entry in entries {
+		runtime.registry.cancel_metric_scan(entry.root);
+		if let Some(device_id) = entry.device_id {
+			runtime.resolver.unregister_device(device_id);
+		}
+		retired = retired
+			.checked_add(entry.live_nodes)
+			.expect("parked generation retirement overflow");
+	}
+	runtime.registry.note_nodes_retired(retired);
+	retired
+}
+
+fn retire_parked_generations_in_mutation(
+	runtime: &RuntimeContext<'_>,
+	pending_parked_retirements: &mut u64,
+	entries: Vec<ParkedGenerationRoot>,
+) {
+	let retired = retire_parked_generations(runtime, entries);
+	*pending_parked_retirements = pending_parked_retirements
+		.checked_add(retired)
+		.expect("pending parked retirement overflow");
+}
+
+fn discard_attached_shadow(
+	runtime: &RuntimeContext<'_>,
+	shadow: &mut Option<ShadowSession>,
+	parked_generations: &mut ParkedGenerationCache,
+	pending_parked_retirements: &mut u64,
+) {
+	let parked = parked_generations.drain();
+	retire_parked_generations_in_mutation(runtime, pending_parked_retirements, parked);
+	// This is the sole attached-shadow disposal seam used by file commands.
+	if let Some(existing_shadow) = shadow.take() {
+		let _ = discard_shadow_session(&existing_shadow);
 	}
 }
 
@@ -5385,6 +5441,8 @@ mod event_bus_integration_tests {
 		commands: CommandSender,
 		events: mpsc::Receiver<EngineEvent>,
 		_views: mpsc::Receiver<crate::uast::projection::Viewport>,
+		registry: Arc<UastRegistry>,
+		resolver: Arc<SvpResolver>,
 		thread: thread::JoinHandle<()>,
 	}
 
@@ -5499,8 +5557,8 @@ mod event_bus_integration_tests {
 		languages.register(NavigationTestProvider);
 		let languages = Arc::new(languages);
 		let engine = Engine::new(
-			registry,
-			resolver,
+			registry.clone(),
+			resolver.clone(),
 			requests,
 			internal,
 			tx_view,
@@ -5523,6 +5581,8 @@ mod event_bus_integration_tests {
 			commands,
 			events,
 			_views: views,
+			registry,
+			resolver,
 			thread,
 		}
 	}
@@ -6563,6 +6623,237 @@ pub fn main(editor) {
 		);
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();
+	}
+
+	#[test]
+	fn generation_ping_pong_parks_roots_after_the_first_ingest() {
+		// Stage-1 baseline on this one-extent fixture: every crossing allocated
+		// and retired two nodes and consumed a new dynamic device id. Stage 2
+		// pays one two-node ingest for the first undo, then holds all three
+		// high-waters flat across cache-hit crossings.
+		fn viewport_contains(viewport: &crate::uast::projection::Viewport, needle: &[u8]) -> bool {
+			viewport.panes.iter().any(|pane| {
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				text.windows(needle.len()).any(|window| window == needle)
+			})
+		}
+
+		let path = crate::engine::test_support::temp_test_path("generation-parking.txt");
+		std::fs::write(&path, "alpha\n".repeat(300)).expect("write generation fixture");
+		let engine = spawn_test_engine(Some(path.to_string_lossy().into_owned()));
+		for _ in 0..3 {
+			let _ = recv_event(&engine.events);
+		}
+
+		engine
+			.commands
+			.send(EditorCommand::SubstituteAll {
+				pattern: "alpha".to_string(),
+				replacement: "bravo".to_string(),
+				range: crate::engine::CommandRange::WholeFile,
+				flags: crate::engine::SubstituteFlags {
+					global: true,
+					..crate::engine::SubstituteFlags::default()
+				},
+			})
+			.expect("create shadow generations");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("300 substitution(s)")
+		});
+		assert!(matches!(
+			recv_event(&engine.events),
+			EngineEvent::BufferReplaced { .. }
+		));
+		let before_crossing = engine.registry.stats();
+
+		engine
+			.commands
+			.send(EditorCommand::Undo)
+			.expect("first undo");
+		assert!(matches!(
+			recv_event(&engine.events),
+			EngineEvent::BufferReplaced { .. }
+		));
+		let after_first_ingest = engine.registry.stats();
+		assert!(
+			after_first_ingest.allocated_nodes > before_crossing.allocated_nodes,
+			"the first visit to the before generation establishes its parked tree"
+		);
+		assert_eq!(
+			after_first_ingest.retired_nodes, before_crossing.retired_nodes,
+			"parking must not report a revivable root as retired"
+		);
+		let stable_devices = engine.resolver.registered_device_counts();
+
+		for command in [
+			EditorCommand::Redo,
+			EditorCommand::Undo,
+			EditorCommand::Redo,
+			EditorCommand::Undo,
+			EditorCommand::Redo,
+		] {
+			engine.commands.send(command).expect("cached crossing");
+			assert!(matches!(
+				recv_event(&engine.events),
+				EngineEvent::BufferReplaced { .. }
+			));
+			let stats = engine.registry.stats();
+			assert_eq!(
+				stats.allocated_nodes, after_first_ingest.allocated_nodes,
+				"cache-hit crossings must allocate zero nodes"
+			);
+			assert_eq!(
+				stats.retired_nodes, after_first_ingest.retired_nodes,
+				"cache-hit crossings must not retire either generation"
+			);
+			assert_eq!(
+				engine.resolver.registered_device_counts(),
+				stable_devices,
+				"cache-hit crossings must consume zero backing devices"
+			);
+		}
+
+		engine
+			.commands
+			.send(EditorCommand::OpenUastInspector { mode: None })
+			.expect("open accounting inspector");
+		let inspector = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport_contains(viewport, b"owner-nodes:")
+		});
+		let inspector_text = inspector
+			.panes
+			.iter()
+			.flat_map(|pane| pane.tokens.iter())
+			.flat_map(|token| token.text.iter().copied())
+			.collect::<Vec<_>>();
+		assert!(
+			inspector_text
+				.windows(b"owner-nodes: live=2 parked=2 retired=2 allocated=6 roots=8".len())
+				.any(|window| {
+					window == b"owner-nodes: live=2 parked=2 retired=2 allocated=6 roots=8"
+				}),
+			"active and parked exact trees must reconcile in the owner header: {}",
+			String::from_utf8_lossy(&inspector_text)
+		);
+		let source_pane_id = inspector
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title != "uast")
+			.expect("source pane beside inspector")
+			.pane_id;
+		let before_release = engine.registry.stats();
+		let devices_before_release = engine.resolver.registered_device_counts();
+		engine
+			.commands
+			.send(EditorCommand::FocusPane(source_pane_id))
+			.expect("focus generation source");
+		engine
+			.commands
+			.send(EditorCommand::ClosePane)
+			.expect("close generation source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.len() == 1
+				&& viewport.panes[0].tabs[viewport.panes[0].active_doctab_index].title == "uast"
+		});
+		assert_eq!(
+			engine.registry.stats().retired_nodes,
+			before_release.retired_nodes + 4,
+			"buffer release must retire its active and parked roots exactly once"
+		);
+		assert_eq!(
+			engine.resolver.registered_device_counts().0 + 2,
+			devices_before_release.0,
+			"buffer release must unregister both generation devices"
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn file_commands_cannot_bypass_attached_shadow_disposal() {
+		let source = include_str!("runtime/system.rs");
+		assert!(
+			!source.contains("discard_shadow_session"),
+			"save/load/reload/replace must drain parked roots through discard_attached_shadow"
+		);
+		assert!(
+			source.contains("discard_attached_shadow"),
+			"file commands must retain the centralized attached-shadow seam"
+		);
+	}
+
+	#[test]
+	fn parked_eviction_cancels_metric_scans_before_device_retirement() {
+		let registry = Arc::new(UastRegistry::new(2));
+		let (notify, _notifications) = mpsc::channel();
+		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
+		let languages = super::super::language::LanguageRegistry::new();
+		let runtime = RuntimeContext {
+			registry: &registry,
+			resolver: &resolver,
+			lang_registry: &languages,
+			init_script: None,
+			init_entrypoint: None,
+		};
+		let mut chunk = registry.reserve_chunk(2).expect("metric fixture nodes");
+		let root = chunk.spawn_node(
+			crate::uast::SemanticKind::RelationalTable,
+			None,
+			crate::uast::SpanMetrics {
+				byte_length: 1,
+				newlines: 0,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			crate::uast::SemanticKind::Token,
+			Some(crate::svp::SvpPointer {
+				lba: 0,
+				byte_length: 1,
+				device_id: 77,
+				head_trim: 0,
+			}),
+			crate::uast::SpanMetrics {
+				byte_length: 1,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		registry.register_backing_store(
+			77,
+			Arc::new(crate::svp::GeneratedBackingStore::new(1, |_| b'x')),
+		);
+		registry.begin_metric_scan(root, leaf, leaf);
+		assert!(registry.inspector_root_metrics_incomplete(root));
+		let retired_before = registry.stats().retired_nodes;
+
+		retire_parked_generations(
+			&runtime,
+			vec![ParkedGenerationRoot {
+				target: super::super::undo::GenerationTarget {
+					generation_id: 1,
+					path: "/generation/1".to_string(),
+					byte_len: 1,
+				},
+				root,
+				device_id: Some(77),
+				live_nodes: 2,
+				file_identity: crate::svp::BackingIdentity {
+					length: 1,
+					modified_nanos: 0,
+					file_id: None,
+				},
+			}],
+		);
+
+		assert!(!registry.inspector_root_metrics_incomplete(root));
+		assert!(registry.backing_identity(77).is_none());
+		assert_eq!(registry.stats().retired_nodes, retired_before + 2);
 	}
 
 	#[test]
