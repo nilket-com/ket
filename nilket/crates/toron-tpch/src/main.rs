@@ -4862,10 +4862,30 @@ fn route_distinct_gate_record(
 	if off_probe_spill == 0 {
 		return Err("route gate control must spill the probe reservoir".to_string());
 	}
+	// The chain-stage profiler emits the deferred block unconditionally; the
+	// candidate's must be inert — zero partitions completed, zero rows
+	// buffered, zero reservoir spill. Any live fact means the deferred
+	// lifecycle ran and the gate fails closed.
 	if let Some(on_deferred) = on_profile.get("deferred_replay_1") {
-		return Err(format!(
-			"route gate candidate still ran the deferred reservoir lifecycle: {on_deferred}"
-		));
+		for key in [
+			"completed_partitions",
+			"probe_rows_buffered",
+			"probe_spill_bytes",
+			"build_spill_bytes",
+			"index_builds",
+		] {
+			let value = on_deferred
+				.get(key)
+				.and_then(serde_json::Value::as_u64)
+				.ok_or_else(|| {
+					format!("route gate candidate deferred block lacks numeric {key}")
+				})?;
+			if value != 0 {
+				return Err(format!(
+					"route gate candidate still ran the deferred reservoir lifecycle ({key} = {value})"
+				));
+			}
+		}
 	}
 	Ok(serde_json::json!({
 		"suite": "route_distinct_gate",
