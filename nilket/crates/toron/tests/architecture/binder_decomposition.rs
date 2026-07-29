@@ -169,9 +169,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// guarded by the coordinator/fragmenter distributed rails, so it remains at this root boundary.
 	// The admission decision also records a per-join receipt on the optimizer trace (the bare bool
 	// proved unauditable in the first live cell), which is the small remainder of this bound.
+	// ADR 511 adds the filtered-build-side-swap placement knob on `PlannerConfig` — a real
+	// placement-pass decision surface, the same class as ADR 472's unknown-size fact.
 	assert!(
-		lines <= 6_120,
-		"binder root has {lines} lines; expected <= 6,120 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_125,
+		"binder root has {lines} lines; expected <= 6,125 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

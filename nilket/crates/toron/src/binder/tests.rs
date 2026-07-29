@@ -25928,6 +25928,112 @@ fn adr472_unknown_size_side_declines_the_swap() {
 	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
 }
 
+#[test]
+fn adr511_filtered_right_side_swaps_on_its_raw_bound() {
+	// The right side carries a filter no estimator could size. Its bound can
+	// only overstate it, so the comparison proceeds on the raw bound when the
+	// swap is enabled; the same shape keeps natural when it is off. Fails
+	// without the asymmetric decline.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	let sizable_left = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(700 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(6_000_000)),
+		filtered_without_estimate: false,
+	};
+	let filtered_right = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(100 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(1_000_000)),
+		filtered_without_estimate: true,
+	};
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(sizable_left),
+		join_input(filtered_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
+	assert_eq!(
+		decision.reason,
+		JoinStrategyDecisionReason::HashSmallerBuild {
+			build_bytes: ByteCount::new(100 * 1024 * 1024),
+			rejected_side_bytes: ByteCount::new(700 * 1024 * 1024),
+			fallback: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
+		}
+	);
+	// The compiled-off arm is byte-for-byte the ADR 472 symmetric decline.
+	config.filtered_build_side_swap = false;
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(sizable_left),
+		join_input(filtered_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+}
+
+#[test]
+fn adr511_left_and_both_filtered_still_decline_with_swap_enabled() {
+	// Left staleness is the direction the comparison must trust as larger; it
+	// declines with the swap enabled, alone and when both sides carry the mark.
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	let filtered_left = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(700 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(6_000_000)),
+		filtered_without_estimate: true,
+	};
+	let sizable_right = PlanOptimizerFacts {
+		origin: PlanOrigin::SingleBaseRelation,
+		byte_upper_bound: Some(ByteCount::new(100 * 1024 * 1024)),
+		estimated_byte_size: None,
+		estimated_row_count: None,
+		row_upper_bound: Some(RowCount::new(1_000_000)),
+		filtered_without_estimate: false,
+	};
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(filtered_left),
+		join_input(sizable_right),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+	let decision = choose_join_strategy(
+		JoinReplayId::SYNTHETIC,
+		JoinStrategyIntent::Auto,
+		JoinKind::Inner,
+		join_input(filtered_left),
+		join_input(PlanOptimizerFacts {
+			filtered_without_estimate: true,
+			..sizable_right
+		}),
+		&config,
+	)
+	.expect("choose join strategy");
+	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+}
+
 #[tokio::test]
 async fn adr466_hash_swapped_placement_swaps_physical_build_and_restores_order() {
 	let mut catalog = join_catalog();
@@ -26009,4 +26115,154 @@ fn adr467_hash_tier_uniformity_is_strategy_uniform_with_placement_in_fingerprint
 		join_order::uniform_star_order_strategy(&[broadcast_natural]),
 		None
 	);
+}
+
+fn adr511_descriptor(id_byte: u8, table: &str, pk: &str, schema: Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new(
+		TableObjectId::new([id_byte; 16]),
+		1,
+		"default",
+		table,
+		&schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(pk)),
+		LocalityPolicy::default_table_spread(),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("descriptor")
+}
+
+fn adr511_q17_shape_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(81),
+			adr511_descriptor(
+				81,
+				"lineitem",
+				"l_orderkey",
+				Schema::new(vec![
+					Field::new("l_orderkey", DataType::Int64, false),
+					Field::new("l_partkey", DataType::Int64, false),
+					Field::new("l_quantity", DataType::Float64, false),
+					Field::new("l_extendedprice", DataType::Float64, false),
+				]),
+			),
+		)
+		.expect("register lineitem");
+	catalog
+		.register_descriptor(
+			TableId(82),
+			adr511_descriptor(
+				82,
+				"part",
+				"p_partkey",
+				Schema::new(vec![
+					Field::new("p_partkey", DataType::Int64, false),
+					Field::new("p_brand", DataType::Utf8, false),
+					Field::new("p_container", DataType::Utf8, false),
+				]),
+			),
+		)
+		.expect("register part");
+	seed_byte_upper_bound(&mut catalog, "lineitem", 5_758_680_840);
+	seed_byte_upper_bound(&mut catalog, "part", 240_000_000);
+	catalog
+}
+
+const ADR511_Q17_SHAPE_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
+	 FROM lineitem, part \
+	 WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' \
+	   AND l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
+
+#[tokio::test]
+async fn adr511_q17_shape_swaps_join0_toward_filtered_part() {
+	// q17's comma join builds on full lineitem exactly because the filtered
+	// part side carries no estimate; the swap must engage on the raw bound
+	// with the knob on, and keep the symmetric decline with it off.
+	let catalog = adr511_q17_shape_catalog();
+	let logical = SqlPlanner::new()
+		.plan(ADR511_Q17_SHAPE_SQL)
+		.expect("plan q17 shape");
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind q17 shape");
+	let join0 = trace
+		.join_decisions
+		.iter()
+		.find(|receipt| receipt.target.join_index == 0)
+		.expect("join0 receipt");
+	assert_eq!(join0.placement, JoinPhysicalPlacement::SwappedRightBuild);
+	assert!(matches!(
+		join0.reason,
+		JoinStrategyDecisionReason::HashSmallerBuild { .. }
+	));
+
+	config.filtered_build_side_swap = false;
+	let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind q17 shape, swap off");
+	let join0 = trace
+		.join_decisions
+		.iter()
+		.find(|receipt| receipt.target.join_index == 0)
+		.expect("join0 receipt");
+	assert_eq!(join0.placement, JoinPhysicalPlacement::Natural);
+}
+
+#[tokio::test]
+async fn adr511_left_filtered_shape_keeps_natural_in_both_arms() {
+	// The mirror: the unestimated filter sits on the LEFT side whose bound the
+	// comparison trusts as larger. Both arms must decline — this fails under a
+	// fully symmetric relaxation that trusts stale bounds on either side.
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(83),
+			adr511_descriptor(
+				83,
+				"big",
+				"id",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("k", DataType::Int64, false),
+					Field::new("category", DataType::Utf8, false),
+				]),
+			),
+		)
+		.expect("register big");
+	catalog
+		.register_descriptor(
+			TableId(84),
+			adr511_descriptor(
+				84,
+				"small",
+				"id",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("k", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register small");
+	seed_byte_upper_bound(&mut catalog, "big", 700 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "small", 100 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM big INNER JOIN small ON big.k = small.k WHERE big.category = 'x'")
+		.expect("plan left-filtered shape");
+	for filtered_build_side_swap in [true, false] {
+		let mut config = auto_broadcast_config(4_096);
+		config.hash_smaller_build_placement = true;
+		config.filtered_build_side_swap = filtered_build_side_swap;
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind left-filtered shape");
+		assert_eq!(trace.join_decisions.len(), 1);
+		assert_eq!(
+			trace.join_decisions[0].placement,
+			JoinPhysicalPlacement::Natural
+		);
+	}
 }

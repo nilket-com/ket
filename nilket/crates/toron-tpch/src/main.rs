@@ -16,14 +16,14 @@ use toron_tpch::telemetry::{
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, PRIMITIVE_LADDER_IDS, Q17BoundaryCensusOutcome,
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
-	export_persisted_perf_query_parquet, gauge_hash_smaller_build, gauge_memory_per_task,
-	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
-	node_attribution_outer_reconciliation, normalize_duckdb_type,
-	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
-	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	export_persisted_perf_query_parquet, gauge_filtered_build_side_swap, gauge_hash_smaller_build,
+	gauge_memory_per_task, gauge_spill_bytes_reserved, generate_dev_lineitem,
+	load_persisted_tpch_dataset, matrix, node_attribution_outer_reconciliation,
+	normalize_duckdb_type, paired_ablation_dataset_fingerprint, parse_scale_factor,
+	prepare_persisted_tpch_dataset, primitive_ladder_intent, q17_correctness_scale, run_dev_q1,
+	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
+	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
+	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -172,6 +172,11 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Ok(setting) => setting,
 		Err(message) => return harness_error(&message),
 	};
+	let (filtered_build_side_swap, filtered_build_side_swap_provenance) =
+		match gauge_filtered_build_side_swap() {
+			Ok(setting) => setting,
+			Err(message) => return harness_error(&message),
+		};
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
@@ -328,6 +333,9 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
 	row["hash_smaller_build"] = serde_json::json!(hash_smaller_build);
 	row["hash_smaller_build_provenance"] = serde_json::json!(hash_smaller_build_provenance);
+	row["filtered_build_side_swap"] = serde_json::json!(filtered_build_side_swap);
+	row["filtered_build_side_swap_provenance"] =
+		serde_json::json!(filtered_build_side_swap_provenance);
 	if std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some() {
 		let ledger = take_parquet_scan_ledger();
 		let batches = ledger.iter().flat_map(|scan| scan.batches.iter());
@@ -6006,6 +6014,33 @@ mod adr469_tests {
 		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "yes") };
 		assert!(gauge_hash_smaller_build().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
+	}
+}
+#[cfg(test)]
+mod adr511_tests {
+	use super::*;
+
+	#[test]
+	fn adr511_filtered_build_side_swap_knob_contract() {
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::remove_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP") };
+		assert_eq!(
+			gauge_filtered_build_side_swap().unwrap(),
+			(false, "default")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "1") };
+		assert_eq!(
+			gauge_filtered_build_side_swap().unwrap(),
+			(true, "explicit")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "0") };
+		assert_eq!(
+			gauge_filtered_build_side_swap().unwrap(),
+			(false, "explicit")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "yes") };
+		assert!(gauge_filtered_build_side_swap().is_err());
+		unsafe { std::env::remove_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP") };
 	}
 }
 

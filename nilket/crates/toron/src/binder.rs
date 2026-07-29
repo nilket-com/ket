@@ -178,6 +178,11 @@ pub struct PlannerConfig {
 	/// (472) left three engaged cells, all material wins (+17.7%/+34.6%/+23.1%),
 	/// and no regression. Retained as an operator off-switch.
 	pub hash_smaller_build_placement: bool,
+	/// ADR 511: allow the smaller-build swap toward a right side narrowed by an
+	/// unestimated filter — its byte bound only overstates it, since filters are
+	/// volume-non-increasing, so the raw-bound comparison stays conservative.
+	/// Left-side staleness still declines. Default false until activation.
+	pub filtered_build_side_swap: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -208,6 +213,7 @@ impl Default for PlannerConfig {
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,
+			filtered_build_side_swap: false,
 		}
 	}
 }
