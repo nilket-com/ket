@@ -19,6 +19,8 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegistryStatsSnapshot {
 	pub allocated_nodes: u64,
+	/// Fixed node-slot capacity. Slots remain monotonic until ADR 0001 stage 5.
+	pub capacity: u64,
 	/// Nodes detached from live ownership. Stage-1 accounting does not reclaim
 	/// their slots, so this is retirement traffic rather than free capacity.
 	pub retired_nodes: u64,
@@ -294,15 +296,16 @@ impl UastRegistry {
 		}
 	}
 
-	/// Internal node allocator for mutations.
-	pub(crate) fn alloc_node_internal(&self) -> NodeId {
-		self.try_alloc_node_internal()
-			.expect("UastRegistry capacity exceeded during split")
-	}
-
-	pub(crate) fn try_alloc_node_internal(&self) -> Option<NodeId> {
+	#[cfg(test)]
+	pub(crate) fn try_alloc_test_node(&self) -> Option<NodeId> {
 		let id_val = self.reserve_ids(1)?;
 		Some(NodeId::from_index(id_val as usize - 1))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn alloc_test_node(&self) -> NodeId {
+		self.try_alloc_test_node()
+			.expect("test registry node capacity")
 	}
 
 	/// Atomically reserves a chunk of `NodeId`s for a single thread.
@@ -337,6 +340,23 @@ impl UastRegistry {
 
 	pub(crate) fn allocated_node_count(&self) -> u64 {
 		u64::from(self.next_id.load(Ordering::Acquire).saturating_sub(1))
+	}
+
+	pub(crate) fn capacity(&self) -> u64 {
+		u64::from(self.capacity)
+	}
+
+	pub(crate) fn remaining_node_capacity(&self) -> u64 {
+		self.capacity().saturating_sub(self.allocated_node_count())
+	}
+
+	pub(crate) fn capacity_refusal_message(&self, operation: &str, required: u64) -> String {
+		format!(
+			"{operation} refused: UAST registry node capacity exhausted; needs {required} \
+			 nodes but only {} remain. Restart the editor (closing buffers does not \
+			 reclaim node IDs yet)",
+			self.remaining_node_capacity()
+		)
 	}
 
 	pub(crate) fn retired_node_count(&self) -> u64 {
@@ -1118,6 +1138,7 @@ impl UastRegistry {
 		let payload = self.authoritative_payload_snapshot();
 		RegistryStatsSnapshot {
 			allocated_nodes: self.allocated_node_count(),
+			capacity: self.capacity(),
 			retired_nodes: self.retired_node_count(),
 			cold_extents: self.cold_extent_count.load(Ordering::Acquire),
 			hot_extents: self.hot_extent_count.load(Ordering::Acquire),
@@ -2123,6 +2144,7 @@ mod tests {
 			("semantic", include_str!("../engine/semantic.rs")),
 			("session", include_str!("../engine/session.rs")),
 			("file-browser", include_str!("../engine/file_browser.rs")),
+			("file-browser", include_str!("../engine/file_browser.rs")),
 			("runtime", include_str!("../engine/runtime.rs")),
 			("runtime-edit", include_str!("../engine/runtime/edit.rs")),
 			("system", include_str!("../engine/runtime/system.rs")),
@@ -2173,6 +2195,41 @@ mod tests {
 				.contains("#[cfg(test)]\npub fn apply_graft"),
 			"production grafts must return exact retired forest heads"
 		);
+	}
+
+	#[test]
+	fn production_node_allocations_have_no_panicking_capacity_path() {
+		let sources = [
+			("registry", include_str!("registry.rs")),
+			("mutation", include_str!("../uast/mutation.rs")),
+			("graft", include_str!("../engine/structural_graft.rs")),
+			("folding", include_str!("../engine/folding/synthetic.rs")),
+			("session", include_str!("../engine/session.rs")),
+			("system", include_str!("../engine/runtime/system.rs")),
+			("ingest", include_str!("../svp/ingest.rs")),
+		];
+		for (label, source) in sources {
+			let production = source
+				.split("\n#[cfg(test)]\nmod tests {")
+				.next()
+				.unwrap_or(source);
+			assert!(
+				!production.contains("alloc_node_internal"),
+				"{label} reintroduced the panicking per-node allocator"
+			);
+			let lines = production.lines().collect::<Vec<_>>();
+			for (line_number, line) in lines.iter().enumerate() {
+				if !line.contains("reserve_chunk") && !line.contains("reserve_ids") {
+					continue;
+				}
+				let window = lines[line_number..lines.len().min(line_number + 4)].join("\n");
+				assert!(
+					!window.contains(".expect(") && !window.contains(".unwrap("),
+					"{label}:{} unwraps a registry capacity reservation:\n{window}",
+					line_number + 1
+				);
+			}
+		}
 	}
 
 	#[test]

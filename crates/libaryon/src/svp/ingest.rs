@@ -25,8 +25,9 @@ pub fn ingest_svp_file(
 		.and_then(|count| u32::try_from(count).ok())
 		.ok_or_else(|| format!("File requires too many extents to load ({chunk_count})"))?;
 	let mut chunk = registry.reserve_chunk(node_count).ok_or_else(|| {
-		format!(
-			"Not enough document-node capacity to load {file_size} bytes ({chunk_count} extents required)"
+		registry.capacity_refusal_message(
+			&format!("Loading {file_size} bytes ({chunk_count} extents)"),
+			u64::from(node_count),
 		)
 	})?;
 
@@ -237,6 +238,19 @@ mod tests {
 		assert!(error.contains("Open error"));
 		assert_eq!(registry.stats().allocated_nodes, 2);
 		assert_eq!(registry.stats().retired_nodes, 2);
+	}
+
+	#[test]
+	fn ingest_capacity_refusal_consumes_no_nodes_and_names_the_remedy() {
+		let registry = Arc::new(UastRegistry::new(1));
+		let (notify, _notifications) = mpsc::channel();
+		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
+		let error = ingest_svp_file(&resolver, &registry, 1, 91, "unused".to_string())
+			.expect_err("root plus extent cannot fit");
+		assert!(error.contains("Loading 1 bytes"));
+		assert!(error.contains("UAST registry"));
+		assert!(error.contains("Restart"));
+		assert_eq!(registry.stats().allocated_nodes, 0);
 	}
 
 	#[test]

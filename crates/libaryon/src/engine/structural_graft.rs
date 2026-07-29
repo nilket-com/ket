@@ -6,6 +6,7 @@
 //! to splice that structure into the live LCRS tree, replacing the flat
 //! token chain with a deep structural representation.
 
+use crate::ecs::chunk::RegistryChunk;
 use crate::ecs::id::NodeId;
 use crate::ecs::registry::UastRegistry;
 use crate::engine::language::GreenNode;
@@ -24,6 +25,8 @@ pub enum GraftError {
 	TopologyLengthMismatch { topology: u32, source: usize },
 	/// An interior node's children do not exactly cover its declared extent.
 	TopologyCoverageMismatch { declared: u32, children: u64 },
+	/// The exact semantic tree, including synthetic fan-out groups, cannot fit.
+	CapacityRefused { required: u64, remaining: u64 },
 }
 
 impl std::fmt::Display for GraftError {
@@ -40,6 +43,15 @@ impl std::fmt::Display for GraftError {
 			Self::TopologyCoverageMismatch { declared, children } => write!(
 				f,
 				"graft node declares {declared} bytes but its children cover {children}"
+			),
+			Self::CapacityRefused {
+				required,
+				remaining,
+			} => write!(
+				f,
+				"UAST registry node capacity exhausted: graft needs {required} nodes but \
+				 only {remaining} remain; restart the editor (closing buffers does not \
+				 reclaim node IDs yet)"
 			),
 		}
 	}
@@ -129,6 +141,18 @@ pub(crate) fn apply_graft_tracked(
 ) -> Result<AppliedGraft, GraftError> {
 	// Reject before detaching anything. Past this point the graft cannot fail.
 	validate_graft(registry, root, green, source)?;
+	let required = graft_allocation_count(green);
+	let required_u32 = u32::try_from(required).map_err(|_| GraftError::CapacityRefused {
+		required,
+		remaining: registry.remaining_node_capacity(),
+	})?;
+	let mut chunk =
+		registry
+			.reserve_chunk(required_u32)
+			.ok_or_else(|| GraftError::CapacityRefused {
+				required,
+				remaining: registry.remaining_node_capacity(),
+			})?;
 
 	// The immutable source generation is being replaced by a semantic tree.
 	// Detach old scan leaves before publishing the graft so late completions
@@ -146,7 +170,12 @@ pub(crate) fn apply_graft_tracked(
 	}
 
 	// 1. Recursively build the new LCRS subtree
-	let new_module = graft_recursive(registry, green, Some(root), None, source, 0);
+	let new_module = graft_recursive(registry, &mut chunk, green, Some(root), None, source, 0);
+	assert_eq!(
+		chunk.remaining(),
+		0,
+		"exact graft reservation must be consumed completely"
+	);
 
 	// 2. Disconnect old children and install the new subtree
 	unsafe {
@@ -177,6 +206,7 @@ pub(crate) fn apply_graft_tracked(
 /// `base_offset` — byte offset of this node within the source.
 fn graft_recursive(
 	registry: &UastRegistry,
+	chunk: &mut RegistryChunk<'_>,
 	node: &GreenNode,
 	parent: Option<NodeId>,
 	prev_sibling: Option<NodeId>,
@@ -193,6 +223,7 @@ fn graft_recursive(
 
 	let id = allocate_graft_node(
 		registry,
+		chunk,
 		node.kind,
 		node.provider_kind,
 		byte_len,
@@ -206,6 +237,7 @@ fn graft_recursive(
 		let group_depth = grouping_depth(node.children.len());
 		let children = graft_child_level(
 			registry,
+			chunk,
 			&node.children,
 			id,
 			source,
@@ -241,6 +273,7 @@ struct GraftedChildLevel {
 
 fn allocate_graft_node(
 	registry: &UastRegistry,
+	chunk: &mut RegistryChunk<'_>,
 	kind: SemanticKind,
 	provider_kind: ProviderKindId,
 	byte_len: u32,
@@ -248,16 +281,17 @@ fn allocate_graft_node(
 	parent: Option<NodeId>,
 	prev_sibling: Option<NodeId>,
 ) -> NodeId {
-	let id = registry.alloc_node_internal();
-	let idx = id.index();
-	unsafe {
-		*registry.kinds[idx].get() = kind;
-		*registry.provider_kinds[idx].get() = provider_kind;
-		*registry.spans[idx].get() = None;
-		*registry.metrics[idx].get() = SpanMetrics {
+	let id = chunk.spawn_node(
+		kind,
+		None,
+		SpanMetrics {
 			byte_length: u64::from(byte_len),
 			newlines,
-		};
+		},
+	);
+	let idx = id.index();
+	unsafe {
+		*registry.provider_kinds[idx].get() = provider_kind;
 		let edges = &mut *registry.edges[idx].get();
 		edges.parent = parent;
 		edges.first_child = None;
@@ -284,21 +318,21 @@ fn grouping_depth(child_count: usize) -> usize {
 	depth
 }
 
-#[cfg(test)]
-pub(crate) fn graft_allocation_count(node: &GreenNode) -> usize {
-	let semantic_nodes = 1usize.saturating_add(
-		node.children
-			.iter()
-			.map(graft_allocation_count)
-			.sum::<usize>(),
-	);
+pub(crate) fn graft_allocation_count(node: &GreenNode) -> u64 {
+	checked_graft_allocation_count(node).unwrap_or(u64::MAX)
+}
+
+fn checked_graft_allocation_count(node: &GreenNode) -> Option<u64> {
+	let semantic_nodes = node.children.iter().try_fold(1u64, |total, child| {
+		total.checked_add(checked_graft_allocation_count(child)?)
+	})?;
 	let mut level_width = node.children.len();
-	let mut groups = 0usize;
+	let mut groups = 0u64;
 	while level_width > TARGET_TREE_FANOUT {
 		level_width = level_width.div_ceil(TARGET_TREE_FANOUT);
-		groups = groups.saturating_add(level_width);
+		groups = groups.checked_add(u64::try_from(level_width).ok()?)?;
 	}
-	semantic_nodes.saturating_add(groups)
+	semantic_nodes.checked_add(groups)
 }
 
 fn child_span_at_group_depth(depth: usize) -> usize {
@@ -307,6 +341,7 @@ fn child_span_at_group_depth(depth: usize) -> usize {
 
 fn graft_child_level(
 	registry: &UastRegistry,
+	chunk: &mut RegistryChunk<'_>,
 	children: &[GreenNode],
 	parent: NodeId,
 	source: &[u8],
@@ -320,6 +355,7 @@ fn graft_child_level(
 		for child in children {
 			let child_id = graft_recursive(
 				registry,
+				chunk,
 				child,
 				Some(parent),
 				result.last,
@@ -344,6 +380,7 @@ fn graft_child_level(
 		let byte_len = u32::try_from(byte_length).expect("graft group byte length fits u32");
 		let group = allocate_graft_node(
 			registry,
+			chunk,
 			SemanticKind::Group,
 			ProviderKindId::NONE,
 			byte_len,
@@ -353,6 +390,7 @@ fn graft_child_level(
 		);
 		let grouped = graft_child_level(
 			registry,
+			chunk,
 			grouped_children,
 			group,
 			source,
@@ -399,8 +437,8 @@ mod tests {
 	fn build_flat_document(raw: &[u8]) -> (UastRegistry, NodeId) {
 		let newlines = raw.iter().filter(|&&b| b == b'\n').count() as u64;
 		let registry = UastRegistry::new(256);
-		let root = registry.alloc_node_internal();
-		let leaf = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
+		let leaf = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -496,6 +534,59 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn capacity_refusal_precedes_detach_and_is_counter_neutral() {
+		let source = b"old";
+		let registry = UastRegistry::new(2);
+		let mut chunk = registry.reserve_chunk(2).expect("fixture capacity");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: source.len() as u64,
+				newlines: 0,
+			},
+		);
+		let old_leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: source.len() as u64,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, old_leaf);
+		registry.replace_authoritative_data(old_leaf, source.to_vec());
+		let before = registry.stats();
+		let green = GreenNode {
+			kind: SemanticKind::RelationalTable,
+			provider_kind: ProviderKindId::NONE,
+			byte_len: source.len() as u32,
+			children: vec![GreenNode {
+				kind: SemanticKind::Token,
+				provider_kind: ProviderKindId::NONE,
+				byte_len: source.len() as u32,
+				children: Vec::new(),
+			}],
+		};
+
+		let error = match apply_graft_tracked(&registry, root, &green, source) {
+			Ok(_) => panic!("full registry must refuse the graft"),
+			Err(error) => error,
+		};
+		assert_eq!(
+			error,
+			GraftError::CapacityRefused {
+				required: 2,
+				remaining: 0,
+			}
+		);
+		assert_eq!(registry.get_first_child(root), Some(old_leaf));
+		assert_eq!(read_document(&registry, root), source);
+		assert_eq!(registry.stats(), before);
+		assert!(registry.drain_retired_forest_notices().is_empty());
+	}
+
 	/// A topology whose children do not cover their parent's extent is refused: the leaf
 	/// offsets it would distribute `virtual_data` at are meaningless.
 	#[test]
@@ -579,7 +670,7 @@ mod tests {
 				.collect(),
 		};
 		let registry = UastRegistry::new((ROWS * 2 + 16) as u32);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -590,6 +681,11 @@ mod tests {
 
 		let module =
 			apply_graft(&registry, root, &green, &source).expect("test graft is byte-identical");
+		assert_eq!(
+			registry.stats().allocated_nodes,
+			1 + graft_allocation_count(&green),
+			"reservation count must include every synthetic fan-out group"
+		);
 
 		assert!(
 			assert_bounded_fan_out(&registry, module) > TARGET_TREE_FANOUT,
@@ -634,8 +730,8 @@ mod tests {
 		};
 
 		let registry = UastRegistry::new(64);
-		let root = registry.alloc_node_internal();
-		let old_token = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
+		let old_token = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -715,7 +811,7 @@ mod tests {
 		};
 
 		let registry = UastRegistry::new(64);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -812,7 +908,7 @@ mod tests {
 		};
 
 		let registry = UastRegistry::new(64);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -903,7 +999,7 @@ mod tests {
 		};
 
 		let registry = UastRegistry::new(128);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -942,7 +1038,7 @@ mod tests {
 				.try_into()
 				.expect("test graft fits u32 registry capacity"),
 		);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {

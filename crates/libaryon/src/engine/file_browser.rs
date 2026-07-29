@@ -22,7 +22,7 @@ pub(crate) fn create_file_browser_buffer(
 	let visible_rows = build_visible_rows(&root_path, &expanded_dirs)?;
 	let mut chunk = registry
 		.reserve_chunk(2)
-		.ok_or_else(|| "Not enough document-node capacity for file browser".to_string())?;
+		.ok_or_else(|| registry.capacity_refusal_message("File browser creation", 2))?;
 	let root = chunk.spawn_node(
 		SemanticKind::RelationalTable,
 		None,
@@ -463,5 +463,21 @@ mod tests {
 		let text = render_rows(&rows);
 		assert_eq!(text, "▼ src/\n    main.rs");
 		assert_eq!(text.lines().count(), rows.len());
+	}
+
+	#[test]
+	fn file_browser_capacity_refusal_is_atomic_and_honest() {
+		let root = temp_dir("capacity");
+		std::fs::create_dir_all(&root).expect("create fixture directory");
+		let registry = UastRegistry::new(1);
+		let error = match create_file_browser_buffer(&registry, root.clone()) {
+			Ok(_) => panic!("browser root and leaf cannot fit"),
+			Err(error) => error,
+		};
+		assert!(error.contains("File browser creation refused"));
+		assert!(error.contains("UAST registry"));
+		assert!(error.contains("Restart"));
+		assert_eq!(registry.stats().allocated_nodes, 0);
+		let _ = std::fs::remove_dir_all(root);
 	}
 }

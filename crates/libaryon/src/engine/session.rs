@@ -565,9 +565,9 @@ pub(crate) struct TextBuffer {
 
 impl TextBuffer {
 	pub(crate) fn new_unnamed(registry: &UastRegistry) -> Result<(Self, NodeId), String> {
-		let mut chunk = registry.reserve_chunk(2).ok_or_else(|| {
-			"Not enough document-node capacity to create an empty document".to_string()
-		})?;
+		let mut chunk = registry
+			.reserve_chunk(2)
+			.ok_or_else(|| registry.capacity_refusal_message("Document creation", 2))?;
 		let root = chunk.spawn_node(
 			crate::uast::SemanticKind::RelationalTable,
 			None,
@@ -1804,6 +1804,9 @@ impl CommonViewState {
 
 pub(crate) struct UiState {
 	pub(crate) status_message: Option<String>,
+	/// ADR 0001 stage 4 warning; allocation is monotonic until stage 5, so
+	/// crossing the threshold can occur at most once per session.
+	pub(crate) capacity_warning_shown: bool,
 	/// One-shot `QueryDocumentText` reply, drained into the next viewport.
 	pub(crate) document_text_response: Option<String>,
 	/// Buffer that produced `document_text_response`.
@@ -1818,6 +1821,7 @@ pub(crate) struct UiState {
 pub(crate) enum StructuralIssueKind {
 	Unavailable,
 	Rejected,
+	CapacityRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4131,6 +4135,7 @@ impl EditorSession {
 			git_branch_cache: super::git::GitBranchCache::default(),
 			ui: UiState {
 				status_message: startup_status,
+				capacity_warning_shown: false,
 				document_text_response: None,
 				document_text_response_buffer_id: None,
 				busy: false,
@@ -6892,5 +6897,19 @@ mod tests {
 		state.set_active_visual(None);
 		assert!(matches!(state.mode, CursorMode::Points(_)));
 		assert_eq!(state.len(), 1);
+	}
+
+	#[test]
+	fn unnamed_document_refuses_capacity_with_an_honest_remedy() {
+		let registry = UastRegistry::new(1);
+		let error = match TextBuffer::new_unnamed(&registry) {
+			Ok(_) => panic!("two-node document cannot fit one remaining slot"),
+			Err(error) => error,
+		};
+		assert!(error.contains("Document creation refused"));
+		assert!(error.contains("UAST registry"));
+		assert!(error.contains("Restart"));
+		assert!(error.contains("closing buffers does not reclaim node IDs yet"));
+		assert_eq!(registry.stats().allocated_nodes, 0);
 	}
 }

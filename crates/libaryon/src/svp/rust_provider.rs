@@ -1584,7 +1584,7 @@ mod tests {
 		let green = build_rust_green_tree(std::str::from_utf8(source).unwrap());
 
 		let registry = UastRegistry::new(128);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {
@@ -1637,7 +1637,7 @@ mod tests {
 				.try_into()
 				.expect("test graft fits u32 registry capacity"),
 		);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {

@@ -1092,6 +1092,7 @@ mod tests {
 		let cursors_before = tab.cursor.snapshot();
 		let mut ui = UiState {
 			status_message: None,
+			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
 			busy: false,
@@ -1375,6 +1376,7 @@ mod tests {
 			);
 			let mut ui = UiState {
 				status_message: None,
+				capacity_warning_shown: false,
 				document_text_response: None,
 				document_text_response_buffer_id: None,
 				busy: false,
@@ -1419,6 +1421,7 @@ mod tests {
 		let mut tab = fixture.editor_mut();
 		let mut ui = UiState {
 			status_message: None,
+			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
 			busy: false,

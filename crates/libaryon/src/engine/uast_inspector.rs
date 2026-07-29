@@ -805,6 +805,8 @@ fn render_snapshot(
 		"reparse pending".to_string()
 	} else if issue.is_some_and(|issue| issue.kind == StructuralIssueKind::Rejected) {
 		"graft rejected".to_string()
+	} else if issue.is_some_and(|issue| issue.kind == StructuralIssueKind::CapacityRefused) {
+		"graft capacity-refused".to_string()
 	} else if issue.is_some_and(|issue| issue.kind == StructuralIssueKind::Unavailable) {
 		"provider topology unavailable".to_string()
 	} else if semantic_current {
@@ -853,7 +855,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} authoritative-payload={} B orphaned-payload={} B reclaimed={} B reclaim-heads={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={}/{} global-retired={} authoritative-payload={} B orphaned-payload={} B reclaimed={} B reclaim-heads={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -867,6 +869,7 @@ fn render_snapshot(
 			.map_or_else(|| "none".to_string(), |view| view.to_string()),
 		reachable,
 		snapshot.allocated_nodes,
+		snapshot.capacity,
 		snapshot.retired_nodes,
 		snapshot.authoritative_payload_bytes,
 		snapshot.orphaned_payload_bytes,
@@ -1445,6 +1448,7 @@ mod tests {
 			root,
 			total_bytes: 20,
 			allocated_nodes: 4,
+			capacity: 16,
 			retired_nodes: 7,
 			authoritative_payload_bytes: 20,
 			orphaned_payload_bytes: 10,
@@ -1553,7 +1557,7 @@ mod tests {
 		let text = String::from_utf8(rendered.text).expect("UTF-8 inspector");
 		assert!(text.contains("semantic: graft rejected"));
 		assert!(text.contains("pane=80x24 shown=4"));
-		assert!(text.contains("global-allocated=4 global-retired=7"));
+		assert!(text.contains("global-allocated=4/16 global-retired=7"));
 		let owner_line = text
 			.lines()
 			.find(|line| line.starts_with("owner-nodes:"))

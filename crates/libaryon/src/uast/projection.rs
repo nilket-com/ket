@@ -1828,7 +1828,7 @@ mod tests {
 			.and_then(|count| u32::try_from(count).ok())
 			.expect("test topology fits registry capacity");
 		let registry = UastRegistry::new(capacity);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {

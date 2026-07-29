@@ -46,7 +46,7 @@ fn synthetic_fold_does_not_materialize_inside_topology_group() {
 		}],
 	};
 	let registry = UastRegistry::new(16);
-	let root = registry.alloc_node_internal();
+	let root = registry.alloc_test_node();
 	unsafe {
 		*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 		*registry.metrics[root.index()].get() = SpanMetrics {
@@ -74,6 +74,37 @@ fn synthetic_fold_does_not_materialize_inside_topology_group() {
 		None
 	);
 	assert_eq!(registry.stats().allocated_nodes, allocated_before);
+}
+
+#[test]
+fn synthetic_fold_refuses_without_mutating_at_full_capacity() {
+	let source = "fn main() {\n\twork();\n}\n";
+	let (registry, root) = build_document(source);
+	let remaining = registry.remaining_node_capacity();
+	let filler = u32::try_from(remaining).expect("fixture capacity fits u32");
+	let _filler = registry
+		.reserve_chunk(filler)
+		.expect("fill registry exactly");
+	let before = registry.stats();
+	let child_before = registry.get_first_child(root);
+
+	assert_eq!(
+		materialize_fold_boundary_at_cursor(
+			&registry,
+			root,
+			DocLine::new(1),
+			DocDisplayCol::new(1),
+		),
+		None
+	);
+	assert_eq!(registry.stats(), before);
+	assert_eq!(registry.get_first_child(root), child_before);
+	assert_eq!(
+		registry
+			.read_loaded_slice(root, DocByte::ZERO, DocByte::new(source.len() as u64))
+			.expect("unchanged source"),
+		source.as_bytes()
+	);
 }
 
 #[test]
@@ -575,7 +606,7 @@ fn resolve_fold_boundary_prefers_narrower_projection_method_over_existing_impl_f
 #[test]
 fn materialize_fold_boundary_inside_multiline_macro_in_method_prefers_method() {
 	let (registry, root) = build_document(
-		"impl UastRegistry {\n    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
+		"impl UastRegistry {\n    fn alloc_test_node(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
 	);
 
 	let fold = materialize_fold_boundary_at_cursor(
@@ -594,14 +625,14 @@ fn materialize_fold_boundary_inside_multiline_macro_in_method_prefers_method() {
 
 	assert_eq!(
 		std::str::from_utf8(&folded_text).expect("folded utf8"),
-		"    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n",
+		"    fn alloc_test_node(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n",
 	);
 }
 
 #[test]
 fn materialize_fold_boundary_inside_if_in_method_prefers_method() {
 	let (registry, root) = build_document(
-		"impl UastRegistry {\n    fn alloc_node_internal(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
+		"impl UastRegistry {\n    fn alloc_test_node(&self) -> NodeId {\n        let id_val = self.next_id.fetch_add(1, Ordering::Relaxed);\n        assert!(\n            id_val <= self.capacity,\n            \"UastRegistry capacity exceeded during split\"\n        );\n        let node = NodeId::from_index(id_val as usize - 1);\n        node\n    }\n\n    fn reserve_chunk(&self, size: u32) -> Option<RegistryChunk<'_>> {\n        let start_id = self.next_id.fetch_add(size, Ordering::Relaxed);\n        if start_id + size > self.capacity + 1 {\n            return None;\n        }\n        Some(RegistryChunk::new(self, start_id, size))\n    }\n}\n",
 	);
 
 	let fold = materialize_fold_boundary_at_cursor(

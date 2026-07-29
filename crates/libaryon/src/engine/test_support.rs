@@ -53,7 +53,7 @@ pub(crate) fn build_grafted_rust_document(text: &str) -> (UastRegistry, crate::e
 		.try_into()
 		.expect("test graft fits u32 registry capacity");
 	let registry = UastRegistry::new(capacity);
-	let root = registry.alloc_node_internal();
+	let root = registry.alloc_test_node();
 	unsafe {
 		*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 		*registry.metrics[root.index()].get() = SpanMetrics {
@@ -124,7 +124,7 @@ pub(crate) fn build_grouped_semantic_document() -> (
 	assert_eq!(green.byte_len as usize, source.len());
 
 	let registry = UastRegistry::new(16);
-	let root = registry.alloc_node_internal();
+	let root = registry.alloc_test_node();
 	unsafe {
 		*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 		*registry.metrics[root.index()].get() = SpanMetrics {

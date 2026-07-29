@@ -964,9 +964,9 @@ fn create_document_from_bytes(
 		byte_length: bytes.len() as u64,
 		newlines: bytes.iter().filter(|byte| **byte == b'\n').count() as u64,
 	};
-	let mut chunk = registry.reserve_chunk(2).ok_or_else(|| {
-		"Not enough document-node capacity to create an empty document".to_string()
-	})?;
+	let mut chunk = registry
+		.reserve_chunk(2)
+		.ok_or_else(|| registry.capacity_refusal_message("Document creation", 2))?;
 	let rid = chunk.spawn_node(SemanticKind::RelationalTable, None, metrics);
 	let leaf = chunk.spawn_node(SemanticKind::Token, None, metrics);
 	chunk.append_local_child(rid, leaf);
@@ -2999,6 +2999,7 @@ mod tests {
 		let mut tab = fixture.editor_mut();
 		let mut ui = UiState {
 			status_message: None,
+			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
 			busy: false,
@@ -3100,6 +3101,7 @@ mod tests {
 		assert!(tab.document.ledger.is_dirty());
 		let mut ui = UiState {
 			status_message: None,
+			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
 			busy: false,

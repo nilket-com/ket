@@ -164,14 +164,14 @@ mod tests {
 	fn build_deep_tree() -> (UastRegistry, NodeId) {
 		let registry = UastRegistry::new(64);
 
-		let root = registry.alloc_node_internal();
-		let t1 = registry.alloc_node_internal();
-		let func = registry.alloc_node_internal();
-		let func_header = registry.alloc_node_internal();
-		let row = registry.alloc_node_internal();
-		let row_a = registry.alloc_node_internal();
-		let row_b = registry.alloc_node_internal();
-		let t2 = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
+		let t1 = registry.alloc_test_node();
+		let func = registry.alloc_test_node();
+		let func_header = registry.alloc_test_node();
+		let row = registry.alloc_test_node();
+		let row_a = registry.alloc_test_node();
+		let row_b = registry.alloc_test_node();
+		let t2 = registry.alloc_test_node();
 
 		unsafe {
 			// Root
@@ -332,12 +332,12 @@ mod tests {
 	#[test]
 	fn next_of_kind_skips_to_second_function() {
 		let registry = UastRegistry::new(64);
-		let root = registry.alloc_node_internal();
-		let func1 = registry.alloc_node_internal();
-		let f1_tok = registry.alloc_node_internal();
-		let gap = registry.alloc_node_internal();
-		let func2 = registry.alloc_node_internal();
-		let f2_tok = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
+		let func1 = registry.alloc_test_node();
+		let f1_tok = registry.alloc_test_node();
+		let gap = registry.alloc_test_node();
+		let func2 = registry.alloc_test_node();
+		let f2_tok = registry.alloc_test_node();
 
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;

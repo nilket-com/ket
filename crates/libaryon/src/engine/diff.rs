@@ -1431,7 +1431,7 @@ mod tests {
 	}
 
 	fn graft_diff_side(registry: &UastRegistry, source: &[u8]) -> NodeId {
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root.index()].get() = SpanMetrics {

@@ -388,7 +388,7 @@ fn graft_recursive(
 		0 // Branch nodes: newlines aggregated from children
 	};
 
-	let id = registry.alloc_node_internal();
+	let id = registry.alloc_test_node();
 	let idx = id.index();
 
 	unsafe {
@@ -710,8 +710,8 @@ mod tests {
 
 		// Create a minimal registry with a single unparsed text node
 		let registry = UastRegistry::new(256);
-		let root_id = registry.alloc_node_internal();
-		let target_id = registry.alloc_node_internal();
+		let root_id = registry.alloc_test_node();
+		let target_id = registry.alloc_test_node();
 
 		// Set up root -> target as a simple parent-child
 		unsafe {
@@ -782,7 +782,7 @@ mod tests {
 		let green = build_green_tree(&parsed, source.len() as u32);
 
 		let registry = UastRegistry::new(64);
-		let target_id = registry.alloc_node_internal();
+		let target_id = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[target_id.index()].get() = SemanticKind::Token;
 			*registry.metrics[target_id.index()].get() = SpanMetrics {
@@ -822,8 +822,8 @@ mod tests {
 		let green = build_green_tree(&parsed, source.len() as u32);
 
 		let registry = UastRegistry::new(256);
-		let root_id = registry.alloc_node_internal();
-		let target_id = registry.alloc_node_internal();
+		let root_id = registry.alloc_test_node();
+		let target_id = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root_id.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root_id.index()].get() = SpanMetrics {

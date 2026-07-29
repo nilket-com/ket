@@ -1,8 +1,10 @@
+use crate::ecs::chunk::RegistryChunk;
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::pointer::SvpPointer;
 use crate::svp::resolver::{DMA_CHUNK_SIZE, RESOLVER_TRANSFER_SIZE};
 use crate::uast::UastProjection;
 use crate::uast::kind::SemanticKind;
+use crate::uast::metrics::SpanMetrics;
 use std::sync::atomic::Ordering;
 
 pub trait UastMutation {
@@ -21,12 +23,59 @@ pub trait UastMutation {
 		offset_in_node: u32,
 		max_bytes: u32,
 	) -> (NodeId, u32, u32);
-	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId;
-	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId;
+	fn split_node_pvp(
+		&self,
+		target: NodeId,
+		offset: u32,
+		new_text: &[u8],
+	) -> Result<NodeId, MutationCapacityError>;
+	fn split_node_pvp_delete(
+		&self,
+		target: NodeId,
+		offset: u32,
+		delete_len: u32,
+	) -> Result<NodeId, MutationCapacityError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationCapacityError {
+	pub required: u64,
+	pub remaining: u64,
+}
+
+impl std::fmt::Display for MutationCapacityError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"UAST registry node capacity exhausted: edit needs {} nodes but only {} \
+			 remain; restart the editor (closing buffers does not reclaim node IDs yet)",
+			self.required, self.remaining
+		)
+	}
+}
+
+fn physical_tail_node_count(total_len: u32) -> u32 {
+	total_len.div_ceil(DMA_CHUNK_SIZE as u32)
+}
+
+fn reserve_split_nodes(
+	registry: &UastRegistry,
+	tail_len: u32,
+) -> Result<RegistryChunk<'_>, MutationCapacityError> {
+	let required = 1u32
+		.checked_add(physical_tail_node_count(tail_len))
+		.expect("physical split node count fits u32");
+	registry
+		.reserve_chunk(required)
+		.ok_or_else(|| MutationCapacityError {
+			required: u64::from(required),
+			remaining: registry.remaining_node_capacity(),
+		})
 }
 
 fn spawn_physical_tail_chain(
 	registry: &UastRegistry,
+	chunk: &mut RegistryChunk<'_>,
 	parent: NodeId,
 	start_offset: u64,
 	total_len: u32,
@@ -45,7 +94,14 @@ fn spawn_physical_tail_chain(
 	while offset_in_tail < total_len {
 		let chunk_len = (total_len - offset_in_tail).min(DMA_CHUNK_SIZE as u32);
 		let chunk_start = start_offset + u64::from(offset_in_tail);
-		let node = registry.alloc_node_internal();
+		let node = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: u64::from(chunk_len),
+				newlines: 0,
+			},
+		);
 		let idx = node.index();
 
 		let mut chunk_newlines = 0u32;
@@ -304,12 +360,11 @@ impl UastMutation for UastRegistry {
 		let added_newlines = i64::try_from(new_text.iter().filter(|&&b| b == b'\n').count())
 			.expect("insert newline count fits i64");
 
-		self.apply_edit(target, added_bytes, added_newlines);
-
 		let idx = target.index();
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
+			self.apply_edit(target, added_bytes, added_newlines);
 			self.bump_content_generation(target);
 			self.mutate_authoritative_data(target, |v_data| {
 				v_data.splice(
@@ -321,19 +376,22 @@ impl UastMutation for UastRegistry {
 			self.refresh_installed_root_child_line_index_for_node(target);
 			(target, offset_in_node + new_text.len() as u32)
 		} else {
-			self.bump_content_generation(target);
 			let promoted_in_place = {
 				let _resident_read = self.resident_data_guard();
 				unsafe {
-					(&*self.virtual_data[idx].get()).as_ref().is_some_and(|v_data| {
-						v_data
-							.len()
-							.checked_add(new_text.len())
-							.is_some_and(|new_len| new_len <= RESOLVER_TRANSFER_SIZE)
-					})
+					(&*self.virtual_data[idx].get())
+						.as_ref()
+						.is_some_and(|v_data| {
+							v_data
+								.len()
+								.checked_add(new_text.len())
+								.is_some_and(|new_len| new_len <= RESOLVER_TRANSFER_SIZE)
+						})
 				}
 			};
 			if promoted_in_place {
+				self.apply_edit(target, added_bytes, added_newlines);
+				self.bump_content_generation(target);
 				self.promote_hydrated_data(target);
 				self.mutate_authoritative_data(target, |v_data| {
 					v_data.splice(
@@ -347,13 +405,46 @@ impl UastMutation for UastRegistry {
 				return (target, offset_in_node + new_text.len() as u32);
 			}
 
-			let v_id = self.split_node_pvp(target, offset_in_node, new_text);
-			(v_id, new_text.len() as u32)
+			match self.split_node_pvp(target, offset_in_node, new_text) {
+				Ok(v_id) => (v_id, new_text.len() as u32),
+				Err(_) => {
+					// Capacity survival path: preflight has made this physical
+					// leaf resident, so it can become one authoritative leaf
+					// without allocating a split topology.
+					let resident = {
+						let _resident_read = self.resident_data_guard();
+						unsafe { (&*self.virtual_data[idx].get()).clone() }
+					}
+					.or_else(|| self.read_node_bytes_sync(target).ok());
+					let Some(mut resident) = resident else {
+						return (target, offset_in_node);
+					};
+					self.apply_edit(target, added_bytes, added_newlines);
+					self.bump_content_generation(target);
+					if unsafe { (*self.spans[idx].get()).is_some() } {
+						self.publish_hydrated_data(target, resident.clone());
+						self.promote_hydrated_data(target);
+					}
+					resident.splice(
+						offset_in_node as usize..offset_in_node as usize,
+						new_text.iter().copied(),
+					);
+					self.replace_authoritative_data(target, resident);
+					self.metrics_inflated[idx].store(true, Ordering::Relaxed);
+					self.refresh_terminal_newline_from_resident(target);
+					self.refresh_installed_root_child_line_index_for_node(target);
+					(target, offset_in_node + new_text.len() as u32)
+				}
+			}
 		}
 	}
 
-	fn split_node_pvp(&self, target: NodeId, offset: u32, new_text: &[u8]) -> NodeId {
-		self.bump_content_generation(target);
+	fn split_node_pvp(
+		&self,
+		target: NodeId,
+		offset: u32,
+		new_text: &[u8],
+	) -> Result<NodeId, MutationCapacityError> {
 		let target_idx = target.index();
 
 		let (parent, old_next_sibling, old_svp, old_metrics) = unsafe {
@@ -363,6 +454,9 @@ impl UastMutation for UastRegistry {
 			(e.parent, e.next_sibling, s, m)
 		};
 		let parent = parent.expect("Cannot split a root node");
+		let p2_len = old_svp.byte_length.saturating_sub(offset);
+		let mut chunk = reserve_split_nodes(self, p2_len)?;
+		self.bump_content_generation(target);
 
 		// 1. Subtract original metrics from parent chain
 		self.apply_edit(
@@ -371,7 +465,7 @@ impl UastMutation for UastRegistry {
 			-i64::try_from(old_metrics.newlines).expect("leaf newline count fits i64"),
 		);
 
-		let v_id = self.alloc_node_internal();
+		let v_id = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		let v_idx = v_id.index();
 
 		let p1_len = offset;
@@ -436,11 +530,11 @@ impl UastMutation for UastRegistry {
 		self.apply_edit(parent, i64::from(v_len), i64::from(v_newlines));
 
 		// 4. Create tail chain (p2)
-		let p2_len = old_svp.byte_length.saturating_sub(offset);
 		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
 		let split_offset = base_offset + u64::from(offset);
 		let tail_chain = spawn_physical_tail_chain(
 			self,
+			&mut chunk,
 			parent,
 			split_offset,
 			p2_len,
@@ -464,7 +558,12 @@ impl UastMutation for UastRegistry {
 		}
 
 		self.refresh_installed_root_child_line_index_for_node(target);
-		v_id
+		assert_eq!(
+			chunk.remaining(),
+			0,
+			"physical insertion split must consume its exact reservation"
+		);
+		Ok(v_id)
 	}
 
 	fn delete_backwards(&self, target: NodeId, offset_in_node: u32) -> (NodeId, u32) {
@@ -494,12 +593,12 @@ impl UastMutation for UastRegistry {
 			return (target, 0);
 		}
 		prepare_leaf_metrics_for_mutation(self, target);
-		self.bump_content_generation(target);
 
 		let idx = target.index();
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
+			self.bump_content_generation(target);
 			let (bytes_to_remove, removed_newlines) =
 				self.mutate_authoritative_data(target, |v_data| {
 					let mut start = offset_in_node as usize - 1;
@@ -536,8 +635,11 @@ impl UastMutation for UastRegistry {
 			let mut data = self.read_node_bytes_sync(target).unwrap_or_default();
 			if data.is_empty() {
 				let delete_start = offset_in_node.saturating_sub(1);
-				let tombstone = self.split_node_pvp_delete(target, delete_start, 1);
-				return (tombstone, delete_start);
+				return self
+					.split_node_pvp_delete(target, delete_start, 1)
+					.map_or((target, offset_in_node), |tombstone| {
+						(tombstone, delete_start)
+					});
 			}
 
 			let mut start = offset_in_node as usize - 1;
@@ -551,6 +653,7 @@ impl UastMutation for UastRegistry {
 				.count() as i32;
 			data.drain(start..offset_in_node as usize);
 
+			self.bump_content_generation(target);
 			self.promote_hydrated_data(target);
 			self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 			let ends_with_newline = data.last() == Some(&b'\n');
@@ -618,7 +721,6 @@ impl UastMutation for UastRegistry {
 		}
 
 		prepare_leaf_metrics_for_mutation(self, target);
-		self.bump_content_generation(target);
 
 		let delete_len = offset_in_node.min(max_bytes);
 		let delete_start = offset_in_node - delete_len;
@@ -626,6 +728,7 @@ impl UastMutation for UastRegistry {
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
+			self.bump_content_generation(target);
 			let removed_newlines = self.mutate_authoritative_data(target, |v_data| {
 					let range = delete_start as usize..offset_in_node as usize;
 					let removed = v_data[range.clone()]
@@ -657,8 +760,11 @@ impl UastMutation for UastRegistry {
 		// endpoints never inherit `delete_backwards`' UTF-8-width grouping.
 		let mut data = self.read_node_bytes_sync(target).unwrap_or_default();
 		if data.is_empty() {
-			let tombstone = self.split_node_pvp_delete(target, delete_start, delete_len);
-			return (tombstone, delete_start, delete_len);
+			return self
+				.split_node_pvp_delete(target, delete_start, delete_len)
+				.map_or((target, offset_in_node, 0), |tombstone| {
+					(tombstone, delete_start, delete_len)
+				});
 		}
 		assert!(
 			offset_in_node as usize <= data.len(),
@@ -671,6 +777,7 @@ impl UastMutation for UastRegistry {
 			.count();
 		data.drain(range);
 
+		self.bump_content_generation(target);
 		self.promote_hydrated_data(target);
 		self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 		let ends_with_newline = data.last() == Some(&b'\n');
@@ -715,7 +822,6 @@ impl UastMutation for UastRegistry {
 		}
 
 		prepare_leaf_metrics_for_mutation(self, target);
-		self.bump_content_generation(target);
 		let delete_len = max_bytes.min(node_len - offset_in_node);
 		let delete_end = offset_in_node + delete_len;
 		let deleted_to_end = delete_end == node_len;
@@ -726,6 +832,7 @@ impl UastMutation for UastRegistry {
 		let is_virtual = unsafe { (*self.spans[idx].get()).is_none() };
 
 		if is_virtual {
+			self.bump_content_generation(target);
 			let removed_newlines = self.mutate_authoritative_data(target, |data| {
 					let range = offset_in_node as usize..delete_end as usize;
 					let removed = data[range.clone()]
@@ -760,7 +867,10 @@ impl UastMutation for UastRegistry {
 
 		let mut data = self.read_node_bytes_sync(target).unwrap_or_default();
 		if data.is_empty() {
-			let tombstone = self.split_node_pvp_delete(target, offset_in_node, delete_len);
+			let Ok(tombstone) = self.split_node_pvp_delete(target, offset_in_node, delete_len)
+			else {
+				return (target, offset_in_node, 0);
+			};
 			return (tombstone, offset_in_node, delete_len);
 		}
 		assert!(
@@ -773,6 +883,7 @@ impl UastMutation for UastRegistry {
 			.filter(|&&byte| byte == b'\n')
 			.count();
 		data.drain(range);
+		self.bump_content_generation(target);
 		self.promote_hydrated_data(target);
 		self.metrics_inflated[idx].store(true, Ordering::Relaxed);
 		let ends_with_newline = data.last() == Some(&b'\n');
@@ -797,8 +908,12 @@ impl UastMutation for UastRegistry {
 		})
 	}
 
-	fn split_node_pvp_delete(&self, target: NodeId, offset: u32, delete_len: u32) -> NodeId {
-		self.bump_content_generation(target);
+	fn split_node_pvp_delete(
+		&self,
+		target: NodeId,
+		offset: u32,
+		delete_len: u32,
+	) -> Result<NodeId, MutationCapacityError> {
 		let target_idx = target.index();
 
 		let (parent, old_next_sibling, old_svp, old_metrics) = unsafe {
@@ -808,6 +923,11 @@ impl UastMutation for UastRegistry {
 			(e.parent, e.next_sibling, s, m)
 		};
 		let parent = parent.expect("Cannot split a root node");
+		let p2_len = old_svp
+			.byte_length
+			.saturating_sub(offset.saturating_add(delete_len));
+		let mut chunk = reserve_split_nodes(self, p2_len)?;
+		self.bump_content_generation(target);
 
 		// 1. Subtract original metrics from parent chain
 		self.apply_edit(
@@ -816,7 +936,7 @@ impl UastMutation for UastRegistry {
 			-i64::try_from(old_metrics.newlines).expect("leaf newline count fits i64"),
 		);
 
-		let v_id = self.alloc_node_internal();
+		let v_id = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		let v_idx = v_id.index();
 
 		let mut resolved_data = self.take_hydrated_data(target);
@@ -874,11 +994,11 @@ impl UastMutation for UastRegistry {
 		self.set_terminal_newline(v_id, false);
 
 		// 4. Create tail chain (p2, starting after the deleted byte)
-		let p2_len = old_svp.byte_length.saturating_sub(offset + delete_len);
 		let base_offset = old_svp.lba * 512 + u64::from(old_svp.head_trim);
-		let split_offset = base_offset + u64::from(offset + delete_len);
+		let split_offset = base_offset + u64::from(offset.saturating_add(delete_len));
 		let tail_chain = spawn_physical_tail_chain(
 			self,
+			&mut chunk,
 			parent,
 			split_offset,
 			p2_len,
@@ -904,7 +1024,12 @@ impl UastMutation for UastRegistry {
 		}
 
 		self.refresh_installed_root_child_line_index_for_node(target);
-		v_id
+		assert_eq!(
+			chunk.remaining(),
+			0,
+			"physical delete split must consume its exact reservation"
+		);
+		Ok(v_id)
 	}
 }
 
@@ -913,7 +1038,7 @@ mod tests {
 	use super::UastMutation;
 	use crate::ecs::UastRegistry;
 	use crate::svp::pointer::SvpPointer;
-	use crate::svp::resolver::DMA_CHUNK_SIZE;
+	use crate::svp::resolver::{DMA_CHUNK_SIZE, RESOLVER_TRANSFER_SIZE};
 	use crate::uast::UastProjection;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
@@ -1013,7 +1138,9 @@ mod tests {
 		};
 		let leaf = build_physical_leaf(&registry, span);
 
-		let inserted = registry.split_node_pvp(leaf, 9_000, b"hi");
+		let inserted = registry
+			.split_node_pvp(leaf, 9_000, b"hi")
+			.expect("split capacity");
 		let tail = registry
 			.get_next_sibling(inserted)
 			.expect("tail span should exist");
@@ -1049,7 +1176,9 @@ mod tests {
 			.root_child_line_index_full_builds
 			.load(Ordering::Acquire);
 
-		let inserted = registry.split_node_pvp(leaf, 4, b"X");
+		let inserted = registry
+			.split_node_pvp(leaf, 4, b"X")
+			.expect("split capacity");
 
 		assert_eq!(
 			registry
@@ -1093,7 +1222,9 @@ mod tests {
 		};
 		let leaf = build_physical_leaf(&registry, span);
 
-		let tombstone = registry.split_node_pvp_delete(leaf, 8_000, 3);
+		let tombstone = registry
+			.split_node_pvp_delete(leaf, 8_000, 3)
+			.expect("split capacity");
 		let tail = registry
 			.get_next_sibling(tombstone)
 			.expect("tail span should exist");
@@ -1102,6 +1233,86 @@ mod tests {
 		let expected_offset = span.lba * 512 + u64::from(span.head_trim) + 8_003;
 		assert_eq!(tail_span.lba, expected_offset / 512);
 		assert_eq!(u64::from(tail_span.head_trim), expected_offset % 512);
+	}
+
+	#[test]
+	fn full_capacity_split_refuses_atomically_and_insert_promotes_in_place() {
+		let len = RESOLVER_TRANSFER_SIZE + 1;
+		let registry = UastRegistry::new(2);
+		let leaf = build_physical_leaf(
+			&registry,
+			SvpPointer {
+				lba: 0,
+				byte_length: len as u32,
+				device_id: 1,
+				head_trim: 0,
+			},
+		);
+		let root = parent_of(&registry, leaf);
+		let bytes = vec![b'a'; len];
+		registry.publish_hydrated_data(leaf, bytes.clone());
+		registry.metrics_inflated[leaf.index()].store(true, Ordering::Release);
+		let before = registry.stats();
+		let before_span = unsafe { *registry.spans[leaf.index()].get() };
+		let before_metrics = unsafe { *registry.metrics[leaf.index()].get() };
+		let before_generation = registry.content_generation(leaf);
+
+		let error = registry
+			.split_node_pvp(leaf, 1, b"x")
+			.expect_err("full registry must refuse a low-level split");
+		assert!(error.required >= 2);
+		assert_eq!(error.remaining, 0);
+		assert_eq!(registry.stats(), before);
+		let after_span = unsafe { *registry.spans[leaf.index()].get() };
+		assert_eq!(
+			after_span.map(|span| (span.lba, span.byte_length, span.device_id, span.head_trim)),
+			before_span.map(|span| (span.lba, span.byte_length, span.device_id, span.head_trim))
+		);
+		let after_metrics = unsafe { *registry.metrics[leaf.index()].get() };
+		assert_eq!(after_metrics.byte_length, before_metrics.byte_length);
+		assert_eq!(after_metrics.newlines, before_metrics.newlines);
+		assert_eq!(registry.content_generation(leaf), before_generation);
+		assert_eq!(registry.get_first_child(root), Some(leaf));
+
+		let (target, offset) = registry.insert_text(leaf, 1, b"x");
+		assert_eq!((target, offset), (leaf, 2));
+		assert_eq!(registry.stats().allocated_nodes, before.allocated_nodes);
+		assert!(unsafe { (*registry.spans[leaf.index()].get()).is_none() });
+		let result = registry.read_node_bytes_sync(leaf).expect("promoted bytes");
+		assert_eq!(result.len(), len + 1);
+		assert_eq!(&result[..3], b"axa");
+		assert_eq!(registry.get_total_bytes(root), (len + 1) as u64);
+	}
+
+	#[test]
+	fn virtual_edits_remain_allocation_free_at_capacity() {
+		let registry = UastRegistry::new(2);
+		let mut chunk = registry.reserve_chunk(2).expect("fill registry");
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length: 2,
+				newlines: 0,
+			},
+		);
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 2,
+				newlines: 0,
+			},
+		);
+		chunk.append_local_child(root, leaf);
+		registry.replace_authoritative_data(leaf, b"ab".to_vec());
+		let allocated = registry.stats().allocated_nodes;
+
+		assert_eq!(registry.insert_text(leaf, 1, b"x"), (leaf, 2));
+		assert_eq!(registry.delete_backwards(leaf, 2), (leaf, 1));
+		assert_eq!(registry.read_node_bytes_sync(leaf).unwrap(), b"ab");
+		assert_eq!(registry.stats().allocated_nodes, allocated);
+		assert_eq!(registry.get_total_bytes(root), 2);
 	}
 
 	#[test]

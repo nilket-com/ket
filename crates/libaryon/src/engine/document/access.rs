@@ -1301,7 +1301,7 @@ mod tests {
 	#[test]
 	fn oversized_read_and_snapshot_fail_from_metrics_before_traversal() {
 		let registry = UastRegistry::new(1);
-		let root = registry.alloc_node_internal();
+		let root = registry.alloc_test_node();
 		unsafe {
 			(*registry.metrics[root.index()].get()).byte_length = 200 * 1024 * 1024 * 1024;
 		}

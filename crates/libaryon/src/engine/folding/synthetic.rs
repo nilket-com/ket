@@ -434,6 +434,19 @@ fn materialize_synthetic_fold_plan(
 		return None;
 	}
 
+	let prefix_needed = usize::from(start_offset > 0);
+	let suffix_needed = usize::from(end_offset < end_slice.bytes.len());
+	let selected_copy_needed = if start_slice.node == end_slice.node {
+		usize::from(start_offset != 0 || end_offset != start_slice.bytes.len())
+	} else {
+		usize::from(start_offset != 0) + usize::from(end_offset != end_slice.bytes.len())
+	};
+	let required = 1usize
+		.checked_add(prefix_needed)?
+		.checked_add(suffix_needed)?
+		.checked_add(selected_copy_needed)?;
+	let mut chunk = registry.reserve_chunk(u32::try_from(required).ok()?)?;
+
 	let prev = registry.get_prev_sibling(start_slice.node);
 	let next = registry.get_next_sibling(end_slice.node);
 	let old_was_tail =
@@ -456,14 +469,14 @@ fn materialize_synthetic_fold_plan(
 			.checked_add(registry.authoritative_payload_len(*node))
 			.expect("synthetic-fold retired payload overflow")
 	});
-	let fold_node = registry.alloc_node_internal();
+	let fold_node = chunk.spawn_node(SemanticKind::RelationalRow, None, SpanMetrics::default());
 	let prefix = &start_slice.bytes[..start_offset];
 	let suffix = &end_slice.bytes[end_offset..];
 
 	let prefix_node = if prefix.is_empty() {
 		None
 	} else {
-		let node = registry.alloc_node_internal();
+		let node = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		init_virtual_token_node(registry, node, parent, Some(fold_node), prefix);
 		Some(node)
 	};
@@ -471,7 +484,7 @@ fn materialize_synthetic_fold_plan(
 	let suffix_node = if suffix.is_empty() {
 		None
 	} else {
-		let node = registry.alloc_node_internal();
+		let node = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		init_virtual_token_node(registry, node, parent, next, suffix);
 		Some(node)
 	};
@@ -501,7 +514,7 @@ fn materialize_synthetic_fold_plan(
 		if start_offset == 0 && end_offset == start_slice.bytes.len() {
 			append_child(start_slice.node);
 		} else {
-			let node = registry.alloc_node_internal();
+			let node = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 			init_virtual_token_node(registry, node, fold_node, None, selected);
 			append_child(node);
 		}
@@ -510,7 +523,7 @@ fn materialize_synthetic_fold_plan(
 		if start_offset == 0 {
 			append_child(start_slice.node);
 		} else {
-			let node = registry.alloc_node_internal();
+			let node = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 			init_virtual_token_node(
 				registry,
 				node,
@@ -532,7 +545,7 @@ fn materialize_synthetic_fold_plan(
 		if end_offset == end_slice.bytes.len() {
 			append_child(end_slice.node);
 		} else {
-			let node = registry.alloc_node_internal();
+			let node = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 			init_virtual_token_node(
 				registry,
 				node,
@@ -545,6 +558,11 @@ fn materialize_synthetic_fold_plan(
 	}
 
 	let first_fold_child = first_fold_child?;
+	assert_eq!(
+		chunk.remaining(),
+		0,
+		"synthetic fold must consume its exact node reservation"
+	);
 	init_fold_boundary_node(
 		registry,
 		fold_node,

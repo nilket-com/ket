@@ -421,7 +421,7 @@ fn graft_recursive(
 		0
 	};
 
-	let id = registry.alloc_node_internal();
+	let id = registry.alloc_test_node();
 	let idx = id.index();
 
 	unsafe {
@@ -713,8 +713,8 @@ mod tests {
 
 	fn setup_registry(source_len: u32) -> (UastRegistry, NodeId, NodeId) {
 		let registry = UastRegistry::new(256);
-		let root_id = registry.alloc_node_internal();
-		let target_id = registry.alloc_node_internal();
+		let root_id = registry.alloc_test_node();
+		let target_id = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root_id.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root_id.index()].get() = SpanMetrics {
@@ -860,7 +860,7 @@ mod tests {
 		let source = b"fn main() {}\n";
 		let green = build_green_tree(std::str::from_utf8(source).unwrap(), source.len() as u32);
 		let registry = UastRegistry::new(64);
-		let target_id = registry.alloc_node_internal();
+		let target_id = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[target_id.index()].get() = SemanticKind::Token;
 			*registry.metrics[target_id.index()].get() = SpanMetrics {
@@ -895,8 +895,8 @@ mod tests {
 		let green = build_green_tree(std::str::from_utf8(source).unwrap(), source.len() as u32);
 
 		let registry = UastRegistry::new(256);
-		let root_id = registry.alloc_node_internal();
-		let target_id = registry.alloc_node_internal();
+		let root_id = registry.alloc_test_node();
+		let target_id = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root_id.index()].get() = SemanticKind::RelationalTable;
 			*registry.metrics[root_id.index()].get() = SpanMetrics {

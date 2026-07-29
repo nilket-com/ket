@@ -97,12 +97,20 @@ fn apply_semantic_response(
 		// A graft that would not reproduce the document's bytes is refused, and the
 		// document keeps the tree it has. The highlights above still stand: they are
 		// offsets into unchanged bytes.
-		let Ok(graft) = apply_graft_tracked(registry, rid, &green, &source_bytes) else {
-			document.semantic.structural_issue = Some(StructuralIssue {
-				state_id,
-				kind: StructuralIssueKind::Rejected,
-			});
-			return false;
+		let graft = match apply_graft_tracked(registry, rid, &green, &source_bytes) {
+			Ok(graft) => graft,
+			Err(error) => {
+				let kind = if matches!(
+					error,
+					crate::engine::structural_graft::GraftError::CapacityRefused { .. }
+				) {
+					StructuralIssueKind::CapacityRefused
+				} else {
+					StructuralIssueKind::Rejected
+				};
+				document.semantic.structural_issue = Some(StructuralIssue { state_id, kind });
+				return false;
+			}
 		};
 		registry.retire_orphaned_forest(
 			graft.retired_heads,
@@ -606,6 +614,47 @@ mod tests {
 				})
 			);
 		}
+	}
+
+	#[test]
+	fn capacity_refused_semantic_graft_keeps_last_applied_state_and_topology() {
+		let registry = Arc::new(UastRegistry::new(4));
+		let (root, leaf) = append_virtual_document(&registry, "alpha");
+		let mut doctab = test_editor(&registry, root, leaf, "src/full.rs");
+		let state = doctab.editor_mut().document.ledger.current_state_id;
+		{
+			let mut editor = doctab.editor_mut();
+			editor.document.semantic.applied_structural_state_id = Some(state);
+			editor.document.semantic.pending_semantic_request_id = Some(RequestId::new(503));
+			assert!(!apply_semantic_response(
+				&registry,
+				BufferId::new(1),
+				&mut editor,
+				SemanticResponse {
+					buffer_id: BufferId::new(1),
+					state_id: state,
+					request_id: RequestId::new(503),
+					highlights: Vec::new(),
+					diagnostics: Vec::new(),
+					inline_annotations: Vec::new(),
+					structural_topology: Some((flat_green_node("alpha"), b"alpha".to_vec())),
+				},
+			));
+			assert_eq!(
+				editor.document.semantic.applied_structural_state_id,
+				Some(state)
+			);
+			assert_eq!(
+				editor.document.semantic.structural_issue,
+				Some(StructuralIssue {
+					state_id: state,
+					kind: StructuralIssueKind::CapacityRefused,
+				})
+			);
+			assert_eq!(editor.document.topology_rev, crate::core::TopologyRev::ZERO);
+		}
+		assert_eq!(registry.get_first_child(root), Some(leaf));
+		assert!(registry.drain_retired_forest_notices().is_empty());
 	}
 
 	#[test]

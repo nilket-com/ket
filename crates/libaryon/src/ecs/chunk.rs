@@ -27,6 +27,10 @@ impl<'a> RegistryChunk<'a> {
 		}
 	}
 
+	pub(crate) fn remaining(&self) -> u32 {
+		self.len - self.offset
+	}
+
 	/// $O(1)$ lock-free entity allocation within the thread's reserved chunk.
 	pub fn spawn_node(
 		&mut self,

@@ -149,6 +149,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		lang_registry,
 		session,
 	} = params;
+	warn_at_registry_capacity(registry, session);
 	for root in registry.drain_metric_inflations() {
 		crate::svp::ingest::persist_line_index(registry, root);
 	}
@@ -373,6 +374,38 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	registry.enforce_resident_budget(None);
 
 	should_quit
+}
+
+const REGISTRY_CAPACITY_WARNING_PERCENT: u64 = 90;
+
+fn warn_at_registry_capacity(registry: &UastRegistry, session: &mut EditorSession) {
+	let stats = registry.stats();
+	if let Some(message) = take_capacity_warning(stats, &mut session.ui.capacity_warning_shown) {
+		session.ui.status_message = Some(message);
+	}
+}
+
+fn take_capacity_warning(
+	stats: crate::ecs::registry::RegistryStatsSnapshot,
+	already_shown: &mut bool,
+) -> Option<String> {
+	if *already_shown
+		|| stats.capacity == 0
+		|| stats.allocated_nodes.saturating_mul(100)
+			< stats
+				.capacity
+				.saturating_mul(REGISTRY_CAPACITY_WARNING_PERCENT)
+	{
+		return None;
+	}
+	*already_shown = true;
+	Some(format!(
+		"UAST registry node capacity is {}% full ({}/{}); restart the editor before \
+		 exhaustion (closing buffers does not reclaim node IDs yet)",
+		stats.allocated_nodes.saturating_mul(100) / stats.capacity,
+		stats.allocated_nodes,
+		stats.capacity
+	))
 }
 
 /// Widen a divider's grab area beyond its painted size. A 1-row horizontal
@@ -1571,7 +1604,9 @@ pub(crate) fn merge_highlights(
 
 #[cfg(test)]
 mod tests {
-	use super::{merge_highlights, project_gutter_line_numbers, viewport_is_busy};
+	use super::{
+		merge_highlights, project_gutter_line_numbers, take_capacity_warning, viewport_is_busy,
+	};
 	use crate::core::{DocByte, DocLine};
 	use crate::engine::GutterNumbering;
 	use crate::engine::folding::FoldSet;
@@ -1584,6 +1619,29 @@ mod tests {
 			.find(|entry| entry.line == DocLine::new(line))
 			.expect("line should have a projected gutter number")
 			.number
+	}
+
+	#[test]
+	fn registry_capacity_warning_crosses_at_ninety_percent_once() {
+		let mut shown = false;
+		let below = crate::ecs::registry::RegistryStatsSnapshot {
+			allocated_nodes: 89,
+			capacity: 100,
+			..Default::default()
+		};
+		assert_eq!(take_capacity_warning(below, &mut shown), None);
+		assert!(!shown);
+
+		let threshold = crate::ecs::registry::RegistryStatsSnapshot {
+			allocated_nodes: 90,
+			capacity: 100,
+			..Default::default()
+		};
+		let message = take_capacity_warning(threshold, &mut shown).expect("threshold warning");
+		assert!(message.contains("UAST registry"));
+		assert!(message.contains("restart"));
+		assert!(message.contains("closing buffers does not reclaim node IDs yet"));
+		assert_eq!(take_capacity_warning(threshold, &mut shown), None);
 	}
 
 	#[test]
