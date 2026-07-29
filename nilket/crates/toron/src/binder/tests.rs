@@ -26439,3 +26439,167 @@ fn adr512_left_semi_swaps_toward_smaller_filtered_membership_side() {
 	.expect("choose join strategy");
 	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
 }
+
+fn adr515_membership_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	for (id, table, pk, fields) in [
+		(
+			85u8,
+			"cst",
+			"c_ckey",
+			vec![("c_ckey", DataType::Int64), ("c_name", DataType::Utf8)],
+		),
+		(
+			86,
+			"ord",
+			"o_okey",
+			vec![
+				("o_okey", DataType::Int64),
+				("o_ckey", DataType::Int64),
+				("o_total", DataType::Float64),
+			],
+		),
+		(
+			87,
+			"itm",
+			"l_okey",
+			vec![("l_okey", DataType::Int64), ("l_qty", DataType::Float64)],
+		),
+	] {
+		let schema = Schema::new(
+			fields
+				.into_iter()
+				.map(|(name, ty)| Field::new(name, ty, false))
+				.collect::<Vec<_>>(),
+		);
+		catalog
+			.register_descriptor(TableId(id.into()), adr511_descriptor(id, table, pk, schema))
+			.expect("register");
+	}
+	seed_byte_upper_bound(&mut catalog, "itm", 5_758_680_840);
+	seed_byte_upper_bound(&mut catalog, "ord", 1_700_000_000);
+	seed_byte_upper_bound(&mut catalog, "cst", 240_000_000);
+	catalog
+}
+
+const ADR515_MEMBERSHIP_SQL: &str = "SELECT c_name, SUM(l_qty) \
+	 FROM cst, ord, itm \
+	 WHERE o_okey IN ( \
+	   SELECT l_okey FROM itm GROUP BY l_okey HAVING SUM(l_qty) > 300 \
+	 ) \
+	   AND c_ckey = o_ckey \
+	   AND o_okey = l_okey \
+	 GROUP BY c_name";
+
+#[test]
+fn adr515_membership_semi_commutes_to_source_branch() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr515_membership_catalog();
+				let logical = SqlPlanner::new()
+					.plan(ADR515_MEMBERSHIP_SQL)
+					.expect("plan membership shape");
+				let mut config = PlannerConfig::default();
+				config.membership_first_composition = true;
+				let (plan, trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind membership shape, commute on");
+				let kinds = execution_join_kinds(&plan);
+				// The commute relocates the semi below the spine: the first
+				// (root-most) join kind is Inner, exactly one semi remains.
+				assert_eq!(
+					kinds
+						.iter()
+						.filter(|kind| **kind == JoinKind::LeftSemi)
+						.count(),
+					1,
+					"exactly one semi after the commute, got {kinds:?}"
+				);
+				assert_ne!(
+					kinds.first(),
+					Some(&JoinKind::LeftSemi),
+					"the root must no longer be the semi, got {kinds:?}"
+				);
+				// Exactly one pinned receipt: the moved semi carries the author
+				// pin, and no duplicate bind/placement receipt exists.
+				let pinned = trace
+					.join_decisions
+					.iter()
+					.filter(|receipt| {
+						matches!(receipt.reason, JoinStrategyDecisionReason::PinnedByAuthor)
+					})
+					.count();
+				assert_eq!(pinned, 1, "one pinned receipt: {:#?}", trace.join_decisions);
+
+				config.membership_first_composition = false;
+				let (plan, trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind membership shape, commute off");
+				let kinds = execution_join_kinds(&plan);
+				assert_eq!(
+					kinds.first(),
+					Some(&JoinKind::LeftSemi),
+					"knob off keeps the root semi, got {kinds:?}"
+				);
+				let pinned = trace
+					.join_decisions
+					.iter()
+					.filter(|receipt| {
+						matches!(receipt.reason, JoinStrategyDecisionReason::PinnedByAuthor)
+					})
+					.count();
+				assert_eq!(pinned, 1, "one pinned receipt off-arm too");
+			});
+		})
+		.expect("spawn membership commute thread")
+		.join()
+		.expect("membership commute thread panicked");
+}
+
+#[test]
+fn adr515_outer_join_on_path_declines_commute() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr515_membership_catalog();
+				// The crossed join to the key source is LEFT OUTER: decline,
+				// root semi stays.
+				let logical = SqlPlanner::new()
+					.plan(
+						"SELECT c_name, SUM(l_qty) \
+						 FROM itm INNER JOIN ord ON o_okey = l_okey \
+						 LEFT JOIN cst ON c_ckey = o_ckey \
+						 WHERE o_okey IN ( \
+						   SELECT l_okey FROM itm GROUP BY l_okey HAVING SUM(l_qty) > 300 \
+						 ) \
+						 GROUP BY c_name",
+					)
+					.expect("plan outer-path shape");
+				let mut config = PlannerConfig::default();
+				config.membership_first_composition = true;
+				let (plan, _trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind outer-path shape");
+				let kinds = execution_join_kinds(&plan);
+				assert_eq!(
+					kinds.first(),
+					Some(&JoinKind::LeftSemi),
+					"an outer join on the path must decline the commute, got {kinds:?}"
+				);
+			});
+		})
+		.expect("spawn outer-path thread")
+		.join()
+		.expect("outer-path thread panicked");
+}

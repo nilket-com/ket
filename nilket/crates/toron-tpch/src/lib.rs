@@ -4075,6 +4075,28 @@ pub fn gauge_scalar_agg_input_reduction() -> Result<(bool, &'static str), String
 	}
 }
 
+pub const GAUGE_MEMBERSHIP_FIRST_ENV: &str = "TORON_TPCH_MEMBERSHIP_FIRST";
+
+/// The gauge's membership-first composition setting and its provenance: unset
+/// means the engine default; "0"/"1" are explicit arms. Same loud contract as
+/// the budget knobs.
+pub fn gauge_membership_first() -> Result<(bool, &'static str), String> {
+	match std::env::var(GAUGE_MEMBERSHIP_FIRST_ENV) {
+		Ok(raw) => match raw.as_str() {
+			"0" => Ok((false, "explicit")),
+			"1" => Ok((true, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_MEMBERSHIP_FIRST_ENV} must be \"0\" or \"1\", got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => Ok((
+			PlannerConfig::default().membership_first_composition,
+			"default",
+		)),
+		Err(error) => Err(format!("{GAUGE_MEMBERSHIP_FIRST_ENV}: {error}")),
+	}
+}
+
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
 pub const GAUGE_LOCAL_JOIN_ADMISSION_ENV: &str = "TORON_TPCH_LOCAL_JOIN_ADMISSION";
@@ -4110,6 +4132,9 @@ fn gauge_planner_config_with_task_memory(
 	}
 	if let Ok((value, "explicit")) = gauge_scalar_agg_input_reduction() {
 		config.scalar_aggregate_input_reduction = value;
+	}
+	if let Ok((value, "explicit")) = gauge_membership_first() {
+		config.membership_first_composition = value;
 	}
 	// The gauge binds and immediately runs through `Executor::with_context`; it is
 	// the caller that can prove this plan will not be fragmented. ADR 489's

@@ -175,9 +175,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// placement-pass decision surface, the same class as ADR 472's unknown-size fact. ADR 512
 	// adds the reachable-key reduction pass: its knob, the deferred-path hook, and the
 	// recombine-shape re-entry in the Join arm; the pass body lives in binder/scalar_reduction.rs.
+	// ADR 515 adds the membership-first commute: its knob and the Join-arm re-entry hook; the
+	// commute body also lives in binder/scalar_reduction.rs.
 	assert!(
-		lines <= 6_170,
-		"binder root has {lines} lines; expected <= 6,170 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_190,
+		"binder root has {lines} lines; expected <= 6,190 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

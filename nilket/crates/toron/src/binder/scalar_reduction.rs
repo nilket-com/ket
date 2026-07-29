@@ -362,3 +362,210 @@ impl<'a> Binder<'a> {
 		})
 	}
 }
+
+// ADR 515: membership-first composition — commute an author-pinned membership
+// `LeftSemi` through an Inner-join spine to the single source branch of its
+// complete correlation-key tuple. A plain-equality semi is a row-level
+// predicate on the source branch's columns (membership of the key tuple), and
+// row-level predicates on one branch commute with Inner spines: filtering the
+// source before fanout is identical to filtering the composite afterward, for
+// every key distribution. The spine's join order, strategies, pins, schemas,
+// and column identities are untouched; only the selected branch is replaced by
+// its semi-filtered equivalent, and the membership subtree moves — it is never
+// cloned or re-executed.
+
+/// The exact pinned shape ADR 322's membership lowering constructs. Anything
+/// else declines.
+fn membership_pin(intent: JoinStrategyIntent) -> bool {
+	matches!(
+		intent,
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Direct,
+			build_side: None,
+		}
+	)
+}
+
+/// The membership subtree must be self-contained over a conservative
+/// whitelist; any other node declines the commute.
+fn membership_body_whitelisted(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Scan { .. } | LogicalPlan::ScanNamed { .. } => true,
+		LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Distinct { input }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Aggregate { input, .. } => membership_body_whitelisted(input),
+		_ => false,
+	}
+}
+
+impl<'a> Binder<'a> {
+	/// Commute the pinned membership semi at the Join arm's root into the
+	/// spine on `outer`, returning the rewritten spine (whose root is the
+	/// spine's own top join) or `None` to decline. `body` is the semi's
+	/// original right subtree, moved verbatim into the relocated semi.
+	pub(super) async fn try_commute_membership_semi(
+		&self,
+		outer: &LogicalPlan,
+		body: &LogicalPlan,
+		on: &[(Expr, Expr)],
+		intent: JoinStrategyIntent,
+	) -> Option<LogicalPlan> {
+		if !self.config.membership_first_composition
+			|| on.is_empty()
+			|| !membership_pin(intent)
+			|| !membership_body_whitelisted(body)
+		{
+			return None;
+		}
+		let mut key_columns = Vec::with_capacity(on.len());
+		for (outer_key, _) in on {
+			key_columns.push(plain_column(outer_key)?.clone());
+		}
+		// The semi's own construction wrapped the spine in an Exchange keyed on
+		// the membership tuple; the commute discards that wrapper (it belongs
+		// to the root semi, not to any crossed join) and descends the spine.
+		let spine = match outer {
+			LogicalPlan::Exchange { input, .. } => input.as_ref(),
+			other => other,
+		};
+		// The relocation must cross at least one Inner join: a single-branch
+		// outer is already membership-first and declines structurally.
+		if !matches!(
+			spine,
+			LogicalPlan::Join {
+				kind: JoinKind::Inner,
+				..
+			}
+		) {
+			return None;
+		}
+		self.commute_semi_below(spine, &key_columns, body, on, intent)
+			.await
+	}
+
+	/// Recursive descent: rebuild every crossed node with identical fields,
+	/// replacing only the child on the ownership path; at the source branch,
+	/// wrap it in the relocated pinned semi.
+	fn commute_semi_below<'p>(
+		&'p self,
+		plan: &'p LogicalPlan,
+		key_columns: &'p [ColumnRef],
+		body: &'p LogicalPlan,
+		on: &'p [(Expr, Expr)],
+		intent: JoinStrategyIntent,
+	) -> Pin<Box<dyn Future<Output = Option<LogicalPlan>> + Send + 'p>> {
+		Box::pin(async move {
+			match plan {
+				LogicalPlan::Join {
+					left,
+					right,
+					kind,
+					on: join_on,
+					on_filter,
+					null_safe_keys,
+					strategy_intent,
+				} => {
+					// Only plain-equality Inner joins may be crossed; outer,
+					// anti, cross, and null-safe shapes decline.
+					if *kind != JoinKind::Inner || *null_safe_keys {
+						return None;
+					}
+					let mut owns_left = true;
+					let mut owns_right = true;
+					for column in key_columns {
+						let left_owns = self.reduction_scope_owns_column(left, column).await;
+						let right_owns = self.reduction_scope_owns_column(right, column).await;
+						// Ambiguous or missing lineage declines.
+						if left_owns == right_owns {
+							return None;
+						}
+						owns_left &= left_owns;
+						owns_right &= right_owns;
+					}
+					// The complete tuple must trace to exactly one side.
+					let (descend_left, child) = match (owns_left, owns_right) {
+						(true, false) => (true, left.as_ref()),
+						(false, true) => (false, right.as_ref()),
+						_ => return None,
+					};
+					let rebuilt_child = self
+						.commute_semi_below(child, key_columns, body, on, intent)
+						.await?;
+					// Every retained field of the crossed join is identical;
+					// only the owning child pointer changes.
+					let (new_left, new_right) = if descend_left {
+						(Box::new(rebuilt_child), right.clone())
+					} else {
+						(left.clone(), Box::new(rebuilt_child))
+					};
+					Some(LogicalPlan::Join {
+						left: new_left,
+						right: new_right,
+						kind: *kind,
+						on: join_on.clone(),
+						on_filter: on_filter.clone(),
+						null_safe_keys: *null_safe_keys,
+						strategy_intent: *strategy_intent,
+					})
+				}
+				LogicalPlan::Exchange {
+					input,
+					partition_count,
+					key,
+				} => {
+					let rebuilt = self
+						.commute_semi_below(input, key_columns, body, on, intent)
+						.await?;
+					Some(LogicalPlan::Exchange {
+						input: Box::new(rebuilt),
+						partition_count: *partition_count,
+						key: key.clone(),
+					})
+				}
+				LogicalPlan::Filter { .. }
+				| LogicalPlan::Project { .. }
+				| LogicalPlan::Alias { .. }
+				| LogicalPlan::Distinct { .. }
+				| LogicalPlan::Scan { .. }
+				| LogicalPlan::ScanNamed { .. } => {
+					// The source branch: it must own the complete tuple, and
+					// the relocated semi keeps the original on-tuple, body
+					// subtree, and pinned intent — reconstructed in the same
+					// pinned hash shape the membership lowering builds, keyed
+					// on the semi tuple for both sides.
+					for column in key_columns {
+						if !self.reduction_scope_owns_column(plan, column).await {
+							return None;
+						}
+					}
+					let left_keys: Vec<Expr> =
+						on.iter().map(|(outer_key, _)| outer_key.clone()).collect();
+					let right_keys: Vec<Expr> =
+						on.iter().map(|(_, body_key)| body_key.clone()).collect();
+					Some(LogicalPlan::Join {
+						left: Box::new(LogicalPlan::Exchange {
+							input: Box::new(plan.clone()),
+							partition_count: DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+							key: left_keys,
+						}),
+						right: Box::new(LogicalPlan::Exchange {
+							input: Box::new(body.clone()),
+							partition_count: DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+							key: right_keys,
+						}),
+						kind: JoinKind::LeftSemi,
+						on: on.to_vec(),
+						on_filter: None,
+						null_safe_keys: false,
+						strategy_intent: intent,
+					})
+				}
+				_ => None,
+			}
+		})
+	}
+}

@@ -194,6 +194,12 @@ pub struct PlannerConfig {
 	/// improved 7,180-7,367 ms against the 3,554 ms floor with zero spill in
 	/// both arms, q17 was the only engaged cell, and every digest held.
 	pub scalar_aggregate_input_reduction: bool,
+	/// ADR 515: commute an author-pinned membership semi through an Inner-join
+	/// spine to the single source branch of its complete key tuple. A
+	/// plain-equality semi is a row-level predicate on that branch, so the
+	/// commute is filter-before-fanout; the recognizer declines any shape it
+	/// cannot prove. Default false until the ADR 515 paired receipt.
+	pub membership_first_composition: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -226,6 +232,7 @@ impl Default for PlannerConfig {
 			hash_smaller_build_placement: true,
 			filtered_build_side_swap: true,
 			scalar_aggregate_input_reduction: true,
+			membership_first_composition: false,
 		}
 	}
 }
@@ -1730,6 +1737,27 @@ impl<'a> Binder<'a> {
 								recursive_ctx,
 							)
 							.await;
+					}
+					// ADR 515: membership-first composition — commute the pinned
+					// membership semi to its key-source branch, then bind the
+					// rewritten tree. Termination is structural: the rewritten
+					// root is Inner, and the relocated semi's outer side is a
+					// single branch the recognizer declines on re-entry.
+					if matches!(kind, JoinKind::LeftSemi) && !*null_safe_keys {
+						if let Some(rewritten) = self
+							.try_commute_membership_semi(left, right, on, *strategy_intent)
+							.await
+						{
+							return self
+								.bind_plan_with_trace(
+									&rewritten,
+									trace,
+									render_trace,
+									join_order_source_capture,
+									recursive_ctx,
+								)
+								.await;
+						}
 					}
 					// ADR 200: the unified bounded graph root-swap, galaxy then bridge. A query is a
 					// galaxy XOR a bridge (conformed vs distinct junction signatures), so the arms never

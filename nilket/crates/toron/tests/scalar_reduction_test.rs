@@ -383,3 +383,124 @@ impl StorageScan for FixtureScan {
 		))
 	}
 }
+
+// -- ADR 515: membership-first composition -------------------------------------------------
+
+#[test]
+fn membership_commute_is_equivalent_and_relocates_the_semi() {
+	// Deep graph scratch binds on the commuted shape need the explicit stack,
+	// per the suite convention.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(membership_commute_is_equivalent_and_relocates_the_semi_body());
+		})
+		.expect("spawn membership_commute_is_equivalent_and_relocates_the_semi thread")
+		.join()
+		.expect("membership_commute_is_equivalent_and_relocates_the_semi thread panicked");
+}
+
+async fn membership_commute_is_equivalent_and_relocates_the_semi_body() {
+	// Covers null keys (the src null row never matches the membership), keys
+	// missing from the body (pid 2) or failing HAVING (pid 3), duplicate body
+	// keys (gagg pid 1 twice), and duplicate-fanout atomicity (two fact rows
+	// join the surviving src pid 1 and both live or die together).
+	let sql = "SELECT f_qty FROM src, fact \
+		 WHERE s_pid = f_pid \
+		   AND s_pid IN (SELECT g_pid FROM gagg GROUP BY g_pid HAVING SUM(g_qty) > 35)";
+	let logical = SqlPlanner::new().plan(sql).expect("plan membership sql");
+	let (catalog, storage) = fixture();
+	let mut results = Vec::new();
+	for commute in [false, true] {
+		let mut config = PlannerConfig::default();
+		config.membership_first_composition = commute;
+		let bound = bind(&logical, &catalog, &config).await.expect("bind");
+		assert_eq!(
+			count_join_kind(&bound, JoinKind::LeftSemi),
+			1,
+			"exactly one semi in both arms"
+		);
+		let root_is_semi = matches!(first_join_kind(&bound), Some(JoinKind::LeftSemi));
+		if commute {
+			assert!(!root_is_semi, "commute must relocate the semi off the root");
+		} else {
+			assert!(root_is_semi, "knob off keeps the root semi");
+		}
+		let executor = Executor::new(Arc::clone(&storage) as Arc<dyn StorageScan>);
+		let batches = executor.execute_bound(&bound, None).await.expect("execute");
+		results.push(collect_f64(&batches));
+	}
+	assert_eq!(results[0], results[1], "commute must not change results");
+}
+
+#[test]
+fn membership_commute_onto_fanout_branch_is_equivalent() {
+	// Deep graph scratch binds on the commuted shape need the explicit stack,
+	// per the suite convention.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(membership_commute_onto_fanout_branch_is_equivalent_body());
+		})
+		.expect("spawn membership_commute_onto_fanout_branch_is_equivalent thread")
+		.join()
+		.expect("membership_commute_onto_fanout_branch_is_equivalent thread panicked");
+}
+
+async fn membership_commute_onto_fanout_branch_is_equivalent_body() {
+	// Membership keyed on the fanout branch itself: the semi commutes onto
+	// fact, so filter-before-fanout applies to the duplicated side — the two
+	// fact pid-1 rows must survive or die atomically, matching the composite
+	// filter. (A joined membership body is unreachable from the SQL IN path —
+	// the frontend rejects it — so the whitelist decline is defense-in-depth
+	// exercised at recognizer level, not from SQL.)
+	let sql = "SELECT f_qty FROM src, fact \
+		 WHERE s_pid = f_pid \
+		   AND f_pid IN (SELECT g_pid FROM gagg GROUP BY g_pid HAVING SUM(g_qty) > 35)";
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.expect("plan fanout-key membership sql");
+	let (catalog, storage) = fixture();
+	let mut results = Vec::new();
+	for commute in [false, true] {
+		let mut config = PlannerConfig::default();
+		config.membership_first_composition = commute;
+		let bound = bind(&logical, &catalog, &config).await.expect("bind");
+		assert_eq!(count_join_kind(&bound, JoinKind::LeftSemi), 1);
+		let root_is_semi = matches!(first_join_kind(&bound), Some(JoinKind::LeftSemi));
+		if commute {
+			assert!(
+				!root_is_semi,
+				"commute must relocate onto the fanout branch"
+			);
+		} else {
+			assert!(root_is_semi, "knob off keeps the root semi");
+		}
+		let executor = Executor::new(Arc::clone(&storage) as Arc<dyn StorageScan>);
+		let batches = executor.execute_bound(&bound, None).await.expect("execute");
+		results.push(collect_f64(&batches));
+	}
+	assert_eq!(results[0], results[1]);
+}
+
+fn first_join_kind(plan: &ExecutionPlan) -> Option<JoinKind> {
+	match plan {
+		ExecutionPlan::Join { kind, .. } => Some(*kind),
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => first_join_kind(input),
+		_ => None,
+	}
+}

@@ -17,8 +17,8 @@ use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, PRIMITIVE_LADDER_IDS, Q17BoundaryCensusOutcome,
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
 	export_persisted_perf_query_parquet, gauge_filtered_build_side_swap, gauge_hash_smaller_build,
-	gauge_memory_per_task, gauge_scalar_agg_input_reduction, gauge_spill_bytes_reserved,
-	generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
+	gauge_membership_first, gauge_memory_per_task, gauge_scalar_agg_input_reduction,
+	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
 	node_attribution_outer_reconciliation, normalize_duckdb_type,
 	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
 	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
@@ -183,6 +183,10 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			Ok(setting) => setting,
 			Err(message) => return harness_error(&message),
 		};
+	let (membership_first, membership_first_provenance) = match gauge_membership_first() {
+		Ok(setting) => setting,
+		Err(message) => return harness_error(&message),
+	};
 	let query = flag_value(args, "--query").unwrap_or("q06");
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
@@ -345,6 +349,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["scalar_aggregate_input_reduction"] = serde_json::json!(scalar_agg_input_reduction);
 	row["scalar_aggregate_input_reduction_provenance"] =
 		serde_json::json!(scalar_agg_input_reduction_provenance);
+	row["membership_first_composition"] = serde_json::json!(membership_first);
+	row["membership_first_composition_provenance"] = serde_json::json!(membership_first_provenance);
 	if std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some() {
 		let ledger = take_parquet_scan_ledger();
 		let batches = ledger.iter().flat_map(|scan| scan.batches.iter());
@@ -6262,6 +6268,24 @@ mod adr512_tests {
 		unsafe { std::env::set_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION", "yes") };
 		assert!(gauge_scalar_agg_input_reduction().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION") };
+	}
+}
+#[cfg(test)]
+mod adr515_tests {
+	use super::*;
+
+	#[test]
+	fn adr515_membership_first_knob_contract() {
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::remove_var("TORON_TPCH_MEMBERSHIP_FIRST") };
+		assert_eq!(gauge_membership_first().unwrap(), (false, "default"));
+		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "1") };
+		assert_eq!(gauge_membership_first().unwrap(), (true, "explicit"));
+		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "0") };
+		assert_eq!(gauge_membership_first().unwrap(), (false, "explicit"));
+		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "yes") };
+		assert!(gauge_membership_first().is_err());
+		unsafe { std::env::remove_var("TORON_TPCH_MEMBERSHIP_FIRST") };
 	}
 }
 
