@@ -42,12 +42,21 @@ The reduced inner is `LeftSemi(inner, source_projection)` on the correlation key
 existing `Exchange` and `Aggregate` wrap it unchanged. On any failure the helper returns `None`
 and the caller proceeds byte-identically.
 
-Wire the helper into both recombine sites behind the config:
+Wire the helper into both engagement points **in the binder** (the frontend has no
+`PlannerConfig`, and a binder-owned recognizer covers every frontend):
 
-- `bind_deferred_scalar_subquery` (binder.rs), before constructing the `Aggregate`;
-- `join_scalar_subplans` (sql_planner.rs) for the qualified path — the helper lives in a
-  frontend-shared location so both frontends reach it, mirroring how the deferred node already
-  hands the same work to the binder.
+- deferred path: `bind_deferred_scalar_subquery`, before constructing the `Aggregate`;
+- qualified path: the `LogicalPlan::Join` bind arm recognizes the frontend-constructed recombine
+  shape (through the auto-join `Exchange` wrapper) and substitutes the reduced right side on the
+  direct bind path only — an actuated graph re-bind forgoes the reduction, and the rewrite never
+  re-enters the arm, so no shape oscillation with the root-swap passes is possible.
+
+Two path asymmetries are load-bearing and pinned rather than papered over: the deferred frontier
+rejects correlated COUNT (its coalesce does not compose with a wrapper), so COUNT coverage rides
+the qualified path's empty-group coalesce — which composes with the reduction because eliminated
+groups are exactly the unmatched keys the coalesce already handles; and at recognizer time the
+qualified path has not yet pushed WHERE conjuncts below the recombine, so a qualified engagement
+needs its filter inside the outer subtree (a filtered derived table is the natural spelling).
 
 Gauge wiring mirrors ADR 511 exactly: `TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION`, "0"/"1" explicit,
 absence = compiled default, loud error otherwise; rows carry
@@ -93,8 +102,10 @@ From the sealed binary, both arms at the exact coordinate: q01-q22 route census 
 ladder census. Enumerate every fingerprint change with per-arm routes, admissions, spill
 observations, and digests. No silent caps.
 
-Expected engagement: q17 (deferred path), q02 and q20 (qualified path). Any additional engaged
-cell expands correctness coverage before measurement, not the performance claim.
+Engagement hypothesis (the census is authoritative, not this list): q17 via the deferred path;
+q02 and q20 correlate with bare identifiers in the official text, so they are expected to ride
+the deferred path too — whether their outer shapes admit a source is exactly what the census
+decides.
 
 Every changed cell runs its supported strict correctness rail in both arms with explicit budgets
 (q17 at sf=0.02; others at their supported coordinates). q19 remains a named sentinel from

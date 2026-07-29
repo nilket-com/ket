@@ -63,6 +63,7 @@ mod join_order;
 mod outer_join_demotion;
 mod pushdown;
 mod runtime_evidence;
+mod scalar_reduction;
 mod selectivity;
 mod set_ops;
 
@@ -185,6 +186,12 @@ pub struct PlannerConfig {
 	/// q17 pairs improved 21.5-23.5 s against a 3,554 ms floor, q20 was the only
 	/// other engaged cell, and both hold digests with the swap on.
 	pub filtered_build_side_swap: bool,
+	/// ADR 512: reduce a decorrelated scalar aggregate's input to keys
+	/// reachable from the recombine's outer side. A semi build that is a
+	/// superset of the outer key domain eliminates only never-matched groups,
+	/// so every aggregate in the grouped shape is preserved; the recognizer
+	/// declines otherwise. Default false until the ADR 512 paired receipt.
+	pub scalar_aggregate_input_reduction: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -216,6 +223,7 @@ impl Default for PlannerConfig {
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,
 			filtered_build_side_swap: true,
+			scalar_aggregate_input_reduction: false,
 		}
 	}
 }
@@ -1756,6 +1764,24 @@ impl<'a> Binder<'a> {
 							return Ok(plan);
 						}
 					}
+					// ADR 512: reachable-key reduction on the scalar-recombine shape, applied
+					// only on the direct bind path — an actuated graph re-bind forgoes the
+					// reduction, and the rewrite never re-enters this arm, so no shape
+					// oscillation with the root-swap passes is possible. The recognizer
+					// declines unless every precondition is proved.
+					let adr512_reduced_right;
+					let right: &LogicalPlan =
+						if matches!(kind, JoinKind::LeftOuter) && !*null_safe_keys {
+							match self.try_reduce_scalar_recombine(left, right, on).await {
+								Some(reduced) => {
+									adr512_reduced_right = reduced;
+									&adr512_reduced_right
+								}
+								None => right,
+							}
+						} else {
+							right
+						};
 					match self
 						.try_bind_preserved_outer_star_actuation(plan, trace, render_trace)
 						.await?
@@ -2859,6 +2885,11 @@ impl<'a> Binder<'a> {
 			None => inner.clone(),
 		};
 		let inner_filtered = self.recognize_cross_equi_joins(&inner_filtered).await?;
+		// ADR 512: reduce the inner to reachable keys before grouping; declines
+		// leave it untouched.
+		let inner_filtered = self
+			.reduce_deferred_scalar_inner(outer, inner_filtered, &pairs)
+			.await;
 		let group_expr: Vec<Expr> = pairs
 			.iter()
 			.map(|(_, inner_key)| inner_key.clone())

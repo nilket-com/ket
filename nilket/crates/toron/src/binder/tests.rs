@@ -26266,3 +26266,119 @@ async fn adr511_left_filtered_shape_keeps_natural_in_both_arms() {
 		);
 	}
 }
+
+#[tokio::test]
+async fn adr512_q17_shape_inserts_left_semi_under_reduction() {
+	// Deferred path (unqualified correlation): with the reduction on, the
+	// grouped aggregate's input gains a LeftSemi against the filtered part
+	// keys; with it off the plan is byte-identical to ADR 511's.
+	let catalog = adr511_q17_shape_catalog();
+	let logical = SqlPlanner::new()
+		.plan(ADR511_Q17_SHAPE_SQL)
+		.expect("plan q17 shape");
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	config.scalar_aggregate_input_reduction = true;
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind q17 shape, reduction on");
+	let kinds = execution_join_kinds(&plan);
+	assert!(
+		kinds.contains(&JoinKind::LeftSemi),
+		"reduction on must insert a LeftSemi, got {kinds:?}"
+	);
+
+	config.scalar_aggregate_input_reduction = false;
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind q17 shape, reduction off");
+	let kinds = execution_join_kinds(&plan);
+	assert!(
+		!kinds.contains(&JoinKind::LeftSemi),
+		"reduction off must not insert a LeftSemi, got {kinds:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr512_unfiltered_source_declines_reduction() {
+	// Without the part filter the only traceable sources are unfiltered base
+	// relations — domain-complete under referential integrity — so the rule
+	// must decline even with the knob on.
+	let catalog = adr511_q17_shape_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
+			 FROM lineitem, part \
+			 WHERE p_partkey = l_partkey \
+			   AND l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)",
+		)
+		.expect("plan unfiltered q17 shape");
+	let mut config = auto_broadcast_config(4_096);
+	config.hash_smaller_build_placement = true;
+	config.filtered_build_side_swap = true;
+	config.scalar_aggregate_input_reduction = true;
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind unfiltered q17 shape");
+	let kinds = execution_join_kinds(&plan);
+	assert!(
+		!kinds.contains(&JoinKind::LeftSemi),
+		"an unfiltered source must decline the reduction, got {kinds:?}"
+	);
+}
+
+#[test]
+fn adr512_qualified_recombine_inserts_left_semi_under_reduction() {
+	// Path A (qualified correlation): the frontend builds the recombine and
+	// the binder's Join-arm recognizer engages it. The graph passes' scratch
+	// re-binds nest deeply on this shape, so run on an explicit 64 MB stack
+	// like the other deep-plan binds in this suite.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr511_q17_shape_catalog();
+				let logical = SqlPlanner::new()
+					.plan(
+						"SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly \
+						 FROM lineitem INNER JOIN ( \
+						   SELECT p_partkey FROM part \
+						   WHERE p_brand = 'Brand#23' AND p_container = 'MED BOX' \
+						 ) AS fp ON fp.p_partkey = l_partkey \
+						 WHERE l_quantity < (SELECT AVG(li.l_quantity) FROM lineitem AS li \
+						                     WHERE li.l_partkey = fp.p_partkey)",
+					)
+					.expect("plan qualified q17 shape");
+				let mut config = auto_broadcast_config(4_096);
+				config.hash_smaller_build_placement = true;
+				config.filtered_build_side_swap = true;
+				config.scalar_aggregate_input_reduction = true;
+				let plan = bind(&logical, &catalog, &config)
+					.await
+					.expect("bind qualified q17 shape, reduction on");
+				let kinds = execution_join_kinds(&plan);
+				assert!(
+					kinds.contains(&JoinKind::LeftSemi),
+					"qualified recombine must engage the reduction, got {kinds:?}"
+				);
+
+				config.scalar_aggregate_input_reduction = false;
+				let plan = bind(&logical, &catalog, &config)
+					.await
+					.expect("bind qualified q17 shape, reduction off");
+				let kinds = execution_join_kinds(&plan);
+				assert!(
+					!kinds.contains(&JoinKind::LeftSemi),
+					"reduction off must not engage, got {kinds:?}"
+				);
+			});
+		})
+		.expect("spawn qualified-recombine thread")
+		.join()
+		.expect("qualified-recombine thread panicked");
+}

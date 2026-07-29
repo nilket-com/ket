@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 12] = [
+const BINDER_MODULES: [&str; 13] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
@@ -11,6 +11,7 @@ const BINDER_MODULES: [&str; 12] = [
 	"outer_join_demotion",
 	"pushdown",
 	"runtime_evidence",
+	"scalar_reduction",
 	"selectivity",
 	"set_ops",
 ];
@@ -30,6 +31,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/outer_join_demotion.rs",
 		"src/binder/pushdown.rs",
 		"src/binder/runtime_evidence.rs",
+		"src/binder/scalar_reduction.rs",
 		"src/binder/selectivity.rs",
 		"src/binder/set_ops.rs",
 		"src/binder/tests.rs",
@@ -170,10 +172,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// The admission decision also records a per-join receipt on the optimizer trace (the bare bool
 	// proved unauditable in the first live cell), which is the small remainder of this bound.
 	// ADR 511 adds the filtered-build-side-swap placement knob on `PlannerConfig` — a real
-	// placement-pass decision surface, the same class as ADR 472's unknown-size fact.
+	// placement-pass decision surface, the same class as ADR 472's unknown-size fact. ADR 512
+	// adds the reachable-key reduction pass: its knob, the deferred-path hook, and the
+	// recombine-shape re-entry in the Join arm; the pass body lives in binder/scalar_reduction.rs.
 	assert!(
-		lines <= 6_125,
-		"binder root has {lines} lines; expected <= 6,125 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_170,
+		"binder root has {lines} lines; expected <= 6,170 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -306,6 +310,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/daemon_test.rs",
 				"crates/toron/tests/sql_listener_test.rs",
 				"crates/toron/tests/tls_listener_test.rs",
+				// ADR 512: the reachable-key reduction's execution equivalence battery.
+				"crates/toron/tests/scalar_reduction_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")
