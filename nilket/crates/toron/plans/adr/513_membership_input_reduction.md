@@ -100,3 +100,15 @@ do not exist — no NOT-EXISTS outcome either.
 - Selectivity coverage (ADR 472 forward) would sharpen every source-derivation admission.
 - q02/q20 scalar-reduction coverage and `LeftAnti` placement (moot for q21, possibly not
   elsewhere) remain named follow-ons.
+
+## Closure
+
+Phase 0 closed this ADR **red** before the recognizer was implemented, on both predeclared
+conditions at once: the deferred/direct selection is a pure function of
+(estimated_build_bytes, memory_cap, spill_budget) — structurally independent of everything the
+mechanism changes, so no route flip is possible without editing the condition — and the measured
+membership cut (78,332,548 → 37,899,410 rows, −51.6%) bounds gross avoided cost at ~2,956 ms,
+below the 3,554 ms floor even with free source acquisition. The source would in fact execute
+twice (cloned per membership input). The superset theorem stays sound and unimplemented here; the
+receipt maps the surviving q21 envelope to the reservoir lifecycle and the suffix build's own
+partitioning economics.

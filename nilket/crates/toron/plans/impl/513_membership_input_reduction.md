@@ -114,3 +114,52 @@ how much was the route consequence, so a no-flip close leaves the successor an e
 
 The standard council seal and changed-surface blocks, via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Phase 0 result — closed red, recognizer not implemented
+
+### The route cannot flip under the unchanged admission logic
+
+The deferred/direct selection chain is: `partition_at_a_time_replay_spec` (streaming.rs:14500)
+takes the deferred route iff suffix runtime 1's build is `PartitionedScan` with
+`partition_count > 1`; that partition count comes from
+`choose_streaming_scan_inner_build_partitioning` → `streamed_inner_build_partition_count`
+(streaming.rs:4210), a pure function of **(estimated_build_bytes, memory_cap, spill_budget)**.
+The resident baseline — the only quantity membership reduction lowers — does not appear in the
+selection at all (it feeds `guard_membership_owner_resident`, a later safety guard, not the
+choice), and `estimated_build_bytes` is estimated from the suffix build's own scan input, which
+the mechanism does not touch. The projected route flip is therefore not merely unlikely; it is
+structurally impossible without editing the condition, which this ADR forbids. The 898 MB
+reservoir and its 9.9 s deferred envelope (including the 4.6 s compact-index rebuild) survive
+the mechanism untouched.
+
+### The net mechanism envelope cannot plausibly clear the floor
+
+Measured membership cut at sf=8 (counted from the persisted Parquet):
+σ_F(orders) = 5,845,938 of 12,000,000 keys; l2 47,989,007 → 23,242,802; l3 (receiptdate >
+commitdate, 63.2% of lineitem) 30,343,541 → 14,656,608. Total summarized rows
+78,332,548 → 37,899,410 (−51.6%).
+
+- **Gross avoided cost** (free-acquisition limit): 51.6% of the 5,728.7 ms `runtime_prep` ≈
+  **2,956 ms — below the 3,554 ms floor by itself**, before any acquisition or probe charge.
+- **Acquisition**: the source chain is cloned per membership input and physically executed
+  **twice** (no sharing machinery in this cut) — two σ_F(orders) passes (12 M rows, 2-column
+  projection) plus two 5,845,938-key semi builds, roughly 1.0-1.6 s combined at banked
+  per-pass rates.
+- **Reduction-semi probe**: all 78.3 M membership rows probe the key set, roughly 1.5-2.0 s at
+  the ADR 512-measured probe rate (48 M probes ≈ 0.9 s against a small build).
+- **Net**: approximately zero, plausibly negative.
+
+Both predeclared red conditions hold: the unchanged admission logic predicts no route flip, and
+the net mechanism envelope cannot plausibly clear 3,554 ms. Phase 0 closes red; the recognizer,
+knob, battery, and census are not implemented. No code changed.
+
+### What the close leaves the successor
+
+The q21 envelope's true owners, with this ADR's dead end mapped: the deferred reservoir
+lifecycle (9.9 s, 898 MB — of which 4.6 s is the compact-index rebuild ADR 510 already proved
+is not recoverable by relocation) and the suffix build whose ~873 MB reservoir class is what
+actually selects the deferred route. A successor that wants the direct route must shrink
+**that build's own estimate** or revisit its partitioning economics — a different mechanism
+with a different safety argument, not a membership reduction. The membership-reduction theorem
+itself remains sound and free for a future shape where the cut is deep (q17-class, not 2x) or
+the source is already resident.
