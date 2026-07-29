@@ -2004,6 +2004,7 @@ fn apply_history_replay(
 				BackingIdentity::for_path(std::path::Path::new(&outgoing_target.path))
 					.map_err(|error| format!("Shadow generation changed: {error}"))?;
 			let allocated_before = ctx.registry.allocated_node_count();
+			let payload_before = ctx.registry.authoritative_payload_snapshot().retained();
 			let mut revived = tab.document.parked_generations.take(&target);
 			if revived.as_ref().is_some_and(|entry| {
 				entry.target.byte_len != target.byte_len
@@ -2047,7 +2048,18 @@ fn apply_history_replay(
 					.registry
 					.allocated_node_count()
 					.saturating_sub(allocated_before);
-				ctx.registry.note_nodes_retired(candidate_nodes);
+				let candidate_payload = ctx
+					.registry
+					.authoritative_payload_snapshot()
+					.retained()
+					.checked_sub(payload_before)
+					.expect("abandoned candidate payload counter regressed");
+				ctx.registry.retire_orphaned_forest(
+					[rid],
+					candidate_nodes,
+					candidate_payload,
+					crate::ecs::registry::ReclaimFence::NeverPublished,
+				);
 				return Err("Shadow generation length no longer matches its manifest".to_string());
 			}
 
@@ -2070,7 +2082,18 @@ fn apply_history_replay(
 						.registry
 						.allocated_node_count()
 						.saturating_sub(allocated_before);
-					ctx.registry.note_nodes_retired(candidate_nodes);
+					let candidate_payload = ctx
+						.registry
+						.authoritative_payload_snapshot()
+						.retained()
+						.checked_sub(payload_before)
+						.expect("abandoned candidate payload counter regressed");
+					ctx.registry.retire_orphaned_forest(
+						[candidate_root],
+						candidate_nodes,
+						candidate_payload,
+						crate::ecs::registry::ReclaimFence::NeverPublished,
+					);
 				}
 				return Err(msg);
 			}

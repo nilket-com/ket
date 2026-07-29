@@ -71,7 +71,12 @@ pub fn ingest_svp_file(
 		.cold_extent_count
 		.fetch_add(chunk_count, std::sync::atomic::Ordering::Relaxed);
 	if let Err(error) = resolver.register_device(device_id, &path) {
-		registry.note_nodes_retired(u64::from(node_count));
+		registry.retire_orphaned_forest(
+			[root_id],
+			u64::from(node_count),
+			0,
+			crate::ecs::registry::ReclaimFence::NeverPublished,
+		);
 		return Err(format!("Open error: {error}"));
 	}
 	let warm_index = registry

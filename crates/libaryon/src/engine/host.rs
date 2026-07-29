@@ -429,21 +429,27 @@ mod tests {
 			.expect("open UAST inspector");
 		let viewport = recv_viewport_until(&viewports, "current UAST inspector", |viewport| {
 			viewport.panes.iter().any(|pane| {
-				pane.tabs[pane.active_doctab_index].title == "uast"
-					&& {
-						let text = pane
-							.tokens
-							.iter()
-							.flat_map(|token| token.text.iter().copied())
-							.collect::<Vec<_>>();
-						text.windows(b"current".len()).any(|window| window == b"current")
-							&& text
-								.windows(b"SOURCE_FILE".len())
-								.any(|window| window == b"SOURCE_FILE")
-							&& text
-								.windows(b"IDENT".len())
-								.any(|window| window == b"IDENT")
-					}
+				pane.tabs[pane.active_doctab_index].title == "uast" && {
+					let text = pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>();
+					text.windows(b"current".len())
+						.any(|window| window == b"current")
+						&& text
+							.windows(b"SOURCE_FILE".len())
+							.any(|window| window == b"SOURCE_FILE")
+						&& text
+							.windows(b"IDENT".len())
+							.any(|window| window == b"IDENT")
+						&& text
+							.windows(b"orphaned-payload=0 B".len())
+							.any(|window| window == b"orphaned-payload=0 B")
+						&& text
+							.windows(b"reclaim-heads=0".len())
+							.any(|window| window == b"reclaim-heads=0")
+				}
 			})
 		});
 		assert_eq!(viewport.panes.len(), 2);
@@ -483,6 +489,12 @@ mod tests {
 			inspector_text
 				.windows(b"global-allocated=".len())
 				.any(|window| window == b"global-allocated=")
+		);
+		assert!(
+			inspector_text
+				.windows(b"reclaimed=31 B".len())
+				.any(|window| window == b"reclaimed=31 B"),
+			"the automatic follow-up frame must reclaim the flat source payload"
 		);
 		assert!(
 			inspector_text

@@ -14,6 +14,7 @@ pub(crate) enum EngineRequest {
 #[derive(Debug)]
 pub(crate) enum InternalEvent {
 	Refresh,
+	Reclaim,
 	DrainEvents,
 	HydrationCompleted(BufferId),
 	ClearYankFlash,

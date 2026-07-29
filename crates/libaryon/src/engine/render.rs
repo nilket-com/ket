@@ -41,6 +41,7 @@ use std::sync::{Arc, mpsc};
 pub(crate) struct RenderParams<'a> {
 	pub(crate) registry: &'a Arc<UastRegistry>,
 	pub(crate) resolver: &'a Arc<SvpResolver>,
+	pub(crate) tx_internal: &'a super::request::InternalSender,
 	pub(crate) tx_view: &'a mpsc::Sender<Viewport>,
 	pub(crate) reactor: &'a SemanticReactor,
 	pub(crate) lang_registry: &'a Arc<LanguageRegistry>,
@@ -142,6 +143,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	let RenderParams {
 		registry,
 		resolver,
+		tx_internal,
 		tx_view,
 		reactor,
 		lang_registry,
@@ -159,6 +161,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		session.focused_pane_id = first_pane_id;
 	}
 
+	session.reclaim_queue.collect_registry_notices(registry);
 	let grafted = dispatch_semantic_responses_in_layout(
 		registry,
 		reactor,
@@ -166,6 +169,10 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		&mut session.layout,
 		&mut session.events,
 	);
+	session.reclaim_queue.collect_registry_notices(registry);
+	let _reclaim_progress = session
+		.reclaim_queue
+		.drain_eligible(registry, super::reclaim::RECLAIM_NODES_PER_FRAME);
 	if grafted && !session.diff_pairs.is_empty() {
 		super::diff::recompute_all_diffs(registry, session);
 	}
@@ -352,6 +359,13 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		input: input.projection(),
 		language_completion_candidates: lang_registry.completion_candidates(),
 	});
+
+	// Materializing a synthetic fold can retire endpoint leaves while panes are
+	// projected. Collect those notices only after the viewport is complete, then
+	// advance the two-cohort publication fence.
+	session.reclaim_queue.collect_registry_notices(registry);
+	session.reclaim_queue.finish_frame();
+	session.reclaim_queue.schedule_maintenance(tx_internal);
 
 	// Eviction frees buffers that engine-thread readers borrow into, so it runs
 	// here rather than on the resolver's completion path. Visible nodes were

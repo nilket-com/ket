@@ -1525,10 +1525,20 @@ fn release_buffer(
 		),
 		BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_) => (0, 0),
 	};
-	runtime.registry.note_nodes_retired(retired_nodes);
-	runtime.registry.note_orphaned_payload(retired_payload);
 	if let Some(root) = buffer.root_id() {
 		runtime.registry.cancel_metric_scan(root);
+		runtime.registry.retire_orphaned_forest(
+			[root],
+			retired_nodes,
+			retired_payload,
+			crate::ecs::registry::ReclaimFence::AfterPublication,
+		);
+	} else {
+		assert_eq!(retired_nodes, 0, "rootless buffer cannot retire UAST nodes");
+		assert_eq!(
+			retired_payload, 0,
+			"rootless buffer cannot retire authoritative payload"
+		);
 	}
 }
 
@@ -1538,6 +1548,7 @@ fn retire_parked_generations(
 ) -> (u64, u64) {
 	let mut retired = 0u64;
 	let mut retired_payload = 0u64;
+	let mut heads = Vec::with_capacity(entries.len());
 	for entry in entries {
 		runtime.registry.cancel_metric_scan(entry.root);
 		if let Some(device_id) = entry.device_id {
@@ -1549,9 +1560,14 @@ fn retire_parked_generations(
 		retired_payload = retired_payload
 			.checked_add(entry.payload_bytes)
 			.expect("parked generation payload retirement overflow");
+		heads.push(entry.root);
 	}
-	runtime.registry.note_nodes_retired(retired);
-	runtime.registry.note_orphaned_payload(retired_payload);
+	runtime.registry.retire_orphaned_forest(
+		heads,
+		retired,
+		retired_payload,
+		crate::ecs::registry::ReclaimFence::AfterPublication,
+	);
 	(retired, retired_payload)
 }
 
@@ -4369,6 +4385,7 @@ fn dispatch_command(
 					if render_frame(RenderParams {
 						registry,
 						resolver,
+						tx_internal,
 						tx_view,
 						reactor,
 						lang_registry,
@@ -5133,6 +5150,7 @@ pub(crate) fn run_engine(engine: Engine) {
 		&& render_frame(RenderParams {
 			registry: &registry,
 			resolver: &resolver,
+			tx_internal: &tx_internal,
 			tx_view: &tx_view,
 			reactor: &reactor,
 			lang_registry: &lang_registry,
@@ -5205,6 +5223,16 @@ pub(crate) fn run_engine(engine: Engine) {
 			EngineRequest::Internal(event) => {
 				let mut needs_render = match event {
 					InternalEvent::Refresh => true,
+					InternalEvent::Reclaim => {
+						session.reclaim_queue.begin_maintenance_turn();
+						session.reclaim_queue.collect_registry_notices(&registry);
+						let progress = session
+							.reclaim_queue
+							.drain_eligible(&registry, super::reclaim::RECLAIM_NODES_PER_FRAME);
+						progress.visited_nodes > 0
+							&& !progress.work_remaining
+							&& !session.uast_inspectors.is_empty()
+					}
 					InternalEvent::DrainEvents => false,
 					InternalEvent::GitObservationChanged => false,
 					InternalEvent::RefreshGitStatus => {
@@ -5280,10 +5308,13 @@ pub(crate) fn run_engine(engine: Engine) {
 					&dynamic_invocation_gate,
 					event_tap.as_ref(),
 				);
+				session.reclaim_queue.collect_registry_notices(&registry);
+				session.reclaim_queue.schedule_maintenance(&tx_internal);
 				if needs_render
 					&& render_frame(RenderParams {
 						registry: &registry,
 						resolver: &resolver,
+						tx_internal: &tx_internal,
 						tx_view: &tx_view,
 						reactor: &reactor,
 						lang_registry: &lang_registry,
@@ -5412,10 +5443,13 @@ pub(crate) fn run_engine(engine: Engine) {
 			&dynamic_invocation_gate,
 			event_tap.as_ref(),
 		);
+		session.reclaim_queue.collect_registry_notices(&registry);
+		session.reclaim_queue.schedule_maintenance(&tx_internal);
 		if should_stop {
 			let _ = render_frame(RenderParams {
 				registry: &registry,
 				resolver: &resolver,
+				tx_internal: &tx_internal,
 				tx_view: &tx_view,
 				reactor: &reactor,
 				lang_registry: &lang_registry,
@@ -5427,6 +5461,7 @@ pub(crate) fn run_engine(engine: Engine) {
 			&& render_frame(RenderParams {
 				registry: &registry,
 				resolver: &resolver,
+				tx_internal: &tx_internal,
 				tx_view: &tx_view,
 				reactor: &reactor,
 				lang_registry: &lang_registry,
@@ -6905,6 +6940,69 @@ pub fn main(editor) {
 		assert!(registry.backing_identity(77).is_none());
 		assert_eq!(registry.stats().retired_nodes, retired_before + 3);
 		assert_eq!(registry.stats().orphaned_payload_bytes, 1);
+
+		let mut reclaim = crate::engine::reclaim::ReclaimQueue::default();
+		reclaim.collect_registry_notices(&registry);
+		assert_eq!(reclaim.pending_heads(), 1);
+		reclaim.finish_frame();
+		let progress =
+			reclaim.drain_eligible(&registry, crate::engine::reclaim::RECLAIM_NODES_PER_FRAME);
+		assert_eq!(progress.visited_nodes, 3);
+		assert_eq!(progress.authoritative_bytes, 1);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 0);
+	}
+
+	#[test]
+	fn buffer_release_reclaims_authoritative_payload_after_the_publication_frame() {
+		const SOURCE: &str = "released payload\n";
+		let engine = spawn_test_engine(None);
+		engine
+			.commands
+			.send(EditorCommand::ReplaceDocument {
+				text: SOURCE.to_string(),
+				language: None,
+				virtual_path: Some("released.txt".to_string()),
+			})
+			.expect("replace source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.eq(SOURCE.as_bytes().iter().copied())
+			})
+		});
+		engine
+			.commands
+			.send(EditorCommand::OpenUastInspector { mode: None })
+			.expect("open inspector");
+		let split = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.len() == 2
+		});
+		let source_pane = split
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title != "uast")
+			.expect("source pane")
+			.pane_id;
+		engine
+			.commands
+			.send(EditorCommand::FocusPane(source_pane))
+			.expect("focus source");
+		engine
+			.commands
+			.send(EditorCommand::ClosePane)
+			.expect("close source");
+
+		let registry = engine.registry.clone();
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.len() == 1
+				&& registry.stats().orphaned_payload_bytes == 0
+				&& registry.stats().orphaned_payload_bytes_reclaimed >= SOURCE.len() as u64
+		});
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
 	}
 
 	#[test]

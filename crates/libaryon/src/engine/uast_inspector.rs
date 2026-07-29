@@ -286,6 +286,7 @@ pub(crate) fn refresh_uast_inspectors(
 			pane_lines: viewport_lines,
 			snapshot_node_budget,
 			registry_revision: registry.inspector_revision(),
+			reclaim_pending_heads: session.reclaim_queue.pending_heads(),
 		};
 		if session
 			.uast_inspectors
@@ -320,6 +321,7 @@ pub(crate) fn refresh_uast_inspectors(
 				follow_cursor,
 				fold_revision,
 				(viewport_width, viewport_lines),
+				session.reclaim_queue.pending_heads(),
 			);
 			if !inspector_view_needs_more_rows(
 				rendered.rows.len(),
@@ -793,6 +795,7 @@ fn render_snapshot(
 	follow_cursor: bool,
 	fold_revision: u64,
 	pane_geometry: (u16, u32),
+	reclaim_pending_heads: usize,
 ) -> RenderedInspector {
 	let semantic_current = identity.applied_structural_state_id == Some(identity.state_id);
 	let issue = identity
@@ -850,7 +853,7 @@ fn render_snapshot(
 	};
 	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} authoritative-payload={} B orphaned-payload={} B reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} global-allocated={} global-retired={} authoritative-payload={} B orphaned-payload={} B reclaimed={} B reclaim-heads={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nowner-nodes: live={} parked={} retired={} allocated={} roots={} · owner-payload: live={} B parked={} B retired={} B added={} B\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -867,6 +870,8 @@ fn render_snapshot(
 		snapshot.retired_nodes,
 		snapshot.authoritative_payload_bytes,
 		snapshot.orphaned_payload_bytes,
+		snapshot.orphaned_payload_bytes_reclaimed,
+		reclaim_pending_heads,
 		reachable_resident,
 		snapshot.total_bytes,
 		pane_width,
@@ -1443,6 +1448,7 @@ mod tests {
 			retired_nodes: 7,
 			authoritative_payload_bytes: 20,
 			orphaned_payload_bytes: 10,
+			orphaned_payload_bytes_reclaimed: 5,
 			reachable_visited: 4,
 			reachable_complete: true,
 			reachable_resident_bytes: 0,
@@ -1533,6 +1539,7 @@ mod tests {
 			false,
 			1,
 			(80, 24),
+			2,
 		);
 
 		assert_eq!(

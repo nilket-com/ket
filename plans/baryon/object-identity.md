@@ -94,9 +94,10 @@ Capacity is fixed at `UastRegistry::new(capacity)` (16M, `host.rs:62`), and exha
 `expect("UastRegistry capacity exceeded during split")` (`registry.rs:216-218`).
 
 **The upside is load-bearing for identity:** a stale `NodeId` can never denote a *different* object —
-only a dead one. Reads of an orphaned node succeed and return stale content; there is no "dead" bit
-and no generation to check. Any buffer store must preserve this property deliberately rather than
-inherit it.
+only a dead one. ADR 0001 stage 3b preserves that non-aliasing identity while reclaiming payload
+after a publication fence: topology and metrics remain readable, but a reclaimed node has no stale
+resident content. There is still no reusable slot or generation-tagged id. Any future address-reuse
+scheme must preserve stale-handle safety deliberately rather than inherit it.
 
 ### 2.3 The existing stale-rejection precedent
 

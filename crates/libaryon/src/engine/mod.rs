@@ -22,6 +22,7 @@ mod markdown_image_preview;
 mod minimap;
 pub(crate) mod navigation;
 mod protocol;
+mod reclaim;
 mod render;
 pub(crate) mod request;
 mod rune_host;

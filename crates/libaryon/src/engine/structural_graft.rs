@@ -100,13 +100,33 @@ fn validate_coverage(green: &GreenNode) -> Result<(), GraftError> {
 /// enforced by [`validate_graft`] before anything is mutated. On `Err` the
 /// registry is untouched.
 ///
-/// Returns the NodeId of the grafted module node (first child of root).
+/// Test-fixture wrapper returning only the grafted module id. Production must
+/// retain the detached forest heads from [`apply_graft_tracked`].
+#[cfg(test)]
 pub fn apply_graft(
 	registry: &UastRegistry,
 	root: NodeId,
 	green: &GreenNode,
 	source: &[u8],
 ) -> Result<NodeId, GraftError> {
+	apply_graft_tracked(registry, root, green, source).map(|outcome| outcome.new_module)
+}
+
+pub(crate) struct AppliedGraft {
+	#[cfg(test)]
+	pub(crate) new_module: NodeId,
+	pub(crate) retired_heads: Vec<NodeId>,
+}
+
+/// Production graft entry point. In addition to the new module, return every
+/// direct child detached from the stable root so reclamation can traverse the
+/// exact retired forest without following stale root-level sibling links.
+pub(crate) fn apply_graft_tracked(
+	registry: &UastRegistry,
+	root: NodeId,
+	green: &GreenNode,
+	source: &[u8],
+) -> Result<AppliedGraft, GraftError> {
 	// Reject before detaching anything. Past this point the graft cannot fail.
 	validate_graft(registry, root, green, source)?;
 
@@ -115,11 +135,13 @@ pub fn apply_graft(
 	// cannot propagate stale newline deltas into the new root.
 	registry.cancel_metric_scan(root);
 	let mut old_child = registry.get_first_child(root);
+	let mut retired_heads = Vec::new();
 	while let Some(node) = old_child {
 		let next = registry.get_next_sibling(node);
 		unsafe {
 			(*registry.edges[node.index()].get()).parent = None;
 		}
+		retired_heads.push(node);
 		old_child = next;
 	}
 
@@ -140,7 +162,11 @@ pub fn apply_graft(
 	}
 	registry.remove_root_child_line_index(root);
 
-	Ok(new_module)
+	Ok(AppliedGraft {
+		#[cfg(test)]
+		new_module,
+		retired_heads,
+	})
 }
 
 /// Recursively allocate nodes in the registry for a GreenNode subtree.

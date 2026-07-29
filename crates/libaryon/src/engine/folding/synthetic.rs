@@ -574,8 +574,12 @@ fn materialize_synthetic_fold_plan(
 			edges.next_sibling = None;
 		}
 	}
-	registry.note_nodes_retired(retired_originals.len() as u64);
-	registry.note_orphaned_payload(retired_payload);
+	registry.retire_orphaned_forest(
+		retired_originals.iter().copied(),
+		retired_originals.len() as u64,
+		retired_payload,
+		crate::ecs::registry::ReclaimFence::AfterPublication,
+	);
 	registry.reconcile_installed_root_child_line_index_after(parent, prev);
 
 	Some(fold_node)

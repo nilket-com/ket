@@ -158,6 +158,7 @@ pub(crate) struct UastInspectorRefreshKey {
 	pub(crate) pane_lines: u32,
 	pub(crate) snapshot_node_budget: usize,
 	pub(crate) registry_revision: u64,
+	pub(crate) reclaim_pending_heads: usize,
 }
 
 #[derive(Debug)]
@@ -3581,6 +3582,7 @@ pub(crate) struct EditorSession {
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
 	pub(crate) uast_inspectors: HashMap<BufferId, UastInspectorPanel>,
+	pub(crate) reclaim_queue: super::reclaim::ReclaimQueue,
 	pub(crate) git_status_job: Option<JobId>,
 	pub(crate) git_status_refresh_pending: bool,
 	pub(crate) git_status_branch: Option<String>,
@@ -3851,8 +3853,12 @@ impl EditorSession {
 				.take()
 				.unwrap_or(RootTransition::Retire);
 			if transition == RootTransition::Retire {
-				registry.note_nodes_retired(accounting_before.current_live_nodes);
-				registry.note_orphaned_payload(accounting_before.current_live_payload_bytes);
+				registry.retire_orphaned_forest(
+					[root_before],
+					accounting_before.current_live_nodes,
+					accounting_before.current_live_payload_bytes,
+					crate::ecs::registry::ReclaimFence::AfterPublication,
+				);
 			}
 			document.uast_accounting.record_root_transition(
 				allocated_delta,
@@ -4143,6 +4149,7 @@ impl EditorSession {
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),
 			uast_inspectors: HashMap::new(),
+			reclaim_queue: super::reclaim::ReclaimQueue::default(),
 			git_status_job: None,
 			git_status_refresh_pending: false,
 			git_status_branch: None,
@@ -5237,15 +5244,19 @@ mod tests {
 						.saturating_sub(1);
 					let retired_payload =
 						editor.document.uast_accounting.current_live_payload_bytes;
-					crate::engine::structural_graft::apply_graft(
+					let graft = crate::engine::structural_graft::apply_graft_tracked(
 						&registry,
 						editor.document.root_id,
 						&green,
 						SOURCE,
 					)
 					.expect("graft is byte-identical");
-					registry.note_nodes_retired(retired_nodes);
-					registry.note_orphaned_payload(retired_payload);
+					registry.retire_orphaned_forest(
+						graft.retired_heads,
+						retired_nodes,
+						retired_payload,
+						crate::ecs::registry::ReclaimFence::AfterPublication,
+					);
 					editor.document.bump_topology_rev();
 				},
 			)
@@ -5275,6 +5286,35 @@ mod tests {
 			payload.retained() - baseline.retained(),
 			document.uast_accounting.current_live_payload_bytes + orphaned_delta
 		);
+
+		session.reclaim_queue.collect_registry_notices(&registry);
+		assert_eq!(
+			registry.authoritative_payload_snapshot().orphaned(),
+			orphaned_delta,
+			"retirement frame must retain quarantined payload"
+		);
+		session.reclaim_queue.finish_frame();
+		let live_payload = document.uast_accounting.current_live_payload_bytes;
+		while session.reclaim_queue.has_eligible_work() {
+			let step = session.reclaim_queue.drain_eligible(&registry, 1);
+			assert!(
+				step.visited_nodes <= 1,
+				"reclaim step exceeded its node budget"
+			);
+			let partial = registry.authoritative_payload_snapshot();
+			assert_eq!(
+				partial.retained() - baseline.retained(),
+				live_payload + (partial.orphaned() - baseline.orphaned()),
+				"retained payload must reconcile after every partial reclaim step"
+			);
+		}
+		let reclaimed = registry.authoritative_payload_snapshot();
+		assert_eq!(reclaimed.orphaned() - baseline.orphaned(), 0);
+		assert_eq!(
+			reclaimed.orphaned_removed - baseline.orphaned_removed,
+			(GRAFTS - 1) * SOURCE.len() as u64
+		);
+		assert_eq!(reclaimed.retained() - baseline.retained(), live_payload);
 	}
 
 	#[test]
@@ -5315,8 +5355,12 @@ mod tests {
 				);
 				candidate.append_local_child(root, leaf);
 				registry.replace_authoritative_data(leaf, b"lost".to_vec());
-				registry.note_nodes_retired(2);
-				registry.note_orphaned_payload(4);
+				registry.retire_orphaned_forest(
+					[root],
+					2,
+					4,
+					crate::ecs::registry::ReclaimFence::NeverPublished,
+				);
 			},
 		);
 
@@ -5336,6 +5380,14 @@ mod tests {
 			document.uast_accounting.current_live_nodes,
 			exact_reachable_nodes(&registry, document.root_id)
 		);
+
+		session.reclaim_queue.collect_registry_notices(&registry);
+		let reclaimed = session
+			.reclaim_queue
+			.drain_eligible(&registry, crate::engine::reclaim::RECLAIM_NODES_PER_FRAME);
+		assert_eq!(reclaimed.visited_nodes, 2);
+		assert_eq!(reclaimed.authoritative_bytes, 4);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 0);
 	}
 
 	#[test]

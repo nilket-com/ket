@@ -32,12 +32,32 @@ pub struct RegistryStatsSnapshot {
 	pub authoritative_payload_bytes: u64,
 	/// Authoritative bytes detached from their final owner but not yet freed.
 	pub orphaned_payload_bytes: u64,
+	/// Authoritative orphan bytes physically reclaimed since registry creation.
+	pub orphaned_payload_bytes_reclaimed: u64,
 	pub sum_tree_rebuilds: u64,
 	/// UAST nodes examined while viewport queries seek their first visible leaf.
 	pub viewport_descent_node_visits: u64,
 	pub high_priority_io_count: u64,
 	pub high_priority_io_total_micros: u64,
 	pub high_priority_io_max_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimFence {
+	AfterPublication,
+	NeverPublished,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetiredForestNotice {
+	pub(crate) heads: Vec<NodeId>,
+	pub(crate) fence: ReclaimFence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReclaimedPayload {
+	pub(crate) authoritative_bytes: u64,
+	pub(crate) hydrated_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -185,6 +205,7 @@ pub struct UastRegistry {
 	authoritative_bytes_removed: AtomicU64,
 	orphaned_payload_bytes_added: AtomicU64,
 	orphaned_payload_bytes_removed: AtomicU64,
+	retired_forest_outbox: Mutex<Vec<RetiredForestNotice>>,
 	/// Monotonic invalidation token for metadata-only inspector snapshots.
 	/// Residency, metric knowledge, allocation, and topology changes bump it.
 	inspector_revision: AtomicU64,
@@ -251,6 +272,7 @@ impl UastRegistry {
 			authoritative_bytes_removed: AtomicU64::new(0),
 			orphaned_payload_bytes_added: AtomicU64::new(0),
 			orphaned_payload_bytes_removed: AtomicU64::new(0),
+			retired_forest_outbox: Mutex::new(Vec::new()),
 			inspector_revision: AtomicU64::new(0),
 			resident_accounted_bytes: PagedArray::new(cap, || AtomicU64::new(0)),
 			resident_counted_hot: PagedArray::new(cap, || AtomicBool::new(false)),
@@ -395,6 +417,91 @@ impl UastRegistry {
 			"orphaned payload additions overflow",
 		);
 		self.bump_inspector_revision();
+	}
+
+	pub(crate) fn retire_orphaned_forest(
+		&self,
+		heads: impl IntoIterator<Item = NodeId>,
+		retired_nodes: u64,
+		authoritative_payload: u64,
+		fence: ReclaimFence,
+	) {
+		let heads = heads.into_iter().collect::<Vec<_>>();
+		assert!(
+			!heads.is_empty() || (retired_nodes == 0 && authoritative_payload == 0),
+			"nonempty retirement requires at least one forest head"
+		);
+		for head in &heads {
+			assert!(
+				unsafe { (*self.edges[head.index()].get()).parent.is_none() },
+				"retired forest head must be detached"
+			);
+		}
+		self.note_nodes_retired(retired_nodes);
+		self.note_orphaned_payload(authoritative_payload);
+		if !heads.is_empty() {
+			self.retired_forest_outbox
+				.lock()
+				.unwrap()
+				.push(RetiredForestNotice { heads, fence });
+		}
+	}
+
+	pub(crate) fn drain_retired_forest_notices(&self) -> Vec<RetiredForestNotice> {
+		std::mem::take(&mut *self.retired_forest_outbox.lock().unwrap())
+	}
+
+	/// Drop payload from one node in a retired forest without changing its
+	/// identity, topology, metrics, or physical span.
+	///
+	/// Reclamation and physical splits are engine-thread serialized. Advancing
+	/// the generation while holding the residency write lock makes every late
+	/// whole/partial resolver publication fail before it can resurrect bytes.
+	pub(crate) fn reclaim_orphaned_payload(&self, node: NodeId) -> ReclaimedPayload {
+		let _resident_write = self.resident_data_lock.write().unwrap();
+		let idx = node.index();
+		let _ = self.bump_content_generation(node);
+		let spanless = unsafe { (*self.spans[idx].get()).is_none() };
+		let full_len = unsafe {
+			(&mut *self.virtual_data[idx].get())
+				.take()
+				.map_or(0, |bytes| bytes.len() as u64)
+		};
+		unsafe {
+			(&mut *self.partial_residency[idx].get()).clear();
+		}
+		let accounted = self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel);
+		if accounted > 0 {
+			self.resident_bytes.fetch_sub(accounted, Ordering::AcqRel);
+		}
+		if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+			self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+		}
+		self.touch_resident_lru(node, false);
+
+		let reclaimed = if spanless {
+			Self::checked_monotonic_add(
+				&self.authoritative_bytes_removed,
+				full_len,
+				"authoritative payload removals overflow",
+			);
+			Self::checked_monotonic_add(
+				&self.orphaned_payload_bytes_removed,
+				full_len,
+				"orphaned payload removals overflow",
+			);
+			ReclaimedPayload {
+				authoritative_bytes: full_len,
+				hydrated_bytes: 0,
+			}
+		} else {
+			ReclaimedPayload {
+				authoritative_bytes: 0,
+				hydrated_bytes: accounted,
+			}
+		};
+		self.bump_inspector_revision();
+		reclaimed
 	}
 
 	/// Replace the sole copy of a span-less node's content.
@@ -1019,6 +1126,7 @@ impl UastRegistry {
 			resident_bytes: self.resident_bytes.load(Ordering::Acquire),
 			authoritative_payload_bytes: payload.retained(),
 			orphaned_payload_bytes: payload.orphaned(),
+			orphaned_payload_bytes_reclaimed: payload.orphaned_removed,
 			sum_tree_rebuilds: self.sum_tree_rebuilds.load(Ordering::Acquire),
 			viewport_descent_node_visits: self.viewport_descent_node_visits.load(Ordering::Acquire),
 			high_priority_io_count: self.high_priority_io_count.load(Ordering::Acquire),
@@ -1195,8 +1303,12 @@ impl UastRegistry {
 			}
 		}
 		if parent.is_some() {
-			self.note_nodes_retired(1);
-			self.note_orphaned_payload(orphaned_payload);
+			self.retire_orphaned_forest(
+				[node],
+				1,
+				orphaned_payload,
+				ReclaimFence::AfterPublication,
+			);
 		} else {
 			self.bump_inspector_revision();
 		}
@@ -1640,7 +1752,7 @@ impl UastRegistry {
 
 #[cfg(test)]
 mod tests {
-	use super::UastRegistry;
+	use super::{ReclaimFence, ReclaimedPayload, UastRegistry};
 	use crate::svp::pointer::SvpPointer;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
@@ -1921,16 +2033,102 @@ mod tests {
 	}
 
 	#[test]
+	fn reclaimed_spanless_nodes_keep_inert_identity_topology_and_metrics() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			None,
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		registry.replace_authoritative_data(leaf, b"data".to_vec());
+		registry.retire_orphaned_forest([leaf], 1, 4, ReclaimFence::NeverPublished);
+
+		assert_eq!(
+			registry.reclaim_orphaned_payload(leaf),
+			ReclaimedPayload {
+				authoritative_bytes: 4,
+				hydrated_bytes: 0,
+			}
+		);
+		assert_eq!(
+			registry.reclaim_orphaned_payload(leaf),
+			ReclaimedPayload::default()
+		);
+		assert_eq!(registry.get_total_bytes(leaf), 4);
+		assert_eq!(registry.get_first_child(leaf), None);
+		assert!(registry.resolve_physical_bytes(leaf).is_empty());
+		assert_eq!(
+			registry
+				.read_node_bytes_sync(leaf)
+				.expect_err("reclaimed authoritative payload is absent")
+				.kind(),
+			std::io::ErrorKind::NotFound
+		);
+		let metadata = registry.inspector_node_metadata(leaf, 0);
+		assert!(!metadata.has_physical_span);
+		assert_eq!(metadata.resident_bytes, 0);
+		assert_eq!(registry.stats().orphaned_payload_bytes, 0);
+		assert_eq!(registry.stats().orphaned_payload_bytes_reclaimed, 4);
+	}
+
+	#[test]
+	fn reclaim_generation_rejects_late_whole_and_partial_hydration() {
+		let registry = UastRegistry::new(1);
+		let mut chunk = registry.reserve_chunk(1).expect("registry chunk");
+		let leaf = chunk.spawn_node(
+			SemanticKind::Token,
+			Some(SvpPointer {
+				lba: 0,
+				byte_length: 4,
+				device_id: 1,
+				head_trim: 0,
+			}),
+			SpanMetrics {
+				byte_length: 4,
+				newlines: 0,
+			},
+		);
+		let admitted_generation = registry.content_generation(leaf);
+		registry.publish_hydrated_data(leaf, b"old!".to_vec());
+		registry.retire_orphaned_forest([leaf], 1, 0, ReclaimFence::NeverPublished);
+
+		assert_eq!(
+			registry.reclaim_orphaned_payload(leaf),
+			ReclaimedPayload {
+				authoritative_bytes: 0,
+				hydrated_bytes: 4,
+			}
+		);
+		assert!(!registry.publish_resolved_data(leaf, admitted_generation, b"late".to_vec()));
+		assert!(!registry.publish_partial_resident_range(
+			leaf,
+			admitted_generation,
+			0,
+			b"late".to_vec(),
+		));
+		assert!(!registry.whole_leaf_is_resident(leaf));
+		assert_eq!(registry.stats().resident_bytes, 0);
+	}
+
+	#[test]
 	fn production_payload_writes_use_the_intent_api() {
 		let sources = [
 			("mutation", include_str!("../uast/mutation.rs")),
 			("graft", include_str!("../engine/structural_graft.rs")),
 			("folding", include_str!("../engine/folding/synthetic.rs")),
+			("semantic", include_str!("../engine/semantic.rs")),
 			("session", include_str!("../engine/session.rs")),
 			("file-browser", include_str!("../engine/file_browser.rs")),
+			("runtime", include_str!("../engine/runtime.rs")),
+			("runtime-edit", include_str!("../engine/runtime/edit.rs")),
 			("system", include_str!("../engine/runtime/system.rs")),
 			("document-io", include_str!("../engine/document/io.rs")),
 			("resolver", include_str!("../svp/resolver.rs")),
+			("ingest", include_str!("../svp/ingest.rs")),
 			("python", include_str!("../svp/python_ast.rs")),
 			("rune", include_str!("../svp/rune_ast.rs")),
 		];
@@ -1953,6 +2151,11 @@ mod tests {
 					"{label}:{} bypasses authoritative payload accounting: {trimmed}",
 					line_number + 1
 				);
+				assert!(
+					!line.contains("note_nodes_retired") && !line.contains("note_orphaned_payload"),
+					"{label}:{} bypasses typed retired-forest transport: {trimmed}",
+					line_number + 1
+				);
 			}
 		}
 		assert!(
@@ -1964,6 +2167,11 @@ mod tests {
 			include_str!("../svp/rune_ast.rs")
 				.contains("#[cfg(test)]\npub fn apply_rune_semantic_update"),
 			"obsolete Rune semantic application must remain test-only"
+		);
+		assert!(
+			include_str!("../engine/structural_graft.rs")
+				.contains("#[cfg(test)]\npub fn apply_graft"),
+			"production grafts must return exact retired forest heads"
 		);
 	}
 

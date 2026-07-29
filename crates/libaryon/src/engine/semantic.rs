@@ -6,7 +6,7 @@ use super::session::{
 	BufferStore, CommonViewState, LayoutNode, SemanticState, StructuralIssue, StructuralIssueKind,
 	TextEditorMut, with_text_buffer_mut,
 };
-use super::structural_graft::apply_graft;
+use super::structural_graft::apply_graft_tracked;
 use crate::core::{BufferId, DocByte, RequestId};
 use crate::ecs::UastRegistry;
 use crate::svp::semantic::{SemanticReactor, SemanticRequest, SemanticResponse};
@@ -97,15 +97,19 @@ fn apply_semantic_response(
 		// A graft that would not reproduce the document's bytes is refused, and the
 		// document keeps the tree it has. The highlights above still stand: they are
 		// offsets into unchanged bytes.
-		if apply_graft(registry, rid, &green, &source_bytes).is_err() {
+		let Ok(graft) = apply_graft_tracked(registry, rid, &green, &source_bytes) else {
 			document.semantic.structural_issue = Some(StructuralIssue {
 				state_id,
 				kind: StructuralIssueKind::Rejected,
 			});
 			return false;
-		}
-		registry.note_nodes_retired(retired_descendants);
-		registry.note_orphaned_payload(retired_payload);
+		};
+		registry.retire_orphaned_forest(
+			graft.retired_heads,
+			retired_descendants,
+			retired_payload,
+			crate::ecs::registry::ReclaimFence::AfterPublication,
+		);
 		document.bump_topology_rev();
 		doctab
 			.view
