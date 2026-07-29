@@ -19,6 +19,7 @@ const INSPECTOR_NODE_BUDGET: usize = 2_048;
 const INSPECTOR_DEPTH_BUDGET: u16 = 32;
 const INSPECTOR_MIN_NODE_BUDGET: usize = 64;
 const INSPECTOR_VIEWPORT_OVERSCAN: usize = 4;
+const INSPECTOR_RENDERED_OVERSCAN: usize = 2;
 const INSPECTOR_HEADER_LINES: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +109,7 @@ pub(crate) fn open_uast_inspector(
 			last_refresh_key: None,
 			graph: None,
 			rendered_text: Vec::new(),
+			snapshot_node_budget: 0,
 		},
 	);
 	session.ui.status_message = Some(format!("UAST inspector opened ({})", mode_name(mode)));
@@ -179,14 +181,20 @@ pub(crate) fn refresh_uast_inspectors(
 				)
 			})
 			.unwrap_or((80, 24, 0));
-		let viewport_budget = usize::try_from(inspector_scroll)
-			.unwrap_or(usize::MAX)
-			.saturating_add(
-				usize::try_from(viewport_lines)
-					.unwrap_or(usize::MAX)
-					.saturating_mul(INSPECTOR_VIEWPORT_OVERSCAN),
-			)
-			.clamp(INSPECTOR_MIN_NODE_BUDGET, INSPECTOR_NODE_BUDGET);
+		let rendered_rows = session
+			.uast_inspectors
+			.get(&panel_buffer_id)
+			.map_or(0, |panel| panel.rows.len());
+		let current_node_budget = session
+			.uast_inspectors
+			.get(&panel_buffer_id)
+			.map_or(0, |panel| panel.snapshot_node_budget);
+		let mut snapshot_node_budget = next_snapshot_node_budget(
+			current_node_budget,
+			inspector_scroll,
+			viewport_lines,
+			rendered_rows,
+		);
 		let Some((mut identity, source_name)) = session
 			.buffers
 			.get(source_buffer_id)
@@ -255,7 +263,7 @@ pub(crate) fn refresh_uast_inspectors(
 			// in the paired source view recenter or invalidate the inspector.
 			identity.cursor_byte = selected_inspector_source_byte(session, panel_buffer_id, stamp);
 		}
-		let refresh_key = UastInspectorRefreshKey {
+		let mut refresh_key = UastInspectorRefreshKey {
 			source_buffer_id,
 			source_view_id: identity.view_id,
 			source_name: source_name.clone(),
@@ -272,7 +280,7 @@ pub(crate) fn refresh_uast_inspectors(
 			follow_cursor,
 			pane_width: viewport_width,
 			pane_lines: viewport_lines,
-			pane_scroll: inspector_scroll,
+			snapshot_node_budget,
 			registry_revision: registry.inspector_revision(),
 		};
 		if session
@@ -284,30 +292,53 @@ pub(crate) fn refresh_uast_inspectors(
 			}) {
 			continue;
 		}
-		let snapshot = registry.inspect_uast(
-			identity.root,
-			UastInspectorOptions {
-				max_nodes: viewport_budget,
-				max_depth: INSPECTOR_DEPTH_BUDGET,
-				cursor_byte: identity.cursor_byte.map(DocByte::get),
-				..UastInspectorOptions::default()
-			},
-		);
 		let provider = identity
 			.active_language_id
 			.and_then(|language_id| lang_registry.get_provider(language_id));
-		let rendered = render_snapshot(
-			&snapshot,
-			identity,
-			&source_name,
-			mode,
-			provider,
-			stamp,
-			&folded,
-			follow_cursor,
-			fold_revision,
-			(viewport_width, viewport_lines, inspector_scroll),
-		);
+		let rendered = loop {
+			let snapshot = registry.inspect_uast(
+				identity.root,
+				UastInspectorOptions {
+					max_nodes: snapshot_node_budget,
+					max_depth: INSPECTOR_DEPTH_BUDGET,
+					cursor_byte: identity.cursor_byte.map(DocByte::get),
+					..UastInspectorOptions::default()
+				},
+			);
+			let rendered = render_snapshot(
+				&snapshot,
+				identity,
+				&source_name,
+				mode,
+				provider,
+				stamp,
+				&folded,
+				follow_cursor,
+				fold_revision,
+				(viewport_width, viewport_lines),
+			);
+			if !inspector_view_needs_more_rows(
+				rendered.rows.len(),
+				inspector_scroll,
+				viewport_lines,
+			) || snapshot_node_budget == INSPECTOR_NODE_BUDGET
+			{
+				break rendered;
+			}
+			if snapshot.nodes.len() < snapshot_node_budget {
+				// This scope is already exhausted. Mark the high-water budget
+				// complete so later scroll frames do not retry the same walk.
+				snapshot_node_budget = INSPECTOR_NODE_BUDGET;
+				break rendered;
+			}
+			snapshot_node_budget = snapshot_node_budget
+				.saturating_mul(2)
+				.min(INSPECTOR_NODE_BUDGET);
+		};
+		refresh_key.snapshot_node_budget = snapshot_node_budget;
+		if let Some(panel) = session.uast_inspectors.get_mut(&panel_buffer_id) {
+			panel.snapshot_node_budget = snapshot_node_budget;
+		}
 		let selected = selected_row_after_refresh(
 			session,
 			panel_buffer_id,
@@ -328,6 +359,42 @@ pub(crate) fn refresh_uast_inspectors(
 			refresh_key,
 		);
 	}
+}
+
+fn next_snapshot_node_budget(
+	current: usize,
+	scroll_y: u64,
+	viewport_lines: u32,
+	rendered_rows: usize,
+) -> usize {
+	if current == 0 {
+		return usize::try_from(viewport_lines)
+			.unwrap_or(usize::MAX)
+			.saturating_mul(INSPECTOR_VIEWPORT_OVERSCAN)
+			.clamp(INSPECTOR_MIN_NODE_BUDGET, INSPECTOR_NODE_BUDGET);
+	}
+	if inspector_view_needs_more_rows(rendered_rows, scroll_y, viewport_lines) {
+		current
+			.saturating_mul(2)
+			.clamp(INSPECTOR_MIN_NODE_BUDGET, INSPECTOR_NODE_BUDGET)
+	} else {
+		current.clamp(INSPECTOR_MIN_NODE_BUDGET, INSPECTOR_NODE_BUDGET)
+	}
+}
+
+fn inspector_view_needs_more_rows(
+	rendered_rows: usize,
+	scroll_y: u64,
+	viewport_lines: u32,
+) -> bool {
+	let required_lines = usize::try_from(scroll_y)
+		.unwrap_or(usize::MAX)
+		.saturating_add(
+			usize::try_from(viewport_lines)
+				.unwrap_or(usize::MAX)
+				.saturating_mul(INSPECTOR_RENDERED_OVERSCAN),
+		);
+	(INSPECTOR_HEADER_LINES as usize).saturating_add(rendered_rows) < required_lines
 }
 
 fn selected_inspector_source_byte(
@@ -720,7 +787,7 @@ fn render_snapshot(
 	folded: &HashSet<UastInspectorNodeKey>,
 	follow_cursor: bool,
 	fold_revision: u64,
-	pane_geometry: (u16, u32, u64),
+	pane_geometry: (u16, u32),
 ) -> RenderedInspector {
 	let semantic_current = identity.applied_structural_state_id == Some(identity.state_id);
 	let issue = identity
@@ -776,9 +843,9 @@ fn render_snapshot(
 	} else {
 		format!(">={}", snapshot.reachable_resident_bytes)
 	};
-	let (pane_width, pane_lines, pane_scroll) = pane_geometry;
+	let (pane_width, pane_lines) = pane_geometry;
 	let mut text = format!(
-		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} allocated={} reachable-resident={} B total={} B pane={}x{} scroll={} fold-rev={}\nEnter jump · Space fold · f follow\n",
+		"UAST {source_name} · {}\ntopology: {topology_regime} · semantic: {semantic_status} · scope: {scope} · follow: {}\nstate={} applied={} topology-rev={} root=#{} view={}\nreachable={} allocated={} reachable-resident={} B total={} B pane={}x{} shown={} fold-rev={}\nEnter jump · Space fold · f follow\n",
 		mode_name(mode),
 		if follow_cursor { "on" } else { "off" },
 		identity.state_id,
@@ -796,7 +863,7 @@ fn render_snapshot(
 		snapshot.total_bytes,
 		pane_width,
 		pane_lines,
-		pane_scroll,
+		snapshot.nodes.len(),
 		fold_revision,
 	);
 	let mut highlights = vec![HighlightSpan::new(
@@ -1257,6 +1324,25 @@ mod tests {
 	}
 
 	#[test]
+	fn snapshot_budget_grows_from_rendered_rows_and_never_shrinks() {
+		let initial = next_snapshot_node_budget(0, 9, 106, 0);
+		assert_eq!(initial, 424);
+		assert!(inspector_view_needs_more_rows(67, 9, 106));
+
+		let grown = next_snapshot_node_budget(initial, 9, 106, 67);
+		assert_eq!(grown, 848);
+		assert_eq!(
+			next_snapshot_node_budget(grown, 0, 106, 300),
+			grown,
+			"scrolling upward must not shorten the synthetic document"
+		);
+		assert_eq!(
+			next_snapshot_node_budget(INSPECTOR_NODE_BUDGET, u64::MAX, u32::MAX, 0),
+			INSPECTOR_NODE_BUDGET
+		);
+	}
+
+	#[test]
 	fn selection_remap_uses_full_identity_and_prefers_the_deepest_match() {
 		let root = NodeId::from_index(0);
 		let old_stamp = stamp(root, StateId::ZERO, TopologyRev::ZERO);
@@ -1415,7 +1501,7 @@ mod tests {
 			&folded,
 			false,
 			1,
-			(80, 24, 0),
+			(80, 24),
 		);
 
 		assert_eq!(
@@ -1428,6 +1514,8 @@ mod tests {
 		);
 		let text = String::from_utf8(rendered.text).expect("UTF-8 inspector");
 		assert!(text.contains("semantic: graft rejected"));
+		assert!(text.contains("pane=80x24 shown=4"));
+		assert!(!text.contains("scroll="));
 		assert!(text.contains("\n▾\t"));
 		assert!(text.contains("\n▸\t\t"));
 		assert!(

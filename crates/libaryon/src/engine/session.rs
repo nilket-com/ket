@@ -154,7 +154,7 @@ pub(crate) struct UastInspectorRefreshKey {
 	pub(crate) follow_cursor: bool,
 	pub(crate) pane_width: u16,
 	pub(crate) pane_lines: u32,
-	pub(crate) pane_scroll: u64,
+	pub(crate) snapshot_node_budget: usize,
 	pub(crate) registry_revision: u64,
 }
 
@@ -173,6 +173,7 @@ pub(crate) struct UastInspectorPanel {
 	pub(crate) last_refresh_key: Option<UastInspectorRefreshKey>,
 	pub(crate) graph: Option<crate::uast::UastGraphSnapshot>,
 	pub(crate) rendered_text: Vec<u8>,
+	pub(crate) snapshot_node_budget: usize,
 }
 
 pub(crate) struct TextBuffer {
