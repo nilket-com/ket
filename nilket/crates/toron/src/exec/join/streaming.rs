@@ -1587,6 +1587,55 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct SuffixProbeBuildFacts {
+	shape: super::build_rows::JoinBuildProfileShape,
+	build_rows: u64,
+	build_batch_bytes: u64,
+	key_width_bytes: u64,
+	unsupported_reason: Option<&'static str>,
+}
+
+impl SuffixProbeBuildFacts {
+	fn from_in_memory(
+		key_plan: JoinKeyPlan,
+		build_batch: &RecordBatch,
+		build_rows: &JoinBuildRows,
+	) -> Self {
+		let (key_width_bytes, unsupported_reason) = match key_plan {
+			JoinKeyPlan::Int32 => (4, None),
+			JoinKeyPlan::Int64 => (8, None),
+			JoinKeyPlan::Generic => (
+				0,
+				Some("generic suffix keys have no batch-window timing boundary"),
+			),
+		};
+		Self {
+			// `accounted_bytes()` walks the build entries. This constructor is therefore called
+			// only behind the runtime's one-time cache, never from a suffix probe call directly.
+			shape: build_rows.profile_shape(),
+			build_rows: u64::try_from(build_batch.num_rows()).unwrap_or(u64::MAX),
+			build_batch_bytes: record_batch_memory_bytes(build_batch),
+			key_width_bytes,
+			unsupported_reason,
+		}
+	}
+}
+
+#[derive(Default)]
+pub(in crate::exec) struct SuffixProbeBuildFactsCache {
+	facts: Option<SuffixProbeBuildFacts>,
+}
+
+impl SuffixProbeBuildFactsCache {
+	fn get_or_insert_with(
+		&mut self,
+		build: impl FnOnce() -> SuffixProbeBuildFacts,
+	) -> SuffixProbeBuildFacts {
+		*self.facts.get_or_insert_with(build)
+	}
+}
+
 #[derive(Default)]
 struct SuffixProbeCallProfile {
 	probe: InMemoryProbeProfile,
@@ -1618,43 +1667,24 @@ impl SuffixProbeCallProfile {
 		*target = total;
 	}
 
-	fn observe_in_memory_build(
-		&mut self,
-		key_plan: JoinKeyPlan,
-		build_batch: &RecordBatch,
-		build_rows: &JoinBuildRows,
-	) {
-		let shape = build_rows.profile_shape();
-		let rows = u64::try_from(build_batch.num_rows()).unwrap_or(u64::MAX);
-		let bytes = record_batch_memory_bytes(build_batch);
-		let key_width_bytes = match key_plan {
-			JoinKeyPlan::Int32 => {
-				self.probe.supported = true;
-				4
-			}
-			JoinKeyPlan::Int64 => {
-				self.probe.supported = true;
-				8
-			}
-			JoinKeyPlan::Generic => {
-				self.unsupported_reason =
-					Some("generic suffix keys have no batch-window timing boundary");
-				0
-			}
-		};
+	fn observe_in_memory_build(&mut self, facts: SuffixProbeBuildFacts) {
+		self.probe.supported = facts.unsupported_reason.is_none();
+		if facts.unsupported_reason.is_some() {
+			self.unsupported_reason = facts.unsupported_reason;
+		}
 		if let Some(existing) = self.build_shape {
-			if existing != shape
-				|| self.build_rows != rows
-				|| self.build_batch_bytes != bytes
-				|| self.key_width_bytes != key_width_bytes
+			if existing != facts.shape
+				|| self.build_rows != facts.build_rows
+				|| self.build_batch_bytes != facts.build_batch_bytes
+				|| self.key_width_bytes != facts.key_width_bytes
 			{
 				self.unsupported_reason = Some("suffix build shape changed within one replay call");
 			}
 		} else {
-			self.build_shape = Some(shape);
-			self.build_rows = rows;
-			self.build_batch_bytes = bytes;
-			self.key_width_bytes = key_width_bytes;
+			self.build_shape = Some(facts.shape);
+			self.build_rows = facts.build_rows;
+			self.build_batch_bytes = facts.build_batch_bytes;
+			self.key_width_bytes = facts.key_width_bytes;
 		}
 	}
 
@@ -1958,6 +1988,7 @@ pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 	InMemory {
 		batch: RecordBatch,
 		rows: JoinBuildRows,
+		suffix_profile_build: SuffixProbeBuildFactsCache,
 	},
 	Spilled {
 		build: SpilledInnerJoinBuild,
@@ -2125,7 +2156,7 @@ impl ReorientedInnerJoinRuntime<'_> {
 
 	fn retained_resident_bytes(&self) -> u64 {
 		match &self.build {
-			ReorientedInnerJoinBuild::InMemory { batch, rows } => {
+			ReorientedInnerJoinBuild::InMemory { batch, rows, .. } => {
 				record_batch_memory_bytes(batch).saturating_add(rows.accounted_bytes())
 			}
 			ReorientedInnerJoinBuild::Spilled { build, .. } => build.retained_resident_bytes(),
@@ -16563,6 +16594,7 @@ impl Executor {
 			build: ReorientedInnerJoinBuild::InMemory {
 				batch: build_batch,
 				rows: build_rows,
+				suffix_profile_build: SuffixProbeBuildFactsCache::default(),
 			},
 			key_plan,
 			probe_keys: stage.probe_keys,
@@ -17184,8 +17216,17 @@ impl Executor {
 		mut profile: Option<&mut SuffixProbeCallProfile>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let (output, probe_rows, output_rows) = match &mut runtime.build {
-			ReorientedInnerJoinBuild::InMemory { batch, rows } => self
-				.probe_reoriented_inner_join_in_memory(
+			ReorientedInnerJoinBuild::InMemory {
+				batch,
+				rows,
+				suffix_profile_build,
+			} => {
+				let profile_build = profile.as_ref().map(|_| {
+					suffix_profile_build.get_or_insert_with(|| {
+						SuffixProbeBuildFacts::from_in_memory(runtime.key_plan, batch, rows)
+					})
+				});
+				self.probe_reoriented_inner_join_in_memory(
 					runtime.key_plan,
 					&runtime.probe_keys,
 					&runtime.output_schema,
@@ -17193,8 +17234,10 @@ impl Executor {
 					batch,
 					rows,
 					probe_batch,
+					profile_build,
 					profile.as_deref_mut(),
-				)?,
+				)?
+			}
 			ReorientedInnerJoinBuild::Spilled {
 				build,
 				materialized_output_schema,
@@ -18294,10 +18337,11 @@ impl Executor {
 		build_batch: &RecordBatch,
 		build_rows: &JoinBuildRows,
 		probe_batch: &RecordBatch,
+		profile_build: Option<SuffixProbeBuildFacts>,
 		mut profile: Option<&mut SuffixProbeCallProfile>,
 	) -> Result<(Vec<RecordBatch>, u64, u64), ExecutionError> {
-		if let Some(profile) = profile.as_deref_mut() {
-			profile.observe_in_memory_build(key_plan, build_batch, build_rows);
+		if let (Some(profile), Some(profile_build)) = (profile.as_deref_mut(), profile_build) {
+			profile.observe_in_memory_build(profile_build);
 			let probe_rows = u64::try_from(probe_batch.num_rows()).unwrap_or_else(|_| {
 				profile.unsupported_reason = Some("suffix input-row count overflowed");
 				0
@@ -18497,6 +18541,37 @@ mod tests {
 	}
 
 	#[test]
+	fn adr516_suffix_build_facts_cache_constructs_once() {
+		let constructions = std::cell::Cell::new(0u64);
+		let expected = SuffixProbeBuildFacts {
+			shape: super::super::build_rows::JoinBuildProfileShape {
+				representation: "int64_primitive",
+				distinct_keys: 3,
+				entry_capacity: 4,
+				bucket_capacity: 8,
+				index_accounted_bytes: 256,
+			},
+			build_rows: 4,
+			build_batch_bytes: 64,
+			key_width_bytes: 8,
+			unsupported_reason: None,
+		};
+		let mut cache = SuffixProbeBuildFactsCache::default();
+		for _ in 0..23_436 {
+			let observed = cache.get_or_insert_with(|| {
+				constructions.set(constructions.get() + 1);
+				expected
+			});
+			assert_eq!(observed, expected);
+		}
+		assert_eq!(
+			constructions.get(),
+			1,
+			"the O(build entries) shape walk must run once per runtime, not once per suffix call"
+		);
+	}
+
+	#[test]
 	fn adr516_suffix_profile_counts_duplicate_matches_payload_and_empty_batches_exactly() {
 		let build_schema = Arc::new(Schema::new(vec![
 			Field::new("build_key", DataType::Int64, false),
@@ -18544,6 +18619,7 @@ mod tests {
 			batches: HashMap::new(),
 			requested_tables: Arc::new(Mutex::new(Vec::new())),
 		}));
+		let build_facts = SuffixProbeBuildFacts::from_in_memory(JoinKeyPlan::Int64, &build, &rows);
 		let mut profile = SuffixProbeCallProfile::default();
 		let (output, probe_rows, output_rows) = executor
 			.probe_reoriented_inner_join_in_memory(
@@ -18554,6 +18630,7 @@ mod tests {
 				&build,
 				&rows,
 				&matching_probe,
+				Some(build_facts),
 				Some(&mut profile),
 			)
 			.expect("matching profile");
@@ -18566,6 +18643,7 @@ mod tests {
 				&build,
 				&rows,
 				&empty_probe,
+				Some(build_facts),
 				Some(&mut profile),
 			)
 			.expect("empty profile");
