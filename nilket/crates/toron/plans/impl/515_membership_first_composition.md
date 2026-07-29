@@ -101,3 +101,75 @@ q19 from the flipped tree.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Measured outcome
+
+### Seal and evidence tiers
+
+Steps 1-2 sealed and pushed as `1ee7d952af82`; every gate green with direct exit statuses, and
+the ADR 176 binder-root bound moved 6,170 → 6,190 with its justification sentence. All evidence
+below is from the release binary built from that clean identity.
+
+The pre-cohort readout followed the operator's three tiers. **Structural/mechanism gate (held in
+full):** the census engaged exactly one cell — q18, fingerprint `1c3870f3f1f9af20` →
+`46f9b6171129eaef` — with digests identical on all 22 q-cells and 11 ladder cells and the ladder
+plan-invariant; strict correctness green in both arms for q18 and the q19 sentinel; the
+989,777,032 B spill **fully eliminated** (zero, not approximately zero); the invocation receipts
+show exactly one membership body fold per arm (`scan_grouped`, ~2.75 s both arms — moved, never
+duplicated); the 501-key / 3,507-row volume invariants are corroborated by the zeroed spill and
+equal digests, and pinned at fixture level. **Explanatory:** join node 13,394.7 → 1,506.1 ms,
+exchange 3,530.5 → 1,421.5 ms, peak RSS 10.3 → 3.9 GiB. **One named residual for the successor:**
+the outer fold (`uncovered_generic_fold`) costs 2,276.1 ms in the commuted shape versus 0.3 ms at
+the root-semi shape — pure cost, not semantics (digests equal) — the commuted spine's outer
+aggregate arrives by a path the grouped-fold recognizers do not cover.
+
+One reachability finding recorded: a joined membership body is unreachable from the SQL `IN`
+path (the frontend rejects the shape), so the body whitelist is defense-in-depth for other
+frontends; the outer-join-on-path decline and both engagement directions (source branch and
+fanout branch) are pinned by tests.
+
+| evidence | artifact |
+|---|---|
+| censuses, both arms | `target/tpch/adr515_{route,ladder}_census_{off,on}_1ee7d952/` |
+| evidence diagnostics, both arms | `target/tpch/adr515_q18_diag_{off,on}_1ee7d952/` |
+| locked 10-pair cohort | `target/tpch/adr515_q18_paired_1ee7d952/` |
+
+### Locked paired cohort
+
+| pair | candidate | control | control - candidate |
+|---:|---:|---:|---:|
+| 1 | 8,064.255 ms | 20,818.110 ms | 12,753.854 ms |
+| 2 | 8,028.850 ms | 20,127.792 ms | 12,098.942 ms |
+| 3 | 8,085.611 ms | 21,034.297 ms | 12,948.686 ms |
+| 4 | 8,672.312 ms | 20,801.033 ms | 12,128.721 ms |
+| 5 | 8,655.637 ms | 21,099.827 ms | 12,444.190 ms |
+| 6 | 8,695.204 ms | 21,255.712 ms | 12,560.509 ms |
+| 7 | 8,682.852 ms | 21,312.033 ms | 12,629.180 ms |
+| 8 | 8,206.967 ms | 20,871.185 ms | 12,664.218 ms |
+| 9 | 8,631.517 ms | 21,099.508 ms | 12,467.991 ms |
+| 10 | 8,748.679 ms | 21,042.152 ms | 12,293.472 ms |
+
+```text
+Hodges-Lehmann point        = 12,514.250 ms
+two-sided 95% interval      = [12,293.472, 12,696.438] ms
+fixed materiality floor     = 3,554 ms
+interval excludes zero      = true
+point reaches floor         = true (3.52x; the interval lower bound alone is 3.46x)
+activate                    = true
+```
+
+### Activation
+
+One guard retarget rides this receipt, named per the council discipline: ADR 322's
+`has_q18_grouped_membership_keyed_join` pinned the semi's composite output schema (`c_name`,
+`l_orderkey`), which was the pre-515 position, not the invariant. It now pins the
+position-agnostic invariant — a keyed `LeftSemi` with the grouped body as its build and
+`o_orderkey` on the preserved side — which holds in both arms.
+
+Per ADR 472's rule: `activate`, with q18 the only engaged cell and no plan, digest, or route
+change anywhere else. This receipt flips `membership_first_composition` to compiled default
+true, retargets the gauge knob-contract default arm, and re-runs the full seal gate plus
+default-arm strict correctness smokes for q18 and q19 from the flipped tree. q18 moves from
+~21.0 s to ~8.4 s with spill 990 MB → 0 and RSS 10.3 → 3.9 GiB. The remaining q18 envelope is
+the membership body fold (~2.75 s, an ADR 508 compute-fold premise) and the commuted shape's
+2.28 s outer-fold residual — both named, neither claimed here.

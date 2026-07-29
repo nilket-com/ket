@@ -198,7 +198,9 @@ pub struct PlannerConfig {
 	/// spine to the single source branch of its complete key tuple. A
 	/// plain-equality semi is a row-level predicate on that branch, so the
 	/// commute is filter-before-fanout; the recognizer declines any shape it
-	/// cannot prove. Default false until the ADR 515 paired receipt.
+	/// cannot prove. Default-on since the ADR 515 receipt: q18 pairs improved
+	/// 12,098-12,949 ms against the 3,554 ms floor, the 989,777,032 B spill
+	/// vanished, q18 was the only engaged cell, and every digest held.
 	pub membership_first_composition: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
@@ -232,7 +234,7 @@ impl Default for PlannerConfig {
 			hash_smaller_build_placement: true,
 			filtered_build_side_swap: true,
 			scalar_aggregate_input_reduction: true,
-			membership_first_composition: false,
+			membership_first_composition: true,
 		}
 	}
 }

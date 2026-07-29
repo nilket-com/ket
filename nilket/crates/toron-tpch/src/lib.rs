@@ -12313,10 +12313,15 @@ fn has_q18_grouped_membership_keyed_join(plan: &ExecutionPlan) -> bool {
 			output_schema,
 			..
 		} => {
+			// The membership invariant is position-agnostic: a keyed LeftSemi
+			// whose build side is the grouped body and whose preserved side
+			// carries the membership key. ADR 515's commute relocates the semi
+			// onto the orders branch, so the output schema is the branch's, not
+			// the composite's.
 			(*kind == JoinKind::LeftSemi
 				&& left_keys.len() == 1
 				&& right_keys.len() == 1
-				&& schema_has_fields(output_schema, &["c_name", "o_orderkey", "l_orderkey"])
+				&& schema_has_fields(output_schema, &["o_orderkey"])
 				&& execution_plan_contains_aggregate(right))
 				|| has_q18_grouped_membership_keyed_join(left)
 				|| has_q18_grouped_membership_keyed_join(right)

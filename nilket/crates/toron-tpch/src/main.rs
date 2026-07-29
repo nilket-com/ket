@@ -6278,7 +6278,7 @@ mod adr515_tests {
 	fn adr515_membership_first_knob_contract() {
 		// SAFETY: gate suites run single-threaded; no concurrent env readers.
 		unsafe { std::env::remove_var("TORON_TPCH_MEMBERSHIP_FIRST") };
-		assert_eq!(gauge_membership_first().unwrap(), (false, "default"));
+		assert_eq!(gauge_membership_first().unwrap(), (true, "default"));
 		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "1") };
 		assert_eq!(gauge_membership_first().unwrap(), (true, "explicit"));
 		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "0") };
