@@ -116,3 +116,50 @@ scripts/cargo-cgroup check -p toron-tpch --features polars-sql-reference --all-t
 
 Preserve each command's direct exit status. Repeat the applicable gate after any code change made
 in response; finish all gates before building the measurement binary.
+
+## Measured outcome — the ranked premises
+
+### Perturbation gate (both cells PASS)
+
+Five adjacent off/on pairs per cell from the approved `092e574a` release binary, all 20 rows
+passing, full-hash, one fingerprint and one digest per cell across arms, zero spill everywhere.
+
+| cell | pair movements (on vs off) | median | verdict |
+|---|---|---:|---|
+| q08 | -0.053%, +1.800%, +0.840%, +1.661%, +1.774% | **+1.661%** | PASS (< 3%) |
+| q09 | +2.093%, +0.950%, +1.283%, +1.613%, +1.537% | **+1.537%** | PASS (< 3%) |
+
+The scalar-prefetch corner is recorded as agreed: under prefetch ablation the probe window is one
+row, so profiler-plus-ablation would time per row; both cells run batched probing, so the corner
+cannot affect this evidence. A future generic instrumentation pass may add the fail-closed scalar
+decline.
+
+### The four ranked premises (medians over the five on-runs)
+
+| premise | parent | split (lookup / expand / take / residual) | flow | locality facts |
+|---|---:|---|---|---|
+| **1. q08 suffix 1 — part** | 3,759.3 ms | 1,481.4 / 618.7 / **1,549.0** / 110.3 — dominant **payload take (41%)**, lookup 39% | probe 47,989,007 = matched = emitted; **multiplicity 1.000**; output 431,901,063 values, **5,040,455,828 B** | int64_primitive, 1.6 M keys, load 0.38, idx 110.4 MB |
+| **2. q09 suffix 1 — part** | 3,916.2 ms | 1,509.6 / 626.0 / **1,670.3** / 110.2 — dominant **payload take (43%)**, lookup 39% | probe 47,989,007 = matched = emitted; multiplicity 1.000; output 479,890,070 values, **6,393,624,036 B** | int64_primitive, 1.6 M keys, load 0.38 |
+| **3. q09 suffix 2 — partsupp** | 1,743.8 ms | **split unsupported by contract** (generic composite key; status `unsupported`, `passed: false`, take-phase alone 153.5 ms) | probe 2,610,723 = matched = emitted | generic_hash, 6.4 M keys, load 0.87, idx 792.0 MB |
+| **4. q09 suffixes 3-4 — orders, nation** | 297.1 + 133.9 ms | lookup 117.6 / 24.4 dominant shares; all components sub-materiality | probe 2,610,723, multiplicity 1.000 | int64_primitive, 12 M and 25 keys |
+
+### What the attribution establishes (and no remedy is selected)
+
+- **The shared premise is rows 1-2, and it is not lookup cost**: both cells' first suffix join
+  probes all 47,989,007 lineitem rows against the part build at **multiplicity exactly 1.000**
+  (referential integrity — no reduction, no fanout) and materializes the full 48 M-row,
+  9-10-column output (5.0 / 6.4 GB of Arrow) which the immediately following `suffix_filter`
+  then cuts (q09: to 2,610,723 rows, 5.4% survival). Payload take is the dominant sub-stage in
+  both, with lookup second. The premise is pre-filter materialization volume; the mechanism
+  family is the successor's to choose.
+- **The build-size lookup hypothesis is falsified at the measured volumes**: q09's 12 M-key
+  orders build costs only 117.6 ms of lookup for 2.6 M probes (suffix 3). Large builds are not
+  intrinsically expensive to probe here; volume upstream of the filter is what costs.
+- **Row 3 is honest opacity**: the partsupp composite key takes the generic path, which this
+  first instrument declines by contract rather than fabricating a split. Its 1.6 s residual is
+  a named gap for a future generic-path instrument, not a premise.
+- The 508-era numbers reconcile: the prior lumped suffix figures (4,028.7 / 1,781.7 / 272.0 ms)
+  match these parents within run noise.
+
+Per the ADR: **no remedy is selected, sketched, or implemented in this cycle.** The successor
+follows this split, with rows 1-2 as the board-level shared premise.
