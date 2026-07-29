@@ -867,15 +867,16 @@ fn render_snapshot(
 		let is_folded = node.child_count > 0 && folded.contains(&key);
 		let line = DocLine::new(INSPECTOR_HEADER_LINES + rows.len() as u64);
 		let row_start = text.len();
-		text.push_str(if node.contains_cursor { "> " } else { "  " });
-		text.push_str(if node.child_count == 0 {
-			"  "
-		} else if is_folded {
-			"▸ "
-		} else {
-			"▾ "
-		});
-		text.push_str(&"  ".repeat(display_depth as usize));
+		if node.contains_cursor {
+			text.push('>');
+		}
+		if node.child_count > 0 {
+			text.push(if is_folded { '▸' } else { '▾' });
+		}
+		text.push('\t');
+		for _ in 0..display_depth {
+			text.push('\t');
+		}
 		let label_start = text.len();
 		let label = provider
 			.and_then(|provider| provider.structural_kind_name(node.provider_kind))
@@ -1427,7 +1428,13 @@ mod tests {
 		);
 		let text = String::from_utf8(rendered.text).expect("UTF-8 inspector");
 		assert!(text.contains("semantic: graft rejected"));
-		assert!(text.contains("▸ "));
+		assert!(text.contains("\n▾\t"));
+		assert!(text.contains("\n▸\t\t"));
+		assert!(
+			text.lines()
+				.skip(INSPECTOR_HEADER_LINES as usize)
+				.all(|line| !line.starts_with(' '))
+		);
 	}
 
 	#[test]
