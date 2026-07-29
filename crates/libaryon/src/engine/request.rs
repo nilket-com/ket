@@ -18,6 +18,7 @@ pub(crate) enum InternalEvent {
 	HydrationCompleted(BufferId),
 	ClearYankFlash,
 	PathCompletion(super::input::PathCompletionResponse),
+	NavigationResolved(Box<super::navigation::NavigationResolved>),
 	RuneCompile(Box<super::rune_host::SourceCompileResult>),
 	JobCompleted(JobId),
 	GitObservationChanged,

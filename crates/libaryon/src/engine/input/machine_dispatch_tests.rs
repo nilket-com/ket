@@ -441,6 +441,22 @@ fn file_browser_dispatch_and_register_preservation_are_characterized() {
 }
 
 #[test]
+fn gd_dispatches_go_to_definition_and_clears_the_prefix() {
+	let (mut frontend, rx) = build_frontend();
+	with_viewport(&mut frontend);
+
+	chars(&mut frontend, "gd");
+	assert!(matches!(rx.try_recv(), Ok(EditorCommand::GotoDefinition)));
+	assert!(rx.try_recv().is_err());
+
+	press(&mut frontend, KeyCode::Char('j'));
+	assert!(matches!(
+		rx.try_recv(),
+		Ok(EditorCommand::MoveCursor(MoveDirection::Down))
+	));
+}
+
+#[test]
 fn visual_mode_sweep_is_characterized() {
 	for (key, expected_kind) in [
 		(KeyCode::Char('v'), VisualKind::Char),

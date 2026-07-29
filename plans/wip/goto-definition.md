@@ -1,6 +1,6 @@
 # Rust Go to Definition (`gd`, `:definition`)
 
-Status: planning converged 2026-07-28. Not implemented.
+Status: implemented and validated 2026-07-28.
 
 ## Purpose
 
@@ -264,6 +264,12 @@ Starting a request may show `Finding definition…`; completion replaces it.
    updates, and end-to-end tests.
 5. Run full workspace tests and strict production Clippy for libaryon, Baryon,
    and Polariton.
+
+All five steps are complete. The shipped implementation keeps navigation on
+the semantic-reactor thread, returns through `NavigationResolved`, validates
+the full request stamp in the engine, and applies the dirty-buffer and
+exact-view policies described above. The production two-file Rust fixture,
+workspace tests, and production Clippy gates pass.
 
 ## Deferred stage 6.1
 

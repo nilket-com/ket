@@ -200,6 +200,8 @@ pub enum EditorCommand {
 	UnloadRune(String),
 	ReplaceChar(char),
 	ToggleCaseAtCursor,
+	/// Resolve and jump to the symbol definition under the primary cursor.
+	GotoDefinition,
 	OpenLineBelow,
 	OpenLineAbove,
 	AppendAtLineEnd,

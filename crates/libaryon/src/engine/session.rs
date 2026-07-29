@@ -3195,6 +3195,7 @@ pub(crate) struct EditorSession {
 	/// Ordered frontend events queued since the last drain.
 	pending_host_events: Vec<crate::engine::HostEvent>,
 	pub(crate) next_semantic_request_id: RequestId,
+	pub(crate) pending_navigation: Option<super::navigation::NavigationStamp>,
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
@@ -3679,6 +3680,7 @@ impl EditorSession {
 			next_view_id: initial_view_id.next(),
 			pending_host_events: Vec::new(),
 			next_semantic_request_id: RequestId::new(1),
+			pending_navigation: None,
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),

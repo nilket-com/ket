@@ -1065,6 +1065,10 @@ impl InputRuntime {
 				self.state = InputState::normal();
 			}
 			NormalAction::ClearPending => self.state = InputState::normal(),
+			NormalAction::GotoDefinition => {
+				self.send_command(EditorCommand::GotoDefinition);
+				self.state = InputState::normal();
+			}
 			NormalAction::NextFunction => {
 				self.send_command(EditorCommand::NextFunction);
 				self.state = InputState::normal();

@@ -11,13 +11,14 @@ use ra_ap_ide::{
 	Analysis, AnalysisHost, AssistResolveStrategy, Cancellable, DiagnosticsConfig, Highlight,
 	HighlightConfig, HlMod, HlTag, RaFixtureConfig, SymbolKind,
 };
+use ra_ap_ide::{FilePosition, GotoDefinitionConfig};
 use ra_ap_ide_db::{ChangeWithProcMacros, Severity};
 use ra_ap_paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use ra_ap_project_model::{
 	CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
 	RustLibSource,
 };
-use ra_ap_syntax::{Edition, SyntaxKind};
+use ra_ap_syntax::{Edition, SyntaxKind, TextRange};
 use ra_ap_vfs::{
 	FileId, Vfs, VfsPath,
 	file_set::{FileSet, FileSetConfig},
@@ -25,7 +26,10 @@ use ra_ap_vfs::{
 use rustc_hash::FxHashMap;
 
 use crate::core::DocByte;
-use crate::engine::language::{GreenNode, LanguageProvider, SemanticOutput};
+use crate::engine::language::{
+	DefinitionLocation, DefinitionResult, DefinitionTarget, GreenNode, LanguageProvider,
+	SemanticOutput, normalize_definition_targets,
+};
 use crate::svp::diagnostic::{DiagnosticSeverity, DiagnosticSpan};
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory, highlight_viewport};
 use crate::svp::rust_parse::parse_fragment;
@@ -133,16 +137,105 @@ impl ProviderState {
 		}
 		self.workspaces.insert(key, state);
 	}
+}
 
-	fn cached_single_file(&mut self, file_path: &str) -> Option<(&mut WorkspaceState, FileId)> {
-		let fallback = self.single_files.get_mut(file_path)?;
+#[derive(Debug)]
+enum ProviderFileOwner {
+	Workspace(WorkspaceKey),
+	SingleFile(String),
+}
+
+fn resolve_provider_file(
+	state: &mut ProviderState,
+	file_path: &str,
+	content: &str,
+) -> (ProviderFileOwner, FileId) {
+	let canonical = canonical_path(file_path);
+	if let Some(path) = canonical.as_ref()
+		&& let Some(key) = state.workspace_key_for_path(path)
+	{
+		if state.workspace_fingerprint_changed(&key) {
+			state.remove_workspace(&key);
+		} else if let Some(file_id) = state
+			.workspaces
+			.get(&key)
+			.and_then(|workspace| workspace.file_ids.get(&VfsPath::from(path.clone())))
+			.copied()
+		{
+			return (ProviderFileOwner::Workspace(key), file_id);
+		}
+	}
+
+	if let Some(fallback) = state.single_files.get(file_path) {
 		let file_id = *fallback
 			.file_ids
 			.values()
 			.next()
 			.expect("single-file state has one FileId");
-		Some((fallback, file_id))
+		return (
+			ProviderFileOwner::SingleFile(file_path.to_string()),
+			file_id,
+		);
 	}
+
+	if let Some(path) = canonical
+		&& let Some(initialized) = initialize_workspace(path.clone())
+	{
+		let key = initialized.key.clone();
+		state.install_workspace(initialized);
+		if let Some(file_id) = state
+			.workspaces
+			.get(&key)
+			.and_then(|workspace| workspace.file_ids.get(&VfsPath::from(path)))
+			.copied()
+		{
+			return (ProviderFileOwner::Workspace(key), file_id);
+		}
+	}
+
+	let fallback = state
+		.single_files
+		.entry(file_path.to_string())
+		.or_insert_with(|| {
+			let (host, file_id) = init_single_file(content);
+			let mut file_ids = HashMap::new();
+			file_ids.insert(single_file_vfs_path(file_path), file_id);
+			WorkspaceState {
+				host,
+				file_ids,
+				diagnostic_mode: DiagnosticCollectionMode::SyntaxOnly,
+				fingerprint: WorkspaceFingerprint(Vec::new()),
+			}
+		});
+	let file_id = *fallback
+		.file_ids
+		.values()
+		.next()
+		.expect("single-file state has one FileId");
+	(
+		ProviderFileOwner::SingleFile(file_path.to_string()),
+		file_id,
+	)
+}
+
+fn with_resolved_provider_file<R>(
+	state: &mut ProviderState,
+	file_path: &str,
+	content: &str,
+	use_file: impl FnOnce(&mut WorkspaceState, FileId) -> R,
+) -> R {
+	let (owner, file_id) = resolve_provider_file(state, file_path, content);
+	let workspace = match owner {
+		ProviderFileOwner::Workspace(key) => state
+			.workspaces
+			.get_mut(&key)
+			.expect("resolved workspace remains installed"),
+		ProviderFileOwner::SingleFile(key) => state
+			.single_files
+			.get_mut(&key)
+			.expect("resolved single-file host remains installed"),
+	};
+	use_file(workspace, file_id)
 }
 
 /// Name a fallback file inside the provider's virtual root. The caller's path is
@@ -225,6 +318,88 @@ fn analyze_workspace_file(
 	}
 }
 
+fn definition_range(range: TextRange) -> (u64, u64) {
+	(
+		u64::from(u32::from(range.start())),
+		u64::from(u32::from(range.end())),
+	)
+}
+
+fn goto_definition_in_workspace(
+	state: &mut WorkspaceState,
+	file_id: FileId,
+	content: &str,
+	cursor: DocByte,
+) -> DefinitionResult {
+	let Ok(offset) = u32::try_from(cursor.get()) else {
+		return DefinitionResult::Failed("Definition cursor is outside Rust's offset range".into());
+	};
+	if cursor.get() > content.len() as u64 {
+		return DefinitionResult::Failed("Definition cursor is outside the source buffer".into());
+	}
+
+	let mut change = ChangeWithProcMacros::default();
+	change.change_file(file_id, Some(content.to_owned()));
+	state.host.apply_change(change);
+	let analysis = state.host.analysis();
+	let config = GotoDefinitionConfig {
+		ra_fixture: RaFixtureConfig::default(),
+	};
+	let resolved = match analysis.goto_definition(
+		FilePosition {
+			file_id,
+			offset: offset.into(),
+		},
+		&config,
+	) {
+		Ok(Some(resolved)) => resolved,
+		Ok(None) => return DefinitionResult::NoDefinition,
+		Err(_) => return DefinitionResult::Failed("Rust definition analysis was cancelled".into()),
+	};
+
+	let mut had_unopenable_target = false;
+	let targets = resolved
+		.info
+		.into_iter()
+		.filter_map(|target| {
+			let location =
+				if target.file_id == file_id {
+					DefinitionLocation::SameDocument
+				} else {
+					let Some(path) = state.file_ids.iter().find_map(|(path, candidate)| {
+						(*candidate == target.file_id).then_some(path)
+					}) else {
+						had_unopenable_target = true;
+						return None;
+					};
+					let Some(path) = path.as_path() else {
+						had_unopenable_target = true;
+						return None;
+					};
+					DefinitionLocation::File(PathBuf::from(path.as_str()))
+				};
+			Some(DefinitionTarget {
+				location,
+				focus_range: target.focus_range.map(definition_range),
+				full_range: definition_range(target.full_range),
+				name: target.name.to_string(),
+			})
+		})
+		.collect::<Vec<_>>();
+	let targets = normalize_definition_targets(targets);
+	if targets.is_empty() {
+		if had_unopenable_target {
+			DefinitionResult::Failed(
+				"Definition exists only in a virtual file that cannot be opened".into(),
+			)
+		} else {
+			DefinitionResult::NoDefinition
+		}
+	} else {
+		DefinitionResult::Targets(targets)
+	}
+}
+
 impl LanguageProvider for RustProvider {
 	fn language_id(&self) -> &'static str {
 		"rust"
@@ -285,62 +460,22 @@ impl LanguageProvider for RustProvider {
 	) -> SemanticOutput {
 		let content: &str = &full_source;
 		let mut state = self.state.lock().unwrap();
-		let canonical_path = canonical_path(file_path);
+		with_resolved_provider_file(&mut state, file_path, content, |workspace, file_id| {
+			analyze_workspace_file(workspace, file_id, content, global_offset)
+		})
+	}
 
-		if let Some(path) = canonical_path.as_ref()
-			&& let Some(key) = state.workspace_key_for_path(path)
-		{
-			if state.workspace_fingerprint_changed(&key) {
-				state.remove_workspace(&key);
-			} else if let Some(workspace) = state.workspaces.get_mut(&key)
-				&& let Some(file_id) = workspace
-					.file_ids
-					.get(&VfsPath::from(path.clone()))
-					.copied()
-			{
-				return analyze_workspace_file(workspace, file_id, content, global_offset);
-			}
-		}
-
-		// A canonical path that has already failed workspace resolution must remain
-		// syntax-only until the provider is evicted. In particular, do not repeat
-		// cargo metadata and the workspace scan for files under excluded roots.
-		if let Some((fallback, file_id)) = state.cached_single_file(file_path) {
-			return analyze_workspace_file(fallback, file_id, content, global_offset);
-		}
-
-		if let Some(path) = canonical_path
-			&& let Some(initialized) = initialize_workspace(path.clone())
-		{
-			let key = initialized.key.clone();
-			state.install_workspace(initialized);
-			if let Some(workspace) = state.workspaces.get_mut(&key)
-				&& let Some(file_id) = workspace.file_ids.get(&VfsPath::from(path)).copied()
-			{
-				return analyze_workspace_file(workspace, file_id, content, global_offset);
-			}
-		}
-
-		let fallback = state
-			.single_files
-			.entry(file_path.to_string())
-			.or_insert_with(|| {
-				let (host, file_id) = init_single_file(content);
-				let mut file_ids = HashMap::new();
-				file_ids.insert(single_file_vfs_path(file_path), file_id);
-				WorkspaceState {
-					host,
-					file_ids,
-					diagnostic_mode: DiagnosticCollectionMode::SyntaxOnly,
-					fingerprint: WorkspaceFingerprint(Vec::new()),
-				}
-			});
-		let file_id = *fallback
-			.file_ids
-			.values()
-			.next()
-			.expect("single-file state has one FileId");
-		analyze_workspace_file(fallback, file_id, content, global_offset)
+	fn goto_definition(
+		&self,
+		source: Arc<String>,
+		file_path: &str,
+		cursor: DocByte,
+	) -> DefinitionResult {
+		let content = source.as_str();
+		let mut state = self.state.lock().unwrap();
+		with_resolved_provider_file(&mut state, file_path, content, |workspace, file_id| {
+			goto_definition_in_workspace(workspace, file_id, content, cursor)
+		})
 	}
 }
 
@@ -1003,9 +1138,15 @@ mod tests {
 			syntax_only_workspace_state(WorkspaceFingerprint(Vec::new())),
 		);
 
-		let (fallback, _) = state
-			.cached_single_file("/workspace/target/generated.rs")
-			.expect("cached fallback");
+		let (owner, _) = resolve_provider_file(
+			&mut state,
+			"/workspace/target/generated.rs",
+			"fn generated() {}\n",
+		);
+		let ProviderFileOwner::SingleFile(key) = owner else {
+			panic!("expected cached single-file owner");
+		};
+		let fallback = state.single_files.get(&key).expect("cached fallback");
 		assert_eq!(
 			fallback.diagnostic_mode,
 			DiagnosticCollectionMode::SyntaxOnly
@@ -1083,6 +1224,73 @@ mod tests {
 
 		let state = provider.state.lock().expect("provider state");
 		assert_eq!(state.single_files.len(), 2);
+	}
+
+	#[test]
+	fn goto_definition_uses_live_fallback_bytes() {
+		let provider = RustProvider::new();
+		let first = "fn target() {}\nfn caller() { target(); }\n";
+		let first_cursor = DocByte::new(first.rfind("target").expect("call") as u64);
+		let first_result =
+			provider.goto_definition(Arc::new(first.to_string()), "scratch.rs", first_cursor);
+		let DefinitionResult::Targets(first_targets) = first_result else {
+			panic!("expected same-file target, got {first_result:?}");
+		};
+		assert_eq!(first_targets[0].location, DefinitionLocation::SameDocument);
+		assert_eq!(first_targets[0].focus_range, Some((3, 9)));
+
+		let edited = "\n\nfn target() {}\nfn caller() { target(); }\n";
+		let edited_cursor = DocByte::new(edited.rfind("target").expect("call") as u64);
+		let edited_result =
+			provider.goto_definition(Arc::new(edited.to_string()), "scratch.rs", edited_cursor);
+		let DefinitionResult::Targets(edited_targets) = edited_result else {
+			panic!("expected edited same-file target, got {edited_result:?}");
+		};
+		assert_eq!(edited_targets[0].focus_range, Some((5, 11)));
+	}
+
+	#[test]
+	fn goto_definition_resolves_a_real_two_file_workspace() {
+		let directory = std::env::temp_dir().join(format!(
+			"baryon-goto-workspace-{}-{}",
+			std::process::id(),
+			std::thread::current().name().unwrap_or("test")
+		));
+		let source_dir = directory.join("src");
+		std::fs::create_dir_all(&source_dir).expect("create fixture");
+		std::fs::write(
+			directory.join("Cargo.toml"),
+			"[package]\nname = \"goto_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+		)
+		.expect("write manifest");
+		let main_path = source_dir.join("main.rs");
+		let other_path = source_dir.join("other.rs");
+		let main_source = "mod other;\nfn main() { other::target(); }\n";
+		std::fs::write(&main_path, main_source).expect("write main");
+		std::fs::write(&other_path, "pub fn target() {}\n").expect("write other");
+		let provider = RustProvider::new();
+		let cursor = DocByte::new(main_source.rfind("target").expect("target call") as u64);
+
+		let result = provider.goto_definition(
+			Arc::new(main_source.to_string()),
+			main_path.to_str().expect("utf8 path"),
+			cursor,
+		);
+		let DefinitionResult::Targets(targets) = result else {
+			panic!("expected cross-file definition, got {result:?}");
+		};
+		assert_eq!(targets.len(), 1);
+		assert!(
+			matches!(
+				&targets[0].location,
+				DefinitionLocation::File(path) if path.ends_with("other.rs")
+			),
+			"unexpected target: {:?}",
+			targets[0]
+		);
+		assert_eq!(targets[0].focus_range, Some((7, 13)));
+
+		std::fs::remove_dir_all(directory).expect("remove fixture");
 	}
 
 	#[test]

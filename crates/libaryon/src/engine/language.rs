@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::{DocByte, DocLine};
@@ -59,6 +60,70 @@ pub struct SemanticOutput {
 	pub highlights: Vec<HighlightSpan>,
 	pub diagnostics: Vec<DiagnosticSpan>,
 	pub inline_annotations: Vec<InlineAnnotation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Provider-neutral identity of a resolved definition's document.
+pub enum DefinitionLocation {
+	/// The definition is in the exact source document supplied to the provider.
+	SameDocument,
+	/// The definition is in a file-backed document at this path.
+	File(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One provider-owned definition target expressed in UTF-8 byte ranges.
+pub struct DefinitionTarget {
+	/// Document containing the target.
+	pub location: DefinitionLocation,
+	/// Preferred selection range, when the provider can distinguish it.
+	pub focus_range: Option<(u64, u64)>,
+	/// Full syntax range for the target.
+	pub full_range: (u64, u64),
+	/// Human-readable symbol name used as the final deterministic tiebreak.
+	pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Provider-neutral outcome of a definition lookup.
+pub enum DefinitionResult {
+	/// This provider does not implement definition lookup.
+	Unsupported,
+	/// Lookup completed successfully but found no definition.
+	NoDefinition,
+	/// One or more candidate definitions.
+	Targets(Vec<DefinitionTarget>),
+	/// Lookup could not complete safely.
+	Failed(String),
+}
+
+pub(crate) fn normalize_definition_targets(
+	mut targets: Vec<DefinitionTarget>,
+) -> Vec<DefinitionTarget> {
+	targets.sort_by(|left, right| {
+		let location_order = match (&left.location, &right.location) {
+			(DefinitionLocation::SameDocument, DefinitionLocation::SameDocument) => {
+				std::cmp::Ordering::Equal
+			}
+			(DefinitionLocation::SameDocument, DefinitionLocation::File(_)) => {
+				std::cmp::Ordering::Less
+			}
+			(DefinitionLocation::File(_), DefinitionLocation::SameDocument) => {
+				std::cmp::Ordering::Greater
+			}
+			(DefinitionLocation::File(left), DefinitionLocation::File(right)) => left.cmp(right),
+		};
+		let left_focus = left.focus_range.unwrap_or(left.full_range);
+		let right_focus = right.focus_range.unwrap_or(right.full_range);
+		location_order
+			.then_with(|| left_focus.0.cmp(&right_focus.0))
+			.then_with(|| left.full_range.0.cmp(&right.full_range.0))
+			.then_with(|| left_focus.1.cmp(&right_focus.1))
+			.then_with(|| left.full_range.1.cmp(&right.full_range.1))
+			.then_with(|| left.name.cmp(&right.name))
+	});
+	targets.dedup();
+	targets
 }
 
 /// A language-shaped subrange embedded in a parent document.
@@ -193,6 +258,17 @@ pub trait LanguageProvider: Send + Sync {
 	/// semantic inspector should collapse by default.
 	fn structural_kind_is_trivia(&self, _kind: ProviderKindId) -> bool {
 		false
+	}
+
+	/// Resolve definitions at a UTF-8 byte offset. Providers that do not own
+	/// symbol resolution keep the default honest unsupported result.
+	fn goto_definition(
+		&self,
+		_source: Arc<String>,
+		_file_path: &str,
+		_cursor: DocByte,
+	) -> DefinitionResult {
+		DefinitionResult::Unsupported
 	}
 }
 
@@ -484,5 +560,35 @@ mod tests {
 		reg.register(DummyProvider);
 		assert!(reg.provider_for_extension("txt").is_none());
 		assert!(reg.provider_for_extension("").is_none());
+	}
+
+	#[test]
+	fn definition_targets_have_a_total_deterministic_order_and_deduplicate() {
+		let same = DefinitionTarget {
+			location: DefinitionLocation::SameDocument,
+			focus_range: Some((8, 10)),
+			full_range: (4, 12),
+			name: "same".to_string(),
+		};
+		let earlier_full = DefinitionTarget {
+			location: DefinitionLocation::File(PathBuf::from("/a.rs")),
+			focus_range: Some((5, 7)),
+			full_range: (1, 9),
+			name: "later-name".to_string(),
+		};
+		let later_full = DefinitionTarget {
+			location: DefinitionLocation::File(PathBuf::from("/a.rs")),
+			focus_range: Some((5, 7)),
+			full_range: (2, 9),
+			name: "earlier-name".to_string(),
+		};
+		let targets = normalize_definition_targets(vec![
+			later_full.clone(),
+			earlier_full.clone(),
+			same.clone(),
+			earlier_full.clone(),
+		]);
+
+		assert_eq!(targets, vec![same, earlier_full, later_full]);
 	}
 }

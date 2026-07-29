@@ -3,7 +3,12 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::core::{BufferId, ByteLen, DocByte, RequestId, StateId};
-use crate::engine::language::{GreenNode, InlineAnnotation, LanguageId, LanguageRegistry};
+use crate::engine::MAX_SEMANTIC_BYTES;
+use crate::engine::language::{
+	DefinitionResult, GreenNode, InlineAnnotation, LanguageId, LanguageRegistry,
+	normalize_definition_targets,
+};
+use crate::engine::navigation::{GotoDefinitionRequest, NavigationResolved};
 use crate::engine::request::{InternalEvent, InternalSender};
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
@@ -35,15 +40,21 @@ pub struct SemanticResponse {
 	pub structural_topology: Option<(GreenNode, Vec<u8>)>,
 }
 
+#[derive(Debug)]
+enum ReactorRequest {
+	Analyze(SemanticRequest),
+	GotoDefinition(GotoDefinitionRequest),
+}
+
 pub struct SemanticReactor {
-	tx_in: Option<mpsc::Sender<SemanticRequest>>,
+	tx_in: Option<mpsc::Sender<ReactorRequest>>,
 	rx_out: mpsc::Receiver<SemanticResponse>,
 	worker: Option<thread::JoinHandle<()>>,
 }
 
 impl SemanticReactor {
 	pub(crate) fn new(tx_internal: InternalSender, registry: Arc<LanguageRegistry>) -> Self {
-		let (tx_in, rx_worker) = mpsc::channel::<SemanticRequest>();
+		let (tx_in, rx_worker) = mpsc::channel::<ReactorRequest>();
 		let (tx_worker, rx_out) = mpsc::channel::<SemanticResponse>();
 
 		let handle = thread::Builder::new()
@@ -63,7 +74,13 @@ impl SemanticReactor {
 	/// Push new file content to the reactor. Non-blocking.
 	pub fn send(&self, request: SemanticRequest) {
 		if let Some(tx_in) = &self.tx_in {
-			let _ = tx_in.send(request);
+			let _ = tx_in.send(ReactorRequest::Analyze(request));
+		}
+	}
+
+	pub(crate) fn send_goto_definition(&self, request: GotoDefinitionRequest) {
+		if let Some(tx_in) = &self.tx_in {
+			let _ = tx_in.send(ReactorRequest::GotoDefinition(request));
 		}
 	}
 
@@ -73,12 +90,52 @@ impl SemanticReactor {
 	}
 
 	fn run_event_loop(
-		rx: mpsc::Receiver<SemanticRequest>,
+		rx: mpsc::Receiver<ReactorRequest>,
 		tx: mpsc::Sender<SemanticResponse>,
 		tx_internal: InternalSender,
 		registry: Arc<LanguageRegistry>,
 	) {
-		while let Ok(request) = rx.recv() {
+		while let Ok(work) = rx.recv() {
+			let request = match work {
+				ReactorRequest::Analyze(request) => request,
+				ReactorRequest::GotoDefinition(request) => {
+					let result = if request.content.len() as u64 >= MAX_SEMANTIC_BYTES {
+						crate::engine::language::DefinitionResult::Failed(
+							"Go to definition is unavailable for documents at or above 8 MiB"
+								.to_string(),
+						)
+					} else {
+						match String::from_utf8(request.content) {
+							Ok(source) => registry.get_provider(request.language_id).map_or(
+								crate::engine::language::DefinitionResult::Unsupported,
+								|provider| {
+									provider.goto_definition(
+										Arc::new(source),
+										&request.file_path,
+										request.stamp.cursor,
+									)
+								},
+							),
+							Err(_) => crate::engine::language::DefinitionResult::Failed(
+								"Go to definition requires valid UTF-8".to_string(),
+							),
+						}
+					};
+					let result = match result {
+						DefinitionResult::Targets(targets) => {
+							DefinitionResult::Targets(normalize_definition_targets(targets))
+						}
+						other => other,
+					};
+					let _ = tx_internal.send(InternalEvent::NavigationResolved(Box::new(
+						NavigationResolved {
+							stamp: request.stamp,
+							result,
+						},
+					)));
+					continue;
+				}
+			};
 			let provider = registry.get_provider(request.language_id);
 
 			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider
@@ -185,7 +242,10 @@ impl Drop for SemanticReactor {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ecs::NodeId;
 	use crate::engine::language::{LanguageProvider, SemanticOutput};
+	use crate::engine::navigation::{GotoDefinitionRequest, NavigationStamp};
+	use crate::engine::request::{EngineRequest, InternalEvent};
 	use std::time::{Duration, Instant};
 
 	struct SlowTestProvider;
@@ -265,6 +325,107 @@ mod tests {
 				(BufferId::new(2), RequestId::new(2)),
 			]
 		);
+	}
+
+	#[test]
+	fn navigation_uses_the_internal_event_path_and_leaves_semantic_output_empty() {
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(SlowTestProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		let stamp = NavigationStamp {
+			request_id: RequestId::new(9),
+			buffer_id: BufferId::new(3),
+			root: NodeId::from_index(7),
+			state_id: StateId::new(4),
+			view_id: crate::core::ViewId::new(5),
+			cursor: DocByte::new(2),
+		};
+
+		reactor.send_goto_definition(GotoDefinitionRequest {
+			stamp,
+			content: b"hello".to_vec(),
+			file_path: "test.slow".to_string(),
+			language_id: LanguageId::from_registered("slowtest"),
+		});
+
+		let event = requests
+			.recv_timeout(Duration::from_secs(2))
+			.expect("navigation event");
+		let EngineRequest::Internal(InternalEvent::NavigationResolved(resolved)) = event else {
+			panic!("navigation must not use the semantic response path");
+		};
+		assert_eq!(resolved.stamp, stamp);
+		assert_eq!(
+			resolved.result,
+			crate::engine::language::DefinitionResult::Unsupported
+		);
+		assert!(reactor.try_recv().is_none());
+	}
+
+	#[test]
+	fn navigation_rejects_invalid_utf8_before_calling_a_provider() {
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(SlowTestProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		let stamp = NavigationStamp {
+			request_id: RequestId::new(1),
+			buffer_id: BufferId::new(1),
+			root: NodeId::from_index(0),
+			state_id: StateId::new(1),
+			view_id: crate::core::ViewId::new(1),
+			cursor: DocByte::ZERO,
+		};
+		reactor.send_goto_definition(GotoDefinitionRequest {
+			stamp,
+			content: vec![0xff],
+			file_path: "test.slow".to_string(),
+			language_id: LanguageId::from_registered("slowtest"),
+		});
+		let event = requests
+			.recv_timeout(Duration::from_secs(2))
+			.expect("navigation event");
+		let EngineRequest::Internal(InternalEvent::NavigationResolved(resolved)) = event else {
+			panic!("expected navigation result");
+		};
+		assert!(matches!(
+			resolved.result,
+			crate::engine::language::DefinitionResult::Failed(ref message)
+				if message.contains("UTF-8")
+		));
+	}
+
+	#[test]
+	fn navigation_rejects_documents_at_the_semantic_size_limit() {
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(SlowTestProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		let stamp = NavigationStamp {
+			request_id: RequestId::new(1),
+			buffer_id: BufferId::new(1),
+			root: NodeId::from_index(0),
+			state_id: StateId::new(1),
+			view_id: crate::core::ViewId::new(1),
+			cursor: DocByte::ZERO,
+		};
+		reactor.send_goto_definition(GotoDefinitionRequest {
+			stamp,
+			content: vec![b'x'; MAX_SEMANTIC_BYTES as usize],
+			file_path: "test.slow".to_string(),
+			language_id: LanguageId::from_registered("slowtest"),
+		});
+		let event = requests
+			.recv_timeout(Duration::from_secs(2))
+			.expect("navigation event");
+		let EngineRequest::Internal(InternalEvent::NavigationResolved(resolved)) = event else {
+			panic!("expected navigation result");
+		};
+		assert!(matches!(
+			resolved.result,
+			DefinitionResult::Failed(ref message) if message.contains("8 MiB")
+		));
 	}
 
 	#[test]

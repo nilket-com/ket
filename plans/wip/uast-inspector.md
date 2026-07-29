@@ -189,8 +189,8 @@ Metric certainty is exposed explicitly: a sparse node's newline count reports
    [`goto-definition.md`](goto-definition.md); it uses the provider's
    `ra_ap_ide::AnalysisHost`, not UAST node identity.
 
-Stages 1–5 are implemented. Stage 6 remains a separate navigation feature,
-not part of the inspector implementation.
+Stages 1–5 are implemented. Stage 6 is implemented as the separate navigation
+feature described above, not as part of the inspector machinery.
 
 ## Settled questions
 

@@ -612,6 +612,7 @@ pub(super) enum NormalAction {
 	Esc,
 	ReadOnlyStatus,
 	ClearPending,
+	GotoDefinition,
 	NextFunction,
 	AddCursor(VerticalDirection),
 }
@@ -825,7 +826,9 @@ pub(super) const fn binding_is_applicable(binding: &BindingSpec) -> bool {
 			NormalContext::Goto => {
 				matches!(
 					action,
-					NormalAction::Motion(NormalMotion::Top) | NormalAction::Tab(_)
+					NormalAction::Motion(NormalMotion::Top)
+						| NormalAction::Tab(_)
+						| NormalAction::GotoDefinition
 				)
 			}
 			NormalContext::Fold => matches!(action, NormalAction::Fold(_)),
@@ -946,7 +949,7 @@ pub(super) static KEYMAP: &[KeyGroup] = &[
 	},
 	KeyGroup {
 		category: Category::Motion,
-		summary: "Top / bottom of the file",
+		summary: "Go to top, bottom, or symbol definition",
 		bindings: &[
 			n!(
 				NormalContext::Ready,
@@ -957,6 +960,11 @@ pub(super) static KEYMAP: &[KeyGroup] = &[
 				NormalContext::Goto,
 				KeyPattern::Char('g'),
 				NormalAction::Motion(NormalMotion::Top)
+			),
+			n!(
+				NormalContext::Goto,
+				KeyPattern::Char('d'),
+				NormalAction::GotoDefinition
 			),
 			n!(
 				NormalContext::Ready,

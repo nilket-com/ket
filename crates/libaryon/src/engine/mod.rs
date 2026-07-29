@@ -20,6 +20,7 @@ pub mod language;
 mod layout;
 mod markdown_image_preview;
 mod minimap;
+pub(crate) mod navigation;
 mod protocol;
 mod render;
 pub(crate) mod request;
@@ -43,7 +44,6 @@ pub mod uast_query;
 pub mod ui_colors;
 pub mod undo;
 
-#[cfg(test)]
 pub(crate) use self::core::MAX_SEMANTIC_BYTES;
 pub use self::document::selection::resolve_visual_ranges;
 pub use self::host::{EngineConfig, EngineHandle, supported_languages};

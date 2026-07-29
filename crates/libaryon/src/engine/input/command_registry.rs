@@ -499,6 +499,18 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_language),
 	},
 	CommandSpec {
+		name: "definition",
+		aliases: &["def"],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Language,
+		usage: ":definition",
+		summary: "Jump to the definition under the cursor",
+		help: "Asynchronously resolves the symbol under the primary cursor. Rust workspace resolution is supported; other languages report that navigation is unavailable.",
+		dispatch: DispatchKind::Exact(cmd_definition),
+	},
+	CommandSpec {
 		name: "set",
 		aliases: &[],
 		bang: true,
@@ -925,6 +937,10 @@ fn cmd_uast_dot(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	ctx.send(EditorCommand::ExportUastDot {
 		path: (!inv.args.trim().is_empty()).then(|| expand_path_arg(inv.args)),
 	});
+}
+
+fn cmd_definition(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
+	ctx.send(EditorCommand::GotoDefinition);
 }
 
 fn cmd_markdown_preview(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
@@ -1563,6 +1579,18 @@ mod tests {
 			[EditorCommand::ExportUastDot { path: Some(path) }]
 				if path.ends_with("tree.dot")
 		));
+	}
+
+	#[test]
+	fn definition_command_and_alias_share_one_editor_command() {
+		for invocation in ["definition", "def"] {
+			let (_, commands, status, _) = dispatch(invocation, None);
+			assert_eq!(status, None);
+			assert!(matches!(
+				commands.as_slice(),
+				[EditorCommand::GotoDefinition]
+			));
+		}
 	}
 
 	#[test]

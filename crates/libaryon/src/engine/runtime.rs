@@ -33,10 +33,12 @@ use super::file_browser::{
 use super::git_observer::GitRefreshController;
 use super::input::{InputContext, InputDispatch};
 use super::jobs::{JobCompletion, JobDispatcher, JobInvocation, JobSpec, MAX_JOB_DELIVERY_STEPS};
+use super::language::{DefinitionLocation, DefinitionResult};
 use super::markdown_image_preview::{
 	open_markdown_image_preview, open_static_markdown_preview, scroll_pinned_preview,
 	scroll_target_view as markdown_preview_source_target, sync_markdown_image_preview_scroll,
 };
+use super::navigation::{GotoDefinitionRequest, NavigationResolved, NavigationStamp};
 use super::protocol::{
 	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, SplitDirection,
 };
@@ -48,7 +50,7 @@ use super::rune_host::{
 };
 use super::runtime_registry::{ActionError, InvocationGate};
 use super::session::{
-	BufferContent, BufferStore, CachedSumTree, CanonicalPath, EditorPane, EditorSession,
+	Affinity, BufferContent, BufferStore, CachedSumTree, CanonicalPath, EditorPane, EditorSession,
 	LayoutNode, PaneResizeResult, PendingReload, SemanticState, TextEditorMut, View, ViewContent,
 	text_editor, with_file_browser_buffer_mut, with_text_buffer_mut,
 };
@@ -1810,6 +1812,260 @@ fn retarget_text_view(
 	Ok(())
 }
 
+fn request_goto_definition(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	reactor: &crate::svp::semantic::SemanticReactor,
+) -> bool {
+	let view = focused_doctab(&session.layout, session.focused_pane_id);
+	let view_id = view.id;
+	let buffer_id = view.buffer_id;
+	let Some(buffer) = session.buffers.get(buffer_id) else {
+		return false;
+	};
+	let Some(document) = buffer.text() else {
+		session.ui.status_message = Some("Go to definition requires a text document".to_string());
+		return true;
+	};
+	let Some(language_id) = document.active_language_id else {
+		session.ui.status_message =
+			Some("Go to definition is unsupported for this document".to_string());
+		return true;
+	};
+	let Some(file_path) = document
+		.backing_path
+		.as_deref()
+		.or(document.file_path.as_deref())
+		.or(document.virtual_path.as_deref())
+		.map(ToOwned::to_owned)
+	else {
+		session.ui.status_message = Some("Go to definition requires a document path".to_string());
+		return true;
+	};
+	let total_bytes = runtime.registry.get_total_bytes(document.root_id);
+	if total_bytes >= super::MAX_SEMANTIC_BYTES {
+		session.ui.status_message =
+			Some("Go to definition is unavailable for documents at or above 8 MiB".to_string());
+		return true;
+	}
+	let cursor = match &view.content {
+		ViewContent::Text(text) => text.cursor.primary().byte(),
+		_ => {
+			session.ui.status_message =
+				Some("Go to definition requires an editable text view".to_string());
+			return true;
+		}
+	};
+	let content = match read_document_snapshot(
+		runtime.registry,
+		document.root_id,
+		document.backing_path.as_deref().map(Path::new),
+	) {
+		Ok(content) => content,
+		Err(error) => {
+			session.ui.status_message = Some(format!(
+				"Unable to read document for definition lookup: {error}"
+			));
+			return true;
+		}
+	};
+	let request_id = session.next_semantic_request_id;
+	session.next_semantic_request_id = request_id.next();
+	let stamp = NavigationStamp {
+		request_id,
+		buffer_id,
+		root: document.root_id,
+		state_id: document.ledger.current_state_id,
+		view_id,
+		cursor,
+	};
+	session.pending_navigation = Some(stamp);
+	session.ui.status_message = Some("Finding definition…".to_string());
+	reactor.send_goto_definition(GotoDefinitionRequest {
+		stamp,
+		content,
+		file_path,
+		language_id,
+	});
+	true
+}
+
+fn set_view_cursor(session: &mut EditorSession, view_id: crate::core::ViewId, byte: DocByte) {
+	if let Some(view) = session.layout.find_view_mut(view_id)
+		&& let ViewContent::Text(text) = &mut view.content
+	{
+		text.cursor.collapse();
+		text.cursor.primary_mut().set_byte(byte, Affinity::After);
+	}
+}
+
+fn apply_navigation_resolved(
+	runtime: &RuntimeContext<'_>,
+	session: &mut EditorSession,
+	resolved: NavigationResolved,
+) -> bool {
+	if session.pending_navigation != Some(resolved.stamp) {
+		return false;
+	}
+	session.pending_navigation = None;
+	let stamp = resolved.stamp;
+	let Some(view) = session.layout.find_view(stamp.view_id) else {
+		session.ui.status_message =
+			Some("Definition result discarded: the requesting view was closed".to_string());
+		return true;
+	};
+	if view.buffer_id != stamp.buffer_id {
+		session.ui.status_message =
+			Some("Definition result discarded: the requesting view changed documents".to_string());
+		return true;
+	}
+	let Some(source) = session
+		.buffers
+		.get(stamp.buffer_id)
+		.and_then(|buffer| buffer.text())
+	else {
+		session.ui.status_message =
+			Some("Definition result discarded: the source document is unavailable".to_string());
+		return true;
+	};
+	if source.root_id != stamp.root || source.ledger.current_state_id != stamp.state_id {
+		session.ui.status_message =
+			Some("Definition result discarded: the source document changed".to_string());
+		return true;
+	}
+	let targets = match resolved.result {
+		DefinitionResult::Unsupported => {
+			session.ui.status_message =
+				Some("Go to definition is unsupported for this language".to_string());
+			return true;
+		}
+		DefinitionResult::NoDefinition => {
+			session.ui.status_message = Some("No definition found".to_string());
+			return true;
+		}
+		DefinitionResult::Failed(error) => {
+			session.ui.status_message = Some(format!("Go to definition failed: {error}"));
+			return true;
+		}
+		DefinitionResult::Targets(targets) if targets.is_empty() => {
+			session.ui.status_message = Some("No definition found".to_string());
+			return true;
+		}
+		DefinitionResult::Targets(targets) => targets,
+	};
+	let target_count = targets.len();
+	let target = &targets[0];
+	let range = target.focus_range.unwrap_or(target.full_range);
+	if range.0 > range.1 {
+		session.ui.status_message =
+			Some("Definition target has an invalid source range".to_string());
+		return true;
+	}
+	let target_byte = DocByte::new(range.0);
+	match &target.location {
+		DefinitionLocation::SameDocument => {
+			if range.1 > runtime.registry.get_total_bytes(source.root_id) {
+				session.ui.status_message =
+					Some("Definition target is outside the source document".to_string());
+				return true;
+			}
+			set_view_cursor(session, stamp.view_id, target_byte);
+			if let Some(pane_id) = session.layout.pane_id_for_view(stamp.view_id) {
+				session.focus_pane(pane_id);
+			}
+		}
+		DefinitionLocation::File(path) => {
+			let canonical = match CanonicalPath::resolve(path) {
+				Ok(path) => path,
+				Err(error) => {
+					session.ui.status_message = Some(error);
+					return true;
+				}
+			};
+			if let Some(target_buffer) = session.buffers.buffer_for_path(&canonical)
+				&& let Some(target_view) = session.layout.view_id_for_buffer(target_buffer)
+			{
+				let Some(target_document) = session
+					.buffers
+					.get(target_buffer)
+					.and_then(|buffer| buffer.text())
+				else {
+					session.ui.status_message =
+						Some("Definition target is not editable text".to_string());
+					return true;
+				};
+				if range.1 > runtime.registry.get_total_bytes(target_document.root_id) {
+					session.ui.status_message =
+						Some("Definition target is outside the target document".to_string());
+					return true;
+				}
+				set_view_cursor(session, target_view, target_byte);
+				if let Some(pane_id) = session.layout.pane_id_for_view(target_view) {
+					if let Some(pane) = session.layout.find_pane_mut(pane_id) {
+						pane.activate_view(target_view);
+					}
+					session.focus_pane(pane_id);
+				}
+			} else {
+				if session
+					.buffers
+					.get(stamp.buffer_id)
+					.is_some_and(|buffer| buffer.is_dirty())
+				{
+					session.ui.status_message = Some(
+						"Definition is in another file; write or discard source changes first"
+							.to_string(),
+					);
+					return true;
+				}
+				let (target_buffer, _) =
+					match resolve_or_load_buffer(runtime, session, path.display().to_string()) {
+						Ok(target) => target,
+						Err(error) => {
+							session.ui.status_message =
+								Some(format!("Unable to open definition target: {error}"));
+							return true;
+						}
+					};
+				let Some(target_document) = session
+					.buffers
+					.get(target_buffer)
+					.and_then(|buffer| buffer.text())
+				else {
+					session.ui.status_message =
+						Some("Definition target is not editable text".to_string());
+					return true;
+				};
+				if range.1 > runtime.registry.get_total_bytes(target_document.root_id) {
+					if session.layout.view_count_for_buffer(target_buffer) == 0 {
+						release_buffer(runtime, session, target_buffer);
+					}
+					session.ui.status_message =
+						Some("Definition target is outside the target document".to_string());
+					return true;
+				}
+				if let Err(error) =
+					retarget_text_view(runtime, session, stamp.view_id, target_buffer)
+				{
+					session.ui.status_message = Some(error);
+					return true;
+				}
+				set_view_cursor(session, stamp.view_id, target_byte);
+				if let Some(pane_id) = session.layout.pane_id_for_view(stamp.view_id) {
+					session.focus_pane(pane_id);
+				}
+			}
+		}
+	}
+	session.ui.status_message = Some(if target_count == 1 {
+		"Jumped to definition".to_string()
+	} else {
+		format!("Jumped to definition ({target_count} definitions)")
+	});
+	reset_global_transients(session);
+	true
+}
+
 fn handle_file_command_for_view(
 	runtime: &RuntimeContext<'_>,
 	buffers: &mut BufferStore,
@@ -2234,6 +2490,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::CloseAllFolds
 		| EditorCommand::OpenAllFolds
 		| EditorCommand::MatchDelimiter
+		| EditorCommand::GotoDefinition
 		| EditorCommand::ClickCursor(_)
 		| EditorCommand::GotoLine(_)
 		| EditorCommand::MoveCursor(MoveDirection::Top | MoveDirection::Bottom)
@@ -2983,6 +3240,9 @@ fn dispatch_command(
 	}
 
 	match cmd {
+		EditorCommand::GotoDefinition => {
+			needs_render |= request_goto_definition(runtime, session, reactor);
+		}
 		EditorCommand::BeginPasswordPrompt { label } => {
 			session.input.begin_password_prompt(label);
 			needs_render = true;
@@ -4600,6 +4860,12 @@ pub(crate) fn run_engine(engine: Engine) {
 							None => false,
 						}
 					}
+					InternalEvent::NavigationResolved(resolved) => {
+						let lifecycle_before = session.capture_text_lifecycle();
+						let rendered = apply_navigation_resolved(&runtime, &mut session, *resolved);
+						session.emit_text_lifecycle_since(lifecycle_before);
+						rendered
+					}
 					InternalEvent::RuneCompile(result) => {
 						if let Some(host) = rune_host.as_mut() {
 							let report = host.apply_compile_result(&mut session, *result);
@@ -4796,6 +5062,9 @@ mod event_bus_integration_tests {
 	use crate::engine::event_subscribers::{
 		SubscriberBaseline, SubscriberDispatcher, SubscriberOutcome,
 	};
+	use crate::engine::language::{
+		DefinitionLocation, DefinitionResult, DefinitionTarget, LanguageProvider, SemanticOutput,
+	};
 	use crate::engine::request::CommandSender;
 	use crate::engine::runtime_registry::{
 		ActionLease, RegistrationBatch, RuntimeSubscriptionRegistration, SubscriberInvocation,
@@ -4805,6 +5074,7 @@ mod event_bus_integration_tests {
 	use crate::engine::{InputEvent, KeyCode, Modifiers};
 	use std::collections::BTreeMap;
 	use std::fs;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::mpsc;
 	use std::thread;
 	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4814,6 +5084,102 @@ mod event_bus_integration_tests {
 		events: mpsc::Receiver<EngineEvent>,
 		_views: mpsc::Receiver<crate::uast::projection::Viewport>,
 		thread: thread::JoinHandle<()>,
+	}
+
+	struct NavigationTestProvider;
+	static NAVIGATION_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+	impl LanguageProvider for NavigationTestProvider {
+		fn language_id(&self) -> &'static str {
+			"navigation-test"
+		}
+
+		fn label(&self) -> &'static str {
+			"Navigation Test"
+		}
+
+		fn extensions(&self) -> &'static [&'static str] {
+			&["nav"]
+		}
+
+		fn lexical_baseline(
+			&self,
+			_viewport_bytes: &[u8],
+			_offset_map: &[(usize, DocByte)],
+		) -> Vec<HighlightSpan> {
+			Vec::new()
+		}
+
+		fn semantic_reactor(
+			&self,
+			_full_source: Arc<String>,
+			_global_offset: DocByte,
+			_file_path: &str,
+		) -> SemanticOutput {
+			SemanticOutput::default()
+		}
+
+		fn goto_definition(
+			&self,
+			source: Arc<String>,
+			_file_path: &str,
+			_cursor: DocByte,
+		) -> DefinitionResult {
+			if source.contains("slow") {
+				thread::sleep(Duration::from_millis(75));
+			}
+			if source.contains("unsupported") {
+				return DefinitionResult::Unsupported;
+			}
+			if source.contains("sequence") {
+				let key = if NAVIGATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) == 0 {
+					thread::sleep(Duration::from_millis(75));
+					"first="
+				} else {
+					"second="
+				};
+				let path = source
+					.find(key)
+					.and_then(|marker| source[marker + key.len()..].lines().next())
+					.unwrap_or_default();
+				return DefinitionResult::Targets(vec![DefinitionTarget {
+					location: DefinitionLocation::File(PathBuf::from(path)),
+					focus_range: Some((0, 4)),
+					full_range: (0, 4),
+					name: key.to_string(),
+				}]);
+			}
+			let Some(marker) = source.find("target=") else {
+				return DefinitionResult::NoDefinition;
+			};
+			let path = source[marker + "target=".len()..]
+				.lines()
+				.next()
+				.unwrap_or_default();
+			let first = DefinitionTarget {
+				location: DefinitionLocation::File(PathBuf::from(path)),
+				focus_range: Some((0, 4)),
+				full_range: (0, 4),
+				name: "test_target".to_string(),
+			};
+			if let Some(marker) = source.find("second=") {
+				let second_path = source[marker + "second=".len()..]
+					.lines()
+					.next()
+					.unwrap_or_default();
+				DefinitionResult::Targets(vec![
+					DefinitionTarget {
+						location: DefinitionLocation::File(PathBuf::from(second_path)),
+						focus_range: Some((0, 4)),
+						full_range: (0, 4),
+						name: "second_target".to_string(),
+					},
+					first,
+				])
+			} else {
+				DefinitionResult::Targets(vec![first])
+			}
+		}
 	}
 
 	fn spawn_test_engine(initial_file: Option<String>) -> RunningTestEngine {
@@ -4826,7 +5192,10 @@ mod event_bus_integration_tests {
 			registry.clone(),
 			tx_notify,
 		));
-		let languages = Arc::new(super::super::language::LanguageRegistry::new());
+		let mut languages = super::super::language::LanguageRegistry::new();
+		languages.register(crate::svp::rust_provider::RustProvider::new());
+		languages.register(NavigationTestProvider);
+		let languages = Arc::new(languages);
 		let engine = Engine::new(
 			registry,
 			resolver,
@@ -4860,6 +5229,32 @@ mod event_bus_integration_tests {
 		events
 			.recv_timeout(Duration::from_secs(2))
 			.expect("engine event")
+	}
+
+	fn recv_viewport_until(
+		views: &mpsc::Receiver<crate::uast::projection::Viewport>,
+		timeout: Duration,
+		mut accept: impl FnMut(&crate::uast::projection::Viewport) -> bool,
+	) -> crate::uast::projection::Viewport {
+		let deadline = Instant::now() + timeout;
+		let mut last = None;
+		loop {
+			match views.recv_timeout(Duration::from_millis(250)) {
+				Ok(viewport) if accept(&viewport) => return viewport,
+				Ok(viewport) if Instant::now() < deadline => {
+					last = Some((
+						viewport.status_message.clone(),
+						viewport
+							.panes
+							.first()
+							.and_then(|pane| pane.file_name.clone()),
+					));
+				}
+				Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+				Ok(_) => unreachable!(),
+				Err(error) => panic!("viewport unavailable: {error}; last={last:?}"),
+			}
+		}
 	}
 
 	fn temp_rune_path(name: &str) -> PathBuf {
@@ -5245,6 +5640,520 @@ pub fn main(editor) {
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();
 		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn goto_definition_uses_the_live_rust_document_and_moves_the_exact_view() {
+		let source = "fn main() { target(); }\nfn target() {}\n";
+		let engine = spawn_test_engine(None);
+		engine
+			.commands
+			.send(EditorCommand::ReplaceDocument {
+				text: source.to_string(),
+				language: Some("rust".to_string()),
+				virtual_path: Some("live.rs".to_string()),
+			})
+			.expect("install live Rust source");
+		let mut cursor = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.first()
+				.is_some_and(|pane| !pane.tokens.is_empty())
+		})
+		.panes[0]
+			.cursor_abs_byte;
+		while cursor < DocByte::new(source.find("target").expect("target call") as u64) {
+			engine
+				.commands
+				.send(EditorCommand::MoveCursor(MoveDirection::NextWord))
+				.expect("move to target call");
+			cursor = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport
+					.panes
+					.first()
+					.is_some_and(|pane| pane.cursor_abs_byte > cursor)
+			})
+			.panes[0]
+				.cursor_abs_byte;
+		}
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(30), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+		});
+		let pane = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == viewport.focused_pane_id)
+			.expect("focused pane");
+		assert_eq!(
+			pane.cursor_abs_byte,
+			DocByte::new(source.rfind("target").expect("definition name") as u64)
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+	}
+
+	#[test]
+	fn goto_definition_navigates_a_real_two_file_rust_workspace_end_to_end() {
+		let directory = crate::engine::test_support::temp_test_path("goto-engine-workspace");
+		let source_dir = directory.join("src");
+		std::fs::create_dir_all(&source_dir).expect("create workspace fixture");
+		std::fs::write(
+			directory.join("Cargo.toml"),
+			"[package]\nname = \"goto_engine_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+		)
+		.expect("write manifest");
+		let main_path = source_dir.join("main.rs");
+		let target_path = source_dir.join("other.rs");
+		let source = "mod other;\nfn main() { other::target(); }\n";
+		std::fs::write(&target_path, "pub fn target() {}\n").expect("write target");
+		let engine = spawn_test_engine(None);
+		engine
+			.commands
+			.send(EditorCommand::ReplaceDocument {
+				text: source.to_string(),
+				language: Some("rust".to_string()),
+				virtual_path: Some("main.rs".to_string()),
+			})
+			.expect("install live main source");
+		let mut cursor = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.first()
+				.is_some_and(|pane| !pane.tokens.is_empty())
+		})
+		.panes[0]
+			.cursor_abs_byte;
+		let target_call = DocByte::new(source.rfind("target").expect("target call") as u64);
+		while cursor < target_call {
+			engine
+				.commands
+				.send(EditorCommand::MoveCursor(MoveDirection::NextWord))
+				.expect("move to target call");
+			cursor = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport
+					.panes
+					.first()
+					.is_some_and(|pane| pane.cursor_abs_byte > cursor)
+			})
+			.panes[0]
+				.cursor_abs_byte;
+		}
+		engine
+			.commands
+			.send(EditorCommand::WriteFileAs(
+				main_path.to_string_lossy().into_owned(),
+			))
+			.expect("save main source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.first().is_some_and(|pane| {
+				pane.file_name
+					.as_deref()
+					.is_some_and(|name| name.ends_with("main.rs"))
+					&& !pane.is_dirty
+			})
+		});
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(30), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+		});
+		assert!(
+			viewport.panes[0]
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("other.rs"))
+		);
+		assert_eq!(viewport.panes[0].cursor_abs_byte, DocByte::new(7));
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_dir_all(directory);
+	}
+
+	fn install_navigation_test_source(engine: &RunningTestEngine, text: String) -> BufferId {
+		engine
+			.commands
+			.send(EditorCommand::ReplaceDocument {
+				text,
+				language: Some("navigation-test".to_string()),
+				virtual_path: Some("source.nav".to_string()),
+			})
+			.expect("install navigation source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.first()
+				.is_some_and(|pane| !pane.tokens.is_empty())
+		})
+		.panes[0]
+			.buffer_id
+	}
+
+	#[test]
+	fn goto_definition_refuses_to_replace_a_dirty_source_for_cross_file_navigation() {
+		let target = crate::engine::test_support::temp_test_path("goto-dirty-target");
+		std::fs::write(&target, "dest").expect("write target");
+		let engine = spawn_test_engine(None);
+		let source_buffer =
+			install_navigation_test_source(&engine, format!("target={}\n", target.display()));
+		engine
+			.commands
+			.send(EditorCommand::InsertText("#".to_string()))
+			.expect("dirty source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.first().is_some_and(|pane| pane.is_dirty)
+		});
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Definition is in another file; write or discard source changes first")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+	}
+
+	#[test]
+	fn goto_definition_rejects_a_response_after_the_source_state_changes() {
+		let target = crate::engine::test_support::temp_test_path("goto-stale-target");
+		std::fs::write(&target, "dest").expect("write target");
+		let engine = spawn_test_engine(None);
+		let source_buffer =
+			install_navigation_test_source(&engine, format!("slow\ntarget={}\n", target.display()));
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		engine
+			.commands
+			.send(EditorCommand::InsertText("#".to_string()))
+			.expect("change source");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Definition result discarded: the source document changed")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+	}
+
+	#[test]
+	fn goto_definition_rejects_a_response_after_the_requesting_view_is_retargeted() {
+		let target = crate::engine::test_support::temp_test_path("goto-retarget-target");
+		let replacement = crate::engine::test_support::temp_test_path("goto-retarget-replacement");
+		std::fs::write(&target, "dest").expect("write target");
+		std::fs::write(&replacement, "replacement").expect("write replacement");
+		let engine = spawn_test_engine(None);
+		let _ =
+			install_navigation_test_source(&engine, format!("slow\ntarget={}\n", target.display()));
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		engine
+			.commands
+			.send(EditorCommand::LoadFile(replacement.display().to_string()))
+			.expect("retarget requesting view");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Definition result discarded: the requesting view changed documents")
+		});
+		assert!(viewport.panes[0].file_name.as_deref().is_some_and(|name| {
+			name.ends_with(
+				replacement
+					.file_name()
+					.and_then(|name| name.to_str())
+					.unwrap(),
+			)
+		}));
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+		let _ = std::fs::remove_file(replacement);
+	}
+
+	#[test]
+	fn goto_definition_rejects_a_response_after_the_requesting_view_is_closed() {
+		let target = crate::engine::test_support::temp_test_path("goto-closed-target");
+		std::fs::write(&target, "dest").expect("write target");
+		let engine = spawn_test_engine(None);
+		let source_buffer = install_navigation_test_source(
+			&engine,
+			format!("slow\ntarget={}\n", target.display()),
+		);
+		let source_pane = recv_viewport_until(
+			&engine._views,
+			Duration::from_secs(5),
+			|viewport| viewport.panes.first().is_some_and(|pane| pane.buffer_id == source_buffer),
+		)
+		.panes[0]
+			.pane_id;
+		engine
+			.commands
+			.send(EditorCommand::NewPane {
+				direction: SplitDirection::Vertical,
+				language: None,
+			})
+			.expect("open surviving pane");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.len() == 2
+		});
+		engine
+			.commands
+			.send(EditorCommand::FocusPane(source_pane))
+			.expect("focus source");
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		engine
+			.commands
+			.send(EditorCommand::ClosePane)
+			.expect("close requesting view");
+		let viewport =
+			recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport.status_message.as_deref()
+					== Some("Definition result discarded: the requesting view was closed")
+			});
+		assert_eq!(viewport.panes.len(), 1);
+		assert!(
+			viewport
+				.panes
+				.iter()
+				.all(|pane| pane.buffer_id != source_buffer)
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+	}
+
+	#[test]
+	fn goto_definition_retargets_the_requesting_view_for_a_clean_cross_file_target() {
+		let target = crate::engine::test_support::temp_test_path("goto-clean-target");
+		std::fs::write(&target, "dest").expect("write target");
+		let engine = spawn_test_engine(None);
+		let _ = install_navigation_test_source(&engine, format!("target={}\n", target.display()));
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+		});
+		assert!(viewport.panes[0].file_name.as_deref().is_some_and(|name| {
+			name.ends_with(target.file_name().and_then(|name| name.to_str()).unwrap())
+		}));
+		assert_eq!(viewport.panes[0].cursor_abs_byte, DocByte::ZERO);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+	}
+
+	#[test]
+	fn goto_definition_focuses_an_already_visible_target_without_losing_dirty_source() {
+		let target = crate::engine::test_support::temp_test_path("goto-visible-target");
+		std::fs::write(&target, "dest").expect("write target");
+		let engine = spawn_test_engine(None);
+		let source_buffer =
+			install_navigation_test_source(&engine, format!("target={}\n", target.display()));
+		let source_pane = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.first()
+				.is_some_and(|pane| pane.buffer_id == source_buffer)
+		})
+		.panes[0]
+			.pane_id;
+		engine
+			.commands
+			.send(EditorCommand::NewPane {
+				direction: SplitDirection::Vertical,
+				language: None,
+			})
+			.expect("open target pane");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.len() == 2
+		});
+		engine
+			.commands
+			.send(EditorCommand::LoadFile(target.display().to_string()))
+			.expect("load visible target");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.file_name.as_deref().is_some_and(|name| {
+					name.ends_with(target.file_name().and_then(|name| name.to_str()).unwrap())
+				})
+			})
+		});
+		engine
+			.commands
+			.send(EditorCommand::FocusPane(source_pane))
+			.expect("focus source");
+		engine
+			.commands
+			.send(EditorCommand::InsertText("#".to_string()))
+			.expect("dirty source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.iter()
+				.any(|pane| pane.buffer_id == source_buffer && pane.is_dirty)
+		});
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+		});
+		let focused = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == viewport.focused_pane_id)
+			.expect("focused target");
+		assert!(focused.file_name.as_deref().is_some_and(|name| {
+			name.ends_with(target.file_name().and_then(|name| name.to_str()).unwrap())
+		}));
+		assert!(
+			viewport
+				.panes
+				.iter()
+				.any(|pane| pane.buffer_id == source_buffer && pane.is_dirty)
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_file(target);
+	}
+
+	#[test]
+	fn goto_definition_sorts_multiple_targets_and_reports_the_count() {
+		let directory = crate::engine::test_support::temp_test_path("goto-multiple");
+		std::fs::create_dir_all(&directory).expect("create target directory");
+		let first = directory.join("a.txt");
+		let second = directory.join("b.txt");
+		std::fs::write(&first, "first").expect("write first target");
+		std::fs::write(&second, "second").expect("write second target");
+		let engine = spawn_test_engine(None);
+		let _ = install_navigation_test_source(
+			&engine,
+			format!("target={}\nsecond={}\n", first.display(), second.display()),
+		);
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definitions");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition (2 definitions)")
+		});
+		assert!(
+			viewport.panes[0]
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("a.txt"))
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_dir_all(directory);
+	}
+
+	#[test]
+	fn a_newer_goto_definition_request_supersedes_an_older_response() {
+		let directory = crate::engine::test_support::temp_test_path("goto-supersede");
+		std::fs::create_dir_all(&directory).expect("create target directory");
+		let first = directory.join("a.txt");
+		let second = directory.join("b.txt");
+		std::fs::write(&first, "first").expect("write first target");
+		std::fs::write(&second, "second").expect("write second target");
+		NAVIGATION_SEQUENCE.store(0, Ordering::SeqCst);
+		let engine = spawn_test_engine(None);
+		let _ = install_navigation_test_source(
+			&engine,
+			format!(
+				"sequence\nfirst={}\nsecond={}\n",
+				first.display(),
+				second.display()
+			),
+		);
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request first definition");
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request newer definition");
+		let viewport =
+			recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport.status_message.as_deref() == Some("Jumped to definition")
+					&& viewport.panes[0]
+						.file_name
+						.as_deref()
+						.is_some_and(|name| name.ends_with("b.txt"))
+			});
+		assert!(
+			viewport.panes[0]
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("b.txt"))
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_dir_all(directory);
+	}
+
+	#[test]
+	fn goto_definition_reports_an_unsupported_provider_without_touching_the_document() {
+		let engine = spawn_test_engine(None);
+		engine
+			.commands
+			.send(EditorCommand::ReplaceDocument {
+				text: "unsupported".to_string(),
+				language: Some("navigation-test".to_string()),
+				virtual_path: Some("unsupported.nav".to_string()),
+			})
+			.expect("install source");
+		let source_buffer =
+			recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport
+					.panes
+					.first()
+					.is_some_and(|pane| !pane.tokens.is_empty())
+			})
+			.panes[0]
+				.buffer_id;
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition");
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Go to definition is unsupported for this language")
+		});
+		assert_eq!(viewport.panes[0].buffer_id, source_buffer);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
 	}
 
 	#[test]
