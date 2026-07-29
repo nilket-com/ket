@@ -852,8 +852,26 @@ fn q16_executes_in_both_modes_at_default_scale() {
 // ADR 282 resolved q17's unqualified correlated scalar. ADR 283 clears the strict Decimal operand-alignment
 // walls behind it: non-literal Decimal comparison rescale and `SUM(decimal) / 7.0` literal coercion. q17 now
 // reaches execute in both modes with the official SQL unchanged.
-#[tokio::test]
-async fn q17_executes_in_both_modes() {
+#[test]
+fn q17_executes_in_both_modes() {
+	// ADR 512: the default-on reachable-key reduction deepens q17's bind (graph
+	// scratch re-binds over the engaged recombine); debug frames need the
+	// explicit 64 MB stack, per the suite convention.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime")
+				.block_on(q17_executes_in_both_modes_body())
+		})
+		.expect("spawn q17 harness thread")
+		.join()
+		.expect("q17 harness thread panicked");
+}
+
+async fn q17_executes_in_both_modes_body() {
 	assert!(
 		status_rows()
 			.iter()

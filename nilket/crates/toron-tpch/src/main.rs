@@ -6059,7 +6059,7 @@ mod adr512_tests {
 		unsafe { std::env::remove_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION") };
 		assert_eq!(
 			gauge_scalar_agg_input_reduction().unwrap(),
-			(false, "default")
+			(true, "default")
 		);
 		unsafe { std::env::set_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION", "1") };
 		assert_eq!(

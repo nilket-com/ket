@@ -210,3 +210,93 @@ scripts/cargo-cgroup check -p toron-tpch --features polars-sql-reference --all-t
 Preserve every gate's direct exit status; never pipe a gate through `tail` or a zero-match
 `grep`. Repeat the applicable seal gate after any code change made in response. Finish all gates
 before starting measurement.
+
+## Measured outcome
+
+### Two seals, one honest red between them
+
+Steps 1-2 first sealed as `a1bf26789afb`. Its census engaged exactly one cell — q17, digests
+identical on all 22 q-cells and 11 ladder cells — and proved the semantic goal outright: the inner
+grouped fold collapsed from 10,614.6 ms (`scan_grouped` over 47,989,007 rows) to 1.2 ms over the
+semi output. It also caught a real physical defect the plan had not priced: the inserted LeftSemi
+built on the 48 M-row probe side (join node 11,796.2 ms carrying 379,378,656 spilled bytes, with
+`join_spill_observations` empty — node-attributed spill, not a committed join route), because both
+the smaller-build comparator and local join admission gated on `JoinKind::Inner`
+(`declined(not_inner)`). Net wall moved +1.8 s. The completing cut — widening
+`hash_join_decision_with_placement` to `Inner | LeftSemi`, whose swap is the executor's existing
+`RightSemi` via `mirrored_broadcast_physical_kind`, with ADR 511's shrink-only rule unchanged and
+a discriminating unit test that fails under the Inner-only gate — sealed and pushed as
+`bf11c6e0b35b`. All evidence below is from the release binary built from that clean identity.
+
+| evidence | artifact |
+|---|---|
+| first-seal census (the caught red) | `target/tpch/adr512_route_census_{off,on}_a1bf2678/` |
+| corrected census, both arms | `target/tpch/adr512_route_census_{off,on}_bf11c6e0/` |
+| ladder census, both arms | `target/tpch/adr512_ladder_census_{off,on}_bf11c6e0/` |
+| diagnostic pair with node attribution | `target/tpch/adr512_q17_diag_{off,on}_bf11c6e0/` |
+| plan-distinct gated 10-pair cohort | `target/tpch/adr512_q17_paired_bf11c6e0/` |
+
+### Census, reach, and correctness
+
+The corrected census: q17 is the only engaged cell (fingerprint `9062c1de21622849` →
+`e30b1263f6a8e25e`), single-run execute 11,419 → 4,236 ms, spill **zero in both arms**, digest and
+row count identical; 21 q-cells and all 11 ladder cells are plan-invariant with equal digests. The
+plan's q02/q20 engagement hypothesis is **falsified**: their bare-identifier correlations ride the
+deferred path, but their outer shapes do not admit a source under the conservative derivation
+walk. The census is authoritative; their coverage is a named forward candidate, not a claim.
+
+Strict correctness passed in both arms with direct exit 0: q17 at its supported sf=0.02 oracle
+coordinate and the q19 sentinel at sf=0.01.
+
+### Structural evidence (the operator-required pair)
+
+Reduced aggregate input: the fold's 9,405.6 ms (`scan_grouped`, control) disappears entirely in
+the candidate (generic fold below the 100 ms reporting threshold). Unchanged grouping and
+exchange: pinned structurally by the binder tests (exchange count, partition keys, and grouping
+above the semi are byte-identical wrappers) and corroborated by identical digests and clean
+attribution reconciliation (zero unattributed spill, zero bridge/stage/interleaved mismatches) in
+both arms. Candidate node profile: scan 1,296.6 ms, join 2,076.6 ms (join0 plus the swapped semi,
+zero spill), exchange 890.6 ms.
+
+### Locked paired cohort
+
+The gate passed as gate-zero over the full-hash dataset; the journal holds one discarded warmup
+and 20 measured rows in adjacent pairs — every row passing, full-hash, clean `bf11c6e0b35b`
+release, one shared digest, per-arm fingerprints as above, zero spill on every row.
+
+| pair | candidate | control | control - candidate |
+|---:|---:|---:|---:|
+| 1 | 4,278.369 ms | 11,463.539 ms | 7,185.170 ms |
+| 2 | 4,224.342 ms | 11,461.469 ms | 7,237.127 ms |
+| 3 | 4,241.414 ms | 11,528.230 ms | 7,286.817 ms |
+| 4 | 4,233.966 ms | 11,466.883 ms | 7,232.917 ms |
+| 5 | 4,238.979 ms | 11,456.834 ms | 7,217.855 ms |
+| 6 | 4,239.913 ms | 11,525.464 ms | 7,285.551 ms |
+| 7 | 4,275.752 ms | 11,472.038 ms | 7,196.285 ms |
+| 8 | 4,243.002 ms | 11,610.308 ms | 7,367.306 ms |
+| 9 | 4,258.915 ms | 11,439.391 ms | 7,180.476 ms |
+| 10 | 4,246.511 ms | 11,476.383 ms | 7,229.872 ms |
+
+```text
+Hodges-Lehmann point        = 7,233.646 ms
+two-sided 95% interval      = [7,205.174, 7,286.184] ms
+fixed materiality floor     = 3,554 ms
+interval excludes zero      = true
+point reaches floor         = true (2.04x; the interval lower bound alone is 2.03x)
+activate                    = true
+```
+
+### Activation
+
+The verdict is `activate` under ADR 472's rule verbatim: the interval excludes zero at twice the
+fixed floor, the only engaged cell improves 2.7x with held digests, and no other cell changed
+plans. This receipt flips `PlannerConfig::scalar_aggregate_input_reduction` to compiled default
+**true**, retargets the gauge knob-contract default arm, and re-runs the full seal gate plus
+default-arm strict correctness smokes for q17 and the q19 sentinel from the flipped tree. The
+implementation seals `a1bf26789afb` and `bf11c6e0b35b` remain the measurement identities; this
+receipt commit is independently revertible.
+
+q17's cumulative arc across ADRs 511-512: 35,541 ms (ADR 508 baseline) → ~11.6 s (511, build-side
+swap) → ~4.24 s (512, reachable-key reduction) against DuckDB's single-thread 765 ms — the cell's
+engine gap compressed from 46.5x to roughly 5.5x, with the remaining envelope now scan + join0 +
+exchange rather than any single dominant defect.

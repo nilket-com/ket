@@ -190,7 +190,9 @@ pub struct PlannerConfig {
 	/// reachable from the recombine's outer side. A semi build that is a
 	/// superset of the outer key domain eliminates only never-matched groups,
 	/// so every aggregate in the grouped shape is preserved; the recognizer
-	/// declines otherwise. Default false until the ADR 512 paired receipt.
+	/// declines otherwise. Default-on since the ADR 512 receipt: q17 pairs
+	/// improved 7,180-7,367 ms against the 3,554 ms floor with zero spill in
+	/// both arms, q17 was the only engaged cell, and every digest held.
 	pub scalar_aggregate_input_reduction: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
@@ -223,7 +225,7 @@ impl Default for PlannerConfig {
 			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 			hash_smaller_build_placement: true,
 			filtered_build_side_swap: true,
-			scalar_aggregate_input_reduction: false,
+			scalar_aggregate_input_reduction: true,
 		}
 	}
 }
