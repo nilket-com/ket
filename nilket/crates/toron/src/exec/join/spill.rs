@@ -1254,6 +1254,45 @@ fn spilled_primitive_index_base_bytes<K>(
 	.saturating_add(overflow_heap_bytes)
 }
 
+/// ADR 514: the owner-complete resident bound for a compact single-key streamed
+/// scan build at one partition, priced from the pre-scan's exact row count.
+/// Every simultaneously resident owner is charged with the same layout this
+/// module actually allocates: power-of-two bucket capacity (4 B per bucket),
+/// power-of-two entry-vector capacity (the widest compact entry), a worst-case
+/// duplicate-ref overflow term covering any key distribution, the decoded-page
+/// cache target, page metadata, and write scratch. Returns `None` when any term
+/// overflows; callers fail closed to the legacy row-overhead estimate.
+pub(in crate::exec) fn compact_streamed_build_owner_bound_bytes(
+	rows: u64,
+	decoded_bytes: u64,
+) -> Option<u64> {
+	let rows_usize = usize::try_from(rows).ok()?;
+	let bucket_count = rows_usize
+		.checked_mul(2)?
+		.checked_next_power_of_two()?
+		.max(1);
+	let entry_count = rows_usize.checked_next_power_of_two()?.max(1);
+	let bucket_bytes = u64::try_from(bucket_count.checked_mul(std::mem::size_of::<u32>())?).ok()?;
+	let entry_bytes = u64::try_from(
+		entry_count.checked_mul(std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<i64>>())?,
+	)
+	.ok()?;
+	let per_overflow_ref = u64::try_from(std::mem::size_of::<CompactSpilledBatchRowRef>())
+		.ok()?
+		.checked_add(8)?;
+	let overflow_bytes = rows.checked_mul(per_overflow_ref)?;
+	let page_size = u64::try_from(JOIN_SPILL_PAGE_SIZE).ok()?;
+	let page_count = decoded_bytes.checked_div(page_size)?.checked_add(1)?;
+	let metadata_bytes = page_count.checked_mul(256)?;
+	let scratch_bytes = page_size.checked_mul(4)?;
+	bucket_bytes
+		.checked_add(entry_bytes)?
+		.checked_add(overflow_bytes)?
+		.checked_add(JOIN_SPILL_CACHE_TARGET_BYTES)?
+		.checked_add(metadata_bytes)?
+		.checked_add(scratch_bytes)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::exec) struct SpilledInnerJoinMatch {
 	pub(super) build: SpilledBatchRowRef,

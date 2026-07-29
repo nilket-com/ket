@@ -28,6 +28,81 @@ const PARTITIONED_BUILD_SPILL_PROFILE_ENV: &str = "TORON_PARTITIONED_BUILD_SPILL
 const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_ENV: &str =
 	"TORON_PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH";
 const PARTITIONED_SCAN_BUILD_INDEX_AT_FLUSH_DEFAULT: bool = false;
+const COMPACT_BUILD_PARTITION_SIZING_ENV: &str = "TORON_COMPACT_BUILD_PARTITION_SIZING";
+const COMPACT_BUILD_PARTITION_SIZING_DEFAULT: bool = false;
+
+/// ADR 514: how the streamed scan-build partitioning choice prices the build.
+/// The legacy mode keeps the shared 112-byte-per-row admission estimate; the
+/// compact mode prices provably compact single-key builds with the
+/// owner-complete resident bound plus a 5/4 contingency above it. The mode is
+/// read once at the partitioning decision and never below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildPartitionSizingMode {
+	LegacyRowOverhead,
+	CompactOwnerBound,
+}
+
+fn build_partition_sizing_mode_from_env(
+	value: Option<&str>,
+) -> Result<BuildPartitionSizingMode, ExecutionError> {
+	let normalized = value.map(|value| value.trim().to_ascii_lowercase());
+	match normalized.as_deref() {
+		Some("1" | "true" | "yes" | "on") => Ok(BuildPartitionSizingMode::CompactOwnerBound),
+		Some("0" | "false" | "no" | "off") => Ok(BuildPartitionSizingMode::LegacyRowOverhead),
+		None if COMPACT_BUILD_PARTITION_SIZING_DEFAULT => {
+			Ok(BuildPartitionSizingMode::CompactOwnerBound)
+		}
+		None => Ok(BuildPartitionSizingMode::LegacyRowOverhead),
+		Some(value) => Err(ExecutionError::Kernel {
+			message: format!(
+				"{COMPACT_BUILD_PARTITION_SIZING_ENV} must be one of 0/false/no/off or 1/true/yes/on, got {value:?}"
+			),
+		}),
+	}
+}
+
+fn build_partition_sizing_mode() -> Result<BuildPartitionSizingMode, ExecutionError> {
+	build_partition_sizing_mode_from_env(
+		std::env::var(COMPACT_BUILD_PARTITION_SIZING_ENV)
+			.ok()
+			.as_deref(),
+	)
+}
+
+/// ADR 514: facts the estimate pre-scan proves about a streamed scan build —
+/// the exact post-filter row count, the decoded projected bytes, and whether
+/// the committed representation is the compact single-key index (one build
+/// key of Int32/Int64, plain equality).
+#[derive(Debug, Clone, Copy)]
+struct CompactBuildSizingFacts {
+	rows: u64,
+	decoded_bytes: u64,
+	compact_single_key: bool,
+}
+
+/// ADR 514: the effective partitioning estimate. The legacy mode and every
+/// ineligible or overflowing shape keep the shared row-overhead estimate
+/// byte-for-byte; an eligible compact shape prices the owner-complete bound
+/// with the predeclared 5/4 contingency above it.
+fn effective_partition_sizing_bytes(
+	mode: BuildPartitionSizingMode,
+	legacy_bytes: u64,
+	facts: Option<CompactBuildSizingFacts>,
+) -> u64 {
+	if mode != BuildPartitionSizingMode::CompactOwnerBound {
+		return legacy_bytes;
+	}
+	let Some(facts) = facts else {
+		return legacy_bytes;
+	};
+	if !facts.compact_single_key {
+		return legacy_bytes;
+	}
+	match super::spill::compact_streamed_build_owner_bound_bytes(facts.rows, facts.decoded_bytes) {
+		Some(bound) => bound.saturating_add(bound / 4),
+		None => legacy_bytes,
+	}
+}
 
 fn physical_scan_build_enabled_from_env(value: Option<&str>) -> bool {
 	!matches!(value, Some("0"))
@@ -5871,6 +5946,7 @@ impl Executor {
 		let partitioning = self
 			.choose_streaming_scan_inner_build_partitioning(
 				estimated_build_bytes,
+				None,
 				build_scan_input,
 				None,
 				build_keys,
@@ -7352,6 +7428,30 @@ impl Executor {
 		null_safe_keys: bool,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<u64, ExecutionError> {
+		let (estimated, _) = self
+			.estimate_streaming_scan_inner_build_with_facts(
+				scan_input,
+				retained_columns,
+				build_keys,
+				null_safe_keys,
+				morsel,
+			)
+			.await?;
+		Ok(estimated)
+	}
+
+	/// ADR 514: the estimate pre-scan, additionally proving the sizing facts —
+	/// the exact post-filter row count, the decoded projected bytes, and
+	/// whether the build commits the compact single-key representation. The
+	/// row count is the pre-scan's exact count, never a planner estimate.
+	async fn estimate_streaming_scan_inner_build_with_facts(
+		&self,
+		scan_input: StreamingScanProbeInput<'_>,
+		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(u64, CompactBuildSizingFacts), ExecutionError> {
 		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
 			return Err(ExecutionError::InvalidExpression {
 				message: "streaming scan build expected a scan input".to_string(),
@@ -7366,6 +7466,12 @@ impl Executor {
 			.await?
 			.into_batches();
 		let mut estimated = 0u64;
+		let mut facts = CompactBuildSizingFacts {
+			rows: 0,
+			decoded_bytes: 0,
+			compact_single_key: false,
+		};
+		let mut key_shape_checked = false;
 		while let Some(batch) = stream.next().await {
 			let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
 				break;
@@ -7375,6 +7481,29 @@ impl Executor {
 					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
 				if batch.num_rows() == 0 {
 					continue;
+				}
+			}
+			{
+				let projected;
+				let sized = if let Some(retained_columns) = retained_columns {
+					projected = project_batch_columns(&batch, retained_columns)?;
+					&projected
+				} else {
+					&batch
+				};
+				facts.rows = facts.rows.saturating_add(sized.num_rows() as u64);
+				facts.decoded_bytes = facts
+					.decoded_bytes
+					.saturating_add(record_batch_memory_bytes(sized));
+				if !key_shape_checked {
+					key_shape_checked = true;
+					let key_arrays = key_arrays(sized, build_keys)?;
+					facts.compact_single_key = !null_safe_keys
+						&& key_arrays.len() == 1
+						&& matches!(
+							key_arrays[0].data_type(),
+							arrow::datatypes::DataType::Int32 | arrow::datatypes::DataType::Int64
+						);
 				}
 			}
 			if let Some(exchange) = scan_input.exchange {
@@ -7398,7 +7527,7 @@ impl Executor {
 				)?);
 			}
 		}
-		Ok(estimated)
+		Ok((estimated, facts))
 	}
 
 	async fn estimate_streaming_scan_inner_build_partition_bytes(
@@ -7473,6 +7602,7 @@ impl Executor {
 	async fn choose_streaming_scan_inner_build_partitioning(
 		&self,
 		estimated_build_bytes: u64,
+		compact_facts: Option<CompactBuildSizingFacts>,
 		scan_input: StreamingScanProbeInput<'_>,
 		retained_columns: Option<&[crate::ir::ColumnOrdinal]>,
 		partition_build_keys: &[crate::ir::ColumnOrdinal],
@@ -7480,8 +7610,14 @@ impl Executor {
 		null_safe_keys: bool,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<(u32, u32, u64), ExecutionError> {
+		// ADR 514: the sizing mode is read once at this decision and never
+		// below it; every ineligible or overflowing shape keeps the legacy
+		// estimate byte-for-byte.
+		let sizing_mode = build_partition_sizing_mode()?;
+		let effective_build_bytes =
+			effective_partition_sizing_bytes(sizing_mode, estimated_build_bytes, compact_facts);
 		let mut partition_count = streamed_inner_build_partition_count(
-			estimated_build_bytes,
+			effective_build_bytes,
 			self.context.task_budget.memory.get(),
 			self.context.task_budget.spill_bytes.get(),
 		)?;
@@ -16012,8 +16148,8 @@ impl Executor {
 			} else {
 				stage.output_schema.clone()
 			};
-			let estimated_build_bytes = self
-				.estimate_streaming_scan_inner_build_bytes(
+			let (estimated_build_bytes, compact_facts) = self
+				.estimate_streaming_scan_inner_build_with_facts(
 					scan_input,
 					retained_columns,
 					write_build_keys,
@@ -16024,6 +16160,7 @@ impl Executor {
 			let (partition_count, group_count, _max_group_spill) = self
 				.choose_streaming_scan_inner_build_partitioning(
 					estimated_build_bytes,
+					Some(compact_facts),
 					scan_input,
 					retained_columns,
 					&stage.build_keys,
@@ -21360,6 +21497,155 @@ mod tests {
 			projected_runtime.cleanup().await;
 			materialized_runtime.cleanup().await;
 		}
+	}
+
+	#[test]
+	fn adr514_sizing_mode_env_contract() {
+		assert_eq!(
+			build_partition_sizing_mode_from_env(None).unwrap(),
+			BuildPartitionSizingMode::LegacyRowOverhead,
+			"compiled default is legacy until the ADR 514 receipt"
+		);
+		assert_eq!(
+			build_partition_sizing_mode_from_env(Some("1")).unwrap(),
+			BuildPartitionSizingMode::CompactOwnerBound
+		);
+		assert_eq!(
+			build_partition_sizing_mode_from_env(Some("0")).unwrap(),
+			BuildPartitionSizingMode::LegacyRowOverhead
+		);
+		assert!(build_partition_sizing_mode_from_env(Some("maybe")).is_err());
+	}
+
+	#[test]
+	fn adr514_effective_sizing_fails_closed() {
+		let facts = CompactBuildSizingFacts {
+			rows: 1_000,
+			decoded_bytes: 8_192,
+			compact_single_key: true,
+		};
+		// Legacy mode passes the legacy estimate through untouched.
+		assert_eq!(
+			effective_partition_sizing_bytes(
+				BuildPartitionSizingMode::LegacyRowOverhead,
+				701,
+				Some(facts)
+			),
+			701
+		);
+		// Missing facts and ineligible shapes keep legacy byte-for-byte.
+		assert_eq!(
+			effective_partition_sizing_bytes(
+				BuildPartitionSizingMode::CompactOwnerBound,
+				701,
+				None
+			),
+			701
+		);
+		assert_eq!(
+			effective_partition_sizing_bytes(
+				BuildPartitionSizingMode::CompactOwnerBound,
+				701,
+				Some(CompactBuildSizingFacts {
+					compact_single_key: false,
+					..facts
+				})
+			),
+			701
+		);
+		// Overflow in the owner bound falls back closed to legacy.
+		assert_eq!(
+			effective_partition_sizing_bytes(
+				BuildPartitionSizingMode::CompactOwnerBound,
+				701,
+				Some(CompactBuildSizingFacts {
+					rows: u64::MAX,
+					..facts
+				})
+			),
+			701
+		);
+		// The eligible path prices the owner bound plus the 5/4 contingency.
+		let bound = super::super::spill::compact_streamed_build_owner_bound_bytes(
+			facts.rows,
+			facts.decoded_bytes,
+		)
+		.expect("small bound computes");
+		assert_eq!(
+			effective_partition_sizing_bytes(
+				BuildPartitionSizingMode::CompactOwnerBound,
+				701,
+				Some(facts)
+			),
+			bound + bound / 4
+		);
+	}
+
+	#[test]
+	fn adr514_owner_bound_straddles_every_power_of_two_discontinuity() {
+		// One additional row across a power-of-two boundary doubles the
+		// bucket and entry capacities; the bound must jump accordingly on
+		// both discontinuities, and grow only linearly between them.
+		let entry_bytes = 24u64; // PrimitiveSpilledBatchIndexEntry<i64>
+		let at = |rows: u64| {
+			super::super::spill::compact_streamed_build_owner_bound_bytes(rows, 0)
+				.expect("bound computes")
+		};
+		// Bucket capacity is pow2(2*rows) and entry capacity is pow2(rows), so
+		// both discontinuities coincide at rows = 2^m: one additional row
+		// doubles both allocations at once. Assert the combined jump at two
+		// different magnitudes.
+		for shift in [20u64, 22] {
+			let rows = 1u64 << shift;
+			let jump = at(rows + 1) - at(rows);
+			let expected = rows * entry_bytes + (rows * 2) * 4;
+			assert!(
+				jump >= expected,
+				"bucket+entry capacity must double across rows=2^{shift}: jump {jump} < {expected}"
+			);
+		}
+		// Between discontinuities the bound grows by the linear per-row terms
+		// only (the worst-case overflow refs), far below a capacity doubling.
+		let rows = (1u64 << 22) + 10;
+		let linear = at(rows + 1) - at(rows);
+		assert!(linear <= 64, "linear growth between capacities: {linear}");
+	}
+
+	#[test]
+	fn adr514_threshold_edge_selects_partition_count() {
+		let memory_cap = 2u64 * 1024 * 1024 * 1024;
+		let spill_budget = 2u64 * 1024 * 1024 * 1024;
+		let threshold = streamed_inner_build_writer_target_bytes(spill_budget);
+		assert_eq!(threshold, 536_870_912);
+		// Find the largest priced bound at or under the threshold and the
+		// first one over it by probing the composed pipeline the fork feeds.
+		let effective = |rows: u64| {
+			let bound = super::super::spill::compact_streamed_build_owner_bound_bytes(rows, 0)
+				.expect("bound computes");
+			bound + bound / 4
+		};
+		let partitions = |bytes: u64| {
+			streamed_inner_build_partition_count(bytes, memory_cap, spill_budget).unwrap()
+		};
+		// The grounded coordinate: 5,845,938 rows price under the threshold and
+		// keep one partition — the route-flip fact this ADR measures.
+		let grounded = effective(5_845_938);
+		assert!(
+			grounded <= threshold,
+			"grounded bound {grounded} must fit the threshold"
+		);
+		assert_eq!(partitions(grounded), 1);
+		// Directly above the threshold the count moves to 2: the predeclared
+		// edge, exercised on both sides.
+		assert_eq!(partitions(threshold), 1);
+		assert_eq!(partitions(threshold + 1), 2);
+		// A row count whose priced bound exceeds the threshold partitions.
+		let big = effective(12_000_000);
+		assert!(
+			big > threshold,
+			"12M-row bound {big} must exceed the threshold"
+		);
+		assert_eq!(partitions(big), 2);
 	}
 
 	#[test]

@@ -835,3 +835,51 @@ fn contains_query_number_reference(line: &str) -> bool {
 				&& bytes[1..].iter().all(u8::is_ascii_digit)
 		})
 }
+
+#[test]
+pub(crate) fn adr514_compact_sizing_scope_is_pinned() {
+	// ADR 514: the representation-aware sizing exists as a second opinion at
+	// exactly one decision — the streamed scan-build partitioning choice — and
+	// the shared binder/executor admission constant is untouched. The counts
+	// below pin that scope (definitions plus the single production call plus
+	// the named tests); a new consumer must retarget this guard explicitly.
+	let manifest = manifest_dir();
+	let streaming =
+		std::fs::read_to_string(manifest.join("src/exec/join/streaming.rs")).expect("streaming");
+	let spill = std::fs::read_to_string(manifest.join("src/exec/join/spill.rs")).expect("spill");
+	let ir = std::fs::read_to_string(manifest.join("src/ir.rs")).expect("ir");
+
+	assert_eq!(
+		ir.matches("HASH_JOIN_BUILD_ROW_OVERHEAD_BYTES").count(),
+		2,
+		"the shared admission constant keeps its definition and single use in ir.rs"
+	);
+	assert_eq!(
+		streaming
+			.matches("HASH_JOIN_BUILD_ROW_OVERHEAD_BYTES")
+			.count(),
+		0,
+		"the sizing fork must not consume the shared admission constant directly"
+	);
+	assert_eq!(
+		spill
+			.matches("compact_streamed_build_owner_bound_bytes")
+			.count(),
+		1,
+		"the owner bound is defined once beside the accounting it mirrors"
+	);
+	assert_eq!(
+		streaming
+			.matches("compact_streamed_build_owner_bound_bytes")
+			.count(),
+		4,
+		"one production consumer (effective_partition_sizing_bytes) plus the three named tests"
+	);
+	assert_eq!(
+		streaming
+			.matches("effective_partition_sizing_bytes")
+			.count(),
+		7,
+		"one definition, one call in the partitioning choice, five test references"
+	);
+}

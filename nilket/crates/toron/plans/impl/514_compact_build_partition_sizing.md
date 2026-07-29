@@ -38,6 +38,42 @@ are read, never written.
 
 Phase 0 results land in this document before step 1 code is written.
 
+### Phase 0 result — green, with the owner model corrected downward
+
+The count=1 path routes through the standard coalescing `SpilledInnerJoinBuild`: pages are
+written with an index and page residency is bounded by `JOIN_SPILL_CACHE_TARGET_BYTES` = 8 MiB —
+decoded pages are never simultaneously resident in full. That corrects the plan's provisional
+409 MB projection (which wrongly charged all decoded pages as resident) and is the precise
+explanation of the measurement split: 23.4 MB pinned and 46.8 MB decoded are deferred-route and
+cache-bounded artifacts; the priced owners are the index allocations plus bounded cache and
+scratch.
+
+Owner-complete bound at the pre-scan's exact count (5,845,938 rows, 46,837,968 decoded bytes),
+priced with the layout the spill module actually allocates:
+
+| owner | bytes |
+|---|---:|
+| buckets: pow2(2 x rows) x 4 B | 67,108,864 |
+| entries: pow2(rows) x 24 B (`PrimitiveSpilledBatchIndexEntry<i64>`) | 201,326,592 |
+| worst-case duplicate-ref overflow: rows x 16 B | 93,535,008 |
+| decoded-page cache target | 8,388,608 |
+| page metadata + write scratch | 445,184 |
+| **owner-complete bound** | **370,804,256** |
+| x 5/4 contingency | **463,505,320** |
+| threshold (`spill_budget / 4`) | 536,870,912 |
+| **margin** | **73,365,592 (13.7%)** |
+
+The fit holds with the contingency as pure headroom above an owner-complete sum — no owner was
+omitted to make room for it. The composed threshold-edge unit test pins this arithmetic
+(5,845,938 rows price to one partition; 12,000,000 price to two; the edge is exercised on both
+sides of 536,870,912). The guard check (`guard_membership_owner_resident` at 2 GiB) has
+1.68 GiB of headroom above the priced resident set plus the measured runtime baseline.
+
+Two scope facts recorded for the receipt: the join0 spill route's call into the partitioning
+choice passes no compact facts this cut (it keeps legacy sizing; its census route facts must not
+change), and the probe-side page access through the 8 MiB cache under the direct route is the
+principal residual risk the cohort prices.
+
 ## Step 1 - the sizing fork and control
 
 At `choose_streaming_scan_inner_build_partitioning` (the only call site):

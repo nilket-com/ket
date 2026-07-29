@@ -683,6 +683,15 @@ async fn perf_command(args: &[String]) -> ExitCode {
 					&output_dir,
 					&paired_switch,
 				),
+				PairedGate::RouteDistinct => run_route_distinct_gate(
+					queries[0],
+					mode,
+					sf,
+					data_source,
+					&data_dir,
+					&output_dir,
+					&paired_switch,
+				),
 			}
 		};
 		match gate {
@@ -4328,6 +4337,7 @@ struct PairedSwitch {
 enum PairedGate {
 	PlanDistinct,
 	ShapePreservingSpillIndex,
+	RouteDistinct,
 }
 
 impl PairedGate {
@@ -4335,6 +4345,7 @@ impl PairedGate {
 		match self {
 			Self::PlanDistinct => "plan-distinct",
 			Self::ShapePreservingSpillIndex => "shape-preserving-spill-index",
+			Self::RouteDistinct => "route-distinct",
 		}
 	}
 }
@@ -4347,6 +4358,7 @@ fn paired_gate_from_args(args: &[String]) -> Result<PairedGate, String> {
 	match flag_value(args, "--paired-gate").unwrap_or("plan-distinct") {
 		"plan-distinct" => Ok(PairedGate::PlanDistinct),
 		"shape-preserving-spill-index" => Ok(PairedGate::ShapePreservingSpillIndex),
+		"route-distinct" => Ok(PairedGate::RouteDistinct),
 		other => Err(format!("unsupported --paired-gate {other:?}")),
 	}
 }
@@ -4711,6 +4723,162 @@ fn run_shape_preserving_spill_index_gate(
 			"passed": false,
 		})),
 	}
+}
+
+/// ADR 514: the plan-identical route ablation gate. Both arms must bind the
+/// same plan and produce the same result facts; the route facts must be
+/// opposite — the control on the deferred reservoir lifecycle
+/// (partition_count >= 2, probe reservoir spill positive) and the candidate on
+/// the direct lifecycle (no deferred block, reservoir zero by construction).
+/// Missing, stale, or same-arm evidence fails closed.
+fn run_route_distinct_gate(
+	query: &str,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+	switch: &PairedSwitch,
+) -> Result<serde_json::Value, String> {
+	let gate_dir = output_dir.join("route_distinct_gate");
+	std::fs::create_dir_all(&gate_dir)
+		.map_err(|error| format!("create route-distinct gate directory: {error}"))?;
+	let run_arm = |arm: &str, value: &str| {
+		let spill_dir = PathBuf::from(CACHE_ROOT).join("join_spill");
+		if spill_dir.exists() {
+			std::fs::remove_dir_all(&spill_dir)
+				.map_err(|error| format!("clear route-gate join spill scratch: {error}"))?;
+		}
+		let profile_path = gate_dir.join(format!("{arm}_chain_stage.json"));
+		let profile = profile_path.display().to_string();
+		let row = run_perf_child_with_envs(
+			query,
+			mode,
+			sf,
+			0,
+			data_source,
+			data_dir,
+			&[
+				(switch.env.as_str(), value),
+				("TORON_CHAIN_STAGE_PROFILE_PATH", profile.as_str()),
+			],
+		)?;
+		if spill_dir.exists()
+			&& std::fs::read_dir(&spill_dir)
+				.map_err(|error| format!("inspect route-gate join spill scratch: {error}"))?
+				.next()
+				.is_some()
+		{
+			return Err(format!(
+				"route-gate {arm} child abandoned join spill state in {}",
+				spill_dir.display()
+			));
+		}
+		let profile_value: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&profile_path).map_err(|error| {
+				format!("route-gate {arm} chain stage profile missing: {error}")
+			})?)
+			.map_err(|error| format!("route-gate {arm} chain stage profile parse: {error}"))?;
+		Ok((row, profile_value))
+	};
+	let (on_row, on_profile) = run_arm("candidate", &switch.on_value)?;
+	let (off_row, off_profile) = run_arm("control", &switch.off_value)?;
+	match route_distinct_gate_record(&on_row, &off_row, &on_profile, &off_profile) {
+		Ok(mut record) => {
+			record["switch_env"] = serde_json::json!(switch.env);
+			record["on_value"] = serde_json::json!(switch.on_value);
+			record["off_value"] = serde_json::json!(switch.off_value);
+			record["join_spill_scratch_empty"] = serde_json::json!(true);
+			Ok(record)
+		}
+		Err(reason) => Ok(serde_json::json!({
+			"suite": "route_distinct_gate",
+			"switch_env": switch.env,
+			"on_value": switch.on_value,
+			"off_value": switch.off_value,
+			"reason": reason,
+			"passed": false,
+		})),
+	}
+}
+
+fn route_distinct_gate_record(
+	on_row: &serde_json::Value,
+	off_row: &serde_json::Value,
+	on_profile: &serde_json::Value,
+	off_profile: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+	let row_str = |row: &serde_json::Value, key: &str| -> Result<String, String> {
+		row.get(key)
+			.and_then(serde_json::Value::as_str)
+			.map(ToOwned::to_owned)
+			.ok_or_else(|| format!("route gate row lacks {key}"))
+	};
+	let row_u64 = |row: &serde_json::Value, key: &str| -> Result<u64, String> {
+		row.get(key)
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| format!("route gate row lacks numeric {key}"))
+	};
+	for (arm, row) in [("candidate", on_row), ("control", off_row)] {
+		if row_str(row, "status")? != "pass" {
+			return Err(format!("route gate {arm} child did not pass"));
+		}
+		if row_str(row, "dataset_verification")? != "full_hash" {
+			return Err(format!("route gate {arm} child is not full-hash verified"));
+		}
+		if row.get("debug_build").and_then(serde_json::Value::as_bool) != Some(false) {
+			return Err(format!("route gate {arm} child is not a release build"));
+		}
+	}
+	for key in [
+		"plan_fingerprint",
+		"digest",
+		"output_schema_fingerprint",
+		"build_commit",
+	] {
+		if row_str(on_row, key)? != row_str(off_row, key)? {
+			return Err(format!("route gate arms disagree on {key}"));
+		}
+	}
+	if row_u64(on_row, "output_row_count")? != row_u64(off_row, "output_row_count")? {
+		return Err("route gate arms disagree on output_row_count".to_string());
+	}
+	let off_deferred = off_profile
+		.get("deferred_replay_1")
+		.ok_or("route gate control lacks the deferred reservoir block")?;
+	let off_partitions = off_deferred
+		.get("partition_count")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or("route gate control lacks a numeric partition_count")?;
+	let off_probe_spill = off_deferred
+		.get("probe_spill_bytes")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or("route gate control lacks numeric probe_spill_bytes")?;
+	if off_partitions < 2 {
+		return Err(format!(
+			"route gate control must partition (partition_count {off_partitions})"
+		));
+	}
+	if off_probe_spill == 0 {
+		return Err("route gate control must spill the probe reservoir".to_string());
+	}
+	if let Some(on_deferred) = on_profile.get("deferred_replay_1") {
+		return Err(format!(
+			"route gate candidate still ran the deferred reservoir lifecycle: {on_deferred}"
+		));
+	}
+	Ok(serde_json::json!({
+		"suite": "route_distinct_gate",
+		"plan_fingerprint": row_str(on_row, "plan_fingerprint")?,
+		"digest_equal": true,
+		"control_partition_count": off_partitions,
+		"control_probe_spill_bytes": off_probe_spill,
+		"candidate_deferred_block": false,
+		"control_spill_bytes": off_row.get("spill_bytes").cloned().unwrap_or(serde_json::json!(null)),
+		"candidate_spill_bytes": on_row.get("spill_bytes").cloned().unwrap_or(serde_json::json!(null)),
+		"dataset_fingerprint": on_row.get("dataset_verification").cloned().unwrap_or(serde_json::json!(null)),
+		"passed": true,
+	}))
 }
 
 fn paired_ablation_arm(run_index: u32) -> bool {
