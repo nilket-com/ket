@@ -126,6 +126,56 @@ pub(crate) struct UastInspectorRow {
 	pub(crate) stamp: UastInspectorStamp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UastIndexInspectorTarget {
+	RootExtent { node_id: NodeId, rank: usize },
+	SumTreeEntry { rank: usize, leaf: u32, slot: usize },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UastIndexInspectorRow {
+	pub(crate) line: DocLine,
+	pub(crate) line_start_byte: DocByte,
+	pub(crate) start_byte: DocByte,
+	pub(crate) end_byte: DocByte,
+	pub(crate) contains_cursor: bool,
+	pub(crate) stamp: UastInspectorStamp,
+	pub(crate) index_revision: u64,
+	pub(crate) target: UastIndexInspectorTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UastSumTreeCacheKey {
+	pub(crate) root: NodeId,
+	pub(crate) state_id: StateId,
+	pub(crate) total_lines: u64,
+	pub(crate) total_bytes: u64,
+	pub(crate) topology_revision: u64,
+}
+
+impl From<&CachedSumTree> for UastSumTreeCacheKey {
+	fn from(cache: &CachedSumTree) -> Self {
+		Self {
+			root: cache.root,
+			state_id: cache.state_id,
+			total_lines: cache.total_lines,
+			total_bytes: cache.total_bytes,
+			topology_revision: cache.topology_revision,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UastIndexRefreshIdentity {
+	Treap {
+		revision: u64,
+	},
+	SumTree {
+		cache: Option<UastSumTreeCacheKey>,
+		rebuilds: u64,
+	},
+}
+
 impl UastInspectorRow {
 	pub(crate) fn key(&self) -> UastInspectorNodeKey {
 		UastInspectorNodeKey {
@@ -159,6 +209,7 @@ pub(crate) struct UastInspectorRefreshKey {
 	pub(crate) snapshot_node_budget: usize,
 	pub(crate) registry_revision: u64,
 	pub(crate) reclaim_pending_heads: usize,
+	pub(crate) index_identity: Option<UastIndexRefreshIdentity>,
 }
 
 #[derive(Debug)]
@@ -170,6 +221,7 @@ pub(crate) struct UastInspectorPanel {
 	pub(crate) source_state_id: Option<StateId>,
 	pub(crate) source_topology_rev: Option<TopologyRev>,
 	pub(crate) rows: Vec<UastInspectorRow>,
+	pub(crate) index_rows: Vec<UastIndexInspectorRow>,
 	pub(crate) folded: HashSet<UastInspectorNodeKey>,
 	pub(crate) fold_revision: u64,
 	pub(crate) follow_cursor: bool,

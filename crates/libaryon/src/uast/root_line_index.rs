@@ -9,13 +9,13 @@ use std::collections::HashMap;
 /// from the count alone. Keeping them as two independent `Option`s let a caller
 /// build an entry that reported itself unknown while still contributing its
 /// newlines to the known-prefix summary, which silently mis-seeks `seek_line`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KnownLineMetric {
 	pub(crate) newline_count: u64,
 	pub(crate) ends_with_newline: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RootChildLineIndexEntry {
 	pub(crate) node_id: NodeId,
 	pub(crate) byte_length: u64,
@@ -49,6 +49,7 @@ struct IndexSummary {
 	len: usize,
 	bytes: u64,
 	newlines: u64,
+	height: usize,
 	all_known: bool,
 	known_prefix_len: usize,
 	known_prefix_bytes: u64,
@@ -71,6 +72,7 @@ impl IndexSummary {
 			len: 1,
 			bytes: entry.byte_length,
 			newlines: known.unwrap_or(0),
+			height: 1,
 			all_known: known.is_some(),
 			known_prefix_len: usize::from(known.is_some()),
 			known_prefix_bytes: known.map_or(0, |_| entry.byte_length),
@@ -96,6 +98,7 @@ impl IndexSummary {
 			len: self.len.saturating_add(other.len),
 			bytes: self.bytes.saturating_add(other.bytes),
 			newlines: self.newlines.saturating_add(other.newlines),
+			height: self.height.max(other.height),
 			all_known: self.all_known && other.all_known,
 			known_prefix_len,
 			known_prefix_bytes,
@@ -153,6 +156,41 @@ impl RootChildLineIndexLocation {
 					.expect("root child line prefix overflow")
 			})
 	}
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RootChildLineIndexInspectorRow {
+	pub(crate) rank: usize,
+	pub(crate) arena: usize,
+	pub(crate) node_id: NodeId,
+	pub(crate) start_byte: DocByte,
+	pub(crate) end_byte: DocByte,
+	pub(crate) start_line: Option<DocLine>,
+	pub(crate) end_line: Option<DocLine>,
+	pub(crate) byte_length: u64,
+	pub(crate) newline_count: Option<u64>,
+	pub(crate) subtree_bytes: u64,
+	pub(crate) subtree_newlines: Option<u64>,
+	pub(crate) parent: Option<usize>,
+	pub(crate) left: Option<usize>,
+	pub(crate) right: Option<usize>,
+	pub(crate) on_lookup_path: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RootChildLineIndexInspectorSnapshot {
+	pub(crate) total_entries: usize,
+	pub(crate) arena_slots: usize,
+	pub(crate) depth: usize,
+	pub(crate) known_prefix_entries: usize,
+	pub(crate) known_prefix_bytes: u64,
+	pub(crate) known_prefix_newlines: u64,
+	pub(crate) total_bytes: u64,
+	pub(crate) focus_rank: Option<usize>,
+	pub(crate) lookup_path: Vec<usize>,
+	pub(crate) rows: Vec<RootChildLineIndexInspectorRow>,
+	pub(crate) truncated_before: bool,
+	pub(crate) truncated_after: bool,
 }
 
 /// Dynamic prefix-sum index over the direct children of a flat document root.
@@ -227,12 +265,21 @@ impl RootChildLineIndex {
 	}
 
 	pub(crate) fn update(&mut self, entry: RootChildLineIndexEntry) -> bool {
-		let Some(&arena) = self.positions.get(&entry.node_id) else {
-			return false;
-		};
+		self.update_status(entry).is_some()
+	}
+
+	pub(crate) fn update_changed(&mut self, entry: RootChildLineIndexEntry) -> bool {
+		self.update_status(entry) == Some(true)
+	}
+
+	fn update_status(&mut self, entry: RootChildLineIndexEntry) -> Option<bool> {
+		let &arena = self.positions.get(&entry.node_id)?;
+		if self.nodes[arena].entry == entry {
+			return Some(false);
+		}
 		self.nodes[arena].entry = entry;
 		self.recompute_to_root(Some(arena));
-		true
+		Some(true)
 	}
 
 	pub(crate) fn insert_after(&mut self, anchor: Option<NodeId>, entry: RootChildLineIndexEntry) {
@@ -270,10 +317,19 @@ impl RootChildLineIndex {
 	}
 
 	pub(crate) fn seek_byte(&self, target: DocByte) -> Option<RootChildLineIndexLocation> {
+		self.seek_byte_traced(target, |_| {})
+	}
+
+	fn seek_byte_traced(
+		&self,
+		target: DocByte,
+		mut visit: impl FnMut(usize),
+	) -> Option<RootChildLineIndexLocation> {
 		let mut arena = self.root?;
 		let mut prefix_bytes = 0u64;
 		let mut prefix_rank = 0usize;
 		loop {
+			visit(arena);
 			let left = self.nodes[arena].left;
 			let left_summary = self.summary(left);
 			let entry = self.nodes[arena].entry;
@@ -294,6 +350,65 @@ impl RootChildLineIndex {
 			} else {
 				return self.location_at(self.len().saturating_sub(1));
 			}
+		}
+	}
+
+	pub(crate) fn inspector_snapshot(
+		&self,
+		cursor_byte: Option<DocByte>,
+		max_rows: usize,
+	) -> RootChildLineIndexInspectorSnapshot {
+		let mut path = Vec::new();
+		let focus_rank = cursor_byte
+			.and_then(|target| self.seek_byte_traced(target, |arena| path.push(arena)))
+			.map(|location| location.rank);
+		let max_rows = max_rows.max(1);
+		let desired_start = focus_rank
+			.unwrap_or(0)
+			.saturating_sub(max_rows.saturating_div(2));
+		let start_rank = desired_start.min(self.len().saturating_sub(max_rows));
+		let end_rank = start_rank.saturating_add(max_rows).min(self.len());
+		let mut rows = Vec::with_capacity(end_rank.saturating_sub(start_rank));
+		for rank in start_rank..end_rank {
+			let Some(arena) = self.arena_at(rank) else {
+				break;
+			};
+			let Some(location) = self.location_at_arena(arena, rank) else {
+				break;
+			};
+			let node = &self.nodes[arena];
+			rows.push(RootChildLineIndexInspectorRow {
+				rank,
+				arena,
+				node_id: location.entry.node_id,
+				start_byte: location.start_byte,
+				end_byte: location.end_byte(),
+				start_line: location.start_line,
+				end_line: location.end_line(),
+				byte_length: location.entry.byte_length,
+				newline_count: location.entry.newline_count(),
+				subtree_bytes: node.summary.bytes,
+				subtree_newlines: node.summary.all_known.then_some(node.summary.newlines),
+				parent: node.parent,
+				left: node.left,
+				right: node.right,
+				on_lookup_path: path.contains(&arena),
+			});
+		}
+		let summary = self.summary(self.root);
+		RootChildLineIndexInspectorSnapshot {
+			total_entries: summary.len,
+			arena_slots: self.nodes.len(),
+			depth: summary.height,
+			known_prefix_entries: summary.known_prefix_len,
+			known_prefix_bytes: summary.known_prefix_bytes,
+			known_prefix_newlines: summary.known_prefix_newlines,
+			total_bytes: summary.bytes,
+			focus_rank,
+			lookup_path: path,
+			rows,
+			truncated_before: start_rank > 0,
+			truncated_after: end_rank < self.len(),
 		}
 	}
 
@@ -466,7 +581,9 @@ impl RootChildLineIndex {
 		let left = self.summary(self.nodes[arena].left);
 		let entry = IndexSummary::entry(self.nodes[arena].entry);
 		let right = self.summary(self.nodes[arena].right);
-		self.nodes[arena].summary = left.concat(entry).concat(right);
+		let mut summary = left.concat(entry).concat(right);
+		summary.height = left.height.max(right.height).saturating_add(1);
+		self.nodes[arena].summary = summary;
 	}
 
 	fn recompute_to_root(&mut self, mut arena: Option<usize>) {
@@ -673,5 +790,41 @@ mod tests {
 				.node_id,
 			model.last().expect("model is non-empty").node_id
 		);
+	}
+
+	#[test]
+	fn inspector_window_is_bounded_ordered_and_uses_the_real_seek_path() {
+		let index = RootChildLineIndex::from_entries((0..32usize).map(|id| {
+			entry(
+				id,
+				u64::try_from(id + 1).expect("fixture"),
+				Some((id % 3) as u64),
+			)
+		}));
+		let target = DocByte::new(200);
+		let expected = index.seek_byte(target).expect("real seek");
+		let snapshot = index.inspector_snapshot(Some(target), 7);
+
+		assert_eq!(snapshot.focus_rank, Some(expected.rank));
+		assert_eq!(snapshot.rows.len(), 7);
+		assert!(snapshot.truncated_before);
+		assert!(snapshot.truncated_after);
+		assert!(
+			snapshot
+				.rows
+				.windows(2)
+				.all(|pair| pair[0].rank + 1 == pair[1].rank
+					&& pair[0].end_byte == pair[1].start_byte)
+		);
+		let focused = snapshot
+			.rows
+			.iter()
+			.find(|row| row.rank == expected.rank)
+			.expect("focused row");
+		assert_eq!(focused.node_id, expected.entry.node_id);
+		assert!(focused.on_lookup_path);
+		assert_eq!(snapshot.lookup_path.last(), Some(&focused.arena));
+		assert_eq!(snapshot.total_entries, 32);
+		assert!(snapshot.depth > 0);
 	}
 }

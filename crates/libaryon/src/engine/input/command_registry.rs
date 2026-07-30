@@ -399,8 +399,20 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		category: CommandCategory::Panes,
 		usage: ":uast [MODE]",
 		summary: "Inspect live UAST storage",
-		help: "Opens a bounded, live split-pane view of libaryon's stored UAST. Semantic mode collapses topology-only groups and trivia; raw mode shows physical and synthetic storage nodes. The view follows the source cursor by default; press Space to fold the selected node, f to toggle cursor following, and Enter to jump to the source. Inspection never hydrates cold bytes.",
+		help: "Opens a bounded, live split-pane view of libaryon's stored UAST. Semantic mode collapses topology-only groups and trivia; raw mode shows physical and synthetic storage nodes; index mode inspects the root-child positional treap, while 'index sumtree' inspects an already-cached layout SumTree. The view follows the source cursor by default; press Space to fold a selected UAST node, f to toggle cursor following, and Enter to jump to the source. Inspection never hydrates cold bytes or constructs a missing index.",
 		dispatch: DispatchKind::Exact(cmd_uast),
+	},
+	CommandSpec {
+		name: "treap",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::None,
+		completion: ArgCompletion::None,
+		category: CommandCategory::Panes,
+		usage: ":treap",
+		summary: "Inspect the UAST positional treap",
+		help: "Alias for ':uast index'. Opens the existing UAST microscope in its root-child positional-index mode.",
+		dispatch: DispatchKind::Exact(cmd_treap),
 	},
 	CommandSpec {
 		name: "uastdot",
@@ -925,12 +937,26 @@ fn cmd_uast(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 		"semantic" | "sem" => Some(UastInspectorMode::Semantic),
 		"raw" | "storage" => Some(UastInspectorMode::Raw),
 		"graph" | "dotviz" => Some(UastInspectorMode::Graph),
+		"index" | "index treap" => Some(UastInspectorMode::Index(
+			super::super::protocol::PositionalIndexKind::Treap,
+		)),
+		"index sumtree" => Some(UastInspectorMode::Index(
+			super::super::protocol::PositionalIndexKind::SumTree,
+		)),
 		_ => {
-			ctx.error("Usage: :uast [semantic|raw|graph]");
+			ctx.error("Usage: :uast [semantic|raw|graph|index [sumtree]]");
 			return;
 		}
 	};
 	ctx.send(EditorCommand::OpenUastInspector { mode });
+}
+
+fn cmd_treap(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
+	ctx.send(EditorCommand::OpenUastInspector {
+		mode: Some(UastInspectorMode::Index(
+			super::super::protocol::PositionalIndexKind::Treap,
+		)),
+	});
 }
 
 fn cmd_uast_dot(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
@@ -1569,6 +1595,29 @@ mod tests {
 			commands.as_slice(),
 			[EditorCommand::OpenUastInspector {
 				mode: Some(UastInspectorMode::Semantic)
+			}]
+		));
+
+		for invocation in ["uast index", "uast index treap", "treap"] {
+			let (_, commands, status, _) = dispatch(invocation, None);
+			assert_eq!(status, None);
+			assert!(matches!(
+				commands.as_slice(),
+				[EditorCommand::OpenUastInspector {
+					mode: Some(UastInspectorMode::Index(
+						super::super::super::protocol::PositionalIndexKind::Treap
+					))
+				}]
+			));
+		}
+		let (_, commands, status, _) = dispatch("uast index sumtree", None);
+		assert_eq!(status, None);
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::OpenUastInspector {
+				mode: Some(UastInspectorMode::Index(
+					super::super::super::protocol::PositionalIndexKind::SumTree
+				))
 			}]
 		));
 

@@ -29,6 +29,7 @@ enum TreeNode {
 	Interior {
 		children: [u32; B],
 		child_count: u8,
+		entry_count: usize,
 		summary: LineMetric,
 	},
 	Leaf {
@@ -43,6 +44,13 @@ impl TreeNode {
 	fn summary(&self) -> LineMetric {
 		match self {
 			TreeNode::Interior { summary, .. } | TreeNode::Leaf { summary, .. } => *summary,
+		}
+	}
+
+	fn entry_count(&self) -> usize {
+		match self {
+			TreeNode::Interior { entry_count, .. } => *entry_count,
+			TreeNode::Leaf { len, .. } => usize::from(*len),
 		}
 	}
 }
@@ -63,6 +71,33 @@ pub struct VisualRowQuery {
 pub struct ByteQuery {
 	pub doc_line: u64,
 	pub visual_row: DocVisualRow,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SumTreeInspectorRow {
+	pub(crate) rank: usize,
+	pub(crate) leaf: u32,
+	pub(crate) slot: usize,
+	pub(crate) start_byte: u64,
+	pub(crate) end_byte: u64,
+	pub(crate) start_doc_line: u64,
+	pub(crate) end_doc_line: u64,
+	pub(crate) start_visual_row: u64,
+	pub(crate) end_visual_row: u64,
+	pub(crate) on_lookup_path: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SumTreeInspectorSnapshot {
+	pub(crate) total_entries: usize,
+	pub(crate) arena_nodes: usize,
+	pub(crate) levels: usize,
+	pub(crate) total: LineMetric,
+	pub(crate) focus_rank: Option<usize>,
+	pub(crate) lookup_path: Vec<u32>,
+	pub(crate) rows: Vec<SumTreeInspectorRow>,
+	pub(crate) truncated_before: bool,
+	pub(crate) truncated_after: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -141,13 +176,16 @@ impl SumTree {
 				let idx = arena.len() as u32;
 				let mut children = [SENTINEL; B];
 				let mut summary = LineMetric::default();
+				let mut entry_count = 0usize;
 				for (i, &child) in chunk.iter().enumerate() {
 					children[i] = child;
 					summary = summary.add(arena[child as usize].summary());
+					entry_count = entry_count.saturating_add(arena[child as usize].entry_count());
 				}
 				arena.push(TreeNode::Interior {
 					children,
 					child_count: chunk.len() as u8,
+					entry_count,
 					summary,
 				});
 				next_level.push(idx);
@@ -312,19 +350,185 @@ impl SumTree {
 	}
 
 	pub fn query_by_byte(&self, target_byte: u64) -> ByteQuery {
+		self.query_by_byte_traced(target_byte, |_| {}).0
+	}
+
+	fn query_by_byte_traced(
+		&self,
+		target_byte: u64,
+		mut visit: impl FnMut(u32),
+	) -> (ByteQuery, Option<usize>) {
 		if self.doc_line_count == DocLineCount::ZERO || target_byte == 0 {
-			return ByteQuery {
-				doc_line: 0,
-				visual_row: DocVisualRow::ZERO,
-			};
+			return (
+				ByteQuery {
+					doc_line: 0,
+					visual_row: DocVisualRow::ZERO,
+				},
+				(self.arena[self.root as usize].entry_count() > 0).then_some(0),
+			);
 		}
 		let total = self.total_summary();
 		let target = target_byte.min(total.bytes);
 		let mut prefix = LineMetric::default();
-		self.walk_prefix_by_bytes(self.root, target, &mut prefix);
-		ByteQuery {
-			doc_line: prefix.doc_lines.get(),
-			visual_row: prefix.visual_rows.start_position(),
+		let mut rank = 0usize;
+		let mut node = self.root;
+		loop {
+			visit(node);
+			match &self.arena[node as usize] {
+				TreeNode::Interior {
+					children,
+					child_count,
+					..
+				} => {
+					let mut descended = false;
+					for &child in &children[..usize::from(*child_count)] {
+						let child_node = &self.arena[child as usize];
+						let child_summary = child_node.summary();
+						if prefix.bytes.saturating_add(child_summary.bytes) > target {
+							node = child;
+							descended = true;
+							break;
+						}
+						prefix = prefix.add(child_summary);
+						rank = rank.saturating_add(child_node.entry_count());
+					}
+					if !descended {
+						return (
+							ByteQuery {
+								doc_line: prefix.doc_lines.get(),
+								visual_row: prefix.visual_rows.start_position(),
+							},
+							rank.checked_sub(1),
+						);
+					}
+				}
+				TreeNode::Leaf { entries, len, .. } => {
+					for entry in &entries[..usize::from(*len)] {
+						if prefix.bytes.saturating_add(entry.bytes) > target {
+							return (
+								ByteQuery {
+									doc_line: prefix.doc_lines.get(),
+									visual_row: prefix.visual_rows.start_position(),
+								},
+								Some(rank),
+							);
+						}
+						prefix = prefix.add(*entry);
+						rank = rank.saturating_add(1);
+					}
+					return (
+						ByteQuery {
+							doc_line: prefix.doc_lines.get(),
+							visual_row: prefix.visual_rows.start_position(),
+						},
+						rank.checked_sub(1),
+					);
+				}
+			}
+		}
+	}
+
+	pub(crate) fn inspector_snapshot(
+		&self,
+		cursor_byte: Option<u64>,
+		max_rows: usize,
+	) -> SumTreeInspectorSnapshot {
+		let mut path = Vec::new();
+		let focus_rank =
+			cursor_byte.and_then(|byte| self.query_by_byte_traced(byte, |node| path.push(node)).1);
+		let total_entries = self.arena[self.root as usize].entry_count();
+		let max_rows = max_rows.max(1);
+		let desired_start = focus_rank
+			.unwrap_or(0)
+			.saturating_sub(max_rows.saturating_div(2));
+		let start_rank = desired_start.min(total_entries.saturating_sub(max_rows));
+		let end_rank = start_rank.saturating_add(max_rows).min(total_entries);
+		let rows = (start_rank..end_rank)
+			.filter_map(|rank| self.inspector_row_at(rank, &path))
+			.collect();
+		let mut levels = 1usize;
+		let mut node = self.root;
+		while let TreeNode::Interior {
+			children,
+			child_count,
+			..
+		} = &self.arena[node as usize]
+		{
+			let Some(&child) = children[..usize::from(*child_count)].first() else {
+				break;
+			};
+			levels = levels.saturating_add(1);
+			node = child;
+		}
+		SumTreeInspectorSnapshot {
+			total_entries,
+			arena_nodes: self.arena.len(),
+			levels,
+			total: self.total_summary(),
+			focus_rank,
+			lookup_path: path,
+			rows,
+			truncated_before: start_rank > 0,
+			truncated_after: end_rank < total_entries,
+		}
+	}
+
+	fn inspector_row_at(&self, mut rank: usize, path: &[u32]) -> Option<SumTreeInspectorRow> {
+		let absolute_rank = rank;
+		let mut node = self.root;
+		let mut prefix = LineMetric::default();
+		loop {
+			match &self.arena[node as usize] {
+				TreeNode::Interior {
+					children,
+					child_count,
+					..
+				} => {
+					let mut descended = false;
+					for &child in &children[..usize::from(*child_count)] {
+						let child_node = &self.arena[child as usize];
+						let child_entries = child_node.entry_count();
+						if rank < child_entries {
+							node = child;
+							descended = true;
+							break;
+						}
+						rank = rank.saturating_sub(child_entries);
+						prefix = prefix.add(child_node.summary());
+					}
+					if !descended {
+						return None;
+					}
+				}
+				TreeNode::Leaf { entries, len, .. } => {
+					let slot = rank;
+					if slot >= usize::from(*len) {
+						return None;
+					}
+					for entry in &entries[..slot] {
+						prefix = prefix.add(*entry);
+					}
+					let metric = entries[slot];
+					return Some(SumTreeInspectorRow {
+						rank: absolute_rank,
+						leaf: node,
+						slot,
+						start_byte: prefix.bytes,
+						end_byte: prefix.bytes.saturating_add(metric.bytes),
+						start_doc_line: prefix.doc_lines.get(),
+						end_doc_line: prefix
+							.doc_lines
+							.get()
+							.saturating_add(metric.doc_lines.get()),
+						start_visual_row: prefix.visual_rows.get(),
+						end_visual_row: prefix
+							.visual_rows
+							.get()
+							.saturating_add(metric.visual_rows.get()),
+						on_lookup_path: path.contains(&node),
+					});
+				}
+			}
 		}
 	}
 
@@ -384,33 +588,6 @@ impl SumTree {
 			TreeNode::Leaf { entries, len, .. } => {
 				for e in &entries[..*len as usize] {
 					if prefix.visual_rows + e.visual_rows.get() > target {
-						return;
-					}
-					*prefix = prefix.add(*e);
-				}
-			}
-		}
-	}
-
-	fn walk_prefix_by_bytes(&self, node_idx: u32, target: u64, prefix: &mut LineMetric) {
-		match &self.arena[node_idx as usize] {
-			TreeNode::Interior {
-				children,
-				child_count,
-				..
-			} => {
-				for &child in &children[..*child_count as usize] {
-					let child_summary = self.arena[child as usize].summary();
-					if prefix.bytes + child_summary.bytes > target {
-						self.walk_prefix_by_bytes(child, target, prefix);
-						return;
-					}
-					*prefix = prefix.add(child_summary);
-				}
-			}
-			TreeNode::Leaf { entries, len, .. } => {
-				for e in &entries[..*len as usize] {
-					if prefix.bytes + e.bytes > target {
 						return;
 					}
 					*prefix = prefix.add(*e);
@@ -1057,5 +1234,31 @@ mod tests {
 
 		let q = tree.query_by_byte(10000);
 		assert_eq!(q.doc_line, 10);
+	}
+
+	#[test]
+	fn inspector_window_uses_the_production_byte_descent() {
+		let tree = SumTree::build_from_lines(&uniform_metrics(B * 3 + 7));
+		let target = 80 * (B as u64 + 5) + 17;
+		let production = tree.query_by_byte(target);
+		let snapshot = tree.inspector_snapshot(Some(target), 9);
+
+		assert_eq!(snapshot.rows.len(), 9);
+		assert!(snapshot.truncated_before);
+		assert!(snapshot.truncated_after);
+		let focus_rank = snapshot.focus_rank.expect("focus rank");
+		assert_eq!(focus_rank, B + 5);
+		let focused = snapshot
+			.rows
+			.iter()
+			.find(|row| row.rank == focus_rank)
+			.expect("focused row");
+		assert_eq!(focused.start_byte, production.doc_line * 80);
+		assert_eq!(focused.start_doc_line, production.doc_line);
+		assert!(focused.on_lookup_path);
+		assert_eq!(snapshot.lookup_path.last(), Some(&focused.leaf));
+		assert_eq!(snapshot.total_entries, B * 3 + 7);
+		assert_eq!(snapshot.total.bytes, 80 * (B * 3 + 7) as u64);
+		assert!(snapshot.levels >= 2);
 	}
 }

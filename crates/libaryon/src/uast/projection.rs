@@ -12,7 +12,9 @@ use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
 use crate::uast::kind::SemanticKind;
 pub use crate::uast::root_line_index::RootChildLineIndex;
-use crate::uast::root_line_index::{KnownLineMetric, RootChildLineIndexEntry};
+use crate::uast::root_line_index::{
+	KnownLineMetric, RootChildLineIndexEntry, RootChildLineIndexInspectorSnapshot,
+};
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
@@ -662,10 +664,32 @@ impl UastRegistry {
 			.write()
 			.unwrap()
 			.insert(root, index);
+		self.note_root_child_line_index_change(0);
 	}
 
 	pub(crate) fn remove_root_child_line_index(&self, root: NodeId) {
-		self.root_child_line_indexes.write().unwrap().remove(&root);
+		if self
+			.root_child_line_indexes
+			.write()
+			.unwrap()
+			.remove(&root)
+			.is_some()
+		{
+			self.note_root_child_line_index_change(0);
+		}
+	}
+
+	pub(crate) fn inspect_root_child_line_index(
+		&self,
+		root: NodeId,
+		cursor_byte: Option<DocByte>,
+		max_rows: usize,
+	) -> Option<RootChildLineIndexInspectorSnapshot> {
+		self.root_child_line_indexes
+			.read()
+			.unwrap()
+			.get(&root)
+			.map(|index| index.inspector_snapshot(cursor_byte, max_rows))
 	}
 
 	pub(crate) fn refresh_installed_root_child_line_index_for_node(&self, node: NodeId) {
@@ -683,7 +707,7 @@ impl UastRegistry {
 		let Some(index) = indexes.get_mut(&root) else {
 			return;
 		};
-		if !index.contains(root_child) {
+		let changes = if !index.contains(root_child) {
 			// New direct children are normally reconciled from their existing
 			// predecessor by the mutation path. Keep a bounded fallback for a new
 			// tail by anchoring at the last indexed child.
@@ -701,13 +725,22 @@ impl UastRegistry {
 						.checked_sub(1)
 						.and_then(|rank| index.node_at(rank))
 				});
-			self.reconcile_root_child_index_after_locked(root, anchor, index);
-			return;
-		}
-
-		index.update(self.root_child_index_entry(root, root_child));
-		if unsafe { (*self.edges[root_child.index()].get()).parent } == Some(root) {
-			self.reconcile_root_child_index_after_locked(root, Some(root_child), index);
+			self.reconcile_root_child_index_after_locked(root, anchor, index)
+		} else {
+			let mut changes =
+				u64::from(index.update_changed(self.root_child_index_entry(root, root_child)));
+			if unsafe { (*self.edges[root_child.index()].get()).parent } == Some(root) {
+				changes = changes.saturating_add(self.reconcile_root_child_index_after_locked(
+					root,
+					Some(root_child),
+					index,
+				));
+			}
+			changes
+		};
+		drop(indexes);
+		if changes > 0 {
+			self.note_root_child_line_index_change(changes);
 		}
 	}
 
@@ -721,7 +754,11 @@ impl UastRegistry {
 		let Some(index) = indexes.get_mut(&root) else {
 			return;
 		};
-		self.reconcile_root_child_index_after_locked(root, anchor, index);
+		let changes = self.reconcile_root_child_index_after_locked(root, anchor, index);
+		drop(indexes);
+		if changes > 0 {
+			self.note_root_child_line_index_change(changes);
+		}
 	}
 
 	fn reconcile_root_child_index_after_locked(
@@ -729,7 +766,8 @@ impl UastRegistry {
 		root: NodeId,
 		anchor: Option<NodeId>,
 		index: &mut RootChildLineIndex,
-	) {
+	) -> u64 {
+		let mut changes = 0u64;
 		let mut anchor = anchor.filter(|node| index.contains(*node));
 		let mut desired = anchor
 			.and_then(|node| self.get_next_sibling(node))
@@ -753,10 +791,11 @@ impl UastRegistry {
 					let Some(stale) = indexed_next else {
 						break;
 					};
-					index.remove(stale);
+					changes = changes.saturating_add(u64::from(index.remove(stale)));
 				}
 				Some(node) => {
 					index.insert_after(anchor, self.root_child_index_entry(root, node));
+					changes = changes.saturating_add(1);
 					anchor = Some(node);
 					desired = self.get_next_sibling(node);
 				}
@@ -764,10 +803,11 @@ impl UastRegistry {
 					let Some(stale) = indexed_next else {
 						break;
 					};
-					index.remove(stale);
+					changes = changes.saturating_add(u64::from(index.remove(stale)));
 				}
 			}
 		}
+		changes
 	}
 
 	fn root_child_index_entry(&self, root: NodeId, node: NodeId) -> RootChildLineIndexEntry {
@@ -806,7 +846,11 @@ impl UastRegistry {
 		let Some(index) = indexes.get_mut(&root) else {
 			return;
 		};
-		index.update(self.root_child_index_entry(root, root_child));
+		let changed = index.update_changed(self.root_child_index_entry(root, root_child));
+		drop(indexes);
+		if changed {
+			self.note_root_child_line_index_change(1);
+		}
 	}
 
 	pub(crate) fn next_node_skipping_children(&self, node: NodeId) -> Option<NodeId> {
@@ -2852,5 +2896,58 @@ mod tests {
 		assert_eq!(selected_line.node_id.index() as u64, expected_extent + 1);
 		assert!(generated.bytes_read() <= 16 * 1024 * 1024);
 		assert_eq!(registry.stats().allocated_nodes, EXTENT_COUNT + 1);
+	}
+
+	#[test]
+	fn installed_root_index_counters_are_global_monotonic_and_effective_only() {
+		let (registry, root) = build_document_with_leaves(&["ab", "cd"]);
+		let child = registry.get_first_child(root).expect("first child");
+		assert_eq!(registry.root_child_line_index_counters(), (0, 0));
+		assert_eq!(registry.root_child_line_index_revision(), 0);
+
+		registry.install_root_child_line_index(root);
+		assert_eq!(registry.root_child_line_index_counters(), (1, 0));
+		let installed_revision = registry.root_child_line_index_revision();
+		assert!(installed_revision > 0);
+
+		registry.refresh_installed_root_child_line_index_for_node(child);
+		assert_eq!(
+			registry.root_child_line_index_counters(),
+			(1, 0),
+			"an identical point refresh is not splice traffic"
+		);
+		assert_eq!(
+			registry.root_child_line_index_revision(),
+			installed_revision
+		);
+
+		unsafe {
+			(*registry.metrics[child.index()].get()).byte_length += 1;
+		}
+		registry.refresh_installed_root_child_line_index_for_node(child);
+		assert_eq!(registry.root_child_line_index_counters(), (1, 1));
+		assert!(registry.root_child_line_index_revision() > installed_revision);
+	}
+
+	#[test]
+	fn root_index_inspection_does_not_hydrate_or_inflate_cold_extents() {
+		let (registry, root) =
+			build_uninflated_physical_document(&["cold-one", "cold-two", "cold-three"]);
+		registry.install_root_child_line_index(root);
+		let resident_before = registry.stats().resident_bytes;
+		let inspector_revision_before = registry.inspector_revision();
+		let snapshot = registry
+			.inspect_root_child_line_index(root, Some(DocByte::new(12)), 2)
+			.expect("installed root index");
+
+		assert_eq!(snapshot.rows.len(), 2);
+		assert_eq!(registry.stats().resident_bytes, resident_before);
+		assert_eq!(registry.inspector_revision(), inspector_revision_before);
+		let mut child = registry.get_first_child(root);
+		while let Some(node) = child {
+			assert!(!registry.metrics_inflated[node.index()].load(Ordering::Acquire));
+			assert!(unsafe { (&*registry.virtual_data[node.index()].get()).is_none() });
+			child = registry.get_next_sibling(node);
+		}
 	}
 }

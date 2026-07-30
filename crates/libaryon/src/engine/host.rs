@@ -541,6 +541,77 @@ mod tests {
 	}
 
 	#[test]
+	fn uast_index_modes_project_existing_treap_and_sumtree_without_parallel_panels() {
+		let path = temp_path("uast-index", "txt");
+		fs::write(&path, b"alpha\nbeta\ngamma\n").expect("write index fixture");
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let commands = engine.command_sender();
+		let viewports = engine.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::LoadFile(path.to_string_lossy().into_owned()))
+			.expect("load source");
+		recv_viewport_until(&viewports, "index source", |viewport| {
+			visible_text(viewport) == b"alpha\nbeta\ngamma\n"
+		});
+
+		commands
+			.send(EditorCommand::OpenUastInspector {
+				mode: Some(crate::engine::UastInspectorMode::Index(
+					crate::engine::protocol::PositionalIndexKind::Treap,
+				)),
+			})
+			.expect("open treap mode");
+		let treap = recv_viewport_until(&viewports, "treap index", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.tabs[pane.active_doctab_index].title == "uast"
+					&& pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>()
+						.windows(b"extents=".len())
+						.any(|window| window == b"extents=")
+			})
+		});
+		assert_eq!(
+			treap
+				.panes
+				.iter()
+				.filter(|pane| pane.tabs[pane.active_doctab_index].title == "uast")
+				.count(),
+			1
+		);
+
+		commands
+			.send(EditorCommand::OpenUastInspector {
+				mode: Some(crate::engine::UastInspectorMode::Index(
+					crate::engine::protocol::PositionalIndexKind::SumTree,
+				)),
+			})
+			.expect("switch to SumTree mode");
+		recv_viewport_until(&viewports, "sumtree index", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				if pane.tabs[pane.active_doctab_index].title != "uast" {
+					return false;
+				}
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				text.windows(b"sumtree".len())
+					.any(|window| window == b"sumtree")
+					&& text
+						.windows("bytes-check=✓".len())
+						.any(|window| window == "bytes-check=✓".as_bytes())
+			})
+		});
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = fs::remove_file(path);
+	}
+
+	#[test]
 	fn markdown_uast_cursor_follows_adr_section_and_list_item() {
 		const ADR: &str = include_str!("../../plans/adr/0001-ecs-memory-reclamation.md");
 		let mut engine = EngineHandle::spawn(EngineConfig::default());

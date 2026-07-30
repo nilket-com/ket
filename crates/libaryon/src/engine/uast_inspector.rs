@@ -1,14 +1,17 @@
 use super::core::MAX_SEMANTIC_BYTES;
+use super::index::SumTreeInspectorSnapshot;
 use super::language::{LanguageProvider, LanguageRegistry};
-use super::protocol::UastInspectorMode;
+use super::protocol::{PositionalIndexKind, UastInspectorMode};
 use super::session::{
-	Affinity, EditorSession, StructuralIssue, StructuralIssueKind, UastInspectorNodeKey,
-	UastInspectorPanel, UastInspectorRefreshKey, UastInspectorRow, UastInspectorStamp,
-	UastOwnerAccounting, ViewContent,
+	Affinity, EditorSession, StructuralIssue, StructuralIssueKind, UastIndexInspectorRow,
+	UastIndexInspectorTarget, UastIndexRefreshIdentity, UastInspectorNodeKey, UastInspectorPanel,
+	UastInspectorRefreshKey, UastInspectorRow, UastInspectorStamp, UastOwnerAccounting,
+	UastSumTreeCacheKey, ViewContent,
 };
 use crate::core::{BufferId, DocByte, DocLine, ViewId};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+use crate::uast::RootChildLineIndexInspectorSnapshot;
 use crate::uast::{
 	ProviderKindId, SemanticKind, UastGraphNode, UastGraphSelection, UastGraphSnapshot,
 	UastGraphStamp, UastInspectorOptions, UastInspectorSnapshot, UastMetricCertainty,
@@ -105,6 +108,7 @@ pub(crate) fn open_uast_inspector(
 			source_state_id: None,
 			source_topology_rev: None,
 			rows: Vec::new(),
+			index_rows: Vec::new(),
 			folded: HashSet::new(),
 			fold_revision: 0,
 			follow_cursor: true,
@@ -186,7 +190,9 @@ pub(crate) fn refresh_uast_inspectors(
 		let rendered_rows = session
 			.uast_inspectors
 			.get(&panel_buffer_id)
-			.map_or(0, |panel| panel.rows.len());
+			.map_or(0, |panel| {
+				panel.rows.len().saturating_add(panel.index_rows.len())
+			});
 		let current_node_budget = session
 			.uast_inspectors
 			.get(&panel_buffer_id)
@@ -197,7 +203,7 @@ pub(crate) fn refresh_uast_inspectors(
 			viewport_lines,
 			rendered_rows,
 		);
-		let Some((mut identity, source_name)) = session
+		let Some((mut identity, source_name, sum_tree_cache_key)) = session
 			.buffers
 			.get(source_buffer_id)
 			.and_then(|buffer| buffer.text())
@@ -221,6 +227,11 @@ pub(crate) fn refresh_uast_inspectors(
 						.or(document.virtual_path.as_deref())
 						.unwrap_or("[No Name]")
 						.to_owned(),
+					document
+						.semantic
+						.cached_sum_tree
+						.as_ref()
+						.map(UastSumTreeCacheKey::from),
 				)
 			})
 		else {
@@ -266,6 +277,21 @@ pub(crate) fn refresh_uast_inspectors(
 			// in the paired source view recenter or invalidate the inspector.
 			identity.cursor_byte = selected_inspector_source_byte(session, panel_buffer_id, stamp);
 		}
+		let stats = registry.stats();
+		let index_identity = match mode {
+			UastInspectorMode::Index(PositionalIndexKind::Treap) => {
+				Some(UastIndexRefreshIdentity::Treap {
+					revision: registry.root_child_line_index_revision(),
+				})
+			}
+			UastInspectorMode::Index(PositionalIndexKind::SumTree) => {
+				Some(UastIndexRefreshIdentity::SumTree {
+					cache: sum_tree_cache_key,
+					rebuilds: stats.sum_tree_rebuilds,
+				})
+			}
+			_ => None,
+		};
 		let mut refresh_key = UastInspectorRefreshKey {
 			source_buffer_id,
 			source_view_id: identity.view_id,
@@ -287,6 +313,7 @@ pub(crate) fn refresh_uast_inspectors(
 			snapshot_node_budget,
 			registry_revision: registry.inspector_revision(),
 			reclaim_pending_heads: session.reclaim_queue.pending_heads(),
+			index_identity,
 		};
 		if session
 			.uast_inspectors
@@ -300,58 +327,118 @@ pub(crate) fn refresh_uast_inspectors(
 		let provider = identity
 			.active_language_id
 			.and_then(|language_id| lang_registry.get_provider(language_id));
-		let rendered = loop {
-			let snapshot = registry.inspect_uast(
-				identity.root,
-				UastInspectorOptions {
-					max_nodes: snapshot_node_budget,
-					max_depth: INSPECTOR_DEPTH_BUDGET,
-					cursor_byte: identity.cursor_byte.map(DocByte::get),
-					..UastInspectorOptions::default()
-				},
-			);
-			let rendered = render_snapshot(
-				&snapshot,
-				identity,
-				&source_name,
-				mode,
-				provider,
-				stamp,
-				&folded,
-				follow_cursor,
-				fold_revision,
-				(viewport_width, viewport_lines),
-				session.reclaim_queue.pending_heads(),
-			);
-			if !inspector_view_needs_more_rows(
-				rendered.rows.len(),
-				inspector_scroll,
-				viewport_lines,
-			) || snapshot_node_budget == INSPECTOR_NODE_BUDGET
-			{
-				break rendered;
+		let rendered = match mode {
+			UastInspectorMode::Index(PositionalIndexKind::Treap) => {
+				let snapshot = registry.inspect_root_child_line_index(
+					identity.root,
+					identity.cursor_byte,
+					snapshot_node_budget,
+				);
+				let (rebuilds, splices) = registry.root_child_line_index_counters();
+				render_treap_snapshot(
+					snapshot.as_ref(),
+					identity,
+					&source_name,
+					stamp,
+					registry.root_child_line_index_revision(),
+					rebuilds,
+					splices,
+					registry,
+					follow_cursor,
+				)
 			}
-			if snapshot.nodes.len() < snapshot_node_budget {
-				// This scope is already exhausted. Mark the high-water budget
-				// complete so later scroll frames do not retry the same walk.
-				snapshot_node_budget = INSPECTOR_NODE_BUDGET;
-				break rendered;
+			UastInspectorMode::Index(PositionalIndexKind::SumTree) => {
+				let snapshot = session
+					.buffers
+					.get(source_buffer_id)
+					.and_then(|buffer| buffer.text())
+					.and_then(|document| document.semantic.cached_sum_tree.as_ref())
+					.filter(|cache| {
+						cache.root == identity.root && cache.state_id == identity.state_id
+					})
+					.map(|cache| {
+						(
+							cache.tree.inspector_snapshot(
+								identity.cursor_byte.map(DocByte::get),
+								snapshot_node_budget,
+							),
+							UastSumTreeCacheKey::from(cache),
+						)
+					});
+				render_sumtree_snapshot(
+					snapshot.as_ref().map(|(snapshot, _)| snapshot),
+					identity,
+					&source_name,
+					stamp,
+					stats.sum_tree_rebuilds,
+					snapshot.as_ref().map(|(_, key)| *key),
+					follow_cursor,
+				)
 			}
-			snapshot_node_budget = snapshot_node_budget
-				.saturating_mul(2)
-				.min(INSPECTOR_NODE_BUDGET);
+			_ => loop {
+				let snapshot = registry.inspect_uast(
+					identity.root,
+					UastInspectorOptions {
+						max_nodes: snapshot_node_budget,
+						max_depth: INSPECTOR_DEPTH_BUDGET,
+						cursor_byte: identity.cursor_byte.map(DocByte::get),
+						..UastInspectorOptions::default()
+					},
+				);
+				let rendered = render_snapshot(
+					&snapshot,
+					identity,
+					&source_name,
+					mode,
+					provider,
+					stamp,
+					&folded,
+					follow_cursor,
+					fold_revision,
+					(viewport_width, viewport_lines),
+					session.reclaim_queue.pending_heads(),
+				);
+				if !inspector_view_needs_more_rows(
+					rendered.rows.len(),
+					inspector_scroll,
+					viewport_lines,
+				) || snapshot_node_budget == INSPECTOR_NODE_BUDGET
+				{
+					break rendered;
+				}
+				if snapshot.nodes.len() < snapshot_node_budget {
+					// This scope is already exhausted. Mark the high-water budget
+					// complete so later scroll frames do not retry the same walk.
+					snapshot_node_budget = INSPECTOR_NODE_BUDGET;
+					break rendered;
+				}
+				snapshot_node_budget = snapshot_node_budget
+					.saturating_mul(2)
+					.min(INSPECTOR_NODE_BUDGET);
+			},
 		};
 		refresh_key.snapshot_node_budget = snapshot_node_budget;
 		if let Some(panel) = session.uast_inspectors.get_mut(&panel_buffer_id) {
 			panel.snapshot_node_budget = snapshot_node_budget;
 		}
-		let selected = selected_row_after_refresh(
-			session,
-			panel_buffer_id,
-			&rendered.rows,
-			stamp,
-			follow_cursor,
-		);
+		let selected = if rendered.index_rows.is_empty() {
+			selected_row_after_refresh(
+				session,
+				panel_buffer_id,
+				&rendered.rows,
+				stamp,
+				follow_cursor,
+			)
+			.map(SelectedInspectorRow::Node)
+		} else {
+			selected_index_row_after_refresh(
+				session,
+				panel_buffer_id,
+				&rendered.index_rows,
+				follow_cursor,
+			)
+			.map(SelectedInspectorRow::Index)
+		};
 		replace_if_changed(
 			registry,
 			session,
@@ -359,6 +446,7 @@ pub(crate) fn refresh_uast_inspectors(
 			rendered.text,
 			rendered.highlights,
 			rendered.rows,
+			rendered.index_rows,
 			rendered.graph,
 			stamp,
 			selected,
@@ -416,9 +504,8 @@ fn selected_inspector_source_byte(
 			ViewContent::Text(text) => Some(text.cursor.primary().abs_line()),
 			_ => None,
 		})?;
-	session
-		.uast_inspectors
-		.get(&panel_buffer_id)?
+	let panel = session.uast_inspectors.get(&panel_buffer_id)?;
+	panel
 		.rows
 		.iter()
 		.find(|row| {
@@ -428,6 +515,18 @@ fn selected_inspector_source_byte(
 				&& row.stamp.state_id == stamp.state_id
 		})
 		.map(|row| row.start_byte)
+		.or_else(|| {
+			panel
+				.index_rows
+				.iter()
+				.find(|row| {
+					row.line == selected_line
+						&& row.stamp.source_buffer_id == stamp.source_buffer_id
+						&& row.stamp.root == stamp.root
+						&& row.stamp.state_id == stamp.state_id
+				})
+				.map(|row| row.start_byte)
+		})
 }
 
 pub(crate) fn activate_selected_row(
@@ -446,24 +545,70 @@ pub(crate) fn activate_selected_row(
 		};
 		(view.buffer_id, line)
 	};
-	let (source_view_id, row) = {
+	let (source_view_id, node_row, index_row, mode) = {
 		let panel = session
 			.uast_inspectors
 			.get(&panel_buffer_id)
 			.ok_or_else(|| "The focused pane is not a UAST inspector".to_string())?;
-		let row = panel
-			.rows
-			.iter()
-			.find(|row| row.line == selected_line)
-			.cloned()
-			.ok_or_else(|| "Select a UAST node row before jumping".to_string())?;
-		(panel.source_view_id, row)
+		(
+			panel.source_view_id,
+			panel
+				.rows
+				.iter()
+				.find(|row| row.line == selected_line)
+				.cloned(),
+			panel
+				.index_rows
+				.iter()
+				.find(|row| row.line == selected_line)
+				.cloned(),
+			panel.mode,
+		)
 	};
-	jump_to_row(registry, session, source_view_id, row)
+	if let Some(row) = node_row {
+		return jump_to_row(registry, session, source_view_id, row);
+	}
+	let row = index_row.ok_or_else(|| "Select an inspector row before jumping".to_string())?;
+	let current_revision = match mode {
+		UastInspectorMode::Index(PositionalIndexKind::Treap) => {
+			registry.root_child_line_index_revision()
+		}
+		UastInspectorMode::Index(PositionalIndexKind::SumTree) => {
+			registry.stats().sum_tree_rebuilds
+		}
+		_ => return Err("The selected row no longer belongs to index mode".to_string()),
+	};
+	validate_index_row_revision(row.index_revision, current_revision)?;
+	jump_to_source_range(
+		registry,
+		session,
+		source_view_id,
+		row.stamp,
+		row.start_byte,
+		row.end_byte,
+		format!("index {:?}", row.target),
+	)
+}
+
+fn validate_index_row_revision(row_revision: u64, current_revision: u64) -> Result<(), String> {
+	if row_revision == current_revision {
+		Ok(())
+	} else {
+		Err("The positional index changed; the stale row was not followed".to_string())
+	}
 }
 
 pub(crate) fn toggle_selected_fold(session: &mut EditorSession) -> Result<(), String> {
 	let (panel_buffer_id, selected_line) = focused_inspector_line(session)?;
+	if session
+		.uast_inspectors
+		.get(&panel_buffer_id)
+		.is_some_and(|panel| {
+			matches!(panel.mode, UastInspectorMode::Index(_))
+				&& panel.index_rows.iter().any(|row| row.line == selected_line)
+		}) {
+		return Err("Positional-index rows are flat; there is nothing to fold".to_string());
+	}
 	let row = session
 		.uast_inspectors
 		.get(&panel_buffer_id)
@@ -602,17 +747,37 @@ pub(crate) fn activate_graph_node(
 fn jump_to_row(
 	registry: &UastRegistry,
 	session: &mut EditorSession,
-	mut source_view_id: Option<ViewId>,
+	source_view_id: Option<ViewId>,
 	row: UastInspectorRow,
 ) -> Result<(), String> {
-	let source_buffer_id = row.stamp.source_buffer_id;
+	jump_to_source_range(
+		registry,
+		session,
+		source_view_id,
+		row.stamp,
+		row.start_byte,
+		row.end_byte,
+		format!("UAST #{}", row.node_id.raw()),
+	)
+}
+
+fn jump_to_source_range(
+	registry: &UastRegistry,
+	session: &mut EditorSession,
+	mut source_view_id: Option<ViewId>,
+	stamp: UastInspectorStamp,
+	start_byte: DocByte,
+	end_byte: DocByte,
+	label: String,
+) -> Result<(), String> {
+	let source_buffer_id = stamp.source_buffer_id;
 	let (current_state, current_root) = session
 		.buffers
 		.get(source_buffer_id)
 		.and_then(|buffer| buffer.text())
 		.map(|document| (document.ledger.current_state_id, document.root_id))
 		.ok_or_else(|| "The inspected source buffer has closed".to_string())?;
-	if row.stamp.state_id != current_state || row.stamp.root != current_root {
+	if stamp.state_id != current_state || stamp.root != current_root {
 		return Err("The source changed; the stale inspector row was not followed".to_string());
 	}
 	if !source_view_id.is_some_and(|view_id| {
@@ -629,12 +794,12 @@ fn jump_to_row(
 	// ranges remain exact. TopologyRev therefore gates node identity only; this
 	// source-range jump is valid whenever StateId and root still match.
 	let source_len = registry.get_total_bytes(current_root);
-	if row.start_byte > row.end_byte || row.end_byte.get() > source_len {
+	if start_byte > end_byte || end_byte.get() > source_len {
 		return Err(
 			"The inspector row range is no longer valid; refresh before jumping".to_string(),
 		);
 	}
-	let target = row.start_byte;
+	let target = start_byte;
 	{
 		let source_view = session
 			.layout
@@ -652,11 +817,7 @@ fn jump_to_row(
 		session.focused_pane_id = pane_id;
 	}
 	session.ui.status_message = Some(format!(
-		"UAST #{} [{}..{}) → byte {}",
-		row.node_id.raw(),
-		row.start_byte,
-		row.end_byte,
-		target
+		"{label} [{start_byte}..{end_byte}) → byte {target}"
 	));
 	Ok(())
 }
@@ -786,7 +947,296 @@ struct RenderedInspector {
 	text: Vec<u8>,
 	highlights: Vec<HighlightSpan>,
 	rows: Vec<UastInspectorRow>,
+	index_rows: Vec<UastIndexInspectorRow>,
 	graph: Option<UastGraphSnapshot>,
+}
+
+enum SelectedInspectorRow {
+	Node(UastInspectorRow),
+	Index(UastIndexInspectorRow),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_treap_snapshot(
+	snapshot: Option<&RootChildLineIndexInspectorSnapshot>,
+	identity: SourceIdentity,
+	source_name: &str,
+	stamp: UastInspectorStamp,
+	index_revision: u64,
+	rebuilds: u64,
+	splices: u64,
+	registry: &UastRegistry,
+	follow_cursor: bool,
+) -> RenderedInspector {
+	let Some(snapshot) = snapshot else {
+		return render_missing_index(source_name, "treap", stamp, index_revision, follow_cursor);
+	};
+	let ideal_depth = if snapshot.total_entries <= 1 {
+		snapshot.total_entries
+	} else {
+		usize::BITS as usize - snapshot.total_entries.saturating_sub(1).leading_zeros() as usize
+	};
+	let focus = snapshot
+		.focus_rank
+		.map_or_else(|| "none".to_string(), |rank| rank.to_string());
+	let focus_links = snapshot
+		.focus_rank
+		.and_then(|rank| snapshot.rows.iter().find(|row| row.rank == rank))
+		.map_or_else(
+			|| "p=- l=- r=-".to_string(),
+			|row| {
+				format!(
+					"p={} l={} r={}",
+					optional_arena(row.parent),
+					optional_arena(row.left),
+					optional_arena(row.right)
+				)
+			},
+		);
+	let mut text = format!(
+		"INDEX {source_name} · treap · follow={}\nextents={} arena={} depth={}/log2={} known-extents={} known={}/{} B · known-lines={}\nroot=#{} · state={} topology-rev={} · rev={} · builds={} splices={}\nfocus-rank={} · path={:?} · {focus_links} · window={}{}{}\nrank\tarena\tnode\tbytes\tlines\tentry-nl/subtree(b/nl)\tcheck\nEnter jump · Space flat · f follow\n",
+		if follow_cursor { "on" } else { "off" },
+		snapshot.total_entries,
+		snapshot.arena_slots,
+		snapshot.depth,
+		ideal_depth,
+		snapshot.known_prefix_entries,
+		snapshot.known_prefix_bytes,
+		snapshot.total_bytes,
+		snapshot.known_prefix_newlines,
+		stamp.root.raw(),
+		identity.state_id,
+		identity.topology_rev,
+		index_revision,
+		rebuilds,
+		splices,
+		focus,
+		snapshot.lookup_path,
+		snapshot.rows.len(),
+		if snapshot.truncated_before {
+			" · …before"
+		} else {
+			""
+		},
+		if snapshot.truncated_after {
+			" · …after"
+		} else {
+			""
+		},
+	);
+	let mut highlights = vec![HighlightSpan::new(
+		DocByte::ZERO,
+		DocByte::new(5),
+		TokenCategory::Keyword,
+	)];
+	let mut rows = Vec::with_capacity(snapshot.rows.len());
+	for entry in &snapshot.rows {
+		let line = DocLine::new(INSPECTOR_HEADER_LINES + rows.len() as u64);
+		let row_start = text.len();
+		let marker = if snapshot.focus_rank == Some(entry.rank) {
+			'>'
+		} else if entry.on_lookup_path {
+			'*'
+		} else {
+			' '
+		};
+		let current = registry.is_current_node(entry.node_id);
+		let consistent = current && registry.get_total_bytes(entry.node_id) == entry.byte_length;
+		let lines = match (entry.start_line, entry.end_line) {
+			(Some(start), Some(end)) => format!("{start}..{end}"),
+			_ => "unknown".to_string(),
+		};
+		let subtree_lines = entry
+			.subtree_newlines
+			.map_or_else(|| "?".to_string(), |lines| lines.to_string());
+		text.push_str(&format!(
+			"{marker}\t{}\t{}\t#{}@g{}\t{}..{}\t{}\t{}/{}/{}\t{}\n",
+			entry.rank,
+			entry.arena,
+			entry.node_id.index(),
+			entry.node_id.generation(),
+			entry.start_byte,
+			entry.end_byte,
+			lines,
+			entry
+				.newline_count
+				.map_or_else(|| "?".to_string(), |lines| lines.to_string()),
+			entry.subtree_bytes,
+			subtree_lines,
+			if consistent { '✓' } else { '!' },
+		));
+		highlights.push(HighlightSpan::new(
+			DocByte::new(row_start as u64),
+			DocByte::new(row_start.saturating_add(1) as u64),
+			if marker == '>' {
+				TokenCategory::Keyword
+			} else {
+				TokenCategory::Comment
+			},
+		));
+		rows.push(UastIndexInspectorRow {
+			line,
+			line_start_byte: DocByte::new(row_start as u64),
+			start_byte: entry.start_byte,
+			end_byte: entry.end_byte,
+			contains_cursor: snapshot.focus_rank == Some(entry.rank),
+			stamp,
+			index_revision,
+			target: UastIndexInspectorTarget::RootExtent {
+				node_id: entry.node_id,
+				rank: entry.rank,
+			},
+		});
+	}
+	RenderedInspector {
+		text: text.into_bytes(),
+		highlights,
+		rows: Vec::new(),
+		index_rows: rows,
+		graph: None,
+	}
+}
+
+fn render_sumtree_snapshot(
+	snapshot: Option<&SumTreeInspectorSnapshot>,
+	identity: SourceIdentity,
+	source_name: &str,
+	stamp: UastInspectorStamp,
+	rebuilds: u64,
+	cache_key: Option<UastSumTreeCacheKey>,
+	follow_cursor: bool,
+) -> RenderedInspector {
+	let Some(snapshot) = snapshot else {
+		return render_missing_index(source_name, "sumtree", stamp, rebuilds, follow_cursor);
+	};
+	let bytes_ok = cache_key.is_some_and(|key| key.total_bytes == snapshot.total.bytes);
+	let focus = snapshot
+		.focus_rank
+		.map_or_else(|| "none".to_string(), |rank| rank.to_string());
+	let mut text = format!(
+		"INDEX {source_name} · sumtree · follow={}\nentries={} arena={} levels={} · total={} B/{} doc-lines/{} visual-rows · bytes-check={}\nroot=#{} · state={} topology-rev={} · rebuilds={} · cache={}\nfocus-rank={} · path={:?} · window={}{}{}\nrank\tleaf\tslot\tbytes\tdoc-lines\tvisual-rows\nEnter jump · Space flat · f follow\n",
+		if follow_cursor { "on" } else { "off" },
+		snapshot.total_entries,
+		snapshot.arena_nodes,
+		snapshot.levels,
+		snapshot.total.bytes,
+		snapshot.total.doc_lines,
+		snapshot.total.visual_rows,
+		if bytes_ok { '✓' } else { '!' },
+		stamp.root.raw(),
+		identity.state_id,
+		identity.topology_rev,
+		rebuilds,
+		if cache_key.is_some() {
+			"present"
+		} else {
+			"none"
+		},
+		focus,
+		snapshot.lookup_path,
+		snapshot.rows.len(),
+		if snapshot.truncated_before {
+			" · …before"
+		} else {
+			""
+		},
+		if snapshot.truncated_after {
+			" · …after"
+		} else {
+			""
+		},
+	);
+	let mut highlights = vec![HighlightSpan::new(
+		DocByte::ZERO,
+		DocByte::new(5),
+		TokenCategory::Keyword,
+	)];
+	let mut rows = Vec::with_capacity(snapshot.rows.len());
+	for entry in &snapshot.rows {
+		let line = DocLine::new(INSPECTOR_HEADER_LINES + rows.len() as u64);
+		let row_start = text.len();
+		let marker = if snapshot.focus_rank == Some(entry.rank) {
+			'>'
+		} else if entry.on_lookup_path {
+			'*'
+		} else {
+			' '
+		};
+		text.push_str(&format!(
+			"{marker}\t{}\t{}\t{}\t{}..{}\t{}..{}\t{}..{}\n",
+			entry.rank,
+			entry.leaf,
+			entry.slot,
+			entry.start_byte,
+			entry.end_byte,
+			entry.start_doc_line,
+			entry.end_doc_line,
+			entry.start_visual_row,
+			entry.end_visual_row,
+		));
+		highlights.push(HighlightSpan::new(
+			DocByte::new(row_start as u64),
+			DocByte::new(row_start.saturating_add(1) as u64),
+			if marker == '>' {
+				TokenCategory::Keyword
+			} else {
+				TokenCategory::Comment
+			},
+		));
+		rows.push(UastIndexInspectorRow {
+			line,
+			line_start_byte: DocByte::new(row_start as u64),
+			start_byte: DocByte::new(entry.start_byte),
+			end_byte: DocByte::new(entry.end_byte),
+			contains_cursor: snapshot.focus_rank == Some(entry.rank),
+			stamp,
+			index_revision: rebuilds,
+			target: UastIndexInspectorTarget::SumTreeEntry {
+				rank: entry.rank,
+				leaf: entry.leaf,
+				slot: entry.slot,
+			},
+		});
+	}
+	RenderedInspector {
+		text: text.into_bytes(),
+		highlights,
+		rows: Vec::new(),
+		index_rows: rows,
+		graph: None,
+	}
+}
+
+fn render_missing_index(
+	source_name: &str,
+	kind: &str,
+	stamp: UastInspectorStamp,
+	revision: u64,
+	follow_cursor: bool,
+) -> RenderedInspector {
+	let text = format!(
+		"INDEX {source_name} · {kind} · follow={}\nindex: none for this root\nroot=#{} · state={} topology-rev={} · revision={}\ninspection is read-only; no index was constructed\nrank\tindex entry\nEnter jump · Space flat · f follow\n",
+		if follow_cursor { "on" } else { "off" },
+		stamp.root.raw(),
+		stamp.state_id,
+		stamp.topology_rev,
+		revision,
+	);
+	RenderedInspector {
+		text: text.into_bytes(),
+		highlights: vec![HighlightSpan::new(
+			DocByte::ZERO,
+			DocByte::new(5),
+			TokenCategory::Keyword,
+		)],
+		rows: Vec::new(),
+		index_rows: Vec::new(),
+		graph: None,
+	}
+}
+
+fn optional_arena(arena: Option<usize>) -> String {
+	arena.map_or_else(|| "-".to_string(), |arena| arena.to_string())
 }
 
 fn render_snapshot(
@@ -1052,6 +1502,7 @@ fn render_snapshot(
 		text: text.into_bytes(),
 		highlights,
 		rows,
+		index_rows: Vec::new(),
 		graph: (mode == UastInspectorMode::Graph).then(|| UastGraphSnapshot {
 			stamp: UastGraphStamp {
 				source_buffer_id: stamp.source_buffer_id,
@@ -1161,6 +1612,43 @@ fn selected_row_after_refresh(
 		.or_else(|| rows.first().cloned())
 }
 
+fn selected_index_row_after_refresh(
+	session: &EditorSession,
+	panel_buffer_id: BufferId,
+	rows: &[UastIndexInspectorRow],
+	follow_cursor: bool,
+) -> Option<UastIndexInspectorRow> {
+	let cursor_row = || {
+		rows.iter()
+			.find(|row| row.contains_cursor)
+			.cloned()
+			.or_else(|| rows.first().cloned())
+	};
+	if follow_cursor {
+		return cursor_row();
+	}
+	let selected_line = session
+		.layout
+		.view_id_for_buffer(panel_buffer_id)
+		.and_then(|view_id| session.layout.find_view(view_id))
+		.and_then(|view| match &view.content {
+			ViewContent::Text(text) => Some(text.cursor.primary().abs_line()),
+			_ => None,
+		});
+	let old = selected_line.and_then(|line| {
+		session
+			.uast_inspectors
+			.get(&panel_buffer_id)
+			.and_then(|panel| panel.index_rows.iter().find(|row| row.line == line))
+	});
+	old.and_then(|old| {
+		rows.iter()
+			.find(|row| row.target == old.target && row.index_revision == old.index_revision)
+			.cloned()
+	})
+	.or_else(cursor_row)
+}
+
 fn remap_selected_row(
 	old_row: Option<&UastInspectorRow>,
 	rows: &[UastInspectorRow],
@@ -1215,6 +1703,7 @@ fn replace_detached(
 		panel.source_state_id = None;
 		panel.source_topology_rev = None;
 		panel.rows.clear();
+		panel.index_rows.clear();
 		panel.graph = None;
 		panel.last_refresh_key = None;
 		panel.rendered_text = text;
@@ -1228,9 +1717,10 @@ fn replace_if_changed(
 	text: Vec<u8>,
 	highlights: Vec<HighlightSpan>,
 	rows: Vec<UastInspectorRow>,
+	index_rows: Vec<UastIndexInspectorRow>,
 	graph: Option<UastGraphSnapshot>,
 	stamp: UastInspectorStamp,
-	selected: Option<UastInspectorRow>,
+	selected: Option<SelectedInspectorRow>,
 	refresh_key: UastInspectorRefreshKey,
 ) {
 	let unchanged = session
@@ -1252,8 +1742,13 @@ fn replace_if_changed(
 		panel.last_refresh_key = Some(refresh_key);
 		panel.rendered_text = text;
 		panel.rows = rows;
+		panel.index_rows = index_rows;
 	}
 	if let Some(selected) = selected {
+		let line_start_byte = match selected {
+			SelectedInspectorRow::Node(row) => row.line_start_byte,
+			SelectedInspectorRow::Index(row) => row.line_start_byte,
+		};
 		let mut view_ids = Vec::new();
 		session
 			.layout
@@ -1265,7 +1760,7 @@ fn replace_if_changed(
 			if let ViewContent::Text(text) = &mut view.content {
 				text.cursor
 					.primary_mut()
-					.set_byte(selected.line_start_byte, Affinity::After);
+					.set_byte(line_start_byte, Affinity::After);
 			}
 		}
 	}
@@ -1276,6 +1771,8 @@ fn mode_name(mode: UastInspectorMode) -> &'static str {
 		UastInspectorMode::Semantic => "semantic",
 		UastInspectorMode::Raw => "raw",
 		UastInspectorMode::Graph => "graph",
+		UastInspectorMode::Index(PositionalIndexKind::Treap) => "index",
+		UastInspectorMode::Index(PositionalIndexKind::SumTree) => "index sumtree",
 	}
 }
 
@@ -1360,6 +1857,31 @@ mod tests {
 		}
 	}
 
+	fn identity(root: NodeId) -> SourceIdentity {
+		SourceIdentity {
+			view_id: None,
+			root,
+			state_id: StateId::ZERO,
+			topology_rev: TopologyRev::ZERO,
+			applied_structural_state_id: None,
+			pending_semantic: false,
+			structural_issue: None,
+			active_language_id: None,
+			cursor_byte: Some(DocByte::ZERO),
+			owner_accounting: UastOwnerAccounting {
+				allocated_nodes: 2,
+				retired_nodes: 0,
+				current_live_nodes: 2,
+				parked_nodes: 0,
+				payload_added_bytes: 0,
+				payload_removed_bytes: 0,
+				current_live_payload_bytes: 0,
+				parked_payload_bytes: 0,
+				root_generations: 1,
+			},
+		}
+	}
+
 	#[test]
 	fn snapshot_budget_grows_from_rendered_rows_and_never_shrinks() {
 		let initial = next_snapshot_node_budget(0, 9, 106, 0);
@@ -1377,6 +1899,81 @@ mod tests {
 			next_snapshot_node_budget(INSPECTOR_NODE_BUDGET, u64::MAX, u32::MAX, 0),
 			INSPECTOR_NODE_BUDGET
 		);
+	}
+
+	#[test]
+	fn treap_inspection_is_no_construction_and_marks_registry_drift() {
+		let (registry, root) = crate::engine::test_support::build_document("abcd");
+		let counters_before = registry.root_child_line_index_counters();
+		let revision_before = registry.inspector_revision();
+		assert!(
+			registry
+				.inspect_root_child_line_index(root, Some(DocByte::ZERO), 8)
+				.is_none()
+		);
+		assert_eq!(registry.root_child_line_index_counters(), counters_before);
+		assert_eq!(registry.inspector_revision(), revision_before);
+
+		registry.install_root_child_line_index(root);
+		let snapshot = registry
+			.inspect_root_child_line_index(root, Some(DocByte::ZERO), 8)
+			.expect("installed index");
+		let (rebuilds, splices) = registry.root_child_line_index_counters();
+		let rendered = render_treap_snapshot(
+			Some(&snapshot),
+			identity(root),
+			"fixture",
+			stamp(root, StateId::ZERO, TopologyRev::ZERO),
+			registry.root_child_line_index_revision(),
+			rebuilds,
+			splices,
+			&registry,
+			true,
+		);
+		assert!(String::from_utf8(rendered.text).unwrap().contains("\t✓\n"));
+
+		let leaf = registry.get_first_child(root).expect("leaf");
+		unsafe {
+			(*registry.metrics[leaf.index()].get()).byte_length += 1;
+		}
+		let stale_snapshot = registry
+			.inspect_root_child_line_index(root, Some(DocByte::ZERO), 8)
+			.expect("still installed");
+		let rendered = render_treap_snapshot(
+			Some(&stale_snapshot),
+			identity(root),
+			"fixture",
+			stamp(root, StateId::ZERO, TopologyRev::ZERO),
+			registry.root_child_line_index_revision(),
+			rebuilds,
+			splices,
+			&registry,
+			true,
+		);
+		assert!(String::from_utf8(rendered.text).unwrap().contains("\t!\n"));
+	}
+
+	#[test]
+	fn inspector_source_has_no_positional_index_construction_path() {
+		let source = include_str!("uast_inspector.rs")
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production section");
+		assert!(
+			!source.contains("refresh_sum_tree("),
+			"SumTree inspection must only observe CachedSumTree"
+		);
+		assert!(
+			!source.contains("install_root_child_line_index("),
+			"treap inspection must not install a missing index"
+		);
+	}
+
+	#[test]
+	fn stale_index_rows_are_rejected_instead_of_rank_remapped() {
+		assert!(validate_index_row_revision(41, 41).is_ok());
+		let error = validate_index_row_revision(41, 42).expect_err("stale revision");
+		assert!(error.contains("stale row was not followed"));
 	}
 
 	#[test]

@@ -494,6 +494,13 @@ pub enum UastInspectorMode {
 	Semantic,
 	Raw,
 	Graph,
+	Index(PositionalIndexKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionalIndexKind {
+	Treap,
+	SumTree,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

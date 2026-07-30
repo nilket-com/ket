@@ -236,6 +236,8 @@ pub struct UastRegistry {
 	/// Production prefix indexes for flat source-backed document roots.
 	pub(crate) root_child_line_indexes: RwLock<HashMap<NodeId, RootChildLineIndex>>,
 	pub(crate) root_child_line_index_full_builds: AtomicU64,
+	pub(crate) root_child_line_index_splices: AtomicU64,
+	pub(crate) root_child_line_index_revision: AtomicU64,
 	pub(crate) cold_extent_count: AtomicU64,
 	pub(crate) hot_extent_count: AtomicU64,
 	pub(crate) scanned_bytes: AtomicU64,
@@ -320,6 +322,8 @@ impl UastRegistry {
 			whole_leaf_read_outcomes: Mutex::new(HashMap::new()),
 			root_child_line_indexes: RwLock::new(HashMap::new()),
 			root_child_line_index_full_builds: AtomicU64::new(0),
+			root_child_line_index_splices: AtomicU64::new(0),
+			root_child_line_index_revision: AtomicU64::new(0),
 			cold_extent_count: AtomicU64::new(0),
 			hot_extent_count: AtomicU64::new(0),
 			scanned_bytes: AtomicU64::new(0),
@@ -626,11 +630,15 @@ impl UastRegistry {
 			.retain(|entry| entry.node_id != node && entry.scan_root != Some(node));
 		self.incomplete_metric_roots.lock().unwrap().remove(&node);
 		let mut indexes = self.root_child_line_indexes.write().unwrap();
-		indexes.remove(&node);
+		let removed_root = usize::from(indexes.remove(&node).is_some());
+		let mut removed_entries = 0usize;
 		for index in indexes.values_mut() {
-			index.remove(node);
+			removed_entries = removed_entries.saturating_add(usize::from(index.remove(node)));
 		}
 		drop(indexes);
+		if removed_root > 0 || removed_entries > 0 {
+			self.note_root_child_line_index_change(removed_entries as u64);
+		}
 		for nodes in self.viewport_resident_pins.lock().unwrap().values_mut() {
 			nodes.remove(&node);
 		}
@@ -1562,6 +1570,34 @@ impl UastRegistry {
 
 	pub(crate) fn inspector_revision(&self) -> u64 {
 		self.inspector_revision.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn root_child_line_index_revision(&self) -> u64 {
+		self.root_child_line_index_revision.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn root_child_line_index_counters(&self) -> (u64, u64) {
+		(
+			self.root_child_line_index_full_builds
+				.load(Ordering::Acquire),
+			self.root_child_line_index_splices.load(Ordering::Acquire),
+		)
+	}
+
+	pub(crate) fn note_root_child_line_index_change(&self, splice_delta: u64) {
+		if splice_delta > 0 {
+			Self::checked_monotonic_add(
+				&self.root_child_line_index_splices,
+				splice_delta,
+				"root-child index splice counter exhausted",
+			);
+		}
+		Self::checked_monotonic_add(
+			&self.root_child_line_index_revision,
+			1,
+			"root-child index revision exhausted",
+		);
+		self.bump_inspector_revision();
 	}
 
 	/// Returns only state already present in memory. This is intentionally

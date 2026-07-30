@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod mutation;
 pub mod projection;
 mod root_line_index;
+pub(crate) use root_line_index::RootChildLineIndexInspectorSnapshot;
 #[allow(unused_imports)]
 pub mod topology;
 
