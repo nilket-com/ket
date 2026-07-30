@@ -555,7 +555,10 @@ pub enum MouseIntent {
 	FocusPane(PaneId),
 	ActivateDocTab { pane_id: PaneId, view_id: ViewId },
 	CloseDocTab { pane_id: PaneId, view_id: ViewId },
-	ScrollViewport(i32),
+	ScrollViewport {
+		delta: i32,
+		synchronize_diff: bool,
+	},
 	ScrollViewportToLine(DocLine),
 	ClickBrowserEntry { line: DocLine, double_click: bool },
 	OpenGitStatusEntry { line: DocLine },

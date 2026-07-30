@@ -3296,41 +3296,6 @@ fn sync_diff_scroll(
 		return false;
 	};
 	let partner_id = pair.partner_pane_id;
-	let blocks = pair.blocks.clone();
-
-	let focused_tab = session
-		.layout
-		.find_pane(focused_id)
-		.map(|p| p.active_tab())
-		.unwrap();
-	let focused_line = focused_tab.common().scroll_y;
-
-	// Find the corresponding line in the partner
-	let mut partner_line = focused_line;
-	for block in &blocks {
-		if focused_line >= block.range.0.get() && focused_line < block.range.1.get() {
-			// Inside a block, interpolate
-			let offset = focused_line - block.range.0.get();
-			let partner_start = block.partner_range.0.get();
-			let partner_end = block.partner_range.1.get();
-			let focused_len = block.range.1.get() - block.range.0.get();
-			let partner_len = partner_end - partner_start;
-
-			partner_line =
-				partner_start + (offset * partner_len).checked_div(focused_len).unwrap_or(0);
-			break;
-		} else if focused_line < block.range.0.get() {
-			// Before this block, we assume 1:1 mapping from last block or start
-			break;
-		} else {
-			// After this block, adjust base
-			let focused_end = block.range.1.get();
-			let partner_end = block.partner_range.1.get();
-			partner_line = focused_line
-				.saturating_sub(focused_end)
-				.saturating_add(partner_end);
-		}
-	}
 
 	let EditorSession {
 		buffers,
@@ -3347,14 +3312,13 @@ fn sync_diff_scroll(
 		events,
 		partner_view_id,
 		|partner_tab| {
-			// In linked scrolling, we want the partner to follow. Eventually this
-			// should use the calculated visual alignment in `partner_line`.
+			// Explicitly locked scrolling is phase-locked: the partner receives
+			// the same navigation command as the focused pane.
 			handle_navigation_doctab_command(registry, partner_tab, ui, command.clone());
 		},
 	) else {
 		return false;
 	};
-	let _ = partner_line; // Keep for future alignment logic
 	true
 }
 
@@ -3467,6 +3431,7 @@ fn dispatch_command(
 	} = context;
 	let registry = runtime.registry;
 	let mut needs_render = false;
+	let mut synchronize_diff_scroll = false;
 	if let EditorCommand::WriteInit { force } = cmd {
 		session.ui.status_message = Some(
 			match runtime
@@ -3523,7 +3488,13 @@ fn dispatch_command(
 				MouseIntent::CloseDocTab { pane_id, view_id } => {
 					EditorCommand::CloseDocTab { pane_id, view_id }
 				}
-				MouseIntent::ScrollViewport(delta) => EditorCommand::ScrollViewport(delta),
+				MouseIntent::ScrollViewport {
+					delta,
+					synchronize_diff,
+				} => {
+					synchronize_diff_scroll = synchronize_diff;
+					EditorCommand::ScrollViewport(delta)
+				}
 				MouseIntent::ScrollViewportToLine(line) => {
 					EditorCommand::ScrollViewportToLine(line)
 				}
@@ -3958,7 +3929,9 @@ fn dispatch_command(
 						needs_render |= effect.needs_render;
 					}
 				}
-				sync_diff_scroll(registry, session, &navigation_cmd);
+				if synchronize_diff_scroll {
+					sync_diff_scroll(registry, session, &navigation_cmd);
+				}
 				sync_markdown_image_preview_scroll(registry, session);
 			}
 		}

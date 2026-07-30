@@ -206,6 +206,20 @@ fn cursor_click_command(
 	}
 }
 
+fn viewport_scroll_command(
+	viewport_id: ViewportId,
+	modifiers: event::KeyModifiers,
+	delta: i32,
+) -> EditorCommand {
+	EditorCommand::MouseIntent {
+		viewport_id,
+		intent: MouseIntent::ScrollViewport {
+			delta,
+			synchronize_diff: modifiers.contains(event::KeyModifiers::CONTROL),
+		},
+	}
+}
+
 fn text_click_target(
 	visible_rows: &[libaryon::engine::VisibleRow],
 	scroll_y: u64,
@@ -242,10 +256,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if let Some(viewport_id) =
 					self.current_viewport.as_ref().map(|view| view.viewport_id)
 				{
-					self.send_command(EditorCommand::MouseIntent {
+					self.send_command(viewport_scroll_command(
 						viewport_id,
-						intent: MouseIntent::ScrollViewport(-3),
-					});
+						mouse.modifiers,
+						-3,
+					));
 				} else {
 					self.send_command(EditorCommand::ScrollViewport(-3));
 				}
@@ -263,10 +278,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if let Some(viewport_id) =
 					self.current_viewport.as_ref().map(|view| view.viewport_id)
 				{
-					self.send_command(EditorCommand::MouseIntent {
+					self.send_command(viewport_scroll_command(
 						viewport_id,
-						intent: MouseIntent::ScrollViewport(3),
-					});
+						mouse.modifiers,
+						3,
+					));
 				} else {
 					self.send_command(EditorCommand::ScrollViewport(3));
 				}
@@ -484,6 +500,7 @@ mod tests {
 		DOUBLE_CLICK_INTERVAL, PaneDivider, PaneResizeDrag, TabHit, cursor_click_command,
 		divider_under_mouse_in_rects, is_browser_double_click, minimap_click_content_height,
 		minimap_click_viewport_start_line, pane_resize_target, tab_hit_test, text_click_target,
+		viewport_scroll_command,
 	};
 	use crossterm::event::KeyModifiers;
 	use libaryon::core::{
@@ -624,6 +641,29 @@ mod tests {
 				},
 			} if actual_revision == viewport_id && actual == target
 		));
+	}
+
+	#[test]
+	fn control_is_the_explicit_diff_scroll_lock_modifier() {
+		let viewport_id = ViewportId::new(9);
+		for (modifiers, expected) in [
+			(KeyModifiers::NONE, false),
+			(KeyModifiers::SHIFT, false),
+			(KeyModifiers::ALT, false),
+			(KeyModifiers::CONTROL, true),
+			(KeyModifiers::CONTROL | KeyModifiers::ALT, true),
+		] {
+			assert!(matches!(
+				viewport_scroll_command(viewport_id, modifiers, 3),
+				EditorCommand::MouseIntent {
+					viewport_id: actual_viewport,
+					intent: MouseIntent::ScrollViewport {
+						delta: 3,
+						synchronize_diff,
+					},
+				} if actual_viewport == viewport_id && synchronize_diff == expected
+			));
+		}
 	}
 
 	#[test]
