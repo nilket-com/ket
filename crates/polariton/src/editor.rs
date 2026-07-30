@@ -2231,16 +2231,12 @@ fn pane_title(pane: &libaryon::uast::projection::PaneViewport) -> &str {
 	)
 }
 
-fn tab_label(
-	tab: &libaryon::uast::projection::DocTabSummary,
-	active_fallback: Option<&str>,
-) -> String {
-	let title = if tab.title == "[No Name]" {
-		active_fallback.unwrap_or(tab.title.as_str())
-	} else {
-		tab.title.as_str()
-	};
-	format!("{}{}", title, if tab.is_dirty { " +" } else { "" })
+fn tab_label(tab: &libaryon::uast::projection::DocTabSummary) -> String {
+	format!(
+		"{}{}",
+		tab.title,
+		if tab.is_dirty { " +" } else { "" }
+	)
 }
 
 fn tab_button_style(
@@ -2304,8 +2300,7 @@ fn pane_tab_bar<'a>(
 		.height(Length::Fixed(PANE_HEADER_HEIGHT));
 	for (index, tab) in pane.tabs.iter().enumerate() {
 		let active = index == pane.active_doctab_index;
-		let fallback = active.then(|| pane_title(pane));
-		let label = tab_label(tab, fallback);
+		let label = tab_label(tab);
 		let font = iced::Font {
 			weight: if active {
 				iced::font::Weight::Bold
@@ -4813,12 +4808,12 @@ mod tests {
 			..clean.clone()
 		};
 		let unnamed = DocTabSummary {
-			title: "[No Name]".to_owned(),
+			title: "_".to_owned(),
 			..clean.clone()
 		};
-		assert_eq!(tab_label(&clean, None), "query.sql");
-		assert_eq!(tab_label(&dirty, None), "query.sql +");
-		assert_eq!(tab_label(&unnamed, Some("SQL")), "SQL");
+		assert_eq!(tab_label(&clean), "query.sql");
+		assert_eq!(tab_label(&dirty), "query.sql +");
+		assert_eq!(tab_label(&unnamed), "_");
 
 		let palette = libaryon::engine::UiPalette::default();
 		let active = tab_button_style(true, true, palette, button::Status::Active);

@@ -467,7 +467,7 @@ fn create_markdown_preview_view(
 		source
 			.path
 			.clone()
-			.unwrap_or_else(|| "[No Name]".to_string())
+			.unwrap_or_else(|| "_".to_string())
 	} else {
 		preview_title(source.path.as_deref())
 	};
@@ -656,7 +656,7 @@ fn preview_title(source_path: Option<&str>) -> String {
 				.unwrap_or(path)
 				.to_string()
 		})
-		.unwrap_or_else(|| "[No Name]".to_string());
+		.unwrap_or_else(|| "_".to_string());
 	format!("{} Preview", source_name)
 }
 
@@ -696,6 +696,7 @@ mod tests {
 			preview_title(Some("/tmp/project/README.md")),
 			"README.md Preview"
 		);
+		assert_eq!(preview_title(None), "_ Preview");
 	}
 
 	#[test]

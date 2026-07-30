@@ -225,7 +225,7 @@ pub(crate) fn refresh_uast_inspectors(
 						.file_path
 						.as_deref()
 						.or(document.virtual_path.as_deref())
-						.unwrap_or("[No Name]")
+						.unwrap_or("_")
 						.to_owned(),
 					document
 						.semantic
@@ -850,7 +850,7 @@ pub(crate) fn export_dot(
 					.file_path
 					.as_deref()
 					.or(document.virtual_path.as_deref())
-					.unwrap_or("[No Name]")
+					.unwrap_or("_")
 					.to_owned(),
 			)
 		})

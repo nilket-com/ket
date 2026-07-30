@@ -4675,6 +4675,10 @@ mod tests {
 			resized_view.viewport_line_count,
 			33 - EDITOR_CHROME_ROWS as u32
 		);
+		assert_eq!(
+			resized_view.tabs[resized_view.active_doctab_index].title,
+			"_"
+		);
 
 		tx_cmd
 			.send(EditorCommand::DocTabNew)
@@ -4683,6 +4687,10 @@ mod tests {
 		assert_eq!(
 			new_tab_view.viewport_line_count,
 			resized_view.viewport_line_count
+		);
+		assert_eq!(
+			new_tab_view.tabs[new_tab_view.active_doctab_index].title,
+			"_"
 		);
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit engine");
@@ -6248,7 +6256,7 @@ mod tests {
 		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
 
 		// Plain text in a buffer with no file and no virtual identity — the
-		// scratch-buffer scenario a terminal user reaches with `[No Name]`.
+		// scratch-buffer scenario a terminal user reaches with `_`.
 		let plain = send_cmd_and_recv(
 			&tx_cmd,
 			&rx_view,

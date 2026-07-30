@@ -105,7 +105,7 @@ Implement the following chord mappings:
 ### 5.1 Tab Bar Rendering
 *   Allocate the top row of the terminal viewport for the tab bar.
 *   Iterate through `session.pane.tabs`.
-*   Render the filename (or `[No Name]`) for each tab.
+*   Render the filename (or `_`) for each tab.
 *   Apply distinct styling to the active tab.
 *   Display a modified indicator (e.g., `+` or `●`) next to the filename if `doctab.document.ledger.is_dirty()` is true.
 

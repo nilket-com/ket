@@ -1542,7 +1542,7 @@ fn render_pane_viewport(
 									.unwrap_or(path)
 									.to_string()
 							})
-							.unwrap_or_else(|| "[No Name]".to_string())
+							.unwrap_or_else(|| "_".to_string())
 					},
 					is_dirty: buffer.is_dirty(),
 				}
