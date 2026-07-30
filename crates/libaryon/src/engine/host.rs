@@ -581,6 +581,33 @@ mod tests {
 				.count(),
 			1
 		);
+		commands
+			.send(EditorCommand::GotoLine(DocLine::new(1)))
+			.expect("move source cursor within the treap's single extent");
+		recv_viewport_until(
+			&viewports,
+			"treap query follows cursor within one unchanged extent",
+			|viewport| {
+				viewport.panes.iter().any(|pane| {
+					if pane.tabs[pane.active_doctab_index].title != "uast" {
+						return false;
+					}
+					let text = pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>();
+					text.windows(b"query-byte=6".len())
+						.any(|window| window == b"query-byte=6")
+						&& text
+							.windows(b"local=6/17".len())
+							.any(|window| window == b"local=6/17")
+						&& text
+							.windows(b"focus-rank=0".len())
+							.any(|window| window == b"focus-rank=0")
+				})
+			},
+		);
 
 		commands
 			.send(EditorCommand::OpenUastInspector {
@@ -604,6 +631,23 @@ mod tests {
 					&& text
 						.windows("bytes-check=✓".len())
 						.any(|window| window == "bytes-check=✓".as_bytes())
+			})
+		});
+		commands
+			.send(EditorCommand::GotoLine(DocLine::new(2)))
+			.expect("move source cursor while inspecting the SumTree");
+		recv_viewport_until(&viewports, "SumTree query follows cursor", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				if pane.tabs[pane.active_doctab_index].title != "uast" {
+					return false;
+				}
+				let text = pane
+					.tokens
+					.iter()
+					.flat_map(|token| token.text.iter().copied())
+					.collect::<Vec<_>>();
+				text.windows(b"query-byte=11".len())
+					.any(|window| window == b"query-byte=11")
 			})
 		});
 

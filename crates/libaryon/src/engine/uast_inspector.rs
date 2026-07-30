@@ -979,22 +979,26 @@ fn render_treap_snapshot(
 	let focus = snapshot
 		.focus_rank
 		.map_or_else(|| "none".to_string(), |rank| rank.to_string());
-	let focus_links = snapshot
+	let focus_row = snapshot
 		.focus_rank
-		.and_then(|rank| snapshot.rows.iter().find(|row| row.rank == rank))
-		.map_or_else(
-			|| "p=- l=- r=-".to_string(),
-			|row| {
-				format!(
-					"p={} l={} r={}",
-					optional_arena(row.parent),
-					optional_arena(row.left),
-					optional_arena(row.right)
-				)
-			},
-		);
+		.and_then(|rank| snapshot.rows.iter().find(|row| row.rank == rank));
+	let focus_links = focus_row.map_or_else(
+		|| "p=- l=- r=-".to_string(),
+		|row| {
+			format!(
+				"p={} l={} r={}",
+				optional_arena(row.parent),
+				optional_arena(row.left),
+				optional_arena(row.right)
+			)
+		},
+	);
+	let query = format_index_query(
+		identity.cursor_byte,
+		focus_row.map(|row| (row.start_byte.get(), row.end_byte.get())),
+	);
 	let mut text = format!(
-		"INDEX {source_name} · treap · follow={}\nextents={} arena={} depth={}/log2={} known-extents={} known={}/{} B · known-lines={}\nroot=#{} · state={} topology-rev={} · rev={} · builds={} splices={}\nfocus-rank={} · path={:?} · {focus_links} · window={}{}{}\nrank\tarena\tnode\tbytes\tlines\tentry-nl/subtree(b/nl)\tcheck\nEnter jump · Space flat · f follow\n",
+		"INDEX {source_name} · treap · follow={}\nextents={} arena={} depth={}/log2={} known-extents={} known={}/{} B · known-lines={}\nroot=#{} · state={} topology-rev={} · rev={} · builds={} splices={}\n{query} · focus-rank={} · path={:?} · {focus_links} · window={}{}{}\nrank\tarena\tnode\tbytes\tlines\tentry-nl/subtree(b/nl)\tcheck\nEnter jump · Space flat · f follow\n",
 		if follow_cursor { "on" } else { "off" },
 		snapshot.total_entries,
 		snapshot.arena_slots,
@@ -1113,8 +1117,15 @@ fn render_sumtree_snapshot(
 	let focus = snapshot
 		.focus_rank
 		.map_or_else(|| "none".to_string(), |rank| rank.to_string());
+	let focus_row = snapshot
+		.focus_rank
+		.and_then(|rank| snapshot.rows.iter().find(|row| row.rank == rank));
+	let query = format_index_query(
+		identity.cursor_byte,
+		focus_row.map(|row| (row.start_byte, row.end_byte)),
+	);
 	let mut text = format!(
-		"INDEX {source_name} · sumtree · follow={}\nentries={} arena={} levels={} · total={} B/{} doc-lines/{} visual-rows · bytes-check={}\nroot=#{} · state={} topology-rev={} · rebuilds={} · cache={}\nfocus-rank={} · path={:?} · window={}{}{}\nrank\tleaf\tslot\tbytes\tdoc-lines\tvisual-rows\nEnter jump · Space flat · f follow\n",
+		"INDEX {source_name} · sumtree · follow={}\nentries={} arena={} levels={} · total={} B/{} doc-lines/{} visual-rows · bytes-check={}\nroot=#{} · state={} topology-rev={} · rebuilds={} · cache={}\n{query} · focus-rank={} · path={:?} · window={}{}{}\nrank\tleaf\tslot\tbytes\tdoc-lines\tvisual-rows\nEnter jump · Space flat · f follow\n",
 		if follow_cursor { "on" } else { "off" },
 		snapshot.total_entries,
 		snapshot.arena_nodes,
@@ -1205,6 +1216,23 @@ fn render_sumtree_snapshot(
 		index_rows: rows,
 		graph: None,
 	}
+}
+
+fn format_index_query(cursor_byte: Option<DocByte>, focus_bounds: Option<(u64, u64)>) -> String {
+	let Some(cursor_byte) = cursor_byte.map(DocByte::get) else {
+		return "query-byte=none · local=none".to_string();
+	};
+	let local = focus_bounds.map_or_else(
+		|| "none".to_string(),
+		|(start, end)| {
+			format!(
+				"{}/{}",
+				cursor_byte.saturating_sub(start),
+				end.saturating_sub(start)
+			)
+		},
+	);
+	format!("query-byte={cursor_byte} · local={local}")
 }
 
 fn render_missing_index(
