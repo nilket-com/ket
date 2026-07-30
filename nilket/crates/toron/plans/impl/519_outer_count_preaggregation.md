@@ -73,3 +73,35 @@ verdict reporting.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Engagement result — closed red, recognizer not sealed
+
+The load-bearing uniqueness gate is unavailable on q13's production-census catalog. The
+persisted TPC-H `customer` schema declares `c_custkey` non-null and the manifest records
+1,200,000 rows, but `customer_descriptor` uses `RowIdentityPolicy::AppendOnly`; the resulting
+`TableBinding.primary_key_columns` is empty. The manifest carries no exact NDV/unique-key fact
+that could prove the missing property. The rule therefore cannot prove `c_custkey` unique and
+must decline exactly as predeclared in the ADR's red path.
+
+A throwaway implementation established that this is the only blocking gate:
+
+- the hand-built and SQL-planned nested q13 shapes engaged against an otherwise identical mock
+  catalog declaring `c_custkey` as its primary key;
+- the structural decline battery and execution equivalence fixtures were green, including
+  duplicate right matches, unmatched rows, null right keys, empty/all-filtered right inputs,
+  nullable-counted-column decline, and exact output field/nullability identity;
+- at the exact sf=8 persisted-Parquet 2 GiB / 2 GiB coordinate, however, the official q13
+  off/on pair remained plan-identical (`32c7b15a1c5a244e`), digest-identical, and retained
+  5,131,808 B spill in both arms. The latched on arm therefore proved a recognizer decline,
+  not an ineffective execution rewrite.
+
+No uniqueness inference was invented and the benchmark descriptor was not retargeted: either
+would weaken or move the proof obligation after the gate failed, and changing `customer` from
+AppendOnly to PrimaryKey would affect every customer-using board cell rather than this bounded
+mechanism alone. All throwaway mechanism, knob, and test changes were removed. No implementation
+seal, census, or performance cohort exists for ADR 519.
+
+The twin-proven economics and transformation theorem remain valid. A successor may reopen this
+shape only after a separately justified catalog/descriptor cut supplies durable uniqueness
+evidence (with its own board-wide census), or with a different transformation whose soundness
+does not depend on preserved-key uniqueness.
