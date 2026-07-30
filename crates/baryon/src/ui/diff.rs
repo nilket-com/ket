@@ -222,6 +222,10 @@ impl DiffBridgeController {
 	) {
 		let pair_key = (left_pane.pane_id, right_pane.pane_id);
 		let blocks = left_pane.diff_pair.as_ref().map(|p| &p.blocks).unwrap();
+		if blocks.is_empty() {
+			self.clear_bridge(left_pane.pane_id, right_pane.pane_id);
+			return;
+		}
 		let colors = DiffColors::from(palette);
 		let hovered_band = self.hovered_band.filter(|hover| {
 			hover.left_pane_id == left_pane.pane_id
@@ -271,6 +275,13 @@ impl DiffBridgeController {
 		}
 	}
 
+	pub fn clear_bridge(&mut self, left_id: PaneId, right_id: PaneId) {
+		for pair_key in [(left_id, right_id), (right_id, left_id)] {
+			self.requested_fingerprints.remove(&pair_key);
+			self.current_protocols.remove(&pair_key);
+		}
+	}
+
 	pub fn poll(&mut self) -> bool {
 		let mut updated = false;
 		while let Ok(response) = self.rx_ready.try_recv() {
@@ -291,6 +302,10 @@ impl DiffBridgeController {
 	pub fn get_protocol(&self, left_id: PaneId, right_id: PaneId) -> Option<&Protocol> {
 		self.current_protocols.get(&(left_id, right_id))
 	}
+}
+
+pub(super) fn should_render_diff_bridge(blocks: &[DiffBlock], pane_resize_active: bool) -> bool {
+	!pane_resize_active && !blocks.is_empty()
 }
 
 fn bridge_request_fingerprint(
@@ -577,6 +592,26 @@ mod tests {
 			bridge_tint(color, DiffHoverEmphasis::Dimmed),
 			Rgba([10, 20, 30, 40])
 		);
+	}
+
+	#[test]
+	fn bridge_render_policy_skips_empty_pairs_and_active_resize() {
+		let block = DiffBlock {
+			range: (DocLine::new(0), DocLine::new(1)),
+			partner_range: (DocLine::new(0), DocLine::new(1)),
+			kind: DiffKind::Modified,
+			intra_line_diffs: None,
+		};
+
+		assert!(!should_render_diff_bridge(&[], false));
+		assert!(!should_render_diff_bridge(
+			std::slice::from_ref(&block),
+			true
+		));
+		assert!(should_render_diff_bridge(
+			std::slice::from_ref(&block),
+			false
+		));
 	}
 
 	#[test]

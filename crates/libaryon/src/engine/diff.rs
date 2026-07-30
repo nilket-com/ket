@@ -11,6 +11,13 @@ use super::session::{DiffBlock, DiffKind, DiffRole, IntraLineDiff, IntraLineDiff
 use crate::core::PaneId;
 use crate::engine::session::EditorSession;
 
+#[cfg(test)]
+std::thread_local! {
+	static STRUCTURAL_DIFF_NODE_VISITS: std::cell::Cell<u64> = const {
+		std::cell::Cell::new(0)
+	};
+}
+
 pub(crate) fn recompute_all_diffs(registry: &UastRegistry, session: &mut EditorSession) {
 	let mut pairs_to_recompute = Vec::new();
 	for (&pane_id, pair) in &session.diff_pairs {
@@ -146,6 +153,15 @@ pub(crate) fn compute_diff(
 			DocByte::new(registry.get_total_bytes(right_root)),
 		)
 		.unwrap_or_default();
+
+	// Git snapshots commonly differ in registry topology before and after their
+	// asynchronous semantic graft even when their bytes are identical. Avoid
+	// entering the structural matcher at all in that case: discovering equality
+	// after the all-pairs node walk is both redundant and extremely expensive in
+	// debug builds.
+	if left_bytes == right_bytes {
+		return blocks;
+	}
 
 	if left_bytes.is_empty() || right_bytes.is_empty() {
 		return blocks;
@@ -505,6 +521,9 @@ fn extract_nodes_with_coords(
 ) {
 	let mut stack = vec![(root, DocByte::ZERO)];
 	while let Some((node, start_byte)) = stack.pop() {
+		#[cfg(test)]
+		STRUCTURAL_DIFF_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
+
 		let metrics = unsafe { *registry.metrics[node.index()].get() };
 		let kind = unsafe { *registry.kinds[node.index()].get() };
 
@@ -1494,7 +1513,7 @@ fn split_modified_whitespace_lines(
 
 #[cfg(test)]
 mod tests {
-	use super::{canonical_pair_order, compute_diff};
+	use super::{STRUCTURAL_DIFF_NODE_VISITS, canonical_pair_order, compute_diff};
 	use crate::core::PaneId;
 	use crate::ecs::{NodeId, UastRegistry};
 	use crate::engine::language::{GreenNode, LanguageProvider};
@@ -1575,6 +1594,27 @@ mod tests {
 		}
 		apply_graft(registry, root, green, source).expect("test graft is byte-identical");
 		root
+	}
+
+	#[test]
+	fn identical_documents_never_enter_the_structural_matcher() {
+		let source = (0..512)
+			.map(|line| format!("fn item_{line:03}() {{ shared(); }}\n"))
+			.collect::<String>()
+			.into_bytes();
+		let registry = UastRegistry::new(2_048);
+		let left_root = graft_diff_side(&registry, &source);
+		let right_root = graft_diff_side(&registry, &source);
+
+		STRUCTURAL_DIFF_NODE_VISITS.with(|visits| visits.set(0));
+		let blocks = compute_diff(left_root, right_root, &registry);
+		let visits = STRUCTURAL_DIFF_NODE_VISITS.with(std::cell::Cell::get);
+
+		assert!(blocks.is_empty());
+		assert_eq!(
+			visits, 0,
+			"byte-identical documents must return before structural extraction"
+		);
 	}
 
 	#[test]

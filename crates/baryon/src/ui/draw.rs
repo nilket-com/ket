@@ -1352,6 +1352,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let markdown_preview = &mut self.markdown_preview;
 		let diff_hover = self.diff_bridge.hovered_band();
 		let diff_bridge = &mut self.diff_bridge;
+		let pane_resize_active = self.pane_resize_drag.is_some();
 		let uast_graph = &mut self.uast_graph;
 		let ui_palette = current_viewport
 			.as_ref()
@@ -1446,6 +1447,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 
 									// If this is the "left" pane of the pair (to avoid double drawing)
 									if pane.rect.screen_col.get() < partner.rect.screen_col.get() {
+										if !super::diff::should_render_diff_bridge(
+											&diff_pair.blocks,
+											pane_resize_active,
+										) {
+											diff_bridge.clear_bridge(pane.pane_id, partner.pane_id);
+											continue;
+										}
+
 										let bridge_top = pane
 											.rect
 											.screen_row

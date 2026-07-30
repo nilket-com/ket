@@ -467,8 +467,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 					});
 				}
 			}
-			MouseEventKind::Up(MouseButton::Left) => {
+			MouseEventKind::Up(MouseButton::Left) if self.pane_resize_drag.is_some() => {
 				self.pane_resize_drag = None;
+				// Bridge rasterization is suspended during divider drag. One
+				// final redraw requests the settled geometry after release.
+				self.needs_redraw = true;
 			}
 			_ => {}
 		}
