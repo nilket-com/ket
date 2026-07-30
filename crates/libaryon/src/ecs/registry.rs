@@ -174,7 +174,9 @@ pub(crate) enum WholeLeafReadOutcome {
 /// ==========================================
 /// THE CONCURRENT ECS REGISTRY (WORLD)
 /// ==========================================
-/// Structure of Arrays (SoA) layout.
+/// Process-wide Structure of Arrays (SoA) store for a forest of document
+/// trees. `Registry` names its ECS role; each document root and its descendants
+/// form one tree, while multiple roots coexist in the same registry.
 pub struct UastRegistry {
 	capacity: u32,
 	next_id: AtomicU32,

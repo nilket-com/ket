@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 pub(crate) const RECLAIM_NODES_PER_FRAME: usize = 4_096;
 
 #[derive(Debug)]
-struct RetiredForest {
+struct RetiredTree {
 	head: NodeId,
 }
 
@@ -24,8 +24,8 @@ pub(crate) struct ReclaimProgress {
 
 #[derive(Debug, Default)]
 pub(crate) struct ReclaimQueue {
-	quarantined: VecDeque<RetiredForest>,
-	eligible: VecDeque<RetiredForest>,
+	quarantined: VecDeque<RetiredTree>,
+	eligible: VecDeque<RetiredTree>,
 	in_progress: Option<ReclaimCursor>,
 	maintenance_wake_pending: bool,
 }
@@ -37,7 +37,7 @@ impl ReclaimQueue {
 				ReclaimFence::AfterPublication => &mut self.quarantined,
 				ReclaimFence::NeverPublished => &mut self.eligible,
 			};
-			target.extend(heads.into_iter().map(|head| RetiredForest { head }));
+			target.extend(heads.into_iter().map(|head| RetiredTree { head }));
 		}
 	}
 
@@ -49,11 +49,11 @@ impl ReclaimQueue {
 		let mut progress = ReclaimProgress::default();
 		while progress.visited_nodes < budget {
 			if self.in_progress.is_none() {
-				let Some(forest) = self.eligible.pop_front() else {
+				let Some(tree) = self.eligible.pop_front() else {
 					break;
 				};
 				self.in_progress = Some(ReclaimCursor {
-					stack: vec![forest.head],
+					stack: vec![tree.head],
 				});
 			}
 
@@ -91,7 +91,7 @@ impl ReclaimQueue {
 	}
 
 	/// Advance the publication fence after the fully projected viewport has
-	/// been sent. Newly retired forests cannot be reclaimed before this point.
+	/// been sent. Newly retired trees cannot be reclaimed before this point.
 	pub(crate) fn finish_frame(&mut self) {
 		self.eligible.append(&mut self.quarantined);
 	}
@@ -156,7 +156,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_large_forest_waits_for_publication_and_drains_within_budget() {
+	fn a_large_tree_waits_for_publication_and_drains_within_budget() {
 		const LEAVES: usize = RECLAIM_NODES_PER_FRAME + 17;
 		let registry = UastRegistry::new((LEAVES + 1) as u32);
 		let mut chunk = registry
