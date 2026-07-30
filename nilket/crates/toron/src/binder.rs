@@ -211,7 +211,9 @@ pub struct PlannerConfig {
 	pub side_local_filter_routing: bool,
 	/// ADR 518: let reachable-key traces cross a membership semi from its
 	/// preserved side and derive a weaker semi from any nonempty, same-source
-	/// subset of correlation keys. Default off pending the measured receipt.
+	/// subset of correlation keys. Default-on since the ADR 518 receipt: q20
+	/// pairs improved 6,668-6,764 ms against the 3,554 ms floor (the scalar
+	/// aggregate fell 5.48 s → 14 ms), sole engaged cell, every digest held.
 	pub semi_filtered_reachable_keys: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
@@ -247,7 +249,7 @@ impl Default for PlannerConfig {
 			scalar_aggregate_input_reduction: true,
 			membership_first_composition: true,
 			side_local_filter_routing: true,
-			semi_filtered_reachable_keys: false,
+			semi_filtered_reachable_keys: true,
 		}
 	}
 }

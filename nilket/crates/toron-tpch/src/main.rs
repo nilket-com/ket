@@ -6341,7 +6341,7 @@ mod adr518_tests {
 		unsafe { std::env::remove_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS") };
 		assert_eq!(
 			gauge_semi_filtered_reachable_keys().unwrap(),
-			(false, "default")
+			(true, "default")
 		);
 		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "1") };
 		assert_eq!(
