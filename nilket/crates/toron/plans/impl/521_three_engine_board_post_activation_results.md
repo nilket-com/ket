@@ -7,11 +7,21 @@ runs + 1 warmup per engine per cell, join-spill scratch cleared between legs.
 
 References follow the one-thread doctrine for the arbitration columns: DuckDB v1.5.4 pinned via
 `TORON_TPCH_DUCKDB_THREADS=1`, Polars 0.54.4 pinned via `POLARS_MAX_THREADS=1` (the
-`polars-sql-reference` build; the reference engine does not alter the toron engine). The
+`polars-sql-reference` build; the reference engine does not alter the toron engine). These pins
+are **operator/session environment settings, not artifact-verifiable facts**: the stored rows
+carry `duckdb_threads=null` and `polars_max_threads=null` because the current perf rail does
+not persist them — a named harness gap; the rail should record the pins it ran under. The
 machine-parallel DuckDB column is disclosure only — the board's honest comparison remains
 Toron's one-task coordinate against a one-thread reference. Polars rows exist only for its
 ADR 394 capability set ({q01, q03, q06, q14, q19}); the other 17 cells are outside its
 supported grammar and are shown sparse rather than zero.
+
+**What the reference rows prove — and do not.** This snapshot is timing and capability
+evidence, not cross-engine digest-parity evidence: every DuckDB and Polars row carries
+`digest="none"`, and 16 of 22 DuckDB rows in the one-thread sweep carry the informational
+`schema_mismatch` flag (cross-engine type presentation; the DuckDB-only machine-parallel sweep
+computes no comparison flags). Toron-side result identity is adjudicated by its own census and
+correctness rails, not by this board.
 
 Rows are ranked by the absolute toron-minus-duckdb-1t gap, the board's arbitration order.
 
@@ -44,14 +54,20 @@ Rows are ranked by the absolute toron-minus-duckdb-1t gap, the board's arbitrati
 |---|---:|
 | median toron/duckdb ratio | 4.26x |
 | geometric-mean ratio | 4.19x |
-| total board wall, toron | 80.6 s |
-| total board wall, duckdb 1t | 19.0 s |
-| total-wall ratio | 4.24x |
+| sum of per-cell medians, toron | 80.6 s |
+| sum of per-cell medians, duckdb 1t | 19.0 s |
+| summed-median ratio | 4.24x |
+
+The summed-median figures are arithmetic over the 22 per-cell medians, not an observed
+end-to-end wall-clock run.
 
 ## Reading the snapshot
 
-- The trajectory on total wall: roughly 8x before ADR 511, roughly 6.4x after ADR 512, **4.2x
-  here** — the 511-521 arc removed about 70 s of Toron wall at this coordinate.
+- The trajectory — roughly 8x before ADR 511, roughly 6.4x after ADR 512, **4.2x here** — is a
+  **reconstruction from prior receipts** (the pre-511 and post-512 Toron walls from the ADR
+  511-521 receipt chain against this snapshot's reference sums), not a series of homogeneous
+  historical sweeps; only the 4.2x figure is artifact-backed by this snapshot. The 511-521 arc
+  removed about 70 s of summed Toron medians at this coordinate.
 - q13 (ADR 521, activated at this identity) measures 3,060 ms / 2.16x — among the board's best
   cells — with zero default-arm spill; q20 (ADR 518) holds at 2,034 ms / 3.17x.
 - q21 is the only spilling cell left on the board (27,242,808 B) and remains parked pending a
@@ -69,5 +85,9 @@ Rows are ranked by the absolute toron-minus-duckdb-1t gap, the board's arbitrati
 | one-thread three-engine sweep | `target/tpch/board_a1eca4e2_ref1/` |
 | machine-parallel duckdb sweep | `target/tpch/board_a1eca4e2_duckdb_mt/` |
 
-Every row carries `build_commit=a1eca4e2cb61`, `dataset_verification=full_hash`, and both
-budget provenances as `explicit`.
+Every row carries `build_commit=a1eca4e2cb61` and `dataset_verification=full_hash`. The
+explicit 2 GiB memory / 2 GiB spill coordinate applies to **Toron**: its 22 rows record both
+budget provenances as `explicit`. DuckDB is an external reference process that does not consume
+those budgets — its rows record both provenances as `unrecorded`. Polars rows carry the
+`explicit` env provenance but Polars does not enforce these budgets either; the budget
+coordinate constrains only the Toron arm.
