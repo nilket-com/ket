@@ -177,9 +177,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// recombine-shape re-entry in the Join arm; the pass body lives in binder/scalar_reduction.rs.
 	// ADR 515 adds the membership-first commute: its knob and the Join-arm re-entry hook; the
 	// commute body also lives in binder/scalar_reduction.rs.
+	// ADR 517 adds the side-local filter routing knob on `PlannerConfig`; the routing itself
+	// lives at the reassociation site in binder/outer_join_demotion.rs.
 	assert!(
-		lines <= 6_190,
-		"binder root has {lines} lines; expected <= 6,190 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_195,
+		"binder root has {lines} lines; expected <= 6,195 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

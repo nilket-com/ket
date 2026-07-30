@@ -930,8 +930,21 @@ impl<'a> Binder<'a> {
 				&& !self.contains_nested_cross_equi(&right, &right_only).await?
 			{
 				let mut reassociated_residual = residual.clone();
-				reassociated_residual.extend(left_only.iter().cloned());
-				reassociated_residual.extend(right_only.iter().cloned());
+				// ADR 517: a deterministic, pushdown-safe, single-owner conjunct is a
+				// row-level predicate on its branch and commutes with the reassociated
+				// inner spine; route it to its source branch instead of the root
+				// residual. Everything unproven keeps today's residual placement.
+				let mut side_local = Vec::new();
+				for conjunct in left_only.iter().chain(right_only.iter()) {
+					if self.config.side_local_filter_routing
+						&& conjunct.is_deterministic()
+						&& guard_filter_pushdown_safe(conjunct)
+					{
+						side_local.push(conjunct.clone());
+					} else {
+						reassociated_residual.push(conjunct.clone());
+					}
+				}
 				if let Some(join) = self
 					.reassociate_lifted_cross_child(
 						left.clone(),
@@ -941,6 +954,12 @@ impl<'a> Binder<'a> {
 					)
 					.await?
 				{
+					let join = if side_local.is_empty() {
+						join
+					} else {
+						self.push_into_cross_child(join, side_local, &mut reassociated_residual)
+							.await?
+					};
 					return Ok(wrap_residual_filter(join, reassociated_residual));
 				}
 			}
@@ -1388,6 +1407,74 @@ impl<'a> Binder<'a> {
 						input: Box::new(pushed),
 						alias,
 						columns,
+					})
+				}
+				LogicalPlan::Join {
+					left,
+					right,
+					kind: JoinKind::Inner,
+					on,
+					on_filter,
+					null_safe_keys,
+					strategy_intent,
+				} if self.config.side_local_filter_routing => {
+					// ADR 517: complete the ADR 401 side-local rule through inner joins.
+					// An inner join eliminates rows, so descending past it needs the full
+					// fence per conjunct — deterministic, pushdown-safe, and exclusively
+					// single-owner — because a pushed predicate would otherwise evaluate
+					// on rows the join removes. Anything unproven stays residual.
+					let (left_scope, right_scope) = match (
+						self.logical_scope_for_outer_demotion(&left).await?,
+						self.logical_scope_for_outer_demotion(&right).await?,
+					) {
+						(Some(left_scope), Some(right_scope)) => (left_scope, right_scope),
+						_ => {
+							residual.extend(routed_originals(conjuncts));
+							let join = LogicalPlan::Join {
+								left,
+								right,
+								kind: JoinKind::Inner,
+								on,
+								on_filter,
+								null_safe_keys,
+								strategy_intent,
+							};
+							return Ok(join);
+						}
+					};
+					let mut left_routed = Vec::new();
+					let mut right_routed = Vec::new();
+					for conjunct in conjuncts {
+						if !conjunct.routed.is_deterministic()
+							|| !guard_filter_pushdown_safe(&conjunct.routed)
+						{
+							residual.push(conjunct.original);
+							continue;
+						}
+						let sides =
+							conjunct_column_sides(&conjunct.routed, &left_scope, &right_scope);
+						if sides.left && !sides.right && !sides.ambiguous {
+							left_routed.push(conjunct);
+						} else if sides.right && !sides.left && !sides.ambiguous {
+							right_routed.push(conjunct);
+						} else {
+							residual.push(conjunct.original);
+						}
+					}
+					let left = self
+						.push_routed_into_cross_child(*left, left_routed, residual)
+						.await?;
+					let right = self
+						.push_routed_into_cross_child(*right, right_routed, residual)
+						.await?;
+					Ok(LogicalPlan::Join {
+						left: Box::new(left),
+						right: Box::new(right),
+						kind: JoinKind::Inner,
+						on,
+						on_filter,
+						null_safe_keys,
+						strategy_intent,
 					})
 				}
 				other => {

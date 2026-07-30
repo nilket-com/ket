@@ -106,3 +106,25 @@ tree. Both cells' verdicts are reported either way.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+### Phase 0 result — both twins clear the floor; proceed, with the ceiling caveat
+
+The plan's SQL twins proved grammar-unreachable: the prefiltered branch nests a derived table
+inside the queries' existing derived-table wrapper (unsupported construct), and flattening the
+wrapper requires GROUP BY expressions (also unsupported — the wrapper exists because of exactly
+that restriction). The instrument substituted is a **dataset twin**: the same sealed binary and
+original SQL against a full-hash-verified copy of the sf=8 dataset whose `part.parquet` holds
+only the qualifying rows (10,801 for q08's p_type; 87,125 for q09's p_name — matching the
+predicted counts exactly), all other tables shared byte-identically, manifest re-fingerprinted
+with the harness's own fnv1a64 scheme. Twin digests equal the originals on every pair — the
+semantic identity is proven, not assumed. No engine code was touched.
+
+| cell | pair deltas (orig − twin) | median | floor | verdict |
+|---|---|---:|---:|---|
+| q08 | 3,983.1 / 3,948.1 / 3,766.2 / 3,793.7 / 3,750.3 ms | **+3,793.7 ms** | 3,554 | CLEARS |
+| q09 | 3,996.7 / 3,919.7 / 3,888.7 / 3,943.4 / 3,931.1 ms | **+3,931.1 ms** | 3,554 | CLEARS |
+
+Stated conservatively before the mechanism: the dataset twin is a slightly **generous ceiling** —
+it also shrinks the part scan itself, which filter routing keeps as a full scan plus a (likely
+scan-pushed) predicate. With medians only 6.7% / 10.6% above the floor, the cohorts may still
+close below it; that outcome remains priced in and honest. Phase 0 authorizes proceeding.

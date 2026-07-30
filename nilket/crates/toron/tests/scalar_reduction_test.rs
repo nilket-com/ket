@@ -247,11 +247,19 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	catalog
 		.register_descriptor(TableId(3), descriptor(3, "gagg", gagg.as_ref()))
 		.expect("register gagg");
+	let bridge = bridge_schema();
+	catalog
+		.register_descriptor(TableId(4), descriptor(4, "bridge", bridge.as_ref()))
+		.expect("register bridge");
+	let bridge_batch =
+		RecordBatch::try_new(bridge.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+			.expect("bridge batch");
 	let storage = Arc::new(FixtureScan {
 		batches: HashMap::from([
 			(TableId(1), fact_batch(fact)),
 			(TableId(2), src_batch(src)),
 			(TableId(3), gagg_batch(gagg)),
+			(TableId(4), bridge_batch),
 		]),
 	});
 	(catalog, storage)
@@ -261,6 +269,7 @@ fn fact_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("f_pid", DataType::Int64, true),
 		Field::new("f_qty", DataType::Float64, false),
+		Field::new("f_bid", DataType::Int64, false),
 	]))
 }
 
@@ -268,7 +277,16 @@ fn src_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("s_pid", DataType::Int64, true),
 		Field::new("s_cat", DataType::Utf8, false),
+		Field::new("s_tag", DataType::Utf8, true),
 	]))
+}
+
+fn bridge_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![Field::new(
+		"b_id",
+		DataType::Int64,
+		false,
+	)]))
 }
 
 fn gagg_schema() -> SchemaRef {
@@ -292,6 +310,7 @@ fn fact_batch(schema: SchemaRef) -> RecordBatch {
 				Some(9),
 			])),
 			Arc::new(Float64Array::from(vec![10.0, 50.0, 200.0, 7.0, 5.0])),
+			Arc::new(Int64Array::from(vec![1, 1, 1, 1, 2])),
 		],
 	)
 	.expect("fact batch")
@@ -302,8 +321,21 @@ fn src_batch(schema: SchemaRef) -> RecordBatch {
 	RecordBatch::try_new(
 		schema,
 		vec![
-			Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), None])),
-			Arc::new(StringArray::from(vec!["X", "X", "Y", "X"])),
+			Arc::new(Int64Array::from(vec![
+				Some(1),
+				Some(2),
+				Some(3),
+				None,
+				Some(5_000_000_000),
+			])),
+			Arc::new(StringArray::from(vec!["X", "X", "Y", "X", "X"])),
+			Arc::new(StringArray::from(vec![
+				Some("X"),
+				None,
+				Some("Y"),
+				Some("X"),
+				Some("X"),
+			])),
 		],
 	)
 	.expect("src batch")
@@ -489,6 +521,80 @@ async fn membership_commute_onto_fanout_branch_is_equivalent_body() {
 		results.push(collect_f64(&batches));
 	}
 	assert_eq!(results[0], results[1]);
+}
+
+// ADR 517 semantic battery: side-local filter routing through comma-join
+// reassociation must be invisible in results. The 4-table comma shape (two
+// equis bridging the crossed src×bridge pair) is the shape whose left_only
+// conjuncts reach the reassociation site instead of the plain push path.
+async fn adr517_arms(sql: &str) -> (Vec<Option<u64>>, Vec<Option<u64>>, bool) {
+	let logical = SqlPlanner::new().plan(sql).expect("plan adr517 sql");
+	let (catalog, storage) = fixture();
+	let mut results = Vec::new();
+	let mut plans = Vec::new();
+	for routing in [false, true] {
+		let mut config = PlannerConfig::default();
+		config.side_local_filter_routing = routing;
+		let bound = bind(&logical, &catalog, &config).await.expect("bind");
+		plans.push(format!("{bound:?}"));
+		let executor = Executor::new(Arc::clone(&storage) as Arc<dyn StorageScan>);
+		let batches = executor.execute_bound(&bound, None).await.expect("execute");
+		results.push(collect_f64(&batches));
+	}
+	let on = results.pop().expect("on arm");
+	let off = results.pop().expect("off arm");
+	(off, on, plans[0] == plans[1])
+}
+
+#[tokio::test]
+async fn adr517_routing_is_equivalent_with_nulls_and_duplicates() {
+	// s_tag carries a NULL (unknown eliminates identically on either side),
+	// fact fans out pid 1 twice, and gagg duplicates g_pid 1 (duplicate join
+	// matches) — bag multiplicity must survive the routed placement.
+	let sql = "SELECT SUM(x) FROM ( \
+		   SELECT f_qty AS x FROM src, bridge, fact, gagg \
+		   WHERE s_pid = f_pid AND b_id = f_bid AND f_pid = g_pid \
+		     AND s_tag = 'X' \
+		 ) AS t";
+	let (off, on, plans_equal) = adr517_arms(sql).await;
+	assert!(!plans_equal, "the routed arm must bind a distinct plan");
+	assert_eq!(off, on, "routing must not change results");
+	assert_eq!(off.len(), 1, "one aggregate row");
+	assert!(
+		off[0].is_some(),
+		"the qualifying rows must survive both arms"
+	);
+}
+
+#[tokio::test]
+async fn adr517_routing_always_false_is_equivalent() {
+	// An always-false side-local predicate: empty branch on the routed arm vs
+	// empty residual result on the off arm — identical either way.
+	let sql = "SELECT SUM(x) FROM ( \
+		   SELECT f_qty AS x FROM src, bridge, fact, gagg \
+		   WHERE s_pid = f_pid AND b_id = f_bid AND f_pid = g_pid \
+		     AND s_tag = 'ZZZ' \
+		 ) AS t";
+	let (off, on, _) = adr517_arms(sql).await;
+	assert_eq!(off, on, "empty branch and empty result must agree");
+}
+
+#[tokio::test]
+async fn adr517_error_fence_predicate_stays_residual() {
+	// src holds s_pid 5_000_000_000 — castable to INT only with an error, and
+	// joined away by fact. Residual evaluation never sees the row; a routed
+	// (pushed) evaluation would error before the join eliminates it. The
+	// strict-cast fence must keep the predicate residual on BOTH arms: the
+	// plans stay byte-identical and both arms execute cleanly.
+	let sql = "SELECT SUM(x) FROM ( \
+		   SELECT f_qty AS x FROM src, bridge, fact, gagg \
+		   WHERE s_pid = f_pid AND b_id = f_bid AND f_pid = g_pid \
+		     AND CAST(s_pid AS INT) = 1 \
+		 ) AS t";
+	let (off, on, plans_equal) = adr517_arms(sql).await;
+	assert!(plans_equal, "the fence must decline byte-identically");
+	assert_eq!(off, on, "declined predicate must behave as today");
+	assert!(off[0].is_some(), "pid 1 rows must survive both arms");
 }
 
 fn first_join_kind(plan: &ExecutionPlan) -> Option<JoinKind> {

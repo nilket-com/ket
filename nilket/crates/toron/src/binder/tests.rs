@@ -26603,3 +26603,160 @@ fn adr515_outer_join_on_path_declines_commute() {
 		.join()
 		.expect("outer-path thread panicked");
 }
+
+fn adr517_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	for (id, table, pk, fields) in [
+		(
+			70u8,
+			"part",
+			"p_partkey",
+			vec![
+				("p_partkey", DataType::Int64),
+				("p_type", DataType::Utf8),
+				("p_size", DataType::Int64),
+			],
+		),
+		(
+			71,
+			"lineitem",
+			"l_orderkey",
+			vec![
+				("l_orderkey", DataType::Int64),
+				("l_partkey", DataType::Int64),
+				("l_suppkey", DataType::Int64),
+				("l_quantity", DataType::Float64),
+			],
+		),
+		(
+			73,
+			"supplier",
+			"s_suppkey",
+			vec![("s_suppkey", DataType::Int64)],
+		),
+		(
+			72,
+			"orders",
+			"o_orderkey",
+			vec![
+				("o_orderkey", DataType::Int64),
+				("o_totalprice", DataType::Float64),
+			],
+		),
+	] {
+		let schema = Schema::new(
+			fields
+				.into_iter()
+				.map(|(name, ty)| Field::new(name, ty, false))
+				.collect::<Vec<_>>(),
+		);
+		catalog
+			.register_descriptor(TableId(id.into()), adr511_descriptor(id, table, pk, schema))
+			.expect("register");
+	}
+	catalog
+}
+
+fn adr517_part_scan_receipts(trace: &OptimizerTrace) -> usize {
+	trace
+		.scan_filter_decisions
+		.iter()
+		.filter(|receipt| receipt.target.table_id == Some(TableId(70)))
+		.count()
+}
+
+#[test]
+fn adr517_side_local_filter_routes_to_part_branch() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr517_catalog();
+				// Left-cross orientation (part first) and right-cross (part last):
+				// the side-local predicate must reach the part scan in both.
+				// The derived-table wrapper is load-bearing: it is q08/q09's true
+				// shape, and it is where the reassociation path (not the plain
+				// push path) owns the conjunct placement.
+				for sql in [
+					"SELECT SUM(x) FROM ( \
+					   SELECT l_quantity AS x FROM part, supplier, lineitem, orders \
+					   WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey \
+					     AND l_orderkey = o_orderkey \
+					     AND p_type = 'ECONOMY ANODIZED STEEL' \
+					 ) AS t",
+					"SELECT SUM(x) FROM ( \
+					   SELECT l_quantity AS x FROM supplier, part, lineitem, orders \
+					   WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey \
+					     AND l_orderkey = o_orderkey \
+					     AND p_type = 'ECONOMY ANODIZED STEEL' \
+					 ) AS t",
+				] {
+					let logical = SqlPlanner::new().plan(sql).expect("plan comma shape");
+					let mut config = PlannerConfig::default();
+					config.side_local_filter_routing = true;
+					let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+						.await
+						.expect("bind routed");
+					assert_eq!(
+						adr517_part_scan_receipts(&trace),
+						1,
+						"the routed predicate reaches the part scan exactly once: {sql}"
+					);
+
+					config.side_local_filter_routing = false;
+					let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+						.await
+						.expect("bind unrouted");
+					assert_eq!(
+						adr517_part_scan_receipts(&trace),
+						0,
+						"knob off keeps the residual placement: {sql}"
+					);
+				}
+			});
+		})
+		.expect("spawn routing thread")
+		.join()
+		.expect("routing thread panicked");
+}
+
+#[test]
+fn adr517_unsafe_predicates_stay_residual() {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr517_catalog();
+				// A strict cast can error on rows the join would eliminate; the
+				// pushdown-safety fence must keep it residual even with the knob on.
+				let sql = "SELECT SUM(x) FROM ( \
+					   SELECT l_quantity AS x FROM part, supplier, lineitem, orders \
+					   WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey \
+					     AND l_orderkey = o_orderkey \
+					     AND CAST(p_size AS INT) = 5 \
+					 ) AS t";
+				let logical = SqlPlanner::new().plan(sql).expect("plan strict-cast shape");
+				let mut config = PlannerConfig::default();
+				config.side_local_filter_routing = true;
+				let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind strict-cast shape");
+				assert_eq!(
+					adr517_part_scan_receipts(&trace),
+					0,
+					"a strict cast must not descend past the inner joins"
+				);
+			});
+		})
+		.expect("spawn fence thread")
+		.join()
+		.expect("fence thread panicked");
+}

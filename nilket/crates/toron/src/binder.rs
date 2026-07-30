@@ -202,6 +202,11 @@ pub struct PlannerConfig {
 	/// 12,098-12,949 ms against the 3,554 ms floor, the 989,777,032 B spill
 	/// vanished, q18 was the only engaged cell, and every digest held.
 	pub membership_first_composition: bool,
+	/// ADR 517: complete the ADR 401 side-local rule through inner joins — a
+	/// deterministic, pushdown-safe, single-owner conjunct is a row-level
+	/// predicate on its branch and commutes with an inner join; everything
+	/// else stays residual. Default false until the ADR 517 paired receipt.
+	pub side_local_filter_routing: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -235,6 +240,7 @@ impl Default for PlannerConfig {
 			filtered_build_side_swap: true,
 			scalar_aggregate_input_reduction: true,
 			membership_first_composition: true,
+			side_local_filter_routing: false,
 		}
 	}
 }
