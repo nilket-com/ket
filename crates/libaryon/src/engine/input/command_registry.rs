@@ -422,8 +422,8 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		completion: ArgCompletion::Path,
 		category: CommandCategory::Panes,
 		usage: ":uastdot [PATH]",
-		summary: "Render bounded UAST Graphviz DOT",
-		help: "Opens DOT source for the focused document or writes it atomically to PATH. The graph is bounded by the same no-I/O snapshot contract as :uast.",
+		summary: "Open the live UAST graph or export DOT",
+		help: "Without a path, opens the bounded live graphical UAST inspector. With PATH, writes Graphviz DOT atomically. Both routes use the same metadata-only, no-I/O snapshot contract as :uast.",
 		dispatch: DispatchKind::Exact(cmd_uast_dot),
 	},
 	CommandSpec {
@@ -960,8 +960,14 @@ fn cmd_treap(ctx: &mut CommandCtx<'_>, _inv: Invocation<'_>) {
 }
 
 fn cmd_uast_dot(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	if inv.args.trim().is_empty() {
+		ctx.send(EditorCommand::OpenUastInspector {
+			mode: Some(UastInspectorMode::Graph),
+		});
+		return;
+	}
 	ctx.send(EditorCommand::ExportUastDot {
-		path: (!inv.args.trim().is_empty()).then(|| expand_path_arg(inv.args)),
+		path: Some(expand_path_arg(inv.args)),
 	});
 }
 
@@ -1620,6 +1626,17 @@ mod tests {
 				))
 			}]
 		));
+
+		for invocation in ["uast graph", "uast dotviz", "uastdot", "astdot"] {
+			let (_, commands, status, _) = dispatch(invocation, None);
+			assert_eq!(status, None);
+			assert!(matches!(
+				commands.as_slice(),
+				[EditorCommand::OpenUastInspector {
+					mode: Some(UastInspectorMode::Graph)
+				}]
+			));
+		}
 
 		let (_, commands, status, _) = dispatch("uastdot tree.dot", None);
 		assert_eq!(status, None);
