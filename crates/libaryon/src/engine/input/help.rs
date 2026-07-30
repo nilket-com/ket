@@ -963,7 +963,14 @@ fn push_markdown_command_tables(out: &mut String, runtime_commands: &[EffectiveC
 					.collect();
 				summary.push_str(&format!(" ({})", aliases.join(", ")));
 			}
-			push_line(out, &format!("| `{}` | {} |", spec.usage, summary));
+			push_line(
+				out,
+				&format!(
+					"| `{}` | {} |",
+					markdown_table_cell(spec.usage),
+					markdown_table_cell(&summary)
+				),
+			);
 		}
 	}
 	if !runtime_commands.is_empty() {
@@ -982,7 +989,14 @@ fn push_markdown_command_tables(out: &mut String, runtime_commands: &[EffectiveC
 					.collect::<Vec<_>>();
 				summary.push_str(&format!(" ({})", aliases.join(", ")));
 			}
-			push_line(out, &format!("| `{}` | {} |", command.usage, summary));
+			push_line(
+				out,
+				&format!(
+					"| `{}` | {} |",
+					markdown_table_cell(&command.usage),
+					markdown_table_cell(&summary)
+				),
+			);
 		}
 	}
 }
@@ -1552,6 +1566,10 @@ fn push_line(out: &mut String, line: &str) {
 	out.push('\n');
 }
 
+fn markdown_table_cell(text: &str) -> String {
+	text.replace('|', "\\|")
+}
+
 /// Append a two-column table, aligning the second column after the widest
 /// entry in the first.
 fn push_table(out: &mut String, rows: &[(String, String)]) {
@@ -1691,6 +1709,25 @@ mod tests {
 				spec.name
 			);
 		}
+	}
+
+	#[test]
+	fn command_usages_with_pipes_remain_single_markdown_code_cells() {
+		let rendered = markdown_commands();
+		assert!(rendered.contains("`:panediff [PATH\\|REV]`"));
+		assert!(rendered.contains("`:diffstep older\\|newer\\|N`"));
+
+		let code_spans = pulldown_cmark::Parser::new_ext(
+			&rendered,
+			pulldown_cmark::Options::ENABLE_TABLES,
+		)
+		.filter_map(|event| match event {
+			pulldown_cmark::Event::Code(code) => Some(code.into_string()),
+			_ => None,
+		})
+		.collect::<HashSet<_>>();
+		assert!(code_spans.contains(":panediff [PATH|REV]"));
+		assert!(code_spans.contains(":diffstep older|newer|N"));
 	}
 
 	#[test]
@@ -1939,7 +1976,7 @@ mod tests {
 		let rendered = render_markdown(&topic("overview"));
 		for spec in COMMANDS {
 			assert!(
-				rendered.contains(&spec.usage.to_string()),
+				rendered.contains(&markdown_table_cell(spec.usage)),
 				"markdown overview is missing {}",
 				spec.usage
 			);
