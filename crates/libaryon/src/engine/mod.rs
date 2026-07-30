@@ -6,6 +6,7 @@ mod event_bus;
 mod event_subscribers;
 mod file_browser;
 mod folding;
+mod fuzzy_search;
 mod git;
 mod git_observer;
 mod host;
@@ -68,8 +69,8 @@ pub use self::minimap::{
 pub use self::protocol::{
 	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
 	GitRefreshMode, MouseIntent, MoveDirection, PaneDropEdge, PaneFocusDirection,
-	PaneResizeDirection, SecretInput, SplitDirection, SubstituteFlags, VerticalDirection,
-	UastInspectorMode, VisualKind, WordMotion,
+	PaneResizeDirection, PickerAction, PickerCursorMovement, SecretInput, SplitDirection,
+	SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};

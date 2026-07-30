@@ -30,8 +30,15 @@ use super::file_browser::{
 	collapse_selected_browser_entry_or_parent, create_file_browser_buffer, initialize_file_browser,
 	refresh_file_browser,
 };
+use super::fuzzy_search::{
+	LiveFileSnapshot, PickerOrigin, RepoSearchBatch, RepoSearchRequest, SearchSourceStamp,
+	query_column, spawn_search_debounce, spawn_search_task,
+};
 use super::git_observer::GitRefreshController;
-use super::input::{InputContext, InputDispatch};
+use super::input::{
+	InputContext, InputDispatch, PromptCursorMovement, backspace_at_prompt_cursor,
+	delete_at_prompt_cursor, insert_at_prompt_cursor, move_prompt_cursor,
+};
 use super::jobs::{JobCompletion, JobDispatcher, JobInvocation, JobSpec, MAX_JOB_DELIVERY_STEPS};
 use super::language::{DefinitionLocation, DefinitionResult};
 use super::markdown_image_preview::{
@@ -40,7 +47,8 @@ use super::markdown_image_preview::{
 };
 use super::navigation::{GotoDefinitionRequest, JumpEntry, NavigationResolved, NavigationStamp};
 use super::protocol::{
-	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, SplitDirection,
+	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, PickerAction,
+	PickerCursorMovement, SplitDirection,
 };
 use super::render::{RenderParams, render_frame};
 use super::request::{EngineRequest, InternalEvent};
@@ -58,12 +66,13 @@ use super::session::{
 use super::settings::SaveDurability;
 use super::shadow::{ShadowSession, discard_shadow_session};
 use super::ui_colors::UiColorKey;
-use crate::core::{BufferId, DocByte, DocLine, PaneId, RequestId, StateId};
+use crate::core::{BufferId, DocByte, DocDisplayCol, DocLine, PaneId, RequestId, StateId};
 use crate::ecs::UastRegistry;
 use crate::svp::SvpResolver;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -1067,6 +1076,7 @@ fn current_input_context(registry: &UastRegistry, session: &EditorSession) -> In
 		.and_then(|root| super::support::line_start_byte_sparse(registry, root, cursor_line).ok())
 		.unwrap_or(cursor_abs_byte);
 	InputContext {
+		is_picker: session.picker.is_some(),
 		is_file_browser: view.is_file_browser(),
 		is_uast_inspector: session.uast_inspectors.contains_key(&view.buffer_id),
 		is_host_panel: view.is_host_panel(),
@@ -1250,6 +1260,495 @@ fn focused_git_repo_root(session: &mut EditorSession) -> Option<PathBuf> {
 		Some(path) => session.git_branch_cache.repo_root_for_path(&path),
 		None => session.git_branch_cache.repo_root_for_current_dir(),
 	}
+}
+
+fn picker_origin(session: &EditorSession) -> Result<PickerOrigin, String> {
+	let pane_id = session.focused_pane_id;
+	let view = focused_doctab(&session.layout, pane_id);
+	let document = session
+		.buffers
+		.get(view.buffer_id)
+		.and_then(|buffer| buffer.text())
+		.ok_or_else(|| "Repository search requires an editable text view".to_string())?;
+	let ViewContent::Text(text) = &view.content else {
+		return Err("Repository search requires an editable text view".to_string());
+	};
+	Ok(PickerOrigin {
+		pane_id,
+		view_id: view.id,
+		buffer_id: view.buffer_id,
+		root: document.root_id,
+		state_id: document.ledger.current_state_id,
+		cursor: text.cursor.primary().byte(),
+	})
+}
+
+fn live_file_snapshots(
+	runtime: &RuntimeContext<'_>,
+	session: &EditorSession,
+) -> Result<Vec<LiveFileSnapshot>, String> {
+	let mut snapshots = Vec::new();
+	for (buffer_id, buffer) in session.buffers.iter() {
+		let Some(document) = buffer.text() else {
+			continue;
+		};
+		let Some(canonical) = document.canonical_path() else {
+			continue;
+		};
+		let total_bytes = runtime.registry.get_total_bytes(document.root_id);
+		let bytes = if total_bytes >= super::MAX_SEMANTIC_BYTES {
+			None
+		} else {
+			Some(
+				read_document_snapshot(
+					runtime.registry,
+					document.root_id,
+					document.backing_path.as_deref().map(Path::new),
+				)
+				.map_err(|error| {
+					format!(
+						"Unable to snapshot open file {} for search: {error}",
+						canonical.as_path().display()
+					)
+				})?,
+			)
+		};
+		snapshots.push(LiveFileSnapshot {
+			path: canonical.as_path().to_path_buf(),
+			bytes,
+			stamp: SearchSourceStamp {
+				buffer_id,
+				root: document.root_id,
+				state_id: document.ledger.current_state_id,
+			},
+		});
+	}
+	Ok(snapshots)
+}
+
+fn schedule_picker_search(
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+) -> Result<(), String> {
+	let generation = session.next_picker_generation;
+	session.next_picker_generation = session
+		.next_picker_generation
+		.checked_add(1)
+		.expect("fuzzy-search generation exhausted");
+	let cancel = {
+		let picker = session
+			.picker
+			.as_mut()
+			.ok_or_else(|| "Repository search picker is not open".to_string())?;
+		picker.begin_generation(generation);
+		if picker.query.is_empty() {
+			return Ok(());
+		}
+		let cancel = Arc::new(AtomicBool::new(false));
+		picker.cancel = Some(cancel.clone());
+		cancel
+	};
+	spawn_search_debounce(generation, cancel, internal.clone())
+}
+
+fn launch_picker_search(
+	runtime: &RuntimeContext<'_>,
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+	generation: u64,
+) -> bool {
+	let Some((query, cancel)) = session.picker.as_ref().and_then(|picker| {
+		(picker.generation == generation && !picker.query.is_empty())
+			.then(|| (picker.query.clone(), picker.cancel.clone()))
+	}) else {
+		return false;
+	};
+	let Some(cancel) = cancel else {
+		return false;
+	};
+	if cancel.load(std::sync::atomic::Ordering::Acquire) {
+		return false;
+	}
+	let anchor = focused_git_path(session)
+		.or_else(|| std::env::current_dir().ok())
+		.unwrap_or_else(|| PathBuf::from("."));
+	let live_files = match live_file_snapshots(runtime, session) {
+		Ok(files) => files,
+		Err(error) => {
+			if let Some(picker) = session.picker.as_mut() {
+				picker.cancel_active();
+			}
+			session.ui.status_message = Some(error);
+			return true;
+		}
+	};
+	let result = spawn_search_task(
+		RepoSearchRequest {
+			generation,
+			query,
+			anchor,
+			live_files,
+			cancel,
+			files_walked: Arc::new(AtomicU64::new(0)),
+		},
+		internal.clone(),
+	);
+	if let Err(error) = result {
+		if let Some(picker) = session.picker.as_mut() {
+			picker.cancel_active();
+		}
+		session.ui.status_message = Some(error);
+	}
+	true
+}
+
+fn open_fuzzy_repo_search(
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+	query: String,
+) -> bool {
+	let origin = match picker_origin(session) {
+		Ok(origin) => origin,
+		Err(error) => {
+			session.ui.status_message = Some(error);
+			return true;
+		}
+	};
+	session.picker = Some(super::fuzzy_search::PickerState::new(query, origin));
+	session.ui.status_message = None;
+	if let Err(error) = schedule_picker_search(internal, session) {
+		if let Some(picker) = session.picker.as_mut() {
+			picker.cancel_active();
+		}
+		session.ui.status_message = Some(error);
+	}
+	true
+}
+
+fn apply_fuzzy_search_batch(session: &mut EditorSession, batch: RepoSearchBatch) -> bool {
+	session
+		.picker
+		.as_mut()
+		.is_some_and(|picker| picker.apply_batch(batch))
+}
+
+fn resolve_picker_line(
+	bytes: &[u8],
+	line: DocLine,
+	query: &str,
+) -> Option<(DocByte, DocDisplayCol)> {
+	let text = std::str::from_utf8(bytes).ok()?;
+	let mut line_start = 0usize;
+	for (line_index, segment) in text.split_inclusive('\n').enumerate() {
+		if line_index as u64 == line.get() {
+			let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
+			let line_text = without_newline
+				.strip_suffix('\r')
+				.unwrap_or(without_newline);
+			let (column_byte, display_column) = query_column(query, line_text)?;
+			return Some((
+				DocByte::new(line_start.saturating_add(column_byte) as u64),
+				display_column,
+			));
+		}
+		line_start = line_start.saturating_add(segment.len());
+	}
+	None
+}
+
+fn resolve_picker_match_in_buffer(
+	runtime: &RuntimeContext<'_>,
+	session: &EditorSession,
+	buffer_id: BufferId,
+	line: DocLine,
+	query: &str,
+) -> Result<Option<(DocByte, DocDisplayCol)>, String> {
+	let document = session
+		.buffers
+		.get(buffer_id)
+		.and_then(|buffer| buffer.text())
+		.ok_or_else(|| "Search target is not editable text".to_string())?;
+	let bytes = read_document_snapshot(
+		runtime.registry,
+		document.root_id,
+		document.backing_path.as_deref().map(Path::new),
+	)
+	.map_err(|error| format!("Unable to read search target: {error}"))?;
+	Ok(resolve_picker_line(&bytes, line, query))
+}
+
+fn picker_origin_is_current(session: &EditorSession, origin: PickerOrigin) -> bool {
+	session
+		.layout
+		.find_view(origin.view_id)
+		.is_some_and(|view| view.buffer_id == origin.buffer_id)
+		&& session
+			.buffers
+			.get(origin.buffer_id)
+			.and_then(|buffer| buffer.text())
+			.is_some_and(|document| {
+				document.root_id == origin.root
+					&& document.ledger.current_state_id == origin.state_id
+			})
+}
+
+fn stale_picker_result(
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+	message: String,
+) -> bool {
+	session.ui.status_message = Some(message);
+	if let Err(error) = schedule_picker_search(internal, session) {
+		session.ui.status_message = Some(error);
+	}
+	true
+}
+
+fn accept_picker_result(
+	runtime: &RuntimeContext<'_>,
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+) -> bool {
+	let Some((origin, query, result)) = session.picker.as_ref().and_then(|picker| {
+		picker
+			.results
+			.get(picker.selected)
+			.cloned()
+			.map(|result| (picker.origin, picker.query.clone(), result))
+	}) else {
+		session.ui.status_message = Some("No repository search result selected".to_string());
+		return true;
+	};
+	if !picker_origin_is_current(session, origin) {
+		session.ui.status_message =
+			Some("Search jump discarded: the source document changed".to_string());
+		session.picker.take();
+		return true;
+	}
+
+	let canonical = match CanonicalPath::resolve(&result.path) {
+		Ok(path) => path,
+		Err(error) => {
+			session.ui.status_message = Some(error);
+			return true;
+		}
+	};
+	let target_buffer = session.buffers.buffer_for_path(&canonical);
+
+	if let Some(target_buffer) = target_buffer {
+		let target_view = if target_buffer == origin.buffer_id {
+			Some(origin.view_id)
+		} else {
+			session.layout.view_id_for_buffer(target_buffer)
+		};
+		let target = match resolve_picker_match_in_buffer(
+			runtime,
+			session,
+			target_buffer,
+			result.line,
+			&query,
+		) {
+			Ok(Some(target)) => target,
+			Ok(None) => {
+				return stale_picker_result(
+					internal,
+					session,
+					"Search result changed; refreshed matches".to_string(),
+				);
+			}
+			Err(error) => {
+				session.ui.status_message = Some(error);
+				return true;
+			}
+		};
+		if let Some(target_view) = target_view {
+			record_navigation_origin(
+				runtime,
+				session,
+				origin.buffer_id,
+				origin.view_id,
+				origin.root,
+				origin.state_id,
+				origin.cursor,
+				None,
+			);
+			set_view_cursor(session, target_view, target.0);
+			if let Some(pane_id) = session.layout.pane_id_for_view(target_view) {
+				if let Some(pane) = session.layout.find_pane_mut(pane_id) {
+					pane.activate_view(target_view);
+				}
+				session.focus_pane(pane_id);
+			}
+		} else {
+			if session
+				.buffers
+				.get(origin.buffer_id)
+				.is_some_and(|buffer| buffer.is_dirty())
+			{
+				session.ui.status_message = Some(
+					"Search result is in another file; write or discard source changes first"
+						.to_string(),
+				);
+				return true;
+			}
+			record_navigation_origin(
+				runtime,
+				session,
+				origin.buffer_id,
+				origin.view_id,
+				origin.root,
+				origin.state_id,
+				origin.cursor,
+				Some(target_buffer),
+			);
+			if let Err(error) =
+				retarget_text_view(runtime, session, origin.view_id, target_buffer)
+			{
+				session.ui.status_message = Some(error);
+				return true;
+			}
+			set_view_cursor(session, origin.view_id, target.0);
+			session.focus_pane(origin.pane_id);
+		}
+	} else {
+		if session
+			.buffers
+			.get(origin.buffer_id)
+			.is_some_and(|buffer| buffer.is_dirty())
+		{
+			session.ui.status_message = Some(
+				"Search result is in another file; write or discard source changes first"
+					.to_string(),
+			);
+			return true;
+		}
+		let (target_buffer, _) = match resolve_or_load_buffer(
+			runtime,
+			session,
+			canonical.as_path().display().to_string(),
+		) {
+			Ok(target) => target,
+			Err(error) => {
+				session.ui.status_message =
+					Some(format!("Unable to open search result: {error}"));
+				return true;
+			}
+		};
+		let target = match resolve_picker_match_in_buffer(
+			runtime,
+			session,
+			target_buffer,
+			result.line,
+			&query,
+		) {
+			Ok(Some(target)) => target,
+			Ok(None) => {
+				if session.layout.view_count_for_buffer(target_buffer) == 0 {
+					release_buffer(runtime, session, target_buffer);
+				}
+				return stale_picker_result(
+					internal,
+					session,
+					"Search result changed; refreshed matches".to_string(),
+				);
+			}
+			Err(error) => {
+				if session.layout.view_count_for_buffer(target_buffer) == 0 {
+					release_buffer(runtime, session, target_buffer);
+				}
+				session.ui.status_message = Some(error);
+				return true;
+			}
+		};
+		record_navigation_origin(
+			runtime,
+			session,
+			origin.buffer_id,
+			origin.view_id,
+			origin.root,
+			origin.state_id,
+			origin.cursor,
+			Some(target_buffer),
+		);
+		if let Err(error) =
+			retarget_text_view(runtime, session, origin.view_id, target_buffer)
+		{
+			session.ui.status_message = Some(error);
+			return true;
+		}
+		set_view_cursor(session, origin.view_id, target.0);
+		session.focus_pane(origin.pane_id);
+	}
+
+	session.picker.take();
+	session.ui.status_message = Some(format!(
+		"{}:{}:{}",
+		result.display_path,
+		result.line.get().saturating_add(1),
+		result.col.get().saturating_add(1)
+	));
+	reset_global_transients(session);
+	true
+}
+
+fn apply_picker_action(
+	runtime: &RuntimeContext<'_>,
+	internal: &super::request::InternalSender,
+	session: &mut EditorSession,
+	action: PickerAction,
+) -> bool {
+	if session.picker.is_none() {
+		return false;
+	}
+	match action {
+		PickerAction::Cancel => {
+			session.picker.take();
+			session.ui.status_message = None;
+		}
+		PickerAction::Accept => return accept_picker_result(runtime, internal, session),
+		PickerAction::MoveSelection(delta) => {
+			session
+				.picker
+				.as_mut()
+				.expect("picker checked above")
+				.move_selection(delta);
+		}
+		PickerAction::Insert(text) => {
+			let picker = session.picker.as_mut().expect("picker checked above");
+			insert_at_prompt_cursor(&mut picker.query, &mut picker.query_cursor, &text);
+			session.ui.status_message = None;
+			if let Err(error) = schedule_picker_search(internal, session) {
+				session.ui.status_message = Some(error);
+			}
+		}
+		PickerAction::Backspace => {
+			let picker = session.picker.as_mut().expect("picker checked above");
+			backspace_at_prompt_cursor(&mut picker.query, &mut picker.query_cursor);
+			session.ui.status_message = None;
+			if let Err(error) = schedule_picker_search(internal, session) {
+				session.ui.status_message = Some(error);
+			}
+		}
+		PickerAction::Delete => {
+			let picker = session.picker.as_mut().expect("picker checked above");
+			delete_at_prompt_cursor(&mut picker.query, &mut picker.query_cursor);
+			session.ui.status_message = None;
+			if let Err(error) = schedule_picker_search(internal, session) {
+				session.ui.status_message = Some(error);
+			}
+		}
+		PickerAction::MoveCursor(movement) => {
+			let movement = match movement {
+				PickerCursorMovement::Left => PromptCursorMovement::Left,
+				PickerCursorMovement::Right => PromptCursorMovement::Right,
+				PickerCursorMovement::Home => PromptCursorMovement::Home,
+				PickerCursorMovement::End => PromptCursorMovement::End,
+			};
+			let picker = session.picker.as_mut().expect("picker checked above");
+			move_prompt_cursor(&picker.query, &mut picker.query_cursor, movement);
+		}
+	}
+	true
 }
 
 fn with_focused_text_buffer_mut<R>(
@@ -2064,16 +2563,21 @@ fn discard_jump_entries(
 	}
 }
 
-fn record_definition_origin(
+#[allow(clippy::too_many_arguments)]
+fn record_navigation_origin(
 	runtime: &RuntimeContext<'_>,
 	session: &mut EditorSession,
-	stamp: NavigationStamp,
+	buffer_id: BufferId,
+	view_id: crate::core::ViewId,
+	root: crate::ecs::NodeId,
+	state_id: StateId,
+	cursor: DocByte,
 	protected_buffer: Option<BufferId>,
 ) {
 	let duplicate = session
 		.jump_history
 		.newest_back()
-		.filter(|entry| entry.buffer_id == stamp.buffer_id)
+		.filter(|entry| entry.buffer_id == buffer_id)
 		.and_then(|entry| {
 			session
 				.buffers
@@ -2082,9 +2586,7 @@ fn record_definition_origin(
 				.and_then(|document| document.navigation_anchors.get(entry.anchor_id))
 		})
 		.is_some_and(|saved| {
-			saved.root == stamp.root
-				&& saved.state_id == stamp.state_id
-				&& saved.anchor.byte == stamp.cursor
+			saved.root == root && saved.state_id == state_id && saved.anchor.byte == cursor
 		});
 	if duplicate {
 		let removed = session.jump_history.clear_forward();
@@ -2093,17 +2595,17 @@ fn record_definition_origin(
 	}
 	let Some(document) = session
 		.buffers
-		.get_mut(stamp.buffer_id)
+		.get_mut(buffer_id)
 		.and_then(|buffer| buffer.text_mut())
 	else {
 		return;
 	};
 	let anchor_id = document
 		.navigation_anchors
-		.insert(stamp.root, stamp.state_id, stamp.cursor);
+		.insert(root, state_id, cursor);
 	let removed = session.jump_history.record_back(JumpEntry {
-		buffer_id: stamp.buffer_id,
-		preferred_view_id: stamp.view_id,
+		buffer_id,
+		preferred_view_id: view_id,
 		anchor_id,
 	});
 	discard_jump_entries(runtime, session, removed, protected_buffer);
@@ -2362,7 +2864,16 @@ fn apply_navigation_resolved(
 					Some("Definition target is outside the source document".to_string());
 				return true;
 			}
-			record_definition_origin(runtime, session, stamp, None);
+			record_navigation_origin(
+				runtime,
+				session,
+				stamp.buffer_id,
+				stamp.view_id,
+				stamp.root,
+				stamp.state_id,
+				stamp.cursor,
+				None,
+			);
 			set_view_cursor(session, stamp.view_id, target_byte);
 			if let Some(pane_id) = session.layout.pane_id_for_view(stamp.view_id) {
 				session.focus_pane(pane_id);
@@ -2393,7 +2904,16 @@ fn apply_navigation_resolved(
 						Some("Definition target is outside the target document".to_string());
 					return true;
 				}
-				record_definition_origin(runtime, session, stamp, None);
+				record_navigation_origin(
+					runtime,
+					session,
+					stamp.buffer_id,
+					stamp.view_id,
+					stamp.root,
+					stamp.state_id,
+					stamp.cursor,
+					None,
+				);
 				set_view_cursor(session, target_view, target_byte);
 				if let Some(pane_id) = session.layout.pane_id_for_view(target_view) {
 					if let Some(pane) = session.layout.find_pane_mut(pane_id) {
@@ -2439,7 +2959,16 @@ fn apply_navigation_resolved(
 						Some("Definition target is outside the target document".to_string());
 					return true;
 				}
-				record_definition_origin(runtime, session, stamp, Some(target_buffer));
+				record_navigation_origin(
+					runtime,
+					session,
+					stamp.buffer_id,
+					stamp.view_id,
+					stamp.root,
+					stamp.state_id,
+					stamp.cursor,
+					Some(target_buffer),
+				);
 				if let Err(error) =
 					retarget_text_view(runtime, session, stamp.view_id, target_buffer)
 				{
@@ -2983,6 +3512,8 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::GitStatus
 		| EditorCommand::RefreshGitStatus
 		| EditorCommand::OpenGitStatusEntry(_)
+		| EditorCommand::FuzzyRepoSearch(_)
+		| EditorCommand::Picker(_)
 		| EditorCommand::MouseIntent { .. }
 		| EditorCommand::QueryDocumentText
 		| EditorCommand::BeginPasswordPrompt { .. }
@@ -3609,6 +4140,12 @@ fn dispatch_command(
 	}
 
 	match cmd {
+		EditorCommand::FuzzyRepoSearch(query) => {
+			needs_render |= open_fuzzy_repo_search(tx_internal, session, query);
+		}
+		EditorCommand::Picker(action) => {
+			needs_render |= apply_picker_action(runtime, tx_internal, session, action);
+		}
 		EditorCommand::GotoDefinition => {
 			needs_render |= request_goto_definition(runtime, session, reactor);
 		}
@@ -5249,11 +5786,17 @@ pub(crate) fn run_engine(engine: Engine) {
 							None => false,
 						}
 					}
+					InternalEvent::FuzzySearchReady(generation) => {
+						launch_picker_search(&runtime, &tx_internal, &mut session, generation)
+					}
 					InternalEvent::NavigationResolved(resolved) => {
 						let lifecycle_before = session.capture_text_lifecycle();
 						let rendered = apply_navigation_resolved(&runtime, &mut session, *resolved);
 						session.emit_text_lifecycle_since(lifecycle_before);
 						rendered
+					}
+					InternalEvent::FuzzySearchBatch(batch) => {
+						apply_fuzzy_search_batch(&mut session, *batch)
 					}
 					InternalEvent::RuneCompile(result) => {
 						if let Some(host) = rune_host.as_mut() {
@@ -6121,6 +6664,226 @@ pub fn main(editor) {
 
 		engine.commands.send(EditorCommand::Quit).unwrap();
 		engine.thread.join().unwrap();
+	}
+
+	#[test]
+	#[ignore = "repository fixture shells out to git"]
+	fn fuzzy_repo_search_streams_jumps_and_records_jump_back() {
+		let repo = std::env::temp_dir().join(format!(
+			"libaryon-fuzzy-search-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("clock")
+				.as_nanos()
+		));
+		fs::create_dir_all(repo.join("src")).expect("repo");
+		let source_path = repo.join("src/origin.rs");
+		let target_path = repo.join("src/supervisor.rs");
+		fs::write(&source_path, "fn origin() {}\n").expect("source");
+		fs::write(
+			&target_path,
+			"pub fn render_frame() {\n\t// supervisor\n}\n",
+		)
+		.expect("target");
+		assert!(
+			std::process::Command::new("git")
+				.arg("init")
+				.arg("-q")
+				.arg(&repo)
+				.status()
+				.expect("git init")
+				.success()
+		);
+		assert!(
+			std::process::Command::new("git")
+				.arg("-C")
+				.arg(&repo)
+				.args(["add", "src/origin.rs", "src/supervisor.rs"])
+				.status()
+				.expect("git add")
+				.success()
+		);
+
+		let engine = spawn_test_engine(Some(source_path.display().to_string()));
+		engine.commands.refresh_for_test().expect("initial render");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("origin.rs"))
+		});
+		engine
+			.commands
+			.send(EditorCommand::InsertChar(' '))
+			.expect("dirty source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.is_dirty
+		});
+		engine
+			.commands
+			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
+			.expect("open picker");
+		let picker_view = recv_viewport_until(
+			&engine._views,
+			Duration::from_secs(10),
+			|viewport| {
+				viewport.picker.as_ref().is_some_and(|picker| {
+					!picker.searching
+						&& picker
+							.results
+							.iter()
+							.any(|result| result.path == "src/supervisor.rs")
+				})
+			},
+		);
+		assert_eq!(
+			picker_view
+				.picker
+				.as_ref()
+				.expect("picker")
+				.results[0]
+				.path,
+			"src/supervisor.rs"
+		);
+		engine
+			.commands
+			.send(EditorCommand::Picker(PickerAction::Accept))
+			.expect("accept");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.picker.is_some()
+				&& viewport.status_message.as_deref()
+					== Some(
+						"Search result is in another file; write or discard source changes first",
+					)
+		});
+		engine
+			.commands
+			.send(EditorCommand::Picker(PickerAction::Cancel))
+			.expect("cancel refused picker");
+		engine.commands.send(EditorCommand::Undo).expect("restore source");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.picker.is_none() && !viewport.is_dirty
+		});
+		engine
+			.commands
+			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
+			.expect("reopen picker");
+		recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
+			viewport
+				.picker
+				.as_ref()
+				.is_some_and(|picker| !picker.searching && !picker.results.is_empty())
+		});
+		engine
+			.commands
+			.send(EditorCommand::Picker(PickerAction::Accept))
+			.expect("accept clean source");
+		let target = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.picker.is_none()
+				&& viewport
+					.file_name
+					.as_deref()
+					.is_some_and(|name| name.ends_with("supervisor.rs"))
+				&& viewport.status_message.as_deref() == Some("src/supervisor.rs:1:8")
+		});
+		assert_eq!(target.cursor_abs_byte, DocByte::new(7));
+
+		engine
+			.commands
+			.send(EditorCommand::JumpBack)
+			.expect("jump back");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("origin.rs"))
+				&& viewport.status_message.as_deref() == Some("Jumped back")
+		});
+		engine.commands.send(EditorCommand::Quit).expect("quit");
+		engine.thread.join().expect("engine");
+		fs::remove_dir_all(repo).expect("cleanup");
+	}
+
+	#[test]
+	#[ignore = "repository fixture shells out to git"]
+	fn fuzzy_repo_search_prefers_unsaved_open_buffer_bytes_over_disk() {
+		let repo = std::env::temp_dir().join(format!(
+			"libaryon-fuzzy-live-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("clock")
+				.as_nanos()
+		));
+		fs::create_dir_all(&repo).expect("repo");
+		let path = repo.join("live.rs");
+		fs::write(&path, "fn disk_only() {}\n").expect("disk source");
+		assert!(
+			std::process::Command::new("git")
+				.arg("init")
+				.arg("-q")
+				.arg(&repo)
+				.status()
+				.expect("git init")
+				.success()
+		);
+		assert!(
+			std::process::Command::new("git")
+				.arg("-C")
+				.arg(&repo)
+				.args(["add", "live.rs"])
+				.status()
+				.expect("git add")
+				.success()
+		);
+
+		let engine = spawn_test_engine(Some(path.display().to_string()));
+		engine.commands.refresh_for_test().expect("initial render");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.file_name.as_deref().is_some_and(|name| name.ends_with("live.rs"))
+		});
+		engine
+			.commands
+			.send(EditorCommand::InsertText("render_frame\n".to_string()))
+			.expect("unsaved insertion");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.is_dirty && viewport.cursor_abs_byte >= DocByte::new(12)
+		});
+		engine
+			.commands
+			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
+			.expect("search live bytes");
+		let viewport =
+			recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
+				viewport.picker.as_ref().is_some_and(|picker| {
+					!picker.searching
+						&& picker.results.iter().any(|result| {
+							result.path == "live.rs" && result.line == DocLine::ZERO
+						})
+				})
+			});
+		assert!(
+			viewport
+				.picker
+				.as_ref()
+				.expect("picker")
+				.results
+				.iter()
+				.all(|result| result.line_text.contains("render_frame"))
+		);
+		engine
+			.commands
+			.send(EditorCommand::Picker(PickerAction::Accept))
+			.expect("same-file jump");
+		let jumped = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.picker.is_none() && viewport.cursor_abs_byte == DocByte::ZERO
+		});
+		assert!(jumped.is_dirty, "same-file jumps must preserve unsaved bytes");
+
+		engine.commands.send(EditorCommand::Quit).expect("quit");
+		engine.thread.join().expect("engine");
+		fs::remove_dir_all(repo).expect("cleanup");
 	}
 
 	#[test]

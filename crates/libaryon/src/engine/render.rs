@@ -30,7 +30,8 @@ use crate::svp::SvpResolver;
 use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
 use crate::uast::projection::{
-	GutterLineNumber, HostPanelViewport, PaneDividerViewport, ProjectedCaret,
+	GutterLineNumber, HostPanelViewport, PaneDividerViewport, PickerResultViewport,
+	PickerViewport, ProjectedCaret,
 };
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +90,49 @@ impl RenderTab<'_> {
 
 fn viewport_is_busy(io_busy: bool, semantic_busy: bool) -> bool {
 	io_busy || semantic_busy
+}
+
+fn picker_viewport(
+	picker: Option<&super::fuzzy_search::PickerState>,
+	terminal_height: ScreenRow,
+) -> Option<PickerViewport> {
+	let picker = picker?;
+	let visible_count = usize::try_from(terminal_height.get().saturating_sub(7))
+		.unwrap_or(usize::MAX)
+		.clamp(1, 24);
+	let first_result = if picker.results.len() <= visible_count {
+		0
+	} else {
+		picker
+			.selected
+			.saturating_sub(visible_count / 2)
+			.min(picker.results.len().saturating_sub(visible_count))
+	};
+	let results = picker
+		.results
+		.iter()
+		.skip(first_result)
+		.take(visible_count)
+		.map(|result| PickerResultViewport {
+			path: result.display_path.clone(),
+			line: result.line,
+			col: result.col,
+			line_text: result.line_text.clone(),
+			score: result.score,
+		})
+		.collect();
+	Some(PickerViewport {
+		query: picker.query.clone(),
+		query_cursor: picker.query_cursor,
+		selected: picker.selected,
+		first_result,
+		results,
+		shown: picker.results.len(),
+		matched: picker.matched,
+		truncated: picker.truncated,
+		searching: picker.searching,
+		files_walked: picker.files_walked,
+	})
 }
 
 fn analysis_depth_for_buffer(
@@ -263,6 +307,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 			Some(BufferContent::MarkdownPreview(_) | BufferContent::HostPanel(_)) | None => None,
 		}
 	};
+	let picker = picker_viewport(session.picker.as_ref(), session.terminal_height);
 
 	let EditorSession {
 		input,
@@ -368,6 +413,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		ui_palette,
 		git_refresh_mode: session.git_refresh_mode,
 		confirm_prompt,
+		picker,
 		input: input.projection(),
 		language_completion_candidates: lang_registry.completion_candidates(),
 	});

@@ -316,6 +316,31 @@ pub struct ProjectedCaret {
 	pub abs_byte: DocByte,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerResultViewport {
+	pub path: String,
+	pub line: DocLine,
+	pub col: DocDisplayCol,
+	pub line_text: String,
+	pub score: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerViewport {
+	pub query: String,
+	pub query_cursor: usize,
+	/// Absolute selected result within the engine-owned ranked result set.
+	pub selected: usize,
+	/// Absolute index of `results[0]` within that same set.
+	pub first_result: usize,
+	pub results: Vec<PickerResultViewport>,
+	pub shown: usize,
+	pub matched: u64,
+	pub truncated: bool,
+	pub searching: bool,
+	pub files_walked: u64,
+}
+
 /// Immutable render projection sent from the engine to a frontend.
 pub struct Viewport {
 	pub viewport_id: ViewportId,
@@ -353,6 +378,8 @@ pub struct Viewport {
 	pub ui_palette: UiPalette,
 	pub git_refresh_mode: crate::engine::GitRefreshMode,
 	pub confirm_prompt: Option<String>,
+	/// Engine-owned modal picker. Frontends render this value but never search.
+	pub picker: Option<PickerViewport>,
 	pub input: crate::engine::InputProjection,
 	pub language_completion_candidates: Vec<String>,
 }

@@ -12,7 +12,9 @@ use libaryon::engine::{
 use libaryon::svp::diagnostic::DiagnosticSeverity;
 use libaryon::svp::projector::{DiagnosticProjector, HighlightProjector};
 use libaryon::svp::rust_highlight::default_text_color;
-use libaryon::uast::projection::{DocTabSummary, PaneViewport, ProjectedCaret};
+use libaryon::uast::projection::{
+	DocTabSummary, PaneViewport, PickerViewport, ProjectedCaret,
+};
 use ratatui::{
 	backend::Backend,
 	buffer::Buffer,
@@ -365,6 +367,157 @@ fn prompt_window(buffer: &str, cursor_byte: usize, width: usize) -> (String, usi
 	let visible = buffer.chars().skip(start).take(width).collect();
 	let cursor_col = cursor_char.saturating_sub(start).min(width - 1);
 	(visible, cursor_col)
+}
+
+fn paint_picker_text(
+	buf: &mut Buffer,
+	x: u16,
+	y: u16,
+	width: u16,
+	text: &str,
+	style: Style,
+) {
+	for (offset, ch) in text.chars().take(width as usize).enumerate() {
+		if let Some(cell) = buf.cell_mut((x.saturating_add(offset as u16), y)) {
+			cell.set_char(ch).set_style(style);
+		}
+	}
+}
+
+fn draw_picker_overlay(
+	buf: &mut Buffer,
+	screen: Rect,
+	picker: &PickerViewport,
+	palette: UiPalette,
+) -> Option<(u16, u16)> {
+	if screen.width < 12 || screen.height < 5 {
+		return None;
+	}
+	let width = screen.width.saturating_sub(4).clamp(12, 112);
+	let requested_height = u16::try_from(picker.results.len())
+		.unwrap_or(u16::MAX)
+		.saturating_add(4);
+	let height = requested_height.min(screen.height).max(5);
+	let x = screen.x.saturating_add(screen.width.saturating_sub(width) / 2);
+	let y = screen
+		.y
+		.saturating_add(screen.height.saturating_sub(height) / 3);
+	let right = x.saturating_add(width).saturating_sub(1);
+	let bottom = y.saturating_add(height).saturating_sub(1);
+	let surface = Style::default()
+		.bg(ratatui_color(palette.tab_surface))
+		.fg(ratatui_color(palette.tab_text));
+	let border = surface.fg(ratatui_color(palette.tab_accent));
+	let selected = Style::default()
+		.bg(ratatui_color(palette.tab_active_surface))
+		.fg(ratatui_color(palette.tab_accent))
+		.add_modifier(Modifier::BOLD);
+
+	for row in y..=bottom {
+		for col in x..=right {
+			if let Some(cell) = buf.cell_mut((col, row)) {
+				cell.set_char(' ').set_style(surface);
+			}
+		}
+	}
+	if let Some(cell) = buf.cell_mut((x, y)) {
+		cell.set_char('╭').set_style(border);
+	}
+	if let Some(cell) = buf.cell_mut((right, y)) {
+		cell.set_char('╮').set_style(border);
+	}
+	if let Some(cell) = buf.cell_mut((x, bottom)) {
+		cell.set_char('╰').set_style(border);
+	}
+	if let Some(cell) = buf.cell_mut((right, bottom)) {
+		cell.set_char('╯').set_style(border);
+	}
+	for col in x.saturating_add(1)..right {
+		if let Some(top) = buf.cell_mut((col, y)) {
+			top.set_char('─').set_style(border);
+		}
+		if let Some(bottom_cell) = buf.cell_mut((col, bottom)) {
+			bottom_cell.set_char('─').set_style(border);
+		}
+	}
+	for row in y.saturating_add(1)..bottom {
+		if let Some(left) = buf.cell_mut((x, row)) {
+			left.set_char('│').set_style(border);
+		}
+		if let Some(right_cell) = buf.cell_mut((right, row)) {
+			right_cell.set_char('│').set_style(border);
+		}
+	}
+	paint_picker_text(
+		buf,
+		x.saturating_add(2),
+		y,
+		width.saturating_sub(4),
+		" repo search ",
+		border.add_modifier(Modifier::BOLD),
+	);
+
+	let inner_x = x.saturating_add(2);
+	let inner_width = width.saturating_sub(4);
+	let query_width = inner_width.saturating_sub(2) as usize;
+	let (visible_query, query_cursor_col) =
+		prompt_window(&picker.query, picker.query_cursor, query_width);
+	paint_picker_text(buf, inner_x, y.saturating_add(1), 2, "> ", border);
+	paint_picker_text(
+		buf,
+		inner_x.saturating_add(2),
+		y.saturating_add(1),
+		query_width as u16,
+		&visible_query,
+		surface,
+	);
+
+	let result_rows = height.saturating_sub(4) as usize;
+	for (local_index, result) in picker.results.iter().take(result_rows).enumerate() {
+		let absolute_index = picker.first_result.saturating_add(local_index);
+		let style = if absolute_index == picker.selected {
+			selected
+		} else {
+			surface
+		};
+		let row = y.saturating_add(2).saturating_add(local_index as u16);
+		for col in inner_x..inner_x.saturating_add(inner_width) {
+			if let Some(cell) = buf.cell_mut((col, row)) {
+				cell.set_char(' ').set_style(style);
+			}
+		}
+		let label = format!(
+			"{}:{}:{}  {}",
+			result.path,
+			result.line.get().saturating_add(1),
+			result.col.get().saturating_add(1),
+			result.line_text
+		);
+		paint_picker_text(buf, inner_x, row, inner_width, &label, style);
+	}
+
+	let qualifier = if picker.truncated { "≥" } else { "" };
+	let activity = if picker.searching { " · searching…" } else { "" };
+	let footer = format!(
+		" {}/{}{qualifier} · {} files{} · ↑↓ select · Enter open · Esc close ",
+		picker.shown, picker.matched, picker.files_walked, activity
+	);
+	paint_picker_text(
+		buf,
+		x.saturating_add(1),
+		bottom,
+		width.saturating_sub(2),
+		&footer,
+		border,
+	);
+
+	Some((
+		inner_x
+			.saturating_add(2)
+			.saturating_add(query_cursor_col as u16)
+			.min(right.saturating_sub(1)),
+		y.saturating_add(1),
+	))
 }
 
 fn should_render_preview_snapshot_fallback(rendered_preview: bool, preview_pending: bool) -> bool {
@@ -1608,6 +1761,16 @@ impl<B: Backend + io::Write> Frontend<B> {
 							}
 						}
 					}
+					if let Some(picker) = view.picker.as_ref() {
+						let overlay_area = Rect {
+							x: 0,
+							y: 0,
+							width: max_width,
+							height: editor_area_height,
+						};
+						cursor_to_set =
+							draw_picker_overlay(f.buffer_mut(), overlay_area, picker, view.ui_palette);
+					}
 				}
 
 				let bar_y = max_height.saturating_sub(status_bar_height);
@@ -1939,9 +2102,10 @@ mod tests {
 	use super::{
 		BUSY_SPINNER_FRAMES, apply_diagnostic_style, braille_spinner_frame,
 		cursor_gutter_line_number_style, diff_block_fill, diff_intra_line_fill, draw_tab_bar,
-		effective_editor_background, focused_diff_block_fill, folded_placeholder_style,
-		format_line_count, gutter_fill_style, gutter_line_number_style, paint_busy_spinner,
-		paint_git_branch, paint_secondary_carets, paint_text_segment, prompt_window,
+		draw_picker_overlay, effective_editor_background, focused_diff_block_fill,
+		folded_placeholder_style, format_line_count, gutter_fill_style, gutter_line_number_style,
+		paint_busy_spinner, paint_git_branch, paint_secondary_carets, paint_text_segment,
+		prompt_window,
 		should_render_preview_snapshot_fallback, status_file_name, status_right_text,
 	};
 	use crate::ui::{
@@ -1953,12 +2117,60 @@ mod tests {
 	};
 	use libaryon::engine::{UiPalette, VisibleRow};
 	use libaryon::svp::diagnostic::DiagnosticSeverity;
-	use libaryon::uast::projection::{DocTabSummary, ProjectedCaret};
+	use libaryon::uast::projection::{
+		DocTabSummary, PickerResultViewport, PickerViewport, ProjectedCaret,
+	};
 	use ratatui::{
 		buffer::Buffer,
 		layout::Rect,
 		style::{Modifier, Style},
 	};
+
+	#[test]
+	fn picker_overlay_marks_the_selected_row_and_places_the_query_cursor() {
+		let palette = UiPalette::default();
+		let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+		let picker = PickerViewport {
+			query: "render_frame".to_string(),
+			query_cursor: "render".len(),
+			selected: 1,
+			first_result: 0,
+			results: vec![
+				PickerResultViewport {
+					path: "src/a.rs".to_string(),
+					line: DocLine::new(3),
+					col: DocDisplayCol::new(2),
+					line_text: "render_frame();".to_string(),
+					score: 3_000_000,
+				},
+				PickerResultViewport {
+					path: "src/b.rs".to_string(),
+					line: DocLine::new(7),
+					col: DocDisplayCol::new(4),
+					line_text: "fn render_frame()".to_string(),
+					score: 2_999_996,
+				},
+			],
+			shown: 2,
+			matched: 2,
+			truncated: false,
+			searching: false,
+			files_walked: 9,
+		};
+		let cursor =
+			draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
+				.expect("overlay");
+		assert_eq!(buffer[cursor].symbol(), "_");
+		assert_eq!(
+			buffer[(cursor.0.saturating_sub(1), cursor.1)].symbol(),
+			"r"
+		);
+		let selected_row_y = cursor.1.saturating_add(2);
+		assert_eq!(
+			buffer[(4, selected_row_y)].bg,
+			ratatui_color(palette.tab_active_surface)
+		);
+	}
 
 	#[test]
 	fn dark_diff_glass_stays_saturated_while_capping_perceptual_brightness() {

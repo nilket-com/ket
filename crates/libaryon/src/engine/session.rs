@@ -616,6 +616,10 @@ pub(crate) struct TextBuffer {
 }
 
 impl TextBuffer {
+	pub(crate) fn canonical_path(&self) -> Option<&CanonicalPath> {
+		self.canonical_path.as_ref()
+	}
+
 	pub(crate) fn new_unnamed(registry: &UastRegistry) -> Result<(Self, NodeId), String> {
 		let mut chunk = registry
 			.reserve_chunk(2)
@@ -862,6 +866,10 @@ impl CanonicalPath {
 		};
 		Ok(Self(resolve_path_components(&absolute, 0)?))
 	}
+
+	pub(crate) fn as_path(&self) -> &Path {
+		&self.0
+	}
 }
 
 fn resolve_path_components(path: &Path, symlink_depth: u8) -> Result<PathBuf, String> {
@@ -942,6 +950,10 @@ impl BufferStore {
 
 	pub(crate) fn get_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
 		self.by_id.get_mut(&id)
+	}
+
+	pub(crate) fn iter(&self) -> impl Iterator<Item = (BufferId, &Buffer)> {
+		self.by_id.iter().map(|(id, buffer)| (*id, buffer))
 	}
 
 	/// Mutate a text buffer/view pair before the view enters the live layout.
@@ -3648,6 +3660,10 @@ pub(crate) struct EditorSession {
 	pub(crate) next_semantic_request_id: RequestId,
 	pub(crate) pending_navigation: Option<super::navigation::NavigationStamp>,
 	pub(crate) jump_history: super::navigation::JumpHistory,
+	pub(crate) picker: Option<super::fuzzy_search::PickerState>,
+	/// Session-monotonic picker work identity. A closed picker may still have
+	/// a queued worker response, so reopening must never reuse its generation.
+	pub(crate) next_picker_generation: u64,
 	pub(crate) next_dynamic_device_id: u16,
 	pub(crate) output_panels: HashMap<String, BufferId>,
 	pub(crate) output_panel_leaves: HashMap<BufferId, NodeId>,
@@ -4216,6 +4232,8 @@ impl EditorSession {
 			next_semantic_request_id: RequestId::new(1),
 			pending_navigation: None,
 			jump_history: super::navigation::JumpHistory::default(),
+			picker: None,
+			next_picker_generation: 1,
 			next_dynamic_device_id: super::core::FILE_DEVICE_ID + 1,
 			output_panels: HashMap::new(),
 			output_panel_leaves: HashMap::new(),

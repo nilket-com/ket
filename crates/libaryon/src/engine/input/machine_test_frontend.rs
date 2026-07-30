@@ -77,6 +77,7 @@ impl TestFrontend {
 			return InputContext::default();
 		};
 		InputContext {
+			is_picker: viewport.picker.is_some(),
 			is_host_panel: false,
 			is_file_browser: pane.is_file_browser,
 			is_uast_inspector: self.uast_inspector,

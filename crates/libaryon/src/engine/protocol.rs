@@ -104,6 +104,25 @@ pub enum PaneResizeDirection {
 	Decrease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerCursorMovement {
+	Left,
+	Right,
+	Home,
+	End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerAction {
+	Insert(String),
+	Backspace,
+	Delete,
+	MoveCursor(PickerCursorMovement),
+	MoveSelection(i32),
+	Accept,
+	Cancel,
+}
+
 /// Where a dragged pane lands relative to its drop target.
 ///
 /// `Center` exchanges the two panes; the four edges detach the source pane
@@ -202,6 +221,10 @@ pub enum EditorCommand {
 	ToggleCaseAtCursor,
 	/// Resolve and jump to the symbol definition under the primary cursor.
 	GotoDefinition,
+	/// Open the engine-owned modal fuzzy repository-content picker.
+	FuzzyRepoSearch(String),
+	/// Edit, navigate, accept, or close the active picker.
+	Picker(PickerAction),
 	/// Return to the newest retained code-navigation origin.
 	JumpBack,
 	/// Reapply the newest retained forward navigation after jumping back.

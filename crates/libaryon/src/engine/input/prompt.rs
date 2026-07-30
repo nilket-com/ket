@@ -18,6 +18,16 @@ impl InputRuntime {
 		if data.is_empty() {
 			return;
 		}
+		if self.context.is_picker {
+			let pasted = sanitized_prompt_paste(&data);
+			if !pasted.is_empty() {
+				self.send_command(EditorCommand::Picker(
+					crate::engine::PickerAction::Insert(pasted),
+				));
+				self.needs_render = true;
+			}
+			return;
+		}
 		match self.editor_mode() {
 			EditorMode::Insert => {
 				self.send_command(EditorCommand::InsertText(data));
@@ -387,7 +397,7 @@ impl InputRuntime {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PromptCursorMovement {
+pub(crate) enum PromptCursorMovement {
 	Left,
 	Right,
 	Home,
@@ -422,13 +432,13 @@ fn next_char_boundary(buffer: &str, cursor: usize) -> Option<usize> {
 		.map(|ch| cursor + ch.len_utf8())
 }
 
-fn insert_at_prompt_cursor(buffer: &mut String, cursor: &mut usize, text: &str) {
+pub(crate) fn insert_at_prompt_cursor(buffer: &mut String, cursor: &mut usize, text: &str) {
 	let insertion = clamped_prompt_cursor(buffer, *cursor);
 	buffer.insert_str(insertion, text);
 	*cursor = insertion + text.len();
 }
 
-fn backspace_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
+pub(crate) fn backspace_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
 	let insertion = clamped_prompt_cursor(buffer, *cursor);
 	if let Some(previous) = previous_char_boundary(buffer, insertion) {
 		buffer.drain(previous..insertion);
@@ -438,7 +448,7 @@ fn backspace_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
 	}
 }
 
-fn delete_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
+pub(crate) fn delete_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
 	let deletion = clamped_prompt_cursor(buffer, *cursor);
 	if let Some(next) = next_char_boundary(buffer, deletion) {
 		buffer.drain(deletion..next);
@@ -446,7 +456,11 @@ fn delete_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
 	*cursor = deletion;
 }
 
-fn move_prompt_cursor(buffer: &str, cursor: &mut usize, movement: PromptCursorMovement) {
+pub(crate) fn move_prompt_cursor(
+	buffer: &str,
+	cursor: &mut usize,
+	movement: PromptCursorMovement,
+) {
 	let current = clamped_prompt_cursor(buffer, *cursor);
 	*cursor = match movement {
 		PromptCursorMovement::Left => previous_char_boundary(buffer, current).unwrap_or(current),

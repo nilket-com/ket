@@ -18,12 +18,16 @@ use crate::engine::request::InternalSender;
 use crate::engine::runtime_registry::{
 	InvocationSnapshot, KeyStroke, MappingMode, ResolvedMappingTarget, RuntimeRegistries,
 };
-use crate::engine::{EditorCommand, EditorMode, KeyCode, Modifiers, MoveDirection, VisualKind};
+use crate::engine::{
+	EditorCommand, EditorMode, KeyCode, Modifiers, MoveDirection, PickerAction,
+	PickerCursorMovement, VisualKind,
+};
 use crate::engine::{InputCompletionStatus, InputProjection};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InputContext {
+	pub(crate) is_picker: bool,
 	pub(crate) is_file_browser: bool,
 	pub(crate) is_uast_inspector: bool,
 	/// The focused pane is host-rendered, so document-shaped input is declined
@@ -214,11 +218,18 @@ impl InputRuntime {
 		self.needs_render = true;
 		let mode_before = self.editor_mode();
 		let mut should_quit = false;
+		let picker_handled = self.context.is_picker;
+		if picker_handled {
+			self.clear_runtime_mapping_pending();
+			self.state = InputState::normal();
+			self.dispatch_picker_key(code, modifiers);
+		}
 		// Password input is never eligible for user mappings: a mapping can
 		// persist, log, or reroute keystrokes outside libaryon's secret boundary.
-		let runtime_handled = !matches!(self.editor_mode(), EditorMode::Password)
+		let runtime_handled = !picker_handled
+			&& !matches!(self.editor_mode(), EditorMode::Password)
 			&& self.dispatch_runtime_mapping_key(code, modifiers, registries, &mut should_quit);
-		if !runtime_handled {
+		if !picker_handled && !runtime_handled {
 			match self.editor_mode() {
 				EditorMode::Normal => self.dispatch_normal_key(code, modifiers, &mut should_quit),
 				EditorMode::Insert => self.dispatch_insert_key(code, modifiers, &mut should_quit),
@@ -326,6 +337,49 @@ impl InputRuntime {
 
 	pub(crate) fn send_command(&mut self, command: EditorCommand) {
 		self.commands.push(command);
+	}
+
+	fn dispatch_picker_key(&mut self, code: KeyCode, modifiers: Modifiers) {
+		let control_only = modifiers == Modifiers::CONTROL;
+		let action = match (code, control_only) {
+			(KeyCode::Esc, _) => Some(PickerAction::Cancel),
+			(KeyCode::Enter, _) => Some(PickerAction::Accept),
+			(KeyCode::Up, _) | (KeyCode::Char('p'), true) => {
+				Some(PickerAction::MoveSelection(-1))
+			}
+			(KeyCode::Down, _) | (KeyCode::Char('n'), true) => {
+				Some(PickerAction::MoveSelection(1))
+			}
+			(KeyCode::Left, _) | (KeyCode::Char('b'), true) => {
+				Some(PickerAction::MoveCursor(PickerCursorMovement::Left))
+			}
+			(KeyCode::Right, _) | (KeyCode::Char('f'), true) => {
+				Some(PickerAction::MoveCursor(PickerCursorMovement::Right))
+			}
+			(KeyCode::Home, _) | (KeyCode::Char('a'), true) => {
+				Some(PickerAction::MoveCursor(PickerCursorMovement::Home))
+			}
+			(KeyCode::End, _) | (KeyCode::Char('e'), true) => {
+				Some(PickerAction::MoveCursor(PickerCursorMovement::End))
+			}
+			(KeyCode::Backspace, _) => Some(PickerAction::Backspace),
+			(KeyCode::Delete, _) => Some(PickerAction::Delete),
+			(KeyCode::Char(ch), false)
+				if !modifiers.intersects(
+					Modifiers::CONTROL
+						| Modifiers::ALT
+						| Modifiers::SUPER
+						| Modifiers::HYPER
+						| Modifiers::META,
+				) =>
+			{
+				Some(PickerAction::Insert(ch.to_string()))
+			}
+			_ => None,
+		};
+		if let Some(action) = action {
+			self.send_command(EditorCommand::Picker(action));
+		}
 	}
 
 	fn send_move(&mut self, direction: MoveDirection) {

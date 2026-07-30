@@ -559,6 +559,18 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 		dispatch: DispatchKind::Exact(cmd_init0),
 	},
 	CommandSpec {
+		name: "fz",
+		aliases: &["rg"],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::View,
+		usage: ":fz [QUERY]",
+		summary: "Fuzzily search repository content",
+		help: "Opens an engine-owned modal repository-content picker. Results stream while the query changes and prefer live bytes from open buffers. Type to refine; use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return. :rg is an alias; v1 is fuzzy/literal rather than regular-expression search.",
+		dispatch: DispatchKind::Exact(cmd_fuzzy_repo_search),
+	},
+	CommandSpec {
 		name: "help",
 		aliases: &["h", "?"],
 		bang: false,
@@ -752,7 +764,12 @@ pub(super) fn suggestion_candidates() -> Vec<String> {
 			candidates.push(spec.name.to_string());
 		}
 		for alias in spec.aliases {
-			candidates.push(alias.to_string());
+			// Punctuation aliases such as `:?` are directly typeable, but are
+			// poor typo suggestions: edit-distance correction should never
+			// replace a word with punctuation.
+			if alias.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+				candidates.push(alias.to_string());
+			}
 		}
 	}
 	for option in super::option_registry::BOOL_OPTIONS {
@@ -1050,6 +1067,10 @@ fn cmd_init(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 
 fn cmd_init0(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	ctx.send(EditorCommand::WriteDefaultInit { force: inv.bang });
+}
+
+fn cmd_fuzzy_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::FuzzyRepoSearch(inv.args.to_string()));
 }
 
 fn cmd_help(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
@@ -1657,6 +1678,24 @@ mod tests {
 				[EditorCommand::GotoDefinition]
 			));
 		}
+	}
+
+	#[test]
+	fn fuzzy_repo_search_command_and_alias_preserve_the_initial_query() {
+		for invocation in ["fz render_frame", "rg render_frame"] {
+			let (_, commands, status, _) = dispatch(invocation, None);
+			assert_eq!(status, None);
+			assert!(matches!(
+				commands.as_slice(),
+				[EditorCommand::FuzzyRepoSearch(query)] if query == "render_frame"
+			));
+		}
+		let (_, commands, status, _) = dispatch("fz", None);
+		assert_eq!(status, None);
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::FuzzyRepoSearch(query)] if query.is_empty()
+		));
 	}
 
 	#[test]

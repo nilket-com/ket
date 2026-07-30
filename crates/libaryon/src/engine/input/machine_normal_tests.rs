@@ -480,6 +480,7 @@ mod tests {
 			search_case_insensitive: false,
 			ui_palette: crate::engine::UiPalette::default(),
 			confirm_prompt: None,
+			picker: None,
 			input: crate::engine::InputProjection::default(),
 			language_completion_candidates: Vec::new(),
 		});

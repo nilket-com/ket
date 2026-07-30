@@ -326,6 +326,16 @@ fn text_click_target(
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn handle_mouse(&mut self, mouse: event::MouseEvent) {
 		self.last_mouse_position = Some((mouse.column, mouse.row));
+		if self
+			.current_viewport
+			.as_ref()
+			.is_some_and(|viewport| viewport.picker.is_some())
+		{
+			// The repository picker is an engine-owned modal. Until it grows
+			// explicit result hit targets, mouse input must not leak through to
+			// the panes obscured beneath it.
+			return;
+		}
 		match mouse.kind {
 			MouseEventKind::ScrollUp => {
 				if let Some(view) = &self.current_viewport

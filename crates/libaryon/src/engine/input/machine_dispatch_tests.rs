@@ -1,11 +1,13 @@
 use super::machine_test_frontend::TestFrontend;
+use super::{InputContext, InputRuntime};
 use crate::core::{
 	CursorPosition, DisplayRow, DocByte, DocDisplayCol, DocLine, PaneCol, PaneId, PaneLocalCol,
 	PaneLocalRow, PaneRect, PaneRow, ScreenCol, ScreenRow,
 };
 use crate::engine::{
 	ConfirmAction, EditorCommand, EditorMode, GutterNumbering, KeyCode, Modifiers, MoveDirection,
-	PaneFocusDirection, PaneResizeDirection, SplitDirection, VisualKind, WordMotion,
+	PaneFocusDirection, PaneResizeDirection, PickerAction, PickerCursorMovement, SplitDirection,
+	VisualKind, WordMotion,
 };
 use crate::uast::{PaneViewport, Viewport};
 use std::sync::mpsc;
@@ -98,6 +100,7 @@ fn test_viewport() -> Viewport {
 		search_case_insensitive: false,
 		ui_palette: crate::engine::UiPalette::default(),
 		confirm_prompt: None,
+		picker: None,
 		input: crate::engine::InputProjection::default(),
 		language_completion_candidates: Vec::new(),
 	}
@@ -629,5 +632,58 @@ fn same_mode_override_preserves_pending_input() {
 			register: '"',
 			motion: WordMotion::NextStart,
 		})
+	));
+}
+
+#[test]
+fn picker_modal_routes_text_navigation_accept_and_cancel_before_normal_input() {
+	let mut input = InputRuntime::new();
+	let context = InputContext {
+		is_picker: true,
+		..InputContext::default()
+	};
+	let inserted = input.dispatch_key(context, KeyCode::Char('x'), Modifiers::NONE);
+	assert!(matches!(
+		inserted.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::Insert(text))] if text == "x"
+	));
+	let selected = input.dispatch_key(context, KeyCode::Char('n'), Modifiers::CONTROL);
+	assert!(matches!(
+		selected.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::MoveSelection(1))]
+	));
+	let moved = input.dispatch_key(context, KeyCode::Left, Modifiers::NONE);
+	assert!(matches!(
+		moved.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::MoveCursor(PickerCursorMovement::Left))]
+	));
+	let accepted = input.dispatch_key(context, KeyCode::Enter, Modifiers::NONE);
+	assert!(matches!(
+		accepted.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::Accept)]
+	));
+	let cancelled = input.dispatch_key(context, KeyCode::Esc, Modifiers::NONE);
+	assert!(matches!(
+		cancelled.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::Cancel)]
+	));
+	let control_shift =
+		input.dispatch_key(context, KeyCode::Char('x'), Modifiers::CONTROL | Modifiers::SHIFT);
+	assert!(control_shift.commands.is_empty());
+}
+
+#[test]
+fn picker_modal_paste_is_sanitized_and_never_reaches_the_document() {
+	let mut input = InputRuntime::new();
+	let dispatch = input.dispatch_paste(
+		InputContext {
+			is_picker: true,
+			..InputContext::default()
+		},
+		"render_\nframe\r".to_string(),
+	);
+	assert!(matches!(
+		dispatch.commands.as_slice(),
+		[EditorCommand::Picker(PickerAction::Insert(text))] if text == "render_frame"
 	));
 }
