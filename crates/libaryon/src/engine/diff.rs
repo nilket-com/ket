@@ -359,18 +359,29 @@ pub(crate) fn compute_diff(
 			&& b.partner_range.0 == b.partner_range.1)
 	});
 
-	// Structural matching can deliberately pair large, unequal subtrees. Once
-	// their coordinates reach the presentation layer, refine those broad
-	// Modified spans through the same histogram line diff used for terminal
-	// tables. This preserves semantic anchoring without painting inserted
-	// after-side lines blue merely because their parent nodes matched.
-	refine_multiline_modified_blocks(
-		&mut combined_blocks,
-		&left_bytes,
-		&right_bytes,
-		&l_index,
-		&r_index,
-	);
+	// Semantic topology proposes correspondences, but exact text alignment
+	// owns presentation coverage. An unmatched parent can span byte-identical
+	// children (for example a rewritten Rust item's unchanged declaration);
+	// painting the parent's structural range would falsely mark those lines.
+	// Fence the final blocks through a whole-document histogram diff, retaining
+	// only exact semantic move candidates that line alignment also recognizes
+	// as a deletion paired with an insertion.
+	if std::str::from_utf8(&left_bytes).is_ok() && std::str::from_utf8(&right_bytes).is_ok() {
+		let semantic_moves = combined_blocks
+			.iter()
+			.filter(|block| block.kind == DiffKind::Moved)
+			.cloned()
+			.collect::<Vec<_>>();
+		combined_blocks.clear();
+		run_line_diff(
+			&left_bytes,
+			&right_bytes,
+			DocLine::ZERO,
+			DocLine::ZERO,
+			&mut combined_blocks,
+		);
+		promote_exact_semantic_moves(&mut combined_blocks, &semantic_moves);
+	}
 
 	// Reclassify Modified blocks where one side is pure whitespace — a blank
 	// line paired against a line of real content is really an insertion or
@@ -480,21 +491,6 @@ impl LineIndex {
 		&bytes[start..trimmed_end]
 	}
 
-	fn line_range_slice<'b>(
-		&self,
-		bytes: &'b [u8],
-		range: (DocLine, DocLine),
-	) -> &'b [u8] {
-		let start = self.line_start(range.0.get()).min(bytes.len());
-		let end = usize::try_from(range.1.get())
-			.ok()
-			.and_then(|line| self.line_starts.get(line))
-			.copied()
-			.unwrap_or(bytes.len())
-			.min(bytes.len())
-			.max(start);
-		&bytes[start..end]
-	}
 }
 
 fn extract_nodes_with_coords(
@@ -1234,41 +1230,35 @@ fn range_is_all_whitespace(bytes: &[u8], index: &LineIndex, range: (DocLine, Doc
 	true
 }
 
-fn refine_multiline_modified_blocks(
-	blocks: &mut Vec<DiffBlock>,
-	left_bytes: &[u8],
-	right_bytes: &[u8],
-	l_index: &LineIndex,
-	r_index: &LineIndex,
-) {
-	let mut refined = Vec::with_capacity(blocks.len());
-	for block in blocks.drain(..) {
-		let left_lines = block.range.1.get().saturating_sub(block.range.0.get());
-		let right_lines = block
-			.partner_range
-			.1
-			.get()
-			.saturating_sub(block.partner_range.0.get());
-		if block.kind != DiffKind::Modified || (left_lines <= 1 && right_lines <= 1) {
-			refined.push(block);
+fn promote_exact_semantic_moves(blocks: &mut Vec<DiffBlock>, candidates: &[DiffBlock]) {
+	for candidate in candidates {
+		let Some(removed) = blocks.iter().position(|block| {
+			block.kind == DiffKind::Removed && block.range == candidate.range
+		}) else {
 			continue;
-		}
-
-		let left = l_index.line_range_slice(left_bytes, block.range);
-		let right = r_index.line_range_slice(right_bytes, block.partner_range);
-		if std::str::from_utf8(left).is_err() || std::str::from_utf8(right).is_err() {
-			refined.push(block);
+		};
+		let Some(added) = blocks.iter().position(|block| {
+			block.kind == DiffKind::Added
+				&& block.partner_range == candidate.partner_range
+		}) else {
 			continue;
-		}
-		run_line_diff(
-			left,
-			right,
-			block.range.0,
-			block.partner_range.0,
-			&mut refined,
-		);
+		};
+		let (first, second) = if removed < added {
+			(removed, added)
+		} else {
+			(added, removed)
+		};
+		blocks.remove(second);
+		blocks.remove(first);
+		blocks.push(candidate.clone());
 	}
-	*blocks = refined;
+	blocks.sort_by_key(|block| {
+		(
+			block.range.0.get(),
+			block.partner_range.0.get(),
+			matches!(block.kind, DiffKind::Moved),
+		)
+	});
 }
 
 /// Detect moves at the line level. For every line whose normalized content
@@ -1720,6 +1710,54 @@ impl NodeId {\n\
 		assert!(
 			blocks.iter().any(|block| block.kind == DiffKind::Moved),
 			"an unchanged reordered function should retain a purple move: {blocks:?}"
+		);
+	}
+
+	#[test]
+	fn unchanged_node_id_declaration_is_not_colored_by_its_rewritten_parent() {
+		let before = b"use std::num::NonZeroU32;\n\
+\n\
+/// ==========================================\n\
+/// CORE ENTITY\n\
+/// ==========================================\n\
+/// The Entity ID. A lightweight 32-bit integer.\n\
+/// We use NonZeroU32 to allow `Option<NodeId>` to fit cleanly into 4 bytes (Null-pointer optimization).\n\
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n\
+pub struct NodeId(pub NonZeroU32);\n\
+\n\
+impl NodeId {\n\
+\t#[inline(always)]\n\
+\tpub fn index(self) -> usize {\n\
+\t\tself.0.get() as usize - 1\n\
+\t}\n\
+\n\
+\tpub fn from_index(idx: usize) -> Self {\n\
+\t\tSelf(NonZeroU32::new(idx as u32 + 1).unwrap())\n\
+\t}\n\
+}\n";
+		let after = include_bytes!("../ecs/id.rs");
+		let registry = UastRegistry::new(2_048);
+		let provider = RustProvider::new();
+		let before_green = provider
+			.parse_structural_topology(before)
+			.expect("before Rust topology");
+		let after_green = provider
+			.parse_structural_topology(after)
+			.expect("after Rust topology");
+		let before_root = graft_diff_side_with_green(&registry, before, &before_green);
+		let after_root = graft_diff_side_with_green(&registry, after, &after_green);
+
+		let blocks = compute_diff(before_root, after_root, &registry);
+		let before_declaration = 8;
+		let after_declaration = 15;
+		assert!(
+			blocks.iter().all(|block| {
+				!(block.range.0.get() <= before_declaration
+					&& before_declaration < block.range.1.get())
+					&& !(block.partner_range.0.get() <= after_declaration
+						&& after_declaration < block.partner_range.1.get())
+			}),
+			"the byte-identical declaration is aligned context, not removed or added: {blocks:#?}"
 		);
 	}
 }
