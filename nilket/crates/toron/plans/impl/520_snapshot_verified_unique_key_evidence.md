@@ -22,45 +22,53 @@ performance.
 
 ## Step 1 - evidence model and consumption API (toron)
 
-`UniqueKeyEvidence { columns: Vec<ColumnOrdinal>, provenance }` and `UniquenessProvenance
-{ EnforcedConstraint, VerifiedSnapshot, EstimatedNdv }` in the catalog module;
-`TableBinding.unique_key_evidence: Vec<UniqueKeyEvidence>` populated only from validated
-manifest evidence (empty everywhere else, including every Wendelon descriptor path). The proof
-accessor (`semantic_proof`-style) returns evidence only for the two proof tiers; EstimatedNdv
-is structurally unreachable through it. `primary_key_columns` and row identity untouched.
-MockCatalog gains a fixture hook to attach evidence for bind-level tests.
+`UniqueKeyProof { columns: Vec<ColumnOrdinal>, provenance }` and
+`UniqueKeyProofProvenance { EnforcedConstraint, VerifiedSnapshot }` in the catalog module;
+`TableBinding.unique_key_evidence: Vec<UniqueKeyProof>` populated only from validated manifest
+evidence (empty everywhere else, including every Wendelon descriptor path). Estimated NDV
+remains in `TableOptimizerFacts` and cannot inhabit the proof type. The proof accessor is the
+only semantic-consumer path. `primary_key_columns` and row identity remain untouched.
+MockCatalog gains a fixture hook to attach proof evidence for bind-level tests.
 
 ## Step 2 - seal-time verification and manifest round-trip (toron-tpch)
 
-At `prepare_persisted_tpch_dataset` sealing: exact, deterministic uniqueness verification for
-the declared key columns per table — non-null complete key under Toron equality, hash-set
-based, overflow-checked counters, fail-closed on unsupported types, missing files, or
-incomplete scans. Evidence records `{table, columns (ordered), schema_fp, file_hash,
-provenance: VerifiedSnapshot}` in a versioned manifest section; the manifest fingerprint
-preimage extends accordingly. `load_persisted_tpch_dataset` re-validates each record against
-the manifest's current schema_fp/file_hash and drops mismatches loudly; surviving evidence
-flows into the gauge catalog's bindings.
+At `prepare_persisted_tpch_dataset` sealing, a generic API accepts ordered
+`SnapshotUniqueKeyCandidate` requests. Requests are not facts; only exact deterministic
+verification emits proof. The first TPC-H request is `customer(c_custkey)`, with no
+benchmark-specific branch in the verifier. Verification checks a non-null complete key under
+Toron equality, uses overflow-checked counters, and fails closed on unsupported types, invalid
+columns, missing files, or incomplete scans. Proof records `{table, columns (ordered),
+schema_fp, file_hash, provenance: VerifiedSnapshot}` in an explicitly versioned manifest
+section; the manifest fingerprint preimage extends accordingly.
+
+`load_persisted_tpch_dataset` validates proof structure and binding against the table entry;
+malformed, invalid-column, or mismatched evidence fails manifest load. It exposes
+VerifiedSnapshot proofs only when the current load is `DatasetVerification::FullHash`.
+`ManifestOnly` retains its measurement-only dataset load but supplies an empty proof set.
+Surviving proofs flow into the gauge catalog's bindings.
 
 ## Step 3 - tests
 
 - Round-trip: tiny sealed fixture → load → binding carries ordered key + VerifiedSnapshot;
   composite-key fixture preserves order and identity.
-- Fail-closed battery: duplicates → no evidence; null-bearing key → no evidence; unsupported
-  type → seal declines; missing file / tampered hash / schema mismatch at load → evidence
-  dropped loudly; overflow and incomplete-scan guards.
+- Fail-closed battery: duplicates → no proof; null-bearing key → no proof; unsupported type or
+  invalid candidate → seal declines; missing file / tampered proof binding / schema mismatch →
+  manifest-load error; overflow and incomplete-scan guards; ManifestOnly load → no proof.
 - 519 gate fixtures: bind-level probe sees VerifiedSnapshot proof for a q13-shaped
-  `customer(c_custkey)` catalog; the EstimatedNdv-only twin finds no proof.
+  `customer(c_custkey)` catalog; the estimated-NDV-only optimizer-fact twin finds no proof.
 - Identity non-interference: row-identity suites untouched and green; no descriptor diff.
 - Serialization: goldens re-pinned in-cut if the binding/IR encoding shifts; the new field
   rides all three `--all-targets` checks and the full architecture_test.
 
 ## Step 4 - reseal, invariance census, and receipt
 
-Reseal sf=8 (file bytes identical; manifest extended), then: baseline census from the
-`dfc6ea10` release binary vs the sealed post-520 binary, q01-q22 + m00-m10 — every plan
-fingerprint and digest identical (q13 at `32c7b15a1c5a244e` explicitly); strict correctness
-spot rails on q13 and the q19 sentinel; the gauge-side fixture confirming customer's
-VerifiedSnapshot evidence loads from the resealed sf=8 manifest. Seal
+Preserve the control sf=8 root for `dfc6ea10`; reseal a distinct candidate root for post-520.
+First require every table's file hash, row count, schema fingerprint, and schema signature to
+match across roots. Then run q01-q22 + m00-m10 at the respective compatible manifests — every
+plan fingerprint and digest identical (q13 at `32c7b15a1c5a244e` explicitly); strict
+correctness spot rails on q13 and the q19 sentinel; the gauge-side fixture confirms customer's
+VerifiedSnapshot proof loads from the resealed sf=8 manifest under FullHash and is absent under
+ManifestOnly. Seal
 `impl: adr 520 snapshot-verified unique-key evidence` with the full gate battery and direct
 exit statuses, push, and record the receipt: the fact is available, bound, provenance-correct,
 and changed no plan.
