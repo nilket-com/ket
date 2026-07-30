@@ -303,6 +303,17 @@ fn gutter_line_number_style(
 	}
 }
 
+fn status_file_name(file_path: Option<&str>) -> &str {
+	file_path
+		.map(|path| {
+			std::path::Path::new(path)
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or(path)
+		})
+		.unwrap_or("_")
+}
+
 fn status_right_text(
 	search_info: Option<&str>,
 	wrap_enabled: bool,
@@ -1744,14 +1755,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 							x += 1;
 						}
 					} else {
-						let display_name = file_name
-							.map(|p| {
-								std::path::Path::new(p)
-									.file_name()
-									.and_then(|n| n.to_str())
-									.unwrap_or(p)
-							})
-							.unwrap_or("[No File]");
+						let display_name = status_file_name(file_name);
 						let name_style = if dirty { bar_bg.fg(DIRTY_FG) } else { bar_bg };
 						for c in display_name.chars() {
 							if x >= w {
@@ -1938,7 +1942,7 @@ mod tests {
 		effective_editor_background, focused_diff_block_fill, folded_placeholder_style,
 		format_line_count, gutter_fill_style, gutter_line_number_style, paint_busy_spinner,
 		paint_git_branch, paint_secondary_carets, paint_text_segment, prompt_window,
-		should_render_preview_snapshot_fallback, status_right_text,
+		should_render_preview_snapshot_fallback, status_file_name, status_right_text,
 	};
 	use crate::ui::{
 		DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, blend_rgb, diff::DiffHoverEmphasis,
@@ -2158,6 +2162,8 @@ mod tests {
 
 	#[test]
 	fn status_bar_reports_wrap_state_before_file_size() {
+		assert_eq!(status_file_name(None), "_");
+		assert_eq!(status_file_name(Some("/tmp/project/main.rs")), "main.rs");
 		assert_eq!(
 			status_right_text(None, true, 1024, Some(27), 4, 8, 1, "Rust"),
 			"WRAP | 1.0 KB | 27 lines | Rust | UTF-8 | 4:8 "
