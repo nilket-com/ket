@@ -4119,6 +4119,27 @@ pub fn gauge_side_local_filter_routing() -> Result<(bool, &'static str), String>
 	}
 }
 
+pub const GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV: &str = "TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS";
+
+/// The gauge's membership-filtered reachable-key coverage setting and its
+/// provenance: unset means the engine default; "0"/"1" are explicit arms.
+pub fn gauge_semi_filtered_reachable_keys() -> Result<(bool, &'static str), String> {
+	match std::env::var(GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV) {
+		Ok(raw) => match raw.as_str() {
+			"0" => Ok((false, "explicit")),
+			"1" => Ok((true, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV} must be \"0\" or \"1\", got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => Ok((
+			PlannerConfig::default().semi_filtered_reachable_keys,
+			"default",
+		)),
+		Err(error) => Err(format!("{GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV}: {error}")),
+	}
+}
+
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
 pub const GAUGE_LOCAL_JOIN_ADMISSION_ENV: &str = "TORON_TPCH_LOCAL_JOIN_ADMISSION";
@@ -4160,6 +4181,9 @@ fn gauge_planner_config_with_task_memory(
 	}
 	if let Ok((value, "explicit")) = gauge_side_local_filter_routing() {
 		config.side_local_filter_routing = value;
+	}
+	if let Ok((value, "explicit")) = gauge_semi_filtered_reachable_keys() {
+		config.semi_filtered_reachable_keys = value;
 	}
 	// The gauge binds and immediately runs through `Executor::with_context`; it is
 	// the caller that can prove this plan will not be fragmented. ADR 489's

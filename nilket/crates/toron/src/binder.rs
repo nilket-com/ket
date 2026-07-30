@@ -209,6 +209,10 @@ pub struct PlannerConfig {
 	/// pairs improved 3,809-4,055 ms against the 3,554 ms floor, the part
 	/// suffix build collapsed 1.6M → 10,801/87,125 rows, every digest held.
 	pub side_local_filter_routing: bool,
+	/// ADR 518: let reachable-key traces cross a membership semi from its
+	/// preserved side and derive a weaker semi from any nonempty, same-source
+	/// subset of correlation keys. Default off pending the measured receipt.
+	pub semi_filtered_reachable_keys: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -243,6 +247,7 @@ impl Default for PlannerConfig {
 			scalar_aggregate_input_reduction: true,
 			membership_first_composition: true,
 			side_local_filter_routing: true,
+			semi_filtered_reachable_keys: false,
 		}
 	}
 }
@@ -1747,6 +1752,34 @@ impl<'a> Binder<'a> {
 								recursive_ctx,
 							)
 							.await;
+					}
+					// ADR 518: official q20 lowers its membership filter one
+					// wrapper above the deferred scalar. Move that exact semi
+					// onto the scalar's outer input so reachable-key derivation
+					// sees the surviving domain; the moved shape cannot match
+					// this recognizer on re-entry.
+					if matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi) {
+						if let Some(rewritten) = self
+							.try_expose_membership_to_deferred_scalar(
+								left,
+								right,
+								*kind,
+								on,
+								*null_safe_keys,
+								*strategy_intent,
+							)
+							.await
+						{
+							return self
+								.bind_plan_with_trace(
+									&rewritten,
+									trace,
+									render_trace,
+									join_order_source_capture,
+									recursive_ctx,
+								)
+								.await;
+						}
 					}
 					// ADR 515: membership-first composition — commute the pinned
 					// membership semi to its key-source branch, then bind the

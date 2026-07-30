@@ -26174,42 +26174,56 @@ const ADR511_Q17_SHAPE_SQL: &str = "SELECT SUM(l_extendedprice) / 7.0 AS avg_yea
 	 WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' \
 	   AND l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
 
-#[tokio::test]
-async fn adr511_q17_shape_swaps_join0_toward_filtered_part() {
+#[test]
+fn adr511_q17_shape_swaps_join0_toward_filtered_part() {
 	// q17's comma join builds on full lineitem exactly because the filtered
 	// part side carries no estimate; the swap must engage on the raw bound
-	// with the knob on, and keep the symmetric decline with it off.
-	let catalog = adr511_q17_shape_catalog();
-	let logical = SqlPlanner::new()
-		.plan(ADR511_Q17_SHAPE_SQL)
-		.expect("plan q17 shape");
-	let mut config = auto_broadcast_config(4_096);
-	config.hash_smaller_build_placement = true;
-	config.filtered_build_side_swap = true;
-	let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
-		.await
-		.expect("bind q17 shape");
-	let join0 = trace
-		.join_decisions
-		.iter()
-		.find(|receipt| receipt.target.join_index == 0)
-		.expect("join0 receipt");
-	assert_eq!(join0.placement, JoinPhysicalPlacement::SwappedRightBuild);
-	assert!(matches!(
-		join0.reason,
-		JoinStrategyDecisionReason::HashSmallerBuild { .. }
-	));
+	// with the knob on, and keep the symmetric decline with it off. This
+	// deep graph bind uses the suite's explicit-stack convention.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr511_q17_shape_catalog();
+				let logical = SqlPlanner::new()
+					.plan(ADR511_Q17_SHAPE_SQL)
+					.expect("plan q17 shape");
+				let mut config = auto_broadcast_config(4_096);
+				config.hash_smaller_build_placement = true;
+				config.filtered_build_side_swap = true;
+				let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind q17 shape");
+				let join0 = trace
+					.join_decisions
+					.iter()
+					.find(|receipt| receipt.target.join_index == 0)
+					.expect("join0 receipt");
+				assert_eq!(join0.placement, JoinPhysicalPlacement::SwappedRightBuild);
+				assert!(matches!(
+					join0.reason,
+					JoinStrategyDecisionReason::HashSmallerBuild { .. }
+				));
 
-	config.filtered_build_side_swap = false;
-	let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
-		.await
-		.expect("bind q17 shape, swap off");
-	let join0 = trace
-		.join_decisions
-		.iter()
-		.find(|receipt| receipt.target.join_index == 0)
-		.expect("join0 receipt");
-	assert_eq!(join0.placement, JoinPhysicalPlacement::Natural);
+				config.filtered_build_side_swap = false;
+				let (_plan, trace) = bind_with_trace(&logical, &catalog, &config)
+					.await
+					.expect("bind q17 shape, swap off");
+				let join0 = trace
+					.join_decisions
+					.iter()
+					.find(|receipt| receipt.target.join_index == 0)
+					.expect("join0 receipt");
+				assert_eq!(join0.placement, JoinPhysicalPlacement::Natural);
+			});
+		})
+		.expect("spawn deep q17 bind")
+		.join()
+		.expect("deep q17 bind thread");
 }
 
 #[tokio::test]
@@ -26267,38 +26281,52 @@ async fn adr511_left_filtered_shape_keeps_natural_in_both_arms() {
 	}
 }
 
-#[tokio::test]
-async fn adr512_q17_shape_inserts_left_semi_under_reduction() {
+#[test]
+fn adr512_q17_shape_inserts_left_semi_under_reduction() {
 	// Deferred path (unqualified correlation): with the reduction on, the
 	// grouped aggregate's input gains a LeftSemi against the filtered part
-	// keys; with it off the plan is byte-identical to ADR 511's.
-	let catalog = adr511_q17_shape_catalog();
-	let logical = SqlPlanner::new()
-		.plan(ADR511_Q17_SHAPE_SQL)
-		.expect("plan q17 shape");
-	let mut config = auto_broadcast_config(4_096);
-	config.hash_smaller_build_placement = true;
-	config.filtered_build_side_swap = true;
-	config.scalar_aggregate_input_reduction = true;
-	let plan = bind(&logical, &catalog, &config)
-		.await
-		.expect("bind q17 shape, reduction on");
-	let kinds = execution_join_kinds(&plan);
-	assert!(
-		kinds.contains(&JoinKind::RightSemi) || kinds.contains(&JoinKind::LeftSemi),
-		"reduction on must insert the semi (physically swapped to RightSemi \
-		 when the membership side is the smaller build), got {kinds:?}"
-	);
+	// keys; with it off the plan is byte-identical to ADR 511's. The deep
+	// graph bind uses the suite's explicit-stack convention.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let catalog = adr511_q17_shape_catalog();
+				let logical = SqlPlanner::new()
+					.plan(ADR511_Q17_SHAPE_SQL)
+					.expect("plan q17 shape");
+				let mut config = auto_broadcast_config(4_096);
+				config.hash_smaller_build_placement = true;
+				config.filtered_build_side_swap = true;
+				config.scalar_aggregate_input_reduction = true;
+				let plan = bind(&logical, &catalog, &config)
+					.await
+					.expect("bind q17 shape, reduction on");
+				let kinds = execution_join_kinds(&plan);
+				assert!(
+					kinds.contains(&JoinKind::RightSemi) || kinds.contains(&JoinKind::LeftSemi),
+					"reduction on must insert the semi (physically swapped to RightSemi \
+					 when the membership side is the smaller build), got {kinds:?}"
+				);
 
-	config.scalar_aggregate_input_reduction = false;
-	let plan = bind(&logical, &catalog, &config)
-		.await
-		.expect("bind q17 shape, reduction off");
-	let kinds = execution_join_kinds(&plan);
-	assert!(
-		!kinds.contains(&JoinKind::LeftSemi) && !kinds.contains(&JoinKind::RightSemi),
-		"reduction off must not insert a semi, got {kinds:?}"
-	);
+				config.scalar_aggregate_input_reduction = false;
+				let plan = bind(&logical, &catalog, &config)
+					.await
+					.expect("bind q17 shape, reduction off");
+				let kinds = execution_join_kinds(&plan);
+				assert!(
+					!kinds.contains(&JoinKind::LeftSemi) && !kinds.contains(&JoinKind::RightSemi),
+					"reduction off must not insert a semi, got {kinds:?}"
+				);
+			});
+		})
+		.expect("spawn deep q17 reduction bind")
+		.join()
+		.expect("deep q17 reduction bind thread");
 }
 
 #[tokio::test]
@@ -26759,4 +26787,355 @@ fn adr517_unsafe_predicates_stay_residual() {
 		.expect("spawn fence thread")
 		.join()
 		.expect("fence thread panicked");
+}
+
+// -- q20 grounding probes (pre-ADR): where does the reachable-key reduction decline? ----------
+
+fn q20_shape_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	for (id, table, pk, fields) in [
+		(
+			80u8,
+			"part",
+			"p_partkey",
+			vec![("p_partkey", DataType::Int64), ("p_name", DataType::Utf8)],
+		),
+		(
+			81,
+			"partsupp",
+			"ps_partkey",
+			vec![
+				("ps_partkey", DataType::Int64),
+				("ps_suppkey", DataType::Int64),
+				("ps_availqty", DataType::Float64),
+			],
+		),
+		(
+			82,
+			"lineitem",
+			"l_partkey",
+			vec![
+				("l_partkey", DataType::Int64),
+				("l_suppkey", DataType::Int64),
+				("l_quantity", DataType::Float64),
+			],
+		),
+	] {
+		let schema = Schema::new(
+			fields
+				.into_iter()
+				.map(|(name, ty)| Field::new(name, ty, false))
+				.collect::<Vec<_>>(),
+		);
+		catalog
+			.register_descriptor(TableId(id.into()), adr511_descriptor(id, table, pk, schema))
+			.expect("register");
+	}
+	catalog
+}
+
+fn bind_q20_logical_on_large_stack(logical: LogicalPlan, config: PlannerConfig) -> ExecutionPlan {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("q20 shape runtime");
+			runtime.block_on(async {
+				bind(&logical, &q20_shape_catalog(), &config)
+					.await
+					.expect("bind q20 shape")
+			})
+		})
+		.expect("spawn q20 shape bind")
+		.join()
+		.expect("q20 shape bind thread panicked")
+}
+
+fn q20_shape_plan(sql: &str, semi_filtered_reachable_keys: bool) -> ExecutionPlan {
+	let logical = SqlPlanner::new().plan(sql).expect("plan q20 shape");
+	let mut config = PlannerConfig::default();
+	config.semi_filtered_reachable_keys = semi_filtered_reachable_keys;
+	bind_q20_logical_on_large_stack(logical, config)
+}
+
+fn q20_shape_semi_count(sql: &str, semi_filtered_reachable_keys: bool) -> usize {
+	execution_join_kinds(&q20_shape_plan(sql, semi_filtered_reachable_keys))
+		.into_iter()
+		.filter(|kind| matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi))
+		.count()
+}
+
+fn execution_semi_key_name_pairs(plan: &ExecutionPlan) -> Vec<(String, String)> {
+	fn collect(plan: &ExecutionPlan, pairs: &mut Vec<(String, String)>) {
+		match plan {
+			ExecutionPlan::Join {
+				left,
+				right,
+				kind,
+				left_keys,
+				right_keys,
+				..
+			} => {
+				if matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi) {
+					for (left_key, right_key) in left_keys.iter().zip(right_keys) {
+						pairs.push((
+							left.schema().field(left_key.0 as usize).name().clone(),
+							right.schema().field(right_key.0 as usize).name().clone(),
+						));
+					}
+				}
+				collect(left, pairs);
+				collect(right, pairs);
+			}
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Window { input, .. }
+			| ExecutionPlan::Take { input, .. }
+			| ExecutionPlan::Repeat { input, .. } => collect(input, pairs),
+			ExecutionPlan::Union { left, right, .. } => {
+				collect(left, pairs);
+				collect(right, pairs);
+			}
+			_ => {}
+		}
+	}
+	let mut pairs = Vec::new();
+	collect(plan, &mut pairs);
+	pairs
+}
+
+fn semi_pairs_include(pairs: &[(String, String)], a: &str, b: &str) -> bool {
+	pairs
+		.iter()
+		.any(|(left, right)| (left == a && right == b) || (left == b && right == a))
+}
+
+#[tokio::test]
+async fn q20_probe_plain_filter_single_key_engages() {
+	// Control: a deterministic filter on the outer chain, single-key
+	// correlation — the ADR 512 rule's home shape. One semi = the reduction.
+	let semis = q20_shape_semi_count(
+		"SELECT ps_availqty FROM partsupp \
+		 WHERE ps_partkey > 100 \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey)",
+		false,
+	);
+	assert_eq!(
+		semis, 1,
+		"plain-filtered single-key must engage the reduction"
+	);
+}
+
+#[tokio::test]
+async fn q20_probe_plain_filter_composite_key_engages() {
+	// Control: composite correlation with a plain-filtered outer — both keys
+	// trace to the same filtered partsupp chain.
+	let semis = q20_shape_semi_count(
+		"SELECT ps_availqty FROM partsupp \
+		 WHERE ps_partkey > 100 \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)",
+		false,
+	);
+	assert_eq!(
+		semis, 1,
+		"plain-filtered composite must engage the reduction"
+	);
+}
+
+#[tokio::test]
+async fn adr518_membership_filter_single_key_engages() {
+	// q20's outer filter is a membership semi, not a Filter node. If the
+	// trace credited the semi (partner part is deterministically filtered),
+	// this would engage; today it declines. Expected: 1 semi = membership only.
+	let sql = "SELECT ps_availqty FROM partsupp \
+		 WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name = 'forest') \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey)";
+	let off_plan = q20_shape_plan(sql, false);
+	assert_eq!(
+		execution_join_kinds(&off_plan)
+			.into_iter()
+			.filter(|kind| matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi))
+			.count(),
+		1,
+		"knob off keeps the grounding decline"
+	);
+	let plan = q20_shape_plan(sql, true);
+	let off_schema = off_plan.schema();
+	let on_schema = plan.schema();
+	assert_eq!(
+		field_names(&off_schema),
+		field_names(&on_schema),
+		"shape exposure must preserve the deferred scalar output schema"
+	);
+	assert_eq!(
+		execution_join_kinds(&plan)
+			.into_iter()
+			.filter(|kind| matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi))
+			.count(),
+		2,
+		"semi traversal must add the reduction"
+	);
+	let pairs = execution_semi_key_name_pairs(&plan);
+	assert!(
+		semi_pairs_include(&pairs, "l_partkey", "p_partkey"),
+		"reduction must clone the filtered part-key source, got {pairs:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr518_membership_filter_composite_key_uses_traceable_subset() {
+	// The full q20 shape: membership-filtered outer, composite correlation.
+	// ps_suppkey has no filtered source anywhere, so the all-keys rule is a
+	// second, independent gate. Expected: 1 semi = membership only.
+	let sql = "SELECT ps_availqty FROM partsupp \
+		 WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name = 'forest') \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)";
+	assert_eq!(
+		q20_shape_semi_count(sql, false),
+		1,
+		"knob off keeps both grounding gates closed"
+	);
+	let plan = q20_shape_plan(sql, true);
+	assert_eq!(
+		execution_join_kinds(&plan)
+			.into_iter()
+			.filter(|kind| matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi))
+			.count(),
+		2,
+		"traceable-subset derivation must add one reduction semi"
+	);
+	let pairs = execution_semi_key_name_pairs(&plan);
+	assert!(
+		semi_pairs_include(&pairs, "l_partkey", "p_partkey"),
+		"traceable part key must drive the reduction, got {pairs:?}"
+	);
+	assert!(
+		!pairs
+			.iter()
+			.any(|(left, right)| left == "l_suppkey" || right == "l_suppkey"),
+		"untraced supplier key must not be miswired into the subset semi: {pairs:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr518_non_prefix_subset_keeps_original_inner_key_position() {
+	// Only tuple position 1 traces: ps_suppkey crosses the membership semi to
+	// filtered part.p_partkey, while tuple position 0 has no filtered source.
+	// A shortened-vector zip would incorrectly pair l_partkey with p_partkey.
+	let sql = "SELECT ps_availqty FROM partsupp \
+		 WHERE ps_suppkey IN (SELECT p_partkey FROM part WHERE p_name = 'forest') \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)";
+	let plan = q20_shape_plan(sql, true);
+	let pairs = execution_semi_key_name_pairs(&plan);
+	assert!(
+		semi_pairs_include(&pairs, "l_suppkey", "p_partkey"),
+		"source key must pair with tuple position 1, got {pairs:?}"
+	);
+	assert!(
+		!semi_pairs_include(&pairs, "l_partkey", "p_partkey"),
+		"non-prefix subset must not fall back to tuple position 0: {pairs:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr518_zero_traceable_keys_still_declines() {
+	let sql = "SELECT ps_availqty FROM partsupp \
+		 WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name = 'forest') \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_suppkey = ps_suppkey)";
+	assert_eq!(
+		q20_shape_semi_count(sql, true),
+		1,
+		"membership remains, but no reduction may be derived without a traced key"
+	);
+}
+
+#[tokio::test]
+async fn adr518_keys_tracing_to_different_sources_decline() {
+	let sql = "SELECT ps_availqty FROM partsupp, \
+		   (SELECT p_partkey FROM part WHERE p_name = 'forest') AS fp1, \
+		   (SELECT p_partkey AS other_key FROM part WHERE p_name = 'forest') AS fp2 \
+		 WHERE ps_partkey = fp1.p_partkey AND ps_suppkey = fp2.other_key \
+		   AND ps_availqty > (SELECT SUM(l_quantity) FROM lineitem \
+		                      WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey)";
+	assert_eq!(
+		q20_shape_semi_count(sql, true),
+		0,
+		"two independently filtered sources require composition and must decline"
+	);
+}
+
+#[tokio::test]
+async fn adr518_right_semi_traverses_from_preserved_side_only() {
+	// The SQL frontend rejects a derived-table operand on an explicit
+	// RightSemi, so construct the same transient binder shape directly.
+	let filtered_part = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("part"),
+			projection: None,
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("p_name")),
+			Box::new(Expr::Literal(ScalarValue::Utf8(Some("forest".to_string())))),
+		),
+	};
+	let deferred = LogicalPlan::DeferredScalarSubquery {
+		outer: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("partsupp"),
+			projection: None,
+		}),
+		inner: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("lineitem"),
+			projection: None,
+		}),
+		predicates: vec![Expr::Eq(
+			Box::new(Expr::column("l_partkey")),
+			Box::new(Expr::column("ps_partkey")),
+		)],
+		aggregate: (AggregateFunction::Sum, vec![Expr::column("l_quantity")]),
+		alias: "__scalar_adr518_right".to_string(),
+	};
+	let logical = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			input: Box::new(filtered_part),
+			partition_count: 4,
+			key: vec![Expr::column("p_partkey")],
+		}),
+		right: Box::new(LogicalPlan::Exchange {
+			input: Box::new(deferred),
+			partition_count: 4,
+			key: vec![Expr::column("ps_partkey")],
+		}),
+		kind: JoinKind::RightSemi,
+		on: vec![(Expr::column("p_partkey"), Expr::column("ps_partkey"))],
+		on_filter: None,
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let mut config = PlannerConfig::default();
+	config.semi_filtered_reachable_keys = true;
+	let plan = bind_q20_logical_on_large_stack(logical, config);
+	let pairs = execution_semi_key_name_pairs(&plan);
+	assert_eq!(
+		execution_join_kinds(&plan)
+			.into_iter()
+			.filter(|kind| matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi))
+			.count(),
+		2,
+		"right membership plus reduction expected"
+	);
+	assert!(
+		semi_pairs_include(&pairs, "l_partkey", "p_partkey"),
+		"RightSemi must trace from its preserved right side to the left membership source: {pairs:?}"
+	);
 }

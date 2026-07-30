@@ -14,7 +14,9 @@ use super::*;
 
 pub(super) struct ReachableKeySource {
 	pub(super) source: LogicalPlan,
-	pub(super) source_keys: Vec<Expr>,
+	/// `(outer correlation tuple index, source key)` pairs. Keeping the
+	/// original index is load-bearing when only a non-prefix subset traces.
+	pub(super) key_mappings: Vec<(usize, Expr)>,
 }
 
 fn plain_column(expr: &Expr) -> Option<&ColumnRef> {
@@ -138,24 +140,63 @@ impl<'a> Binder<'a> {
 						on,
 						..
 					} => {
-						if matches!(kind, JoinKind::Inner) {
-							for (a, b) in on {
-								if let (Some(a), Some(b)) = (plain_column(a), plain_column(b)) {
-									if columns_structurally_equal(a, &column) {
-										candidates.push((right, b.clone()));
-									} else if columns_structurally_equal(b, &column) {
-										candidates.push((left, a.clone()));
-									}
-								}
-							}
-						}
 						let owns_left = self.reduction_scope_owns_column(left, &column).await;
 						let owns_right = self.reduction_scope_owns_column(right, &column).await;
-						plan = match (owns_left, owns_right) {
-							(true, false) => left,
-							(false, true) => right,
-							_ => break,
-						};
+						match kind {
+							JoinKind::Inner => {
+								for (a, b) in on {
+									if let (Some(a), Some(b)) = (plain_column(a), plain_column(b)) {
+										if columns_structurally_equal(a, &column) {
+											candidates.push((right, b.clone()));
+										} else if columns_structurally_equal(b, &column) {
+											candidates.push((left, a.clone()));
+										}
+									}
+								}
+								plan = match (owns_left, owns_right) {
+									(true, false) => left,
+									(false, true) => right,
+									_ => break,
+								};
+							}
+							JoinKind::LeftSemi
+								if self.config.semi_filtered_reachable_keys
+									&& owns_left && !owns_right =>
+							{
+								for (left_key, right_key) in on {
+									if let (Some(left_key), Some(right_key)) =
+										(plain_column(left_key), plain_column(right_key))
+									{
+										if columns_structurally_equal(left_key, &column) {
+											candidates.push((right, right_key.clone()));
+										}
+									}
+								}
+								plan = left;
+							}
+							JoinKind::RightSemi
+								if self.config.semi_filtered_reachable_keys
+									&& owns_right && !owns_left =>
+							{
+								for (left_key, right_key) in on {
+									if let (Some(left_key), Some(right_key)) =
+										(plain_column(left_key), plain_column(right_key))
+									{
+										if columns_structurally_equal(right_key, &column) {
+											candidates.push((left, left_key.clone()));
+										}
+									}
+								}
+								plan = right;
+							}
+							_ => {
+								plan = match (owns_left, owns_right) {
+									(true, false) => left,
+									(false, true) => right,
+									_ => break,
+								};
+							}
+						}
 					}
 					_ => break,
 				}
@@ -164,9 +205,10 @@ impl<'a> Binder<'a> {
 		None
 	}
 
-	/// Derive the semi build for the given outer correlation keys. All keys
-	/// must trace to the same filtered base-relation chain, or the rule
-	/// declines.
+	/// Derive the semi build for the given outer correlation keys. ADR 512
+	/// requires every key to reach the same filtered base chain. ADR 518 may
+	/// retain a nonempty same-source subset, carrying original tuple positions
+	/// so both callers pair each source key with the correct inner/group key.
 	pub(super) async fn derive_reachable_key_source(
 		&self,
 		outer: &LogicalPlan,
@@ -176,10 +218,16 @@ impl<'a> Binder<'a> {
 			return None;
 		}
 		let mut source_plan: Option<&LogicalPlan> = None;
-		let mut source_keys = Vec::with_capacity(outer_keys.len());
-		for key in outer_keys {
+		let mut key_mappings = Vec::with_capacity(outer_keys.len());
+		for (index, key) in outer_keys.iter().enumerate() {
 			let column = plain_column(key)?.clone();
-			let (subtree, resolved) = self.trace_key_to_filtered_base(outer, column).await?;
+			let Some((subtree, resolved)) = self.trace_key_to_filtered_base(outer, column).await
+			else {
+				if self.config.semi_filtered_reachable_keys {
+					continue;
+				}
+				return None;
+			};
 			match source_plan {
 				None => source_plan = Some(subtree),
 				Some(existing) => {
@@ -188,11 +236,117 @@ impl<'a> Binder<'a> {
 					}
 				}
 			}
-			source_keys.push(Expr::Column(resolved));
+			key_mappings.push((index, Expr::Column(resolved)));
+		}
+		if key_mappings.is_empty() {
+			return None;
 		}
 		Some(ReachableKeySource {
 			source: source_plan?.clone(),
-			source_keys,
+			key_mappings,
+		})
+	}
+
+	/// ADR 518 shape exposure for the deferred path. SQL lowering places an
+	/// `IN` membership semi immediately above `Exchange(DeferredScalarSubquery)`
+	/// in q20, while ADR 512 derives reachability while binding the wrapper's
+	/// still-unfiltered outer. Move that exact semi onto the deferred scalar's
+	/// outer input when every membership/exchange key belongs to that outer.
+	/// The membership subtree moves once; the scalar inner is untouched.
+	pub(super) async fn try_expose_membership_to_deferred_scalar(
+		&self,
+		left: &LogicalPlan,
+		right: &LogicalPlan,
+		kind: JoinKind,
+		on: &[(Expr, Expr)],
+		null_safe_keys: bool,
+		strategy_intent: JoinStrategyIntent,
+	) -> Option<LogicalPlan> {
+		if !self.config.semi_filtered_reachable_keys
+			|| null_safe_keys
+			|| on.is_empty()
+			|| !matches!(kind, JoinKind::LeftSemi | JoinKind::RightSemi)
+		{
+			return None;
+		}
+		let (preserved, membership, preserved_keys): (&LogicalPlan, &LogicalPlan, Vec<&Expr>) =
+			match kind {
+				JoinKind::LeftSemi => (
+					left,
+					right,
+					on.iter().map(|(left_key, _)| left_key).collect(),
+				),
+				JoinKind::RightSemi => (
+					right,
+					left,
+					on.iter().map(|(_, right_key)| right_key).collect(),
+				),
+				_ => return None,
+			};
+		if !membership_body_whitelisted(membership) {
+			return None;
+		}
+		let LogicalPlan::Exchange {
+			input,
+			partition_count,
+			key: exchange_keys,
+		} = preserved
+		else {
+			return None;
+		};
+		let LogicalPlan::DeferredScalarSubquery {
+			outer,
+			inner,
+			predicates,
+			aggregate,
+			alias,
+		} = input.as_ref()
+		else {
+			return None;
+		};
+		for key in preserved_keys.into_iter().chain(exchange_keys) {
+			let column = plain_column(key)?;
+			if !self.reduction_scope_owns_column(outer, column).await {
+				return None;
+			}
+		}
+		if on.iter().any(|(left_key, right_key)| {
+			plain_column(left_key).is_none() || plain_column(right_key).is_none()
+		}) {
+			return None;
+		}
+		let exchanged_outer = LogicalPlan::Exchange {
+			input: outer.clone(),
+			partition_count: *partition_count,
+			key: exchange_keys.clone(),
+		};
+		let moved_membership = match kind {
+			JoinKind::LeftSemi => LogicalPlan::Join {
+				left: Box::new(exchanged_outer),
+				right: Box::new(membership.clone()),
+				kind,
+				on: on.to_vec(),
+				on_filter: None,
+				null_safe_keys,
+				strategy_intent,
+			},
+			JoinKind::RightSemi => LogicalPlan::Join {
+				left: Box::new(membership.clone()),
+				right: Box::new(exchanged_outer),
+				kind,
+				on: on.to_vec(),
+				on_filter: None,
+				null_safe_keys,
+				strategy_intent,
+			},
+			_ => return None,
+		};
+		Some(LogicalPlan::DeferredScalarSubquery {
+			outer: Box::new(moved_membership),
+			inner: inner.clone(),
+			predicates: predicates.clone(),
+			aggregate: aggregate.clone(),
+			alias: alias.clone(),
 		})
 	}
 
@@ -215,14 +369,17 @@ impl<'a> Binder<'a> {
 		let Some(reduced) = self.derive_reachable_key_source(outer, &outer_keys).await else {
 			return inner;
 		};
+		let ReachableKeySource {
+			source,
+			key_mappings,
+		} = reduced;
 		LogicalPlan::Join {
 			left: Box::new(inner),
-			right: Box::new(reduced.source),
+			right: Box::new(source),
 			kind: JoinKind::LeftSemi,
-			on: pairs
-				.iter()
-				.map(|(_, inner_key)| inner_key.clone())
-				.zip(reduced.source_keys)
+			on: key_mappings
+				.into_iter()
+				.map(|(index, source_key)| (pairs[index].1.clone(), source_key))
 				.collect(),
 			on_filter: None,
 			null_safe_keys: false,
@@ -327,17 +484,20 @@ impl<'a> Binder<'a> {
 			outer_keys.push(outer_expr.clone());
 		}
 		let reduced = self.derive_reachable_key_source(outer, &outer_keys).await?;
+		let ReachableKeySource {
+			source,
+			key_mappings,
+		} = reduced;
 		let rebuilt = LogicalPlan::Alias {
 			input: Box::new(LogicalPlan::Aggregate {
 				input: Box::new(LogicalPlan::Exchange {
 					input: Box::new(LogicalPlan::Join {
 						left: inner.clone(),
-						right: Box::new(reduced.source),
+						right: Box::new(source),
 						kind: JoinKind::LeftSemi,
-						on: group_expr
-							.iter()
-							.cloned()
-							.zip(reduced.source_keys)
+						on: key_mappings
+							.into_iter()
+							.map(|(index, source_key)| (group_expr[index].clone(), source_key))
 							.collect(),
 						on_filter: None,
 						null_safe_keys: false,

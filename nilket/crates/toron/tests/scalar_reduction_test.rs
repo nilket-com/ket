@@ -292,6 +292,7 @@ fn bridge_schema() -> SchemaRef {
 fn gagg_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("g_pid", DataType::Int64, true),
+		Field::new("g_bid", DataType::Int64, true),
 		Field::new("g_qty", DataType::Float64, false),
 	]))
 }
@@ -342,19 +343,28 @@ fn src_batch(schema: SchemaRef) -> RecordBatch {
 }
 
 fn gagg_batch(schema: SchemaRef) -> RecordBatch {
-	// pid 1 duplicated; pid 2 absent; pids 3 and 9 unreachable through the
-	// filtered src; one null key.
+	// pid 1 duplicated at bid 1 plus an extra bid-99 group; pid 2 absent;
+	// pids 3 and 9 unreachable through filtered src; one null key.
 	RecordBatch::try_new(
 		schema,
 		vec![
 			Arc::new(Int64Array::from(vec![
 				Some(1),
 				Some(1),
+				Some(1),
 				Some(3),
 				Some(9),
 				None,
 			])),
-			Arc::new(Float64Array::from(vec![10.0, 50.0, 30.0, 40.0, 70.0])),
+			Arc::new(Int64Array::from(vec![
+				Some(1),
+				Some(1),
+				Some(99),
+				Some(1),
+				Some(2),
+				None,
+			])),
+			Arc::new(Float64Array::from(vec![10.0, 50.0, 90.0, 30.0, 40.0, 70.0])),
 		],
 	)
 	.expect("gagg batch")
@@ -414,6 +424,94 @@ impl StorageScan for FixtureScan {
 			vec![batch],
 		))
 	}
+}
+
+// -- ADR 518: membership-filtered reachable-key sources ------------------------------------
+
+fn adr518_arms(sql: &'static str, expected_on_semis: usize) {
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("ADR 518 runtime");
+			runtime.block_on(adr518_arms_body(sql, expected_on_semis));
+		})
+		.expect("spawn ADR 518 test")
+		.join()
+		.expect("ADR 518 test thread panicked");
+}
+
+async fn adr518_arms_body(sql: &str, expected_on_semis: usize) {
+	let logical = SqlPlanner::new().plan(sql).expect("plan ADR 518 SQL");
+	let (catalog, storage) = fixture();
+	let mut results = Vec::new();
+	for coverage in [false, true] {
+		let mut config = PlannerConfig::default();
+		config.semi_filtered_reachable_keys = coverage;
+		let bound = bind(&logical, &catalog, &config)
+			.await
+			.expect("bind ADR 518 SQL");
+		let semis = count_join_kind(&bound, JoinKind::LeftSemi)
+			+ count_join_kind(&bound, JoinKind::RightSemi);
+		assert_eq!(
+			semis,
+			if coverage { expected_on_semis } else { 1 },
+			"coverage={coverage} must have the expected membership/reduction semis for {sql}"
+		);
+		let executor = Executor::new(Arc::clone(&storage) as Arc<dyn StorageScan>);
+		let batches = executor.execute_bound(&bound, None).await.expect("execute");
+		results.push(collect_f64(&batches));
+	}
+	assert_eq!(
+		results[0], results[1],
+		"semi-filtered reachable-key coverage must not change results for {sql}"
+	);
+}
+
+#[test]
+fn adr518_q20_shape_is_equivalent_with_nulls_duplicates_and_subset_keys() {
+	// Membership filters fact by the deterministic src chain. Null membership
+	// keys never survive plain equality; fact pid 1 is duplicated; gagg has
+	// duplicate pid/bid-1 rows and an extra bid-99 group. The reduction traces
+	// f_pid only, so it deliberately keeps the bid-99 group as a harmless
+	// superset even though the composite recombine can never consume it.
+	adr518_arms(
+		"SELECT f_qty FROM fact \
+		 WHERE f_pid IN (SELECT s_pid FROM src WHERE s_cat = 'X') \
+		   AND f_qty < (SELECT AVG(g_qty) FROM gagg \
+		                WHERE g_pid = f_pid AND g_bid = f_bid)",
+		2,
+	);
+}
+
+#[test]
+fn adr518_empty_membership_source_is_equivalent() {
+	// The cloned filtered source is empty. Both the original membership and
+	// the reduction eliminate everything without inventing a scalar row.
+	adr518_arms(
+		"SELECT f_qty FROM fact \
+		 WHERE f_pid IN (SELECT s_pid FROM src WHERE s_cat = 'Z') \
+		   AND f_qty < (SELECT AVG(g_qty) FROM gagg \
+		                WHERE g_pid = f_pid AND g_bid = f_bid)",
+		2,
+	);
+}
+
+#[test]
+fn adr518_non_prefix_subset_is_equivalent() {
+	// Correlation tuple position 0 (pid) has no filtered source; position 1
+	// (bid) crosses the membership Right/LeftSemi to filtered bridge. The
+	// extra gagg (pid 1, bid 99) row proves that ignoring the untraced pid key
+	// produces a weaker semi while the final composite recombine stays exact.
+	adr518_arms(
+		"SELECT f_qty FROM fact \
+		 WHERE f_bid IN (SELECT b_id FROM bridge WHERE b_id > 0) \
+		   AND f_qty < (SELECT AVG(g_qty) FROM gagg \
+		                WHERE g_pid = f_pid AND g_bid = f_bid)",
+		2,
+	);
 }
 
 // -- ADR 515: membership-first composition -------------------------------------------------

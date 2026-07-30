@@ -18,13 +18,14 @@ use toron_tpch::{
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
 	export_persisted_perf_query_parquet, gauge_filtered_build_side_swap, gauge_hash_smaller_build,
 	gauge_membership_first, gauge_memory_per_task, gauge_scalar_agg_input_reduction,
-	gauge_side_local_filter_routing, gauge_spill_bytes_reserved, generate_dev_lineitem,
-	load_persisted_tpch_dataset, matrix, node_attribution_outer_reconciliation,
-	normalize_duckdb_type, paired_ablation_dataset_fingerprint, parse_scale_factor,
-	prepare_persisted_tpch_dataset, primitive_ladder_intent, q17_correctness_scale, run_dev_q1,
-	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
-	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	gauge_semi_filtered_reachable_keys, gauge_side_local_filter_routing,
+	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
+	node_attribution_outer_reconciliation, normalize_duckdb_type,
+	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
+	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -189,6 +190,11 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	};
 	let (side_local_routing, side_local_routing_provenance) =
 		match gauge_side_local_filter_routing() {
+			Ok(setting) => setting,
+			Err(message) => return harness_error(&message),
+		};
+	let (semi_filtered_reachable_keys, semi_filtered_reachable_keys_provenance) =
+		match gauge_semi_filtered_reachable_keys() {
 			Ok(setting) => setting,
 			Err(message) => return harness_error(&message),
 		};
@@ -358,6 +364,9 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["membership_first_composition_provenance"] = serde_json::json!(membership_first_provenance);
 	row["side_local_filter_routing"] = serde_json::json!(side_local_routing);
 	row["side_local_filter_routing_provenance"] = serde_json::json!(side_local_routing_provenance);
+	row["semi_filtered_reachable_keys"] = serde_json::json!(semi_filtered_reachable_keys);
+	row["semi_filtered_reachable_keys_provenance"] =
+		serde_json::json!(semi_filtered_reachable_keys_provenance);
 	if std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some() {
 		let ledger = take_parquet_scan_ledger();
 		let batches = ledger.iter().flat_map(|scan| scan.batches.iter());
@@ -6320,6 +6329,33 @@ mod adr517_tests {
 		unsafe { std::env::set_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING", "yes") };
 		assert!(gauge_side_local_filter_routing().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING") };
+	}
+}
+#[cfg(test)]
+mod adr518_tests {
+	use super::*;
+
+	#[test]
+	fn adr518_semi_filtered_reachable_keys_knob_contract() {
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::remove_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS") };
+		assert_eq!(
+			gauge_semi_filtered_reachable_keys().unwrap(),
+			(false, "default")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "1") };
+		assert_eq!(
+			gauge_semi_filtered_reachable_keys().unwrap(),
+			(true, "explicit")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "0") };
+		assert_eq!(
+			gauge_semi_filtered_reachable_keys().unwrap(),
+			(false, "explicit")
+		);
+		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "yes") };
+		assert!(gauge_semi_filtered_reachable_keys().is_err());
+		unsafe { std::env::remove_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS") };
 	}
 }
 

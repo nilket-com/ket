@@ -28,18 +28,35 @@ semi-filtered shapes decline, at two independent gates:
 
 ## Decision
 
-Two bounded relaxations, both instances of ADR 512's existing superset theorem — the semi build
-must only be a superset of the keys actually probed; row-removal above the source never breaks
-that:
+Implementation grounding added one shape fact the probe matrix did not expose: official q20's
+unqualified/deferred lowering places the part membership semi immediately **above** the
+`DeferredScalarSubquery`, while the ADR 512 hook runs while binding the wrapper's still-unfiltered
+`outer`. The trace relaxations alone therefore cannot reach q20. A bounded normalization exposes
+the same evidence before the two theorem-preserving relaxations run:
 
-1. **Semi-partner traversal.** At a membership semi in the trace, the surviving probe-side key
+1. **Deferred-scalar membership exposure.** Recognize a plain-equality LeftSemi/RightSemi whose
+   preserved side is exactly `Exchange(DeferredScalarSubquery)` and whose membership subtree is
+   self-contained under ADR 515's whitelist. Every preserved-side key and exchange key must
+   resolve exclusively in the deferred scalar's `outer`; the membership cannot inspect the
+   scalar value. Move that exact semi (body, ON tuple, strategy intent, and exchange metadata) to
+   become the deferred scalar's outer input, once, and remove its former wrapper. This is the
+   row-filter identity across a scalar extension: filtering on pre-existing outer columns before
+   computing a correlated scalar is identical to computing it and then filtering, because
+   scalar values for eliminated outer rows are unobservable. The rewrite terminates
+   structurally—the rebuilt semi no longer wraps a deferred scalar—and neither the membership
+   body nor the scalar inner is cloned.
+2. **Semi-partner traversal.** At a membership semi in the trace, the surviving probe-side key
    domain is bounded by the build-side equality partner (a row survives only by matching), so
    the partner is queued exactly as an `Inner` equality partner is today, and the semi is
    skipped as a row-removing node like `Filter`/`Distinct`. Orientation-general (left or right
    membership), same plain-column equality requirement as the `Inner` arm.
-2. **Traceable-subset derivation.** When a nonempty subset of correlation keys traces to one
+3. **Traceable-subset derivation.** When a nonempty subset of correlation keys traces to one
    common filtered source and the remaining keys trace nowhere, derive the semi on that subset.
    A semi on fewer keys removes fewer rows — a strictly weaker, still-sound superset reduction.
+   The derived source carries each retained key's original correlation-tuple index; both
+   decorrelation paths select their inner/group key by that index rather than zipping a shortened
+   source-key vector from position zero. A non-prefix fixture (only key 1 of a two-key tuple
+   traces) pins this mapping as load-bearing.
    Keys tracing to **different** filtered sources still decline (no multi-source composition in
    this cut); zero traceable keys still decline; every other gate is untouched.
 
@@ -58,9 +75,14 @@ with provenance. Plans change; cohorts run plan-distinct.
 
 1. **Structural battery**: the four grounding probes ride the impl, the two semi shapes flipped
    to engagement (single-key and composite both insert the reduction semi keyed on the traced
-   subset); declines pinned for keys tracing to different filtered sources, zero traceable
-   keys, and a non-equality membership; the derived source is the filtered dimension scan, not
-   a join clone (asserted on the bound plan).
+   subset); a non-prefix composite fixture proves the retained source key is paired with its
+   original inner/group key; LeftSemi and RightSemi fixtures prove traversal only from each
+   join's preserved/output side toward its membership side; declines are pinned for keys tracing
+   to different filtered sources, zero traceable keys, and a membership edge without a
+   plain-equality partner for the traced key. The derived source is the filtered dimension scan,
+   not a join clone (asserted on the bound plan). An official-shaped deferred fixture pins the
+   exposure rewrite: one original membership invocation, one cloned tiny source for the reduction,
+   no duplicated membership join, and identical scalar/output schemas.
 2. **Semantic battery** (both arms identical results, the 512/515/517 fixture family): NULL
    keys on both sides, duplicate outer rows and duplicate matches, empty membership, and a
    subset-reduction case where the untraced key would have removed additional rows — proving
@@ -76,7 +98,7 @@ with provenance. Plans change; cohorts run plan-distinct.
 
 ## Guardrails
 
-- Both relaxations fail closed to today's residual behavior; the knob-off arm is
+- All three increments fail closed to today's residual behavior; the knob-off arm is
   byte-identical.
 - No executor changes; the semi the rule inserts is the same LeftSemi the placement and
   admission machinery already handles (ADR 511/512 surfaces untouched).
