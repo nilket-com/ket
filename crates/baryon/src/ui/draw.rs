@@ -40,11 +40,36 @@ const BUSY_SPINNER_FRAMES: [[char; 2]; 10] = [
 ];
 
 fn diff_block_fill(base: Rgb, accent: Rgb) -> Rgb {
-	blend_rgb(base, accent, libaryon::core::BlendRatio::new(2, 5))
+	let glass = blend_rgb(base, accent, libaryon::core::BlendRatio::new(2, 5));
+	cap_dark_glass_luma(base, glass, 46)
 }
 
 fn diff_intra_line_fill(base: Rgb, accent: Rgb) -> Rgb {
-	blend_rgb(base, accent, libaryon::core::BlendRatio::new(4, 5))
+	let glass = blend_rgb(base, accent, libaryon::core::BlendRatio::new(3, 5));
+	cap_dark_glass_luma(base, glass, 66)
+}
+
+fn cap_dark_glass_luma(base: Rgb, glass: Rgb, lift: u32) -> Rgb {
+	let luma = |color: Rgb| {
+		(u32::from(color.r) * 299
+			+ u32::from(color.g) * 587
+			+ u32::from(color.b) * 114)
+			/ 1_000
+	};
+	let base_luma = luma(base);
+	if base_luma >= 128 {
+		return glass;
+	}
+	let glass_luma = luma(glass);
+	let cap = base_luma.saturating_add(lift).min(255);
+	if glass_luma <= cap || glass_luma == 0 {
+		return glass;
+	}
+	let scale = |channel: u8| {
+		u8::try_from(u32::from(channel) * cap / glass_luma)
+			.expect("luminance cap never increases a channel")
+	};
+	Rgb::new(scale(glass.r), scale(glass.g), scale(glass.b))
 }
 
 fn braille_spinner_frame(frame: usize) -> [char; 2] {
@@ -1892,19 +1917,32 @@ mod tests {
 	};
 
 	#[test]
-	fn dark_diff_glass_keeps_substantially_more_palette_color_than_the_old_wash() {
+	fn dark_diff_glass_stays_saturated_while_capping_perceptual_brightness() {
 		let palette = UiPalette::default();
 		assert_eq!(
 			diff_block_fill(palette.editor_background, palette.diff_added),
-			libaryon::core::Rgb::new(42, 90, 58)
+			libaryon::core::Rgb::new(37, 80, 51)
+		);
+		assert_eq!(
+			diff_block_fill(palette.editor_background, palette.diff_removed),
+			libaryon::core::Rgb::new(104, 46, 46),
+			"the already-dark red glass should remain unchanged"
 		);
 		assert_eq!(
 			diff_block_fill(palette.editor_background, palette.diff_modified),
-			libaryon::core::Rgb::new(50, 74, 104)
+			libaryon::core::Rgb::new(45, 67, 95)
 		);
 		assert_eq!(
 			diff_intra_line_fill(palette.editor_background, palette.diff_moved),
-			libaryon::core::Rgb::new(155, 99, 191)
+			libaryon::core::Rgb::new(102, 67, 125)
+		);
+		assert_eq!(
+			diff_block_fill(
+				libaryon::core::Rgb::new(230, 230, 230),
+				palette.diff_added
+			),
+			libaryon::core::Rgb::new(170, 218, 186),
+			"the black-glass luminance cap is dark-theme-specific"
 		);
 	}
 
