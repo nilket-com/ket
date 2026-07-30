@@ -6377,7 +6377,7 @@ mod adr521_tests {
 		unsafe { std::env::remove_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION") };
 		assert_eq!(
 			gauge_outer_count_preaggregation().unwrap(),
-			(false, "default")
+			(true, "default")
 		);
 		unsafe { std::env::set_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION", "1") };
 		assert_eq!(

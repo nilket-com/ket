@@ -73,3 +73,84 @@ verdict reporting.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Measured outcome
+
+### Seal and semantic evidence
+
+Steps 1-2 sealed and pushed as `2c78c305`. The rewrite consumes only ADR 520's ordered
+proof-tier accessor; the fixtures prove that primary-key-only, estimated-NDV-only, and
+wrong-order evidence all decline. Seven execution fixtures pin the original aggregate field
+contract through parent projection pruning and cover unmatched rows, all-filtered input,
+duplicate matches, NULL counted values, NULL keys, and every six-gate decline. One real defect
+was caught before the seal: the new async bind hook overflowed the deep-chain fixture until its
+future was boxed at the recursive boundary. The permanent breadth-cap test now covers that
+path.
+
+The seal battery passed with direct exit statuses: 1,456 Toron lib tests, 2,095 architecture
+tests, the complete `--no-fail-fast` integration and toron-tpch suites, all three
+`--all-targets` checks, fmt, and `git diff --check`. Architecture reconciliations add the carved
+module and changed-surface fixture, move ADR 176's binder-root bound 6,230 → 6,275 with its
+justification, and enforce that this module cannot consult primary-key or NDV evidence.
+
+### Census, correctness, and attribution gate
+
+Both arms used the sealed release binary, the ADR 520 manifest-format-2 sf=8 dataset under
+`full_hash`, and explicit 2 GiB memory/spill budgets. The q-series engaged exactly q13:
+
+| fact | control | candidate |
+|---|---:|---:|
+| plan fingerprint | `32c7b15a1c5a244e` | `4ddb353ff791ff65` |
+| one-run execute | 9,387.779 ms | 3,333.286 ms |
+| spill | 5,131,808 B | 0 B |
+| peak RSS | 650,396 KiB | 350,496 KiB |
+| output | 44 rows, schema `fnv1a64:06933e705bc02cb3` | identical |
+
+All 22 q-series digests, schemas, row counts, and statuses match; the other 21 plans are
+identical. All 11 ladder cells are invariant on plan, digest, row count, and spill. Strict sf=8
+correctness passes for q13 and the q19 sentinel in both arms.
+
+The exact-coordinate node pair corroborates the mechanism: `left_outer_grouped` disappears;
+aggregate ownership falls 9,257.4 → 3,169.8 ms; its survivor is the reconciled 3,158.7 ms
+`scan_grouped` orders preaggregation; spill falls 5,131,808 → 0 and RSS by about 298 MiB. Thus
+the inherited twin's field-contract warning is resolved by the rewrite itself, and the win is
+volume removal rather than spill relocation.
+
+One discarded scratch census used obsolete budget variable names and consequently reported the
+compiled 64 MiB / 512 MiB defaults. It was stopped before completion and is not evidence. Every
+number above comes from the rerun whose rows state both 2 GiB budgets with `explicit`
+provenance.
+
+### Locked q13 cohort and activation
+
+The plan-distinct gate passed with one digest and schema across arms. Ten adjacent pairs from
+the persisted journal all report control spill 5,131,808 B and candidate spill 0 B:
+
+| statistic | value |
+|---|---:|
+| Hodges-Lehmann point | **+5,985.221 ms** |
+| two-sided 95% Wilcoxon interval | **[+5,964.995, +6,002.108] ms** |
+| fixed materiality floor | 3,554 ms |
+| verdict | **activate** |
+
+The interval lower bound alone is 1.68x the inherited floor. Pair differences (control minus
+candidate, ms) are 5,959.960; 5,947.890; 5,963.224; 6,021.288; 5,982.101; 5,988.342;
+6,015.280; 6,002.108; 5,974.805; 6,001.411. All 20 children pass with one 44-row digest,
+schema fingerprint, and the two predeclared plan fingerprints.
+
+Per ADR 472's rule, the sole engaged cell activates with no census regression. This receipt
+flips `outer_count_preaggregation` to compiled default true, retargets the knob-contract
+default arm, and re-runs the complete seal battery plus default-arm strict sf=8 q13/q19 smokes
+from a fresh release build.
+
+The post-521 owner is now the roughly 3.16 s orders preaggregation — below the fixed floor by
+itself and a third tenant of the grouped-fold family after q18 and q20. Wendelon's declared
+`EnforcedConstraint` tier remains an independent cross-ring follow-on; this rewrite continues
+to accept proof-tier evidence only.
+
+| evidence | artifact |
+|---|---|
+| q-series censuses | `target/tpch/adr521_route_census_{off,on}_v2_2c78c305/` |
+| primitive ladder | `target/tpch/adr521_ladder_census_{off,on}_2c78c305/` |
+| exact-coordinate attribution | `target/tpch/adr521_q13_attr_{off,on}_2c78c305/` |
+| locked cohort | `target/tpch/adr521_q13_paired_2c78c305/` |

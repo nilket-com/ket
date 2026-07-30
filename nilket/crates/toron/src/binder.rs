@@ -219,7 +219,8 @@ pub struct PlannerConfig {
 	pub semi_filtered_reachable_keys: bool,
 	/// ADR 521: preaggregate a counted right column beneath a plain-equality
 	/// left outer join when proof-grade unique-key evidence establishes one
-	/// preserved row per group. Default off until the ADR 521 receipt.
+	/// preserved row per group. Default-on since the ADR 521 receipt: q13 pairs
+	/// improved 5,948-6,021 ms; spill fell 5,131,808 B → 0; field contracts held.
 	pub outer_count_preaggregation: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
@@ -256,7 +257,7 @@ impl Default for PlannerConfig {
 			membership_first_composition: true,
 			side_local_filter_routing: true,
 			semi_filtered_reachable_keys: true,
-			outer_count_preaggregation: false,
+			outer_count_preaggregation: true,
 		}
 	}
 }
