@@ -1157,6 +1157,7 @@ struct SemanticRuntime<'a> {
 	structural_issue: &'a mut Option<super::session::StructuralIssue>,
 	last_len: &'a mut usize,
 	last_path: &'a mut Option<String>,
+	last_analysis_depth: &'a mut Option<super::language::AnalysisDepth>,
 	pending_request_id: &'a mut Option<RequestId>,
 	cached_sum_tree: &'a mut Option<CachedSumTree>,
 	view_revision: &'a mut u64,
@@ -1173,6 +1174,7 @@ impl SemanticRuntime<'_> {
 			structural_issue: &mut semantic.structural_issue,
 			last_len: &mut semantic.last_semantic_len,
 			last_path: &mut semantic.last_semantic_path,
+			last_analysis_depth: &mut semantic.last_analysis_depth,
 			pending_request_id: &mut semantic.pending_semantic_request_id,
 			cached_sum_tree: &mut semantic.cached_sum_tree,
 			view_revision: &mut semantic.view_revision,
@@ -1192,6 +1194,7 @@ impl SemanticRuntime<'_> {
 		*self.structural_issue = None;
 		*self.last_len = usize::MAX;
 		*self.last_path = None;
+		*self.last_analysis_depth = None;
 		*self.pending_request_id = None;
 		*self.cached_sum_tree = None;
 		*self.view_revision = self.view_revision.wrapping_add(1);

@@ -54,6 +54,17 @@ impl fmt::Display for LanguageId {
 // SemanticOutput — Reactor result bundle
 // ============================================================
 
+/// Amount of provider work requested for one document state.
+///
+/// Topology-only analysis still produces the exact provider tree used by the
+/// UAST graft, but deliberately avoids workspace semantics, diagnostics, and
+/// deep highlight overlays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisDepth {
+	Full,
+	TopologyOnly,
+}
+
 /// Combined output from a semantic reactor pass: highlights and diagnostics.
 #[derive(Debug, Default)]
 pub struct SemanticOutput {

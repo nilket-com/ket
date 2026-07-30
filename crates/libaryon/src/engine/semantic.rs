@@ -1,7 +1,7 @@
 use super::core::MAX_SEMANTIC_BYTES;
 use super::document::io::read_document_snapshot;
 use super::event_bus::EngineEventQueue;
-use super::language::{LanguageId, LanguageRegistry};
+use super::language::{AnalysisDepth, LanguageId, LanguageRegistry};
 use super::session::{
 	BufferStore, CommonViewState, LayoutNode, SemanticState, StructuralIssue, StructuralIssueKind,
 	TextEditorMut, with_text_buffer_mut,
@@ -24,6 +24,7 @@ pub(crate) struct SemanticPipelineParams<'a> {
 	pub(crate) backing_path: Option<&'a str>,
 	pub(crate) active_language_id: Option<LanguageId>,
 	pub(crate) state_id: crate::core::StateId,
+	pub(crate) analysis_depth: AnalysisDepth,
 	pub(crate) semantic: &'a mut SemanticState,
 	pub(crate) has_virtual_tokens: bool,
 }
@@ -40,6 +41,7 @@ fn clear_for_unavailable_inputs(semantic: &mut SemanticState) {
 	semantic.structural_issue = None;
 	semantic.last_semantic_len = usize::MAX;
 	semantic.last_semantic_path = None;
+	semantic.last_analysis_depth = None;
 	semantic.pending_semantic_request_id = None;
 }
 
@@ -171,6 +173,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 		backing_path,
 		active_language_id,
 		state_id,
+		analysis_depth,
 		semantic,
 		has_virtual_tokens,
 	} = params;
@@ -187,6 +190,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 					if path_changed
 						|| semantic.last_semantic_state != Some(state_id)
 						|| live_len != semantic.last_semantic_len
+						|| semantic.last_analysis_depth != Some(analysis_depth)
 					{
 						if live_len_wide == 0 || live_len_wide >= MAX_SEMANTIC_BYTES {
 							semantic.highlights.clear();
@@ -195,6 +199,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 							semantic.last_semantic_state = Some(state_id);
 							semantic.last_semantic_len = live_len;
 							semantic.last_semantic_path = Some(path.to_string());
+							semantic.last_analysis_depth = Some(analysis_depth);
 							semantic.pending_semantic_request_id = None;
 						} else if let Ok(live_bytes) =
 							read_document_snapshot(registry, rid, backing_path.map(Path::new))
@@ -208,11 +213,13 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 								language_id: active_language_id.expect("active provider"),
 								state_id,
 								request_id,
+								depth: analysis_depth,
 							});
 							semantic.pending_semantic_request_id = Some(request_id);
 							semantic.last_semantic_state = Some(state_id);
 							semantic.last_semantic_len = live_len;
 							semantic.last_semantic_path = Some(path.to_string());
+							semantic.last_analysis_depth = Some(analysis_depth);
 						}
 					}
 				}
@@ -223,6 +230,7 @@ pub(crate) fn drive_semantic_pipeline(params: SemanticPipelineParams<'_>) {
 				semantic.last_semantic_state = Some(state_id);
 				semantic.last_semantic_len = 0;
 				semantic.last_semantic_path = Some(path.to_string());
+				semantic.last_analysis_depth = Some(analysis_depth);
 				semantic.pending_semantic_request_id = None;
 			}
 		} else {

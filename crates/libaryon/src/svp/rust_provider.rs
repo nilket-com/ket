@@ -1574,6 +1574,22 @@ mod tests {
 	}
 
 	#[test]
+	fn structural_topology_does_not_construct_a_provider_host() {
+		let provider = RustProvider::new();
+		let green = provider
+			.parse_structural_topology(b"fn snapshot() {}\n")
+			.expect("valid Rust has topology");
+		assert_eq!(green.kind, SemanticKind::RelationalTable);
+
+		let state = provider.state.lock().expect("provider state");
+		assert!(state.workspaces.is_empty());
+		assert!(
+			state.single_files.is_empty(),
+			"pure topology parsing must not retain an AnalysisHost"
+		);
+	}
+
+	#[test]
 	fn structural_topology_graft_enables_function_query() {
 		use crate::ecs::registry::UastRegistry;
 		use crate::engine::structural_graft::apply_graft;

@@ -26,7 +26,7 @@ use crate::core::{
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
 use crate::engine::host_event::{HostPanelDescriptor, HostPanelId, PanelRevision};
-use crate::engine::language::FILE_BROWSER_THEME_ID;
+use crate::engine::language::{AnalysisDepth, FILE_BROWSER_THEME_ID};
 use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
 use crate::svp::BackingIdentity;
@@ -1894,6 +1894,7 @@ pub(crate) struct SemanticState {
 	pub(crate) structural_issue: Option<StructuralIssue>,
 	pub(crate) last_semantic_len: usize,
 	pub(crate) last_semantic_path: Option<String>,
+	pub(crate) last_analysis_depth: Option<AnalysisDepth>,
 	pub(crate) pending_semantic_request_id: Option<RequestId>,
 	pub(crate) cached_sum_tree: Option<CachedSumTree>,
 	pub(crate) view_revision: u64,
@@ -1910,6 +1911,7 @@ impl SemanticState {
 			structural_issue: None,
 			last_semantic_len: usize::MAX,
 			last_semantic_path: None,
+			last_analysis_depth: None,
 			pending_semantic_request_id: None,
 			cached_sum_tree: None,
 			view_revision: 0,
@@ -1925,6 +1927,7 @@ impl SemanticState {
 		self.structural_issue = None;
 		self.last_semantic_len = usize::MAX;
 		self.last_semantic_path = None;
+		self.last_analysis_depth = None;
 		self.pending_semantic_request_id = None;
 		self.cached_sum_tree = None;
 		self.view_revision = self.view_revision.wrapping_add(1);
@@ -3581,6 +3584,12 @@ pub(crate) enum SnapshotProvenance {
 }
 
 impl SnapshotProvenance {
+	pub(crate) fn analysis_depth(&self) -> AnalysisDepth {
+		match self {
+			Self::GitRevision { .. } => AnalysisDepth::TopologyOnly,
+		}
+	}
+
 	/// Tab title for a snapshot pane, e.g. `main.rs@HEAD~3`.
 	pub(crate) fn title(&self) -> String {
 		match self {

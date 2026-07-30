@@ -91,6 +91,17 @@ fn viewport_is_busy(io_busy: bool, semantic_busy: bool) -> bool {
 	io_busy || semantic_busy
 }
 
+fn analysis_depth_for_buffer(
+	snapshot_partners: &HashMap<BufferId, SnapshotProvenance>,
+	buffer_id: BufferId,
+) -> super::language::AnalysisDepth {
+	snapshot_partners
+		.get(&buffer_id)
+		.map_or(super::language::AnalysisDepth::Full, |snapshot| {
+			snapshot.analysis_depth()
+		})
+}
+
 fn project_gutter_line_numbers(
 	registry: &UastRegistry,
 	root: Option<NodeId>,
@@ -1096,6 +1107,8 @@ fn render_pane_viewport(
 		}
 
 		if !is_output_panel && let Some(semantic) = tab.semantic.as_deref_mut() {
+			let analysis_depth =
+				analysis_depth_for_buffer(snapshot_partners, tab.document.buffer_id);
 			drive_semantic_pipeline(SemanticPipelineParams {
 				registry,
 				reactor,
@@ -1113,6 +1126,7 @@ fn render_pane_viewport(
 				backing_path: tab.document.backing_path.as_deref(),
 				active_language_id: tab.document.active_language_id,
 				state_id: tab.document.ledger.current_state_id,
+				analysis_depth,
 				semantic,
 				has_virtual_tokens: !virtual_tokens.is_empty(),
 			});
@@ -1612,13 +1626,18 @@ pub(crate) fn merge_highlights(
 #[cfg(test)]
 mod tests {
 	use super::{
-		merge_highlights, project_gutter_line_numbers, take_capacity_warning, viewport_is_busy,
+		analysis_depth_for_buffer, merge_highlights, project_gutter_line_numbers,
+		take_capacity_warning, viewport_is_busy,
 	};
-	use crate::core::{DocByte, DocLine};
+	use crate::core::{BufferId, DocByte, DocLine};
+	use crate::engine::language::AnalysisDepth;
+	use crate::engine::session::SnapshotProvenance;
 	use crate::engine::GutterNumbering;
 	use crate::engine::folding::FoldSet;
 	use crate::engine::test_support::build_foldable_document;
 	use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
+	use std::collections::HashMap;
+	use std::path::PathBuf;
 
 	fn number_for(numbers: &[crate::uast::projection::GutterLineNumber], line: u64) -> u64 {
 		numbers
@@ -1626,6 +1645,37 @@ mod tests {
 			.find(|entry| entry.line == DocLine::new(line))
 			.expect("line should have a projected gutter number")
 			.number
+	}
+
+	#[test]
+	fn snapshot_provenance_is_the_explicit_analysis_depth_boundary() {
+		let buffer_id = BufferId::new(7);
+		let mut snapshots = HashMap::new();
+		assert_eq!(
+			analysis_depth_for_buffer(&snapshots, buffer_id),
+			AnalysisDepth::Full
+		);
+
+		snapshots.insert(
+			buffer_id,
+			SnapshotProvenance::GitRevision {
+				repo_root: PathBuf::from("/repo"),
+				rel_path: "src/main.rs".to_string(),
+				revision: "HEAD~1".to_string(),
+				commit_oid: "a".repeat(40),
+				blob_oid: "b".repeat(40),
+			},
+		);
+		assert_eq!(
+			analysis_depth_for_buffer(&snapshots, buffer_id),
+			AnalysisDepth::TopologyOnly
+		);
+
+		snapshots.remove(&buffer_id);
+		assert_eq!(
+			analysis_depth_for_buffer(&snapshots, buffer_id),
+			AnalysisDepth::Full
+		);
 	}
 
 	#[test]

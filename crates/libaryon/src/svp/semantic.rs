@@ -5,7 +5,7 @@ use std::thread;
 use crate::core::{BufferId, ByteLen, DocByte, RequestId, StateId};
 use crate::engine::MAX_SEMANTIC_BYTES;
 use crate::engine::language::{
-	DefinitionResult, GreenNode, InlineAnnotation, LanguageId, LanguageRegistry,
+	AnalysisDepth, DefinitionResult, GreenNode, InlineAnnotation, LanguageId, LanguageRegistry,
 	normalize_definition_targets,
 };
 use crate::engine::navigation::{GotoDefinitionRequest, NavigationResolved};
@@ -25,6 +25,7 @@ pub struct SemanticRequest {
 	pub language_id: LanguageId,
 	pub state_id: StateId,
 	pub request_id: RequestId,
+	pub depth: AnalysisDepth,
 }
 
 #[derive(Debug)]
@@ -153,8 +154,9 @@ impl SemanticReactor {
 					// Deep semantic analysis is string-oriented. A document that is not
 					// valid UTF-8 forgoes it rather than being rewritten to suit it; it
 					// still gets topology and lexical highlighting.
-					let (highlights, diagnostics, inline_annotations) =
-						match std::str::from_utf8(&source_bytes) {
+					let (highlights, diagnostics, inline_annotations) = match request.depth {
+						AnalysisDepth::TopologyOnly => (Vec::new(), Vec::new(), Vec::new()),
+						AnalysisDepth::Full => match std::str::from_utf8(&source_bytes) {
 							Ok(text) => {
 								let mut output = p.semantic_reactor(
 									Arc::new(text.to_owned()),
@@ -209,7 +211,8 @@ impl SemanticReactor {
 								)
 							}
 							Err(_) => (Vec::new(), Vec::new(), Vec::new()),
-						};
+						},
+					};
 
 					(highlights, diagnostics, inline_annotations, topology)
 				}
@@ -246,6 +249,8 @@ mod tests {
 	use crate::engine::language::{LanguageProvider, SemanticOutput};
 	use crate::engine::navigation::{GotoDefinitionRequest, NavigationStamp};
 	use crate::engine::request::{EngineRequest, InternalEvent};
+	use crate::uast::{ProviderKindId, SemanticKind};
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::{Duration, Instant};
 
 	struct SlowTestProvider;
@@ -282,6 +287,105 @@ mod tests {
 		}
 	}
 
+	struct CountingTestProvider {
+		deep_calls: Arc<AtomicUsize>,
+		injection_calls: Arc<AtomicUsize>,
+	}
+
+	impl LanguageProvider for CountingTestProvider {
+		fn language_id(&self) -> &'static str {
+			"counting"
+		}
+
+		fn label(&self) -> &'static str {
+			"Counting"
+		}
+
+		fn extensions(&self) -> &'static [&'static str] {
+			&["counting"]
+		}
+
+		fn lexical_baseline(
+			&self,
+			_viewport_bytes: &[u8],
+			_offset_map: &[(usize, DocByte)],
+		) -> Vec<HighlightSpan> {
+			Vec::new()
+		}
+
+		fn semantic_reactor(
+			&self,
+			_full_source: Arc<String>,
+			_global_offset: DocByte,
+			_file_path: &str,
+		) -> SemanticOutput {
+			self.deep_calls.fetch_add(1, Ordering::Relaxed);
+			SemanticOutput::default()
+		}
+
+		fn injections(&self, _source: &str) -> Vec<crate::engine::language::LanguageInjection> {
+			self.injection_calls.fetch_add(1, Ordering::Relaxed);
+			Vec::new()
+		}
+
+		fn parse_structural_topology(&self, source: &[u8]) -> Option<GreenNode> {
+			Some(GreenNode {
+				kind: SemanticKind::RelationalTable,
+				provider_kind: ProviderKindId::NONE,
+				byte_len: source.len() as u32,
+				children: Vec::new(),
+			})
+		}
+	}
+
+	fn recv_semantic_response(reactor: &SemanticReactor) -> SemanticResponse {
+		let deadline = Instant::now() + Duration::from_secs(2);
+		loop {
+			if let Some(response) = reactor.try_recv() {
+				return response;
+			}
+			assert!(Instant::now() < deadline, "semantic response timed out");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	#[test]
+	fn topology_only_returns_structure_without_calling_deep_or_injected_semantics() {
+		let deep_calls = Arc::new(AtomicUsize::new(0));
+		let injection_calls = Arc::new(AtomicUsize::new(0));
+		let (_commands, _input, tx_internal, _requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(CountingTestProvider {
+			deep_calls: deep_calls.clone(),
+			injection_calls: injection_calls.clone(),
+		});
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		let content = b"structure only".to_vec();
+
+		reactor.send(SemanticRequest {
+			buffer_id: BufferId::new(1),
+			content: content.clone(),
+			global_offset: DocByte::ZERO,
+			file_path: "snapshot.counting".to_string(),
+			language_id: LanguageId::from_registered("counting"),
+			state_id: StateId::new(1),
+			request_id: RequestId::new(1),
+			depth: AnalysisDepth::TopologyOnly,
+		});
+		let response = recv_semantic_response(&reactor);
+
+		let (green, source_bytes) = response
+			.structural_topology
+			.expect("topology-only work must still return a provider tree");
+		assert_eq!(green.byte_len, content.len() as u32);
+		assert_eq!(source_bytes, content);
+		assert!(response.highlights.is_empty());
+		assert!(response.diagnostics.is_empty());
+		assert!(response.inline_annotations.is_empty());
+		assert_eq!(deep_calls.load(Ordering::Relaxed), 0);
+		assert_eq!(injection_calls.load(Ordering::Relaxed), 0);
+	}
+
 	#[test]
 	fn reactor_emits_a_response_for_each_enqueued_request() {
 		let (_commands, _input, tx_internal, _requests) = crate::engine::request::channel();
@@ -297,6 +401,7 @@ mod tests {
 			language_id: LanguageId::from_registered("slowtest"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
+			depth: AnalysisDepth::Full,
 		});
 		reactor.send(SemanticRequest {
 			buffer_id: BufferId::new(2),
@@ -306,6 +411,7 @@ mod tests {
 			language_id: LanguageId::from_registered("slowtest"),
 			state_id: StateId::new(2),
 			request_id: RequestId::new(2),
+			depth: AnalysisDepth::Full,
 		});
 
 		let deadline = Instant::now() + Duration::from_secs(2);
@@ -449,6 +555,7 @@ mod tests {
 			language_id: LanguageId::from_registered("markdown"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
+			depth: AnalysisDepth::Full,
 		});
 
 		let deadline = Instant::now() + Duration::from_secs(2);
@@ -488,6 +595,7 @@ mod tests {
 			language_id: LanguageId::from_registered("markdown"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
+			depth: AnalysisDepth::Full,
 		});
 
 		let deadline = Instant::now() + Duration::from_secs(2);
@@ -535,6 +643,7 @@ mod tests {
 			language_id: LanguageId::from_registered("csv"),
 			state_id: StateId::new(1),
 			request_id: RequestId::new(1),
+			depth: AnalysisDepth::Full,
 		});
 
 		let deadline = Instant::now() + Duration::from_secs(2);
