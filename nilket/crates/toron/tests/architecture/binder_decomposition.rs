@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 13] = [
+const BINDER_MODULES: [&str; 14] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
@@ -8,6 +8,7 @@ const BINDER_MODULES: [&str; 13] = [
 	"explain",
 	"join",
 	"join_order",
+	"outer_count_preaggregation",
 	"outer_join_demotion",
 	"pushdown",
 	"runtime_evidence",
@@ -28,6 +29,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/explain.rs",
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
+		"src/binder/outer_count_preaggregation.rs",
 		"src/binder/outer_join_demotion.rs",
 		"src/binder/pushdown.rs",
 		"src/binder/runtime_evidence.rs",
@@ -64,6 +66,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"pub(super) fn table_name",
 		"pub(super) fn choose_join_strategy",
 		"pub(super) fn analyze",
+		"try_outer_count_preaggregation",
 		"pub(super) fn demote_null_rejected_outer_joins",
 		"pub(super) fn predicate_pushdown_plan",
 		"pub(super) fn predicate_includes_primary_key_equality",
@@ -182,9 +185,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// ADR 518 adds only the membership-filtered reachable-key coverage knob at the root; indexed
 	// subset derivation, directional semi traversal, and deferred-shape exposure live in
 	// binder/scalar_reduction.rs; the Join arm carries only the terminating re-entry hook.
+	// ADR 521 adds the proven-key outer-count knob and Aggregate-arm rewrite hook; the six-gate
+	// recognizer and field-contract assertion live in binder/outer_count_preaggregation.rs.
 	assert!(
-		lines <= 6_230,
-		"binder root has {lines} lines; expected <= 6,230 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_275,
+		"binder root has {lines} lines; expected <= 6,275 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -319,6 +324,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/tls_listener_test.rs",
 				// ADR 512: the reachable-key reduction's execution equivalence battery.
 				"crates/toron/tests/scalar_reduction_test.rs",
+				// ADR 521: proof-gated outer-count structural and equivalence battery.
+				"crates/toron/tests/outer_count_preaggregation_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

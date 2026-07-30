@@ -60,6 +60,7 @@ mod decision_log;
 mod explain;
 mod join;
 mod join_order;
+mod outer_count_preaggregation;
 mod outer_join_demotion;
 mod pushdown;
 mod runtime_evidence;
@@ -74,6 +75,7 @@ use self::decision_log::*;
 use self::explain::*;
 use self::join::*;
 use self::join_order::*;
+use self::outer_count_preaggregation::*;
 use self::outer_join_demotion::*;
 use self::pushdown::*;
 use self::selectivity::*;
@@ -215,6 +217,10 @@ pub struct PlannerConfig {
 	/// pairs improved 6,668-6,764 ms against the 3,554 ms floor (the scalar
 	/// aggregate fell 5.48 s → 14 ms), sole engaged cell, every digest held.
 	pub semi_filtered_reachable_keys: bool,
+	/// ADR 521: preaggregate a counted right column beneath a plain-equality
+	/// left outer join when proof-grade unique-key evidence establishes one
+	/// preserved row per group. Default off until the ADR 521 receipt.
+	pub outer_count_preaggregation: bool,
 	/// ADR 489: the caller asserts single-partition (non-distributed) execution, so
 	/// the binder may admit a local no-exchange inner join. Default **false**
 	/// (conservative): only an execution entry that knows the plan will not be
@@ -250,6 +256,7 @@ impl Default for PlannerConfig {
 			membership_first_composition: true,
 			side_local_filter_routing: true,
 			semi_filtered_reachable_keys: true,
+			outer_count_preaggregation: false,
 		}
 	}
 }
@@ -1379,6 +1386,38 @@ impl<'a> Binder<'a> {
 					group_expr,
 					aggr_expr,
 				} => {
+					if let Some(rewrite) =
+						Box::pin(self.try_outer_count_preaggregation(input, group_expr, aggr_expr))
+							.await?
+					{
+						let mut rewritten = self
+							.bind_plan_with_trace(
+								&rewrite.plan,
+								trace,
+								render_trace,
+								join_order_source_capture,
+								recursive_ctx.clone(),
+							)
+							.await?;
+						let ExecutionPlan::Project {
+							exprs,
+							output_schema,
+							..
+						} = &mut rewritten.plan
+						else {
+							unreachable!(
+								"outer-count preaggregation rewrite must bind to a root project"
+							);
+						};
+						if !is_outer_count_contract_project(exprs) {
+							unreachable!(
+								"outer-count preaggregation rewrite lost its field-contract project"
+							);
+						}
+						*output_schema = rewrite.output_schema;
+						rewritten.scope = rewrite.output_scope;
+						return Ok(rewritten);
+					}
 					let input = self
 						.bind_plan_with_trace(
 							input,
@@ -4283,6 +4322,7 @@ fn optimize_for_required(
 			exprs,
 			output_schema,
 		} => {
+			let preserve_outer_count_contract = is_outer_count_contract_project(&exprs);
 			let requested_outputs =
 				required_output.unwrap_or_else(|| output_columns(exprs.root_count()));
 			let requested_outputs_vec = requested_outputs.iter().copied().collect::<Vec<_>>();
@@ -4292,11 +4332,15 @@ fn optimize_for_required(
 			let (input, remap) =
 				optimize_for_required(*input, Some(child_required), logical_types)?;
 			let exprs = rewrite_program_ordinals(exprs, &remap)?;
-			let output_schema = schema_for_projected_exprs_with_existing_names(
-				&exprs,
-				&output_schema,
-				&requested_outputs_vec,
-			);
+			let output_schema = if preserve_outer_count_contract {
+				project_schema(&output_schema, &requested_outputs_vec)?
+			} else {
+				schema_for_projected_exprs_with_existing_names(
+					&exprs,
+					&output_schema,
+					&requested_outputs_vec,
+				)
+			};
 			let output_remap = ordinal_remap(&requested_outputs_vec);
 
 			Ok((

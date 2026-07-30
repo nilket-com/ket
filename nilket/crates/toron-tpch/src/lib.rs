@@ -4535,6 +4535,27 @@ pub fn gauge_semi_filtered_reachable_keys() -> Result<(bool, &'static str), Stri
 	}
 }
 
+pub const GAUGE_OUTER_COUNT_PREAGGREGATION_ENV: &str = "TORON_TPCH_OUTER_COUNT_PREAGGREGATION";
+
+/// The gauge's proven-key outer-count rewrite setting and provenance: unset
+/// means the compiled default; "0"/"1" are explicit measurement arms.
+pub fn gauge_outer_count_preaggregation() -> Result<(bool, &'static str), String> {
+	match std::env::var(GAUGE_OUTER_COUNT_PREAGGREGATION_ENV) {
+		Ok(raw) => match raw.as_str() {
+			"0" => Ok((false, "explicit")),
+			"1" => Ok((true, "explicit")),
+			_ => Err(format!(
+				"{GAUGE_OUTER_COUNT_PREAGGREGATION_ENV} must be \"0\" or \"1\", got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => Ok((
+			PlannerConfig::default().outer_count_preaggregation,
+			"default",
+		)),
+		Err(error) => Err(format!("{GAUGE_OUTER_COUNT_PREAGGREGATION_ENV}: {error}")),
+	}
+}
+
 /// Every gauge bind flows through this constructor so the knob cannot be
 /// silently bypassed.
 pub const GAUGE_LOCAL_JOIN_ADMISSION_ENV: &str = "TORON_TPCH_LOCAL_JOIN_ADMISSION";
@@ -4579,6 +4600,9 @@ fn gauge_planner_config_with_task_memory(
 	}
 	if let Ok((value, "explicit")) = gauge_semi_filtered_reachable_keys() {
 		config.semi_filtered_reachable_keys = value;
+	}
+	if let Ok((value, "explicit")) = gauge_outer_count_preaggregation() {
+		config.outer_count_preaggregation = value;
 	}
 	// The gauge binds and immediately runs through `Executor::with_context`; it is
 	// the caller that can prove this plan will not be fragmented. ADR 489's
