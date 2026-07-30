@@ -1,6 +1,6 @@
 use crate::core::Rgb;
 
-pub const UI_COLOR_COUNT: usize = 24;
+pub const UI_COLOR_COUNT: usize = 28;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -29,6 +29,10 @@ pub enum UiColorKey {
 	GitUnstaged,
 	GitUntracked,
 	GitRename,
+	DiffAdded,
+	DiffRemoved,
+	DiffModified,
+	DiffMoved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,7 @@ const GIT_GREEN: Rgb = Rgb::new(80, 200, 120);
 const GIT_RED: Rgb = Rgb::new(235, 90, 90);
 const GIT_YELLOW: Rgb = Rgb::new(235, 200, 80);
 const GIT_BLUE: Rgb = Rgb::new(100, 160, 235);
+const DIFF_PURPLE: Rgb = Rgb::new(190, 120, 235);
 
 pub const UI_COLOR_SPECS: [UiColorSpec; UI_COLOR_COUNT] = [
 	UiColorSpec {
@@ -249,6 +254,38 @@ pub const UI_COLOR_SPECS: [UiColorSpec; UI_COLOR_COUNT] = [
 		default: UiColorDefault::Value(GIT_BLUE),
 		summary: "Git renamed files",
 	},
+	UiColorSpec {
+		key: UiColorKey::DiffAdded,
+		name: "colors.diff.added",
+		aliases: &[],
+		parent: None,
+		default: UiColorDefault::Value(GIT_GREEN),
+		summary: "Content added in the after document",
+	},
+	UiColorSpec {
+		key: UiColorKey::DiffRemoved,
+		name: "colors.diff.removed",
+		aliases: &[],
+		parent: None,
+		default: UiColorDefault::Value(GIT_RED),
+		summary: "Content removed from the before document",
+	},
+	UiColorSpec {
+		key: UiColorKey::DiffModified,
+		name: "colors.diff.modified",
+		aliases: &[],
+		parent: None,
+		default: UiColorDefault::Value(GIT_BLUE),
+		summary: "Content modified across the pair",
+	},
+	UiColorSpec {
+		key: UiColorKey::DiffMoved,
+		name: "colors.diff.moved",
+		aliases: &[],
+		parent: None,
+		default: UiColorDefault::Value(DIFF_PURPLE),
+		summary: "Content moved across the pair",
+	},
 ];
 
 impl UiColorKey {
@@ -277,6 +314,10 @@ impl UiColorKey {
 		Self::GitUnstaged,
 		Self::GitUntracked,
 		Self::GitRename,
+		Self::DiffAdded,
+		Self::DiffRemoved,
+		Self::DiffModified,
+		Self::DiffMoved,
 	];
 
 	pub const fn index(self) -> usize {
@@ -319,6 +360,9 @@ impl UiColorKey {
 			Self::DividerSurface => "ui.colors.divider",
 			Self::GitStaged | Self::GitUnstaged | Self::GitUntracked | Self::GitRename => {
 				"ui.colors.git"
+			}
+			Self::DiffAdded | Self::DiffRemoved | Self::DiffModified | Self::DiffMoved => {
+				"ui.colors.diff"
 			}
 		}
 	}
@@ -439,6 +483,10 @@ impl UiColorOverrides {
 			preview_surface: color(UiColorKey::PreviewSurface),
 			preview_text: color(UiColorKey::PreviewText),
 			divider_surface: color(UiColorKey::DividerSurface),
+			diff_added: color(UiColorKey::DiffAdded),
+			diff_removed: color(UiColorKey::DiffRemoved),
+			diff_modified: color(UiColorKey::DiffModified),
+			diff_moved: color(UiColorKey::DiffMoved),
 		}
 	}
 }
@@ -465,6 +513,10 @@ pub struct UiPalette {
 	pub preview_surface: Rgb,
 	pub preview_text: Rgb,
 	pub divider_surface: Rgb,
+	pub diff_added: Rgb,
+	pub diff_removed: Rgb,
+	pub diff_modified: Rgb,
+	pub diff_moved: Rgb,
 }
 
 impl Default for UiPalette {
@@ -535,6 +587,68 @@ mod tests {
 		assert_eq!(palette.gutter_text, Rgb::new(108, 108, 108));
 		assert_eq!(palette.status_text, Rgb::new(255, 255, 255));
 		assert_eq!(palette.tab_text, Rgb::new(148, 148, 148));
+		assert_eq!(palette.diff_added, GIT_GREEN);
+		assert_eq!(palette.diff_removed, GIT_RED);
+		assert_eq!(palette.diff_modified, GIT_BLUE);
+		assert_eq!(palette.diff_moved, DIFF_PURPLE);
+	}
+
+	#[test]
+	fn diff_palette_overrides_round_trip_independently() {
+		let mut overrides = UiColorOverrides::default();
+		let custom = [
+			(UiColorKey::DiffAdded, Rgb::new(1, 2, 3)),
+			(UiColorKey::DiffRemoved, Rgb::new(4, 5, 6)),
+			(UiColorKey::DiffModified, Rgb::new(7, 8, 9)),
+			(UiColorKey::DiffMoved, Rgb::new(10, 11, 12)),
+		];
+		for (key, color) in custom {
+			overrides.set(key, Some(color));
+		}
+		let palette = overrides.palette();
+		assert_eq!(palette.diff_added, custom[0].1);
+		assert_eq!(palette.diff_removed, custom[1].1);
+		assert_eq!(palette.diff_modified, custom[2].1);
+		assert_eq!(palette.diff_moved, custom[3].1);
+	}
+
+	#[test]
+	fn built_in_diff_colors_remain_distinct_under_red_green_deficiency_sanity_transforms() {
+		fn transform(color: Rgb, coefficients: [[u32; 3]; 3]) -> [i32; 3] {
+			let channels = [u32::from(color.r), u32::from(color.g), u32::from(color.b)];
+			coefficients.map(|row| {
+				(row[0] * channels[0] + row[1] * channels[1] + row[2] * channels[2]).div_ceil(1_000)
+					as i32
+			})
+		}
+		fn assert_pairwise_distinct(colors: [Rgb; 4], coefficients: [[u32; 3]; 3]) {
+			let transformed = colors.map(|color| transform(color, coefficients));
+			for left in 0..transformed.len() {
+				for right in (left + 1)..transformed.len() {
+					let squared_distance: i32 = transformed[left]
+						.into_iter()
+						.zip(transformed[right])
+						.map(|(a, b)| (a - b).pow(2))
+						.sum();
+					assert!(
+						squared_distance >= 900,
+						"default diff colors {left} and {right} collapse under the sanity transform"
+					);
+				}
+			}
+		}
+
+		let palette = UiPalette::default();
+		let colors = [
+			palette.diff_added,
+			palette.diff_removed,
+			palette.diff_modified,
+			palette.diff_moved,
+		];
+		// Simple protanopia and deuteranopia matrices. This is a regression
+		// guard for the defaults, not a claim about arbitrary user overrides.
+		assert_pairwise_distinct(colors, [[567, 433, 0], [558, 442, 0], [0, 242, 758]]);
+		assert_pairwise_distinct(colors, [[625, 375, 0], [700, 300, 0], [0, 300, 700]]);
 	}
 
 	#[test]

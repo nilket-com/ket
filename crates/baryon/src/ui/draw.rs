@@ -544,10 +544,8 @@ fn draw_pane(
 		height: text_area_height.get() as u16,
 	};
 
-	let effective_bg = ratatui_color(effective_editor_background(
-		pane.background_override,
-		palette,
-	));
+	let effective_bg_rgb = effective_editor_background(pane.background_override, palette);
+	let effective_bg = ratatui_color(effective_bg_rgb);
 	let render_height = text_area_height.get() as usize;
 	let skip_rows = if pane.wrap_enabled {
 		pane.viewport_row_offset.get() as usize
@@ -599,12 +597,17 @@ fn draw_pane(
 
 	if let Some(diff_pair) = &pane.diff_pair {
 		for block in &diff_pair.blocks {
-			let color = match block.kind {
-				libaryon::uast::projection::DiffKind::Added => Color::Rgb(0, 48, 0),
-				libaryon::uast::projection::DiffKind::Removed => Color::Rgb(48, 0, 0),
-				libaryon::uast::projection::DiffKind::Modified => Color::Rgb(0, 0, 48),
-				libaryon::uast::projection::DiffKind::Moved => Color::Rgb(48, 0, 48),
+			let accent = match block.kind {
+				libaryon::uast::projection::DiffKind::Added => palette.diff_added,
+				libaryon::uast::projection::DiffKind::Removed => palette.diff_removed,
+				libaryon::uast::projection::DiffKind::Modified => palette.diff_modified,
+				libaryon::uast::projection::DiffKind::Moved => palette.diff_moved,
 			};
+			let color = ratatui_color(blend_rgb(
+				effective_bg_rgb,
+				accent,
+				libaryon::core::BlendRatio::new(1, 5),
+			));
 
 			for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 				if row.line >= block.range.0 && row.line < block.range.1 {
@@ -626,16 +629,19 @@ fn draw_pane(
 			if let Some(intra_line_diffs) = block.intra_line_diffs.as_ref() {
 				for intra in intra_line_diffs {
 					let intense = match intra.kind {
-						libaryon::uast::projection::IntraLineDiffKind::Added => {
-							Color::Rgb(16, 120, 16)
-						}
+						libaryon::uast::projection::IntraLineDiffKind::Added => palette.diff_added,
 						libaryon::uast::projection::IntraLineDiffKind::Removed => {
-							Color::Rgb(120, 16, 16)
+							palette.diff_removed
 						}
 						libaryon::uast::projection::IntraLineDiffKind::Modified => {
-							Color::Rgb(32, 64, 180)
+							palette.diff_modified
 						}
 					};
+					let intense = ratatui_color(blend_rgb(
+						effective_bg_rgb,
+						intense,
+						libaryon::core::BlendRatio::new(3, 5),
+					));
 
 					for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 						if row.line != intra.line {
@@ -1414,6 +1420,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 												partner,
 												bridge_area,
 												bridge_top,
+												ui_palette,
 											);
 											if let Some(protocol) = diff_bridge
 												.get_protocol(pane.pane_id, partner.pane_id)

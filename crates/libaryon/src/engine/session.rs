@@ -3446,6 +3446,12 @@ pub(crate) enum DiffKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffRole {
+	Before,
+	After,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntraLineDiffKind {
 	Added,
 	Removed,
@@ -3477,11 +3483,7 @@ impl IntraLineDiff {
 			partner_line: self.line,
 			partner_col_start: self.col_start,
 			partner_col_end: self.col_end,
-			kind: match self.kind {
-				IntraLineDiffKind::Added => IntraLineDiffKind::Removed,
-				IntraLineDiffKind::Removed => IntraLineDiffKind::Added,
-				IntraLineDiffKind::Modified => IntraLineDiffKind::Modified,
-			},
+			kind: self.kind,
 		}
 	}
 }
@@ -3496,6 +3498,9 @@ pub(crate) struct DiffBlock {
 
 pub(crate) struct DiffPair {
 	pub(crate) partner_pane_id: PaneId,
+	/// Chronological role of the pane that owns this entry. Geometry may move;
+	/// the comparison remains Before -> After.
+	pub(crate) role: DiffRole,
 	pub(crate) blocks: Vec<DiffBlock>,
 }
 
@@ -4793,7 +4798,7 @@ impl EditorSession {
 mod tests {
 	use super::{
 		AddCaretResult, Affinity, BufferContent, CanonicalPath, CursorMode, CursorSet, CursorState,
-		DiffPair, EditorPane, EditorSession, GENERATION_PARK_CAP, LayoutLeaf, LayoutNode,
+		DiffPair, DiffRole, EditorPane, EditorSession, GENERATION_PARK_CAP, LayoutLeaf, LayoutNode,
 		MAX_CURSORS, ParkedGenerationCache, ParkedGenerationRoot, RootTransition,
 		SettingsPersistent, SnapshotProvenance, TextAnchor, TextBuffer, UastOwnerAccounting, View,
 		caret_from_doc_byte, resolve_theme_name, split_child_rects, with_file_browser_buffer_mut,
@@ -6274,6 +6279,7 @@ mod tests {
 			left,
 			DiffPair {
 				partner_pane_id: right,
+				role: DiffRole::Before,
 				blocks: Vec::new(),
 			},
 		);
@@ -6281,6 +6287,7 @@ mod tests {
 			right,
 			DiffPair {
 				partner_pane_id: left,
+				role: DiffRole::After,
 				blocks: Vec::new(),
 			},
 		);

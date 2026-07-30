@@ -590,7 +590,7 @@ fn materialize_snapshot(context: &mut EditorHost, m: SnapshotMaterialization) ->
 	session
 		.snapshot_partners
 		.insert(m.snapshot_buffer_id, provenance);
-	super::diff::compute_pane_diff(&registry, session, m.left_pane_id, m.snapshot_pane_id);
+	super::diff::compute_pane_diff(&registry, session, m.snapshot_pane_id, m.left_pane_id);
 	// Announce the snapshot only when nothing more important (e.g. a theme
 	// error) is already on the status line.
 	session.ui.status_message.get_or_insert(title);
@@ -2532,8 +2532,8 @@ fn handle_file_diff_split(
 		return true;
 	}
 
-	// Pair them
-	super::diff::compute_pane_diff(runtime.registry, session, left_pane_id, right_pane_id);
+	// The explicit target is the baseline; the focused document is current.
+	super::diff::compute_pane_diff(runtime.registry, session, right_pane_id, left_pane_id);
 	true
 }
 

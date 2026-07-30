@@ -1,8 +1,9 @@
 use image::Rgba;
 use libaryon::core::{
 	DiffFingerprint, DocLine, PaneId, PaneLocalRow, PixelDelta, PixelHeight, PixelWidth, PixelY,
-	ScreenRow,
+	Rgb, ScreenRow,
 };
+use libaryon::engine::UiPalette;
 use libaryon::uast::projection::{DiffBlock, PaneViewport};
 use ratatui::layout::Rect;
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
@@ -27,6 +28,26 @@ struct BridgeRequest {
 	right_visible_rows: Vec<libaryon::engine::VisibleRow>,
 	blocks: Vec<DiffBlock>,
 	text_area_top: ScreenRow,
+	colors: DiffColors,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DiffColors {
+	added: Rgb,
+	removed: Rgb,
+	modified: Rgb,
+	moved: Rgb,
+}
+
+impl From<UiPalette> for DiffColors {
+	fn from(palette: UiPalette) -> Self {
+		Self {
+			added: palette.diff_added,
+			removed: palette.diff_removed,
+			modified: palette.diff_modified,
+			moved: palette.diff_moved,
+		}
+	}
 }
 
 struct BridgeResponse {
@@ -73,11 +94,13 @@ impl DiffBridgeController {
 		right_pane: &PaneViewport,
 		area: Rect,
 		text_area_top: ScreenRow,
+		palette: UiPalette,
 	) {
 		let pair_key = (left_pane.pane_id, right_pane.pane_id);
 		let blocks = left_pane.diff_pair.as_ref().map(|p| &p.blocks).unwrap();
+		let colors = DiffColors::from(palette);
 
-		let fingerprint = bridge_request_fingerprint(left_pane, right_pane, area, blocks);
+		let fingerprint = bridge_request_fingerprint(left_pane, right_pane, area, blocks, colors);
 		if self.requested_fingerprints.get(&pair_key) == Some(&fingerprint) {
 			return;
 		}
@@ -107,6 +130,7 @@ impl DiffBridgeController {
 				.collect(),
 			blocks: blocks.clone(),
 			text_area_top,
+			colors,
 		});
 	}
 
@@ -134,6 +158,7 @@ fn bridge_request_fingerprint(
 	right: &PaneViewport,
 	area: Rect,
 	blocks: &[DiffBlock],
+	colors: DiffColors,
 ) -> DiffFingerprint {
 	let mut hasher = DefaultHasher::new();
 	area.x.hash(&mut hasher);
@@ -145,6 +170,7 @@ fn bridge_request_fingerprint(
 	right.viewport_start_line.get().hash(&mut hasher);
 	right.viewport_row_offset.get().hash(&mut hasher);
 	blocks.hash(&mut hasher);
+	colors.hash(&mut hasher);
 	DiffFingerprint::new(hasher.finish())
 }
 
@@ -160,11 +186,12 @@ fn render_bridge_protocol(picker: &Picker, request: &BridgeRequest) -> Option<Pr
 
 	for block in &request.blocks {
 		let color = match block.kind {
-			libaryon::uast::projection::DiffKind::Added => Rgba([0, 128, 0, 128]),
-			libaryon::uast::projection::DiffKind::Removed => Rgba([128, 0, 0, 128]),
-			libaryon::uast::projection::DiffKind::Modified => Rgba([0, 0, 128, 128]),
-			libaryon::uast::projection::DiffKind::Moved => Rgba([128, 0, 128, 128]),
+			libaryon::uast::projection::DiffKind::Added => request.colors.added,
+			libaryon::uast::projection::DiffKind::Removed => request.colors.removed,
+			libaryon::uast::projection::DiffKind::Modified => request.colors.modified,
+			libaryon::uast::projection::DiffKind::Moved => request.colors.moved,
 		};
+		let color = Rgba([color.r, color.g, color.b, 128]);
 
 		let left_y_range = find_line_range_y(
 			block.range,
@@ -293,6 +320,23 @@ fn blend_rgba(base: Rgba<u8>, overlay: Rgba<u8>) -> Rgba<u8> {
 mod tests {
 	use super::*;
 	use ratatui::layout::Rect;
+	use std::hash::{Hash, Hasher};
+
+	fn color_fingerprint(colors: DiffColors) -> u64 {
+		let mut hasher = DefaultHasher::new();
+		colors.hash(&mut hasher);
+		hasher.finish()
+	}
+
+	#[test]
+	fn bridge_palette_participates_in_the_cache_identity() {
+		let first = DiffColors::from(UiPalette::default());
+		let second = DiffColors {
+			added: Rgb::new(1, 2, 3),
+			..first
+		};
+		assert_ne!(color_fingerprint(first), color_fingerprint(second));
+	}
 
 	#[test]
 	fn test_render_bridge_protocol() {
@@ -317,6 +361,7 @@ mod tests {
 				intra_line_diffs: None,
 			}],
 			text_area_top: ScreenRow::new(0),
+			colors: DiffColors::from(UiPalette::default()),
 		};
 
 		let protocol = render_bridge_protocol(&picker, &request);

@@ -7,45 +7,59 @@ use crate::uast::UastProjection;
 use crate::uast::kind::SemanticKind;
 use std::collections::HashMap;
 
-use super::session::{DiffBlock, DiffKind, IntraLineDiff, IntraLineDiffKind};
+use super::session::{DiffBlock, DiffKind, DiffRole, IntraLineDiff, IntraLineDiffKind};
 use crate::core::PaneId;
 use crate::engine::session::EditorSession;
 
 pub(crate) fn recompute_all_diffs(registry: &UastRegistry, session: &mut EditorSession) {
 	let mut pairs_to_recompute = Vec::new();
-	for (&left_id, pair) in &session.diff_pairs {
-		// Only consider pairs where left_id < right_id to avoid double computation
-		if left_id.get() < pair.partner_pane_id.get() {
-			pairs_to_recompute.push((left_id, pair.partner_pane_id));
+	for (&pane_id, pair) in &session.diff_pairs {
+		// Pane ids deduplicate reciprocal entries only. Chronology comes from
+		// the persistent role, never from allocation or screen order.
+		if pane_id.get() < pair.partner_pane_id.get() {
+			let (before_pane_id, after_pane_id) =
+				canonical_pair_order(pane_id, pair.partner_pane_id, pair.role);
+			pairs_to_recompute.push((before_pane_id, after_pane_id));
 		}
 	}
 
-	for (left_id, right_id) in pairs_to_recompute {
-		compute_pane_diff(registry, session, left_id, right_id);
+	for (before_pane_id, after_pane_id) in pairs_to_recompute {
+		compute_pane_diff(registry, session, before_pane_id, after_pane_id);
+	}
+}
+
+fn canonical_pair_order(
+	pane_id: PaneId,
+	partner_pane_id: PaneId,
+	role: DiffRole,
+) -> (PaneId, PaneId) {
+	match role {
+		DiffRole::Before => (pane_id, partner_pane_id),
+		DiffRole::After => (partner_pane_id, pane_id),
 	}
 }
 
 pub(crate) fn compute_pane_diff(
 	registry: &UastRegistry,
 	session: &mut EditorSession,
-	left_id: PaneId,
-	right_id: PaneId,
+	before_pane_id: PaneId,
+	after_pane_id: PaneId,
 ) {
-	let left_doc = session
+	let before_doc = session
 		.layout
-		.find_pane(left_id)
+		.find_pane(before_pane_id)
 		.and_then(|pane| session.buffers.get(pane.active_tab().buffer_id));
-	let right_doc = session
+	let after_doc = session
 		.layout
-		.find_pane(right_id)
+		.find_pane(after_pane_id)
 		.and_then(|pane| session.buffers.get(pane.active_tab().buffer_id));
 
-	if let (Some(left), Some(right)) = (left_doc, right_doc)
-		&& let (Some(left_rid), Some(right_rid)) = (left.root_id(), right.root_id())
+	if let (Some(before), Some(after)) = (before_doc, after_doc)
+		&& let (Some(before_root), Some(after_root)) = (before.root_id(), after.root_id())
 	{
-		let blocks = compute_diff(left_rid, right_rid, registry);
+		let blocks = compute_diff(before_root, after_root, registry);
 
-		let mut right_blocks = Vec::with_capacity(blocks.len());
+		let mut after_blocks = Vec::with_capacity(blocks.len());
 		for block in &blocks {
 			let mirrored_intra = block.intra_line_diffs.as_ref().map(|diffs| {
 				diffs
@@ -53,7 +67,7 @@ pub(crate) fn compute_pane_diff(
 					.map(|diff| diff.swap_sides())
 					.collect::<Vec<_>>()
 			});
-			right_blocks.push(crate::engine::session::DiffBlock {
+			after_blocks.push(crate::engine::session::DiffBlock {
 				range: block.partner_range,
 				kind: block.kind,
 				partner_range: block.range,
@@ -67,7 +81,10 @@ pub(crate) fn compute_pane_diff(
 		// the abandoned partner holding a stale one-way pair, and scroll
 		// sync / navigation would disagree depending on which pane is
 		// focused. The abandoned partner stays open, just unpaired.
-		for (pane, partner) in [(left_id, right_id), (right_id, left_id)] {
+		for (pane, partner) in [
+			(before_pane_id, after_pane_id),
+			(after_pane_id, before_pane_id),
+		] {
 			if let Some(old) = session.diff_pairs.get(&pane)
 				&& old.partner_pane_id != partner
 			{
@@ -82,17 +99,19 @@ pub(crate) fn compute_pane_diff(
 			}
 		}
 		session.diff_pairs.insert(
-			left_id,
+			before_pane_id,
 			crate::engine::session::DiffPair {
-				partner_pane_id: right_id,
+				partner_pane_id: after_pane_id,
+				role: DiffRole::Before,
 				blocks: blocks.clone(),
 			},
 		);
 		session.diff_pairs.insert(
-			right_id,
+			after_pane_id,
 			crate::engine::session::DiffPair {
-				partner_pane_id: left_id,
-				blocks: right_blocks,
+				partner_pane_id: before_pane_id,
+				role: DiffRole::After,
+				blocks: after_blocks,
 			},
 		);
 	}
@@ -1405,12 +1424,48 @@ fn split_modified_whitespace_lines(
 
 #[cfg(test)]
 mod tests {
-	use super::compute_diff;
+	use super::{canonical_pair_order, compute_diff};
+	use crate::core::PaneId;
 	use crate::ecs::{NodeId, UastRegistry};
 	use crate::engine::language::GreenNode;
+	use crate::engine::session::{DiffRole, IntraLineDiff, IntraLineDiffKind};
 	use crate::engine::structural_graft::apply_graft;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
+
+	#[test]
+	fn chronology_is_independent_of_pane_id_order() {
+		let low = PaneId::new(1);
+		let high = PaneId::new(2);
+		assert_eq!(
+			canonical_pair_order(low, high, DiffRole::Before),
+			(low, high)
+		);
+		assert_eq!(
+			canonical_pair_order(low, high, DiffRole::After),
+			(high, low)
+		);
+	}
+
+	#[test]
+	fn mirrored_intra_line_insertions_keep_their_canonical_kind() {
+		let insertion = IntraLineDiff {
+			line: crate::core::DocLine::new(4),
+			col_start: 3,
+			col_end: 3,
+			partner_line: crate::core::DocLine::new(5),
+			partner_col_start: 3,
+			partner_col_end: 9,
+			kind: IntraLineDiffKind::Added,
+		};
+		let mirrored = insertion.swap_sides();
+		assert_eq!(mirrored.kind, IntraLineDiffKind::Added);
+		assert_eq!((mirrored.col_start, mirrored.col_end), (3, 9));
+		assert_eq!(
+			(mirrored.partner_col_start, mirrored.partner_col_end),
+			(3, 3)
+		);
+	}
 
 	fn green_lines(source: &[u8]) -> GreenNode {
 		let children = source

@@ -723,6 +723,110 @@ mod tests {
 
 	#[test]
 	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn panediff_colors_follow_chronology_when_the_worktree_has_the_lower_pane_id() {
+		let dir = git_fixture_repo(
+			"panediff-chronology",
+			"main.rs",
+			&["old_only();\nstable_one();\nstable_two();\n"],
+			"stable_one();\nstable_two();\nnew_only();\n",
+		);
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(
+			&mut engine,
+			&dir,
+			"main.rs",
+			b"stable_one();\nstable_two();\nnew_only();\n",
+		);
+
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("start revision diff");
+		let viewport = recv_viewport_until(&viewports, "chronological diff", |viewport| {
+			viewport.panes.len() == 2
+				&& viewport
+					.panes
+					.iter()
+					.any(|pane| pane.tabs[pane.active_doctab_index].title == "main.rs@HEAD")
+		});
+		let snapshot_pane_id = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.tabs[pane.active_doctab_index].title == "main.rs@HEAD")
+			.expect("snapshot pane")
+			.pane_id;
+		let worktree_pane_id = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != snapshot_pane_id)
+			.expect("worktree pane")
+			.pane_id;
+		assert!(
+			worktree_pane_id.get() < snapshot_pane_id.get(),
+			"fixture must reproduce the screenshot's misleading PaneId order"
+		);
+
+		let worktree_blocks = &viewport
+			.pane(worktree_pane_id)
+			.expect("worktree pane")
+			.diff_pair
+			.as_ref()
+			.expect("worktree diff pair")
+			.blocks;
+		assert!(
+			worktree_blocks.iter().any(|block| {
+				block.kind == crate::uast::projection::DiffKind::Added
+					&& block.range.0 < block.range.1
+			}),
+			"worktree-only content must be Added: {worktree_blocks:?}"
+		);
+
+		let snapshot_blocks = &viewport
+			.pane(snapshot_pane_id)
+			.expect("snapshot pane")
+			.diff_pair
+			.as_ref()
+			.expect("snapshot diff pair")
+			.blocks;
+		assert!(
+			snapshot_blocks.iter().any(|block| {
+				block.kind == crate::uast::projection::DiffKind::Removed
+					&& block.range.0 < block.range.1
+			}),
+			"HEAD-only content must be Removed: {snapshot_blocks:?}"
+		);
+
+		// Force the ordinary per-frame recomputation path after pairing. It
+		// may use pane ids to deduplicate the reciprocal entries, but must
+		// recover Before/After from their persistent roles.
+		commands
+			.send(EditorCommand::FocusPane(worktree_pane_id))
+			.expect("focus worktree");
+		commands
+			.send(EditorCommand::InsertText("fresh();\n".to_string()))
+			.expect("edit worktree");
+		recv_viewport_until(
+			&viewports,
+			"recomputed chronological diff",
+			|viewport| {
+				pane_text(viewport, worktree_pane_id).starts_with(b"fresh();\n")
+					&& viewport
+						.pane(worktree_pane_id)
+						.and_then(|pane| pane.diff_pair.as_ref())
+						.is_some_and(|pair| {
+							pair.blocks.iter().any(|block| {
+								block.kind == crate::uast::projection::DiffKind::Added
+									&& block.range.0 < block.range.1
+							})
+						})
+			},
+		);
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
 	fn panediff_snapshots_plain_text_documents_without_a_language() {
 		// A .txt buffer has no recognized language: materialization success
 		// must not be conflated with having a language id.
@@ -854,6 +958,60 @@ mod tests {
 				== Some("Already at the newest revision for this file")
 		});
 		assert_eq!(pane_text(&viewport, snap), b"three\n");
+
+		engine.shutdown().expect("engine shutdown");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	#[ignore = "requires a git binary; run explicitly with -- --ignored"]
+	fn diffstep_keeps_the_snapshot_before_and_the_worktree_after() {
+		let dir = git_fixture_repo(
+			"diffstep-chronology",
+			"main.rs",
+			&["base();\n", "base();\nmiddle();\n"],
+			"base();\nmiddle();\nnew();\n",
+		);
+		let mut engine = EngineHandle::spawn(EngineConfig::default());
+		let (commands, viewports) = load_fixture_file(
+			&mut engine,
+			&dir,
+			"main.rs",
+			b"base();\nmiddle();\nnew();\n",
+		);
+		commands
+			.send(EditorCommand::DiffSplit(String::new()))
+			.expect("acquire HEAD snapshot");
+		let viewport = recv_viewport_until(&viewports, "HEAD chronological diff", |viewport| {
+			viewport.panes.len() == 2 && visible_text(viewport) == b"base();\nmiddle();\n"
+		});
+		let snapshot_pane_id = viewport.focused_pane_id;
+		let worktree_pane_id = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id != snapshot_pane_id)
+			.expect("worktree pane")
+			.pane_id;
+		let has_worktree_addition = |viewport: &Viewport| {
+			viewport
+				.pane(worktree_pane_id)
+				.and_then(|pane| pane.diff_pair.as_ref())
+				.is_some_and(|pair| {
+					pair.blocks.iter().any(|block| {
+						block.kind == crate::uast::projection::DiffKind::Added
+							&& block.range.0 < block.range.1
+					})
+				})
+		};
+		assert!(has_worktree_addition(&viewport));
+
+		commands
+			.send(EditorCommand::DiffStep(-1))
+			.expect("step snapshot older");
+		let viewport = recv_viewport_until(&viewports, "older chronological diff", |viewport| {
+			pane_text(viewport, snapshot_pane_id) == b"base();\n" && has_worktree_addition(viewport)
+		});
+		assert!(has_worktree_addition(&viewport));
 
 		engine.shutdown().expect("engine shutdown");
 		let _ = std::fs::remove_dir_all(dir);
