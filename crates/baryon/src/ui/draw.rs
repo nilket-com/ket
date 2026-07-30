@@ -1,4 +1,5 @@
 use super::Frontend;
+use super::diff::{DiffHoverEmphasis, HoveredDiffBand};
 use super::markdown_preview::render_markdown_preview_fallback;
 use super::minimap::render_minimap_snapshot;
 use crate::ui::*;
@@ -49,12 +50,25 @@ fn diff_intra_line_fill(base: Rgb, accent: Rgb) -> Rgb {
 	cap_dark_glass_luma(base, glass, 66)
 }
 
+fn focused_diff_block_fill(base: Rgb, accent: Rgb, emphasis: DiffHoverEmphasis) -> Rgb {
+	match emphasis {
+		DiffHoverEmphasis::Normal | DiffHoverEmphasis::Selected => diff_block_fill(base, accent),
+		DiffHoverEmphasis::Dimmed => blend_rgb(base, accent, libaryon::core::BlendRatio::new(1, 8)),
+	}
+}
+
+fn focused_diff_intra_line_fill(base: Rgb, accent: Rgb, emphasis: DiffHoverEmphasis) -> Rgb {
+	match emphasis {
+		DiffHoverEmphasis::Normal | DiffHoverEmphasis::Selected => {
+			diff_intra_line_fill(base, accent)
+		}
+		DiffHoverEmphasis::Dimmed => blend_rgb(base, accent, libaryon::core::BlendRatio::new(1, 5)),
+	}
+}
+
 fn cap_dark_glass_luma(base: Rgb, glass: Rgb, lift: u32) -> Rgb {
 	let luma = |color: Rgb| {
-		(u32::from(color.r) * 299
-			+ u32::from(color.g) * 587
-			+ u32::from(color.b) * 114)
-			/ 1_000
+		(u32::from(color.r) * 299 + u32::from(color.g) * 587 + u32::from(color.b) * 114) / 1_000
 	};
 	let base_luma = luma(base);
 	if base_luma >= 128 {
@@ -468,6 +482,7 @@ fn draw_pane(
 	search_pattern: Option<&str>,
 	search_case_insensitive: bool,
 	palette: UiPalette,
+	diff_hover: Option<HoveredDiffBand>,
 ) -> PaneDrawArtifacts {
 	let pane_area = pane_rect_to_area(pane.rect);
 	if pane_area.width == 0 || pane_area.height == 0 {
@@ -630,13 +645,20 @@ fn draw_pane(
 
 	if let Some(diff_pair) = &pane.diff_pair {
 		for block in &diff_pair.blocks {
+			let hover_emphasis = diff_hover.map_or(DiffHoverEmphasis::Normal, |hover| {
+				hover.emphasis_for(pane.pane_id, diff_pair.partner_pane_id, block)
+			});
 			let accent = match block.kind {
 				libaryon::uast::projection::DiffKind::Added => palette.diff_added,
 				libaryon::uast::projection::DiffKind::Removed => palette.diff_removed,
 				libaryon::uast::projection::DiffKind::Modified => palette.diff_modified,
 				libaryon::uast::projection::DiffKind::Moved => palette.diff_moved,
 			};
-			let color = ratatui_color(diff_block_fill(effective_bg_rgb, accent));
+			let color = ratatui_color(focused_diff_block_fill(
+				effective_bg_rgb,
+				accent,
+				hover_emphasis,
+			));
 
 			for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 				if row.line >= block.range.0 && row.line < block.range.1 {
@@ -665,7 +687,11 @@ fn draw_pane(
 							palette.diff_modified
 						}
 					};
-					let intense = ratatui_color(diff_intra_line_fill(effective_bg_rgb, intense));
+					let intense = ratatui_color(focused_diff_intra_line_fill(
+						effective_bg_rgb,
+						intense,
+						hover_emphasis,
+					));
 
 					for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 						if row.line != intra.line {
@@ -1324,6 +1350,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		let prompt_cursor = input_projection.map_or(0, |input| input.prompt_cursor);
 		let minimap = &mut self.minimap;
 		let markdown_preview = &mut self.markdown_preview;
+		let diff_hover = self.diff_bridge.hovered_band();
 		let diff_bridge = &mut self.diff_bridge;
 		let uast_graph = &mut self.uast_graph;
 		let ui_palette = current_viewport
@@ -1372,6 +1399,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 								view.search_pattern.as_deref(),
 								view.search_case_insensitive,
 								view.ui_palette,
+								diff_hover,
 							);
 							if artifacts.cursor_to_set.is_some() {
 								cursor_to_set = artifacts.cursor_to_set;
@@ -1398,8 +1426,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 											.height
 											.saturating_sub(DOCTAB_BAR_ROWS.into())
 											.get()
-											.min(u16::MAX as u32)
-											as u16,
+											.min(u16::MAX as u32) as u16,
 									},
 								));
 							}
@@ -1897,13 +1924,16 @@ fn format_line_count(lines: u64) -> String {
 mod tests {
 	use super::{
 		BUSY_SPINNER_FRAMES, apply_diagnostic_style, braille_spinner_frame,
-		cursor_gutter_line_number_style, draw_tab_bar, effective_editor_background,
-		diff_block_fill, diff_intra_line_fill, folded_placeholder_style, format_line_count,
-		gutter_fill_style, gutter_line_number_style, paint_busy_spinner, paint_git_branch,
-		paint_secondary_carets, paint_text_segment, prompt_window,
+		cursor_gutter_line_number_style, diff_block_fill, diff_intra_line_fill, draw_tab_bar,
+		effective_editor_background, focused_diff_block_fill, folded_placeholder_style,
+		format_line_count, gutter_fill_style, gutter_line_number_style, paint_busy_spinner,
+		paint_git_branch, paint_secondary_carets, paint_text_segment, prompt_window,
 		should_render_preview_snapshot_fallback, status_right_text,
 	};
-	use crate::ui::{DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, ratatui_color};
+	use crate::ui::{
+		DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, blend_rgb, diff::DiffHoverEmphasis,
+		ratatui_color,
+	};
 	use libaryon::core::{
 		CursorPosition, DocByte, DocDisplayCol, DocLine, PaneLocalCol, PaneLocalRow,
 	};
@@ -1937,13 +1967,38 @@ mod tests {
 			libaryon::core::Rgb::new(102, 67, 125)
 		);
 		assert_eq!(
-			diff_block_fill(
-				libaryon::core::Rgb::new(230, 230, 230),
-				palette.diff_added
-			),
+			diff_block_fill(libaryon::core::Rgb::new(230, 230, 230), palette.diff_added),
 			libaryon::core::Rgb::new(170, 218, 186),
 			"the black-glass luminance cap is dark-theme-specific"
 		);
+	}
+
+	#[test]
+	fn hover_focus_preserves_the_selected_glass_and_dims_unrelated_blocks() {
+		let palette = UiPalette::default();
+		let selected = focused_diff_block_fill(
+			palette.editor_background,
+			palette.diff_added,
+			DiffHoverEmphasis::Selected,
+		);
+		let dimmed = focused_diff_block_fill(
+			palette.editor_background,
+			palette.diff_added,
+			DiffHoverEmphasis::Dimmed,
+		);
+		assert_eq!(
+			selected,
+			diff_block_fill(palette.editor_background, palette.diff_added)
+		);
+		assert_eq!(
+			dimmed,
+			blend_rgb(
+				palette.editor_background,
+				palette.diff_added,
+				libaryon::core::BlendRatio::new(1, 8),
+			)
+		);
+		assert_ne!(selected, dimmed);
 	}
 
 	#[test]

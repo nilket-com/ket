@@ -228,6 +228,7 @@ fn text_click_target(
 
 impl<B: Backend + io::Write> Frontend<B> {
 	pub(super) fn handle_mouse(&mut self, mouse: event::MouseEvent) {
+		self.last_mouse_position = Some((mouse.column, mouse.row));
 		match mouse.kind {
 			MouseEventKind::ScrollUp => {
 				if let Some(view) = &self.current_viewport
@@ -270,6 +271,14 @@ impl<B: Backend + io::Write> Frontend<B> {
 					self.send_command(EditorCommand::ScrollViewport(3));
 				}
 				self.needs_redraw = true;
+			}
+			MouseEventKind::Moved => {
+				let Some(view) = self.current_viewport.as_ref() else {
+					return;
+				};
+				if self.diff_bridge.update_hover(view, mouse.column, mouse.row) {
+					self.needs_redraw = true;
+				}
 			}
 			MouseEventKind::Down(MouseButton::Left) => {
 				let previous_browser_click = self.last_browser_click.take();

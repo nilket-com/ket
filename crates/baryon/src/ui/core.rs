@@ -70,6 +70,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) busy_spinner_frame: usize,
 	pub(super) busy_spinner_last_tick: Instant,
 	pub(super) last_browser_click: Option<(PaneId, DocLine, Instant)>,
+	pub(super) last_mouse_position: Option<(u16, u16)>,
 	pub(super) pane_resize_drag: Option<super::mouse::PaneResizeDrag>,
 	pub(super) minimap: MinimapController,
 	pub(super) markdown_preview: MarkdownPreviewController,
@@ -97,6 +98,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 			busy_spinner_frame: 0,
 			busy_spinner_last_tick: Instant::now(),
 			last_browser_click: None,
+			last_mouse_position: None,
 			pane_resize_drag: None,
 			minimap: MinimapController::new(),
 			markdown_preview: MarkdownPreviewController::new(),
@@ -152,6 +154,11 @@ impl<B: Backend + io::Write> Frontend<B> {
 					.current_viewport
 					.as_ref()
 					.is_none_or(|current| current.input.mode != view.input.mode);
+				if let Some((column, row)) = self.last_mouse_position {
+					self.diff_bridge.update_hover(&view, column, row);
+				} else {
+					self.diff_bridge.retain_valid_hover(&view);
+				}
 				self.current_viewport = Some(view);
 				if mode_changed {
 					self.apply_cursor_style();
