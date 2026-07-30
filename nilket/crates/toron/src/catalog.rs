@@ -76,6 +76,51 @@ impl TableRowIdentity {
 	}
 }
 
+/// Provenance strong enough to justify a semantic uniqueness rewrite.
+///
+/// Estimated cardinality remains in [`TableOptimizerFacts`] and cannot inhabit this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UniqueKeyProofProvenance {
+	EnforcedConstraint,
+	VerifiedSnapshot,
+}
+
+/// An ordered, complete, non-null logical key with proof-grade provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UniqueKeyProof {
+	columns: Vec<ColumnOrdinal>,
+	provenance: UniqueKeyProofProvenance,
+}
+
+impl UniqueKeyProof {
+	pub fn enforced_constraint(columns: Vec<ColumnOrdinal>) -> Option<Self> {
+		Self::new(columns, UniqueKeyProofProvenance::EnforcedConstraint)
+	}
+
+	pub fn verified_snapshot(columns: Vec<ColumnOrdinal>) -> Option<Self> {
+		Self::new(columns, UniqueKeyProofProvenance::VerifiedSnapshot)
+	}
+
+	fn new(columns: Vec<ColumnOrdinal>, provenance: UniqueKeyProofProvenance) -> Option<Self> {
+		let mut seen = HashSet::new();
+		if columns.is_empty() || columns.iter().any(|column| !seen.insert(*column)) {
+			return None;
+		}
+		Some(Self {
+			columns,
+			provenance,
+		})
+	}
+
+	pub fn columns(&self) -> &[ColumnOrdinal] {
+		&self.columns
+	}
+
+	pub const fn provenance(&self) -> UniqueKeyProofProvenance {
+		self.provenance
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DistinctCountFact {
 	Exact(u64),
@@ -861,6 +906,7 @@ pub struct TableBinding {
 	pub pbc_eligible_columns: HashSet<ColumnOrdinal>,
 	pub primary_key_columns: HashSet<ColumnOrdinal>,
 	pub optimizer_facts: TableOptimizerFacts,
+	unique_key_evidence: Vec<UniqueKeyProof>,
 }
 
 impl TableBinding {
@@ -998,11 +1044,61 @@ impl TableBinding {
 			pbc_eligible_columns,
 			primary_key_columns,
 			optimizer_facts: TableOptimizerFacts::default(),
+			unique_key_evidence: Vec::new(),
 		}
 	}
 
 	pub fn column_is_pbc_eligible(&self, ordinal: ColumnOrdinal) -> bool {
 		self.pbc_eligible_columns.contains(&ordinal)
+	}
+
+	pub fn unique_key_proofs(&self) -> &[UniqueKeyProof] {
+		&self.unique_key_evidence
+	}
+
+	pub fn unique_key_proof(&self, columns: &[ColumnOrdinal]) -> Option<&UniqueKeyProof> {
+		self.unique_key_evidence
+			.iter()
+			.find(|proof| proof.columns() == columns)
+	}
+
+	pub fn replace_unique_key_evidence(
+		&mut self,
+		proofs: Vec<UniqueKeyProof>,
+	) -> Result<(), CatalogError> {
+		let mut seen = HashSet::new();
+		for proof in &proofs {
+			if !seen.insert(proof.columns().to_vec()) {
+				return Err(CatalogError::AdminFailed {
+					message: format!(
+						"duplicate unique-key proof for columns {:?}",
+						proof.columns()
+					),
+				});
+			}
+			for column in proof.columns() {
+				let Some(field) = self.schema.fields().get(column.0 as usize) else {
+					return Err(CatalogError::AdminFailed {
+						message: format!(
+							"unique-key proof column {} is outside schema width {}",
+							column.0,
+							self.schema.fields().len()
+						),
+					});
+				};
+				if field.is_nullable() {
+					return Err(CatalogError::AdminFailed {
+						message: format!(
+							"unique-key proof column {} ({}) is nullable",
+							column.0,
+							field.name()
+						),
+					});
+				}
+			}
+		}
+		self.unique_key_evidence = proofs;
+		Ok(())
 	}
 }
 
@@ -1391,6 +1487,28 @@ impl MockCatalog {
 			})?;
 		binding.optimizer_facts = facts;
 		Ok(())
+	}
+
+	pub fn seed_unique_key_evidence(
+		&mut self,
+		table_ref: &TableRef,
+		proofs: Vec<UniqueKeyProof>,
+	) -> Result<(), CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let table_id = inner
+			.by_ref
+			.get(&(self.tenant_id, table_ref.clone()))
+			.copied()
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(table_ref),
+			})?;
+		let binding = inner
+			.by_id
+			.get_mut(&(self.tenant_id, table_id))
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(table_ref),
+			})?;
+		binding.replace_unique_key_evidence(proofs)
 	}
 
 	pub fn register_logical_type_for_tenant(
@@ -3634,6 +3752,66 @@ mod tests {
 				column_group_ndv: Default::default(),
 			}
 		);
+	}
+
+	#[test]
+	fn unique_key_proofs_are_ordered_non_null_and_separate_from_estimates() {
+		let descriptor = descriptor();
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("left", DataType::Int64, false),
+			Field::new("estimate_only", DataType::Int64, false),
+			Field::new("right", DataType::Int32, false),
+		]));
+		let mut binding = TableBinding::new(
+			TableId(9),
+			descriptor.table_object_id,
+			descriptor.physical_descriptor_fingerprint,
+			schema,
+		);
+		let composite = UniqueKeyProof::verified_snapshot(vec![ColumnOrdinal(2), ColumnOrdinal(0)])
+			.expect("ordered proof");
+
+		binding
+			.replace_unique_key_evidence(vec![composite.clone()])
+			.expect("attach proof");
+		binding.optimizer_facts.column_ndv.insert(
+			ColumnOrdinal(1),
+			DistinctCountFact::Approx {
+				estimate: 1_000,
+				rel_err_ppm: 10_000,
+			},
+		);
+
+		assert_eq!(
+			binding
+				.unique_key_proof(&[ColumnOrdinal(2), ColumnOrdinal(0)])
+				.expect("verified proof"),
+			&composite
+		);
+		assert!(
+			binding.unique_key_proof(&[ColumnOrdinal(1)]).is_none(),
+			"estimated NDV is optimizer evidence, never a semantic proof"
+		);
+		assert!(
+			UniqueKeyProof::verified_snapshot(vec![ColumnOrdinal(0), ColumnOrdinal(0)]).is_none()
+		);
+
+		let nullable_schema = Arc::new(Schema::new(vec![Field::new(
+			"nullable",
+			DataType::Int64,
+			true,
+		)]));
+		let mut nullable_binding = TableBinding::new(
+			TableId(10),
+			descriptor.table_object_id,
+			descriptor.physical_descriptor_fingerprint,
+			nullable_schema,
+		);
+		nullable_binding
+			.replace_unique_key_evidence(vec![
+				UniqueKeyProof::verified_snapshot(vec![ColumnOrdinal(0)]).expect("proof shape"),
+			])
+			.expect_err("nullable proof component must fail closed");
 	}
 
 	#[tokio::test]

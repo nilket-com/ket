@@ -10,6 +10,7 @@ pub(crate) mod exec_decomposition;
 pub(crate) mod heavy_hitter;
 pub(crate) mod join_cardinality;
 pub(crate) mod join_order;
+pub(crate) mod logical_properties;
 pub(crate) mod multi_dedup;
 pub(crate) mod network_tls;
 pub(crate) mod nominal_type_identity;

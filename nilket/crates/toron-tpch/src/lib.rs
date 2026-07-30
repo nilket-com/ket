@@ -48,14 +48,14 @@ use tpchgen::generators::{
 use toron::binder::{
 	PlannerConfig, bind, bind_with_explain_summary, bind_with_local_join_admissions,
 };
-use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef};
+use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::{JoinBuildProfile, JoinSpillObservation, RowCount, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	BoundExprNode, BoundExprProgram, ExecutionPlan, JoinKind, LogicalPlan, TableId,
+	BoundExprNode, BoundExprProgram, ColumnOrdinal, ExecutionPlan, JoinKind, LogicalPlan, TableId,
 	decimal_division_output_type,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
@@ -76,6 +76,7 @@ use telemetry::{
 pub const CACHE_ROOT: &str = "target/tpch";
 
 const TPCH_PERSISTED_CHUNK_ROWS: usize = 65_536;
+const TPCH_PERSISTED_MANIFEST_FORMAT: u64 = 2;
 /// The 22 TPC-H query IDs (the reachability inventory).
 pub const ALL_QUERY_IDS: [&str; 22] = [
 	"q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13",
@@ -2184,6 +2185,7 @@ pub struct TpchPersistedTable {
 	pub schema_fingerprint: String,
 	pub schema_signature: String,
 	pub file_hash: String,
+	pub unique_key_evidence: Vec<UniqueKeyProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -2208,6 +2210,7 @@ pub struct HarnessTableMetadata {
 	pub name: &'static str,
 	pub descriptor: TableSchemaDescriptor,
 	pub facts: TableOptimizerFacts,
+	pub unique_key_evidence: Vec<UniqueKeyProof>,
 }
 
 pub struct PersistedPerfQuerySpec {
@@ -2572,6 +2575,7 @@ fn persisted_table_metadata(
 		name,
 		descriptor: table_descriptor_for_name(name, strict)?,
 		facts: table_facts_from_manifest(table),
+		unique_key_evidence: table.unique_key_evidence.clone(),
 	})
 }
 
@@ -2671,18 +2675,34 @@ fn manifest_signature_for_tables(
 	let table_signature = tables
 		.values()
 		.map(|table| {
+			let unique_keys = table
+				.unique_key_evidence
+				.iter()
+				.map(|proof| {
+					proof
+						.columns()
+						.iter()
+						.map(|column| column.0.to_string())
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.collect::<Vec<_>>()
+				.join(";");
 			format!(
-				"{}:{}:{}:{}:{}",
+				"{}:{}:{}:{}:{}:{}",
 				table.name,
 				table.row_count,
 				table.logical_bytes,
 				table.schema_fingerprint,
-				table.file_hash
+				table.file_hash,
+				unique_keys
 			)
 		})
 		.collect::<Vec<_>>()
 		.join("|");
-	format!("suite=tpch_persisted_dataset;mode={mode};sf={scale_factor};tables={table_signature}")
+	format!(
+		"suite=tpch_persisted_dataset;format={TPCH_PERSISTED_MANIFEST_FORMAT};mode={mode};sf={scale_factor};tables={table_signature}"
+	)
 }
 
 fn manifest_fingerprint_for_tables(
@@ -2693,14 +2713,345 @@ fn manifest_fingerprint_for_tables(
 	stable_fingerprint(&manifest_signature_for_tables(mode, scale_factor, tables))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SnapshotUniqueKeyCandidate {
+	table: &'static str,
+	columns: &'static [&'static str],
+}
+
+const TPCH_SNAPSHOT_UNIQUE_KEY_CANDIDATES: &[SnapshotUniqueKeyCandidate] =
+	&[SnapshotUniqueKeyCandidate {
+		table: "customer",
+		columns: &["c_custkey"],
+	}];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SnapshotKeyValue {
+	Int32(i32),
+	Int64(i64),
+}
+
+enum SnapshotKeyArray<'a> {
+	Int32(&'a Int32Array),
+	Int64(&'a Int64Array),
+}
+
+impl SnapshotKeyArray<'_> {
+	fn value(&self, row: usize) -> Option<SnapshotKeyValue> {
+		match self {
+			Self::Int32(values) => {
+				(!values.is_null(row)).then(|| SnapshotKeyValue::Int32(values.value(row)))
+			}
+			Self::Int64(values) => {
+				(!values.is_null(row)).then(|| SnapshotKeyValue::Int64(values.value(row)))
+			}
+		}
+	}
+}
+
+fn verify_snapshot_unique_key_candidate(
+	path: &Path,
+	schema: &Schema,
+	expected_rows: u64,
+	candidate: SnapshotUniqueKeyCandidate,
+) -> Result<Option<UniqueKeyProof>, String> {
+	let mut ordinals = Vec::with_capacity(candidate.columns.len());
+	let mut seen_ordinals = HashSet::new();
+	if candidate.columns.is_empty() {
+		return Err(format!(
+			"snapshot unique-key candidate for {} has no columns",
+			candidate.table
+		));
+	}
+	for column in candidate.columns {
+		let ordinal = schema.index_of(column).map_err(|_| {
+			format!(
+				"snapshot unique-key candidate {}.{column} is absent from the schema",
+				candidate.table
+			)
+		})?;
+		if !seen_ordinals.insert(ordinal) {
+			return Err(format!(
+				"snapshot unique-key candidate for {} repeats column {column}",
+				candidate.table
+			));
+		}
+		let field = schema.field(ordinal);
+		if field.is_nullable() {
+			return Ok(None);
+		}
+		if !matches!(field.data_type(), DataType::Int32 | DataType::Int64) {
+			return Ok(None);
+		}
+		ordinals.push(ColumnOrdinal(u32::try_from(ordinal).map_err(|_| {
+			format!("snapshot unique-key ordinal overflow for {column}")
+		})?));
+	}
+
+	let file = File::open(path).map_err(|error| {
+		format!(
+			"open snapshot unique-key source {}: {error}",
+			path.display()
+		)
+	})?;
+	let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+		format!(
+			"read snapshot unique-key source {}: {error}",
+			path.display()
+		)
+	})?;
+	let reader = builder
+		.with_batch_size(TPCH_PERSISTED_CHUNK_ROWS)
+		.build()
+		.map_err(|error| {
+			format!(
+				"build snapshot unique-key reader {}: {error}",
+				path.display()
+			)
+		})?;
+	let mut keys = HashSet::new();
+	let mut scanned_rows = 0_u64;
+	for batch in reader {
+		let batch = batch.map_err(|error| {
+			format!(
+				"scan snapshot unique-key source {}: {error}",
+				path.display()
+			)
+		})?;
+		scanned_rows = scanned_rows
+			.checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
+				format!(
+					"snapshot unique-key row count overflow for {}",
+					candidate.table
+				)
+			})?)
+			.ok_or_else(|| {
+				format!(
+					"snapshot unique-key row count overflow for {}",
+					candidate.table
+				)
+			})?;
+		let arrays = ordinals
+			.iter()
+			.map(|ordinal| {
+				let array = batch.column(ordinal.0 as usize);
+				match array.data_type() {
+					DataType::Int32 => array
+						.as_any()
+						.downcast_ref::<Int32Array>()
+						.map(SnapshotKeyArray::Int32),
+					DataType::Int64 => array
+						.as_any()
+						.downcast_ref::<Int64Array>()
+						.map(SnapshotKeyArray::Int64),
+					_ => None,
+				}
+				.ok_or_else(|| {
+					format!(
+						"snapshot unique-key type changed while scanning {} column {}",
+						candidate.table, ordinal.0
+					)
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		for row in 0..batch.num_rows() {
+			let Some(key) = arrays
+				.iter()
+				.map(|array| array.value(row))
+				.collect::<Option<Vec<_>>>()
+			else {
+				return Ok(None);
+			};
+			if !keys.insert(key) {
+				return Ok(None);
+			}
+		}
+	}
+	if scanned_rows != expected_rows {
+		return Err(format!(
+			"snapshot unique-key scan for {} was incomplete: expected {expected_rows} rows, scanned {scanned_rows}",
+			candidate.table
+		));
+	}
+	Ok(UniqueKeyProof::verified_snapshot(ordinals))
+}
+
+fn verify_snapshot_unique_keys_for_table(
+	name: &str,
+	path: &Path,
+	schema: &Schema,
+	expected_rows: u64,
+	candidates: &[SnapshotUniqueKeyCandidate],
+) -> Result<Vec<UniqueKeyProof>, String> {
+	let mut proofs = Vec::new();
+	for candidate in candidates
+		.iter()
+		.copied()
+		.filter(|candidate| candidate.table == name)
+	{
+		if let Some(proof) =
+			verify_snapshot_unique_key_candidate(path, schema, expected_rows, candidate)?
+		{
+			proofs.push(proof);
+		}
+	}
+	Ok(proofs)
+}
+
+fn parse_manifest_unique_key_proofs(
+	table_value: &serde_json::Value,
+	table_name: &str,
+	schema: &Schema,
+	schema_fingerprint: &str,
+	file_hash: &str,
+	manifest_path: &Path,
+) -> Result<Vec<UniqueKeyProof>, String> {
+	let values = table_value
+		.get("unique_key_proofs")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| {
+			format!(
+				"{} table {table_name} missing unique_key_proofs",
+				manifest_path.display()
+			)
+		})?;
+	let mut proofs = Vec::with_capacity(values.len());
+	let mut seen = HashSet::new();
+	for value in values {
+		let provenance = value
+			.get("provenance")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| {
+				format!(
+					"{} table {table_name} unique-key proof missing provenance",
+					manifest_path.display()
+				)
+			})?;
+		if provenance != "verified_snapshot" {
+			return Err(format!(
+				"{} table {table_name} unique-key proof has unsupported provenance {provenance:?}",
+				manifest_path.display()
+			));
+		}
+		let proof_schema = value
+			.get("schema_fingerprint")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| {
+				format!(
+					"{} table {table_name} unique-key proof missing schema_fingerprint",
+					manifest_path.display()
+				)
+			})?;
+		let proof_file_hash = value
+			.get("file_hash")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| {
+				format!(
+					"{} table {table_name} unique-key proof missing file_hash",
+					manifest_path.display()
+				)
+			})?;
+		if proof_schema != schema_fingerprint || proof_file_hash != file_hash {
+			return Err(format!(
+				"{} table {table_name} unique-key proof binding mismatch",
+				manifest_path.display()
+			));
+		}
+		let columns = value
+			.get("columns")
+			.and_then(serde_json::Value::as_array)
+			.ok_or_else(|| {
+				format!(
+					"{} table {table_name} unique-key proof missing columns",
+					manifest_path.display()
+				)
+			})?
+			.iter()
+			.map(|column| {
+				let ordinal = column.as_u64().ok_or_else(|| {
+					format!(
+						"{} table {table_name} unique-key proof column is not an ordinal",
+						manifest_path.display()
+					)
+				})?;
+				let ordinal = u32::try_from(ordinal).map_err(|_| {
+					format!(
+						"{} table {table_name} unique-key proof column overflows u32",
+						manifest_path.display()
+					)
+				})?;
+				let field = schema.fields().get(ordinal as usize).ok_or_else(|| {
+					format!(
+						"{} table {table_name} unique-key proof column {ordinal} is outside schema width {}",
+						manifest_path.display(),
+						schema.fields().len()
+					)
+				})?;
+				if field.is_nullable()
+					|| !matches!(field.data_type(), DataType::Int32 | DataType::Int64)
+				{
+					return Err(format!(
+						"{} table {table_name} unique-key proof column {ordinal} is not a supported non-null key",
+						manifest_path.display()
+					));
+				}
+				Ok(ColumnOrdinal(ordinal))
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+		let proof = UniqueKeyProof::verified_snapshot(columns).ok_or_else(|| {
+			format!(
+				"{} table {table_name} unique-key proof has an empty or repeated column tuple",
+				manifest_path.display()
+			)
+		})?;
+		if !seen.insert(proof.columns().to_vec()) {
+			return Err(format!(
+				"{} table {table_name} repeats unique-key proof {:?}",
+				manifest_path.display(),
+				proof.columns()
+			));
+		}
+		proofs.push(proof);
+	}
+	Ok(proofs)
+}
+
+fn manifest_unique_key_proofs_json(table: &TpchPersistedTable) -> Vec<serde_json::Value> {
+	table
+		.unique_key_evidence
+		.iter()
+		.map(|proof| {
+			serde_json::json!({
+				"columns": proof.columns().iter().map(|column| column.0).collect::<Vec<_>>(),
+				"provenance": "verified_snapshot",
+				"schema_fingerprint": table.schema_fingerprint,
+				"file_hash": table.file_hash,
+			})
+		})
+		.collect()
+}
+
 pub fn load_persisted_tpch_dataset(
 	mode: &str,
 	scale_factor: f64,
 	root: &Path,
 ) -> Result<TpchPersistedDataset, String> {
+	load_persisted_tpch_dataset_with_verification(
+		mode,
+		scale_factor,
+		root,
+		dataset_verification_mode(),
+	)
+}
+
+fn load_persisted_tpch_dataset_with_verification(
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+	verification: DatasetVerification,
+) -> Result<TpchPersistedDataset, String> {
 	// Resolved once for the whole load so every table in this dataset is reconciled the same way and
 	// the returned dataset can state, as a fact, what was proved about it.
-	let verification = dataset_verification_mode();
 	let root_dir = persisted_dataset_dir(root, mode, scale_factor);
 	let manifest_path = root_dir.join("manifest.json");
 	let body = std::fs::read_to_string(&manifest_path)
@@ -2710,6 +3061,16 @@ pub fn load_persisted_tpch_dataset(
 	if value.get("suite").and_then(serde_json::Value::as_str) != Some("tpch_persisted_dataset") {
 		return Err(format!(
 			"{} is not a persisted TPC-H manifest",
+			manifest_path.display()
+		));
+	}
+	let format = value
+		.get("format")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("{} missing format", manifest_path.display()))?;
+	if format != TPCH_PERSISTED_MANIFEST_FORMAT {
+		return Err(format!(
+			"{} format mismatch: manifest={format} expected={TPCH_PERSISTED_MANIFEST_FORMAT}",
 			manifest_path.display()
 		));
 	}
@@ -2788,6 +3149,15 @@ pub fn load_persisted_tpch_dataset(
 			.and_then(serde_json::Value::as_str)
 			.ok_or_else(|| format!("{} table {name} missing file_hash", manifest_path.display()))?
 			.to_string();
+		let schema = table_schema_for_name(&name, mode == "strict")?;
+		let unique_key_evidence = parse_manifest_unique_key_proofs(
+			table,
+			&name,
+			schema.as_ref(),
+			&schema_fingerprint,
+			&file_hash,
+			&manifest_path,
+		)?;
 		if !path.exists() {
 			return Err(format!(
 				"manifest table {name} path does not exist: {}",
@@ -2812,6 +3182,7 @@ pub fn load_persisted_tpch_dataset(
 				schema_fingerprint,
 				schema_signature,
 				file_hash,
+				unique_key_evidence,
 			},
 		);
 	}
@@ -2825,6 +3196,11 @@ pub fn load_persisted_tpch_dataset(
 			"{} manifest fingerprint mismatch: manifest={recorded} observed={manifest_fingerprint}",
 			manifest_path.display()
 		));
+	}
+	if verification == DatasetVerification::ManifestOnly {
+		for table in tables.values_mut() {
+			table.unique_key_evidence.clear();
+		}
 	}
 	Ok(TpchPersistedDataset {
 		mode: mode.to_string(),
@@ -2863,6 +3239,13 @@ pub fn prepare_persisted_tpch_dataset(
 		let schema = table_schema_for_name(name, strict)?;
 		let stats = write_persisted_table(name, strict, scale_factor, schema.clone(), &path)?;
 		let signature = schema_signature(schema.as_ref());
+		let unique_key_evidence = verify_snapshot_unique_keys_for_table(
+			name,
+			&path,
+			schema.as_ref(),
+			stats.row_count,
+			TPCH_SNAPSHOT_UNIQUE_KEY_CANDIDATES,
+		)?;
 		tables.insert(
 			name.to_string(),
 			TpchPersistedTable {
@@ -2873,6 +3256,7 @@ pub fn prepare_persisted_tpch_dataset(
 				schema_fingerprint: stable_fingerprint(&signature),
 				schema_signature: signature,
 				file_hash: stable_file_hash(&path)?,
+				unique_key_evidence,
 			},
 		);
 	}
@@ -2882,6 +3266,7 @@ pub fn prepare_persisted_tpch_dataset(
 	let manifest_tables = tables
 		.values()
 		.map(|table| {
+			let unique_key_proofs = manifest_unique_key_proofs_json(table);
 			serde_json::json!({
 				"name": table.name,
 				"path": table.path.display().to_string(),
@@ -2890,11 +3275,13 @@ pub fn prepare_persisted_tpch_dataset(
 				"schema_fingerprint": table.schema_fingerprint,
 				"schema_signature": table.schema_signature,
 				"file_hash": table.file_hash,
+				"unique_key_proofs": unique_key_proofs,
 			})
 		})
 		.collect::<Vec<_>>();
 	let manifest = serde_json::json!({
 		"suite": "tpch_persisted_dataset",
+		"format": TPCH_PERSISTED_MANIFEST_FORMAT,
 		"mode": mode,
 		"scale_factor": scale_factor,
 		"manifest_fingerprint": manifest_fingerprint,
@@ -3834,6 +4221,7 @@ fn metadata_storage_from_tables(
 			name: table.name,
 			descriptor: table.descriptor,
 			facts: table.facts,
+			unique_key_evidence: Vec::new(),
 		});
 		batches.insert(table.id, table.batch);
 	}
@@ -3855,6 +4243,13 @@ fn load_catalog_from_metadata(
 			return Err(StageError::from_debug(Phase::Load, error).with_perf(*timings, None, 0));
 		}
 		if let Err(error) = catalog.seed_optimizer_facts(&TableRef::new(table.name), table.facts) {
+			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+			return Err(StageError::from_debug(Phase::Load, error).with_perf(*timings, None, 0));
+		}
+		if let Err(error) =
+			catalog.seed_unique_key_evidence(&TableRef::new(table.name), table.unique_key_evidence)
+		{
 			timings.load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 			return Err(StageError::from_debug(Phase::Load, error).with_perf(*timings, None, 0));
@@ -15172,6 +15567,224 @@ mod adr360_persisted_data_surface {
 		let _ = std::fs::remove_dir_all(&root);
 	}
 
+	fn write_unique_key_fixture(
+		label: &str,
+		schema: SchemaRef,
+		columns: Vec<ArrayRef>,
+	) -> (PathBuf, RecordBatch) {
+		let root = temp_root(label);
+		std::fs::create_dir_all(&root).expect("fixture root");
+		let path = root.join("keys.parquet");
+		let batch = RecordBatch::try_new(schema.clone(), columns).expect("key fixture batch");
+		let mut writer = parquet_writer(&path, schema).expect("key fixture writer");
+		writer.write(&batch).expect("write key fixture");
+		writer.close().expect("close key fixture");
+		(path, batch)
+	}
+
+	#[test]
+	fn snapshot_unique_key_verifier_is_exact_ordered_and_fail_closed() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("a", DataType::Int64, false),
+			Field::new("b", DataType::Int32, false),
+		]));
+		let (path, batch) = write_unique_key_fixture(
+			"unique_composite",
+			schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1_i64, 1, 2])),
+				Arc::new(Int32Array::from(vec![10_i32, 11, 10])),
+			],
+		);
+		let proof = verify_snapshot_unique_key_candidate(
+			&path,
+			schema.as_ref(),
+			batch.num_rows() as u64,
+			SnapshotUniqueKeyCandidate {
+				table: "fixture",
+				columns: &["b", "a"],
+			},
+		)
+		.expect("verify composite")
+		.expect("composite is unique");
+		assert_eq!(proof.columns(), &[ColumnOrdinal(1), ColumnOrdinal(0)]);
+
+		let incomplete = verify_snapshot_unique_key_candidate(
+			&path,
+			schema.as_ref(),
+			(batch.num_rows() + 1) as u64,
+			SnapshotUniqueKeyCandidate {
+				table: "fixture",
+				columns: &["a", "b"],
+			},
+		)
+		.expect_err("row-count mismatch is an incomplete scan");
+		assert!(incomplete.contains("incomplete"));
+		let invalid = verify_snapshot_unique_key_candidate(
+			&path,
+			schema.as_ref(),
+			batch.num_rows() as u64,
+			SnapshotUniqueKeyCandidate {
+				table: "fixture",
+				columns: &["missing"],
+			},
+		)
+		.expect_err("unknown candidate column");
+		assert!(invalid.contains("absent"));
+		let _ = std::fs::remove_dir_all(path.parent().expect("fixture parent"));
+
+		let duplicate_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+		let (duplicate_path, duplicate_batch) = write_unique_key_fixture(
+			"unique_duplicate",
+			duplicate_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 1]))],
+		);
+		assert!(
+			verify_snapshot_unique_key_candidate(
+				&duplicate_path,
+				duplicate_schema.as_ref(),
+				duplicate_batch.num_rows() as u64,
+				SnapshotUniqueKeyCandidate {
+					table: "fixture",
+					columns: &["k"],
+				},
+			)
+			.expect("duplicate verification")
+			.is_none()
+		);
+		let _ = std::fs::remove_dir_all(duplicate_path.parent().expect("fixture parent"));
+
+		let nullable_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+		let (nullable_path, nullable_batch) = write_unique_key_fixture(
+			"unique_null",
+			nullable_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![Some(1_i64), None]))],
+		);
+		assert!(
+			verify_snapshot_unique_key_candidate(
+				&nullable_path,
+				nullable_schema.as_ref(),
+				nullable_batch.num_rows() as u64,
+				SnapshotUniqueKeyCandidate {
+					table: "fixture",
+					columns: &["k"],
+				},
+			)
+			.expect("nullable verification")
+			.is_none()
+		);
+		let _ = std::fs::remove_dir_all(nullable_path.parent().expect("fixture parent"));
+
+		let unsupported_schema =
+			Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+		let (unsupported_path, unsupported_batch) = write_unique_key_fixture(
+			"unique_unsupported",
+			unsupported_schema.clone(),
+			vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+		);
+		assert!(
+			verify_snapshot_unique_key_candidate(
+				&unsupported_path,
+				unsupported_schema.as_ref(),
+				unsupported_batch.num_rows() as u64,
+				SnapshotUniqueKeyCandidate {
+					table: "fixture",
+					columns: &["k"],
+				},
+			)
+			.expect("unsupported verification")
+			.is_none()
+		);
+		let _ = std::fs::remove_dir_all(unsupported_path.parent().expect("fixture parent"));
+	}
+
+	#[test]
+	fn manifest_unique_key_round_trip_preserves_composite_order_and_binding() {
+		let schema = Schema::new(vec![
+			Field::new("a", DataType::Int64, false),
+			Field::new("b", DataType::Int32, false),
+		]);
+		let table = TpchPersistedTable {
+			name: "fixture".to_string(),
+			path: PathBuf::from("fixture.parquet"),
+			row_count: 2,
+			logical_bytes: 16,
+			schema_fingerprint: "schema".to_string(),
+			schema_signature: "signature".to_string(),
+			file_hash: "hash".to_string(),
+			unique_key_evidence: vec![
+				UniqueKeyProof::verified_snapshot(vec![ColumnOrdinal(1), ColumnOrdinal(0)])
+					.expect("proof"),
+			],
+		};
+		let mut table_json = serde_json::json!({
+			"unique_key_proofs": manifest_unique_key_proofs_json(&table),
+		});
+		let parsed = parse_manifest_unique_key_proofs(
+			&table_json,
+			&table.name,
+			&schema,
+			&table.schema_fingerprint,
+			&table.file_hash,
+			Path::new("manifest.json"),
+		)
+		.expect("parse proof");
+		assert_eq!(parsed[0].columns(), &[ColumnOrdinal(1), ColumnOrdinal(0)]);
+
+		table_json["unique_key_proofs"][0]["file_hash"] =
+			serde_json::Value::String("other".to_string());
+		assert!(
+			parse_manifest_unique_key_proofs(
+				&table_json,
+				&table.name,
+				&schema,
+				&table.schema_fingerprint,
+				&table.file_hash,
+				Path::new("manifest.json"),
+			)
+			.expect_err("tampered binding")
+			.contains("binding mismatch")
+		);
+	}
+
+	#[test]
+	fn persisted_manifest_rejects_a_tampered_unique_key_binding() {
+		let root = temp_root("tampered_unique_binding");
+		let dataset =
+			prepare_persisted_tpch_dataset("strict", 0.01, &root).expect("prepare dataset");
+		let body = std::fs::read_to_string(&dataset.manifest_path).expect("read manifest");
+		let mut manifest: serde_json::Value = serde_json::from_str(&body).expect("parse manifest");
+		let customer = manifest["tables"]
+			.as_array_mut()
+			.expect("table array")
+			.iter_mut()
+			.find(|table| table["name"] == "customer")
+			.expect("customer table");
+		customer["unique_key_proofs"][0]["file_hash"] =
+			serde_json::Value::String("fnv1a64:0000000000000000".to_string());
+		std::fs::write(
+			&dataset.manifest_path,
+			format!(
+				"{}\n",
+				serde_json::to_string_pretty(&manifest).expect("encode manifest")
+			),
+		)
+		.expect("write tampered manifest");
+
+		let error = load_persisted_tpch_dataset_with_verification(
+			"strict",
+			0.01,
+			&root,
+			DatasetVerification::FullHash,
+		)
+		.expect_err("tampered proof binding must fail manifest load");
+		assert!(
+			error.contains("unique-key proof binding mismatch"),
+			"{error}"
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
 	#[tokio::test]
 	async fn persisted_q06_matches_in_memory_digest_at_default_scale() {
 		let root = temp_root("q06_parity");
@@ -15351,6 +15964,51 @@ mod dataset_verification_provenance {
 		let reloaded = load_persisted_tpch_dataset("strict", 0.01, &root).expect("reload");
 		assert_eq!(reloaded.verification, DatasetVerification::FullHash);
 		assert_eq!(prepared.manifest_fingerprint, reloaded.manifest_fingerprint);
+		let customer_proof = reloaded.tables["customer"]
+			.unique_key_evidence
+			.first()
+			.expect("customer snapshot proof");
+		assert_eq!(customer_proof.columns(), &[ColumnOrdinal(0)]);
+		assert_eq!(
+			customer_proof.provenance(),
+			toron::catalog::UniqueKeyProofProvenance::VerifiedSnapshot
+		);
+
+		let manifest_only = load_persisted_tpch_dataset_with_verification(
+			"strict",
+			0.01,
+			&root,
+			DatasetVerification::ManifestOnly,
+		)
+		.expect("manifest-only load");
+		assert!(
+			manifest_only
+				.tables
+				.values()
+				.all(|table| table.unique_key_evidence.is_empty()),
+			"manifest-only loads cannot expose snapshot proofs"
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn q13_catalog_load_exposes_the_verified_customer_key() {
+		let root = temp_root("q13_unique_key");
+		let spec = build_persisted_perf_query_spec("q13", "strict", 0.01, &root).expect("q13 spec");
+		let mut timings = PerfPhaseTimings::default();
+		let catalog = load_catalog_from_metadata(spec.tables, &mut timings, Instant::now())
+			.expect("load q13 catalog");
+		let customer = toron::catalog::Catalog::resolve_table(&catalog, &TableRef::new("customer"))
+			.await
+			.expect("resolve customer");
+
+		assert_eq!(
+			customer
+				.unique_key_proof(&[ColumnOrdinal(0)])
+				.expect("q13 uniqueness gate proof")
+				.provenance(),
+			toron::catalog::UniqueKeyProofProvenance::VerifiedSnapshot
+		);
 		let _ = std::fs::remove_dir_all(&root);
 	}
 

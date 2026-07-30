@@ -77,3 +77,32 @@ and changed no plan.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Implementation seal
+
+The bounded fact path is implemented without a planner reader:
+
+- Toron's catalog owns private, constructor-validated `UniqueKeyProof` records with ordered
+  columns and a proof-only provenance union (`EnforcedConstraint` / `VerifiedSnapshot`).
+  Estimated NDV remains solely in `TableOptimizerFacts`; the proof record is not deserializable
+  and cannot contain an estimate.
+- The TPC-H sealer supplies an explicit, untrusted `customer(c_custkey)` candidate to a generic
+  ordered Int32/Int64 tuple verifier. Duplicate rows, NULL-bearing/nullable keys, unsupported
+  types, invalid columns, counter overflow, and incomplete scans emit no unearned proof or fail
+  the seal as appropriate.
+- Manifest format 2 carries the ordered proof plus its schema/file binding in the fingerprint
+  preimage. Malformed or mismatched proof metadata fails load. A FullHash load propagates the
+  proof through `HarnessTableMetadata` into `TableBinding`; ManifestOnly clears all snapshot
+  proofs before returning the dataset.
+- The q13-shaped catalog fixture resolves `customer` with a
+  `VerifiedSnapshot([ColumnOrdinal(0)])` proof. Composite order, tampered binding, duplicate,
+  NULL, unsupported-type, incomplete-scan, ManifestOnly, and estimated-NDV-only cases are pinned.
+  Row identity and every Wendelon source remain untouched.
+
+The final seal battery is all green with direct statuses preserved under
+`target/adr520_gates_final`: fmt checks, 1,456 Toron lib tests, 2,095 full architecture tests,
+the complete `--no-fail-fast` integration suite, the full toron-tpch suite, all three
+`--all-targets` checks, and `git diff --check`. The only guard reconciliation was structural:
+the new source assertion lives in the carved `architecture/logical_properties.rs` module and
+uses the shared binder corpus, keeping `architecture/optimizer.rs` below ADR 077's 2,500-line
+ceiling.
