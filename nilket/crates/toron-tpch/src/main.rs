@@ -6305,7 +6305,7 @@ mod adr517_tests {
 		unsafe { std::env::remove_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING") };
 		assert_eq!(
 			gauge_side_local_filter_routing().unwrap(),
-			(false, "default")
+			(true, "default")
 		);
 		unsafe { std::env::set_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING", "1") };
 		assert_eq!(
