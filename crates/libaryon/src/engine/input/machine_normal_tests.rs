@@ -681,6 +681,23 @@ mod tests {
 	}
 
 	#[test]
+	fn question_mark_is_reserved_for_backward_search() {
+		let (mut frontend, rx_cmd) = build_frontend_with_viewport();
+		let mut should_quit = false;
+
+		frontend.set_editor_mode_for_test(EditorMode::Normal);
+		assert!(!frontend.dispatch_key(
+			KeyCode::Char('?'),
+			Modifiers::NONE,
+			&mut should_quit
+		));
+		assert!(
+			rx_cmd.try_recv().is_err(),
+			"normal-mode ? must remain unbound until backward search lands"
+		);
+	}
+
+	#[test]
 	fn escape_dispatches_clear_search_when_search_is_active() {
 		let (mut frontend, rx_cmd) = build_frontend_with_viewport();
 		let mut should_quit = false;

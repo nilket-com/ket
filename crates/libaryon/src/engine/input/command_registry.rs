@@ -560,7 +560,7 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 	},
 	CommandSpec {
 		name: "help",
-		aliases: &["h"],
+		aliases: &["h", "?"],
 		bang: false,
 		args: ArgSpec::Optional,
 		completion: ArgCompletion::None,
@@ -1859,6 +1859,24 @@ mod tests {
 		};
 		assert!(markdown.contains("wrap"));
 		assert!(markdown.contains(":set wrap"));
+	}
+
+	#[test]
+	fn question_mark_is_a_help_alias() {
+		let (result, commands, status, _) = dispatch("?", None);
+		assert_eq!(result, DispatchResult::Dispatched);
+		assert!(status.is_none());
+		assert!(matches!(
+			commands.as_slice(),
+			[EditorCommand::ShowMarkdownDocument { .. }]
+		));
+
+		let (_, commands, status, _) = dispatch("? panes", None);
+		assert!(status.is_none());
+		let [EditorCommand::ShowMarkdownDocument { markdown, .. }] = commands.as_slice() else {
+			panic!("expected panes help");
+		};
+		assert!(markdown.contains("Panes"));
 	}
 
 	#[test]
