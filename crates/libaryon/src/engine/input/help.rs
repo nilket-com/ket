@@ -462,6 +462,11 @@ fn render_panes_with_docs(docs: &[KeyDoc]) -> String {
 	push_line(&mut out, "");
 	push_wrapped(
 		&mut out,
+		"Each tab header exposes ❮/❯ for adjacent tabs, —/| for new horizontal/vertical panes, + for a new tab, and ✕ to close that exact tab.",
+	);
+	push_line(&mut out, "");
+	push_wrapped(
+		&mut out,
 		"For repeated resizing, press sr, then use h/j/k/l until Esc. You can also drag the blank divider between two panes with the left mouse button.",
 	);
 	out
@@ -486,6 +491,11 @@ fn markdown_panes_with_docs(docs: &[KeyDoc]) -> String {
 	for doc in pane_key_docs(docs) {
 		push_line(&mut out, &format!("| `{}` | {} |", doc.keys, doc.summary));
 	}
+	push_line(&mut out, "");
+	push_line(
+		&mut out,
+		"Each tab header exposes `❮`/`❯` for adjacent tabs, `—`/`|` for new horizontal/vertical panes, `+` for a new tab, and `✕` to close that exact tab.",
+	);
 	push_line(&mut out, "");
 	push_line(
 		&mut out,

@@ -31,10 +31,37 @@ pub(super) struct PaneResizeDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabHit {
 	Title(usize),
-	Close(usize),
+	Control {
+		index: usize,
+		action: TabControlAction,
+	},
 }
 
-/// Mirrors `draw_tab_bar`: each tab ends in a three-column ` x ` close target,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabControlAction {
+	Previous,
+	NewHorizontalPane,
+	NewVerticalPane,
+	NewTab,
+	Close,
+	Next,
+}
+
+pub(super) const TAB_CONTROL_LABEL: &str = " ❮ — | + ✕ ❯ ";
+const TAB_CONTROL_WIDTH: usize = 13;
+
+fn tab_control_at(offset: usize) -> TabControlAction {
+	match (offset / 2).min(5) {
+		0 => TabControlAction::Previous,
+		1 => TabControlAction::NewHorizontalPane,
+		2 => TabControlAction::NewVerticalPane,
+		3 => TabControlAction::NewTab,
+		4 => TabControlAction::Close,
+		_ => TabControlAction::Next,
+	}
+}
+
+/// Mirrors `draw_tab_bar`: each tab ends in the fixed-width control strip,
 /// followed by its one-column separator.
 fn tab_hit_test(tabs: &[DocTabSummary], column: u16, width: u16) -> Option<TabHit> {
 	let mut x = 0usize;
@@ -45,21 +72,77 @@ fn tab_hit_test(tabs: &[DocTabSummary], column: u16, width: u16) -> Option<TabHi
 			break;
 		}
 		let title_width = 1 + tab.title.chars().count() + usize::from(tab.is_dirty) * 2;
-		let close_start = x.saturating_add(title_width);
-		let tab_end = close_start.saturating_add(3).min(max_x);
+		let controls_start = x.saturating_add(title_width);
+		let tab_end = controls_start.saturating_add(TAB_CONTROL_WIDTH).min(max_x);
 		if click >= x && click < tab_end {
-			return Some(if click >= close_start {
-				TabHit::Close(index)
+			return Some(if click >= controls_start {
+				TabHit::Control {
+					index,
+					action: tab_control_at(click - controls_start),
+				}
 			} else {
 				TabHit::Title(index)
 			});
 		}
-		x = close_start.saturating_add(3);
+		x = controls_start.saturating_add(TAB_CONTROL_WIDTH);
 		if x < max_x {
 			x += 1;
 		}
 	}
 	None
+}
+
+fn tab_hit_command(
+	viewport_id: ViewportId,
+	pane_id: PaneId,
+	tabs: &[DocTabSummary],
+	hit: TabHit,
+) -> EditorCommand {
+	let (index, action) = match hit {
+		TabHit::Title(index) => (index, None),
+		TabHit::Control { index, action } => (index, Some(action)),
+	};
+	let tab = &tabs[index];
+	match action {
+		None => EditorCommand::MouseIntent {
+			viewport_id,
+			intent: MouseIntent::ActivateDocTab {
+				pane_id,
+				view_id: tab.view_id,
+			},
+		},
+		Some(TabControlAction::Previous | TabControlAction::Next) => {
+			let previous = action == Some(TabControlAction::Previous);
+			let target = if previous {
+				(index + tabs.len() - 1) % tabs.len()
+			} else {
+				(index + 1) % tabs.len()
+			};
+			EditorCommand::MouseIntent {
+				viewport_id,
+				intent: MouseIntent::ActivateDocTab {
+					pane_id,
+					view_id: tabs[target].view_id,
+				},
+			}
+		}
+		Some(TabControlAction::NewHorizontalPane) => EditorCommand::NewPane {
+			direction: SplitDirection::Horizontal,
+			language: None,
+		},
+		Some(TabControlAction::NewVerticalPane) => EditorCommand::NewPane {
+			direction: SplitDirection::Vertical,
+			language: None,
+		},
+		Some(TabControlAction::NewTab) => EditorCommand::DocTabNew,
+		Some(TabControlAction::Close) => EditorCommand::MouseIntent {
+			viewport_id,
+			intent: MouseIntent::CloseDocTab {
+				pane_id,
+				view_id: tab.view_id,
+			},
+		},
+	}
 }
 
 fn is_browser_double_click(
@@ -335,23 +418,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 					if let Some(hit) =
 						tab_hit_test(&pane.tabs, local_tab_col, pane.rect.width.get() as u16)
 					{
-						let tab = &pane.tabs[match hit {
-							TabHit::Title(index) | TabHit::Close(index) => index,
-						}];
-						let intent = match hit {
-							TabHit::Title(_) => MouseIntent::ActivateDocTab {
-								pane_id: pane.pane_id,
-								view_id: tab.view_id,
-							},
-							TabHit::Close(_) => MouseIntent::CloseDocTab {
-								pane_id: pane.pane_id,
-								view_id: tab.view_id,
-							},
-						};
-						self.send_command(EditorCommand::MouseIntent {
-							viewport_id: view.viewport_id,
-							intent,
-						});
+						self.send_command(tab_hit_command(
+							view.viewport_id,
+							pane.pane_id,
+							&pane.tabs,
+							hit,
+						));
 					}
 					self.needs_redraw = true;
 					return;
@@ -497,10 +569,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DOUBLE_CLICK_INTERVAL, PaneDivider, PaneResizeDrag, TabHit, cursor_click_command,
-		divider_under_mouse_in_rects, is_browser_double_click, minimap_click_content_height,
-		minimap_click_viewport_start_line, pane_resize_target, tab_hit_test, text_click_target,
-		viewport_scroll_command,
+		DOUBLE_CLICK_INTERVAL, PaneDivider, PaneResizeDrag, TAB_CONTROL_LABEL, TabControlAction,
+		TabHit, cursor_click_command, divider_under_mouse_in_rects, is_browser_double_click,
+		minimap_click_content_height, minimap_click_viewport_start_line, pane_resize_target,
+		tab_hit_command, tab_hit_test, text_click_target, viewport_scroll_command,
 	};
 	use crossterm::event::KeyModifiers;
 	use libaryon::core::{
@@ -531,16 +603,141 @@ mod tests {
 	}
 
 	#[test]
-	fn tab_title_and_spaced_close_targets_are_distinct() {
+	fn tab_title_and_control_strip_targets_are_distinct() {
 		let tabs = [tab(1, "one", false), tab(2, "two", true)];
-		assert_eq!(tab_hit_test(&tabs, 0, 30), Some(TabHit::Title(0)));
-		assert_eq!(tab_hit_test(&tabs, 3, 30), Some(TabHit::Title(0)));
-		assert_eq!(tab_hit_test(&tabs, 4, 30), Some(TabHit::Close(0)));
-		assert_eq!(tab_hit_test(&tabs, 6, 30), Some(TabHit::Close(0)));
-		assert_eq!(tab_hit_test(&tabs, 7, 30), None);
-		assert_eq!(tab_hit_test(&tabs, 8, 30), Some(TabHit::Title(1)));
-		assert_eq!(tab_hit_test(&tabs, 13, 30), Some(TabHit::Title(1)));
-		assert_eq!(tab_hit_test(&tabs, 14, 30), Some(TabHit::Close(1)));
+		assert_eq!(TAB_CONTROL_LABEL.chars().count(), 13);
+		assert_eq!(tab_hit_test(&tabs, 0, 50), Some(TabHit::Title(0)));
+		assert_eq!(tab_hit_test(&tabs, 3, 50), Some(TabHit::Title(0)));
+		for (column, action) in [
+			(4, TabControlAction::Previous),
+			(6, TabControlAction::NewHorizontalPane),
+			(8, TabControlAction::NewVerticalPane),
+			(10, TabControlAction::NewTab),
+			(12, TabControlAction::Close),
+			(14, TabControlAction::Next),
+		] {
+			assert_eq!(
+				tab_hit_test(&tabs, column, 50),
+				Some(TabHit::Control { index: 0, action })
+			);
+		}
+		assert_eq!(tab_hit_test(&tabs, 17, 50), None);
+		assert_eq!(tab_hit_test(&tabs, 18, 50), Some(TabHit::Title(1)));
+		assert_eq!(tab_hit_test(&tabs, 22, 50), Some(TabHit::Title(1)));
+		assert_eq!(
+			tab_hit_test(&tabs, 32, 50),
+			Some(TabHit::Control {
+				index: 1,
+				action: TabControlAction::Close,
+			})
+		);
+	}
+
+	#[test]
+	fn tab_control_strip_maps_to_targeted_existing_commands() {
+		let pane_id = PaneId::new(4);
+		let viewport_id = ViewportId::new(9);
+		let tabs = [
+			tab(1, "one", false),
+			tab(2, "two", false),
+			tab(3, "three", false),
+		];
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::Previous,
+				},
+			),
+			EditorCommand::MouseIntent {
+				intent: MouseIntent::ActivateDocTab {
+					pane_id: actual_pane,
+					view_id,
+				},
+				..
+			} if actual_pane == pane_id && view_id == tabs[0].view_id
+		));
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::Next,
+				},
+			),
+			EditorCommand::MouseIntent {
+				intent: MouseIntent::ActivateDocTab {
+					pane_id: actual_pane,
+					view_id,
+				},
+				..
+			} if actual_pane == pane_id && view_id == tabs[2].view_id
+		));
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::NewHorizontalPane,
+				},
+			),
+			EditorCommand::NewPane {
+				direction: SplitDirection::Horizontal,
+				language: None,
+			}
+		));
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::NewVerticalPane,
+				},
+			),
+			EditorCommand::NewPane {
+				direction: SplitDirection::Vertical,
+				language: None,
+			}
+		));
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::NewTab,
+				},
+			),
+			EditorCommand::DocTabNew
+		));
+		assert!(matches!(
+			tab_hit_command(
+				viewport_id,
+				pane_id,
+				&tabs,
+				TabHit::Control {
+					index: 1,
+					action: TabControlAction::Close,
+				},
+			),
+			EditorCommand::MouseIntent {
+				intent: MouseIntent::CloseDocTab {
+					pane_id: actual_pane,
+					view_id,
+				},
+				..
+			} if actual_pane == pane_id && view_id == tabs[1].view_id
+		));
 	}
 
 	#[test]

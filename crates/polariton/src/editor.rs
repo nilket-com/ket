@@ -95,6 +95,12 @@ fn viewport_cells(size: iced::Size) -> (u16, u16) {
 	(columns, rows)
 }
 
+#[derive(Clone, Copy)]
+pub enum PaneTabAction {
+	NewPane(SplitDirection),
+	NewTab,
+}
+
 #[derive(Clone)]
 pub enum EditorMsg {
 	EngineReady,
@@ -108,6 +114,10 @@ pub enum EditorMsg {
 	CloseDocTab {
 		pane_id: libaryon::core::PaneId,
 		view_id: ViewId,
+	},
+	PaneTabAction {
+		pane_id: libaryon::core::PaneId,
+		action: PaneTabAction,
 	},
 	Dashboard(DashboardMsg),
 	Input(InputEvent),
@@ -1065,6 +1075,18 @@ impl CodeEditor {
 			EditorMsg::CloseDocTab { pane_id, view_id } => {
 				self.cursor_blink.note_activity(time::Instant::now());
 				self.send(EditorCommand::CloseDocTab { pane_id, view_id });
+				self.request_content();
+			}
+			EditorMsg::PaneTabAction { pane_id, action } => {
+				self.cursor_blink.note_activity(time::Instant::now());
+				self.send(EditorCommand::FocusPane(pane_id));
+				self.send(match action {
+					PaneTabAction::NewPane(direction) => EditorCommand::NewPane {
+						direction,
+						language: None,
+					},
+					PaneTabAction::NewTab => EditorCommand::DocTabNew,
+				});
 				self.request_content();
 			}
 			EditorMsg::Dashboard(_) => {}
@@ -2299,12 +2321,57 @@ fn pane_tab_bar<'a>(
 			.height(Length::Fixed(PANE_HEADER_HEIGHT))
 			.style(move |_theme: &Theme, status| tab_button_style(active, focused, palette, status))
 			.on_press(EditorMsg::ActivateDocTab { pane_id, view_id });
-		let close = button(text("x").font(font).size(13.0))
-			.padding([2, 5])
-			.height(Length::Fixed(PANE_HEADER_HEIGHT))
-			.style(move |_theme: &Theme, status| tab_button_style(active, focused, palette, status))
-			.on_press(EditorMsg::CloseDocTab { pane_id, view_id });
-		tabs = tabs.push(row![title, close].spacing(0));
+		let previous_view_id = pane.tabs[(index + pane.tabs.len() - 1) % pane.tabs.len()].view_id;
+		let next_view_id = pane.tabs[(index + 1) % pane.tabs.len()].view_id;
+		let control = |label: &'static str, message| {
+			button(text(label).font(font).size(13.0))
+				.padding([2, 4])
+				.height(Length::Fixed(PANE_HEADER_HEIGHT))
+				.style(move |_theme: &Theme, status| {
+					tab_button_style(active, focused, palette, status)
+				})
+				.on_press(message)
+		};
+		let controls = row![
+			control(
+				"❮",
+				EditorMsg::ActivateDocTab {
+					pane_id,
+					view_id: previous_view_id,
+				}
+			),
+			control(
+				"—",
+				EditorMsg::PaneTabAction {
+					pane_id,
+					action: PaneTabAction::NewPane(SplitDirection::Horizontal),
+				}
+			),
+			control(
+				"|",
+				EditorMsg::PaneTabAction {
+					pane_id,
+					action: PaneTabAction::NewPane(SplitDirection::Vertical),
+				}
+			),
+			control(
+				"+",
+				EditorMsg::PaneTabAction {
+					pane_id,
+					action: PaneTabAction::NewTab,
+				}
+			),
+			control("✕", EditorMsg::CloseDocTab { pane_id, view_id }),
+			control(
+				"❯",
+				EditorMsg::ActivateDocTab {
+					pane_id,
+					view_id: next_view_id,
+				}
+			),
+		]
+		.spacing(0);
+		tabs = tabs.push(row![title, controls].spacing(0));
 	}
 	tabs = tabs.push(
 		mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
@@ -4074,10 +4141,11 @@ mod tests {
 	use super::{
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
 		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
-		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, Rgb, SplitDirection, UiPalette,
-		command_bar_fragments, fence_body_start, highlight_span_at, markdown_code_fragments,
-		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
-		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
+		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, Rgb, SplitDirection,
+		UiPalette, command_bar_fragments, fence_body_start, highlight_span_at,
+		markdown_code_fragments, metrics, pane_gutter_width, pane_title, parse_markdown_blocks,
+		preview_row_budget, preview_source_window, prompt_cursor_byte, viewport_cells,
+		visible_blocks,
 	};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
@@ -4783,7 +4851,10 @@ mod tests {
 			.tabs[0]
 			.view_id;
 
-		editor.send(EditorCommand::DocTabNew);
+		let _ = editor.update(EditorMsg::PaneTabAction {
+			pane_id,
+			action: PaneTabAction::NewTab,
+		});
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor
 			.viewport

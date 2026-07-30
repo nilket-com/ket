@@ -2,6 +2,7 @@ use super::Frontend;
 use super::diff::{DiffHoverEmphasis, HoveredDiffBand};
 use super::markdown_preview::render_markdown_preview_fallback;
 use super::minimap::render_minimap_snapshot;
+use super::mouse::TAB_CONTROL_LABEL;
 use crate::ui::*;
 use libaryon::core::{DOCTAB_BAR_ROWS, PaneLocalRow, PaneRect, Rgb, STATUS_BAR_ROWS, TAB_SIZE};
 use libaryon::engine::{
@@ -449,7 +450,7 @@ fn draw_tab_bar(
 		if tab.is_dirty {
 			label.push_str(" +");
 		}
-		label.push_str(" x ");
+		label.push_str(TAB_CONTROL_LABEL);
 		for ch in label.chars() {
 			if x >= max_x {
 				break;
@@ -2115,7 +2116,7 @@ mod tests {
 				snapshot: None,
 			},
 		];
-		let area = Rect::new(0, 0, 10, 1);
+		let area = Rect::new(0, 0, 40, 1);
 
 		let mut focused = Buffer::empty(area);
 		draw_tab_bar(&mut focused, area, &tabs, 0, true, palette);
@@ -2123,13 +2124,17 @@ mod tests {
 			focused[(0, 0)].bg,
 			ratatui_color(palette.tab_active_surface)
 		);
-		assert_eq!(focused[(9, 0)].bg, ratatui_color(palette.tab_surface));
+		assert_eq!(focused[(15, 0)].bg, ratatui_color(palette.tab_surface));
+		for (column, symbol) in [(3, "❮"), (5, "—"), (7, "|"), (9, "+"), (11, "✕"), (13, "❯")]
+		{
+			assert_eq!(focused[(column, 0)].symbol(), symbol);
+		}
 
 		let mut unfocused = Buffer::empty(area);
 		draw_tab_bar(&mut unfocused, area, &tabs, 0, false, palette);
 		assert_eq!(unfocused[(0, 0)].bg, ratatui_color(palette.tab_surface));
 		assert_eq!(
-			unfocused[(9, 0)].bg,
+			unfocused[(15, 0)].bg,
 			ratatui_color(palette.tab_active_surface)
 		);
 	}
