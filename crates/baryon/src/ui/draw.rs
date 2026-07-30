@@ -39,6 +39,14 @@ const BUSY_SPINNER_FRAMES: [[char; 2]; 10] = [
 	['⢰', '⠀'],
 ];
 
+fn diff_block_fill(base: Rgb, accent: Rgb) -> Rgb {
+	blend_rgb(base, accent, libaryon::core::BlendRatio::new(2, 5))
+}
+
+fn diff_intra_line_fill(base: Rgb, accent: Rgb) -> Rgb {
+	blend_rgb(base, accent, libaryon::core::BlendRatio::new(4, 5))
+}
+
 fn braille_spinner_frame(frame: usize) -> [char; 2] {
 	BUSY_SPINNER_FRAMES[frame % BUSY_SPINNER_FRAMES.len()]
 }
@@ -603,11 +611,7 @@ fn draw_pane(
 				libaryon::uast::projection::DiffKind::Modified => palette.diff_modified,
 				libaryon::uast::projection::DiffKind::Moved => palette.diff_moved,
 			};
-			let color = ratatui_color(blend_rgb(
-				effective_bg_rgb,
-				accent,
-				libaryon::core::BlendRatio::new(1, 5),
-			));
+			let color = ratatui_color(diff_block_fill(effective_bg_rgb, accent));
 
 			for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 				if row.line >= block.range.0 && row.line < block.range.1 {
@@ -623,9 +627,8 @@ fn draw_pane(
 				}
 			}
 
-			// Layer 3 overlay: keep the soft-blue block background but
-			// intensify the specific token columns that actually changed so
-			// reviewers can see what moved inside the modified line.
+			// Layer 3 overlay: keep the saturated glass block background while
+			// intensifying the specific token columns that actually changed.
 			if let Some(intra_line_diffs) = block.intra_line_diffs.as_ref() {
 				for intra in intra_line_diffs {
 					let intense = match intra.kind {
@@ -637,11 +640,7 @@ fn draw_pane(
 							palette.diff_modified
 						}
 					};
-					let intense = ratatui_color(blend_rgb(
-						effective_bg_rgb,
-						intense,
-						libaryon::core::BlendRatio::new(3, 5),
-					));
+					let intense = ratatui_color(diff_intra_line_fill(effective_bg_rgb, intense));
 
 					for (pane_row_idx, row) in pane.visible_rows.iter().enumerate() {
 						if row.line != intra.line {
@@ -1874,9 +1873,10 @@ mod tests {
 	use super::{
 		BUSY_SPINNER_FRAMES, apply_diagnostic_style, braille_spinner_frame,
 		cursor_gutter_line_number_style, draw_tab_bar, effective_editor_background,
-		folded_placeholder_style, format_line_count, gutter_fill_style, gutter_line_number_style,
-		paint_busy_spinner, paint_git_branch, paint_secondary_carets, paint_text_segment,
-		prompt_window, should_render_preview_snapshot_fallback, status_right_text,
+		diff_block_fill, diff_intra_line_fill, folded_placeholder_style, format_line_count,
+		gutter_fill_style, gutter_line_number_style, paint_busy_spinner, paint_git_branch,
+		paint_secondary_carets, paint_text_segment, prompt_window,
+		should_render_preview_snapshot_fallback, status_right_text,
 	};
 	use crate::ui::{DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, ratatui_color};
 	use libaryon::core::{
@@ -1890,6 +1890,23 @@ mod tests {
 		layout::Rect,
 		style::{Modifier, Style},
 	};
+
+	#[test]
+	fn dark_diff_glass_keeps_substantially_more_palette_color_than_the_old_wash() {
+		let palette = UiPalette::default();
+		assert_eq!(
+			diff_block_fill(palette.editor_background, palette.diff_added),
+			libaryon::core::Rgb::new(42, 90, 58)
+		);
+		assert_eq!(
+			diff_block_fill(palette.editor_background, palette.diff_modified),
+			libaryon::core::Rgb::new(50, 74, 104)
+		);
+		assert_eq!(
+			diff_intra_line_fill(palette.editor_background, palette.diff_moved),
+			libaryon::core::Rgb::new(155, 99, 191)
+		);
+	}
 
 	#[test]
 	fn text_painting_uses_layout_word_boundaries() {

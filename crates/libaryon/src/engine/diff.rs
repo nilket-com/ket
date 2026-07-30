@@ -359,6 +359,19 @@ pub(crate) fn compute_diff(
 			&& b.partner_range.0 == b.partner_range.1)
 	});
 
+	// Structural matching can deliberately pair large, unequal subtrees. Once
+	// their coordinates reach the presentation layer, refine those broad
+	// Modified spans through the same histogram line diff used for terminal
+	// tables. This preserves semantic anchoring without painting inserted
+	// after-side lines blue merely because their parent nodes matched.
+	refine_multiline_modified_blocks(
+		&mut combined_blocks,
+		&left_bytes,
+		&right_bytes,
+		&l_index,
+		&r_index,
+	);
+
 	// Reclassify Modified blocks where one side is pure whitespace — a blank
 	// line paired against a line of real content is really an insertion or
 	// deletion, and painting it blue/Modified misleads the reader.
@@ -465,6 +478,22 @@ impl LineIndex {
 			end
 		};
 		&bytes[start..trimmed_end]
+	}
+
+	fn line_range_slice<'b>(
+		&self,
+		bytes: &'b [u8],
+		range: (DocLine, DocLine),
+	) -> &'b [u8] {
+		let start = self.line_start(range.0.get()).min(bytes.len());
+		let end = usize::try_from(range.1.get())
+			.ok()
+			.and_then(|line| self.line_starts.get(line))
+			.copied()
+			.unwrap_or(bytes.len())
+			.min(bytes.len())
+			.max(start);
+		&bytes[start..end]
 	}
 }
 
@@ -772,9 +801,22 @@ fn generate_blocks(
 
 				if let Some(&r_match) = l_matches.get(&node) {
 					let r_c_match = &r_coords[&r_match];
+					let l_start = coords.start_byte.get() as usize;
+					let l_end = coords.end_byte.get() as usize;
+					let r_start = r_c_match.start_byte.get() as usize;
+					let r_end = r_c_match.end_byte.get() as usize;
+					let unchanged = left_bytes.get(l_start..l_end).is_some_and(|left| {
+						right_bytes
+							.get(r_start..r_end)
+							.is_some_and(|right| left == right)
+					});
 					blocks.push(DiffBlock {
 						range: (coords.start_line, coords.end_line),
-						kind: DiffKind::Modified,
+						kind: if unchanged {
+							DiffKind::Moved
+						} else {
+							DiffKind::Modified
+						},
 						partner_range: (r_c_match.start_line, r_c_match.end_line),
 						intra_line_diffs: None,
 					});
@@ -1192,14 +1234,48 @@ fn range_is_all_whitespace(bytes: &[u8], index: &LineIndex, range: (DocLine, Doc
 	true
 }
 
+fn refine_multiline_modified_blocks(
+	blocks: &mut Vec<DiffBlock>,
+	left_bytes: &[u8],
+	right_bytes: &[u8],
+	l_index: &LineIndex,
+	r_index: &LineIndex,
+) {
+	let mut refined = Vec::with_capacity(blocks.len());
+	for block in blocks.drain(..) {
+		let left_lines = block.range.1.get().saturating_sub(block.range.0.get());
+		let right_lines = block
+			.partner_range
+			.1
+			.get()
+			.saturating_sub(block.partner_range.0.get());
+		if block.kind != DiffKind::Modified || (left_lines <= 1 && right_lines <= 1) {
+			refined.push(block);
+			continue;
+		}
+
+		let left = l_index.line_range_slice(left_bytes, block.range);
+		let right = r_index.line_range_slice(right_bytes, block.partner_range);
+		if std::str::from_utf8(left).is_err() || std::str::from_utf8(right).is_err() {
+			refined.push(block);
+			continue;
+		}
+		run_line_diff(
+			left,
+			right,
+			block.range.0,
+			block.partner_range.0,
+			&mut refined,
+		);
+	}
+	*blocks = refined;
+}
+
 /// Detect moves at the line level. For every line whose normalized content
-/// appears exactly once inside some left-side block range and exactly once
-/// inside some right-side block range, emit a dedicated `Moved` block and
-/// shrink the source blocks' boundary ranges so the moved content isn't
-/// double-counted. Lines that would need interior splits (moved line is in
-/// the middle of a block, with non-moved lines on both sides) are left alone
-/// — the rare visual mismatch is acceptable vs. the complexity of splitting
-/// a mixed block into three pieces with ambiguous partner mapping.
+/// appears exactly once in a Removed range and exactly once in an Added
+/// range, emit a dedicated `Moved` block and shrink those source blocks.
+/// Merely changing absolute line number inside a Modified region is not a
+/// move: ordinary insertions shift every following line.
 fn detect_line_level_moves(
 	blocks: &mut Vec<DiffBlock>,
 	left_bytes: &[u8],
@@ -1210,14 +1286,18 @@ fn detect_line_level_moves(
 	let mut left_positions: HashMap<String, Vec<u64>> = HashMap::new();
 	let mut right_positions: HashMap<String, Vec<u64>> = HashMap::new();
 	for block in blocks.iter() {
-		for line in block.range.0.get()..block.range.1.get() {
-			if let Some(content) = line_content_normalized(left_bytes, l_index, line) {
-				left_positions.entry(content).or_default().push(line);
+		if block.kind == DiffKind::Removed {
+			for line in block.range.0.get()..block.range.1.get() {
+				if let Some(content) = line_content_normalized(left_bytes, l_index, line) {
+					left_positions.entry(content).or_default().push(line);
+				}
 			}
 		}
-		for line in block.partner_range.0.get()..block.partner_range.1.get() {
-			if let Some(content) = line_content_normalized(right_bytes, r_index, line) {
-				right_positions.entry(content).or_default().push(line);
+		if block.kind == DiffKind::Added {
+			for line in block.partner_range.0.get()..block.partner_range.1.get() {
+				if let Some(content) = line_content_normalized(right_bytes, r_index, line) {
+					right_positions.entry(content).or_default().push(line);
+				}
 			}
 		}
 	}
@@ -1427,9 +1507,10 @@ mod tests {
 	use super::{canonical_pair_order, compute_diff};
 	use crate::core::PaneId;
 	use crate::ecs::{NodeId, UastRegistry};
-	use crate::engine::language::GreenNode;
-	use crate::engine::session::{DiffRole, IntraLineDiff, IntraLineDiffKind};
+	use crate::engine::language::{GreenNode, LanguageProvider};
+	use crate::engine::session::{DiffKind, DiffRole, IntraLineDiff, IntraLineDiffKind};
 	use crate::engine::structural_graft::apply_graft;
+	use crate::svp::rust_provider::RustProvider;
 	use crate::uast::kind::SemanticKind;
 	use crate::uast::metrics::SpanMetrics;
 
@@ -1486,6 +1567,14 @@ mod tests {
 	}
 
 	fn graft_diff_side(registry: &UastRegistry, source: &[u8]) -> NodeId {
+		graft_diff_side_with_green(registry, source, &green_lines(source))
+	}
+
+	fn graft_diff_side_with_green(
+		registry: &UastRegistry,
+		source: &[u8],
+		green: &GreenNode,
+	) -> NodeId {
 		let root = registry.alloc_test_node();
 		unsafe {
 			*registry.kinds[root.index()].get() = SemanticKind::RelationalTable;
@@ -1494,8 +1583,7 @@ mod tests {
 				newlines: source.iter().filter(|&&byte| byte == b'\n').count() as u64,
 			};
 		}
-		apply_graft(registry, root, &green_lines(source), source)
-			.expect("test graft is byte-identical");
+		apply_graft(registry, root, green, source).expect("test graft is byte-identical");
 		root
 	}
 
@@ -1543,6 +1631,95 @@ mod tests {
 						<= 1
 			}),
 			"a local edit must not become a 64-line Group removal/addition: {blocks:?}"
+		);
+	}
+
+	#[test]
+	fn expanded_rewrite_exposes_additions_without_calling_shifted_context_moved() {
+		let before = b"use std::num::NonZeroU32;\n\
+\n\
+/// CORE ENTITY\n\
+/// A lightweight 32-bit integer.\n\
+pub struct NodeId(pub NonZeroU32);\n\
+\n\
+impl NodeId {\n\
+\tpub fn index(self) -> usize {\n\
+\t\tself.0.get() as usize - 1\n\
+\t}\n\
+}\n";
+		let after = b"use std::num::NonZeroU32;\n\
+\n\
+pub(crate) const NODE_SLOT_BITS: u32 = 24;\n\
+pub(crate) const NODE_SLOT_MASK: u32 = (1 << NODE_SLOT_BITS) - 1;\n\
+\n\
+/// CORE ENTITY\n\
+/// A generation-qualified registry entity identity.\n\
+pub struct NodeId(pub NonZeroU32);\n\
+\n\
+impl NodeId {\n\
+\tpub fn index(self) -> usize {\n\
+\t\t((self.0.get() & NODE_SLOT_MASK) - 1) as usize\n\
+\t}\n\
+\n\
+\tpub(crate) fn generation(self) -> u8 {\n\
+\t\t(self.0.get() >> NODE_SLOT_BITS) as u8\n\
+\t}\n\
+}\n";
+		let registry = UastRegistry::new(1_024);
+		let provider = RustProvider::new();
+		let before_green = provider
+			.parse_structural_topology(before)
+			.expect("before Rust topology");
+		let after_green = provider
+			.parse_structural_topology(after)
+			.expect("after Rust topology");
+		let before_root = graft_diff_side_with_green(&registry, before, &before_green);
+		let after_root = graft_diff_side_with_green(&registry, after, &after_green);
+
+		let blocks = compute_diff(before_root, after_root, &registry);
+
+		assert!(
+			blocks.iter().any(|block| block.kind == DiffKind::Added),
+			"the expanded after-side rewrite must expose added lines: {blocks:?}"
+		);
+		assert!(
+			blocks.iter().all(|block| block.kind != DiffKind::Moved),
+			"context shifted by preceding additions is not a move: {blocks:?}"
+		);
+		assert!(
+			blocks.iter().all(|block| {
+				block.kind != DiffKind::Modified
+					|| block
+						.partner_range
+						.1
+						.get()
+						.saturating_sub(block.partner_range.0.get())
+						< 10
+			}),
+			"a structural match must not paint the expanded rewrite as one blue slab: {blocks:?}"
+		);
+	}
+
+	#[test]
+	fn unchanged_subtree_reordered_across_an_anchor_is_moved() {
+		let before = b"fn first() { alpha(); }\nfn second() { beta(); }\n";
+		let after = b"fn second() { beta(); }\nfn first() { alpha(); }\n";
+		let registry = UastRegistry::new(512);
+		let provider = RustProvider::new();
+		let before_green = provider
+			.parse_structural_topology(before)
+			.expect("before Rust topology");
+		let after_green = provider
+			.parse_structural_topology(after)
+			.expect("after Rust topology");
+		let before_root = graft_diff_side_with_green(&registry, before, &before_green);
+		let after_root = graft_diff_side_with_green(&registry, after, &after_green);
+
+		let blocks = compute_diff(before_root, after_root, &registry);
+
+		assert!(
+			blocks.iter().any(|block| block.kind == DiffKind::Moved),
+			"an unchanged reordered function should retain a purple move: {blocks:?}"
 		);
 	}
 }

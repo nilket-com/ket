@@ -39,6 +39,8 @@ struct DiffColors {
 	moved: Rgb,
 }
 
+const DIFF_BRIDGE_ALPHA: u8 = 192;
+
 impl From<UiPalette> for DiffColors {
 	fn from(palette: UiPalette) -> Self {
 		Self {
@@ -48,6 +50,10 @@ impl From<UiPalette> for DiffColors {
 			moved: palette.diff_moved,
 		}
 	}
+}
+
+fn bridge_tint(color: Rgb) -> Rgba<u8> {
+	Rgba([color.r, color.g, color.b, DIFF_BRIDGE_ALPHA])
 }
 
 struct BridgeResponse {
@@ -191,7 +197,7 @@ fn render_bridge_protocol(picker: &Picker, request: &BridgeRequest) -> Option<Pr
 			libaryon::uast::projection::DiffKind::Modified => request.colors.modified,
 			libaryon::uast::projection::DiffKind::Moved => request.colors.moved,
 		};
-		let color = Rgba([color.r, color.g, color.b, 128]);
+		let color = bridge_tint(color);
 
 		let left_y_range = find_line_range_y(
 			block.range,
@@ -336,6 +342,12 @@ mod tests {
 			..first
 		};
 		assert_ne!(color_fingerprint(first), color_fingerprint(second));
+	}
+
+	#[test]
+	fn bridge_uses_a_vivid_glass_alpha() {
+		let tint = bridge_tint(Rgb::new(10, 20, 30));
+		assert_eq!(tint, Rgba([10, 20, 30, 192]));
 	}
 
 	#[test]
