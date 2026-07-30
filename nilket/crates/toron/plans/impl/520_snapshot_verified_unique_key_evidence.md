@@ -106,3 +106,25 @@ the complete `--no-fail-fast` integration suite, the full toron-tpch suite, all 
 the new source assertion lives in the carved `architecture/logical_properties.rs` module and
 uses the shared binder corpus, keeping `architecture/optimizer.rs` below ADR 077's 2,500-line
 ceiling.
+
+## Evidence receipt
+
+The implementation seal is `6940cda2`; the compatible control identity is `dfc6ea10`. The
+two-root acceptance gate preserved the legacy control root and resealed a copy at manifest
+format 2. Before any query ran, all eight tables matched across roots on file hash, row count,
+schema fingerprint, and schema signature. The candidate manifest carries one
+`VerifiedSnapshot` proof for ordered key `[c_custkey]`, bound to customer's unchanged
+`fnv1a64:47fee385c7b4099d` schema fingerprint and
+`fnv1a64:562c67ef2a64d53c` file hash.
+
+At strict sf=8 with explicit 2 GiB memory and spill budgets, both q01-q22 legs and both m00-m10
+legs exited 0. All 22 query rows and all 11 ladder rows were identical across compatible
+roots/binaries on plan fingerprint, digest, output row count, output schema fingerprint where
+reported, and spill bytes. q13 remained `32c7b15a1c5a244e`. Both binaries also passed strict
+sf=8 correctness for q13 and the q19 sentinel. The candidate reported `full_hash` on every query
+row; the fixture battery separately pins that the same manifest exposes no snapshot proof under
+`ManifestOnly`.
+
+ADR 520 therefore closes green on its only claim: the proof fact is available, byte-bound,
+ordered, and provenance-correct, with no planner or result change. Reopening ADR 519 remains a
+separate semantic-rewrite decision.
