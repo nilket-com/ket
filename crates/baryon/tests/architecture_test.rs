@@ -1,6 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "../../../tests/support/manifest_dependency_guard.rs"]
+mod manifest_dependency_guard;
+
+use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
+
 fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 	let entries = fs::read_dir(dir).expect("read_dir should succeed");
 	for entry in entries {
@@ -124,5 +129,13 @@ fn test_mod_rs_files_are_manifests_only() {
 		violations.is_empty(),
 		"mod.rs files must be manifests only:\n{}",
 		violations.join("\n")
+	);
+}
+
+#[test]
+fn adr_0005_keeps_analytics_implementation_out_of_the_terminal_head() {
+	assert_product_dependency_boundary(
+		Path::new(env!("CARGO_MANIFEST_DIR")),
+		ProductBoundary::Baryon,
 	);
 }

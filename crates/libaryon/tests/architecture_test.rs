@@ -1,6 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "../../../tests/support/manifest_dependency_guard.rs"]
+mod manifest_dependency_guard;
+
+use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
+
 fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 	let entries = fs::read_dir(dir).expect("read_dir should succeed");
 	for entry in entries {
@@ -199,4 +204,12 @@ fn semantic_kind_source_carries_the_normative_vocabulary_contract() {
 			"SemanticKind must retain ADR 0003's normative contract: {required_contract}"
 		);
 	}
+}
+
+#[test]
+fn adr_0005_keeps_analytics_out_of_the_document_engine() {
+	assert_product_dependency_boundary(
+		Path::new(env!("CARGO_MANIFEST_DIR")),
+		ProductBoundary::Libaryon,
+	);
 }
