@@ -18,14 +18,15 @@ use toron_tpch::{
 	check_strict_query_with_data_source, correctness_matrix, export_perf_query_parquet,
 	export_persisted_perf_query_parquet, gauge_filtered_build_side_swap, gauge_hash_smaller_build,
 	gauge_membership_first, gauge_memory_per_task, gauge_outer_count_preaggregation,
-	gauge_scalar_agg_input_reduction, gauge_semi_filtered_reachable_keys,
-	gauge_side_local_filter_routing, gauge_spill_bytes_reserved, generate_dev_lineitem,
-	load_persisted_tpch_dataset, matrix, node_attribution_outer_reconciliation,
-	normalize_duckdb_type, paired_ablation_dataset_fingerprint, parse_scale_factor,
-	prepare_persisted_tpch_dataset, primitive_ladder_intent, q17_correctness_scale, run_dev_q1,
-	run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08,
-	run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15,
-	run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	gauge_partition_work_concurrency_requested, gauge_scalar_agg_input_reduction,
+	gauge_semi_filtered_reachable_keys, gauge_side_local_filter_routing,
+	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
+	node_attribution_outer_reconciliation, normalize_duckdb_type,
+	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
+	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
+	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
+	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -221,6 +222,14 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 		Ok(engine) => engine,
 		Err(message) => return harness_error(&message),
 	};
+	let partition_work_concurrency = if engine == PerfEngine::Toron {
+		match gauge_partition_work_concurrency_requested() {
+			Ok(setting) => Some(setting),
+			Err(message) => return harness_error(&message),
+		}
+	} else {
+		None
+	};
 	if engine == PerfEngine::Rune {
 		if let Some(raw_iterations) = std::env::var_os("TORON_TPCH_PROFILE_LOOP") {
 			let iterations = match raw_iterations.to_string_lossy().parse::<usize>() {
@@ -375,6 +384,7 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["outer_count_preaggregation"] = serde_json::json!(outer_count_preaggregation);
 	row["outer_count_preaggregation_provenance"] =
 		serde_json::json!(outer_count_preaggregation_provenance);
+	add_partition_work_concurrency_fields(&mut row, partition_work_concurrency);
 	if std::env::var_os("TORON_TPCH_PARQUET_SCAN_LEDGER").is_some() {
 		let ledger = take_parquet_scan_ledger();
 		let batches = ledger.iter().flat_map(|scan| scan.batches.iter());
@@ -461,6 +471,15 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	}
 	println!("{row}");
 	ExitCode::SUCCESS
+}
+
+fn add_partition_work_concurrency_fields(
+	row: &mut serde_json::Value,
+	setting: Option<(u64, &'static str)>,
+) {
+	row["partition_work_concurrency_requested"] = serde_json::json!(setting.map(|value| value.0));
+	row["partition_work_concurrency_requested_provenance"] =
+		serde_json::json!(setting.map(|value| value.1));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2269,6 +2288,7 @@ fn duckdb_not_attempted_row(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: None,
 	}
 	.json_value()
@@ -2308,6 +2328,7 @@ fn polars_not_attempted_row(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: None,
 	}
 	.json_value()
@@ -2368,6 +2389,7 @@ fn perf_stub_row(stub: PerfStubRow<'_>) -> serde_json::Value {
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: None,
 	}
 	.json_value()
@@ -2548,6 +2570,7 @@ fn run_polars_perf_export(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: None,
 	}
 }
@@ -2670,6 +2693,7 @@ fn run_polars_perf_export(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
 	}
 }
@@ -3021,6 +3045,7 @@ fn polars_unsupported_attempt(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
 	}
 }
@@ -3071,6 +3096,7 @@ fn polars_fail_attempt(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
 	}
 }
@@ -3220,6 +3246,7 @@ fn run_duckdb_perf_child(
 			debug_build: false,
 			local_join_admissions: None,
 			join_spill_observations: None,
+			partition_work_concurrency_observations: None,
 			dataset_verification: export.dataset_verification,
 		}
 		.json_value());
@@ -3262,6 +3289,7 @@ fn run_duckdb_perf_child(
 		debug_build: false,
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
 	}
 	.json_value())
@@ -3829,6 +3857,16 @@ fn summarize_query_rows(
 		.and_then(|row| row.get("spill_bytes_reserved_provenance"))
 		.and_then(serde_json::Value::as_str)
 		.unwrap_or("unrecorded");
+	let partition_work_concurrency_requested = first
+		.and_then(|row| row.get("partition_work_concurrency_requested"))
+		.and_then(serde_json::Value::as_u64);
+	let partition_work_concurrency_requested_provenance = first
+		.and_then(|row| row.get("partition_work_concurrency_requested_provenance"))
+		.and_then(serde_json::Value::as_str);
+	let partition_work_concurrency_observations = first
+		.and_then(|row| row.get("partition_work_concurrency_observations"))
+		.cloned()
+		.unwrap_or(serde_json::Value::Null);
 	let (dataset_verification, dataset_verification_changed) = summary_dataset_verification(&rows);
 	let mut flags = Vec::new();
 	const STABILITY_THRESHOLD: f64 = 0.20;
@@ -3889,6 +3927,9 @@ fn summarize_query_rows(
 		"memory_per_task_provenance": memory_per_task_provenance,
 		"spill_bytes_reserved": spill_bytes_reserved,
 		"spill_bytes_reserved_provenance": spill_bytes_reserved_provenance,
+		"partition_work_concurrency_requested": partition_work_concurrency_requested,
+		"partition_work_concurrency_requested_provenance": partition_work_concurrency_requested_provenance,
+		"partition_work_concurrency_observations": partition_work_concurrency_observations,
 		"status": status,
 		"runs": runs,
 		"warmup": warmup,
@@ -5540,6 +5581,40 @@ mod tests {
 		unsafe { std::env::set_var("TORON_TPCH_SPILL_BYTES_RESERVED", "0") };
 		assert!(gauge_spill_bytes_reserved().is_err());
 		unsafe { std::env::remove_var("TORON_TPCH_SPILL_BYTES_RESERVED") };
+	}
+
+	#[test]
+	fn adr527_partition_work_pin_is_loud_and_rows_name_requested_concurrency() {
+		// SAFETY: this gate suite runs with --test-threads=1.
+		unsafe { std::env::remove_var("TORON_PARTITION_PARALLELISM") };
+		let (default_value, default_provenance) =
+			gauge_partition_work_concurrency_requested().expect("default partition-work pin");
+		assert!(default_value > 0);
+		assert_eq!(default_provenance, "default");
+
+		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "8") };
+		assert_eq!(
+			gauge_partition_work_concurrency_requested().expect("explicit partition-work pin"),
+			(8, "explicit")
+		);
+		let mut toron_row = serde_json::json!({});
+		add_partition_work_concurrency_fields(&mut toron_row, Some((8, "explicit")));
+		assert_eq!(toron_row["partition_work_concurrency_requested"], 8);
+		assert_eq!(
+			toron_row["partition_work_concurrency_requested_provenance"],
+			"explicit"
+		);
+
+		let mut peer_row = serde_json::json!({});
+		add_partition_work_concurrency_fields(&mut peer_row, None);
+		assert!(peer_row["partition_work_concurrency_requested"].is_null());
+		assert!(peer_row["partition_work_concurrency_requested_provenance"].is_null());
+
+		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "0") };
+		assert!(gauge_partition_work_concurrency_requested().is_err());
+		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "many") };
+		assert!(gauge_partition_work_concurrency_requested().is_err());
+		unsafe { std::env::remove_var("TORON_PARTITION_PARALLELISM") };
 	}
 
 	#[test]

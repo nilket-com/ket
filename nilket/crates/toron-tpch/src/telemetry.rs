@@ -330,6 +330,10 @@ pub struct PerfAttempt {
 	pub local_join_admissions: Option<Vec<String>>,
 	/// Runtime hash-join path and attributed spill bytes, keyed by replay id.
 	pub join_spill_observations: Option<Vec<toron::distributed::task::JoinSpillObservation>>,
+	/// ADR 527: route-local requested/effective partition-work facts. An empty Toron vector means
+	/// the query never reached the sole executor consumer; peer rows carry `None`.
+	pub partition_work_concurrency_observations:
+		Option<Vec<toron::distributed::task::PartitionWorkConcurrencyObservation>>,
 	/// How the persisted dataset behind this row was verified. `None` means no persisted dataset
 	/// backed the run — an in-memory fixture, or a peer engine row the harness did not load data for.
 	pub dataset_verification: Option<DatasetVerification>,
@@ -381,6 +385,7 @@ impl PerfAttempt {
 			"binary_modified_unix": binary_modified_unix(),
 			"local_join_admissions": self.local_join_admissions,
 			"join_spill_observations": self.join_spill_observations,
+			"partition_work_concurrency_observations": self.partition_work_concurrency_observations,
 			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");

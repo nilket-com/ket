@@ -90,6 +90,11 @@ pub struct TaskTelemetry {
 	/// conceal a change in the runtime path that produced it.
 	#[serde(default)]
 	pub join_spill_observations: Vec<JoinSpillObservation>,
+	/// ADR 527: requested and effective concurrency facts for the one executor path that consumes
+	/// `ExecutionContext::partition_parallelism`. Absence means the task never reached that path;
+	/// it must not be interpreted as sequential execution.
+	#[serde(default)]
+	pub partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +113,29 @@ pub struct JoinSpillObservation {
 	pub replay_id: JoinReplayId,
 	pub path: JoinSpillPath,
 	pub spill_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionWorkConcurrencyPath {
+	PartitionedStreamingScanBuild,
+}
+
+/// One runtime-scoped capability receipt. `planned_k` is the executor's bounded semaphore width,
+/// not a query-wide thread count. Work-item totals cover the complete lifetime of that runtime and
+/// reconcile even when it takes the sequential fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionWorkConcurrencyObservation {
+	pub replay_id: JoinReplayId,
+	pub path: PartitionWorkConcurrencyPath,
+	pub partition_count: u64,
+	pub requested_concurrency: u64,
+	pub available_parallelism: u64,
+	pub planned_k: u64,
+	pub resident_peak_bytes: u64,
+	pub resident_budget_bytes: u64,
+	pub work_items_started: u64,
+	pub work_items_completed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +250,7 @@ mod join_spill_observation_tests {
 		)
 		.expect("legacy telemetry remains readable");
 		assert!(legacy.join_spill_observations.is_empty());
+		assert!(legacy.partition_work_concurrency_observations.is_empty());
 
 		let observation = JoinSpillObservation {
 			replay_id: JoinReplayId(0),
@@ -231,6 +260,29 @@ mod join_spill_observation_tests {
 		let value = serde_json::to_value(&observation).expect("serialize observation");
 		assert_eq!(value["path"], "partitioned_streaming_scan_build");
 		assert_eq!(value["spill_bytes"], 88_559_536);
+	}
+
+	#[test]
+	fn partition_work_concurrency_observation_has_typed_route_and_exact_counts() {
+		let observation = PartitionWorkConcurrencyObservation {
+			replay_id: JoinReplayId(2),
+			path: PartitionWorkConcurrencyPath::PartitionedStreamingScanBuild,
+			partition_count: 8,
+			requested_concurrency: 4,
+			available_parallelism: 2,
+			planned_k: 2,
+			resident_peak_bytes: 64 * 1024 * 1024,
+			resident_budget_bytes: 512 * 1024 * 1024,
+			work_items_started: 8,
+			work_items_completed: 8,
+		};
+		let value = serde_json::to_value(&observation).expect("serialize capability receipt");
+		assert_eq!(value["path"], "partitioned_streaming_scan_build");
+		assert_eq!(value["requested_concurrency"], 4);
+		assert_eq!(value["available_parallelism"], 2);
+		assert_eq!(value["planned_k"], 2);
+		assert_eq!(value["resident_budget_bytes"], 512 * 1024 * 1024u64);
+		assert_eq!(value["work_items_started"], value["work_items_completed"]);
 	}
 }
 

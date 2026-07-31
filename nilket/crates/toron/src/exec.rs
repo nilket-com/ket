@@ -2,7 +2,8 @@ use crate::aggregate_kernel;
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::{
-	JoinRuntimeObservation, JoinRuntimeObservationMode, RowCount, TaskTelemetry,
+	JoinRuntimeObservation, JoinRuntimeObservationMode, PartitionWorkConcurrencyObservation,
+	PartitionWorkConcurrencyPath, RowCount, TaskTelemetry,
 };
 use crate::error::ExecutionError;
 #[cfg(test)]

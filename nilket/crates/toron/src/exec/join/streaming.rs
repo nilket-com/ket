@@ -1587,6 +1587,83 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+pub(in crate::exec) struct PartitionWorkConcurrencyTracker {
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	observation: PartitionWorkConcurrencyObservation,
+	engaged: bool,
+}
+
+impl PartitionWorkConcurrencyTracker {
+	fn new(
+		telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+		replay_id: JoinReplayId,
+		partition_count: u32,
+		requested_concurrency: usize,
+	) -> Self {
+		Self {
+			telemetry,
+			observation: PartitionWorkConcurrencyObservation {
+				replay_id,
+				path: PartitionWorkConcurrencyPath::PartitionedStreamingScanBuild,
+				partition_count: u64::from(partition_count),
+				requested_concurrency: requested_concurrency as u64,
+				available_parallelism: 0,
+				planned_k: 0,
+				resident_peak_bytes: 0,
+				resident_budget_bytes: 0,
+				work_items_started: 0,
+				work_items_completed: 0,
+			},
+			engaged: false,
+		}
+	}
+
+	fn observe_plan(
+		&mut self,
+		available_parallelism: usize,
+		planned_k: usize,
+		resident_peak_bytes: u64,
+		resident_budget_bytes: u64,
+	) {
+		self.engaged = true;
+		self.observation.available_parallelism = self
+			.observation
+			.available_parallelism
+			.max(available_parallelism as u64);
+		self.observation.planned_k = self.observation.planned_k.max(planned_k as u64);
+		self.observation.resident_peak_bytes = self
+			.observation
+			.resident_peak_bytes
+			.max(resident_peak_bytes);
+		self.observation.resident_budget_bytes = self
+			.observation
+			.resident_budget_bytes
+			.max(resident_budget_bytes);
+	}
+
+	fn work_started(&mut self) {
+		self.observation.work_items_started = self.observation.work_items_started.saturating_add(1);
+	}
+
+	fn work_completed(&mut self) {
+		self.observation.work_items_completed =
+			self.observation.work_items_completed.saturating_add(1);
+	}
+}
+
+impl Drop for PartitionWorkConcurrencyTracker {
+	fn drop(&mut self) {
+		if !self.engaged {
+			return;
+		}
+		let observation = self.observation.clone();
+		record_task_telemetry(&self.telemetry, |task| {
+			task.partition_work_concurrency_observations
+				.push(observation);
+		});
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::exec) struct SuffixProbeBuildFacts {
 	shape: super::build_rows::JoinBuildProfileShape,
@@ -2022,6 +2099,7 @@ pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 		loaded_builds: Vec<Option<LoadedSpilledInnerBuild>>,
 		loaded_resident_bytes: u64,
 		loaded_build_attempted: bool,
+		partition_work_tracker: PartitionWorkConcurrencyTracker,
 	},
 }
 
@@ -2296,6 +2374,8 @@ struct PartitionAtATimeReplayReservoir {
 struct ParallelPartitionPlan {
 	k: usize,
 	resident_peak: u64,
+	available_parallelism: usize,
+	resident_budget: u64,
 }
 
 fn partition_streaming_join_batch_with_buckets(
@@ -4758,7 +4838,6 @@ fn parallel_partition_plan(
 		.map(std::num::NonZeroUsize::get)
 		.unwrap_or(1)
 		.max(1);
-	let requested = configured.min(available).max(1);
 	let resident_peak = group_probe_batches
 		.iter()
 		.filter_map(|(partition, probe)| {
@@ -4769,16 +4848,30 @@ fn parallel_partition_plan(
 		})
 		.fold(0u64, u64::max);
 	let budget = join_spill_retained_footprint_memory_cap(memory_cap).max(1);
+	bounded_parallel_partition_plan(configured, available, resident_peak, budget)
+}
+
+fn bounded_parallel_partition_plan(
+	configured_parallelism: usize,
+	available_parallelism: usize,
+	resident_peak: u64,
+	resident_budget: u64,
+) -> ParallelPartitionPlan {
+	let requested = configured_parallelism
+		.max(1)
+		.min(available_parallelism.max(1));
 	let memory_k = if resident_peak == 0 {
 		requested
 	} else {
-		usize::try_from(budget / resident_peak)
+		usize::try_from(resident_budget / resident_peak)
 			.unwrap_or(usize::MAX)
 			.max(1)
 	};
 	ParallelPartitionPlan {
 		k: requested.min(memory_k).max(1),
 		resident_peak,
+		available_parallelism: available_parallelism.max(1),
+		resident_budget,
 	}
 }
 
@@ -11821,6 +11914,12 @@ impl Executor {
 				loaded_builds: vec![None],
 				loaded_resident_bytes: 0,
 				loaded_build_attempted: false,
+				partition_work_tracker: PartitionWorkConcurrencyTracker::new(
+					self.context.task_telemetry.clone(),
+					stage.replay_id,
+					1,
+					self.context.partition_parallelism,
+				),
 			},
 			key_plan,
 			probe_keys: stage.probe_keys.clone(),
@@ -16514,6 +16613,12 @@ impl Executor {
 						loaded_builds: (0..partition_count_usize).map(|_| None).collect(),
 						loaded_resident_bytes: 0,
 						loaded_build_attempted: false,
+						partition_work_tracker: PartitionWorkConcurrencyTracker::new(
+							self.context.task_telemetry.clone(),
+							stage.replay_id,
+							partition_count,
+							self.context.partition_parallelism,
+						),
 					},
 					key_plan,
 					probe_keys: stage.probe_keys,
@@ -17437,6 +17542,7 @@ impl Executor {
 				loaded_builds,
 				loaded_resident_bytes,
 				loaded_build_attempted,
+				partition_work_tracker,
 			} => {
 				if let Some(profile) = profile.as_deref_mut() {
 					profile.mark_unsupported(
@@ -17502,6 +17608,7 @@ impl Executor {
 								runtime.probe_columns_first,
 								*build_column_count,
 								projection.as_ref(),
+								partition_work_tracker,
 							)
 							.await?;
 						*observed_build_rows = observed_build_rows.saturating_add(build_rows);
@@ -18080,6 +18187,7 @@ impl Executor {
 		probe_columns_first: bool,
 		build_column_count: usize,
 		projection: Option<&ProjectedInnerBuildProjection>,
+		partition_work_tracker: &mut PartitionWorkConcurrencyTracker,
 	) -> Result<(Vec<RecordBatch>, u64, u64, u64), ExecutionError> {
 		let mut output = Vec::new();
 		let mut total_probe_rows = 0u64;
@@ -18190,6 +18298,12 @@ impl Executor {
 				self.context.partition_parallelism,
 				self.context.task_budget.memory.get(),
 			);
+			partition_work_tracker.observe_plan(
+				parallel_plan.available_parallelism,
+				parallel_plan.k,
+				parallel_plan.resident_peak,
+				parallel_plan.resident_budget,
+			);
 			debug_assert!(parallel_plan.resident_peak > 0 || group_probe_batches.is_empty());
 			if parallel_plan.k > 1 {
 				let partition_count_usize =
@@ -18250,6 +18364,7 @@ impl Executor {
 						let _permit = permit;
 						run_loaded_partition_work(work, None, None)
 					}));
+					partition_work_tracker.work_started();
 				}
 				let mut slots: Vec<Option<LoadedPartitionResult>> =
 					(0..partition_count_usize).map(|_| None).collect();
@@ -18257,7 +18372,9 @@ impl Executor {
 					join_output_materialization_memory_cap(self.context.task_budget.memory.get());
 				let mut ordered_output_slot_bytes = 0u64;
 				for handle in handles {
-					let result = match handle.await {
+					let joined = handle.await;
+					partition_work_tracker.work_completed();
+					let result = match joined {
 						Ok(Ok(result)) => result,
 						Ok(Err(error)) => {
 							first_error.get_or_insert(error);
@@ -18329,6 +18446,7 @@ impl Executor {
 						spilled.cleanup().await;
 						continue;
 					}
+					partition_work_tracker.work_started();
 					let memory_cap = self.context.task_budget.memory.get();
 					let loaded_resident = estimate_parallel_partition_resident(
 						&spilled,
@@ -18425,6 +18543,7 @@ impl Executor {
 						total_output_rows = total_output_rows.saturating_add(output_rows);
 						output.extend(partition_output);
 					}
+					partition_work_tracker.work_completed();
 				}
 			}
 			Self::cleanup_partitioned_streamed_inner_builds(partitioned_builds).await;
@@ -20544,6 +20663,7 @@ mod tests {
 
 		let group_requested_tables = Arc::new(Mutex::new(Vec::new()));
 		let group_executor = make_executor(group_requested_tables.clone());
+		let mut group_tracker = PartitionWorkConcurrencyTracker::new(None, JoinReplayId(0), 8, 1);
 		let (group_output, group_probe_rows, group_output_rows, _) = group_executor
 			.probe_partitioned_streamed_inner_scan_build(
 				scan_input,
@@ -20561,6 +20681,7 @@ mod tests {
 				true,
 				build_schema.fields().len(),
 				None,
+				&mut group_tracker,
 			)
 			.await
 			.expect("group re-scan probe");
@@ -21128,6 +21249,20 @@ mod tests {
 			filter_predicate: None,
 			exchange: None,
 		};
+		let sequential_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let parallel_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let mut sequential_tracker = PartitionWorkConcurrencyTracker::new(
+			Some(sequential_telemetry.clone()),
+			JoinReplayId(1),
+			4,
+			1,
+		);
+		let mut parallel_tracker = PartitionWorkConcurrencyTracker::new(
+			Some(parallel_telemetry.clone()),
+			JoinReplayId(1),
+			4,
+			4,
+		);
 
 		let (sequential_output, sequential_probe_rows, sequential_output_rows, _) = sequential
 			.probe_partitioned_streamed_inner_scan_build(
@@ -21146,6 +21281,7 @@ mod tests {
 				true,
 				build_schema.fields().len(),
 				None,
+				&mut sequential_tracker,
 			)
 			.await
 			.expect("sequential partitioned probe");
@@ -21166,6 +21302,7 @@ mod tests {
 				true,
 				build_schema.fields().len(),
 				None,
+				&mut parallel_tracker,
 			)
 			.await
 			.expect("parallel partitioned probe");
@@ -21179,6 +21316,75 @@ mod tests {
 			canonical_arrow_ipc_digest(&sequential_output, SortPolicy::None)
 				.expect("sequential digest")
 		);
+		drop(sequential_tracker);
+		drop(parallel_tracker);
+		let sequential_receipt = sequential_telemetry
+			.lock()
+			.expect("sequential telemetry")
+			.partition_work_concurrency_observations[0]
+			.clone();
+		let parallel_receipt = parallel_telemetry
+			.lock()
+			.expect("parallel telemetry")
+			.partition_work_concurrency_observations[0]
+			.clone();
+		assert_eq!(sequential_receipt.planned_k, 1);
+		assert_eq!(parallel_receipt.requested_concurrency, 4);
+		assert!(parallel_receipt.available_parallelism >= 1);
+		assert_eq!(
+			parallel_receipt.resident_budget_bytes,
+			join_spill_retained_footprint_memory_cap(budget.memory.get())
+		);
+		assert!(
+			parallel_receipt.planned_k >= 1 && parallel_receipt.planned_k <= 4,
+			"the live host may cap the requested concurrency"
+		);
+		assert_eq!(
+			sequential_receipt.work_items_started,
+			sequential_receipt.work_items_completed
+		);
+		assert_eq!(
+			parallel_receipt.work_items_started,
+			parallel_receipt.work_items_completed
+		);
+	}
+
+	#[test]
+	fn parallel_partition_plan_bounds_requested_host_and_memory_concurrency() {
+		assert_eq!(bounded_parallel_partition_plan(1, 8, 10, 100).k, 1);
+		let requested = bounded_parallel_partition_plan(8, 8, 10, 100);
+		assert_eq!(requested.k, 8);
+		assert_eq!(requested.available_parallelism, 8);
+		assert_eq!(requested.resident_budget, 100);
+		assert_eq!(bounded_parallel_partition_plan(8, 1, 10, 100).k, 1);
+		assert_eq!(bounded_parallel_partition_plan(8, 8, 60, 100).k, 1);
+		assert_eq!(
+			bounded_parallel_partition_plan(8, 8, 0, 1).k,
+			8,
+			"an empty resident footprint must not invent a memory restriction"
+		);
+	}
+
+	#[test]
+	fn partition_work_tracker_emits_one_runtime_scoped_receipt() {
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let mut tracker =
+			PartitionWorkConcurrencyTracker::new(Some(telemetry.clone()), JoinReplayId(3), 8, 8);
+		tracker.observe_plan(8, 2, 100, 400);
+		tracker.observe_plan(8, 4, 120, 400);
+		tracker.work_started();
+		tracker.work_completed();
+		drop(tracker);
+
+		let telemetry = telemetry.lock().expect("partition-work telemetry");
+		let receipts = &telemetry.partition_work_concurrency_observations;
+		assert_eq!(receipts.len(), 1);
+		assert_eq!(receipts[0].replay_id, JoinReplayId(3));
+		assert_eq!(receipts[0].planned_k, 4);
+		assert_eq!(receipts[0].resident_peak_bytes, 120);
+		assert_eq!(receipts[0].resident_budget_bytes, 400);
+		assert_eq!(receipts[0].work_items_started, 1);
+		assert_eq!(receipts[0].work_items_completed, 1);
 	}
 
 	#[tokio::test]
@@ -21215,6 +21421,7 @@ mod tests {
 		let scan = test_scan_plan_with_first_field_key(TableId(10), build_schema.clone(), 10);
 		let materialized_output_schema = concat_test_schema(&build_schema, &probe_schema);
 		let output_schema = concat_test_schema(&probe_schema, &build_schema);
+		let mut tracker = PartitionWorkConcurrencyTracker::new(None, JoinReplayId(0), 1, 1);
 
 		let (output, probe_rows, output_rows, observed_build_rows) = executor
 			.probe_partitioned_streamed_inner_scan_build(
@@ -21237,6 +21444,7 @@ mod tests {
 				true,
 				build_schema.fields().len(),
 				None,
+				&mut tracker,
 			)
 			.await
 			.expect("sequential loaded partition probe");
@@ -22560,6 +22768,12 @@ mod tests {
 				loaded_builds: (0..4).map(|_| None).collect(),
 				loaded_resident_bytes: 0,
 				loaded_build_attempted: false,
+				partition_work_tracker: PartitionWorkConcurrencyTracker::new(
+					None,
+					JoinReplayId(1),
+					4,
+					1,
+				),
 			},
 			key_plan: JoinKeyPlan::Int64,
 			probe_keys: vec![ColumnOrdinal(3)],
@@ -22700,6 +22914,12 @@ mod tests {
 				loaded_builds: (0..4).map(|_| None).collect(),
 				loaded_resident_bytes: 0,
 				loaded_build_attempted: false,
+				partition_work_tracker: PartitionWorkConcurrencyTracker::new(
+					None,
+					JoinReplayId(1),
+					4,
+					1,
+				),
 			},
 			key_plan: JoinKeyPlan::Int64,
 			probe_keys: vec![ColumnOrdinal(2)],

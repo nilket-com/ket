@@ -51,7 +51,10 @@ use toron::binder::{
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::task::{JoinBuildProfile, JoinSpillObservation, RowCount, TaskTelemetry};
+use toron::distributed::task::{
+	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
+	TaskTelemetry,
+};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -4187,6 +4190,7 @@ struct QueryExecution {
 	spill_bytes: u64,
 	local_join_admissions: Vec<String>,
 	join_spill_observations: Vec<JoinSpillObservation>,
+	partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -4368,6 +4372,8 @@ async fn execute_logical_with_catalog_timed(
 	let telemetry = task_telemetry.lock().expect("task telemetry lock");
 	spill_bytes = telemetry.counters.spill_bytes;
 	let join_spill_observations = telemetry.join_spill_observations.clone();
+	let partition_work_concurrency_observations =
+		telemetry.partition_work_concurrency_observations.clone();
 	drop(telemetry);
 
 	Ok(QueryExecution {
@@ -4380,10 +4386,37 @@ async fn execute_logical_with_catalog_timed(
 			.map(|admission| admission.describe())
 			.collect(),
 		join_spill_observations,
+		partition_work_concurrency_observations,
 	})
 }
 
 pub const GAUGE_MEMORY_PER_TASK_ENV: &str = "TORON_TPCH_MEMORY_PER_TASK";
+pub const PARTITION_WORK_CONCURRENCY_ENV: &str = "TORON_PARTITION_PARALLELISM";
+
+/// ADR 527 names this setting by its actual reach: it is the requested upper bound consumed by
+/// one partitioned scan-build path, not a query-wide thread count. The absent arm mirrors Toron's
+/// engine default; malformed explicit values fail loudly in the performance rail.
+pub fn gauge_partition_work_concurrency_requested() -> Result<(u64, &'static str), String> {
+	match std::env::var(PARTITION_WORK_CONCURRENCY_ENV) {
+		Ok(raw) => match raw.parse::<usize>() {
+			Ok(value) if value > 0 => u64::try_from(value)
+				.map(|value| (value, "explicit"))
+				.map_err(|_| format!("{PARTITION_WORK_CONCURRENCY_ENV} does not fit u64")),
+			_ => Err(format!(
+				"{PARTITION_WORK_CONCURRENCY_ENV} must be a positive integer, got {raw:?}"
+			)),
+		},
+		Err(std::env::VarError::NotPresent) => u64::try_from(
+			std::thread::available_parallelism()
+				.map(std::num::NonZeroUsize::get)
+				.unwrap_or(1)
+				.max(1),
+		)
+		.map(|value| (value, "default"))
+		.map_err(|_| format!("{PARTITION_WORK_CONCURRENCY_ENV} default does not fit u64")),
+		Err(error) => Err(format!("{PARTITION_WORK_CONCURRENCY_ENV}: {error}")),
+	}
+}
 
 /// The gauge's memory budget and where it came from. `default` means the
 /// engine's 64 MiB test constant; `explicit` means the operator set the env.
@@ -5260,6 +5293,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5297,6 +5331,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5333,6 +5368,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
 			join_spill_observations: None,
+			partition_work_concurrency_observations: None,
 			dataset_verification: None,
 		};
 	}
@@ -5362,6 +5398,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
 			join_spill_observations: None,
+			partition_work_concurrency_observations: None,
 			dataset_verification: None,
 		};
 	}
@@ -5390,6 +5427,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
 		join_spill_observations: None,
+		partition_work_concurrency_observations: None,
 		dataset_verification: None,
 	}
 }
@@ -5437,6 +5475,7 @@ async fn run_perf_query_with_tables(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5474,6 +5513,7 @@ async fn run_perf_query_with_tables(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5507,6 +5547,9 @@ async fn run_perf_query_with_tables(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
 		join_spill_observations: Some(execution.join_spill_observations),
+		partition_work_concurrency_observations: Some(
+			execution.partition_work_concurrency_observations,
+		),
 		dataset_verification: None,
 	}
 }
@@ -5555,6 +5598,7 @@ async fn run_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5592,6 +5636,7 @@ async fn run_perf_query_with_metadata(
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
 				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
 				dataset_verification: None,
 			};
 		}
@@ -5625,6 +5670,9 @@ async fn run_perf_query_with_metadata(
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
 		join_spill_observations: Some(execution.join_spill_observations),
+		partition_work_concurrency_observations: Some(
+			execution.partition_work_concurrency_observations,
+		),
 		dataset_verification: None,
 	}
 }
@@ -15298,6 +15346,11 @@ mod adr356_perf_rail {
 		assert!(row["execute_ms"].as_f64().expect("execute_ms") > 0.0);
 		assert!(row.get("elapsed_ms").is_none());
 		assert_eq!(row["spill_bytes"], 0);
+		assert_eq!(
+			row["partition_work_concurrency_observations"],
+			serde_json::json!([]),
+			"an in-memory q06 must not counterfeit reach of the route-local control"
+		);
 		assert!(row["output_row_count"].as_u64().expect("row count") > 0);
 		assert!(
 			row["output_schema_fingerprint"]
@@ -15957,6 +16010,7 @@ mod dataset_verification_provenance {
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
 			join_spill_observations: None,
+			partition_work_concurrency_observations: None,
 			dataset_verification: None,
 		};
 
