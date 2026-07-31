@@ -555,7 +555,7 @@ mod tests {
 			parent: Some(11),
 			depth: 2,
 			label: "FN".to_string(),
-			semantic_kind: SemanticKind::Group,
+			semantic_kind: SemanticKind::None,
 			storage: UastStorageKind::Branch,
 			start_byte: 23,
 			end_byte: 29,

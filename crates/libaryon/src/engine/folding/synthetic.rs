@@ -619,7 +619,7 @@ fn preview_synthetic_fold_plan_at_cursor(
 		registry.publish_hydrated_data(node, bytes);
 	};
 	let parent = unsafe { (*registry.edges[target.node_id.index()].get()).parent }?;
-	if unsafe { *registry.kinds[parent.index()].get() } == SemanticKind::Group {
+	if unsafe { *registry.kinds[parent.index()].get() } == SemanticKind::None {
 		// A grouping bucket is an indexing detail, not a stable editing
 		// boundary. Synthetic folds may not split or reparent its children.
 		return None;

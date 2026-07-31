@@ -158,7 +158,7 @@ fn fold_kind(registry: &UastRegistry, root: NodeId, node: NodeId) -> Option<Sema
 		return None;
 	}
 	let kind = unsafe { *registry.kinds[idx].get() };
-	(!matches!(kind, SemanticKind::Group | SemanticKind::Token)).then_some(kind)
+	(!matches!(kind, SemanticKind::None | SemanticKind::Token)).then_some(kind)
 }
 
 fn attached_to_root(registry: &UastRegistry, root: NodeId, node: NodeId) -> bool {

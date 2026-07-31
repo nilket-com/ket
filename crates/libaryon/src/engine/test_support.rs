@@ -66,20 +66,20 @@ pub(crate) fn build_grafted_rust_document(text: &str) -> (UastRegistry, crate::e
 	(registry, root)
 }
 
-/// Grafted topology probe with a synthetic group before a real function:
+/// Grafted topology probe with a neutral fan-out bucket before a real function:
 ///
 /// ```text
 /// document root
-/// └─ Group (transparent spine)
+/// └─ None (transparent structural spine)
 ///    ├─ Token [0..1]
-///    ├─ Group [1..10]
+///    ├─ None [1..10]
 ///    │  └─ Token [1..10]
 ///    └─ RelationalTable [10..30]
 ///       └─ Token [10..30]
 /// ```
 ///
-/// The returned leaf is inside the synthetic group. The returned function is
-/// the later semantic boundary used to verify `]m` skips topology-only nodes.
+/// The returned leaf is inside the neutral bucket. The returned function is the
+/// later semantic boundary used to verify `]m` skips topology-only nodes.
 pub(crate) fn build_grouped_semantic_document() -> (
 	UastRegistry,
 	crate::ecs::NodeId,
@@ -88,7 +88,7 @@ pub(crate) fn build_grouped_semantic_document() -> (
 ) {
 	let source = b"pgggggggggffffffffffffffffffff";
 	let green = GreenNode {
-		kind: SemanticKind::Group,
+		kind: SemanticKind::None,
 		provider_kind: crate::uast::ProviderKindId::NONE,
 		byte_len: source.len() as u32,
 		children: vec![
@@ -99,7 +99,7 @@ pub(crate) fn build_grouped_semantic_document() -> (
 				children: Vec::new(),
 			},
 			GreenNode {
-				kind: SemanticKind::Group,
+				kind: SemanticKind::None,
 				provider_kind: crate::uast::ProviderKindId::NONE,
 				byte_len: 9,
 				children: vec![GreenNode {

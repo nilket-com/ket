@@ -2564,7 +2564,7 @@ impl canvas::Program<EditorMsg> for UastGraphWidget<'_> {
 			let fill = match node.semantic_kind {
 				libaryon::uast::SemanticKind::RelationalTable => self.palette.tab_active_surface,
 				libaryon::uast::SemanticKind::RelationalRow => self.palette.gutter_surface,
-				libaryon::uast::SemanticKind::Group => self.palette.tab_surface,
+				libaryon::uast::SemanticKind::None => self.palette.tab_surface,
 				libaryon::uast::SemanticKind::Token => self.palette.editor_background,
 			};
 			let path = canvas::Path::rectangle(rect.position(), rect.size());

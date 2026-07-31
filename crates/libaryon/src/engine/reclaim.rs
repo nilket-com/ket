@@ -71,7 +71,7 @@ impl ReclaimQueue {
 			}
 			cursor.stack.extend(children.into_iter().rev());
 
-			let reclaimed = registry.reclaim_orphaned_payload(node);
+			let reclaimed = registry.reclaim_orphaned_node(node);
 			progress.visited_nodes += 1;
 			progress.authoritative_bytes = progress
 				.authoritative_bytes
@@ -133,7 +133,7 @@ mod tests {
 	fn a_forest_head_does_not_walk_its_detached_root_sibling() {
 		let registry = UastRegistry::new(4);
 		let mut chunk = registry.reserve_chunk(4).expect("registry chunk");
-		let first = chunk.spawn_node(SemanticKind::Group, None, SpanMetrics::default());
+		let first = chunk.spawn_node(SemanticKind::None, None, SpanMetrics::default());
 		let child = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		let sibling = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		let sibling_child = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
@@ -162,7 +162,7 @@ mod tests {
 		let mut chunk = registry
 			.reserve_chunk((LEAVES + 1) as u32)
 			.expect("registry chunk");
-		let root = chunk.spawn_node(SemanticKind::Group, None, SpanMetrics::default());
+		let root = chunk.spawn_node(SemanticKind::None, None, SpanMetrics::default());
 		for _ in 0..LEAVES {
 			let leaf = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 			chunk.append_local_child(root, leaf);
@@ -220,7 +220,7 @@ mod tests {
 	fn an_attached_subtree_cannot_enter_reclamation() {
 		let registry = UastRegistry::new(2);
 		let mut chunk = registry.reserve_chunk(2).expect("registry chunk");
-		let root = chunk.spawn_node(SemanticKind::Group, None, SpanMetrics::default());
+		let root = chunk.spawn_node(SemanticKind::None, None, SpanMetrics::default());
 		let child = chunk.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		chunk.append_local_child(root, child);
 		registry.retire_orphaned_forest([child], 1, 0, ReclaimFence::AfterPublication);
@@ -286,7 +286,7 @@ mod tests {
 		assert_eq!(registry.stats().reusable_slots, 1);
 		let mut recycled = registry.reserve_chunk(1).expect("quiescent slot");
 		let new = recycled.spawn_node(
-			SemanticKind::Group,
+			SemanticKind::None,
 			None,
 			SpanMetrics {
 				byte_length: 11,
@@ -330,7 +330,7 @@ mod tests {
 		let mut mixed = registry
 			.reserve_chunk(3)
 			.expect("one free plus two tail slots");
-		let parent = mixed.spawn_node(SemanticKind::Group, None, SpanMetrics::default());
+		let parent = mixed.spawn_node(SemanticKind::None, None, SpanMetrics::default());
 		let left = mixed.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		let right = mixed.spawn_node(SemanticKind::Token, None, SpanMetrics::default());
 		mixed.append_local_child(parent, left);

@@ -14,6 +14,19 @@ fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 	}
 }
 
+fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+	let entries = fs::read_dir(dir).expect("read_dir should succeed");
+	for entry in entries {
+		let entry = entry.expect("directory entry should load");
+		let path = entry.path();
+		if path.is_dir() {
+			collect_rs_files(&path, files);
+		} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+			files.push(path);
+		}
+	}
+}
+
 fn strip_line_comment(line: &str) -> &str {
 	line.split_once("//").map(|(code, _)| code).unwrap_or(line)
 }
@@ -124,5 +137,38 @@ fn test_mod_rs_files_are_manifests_only() {
 		violations.is_empty(),
 		"mod.rs files must be manifests only:\n{}",
 		violations.join("\n")
+	);
+}
+
+#[test]
+fn semantic_none_is_the_only_neutral_kind_and_never_decides_liveness() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let crates_dir = manifest_dir.parent().expect("workspace crates directory");
+	let mut rust_sources = Vec::new();
+	collect_rs_files(crates_dir, &mut rust_sources);
+	let legacy_variant = ["SemanticKind::", "Group"].concat();
+	for path in rust_sources {
+		let source = fs::read_to_string(&path).expect("Rust source should be readable");
+		assert!(
+			!source.contains(&legacy_variant),
+			"{} reintroduced the topology name into the semantic algebra",
+			path.display()
+		);
+	}
+
+	let registry =
+		fs::read_to_string(manifest_dir.join("src/ecs/registry.rs")).expect("registry source");
+	let currency = registry
+		.split("pub(crate) fn is_current_node")
+		.nth(1)
+		.and_then(|tail| tail.split("pub(crate) fn checked_node_index").next())
+		.expect("NodeId currency function");
+	assert!(
+		currency.contains("slot_published") && currency.contains("object_generation"),
+		"NodeId currency must remain publication- and generation-based"
+	);
+	assert!(
+		!currency.contains("kinds"),
+		"SemanticKind::None is an algebra value, never a liveness sentinel"
 	);
 }

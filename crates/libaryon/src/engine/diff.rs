@@ -556,7 +556,7 @@ fn extract_nodes_with_coords(
 		match kind {
 			SemanticKind::RelationalTable => tables.push(node),
 			SemanticKind::RelationalRow => rows.push(node),
-			SemanticKind::Group => groups.push(node),
+			SemanticKind::None => groups.push(node),
 			SemanticKind::Token => tokens.push(node),
 		}
 
@@ -1660,7 +1660,7 @@ mod tests {
 						.saturating_sub(block.partner_range.0.get())
 						<= 1
 			}),
-			"a local edit must not become a 64-line Group removal/addition: {blocks:?}"
+			"a local edit must not become a 64-line fan-out removal/addition: {blocks:?}"
 		);
 	}
 

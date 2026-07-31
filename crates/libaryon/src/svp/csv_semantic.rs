@@ -49,7 +49,7 @@ impl RangeNode {
 			provider_kind: match self.kind {
 				SemanticKind::RelationalTable => CSV_TABLE_KIND,
 				SemanticKind::RelationalRow => CSV_ROW_KIND,
-				SemanticKind::Token | SemanticKind::Group => CSV_TOKEN_KIND,
+				SemanticKind::Token | SemanticKind::None => CSV_TOKEN_KIND,
 			},
 			byte_len: self.end.saturating_sub(self.start) as u32,
 			children: self.children.iter().map(Self::to_green).collect(),

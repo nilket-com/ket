@@ -2542,7 +2542,7 @@ mod tests {
 		let first_bucket = registry.get_first_child(module).expect("group bucket");
 		assert_eq!(
 			unsafe { *registry.kinds[first_bucket.index()].get() },
-			SemanticKind::Group
+			SemanticKind::None
 		);
 		assert!(
 			!registry

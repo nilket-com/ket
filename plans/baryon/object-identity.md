@@ -102,12 +102,16 @@ refusal graceful for genuine live, pending, or burned-slot pressure.
 a different live object. Checked registry entry points compare the packed
 generation with the slot's current generation. Once a reclaimed slot becomes
 allocator-eligible, stale topology/metric reads are inert; after reuse they
-fail the identity check. Resolver publication additionally checks the separate
-monotonic `content_generation`, because object lifetime and byte lifetime are
-different questions. A failed content-generation increment permanently closes
-resolver admission for that slot and burns it at retirement; it never wraps.
-The validation-to-I/O-lease transition shares the allocator lock with
-retirement, so first reuse cannot occur in the gap between those two operations.
+fail the identity check. The bounded reclaim visit also resets the semantic
+and provider classifications to their explicit zero-states
+(`SemanticKind::None`, `ProviderKindId::NONE`), so a corpse retains neither
+language meaning nor provider identity while awaiting reuse. Resolver
+publication additionally checks the separate monotonic `content_generation`,
+because object lifetime and byte lifetime are different questions. A failed
+content-generation increment permanently closes resolver admission for that
+slot and burns it at retirement; it never wraps. The validation-to-I/O-lease
+transition shares the allocator lock with retirement, so first reuse cannot
+occur in the gap between those two operations.
 
 ### 2.3 The existing stale-rejection precedent
 

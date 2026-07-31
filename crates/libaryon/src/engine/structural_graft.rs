@@ -25,7 +25,7 @@ pub enum GraftError {
 	TopologyLengthMismatch { topology: u32, source: usize },
 	/// An interior node's children do not exactly cover its declared extent.
 	TopologyCoverageMismatch { declared: u32, children: u64 },
-	/// The exact semantic tree, including synthetic fan-out groups, cannot fit.
+	/// The exact semantic tree, including synthetic fan-out buckets, cannot fit.
 	CapacityRefused { required: u64, remaining: u64 },
 }
 
@@ -381,7 +381,7 @@ fn graft_child_level(
 		let group = allocate_graft_node(
 			registry,
 			chunk,
-			SemanticKind::Group,
+			SemanticKind::None,
 			ProviderKindId::NONE,
 			byte_len,
 			0,
@@ -622,6 +622,10 @@ mod tests {
 		unsafe { *registry.kinds[id.index()].get() }
 	}
 
+	fn provider_kind_of(registry: &UastRegistry, id: NodeId) -> ProviderKindId {
+		unsafe { *registry.provider_kinds[id.index()].get() }
+	}
+
 	fn collect_children(registry: &UastRegistry, id: NodeId) -> Vec<NodeId> {
 		let mut result = Vec::new();
 		let mut cursor = registry.get_first_child(id);
@@ -643,7 +647,12 @@ mod tests {
 				children.len()
 			);
 			for child in children {
-				if kind_of(registry, child) == SemanticKind::Group {
+				if kind_of(registry, child) == SemanticKind::None {
+					assert_eq!(
+						provider_kind_of(registry, child),
+						ProviderKindId::NONE,
+						"topology-only fan-out must carry no provider identity"
+					);
 					groups += 1;
 				}
 				stack.push(child);

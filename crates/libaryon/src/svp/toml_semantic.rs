@@ -46,7 +46,7 @@ impl RangeNode {
 			provider_kind: match self.kind {
 				SemanticKind::RelationalTable => TOML_SECTION_KIND,
 				SemanticKind::RelationalRow => TOML_ENTRY_KIND,
-				SemanticKind::Token | SemanticKind::Group => TOML_TOKEN_KIND,
+				SemanticKind::Token | SemanticKind::None => TOML_TOKEN_KIND,
 			},
 			byte_len: self.end.saturating_sub(self.start) as u32,
 			children: self.children.iter().map(Self::to_green).collect(),

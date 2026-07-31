@@ -15,7 +15,7 @@ fn node_is_foldable_boundary(registry: &UastRegistry, root: NodeId, node: NodeId
 	has_children
 		&& !matches!(
 			unsafe { *registry.kinds[idx].get() },
-			SemanticKind::Group | SemanticKind::Token
+			SemanticKind::None | SemanticKind::Token
 		)
 }
 

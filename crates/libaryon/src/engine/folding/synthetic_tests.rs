@@ -31,7 +31,7 @@ fn synthetic_fold_does_not_materialize_inside_topology_group() {
 		provider_kind: crate::uast::ProviderKindId::NONE,
 		byte_len: source.len() as u32,
 		children: vec![GreenNode {
-			kind: SemanticKind::Group,
+			kind: SemanticKind::None,
 			provider_kind: crate::uast::ProviderKindId::NONE,
 			byte_len: source.len() as u32,
 			children: parts
@@ -65,7 +65,7 @@ fn synthetic_fold_does_not_materialize_inside_topology_group() {
 		.expect("cursor token parent");
 	assert_eq!(
 		unsafe { *registry.kinds[parent.index()].get() },
-		SemanticKind::Group
+		SemanticKind::None
 	);
 	let allocated_before = registry.stats().allocated_nodes;
 

@@ -237,7 +237,7 @@ fn draw_graph(image: &mut RgbaImage, snapshot: &UastGraphSnapshot) {
 		let fill = match node.semantic_kind {
 			SemanticKind::RelationalTable => Rgba([40, 66, 96, 255]),
 			SemanticKind::RelationalRow => Rgba([48, 82, 72, 255]),
-			SemanticKind::Group => Rgba([65, 59, 83, 255]),
+			SemanticKind::None => Rgba([65, 59, 83, 255]),
 			SemanticKind::Token => Rgba([55, 59, 68, 255]),
 		};
 		fill_rect(image, rect, fill);

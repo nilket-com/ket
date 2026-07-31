@@ -745,7 +745,7 @@ mod tests {
 			0,
 			crate::ecs::registry::ReclaimFence::NeverPublished,
 		);
-		registry.reclaim_orphaned_payload(old);
+		registry.reclaim_orphaned_node(old);
 		assert_eq!(registry.stats().pending_reuse_slots, 1);
 		assert!(
 			registry.reserve_chunk(1).is_none(),
@@ -757,7 +757,7 @@ mod tests {
 		assert_eq!(registry.stats().pending_reuse_slots, 0);
 		let mut replacement = registry.reserve_chunk(1).expect("completion released slot");
 		let new = replacement.spawn_node(
-			SemanticKind::Group,
+			SemanticKind::None,
 			None,
 			SpanMetrics {
 				byte_length: 9,

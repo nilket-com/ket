@@ -1418,12 +1418,12 @@ fn render_snapshot(
 		let graph_parent = node
 			.parent
 			.and_then(|parent| nearest_visible.get(&parent).copied().flatten());
-		let collapse_group = semantic_mode && node.semantic_kind == SemanticKind::Group;
+		let collapse_neutral = semantic_mode && node.semantic_kind == SemanticKind::None;
 		let hide_trivia = semantic_mode
 			&& node.child_count == 0
 			&& provider
 				.is_some_and(|provider| provider.structural_kind_is_trivia(node.provider_kind));
-		if collapse_group {
+		if collapse_neutral {
 			effective_depths.insert(
 				node.node_id,
 				parent_depth.unwrap_or(display_depth.saturating_sub(1)),
@@ -1490,6 +1490,9 @@ fn render_snapshot(
 			if node.child_count_exact { "" } else { "+" },
 			storage_name(node.storage),
 		));
+		if node.semantic_kind == SemanticKind::None && node.child_count > 0 {
+			text.push_str(" · topology=fanout");
+		}
 		if let Some(snippet) = node.resident_snippet.as_deref()
 			&& !snippet.is_empty()
 		{
@@ -1808,7 +1811,7 @@ fn semantic_name(kind: SemanticKind) -> &'static str {
 	match kind {
 		SemanticKind::RelationalTable => "table",
 		SemanticKind::RelationalRow => "row",
-		SemanticKind::Group => "group",
+		SemanticKind::None => "none",
 		SemanticKind::Token => "token",
 	}
 }
@@ -2070,6 +2073,102 @@ mod tests {
 			resident_snippet: None,
 			contains_cursor: false,
 		}
+	}
+
+	#[test]
+	fn neutral_fanout_displays_semantic_none_and_only_derived_topology() {
+		let root = NodeId::from_index(0);
+		let fanout = NodeId::from_index(1);
+		let leaf = NodeId::from_index(2);
+		let snapshot = UastInspectorSnapshot {
+			root,
+			total_bytes: 1,
+			allocated_nodes: 3,
+			allocation_events: 3,
+			capacity: 8,
+			reusable_slots: 0,
+			pending_reuse_slots: 0,
+			burned_slots: 0,
+			retired_nodes: 0,
+			authoritative_payload_bytes: 0,
+			orphaned_payload_bytes: 0,
+			orphaned_payload_bytes_reclaimed: 0,
+			reachable_visited: 3,
+			reachable_complete: true,
+			reachable_resident_bytes: 0,
+			cursor_scoped: false,
+			nodes: vec![
+				snapshot_node(
+					root,
+					None,
+					0,
+					0,
+					1,
+					SemanticKind::RelationalTable,
+					ProviderKindId::new(1),
+					1,
+				),
+				snapshot_node(
+					fanout,
+					Some(root),
+					1,
+					0,
+					1,
+					SemanticKind::None,
+					ProviderKindId::NONE,
+					1,
+				),
+				snapshot_node(
+					leaf,
+					Some(fanout),
+					2,
+					0,
+					1,
+					SemanticKind::Token,
+					ProviderKindId::new(2),
+					0,
+				),
+			],
+		};
+		let raw = render_snapshot(
+			&snapshot,
+			identity(root),
+			"fixture.rs",
+			UastInspectorMode::Raw,
+			None,
+			stamp(root, StateId::ZERO, TopologyRev::ZERO),
+			&HashSet::new(),
+			false,
+			0,
+			(100, 24),
+			0,
+		);
+		let raw_text = String::from_utf8(raw.text).expect("UTF-8 raw inspector");
+		assert!(raw_text.contains("none · #"));
+		assert!(raw_text.contains("topology=fanout"));
+		assert!(!raw_text.contains("group"));
+
+		let semantic = render_snapshot(
+			&snapshot,
+			identity(root),
+			"fixture.rs",
+			UastInspectorMode::Semantic,
+			None,
+			stamp(root, StateId::ZERO, TopologyRev::ZERO),
+			&HashSet::new(),
+			false,
+			0,
+			(100, 24),
+			0,
+		);
+		assert!(
+			semantic.rows.iter().all(|row| row.node_id != fanout),
+			"semantic interpretation must project through the identity node"
+		);
+
+		let dot = render_dot(&snapshot, "fixture.rs", None);
+		assert!(dot.contains("none"));
+		assert!(!dot.contains("group"));
 	}
 
 	#[test]

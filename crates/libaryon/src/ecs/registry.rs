@@ -303,7 +303,7 @@ impl UastRegistry {
 			object_generation: PagedArray::new(cap, || AtomicU8::new(0)),
 			slot_published: PagedArray::new(cap, || AtomicBool::new(false)),
 			io_lifetime: PagedArray::new(cap, || AtomicU64::new(0)),
-			kinds: PagedArray::new(cap, || UnsafeCell::new(SemanticKind::Token)),
+			kinds: PagedArray::new(cap, || UnsafeCell::new(SemanticKind::None)),
 			provider_kinds: PagedArray::new(cap, || UnsafeCell::new(ProviderKindId::NONE)),
 			spans: PagedArray::new(cap, || UnsafeCell::new(None)),
 			metrics: PagedArray::new(cap, || UnsafeCell::new(SpanMetrics::default())),
@@ -793,18 +793,22 @@ impl UastRegistry {
 		std::mem::take(&mut *self.retired_forest_outbox.lock().unwrap())
 	}
 
-	/// Drop payload from one node in a retired forest, then retire its object
-	/// lifetime once all resolver leases are quiescent.
+	/// Make one node in a retired forest semantically and physically inert,
+	/// then retire its object lifetime once all resolver leases are quiescent.
 	///
 	/// Reclamation and physical splits are engine-thread serialized. Advancing
 	/// the generation while holding the residency write lock makes every late
 	/// whole/partial resolver publication fail before it can resurrect bytes.
-	pub(crate) fn reclaim_orphaned_payload(&self, node: NodeId) -> ReclaimedPayload {
+	pub(crate) fn reclaim_orphaned_node(&self, node: NodeId) -> ReclaimedPayload {
 		let _resident_write = self.resident_data_lock.write().unwrap();
 		let Some(idx) = self.checked_node_index(node) else {
 			return ReclaimedPayload::default();
 		};
 		let _ = self.bump_content_generation_index(idx, node);
+		unsafe {
+			*self.kinds[idx].get() = SemanticKind::None;
+			*self.provider_kinds[idx].get() = ProviderKindId::NONE;
+		}
 		let spanless = unsafe { (*self.spans[idx].get()).is_none() };
 		let full_len = unsafe {
 			(&mut *self.virtual_data[idx].get())
@@ -2256,7 +2260,7 @@ mod tests {
 	use super::{ReclaimFence, ReclaimedPayload, UastRegistry};
 	use crate::svp::pointer::SvpPointer;
 	use crate::uast::TreeEdges;
-	use crate::uast::kind::SemanticKind;
+	use crate::uast::kind::{ProviderKindId, SemanticKind};
 	use crate::uast::metrics::SpanMetrics;
 	use std::sync::Arc;
 	use std::sync::atomic::Ordering;
@@ -2437,6 +2441,17 @@ mod tests {
 	}
 
 	#[test]
+	fn untouched_slots_begin_at_the_semantic_and_provider_zero_state() {
+		let registry = UastRegistry::new(1);
+		assert!(!registry.slot_published[0].load(Ordering::Acquire));
+		assert_eq!(unsafe { *registry.kinds[0].get() }, SemanticKind::None);
+		assert_eq!(
+			unsafe { *registry.provider_kinds[0].get() },
+			ProviderKindId::NONE
+		);
+	}
+
+	#[test]
 	fn unused_exact_reservation_slots_return_without_consuming_a_lifetime() {
 		let registry = UastRegistry::new(2);
 		let mut reservation = registry.reserve_chunk(2).expect("two slots");
@@ -2488,10 +2503,20 @@ mod tests {
 		registry.record_high_priority_start(old);
 
 		registry.retire_orphaned_forest([old], 1, 0, ReclaimFence::NeverPublished);
-		registry.reclaim_orphaned_payload(old);
+		registry.reclaim_orphaned_node(old);
+		assert_eq!(
+			unsafe { *registry.kinds[old.index()].get() },
+			SemanticKind::None,
+			"bounded reclaim must remove the old semantic claim"
+		);
+		assert_eq!(
+			unsafe { *registry.provider_kinds[old.index()].get() },
+			ProviderKindId::NONE,
+			"bounded reclaim must remove the old provider identity"
+		);
 		let mut next = registry.reserve_chunk(1).expect("reclaimed slot");
 		let new = next.spawn_node(
-			SemanticKind::Group,
+			SemanticKind::RelationalTable,
 			None,
 			SpanMetrics {
 				byte_length: 42,
@@ -2501,6 +2526,11 @@ mod tests {
 		assert_eq!(new.index(), old.index());
 		assert_eq!(new.generation(), old.generation() + 1);
 		assert!(registry.content_generation(new) > old_content_generation);
+		assert_eq!(
+			unsafe { *registry.kinds[new.index()].get() },
+			SemanticKind::RelationalTable,
+			"publication must overwrite the inert semantic zero-state"
+		);
 		assert_eq!(
 			unsafe { *registry.provider_kinds[new.index()].get() },
 			crate::uast::kind::ProviderKindId::NONE
@@ -2542,7 +2572,7 @@ mod tests {
 			"an old max-generation completion must fail closed"
 		);
 		registry.retire_orphaned_forest([node], 1, 0, ReclaimFence::NeverPublished);
-		registry.reclaim_orphaned_payload(node);
+		registry.reclaim_orphaned_node(node);
 		assert_eq!(registry.stats().burned_slots, 1);
 		assert_eq!(registry.stats().reusable_slots, 0);
 		assert!(registry.reserve_chunk(1).is_none());
@@ -2699,14 +2729,14 @@ mod tests {
 		registry.retire_orphaned_forest([leaf], 1, 4, ReclaimFence::NeverPublished);
 
 		assert_eq!(
-			registry.reclaim_orphaned_payload(leaf),
+			registry.reclaim_orphaned_node(leaf),
 			ReclaimedPayload {
 				authoritative_bytes: 4,
 				hydrated_bytes: 0,
 			}
 		);
 		assert_eq!(
-			registry.reclaim_orphaned_payload(leaf),
+			registry.reclaim_orphaned_node(leaf),
 			ReclaimedPayload::default()
 		);
 		assert_eq!(registry.get_total_bytes(leaf), 0);
@@ -2748,7 +2778,7 @@ mod tests {
 		registry.retire_orphaned_forest([leaf], 1, 0, ReclaimFence::NeverPublished);
 
 		assert_eq!(
-			registry.reclaim_orphaned_payload(leaf),
+			registry.reclaim_orphaned_node(leaf),
 			ReclaimedPayload {
 				authoritative_bytes: 0,
 				hydrated_bytes: 4,
