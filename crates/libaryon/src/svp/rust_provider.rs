@@ -718,10 +718,14 @@ fn initialize_workspace(abs_file: AbsPathBuf) -> Option<InitializedWorkspace> {
 	};
 	let discover_sysroot = CargoConfig {
 		sysroot: Some(RustLibSource::Discover),
+		set_test: true,
 		..CargoConfig::default()
 	};
-	let workspace =
-		load_workspace(&discover_sysroot).or_else(|| load_workspace(&CargoConfig::default()))?;
+	let fallback = CargoConfig {
+		set_test: true,
+		..CargoConfig::default()
+	};
+	let workspace = load_workspace(&discover_sysroot).or_else(|| load_workspace(&fallback))?;
 
 	let mut vfs = Vfs::default();
 	let extra_env: FxHashMap<String, Option<String>> = FxHashMap::default();
@@ -1289,6 +1293,106 @@ mod tests {
 			targets[0]
 		);
 		assert_eq!(targets[0].focus_range, Some((7, 13)));
+
+		std::fs::remove_dir_all(directory).expect("remove fixture");
+	}
+
+	#[test]
+	fn workspace_analysis_includes_cfg_test_code() {
+		let directory = std::env::temp_dir().join(format!(
+			"baryon-test-aware-workspace-{}-{}",
+			std::process::id(),
+			std::thread::current().name().unwrap_or("test")
+		));
+		let source_dir = directory.join("src");
+		std::fs::create_dir_all(&source_dir).expect("create fixture");
+		std::fs::write(
+			directory.join("Cargo.toml"),
+			"[package]\nname = \"test_aware_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+		)
+		.expect("write manifest");
+		let source_path = source_dir.join("lib.rs");
+		let source = r#"pub fn production_target() -> u32 { 7 }
+
+#[cfg(test)]
+mod tests {
+	use super::production_target;
+
+	fn test_target() -> u32 { 9 }
+
+	#[test]
+	fn resolves_from_test_cfg() {
+		let _ = production_target();
+		let _ = test_target();
+		missing_in_test_cfg();
+	}
+}
+"#;
+		std::fs::write(&source_path, source).expect("write source");
+		let provider = RustProvider::new();
+		let path = source_path.to_str().expect("utf8 path");
+
+		let production_call = source.rfind("production_target").expect("production call");
+		let production_result = provider.goto_definition(
+			Arc::new(source.to_string()),
+			path,
+			DocByte::new(production_call as u64),
+		);
+		let DefinitionResult::Targets(production_targets) = production_result else {
+			panic!("expected production definition from cfg(test), got {production_result:?}");
+		};
+		let production_definition = source
+			.find("production_target")
+			.expect("production definition");
+		assert_eq!(
+			production_targets[0].focus_range,
+			Some((
+				production_definition as u64,
+				(production_definition + "production_target".len()) as u64,
+			))
+		);
+
+		let test_call = source.rfind("test_target").expect("test-local call");
+		let test_result = provider.goto_definition(
+			Arc::new(source.to_string()),
+			path,
+			DocByte::new(test_call as u64),
+		);
+		let DefinitionResult::Targets(test_targets) = test_result else {
+			panic!("expected test-local definition, got {test_result:?}");
+		};
+		let test_definition = source
+			.find("fn test_target")
+			.expect("test-local definition")
+			+ 3;
+		assert_eq!(
+			test_targets[0].focus_range,
+			Some((
+				test_definition as u64,
+				(test_definition + "test_target".len()) as u64,
+			))
+		);
+
+		let output = provider.semantic_reactor(Arc::new(source.to_string()), DocByte::ZERO, path);
+		assert!(
+			output.highlights.iter().any(|span| {
+				span.start == DocByte::new(test_call as u64)
+					&& span.end == DocByte::new((test_call + "test_target".len()) as u64)
+					&& span.category == TokenCategory::Function
+			}),
+			"test-local call was not semantically highlighted: {:?}",
+			output.highlights
+		);
+		let missing = source.find("missing_in_test_cfg").expect("missing call");
+		assert!(
+			output.diagnostics.iter().any(|diagnostic| {
+				diagnostic.start <= DocByte::new(missing as u64)
+					&& diagnostic.end
+						>= DocByte::new((missing + "missing_in_test_cfg".len()) as u64)
+			}),
+			"test-only unresolved call produced no diagnostic: {:?}",
+			output.diagnostics
+		);
 
 		std::fs::remove_dir_all(directory).expect("remove fixture");
 	}

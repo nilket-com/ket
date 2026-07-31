@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -45,6 +46,55 @@ pub struct SemanticResponse {
 enum ReactorRequest {
 	Analyze(SemanticRequest),
 	GotoDefinition(GotoDefinitionRequest),
+}
+
+/// Work waiting behind the reactor's single in-flight provider call.
+///
+/// Analysis is newest-only per buffer because every older response would be
+/// rejected by its request/state stamp after paying the provider cost.
+/// Navigation is newest-only globally because the session owns one pending
+/// navigation stamp. Replacing an analysis slot in place preserves FIFO
+/// fairness between distinct buffers.
+#[derive(Default)]
+struct PendingReactorWork {
+	analyses: VecDeque<SemanticRequest>,
+	navigation: Option<GotoDefinitionRequest>,
+}
+
+impl PendingReactorWork {
+	fn push(&mut self, work: ReactorRequest) {
+		match work {
+			ReactorRequest::Analyze(request) => {
+				if let Some(pending) = self
+					.analyses
+					.iter_mut()
+					.find(|pending| pending.buffer_id == request.buffer_id)
+				{
+					*pending = request;
+				} else {
+					self.analyses.push_back(request);
+				}
+			}
+			ReactorRequest::GotoDefinition(request) => {
+				// EditorSession owns one global pending-navigation stamp. Any older
+				// request is doomed at response time, regardless of its source view.
+				self.navigation = Some(request);
+			}
+		}
+	}
+
+	fn drain_ready(&mut self, rx: &mpsc::Receiver<ReactorRequest>) {
+		while let Ok(work) = rx.try_recv() {
+			self.push(work);
+		}
+	}
+
+	fn pop_next(&mut self) -> Option<ReactorRequest> {
+		self.navigation
+			.take()
+			.map(ReactorRequest::GotoDefinition)
+			.or_else(|| self.analyses.pop_front().map(ReactorRequest::Analyze))
+	}
 }
 
 pub struct SemanticReactor {
@@ -96,139 +146,158 @@ impl SemanticReactor {
 		tx_internal: InternalSender,
 		registry: Arc<LanguageRegistry>,
 	) {
+		let mut pending = PendingReactorWork::default();
 		while let Ok(work) = rx.recv() {
-			let request = match work {
-				ReactorRequest::Analyze(request) => request,
-				ReactorRequest::GotoDefinition(request) => {
-					let result = if request.content.len() as u64 >= MAX_SEMANTIC_BYTES {
-						crate::engine::language::DefinitionResult::Failed(
-							"Go to definition is unavailable for documents at or above 8 MiB"
-								.to_string(),
-						)
-					} else {
-						match String::from_utf8(request.content) {
-							Ok(source) => registry.get_provider(request.language_id).map_or(
-								crate::engine::language::DefinitionResult::Unsupported,
-								|provider| {
-									provider.goto_definition(
-										Arc::new(source),
-										&request.file_path,
-										request.stamp.cursor,
-									)
-								},
-							),
-							Err(_) => crate::engine::language::DefinitionResult::Failed(
-								"Go to definition requires valid UTF-8".to_string(),
-							),
-						}
-					};
-					let result = match result {
-						DefinitionResult::Targets(targets) => {
-							DefinitionResult::Targets(normalize_definition_targets(targets))
-						}
-						other => other,
-					};
-					let _ = tx_internal.send(InternalEvent::NavigationResolved(Box::new(
-						NavigationResolved {
-							stamp: request.stamp,
-							result,
-						},
-					)));
-					continue;
-				}
-			};
-			let provider = registry.get_provider(request.language_id);
-
-			let (highlights, diagnostics, inline_annotations, structural_topology) = match provider
-			{
-				Some(p) => {
-					let source_bytes = request.content;
-
-					// Structural topology is byte-oriented and must be parsed from the
-					// document's own bytes, so the graft payload is byte-identical to what
-					// the document already holds.
-					let topology = p
-						.parse_structural_topology(&source_bytes)
-						.map(|green| (green, source_bytes.clone()));
-
-					// Deep semantic analysis is string-oriented. A document that is not
-					// valid UTF-8 forgoes it rather than being rewritten to suit it; it
-					// still gets topology and lexical highlighting.
-					let (highlights, diagnostics, inline_annotations) = match request.depth {
-						AnalysisDepth::TopologyOnly => (Vec::new(), Vec::new(), Vec::new()),
-						AnalysisDepth::Full => match std::str::from_utf8(&source_bytes) {
-							Ok(text) => {
-								let mut output = p.semantic_reactor(
-									Arc::new(text.to_owned()),
-									request.global_offset,
-									&request.file_path,
-								);
-								// Only the parent describes injections. Calling this method on
-								// injected providers would turn a syntax highlighter into an
-								// unbounded recursive embedding system.
-								for injection in p.injections(text) {
-									let Some(fragment) = text.get(injection.range.clone()) else {
-										continue;
-									};
-									let Some(embedded) = registry
-										.resolve_supported_language_provider(
-											&injection.language_id,
+			pending.push(work);
+			loop {
+				// Re-drain after every completed provider call. A navigation request
+				// arriving during an analysis therefore runs before any second
+				// analysis. It may still wait behind the one call selected in the
+				// drain-to-dispatch race; the provider mutex makes that unavoidable
+				// without RA-level cancellation.
+				pending.drain_ready(&rx);
+				let Some(work) = pending.pop_next() else {
+					break;
+				};
+				let request = match work {
+					ReactorRequest::Analyze(request) => request,
+					ReactorRequest::GotoDefinition(request) => {
+						let result = if request.content.len() as u64 >= MAX_SEMANTIC_BYTES {
+							crate::engine::language::DefinitionResult::Failed(
+								"Go to definition is unavailable for documents at or above 8 MiB"
+									.to_string(),
+							)
+						} else {
+							match String::from_utf8(request.content) {
+								Ok(source) => registry.get_provider(request.language_id).map_or(
+									crate::engine::language::DefinitionResult::Unsupported,
+									|provider| {
+										provider.goto_definition(
+											Arc::new(source),
+											&request.file_path,
+											request.stamp.cursor,
 										)
-									else {
-										continue;
-									};
-									let embedded_offset = request.global_offset
-										+ ByteLen::new(injection.range.start as u64);
-									// A provider's semantic pass enriches its lexical baseline; it
-									// does not necessarily repeat keywords and punctuation. Run both
-									// here so a fenced block gets the same complete coloring as a
-									// top-level document.
-									output.highlights.extend(embedded.lexical_baseline(
-										fragment.as_bytes(),
-										&[(0, embedded_offset)],
-									));
-									let embedded_output = embedded.semantic_reactor(
-										Arc::new(fragment.to_owned()),
-										embedded_offset,
-										&format!(
-											"embedded.{}",
-											embedded.extensions().first().copied().unwrap_or("txt")
-										),
-									);
-									// Appending gives the embedded span precedence where a parent
-									// Markdown span overlaps it; the frontend already resolves
-									// overlapping categories from the end of this list.
-									output.highlights.extend(embedded_output.highlights);
-									output.diagnostics.extend(embedded_output.diagnostics);
-									output
-										.inline_annotations
-										.extend(embedded_output.inline_annotations);
-								}
-								(
-									output.highlights,
-									output.diagnostics,
-									output.inline_annotations,
-								)
+									},
+								),
+								Err(_) => crate::engine::language::DefinitionResult::Failed(
+									"Go to definition requires valid UTF-8".to_string(),
+								),
 							}
-							Err(_) => (Vec::new(), Vec::new(), Vec::new()),
-						},
+						};
+						let result = match result {
+							DefinitionResult::Targets(targets) => {
+								DefinitionResult::Targets(normalize_definition_targets(targets))
+							}
+							other => other,
+						};
+						let _ = tx_internal.send(InternalEvent::NavigationResolved(Box::new(
+							NavigationResolved {
+								stamp: request.stamp,
+								result,
+							},
+						)));
+						continue;
+					}
+				};
+				let provider = registry.get_provider(request.language_id);
+
+				let (highlights, diagnostics, inline_annotations, structural_topology) =
+					match provider {
+						Some(p) => {
+							let source_bytes = request.content;
+
+							// Structural topology is byte-oriented and must be parsed from the
+							// document's own bytes, so the graft payload is byte-identical to what
+							// the document already holds.
+							let topology = p
+								.parse_structural_topology(&source_bytes)
+								.map(|green| (green, source_bytes.clone()));
+
+							// Deep semantic analysis is string-oriented. A document that is not
+							// valid UTF-8 forgoes it rather than being rewritten to suit it; it
+							// still gets topology and lexical highlighting.
+							let (highlights, diagnostics, inline_annotations) = match request.depth
+							{
+								AnalysisDepth::TopologyOnly => (Vec::new(), Vec::new(), Vec::new()),
+								AnalysisDepth::Full => match std::str::from_utf8(&source_bytes) {
+									Ok(text) => {
+										let mut output = p.semantic_reactor(
+											Arc::new(text.to_owned()),
+											request.global_offset,
+											&request.file_path,
+										);
+										// Only the parent describes injections. Calling this method on
+										// injected providers would turn a syntax highlighter into an
+										// unbounded recursive embedding system.
+										for injection in p.injections(text) {
+											let Some(fragment) = text.get(injection.range.clone())
+											else {
+												continue;
+											};
+											let Some(embedded) = registry
+												.resolve_supported_language_provider(
+													&injection.language_id,
+												)
+											else {
+												continue;
+											};
+											let embedded_offset = request.global_offset
+												+ ByteLen::new(injection.range.start as u64);
+											// A provider's semantic pass enriches its lexical baseline; it
+											// does not necessarily repeat keywords and punctuation. Run both
+											// here so a fenced block gets the same complete coloring as a
+											// top-level document.
+											output.highlights.extend(embedded.lexical_baseline(
+												fragment.as_bytes(),
+												&[(0, embedded_offset)],
+											));
+											let embedded_output = embedded.semantic_reactor(
+												Arc::new(fragment.to_owned()),
+												embedded_offset,
+												&format!(
+													"embedded.{}",
+													embedded
+														.extensions()
+														.first()
+														.copied()
+														.unwrap_or("txt")
+												),
+											);
+											// Appending gives the embedded span precedence where a parent
+											// Markdown span overlaps it; the frontend already resolves
+											// overlapping categories from the end of this list.
+											output.highlights.extend(embedded_output.highlights);
+											output.diagnostics.extend(embedded_output.diagnostics);
+											output
+												.inline_annotations
+												.extend(embedded_output.inline_annotations);
+										}
+										(
+											output.highlights,
+											output.diagnostics,
+											output.inline_annotations,
+										)
+									}
+									Err(_) => (Vec::new(), Vec::new(), Vec::new()),
+								},
+							};
+
+							(highlights, diagnostics, inline_annotations, topology)
+						}
+						None => (Vec::new(), Vec::new(), Vec::new(), None),
 					};
 
-					(highlights, diagnostics, inline_annotations, topology)
-				}
-				None => (Vec::new(), Vec::new(), Vec::new(), None),
-			};
-
-			let _ = tx.send(SemanticResponse {
-				buffer_id: request.buffer_id,
-				state_id: request.state_id,
-				request_id: request.request_id,
-				highlights,
-				diagnostics,
-				inline_annotations,
-				structural_topology,
-			});
-			let _ = tx_internal.send(InternalEvent::Refresh);
+				let _ = tx.send(SemanticResponse {
+					buffer_id: request.buffer_id,
+					state_id: request.state_id,
+					request_id: request.request_id,
+					highlights,
+					diagnostics,
+					inline_annotations,
+					structural_topology,
+				});
+				let _ = tx_internal.send(InternalEvent::Refresh);
+			}
 		}
 	}
 }
@@ -251,6 +320,7 @@ mod tests {
 	use crate::engine::request::{EngineRequest, InternalEvent};
 	use crate::uast::{ProviderKindId, SemanticKind};
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{Condvar, Mutex};
 	use std::time::{Duration, Instant};
 
 	struct SlowTestProvider;
@@ -284,6 +354,107 @@ mod tests {
 		) -> SemanticOutput {
 			std::thread::sleep(Duration::from_millis(40));
 			SemanticOutput::default()
+		}
+	}
+
+	#[derive(Default)]
+	struct WorkGate {
+		entered: (Mutex<bool>, Condvar),
+		released: (Mutex<bool>, Condvar),
+	}
+
+	impl WorkGate {
+		fn enter_and_wait(&self) {
+			let (entered, entered_cv) = &self.entered;
+			*entered.lock().expect("entered gate") = true;
+			entered_cv.notify_all();
+
+			let (released, released_cv) = &self.released;
+			let mut released = released.lock().expect("release gate");
+			while !*released {
+				released = released_cv.wait(released).expect("release wait");
+			}
+		}
+
+		fn wait_until_entered(&self) {
+			let deadline = Instant::now() + Duration::from_secs(2);
+			let (entered, entered_cv) = &self.entered;
+			let mut entered = entered.lock().expect("entered gate");
+			while !*entered {
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				assert!(!remaining.is_zero(), "provider did not enter gated work");
+				let (next, timeout) = entered_cv
+					.wait_timeout(entered, remaining)
+					.expect("entered wait");
+				entered = next;
+				assert!(
+					!timeout.timed_out() || *entered,
+					"provider did not enter gated work"
+				);
+			}
+		}
+
+		fn release(&self) {
+			let (released, released_cv) = &self.released;
+			*released.lock().expect("release gate") = true;
+			released_cv.notify_all();
+		}
+	}
+
+	struct ControlledTestProvider {
+		block_source: &'static str,
+		gate: Arc<WorkGate>,
+		work_log: Arc<Mutex<Vec<String>>>,
+	}
+
+	impl LanguageProvider for ControlledTestProvider {
+		fn language_id(&self) -> &'static str {
+			"controlled"
+		}
+
+		fn label(&self) -> &'static str {
+			"Controlled"
+		}
+
+		fn extensions(&self) -> &'static [&'static str] {
+			&["controlled"]
+		}
+
+		fn lexical_baseline(
+			&self,
+			_viewport_bytes: &[u8],
+			_offset_map: &[(usize, DocByte)],
+		) -> Vec<HighlightSpan> {
+			Vec::new()
+		}
+
+		fn semantic_reactor(
+			&self,
+			full_source: Arc<String>,
+			_global_offset: DocByte,
+			_file_path: &str,
+		) -> SemanticOutput {
+			self.work_log
+				.lock()
+				.expect("work log")
+				.push(format!("analyze:{full_source}"));
+			if full_source.as_str() == self.block_source {
+				self.gate.enter_and_wait();
+			}
+			SemanticOutput::default()
+		}
+
+		fn goto_definition(
+			&self,
+			_source: Arc<String>,
+			_file_path: &str,
+			cursor: DocByte,
+		) -> DefinitionResult {
+			self.work_log
+				.lock()
+				.expect("work log")
+				.push(format!("navigate:{}", cursor.get()));
+			DefinitionResult::Unsupported
 		}
 	}
 
@@ -346,6 +517,35 @@ mod tests {
 			}
 			assert!(Instant::now() < deadline, "semantic response timed out");
 			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	fn semantic_request(buffer: u64, request: u64, content: impl Into<Vec<u8>>) -> SemanticRequest {
+		SemanticRequest {
+			buffer_id: BufferId::new(buffer),
+			content: content.into(),
+			global_offset: DocByte::ZERO,
+			file_path: format!("buffer-{buffer}.controlled"),
+			language_id: LanguageId::from_registered("controlled"),
+			state_id: StateId::new(request),
+			request_id: RequestId::new(request),
+			depth: AnalysisDepth::Full,
+		}
+	}
+
+	fn navigation_request(view: u64, request: u64, cursor: u64) -> GotoDefinitionRequest {
+		GotoDefinitionRequest {
+			stamp: NavigationStamp {
+				request_id: RequestId::new(request),
+				buffer_id: BufferId::new(1),
+				root: NodeId::from_index(0),
+				state_id: StateId::new(request),
+				view_id: crate::core::ViewId::new(view),
+				cursor: DocByte::new(cursor),
+			},
+			content: b"navigation".to_vec(),
+			file_path: "buffer-1.controlled".to_string(),
+			language_id: LanguageId::from_registered("controlled"),
 		}
 	}
 
@@ -430,6 +630,108 @@ mod tests {
 				(BufferId::new(1), RequestId::new(1)),
 				(BufferId::new(2), RequestId::new(2)),
 			]
+		);
+	}
+
+	#[test]
+	fn reactor_coalesces_bursts_per_owner_and_prioritizes_navigation() {
+		let gate = Arc::new(WorkGate::default());
+		let work_log = Arc::new(Mutex::new(Vec::new()));
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(ControlledTestProvider {
+			block_source: "blocker",
+			gate: gate.clone(),
+			work_log: work_log.clone(),
+		});
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+
+		reactor.send(semantic_request(90, 90, b"blocker".to_vec()));
+		gate.wait_until_entered();
+		for request in 1..=5 {
+			reactor.send(semantic_request(
+				1,
+				request,
+				format!("burst-{request}").into_bytes(),
+			));
+		}
+		reactor.send(semantic_request(2, 20, b"other-buffer".to_vec()));
+		reactor.send_goto_definition(navigation_request(6, 30, 3));
+		reactor.send_goto_definition(navigation_request(7, 31, 9));
+		gate.release();
+
+		let responses = (0..3)
+			.map(|_| {
+				let response = recv_semantic_response(&reactor);
+				(response.buffer_id, response.request_id)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			responses,
+			vec![
+				(BufferId::new(90), RequestId::new(90)),
+				(BufferId::new(1), RequestId::new(5)),
+				(BufferId::new(2), RequestId::new(20)),
+			]
+		);
+
+		let navigation = loop {
+			let event = requests
+				.recv_timeout(Duration::from_secs(2))
+				.expect("navigation event");
+			if let EngineRequest::Internal(InternalEvent::NavigationResolved(resolved)) = event {
+				break resolved;
+			}
+		};
+		assert_eq!(navigation.stamp.request_id, RequestId::new(31));
+		assert_eq!(
+			*work_log.lock().expect("work log"),
+			vec![
+				"analyze:blocker",
+				"navigate:9",
+				"analyze:burst-5",
+				"analyze:other-buffer",
+			]
+		);
+	}
+
+	#[test]
+	fn navigation_arriving_during_analysis_runs_before_a_second_analysis() {
+		let gate = Arc::new(WorkGate::default());
+		let work_log = Arc::new(Mutex::new(Vec::new()));
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(ControlledTestProvider {
+			block_source: "analysis-a",
+			gate: gate.clone(),
+			work_log: work_log.clone(),
+		});
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+
+		reactor.send(semantic_request(1, 1, b"analysis-a".to_vec()));
+		gate.wait_until_entered();
+		reactor.send(semantic_request(2, 2, b"analysis-b".to_vec()));
+		reactor.send_goto_definition(navigation_request(3, 3, 4));
+		gate.release();
+
+		for _ in 0..2 {
+			recv_semantic_response(&reactor);
+		}
+		loop {
+			let event = requests
+				.recv_timeout(Duration::from_secs(2))
+				.expect("navigation event");
+			if matches!(
+				event,
+				EngineRequest::Internal(InternalEvent::NavigationResolved(_))
+			) {
+				break;
+			}
+		}
+
+		assert_eq!(
+			*work_log.lock().expect("work log"),
+			vec!["analyze:analysis-a", "navigate:4", "analyze:analysis-b"]
 		);
 	}
 
