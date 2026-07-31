@@ -1,0 +1,22 @@
+name: Simulator Nightly
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Simulator nightly ladder
+        run: bash ci/check_simulator_ladder.sh 1000000
+      - name: Chaos smoke nightly
+        run: bash ci/check_chaos_harness.sh

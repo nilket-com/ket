@@ -30,18 +30,25 @@ gates and connectors demote to optional features. What is decided today:
 | layer | owns |
 |---|---|
 | `libaryon` | documents, commands, panes, UAST — the headless editor engine, unchanged |
-| **shared analytics crate** (working name open; `boson` suggested — the exchange particle, for an interchange boundary) | data sources, Arrow record-batch streams, result products, `PlotSpec`/`PlotThemeSpec`/`PlotExecutionPolicy` |
+| **shared interchange/plot-contract crate** (working name open; `boson` suggested — the exchange particle, for an interchange boundary) | data-source contracts, Arrow record-batch streams, result products, `PlotSpec`/`PlotThemeSpec`/`PlotExecutionPolicy` — not analytical execution |
 | `baryon` | terminal head; *optional* plot-raster consumer |
 | `polariton` | graphical workbench head |
 | Toron / Polars | optional execution engines behind the seam |
 | connectors | optional data sources behind the seam |
 
-Dependency direction: heads depend on `libaryon` and the analytics crate;
-the analytics crate depends on **neither** editor crate. Analytics never
-enters `libaryon`; editor semantics never enter the analytics crate.
+Dependency direction: heads depend on `libaryon` and the interchange crate;
+the interchange crate depends on **neither** editor crate. Analytics never
+enters `libaryon`; editor semantics never enter the interchange crate.
 Heads compose the two (e.g., bridging `UiPalette` chrome roles with
 `PlotThemeSpec` happens head-side or in a thin bridge, never by merging
 the palettes).
+
+**PRODUCT-0001 ownership clarification:** almost all analytical execution —
+query planning, joins, aggregation, and transforms — belongs in Toron. The
+shared crate is a thin contract/adapter boundary, not a second analytics
+engine. Libaryon's text indexes are document infrastructure, not precedent for
+ad hoc data analytics. A future workbench library may own composition,
+interaction, and presentation without acquiring Toron's execution role.
 
 ### 2. The interchange seam
 

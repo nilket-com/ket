@@ -1,0 +1,63 @@
+[package]
+name = "toron"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+telemetry = ["observability/telemetry"]
+otlp-http = ["telemetry", "observability/otlp-http"]
+otlp-grpc = ["telemetry", "observability/otlp-grpc"]
+
+[dependencies]
+arrow.workspace = true
+arrow-cast = { version = "58.3.0", features = ["prettyprint"] }
+arrow-schema.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+chrono = "0.4"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+postcard.workspace = true
+toml = "0.8"
+bytemuck = { version = "1.16", features = ["derive"] }
+futures = "0.3"
+observability = { path = "../observability", default-features = false, features = ["http", "audit"] }
+blake3 = "1.5"
+rune = "0.14"
+sqlparser = "0.62"
+rand = "0.10"
+ahash = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
+aws-lc-rs = { version = "1.14", default-features = false }
+quinn = "0.11"
+rcgen = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.10"
+tokio-rustls = "0.26"
+tls-pki = { path = "../tls-pki" }
+wendelon = { path = "../wendelon" }
+wendelon-client = { path = "../wendelon/crates/wendelon-client" }
+
+[lints.clippy]
+manual_div_ceil = "allow"
+
+[[bench]]
+name = "storage_execution"
+harness = false
+
+[[bench]]
+name = "distributed_runtime"
+harness = false
+
+[[bench]]
+name = "distributed_inner_equi_join"
+harness = false

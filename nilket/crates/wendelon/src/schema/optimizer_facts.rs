@@ -1,0 +1,827 @@
+use crate::schema::{PhysicalDescriptorFingerprint, TableObjectId};
+use serde::{Deserialize, Serialize};
+use std::io::{Error, ErrorKind};
+
+pub const ARROW_STATS_TAG_INT8: u8 = 0x01;
+pub const ARROW_STATS_TAG_INT16: u8 = 0x02;
+pub const ARROW_STATS_TAG_INT32: u8 = 0x03;
+pub const ARROW_STATS_TAG_INT64: u8 = 0x04;
+pub const ARROW_STATS_TAG_UINT8: u8 = 0x05;
+pub const ARROW_STATS_TAG_UINT16: u8 = 0x06;
+pub const ARROW_STATS_TAG_UINT32: u8 = 0x07;
+pub const ARROW_STATS_TAG_UINT64: u8 = 0x08;
+pub const ARROW_STATS_TAG_FLOAT32: u8 = 0x09;
+pub const ARROW_STATS_TAG_FLOAT64: u8 = 0x0A;
+pub const ARROW_STATS_TAG_OPAQUE_UNSUPPORTED: u8 = 0x0E;
+pub const ARROW_STATS_TAG_UTF8: u8 = 0x10;
+pub const ARROW_STATS_TAG_LARGE_UTF8: u8 = 0x11;
+pub const ARROW_STATS_TAG_BINARY: u8 = 0x12;
+pub const ARROW_STATS_TAG_LARGE_BINARY: u8 = 0x13;
+pub const ARROW_STATS_TAG_TIMESTAMP_MILLISECOND: u8 = 0x20;
+pub const ARROW_STATS_TAG_TIMESTAMP_MICROSECOND: u8 = 0x21;
+pub const ARROW_STATS_TAG_TIMESTAMP_NANOSECOND: u8 = 0x22;
+pub const ARROW_STATS_TAG_DATE32: u8 = 0x30;
+pub const ARROW_STATS_TAG_DATE64: u8 = 0x31;
+pub const ARROW_STATS_TAG_BOOLEAN: u8 = 0x40;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableOptimizerFacts {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_range_distributions: Vec<ColumnRangeDistributionFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+	#[serde(default)]
+	pub column_group_top_k: Vec<ColumnGroupTopKFact>,
+	#[serde(default)]
+	pub column_group_ndv: Vec<ColumnGroupNdvFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnNdvFact {
+	pub column_ordinal: u16,
+	pub distinct: NdvFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnRangeFact {
+	pub column_ordinal: u16,
+	pub arrow_type_tag: u8,
+	pub null_count: u64,
+	pub non_null_count: u64,
+	pub min: Option<Vec<u8>>,
+	pub max: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeDistributionBucket {
+	pub lower: Vec<u8>,
+	pub upper: Vec<u8>,
+	pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnRangeDistributionFact {
+	pub column_ordinal: u16,
+	pub arrow_type_tag: u8,
+	pub non_null_count: u64,
+	pub rank_error_ppm: u32,
+	pub buckets: Vec<RangeDistributionBucket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterFact {
+	pub column_ordinal: u16,
+	pub arrow_type_tag: u8,
+	pub entries: Vec<ColumnHeavyHitterEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterEntry {
+	pub value_key: Vec<u8>,
+	pub frequency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnGroupTopKFact {
+	pub column_ordinals: Vec<u16>,
+	pub arrow_type_tags: Vec<u8>,
+	pub entries: Vec<ColumnGroupTopKEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnGroupNdvFact {
+	pub column_ordinals: Vec<u16>,
+	pub distinct: NdvFact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColumnGroupTopKEntry {
+	pub value_keys: Vec<Vec<u8>>,
+	pub frequency: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NdvFact {
+	Exact { count: u64 },
+	Approx { estimate: u64, rel_err_ppm: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyTableOptimizerFacts {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutRowBound {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutHeavyHitters {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutRangeDistributions {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutColumnGroupNdv {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_range_distributions: Vec<ColumnRangeDistributionFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+	#[serde(default)]
+	pub column_group_top_k: Vec<ColumnGroupTopKFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutColumnGroupTopK {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_range_distributions: Vec<ColumnRangeDistributionFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+}
+
+impl From<TableOptimizerFactsWithoutColumnGroupNdv> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutColumnGroupNdv) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: facts.column_range_distributions,
+			column_heavy_hitters: facts.column_heavy_hitters,
+			column_group_top_k: facts.column_group_top_k,
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+impl From<TableOptimizerFactsWithoutColumnGroupTopK> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutColumnGroupTopK) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: facts.column_range_distributions,
+			column_heavy_hitters: facts.column_heavy_hitters,
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+impl From<TableOptimizerFactsWithoutRangeDistributions> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutRangeDistributions) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: facts.column_heavy_hitters,
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+impl From<TableOptimizerFactsWithoutHeavyHitters> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutHeavyHitters) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+impl From<TableOptimizerFactsWithoutRowBound> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutRowBound) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: None,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts {
+	fn from(facts: LegacyTableOptimizerFacts) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: None,
+			column_ndv: facts.column_ndv,
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		}
+	}
+}
+
+pub fn range_fact_tag_supported(tag: u8) -> bool {
+	matches!(
+		tag,
+		ARROW_STATS_TAG_INT8
+			| ARROW_STATS_TAG_INT16
+			| ARROW_STATS_TAG_INT32
+			| ARROW_STATS_TAG_INT64
+			| ARROW_STATS_TAG_UINT8
+			| ARROW_STATS_TAG_UINT16
+			| ARROW_STATS_TAG_UINT32
+			| ARROW_STATS_TAG_UINT64
+			| ARROW_STATS_TAG_FLOAT32
+			| ARROW_STATS_TAG_FLOAT64
+			| ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+			| ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+			| ARROW_STATS_TAG_TIMESTAMP_NANOSECOND
+			| ARROW_STATS_TAG_DATE32
+			| ARROW_STATS_TAG_DATE64
+	)
+}
+
+pub fn encode_signed_optimizer_fact_scalar(
+	value: i64,
+	byte_width: usize,
+) -> std::io::Result<Vec<u8>> {
+	if !matches!(byte_width, 1 | 2 | 4 | 8) {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"signed optimizer fact scalar byte width must be one of 1, 2, 4, 8",
+		));
+	}
+	let bits = byte_width * 8;
+	let min = -(1_i128 << (bits - 1));
+	let max = (1_i128 << (bits - 1)) - 1;
+	let value_i128 = i128::from(value);
+	if value_i128 < min || value_i128 > max {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"signed optimizer fact scalar exceeds requested byte width",
+		));
+	}
+	let sign_bit = 1_u64 << (bits - 1);
+	let mask = if bits == 64 {
+		u64::MAX
+	} else {
+		(1_u64 << bits) - 1
+	};
+	let biased = ((value as u64) & mask) ^ sign_bit;
+	Ok(biased.to_be_bytes()[8 - byte_width..].to_vec())
+}
+
+pub fn decode_signed_optimizer_fact_scalar(bytes: &[u8]) -> Option<i64> {
+	let byte_width = bytes.len();
+	if !matches!(byte_width, 1 | 2 | 4 | 8) {
+		return None;
+	}
+	let bits = byte_width * 8;
+	let mut raw_bytes = [0_u8; 8];
+	raw_bytes[8 - byte_width..].copy_from_slice(bytes);
+	let biased = u64::from_be_bytes(raw_bytes);
+	let sign_bit = 1_u64 << (bits - 1);
+	let raw = biased ^ sign_bit;
+	let sign_extended = if bits == 64 {
+		raw
+	} else if raw & sign_bit != 0 {
+		raw | (!0_u64 << bits)
+	} else {
+		raw
+	};
+	Some(sign_extended as i64)
+}
+
+pub fn encode_float32_optimizer_fact_scalar(value: f32) -> std::io::Result<Vec<u8>> {
+	if !value.is_finite() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"float32 optimizer fact scalar must be finite",
+		));
+	}
+	let value = if value == 0.0 { 0.0 } else { value };
+	let raw = value.to_bits();
+	let sign_bit = 1_u32 << 31;
+	let ordered = if raw & sign_bit == 0 {
+		raw ^ sign_bit
+	} else {
+		!raw
+	};
+	Ok(ordered.to_be_bytes().to_vec())
+}
+
+pub fn decode_float32_optimizer_fact_scalar(bytes: &[u8]) -> Option<f32> {
+	let raw_ordered = u32::from_be_bytes(bytes.try_into().ok()?);
+	let sign_bit = 1_u32 << 31;
+	let raw = if raw_ordered & sign_bit != 0 {
+		raw_ordered ^ sign_bit
+	} else {
+		!raw_ordered
+	};
+	let value = f32::from_bits(raw);
+	if !value.is_finite() {
+		return None;
+	}
+	Some(if value == 0.0 { 0.0 } else { value })
+}
+
+pub fn encode_float64_optimizer_fact_scalar(value: f64) -> std::io::Result<Vec<u8>> {
+	if !value.is_finite() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"float64 optimizer fact scalar must be finite",
+		));
+	}
+	let value = if value == 0.0 { 0.0 } else { value };
+	let raw = value.to_bits();
+	let sign_bit = 1_u64 << 63;
+	let ordered = if raw & sign_bit == 0 {
+		raw ^ sign_bit
+	} else {
+		!raw
+	};
+	Ok(ordered.to_be_bytes().to_vec())
+}
+
+pub fn decode_float64_optimizer_fact_scalar(bytes: &[u8]) -> Option<f64> {
+	let raw_ordered = u64::from_be_bytes(bytes.try_into().ok()?);
+	let sign_bit = 1_u64 << 63;
+	let raw = if raw_ordered & sign_bit != 0 {
+		raw_ordered ^ sign_bit
+	} else {
+		!raw_ordered
+	};
+	let value = f64::from_bits(raw);
+	if !value.is_finite() {
+		return None;
+	}
+	Some(if value == 0.0 { 0.0 } else { value })
+}
+
+pub fn encode_unsigned_optimizer_fact_scalar(
+	value: u64,
+	byte_width: usize,
+) -> std::io::Result<Vec<u8>> {
+	if !matches!(byte_width, 1 | 2 | 4 | 8) {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"unsigned optimizer fact scalar byte width must be one of 1, 2, 4, 8",
+		));
+	}
+	let max = if byte_width == 8 {
+		u64::MAX
+	} else {
+		(1_u64 << (byte_width * 8)) - 1
+	};
+	if value > max {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"unsigned optimizer fact scalar exceeds requested byte width",
+		));
+	}
+	Ok(value.to_be_bytes()[8 - byte_width..].to_vec())
+}
+
+pub fn encode_table_optimizer_facts(facts: &TableOptimizerFacts) -> std::io::Result<Vec<u8>> {
+	postcard::to_allocvec(facts).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to encode table optimizer facts: {err}"),
+		)
+	})
+}
+
+pub fn decode_table_optimizer_facts(bytes: &[u8]) -> std::io::Result<TableOptimizerFacts> {
+	match postcard::from_bytes(bytes) {
+		Ok(facts) => Ok(facts),
+		Err(new_err) => {
+			match postcard::from_bytes::<TableOptimizerFactsWithoutColumnGroupNdv>(bytes) {
+				Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+				Err(without_group_ndv_err) => {
+					match postcard::from_bytes::<TableOptimizerFactsWithoutColumnGroupTopK>(bytes) {
+						Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+						Err(without_group_top_k_err) => {
+							match postcard::from_bytes::<TableOptimizerFactsWithoutRangeDistributions>(
+								bytes,
+							) {
+								Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+								Err(without_range_distribution_err) => {
+									match postcard::from_bytes::<
+										TableOptimizerFactsWithoutHeavyHitters,
+									>(bytes)
+									{
+										Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+										Err(without_heavy_err) => {
+											match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
+												Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+												Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
+													.map(TableOptimizerFacts::from)
+													.map_err(|legacy_err| {
+														Error::new(
+															ErrorKind::InvalidData,
+															format!(
+																"failed to decode table optimizer facts: {new_err}; without-column-group-ndv decode also failed: {without_group_ndv_err}; without-column-group-top-k decode also failed: {without_group_top_k_err}; without-range-distributions decode also failed: {without_range_distribution_err}; without-heavy-hitters decode also failed: {without_heavy_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
+															),
+														)
+													}),
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn table_id() -> TableObjectId {
+		TableObjectId::new([0x42; 16])
+	}
+
+	fn fingerprint() -> PhysicalDescriptorFingerprint {
+		PhysicalDescriptorFingerprint::from_bytes([0x51; 32])
+	}
+
+	#[test]
+	fn signed_optimizer_fact_scalar_round_trips_supported_widths() {
+		for (value, width) in [
+			(i8::MIN as i64, 1),
+			(-1, 1),
+			(0, 1),
+			(i8::MAX as i64, 1),
+			(i32::MIN as i64, 4),
+			(42, 4),
+			(i32::MAX as i64, 4),
+			(i64::MIN, 8),
+			(i64::MAX, 8),
+		] {
+			let encoded = encode_signed_optimizer_fact_scalar(value, width).unwrap();
+			assert_eq!(decode_signed_optimizer_fact_scalar(&encoded), Some(value));
+		}
+	}
+
+	#[test]
+	fn float_canonical_encode_round_trips_and_orders() {
+		let values = [-10.5_f64, -1.0, -0.0, 0.0, 0.25, 7.5];
+		let encoded = values
+			.into_iter()
+			.map(|value| encode_float64_optimizer_fact_scalar(value).unwrap())
+			.collect::<Vec<_>>();
+		assert!(encoded.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert_eq!(encoded[2], encoded[3]);
+		assert_eq!(decode_float64_optimizer_fact_scalar(&encoded[2]), Some(0.0));
+		assert_eq!(
+			decode_float64_optimizer_fact_scalar(
+				&encode_float64_optimizer_fact_scalar(-10.5).unwrap()
+			),
+			Some(-10.5)
+		);
+
+		let values = [-3.25_f32, -0.0, 0.0, 4.5];
+		let encoded = values
+			.into_iter()
+			.map(|value| encode_float32_optimizer_fact_scalar(value).unwrap())
+			.collect::<Vec<_>>();
+		assert!(encoded.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert_eq!(encoded[1], encoded[2]);
+		assert_eq!(decode_float32_optimizer_fact_scalar(&encoded[3]), Some(4.5));
+
+		assert!(encode_float64_optimizer_fact_scalar(f64::NAN).is_err());
+		assert!(encode_float64_optimizer_fact_scalar(f64::INFINITY).is_err());
+		assert_eq!(decode_float64_optimizer_fact_scalar(&[0_u8; 7]), None);
+		let ordered_nan = (f64::NAN.to_bits() ^ (1_u64 << 63)).to_be_bytes();
+		assert_eq!(decode_float64_optimizer_fact_scalar(&ordered_nan), None);
+	}
+
+	#[test]
+	fn table_optimizer_facts_legacy_payload_decodes_empty_range() {
+		let legacy = LegacyTableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			column_ndv: vec![ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: NdvFact::Exact { count: 3 },
+			}],
+		};
+		let bytes = postcard::to_allocvec(&legacy).expect("encode legacy facts");
+
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode legacy facts");
+		assert_eq!(decoded.table_object_id, legacy.table_object_id);
+		assert_eq!(decoded.schema_generation, legacy.schema_generation);
+		assert_eq!(decoded.row_upper_bound, None);
+		assert_eq!(decoded.column_ndv, legacy.column_ndv);
+		assert!(decoded.column_range.is_empty());
+		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_heavy_hitters.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
+		assert!(decoded.column_group_ndv.is_empty());
+	}
+
+	#[test]
+	fn table_optimizer_facts_round_trips_range_facts() {
+		let facts = TableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: vec![ColumnRangeFact {
+				column_ordinal: 0,
+				arrow_type_tag: ARROW_STATS_TAG_INT64,
+				null_count: 1,
+				non_null_count: 2,
+				min: Some(encode_signed_optimizer_fact_scalar(-5, 8).unwrap()),
+				max: Some(encode_signed_optimizer_fact_scalar(7, 8).unwrap()),
+			}],
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		};
+
+		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+	}
+
+	#[test]
+	fn table_optimizer_facts_round_trips_range_distributions() {
+		let facts = TableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: vec![ColumnRangeDistributionFact {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_INT64,
+				non_null_count: 12,
+				rank_error_ppm: 5_000,
+				buckets: vec![RangeDistributionBucket {
+					lower: encode_signed_optimizer_fact_scalar(0, 8).unwrap(),
+					upper: encode_signed_optimizer_fact_scalar(9, 8).unwrap(),
+					count: 12,
+				}],
+			}],
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
+		};
+
+		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+	}
+
+	#[test]
+	fn table_optimizer_facts_round_trips_heavy_hitters_and_legacy_decodes_empty() {
+		let facts = TableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: vec![ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_UTF8,
+				entries: vec![ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 5,
+				}],
+			}],
+			column_group_top_k: vec![ColumnGroupTopKFact {
+				column_ordinals: vec![0, 1],
+				arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_UTF8],
+				entries: vec![ColumnGroupTopKEntry {
+					value_keys: vec![
+						encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+						b"hot".to_vec(),
+					],
+					frequency: 3,
+				}],
+			}],
+			column_group_ndv: vec![ColumnGroupNdvFact {
+				column_ordinals: vec![0, 1],
+				distinct: NdvFact::Exact { count: 2 },
+			}],
+		};
+		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+
+		let without_heavy = TableOptimizerFactsWithoutHeavyHitters {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+		};
+		let bytes = postcard::to_allocvec(&without_heavy).expect("encode without-heavy facts");
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode without-heavy facts");
+		assert_eq!(decoded.row_upper_bound, Some(12));
+		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_heavy_hitters.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
+		assert!(decoded.column_group_ndv.is_empty());
+
+		let without_range_distribution = TableOptimizerFactsWithoutRangeDistributions {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_heavy_hitters: vec![ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_UTF8,
+				entries: vec![ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 5,
+				}],
+			}],
+		};
+		let bytes =
+			postcard::to_allocvec(&without_range_distribution).expect("encode without-range facts");
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode without-range facts");
+		assert_eq!(decoded.row_upper_bound, Some(12));
+		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
+		assert!(decoded.column_group_ndv.is_empty());
+		assert_eq!(
+			decoded.column_heavy_hitters,
+			without_range_distribution.column_heavy_hitters
+		);
+
+		let without_group_ndv = TableOptimizerFactsWithoutColumnGroupNdv {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: vec![ColumnGroupTopKFact {
+				column_ordinals: vec![0, 1],
+				arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_UTF8],
+				entries: vec![ColumnGroupTopKEntry {
+					value_keys: vec![
+						encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+						b"hot".to_vec(),
+					],
+					frequency: 3,
+				}],
+			}],
+		};
+		let bytes = postcard::to_allocvec(&without_group_ndv)
+			.expect("encode without-column-group-ndv facts");
+		let decoded =
+			decode_table_optimizer_facts(&bytes).expect("decode without-column-group-ndv facts");
+		assert_eq!(
+			decoded.column_group_top_k,
+			without_group_ndv.column_group_top_k
+		);
+		assert!(decoded.column_group_ndv.is_empty());
+	}
+
+	#[test]
+	fn table_optimizer_facts_current_payload_decodes_row_bound_absent() {
+		let without_row_bound = TableOptimizerFactsWithoutRowBound {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			column_ndv: Vec::new(),
+			column_range: vec![ColumnRangeFact {
+				column_ordinal: 0,
+				arrow_type_tag: ARROW_STATS_TAG_INT64,
+				null_count: 1,
+				non_null_count: 2,
+				min: Some(encode_signed_optimizer_fact_scalar(-5, 8).unwrap()),
+				max: Some(encode_signed_optimizer_fact_scalar(7, 8).unwrap()),
+			}],
+		};
+		let bytes = postcard::to_allocvec(&without_row_bound).expect("encode current facts");
+
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode current facts");
+		assert_eq!(decoded.table_object_id, without_row_bound.table_object_id);
+		assert_eq!(
+			decoded.schema_generation,
+			without_row_bound.schema_generation
+		);
+		assert_eq!(decoded.row_upper_bound, None);
+		assert_eq!(decoded.column_range, without_row_bound.column_range);
+		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
+	}
+}

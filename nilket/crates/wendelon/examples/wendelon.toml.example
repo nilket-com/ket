@@ -1,0 +1,182 @@
+# Example Wendelon single-node bootstrap config.
+#
+# The checked-in file is a template. The binary can render concrete
+# starter values from it with:
+#
+#   wendelon --print-example-config
+#   wendelon --write-example-config ./wendelon.toml
+#
+# The generated config uses dev-derived signing material for
+# `node_id = 1`. That is suitable for local bring-up only. Replace
+# the identity section for any non-development deployment.
+
+[node]
+node_id = {{NODE_ID}}
+advertise_address = "{{ADVERTISE_ADDRESS}}"
+
+[cluster]
+mode = "bootstrap"
+
+[storage]
+# Resolved relative to the config file location.
+data_dir = "{{DATA_DIR}}"
+slab_max_bytes = {{SLAB_MAX_BYTES}}
+# Node-local ADR 055 maintenance switch. Leave false for ordinary nodes.
+lsm_compaction_paused = false
+
+# ADR 044 L2 columnar fetch is node-local and disabled by default
+# until stabilization benchmarks pass.
+#
+# [storage.l2_column_fetch]
+# enabled = false
+# ipc_metadata_initial_window_bytes = 65536
+# max_ipc_metadata_probe_bytes = 262144
+# min_record_bytes = 262144
+# max_selected_fraction_micros = 670000
+# max_ranges_per_record = 8
+# max_parallel_range_gets = 4
+
+# ADR 056 row-group writer/fetch are independently rolled out and
+# disabled by default.
+#
+# [storage.row_group_writer]
+# enabled = false
+# profile = "point_read" # "point_read" (default) or "scan"
+# Numeric fields are PointRead-only overrides; they are ignored with a
+# warning when profile = "scan".
+# target_row_group_rows = 4096
+# max_row_group_rows = 8192
+# min_paged_record_rows = 8192
+# min_paged_record_bytes = 524288
+#
+# [storage.l2_row_group_fetch]
+# enabled = false
+# max_selected_row_group_fraction_micros = 250000
+# max_selected_byte_fraction_micros = 500000
+# max_ranges_per_record = 16
+# max_parallel_range_gets = 4
+
+# ADR 057 Encoding writer/fetch are opt-in and require row-group records.
+#
+# [storage.encoding_writer]
+# enabled = false
+# target_simd_page_values = 1024
+# cascade_sample_rows = 256
+# min_buffer_bytes_for_encoding = 4096
+# enabled_cascades = ["plain", "lz4_frame", "bit_packed", "rle", "dictionary", "delta", "fsst", "alp"]
+#
+# [storage.l2_encoding_fetch]
+# enabled = false
+# max_simd_pages_per_record = 64
+# max_parallel_materialize_tasks = 4
+#
+# ADR 058 compute-over-encoded-data is node-local and disabled by default.
+# The selectivity gate routes encoded predicate leaves at selectivity <= 0.25.
+#
+# [storage.encoding_compute]
+# enabled = false
+# max_dict_match_set_size = 4096
+# min_buffer_rows_for_encoded_eval = 256
+# max_parallel_kernel_tasks = 4
+# max_mask_bytes_per_record = 262144
+# max_encoded_pages_per_record = 256
+# min_selectivity_for_encoded_eval_micros = 250000
+# min_prefilter_rejection_micros = 100000
+# enabled_predicate_evaluators = ["bit_packed", "rle_plain", "rle_bit_packed", "dictionary_plain", "dictionary_bit_packed", "delta", "fsst"]
+# enabled_aggregate_kernels = ["count_star", "count_non_null", "min", "max", "signed_sum", "unsigned_sum", "signed_avg", "unsigned_avg"]
+
+[tuning]
+rf = {{RF}}
+wal_io_depth = {{WAL_IO_DEPTH}}
+slab_io_depth = {{SLAB_IO_DEPTH}}
+
+[identity]
+lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"
+transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
+
+[identity.trusted_lease_signers]
+"{{NODE_ID}}" = "{{LEASE_VERIFYING_KEY}}"
+
+[identity.trusted_transfer_signers]
+"{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"
+
+# Root-KEK bootstrap selector.
+#
+# This checked-in example is explicitly dev-only, so it uses the
+# `dev-insecure` provider on purpose. Serious deployments should switch
+# this to `local-sealed`, which is the default serious custody path for
+# ordinary config loading:
+#
+#   root_kek_provider = { kind = "local-sealed", unlock_secret_env = "WENDELON_ROOT_KEK_SECRET" }
+#   root_kek_provider = { kind = "aws-kms", region = "us-east-1", key_id = "arn:aws:kms:us-east-1:111122223333:key/your-root-kek", access_key_id_env = "AWS_ACCESS_KEY_ID", secret_access_key_env = "AWS_SECRET_ACCESS_KEY", session_token_env = "AWS_SESSION_TOKEN" }
+#   root_kek_provider = { kind = "pkcs11", library_path = "/usr/lib/your-pkcs11.so", token_label = "WendelonToken", key_label = "root-kek", pin_env = "WENDELON_PKCS11_PIN", slot = 0 }   # seam only; runtime support not implemented yet
+#
+# `dev-insecure` persists a local plaintext Root KEK at
+# `<data_dir>/.wendelon/dev-root-kek.bin` and is not a real custody
+# boundary.
+
+[crypto]
+root_kek_provider = "dev-insecure"
+tenant_kek_cache_max_entries = 2048
+slab_dek_cache_max_entries = 10000
+
+# Optional inter-node mTLS transport. When configured, Wendelon binds
+# the real QUIC transport stack (`quinn`) plus the TCP+TLS fallback
+# listener, advertises both tiers, and uses this identity for both
+# inbound accepts and outbound dials. Required for multi-node joins
+# outside the in-process loopback harness.
+#
+# [transport.tls]
+# cert_path = "certs/node.crt"
+# key_path = "certs/node.key"
+# node_ca_path = "certs/node-ca.crt"
+# operator_ca_path = "certs/ops-ca.crt"
+# cluster_domain = "cluster.local"
+#
+# [time]
+# drift_max_offset_ms = 500
+# mvcc_retention_window_secs = 604800
+# Set to `0` to disable MVCC snapshot pruning. Internally this maps to
+# the bootstrap retention policy's `Disabled` / `FixedWindow` modes.
+#
+# Optional observability listener topology. `/ready` and `/metrics`
+# are mTLS-gated and therefore require `[transport.tls]`.
+#
+# [observability.listeners]
+# health = "0.0.0.0:7431"
+# ready = "0.0.0.0:7432"
+# metrics = "0.0.0.0:7433"
+#
+# Optional OTLP trace export. Both transports are feature-gated and
+# implemented in pure Rust without any protobuf or gRPC codegen:
+# `otlp-http` enables `http/protobuf`, `otlp-grpc` enables gRPC.
+#
+# [observability.traces]
+# endpoint = "https://otel-collector.internal:4317"
+# protocol = "grpc"                              # or "http/protobuf"
+# sampling_rate = 0.01
+# client_cert_path = "certs/obs-client.crt"
+# client_key_path = "certs/obs-client.key"
+# ca_bundle_path = "certs/obs-ca.crt"
+# max_queue_size = 8192
+# export_timeout_s = 30
+#
+# Optional additive audit shipping sinks. The local NDJSON audit chain
+# at `<data_dir>/audit.ndjson` stays enabled even when these are
+# configured; sink shapes and archive guidance are documented in
+# `plans/ops/audit.md`.
+#
+# [audit.archive]
+# directory = "/mnt/worm/wendelon-audit/node-01"
+# max_segment_bytes = 8388608
+# lock_mode = "governance"   # "none", "governance", or "compliance"
+# retain_days = 2555
+#
+# [audit.syslog]
+# socket_path = "/run/systemd/journal/syslog"
+#
+# [audit.kafka]
+# brokers = "kafka-1.internal:9092,kafka-2.internal:9092"
+# topic = "wendelon.audit"
+# payload_mode = "distribution"   # or "canonical" for persisted chain records
+# client_id = "wendelon-node-01"

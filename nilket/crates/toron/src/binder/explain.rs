@@ -1,0 +1,3271 @@
+use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct JoinTraceTarget {
+	pub(crate) join_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionReceipt {
+	pub(crate) target: JoinTraceTarget,
+	pub(crate) strategy: JoinStrategy,
+	pub(crate) placement: JoinPhysicalPlacement,
+	pub(crate) reason: JoinStrategyDecisionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanTraceTarget {
+	pub(crate) scan_index: usize,
+	pub(crate) table_id: Option<TableId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilterEstimateSource {
+	Range,
+	ConvertedRange,
+	NdvEquality,
+	NdvInList,
+	HeavyHitterTopK,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanFilterOutcome {
+	FullyPushed,
+	PartiallyPushed,
+	ResidualOnly,
+	StaticElided,
+	PointRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanFilterReceipt {
+	pub(crate) target: ScanTraceTarget,
+	pub(crate) outcome: ScanFilterOutcome,
+	pub(crate) converted_pushdown: bool,
+	pub(crate) profile_hint: QueryProfileHint,
+	pub(crate) estimated_rows: Option<RowCount>,
+	pub(crate) spent_fact: Option<FilterEstimateSource>,
+	pub(crate) spent_column: Option<ColumnOrdinal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FilterEstimateEvidence {
+	pub(super) rows: RowCount,
+	pub(super) source: FilterEstimateSource,
+	pub(super) column: Option<ColumnOrdinal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ScanFilterPushdownEvidence {
+	pub(super) outcome: ScanFilterOutcome,
+	pub(super) converted_pushdown: bool,
+	pub(super) profile_hint: QueryProfileHint,
+	pub(super) table_id: Option<TableId>,
+}
+
+/// ADR 490: one local hash-join admission outcome per binder-physicalized hash
+/// join, in bind order. Recorded whether or not the join admits, so a live cell
+/// can name the exact declining precondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalHashJoinAdmissionReceipt {
+	pub(crate) target: JoinTraceTarget,
+	pub(crate) admission: LocalHashJoinAdmission,
+}
+
+/// ADR 490: bind and surface each binder-physicalized hash join's local-admission
+/// receipt, in bind order. The gauge threads these into perf rows so a live cell
+/// always names the exact admission outcome instead of inferring it from a
+/// fingerprint.
+pub async fn bind_with_local_join_admissions(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, Vec<LocalHashJoinAdmission>), BindingError> {
+	let (plan, trace) = bind_with_trace(plan, catalog, config).await?;
+	Ok((
+		plan,
+		trace
+			.local_hash_join_admissions
+			.iter()
+			.map(|receipt| receipt.admission)
+			.collect(),
+	))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OptimizerTrace {
+	pub(crate) join_decisions: Vec<DecisionReceipt>,
+	pub(crate) scan_filter_decisions: Vec<ScanFilterReceipt>,
+	pub(crate) local_hash_join_admissions: Vec<LocalHashJoinAdmissionReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct OptimizerExplainRenderTrace {
+	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
+	pub(super) outer_join_demotions: Vec<OuterJoinDemotionReceipt>,
+	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
+	pub(super) join_order: JoinOrderRenderState,
+	// ADR 214: a true outer join remains fenced from tree/graph actuation. This sibling receipt records
+	// the inner-equivalent ordering opportunity without changing the live join-order receipt.
+	pub(super) preserved_outer_order: Vec<PreservedOuterOrderReceipt>,
+	// ADR 194: galaxy graph evidence rides a sibling field, additive to the `join_order` tree receipt
+	// — it never changes the star/snowflake render state, so existing arms and behavior stay untouched.
+	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
+	// ADR 196: bridge (many-to-many junction) evidence — a sibling to galaxy, equally additive.
+	pub(super) bridge_order: Option<BridgeOrderEvidence>,
+	// ADR 203: a recognized 2-hop bridge chain `F ⋈ B1 ⋈ B2 ⋈ D` — an additive observe-only sibling.
+	pub(super) bridge_chain_order: Option<BridgeChainEvidence>,
+	// ADR 198: when galaxy root-swap actuation fires, the applied root fact. The receipt then shows
+	// `action=reordered; applied_root={fact}` instead of the re-rooted galaxy's intrinsic recommendation.
+	pub(super) applied_galaxy_root: Option<String>,
+	// ADR 199: when bridge actuation fires, the applied dimension root. The bridge receipt then shows
+	// `action=reordered; applied_root={dim}` instead of the re-rooted bridge's intrinsic recommendation.
+	pub(super) applied_bridge_root: Option<String>,
+	// ADR 205: when chain actuation fires, the applied `D` driver-end. The chain row then shows
+	// `reordered; applied_root={D}` instead of the observe-only `observed`.
+	pub(super) applied_bridge_chain_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOrderRenderReceipt {
+	pub(super) probe_label: String,
+	pub(super) outcome: StarOrderOutcome,
+	pub(super) edge_targets: Vec<JoinTraceTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreservedOuterOrderReceipt {
+	pub(super) receipt: StarOrderRenderReceipt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum JoinOrderRenderState {
+	#[default]
+	None,
+	StarReceipts(Vec<StarOrderRenderReceipt>),
+	ObservedSnowflake(SnowflakeOrderEvidence),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScanFilterRenderReceipt {
+	pub(super) target: ScanTraceTarget,
+	pub(super) predicate_text: Option<String>,
+	pub(super) pushed_predicate_text: Option<String>,
+	pub(super) residual_predicate_text: Option<String>,
+	pub(super) spent_column_name: Option<String>,
+}
+
+impl OptimizerExplainRenderTrace {
+	pub(super) fn scan_filter(&self, target: ScanTraceTarget) -> Option<&ScanFilterRenderReceipt> {
+		self.scan_filters
+			.iter()
+			.find(|receipt| receipt.target == target)
+	}
+
+	pub(super) fn has_recognized_star_order(&self) -> bool {
+		match &self.join_order {
+			JoinOrderRenderState::StarReceipts(receipts) => receipts
+				.iter()
+				.any(|receipt| matches!(receipt.outcome, StarOrderOutcome::Recognized(_))),
+			JoinOrderRenderState::None | JoinOrderRenderState::ObservedSnowflake(_) => false,
+		}
+	}
+
+	pub(super) fn star_order_receipts(&self) -> &[StarOrderRenderReceipt] {
+		match &self.join_order {
+			JoinOrderRenderState::StarReceipts(receipts) => receipts,
+			JoinOrderRenderState::None | JoinOrderRenderState::ObservedSnowflake(_) => &[],
+		}
+	}
+
+	pub(super) fn set_observed_snowflake(&mut self, evidence: SnowflakeOrderEvidence) {
+		self.join_order = JoinOrderRenderState::ObservedSnowflake(evidence);
+	}
+
+	pub(super) fn set_observed_galaxy(&mut self, evidence: GalaxyOrderEvidence) {
+		self.galaxy_order = Some(evidence);
+	}
+
+	pub(super) fn set_observed_bridge(&mut self, evidence: BridgeOrderEvidence) {
+		self.bridge_order = Some(evidence);
+	}
+
+	pub(super) fn set_observed_bridge_chain(&mut self, evidence: BridgeChainEvidence) {
+		self.bridge_chain_order = Some(evidence);
+	}
+
+	pub(super) fn set_preserved_outer_order(&mut self, receipts: Vec<PreservedOuterOrderReceipt>) {
+		self.preserved_outer_order = receipts;
+	}
+
+	pub(super) fn set_applied_galaxy_root(&mut self, root: String) {
+		self.applied_galaxy_root = Some(root);
+	}
+
+	pub(super) fn set_applied_bridge_root(&mut self, root: String) {
+		self.applied_bridge_root = Some(root);
+	}
+
+	pub(super) fn set_applied_bridge_chain_root(&mut self, root: String) {
+		self.applied_bridge_chain_root = Some(root);
+	}
+
+	// ADR 206: the applied root of whichever graph shape actuated, partition-complete over the 3-way
+	// galaxy / bridge / chain partition. Exhaustive by construction — a new graph shape adds one arm here, so
+	// the `graph_actuated` boundary can never silently miss a shape (205's chain bug).
+	pub(super) fn applied_graph_root(&self) -> Option<&str> {
+		self.applied_galaxy_root
+			.as_deref()
+			.or(self.applied_bridge_root.as_deref())
+			.or(self.applied_bridge_chain_root.as_deref())
+	}
+
+	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
+		self.join_order = JoinOrderRenderState::StarReceipts(vec![receipt]);
+	}
+
+	pub(super) fn set_star_receipts(&mut self, receipts: Vec<StarOrderRenderReceipt>) {
+		self.join_order = JoinOrderRenderState::StarReceipts(receipts);
+	}
+}
+
+pub(super) fn table_name(table: &TableRef) -> String {
+	match &table.schema {
+		Some(schema) => format!("{schema}.{}", table.table),
+		None => table.table.clone(),
+	}
+}
+
+pub(super) fn is_information_schema_namespace(table: &TableRef) -> bool {
+	table
+		.schema
+		.as_deref()
+		.is_some_and(|schema| schema.eq_ignore_ascii_case(INFORMATION_SCHEMA_NAMESPACE))
+}
+
+pub(super) fn reject_information_schema_target(table: &TableRef) -> Result<(), BindingError> {
+	if is_information_schema_namespace(table) {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!("information_schema is read-only: {}", table_name(table)),
+		});
+	}
+	Ok(())
+}
+
+pub(super) fn information_schema_logical_types_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("logical_type_id", DataType::Int64, false),
+		Field::new("name", DataType::Utf8, false),
+		Field::new("physical", DataType::Utf8, false),
+		Field::new("refinement", DataType::Utf8, true),
+	]))
+}
+
+pub(super) fn information_schema_tables_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("table_schema", DataType::Utf8, false),
+		Field::new("table_name", DataType::Utf8, false),
+		Field::new("table_type", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_columns_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("table_schema", DataType::Utf8, false),
+		Field::new("table_name", DataType::Utf8, false),
+		Field::new("column_name", DataType::Utf8, false),
+		Field::new("ordinal_position", DataType::Int64, false),
+		Field::new("data_type", DataType::Utf8, false),
+		Field::new("is_nullable", DataType::Utf8, false),
+		Field::new("logical_type_name", DataType::Utf8, true),
+	]))
+}
+
+pub(super) fn information_schema_schemata_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![Field::new(
+		"schema_name",
+		DataType::Utf8,
+		false,
+	)]))
+}
+
+pub(super) fn information_schema_optimizer_decisions_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("outcome", DataType::Utf8, false),
+		Field::new("decline_reason", DataType::Utf8, true),
+		Field::new("count", DataType::Int64, false),
+		Field::new("provenance", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_decision_rows(
+	decisions: &[OptimizerDecisionRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	decisions
+		.iter()
+		.map(|decision| {
+			Ok(vec![
+				ScalarValue::Utf8(Some(
+					optimizer_decision_kind_label(decision.kind).to_string(),
+				)),
+				ScalarValue::Utf8(Some(
+					optimizer_decision_outcome_label(decision.outcome).to_string(),
+				)),
+				ScalarValue::Utf8(match decision.outcome {
+					OptimizerDecisionOutcome::Declined(reason) => {
+						Some(optimizer_decision_decline_reason_label(reason).to_string())
+					}
+					OptimizerDecisionOutcome::Reordered
+					| OptimizerDecisionOutcome::KeptOptimal
+					| OptimizerDecisionOutcome::KeptThinMargin => None,
+				}),
+				ScalarValue::Int64(Some(i64::try_from(decision.count).map_err(|_| {
+					BindingError::UnsupportedExpression {
+						message: "optimizer explain optimizer_decision_count exceeds i64::MAX"
+							.to_string(),
+					}
+				})?)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_provenance_label(decision.provenance).to_string(),
+				)),
+			])
+		})
+		.collect()
+}
+
+pub(super) fn information_schema_optimizer_decision_conflicts_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("provenance", DataType::Utf8, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("reordered_count", DataType::Int64, false),
+		Field::new("kept_optimal_count", DataType::Int64, false),
+		Field::new("kept_thin_margin_count", DataType::Int64, false),
+		Field::new("declined_count", DataType::Int64, false),
+		Field::new("blocked_or_near_miss_count", DataType::Int64, false),
+		Field::new("total_count", DataType::Int64, false),
+		Field::new("conflict_strength", DataType::Int64, false),
+		Field::new("top_decline_reason", DataType::Utf8, true),
+		Field::new("top_decline_count", DataType::Int64, false),
+		Field::new("evidence_health", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_decision_conflict_rows(
+	reports: &[DecisionConflictReport],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::with_capacity(reports.len());
+	for report in reports {
+		rows.push(vec![
+			ScalarValue::Utf8(Some(optimizer_decision_kind_label(report.kind).to_string())),
+			ScalarValue::Utf8(Some(
+				optimizer_runtime_verdict_provenance_label(report.provenance).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				decision_conflict_status_label(report.status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.reordered_count,
+				"optimizer decision conflict reordered_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.kept_optimal_count,
+				"optimizer decision conflict kept_optimal_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.kept_thin_margin_count,
+				"optimizer decision conflict kept_thin_margin_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.declined_count,
+				"optimizer decision conflict declined_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.blocked_or_near_miss_count,
+				"optimizer decision conflict blocked_or_near_miss_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.total_count,
+				"optimizer decision conflict total_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.conflict_strength,
+				"optimizer decision conflict conflict_strength",
+			)?)),
+			ScalarValue::Utf8(
+				report
+					.top_decline_reason
+					.map(|reason| optimizer_decision_decline_reason_label(reason).to_string()),
+			),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.top_decline_count,
+				"optimizer decision conflict top_decline_count",
+			)?)),
+			ScalarValue::Utf8(Some(report.evidence_health.clone())),
+			ScalarValue::Utf8(Some(report.reason.clone())),
+			ScalarValue::Utf8(Some(report.next_cut.to_string())),
+		]);
+	}
+	Ok(rows)
+}
+
+pub(super) fn information_schema_optimizer_memo_admission_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("provenance", DataType::Utf8, false),
+		Field::new("admission_status", DataType::Utf8, false),
+		Field::new("conflict_strength", DataType::Int64, false),
+		Field::new("recent_window", DataType::Int64, false),
+		Field::new("stale_lifetime", DataType::Int64, false),
+		Field::new("lifetime_total", DataType::Int64, false),
+		Field::new("bounded_candidate_count", DataType::Int64, false),
+		Field::new("evidence_health", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+		Field::new("blocker_class", DataType::Utf8, false),
+		Field::new("margin_blocked_count", DataType::Int64, false),
+		Field::new("hard_decline_count", DataType::Int64, false),
+		Field::new("capability_decline_count", DataType::Int64, false),
+		Field::new("top_decline_reason", DataType::Utf8, false),
+		Field::new("top_decline_count", DataType::Int64, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_memo_admission_rows(
+	rows: &[OptimizerAdmissionRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rendered = Vec::with_capacity(rows.len());
+	for row in rows {
+		rendered.push(vec![
+			ScalarValue::Utf8(Some(
+				optimizer_decision_kind_label(row.decision_kind).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				optimizer_runtime_verdict_provenance_label(row.provenance).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				optimizer_memo_admission_status_label(row.admission_status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.conflict_strength,
+				"optimizer memo admission conflict_strength",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_window,
+				"optimizer memo admission recent_window",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.stale_lifetime,
+				"optimizer memo admission stale_lifetime",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.lifetime_total,
+				"optimizer memo admission lifetime_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.bounded_candidate_count,
+				"optimizer memo admission bounded_candidate_count",
+			)?)),
+			ScalarValue::Utf8(Some(row.evidence_health.clone())),
+			ScalarValue::Utf8(Some(row.reason.clone())),
+			ScalarValue::Utf8(Some(row.next_cut.to_string())),
+			ScalarValue::Utf8(Some(
+				admission_blocker_class_label(row.blocker_class).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.margin_blocked_count,
+				"optimizer memo admission margin_blocked_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.hard_decline_count,
+				"optimizer memo admission hard_decline_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.capability_decline_count,
+				"optimizer memo admission capability_decline_count",
+			)?)),
+			ScalarValue::Utf8(Some(
+				row.top_decline_reason
+					.map(optimizer_decision_decline_reason_label)
+					.unwrap_or("")
+					.to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.top_decline_count,
+				"optimizer memo admission top_decline_count",
+			)?)),
+		]);
+	}
+	Ok(rendered)
+}
+
+pub(super) fn information_schema_optimizer_probe_linearity_fences_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("consumer", DataType::Utf8, false),
+		Field::new("fence", DataType::Utf8, false),
+		Field::new("recent_count", DataType::Int64, false),
+		Field::new("lifetime_count", DataType::Int64, false),
+		Field::new("consumer_recent_total", DataType::Int64, false),
+		Field::new("consumer_lifetime_total", DataType::Int64, false),
+		Field::new("recent_share_per_mille", DataType::Int64, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_probe_linearity_fence_rows(
+	rows: &[OptimizerProbeLinearityFenceRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rendered = Vec::with_capacity(rows.len());
+	for row in rows {
+		rendered.push(vec![
+			ScalarValue::Utf8(Some(
+				optimizer_probe_linearity_consumer_label(row.consumer).to_string(),
+			)),
+			ScalarValue::Utf8(Some(row.fence.label().to_string())),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_count,
+				"optimizer probe linearity recent_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.lifetime_count,
+				"optimizer probe linearity lifetime_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.consumer_recent_total,
+				"optimizer probe linearity consumer_recent_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.consumer_lifetime_total,
+				"optimizer probe linearity consumer_lifetime_total",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				row.recent_share_per_mille,
+				"optimizer probe linearity recent_share_per_mille",
+			)?)),
+			ScalarValue::Utf8(Some(
+				optimizer_probe_linearity_fence_status_label(row.status).to_string(),
+			)),
+			ScalarValue::Utf8(Some(row.reason.clone())),
+			ScalarValue::Utf8(Some(row.next_cut.to_string())),
+		]);
+	}
+	Ok(rendered)
+}
+
+pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("verdict", DataType::Utf8, false),
+		Field::new("count", DataType::Int64, false),
+		Field::new("provenance", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_runtime_verdict_rows(
+	verdicts: &[OptimizerRuntimeVerdictRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	verdicts
+		.iter()
+		.map(|verdict| {
+			Ok(vec![
+				ScalarValue::Utf8(Some(
+					optimizer_decision_kind_label(verdict.kind).to_string(),
+				)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_label(verdict.verdict).to_string(),
+				)),
+				ScalarValue::Int64(Some(i64::try_from(verdict.count).map_err(|_| {
+					BindingError::UnsupportedExpression {
+						message: "optimizer runtime verdict count exceeds i64::MAX".to_string(),
+					}
+				})?)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_provenance_label(verdict.provenance).to_string(),
+				)),
+			])
+		})
+		.collect()
+}
+
+pub(super) fn information_schema_optimizer_evidence_status_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("mode", DataType::Utf8, false),
+		Field::new("state", DataType::Utf8, false),
+		Field::new("pending_deltas", DataType::Int64, false),
+		Field::new("dropped_deltas", DataType::Int64, false),
+		Field::new("ambiguous_deltas", DataType::Int64, false),
+		Field::new("refresh_failures", DataType::Int64, false),
+		Field::new("last_error", DataType::Utf8, true),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_evidence_status_rows(
+	status: &OptimizerEvidenceStatusSnapshot,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	Ok(vec![vec![
+		ScalarValue::Utf8(Some(status.mode.as_str().to_string())),
+		ScalarValue::Utf8(Some(status.state.as_str().to_string())),
+		ScalarValue::Int64(Some(i64::try_from(status.pending_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence pending_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.dropped_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence dropped_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.ambiguous_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence ambiguous_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.refresh_failures).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence refresh_failures exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Utf8(status.last_error.clone()),
+	]])
+}
+
+pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("current_margin", DataType::Utf8, false),
+		Field::new("recommended_margin", DataType::Utf8, false),
+		Field::new("recommendation", DataType::Utf8, false),
+		Field::new("missed_win", DataType::Int64, false),
+		Field::new("over_eager", DataType::Int64, false),
+		Field::new("vindicated", DataType::Int64, false),
+		Field::new("mis_ranked", DataType::Int64, false),
+		Field::new("indeterminate", DataType::Int64, false),
+		Field::new("sample_size", DataType::Int64, false),
+		// ADR 191/208: appended at the tail so existing column indexes stay stable.
+		// `application_mode` reports Manual vs ApplyAdvisory; `applied_margin` is the tree advisory
+		// step. `current_margin`/`recommended_margin` keep their ADR 189/190 meaning (the configured
+		// base and the recommendation from that base) so the report never double-steps.
+		Field::new("application_mode", DataType::Utf8, false),
+		Field::new("applied_margin", DataType::Utf8, false),
+		Field::new("evidence_scope", DataType::Utf8, false),
+		Field::new("excluded_sample_size", DataType::Int64, false),
+		Field::new("row_kind", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_margin_advisory_rows(
+	reports: &[MarginAdvisoryReport],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::with_capacity(reports.len());
+	for report in reports {
+		let advisory = report.advisory;
+		rows.push(vec![
+			ScalarValue::Utf8(Some(advisory.current.label())),
+			ScalarValue::Utf8(Some(advisory.recommended.label())),
+			ScalarValue::Utf8(Some(
+				margin_recommendation_label(advisory.recommendation).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.missed_win,
+				"optimizer margin advisory missed_win",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.over_eager,
+				"optimizer margin advisory over_eager",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.vindicated,
+				"optimizer margin advisory vindicated",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.mis_ranked,
+				"optimizer margin advisory mis_ranked",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.indeterminate,
+				"optimizer margin advisory indeterminate",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.sample_size,
+				"optimizer margin advisory sample_size",
+			)?)),
+			ScalarValue::Utf8(Some(
+				join_order_soft_margin_application_label(report.application).to_string(),
+			)),
+			ScalarValue::Utf8(Some(report.applied_step.margin().label())),
+			ScalarValue::Utf8(Some(report.evidence_scope.to_string())),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.excluded_sample_size,
+				"optimizer margin advisory excluded_sample_size",
+			)?)),
+			ScalarValue::Utf8(Some(
+				margin_advisory_row_kind_label(report.row_kind).to_string(),
+			)),
+		]);
+	}
+	Ok(rows)
+}
+
+pub(super) fn information_schema_optimizer_receipt_gates_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("gate_name", DataType::Utf8, false),
+		Field::new("gate_family", DataType::Utf8, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("sample_count", DataType::Int64, false),
+		Field::new("primary_signal", DataType::Utf8, false),
+		Field::new("secondary_signal", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_receipt_gate_rows(
+	gates: &[OptimizerReceiptGateRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::with_capacity(gates.len());
+	for gate in gates {
+		rows.push(vec![
+			ScalarValue::Utf8(Some(gate.gate_name.to_string())),
+			ScalarValue::Utf8(Some(gate.gate_family.to_string())),
+			ScalarValue::Utf8(Some(
+				optimizer_receipt_gate_status_label(gate.status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				gate.sample_count,
+				"optimizer receipt gate sample_count",
+			)?)),
+			ScalarValue::Utf8(Some(gate.primary_signal.clone())),
+			ScalarValue::Utf8(Some(gate.secondary_signal.clone())),
+			ScalarValue::Utf8(Some(gate.reason.clone())),
+			ScalarValue::Utf8(Some(gate.next_cut.to_string())),
+		]);
+	}
+	Ok(rows)
+}
+
+pub(super) fn optimizer_explain_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("target", DataType::Utf8, false),
+		Field::new("outcome", DataType::Utf8, false),
+		Field::new("detail", DataType::Utf8, true),
+		Field::new("predicate_text", DataType::Utf8, true),
+		Field::new("pushed_predicate_text", DataType::Utf8, true),
+		Field::new("residual_predicate_text", DataType::Utf8, true),
+		Field::new("estimated_rows", DataType::Int64, true),
+		Field::new("spent_fact", DataType::Utf8, true),
+		Field::new("spent_column", DataType::Utf8, true),
+		Field::new("spent_column_name", DataType::Utf8, true),
+		Field::new("build_side", DataType::Utf8, true),
+		Field::new("build_bytes", DataType::Int64, true),
+		Field::new("threshold_bytes", DataType::Int64, true),
+		Field::new("rejected_side_bytes", DataType::Int64, true),
+	]))
+}
+
+pub(super) fn optimizer_explain_plan(
+	trace: OptimizerTrace,
+	render_trace: Option<OptimizerExplainRenderTrace>,
+) -> Result<ExecutionPlan, BindingError> {
+	let mut rows = trace
+		.join_decisions
+		.iter()
+		.map(optimizer_explain_row)
+		.collect::<Result<Vec<_>, _>>()?;
+	let render_trace = render_trace.as_ref();
+	rows.extend(
+		trace
+			.scan_filter_decisions
+			.iter()
+			.map(|receipt| {
+				optimizer_explain_scan_filter_row(
+					receipt,
+					render_trace.and_then(|trace| trace.scan_filter(receipt.target)),
+				)
+			})
+			.collect::<Result<Vec<_>, _>>()?,
+	);
+	if let Some(render_trace) = render_trace {
+		rows.extend(
+			render_trace
+				.outer_join_demotions
+				.iter()
+				.map(optimizer_explain_outer_join_demotion_row)
+				.collect::<Result<Vec<_>, _>>()?,
+		);
+		match &render_trace.join_order {
+			JoinOrderRenderState::None => {}
+			JoinOrderRenderState::ObservedSnowflake(evidence) => {
+				rows.push(optimizer_explain_snowflake_order_row(evidence)?);
+			}
+			JoinOrderRenderState::StarReceipts(receipts) => {
+				for receipt in receipts {
+					rows.push(optimizer_explain_join_order_row(&receipt.outcome)?);
+				}
+			}
+		}
+		// ADR 194: galaxy evidence is additive — it renders alongside whatever tree
+		// receipt the query produced, never in place of it.
+		if let Some(galaxy) = &render_trace.galaxy_order {
+			rows.push(optimizer_explain_galaxy_order_row(
+				galaxy,
+				render_trace.applied_galaxy_root.as_deref(),
+			));
+		}
+		// ADR 196: bridge evidence is the same additive sibling, alongside galaxy + tree receipts.
+		if let Some(bridge) = &render_trace.bridge_order {
+			rows.push(optimizer_explain_bridge_order_row(
+				bridge,
+				render_trace.applied_bridge_root.as_deref(),
+			));
+		}
+		// ADR 203: a recognized bridge chain renders an additional observe-only path row, after its
+		// per-junction bridge rows.
+		if let Some(chain) = &render_trace.bridge_chain_order {
+			rows.push(optimizer_explain_bridge_chain_row(
+				chain,
+				render_trace.applied_bridge_chain_root.as_deref(),
+			));
+		}
+	}
+	system_table_plan(
+		SystemTableKind::OptimizerExplain,
+		optimizer_explain_schema(),
+		rows,
+		None,
+	)
+}
+
+pub(super) fn optimizer_analyze_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("target", DataType::Utf8, false),
+		Field::new("outcome", DataType::Utf8, false),
+		Field::new("detail", DataType::Utf8, true),
+		Field::new("estimated_rows", DataType::Int64, true),
+		Field::new("actual_rows", DataType::Int64, true),
+		Field::new("ratio", DataType::Float64, true),
+		Field::new("estimate_source", DataType::Utf8, true),
+		Field::new("build_rows", DataType::Int64, true),
+		Field::new("probe_rows", DataType::Int64, true),
+	]))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JoinRuntimeObservationSummary {
+	build_rows: RowCount,
+	probe_rows: RowCount,
+	output_rows: RowCount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeasuredLevelVerdict {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
+}
+
+pub(super) fn optimizer_analyze_plan(
+	_trace: OptimizerTrace,
+	render_trace: OptimizerExplainRenderTrace,
+	observations: &[JoinRuntimeObservation],
+) -> Result<ExecutionPlan, BindingError> {
+	let summaries = summarize_join_runtime_observations(observations);
+	let rows = optimizer_analyze_rows(&render_trace, &summaries)?;
+	system_table_plan(
+		SystemTableKind::OptimizerExplain,
+		optimizer_analyze_schema(),
+		rows,
+		None,
+	)
+}
+
+fn summarize_join_runtime_observations(
+	observations: &[JoinRuntimeObservation],
+) -> BTreeMap<JoinReplayId, JoinRuntimeObservationSummary> {
+	let mut summaries = BTreeMap::<JoinReplayId, JoinRuntimeObservationSummary>::new();
+	for observation in observations {
+		let summary = summaries.entry(observation.replay_id).or_default();
+		summary.build_rows = RowCount::new(
+			summary
+				.build_rows
+				.get()
+				.saturating_add(observation.build_rows.get()),
+		);
+		summary.probe_rows = RowCount::new(
+			summary
+				.probe_rows
+				.get()
+				.saturating_add(observation.probe_rows.get()),
+		);
+		summary.output_rows = RowCount::new(
+			summary
+				.output_rows
+				.get()
+				.saturating_add(observation.output_rows.get()),
+		);
+	}
+	summaries
+}
+
+pub(crate) fn measured_verdicts(
+	render_trace: &OptimizerExplainRenderTrace,
+	observations: &[JoinRuntimeObservation],
+) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
+	let summaries = summarize_join_runtime_observations(observations);
+	measured_verdicts_from_summaries(render_trace, &summaries)
+}
+
+fn measured_verdicts_from_summaries(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
+	let mut verdicts = Vec::new();
+	let provenance = if render_trace.outer_join_demotions.is_empty() {
+		OptimizerRuntimeVerdictProvenance::Native
+	} else {
+		OptimizerRuntimeVerdictProvenance::Demoted
+	};
+
+	// ADR 201: when a graph actuated, its re-rooted tree was bound on the no-op recorder, so the tree
+	// decisions were never accrued (ADR 200) — a tree verdict here would be an orphan with no matching
+	// decision. Suppress tree verdicts for an actuated graph, but keep them for a kept graph (whose FROM
+	// tree really executed and whose tree decisions did accrue). ADR 206: partition-complete over galaxy /
+	// bridge / chain — an actuated chain (205) leaked orphan tree verdicts under the old galaxy/bridge-only OR.
+	let graph_actuated = render_trace.applied_graph_root().is_some();
+
+	if !graph_actuated {
+		if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
+			let measured_rows_by_dimension =
+				snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
+			let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
+			verdicts.extend(verdict.levels.iter().enumerate().map(|(index, level)| {
+				MeasuredLevelVerdict {
+					kind: if index == 0 {
+						OptimizerDecisionKind::SnowflakeRoot
+					} else {
+						OptimizerDecisionKind::SnowflakeBranch
+					},
+					verdict: runtime_verdict_class_from_snowflake(level.verdict),
+					provenance,
+				}
+			}));
+		} else {
+			let receipts = render_trace.star_order_receipts();
+			let root_kind = if receipts.len() > 1 {
+				OptimizerDecisionKind::SnowflakeRoot
+			} else {
+				OptimizerDecisionKind::FlatStar
+			};
+			for (index, receipt) in receipts.iter().enumerate() {
+				let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
+					continue;
+				};
+				let measured_rows_by_dimension =
+					star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
+				let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
+				verdicts.push(MeasuredLevelVerdict {
+					kind: if index == 0 {
+						root_kind
+					} else {
+						OptimizerDecisionKind::SnowflakeBranch
+					},
+					verdict: runtime_verdict_class_from_star(verdict.verdict),
+					provenance,
+				});
+			}
+		}
+	}
+
+	for preserved in &render_trace.preserved_outer_order {
+		let StarOrderOutcome::Recognized(evidence) = &preserved.receipt.outcome else {
+			continue;
+		};
+		let measured_rows_by_dimension =
+			star_measured_rows_by_dimension(render_trace, &preserved.receipt, evidence, summaries)?;
+		let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
+		verdicts.push(MeasuredLevelVerdict {
+			kind: OptimizerDecisionKind::PreservedOuterOrder,
+			verdict: runtime_verdict_class_from_preserved_outer(verdict.verdict),
+			provenance,
+		});
+	}
+
+	// ADR 201: the graph order verdict — emitted whenever a galaxy/bridge is recognized (kept or
+	// actuated), judging the root choice. Shares the render-path classifier + measured-cost assembly.
+	if let Some(galaxy) = &render_trace.galaxy_order {
+		if let Some(rec) = galaxy_order_recommendation(galaxy) {
+			let measured = galaxy_measured_costs(galaxy, &rec, summaries);
+			verdicts.push(MeasuredLevelVerdict {
+				kind: OptimizerDecisionKind::GalaxyRoot,
+				verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+					&rec, &measured,
+				)),
+				provenance,
+			});
+		}
+	}
+	// ADR 205: the 3-way partition extends to the verdict log — a chain query also carries `bridge_order`
+	// (additive per-junction evidence, judged only at `links.first()`), so without this gate the sampled
+	// verdict log would double-count a partial first-junction `BridgeRoot` alongside the authoritative
+	// `BridgeChainRoot`. The chain verdict is authoritative; the partial single-bridge verdict is suppressed.
+	if render_trace.bridge_chain_order.is_none() {
+		if let Some(bridge) = &render_trace.bridge_order {
+			if let Some(rec) = bridge_order_recommendation(bridge) {
+				if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+					verdicts.push(MeasuredLevelVerdict {
+						kind: OptimizerDecisionKind::BridgeRoot,
+						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+							&rec, &measured,
+						)),
+						provenance,
+					});
+				}
+			}
+		}
+	}
+	// ADR 203: judge the recognized bridge chain's path order against the measured per-hop fan-out. ADR 206:
+	// an ACTUATED chain reversed its execution, so judge the reversed (applied) order — `reverse_chain_
+	// evidence` re-keys the measured costs to the reversed plan's targets (the AST evidence stays on
+	// `render_trace` for the receipt label). A kept chain judges its AST order (204).
+	if let Some(chain) = &render_trace.bridge_chain_order {
+		let judged = if render_trace.applied_bridge_chain_root.is_some() {
+			reverse_chain_evidence(chain, &render_trace.join_order_edges)
+		} else {
+			Some(chain.clone())
+		};
+		if let Some(chain) = judged {
+			if let Some(rec) = bridge_chain_order_recommendation(&chain) {
+				if let Some(measured) = bridge_chain_measured_costs(&chain, summaries) {
+					verdicts.push(MeasuredLevelVerdict {
+						kind: OptimizerDecisionKind::BridgeChainRoot,
+						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+							&rec, &measured,
+						)),
+						provenance,
+					});
+				}
+			}
+		}
+	}
+	Ok(verdicts)
+}
+
+fn optimizer_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
+		let mut rows = vec![optimizer_analyze_snowflake_order_row(evidence)];
+		let dimensions = flatten_snowflake_dimensions(evidence);
+		for edge in &render_trace.join_order_edges {
+			let Some(dimension) = edge.dimension.as_deref() else {
+				continue;
+			};
+			let Some((probe, dimension)) = dimensions.get(dimension) else {
+				continue;
+			};
+			rows.push(optimizer_analyze_snowflake_runtime_row(
+				probe, edge, dimension, summaries,
+			)?);
+		}
+		let measured_rows_by_dimension =
+			snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
+		let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
+		for level in &verdict.levels {
+			rows.push(optimizer_analyze_snowflake_verdict_row(level));
+		}
+		rows.push(optimizer_analyze_snowflake_aggregate_verdict_row(&verdict));
+		rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
+		rows.extend(bridge_analyze_rows(render_trace, summaries)?);
+		return Ok(rows);
+	}
+
+	let mut rows = Vec::new();
+	for receipt in render_trace.star_order_receipts() {
+		let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
+			continue;
+		};
+		let edge_targets = receipt
+			.edge_targets
+			.iter()
+			.copied()
+			.collect::<BTreeSet<_>>();
+		let dimensions = evidence
+			.dimensions
+			.iter()
+			.map(|dimension| (dimension.dimension.as_str(), dimension))
+			.collect::<BTreeMap<_, _>>();
+		for edge in &render_trace.join_order_edges {
+			if !edge_targets.contains(&edge.target) {
+				continue;
+			}
+			let Some(dimension) = edge.dimension.as_deref() else {
+				continue;
+			};
+			let Some(dimension) = dimensions.get(dimension) else {
+				continue;
+			};
+			rows.push(optimizer_analyze_join_order_row(
+				edge, dimension, summaries,
+			)?);
+		}
+		let measured_rows_by_dimension =
+			star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
+		rows.push(optimizer_analyze_join_order_verdict_row(
+			evidence,
+			&measured_rows_by_dimension,
+		)?);
+	}
+	rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
+	rows.extend(bridge_analyze_rows(render_trace, summaries)?);
+	Ok(rows)
+}
+
+fn snowflake_measured_rows_by_dimension(
+	render_trace: &OptimizerExplainRenderTrace,
+	evidence: &SnowflakeOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<BTreeMap<String, RowCount>, BindingError> {
+	let dimensions = flatten_snowflake_dimensions(evidence);
+	let mut measured_rows_by_dimension = BTreeMap::new();
+	for edge in &render_trace.join_order_edges {
+		let Some(dimension) = edge.dimension.as_deref() else {
+			continue;
+		};
+		let Some((_probe, dimension)) = dimensions.get(dimension) else {
+			continue;
+		};
+		let replay_id = join_replay_id_for_trace_target(edge.target)?;
+		if let Some(summary) = summaries.get(&replay_id) {
+			measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+		}
+	}
+	Ok(measured_rows_by_dimension)
+}
+
+fn star_measured_rows_by_dimension(
+	render_trace: &OptimizerExplainRenderTrace,
+	receipt: &StarOrderRenderReceipt,
+	evidence: &StarOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<BTreeMap<String, RowCount>, BindingError> {
+	let edge_targets = receipt
+		.edge_targets
+		.iter()
+		.copied()
+		.collect::<BTreeSet<_>>();
+	let dimensions = evidence
+		.dimensions
+		.iter()
+		.map(|dimension| (dimension.dimension.as_str(), dimension))
+		.collect::<BTreeMap<_, _>>();
+	let mut measured_rows_by_dimension = BTreeMap::new();
+	for edge in &render_trace.join_order_edges {
+		if !edge_targets.contains(&edge.target) {
+			continue;
+		}
+		let Some(dimension) = edge.dimension.as_deref() else {
+			continue;
+		};
+		let Some(dimension) = dimensions.get(dimension) else {
+			continue;
+		};
+		let replay_id = join_replay_id_for_trace_target(edge.target)?;
+		if let Some(summary) = summaries.get(&replay_id) {
+			measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+		}
+	}
+	Ok(measured_rows_by_dimension)
+}
+
+fn runtime_verdict_class_from_star(verdict: StarOrderVerdict) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		StarOrderVerdict::Vindicated => OptimizerRuntimeVerdictClass::Vindicated,
+		StarOrderVerdict::MisRanked => OptimizerRuntimeVerdictClass::MisRanked,
+		StarOrderVerdict::MissedWin => OptimizerRuntimeVerdictClass::MissedWin,
+		StarOrderVerdict::OverEager => OptimizerRuntimeVerdictClass::OverEager,
+		StarOrderVerdict::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
+}
+
+fn runtime_verdict_class_from_preserved_outer(
+	verdict: StarOrderVerdict,
+) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		StarOrderVerdict::Vindicated | StarOrderVerdict::OverEager => {
+			OptimizerRuntimeVerdictClass::Vindicated
+		}
+		StarOrderVerdict::MissedWin | StarOrderVerdict::MisRanked => {
+			OptimizerRuntimeVerdictClass::MissedWin
+		}
+		StarOrderVerdict::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
+}
+
+fn runtime_verdict_class_from_snowflake(
+	verdict: SnowflakeOrderVerdictKind,
+) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		SnowflakeOrderVerdictKind::Vindicated => OptimizerRuntimeVerdictClass::Vindicated,
+		SnowflakeOrderVerdictKind::MissedWin => OptimizerRuntimeVerdictClass::MissedWin,
+		SnowflakeOrderVerdictKind::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
+}
+
+fn optimizer_analyze_join_order_row(
+	edge: &JoinOrderEdgeEvidence,
+	dimension: &JoinOrderDimEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let measurement = join_order_runtime_measurement(edge, dimension.estimated_rows, summaries)?;
+	let estimated_rows = dimension.estimated_rows;
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] dimension={}",
+			measurement.replay_id.0, dimension.dimension
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"estimated={}; actual={}; ratio={}; source={}; build_rows={}; probe_rows={}",
+			estimated_rows.get(),
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			join_order_estimate_source_label(dimension.estimate_source),
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get()
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(measurement.ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(dimension.estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinOrderRuntimeMeasurement {
+	replay_id: JoinReplayId,
+	summary: JoinRuntimeObservationSummary,
+	actual_rows: Option<RowCount>,
+	ratio: Option<f64>,
+}
+
+fn join_order_runtime_measurement(
+	edge: &JoinOrderEdgeEvidence,
+	estimated_rows: RowCount,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<JoinOrderRuntimeMeasurement, BindingError> {
+	let replay_id = join_replay_id_for_trace_target(edge.target)?;
+	let observed_summary = summaries.get(&replay_id).copied();
+	let summary = observed_summary.unwrap_or_default();
+	let actual_rows = observed_summary.map(|summary| summary.output_rows);
+	let ratio = actual_rows.and_then(|actual| {
+		(estimated_rows.get() > 0).then_some(actual.get() as f64 / estimated_rows.get() as f64)
+	});
+	Ok(JoinOrderRuntimeMeasurement {
+		replay_id,
+		summary,
+		actual_rows,
+		ratio,
+	})
+}
+
+fn optimizer_analyze_snowflake_runtime_row(
+	probe: &str,
+	edge: &JoinOrderEdgeEvidence,
+	dimension: &JoinOrderDimEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let measurement = join_order_runtime_measurement(edge, dimension.estimated_rows, summaries)?;
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] level={} dimension={}",
+			measurement.replay_id.0, probe, dimension.dimension
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"level={}; dimension={}; estimated={}; actual={}; ratio={}; source={}; build_rows={}; probe_rows={}",
+			probe,
+			dimension.dimension,
+			dimension.estimated_rows.get(),
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			join_order_estimate_source_label(dimension.estimate_source),
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get()
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			dimension.estimated_rows,
+			"estimated_rows",
+		)?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(measurement.ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(dimension.estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+// ADR 195: galaxy runtime rows are built at render time from 194's `galaxy_order` evidence plus the
+// observations already on the ANALYZE path — a view over the graph identity, not a second
+// representation. Additive: appended alongside whatever tree-receipt runtime rows the query produced.
+fn galaxy_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let Some(galaxy) = &render_trace.galaxy_order else {
+		return Ok(Vec::new());
+	};
+	let mut rows = vec![optimizer_analyze_galaxy_order_row(
+		galaxy,
+		render_trace.applied_galaxy_root.as_deref(),
+	)];
+	let by_target = galaxy
+		.edges
+		.iter()
+		.map(|edge| (edge.target, edge))
+		.collect::<BTreeMap<_, _>>();
+	let conformed_labels = galaxy
+		.conformed
+		.iter()
+		.map(|dim| dim.label.as_str())
+		.collect::<BTreeSet<_>>();
+	// Galaxy edges ARE `join_order_edges` by target, so the measurement reuses the snowflake machinery.
+	for edge in &render_trace.join_order_edges {
+		let Some(galaxy_edge) = by_target.get(&edge.target) else {
+			continue;
+		};
+		let Some(estimated) = edge.estimated_rows else {
+			continue;
+		};
+		let measurement = join_order_runtime_measurement(edge, estimated, summaries)?;
+		let conformed = conformed_labels.contains(galaxy_edge.left_label.as_str())
+			|| conformed_labels.contains(galaxy_edge.right_label.as_str());
+		rows.push(optimizer_analyze_galaxy_runtime_row(
+			galaxy_edge,
+			estimated,
+			edge.estimate_source,
+			&measurement,
+			conformed,
+		)?);
+	}
+	// ADR 197: the measured graph order verdict — judges the FROM order against the cost model's
+	// preference using the measured fact-to-pivot cardinalities.
+	if let Some(rec) = galaxy_order_recommendation(galaxy) {
+		let measured = galaxy_measured_costs(galaxy, &rec, summaries);
+		rows.push(graph_order_verdict_row(&rec, &measured));
+	}
+	Ok(rows)
+}
+
+// Measured fact-to-pivot output rows, via the galaxy edge connecting `fact` and `pivot`.
+fn galaxy_measured_fact_cost(
+	galaxy: &GalaxyOrderEvidence,
+	fact: &str,
+	pivot: &str,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<u128> {
+	let edge = galaxy.edges.iter().find(|edge| {
+		(edge.left_label == fact && edge.right_label == pivot)
+			|| (edge.left_label == pivot && edge.right_label == fact)
+	})?;
+	let replay_id = join_replay_id_for_trace_target(edge.target).ok()?;
+	summaries
+		.get(&replay_id)
+		.map(|summary| u128::from(summary.output_rows.get()))
+}
+
+// ADR 201: the per-fact measured costs that feed the galaxy order verdict — one `(fact, measured)` pair
+// per candidate root, the measured fact-to-pivot output rows. Shared by the EXPLAIN ANALYZE render row
+// and the sampled accrual path so they cannot drift.
+fn galaxy_measured_costs(
+	galaxy: &GalaxyOrderEvidence,
+	rec: &GraphOrderRecommendation,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Vec<(String, Option<u128>)> {
+	rec.costs
+		.iter()
+		.map(|(fact, _)| {
+			(
+				fact.clone(),
+				galaxy_measured_fact_cost(galaxy, fact, &rec.pivot, summaries),
+			)
+		})
+		.collect()
+}
+
+// ADR 201: the bridge measured costs — fact root = measured incoming `F⋈B` output rows (the candidate
+// that ran), dim root = the `B⋈D` outgoing edge estimate (the un-run counterfactual). Shared by render
+// and accrual. `None` when the bridge has no link.
+fn bridge_measured_costs(
+	bridge: &BridgeOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<Vec<(String, Option<u128>)>> {
+	let link = bridge.links.first()?;
+	let measured_fan_out = join_replay_id_for_trace_target(link.incoming_target)
+		.ok()
+		.and_then(|replay_id| summaries.get(&replay_id))
+		.map(|summary| u128::from(summary.output_rows.get()));
+	Some(vec![
+		(link.fact.clone(), measured_fan_out),
+		(
+			link.dim.clone(),
+			link.outgoing_edge_rows.map(|rows| u128::from(rows.get())),
+		),
+	])
+}
+
+// ADR 203/204: the bridge chain *compounded* measured costs — the path verdict, not an endcap verdict.
+//
+// The recommendation is a cheap entry-hop direction heuristic (drive from the cheaper end), deliberately
+// BLIND to the inter-bridge middles — the common terms that do not discriminate direction. The verdict's
+// whole job (D3) is to falsify that heuristic against realized cost, so it folds EVERY middle in: the
+// heuristic's blind spot is exactly where a chain explodes, and at N hops the explosion can sit in any
+// interior middle, not just the head's.
+//
+// The verdict stays a 2-way `F`-vs-`D` decision: this returns exactly TWO labelled costs for any N — the
+// middles compound into the two end costs, never into new ends. The declared `F`-end RAN (the AST left-deep
+// order drives from `F`), so its cost is the PEAK over the measured `F`-entry (`head.incoming_target`) and
+// every measured inter-bridge middle (each non-tail hop's `outgoing_target`). A measured explosion in ANY
+// interior middle lifts this peak above the counterfactual → `MissedWin`, which an endcap (or head-only)
+// cost would miss. The `D`-end did NOT run, so its cost is the ESTIMATED peak over the `D`-entry
+// (`tail.outgoing_edge_rows`) and every estimated middle — the single-bridge measured-vs-estimated shape of
+// `bridge_measured_costs`. `peak_all` is `None` if any term is unmeasured (no judging a chain without all
+// its middles). `None` when the chain has no hops.
+fn bridge_chain_measured_costs(
+	chain: &BridgeChainEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<Vec<(String, Option<u128>)>> {
+	let head = chain.hops.first()?;
+	let tail = chain.hops.last()?;
+	let measured = |target| {
+		join_replay_id_for_trace_target(target)
+			.ok()
+			.and_then(|replay_id| summaries.get(&replay_id))
+			.map(|summary| u128::from(summary.output_rows.get()))
+	};
+	let estimated = |rows: Option<RowCount>| rows.map(|rows| u128::from(rows.get()));
+	// Fold entry + all middles to the largest materialization (`max`, the 203 combinator); `None` if any
+	// term is unmeasured.
+	let peak_all = |terms: &[Option<u128>]| -> Option<u128> {
+		terms
+			.iter()
+			.copied()
+			.try_fold(0u128, |acc, term| Some(acc.max(term?)))
+	};
+	// The inter-bridge middles are every NON-TAIL hop's outgoing edge (`Bi⋈B_{i+1}`); the tail's outgoing is
+	// the `D`-entry. `hops.len() >= 2` is guaranteed by the recognizer, so `middles` is non-empty.
+	let middles = &chain.hops[..chain.hops.len() - 1];
+	let mut fact_terms = vec![measured(head.incoming_target)];
+	fact_terms.extend(middles.iter().map(|hop| measured(hop.outgoing_target)));
+	let mut dim_terms = vec![estimated(tail.outgoing_edge_rows)];
+	dim_terms.extend(middles.iter().map(|hop| estimated(hop.outgoing_edge_rows)));
+	Some(vec![
+		(head.fact.clone(), peak_all(&fact_terms)),
+		(tail.dim.clone(), peak_all(&dim_terms)),
+	])
+}
+
+// ADR 197: unified `join_order_graph_verdict` row — reuses the 180/184 `StarOrderVerdict` vocabulary.
+// `Vindicated` when the FROM order is the measured-optimal root, `MissedWin` when a reorder would have
+// won, `Indeterminate` when any candidate measurement is absent.
+// ADR 201: the authoritative graph order verdict classification, shared by the EXPLAIN ANALYZE render
+// row (`graph_order_verdict_row`) and the sampled accrual path (`measured_verdicts_from_summaries`).
+// `Indeterminate` when any candidate cost is unmeasured; else `Vindicated` iff the declared (FROM/applied)
+// root is the measured-optimal one, else `MissedWin`.
+pub(super) fn measured_graph_order_verdict(
+	rec: &GraphOrderRecommendation,
+	measured: &[(String, Option<u128>)],
+) -> StarOrderVerdict {
+	if measured.iter().any(|(_, cost)| cost.is_none()) {
+		return StarOrderVerdict::Indeterminate;
+	}
+	let measured_optimal = measured
+		.iter()
+		.min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+		.map(|(label, _)| label.clone())
+		.unwrap_or_default();
+	if rec.declared_root == measured_optimal {
+		StarOrderVerdict::Vindicated
+	} else {
+		StarOrderVerdict::MissedWin
+	}
+}
+
+fn graph_order_verdict_row(
+	rec: &GraphOrderRecommendation,
+	measured: &[(String, Option<u128>)],
+) -> Vec<ScalarValue> {
+	let verdict = measured_graph_order_verdict(rec, measured);
+	let recommendation = match rec.action {
+		StarOrderAction::Reordered => "WOULD_REORDER_ROOT_FACT",
+		_ => "KEEP_DECLARED",
+	};
+	let measured_label = measured
+		.iter()
+		.map(|(label, cost)| {
+			format!(
+				"{label}:{}",
+				cost.map(|value| value.to_string())
+					.unwrap_or_else(|| "missing".to_string())
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(",");
+	vec![
+		ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())),
+		ScalarValue::Utf8(Some(format!("pivot={}", rec.pivot))),
+		ScalarValue::Utf8(Some(star_order_verdict_label(verdict).to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"declared_root={}; preferred_root={}; recommendation={recommendation}; measured=[{measured_label}]",
+			rec.declared_root, rec.preferred_root
+		))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_galaxy_order_row(
+	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence, applied_root))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+// ADR 196: bridge runtime rows — the M:N fan-out made real. The fan-out ratio is `output_rows /
+// probe_rows` at each bridge-incident edge (distinct from 195's estimate-accuracy ratio), skipped when
+// `probe_rows == 0`. Reuses 195's per-replay-id measurement machinery.
+fn bridge_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let Some(bridge) = &render_trace.bridge_order else {
+		return Ok(Vec::new());
+	};
+	let mut rows = vec![optimizer_analyze_bridge_order_row(
+		bridge,
+		render_trace.applied_bridge_root.as_deref(),
+	)];
+	for link in &bridge.links {
+		for (target, role) in [
+			(link.incoming_target, "fact_to_bridge"),
+			(link.outgoing_target, "bridge_to_dim"),
+		] {
+			let Some(edge) = render_trace
+				.join_order_edges
+				.iter()
+				.find(|edge| edge.target == target)
+			else {
+				continue;
+			};
+			let Some(estimated) = edge.estimated_rows else {
+				continue;
+			};
+			let measurement = join_order_runtime_measurement(edge, estimated, summaries)?;
+			rows.push(optimizer_analyze_bridge_runtime_row(
+				link,
+				edge,
+				role,
+				estimated,
+				&measurement,
+			)?);
+		}
+	}
+	// ADR 197/199: the bridge measured verdict, keyed by relation root (ADR 199). The candidate that
+	// actually ran is the fact root `F`, so its measured cost is the incoming edge's measured output (the
+	// materialized `F⋈B` fan-out); the dimension root `D` is the un-run counterfactual, costed by the
+	// `B⋈D` outgoing edge estimate. A measured fan-out above the `D`-root estimate reorders (`MissedWin`).
+	// ADR 205: suppressed for a chain — its authoritative chain verdict replaces the partial first-junction
+	// bridge verdict (the 3-way partition on the verdict surface). Per-junction runtime rows above remain.
+	if render_trace.bridge_chain_order.is_none() {
+		if let Some(rec) = bridge_order_recommendation(bridge) {
+			if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+				rows.push(graph_order_verdict_row(&rec, &measured));
+			}
+		}
+	}
+	// ADR 203: the chain measured verdict — the compounded path scorer fed the measured per-hop fan-out.
+	// ADR 206: an actuated chain judges the reversed (applied) order via `reverse_chain_evidence`; a kept
+	// chain judges its AST order. Additive beside the per-junction bridge verdict above.
+	if let Some(chain) = &render_trace.bridge_chain_order {
+		let judged = if render_trace.applied_bridge_chain_root.is_some() {
+			reverse_chain_evidence(chain, &render_trace.join_order_edges)
+		} else {
+			Some(chain.clone())
+		};
+		if let Some(chain) = judged {
+			if let Some(rec) = bridge_chain_order_recommendation(&chain) {
+				if let Some(measured) = bridge_chain_measured_costs(&chain, summaries) {
+					rows.push(graph_order_verdict_row(&rec, &measured));
+				}
+			}
+		}
+	}
+	Ok(rows)
+}
+
+fn optimizer_analyze_bridge_order_row(
+	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence, applied_root))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_bridge_runtime_row(
+	link: &BridgeLink,
+	edge: &JoinOrderEdgeEvidence,
+	role: &str,
+	estimated_rows: RowCount,
+	measurement: &JoinOrderRuntimeMeasurement,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let probe_rows = measurement.summary.probe_rows.get();
+	let output_rows = measurement.summary.output_rows.get();
+	// Fan-out is the M:N explosion: skipped when there is no probe-side denominator.
+	let fan_out = (probe_rows > 0).then(|| output_rows as f64 / probe_rows as f64);
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_bridge_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] {}->{}",
+			measurement.replay_id.0,
+			edge.probe.as_deref().unwrap_or("?"),
+			edge.dimension.as_deref().unwrap_or("?"),
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"bridge={}; role={}; output_rows={}; probe_rows={}; build_rows={}; fan_out={}",
+			link.bridge,
+			role,
+			output_rows,
+			probe_rows,
+			measurement.summary.build_rows.get(),
+			fan_out
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(fan_out),
+		ScalarValue::Utf8(Some(role.to_string())),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+fn optimizer_analyze_galaxy_runtime_row(
+	edge: &GalaxyEdgeEvidence,
+	estimated_rows: RowCount,
+	estimate_source: JoinOrderEstimateSource,
+	measurement: &JoinOrderRuntimeMeasurement,
+	conformed: bool,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let left_sig = edge.left_key_signature.join("+");
+	let right_sig = edge.right_key_signature.join("+");
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_galaxy_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] {}->{}",
+			measurement.replay_id.0, edge.left_label, edge.right_label
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"{}->{} on {}={}; estimated={}; actual={}; ratio={}; build_rows={}; probe_rows={}; strategy={}; placement={}; conformed={}",
+			edge.left_label,
+			edge.right_label,
+			left_sig,
+			right_sig,
+			estimated_rows.get(),
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get(),
+			join_strategy_label(edge.strategy),
+			join_physical_placement_label(edge.placement),
+			conformed,
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(measurement.ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+fn flatten_snowflake_dimensions(
+	evidence: &SnowflakeOrderEvidence,
+) -> BTreeMap<String, (String, JoinOrderDimEvidence)> {
+	let mut dimensions = BTreeMap::new();
+	collect_snowflake_dimensions(evidence, &mut dimensions);
+	dimensions
+}
+
+fn collect_snowflake_dimensions(
+	evidence: &SnowflakeOrderEvidence,
+	dimensions: &mut BTreeMap<String, (String, JoinOrderDimEvidence)>,
+) {
+	for dimension in &evidence.ranking.dimensions {
+		dimensions.insert(
+			dimension.dimension.clone(),
+			(evidence.ranking.probe.clone(), dimension.clone()),
+		);
+	}
+	for branch in &evidence.branches {
+		collect_snowflake_dimensions(&branch.evidence, dimensions);
+	}
+}
+
+fn optimizer_analyze_join_order_verdict_row(
+	evidence: &StarOrderEvidence,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let verdict = measured_star_order_verdict(evidence, measured_rows_by_dimension);
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_verdict".to_string())),
+		ScalarValue::Utf8(Some("star_path".to_string())),
+		ScalarValue::Utf8(Some(star_order_verdict_label(verdict.verdict).to_string())),
+		ScalarValue::Utf8(Some(star_order_verdict_detail_label(evidence, &verdict))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+fn optimizer_analyze_snowflake_verdict_row(level: &SnowflakeLevelVerdict) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string())),
+		ScalarValue::Utf8(Some(format!("level={}", level.probe))),
+		ScalarValue::Utf8(Some(
+			snowflake_order_verdict_label(level.verdict).to_string(),
+		)),
+		ScalarValue::Utf8(Some(snowflake_order_verdict_detail_label(level))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_snowflake_aggregate_verdict_row(
+	verdict: &SnowflakeOrderVerdict,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string())),
+		ScalarValue::Utf8(Some("snowflake".to_string())),
+		ScalarValue::Utf8(Some(
+			snowflake_order_verdict_label(verdict.aggregate).to_string(),
+		)),
+		ScalarValue::Utf8(Some(snowflake_order_aggregate_verdict_detail_label(
+			verdict,
+		))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn join_replay_id_for_trace_target(target: JoinTraceTarget) -> Result<JoinReplayId, BindingError> {
+	u32::try_from(target.join_index)
+		.map(JoinReplayId)
+		.map_err(|_| BindingError::UnsupportedExpression {
+			message: "optimizer analyze join replay id exceeds u32".to_string(),
+		})
+}
+
+pub(super) fn optimizer_explain_row(
+	receipt: &DecisionReceipt,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let (build_side, build_bytes, threshold_bytes, rejected_side_bytes) =
+		optimizer_explain_build_columns(receipt)?;
+	Ok(vec![
+		ScalarValue::Utf8(Some("join".to_string())),
+		ScalarValue::Utf8(Some(join_target_label(receipt.target)?)),
+		ScalarValue::Utf8(Some(join_strategy_label(receipt.strategy).to_string())),
+		ScalarValue::Utf8(Some(join_strategy_decision_detail_label(receipt))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(build_side.map(str::to_string)),
+		ScalarValue::Int64(build_bytes),
+		ScalarValue::Int64(threshold_bytes),
+		ScalarValue::Int64(rejected_side_bytes),
+	])
+}
+
+pub(super) fn optimizer_explain_outer_join_demotion_row(
+	receipt: &OuterJoinDemotionReceipt,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let mut detail = format!("null_rejecting_filter:{}", receipt.conjunct_text);
+	if !receipt.propagation_path.is_empty() {
+		let path = receipt
+			.propagation_path
+			.iter()
+			.map(JoinSideStep::label)
+			.collect::<Vec<_>>()
+			.join(".");
+		detail.push_str(";propagated_path:");
+		detail.push_str(&path);
+	}
+	Ok(vec![
+		ScalarValue::Utf8(Some("outer_join_demotion".to_string())),
+		ScalarValue::Utf8(Some("prebind".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"{}->{}",
+			join_kind_label(receipt.from_kind),
+			join_kind_label(receipt.to_kind)
+		))),
+		ScalarValue::Utf8(Some(detail)),
+		ScalarValue::Utf8(Some(receipt.conjunct_text.clone())),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+pub(super) fn join_kind_label(kind: JoinKind) -> &'static str {
+	match kind {
+		JoinKind::Inner => "inner",
+		JoinKind::LeftOuter => "left_outer",
+		JoinKind::RightOuter => "right_outer",
+		JoinKind::FullOuter => "full_outer",
+		JoinKind::LeftSemi => "left_semi",
+		JoinKind::RightSemi => "right_semi",
+		JoinKind::LeftAnti => "left_anti",
+		JoinKind::RightAnti => "right_anti",
+		JoinKind::Cross => "cross",
+	}
+}
+
+pub(super) fn optimizer_explain_join_order_row(
+	outcome: &StarOrderOutcome,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order".to_string())),
+		ScalarValue::Utf8(Some(join_order_target_label(outcome)?)),
+		ScalarValue::Utf8(Some(join_order_outcome_label(outcome).to_string())),
+		ScalarValue::Utf8(Some(join_order_detail_label(outcome))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+pub(super) fn optimizer_explain_snowflake_order_row(
+	evidence: &SnowflakeOrderEvidence,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(snowflake_order_outcome_label(evidence).to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_detail_label(evidence))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+// ADR 194: the galaxy graph evidence row — a gauge, not a steer. It names the conformed dimension(s),
+// the incident relations, the component count, and the role-neutral edge list. `outcome=observed`
+// because 194 recognizes the graph without ordering or actuating it.
+pub(super) fn optimizer_explain_galaxy_order_row(
+	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence, applied_root))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+// ADR 196: the bridge graph evidence row — a gauge naming each many-to-many junction and its estimated
+// fan-out. `outcome=observed`; 196 recognizes the junction without ordering or actuating it.
+pub(super) fn optimizer_explain_bridge_order_row(
+	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence, applied_root))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+pub(super) fn bridge_fan_out_ratio(link: &BridgeLink) -> f64 {
+	// `fact_rows > 0` is guaranteed by the recognizer's zero-denominator decline.
+	link.bridge_rows.get() as f64 / link.fact_rows.get() as f64
+}
+
+// ADR 203/204: the bridge chain path label, `chain[F->B1->…->Bk->D]` — the head fact, every hop's bridge,
+// then the tail dim. (203 hardcoded the 2-hop shape and dropped interior bridges.)
+pub(super) fn bridge_chain_order_target_label(chain: &BridgeChainEvidence) -> String {
+	let (Some(head), Some(tail)) = (chain.hops.first(), chain.hops.last()) else {
+		return "chain[]".to_string();
+	};
+	let mut path = vec![head.fact.as_str()];
+	path.extend(chain.hops.iter().map(|hop| hop.bridge.as_str()));
+	path.push(tail.dim.as_str());
+	format!("chain[{}]", path.join("->"))
+}
+
+// ADR 203/205: the per-hop signatures + the path-ordering recommendation (declared/preferred end, action,
+// per-end costs). When `applied_root` is set (ADR 205 actuation), the receipt shows the applied reversal.
+pub(super) fn bridge_chain_order_detail_label(
+	chain: &BridgeChainEvidence,
+	applied_root: Option<&str>,
+) -> String {
+	let hops = chain
+		.hops
+		.iter()
+		.map(|hop| {
+			format!(
+				"{} on {}={} and {}={}",
+				hop.bridge,
+				hop.b_in_signature.join("+"),
+				hop.fact,
+				hop.b_out_signature.join("+"),
+				hop.dim,
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ");
+	let order = match applied_root {
+		// ADR 205: actuation fired — the receipt shows the applied reversal, not the reversed chain's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = bridge_chain_order_recommendation(chain)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => bridge_chain_order_recommendation(chain)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	};
+	format!("{hops}{order}")
+}
+
+// ADR 203/205: the bridge chain cockpit row — `observed` until actuation fires, then `reordered`.
+pub(super) fn optimizer_explain_bridge_chain_row(
+	chain: &BridgeChainEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())),
+		ScalarValue::Utf8(Some(bridge_chain_order_target_label(chain))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_chain_order_detail_label(chain, applied_root))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+pub(super) fn bridge_order_target_label(evidence: &BridgeOrderEvidence) -> String {
+	let links = evidence
+		.links
+		.iter()
+		.map(|link| format!("{}->{}->{}", link.fact, link.bridge, link.dim))
+		.collect::<Vec<_>>()
+		.join(",");
+	format!("bridge[{links}]")
+}
+
+pub(super) fn bridge_order_detail_label(
+	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
+) -> String {
+	let links = evidence
+		.links
+		.iter()
+		.map(|link| {
+			format!(
+				"{} on {}={} and {}={}; fan_out={:.6}",
+				link.bridge,
+				link.b_in_signature.join("+"),
+				link.fact,
+				link.b_out_signature.join("+"),
+				link.dim,
+				bridge_fan_out_ratio(link),
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ");
+	let order = match applied_root {
+		// ADR 199: actuation fired — the receipt shows the applied re-root, not the re-rooted bridge's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = bridge_order_recommendation(evidence)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => bridge_order_recommendation(evidence)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	};
+	format!("{links}{order}")
+}
+
+pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> String {
+	let conformed = evidence
+		.conformed
+		.iter()
+		.map(|dim| dim.label.clone())
+		.collect::<Vec<_>>()
+		.join(",");
+	let facts = evidence
+		.conformed
+		.iter()
+		.flat_map(|dim| dim.incident_relations.iter().cloned())
+		.collect::<std::collections::BTreeSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>()
+		.join(",");
+	format!("galaxy[conformed={conformed}; relations=[{facts}]]")
+}
+
+pub(super) fn galaxy_order_detail_label(
+	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
+) -> String {
+	let conformed = evidence
+		.conformed
+		.iter()
+		.map(|dim| {
+			format!(
+				"{}:{}->[{}]",
+				dim.label,
+				dim.key_signature.join("+"),
+				dim.incident_relations.join(",")
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ");
+	let edges = evidence
+		.edges
+		.iter()
+		.map(|edge| {
+			format!(
+				"{}->{} on {}={} {}/{}",
+				edge.left_label,
+				edge.right_label,
+				edge.left_key_signature.join("+"),
+				edge.right_key_signature.join("+"),
+				join_strategy_label(edge.strategy),
+				join_physical_placement_label(edge.placement),
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ");
+	let order = match applied_root {
+		// ADR 198: actuation fired — the receipt shows the applied re-root, not the re-rooted galaxy's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = galaxy_order_recommendation(evidence)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => galaxy_order_recommendation(evidence)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	};
+	format!(
+		"conformed=[{conformed}]; components={}; edges=[{edges}]{order}",
+		evidence.component_count,
+	)
+}
+
+// ADR 197: the observe-only order recommendation appended to a graph evidence detail. It says what the
+// cost model would prefer; it never rewrites the plan.
+pub(super) fn graph_order_recommendation_label(rec: &GraphOrderRecommendation) -> String {
+	let costs = rec
+		.costs
+		.iter()
+		.map(|(label, cost)| format!("{label}:{cost}"))
+		.collect::<Vec<_>>()
+		.join(",");
+	format!(
+		"; declared_root={}; preferred_root={}; action={}; costs=[{costs}]",
+		rec.declared_root,
+		rec.preferred_root,
+		star_order_action_label(rec.action),
+	)
+}
+
+fn optimizer_analyze_snowflake_order_row(evidence: &SnowflakeOrderEvidence) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(snowflake_order_outcome_label(evidence).to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_detail_label(evidence))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+pub(super) fn optimizer_explain_scan_filter_row(
+	receipt: &ScanFilterReceipt,
+	render_receipt: Option<&ScanFilterRenderReceipt>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("scan_filter".to_string())),
+		ScalarValue::Utf8(Some(scan_filter_target_label(receipt.target)?)),
+		ScalarValue::Utf8(Some(scan_filter_outcome_label(
+			receipt.outcome,
+			receipt.converted_pushdown,
+		))),
+		ScalarValue::Utf8(Some(profile_hint_label(receipt.profile_hint).to_string())),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.predicate_text.clone())),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.pushed_predicate_text.clone())),
+		ScalarValue::Utf8(
+			render_receipt.and_then(|receipt| receipt.residual_predicate_text.clone()),
+		),
+		ScalarValue::Int64(
+			receipt
+				.estimated_rows
+				.map(|rows| row_count_to_i64(rows, "estimated_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Utf8(receipt.spent_fact.map(spent_fact_label).map(str::to_string)),
+		ScalarValue::Utf8(receipt.spent_column.map(column_ordinal_label).transpose()?),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.spent_column_name.clone())),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+pub(super) fn optimizer_explain_build_columns(
+	receipt: &DecisionReceipt,
+) -> Result<(Option<&'static str>, Option<i64>, Option<i64>, Option<i64>), BindingError> {
+	match receipt.reason {
+		JoinStrategyDecisionReason::BroadcastInferred {
+			build_side,
+			build_bytes,
+			threshold,
+			rejected_side_bytes,
+		} => Ok((
+			Some(broadcast_build_side_label(build_side)),
+			Some(byte_count_to_i64(build_bytes, "build_bytes")?),
+			Some(byte_count_to_i64(threshold, "threshold_bytes")?),
+			rejected_side_bytes
+				.map(|bytes| byte_count_to_i64(bytes, "rejected_side_bytes"))
+				.transpose()?,
+		)),
+		JoinStrategyDecisionReason::BroadcastEstimated {
+			build_side,
+			estimated_byte_size,
+			threshold,
+			rejected_side_bytes,
+		} => Ok((
+			Some(broadcast_build_side_label(build_side)),
+			Some(byte_count_to_i64(estimated_byte_size, "build_bytes")?),
+			Some(byte_count_to_i64(threshold, "threshold_bytes")?),
+			rejected_side_bytes
+				.map(|bytes| byte_count_to_i64(bytes, "rejected_side_bytes"))
+				.transpose()?,
+		)),
+		JoinStrategyDecisionReason::PinnedByAuthor
+			if receipt.strategy == JoinStrategy::Broadcast =>
+		{
+			Ok((
+				Some(match receipt.placement {
+					JoinPhysicalPlacement::Natural => "left",
+					JoinPhysicalPlacement::SwappedRightBuild => "right",
+				}),
+				None,
+				None,
+				None,
+			))
+		}
+		JoinStrategyDecisionReason::ScalarBroadcastCross => Ok((
+			Some(match receipt.placement {
+				JoinPhysicalPlacement::Natural => "left",
+				JoinPhysicalPlacement::SwappedRightBuild => "right",
+			}),
+			None,
+			None,
+			None,
+		)),
+		JoinStrategyDecisionReason::HashSmallerBuild {
+			build_bytes,
+			rejected_side_bytes,
+			..
+		} => Ok((
+			Some("right"),
+			Some(byte_count_to_i64(build_bytes, "build_bytes")?),
+			None,
+			Some(byte_count_to_i64(
+				rejected_side_bytes,
+				"rejected_side_bytes",
+			)?),
+		)),
+		JoinStrategyDecisionReason::PinnedByAuthor
+		| JoinStrategyDecisionReason::HashByDefault { .. }
+		| JoinStrategyDecisionReason::ScalarLocalCross => Ok((None, None, None, None)),
+	}
+}
+
+pub(super) fn join_strategy_label(strategy: JoinStrategy) -> &'static str {
+	match strategy {
+		JoinStrategy::HashPartitioned => "hash_partitioned",
+		JoinStrategy::Broadcast => "broadcast",
+	}
+}
+
+pub(super) fn join_target_label(target: JoinTraceTarget) -> Result<String, BindingError> {
+	Ok(format!(
+		"join[{}]",
+		usize_to_i64(target.join_index, "join_index")?
+	))
+}
+
+pub(super) fn join_physical_placement_label(placement: JoinPhysicalPlacement) -> &'static str {
+	match placement {
+		JoinPhysicalPlacement::Natural => "natural",
+		JoinPhysicalPlacement::SwappedRightBuild => "swapped_right_build",
+	}
+}
+
+pub(super) fn join_strategy_decision_reason_label(
+	reason: &JoinStrategyDecisionReason,
+) -> &'static str {
+	match reason {
+		JoinStrategyDecisionReason::PinnedByAuthor => "pinned_by_author",
+		JoinStrategyDecisionReason::BroadcastInferred { .. } => "broadcast_inferred",
+		JoinStrategyDecisionReason::BroadcastEstimated { .. } => "broadcast_estimated",
+		JoinStrategyDecisionReason::HashByDefault { .. } => "hash_by_default",
+		JoinStrategyDecisionReason::HashSmallerBuild { .. } => "hash_smaller_build",
+		JoinStrategyDecisionReason::ScalarLocalCross => "scalar_local_cross",
+		JoinStrategyDecisionReason::ScalarBroadcastCross => "scalar_broadcast_cross",
+	}
+}
+
+pub(super) fn join_strategy_decision_reason_detail(
+	reason: &JoinStrategyDecisionReason,
+) -> Option<String> {
+	match reason {
+		JoinStrategyDecisionReason::HashByDefault { reason } => {
+			Some(hash_by_default_reason_label(*reason))
+		}
+		JoinStrategyDecisionReason::HashSmallerBuild { fallback, .. } => {
+			Some(hash_by_default_reason_label(*fallback))
+		}
+		JoinStrategyDecisionReason::PinnedByAuthor
+		| JoinStrategyDecisionReason::BroadcastInferred { .. }
+		| JoinStrategyDecisionReason::BroadcastEstimated { .. }
+		| JoinStrategyDecisionReason::ScalarLocalCross
+		| JoinStrategyDecisionReason::ScalarBroadcastCross => None,
+	}
+}
+
+pub(super) fn join_strategy_decision_detail_label(receipt: &DecisionReceipt) -> String {
+	let placement = join_physical_placement_label(receipt.placement);
+	let reason = join_strategy_decision_reason_label(&receipt.reason);
+	match join_strategy_decision_reason_detail(&receipt.reason) {
+		Some(detail) => format!("{placement}:{reason}:{detail}"),
+		None => format!("{placement}:{reason}"),
+	}
+}
+
+pub(super) fn hash_by_default_reason_label(reason: HashByDefaultReason) -> String {
+	match reason {
+		HashByDefaultReason::AutoBroadcastDisabled => "auto_broadcast_disabled".to_string(),
+		HashByDefaultReason::NonInnerJoin => "non_inner_join".to_string(),
+		HashByDefaultReason::LeftInputNotSingleBaseRelation => {
+			"left_input_not_single_base_relation".to_string()
+		}
+		HashByDefaultReason::RightInputNotSingleBaseRelation => {
+			"right_input_not_single_base_relation".to_string()
+		}
+		HashByDefaultReason::ProbeNotScanLinear(fence) => {
+			format!("probe_not_scan_linear:{}", fence.label())
+		}
+		HashByDefaultReason::MissingBuildByteUpperBound => {
+			"missing_build_byte_upper_bound".to_string()
+		}
+		HashByDefaultReason::BuildByteUpperBoundAboveThreshold => {
+			"build_byte_upper_bound_above_threshold".to_string()
+		}
+		HashByDefaultReason::HashAfterBroadcastCap => "hash_after_broadcast_cap".to_string(),
+	}
+}
+
+pub(super) fn join_order_target_label(outcome: &StarOrderOutcome) -> Result<String, BindingError> {
+	Ok(match outcome {
+		StarOrderOutcome::Recognized(evidence) => format!("star[probe={}]", evidence.probe),
+		StarOrderOutcome::Declined(decline) => format!(
+			"star_candidate[edges={}]",
+			usize_to_i64(decline.edge_count, "join_order_edge_count")?
+		),
+	})
+}
+
+pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static str {
+	match outcome {
+		StarOrderOutcome::Recognized(evidence) => star_order_action_label(evidence.action),
+		StarOrderOutcome::Declined(decline) => star_order_decline_outcome_label(decline.reason),
+	}
+}
+
+pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
+	match outcome {
+		StarOrderOutcome::Recognized(evidence) => format!(
+			"strategy={}; strategies=[{}]; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]",
+			star_order_strategy_label(evidence.strategy),
+			evidence
+				.edge_strategies
+				.iter()
+				.map(|(label, strategy, placement)| format!(
+					"{label}:{}/{}",
+					join_strategy_label(*strategy),
+					join_physical_placement_label(*placement)
+				))
+				.collect::<Vec<_>>()
+				.join(","),
+			evidence
+				.dimensions
+				.iter()
+				.map(|dim| dim.dimension.as_str())
+				.collect::<Vec<_>>()
+				.join(","),
+			evidence.declared_order.join(","),
+			evidence.cost_preferred_order.join(","),
+			evidence.applied_order.join(","),
+			evidence.declared_cost,
+			evidence.preferred_cost,
+			join_order_estimate_confidence_label(evidence.confidence),
+			evidence.applied_margin.label(),
+			evidence
+				.dimensions
+				.iter()
+				.map(|dim| format!(
+					"{}:{}:{}:{}",
+					dim.dimension,
+					dim.estimated_rows.get(),
+					join_order_estimate_source_label(dim.estimate_source),
+					join_order_estimate_confidence_label(dim.confidence)
+				))
+				.collect::<Vec<_>>()
+				.join(",")
+		),
+		StarOrderOutcome::Declined(decline) => {
+			format!(
+				"reason={}; edges={}",
+				star_order_decline_reason_label(decline.reason),
+				decline.edge_count
+			)
+		}
+	}
+}
+
+pub(super) fn snowflake_order_target_label(evidence: &SnowflakeOrderEvidence) -> String {
+	format!("snowflake[probe={}]", evidence.ranking.probe)
+}
+
+pub(super) fn snowflake_order_outcome_label(evidence: &SnowflakeOrderEvidence) -> &'static str {
+	if snowflake_order_would_reorder(evidence) {
+		"would_reorder"
+	} else {
+		"would_keep_declared"
+	}
+}
+
+fn snowflake_order_would_reorder(evidence: &SnowflakeOrderEvidence) -> bool {
+	evidence.ranking.action == StarOrderAction::Reordered
+		|| evidence
+			.branches
+			.iter()
+			.any(|branch| snowflake_order_would_reorder(&branch.evidence))
+}
+
+pub(super) fn snowflake_order_detail_label(evidence: &SnowflakeOrderEvidence) -> String {
+	snowflake_order_level_detail_label(evidence)
+}
+
+fn snowflake_order_level_detail_label(evidence: &SnowflakeOrderEvidence) -> String {
+	let ranking = &evidence.ranking;
+	format!(
+		"root={}; action={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]; strategies=[{}]; branches=[{}]",
+		ranking.probe,
+		snowflake_order_action_label(ranking.action),
+		ranking
+			.dimensions
+			.iter()
+			.map(|dim| dim.dimension.as_str())
+			.collect::<Vec<_>>()
+			.join(","),
+		ranking.declared_order.join(","),
+		ranking.cost_preferred_order.join(","),
+		ranking.declared_cost,
+		ranking.preferred_cost,
+		join_order_estimate_confidence_label(ranking.confidence),
+		ranking.applied_margin.label(),
+		ranking
+			.dimensions
+			.iter()
+			.map(|dim| format!(
+				"{}:{}:{}:{}",
+				dim.dimension,
+				dim.estimated_rows.get(),
+				join_order_estimate_source_label(dim.estimate_source),
+				join_order_estimate_confidence_label(dim.confidence)
+			))
+			.collect::<Vec<_>>()
+			.join(","),
+		evidence
+			.edge_strategies
+			.iter()
+			.map(snowflake_edge_strategy_label)
+			.collect::<Vec<_>>()
+			.join(","),
+		evidence
+			.branches
+			.iter()
+			.map(|branch| format!(
+				"{}:{{{}}}",
+				branch.dimension,
+				snowflake_order_level_detail_label(&branch.evidence)
+			))
+			.collect::<Vec<_>>()
+			.join("|")
+	)
+}
+
+fn snowflake_edge_strategy_label(strategy: &SnowflakeEdgeStrategy) -> String {
+	format!(
+		"{}:{}/{}:scan_linear={}",
+		strategy.dimension,
+		join_strategy_label(strategy.strategy),
+		join_physical_placement_label(strategy.placement),
+		strategy.probe_linearity.is_linear()
+	)
+}
+
+fn snowflake_order_action_label(action: StarOrderAction) -> &'static str {
+	match action {
+		StarOrderAction::Reordered => "would_reorder",
+		StarOrderAction::KeptAlreadyOptimal | StarOrderAction::KeptInsufficientMargin => {
+			"would_keep_declared"
+		}
+	}
+}
+
+fn snowflake_order_verdict_label(verdict: SnowflakeOrderVerdictKind) -> &'static str {
+	match verdict {
+		SnowflakeOrderVerdictKind::Vindicated => "vindicated",
+		SnowflakeOrderVerdictKind::MissedWin => "missed_win",
+		SnowflakeOrderVerdictKind::Indeterminate => "indeterminate",
+	}
+}
+
+fn snowflake_order_recommendation_label(
+	recommendation: SnowflakeOrderRecommendation,
+) -> &'static str {
+	match recommendation {
+		SnowflakeOrderRecommendation::KeepDeclared => "KEEP_DECLARED",
+		SnowflakeOrderRecommendation::WouldReorder => "WOULD_REORDER",
+		SnowflakeOrderRecommendation::NoRecommendation => "NO_RECOMMENDATION",
+	}
+}
+
+fn snowflake_order_verdict_detail_label(level: &SnowflakeLevelVerdict) -> String {
+	let measured = level.rerank.measured_ranking.as_ref();
+	let measured_action = measured
+		.map(|ranking| star_order_action_label(ranking.action))
+		.unwrap_or("missing");
+	let measured_declared_cost = measured
+		.map(|ranking| ranking.declared_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let measured_preferred_cost = measured
+		.map(|ranking| ranking.preferred_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"estimated_action={}; measured_action={}; recommendation={}; declared_order=[{}]; estimated_preferred_order=[{}]; measured_applied_order=[{}]; estimated_declared_cost={}; estimated_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]; strategies=[{}]",
+		star_order_action_label(level.estimated_ranking.action),
+		measured_action,
+		snowflake_order_recommendation_label(level.recommendation),
+		level.estimated_ranking.declared_order.join(","),
+		level.estimated_ranking.cost_preferred_order.join(","),
+		level.rerank.measured_applied_order.join(","),
+		level.estimated_ranking.declared_cost,
+		level.estimated_ranking.preferred_cost,
+		measured_declared_cost,
+		measured_preferred_cost,
+		level
+			.rerank
+			.accuracy
+			.iter()
+			.map(star_order_dim_accuracy_label)
+			.collect::<Vec<_>>()
+			.join(","),
+		level
+			.strategies
+			.iter()
+			.map(snowflake_edge_strategy_label)
+			.collect::<Vec<_>>()
+			.join(",")
+	)
+}
+
+fn snowflake_order_aggregate_verdict_detail_label(verdict: &SnowflakeOrderVerdict) -> String {
+	format!(
+		"recommendation={}; levels=[{}]",
+		snowflake_order_recommendation_label(verdict.recommendation),
+		verdict
+			.levels
+			.iter()
+			.map(|level| format!(
+				"{}:{}",
+				level.probe,
+				snowflake_order_verdict_label(level.verdict)
+			))
+			.collect::<Vec<_>>()
+			.join(",")
+	)
+}
+
+pub(super) fn star_order_strategy_label(strategy: StarOrderStrategy) -> &'static str {
+	match strategy {
+		StarOrderStrategy::Broadcast => "broadcast",
+		StarOrderStrategy::HashPartitioned => "hash_partitioned",
+		StarOrderStrategy::Mixed => "mixed",
+	}
+}
+
+pub(super) fn star_order_action_label(action: StarOrderAction) -> &'static str {
+	match action {
+		StarOrderAction::Reordered => "reordered",
+		StarOrderAction::KeptAlreadyOptimal => "kept_already_optimal",
+		StarOrderAction::KeptInsufficientMargin => "kept_insufficient_margin",
+	}
+}
+
+pub(super) fn star_order_verdict_label(verdict: StarOrderVerdict) -> &'static str {
+	match verdict {
+		StarOrderVerdict::Vindicated => "vindicated",
+		StarOrderVerdict::MisRanked => "mis_ranked",
+		StarOrderVerdict::MissedWin => "missed_win",
+		StarOrderVerdict::OverEager => "over_eager",
+		StarOrderVerdict::Indeterminate => "indeterminate",
+	}
+}
+
+pub(super) fn star_order_verdict_recommendation_label(
+	recommendation: StarOrderVerdictRecommendation,
+) -> &'static str {
+	match recommendation {
+		StarOrderVerdictRecommendation::KeepApplied => "KEEP_APPLIED",
+		StarOrderVerdictRecommendation::WouldReorder => "WOULD_REORDER",
+		StarOrderVerdictRecommendation::WouldKeepDeclared => "WOULD_KEEP_DECLARED",
+		StarOrderVerdictRecommendation::NoRecommendation => "NO_RECOMMENDATION",
+	}
+}
+
+fn star_order_verdict_detail_label(
+	evidence: &StarOrderEvidence,
+	verdict: &StarOrderVerdictReceipt,
+) -> String {
+	let measured = verdict.measured_evidence.as_ref();
+	let measured_action = measured
+		.map(|evidence| star_order_action_label(evidence.action))
+		.unwrap_or("missing");
+	let measured_declared_cost = measured
+		.map(|evidence| evidence.declared_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let measured_preferred_cost = measured
+		.map(|evidence| evidence.preferred_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"strategy={}; applied_order=[{}]; measured_applied_order=[{}]; original_action={}; measured_action={}; recommendation={}; original_declared_cost={}; original_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]",
+		star_order_strategy_label(evidence.strategy),
+		evidence.applied_order.join(","),
+		verdict.measured_applied_order.join(","),
+		star_order_action_label(evidence.action),
+		measured_action,
+		star_order_verdict_recommendation_label(verdict.recommendation),
+		evidence.declared_cost,
+		evidence.preferred_cost,
+		measured_declared_cost,
+		measured_preferred_cost,
+		verdict
+			.accuracy
+			.iter()
+			.map(star_order_dim_accuracy_label)
+			.collect::<Vec<_>>()
+			.join(",")
+	)
+}
+
+fn star_order_dim_accuracy_label(accuracy: &StarOrderDimAccuracy) -> String {
+	let actual = accuracy
+		.actual_rows
+		.map(|rows| rows.get().to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let ratio = accuracy
+		.actual_rows
+		.and_then(|actual| {
+			(accuracy.estimated_rows.get() > 0)
+				.then_some(actual.get() as f64 / accuracy.estimated_rows.get() as f64)
+		})
+		.map(|value| format!("{value:.6}"))
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"{}:estimated={}:actual={}:ratio={}:accuracy={}",
+		accuracy.dimension,
+		accuracy.estimated_rows.get(),
+		actual,
+		ratio,
+		star_order_dim_accuracy_kind_label(accuracy)
+	)
+}
+
+fn star_order_dim_accuracy_kind_label(accuracy: &StarOrderDimAccuracy) -> &'static str {
+	let Some(actual_rows) = accuracy.actual_rows else {
+		return "missing";
+	};
+	if actual_rows == accuracy.estimated_rows {
+		"accurate"
+	} else if actual_rows.get() > accuracy.estimated_rows.get() {
+		"under_estimate"
+	} else {
+		"over_estimate"
+	}
+}
+
+pub(super) fn star_order_decline_outcome_label(reason: StarOrderDeclineReason) -> &'static str {
+	match reason {
+		StarOrderDeclineReason::MixedStrategyStar => "declined_mixed_strategy_star",
+		StarOrderDeclineReason::NonInnerEquiJoin => "declined_non_inner_equi_join",
+		StarOrderDeclineReason::MissingRelationLabel => "declined_missing_relation_label",
+		StarOrderDeclineReason::MultipleProbeRelations => "declined_multiple_probe_relations",
+		StarOrderDeclineReason::DuplicateDimension => "declined_duplicate_dimension",
+		StarOrderDeclineReason::MissingEstimate => "declined_missing_estimate",
+		StarOrderDeclineReason::ProbeNotScanLinear(_) => "declined_probe_not_scan_linear",
+	}
+}
+
+pub(super) fn join_order_estimate_confidence_label(
+	confidence: JoinOrderEstimateConfidence,
+) -> &'static str {
+	match confidence {
+		JoinOrderEstimateConfidence::Hard => "hard",
+		JoinOrderEstimateConfidence::Soft => "soft",
+	}
+}
+
+pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) -> &'static str {
+	match source {
+		JoinOrderEstimateSource::SingleKeyNdvContainment => "single_key_ndv_containment",
+		JoinOrderEstimateSource::MultiKeyNdvContainment => "multi_key_ndv_containment",
+		JoinOrderEstimateSource::Missing => "missing",
+	}
+}
+
+pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> String {
+	match reason {
+		StarOrderDeclineReason::MixedStrategyStar => "mixed_strategy_star".to_string(),
+		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join".to_string(),
+		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label".to_string(),
+		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations".to_string(),
+		StarOrderDeclineReason::DuplicateDimension => "duplicate_dimension".to_string(),
+		StarOrderDeclineReason::MissingEstimate => "missing_estimate".to_string(),
+		StarOrderDeclineReason::ProbeNotScanLinear(fence) => {
+			format!("probe_not_scan_linear:{}", fence.label())
+		}
+	}
+}
+
+pub(super) fn broadcast_build_side_label(side: BroadcastBuildSide) -> &'static str {
+	match side {
+		BroadcastBuildSide::Left => "left",
+		BroadcastBuildSide::Right => "right",
+	}
+}
+
+fn summarize_join_decisions(trace: &OptimizerTrace) -> String {
+	trace
+		.join_decisions
+		.iter()
+		.map(|receipt| {
+			format!(
+				"#{} {} {} {}",
+				receipt.target.join_index,
+				join_strategy_label(receipt.strategy),
+				join_physical_placement_label(receipt.placement),
+				join_strategy_decision_reason_label(&receipt.reason)
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
+fn summarize_join_order_edges(render: &OptimizerExplainRenderTrace) -> String {
+	render
+		.join_order_edges
+		.iter()
+		.map(|edge| {
+			format!(
+				"#{} {:?} probe={:?} dim={:?} left_keys={:?} right_keys={:?} rows={:?} linearity={:?}",
+				edge.target.join_index,
+				edge.join_kind,
+				edge.probe,
+				edge.dimension,
+				edge.left_key_signature,
+				edge.right_key_signature,
+				edge.estimated_rows,
+				edge.probe_linearity
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(" | ")
+}
+
+#[doc(hidden)]
+pub async fn bind_with_explain_summary(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, String, String), BindingError> {
+	let (plan, trace, render_trace) = bind_with_explain_trace(plan, catalog, config).await?;
+	Ok((
+		plan,
+		summarize_join_decisions(&trace),
+		summarize_join_order_edges(&render_trace),
+	))
+}
+
+pub(super) fn scan_filter_target_label(target: ScanTraceTarget) -> Result<String, BindingError> {
+	let scan = usize_to_i64(target.scan_index, "scan_index")?;
+	Ok(match target.table_id {
+		Some(table_id) => format!("scan[{scan}] table_id={}", table_id.0),
+		None => format!("scan[{scan}]"),
+	})
+}
+
+pub(super) fn scan_filter_outcome_label(
+	outcome: ScanFilterOutcome,
+	converted_pushdown: bool,
+) -> String {
+	let label = match outcome {
+		ScanFilterOutcome::FullyPushed => "fully_pushed",
+		ScanFilterOutcome::PartiallyPushed => "partially_pushed",
+		ScanFilterOutcome::ResidualOnly => "residual_only",
+		ScanFilterOutcome::StaticElided => "static_elided",
+		ScanFilterOutcome::PointRead => "point_read",
+	};
+	if converted_pushdown {
+		format!("{label}:converted")
+	} else {
+		label.to_string()
+	}
+}
+
+pub(super) fn profile_hint_label(profile_hint: QueryProfileHint) -> &'static str {
+	match profile_hint {
+		QueryProfileHint::PointRead => "point_read",
+		QueryProfileHint::Scan => "scan",
+	}
+}
+
+pub(super) fn spent_fact_label(source: FilterEstimateSource) -> &'static str {
+	match source {
+		FilterEstimateSource::Range => "range",
+		FilterEstimateSource::ConvertedRange => "converted_range",
+		FilterEstimateSource::NdvEquality => "ndv_equality",
+		FilterEstimateSource::NdvInList => "ndv_in_list",
+		FilterEstimateSource::HeavyHitterTopK => "heavy_hitter_top_k",
+	}
+}
+
+pub(super) fn column_ordinal_label(column: ColumnOrdinal) -> Result<String, BindingError> {
+	Ok(format!("col[{}]", i64::from(column.0)))
+}
+
+pub(super) fn byte_count_to_i64(
+	value: ByteCount,
+	column: &'static str,
+) -> Result<i64, BindingError> {
+	i64::try_from(value.get()).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+pub(super) fn usize_to_i64(value: usize, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+pub(super) fn u64_to_i64(value: u64, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+pub(super) fn row_count_to_i64(value: RowCount, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value.get()).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+pub(super) fn system_table_plan(
+	kind: SystemTableKind,
+	full_schema: SchemaRef,
+	rows: Vec<Vec<ScalarValue>>,
+	projection: Option<&Vec<String>>,
+) -> Result<ExecutionPlan, BindingError> {
+	let Some(projection) = projection else {
+		return Ok(ExecutionPlan::SystemTable {
+			kind,
+			schema: full_schema,
+			rows,
+		});
+	};
+
+	let requested = projection
+		.iter()
+		.map(|column| resolve_column(column, &full_schema).map(|column| column.ordinal))
+		.collect::<Result<Vec<_>, _>>()?;
+	let schema = project_schema(&full_schema, &requested)?;
+	let rows = project_scalar_rows(&rows, &requested)?;
+
+	Ok(ExecutionPlan::SystemTable { kind, schema, rows })
+}
+
+pub(super) fn logical_type_spec_row(
+	spec: LogicalTypeSpec,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Int64(Some(i64::from(spec.id.0))),
+		ScalarValue::Utf8(Some(spec.name)),
+		ScalarValue::Utf8(Some(sql_carrier_keyword(&spec.physical)?.to_string())),
+		ScalarValue::Utf8(
+			spec.refinement
+				.as_ref()
+				.map(render_refinement_check)
+				.transpose()?,
+		),
+	])
+}
+
+pub(super) fn information_schema_table_rows(
+	descriptors: &[TableSchemaDescriptor],
+) -> Vec<Vec<ScalarValue>> {
+	descriptors
+		.iter()
+		.map(|descriptor| {
+			vec![
+				ScalarValue::Utf8(Some(descriptor.namespace.clone())),
+				ScalarValue::Utf8(Some(descriptor.table_name.clone())),
+				ScalarValue::Utf8(Some("BASE TABLE".to_string())),
+			]
+		})
+		.collect()
+}
+
+pub(super) fn information_schema_schemata_rows(
+	descriptors: &[TableSchemaDescriptor],
+) -> Vec<Vec<ScalarValue>> {
+	descriptors
+		.iter()
+		.map(|descriptor| descriptor.namespace.clone())
+		.collect::<BTreeSet<_>>()
+		.into_iter()
+		.map(|schema_name| vec![ScalarValue::Utf8(Some(schema_name))])
+		.collect()
+}
+
+pub(super) fn information_schema_column_rows(
+	descriptors: &[TableSchemaDescriptor],
+	logical_types: &LogicalTypeRegistry,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::new();
+	for descriptor in descriptors {
+		let schema =
+			descriptor
+				.arrow_schema()
+				.map_err(|error| BindingError::UnsupportedExpression {
+					message: format!(
+						"failed to decode table descriptor schema for {}.{}: {error}",
+						descriptor.namespace, descriptor.table_name
+					),
+				})?;
+		for (index, field) in schema.fields().iter().enumerate() {
+			let ordinal =
+				i64::try_from(index + 1).map_err(|_| BindingError::UnsupportedExpression {
+					message: "information_schema.columns ordinal overflow".to_string(),
+				})?;
+			rows.push(vec![
+				ScalarValue::Utf8(Some(descriptor.namespace.clone())),
+				ScalarValue::Utf8(Some(descriptor.table_name.clone())),
+				ScalarValue::Utf8(Some(field.name().clone())),
+				ScalarValue::Int64(Some(ordinal)),
+				ScalarValue::Utf8(Some(sql_carrier_keyword(field.data_type())?.to_string())),
+				ScalarValue::Utf8(Some(
+					if field.is_nullable() { "YES" } else { "NO" }.to_string(),
+				)),
+				ScalarValue::Utf8(logical_type_display_name(field, logical_types)?),
+			]);
+		}
+	}
+	Ok(rows)
+}
+
+pub(super) fn logical_type_display_name(
+	field: &Field,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<Option<String>, BindingError> {
+	let logical_type = decode_column_logical_type_with_resolver(
+		field,
+		LogicalTypeResolver::with_registry(logical_types),
+	)
+	.map_err(|error| BindingError::UnsupportedExpression {
+		message: error.to_string(),
+	})?;
+	if logical_type.is_naked() {
+		return Ok(None);
+	}
+	LogicalTypeResolver::with_registry(logical_types)
+		.spec(logical_type)
+		.map(|spec| Some(spec.name))
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: format!(
+				"logical type metadata for column {} references unknown id {}",
+				field.name(),
+				logical_type.0
+			),
+		})
+}
+
+pub(super) fn sql_carrier_keyword(data_type: &DataType) -> Result<&'static str, BindingError> {
+	match data_type {
+		DataType::Int32 => Ok("INT"),
+		DataType::Int64 => Ok("BIGINT"),
+		DataType::Date32 => Ok("DATE"),
+		DataType::Timestamp(_, Some(timezone)) if timezone.as_ref() == "UTC" => Ok("TIMESTAMPTZ"),
+		DataType::Float32 => Ok("REAL"),
+		DataType::Float64 => Ok("DOUBLE"),
+		DataType::Utf8 => Ok("TEXT"),
+		DataType::Boolean => Ok("BOOLEAN"),
+		other => Err(BindingError::UnsupportedExpression {
+			message: format!("unsupported SQL carrier for information_schema: {other:?}"),
+		}),
+	}
+}
+
+pub(super) fn render_refinement_check(
+	predicate: &LogicalTypeRefinementPredicate,
+) -> Result<String, BindingError> {
+	Ok(format!(
+		"CHECK ({})",
+		render_refinement_predicate(predicate)?
+	))
+}
+
+pub(super) fn render_refinement_predicate(
+	predicate: &LogicalTypeRefinementPredicate,
+) -> Result<String, BindingError> {
+	match predicate {
+		LogicalTypeRefinementPredicate::Comparison { left, op, right } => Ok(format!(
+			"{} {} {}",
+			render_refinement_value(left)?,
+			refinement_op_sql(*op),
+			render_refinement_value(right)?
+		)),
+		LogicalTypeRefinementPredicate::And(predicates) => predicates
+			.iter()
+			.map(render_refinement_predicate)
+			.collect::<Result<Vec<_>, _>>()
+			.map(|parts| parts.join(" AND ")),
+	}
+}
+
+pub(super) fn render_refinement_value(
+	value: &LogicalTypeRefinementValue,
+) -> Result<String, BindingError> {
+	match value {
+		LogicalTypeRefinementValue::Value => Ok("VALUE".to_string()),
+		LogicalTypeRefinementValue::Int64(value) => Ok(value.to_string()),
+		LogicalTypeRefinementValue::Int32(value) => Ok(value.to_string()),
+		LogicalTypeRefinementValue::Float64(bits) => {
+			let value = f64::from_bits(*bits);
+			if value.is_finite() {
+				Ok(value.to_string())
+			} else {
+				Err(BindingError::UnsupportedExpression {
+					message: "logical type FLOAT64 refinement literal is not finite".to_string(),
+				})
+			}
+		}
+		LogicalTypeRefinementValue::Float32(bits) => {
+			let value = f32::from_bits(*bits);
+			if value.is_finite() {
+				Ok(value.to_string())
+			} else {
+				Err(BindingError::UnsupportedExpression {
+					message: "logical type FLOAT32 refinement literal is not finite".to_string(),
+				})
+			}
+		}
+		LogicalTypeRefinementValue::Utf8(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+		LogicalTypeRefinementValue::Boolean(value) => {
+			Ok(if *value { "TRUE" } else { "FALSE" }.to_string())
+		}
+	}
+}
+
+pub(super) fn refinement_op_sql(op: LogicalTypeRefinementComparisonOp) -> &'static str {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => "=",
+		LogicalTypeRefinementComparisonOp::Ne => "!=",
+		LogicalTypeRefinementComparisonOp::Lt => "<",
+		LogicalTypeRefinementComparisonOp::Le => "<=",
+		LogicalTypeRefinementComparisonOp::Gt => ">",
+		LogicalTypeRefinementComparisonOp::Ge => ">=",
+	}
+}
+
+pub(super) fn project_scalar_rows(
+	rows: &[Vec<ScalarValue>],
+	requested: &[ColumnOrdinal],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	rows.iter()
+		.map(|row| {
+			requested
+				.iter()
+				.map(|column| {
+					row.get(column.0 as usize).cloned().ok_or_else(|| {
+						BindingError::UnsupportedExpression {
+							message: format!(
+								"internal: system table projection column {} out of range",
+								column.0
+							),
+						}
+					})
+				})
+				.collect::<Result<Vec<_>, _>>()
+		})
+		.collect()
+}
+
+pub(super) type OrdinalRemap = HashMap<ColumnOrdinal, ColumnOrdinal>;

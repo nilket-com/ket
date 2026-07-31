@@ -1,0 +1,72 @@
+name: Seed Retention Advisory
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  advisory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Render advisory report
+        run: |
+          python ci/seed_retention_advisory.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --default-branch "${DEFAULT_BRANCH}" \
+            --output seed-retention-advisory.md
+          cat seed-retention-advisory.md >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload advisory artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seed-retention-advisory
+          path: seed-retention-advisory.md
+      - name: Update tracking issue comment
+        if: vars.SEED_RETENTION_TRACKING_ISSUE != ''
+        uses: actions/github-script@v7
+        env:
+          TRACKING_ISSUE: ${{ vars.SEED_RETENTION_TRACKING_ISSUE }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- seed-retention-advisory -->';
+            const issueNumber = Number(process.env.TRACKING_ISSUE);
+            const body = `${marker}\n${fs.readFileSync('seed-retention-advisory.md', 'utf8')}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              typeof comment.body === 'string' && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+            }

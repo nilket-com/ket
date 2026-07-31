@@ -1,0 +1,20 @@
+name: Query Weekly
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wpbc-fuzz-ladder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: WPBC fuzz ladder
+        run: bash ci/check_wpbc_fuzz_ladder.sh

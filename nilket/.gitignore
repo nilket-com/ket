@@ -1,0 +1,6 @@
+/target
+/crates/*/target
+.claude
+.codex
+__pycache__/
+*.pyc

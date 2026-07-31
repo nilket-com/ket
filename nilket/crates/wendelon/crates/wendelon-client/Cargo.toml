@@ -1,0 +1,18 @@
+[package]
+name = "wendelon-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["non-fips"]
+non-fips = ["wendelon/non-fips"]
+fips = ["wendelon/fips"]
+
+[dependencies]
+arrow = { version = "58.1.0", features = ["ipc_compression"] }
+postcard = { workspace = true }
+thiserror = "2.0.18"
+tokio = { version = "1.37", features = ["sync"] }
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+wendelon = { path = "../..", default-features = false }

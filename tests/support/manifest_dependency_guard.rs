@@ -6,6 +6,8 @@ use std::path::Path;
 pub(crate) enum ProductBoundary {
 	Libaryon,
 	Baryon,
+	Polariton,
+	NilketEngine,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,11 +32,59 @@ enum Section {
 	Other,
 }
 
+#[allow(dead_code)]
 pub(crate) fn assert_product_dependency_boundary(manifest_dir: &Path, boundary: ProductBoundary) {
 	let workspace_dir = manifest_dir
 		.parent()
 		.and_then(Path::parent)
 		.expect("crate must live directly below the workspace crates directory");
+	assert_product_dependency_boundary_in_workspace(manifest_dir, workspace_dir, boundary);
+}
+
+#[allow(dead_code)]
+pub(crate) fn assert_workspace_product_dependency_boundary(
+	workspace_dir: &Path,
+	boundary: ProductBoundary,
+) {
+	let mut manifests = Vec::new();
+	collect_manifests(workspace_dir, workspace_dir, &mut manifests);
+	manifests.sort();
+	for manifest in manifests {
+		let Some(manifest_dir) = manifest.parent() else {
+			continue;
+		};
+		assert_product_dependency_boundary_in_workspace(manifest_dir, workspace_dir, boundary);
+	}
+}
+
+#[allow(dead_code)]
+fn collect_manifests(root: &Path, current: &Path, manifests: &mut Vec<std::path::PathBuf>) {
+	let entries =
+		fs::read_dir(current).unwrap_or_else(|error| panic!("read {}: {error}", current.display()));
+	for entry in entries {
+		let entry = entry.expect("read manifest directory entry");
+		let path = entry.path();
+		if path.is_dir() {
+			if matches!(
+				path.file_name().and_then(|name| name.to_str()),
+				Some(".git" | "target")
+			) {
+				continue;
+			}
+			collect_manifests(root, &path, manifests);
+		} else if path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
+			&& path != root.join("Cargo.toml")
+		{
+			manifests.push(path);
+		}
+	}
+}
+
+fn assert_product_dependency_boundary_in_workspace(
+	manifest_dir: &Path,
+	workspace_dir: &Path,
+	boundary: ProductBoundary,
+) {
 	let crate_manifest_path = manifest_dir.join("Cargo.toml");
 	let workspace_manifest_path = workspace_dir.join("Cargo.toml");
 	let crate_manifest = fs::read_to_string(&crate_manifest_path)
@@ -45,8 +95,8 @@ pub(crate) fn assert_product_dependency_boundary(manifest_dir: &Path, boundary: 
 	let violations = forbidden_dependencies(&crate_manifest, &workspace_manifest, boundary);
 	assert!(
 		violations.is_empty(),
-		"ADR 0005 forbids analytics and connector dependencies in {}: {}. \
-		 Amend crates/libaryon/plans/adr/0005-product-boundary.md first, then \
+		"PRODUCT-0001 and KET-0005 forbid boundary-crossing dependencies in {}: {}. \
+		 Amend plans/product/adr/0001_one_repository.md and the applicable subsystem ADR first, then \
 		 update the dependency-boundary denylist.",
 		manifest_dir.display(),
 		violations.join(", ")
@@ -86,7 +136,7 @@ fn forbidden_dependencies(
 
 fn is_forbidden_package(package: &str, boundary: ProductBoundary) -> bool {
 	let package = package.to_ascii_lowercase();
-	package.starts_with("arrow")
+	let analytics_or_connector = package.starts_with("arrow")
 		|| package.starts_with("parquet")
 		|| package.starts_with("polars")
 		|| package.starts_with("datafusion")
@@ -100,8 +150,23 @@ fn is_forbidden_package(package: &str, boundary: ProductBoundary) -> bool {
 		|| package.starts_with("connectorx")
 		|| package.starts_with("gcloud")
 		|| package.contains("bigquery")
-		|| package.contains("snowflake")
-		|| (boundary == ProductBoundary::Libaryon && package == "boson")
+		|| package.contains("snowflake");
+	let nilket_engine = package == "nilket"
+		|| package == "toron"
+		|| (package.starts_with("toron-") && package != "toron-client")
+		|| package == "wendelon"
+		|| package.starts_with("wendelon-");
+	let editor = matches!(
+		package.as_str(),
+		"libaryon" | "baryon" | "polariton" | "spectrometer"
+	);
+
+	match boundary {
+		ProductBoundary::Libaryon => analytics_or_connector || nilket_engine || package == "boson",
+		ProductBoundary::Baryon => analytics_or_connector || nilket_engine,
+		ProductBoundary::Polariton => nilket_engine,
+		ProductBoundary::NilketEngine => editor || package == "boson",
+	}
 }
 
 fn parse_manifest_dependencies(manifest: &str) -> ManifestDependencies {
@@ -522,6 +587,39 @@ mod tests {
 				"snowflake-api",
 				"tokio-rusqlite",
 			]
+		);
+	}
+
+	#[test]
+	fn editor_heads_cannot_reach_nilket_engines_directly() {
+		let manifest = r#"
+			[dependencies]
+			toron = { path = "../nilket/crates/toron" }
+			toron-tpch = "1"
+			wendelon = "1"
+			nilket = "1"
+			toron-client = "1"
+		"#;
+		assert_eq!(
+			forbidden_dependencies(manifest, "", ProductBoundary::Polariton),
+			["nilket", "toron", "toron-tpch", "wendelon"]
+		);
+	}
+
+	#[test]
+	fn nilket_engines_cannot_reach_editor_or_shared_analytics_crates() {
+		let manifest = r#"
+			[dependencies]
+			baryon = "1"
+			boson = "1"
+			libaryon = "1"
+			polariton = "1"
+			toron = "1"
+			wendelon = "1"
+		"#;
+		assert_eq!(
+			forbidden_dependencies(manifest, "", ProductBoundary::NilketEngine),
+			["baryon", "boson", "libaryon", "polariton"]
 		);
 	}
 }

@@ -1,9 +1,9 @@
 # ADR 0001: one repository, one state vector
 
-Status: accepted 2026-07-31; execution is blocked until the user declares
-the nilket repository frozen after Toron ADR 529. This is the first record
-in the PRODUCT namespace: decisions spanning the complete system. The ket
-lineage through ADR 0005 and the Toron lineage through ADR 529 remain
+Status: accepted and executed 2026-07-31 from frozen nilket commit
+`7d978dbf` (`plan: adr 531 global aggregate gather`). This is the first
+record in the PRODUCT namespace: decisions spanning the complete system. The
+ket lineage through ADR 0005 and the Toron lineage through ADR 531 remain
 distinct and unchanged. This merge joins two mature architectural
 civilizations; it does not absorb a side project or pretend the database
 appeared yesterday.
@@ -43,20 +43,24 @@ choreography.
    in the nilket workspace beside the protocol and server it represents;
    Polariton may depend on that client across the workspace boundary, never on
    Toron server internals. A root `shared/` workspace is introduced only for a
-   genuinely jointly-owned abstraction, such as the future analytics seam
-   currently called `boson`, and only with an explicit owner and dependency
-   guard. It is not a miscellaneous-crate directory.
+   genuinely jointly-owned abstraction, such as a future interchange and plot
+   contract currently called `boson`, and only with an explicit owner and
+   dependency guard. It is not a miscellaneous-crate directory or a second
+   analytics engine. Toron owns almost all analytical execution; a future
+   workbench library may own composition and presentation.
 5. **ADR namespaces remain federated.** Existing names and files are not
    rewritten. New prose qualifies cross-lineage references as `KET-NNNN`,
    `TORON-NNNN`, or `PRODUCT-NNNN`; the directory supplies the namespace for
    filenames such as this one. There is no global counter because the imported
    histories developed concurrently. Git is the shared ledger; qualified
    namespaces preserve each lineage.
-6. **Dependency guards extend before product work resumes.** Libaryon and
-   Baryon reject Toron, Wendelon, connector, and analytics dependencies.
-   Nilket engine crates reciprocally reject editor and document-engine crates.
-   Polariton receives one narrow engine allowance: the public Toron client.
-   Any wider dependency requires amending the applicable ADR first.
+6. **Dependency guards extend before product work resumes.** Libaryon rejects
+   Toron, Wendelon, connectors, and analytics. Baryon rejects engines and
+   connectors but retains KET-0005's explicit permission to consume shared
+   result and plot contracts as an optional plot-raster head. Nilket engine crates
+   reciprocally reject editor and document-engine crates. Polariton receives
+   one narrow nilket allowance: the public Toron client. Any wider dependency
+   requires amending the applicable ADR first.
 7. **CI follows workspaces.** Ket-only changes do not build the distributed
    database; nilket-only changes do not build the editor heads. One
    cross-product dogfood job covers the client/server/UI path. Path filters are
@@ -74,7 +78,7 @@ No migration command runs until the user declares nilket frozen. At that
 point the graft records and verifies all of the following:
 
 1. The nilket worktree is clean, its local main equals `origin/main`, and the
-   frozen tip includes the completed Toron ADR 529 work.
+   frozen tip includes the completed Toron ADR 531 work.
 2. A fresh mirror is cloned from the authoritative remote. Its source URL,
    frozen main SHA, complete ref inventory, reachable commit count, and
    `git fsck --full` result form the freeze certificate. The current sibling
@@ -123,6 +127,9 @@ touch Polariton, the public client, and the engine atomically.
 - Existing ket paths and their documentation links do not churn. Nilket paths
   gain the one prefix required by the graft, throughout their rewritten
   history.
+- Libaryon's text indexes remain document infrastructure, not precedent for
+  data analytics. Query planning, aggregation, joins, and transforms belong in
+  Toron. Product-side crates compose sources and present results.
 - The plotting contract may become PRODUCT-0002 if its ownership crosses the
   editor/analytics boundary; its author decides from ownership, not prestige.
 - Cross-system findings may migrate to `plans/product/` when touched. Nothing

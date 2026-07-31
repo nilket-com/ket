@@ -1,0 +1,93 @@
+name: Rust CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rust-ci.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'ci/**'
+      - 'plans/**'
+      - 'src/**'
+      - 'tests/**'
+  pull_request:
+    paths:
+      - '.github/workflows/rust-ci.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'ci/**'
+      - 'plans/**'
+      - 'src/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ensure strace is present
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - name: cargo check
+        run: cargo check
+      - name: Recovery tests
+        run: cargo test recovery_tests
+      - name: Bootstrap tests
+        run: cargo test single_node_bootstrap
+      - name: Backup/restore tests
+        run: cargo test --test backup_restore
+      - name: WPBC fuzz smoke
+        run: cargo test wpbc_surface_survives_smoke_fuzz_samples
+      - name: W1 grep sweeps
+        run: bash ci/check_w1_foundation_grep.sh
+      - name: BLAKE3 confinement inventory
+        run: bash ci/check_blake3_confinement.sh
+      - name: W1 strace metadata sync check
+        run: bash ci/check_w1_wal_metadata_sync_strace.sh
+
+  fips-symbol-sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ensure clang and binutils are present
+        run: sudo apt-get update && sudo apt-get install -y clang binutils
+      - name: FIPS symbol sweep
+        run: bash ci/check_fips_symbol_sweep.sh
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny
+        run: cargo deny --workspace --all-features check bans sources advisories
+
+  simulator-pr-ladder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Simulator PR ladder
+        run: bash ci/check_simulator_ladder.sh 10000 424242
+
+  chaos-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Chaos smoke harness
+        run: bash ci/check_chaos_harness.sh

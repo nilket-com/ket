@@ -1,0 +1,8594 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use proc_macro2::{TokenStream, TokenTree};
+
+fn walk_dir(dir: &Path, callback: &mut impl FnMut(&Path)) {
+	if let Ok(entries) = fs::read_dir(dir) {
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path.is_dir() {
+				walk_dir(&path, callback);
+			} else {
+				callback(&path);
+			}
+		}
+	}
+}
+
+fn rust_identifiers_from_source(source_name: &str, source: &str) -> Vec<String> {
+	let tokens = TokenStream::from_str(source).unwrap_or_else(|err| {
+		panic!("{source_name}: Rust tokenization failed: {err}");
+	});
+	let mut identifiers = Vec::new();
+	collect_identifiers(tokens, &mut identifiers);
+	identifiers
+}
+
+fn collect_identifiers(tokens: TokenStream, identifiers: &mut Vec<String>) {
+	for token in tokens {
+		match token {
+			TokenTree::Ident(ident) => identifiers.push(ident.to_string()),
+			TokenTree::Group(group) => collect_identifiers(group.stream(), identifiers),
+			TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+		}
+	}
+}
+
+fn has_rust_identifier(identifiers: &[String], ident: &str) -> bool {
+	identifiers.iter().any(|candidate| candidate == ident)
+}
+
+/// ADR 077: the data server became `network/data_server/{mod.rs + domain modules}`.
+/// Architecture guards that used to read the flat `data_server.rs` now read the
+/// concatenation of every module under that directory, so a symbol moved into a
+/// child module is still found by source-scanning guards.
+fn data_server_source_files(manifest_dir: &Path) -> Vec<PathBuf> {
+	// ADR 077: the module root stays `network/data_server.rs` (mod.rs files are
+	// manifests-only in this crate); carved handler families live under
+	// `network/data_server/`. Production source-scanning guards read the root
+	// plus every NON-TEST submodule, so a symbol moved into a child module is
+	// still found, while `tests.rs` is excluded (it is not production source —
+	// the old single-file scans stripped the inline `mod tests` for the same
+	// reason). The root is listed first; submodules are sorted among themselves
+	// (a global sort would order the `data_server/` directory component ahead of
+	// the `data_server.rs` file and put test/handler modules before the root).
+	let mut files = Vec::new();
+	let root = manifest_dir.join("src/network/data_server.rs");
+	if root.is_file() {
+		files.push(root);
+	}
+	let dir = manifest_dir.join("src/network/data_server");
+	if dir.is_dir() {
+		let mut submodules = Vec::new();
+		walk_dir(&dir, &mut |path| {
+			let is_rs = path.extension().and_then(|s| s.to_str()) == Some("rs");
+			let is_tests = path.file_name().and_then(|s| s.to_str()) == Some("tests.rs");
+			if is_rs && !is_tests {
+				submodules.push(path.to_path_buf());
+			}
+		});
+		submodules.sort();
+		files.extend(submodules);
+	}
+	files
+}
+
+fn data_server_source(manifest_dir: &Path) -> String {
+	data_server_source_files(manifest_dir)
+		.iter()
+		.map(|path| fs::read_to_string(path).unwrap())
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+/// ADR 078: storage/manager.rs decomposed into storage/manager/{islands + tests.rs}.
+/// Production source-scan guards read the root plus every NON-TEST submodule (tests.rs
+/// excluded — not production source), mirroring data_server_source_files().
+fn manager_source_files(manifest_dir: &Path) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	let root = manifest_dir.join("src/storage/manager.rs");
+	if root.is_file() {
+		files.push(root);
+	}
+	let dir = manifest_dir.join("src/storage/manager");
+	if dir.is_dir() {
+		let mut submodules = Vec::new();
+		walk_dir(&dir, &mut |path| {
+			let is_rs = path.extension().and_then(|s| s.to_str()) == Some("rs");
+			let is_tests = path.file_name().and_then(|s| s.to_str()) == Some("tests.rs");
+			if is_rs && !is_tests {
+				submodules.push(path.to_path_buf());
+			}
+		});
+		submodules.sort();
+		files.extend(submodules);
+	}
+	files
+}
+
+fn manager_source(manifest_dir: &Path) -> String {
+	manager_source_files(manifest_dir)
+		.iter()
+		.map(|path| fs::read_to_string(path).unwrap())
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+#[test]
+fn test_adr039_wendelon_drop_migration_substrate_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let compute = fs::read_to_string(manifest_dir.join("src/integration/compute.rs")).unwrap();
+	let consensus_core = fs::read_to_string(manifest_dir.join("src/consensus/core.rs")).unwrap();
+	let raft_storage =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let control_server =
+		fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
+	let storage_manager = manager_source(manifest_dir);
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let table_schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let lifecycle = fs::read_to_string(manifest_dir.join("src/schema/lifecycle.rs")).unwrap();
+
+	assert!(compute.contains("pub enum TableSchemaDropRequest"));
+	assert!(compute.contains("pub struct DropOperationId"));
+	assert!(compute.contains("pub tenant_id: TenantId"));
+	assert!(compute.contains("pub table_object_id: TableObjectId"));
+	assert!(compute.contains("pub schema_generation: SchemaGeneration"));
+	assert!(!compute.contains("TableSchemaDropRequestV1"));
+	assert!(!compute.contains("query_id"));
+
+	assert!(consensus_core.contains("pub enum TableDropPrepareRequest"));
+	assert!(consensus_core.contains("pub enum TableReclaimCompletionRequest"));
+	assert!(consensus_core.contains("pub enum TableDropFinalizeRequest"));
+	assert!(consensus_core.contains("TableDropPrepare(TableDropPrepareRequest)"));
+	assert!(consensus_core.contains("TableReclaimCompletion(TableReclaimCompletionRequest)"));
+	assert!(consensus_core.contains("TableDropFinalize(TableDropFinalizeRequest)"));
+
+	assert!(raft_storage.contains("pub table_drop_fences: TableDropFenceCatalog"));
+	assert!(raft_storage.contains("apply_request_at_log_index"));
+	assert!(raft_storage.contains("apply_table_drop_prepare"));
+	assert!(raft_storage.contains("apply_table_reclaim_completion"));
+	assert!(raft_storage.contains("apply_table_drop_finalize"));
+	assert!(raft_storage.contains("entry.log_id.index"));
+	assert!(
+		raft_storage.contains("table schema update rejected because table drop is in progress")
+	);
+	assert!(
+		raft_storage.contains("secondary index create rejected because table drop is in progress")
+	);
+	assert!(
+		raft_storage
+			.contains("table retention policy update rejected because table drop is in progress")
+	);
+	assert!(table_schema.contains("pub fn unbind_latest_name"));
+	assert!(lifecycle.contains("pub struct TableDropFenceCatalog"));
+	let drop_fence_block = lifecycle
+		.split_once("pub struct TableDropFenceCatalog")
+		.and_then(|(_, rest)| rest.split_once("pub struct TableLifecyclePolicyCounts"))
+		.map(|(block, _)| block)
+		.expect("drop fence definitions");
+	assert!(!drop_fence_block.contains("TableRetentionPolicy"));
+
+	assert!(control_server.contains("SCHEMA_DROP_REQ"));
+	assert!(control_server.contains("SCHEMA_DROP_RESP"));
+	assert!(control_server.contains("run_table_schema_drop"));
+	assert!(control_server.contains("drive_table_drop_physical_reclaim"));
+	assert!(control_server.contains(".reclaim_table_drop_storage("));
+	assert!(control_server.contains(".reclaim_table_drop_tiered_storage("));
+	assert!(control_server.contains("RaftCommitter::new"));
+	assert!(control_server.contains("WendelonAdminError"));
+	assert!(control_server.contains("TableSchemaDropResponseWire"));
+	assert!(control_server.contains("with_storage_manager"));
+	assert!(storage_manager.contains("pub struct TableDropReclaimReport"));
+	assert!(storage_manager.contains("pub async fn reclaim_table_drop_storage"));
+	assert!(storage_manager.contains("pub async fn reclaim_table_drop_tiered_storage"));
+	assert!(storage_manager.contains("prepare_tiered_table_drop_rewrite"));
+	assert!(storage_manager.contains("PreparedTieredTableDropRewrite"));
+	assert!(storage_manager.contains("mark_record_group_for_table_drop"));
+	assert!(node.contains(".with_storage_manager(slab.clone())"));
+	assert!(data_server.matches("table_drop_fences").count() >= 5);
+	assert!(data_server.matches(".is_fenced(").count() >= 5);
+}
+
+#[test]
+fn test_adr055_lsm_compaction_substrate_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let storage_lsm = fs::read_to_string(manifest_dir.join("src/storage/lsm.rs")).unwrap();
+	let storage_manifest =
+		fs::read_to_string(manifest_dir.join("src/storage/manifest.rs")).unwrap();
+	let storage_worker =
+		fs::read_to_string(manifest_dir.join("src/storage/lsm_worker.rs")).unwrap();
+	let storage_manager = manager_source(manifest_dir);
+	let storage_index = fs::read_to_string(manifest_dir.join("src/storage/index.rs")).unwrap();
+	let slab_pins = fs::read_to_string(manifest_dir.join("src/storage/slab_pins.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let consensus_core = fs::read_to_string(manifest_dir.join("src/consensus/core.rs")).unwrap();
+	let raft_storage =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let storage_sweeper = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let lsm_runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/lsm_compaction.md")).unwrap();
+
+	let mut violations = Vec::new();
+
+	if units.matches("pub struct CompactionLevelIndex").count() != 1 {
+		violations.push(
+			"src/schema/units.rs: expected exactly one CompactionLevelIndex definition".to_string(),
+		);
+	}
+	if units.contains("pub struct LevelIndex") {
+		violations.push(
+			"src/schema/units.rs: bare LevelIndex is ambiguous with L1/L2 storage tiers"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub const MAX_RAW: u8 = 3;",
+		"pub const L0: Self = Self(0);",
+		"pub const L3: Self = Self(3);",
+		"Self::try_new(raw)",
+		"invalid LSM compaction level",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing CompactionLevelIndex range guard token {required}"
+			));
+		}
+	}
+	for required in [
+		"impl_unit!(CompactionJobId, u64);",
+		"impl_unit!(ManifestEpoch, u64);",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 055 unit {required}"
+			));
+		}
+	}
+
+	if storage_lsm.matches("pub struct CompactionMergeKey").count() != 1 {
+		violations.push(
+			"src/storage/lsm.rs: expected exactly one CompactionMergeKey definition".to_string(),
+		);
+	}
+	for cdc_path in [
+		"src/schema/cdc.rs",
+		"src/storage/cdc.rs",
+		"src/network/cdc.rs",
+	] {
+		let content = fs::read_to_string(manifest_dir.join(cdc_path)).unwrap_or_default();
+		if content.contains("CompactionMergeKey") || content.contains("CompactionLevelIndex") {
+			violations.push(format!(
+				"{cdc_path}: CDC must not import LSM compaction key/level types"
+			));
+		}
+	}
+
+	for required in [
+		"pub enum SlabState",
+		"Retired { successors: Vec<SlabId> }",
+		"pub struct LsmRunSummary",
+		"pub compaction_level: CompactionLevelIndex",
+		"pub enum LsmRejectCode",
+		"ManifestRace = 1",
+		"SidecarDigestMismatch = 2",
+		"VisibleDigestInvariance = 3",
+		"pub enum VersionLifecycle",
+		"pub struct LsmSourceFrame",
+		"pub struct VisibleDomainRow",
+		"compaction_visible_domain_summary",
+		"pub fn apply_elision",
+		"pub struct PlannedOutputRun",
+		"pub fn plan_output_runs",
+		"pub struct LsmConfig",
+		"lsm_compaction_concurrency_per_locality: 1",
+		"output_run_target_bytes",
+		"pub fn pick_compaction",
+		"pub fn touched_slabs",
+	] {
+		if !storage_lsm.contains(required) {
+			violations.push(format!(
+				"src/storage/lsm.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct ManifestSnapshot",
+		"slabs_at_compaction_level",
+		"overlapping_slabs",
+		"oldest_l0_slab_age_millis",
+		"compaction_level_total_bytes",
+		"compaction_level_slab_count",
+		"apply_compaction_commit",
+		"validate_compaction_commit_against_plan",
+		"apply_planned_compaction_commit",
+	] {
+		if !storage_manifest.contains(required) {
+			violations.push(format!(
+				"src/storage/manifest.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct SlabPinTable",
+		"pub fn acquire(&self, slabs: &[SlabId])",
+		"pub struct SlabPinGuard",
+		"impl Drop for SlabPinGuard",
+		"SlabAlreadyDeletePending",
+	] {
+		if !slab_pins.contains(required) {
+			violations.push(format!(
+				"src/storage/slab_pins.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"compaction_manifest_snapshot",
+		"reserve_lsm_output_slab_ids",
+		"lsm_version_entries_for_plan",
+		"prepare_lsm_compaction_outputs",
+		"read_lsm_single_row_source_frames",
+		"apply_lsm_manifest_compaction_commit",
+		"apply_lsm_manifest_planned_compaction_commit",
+		"install_lsm_compaction_temp_outputs",
+		"install_lsm_compaction_temp_outputs_via_control_ring",
+		"run_lsm_compaction_once",
+		"pick_lsm_compaction_plan",
+		"run_lsm_compaction_tick",
+		"run_lsm_compaction_tick_via_control_ring",
+		"run_lsm_compaction_tick_via_control_ring_with_catalogs",
+		"reconcile_lsm_secondary_index_segments_after_compaction",
+		"sweep_lsm_delete_pending_once",
+		"sweep_lsm_delete_pending_once_via_control_ring",
+		"cleanup_lsm_compaction_tmp_files",
+		"lsm_source_frame_table_object_id",
+		"compaction-temp-",
+		"slab_pin_table",
+		"pin_lsm_read_location",
+	] {
+		if !storage_manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 055 manager token {required}"
+			));
+		}
+	}
+	for required in [
+		"LSM_RUNS_TABLE",
+		"lsm_runs_v1",
+		"pub lsm_runs: Vec<LsmRunSummary>",
+		"pub put_lsm_runs: Vec<LsmRunSummary>",
+		"pub delete_lsm_run_ids: Vec<SlabId>",
+		"encode_lsm_run_summary",
+		"decode_lsm_run_summary",
+	] {
+		if !storage_index.contains(required) {
+			violations.push(format!(
+				"src/storage/index.rs: missing ADR 055 persisted run token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct LsmCompactionWorker",
+		"TableLifecycleCatalog",
+		"retention_floor_from_catalog",
+		"acquire_plan_pins",
+		"pub struct LsmPreparedOutputs",
+		"plan_survivor_outputs",
+		"pub trait LsmCompactionDriver",
+		"pub trait LsmCompactionJobRunner",
+		"pub struct LsmCompactionService",
+		"pub struct LsmCompactionServiceControl",
+		"pub fn spawn(self) -> JoinHandle<()>",
+		"pub async fn run_one",
+		"build_compaction_commit",
+		"compaction_outcome_from_commit",
+		"pub struct LsmGcWorker",
+		"pub trait LsmGcDriver",
+		"pub struct LsmGcService",
+		"pub struct LsmGcPlan",
+		"transition_retired_to_delete_pending",
+		"transition_retired_to_delete_pending_if",
+	] {
+		if !storage_worker.contains(required) {
+			violations.push(format!(
+				"src/storage/lsm_worker.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+
+	for required in [
+		"wendelon_lsm_compactions_total",
+		"wendelon_lsm_compaction_input_slabs",
+		"wendelon_lsm_compaction_output_bytes",
+		"wendelon_lsm_compaction_duration_millis",
+		"wendelon_lsm_level_slab_count",
+		"wendelon_lsm_level_total_bytes",
+		"wendelon_lsm_pending_delete_slabs",
+		"wendelon_lsm_retired_slab_pinned_bytes",
+		"wendelon_lsm_digest_invariance_violations_total",
+		"result.as_str()",
+		"kind.as_str()",
+	] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 055 metric token {required}"
+			));
+		}
+	}
+	for forbidden in ["tenant_id", "table_object_id", "subscription_id", "slab_id"] {
+		for line in metrics
+			.lines()
+			.filter(|line| line.contains("wendelon_lsm_"))
+		{
+			if line.contains(forbidden) {
+				violations.push(format!(
+					"src/metrics/registry.rs: LSM metric line carries forbidden high-cardinality label {forbidden}: {line}"
+				));
+			}
+		}
+	}
+
+	for forbidden in [
+		"MsgType::LSM",
+		"MsgType::COMPACTION",
+		"FRAME_FLAG_LSM",
+		"FRAME_FLAG_COMPACTION",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 055 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Lsm",
+		"NodeCapability::Compaction",
+		"NodeCapability::LSM",
+		"NodeCapability::COMPACTION",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 055 capability token {forbidden}"
+			));
+		}
+	}
+
+	for source in [&storage_lsm, &storage_manifest, &storage_worker, &slab_pins] {
+		if source.contains("StorageTier") {
+			violations.push("LSM substrate must not embed StorageTier".to_string());
+		}
+		if source.contains("DigestEvictionMarker") {
+			violations.push("LSM substrate must not add DigestEvictionMarker".to_string());
+		}
+		if source.contains("relocated_reads") {
+			violations.push("LSM substrate must not write or embed relocated_reads".to_string());
+		}
+	}
+	for source in [&consensus_core, &raft_storage] {
+		if source.contains("DigestEvictionMarker") {
+			violations.push("LSM control-ring path must not add DigestEvictionMarker".to_string());
+		}
+	}
+
+	for forbidden in [
+		"LsmV1",
+		"LsmV2",
+		"CompactionV1",
+		"CompactionV2",
+		"WendelonLsm",
+		"WendelonCompaction",
+	] {
+		for source in [
+			&units,
+			&storage_lsm,
+			&storage_manifest,
+			&storage_worker,
+			&slab_pins,
+		] {
+			if source.contains(forbidden) {
+				violations.push(format!("ADR 055 forbidden suffix/prefix token {forbidden}"));
+			}
+		}
+	}
+
+	for required in [
+		"LsmCompactionCommitted",
+		"LsmInvariantViolation",
+		"LsmCompactionPaused",
+		"lsm.compaction_committed",
+		"lsm.invariant_violation",
+		"lsm.compaction_paused",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 055 audit token {required}"
+			));
+		}
+	}
+
+	for required in ["CompactionCommit(CompactionCommit)", "control ring"] {
+		if !consensus_core.contains(required) {
+			violations.push(format!(
+				"src/consensus/core.rs: missing ADR 055 control-ring token {required}"
+			));
+		}
+	}
+	for required in [
+		"WendelonRequest::CompactionCommit",
+		"TierObserverEvent::LsmCompactionCommitted",
+		"on_lsm_compaction_committed",
+		"AuditOperation::LsmCompactionCommitted",
+		"AuditOperation::LsmInvariantViolation",
+	] {
+		if !raft_storage.contains(required) {
+			violations.push(format!(
+				"src/consensus/raft_storage.rs: missing ADR 055 control-ring apply token {required}"
+			));
+		}
+	}
+	for required in [
+		"on_lsm_compaction_committed",
+		"apply_lsm_manifest_compaction_commit(commit)",
+		"commit_lsm_compaction",
+		"WendelonRequest::CompactionCommit(commit)",
+	] {
+		if !storage_sweeper.contains(required) {
+			violations.push(format!(
+				"src/storage/sweeper.rs: missing ADR 055 manager observer token {required}"
+			));
+		}
+	}
+	for required in [
+		"LeaderGatedLsmCompactionDriver",
+		"impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver",
+		"if !self.leader.is_leader().await",
+		"committer: Arc<dyn TierCommitter>",
+		"state_machine: WendelonStateMachine",
+		"run_lsm_compaction_tick_via_control_ring",
+		"run_lsm_compaction_tick_via_control_ring_with_catalogs",
+		"lsm_compaction_paused",
+		"lsm_compaction_control",
+		"LsmCompactionService::new",
+		"LeaderGatedLsmGcDriver",
+		"sweep_lsm_delete_pending_once_via_control_ring",
+		"LsmGcService::new",
+		"lsm_gc",
+		"lsm_compaction",
+	] {
+		if !node.contains(required) {
+			violations.push(format!(
+				"src/node.rs: missing ADR 055 node service token {required}"
+			));
+		}
+	}
+
+	for required in ["[[bench]]", "name = \"lsm_compaction\"", "harness = false"] {
+		if !cargo_toml.contains(required) {
+			violations.push(format!(
+				"Cargo.toml: missing ADR 055 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"wendelon_lsm_compactions_total{level,result}",
+		"wendelon_lsm_retired_slab_pinned_bytes",
+		"sidecar_digest_mismatch",
+		"visible_digest_invariance",
+		"cargo bench --bench lsm_compaction -- --quick",
+	] {
+		if !lsm_runbook.contains(required) {
+			violations.push(format!(
+				"plans/ops/runbooks/lsm_compaction.md: missing ADR 055 runbook token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 055 architecture guard violations:\n{}",
+		violations.join("\n")
+	);
+}
+
+fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+	walk_dir(dir, &mut |path| {
+		if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+			files.push(path.to_path_buf());
+		}
+	});
+}
+
+fn strip_line_comment(line: &str) -> &str {
+	line.split_once("//").map(|(code, _)| code).unwrap_or(line)
+}
+
+fn is_allowed_manifest_line(line: &str) -> bool {
+	let line = line.trim();
+	line.is_empty()
+		|| line.starts_with("mod ")
+		|| line.starts_with("pub mod ")
+		|| line.starts_with("use ")
+		|| line.starts_with("pub use ")
+		|| line.starts_with("#[cfg")
+		|| line.starts_with("#[allow")
+}
+
+fn contains_forbidden_keyword(line: &str) -> bool {
+	line.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+		.any(|token| {
+			matches!(
+				token,
+				"struct" | "enum" | "fn" | "const" | "impl" | "static" | "trait"
+			)
+		})
+}
+
+#[test]
+fn test_mod_rs_files_are_manifests_only() {
+	let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut mod_files = Vec::new();
+	collect_mod_rs_files(&src_dir, &mut mod_files);
+	mod_files.sort();
+
+	let mut violations = Vec::new();
+
+	for path in mod_files {
+		let content = fs::read_to_string(&path).expect("mod.rs should be readable");
+		let mut in_block_comment = false;
+		let mut in_use_block = false;
+
+		for (line_no, raw_line) in content.lines().enumerate() {
+			let mut line = raw_line.trim();
+
+			if in_block_comment {
+				if let Some((_, rest)) = line.split_once("*/") {
+					in_block_comment = false;
+					line = rest.trim();
+				} else {
+					continue;
+				}
+			}
+
+			if line.starts_with("/*") {
+				if !line.contains("*/") {
+					in_block_comment = true;
+				}
+				continue;
+			}
+
+			if matches!(line, "" | "}" | "{")
+				|| line.starts_with("//")
+				|| line.starts_with("///")
+				|| line.starts_with("//!")
+				|| line.starts_with('*')
+			{
+				continue;
+			}
+
+			line = strip_line_comment(line).trim();
+			if line.is_empty() {
+				continue;
+			}
+
+			if in_use_block {
+				if line.ends_with(';') {
+					in_use_block = false;
+				}
+				continue;
+			}
+
+			if is_allowed_manifest_line(line) {
+				if (line.starts_with("use ") || line.starts_with("pub use "))
+					&& !line.ends_with(';')
+				{
+					in_use_block = true;
+				}
+				continue;
+			}
+
+			let reason = if contains_forbidden_keyword(line) {
+				format!("forbidden item on line {}", line_no + 1)
+			} else {
+				format!("unexpected manifest content on line {}", line_no + 1)
+			};
+			violations.push(format!(
+				"{}: {}: {}",
+				path.display(),
+				reason,
+				raw_line.trim()
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"mod.rs files must be manifests only:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_forbidden_word_count() {
+	let forbidden_word = "plane";
+	let max_allowed = 2;
+	let mut total_occurrences = 0;
+
+	let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+	walk_dir(&src_dir, &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& let Ok(content) = fs::read_to_string(path)
+		{
+			total_occurrences += content.matches(forbidden_word).count();
+		}
+	});
+
+	assert!(
+		total_occurrences <= max_allowed,
+		"The word '{}' appeared {} times, which exceeds the limit of {}.",
+		forbidden_word,
+		total_occurrences,
+		max_allowed
+	);
+}
+
+// Per ADR 041 (Project-name decoupling) Tier-1 enforcement: former
+// brand-leaked names of the predicate-bytecode protocol are forbidden in code
+// surfaces. The `Wendelon[A-Z]` Tier-2 audit is a separate follow-up effort and
+// is not enforced by this test.
+#[test]
+fn test_no_brand_leaked_pbc_names_in_code_surfaces() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let scan_roots = ["src", "tests", "benches", "examples", "crates", "ci"];
+	let mut violations: Vec<String> = Vec::new();
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in ["WPBC", "Wpbc", "wpbc"] {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	let old_pbc_module = manifest_dir.join("src/schema/wpbc.rs");
+	if old_pbc_module.exists() {
+		violations.push(format!(
+			"{}: forbidden module path; rename to src/schema/pbc.rs",
+			old_pbc_module.display()
+		));
+	}
+
+	assert!(
+		violations.is_empty(),
+		"WPBC brand-leaked names are forbidden in code surfaces (ADR 041 Tier-1):\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr048_retention_policy_surface_stays_typed_and_brand_clean() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let scan_roots = ["src", "tests", "benches"];
+	let mut violations: Vec<String> = Vec::new();
+	let forbidden_needles = [
+		"RETENTION_REJECTED_BAD_UNIT",
+		"RETENTION_REJECTED_NEGATIVE",
+		"RETENTION_REJECTED_ZERO",
+		"RETENTION_REJECTED_STALE_GENERATION",
+		"TABLE_RETENTION_REQ",
+		"TABLE_RETENTION_RESP",
+		"RETENTION_REQ",
+		"RETENTION_RESP",
+		"parse_retention",
+		"retention_parser",
+		"parse_retention_policy",
+		"parse_table_retention",
+		"ALTER TABLE",
+		"RETENTION =",
+		"WendelonRetention",
+		"wendelon_retention",
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden_needles {
+				if content.contains(needle) {
+					violations.push(format!("{}: contains '{}'", path.display(), needle));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 048 retention policy engine surface must stay typed and brand-clean:\n{}",
+		violations.join("\n")
+	);
+
+	let lifecycle_source =
+		fs::read_to_string(manifest_dir.join("src/schema/lifecycle.rs")).unwrap();
+	assert!(
+		lifecycle_source.contains("pub enum TableRetentionPolicy {\n\tInheritCluster,\n\tDisabled,\n\tFixedWindow(RetentionWindowMillis),\n}"),
+		"TableRetentionPolicy must stay a three-variant typed enum"
+	);
+	assert!(
+		!lifecycle_source.contains("at_generation"),
+		"ADR 048 rejected at_generation retention snapshots"
+	);
+
+	let table_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let descriptor_block = table_source
+		.split_once("pub struct TableSchemaDescriptor {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("TableSchemaDescriptor block should be present");
+	assert!(
+		!descriptor_block.to_ascii_lowercase().contains("retention"),
+		"TableSchemaDescriptor must not carry retention policy fields"
+	);
+
+	let transport_source =
+		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let capability_block = transport_source
+		.split_once("pub enum NodeCapability {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("NodeCapability block should be present");
+	assert!(
+		!capability_block.contains("Retention"),
+		"ADR 048 must not add a retention node capability bit"
+	);
+
+	let raft_storage_source =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	assert!(
+		raft_storage_source.contains("pub table_lifecycle: TableLifecycleCatalog,"),
+		"SmState must keep the table lifecycle catalog explicit"
+	);
+	assert!(
+		!raft_storage_source.contains("#[serde(default)]\n\tpub table_lifecycle"),
+		"ADR 048 forbids a serde default shim on retention state"
+	);
+
+	let state_digest_source =
+		fs::read_to_string(manifest_dir.join("src/hash/state_digest.rs")).unwrap();
+	assert_eq!(
+		state_digest_source
+			.matches("StateDigestDomain(b\"digest.")
+			.count(),
+		5,
+		"ADR 048 must not add a new state-digest domain constant"
+	);
+	assert!(
+		state_digest_source.contains("apply_retention_eviction_to_visible_digest"),
+		"ADR 048 retention must reuse the visible-domain eviction helper"
+	);
+	assert!(
+		!state_digest_source.contains("retention_gc_element"),
+		"ADR 048 must not introduce a retention-specific digest element helper"
+	);
+
+	let data_server_source = data_server_source(manifest_dir.as_ref());
+	assert!(
+		data_server_source.contains("aggregate_csb_retention_decision"),
+		"ADR 048 aggregate CSB path must gate retention-active direct answers by slab row-HLC bounds"
+	);
+	assert!(
+		!data_server_source
+			.contains("if prepared.retention_floor.is_some() {\n\t\t\treturn Ok(None);\n\t\t}"),
+		"ADR 048 aggregate CSB path must not disable every retention-active direct answer"
+	);
+
+	let runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/table_retention.md")).unwrap();
+	for signal in [
+		"SetTableRetentionPolicy",
+		"wendelon_storage_table_retention_policy_updates_total",
+		"wendelon_storage_table_retention_read_floor_rejects_total",
+		"table.retention_policy_updated",
+	] {
+		assert!(
+			runbook.contains(signal),
+			"ADR 048 runbook must mention {signal}"
+		);
+	}
+}
+
+#[test]
+fn test_adr042_protocol_surfaces_stay_brand_clean_and_unsuffixed() {
+	let rendered_metrics = wendelon::metrics::MetricsRegistry::default().render_prometheus();
+	let mut violations: Vec<String> = Vec::new();
+	for metric in prometheus_metric_names(&rendered_metrics) {
+		if metric.starts_with("wendelon_agg")
+			|| metric.starts_with("wendelon_pbc")
+			|| metric.starts_with("wendelon_storage_multirow")
+		{
+			if metric.starts_with("wendelon_w") {
+				violations.push(format!(
+					"metric '{metric}' brand-prefixes the protocol segment"
+				));
+			}
+			if metric.contains("_v1") || metric.contains("_v2") {
+				violations.push(format!("metric '{metric}' carries a version suffix"));
+			}
+		}
+	}
+
+	for column in [
+		wendelon::schema::STORAGE_ROW_HLC_COLUMN,
+		wendelon::schema::STORAGE_ROW_KEY_ID_COLUMN,
+		wendelon::schema::STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	] {
+		if !column.starts_with("__row_") || !column.ends_with("__") {
+			violations.push(format!("synthetic column '{column}' is not row-functional"));
+		}
+		if column.contains("wendelon") || column.contains("_v1") || column.contains("_v2") {
+			violations.push(format!(
+				"synthetic column '{column}' is brand-prefixed or version-suffixed"
+			));
+		}
+	}
+
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	forbidden_protocol_tokens_in_code(manifest_dir, &mut violations);
+
+	assert!(
+		violations.is_empty(),
+		"ADR 042 protocol surfaces must stay brand-clean, unsuffixed, and free of deleted scalar-context opcodes:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr043_storage_compression_surfaces_are_centralized() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for manifest in ["Cargo.toml", "crates/wendelon-client/Cargo.toml"] {
+		let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+		assert!(
+			content.contains("ipc_compression"),
+			"{manifest} must keep Arrow ipc_compression enabled"
+		);
+	}
+
+	let storage_ipc = fs::read_to_string(manifest_dir.join("src/storage/ipc.rs")).unwrap();
+	assert!(storage_ipc.contains("try_with_compression"));
+	assert!(storage_ipc.contains("CompressionType::LZ4_FRAME"));
+	assert!(storage_ipc.contains("StreamWriter::try_new_with_options"));
+
+	let dump_slab_record =
+		fs::read_to_string(manifest_dir.join("src/bin/dump_slab_record.rs")).unwrap();
+	assert!(dump_slab_record.contains("record_batch_compression_policy_from_ipc"));
+	assert!(dump_slab_record.contains("decode_batch"));
+	assert!(dump_slab_record.contains("strip_storage_synthetic_columns"));
+	assert!(dump_slab_record.contains("user_visible_preview"));
+
+	let storage_manager = manager_source(manifest_dir);
+	assert!(
+		storage_manager.contains(
+			"pub(crate) async fn refresh_storage_compression_uncompressed_resident_bytes"
+		)
+	);
+	assert!(storage_manager.contains("expensive diagnostic refresh"));
+	assert!(storage_manager.contains("Prometheus scrape path"));
+
+	let stabilization_runbook = fs::read_to_string(
+		manifest_dir.join("plans/ops/runbooks/adr043_storage_body_stabilization.md"),
+	)
+	.unwrap();
+	for signal in [
+		"storage_compression_ratio",
+		"storage_compression_decode_micros",
+		"storage_compression_encode_micros",
+		"storage_compression_uncompressed_resident_bytes",
+		"storage_compression_decode_error_total",
+		"storage_compression_l2_record_body_bytes_fetched_total",
+		"pbc_slab_stats_pruned_total",
+		"pbc_slab_stats_consulted_total",
+		"storage_multirow_point_read_amplification_bytes",
+	] {
+		assert!(
+			stabilization_runbook.contains(signal),
+			"ADR 043 stabilization runbook must mention {signal}"
+		);
+	}
+
+	let storage_dir = manifest_dir.join("src/storage");
+	let mut bare_stream_writers = Vec::new();
+	walk_dir(&storage_dir, &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for (line_no, line) in content.lines().enumerate() {
+			if line.contains("StreamWriter::try_new(") {
+				bare_stream_writers.push(format!("{}:{}", path.display(), line_no + 1));
+			}
+		}
+	});
+	assert!(
+		bare_stream_writers.is_empty(),
+		"storage record-body writers must route through src/storage/ipc.rs; bare StreamWriter::try_new at:\n{}",
+		bare_stream_writers.join("\n")
+	);
+
+	let schema_table = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	assert!(schema_table.contains("pub fn encode_arrow_schema_ipc"));
+	assert!(
+		!schema_table.contains("try_with_compression(Some"),
+		"descriptor schema IPC must stay uncompressed"
+	);
+
+	let rendered_metrics = wendelon::metrics::MetricsRegistry::default().render_prometheus();
+	for segment in [
+		"storage_compression_records_written_total",
+		"storage_compression_plaintext_bytes_total",
+		"storage_compression_encoded_bytes_total",
+		"storage_compression_encode_micros",
+		"storage_compression_decode_micros",
+		"storage_compression_decompressed_bytes_total",
+		"storage_compression_decode_error_total",
+		"storage_compression_l2_record_body_bytes_fetched_total",
+		"storage_compression_ratio",
+		"storage_compression_uncompressed_resident_bytes",
+	] {
+		// Keep the namespace and segment split so this fixture does
+		// not self-match the ADR 043 brand-prefix grep guard.
+		let metric = format!("{}{}", "wendelon_", segment);
+		assert!(
+			rendered_metrics.contains(&metric),
+			"missing ADR 043 metric {metric}"
+		);
+	}
+}
+
+#[test]
+fn test_adr044_columnar_fetch_stays_read_side_and_provider_neutral() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let descriptor_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	for forbidden in [
+		concat!("column", "_fetch", "_policy"),
+		concat!("Column", "Fetch", "Policy"),
+	] {
+		if descriptor_source.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/table.rs: descriptor surface contains forbidden token '{forbidden}'"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let provider_or_format_forbidden = [
+		concat!("Parque", "t"),
+		concat!("parque", "t"),
+		concat!("OR", "C"),
+		concat!("S3 Selec", "t"),
+		concat!("SelectObjectConten", "t"),
+	];
+	let capability_forbidden = [
+		concat!("Columnar", "L2Fetch"),
+		concat!("L2", "Columnar", "Fetch", "Capability"),
+		concat!("Node", "Capability::", "Column"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in provider_or_format_forbidden
+				.iter()
+				.chain(capability_forbidden.iter())
+				.copied()
+			{
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 044 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+		});
+	}
+
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	if columnar.contains("AuthFailed") || columnar.contains("AuthenticationFailed") {
+		violations.push(
+			"src/storage/columnar.rs: auth failures must not be L2 fetch-strategy fallbacks"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 044 columnar fetch must stay read-side, provider-neutral, and auth-strict:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 045 architectural guards.
+///
+/// Enforce that:
+/// - The compactor / sweeper / multi-row recompaction sources never
+///   re-call `synthesize_append_only_row_id`. Identities for surviving
+///   rows are preserved byte-for-byte from the slab body.
+/// - The retracted V1 counter design (`TableAppendState`,
+///   `AppendOrdinal`, `reserve_append_ordinals`,
+///   `__row_append_ordinal__`) does not reappear under a different
+///   name.
+/// - No descriptor coexistence shim
+///   (`Option<PrimaryKeyDescriptor>` field) survives the Phase 1
+///   rewrite.
+/// - No node capability bit is added for append-only.
+/// - `canonical_row_payload_hash` does not reappear in `src/`. Phase 7
+///   resolved Open question 1 by dropping the canonical row payload
+///   hash from the identity preimage on bench evidence; the helper
+///   was deleted and must not be re-introduced.
+/// - Append-only admission must not derive `WriterNodeId` from
+///   `meta.proxy_source`. Phase 8 binds it from the admitting
+///   server's authenticated `self.local_node`; the wire field
+///   `proxy_source` is zeroed on direct SDK writes and is not
+///   the authenticated-admitter contract.
+/// - The `storage_append_only_identity_synthesis_micros` histogram
+///   was deleted in Phase 8. Bench is the measurement surface for
+///   per-row identity CPU.
+/// - AppendOnly descriptor isolation: the matchers
+///   (`table_record_matches_descriptor`,
+///   `descriptor_matches_tiered_row`) accept a
+///   `stored_table_object_id` argument and verify it for
+///   AppendOnly. The schema-only matcher Phase 8 first shipped
+///   was insufficient — same-tenant table-spread prefix
+///   collisions could leak rows. Re-introducing
+///   `RowIdentityPolicy::AppendOnly => Ok(true)` (no
+///   `stored_table_object_id` check) regresses to that bug.
+#[test]
+fn test_adr045_append_only_invariants() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	// Compactor source must not call the append-only identity helper.
+	let compactor_paths = ["src/storage/sweeper.rs", "src/storage/multirow.rs"];
+	for relative in compactor_paths {
+		let path = manifest_dir.join(relative);
+		let content = match fs::read_to_string(&path) {
+			Ok(content) => content,
+			Err(_) => continue,
+		};
+		if content.contains("synthesize_append_only_row_id") {
+			violations.push(format!(
+				"{relative}: compactor / multirow source must not synthesize append-only \
+				identities for existing rows"
+			));
+		}
+	}
+	// ADR 078: the manager compactor code is now spread across storage/manager/**;
+	// scan the whole decomposed manager source, not just the root file.
+	if manager_source(manifest_dir).contains("synthesize_append_only_row_id") {
+		violations.push(
+			"src/storage/manager.rs: compactor / multirow source must not synthesize \
+			append-only identities for existing rows"
+				.to_string(),
+		);
+	}
+
+	// Retracted V1 counter symbols must not appear anywhere.
+	let scan_roots = ["src", "tests", "benches"];
+	let retracted_symbols = [
+		"TableAppendState",
+		"AppendOrdinal",
+		"reserve_append_ordinals",
+		"__row_append_ordinal__",
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for symbol in retracted_symbols {
+				if content.contains(symbol) {
+					violations.push(format!(
+						"{}: contains retracted ADR 045 V1 counter symbol '{symbol}'",
+						path.display()
+					));
+				}
+			}
+			// Coexistence-shim guard.
+			if content.contains("Option<PrimaryKeyDescriptor") {
+				violations.push(format!(
+					"{}: contains Option<PrimaryKeyDescriptor> coexistence shim \
+					 (forbidden by no-premature-backward-compat.md)",
+					path.display()
+				));
+			}
+			// Node capability bit guard.
+			if content.contains("NodeCapability::AppendOnly")
+				|| content.contains("AppendOnlyCapability")
+			{
+				violations.push(format!(
+					"{}: append-only must not introduce a node capability bit; mixed PK \
+					 and append-only fleets are descriptor-driven",
+					path.display()
+				));
+			}
+			// Phase 7 deletion guard. The canonical row payload hash
+			// was dropped from the ADR 045 §4 preimage on Phase 7 bench
+			// evidence (Open question 1, resolved). The helper must not
+			// re-appear under any name.
+			if content.contains("canonical_row_payload_hash") {
+				violations.push(format!(
+					"{}: `canonical_row_payload_hash` was deleted in Phase 7 — append-only \
+					 admission must not reintroduce per-row payload hashing (ADR 045 §4)",
+					path.display()
+				));
+			}
+			// Phase 8 deletion guard. The
+			// `storage_append_only_identity_synthesis_micros` histogram
+			// was removed; bench is the measurement surface. Re-adding
+			// the always-on per-row timer would re-introduce the cost
+			// for a metric that is only useful in bench-grade
+			// comparisons.
+			if content.contains("storage_append_only_identity_synthesis_micros")
+				|| content.contains("observe_storage_append_only_identity_synthesis")
+			{
+				violations.push(format!(
+					"{}: append-only identity-synthesis histogram was deleted in Phase 8 — \
+					 use the `benches/append_only_tables.rs` bench instead of an always-on \
+					 production timer (ADR 045 Phase 8)",
+					path.display()
+				));
+			}
+			// Phase 8 writer-identity guard. Append-only admission
+			// must bind `WriterNodeId` from the admitting server's
+			// authenticated `self.local_node`, not from the wire
+			// field `meta.proxy_source` (which the wire contract
+			// zeros on direct SDK writes).
+			if content.contains("WriterNodeId::from_node_id(meta.proxy_source)") {
+				violations.push(format!(
+					"{}: append-only admission must bind WriterNodeId from the admitting \
+					 server's authenticated `self.local_node`, not `meta.proxy_source` \
+					 (ADR 045 §3 / Phase 8). `proxy_source` is zeroed on direct SDK writes.",
+					path.display()
+				));
+			}
+			// Phase 8 descriptor-isolation guard for AppendOnly
+			// matchers. The schema-only AppendOnly arm Phase 8
+			// first shipped allowed cross-table prefix collisions
+			// to leak rows; the fix is to verify
+			// `stored_table_object_id == Some(descriptor.table_object_id)`.
+			// Re-introducing the schema-only acceptance regresses
+			// to that bug.
+			let parent_dir = path
+				.parent()
+				.and_then(|parent| parent.file_name())
+				.and_then(|name| name.to_str());
+			let is_matcher_file = path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "manager.rs")
+				|| parent_dir == Some("data_server")
+				|| parent_dir == Some("manager");
+			if is_matcher_file
+				&& content.contains("RowIdentityPolicy::AppendOnly => {")
+				&& !content.contains("descriptor.table_object_id")
+			{
+				violations.push(format!(
+					"{}: AppendOnly matcher arm must verify stored_table_object_id == \
+					 Some(descriptor.table_object_id) — schema-only acceptance permits \
+					 cross-table prefix-collision leakage (ADR 045 §5 / Phase 8).",
+					path.display()
+				));
+			}
+			// ADR 045 idempotency-bytes canonicalization. Any
+			// retry-stable derivation off `ClientWriteId` (locality
+			// salts, content hashes, redb keys, parent identities,
+			// etc.) MUST hash only the canonical idempotency
+			// identity (`client_uuid` + `sequence_no`), via
+			// `ClientWriteId::canonical_idempotency_bytes()`.
+			// Hashing the full 32-byte struct also folds in
+			// `idempotency_ttl_ms` (a server-clamped hint) and
+			// `_pad` (alignment), which break retry convergence
+			// when a client re-sends with a drifted TTL after the
+			// idempotency cache eviction or a node restart. The
+			// previously narrow guard (scoped to the
+			// `"table.append-locality"` domain) was widened in the
+			// Phase 8 idempotency-canonicalization pass once the
+			// three pre-existing sites
+			// (`PendingFinalizationId::for_record`,
+			// `encode_write_id_key`,
+			// `table_write_parent_identity`) were canonicalized.
+			let forbidden_write_id_byte_patterns = [
+				"bytemuck::bytes_of(&parent_write_id)",
+				"bytemuck::bytes_of(&meta.parent_write_id)",
+				"bytemuck::bytes_of(&write_id)",
+				"bytemuck::bytes_of(&record.write_id)",
+				"bytemuck::bytes_of(&meta.client_write_id)",
+				"bytemuck::bytes_of(&self.write_id)",
+			];
+			for pattern in forbidden_write_id_byte_patterns {
+				if content.contains(pattern) {
+					violations.push(format!(
+						"{}: forbidden raw-bytes hashing of `ClientWriteId` ({pattern}). \
+						 Retry-stable derivations must use \
+						 `ClientWriteId::canonical_idempotency_bytes()`; the full 32-byte \
+						 struct includes `idempotency_ttl_ms` (a server-clamped hint) and \
+						 `_pad`, which break retry convergence.",
+						path.display()
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 045 architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 046 architectural guards.
+///
+/// StateDigest is a hash-layer substrate only. It must not leak curve
+/// math into request admission, storage ingestion, network routing, or
+/// any durable/wire surface before a consumer ADR owns that surface.
+#[test]
+fn test_adr046_state_digest_substrate_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	for root in ["src/network", "src/storage"] {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_none_or(|ext| ext != "rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
+			if content.contains("curve25519_dalek") {
+				violations.push(format!(
+					"{}: curve25519-dalek must stay out of network/storage hot paths",
+					path.display()
+				));
+			}
+			let state_digest_storage_surface = relative
+				== Path::new("src/storage/secondary_index_segment.rs")
+				|| relative == Path::new("src/storage/lsm.rs");
+			if content.contains("StateDigest") && !state_digest_storage_surface {
+				violations.push(format!(
+					"{}: StateDigest must not be imported into storage/network durable or \
+					 protocol surfaces in ADR 046",
+					path.display()
+				));
+			}
+		});
+	}
+
+	let src_dir = manifest_dir.join("src");
+	walk_dir(&src_dir, &mut |path| {
+		if path
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.is_none_or(|ext| ext != "rs")
+		{
+			return;
+		}
+		let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
+		let Ok(content) = fs::read_to_string(path) else {
+			return;
+		};
+
+		if content.contains("NodeCapability::StateDigest")
+			|| content.contains("NodeCapability::Ecmh")
+			|| content.contains("NodeCapability::ECMH")
+			|| content.contains("StateDigestCapability")
+			|| content.contains("EcmhCapability")
+			|| content.contains("ECMHCapability")
+		{
+			violations.push(format!(
+				"{}: ADR 046 must not add a node capability bit",
+				relative.display()
+			));
+		}
+		let version_suffix_tokens = [
+			concat!("StateDigest", "V1"),
+			concat!("StateDigest", "V2"),
+			concat!("StateDigestDomain", "V1"),
+			concat!("StateDigestDomain", "V2"),
+			concat!("StateDigestAccumulator", "V1"),
+			concat!("StateDigestAccumulator", "V2"),
+			concat!("StateDigestElement", "V1"),
+			concat!("StateDigestElement", "V2"),
+		];
+		if version_suffix_tokens
+			.iter()
+			.any(|token| content.contains(token))
+		{
+			violations.push(format!(
+				"{}: ADR 046 Rust surfaces must not carry V1/V2 suffixes",
+				relative.display()
+			));
+		}
+		if content.contains("b\"table.append-row\"") && content.contains("b\"digest.table.row.") {
+			violations.push(format!(
+				"{}: append-row identity and state-digest row preimages must stay separated",
+				relative.display()
+			));
+		}
+
+		for (line_no, line) in content.lines().enumerate() {
+			if !line.contains("StateDigestDomain(") {
+				continue;
+			}
+			let trimmed = line.trim();
+			let allowed = relative == Path::new("src/hash/state_digest.rs")
+				&& (trimmed.starts_with("pub const DOMAIN_")
+					|| trimmed.starts_with("StateDigestDomain(b\"digest.")
+					|| trimmed.starts_with("pub struct StateDigestDomain(")
+					|| trimmed.starts_with("const MALFORMED_DOMAIN_FOR_TEST:"));
+			if !allowed {
+				violations.push(format!(
+					"{}:{}: StateDigestDomain construction must be a named module constant",
+					relative.display(),
+					line_no + 1
+				));
+			}
+		}
+	});
+
+	assert!(
+		violations.is_empty(),
+		"ADR 046 architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 047 architectural guards.
+///
+/// Row tombstones are now an approved append-only storage fact, but
+/// the ADR intentionally keeps the surface narrow: shared
+/// `__row_key_id__` identity, no target column, no capability bit,
+/// no short footer alias, and no project-prefixed row-delete domain.
+#[test]
+fn test_adr047_row_tombstone_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+	// Scope this guard to source/test/bench code. Plans may quote
+	// rejected peer-draft names while explaining ADR decisions.
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("__row_tombstone", "_target__"),
+		concat!("has_", "tombstones"),
+		concat!("NodeCapability::", "RowTombstone"),
+		concat!("NodeCapability::", "Tombstone"),
+		concat!("NodeCapability::", "DeleteRows"),
+		concat!("RowTombstone", "Capability"),
+		concat!("Tombstone", "Capability"),
+		concat!("DeleteRows", "Capability"),
+		concat!("wendelon.table", ".delete"),
+		concat!("wendelon.table", "-delete"),
+		concat!("TableDeleteRows", "V1"),
+		concat!("TableDeleteRows", "V2"),
+		concat!("DeleteRows", "V1"),
+		concat!("DeleteRows", "V2"),
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 047 row-tombstone token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	let schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema.contains("STORAGE_ROW_TOMBSTONE_COLUMN") {
+		violations
+			.push("src/schema/table.rs: missing STORAGE_ROW_TOMBSTONE_COLUMN constant".to_string());
+	}
+	let crypto = fs::read_to_string(manifest_dir.join("src/crypto.rs")).unwrap();
+	if !crypto.contains("HAS_ROW_TOMBSTONE_RECORDS_BIT")
+		|| !crypto.contains("has_row_tombstone_records")
+	{
+		violations.push(
+			"src/crypto.rs: missing ADR 047 has_row_tombstone_records footer bit plumbing"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 047 row-tombstone architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 049 architectural guards.
+///
+/// Content-hash row identity is now an accepted table identity
+/// policy, but its surface stays deliberately narrow: canonical
+/// logical Arrow values only, no raw IPC preimage, no schema
+/// generation/fingerprint in the row key, no new digest domain, and
+/// no version-suffixed Rust identity types.
+#[test]
+fn test_adr049_content_hash_identity_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema_source.contains("AppendOnlyContentHash") {
+		violations.push(
+			"src/schema/table.rs: missing RowIdentityPolicy::AppendOnlyContentHash".to_string(),
+		);
+	}
+	if !schema_source.contains("CONTENT_HASH_REJECTED_NON_NULL_DEFAULT")
+		|| !schema_source.contains("CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION")
+		|| !schema_source.contains("CONTENT_HASH_REJECTED_INVALID_UTF8")
+	{
+		violations.push(
+			"src/schema/table.rs: missing ADR 049 content-hash reject code surface".to_string(),
+		);
+	}
+	if !schema_source.contains("AppendOnlyContentHash rejects LocalityPolicy::ColumnProjection") {
+		violations.push(
+			"src/schema/table.rs: content-hash ColumnProjection rejection must stay explicit"
+				.to_string(),
+		);
+	}
+
+	let data_server_source = data_server_source(manifest_dir.as_ref());
+	if !data_server_source.contains("bifurcate_content_hash_table_write")
+		|| !data_server_source.contains("content_hash_admission_guard")
+		|| !data_server_source.contains("observe_storage_content_hash_duplicate_absorption")
+		|| !data_server_source.contains("row_visible_for_admission")
+	{
+		violations.push(
+			"src/network/data_server.rs: missing explicit ADR 049 duplicate absorption path"
+				.to_string(),
+		);
+	}
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	if !pk_delete_source.contains("row_visible_for_admission")
+		|| !pk_delete_source.contains("row_visible_under_retention")
+	{
+		violations.push(
+			"src/storage/pk_delete.rs: ADR 049 visible-membership helper must include ADR 048 retention visibility"
+				.to_string(),
+		);
+	}
+
+	let content_hash_path = manifest_dir.join("src/storage/content_hash.rs");
+	let content_hash_source = fs::read_to_string(&content_hash_path).unwrap();
+	let production_content_hash = content_hash_source
+		.split("#[cfg(test)]")
+		.next()
+		.unwrap_or(&content_hash_source);
+	if !production_content_hash.contains("DOMAIN_CONTENT_HASH_ROW")
+		|| !production_content_hash.contains("b\"table.append-content-row.v1\"")
+	{
+		violations.push(
+			"src/storage/content_hash.rs: missing exact ADR 049 row identity domain".to_string(),
+		);
+	}
+	if !production_content_hash.contains("content_hash_row_key_id") {
+		violations.push("src/storage/content_hash.rs: missing content-hash key helper".to_string());
+	}
+	for needle in [
+		"arrow::ipc",
+		"StreamWriter",
+		"FileWriter",
+		"IpcWriteOptions",
+		"encode_arrow_schema_ipc",
+		"schema_generation",
+		"logical_schema_fingerprint",
+		"physical_descriptor_fingerprint",
+	] {
+		if production_content_hash.contains(needle) {
+			violations.push(format!(
+				"src/storage/content_hash.rs: production encoder/preimage must not contain '{needle}'"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("AppendOnlyContentHash", "V1"),
+		concat!("AppendOnlyContentHash", "V2"),
+		concat!("ContentHashIdentity", "V1"),
+		concat!("ContentHashIdentity", "V2"),
+		concat!("digest.table.row.", "content.v1"),
+		concat!("Wendelon", "ContentHash"),
+		concat!("wendelon", "_content_hash"),
+		concat!("NodeCapability::", "ContentHash"),
+		concat!("ContentHash", "Capability"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 049 content-hash token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 049 content-hash architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 050 architectural guards.
+///
+/// PK delete is a supersession behavior on the existing PK version
+/// chain. It reuses the `TableDeleteRows` wire frame, the ADR 047
+/// tombstone marker column, and ADR 049's admission-time visibility
+/// discipline without introducing a new digest domain or reject-code
+/// family.
+#[test]
+fn test_adr050_pk_delete_supersession_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let data_server_source = data_server_source(manifest_dir.as_ref());
+	for needle in [
+		"admit_pk_write_row",
+		"admit_pk_delete_row",
+		"bifurcate_primary_key_table_write",
+		"emit_table_delete_requested_audit",
+		"emit_table_delete_completion_audit",
+		"tombstone_marker_layout",
+		"row_visible_for_admission",
+		"pk_delete_outcome_for_latest",
+		"TableDeleteRowsRequestMeta",
+	] {
+		if !data_server_source.contains(needle) {
+			violations.push(format!(
+				"src/network/data_server.rs: ADR 050 missing required symbol {needle}"
+			));
+		}
+	}
+
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	for needle in [
+		"PkAdmissionOutcome",
+		"admit_pk_write_row",
+		"admit_pk_delete_row",
+		"RowIdentityPolicy::PrimaryKey",
+		"lookup_as_of",
+		"row_visible_under_retention",
+	] {
+		if !pk_delete_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/pk_delete.rs: ADR 050 missing required symbol {needle}"
+			));
+		}
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for needle in [
+		"wendelon_storage_pk_delete_requests_total",
+		"wendelon_storage_pk_delete_rows_deleted_total",
+		"wendelon_storage_pk_delete_rows_already_deleted_total",
+		"wendelon_storage_pk_delete_rows_not_found_total",
+		"wendelon_storage_pk_delete_resurrections_total",
+		"wendelon_storage_pk_delete_tombstone_boundary_versions_retained_total",
+		"wendelon_storage_pk_upsert_no_digest_add_total",
+		"wendelon_storage_pk_admission_visibility_lookup_seconds",
+	] {
+		if !metrics_source.contains(needle) {
+			violations.push(format!(
+				"src/metrics/registry.rs: ADR 050 missing required metric {needle}"
+			));
+		}
+	}
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema_source.contains("Self::PrimaryKey(_)") {
+		violations.push(
+			"src/schema/table.rs: PrimaryKey must support row tombstone admission".to_string(),
+		);
+	}
+
+	let sweeper_source = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+	if !sweeper_source.contains("slab_row_tombstone_metadata(info.slab_id)") {
+		violations.push(
+			"src/storage/sweeper.rs: fresh tier commits must carry row tombstone metadata"
+				.to_string(),
+		);
+	}
+
+	let manager_source = manager_source(manifest_dir);
+	for needle in [
+		"row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref()",
+		"tombstone_metadata: merge_row_tombstone_metadata(",
+	] {
+		if !manager_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/manager.rs: tiered retention rewrites must preserve row tombstone metadata via {needle}"
+			));
+		}
+	}
+
+	let core_source = fs::read_to_string(manifest_dir.join("src/storage/core.rs")).unwrap();
+	for needle in [
+		"validate_recovered_row_tombstone_marker_shape",
+		"row tombstone marker missing __row_table_object_id__",
+		"row tombstone marker recovered with user columns",
+	] {
+		if !core_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/core.rs: ADR 050 recovery must fail closed for ambiguous tombstone markers via {needle}"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("row_currently", "_visible"),
+		concat!("PBC_REJECT_ROW_TOMBSTONES_", "REQUIRE_APPEND_ONLY"),
+		concat!("PK_DELETE_", "REJECTED_"),
+		concat!("PkDelete", "V1"),
+		concat!("PkSupersession", "V1"),
+		concat!("PkAdmissionOutcome", "V1"),
+		concat!("digest.", "table.row.", "p", "k.v1"),
+		concat!("digest.", "table.row.", "de", "lete.v1"),
+		concat!("digest.", "table.row.", "super", "session.v1"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: ADR 050 forbidden surface {needle}",
+						path.strip_prefix(manifest_dir).unwrap_or(path).display()
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 050 PK-delete supersession invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 051 architectural guards.
+///
+/// Descriptor fingerprints are split into logical schema identity
+/// and physical descriptor shape. Existing aggregate, CSB, columnar,
+/// and tiered-stats cache consumers must stay on the logical axis.
+#[test]
+fn test_adr051_descriptor_fingerprint_split_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let fingerprint_source =
+		fs::read_to_string(manifest_dir.join("src/hash/descriptor_fingerprint.rs")).unwrap();
+	for needle in [
+		"pub struct LogicalSchemaFingerprint([u8; 32]);",
+		"pub struct PhysicalDescriptorFingerprint([u8; 32]);",
+		"pub(crate) const fn from_bytes",
+		"pub const fn as_bytes",
+		"b\"digest.table.schema.logical.v1\"",
+		"b\"digest.table.descriptor.physical.v1\"",
+	] {
+		if !fingerprint_source.contains(needle) {
+			violations.push(format!(
+				"src/hash/descriptor_fingerprint.rs: ADR 051 missing required surface {needle}"
+			));
+		}
+	}
+	if fingerprint_source.contains("Pod") || fingerprint_source.contains("Zeroable") {
+		violations.push(
+			"src/hash/descriptor_fingerprint.rs: descriptor fingerprints must not derive Pod/Zeroable"
+				.to_string(),
+		);
+	}
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let descriptor_block = schema_source
+		.split_once("pub struct TableSchemaDescriptor {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	if !descriptor_block.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !descriptor_block
+			.contains("pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint")
+	{
+		violations.push(
+			"src/schema/table.rs: descriptor must carry both ADR 051 fingerprint fields"
+				.to_string(),
+		);
+	}
+	for needle in [
+		"compute_logical_schema_fingerprint",
+		"compute_physical_descriptor_fingerprint",
+		"refresh_descriptor_fingerprints",
+		"PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH",
+	] {
+		if !schema_source.contains(needle) {
+			violations.push(format!(
+				"src/schema/table.rs: missing ADR 051 symbol {needle}"
+			));
+		}
+	}
+
+	let aggregate_source =
+		fs::read_to_string(manifest_dir.join("src/schema/aggregate.rs")).unwrap();
+	if !aggregate_source.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint") {
+		violations.push(
+			"src/schema/aggregate.rs: aggregate wire must use LogicalSchemaFingerprint".to_string(),
+		);
+	}
+	if aggregate_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/schema/aggregate.rs: aggregate wire must not bind to physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let stats_source = fs::read_to_string(manifest_dir.join("src/storage/stats.rs")).unwrap();
+	for needle in [
+		"pub logical_schema_fingerprint: LogicalSchemaFingerprint",
+		"header.logical_schema_fingerprint.as_bytes()",
+		"LogicalSchemaFingerprint::from_bytes",
+	] {
+		if !stats_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/stats.rs: CSB header must use logical fingerprint via {needle}"
+			));
+		}
+	}
+	if stats_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/stats.rs: CSB eligibility must not compare descriptor physical policy"
+				.to_string(),
+		);
+	}
+
+	let columnar_source = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	if !columnar_source.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !columnar_source.contains("descriptor.logical_schema_fingerprint")
+	{
+		violations.push(
+			"src/storage/columnar.rs: columnar directory must bind logical fingerprint".to_string(),
+		);
+	}
+	if columnar_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/columnar.rs: columnar directory must not bind physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let manager_source = manager_source(manifest_dir);
+	let tiered_stats_cache_key_block = manager_source
+		.split_once("struct TieredStatsCacheKey {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	// ADR 078: tiered_stats_cache_key moved to the stats_facts island; end the region
+	// at the function's own closing brace, not a downstream derive marker whose position
+	// shifted under module concatenation.
+	let tiered_stats_cache_key_builder = manager_source
+		.split_once("fn tiered_stats_cache_key(")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	let tiered_stats_cache_key_surface =
+		format!("{tiered_stats_cache_key_block}\n{tiered_stats_cache_key_builder}");
+	if !tiered_stats_cache_key_surface
+		.contains("logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !tiered_stats_cache_key_surface.contains("descriptor.logical_schema_fingerprint")
+	{
+		violations.push(
+			"src/storage/manager.rs: tiered stats cache key must bind logical fingerprint"
+				.to_string(),
+		);
+	}
+	if tiered_stats_cache_key_surface.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/manager.rs: tiered stats cache key must not bind physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let content_hash_source =
+		fs::read_to_string(manifest_dir.join("src/storage/content_hash.rs")).unwrap();
+	let content_hash_prod = content_hash_source
+		.split("\n#[cfg(test)]")
+		.next()
+		.unwrap_or(content_hash_source.as_str());
+	for needle in [
+		concat!("logical_schema_", "fingerprint"),
+		concat!("physical_descriptor_", "fingerprint"),
+		concat!("schema_", "fingerprint"),
+	] {
+		if content_hash_prod.contains(needle) {
+			violations.push(format!(
+				"src/storage/content_hash.rs: content-hash row identity production path must stay descriptor-fingerprint-free ({needle})"
+			));
+		}
+	}
+
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	for needle in [
+		concat!("logical_schema_", "fingerprint"),
+		concat!("physical_descriptor_", "fingerprint"),
+		concat!("schema_", "fingerprint"),
+	] {
+		if pk_delete_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/pk_delete.rs: PK delete admission must stay descriptor-fingerprint-free ({needle})"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("schema", "_fingerprint"),
+		concat!("Schema", "Fingerprint"),
+		concat!("PBC_REJECT_STATS_", "FINGERPRINT_MISMATCH"),
+		concat!("PBC_REJECT_STATS_PHYSICAL_", "FINGERPRINT_MISMATCH"),
+		concat!("LogicalSchemaFingerprint", "V1"),
+		concat!("PhysicalDescriptorFingerprint", "V1"),
+		concat!("DescriptorFingerprint", "V1"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content
+					.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+					.any(|token| token == needle)
+				{
+					violations.push(format!(
+						"{}: ADR 051 forbidden descriptor fingerprint token {needle}",
+						path.strip_prefix(manifest_dir).unwrap_or(path).display()
+					));
+				}
+			}
+		});
+	}
+
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"descriptor_fingerprint\"") {
+		violations
+			.push("Cargo.toml: ADR 051 descriptor fingerprint bench is not registered".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for needle in [
+		"wendelon_storage_csb_merge_logical_fingerprint_mismatch_total",
+		"wendelon_storage_csb_payload_coverage_fall_through_total",
+		"wendelon_storage_csb_merge_pre_adr_051_cliff_total",
+		"wendelon_storage_aggregate_cache_logical_fingerprint_hit_total",
+		"wendelon_storage_aggregate_cache_logical_fingerprint_miss_total",
+		"wendelon_storage_descriptor_recompute_seconds",
+		"wendelon_storage_descriptor_validate_seconds",
+		"wendelon_storage_descriptor_logical_only_mutations_total",
+		"wendelon_storage_descriptor_physical_only_mutations_total",
+		"wendelon_storage_descriptor_combined_mutations_total",
+	] {
+		if !metrics_source.contains(needle) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 051 metric {needle}"
+			));
+		}
+	}
+
+	if !manifest_dir
+		.join("plans/ops/runbooks/descriptor_fingerprint_split.md")
+		.exists()
+	{
+		violations.push(
+			"plans/ops/runbooks/descriptor_fingerprint_split.md: ADR 051 runbook is missing"
+				.to_string(),
+		);
+	}
+	let runbook_index =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_index.contains("descriptor_fingerprint_split.md") {
+		violations.push("plans/ops/runbooks/README.md: ADR 051 runbook is not listed".to_string());
+	}
+	let runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/descriptor_fingerprint_split.md"))
+			.unwrap();
+	if !runbook.contains("table.schema_descriptor_updated") {
+		violations.push(
+			"plans/ops/runbooks/descriptor_fingerprint_split.md: ADR 051 audit event is not documented"
+				.to_string(),
+		);
+	}
+	let audit_source = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	if !audit_source.contains("table.schema_descriptor_updated")
+		|| !audit_source.contains("TableSchemaDescriptorUpdate")
+	{
+		violations
+			.push("src/audit.rs: ADR 051 descriptor mutation audit surface is missing".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 051 descriptor fingerprint invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
+	let mut names = Vec::new();
+	for line in rendered.lines() {
+		let line = line.trim();
+		if line.is_empty() {
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("# HELP ") {
+			if let Some(name) = rest.split_whitespace().next() {
+				names.push(name);
+			}
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("# TYPE ") {
+			if let Some(name) = rest.split_whitespace().next() {
+				names.push(name);
+			}
+			continue;
+		}
+		if line.starts_with('#') {
+			continue;
+		}
+		if let Some(name) = line.split_whitespace().next() {
+			names.push(name.split_once('{').map(|(name, _)| name).unwrap_or(name));
+		}
+	}
+	names.sort_unstable();
+	names.dedup();
+	names
+}
+
+#[test]
+fn test_adr052_secondary_index_architecture_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let state_digest = fs::read_to_string(manifest_dir.join("src/hash/state_digest.rs")).unwrap();
+	if !state_digest.contains("DOMAIN_SECONDARY_INDEX_ENTRY")
+		|| !state_digest.contains("digest.secondary_index.entry.v1")
+	{
+		violations.push(
+			"src/hash/state_digest.rs: ADR 052 secondary-index entry digest domain is missing"
+				.to_string(),
+		);
+	}
+
+	let schema_source =
+		fs::read_to_string(manifest_dir.join("src/schema/secondary_index.rs")).unwrap();
+	for required in [
+		"INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH",
+		"INDEX_REJECT_UNSUPPORTED_COLUMN_TYPE",
+		"INDEX_REJECT_PK_COLUMN",
+		"INDEX_REJECT_SYNTHETIC_COLUMN",
+		"SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED",
+		"SCHEMA_UPDATE_REJECT_INDEX_OBJECT_ID_COLLISION",
+		"SCHEMA_UPDATE_REJECT_INDEX_NAME_COLLISION",
+		"SCHEMA_UPDATE_REJECT_INDEX_COLUMN_COLLISION",
+	] {
+		if !schema_source.contains(required) {
+			violations.push(format!(
+				"src/schema/secondary_index.rs: missing ADR 052 reject code {required}"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_none_or(|ext| ext != "rs")
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in [
+				concat!("INDEX_REJECT_", "ALTER"),
+				concat!("INDEX_REJECT_", "NULL"),
+				concat!("SecondaryIndexDescriptor", "V1"),
+				concat!("SecondaryIndexEntry", "V1"),
+				concat!("SecondaryIndexCatalog", "V1"),
+				concat!("IndexLogical", "Fingerprint"),
+				concat!("digest.table.index.descriptor", ".logical.v1"),
+				concat!("Wendelon", "Index"),
+				concat!("wendelon", "_index_"),
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 052 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+		});
+	}
+
+	let secondary_index_sources = [
+		"src/schema/secondary_index.rs",
+		"src/storage/secondary_index.rs",
+		"src/storage/secondary_index_segment.rs",
+	];
+	for relative in secondary_index_sources {
+		let content = fs::read_to_string(manifest_dir.join(relative)).unwrap();
+		if content.contains("PhysicalDescriptorFingerprint") {
+			violations.push(format!(
+				"{relative}: ADR 052 index entries must not bind to the physical descriptor fingerprint"
+			));
+		}
+	}
+
+	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !manifest.contains("name = \"secondary_index\"") {
+		violations.push("Cargo.toml: ADR 052 secondary_index benchmark is missing".to_string());
+	}
+	let bench_source = fs::read_to_string(manifest_dir.join("benches/secondary_index.rs")).unwrap();
+	if !bench_source.contains("--full") || !bench_source.contains("1_000_000") {
+		violations.push(
+			"benches/secondary_index.rs: ADR 052 promotion-gate row-count mode is missing"
+				.to_string(),
+		);
+	}
+
+	let runbook_path = manifest_dir.join("plans/ops/runbooks/secondary_indexes.md");
+	if !runbook_path.exists() {
+		violations.push(
+			"plans/ops/runbooks/secondary_indexes.md: ADR 052 operator runbook is missing"
+				.to_string(),
+		);
+	} else {
+		let runbook = fs::read_to_string(&runbook_path).unwrap();
+		for required in [
+			"wendelon_storage_secondary_index_uncovered_slabs_total",
+			"wendelon_storage_secondary_index_corruption_failures_total",
+			"secondary_index.catalog_updated",
+			"IndexDropGcComplete",
+			"SCHEMA_UPDATE_REJECT_INDEX_NAME_COLLISION",
+			"max_index_buffer_bytes",
+			"active_buffer_overflow",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/secondary_indexes.md: missing ADR 052 runbook token {required}"
+				));
+			}
+		}
+	}
+
+	let runbook_catalog =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_catalog.contains("secondary_indexes.md") {
+		violations
+			.push("plans/ops/runbooks/README.md: ADR 052 runbook is not cataloged".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"wendelon_storage_secondary_index_segments_built_total",
+		"wendelon_storage_secondary_index_segments_failed_total",
+		"wendelon_storage_secondary_index_query_plans_total",
+		"wendelon_storage_secondary_index_drop_gc_seconds",
+	] {
+		if !metrics_source.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 052 metric {required}"
+			));
+		}
+	}
+
+	let manager_source = manager_source(manifest_dir);
+	for required in [
+		"gc_secondary_index_segments_for_dropping_index",
+		"CorruptSegment",
+		"forget_slab",
+		"observe_storage_secondary_index_corruption_failure",
+		"source_slab_lease",
+		"acquire_secondary_index_source_slab_read_lease",
+	] {
+		if !manager_source.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 052 manager surface {required}"
+			));
+		}
+	}
+
+	let audit_source = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	for required in [
+		"SecondaryIndexCatalogUpdated",
+		"secondary_index.catalog_updated",
+		"SecondaryIndexCatalogUpdate",
+		"target_index_object_id",
+	] {
+		if !audit_source.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 052 audit surface {required}"
+			));
+		}
+	}
+
+	let metrics_smoke = fs::read_to_string(manifest_dir.join("tests/metrics_smoke.rs")).unwrap();
+	if !metrics_smoke.contains("wendelon_storage_secondary_index_drop_gc_seconds") {
+		violations
+			.push("tests/metrics_smoke.rs: ADR 052 metrics smoke coverage is missing".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 052 secondary-index invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr053_wire_ipc_compression_architecture_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let network_ipc = fs::read_to_string(manifest_dir.join("src/network/ipc.rs")).unwrap();
+	for required in [
+		"WIRE_BODY_COMPRESSION",
+		"RecordBodyCompressionPolicy::Lz4Frame",
+		"wire_ipc_write_options",
+		"wire_encode_batch",
+		"wire_decode_batch",
+		"wire_encode_batch_for_path",
+		"observe_wire_decode_error_for_bytes",
+		"descriptor-schema: `src/schema/table.rs::encode_arrow_schema_ipc`",
+		"test-or-bench-default",
+	] {
+		if !network_ipc.contains(required) {
+			violations.push(format!(
+				"src/network/ipc.rs: missing ADR 053 wire IPC surface {required}"
+			));
+		}
+	}
+
+	let network_mod = fs::read_to_string(manifest_dir.join("src/network/mod.rs")).unwrap();
+	if !network_mod.contains("pub mod ipc;") || !network_mod.contains("pub use ipc::*;") {
+		violations
+			.push("src/network/mod.rs: ADR 053 network IPC module is not exported".to_string());
+	}
+
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	if !schema_core.contains("FRAME_FLAG_KNOWN_MASK")
+		|| !schema_core.contains("pub const FRAME_FLAG_KNOWN_MASK: u16 = FRAME_FLAG_STREAM_END;")
+	{
+		violations
+			.push("src/schema/core.rs: ADR 053 known HRFT frame flag mask is missing".to_string());
+	}
+	let network_core = fs::read_to_string(manifest_dir.join("src/network/core.rs")).unwrap();
+	if !network_core.contains("header.flags & !FRAME_FLAG_KNOWN_MASK") {
+		violations.push(
+			"src/network/core.rs: ADR 053 unknown frame flag rejection is missing".to_string(),
+		);
+	}
+	if !schema_core.contains("pub const HRFT_ENVELOPE_VERSION: u8 = 1;") {
+		violations
+			.push("src/schema/core.rs: ADR 053 must not bump HRFT_ENVELOPE_VERSION".to_string());
+	}
+	for forbidden in [concat!("arrow_", "compressed"), concat!("has_", "trailing")] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: FrameHeader.flags doc still contains forbidden ADR 053 token {forbidden}"
+			));
+		}
+	}
+
+	let client_core = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
+	if !client_core.contains("NetworkCompressionPath::ClientBatch")
+		|| !client_core.contains("StreamWriter::try_new_with_options")
+		|| client_core.contains("StreamWriter::try_new(")
+	{
+		violations.push(
+			"src/client/core.rs: client batch wire encoder must use compressed IPC options"
+				.to_string(),
+		);
+	}
+
+	let data_server = data_server_source(manifest_dir.as_ref());
+	// ADR 077: data_server_source() already excludes tests.rs, so the source is
+	// production-only; no inline `mod tests` boundary remains to split on.
+	let production_data_server = data_server.as_str();
+	if production_data_server.contains("StreamWriter::try_new(") {
+		violations.push(
+			"src/network/data_server.rs: migration writer must not use bare StreamWriter::try_new"
+				.to_string(),
+		);
+	}
+	for (path, minimum) in [
+		("NetworkCompressionPath::MigrationRecords", 1),
+		("NetworkCompressionPath::QueryResponse", 3),
+		("NetworkCompressionPath::ReadResponse", 1),
+	] {
+		let count = production_data_server.matches(path).count();
+		if count < minimum {
+			violations.push(format!(
+				"src/network/data_server.rs: ADR 053 expected at least {minimum} {path} encoder site(s), found {count}"
+			));
+		}
+	}
+	for forbidden in [
+		"let arrow_bytes = encode_batch(",
+		"let arrow = encode_batch(",
+		"let bytes = encode_batch(",
+	] {
+		if production_data_server.contains(forbidden) {
+			violations.push(format!(
+				"src/network/data_server.rs: production wire response still calls storage multirow encode_batch via `{forbidden}`"
+			));
+		}
+	}
+	for (relative, content) in [
+		("src/client/core.rs", client_core.as_str()),
+		("src/network/data_server.rs", production_data_server),
+	] {
+		if content.contains("StreamWriter::try_new_with_options")
+			&& !content.contains("wire_ipc_write_options")
+		{
+			violations.push(format!(
+				"{relative}: wire-side StreamWriter::try_new_with_options must route through wire_ipc_write_options"
+			));
+		}
+	}
+	let storage_ipc = fs::read_to_string(manifest_dir.join("src/storage/ipc.rs")).unwrap();
+	if !storage_ipc.contains("ipc_write_options_for_policy") {
+		violations
+			.push("src/storage/ipc.rs: ADR 043 storage IPC policy helper is missing".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"network_compression_batches_total",
+		"network_compression_encoded_bytes_total",
+		"network_compression_encode_micros",
+		"network_compression_ratio",
+		"network_compression_decode_error_total",
+		"client_batch",
+		"migration_records",
+		"query_response",
+		"read_response",
+		"compressed",
+		"error",
+	] {
+		if !metrics_source.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 053 network compression metric token {required}"
+			));
+		}
+	}
+	let runbook_path = manifest_dir.join("plans/ops/runbooks/wire_arrow_ipc_body_compression.md");
+	if !runbook_path.exists() {
+		violations
+			.push("plans/ops/runbooks/wire_arrow_ipc_body_compression.md is missing".to_string());
+	} else {
+		let runbook = fs::read_to_string(&runbook_path).unwrap();
+		for required in [
+			"wendelon_network_compression_batches_total",
+			"wendelon_network_compression_decode_error_total",
+			"storage_compression_*",
+			"FRAME_FLAG_STREAM_END",
+			"Identity and locality",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/wire_arrow_ipc_body_compression.md: missing ADR 053 runbook token {required}"
+				));
+			}
+		}
+	}
+	let runbook_catalog =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_catalog.contains("wire_arrow_ipc_body_compression.md") {
+		violations
+			.push("plans/ops/runbooks/README.md: ADR 053 runbook is not cataloged".to_string());
+	}
+	let observability =
+		fs::read_to_string(manifest_dir.join("plans/ops/observability.md")).unwrap();
+	for required in [
+		"wendelon_network_compression_batches_total",
+		"wendelon_network_compression_encoded_bytes_total",
+		"wendelon_network_compression_encode_micros",
+		"wendelon_network_compression_ratio",
+		"wendelon_network_compression_decode_error_total",
+	] {
+		if !observability.contains(required) {
+			violations.push(format!(
+				"plans/ops/observability.md: missing ADR 053 metric {required}"
+			));
+		}
+	}
+
+	for root in ["src", "tests", "benches"] {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_none_or(|ext| ext != "rs")
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in [
+				concat!("network_compression_plain", "text_bytes_total"),
+				concat!("network_compression_decode", "_micros"),
+				concat!("uncompressed_", "passthrough"),
+				concat!("network_compression_decode_error_total{codec, ", "reason"),
+				concat!("MsgType::", "ARROW_COMPRESSED_"),
+				concat!("FRAME_FLAG_", "COMPRESS"),
+				concat!("Wire", "Body", "Compression", "Policy"),
+				concat!("Wire", "Compression", "Level"),
+				concat!("Record", "Body", "Compression", "Policy", "V"),
+				concat!("Wire", "Compression", "V"),
+				concat!("Wendelon", "WireCompression"),
+				concat!("wendelon", "_wire_compression_"),
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 053 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+			for line in content.lines() {
+				if line.contains("StreamReader::try_new(") && !line.contains(", None)") {
+					violations.push(format!(
+						"{}: ADR 053 receiver StreamReader must pass projection None: {}",
+						path.display(),
+						line.trim()
+					));
+				}
+			}
+		});
+	}
+
+	for manifest in ["Cargo.toml", "crates/wendelon-client/Cargo.toml"] {
+		let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+		if !content.contains("arrow = {") || !content.contains("\"ipc_compression\"") {
+			violations.push(format!(
+				"{manifest}: ADR 053 requires Arrow ipc_compression feature to stay pinned on"
+			));
+		}
+	}
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"wire_arrow_ipc_body_compression\"") {
+		violations.push("Cargo.toml: ADR 053 wire compression benchmark is missing".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/wire_arrow_ipc_body_compression.rs");
+	if !bench_path.exists() {
+		violations.push(
+			"benches/wire_arrow_ipc_body_compression.rs: ADR 053 bench harness is missing"
+				.to_string(),
+		);
+	} else {
+		let bench = fs::read_to_string(&bench_path).unwrap();
+		for required in [
+			"--quick",
+			"--full",
+			"encode_wire_lz4",
+			"decode_wire_lz4",
+			"wire_arrow_ipc_size",
+			"wire_arrow_ipc_rpc_size",
+			"wire_arrow_ipc_transmit_estimate",
+			"rpc_{rpc}_default_encode_decode",
+			"rpc_{rpc}_wire_lz4_encode_decode",
+			"rpc_read_resp_pass_through_decode_only",
+			"RecordBodyCompressionPolicy::Lz4Frame",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/wire_arrow_ipc_body_compression.rs: missing ADR 053 bench token {required}"
+				));
+			}
+		}
+	}
+	let bench_results =
+		manifest_dir.join("plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md");
+	if !bench_results.exists() {
+		violations.push(
+			"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md is missing"
+				.to_string(),
+		);
+	} else {
+		let bench_results = fs::read_to_string(&bench_results).unwrap();
+		for required in [
+			"2026-05-04 Quick Smoke",
+			"wire_helper_encode_in_timed_path=false",
+			"full promotion matrix",
+		] {
+			if !bench_results.contains(required) {
+				violations.push(format!(
+					"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md: missing ADR 053 bench-results token {required}"
+				));
+			}
+		}
+	}
+	let transport_source =
+		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	if !transport_source.contains("pub const ALL: [NodeCapability; 2]") {
+		violations.push(
+			"src/network/transport.rs: ADR 053 must not add a node capability bit".to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 053 wire IPC compression invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn adr054_cdc_subscription_substrate_contract() {
+	let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let schema_cdc = fs::read_to_string(manifest_dir.join("src/schema/cdc.rs")).unwrap();
+	for required in [
+		"pub struct CdcCursor",
+		"pub row_hlc: Hlc",
+		"pub row_key_id: RowKeyId",
+		"pub record_row_index: RecordRowIndex",
+		"pub struct CdcSubscriptionId(pub u128)",
+		"pub enum CdcSubscribeBound",
+		"pub enum CdcFrameSource",
+		"pub enum CdcRejectCode",
+		"BelowRetentionFloor = 1",
+		"InternalEngineError = 8",
+		"pub struct CdcSubscribeRequestMeta",
+		"resume_visible_state_digest: StateDigest",
+		"pub struct CdcFrameMeta",
+		"frame_low_cursor",
+		"frame_high_cursor",
+		"pub struct CdcCheckpointMeta",
+		"digest_domain_raw: u32",
+		"pub struct CdcRejectMeta",
+		"code_raw: u32",
+		"pub fn cdc_event_batch",
+		"pub fn cdc_tombstone_event_batch",
+		"pub fn cdc_cursor_in_catchup_window",
+		"cursor > start_exclusive && cursor <= upper_inclusive",
+	] {
+		if !schema_cdc.contains(required) {
+			violations.push(format!(
+				"src/schema/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"CdcRejectCode, Pod",
+		"CdcSubscribeBound, Pod",
+		"CdcFrameSource, Pod",
+		concat!("Cdc", "EventKind"),
+		concat!("Cdc", "Operation"),
+	] {
+		if schema_cdc.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/cdc.rs: contains forbidden ADR 054 token {forbidden}"
+			));
+		}
+	}
+
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	for required in [
+		"pub const CDC_SUBSCRIBE_REQ: Self = Self(0x36)",
+		"pub const CDC_FRAME: Self = Self(0x37)",
+		"pub const CDC_CHECKPOINT: Self = Self(0x38)",
+		"pub const CDC_REJECT: Self = Self(0x39)",
+	] {
+		if !schema_core.contains(required) {
+			violations.push(format!(
+				"src/schema/core.rs: missing ADR 054 MsgType {required}"
+			));
+		}
+	}
+	if schema_core.contains(concat!("FRAME_FLAG_", "CDC")) {
+		violations.push("src/schema/core.rs: ADR 054 must not add CDC frame flags".to_string());
+	}
+
+	let network_cdc = fs::read_to_string(manifest_dir.join("src/network/cdc.rs")).unwrap();
+	for required in [
+		"CdcSubscriptionRegistry",
+		"SubscriptionHandle",
+		"cdc_emit_frame",
+		"wire_encode_batch_for_path(batch, NetworkCompressionPath::CdcEvent)",
+		"cdc_emit_checkpoint",
+		"cdc_emit_reject",
+		"pub fn remove",
+	] {
+		if !network_cdc.contains(required) {
+			violations.push(format!(
+				"src/network/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+
+	let data_server = data_server_source(manifest_dir.as_ref());
+	for required in [
+		"MsgType::CDC_SUBSCRIBE_REQ",
+		"handle_cdc_subscribe_stream",
+		"cdc_registry: Arc<CdcSubscriptionRegistry>",
+		"cdc_live_tail_rings",
+		"cdc_locality_frontiers: Arc<CdcLocalityFrontiers>",
+		"cdc_pending_live_entries: Arc<DashMap<PendingFinalizationId, Vec<CdcStagedEntryRef>>>",
+		"cdc_marker_pending_live_entries: Arc<DashMap<CdcFinalizationKey, Vec<CdcStagedEntryRef>>>",
+		"struct CdcFinalizationKey",
+		"fn from_table_replica_meta(meta: &TableReplicaWriteMeta) -> Self",
+		"spawn_cdc_finalization_release_observer",
+		"cdc_release_pending_finalization_marker",
+		"stage_cdc_table_replica_children",
+		"self.cdc_stage_pending_finalization_marker",
+		"CdcFinalizationKey::from_table_replica_meta(&meta)",
+		"cdc_heartbeat_localities: Arc<DashMap<Locality, ()>>",
+		"cdc_heartbeat_observed_frontiers: Arc<DashMap<Locality, HybridTimestamp>>",
+		"stage_cdc_table_children",
+		".with_finalized(finalized)",
+		"self.cdc_pending_live_entries",
+		"self.cdc_release_pending_finalization(record.id).await",
+		"self.cdc_evict_pending_finalization(pending.id).await",
+		"ring.mark_finalized_entry",
+		"} else {\n\t\t\t\tmetrics().observe_cdc_pending_finalization_evicted();",
+		"metrics().observe_cdc_pending_finalization_evicted()",
+		"cdc_emit_frame",
+		"collect_cdc_catchup_events",
+		"compute_cdc_visible_row_keys_at_cursor",
+		"cdc_open_time_ring_continuity_check",
+		"cdc_safe_emission_hlc",
+		"cdc_capture_snapshot_hlc",
+		"cdc_live_retention_reject_code",
+		"cdc_live_recovery_upper_after",
+		"evicted_cursor_frontier",
+		"emit_cdc_live_recovery_catchup_events",
+		"handle.cursor_high_water.advance_max(recovery_upper)",
+		"CdcFrameSource::Catchup.as_raw()",
+		"cdc_retention_reject_code_for_cursor",
+		"cdc_table_maybe_replicated_here",
+		"cdc_ranges_maybe_replicated_by_local_node",
+		"CdcRejectCode::TableNotReplicatedHere",
+		"emit_cdc_subscription_opened_audit",
+		"emit_cdc_subscription_closed_audit",
+		"AuditOperation::CdcSubscriptionOpened",
+		"AuditOperation::CdcSubscriptionClosed",
+		"cdc_cursor_audit_json",
+		"cdc_reject_audit_reason",
+		"cdc_min_locality_frontier_for_ranges",
+		"cdc_source_localities_for_ranges",
+		"CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET",
+		"cdc_source_localities_from_ranges_and_rings",
+		"register_cdc_heartbeat_localities",
+		"register_cdc_heartbeat_localities_for_primary_ranges",
+		"cdc_heartbeat_localities_for_primary_ranges",
+		"ring.primary_ranges_for(self.local_node)",
+		"self.register_cdc_heartbeat_locality(child.locality);",
+		"spawn_cdc_locality_heartbeat_supervisor",
+		"CdcLocalityHeartbeatWorker::new(locality_id, interval)",
+		"cdc_locality_quiet_since_last_finalization",
+		"emit_cdc_heartbeat_finalization_marker",
+		"cdc_heartbeat_identity",
+		"cdc_heartbeat_payload_hash",
+		"WendelonRequest::Finalize(finalization)",
+		"tenant_id: TenantId::ZERO",
+		"charged_bytes: 0",
+		"record_count: 0",
+		"localities.insert(range.start)",
+		"localities.insert(range.end)",
+		"cdc_locality_frontiers.wait_for_advance",
+		"drain_cdc_ready_live_entries",
+		"pending_live_entries.extend",
+		"let catchup_started = Instant::now()",
+		"metrics().observe_cdc_catchup_to_live_handoff(catchup_started.elapsed())",
+		"handle.cursor_high_water.load()",
+		"pending.dedup_by_key(|entry| entry.cursor)",
+		"CdcRejectCode::BelowRetentionFloor",
+		"self.cdc_registry.remove",
+		"cdc_snapshot_hlc_from_state",
+		"check_read_against_retention(req.start_cursor.row_hlc",
+		"cdc_emit_checkpoint",
+		"CDC_CHECKPOINT_EVENT_CADENCE",
+		"CDC_CHECKPOINT_WALL_CADENCE",
+		"CdcCheckpointCadence",
+		"checkpoint_cadence.note_events(meta.event_count.get())",
+		"checkpoint_cadence.checkpoint_due(now)",
+		"cdc_emit_checkpoint(stream, stream_id, &checkpoint, CdcFrameSource::Ring)",
+		"storage_row_is_tombstone_at",
+		"cdc_tombstone_event_batch",
+		"CatchupSnapshot::new(self.cdc_capture_snapshot_hlc(&source_ranges).await)",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 054 integration token {required}"
+			));
+		}
+	}
+	let cdc_handler_section = data_server
+		.split("async fn handle_cdc_subscribe_stream")
+		.nth(1)
+		.and_then(|tail| tail.split("async fn emit_cdc_catchup_events").next())
+		.unwrap_or("");
+	if cdc_handler_section.contains("cdc_snapshot_hlc_from_state(&state)") {
+		violations.push(
+			"src/network/data_server.rs: CDC subscribe open must capture snapshot through cdc_capture_snapshot_hlc after source_ranges, not directly from state".to_string(),
+		);
+	}
+
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	for required in [
+		"DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS",
+		"cdc_finalization_release_observer: JoinHandle<()>",
+		"cdc_locality_heartbeat: JoinHandle<()>",
+		"spawn_cdc_finalization_release_observer()",
+		"spawn_cdc_locality_heartbeat_supervisor(\n\t\t\tring.clone()",
+		"self.cdc_finalization_release_observer.abort()",
+		"self.cdc_locality_heartbeat.abort()",
+		"await_background_task(\n\t\t\tself.cdc_finalization_release_observer",
+		"await_background_task(self.cdc_locality_heartbeat, \"CDC locality heartbeat\")",
+	] {
+		if !node.contains(required) {
+			violations.push(format!(
+				"src/node.rs: missing ADR 054 heartbeat supervisor token {required}"
+			));
+		}
+	}
+
+	let storage_cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+	for required in [
+		"DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY",
+		"DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS",
+		"pub struct CdcLiveTailRing",
+		"pub struct CdcLiveEntry",
+		"mark_finalized_entry",
+		"eviction_frontiers: HashMap<(TenantId, TableObjectId), CdcCursor>",
+		"pub async fn evicted_cursor_frontier",
+		"pub struct CdcLocalityFrontiers",
+		"min_for_localities",
+		"wait_for_advance",
+		"notify_waiters",
+		"CdcFinalizationObserver",
+		"open_time_ring_continuity_check",
+		"pub struct CdcLocalityHeartbeatWorker",
+		"pub locality_id: Locality",
+	] {
+		if !storage_cdc.contains(required) {
+			violations.push(format!(
+				"src/storage/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+	let heartbeat_section = storage_cdc
+		.split("pub struct CdcLocalityHeartbeatWorker")
+		.nth(1)
+		.unwrap_or("");
+	if heartbeat_section.contains("table_object_id") {
+		violations.push(
+			"src/storage/cdc.rs: heartbeat worker must not carry table_object_id".to_string(),
+		);
+	}
+
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"cdc_event",
+		"wendelon_cdc_subscriptions_total",
+		"wendelon_cdc_events_emitted_total",
+		"wendelon_cdc_event_bytes_emitted_total",
+		"wendelon_cdc_checkpoints_emitted_total",
+		"wendelon_cdc_rejects_total",
+		"wendelon_cdc_subscription_lag_micros",
+		"wendelon_cdc_ring_overflow_total",
+		"wendelon_cdc_catchup_to_live_handoff_micros",
+		"wendelon_cdc_staged_entries_in_ring",
+		"wendelon_cdc_pending_finalization_evicted_total",
+		"below_retention_floor",
+		"ring_overflow_during_catchup",
+		"schema_fingerprint_incompatible",
+		"checkpoint_digest_mismatch",
+		"unknown_table",
+		"tenant_auth_denied",
+		"table_not_replicated_here",
+		"internal_engine_error",
+	] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 054 metric token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"cdc_.*tenant_id",
+		"cdc_.*table_object_id",
+		"subscription_id\"",
+		"schema_fingerprint\"",
+	] {
+		if metrics.contains(forbidden) {
+			violations.push(format!(
+				"src/metrics/registry.rs: contains forbidden CDC metric label token {forbidden}"
+			));
+		}
+	}
+
+	let runbook = manifest_dir.join("plans/ops/runbooks/cdc_subscription.md");
+	if !runbook.exists() {
+		violations.push("plans/ops/runbooks/cdc_subscription.md is missing".to_string());
+	} else {
+		let runbook = fs::read_to_string(&runbook).unwrap();
+		for required in [
+			"## Promotion Evidence",
+			"scripts/bench/run_cdc_subscription_acceptance.sh",
+			"measured_one_way_quic_rtt_micros",
+			"promotion_candidate=true",
+			"cdc_acceptance_*",
+			"placeholder RTT",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/cdc_subscription.md: missing ADR 054 promotion-evidence token {required}"
+				));
+			}
+		}
+	}
+	let runbook_index =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_index.contains("cdc_subscription.md") {
+		violations.push("plans/ops/runbooks/README.md: CDC runbook is not cataloged".to_string());
+	}
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"cdc_subscription\"") {
+		violations.push("Cargo.toml: ADR 054 CDC subscription benchmark is missing".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/cdc_subscription.rs");
+	if !bench_path.exists() {
+		violations
+			.push("benches/cdc_subscription.rs: ADR 054 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for required in [
+			"FULL_MATRIX",
+			"--full",
+			"--acceptance-one-way-quic-rtt-micros",
+			"cdc_live_tail_latency",
+			"cdc_live_tail_fanout",
+			"cdc_catchup_throughput",
+			"cdc_ring_overflow_threshold",
+			"cdc_admission_isolation",
+			"cdc_stage_release_drain",
+			"cdc_safe_emission_watermark_hold",
+			"cdc_acceptance_live_tail_latency",
+			"cdc_acceptance_catchup_throughput",
+			"cdc_acceptance_ring_overflow_nonblocking",
+			"cdc_acceptance_admission_isolation",
+			"CDC acceptance thresholds failed",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/cdc_subscription.rs: missing ADR 054 bench token {required}"
+				));
+			}
+		}
+	}
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/054_cdc_subscription_substrate_bench_results.md"),
+	)
+	.unwrap();
+	for required in [
+		"--acceptance-one-way-quic-rtt-micros",
+		"cdc_acceptance_live_tail_latency",
+		"cdc_acceptance_catchup_throughput",
+		"cdc_acceptance_ring_overflow_nonblocking",
+		"cdc_acceptance_admission_isolation",
+		"representative deployment evidence",
+		"Representative Acceptance Template",
+		"measured one-way QUIC RTT micros",
+		"CPU governor / power profile",
+		"scripts/bench/run_cdc_subscription_acceptance.sh",
+		"promotion_candidate=true",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/054_cdc_subscription_substrate_bench_results.md: missing ADR 054 bench-results token {required}"
+			));
+		}
+	}
+	let acceptance_script = manifest_dir.join("scripts/bench/run_cdc_subscription_acceptance.sh");
+	if !acceptance_script.exists() {
+		violations.push("scripts/bench/run_cdc_subscription_acceptance.sh is missing".to_string());
+	} else {
+		let script = fs::read_to_string(acceptance_script).unwrap();
+		for required in [
+			"CDC_ACCEPTANCE_BENCH_ARGS",
+			"CDC_ACCEPTANCE_MATRIX_ROWS",
+			"--acceptance-one-way-quic-rtt-micros",
+			"cdc_subscription_acceptance.log",
+			"validation_status=pass",
+			"promotion_candidate=true",
+			"cdc_acceptance_live_tail_latency",
+			"cdc_acceptance_catchup_throughput",
+			"cdc_acceptance_ring_overflow_nonblocking",
+			"cdc_acceptance_admission_isolation",
+		] {
+			if !script.contains(required) {
+				violations.push(format!(
+					"scripts/bench/run_cdc_subscription_acceptance.sh: missing ADR 054 acceptance token {required}"
+				));
+			}
+		}
+	}
+	let observability =
+		fs::read_to_string(manifest_dir.join("plans/ops/observability.md")).unwrap();
+	for required in [
+		"#### Change Data Capture",
+		"wendelon_cdc_subscriptions_total",
+		"wendelon_cdc_events_emitted_total",
+		"wendelon_cdc_event_bytes_emitted_total",
+		"wendelon_cdc_checkpoints_emitted_total",
+		"wendelon_cdc_rejects_total",
+		"wendelon_cdc_subscription_lag_micros",
+		"wendelon_cdc_ring_overflow_total",
+		"wendelon_cdc_catchup_to_live_handoff_micros",
+		"wendelon_cdc_staged_entries_in_ring",
+		"wendelon_cdc_pending_finalization_evicted_total",
+		"CDC metrics deliberately do not label tenant, table, subscription id",
+	] {
+		if !observability.contains(required) {
+			violations.push(format!(
+				"plans/ops/observability.md: missing ADR 054 CDC metric token {required}"
+			));
+		}
+	}
+	let fixtures = manifest_dir.join("tests/fixtures/cdc_subscription/README.md");
+	if !fixtures.exists() {
+		violations.push("tests/fixtures/cdc_subscription/README.md is missing".to_string());
+	} else {
+		let fixtures = fs::read_to_string(fixtures).unwrap();
+		for required in [
+			"same_hlc_suffix_catchup",
+			"live_tail_release",
+			"open_time_ring_continuity",
+			"checkpoint_visible_digest",
+			"reject_taxonomy",
+		] {
+			if !fixtures.contains(required) {
+				violations.push(format!(
+					"tests/fixtures/cdc_subscription/README.md: missing fixture case {required}"
+				));
+			}
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 054 CDC subscription invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("LOAD", "_", "IDENTITY"),
+		concat!("ROUTE", "_", "BY", "_", "LOCALITY"),
+		concat!("WENDELON", "_", "PBC_REJECT"),
+		concat!("WENDELON", "_", "AGG"),
+		concat!("WENDELON", "_", "CSB"),
+		concat!("WENDELON", "_", "MULTIROW"),
+		concat!("Wendelon", "Pbc"),
+		concat!("Wendelon", "Agg"),
+		concat!("Wendelon", "Csb"),
+		concat!("Wendelon", "MultiRow"),
+		concat!("W", "AGG"),
+		concat!("W", "CSB"),
+		concat!("W", "MULTIROW"),
+		concat!("__wendelon", "_row"),
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 042 protocol token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+}
+
+#[test]
+fn test_adr056_row_group_fetch_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
+	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for unit in [
+		"impl_unit!(IpcColumnOrdinal, u32);",
+		"impl_unit!(RowGroupIndex, u32);",
+		"impl_unit!(RowGroupRowCount, u32);",
+	] {
+		if !units.contains(unit) {
+			violations.push(format!("src/schema/units.rs: missing ADR 056 unit {unit}"));
+		}
+	}
+	for definition in [
+		"pub struct RecordPageDirectory",
+		"pub struct RowGroupDirectoryEntry",
+		"pub struct BufferPageDirectoryEntry",
+		"pub struct RowGroupColumnStats",
+		"pub struct RowGroupFetchPlan",
+		"pub struct PhaseBOutcome",
+	] {
+		if row_group.matches(definition).count() != 1 {
+			violations.push(format!(
+				"src/storage/row_group.rs: expected exactly one {definition}"
+			));
+		}
+	}
+	for required in [
+		"pub enum RowGroupRejectCode",
+		"PageDirectoryParseError = 1",
+		"RowGroupRangeOverflow = 2",
+		"LayoutUnsupported = 3",
+		"pub enum RowGroupFallbackReason",
+		"TooFewRows",
+		"TooManyRowGroups",
+		"UnpagedRecord",
+		"pub struct RowGroupWriterConfig",
+		"pub struct L2RowGroupFetchConfig",
+		"storage.row_group_directory",
+		"phase_b_fetch",
+		"phase_c_fetch",
+		"logical_schema_fingerprint",
+		"predicate_fetched_groups",
+		"apply_phase_b_masks_to_projected_row_groups",
+	] {
+		if !row_group.contains(required) {
+			violations.push(format!(
+				"src/storage/row_group.rs: missing ADR 056 token {required}"
+			));
+		}
+	}
+	if !columnar.contains("RowGroup(RowGroupFetchPlan)") {
+		violations.push("src/storage/columnar.rs: L2FetchStrategy::RowGroup missing".to_string());
+	}
+	if !columnar.contains("page_directory: Option<RecordPageDirectory>") {
+		violations.push(
+			"src/storage/columnar.rs: RecordBufferDirectory page_directory missing".to_string(),
+		);
+	}
+	if !multirow.contains("RowGroupWriterConfig")
+		|| !multirow.contains("encode_record_batches_bytes")
+	{
+		violations.push("src/storage/multirow.rs: row-group writer path is not wired".to_string());
+	}
+	for metric in [
+		"storage_l2_row_group_fetch_requests_total",
+		"storage_l2_row_group_fetch_fallback_total",
+		"storage_l2_row_group_fetch_row_groups_total",
+		"storage_l2_row_group_fetch_bytes_total",
+		"storage_l2_row_group_fetch_plan_micros",
+		"storage_l2_row_group_fetch_selected_ranges",
+		"storage_l2_row_group_fetch_directory_bytes",
+		"storage_l2_row_group_fetch_invariant_violations_total",
+		"violation_kind",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 056 metric token {metric}"
+			));
+		}
+	}
+	for forbidden in [
+		"__row_group_directory__",
+		"SyntheticColumn::RowGroupDirectory",
+		"partial_buffer_materialize",
+		"slice_compressed_buffer",
+		"intra_buffer_page_decode",
+		"mini_page_",
+	] {
+		for (path, content) in [
+			("src/storage/row_group.rs", &row_group),
+			("src/storage/columnar.rs", &columnar),
+			("src/storage/multirow.rs", &multirow),
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{path}: forbidden ADR 056 V1 token {forbidden}"));
+			}
+		}
+	}
+	for forbidden in [
+		"MsgType::ROW_GROUP",
+		"MsgType::PAGE_DIRECTORY",
+		"FRAME_FLAG_ROW_GROUP",
+		"FRAME_FLAG_PAGE_DIRECTORY",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 056 token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::RowGroup",
+		"NodeCapability::PageDirectory",
+		"NodeCapability::ROW_GROUP",
+		"NodeCapability::PAGE_DIRECTORY",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 056 capability {forbidden}"
+			));
+		}
+	}
+	if cdc.contains("RecordPageDirectory") || cdc.contains("RowGroupFetchPlan") {
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 056 internals".to_string());
+	}
+	for token in [
+		"RowGroupFetchSampled",
+		"row_group.fetch_sampled",
+		"RowGroupInvariantViolation",
+		"row_group.invariant_violation",
+	] {
+		if !audit.contains(token) {
+			violations.push(format!("src/audit.rs: missing ADR 056 audit token {token}"));
+		}
+	}
+	for token in [
+		"emit_row_group_fetch_sampled_audit",
+		"emit_row_group_invariant_audit_for_error",
+		"AuditOperation::RowGroupFetchSampled",
+		"AuditOperation::RowGroupInvariantViolation",
+		"row_groups_fetched",
+		"predicate_fetched_groups",
+		"dominant_strategy",
+	] {
+		if !data_server.contains(token) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 056 audit emission token {token}"
+			));
+		}
+	}
+	if data_server
+		.matches("emit_row_group_invariant_audit_for_error(")
+		.count()
+		< 2
+	{
+		violations.push(
+			"src/network/data_server.rs: RowGroupInvariantViolation audit helper must have at least one production call site"
+				.to_string(),
+		);
+	}
+	if !manager.contains("apply_phase_b_masks_to_projected_row_groups(") {
+		violations.push(
+			"src/storage/manager.rs: Phase B mask materializer must be called by production storage code"
+				.to_string(),
+		);
+	}
+	if !columnar.contains("observe_storage_l2_row_group_fetch_invariant_violation(")
+		&& !multirow.contains("observe_storage_l2_row_group_fetch_invariant_violation(")
+	{
+		violations.push(
+			"row-group invariant metric must be emitted outside src/metrics/registry.rs"
+				.to_string(),
+		);
+	}
+	if row_group.contains("execute_program(") {
+		violations
+			.push("src/storage/row_group.rs: Phase 5 materializer must not re-run PBC".to_string());
+	}
+	if !cargo.contains("name = \"row_group_fetch\"") || !cargo.contains("harness = false") {
+		violations.push("Cargo.toml: ADR 056 row_group_fetch bench is not registered".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/row_group_fetch.rs");
+	if !bench_path.exists() {
+		violations.push("benches/row_group_fetch.rs: ADR 056 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for token in [
+			"writer",
+			"planner_one_group",
+			"phase_b_mask",
+			"masked_materialization",
+			"--quick",
+		] {
+			if !bench.contains(token) {
+				violations.push(format!(
+					"benches/row_group_fetch.rs: missing ADR 056 bench token {token}"
+				));
+			}
+		}
+	}
+	for forbidden in [
+		"RowGroupV1",
+		"RowGroupV2",
+		"PageDirectoryV1",
+		"PageDirectoryV2",
+		"WendelonRowGroup",
+		"WendelonPageDirectory",
+	] {
+		if row_group.contains(forbidden)
+			|| columnar.contains(forbidden)
+			|| multirow.contains(forbidden)
+		{
+			violations.push(format!("ADR 056 forbidden suffix/prefix token {forbidden}"));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 056 row-group fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr062_row_group_sizing_profile_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
+	let adr056 = fs::read_to_string(
+		manifest_dir.join("plans/adr/056_row_group_fetch_and_page_directory.md"),
+	)
+	.unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/062_row_group_sizing_profile_bench_results.md"),
+	)
+	.unwrap();
+
+	let mut violations = Vec::new();
+
+	for required in [
+		"pub enum RowGroupSizingProfile {\n\tPointRead,\n\tScan,\n}",
+		"pub profile: RowGroupSizingProfile",
+		"sizing: RowGroupSizingValues",
+		"ROW_GROUP_POINT_READ_TARGET_ROWS: u32 = 4_096",
+		"ROW_GROUP_POINT_READ_MAX_ROWS: u32 = 8_192",
+		"ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS: u64 = 8_192",
+		"ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_BYTES: u64 = 512 * 1024",
+		"ROW_GROUP_SCAN_TARGET_ROWS: u32 = 65_536",
+		"ROW_GROUP_SCAN_MAX_ROWS: u32 = 131_072",
+		"ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS: u64 = 65_536",
+		"ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES: u64 = 1024 * 1024",
+		"pub fn target_row_group_rows(&self) -> RowGroupRowCount",
+		"pub fn max_row_group_rows(&self) -> RowGroupRowCount",
+		"pub fn min_paged_record_rows(&self) -> RowCount",
+		"pub fn min_paged_record_bytes(&self) -> RecordBodyByteLen",
+	] {
+		if !row_group.contains(required) {
+			violations.push(format!(
+				"src/storage/row_group.rs: missing ADR 062 token {required}"
+			));
+		}
+	}
+
+	for forbidden in [
+		"pub target_row_group_rows: RowGroupRowCount",
+		"pub max_row_group_rows: RowGroupRowCount",
+		"pub min_paged_record_rows: RowCount",
+		"pub min_paged_record_bytes: RecordBodyByteLen",
+	] {
+		if row_group.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/row_group.rs: ADR 062 profile-derived sizing field is public: {forbidden}"
+			));
+		}
+	}
+
+	for required in [
+		"profile: Option<String>",
+		"None | Some(\"point_read\") => RowGroupSizingProfile::PointRead",
+		"Some(\"scan\") => RowGroupSizingProfile::Scan",
+		"unknown storage.row_group_writer profile",
+		"apply_point_read_overrides(",
+		"tracing::warn!",
+		"profile = \\\"scan\\\"",
+	] {
+		if !config.contains(required) {
+			violations.push(format!("src/config.rs: missing ADR 062 token {required}"));
+		}
+	}
+
+	for required in [
+		"RowGroupSizingProfile",
+		"row_group_config.profile != RowGroupSizingProfile::Scan",
+		"row_group_config.target_row_group_rows().get()",
+	] {
+		if !multirow.contains(required) {
+			violations.push(format!(
+				"src/storage/multirow.rs: missing ADR 062 token {required}"
+			));
+		}
+	}
+
+	if !example.contains("profile = \"point_read\" # \"point_read\" (default) or \"scan\"") {
+		violations
+			.push("examples/wendelon.toml.example: missing ADR 062 profile example".to_string());
+	}
+
+	if !adr056.contains("ADR 062 row-group sizing profile is now implemented and") {
+		violations.push("plans/adr/056_row_group_fetch_and_page_directory.md: missing ADR 062 amendment reference".to_string());
+	}
+
+	for required in [
+		"ADR 062 Row-Group Sizing Profile Bench Results",
+		"scenario=adr062_writer_cost",
+		"scenario=adr062_scan_profile_directory",
+		"scenario=adr062_scan_boundary",
+		"writer-cost gate passes",
+		"ADR 062 is promoted with `Scan` target `65_536`",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/062_row_group_sizing_profile_bench_results.md: missing ADR 062 bench token {required}"
+			));
+		}
+	}
+
+	for forbidden in [
+		"choose_row_group_sizing_profile",
+		"RecordBodyCompressionPolicy::ScanProfile",
+		"L2FetchStrategy::ScanRowGroup",
+	] {
+		for (path, content) in [
+			("src/storage/row_group.rs", &row_group),
+			("src/storage/multirow.rs", &multirow),
+			("src/config.rs", &config),
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{path}: forbidden ADR 062 token {forbidden}"));
+			}
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 062 row-group sizing profile invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr057_encoding_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let encoding_directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let encoding_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/materialize.rs")).unwrap();
+	let encoding_select =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let encoding_sample =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sample.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
+	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for unit in [
+		"impl_unit!(BitsPerValue, u8);",
+		"impl_unit!(BaseValue, i128);",
+		"impl_unit!(RunCount, u32);",
+		"impl_unit!(DictValueCount, u32);",
+		"impl_unit!(Exponent, i16);",
+		"impl_unit!(Factor, i64);",
+		"impl_unit!(ExceptionCount, u32);",
+		"impl_unit!(EncodingPageIndex, u32);",
+		"impl_unit!(EncodingPageByteOffset, u32);",
+		"impl_unit!(EncodingCascadeIndex, u16);",
+		"impl_unit!(BufferValueIndex, u32);",
+		"impl_unit!(BufferValueCount, u32);",
+		"impl_unit!(SimdPageValueCount, u32);",
+		"impl_unit!(SampleRowCount, u32);",
+		"impl_unit!(EncodingPageCount, u32);",
+		"impl_unit!(TaskCount, u32);",
+	] {
+		if !units.contains(unit) {
+			violations.push(format!("src/schema/units.rs: missing ADR 057 unit {unit}"));
+		}
+	}
+
+	for definition in [
+		"pub enum EncodingCascadeKind",
+		"pub enum EncodingLeafCascade",
+		"pub enum EncodingCascade {",
+		"pub struct EncodingDirectory",
+		"pub struct BufferEncoding",
+		"pub struct EncodingPageDescriptor",
+		"pub enum EncodingRejectCode",
+		"pub enum EncodingFallbackReason",
+		"pub struct EncodingWriterConfig",
+		"pub struct L2EncodingFetchConfig",
+	] {
+		if encoding_mod.matches(definition).count() != 1 {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: expected exactly one {definition}"
+			));
+		}
+	}
+	for required in [
+		"Plain = 1",
+		"Lz4Frame = 2",
+		"BitPacked = 3",
+		"Rle = 4",
+		"Dictionary = 5",
+		"Delta = 6",
+		"FsstWholeBuffer = 7",
+		"Alp = 8",
+		"FsstRowSafe = 9",
+		"pub const ALL: [Self; 9]",
+		"pub const DEFAULT_ENABLED: [Self; 9]",
+		"storage.encoding_directory",
+		"cascades: Vec<EncodingCascade>",
+		"cascade_index: EncodingCascadeIndex",
+		"page_end_offsets: Vec<EncodingPageByteOffset>",
+		"EncodingDirectoryParseError = 1",
+		"BufferEncodingMismatch = 2",
+		"PageRangeOverflow = 3",
+		"CascadeUnsupported = 4",
+		"DecodedLengthMismatch = 5",
+		"enabled_cascades: BTreeSet<EncodingCascadeKind>",
+	] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 057 token {required}"
+			));
+		}
+	}
+	if encoding_mod.contains("Reserved") {
+		violations.push(
+			"src/storage/encoding/types.rs: cascade catalog must not reserve variants".into(),
+		);
+	}
+	for required in [
+		"build_encoding_directory_for_ipc_stream",
+		"serialize_encoding_directory_value",
+		"deserialize_encoding_directory_value",
+		"validate_encoding_directory",
+		"apply_encoding_buffers_in_place",
+		"page_end_offsets",
+		"seen.insert((",
+	] {
+		if !encoding_directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 057 token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"Vec<EncodingSimdPageEntry>",
+		"pub struct EncodingSimdPageEntry",
+		"simd_pages:",
+		"per_page_rows",
+	] {
+		if encoding_directory.contains(forbidden) || encoding_mod.contains(forbidden) {
+			violations.push(format!(
+				"ADR 057 compact directory forbidden token {forbidden}"
+			));
+		}
+	}
+	for module in [
+		"plain.rs",
+		"lz4.rs",
+		"bitpacked.rs",
+		"rle.rs",
+		"dict.rs",
+		"delta.rs",
+		"fsst.rs",
+		"alp.rs",
+	] {
+		if !manifest_dir
+			.join("src/storage/encoding/cascade")
+			.join(module)
+			.exists()
+		{
+			violations.push(format!("src/storage/encoding/cascade/{module}: missing"));
+		}
+	}
+	for required in [
+		"select_and_encode_buffer",
+		"cascade_enabled",
+		"sample_buffer",
+		"cascade_sample_rows",
+		"observe_storage_l2_encoding_cascade_select",
+	] {
+		if !encoding_select.contains(required)
+			&& !encoding_sample.contains(required)
+			&& !encoding_directory.contains(required)
+		{
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 057 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct ColumnSample",
+		"deterministic_sample_indices",
+		"distinct_count_estimate",
+		"run_count_estimate",
+		"is_monotonic",
+		"fsst_compressible",
+		"alp_candidate",
+	] {
+		if !encoding_sample.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sample.rs: missing ADR 057 sample token {required}"
+			));
+		}
+	}
+	for required in [
+		"materialize_encoding_buffer",
+		"materialize_encoding_ipc_stream",
+		"find_buffer_encoding",
+		"row_group_index",
+		"observe_storage_l2_encoding_materialize",
+	] {
+		if !encoding_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/materialize.rs: missing ADR 057 materializer token {required}"
+			));
+		}
+	}
+	for required in [
+		"encoding_directory: Option<EncodingDirectory>",
+		"EncodingRejected(EncodingRejectCode)",
+		"ENCODING_DIRECTORY_METADATA_KEY",
+		"validate_encoding_directory",
+		"materialize_encoding_buffer",
+		"encoding_for_ipc_body_buffer",
+	] {
+		if !columnar.contains(required) {
+			violations.push(format!(
+				"src/storage/columnar.rs: missing ADR 057 columnar token {required}"
+			));
+		}
+	}
+	for required in [
+		"encode_multirow_from_survivors_with_row_group_and_encoding_config",
+		"build_encoding_directory_for_ipc_stream",
+		"compact_encoding_ipc_stream",
+		"serialize_encoding_directory_value",
+		"materialize_encoding_ipc_stream",
+	] {
+		if !multirow.contains(required) {
+			violations.push(format!(
+				"src/storage/multirow.rs: missing ADR 057 writer token {required}"
+			));
+		}
+	}
+	if !manager.contains(
+		"pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config",
+	) || !manager.contains("&self.config.encoding_writer")
+	{
+		violations.push(
+			"src/storage/manager.rs: compaction/admission paths must pass Encoding writer config"
+				.to_string(),
+		);
+	}
+	for required in [
+		"!self.config.l2_encoding_fetch.enabled",
+		"observe_storage_l2_encoding_fallback(\"reader_disabled\")",
+		"try_read_encoding_indexed_pages_from_l2",
+		"build_encoding_indexed_page_plan",
+		"materialize_encoding_indexed_pages",
+		"indexed_rows_materialized",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 057 L2 Encoding reader gate token {required}"
+			));
+		}
+	}
+	if !row_group.contains("encoding_fetch_range_for_buffer_page")
+		|| !row_group.contains("observe_storage_l2_encoding_simd_pages_fetched")
+	{
+		violations.push(
+			"src/storage/row_group.rs: selected row-group ranges must narrow to Encoding encoded_range"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encoding_writer: RawEncodingWriterConfig",
+		"l2_encoding_fetch: RawL2EncodingFetchConfig",
+		"enabled_cascades",
+		"target_simd_page_values",
+		"max_parallel_materialize_tasks",
+	] {
+		if !config.contains(required) {
+			violations.push(format!(
+				"src/config.rs: missing ADR 057 config token {required}"
+			));
+		}
+	}
+	if !node.contains("pub encoding_writer: EncodingWriterConfig")
+		|| !node.contains("pub l2_encoding_fetch: L2EncodingFetchConfig")
+	{
+		violations.push("src/node.rs: NodeBootstrapConfig missing ADR 057 configs".to_string());
+	}
+	for metric in [
+		"storage_l2_encoding_buffer_encodings_total",
+		"storage_l2_encoding_materialize_micros",
+		"storage_l2_encoding_simd_pages_fetched_total",
+		"storage_l2_encoding_compression_ratio",
+		"storage_l2_encoding_cascade_select_micros",
+		"storage_l2_encoding_directory_bytes",
+		"storage_l2_encoding_fallback_total",
+		"storage_l2_encoding_bytes_total",
+		"storage_l2_encoding_invariant_violations_total",
+		"cascade",
+		"reason",
+		"violation_kind",
+		"EncodingCascadeHistograms",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 057 metric token {metric}"
+			));
+		}
+	}
+	for required in [
+		"EncodingMaterializeSampled",
+		"encoding.materialize_sampled",
+		"EncodingInvariantViolation",
+		"encoding.invariant_violation",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 057 audit token {required}"
+			));
+		}
+	}
+	for required in [
+		"emit_encoding_materialize_sampled_audit",
+		"AuditOperation::EncodingMaterializeSampled",
+		"emit_encoding_invariant_audit_for_error",
+		"encoding_invariant_violation_kind",
+		"AuditOperation::EncodingInvariantViolation",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 057 audit token {required}"
+			));
+		}
+	}
+	if data_server
+		.matches("emit_encoding_materialize_sampled_audit(")
+		.count()
+		< 2
+	{
+		violations.push(
+			"src/network/data_server.rs: EncodingMaterializeSampled audit helper must have at least one production call site"
+				.to_string(),
+		);
+	}
+	if let Some(execute_aggregate_local) =
+		data_server.split("async fn execute_aggregate_local").nth(1)
+	{
+		let csb_pos = execute_aggregate_local.find(".try_aggregate_csb_direct_answer");
+		let projected_pos = execute_aggregate_local.find("aggregate_projected_execution");
+		let plan_pos = execute_aggregate_local.find("plan_query_execution_for_ranges_with_program");
+		match (csb_pos, projected_pos, plan_pos) {
+			(Some(csb_pos), Some(projected_pos), Some(plan_pos))
+				if csb_pos < projected_pos && csb_pos < plan_pos => {}
+			_ => violations.push(
+				"src/network/data_server.rs: aggregate CSB direct answer must bypass projected-read and Encoding planner paths"
+					.to_string(),
+			),
+		}
+	} else {
+		violations.push(
+			"src/network/data_server.rs: missing execute_aggregate_local for CSB/Encoding ordering guard"
+				.to_string(),
+		);
+	}
+	if !cargo.contains("name = \"encoding\"") || !cargo.contains("harness = false") {
+		violations.push("Cargo.toml: ADR 057 encoding bench is not registered".to_string());
+	}
+	for test_file in [
+		"encoding_cascade.rs",
+		"encoding_select.rs",
+		"encoding_directory.rs",
+		"encoding_materialize.rs",
+		"encoding_simd_page.rs",
+		"encoding_planner.rs",
+		"encoding_secondary_index.rs",
+		"encoding_lsm.rs",
+		"encoding_neutral.rs",
+	] {
+		if !manifest_dir.join("tests").join(test_file).exists() {
+			violations.push(format!("tests/{test_file}: ADR 057 test file is missing"));
+		}
+	}
+	let bench_path = manifest_dir.join("benches/encoding.rs");
+	if !bench_path.exists() {
+		violations.push("benches/encoding.rs: ADR 057 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for token in [
+			"writer_encoding_enabled",
+			"full_materialize",
+			"cascade_encode",
+			"cascade_decode",
+			"directory_size",
+			"--quick",
+		] {
+			if !bench.contains(token) {
+				violations.push(format!(
+					"benches/encoding.rs: missing ADR 057 bench token {token}"
+				));
+			}
+		}
+	}
+	if !manifest_dir.join("plans/ops/runbooks/encoding.md").exists() {
+		violations.push("plans/ops/runbooks/encoding.md: ADR 057 runbook is missing".to_string());
+	}
+	for forbidden in [
+		"MsgType::Encoding",
+		"MsgType::EncodingCascade",
+		"FRAME_FLAG_ENCODING",
+		"FRAME_FLAG_ENCODING_CASCADE",
+		"FRAME_FLAG_SIMD_PAGE",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 057 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Encoding",
+		"NodeCapability::EncodingDirectory",
+		"NodeCapability::EncodingCascade",
+		"NodeCapability::SimdPage",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 057 capability {forbidden}"
+			));
+		}
+	}
+	let cdc_identifiers = rust_identifiers_from_source("src/storage/cdc.rs", &cdc);
+	if has_rust_identifier(&cdc_identifiers, "EncodingCascade")
+		|| has_rust_identifier(&cdc_identifiers, "EncodingDirectory")
+	{
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 057 internals".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 057 Encoding invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr058_encoding_compute_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let compute_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mod.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let compute_mask =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mask.rs")).unwrap();
+	let compute_dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let compute_aggregate =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/aggregate.rs")).unwrap();
+	let compute_planner =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/planner.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
+	let bench_path = manifest_dir.join("benches/encoding_compute.rs");
+	let bench = fs::read_to_string(&bench_path).unwrap_or_default();
+
+	for required in [
+		"impl_unit!(DictMatchSetSize, u32)",
+		"impl_unit!(PredicateLeafIndex, u16)",
+		"impl_unit!(SelectivityFractionMicros, u32)",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 058 unit {required}"
+			));
+		}
+	}
+	for module in [
+		"aggregate.rs",
+		"coerce.rs",
+		"dispatch.rs",
+		"index.rs",
+		"kernels/mod.rs",
+		"mask.rs",
+		"null.rs",
+		"planner.rs",
+		"predicate.rs",
+		"types.rs",
+	] {
+		if !manifest_dir
+			.join("src/storage/encoding/compute")
+			.join(module)
+			.exists()
+		{
+			violations.push(format!(
+				"src/storage/encoding/compute/{module}: missing ADR 058 module"
+			));
+		}
+	}
+	if !compute_mod.contains("pub mod types;") || !compute_mod.contains("pub use types::*;") {
+		violations.push(
+			"src/storage/encoding/compute/mod.rs: compute manifest must re-export types"
+				.to_string(),
+		);
+	}
+	for required in [
+		"BitPacked = 1",
+		"RlePlain = 2",
+		"RleBitPacked = 3",
+		"DictionaryPlain = 4",
+		"DictionaryBitPacked = 5",
+		"Delta = 6",
+		"CountStar = 1",
+		"CountNonNull = 2",
+		"SignedAvg = 7",
+		"UnsignedAvg = 8",
+		"MaskLengthMismatch = 1",
+		"SelectionRangeOverflow = 5",
+		"pub max_dict_match_set_size: DictMatchSetSize",
+		"pub min_selectivity_for_encoded_eval_micros: SelectivityFractionMicros",
+		"ENCODING_COMPUTE_MAX_MASK_BYTES_PER_RECORD_DEFAULT: u64 = 256 * 1024",
+		"ENCODING_COMPUTE_MIN_SELECTIVITY_FOR_ENCODED_EVAL_MICROS_DEFAULT: u32 = 250_000",
+		"ENCODING_COMPUTE_MIN_PREFILTER_REJECTION_MICROS_DEFAULT: u32 = 100_000",
+	] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 058 token {required}"
+			));
+		}
+	}
+	if compute_types.contains("Reserved") || compute_types.contains("V1") {
+		violations.push(
+			"src/storage/encoding/compute/types.rs: ADR 058 types must not reserve variants or use V1 suffixes"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub enum EncodedRowMask",
+		"All",
+		"None",
+		"Bitmap",
+		"bytes: Vec<u8>",
+		"Runs",
+		"runs: Vec<SelectionRun>",
+		"pub fn to_arrow_boolean_array",
+		"pub fn from_arrow_boolean_array",
+		"SelectionRangeOverflow",
+	] {
+		if !compute_mask.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/mask.rs: missing ADR 058 mask token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub fn evaluate(",
+		"evaluator_kind_for_cascade",
+		"EncodingComputeEvaluatorKind::BitPacked",
+		"EncodingComputeEvaluatorKind::RlePlain",
+		"EncodingComputeEvaluatorKind::DictionaryBitPacked",
+		"EncodingComputeEvaluatorKind::Delta",
+		"decode_buffer(",
+		"expand_page_descriptors",
+		"KernelDecodedLengthMismatch",
+	] {
+		if !compute_dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 058 dispatch token {required}"
+			));
+		}
+	}
+	for required in [
+		"try_fold_encoded_aggregate_request",
+		"with_encoded_column",
+		"with_validity_mask",
+		"decode_encoded_buffer",
+		"AggregateFunction::CountStar",
+		"return Ok(None)",
+		"AggregateOverflowMismatch",
+		"aggregate_kind_for_tag",
+	] {
+		if !compute_aggregate.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/aggregate.rs: missing ADR 058 aggregate token {required}"
+			));
+		}
+	}
+	if !compute_planner
+		.contains("selectivity.get() <= config.min_selectivity_for_encoded_eval_micros.get()")
+		|| !compute_planner.contains("EncodingComputePlanMode::DenseFallback")
+	{
+		violations.push(
+			"src/storage/encoding/compute/planner.rs: selectivity boundary must be <= 0.25 else DenseFallback"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encoding_compute: RawEncodingComputeConfig",
+		"enabled_predicate_evaluators",
+		"enabled_aggregate_kernels",
+		"RawEncodingComputeConfig",
+	] {
+		if !config.contains(required) {
+			violations.push(format!(
+				"src/config.rs: missing ADR 058 config token {required}"
+			));
+		}
+	}
+	if !node.contains("pub encoding_compute: EncodingComputeConfig")
+		|| !manager.contains("pub encoding_compute: EncodingComputeConfig")
+	{
+		violations.push("node/manager configs must carry EncodingComputeConfig".to_string());
+	}
+	for required in [
+		"try_read_encoding_compute_phase_b_from_l2",
+		"build_encoding_compute_phase_b_plan",
+		"read_encoded_aggregate_record",
+		"build_encoding_compute_aggregate_plan",
+		"try_fold_encoded_aggregate_request",
+		"phase_b_point_read_survives",
+		"evaluate_encoded_predicate",
+		"observe_storage_l2_encoding_compute_plan(\"exact\", \"none\")",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 058 runtime hook token {required}"
+			));
+		}
+	}
+	for metric in [
+		"storage_l2_encoding_compute_plan_total",
+		"storage_l2_encoding_compute_kernel_micros",
+		"storage_l2_encoding_compute_rows_total",
+		"storage_l2_encoding_compute_mask_bytes",
+		"storage_l2_encoding_compute_pages_fetched_total",
+		"storage_l2_encoding_compute_aggregate_total",
+		"storage_l2_encoding_compute_invariant_violations_total",
+		"ENCODING_COMPUTE_FALLBACK_REASONS",
+		"ENCODING_COMPUTE_KERNEL_LABELS",
+		"ENCODING_COMPUTE_INVARIANT_KINDS",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 058 metric token {metric}"
+			));
+		}
+	}
+	if !example.contains("[storage.encoding_compute]")
+		|| !example.contains("min_selectivity_for_encoded_eval_micros = 250000")
+	{
+		violations.push(
+			"examples/wendelon.toml.example: missing ADR 058 encoding_compute example config"
+				.to_string(),
+		);
+	}
+	if !cargo_toml.contains("name = \"encoding_compute\"")
+		|| !cargo_toml.contains("harness = false")
+	{
+		violations.push("Cargo.toml: ADR 058 encoding_compute bench is not registered".to_string());
+	}
+	if !bench_path.exists() {
+		violations
+			.push("benches/encoding_compute.rs: ADR 058 bench harness is missing".to_string());
+	} else {
+		for required in [
+			"encoding_compute_bench",
+			"predicate_exact",
+			"mask_algebra",
+			"aggregate_fold",
+			"try_fold_encoded_aggregate_request",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/encoding_compute.rs: missing ADR 058 bench token {required}"
+				));
+			}
+		}
+	}
+	for required in [
+		"EncodingComputeSampled",
+		"encoding_compute.sampled",
+		"EncodingComputeInvariantViolation",
+		"encoding_compute.invariant_violation",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 058 audit token {required}"
+			));
+		}
+	}
+	for required in [
+		"emit_encoding_compute_sampled_audit",
+		"AuditOperation::EncodingComputeSampled",
+		"emit_encoding_compute_invariant_audit",
+		"AuditOperation::EncodingComputeInvariantViolation",
+		"try_read_encoded_aggregate_query_location",
+		"aggregate_responses",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 058 audit token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"MsgType::Cocd",
+		"MsgType::EncodingCompute",
+		"FRAME_FLAG_ENCODING_COMPUTE",
+		"FRAME_FLAG_COCD",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 058 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Cocd",
+		"NodeCapability::EncodingCompute",
+		"NodeCapability::EncodedAggregate",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 058 capability {forbidden}"
+			));
+		}
+	}
+	if cdc.contains("EncodingCompute") {
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 058 internals".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 058 Encoding compute invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr059_native_cocd_kernel_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let aggregate =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/aggregate.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let kernels_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/mod.rs"))
+			.unwrap();
+	let bitpacked =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/bitpacked.rs"))
+			.unwrap();
+	let dictionary =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/dictionary.rs"))
+			.unwrap();
+	let delta =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/delta.rs"))
+			.unwrap();
+	let rle = fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/rle.rs"))
+		.unwrap();
+	let validity =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/validity.rs"))
+			.unwrap();
+	let scalar =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/scalar.rs"))
+			.unwrap();
+	let mask =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mask.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let bench = fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let bench_artifact = fs::read_to_string(
+		manifest_dir.join("plans/impl/059_native_cocd_kernels_bench_results.md"),
+	)
+	.unwrap_or_default();
+
+	for required in [
+		"pub(crate) struct BitPackedFrame",
+		"pub(crate) struct FixedWidthDictionaryFrame",
+		"pub(crate) struct DeltaFrame",
+		"pub(crate) struct RleByteRun",
+		"pub(crate) fn parse_bitpacked_frame",
+		"pub(crate) fn parse_fixed_width_dictionary_frame",
+		"pub(crate) fn parse_delta_frame",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 059 parser token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub fn evaluate(",
+		"pub fn evaluate_decode_scalar",
+		"NativeEvaluationEligibility",
+		"kernels::bitpacked::evaluate_predicate",
+		"kernels::dictionary::evaluate_predicate",
+		"kernels::delta::evaluate_predicate",
+		"kernels::rle::evaluate_predicate",
+		"native_predicate_cascade_eligible",
+		"evaluate_decoded_fixed_width_integer",
+	] {
+		if !dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 059 dispatch token {required}"
+			));
+		}
+	}
+	if !compute_types.contains("enabled: true")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::BitPacked")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::DictionaryPlain")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::DictionaryBitPacked")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::Delta")
+		|| compute_types.contains("enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL")
+	{
+		violations.push(
+			"src/storage/encoding/compute/types.rs: ADR 059 promoted default must enable only the narrowed predicate allow-list"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub mod bitpacked;",
+		"pub mod delta;",
+		"pub mod dictionary;",
+		"pub mod rle;",
+		"pub mod scalar;",
+		"pub mod validity;",
+	] {
+		if !kernels_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/mod.rs: missing ADR 059 module token {required}"
+			));
+		}
+	}
+	for (path, source, required) in [
+		(
+			"bitpacked.rs",
+			bitpacked.as_str(),
+			[
+				"parse_bitpacked_frame",
+				"unsigned_predicate",
+				"signed_predicate",
+				"evaluate_u8_frame",
+				"chunks_exact",
+				"read_unsigned_le_as_u128",
+			]
+			.as_slice(),
+		),
+		(
+			"dictionary.rs",
+			dictionary.as_str(),
+			[
+				"parse_fixed_width_dictionary_frame",
+				"dictionary_matches",
+				"DictionaryIndexEncoding",
+				"push_index_match",
+			]
+			.as_slice(),
+		),
+		(
+			"delta.rs",
+			delta.as_str(),
+			[
+				"parse_delta_frame",
+				"try_push_monotonic_signed_range",
+				"checked_add",
+				"read_signed_delta",
+				"signed_value_from_u128",
+			]
+			.as_slice(),
+		),
+		(
+			"rle.rs",
+			rle.as_str(),
+			[
+				"RleByteRunIter",
+				"push_many",
+				"evaluate_lane",
+				"signed_value_from_le_bytes",
+			]
+			.as_slice(),
+		),
+	] {
+		for token in required {
+			if !source.contains(token) {
+				violations.push(format!(
+					"src/storage/encoding/compute/kernels/{path}: missing ADR 059 token {token}"
+				));
+			}
+		}
+	}
+	for required in [
+		"SignedPredicate",
+		"UnsignedPredicate",
+		"push_many",
+		"push_aligned_bitmap_byte",
+		"signed_value_from_le_bytes",
+		"unsigned_predicate",
+	] {
+		if !scalar.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/scalar.rs: missing ADR 059 scalar token {required}"
+			));
+		}
+	}
+	for required in [
+		"compose_value_mask_with_validity",
+		"evaluate_validity_bitmap",
+		"validity_bit",
+	] {
+		if !validity.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/validity.rs: missing ADR 059 validity token {required}"
+			));
+		}
+	}
+	for required in ["combine_bitmap", "mask_tail_bits", "combine_bool"] {
+		if !mask.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/mask.rs: missing ADR 059 mask algebra token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodedAggregateSource",
+		"fold_native_signed_sum",
+		"fold_native_unsigned_sum",
+		"fold_native_min_max",
+		"fold_signed_encoded_values",
+		"fold_unsigned_encoded_values",
+		"fold_signed_min_max_encoded_values",
+		"fold_unsigned_min_max_encoded_values",
+		"with_native_encoded_column",
+		"fold_unsigned_sum_no_validity",
+		"try_fold_native_masked_aggregate_request",
+		"AggregateMaskSelection",
+		"count_masked_dictionary_indices",
+		"for_selected_rows_in_page",
+		"bitpacked_value_at",
+		"dictionary_index_at",
+		"native_aggregate_cascade_eligible",
+		"native_unsigned_aggregate_cascade_eligible",
+	] {
+		if !aggregate.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/aggregate.rs: missing ADR 059 aggregate token {required}"
+			));
+		}
+	}
+	for required in [
+		"native_aggregate_cascade_eligible(&function, field.data_type(), Some(cascade))",
+		"native_evaluation_eligibility(cascade, atom, &coercion)",
+		"with_native_encoded_column",
+		"EncodingComputeFallbackReason::AggregateUnsupported",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 059 aggregate eligibility token {required}"
+			));
+		}
+	}
+	for required in [
+		"rows: vec![8_192, 65_536, 1_048_576]",
+		"cargo bench --bench encoding_compute",
+		"predicate_selectivity_sweep",
+		"aggregate_{kind_label}_selectivity_sweep",
+		"for _ in 0..iterations.min(5)",
+	] {
+		if !bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 059 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"default-set promotion gate **passed**",
+		"Promote ADR 059 to default-enabled with a narrowed default set.",
+		"RlePlain",
+		"native_aggregate_cascade_eligible(...)",
+		"cargo bench --bench encoding_compute",
+	] {
+		if !bench_artifact.contains(required) {
+			violations.push(format!(
+				"plans/impl/059_native_cocd_kernels_bench_results.md: missing ADR 059 evidence token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 059 native COCD kernel invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr066_fsst_evaluator_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let kernels_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/mod.rs"))
+			.unwrap();
+	let fsst_kernel =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
+			.unwrap();
+	let manager = manager_source(manifest_dir);
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+
+	for required in [
+		"FsstWholeBuffer = 7",
+		"Self::FsstWholeBuffer",
+		"\"fsst_whole_buffer\" => Some(Self::FsstWholeBuffer)",
+	] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 066 token {required}"
+			));
+		}
+	}
+	if compute_types.contains("EncodingComputeEvaluatorKind::FsstWholeBuffer,")
+		&& compute_types.contains("enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL")
+	{
+		violations.push(
+			"src/storage/encoding/compute/types.rs: Fsst must not be default-enabled by ALL"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub mod fsst;",
+		"parse_fsst_frame",
+		"decode_offsets",
+		"evaluate_fsst_equality",
+		"FsstDecodedByteReader",
+	] {
+		if !kernels_mod.contains(required) && !fsst_kernel.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: missing ADR 066 token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodingCascade::FsstWholeBuffer { .. } =>",
+		"Some(EncodingComputeEvaluatorKind::FsstWholeBuffer)",
+		"evaluate_fsst_predicate",
+		"PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList",
+		"string_like_data_type_supported",
+	] {
+		if !dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 066 dispatch token {required}"
+			));
+		}
+	}
+	for required in [
+		"FsstValues",
+		"FsstOffsets",
+		"offsets_buffer_ordinal",
+		"output_columns.contains(*column_index as u32)",
+		"EncodingComputeEvaluatorKind::FsstWholeBuffer",
+		"evaluate_fsst_predicate(",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 066 manager token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"symbol_table_byte_len",
+		"materialize_encoding_buffer",
+		"pre_encoded",
+		"encoded_literal",
+	] {
+		if fsst_kernel.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: forbidden ADR 066 token {forbidden}"
+			));
+		}
+	}
+	for required in ["\"fsst_whole_buffer\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 066 metric token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("FsstWholeBuffer {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,")
+		|| !encoding_types.contains("FsstWholeBuffer = 7")
+	{
+		violations.push(
+			"src/storage/encoding/types.rs: ADR 068 prerequisite must keep whole-buffer FSST discriminant/layout stable"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 066 FSST evaluator invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr067_row_safe_fsst_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let fsst_kernel =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
+			.unwrap();
+	let manager = manager_source(manifest_dir);
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let row_group_fetch_bench =
+		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
+	let bench_results =
+		fs::read_to_string(manifest_dir.join("plans/impl/067_row_canonical_fsst_bench_results.md"))
+			.unwrap_or_default();
+
+	for required in [
+		"FsstRowSafe = 9",
+		"Self::FsstRowSafe => \"fsst_row_safe\"",
+		"\"fsst_row_safe\" => Some(Self::FsstRowSafe)",
+		"pub const DEFAULT_ENABLED: [Self; 9]",
+		"enabled_cascades: EncodingCascadeKind::DEFAULT_ENABLED.into_iter().collect()",
+		"FsstRowSafe {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,",
+	] {
+		if !encoding_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 067 token {required}"
+			));
+		}
+	}
+	// Post-promotion (ADR 067 Phase 8): FsstRowSafe is now in DEFAULT_ENABLED.
+	// The original Phase 1 architecture guard pinned the opposite (kept it
+	// out of defaults pending Phase 7 evidence); the council promoted it
+	// default-on per the Phase 7 promotion-gate evidence in
+	// plans/impl/067_row_canonical_fsst_bench_results.md.
+	if !encoding_types.contains("Self::FsstRowSafe,\n\t];")
+		&& !encoding_types.contains("Self::FsstRowSafe,\r\n\t];")
+	{
+		violations.push(
+			"src/storage/encoding/types.rs: DEFAULT_ENABLED must list FsstRowSafe last (post-promotion contract)"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encode_fsst_row_safe_bytes",
+		"decode_fsst_row_safe_bytes",
+		"b\"RSFS\"",
+		"value_offsets.windows(2)",
+		"row_count as u32).to_le_bytes()",
+		"FSST_ROW_SAFE_BLOCK_ROWS: usize = 256",
+		"FSST_ROW_SAFE_LENGTH_SENTINEL: u8 = 255",
+		"block_offsets",
+		"encoded_lengths",
+		"exception_lengths",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 067 RSFS token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodingCascadeKind::FsstRowSafe",
+		"EncodingCascade::FsstRowSafe",
+		"saturating_mul(11).div_ceil(10)",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 067 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"FsstRowSafe = 8",
+		"Self::FsstRowSafe => \"fsst_row_safe\"",
+		"\"fsst_row_safe\" => Some(Self::FsstRowSafe)",
+	] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 067 evaluator token {required}"
+			));
+		}
+	}
+	for required in [
+		"evaluate_fsst_row_safe_predicate",
+		"parse_fsst_row_safe_frame",
+		"evaluate_fsst_row_safe_equality",
+		"EncodingCascade::FsstRowSafe { .. } =>",
+	] {
+		if !dispatch.contains(required) && !fsst_kernel.contains(required) {
+			violations.push(format!(
+				"ADR 067 dispatch/kernel token missing from dispatch or fsst kernel: {required}"
+			));
+		}
+	}
+	for required in [
+		"evaluate_fsst_row_safe_predicate",
+		"EncodingComputeEvaluatorKind::FsstRowSafe",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 067 manager token {required}"
+			));
+		}
+	}
+	for required in ["\"fsst_row_safe\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 067 metric token {required}"
+			));
+		}
+	}
+	for required in [
+		"fsst_row_safe_recorded_diagnostic",
+		"fsst_row_safe_writer_selected",
+		"fsst_row_safe_dense_fallback_atom_unsupported",
+		"fsst_row_safe_cross_replica_determinism",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 067 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"adr067_fsst_row_safe_row_group_fetch",
+		"fsst_row_safe_kernel_case_a1",
+		"fsst_row_safe_dense_case_b_overlap_a2",
+	] {
+		if !row_group_fetch_bench.contains(required) {
+			violations.push(format!(
+				"benches/row_group_fetch.rs: missing ADR 067 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"ADR 067 Row-Canonical FSST Bench Results",
+		"Promotion-gate summary",
+		"EncodingCascadeKind::DEFAULT_ENABLED",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/067_row_canonical_fsst_bench_results.md: missing ADR 067 evidence token {required}"
+			));
+		}
+	}
+	let row_safe_impl = fsst_kernel
+		.split("fn evaluate_fsst_row_safe_equality_impl")
+		.nth(1)
+		.and_then(|tail| tail.split("struct EncodedRowSafeLiteral").next())
+		.unwrap_or_default();
+	for forbidden in [
+		"FsstDecodedByteReader",
+		"decode_buffer(",
+		"evaluate_fsst_equality_impl",
+	] {
+		if row_safe_impl.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: row-safe Strategy B path used forbidden token {forbidden}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 067 row-safe FSST invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr068_fsst_row_safe_estimator_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let estimator =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/estimator.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+
+	for required in [
+		"pub(crate) enum FsstRowSafeEstimatorDecision",
+		"pub(crate) enum FsstRowSafeEstimatorDecline",
+		"pub(crate) enum FsstRowSafeEstimatorRouting",
+		"pub(crate) struct FsstRowSafeEstimatorStats",
+		"pub(crate) enum FsstRowSafeEstimatorTableSource",
+		"FsstRowSafeEstimatorTableSource::CrossBufferCached => None",
+		"pub(crate) fn estimate_fsst_row_safe_cost_free_decline",
+		"pub(crate) fn estimate_fsst_row_safe_with_cached_tables",
+		"MetadataFloorExceedsPlaintext",
+		"MetadataPayloadFloorExceedsPlaintext",
+		"TrainedMetadataFloorExceedsPlaintext",
+		"SampledRowSafeExceedsPlaintext",
+		"SampledRowSafeExceedsWholeBufferGuard",
+		"FsstRowSafeEstimatorSampleShape::DeterministicSpread",
+		"deterministic_spread_sample_shape_bounds_prefix_projection_error",
+		"CROSS_BUFFER_SAMPLE_FLOOR_PRESSURE_DENOMINATOR",
+		"fsst_symbol_training_cost_probe",
+		"cached_tables_do_not_decline_from_cross_buffer_sample",
+		"EARLY_DECLINE_SAFETY_MULTIPLIER_NUMERATOR: usize = 6",
+		"EARLY_DECLINE_SAFETY_MULTIPLIER_DENOMINATOR: usize = 5",
+	] {
+		if !estimator.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/estimator.rs: missing ADR 068 token {required}"
+			));
+		}
+	}
+	for required in [
+		"fsst_row_safe_metadata_floor_bytes",
+		"fsst_row_safe_metadata_payload_floor_bytes",
+		"fsst_row_safe_metadata_bytes",
+		"FSST_ROW_SAFE_FIXED_HEADER_BYTES: usize = 13",
+		"train_fsst_whole_buffer_symbol_table",
+		"train_fsst_row_safe_symbol_table",
+		"fsst_whole_buffer_encoded_len_with_table",
+		"fsst_row_safe_encoded_len_with_table",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 068 codec token {required}"
+			));
+		}
+	}
+	for required in [
+		"select_fsst_candidate_with_routing",
+		"pub(crate) fn select_fsst_candidate_with_routing",
+		"pub(crate) fn select_fsst_candidate_with_routing_and_context",
+		"pub(crate) struct WriterCascadeContext",
+		"pub(crate) struct ColumnFsstSymbolTableCache",
+		"pub(crate) fn select_and_encode_buffer_with_value_offsets_and_context",
+		"FsstRowSafeEstimatorRouting::Estimator",
+		"FsstRowSafeEstimatorRouting::ExactOnly",
+		"writer_context.is_some() && ipc_column_ordinal.is_some()",
+		"FsstRowSafeEstimatorDecision::Decline(_) => {}",
+		"FsstRowSafeExactLengths::CurrentBuffer",
+		"fsst_writer_context_warms_column_cache_from_exact_route",
+		"row_safe_exact_guard(",
+		"fsst_estimator_route_emits_exact_bytes_on_warehouse_winner_matrix_8k",
+		"fsst_estimator_route_emits_exact_bytes_on_warehouse_winner_matrix_all_tiers",
+		"fsst_estimator_route_emits_byte_identical_predicate_masks_on_warehouse_winner_matrix_8k",
+		"fsst_estimator_route_emits_byte_identical_predicate_masks_on_warehouse_winner_matrix_all_tiers",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 068 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"WriterCascadeContext::default()",
+		"build_encoding_directory_for_ipc_stream_exact_fsst_for_bench",
+		"FsstRowSafeEstimatorRouting::ExactOnly",
+		"select_and_encode_buffer_with_value_offsets_and_context",
+		"writer_context.as_mut()",
+		"context_column",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 068 writer column-cache context token {required}"
+			));
+		}
+	}
+	for required in [
+		"fn fsst_log_line_eq_5p_fixture",
+		"fn fsst_metadata_floor_decline_fixture",
+		"fsst_metadata_floor_decline_diag",
+		"fsst_log_line_eq_5p",
+		"fsst_row_safe_log_line_eq_5p",
+		"encoding_compute_bench scenario=fsst_row_safe_writer route={}",
+		"encoding_compute_bench scenario=fsst_row_safe_writer_column_cache_matrix",
+		"--writer-column-cache-only",
+		"--writer-column-cache-rows=",
+		"--writer-column-cache-fixture=",
+		"--fsst-writer-only",
+		"selected_writer_ms",
+		"selected_vs_dual_cpu_micros",
+		"exact_writer_ms",
+		"writer_vs_exact_cpu_micros",
+		"exact_vs_writer_cpu_micros",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 068 free-text/log-line fixture token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"AtomicUsize",
+		"fsst_row_safe_estimator_total",
+		"fsst_row_safe_estimator_decline",
+		"--d2-",
+		"d2_only",
+		"d2_fixture",
+		"d2_rows",
+		"prepare_d2",
+		"D2_",
+		"fsst_row_safe_writer_d2_matrix",
+	] {
+		if encoding_compute_bench.contains(forbidden) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: ADR 068 bench diagnostics must stay stdout-row based and semantic-named, found forbidden token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub enum FsstRowSafeEstimatorRouting",
+		"pub enum FsstRowSafeEstimatorDecision",
+		"pub enum FsstRowSafeEstimatorDecline",
+		"pub enum FsstRowSafeEstimatorTableSource",
+		"pub struct FsstRowSafeEstimatorStats",
+		"pub sampled_rows",
+		"pub estimated_fsst_whole_buffer_encoded_len",
+		"pub estimated_fsst_row_safe_encoded_len",
+		"pub decision",
+		"pub payload_len",
+		"pub exception_count",
+	] {
+		if estimator.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/estimator.rs: ADR 068 estimator type escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub struct WriterCascadeContext",
+		"pub struct ColumnFsstSymbolTableCache",
+		"pub fsst_tables_by_column",
+		"pub row_safe_table",
+		"pub whole_buffer_table",
+	] {
+		if select.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: ADR 068 writer column-cache context escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"estimator_enabled",
+		"fsst_row_safe_estimator_enabled",
+		"row_safe_estimator_enabled",
+	] {
+		if encoding_types.contains(forbidden) || config.contains(forbidden) {
+			violations.push(format!(
+				"encoding writer config exposed forbidden ADR 068 estimator knob {forbidden}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 068 row-safe FSST estimator invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr069_encoded_validity_sparse_projection_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/materialize.rs")).unwrap();
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let manager = manager_source(manifest_dir);
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/069_encoded_validity_sparse_projection_bench_results.md"),
+	)
+	.unwrap_or_default();
+	let adr064 =
+		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+			.unwrap();
+	let roadmap = fs::read_to_string(manifest_dir.join("plans/wip/roadmap.md")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for required in [
+		"pub(crate) enum WriterValidityCascadeRouting",
+		"Disabled",
+		"Enabled",
+		"pub(crate) const VALIDITY_RLE_BYTE_SAVING_FRACTION",
+		"pub(crate) const MIN_VALIDITY_ENCODE_BYTES",
+		"pub(crate) struct ValidityRleEncodingPlan",
+		"pub(crate) struct ValuePageRowSpan",
+		"pub(crate) fn select_validity_cascade",
+		"run_count: RunCount",
+		"EncodingCascade::Rle",
+		"inner: Box::new(EncodingLeafCascade::Plain)",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 069 selection token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub enum WriterValidityCascadeRouting",
+		"pub fn select_validity_cascade",
+		"pub struct ValidityRleEncodingPlan",
+		"pub struct ValuePageRowSpan",
+	] {
+		if select.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: ADR 069 helper escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"WriterValidityCascadeRouting::Disabled",
+		"WriterValidityCascadeRouting::Enabled",
+		"pub(crate) fn build_encoding_directory_for_ipc_stream_with_validity_for_bench",
+		"select_validity_cascade",
+		"is_validity_buffer",
+		"cascade_index_for",
+		"page_value_count: value_page_value_count",
+		"decoded_value_count: BufferValueCount::new(group.row_count.get())",
+		"decoded_byte_len: RecordBodyByteLen::new(plan.raw_byte_len as u64)",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 069 writer token {required}"
+			));
+		}
+	}
+	if directory.contains("pub fn build_encoding_directory_for_ipc_stream_with_validity_for_bench")
+	{
+		violations.push(
+			"src/storage/encoding/directory.rs: ADR 069 validity writer bench route must remain crate-private"
+				.to_string(),
+		);
+	}
+	let production_writer_route = directory
+		.split("pub fn build_encoding_directory_for_ipc_stream(")
+		.nth(1)
+		.and_then(|tail| tail.split("#[doc(hidden)]").next())
+		.unwrap_or_default();
+	if !production_writer_route.contains("WriterValidityCascadeRouting::Enabled") {
+		violations.push(
+			"src/storage/encoding/directory.rs: promoted ADR 069 production writer route must initialize validity routing Enabled"
+				.to_string(),
+		);
+	}
+	if production_writer_route.contains("WriterValidityCascadeRouting::Disabled") {
+		violations.push(
+			"src/storage/encoding/directory.rs: promoted ADR 069 production writer route must not initialize validity routing Disabled"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub(crate) enum PageMaterializeValiditySource",
+		"Raw { bit_offset: u8 }",
+		"Encoded { cascade: EncodingCascadeIndex }",
+		"pub(crate) fn validity_page_decoded_byte_len",
+		"pub(crate) fn decode_rle_validity_page",
+		"pub(crate) fn stitch_validity_pages_into_row_group_bitmap",
+		"RleByteRunIter::new",
+		"validity_null_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 069 bitmap token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) fn materialize_encoding_validity_buffer",
+		"pub(crate) fn decode_encoded_validity_buffer",
+		"pub(crate) fn encoded_validity_cascade_supported",
+		"stitch_validity_pages_into_row_group_bitmap",
+		"materialize_ipc_page_is_validity_buffer",
+	] {
+		if !materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/materialize.rs: missing ADR 069 materialize token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) enum EncodedValiditySparseEligibility",
+		"Eligible",
+		"Decline(EncodedValidityDeclineReason)",
+		"pub(crate) enum EncodedValidityDeclineReason",
+		"UnsupportedCascade",
+		"MissingPageMetadata",
+		"PageGeometryMismatch",
+		"RowGroupRowCountMismatch",
+		"DecodedByteLenMismatch",
+		"CorruptPageDescriptor",
+		"pub(crate) fn encoded_validity_sparse_eligibility",
+		"encoded_validity_cascade_supported",
+		"PageMaterializeValiditySource::Encoded",
+		"PageMaterializeValiditySource::Raw",
+		"EncodedValidityBufferUnsupported",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 069 planner token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"ValidityV1Eligibility",
+		"validity_v1_eligibility",
+		"pub enum EncodedValiditySparseEligibility",
+		"pub enum EncodedValidityDeclineReason",
+		"pub fn encoded_validity_sparse_eligibility",
+	] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: ADR 069 planner helper escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"PageMaterializeValiditySource::Raw { bit_offset }",
+		"PageMaterializeValiditySource::Encoded { cascade }",
+		"decode_rle_validity_page",
+		"decode_encoded_validity_buffer",
+		"encoded_validity_cascade_supported",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 069 runtime token {required}"
+			));
+		}
+	}
+	for required in [
+		"materialize_encoding_validity_buffer",
+		"buffer_ordinal == mapping.first_buffer_ordinal",
+	] {
+		if !columnar.contains(required) {
+			violations.push(format!(
+				"src/storage/columnar.rs: missing ADR 069 full-buffer role-dispatch token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3;") {
+		violations.push("ADR 069 must not bump ENCODING_DIRECTORY_FORMAT_VERSION".to_string());
+	}
+	for forbidden in [
+		"EncodedValidity",
+		"ValidityRle",
+		"WriterValidityCascadeRouting",
+		"VALIDITY_RLE_BYTE_SAVING_FRACTION",
+		"MIN_VALIDITY_ENCODE_BYTES",
+	] {
+		if encoding_types.contains(forbidden) || config.contains(forbidden) {
+			violations.push(format!(
+				"ADR 069 must not expose encoded-validity through public/config surfaces, found {forbidden}"
+			));
+		}
+	}
+	for forbidden in ["encoded_validity", "encoded-validity", "validity_rle"] {
+		if metrics.contains(forbidden) {
+			violations.push(format!(
+				"ADR 069 must not add public metric labels, found {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"--encoded-validity-only",
+		"--rows=",
+		"encoded_validity_sparse_projection",
+		"selected_validity_raw_bytes",
+		"selected_validity_encoded_bytes",
+		"deterministic={}",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 069 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"Status: promoted",
+		"Prompt-to-artifact checklist",
+		"Phase 0 pins",
+		"Hard gates",
+		"Soft gates",
+		"cargo bench --bench encoding_compute -- --quick --encoded-validity-only --rows=8192,65536,1048576",
+		"Writer wall-clock percentage overhead is not bounded by the original",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/069_encoded_validity_sparse_projection_bench_results.md: missing ADR 069 evidence token {required}"
+			));
+		}
+	}
+	for required in [
+		"Where we are after ADR 069",
+		"ADR 069 adds the encoded-validity producer and reader",
+		"Closed by ADR 069 for",
+	] {
+		if !adr064.contains(required) {
+			violations.push(format!(
+				"plans/adr/064_nullable_sparse_projection.md: missing ADR 069 closure token {required}"
+			));
+		}
+	}
+	for required in [
+		"plans/impl/069_encoded_validity_sparse_projection_bench_results.md",
+		"Shipped and promoted",
+		"now initializes `Enabled`",
+		"RowGroupRowCountMismatch",
+	] {
+		if !roadmap.contains(required) {
+			violations.push(format!(
+				"plans/wip/roadmap.md: missing ADR 069 promotion token {required}"
+			));
+		}
+	}
+	if page_materialize.contains("decode_page(")
+		&& page_materialize.contains("decode_rle_validity_page")
+		&& manager.contains("PageMaterializeValiditySource::Encoded")
+		&& !manager.contains("decode_page_fetch(fetch, &fetched)")
+	{
+		// The existing value-page decoder can remain in the helper module, but encoded
+		// validity materialization must take the RLE bitmap path in manager.rs.
+	} else if manager.contains("PageMaterializeValiditySource::Encoded")
+		&& manager.contains("decode_page_fetch(fetch, &fetched)")
+	{
+		violations.push(
+			"src/storage/manager.rs: encoded validity must not reuse fixed-width page decoder"
+				.to_string(),
+		);
+	}
+	assert!(
+		violations.is_empty(),
+		"ADR 069 encoded-validity sparse projection invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr070_all_null_page_skip_sparse_projection_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let row_group_bench =
+		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let schema_pbc = fs::read_to_string(manifest_dir.join("src/schema/pbc.rs")).unwrap();
+	let adr = fs::read_to_string(
+		manifest_dir.join("plans/adr/070_all_null_page_skip_sparse_projection.md"),
+	)
+	.unwrap();
+	let adr064 =
+		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+			.unwrap();
+	let adr069 = fs::read_to_string(
+		manifest_dir.join("plans/adr/069_encoded_validity_sparse_projection.md"),
+	)
+	.unwrap();
+	let impl_plan = fs::read_to_string(
+		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection.md"),
+	)
+	.unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md"),
+	)
+	.unwrap();
+
+	for required in [
+		"pub(crate) enum SelectedPageDisposition",
+		"AllNullElided",
+		"page_row_count",
+		"bytes_per_value",
+		"value_page_dispositions",
+		"pub(crate) enum AllNullElisionDeclineReason",
+		"pub(crate) fn value_page_is_metadata_all_null",
+		"all_null_elision_data_type_eligible",
+		"DataType::Int8",
+		"DataType::UInt64",
+		"DataType::Timestamp",
+		"TimeUnit::Nanosecond",
+		"DataType::Date64",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 070 planner token {required}"
+			));
+		}
+	}
+	for forbidden in ["fixed_width_value_bytes(field.data_type()).is_none() ||"] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: forbidden ADR 070 V1 widening token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) enum PageMaterializeValueSource",
+		"AllNullSynthesized",
+		"pub(crate) fn synthesize_all_null_page_buffers",
+		"validity_page_decoded_byte_len(page_row_count)",
+		"null_count: page_row_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 070 synthesis token {required}"
+			));
+		}
+	}
+	for required in [
+		"SelectedPageDisposition",
+		"synthesize_all_null_projection_page",
+		"SelectedPageDisposition::AllNullElided",
+		"PageMaterializeValueSource::AllNullSynthesized",
+		"synthesize_all_null_page_buffers",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 070 runtime token {required}"
+			));
+		}
+	}
+	for required in [
+		"--all-null-elision-only",
+		"--rows=",
+		"adr070_all_null_page_skip",
+		"elided_pages",
+		"synthesized_value_bytes",
+		"drift_sentinel_pages",
+		"baseline_macro_block_get_count",
+		"elision_macro_block_get_count",
+	] {
+		if !row_group_bench.contains(required) {
+			violations.push(format!(
+				"benches/row_group_fetch.rs: missing ADR 070 bench token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3;") {
+		violations.push("ADR 070 must not bump ENCODING_DIRECTORY_FORMAT_VERSION".to_string());
+	}
+	for forbidden in [
+		"AllNullElision",
+		"all_null_elision",
+		"AllNullPageSkip",
+		"all_null_page_skip",
+	] {
+		if config.contains(forbidden)
+			|| metrics.contains(forbidden)
+			|| schema_pbc.contains(forbidden)
+			|| encoding_types.contains(forbidden)
+		{
+			violations.push(format!(
+				"ADR 070 must not expose all-null elision through public/config surfaces, found {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"Boolean is V2",
+		"Do not gate promotion on GET count never increasing",
+		"Do not add bridge-overfetch logic",
+		"Catalog gating is the planner's",
+	] {
+		if !adr.contains(required) {
+			violations.push(format!(
+				"plans/adr/070_all_null_page_skip_sparse_projection.md: missing ADR 070 convergence token {required}"
+			));
+		}
+	}
+	for required in ["ADR 070 later", "closes this deferral"] {
+		if !adr064.contains(required) {
+			violations.push(format!(
+				"plans/adr/064_nullable_sparse_projection.md: missing ADR 070 closure token {required}"
+			));
+		}
+	}
+	for required in ["closed by ADR 070", "metadata-all-null reader path"] {
+		if !adr069.contains(required) {
+			violations.push(format!(
+				"plans/adr/069_encoded_validity_sparse_projection.md: missing ADR 070 boundary-closure token {required}"
+			));
+		}
+	}
+	for required in [
+		"SelectedPageDisposition",
+		"value_page_is_metadata_all_null",
+		"synthesize_all_null_page_buffers",
+		"all-null elision",
+	] {
+		if !impl_plan.contains(required) {
+			violations.push(format!(
+				"plans/impl/070_all_null_page_skip_sparse_projection.md: missing ADR 070 implementation token {required}"
+			));
+		}
+	}
+	for required in [
+		"Status: implementation evidence captured",
+		"Phase 0 Audit",
+		"Prompt-to-artifact Checklist",
+		"cargo bench --bench row_group_fetch -- --all-null-elision-only --rows=8192,65536,1048576",
+		"alternating_pages_all_null",
+		"baseline_macro_block_get_count",
+		"drift_sentinel_pages",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md: missing ADR 070 evidence token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 070 all-null page skip sparse projection invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr060_sparse_projection_fetch_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/mod.rs")).unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let manager = manager_source(manifest_dir);
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let schema_pbc = fs::read_to_string(manifest_dir.join("src/schema/pbc.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+
+	for required in [
+		"pub mod page_materialize;",
+		"pub mod sparse_projection_fetch;",
+	] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/mod.rs: missing ADR 060 token {required}"
+			));
+		}
+	}
+	for required in [
+		"PageMaterializeKey",
+		"PageMaterializeBufferKey",
+		"PageMaterializeColumn",
+		"PageMaterializeFetch",
+		"PageMaterializeValidityFetch",
+		"PageValidityBitmap",
+		"decode_page_fetch",
+		"projected_page_batch_from_decoded_buffers",
+		"extract_record_body_bytes",
+		"fixed_width_sparse_projection_column",
+		"fixed_width_encoding_indexed_value_column",
+		"validity_bitmap_body_range_for_page",
+		"rebase_validity_bitmap",
+		"empty_projected_batch_for_row_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 060 helper token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"SparseProjectionFetchDecision",
+		"SparseProjectionFetchDecline",
+		"decide_sparse_projection_fetch",
+		"MAX_SPARSE_RANGES_PER_BUFFER",
+	] {
+		if page_materialize.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: helper module must not own planner token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) const MAX_SPARSE_RANGES_PER_BUFFER",
+		"pub(crate) struct RowToPageMap",
+		"pub(crate) enum ActivePageSet",
+		"pub(crate) struct SparseProjectionFetchPlan",
+		"pub(crate) enum SparseProjectionFetchDecision",
+		"pub(crate) enum SparseProjectionFetchDecline",
+		"pub(crate) fn decide_sparse_projection_fetch",
+		"mask_to_active_pages",
+		"projection_cascade_eligible",
+		"validity_fetches",
+		"EncodedValidityBufferUnsupported",
+		"ValidityBufferRangeMissing",
+		"NullableTypeNotInCatalog",
+		"all_valid_nullable_pages",
+		"ByteEstimateNotSparse",
+		"PerBufferFragmentationCapExceeded",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 060 planner token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"decode_page_fetch(",
+		"projected_page_batch_from_decoded_buffers(",
+		"pub struct Config",
+		"sparse_phase",
+		"SparsePhase",
+		"phase_c",
+	] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: forbidden ADR 060 token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"decide_sparse_projection_fetch(SparseProjectionFetchInput",
+		"materialize_sparse_projection_pages",
+		"materialize_sparse_projection_page_batches",
+		"predicate_output_overlap",
+		"filtered_predicate_page_batch",
+		"zip_predicate_and_projection_columns",
+		"predicate_outcome: &predicate_outcome",
+		"plan.validity_fetches",
+		"rebase_validity_bitmap",
+		"observe_storage_l2_encoding_simd_pages_fetched",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 060 runtime token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"L2FetchStrategy::Sparse",
+		"RowGroupFallbackReason::Sparse",
+		"EncodingFallbackReason::Sparse",
+		"EncodingRejectCode::Sparse",
+		"EncodedRowMask::Sparse",
+		"sparse_projection_fetch_",
+	] {
+		if columnar.contains(forbidden)
+			|| row_group.contains(forbidden)
+			|| encoding_types.contains(forbidden)
+			|| compute_types.contains(forbidden)
+			|| config.contains(forbidden)
+			|| schema_pbc.contains(forbidden)
+			|| transport.contains(forbidden)
+			|| metrics.contains(forbidden)
+		{
+			violations.push(format!("ADR 060 forbidden public/config token {forbidden}"));
+		}
+	}
+	if !row_group.contains("pub struct RowGroupFetchPlan")
+		|| !row_group.contains("phase_c_fetch")
+		|| !columnar.contains("RowGroup(RowGroupFetchPlan)")
+	{
+		violations.push(
+			"ADR 060 must reuse the existing row-group fetch strategy and projection-fetch plan field"
+				.to_string(),
+		);
+	}
+	if metrics.contains("sparse_projection") || metrics.contains("sparse_projection_fetch") {
+		violations.push("ADR 060 must not add sparse-specific metric labels".to_string());
+	}
+	if page_materialize.contains("NullableProjectedColumn")
+		|| sparse_projection.contains("NullableProjectedColumn")
+		|| manager.contains("NullableProjectedColumn")
+	{
+		violations.push("ADR 064 must not restore NullableProjectedColumn".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 060 sparse projection fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr061_authenticated_chunk_layout_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let crypto = fs::read_to_string(manifest_dir.join("src/crypto.rs")).unwrap();
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/mod.rs")).unwrap();
+	let chunk_layout =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/chunk_layout.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let macro_block_test =
+		fs::read_to_string(manifest_dir.join("tests/crypto_macro_block_coalescing.rs")).unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir
+			.join("plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md"),
+	)
+	.unwrap();
+
+	for required in [
+		"pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES: usize = 64 * 1024;",
+		"pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE: ChunkSizeBytes",
+		"pub const SLAB_ENCRYPTION_CHUNK_SIZES: [usize; 5]",
+		"4 * 1024",
+		"8 * 1024",
+		"16 * 1024",
+		"32 * 1024",
+		"64 * 1024",
+		"pub chunk_size_bytes: ChunkSizeBytes",
+		"validate_slab_chunk_size(chunk_size_bytes)?",
+		"chunk_size_bytes.get().to_be_bytes()",
+		"ChunkSizeBytes::new(u32::from_be_bytes",
+	] {
+		if !crypto.contains(required) {
+			violations.push(format!("src/crypto.rs: missing ADR 061 token {required}"));
+		}
+	}
+	if !units.contains("impl_unit!(ChunkSizeBytes, u32);") {
+		violations.push("src/schema/units.rs: missing ChunkSizeBytes unit".to_string());
+	}
+	for forbidden in [
+		concat!("SLAB_ENCRYPTION_", "LEGACY_", "CHUNK_BYTES"),
+		concat!("SLAB_ENCRYPTION_", "CHUNK_BYTES"),
+		"AuthenticatedChunkDirectory",
+		"base_chunk_index",
+	] {
+		if crypto.contains(forbidden)
+			|| units.contains(forbidden)
+			|| encoding_mod.contains(forbidden)
+			|| chunk_layout.contains(forbidden)
+			|| directory.contains(forbidden)
+			|| manager.contains(forbidden)
+			|| node.contains(forbidden)
+			|| config.contains(forbidden)
+		{
+			violations.push(format!(
+				"ADR 061 forbidden implementation token {forbidden}"
+			));
+		}
+	}
+	for required in ["pub mod chunk_layout;", "pub use chunk_layout::*;"] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/mod.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct L2ChunkLayoutConfig",
+		"pub enabled: bool",
+		"pub max_pad_inflation_micros: SelectivityFractionMicros",
+		"enabled: true",
+		"PROMOTED_FLOOR: ChunkSizeBytes = ChunkSizeBytes::new(16 * 1024)",
+		"pub fn choose_chunk_size_bytes",
+		"pub fn choose_chunk_size_bytes_for_directories",
+		"pub fn estimate_pad_inflation",
+		"pub fn align_buffers_to_chunks",
+		"default_sparse_engaged_cascade",
+		"EncodingCascade::Dictionary",
+		"EncodingLeafCascade::Plain | EncodingLeafCascade::BitPacked",
+	] {
+		if !chunk_layout.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/chunk_layout.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	if chunk_layout.contains("matches!(cascade, EncodingCascade::Rle") {
+		violations
+			.push("ADR 061 must not put Rle in the default sparse engagement set".to_string());
+	}
+	for required in [
+		"chunk_size_bytes: ChunkSizeBytes",
+		"default_sparse_engaged_key",
+		"body.resize(new_len, 0)",
+		"chunk_alignment_pad_bytes",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub l2_chunk_layout: L2ChunkLayoutConfig",
+		"choose_tiered_object_chunk_size",
+		"choose_chunk_size_bytes_for_directories",
+		"l2_chunk_layout_config",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub l2_chunk_layout: L2ChunkLayoutConfig",
+		"self.l2_chunk_layout.validate()?",
+		"l2_chunk_layout: cfg.l2_chunk_layout.clone()",
+	] {
+		if !node.contains(required) {
+			violations.push(format!("src/node.rs: missing ADR 061 token {required}"));
+		}
+	}
+	for required in [
+		"l2_chunk_layout: RawL2ChunkLayoutConfig",
+		"struct RawL2ChunkLayoutConfig",
+		"max_pad_inflation_micros",
+		"l2_chunk_layout,",
+	] {
+		if !config.contains(required) {
+			violations.push(format!("src/config.rs: missing ADR 061 token {required}"));
+		}
+	}
+	for required in [
+		"100 * 1024 * 1024",
+		"ChunkSizeBytes::new(16 * 1024)",
+		"ranges.len()",
+		"1,",
+		"coalesce_per_region",
+		"plan.decrypt",
+	] {
+		if !macro_block_test.contains(required) {
+			violations.push(format!(
+				"tests/crypto_macro_block_coalescing.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"cargo bench --bench row_group_fetch > /tmp/row_group_fetch_061_full_final.out",
+		"Full-run evidence supports the ADR 061 V1 default of 16 KiB",
+		"| 16 KiB | 6,400 | 1 | 1 |",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md: missing ADR 061 token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 061 authenticated chunk layout invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr063_page_level_predicate_stats_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let stats = fs::read_to_string(manifest_dir.join("src/storage/stats.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let encoding_directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let predicate_page_fetch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/predicate_page_fetch.rs"))
+			.unwrap();
+	let manager = manager_source(manifest_dir);
+
+	for required in [
+		"impl_unit!(PageNullCount, u32)",
+		"impl_unit!(EncodingPageCount, u32)",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 063 unit {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct CanonicalScalar",
+		"pub struct CanonicalStatsValues",
+		"canonical_stats_for_array_slice",
+		"fixed_width_page_stats_supported_type",
+		"DataType::Timestamp(TimeUnit::Millisecond, None)",
+	] {
+		if !stats.contains(required) {
+			violations.push(format!(
+				"src/storage/stats.rs: missing ADR 063 shared stats token {required}"
+			));
+		}
+	}
+	for required in [
+		"ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3",
+		"pub struct EncodingPageStats",
+		"pub page_stats: Vec<EncodingPageStats>",
+		"pub null_count: PageNullCount",
+	] {
+		if !encoding_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 063 directory shape token {required}"
+			));
+		}
+	}
+	for required in [
+		"page_stats_cascade_eligible",
+		"EncodingComputeConfig::default()",
+		"enabled_predicate_evaluators",
+		"cascade.emits_pages_in_v1()",
+		"validate_page_stats",
+		"write_canonical_scalar",
+		"read_canonical_scalar",
+	] {
+		if !encoding_directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 063 writer/validation token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub enum PagePredicateClassification",
+		"PredicatePageFetchPlan",
+		"enum PredicatePageFetchDecline",
+		"stitch_predicate_page_mask",
+		"classify_page_stats_for_atom",
+		"PagePredicateClassification::ExactMatch",
+		"PagePredicateClassification::Disjoint",
+		"PagePredicateClassification::Maybe",
+	] {
+		if !predicate_page_fetch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/predicate_page_fetch.rs: missing ADR 063 classifier token {required}"
+			));
+		}
+	}
+	for required in [
+		"build_encoding_predicate_page_plan",
+		"EncodingPredicatePageDecision",
+		"page_fallback",
+		"page_exact",
+		"classify_page_stats_for_atom",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 063 predicate-page narrowing token {required}"
+			));
+		}
+	}
+
+	use arrow::datatypes::{DataType, TimeUnit};
+	use wendelon::storage::encoding::compute::EncodingComputeEvaluatorKind;
+	use wendelon::storage::encoding::directory::page_stats_cascade_eligible;
+	use wendelon::storage::encoding::{EncodingCascade, EncodingLeafCascade};
+	use wendelon::storage::stats::fixed_width_page_stats_supported_type;
+	let bitpacked = EncodingCascade::BitPacked {
+		bits: wendelon::schema::BitsPerValue::new(8),
+		base: wendelon::schema::BaseValue::new(0),
+	};
+	let dictionary_plain = EncodingCascade::Dictionary {
+		dict_byte_len: wendelon::schema::RecordBodyByteLen::new(8),
+		dict_value_count: wendelon::schema::DictValueCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	let dictionary_bitpacked = EncodingCascade::Dictionary {
+		dict_byte_len: wendelon::schema::RecordBodyByteLen::new(8),
+		dict_value_count: wendelon::schema::DictValueCount::new(1),
+		inner: Box::new(EncodingLeafCascade::BitPacked {
+			bits: wendelon::schema::BitsPerValue::new(1),
+			base: wendelon::schema::BaseValue::new(0),
+		}),
+	};
+	let rle = EncodingCascade::Rle {
+		run_count: wendelon::schema::RunCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	let delta = EncodingCascade::Delta {
+		base: wendelon::schema::BaseValue::new(0),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	for cascade in [&bitpacked, &dictionary_plain, &dictionary_bitpacked] {
+		if !page_stats_cascade_eligible(cascade) {
+			violations.push(format!(
+				"ADR 063 V1 cascade intersection unexpectedly excluded {cascade:?}"
+			));
+		}
+	}
+	for cascade in [&rle, &delta] {
+		if page_stats_cascade_eligible(cascade) {
+			violations.push(format!(
+				"ADR 063 V1 cascade intersection unexpectedly included {cascade:?}"
+			));
+		}
+	}
+	if !fixed_width_page_stats_supported_type(&DataType::Int64)
+		|| !fixed_width_page_stats_supported_type(&DataType::Timestamp(TimeUnit::Nanosecond, None))
+		|| fixed_width_page_stats_supported_type(&DataType::Float64)
+		|| fixed_width_page_stats_supported_type(&DataType::Utf8)
+	{
+		violations.push(
+			"ADR 063 fixed-width page stat type subset drifted from the approved V1 set"
+				.to_string(),
+		);
+	}
+	if !format!("{:?}", EncodingComputeEvaluatorKind::Delta).contains("Delta") {
+		violations
+			.push("ADR 063 architecture guard failed to reach compute evaluator types".into());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 063 page-level predicate stats invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+fn workspace_root() -> PathBuf {
+	Path::new(env!("CARGO_MANIFEST_DIR"))
+		.parent()
+		.and_then(Path::parent)
+		.expect("workspace root")
+		.to_path_buf()
+}
+
+fn read_workspace(path: &str) -> String {
+	fs::read_to_string(workspace_root().join(path)).unwrap_or_else(|err| {
+		panic!("{path}: failed to read workspace file: {err}");
+	})
+}
+
+/// ADR 077: production data-server source via the workspace root (the
+/// `read_workspace` style). Concatenates `network/data_server.rs` plus every
+/// non-test submodule, so guards that scan handler code keep working after the
+/// monolith was split into domain modules. Mirrors `data_server_source`.
+fn data_server_workspace_source() -> String {
+	data_server_source(&workspace_root().join("crates/wendelon"))
+}
+
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+	source
+		.split_once(start)
+		.unwrap_or_else(|| panic!("missing source start marker {start:?}"))
+		.1
+		.split_once(end)
+		.unwrap_or_else(|| panic!("missing source end marker {end:?} after {start:?}"))
+		.0
+}
+
+fn wendelon_cli_source() -> String {
+	read_workspace("crates/wendelon/src/cli.rs")
+}
+
+fn wendelon_inspect_region(cli: &str) -> &str {
+	source_region(cli, "fn run_inspect(args: &[String])", "fn verify_audit")
+}
+
+fn wendelon_inspect_fetch_region(cli: &str) -> &str {
+	source_region(
+		cli,
+		"async fn fetch_ready_with_tcp_connect",
+		"fn parse_readiness_view",
+	)
+}
+
+#[test]
+fn adr071_wendelon_inspect_branch_exists() {
+	let cli = wendelon_cli_source();
+	assert!(cli.contains("[cmd, rest @ ..] if cmd == \"inspect\" => run_inspect(rest)"));
+	assert!(cli.contains("fn run_inspect(args: &[String]) -> ExitCode"));
+	assert!(cli.contains("{program} inspect [--endpoint <addr>]"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_is_client_only() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	for forbidden in [
+		"WendelonNode",
+		"NodeBootstrapConfig",
+		"load_node_bootstrap_config",
+		"observability::spawn",
+		"LocalAuditSink",
+		"ReadinessReporter",
+		"start_daemon",
+	] {
+		assert!(
+			!inspect.contains(forbidden),
+			"inspect path must not construct daemon-side machinery token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_endpoint_precedence_is_pinned() {
+	let cli = wendelon_cli_source();
+	let parse = source_region(&cli, "fn parse_inspect_args", "async fn run_inspect_async");
+	assert!(cli.contains("const DEFAULT_INSPECT_ENDPOINT: &str = \"127.0.0.1:7432\";"));
+	assert!(parse.contains("WENDELON_INSPECT_ENDPOINT"));
+	assert!(parse.contains("endpoint_flag"));
+	assert!(parse.contains("invalid WENDELON_INSPECT_ENDPOINT"));
+	assert!(parse.contains("DEFAULT_INSPECT_ENDPOINT"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_tls_flags_are_all_or_none() {
+	let cli = wendelon_cli_source();
+	let parse = source_region(&cli, "fn parse_inspect_args", "async fn run_inspect_async");
+	assert!(cli.contains("wendelon inspect requires --server-name, --cert, --key, and --ca"));
+	for required in [
+		"WENDELON_INSPECT_SERVER_NAME",
+		"WENDELON_INSPECT_CLIENT_CERT",
+		"WENDELON_INSPECT_CLIENT_KEY",
+		"WENDELON_INSPECT_CA",
+		"server_name.is_none() || cert_path.is_none() || key_path.is_none() || ca_path.is_none()",
+	] {
+		assert!(
+			parse.contains(required),
+			"missing TLS parse token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_existing_actor_authorization() {
+	let tls = read_workspace("crates/wendelon/src/network/tls.rs");
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	let cli = wendelon_cli_source();
+	assert!(tls.contains("ActorPermission::ObservabilityReady"));
+	assert!(observability.contains("ActorPermission::ObservabilityReady"));
+	assert!(observability.contains("authorize_actor(&actor, permission)"));
+	assert!(!tls.contains("Inspect"));
+	assert!(!cli.contains("monitor-"));
+	assert!(!tls.contains("inspect-"));
+	assert!(
+		!read_workspace("crates/wendelon/src/network/cert_issuance_policy.rs").contains("inspect-")
+	);
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_empty_alpn() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("rustls_client_config_with_alpn(&material, Vec::new())"));
+	assert!(!fetch.contains("HRFT_ALPN"));
+	assert!(!fetch.contains("http/1.1"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_observability_http_client_helpers() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("observability_http::write_request"));
+	assert!(fetch.contains("observability_http::read_response"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_does_not_use_generic_http_clients() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	for forbidden in [
+		"reqwest",
+		"hyper",
+		"h2",
+		"http::Request",
+		"http::Response",
+		"tower",
+		"ureq",
+	] {
+		assert!(
+			!fetch.contains(forbidden),
+			"inspect fetch path must not use generic HTTP client token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_accepts_only_200_and_503() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("response.status_code != 200 && response.status_code != 503"));
+	assert!(fetch.contains("InspectError::UnexpectedStatus(response.status_code)"));
+	assert!(cli.contains(
+		"wendelon inspect: failed to read /ready response: unexpected HTTP status {status_code}"
+	));
+}
+
+#[test]
+fn adr071_wendelon_inspect_exit_codes_are_pinned_to_0_1_2() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	assert!(inspect.contains("ExitCode::SUCCESS"));
+	assert!(inspect.contains("ExitCode::from(1)"));
+	assert!(inspect.contains("ExitCode::from(2)"));
+	assert!(!inspect.contains("ExitCode::from(3)"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_text_and_json_output_are_pinned() {
+	let cli = wendelon_cli_source();
+	let render = source_region(&cli, "fn render_inspect_output", "fn verify_audit");
+	for required in [
+		"out.push(b'\\n')",
+		"render_readiness_text",
+		"node_id",
+		"epoch",
+		"leader_id",
+		"cluster_members",
+		"drain_state",
+		"audit_materialization_lag_entries",
+		"degraded_reason",
+		"fips_mode",
+		"fips_self_test_last_ts",
+		"serde_json::to_string(value)",
+	] {
+		assert!(render.contains(required), "missing render token {required}");
+	}
+	let run = source_region(
+		&cli,
+		"async fn run_inspect_async",
+		"fn inspect_error_message",
+	);
+	assert!(run.contains("io::stdout().write_all"));
+	assert!(run.contains("eprintln!(\"wendelon inspect: failed to write output: {err}\")"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_has_symmetric_timeouts() {
+	let cli = wendelon_cli_source();
+	assert!(cli.contains("pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);"));
+	assert!(cli.contains("pub const READ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);"));
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("tokio::time::timeout(connect_timeout, connect)"));
+	assert!(fetch.contains("tokio::time::timeout(read_timeout, observability_http::read_response"));
+}
+
+#[test]
+fn adr071_no_new_wendelon_observability_routes() {
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	assert!(!observability.contains("INSPECT_PATH"));
+	assert!(!observability.contains("\"/inspect\""));
+	assert!(observability.contains("pub const READY_PATH: &str = \"/ready\";"));
+	assert!(observability.contains("pub const METRICS_PATH: &str = \"/metrics\";"));
+}
+
+#[test]
+fn adr071_wendelon_observability_server_helpers_remain_local() {
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	let exporter = read_workspace("crates/wendelon/src/metrics/exporter.rs");
+	assert!(observability.contains("async fn read_request"));
+	assert!(observability.contains("fn parse_request_line"));
+	assert!(observability.contains("async fn write_response"));
+	assert!(!observability.contains("observability_http"));
+	assert!(!exporter.contains("observability_http"));
+}
+
+#[test]
+fn adr071_nilket_root_stays_runtime_free() {
+	let nilket_manifest = read_workspace("crates/nilket/Cargo.toml");
+	for forbidden in [
+		"tokio",
+		"tokio-rustls",
+		"rustls",
+		"observability",
+		"tls-pki",
+		"serde_json",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket root manifest must stay runtime-free; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_prior_adr_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn test_adr039_wendelon_drop_migration_substrate_guards",
+		"fn test_adr055_lsm_compaction_substrate_guards",
+		"fn test_adr063_page_level_predicate_stats_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior guard {required}"
+		);
+	}
+}
+
+#[test]
+fn adr071_new_inspect_types_are_brand_clean_and_no_v1_suffix() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	for required in ["InspectOptions", "InspectError", "ReadinessView"] {
+		assert!(
+			inspect.contains(required),
+			"missing inspect type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonInspect",
+		"InspectOptionsV1",
+		"InspectErrorV1",
+		"ReadinessViewV1",
+		"InspectV1",
+	] {
+		assert!(
+			!inspect.contains(forbidden),
+			"inspect surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+fn adr072_control_descriptor_get_handler_region(control: &str) -> &str {
+	source_region(
+		control,
+		"async fn handle_table_descriptor_get",
+		"async fn handle_table_descriptor_list",
+	)
+}
+
+fn adr102_control_descriptor_list_handler_region(control: &str) -> &str {
+	source_region(
+		control,
+		"async fn handle_table_descriptor_list",
+		"async fn handle_logical_type_get",
+	)
+}
+
+fn adr072_descriptor_get_auth_region(control: &str) -> &str {
+	source_region(
+		control,
+		"fn authorize_descriptor_get_actor",
+		"async fn handle_table_descriptor_get",
+	)
+}
+
+#[test]
+fn adr072_descriptor_get_msg_types_are_unique() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_REQ: Self = Self(0x3C);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);"));
+	assert_eq!(schema_core.matches("Self(0x3C)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x3D)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x44)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x45)").count(), 1);
+
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_RESP.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
+}
+
+#[test]
+fn adr072_descriptor_get_response_meta_has_no_bool_and_pins_descriptor_len() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let response = source_region(
+		&schema_core,
+		"pub struct TableDescriptorGetResponseMeta",
+		"// ============================================================\n//  ROLLING-UPGRADE VERSION WINDOW",
+	);
+	assert!(response.contains("pub accepted: u8"));
+	assert!(response.contains("pub reason_code: u8"));
+	assert!(response.contains("pub leader_hint: NodeId"));
+	assert!(response.contains("pub descriptor_len: u32"));
+	assert!(!response.contains("bool"));
+	assert!(schema_core.contains("size_of::<TableDescriptorGetRequestMeta>() == 264"));
+	assert!(schema_core.contains("size_of::<TableDescriptorGetResponseMeta>() == 24"));
+}
+
+#[test]
+fn adr072_descriptor_get_uses_descriptor_authorization_helper() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(control.contains("fn authorize_descriptor_get_actor"));
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("Self::authorize_descriptor_get_actor(&context.actor"));
+	assert!(!handler.contains("TenantAdminRequestWire"));
+}
+
+#[test]
+fn adr072_descriptor_get_enforces_tenant_isolation() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let auth = adr072_descriptor_get_auth_region(&control);
+	assert!(auth.contains("authorize_actor(actor, ActorPermission::TenantAdminRead)"));
+	assert!(auth.contains("actor.claimed_tenant_id()?"));
+	assert!(auth.contains("claimed_tenant != tenant_id"));
+}
+
+#[test]
+fn adr072_descriptor_get_is_leader_only_with_leader_hint() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("!self.is_leader().await"));
+	assert!(handler.contains("CONTROL_REASON_NOT_LEADER"));
+	assert!(handler.contains("self.leader_hint()"));
+	assert!(handler.contains("leader_hint"));
+}
+
+#[test]
+fn adr072_descriptor_get_bypasses_raft_log() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(!handler.contains("client_write"));
+	assert!(!handler.contains("WendelonRequest"));
+	assert!(!handler.contains("SchemaUpdate"));
+	assert!(handler.contains("self.state_machine.state_snapshot().await"));
+}
+
+#[test]
+fn adr072_descriptor_get_returns_latest_by_name() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("table_schemas.latest_by_name"));
+	assert!(handler.contains("request.namespace.as_str()"));
+	assert!(handler.contains("request.table_name.as_str()"));
+}
+
+#[test]
+fn adr072_descriptor_get_not_found_is_control_reason_not_found() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("CONTROL_REASON_NOT_FOUND"));
+	assert!(handler.contains("table_descriptor_get_rejection"));
+}
+
+#[test]
+fn adr072_descriptor_get_tenant_mismatch_is_authorization_failed() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let auth = adr072_descriptor_get_auth_region(&control);
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(auth.contains("claimed_tenant != tenant_id"));
+	assert!(handler.contains("CONTROL_REASON_AUTHORIZATION_FAILED"));
+}
+
+#[test]
+fn adr072_descriptor_get_malformed_name_is_invalid_config() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("decode_table_descriptor_get_request"));
+	assert!(handler.contains("CONTROL_REASON_INVALID_CONFIG"));
+}
+
+#[test]
+fn adr072_descriptor_get_returns_catalog_descriptor_without_mutation() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("encode_table_schema_descriptor_v1(descriptor)"));
+	assert!(!handler.contains("refresh_descriptor_fingerprints"));
+	assert!(!handler.contains("compute_logical_schema_fingerprint"));
+	assert!(!handler.contains("compute_physical_descriptor_fingerprint"));
+}
+
+#[test]
+fn adr072_descriptor_get_payload_is_full_descriptor_v1_postcard() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	assert!(control.contains("encode_table_schema_descriptor_v1(descriptor)"));
+	assert!(client.contains("decode_table_schema_descriptor_v1(&trailing[..])"));
+	assert!(client.contains("response.descriptor_len as usize != trailing.len()"));
+}
+
+#[test]
+fn adr072_metrics_track_descriptor_get_outcomes() {
+	let metrics = read_workspace("crates/wendelon/src/metrics/registry.rs");
+	for required in [
+		"control_descriptor_get_requests_total",
+		"control_descriptor_get_success_total",
+		"control_descriptor_get_not_found_total",
+		"control_descriptor_get_not_leader_total",
+		"control_descriptor_get_authorization_failed_total",
+		"control_descriptor_get_invalid_request_total",
+		"wendelon_control_descriptor_get_requests_total",
+		"wendelon_control_descriptor_get_success_total",
+		"wendelon_control_descriptor_get_not_found_total",
+		"wendelon_control_descriptor_get_not_leader_total",
+		"wendelon_control_descriptor_get_authorization_failed_total",
+		"wendelon_control_descriptor_get_invalid_request_total",
+	] {
+		assert!(metrics.contains(required), "missing metric {required}");
+	}
+	for line in metrics
+		.lines()
+		.filter(|line| line.contains("control_descriptor_get"))
+	{
+		assert!(
+			!line.contains("tenant") && !line.contains("table"),
+			"descriptor-get metrics must stay aggregate-only: {line}"
+		);
+	}
+}
+
+#[test]
+fn adr072_no_data_ring_or_bulk_or_object_id_descriptor_lookup() {
+	let data_server = data_server_workspace_source();
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(!data_server.contains("TABLE_DESCRIPTOR_GET"));
+	assert!(!handler.contains("descriptors_for_tenant"));
+	assert!(!handler.contains("latest_by_id"));
+	assert!(!handler.contains("table_object_id"));
+}
+
+#[test]
+fn adr102_descriptor_list_surface_is_latest_only_metadata() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let table_schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = data_server_workspace_source();
+	let handler = adr102_control_descriptor_list_handler_region(&control);
+
+	assert!(schema_core.contains("pub struct TableDescriptorListRequestMeta"));
+	assert!(schema_core.contains("pub struct TableDescriptorListResponseMeta"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
+	assert!(client.contains("pub async fn list_table_schema_descriptors"));
+	assert!(client.contains("decode_table_schema_descriptors(&trailing[..])"));
+	assert!(table_schema.contains("pub fn latest_descriptors_for_tenant"));
+	assert!(handler.contains(".latest_descriptors_for_tenant("));
+	assert!(!handler.contains(".descriptors_for_tenant("));
+	assert!(handler.contains("self.state_machine.state_snapshot().await"));
+	assert!(handler.contains("authorize_descriptor_get_actor"));
+	assert!(handler.contains("CONTROL_REASON_NOT_LEADER"));
+	assert!(handler.contains("encode_table_schema_descriptors(&descriptors)"));
+	assert!(!data_server.contains("TABLE_DESCRIPTOR_LIST"));
+	assert!(!handler.contains("Pbc"));
+	assert!(!handler.contains("scan"));
+}
+
+#[test]
+fn adr072_schema_update_and_drop_paths_stay_unchanged() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let schema_update = source_region(
+		&control,
+		"async fn handle_schema_update",
+		"async fn handle_schema_drop",
+	);
+	let schema_drop = source_region(
+		&control,
+		"async fn handle_schema_drop",
+		"fn decode_table_descriptor_get_request",
+	);
+	assert!(schema_update.contains("WendelonRequest::SchemaUpdate(frame.meta.to_vec())"));
+	assert!(schema_drop.contains("run_table_schema_drop"));
+	assert!(!schema_update.contains("TABLE_DESCRIPTOR_GET"));
+	assert!(!schema_drop.contains("TABLE_DESCRIPTOR_GET"));
+}
+
+#[test]
+fn adr072_no_toron_descriptor_sync_stub() {
+	let catalog = read_workspace("crates/toron/src/catalog.rs");
+	assert!(catalog.contains("trait DescriptorSyncClient"));
+	assert!(catalog.contains("Client::get_table_schema_descriptor"));
+	assert!(catalog.contains("sync_descriptor_for_tenant"));
+	assert!(!catalog.contains("DescriptorSource"));
+	assert!(!catalog.contains("todo!(\"descriptor sync"));
+	assert!(!catalog.contains("unimplemented!(\"descriptor sync"));
+}
+
+#[test]
+fn adr072_nilket_root_stays_runtime_free() {
+	adr071_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr072_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let combined = format!("{schema_core}\n{control}\n{client}");
+	let identifiers = rust_identifiers_from_source("adr072 combined surface", &combined);
+	for required in [
+		"TableDescriptorGetRequestMeta",
+		"TableDescriptorGetResponseMeta",
+		"TableDescriptorGetRequest",
+		"TableDescriptorGetResult",
+	] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing descriptor-get type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonTableDescriptorGetRequest",
+		"WendelonTableDescriptorGetResponse",
+		"TableDescriptorGetRequestMetaV1",
+		"TableDescriptorGetResponseMetaV1",
+		"TableDescriptorGetRequestV1",
+		"TableDescriptorGetResultV1",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"descriptor-get surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr072_prior_adr_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr071_wendelon_inspect_branch_exists",
+		"fn adr071_prior_adr_guards_continue_to_pass",
+		"fn test_adr063_page_level_predicate_stats_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior guard {required}"
+		);
+	}
+}
+
+fn adr073_active_registry_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"struct ActiveTableQueryRegistry",
+		"#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum LeaseGateResult",
+	)
+}
+
+fn adr073_table_query_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query",
+		"async fn handle_table_query_cancel",
+	)
+}
+
+fn adr073_cancel_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query_cancel",
+		"async fn handle_aggregate",
+	)
+}
+
+fn adr073_plan_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn prepare_table_query_execution_plan_with_migration_with_cancellation",
+		"async fn execute_aggregate_with_migration_merge",
+	)
+}
+
+#[test]
+fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let data_server = data_server_workspace_source();
+	let adr060 =
+		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
+	assert!(schema.contains("pub struct TableQueryRequestId"));
+	assert!(data_server.contains("ActiveTableQueryRegistry"));
+	assert!(adr060.contains("073 remains producer"));
+	assert!(adr060.contains("owner; 060 retargets"));
+	assert!(adr060.contains("No Wendelon/transport change"));
+
+	let mut toron_hits = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in [
+			"TABLE_QUERY_CANCEL_REQ",
+			"TABLE_QUERY_CANCEL_RESP",
+			"MsgType::TABLE_QUERY_CANCEL",
+			"handle_table_query_cancel",
+			"ActiveTableQueryRegistry",
+		] {
+			if content.contains(forbidden) {
+				toron_hits.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(toron_hits.is_empty(), "{}", toron_hits.join("\n"));
+
+	let toron_consumer = read_workspace("crates/toron/src/distributed/cancellation.rs");
+	assert!(toron_consumer.contains("WendelonTableQueryCancelSender"));
+	assert!(toron_consumer.contains("cancel_table_query_attempt"));
+}
+
+#[test]
+fn adr073_table_query_request_id_is_wendelon_owned_not_toron() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	assert!(schema.contains("pub struct TableQueryRequestId([u8; 16]);"));
+	assert!(schema.contains("pub fn from_u128(value: u128) -> Self"));
+	assert!(schema.contains("pub fn get(self) -> u128"));
+	for forbidden in ["QueryId", "TaskIdentity", "ClientWriteId"] {
+		let region = source_region(
+			&schema,
+			"pub struct TableQueryRequestId",
+			"// ============================================================\n//  TABLE WRITE WIRE METADATA AND ADMISSION",
+		);
+		assert!(
+			!region.contains(forbidden),
+			"request id must not import {forbidden}"
+		);
+	}
+	assert!(client.contains("attempt_request.meta.request_id = TableQueryRequestId::random();"));
+}
+
+#[test]
+fn adr073_table_query_request_id_is_required_fixed_meta() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let data_server = data_server_workspace_source();
+	let meta = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+	assert!(meta.contains("pub request_id: TableQueryRequestId"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 128"));
+	assert!(client.contains("TABLE_QUERY_REQ request_id must be non-zero"));
+	assert!(data_server.contains("TABLE_QUERY_REQ request_id must be non-zero"));
+}
+
+#[test]
+fn adr073_no_table_query_meta_extension_or_compat_path() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let data_server = data_server_workspace_source();
+	assert!(!schema.contains("TableQueryRequestMetaExtension"));
+	assert!(!schema.contains("TableQueryRequestMetaV1"));
+	assert!(!data_server.contains("TABLE_QUERY_META_EXTENSION"));
+	assert!(!data_server.contains("uncancellable"));
+	assert!(data_server.contains(
+		"*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()])"
+	));
+}
+
+#[test]
+fn adr073_table_query_cancel_msg_types_are_3e_3f_not_1f() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	assert!(core.contains("pub const AUDIT_CHAIN_HEAD_RESP: Self = Self(0x1F);"));
+	assert!(core.contains("pub const TABLE_QUERY_CANCEL_REQ: Self = Self(0x3E);"));
+	assert!(core.contains("pub const TABLE_QUERY_CANCEL_RESP: Self = Self(0x3F);"));
+	assert_eq!(core.matches("Self(0x3E)").count(), 1);
+	assert_eq!(core.matches("Self(0x3F)").count(), 1);
+	assert!(!core.contains("TABLE_QUERY_CANCEL_REQ: Self = Self(0x1F)"));
+}
+
+#[test]
+fn adr073_cancel_wire_uses_data_ring_bidi_not_control_plane() {
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = data_server_workspace_source();
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(router.contains("MsgType::TABLE_QUERY_CANCEL_REQ.0"));
+	assert!(router.contains("Some(h) => h.handle_data_frame(context, frame).await"));
+	assert!(data_server.contains("MsgType::TABLE_QUERY_CANCEL_REQ => self"));
+	assert!(data_server.contains("handle_table_query_cancel"));
+	assert!(!control.contains("TABLE_QUERY_CANCEL"));
+}
+
+#[test]
+fn adr073_no_uni_stream_sidecar_listener_or_transport_redesign() {
+	let combined = format!(
+		"{}\n{}",
+		data_server_workspace_source(),
+		read_workspace("crates/wendelon/src/network/router.rs")
+	);
+	for forbidden in [
+		"open_uni",
+		"accept_uni",
+		"TABLE_QUERY_CANCEL_LISTENER",
+		"table_query_cancel_listener",
+		"CancelTransport",
+	] {
+		assert!(
+			!combined.contains(forbidden),
+			"cancel wire must not add transport sidecar: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_active_table_query_registry_is_tenant_scoped_raii_removed() {
+	let data_server = data_server_workspace_source();
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(
+		data_server.contains("type TableQueryCancellationKey = (TenantId, TableQueryRequestId);")
+	);
+	assert!(registry.contains("struct ActiveTableQueryGuard"));
+	assert!(registry.contains("impl Drop for ActiveTableQueryGuard"));
+	assert!(registry.contains("state.active.remove(&key)"));
+	assert!(registry.contains("Arc::ptr_eq(active, token)"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("let active_query = match"));
+}
+
+#[test]
+fn adr073_cancel_before_register_tombstone_is_bounded_and_consumed() {
+	let data_server = data_server_workspace_source();
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_TTL"));
+	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_CAP"));
+	assert!(registry.contains("pending: HashMap<TableQueryCancellationKey, Instant>"));
+	assert!(registry.contains("order: VecDeque<TableQueryTombstoneOrder>"));
+	assert!(registry.contains("state.pending.remove(&key).is_some()"));
+	assert!(registry.contains("Self::prune_locked(state, now)"));
+}
+
+#[test]
+fn adr073_cancellation_signal_uses_cancellation_token() {
+	let cargo = read_workspace("crates/wendelon/Cargo.toml");
+	let data_server = data_server_workspace_source();
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(cargo.contains("tokio-util = \"0.7\""));
+	assert!(data_server.contains("use tokio_util::sync::CancellationToken;"));
+	assert!(registry.contains("Arc<CancellationToken>"));
+	assert!(registry.contains("token.cancel();"));
+	assert!(!registry.contains("Notify"));
+	assert!(!registry.contains("notify_waiters"));
+}
+
+#[test]
+fn adr073_cancel_is_idempotent_for_terminal_and_missing_requests() {
+	let data_server = data_server_workspace_source();
+	let registry = adr073_active_registry_region(&data_server);
+	let cancel = source_region(registry, "fn cancel(", "fn finish(");
+	assert!(cancel.contains("state.active.get(&key)"));
+	assert!(cancel.contains("return TableQueryCancelStatus::ACCEPTED;"));
+	assert!(cancel.contains("state.terminal.contains_key(&key)"));
+	assert!(cancel.contains("return TableQueryCancelStatus::TERMINAL;"));
+	assert!(cancel.contains("TableQueryTombstoneKind::Pending"));
+	assert!(cancel.contains("TableQueryCancelStatus::ACCEPTED"));
+}
+
+#[test]
+fn adr073_cancel_response_is_oracle_safe() {
+	let data_server = data_server_workspace_source();
+	let handler = adr073_cancel_handler_region(&data_server);
+	assert!(handler.contains("TableQueryCancelStatus::TERMINAL"));
+	assert!(handler.contains("authorize_actor_for_data"));
+	assert!(handler.contains("enforce_read_policy"));
+	assert!(handler.contains(".cancel(meta.tenant_id, meta.request_id)"));
+	assert!(!handler.contains("TableQueryRequestId::get"));
+	assert!(!handler.contains("table_object_id"));
+}
+
+#[test]
+fn adr073_table_query_checks_cancel_at_execution_boundaries() {
+	let data_server = data_server_workspace_source();
+	let plan = adr073_plan_region(&data_server);
+	let ranged = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"// 4. Empty result is a legitimate answer.",
+	);
+	assert!(plan.matches("cancellation_token.is_cancelled()").count() >= 5);
+	assert!(ranged.matches("cancel.is_cancelled()").count() >= 6);
+	assert!(plan.contains("pull_migration_range"));
+	assert!(plan.contains("plan_table_query_execution_by_secondary_index"));
+	assert!(ranged.contains("for range in ranges"));
+	assert!(ranged.contains("for (key_identity, locality, location) in scanned"));
+	assert!(ranged.contains("writer.emit_batch(&result).await?"));
+}
+
+#[test]
+fn adr073_cancelled_table_query_has_stable_read_status() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let data_server = data_server_workspace_source();
+	assert!(core.contains("pub const QUERY_CANCELLED: Self = Self(15);"));
+	assert!(core.contains("Self::QUERY_CANCELLED => \"query_cancelled\""));
+	assert!(client.contains("Wendelon query failed: QUERY_CANCELLED"));
+	assert!(client.contains("ErrorKind::Interrupted"));
+	assert!(data_server.contains("ReadStatus::QUERY_CANCELLED"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("FRAME_FLAG_STREAM_END"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("None"));
+}
+
+#[test]
+fn adr073_stream_drop_is_fallback_not_primary_mechanism() {
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = data_server_workspace_source();
+	assert!(router.contains("observe_table_query_cancellation(\"stream_dropped\")"));
+	assert!(router.contains("resp.header.msg_type == MsgType::TABLE_QUERY_RESP.0"));
+	assert!(data_server.contains("TABLE_QUERY_CANCEL_REQ"));
+	assert!(data_server.contains("cancellation_token.is_cancelled()"));
+}
+
+#[test]
+fn adr073_cancel_releases_admission_buffers_and_scratch() {
+	let data_server = data_server_workspace_source();
+	let handler = adr073_table_query_handler_region(&data_server);
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(handler.contains("let active_query = match"));
+	assert!(registry.contains("impl Drop for ActiveTableQueryGuard"));
+	assert!(registry.contains("state.active.remove(&key)"));
+	assert!(data_server.contains("let _admission = match self.try_admit_data_request"));
+	assert!(!data_server.contains("std::mem::forget(active_query)"));
+	assert!(!data_server.contains("Box::leak"));
+}
+
+#[test]
+fn adr073_metrics_are_aggregate_only() {
+	let metrics = read_workspace("crates/wendelon/src/metrics/registry.rs");
+	assert!(metrics.contains("wendelon_table_query_cancellations_total"));
+	assert!(metrics.contains("TABLE_QUERY_CANCELLATION_OUTCOMES"));
+	assert!(metrics.contains("\"accepted\""));
+	assert!(metrics.contains("\"terminal\""));
+	assert!(metrics.contains("\"cancelled_response\""));
+	assert!(metrics.contains("\"stream_dropped\""));
+	for line in metrics
+		.lines()
+		.filter(|line| line.contains("table_query_cancellation"))
+	{
+		for forbidden in [
+			"(\"tenant\"",
+			"(\"table\"",
+			"(\"request_id\"",
+			"(\"node_id\"",
+			"(\"fingerprint\"",
+			"(\"endpoint\"",
+			"(\"sql\"",
+			"(\"peer\"",
+		] {
+			assert!(
+				!line.contains(forbidden),
+				"table-query cancellation metric must stay aggregate-only: {line}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr073_no_writes_cdc_admin_agg_or_legacy_query_scope() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = data_server_workspace_source();
+	assert!(!schema.contains("WRITE_CANCEL"));
+	assert!(!schema.contains("AGG_CANCEL"));
+	assert!(!schema.contains("CDC_CANCEL"));
+	assert!(!schema.contains("pub const QUERY_CANCEL_REQ"));
+	assert!(!data_server.contains("MsgType::AGG_CANCEL"));
+	assert!(!data_server.contains("MsgType::QUERY_CANCEL_REQ"));
+	assert!(!data_server.contains("MsgType::WRITE_CANCEL"));
+}
+
+#[test]
+fn adr073_toron_storage_scan_consumer_claim_is_retargeted_by_adr060() {
+	let adr060 =
+		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
+	let storage = read_workspace("crates/toron/src/storage.rs");
+	let cancellation = read_workspace("crates/toron/src/distributed/cancellation.rs");
+	assert!(adr060.contains("Toron consumer of Wendelon 073"));
+	assert!(adr060.contains("best-effort"));
+	assert!(adr060.contains("checkpoint-bounded"));
+	assert!(storage.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("register_wendelon_table_query_attempt"));
+	assert!(cancellation.contains("DownstreamAttemptRegistry"));
+
+	let mut violations = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in ["TABLE_QUERY_CANCEL_REQ", "TABLE_QUERY_CANCEL_RESP"] {
+			if content.contains(forbidden) {
+				violations.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn adr073_nilket_root_stays_runtime_free() {
+	adr072_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr073_fixture_worker_source_unchanged() {
+	let fixture = read_workspace("crates/toron/src/bin/toron_fixture_worker.rs");
+	for forbidden in [
+		"TableQueryRequestId",
+		"TableQueryCancel",
+		"TABLE_QUERY_CANCEL",
+		"QUERY_CANCELLED",
+	] {
+		assert!(
+			!fixture.contains(forbidden),
+			"fixture worker must not grow ADR073 surface: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let combined = format!(
+		"{}\n{}\n{}\n{}",
+		read_workspace("crates/wendelon/src/schema/table.rs"),
+		read_workspace("crates/wendelon/src/schema/core.rs"),
+		read_workspace("crates/wendelon/src/client/core.rs"),
+		data_server_workspace_source()
+	);
+	let identifiers = rust_identifiers_from_source("adr073 combined surface", &combined);
+	for required in [
+		"TableQueryRequestId",
+		"TableQueryCancelStatus",
+		"TableQueryCancelRequestMeta",
+		"TableQueryCancelResponseMeta",
+		"ActiveTableQueryRegistry",
+		"ActiveTableQueryGuard",
+	] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing table-query cancellation type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonTableQueryRequestId",
+		"WendelonTableQueryCancelRequest",
+		"TableQueryRequestIdV1",
+		"TableQueryCancelStatusV1",
+		"TableQueryCancelRequestMetaV1",
+		"TableQueryCancelResponseMetaV1",
+		"CancelRequest",
+		"CancelResponse",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"new cancellation surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr072_descriptor_get_msg_types_are_unique",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}
+
+fn adr074_trace_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query",
+		"async fn handle_table_query_cancel",
+	)
+}
+
+fn adr074_linked_span_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"fn linked_table_query_span",
+		"fn local_table_query_span",
+	)
+}
+
+fn adr074_trace_carrier_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"enum TableQueryTraceCarrier",
+		"#[derive(Clone, Debug)]\nstruct RuntimeFilterApplication",
+	)
+}
+
+#[test]
+fn adr074_table_query_options_trace_context_is_absent_by_default() {
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	assert!(client.contains("pub trace_context: TableQueryTraceContext"));
+	assert!(client.contains("trace_context: TableQueryTraceContext::Absent"));
+	assert!(client.contains("pub enum TableQueryTraceContext"));
+	assert!(client.contains("#[default]"));
+}
+
+#[test]
+fn adr074_table_query_trace_context_has_absent_unsampled_sampled_states() {
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let enum_region = source_region(
+		&client,
+		"pub enum TableQueryTraceContext",
+		"impl Default for TableQueryOptions",
+	);
+	for required in [
+		"Absent",
+		"Unsampled",
+		"Sampled",
+		"trace_id: [u8; 16]",
+		"parent_span_id: [u8; 8]",
+	] {
+		assert!(enum_region.contains(required), "missing {required}");
+	}
+}
+
+#[test]
+fn adr074_table_query_trace_carrier_is_fixed_binary_not_traceparent() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let meta = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+	assert!(meta.contains("pub trace_id: [u8; 16]"));
+	assert!(meta.contains("pub trace_parent_span_id: [u8; 8]"));
+	assert!(meta.contains("pub trace_flags: u8"));
+	assert!(!meta.contains("traceparent"));
+	assert!(!meta.contains("tracestate"));
+}
+
+#[test]
+fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	for forbidden in [
+		"TableQueryRequestMetaV1",
+		"TableQueryRequestMetaExtension",
+		"ComputeTraceContext",
+	] {
+		assert!(
+			!schema.contains(forbidden),
+			"forbidden trace carrier {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_trace_meta_offsets_are_pinned() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	for required in [
+		"offset_of!(TableQueryRequestMeta, trace_id), 144",
+		"offset_of!(TableQueryRequestMeta, trace_parent_span_id)",
+		"160",
+		"offset_of!(TableQueryRequestMeta, trace_flags)",
+		"168",
+		"offset_of!(TableQueryRequestMeta, _trace_pad), 169",
+		"169",
+	] {
+		assert!(schema.contains(required), "missing offset pin {required}");
+	}
+}
+
+#[test]
+fn adr074_wendelon_span_id_is_derived_nonzero_from_request_attempt() {
+	let data_server = data_server_workspace_source();
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("TABLE_QUERY_LINKED_SPAN_DOMAIN"));
+	assert!(region.contains("b\"wendelon.table_query.span.v1\""));
+	assert!(region.contains("hasher.update(&trace_id)"));
+	assert!(region.contains("hasher.update(&parent_span_id)"));
+	assert!(region.contains("hasher.update(meta.request_id.as_bytes())"));
+	assert!(region.contains("fn nonzero_span_id"));
+	assert!(region.contains("span_id[7] = 1"));
+}
+
+#[test]
+fn adr074_linked_span_uses_explicit_otel_context_fields() {
+	let data_server = data_server_workspace_source();
+	let linked = adr074_linked_span_region(&data_server);
+	for required in [
+		"\"wendelon.table.query\"",
+		"otel.trace_id",
+		"otel.parent_span_id",
+		"otel.span_id",
+		"otel.sampled = true",
+	] {
+		assert!(
+			linked.contains(required),
+			"missing linked span field {required}"
+		);
+	}
+}
+
+#[test]
+fn adr074_unsampled_carrier_bypasses_root_sampling() {
+	let data_server = data_server_workspace_source();
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("TableQueryTraceCarrier::Unsampled"));
+	assert!(region.contains("otel.sampled = false"));
+	assert!(!region.contains("should_sample_root_span"));
+}
+
+#[test]
+fn adr074_sampled_emits_sanitized_linked_span_local_raw_span_preserved() {
+	let data_server = data_server_workspace_source();
+	let handler = adr074_trace_handler_region(&data_server);
+	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
+	assert!(data_server.contains("\"wendelon.table.query\""));
+	assert!(data_server.contains("\"data_ring.table_query.request\""));
+}
+
+#[test]
+fn adr074_local_raw_span_is_never_nested_under_linked_span() {
+	let data_server = data_server_workspace_source();
+	let handler = adr074_trace_handler_region(&data_server);
+	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
+	assert!(handler.contains(
+		"let span = local_table_query_span(&meta, frame.header.stream_id, trace_carrier);"
+	));
+	assert!(handler.contains(".instrument(span)"));
+	assert!(!handler.contains(".instrument(linked_span"));
+	assert!(!handler.contains("linked_span.enter()"));
+}
+
+#[test]
+fn adr074_linked_span_has_no_tenant_table_request_descriptor_query_attrs() {
+	let data_server = data_server_workspace_source();
+	let linked = adr074_linked_span_region(&data_server);
+	for forbidden in [
+		"tenant_id",
+		"table_object_id",
+		"request_id",
+		"physical_descriptor_fingerprint",
+		"descriptor",
+		"query_id",
+		"peer",
+		"sql",
+	] {
+		assert!(
+			!linked.contains(forbidden),
+			"linked span leaks forbidden raw identity marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_malformed_trace_carrier_is_fail_open_unsampled() {
+	let data_server = data_server_workspace_source();
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("flags & !TABLE_QUERY_TRACE_FLAG_KNOWN_MASK"));
+	assert!(region.contains("flags & TABLE_QUERY_TRACE_FLAG_PRESENT == 0"));
+	assert!(region.contains("!has_trace_id || !has_parent_span_id"));
+	assert!(
+		region
+			.matches("return TableQueryTraceCarrier::Unsampled")
+			.count() >= 4
+	);
+}
+
+#[test]
+fn adr074_no_new_shared_observability_telemetry_seam() {
+	let data_server = data_server_workspace_source();
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	assert!(!data_server.contains("observability::telemetry::"));
+	assert!(!client.contains("observability::telemetry::"));
+	assert!(!data_server.contains("TraceContextV1"));
+}
+
+#[test]
+fn adr074_absent_context_preserves_wendelon_otlp_behavior_fixtures() {
+	let fixtures = read_workspace("crates/wendelon/tests/table_query_telemetry.rs");
+	assert!(fixtures.contains("table_query_options_default_trace_context_absent"));
+	assert!(fixtures.contains("table_query_meta_absent_roundtrips_zero_flags"));
+	assert!(read_workspace("crates/wendelon/tests/otlp_http_export.rs").contains("otlp.test.span"));
+	assert!(read_workspace("crates/wendelon/tests/otlp_grpc_export.rs").contains("grpc.test.span"));
+}
+
+#[test]
+fn adr074_no_toron_production_change() {
+	let toron_storage = read_workspace("crates/toron/src/storage.rs");
+	let toron_telemetry = read_workspace("crates/toron/src/telemetry.rs");
+	assert!(
+		toron_storage.contains("fn wendelon_table_query_trace_context("),
+		"ADR 069 owns Toron's table-query trace carrier population"
+	);
+	assert!(
+		toron_storage.contains("wendelon_client::TableQueryTraceContext"),
+		"Toron must consume Wendelon's ADR 074 carrier type directly"
+	);
+	assert!(
+		toron_telemetry.contains("pub(crate) fn storage_scan_trace_context("),
+		"Toron must derive the storage-scan parent through its local telemetry seam"
+	);
+
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let data_server = data_server_workspace_source();
+	assert!(client.contains("pub enum TableQueryTraceContext"));
+	assert!(data_server.contains("fn decode_table_query_trace_carrier"));
+
+	let mut violations = Vec::new();
+	for dir in [
+		workspace_root().join("crates/wendelon/src"),
+		workspace_root().join("crates/wendelon/crates/wendelon-client/src"),
+	] {
+		walk_dir(&dir, &mut |path| {
+			if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+				return;
+			}
+			let content = fs::read_to_string(path).unwrap();
+			for forbidden in [
+				"wendelon_table_query_trace_context",
+				"storage_scan_trace_context",
+				"toron.storage.scan",
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!("{} contains {forbidden}", path.display()));
+				}
+			}
+		});
+	}
+	assert!(
+		violations.is_empty(),
+		"Toron consumer hooks must not be added to Wendelon production:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn adr074_toron_consumer_population_is_owned_by_adr069() {
+	let mut violations = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in ["TABLE_QUERY_TRACE_FLAG", "wendelon.table.query"] {
+			if content.contains(forbidden) {
+				violations.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(
+		violations.is_empty(),
+		"Toron should consume the carrier, not duplicate Wendelon's producer internals:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn adr074_no_control_ring_sql_wire_audit_cancellation_or_non_table_query_drift() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = data_server_workspace_source();
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(!core.contains("TRACE_REQ"));
+	assert!(!control.contains("TableQueryTrace"));
+	assert!(!data_server.contains("SQL_TRACE"));
+	assert!(!data_server.contains("CDC_TRACE"));
+	assert!(data_server.contains("fn decode_table_query_trace_carrier"));
+}
+
+#[test]
+fn adr074_new_trace_surface_is_brand_clean_no_v1_suffix() {
+	let combined = format!(
+		"{}\n{}\n{}",
+		read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs"),
+		read_workspace("crates/wendelon/src/schema/table.rs"),
+		data_server_workspace_source()
+	);
+	let identifiers = rust_identifiers_from_source("adr074 combined surface", &combined);
+	assert!(has_rust_identifier(&identifiers, "TableQueryTraceContext"));
+	for forbidden in [
+		"TableQueryTraceContextV1",
+		"WendelonTableQueryTraceContext",
+		"TableQueryRequestMetaV1",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"new trace surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_carrier_does_not_transmit_compute_trace_context_v1() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let options_region = source_region(
+		&client,
+		"pub struct TableQueryOptions",
+		"pub struct WriteReceipt",
+	);
+	assert!(!schema.contains("ComputeTraceContext"));
+	assert!(!options_region.contains("ComputeTraceContext"));
+}
+
+#[test]
+fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let data_server = data_server_workspace_source();
+	let options_region = source_region(
+		&client,
+		"pub struct TableQueryOptions",
+		"pub struct WriteReceipt",
+	);
+	let meta_region = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+
+	assert!(options_region.contains("pub row_limit: Option<NonZeroU64>"));
+	assert!(client.contains("row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0)"));
+	assert!(meta_region.contains("pub row_limit_rows: u64"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, row_limit_rows)"));
+	assert!(schema.contains("120"));
+	assert!(data_server.contains("fn table_query_row_limit"));
+	assert!(data_server.contains("fn take_output_batch"));
+	assert!(data_server.contains("table_query_row_limit(meta)"));
+	assert!(data_server.contains("QueryExecutionBudget::default()"));
+	assert!(!schema.contains("TableQueryRequestMetaExtension"));
+	assert!(!schema.contains("TableQueryRequestMetaV1"));
+}
+
+#[test]
+fn adr118_table_query_resp_has_terminal_metadata_contract() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = data_server_workspace_source();
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+	assert!(!schema.contains("terminal_status"));
+	assert!(!schema.contains("provisional"));
+	assert!(router.contains("MsgType::TABLE_QUERY_REQ.0"));
+	assert!(data_server.contains("async fn handle_table_query_stream"));
+	assert!(data_server.contains("struct TableQueryResponseStreamWriter"));
+	assert!(data_server.contains("fn query_ok_provisional_meta"));
+	assert!(data_server.contains("async fn emit_terminal"));
+	assert!(data_server.contains("MsgType::TABLE_QUERY_RESP.0"));
+	assert!(data_server.contains("FRAME_FLAG_STREAM_END"));
+	assert!(data_server.contains("writer.emit_terminal(response).await"));
+}
+
+#[test]
+fn adr118_streaming_query_result_terminal_mode_is_opt_in() {
+	let client_core = read_workspace("crates/wendelon/src/client/core.rs");
+	let strict_query = source_region(
+		&client_core,
+		"async fn query_once",
+		"#[derive(Debug)]\nenum QueryOutcome",
+	);
+	let table_query = source_region(
+		&client_core,
+		"async fn table_query_once",
+		"async fn bulk_write_group",
+	);
+
+	assert!(client_core.contains("enum StreamingQueryMetaMode"));
+	assert!(client_core.contains("StrictContinuations"));
+	assert!(client_core.contains("TerminalMetadata"));
+	assert!(strict_query.contains("StreamingQueryMetaMode::StrictContinuations"));
+	assert!(table_query.contains("StreamingQueryMetaMode::TerminalMetadata"));
+	assert!(client_core.contains("QUERY_RESP continuation must not carry response meta"));
+	assert!(client_core.contains("query terminal response meta too small"));
+}
+
+#[test]
+fn adr118_table_query_production_streams_batches_without_boundary_concat() {
+	let data_server = data_server_workspace_source();
+	let stream_handler = source_region(
+		&data_server,
+		"async fn handle_table_query_stream",
+		"async fn handle_table_query_cancel",
+	);
+
+	assert!(stream_handler.contains(
+		"prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream"
+	));
+	assert!(!stream_handler.contains("concat_batches"));
+	assert!(stream_handler.contains("writer.total_arrow_bytes()"));
+	assert!(stream_handler.contains("writer.emit_terminal(response).await"));
+	assert!(data_server.contains("stream_writer.as_deref_mut()"));
+	assert!(data_server.contains("writer.emit_batch(&result).await?"));
+	assert!(data_server.contains("if rows == 0 && batches.is_empty()"));
+}
+
+#[test]
+fn adr118_wendelon_table_query_checks_cancellation_during_production() {
+	let data_server = data_server_workspace_source();
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	// The cost bound depends on the cancellation check living *inside*
+	// the per-location scan loop (alongside the per-location emit), not
+	// only before planning — so a cancelled/dropped consumer stops
+	// Wendelon before it reads the remaining row groups. Pin the check
+	// to the scan-loop region so both projected and whole-record
+	// production stay cancellation-bounded.
+	let scan_loop = source_region(
+		producer,
+		"for (key_identity, locality, location) in scanned",
+		"// 4. Empty result is a legitimate answer.",
+	);
+	assert!(
+		scan_loop.contains("cancel.is_cancelled()"),
+		"cancellation must be checked inside the per-location scan loop"
+	);
+	assert!(
+		scan_loop.contains("writer.emit_batch(&result).await?"),
+		"the table-query producer emits per location inside the scan loop"
+	);
+	assert!(
+		scan_loop.contains("ReadStatus::QUERY_CANCELLED"),
+		"an in-loop cancellation yields QUERY_CANCELLED"
+	);
+}
+
+#[test]
+fn adr118_table_query_req_uses_stream_handler() {
+	let data_server = data_server_workspace_source();
+	assert!(
+		data_server.contains("self.handle_table_query_stream("),
+		"a TABLE_QUERY_REQ dispatch arm must call the streaming handler"
+	);
+	// The streaming handler must run the streaming producer, not a
+	// materialize-then-respond path.
+	let handler = source_region(
+		&data_server,
+		"async fn handle_table_query_stream",
+		"async fn handle_table_query_cancel",
+	);
+	assert!(handler.contains(
+		"prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream"
+	));
+}
+
+#[test]
+fn adr118_query_response_meta_not_widened() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let meta = source_region(&schema, "pub struct QueryResponseMeta", "}");
+	// D3: provisional-vs-terminal is distinguished by frame position +
+	// FRAME_FLAG_STREAM_END + the opt-in cursor mode — never by widening
+	// the fixed-size meta. The struct must carry no terminal/cursor fields.
+	for forbidden in [
+		"is_terminal",
+		"terminal_status",
+		"provisional",
+		"cursor",
+		"stream_end",
+		"continuation",
+	] {
+		assert!(
+			!meta.contains(forbidden),
+			"QueryResponseMeta must not be widened with `{forbidden}` (ADR 118 D3)"
+		);
+	}
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+}
+
+#[test]
+fn adr118_secondary_index_table_query_streams() {
+	let data_server = data_server_workspace_source();
+	// D7: the secondary-index table-query path uses the same streaming
+	// producer contract as the full scan — it threads the stream writer
+	// so the cost bound is access-path-independent.
+	assert!(
+		data_server.contains("plan_table_query_execution_by_secondary_index"),
+		"secondary-index producer exists"
+	);
+	let by_index = source_region(
+		&data_server,
+		"match plan_table_query_execution_by_secondary_index(",
+		"Ok(plan) =>",
+	);
+	assert!(
+		by_index.contains("stream_writer.as_deref_mut()"),
+		"the secondary-index path threads the stream writer (D7 parity)"
+	);
+}
+
+#[test]
+fn adr120_whole_record_table_query_emits_per_location() {
+	let data_server = data_server_workspace_source();
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let descriptor_backed = source_region(
+		producer,
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
+	);
+	// ADR 120 retires the ADR 118 projected-only scope carve-out: the
+	// whole-record fallback must execute PBC and emit from inside the
+	// per-location scan loop, with no post-scan rebatch buffer.
+	assert!(
+		descriptor_backed.contains("writer.emit_batch(&result).await?"),
+		"table-query results must emit per location inside the scan loop"
+	);
+	assert!(
+		descriptor_backed.contains("pbc::execute_program(program, &batch)"),
+		"whole-record fallback must execute PBC per location"
+	);
+	assert!(
+		descriptor_backed.contains("take_output_batch(result, &mut rows, row_limit)"),
+		"whole-record fallback must apply row_limit before any later scan location can be read"
+	);
+	assert!(!descriptor_backed.contains("concat_batches"));
+	assert!(data_server.contains("struct DescriptorlessRebatchGroup"));
+	assert!(producer.contains("for group in descriptorless_rebatch_groups"));
+}
+
+#[test]
+fn adr120_rebatch_groups_post_scan_emit_is_gone_for_descriptor_backed_queries() {
+	let data_server = data_server_workspace_source();
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let descriptorless_compat = source_region(
+		producer,
+		"if table_descriptor.is_none()",
+		"// ADR 120 descriptor-backed whole-record path:",
+	);
+	let descriptor_backed = source_region(
+		producer,
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
+	);
+
+	assert!(data_server.contains("struct DescriptorlessRebatchGroup"));
+	assert!(descriptorless_compat.contains("descriptorless_rebatch_groups"));
+	assert!(descriptorless_compat.contains("continue;"));
+	assert!(producer.contains("for group in descriptorless_rebatch_groups"));
+	assert!(!descriptor_backed.contains("descriptorless_rebatch_groups"));
+	assert!(!descriptor_backed.contains("concat_batches"));
+	assert!(!descriptor_backed.contains("Vec<DescriptorlessRebatchGroup>"));
+}
+
+#[test]
+fn adr120_cost_bound_is_access_path_independent_for_descriptor_backed_queries() {
+	let data_server = data_server_workspace_source();
+	let full_scan = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let descriptor_backed = source_region(
+		full_scan,
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
+	);
+	let secondary_index = source_region(
+		&data_server,
+		"async fn plan_table_query_execution_by_secondary_index",
+		"async fn plan_query_execution_for_ranges",
+	);
+
+	for (name, region) in [
+		(
+			"full scan descriptor-backed whole-record",
+			descriptor_backed,
+		),
+		("secondary-index descriptor-backed", secondary_index),
+	] {
+		assert!(
+			region.contains("take_output_batch(result, &mut rows, row_limit)"),
+			"{name}: row_limit must be applied before the next storage read"
+		);
+		assert!(
+			region.contains("writer.emit_batch(&result).await?"),
+			"{name}: batch must be emitted from the producer path"
+		);
+		assert!(
+			region.contains("row_limit_satisfied(rows, row_limit)"),
+			"{name}: producer must break once the bound is satisfied"
+		);
+	}
+	assert!(
+		secondary_index.contains("for indexed_chunk in indexed_rows.chunks(4)"),
+		"secondary-index reads must be chunked so LIMIT does not materialize all index hits"
+	);
+	assert!(
+		secondary_index.contains("break 'indexed_rows;"),
+		"secondary-index producer must stop reading indexed chunks once LIMIT is satisfied"
+	);
+}
+
+#[test]
+fn adr120_no_wendelon_protocol_widening() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = data_server_workspace_source();
+	let meta = source_region(&schema, "pub struct QueryResponseMeta", "}");
+
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+	for forbidden in [
+		"cursor",
+		"stream_id",
+		"terminal_status",
+		"result_stream",
+		"TaskBatch",
+	] {
+		assert!(
+			!meta.contains(forbidden),
+			"QueryResponseMeta must not grow ADR 120 field `{forbidden}`"
+		);
+	}
+	assert!(data_server.contains("TableQueryResponseStreamWriter"));
+	assert!(!data_server.contains("MsgType::TABLE_QUERY_CURSOR"));
+}
+
+#[test]
+fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr073_table_query_request_id_is_required_fixed_meta",
+		"fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}
+
+// ============================================================
+//  ADR 075 — Idempotent Atomic Counter Fetch-Add (10 guards)
+// ============================================================
+
+fn adr075_counter_handler_region(server: &str) -> &str {
+	// ADR 077: counter handlers live in `network/data_server/counter.rs` in the
+	// order replicate, rollback, add, read; `handle_counter_add`'s body is bounded
+	// by the next counter handler, `handle_counter_read` (was `handle_table_replicate`,
+	// the next handler when all handlers shared one file).
+	source_region(
+		server,
+		"async fn handle_counter_add",
+		"async fn handle_counter_read",
+	)
+}
+
+#[test]
+fn adr075_counter_add_is_first_class_operation_not_blob_write() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = data_server_workspace_source();
+	// Its own wire op + fixed metas, distinct from the blob write surface.
+	assert!(schema.contains("pub const COUNTER_ADD_REQ: Self = Self(0x4C);"));
+	assert!(schema.contains("pub const COUNTER_ADD_RESP: Self = Self(0x4D);"));
+	assert!(schema.contains("pub struct CounterAddRequestMeta"));
+	assert!(schema.contains("pub struct CounterAddResponseMeta"));
+	// A counter add carries an additive delta, never an Arrow value section.
+	assert!(schema.contains("pub delta: u64"));
+	// Dispatched as its own match arm + handler, not folded into WRITE_REQ.
+	assert!(server.contains("MsgType::COUNTER_ADD_REQ => {"));
+	assert!(server.contains("async fn handle_counter_add"));
+}
+
+#[test]
+fn adr075_counter_add_has_per_key_read_modify_write_serialization() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// The leader holds a per-key mutation lock...
+	assert!(counter.contains("locks: DashMap<CounterKey, Arc<Mutex<()>>>"));
+	// ...acquired across the WHOLE read -> checked_add -> append unit (D2).
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	assert!(fetch_add.contains("self.locks.entry(key.clone()).or_default().clone()"));
+	assert!(fetch_add.contains("let _guard = lock.lock().await;"));
+	// The base read and the overflow-checked add both happen under the guard.
+	assert!(fetch_add.contains("read_committed(key)"));
+	assert!(fetch_add.contains("checked_add(delta)"));
+}
+
+#[test]
+fn adr075_counter_add_reuses_client_write_id_idempotency() {
+	let server = data_server_workspace_source();
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// D4 public idempotency is keyed by the canonical ClientWriteId bytes (the
+	// same derivation as the blob-write cache) and lives in the MUTATION layer:
+	// the handler passes the canonical key into the leader, whose dedup record
+	// is durable with the witness/applied log (replay survives restart).
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("meta.write_id.canonical_idempotency_bytes()"));
+	assert!(handler.contains("leader.fetch_add(plan, write_key, &key, meta.delta)"));
+	assert!(counter.contains("idempotency: DashMap<CounterWriteKey, CounterAddOutcome>"));
+	// Never a hashed/narrowed handle — collisions would break exactly-once.
+	assert!(counter.contains("pub type CounterWriteKey = [u8; 24];"));
+	// The durable witness carries the dedup identity, and a resolved witness is
+	// compacted into the applied log BEFORE pruning (no dedup window).
+	assert!(counter.contains("write_key: CounterWriteKey,"));
+	assert!(counter.contains("fn append_applied"));
+	assert!(counter.contains("fn load_applied"));
+}
+
+#[test]
+fn adr075_duplicate_counter_add_replays_without_mutating() {
+	let server = data_server_workspace_source();
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// The duplicate replay short-circuits inside the leader BEFORE any mutation
+	// (both the unlocked fast path and the under-lock recheck return `Replayed`),
+	// so a retry never re-applies the delta (D4)...
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	let replay = fetch_add
+		.find("CounterAddResult::Replayed")
+		.expect("the leader must replay duplicates");
+	let mutate = fetch_add
+		.find("replicate_tentative")
+		.expect("the leader must fan out the tentative");
+	assert!(
+		replay < mutate,
+		"duplicate replay must short-circuit before the tentative fan-out"
+	);
+	// ...and the server answers a replay as DUPLICATE (never a second OK).
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("result.is_replay()"));
+	assert!(handler.contains("WriteStatus::DUPLICATE"));
+}
+
+#[test]
+fn adr075_counter_add_goes_through_finalization_not_metric_side_channel() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("struct CounterFinalizationWitness"));
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	// The durable finalization witness is persisted before the commit fan-out...
+	assert!(fetch_add.contains("self.witness_store.write(&witness)"));
+	// ...and the add is NOT a metrics counter / in-memory side channel (D3).
+	assert!(!fetch_add.contains("metrics()"));
+}
+
+#[test]
+fn adr075_counter_blob_type_safety_is_structural() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let server = data_server_workspace_source();
+	// Counter identity is domain-separated (blake3_keyed in a reserved domain),
+	// not the blob tenant-scoped identity — the collision is unrepresentable.
+	assert!(counter.contains("b\"wendelon::adr075::counter-domain\""));
+	assert!(counter.contains("Identity::blake3_keyed(COUNTER_DOMAIN, &key.0)"));
+	// The server re-derives and verifies it; it never trusts the wire identity.
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("counter_identity(&key) != meta.key_identity"));
+}
+
+#[test]
+fn adr075_no_prefix_scan_registry_or_node_keys() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	for forbidden in [
+		"scan_prefix",
+		"prefix_scan",
+		"list_counters",
+		"counter_registry",
+	] {
+		assert!(
+			!counter.contains(forbidden),
+			"counter substrate must stay point-addressed (no `{forbidden}`)"
+		);
+	}
+}
+
+#[test]
+fn adr075_existing_blob_point_write_stays_last_writer_wins() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = data_server_workspace_source();
+	// The blob write meta is untouched by counters (no delta/counter contamination).
+	let write_meta = source_region(
+		&schema,
+		"pub struct WriteRequestMeta {",
+		"WRITE RESPONSE METADATA",
+	);
+	for forbidden in ["delta", "counter", "previous_value"] {
+		assert!(
+			!write_meta.contains(forbidden),
+			"WriteRequestMeta must stay a plain LWW blob write (no `{forbidden}`)"
+		);
+	}
+	// The blob write path still routes through its own handler, separate from counters.
+	assert!(server.contains("MsgType::WRITE_REQ => {"));
+	assert!(server.contains("self.handle_write(&context.actor, frame)"));
+}
+
+#[test]
+fn adr075_counter_surface_is_brand_clean_no_v1_suffix() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = data_server_workspace_source();
+	let combined = format!("{schema}\n{server}");
+	let identifiers = rust_identifiers_from_source("adr075 counter surface", &combined);
+	for required in ["CounterAddRequestMeta", "CounterAddResponseMeta"] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing counter-add type {required}"
+		);
+	}
+	for forbidden in [
+		"CounterAddRequestMetaV1",
+		"CounterAddResponseMetaV1",
+		"CounterAddRequestV1",
+		"WendelonCounterAddRequest",
+		"WendelonCounterAddResponse",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"counter-add surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr075_no_toron_production_change() {
+	// Retargeted after Toron ADR 207: runtime evidence is the one promoted
+	// consumer of the counter-add surface. ADR 075 still forbids incidental Toron
+	// production drift outside that named later-ADR integration.
+	let toron_src = workspace_root().join("crates/toron/src");
+	let allowed = ["crates/toron/src/binder/runtime_evidence.rs"];
+	let mut offenders = Vec::new();
+	walk_dir(&toron_src, &mut |path| {
+		if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+			let body = fs::read_to_string(path).unwrap_or_default();
+			if body.contains("counter_fetch_add") || body.contains("COUNTER_ADD_REQ") {
+				let rel = path
+					.strip_prefix(workspace_root())
+					.unwrap_or(path)
+					.to_string_lossy();
+				if !allowed.iter().any(|allowed| *allowed == rel.as_ref()) {
+					offenders.push(rel.to_string());
+				}
+			}
+		}
+	});
+	assert!(
+		offenders.is_empty(),
+		"ADR 075 allows only the ADR 207 runtime-evidence Toron consumer: {offenders:?}"
+	);
+}
+
+#[test]
+fn adr075_counter_add_fails_closed_under_replication() {
+	let server = data_server_workspace_source();
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	// Retargeted by ADR 076: the wire status remains for decoding compatibility,
+	// but a healthy rf>1 add now builds the replicated participant set instead of
+	// failing closed before mutation.
+	assert!(schema.contains("pub const COUNTER_REPLICATION_UNSUPPORTED: Self = Self(17);"));
+	let handler = adr075_counter_handler_region(&server);
+	assert!(!handler.contains("WriteStatus::COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(!handler.contains("replication_factor() > 1"));
+	assert!(
+		handler.contains("let replicas = self\n\t\t\t.router\n\t\t\t.replicas_for_locality(Locality::from(meta.key_identity));")
+	);
+	assert!(handler.contains("let Some(owner) = replicas.first().copied()"));
+	assert!(handler.contains("WriteStatus::NOT_LEADER"));
+	assert!(handler.contains("CounterParticipantPlan::new"));
+	assert!(handler.contains("let quorum = (replicas.len() / 2) + 1;"));
+	let route = handler
+		.find("replicas_for_locality")
+		.expect("counter add must derive fresh participants from the ring");
+	let mutate = handler
+		.find("self.counter_leader_for(meta.tenant_id)")
+		.expect("counter add must drive the leader");
+	assert!(
+		route < mutate,
+		"counter add must derive replicated participants before leader mutation"
+	);
+}
+
+#[test]
+fn adr076_witness_records_peer_identities_not_indices() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let witness = source_region(
+		&counter,
+		"struct CounterFinalizationWitness {",
+		"struct AppliedCounterAdd",
+	);
+	assert!(witness.contains("accepted: Vec<NodeId>"));
+	assert!(witness.contains("committed: HashSet<NodeId>"));
+	assert!(!witness.contains("Vec<usize>"));
+	assert!(!witness.contains("HashSet<usize>"));
+}
+
+#[test]
+fn adr076_witness_format_is_flattened() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self>"));
+	assert!(!counter.contains("V1"));
+	assert!(!counter.contains("COUNTER_WITNESS_V1_PREFIX"));
+	assert!(!counter.contains("migrate_v0_witness"));
+	assert!(!counter.contains("_local_node"));
+}
+
+#[test]
+fn adr076_fresh_and_recorded_resolution_are_distinct_routes() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let server = data_server_workspace_source();
+	assert!(counter.contains("pub struct CounterParticipantPlan<P>"));
+	assert!(counter.contains("pub trait CounterParticipantResolver<P: CounterParticipant>"));
+	assert!(counter.contains("fn resolve_recorded(&self, id: NodeId) -> Option<P>;"));
+	assert!(counter.contains("self.drive_commits(op_id, &resolver).await;"));
+	assert!(counter.contains("pub async fn reconcile<R>(&self, resolver: &R)"));
+	assert!(server.contains("impl\n\tcrate::storage::counter::CounterParticipantResolver"));
+	assert!(server.contains("Some(self.participant_for(id))"));
+}
+
+#[test]
+fn adr076_counter_leader_has_explicit_local_arm() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("local_id: NodeId"));
+	assert!(counter.contains("local: P"));
+	assert!(counter.contains("plan.get(self.local_id).is_none()"));
+	assert!(counter.contains("self.local\n\t\t\t.read_committed(key)"));
+	assert!(!counter.contains("participants[0]"));
+}
+
+#[test]
+fn adr076_fresh_counter_participants_are_ring_derived() {
+	let server = data_server_workspace_source();
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("let replicas = self\n\t\t\t.router\n\t\t\t.replicas_for_locality(Locality::from(meta.key_identity));"));
+	assert!(handler.contains("let Some(owner) = replicas.first().copied()"));
+	assert!(handler.contains("if owner.id != self.local_node.id"));
+	assert!(handler.contains("self.counter_add_response_with_hint("));
+	assert!(handler.contains("participant_factory.participant_for(*peer)"));
+}
+
+#[test]
+fn adr076_counter_quorum_uses_majority_floor() {
+	let server = data_server_workspace_source();
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("let quorum = (replicas.len() / 2) + 1;"));
+	assert!(handler.contains("CounterParticipantPlan::new"));
+	assert!(!handler.contains("quorum = 1"));
+}
+
+#[test]
+fn adr076_commit_completion_covers_full_accepted_set() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let commit = source_region(
+		&counter,
+		"async fn drive_commits<R>(&self, op_id: u64, resolver: &R)",
+		"/// The counter-specific reconciler",
+	);
+	assert!(commit.contains("witness.accepted.clone()"));
+	assert!(commit.contains("for i in accepted"));
+	assert!(commit.contains("witness.committed.insert(i);"));
+	assert!(commit.contains("let complete = witness\n\t\t\t\t.accepted\n\t\t\t\t.iter()\n\t\t\t\t.all(|i| witness.committed.contains(i));"));
+}
+
+#[test]
+fn adr076_pending_witness_never_expires_on_peer_loss() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let commit = source_region(
+		&counter,
+		"async fn drive_commits<R>(&self, op_id: u64, resolver: &R)",
+		"/// The counter-specific reconciler",
+	);
+	assert!(commit.contains("let Some(participant) = resolver.resolve_recorded(i) else"));
+	assert!(commit.contains("continue;"));
+	assert!(
+		commit.contains(".is_ok() && participant.commit(op_id).await.is_ok()"),
+		"commit failures must leave the witness pending for a later reconcile"
+	);
+	assert!(!commit.contains("expire"));
+	assert!(!commit.contains("deadline"));
+}
+
+#[test]
+fn adr076_replication_unsupported_not_on_healthy_path() {
+	let server = data_server_workspace_source();
+	let handler = adr075_counter_handler_region(&server);
+	assert!(!handler.contains("COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(!handler.contains("replication_factor() > 1"));
+}
+
+#[test]
+fn adr076_no_new_wire_operations() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	for required in [
+		"pub const COUNTER_ADD_REQ: Self = Self(0x4C);",
+		"pub const COUNTER_ADD_RESP: Self = Self(0x4D);",
+		"pub const COUNTER_READ_REQ: Self = Self(0x4E);",
+		"pub const COUNTER_READ_RESP: Self = Self(0x4F);",
+		"pub const COUNTER_REPLICATE_REQ: Self = Self(0x48);",
+		"pub const COUNTER_REPLICATE_RESP: Self = Self(0x49);",
+		"pub const COUNTER_ROLLBACK_REQ: Self = Self(0x4A);",
+		"pub const COUNTER_ROLLBACK_RESP: Self = Self(0x4B);",
+	] {
+		assert!(
+			schema.contains(required),
+			"missing existing counter wire op {required}"
+		);
+	}
+	for forbidden in [
+		"COUNTER_FETCH_ADD_REQ",
+		"COUNTER_FETCH_ADD_RESP",
+		"COUNTER_REPLICATED_ADD_REQ",
+		"COUNTER_FINALIZE_REQ",
+	] {
+		assert!(
+			!schema.contains(forbidden),
+			"ADR 076 must reuse the ADR 075 counter wire surface; found {forbidden}"
+		);
+	}
+	for routed in [
+		"MsgType::COUNTER_REPLICATE_REQ.0",
+		"MsgType::COUNTER_REPLICATE_RESP.0",
+		"MsgType::COUNTER_ROLLBACK_REQ.0",
+		"MsgType::COUNTER_ROLLBACK_RESP.0",
+	] {
+		assert!(
+			router.contains(routed),
+			"existing counter replica wire op must route through the Data Ring: {routed}"
+		);
+	}
+}
+
+#[test]
+fn adr076_no_toron_production_change() {
+	let toron_src = workspace_root().join("crates/toron/src");
+	let mut offenders = Vec::new();
+	walk_dir(&toron_src, &mut |path| {
+		if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+			let body = fs::read_to_string(path).unwrap_or_default();
+			if body.contains("CounterFinalizationWitness")
+				|| body.contains("CounterParticipantResolver")
+				|| body.contains("CounterParticipantPlan")
+			{
+				let rel = path
+					.strip_prefix(workspace_root())
+					.unwrap_or(path)
+					.to_string_lossy();
+				offenders.push(rel.to_string());
+			}
+		}
+	});
+	assert!(
+		offenders.is_empty(),
+		"ADR 076 is Wendelon-only; Toron production files contain ADR 076 symbols:\n{offenders:?}"
+	);
+}
+
+#[test]
+fn adr076_prior_wendelon_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr075_prior_wendelon_guards_continue_to_pass",
+		"fn adr075_counter_add_fails_closed_under_replication",
+		"fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}
+
+#[test]
+fn adr075_prior_wendelon_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass",
+		"fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}
+
+// ============================================================
+//  ADR 077 — data server module decomposition
+// ============================================================
+
+/// The production source-scan surface is the root plus exactly the carved
+/// domain submodules (sorted), `tests.rs` excluded. Pins the file manifest so a
+/// new module is a deliberate edit here, and proves the concatenation actually
+/// spans modules (symbols from three different domain files are all present).
+#[test]
+fn adr077_data_server_source_concatenates_submodules() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let basenames: Vec<String> = data_server_source_files(manifest_dir)
+		.iter()
+		.map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+		.collect();
+	assert_eq!(
+		basenames,
+		vec![
+			"data_server.rs",
+			"counter.rs",
+			"descriptor_migration.rs",
+			"replica_routing.rs",
+			"streaming.rs",
+			"table_query.rs",
+			"write_replication.rs",
+		],
+		"ADR 077 production source manifest changed; update this guard deliberately \
+		 (tests.rs is excluded — it is not production source)"
+	);
+	let source = data_server_source(manifest_dir);
+	for symbol in [
+		"struct CounterParticipantFactory", // counter.rs
+		"struct DurableQuorumTracker",      // write_replication.rs
+		"enum QueryProjectedExecution",     // table_query.rs
+	] {
+		assert!(
+			source.contains(symbol),
+			"data_server_source concatenation is missing a carved symbol: {symbol}"
+		);
+	}
+	// Every prior data-server source-scan guard must route through this helper,
+	// not a raw read of the (now-decomposed) flat file.
+	let arch = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	assert!(
+		arch.contains("data_server_source(") || arch.contains("data_server_workspace_source("),
+		"source-scan guards must read the data server via the concatenation helper"
+	);
+}
+
+/// Each named domain module exists as a file and is declared in the root.
+#[test]
+fn adr077_semantic_modules_exist() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	for module in [
+		"counter",
+		"table_query",
+		"write_replication",
+		"descriptor_migration",
+		"streaming",
+		"replica_routing",
+	] {
+		let path = manifest_dir.join(format!("src/network/data_server/{module}.rs"));
+		assert!(path.is_file(), "ADR 077 domain module missing: {module}.rs");
+		assert!(
+			root.contains(&format!("mod {module};")),
+			"ADR 077 domain module not declared in root: mod {module};"
+		);
+	}
+}
+
+/// The struct definition and `MsgType` dispatch stay in the root; carved handler
+/// *definitions* do not (their call sites in dispatch legitimately remain).
+#[test]
+fn adr077_dispatch_and_struct_stay_in_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	assert!(
+		root.contains("struct WendelonDataServer"),
+		"WendelonDataServer struct must stay in the root module"
+	);
+	assert!(
+		root.contains("MsgType::"),
+		"MsgType dispatch routing must stay in the root module"
+	);
+	assert!(
+		!root.contains("async fn handle_counter_add"),
+		"carved handler definition leaked back into the root (handle_counter_add)"
+	);
+	let source = data_server_source(manifest_dir);
+	assert!(
+		source.contains("async fn handle_counter_add"),
+		"carved handler definition not found anywhere in the decomposition"
+	);
+}
+
+/// The root is bounded. Set from the post-carve size plus modest headroom;
+/// ratchet DOWN as domain helper methods are relocated in follow-on cuts
+/// (see plans/conventions/module-decomposition.md). It must never regrow toward
+/// the pre-carve monolith.
+#[test]
+fn adr077_root_is_bounded() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let lines = root.lines().count();
+	assert!(
+		lines <= 15_200,
+		"data_server.rs root is {lines} lines (cap 15_200); carve more or justify a deliberate cap bump"
+	);
+}
+
+/// The inline `#[cfg(test)] mod tests` block was extracted to its own file.
+#[test]
+fn adr077_tests_extracted() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	assert!(
+		root.contains("#[cfg(test)]\nmod tests;"),
+		"root must declare the extracted tests module, not inline it"
+	);
+	let tests = manifest_dir.join("src/network/data_server/tests.rs");
+	assert!(tests.is_file(), "data_server/tests.rs must exist");
+	let body = fs::read_to_string(&tests).unwrap();
+	assert!(
+		body.contains("use super::*;") && body.contains("async fn"),
+		"tests.rs must be the extracted test body (use super::*; + test fns)"
+	);
+}
+
+// ADR 077 `adr077_no_wire_or_runtime_surface_change` — RETIRED in the ADR 233 cross-ring
+// reconciliation. It was a development-time `git status --short` tripwire (no production source
+// outside `network/data_server/**` dirty while the cut was in flight). It could not simply be
+// color-hardened: (1) under `color.ui=always` the ANSI codes shift `line[3..]`, so
+// `starts_with("crates/")` was always false and the guard asserted nothing; (2) a *working*
+// git-status form false-positives on any unrelated dirty production file — it would fail this suite
+// whenever a Toron cut like ADR 233 stages an edit under `crates/toron/src`. The move-only invariant
+// it proxied is enforced, git-independently, by the structural siblings
+// `adr077_dispatch_and_struct_stay_in_root`, `adr077_root_is_bounded`,
+// `adr077_semantic_modules_exist`, and `adr077_data_server_source_concatenates_submodules`.
+
+/// The de-versioned doc heading stays renamed (doc-prose variant of the
+/// repo-wide no-V1 discipline): no `## V1 scope` heading, no `V1 fallback` prose.
+#[test]
+fn adr077_no_v1_scope_heading() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = data_server_source(manifest_dir);
+	assert!(
+		!source.contains("## V1 scope"),
+		"the `## V1 scope` heading must stay renamed"
+	);
+	assert!(
+		!source.contains("V1 fallback"),
+		"the `V1 fallback` prose must stay renamed"
+	);
+	assert!(
+		fs::read_to_string(manifest_dir.join("src/network/data_server.rs"))
+			.unwrap()
+			.contains("## Scope and simplifications"),
+		"the renamed scope heading must be present in the root"
+	);
+}
+
+// ============================================================
+//  ADR 078 — slab-manager module decomposition
+// ============================================================
+
+/// The production source-scan surface is the root plus exactly the carved
+/// subsystem islands (sorted), `tests.rs` excluded. Pins the file manifest and
+/// proves the concatenation spans islands (symbols from three different islands
+/// are all present).
+#[test]
+fn adr078_manager_source_concatenates_submodules() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let basenames: Vec<String> = manager_source_files(manifest_dir)
+		.iter()
+		.map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+		.collect();
+	assert_eq!(
+		basenames,
+		vec![
+			"manager.rs",
+			"compaction.rs",
+			"encoding_compute.rs",
+			"lsm_driver.rs",
+			"retention_reclaim.rs",
+			"secondary_index_segments.rs",
+			"stats_facts.rs",
+			"tiered_io.rs",
+		],
+		"ADR 078 production source manifest changed; update this guard deliberately \
+		 (tests.rs is excluded — it is not production source)"
+	);
+	let source = manager_source(manifest_dir);
+	for symbol in [
+		"enum TieredStatsContributor",      // stats_facts.rs
+		"struct EncodingComputePhaseBPlan", // encoding_compute.rs
+		"struct CompactionRecord",          // compaction.rs
+	] {
+		assert!(
+			source.contains(symbol),
+			"manager_source concatenation is missing a carved symbol: {symbol}"
+		);
+	}
+	let arch = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	assert!(
+		arch.contains("manager_source("),
+		"source-scan guards must read the manager via the concatenation helper"
+	);
+}
+
+/// Each named subsystem island exists as a file and is declared in the root.
+#[test]
+fn adr078_semantic_modules_exist() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	for module in [
+		"stats_facts",
+		"encoding_compute",
+		"tiered_io",
+		"lsm_driver",
+		"compaction",
+		"retention_reclaim",
+		"secondary_index_segments",
+	] {
+		let path = manifest_dir.join(format!("src/storage/manager/{module}.rs"));
+		assert!(path.is_file(), "ADR 078 island missing: {module}.rs");
+		assert!(
+			root.contains(&format!("mod {module};")),
+			"ADR 078 island not declared in root: mod {module};"
+		);
+	}
+}
+
+/// The `SlabManager` struct, its public config/report surface, and construction
+/// stay in the root; carved subsystem method *definitions* do not.
+#[test]
+fn adr078_slab_manager_public_surface_stays_in_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	assert!(
+		root.contains("pub struct SlabManager {"),
+		"the SlabManager struct must stay in the root module"
+	);
+	for surface in [
+		"pub struct SlabManagerConfig",
+		"pub struct TombstoneCompactionReport",
+		"pub struct RetentionPruningReport",
+	] {
+		assert!(
+			root.contains(surface),
+			"the public surface type must stay in the root: {surface}"
+		);
+	}
+	assert!(
+		root.contains("pub use secondary_index_segments::SecondaryIndexSegmentInfo;"),
+		"moved public island type must preserve the pre-split manager::SecondaryIndexSegmentInfo path"
+	);
+	for crate_visible in [
+		"EncodedAggregateL2RecordRead",
+		"EncodingMaterializeAuditSample",
+		"ProjectedL2RecordRead",
+	] {
+		assert!(
+			root.contains(crate_visible) && root.contains("pub(crate) use encoding_compute::{"),
+			"moved crate-visible encoding type must preserve the pre-split manager::{crate_visible} path"
+		);
+	}
+	assert!(
+		root.contains("async fn open("),
+		"construction (open) must stay in the root module"
+	);
+	assert!(
+		!root.contains("fn compact_one_sealed_slab"),
+		"a carved subsystem method definition leaked back into the root"
+	);
+	let source = manager_source(manifest_dir);
+	assert!(
+		source.contains("fn compact_one_sealed_slab"),
+		"carved subsystem method not found anywhere in the decomposition"
+	);
+}
+
+/// The root is bounded. Set from the post-carve size plus modest headroom;
+/// ratchet DOWN in the deferred deeper-helper-relocation follow-on (ADR 078 D5).
+#[test]
+fn adr078_root_is_bounded() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let lines = root.lines().count();
+	assert!(
+		lines <= 4_500,
+		"manager.rs root is {lines} lines (cap 4_500); carve more or justify a deliberate cap bump"
+	);
+}
+
+/// The inline `#[cfg(test)] mod tests` block was extracted to its own file.
+#[test]
+fn adr078_tests_extracted() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	assert!(
+		root.contains("#[cfg(test)]\nmod tests;"),
+		"root must declare the extracted tests module, not inline it"
+	);
+	let tests = manifest_dir.join("src/storage/manager/tests.rs");
+	assert!(tests.is_file(), "manager/tests.rs must exist");
+	let body = fs::read_to_string(&tests).unwrap();
+	assert!(
+		body.contains("use super::*;") && body.contains("async fn"),
+		"tests.rs must be the extracted test body (use super::*; + test fns)"
+	);
+	assert!(
+		!body.contains("V1 sparse projection"),
+		"retired milestone prose must not reappear in the extracted tests"
+	);
+	assert!(
+		body.contains("Sparse projection fetch consumes"),
+		"the de-versioned sparse projection comment must remain referent-named"
+	);
+}
+
+// ADR 078 `adr078_no_storage_wire_or_runtime_surface_change` — RETIRED in the ADR 233 cross-ring
+// reconciliation, for the same reasons as the ADR 077 tripwire above: the `git status --short` form
+// was vacuous under `color.ui=always` (ANSI codes defeat the `line[3..]` path parse), and a working
+// version would false-positive on any unrelated dirty production file. The move-only invariant is
+// enforced, git-independently, by the structural siblings
+// `adr078_slab_manager_public_surface_stays_in_root`, `adr078_no_mod_rs_root`,
+// `adr078_root_is_bounded`, `adr078_semantic_modules_exist`, and
+// `adr078_manager_source_concatenates_submodules`.
+
+/// The module root is a sibling file `storage/manager.rs`, never
+/// `storage/manager/mod.rs` (mod.rs is manifests-only in this crate).
+#[test]
+fn adr078_no_mod_rs_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	assert!(
+		manifest_dir.join("src/storage/manager.rs").is_file(),
+		"the module root must be the sibling file storage/manager.rs"
+	);
+	assert!(
+		!manifest_dir.join("src/storage/manager/mod.rs").exists(),
+		"storage/manager/mod.rs must not exist (mod.rs is manifests-only)"
+	);
+}

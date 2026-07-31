@@ -1,5 +1,26 @@
 # Local CI
 
+The repository contains two independent Cargo workspaces after PRODUCT-0001.
+The product dispatcher preserves that isolation:
+
+```bash
+ci/product-check.sh ket
+ci/product-check.sh nilket
+ci/product-check.sh cross
+ci/product-check.sh all
+ci/product-check.sh changed origin/main
+```
+
+`changed` selects workspace checks from Git paths and adds the cross-product
+contract job whenever both workspaces or `plans/product/` changed. Path
+selection is a latency optimization, not the only gate: `all` remains the
+scheduled/manual complete run. The cross-product job initially enforces Cargo
+and dependency boundaries; the Toron dogfood pair extends that same entrypoint
+with its durable launcher/client/UI acceptance test.
+
+Set `PRODUCT_CI_DRY_RUN=1` to print the lanes selected by `changed` without
+executing them.
+
 Baryon's repository-owned CI entrypoint is `ci/check.sh`. It is designed for a
 Linux machine controlled by the project, not for a hosted provider workflow.
 There are deliberately no `.github` workflows or provider-specific control

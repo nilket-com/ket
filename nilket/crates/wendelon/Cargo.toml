@@ -1,0 +1,144 @@
+[package]
+name = "wendelon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["non-fips"]
+non-fips = ["aws-lc-rs/non-fips", "observability/non-fips"]
+fips = ["aws-lc-rs/fips", "observability/fips"]
+audit-kafka = ["observability/kafka"]
+otlp-http = ["observability/otlp-http"]
+otlp-grpc = ["observability/otlp-grpc"]
+
+[dependencies]
+arrow = { version = "58.1.0", features = ["ipc_compression"] }
+async-trait = "0.1"
+aws-lc-rs = { version = "1.14", default-features = false }
+base64 = "0.22"
+blake3 = "1.5"
+bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
+bytes = "1.6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables"] }
+dashmap = "6.1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# ADR 057 rewrites Arrow IPC RecordBatch flatbuffer messages after
+# compacting/materializing body buffers; Arrow's public Schema APIs do not
+# expose that metadata rewrite path.
+flatbuffers = "25.12.19"
+io-uring = "0.7.11"
+libc = "0.2"
+lz4_flex = "0.13"
+observability = { path = "../observability", default-features = false, features = ["http", "audit", "telemetry"] }
+opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+postcard = { workspace = true }
+quinn = "0.11"
+rand = "0.10.1"
+redb = "4.0.0"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "blocking", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11.19"
+scrypt = "0.11.0"
+thiserror = "2.0.18"
+tokio = { version = "1.37", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-util = "0.7"
+tls-pki = { path = "../tls-pki" }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
+unicode-normalization = "0.1"
+uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+h2 = "0.4"
+http = "1"
+proc-macro2 = "1"
+syn = { version = "2", features = ["full"] }
+wendelon-client = { path = "crates/wendelon-client", default-features = false }
+
+
+
+[[bench]]
+name = "quic_hot_path"
+harness = false
+
+[[bench]]
+name = "slab_crypto"
+harness = false
+
+[[bench]]
+name = "io_topology"
+harness = false
+
+[[bench]]
+name = "pbc_vectorized"
+harness = false
+
+[[bench]]
+name = "multi_row_fragments"
+harness = false
+
+[[bench]]
+name = "append_only_tables"
+harness = false
+
+[[bench]]
+name = "state_digest"
+harness = false
+
+[[bench]]
+name = "row_tombstones"
+harness = false
+
+[[bench]]
+name = "table_retention"
+harness = false
+
+[[bench]]
+name = "content_hash"
+harness = false
+
+[[bench]]
+name = "pk_delete_supersession"
+harness = false
+
+[[bench]]
+name = "descriptor_fingerprint"
+harness = false
+
+[[bench]]
+name = "secondary_index"
+harness = false
+
+[[bench]]
+name = "wire_arrow_ipc_body_compression"
+harness = false
+
+[[bench]]
+name = "cdc_subscription"
+harness = false
+
+[[bench]]
+name = "lsm_compaction"
+harness = false
+
+[[bench]]
+name = "row_group_fetch"
+harness = false
+
+[[bench]]
+name = "encoding"
+harness = false
+
+[[bench]]
+name = "encoding_compute"
+harness = false

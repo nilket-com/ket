@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 #[path = "../../../tests/support/manifest_dependency_guard.rs"]
 mod manifest_dependency_guard;
 
-use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
+use manifest_dependency_guard::{
+	ProductBoundary, assert_product_dependency_boundary,
+	assert_workspace_product_dependency_boundary,
+};
 
 fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 	let entries = fs::read_dir(dir).expect("read_dir should succeed");
@@ -211,5 +214,17 @@ fn adr_0005_keeps_analytics_out_of_the_document_engine() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),
 		ProductBoundary::Libaryon,
+	);
+}
+
+#[test]
+fn product_0001_keeps_editor_crates_out_of_the_nilket_workspace() {
+	let product_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.parent()
+		.and_then(Path::parent)
+		.expect("libaryon must live at crates/libaryon");
+	assert_workspace_product_dependency_boundary(
+		&product_root.join("nilket"),
+		ProductBoundary::NilketEngine,
 	);
 }
