@@ -1,0 +1,24 @@
+# Pilot-tuned candidate only. ADR 0004 must explicitly freeze or revise it
+# before any sealed holdout is authored.
+extractor_version = 1
+depths = ["name", "span", "callees", "callers"]
+own_name_exclusion = [false, true]
+literal_channel = [false, true]
+
+[weights]
+name = 4.0
+span_identifier = 1.0
+context = 1.5
+literal = 0.5
+callee = 3.0
+caller = 2.0
+
+[bm25]
+k1 = 1.2
+b = 0.75
+
+[rank_sif]
+a = 0.001
+power_iterations = 20
+frequency_ranked = true
+salience_k = [16, 32, 64]

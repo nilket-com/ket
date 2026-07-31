@@ -1,0 +1,92 @@
+[metadata]
+contaminated = true
+purpose = """
+Tuning-only pilot derived from the design conversation that created this
+benchmark. These probes and targets are doubly exposed: they shaped both the
+behavioral-document hypothesis and the harness. They decide no tier and must
+never be copied into the sealed holdout.
+"""
+
+[[probe]]
+kind = "canonical"
+id = "supervisor"
+query = "supervisor"
+expected = { path = "crates/libaryon/src/engine/render.rs", name = "render_frame" }
+
+[[probe]]
+kind = "canonical"
+id = "auditor"
+query = "auditor"
+expected = { path = "crates/libaryon/src/engine/session.rs", name = "with_text_buffer_mut" }
+
+[[probe]]
+kind = "canonical"
+id = "decomposer"
+query = "decomposer"
+expected = { path = "crates/libaryon/src/engine/reclaim.rs", name = "drain_eligible" }
+
+[[probe]]
+kind = "canonical"
+id = "building-inspector"
+query = "building inspector"
+expected = { path = "crates/libaryon/src/engine/structural_graft.rs", name = "validate_graft" }
+
+[[probe]]
+kind = "canonical"
+id = "receiving-dock"
+query = "receiving dock"
+expected = { path = "crates/libaryon/src/svp/resolver.rs", name = "complete_read" }
+
+[[probe]]
+kind = "canonical"
+id = "microscope"
+query = "microscope"
+expected = { path = "crates/libaryon/src/engine/uast_inspector.rs", name = "refresh_uast_inspectors" }
+
+[[probe]]
+kind = "paraphrase"
+id = "floor-manager"
+query = "floor manager"
+expected = { path = "crates/libaryon/src/engine/render.rs", name = "render_frame" }
+
+[[probe]]
+kind = "paraphrase"
+id = "bookkeeper"
+query = "bookkeeper"
+expected = { path = "crates/libaryon/src/engine/session.rs", name = "with_text_buffer_mut" }
+
+[[probe]]
+kind = "paraphrase"
+id = "janitor"
+query = "janitor"
+expected = { path = "crates/libaryon/src/engine/reclaim.rs", name = "drain_eligible" }
+
+[[probe]]
+kind = "paraphrase"
+id = "watchdog"
+query = "watchdog"
+expected = { path = "crates/libaryon/src/engine/render.rs", name = "warn_at_registry_capacity" }
+
+[[probe]]
+kind = "distinction"
+id = "supervisor-over-auditor"
+query = "supervisor"
+preferred = { path = "crates/libaryon/src/engine/render.rs", name = "render_frame" }
+over = { path = "crates/libaryon/src/engine/session.rs", name = "with_text_buffer_mut" }
+
+[[probe]]
+kind = "distinction"
+id = "auditor-over-supervisor"
+query = "auditor"
+preferred = { path = "crates/libaryon/src/engine/session.rs", name = "with_text_buffer_mut" }
+over = { path = "crates/libaryon/src/engine/render.rs", name = "render_frame" }
+
+[[probe]]
+kind = "negative"
+id = "connection-pool"
+query = "connection pool"
+
+[[probe]]
+kind = "negative"
+id = "css-parser"
+query = "css parser"

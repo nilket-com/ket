@@ -1,0 +1,14 @@
+[package]
+name = "spectrometer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Offline behavioral concept-discovery benchmark for Baryon."
+
+[dependencies]
+ra_ap_syntax.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+url.workspace = true
