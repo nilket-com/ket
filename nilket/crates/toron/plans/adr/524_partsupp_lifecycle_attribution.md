@@ -22,7 +22,9 @@ behavior change:
 
 1. **`runtime_prep` per replay/build**: predeclared per-build prep sub-stages (one per suffix
    replay identity) with rows and retained bytes, reconciling to the `runtime_prep` parent
-   with an explicit residual — reconciliation-or-fail, the 516 contract.
+   with an explicit residual — reconciliation-or-fail, the 516 contract. Each child begins
+   before that stage's scan-build decision/admission work and ends only after its runtime is
+   constructed; decision pre-scans cannot leak into an unattributed parent residual.
 2. **Replay-2 sub-stage coverage**: extend `suffix_lookup`, `suffix_match_expand`, and
    `suffix_payload_take` to the generic composite-key suffix path, batch-scoped tokens only
    (never per-row), with the same parent reconciliation and flow counters the specialized
@@ -32,7 +34,9 @@ behavior change:
 4. **Composite-key representation facts, stated not interpreted** (the 516 locality-proxy
    discipline — no hardware-miss claims): key width in bytes, table capacity and load factor,
    retained bytes, and the hash/index type name for each build, generic and specialized
-   alike.
+   alike. Fact collection is O(1): exact fixed-width key/retained bytes are reported only
+   where the representation proves them; variable-width or otherwise untracked ownership is
+   `unknown` with a reason. The profiler never walks entries to manufacture a fact.
 
 Construction is profiler-gated and computed once per runtime (the ADR 516 corrective-seal
 lesson: no per-call shape walks); with the profiler env unset the instrument is absent and
@@ -73,6 +77,8 @@ partsupp prep + replay-2 probe (all sub-stages + residual) + partsupp cleanup
 - No planner or executor behavior change; no knob beyond the existing profiler env; census
   not applicable (plans cannot change — asserted by fingerprint identity in the gate pairs).
 - Timers batch-scoped only; representation facts are recorded fields, never inferences.
+- Per-build cleanup is order-sensitive lifecycle attribution and therefore an upper bound on
+  removable cost, not a claim that changing one build recovers its measured teardown wall.
 - ADR 511-523 surfaces untouched.
 
 ## Risks

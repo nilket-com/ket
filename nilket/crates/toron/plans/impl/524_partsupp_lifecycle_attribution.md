@@ -25,13 +25,15 @@ be priced against the 3,554 ms floor. No remedy, no planner change, no new knob.
 On the reoriented-chain vocabulary in exec/join/streaming.rs:
 
 - `runtime_prep` gains per-replay children (`prep_build`, one per suffix identity) with rows
-  and retained bytes, parent-reconciled with explicit residual;
+  and retained bytes, parent-reconciled with explicit residual; each timer brackets the
+  complete stage-specific decision/admission/pre-scan plus runtime construction path;
 - the generic composite-key suffix path gains the same `suffix_lookup` /
   `suffix_match_expand` / `suffix_payload_take` children and flow counters the specialized
   path carries, batch-scoped;
 - `cleanup` gains per-replay children, parent-reconciled;
-- every build (generic and specialized) records representation facts: key width bytes,
-  capacity, load factor, retained bytes, hash/index type name — recorded fields only.
+- every build (generic and specialized) records O(1) representation facts: exact fixed-width
+  key/retained bytes when provable, otherwise `unknown` plus reason; capacity, load factor,
+  and hash/index type name are recorded fields only, with no entry walk.
 
 Profiler-off byte-identity; once-per-runtime construction.
 
@@ -53,6 +55,9 @@ Then one profiled q09 run supplies the envelope:
 ```text
 E = prep_build(partsupp) + suffix_probe(replay 2, attributed + residual) + cleanup(partsupp)
 ```
+
+Cleanup is reported as order-sensitive lifecycle ownership and contributes only to this
+maximum removable upper bound; it is not asserted as independently recoverable wall.
 
 ## Step 4 - receipt and the predeclared decision
 
