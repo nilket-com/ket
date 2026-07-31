@@ -68,3 +68,67 @@ selected either way.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Measured outcome - lifecycle envelope clears the floor
+
+The mechanism sealed as `6ace39f5` after the plan amendment
+`d643ebea` made ADR 516's inherited generic-key opacity explicit. Generic probing is unchanged:
+the implementation adds only replay-scoped `prep_build` / `cleanup_build` clocks, cached owner
+facts, and the invocation-parent partition receipt.
+
+The seal battery passed with direct exit 0: both fmt legs; 1,458 library tests; all 2,095
+architecture tests; the full `--no-fail-fast` suite; `toron-tpch`; the Toron telemetry, base
+TPC-H, and Polars-reference TPC-H all-targets checks; and `git diff --check`. The release binary
+was then rebuilt from the pushed seal before measurement.
+
+### Perturbation gates
+
+Both five-pair gates pass their predeclared absolute-median 3% bound:
+
+| cell | pair | profiler off (ms) | profiler on (ms) | `(on - off) / off` |
+|---|---:|---:|---:|---:|
+| q09 | 1 | 10,825.602130 | 10,844.520661 | +0.174757% |
+| q09 | 2 | 10,792.605168 | 11,049.042955 | +2.376051% |
+| q09 | 3 | 10,788.775677 | 10,985.318328 | +1.821733% |
+| q09 | 4 | 10,715.447201 | 10,971.284204 | +2.387553% |
+| q09 | 5 | 10,735.289609 | 10,988.599383 | +2.359599% |
+| q08 | 1 | 4,659.599710 | 4,851.054883 | +4.108833% |
+| q08 | 2 | 4,664.733990 | 4,838.047435 | +3.715398% |
+| q08 | 3 | 4,680.215102 | 4,813.163441 | +2.840646% |
+| q08 | 4 | 4,729.821147 | 4,842.432366 | +2.380877% |
+| q08 | 5 | 4,759.329177 | 4,785.752864 | +0.555198% |
+
+The q09 absolute median is **2.359599%**; q08's is **2.840646%**. q08 has two individual
+pairs above 3%, but the predeclared gate is the five-pair median, not an every-pair maximum;
+the run set is neither extended nor corrected.
+
+All 20 children report the sealed build, full-hash verification, pass status, identical
+off/on fingerprints, digests, and local-admission receipts per cell, stable row counts (q09
+175; q08 2), and zero spill. The profiler-off rows do not serialize a handler-route field; the
+route witness is therefore every on-arm reporting `reoriented_inner_chain_grouped`, paired with
+the off/on plan and admission identity — not a claim that an absent off-arm field is a recorded
+route fact. Every on-arm publishes exactly one passing replay partition for each of
+`runtime_prep` and `cleanup`; q08 retains complete stage coverage. q09 retains exactly the three
+predeclared unsupported replay-2 leaves and no others, while its existing `suffix_probe` parent
+and both new partitions reconcile. No strike fires.
+
+### Partsupp lifecycle envelope
+
+A separate, non-selected sealed q09 profile (`adr525_q09_envelope_6ace39f5`) supplies E:
+
+| component | replay | rows | retained bytes | time (ms) |
+|---|---:|---:|---:|---:|
+| `prep_build` | 2 | 6,400,000 | 996,802,848 | 1,485.119 |
+| existing `suffix_probe` parent | 2 | - | - | 1,918.675 |
+| `cleanup_build` upper bound | 2 | 6,400,000 | 996,802,848 | 729.717 |
+| **E** | | | | **4,133.511** |
+
+Both invocation-parent partitions pass: runtime prep attributes 2,203,498 of 2,203,504 us
+(6 us residual), and cleanup attributes 801,325 of 801,333 us (8 us residual). The five
+gated q09 on-arms independently put E in **[4,088.985, 4,147.156] ms**.
+
+E therefore clears the fixed 3,554 ms floor by **579.511 ms** in the decision profile. Per the
+predeclared rule, q09 is not parked: the compact composite-key lifecycle is a legitimate
+single-envelope successor target. This is maximum removable ownership, because teardown is
+order-sensitive; ADR 525 selects no layout, probe, or cleanup remedy and assigns no activation
+claim to the quarantined 64-row-window observation.
