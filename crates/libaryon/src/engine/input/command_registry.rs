@@ -573,14 +573,26 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 	CommandSpec {
 		name: "grep",
 		aliases: &[],
-		bang: true,
+		bang: false,
 		args: ArgSpec::Optional,
 		completion: ArgCompletion::None,
 		category: CommandCategory::View,
-		usage: ":grep[!] [QUERY]",
-		summary: "Search repository content literally or by regex",
-		help: "Opens the engine-owned repository-content picker. :grep searches for a case-sensitive literal string; :grep! interprets the query as a Rust regular expression. Matching remains line-oriented. Invalid regular expressions stay visible and editable in the picker. Use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return.",
+		usage: ":grep [REGEX]",
+		summary: "Search repository content by regex",
+		help: "Opens the engine-owned regex repository-content picker. The query is interpreted as a Rust regular expression and matching remains line-oriented. Invalid regular expressions stay visible and editable in the picker. Use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return.",
 		dispatch: DispatchKind::Exact(cmd_grep_repo_search),
+	},
+	CommandSpec {
+		name: "str",
+		aliases: &[],
+		bang: false,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::View,
+		usage: ":str [QUERY]",
+		summary: "Search repository content literally",
+		help: "Opens the engine-owned literal repository-content picker. The query is matched as an exact case-sensitive string with no regex interpretation. Use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return.",
+		dispatch: DispatchKind::Exact(cmd_string_repo_search),
 	},
 	CommandSpec {
 		name: "help",
@@ -743,28 +755,34 @@ pub(super) fn suggest_from_candidates(
 		return None;
 	}
 	let max_distance = (token.chars().count() / 3).max(1);
-	let mut best: Option<(usize, bool, String)> = None;
+	let token_len = token.chars().count();
+	let mut best: Option<(usize, bool, usize, String)> = None;
 	for candidate in candidates {
 		let distance = edit_distance(token, &candidate);
-		if distance > max_distance || distance >= token.chars().count() {
+		if distance > max_distance || distance >= token_len {
 			continue;
 		}
 		let prefix_related = candidate.starts_with(token) || token.starts_with(candidate.as_str());
+		let length_delta = token_len.abs_diff(candidate.chars().count());
 		let better = match &best {
 			None => true,
-			Some((best_distance, best_prefix, best_candidate)) => {
+			Some((best_distance, best_prefix, best_length_delta, best_candidate)) => {
 				distance < *best_distance
 					|| (distance == *best_distance && prefix_related && !*best_prefix)
 					|| (distance == *best_distance
 						&& prefix_related == *best_prefix
+						&& length_delta < *best_length_delta)
+					|| (distance == *best_distance
+						&& prefix_related == *best_prefix
+						&& length_delta == *best_length_delta
 						&& candidate.len() < best_candidate.len())
 			}
 		};
 		if better {
-			best = Some((distance, prefix_related, candidate));
+			best = Some((distance, prefix_related, length_delta, candidate));
 		}
 	}
-	best.map(|(_, _, candidate)| candidate)
+	best.map(|(_, _, _, candidate)| candidate)
 }
 
 /// Every token a user could actually type as a command: exact names and
@@ -1090,11 +1108,14 @@ fn cmd_fuzzy_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 
 fn cmd_grep_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 	ctx.send(EditorCommand::RepoSearch {
-		mode: if inv.bang {
-			crate::engine::RepoSearchMode::Regex
-		} else {
-			crate::engine::RepoSearchMode::Literal
-		},
+		mode: crate::engine::RepoSearchMode::Regex,
+		query: inv.args.to_string(),
+	});
+}
+
+fn cmd_string_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::RepoSearch {
+		mode: crate::engine::RepoSearchMode::Literal,
 		query: inv.args.to_string(),
 	});
 }
@@ -1708,10 +1729,22 @@ mod tests {
 
 	#[test]
 	fn repository_search_commands_preserve_mode_and_initial_query() {
-		for (invocation, expected_mode) in [
-			("fz render_frame", crate::engine::RepoSearchMode::Fuzzy),
-			("grep render_frame", crate::engine::RepoSearchMode::Literal),
-			("grep! render.*frame", crate::engine::RepoSearchMode::Regex),
+		for (invocation, expected_mode, expected_query) in [
+			(
+				"fz render_frame",
+				crate::engine::RepoSearchMode::Fuzzy,
+				"render_frame",
+			),
+			(
+				"grep render.*frame",
+				crate::engine::RepoSearchMode::Regex,
+				"render.*frame",
+			),
+			(
+				"str render_frame",
+				crate::engine::RepoSearchMode::Literal,
+				"render_frame",
+			),
 		] {
 			let (_, commands, status, _) = dispatch(invocation, None);
 			assert_eq!(status, None);
@@ -1719,11 +1752,7 @@ mod tests {
 				commands.as_slice(),
 				[EditorCommand::RepoSearch { mode, query }]
 					if *mode == expected_mode
-						&& query == if expected_mode == crate::engine::RepoSearchMode::Regex {
-							"render.*frame"
-						} else {
-							"render_frame"
-						}
+						&& query == expected_query
 			));
 		}
 		let (_, commands, status, _) = dispatch("fz", None);
@@ -1735,10 +1764,12 @@ mod tests {
 				query,
 			}] if query.is_empty()
 		));
-		let (result, commands, status, _) = dispatch("rg render_frame", None);
-		assert_eq!(result, DispatchResult::Unknown);
-		assert!(commands.is_empty());
-		assert_eq!(status, None);
+		for rejected in ["rg render_frame", "grep! render.*frame"] {
+			let (result, commands, status, _) = dispatch(rejected, None);
+			assert_eq!(result, DispatchResult::Unknown);
+			assert!(commands.is_empty());
+			assert_eq!(status, None);
+		}
 	}
 
 	#[test]

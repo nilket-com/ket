@@ -470,7 +470,7 @@ fn builtin_catalogs_match_the_pre_overlay_contract() {
 
 #[test]
 fn characterized_catalog_sizes_match_the_planning_inventory() {
-	assert_eq!(COMMANDS.len(), 43);
+	assert_eq!(COMMANDS.len(), 44);
 	assert_eq!(BOOL_OPTIONS.len(), 6);
 	assert_eq!(VALUE_OPTIONS.len(), 5);
 	assert_eq!(
