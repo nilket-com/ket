@@ -139,8 +139,10 @@ impl State {
 	}
 
 	pub fn split(&mut self, axis: Axis, pane: PaneId) -> Option<(SplitId, PaneId)> {
-		let new_pane = self.alloc_pane();
 		let node = self.find_node(NodeId::Pane(pane))?;
+		// Validate the target before allocating. A failed split must not leave a
+		// phantom pane in the public pane list.
+		let new_pane = self.alloc_pane();
 
 		let split = Split {
 			axis,
@@ -341,6 +343,34 @@ impl State {
 		true
 	}
 
+	/// Remove a pane from both the split tree and the public pane census.
+	///
+	/// `detach_pane` deliberately preserves the pane id while a drag operation
+	/// moves it elsewhere in the same tree. Closing a pane has different
+	/// lifetime semantics and must remove that id, otherwise later callers can
+	/// select a pane that no longer exists in the tree.
+	pub fn remove_pane(&mut self, pane: PaneId) -> bool {
+		let pane_node = NodeId::Pane(pane);
+		let removed = if self.root == Some(pane_node) {
+			self.root = None;
+			true
+		} else {
+			self.detach_pane(pane)
+		};
+		if !removed {
+			return false;
+		}
+
+		self.panes.retain(|candidate| *candidate != pane);
+		if self.maximize == MaximizeState::Maximized(pane) {
+			self.maximize = MaximizeState::None;
+		}
+		if self.pane_dragging.is_some_and(|drag| drag.pane == pane) {
+			self.pane_dragging = None;
+		}
+		true
+	}
+
 	pub fn insert_by_split(&mut self, pane: PaneId, target: PaneId, axis: Axis, before: bool) {
 		let target_node = NodeId::Pane(target);
 		let pane_node = NodeId::Pane(pane);
@@ -458,5 +488,26 @@ mod tests {
 		state.apply(Action::DragStarted(split));
 		assert_eq!(state.dragging(), Some(split));
 		assert!(state.pane_dragging().is_none());
+	}
+
+	#[test]
+	fn removing_a_pane_updates_the_tree_and_public_census() {
+		let (mut state, first_pane) = State::with_initial_pane();
+		let (_, second_pane) = state.split(Axis::Horizontal, first_pane).unwrap();
+
+		assert!(state.remove_pane(first_pane));
+		assert_eq!(state.panes(), &[second_pane]);
+		assert_eq!(state.root(), Some(NodeId::Pane(second_pane)));
+		assert!(state.split(Axis::Horizontal, second_pane).is_some());
+	}
+
+	#[test]
+	fn failed_split_does_not_allocate_a_phantom_pane() {
+		let (mut state, first_pane) = State::with_initial_pane();
+		assert!(state.split(Axis::Horizontal, PaneId(99)).is_none());
+		assert_eq!(state.panes(), &[first_pane]);
+
+		let (_, second_pane) = state.split(Axis::Horizontal, first_pane).unwrap();
+		assert_eq!(second_pane, PaneId(1));
 	}
 }

@@ -67,12 +67,12 @@ impl DashboardState {
 			},
 			DashboardMsg::ClosePlot(pane) => {
 				if let Some(dashboard) = &mut self.panes {
-					if dashboard.panes().len() <= 1 {
+					if dashboard.remove_pane(pane) {
+						self.content.remove(&pane);
+					}
+					if dashboard.panes().is_empty() {
 						self.panes = None;
 						self.content.clear();
-					} else {
-						dashboard.detach_pane(pane);
-						self.content.remove(&pane);
 					}
 				}
 				DashboardEffect::None
@@ -196,21 +196,78 @@ impl DashboardState {
 		}
 
 		let new_plot = PlotPaneState::with_kernel(composition, kernel, 1200, 1200);
-		if let Some(dashboard) = &mut self.panes {
-			let first_pane = *dashboard
-				.panes()
-				.first()
-				.expect("dashboard panes must exist when dashboard state exists");
-			let (_, new_pane) = dashboard
-				.split(Axis::Horizontal, first_pane)
-				.expect("dashboard split failed");
+		if let Some(dashboard) = &mut self.panes
+			&& let Some(first_pane) = dashboard.panes().first().copied()
+			&& let Some((_, new_pane)) = dashboard.split(Axis::Horizontal, first_pane)
+		{
 			self.content.insert(new_pane, new_plot);
-			new_pane
-		} else {
-			let (dashboard, pane) = PaneState::with_initial_pane();
-			self.panes = Some(dashboard);
-			self.content.insert(pane, new_plot);
-			pane
+			return new_pane;
 		}
+
+		// An empty or inconsistent dashboard is recoverable UI state, not a
+		// process-fatal invariant. Start a fresh nested grid for the new plot.
+		let (dashboard, pane) = PaneState::with_initial_pane();
+		self.panes = Some(dashboard);
+		self.content.clear();
+		self.content.insert(pane, new_plot);
+		pane
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::common::{CoordinateTransformer, PlotBackend, PlotLayout, PlotSettings};
+	use crate::plot::core::PlotType;
+	use iced::Rectangle;
+	use iced::advanced::mouse::Cursor;
+
+	struct TestKernel;
+
+	impl PlotKernel for TestKernel {
+		fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+			PlotLayout::Radial
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: PlotSettings,
+		) {
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+	}
+
+	fn add_plot(dashboard: &mut DashboardState) -> PaneId {
+		dashboard.apply_plot_replacing(
+			None,
+			PlotComposition::single(PlotType::Scatter),
+			Arc::new(TestKernel),
+		)
+	}
+
+	#[test]
+	fn dashboard_reopens_after_every_plot_is_closed() {
+		let mut dashboard = DashboardState::default();
+		let first = add_plot(&mut dashboard);
+		let second = add_plot(&mut dashboard);
+
+		dashboard.update(DashboardMsg::ClosePlot(first));
+		dashboard.update(DashboardMsg::ClosePlot(second));
+		assert!(dashboard.panes.is_none());
+		assert!(dashboard.content.is_empty());
+
+		let reopened = add_plot(&mut dashboard);
+		assert!(dashboard.content.contains_key(&reopened));
+		assert_eq!(
+			dashboard.panes.as_ref().map(|panes| panes.panes()),
+			Some(&[reopened][..]),
+		);
 	}
 }
