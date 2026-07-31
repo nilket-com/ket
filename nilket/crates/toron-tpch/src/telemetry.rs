@@ -5,7 +5,8 @@
 //! even under `--allow-blocked`. This is what stops "blocked" from silently absorbing real regressions.
 
 /// The stage a query attempt reached. `Fragment` was reserved at ADR 261 for distributed
-/// reachability; ADR 528's fragment-census rail is its sole producer — no default rail emits it.
+/// reachability; ADR 528/529's explicit census rails are its sole producers — no default rail
+/// emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
 	Generate,
@@ -14,7 +15,7 @@ pub enum Phase {
 	Bind,
 	Execute,
 	Compare,
-	/// Emitted only by the ADR 528 fragment-census rail (plan-shape capability, no execution).
+	/// Emitted only by the ADR 528/529 census rails (plan-shape capability, no default execution).
 	Fragment,
 }
 
@@ -482,6 +483,121 @@ impl FragmentCensusRow {
 		if let Some(message) = &self.diagnostic_message {
 			row.as_object_mut()
 				.expect("fragment census JSON row is an object")
+				.insert("diagnostic_message".to_string(), serde_json::json!(message));
+		}
+		row.to_string()
+	}
+}
+
+/// ADR 529: one execution-reachability result. Identity, rather than elapsed time, is the
+/// authority. The complete distributed envelope travels as the typed `QueryBudget`; the explicit
+/// task-memory envelope is separate because `memory_per_task * admitted_width` bounds concurrent
+/// task allowances, not shuffle-store, transport, result, spill, or broadcast residency.
+#[derive(Debug, Clone)]
+pub struct ExecutionCensusRow {
+	pub query: String,
+	pub scale_factor: f64,
+	pub mode: String,
+	pub phase: Phase,
+	pub classification: String,
+	pub reason: Option<String>,
+	pub local_plan_fingerprint: Option<String>,
+	pub distributed_plan_fingerprint: Option<String>,
+	pub local_digest: Option<String>,
+	pub distributed_digest: Option<String>,
+	pub local_row_count: Option<u64>,
+	pub distributed_row_count: Option<u64>,
+	pub local_schema_fingerprint: Option<String>,
+	pub distributed_schema_fingerprint: Option<String>,
+	pub stage_count: Option<usize>,
+	pub stage_task_counts: Option<Vec<usize>>,
+	pub admitted_width: Option<usize>,
+	pub task_memory_envelope_bytes: u64,
+	pub local_memory_bytes: u64,
+	pub local_spill_bytes: u64,
+	pub distributed_budget: toron::distributed::budget::QueryBudget,
+	pub worker_count: usize,
+	pub transport: &'static str,
+	pub partition_store: &'static str,
+	pub memory_pool_retained_buffers: usize,
+	pub memory_pool_max_buffer_capacity_bytes: usize,
+	pub distributed_attempts: usize,
+	pub transport_retry: bool,
+	pub dataset_verification: Option<DatasetVerification>,
+	pub local_elapsed_ms: Option<f64>,
+	pub distributed_elapsed_ms: Option<f64>,
+	pub total_elapsed_ms: f64,
+	pub diagnostic_message: Option<String>,
+}
+
+impl ExecutionCensusRow {
+	pub fn human(&self) -> String {
+		format!(
+			"tpch_execution_census query={} sf={} mode={} phase={} classification={} reason={} width={} memory_per_task={} max_in_flight={} transport={} store={} identity={}",
+			self.query,
+			self.scale_factor,
+			self.mode,
+			self.phase.as_str(),
+			self.classification,
+			self.reason.as_deref().unwrap_or("none"),
+			self.admitted_width
+				.map_or("none".to_string(), |width| width.to_string()),
+			self.distributed_budget.memory_per_task.get(),
+			self.distributed_budget
+				.max_in_flight_tasks
+				.map_or("none".to_string(), |count| count.to_string()),
+			self.transport,
+			self.partition_store,
+			match (&self.local_digest, &self.distributed_digest) {
+				(Some(local), Some(distributed)) if local == distributed => "equal",
+				(Some(_), Some(_)) => "different",
+				_ => "incomplete",
+			},
+		)
+	}
+
+	pub fn jsonl(&self) -> String {
+		let mut row = serde_json::json!({
+			"suite": "tpch_execution_census",
+			"query": self.query,
+			"scale_factor": self.scale_factor,
+			"mode": self.mode,
+			"phase": self.phase.as_str(),
+			"classification": self.classification,
+			"reason": self.reason,
+			"local_plan_fingerprint": self.local_plan_fingerprint,
+			"distributed_plan_fingerprint": self.distributed_plan_fingerprint,
+			"local_digest": self.local_digest,
+			"distributed_digest": self.distributed_digest,
+			"local_row_count": self.local_row_count,
+			"distributed_row_count": self.distributed_row_count,
+			"local_schema_fingerprint": self.local_schema_fingerprint,
+			"distributed_schema_fingerprint": self.distributed_schema_fingerprint,
+			"stage_count": self.stage_count,
+			"stage_task_counts": self.stage_task_counts,
+			"admitted_width": self.admitted_width,
+			"task_memory_envelope_bytes": self.task_memory_envelope_bytes,
+			"local_memory_bytes": self.local_memory_bytes,
+			"local_spill_bytes": self.local_spill_bytes,
+			"distributed_budget": self.distributed_budget,
+			"worker_count": self.worker_count,
+			"transport": self.transport,
+			"partition_store": self.partition_store,
+			"memory_pool_retained_buffers": self.memory_pool_retained_buffers,
+			"memory_pool_max_buffer_capacity_bytes": self.memory_pool_max_buffer_capacity_bytes,
+			"distributed_attempts": self.distributed_attempts,
+			"transport_retry": self.transport_retry,
+			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
+			"local_elapsed_ms": self.local_elapsed_ms,
+			"distributed_elapsed_ms": self.distributed_elapsed_ms,
+			"total_elapsed_ms": self.total_elapsed_ms,
+			"timing_authority": false,
+			"build_commit": build_commit(),
+			"binary_modified_unix": binary_modified_unix(),
+		});
+		if let Some(message) = &self.diagnostic_message {
+			row.as_object_mut()
+				.expect("execution census JSON row is an object")
 				.insert("diagnostic_message".to_string(), serde_json::json!(message));
 		}
 		row.to_string()

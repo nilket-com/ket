@@ -48,23 +48,31 @@ use tpchgen::generators::{
 use toron::binder::{
 	PlannerConfig, bind, bind_with_explain_summary, bind_with_local_join_admissions,
 };
-use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
-use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
+use toron::catalog::{Catalog, MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
+use toron::coordinator::DistributedQueryCoordinator;
+use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::context::TaskExecutionContext;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use toron::distributed::identity::{LeaseEpoch, WorkerId};
+use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::scheduler::StagePlan;
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
 	TaskOutputBinding, TaskTelemetry,
 };
-use toron::error::StorageError;
+use toron::distributed::worker_registry::{
+	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
+	WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
+};
+use toron::error::{ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	BoundExprNode, BoundExprProgram, ColumnOrdinal, ExecutionPlan, JoinKind, LogicalPlan, TableId,
 	decimal_division_output_type,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
+use toron::server::{ToronWorker, memory::MemoryManager, transport::TcpTransport};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -74,8 +82,8 @@ use wendelon::schema::{
 };
 
 use telemetry::{
-	Attempt, CorrectnessAttempt, DatasetVerification, FragmentCensusRow, PerfAttempt,
-	PerfPhaseTimings, Phase, Status, reason_for_error, status_for_reason,
+	Attempt, CorrectnessAttempt, DatasetVerification, ExecutionCensusRow, FragmentCensusRow,
+	PerfAttempt, PerfPhaseTimings, Phase, Status, reason_for_error, status_for_reason,
 };
 
 /// Default cache / output root — always under `target/`, never a tracked path.
@@ -4271,6 +4279,16 @@ async fn execute_query_with_metadata_timed(
 	tables: Vec<HarnessTableMetadata>,
 	storage: Arc<dyn StorageScan>,
 ) -> Result<QueryExecution, StageError> {
+	execute_query_with_metadata_coordinate(sql, tables, storage, gauge_planner_config(), None).await
+}
+
+async fn execute_query_with_metadata_coordinate(
+	sql: &str,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+	planner_config: PlannerConfig,
+	query_budget: Option<QueryBudget>,
+) -> Result<QueryExecution, StageError> {
 	let total_start = Instant::now();
 	let mut timings = PerfPhaseTimings::default();
 	let catalog = load_catalog_from_metadata(tables, &mut timings, total_start)?;
@@ -4286,7 +4304,16 @@ async fn execute_query_with_metadata_timed(
 	};
 	timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-	execute_logical_with_catalog_timed(total_start, timings, catalog, logical, storage).await
+	execute_logical_with_catalog_timed(
+		total_start,
+		timings,
+		catalog,
+		logical,
+		storage,
+		planner_config,
+		query_budget,
+	)
+	.await
 }
 
 async fn execute_rune_q03_with_metadata_timed(
@@ -4308,7 +4335,16 @@ async fn execute_rune_q03_with_metadata_timed(
 	};
 	timings.plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-	execute_logical_with_catalog_timed(total_start, timings, catalog, logical, storage).await
+	execute_logical_with_catalog_timed(
+		total_start,
+		timings,
+		catalog,
+		logical,
+		storage,
+		gauge_planner_config(),
+		None,
+	)
+	.await
 }
 
 async fn rune_q03_logical_plan() -> Result<LogicalPlan, StageError> {
@@ -4327,12 +4363,14 @@ async fn execute_logical_with_catalog_timed(
 	catalog: MockCatalog,
 	logical: LogicalPlan,
 	storage: Arc<dyn StorageScan>,
+	planner_config: PlannerConfig,
+	query_budget: Option<QueryBudget>,
 ) -> Result<QueryExecution, StageError> {
 	let mut plan_fingerprint = None;
 	let mut spill_bytes = 0;
 	let bind_start = Instant::now();
 	let (bound, local_join_admissions) =
-		match bind_with_local_join_admissions(&logical, &catalog, &gauge_planner_config()).await {
+		match bind_with_local_join_admissions(&logical, &catalog, &planner_config).await {
 			Ok(bound) => bound,
 			Err(error) => {
 				timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
@@ -4348,7 +4386,10 @@ async fn execute_logical_with_catalog_timed(
 	plan_fingerprint = Some(physical_plan_fingerprint(&bound));
 
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
-	let context = tpch_execution_context(task_telemetry.clone());
+	let context = query_budget.map_or_else(
+		|| tpch_execution_context(task_telemetry.clone()),
+		|budget| tpch_execution_context_with_budget(task_telemetry.clone(), budget),
+	);
 	let execute_start = Instant::now();
 	let batches = match Executor::with_context(storage, context)
 		.execute_bound(&bound, None)
@@ -4654,7 +4695,15 @@ fn gauge_planner_config_with_task_memory(
 /// would actually receive: ADR 490's local hash-join admission declines by design, and the
 /// resulting fingerprint legitimately differs from the single-partition gauge plans.
 pub fn distributed_gauge_planner_config() -> PlannerConfig {
-	let mut config = gauge_planner_config();
+	let (bytes, _provenance) =
+		gauge_memory_per_task().unwrap_or_else(|error| panic!("gauge planner config: {error}"));
+	distributed_gauge_planner_config_with_task_memory(Some(ByteCount::new(bytes)))
+}
+
+fn distributed_gauge_planner_config_with_task_memory(
+	local_hash_join_memory_per_task: Option<ByteCount>,
+) -> PlannerConfig {
+	let mut config = gauge_planner_config_with_task_memory(local_hash_join_memory_per_task);
 	config.single_partition_execution = false;
 	config
 }
@@ -4723,28 +4772,30 @@ pub fn gauge_spill_bytes_reserved() -> Result<(u64, &'static str), String> {
 	}
 }
 
-fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> ExecutionContext {
-	let mut context = ExecutionContext::local_test()
+fn tpch_execution_context_with_budget(
+	task_telemetry: Arc<Mutex<TaskTelemetry>>,
+	budget: QueryBudget,
+) -> ExecutionContext {
+	ExecutionContext::local_test()
 		.with_task_telemetry(task_telemetry)
 		.with_join_spill_store(
 			Arc::new(wendelon::storage::BlockingFileOps),
 			PathBuf::from(CACHE_ROOT).join("join_spill"),
-		);
+		)
+		.with_task_budget(TaskBudget::from_query_budget(budget))
+}
+
+fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> ExecutionContext {
+	let mut budget = QueryBudget::test_default();
 	let memory = gauge_memory_per_task();
 	let spill = gauge_spill_bytes_reserved();
-	let explicit =
-		|value: &Result<(u64, &'static str), String>| matches!(value, Ok((_, "explicit")));
-	if explicit(&memory) || explicit(&spill) {
-		let mut budget = QueryBudget::test_default();
-		if let Ok((bytes, "explicit")) = memory {
-			budget.memory_per_task = ByteCount::new(bytes);
-		}
-		if let Ok((bytes, "explicit")) = spill {
-			budget.spill_bytes_reserved_per_query = ByteCount::new(bytes);
-		}
-		context = context.with_task_budget(TaskBudget::from_query_budget(budget));
+	if let Ok((bytes, "explicit")) = memory {
+		budget.memory_per_task = ByteCount::new(bytes);
 	}
-	context
+	if let Ok((bytes, "explicit")) = spill {
+		budget.spill_bytes_reserved_per_query = ByteCount::new(bytes);
+	}
+	tpch_execution_context_with_budget(task_telemetry, budget)
 }
 
 /// ADR 528: the census's typed per-cell answer. Classification derives from this value alone —
@@ -4995,6 +5046,554 @@ fn fragment_census_row(
 			diagnostic_message: None,
 		},
 	}
+}
+
+const EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const EXECUTION_CENSUS_SPILL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const EXECUTION_CENSUS_GENEROUS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const EXECUTION_CENSUS_BYTES_IN_FLIGHT: u64 = 2 * 1024 * 1024 * 1024;
+const EXECUTION_CENSUS_WORKER_COUNT: usize = 2;
+const EXECUTION_CENSUS_FALLBACK_WIDTH: usize = 4;
+const EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS: usize = 32;
+
+fn execution_census_local_budget() -> QueryBudget {
+	QueryBudget {
+		memory_per_task: ByteCount::new(EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES),
+		spill_bytes_reserved_per_query: ByteCount::new(EXECUTION_CENSUS_SPILL_BYTES),
+		..QueryBudget::test_default()
+	}
+}
+
+fn execution_census_distributed_budget(width: usize) -> QueryBudget {
+	execution_census_distributed_budget_with_memory(
+		width,
+		EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES / u64::try_from(width.max(1)).unwrap_or(1),
+	)
+}
+
+fn execution_census_distributed_budget_with_memory(
+	width: usize,
+	memory_per_task: u64,
+) -> QueryBudget {
+	QueryBudget {
+		bytes_in_flight_per_query: ByteCount::new(EXECUTION_CENSUS_BYTES_IN_FLIGHT),
+		bytes_in_flight_per_worker_stream: ByteCount::new(512 * 1024 * 1024),
+		memory_per_task: ByteCount::new(memory_per_task.max(1)),
+		shuffle_bytes_published_per_task: ByteCount::new(EXECUTION_CENSUS_GENEROUS_BYTES),
+		spill_bytes_reserved_per_query: ByteCount::new(EXECUTION_CENSUS_SPILL_BYTES),
+		broadcast_build_bytes_per_task: ByteCount::new(EXECUTION_CENSUS_GENEROUS_BYTES),
+		broadcast_replicated_bytes_per_query: ByteCount::new(EXECUTION_CENSUS_GENEROUS_BYTES),
+		max_in_flight_tasks: Some(width.max(1)),
+		..QueryBudget::test_default()
+	}
+}
+
+fn execution_census_distributed_planner_config(memory_per_task: ByteCount) -> PlannerConfig {
+	distributed_gauge_planner_config_with_task_memory(Some(memory_per_task))
+}
+
+struct ExecutionCensusPreflight {
+	logical: LogicalPlan,
+	catalog: MockCatalog,
+	plan_fingerprint: String,
+	shape: FragmentShapeReceipt,
+}
+
+#[derive(Debug)]
+struct ExecutionCensusPreflightRejection {
+	phase: Phase,
+	reason: String,
+	message: String,
+	plan_fingerprint: Option<String>,
+}
+
+async fn execution_census_preflight(
+	sql: &str,
+	tables: Vec<HarnessTableMetadata>,
+) -> Result<ExecutionCensusPreflight, ExecutionCensusPreflightRejection> {
+	let mut timings = PerfPhaseTimings::default();
+	let catalog =
+		load_catalog_from_metadata(tables, &mut timings, Instant::now()).map_err(|error| {
+			ExecutionCensusPreflightRejection {
+				phase: error.phase,
+				reason: "preflight_load".to_string(),
+				message: error.message,
+				plan_fingerprint: None,
+			}
+		})?;
+	let logical =
+		SqlPlanner::new()
+			.plan(sql)
+			.map_err(|error| ExecutionCensusPreflightRejection {
+				phase: Phase::Plan,
+				reason: "preflight_plan".to_string(),
+				message: error.to_string(),
+				plan_fingerprint: None,
+			})?;
+	let seed_budget = execution_census_distributed_budget(EXECUTION_CENSUS_FALLBACK_WIDTH);
+	let planner_config = execution_census_distributed_planner_config(seed_budget.memory_per_task);
+	let bound = bind_with_local_join_admissions(&logical, &catalog, &planner_config)
+		.await
+		.map(|(bound, _)| bound)
+		.map_err(|error| ExecutionCensusPreflightRejection {
+			phase: Phase::Bind,
+			reason: "preflight_bind".to_string(),
+			message: format!("{error:?}"),
+			plan_fingerprint: None,
+		})?;
+	let plan_fingerprint = physical_plan_fingerprint(&bound);
+	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let context = tpch_execution_context_with_budget(task_telemetry, seed_budget);
+	let fragment_config = FragmentPlanConfig::new(context.query_id, context.task_budget)
+		.with_task_context(TaskExecutionContext::from_execution_context(&context))
+		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone());
+	let stages = fragment_plan(bound, fragment_config).map_err(|error| {
+		ExecutionCensusPreflightRejection {
+			phase: Phase::Fragment,
+			reason: classify_fragment_error(&error).to_string(),
+			message: error.to_string(),
+			plan_fingerprint: Some(plan_fingerprint.clone()),
+		}
+	})?;
+	Ok(ExecutionCensusPreflight {
+		logical,
+		catalog,
+		plan_fingerprint,
+		shape: fragment_shape_receipt(&stages),
+	})
+}
+
+#[derive(Debug)]
+struct ExecutionIdentityFacts {
+	digest: String,
+	row_count: u64,
+	schema_fingerprint: Option<String>,
+}
+
+fn execution_identity_facts(batches: &[RecordBatch]) -> Result<ExecutionIdentityFacts, String> {
+	let digest = canonical_arrow_ipc_digest(batches, SortPolicy::FullRowLex)
+		.map_err(|error| format!("execution census canonical digest: {error:?}"))?;
+	Ok(ExecutionIdentityFacts {
+		digest: format!("{digest:?}"),
+		row_count: output_row_count(batches),
+		schema_fingerprint: output_schema_fingerprint(batches),
+	})
+}
+
+fn budget_dimension_slug(dimension: BudgetDimension) -> &'static str {
+	match dimension {
+		BudgetDimension::Memory => "budget_memory",
+		BudgetDimension::ShuffleBytes => "budget_shuffle_bytes",
+		BudgetDimension::SpillBytes => "budget_spill_bytes",
+		BudgetDimension::BroadcastReplication => "budget_broadcast_replication",
+		BudgetDimension::BytesInFlightPerQuery => "budget_bytes_in_flight_per_query",
+		BudgetDimension::BytesInFlightPerWorkerStream => "budget_bytes_in_flight_per_worker_stream",
+		BudgetDimension::FrameSize => "budget_frame_size",
+	}
+}
+
+fn task_failure_reason(kind: &TaskFailureKind) -> String {
+	match kind {
+		TaskFailureKind::ProtocolMismatch => "task_protocol_mismatch".to_string(),
+		TaskFailureKind::DescriptorEvolved { .. } => "task_descriptor_evolved".to_string(),
+		TaskFailureKind::WorkerLost { .. } => "task_worker_lost".to_string(),
+		TaskFailureKind::TaskFailed { .. } => "task_failed".to_string(),
+		TaskFailureKind::BudgetExhausted { dimension, .. } => {
+			budget_dimension_slug(*dimension).to_string()
+		}
+		TaskFailureKind::Cancelled => "task_cancelled".to_string(),
+		TaskFailureKind::Internal { .. } => "task_internal".to_string(),
+	}
+}
+
+fn execution_error_reason(error: &ExecutionError) -> String {
+	match error {
+		ExecutionError::Storage(_) => "execution_storage".to_string(),
+		ExecutionError::Compute(_) => "execution_compute".to_string(),
+		ExecutionError::Binding(_) => "execution_binding".to_string(),
+		ExecutionError::NotImplemented { .. } => "execution_not_implemented".to_string(),
+		ExecutionError::ColumnNotFound { .. } => "execution_column_not_found".to_string(),
+		ExecutionError::InvalidExpression { .. } => "execution_invalid_expression".to_string(),
+		ExecutionError::Kernel { .. } => "execution_kernel".to_string(),
+		ExecutionError::BudgetExhausted { dimension, .. } => {
+			budget_dimension_slug(*dimension).to_string()
+		}
+		ExecutionError::ConcurrencyExhausted { .. } => {
+			"execution_concurrency_exhausted".to_string()
+		}
+	}
+}
+
+fn execution_census_query_error_reason(error: &QueryError) -> String {
+	match error {
+		QueryError::Execution(error) => execution_error_reason(error),
+		QueryError::Storage(_) => "query_storage".to_string(),
+		QueryError::Binding(_) => "query_binding".to_string(),
+		QueryError::Catalog(_) => "query_catalog".to_string(),
+		QueryError::Frontend(_) => "query_frontend".to_string(),
+		QueryError::Wire(_) => "query_wire".to_string(),
+		QueryError::Spill(_) => "query_spill".to_string(),
+		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
+			"runtime_protocol_mismatch".to_string()
+		}
+		QueryError::Runtime(RuntimeError::PartitionStoreMismatch { .. }) => {
+			"runtime_partition_store_mismatch".to_string()
+		}
+		QueryError::Runtime(RuntimeError::TaskFailure { kind }) => task_failure_reason(kind),
+		QueryError::Io(_) => "query_io".to_string(),
+		QueryError::Arrow(_) => "query_arrow".to_string(),
+		QueryError::Remote { .. } => "query_remote".to_string(),
+		QueryError::UnexpectedMessage { .. } => "query_unexpected_message".to_string(),
+		QueryError::SchemaInstability => "query_schema_instability".to_string(),
+		QueryError::Internal { .. } => "query_internal".to_string(),
+	}
+}
+
+struct ExecutionCensusWorkerHarness {
+	entry: WorkerEntry,
+	shutdown: tokio::sync::oneshot::Sender<()>,
+	handle: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+async fn spawn_execution_census_worker(
+	worker_index: usize,
+	storage: Arc<dyn StorageScan>,
+	budget: QueryBudget,
+	memory_pool_max_buffer_capacity_bytes: usize,
+) -> Result<ExecutionCensusWorkerHarness, String> {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+		.await
+		.map_err(|error| format!("execution census worker bind: {error}"))?;
+	let endpoint = WorkerEndpoint::new(
+		listener
+			.local_addr()
+			.map_err(|error| format!("execution census worker address: {error}"))?
+			.to_string(),
+	);
+	let worker_id = WorkerId::from_u128(529_000 + worker_index as u128);
+	let memory = Arc::new(MemoryManager::new(
+		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+		memory_pool_max_buffer_capacity_bytes,
+	));
+	let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+		storage,
+		memory,
+		Arc::new(InMemoryPartitionStore::with_budget(budget)),
+		worker_id,
+		endpoint.clone(),
+	));
+	let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+	let handle = tokio::spawn(async move {
+		let mut connections = tokio::task::JoinSet::new();
+		loop {
+			tokio::select! {
+				_ = &mut shutdown_rx => break,
+				accepted = listener.accept() => {
+					let (stream, _) = accepted
+						.map_err(|error| format!("execution census worker accept: {error}"))?;
+					let worker = worker.clone();
+					connections.spawn(async move {
+						worker.handle_connection(stream).await
+							.map_err(|error| format!("execution census worker connection: {error}"))
+					});
+				}
+			}
+		}
+		while let Some(result) = connections.join_next().await {
+			result.map_err(|error| format!("execution census worker task join: {error}"))??;
+		}
+		Ok(())
+	});
+	Ok(ExecutionCensusWorkerHarness {
+		entry: WorkerEntry {
+			worker_id,
+			endpoint,
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(1),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: budget.memory_per_task,
+				simd_width: SimdLaneCount::new(8),
+				spill_capacity_reserved: budget.spill_bytes_reserved_per_query,
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::default(),
+			},
+			status: WorkerStatus::Live,
+		},
+		shutdown,
+		handle,
+	})
+}
+
+async fn shutdown_execution_census_workers(
+	workers: Vec<ExecutionCensusWorkerHarness>,
+) -> Result<(), String> {
+	let mut handles = Vec::with_capacity(workers.len());
+	for worker in workers {
+		let _ = worker.shutdown.send(());
+		handles.push(worker.handle);
+	}
+	for handle in handles {
+		handle
+			.await
+			.map_err(|error| format!("execution census worker server join: {error}"))??;
+	}
+	Ok(())
+}
+
+struct ExecutionCensusInput {
+	query_id: &'static str,
+	sql: Cow<'static, str>,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+	dataset_verification: Option<DatasetVerification>,
+}
+
+async fn run_execution_census_input(
+	input: ExecutionCensusInput,
+	scale_factor: f64,
+	mode: &str,
+	distributed_memory_override: Option<u64>,
+) -> Result<ExecutionCensusRow, String> {
+	let total_start = Instant::now();
+	let local_budget = execution_census_local_budget();
+	let local_start = Instant::now();
+	let local = execute_query_with_metadata_coordinate(
+		&input.sql,
+		input.tables.clone(),
+		input.storage.clone(),
+		gauge_planner_config_with_task_memory(Some(local_budget.memory_per_task)),
+		Some(local_budget),
+	)
+	.await
+	.map_err(|error| {
+		format!(
+			"execution census local oracle rejected at {}: {} ({})",
+			error.phase.as_str(),
+			error.reason,
+			error.message
+		)
+	})?;
+	let local_elapsed_ms = local_start.elapsed().as_secs_f64() * 1000.0;
+	let local_identity = execution_identity_facts(&local.batches)?;
+
+	let preflight_result = execution_census_preflight(&input.sql, input.tables).await;
+	let rejected_width = EXECUTION_CENSUS_FALLBACK_WIDTH;
+	let rejected_budget = execution_census_distributed_budget(rejected_width);
+	let preflight = match preflight_result {
+		Ok(preflight) => preflight,
+		Err(rejection) => {
+			return Ok(ExecutionCensusRow {
+				query: input.query_id.to_string(),
+				scale_factor,
+				mode: mode.to_string(),
+				phase: rejection.phase,
+				classification: "execution_rejected".to_string(),
+				reason: Some(rejection.reason),
+				local_plan_fingerprint: Some(local.plan_fingerprint),
+				distributed_plan_fingerprint: rejection.plan_fingerprint,
+				local_digest: Some(local_identity.digest),
+				distributed_digest: None,
+				local_row_count: Some(local_identity.row_count),
+				distributed_row_count: None,
+				local_schema_fingerprint: local_identity.schema_fingerprint,
+				distributed_schema_fingerprint: None,
+				stage_count: None,
+				stage_task_counts: None,
+				admitted_width: None,
+				task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
+				local_memory_bytes: local_budget.memory_per_task.get(),
+				local_spill_bytes: local_budget.spill_bytes_reserved_per_query.get(),
+				distributed_budget: rejected_budget,
+				worker_count: EXECUTION_CENSUS_WORKER_COUNT,
+				transport: "tcp_loopback",
+				partition_store: "in_memory",
+				memory_pool_retained_buffers: EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+				memory_pool_max_buffer_capacity_bytes: usize::try_from(
+					rejected_budget.memory_per_task.get(),
+				)
+				.unwrap_or(usize::MAX),
+				distributed_attempts: 0,
+				transport_retry: false,
+				dataset_verification: input.dataset_verification,
+				local_elapsed_ms: Some(local_elapsed_ms),
+				distributed_elapsed_ms: None,
+				total_elapsed_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+				diagnostic_message: Some(rejection.message),
+			});
+		}
+	};
+	let width = preflight.shape.max_stage_width.max(1);
+	let distributed_budget = distributed_memory_override.map_or_else(
+		|| execution_census_distributed_budget(width),
+		|bytes| execution_census_distributed_budget_with_memory(width, bytes),
+	);
+	let memory_pool_max_buffer_capacity_bytes =
+		usize::try_from(distributed_budget.memory_per_task.get()).unwrap_or(usize::MAX);
+	let mut workers = Vec::with_capacity(EXECUTION_CENSUS_WORKER_COUNT);
+	for worker_index in 0..EXECUTION_CENSUS_WORKER_COUNT {
+		match spawn_execution_census_worker(
+			worker_index,
+			input.storage.clone(),
+			distributed_budget,
+			memory_pool_max_buffer_capacity_bytes,
+		)
+		.await
+		{
+			Ok(worker) => workers.push(worker),
+			Err(error) => {
+				shutdown_execution_census_workers(workers).await?;
+				return Err(error);
+			}
+		}
+	}
+	let entries = workers
+		.iter()
+		.map(|worker| worker.entry.clone())
+		.collect::<Vec<_>>();
+	let registry = Arc::new(StaticWorkerRegistry::new(entries));
+	let coordinator_memory = Arc::new(MemoryManager::new(
+		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+		memory_pool_max_buffer_capacity_bytes,
+	));
+	let catalog: Arc<dyn Catalog> = Arc::new(preflight.catalog);
+	let coordinator = DistributedQueryCoordinator::new(
+		catalog,
+		registry,
+		coordinator_memory,
+		Arc::new(TcpTransport::new()),
+		execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+		distributed_budget,
+	);
+	let distributed_start = Instant::now();
+	let mut distributed_attempts = 1;
+	let mut transport_retry = false;
+	let mut distributed_result = coordinator.execute_query(&preflight.logical).await;
+	if matches!(distributed_result, Err(QueryError::Io(_))) {
+		transport_retry = true;
+		distributed_attempts += 1;
+		distributed_result = coordinator.execute_query(&preflight.logical).await;
+	}
+	let distributed_elapsed_ms = distributed_start.elapsed().as_secs_f64() * 1000.0;
+	shutdown_execution_census_workers(workers).await?;
+
+	let (classification, reason, distributed_identity, diagnostic_message) =
+		match distributed_result {
+			Ok(batches) => {
+				let identity = execution_identity_facts(&batches)?;
+				let identical = local_identity.digest == identity.digest
+					&& local_identity.row_count == identity.row_count
+					&& local_identity.schema_fingerprint == identity.schema_fingerprint;
+				(
+					if identical {
+						"executes_identical"
+					} else {
+						"executes_divergent"
+					},
+					None,
+					Some(identity),
+					None,
+				)
+			}
+			Err(error) => (
+				"execution_rejected",
+				Some(execution_census_query_error_reason(&error)),
+				None,
+				Some(format!("{error:?}")),
+			),
+		};
+	let (distributed_digest, distributed_row_count, distributed_schema_fingerprint) =
+		distributed_identity.map_or((None, None, None), |identity| {
+			(
+				Some(identity.digest),
+				Some(identity.row_count),
+				identity.schema_fingerprint,
+			)
+		});
+	Ok(ExecutionCensusRow {
+		query: input.query_id.to_string(),
+		scale_factor,
+		mode: mode.to_string(),
+		phase: if classification == "execution_rejected" {
+			Phase::Execute
+		} else {
+			Phase::Compare
+		},
+		classification: classification.to_string(),
+		reason,
+		local_plan_fingerprint: Some(local.plan_fingerprint),
+		distributed_plan_fingerprint: Some(preflight.plan_fingerprint),
+		local_digest: Some(local_identity.digest),
+		distributed_digest,
+		local_row_count: Some(local_identity.row_count),
+		distributed_row_count,
+		local_schema_fingerprint: local_identity.schema_fingerprint,
+		distributed_schema_fingerprint,
+		stage_count: Some(preflight.shape.stage_count),
+		stage_task_counts: Some(preflight.shape.stage_task_counts),
+		admitted_width: Some(width),
+		task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
+		local_memory_bytes: local_budget.memory_per_task.get(),
+		local_spill_bytes: local_budget.spill_bytes_reserved_per_query.get(),
+		distributed_budget,
+		worker_count: EXECUTION_CENSUS_WORKER_COUNT,
+		transport: "tcp_loopback",
+		partition_store: "in_memory",
+		memory_pool_retained_buffers: EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+		memory_pool_max_buffer_capacity_bytes,
+		distributed_attempts,
+		transport_retry,
+		dataset_verification: input.dataset_verification,
+		local_elapsed_ms: Some(local_elapsed_ms),
+		distributed_elapsed_ms: Some(distributed_elapsed_ms),
+		total_elapsed_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+		diagnostic_message,
+	})
+}
+
+/// ADR 529's explicit execution-reachability cell. The persisted and in-memory forms both build
+/// one spec and share its storage between the local oracle and the two production-path workers.
+/// Elapsed fields are diagnostic only; classification is derived from typed walls or total identity.
+pub async fn run_execution_census_query(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<ExecutionCensusRow, String> {
+	let input = match data_source {
+		"memory" => {
+			let spec = build_perf_query_spec(query, mode, scale_factor)?;
+			let (tables, storage) = metadata_storage_from_tables(spec.tables);
+			ExecutionCensusInput {
+				query_id: spec.query_id,
+				sql: spec.sql,
+				tables,
+				storage,
+				dataset_verification: None,
+			}
+		}
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
+			let storage: Arc<dyn StorageScan> = spec.storage;
+			ExecutionCensusInput {
+				query_id: spec.query_id,
+				sql: spec.sql,
+				tables: spec.tables,
+				storage,
+				dataset_verification: Some(spec.dataset_verification),
+			}
+		}
+		other => {
+			return Err(format!(
+				"execution-census --data-source {other:?} is not supported"
+			));
+		}
+	};
+	run_execution_census_input(input, scale_factor, mode, None).await
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
@@ -17335,5 +17934,123 @@ mod adr528_fragment_census {
 		}
 		let jsonl = row.jsonl();
 		assert!(jsonl.contains("\"suite\":\"tpch_fragment_census\""));
+	}
+}
+
+#[cfg(test)]
+mod adr529_execution_census {
+	use super::*;
+
+	fn memory_execution_input(query: &str, sql: Option<Cow<'static, str>>) -> ExecutionCensusInput {
+		let spec = build_perf_query_spec(query, "strict", 0.01).expect("execution census spec");
+		let (tables, storage) = metadata_storage_from_tables(spec.tables);
+		ExecutionCensusInput {
+			query_id: spec.query_id,
+			sql: sql.unwrap_or(spec.sql),
+			tables,
+			storage,
+			dataset_verification: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn two_worker_grouped_aggregate_matches_local_identity() {
+		let input = memory_execution_input(
+			"q06",
+			Some(Cow::Borrowed(
+				"SELECT l_shipdate, COUNT(*) FROM lineitem GROUP BY l_shipdate",
+			)),
+		);
+		let row = run_execution_census_input(input, 0.01, "strict", None)
+			.await
+			.expect("grouped execution census");
+		assert_eq!(row.classification, "executes_identical");
+		assert_eq!(row.worker_count, 2);
+		assert_eq!(row.admitted_width, Some(4));
+		assert_eq!(row.local_digest, row.distributed_digest);
+		assert_eq!(row.local_row_count, row.distributed_row_count);
+		assert_eq!(
+			row.local_schema_fingerprint,
+			row.distributed_schema_fingerprint
+		);
+	}
+
+	#[tokio::test]
+	async fn two_worker_join_matches_local_identity() {
+		let row = run_execution_census_query("q03", "strict", 0.01, "memory", Path::new("unused"))
+			.await
+			.expect("join execution census");
+		assert_eq!(row.classification, "executes_identical");
+		assert_eq!(row.admitted_width, Some(4));
+		assert_eq!(row.local_digest, row.distributed_digest);
+	}
+
+	#[tokio::test]
+	async fn tiny_task_budget_is_a_typed_execution_rejection() {
+		let row = run_execution_census_input(
+			memory_execution_input("q03", None),
+			0.01,
+			"strict",
+			Some(1),
+		)
+		.await
+		.expect("tiny-budget execution census");
+		assert_eq!(row.classification, "execution_rejected");
+		assert_eq!(row.reason.as_deref(), Some("budget_memory"));
+		assert_eq!(row.distributed_budget.memory_per_task.get(), 1);
+		assert!(row.distributed_digest.is_none());
+	}
+
+	#[test]
+	fn envelope_is_per_cell_and_row_disclosure_is_complete() {
+		let sequential = execution_census_distributed_budget(1);
+		let parallel = execution_census_distributed_budget(4);
+		assert_eq!(
+			sequential.memory_per_task.get(),
+			EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES
+		);
+		assert_eq!(sequential.max_in_flight_tasks, Some(1));
+		assert_eq!(parallel.memory_per_task.get(), 512 * 1024 * 1024);
+		assert_eq!(parallel.max_in_flight_tasks, Some(4));
+		assert_eq!(
+			parallel.memory_per_task.get() * 4,
+			EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES
+		);
+		let error = QueryError::Runtime(RuntimeError::TaskFailure {
+			kind: TaskFailureKind::BudgetExhausted {
+				dimension: BudgetDimension::ShuffleBytes,
+				requested: ByteCount::new(2),
+				available: ByteCount::new(1),
+			},
+		});
+		assert_eq!(
+			execution_census_query_error_reason(&error),
+			"budget_shuffle_bytes"
+		);
+	}
+
+	#[tokio::test]
+	async fn execution_row_discloses_the_full_non_timing_coordinate() {
+		let row = run_execution_census_query("q06", "strict", 0.01, "memory", Path::new("unused"))
+			.await
+			.expect("q06 execution census");
+		let value: serde_json::Value =
+			serde_json::from_str(&row.jsonl()).expect("execution census JSON");
+		assert_eq!(value["suite"], "tpch_execution_census");
+		assert_eq!(value["timing_authority"], false);
+		assert_eq!(value["worker_count"], 2);
+		assert_eq!(value["transport"], "tcp_loopback");
+		assert_eq!(value["partition_store"], "in_memory");
+		assert_eq!(value["distributed_attempts"], 1);
+		assert_eq!(value["transport_retry"], false);
+		assert_eq!(
+			value["distributed_budget"]["spill_bytes_reserved_per_query"],
+			EXECUTION_CENSUS_SPILL_BYTES
+		);
+		assert_eq!(value["distributed_budget"]["max_in_flight_tasks"], 1);
+		assert_eq!(
+			value["task_memory_envelope_bytes"],
+			EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES
+		);
 	}
 }

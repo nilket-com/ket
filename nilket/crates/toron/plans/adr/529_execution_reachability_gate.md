@@ -15,9 +15,13 @@ answers?
    `budget.rs:314`). ADR 527 forbade dividing the local executor's budget because one task
    owned the whole query; here the aggregate-holding move IS division plus a frontier cap,
    both native: `memory_per_task = envelope / W` and `QueryBudget::max_in_flight_tasks = W`,
-   with `W` the census-admitted maximum stage width. Aggregate resident memory is bounded by
-   the envelope by construction, receipts disclose both the divisor and the cap, and no new
-   ledger is built. The two `_per_query` dimensions (spill, broadcast-replicated) stay
+   with `W` the cell's census-admitted maximum stage width (`W=4` for the 20 parallel cells,
+   `W=1` for q06). Concurrent task-memory allowances are bounded by the envelope by
+   construction; this is not a claim about whole-process RSS because shuffle-store retention,
+   transport pools, coordinator results, spill, and broadcast copies have separate owners.
+   Receipts disclose the divisor, frontier cap, store choice, memory-manager configuration, and
+   every budget dimension; no new ledger is built. The two `_per_query` dimensions (spill,
+   broadcast-replicated) stay
    query-scoped as named; their per-task copy semantics
    (`from_query_budget` hands each task the full allowance) is a disclosed, known distortion
    this gate observes but does not fix.
@@ -44,15 +48,22 @@ answers?
    the identical spec and requires digest, row count, and output schema equality. The local
    run is the oracle; a distributed answer that differs is `executes_divergent` — the severe
    class that no follow-up may compare or optimize around.
-3. **Envelope (disclosed, explicit):** `W = 4` (the census maximum width);
-   `memory_per_task = 512 MiB` (2 GiB / W); `max_in_flight_tasks = 4`; spill reservation
-   2 GiB per query; shuffle, in-flight, and broadcast dimensions set generously and recorded
-   verbatim on every row. A budget wall at this envelope is an honest capacity finding
+3. **Envelope (disclosed, explicit):** `W = max_stage_width` for the cell;
+   `memory_per_task = 2 GiB / W`; `max_in_flight_tasks = W`; spill reservation 2 GiB per
+   query; shuffle, in-flight, and broadcast dimensions set generously and recorded verbatim
+   on every row. q06 therefore keeps one 2 GiB task rather than being artificially restricted
+   by another cell's width. A budget wall at this envelope is an honest capacity finding
    classified by its exact dimension, never retried at a larger size mid-census.
 4. **Classification vocabulary** (predeclared, receipts only): `executes_identical`,
    `executes_divergent`, `execution_rejected(<typed reason>)` for any distributed-side
-   plan/bind/fragment/dispatch/execute wall, with 528's fragment classifications inherited
-   where the wall is the fragmenter (q15 stays `fragment_rejected`).
+   plan/bind/fragment/dispatch/execute wall. A typed bind/fragment preflight identical to ADR
+   528 runs before the coordinator because the public coordinator erases `FragmentError` and
+   several scheduler variants into `QueryError::Internal`; admitted plans then use an exhaustive
+   match over the coordinator's exposed `QueryError` / `TaskFailureKind` surface. q15 is
+   `execution_rejected(fragment_broadcast_probe_not_star_linear)` at phase `fragment`,
+   preserving ADR 528's typed `BroadcastProbeNotStarLinear` wall under this rail's vocabulary.
+   `QueryError::Internal` is a recognized coarse reason with its diagnostic message, never a
+   fabricated finer type.
 5. **No timing authority.** Elapsed fields are diagnostic. A thread/substrate timing atlas
    is a separate follow-up authorized only over `executes_identical` cells, with thresholds
    predeclared there, and must carry the transport-floor disclosure.

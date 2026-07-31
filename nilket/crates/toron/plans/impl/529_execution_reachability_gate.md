@@ -17,8 +17,9 @@ change, no timing claim.
   `StaticWorkerRegistry`, `DistributedQueryCoordinator::new(catalog, registry, memory,
   TcpTransport, distributed_gauge_planner_config(), envelope)` and `execute_query(&logical)`
   (`coordinator.rs:160,395`);
-- the envelope (disclosed on every row): `W = 4`; `memory_per_task = 536,870,912 B`
-  (2 GiB / W); `max_in_flight_tasks = Some(4)`; `spill_bytes_reserved_per_query =
+- the envelope (disclosed on every row): per-cell `W = max_stage_width` (`4` for the 20
+  parallel cells, `1` for q06); `memory_per_task = 2,147,483,648 B / W`;
+  `max_in_flight_tasks = Some(W)`; `spill_bytes_reserved_per_query =
   2,147,483,648 B`; shuffle/in-flight/broadcast dimensions generous, exact values recorded
   at implementation and pinned by the knob-contract test;
 - the oracle: the untouched local gauge funnel on the same spec; identity =
@@ -33,6 +34,14 @@ The shuffle store choice decides whether sf=8 intermediates live in RAM. Ground
 matching production capacity semantics, name it in the row, and record why. This is a
 selection among existing stores — building or modifying a store is out of scope.
 
+Grounding verdict: select `InMemoryPartitionStore::with_budget`. It is the store constructed by
+the production daemon and fixture worker today (`daemon.rs:245`,
+`bin/toron_fixture_worker.rs:26`); selecting a hybrid or encrypted spill store would introduce a
+capacity path the production worker does not use. The row records the store budget and the
+coordinator/worker `MemoryManager` pool configuration. The fixed 2 GiB statement applies only to
+concurrent task-memory allowances; store, transport, result, spill, and broadcast ownership are
+separately disclosed.
+
 ## Step 1 - execution-census rail
 
 1. Library entry `run_execution_census_query`: build the persisted spec once; arm 1 runs the
@@ -44,10 +53,14 @@ selection among existing stores — building or modifying a store is out of scop
    choice, and the typed wall (reason + message) on rejection.
 2. Classification derives from receipts: `executes_identical` (all three identity facts
    equal), `executes_divergent` (distributed answered, any identity fact differs),
-   `execution_rejected(<reason>)` (coordinator error — classified by an exhaustive match
-   over the distributed error surface, reusing 528's `classify_fragment_error` for fragment
-   walls and typed budget-dimension slugs for `BudgetExhausted` walls; nothing lands
-   unrecognized).
+   `execution_rejected(<reason>)`. Before coordinator execution, repeat ADR 528's typed bind and
+   fragment preflight; its `FragmentError` is classified exhaustively by
+   `classify_fragment_error`. For admitted plans, classify the exposed `QueryError` outer enum,
+   nested `ExecutionError`, and `RuntimeError::TaskFailure`/`TaskFailureKind` exhaustively;
+   budget reasons include their typed dimension. `QueryError::Internal` is the recognized
+   `query_internal` reason with its message because the coordinator intentionally erases several
+   internal source types at that boundary. Nothing lands in an unrecognized bucket and no string
+   parsing counterfeits a typed wall.
 3. `execution-census` command mirroring `fragment-census`: q01-q22 or `--query`, JSONL +
    human rows + histogram + summary; exits nonzero only on harness errors, never on an
    honest wall.
@@ -68,7 +81,8 @@ binary from the sealed identity.
 
 From the sealed binary: q01-q22, strict sf=8 persisted, full-hash, the disclosed envelope,
 join-spill scratch cleared first, one run per cell (identity is deterministic; a transport
-flake retries once and is noted on the row). Elapsed recorded as diagnostic only.
+flake exposed as `QueryError::Io` retries once and is noted by `distributed_attempts` and
+`transport_retry` on the row). Elapsed recorded as diagnostic only; no other wall retries.
 
 ## Step 4 - predeclared verdict and receipt
 

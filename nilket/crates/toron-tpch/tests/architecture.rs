@@ -221,16 +221,17 @@ fn adr297_q08_reuses_q05_tables_plus_one_physical_nation() {
 fn adr430_tpch_execution_paths_share_disk_backed_join_spill_placement() {
 	let lib = source("src/lib.rs");
 	assert_eq!(
-		lib.matches("let context = tpch_execution_context(task_telemetry.clone());")
-			.count(),
-		2,
-		"both TPC-H executor context sites must use the centralized constructor"
+		lib.matches("ExecutionContext::local_test()").count(),
+		1,
+		"all TPC-H contexts, including explicit-budget census contexts, must use one constructor"
 	);
 	assert!(
-		lib.contains("fn tpch_execution_context(")
+		lib.contains("fn tpch_execution_context_with_budget(")
+			&& lib.contains("fn tpch_execution_context(")
+			&& lib.contains("tpch_execution_context_with_budget(task_telemetry, budget)")
 			&& lib.contains(".with_join_spill_store(")
 			&& lib.contains("PathBuf::from(CACHE_ROOT).join(\"join_spill\")"),
-		"the centralized context must keep join spill under the untracked TPC-H cache root"
+		"the centralized default/explicit-budget contexts must share untracked join-spill placement"
 	);
 }
 
@@ -325,5 +326,33 @@ fn adr528_fragment_census_posture_and_phase_do_not_leak() {
 	assert!(
 		source("src/telemetry.rs").contains("\"tpch_fragment_census\""),
 		"the census suite name is pinned"
+	);
+}
+
+#[test]
+fn adr529_execution_census_is_explicit_and_does_not_leak_workers() {
+	let lib = source("src/lib.rs");
+	let main = source("src/main.rs");
+	let telemetry = source("src/telemetry.rs");
+	assert!(main.contains("\"execution-census\" => execution_census_command"));
+	assert!(telemetry.contains("\"tpch_execution_census\""));
+	assert_eq!(
+		lib.matches("DistributedQueryCoordinator::new(").count(),
+		1,
+		"the explicit ADR 529 rail is the harness library's sole coordinator constructor"
+	);
+	assert_eq!(
+		lib.matches("ToronWorker::with_partition_store_and_endpoint(")
+			.count(),
+		1,
+		"the explicit ADR 529 rail is the harness library's sole worker constructor"
+	);
+	assert!(
+		lib.contains("InMemoryPartitionStore::with_budget(budget)"),
+		"the census must retain the production worker's in-memory partition store semantics"
+	);
+	assert!(
+		!main.contains("Phase::Fragment"),
+		"the CLI cannot counterfeit a typed preflight phase"
 	);
 }
