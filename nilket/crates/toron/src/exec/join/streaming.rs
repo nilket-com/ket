@@ -1634,6 +1634,17 @@ impl SuffixProbeBuildFactsCache {
 	) -> SuffixProbeBuildFacts {
 		*self.facts.get_or_insert_with(build)
 	}
+
+	fn lifecycle_facts(&self) -> Option<(u64, u64)> {
+		self.facts.map(|facts| {
+			(
+				facts.build_rows,
+				facts
+					.build_batch_bytes
+					.saturating_add(facts.shape.index_accounted_bytes),
+			)
+		})
+	}
 }
 
 #[derive(Default)]
@@ -2170,6 +2181,32 @@ impl ReorientedInnerJoinRuntime<'_> {
 		}
 	}
 
+	/// ADR 525 reads only ownership facts the existing suffix profiler already cached. In-memory
+	/// builds with no probe observation return `None`; the attribution profile then fails closed
+	/// instead of adding a second entry walk merely to manufacture a receipt.
+	fn cached_lifecycle_facts(&self) -> Option<(u64, u64)> {
+		match &self.build {
+			ReorientedInnerJoinBuild::InMemory {
+				suffix_profile_build,
+				..
+			} => suffix_profile_build.lifecycle_facts(),
+			ReorientedInnerJoinBuild::Spilled { build, .. } => {
+				Some((build.input_row_count(), build.retained_resident_bytes()))
+			}
+			ReorientedInnerJoinBuild::PartitionedScan {
+				observed_build_rows,
+				loaded_builds,
+				loaded_resident_bytes,
+				..
+			} => Some((
+				*observed_build_rows,
+				loaded_resident_bytes.saturating_add(summary_bytes::<
+					Option<LoadedSpilledInnerBuild>,
+				>(loaded_builds.capacity())),
+			)),
+		}
+	}
+
 	pub(in crate::exec) async fn cleanup(self) {
 		if let ReorientedInnerJoinBuild::Spilled { build, .. } = self.build {
 			build.cleanup().await;
@@ -2422,6 +2459,16 @@ fn scan_probe_base_variants(
 		.collect();
 	for stage in stages {
 		let replay = Some(u64::from(stage.replay_id.0));
+		for (name, parent) in [
+			("prep_build", Some("runtime_prep")),
+			("cleanup_build", Some("cleanup")),
+		] {
+			required.push(RequiredStage {
+				name,
+				parent,
+				replay,
+			});
+		}
 		required.push(RequiredStage {
 			name: "suffix_probe",
 			parent: None,
@@ -11328,9 +11375,22 @@ impl Executor {
 			.as_ref()
 			.and_then(|h| node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry));
 		for (stage_index, stage) in stages.into_iter().enumerate() {
+			let replay_id = u64::from(stage.replay_id.0);
+			let prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"runtime_prep",
+					"prep_build",
+					replay_id,
+					&attribution_telemetry,
+				)
+			});
 			if stage_index + 1 == stage_count
 				&& self.reoriented_terminal_scan_build_estimated_over_cap(&stage, morsel)
 			{
+				if let Some(timer) = prep_build_stage {
+					node_attribution::close_stage(timer, &attribution_telemetry);
+				}
 				deferred_stream_stage = Some((stage, None, true));
 				break;
 			}
@@ -11356,10 +11416,16 @@ impl Executor {
 			let scan_build_decision = if stage_index + 1 == stage_count {
 				match scan_build_decision {
 					ReorientedStageScanBuildDecision::Stream => {
+						if let Some(timer) = prep_build_stage {
+							node_attribution::close_stage(timer, &attribution_telemetry);
+						}
 						deferred_stream_stage = Some((stage, None, false));
 						break;
 					}
 					ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches) => {
+						if let Some(timer) = prep_build_stage {
+							node_attribution::close_stage(timer, &attribution_telemetry);
+						}
 						deferred_stream_stage = Some((stage, Some(batches), false));
 						break;
 					}
@@ -11389,8 +11455,14 @@ impl Executor {
 				}
 			};
 			let Some(runtime) = runtime else {
+				if let Some(timer) = prep_build_stage {
+					node_attribution::close_stage(timer, &attribution_telemetry);
+				}
 				return Ok(None);
 			};
+			if let Some(timer) = prep_build_stage {
+				node_attribution::close_stage(timer, &attribution_telemetry);
+			}
 			runtimes.push(runtime);
 		}
 		if let Some(stage) = prep_stage {
@@ -11405,9 +11477,28 @@ impl Executor {
 		// does not describe it.
 		let mut committed_branch: Option<&'static str> = None;
 		if let Some((stage, scan_probe_batches, needs_decision_fallback)) = deferred_stream_stage {
-			if let Some(candidate) =
-				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel)?
-			{
+			let replay_id = u64::from(stage.replay_id.0);
+			let adaptive_prep_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_stage(handle, "runtime_prep", &attribution_telemetry)
+			});
+			let adaptive_prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"runtime_prep",
+					"prep_build",
+					replay_id,
+					&attribution_telemetry,
+				)
+			});
+			let adaptive_candidate =
+				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel);
+			if let Some(timer) = adaptive_prep_build_stage {
+				node_attribution::close_stage(timer, &attribution_telemetry);
+			}
+			if let Some(timer) = adaptive_prep_stage {
+				node_attribution::close_stage(timer, &attribution_telemetry);
+			}
+			if let Some(candidate) = adaptive_candidate? {
 				runtimes.push(candidate);
 				committed_branch = Some("adaptive_last_stage");
 				matched = self
@@ -11434,6 +11525,15 @@ impl Executor {
 				// still runtime preparation, merged into the same stage as the loop above.
 				let prep_stage = stage_handle.as_ref().and_then(|h| {
 					node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry)
+				});
+				let prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+					node_attribution::open_replay_substage(
+						handle,
+						"runtime_prep",
+						"prep_build",
+						replay_id,
+						&attribution_telemetry,
+					)
 				});
 				let runtime = if needs_decision_fallback {
 					let scan_build_decision = if force_stream_projected_filtered_base
@@ -11484,11 +11584,20 @@ impl Executor {
 					.await?
 				};
 				let Some(runtime) = runtime else {
+					if let Some(timer) = prep_build_stage {
+						node_attribution::close_stage(timer, &attribution_telemetry);
+					}
+					if let Some(timer) = prep_stage {
+						node_attribution::close_stage(timer, &attribution_telemetry);
+					}
 					for runtime in runtimes {
 						runtime.cleanup().await;
 					}
 					return Ok(None);
 				};
+				if let Some(timer) = prep_build_stage {
+					node_attribution::close_stage(timer, &attribution_telemetry);
+				}
 				runtimes.push(runtime);
 				if let Some(stage) = prep_stage {
 					node_attribution::close_stage(stage, &attribution_telemetry);
@@ -11619,11 +11728,48 @@ impl Executor {
 		let cleanup_stage = stage_handle
 			.as_ref()
 			.and_then(|h| node_attribution::open_stage(h, "cleanup", &attribution_telemetry));
+		let mut lifecycle_facts = stage_handle
+			.as_ref()
+			.map(|_| Vec::with_capacity(runtimes.len()));
 		for runtime in runtimes {
+			let replay_id = u64::from(runtime.replay_id.0);
+			if let Some(facts) = lifecycle_facts.as_mut() {
+				facts.push((replay_id, runtime.cached_lifecycle_facts()));
+			}
+			let cleanup_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"cleanup",
+					"cleanup_build",
+					replay_id,
+					&attribution_telemetry,
+				)
+			});
 			runtime.cleanup().await;
+			if let Some(timer) = cleanup_build_stage {
+				node_attribution::close_stage(timer, &attribution_telemetry);
+			}
 		}
 		if let Some(stage) = cleanup_stage {
 			node_attribution::close_stage(stage, &attribution_telemetry);
+		}
+		if let (Some(handle), Some(facts)) = (stage_handle.as_ref(), lifecycle_facts) {
+			for (replay_id, facts) in facts {
+				if let Some((rows, retained_bytes)) = facts {
+					for (parent, name) in
+						[("runtime_prep", "prep_build"), ("cleanup", "cleanup_build")]
+					{
+						node_attribution::record_replay_stage_facts(
+							handle,
+							parent,
+							name,
+							replay_id,
+							rows,
+							retained_bytes,
+						)?;
+					}
+				}
+			}
 		}
 		if let Some(timer) = cleanup_timer {
 			timer.finish()?;
@@ -18568,6 +18714,12 @@ mod tests {
 			constructions.get(),
 			1,
 			"the O(build entries) shape walk must run once per runtime, not once per suffix call"
+		);
+		assert_eq!(cache.lifecycle_facts(), Some((4, 320)));
+		assert_eq!(
+			constructions.get(),
+			1,
+			"ADR 525 lifecycle facts must reuse the cached walk"
 		);
 	}
 

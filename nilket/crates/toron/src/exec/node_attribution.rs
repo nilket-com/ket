@@ -337,6 +337,10 @@ struct HandlerStage {
 	/// against the parent instance carrying its own replay — without this, one record would satisfy an
 	/// N-replay chain and children from several replays would reconcile against the first parent found.
 	replay: Option<u64>,
+	/// Optional lifecycle facts attached after the runtime has been exercised. ADR 525 reuses the
+	/// existing once-per-runtime suffix-build cache rather than walking build ownership a second time.
+	rows: Option<u64>,
+	retained_bytes: Option<u64>,
 	outcome: StageOutcome,
 }
 
@@ -778,6 +782,8 @@ impl NodeAccounting {
 						calls: observation.calls,
 						parent: Some("suffix_probe"),
 						replay: Some(observation.replay_id),
+						rows: None,
+						retained_bytes: None,
 						outcome: StageOutcome::Reconciled {
 							micros,
 							spill_bytes: 0,
@@ -1024,9 +1030,53 @@ impl NodeAccounting {
 				calls: 1,
 				parent,
 				replay,
+				rows: None,
+				retained_bytes: None,
 				outcome,
 			},
 		);
+	}
+
+	fn record_stage_facts(
+		&mut self,
+		id: u64,
+		parent: &'static str,
+		name: &'static str,
+		replay: u64,
+		rows: u64,
+		retained_bytes: u64,
+	) -> Result<(), &'static str> {
+		let frame = self
+			.stack
+			.iter_mut()
+			.find(|frame| frame.id == id)
+			.ok_or("stage facts recorded after their invocation exited")?;
+		let stages = match frame.pending.as_mut() {
+			Some(pending) => &mut pending.stages,
+			None => &mut frame.stages,
+		};
+		let stage = stages
+			.iter_mut()
+			.find(|stage| {
+				stage.name == name && stage.parent == Some(parent) && stage.replay == Some(replay)
+			})
+			.ok_or("stage facts have no matching replay child")?;
+		match (stage.rows, stage.retained_bytes) {
+			(None, None) => {
+				stage.rows = Some(rows);
+				stage.retained_bytes = Some(retained_bytes);
+				Ok(())
+			}
+			(Some(existing_rows), Some(existing_bytes))
+				if existing_rows == rows && existing_bytes == retained_bytes =>
+			{
+				Ok(())
+			}
+			_ => {
+				stage.outcome = StageOutcome::Failed("replay child facts changed");
+				Err("replay child facts changed")
+			}
+		}
 	}
 
 	/// Merge a stage instance into a list, keyed by `(name, parent, replay)` — a repeat merges only
@@ -1037,6 +1087,24 @@ impl NodeAccounting {
 			s.name == incoming.name && s.parent == incoming.parent && s.replay == incoming.replay
 		}) {
 			existing.calls = existing.calls.saturating_add(incoming.calls);
+			match (
+				existing.rows,
+				existing.retained_bytes,
+				incoming.rows,
+				incoming.retained_bytes,
+			) {
+				(None, None, rows, retained_bytes) => {
+					existing.rows = rows;
+					existing.retained_bytes = retained_bytes;
+				}
+				(_, _, None, None) => {}
+				(Some(a_rows), Some(a_bytes), Some(b_rows), Some(b_bytes))
+					if a_rows == b_rows && a_bytes == b_bytes => {}
+				_ => {
+					existing.outcome = StageOutcome::Failed("repeated stage facts changed");
+					return;
+				}
+			}
 			existing.outcome = match (existing.outcome, incoming.outcome) {
 				(
 					StageOutcome::Reconciled {
@@ -1522,6 +1590,42 @@ pub(in crate::exec) fn close_stage(
 	}
 }
 
+/// Attach the already-cached build ownership facts to one replay-partition child. Facts are
+/// deliberately separate from the clock: discovering them after probing must not widen the prep or
+/// cleanup timing region, and a missing/mismatched child fails the profile rather than inventing one.
+pub(in crate::exec) fn record_replay_stage_facts(
+	handle: &VocabularyHandle,
+	parent: &'static str,
+	name: &'static str,
+	replay: u64,
+	rows: u64,
+	retained_bytes: u64,
+) -> Result<(), ExecutionError> {
+	if !enabled() {
+		return Ok(());
+	}
+	let result = NODE_LEDGER
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "node attribution ledger mutex poisoned".to_string(),
+		})?
+		.as_mut()
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "node attribution stage facts have no active ledger".to_string(),
+		})?
+		.record_stage_facts(
+			handle.invocation_id,
+			parent,
+			name,
+			replay,
+			rows,
+			retained_bytes,
+		);
+	result.map_err(|reason| ExecutionError::Kernel {
+		message: format!("node attribution stage facts failed: {reason}"),
+	})
+}
+
 /// Close a handler span that *won* its dispatch. The nested `execute_bound` children the handler drove
 /// are subtracted here, so the recorded attribution is exclusive — the same domain as the node's
 /// exclusive cost, which is what makes the bridge's residual meaningful. A losing arm never closes its
@@ -1676,6 +1780,54 @@ fn bridge_value(invocation: &AggregateInvocation) -> serde_json::Value {
 /// numbers mean anything: every promised stage observed, and the un-staged remainder inside the
 /// boundary the vocabulary declared. A vocabulary that records nothing reconciles perfectly and
 /// explains nothing — arithmetic passes, coverage fails, and `passed` requires both.
+#[derive(Debug, PartialEq, Eq)]
+struct ReplayPartitionReconciliation {
+	parent_micros: u64,
+	attributed_micros: u64,
+	residual_micros: u64,
+	replay_ids: Vec<u64>,
+}
+
+/// ADR 525's one new reconciliation shape: replay children partition one invocation-scoped parent.
+/// The helper accepts raw rows so every fail-closed branch is testable without relying on the stage
+/// merger to manufacture an otherwise-unrepresentable duplicate.
+fn reconcile_replay_partition(
+	parent_micros: Option<u64>,
+	required_replays: &[u64],
+	children: &[(u64, u64)],
+) -> Result<ReplayPartitionReconciliation, &'static str> {
+	let parent_micros = parent_micros.ok_or("partition_parent_not_reconciled")?;
+	let mut required = required_replays.to_vec();
+	required.sort_unstable();
+	if required.windows(2).any(|ids| ids[0] == ids[1]) {
+		return Err("partition_required_replay_id_duplicated");
+	}
+	let mut observed = children
+		.iter()
+		.map(|(replay, _)| *replay)
+		.collect::<Vec<_>>();
+	observed.sort_unstable();
+	if observed.windows(2).any(|ids| ids[0] == ids[1]) {
+		return Err("partition_replay_id_duplicated");
+	}
+	if observed != required {
+		return Err("partition_replay_coverage_incomplete");
+	}
+	let attributed_micros = children
+		.iter()
+		.try_fold(0u64, |total, (_, micros)| total.checked_add(*micros))
+		.ok_or("partition_child_time_overflowed")?;
+	let residual_micros = parent_micros
+		.checked_sub(attributed_micros)
+		.ok_or("partition_children_exceed_parent")?;
+	Ok(ReplayPartitionReconciliation {
+		parent_micros,
+		attributed_micros,
+		residual_micros,
+		replay_ids: observed,
+	})
+}
+
 fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> serde_json::Value {
 	// A declaration misuse dominates every other verdict: whatever definition survived it cannot be
 	// trusted to describe the measurement, so nothing downstream is computed.
@@ -1822,6 +1974,8 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 				"micros": micros,
 				"spill_bytes": spill_bytes,
 				"calls": stage.calls,
+				"rows": stage.rows,
+				"retained_bytes": stage.retained_bytes,
 				// A stage that observed calls but measured zero is below the timer's resolution, not
 				// free. Each call loses strictly less than one tick to truncation, so `calls` bounds
 				// the LOSS — a nonzero stage's true cost is bounded by `micros + calls`, not by
@@ -1838,73 +1992,164 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 				"parent": stage.parent,
 				"replay_id": stage.replay,
 				"calls": stage.calls,
+				"rows": stage.rows,
+				"retained_bytes": stage.retained_bytes,
 				"error": reason,
 			}),
 		})
 		.collect::<Vec<_>>();
-	// Each refined parent INSTANCE gets its own reconciliation link: sub-stages ⊆ that instance's
-	// micros. The instance is `(name, replay)` — parent lookup and child grouping are both
-	// replay-scoped, or children from several replays would all reconcile against the first parent
-	// whose name matched, silently mixing replays.
+	// Refinements normally reconcile per `(parent, replay)` instance. ADR 525 adds exactly one other
+	// shape: replay-scoped children partition one invocation-scoped parent, with one explicit global
+	// residual. The two shapes are mutually exclusive and a mixed shape fails closed.
 	let mut refinements = Vec::new();
-	let mut refined_parents: Vec<(&'static str, Option<u64>)> = Vec::new();
+	let mut refined_parent_names: Vec<&'static str> = Vec::new();
 	for stage in &invocation.stages {
 		if let Some(parent) = stage.parent
-			&& !refined_parents.contains(&(parent, stage.replay))
+			&& !refined_parent_names.contains(&parent)
 		{
-			refined_parents.push((parent, stage.replay));
+			refined_parent_names.push(parent);
 		}
 	}
 	let mut refinements_reconciled = true;
-	for (parent, replay) in refined_parents {
-		let parent_micros = invocation
+	for parent in refined_parent_names {
+		let children = invocation
 			.stages
 			.iter()
-			.find(|s| s.name == parent && s.parent.is_none() && s.replay == replay)
-			.and_then(|s| s.outcome.reconciled())
+			.filter(|stage| stage.parent == Some(parent))
+			.collect::<Vec<_>>();
+		let invocation_parent_micros = invocation
+			.stages
+			.iter()
+			.find(|stage| stage.name == parent && stage.parent.is_none() && stage.replay.is_none())
+			.and_then(|stage| stage.outcome.reconciled())
 			.map(|(micros, _)| micros);
-		let child_micros = invocation
-			.stages
-			.iter()
-			.filter(|s| s.parent == Some(parent) && s.replay == replay)
-			.fold(0u64, |total, s| {
-				total.saturating_add(s.outcome.reconciled().map_or(0, |(micros, _)| micros))
-			});
-		let entry = match parent_micros {
-			None => {
-				refinements_reconciled = false;
-				serde_json::json!({
-					"parent": parent,
-					"replay_id": replay,
-					"status": "parent_stage_not_reconciled",
-					"passed": false,
+		let all_children_replayed = children.iter().all(|child| child.replay.is_some());
+		let any_child_replayed = children.iter().any(|child| child.replay.is_some());
+		if invocation_parent_micros.is_some() && all_children_replayed {
+			let child_rows = children
+				.iter()
+				.map(|child| {
+					let replay = child.replay.ok_or("partition_child_lacks_replay_id")?;
+					let micros = child
+						.outcome
+						.reconciled()
+						.map(|(micros, _)| micros)
+						.ok_or("partition_child_not_reconciled")?;
+					if child.rows.is_none() || child.retained_bytes.is_none() {
+						return Err("partition_child_facts_missing");
+					}
+					Ok((replay, micros))
 				})
-			}
-			Some(parent_micros) => {
-				match stage_attribution::reconcile_stage_within_drive(child_micros, parent_micros) {
-					Ok(residual) => serde_json::json!({
+				.collect::<Result<Vec<_>, &'static str>>();
+			let required_replays = vocabulary
+				.required_stages
+				.entries()
+				.filter_map(|(_, required_parent, replay)| {
+					(required_parent == Some(parent))
+						.then_some(replay)
+						.flatten()
+				})
+				.collect::<Vec<_>>();
+			let partition = child_rows.and_then(|children| {
+				reconcile_replay_partition(invocation_parent_micros, &required_replays, &children)
+			});
+			let entry = match partition {
+				Ok(partition) => serde_json::json!({
+					"parent": parent,
+					"replay_id": null,
+					"scope": "invocation_parent_replay_partition",
+					"status": "reconciled",
+					"replay_ids": partition.replay_ids,
+					"attributed_micros": partition.attributed_micros,
+					"parent_micros": partition.parent_micros,
+					"residual_micros": partition.residual_micros,
+					"passed": true,
+				}),
+				Err(error) => {
+					refinements_reconciled = false;
+					serde_json::json!({
+						"parent": parent,
+						"replay_id": null,
+						"scope": "invocation_parent_replay_partition",
+						"status": error,
+						"passed": false,
+					})
+				}
+			};
+			refinements.push(entry);
+			continue;
+		}
+		if invocation_parent_micros.is_some() && any_child_replayed {
+			refinements_reconciled = false;
+			refinements.push(serde_json::json!({
+				"parent": parent,
+				"replay_id": null,
+				"scope": "invocation_parent_replay_partition",
+				"status": "partition_replay_scope_mixed",
+				"passed": false,
+			}));
+			continue;
+		}
+
+		let mut replay_ids = children
+			.iter()
+			.map(|stage| stage.replay)
+			.collect::<Vec<_>>();
+		replay_ids.sort_unstable();
+		replay_ids.dedup();
+		for replay in replay_ids {
+			let parent_micros = invocation
+				.stages
+				.iter()
+				.find(|s| s.name == parent && s.parent.is_none() && s.replay == replay)
+				.and_then(|s| s.outcome.reconciled())
+				.map(|(micros, _)| micros);
+			let child_micros =
+				children
+					.iter()
+					.filter(|s| s.replay == replay)
+					.fold(0u64, |total, s| {
+						total.saturating_add(s.outcome.reconciled().map_or(0, |(micros, _)| micros))
+					});
+			let entry = match parent_micros {
+				None => {
+					refinements_reconciled = false;
+					serde_json::json!({
 						"parent": parent,
 						"replay_id": replay,
-						"status": "reconciled",
-						"attributed_micros": child_micros,
-						"parent_micros": parent_micros,
-						"residual_micros": residual,
-						"passed": true,
-					}),
-					Err(error) => {
-						refinements_reconciled = false;
-						serde_json::json!({
+						"status": "parent_stage_not_reconciled",
+						"passed": false,
+					})
+				}
+				Some(parent_micros) => {
+					match stage_attribution::reconcile_stage_within_drive(
+						child_micros,
+						parent_micros,
+					) {
+						Ok(residual) => serde_json::json!({
 							"parent": parent,
 							"replay_id": replay,
-							"status": "refinement_exceeds_parent_stage",
-							"error": error.to_string(),
-							"passed": false,
-						})
+							"status": "reconciled",
+							"attributed_micros": child_micros,
+							"parent_micros": parent_micros,
+							"residual_micros": residual,
+							"passed": true,
+						}),
+						Err(error) => {
+							refinements_reconciled = false;
+							serde_json::json!({
+								"parent": parent,
+								"replay_id": replay,
+								"status": "refinement_exceeds_parent_stage",
+								"error": error.to_string(),
+								"passed": false,
+							})
+						}
 					}
 				}
-			}
-		};
-		refinements.push(entry);
+			};
+			refinements.push(entry);
+		}
 	}
 	let suffix_profiles_reconciled = invocation
 		.suffix_probes
@@ -2669,6 +2914,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 600,
 						spill_bytes: 0,
@@ -2679,6 +2926,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 350,
 						spill_bytes: 0,
@@ -2717,6 +2966,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 900,
 						spill_bytes: 0,
@@ -2727,6 +2978,8 @@ mod tests {
 					calls: 400,
 					parent: Some("fold"),
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 0,
 						spill_bytes: 0,
@@ -2737,6 +2990,8 @@ mod tests {
 					calls: 400,
 					parent: Some("fold"),
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 5,
 						spill_bytes: 0,
@@ -2797,6 +3052,8 @@ mod tests {
 				calls: 1,
 				parent: None,
 				replay: None,
+				rows: None,
+				retained_bytes: None,
 				outcome: StageOutcome::Reconciled {
 					micros: 5_000,
 					spill_bytes: 0,
@@ -2835,6 +3092,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 100,
 						spill_bytes: 400,
@@ -2845,6 +3104,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 100,
 						spill_bytes: 600,
@@ -2913,6 +3174,8 @@ mod tests {
 				calls: 1,
 				parent: None,
 				replay: None,
+				rows: None,
+				retained_bytes: None,
 				outcome: StageOutcome::Reconciled {
 					micros: 999,
 					spill_bytes: 0,
@@ -2937,6 +3200,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 100,
 						spill_bytes: 0,
@@ -2947,6 +3212,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 100,
 						spill_bytes: 0,
@@ -2971,6 +3238,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 500,
 						spill_bytes: 0,
@@ -2981,6 +3250,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 499,
 						spill_bytes: 0,
@@ -3007,6 +3278,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 500,
 						spill_bytes: 0,
@@ -3017,6 +3290,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Failed(
 						"stage span is smaller than the children it drove",
 					),
@@ -3052,6 +3327,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 500,
 						spill_bytes: 0,
@@ -3062,6 +3339,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 499,
 						spill_bytes: 0,
@@ -3208,6 +3487,8 @@ mod tests {
 				calls: 1,
 				parent: None,
 				replay: None,
+				rows: None,
+				retained_bytes: None,
 				outcome: StageOutcome::Reconciled {
 					micros: 950,
 					spill_bytes: 0,
@@ -3225,6 +3506,8 @@ mod tests {
 				calls: 1,
 				parent: Some("fold"),
 				replay: None,
+				rows: None,
+				retained_bytes: None,
 				outcome: StageOutcome::Reconciled {
 					micros,
 					spill_bytes: 0,
@@ -3249,6 +3532,8 @@ mod tests {
 			calls: 1,
 			parent: Some("fold"),
 			replay: None,
+			rows: None,
+			retained_bytes: None,
 			outcome: StageOutcome::Reconciled {
 				micros: 5_000,
 				spill_bytes: 0,
@@ -3290,6 +3575,8 @@ mod tests {
 					calls: 1,
 					parent: None,
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 950,
 						spill_bytes: 0,
@@ -3300,6 +3587,8 @@ mod tests {
 					calls: 1,
 					parent: Some(parent),
 					replay: None,
+					rows: None,
+					retained_bytes: None,
 					outcome: StageOutcome::Reconciled {
 						micros: 900,
 						spill_bytes: 0,
@@ -3398,6 +3687,8 @@ mod tests {
 			calls: 1,
 			parent: None,
 			replay: Some(replay),
+			rows: None,
+			retained_bytes: None,
 			outcome: StageOutcome::Reconciled {
 				micros,
 				spill_bytes: spill,
@@ -3416,6 +3707,103 @@ mod tests {
 			started: Instant::now(),
 			spill_before: 0,
 		}
+	}
+
+	#[test]
+	fn adr525_replay_partition_is_complete_unique_bounded_and_explicit() {
+		let partition =
+			reconcile_replay_partition(Some(1_000), &[1, 2, 3], &[(3, 100), (1, 200), (2, 300)])
+				.expect("valid replay partition");
+		assert_eq!(partition.replay_ids, vec![1, 2, 3]);
+		assert_eq!(partition.attributed_micros, 600);
+		assert_eq!(partition.residual_micros, 400);
+
+		assert_eq!(
+			reconcile_replay_partition(Some(1_000), &[1, 2], &[(1, 100), (1, 200)]),
+			Err("partition_replay_id_duplicated")
+		);
+		assert_eq!(
+			reconcile_replay_partition(Some(1_000), &[1, 2], &[(1, 100)]),
+			Err("partition_replay_coverage_incomplete")
+		);
+		assert_eq!(
+			reconcile_replay_partition(Some(100), &[1, 2], &[(1, 60), (2, 50)]),
+			Err("partition_children_exceed_parent")
+		);
+		assert_eq!(
+			reconcile_replay_partition(None, &[1], &[(1, 10)]),
+			Err("partition_parent_not_reconciled"),
+			"without the parent no explicit residual can be formed"
+		);
+	}
+
+	#[test]
+	fn adr525_global_parent_replay_children_emit_one_partition_receipt() {
+		let required_stages = RequiredStages::Owned(vec![
+			RequiredStage {
+				name: "runtime_prep",
+				parent: None,
+				replay: None,
+			},
+			RequiredStage {
+				name: "prep_build",
+				parent: Some("runtime_prep"),
+				replay: Some(1),
+			},
+			RequiredStage {
+				name: "prep_build",
+				parent: Some("runtime_prep"),
+				replay: Some(2),
+			},
+		]);
+		let mut invocation = invocation_with_stages(
+			1_000,
+			0,
+			Some(Vocabulary {
+				invocation_id: 3,
+				name: "scan_probe_base",
+				spill: SpillCounterKind::Flow,
+				required_stages,
+				residual_boundary_micros: 200,
+			}),
+			vec![HandlerStage {
+				name: "runtime_prep",
+				calls: 1,
+				parent: None,
+				replay: None,
+				rows: None,
+				retained_bytes: None,
+				outcome: StageOutcome::Reconciled {
+					micros: 900,
+					spill_bytes: 0,
+				},
+			}],
+		);
+		for (replay, micros, rows, bytes) in [(1, 300, 10, 100), (2, 500, 20, 200)] {
+			invocation.stages.push(HandlerStage {
+				name: "prep_build",
+				calls: 1,
+				parent: Some("runtime_prep"),
+				replay: Some(replay),
+				rows: Some(rows),
+				retained_bytes: Some(bytes),
+				outcome: StageOutcome::Reconciled {
+					micros,
+					spill_bytes: 0,
+				},
+			});
+		}
+		let value = stages_value(&invocation, &[]);
+		assert_eq!(value["refinements_reconciled"], true);
+		assert_eq!(value["refinements"].as_array().unwrap().len(), 1);
+		let partition = &value["refinements"][0];
+		assert_eq!(partition["scope"], "invocation_parent_replay_partition");
+		assert_eq!(partition["replay_ids"], serde_json::json!([1, 2]));
+		assert_eq!(partition["attributed_micros"], 800);
+		assert_eq!(partition["parent_micros"], 900);
+		assert_eq!(partition["residual_micros"], 100);
+		assert!(partition.get("residual_micros").is_some());
+		assert_eq!(value["passed"], true);
 	}
 
 	fn suffix_observation(replay_id: u64, supported: bool) -> SuffixProbeObservation {
@@ -3525,6 +3913,8 @@ mod tests {
 			calls: 1,
 			parent,
 			replay,
+			rows: None,
+			retained_bytes: None,
 			outcome: StageOutcome::Reconciled {
 				micros,
 				spill_bytes: 0,
@@ -3801,6 +4191,8 @@ mod tests {
 				calls: 1,
 				parent: Some("suffix_probe"),
 				replay: Some(replay),
+				rows: None,
+				retained_bytes: None,
 				outcome: StageOutcome::Reconciled {
 					micros: 450,
 					spill_bytes: 0,
@@ -3867,6 +4259,8 @@ mod tests {
 			calls: 1,
 			parent: None,
 			replay: None,
+			rows: None,
+			retained_bytes: None,
 			outcome: StageOutcome::Reconciled {
 				micros,
 				spill_bytes: 0,
