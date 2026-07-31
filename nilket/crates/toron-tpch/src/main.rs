@@ -2381,6 +2381,23 @@ fn duckdb_thread_setting() -> Option<String> {
 		.filter(|value| !value.is_empty())
 }
 
+fn polars_max_threads_setting() -> Option<String> {
+	std::env::var("POLARS_MAX_THREADS")
+		.ok()
+		.filter(|value| !value.is_empty())
+}
+
+/// Observational record of the reference-engine thread pins a perf row ran
+/// under. An unset pin means the engine chose its own machine-dependent
+/// parallelism; the row says so instead of leaving the condition unverifiable.
+fn reference_thread_pin_provenance(setting: &Option<String>) -> &'static str {
+	if setting.is_some() {
+		"explicit"
+	} else {
+		"engine_default"
+	}
+}
+
 /// A primitive-ladder row compares Toron's one-task coordinate against a one-thread reference.
 /// Do not silently fall back to DuckDB's machine-dependent default parallelism: the recorded
 /// provenance must be the literal single-thread setting before a ladder can run its DuckDB arm.
@@ -3889,6 +3906,10 @@ fn summarize_query_rows(
 		"output_schema_fingerprint": output_schema_fingerprint,
 		"engine_version": engine_version,
 		"duckdb_version": duckdb_version,
+		"duckdb_threads": duckdb_thread_setting(),
+		"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
+		"polars_max_threads": polars_max_threads_setting(),
+		"polars_max_threads_provenance": reference_thread_pin_provenance(&polars_max_threads_setting()),
 		"dataset_verification": dataset_verification,
 		"build_commit": rows.last().and_then(|row| row.get("build_commit")).cloned(),
 		"binary_modified_unix": rows
@@ -6342,6 +6363,33 @@ mod adr517_tests {
 #[cfg(test)]
 mod adr518_tests {
 	use super::*;
+
+	#[test]
+	fn reference_thread_pins_are_observational() {
+		// SAFETY: gate suites run single-threaded; no concurrent env readers.
+		unsafe { std::env::remove_var("TORON_TPCH_DUCKDB_THREADS") };
+		unsafe { std::env::remove_var("POLARS_MAX_THREADS") };
+		assert_eq!(duckdb_thread_setting(), None);
+		assert_eq!(polars_max_threads_setting(), None);
+		assert_eq!(
+			reference_thread_pin_provenance(&duckdb_thread_setting()),
+			"engine_default"
+		);
+		unsafe { std::env::set_var("TORON_TPCH_DUCKDB_THREADS", "1") };
+		unsafe { std::env::set_var("POLARS_MAX_THREADS", "1") };
+		assert_eq!(duckdb_thread_setting().as_deref(), Some("1"));
+		assert_eq!(polars_max_threads_setting().as_deref(), Some("1"));
+		assert_eq!(
+			reference_thread_pin_provenance(&duckdb_thread_setting()),
+			"explicit"
+		);
+		assert_eq!(
+			reference_thread_pin_provenance(&polars_max_threads_setting()),
+			"explicit"
+		);
+		unsafe { std::env::remove_var("TORON_TPCH_DUCKDB_THREADS") };
+		unsafe { std::env::remove_var("POLARS_MAX_THREADS") };
+	}
 
 	#[test]
 	fn adr518_semi_filtered_reachable_keys_knob_contract() {
