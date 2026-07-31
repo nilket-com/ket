@@ -46,6 +46,49 @@ Protocol:
 the component table; the prototype is removed either way; no mechanism code exists before the
 verdict.** Results land in this document before Step 1.
 
+## Phase 0 measured outcome — close red
+
+Measured from the amended plan identity `6ec789db` with a throwaway implementation inside q09's
+actual `reoriented_inner_chain_grouped` route. This was not a flattened microbenchmark: the
+candidate consumed the persisted partsupp scan, preserved all 23,436 probe batches in their
+original order, gathered the real `ps_supplycost` payload, and released the last runtime owners.
+Consequently there is no unpriced integration line outside the prototype. Representation dispatch,
+scan/decode, key extraction and packing, payload projection and materialization, and teardown all
+ran in the measured executor path.
+
+The exact-data identity gate held in every child: one fingerprint (`3d202b6e227b3a8b`), one ordered
+Arrow IPC digest, 175 result rows, zero spill, 2,610,723 input and emitted replay-2 rows, and 23,436
+output batches. The lifecycle profiler reconciled in every run. The compact candidate retained only
+the consumed payload and changed the partsupp footprint from 996,802,848 B (204,800,288 B batch +
+792,002,560 B generic index) to 595,017,824 B (102,400,096 B payload batch + 492,617,728 B pair
+index), a 401,785,024 B / 40.3% reduction.
+
+Five fresh child processes produced the following actual-route measurements; `E` is the per-child
+whole-lifecycle total and is the predeclared authority:
+
+| child | q09 execute (ms) | prep (ms) | probe (ms) | cleanup (ms) | E (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 6,579.265 | 431.324 | 348.840 | 49.067 | 829.231 |
+| 2 | 6,526.120 | 421.707 | 349.500 | 42.217 | 813.424 |
+| 3 | 6,578.688 | 430.499 | 349.283 | 44.986 | 824.768 |
+| 4 | 6,605.287 | 424.084 | 352.612 | 44.689 | 821.385 |
+| 5 | 6,594.079 | 430.015 | 351.227 | 44.901 | 826.143 |
+
+The authoritative median whole-lifecycle total is **824.768 ms**. Component medians are explanatory
+only: prep 430.015 ms, probe 349.500 ms, cleanup 44.901 ms (their independently selected sum is
+824.416 ms and is not substituted for the child-total statistic).
+
+The predeclared replacement budget was 579.511 ms. The candidate overruns it by **245.257 ms**,
+leaving at most 4,133.511 - 824.768 = **3,308.743 ms** of projected saving — 245.257 ms below the
+fixed 3,554 ms floor. This is an economic red, not an apparatus rejection: the candidate achieved
+the intended representation, footprint, schedule, flow, and semantic invariants, but the complete
+lifecycle is too expensive.
+
+**Verdict: close ADR 526 red at Phase 0.** The throwaway source changes were removed in full; no
+mechanism, knob, eligibility path, or fallback change survives. Steps 1-7, the census, and the
+cohort are not authorized. Per the forward rule inherited from ADR 525, q09's compact-composite
+lifecycle thread is parked and the board moves to the shared-fold family.
+
 ## Step 1 - the mechanism and control (contingent)
 
 `PlannerConfig::compact_composite_build` plumbed to the runtime build decision, compiled
@@ -82,5 +125,9 @@ smokes; both-way verdicts priced against E.
 
 ## Repository gates
 
-The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
-statuses preserved, gates re-run after any code change made in response.
+The restored post-prototype tree passed every standard gate with a direct exit status of zero:
+formatting in both crates; the telemetry, harness-default, and Polars-reference `--all-targets`
+checks; 1,458 library tests; 2,095 architecture tests; all 46 result lines in the complete
+`--no-fail-fast` engine suite; all nine result lines in the full `toron-tpch` suite; and
+`git diff --check`. No executable-source or architecture-guard reconciliation survives the red
+close.
