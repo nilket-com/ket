@@ -1,69 +1,77 @@
-# impl 527 - thread scaling atlas plan
+# impl 527 - partition-work capability gate plan
 
-Attribution only: build the 1/2/4/8-thread scaling atlas for q01-q22, Toron and DuckDB at
-matched pins, fixed 2 GiB aggregate memory, persisted identity facts, per-cell verdicts from
-the predeclared decision tree. No morsel code, no executor remedy, no default change.
+Attribution only: persist the requested route-local partition-work limit, add one typed O(1)
+receipt at its sole executor consumer, and run the fixed-budget pin-1/pin-8 q01-q22 capability
+census. No thread-scaling claim, morsel code, executor remedy, or default change.
 
 ## Immutable inputs
 
 - tree: epoch-close main (`53f18ebc` lineage), all activated knobs default on;
 - dataset: strict sf=8 persisted Parquet, manifest format 2, full-hash;
-- the frozen 3,554 ms floor is NOT an input — the atlas measures scaling, not materiality;
-- known controls: `TORON_PARTITION_PARALLELISM` (defaults to machine parallelism — exec.rs
-  `default_partition_parallelism`), `TORON_TPCH_DUCKDB_THREADS` (persisted since the
-  pin-persistence fix), `TORON_TPCH_MEMORY_PER_TASK` / `TORON_TPCH_SPILL_BYTES_RESERVED`
-  (per-task semantics — the atlas divides the fixed 2 GiB aggregate by the thread count);
-- doctrine: reference rows are timing evidence only; perturbation gates per ADR 516 for any
-  new recorder; no summed-board credit.
+- exact local substrate: one `Executor::execute_bound` invocation and one shared `TaskBudget` per
+  query (`toron-tpch/src/lib.rs:4343,4658`);
+- exact control reach: `ExecutionContext::partition_parallelism` has one production consumer,
+  `parallel_partition_plan` in the partitioned spilled scan-build path
+  (`exec/join/streaming.rs:18186`);
+- fixed budgets in both arms: memory 2,147,483,648 B; spill reservation 2,147,483,648 B;
+- the frozen 3,554 ms floor is not an input; capability, not materiality, is being tested.
 
-## Step 0 - honesty facts before any sweep
+## Step 1 - provenance and typed execution receipt
 
-1. Record machine topology (cores, sockets/NUMA if any, governor) into the atlas preamble.
-2. Pin the historical coordinate: measure what effective `TORON_PARTITION_PARALLELISM` the
-   closed board actually ran with (unset env → machine default) and whether q-cell plans or
-   walls at an explicit pin of that value reproduce the era's rows; state the finding either
-   way — the "one-task" era language is verified, not assumed.
-3. Verify plan fingerprints at pins 1/2/4/8 for all 22 cells (cheap bind-only or --runs 1
-   sweep): cells whose plans vary with the pin are flagged optimizer-variant now, before the
-   measured sweep.
+1. Add a loud harness accessor for `TORON_PARTITION_PARALLELISM`: positive integer or error;
+   absent resolves through the engine default. Persist the resolved value and `explicit`/`default`
+   provenance as `partition_work_concurrency_requested` on Toron perf rows; peer-engine rows carry
+   null. A knob-contract test pins valid, invalid, absent, and JSON-row behavior.
+2. Add a serde-defaulted `PartitionWorkConcurrencyObservation` to `TaskTelemetry`, containing:
+   replay id, the partitioned streamed scan-build route, partition count, requested concurrency,
+   planned `K`, resident peak, memory budget, tasks launched, and tasks completed. Emit once per
+   runtime after all launched handles reconcile; the sequential fallback emits `K=1` with its
+   completed work count. No per-row/per-batch clocks and no code motion.
+3. Surface the typed observations in Toron perf rows. Tests pin backward-compatible telemetry
+   deserialization, `K=1`, `K>1`, budget-limited `K`, launched/completed equality, and absence on an
+   unrelated in-memory join. Architecture guard changes, if any, name ADR 527 precisely.
 
-## Step 1 - row provenance and (if needed) the partition recorder
+## Step 2 - seal and gates
 
-- Persist `toron_partition_parallelism` + provenance in perf rows (the Toron side of the
-  pin-persistence fix); persist CPU affinity/topology summary per row.
-- Survey existing telemetry for per-partition completion times and exchange volumes (spill
-  ledger, exchange receipts, chain profiles). Where partition completion is not observable,
-  add a batch-scoped, reconciliation-gated partition recorder under the profiler env —
-  replay/partition-scoped parents from the start (the 524 lesson), once-per-runtime
-  construction (092e574a), no code motion in hot paths.
-- Gates for any recorder: 5 interleaved off/on pairs on q09 and q08 at pins 1 and 8,
-  absolute 3% median, two strikes close the recorder red and the atlas ships with the
-  observable subset, gaps named.
+Commit `impl: adr 527 partition-work capability receipts`, run the standard full battery with
+direct exit statuses, push, and build one release binary from that immutable identity. This is an
+observability seal; no executor decision or budget arithmetic changes.
 
-## Step 2 - seal and battery
+## Step 3 - fixed-budget capability census
 
-Standard cohesive seal (`impl: adr 527 thread scaling atlas`), full battery with direct exit
-statuses, push, release build. Knob-contract tests for any new envs.
+Run two Toron-only q01-q22 censuses from the sealed binary:
 
-## Step 3 - the sweep
+- arm 1: `TORON_PARTITION_PARALLELISM=1`;
+- arm 8: `TORON_PARTITION_PARALLELISM=8`;
+- both: explicit 2 GiB memory and explicit 2 GiB spill reservation, strict sf=8 persisted Parquet,
+  full-hash, one run and no warmup, join-spill scratch cleared before each child.
 
-Per (cell, engine, pin) for pins {1, 2, 4, 8}: 5 runs + 1 warmup, medians and spread.
-Toron: `TORON_PARTITION_PARALLELISM=<pin>`, `TORON_TPCH_MEMORY_PER_TASK = 2 GiB / pin`,
-spill reservation likewise; DuckDB: `TORON_TPCH_DUCKDB_THREADS=<pin>`. Join-spill scratch
-cleared between arms; digest identity asserted across every arm of a cell; rows carry
-thread pins, affinity, binary and dataset identity, RSS, spill, plan fingerprint.
+For every cell require equal fingerprints, digests, row counts, and successful status across arms.
+Classify from receipts only:
 
-## Step 4 - the atlas and verdicts
+- `uncontrolled`: no partition-work receipt in either arm;
+- `controlled_sequential`: receipts exist and maximum planned `K` is 1;
+- `controlled_parallel`: pin-8 has planned `K > 1`, with launched = completed.
 
-One results document: per-cell tables (median, spread, speedup, parallel efficiency vs the
-same engine's pin-1 arm, straggler max/median ratio, exchange volume, RSS, spill) at all four
-pins; the optimizer-variant flag column; the machine topology record. Efficiency and
-straggler bands predeclared in this document from pin-1 noise before the measured sweep runs;
-each cell receives exactly one verdict from the decision tree (good scaling /
-uneven-completion / balanced-but-inefficient / optimizer-variant). `chore:`-class receipt;
-no remedy selected; the doctrine ledger's morsel gate is updated with the verdict counts.
+The receipt table records both budgets, requested pin/provenance, route, partition count, planned
+`K`, resident peak, launched/completed tasks, spill, and identity facts. Execute times are
+diagnostic only and carry no scaling authority.
+
+## Step 4 - predeclared verdict and receipt
+
+If any q-cell is `uncontrolled`, close ADR 527 red as a general thread-scaling atlas. Append the
+matrix and exact controlled set here; do not run DuckDB, pins 2/4, repeated cohorts, efficiency
+statistics, or straggler analysis. The sealed observational fields remain only if the standard
+gates and census prove them behavior-neutral; otherwise revert them and commit a documentation-only
+red receipt.
+
+Only an all-controlled matrix may continue, and even then the plan must be amended with the real
+query-wide control and fixed decision thresholds before a scaling sweep. No result from Step 3 can
+silently authorize that sweep.
 
 ## Repository gates
 
-The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
-statuses preserved, gates re-run after any code change made in response.
+Formatting in both crates; all three `--all-targets` checks; Toron library tests; full
+`architecture_test`; complete Toron `--no-fail-fast`; full `toron-tpch`; `git diff --check`.
+Direct exit statuses and full logs preserved, with the full battery repeated after any code change
+made in response.

@@ -1,9 +1,14 @@
-# single-thread board epoch close at 53f18ebc
+# single-query-task board epoch close at 53f18ebc
 
 The optimization epoch that ran ADRs 511-526 under the fixed 3,554 ms per-cell materiality
 floor is declared **converged** at `53f18ebc`. The floor stays frozen — lowering it now would
 turn a successful stopping rule into a moving target. This record preserves the era's final
-state; the receipts live in the ADR chain.
+state; the receipts live in the ADR chain. “Single query task” is the exact Toron coordinate:
+the harness invokes one local `Executor` with one `TaskBudget`. It is not a retrospective claim
+that every instruction ran on one OS thread. The rows did not persist the route-local
+`TORON_PARTITION_PARALLELISM` setting, and the partitioned spilled scan-build path may dispatch
+bounded blocking work internally. DuckDB's reference arm alone was explicitly pinned to one
+thread as a session fact.
 
 ## What the era delivered
 

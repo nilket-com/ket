@@ -1,93 +1,89 @@
-# ADR 527 - The 1/2/4/8-thread scaling atlas (attribution only)
+# ADR 527 - Partition-work capability gate before a thread-scaling atlas
 
-The single-thread board is closed at `53f18ebc` with its 3,554 ms floor frozen. The next
-doctrinal question — whether morsel-driven scheduling would ever be evidence-backed — has a
-predeclared prerequisite from the standing architecture doctrine: a parallel scaling board
-must exist before any scheduler is judged. This ADR builds that atlas. It is **attribution
-only**: no morsel implementation, no executor change, no scheduling remedy. Its deliverable
-is measurements and a verdict per cell under a clean decision tree.
+The single-query-task board is closed at `53f18ebc` with its 3,554 ms floor frozen. The next
+doctrinal question is whether morsel-driven scheduling could become evidence-backed, but source
+grounding found that the proposed Toron control does not yet mean what a 1/2/4/8-thread atlas
+requires.
+
+`TORON_PARTITION_PARALLELISM` initializes `ExecutionContext::partition_parallelism`, but its only
+production consumer is `parallel_partition_plan` inside the partitioned spilled scan-build join
+path (`exec/join/streaming.rs:18186`). It is a requested upper bound on route-local blocking work,
+further limited by available cores and retained footprint. It does not distribute scans,
+aggregates, exchanges, ordinary joins, or the query task itself. The TPC-H harness invokes one
+local `Executor` with one shared `TaskBudget`; dividing that budget by the requested concurrency
+would shrink the query's real memory cap rather than hold aggregate memory fixed.
+
+ADR 527 therefore begins with a bounded **capability gate**, not a scaling sweep. It remains
+attribution only: no morsel implementation, operator parallelization, distributed-plan migration,
+or scheduling remedy. A true Toron/DuckDB matched-thread atlas is authorized only if the gate proves
+that an existing query-wide Toron thread control actually exists.
 
 ## Contract
 
-1. **Tree and cells**: the current default-on tree; all of q01-q22.
-2. **Engines and thread counts**: Toron and DuckDB at explicitly matched thread counts —
-   1, 2, 4, and 8 — Toron via a pinned `TORON_PARTITION_PARALLELISM`, DuckDB via
-   `TORON_TPCH_DUCKDB_THREADS`, both persisted in every row (the pin-persistence fix covers
-   DuckDB; the atlas extends row provenance to the Toron pin).
-3. **Fixed aggregate memory**: total query memory stays 2 GiB at every thread count — the
-   per-task budget is 2 GiB divided by the thread count, explicitly, so parallelism never
-   silently multiplies available memory; spill reservation follows the same rule; both
-   provenances recorded per row.
-4. **Identity facts persisted per row**: thread pins, CPU affinity/topology of the run,
-   binary identity, dataset identity (format-2 full-hash), peak RSS, and spill bytes.
-5. **Step-zero honesty fact**: the closed board's rows never recorded Toron's effective
-   parallelism (`TORON_PARTITION_PARALLELISM` defaults to machine parallelism). The atlas's
-   first measurement pins what the historical coordinate actually ran with, and the 1-thread
-   arm either reproduces it or the difference is stated — the era's "one-task" language is
-   verified, not assumed.
-6. **Per-cell statistics**: medians and spread from 5 runs + 1 warmup per (cell, engine,
-   thread count); speedup and parallel efficiency versus the same engine's 1-thread arm.
-   **No architectural credit from summed board time** — per-cell verdicts only.
-7. **Partition-level attribution**: per-partition work and completion times, exchange
-   volumes, and the max/median straggler ratio per cell at each thread count, from existing
-   telemetry where it exists; where partition completion is not observable today, a
-   batch-scoped, reconciliation-gated recorder is added under the ADR 516 perturbation
-   discipline (5 interleaved off/on pairs, absolute 3% median, rejected-not-corrected) —
-   the 524/525 lesson applied from the start.
-8. **Plan identity across thread counts**: fingerprints recorded per arm; if plans change
-   with thread count, the cell is flagged **optimizer-variant** and excluded from execution
-   verdicts until the optimizer behavior is isolated — thread-dependent planning is its own
-   finding, not an execution fact.
+1. **Tree and cells:** current default-on tree; q01-q22 at strict sf=8 persisted Parquet,
+   format-2 full-hash.
+2. **Control name and provenance:** persist `partition_work_concurrency_requested` and provenance
+   on Toron perf rows. Never label it `threads`. DuckDB's
+   `TORON_TPCH_DUCKDB_THREADS` remains a real reference-engine thread pin and is not treated as an
+   equivalent control.
+3. **Fixed budget:** both capability arms keep memory and spill reservation at 2 GiB. No division
+   by the requested concurrency is permitted because the local executor owns one shared task
+   budget.
+4. **Actual reach:** one O(1) execution receipt at the sole consumer records the join replay/route,
+   partition count, requested concurrency, footprint-limited planned `K`, and actual partition
+   tasks launched and completed. A cell with no receipt is `uncontrolled`, not `K=1`.
+5. **Capability arms:** run Toron once at requested values 1 and 8 across q01-q22. Fingerprint,
+   digest, row count, spill, budget, requested pin, and execution receipts must be present and
+   reconciled before the gate is evaluated. These are reachability rows, not performance evidence.
+6. **Historical honesty:** the closed epoch's Toron setting is `unrecorded`. Current defaults or a
+   new run cannot reconstruct a past environment. The epoch coordinate is “single query task with
+   unrecorded route-local partition concurrency,” while DuckDB's one-thread reference remains a
+   disclosed session pin.
 
-## The decision tree (predeclared)
+## Predeclared capability gate
 
-Per cell, at 8 threads unless stated:
+A general q01-q22 thread-scaling atlas is expressible only if every cell has a query-wide Toron
+control whose pin-1 arm reports effective concurrency 1 and whose pin-8 arm can report effective
+concurrency greater than 1 without changing the fixed aggregate budget. Route-local receipts do
+not satisfy that condition for cells which never execute the route.
 
-- **Good scaling** (efficiency above the predeclared band): morsels remain unnecessary for
-  that cell.
-- **Poor scaling + uneven partition completion** (straggler ratio above its band): morsel
-  scheduling becomes evidence-backed for that cell class.
-- **Poor scaling + balanced partitions**: the residual is per-tuple efficiency or shared
-  contention, not scheduling — morsels would not help; named accordingly.
-- **Thread-dependent plan changes**: optimizer isolation first; no execution verdict.
+**If any q-cell is uncontrolled, ADR 527 closes red as a general thread-scaling atlas.** The receipt
+publishes the complete controlled/uncontrolled matrix and any route-local `K` facts, but no
+1/2/4/8 sweep, efficiency statistic, straggler verdict, DuckDB comparison, or scheduler conclusion
+is authorized. This is a mechanics red: the measurement axis is absent, not evidence for or
+against morsels.
 
-The bands (efficiency threshold, straggler threshold) are predeclared in the impl plan before
-any measurement, from the 1-thread arm's noise characteristics — not fitted afterward.
+If all cells pass — contrary to the grounded one-consumer source map — a follow-up amendment must
+name the real query-wide control, predeclare fixed efficiency/straggler thresholds independently
+of outcome data, and only then authorize the full atlas. Pin-1 noise may define an indifference
+band around fixed thresholds; it may not choose the thresholds.
 
 ## Acceptance
 
-1. The atlas artifact: per-cell tables (median, spread, speedup, efficiency, straggler
-   ratio, RSS, spill, plan fingerprint) at all four thread counts, both engines, with every
-   identity fact persisted in the rows.
-2. Any new recorder passes the perturbation gate on q09 and q08 at 1 and 8 threads before
-   its facts are trusted; two strikes close the recorder red and the atlas ships with the
-   observable subset, gaps named.
-3. Digest identity across all arms and thread counts per cell (results must not vary with
-   parallelism); any variance is a correctness finding that halts the atlas for that cell.
-4. A verdict row per cell from the decision tree, plus the machine topology record.
-5. No remedy, no knob beyond pins and the recorder env, no default change anywhere.
+1. Requested pin and provenance are persisted on every Toron perf row; non-Toron rows carry null.
+2. The route-local receipt is typed, backward-compatible under serde defaults, O(1) per runtime,
+   and structurally tested for `K=1`, `K>1`, and budget-limited `K`.
+3. Both arms retain explicit 2 GiB memory and spill budgets and share one fingerprint/digest/row
+   count per cell; any identity failure stops the gate.
+4. The q01-q22 capability matrix distinguishes `uncontrolled`, `controlled_sequential`, and
+   `controlled_parallel`, and reconciles launched/completed tasks for every receipt.
+5. Standard gates pass from the final tree. No executor behavior, default, planner, or scheduling
+   policy changes.
 
 ## Guardrails
 
-- The frozen 3,554 ms floor is not consulted — this atlas measures scaling, not materiality;
-  any future remedy ADR born from its verdicts declares its own economics.
-- The single-thread board's receipts stay canonical for the closed epoch; atlas rows live in
-  their own artifact namespace.
-- Reference-engine rows remain timing/capability evidence (digest="none" class), as the
-  board snapshot's evidence-limits doctrine established.
-
-## Risks
-
-- Memory-per-task division may shift spill behavior at higher thread counts; that is a
-  finding (the atlas records it), not a defect — the fixed-aggregate rule is what makes
-  thread counts comparable.
-- Partition-completion observability may be thinner than expected; the recorder is the
-  bounded fix and its perturbation gate bounds the spend.
+- `partition_work_concurrency_requested` is an observational name, not a promise of effective
+  workers. Actual `K` is separately receipt-backed.
+- Plan fingerprints cannot establish control reach: the setting is consumed after bind. Runtime
+  receipts carry the decision.
+- The frozen 3,554 ms floor is not consulted; this gate tests whether a scaling coordinate exists.
+- The closed epoch's receipts stay canonical. No new run rewrites their missing provenance.
+- A red gate does not select distributed tasks, stage parallelism, or morsels. Any substrate is a
+  separately authorized architecture decision.
 
 ## Forward
 
-- The atlas verdicts feed the standing doctrine ledger (morsel gate, per-thread ratio band).
-- If a cell class lands in "poor scaling + uneven completion", a successor scheduling ADR
-  may cite the atlas; if everything lands in "balanced but inefficient", the per-tuple
-  efficiency track continues under the existing bounded-rule regime at whatever floor a new
-  epoch declares.
+- Gate green: amend ADR 527 with the query-wide control and the actual 1/2/4/8 atlas protocol.
+- Gate red: record that the current local executor cannot express a general scaling atlas. Product
+  demand for multicore latency, if any, must authorize a bounded execution-substrate comparison
+  before a scheduler design is chosen.
