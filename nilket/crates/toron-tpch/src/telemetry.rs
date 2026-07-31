@@ -4,8 +4,8 @@
 //! allowlist. Any error whose reason is not recognized — and any panic or malformed row — is a `fail`,
 //! even under `--allow-blocked`. This is what stops "blocked" from silently absorbing real regressions.
 
-/// The stage a query attempt reached. `Fragment` is reserved for later *distributed* reachability; ADR
-/// 261 is single-node only and never emits it.
+/// The stage a query attempt reached. `Fragment` was reserved at ADR 261 for distributed
+/// reachability; ADR 528's fragment-census rail is its sole producer — no default rail emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
 	Generate,
@@ -14,7 +14,7 @@ pub enum Phase {
 	Bind,
 	Execute,
 	Compare,
-	/// Reserved for distributed reachability (unused in ADR 261).
+	/// Emitted only by the ADR 528 fragment-census rail (plan-shape capability, no execution).
 	Fragment,
 }
 
@@ -406,6 +406,85 @@ impl PerfAttempt {
 
 	pub fn jsonl(&self) -> String {
 		self.json_value().to_string()
+	}
+}
+
+/// ADR 528: one fragment-capability census outcome — plan-shape only, no execution, and no
+/// timing authority (`elapsed_ms` is diagnostic). `classification` is the predeclared
+/// vocabulary: `bind_rejected` (any pre-fragment wall; `phase` carries the exact stage),
+/// `fragment_rejected` (`reason` carries the typed `FragmentError` slug), or
+/// `fragments_sequential` / `fragments_parallel` (stage/width facts present). A fragmented
+/// classification proves plan admission only, never executability.
+#[derive(Debug, Clone)]
+pub struct FragmentCensusRow {
+	pub query: String,
+	pub scale_factor: f64,
+	pub mode: String,
+	pub phase: Phase,
+	pub classification: String,
+	pub reason: Option<String>,
+	pub plan_fingerprint: Option<String>,
+	pub stage_count: Option<usize>,
+	pub stage_task_counts: Option<Vec<usize>>,
+	pub max_stage_width: Option<usize>,
+	pub single_task_producer_stages: Option<usize>,
+	pub elapsed_ms: f64,
+	pub diagnostic_message: Option<String>,
+}
+
+impl FragmentCensusRow {
+	pub fn human(&self) -> String {
+		format!(
+			"tpch_fragment_census query={} sf={} mode={} phase={} classification={} reason={} stages={} widths={} max_width={} single_task_producers={}",
+			self.query,
+			self.scale_factor,
+			self.mode,
+			self.phase.as_str(),
+			self.classification,
+			self.reason.as_deref().unwrap_or("none"),
+			self.stage_count
+				.map_or("none".to_string(), |count| count.to_string()),
+			self.stage_task_counts.as_ref().map_or_else(
+				|| "none".to_string(),
+				|counts| {
+					counts
+						.iter()
+						.map(usize::to_string)
+						.collect::<Vec<_>>()
+						.join(",")
+				}
+			),
+			self.max_stage_width
+				.map_or("none".to_string(), |width| width.to_string()),
+			self.single_task_producer_stages
+				.map_or("none".to_string(), |count| count.to_string()),
+		)
+	}
+
+	pub fn jsonl(&self) -> String {
+		let mut row = serde_json::json!({
+			"suite": "tpch_fragment_census",
+			"query": self.query,
+			"scale_factor": self.scale_factor,
+			"mode": self.mode,
+			"phase": self.phase.as_str(),
+			"classification": self.classification,
+			"reason": self.reason,
+			"plan_fingerprint": self.plan_fingerprint,
+			"stage_count": self.stage_count,
+			"stage_task_counts": self.stage_task_counts,
+			"max_stage_width": self.max_stage_width,
+			"single_task_producer_stages": self.single_task_producer_stages,
+			"elapsed_ms": self.elapsed_ms,
+			"build_commit": build_commit(),
+			"binary_modified_unix": binary_modified_unix(),
+		});
+		if let Some(message) = &self.diagnostic_message {
+			row.as_object_mut()
+				.expect("fragment census JSON row is an object")
+				.insert("diagnostic_message".to_string(), serde_json::json!(message));
+		}
+		row.to_string()
 	}
 }
 

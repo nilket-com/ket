@@ -11,7 +11,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 use toron_tpch::telemetry::{
-	Attempt, CorrectnessAttempt, PerfAttempt, PerfPhaseTimings, Phase, Status,
+	Attempt, CorrectnessAttempt, FragmentCensusRow, PerfAttempt, PerfPhaseTimings, Phase, Status,
 };
 use toron_tpch::{
 	ALL_QUERY_IDS, CACHE_ROOT, PRIMITIVE_LADDER_IDS, Q17BoundaryCensusOutcome,
@@ -26,7 +26,7 @@ use toron_tpch::{
 	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
 	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22,
+	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_fragment_census_query,
 	run_perf_query_with_data_source, run_q17_boundary_census_with_data_source,
 	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
 	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
@@ -99,6 +99,7 @@ async fn main() -> ExitCode {
 			ExitCode::SUCCESS
 		}
 		"ladder" => ladder_command(&args).await,
+		"fragment-census" => fragment_census_command(&args).await,
 		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
@@ -112,6 +113,78 @@ async fn main() -> ExitCode {
 		}
 		_ => usage(),
 	}
+}
+
+/// ADR 528: the fragment-capability census — bind q01-q22 under the distributed posture, ask
+/// the fragmenter, and classify every cell from typed receipts. Plan-shape only: no workers,
+/// no execution, no timing authority. The command exits nonzero only when a cell produced no
+/// definitive classification (a harness error), never because the fragmenter said no — the
+/// reject IS the finding.
+async fn fragment_census_command(args: &[String]) -> ExitCode {
+	let scale_factor = match resolved_sf(args) {
+		Ok(scale_factor) => scale_factor,
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("memory");
+	let data_root = data_dir_from_args(args);
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/fragment_census"));
+	let queries: Vec<&str> = match flag_value(args, "--query") {
+		None | Some("all") => ALL_QUERY_IDS.to_vec(),
+		Some(query) => vec![query],
+	};
+	let mut rows = Vec::new();
+	for query in queries {
+		let row =
+			match run_fragment_census_query(query, mode, scale_factor, data_source, &data_root)
+				.await
+			{
+				Ok(row) => row,
+				Err(message) => return harness_error(&message),
+			};
+		println!("{}", row.human());
+		rows.push(row);
+	}
+	if let Err(error) = std::fs::create_dir_all(&output_dir) {
+		return harness_error(&format!(
+			"fragment-census output dir {}: {error}",
+			output_dir.display()
+		));
+	}
+	let jsonl_path = output_dir.join("fragment_census.jsonl");
+	let jsonl = rows
+		.iter()
+		.map(FragmentCensusRow::jsonl)
+		.collect::<Vec<_>>()
+		.join("\n");
+	if let Err(error) = std::fs::write(&jsonl_path, jsonl + "\n") {
+		return harness_error(&format!(
+			"fragment-census write {}: {error}",
+			jsonl_path.display()
+		));
+	}
+	let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+	for row in &rows {
+		let key = match &row.reason {
+			Some(reason) => format!("{}:{reason}", row.classification),
+			None => row.classification.clone(),
+		};
+		*histogram.entry(key).or_insert(0) += 1;
+	}
+	for (key, count) in &histogram {
+		println!("fragment_census_histogram {key}={count}");
+	}
+	let parallel = rows
+		.iter()
+		.filter(|row| row.classification == "fragments_parallel")
+		.count();
+	println!(
+		"fragment_census_summary cells={} fragments_parallel={parallel} rows={}",
+		rows.len(),
+		jsonl_path.display()
+	);
+	ExitCode::SUCCESS
 }
 
 async fn q17_census_command(args: &[String]) -> ExitCode {
@@ -5054,7 +5127,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }

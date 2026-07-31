@@ -50,10 +50,13 @@ use toron::binder::{
 };
 use toron::catalog::{MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
+use toron::distributed::context::TaskExecutionContext;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use toron::distributed::scheduler::StagePlan;
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
-	TaskTelemetry,
+	TaskOutputBinding, TaskTelemetry,
 };
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
@@ -71,8 +74,8 @@ use wendelon::schema::{
 };
 
 use telemetry::{
-	Attempt, CorrectnessAttempt, DatasetVerification, PerfAttempt, PerfPhaseTimings, Phase, Status,
-	reason_for_error, status_for_reason,
+	Attempt, CorrectnessAttempt, DatasetVerification, FragmentCensusRow, PerfAttempt,
+	PerfPhaseTimings, Phase, Status, reason_for_error, status_for_reason,
 };
 
 /// Default cache / output root — always under `target/`, never a tracked path.
@@ -4645,6 +4648,17 @@ fn gauge_planner_config_with_task_memory(
 	config
 }
 
+/// ADR 528: the census bind posture — the gauge config with the coordinator's exact one-field
+/// delta. The distributed coordinator is never evidence that a join will execute in one
+/// partition (`coordinator.rs`, ADR 489), so the census must bind the plan the fragmenter
+/// would actually receive: ADR 490's local hash-join admission declines by design, and the
+/// resulting fingerprint legitimately differs from the single-partition gauge plans.
+pub fn distributed_gauge_planner_config() -> PlannerConfig {
+	let mut config = gauge_planner_config();
+	config.single_partition_execution = false;
+	config
+}
+
 #[cfg(test)]
 #[test]
 fn adr490_single_node_gauge_config_carries_exact_raw_budget_without_admission() {
@@ -4664,6 +4678,27 @@ fn adr490_single_node_gauge_config_carries_exact_raw_budget_without_admission() 
 			.local_hash_join_memory_per_task
 			.is_none(),
 		"non-gauge callers remain conservative until they supply budget evidence"
+	);
+}
+
+#[cfg(test)]
+#[test]
+fn adr528_distributed_posture_differs_only_in_single_partition_execution() {
+	let gauge = gauge_planner_config();
+	let mut distributed = distributed_gauge_planner_config();
+	assert!(
+		!distributed.single_partition_execution,
+		"the census binds under the distributed posture"
+	);
+	assert!(
+		gauge.single_partition_execution,
+		"default gauge rails keep the single-partition posture"
+	);
+	distributed.single_partition_execution = true;
+	assert_eq!(
+		format!("{distributed:?}"),
+		format!("{gauge:?}"),
+		"the posture delta is exactly one field"
 	);
 }
 
@@ -4710,6 +4745,256 @@ fn tpch_execution_context(task_telemetry: Arc<Mutex<TaskTelemetry>>) -> Executio
 		context = context.with_task_budget(TaskBudget::from_query_budget(budget));
 	}
 	context
+}
+
+/// ADR 528: the census's typed per-cell answer. Classification derives from this value alone —
+/// never hand-assigned — and a `Fragmented` receipt proves plan admission only, not
+/// executability.
+#[derive(Debug, Clone)]
+pub enum FragmentCensusOutcome {
+	/// A pre-fragment wall (load/plan/bind); `phase` carries the exact stage.
+	StageRejected {
+		phase: Phase,
+		reason: String,
+		message: String,
+	},
+	/// The fragmenter answered no; `reason` is the typed [`FragmentError`] slug.
+	FragmentRejected {
+		reason: &'static str,
+		message: String,
+	},
+	Fragmented(FragmentShapeReceipt),
+}
+
+/// ADR 528: the shape facts a fragmenting cell admits. `max_stage_width` is the widest
+/// same-stage task fan-out — the substrate's admitted intra-query parallelism ceiling for
+/// this plan; `single_task_producer_stages` counts the stages pinned to one task by the
+/// producer path.
+#[derive(Debug, Clone)]
+pub struct FragmentShapeReceipt {
+	pub stage_count: usize,
+	pub stage_task_counts: Vec<usize>,
+	pub max_stage_width: usize,
+	pub single_task_producer_stages: usize,
+}
+
+/// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
+/// construction — a new `FragmentError` variant fails compilation here instead of falling
+/// through to an unrecognized bucket.
+pub fn classify_fragment_error(error: &FragmentError) -> &'static str {
+	match error {
+		FragmentError::ZeroPartitionCount => "fragment_zero_partition_count",
+		FragmentError::MultipleExchangeBoundaries { .. } => "fragment_multiple_exchange_boundaries",
+		FragmentError::MissingScanMetadata => "fragment_missing_scan_metadata",
+		FragmentError::JoinInputNotExchanged => "fragment_join_input_not_exchanged",
+		FragmentError::SortBarrierInsideJoinInput => "fragment_sort_barrier_inside_join_input",
+		FragmentError::BroadcastNonInner { .. } => "fragment_broadcast_non_inner",
+		FragmentError::BroadcastBuildNotPublished => "fragment_broadcast_build_not_published",
+		FragmentError::BroadcastProbeNotStarLinear => "fragment_broadcast_probe_not_star_linear",
+		FragmentError::CreateTableNotFragmentable
+		| FragmentError::DropTableNotFragmentable
+		| FragmentError::DeleteNotFragmentable
+		| FragmentError::UpdateNotFragmentable
+		| FragmentError::InsertNotFragmentable
+		| FragmentError::InsertSelectNotFragmentable
+		| FragmentError::CreateTableAsSelectNotFragmentable => "fragment_coordinator_only_operation",
+		FragmentError::FragmentIdNamespaceOverflow { .. } => "fragment_id_namespace_overflow",
+	}
+}
+
+/// ADR 528: extract the shape receipt from a fragmented plan. A producer stage is one whose
+/// tasks publish to an exchange; a single-task producer is the fragmenter's hardcoded
+/// one-task-per-join-input shape.
+pub fn fragment_shape_receipt(stages: &[StagePlan]) -> FragmentShapeReceipt {
+	let stage_task_counts: Vec<usize> = stages.iter().map(|stage| stage.tasks.len()).collect();
+	let max_stage_width = stage_task_counts.iter().copied().max().unwrap_or(0);
+	let single_task_producer_stages = stages
+		.iter()
+		.filter(|stage| {
+			stage.tasks.len() == 1
+				&& stage.tasks.iter().all(|task| {
+					matches!(task.spec.output, TaskOutputBinding::ShuffleProducer { .. })
+				})
+		})
+		.count();
+	FragmentShapeReceipt {
+		stage_count: stages.len(),
+		stage_task_counts,
+		max_stage_width,
+		single_task_producer_stages,
+	}
+}
+
+/// ADR 528: bind under the distributed posture and ask the fragmenter — never execute. The
+/// fragment config mirrors the coordinator's derivation exactly: the same
+/// `TaskBudget::from_query_budget` envelope the gauge executes under, the task context lifted
+/// from the execution context, and the context's observation mode.
+async fn fragment_census_outcome_with_metadata(
+	sql: &str,
+	tables: Vec<HarnessTableMetadata>,
+) -> (Option<String>, FragmentCensusOutcome) {
+	let total_start = Instant::now();
+	let mut timings = PerfPhaseTimings::default();
+	let catalog = match load_catalog_from_metadata(tables, &mut timings, total_start) {
+		Ok(catalog) => catalog,
+		Err(error) => return (None, stage_rejection(error)),
+	};
+	let logical = match SqlPlanner::new().plan(sql) {
+		Ok(logical) => logical,
+		Err(error) => {
+			return (
+				None,
+				stage_rejection(StageError::from_display(Phase::Plan, error)),
+			);
+		}
+	};
+	let bound = match bind_with_local_join_admissions(
+		&logical,
+		&catalog,
+		&distributed_gauge_planner_config(),
+	)
+	.await
+	{
+		Ok((bound, _admissions)) => bound,
+		Err(error) => {
+			return (
+				None,
+				stage_rejection(StageError::from_debug(Phase::Bind, error)),
+			);
+		}
+	};
+	let plan_fingerprint = physical_plan_fingerprint(&bound);
+
+	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let context = tpch_execution_context(task_telemetry);
+	let config = FragmentPlanConfig::new(context.query_id, context.task_budget)
+		.with_task_context(TaskExecutionContext::from_execution_context(&context))
+		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone());
+	match fragment_plan(bound, config) {
+		Ok(stages) => (
+			Some(plan_fingerprint),
+			FragmentCensusOutcome::Fragmented(fragment_shape_receipt(&stages)),
+		),
+		Err(error) => (
+			Some(plan_fingerprint),
+			FragmentCensusOutcome::FragmentRejected {
+				reason: classify_fragment_error(&error),
+				message: error.to_string(),
+			},
+		),
+	}
+}
+
+fn stage_rejection(error: StageError) -> FragmentCensusOutcome {
+	FragmentCensusOutcome::StageRejected {
+		phase: error.phase,
+		reason: error.reason,
+		message: error.message,
+	}
+}
+
+/// ADR 528: one census cell, end to end. `data_source` mirrors the perf rail (`memory` /
+/// `parquet` / `persisted`); the persisted arm loads bind-time metadata and facts only —
+/// no data is scanned and nothing executes.
+pub async fn run_fragment_census_query(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	data_source: &str,
+	data_root: &Path,
+) -> Result<FragmentCensusRow, String> {
+	let total_start = Instant::now();
+	let (query_id, sql, tables) = match data_source {
+		"memory" => {
+			let spec = build_perf_query_spec(query, mode, scale_factor)?;
+			let (metadata, _storage) = metadata_storage_from_tables(spec.tables);
+			(spec.query_id, spec.sql, metadata)
+		}
+		"parquet" | "persisted" => {
+			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
+			(spec.query_id, spec.sql, spec.tables)
+		}
+		other => {
+			return Err(format!(
+				"fragment-census --data-source {other:?} is not supported"
+			));
+		}
+	};
+	let (plan_fingerprint, outcome) = fragment_census_outcome_with_metadata(&sql, tables).await;
+	let elapsed_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+	Ok(fragment_census_row(
+		query_id,
+		mode,
+		scale_factor,
+		plan_fingerprint,
+		outcome,
+		elapsed_ms,
+	))
+}
+
+fn fragment_census_row(
+	query_id: &str,
+	mode: &str,
+	scale_factor: f64,
+	plan_fingerprint: Option<String>,
+	outcome: FragmentCensusOutcome,
+	elapsed_ms: f64,
+) -> FragmentCensusRow {
+	match outcome {
+		FragmentCensusOutcome::StageRejected {
+			phase,
+			reason,
+			message,
+		} => FragmentCensusRow {
+			query: query_id.to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			phase,
+			classification: "bind_rejected".to_string(),
+			reason: Some(reason),
+			plan_fingerprint,
+			stage_count: None,
+			stage_task_counts: None,
+			max_stage_width: None,
+			single_task_producer_stages: None,
+			elapsed_ms,
+			diagnostic_message: Some(message),
+		},
+		FragmentCensusOutcome::FragmentRejected { reason, message } => FragmentCensusRow {
+			query: query_id.to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			phase: Phase::Fragment,
+			classification: "fragment_rejected".to_string(),
+			reason: Some(reason.to_string()),
+			plan_fingerprint,
+			stage_count: None,
+			stage_task_counts: None,
+			max_stage_width: None,
+			single_task_producer_stages: None,
+			elapsed_ms,
+			diagnostic_message: Some(message),
+		},
+		FragmentCensusOutcome::Fragmented(receipt) => FragmentCensusRow {
+			query: query_id.to_string(),
+			scale_factor,
+			mode: mode.to_string(),
+			phase: Phase::Fragment,
+			classification: if receipt.max_stage_width > 1 {
+				"fragments_parallel".to_string()
+			} else {
+				"fragments_sequential".to_string()
+			},
+			reason: None,
+			plan_fingerprint,
+			stage_count: Some(receipt.stage_count),
+			stage_task_counts: Some(receipt.stage_task_counts),
+			max_stage_width: Some(receipt.max_stage_width),
+			single_task_producer_stages: Some(receipt.single_task_producer_stages),
+			elapsed_ms,
+			diagnostic_message: None,
+		},
+	}
 }
 
 /// Run a query single-node over N pre-built fixtures (the reachability rail): the shared execute path, then a
@@ -16923,5 +17208,132 @@ mod adr471_probe {
 			"{query} flag-on must bind natural: {joins}"
 		);
 		assert!(!joins.contains("swapped_right_build"), "{joins}");
+	}
+}
+
+#[cfg(test)]
+mod adr528_fragment_census {
+	use super::*;
+
+	#[test]
+	fn fragment_error_classification_is_typed_slugs() {
+		assert_eq!(
+			classify_fragment_error(&FragmentError::JoinInputNotExchanged),
+			"fragment_join_input_not_exchanged"
+		);
+		assert_eq!(
+			classify_fragment_error(&FragmentError::MultipleExchangeBoundaries { count: 3 }),
+			"fragment_multiple_exchange_boundaries"
+		);
+		assert_eq!(
+			classify_fragment_error(&FragmentError::BroadcastProbeNotStarLinear),
+			"fragment_broadcast_probe_not_star_linear"
+		);
+		assert_eq!(
+			classify_fragment_error(&FragmentError::CreateTableNotFragmentable),
+			"fragment_coordinator_only_operation"
+		);
+	}
+
+	/// A grouped aggregate is the by-construction fragmenting shape (producer + group-keyed
+	/// exchange consumer, pinned at the toron fragmenter level): one single-task producer
+	/// stage publishing to the exchange, one consumer stage at the aggregate partition width.
+	#[tokio::test]
+	async fn grouped_aggregate_fragments_parallel_with_shape_receipt() {
+		let spec = build_perf_query_spec("q06", "strict", 0.01).expect("q06 spec");
+		let (metadata, _storage) = metadata_storage_from_tables(spec.tables);
+		let (fingerprint, outcome) = fragment_census_outcome_with_metadata(
+			"SELECT l_shipdate, COUNT(*) FROM lineitem GROUP BY l_shipdate",
+			metadata,
+		)
+		.await;
+		assert!(fingerprint.is_some(), "a bound plan has a fingerprint");
+		let FragmentCensusOutcome::Fragmented(receipt) = outcome else {
+			panic!("grouped aggregate must fragment, got {outcome:?}");
+		};
+		assert_eq!(receipt.stage_count, 2);
+		assert_eq!(receipt.stage_task_counts.len(), receipt.stage_count);
+		assert!(
+			receipt.max_stage_width > 1,
+			"the consumer stage fans out to the aggregate partition width: {receipt:?}"
+		);
+		assert_eq!(
+			receipt.single_task_producer_stages, 1,
+			"the fragmenter pins one single-task producer: {receipt:?}"
+		);
+		let row = fragment_census_row(
+			"probe",
+			"strict",
+			0.01,
+			fingerprint,
+			FragmentCensusOutcome::Fragmented(receipt),
+			0.0,
+		);
+		assert_eq!(row.classification, "fragments_parallel");
+		assert_eq!(row.phase, Phase::Fragment);
+	}
+
+	/// DDL is the by-construction rejecting shape: `fragment_plan` refuses coordinator-only
+	/// operations at its entry, before any recursion.
+	#[tokio::test]
+	async fn ddl_statement_is_fragment_rejected_with_typed_reason() {
+		let spec = build_perf_query_spec("q06", "strict", 0.01).expect("q06 spec");
+		let (metadata, _storage) = metadata_storage_from_tables(spec.tables);
+		let (_fingerprint, outcome) = fragment_census_outcome_with_metadata(
+			"CREATE TABLE fragment_census_probe (x INTEGER)",
+			metadata,
+		)
+		.await;
+		match outcome {
+			FragmentCensusOutcome::FragmentRejected { reason, .. } => {
+				assert_eq!(reason, "fragment_coordinator_only_operation");
+			}
+			FragmentCensusOutcome::StageRejected { phase, reason, .. } => {
+				panic!("DDL must reach the fragmenter, rejected at {phase:?}: {reason}");
+			}
+			FragmentCensusOutcome::Fragmented(receipt) => {
+				panic!("DDL must not fragment: {receipt:?}");
+			}
+		}
+	}
+
+	/// The census cell entry produces a definitive predeclared classification and a coherent
+	/// row — without pre-judging any q-cell's census answer.
+	#[tokio::test]
+	async fn census_cell_yields_definitive_classification() {
+		let row = run_fragment_census_query("q06", "strict", 0.01, "memory", Path::new("unused"))
+			.await
+			.expect("census cell");
+		assert!(
+			[
+				"bind_rejected",
+				"fragment_rejected",
+				"fragments_sequential",
+				"fragments_parallel"
+			]
+			.contains(&row.classification.as_str()),
+			"classification {} is outside the predeclared vocabulary",
+			row.classification
+		);
+		match row.classification.as_str() {
+			"fragments_sequential" | "fragments_parallel" => {
+				assert_eq!(row.phase, Phase::Fragment);
+				let counts = row.stage_task_counts.as_ref().expect("stage task counts");
+				assert_eq!(row.stage_count, Some(counts.len()));
+				assert_eq!(row.max_stage_width, counts.iter().copied().max());
+				assert!(row.reason.is_none());
+			}
+			"fragment_rejected" => {
+				assert_eq!(row.phase, Phase::Fragment);
+				assert!(row.reason.as_deref().unwrap_or("").starts_with("fragment_"));
+				assert!(row.stage_count.is_none());
+			}
+			_ => {
+				assert_ne!(row.phase, Phase::Fragment);
+				assert!(row.reason.is_some());
+			}
+		}
+		let jsonl = row.jsonl();
+		assert!(jsonl.contains("\"suite\":\"tpch_fragment_census\""));
 	}
 }

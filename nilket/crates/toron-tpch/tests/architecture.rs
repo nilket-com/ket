@@ -288,3 +288,42 @@ fn adr450_ablation_arms_share_the_same_parquet_projection_union() {
 	);
 	assert!(lib.matches("inflate_projected_parquet_batch(").count() >= 3);
 }
+
+#[test]
+fn adr528_fragment_census_posture_and_phase_do_not_leak() {
+	// lib.rs interleaves inline #[cfg(test)] items with production code, so this guard scans
+	// the whole file; the assignment patterns are receiver-specific (`config.`), which keeps
+	// test-local mutations out of the counts.
+	let lib = source("src/lib.rs");
+	assert_eq!(
+		lib.matches("config.single_partition_execution = false;")
+			.count(),
+		1,
+		"the distributed posture is set in exactly one place: the census bind config"
+	);
+	assert_eq!(
+		lib.matches("config.single_partition_execution = true;")
+			.count(),
+		1,
+		"default gauge rails keep the single-partition posture in exactly one place"
+	);
+	for vocabulary in [
+		"\"bind_rejected\"",
+		"\"fragment_rejected\"",
+		"\"fragments_sequential\"",
+		"\"fragments_parallel\"",
+	] {
+		assert!(
+			lib.contains(vocabulary),
+			"census classification {vocabulary} is pinned"
+		);
+	}
+	assert!(
+		!source("src/main.rs").contains("Phase::Fragment"),
+		"the CLI never constructs the fragment phase; census rows come from the library rail"
+	);
+	assert!(
+		source("src/telemetry.rs").contains("\"tpch_fragment_census\""),
+		"the census suite name is pinned"
+	);
+}
