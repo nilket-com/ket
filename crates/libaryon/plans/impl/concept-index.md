@@ -1,5 +1,14 @@
 # Concept index: search for "The Supervisor", land on `render_frame`
 
+**STATUS AMENDMENT (2026-07-30): deferred behind the discovery benchmark
+(`discovery-benchmark.md` → ADR 0004).** This plan is the *curation* layer
+of a two-layer design; the benchmark decides the *discovery* layer first.
+Sequencing is load-bearing, not preferential: this plan's seeding step
+would plant concept words in doc comments and **contaminate the
+benchmark's corpus** before its sealed holdout run. After ADR 0004 is
+decided, this plan resumes with one amendment: seeds come from accepted
+discoveries, not from memory of a conversation.
+
 Scope: a controlled-vocabulary **concept layer** over the symbol layer —
 `@concept` annotations authored in doc comments, harvested at grep speed,
 queried through the just-shipped picker as its second source. **Zero ML in
