@@ -26,20 +26,41 @@ A throwaway prototype — no mechanism code, removed after measurement — imple
 candidate representation and measures the full replacement lifecycle on the real inputs at the
 exact coordinate:
 
-1. **fixed-width two-key index**: the (ps_partkey, ps_suppkey) composite as fixed-width
-   integer pairs, no per-key `Vec<u8>` allocation anywhere;
+1. **fixed-width two-key index**: exactly two Int64 columns — q09's
+   (ps_partkey, ps_suppkey) composite — stored as fixed-width pairs, with no per-key
+   `Vec<u8>` allocation anywhere;
 2. **batched construction and probing** (batch-granular staging, no per-row dispatch);
 3. **payload retention**: after index construction retain only the payload columns the chain
-   consumes downstream, releasing redundant key columns from the retained batch;
+   consumes downstream, releasing redundant key columns from the retained batch. For q09 the
+   derived set is exactly `ps_supplycost`: `ps_partkey` and `ps_suppkey` serve lookup only,
+   while the downstream key values come from lineitem. The prototype pins that fact, while the
+   eventual mechanism derives the set from the chain's required-output metadata rather than
+   hard-coding q09;
 4. **unchanged duplicate/null/equality semantics** — duplicates chain exactly as today, a
    NULL key matches nothing, equality is bit-exact with the generic path;
 5. **byte-identical generic fallback** outside the eligible shape (prototype demonstrates
    the boundary; the mechanism would gate on it).
 
 Inputs are exact: the real 6,400,000-row partsupp build columns and the real 2,610,723-entry
-probe-key stream (the chain's suffix-1 output keys), extracted from the sf=8 dataset. The
-prototype verifies match-count identity against the generic path's flow counters before its
-timings count. Measured: construction, full probe pass, teardown — the three E components.
+probe-key stream (the chain's suffix-1 output keys), preserving its 23,436 outer call/batch
+boundaries and row order. Before timing counts, the prototype must match both the generic
+path's flow counters and the ordered `ps_supplycost` output digest — match count alone cannot
+license a probe that skipped payload gathering.
+
+Each of five repetitions runs in a fresh child process. The authority statistic is the median
+of the five **whole replacement lifecycle totals**; component medians are explanatory only.
+The timed regions are E-equivalent:
+
+- construction includes persisted partsupp scan/decode, key extraction and packing, table
+  allocation/insertion, payload projection, and release of redundant build buffers;
+- probing includes per-batch key extraction/packing, lookup, duplicate expansion, and ordered
+  payload gathering under the original 23,436-boundary schedule;
+- teardown drops the last owners of the compact index and retained payload — not cloned Arcs
+  whose buffers remain owned by the harness.
+
+Any unavoidable harness/integration difference is a named positive ledger line. Source
+acquisition, output materialization, allocator ownership, key packing, or dispatch may not be
+silently placed outside the comparison.
 
 **Predeclared kill: if the prototype cannot project total prep + probe + teardown below
 579.511 ms, ADR 526 closes red without mechanism code.** If it clears, the ADR proceeds as
@@ -47,25 +68,30 @@ one lifecycle cut priced against E.
 
 ## Decision (contingent on Phase 0)
 
-1. One lifecycle mechanism behind a declining gate: suffix builds whose composite key is
-   exactly a tuple of fixed-width non-null-width integer columns may commit the compact
-   representation — fixed-width key index, batched construction/probe, payload-trimmed
-   retention — with the generic path byte-identical for every other shape and for the knob-off
-   arm.
+1. One lifecycle mechanism behind a declining gate: a plain-equality suffix build with exactly
+   two Int64 key columns may commit the compact representation — fixed-width pair index,
+   batched construction/probe, payload-trimmed retention. Arrow field nullability does not
+   decline the rule: under plain equality a NULL in either key component is skipped, exactly as
+   today. Null-safe joins and every other key shape retain the generic path byte-identically,
+   as does the knob-off arm.
 2. Typed, latched control: `PlannerConfig::compact_composite_build` (plumbed to the runtime
    build decision), compiled default off at the seal; gauge env
    `TORON_TPCH_COMPACT_COMPOSITE_BUILD`, loud "0"/"1" contract, row fields with provenance.
 3. Plans do not change — the cut is a runtime representation choice. The paired cohort runs
-   under an **identity gate** (fingerprints, digests, routes equal across arms) plus an
-   explicit engagement receipt distinguishing the arms; activation per ADR 472's rule.
+   under an **identity gate** (fingerprints, digests, and execution route equal across arms)
+   plus an explicit build-representation receipt distinguishing them. Both route and
+   representation facts must be serialized in every arm's perf row; ADR 525 proved that a
+   profiler-off row cannot be treated as if an absent route field were evidence. Activation is
+   per ADR 472's rule.
 
 ## Acceptance
 
 1. Phase 0 as above, with red-close authority.
-2. **Structural battery**: eligibility engages on the two-Int64 composite; declines pinned
-   (variable-width or non-integer key columns, single-key shapes — the specialized path owns
-   those, nullable-width representations, knob off) — each byte-identical to the generic
-   plan and route; engagement visible via the build receipt, not the plan.
+2. **Structural battery**: eligibility engages on the two-Int64 composite, including nullable
+   Arrow fields under plain equality; declines pinned (null-safe equality, variable-width or
+   non-Int64 keys, mixed-width pairs, arity other than two, single-key shapes — the existing
+   specialized path owns those — and knob off). Each decline is byte-identical to the generic
+   plan and route; engagement is visible via the build receipt, not the plan.
 3. **Semantic battery**: duplicate keys with multi-row chains, NULL keys on both sides,
    empty build, all-duplicates build, equality edge cases at integer boundaries — both arms
    identical results and flow counters.

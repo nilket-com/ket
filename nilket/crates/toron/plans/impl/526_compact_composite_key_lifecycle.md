@@ -24,17 +24,23 @@ below **579.511 ms** on exact data before any mechanism code exists. Layout alon
 Protocol:
 
 1. Extract exact inputs from the sf=8 dataset: the partsupp build columns and the
-   2,610,723-entry (partkey, suppkey) probe-key stream the chain feeds suffix-2 (derived the
-   same way the chain derives it; validated against the ADR 516 flow counters).
-2. Prototype one representation — fixed-width two-Int64 key index (no per-key `Vec<u8>`),
-   batched construction and probing, payload retention trimmed to the chain's consumed
-   columns with redundant key columns released — with duplicate/null/equality semantics
-   identical to the generic path.
-3. Verify match-count identity against the generic path's counters; then time construction,
-   the full probe pass, and teardown at the coordinate (same allocator and runtime context
-   class as the engine; five repetitions, median per component).
-4. Ledger any cost the prototype cannot see (integration overhead it omits) as a stated
-   line, not a silent zero.
+   2,610,723-entry (partkey, suppkey) probe-key stream the chain feeds suffix-2, preserving
+   its 23,436 call/batch boundaries and row order. Validate both the ADR 516 flow counters and
+   an ordered `ps_supplycost` output digest against the generic path before timings count.
+2. Pin q09's consumed build payload as exactly `ps_supplycost`; its two partsupp keys serve
+   lookup only and lineitem supplies the downstream key values. Prototype one representation
+   — fixed-width two-Int64 key index (no per-key `Vec<u8>`), batched construction and probing,
+   retained `ps_supplycost` only — with duplicate/null/plain-equality semantics identical to
+   the generic path.
+3. Run five fresh child processes. In each child, time one whole lifecycle total with named
+   components: construction includes persisted scan/decode, key extraction/packing, allocation,
+   insertion, payload projection, and redundant-buffer release; probe preserves the original
+   batch schedule and includes extraction, lookup, expansion, and ordered payload gathering;
+   teardown drops the last index and payload owners. The median of child totals is authority;
+   component medians are explanatory only.
+4. Ledger every cost the prototype cannot see (including dispatch or integration overhead) as
+   a positive stated line, not a silent zero. No source acquisition, payload materialization,
+   allocator ownership, or prepacked key work may disappear outside the comparison.
 
 **Predeclared kill: projected prep + probe + teardown ≥ 579.511 ms closes ADR 526 red with
 the component table; the prototype is removed either way; no mechanism code exists before the
@@ -44,14 +50,17 @@ verdict.** Results land in this document before Step 1.
 
 `PlannerConfig::compact_composite_build` plumbed to the runtime build decision, compiled
 default **false**; gauge env `TORON_TPCH_COMPACT_COMPOSITE_BUILD`, loud "0"/"1" contract, row
-fields with provenance, knob-contract test. Eligibility: composite keys that are exactly
-tuples of fixed-width integer columns; everything else (and knob-off) runs the generic path
-byte-identically. The build receipt records which representation engaged.
+fields with provenance, knob-contract test. Eligibility: plain equality over exactly two
+Int64 key columns; nullable Arrow fields engage and NULL entries are skipped, while null-safe
+joins, every other key shape, and knob-off run the generic path byte-identically. The perf row
+records execution route in both arms and the build representation (`generic_hash` versus the
+compact pair) as the engagement fact.
 
 ## Step 2 - tests
 
-Structural: eligibility + per-gate declines (variable-width, non-integer, single-key,
-knob-off) with byte-identical plans and routes; engagement via build receipt. Semantic:
+Structural: eligibility + per-gate declines (null-safe, variable-width, non-Int64,
+mixed-width, key arity other than two, single-key, knob-off) with byte-identical plans and
+routes; nullable plain-equality fields engage; engagement via build receipt. Semantic:
 duplicates with multi-row chains, NULL keys both sides, empty and all-duplicate builds,
 integer-boundary equality — identical results and flow counters both arms. ADR 525
 instrument reconciles on the new lifecycle. Architecture reconciliations named in the
