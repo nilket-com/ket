@@ -64,3 +64,32 @@ default-arm smokes; both-way verdicts.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Phase 0 result — closed red: the probe cost alone exceeds the allowance
+
+The m06 probe (rebound to `lineitem INNER JOIN supplier ON l_suppkey = s_suppkey`, with the
+cell's table registration following; first attempt failed loudly on `TableNotFound: supplier`
+and was corrected) measured at the exact coordinate, 5 runs + 1 warmup:
+
+| primitive | median | samples |
+|---|---:|---|
+| patched m06 (48M probes vs 80,000-key build, every row matches) | **1,316.3 ms** | 1,337.4 / 1,316.3 / 1,328.8 / 1,312.4 / 1,315.4 |
+| m08 (`COUNT(l_orderkey)` decode floor) | 272.9 ms | 272.9 / 271.9 / 274.6 / 270.5 / 273.0 |
+| m00 (scan proof, unchanged) | 238.4 ms | — |
+
+Marginal probe cost = 1,316.3 − 272.9 − 265.4 = **778.0 ms**, against the ~460.5 ms
+allowance — an overrun of ~69% before any acquisition or filter-fusion overhead is even
+considered. The stated overstatements (16,042-key build 5x smaller than 80,000; fused filter
+skipping join scaffolding) would need to recover more than 40% of the probe cost to fit; the
+predeclared rule does not speculate on that recovery. **ADR 523 closes red here.** No
+mechanism code, no knob; the probe was reverted with targeted edits and the tree is clean.
+
+The structural ledger across ADRs 522-523 now bounds the whole reachable-key family at q05:
+any mechanism that tests 48M keys per traversal — semi node or scan-fused — pays 0.8-1.5 s
+against a total allowance of ~0.46 s. The family is closed at this cell, not just these two
+shapes. What remains of the banked +4,524.5 ms ceiling requires a mechanism that avoids
+touching all 48M rows entirely (reorientation is parked with no floor-clearing path; nothing
+else is currently named). Per the predeclared routing, the board returns to **q09**.
+
+Phase 0 artifacts: `target/tpch/adr523_p0_ladder{,2}/` (first run carries the honest
+TableNotFound failure row; the second is the evidence).
