@@ -122,6 +122,7 @@ fn picker_viewport(
 		})
 		.collect();
 	Some(PickerViewport {
+		mode: picker.mode,
 		query: picker.query.clone(),
 		query_cursor: picker.query_cursor,
 		selected: picker.selected,
@@ -132,6 +133,7 @@ fn picker_viewport(
 		truncated: picker.truncated,
 		searching: picker.searching,
 		files_walked: picker.files_walked,
+		error: picker.error.clone(),
 	})
 }
 

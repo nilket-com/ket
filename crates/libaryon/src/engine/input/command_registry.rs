@@ -560,15 +560,27 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
 	},
 	CommandSpec {
 		name: "fz",
-		aliases: &["rg"],
+		aliases: &[],
 		bang: false,
 		args: ArgSpec::Optional,
 		completion: ArgCompletion::None,
 		category: CommandCategory::View,
 		usage: ":fz [QUERY]",
 		summary: "Fuzzily search repository content",
-		help: "Opens an engine-owned modal repository-content picker. Results stream while the query changes and prefer live bytes from open buffers. Type to refine; use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return. :rg is an alias; v1 is fuzzy/literal rather than regular-expression search.",
+		help: "Opens the engine-owned fuzzy repository-content picker. Results stream while the query changes and prefer live bytes from open buffers. Type to refine; use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return.",
 		dispatch: DispatchKind::Exact(cmd_fuzzy_repo_search),
+	},
+	CommandSpec {
+		name: "grep",
+		aliases: &[],
+		bang: true,
+		args: ArgSpec::Optional,
+		completion: ArgCompletion::None,
+		category: CommandCategory::View,
+		usage: ":grep[!] [QUERY]",
+		summary: "Search repository content literally or by regex",
+		help: "Opens the engine-owned repository-content picker. :grep searches for a case-sensitive literal string; :grep! interprets the query as a Rust regular expression. Matching remains line-oriented. Invalid regular expressions stay visible and editable in the picker. Use Ctrl-n/Ctrl-p or Down/Up to select, Enter to jump, Esc to close, and Ctrl-o to return.",
+		dispatch: DispatchKind::Exact(cmd_grep_repo_search),
 	},
 	CommandSpec {
 		name: "help",
@@ -1070,7 +1082,21 @@ fn cmd_init0(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
 }
 
 fn cmd_fuzzy_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
-	ctx.send(EditorCommand::FuzzyRepoSearch(inv.args.to_string()));
+	ctx.send(EditorCommand::RepoSearch {
+		mode: crate::engine::RepoSearchMode::Fuzzy,
+		query: inv.args.to_string(),
+	});
+}
+
+fn cmd_grep_repo_search(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
+	ctx.send(EditorCommand::RepoSearch {
+		mode: if inv.bang {
+			crate::engine::RepoSearchMode::Regex
+		} else {
+			crate::engine::RepoSearchMode::Literal
+		},
+		query: inv.args.to_string(),
+	});
 }
 
 fn cmd_help(ctx: &mut CommandCtx<'_>, inv: Invocation<'_>) {
@@ -1681,21 +1707,38 @@ mod tests {
 	}
 
 	#[test]
-	fn fuzzy_repo_search_command_and_alias_preserve_the_initial_query() {
-		for invocation in ["fz render_frame", "rg render_frame"] {
+	fn repository_search_commands_preserve_mode_and_initial_query() {
+		for (invocation, expected_mode) in [
+			("fz render_frame", crate::engine::RepoSearchMode::Fuzzy),
+			("grep render_frame", crate::engine::RepoSearchMode::Literal),
+			("grep! render.*frame", crate::engine::RepoSearchMode::Regex),
+		] {
 			let (_, commands, status, _) = dispatch(invocation, None);
 			assert_eq!(status, None);
 			assert!(matches!(
 				commands.as_slice(),
-				[EditorCommand::FuzzyRepoSearch(query)] if query == "render_frame"
+				[EditorCommand::RepoSearch { mode, query }]
+					if *mode == expected_mode
+						&& query == if expected_mode == crate::engine::RepoSearchMode::Regex {
+							"render.*frame"
+						} else {
+							"render_frame"
+						}
 			));
 		}
 		let (_, commands, status, _) = dispatch("fz", None);
 		assert_eq!(status, None);
 		assert!(matches!(
 			commands.as_slice(),
-			[EditorCommand::FuzzyRepoSearch(query)] if query.is_empty()
+			[EditorCommand::RepoSearch {
+				mode: crate::engine::RepoSearchMode::Fuzzy,
+				query,
+			}] if query.is_empty()
 		));
+		let (result, commands, status, _) = dispatch("rg render_frame", None);
+		assert_eq!(result, DispatchResult::Unknown);
+		assert!(commands.is_empty());
+		assert_eq!(status, None);
 	}
 
 	#[test]

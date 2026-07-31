@@ -327,6 +327,7 @@ pub struct PickerResultViewport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickerViewport {
+	pub mode: crate::engine::RepoSearchMode,
 	pub query: String,
 	pub query_cursor: usize,
 	/// Absolute selected result within the engine-owned ranked result set.
@@ -339,6 +340,7 @@ pub struct PickerViewport {
 	pub truncated: bool,
 	pub searching: bool,
 	pub files_walked: u64,
+	pub error: Option<String>,
 }
 
 /// Immutable render projection sent from the engine to a frontend.

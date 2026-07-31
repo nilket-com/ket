@@ -1,6 +1,8 @@
+use super::RepoSearchMode;
 use super::request::{InternalEvent, InternalSender};
 use crate::core::{BufferId, DocByte, DocDisplayCol, DocLine, PaneId, StateId, ViewId};
 use crate::ecs::NodeId;
+use regex_automata::meta::Regex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,10 +70,12 @@ pub(crate) struct RepoSearchBatch {
 	pub(crate) truncated: bool,
 	pub(crate) searching: bool,
 	pub(crate) files_walked: u64,
+	pub(crate) error: Option<String>,
 }
 
 pub(crate) struct RepoSearchRequest {
 	pub(crate) generation: u64,
+	pub(crate) mode: RepoSearchMode,
 	pub(crate) query: String,
 	pub(crate) anchor: PathBuf,
 	pub(crate) live_files: Vec<LiveFileSnapshot>,
@@ -81,6 +85,7 @@ pub(crate) struct RepoSearchRequest {
 
 #[derive(Debug)]
 pub(crate) struct PickerState {
+	pub(crate) mode: RepoSearchMode,
 	pub(crate) query: String,
 	pub(crate) query_cursor: usize,
 	pub(crate) selected: usize,
@@ -90,14 +95,16 @@ pub(crate) struct PickerState {
 	pub(crate) truncated: bool,
 	pub(crate) searching: bool,
 	pub(crate) files_walked: u64,
+	pub(crate) error: Option<String>,
 	pub(crate) origin: PickerOrigin,
 	pub(crate) cancel: Option<Arc<AtomicBool>>,
 }
 
 impl PickerState {
-	pub(crate) fn new(query: String, origin: PickerOrigin) -> Self {
+	pub(crate) fn new(mode: RepoSearchMode, query: String, origin: PickerOrigin) -> Self {
 		let query_cursor = query.len();
 		Self {
+			mode,
 			query,
 			query_cursor,
 			selected: 0,
@@ -107,6 +114,7 @@ impl PickerState {
 			truncated: false,
 			searching: false,
 			files_walked: 0,
+			error: None,
 			origin,
 			cancel: None,
 		}
@@ -127,6 +135,7 @@ impl PickerState {
 		self.matched = 0;
 		self.truncated = false;
 		self.files_walked = 0;
+		self.error = None;
 		self.searching = !self.query.is_empty();
 	}
 
@@ -139,9 +148,8 @@ impl PickerState {
 		self.truncated = batch.truncated;
 		self.searching = batch.searching;
 		self.files_walked = batch.files_walked;
-		self.selected = self
-			.selected
-			.min(self.results.len().saturating_sub(1));
+		self.error = batch.error;
+		self.selected = self.selected.min(self.results.len().saturating_sub(1));
 		true
 	}
 
@@ -175,6 +183,50 @@ struct LineScore {
 	col_byte: usize,
 }
 
+enum LineMatcher {
+	Fuzzy(String),
+	Literal(Vec<u8>),
+	Regex(Regex),
+}
+
+impl LineMatcher {
+	fn compile(mode: RepoSearchMode, query: &str) -> Result<Self, String> {
+		match mode {
+			RepoSearchMode::Fuzzy => Ok(Self::Fuzzy(query.to_string())),
+			RepoSearchMode::Literal => Ok(Self::Literal(query.as_bytes().to_vec())),
+			RepoSearchMode::Regex => Regex::new(query).map(Self::Regex).map_err(|error| {
+				let detail = error
+					.to_string()
+					.split_whitespace()
+					.collect::<Vec<_>>()
+					.join(" ");
+				format!("Invalid regular expression: {detail}")
+			}),
+		}
+	}
+
+	fn score(&self, line: &str) -> Option<LineScore> {
+		match self {
+			Self::Fuzzy(query) => score_line(query, line),
+			Self::Literal(query) => {
+				let col = memchr::memmem::find(line.as_bytes(), query)?;
+				Some(exact_line_score(col))
+			}
+			Self::Regex(regex) => regex
+				.find(line.as_bytes())
+				.map(|matched| exact_line_score(matched.start())),
+		}
+	}
+}
+
+fn exact_line_score(col_byte: usize) -> LineScore {
+	LineScore {
+		tier: MatchTier::Exact,
+		score: 3_000_000i64.saturating_sub(col_byte as i64),
+		col_byte,
+	}
+}
+
 pub(crate) fn spawn_search_task(
 	request: RepoSearchRequest,
 	internal: InternalSender,
@@ -196,7 +248,7 @@ pub(crate) fn spawn_search_debounce(
 		.spawn(move || {
 			std::thread::sleep(SEARCH_DEBOUNCE);
 			if !cancel.load(AtomicOrdering::Acquire) {
-				let _ = internal.send(InternalEvent::FuzzySearchReady(generation));
+				let _ = internal.send(InternalEvent::RepoSearchReady(generation));
 			}
 		})
 		.map(|_| ())
@@ -207,6 +259,21 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 	if request.cancel.load(AtomicOrdering::Acquire) {
 		return;
 	}
+	let matcher = match LineMatcher::compile(request.mode, &request.query) {
+		Ok(matcher) => matcher,
+		Err(error) => {
+			let _ = internal.send(InternalEvent::RepoSearchBatch(Box::new(RepoSearchBatch {
+				generation: request.generation,
+				results: Vec::new(),
+				matched: 0,
+				truncated: false,
+				searching: false,
+				files_walked: 0,
+				error: Some(error),
+			})));
+			return;
+		}
+	};
 
 	let (root, files, corpus_truncated) = corpus_files(&request.anchor);
 	let live_files = request
@@ -248,7 +315,7 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 					continue;
 				}
 				search_file(
-					&request.query,
+					&matcher,
 					&relative,
 					&path,
 					&owned,
@@ -260,7 +327,7 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 				);
 				if should_stream(file_index, last_stream) {
 					sort_and_cap(&mut results, &mut truncated);
-					let _ = internal.try_send(InternalEvent::FuzzySearchBatch(Box::new(
+					let _ = internal.try_send(InternalEvent::RepoSearchBatch(Box::new(
 						RepoSearchBatch {
 							generation: request.generation,
 							results: results.clone(),
@@ -268,6 +335,7 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 							truncated,
 							searching: true,
 							files_walked: request.files_walked.load(AtomicOrdering::Acquire),
+							error: None,
 						},
 					)));
 					last_stream = Instant::now();
@@ -279,7 +347,7 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 			continue;
 		}
 		search_file(
-			&request.query,
+			&matcher,
 			&relative,
 			&path,
 			bytes,
@@ -291,16 +359,15 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 		);
 		if should_stream(file_index, last_stream) {
 			sort_and_cap(&mut results, &mut truncated);
-			let _ = internal.try_send(InternalEvent::FuzzySearchBatch(Box::new(
-				RepoSearchBatch {
-					generation: request.generation,
-					results: results.clone(),
-					matched,
-					truncated,
-					searching: true,
-					files_walked: request.files_walked.load(AtomicOrdering::Acquire),
-				},
-			)));
+			let _ = internal.try_send(InternalEvent::RepoSearchBatch(Box::new(RepoSearchBatch {
+				generation: request.generation,
+				results: results.clone(),
+				matched,
+				truncated,
+				searching: true,
+				files_walked: request.files_walked.load(AtomicOrdering::Acquire),
+				error: None,
+			})));
 			last_stream = Instant::now();
 		}
 	}
@@ -309,16 +376,15 @@ fn run_search_task(request: RepoSearchRequest, internal: InternalSender) {
 		return;
 	}
 	sort_and_cap(&mut results, &mut truncated);
-	let _ = internal.send(InternalEvent::FuzzySearchBatch(Box::new(
-		RepoSearchBatch {
-			generation: request.generation,
-			results,
-			matched,
-			truncated,
-			searching: false,
-			files_walked: request.files_walked.load(AtomicOrdering::Acquire),
-		},
-	)));
+	let _ = internal.send(InternalEvent::RepoSearchBatch(Box::new(RepoSearchBatch {
+		generation: request.generation,
+		results,
+		matched,
+		truncated,
+		searching: false,
+		files_walked: request.files_walked.load(AtomicOrdering::Acquire),
+		error: None,
+	})));
 }
 
 fn should_stream(file_index: usize, last_stream: Instant) -> bool {
@@ -328,7 +394,7 @@ fn should_stream(file_index: usize, last_stream: Instant) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn search_file(
-	query: &str,
+	matcher: &LineMatcher,
 	relative: &Path,
 	path: &Path,
 	bytes: &[u8],
@@ -353,7 +419,7 @@ fn search_file(
 		let line = without_newline
 			.strip_suffix('\r')
 			.unwrap_or(without_newline);
-		if let Some(line_score) = score_line(query, line) {
+		if let Some(line_score) = matcher.score(line) {
 			*matched = matched.saturating_add(1);
 			if stored_for_file < MAX_RESULTS_PER_FILE {
 				results.push(RepoSearchMatch {
@@ -419,9 +485,15 @@ fn score_line(query: &str, line: &str) -> Option<LineScore> {
 	})
 }
 
-pub(crate) fn query_column(query: &str, line: &str) -> Option<(usize, DocDisplayCol)> {
-	let score = score_line(query, line)?;
-	Some((score.col_byte, display_col(line, score.col_byte)))
+pub(crate) fn query_column(
+	mode: RepoSearchMode,
+	query: &str,
+	line: &str,
+) -> Result<Option<(usize, DocDisplayCol)>, String> {
+	let matcher = LineMatcher::compile(mode, query)?;
+	Ok(matcher
+		.score(line)
+		.map(|score| (score.col_byte, display_col(line, score.col_byte))))
 }
 
 fn subsequence(
@@ -673,6 +745,7 @@ mod tests {
 	#[test]
 	fn an_older_batch_cannot_land_after_a_new_query_generation() {
 		let mut picker = PickerState::new(
+			RepoSearchMode::Fuzzy,
 			"first".to_string(),
 			PickerOrigin {
 				pane_id: PaneId::new(1),
@@ -692,6 +765,7 @@ mod tests {
 			truncated: true,
 			searching: false,
 			files_walked: 99,
+			error: None,
 		}));
 		assert_eq!(picker.generation, 42);
 		assert_eq!(picker.matched, 0);
@@ -703,8 +777,9 @@ mod tests {
 		let mut results = Vec::new();
 		let mut matched = 0;
 		let mut truncated = false;
+		let matcher = LineMatcher::compile(RepoSearchMode::Fuzzy, "live_value").expect("matcher");
 		search_file(
-			"live_value",
+			&matcher,
 			Path::new("src/live.rs"),
 			Path::new("/repo/src/live.rs"),
 			b"let live_value = 7;\n",
@@ -717,9 +792,67 @@ mod tests {
 		assert_eq!(matched, 1);
 		assert_eq!(results[0].byte, DocByte::new(4));
 		assert_eq!(
-			query_column("live_value", "let stale_value = 7;"),
-			None,
+			query_column(RepoSearchMode::Fuzzy, "live_value", "let stale_value = 7;"),
+			Ok(None),
 			"acceptance must reject a result after its current line stops matching"
+		);
+	}
+
+	#[test]
+	fn literal_and_regex_modes_interpret_metacharacters_honestly() {
+		let literal = LineMatcher::compile(RepoSearchMode::Literal, "render.*frame")
+			.expect("literal matcher");
+		assert!(literal.score("render.*frame").is_some());
+		assert!(literal.score("render_one_frame").is_none());
+
+		let regex =
+			LineMatcher::compile(RepoSearchMode::Regex, "render.*frame").expect("regex matcher");
+		assert!(regex.score("render_one_frame").is_some());
+		assert!(regex.score("RENDER_ONE_FRAME").is_none());
+		let insensitive =
+			LineMatcher::compile(RepoSearchMode::Regex, "(?i)render.*frame").expect("flags");
+		assert!(insensitive.score("RENDER_ONE_FRAME").is_some());
+	}
+
+	#[test]
+	fn literal_and_regex_columns_remain_utf8_bytes_and_tab_display_columns() {
+		for mode in [RepoSearchMode::Literal, RepoSearchMode::Regex] {
+			assert_eq!(
+				query_column(mode, "β", "\tαβ"),
+				Ok(Some((3, DocDisplayCol::new(5))))
+			);
+		}
+	}
+
+	#[test]
+	fn invalid_regex_is_a_recoverable_final_batch() {
+		let (_, _, internal, requests) = super::super::request::channel();
+		run_search_task(
+			RepoSearchRequest {
+				generation: 12,
+				mode: RepoSearchMode::Regex,
+				query: "[".to_string(),
+				anchor: PathBuf::from("."),
+				live_files: Vec::new(),
+				cancel: Arc::new(AtomicBool::new(false)),
+				files_walked: Arc::new(AtomicU64::new(0)),
+			},
+			internal,
+		);
+		let request = requests.recv().expect("regex error");
+		let super::super::request::EngineRequest::Internal(InternalEvent::RepoSearchBatch(batch)) =
+			request
+		else {
+			panic!("expected regex error batch");
+		};
+		assert_eq!(batch.generation, 12);
+		assert!(!batch.searching);
+		assert!(batch.results.is_empty());
+		assert!(
+			batch
+				.error
+				.as_deref()
+				.is_some_and(|error| error.contains("Invalid"))
 		);
 	}
 
@@ -745,9 +878,10 @@ mod tests {
 		let mut results = Vec::new();
 		let mut matched = 0;
 		let mut truncated = false;
+		let matcher = LineMatcher::compile(RepoSearchMode::Fuzzy, "render_frame").expect("matcher");
 		for (path, text) in files {
 			search_file(
-				"render_frame",
+				&matcher,
 				Path::new(path),
 				Path::new(path),
 				text.as_bytes(),
@@ -768,7 +902,12 @@ mod tests {
 			.map(|result| (result.display_path.clone(), result.line.get()))
 			.collect::<BTreeSet<_>>();
 		assert!(literal.is_subset(&found));
-		assert!(results.iter().take(2).all(|result| result.score > 2_000_000));
+		assert!(
+			results
+				.iter()
+				.take(2)
+				.all(|result| result.score > 2_000_000)
+		);
 	}
 
 	#[test]
@@ -783,11 +922,8 @@ mod tests {
 		));
 		std::fs::create_dir_all(&directory).expect("fixture directory");
 		std::fs::write(directory.join("text.txt"), b"find_the_supervisor\n").expect("text");
-		std::fs::write(
-			directory.join("binary.bin"),
-			b"find_the_supervisor\0hidden",
-		)
-		.expect("binary");
+		std::fs::write(directory.join("binary.bin"), b"find_the_supervisor\0hidden")
+			.expect("binary");
 		let oversized = std::fs::File::create(directory.join("oversized.txt")).expect("large");
 		oversized
 			.set_len(super::super::MAX_SEMANTIC_BYTES)
@@ -798,6 +934,7 @@ mod tests {
 		spawn_search_task(
 			RepoSearchRequest {
 				generation: 11,
+				mode: RepoSearchMode::Fuzzy,
 				query: "find_the_supervisor".to_string(),
 				anchor: directory.clone(),
 				live_files: Vec::new(),
@@ -812,10 +949,9 @@ mod tests {
 			let request = requests
 				.recv_timeout(Duration::from_millis(100))
 				.expect("search result");
-			if let super::super::request::EngineRequest::Internal(
-				InternalEvent::FuzzySearchBatch(batch),
-			) = request
-				&& !batch.searching
+			if let super::super::request::EngineRequest::Internal(InternalEvent::RepoSearchBatch(
+				batch,
+			)) = request && !batch.searching
 			{
 				break batch;
 			}
@@ -837,6 +973,7 @@ mod tests {
 		let mut matched = 0;
 		let mut truncated = false;
 		let mut literal = BTreeSet::new();
+		let matcher = LineMatcher::compile(RepoSearchMode::Fuzzy, "render_frame").expect("matcher");
 		for relative in files {
 			let path = root.join(&relative);
 			let Ok(bytes) = std::fs::read(&path) else {
@@ -848,12 +985,13 @@ mod tests {
 			if let Ok(text) = std::str::from_utf8(&bytes) {
 				for (line, text) in text.lines().enumerate() {
 					if text.contains("render_frame") {
-						literal.insert((relative.to_string_lossy().replace('\\', "/"), line as u64));
+						literal
+							.insert((relative.to_string_lossy().replace('\\', "/"), line as u64));
 					}
 				}
 			}
 			search_file(
-				"render_frame",
+				&matcher,
 				&relative,
 				&path,
 				&bytes,

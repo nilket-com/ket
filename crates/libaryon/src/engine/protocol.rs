@@ -112,6 +112,23 @@ pub enum PickerCursorMovement {
 	End,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSearchMode {
+	Fuzzy,
+	Literal,
+	Regex,
+}
+
+impl RepoSearchMode {
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Fuzzy => "fuzzy",
+			Self::Literal => "literal",
+			Self::Regex => "regex",
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerAction {
 	Insert(String),
@@ -221,8 +238,11 @@ pub enum EditorCommand {
 	ToggleCaseAtCursor,
 	/// Resolve and jump to the symbol definition under the primary cursor.
 	GotoDefinition,
-	/// Open the engine-owned modal fuzzy repository-content picker.
-	FuzzyRepoSearch(String),
+	/// Open the engine-owned modal repository-content picker.
+	RepoSearch {
+		mode: RepoSearchMode,
+		query: String,
+	},
 	/// Edit, navigate, accept, or close the active picker.
 	Picker(PickerAction),
 	/// Return to the newest retained code-navigation origin.

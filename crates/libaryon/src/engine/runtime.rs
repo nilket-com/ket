@@ -48,7 +48,7 @@ use super::markdown_image_preview::{
 use super::navigation::{GotoDefinitionRequest, JumpEntry, NavigationResolved, NavigationStamp};
 use super::protocol::{
 	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, PickerAction,
-	PickerCursorMovement, SplitDirection,
+	PickerCursorMovement, RepoSearchMode, SplitDirection,
 };
 use super::render::{RenderParams, render_frame};
 use super::request::{EngineRequest, InternalEvent};
@@ -1334,7 +1334,7 @@ fn schedule_picker_search(
 	session.next_picker_generation = session
 		.next_picker_generation
 		.checked_add(1)
-		.expect("fuzzy-search generation exhausted");
+		.expect("repo-search generation exhausted");
 	let cancel = {
 		let picker = session
 			.picker
@@ -1357,9 +1357,9 @@ fn launch_picker_search(
 	session: &mut EditorSession,
 	generation: u64,
 ) -> bool {
-	let Some((query, cancel)) = session.picker.as_ref().and_then(|picker| {
+	let Some((mode, query, cancel)) = session.picker.as_ref().and_then(|picker| {
 		(picker.generation == generation && !picker.query.is_empty())
-			.then(|| (picker.query.clone(), picker.cancel.clone()))
+			.then(|| (picker.mode, picker.query.clone(), picker.cancel.clone()))
 	}) else {
 		return false;
 	};
@@ -1385,6 +1385,7 @@ fn launch_picker_search(
 	let result = spawn_search_task(
 		RepoSearchRequest {
 			generation,
+			mode,
 			query,
 			anchor,
 			live_files,
@@ -1402,9 +1403,10 @@ fn launch_picker_search(
 	true
 }
 
-fn open_fuzzy_repo_search(
+fn open_repo_search(
 	internal: &super::request::InternalSender,
 	session: &mut EditorSession,
+	mode: RepoSearchMode,
 	query: String,
 ) -> bool {
 	let origin = match picker_origin(session) {
@@ -1414,7 +1416,7 @@ fn open_fuzzy_repo_search(
 			return true;
 		}
 	};
-	session.picker = Some(super::fuzzy_search::PickerState::new(query, origin));
+	session.picker = Some(super::fuzzy_search::PickerState::new(mode, query, origin));
 	session.ui.status_message = None;
 	if let Err(error) = schedule_picker_search(internal, session) {
 		if let Some(picker) = session.picker.as_mut() {
@@ -1425,7 +1427,7 @@ fn open_fuzzy_repo_search(
 	true
 }
 
-fn apply_fuzzy_search_batch(session: &mut EditorSession, batch: RepoSearchBatch) -> bool {
+fn apply_repo_search_batch(session: &mut EditorSession, batch: RepoSearchBatch) -> bool {
 	session
 		.picker
 		.as_mut()
@@ -1435,9 +1437,12 @@ fn apply_fuzzy_search_batch(session: &mut EditorSession, batch: RepoSearchBatch)
 fn resolve_picker_line(
 	bytes: &[u8],
 	line: DocLine,
+	mode: RepoSearchMode,
 	query: &str,
-) -> Option<(DocByte, DocDisplayCol)> {
-	let text = std::str::from_utf8(bytes).ok()?;
+) -> Result<Option<(DocByte, DocDisplayCol)>, String> {
+	let Ok(text) = std::str::from_utf8(bytes) else {
+		return Ok(None);
+	};
 	let mut line_start = 0usize;
 	for (line_index, segment) in text.split_inclusive('\n').enumerate() {
 		if line_index as u64 == line.get() {
@@ -1445,15 +1450,17 @@ fn resolve_picker_line(
 			let line_text = without_newline
 				.strip_suffix('\r')
 				.unwrap_or(without_newline);
-			let (column_byte, display_column) = query_column(query, line_text)?;
-			return Some((
+			let Some((column_byte, display_column)) = query_column(mode, query, line_text)? else {
+				return Ok(None);
+			};
+			return Ok(Some((
 				DocByte::new(line_start.saturating_add(column_byte) as u64),
 				display_column,
-			));
+			)));
 		}
 		line_start = line_start.saturating_add(segment.len());
 	}
-	None
+	Ok(None)
 }
 
 fn resolve_picker_match_in_buffer(
@@ -1461,6 +1468,7 @@ fn resolve_picker_match_in_buffer(
 	session: &EditorSession,
 	buffer_id: BufferId,
 	line: DocLine,
+	mode: RepoSearchMode,
 	query: &str,
 ) -> Result<Option<(DocByte, DocDisplayCol)>, String> {
 	let document = session
@@ -1474,7 +1482,7 @@ fn resolve_picker_match_in_buffer(
 		document.backing_path.as_deref().map(Path::new),
 	)
 	.map_err(|error| format!("Unable to read search target: {error}"))?;
-	Ok(resolve_picker_line(&bytes, line, query))
+	resolve_picker_line(&bytes, line, mode, query)
 }
 
 fn picker_origin_is_current(session: &EditorSession, origin: PickerOrigin) -> bool {
@@ -1509,12 +1517,12 @@ fn accept_picker_result(
 	internal: &super::request::InternalSender,
 	session: &mut EditorSession,
 ) -> bool {
-	let Some((origin, query, result)) = session.picker.as_ref().and_then(|picker| {
+	let Some((origin, mode, query, result)) = session.picker.as_ref().and_then(|picker| {
 		picker
 			.results
 			.get(picker.selected)
 			.cloned()
-			.map(|result| (picker.origin, picker.query.clone(), result))
+			.map(|result| (picker.origin, picker.mode, picker.query.clone(), result))
 	}) else {
 		session.ui.status_message = Some("No repository search result selected".to_string());
 		return true;
@@ -1546,6 +1554,7 @@ fn accept_picker_result(
 			session,
 			target_buffer,
 			result.line,
+			mode,
 			&query,
 		) {
 			Ok(Some(target)) => target,
@@ -1639,6 +1648,7 @@ fn accept_picker_result(
 			session,
 			target_buffer,
 			result.line,
+			mode,
 			&query,
 		) {
 			Ok(Some(target)) => target,
@@ -3512,7 +3522,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::GitStatus
 		| EditorCommand::RefreshGitStatus
 		| EditorCommand::OpenGitStatusEntry(_)
-		| EditorCommand::FuzzyRepoSearch(_)
+		| EditorCommand::RepoSearch { .. }
 		| EditorCommand::Picker(_)
 		| EditorCommand::MouseIntent { .. }
 		| EditorCommand::QueryDocumentText
@@ -4140,8 +4150,8 @@ fn dispatch_command(
 	}
 
 	match cmd {
-		EditorCommand::FuzzyRepoSearch(query) => {
-			needs_render |= open_fuzzy_repo_search(tx_internal, session, query);
+		EditorCommand::RepoSearch { mode, query } => {
+			needs_render |= open_repo_search(tx_internal, session, mode, query);
 		}
 		EditorCommand::Picker(action) => {
 			needs_render |= apply_picker_action(runtime, tx_internal, session, action);
@@ -5786,7 +5796,7 @@ pub(crate) fn run_engine(engine: Engine) {
 							None => false,
 						}
 					}
-					InternalEvent::FuzzySearchReady(generation) => {
+					InternalEvent::RepoSearchReady(generation) => {
 						launch_picker_search(&runtime, &tx_internal, &mut session, generation)
 					}
 					InternalEvent::NavigationResolved(resolved) => {
@@ -5795,8 +5805,8 @@ pub(crate) fn run_engine(engine: Engine) {
 						session.emit_text_lifecycle_since(lifecycle_before);
 						rendered
 					}
-					InternalEvent::FuzzySearchBatch(batch) => {
-						apply_fuzzy_search_batch(&mut session, *batch)
+					InternalEvent::RepoSearchBatch(batch) => {
+						apply_repo_search_batch(&mut session, *batch)
 					}
 					InternalEvent::RuneCompile(result) => {
 						if let Some(host) = rune_host.as_mut() {
@@ -6722,7 +6732,10 @@ pub fn main(editor) {
 		});
 		engine
 			.commands
-			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
+			.send(EditorCommand::RepoSearch {
+				mode: RepoSearchMode::Fuzzy,
+				query: "render_frame".to_string(),
+			})
 			.expect("open picker");
 		let picker_view = recv_viewport_until(
 			&engine._views,
@@ -6767,7 +6780,10 @@ pub fn main(editor) {
 		});
 		engine
 			.commands
-			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
+			.send(EditorCommand::RepoSearch {
+				mode: RepoSearchMode::Fuzzy,
+				query: "render_frame".to_string(),
+			})
 			.expect("reopen picker");
 		recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
 			viewport
@@ -6807,9 +6823,9 @@ pub fn main(editor) {
 
 	#[test]
 	#[ignore = "repository fixture shells out to git"]
-	fn fuzzy_repo_search_prefers_unsaved_open_buffer_bytes_over_disk() {
+	fn every_repo_search_mode_prefers_unsaved_open_buffer_bytes_over_disk() {
 		let repo = std::env::temp_dir().join(format!(
-			"libaryon-fuzzy-live-{}-{}",
+			"libaryon-repo-search-live-{}-{}",
 			std::process::id(),
 			SystemTime::now()
 				.duration_since(UNIX_EPOCH)
@@ -6850,36 +6866,47 @@ pub fn main(editor) {
 		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
 			viewport.is_dirty && viewport.cursor_abs_byte >= DocByte::new(12)
 		});
-		engine
-			.commands
-			.send(EditorCommand::FuzzyRepoSearch("render_frame".to_string()))
-			.expect("search live bytes");
-		let viewport =
-			recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
-				viewport.picker.as_ref().is_some_and(|picker| {
-					!picker.searching
-						&& picker.results.iter().any(|result| {
-							result.path == "live.rs" && result.line == DocLine::ZERO
-						})
+		for (mode, query) in [
+			(RepoSearchMode::Fuzzy, "render_frame"),
+			(RepoSearchMode::Literal, "render_frame"),
+			(RepoSearchMode::Regex, "render.*frame"),
+		] {
+			engine
+				.commands
+				.send(EditorCommand::RepoSearch {
+					mode,
+					query: query.to_string(),
 				})
-			});
-		assert!(
-			viewport
-				.picker
-				.as_ref()
-				.expect("picker")
-				.results
-				.iter()
-				.all(|result| result.line_text.contains("render_frame"))
-		);
-		engine
-			.commands
-			.send(EditorCommand::Picker(PickerAction::Accept))
-			.expect("same-file jump");
-		let jumped = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
-			viewport.picker.is_none() && viewport.cursor_abs_byte == DocByte::ZERO
-		});
-		assert!(jumped.is_dirty, "same-file jumps must preserve unsaved bytes");
+				.expect("search live bytes");
+			let viewport =
+				recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
+					viewport.picker.as_ref().is_some_and(|picker| {
+						!picker.searching
+							&& picker.mode == mode
+							&& picker.results.iter().any(|result| {
+								result.path == "live.rs" && result.line == DocLine::ZERO
+							})
+					})
+				});
+			assert!(
+				viewport
+					.picker
+					.as_ref()
+					.expect("picker")
+					.results
+					.iter()
+					.all(|result| result.line_text.contains("render_frame"))
+			);
+			engine
+				.commands
+				.send(EditorCommand::Picker(PickerAction::Accept))
+				.expect("same-file jump");
+			let jumped =
+				recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+					viewport.picker.is_none() && viewport.cursor_abs_byte == DocByte::ZERO
+				});
+			assert!(jumped.is_dirty, "same-file jumps must preserve unsaved bytes");
+		}
 
 		engine.commands.send(EditorCommand::Quit).expect("quit");
 		engine.thread.join().expect("engine");

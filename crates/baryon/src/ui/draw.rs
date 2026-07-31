@@ -453,7 +453,7 @@ fn draw_picker_overlay(
 		x.saturating_add(2),
 		y,
 		width.saturating_sub(4),
-		" repo search ",
+		&format!(" {} repo search ", picker.mode.label()),
 		border.add_modifier(Modifier::BOLD),
 	);
 
@@ -473,7 +473,24 @@ fn draw_picker_overlay(
 	);
 
 	let result_rows = height.saturating_sub(4) as usize;
-	for (local_index, result) in picker.results.iter().take(result_rows).enumerate() {
+	if let Some(error) = picker.error.as_deref() {
+		paint_picker_text(
+			buf,
+			inner_x,
+			y.saturating_add(2),
+			inner_width,
+			error,
+			surface
+				.fg(ratatui_color(palette.diff_removed))
+				.add_modifier(Modifier::BOLD),
+		);
+	}
+	for (local_index, result) in picker
+		.results
+		.iter()
+		.take(result_rows)
+		.enumerate()
+	{
 		let absolute_index = picker.first_result.saturating_add(local_index);
 		let style = if absolute_index == picker.selected {
 			selected
@@ -2131,6 +2148,7 @@ mod tests {
 		let palette = UiPalette::default();
 		let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
 		let picker = PickerViewport {
+			mode: libaryon::engine::RepoSearchMode::Fuzzy,
 			query: "render_frame".to_string(),
 			query_cursor: "render".len(),
 			selected: 1,
@@ -2156,6 +2174,7 @@ mod tests {
 			truncated: false,
 			searching: false,
 			files_walked: 9,
+			error: None,
 		};
 		let cursor =
 			draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
@@ -2170,6 +2189,38 @@ mod tests {
 			buffer[(4, selected_row_y)].bg,
 			ratatui_color(palette.tab_active_surface)
 		);
+	}
+
+	#[test]
+	fn regex_picker_labels_its_mode_and_renders_compile_errors_inside_the_modal() {
+		let palette = UiPalette::default();
+		let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+		let picker = PickerViewport {
+			mode: libaryon::engine::RepoSearchMode::Regex,
+			query: "[".to_string(),
+			query_cursor: 1,
+			selected: 0,
+			first_result: 0,
+			results: Vec::new(),
+			shown: 0,
+			matched: 0,
+			truncated: false,
+			searching: false,
+			files_walked: 0,
+			error: Some("Invalid regular expression: unclosed character class".to_string()),
+		};
+		draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
+			.expect("overlay");
+		let screen = (0..20)
+			.map(|y| {
+				(0..80)
+					.map(|x| buffer[(x, y)].symbol())
+					.collect::<String>()
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(screen.contains("regex repo search"));
+		assert!(screen.contains("Invalid regular expression"));
 	}
 
 	#[test]

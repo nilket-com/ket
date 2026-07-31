@@ -69,8 +69,8 @@ pub use self::minimap::{
 pub use self::protocol::{
 	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
 	GitRefreshMode, MouseIntent, MoveDirection, PaneDropEdge, PaneFocusDirection,
-	PaneResizeDirection, PickerAction, PickerCursorMovement, SecretInput, SplitDirection,
-	SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
+	PaneResizeDirection, PickerAction, PickerCursorMovement, RepoSearchMode, SecretInput,
+	SplitDirection, SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{THEME_SPECS, Theme, ThemeFamily, canonical_theme_names};
