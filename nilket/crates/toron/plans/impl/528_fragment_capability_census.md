@@ -70,3 +70,72 @@ Formatting in both crates; all three `--all-targets` checks; Toron library tests
 `architecture_test`; complete Toron `--no-fail-fast`; full `toron-tpch`; `git diff --check`.
 Direct exit statuses and full logs preserved; the battery repeats after any code change made
 in response.
+
+## Measured outcome — fragments_parallel is non-empty (20 of 22 cells)
+
+### Seal
+
+The census rail sealed and pushed as `impl: adr 528 fragment census rail` (`e8be3fb1`). All
+gates returned direct exit 0: both format checks; the three `--all-targets` checks (Toron,
+base TPC-H, Polars-reference); Toron library tests (1,461 pass); full `architecture_test`
+(2,095 pass); the complete Toron `--no-fail-fast` suite (46 green suites); the full
+`toron-tpch` suite including the five new ADR 528 tests and the `adr528` posture/leak guard;
+`git diff --check`. The census ran from the release binary built at `e8be3fb1` (rows stamp
+`build_commit = e8be3fb1532b`) at strict sf=8 persisted Parquet with the explicit 2 GiB
+memory / 2 GiB spill envelope. Artifact root:
+`target/tpch/adr528_fragment_census_e8be3fb1/fragment_census.jsonl`.
+
+### Exact capability matrix (sf=8, distributed posture)
+
+| cell | classification | stages | per-stage widths | max width | single-task producers |
+|---|---|---:|---|---:|---:|
+| q01 | fragments_parallel | 3 | 1,4,1 | 4 | 1 |
+| q02 | fragments_parallel | 4 | 1,1,4,1 | 4 | 2 |
+| q03 | fragments_parallel | 4 | 1,1,4,1 | 4 | 2 |
+| q04 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q05 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q06 | fragments_sequential | 1 | 1 | 1 | 0 |
+| q07 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q08 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q09 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q10 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q11 | fragments_parallel | 4 | 1,1,4,1 | 4 | 2 |
+| q12 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q13 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q14 | fragments_parallel | 3 | 1,1,4 | 4 | 2 |
+| q15 | fragment_rejected (broadcast_probe_not_star_linear) | — | — | — | — |
+| q16 | fragments_parallel | 6 | 1,1,4,4,4,1 | 4 | 2 |
+| q17 | fragments_parallel | 3 | 1,1,4 | 4 | 2 |
+| q18 | fragments_parallel | 4 | 1,1,4,1 | 4 | 2 |
+| q19 | fragments_parallel | 3 | 1,1,4 | 4 | 2 |
+| q20 | fragments_parallel | 4 | 1,1,4,1 | 4 | 2 |
+| q21 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+| q22 | fragments_parallel | 5 | 1,1,4,4,1 | 4 | 2 |
+
+Histogram: `fragments_parallel` 20; `fragments_sequential` 1 (q06 — a zero-exchange scalar
+aggregate is a single-task stage by construction); `fragment_rejected` 1 (q15 —
+`BroadcastProbeNotStarLinear`); `bind_rejected` 0.
+
+Two sharpening facts. First, the census answer is scale-dependent in exactly the way that
+justifies running it at the board coordinate: at a sf=0.01 in-memory smoke, q14 and q19 also
+rejected with `BroadcastProbeNotStarLinear`; at sf=8 their size facts steer the binder away
+from the offending broadcast shape and both fragment. Second, the feared
+`JoinInputNotExchanged` wall never fired — under the distributed posture the binder interposes
+exchanges above join inputs for every multi-join chain on the board.
+
+### Verdict
+
+**The predeclared gate does not close red: `fragments_parallel` = {q01-q05, q07-q14,
+q16-q22} \ {q15} — 20 cells.** The distributed substrate can *plan* query-wide intra-query
+parallelism for nearly the whole board. Per contract, no timing arm, worker execution, or
+substrate comparison ran, and this census proves plan admission only — not executability
+(Decimal128 exchange partition keys and worker budget semantics remain untested walls).
+
+The admitted shape is uniform and narrow: maximum stage width 4 everywhere (the planner's
+default aggregate/join partition count), with every scan-side producer pinned to one task.
+The parallelism ceiling the current fragmenter admits is therefore consumer-side width 4
+with sequential scans — the scan stages that dominate sf=8 cost run single-task even when
+fragmented. A follow-up ADR must decide the three named comparison blockers (per-task budget
+multiplication, single-task producers, TCP-only transport) before any timing arm exists;
+the width facts here say producer parallelism is not just a fairness blocker but the
+first-order one.
