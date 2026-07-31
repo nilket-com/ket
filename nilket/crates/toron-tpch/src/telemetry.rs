@@ -493,6 +493,12 @@ impl FragmentCensusRow {
 /// authority. The complete distributed envelope travels as the typed `QueryBudget`; the explicit
 /// task-memory envelope is separate because `memory_per_task * admitted_width` bounds concurrent
 /// task allowances, not shuffle-store, transport, result, spill, or broadcast residency.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionCensusBackpressureReceipt {
+	pub worker_id: toron::distributed::identity::WorkerId,
+	pub observation: toron::distributed::partition_store::LivePartitionBackpressureObservation,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionCensusRow {
 	pub query: String,
@@ -523,6 +529,7 @@ pub struct ExecutionCensusRow {
 	pub memory_pool_max_buffer_capacity_bytes: usize,
 	pub distributed_attempts: usize,
 	pub transport_retry: bool,
+	pub live_backpressure_receipts: Vec<ExecutionCensusBackpressureReceipt>,
 	pub dataset_verification: Option<DatasetVerification>,
 	pub local_elapsed_ms: Option<f64>,
 	pub distributed_elapsed_ms: Option<f64>,
@@ -587,6 +594,7 @@ impl ExecutionCensusRow {
 			"memory_pool_max_buffer_capacity_bytes": self.memory_pool_max_buffer_capacity_bytes,
 			"distributed_attempts": self.distributed_attempts,
 			"transport_retry": self.transport_retry,
+			"live_backpressure_receipts": self.live_backpressure_receipts,
 			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
 			"local_elapsed_ms": self.local_elapsed_ms,
 			"distributed_elapsed_ms": self.distributed_elapsed_ms,

@@ -51,10 +51,11 @@ use toron::binder::{
 use toron::catalog::{Catalog, MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
 use toron::coordinator::DistributedQueryCoordinator;
 use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+use toron::distributed::cancellation::CancellationTrigger;
 use toron::distributed::context::TaskExecutionContext;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
-use toron::distributed::identity::{LeaseEpoch, WorkerId};
+use toron::distributed::identity::{LeaseEpoch, QueryId, WorkerId};
 use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::scheduler::StagePlan;
 use toron::distributed::task::{
@@ -82,8 +83,9 @@ use wendelon::schema::{
 };
 
 use telemetry::{
-	Attempt, CorrectnessAttempt, DatasetVerification, ExecutionCensusRow, FragmentCensusRow,
-	PerfAttempt, PerfPhaseTimings, Phase, Status, reason_for_error, status_for_reason,
+	Attempt, CorrectnessAttempt, DatasetVerification, ExecutionCensusBackpressureReceipt,
+	ExecutionCensusRow, FragmentCensusRow, PerfAttempt, PerfPhaseTimings, Phase, Status,
+	reason_for_error, status_for_reason,
 };
 
 /// Default cache / output root — always under `target/`, never a tracked path.
@@ -5251,6 +5253,7 @@ fn execution_census_query_error_reason(error: &QueryError) -> String {
 
 struct ExecutionCensusWorkerHarness {
 	entry: WorkerEntry,
+	partition_store: Arc<InMemoryPartitionStore>,
 	shutdown: tokio::sync::oneshot::Sender<()>,
 	handle: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -5275,10 +5278,11 @@ async fn spawn_execution_census_worker(
 		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
 		memory_pool_max_buffer_capacity_bytes,
 	));
+	let partition_store = Arc::new(InMemoryPartitionStore::with_budget(budget));
 	let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
 		storage,
 		memory,
-		Arc::new(InMemoryPartitionStore::with_budget(budget)),
+		partition_store.clone(),
 		worker_id,
 		endpoint.clone(),
 	));
@@ -5323,9 +5327,72 @@ async fn spawn_execution_census_worker(
 			},
 			status: WorkerStatus::Live,
 		},
+		partition_store,
 		shutdown,
 		handle,
 	})
+}
+
+enum ExecutionCensusDistributedAttempt {
+	Completed(Result<Vec<RecordBatch>, QueryError>),
+	LiveBackpressure(Vec<ExecutionCensusBackpressureReceipt>),
+}
+
+async fn execute_census_distributed_attempt(
+	coordinator: &DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>,
+	workers: &[ExecutionCensusWorkerHarness],
+	logical: &LogicalPlan,
+	budget: QueryBudget,
+) -> Result<ExecutionCensusDistributedAttempt, String> {
+	let tenant_id = toron::storage::TenantId(1);
+	let context = ExecutionContext::new(
+		toron::ir::SessionId(529),
+		QueryId::new(),
+		tenant_id,
+		toron::storage::HlcBound(1),
+	)
+	.with_task_budget(TaskBudget::from_query_budget(budget));
+	let query_id = context.query_id;
+	let mut execution = Box::pin(coordinator.execute_query_with_context(logical, context));
+	let mut observation_tick = tokio::time::interval(std::time::Duration::from_millis(1));
+	observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		tokio::select! {
+			biased;
+			result = &mut execution => {
+				return Ok(ExecutionCensusDistributedAttempt::Completed(result));
+			}
+			_ = observation_tick.tick() => {
+				let receipts = workers
+					.iter()
+					.filter_map(|worker| {
+						let observation = worker
+							.partition_store
+							.live_backpressure_observation(query_id);
+						(observation.blocked_appenders > 0).then_some(
+							ExecutionCensusBackpressureReceipt {
+								worker_id: worker.entry.worker_id,
+								observation,
+							},
+						)
+					})
+					.collect::<Vec<_>>();
+				if receipts.is_empty() {
+					continue;
+				}
+				coordinator.cancel_query_for_tenant(
+					tenant_id,
+					query_id,
+					CancellationTrigger::SqlCancel,
+				);
+				let _cancellation_result =
+					tokio::time::timeout(std::time::Duration::from_secs(5), &mut execution)
+					.await
+					.map_err(|_| "execution census backpressure cancellation did not quiesce".to_string())?;
+				return Ok(ExecutionCensusDistributedAttempt::LiveBackpressure(receipts));
+			}
+		}
+	}
 }
 
 async fn shutdown_execution_census_workers(
@@ -5418,6 +5485,7 @@ async fn run_execution_census_input(
 				.unwrap_or(usize::MAX),
 				distributed_attempts: 0,
 				transport_retry: false,
+				live_backpressure_receipts: Vec::new(),
 				dataset_verification: input.dataset_verification,
 				local_elapsed_ms: Some(local_elapsed_ms),
 				distributed_elapsed_ms: None,
@@ -5471,39 +5539,68 @@ async fn run_execution_census_input(
 	let distributed_start = Instant::now();
 	let mut distributed_attempts = 1;
 	let mut transport_retry = false;
-	let mut distributed_result = coordinator.execute_query(&preflight.logical).await;
-	if matches!(distributed_result, Err(QueryError::Io(_))) {
-		transport_retry = true;
-		distributed_attempts += 1;
-		distributed_result = coordinator.execute_query(&preflight.logical).await;
-	}
+	let first_attempt = execute_census_distributed_attempt(
+		&coordinator,
+		&workers,
+		&preflight.logical,
+		distributed_budget,
+	)
+	.await?;
+	let (distributed_result, live_backpressure_receipts) = match first_attempt {
+		ExecutionCensusDistributedAttempt::Completed(Err(QueryError::Io(_))) => {
+			transport_retry = true;
+			distributed_attempts += 1;
+			match execute_census_distributed_attempt(
+				&coordinator,
+				&workers,
+				&preflight.logical,
+				distributed_budget,
+			)
+			.await?
+			{
+				ExecutionCensusDistributedAttempt::Completed(result) => (Some(result), Vec::new()),
+				ExecutionCensusDistributedAttempt::LiveBackpressure(receipts) => (None, receipts),
+			}
+		}
+		ExecutionCensusDistributedAttempt::Completed(result) => (Some(result), Vec::new()),
+		ExecutionCensusDistributedAttempt::LiveBackpressure(receipts) => (None, receipts),
+	};
 	let distributed_elapsed_ms = distributed_start.elapsed().as_secs_f64() * 1000.0;
 	shutdown_execution_census_workers(workers).await?;
 
 	let (classification, reason, distributed_identity, diagnostic_message) =
-		match distributed_result {
-			Ok(batches) => {
-				let identity = execution_identity_facts(&batches)?;
-				let identical = local_identity.digest == identity.digest
-					&& local_identity.row_count == identity.row_count
-					&& local_identity.schema_fingerprint == identity.schema_fingerprint;
-				(
-					if identical {
-						"executes_identical"
-					} else {
-						"executes_divergent"
-					},
-					None,
-					Some(identity),
-					None,
-				)
-			}
-			Err(error) => (
+		if !live_backpressure_receipts.is_empty() {
+			(
 				"execution_rejected",
-				Some(execution_census_query_error_reason(&error)),
+				Some("live_shuffle_backpressure_stalled".to_string()),
 				None,
-				Some(format!("{error:?}")),
-			),
+				Some(format!("{live_backpressure_receipts:?}")),
+			)
+		} else {
+			match distributed_result.expect("completed attempt has a result") {
+				Ok(batches) => {
+					let identity = execution_identity_facts(&batches)?;
+					let identical = local_identity.digest == identity.digest
+						&& local_identity.row_count == identity.row_count
+						&& local_identity.schema_fingerprint == identity.schema_fingerprint;
+					(
+						if identical {
+							"executes_identical"
+						} else {
+							"executes_divergent"
+						},
+						None,
+						Some(identity),
+						None,
+					)
+				}
+				Err(error) => (
+					"execution_rejected",
+					Some(execution_census_query_error_reason(&error)),
+					None,
+					Some(format!("{error:?}")),
+				),
+			}
 		};
 	let (distributed_digest, distributed_row_count, distributed_schema_fingerprint) =
 		distributed_identity.map_or((None, None, None), |identity| {
@@ -5546,6 +5643,7 @@ async fn run_execution_census_input(
 		memory_pool_max_buffer_capacity_bytes,
 		distributed_attempts,
 		transport_retry,
+		live_backpressure_receipts,
 		dataset_verification: input.dataset_verification,
 		local_elapsed_ms: Some(local_elapsed_ms),
 		distributed_elapsed_ms: Some(distributed_elapsed_ms),
@@ -18043,6 +18141,7 @@ mod adr529_execution_census {
 		assert_eq!(value["partition_store"], "in_memory");
 		assert_eq!(value["distributed_attempts"], 1);
 		assert_eq!(value["transport_retry"], false);
+		assert_eq!(value["live_backpressure_receipts"], serde_json::json!([]));
 		assert_eq!(
 			value["distributed_budget"]["spill_bytes_reserved_per_query"],
 			EXECUTION_CENSUS_SPILL_BYTES

@@ -351,6 +351,16 @@ fn adr529_execution_census_is_explicit_and_does_not_leak_workers() {
 		lib.contains("InMemoryPartitionStore::with_budget(budget)"),
 		"the census must retain the production worker's in-memory partition store semantics"
 	);
+	assert_eq!(
+		lib.matches(".live_backpressure_observation(query_id)")
+			.count(),
+		1,
+		"only the explicit census may consume the behavior-neutral live-backpressure receipt"
+	);
+	assert!(
+		lib.contains("\"live_shuffle_backpressure_stalled\""),
+		"the receipt-backed liveness wall vocabulary is pinned"
+	);
 	assert!(
 		!main.contains("Phase::Fragment"),
 		"the CLI cannot counterfeit a typed preflight phase"

@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use arrow::datatypes::SchemaRef;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
@@ -326,6 +327,7 @@ struct LivePartition {
 	downstream_cancellation: Option<DownstreamCancellationContext>,
 	notify: Arc<Notify>,
 	pacing_semaphore: Arc<Semaphore>,
+	blocked_appenders: Arc<AtomicUsize>,
 	active_readers: usize,
 	farthest_released_index: usize,
 }
@@ -342,6 +344,7 @@ impl LivePartition {
 			downstream_cancellation: None,
 			notify: Arc::new(Notify::new()),
 			pacing_semaphore: Arc::new(Semaphore::new(LIVE_BACKLOG_DEPTH)),
+			blocked_appenders: Arc::new(AtomicUsize::new(0)),
 			active_readers: 0,
 			farthest_released_index: 0,
 		}
@@ -369,6 +372,52 @@ impl InMemoryPartitionStore {
 
 	pub fn budget_used(&self, dimension: BudgetDimension) -> ByteCount {
 		self.budget.used(dimension)
+	}
+
+	/// Behavior-neutral liveness receipt for a query's live shuffle partitions. A nonzero
+	/// `blocked_appenders` value means a producer is awaiting the existing bounded-backlog
+	/// semaphore; this method does not wake, cancel, or otherwise mutate the store.
+	pub fn live_backpressure_observation(
+		&self,
+		query_id: QueryId,
+	) -> LivePartitionBackpressureObservation {
+		let inner = self.inner.read().expect("partition store poisoned");
+		let mut observation = LivePartitionBackpressureObservation {
+			query_id,
+			..LivePartitionBackpressureObservation::default()
+		};
+		for (address, live) in &inner.live_partitions {
+			if address.query_id != query_id {
+				continue;
+			}
+			observation.live_partitions += 1;
+			observation.buffered_chunks += live.chunks.len();
+			observation.blocked_appenders += live.blocked_appenders.load(Ordering::Acquire);
+		}
+		observation
+	}
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePartitionBackpressureObservation {
+	pub query_id: QueryId,
+	pub live_partitions: usize,
+	pub buffered_chunks: usize,
+	pub blocked_appenders: usize,
+}
+
+struct BlockedAppenderGuard(Arc<AtomicUsize>);
+
+impl BlockedAppenderGuard {
+	fn new(counter: Arc<AtomicUsize>) -> Self {
+		counter.fetch_add(1, Ordering::AcqRel);
+		Self(counter)
+	}
+}
+
+impl Drop for BlockedAppenderGuard {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::AcqRel);
 	}
 }
 
@@ -500,7 +549,7 @@ impl PartitionStore for InMemoryPartitionStore {
 	}
 
 	async fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
-		let semaphore = {
+		let (semaphore, blocked_appenders) = {
 			let inner = self.inner.read().expect("partition store poisoned");
 			if inner.cancelled_queries.contains(&payload.address.query_id) {
 				return Err(PartitionStoreError::CancelledQuery {
@@ -513,7 +562,10 @@ impl PartitionStore for InMemoryPartitionStore {
 						query_id: payload.address.query_id,
 					});
 				}
-				Some(live) => live.pacing_semaphore.clone(),
+				Some(live) => (
+					live.pacing_semaphore.clone(),
+					live.blocked_appenders.clone(),
+				),
 				None => {
 					drop(inner);
 					let mut inner = self.inner.write().expect("partition store poisoned");
@@ -531,11 +583,16 @@ impl PartitionStore for InMemoryPartitionStore {
 							query_id: payload.address.query_id,
 						});
 					}
-					live.pacing_semaphore.clone()
+					(
+						live.pacing_semaphore.clone(),
+						live.blocked_appenders.clone(),
+					)
 				}
 			}
 		};
 
+		let blocked = (semaphore.available_permits() == 0)
+			.then(|| BlockedAppenderGuard::new(blocked_appenders));
 		let permit =
 			semaphore
 				.acquire_owned()
@@ -543,6 +600,7 @@ impl PartitionStore for InMemoryPartitionStore {
 				.map_err(|_| PartitionStoreError::CancelledQuery {
 					query_id: payload.address.query_id,
 				})?;
+		drop(blocked);
 		let reservation = self
 			.budget
 			.reserve(BudgetDimension::ShuffleBytes, payload.size_bytes())?;
@@ -1548,6 +1606,16 @@ mod tests {
 				.is_err(),
 			"append beyond live backlog depth should wait for a reader"
 		);
+		assert_eq!(
+			store.live_backpressure_observation(address.query_id),
+			LivePartitionBackpressureObservation {
+				query_id: address.query_id,
+				live_partitions: 1,
+				buffered_chunks: LIVE_BACKLOG_DEPTH,
+				blocked_appenders: 1,
+			},
+			"the liveness receipt must report the existing wait without mutating it"
+		);
 
 		let mut stream = store
 			.pull_live(address, AttemptId::first())
@@ -1564,6 +1632,13 @@ mod tests {
 			.expect("blocked append should resume after one pull")
 			.expect("append task")
 			.expect("append after pull");
+		assert_eq!(
+			store
+				.live_backpressure_observation(address.query_id)
+				.blocked_appenders,
+			0,
+			"the receipt must clear when the waiter resumes"
+		);
 	}
 
 	#[tokio::test]

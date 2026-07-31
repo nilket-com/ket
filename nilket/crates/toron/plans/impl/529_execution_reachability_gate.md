@@ -60,15 +60,21 @@ separately disclosed.
    budget reasons include their typed dimension. `QueryError::Internal` is the recognized
    `query_internal` reason with its message because the coordinator intentionally erases several
    internal source types at that boundary. Nothing lands in an unrecognized bucket and no string
-   parsing counterfeits a typed wall.
+   parsing counterfeits a typed wall. Scale grounding exposed one non-returning production path:
+   `InMemoryPartitionStore`'s four-chunk live backlog can block a producer before the scheduler
+   starts its downstream stage. A behavior-neutral `LivePartitionBackpressureObservation` counts
+   appenders actually awaiting that existing semaphore. A nonzero receipt authorizes
+   `live_shuffle_backpressure_stalled` and cancellation for cleanup; no elapsed threshold decides
+   the classification and no scheduler/store behavior changes.
 3. `execution-census` command mirroring `fragment-census`: q01-q22 or `--query`, JSONL +
    human rows + histogram + summary; exits nonzero only on harness errors, never on an
    honest wall.
 4. Tests: two-worker digest parity on small memory fixtures (a grouped aggregate and a join
    at sf=0.01) pinning `executes_identical` mechanics end-to-end; a forced-tiny-budget cell
    pinning a typed `execution_rejected` budget classification; envelope-disclosure and
-   vocabulary coherence on the row; the ADR 528 leak guard extended: no default rail
-   constructs workers or the coordinator, census posture stays census-only.
+   vocabulary coherence on the row; the store test pins blocked-appender receipt lifecycle; the
+   ADR 528 leak guard extended: no default rail constructs workers or the coordinator, and only
+   the census consumes the liveness receipt.
 
 ## Step 2 - seal and gates
 

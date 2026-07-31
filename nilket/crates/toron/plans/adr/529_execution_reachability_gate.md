@@ -63,7 +63,11 @@ answers?
    `execution_rejected(fragment_broadcast_probe_not_star_linear)` at phase `fragment`,
    preserving ADR 528's typed `BroadcastProbeNotStarLinear` wall under this rail's vocabulary.
    `QueryError::Internal` is a recognized coarse reason with its diagnostic message, never a
-   fabricated finer type.
+   fabricated finer type. The production in-memory store also exposes a behavior-neutral typed
+   live-backpressure observation: if a producer is actually awaiting the existing four-chunk
+   pacing semaphore before its downstream stage can start, the rail cancels it for cleanup and
+   emits `execution_rejected(live_shuffle_backpressure_stalled)` with the per-worker receipt.
+   No elapsed threshold or timeout decides that verdict.
 5. **No timing authority.** Elapsed fields are diagnostic. A thread/substrate timing atlas
    is a separate follow-up authorized only over `executes_identical` cells, with thresholds
    predeclared there, and must carry the transport-floor disclosure.
@@ -85,7 +89,8 @@ correctness findings that outrank every other thread on this board.
 3. The envelope — divisor, frontier cap, and every budget dimension — is recorded verbatim on
    every row; worker count and transport are named on the row.
 4. Typed classification is total over the distributed-side error surface; no wall lands in an
-   unrecognized bucket.
+   unrecognized bucket. A live-shuffle liveness wall requires a nonzero blocked-appender receipt,
+   not elapsed-time inference.
 5. The full q01-q22 matrix with the wall histogram lands in the impl doc. Standard gates pass
    from the final tree.
 

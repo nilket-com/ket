@@ -221,6 +221,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/coordinator.rs",
 				"crates/toron/src/daemon.rs",
 				"crates/toron/src/distributed/fragment.rs",
+				// ADR 529: behavior-neutral live-shuffle backpressure receipt consumed only by
+				// the explicit execution census rail.
+				"crates/toron/src/distributed/partition_store.rs",
 				"crates/toron/src/distributed/scheduler.rs",
 				"crates/toron/src/distributed/task.rs",
 				// ADR 340: BudgetExhausted carries a producer label so scale wall-movers can be
