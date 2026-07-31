@@ -78,3 +78,56 @@ default-arm smokes from the flipped tree; both-way verdicts.
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Phase 0 result — closed red: the honest net does not clear the floor
+
+**The SQL twin was shape-unreachable.** The derived-table membership form bound and returned
+identical digests, but it broke the reoriented-chain recognition entirely — eight generic join
+nodes, `uncovered_generic_fold`, no suffix chain — and ran **slower** than the original
+(median −813.6 ms over 5 interleaved pairs). It priced "chain shape lost plus membership
+added", not the mechanism, and was discarded as evidence of the mechanism (retained as
+evidence that the membership edge must not disturb chain recognition — a hazard the mechanism
+implementation would have had to avoid). The probe patch was reverted with a targeted edit.
+
+**The dataset twin bound the intended shape exactly.** A full-hash-verified format-2 twin root
+(preimage replication validated against the live manifest fingerprint before use) with
+lineitem filtered to the 9,623,900 ASIA-supplier rows, all other tables byte-identical.
+The sealed binary keeps the `reoriented_inner_chain_grouped` route with exactly the predicted
+volumes — suffix build 9,623,900, suffix-1 emissions 1,460,247, downstream 58,990 — and equal
+digests on every pair.
+
+| pair | orig | twin | delta |
+|---:|---:|---:|---:|
+| 1 | 6,538.0 | 1,912.1 | 4,625.9 |
+| 2 | 6,419.1 | 1,894.6 | 4,524.5 |
+| 3 | 6,454.1 | 1,907.3 | 4,546.9 |
+| 4 | 6,416.3 | 1,898.9 | 4,517.4 |
+| 5 | 6,411.0 | 1,903.5 | 4,507.4 |
+
+Median gross ceiling **+4,524.5 ms** — but the twin pays none of the mechanism's costs. The
+ADR 513 ledger, with measured bases:
+
+| ledger row | basis | cost |
+|---|---|---:|
+| source acquisition (supplier ⋈ nation ⋈ region → 16,042 keys, executed twice) | original runtime_prep throughput over 80,026 input rows | ~50-100 ms |
+| the semi's 48,000,000-row pass | m06 (48M probes vs a 12M-key build, 1,784 ms at this coordinate) as the upper bound; a 16,042-key cache-resident build realistically 400-800 ms | 400-1,500 ms |
+| scan volume the twin removed but the mechanism keeps (twin scans 9.6M rows; the mechanism scans all 48M) | measured scan node 0.72 → 0.21 s | ~510 ms |
+
+Net attainable = 4,524.5 − (960 … 2,110) = **2,415 … 3,565 ms**. Even the optimistic edge of
+the window only touches the 3,554 ms floor; the realistic center (~3,265 ms) and conservative
+edge sit below it. Per the predeclared rule — implement only if the net clears — **ADR 522
+closes red here.** No mechanism code was written; the knob was never created.
+
+**What the ledger teaches, for successors.** About 1-2 s of the gross ceiling is structurally
+unreachable by any branch-semi mechanism, because the semi itself must traverse all 48M rows
+the build traversal already pays for. The two named routes to the remaining ~4.5 s are:
+(1) build reorientation — make lineitem the scan-linear probe side so no 48M-row build or
+semi pass exists at all (the deferred second fork, now to be grounded on the **unchanged**
+original shape); (2) a scan-pushed reachable-key filter — fusing the 16,042-key membership
+into the scan's existing decode as a row filter, which recovers most of the semi cost by
+piggybacking the traversal the scan already performs; that is a different mechanism class
+(scan pushdown, PBC-adjacent) with its own safety story, not this ADR's branch-semi rule.
+
+Phase 0 artifacts: `target/tpch/adr522_p0_q05_p{1..5}_{orig,twin}` (SQL twin),
+`target/tpch/adr522_dt_q05_p{1..5}_{orig,twin}` + `adr522_dt_instr_twin` (dataset twin),
+twin root `target/tpch/adr522_twin_q05/strict/sf8/` (manifest `fnv1a64:f9e19ba9d33defa5`).
