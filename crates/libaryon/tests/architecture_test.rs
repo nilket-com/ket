@@ -172,3 +172,31 @@ fn semantic_none_is_the_only_neutral_kind_and_never_decides_liveness() {
 		"SemanticKind::None is an algebra value, never a liveness sentinel"
 	);
 }
+
+#[test]
+fn semantic_kind_source_carries_the_normative_vocabulary_contract() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let kind_source =
+		fs::read_to_string(manifest_dir.join("src/uast/kind.rs")).expect("semantic kind source");
+	let normalized_docs = kind_source
+		.lines()
+		.filter_map(|line| line.trim_start().strip_prefix("///"))
+		.map(str::trim)
+		.collect::<Vec<_>>()
+		.join(" ");
+
+	for required_contract in [
+		"The identity element of semantic interpretation",
+		"Establishes a semantic context containing addressable members or nested",
+		"One addressable member of a semantic context",
+		"Residual syntax not promoted to a table or row",
+		"not guaranteed to be a topology leaf",
+		"Consumers must determine leafness from topology (`first_child`), never from this semantic kind",
+		"does not promise Codd set semantics",
+	] {
+		assert!(
+			normalized_docs.contains(required_contract),
+			"SemanticKind must retain ADR 0003's normative contract: {required_contract}"
+		);
+	}
+}
