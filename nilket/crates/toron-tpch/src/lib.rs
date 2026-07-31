@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arrow::array::{
@@ -5254,6 +5254,7 @@ fn execution_census_query_error_reason(error: &QueryError) -> String {
 struct ExecutionCensusWorkerHarness {
 	entry: WorkerEntry,
 	partition_store: Arc<InMemoryPartitionStore>,
+	cancellation_cleanup: Arc<AtomicBool>,
 	shutdown: tokio::sync::oneshot::Sender<()>,
 	handle: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -5287,6 +5288,8 @@ async fn spawn_execution_census_worker(
 		endpoint.clone(),
 	));
 	let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+	let cancellation_cleanup = Arc::new(AtomicBool::new(false));
+	let worker_cleanup = cancellation_cleanup.clone();
 	let handle = tokio::spawn(async move {
 		let mut connections = tokio::task::JoinSet::new();
 		loop {
@@ -5304,7 +5307,11 @@ async fn spawn_execution_census_worker(
 			}
 		}
 		while let Some(result) = connections.join_next().await {
-			result.map_err(|error| format!("execution census worker task join: {error}"))??;
+			match result.map_err(|error| format!("execution census worker task join: {error}"))? {
+				Ok(()) => {}
+				Err(_) if worker_cleanup.load(Ordering::Acquire) => {}
+				Err(error) => return Err(error),
+			}
 		}
 		Ok(())
 	});
@@ -5328,6 +5335,7 @@ async fn spawn_execution_census_worker(
 			status: WorkerStatus::Live,
 		},
 		partition_store,
+		cancellation_cleanup,
 		shutdown,
 		handle,
 	})
@@ -5379,6 +5387,9 @@ async fn execute_census_distributed_attempt(
 					.collect::<Vec<_>>();
 				if receipts.is_empty() {
 					continue;
+				}
+				for worker in workers {
+					worker.cancellation_cleanup.store(true, Ordering::Release);
 				}
 				coordinator.cancel_query_for_tenant(
 					tenant_id,

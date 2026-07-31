@@ -65,7 +65,9 @@ separately disclosed.
    starts its downstream stage. A behavior-neutral `LivePartitionBackpressureObservation` counts
    appenders actually awaiting that existing semaphore. A nonzero receipt authorizes
    `live_shuffle_backpressure_stalled` and cancellation for cleanup; no elapsed threshold decides
-   the classification and no scheduler/store behavior changes.
+   the classification and no scheduler/store behavior changes. Worker connection errors are
+   ignored only after that typed receipt has armed cancellation cleanup; without the receipt they
+   remain harness failures.
 3. `execution-census` command mirroring `fragment-census`: q01-q22 or `--query`, JSONL +
    human rows + histogram + summary; exits nonzero only on harness errors, never on an
    honest wall.
