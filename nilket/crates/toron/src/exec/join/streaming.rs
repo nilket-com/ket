@@ -1592,7 +1592,10 @@ pub(in crate::exec) struct SuffixProbeBuildFacts {
 	shape: super::build_rows::JoinBuildProfileShape,
 	build_rows: u64,
 	build_batch_bytes: u64,
-	key_width_bytes: u64,
+	key_width_bytes: Option<u64>,
+	key_width_unknown_reason: Option<&'static str>,
+	retained_bytes: Option<u64>,
+	retained_bytes_unknown_reason: Option<&'static str>,
 	unsupported_reason: Option<&'static str>,
 }
 
@@ -1601,23 +1604,61 @@ impl SuffixProbeBuildFacts {
 		key_plan: JoinKeyPlan,
 		build_batch: &RecordBatch,
 		build_rows: &JoinBuildRows,
+		probe_batch: &RecordBatch,
+		probe_keys: &[crate::ir::ColumnOrdinal],
 	) -> Self {
-		let (key_width_bytes, unsupported_reason) = match key_plan {
-			JoinKeyPlan::Int32 => (4, None),
-			JoinKeyPlan::Int64 => (8, None),
-			JoinKeyPlan::Generic => (
-				0,
-				Some("generic suffix keys have no batch-window timing boundary"),
-			),
+		let (key_width_bytes, key_width_unknown_reason) = match key_plan {
+			JoinKeyPlan::Int32 => (Some(4), None),
+			JoinKeyPlan::Int64 => (Some(8), None),
+			JoinKeyPlan::Generic => {
+				let mut width = 0u64;
+				let mut reason = None;
+				let probe_schema = probe_batch.schema();
+				for key in probe_keys {
+					let ordinal = usize::try_from(key.0).expect("column ordinal fits usize");
+					let Some(field) = probe_schema.fields().get(ordinal) else {
+						reason = Some("suffix key ordinal is outside the probe schema");
+						break;
+					};
+					let column_width = match field.data_type() {
+						DataType::Int32 => 4,
+						DataType::Int64 => 8,
+						_ => {
+							reason = Some(
+								"generic suffix key width is not exact fixed-width Int32/Int64",
+							);
+							break;
+						}
+					};
+					let Some(next) = width.checked_add(column_width) else {
+						reason = Some("suffix key width overflowed");
+						break;
+					};
+					width = next;
+				}
+				(reason.is_none().then_some(width), reason)
+			}
+		};
+		let shape = build_rows.profile_shape();
+		let build_batch_bytes = record_batch_memory_bytes(build_batch);
+		let (retained_bytes, retained_bytes_unknown_reason) = match shape.index_accounted_bytes {
+			Some(index_bytes) => match build_batch_bytes.checked_add(index_bytes) {
+				Some(bytes) => (Some(bytes), None),
+				None => (None, Some("suffix retained-byte sum overflowed")),
+			},
+			None => (None, shape.index_accounted_bytes_unknown_reason),
 		};
 		Self {
-			// `accounted_bytes()` walks the build entries. This constructor is therefore called
-			// only behind the runtime's one-time cache, never from a suffix probe call directly.
-			shape: build_rows.profile_shape(),
+			// ADR 524: every fact here is O(1). Generic index ownership stays explicitly unknown
+			// rather than walking entries from the hot suffix-probe lifecycle.
+			shape,
 			build_rows: u64::try_from(build_batch.num_rows()).unwrap_or(u64::MAX),
-			build_batch_bytes: record_batch_memory_bytes(build_batch),
+			build_batch_bytes,
 			key_width_bytes,
-			unsupported_reason,
+			key_width_unknown_reason,
+			retained_bytes,
+			retained_bytes_unknown_reason,
+			unsupported_reason: None,
 		}
 	}
 }
@@ -1649,7 +1690,10 @@ struct SuffixProbeCallProfile {
 	build_shape: Option<super::build_rows::JoinBuildProfileShape>,
 	build_rows: u64,
 	build_batch_bytes: u64,
-	key_width_bytes: u64,
+	key_width_bytes: Option<u64>,
+	key_width_unknown_reason: Option<&'static str>,
+	retained_bytes: Option<u64>,
+	retained_bytes_unknown_reason: Option<&'static str>,
 	unsupported_reason: Option<&'static str>,
 }
 
@@ -1677,6 +1721,9 @@ impl SuffixProbeCallProfile {
 				|| self.build_rows != facts.build_rows
 				|| self.build_batch_bytes != facts.build_batch_bytes
 				|| self.key_width_bytes != facts.key_width_bytes
+				|| self.key_width_unknown_reason != facts.key_width_unknown_reason
+				|| self.retained_bytes != facts.retained_bytes
+				|| self.retained_bytes_unknown_reason != facts.retained_bytes_unknown_reason
 			{
 				self.unsupported_reason = Some("suffix build shape changed within one replay call");
 			}
@@ -1685,6 +1732,9 @@ impl SuffixProbeCallProfile {
 			self.build_rows = facts.build_rows;
 			self.build_batch_bytes = facts.build_batch_bytes;
 			self.key_width_bytes = facts.key_width_bytes;
+			self.key_width_unknown_reason = facts.key_width_unknown_reason;
+			self.retained_bytes = facts.retained_bytes;
+			self.retained_bytes_unknown_reason = facts.retained_bytes_unknown_reason;
 		}
 	}
 
@@ -1700,7 +1750,8 @@ impl SuffixProbeCallProfile {
 				distinct_keys: 0,
 				entry_capacity: 0,
 				bucket_capacity: 0,
-				index_accounted_bytes: 0,
+				index_accounted_bytes: None,
+				index_accounted_bytes_unknown_reason: Some("suffix build facts were not observed"),
 			});
 		node_attribution::SuffixProbeObservation {
 			replay_id,
@@ -1726,9 +1777,13 @@ impl SuffixProbeCallProfile {
 			distinct_keys: shape.distinct_keys,
 			build_batch_bytes: self.build_batch_bytes,
 			index_accounted_bytes: shape.index_accounted_bytes,
+			index_accounted_bytes_unknown_reason: shape.index_accounted_bytes_unknown_reason,
+			retained_bytes: self.retained_bytes,
+			retained_bytes_unknown_reason: self.retained_bytes_unknown_reason,
 			entry_capacity: shape.entry_capacity,
 			bucket_capacity: shape.bucket_capacity,
 			key_width_bytes: self.key_width_bytes,
+			key_width_unknown_reason: self.key_width_unknown_reason,
 		}
 	}
 }
@@ -1966,6 +2021,15 @@ enum ReorientedStageScanBuildDecision {
 	StreamMaterializedBatches(Vec<RecordBatch>),
 	Materialized,
 	MaterializedBatches(Vec<RecordBatch>),
+}
+
+enum ReorientedStagePrep<'a> {
+	Deferred {
+		stage: ReorientedInnerJoinStage<'a>,
+		scan_probe_batches: Option<Vec<RecordBatch>>,
+		needs_decision_fallback: bool,
+	},
+	Runtime(Option<ReorientedInnerJoinRuntime<'a>>),
 }
 
 fn reoriented_stage_scan_build_decision_for_materialized_batches(
@@ -2422,6 +2486,16 @@ fn scan_probe_base_variants(
 		.collect();
 	for stage in stages {
 		let replay = Some(u64::from(stage.replay_id.0));
+		for (name, parent) in [
+			("prep_build", Some("runtime_prep")),
+			("cleanup_build", Some("cleanup")),
+		] {
+			required.push(RequiredStage {
+				name,
+				parent,
+				replay,
+			});
+		}
 		required.push(RequiredStage {
 			name: "suffix_probe",
 			parent: None,
@@ -11328,70 +11402,107 @@ impl Executor {
 			.as_ref()
 			.and_then(|h| node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry));
 		for (stage_index, stage) in stages.into_iter().enumerate() {
-			if stage_index + 1 == stage_count
-				&& self.reoriented_terminal_scan_build_estimated_over_cap(&stage, morsel)
-			{
-				deferred_stream_stage = Some((stage, None, true));
-				break;
-			}
-			let scan_build_decision = if force_stream_projected_filtered_base
-				&& matches!(
-					base_scan_probe_mode,
-					Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
-				) {
-				ReorientedStageScanBuildDecision::Stream
-			} else if aggregate_input_wrapped {
-				if self
-					.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
-					.await?
+			let replay_id = u64::from(stage.replay_id.0);
+			let prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"runtime_prep",
+					"prep_build",
+					replay_id,
+					&attribution_telemetry,
+				)
+			});
+			let prepared: Result<ReorientedStagePrep<'_>, ExecutionError> = async {
+				if stage_index + 1 == stage_count
+					&& self.reoriented_terminal_scan_build_estimated_over_cap(&stage, morsel)
 				{
-					ReorientedStageScanBuildDecision::Stream
-				} else {
-					ReorientedStageScanBuildDecision::Materialized
-				}
-			} else {
-				self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
-					.await?
-			};
-			let scan_build_decision = if stage_index + 1 == stage_count {
-				match scan_build_decision {
-					ReorientedStageScanBuildDecision::Stream => {
-						deferred_stream_stage = Some((stage, None, false));
-						break;
-					}
-					ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches) => {
-						deferred_stream_stage = Some((stage, Some(batches), false));
-						break;
-					}
-					other => other,
-				}
-			} else {
-				scan_build_decision
-			};
-			let runtime = match scan_build_decision {
-				ReorientedStageScanBuildDecision::Stream
-				| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
-					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
-						stage, morsel,
-					)
-					.await?
-				}
-				ReorientedStageScanBuildDecision::Materialized => {
-					self.prepare_reoriented_inner_join_runtime(stage, morsel)
-						.await?
-				}
-				ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
-					self.prepare_reoriented_inner_join_runtime_from_build_batches(
+					return Ok(ReorientedStagePrep::Deferred {
 						stage,
-						build_batches,
-					)
-					.await?
+						scan_probe_batches: None,
+						needs_decision_fallback: true,
+					});
 				}
-			};
-			let Some(runtime) = runtime else {
-				return Ok(None);
-			};
-			runtimes.push(runtime);
+				let scan_build_decision = if force_stream_projected_filtered_base
+					&& matches!(
+						base_scan_probe_mode,
+						Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+					) {
+					ReorientedStageScanBuildDecision::Stream
+				} else if aggregate_input_wrapped {
+					if self
+						.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
+						.await?
+					{
+						ReorientedStageScanBuildDecision::Stream
+					} else {
+						ReorientedStageScanBuildDecision::Materialized
+					}
+				} else {
+					self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
+						.await?
+				};
+				let scan_build_decision = if stage_index + 1 == stage_count {
+					match scan_build_decision {
+						ReorientedStageScanBuildDecision::Stream => {
+							return Ok(ReorientedStagePrep::Deferred {
+								stage,
+								scan_probe_batches: None,
+								needs_decision_fallback: false,
+							});
+						}
+						ReorientedStageScanBuildDecision::StreamMaterializedBatches(batches) => {
+							return Ok(ReorientedStagePrep::Deferred {
+								stage,
+								scan_probe_batches: Some(batches),
+								needs_decision_fallback: false,
+							});
+						}
+						other => other,
+					}
+				} else {
+					scan_build_decision
+				};
+				let runtime = match scan_build_decision {
+					ReorientedStageScanBuildDecision::Stream
+					| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
+						self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+							stage, morsel,
+						)
+						.await?
+					}
+					ReorientedStageScanBuildDecision::Materialized => {
+						self.prepare_reoriented_inner_join_runtime(stage, morsel)
+							.await?
+					}
+					ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
+						self.prepare_reoriented_inner_join_runtime_from_build_batches(
+							stage,
+							build_batches,
+						)
+						.await?
+					}
+				};
+				Ok(ReorientedStagePrep::Runtime(runtime))
+			}
+			.await;
+			if let Some(stage) = prep_build_stage {
+				node_attribution::close_stage(stage, &attribution_telemetry);
+			}
+			match prepared? {
+				ReorientedStagePrep::Deferred {
+					stage,
+					scan_probe_batches,
+					needs_decision_fallback,
+				} => {
+					deferred_stream_stage =
+						Some((stage, scan_probe_batches, needs_decision_fallback));
+					break;
+				}
+				ReorientedStagePrep::Runtime(Some(runtime)) => runtimes.push(runtime),
+				ReorientedStagePrep::Runtime(None) => {
+					return Ok(None);
+				}
+			}
 		}
 		if let Some(stage) = prep_stage {
 			node_attribution::close_stage(stage, &attribution_telemetry);
@@ -11405,9 +11516,28 @@ impl Executor {
 		// does not describe it.
 		let mut committed_branch: Option<&'static str> = None;
 		if let Some((stage, scan_probe_batches, needs_decision_fallback)) = deferred_stream_stage {
-			if let Some(candidate) =
-				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel)?
-			{
+			let replay_id = u64::from(stage.replay_id.0);
+			let adaptive_prep_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_stage(handle, "runtime_prep", &attribution_telemetry)
+			});
+			let adaptive_prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"runtime_prep",
+					"prep_build",
+					replay_id,
+					&attribution_telemetry,
+				)
+			});
+			let adaptive_candidate =
+				self.reoriented_adaptive_partitioned_scan_candidate(&stage, morsel);
+			if let Some(stage) = adaptive_prep_build_stage {
+				node_attribution::close_stage(stage, &attribution_telemetry);
+			}
+			if let Some(stage) = adaptive_prep_stage {
+				node_attribution::close_stage(stage, &attribution_telemetry);
+			}
+			if let Some(candidate) = adaptive_candidate? {
 				runtimes.push(candidate);
 				committed_branch = Some("adaptive_last_stage");
 				matched = self
@@ -11432,57 +11562,79 @@ impl Executor {
 			if matched.is_none() {
 				// The deferred terminal stage is prepared here, after the adaptive attempt declined —
 				// still runtime preparation, merged into the same stage as the loop above.
+				let replay_id = u64::from(stage.replay_id.0);
 				let prep_stage = stage_handle.as_ref().and_then(|h| {
 					node_attribution::open_stage(h, "runtime_prep", &attribution_telemetry)
 				});
-				let runtime = if needs_decision_fallback {
-					let scan_build_decision = if force_stream_projected_filtered_base
-						&& matches!(
-							base_scan_probe_mode,
-							Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
-						) {
-						ReorientedStageScanBuildDecision::Stream
-					} else if aggregate_input_wrapped {
-						if self
-							.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
-								&stage, morsel,
-							)
-							.await?
-						{
+				let prep_build_stage = stage_handle.as_ref().and_then(|handle| {
+					node_attribution::open_replay_substage(
+						handle,
+						"runtime_prep",
+						"prep_build",
+						replay_id,
+						&attribution_telemetry,
+					)
+				});
+				let runtime = async {
+					if needs_decision_fallback {
+						let scan_build_decision = if force_stream_projected_filtered_base
+							&& matches!(
+								base_scan_probe_mode,
+								Some(ReorientedInnerChainGroupedBaseScanProbeMode::FilteredJoin0)
+							) {
 							ReorientedStageScanBuildDecision::Stream
+						} else if aggregate_input_wrapped {
+							if self
+								.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
+									&stage, morsel,
+								)
+								.await?
+							{
+								ReorientedStageScanBuildDecision::Stream
+							} else {
+								ReorientedStageScanBuildDecision::Materialized
+							}
 						} else {
-							ReorientedStageScanBuildDecision::Materialized
+							self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
+								.await?
+						};
+						match scan_build_decision {
+							ReorientedStageScanBuildDecision::Stream
+							| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
+								self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+									stage, morsel,
+								)
+								.await
+							}
+							ReorientedStageScanBuildDecision::Materialized => {
+								self.prepare_reoriented_inner_join_runtime(stage, morsel)
+									.await
+							}
+							ReorientedStageScanBuildDecision::MaterializedBatches(
+								build_batches,
+							) => {
+								self.prepare_reoriented_inner_join_runtime_from_build_batches(
+									stage,
+									build_batches,
+								)
+								.await
+							}
 						}
 					} else {
-						self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
-							.await?
-					};
-					match scan_build_decision {
-						ReorientedStageScanBuildDecision::Stream
-						| ReorientedStageScanBuildDecision::StreamMaterializedBatches(_) => {
-							self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
-								stage, morsel,
-							)
-							.await?
-						}
-						ReorientedStageScanBuildDecision::Materialized => {
-							self.prepare_reoriented_inner_join_runtime(stage, morsel)
-								.await?
-						}
-						ReorientedStageScanBuildDecision::MaterializedBatches(build_batches) => {
-							self.prepare_reoriented_inner_join_runtime_from_build_batches(
-								stage,
-								build_batches,
-							)
-							.await?
-						}
+						self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
+							stage, morsel,
+						)
+						.await
 					}
-				} else {
-					self.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(
-						stage, morsel,
-					)
-					.await?
-				};
+				}
+				.await;
+				if let Some(stage) = prep_build_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
+				if let Some(stage) = prep_stage {
+					node_attribution::close_stage(stage, &attribution_telemetry);
+				}
+				let runtime = runtime?;
 				let Some(runtime) = runtime else {
 					for runtime in runtimes {
 						runtime.cleanup().await;
@@ -11490,9 +11642,6 @@ impl Executor {
 					return Ok(None);
 				};
 				runtimes.push(runtime);
-				if let Some(stage) = prep_stage {
-					node_attribution::close_stage(stage, &attribution_telemetry);
-				}
 			}
 		}
 		if matched.is_none() {
@@ -11620,7 +11769,19 @@ impl Executor {
 			.as_ref()
 			.and_then(|h| node_attribution::open_stage(h, "cleanup", &attribution_telemetry));
 		for runtime in runtimes {
+			let cleanup_build_stage = stage_handle.as_ref().and_then(|handle| {
+				node_attribution::open_replay_substage(
+					handle,
+					"cleanup",
+					"cleanup_build",
+					u64::from(runtime.replay_id.0),
+					&attribution_telemetry,
+				)
+			});
 			runtime.cleanup().await;
+			if let Some(stage) = cleanup_build_stage {
+				node_attribution::close_stage(stage, &attribution_telemetry);
+			}
 		}
 		if let Some(stage) = cleanup_stage {
 			node_attribution::close_stage(stage, &attribution_telemetry);
@@ -17223,7 +17384,13 @@ impl Executor {
 			} => {
 				let profile_build = profile.as_ref().map(|_| {
 					suffix_profile_build.get_or_insert_with(|| {
-						SuffixProbeBuildFacts::from_in_memory(runtime.key_plan, batch, rows)
+						SuffixProbeBuildFacts::from_in_memory(
+							runtime.key_plan,
+							batch,
+							rows,
+							probe_batch,
+							&runtime.probe_keys,
+						)
 					})
 				});
 				self.probe_reoriented_inner_join_in_memory(
@@ -18549,11 +18716,15 @@ mod tests {
 				distinct_keys: 3,
 				entry_capacity: 4,
 				bucket_capacity: 8,
-				index_accounted_bytes: 256,
+				index_accounted_bytes: Some(256),
+				index_accounted_bytes_unknown_reason: None,
 			},
 			build_rows: 4,
 			build_batch_bytes: 64,
-			key_width_bytes: 8,
+			key_width_bytes: Some(8),
+			key_width_unknown_reason: None,
+			retained_bytes: Some(320),
+			retained_bytes_unknown_reason: None,
 			unsupported_reason: None,
 		};
 		let mut cache = SuffixProbeBuildFactsCache::default();
@@ -18567,7 +18738,7 @@ mod tests {
 		assert_eq!(
 			constructions.get(),
 			1,
-			"the O(build entries) shape walk must run once per runtime, not once per suffix call"
+			"the O(1) shape facts must be constructed once per runtime, not once per suffix call"
 		);
 	}
 
@@ -18619,7 +18790,13 @@ mod tests {
 			batches: HashMap::new(),
 			requested_tables: Arc::new(Mutex::new(Vec::new())),
 		}));
-		let build_facts = SuffixProbeBuildFacts::from_in_memory(JoinKeyPlan::Int64, &build, &rows);
+		let build_facts = SuffixProbeBuildFacts::from_in_memory(
+			JoinKeyPlan::Int64,
+			&build,
+			&rows,
+			&matching_probe,
+			&[ColumnOrdinal(0)],
+		);
 		let mut profile = SuffixProbeCallProfile::default();
 		let (output, probe_rows, output_rows) = executor
 			.probe_reoriented_inner_join_in_memory(
@@ -18666,7 +18843,112 @@ mod tests {
 		assert_eq!(observation.build_representation, "int64_primitive");
 		assert_eq!(observation.build_rows, 3);
 		assert_eq!(observation.distinct_keys, 2);
-		assert_eq!(observation.key_width_bytes, 8);
+		assert_eq!(observation.key_width_bytes, Some(8));
+	}
+
+	#[test]
+	fn adr524_generic_suffix_profile_splits_batches_and_keeps_unknown_ownership_explicit() {
+		let build_schema = Arc::new(Schema::new(vec![
+			Field::new("build_part", DataType::Int64, false),
+			Field::new("build_supp", DataType::Int64, false),
+			Field::new("build_value", DataType::Int64, false),
+		]));
+		let probe_schema = Arc::new(Schema::new(vec![
+			Field::new("probe_part", DataType::Int64, false),
+			Field::new("probe_supp", DataType::Int64, false),
+			Field::new("probe_value", DataType::Int64, false),
+		]));
+		let output_schema = concat_test_schema(&probe_schema, &build_schema);
+		let build = RecordBatch::try_new(
+			build_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 1, 2])),
+				Arc::new(Int64Array::from(vec![10, 10, 20])),
+				Arc::new(Int64Array::from(vec![100, 101, 200])),
+			],
+		)
+		.expect("build");
+		let probe = RecordBatch::try_new(
+			probe_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 404])),
+				Arc::new(Int64Array::from(vec![10, 40])),
+				Arc::new(Int64Array::from(vec![1_000, 4_000])),
+			],
+		)
+		.expect("probe");
+		let keys = [ColumnOrdinal(0), ColumnOrdinal(1)];
+		let rows = build_in_memory_join_rows(
+			JoinKeyPlan::Generic,
+			&key_arrays(&build, &keys).expect("build keys"),
+			build.num_rows(),
+			u64::MAX,
+			false,
+		)
+		.expect("build rows")
+		.expect("in-memory rows");
+		let executor = Executor::new(Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::new(),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		}));
+		let build_facts = SuffixProbeBuildFacts::from_in_memory(
+			JoinKeyPlan::Generic,
+			&build,
+			&rows,
+			&probe,
+			&keys,
+		);
+		let mut profile = SuffixProbeCallProfile::default();
+		let (profiled, probe_rows, output_rows) = executor
+			.probe_reoriented_inner_join_in_memory(
+				JoinKeyPlan::Generic,
+				&keys,
+				&output_schema,
+				true,
+				&build,
+				&rows,
+				&probe,
+				Some(build_facts),
+				Some(&mut profile),
+			)
+			.expect("profiled generic probe");
+		let (plain, plain_probe_rows, plain_output_rows) = executor
+			.probe_reoriented_inner_join_in_memory(
+				JoinKeyPlan::Generic,
+				&keys,
+				&output_schema,
+				true,
+				&build,
+				&rows,
+				&probe,
+				None,
+				None,
+			)
+			.expect("plain generic probe");
+
+		assert_eq!((probe_rows, output_rows), (2, 2));
+		assert_eq!((plain_probe_rows, plain_output_rows), (2, 2));
+		assert_eq!(profiled, plain);
+		let observation = profile.observation(2);
+		assert!(observation.supported);
+		assert_eq!(observation.input_probe_rows, 2);
+		assert_eq!(observation.non_null_keys, 2);
+		assert_eq!(observation.lookup_windows, 1);
+		assert_eq!(observation.matched_references, 2);
+		assert_eq!(observation.emitted_rows, 2);
+		assert_eq!(observation.build_representation, "generic_hash");
+		assert_eq!(observation.key_width_bytes, Some(16));
+		assert_eq!(observation.key_width_unknown_reason, None);
+		assert_eq!(observation.index_accounted_bytes, None);
+		assert_eq!(
+			observation.index_accounted_bytes_unknown_reason,
+			Some("generic variable-width ownership is not tracked without an entry walk")
+		);
+		assert_eq!(observation.retained_bytes, None);
+		assert_eq!(
+			observation.retained_bytes_unknown_reason,
+			observation.index_accounted_bytes_unknown_reason
+		);
 	}
 
 	#[test]
