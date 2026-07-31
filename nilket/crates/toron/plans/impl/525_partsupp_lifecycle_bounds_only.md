@@ -47,6 +47,11 @@ From the sealed release binary at the exact coordinate:
 
 - five interleaved profiler-off/on pairs for **q09** and five for **q08**; absolute median
   bound 3% per cell; identity (fingerprint, digest, rows, route, spill) required per pair;
+- q08 must retain complete stage coverage; q09 may retain only ADR 516's three known,
+  unsupported replay-2 generic leaves (`suffix_lookup`, `suffix_match_expand`,
+  `suffix_payload_take`). They do not count as an ADR 525 rejection because the reconciled
+  replay-2 `suffix_probe` parent is E's declared input. Any wider missing set, failed existing
+  parent, or failed new lifecycle partition does count;
 - **two strikes anywhere — perturbation or reconciliation, either cell — park q09
   attribution; the board moves to the shared-fold family with no third attempt;**
 - on clean gates, one profiled q09 run supplies

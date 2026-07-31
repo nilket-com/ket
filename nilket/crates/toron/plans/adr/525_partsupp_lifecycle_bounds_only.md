@@ -36,7 +36,12 @@ This is therefore the minimum sufficient attribution cut:
 3. **Reconciliation**: the new partition rule holds for `runtime_prep` and `cleanup` families
    (unique IDs, complete coverage, sum ≤ parent, one global residual); replay-2's existing
    refinement continues to reconcile untouched; profiles report the partition verdict
-   explicitly.
+   explicitly. q09 may retain exactly ADR 516's pre-existing generic-key opacity:
+   `suffix_lookup`, `suffix_match_expand`, and `suffix_payload_take` remain unsupported for
+   replay 2, so its suffix-profile coverage stays incomplete while its existing
+   `suffix_probe` parent remains the reconciled E input. Those three named missing leaves are
+   not an ADR 525 rejection; any additional missing requirement, failed existing parent, or
+   failed prep/cleanup partition is.
 4. **Identity**: fingerprints, digests, row counts, route facts, and spill identical across
    every off/on pair; profiler-off byte-identity; once-per-runtime construction pinned.
 5. **The decision, predeclared**: E < 3,554 ms → q09 **parked** with the split recorded;
