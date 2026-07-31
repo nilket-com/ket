@@ -1,8 +1,9 @@
 use crate::bm25::{Bm25Index, logical_index_bytes, select_salient_terms};
+use crate::embedder::EmbedderSession;
 use crate::fuzzy;
 use crate::model::{
-	Corpus, ExpectedSymbol, FeatureCell, FeatureDepth, MethodConfig, Pilot, Probe, RankedSymbol,
-	ResolutionStats, feature_documents,
+	Corpus, EmbedderRendering, ExpectedSymbol, FeatureCell, FeatureDepth, MethodConfig, Pilot,
+	Probe, RankedSymbol, ResolutionStats, feature_documents,
 };
 use crate::vectors::{Coverage, RankSifIndex, StaticVectors};
 use serde::Serialize;
@@ -34,6 +35,28 @@ pub struct RunMetadata {
 	pub cross_platform_score_tolerance: f64,
 	pub comment_policy: String,
 	pub embedder: String,
+	pub embedder_model: Option<EmbedderRunReport>,
+	pub embedder_selection: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbedderRunReport {
+	pub model_id: String,
+	pub revision: String,
+	pub license: String,
+	pub model_path: String,
+	pub model_sha256: String,
+	pub tokenizer_sha256: String,
+	pub config_sha256: String,
+	pub dimension: usize,
+	pub max_sequence: usize,
+	pub threads: usize,
+	pub batch_size: usize,
+	pub max_batch_size: usize,
+	pub load_micros: u128,
+	pub reference_max_abs_error: f64,
+	pub cached_sequences: usize,
+	pub backend: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +83,16 @@ pub struct CellReport {
 	pub mean_query_vector_coverage: Option<f64>,
 	pub determinism: String,
 	pub outcomes: Vec<QueryOutcome>,
+	pub embedding: Option<EmbeddingCellReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingCellReport {
+	pub rendering: EmbedderRendering,
+	pub max_sequence: usize,
+	pub truncation: String,
+	pub embedding_micros: u128,
+	pub incremental_embedding_micros: u128,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -112,6 +145,8 @@ pub struct EvaluationInputs<'a> {
 	pub pilot: &'a Pilot,
 	pub config: &'a MethodConfig,
 	pub vectors: Option<&'a StaticVectors>,
+	pub embedder: Option<&'a EmbedderSession>,
+	pub embedder_headline_only: bool,
 	pub corpus_revision: String,
 	pub corpus_rust_dirty: bool,
 	pub config_sha256: String,
@@ -160,7 +195,13 @@ pub fn evaluate(inputs: EvaluationInputs<'_>) -> Result<Report, String> {
 					reason,
 				));
 			}
-			cells.push(absent_cell("embedder", &cell.label(), reason));
+			for rendering in unique_renderings(&inputs.config.embedder.renderings) {
+				cells.push(absent_cell(
+					"embedder",
+					&embedder_label(cell, rendering),
+					reason,
+				));
+			}
 			continue;
 		}
 		let documents = feature_documents(inputs.corpus, cell, &inputs.config.weights);
@@ -216,12 +257,89 @@ pub fn evaluate(inputs: EvaluationInputs<'_>) -> Result<Report, String> {
 				cells.push(absent_cell("rank_sif", &label, "no vector file supplied"));
 			}
 		}
-		cells.push(absent_cell(
-			"embedder",
-			&cell.label(),
-			"backend deliberately reserved for a later harness-only pair",
-		));
+		for rendering in unique_renderings(&inputs.config.embedder.renderings) {
+			let label = embedder_label(cell, rendering);
+			if !embedder_cell_selected(inputs.embedder_headline_only, cell) {
+				cells.push(absent_cell(
+					"embedder",
+					&label,
+					"excluded by --embedder-headline-only",
+				));
+				continue;
+			}
+			if let Some(embedder) = inputs.embedder {
+				eprintln!("spectrometer: embedding {label}");
+				let index = embedder.build_index(
+					inputs.corpus,
+					cell,
+					rendering,
+					&inputs.config.bm25,
+					&inputs.config.weights,
+				)?;
+				let mut report = evaluate_ranker(
+					"embedder",
+					&label,
+					inputs.pilot,
+					Some(index.logical_index_bytes),
+					|| {
+						inputs
+							.pilot
+							.probe
+							.iter()
+							.map(|probe| {
+								embedder
+									.rank(&index, probe.query())
+									.map(|ranking| (ranking, None))
+							})
+							.collect::<Result<Vec<_>, _>>()
+					},
+				)?;
+				report.embedding = Some(EmbeddingCellReport {
+					rendering,
+					max_sequence: inputs.config.embedder.max_sequence,
+					truncation: match rendering {
+						EmbedderRendering::ChunkedMax => {
+							"complete WordPiece stream; non-overlapping payload chunks; max score"
+								.to_string()
+						}
+						EmbedderRendering::ChannelOrder | EmbedderRendering::SalienceOrder => {
+							"right truncation including special tokens".to_string()
+						}
+					},
+					embedding_micros: index.embedding_micros,
+					incremental_embedding_micros: index.incremental_embedding_micros,
+				});
+				cells.push(report);
+			} else {
+				cells.push(absent_cell(
+					"embedder",
+					&label,
+					"no --embedder-dir supplied",
+				));
+			}
+		}
 	}
+	let embedder_model = inputs.embedder.map(|embedder| {
+		let metadata = embedder.metadata();
+		EmbedderRunReport {
+			model_id: metadata.model_id.clone(),
+			revision: metadata.revision.clone(),
+			license: metadata.license.clone(),
+			model_path: metadata.model_path.display().to_string(),
+			model_sha256: metadata.model_sha256.clone(),
+			tokenizer_sha256: metadata.tokenizer_sha256.clone(),
+			config_sha256: metadata.config_sha256.clone(),
+			dimension: metadata.dimension,
+			max_sequence: metadata.max_sequence,
+			threads: metadata.threads,
+			batch_size: metadata.batch_size,
+			max_batch_size: metadata.max_batch_size,
+			load_micros: metadata.load_micros,
+			reference_max_abs_error: metadata.reference_max_abs_error,
+			cached_sequences: embedder.cache_entries(),
+			backend: "candle-cpu-f32-mean-pool-l2".to_string(),
+		}
+	});
 
 	Ok(Report {
 		metadata: RunMetadata {
@@ -243,7 +361,17 @@ pub fn evaluate(inputs: EvaluationInputs<'_>) -> Result<Report, String> {
 			comment_policy:
 				"RA-token identifiers; COMMENT and explicit #[doc] excluded; literals separate"
 					.to_string(),
-			embedder: "absent by contract".to_string(),
+			embedder: if inputs.embedder.is_some() {
+				"available: checksum-pinned candle CPU backend".to_string()
+			} else {
+				"absent: no --embedder-dir supplied".to_string()
+			},
+			embedder_model,
+			embedder_selection: if inputs.embedder_headline_only {
+				"headline: own-name excluded, literals off".to_string()
+			} else {
+				"complete configured ablation".to_string()
+			},
 		},
 		corpus: CorpusReport {
 			files: inputs.corpus.files.len(),
@@ -257,6 +385,18 @@ pub fn evaluate(inputs: EvaluationInputs<'_>) -> Result<Report, String> {
 		},
 		cells,
 	})
+}
+
+fn unique_renderings(renderings: &[EmbedderRendering]) -> BTreeSet<EmbedderRendering> {
+	renderings.iter().copied().collect()
+}
+
+fn embedder_label(cell: FeatureCell, rendering: EmbedderRendering) -> String {
+	format!("{}/{}", cell.label(), rendering.label())
+}
+
+fn embedder_cell_selected(headline_only: bool, cell: FeatureCell) -> bool {
+	!headline_only || cell.exclude_own_name && !cell.include_literals
 }
 
 fn salience_values(config: &MethodConfig) -> Vec<Option<usize>> {
@@ -342,6 +482,7 @@ fn evaluate_ranker(
 		mean_query_vector_coverage: mean_coverage,
 		determinism: "identical ranked identities across two consecutive evaluations".to_string(),
 		outcomes,
+		embedding: None,
 	})
 }
 
@@ -576,6 +717,7 @@ fn absent_cell(retrieval: &str, features: &str, reason: &str) -> CellReport {
 		mean_query_vector_coverage: None,
 		determinism: "not applicable".to_string(),
 		outcomes: Vec::new(),
+		embedding: None,
 	}
 }
 
@@ -591,7 +733,8 @@ fn peak_rss_kib() -> Option<u64> {
 mod tests {
 	use super::*;
 	use crate::model::{
-		Bm25Config, FeatureDepthConfig, FeatureWeights, PilotMetadata, RankSifConfig, SymbolId,
+		Bm25Config, EmbedderArtifacts, EmbedderConfig, EmbedderRendering, FeatureDepthConfig,
+		FeatureWeights, PilotMetadata, RankSifConfig, SymbolId,
 	};
 	use std::path::PathBuf;
 
@@ -685,6 +828,24 @@ mod tests {
 	}
 
 	#[test]
+	fn headline_selection_is_exactly_the_uncontaminated_surface() {
+		for exclude_own_name in [false, true] {
+			for include_literals in [false, true] {
+				let cell = FeatureCell {
+					depth: FeatureDepth::Span,
+					exclude_own_name,
+					include_literals,
+				};
+				assert_eq!(
+					embedder_cell_selected(true, cell),
+					exclude_own_name && !include_literals
+				);
+				assert!(embedder_cell_selected(false, cell));
+			}
+		}
+	}
+
+	#[test]
 	fn resolved_feature_cells_are_absent_when_the_backend_is_unavailable() {
 		let corpus = Corpus {
 			root: PathBuf::new(),
@@ -721,12 +882,30 @@ mod tests {
 				frequency_ranked: true,
 				salience_k: vec![16, 32],
 			},
+			embedder: EmbedderConfig {
+				model_id: "fixture".to_string(),
+				revision: "fixture".to_string(),
+				license: "fixture".to_string(),
+				max_sequence: 8,
+				threads: 1,
+				batch_size: 1,
+				max_batch_size: 1,
+				renderings: vec![EmbedderRendering::ChannelOrder],
+				reference_tolerance: 1.0e-5,
+				artifacts: EmbedderArtifacts {
+					model_sha256: "fixture".to_string(),
+					tokenizer_sha256: "fixture".to_string(),
+					config_sha256: "fixture".to_string(),
+				},
+			},
 		};
 		let report = evaluate(EvaluationInputs {
 			corpus: &corpus,
 			pilot: &pilot,
 			config: &config,
 			vectors: None,
+			embedder: None,
+			embedder_headline_only: false,
 			corpus_revision: "fixture".to_string(),
 			corpus_rust_dirty: false,
 			config_sha256: "fixture".to_string(),

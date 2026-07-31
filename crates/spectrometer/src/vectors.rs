@@ -119,7 +119,7 @@ pub fn load_static_vectors(
 	})
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub fn sha256_file(path: &Path) -> Result<String, String> {
 	let mut file = File::open(path)
 		.map_err(|error| format!("unable to open {} for hashing: {error}", path.display()))?;
 	let mut hasher = Sha256::new();

@@ -1,0 +1,27 @@
+{
+  "source": "sentence-transformers reference backend",
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+  "python": "3.12.13",
+  "sentence_transformers": "5.1.0",
+  "transformers": "4.57.6",
+  "torch": "2.7.1+cpu",
+  "artifacts": {
+    "config.json": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+    "tokenizer.json": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    "model.safetensors": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+  },
+  "sentences": [
+    "That is a happy person",
+    "That is a happy dog",
+    "That is a very happy person",
+    "Today is a sunny day"
+  ],
+  "cosine_matrix": [
+    [1.0000001192092896, 0.6945773363113403, 0.9429149627685547, 0.25687605142593384],
+    [0.6945773363113403, 1.0, 0.621050238609314, 0.24906285107135773],
+    [0.9429149627685547, 0.621050238609314, 1.000000238418579, 0.2106153666973114],
+    [0.25687605142593384, 0.24906285107135773, 0.2106153666973114, 1.000000238418579]
+  ],
+  "tolerance": 0.00001
+}

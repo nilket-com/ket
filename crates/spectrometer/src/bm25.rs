@@ -100,6 +100,25 @@ pub fn select_salient_terms(
 	limit: usize,
 ) -> Vec<FeatureDocument> {
 	assert!(limit > 0, "salience limit must be nonzero");
+	let order = salient_term_order(documents, config);
+	documents
+		.iter()
+		.zip(order)
+		.map(|(document, order)| FeatureDocument {
+			symbol_index: document.symbol_index,
+			terms: order
+				.into_iter()
+				.take(limit)
+				.map(|term| {
+					let weight = document.terms[&term];
+					(term, weight)
+				})
+				.collect(),
+		})
+		.collect()
+}
+
+pub fn salient_term_order(documents: &[FeatureDocument], config: &Bm25Config) -> Vec<Vec<String>> {
 	let count = documents.len() as f64;
 	let mut document_frequency = BTreeMap::new();
 	let mut total_length = 0.0;
@@ -138,15 +157,7 @@ pub fn select_salient_terms(
 					.total_cmp(left_score)
 					.then_with(|| left_term.cmp(right_term))
 			});
-			let terms = scored
-				.into_iter()
-				.take(limit)
-				.map(|(term, _)| (term.clone(), document.terms[term]))
-				.collect();
-			FeatureDocument {
-				symbol_index: document.symbol_index,
-				terms,
-			}
+			scored.into_iter().map(|(term, _)| term.clone()).collect()
 		})
 		.collect()
 }

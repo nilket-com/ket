@@ -42,8 +42,24 @@ server-status notification to report healthy, quiescent workspace analysis
 before issuing batch requests. It deliberately does not reuse libaryon's
 interactive one-request-at-a-time navigation seam.
 
-The embedder column is deliberately absent until a later plan specifies a
-complete local-model contract.
+The MiniLM embedder is optional, offline-only, and never downloads artifacts.
+Supplying it requires the exact checksum-pinned `model.safetensors`,
+`tokenizer.json`, and `config.json` files named in `candidate.toml`:
 
-The checked-in contaminated-pilot evidence and its deliberately negative
-result are recorded in [PILOT_RESULTS.md](PILOT_RESULTS.md).
+```text
+cargo run --release -p spectrometer -- \
+  --root . \
+  --embedder-dir /models/all-MiniLM-L6-v2-pinned \
+  --embedder-headline-only \
+  --report /tmp/spectrometer-minilm.json
+```
+
+Omitting `--embedder-dir` reports the tier as absent. Supplying an incomplete
+or checksum-mismatched directory fails the run rather than producing corrupt
+evidence. `--embedder-headline-only` evaluates the decisive comment-free,
+own-name-excluded, literals-off surface; omit it to execute every auxiliary
+ablation cell as well.
+
+The checked-in contaminated-pilot evidence, including the deliberate
+none-passes result after the compositional tier, is recorded in
+[PILOT_RESULTS.md](PILOT_RESULTS.md).

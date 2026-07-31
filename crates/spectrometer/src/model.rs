@@ -87,6 +87,12 @@ pub struct FeatureDocument {
 	pub terms: BTreeMap<String, f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeatureTokenStream {
+	pub symbol_index: usize,
+	pub tokens: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MethodConfig {
 	pub extractor_version: u32,
@@ -96,6 +102,7 @@ pub struct MethodConfig {
 	pub weights: FeatureWeights,
 	pub bm25: Bm25Config,
 	pub rank_sif: RankSifConfig,
+	pub embedder: EmbedderConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -141,6 +148,45 @@ pub struct RankSifConfig {
 	pub frequency_ranked: bool,
 	#[serde(default)]
 	pub salience_k: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbedderConfig {
+	pub model_id: String,
+	pub revision: String,
+	pub license: String,
+	pub max_sequence: usize,
+	pub threads: usize,
+	pub batch_size: usize,
+	pub max_batch_size: usize,
+	pub renderings: Vec<EmbedderRendering>,
+	pub reference_tolerance: f64,
+	pub artifacts: EmbedderArtifacts,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbedderArtifacts {
+	pub model_sha256: String,
+	pub tokenizer_sha256: String,
+	pub config_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbedderRendering {
+	ChannelOrder,
+	SalienceOrder,
+	ChunkedMax,
+}
+
+impl EmbedderRendering {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::ChannelOrder => "channel-order",
+			Self::SalienceOrder => "salience-order",
+			Self::ChunkedMax => "chunked-max",
+		}
+	}
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,6 +376,53 @@ pub fn feature_documents(
 		.collect()
 }
 
+pub fn feature_token_streams(corpus: &Corpus, cell: FeatureCell) -> Vec<FeatureTokenStream> {
+	corpus
+		.symbols
+		.iter()
+		.enumerate()
+		.map(|(symbol_index, symbol)| {
+			let mut tokens = Vec::new();
+			if !cell.exclude_own_name {
+				tokens.extend(symbol.name_tokens.clone());
+			}
+			if cell.depth >= FeatureDepth::Span {
+				tokens.extend(
+					symbol
+						.span_identifiers
+						.iter()
+						.filter(|identifier| !cell.exclude_own_name || *identifier != &symbol.name)
+						.flat_map(|identifier| split_identifier(identifier)),
+				);
+				tokens.extend(symbol.context_tokens.clone());
+				if cell.include_literals {
+					tokens.extend(symbol.literal_tokens.clone());
+				}
+			}
+			if cell.depth >= FeatureDepth::Callees {
+				for callee in &symbol.callees {
+					if cell.exclude_own_name && corpus.symbols[*callee].name == symbol.name {
+						continue;
+					}
+					tokens.extend(corpus.symbols[*callee].name_tokens.clone());
+				}
+			}
+			if cell.depth >= FeatureDepth::Callers {
+				for caller in &symbol.callers {
+					if cell.exclude_own_name && corpus.symbols[*caller].name == symbol.name {
+						continue;
+					}
+					tokens.extend(corpus.symbols[*caller].name_tokens.clone());
+				}
+			}
+			FeatureTokenStream {
+				symbol_index,
+				tokens,
+			}
+		})
+		.collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -393,5 +486,15 @@ mod tests {
 			&weights,
 		);
 		assert!(with_literals[0].terms.contains_key("watchdog"));
+
+		let streams = feature_token_streams(
+			&corpus,
+			FeatureCell {
+				depth: FeatureDepth::Span,
+				exclude_own_name: true,
+				include_literals: true,
+			},
+		);
+		assert_eq!(streams[0].tokens, vec!["dispatch", "jobs", "watchdog"]);
 	}
 }

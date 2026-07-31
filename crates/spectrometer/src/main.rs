@@ -1,11 +1,13 @@
 mod bm25;
 mod corpus;
+mod embedder;
 mod eval;
 mod fuzzy;
 mod lsp;
 mod model;
 mod vectors;
 
+use crate::embedder::EmbedderSession;
 use crate::eval::{EvaluationInputs, evaluate, feature_cells};
 use crate::model::{ExpectedSymbol, MethodConfig, Pilot, Probe, feature_documents};
 use crate::vectors::{load_static_vectors, wanted_tokens};
@@ -20,6 +22,8 @@ struct Options {
 	pilot: Option<PathBuf>,
 	vectors: Option<PathBuf>,
 	vector_sha256: Option<String>,
+	embedder_dir: Option<PathBuf>,
+	embedder_headline_only: bool,
 	report: Option<PathBuf>,
 	resolve: bool,
 	rust_analyzer: PathBuf,
@@ -53,6 +57,12 @@ fn run() -> Result<(), String> {
 		.map_err(|error| format!("unable to read {}: {error}", pilot_path.display()))?;
 	let pilot: Pilot =
 		toml::from_slice(&pilot_bytes).map_err(|error| format!("invalid pilot corpus: {error}"))?;
+	if options.embedder_dir.is_some() {
+		rayon::ThreadPoolBuilder::new()
+			.num_threads(config.embedder.threads)
+			.build_global()
+			.map_err(|error| format!("unable to fix embedder worker count: {error}"))?;
+	}
 
 	let build_started = Instant::now();
 	let resolver = options.resolve.then_some(options.rust_analyzer.as_path());
@@ -82,12 +92,25 @@ fn run() -> Result<(), String> {
 		(Some(_), None) => return Err("--vectors requires --vectors-sha256".to_string()),
 		(None, Some(_)) => return Err("--vectors-sha256 requires --vectors".to_string()),
 	};
+	let embedder = options
+		.embedder_dir
+		.as_deref()
+		.map(|directory| {
+			EmbedderSession::load(
+				directory,
+				&config.embedder,
+				pilot.probe.iter().map(|probe| probe.query().to_string()),
+			)
+		})
+		.transpose()?;
 
 	let report = evaluate(EvaluationInputs {
 		corpus: &corpus,
 		pilot: &pilot,
 		config: &config,
 		vectors: static_vectors.as_ref(),
+		embedder: embedder.as_ref(),
+		embedder_headline_only: options.embedder_headline_only,
 		corpus_revision: git_revision(&root)?,
 		corpus_rust_dirty: git_tracked_rust_dirty(&root)?,
 		config_sha256: sha256_bytes(&config_bytes),
@@ -114,6 +137,8 @@ fn parse_options() -> Result<Options, String> {
 	let mut pilot = None;
 	let mut vectors = None;
 	let mut vector_sha256 = None;
+	let mut embedder_dir = None;
+	let mut embedder_headline_only = false;
 	let mut report = None;
 	let mut resolve = true;
 	let mut rust_analyzer = PathBuf::from("rust-analyzer");
@@ -130,6 +155,10 @@ fn parse_options() -> Result<Options, String> {
 			"--vectors-sha256" => {
 				vector_sha256 = Some(next_value(&mut arguments, "--vectors-sha256")?);
 			}
+			"--embedder-dir" => {
+				embedder_dir = Some(PathBuf::from(next_value(&mut arguments, "--embedder-dir")?));
+			}
+			"--embedder-headline-only" => embedder_headline_only = true,
 			"--report" => report = Some(PathBuf::from(next_value(&mut arguments, "--report")?)),
 			"--no-resolve" => resolve = false,
 			"--rust-analyzer" => {
@@ -149,6 +178,8 @@ fn parse_options() -> Result<Options, String> {
 		pilot,
 		vectors,
 		vector_sha256,
+		embedder_dir,
+		embedder_headline_only,
 		report,
 		resolve,
 		rust_analyzer,
@@ -168,9 +199,11 @@ fn next_value(
 fn print_help() {
 	println!(
 		"Usage: spectrometer [--root PATH] [--config PATH] [--pilot PATH]\n\
-		 [--vectors PATH --vectors-sha256 HEX] [--report PATH] [--no-resolve]\n\
+		 [--vectors PATH --vectors-sha256 HEX] [--embedder-dir PATH]\n\
+		 [--embedder-headline-only]\n\
+		 [--report PATH] [--no-resolve]\n\
 		 [--rust-analyzer PATH] [--json]\n\n\
-		 No model is downloaded. Without --vectors the rank-SIF column reports absent."
+		 No model is downloaded. Missing vector/embedder paths report absent columns."
 	);
 }
 
@@ -304,7 +337,7 @@ fn print_summary(report: &eval::Report, pilot: &Pilot) {
 					.is_some_and(|suffix| suffix.starts_with('/'))
 		});
 		cell.retrieval == "fz"
-			|| matches!(cell.retrieval.as_str(), "bm25" | "rank_sif") && strict_feature
+			|| matches!(cell.retrieval.as_str(), "bm25" | "rank_sif" | "embedder") && strict_feature
 	}) {
 		if let Some(metrics) = &cell.metrics {
 			let distinction = metrics
@@ -312,7 +345,7 @@ fn print_summary(report: &eval::Report, pilot: &Pilot) {
 				.map(|rate| format!("{rate:.2}"))
 				.unwrap_or_else(|| "n/a".to_string());
 			println!(
-				"{:9} {:38} h@1={:.2} h@3={:.2} mrr={:.2} distinction={} far={:.2}",
+				"{:9} {:52} h@1={:.2} h@3={:.2} mrr={:.2} distinction={} far={:.2}",
 				cell.retrieval,
 				cell.features,
 				metrics.hit_at_1,
@@ -326,5 +359,19 @@ fn print_summary(report: &eval::Report, pilot: &Pilot) {
 	if report.metadata.vector_checksum.is_none() {
 		println!("rank_sif: absent (supply a checksum-verified text vector file)");
 	}
-	println!("embedder: absent by contract");
+	if let Some(embedder) = &report.metadata.embedder_model {
+		println!(
+			"embedder: {}@{} · {}d · seq={} · threads={} · cached={} · load={:.1}ms · reference-error={:.3e}",
+			embedder.model_id,
+			embedder.revision,
+			embedder.dimension,
+			embedder.max_sequence,
+			embedder.threads,
+			embedder.cached_sequences,
+			embedder.load_micros as f64 / 1_000.0,
+			embedder.reference_max_abs_error,
+		);
+	} else {
+		println!("embedder: absent (supply the checksum-pinned --embedder-dir)");
+	}
 }
