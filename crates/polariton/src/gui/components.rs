@@ -644,38 +644,46 @@ const MODAL_FILL_PORTION_V: u16 = 30;
 const MODAL_FILL_PORTION_H: u16 = 40;
 
 fn adapter_gallery_view() -> Element<'static, Message> {
+	let adapter_buttons = vec![
+		styled_button(
+			"BigQuery",
+			Message::AdapterSelected(AdapterSelection::BigQuery),
+			BUTTON_SIZE_DEFAULT,
+		),
+		styled_button(
+			"MySQL",
+			Message::AdapterSelected(AdapterSelection::MySQL),
+			BUTTON_SIZE_DEFAULT,
+		),
+		styled_button(
+			"Parquet",
+			Message::AdapterSelected(AdapterSelection::Parquet),
+			BUTTON_SIZE_DEFAULT,
+		),
+		styled_button(
+			"Postgres",
+			Message::AdapterSelected(AdapterSelection::Postgres),
+			BUTTON_SIZE_DEFAULT,
+		),
+		styled_button(
+			"SQLite",
+			Message::AdapterSelected(AdapterSelection::SQLite),
+			BUTTON_SIZE_DEFAULT,
+		),
+	];
+	#[cfg(feature = "toron")]
+	let adapter_buttons = {
+		let mut buttons = adapter_buttons;
+		buttons.push(styled_button(
+			"Toron",
+			Message::AdapterSelected(AdapterSelection::Toron),
+			BUTTON_SIZE_DEFAULT,
+		));
+		buttons
+	};
 	let dialog: Element<Message> = container(column![
 		center(text("Select Adapter").size(24)),
-		center(
-			row![
-				styled_button(
-					"BigQuery",
-					Message::AdapterSelected(AdapterSelection::BigQuery),
-					BUTTON_SIZE_DEFAULT
-				),
-				styled_button(
-					"MySQL",
-					Message::AdapterSelected(AdapterSelection::MySQL),
-					BUTTON_SIZE_DEFAULT
-				),
-				styled_button(
-					"Parquet",
-					Message::AdapterSelected(AdapterSelection::Parquet),
-					BUTTON_SIZE_DEFAULT
-				),
-				styled_button(
-					"Postgres",
-					Message::AdapterSelected(AdapterSelection::Postgres),
-					BUTTON_SIZE_DEFAULT
-				),
-				styled_button(
-					"SQLite",
-					Message::AdapterSelected(AdapterSelection::SQLite),
-					BUTTON_SIZE_DEFAULT
-				)
-			]
-			.spacing(20)
-		)
+		center(row(adapter_buttons).spacing(20))
 	])
 	.width(FillPortion(MODAL_FILL_PORTION_H))
 	.height(FillPortion(MODAL_FILL_PORTION_V))
@@ -748,6 +756,8 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 		AdapterSelection::Parquet => "Parquet",
 		AdapterSelection::Postgres => "Postgres",
 		AdapterSelection::SQLite => "SQLite",
+		#[cfg(feature = "toron")]
+		AdapterSelection::Toron => "Toron",
 	};
 	let fields_section: Element<Message> = match &adapter_state.selection {
 		AdapterSelection::None => text("Select an adapter to configure.").into(),

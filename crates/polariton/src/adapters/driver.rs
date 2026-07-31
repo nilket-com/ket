@@ -1,3 +1,5 @@
+#[cfg(feature = "toron")]
+use crate::adapters::toron;
 use crate::adapters::{
 	bigquery,
 	common::{AdapterField, AdapterStage, DatabaseAdapter},
@@ -18,6 +20,8 @@ pub enum AdapterSelection {
 	Parquet,
 	Postgres,
 	SQLite,
+	#[cfg(feature = "toron")]
+	Toron,
 }
 
 impl AdapterSelection {
@@ -29,6 +33,8 @@ impl AdapterSelection {
 			AdapterSelection::Parquet => "Parquet",
 			AdapterSelection::Postgres => "Postgres",
 			AdapterSelection::SQLite => "SQLite",
+			#[cfg(feature = "toron")]
+			AdapterSelection::Toron => "Toron",
 		}
 	}
 }
@@ -51,6 +57,10 @@ pub enum AdapterConfiguration {
 	},
 	SQLite {
 		connection_string: String,
+	},
+	#[cfg(feature = "toron")]
+	Toron {
+		endpoint: String,
 	},
 }
 
@@ -121,6 +131,10 @@ impl AdapterConfiguration {
 			"SQLite" => AdapterConfiguration::SQLite {
 				connection_string: config_value.to_string(),
 			},
+			#[cfg(feature = "toron")]
+			"Toron" => AdapterConfiguration::Toron {
+				endpoint: config_value.to_string(),
+			},
 			_ => AdapterConfiguration::None,
 		}
 	}
@@ -168,6 +182,16 @@ impl AdapterState {
 					.unwrap_or(&"memory".to_string())
 					.clone();
 				self.configuration = AdapterConfiguration::SQLite { connection_string };
+				self.stage = AdapterStage::Configured;
+			}
+			#[cfg(feature = "toron")]
+			AdapterSelection::Toron => {
+				let endpoint = self
+					.fields
+					.get("endpoint")
+					.unwrap_or(&"127.0.0.1:7742".to_string())
+					.clone();
+				self.configuration = AdapterConfiguration::Toron { endpoint };
 				self.stage = AdapterStage::Configured;
 			}
 		}
@@ -268,6 +292,16 @@ impl AdapterState {
 					}
 				}
 			}
+			#[cfg(feature = "toron")]
+			AdapterConfiguration::Toron { endpoint } => {
+				match toron::ToronAdapter::connect(&endpoint).await {
+					Ok(adapter) => Some(Arc::new(RwLock::new(adapter))),
+					Err(error) => {
+						eprintln!("Toron connection error: {error}");
+						None
+					}
+				}
+			}
 		}
 	}
 }
@@ -280,6 +314,8 @@ pub fn fields_for(selection: &AdapterSelection) -> &'static [AdapterField] {
 		AdapterSelection::Parquet => parquet::FIELDS,
 		AdapterSelection::Postgres => postgres::FIELDS,
 		AdapterSelection::SQLite => sqlite::FIELDS,
+		#[cfg(feature = "toron")]
+		AdapterSelection::Toron => toron::FIELDS,
 	}
 }
 
@@ -336,6 +372,11 @@ mod tests {
 		assert!(matches!(
 			AdapterConfiguration::from_saved("unknown", "ignored"),
 			AdapterConfiguration::None
+		));
+		#[cfg(feature = "toron")]
+		assert!(matches!(
+			AdapterConfiguration::from_saved("Toron", "127.0.0.1:7742"),
+			AdapterConfiguration::Toron { endpoint } if endpoint == "127.0.0.1:7742"
 		));
 	}
 

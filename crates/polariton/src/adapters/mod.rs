@@ -6,3 +6,5 @@ pub mod parquet;
 pub mod postgres;
 pub(crate) mod sql_compound;
 pub mod sqlite;
+#[cfg(feature = "toron")]
+pub mod toron;
