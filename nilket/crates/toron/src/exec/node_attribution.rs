@@ -410,14 +410,10 @@ pub(in crate::exec) struct SuffixProbeObservation {
 	pub build_rows: u64,
 	pub distinct_keys: u64,
 	pub build_batch_bytes: u64,
-	pub index_accounted_bytes: Option<u64>,
-	pub index_accounted_bytes_unknown_reason: Option<&'static str>,
-	pub retained_bytes: Option<u64>,
-	pub retained_bytes_unknown_reason: Option<&'static str>,
+	pub index_accounted_bytes: u64,
 	pub entry_capacity: u64,
 	pub bucket_capacity: u64,
-	pub key_width_bytes: Option<u64>,
-	pub key_width_unknown_reason: Option<&'static str>,
+	pub key_width_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -818,14 +814,9 @@ impl NodeAccounting {
 			|| current.distinct_keys != incoming.distinct_keys
 			|| current.build_batch_bytes != incoming.build_batch_bytes
 			|| current.index_accounted_bytes != incoming.index_accounted_bytes
-			|| current.index_accounted_bytes_unknown_reason
-				!= incoming.index_accounted_bytes_unknown_reason
-			|| current.retained_bytes != incoming.retained_bytes
-			|| current.retained_bytes_unknown_reason != incoming.retained_bytes_unknown_reason
 			|| current.entry_capacity != incoming.entry_capacity
 			|| current.bucket_capacity != incoming.bucket_capacity
 			|| current.key_width_bytes != incoming.key_width_bytes
-			|| current.key_width_unknown_reason != incoming.key_width_unknown_reason
 		{
 			existing.error = Some("suffix probe build shape changed within one replay");
 			return;
@@ -2035,10 +2026,6 @@ fn suffix_probe_profiles_value(profiles: &[SuffixProbeProfile]) -> serde_json::V
 						"distinct_keys": observation.distinct_keys,
 						"build_batch_bytes": observation.build_batch_bytes,
 						"index_accounted_bytes": observation.index_accounted_bytes,
-						"index_accounted_bytes_unknown_reason":
-							observation.index_accounted_bytes_unknown_reason,
-						"retained_bytes": observation.retained_bytes,
-						"retained_bytes_unknown_reason": observation.retained_bytes_unknown_reason,
 						"entry_capacity": observation.entry_capacity,
 						"bucket_capacity": observation.bucket_capacity,
 						"load": {
@@ -2046,7 +2033,6 @@ fn suffix_probe_profiles_value(profiles: &[SuffixProbeProfile]) -> serde_json::V
 							"denominator": observation.bucket_capacity,
 						},
 						"key_width_bytes": observation.key_width_bytes,
-						"key_width_unknown_reason": observation.key_width_unknown_reason,
 					},
 					"passed": profile.error.is_none() && observation.supported,
 				})
@@ -3343,85 +3329,6 @@ mod tests {
 	}
 
 	#[test]
-	fn adr524_missing_replay_cleanup_child_fails_the_profile() {
-		let replay = Some(2);
-		let invocation = invocation_with_stages(
-			1_000,
-			0,
-			Some(Vocabulary {
-				invocation_id: 3,
-				name: "scan_probe_base",
-				spill: SpillCounterKind::Flow,
-				required_stages: RequiredStages::Owned(vec![
-					RequiredStage {
-						name: "runtime_prep",
-						parent: None,
-						replay: None,
-					},
-					RequiredStage {
-						name: "prep_build",
-						parent: Some("runtime_prep"),
-						replay,
-					},
-					RequiredStage {
-						name: "cleanup",
-						parent: None,
-						replay: None,
-					},
-					RequiredStage {
-						name: "cleanup_build",
-						parent: Some("cleanup"),
-						replay,
-					},
-				]),
-				residual_boundary_micros: 1_000,
-			}),
-			vec![
-				HandlerStage {
-					name: "runtime_prep",
-					calls: 1,
-					parent: None,
-					replay: None,
-					outcome: StageOutcome::Reconciled {
-						micros: 400,
-						spill_bytes: 0,
-					},
-				},
-				HandlerStage {
-					name: "prep_build",
-					calls: 1,
-					parent: Some("runtime_prep"),
-					replay,
-					outcome: StageOutcome::Reconciled {
-						micros: 350,
-						spill_bytes: 0,
-					},
-				},
-				HandlerStage {
-					name: "cleanup",
-					calls: 1,
-					parent: None,
-					replay: None,
-					outcome: StageOutcome::Reconciled {
-						micros: 200,
-						spill_bytes: 0,
-					},
-				},
-			],
-		);
-		let value = stages_value(&invocation, &[]);
-		assert_eq!(
-			value["missing_required_stages"],
-			serde_json::json!([{
-				"stage": "cleanup_build",
-				"parent": "cleanup",
-				"replay_id": 2,
-			}])
-		);
-		assert_eq!(value["passed"], false);
-	}
-
-	#[test]
 	fn spill_lifecycle_counters_remain_parent_scoped_and_checked() {
 		let mut acc = NodeAccounting::default();
 		acc.enter();
@@ -3536,15 +3443,10 @@ mod tests {
 			build_rows: 100,
 			distinct_keys: 80,
 			build_batch_bytes: 1_600,
-			index_accounted_bytes: supported.then_some(3_200),
-			index_accounted_bytes_unknown_reason: (!supported)
-				.then_some("generic ownership unknown"),
-			retained_bytes: supported.then_some(4_800),
-			retained_bytes_unknown_reason: (!supported).then_some("generic ownership unknown"),
+			index_accounted_bytes: 3_200,
 			entry_capacity: 100,
 			bucket_capacity: 256,
-			key_width_bytes: supported.then_some(8),
-			key_width_unknown_reason: (!supported).then_some("variable-width key"),
+			key_width_bytes: if supported { 8 } else { 0 },
 		}
 	}
 

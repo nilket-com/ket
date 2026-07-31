@@ -1,16 +1,11 @@
 use std::collections::HashMap;
-use std::time::Instant;
 
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
 
 use crate::error::ExecutionError;
 
-use super::{
-	InMemoryProbeProfile, JoinKey, JoinKeyPlan, JoinKind, JoinMatchResidual, JoinOutputRow,
-	append_join_matches_for_kind, append_unmatched_probe_row, join_key_bytes,
-	join_key_bytes_null_safe,
-};
+use super::{JoinKey, JoinKeyPlan};
 
 #[derive(Debug, Clone)]
 pub(in crate::exec) struct BuildRowList {
@@ -44,8 +39,7 @@ pub(super) struct JoinBuildProfileShape {
 	pub(super) distinct_keys: u64,
 	pub(super) entry_capacity: u64,
 	pub(super) bucket_capacity: u64,
-	pub(super) index_accounted_bytes: Option<u64>,
-	pub(super) index_accounted_bytes_unknown_reason: Option<&'static str>,
+	pub(super) index_accounted_bytes: u64,
 }
 
 enum JoinBuildRowsInner {
@@ -71,74 +65,6 @@ const EMPTY_PRIMITIVE_BUCKET: usize = usize::MAX;
 /// loads are in flight concurrently instead of each probe paying its two
 /// dependent misses serially.
 pub(in crate::exec) const PROBE_BATCH_WINDOW: usize = 64;
-
-/// ADR 524: profile generic-key probes in the same batch-scoped cadence as the primitive path.
-/// The production arm keeps its historical scalar loop; the profiler arm stages key encoding and
-/// lookups so lookup/key reconstruction and match expansion have disjoint clocks.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn probe_generic_key_rows_profiled(
-	kind: JoinKind,
-	rows: usize,
-	key_arrays: &[ArrayRef],
-	null_safe_keys: bool,
-	build_rows: &JoinBuildRows,
-	matched_build_rows: &mut Option<Vec<u64>>,
-	selection: &mut Vec<JoinOutputRow>,
-	residual: &mut JoinMatchResidual<'_>,
-	profile: &mut InMemoryProbeProfile,
-) -> Result<(), ExecutionError> {
-	let mut window_keys = Vec::with_capacity(PROBE_BATCH_WINDOW);
-	let mut window_lookups = Vec::with_capacity(PROBE_BATCH_WINDOW);
-	let mut row = 0usize;
-	while row < rows {
-		let end = (row + PROBE_BATCH_WINDOW).min(rows);
-		let lookup_started = Instant::now();
-		window_keys.clear();
-		for key_row in row..end {
-			let key = if null_safe_keys {
-				Some(JoinKey::Generic(join_key_bytes_null_safe(
-					key_arrays, key_row,
-				)?))
-			} else {
-				join_key_bytes(key_arrays, key_row)?.map(JoinKey::Generic)
-			};
-			window_keys.push(key);
-		}
-		profile.record_lookup_window(window_keys.iter().filter(|key| key.is_some()).count());
-		window_lookups.clear();
-		window_lookups.extend(
-			window_keys
-				.iter()
-				.map(|key| key.as_ref().and_then(|key| build_rows.get(key))),
-		);
-		profile.record_lookup_duration(lookup_started.elapsed());
-
-		let match_started = Instant::now();
-		for (offset, (key, lookup)) in window_keys.iter().zip(&window_lookups).enumerate() {
-			let probe_row = row + offset;
-			let matched = if key.is_none() {
-				false
-			} else if let Some(matches) = lookup {
-				append_join_matches_for_kind(
-					kind,
-					probe_row,
-					matches.rows(),
-					matched_build_rows.as_deref_mut(),
-					selection,
-					residual,
-				)?
-			} else {
-				false
-			};
-			if !matched {
-				append_unmatched_probe_row(kind, probe_row, selection)?;
-			}
-		}
-		profile.record_match_expand_duration(match_started.elapsed());
-		row = end;
-	}
-	Ok(())
-}
 
 const BATCHED_PROBE_PREFETCH_ENV: &str = "TORON_BATCHED_PROBE_PREFETCH";
 
@@ -557,38 +483,17 @@ impl JoinBuildRows {
 	}
 
 	pub(super) fn profile_shape(&self) -> JoinBuildProfileShape {
-		let (
-			representation,
-			bucket_capacity,
-			index_accounted_bytes,
-			index_accounted_bytes_unknown_reason,
-		) = match &self.inner {
-			JoinBuildRowsInner::Hash(rows) => (
-				"generic_hash",
-				rows.capacity(),
-				None,
-				Some("generic variable-width ownership is not tracked without an entry walk"),
-			),
-			JoinBuildRowsInner::Int32(table) => (
-				"int32_primitive",
-				table.bucket_capacity(),
-				Some(table.accounted_bytes()),
-				None,
-			),
-			JoinBuildRowsInner::Int64(table) => (
-				"int64_primitive",
-				table.bucket_capacity(),
-				Some(table.accounted_bytes()),
-				None,
-			),
+		let (representation, bucket_capacity) = match &self.inner {
+			JoinBuildRowsInner::Hash(rows) => ("generic_hash", rows.capacity()),
+			JoinBuildRowsInner::Int32(table) => ("int32_primitive", table.bucket_capacity()),
+			JoinBuildRowsInner::Int64(table) => ("int64_primitive", table.bucket_capacity()),
 		};
 		JoinBuildProfileShape {
 			representation,
 			distinct_keys: u64::try_from(self.len()).unwrap_or(u64::MAX),
 			entry_capacity: u64::try_from(self.capacity()).unwrap_or(u64::MAX),
 			bucket_capacity: u64::try_from(bucket_capacity).unwrap_or(u64::MAX),
-			index_accounted_bytes,
-			index_accounted_bytes_unknown_reason,
+			index_accounted_bytes: self.accounted_bytes(),
 		}
 	}
 
@@ -1111,7 +1016,7 @@ mod tests {
 	}
 
 	#[test]
-	fn adr524_generic_probe_times_windows_without_changing_selection() {
+	fn adr516_generic_probe_declines_timing_without_changing_selection() {
 		let build = RecordBatch::try_new(
 			Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)])),
 			vec![Arc::new(StringArray::from(vec![
@@ -1169,9 +1074,8 @@ mod tests {
 		.expect("unprofiled generic probe");
 
 		assert_eq!(observed, expected);
-		assert!(profile.supported);
-		assert_eq!(profile.lookup_windows, 1);
-		assert_eq!(profile.non_null_keys, 2);
+		assert!(!profile.supported);
+		assert_eq!(profile.lookup_windows, 0);
 	}
 
 	#[test]

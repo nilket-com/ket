@@ -73,3 +73,66 @@ against 3,554 ms:
 
 The standard council seal and changed-surface blocks via `scripts/cargo-cgroup`, direct exit
 statuses preserved, gates re-run after any code change made in response.
+
+## Measured outcome - attribution rejected
+
+The mechanism sealed as `f0e9ff25` and passed the complete repository battery, but the live
+exact-coordinate evidence rejected the instrument before it could price `E`. No lifecycle
+number from the profiler-on arms has attribution authority.
+
+### Perturbation gate
+
+The five adjacent q09 pairs all passed query correctness with one fingerprint
+(`3d202b6e227b3a8b`), one digest, 175 rows, and zero spill. Their relative movements were:
+
+| pair | profiler off (ms) | profiler on (ms) | `(on - off) / off` |
+|---:|---:|---:|---:|
+| 1 | 9,927.890117 | 9,293.211530 | -6.392885% |
+| 2 | 10,070.984153 | 9,252.140018 | -8.130726% |
+| 3 | 10,018.539358 | 9,146.304981 | -8.706203% |
+| 4 | 9,874.506213 | 9,198.904684 | -6.841877% |
+| 5 | 9,901.023854 | 9,189.012488 | -7.191290% |
+
+The signed median is **-7.191290%**; ADR 516 defines the gate in absolute value, so the
+perturbation is **7.191290%** and the q09 run set is rejected. Acceleration is not free
+instrumentation: the sealed diff staged generic keys and hash lookups in 64-row windows while
+the profiler-off arm retained the historical scalar loop. That execution-schedule difference is
+a direct confound, whether or not it explains the whole measured movement.
+
+The required q08 sanity check independently rejected twice:
+
+| attempt | profiler off (ms) | profiler on (ms) | movement |
+|---:|---:|---:|---:|
+| 1 | 4,260.620470 | 4,426.569500 | +3.894950% |
+| 2 | 4,305.746352 | 4,513.158760 | +4.817107% |
+
+Both q08 attempts held one fingerprint (`5e07510a975325d2`), one digest, two rows, and zero
+spill. Two consecutive breaches satisfy the predeclared close-red condition; the run set is not
+selectively extended or corrected.
+
+### Reconciliation failure
+
+The q09 profiler artifacts also fail the stronger receipt contract. Every profile reports
+`coverage_complete=true` but `refinements_reconciled=false` and `stages.passed=false`.
+`runtime_prep` and `cleanup` are whole-invocation parents with `replay_id=null`, while each new
+`prep_build` and `cleanup_build` child is replay-scoped. The existing parent-instance reconciler
+therefore emits `parent_stage_not_reconciled` for all four prep children and all four cleanup
+children. The suffix-probe refinements reconcile, including replay 2, but they cannot repair the
+failed lifecycle boundary.
+
+### Decision
+
+ADR 524 closes **red on instrumentation validity**. `E` is not computed, q09 is neither parked
+nor promoted to a compact-composite successor, and no remedy is selected. The receipt removes
+the rejected profiler changes and restores the post-523 implementation surface; only the plan
+and this evidence remain.
+
+A future attribution cut must preserve the generic probe's execution order while placing
+batch-scoped clocks around that same path, and must either publish replay-scoped prep/cleanup
+parents or teach the receipt contract explicitly how replay children partition a global parent.
+Those are instrument-design prerequisites, not q09 performance findings.
+
+The restored tree re-ran green after removal: both fmt legs; 1,456 library tests; all 2,095
+architecture tests; the full `--no-fail-fast` suite and `toron-tpch` with direct exit 0 and no
+failures; the Toron telemetry, base TPC-H, Polars-reference TPC-H, and Wendelon all-targets
+checks; and both staged and unstaged `git diff --check`.

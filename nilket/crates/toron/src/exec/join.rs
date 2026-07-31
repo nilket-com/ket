@@ -1544,44 +1544,33 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 		}
 		JoinKeyPlan::Generic => {
 			if let Some(profile) = profile.as_deref_mut() {
-				build_rows::probe_generic_key_rows_profiled(
-					kind,
-					rows,
-					right_key_arrays,
-					null_safe_keys,
-					build_rows,
-					&mut matched_build_rows,
-					&mut selection,
-					&mut residual,
-					profile,
-				)?;
-			} else {
-				for row in 0..rows {
-					let key = if null_safe_keys {
-						join_key_bytes_null_safe(right_key_arrays, row)?
-					} else {
-						let Some(key) = join_key_bytes(right_key_arrays, row)? else {
-							append_unmatched_probe_row(kind, row, &mut selection)?;
-							continue;
-						};
-						key
-					};
-					let key = JoinKey::Generic(key);
-					let matched = if let Some(matches) = build_rows.get(&key) {
-						append_join_matches_for_kind(
-							kind,
-							row,
-							matches.rows(),
-							matched_build_rows.as_deref_mut(),
-							&mut selection,
-							&mut residual,
-						)?
-					} else {
-						false
-					};
-					if !matched {
+				profile.supported = false;
+			}
+			for row in 0..rows {
+				let key = if null_safe_keys {
+					join_key_bytes_null_safe(right_key_arrays, row)?
+				} else {
+					let Some(key) = join_key_bytes(right_key_arrays, row)? else {
 						append_unmatched_probe_row(kind, row, &mut selection)?;
-					}
+						continue;
+					};
+					key
+				};
+				let key = JoinKey::Generic(key);
+				let matched = if let Some(matches) = build_rows.get(&key) {
+					append_join_matches_for_kind(
+						kind,
+						row,
+						matches.rows(),
+						matched_build_rows.as_deref_mut(),
+						&mut selection,
+						&mut residual,
+					)?
+				} else {
+					false
+				};
+				if !matched {
+					append_unmatched_probe_row(kind, row, &mut selection)?;
 				}
 			}
 		}
