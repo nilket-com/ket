@@ -98,6 +98,13 @@ product slices, as Baryon disciplined libaryon.
 
 ## Consequences
 
+- **The dependency direction is guard-enforced**
+  (`impl/dependency-boundary-guards.md`): manifest denylists in the audit
+  family keep Arrow and the analytics/connector stack out of `libaryon`
+  (and mostly out of `baryon`), with amendment-of-this-ADR as the sole
+  exception path. The recorded fantasy exception — semantic-indexing
+  machinery someday wanting columnar data — points the *other* way:
+  libaryon exposes harvest hooks; the analytics crate consumes them.
 - Polariton's existing closed adapter surface migrates toward the seam
   **incrementally** — this is a migration, not a greenfield.
 - **A thermal benchmark fixture is created now** (before any tile
