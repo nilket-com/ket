@@ -157,3 +157,22 @@ architecture (2,095/2,095), and complete `--no-fail-fast` suite; serialized full
 (75 library passed/3 ignored, 52 CLI, 21 architecture, 5 Arrow decimal, 176 correctness/2 ignored,
 12 decimal, 44 harness, 2 q14, doc tests); `git diff --check`. The two existing Toron warnings
 (unused `QueryBudget` import and unused `inner_resident_bytes`) are unchanged.
+
+## Refinement — stall-classification premise guard (post-review)
+
+Review grounding showed the `blocked_appenders > 0` ⟺ non-returning-wait equivalence holds
+only because no fragmented census plan has a live-eligible shuffle consumer
+(`streamable_unary_plan` admits scan/filter/project/take chains only, so every aggregate,
+join, and sort consumer waits for producer seal). Per the review directive, that premise is
+now enforced rather than assumed: `FragmentShapeReceipt` carries
+`live_eligible_consumer_tasks` (disclosed on both census rows), the execution rail refuses to
+classify a stall when the count is nonzero (a loud harness error demanding consumer-dispatch
+state in the receipt), and `stall_premise_no_live_eligible_consumers_across_board` pins the
+zero count across q01-q22. The sf=8 matrix above is unaffected: all classified cells satisfy
+the premise by grounded fact.
+
+Note on identities: the sealed chain was rebased onto `71df5062` (`plan: close the durable
+toron dogfood loop`) before publication; `a0023ec2 → a7dc0eb3 → 4b37d45b → 289e1ec4` became
+`a7fad8b6 → d64750fb → f8c0da02 → 6b367cb0` with byte-identical crate content. The artifact
+directory name and its rows' `build_commit = 4b37d45b20eb` record the pre-rebase build
+identity of that identical tree.

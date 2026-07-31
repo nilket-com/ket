@@ -60,7 +60,7 @@ use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::scheduler::StagePlan;
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
-	TaskOutputBinding, TaskTelemetry,
+	TaskInputBinding, TaskOutputBinding, TaskTelemetry, is_streamable_shuffle_consumer,
 };
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
@@ -4829,6 +4829,11 @@ pub struct FragmentShapeReceipt {
 	pub stage_task_counts: Vec<usize>,
 	pub max_stage_width: usize,
 	pub single_task_producer_stages: usize,
+	/// ADR 529 refinement: shuffle-consumer tasks the scheduler may dispatch against a live
+	/// (unsealed) producer. The stall classification (`blocked_appenders > 0` ⟺ non-returning
+	/// wait) is sound only when this is zero — a live-eligible consumer drains concurrently,
+	/// making transient backpressure healthy rather than fatal.
+	pub live_eligible_consumer_tasks: usize,
 }
 
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
@@ -4870,11 +4875,23 @@ pub fn fragment_shape_receipt(stages: &[StagePlan]) -> FragmentShapeReceipt {
 				})
 		})
 		.count();
+	let live_eligible_consumer_tasks = stages
+		.iter()
+		.flat_map(|stage| stage.tasks.iter())
+		.filter(|task| {
+			task.spec
+				.inputs
+				.iter()
+				.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
+				&& is_streamable_shuffle_consumer(&task.spec)
+		})
+		.count();
 	FragmentShapeReceipt {
 		stage_count: stages.len(),
 		stage_task_counts,
 		max_stage_width,
 		single_task_producer_stages,
+		live_eligible_consumer_tasks,
 	}
 }
 
@@ -5010,6 +5027,7 @@ fn fragment_census_row(
 			stage_task_counts: None,
 			max_stage_width: None,
 			single_task_producer_stages: None,
+			live_eligible_consumer_tasks: None,
 			elapsed_ms,
 			diagnostic_message: Some(message),
 		},
@@ -5025,6 +5043,7 @@ fn fragment_census_row(
 			stage_task_counts: None,
 			max_stage_width: None,
 			single_task_producer_stages: None,
+			live_eligible_consumer_tasks: None,
 			elapsed_ms,
 			diagnostic_message: Some(message),
 		},
@@ -5044,6 +5063,7 @@ fn fragment_census_row(
 			stage_task_counts: Some(receipt.stage_task_counts),
 			max_stage_width: Some(receipt.max_stage_width),
 			single_task_producer_stages: Some(receipt.single_task_producer_stages),
+			live_eligible_consumer_tasks: Some(receipt.live_eligible_consumer_tasks),
 			elapsed_ms,
 			diagnostic_message: None,
 		},
@@ -5481,6 +5501,7 @@ async fn run_execution_census_input(
 				distributed_schema_fingerprint: None,
 				stage_count: None,
 				stage_task_counts: None,
+				live_eligible_consumer_tasks: None,
 				admitted_width: None,
 				task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
 				local_memory_bytes: local_budget.memory_per_task.get(),
@@ -5579,6 +5600,18 @@ async fn run_execution_census_input(
 	let distributed_elapsed_ms = distributed_start.elapsed().as_secs_f64() * 1000.0;
 	shutdown_execution_census_workers(workers).await?;
 
+	// ADR 529 refinement: `blocked_appenders > 0` proves a non-returning wait only when no
+	// consumer can drain the live buffer before seal. A shape with live-eligible consumers
+	// makes transient backpressure healthy, so classifying it as stalled would counterfeit a
+	// liveness wall — refuse loudly instead.
+	if !live_backpressure_receipts.is_empty() && preflight.shape.live_eligible_consumer_tasks > 0 {
+		return Err(format!(
+			"execution census stall premise violated for {}: {} live-eligible consumer task(s) \
+			 can drain the live buffer, so a blocked appender is not proof of a non-returning \
+			 wait; extend the receipt with consumer-dispatch state before classifying this shape",
+			input.query_id, preflight.shape.live_eligible_consumer_tasks
+		));
+	}
 	let (classification, reason, distributed_identity, diagnostic_message) =
 		if !live_backpressure_receipts.is_empty() {
 			(
@@ -5642,6 +5675,7 @@ async fn run_execution_census_input(
 		distributed_schema_fingerprint,
 		stage_count: Some(preflight.shape.stage_count),
 		stage_task_counts: Some(preflight.shape.stage_task_counts),
+		live_eligible_consumer_tasks: Some(preflight.shape.live_eligible_consumer_tasks),
 		admitted_width: Some(width),
 		task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
 		local_memory_bytes: local_budget.memory_per_task.get(),
@@ -18049,6 +18083,47 @@ mod adr528_fragment_census {
 #[cfg(test)]
 mod adr529_execution_census {
 	use super::*;
+
+	/// The stall classification's premise, pinned board-wide: no fragmented census plan has a
+	/// live-eligible shuffle consumer, so a blocked appender is a non-returning wait. When this
+	/// fails for a new shape, the rail's runtime guard refuses the classification — extend the
+	/// receipt with consumer-dispatch state before widening the census.
+	/// Deep multi-join binds (q10+) need an explicit stack; run on a dedicated 64 MB thread
+	/// with a current-thread runtime.
+	#[test]
+	fn stall_premise_no_live_eligible_consumers_across_board() {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("current-thread runtime");
+				runtime.block_on(async {
+					for query in ALL_QUERY_IDS {
+						let row = run_fragment_census_query(
+							query,
+							"strict",
+							0.01,
+							"memory",
+							Path::new("unused"),
+						)
+						.await
+						.expect("fragment census cell");
+						if row.stage_count.is_some() {
+							assert_eq!(
+								row.live_eligible_consumer_tasks,
+								Some(0),
+								"{query}: a live-eligible consumer invalidates blocked-appender ⟺ stall"
+							);
+						}
+					}
+				});
+			})
+			.expect("spawn premise thread")
+			.join()
+			.expect("premise thread");
+	}
 
 	fn memory_execution_input(query: &str, sql: Option<Cow<'static, str>>) -> ExecutionCensusInput {
 		let spec = build_perf_query_spec(query, "strict", 0.01).expect("execution census spec");
