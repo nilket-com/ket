@@ -103,3 +103,57 @@ parallelism, or store changes — those are the follow-up decisions this receipt
 ## Repository gates
 
 As step 2; the battery repeats after any code change made in response.
+
+## Implementation receipt — 2026-07-31
+
+Sealed implementation chain: `a0023ec2` (execution-census rail) → `a7dc0eb3`
+(typed live-backpressure receipt) → `4b37d45b` (receipt-armed cancellation cleanup). The release
+binary at the final identity ran all 22 cells against strict sf=8 persisted Parquet with full-hash
+verification. Artifact:
+`target/tpch/adr529_execution_census_4b37d45b/execution_census.jsonl` (22 rows, all
+`build_commit=4b37d45b20eb`, all `timing_authority=false`, zero transport retries).
+
+| query | classification | typed reason | local rows | distributed rows | digest | schema | stage widths |
+|---|---|---|---:|---:|---|---|---|
+| q01 | execution_rejected | live_shuffle_backpressure_stalled | 4 | — | incomplete | — | 1,4,1 |
+| q02 | executes_identical | — | 3,747 | 3,747 | equal | equal | 1,1,4,1 |
+| q03 | execution_rejected | live_shuffle_backpressure_stalled | 90,442 | — | incomplete | — | 1,1,4,1 |
+| q04 | execution_rejected | live_shuffle_backpressure_stalled | 5 | — | incomplete | — | 1,1,4,4,1 |
+| q05 | executes_identical | — | 5 | 5 | equal | equal | 1,1,4,4,1 |
+| q06 | executes_identical | — | 1 | 1 | equal | equal | 1 |
+| q07 | executes_identical | — | 4 | 4 | equal | equal | 1,1,4,4,1 |
+| q08 | executes_identical | — | 2 | 2 | equal | equal | 1,1,4,4,1 |
+| q09 | executes_identical | — | 175 | 175 | equal | equal | 1,1,4,4,1 |
+| q10 | executes_identical | — | 304,540 | 304,540 | equal | equal | 1,1,4,4,1 |
+| q11 | executes_divergent | — | 7,508 | 0 | different | equal | 1,1,4,1 |
+| q12 | execution_rejected | live_shuffle_backpressure_stalled | 2 | — | incomplete | — | 1,1,4,4,1 |
+| q13 | execution_rejected | live_shuffle_backpressure_stalled | 44 | — | incomplete | — | 1,1,4,4,1 |
+| q14 | execution_rejected | live_shuffle_backpressure_stalled | 1 | — | incomplete | — | 1,1,4 |
+| q15 | execution_rejected | fragment_broadcast_probe_not_star_linear | 1 | — | incomplete | — | — |
+| q16 | execution_rejected | live_shuffle_backpressure_stalled | 27,838 | — | incomplete | — | 1,1,4,4,4,1 |
+| q17 | executes_divergent | — | 1 | 4 | different | equal | 1,1,4 |
+| q18 | execution_rejected | live_shuffle_backpressure_stalled | 100 | — | incomplete | — | 1,1,4,1 |
+| q19 | execution_rejected | live_shuffle_backpressure_stalled | 1 | — | incomplete | — | 1,1,4 |
+| q20 | executes_identical | — | 1,440 | 1,440 | equal | equal | 1,1,4,1 |
+| q21 | execution_rejected | live_shuffle_backpressure_stalled | 100 | — | incomplete | — | 1,1,4,4,1 |
+| q22 | execution_rejected | live_shuffle_backpressure_stalled | 7 | — | incomplete | — | 1,1,4,4,1 |
+
+Histogram: `executes_identical=8`, `executes_divergent=2`,
+`execution_rejected:live_shuffle_backpressure_stalled=11`, and
+`execution_rejected:fragment_broadcast_probe_not_star_linear=1`. Every backpressure row carries
+exactly one worker receipt with one appender actually waiting on the live backlog semaphore; the
+recorded buffered-chunk totals are respectively 12, 16, 31, 16, 16, 16, 14, 16, 16, 16, and 16
+in query order over that wall set. No row has a schema mismatch.
+
+Gate verdict: the nonempty identical set names the only execution-reachable comparison candidates
+(`q02,q05,q06,q07,q08,q09,q10,q20`), but **q11 and q17 are correctness findings and therefore
+block any timing follow-up** until separately diagnosed and resolved. q11 returns zero distributed
+rows versus 7,508 locally; q17 returns four distributed rows versus one locally. The 11-cell
+backpressure family is a scheduler/store-liveness backlog, not a request to change the store in
+this ADR. No timing, ScanShare, scheduler, or capacity work is authorized by this receipt.
+
+Final gates: both format checks; all three `--all-targets` checks; Toron library (1,461/1,461),
+architecture (2,095/2,095), and complete `--no-fail-fast` suite; serialized full `toron-tpch`
+(75 library passed/3 ignored, 52 CLI, 21 architecture, 5 Arrow decimal, 176 correctness/2 ignored,
+12 decimal, 44 harness, 2 q14, doc tests); `git diff --check`. The two existing Toron warnings
+(unused `QueryBudget` import and unused `inner_resident_bytes`) are unchanged.
