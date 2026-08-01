@@ -32,8 +32,8 @@ pub(crate) fn adr059_reuses_existing_cancel_wire_and_rejects_control_protocol_dr
 
 #[test]
 pub(crate) fn adr059_sql_cancel_uses_existing_cancel_frame_not_execute_grammar() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
 	let cancel_branch = brace_blocks_after_marker(&daemon, "SqlMessage::Cancel")
@@ -530,8 +530,8 @@ pub(crate) fn adr059_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 #[test]
 pub(crate) fn adr060_consumes_wendelon_adr073_without_new_wire() {
 	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let cancellation =
 		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
 			.expect("read cancellation");
@@ -882,8 +882,8 @@ pub(crate) fn adr060_no_writes_cdc_admin_agg_or_legacy_query_scope() {
 pub(crate) fn adr060_no_control_ring_uni_stream_sidecar_or_sql_grammar() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator");
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	assert!(coordinator.contains("DownstreamAttemptRegistry"));
 	assert!(!sql_wire.contains("CancelWendelon"));

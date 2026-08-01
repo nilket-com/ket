@@ -1,32 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct QueryId(Uuid);
-
-impl QueryId {
-	pub fn new() -> Self {
-		Self(Uuid::now_v7())
-	}
-
-	pub const fn from_uuid(value: Uuid) -> Self {
-		Self(value)
-	}
-
-	pub const fn from_u128(value: u128) -> Self {
-		Self(Uuid::from_u128(value))
-	}
-
-	pub const fn get(self) -> Uuid {
-		self.0
-	}
-}
-
-impl Default for QueryId {
-	fn default() -> Self {
-		Self::new()
-	}
-}
+pub use toron_client::QueryId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StageId(pub u32);

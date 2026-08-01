@@ -297,7 +297,9 @@ impl AdapterState {
 				match toron::ToronAdapter::connect(&endpoint).await {
 					Ok(adapter) => Some(Arc::new(RwLock::new(adapter))),
 					Err(error) => {
-						eprintln!("Toron connection error: {error}");
+						eprintln!(
+							"Toron connection error: {error}\nStart local Nilket with: nilket"
+						);
 						None
 					}
 				}

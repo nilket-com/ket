@@ -2,7 +2,13 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use nilket::local::LocalReady;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 use wendelon::audit::{
 	AuditAuthority, AuditEvent, AuditOperation, AuditRootSigner, AuditSink, LocalAuditSink,
@@ -39,6 +45,183 @@ fn fresh_dir(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!("nilket-cli-{tag}-{}-{}", std::process::id(), nanos));
 	std::fs::create_dir_all(&dir).expect("create temp dir");
 	dir
+}
+
+const DOGFOOD_SQL: &str = include_str!("fixtures/toron_dogfood.sql");
+static LIVE_LOCAL_LOCK: Mutex<()> = Mutex::new(());
+
+fn dogfood_statements() -> Vec<String> {
+	DOGFOOD_SQL
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty() && !line.starts_with("--"))
+		.map(|line| {
+			line.strip_suffix(';')
+				.unwrap_or_else(|| panic!("contract statement lacks semicolon: {line}"))
+				.to_owned()
+		})
+		.collect()
+}
+
+struct LiveLocal {
+	child: Child,
+	ready: LocalReady,
+	child_pids: Vec<u32>,
+}
+
+impl LiveLocal {
+	fn spawn(profile: &std::path::Path, stderr_log: &std::path::Path) -> Self {
+		let stderr = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(stderr_log)
+			.expect("open local-profile stderr log");
+		let mut child = nilket_command()
+			.args([
+				"local",
+				"--data-dir",
+				profile.to_str().expect("utf8 live profile path"),
+			])
+			.stdout(Stdio::piped())
+			.stderr(stderr)
+			.spawn()
+			.expect("spawn live local profile");
+		let stdout = child.stdout.take().expect("local profile stdout");
+		let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+		thread::spawn(move || {
+			let mut line = String::new();
+			let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+			let _ = sender.send(result);
+		});
+		let line = receiver
+			.recv_timeout(Duration::from_secs(60))
+			.unwrap_or_else(|error| {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("local profile did not publish readiness: {error}")
+			})
+			.expect("read local readiness line");
+		let ready =
+			LocalReady::parse(&line).unwrap_or_else(|error| panic!("parse {line:?}: {error}"));
+		let child_pids = wait_for_direct_children(child.id(), 2, Duration::from_secs(10));
+		assert_eq!(child_pids.len(), 2, "real local profile owns two roles");
+		assert_ne!(child_pids[0], child_pids[1]);
+		Self {
+			child,
+			ready,
+			child_pids,
+		}
+	}
+
+	fn stop_gracefully(mut self) {
+		kill(Pid::from_raw(self.child.id() as i32), Signal::SIGINT)
+			.expect("signal local supervisor");
+		let status = wait_for_child(&mut self.child, Duration::from_secs(90));
+		assert!(status.success(), "local supervisor exit: {status}");
+		for pid in &self.child_pids {
+			assert!(
+				wait_for_process_exit(*pid, Duration::from_secs(5)),
+				"role process {pid} survived graceful supervisor exit"
+			);
+		}
+	}
+}
+
+impl Drop for LiveLocal {
+	fn drop(&mut self) {
+		if self.child.try_wait().ok().flatten().is_none() {
+			let _ = self.child.kill();
+			let _ = self.child.wait();
+		}
+	}
+}
+
+fn direct_children(pid: u32) -> Vec<u32> {
+	std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+		.unwrap_or_default()
+		.split_ascii_whitespace()
+		.filter_map(|value| value.parse().ok())
+		.collect()
+}
+
+fn wait_for_direct_children(pid: u32, count: usize, timeout: Duration) -> Vec<u32> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		let children = direct_children(pid);
+		if children.len() == count || Instant::now() >= deadline {
+			return children;
+		}
+		thread::sleep(Duration::from_millis(25));
+	}
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+	let deadline = Instant::now() + timeout;
+	loop {
+		if let Some(status) = child.try_wait().expect("poll local supervisor") {
+			return status;
+		}
+		if Instant::now() >= deadline {
+			let _ = child.kill();
+			return child.wait().expect("reap timed-out local supervisor");
+		}
+		thread::sleep(Duration::from_millis(25));
+	}
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+	let deadline = Instant::now() + timeout;
+	loop {
+		if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+			return true;
+		}
+		if Instant::now() >= deadline {
+			return false;
+		}
+		thread::sleep(Duration::from_millis(25));
+	}
+}
+
+fn run_live_sql(endpoint: std::net::SocketAddr, statement: &str) -> Output {
+	nilket_command()
+		.args([
+			"toron",
+			"sql",
+			"--endpoint",
+			&endpoint.to_string(),
+			statement,
+		])
+		.output()
+		.expect("run dogfood SQL")
+}
+
+fn assert_sql_success(endpoint: std::net::SocketAddr, statement: &str) -> String {
+	let output = run_live_sql(endpoint, statement);
+	assert!(
+		output.status.success(),
+		"statement={statement:?} {output:?}"
+	);
+	stdout(&output)
+}
+
+fn assert_executed_or_typed_refusal(endpoint: std::net::SocketAddr, statement: &str) {
+	let output = run_live_sql(endpoint, statement);
+	if output.status.success() {
+		eprintln!("dogfood executed: {statement}");
+		return;
+	}
+	let refusal = stderr(&output);
+	assert_eq!(output.status.code(), Some(1), "{output:?}");
+	assert!(refusal.contains("Toron "), "untyped refusal: {refusal}");
+	assert!(
+		!refusal.contains("connection"),
+		"connectivity failure: {refusal}"
+	);
+	assert!(
+		!refusal.contains("timed out"),
+		"timeout is not a SQL refusal: {refusal}"
+	);
+	eprintln!("dogfood typed refusal: {statement}: {}", refusal.trim());
 }
 
 fn minimal_toron_config(task_listener_bind: &str) -> String {
@@ -121,13 +304,19 @@ fn node(id: u32) -> NodeId {
 }
 
 #[test]
-fn nilket_no_args_exits_nonzero_with_usage() {
-	let output = nilket(&[]);
+fn nilket_no_args_selects_local_and_reports_missing_profile_location_honestly() {
+	let output = nilket_command()
+		.env_remove("XDG_DATA_HOME")
+		.env_remove("HOME")
+		.output()
+		.expect("run bare nilket");
 
-	assert_eq!(output.status.code(), Some(2), "{output:?}");
-	let stderr = stderr(&output);
-	assert!(stderr.contains("wendelon"), "{stderr}");
-	assert!(stderr.contains("toron"), "{stderr}");
+	assert_eq!(output.status.code(), Some(1), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert!(
+		stderr(&output).contains("pass --data-dir PATH"),
+		"{output:?}"
+	);
 }
 
 #[test]
@@ -241,10 +430,7 @@ fn nilket_toron_sql_dials_endpoint_from_flag() {
 
 	assert_eq!(output.status.code(), Some(1), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
-	assert!(
-		stderr(&output).contains("toron sql error [SyntaxError]"),
-		"{output:?}"
-	);
+	assert!(stderr(&output).contains("Toron SyntaxError"), "{output:?}");
 }
 
 #[test]
@@ -260,10 +446,7 @@ fn nilket_toron_sql_dials_endpoint_from_env() {
 
 	assert_eq!(output.status.code(), Some(1), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
-	assert!(
-		stderr(&output).contains("toron sql error [SyntaxError]"),
-		"{output:?}"
-	);
+	assert!(stderr(&output).contains("Toron SyntaxError"), "{output:?}");
 }
 
 #[test]
@@ -279,7 +462,7 @@ fn nilket_toron_sql_reports_connection_failure() {
 	assert_eq!(output.status.code(), Some(2), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
 	assert!(
-		stderr(&output).contains("failed to connect to toron sql endpoint 127.0.0.1:9"),
+		stderr(&output).contains("Toron connection timed out"),
 		"{output:?}"
 	);
 }
@@ -464,4 +647,77 @@ fn nilket_wendelon_audit_verify_round_trips() {
 	]);
 	assert_eq!(bad_output.status.code(), Some(1), "{bad_output:?}");
 	assert!(stdout(&bad_output).contains("\"code\": \"malformed_json\""));
+}
+
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_dogfood_contract_survives_restart_and_exposes_catalog() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-dogfood");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let statements = dogfood_statements();
+	assert_eq!(statements.len(), 10, "contract fixture shape changed");
+
+	let first = LiveLocal::spawn(&profile, &log);
+	toron_client::blocking_health_loopback(&first.ready.sql_endpoint.to_string())
+		.expect("public Toron health probe");
+	assert_sql_success(first.ready.sql_endpoint, &statements[0]);
+	assert_eq!(
+		assert_sql_success(first.ready.sql_endpoint, &statements[1]),
+		"OK rows=3\n"
+	);
+	let first_session = first.ready.session_nonce;
+	let profile_marker = std::fs::read(profile.join("profile.toml")).expect("profile marker");
+	first.stop_gracefully();
+
+	let second = LiveLocal::spawn(&profile, &log);
+	assert_ne!(second.ready.session_nonce, first_session);
+	assert_eq!(
+		std::fs::read(profile.join("profile.toml")).expect("retained profile marker"),
+		profile_marker,
+		"restart must retain profile provenance"
+	);
+	let rows = assert_sql_success(second.ready.sql_endpoint, &statements[2]);
+	for value in ["one", "two", "three", "(3 rows)"] {
+		assert!(rows.contains(value), "missing {value:?} in {rows}");
+	}
+	let schemata = assert_sql_success(second.ready.sql_endpoint, &statements[3]);
+	assert!(schemata.contains("default"), "{schemata}");
+	for statement in &statements[4..6] {
+		let catalog = assert_sql_success(second.ready.sql_endpoint, statement);
+		assert!(catalog.contains("dogfood"), "{statement}: {catalog}");
+	}
+	for statement in &statements[6..] {
+		assert_executed_or_typed_refusal(second.ready.sql_endpoint, statement);
+	}
+	second.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove dogfood fixture");
+}
+
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_death_reaps_roles_and_allows_stale_manifest_restart() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-parent-death");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let mut first = LiveLocal::spawn(&profile, &log);
+	let role_pids = first.child_pids.clone();
+	kill(Pid::from_raw(first.child.id() as i32), Signal::SIGKILL).expect("kill local supervisor");
+	let status = wait_for_child(&mut first.child, Duration::from_secs(5));
+	assert!(!status.success(), "SIGKILL fixture unexpectedly succeeded");
+	for pid in role_pids {
+		assert!(
+			wait_for_process_exit(pid, Duration::from_secs(10)),
+			"parent-death contract left role {pid} alive"
+		);
+	}
+	drop(first);
+
+	let restarted = LiveLocal::spawn(&profile, &log);
+	toron_client::blocking_health_loopback(&restarted.ready.sql_endpoint.to_string())
+		.expect("restart health after stale runtime manifest");
+	restarted.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove parent-death fixture");
 }

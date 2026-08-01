@@ -1314,7 +1314,11 @@ pub(crate) fn adr101_no_cross_ring_surface() {
 			"ADR101 Rune LIKE surface touched cross-ring/storage marker: {forbidden}"
 		);
 	}
-	for source_file in ["src/storage.rs", "src/wire.rs", "src/sql_wire.rs"] {
+	for source_file in [
+		"src/storage.rs",
+		"src/wire.rs",
+		"../toron-client/src/protocol.rs",
+	] {
 		let source = std::fs::read_to_string(manifest_dir.join(source_file))
 			.unwrap_or_else(|_| panic!("read {source_file}"));
 		for marker in ["not_like", "not_ilike", "RuneExpr"] {
@@ -2299,7 +2303,7 @@ pub(crate) fn adr131_no_executor_fragmenter_scheduler_wire_or_wendelon_change() 
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(
@@ -2339,7 +2343,7 @@ pub(crate) fn adr130_no_fragmenter_executor_wire_change() {
 		manifest_dir.join("src/distributed/fragment.rs"),
 		manifest_dir.join("src/distributed/scheduler.rs"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		let offenders = std::fs::read_to_string(&path)
 			.expect("read Toron source")

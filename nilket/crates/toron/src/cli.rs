@@ -15,8 +15,6 @@ use tokio_rustls::TlsConnector;
 const DEFAULT_SQL_ENDPOINT: &str = "127.0.0.1:7742";
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7781";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const AUTHENTICATED_CONNECTION_ERROR_PREFIX: &str =
-	"failed to establish authenticated connection to";
 
 struct SqlClientOptions {
 	endpoint: SocketAddr,
@@ -559,124 +557,63 @@ fn detect_local_timezone() -> String {
 
 async fn run_sql_async(options: SqlClientOptions, statement: String) -> ExitCode {
 	let endpoint = options.endpoint;
-	let (client, authenticated_server_name) = match options.tls {
-		Some(tls) => {
-			let client_config = match crate::network::tls::client_config_from_paths(
-				&tls.cert_path,
-				&tls.key_path,
-				&tls.ca_path,
+	let client = match options.tls {
+		Some(tls) => toron_client::ToronClient::authenticated(
+			endpoint.to_string(),
+			&toron_client::ToronClientTls {
+				server_name: tls.server_name,
+				cert_path: tls.cert_path,
+				key_path: tls.key_path,
+				ca_path: tls.ca_path,
+			},
+		),
+		None => toron_client::ToronClient::loopback(endpoint.to_string()),
+	};
+	let client = match client {
+		Ok(client) => client,
+		Err(error) => {
+			eprintln!("failed to initialize Toron SQL client for {endpoint}: {error}");
+			return ExitCode::from(2);
+		}
+	};
+	let result = match client
+		.execute_with_timezone(&statement, &options.session_timezone)
+		.await
+	{
+		Ok(result) => result,
+		Err(error) => {
+			eprintln!("toron sql request failed: {error}");
+			return if matches!(
+				error,
+				toron_client::ClientError::Configuration(_)
+					| toron_client::ClientError::Transport(_)
+					| toron_client::ClientError::TimedOut(toron_client::ClientOperation::Connect)
 			) {
-				Ok(config) => config,
-				Err(error) => {
-					eprintln!("failed to initialize SQL mTLS client: {error}");
-					return ExitCode::from(2);
-				}
-			};
-			let client = match crate::quic::QuicEndpoint::client_authenticated(client_config) {
-				Ok(client) => client,
-				Err(error) => {
-					eprintln!("failed to initialize SQL QUIC client: {error}");
-					return ExitCode::from(2);
-				}
-			};
-			(client, Some(tls.server_name))
-		}
-		None => {
-			let client = match crate::quic::QuicEndpoint::client_loopback() {
-				Ok(client) => client,
-				Err(error) => {
-					eprintln!("failed to initialize SQL QUIC client: {error}");
-					return ExitCode::from(2);
-				}
-			};
-			(client, None)
-		}
-	};
-	let connect = async {
-		match authenticated_server_name.as_deref() {
-			Some(server_name) => {
-				client
-					.connect_stream_with_server_name(endpoint, server_name)
-					.await
-			}
-			None => client.connect_stream(endpoint).await,
-		}
-	};
-	let mut stream = match tokio::time::timeout(std::time::Duration::from_secs(2), connect).await {
-		Ok(Ok(stream)) => stream,
-		Ok(Err(error)) => {
-			if authenticated_server_name.is_some() {
-				eprintln!("{AUTHENTICATED_CONNECTION_ERROR_PREFIX} {endpoint}: {error}");
+				ExitCode::from(2)
 			} else {
-				eprintln!("failed to connect to toron sql endpoint {endpoint}: {error}");
-			}
-			return ExitCode::from(2);
-		}
-		Err(_) => {
-			if authenticated_server_name.is_some() {
-				eprintln!(
-					"{AUTHENTICATED_CONNECTION_ERROR_PREFIX} {endpoint}: connection timed out"
-				);
-			} else {
-				eprintln!(
-					"failed to connect to toron sql endpoint {endpoint}: connection timed out"
-				);
-			}
-			return ExitCode::from(2);
+				ExitCode::from(1)
+			};
 		}
 	};
-	let query_id = crate::distributed::identity::QueryId::new();
-	let request = crate::sql_wire::SqlFrame::execute_with_timezone(
-		query_id,
-		statement,
-		None,
-		options.session_timezone,
-	);
-	if let Err(error) = crate::sql_wire::write_frame(&mut stream, &request).await {
-		eprintln!("failed to send toron sql request: {error}");
-		return ExitCode::from(2);
-	}
-	if let Err(error) = stream.finish().await {
-		eprintln!("failed to finish toron sql request stream: {error}");
-		return ExitCode::from(2);
-	}
 
 	let mut batches = Vec::new();
-	loop {
-		let frame = match crate::sql_wire::read_frame(&mut stream).await {
-			Ok(frame) => frame,
-			Err(error) => {
-				eprintln!("failed to read toron sql response: {error}");
-				return ExitCode::from(1);
-			}
-		};
-		match frame.message {
-			crate::sql_wire::SqlMessage::ResultBatch(batch) => {
-				if let Err(error) = decode_sql_batch(&batch.arrow_ipc_bytes, &mut batches) {
-					eprintln!("failed to decode toron sql result batch: {error}");
-					return ExitCode::from(1);
-				}
-			}
-			crate::sql_wire::SqlMessage::Complete(complete) => {
-				if batches.is_empty() {
-					if complete.row_count == 0 {
-						println!("OK");
-					} else {
-						println!("OK rows={}", complete.row_count);
-					}
-				} else if let Err(error) = render_batches(&batches) {
-					eprintln!("failed to render toron sql results: {error}");
-					return ExitCode::from(1);
-				}
-				return ExitCode::SUCCESS;
-			}
-			crate::sql_wire::SqlMessage::Error(error) => {
-				eprintln!("toron sql error [{:?}]: {}", error.code, error.message);
-				return ExitCode::from(1);
-			}
-			crate::sql_wire::SqlMessage::Execute(_) | crate::sql_wire::SqlMessage::Cancel(_) => {}
+	for batch in &result.batches {
+		if let Err(error) = decode_sql_batch(batch, &mut batches) {
+			eprintln!("failed to decode toron sql result batch: {error}");
+			return ExitCode::from(1);
 		}
 	}
+	if batches.is_empty() {
+		if result.row_count == 0 {
+			println!("OK");
+		} else {
+			println!("OK rows={}", result.row_count);
+		}
+	} else if let Err(error) = render_batches(&batches) {
+		eprintln!("failed to render toron sql results: {error}");
+		return ExitCode::from(1);
+	}
+	ExitCode::SUCCESS
 }
 
 fn decode_sql_batch(

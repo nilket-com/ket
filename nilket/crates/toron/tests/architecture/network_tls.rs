@@ -94,9 +94,9 @@ pub(crate) fn adr044_sql_cli_remote_tls_flags_do_not_add_nilket_runtime_dependen
 		"TORON_SQL_CLIENT_CERT",
 		"TORON_SQL_CLIENT_KEY",
 		"TORON_SQL_CA",
-		"client_config_from_paths",
-		"client_authenticated",
-		"failed to establish authenticated connection to",
+		"toron_client::ToronClient::authenticated",
+		"toron_client::ToronClientTls",
+		"failed to initialize Toron SQL client",
 	] {
 		assert!(
 			cli.contains(required),
@@ -113,8 +113,8 @@ pub(crate) fn adr044_sql_cli_remote_tls_flags_do_not_add_nilket_runtime_dependen
 
 #[test]
 pub(crate) fn adr044_does_not_change_sql_wire_or_add_token_auth_models() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	for forbidden in ["Tls", "Auth", "Principal", "Certificate", "client_cert"] {
 		assert!(
@@ -240,8 +240,8 @@ pub(crate) fn adr044_loopback_diagnostic_text_is_brand_clean_and_stable() {
 pub(crate) fn adr044_tenant_id_remains_server_stamped() {
 	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
 		.expect("read Toron daemon source");
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
 	assert!(daemon.contains("accepted_sql_tenant(connection, cluster_domain)"));
@@ -846,8 +846,8 @@ pub(crate) fn adr046_no_new_daemon_wire_surface_in_observability_module() {
 	let observability =
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability source");
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	for forbidden in ["INSPECT_PATH", "INFO_PATH", "VERSION_PATH", "WORKERS_PATH"] {
 		assert!(
@@ -985,7 +985,6 @@ pub(crate) fn adr047_no_toron_internal_types_in_tls_pki_public_api() {
 
 	for forbidden in [
 		"WorkerId",
-		"tenant_id",
 		"ToronWorker",
 		"ToronDaemon",
 		"SqlClientTlsOptions",
@@ -997,6 +996,9 @@ pub(crate) fn adr047_no_toron_internal_types_in_tls_pki_public_api() {
 			"tls-pki public/source surface contains Toron-internal token {forbidden}"
 		);
 	}
+	// TORON-532's development PKI carries the protocol's generic
+	// `tenant_id` actor claim for the scoped storage service principal. The
+	// concrete Toron identities above remain forbidden from this crate.
 }
 
 #[test]

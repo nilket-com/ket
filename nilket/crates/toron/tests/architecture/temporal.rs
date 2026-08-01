@@ -126,7 +126,7 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 	let rune = source("src/rune_engine.rs");
 	let cli = source("src/cli.rs");
 	let daemon = source("src/daemon.rs");
-	let sql_wire = source("src/sql_wire.rs");
+	let sql_wire = source("../toron-client/src/protocol.rs");
 	let timestamp = source("src/timestamp.rs");
 	let ctas_test = source("tests/ctas_test.rs");
 	let rune_test = source("tests/rune_relation_handles_test.rs");

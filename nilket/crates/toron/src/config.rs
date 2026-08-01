@@ -688,6 +688,33 @@ pub fn render_example_config() -> String {
 	EXAMPLE_CONFIG.to_string()
 }
 
+/// Render the ordinary Toron role configuration used by Nilket's local
+/// deployment profile. Production defaults remain unchanged (TORON-532).
+pub fn render_local_profile_config(pki: &tls_pki::DevelopmentPki) -> String {
+	let mut config = EXAMPLE_CONFIG
+		.replacen("tenant_id = 1", "tenant_id = 0", 1)
+		.replace(
+			"# tls_cert_path = \"certs/client.crt\"",
+			&format!("tls_cert_path = {}", toml_path(&pki.toron_storage_cert)),
+		)
+		.replace(
+			"# tls_key_path = \"certs/client.key\"",
+			&format!("tls_key_path = {}", toml_path(&pki.toron_storage_key)),
+		)
+		.replace(
+			"# tls_ca_path = \"certs/ca.crt\"",
+			&format!("tls_ca_path = {}", toml_path(&pki.node_ca_cert)),
+		);
+	config.push_str(
+		"\n# Generated development-only storage identity for `nilket local` (TORON-532).\n",
+	);
+	config
+}
+
+fn toml_path(path: &Path) -> String {
+	toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 pub fn write_example_config(path: impl AsRef<Path>) -> Result<(), ToronConfigError> {
 	let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
 	file.write_all(EXAMPLE_CONFIG.as_bytes())?;

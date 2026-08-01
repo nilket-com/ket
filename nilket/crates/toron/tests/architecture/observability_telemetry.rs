@@ -309,8 +309,8 @@ pub(crate) fn adr067_no_toron_telemetry_config_or_exporter_yet() {
 
 #[test]
 pub(crate) fn adr067_no_audit_http_sql_wire_worker_or_storage_behavior_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
 		.expect("read fixture worker");
 	let storage =
@@ -342,15 +342,7 @@ pub(crate) fn adr067_nilket_root_stays_runtime_free() {
 	let nilket_manifest =
 		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
 			.expect("read nilket manifest");
-	for forbidden in [
-		"tokio",
-		"quinn",
-		"rustls",
-		"observability",
-		"tls-pki",
-		"reqwest",
-		"h2",
-	] {
+	for forbidden in ["tokio", "quinn", "rustls", "observability", "reqwest", "h2"] {
 		assert!(
 			!nilket_manifest.contains(forbidden),
 			"nilket manifest gained runtime dependency {forbidden}"
@@ -1012,7 +1004,6 @@ pub(crate) fn adr069_nilket_root_stays_runtime_free() {
 		"quinn",
 		"rustls",
 		"observability",
-		"tls-pki",
 		"reqwest",
 		"h2",
 		"wendelon-client",

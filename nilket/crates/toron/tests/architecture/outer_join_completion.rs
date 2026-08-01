@@ -519,7 +519,7 @@ pub(crate) fn adr210_no_recognizer_pushdown_strategy_executor_or_wire_widening()
 		manifest_dir.join("src/ir/execution.rs"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(
@@ -673,7 +673,7 @@ pub(crate) fn adr211_no_fragmenter_executor_wire_runtime_filter_or_recognizer_wi
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 		manifest_dir.join("src/binder/join_order.rs"),
 		manifest_dir.join("src/binder/selectivity.rs"),
 	] {
@@ -897,7 +897,7 @@ pub(crate) fn adr212_no_executor_fragmenter_wire_runtime_filter_strategy_or_wend
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 		manifest_dir.join("src/binder/join_order.rs"),
 		manifest_dir.join("src/binder/selectivity.rs"),
 	] {
@@ -951,7 +951,7 @@ pub(crate) fn adr209_no_wendelon_wire_executor_semantics_or_strategy_variant() {
 		manifest_dir.join("src/ir/execution.rs"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(

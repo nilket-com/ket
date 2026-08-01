@@ -1,4 +1,3 @@
-mod client;
 mod polars_compat;
 
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
@@ -12,14 +11,14 @@ pub const FIELDS: &[AdapterField] = &[AdapterField {
 }];
 
 pub struct ToronAdapter {
-	client: client::ToronClient,
+	client: toron_client::ToronClient,
 }
 
 impl ToronAdapter {
-	pub async fn connect(endpoint: &str) -> Result<Self, client::ClientError> {
-		Ok(Self {
-			client: client::ToronClient::connect(endpoint).await?,
-		})
+	pub async fn connect(endpoint: &str) -> Result<Self, toron_client::ClientError> {
+		let client = toron_client::ToronClient::loopback(endpoint)?;
+		client.health().await?;
+		Ok(Self { client })
 	}
 }
 
@@ -49,7 +48,7 @@ impl DatabaseAdapter for ToronAdapter {
 
 #[cfg(test)]
 mod tests {
-	use super::{DatabaseAdapter, ExecutionResult, ToronAdapter, client};
+	use super::{DatabaseAdapter, ExecutionResult, ToronAdapter};
 	use crate::plot::common::{PlotRenderLayer, PlotSettings, PlotWidget};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
@@ -113,22 +112,22 @@ mod tests {
 	#[tokio::test]
 	#[ignore = "requires a live Toron SQL endpoint"]
 	async fn live_toron_preserves_errors_and_accepts_cancel_frames() {
-		let client = client::ToronClient::connect(&live_endpoint())
-			.await
-			.expect("connect to Toron");
+		let client =
+			toron_client::ToronClient::loopback(live_endpoint()).expect("configure Toron client");
+		client.health().await.expect("connect to Toron");
 		let error = client
 			.execute("SELEC this is deliberately invalid")
 			.await
 			.expect_err("invalid SQL is refused");
 		assert!(matches!(
 			error,
-			client::ClientError::Remote {
-				code: client::SqlErrorCode::SyntaxError,
+			toron_client::ClientError::Remote {
+				code: toron_client::SqlErrorCode::SyntaxError,
 				..
 			}
 		));
 		client
-			.cancel(client::QueryId::from_u128(0x746f726f6e))
+			.cancel(toron_client::QueryId::from_u128(0x746f726f6e))
 			.await
 			.expect("Toron accepts the cancellation frame");
 	}

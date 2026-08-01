@@ -336,7 +336,9 @@ pub(crate) fn adr065_nilket_root_stays_runtime_free() {
 	let nilket_manifest =
 		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
 			.expect("read nilket manifest");
-	for forbidden in ["tokio", "rustls", "observability", "tls-pki", "serde_json"] {
+	// TORON-532 supersedes the leaf's no-PKI/no-runtime-manifest restriction;
+	// it does not admit an async, TLS, or observability runtime here.
+	for forbidden in ["tokio", "rustls", "observability"] {
 		assert!(
 			!nilket_manifest.contains(forbidden),
 			"nilket manifest gained runtime dependency {forbidden}"
@@ -552,8 +554,8 @@ pub(crate) fn adr066_readiness_degrades_only_on_local_chain_open_or_write_failur
 pub(crate) fn adr066_sql_edge_denials_emit_audit_without_sql_frame_drift() {
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	for required in [
 		"SqlConnectionLimitDenied",
@@ -743,8 +745,8 @@ pub(crate) fn adr066_shared_observability_audit_remains_policy_free() {
 
 #[test]
 pub(crate) fn adr066_no_wendelon_nilket_fixture_worker_or_sql_wire_runtime_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
 		.into_iter()
 		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
@@ -799,14 +801,7 @@ pub(crate) fn adr066_nilket_root_stays_runtime_free() {
 		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
 			.expect("read nilket manifest");
 
-	for forbidden in [
-		"tokio",
-		"quinn",
-		"rustls",
-		"observability",
-		"tls-pki",
-		"serde_json",
-	] {
+	for forbidden in ["tokio", "quinn", "rustls", "observability"] {
 		assert!(
 			!nilket_manifest.contains(forbidden),
 			"nilket manifest gained runtime dependency {forbidden}"
@@ -1204,8 +1199,8 @@ pub(crate) fn adr071_worker_node_id_matches_toron_n_u32() {
 
 #[test]
 pub(crate) fn adr071_no_wendelon_nilket_sql_wire_storage_or_worker_wire_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let worker_wire =
 		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
 	let storage =
@@ -1233,14 +1228,7 @@ pub(crate) fn adr071_nilket_root_stays_runtime_free() {
 		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
 			.expect("read nilket manifest");
 
-	for forbidden in [
-		"tokio",
-		"quinn",
-		"rustls",
-		"observability",
-		"tls-pki",
-		"serde_json",
-	] {
+	for forbidden in ["tokio", "quinn", "rustls", "observability"] {
 		assert!(
 			!nilket_manifest.contains(forbidden),
 			"nilket manifest gained runtime dependency {forbidden}"
@@ -1574,8 +1562,8 @@ pub(crate) fn adr072_audit_unavailable_errors_are_bounded_oracle_safe() {
 
 #[test]
 pub(crate) fn adr072_no_new_sql_error_or_task_failure_enum_variant() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let task_errors = std::fs::read_to_string(manifest_dir().join("src/error/distributed.rs"))
 		.expect("read task errors");
 	let server =
@@ -1615,8 +1603,8 @@ pub(crate) fn adr072_fail_closed_degrades_readiness_for_security_relevant_surfac
 
 #[test]
 pub(crate) fn adr072_no_wendelon_storage_sql_wire_worker_wire_or_shared_substrate_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let worker_wire =
 		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read worker wire");
 	let storage =
@@ -1647,14 +1635,7 @@ pub(crate) fn adr072_nilket_root_stays_runtime_free() {
 		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
 			.expect("read nilket manifest");
 
-	for forbidden in [
-		"tokio",
-		"quinn",
-		"rustls",
-		"observability",
-		"tls-pki",
-		"serde_json",
-	] {
+	for forbidden in ["tokio", "quinn", "rustls", "observability"] {
 		assert!(
 			!nilket_manifest.contains(forbidden),
 			"nilket manifest gained runtime dependency {forbidden}"

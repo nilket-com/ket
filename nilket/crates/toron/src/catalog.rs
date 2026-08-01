@@ -1263,7 +1263,10 @@ impl DescriptorSyncClient for Client {
 		&self,
 		tenant_id: WendelonTenantId,
 	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, ClientError> {
-		Client::list_table_schema_descriptors(self, tenant_id).await
+		self.inner()
+			.list_table_schema_descriptors(tenant_id)
+			.await
+			.map_err(ClientError::from)
 	}
 }
 

@@ -233,8 +233,8 @@ pub(crate) fn adr049_task_context_and_storage_requests_preserve_tenant() {
 
 #[test]
 pub(crate) fn adr049_no_sql_wire_tenant_claim_or_message_variant() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let cli = std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI");
 
 	assert!(!wire.contains("tenant_id"));
@@ -255,8 +255,8 @@ pub(crate) fn adr049_no_sql_wire_tenant_claim_or_message_variant() {
 
 #[test]
 pub(crate) fn adr049_no_new_sql_error_codes() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
 		.into_iter()
 		.next()

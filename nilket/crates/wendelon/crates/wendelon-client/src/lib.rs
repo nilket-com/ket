@@ -621,6 +621,20 @@ impl Client {
 			.map_err(ClientError::from)
 	}
 
+	/// Fetch the latest authoritative table descriptors for one tenant.
+	///
+	/// Keep this forwarding method explicit: callers use the public compute
+	/// client rather than reaching through to its transport-owning inner client.
+	pub async fn list_table_schema_descriptors(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<Vec<TableSchemaDescriptor>, ClientError> {
+		self.inner
+			.list_table_schema_descriptors(tenant_id)
+			.await
+			.map_err(ClientError::from)
+	}
+
 	pub fn identity_for_key(tenant_id: TenantId, key: &[u8]) -> Identity {
 		Identity::blake3_tenant(tenant_id, key)
 	}

@@ -79,6 +79,42 @@ pub fn render_example_config() -> String {
 		)
 }
 
+/// Render the ordinary role configuration used by Nilket's local deployment
+/// profile. Smart defaults live in the launcher artifact, not in
+/// [`NodeBootstrapConfig::default`] (TORON-532).
+pub fn render_local_profile_config(data_dir: &Path, pki: &tls_pki::DevelopmentPki) -> String {
+	let mut config = render_example_config().replace(
+		"data_dir = \"data\"",
+		&format!("data_dir = {}", toml_path(data_dir)),
+	);
+	config.push_str(&format!(
+		r#"
+
+# Generated development-only identity for `nilket local` (TORON-532).
+[transport.tls]
+cert_path = {node_cert}
+key_path = {node_key}
+node_ca_path = {node_ca}
+operator_ca_path = {operator_ca}
+cluster_domain = "cluster.local"
+
+[observability.listeners]
+health = "127.0.0.1:7431"
+ready = "127.0.0.1:7432"
+metrics = "127.0.0.1:7433"
+"#,
+		node_cert = toml_path(&pki.wendelon_node_cert),
+		node_key = toml_path(&pki.wendelon_node_key),
+		node_ca = toml_path(&pki.node_ca_cert),
+		operator_ca = toml_path(&pki.operator_ca_cert),
+	));
+	config
+}
+
+fn toml_path(path: &Path) -> String {
+	toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 /// Write a concrete starter config to `path`. Refuses to clobber an
 /// existing file.
 pub fn write_example_config(path: impl AsRef<Path>) -> std::io::Result<()> {

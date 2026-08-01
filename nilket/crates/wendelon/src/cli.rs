@@ -40,6 +40,61 @@ struct InspectOptions {
 	json: bool,
 }
 
+/// Authenticated Wendelon `/ready` client shared by `wendelon inspect`, the
+/// Nilket local supervisor, and live integration fixtures (TORON-532).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessProbe {
+	endpoint: SocketAddr,
+	server_name: String,
+	cert_path: PathBuf,
+	key_path: PathBuf,
+	ca_path: PathBuf,
+}
+
+impl ReadinessProbe {
+	pub fn new(
+		endpoint: SocketAddr,
+		server_name: impl Into<String>,
+		cert_path: impl Into<PathBuf>,
+		key_path: impl Into<PathBuf>,
+		ca_path: impl Into<PathBuf>,
+	) -> Self {
+		Self {
+			endpoint,
+			server_name: server_name.into(),
+			cert_path: cert_path.into(),
+			key_path: key_path.into(),
+			ca_path: ca_path.into(),
+		}
+	}
+
+	pub async fn check(&self) -> Result<bool, String> {
+		fetch_ready(&self.inspect_options())
+			.await
+			.map(|response| response.view.ready)
+			.map_err(|error| inspect_error_message(&error))
+	}
+
+	pub fn check_blocking(&self) -> Result<bool, String> {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.map_err(|error| format!("Wendelon readiness runtime: {error}"))?;
+		runtime.block_on(self.check())
+	}
+
+	fn inspect_options(&self) -> InspectOptions {
+		InspectOptions {
+			endpoint: self.endpoint,
+			server_name: self.server_name.clone(),
+			cert_path: self.cert_path.clone(),
+			key_path: self.key_path.clone(),
+			ca_path: self.ca_path.clone(),
+			json: false,
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadinessView {
 	node_id: Value,
@@ -245,7 +300,14 @@ fn parse_inspect_args(args: &[String]) -> Result<InspectOptions, String> {
 }
 
 async fn run_inspect_async(options: InspectOptions) -> ExitCode {
-	match fetch_ready(&options).await {
+	let probe = ReadinessProbe::new(
+		options.endpoint,
+		options.server_name.clone(),
+		options.cert_path.clone(),
+		options.key_path.clone(),
+		options.ca_path.clone(),
+	);
+	match fetch_ready(&probe.inspect_options()).await {
 		Ok(response) => {
 			if let Err(err) =
 				io::stdout().write_all(&render_inspect_output(&response, options.json))

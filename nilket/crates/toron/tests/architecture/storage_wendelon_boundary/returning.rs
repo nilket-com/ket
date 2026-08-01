@@ -137,7 +137,8 @@ pub(crate) fn adr064_returning_binds_against_target_user_schema() {
 
 #[test]
 pub(crate) fn adr064_returning_does_not_touch_wendelon_or_worker_transport() {
-	let wire = std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read wire");
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
@@ -152,8 +153,8 @@ pub(crate) fn adr064_returning_does_not_touch_wendelon_or_worker_transport() {
 
 #[test]
 pub(crate) fn adr064_returning_does_not_add_sql_wire_message_or_protocol_version() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
 	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
@@ -175,6 +176,8 @@ pub(crate) fn adr064_returning_does_not_add_sql_wire_message_or_protocol_version
 		"ResultBatch(ResultBatch)",
 		"Complete(Complete)",
 		"Error(SqlError)",
+		"Health(HealthRequest)",
+		"Healthy(HealthyResponse)",
 	] {
 		assert!(
 			message.contains(variant),

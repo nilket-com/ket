@@ -885,7 +885,14 @@ async fn handle_connection<S: HrftService>(
 				tokio::spawn(async move {
 					let _stream_guard = _stream_guard;
 					let _stream_admission = stream_admission;
-					let _ = handle_stream(stream, service, pool, context).await;
+					if let Err(error) = handle_stream(stream, service, pool, context.clone()).await {
+						tracing::warn!(
+							remote_node_id = context.remote.id,
+							actor_role = %context.actor.role,
+							%error,
+							"wendelon request stream failed"
+						);
+					}
 				});
 			}
 		}

@@ -390,18 +390,22 @@ pub fn authorize_actor(actor: &ActorIdentity, permission: ActorPermission) -> st
 				| ActorRole::ClusterAdmin
 				| ActorRole::BreakGlassAdmin
 		),
-		ActorPermission::TenantAdminRead => matches!(
-			actor.role,
-			ActorRole::Operator
-				| ActorRole::TenantAdmin
-				| ActorRole::BackupAdmin
-				| ActorRole::ReadOnlyObserver
-				| ActorRole::BreakGlassAdmin
-		),
-		ActorPermission::TenantAdminMutation => matches!(
-			actor.role,
-			ActorRole::Operator | ActorRole::TenantAdmin | ActorRole::BreakGlassAdmin
-		),
+		ActorPermission::TenantAdminRead => {
+			matches!(
+				actor.role,
+				ActorRole::Operator
+					| ActorRole::TenantAdmin
+					| ActorRole::BackupAdmin
+					| ActorRole::ReadOnlyObserver
+					| ActorRole::BreakGlassAdmin
+			) || (actor.role == ActorRole::DataNode && actor.tenant_id.is_some())
+		}
+		ActorPermission::TenantAdminMutation => {
+			matches!(
+				actor.role,
+				ActorRole::Operator | ActorRole::TenantAdmin | ActorRole::BreakGlassAdmin
+			) || (actor.role == ActorRole::DataNode && actor.tenant_id.is_some())
+		}
 		ActorPermission::TenantKekAdmin => matches!(
 			actor.role,
 			ActorRole::Operator | ActorRole::BackupAdmin | ActorRole::BreakGlassAdmin
@@ -1598,8 +1602,22 @@ impl<'a> CborReader<'a> {
 mod tests {
 	use super::{
 		ACTOR_CLAIMS_KEY_ID_FIELD, ACTOR_CLAIMS_ROLE_FIELD, ACTOR_CLAIMS_SCOPES_FIELD,
-		ACTOR_CLAIMS_TENANT_ID_FIELD, ActorClaims, ActorRole, parse_actor_claims_cbor,
+		ACTOR_CLAIMS_TENANT_ID_FIELD, ActorClaims, ActorIdentity, ActorPermission, ActorRole,
+		authorize_actor, parse_actor_claims_cbor,
 	};
+
+	#[test]
+	fn tenant_scoped_data_node_is_an_internal_schema_client_but_unscoped_node_is_not() {
+		let mut actor = ActorIdentity::data_node(crate::schema::NodeId {
+			id: 2,
+			_reserved: 0,
+		});
+		assert!(authorize_actor(&actor, ActorPermission::TenantAdminRead).is_err());
+		assert!(authorize_actor(&actor, ActorPermission::TenantAdminMutation).is_err());
+		actor.tenant_id = Some("0".to_owned());
+		assert!(authorize_actor(&actor, ActorPermission::TenantAdminRead).is_ok());
+		assert!(authorize_actor(&actor, ActorPermission::TenantAdminMutation).is_ok());
+	}
 
 	#[test]
 	fn actor_claims_v1_accepts_cluster_wide_shape() {

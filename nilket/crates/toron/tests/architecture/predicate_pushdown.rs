@@ -1153,7 +1153,7 @@ pub(crate) fn adr094_no_new_ir_sql_pbc_wendelon_surface() {
 	}
 	for relative in [
 		"src/sql_planner.rs",
-		"src/sql_wire.rs",
+		"../toron-client/src/protocol.rs",
 		"src/storage.rs",
 		"src/coordinator.rs",
 		"src/coordinator/delete.rs",
@@ -1194,7 +1194,7 @@ pub(crate) fn adr078_no_new_sql_surface_pbc_opcode_wendelon_wire_storage_or_depe
 	}
 	for relative in [
 		"src/storage.rs",
-		"src/sql_wire.rs",
+		"../toron-client/src/protocol.rs",
 		"src/audit.rs",
 		"src/telemetry.rs",
 		"src/distributed/scheduler.rs",
@@ -1283,7 +1283,7 @@ pub(crate) fn adr074_no_wendelon_storage_wire_worker_audit_or_telemetry_change()
 	];
 	for relative in [
 		"src/storage.rs",
-		"src/sql_wire.rs",
+		"../toron-client/src/protocol.rs",
 		"src/audit.rs",
 		"src/telemetry.rs",
 		"src/distributed/scheduler.rs",

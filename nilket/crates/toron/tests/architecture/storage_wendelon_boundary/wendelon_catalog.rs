@@ -496,8 +496,8 @@ pub(crate) fn adr061_catalog_create_exposes_created_outcome() {
 #[test]
 pub(crate) fn adr061_no_wendelon_wire_worker_or_sql_protocol_change() {
 	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 	let wendelon_sources = source_files(&wendelon_manifest_dir().join("src"))

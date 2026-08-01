@@ -155,8 +155,8 @@ pub(crate) fn adr050_budget_exhaustion_maps_to_resource_exhausted() {
 
 #[test]
 pub(crate) fn adr050_resource_exhausted_is_only_new_sql_error_code() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
 		.into_iter()
 		.next()
@@ -394,8 +394,8 @@ pub(crate) fn adr052_concurrency_exhaustion_maps_to_resource_exhausted() {
 
 #[test]
 pub(crate) fn adr052_resource_exhausted_reuses_existing_sql_error_code() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
 		.into_iter()
 		.next()
@@ -961,8 +961,8 @@ pub(crate) fn adr056_configured_tenants_have_buckets_other_is_shared() {
 pub(crate) fn adr056_resource_exhausted_reused_no_new_sql_code() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
 
@@ -1045,8 +1045,8 @@ pub(crate) fn adr056_descriptor_retry_does_not_reconsume_rate_token() {
 
 #[test]
 pub(crate) fn adr056_no_wendelon_sql_wire_nilket_or_fixture_worker_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
 		.into_iter()
 		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
@@ -1134,8 +1134,8 @@ pub(crate) fn adr055_no_descriptor_registry_refresh_or_sync_change() {
 
 #[test]
 pub(crate) fn adr055_no_wendelon_server_or_sql_wire_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
 		.into_iter()
 		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
@@ -1152,8 +1152,8 @@ pub(crate) fn adr055_no_wendelon_server_or_sql_wire_change() {
 pub(crate) fn adr055_resource_exhausted_reused_no_new_sql_code() {
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	assert!(daemon.contains("CatalogError::ResourceExhausted"));
 	assert!(daemon.contains("SqlErrorCode::ResourceExhausted"));

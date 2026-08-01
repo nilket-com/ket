@@ -355,8 +355,8 @@ pub(crate) fn adr057_sql_quic_idle_timeout_not_disabled() {
 
 #[test]
 pub(crate) fn adr057_no_wendelon_sql_wire_nilket_or_fixture_worker_change() {
-	let sql_wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let sql_wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
 		.expect("read fixture worker");
 	let nilket_manifest =
@@ -428,8 +428,8 @@ pub(crate) fn adr057_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 
 #[test]
 pub(crate) fn adr058_sql_request_reader_checks_length_before_allocation() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let wire_test = std::fs::read_to_string(manifest_dir().join("tests/toron_sql_wire_test.rs"))
 		.expect("read SQL wire tests");
 	let reader = brace_blocks_after_marker(&wire, "pub async fn read_request_frame_bounded")
@@ -496,8 +496,8 @@ pub(crate) fn adr058_request_limits_are_default_on_nonzero_safety_floor() {
 
 #[test]
 pub(crate) fn adr058_request_limits_have_hard_ceilings() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let config =
 		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
 	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
@@ -529,8 +529,8 @@ pub(crate) fn adr058_statement_cap_cannot_exceed_request_frame_cap() {
 
 #[test]
 pub(crate) fn adr058_default_statement_cap_matches_request_cap() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
 		.expect("read config tests");
 
@@ -623,8 +623,8 @@ pub(crate) fn adr058_request_frame_limit_is_server_inbound_only() {
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
 	let cli = std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read cli");
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let writer = brace_blocks_after_marker(&wire, "pub async fn write_frame")
 		.into_iter()
 		.next()
@@ -639,8 +639,8 @@ pub(crate) fn adr058_request_frame_limit_is_server_inbound_only() {
 
 #[test]
 pub(crate) fn adr058_result_batch_frames_keep_existing_wire_shape() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let wire_test = std::fs::read_to_string(manifest_dir().join("tests/toron_sql_wire_test.rs"))
 		.expect("read SQL wire tests");
 	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
@@ -648,15 +648,15 @@ pub(crate) fn adr058_result_batch_frames_keep_existing_wire_shape() {
 
 	assert!(wire.contains("ResultBatch(ResultBatch)"));
 	assert!(wire.contains("pub arrow_ipc_bytes: ByteBuf"));
-	assert!(wire.contains("let payload = encode_payload(frame);"));
+	assert!(wire.contains("postcard::to_allocvec(frame)"));
 	assert!(wire_test.contains("toron_sql_wire_round_trips_arrow_ipc_batch"));
 	assert!(sql_tests.contains("server_result_batches_not_constrained_by_inbound_request_cap"));
 }
 
 #[test]
 pub(crate) fn adr058_no_new_sql_wire_variant_or_protocol_version() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 	let message = brace_blocks_after_marker(&wire, "pub enum SqlMessage")
 		.into_iter()
 		.next()
@@ -668,7 +668,15 @@ pub(crate) fn adr058_no_new_sql_wire_variant_or_protocol_version() {
 		.expect("SqlProtocolVersion")
 		.1;
 
-	for variant in ["Execute", "Cancel", "ResultBatch", "Complete", "Error"] {
+	for variant in [
+		"Execute",
+		"Cancel",
+		"ResultBatch",
+		"Complete",
+		"Error",
+		"Health",
+		"Healthy",
+	] {
 		assert!(
 			message.contains(variant),
 			"missing SQL message variant {variant}"
@@ -676,6 +684,16 @@ pub(crate) fn adr058_no_new_sql_wire_variant_or_protocol_version() {
 	}
 	assert!(!message.contains("RequestTooLarge"));
 	assert!(!message.contains("Ingress"));
+	assert_eq!(
+		message.matches("Health(").count(),
+		1,
+		"TORON-532 permits exactly one health request variant"
+	);
+	assert_eq!(
+		message.matches("Healthy(").count(),
+		1,
+		"TORON-532 permits exactly one health response variant"
+	);
 	assert!(protocol.contains("Current"));
 	assert!(!protocol.contains("V1"));
 	assert!(!protocol.contains("V2"));

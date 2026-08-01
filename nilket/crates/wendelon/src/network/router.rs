@@ -190,25 +190,14 @@ impl HrftService for MsgRouter {
 				Some(h) => h.handle_control_frame(context, frame).await,
 				None => Err(unhandled("Control Ring", msg_type)),
 			},
-			x if x == MsgType::REVOCATION_ADMIN_REQ.0
-				|| x == MsgType::TABLE_DESCRIPTOR_GET_REQ.0
-				|| x == MsgType::TABLE_DESCRIPTOR_LIST_REQ.0
-				|| x == MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ.0 =>
-			{
-				match &self.control {
-					Some(h) => h.handle_control_frame(context, frame).await,
-					None => Err(unhandled("Control Ring", msg_type)),
-				}
-			}
-			x if x == MsgType::TABLE_DESCRIPTOR_GET_RESP.0
-				|| x == MsgType::TABLE_DESCRIPTOR_LIST_RESP.0
-				|| x == MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0 =>
-			{
-				Err(Error::new(
-					ErrorKind::InvalidData,
-					format!("unexpected response HRFT msg_type=0x{:02x}", msg_type),
-				))
-			}
+			x if is_control_extension_request(x) => match &self.control {
+				Some(h) => h.handle_control_frame(context, frame).await,
+				None => Err(unhandled("Control Ring", msg_type)),
+			},
+			x if is_extension_response(x) => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unexpected response HRFT msg_type=0x{:02x}", msg_type),
+			)),
 			0x20..=0x2F => match &self.raft {
 				Some(h) => h.handle_raft_frame(context, frame).await,
 				None => Err(unhandled("Raft internal", msg_type)),
@@ -271,6 +260,36 @@ impl HrftService for MsgRouter {
 	}
 }
 
+fn is_control_extension_request(msg_type: u8) -> bool {
+	[
+		MsgType::SCHEMA_UPDATE_REQ,
+		MsgType::REVOCATION_ADMIN_REQ,
+		MsgType::SCHEMA_DROP_REQ,
+		MsgType::TABLE_DESCRIPTOR_GET_REQ,
+		MsgType::LOGICAL_TYPE_GET_REQ,
+		MsgType::LOGICAL_TYPE_LIST_REQ,
+		MsgType::TABLE_DESCRIPTOR_LIST_REQ,
+		MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
+	]
+	.iter()
+	.any(|candidate| candidate.0 == msg_type)
+}
+
+fn is_extension_response(msg_type: u8) -> bool {
+	[
+		MsgType::SCHEMA_UPDATE_RESP,
+		MsgType::REVOCATION_ADMIN_RESP,
+		MsgType::SCHEMA_DROP_RESP,
+		MsgType::TABLE_DESCRIPTOR_GET_RESP,
+		MsgType::LOGICAL_TYPE_GET_RESP,
+		MsgType::LOGICAL_TYPE_LIST_RESP,
+		MsgType::TABLE_DESCRIPTOR_LIST_RESP,
+		MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
+	]
+	.iter()
+	.any(|candidate| candidate.0 == msg_type)
+}
+
 // ============================================================
 //  BUILDER
 // ============================================================
@@ -318,4 +337,48 @@ fn unhandled(ring: &'static str, msg_type: u8) -> Error {
 		ErrorKind::Unsupported,
 		format!("{ring} handler not installed (msg_type=0x{msg_type:02x})"),
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{is_control_extension_request, is_extension_response};
+	use crate::schema::MsgType;
+
+	#[test]
+	fn every_control_extension_preempts_the_raft_numeric_range() {
+		for request in [
+			MsgType::SCHEMA_UPDATE_REQ,
+			MsgType::REVOCATION_ADMIN_REQ,
+			MsgType::SCHEMA_DROP_REQ,
+			MsgType::TABLE_DESCRIPTOR_GET_REQ,
+			MsgType::LOGICAL_TYPE_GET_REQ,
+			MsgType::LOGICAL_TYPE_LIST_REQ,
+			MsgType::TABLE_DESCRIPTOR_LIST_REQ,
+			MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
+		] {
+			assert!(
+				is_control_extension_request(request.0),
+				"0x{:02x}",
+				request.0
+			);
+		}
+		assert!(is_control_extension_request(MsgType::SCHEMA_UPDATE_REQ.0));
+		assert!(!is_control_extension_request(0x20));
+	}
+
+	#[test]
+	fn extension_responses_are_never_dispatched_as_requests() {
+		for response in [
+			MsgType::SCHEMA_UPDATE_RESP,
+			MsgType::REVOCATION_ADMIN_RESP,
+			MsgType::SCHEMA_DROP_RESP,
+			MsgType::TABLE_DESCRIPTOR_GET_RESP,
+			MsgType::LOGICAL_TYPE_GET_RESP,
+			MsgType::LOGICAL_TYPE_LIST_RESP,
+			MsgType::TABLE_DESCRIPTOR_LIST_RESP,
+			MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
+		] {
+			assert!(is_extension_response(response.0), "0x{:02x}", response.0);
+		}
+	}
 }

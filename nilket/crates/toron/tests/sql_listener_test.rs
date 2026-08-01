@@ -34,6 +34,7 @@ use toron::sql_wire::{
 	read_frame as read_sql_frame, write_frame as write_sql_frame,
 };
 use toron::storage::TenantId as ToronTenantId;
+use toron_client::ToronClient;
 use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource};
 use wendelon::consensus::WendelonRequest;
 use wendelon::integration::compute::{
@@ -55,6 +56,26 @@ use wendelon_client::{Client, WriteOptions};
 
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const BASE_TS: i64 = 1_599_998_400_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_client_health_probe_reaches_a_live_sql_listener_without_query_state() {
+	let fixture = LiveWendelonFixture::start(142).await;
+	let config = toron_config_with_descriptor(descriptor(), true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	ToronClient::loopback(endpoint.to_string())
+		.expect("construct public loopback client")
+		.health()
+		.await
+		.expect("side-effect-free health response");
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {

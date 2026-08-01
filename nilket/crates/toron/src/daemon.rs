@@ -880,6 +880,14 @@ async fn handle_sql_connection(
 	}
 
 	match frame.message {
+		SqlMessage::Health(_) => {
+			let response = SqlFrame::response(
+				frame.query_id,
+				SqlMessage::Healthy(crate::sql_wire::HealthyResponse),
+			);
+			write_sql_frame(&mut stream, &response).await?;
+			stream.finish().await?;
+		}
 		SqlMessage::Execute(request) => {
 			let query_started = std::time::Instant::now();
 			let session_id = new_sql_session_id();
@@ -1316,7 +1324,10 @@ async fn handle_sql_connection(
 			)
 			.await?;
 		}
-		SqlMessage::ResultBatch(_) | SqlMessage::Complete(_) | SqlMessage::Error(_) => {
+		SqlMessage::ResultBatch(_)
+		| SqlMessage::Complete(_)
+		| SqlMessage::Error(_)
+		| SqlMessage::Healthy(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
 				ToronAuditEvent::edge_denial(

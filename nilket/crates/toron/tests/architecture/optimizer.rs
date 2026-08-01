@@ -188,7 +188,7 @@ pub(crate) fn adr132_no_executor_fragmenter_scheduler_wire_or_wendelon_change() 
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(
@@ -314,7 +314,7 @@ pub(crate) fn adr133_no_trace_on_execution_plan_or_wire() {
 	for path in [
 		manifest_dir.join("src/ir/execution.rs"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 		manifest_dir.join("src/distributed"),
 	] {
 		if path.is_dir() {
@@ -594,7 +594,7 @@ pub(crate) fn adr134_reason_types_stay_crate_private_and_off_wire() {
 	let mut offenders = Vec::new();
 	for path in [
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		let source = std::fs::read_to_string(&path).expect("read wire source");
 		offenders.extend(
@@ -645,7 +645,7 @@ pub(crate) fn adr133_no_executor_fragmenter_scheduler_or_wendelon_change() {
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(
@@ -904,7 +904,7 @@ pub(crate) fn adr137_no_substrate_or_wire_change() {
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	] {
 		if path.is_dir() {
 			offenders.extend(
@@ -1085,7 +1085,7 @@ pub(crate) fn adr138_no_substrate_or_wire_change() {
 		manifest_dir.join("src/distributed"),
 		manifest_dir.join("src/server"),
 		manifest_dir.join("src/wire.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 		manifest_dir.join("src/catalog.rs"),
 		manifest_dir.join("src/config.rs"),
 	] {

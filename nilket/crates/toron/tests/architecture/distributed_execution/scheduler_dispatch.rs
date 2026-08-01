@@ -940,7 +940,7 @@ pub(crate) fn adr120_no_sql_rune_ir_change() {
 		"src/planner.rs",
 		"src/rune_engine.rs",
 		"src/sql_planner.rs",
-		"src/sql_wire.rs",
+		"../toron-client/src/protocol.rs",
 	] {
 		let source = std::fs::read_to_string(manifest_dir.join(path)).expect("read source");
 		for marker in forbidden {
@@ -985,7 +985,7 @@ pub(crate) fn adr119_no_wendelon_or_frontend_change() {
 		manifest_dir.join("src/planner.rs"),
 		manifest_dir.join("src/rune_engine.rs"),
 		manifest_dir.join("src/sql_planner.rs"),
-		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("../toron-client/src/protocol.rs"),
 	];
 	let mut offenders = toron_frontend_files
 		.into_iter()

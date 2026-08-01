@@ -62,7 +62,7 @@ pub(crate) fn adr040_nilket_delegates_to_two_roles() {
 }
 
 #[test]
-pub(crate) fn adr040_no_extra_root_commands() {
+pub(crate) fn adr532_adds_only_the_local_profile_to_adr040_root_commands() {
 	let main = std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
 		.expect("read nilket main");
 
@@ -72,13 +72,23 @@ pub(crate) fn adr040_no_extra_root_commands() {
 		"Some(\"inspect\")",
 		"Some(\"diag\")",
 		"Some(\"standalone\")",
-		"Some(\"local\")",
 	] {
 		assert!(
 			!main.contains(forbidden),
 			"nilket root dispatches {forbidden}"
 		);
 	}
+	assert!(main.contains("Some(\"local\")"));
+	assert!(main.contains("None => run_local("));
+	assert!(
+		!main.contains("Some(\"toron\") => run_local"),
+		"TORON-532 keeps the compute-role noun distinct from the local profile"
+	);
+	let positive_control = "Some(\"toron\") => run_local(options)";
+	assert!(
+		positive_control.contains("Some(\"toron\") => run_local"),
+		"positive control: the TORON-532 role/profile assay must fire"
+	);
 }
 
 #[test]
@@ -520,7 +530,8 @@ pub(crate) fn adr043_toron_cli_sql_is_client_only() {
 			"Toron CLI SQL client must not construct {forbidden}"
 		);
 	}
-	assert!(cli.contains("QuicEndpoint::client_loopback()"));
+	assert!(cli.contains("toron_client::ToronClient::loopback"));
+	assert!(!cli.contains("ToronDaemon"));
 }
 
 #[test]
@@ -572,19 +583,19 @@ pub(crate) fn adr043_task_transport_is_quic_by_default_and_loopback_only() {
 
 #[test]
 pub(crate) fn adr043_sql_wire_uses_length_prefixed_postcard() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
-	assert!(wire.contains("encode_payload(frame)"));
-	assert!(wire.contains("decode_payload(&payload)"));
+	assert!(wire.contains("postcard::to_allocvec(frame)"));
+	assert!(wire.contains("postcard::from_bytes(&payload)"));
 	assert!(wire.contains("to_le_bytes()"));
 	assert!(wire.contains("u32::from_le_bytes"));
 }
 
 #[test]
 pub(crate) fn adr043_sql_wire_uses_arrow_ipc_not_row_strings() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
 	assert!(wire.contains("pub arrow_ipc_bytes: ByteBuf"));
 	assert!(!wire.contains("Vec<String>"));
@@ -627,7 +638,7 @@ pub(crate) fn adr043_no_remote_sql_auth_policy() {
 	for path in [
 		"src/cli.rs",
 		"src/daemon.rs",
-		"src/sql_wire.rs",
+		"../toron-client/src/protocol.rs",
 		"src/quic.rs",
 	] {
 		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
@@ -737,11 +748,12 @@ pub(crate) fn adr043_sql_ready_does_not_mutate_adr042_ready_line() {
 }
 
 #[test]
-pub(crate) fn adr043_sql_wire_uses_existing_wire_crate() {
-	let wire =
-		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+pub(crate) fn adr043_sql_wire_has_one_protocol_owner_after_toron_532() {
+	let wire = std::fs::read_to_string(manifest_dir().join("../toron-client/src/protocol.rs"))
+		.expect("read SQL wire");
 
-	assert!(wire.contains("use crate::wire::{decode_payload, encode_payload};"));
+	assert!(wire.contains("postcard::to_allocvec(frame)"));
+	assert!(!wire.contains("toron::"));
 	assert!(!wire.contains("wendelon::"));
 }
 

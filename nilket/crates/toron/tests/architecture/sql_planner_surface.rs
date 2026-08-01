@@ -1920,7 +1920,7 @@ pub(crate) fn adr073_no_wendelon_wire_storage_or_ir_leakage() {
 	for path in [
 		manifest_dir().join("src/ir.rs"),
 		manifest_dir().join("src/ir/execution.rs"),
-		manifest_dir().join("src/sql_wire.rs"),
+		manifest_dir().join("../toron-client/src/protocol.rs"),
 		manifest_dir().join("src/storage.rs"),
 	] {
 		let source = std::fs::read_to_string(&path).expect("read source");
