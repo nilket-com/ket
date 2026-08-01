@@ -83,14 +83,16 @@ use crate::storage::{
 	fsync_parent_dir, write_file,
 };
 use bytemuck::{Pod, Zeroable};
+#[cfg(test)]
+use openraft::CommittedLeaderId;
 use openraft::anyerror::AnyError;
 use openraft::storage::{
 	LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
 	Snapshot,
 };
 use openraft::{
-	BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta,
-	StorageError, StorageIOError, StoredMembership, Vote,
+	BasicNode, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta, StorageError,
+	StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2646,13 +2648,20 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				.map_err(|err| {
 					StorageIOError::read_snapshot(Some(meta.signature()), AnyError::new(&err))
 				})?;
-		let header_last = log_id_from_snapshot_header(&header);
-		if header_last != meta.last_log_id {
+		validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id).map_err(
+			|err| {
+				StorageIOError::read_snapshot(
+					Some(meta.signature()),
+					AnyError::error(format!("snapshot header/body identity mismatch: {err}")),
+				)
+			},
+		)?;
+		if state.last_applied_log_id != meta.last_log_id {
 			return Err(StorageIOError::read_snapshot(
 				Some(meta.signature()),
 				AnyError::error(format!(
-					"snapshot header {:?} disagrees with install meta {:?}",
-					header_last, meta.last_log_id
+					"snapshot body last_applied {:?} disagrees with install meta {:?}",
+					state.last_applied_log_id, meta.last_log_id
 				)),
 			)
 			.into());
@@ -5225,24 +5234,24 @@ async fn load_snapshot_artifact(
 				),
 			)
 		})?;
-	let header_last = log_id_from_snapshot_header(&header);
-	if state.last_applied_log_id != header_last {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"snapshot artifact {} last_applied {:?} disagrees with header {:?}",
-				snapshot_path.display(),
-				state.last_applied_log_id,
-				header_last
-			),
-		));
-	}
+	validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id).map_err(
+		|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"snapshot artifact {} header/body identity mismatch: {err}",
+					snapshot_path.display()
+				),
+			)
+		},
+	)?;
+	let body_last = state.last_applied_log_id;
 	let snapshot_id = format!("recovered-{}", header.last_included_index);
 	Ok(Some(LoadedSnapshot {
-		last_included: header_last,
+		last_included: body_last,
 		held: HeldSnapshot {
 			meta: SnapshotMeta {
-				last_log_id: header_last,
+				last_log_id: body_last,
 				last_membership: state.last_membership.clone(),
 				snapshot_id,
 			},
@@ -5291,6 +5300,20 @@ async fn replay_wal(
 		..WALReplay::default()
 	};
 	let discovered = discover_all_wal_segments(file_ops, wal_path).await?;
+	if snapshot.is_none()
+		&& let Some(first) = discovered.first()
+		&& !first.legacy
+		&& first.start_index > 1
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"WAL {} begins at retained log index {} but no snapshot provides the purged prefix",
+				first.path.display(),
+				first.start_index
+			),
+		));
+	}
 	for (index, segment) in discovered.iter().enumerate() {
 		let allow_torn_tail = index + 1 == discovered.len();
 		if let Some(meta) =
@@ -5487,22 +5510,18 @@ async fn replay_wal_segment(
 				if checkpoint.e_safe_index > checkpoint.commit_index {
 					checkpoint.e_safe_index = checkpoint.commit_index;
 				}
-				if let Some(boundary) = boundary {
-					if checkpoint.commit_index < boundary {
-						return Err(interior_corruption(
-							&segment.path,
-							offset,
-							format!(
-								"checkpoint commit_index {} is behind snapshot boundary {}",
-								checkpoint.commit_index, boundary
-							),
-						));
-					}
+				let superseded = boundary
+					.map(|snapshot_index| checkpoint.commit_index < snapshot_index)
+					.unwrap_or(false);
+				// A newer snapshot can overtake the last checkpoint in a retained
+				// segment before the next rotation. The record remains checksum-
+				// validated, but the snapshot supersedes its recovery authority.
+				if !superseded {
+					replay.checkpoint = Some(RecoveryCheckpoint {
+						commit_index: checkpoint.commit_index,
+						e_safe_index: checkpoint.e_safe_index,
+					});
 				}
-				replay.checkpoint = Some(RecoveryCheckpoint {
-					commit_index: checkpoint.commit_index,
-					e_safe_index: checkpoint.e_safe_index,
-				});
 			}
 			other => {
 				return Err(interior_corruption(
@@ -5633,15 +5652,20 @@ fn interior_corruption(wal_path: &Path, offset: usize, detail: String) -> Error 
 	)
 }
 
-fn log_id_from_snapshot_header(header: &SnapshotHeader) -> Option<LogId<u32>> {
-	if header.last_included_index == 0 && header.last_included_term == 0 {
-		None
-	} else {
-		Some(LogId::new(
-			CommittedLeaderId::new(header.last_included_term, 0),
-			header.last_included_index,
-		))
+fn validate_snapshot_header_log_coordinates(
+	header: &SnapshotHeader,
+	authoritative: Option<LogId<u32>>,
+) -> Result<(), String> {
+	let (term, index) = authoritative
+		.map(|log_id| (log_id.leader_id.term, log_id.index))
+		.unwrap_or((0, 0));
+	if header.last_included_term == term && header.last_included_index == index {
+		return Ok(());
 	}
+	Err(format!(
+		"header coordinates (term={}, index={}) disagree with authoritative log identity {:?}",
+		header.last_included_term, header.last_included_index, authoritative
+	))
 }
 
 /// Build one page-padded WAL record for a single entry:
@@ -7295,8 +7319,33 @@ mod recovery_tests {
 		)
 	}
 
+	fn rewrite_snapshot_header(path: &Path, rewrite: impl FnOnce(&mut SnapshotHeader)) {
+		let mut bytes = std::fs::read(path).unwrap();
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
+		rewrite(&mut header);
+		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+		std::fs::write(path, bytes).unwrap();
+	}
+
+	fn copy_flat_artifacts(source: &Path, target: &Path, omit_file_name: Option<&str>) {
+		for entry in std::fs::read_dir(source).unwrap() {
+			let entry = entry.unwrap();
+			let file_type = entry.file_type().unwrap();
+			assert!(file_type.is_file(), "unexpected nested test artifact");
+			if entry.file_name().to_str() == omit_file_name {
+				continue;
+			}
+			std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+		}
+	}
+
 	fn log_id(term: u64, index: u64) -> LogId<u32> {
-		LogId::new(CommittedLeaderId::new(term, 0), index)
+		log_id_for(1, term, index)
+	}
+
+	fn log_id_for(node_id: u32, term: u64, index: u64) -> LogId<u32> {
+		LogId::new(CommittedLeaderId::new(term, node_id), index)
 	}
 
 	fn lease_entry(
@@ -7513,6 +7562,21 @@ mod recovery_tests {
 		WendelonLogStore::open(&wal, &vote, &snapshot, io)
 			.await
 			.unwrap()
+	}
+
+	async fn try_open_store_with_segment_bytes(
+		dir: &Path,
+		segment_bytes: u64,
+	) -> std::io::Result<WendelonLogStore> {
+		let (wal, vote, snapshot) = artifact_paths(dir);
+		WendelonLogStore::open_with_file_ops_and_options(
+			&wal,
+			&vote,
+			&snapshot,
+			Arc::new(BlockingFileOps),
+			WalOptions { segment_bytes },
+		)
+		.await
 	}
 
 	async fn open_store_with_segment_bytes(dir: &Path, segment_bytes: u64) -> WendelonLogStore {
@@ -7888,7 +7952,7 @@ mod recovery_tests {
 	}
 
 	#[tokio::test]
-	async fn restart_recovers_blake3_and_sha256_snapshot_artifacts() {
+	async fn restart_recovers_complete_nonzero_identity_from_blake3_and_sha256_snapshots() {
 		for (tag, format) in [
 			("dual-read-snapshot-blake3", TestArtifactHashFormat::Blake3),
 			("dual-read-snapshot-sha256", TestArtifactHashFormat::Sha256),
@@ -7896,15 +7960,163 @@ mod recovery_tests {
 			let dir = tempdir(tag);
 			let (_wal, _vote, snapshot_path) = artifact_paths(&dir);
 			let mut state = SmState::default();
-			state.last_applied_log_id = Some(log_id(1, 5));
+			let incident_log_id = log_id_for(1, 1, 134_999);
+			state.last_applied_log_id = Some(incident_log_id);
 			state.leases.insert(0, lease_descriptor(5, 0, 9, 1));
 			write_snapshot_file_with_hash(&snapshot_path, &state, format);
 
 			let store = open_store(&dir).await;
+			{
+				let guard = store.inner.read().await;
+				let loaded = guard
+					.recovered_snapshot
+					.as_ref()
+					.expect("snapshot must be recovered");
+				assert_eq!(loaded.last_included, Some(incident_log_id));
+				assert_eq!(loaded.held.meta.last_log_id, Some(incident_log_id));
+			}
 			let recovered = store.recovered_state_machine().await.unwrap();
 			let snapshot = recovered.state_snapshot().await;
-			assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 5)));
+			assert_eq!(snapshot.last_applied_log_id, Some(incident_log_id));
 			assert!(snapshot.leases.contains_key(&0));
+		}
+	}
+
+	#[tokio::test]
+	async fn snapshot_zero_coordinates_preserve_body_presence() {
+		let none_dir = tempdir("snapshot-zero-none");
+		let (_, _, none_snapshot) = artifact_paths(&none_dir);
+		write_snapshot_file(&none_snapshot, &SmState::default());
+		let none_store = open_store(&none_dir).await;
+		let none_state = none_store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		assert_eq!(none_state.last_applied_log_id, None);
+
+		let some_dir = tempdir("snapshot-zero-some");
+		let (_, _, some_snapshot) = artifact_paths(&some_dir);
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id_for(0, 0, 0));
+		write_snapshot_file(&some_snapshot, &state);
+		let some_store = open_store(&some_dir).await;
+		{
+			let guard = some_store.inner.read().await;
+			let loaded = guard
+				.recovered_snapshot
+				.as_ref()
+				.expect("zero-coordinate snapshot must remain present");
+			assert_eq!(loaded.last_included, Some(log_id_for(0, 0, 0)));
+			assert_eq!(loaded.held.meta.last_log_id, Some(log_id_for(0, 0, 0)));
+		}
+		let some_state = some_store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		assert_eq!(some_state.last_applied_log_id, Some(log_id_for(0, 0, 0)));
+	}
+
+	#[tokio::test]
+	async fn snapshot_header_coordinates_and_body_digest_remain_independent_guards() {
+		for (tag, corrupt) in [
+			("snapshot-header-term", "term"),
+			("snapshot-header-index", "index"),
+			("snapshot-body-digest", "body"),
+		] {
+			let dir = tempdir(tag);
+			let (_, _, snapshot_path) = artifact_paths(&dir);
+			let mut state = SmState::default();
+			state.last_applied_log_id = Some(log_id_for(9, 3, 17));
+			write_snapshot_file(&snapshot_path, &state);
+
+			match corrupt {
+				"term" => rewrite_snapshot_header(&snapshot_path, |header| {
+					header.last_included_term += 1;
+				}),
+				"index" => rewrite_snapshot_header(&snapshot_path, |header| {
+					header.last_included_index += 1;
+				}),
+				"body" => {
+					let mut bytes = std::fs::read(&snapshot_path).unwrap();
+					let last = bytes.last_mut().expect("snapshot body byte");
+					*last ^= 0x5a;
+					std::fs::write(&snapshot_path, bytes).unwrap();
+				}
+				_ => unreachable!(),
+			}
+
+			let err = match try_open_store_with_segment_bytes(&dir, DEFAULT_WAL_SEGMENT_BYTES).await
+			{
+				Ok(_) => panic!("corrupt snapshot must fail recovery"),
+				Err(err) => err,
+			};
+			assert_eq!(err.kind(), ErrorKind::InvalidData);
+			if corrupt == "body" {
+				assert!(err.to_string().contains("snapshot body hash mismatch"));
+			} else {
+				assert!(err.to_string().contains("header/body identity mismatch"));
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn aged_restart_requires_snapshot_and_preserves_purged_state() {
+		let dir = tempdir("aged-snapshot-restart");
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for index in 1..=5 {
+			append_and_apply(
+				&mut store,
+				&mut sm,
+				lease_entry(index, (index - 1) * 10, index * 10 - 1, index as u32),
+			)
+			.await;
+		}
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		assert_eq!(built.meta.last_log_id, Some(log_id(1, 5)));
+		drop(built);
+
+		append_and_apply(&mut store, &mut sm, lease_entry(6, 50, 59, 6)).await;
+		store.save_committed(Some(log_id(1, 6))).await.unwrap();
+		store.purge(log_id(1, 5)).await.unwrap();
+		drop(sm);
+		drop(store);
+
+		let missing_snapshot = tempdir("aged-snapshot-withheld");
+		copy_flat_artifacts(&dir, &missing_snapshot, Some("snapshot.wnd"));
+		let err = match try_open_store_with_segment_bytes(&missing_snapshot, DIRECT_IO_ALIGN as u64)
+			.await
+		{
+			Ok(_) => panic!("purged WAL tail without its snapshot must fail closed"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string()
+				.contains("no snapshot provides the purged prefix")
+		);
+
+		let mut reopened = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		let log_state = reopened.get_log_state().await.unwrap();
+		assert_eq!(log_state.last_purged_log_id, Some(log_id(1, 5)));
+		assert_eq!(log_state.last_log_id, Some(log_id(1, 6)));
+		let recovered = reopened.recovered_state_machine().await.unwrap();
+		let state = recovered.state_snapshot().await;
+		assert_eq!(state.last_applied_log_id, Some(log_id(1, 6)));
+		for range_start in [0, 10, 20, 30, 40, 50] {
+			assert!(
+				state.leases.contains_key(&range_start),
+				"missing lease at range {range_start} after aged restart"
+			);
 		}
 	}
 
@@ -7977,6 +8189,36 @@ mod recovery_tests {
 	}
 
 	#[tokio::test]
+	async fn snapshot_supersedes_an_older_checkpoint_in_a_retained_segment() {
+		let dir = tempdir("snapshot-supersedes-checkpoint");
+		let (wal, _vote, snapshot_path) = artifact_paths(&dir);
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id(1, 5));
+		state.leases.insert(0, lease_descriptor(5, 0, 9, 1));
+		write_snapshot_file(&snapshot_path, &state);
+
+		let segment = wal_segment_path(&wal, 4).unwrap();
+		write_wal_pages(
+			&segment,
+			&[
+				serialize_entry_page(&lease_entry(4, 100, 109, 4)).unwrap(),
+				serialize_checkpoint_page(4, 4, 4, 1),
+				serialize_entry_page(&lease_entry(6, 10, 19, 6)).unwrap(),
+			],
+		);
+
+		let mut store = open_store(&dir).await;
+		let log_state = store.get_log_state().await.unwrap();
+		assert_eq!(log_state.last_purged_log_id, Some(log_id(1, 5)));
+		assert_eq!(log_state.last_log_id, Some(log_id(1, 6)));
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let state = recovered.state_snapshot().await;
+		assert_eq!(state.last_applied_log_id, Some(log_id(1, 5)));
+		assert!(state.leases.contains_key(&0));
+		assert!(!state.leases.contains_key(&10));
+	}
+
+	#[tokio::test]
 	async fn built_snapshot_persists_artifact_and_recovers_on_reopen() {
 		let dir = tempdir("snapshot-build-persist");
 		let (_wal, _vote, snapshot_path) = artifact_paths(&dir);
@@ -8038,12 +8280,134 @@ mod recovery_tests {
 		let installed = target_sm.state_snapshot().await;
 		assert_eq!(installed.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(installed.leases.contains_key(&0));
+		assert_eq!(
+			target_sm
+				.inner
+				.read()
+				.await
+				.snapshot
+				.as_ref()
+				.unwrap()
+				.meta
+				.last_log_id,
+			Some(log_id(1, 1))
+		);
 
 		let reopened = open_store(&target_dir).await;
 		let reopened_sm = reopened.recovered_state_machine().await.unwrap();
 		let state = reopened_sm.state_snapshot().await;
 		assert_eq!(state.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(state.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn install_snapshot_rejects_full_identity_mismatch_before_publication() {
+		let source_dir = tempdir("snapshot-install-identity-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut source_store, &mut source_sm, lease_entry(1, 0, 9, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let mut mismatched_meta = built.meta.clone();
+		mismatched_meta.last_log_id = Some(log_id_for(2, 1, 1));
+
+		let target_dir = tempdir("snapshot-install-identity-target");
+		let (_, _, target_snapshot_path) = artifact_paths(&target_dir);
+		let target_store = open_store(&target_dir).await;
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		let err = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&mismatched_meta,
+			built.snapshot,
+		)
+		.await
+		.expect_err("install meta may not replace the body identity");
+		assert!(err.to_string().contains("snapshot body last_applied"));
+		assert!(!target_snapshot_path.exists());
+		assert_eq!(target_sm.state_snapshot().await.last_applied_log_id, None);
+	}
+
+	#[tokio::test]
+	async fn install_snapshot_rejects_header_coordinate_corruption_before_publication() {
+		for coordinate in ["term", "index"] {
+			let source_dir = tempdir(&format!("snapshot-install-header-{coordinate}-source"));
+			let (_, _, source_snapshot_path) = artifact_paths(&source_dir);
+			let mut source_store = open_store(&source_dir).await;
+			let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+			append_and_apply(&mut source_store, &mut source_sm, lease_entry(1, 0, 9, 3)).await;
+			let mut builder =
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+					&mut source_sm,
+				)
+				.await;
+			let built = builder.build_snapshot().await.unwrap();
+			let meta = built.meta.clone();
+			drop(built.snapshot);
+			rewrite_snapshot_header(&source_snapshot_path, |header| match coordinate {
+				"term" => header.last_included_term += 1,
+				"index" => header.last_included_index += 1,
+				_ => unreachable!(),
+			});
+			let corrupted =
+				SnapshotDataFile::open(Arc::new(BlockingFileOps), source_snapshot_path.clone())
+					.await
+					.unwrap();
+
+			let target_dir = tempdir(&format!("snapshot-install-header-{coordinate}-target"));
+			let (_, _, target_snapshot_path) = artifact_paths(&target_dir);
+			let target_store = open_store(&target_dir).await;
+			let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+			let err =
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+					&mut target_sm,
+					&meta,
+					Box::new(corrupted),
+				)
+				.await
+				.expect_err("header coordinate corruption must fail install");
+			assert!(
+				err.to_string()
+					.contains("snapshot header/body identity mismatch")
+			);
+			assert!(!target_snapshot_path.exists());
+		}
+	}
+
+	#[tokio::test]
+	async fn install_snapshot_membership_mismatch_remains_rejected() {
+		let source_dir = tempdir("snapshot-install-membership-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut source_store, &mut source_sm, lease_entry(1, 0, 9, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let mut mismatched_meta = built.meta.clone();
+		mismatched_meta.last_membership = StoredMembership::new(
+			Some(log_id_for(2, 1, 1)),
+			openraft::Membership::new(vec![std::collections::BTreeSet::from([2])], ()),
+		);
+
+		let target_dir = tempdir("snapshot-install-membership-target");
+		let (_, _, target_snapshot_path) = artifact_paths(&target_dir);
+		let target_store = open_store(&target_dir).await;
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		let err = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&mismatched_meta,
+			built.snapshot,
+		)
+		.await
+		.expect_err("membership mismatch must remain rejected");
+		assert!(err.to_string().contains("snapshot membership disagrees"));
+		assert!(!target_snapshot_path.exists());
 	}
 
 	#[tokio::test]
@@ -8727,6 +9091,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn purge_drops_fully_purged_segments() {
 		let dir = tempdir("segment-purge");
+		let (_, _, snapshot_path) = artifact_paths(&dir);
 		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
 		store
 			.blocking_append(vec![
@@ -8736,6 +9101,9 @@ mod recovery_tests {
 			])
 			.await
 			.unwrap();
+		let mut snapshot_state = SmState::default();
+		snapshot_state.last_applied_log_id = Some(log_id(1, 2));
+		write_snapshot_file(&snapshot_path, &snapshot_state);
 
 		store.purge(log_id(1, 2)).await.unwrap();
 		let segments = named_segment_paths(&dir);

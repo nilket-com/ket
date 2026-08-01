@@ -159,6 +159,10 @@ whose production authority cannot be reconstructed from zero.
 2. **Aged local restart.** On a nonzero-node fixture, commit durable data, build a snapshot, purge the
    WAL prefix through the snapshot boundary, close every handle, reopen the same artifact paths, and
    read the data. Prove recovery actually needs the snapshot—the retained WAL alone is insufficient.
+   The negative control must withhold the snapshot from a copy of the fixture and observe an
+   `InvalidData` refusal. If the first retained named WAL segment starts beyond the initial log
+   boundary while no snapshot exists, recovery has no authority for the missing prefix and must
+   fail closed rather than replaying the tail onto an empty state.
 3. **Install preserves full identity.** Install a real file-backed snapshot with nonzero leader node
    id; meta, body, held snapshot, and installed state retain it exactly.
 4. **Install identity mismatch rejects.** Header coordinates and body may match while install meta
@@ -195,6 +199,12 @@ After every synthetic test and the full Wendelon suite pass:
 
 Any failure stops the drill. Do not retry with reset, artifact deletion, snapshot renaming, WAL-only
 replay, or a hand-edited binary file. The immutable backup remains the return point.
+
+The disposable-copy drill exposed one second aged-recovery defect after the identity correction:
+the retained segment can contain a valid checkpoint older than the newer snapshot boundary. Such a
+checkpoint remains checksum-validated but is superseded recovery metadata, not corruption and not
+authority. Recovery ignores it while continuing to scan the segment for corruption and tail entries;
+a focused test pins this exact snapshot-overtakes-checkpoint ordering before the real drill resumes.
 
 ## Architecture guard
 

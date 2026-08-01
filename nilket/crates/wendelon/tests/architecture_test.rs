@@ -8592,3 +8592,46 @@ fn adr078_no_mod_rs_root() {
 		"storage/manager/mod.rs must not exist (mod.rs is manifests-only)"
 	);
 }
+
+fn snapshot_header_invents_complete_log_identity(source: &str) -> bool {
+	let compact = source
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect::<String>();
+	compact.contains("CommittedLeaderId::new(header.last_included_term,0)")
+}
+
+/// impl 534: SnapshotHeader owns term/index coordinates, not a complete
+/// OpenRaft LogId. The hash-verified body supplies identity and presence.
+#[test]
+fn impl534_snapshot_headers_do_not_invent_log_identity() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let production = source
+		.split("#[cfg(test)]\nmod recovery_tests")
+		.next()
+		.expect("production raft-storage source");
+	let forbidden_control = r#"
+		CommittedLeaderId::new(header.last_included_term, 0)
+	"#;
+	assert!(
+		snapshot_header_invents_complete_log_identity(forbidden_control),
+		"impl 534 positive control must prove the forbidden reconstruction is observable"
+	);
+	assert!(
+		!snapshot_header_invents_complete_log_identity(production),
+		"impl 534 forbids constructing complete log identity from SnapshotHeader: the header owns coordinates, not node identity"
+	);
+	assert!(
+		production.contains(
+			"validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id)"
+		),
+		"impl 534 requires local load and install to validate header coordinates against hash-verified body identity"
+	);
+	assert!(
+		source.contains(
+			"fn log_id(term: u64, index: u64) -> LogId<u32> {\n\t\tlog_id_for(1, term, index)"
+		),
+		"impl 534 recovery fixtures must default to a nonzero leader node id"
+	);
+}

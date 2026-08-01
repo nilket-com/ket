@@ -429,7 +429,7 @@ impl HrftService for CountingWriteService {
 }
 
 fn log_id(term: u64, index: u64) -> LogId<u32> {
-	LogId::new(CommittedLeaderId::new(term, 0), index)
+	LogId::new(CommittedLeaderId::new(term, 1), index)
 }
 
 fn lease_entry(
