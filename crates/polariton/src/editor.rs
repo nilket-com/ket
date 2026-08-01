@@ -52,6 +52,10 @@ const INITIAL_ROWS: u16 = 40;
 /// natural home for pane titles and close buttons; those can grow here without
 /// leaking pane chrome back into Polariton's old outer grid.
 const PANE_HEADER_HEIGHT: f32 = 22.0;
+/// Keep the leading drag target comfortably clickable without painting a grip
+/// glyph. The tab-strip surface already distinguishes workspace chrome from
+/// document content.
+const PANE_DRAG_HANDLE_WIDTH: f32 = 30.0;
 const PANE_DRAG_DEADBAND: f32 = 8.0;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// A plot needs more room than a tabular result, but remains a document block
@@ -2284,14 +2288,9 @@ fn pane_tab_bar<'a>(
 		palette.tab_active_surface
 	});
 	let drag_handle = mouse_area(
-		container(
-			text("⠿⠿")
-				.font(EDITOR_FONT)
-				.size(13.0)
-				.color(color(palette.tab_text)),
-		)
-		.padding([2, 7])
-		.height(Length::Fixed(PANE_HEADER_HEIGHT)),
+		Space::new()
+			.width(Length::Fixed(PANE_DRAG_HANDLE_WIDTH))
+			.height(Length::Fixed(PANE_HEADER_HEIGHT)),
 	)
 	.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
 	.on_release(EditorMsg::Release);

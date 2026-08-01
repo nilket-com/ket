@@ -187,7 +187,7 @@ pub const UI_COLOR_SPECS: [UiColorSpec; UI_COLOR_COUNT] = [
 		name: "colors.tab.active.surface",
 		aliases: &[],
 		parent: None,
-		default: UiColorDefault::Value(Rgb::new(32, 38, 46)),
+		default: UiColorDefault::Value(Rgb::new(24, 28, 34)),
 		summary: "Active document-tab contrast surface",
 	},
 	UiColorSpec {
@@ -583,7 +583,7 @@ mod tests {
 		assert_eq!(palette.surface, Rgb::new(18, 18, 18));
 		assert_eq!(palette.minimap_surface, Rgb::new(16, 20, 28));
 		assert_eq!(palette.tab_surface, Rgb::new(12, 14, 18));
-		assert_eq!(palette.tab_active_surface, Rgb::new(32, 38, 46));
+		assert_eq!(palette.tab_active_surface, Rgb::new(24, 28, 34));
 		assert_eq!(palette.gutter_text, Rgb::new(108, 108, 108));
 		assert_eq!(palette.status_text, Rgb::new(255, 255, 255));
 		assert_eq!(palette.tab_text, Rgb::new(148, 148, 148));
@@ -662,7 +662,7 @@ mod tests {
 		assert_eq!(palette.gutter_surface, surface);
 		assert_eq!(palette.minimap_surface, surface);
 		assert_eq!(palette.tab_surface, surface);
-		assert_eq!(palette.tab_active_surface, Rgb::new(32, 38, 46));
+		assert_eq!(palette.tab_active_surface, Rgb::new(24, 28, 34));
 		assert_eq!(palette.gutter_text, text);
 		assert_eq!(palette.preview_text, text);
 		assert_eq!(palette.editor_text, TEXT);

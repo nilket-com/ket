@@ -1,5 +1,5 @@
 commands | bytes=21661 lines=137 fnv1a=201dbbda58e49ed6
 options | bytes=6202 lines=121 fnv1a=5bbc789fe88855cb
 keys | bytes=32107 lines=477 fnv1a=9d2481e290a8b0f4
-help | bytes=11173 lines=95 fnv1a=a68ce9f06c58a1ba
+help | bytes=11173 lines=95 fnv1a=f197d31cf21986dd
 completion-and-suggestions | bytes=1173 lines=23 fnv1a=44ba2eb557e999fc
