@@ -146,6 +146,107 @@ async fn adr490_single_node_raw_policy_emits_only_the_local_hash_shape() {
 	assert!(terminal_exchange(right).is_some());
 }
 
+fn first_aggregate(plan: &ExecutionPlan) -> Option<(&ExecutionPlan, &BoundExprProgram)> {
+	match plan {
+		ExecutionPlan::Aggregate {
+			input, group_expr, ..
+		} => Some((input.as_ref(), group_expr)),
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => first_aggregate(input),
+		_ => None,
+	}
+}
+
+#[tokio::test]
+async fn adr531_distributed_posture_gathers_global_aggregate_over_join() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(orders.id) FROM orders \
+			 INNER JOIN customers ON orders.customer_id = customers.id",
+		)
+		.expect("plan global aggregate over join");
+
+	let distributed = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind distributed global aggregate");
+	let (input, group_expr) = first_aggregate(&distributed).expect("distributed aggregate");
+	assert!(
+		group_expr.is_empty_roots(),
+		"global aggregate has no group keys"
+	);
+	let ExecutionPlan::Exchange {
+		partition_count,
+		key,
+		..
+	} = input
+	else {
+		panic!("the distributed global aggregate input must be a gather exchange");
+	};
+	assert_eq!(*partition_count, 1, "the gather funnels to one partition");
+	assert!(key.is_empty_roots(), "the gather key is empty");
+}
+
+#[tokio::test]
+async fn adr531_local_posture_leaves_global_aggregate_shape_untouched() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(orders.id) FROM orders \
+			 INNER JOIN customers ON orders.customer_id = customers.id",
+		)
+		.expect("plan global aggregate over join");
+
+	let local = bind(
+		&logical,
+		&catalog,
+		&PlannerConfig {
+			single_partition_execution: true,
+			..PlannerConfig::default()
+		},
+	)
+	.await
+	.expect("bind local global aggregate");
+	let (input, group_expr) = first_aggregate(&local).expect("local aggregate");
+	assert!(
+		group_expr.is_empty_roots(),
+		"global aggregate has no group keys"
+	);
+	assert!(
+		!matches!(input, ExecutionPlan::Exchange { .. }),
+		"the local posture keeps the frozen no-gather shape by construction"
+	);
+}
+
+#[test]
+fn adr531_gather_skip_arm_requires_a_single_partition_proof() {
+	let schema = std::sync::Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+	let base = ExecutionPlan::EmptyRelation { schema };
+	let gathered = ExecutionPlan::Exchange {
+		input: Box::new(base.clone()),
+		partition_count: 1,
+		key: BoundExprProgram::empty(),
+	};
+	let scattered = ExecutionPlan::Exchange {
+		input: Box::new(base),
+		partition_count: 4,
+		key: BoundExprProgram::empty(),
+	};
+	let global = BoundExprProgram::empty();
+
+	assert!(
+		aggregate_partition_decomposable(&gathered, &global),
+		"a proven single-partition input already folds globally; no second gather"
+	);
+	assert!(
+		!aggregate_partition_decomposable(&scattered, &global),
+		"a keyless multi-partition scatter proves nothing; the gather must be inserted"
+	);
+}
+
 #[test]
 fn predicate_pushdown_emitted_splits_preserve_kleene_3vl() {
 	for program in [

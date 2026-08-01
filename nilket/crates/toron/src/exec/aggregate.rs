@@ -133,6 +133,7 @@ impl Executor {
 			if indices.is_empty() {
 				continue;
 			}
+			let routed_rows = indices.len();
 			let indices = arrow::array::UInt32Array::from(indices);
 			let mut columns = Vec::new();
 			for column in batch.columns() {
@@ -149,7 +150,11 @@ impl Executor {
 				}
 				columns.push(taken);
 			}
-			let partitioned = RecordBatch::try_new(batch.schema(), columns)?;
+			// A count-only input (all columns pruned) still carries rows; arrow requires an
+			// explicit row count to build the column-less routed batch.
+			let options =
+				arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(routed_rows));
+			let partitioned = RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
 			if let Some(r) = receipt.as_deref_mut() {
 				r.partition_batches = r.partition_batches.saturating_add(1);
 				r.partition_rows = r

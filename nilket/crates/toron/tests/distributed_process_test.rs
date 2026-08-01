@@ -213,6 +213,13 @@ struct JoinAggregateProcessRun {
 }
 
 #[derive(Debug)]
+struct GlobalJoinAggregateProcessRun {
+	/// `(sum, count)` rows — a correct global aggregate yields exactly one.
+	rows: Vec<(Option<i64>, i64)>,
+	selected_workers: Vec<WorkerId>,
+}
+
+#[derive(Debug)]
 struct JoinDistinctAggregateProcessRun {
 	rows: HashMap<Option<String>, i64>,
 	selected_workers: Vec<WorkerId>,
@@ -415,6 +422,25 @@ async fn group_by_join_real_aggregate_merges_across_partitions() {
 		unique_selected_worker_count(&run.selected_workers),
 		2,
 		"fixture must exercise more than one worker"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr531_global_aggregate_over_join_gathers_across_producers() {
+	let run = run_global_join_aggregate_process_query(3_100, 0).await;
+
+	// The three matched orders (101,102 from cust 2 -> join partition 0; 103 from cust 3 ->
+	// partition 3) are produced by two different join workers. A global SUM/COUNT with no
+	// group keys is exact only once the binder's gather funnels both producers' rows to a
+	// single terminal aggregate task: one row, SUM=306, COUNT=3. Without the gather each
+	// partition folds locally and the coordinator concatenates the partials (203/2, 103/1)
+	// — the ADR 529 census's q17 divergence.
+	assert_eq!(run.rows, vec![(Some(306), 3)]);
+	assert_cross_producer_cardinal_is_value_discriminating(
+		&run.selected_workers,
+		"the single 306/3 row requires the gather exchange to co-locate join output produced \
+		 on both workers; a single producer reaches only 203/2 or 103/1, and a non-gathering \
+		 plan emits two rows",
 	);
 }
 
@@ -1316,15 +1342,15 @@ async fn scalar_aggregate_ordered_process_digest_is_stable_across_worker_counts(
 	assert_eq!(two_workers.row_count, 1);
 	assert_eq!(four_workers.row_count, 1);
 	assert_eq!(two_workers.digest, four_workers.digest);
-	// Scalar ordered aggregate has only producer + consumer task slots; a larger pool
-	// must not imply grouped-style fan-out.
+	// The gathered scalar chain has scan-producer, fold, and sort task slots — three
+	// single-task stages; a larger pool must not imply grouped-style fan-out.
 	assert_eq!(
 		unique_selected_worker_count(&two_workers.selected_workers),
 		2
 	);
 	assert_eq!(
 		unique_selected_worker_count(&four_workers.selected_workers),
-		2
+		3
 	);
 }
 
@@ -1336,15 +1362,15 @@ async fn scalar_aggregate_having_ordered_process_digest_is_stable_across_worker_
 	assert_eq!(two_workers.row_count, 1);
 	assert_eq!(four_workers.row_count, 1);
 	assert_eq!(two_workers.digest, four_workers.digest);
-	// Scalar ordered aggregate has only producer + consumer task slots; a larger pool
-	// must not imply grouped-style fan-out.
+	// The gathered scalar chain has scan-producer, fold, and sort task slots — three
+	// single-task stages; a larger pool must not imply grouped-style fan-out.
 	assert_eq!(
 		unique_selected_worker_count(&two_workers.selected_workers),
 		2
 	);
 	assert_eq!(
 		unique_selected_worker_count(&four_workers.selected_workers),
-		2
+		3
 	);
 }
 
@@ -2080,6 +2106,49 @@ async fn run_multi_dedup_distinct_join_process_query(
 	}
 }
 
+async fn run_global_join_aggregate_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+) -> GlobalJoinAggregateProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(orders.id), COUNT(*) \
+			 FROM orders JOIN customers ON orders.customer_id = customers.id",
+		)
+		.expect("plan global aggregate over distributed join");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("global join aggregate query");
+	let rows = global_aggregate_rows(&results);
+	let selected_workers = registry.selected_workers();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	GlobalJoinAggregateProcessRun {
+		rows,
+		selected_workers,
+	}
+}
+
 async fn run_group_by_join_real_aggregate_process_query(
 	worker_id_base: u128,
 	start_offset: usize,
@@ -2630,6 +2699,31 @@ fn sum_counts(results: &[arrow::record_batch::RecordBatch]) -> i64 {
 			(0..counts.len()).map(|row| counts.value(row)).sum::<i64>()
 		})
 		.sum()
+}
+
+fn global_aggregate_rows(results: &[RecordBatch]) -> Vec<(Option<i64>, i64)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let sums = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("sum column");
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("count column");
+		for row in 0..batch.num_rows() {
+			let sum = if sums.is_null(row) {
+				None
+			} else {
+				Some(sums.value(row))
+			};
+			rows.push((sum, counts.value(row)));
+		}
+	}
+	rows
 }
 
 fn grouped_join_rows(results: &[RecordBatch]) -> HashMap<Option<String>, (i64, Option<i64>)> {

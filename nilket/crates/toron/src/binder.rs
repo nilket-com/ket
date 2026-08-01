@@ -54,7 +54,7 @@ use wendelon_client::{
 };
 
 mod aggregate;
-mod aggregate_exchange;
+pub(crate) mod aggregate_exchange;
 mod arithmetic;
 mod decision_log;
 mod explain;
@@ -2288,7 +2288,7 @@ impl<'a> Binder<'a> {
 		group_expr: BoundExprProgram,
 		aggr_expr: Vec<BoundAggregateCall>,
 	) -> Result<ScopedExecutionPlan, BindingError> {
-		let input = collapse_redundant_pre_aggregate_exchange(input, &group_expr);
+		let input = prepare_aggregate_input_exchange(input, &group_expr, self.config);
 		let logical_types = self.catalog.logical_type_registry();
 		let output_schema = aggregate_schema(&group_expr, &aggr_expr, &logical_types)?;
 		let scope = input.scope.aggregate(&group_expr, &output_schema);

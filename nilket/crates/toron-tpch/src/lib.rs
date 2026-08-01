@@ -4846,6 +4846,9 @@ pub fn classify_fragment_error(error: &FragmentError) -> &'static str {
 		FragmentError::MissingScanMetadata => "fragment_missing_scan_metadata",
 		FragmentError::JoinInputNotExchanged => "fragment_join_input_not_exchanged",
 		FragmentError::SortBarrierInsideJoinInput => "fragment_sort_barrier_inside_join_input",
+		FragmentError::JoinConsumerAggregateNotDecomposable { .. } => {
+			"fragment_join_consumer_aggregate_not_decomposable"
+		}
 		FragmentError::BroadcastNonInner { .. } => "fragment_broadcast_non_inner",
 		FragmentError::BroadcastBuildNotPublished => "fragment_broadcast_build_not_published",
 		FragmentError::BroadcastProbeNotStarLinear => "fragment_broadcast_probe_not_star_linear",

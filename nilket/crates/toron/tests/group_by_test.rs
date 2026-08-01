@@ -4930,7 +4930,7 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 }
 
 #[tokio::test]
-async fn scalar_aggregate_having_only_fragments_to_single_task_stage() {
+async fn scalar_aggregate_having_only_fragments_to_gathered_terminal_fold() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql("SELECT SUM(amount) FROM sales HAVING SUM(amount) > 10");
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -4938,14 +4938,32 @@ async fn scalar_aggregate_having_only_fragments_to_single_task_stage() {
 		.expect("bind scalar HAVING aggregate");
 	let stages = fragment_plan(bound, fragment_config()).expect("fragment scalar HAVING");
 
-	assert_eq!(stages.len(), 1);
+	// ADR 531: under the distributed posture the binder gathers the global fold's input,
+	// so the scan produces into a single-partition shuffle and the fold + HAVING filter
+	// run exactly once in a one-task terminal stage.
+	assert_eq!(stages.len(), 2);
 	assert_eq!(stages[0].stage_id, StageId::new(0));
 	assert!(stages[0].upstream_stages.is_empty());
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
 	assert_eq!(stages[0].tasks.len(), 1);
-	let task = &stages[0].tasks[0].spec;
-	assert_eq!(task.partition, None);
+	assert!(matches!(
+		&stages[0].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(0)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty_roots()
+	));
+	assert_eq!(stages[1].tasks.len(), 1);
+	let task = &stages[1].tasks[0].spec;
 	assert!(matches!(task.output, TaskOutputBinding::FinalResult));
-	assert!(matches!(task.inputs[0], TaskInputBinding::Scan { .. }));
+	assert!(matches!(
+		task.inputs[0],
+		TaskInputBinding::ShuffleConsumer { exchange_id, .. }
+			if exchange_id == ExchangeId::new(0)
+	));
 	assert!(matches!(
 		&task.plan,
 		ExecutionPlan::Filter { input, .. }
@@ -4957,7 +4975,7 @@ async fn scalar_aggregate_having_only_fragments_to_single_task_stage() {
 }
 
 #[tokio::test]
-async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
+async fn scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) DESC");
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -4965,15 +4983,39 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 		.expect("bind ordered scalar aggregate");
 	let stages = fragment_plan(bound, fragment_config()).expect("fragment ordered scalar");
 
-	assert_eq!(stages.len(), 2);
+	// ADR 531: the binder's gather under the global fold stacks beneath the ORDER BY
+	// funnel, so the plan fragments as scan producer -> one-task fold -> one-task sort.
+	assert_eq!(stages.len(), 3);
 	assert_eq!(stages[0].stage_id, StageId::new(0));
 	assert_eq!(stages[1].stage_id, StageId::new(1));
+	assert_eq!(stages[2].stage_id, StageId::new(2));
 	assert!(stages[0].upstream_stages.is_empty());
 	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[2].upstream_stages, vec![StageId::new(1)]);
 	assert_eq!(stages[0].tasks.len(), 1);
 	assert_eq!(stages[1].tasks.len(), 1);
+	assert_eq!(stages[2].tasks.len(), 1);
 	assert!(matches!(
 		&stages[0].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(1)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty_roots()
+	));
+	let fold = &stages[1].tasks[0].spec;
+	assert!(matches!(
+		&fold.inputs[0],
+		TaskInputBinding::ShuffleConsumer {
+			exchange_id,
+			producer_stage_id,
+			..
+		} if *exchange_id == ExchangeId::new(1) && *producer_stage_id == StageId::new(0)
+	));
+	assert!(matches!(
+		&fold.output,
 		TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count,
@@ -4983,7 +5025,7 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 			&& partition_key.is_empty_roots()
 	));
 	assert!(matches!(
-		&stages[0].tasks[0].spec.plan,
+		&fold.plan,
 		ExecutionPlan::Exchange {
 			input,
 			partition_count: 1,
@@ -4994,7 +5036,7 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty_roots()
 			)
 	));
-	let terminal = &stages[1].tasks[0].spec;
+	let terminal = &stages[2].tasks[0].spec;
 	assert!(matches!(terminal.output, TaskOutputBinding::FinalResult));
 	assert!(matches!(
 		&terminal.inputs[0],
@@ -5004,7 +5046,7 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 			partition_id,
 			..
 		} if *exchange_id == ExchangeId::new(0)
-			&& *producer_stage_id == StageId::new(0)
+			&& *producer_stage_id == StageId::new(1)
 			&& partition_id.0 == 0
 	));
 	assert!(matches!(

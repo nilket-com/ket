@@ -79,6 +79,10 @@ pub enum FragmentError {
 	MissingScanMetadata,
 	#[error("join input must terminate in an explicit exchange")]
 	JoinInputNotExchanged,
+	#[error(
+		"aggregate above a fragmented join is not partition-decomposable at the join boundary; {group_key_count} group key roots"
+	)]
+	JoinConsumerAggregateNotDecomposable { group_key_count: usize },
 	#[error("global sort barriers inside join inputs are not supported")]
 	SortBarrierInsideJoinInput,
 	#[error("broadcast strategy is only supported for INNER joins; observed {kind:?}")]
@@ -655,6 +659,7 @@ fn fragment_hash_join_plan(
 	let runtime_filter_enabled =
 		config.runtime_filters_enabled && runtime_filter_join_eligible(&join);
 	reject_sort_barrier_inside_join_inputs(&join)?;
+	reject_undecomposable_aggregate_in_join_consumer(&plan)?;
 	let left_boundary = extract_exchange(*join.left)?;
 	let right_boundary = extract_exchange(*join.right)?;
 	if left_boundary.partition_count == 0 || right_boundary.partition_count == 0 {
@@ -777,6 +782,7 @@ fn fragment_broadcast_join_plan(
 		return Err(FragmentError::BroadcastNonInner { kind: join.kind });
 	}
 	reject_sort_barrier_inside_join_inputs(&join)?;
+	reject_undecomposable_aggregate_in_join_consumer(&plan)?;
 	let BroadcastStarPlan {
 		plan: consumer_plan,
 		builds,
@@ -1272,6 +1278,62 @@ fn reject_sort_barrier_inside_join_inputs(join: &JoinBoundary) -> Result<(), Fra
 		return Err(FragmentError::SortBarrierInsideJoinInput);
 	}
 	Ok(())
+}
+
+/// ADR 531 backstop: everything above a fragmented join is cloned verbatim into each
+/// partition's consumer task, so an aggregate there must be partition-decomposable at the
+/// join boundary — equal group keys proven co-located by the join's hash partitioning. A
+/// global aggregate never is: it folds every input row into one state, and per-partition
+/// execution would hand the coordinator one partial per partition to concatenate. The
+/// binder's gather funnel is the valid shape for that class (peeled as a leading exchange
+/// before this path), so this arm firing means a plan slipped past the binder discipline.
+fn reject_undecomposable_aggregate_in_join_consumer(
+	plan: &ExecutionPlan,
+) -> Result<(), FragmentError> {
+	match plan {
+		// The join's inputs fragment behind their own exchange boundaries; only the
+		// consumer region above the join is cloned per partition.
+		ExecutionPlan::Join { .. } => Ok(()),
+		ExecutionPlan::Aggregate {
+			input, group_expr, ..
+		} => {
+			if !crate::binder::aggregate_exchange::aggregate_partition_decomposable(input, group_expr)
+			{
+				return Err(FragmentError::JoinConsumerAggregateNotDecomposable {
+					group_key_count: group_expr.roots.len(),
+				});
+			}
+			reject_undecomposable_aggregate_in_join_consumer(input)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. } => {
+			reject_undecomposable_aggregate_in_join_consumer(input)
+		}
+		ExecutionPlan::Union { left, right, .. } => {
+			reject_undecomposable_aggregate_in_join_consumer(left)?;
+			reject_undecomposable_aggregate_in_join_consumer(right)
+		}
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. }
+		// ADR 255: a recursive CTE runs as one self-contained local task; its body is invisible to
+		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
+		| ExecutionPlan::RecursiveCte { .. }
+		| ExecutionPlan::RecursiveRef { .. } => Ok(()),
+	}
 }
 
 fn runtime_filter_join_eligible(join: &JoinBoundary) -> bool {
@@ -2128,6 +2190,129 @@ mod tests {
 	}
 
 	#[test]
+	fn adr531_scalar_aggregate_above_hash_join_consumer_rejects_loudly() {
+		// A global aggregate above a fragmented join would execute once per partition and
+		// hand the coordinator partials to concatenate. The valid shape is the binder's
+		// gather funnel; a plan without it must fail typed, not diverge.
+		let plan = scalar_aggregate_plan(join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		));
+
+		assert_eq!(
+			fragment_plan(plan, config())
+				.expect_err("a scalar aggregate must never ride a partitioned join consumer"),
+			FragmentError::JoinConsumerAggregateNotDecomposable { group_key_count: 0 }
+		);
+	}
+
+	#[test]
+	fn adr531_uncovered_group_keys_above_hash_join_consumer_reject_loudly() {
+		// Group keys that are not covered by the join's partition keys split each group
+		// across partitions; per-partition aggregation would emit duplicate group rows.
+		let mut builder = BoundExprProgramBuilder::new();
+		let uncovered = builder.append_column(ResolvedColumn {
+			name: ColumnName("value".to_string()),
+			ordinal: ColumnOrdinal(2),
+			data_type: DataType::Int32,
+			nullable: false,
+			pbc_eligible: true,
+		});
+		builder.push_root(uncovered);
+		let plan = ExecutionPlan::Aggregate {
+			input: Box::new(join_plan(
+				exchanged_scan(TableId(1), 2),
+				exchanged_scan(TableId(2), 2),
+				JoinStrategy::HashPartitioned,
+			)),
+			group_expr: builder.build(),
+			aggr_expr: vec![BoundAggregateCall {
+				function: AggregateFunction::CountAll,
+				args: BoundExprProgram::empty(),
+			}],
+			output_schema: Arc::new(Schema::new(vec![
+				Field::new("value", DataType::Int32, false),
+				Field::new("count", DataType::Int64, false),
+			])),
+		};
+
+		assert_eq!(
+			fragment_plan(plan, config())
+				.expect_err("uncovered group keys must never ride a partitioned join consumer"),
+			FragmentError::JoinConsumerAggregateNotDecomposable { group_key_count: 1 }
+		);
+	}
+
+	#[test]
+	fn adr531_covered_group_keys_above_hash_join_consumer_still_fragment() {
+		// The redundant-exchange collapse legitimately leaves an aggregate directly on a
+		// join when the group keys are the join keys — equal groups are co-located, so the
+		// backstop must accept exactly what that collapse emits.
+		let plan = final_aggregate_plan(join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		));
+
+		let stages = fragment_plan(plan, config()).expect("covered group keys fragment");
+		assert_eq!(stages.len(), 3);
+		assert!(matches!(
+			stages[2].tasks[0].spec.plan,
+			ExecutionPlan::Aggregate { .. }
+		));
+	}
+
+	#[test]
+	fn adr531_gathered_global_aggregate_over_join_fragments_to_single_task_terminal_stage() {
+		// The binder's gather funnel peels as a leading exchange: the join fragments as a
+		// producer below it and the global aggregate lands in a one-task terminal stage.
+		let plan = scalar_aggregate_plan(ExecutionPlan::Exchange {
+			input: Box::new(join_plan(
+				exchanged_scan(TableId(1), 2),
+				exchanged_scan(TableId(2), 2),
+				JoinStrategy::HashPartitioned,
+			)),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		});
+
+		let stages = fragment_plan(plan, config()).expect("fragment gathered global aggregate");
+		let terminal = stages.last().expect("terminal stage");
+		assert_eq!(
+			stages.len(),
+			4,
+			"two producers, join stage, aggregate stage"
+		);
+		assert_eq!(terminal.tasks.len(), 1, "the gather funnels to one task");
+		assert!(matches!(
+			terminal.tasks[0].spec.plan,
+			ExecutionPlan::Aggregate { .. }
+		));
+		assert!(matches!(
+			terminal.tasks[0].spec.output,
+			TaskOutputBinding::FinalResult
+		));
+	}
+
+	#[test]
+	fn adr531_scalar_aggregate_above_broadcast_join_consumer_rejects_loudly() {
+		// The broadcast probe is scan-shared across workers, so no aggregate above it can
+		// prove co-location; the same backstop guards this path.
+		let plan = scalar_aggregate_plan(join_plan(
+			exchanged_scan(TableId(1), 1),
+			scan_plan_with_table(TableId(2), 2),
+			JoinStrategy::Broadcast,
+		));
+
+		assert_eq!(
+			fragment_plan(plan, config().with_worker_count(3))
+				.expect_err("a scalar aggregate must never ride a broadcast join consumer"),
+			FragmentError::JoinConsumerAggregateNotDecomposable { group_key_count: 0 }
+		);
+	}
+
+	#[test]
 	fn hash_join_runtime_filter_disabled_preserves_parallel_producers() {
 		let plan = join_plan(
 			exchanged_scan(TableId(1), 2),
@@ -2565,6 +2750,22 @@ mod tests {
 				Field::new("key", DataType::Int32, false),
 				Field::new("count", DataType::Int64, false),
 			])),
+		}
+	}
+
+	fn scalar_aggregate_plan(input: ExecutionPlan) -> ExecutionPlan {
+		ExecutionPlan::Aggregate {
+			input: Box::new(input),
+			group_expr: BoundExprProgram::empty(),
+			aggr_expr: vec![BoundAggregateCall {
+				function: AggregateFunction::CountAll,
+				args: BoundExprProgram::empty(),
+			}],
+			output_schema: Arc::new(Schema::new(vec![Field::new(
+				"count",
+				DataType::Int64,
+				false,
+			)])),
 		}
 	}
 
