@@ -70,3 +70,62 @@ remains in force pending q11 (ADR 532).
 ## Repository gates
 
 As step 4; the battery repeats after any code change made in response.
+
+## Implementation receipt — 2026-08-01
+
+Sealed at `7359fd18` (first Toron engine cut in the ket tree; the frozen nilket board carried
+over unchanged).
+
+- **Step 1 (binder gather)** — `prepare_aggregate_input_exchange`
+  (`binder/aggregate_exchange.rs`) composes the redundant-exchange collapse with the new
+  gather pass: distributed posture + empty group keys + no `SinglePartition` proof → wrap the
+  fold input in `Exchange { partition_count: 1, key: empty }`. `bind_bound_aggregate` is the
+  sole `ExecutionPlan::Aggregate` constructor, so the funnel cannot be bypassed. The skip arm
+  reuses `aggregate_partition_decomposable` (empty group program ⇒ decomposable iff
+  single-partition proof). Local posture untouched by construction; pinned by
+  `adr531_local_posture_leaves_global_aggregate_shape_untouched`.
+- **Step 2 (fragmenter backstop)** — `FragmentError::JoinConsumerAggregateNotDecomposable
+  { group_key_count }` raised by `reject_undecomposable_aggregate_in_join_consumer` in both
+  join fragmenters; shares the binder predicate so it accepts exactly what the collapse emits
+  (covered-group-keys guardrail test). Census slug
+  `fragment_join_consumer_aggregate_not_decomposable` added under compile force.
+- **Step 3 (end-to-end)** — `adr531_global_aggregate_over_join_gathers_across_producers`:
+  two worker processes, SUM=306/COUNT=3 in one row, cross-producer value-discriminating.
+  Probe-verified discriminating: with the gather edited out, the same query fails on the
+  typed backstop ("0 group key roots"), not silently divergent.
+- **Engaged defect fixed in-scope** — the gather over count-only inputs exposed that
+  exchange repartitioning could not build zero-column routed batches;
+  `repartition_exchange_batch_profiled` now uses `RecordBatchOptions::with_row_count`
+  (`exec/aggregate.rs`), the existing `storage.rs` idiom.
+- **Re-pinned distributed-posture shapes** (the pre-531 contracts this ADR deliberately
+  changes): `scalar_aggregate_having_only_fragments_to_gathered_terminal_fold` (1 → 2
+  stages), `scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain` (2 → 3
+  stages), and the two ordered-scalar worker-fanout pins (4-worker pool now selects 3
+  unique workers — scan producer, fold, sort).
+- **Battery** — both fmt checks; `--all-targets` checks for toron, toron-tpch,
+  toron-client; toron lib 1473; FULL `architecture_test` 2095 (binder root kept ≤ 6,275 by
+  moving the pass composition into `aggregate_exchange.rs`, no bound bump); complete
+  `--no-fail-fast` exit 0 (46 suites); full toron-tpch; `git diff --check`. All green at the
+  sealed identity.
+
+## Census re-check receipt — 2026-08-01
+
+Release binary at the clean sealed identity (`build_commit=7359fd18abd4`, no dirty flag),
+strict sf=8 persisted Parquet regenerated in the ket tree (full-hash verification), join-spill
+scratch cleared, ADR 529 envelope verbatim (`W=4`, `memory_per_task=536,870,912 B`,
+`max_in_flight_tasks=4`, `tcp_loopback`, `in_memory` store). Artifacts:
+`target/tpch/adr531_execution_census_7359fd18/execution_census.jsonl` and
+`target/tpch/adr531_fragment_census_7359fd18/fragment_census.jsonl`.
+
+| query | classification | local rows | distributed rows | digest | schema | stage widths |
+|---|---|---:|---:|---|---|---|
+| q17 | executes_identical | 1 | 1 | equal | equal | 1,1,4,1 |
+
+The q17 cell left `executes_divergent` (ADR 529: 1 local row vs 4 concatenated partials) for
+`executes_identical` — the predeclared expected outcome. Byte-identical Arrow IPC digests and
+schema fingerprints (`fnv1a64:593a01f287d0e7d8`) on one attempt, zero transport retries. The
+fragment census q17 shape gained the predicted single-task terminal fold stage
+(3 stages `1,1,4` → 4 stages `1,1,4,1`, still `fragments_parallel`). Elapsed is diagnostic
+only (distributed 3,754 ms vs local 4,513 ms); no timing authority is created and the 529
+timing block stands pending q11 (constant-key HAVING-scalar class — its ADR number moves past
+532, which the local-deployment-profile cut took during the freeze).
