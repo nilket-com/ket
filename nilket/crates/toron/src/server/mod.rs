@@ -82,6 +82,13 @@ struct WorkerTaskAuditRecorder<'a> {
 	terminal_recorded: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerConnectionPhase {
+	AwaitingFirstEnvelope,
+	ActiveExchange,
+	BetweenCompletedExchanges,
+}
+
 #[derive(Default)]
 struct ShuffleInputTelemetry {
 	pulled_shuffle_bytes: u64,
@@ -636,14 +643,14 @@ impl ToronWorker {
 	where
 		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 	{
+		let mut phase = WorkerConnectionPhase::AwaitingFirstEnvelope;
 		'connection: loop {
-			let envelope = match read_envelope(&mut stream, self.memory.as_ref()).await {
-				Ok(envelope) => envelope,
-				Err(QueryError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-					break;
-				}
-				Err(error) => return Err(error),
-			};
+			let envelope =
+				match read_worker_envelope(&mut stream, self.memory.as_ref(), phase).await? {
+					Some(envelope) => envelope,
+					None => break,
+				};
+			phase = WorkerConnectionPhase::ActiveExchange;
 			envelope
 				.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
 
@@ -670,14 +677,19 @@ impl ToronWorker {
 								audit_unavailable_task_error()
 							}
 						};
-						send_task_failed(&mut stream, identity, error).await?;
+						send_task_failed(&mut stream, &mut phase, identity, error).await?;
 						continue 'connection;
 					}
 
 					if let Err(error) = audit_recorder.record_started().await {
 						tracing::warn!(error = %error, "required worker start audit unavailable");
-						send_task_failed(&mut stream, identity, audit_unavailable_task_error())
-							.await?;
+						send_task_failed(
+							&mut stream,
+							&mut phase,
+							identity,
+							audit_unavailable_task_error(),
+						)
+						.await?;
 						continue 'connection;
 					}
 					if let Err(error) = send_payload(
@@ -734,7 +746,8 @@ impl ToronWorker {
 											audit_unavailable_task_error()
 										}
 									};
-									send_task_failed(&mut stream, identity, error).await?;
+									send_task_failed(&mut stream, &mut phase, identity, error)
+										.await?;
 									continue 'connection;
 								}
 								let stream_seq = StreamSeq::new(
@@ -755,7 +768,8 @@ impl ToronWorker {
 												audit_unavailable_task_error()
 											}
 										};
-										send_task_failed(&mut stream, identity, error).await?;
+										send_task_failed(&mut stream, &mut phase, identity, error)
+											.await?;
 										continue 'connection;
 									}
 								};
@@ -787,10 +801,6 @@ impl ToronWorker {
 									.batch_send_micros
 									.saturating_add(duration_micros(batch_send_started));
 							}
-							if active_task.signal.is_cancelled() {
-								continue 'connection;
-							}
-
 							let publish_started = Instant::now();
 							if active_task.signal.is_cancelled() {
 								self.partition_store.cancel_query(identity.query_id);
@@ -801,7 +811,7 @@ impl ToronWorker {
 										audit_unavailable_task_error()
 									}
 								};
-								send_task_failed(&mut stream, identity, error).await?;
+								send_task_failed(&mut stream, &mut phase, identity, error).await?;
 								continue 'connection;
 							}
 							let published_output = if let Some(output) = report.output.take() {
@@ -820,7 +830,8 @@ impl ToronWorker {
 												audit_unavailable_task_error()
 											}
 										};
-										send_task_failed(&mut stream, identity, error).await?;
+										send_task_failed(&mut stream, &mut phase, identity, error)
+											.await?;
 										continue 'connection;
 									}
 									report.telemetry.phases.output_publish_micros =
@@ -838,14 +849,16 @@ impl ToronWorker {
 										tracing::warn!(error = %error, "required worker completion audit unavailable");
 										send_task_failed(
 											&mut stream,
+											&mut phase,
 											identity,
 											audit_unavailable_task_error(),
 										)
 										.await?;
 										continue 'connection;
 									}
-									if let Err(error) = send_payload(
+									if let Err(error) = send_terminal_payload(
 										&mut stream,
+										&mut phase,
 										MessageKind::TaskComplete,
 										EnvelopeIdentity::task(identity),
 										None,
@@ -869,8 +882,15 @@ impl ToronWorker {
 											audit_unavailable_task_error()
 										}
 									};
-									send_task_failed(&mut stream, identity, error).await?;
+									send_task_failed(&mut stream, &mut phase, identity, error)
+										.await?;
 								}
+							}
+							if phase != WorkerConnectionPhase::BetweenCompletedExchanges {
+								return Err(QueryError::Internal {
+									message: "worker request ended without a terminal response"
+										.to_string(),
+								});
 							}
 						}
 						Err(error) => {
@@ -895,7 +915,7 @@ impl ToronWorker {
 										audit_unavailable_task_error()
 									}
 								};
-								send_task_failed(&mut stream, identity, error).await?;
+								send_task_failed(&mut stream, &mut phase, identity, error).await?;
 								continue 'connection;
 							} else {
 								let error = match audit_recorder.record_failed(&error).await {
@@ -905,7 +925,7 @@ impl ToronWorker {
 										audit_unavailable_task_error()
 									}
 								};
-								send_task_failed(&mut stream, identity, error).await?;
+								send_task_failed(&mut stream, &mut phase, identity, error).await?;
 								continue 'connection;
 							}
 						}
@@ -922,8 +942,9 @@ impl ToronWorker {
 					}
 					self.active_tasks.cancel(identity);
 					self.partition_store.cancel_query(identity.query_id);
-					send_payload(
+					send_terminal_payload(
 						&mut stream,
+						&mut phase,
 						MessageKind::TaskCancelled,
 						EnvelopeIdentity::task(identity),
 						None,
@@ -944,8 +965,9 @@ impl ToronWorker {
 						.pull(payload.address, payload.expected_attempt)
 					{
 						Ok(partition) => {
-							send_payload(
+							send_terminal_payload(
 								&mut stream,
+								&mut phase,
 								MessageKind::PartitionData,
 								EnvelopeIdentity::partition(partition.address),
 								Some(StreamSeq::new(0)),
@@ -958,8 +980,9 @@ impl ToronWorker {
 							.await?;
 						}
 						Err(reason) => {
-							send_payload(
+							send_terminal_payload(
 								&mut stream,
+								&mut phase,
 								MessageKind::PartitionMissing,
 								EnvelopeIdentity::partition(payload.address),
 								None,
@@ -1444,6 +1467,8 @@ mod tests {
 		BoundExprProgram, BroadcastReplayEligibility, ColumnOrdinal, JoinKind, JoinReplayId,
 		QueryProfileHint,
 	};
+	use crate::quic::QuicEndpoint;
+	use crate::server::transport::QuicTransport;
 	use crate::storage::InMemoryStorageScan;
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -2279,6 +2304,325 @@ mod tests {
 	struct BlockingStorageScan {
 		started: Arc<AtomicBool>,
 		notify: Arc<Notify>,
+	}
+
+	struct CancelledStorageScan;
+
+	#[async_trait::async_trait]
+	impl StorageScan for CancelledStorageScan {
+		async fn scan(&self, _request: ScanRequest) -> Result<ScanStream, StorageError> {
+			Err(StorageError::Cancelled)
+		}
+	}
+
+	fn final_result_task_spec(seed: u128) -> TaskSpec {
+		TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(seed),
+				StageId::new(0),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		}
+	}
+
+	async fn spawn_one_quic_worker(
+		endpoint: QuicEndpoint,
+		worker: Arc<ToronWorker>,
+	) -> Result<(), QueryError> {
+		let connection = endpoint.accept_connection().await?;
+		let stream = QuicEndpoint::accept_stream_on(&connection).await?;
+		worker.handle_connection(stream).await
+	}
+
+	struct ShutdownFails;
+
+	impl tokio::io::AsyncWrite for ShutdownFails {
+		fn poll_write(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+			buf: &[u8],
+		) -> std::task::Poll<std::io::Result<usize>> {
+			std::task::Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::task::Poll::Ready(Ok(()))
+		}
+
+		fn poll_shutdown(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::task::Poll::Ready(Err(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"injected shutdown failure",
+			)))
+		}
+	}
+
+	#[tokio::test]
+	async fn terminal_application_error_outranks_shutdown_failure() {
+		let application_error = QueryError::Runtime(RuntimeError::TaskFailure {
+			kind: TaskFailureKind::Cancelled,
+		});
+		let observed =
+			finish_terminal_exchange::<_, ()>(&mut ShutdownFails, Err(application_error))
+				.await
+				.expect_err("application failure remains primary");
+		assert!(matches!(
+			observed,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::Cancelled
+			})
+		));
+
+		let close_error = finish_terminal_exchange(&mut ShutdownFails, Ok(()))
+			.await
+			.expect_err("successful exchange reports close failure");
+		assert!(matches!(
+			close_error,
+			QueryError::Io(ref error) if error.kind() == std::io::ErrorKind::BrokenPipe
+		));
+	}
+
+	#[tokio::test]
+	async fn quic_worker_task_completion_closes_cleanly() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch =
+			RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
+				.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(533),
+			WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let endpoint =
+			QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap()).expect("bind QUIC worker");
+		let address = endpoint.local_addr().expect("worker address");
+		let server_endpoint = endpoint.clone();
+		let worker_handle =
+			tokio::spawn(spawn_one_quic_worker(server_endpoint, Arc::clone(&worker)));
+
+		let transport = QuicTransport::new().expect("QUIC transport");
+		let stream = transport
+			.connect(address.to_string().as_str())
+			.await
+			.expect("connect worker");
+		let completion = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(stream, final_result_task_spec(533))
+			.await
+			.expect("task completion");
+		assert_eq!(
+			completion
+				.0
+				.iter()
+				.map(RecordBatch::num_rows)
+				.sum::<usize>(),
+			3
+		);
+		tokio::time::timeout(Duration::from_secs(2), worker_handle)
+			.await
+			.expect("worker teardown timeout")
+			.expect("worker join")
+			.expect("worker clean teardown");
+		endpoint.close();
+	}
+
+	#[tokio::test]
+	async fn quic_worker_task_failure_closes_cleanly() {
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(CancelledStorageScan),
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(538),
+			WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let endpoint =
+			QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap()).expect("bind QUIC worker");
+		let address = endpoint.local_addr().expect("worker address");
+		let server_endpoint = endpoint.clone();
+		let worker_handle =
+			tokio::spawn(spawn_one_quic_worker(server_endpoint, Arc::clone(&worker)));
+		let transport = QuicTransport::new().expect("QUIC transport");
+		let stream = transport
+			.connect(address.to_string().as_str())
+			.await
+			.expect("connect worker");
+		let error = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(stream, final_result_task_spec(538))
+			.await
+			.expect_err("cancelled storage produces TaskFailed");
+		assert!(matches!(
+			error,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::Cancelled
+			})
+		));
+		tokio::time::timeout(Duration::from_secs(2), worker_handle)
+			.await
+			.expect("worker teardown timeout")
+			.expect("worker join")
+			.expect("worker clean teardown");
+		endpoint.close();
+	}
+
+	#[tokio::test]
+	async fn quic_worker_only_accepts_connection_loss_between_completed_exchanges() {
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: empty_batch,
+			}),
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(534),
+			WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let endpoint = QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap())
+			.expect("bind completed-exchange worker");
+		let address = endpoint.local_addr().expect("worker address");
+		let server_endpoint = endpoint.clone();
+		let worker_handle =
+			tokio::spawn(spawn_one_quic_worker(server_endpoint, Arc::clone(&worker)));
+		let client_endpoint = QuicEndpoint::client_loopback().expect("QUIC client");
+		let mut stream = client_endpoint
+			.connect_stream(address)
+			.await
+			.expect("connect worker");
+		let identity = final_result_task_spec(534).identity;
+		send_payload(
+			&mut stream,
+			MessageKind::CancelTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&CancelTaskPayload { identity },
+		)
+		.await
+		.expect("send cancellation");
+		let response = read_envelope(&mut stream, memory.as_ref())
+			.await
+			.expect("read terminal cancellation");
+		assert_eq!(response.kind, MessageKind::TaskCancelled);
+		client_endpoint.close();
+		drop(stream);
+		tokio::time::timeout(Duration::from_secs(2), worker_handle)
+			.await
+			.expect("completed-exchange teardown timeout")
+			.expect("completed-exchange worker join")
+			.expect("completed exchange closes cleanly");
+		endpoint.close();
+
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: empty_batch,
+			}),
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(535),
+			WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let endpoint = QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap())
+			.expect("bind active-exchange worker");
+		let address = endpoint.local_addr().expect("worker address");
+		let server_endpoint = endpoint.clone();
+		let worker_handle = tokio::spawn(spawn_one_quic_worker(server_endpoint, worker));
+		let client_endpoint = QuicEndpoint::client_loopback().expect("QUIC client");
+		let mut stream = client_endpoint
+			.connect_stream(address)
+			.await
+			.expect("connect active worker");
+		let spec = final_result_task_spec(535);
+		let identity = spec.identity;
+		let envelope = WireEnvelope::try_new(
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			None,
+			encode_payload(&StartTaskPayload { spec }),
+		)
+		.expect("encode active task");
+		let encoded = envelope.encode();
+		let frame_len = u32::try_from(encoded.len())
+			.expect("frame length")
+			.to_le_bytes();
+		stream
+			.write_all(&frame_len)
+			.await
+			.expect("write active frame length");
+		stream
+			.write_all(&encoded[..encoded.len() - 1])
+			.await
+			.expect("write partial active frame");
+		client_endpoint.close();
+		drop(stream);
+		let error = tokio::time::timeout(Duration::from_secs(2), worker_handle)
+			.await
+			.expect("active-exchange teardown timeout")
+			.expect("active-exchange worker join")
+			.expect_err("active exchange loss remains an error");
+		assert!(matches!(error, QueryError::Io(_)));
+		endpoint.close();
+	}
+
+	#[tokio::test]
+	async fn worker_keeps_multi_envelope_stream_open_until_client_shutdown() {
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: empty_batch,
+			}),
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(536),
+			WorkerEndpoint::new("local"),
+		));
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		for seed in [536_u128, 537] {
+			let identity = final_result_task_spec(seed).identity;
+			send_payload(
+				&mut client,
+				MessageKind::CancelTask,
+				EnvelopeIdentity::task(identity),
+				None,
+				&CancelTaskPayload { identity },
+			)
+			.await
+			.expect("send cancellation");
+			let response = read_envelope(&mut client, memory.as_ref())
+				.await
+				.expect("read cancellation response");
+			assert_eq!(response.kind, MessageKind::TaskCancelled);
+		}
+		client.shutdown().await.expect("close reusable stream");
+		worker_handle
+			.await
+			.expect("worker join")
+			.expect("worker clean teardown");
 	}
 
 	#[async_trait::async_trait]
@@ -4233,7 +4577,7 @@ impl ToronCoordinator {
 
 		let mut results = Vec::new();
 		let mut batch_decode_micros = 0u64;
-		let (output, telemetry) = loop {
+		let terminal_result = loop {
 			let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
 			response
 				.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
@@ -4284,11 +4628,11 @@ impl ToronCoordinator {
 						.phases
 						.batch_decode_micros
 						.saturating_add(batch_decode_micros);
-					break (payload.output, telemetry);
+					break Ok((payload.output, telemetry));
 				}
 				MessageKind::TaskFailed => {
 					let payload: TaskFailedPayload = decode_payload(&response.payload)?;
-					return Err(QueryError::Runtime(RuntimeError::TaskFailure {
+					break Err(QueryError::Runtime(RuntimeError::TaskFailure {
 						kind: payload.kind,
 					}));
 				}
@@ -4299,6 +4643,7 @@ impl ToronCoordinator {
 				}
 			}
 		};
+		let (output, telemetry) = finish_terminal_exchange(&mut stream, terminal_result).await?;
 
 		Ok(RemoteTaskCompletion {
 			batches: results,
@@ -4344,7 +4689,7 @@ impl ToronCoordinator {
 
 		let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
 		response.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
-		match response.kind {
+		let terminal_result = match response.kind {
 			MessageKind::PartitionData => {
 				let payload: PartitionDataPayload = decode_payload(&response.payload)?;
 				if payload.address != address {
@@ -4358,10 +4703,13 @@ impl ToronCoordinator {
 				let payload: PartitionMissingPayload = decode_payload(&response.payload)?;
 				Err(partition_missing_error(payload.reason))
 			}
-			_ => Err(QueryError::UnexpectedMessage {
-				expected: "PartitionData or PartitionMissing",
-			}),
-		}
+			_ => {
+				return Err(QueryError::UnexpectedMessage {
+					expected: "PartitionData or PartitionMissing",
+				});
+			}
+		};
+		finish_terminal_exchange(&mut stream, terminal_result).await
 	}
 
 	pub async fn cancel_task_on_worker<Stream>(
@@ -4396,7 +4744,28 @@ impl ToronCoordinator {
 			});
 		}
 
-		Ok(())
+		finish_terminal_exchange(&mut stream, Ok(())).await
+	}
+}
+
+async fn finish_terminal_exchange<Stream, Output>(
+	stream: &mut Stream,
+	terminal_result: Result<Output, QueryError>,
+) -> Result<Output, QueryError>
+where
+	Stream: tokio::io::AsyncWrite + Unpin,
+{
+	match terminal_result {
+		Ok(output) => {
+			stream.shutdown().await?;
+			Ok(output)
+		}
+		Err(error) => {
+			// The peer's terminal application error is the request result. A
+			// secondary close failure cannot replace it with transport noise.
+			let _ = stream.shutdown().await;
+			Err(error)
+		}
 	}
 }
 
@@ -4416,6 +4785,39 @@ where
 	stream.read_exact(msg_buf.as_mut_vec()).await?;
 
 	Ok(WireEnvelope::decode(&msg_buf)?)
+}
+
+async fn read_worker_envelope<Stream>(
+	stream: &mut Stream,
+	memory: &MemoryManager,
+	phase: WorkerConnectionPhase,
+) -> Result<Option<WireEnvelope>, QueryError>
+where
+	Stream: tokio::io::AsyncRead + Unpin,
+{
+	let mut len_buf = [0u8; 4];
+	match stream.read(&mut len_buf[..1]).await {
+		Ok(0) => return Ok(None),
+		Ok(_) => {}
+		Err(error)
+			if phase == WorkerConnectionPhase::BetweenCompletedExchanges
+				&& error.kind() == std::io::ErrorKind::NotConnected =>
+		{
+			// Quinn maps a connection disappearing after its final response to
+			// NotConnected. At this exact protocol boundary no work is active;
+			// the same error before a terminal response remains a failure.
+			return Ok(None);
+		}
+		Err(error) => return Err(error.into()),
+	}
+	stream.read_exact(&mut len_buf[1..]).await?;
+	let len = usize::try_from(u32::from_le_bytes(len_buf)).expect("u32 frame length fits usize");
+
+	let mut msg_buf = memory.acquire_at_least(len);
+	msg_buf.as_mut_vec().resize(len, 0);
+	stream.read_exact(msg_buf.as_mut_vec()).await?;
+
+	Ok(Some(WireEnvelope::decode(&msg_buf)?))
 }
 
 async fn send_payload<Stream, Payload>(
@@ -4454,6 +4856,7 @@ where
 
 async fn send_task_failed<Stream>(
 	stream: &mut Stream,
+	phase: &mut WorkerConnectionPhase,
 	identity: TaskIdentity,
 	error: QueryError,
 ) -> Result<(), QueryError>
@@ -4494,14 +4897,32 @@ where
 			reason: error.to_string(),
 		},
 	};
-	send_payload(
+	send_terminal_payload(
 		stream,
+		phase,
 		MessageKind::TaskFailed,
 		EnvelopeIdentity::task(identity),
 		None,
 		&TaskFailedPayload::new_worker_emitted(identity, kind).expect("kind is worker-emittable"),
 	)
 	.await
+}
+
+async fn send_terminal_payload<Stream, Payload>(
+	stream: &mut Stream,
+	phase: &mut WorkerConnectionPhase,
+	kind: MessageKind,
+	identity: EnvelopeIdentity,
+	stream_seq: Option<StreamSeq>,
+	payload: &Payload,
+) -> Result<(), QueryError>
+where
+	Stream: tokio::io::AsyncWrite + Unpin,
+	Payload: serde::Serialize,
+{
+	send_payload(stream, kind, identity, stream_seq, payload).await?;
+	*phase = WorkerConnectionPhase::BetweenCompletedExchanges;
+	Ok(())
 }
 
 fn cancelled_task_error() -> QueryError {

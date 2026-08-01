@@ -327,7 +327,7 @@ pub(crate) fn adr059_cancel_before_start_task_tombstones_and_aborts_on_registrat
 	assert!(server.contains("if active_task.cancelled_before_start"));
 	assert!(server.contains("record_cancelled().await"));
 	assert!(server.contains("cancelled_task_error()"));
-	assert!(server.contains("send_task_failed(&mut stream, identity, error).await?"));
+	assert!(server.contains("send_task_failed(&mut stream, &mut phase, identity, error).await?"));
 	assert!(server.contains("cancel_task_before_registration_tombstones_and_prevents_execution"));
 }
 

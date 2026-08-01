@@ -211,6 +211,11 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 		.lines()
 		.filter_map(|line| line.get(3..))
 		.map(|path| path.split(" -> ").last().unwrap_or(path))
+		// PRODUCT-0001 grafted the Toron workspace under `nilket/` without
+		// rewriting its history. Git reports paths from the unified repository
+		// root, while this ADR-176 allowlist intentionally retains Toron's
+		// original workspace-relative vocabulary.
+		.map(|path| path.strip_prefix("nilket/").unwrap_or(path))
 		.filter(|path| {
 			let later_adr_test_and_runtime_surfaces = [
 				"crates/toron/benches/distributed_inner_equi_join.rs",
