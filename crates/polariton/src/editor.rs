@@ -2237,11 +2237,7 @@ fn pane_title(pane: &libaryon::uast::projection::PaneViewport) -> &str {
 }
 
 fn tab_label(tab: &libaryon::uast::projection::DocTabSummary) -> String {
-	format!(
-		"{}{}",
-		tab.title,
-		if tab.is_dirty { " +" } else { "" }
-	)
+	format!("{}{}", tab.title, if tab.is_dirty { " +" } else { "" })
 }
 
 fn tab_button_style(
@@ -2492,7 +2488,12 @@ fn uast_graph_layout(
 	if snapshot.nodes.is_empty() {
 		return HashMap::new();
 	}
-	let min_depth = snapshot.nodes.iter().map(|node| node.depth).min().unwrap_or(0);
+	let min_depth = snapshot
+		.nodes
+		.iter()
+		.map(|node| node.depth)
+		.min()
+		.unwrap_or(0);
 	let max_depth = snapshot
 		.nodes
 		.iter()
@@ -2611,12 +2612,11 @@ impl canvas::Program<EditorMsg> for UastGraphWidget<'_> {
 		};
 		let position = cursor.position_in(bounds)?;
 		let layout = uast_graph_layout(self.snapshot, bounds.size());
-		let node = self
-			.snapshot
-			.nodes
-			.iter()
-			.rev()
-			.find(|node| layout.get(&node.id).is_some_and(|rect| rect.contains(position)))?;
+		let node = self.snapshot.nodes.iter().rev().find(|node| {
+			layout
+				.get(&node.id)
+				.is_some_and(|rect| rect.contains(position))
+		})?;
 		Some(
 			canvas::Action::publish(EditorMsg::UastGraphNode {
 				inspector_view_id: self.inspector_view_id,

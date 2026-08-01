@@ -506,7 +506,6 @@ impl LineIndex {
 		};
 		&bytes[start..trimmed_end]
 	}
-
 }
 
 fn extract_nodes_with_coords(
@@ -1251,14 +1250,14 @@ fn range_is_all_whitespace(bytes: &[u8], index: &LineIndex, range: (DocLine, Doc
 
 fn promote_exact_semantic_moves(blocks: &mut Vec<DiffBlock>, candidates: &[DiffBlock]) {
 	for candidate in candidates {
-		let Some(removed) = blocks.iter().position(|block| {
-			block.kind == DiffKind::Removed && block.range == candidate.range
-		}) else {
+		let Some(removed) = blocks
+			.iter()
+			.position(|block| block.kind == DiffKind::Removed && block.range == candidate.range)
+		else {
 			continue;
 		};
 		let Some(added) = blocks.iter().position(|block| {
-			block.kind == DiffKind::Added
-				&& block.partner_range == candidate.partner_range
+			block.kind == DiffKind::Added && block.partner_range == candidate.partner_range
 		}) else {
 			continue;
 		};

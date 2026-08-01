@@ -21,9 +21,9 @@ impl InputRuntime {
 		if self.context.is_picker {
 			let pasted = sanitized_prompt_paste(&data);
 			if !pasted.is_empty() {
-				self.send_command(EditorCommand::Picker(
-					crate::engine::PickerAction::Insert(pasted),
-				));
+				self.send_command(EditorCommand::Picker(crate::engine::PickerAction::Insert(
+					pasted,
+				)));
 				self.needs_render = true;
 			}
 			return;
@@ -456,11 +456,7 @@ pub(crate) fn delete_at_prompt_cursor(buffer: &mut String, cursor: &mut usize) {
 	*cursor = deletion;
 }
 
-pub(crate) fn move_prompt_cursor(
-	buffer: &str,
-	cursor: &mut usize,
-	movement: PromptCursorMovement,
-) {
+pub(crate) fn move_prompt_cursor(buffer: &str, cursor: &mut usize, movement: PromptCursorMovement) {
 	let current = clamped_prompt_cursor(buffer, *cursor);
 	*cursor = match movement {
 		PromptCursorMovement::Left => previous_char_boundary(buffer, current).unwrap_or(current),

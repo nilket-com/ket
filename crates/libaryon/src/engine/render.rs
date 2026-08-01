@@ -30,8 +30,8 @@ use crate::svp::SvpResolver;
 use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
 use crate::uast::projection::{
-	GutterLineNumber, HostPanelViewport, PaneDividerViewport, PickerResultViewport,
-	PickerViewport, ProjectedCaret,
+	GutterLineNumber, HostPanelViewport, PaneDividerViewport, PickerResultViewport, PickerViewport,
+	ProjectedCaret,
 };
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -1678,10 +1678,10 @@ mod tests {
 		take_capacity_warning, viewport_is_busy,
 	};
 	use crate::core::{BufferId, DocByte, DocLine};
-	use crate::engine::language::AnalysisDepth;
-	use crate::engine::session::SnapshotProvenance;
 	use crate::engine::GutterNumbering;
 	use crate::engine::folding::FoldSet;
+	use crate::engine::language::AnalysisDepth;
+	use crate::engine::session::SnapshotProvenance;
 	use crate::engine::test_support::build_foldable_document;
 	use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 	use std::collections::HashMap;

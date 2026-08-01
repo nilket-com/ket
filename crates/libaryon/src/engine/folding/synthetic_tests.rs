@@ -444,10 +444,7 @@ fn materialize_fold_boundary_uses_real_projection_trait_impl_methods() {
 			"\tfn query_viewport<F: FoldPolicy + ?Sized>(",
 		),
 		(
-			doc_line_of(
-				text,
-				"if let Some(child) = (*self.edges[index].get())",
-			),
+			doc_line_of(text, "if let Some(child) = (*self.edges[index].get())"),
 			DocDisplayCol::new(4),
 			"\tfn get_next_node_in_walk(",
 		),

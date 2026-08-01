@@ -344,12 +344,8 @@ impl InputRuntime {
 		let action = match (code, control_only) {
 			(KeyCode::Esc, _) => Some(PickerAction::Cancel),
 			(KeyCode::Enter, _) => Some(PickerAction::Accept),
-			(KeyCode::Up, _) | (KeyCode::Char('p'), true) => {
-				Some(PickerAction::MoveSelection(-1))
-			}
-			(KeyCode::Down, _) | (KeyCode::Char('n'), true) => {
-				Some(PickerAction::MoveSelection(1))
-			}
+			(KeyCode::Up, _) | (KeyCode::Char('p'), true) => Some(PickerAction::MoveSelection(-1)),
+			(KeyCode::Down, _) | (KeyCode::Char('n'), true) => Some(PickerAction::MoveSelection(1)),
 			(KeyCode::Left, _) | (KeyCode::Char('b'), true) => {
 				Some(PickerAction::MoveCursor(PickerCursorMovement::Left))
 			}
@@ -367,10 +363,8 @@ impl InputRuntime {
 			(KeyCode::Char(ch), false)
 				if !modifiers.intersects(
 					Modifiers::CONTROL
-						| Modifiers::ALT
-						| Modifiers::SUPER
-						| Modifiers::HYPER
-						| Modifiers::META,
+						| Modifiers::ALT | Modifiers::SUPER
+						| Modifiers::HYPER | Modifiers::META,
 				) =>
 			{
 				Some(PickerAction::Insert(ch.to_string()))

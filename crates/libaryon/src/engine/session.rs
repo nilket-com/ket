@@ -3959,15 +3959,13 @@ impl EditorSession {
 				document.pending_root_transition.take().is_none(),
 				"root transition recorded without replacing the root"
 			);
-			document
-				.uast_accounting
-				.record_transaction(
-					allocated_delta,
-					ordinary_retired_delta,
-					payload_added_delta,
-					payload_physically_removed_delta,
-					ordinary_orphaned_payload,
-				);
+			document.uast_accounting.record_transaction(
+				allocated_delta,
+				ordinary_retired_delta,
+				payload_added_delta,
+				payload_physically_removed_delta,
+				ordinary_orphaned_payload,
+			);
 		}
 		let state_after = document.ledger.current_state_id;
 		let topology_after = document.topology_rev;
@@ -4425,15 +4423,13 @@ impl EditorSession {
 		let old_view_state = attached_view_ids
 			.into_iter()
 			.filter_map(|view_id| {
-				self.layout
-					.find_view(view_id)
-					.map(|view| {
-						let cursor = match &view.content {
-							ViewContent::Text(text) => Some(text.cursor.primary().byte()),
-							_ => None,
-						};
-						(view_id, view.common().scroll_y, cursor)
-					})
+				self.layout.find_view(view_id).map(|view| {
+					let cursor = match &view.content {
+						ViewContent::Text(text) => Some(text.cursor.primary().byte()),
+						_ => None,
+					};
+					(view_id, view.common().scroll_y, cursor)
+				})
 			})
 			.collect::<Vec<_>>();
 		let document = self
@@ -4889,7 +4885,6 @@ mod tests {
 		ViewId,
 	};
 	use crate::ecs::UastRegistry;
-	use crate::uast::UastMutation;
 	use crate::engine::event_bus::EngineEvent;
 	use crate::engine::event_subscribers::BaselineBuilder;
 	use crate::engine::file_browser::{create_file_browser_buffer, initialize_file_browser};
@@ -4899,6 +4894,7 @@ mod tests {
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
 	use crate::engine::{HostPanelDescriptor, HostPanelId};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
+	use crate::uast::UastMutation;
 	use std::collections::BTreeMap;
 	use std::ffi::OsString;
 	use std::path::PathBuf;
@@ -5419,8 +5415,7 @@ mod tests {
 					.uast_accounting
 					.current_live_nodes
 					.saturating_sub(1);
-				let retired_payload =
-					editor.document.uast_accounting.current_live_payload_bytes;
+				let retired_payload = editor.document.uast_accounting.current_live_payload_bytes;
 				let graft = crate::engine::structural_graft::apply_graft_tracked(
 					&registry,
 					editor.document.root_id,
@@ -5455,10 +5450,8 @@ mod tests {
 			"recycled publication remains an owner allocation event"
 		);
 		assert_eq!(
-			document.uast_accounting.allocated_nodes
-				- document.uast_accounting.retired_nodes,
-			document.uast_accounting.current_live_nodes
-				+ document.uast_accounting.parked_nodes,
+			document.uast_accounting.allocated_nodes - document.uast_accounting.retired_nodes,
+			document.uast_accounting.current_live_nodes + document.uast_accounting.parked_nodes,
 			"owner lifetime algebra must survive recycled allocation"
 		);
 		assert_eq!(
@@ -5616,10 +5609,8 @@ mod tests {
 	fn file_browser_payload_has_an_exact_synthetic_owner() {
 		let registry = UastRegistry::new(256);
 		let mut session = test_editor_session(&registry);
-		let root_path = std::env::temp_dir().join(format!(
-			"baryon-payload-browser-{}",
-			std::process::id()
-		));
+		let root_path =
+			std::env::temp_dir().join(format!("baryon-payload-browser-{}", std::process::id()));
 		std::fs::create_dir_all(&root_path).expect("browser fixture directory");
 		std::fs::write(root_path.join("owned.txt"), b"x").expect("browser fixture file");
 		let (browser, leaf) =

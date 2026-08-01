@@ -655,7 +655,9 @@ fn picker_modal_routes_text_navigation_accept_and_cancel_before_normal_input() {
 	let moved = input.dispatch_key(context, KeyCode::Left, Modifiers::NONE);
 	assert!(matches!(
 		moved.commands.as_slice(),
-		[EditorCommand::Picker(PickerAction::MoveCursor(PickerCursorMovement::Left))]
+		[EditorCommand::Picker(PickerAction::MoveCursor(
+			PickerCursorMovement::Left
+		))]
 	));
 	let accepted = input.dispatch_key(context, KeyCode::Enter, Modifiers::NONE);
 	assert!(matches!(
@@ -667,8 +669,11 @@ fn picker_modal_routes_text_navigation_accept_and_cancel_before_normal_input() {
 		cancelled.commands.as_slice(),
 		[EditorCommand::Picker(PickerAction::Cancel)]
 	));
-	let control_shift =
-		input.dispatch_key(context, KeyCode::Char('x'), Modifiers::CONTROL | Modifiers::SHIFT);
+	let control_shift = input.dispatch_key(
+		context,
+		KeyCode::Char('x'),
+		Modifiers::CONTROL | Modifiers::SHIFT,
+	);
 	assert!(control_shift.commands.is_empty());
 }
 

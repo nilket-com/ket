@@ -464,10 +464,7 @@ fn create_markdown_preview_view(
 	pinned: bool,
 ) -> View {
 	let title = if pinned {
-		source
-			.path
-			.clone()
-			.unwrap_or_else(|| "_".to_string())
+		source.path.clone().unwrap_or_else(|| "_".to_string())
 	} else {
 		preview_title(source.path.as_deref())
 	};

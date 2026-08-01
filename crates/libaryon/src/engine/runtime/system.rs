@@ -5775,8 +5775,7 @@ mod tests {
 			let focused_buffer_id = view.focused_pane().map(|pane| pane.buffer_id);
 			if let Some(document_text) = view.document_text {
 				assert_eq!(
-					view.document_text_buffer_id,
-					focused_buffer_id,
+					view.document_text_buffer_id, focused_buffer_id,
 					"document text must identify the buffer it was read from"
 				);
 				return document_text;

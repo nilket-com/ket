@@ -1727,15 +1727,13 @@ mod tests {
 		assert!(rendered.contains("`:panediff [PATH\\|REV]`"));
 		assert!(rendered.contains("`:diffstep older\\|newer\\|N`"));
 
-		let code_spans = pulldown_cmark::Parser::new_ext(
-			&rendered,
-			pulldown_cmark::Options::ENABLE_TABLES,
-		)
-		.filter_map(|event| match event {
-			pulldown_cmark::Event::Code(code) => Some(code.into_string()),
-			_ => None,
-		})
-		.collect::<HashSet<_>>();
+		let code_spans =
+			pulldown_cmark::Parser::new_ext(&rendered, pulldown_cmark::Options::ENABLE_TABLES)
+				.filter_map(|event| match event {
+					pulldown_cmark::Event::Code(code) => Some(code.into_string()),
+					_ => None,
+				})
+				.collect::<HashSet<_>>();
 		assert!(code_spans.contains(":panediff [PATH|REV]"));
 		assert!(code_spans.contains(":diffstep older|newer|N"));
 	}

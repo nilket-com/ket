@@ -249,7 +249,11 @@ pub(crate) fn parse_batch_blob(
 	let oid = fields.next().unwrap_or_default();
 	match fields.next() {
 		Some("blob") => {}
-		Some(other) => return Err(format!("the path is a {other} at that revision, not a file")),
+		Some(other) => {
+			return Err(format!(
+				"the path is a {other} at that revision, not a file"
+			));
+		}
 		None => return Err("object header is malformed".to_string()),
 	}
 	if !is_hex_oid(oid) || oid.len() != expected_oid_len {
@@ -274,10 +278,7 @@ pub(crate) fn parse_batch_blob(
 	if tail != b"\n" {
 		return Err("object record has a malformed terminator".to_string());
 	}
-	Ok((
-		oid.to_string(),
-		stdout[content_start..content_end].to_vec(),
-	))
+	Ok((oid.to_string(), stdout[content_start..content_end].to_vec()))
 }
 
 /// Reject revisions that cannot be spliced into a Git object spec.
@@ -290,9 +291,7 @@ pub(crate) fn validate_revision(revision: &str) -> Result<(), String> {
 	if revision.is_empty() {
 		return Err("the Git revision is empty".to_string());
 	}
-	if revision.starts_with('-')
-		|| revision.chars().any(|c| c.is_whitespace() || c == ':')
-	{
+	if revision.starts_with('-') || revision.chars().any(|c| c.is_whitespace() || c == ':') {
 		return Err(format!("not a valid Git revision: {revision}"));
 	}
 	Ok(())
@@ -315,11 +314,7 @@ pub(crate) fn repo_relative_path(repo_root: &Path, file: &Path) -> Option<String
 /// only for titles. The location never exists on disk, so canonicalization
 /// fails and providers fall back to their stable single-file mode instead of
 /// mapping the snapshot onto the live file's workspace identity.
-pub(crate) fn snapshot_virtual_path(
-	repo_root: &Path,
-	commit_oid: &str,
-	rel_path: &str,
-) -> String {
+pub(crate) fn snapshot_virtual_path(repo_root: &Path, commit_oid: &str, rel_path: &str) -> String {
 	repo_root
 		.join(".baryon-snapshots")
 		.join(commit_oid)
@@ -327,7 +322,6 @@ pub(crate) fn snapshot_virtual_path(
 		.to_string_lossy()
 		.into_owned()
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitStatusEntry {
@@ -853,7 +847,10 @@ mod tests {
 	fn single_oids_require_one_hex_id_and_nothing_else() {
 		let sha1 = "a".repeat(40);
 		let sha256 = "f".repeat(64);
-		assert_eq!(parse_single_oid(format!("{sha1}\n").as_bytes()).as_deref(), Some(sha1.as_str()));
+		assert_eq!(
+			parse_single_oid(format!("{sha1}\n").as_bytes()).as_deref(),
+			Some(sha1.as_str())
+		);
 		assert_eq!(
 			parse_single_oid(format!("{sha256}\n").as_bytes()).as_deref(),
 			Some(sha256.as_str())
@@ -936,7 +933,11 @@ mod tests {
 		let c = |n: u8| format!("{:0>40}", n);
 		let mut stdout = Vec::new();
 		stdout.extend(timeline_record(&c(4), "M", &["new name.txt"]));
-		stdout.extend(timeline_record(&c(3), "R097", &["tab\tname.txt", "new name.txt"]));
+		stdout.extend(timeline_record(
+			&c(3),
+			"R097",
+			&["tab\tname.txt", "new name.txt"],
+		));
 		stdout.extend(timeline_record(&c(2), "M", &["tab\tname.txt"]));
 		stdout.extend(timeline_record(&c(1), "A", &["tab\tname.txt"]));
 		let timeline = parse_file_timeline(&stdout);
@@ -946,10 +947,22 @@ mod tests {
 		assert_eq!(
 			timeline,
 			vec![
-				TimelineEntry { commit_oid: c(4), path: "new name.txt".to_string() },
-				TimelineEntry { commit_oid: c(3), path: "new name.txt".to_string() },
-				TimelineEntry { commit_oid: c(2), path: "tab\tname.txt".to_string() },
-				TimelineEntry { commit_oid: c(1), path: "tab\tname.txt".to_string() },
+				TimelineEntry {
+					commit_oid: c(4),
+					path: "new name.txt".to_string()
+				},
+				TimelineEntry {
+					commit_oid: c(3),
+					path: "new name.txt".to_string()
+				},
+				TimelineEntry {
+					commit_oid: c(2),
+					path: "tab\tname.txt".to_string()
+				},
+				TimelineEntry {
+					commit_oid: c(1),
+					path: "tab\tname.txt".to_string()
+				},
 			]
 		);
 	}
@@ -967,8 +980,14 @@ mod tests {
 		assert_eq!(
 			timeline,
 			vec![
-				TimelineEntry { commit_oid: c(3), path: "f.txt".to_string() },
-				TimelineEntry { commit_oid: c(1), path: "f.txt".to_string() },
+				TimelineEntry {
+					commit_oid: c(3),
+					path: "f.txt".to_string()
+				},
+				TimelineEntry {
+					commit_oid: c(1),
+					path: "f.txt".to_string()
+				},
 			]
 		);
 
@@ -982,7 +1001,10 @@ mod tests {
 		let timeline = parse_file_timeline(&stdout);
 		assert_eq!(
 			timeline,
-			vec![TimelineEntry { commit_oid: c(8), path: "file.rs".to_string() }]
+			vec![TimelineEntry {
+				commit_oid: c(8),
+				path: "file.rs".to_string()
+			}]
 		);
 		assert!(parse_file_timeline(b"not a timeline").is_empty());
 		assert!(parse_file_timeline(&[0xff, 0xfe]).is_empty());
@@ -1002,7 +1024,10 @@ mod tests {
 		stdout.extend_from_slice(b"parti"); // no terminating NUL
 		assert_eq!(
 			parse_file_timeline(&stdout),
-			vec![TimelineEntry { commit_oid: c(2), path: "good.txt".to_string() }]
+			vec![TimelineEntry {
+				commit_oid: c(2),
+				path: "good.txt".to_string()
+			}]
 		);
 
 		// Same for a rename cut before its destination path completes.
@@ -1016,7 +1041,10 @@ mod tests {
 		stdout.extend_from_slice(b"new-parti"); // no terminating NUL
 		assert_eq!(
 			parse_file_timeline(&stdout),
-			vec![TimelineEntry { commit_oid: c(2), path: "good.txt".to_string() }]
+			vec![TimelineEntry {
+				commit_oid: c(2),
+				path: "good.txt".to_string()
+			}]
 		);
 
 		// No NUL at all: nothing is complete.
@@ -1034,7 +1062,10 @@ mod tests {
 		let timeline = parse_file_timeline(&stdout);
 		assert_eq!(
 			timeline,
-			vec![TimelineEntry { commit_oid: c(1), path: "we\nird.txt".to_string() }]
+			vec![TimelineEntry {
+				commit_oid: c(1),
+				path: "we\nird.txt".to_string()
+			}]
 		);
 	}
 
@@ -1069,7 +1100,10 @@ mod tests {
 			repo_relative_path(root, Path::new("/repo/src/main.rs")).as_deref(),
 			Some("src/main.rs")
 		);
-		assert_eq!(repo_relative_path(root, Path::new("/elsewhere/main.rs")), None);
+		assert_eq!(
+			repo_relative_path(root, Path::new("/elsewhere/main.rs")),
+			None
+		);
 		assert_eq!(repo_relative_path(root, Path::new("/repo")), None);
 	}
 

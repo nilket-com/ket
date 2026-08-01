@@ -349,11 +349,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if let Some(viewport_id) =
 					self.current_viewport.as_ref().map(|view| view.viewport_id)
 				{
-					self.send_command(viewport_scroll_command(
-						viewport_id,
-						mouse.modifiers,
-						-3,
-					));
+					self.send_command(viewport_scroll_command(viewport_id, mouse.modifiers, -3));
 				} else {
 					self.send_command(EditorCommand::ScrollViewport(-3));
 				}
@@ -371,11 +367,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 				if let Some(viewport_id) =
 					self.current_viewport.as_ref().map(|view| view.viewport_id)
 				{
-					self.send_command(viewport_scroll_command(
-						viewport_id,
-						mouse.modifiers,
-						3,
-					));
+					self.send_command(viewport_scroll_command(viewport_id, mouse.modifiers, 3));
 				} else {
 					self.send_command(EditorCommand::ScrollViewport(3));
 				}

@@ -38,10 +38,10 @@ pub mod settings;
 mod shadow;
 pub mod structural_graft;
 mod support;
-mod uast_inspector;
 #[cfg(test)]
 mod test_support;
 pub mod theme;
+mod uast_inspector;
 pub mod uast_query;
 pub mod ui_colors;
 pub mod undo;

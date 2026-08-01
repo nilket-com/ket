@@ -392,10 +392,7 @@ mod tests {
 		dir: &std::path::Path,
 		file_name: &str,
 		worktree: &[u8],
-	) -> (
-		super::CommandSender,
-		std::sync::mpsc::Receiver<Viewport>,
-	) {
+	) -> (super::CommandSender, std::sync::mpsc::Receiver<Viewport>) {
 		let commands = engine.command_sender();
 		let viewports = engine.take_viewports().expect("viewport receiver");
 		commands
@@ -487,8 +484,8 @@ mod tests {
 		);
 		assert!(
 			inspector_text
-			.windows(b"slots=".len())
-			.any(|window| window == b"slots=")
+				.windows(b"slots=".len())
+				.any(|window| window == b"slots=")
 		);
 		assert!(
 			inspector_text
@@ -509,9 +506,9 @@ mod tests {
 			.expect("switch UAST inspector to graph mode");
 		let graph_viewport = recv_viewport_until(&viewports, "UAST graph payload", |viewport| {
 			viewport.panes.iter().any(|pane| {
-				pane.uast_graph.as_ref().is_some_and(|graph| {
-					graph.nodes.iter().any(|node| node.label == "SOURCE_FILE")
-				})
+				pane.uast_graph
+					.as_ref()
+					.is_some_and(|graph| graph.nodes.iter().any(|node| node.label == "SOURCE_FILE"))
 			})
 		});
 		assert!(graph_viewport.panes.iter().any(|pane| {
@@ -708,23 +705,27 @@ mod tests {
 		commands
 			.send(EditorCommand::GotoLine(DocLine::new(8)))
 			.expect("move into Context paragraph");
-		recv_viewport_until(&viewports, "Markdown cursor crosses into Context", |viewport| {
-			viewport.panes.iter().any(|pane| {
-				if pane.tabs[pane.active_doctab_index].title != "uast" {
-					return false;
-				}
-				let text = pane
-					.tokens
-					.iter()
-					.flat_map(|token| token.text.iter().copied())
-					.collect::<Vec<_>>();
-				text.windows(b"PARAGRAPH".len())
-					.any(|window| window == b"PARAGRAPH")
-					&& !text
-						.windows(b"LIST_ITEM".len())
-						.any(|window| window == b"LIST_ITEM")
-			})
-		});
+		recv_viewport_until(
+			&viewports,
+			"Markdown cursor crosses into Context",
+			|viewport| {
+				viewport.panes.iter().any(|pane| {
+					if pane.tabs[pane.active_doctab_index].title != "uast" {
+						return false;
+					}
+					let text = pane
+						.tokens
+						.iter()
+						.flat_map(|token| token.text.iter().copied())
+						.collect::<Vec<_>>();
+					text.windows(b"PARAGRAPH".len())
+						.any(|window| window == b"PARAGRAPH")
+						&& !text
+							.windows(b"LIST_ITEM".len())
+							.any(|window| window == b"LIST_ITEM")
+				})
+			},
+		);
 
 		// Put the source cursor on the blank line immediately before Decision.
 		// Semantic mode hides that GAP; raw mode must expose the exact storage
@@ -919,22 +920,18 @@ mod tests {
 		commands
 			.send(EditorCommand::InsertText("fresh();\n".to_string()))
 			.expect("edit worktree");
-		recv_viewport_until(
-			&viewports,
-			"recomputed chronological diff",
-			|viewport| {
-				pane_text(viewport, worktree_pane_id).starts_with(b"fresh();\n")
-					&& viewport
-						.pane(worktree_pane_id)
-						.and_then(|pane| pane.diff_pair.as_ref())
-						.is_some_and(|pair| {
-							pair.blocks.iter().any(|block| {
-								block.kind == crate::uast::projection::DiffKind::Added
-									&& block.range.0 < block.range.1
-							})
+		recv_viewport_until(&viewports, "recomputed chronological diff", |viewport| {
+			pane_text(viewport, worktree_pane_id).starts_with(b"fresh();\n")
+				&& viewport
+					.pane(worktree_pane_id)
+					.and_then(|pane| pane.diff_pair.as_ref())
+					.is_some_and(|pair| {
+						pair.blocks.iter().any(|block| {
+							block.kind == crate::uast::projection::DiffKind::Added
+								&& block.range.0 < block.range.1
 						})
-			},
-		);
+					})
+		});
 
 		engine.shutdown().expect("engine shutdown");
 		let _ = std::fs::remove_dir_all(dir);
@@ -1576,8 +1573,9 @@ mod tests {
 			"worktree\n",
 		);
 		fixture_git_stdout(&dir, &["branch", "mark", "HEAD~1"]);
-		let commit_before =
-			fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"]).trim().to_string();
+		let commit_before = fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"])
+			.trim()
+			.to_string();
 
 		let mut engine = EngineHandle::spawn(EngineConfig::default());
 		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"worktree\n");
@@ -1599,8 +1597,9 @@ mod tests {
 		// must carry distinct identities everywhere — provenance and the
 		// provider-facing virtual path alike.
 		fixture_git_stdout(&dir, &["branch", "-f", "mark", "HEAD"]);
-		let commit_after =
-			fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"]).trim().to_string();
+		let commit_after = fixture_git_stdout(&dir, &["rev-parse", "mark^{commit}"])
+			.trim()
+			.to_string();
 		assert_ne!(commit_before, commit_after);
 		commands
 			.send(EditorCommand::FocusPane(left_pane_id))
@@ -1683,9 +1682,9 @@ mod tests {
 			))
 			.expect("write snapshot as file");
 		recv_viewport_until(&viewports, "snapshot converted by write-as", |viewport| {
-			viewport.focused_pane().is_some_and(|pane| {
-				pane.tabs[pane.active_doctab_index].title == "saved.rs"
-			})
+			viewport
+				.focused_pane()
+				.is_some_and(|pane| pane.tabs[pane.active_doctab_index].title == "saved.rs")
 		});
 		assert_eq!(fs::read(&saved).expect("read saved snapshot"), b"old\n");
 
@@ -1750,7 +1749,12 @@ mod tests {
 		// One byte past MAX_JOB_CAPTURE_BYTES: the capture truncates and the
 		// snapshot must be refused rather than diffed partially.
 		let oversized = "x".repeat(crate::engine::jobs::MAX_JOB_CAPTURE_BYTES + 1);
-		let dir = git_fixture_repo("panediff-oversized", "main.rs", &[oversized.as_str()], "tiny\n");
+		let dir = git_fixture_repo(
+			"panediff-oversized",
+			"main.rs",
+			&[oversized.as_str()],
+			"tiny\n",
+		);
 		let mut engine = EngineHandle::spawn(EngineConfig::default());
 		let (commands, viewports) = load_fixture_file(&mut engine, &dir, "main.rs", b"tiny\n");
 

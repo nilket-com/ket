@@ -305,7 +305,11 @@ fn complete_git_resolve_job(
 				stderr.extend_from_slice(chunk);
 			}
 			let stderr = String::from_utf8_lossy(&stderr);
-			let detail = stderr.lines().next().unwrap_or("git rev-parse failed").trim();
+			let detail = stderr
+				.lines()
+				.next()
+				.unwrap_or("git rev-parse failed")
+				.trim();
 			session.ui.status_message = Some(format!("Not a file or Git revision: {detail}"));
 			return true;
 		}
@@ -386,7 +390,11 @@ fn complete_git_diff_job(
 				stderr.extend_from_slice(chunk);
 			}
 			let stderr = String::from_utf8_lossy(&stderr);
-			let detail = stderr.lines().next().unwrap_or("git cat-file failed").trim();
+			let detail = stderr
+				.lines()
+				.next()
+				.unwrap_or("git cat-file failed")
+				.trim();
 			context.session.ui.status_message =
 				Some(format!("Not a file or Git revision: {detail}"));
 			return true;
@@ -397,8 +405,7 @@ fn complete_git_diff_job(
 		}
 	}
 	if completion.stdout.truncated {
-		context.session.ui.status_message =
-			Some("Git snapshot is too large to diff".to_string());
+		context.session.ui.status_message = Some("Git snapshot is too large to diff".to_string());
 		return true;
 	}
 	let mut stdout = Vec::new();
@@ -535,8 +542,7 @@ fn materialize_snapshot(context: &mut EditorHost, m: SnapshotMaterialization) ->
 	// deliberately NOT the real file's path — a shared path would map both
 	// documents onto one workspace `FileId` and let the snapshot's old
 	// content poison analysis of the live buffer.
-	let virtual_path =
-		super::git::snapshot_virtual_path(&m.repo_root, &m.commit_oid, &m.rel_path);
+	let virtual_path = super::git::snapshot_virtual_path(&m.repo_root, &m.commit_oid, &m.rel_path);
 	let replace_cmd = EditorCommand::ReplaceDocument {
 		text: String::from_utf8_lossy(&m.blob_content).into_owned(),
 		language,
@@ -885,7 +891,11 @@ fn complete_git_step_fetch(
 					stderr.extend_from_slice(chunk);
 				}
 				let stderr = String::from_utf8_lossy(&stderr);
-				let detail = stderr.lines().next().unwrap_or("git cat-file failed").trim();
+				let detail = stderr
+					.lines()
+					.next()
+					.unwrap_or("git cat-file failed")
+					.trim();
 				session.ui.status_message = Some(format!("Git step failed: {detail}"));
 				return true;
 			}
@@ -1610,8 +1620,7 @@ fn accept_picker_result(
 				origin.cursor,
 				Some(target_buffer),
 			);
-			if let Err(error) =
-				retarget_text_view(runtime, session, origin.view_id, target_buffer)
+			if let Err(error) = retarget_text_view(runtime, session, origin.view_id, target_buffer)
 			{
 				session.ui.status_message = Some(error);
 				return true;
@@ -1638,8 +1647,7 @@ fn accept_picker_result(
 		) {
 			Ok(target) => target,
 			Err(error) => {
-				session.ui.status_message =
-					Some(format!("Unable to open search result: {error}"));
+				session.ui.status_message = Some(format!("Unable to open search result: {error}"));
 				return true;
 			}
 		};
@@ -1680,9 +1688,7 @@ fn accept_picker_result(
 			origin.cursor,
 			Some(target_buffer),
 		);
-		if let Err(error) =
-			retarget_text_view(runtime, session, origin.view_id, target_buffer)
-		{
+		if let Err(error) = retarget_text_view(runtime, session, origin.view_id, target_buffer) {
 			session.ui.status_message = Some(error);
 			return true;
 		}
@@ -2610,9 +2616,7 @@ fn record_navigation_origin(
 	else {
 		return;
 	};
-	let anchor_id = document
-		.navigation_anchors
-		.insert(root, state_id, cursor);
+	let anchor_id = document.navigation_anchors.insert(root, state_id, cursor);
 	let removed = session.jump_history.record_back(JumpEntry {
 		buffer_id,
 		preferred_view_id: view_id,
@@ -2742,14 +2746,12 @@ fn navigate_jump_history(
 	};
 
 	if visible_target.is_none()
-		&& let Err(error) =
-			retarget_text_view_preserving_departure(
-				runtime,
-				session,
-				current_view_id,
-				target_entry.buffer_id,
-			)
-	{
+		&& let Err(error) = retarget_text_view_preserving_departure(
+			runtime,
+			session,
+			current_view_id,
+			target_entry.buffer_id,
+		) {
 		if let Some(document) = session
 			.buffers
 			.get_mut(current_buffer_id)
@@ -2782,9 +2784,7 @@ fn navigate_jump_history(
 	}
 	let removed = match direction {
 		JumpHistoryDirection::Backward => session.jump_history.push_forward(departure),
-		JumpHistoryDirection::Forward => {
-			session.jump_history.push_back_from_forward(departure)
-		}
+		JumpHistoryDirection::Forward => session.jump_history.push_back_from_forward(departure),
 	};
 	discard_jump_entries(runtime, session, removed, None);
 	session.ui.status_message = Some(if stale_count == 0 {
@@ -4818,17 +4818,14 @@ fn dispatch_command(
 			needs_render = true;
 		}
 		EditorCommand::OpenUastInspector { mode } => {
-			if let Err(error) =
-				super::uast_inspector::open_uast_inspector(registry, session, mode)
+			if let Err(error) = super::uast_inspector::open_uast_inspector(registry, session, mode)
 			{
 				session.ui.status_message = Some(error);
 			}
 			needs_render = true;
 		}
 		EditorCommand::ActivateUastInspectorRow => {
-			if let Err(error) =
-				super::uast_inspector::activate_selected_row(registry, session)
-			{
+			if let Err(error) = super::uast_inspector::activate_selected_row(registry, session) {
 				session.ui.status_message = Some(error);
 			}
 			needs_render = true;
@@ -4860,12 +4857,9 @@ fn dispatch_command(
 			needs_render = true;
 		}
 		EditorCommand::ExportUastDot { path } => {
-			if let Err(error) = super::uast_inspector::export_dot(
-				registry,
-				lang_registry,
-				session,
-				path.as_deref(),
-			) {
+			if let Err(error) =
+				super::uast_inspector::export_dot(registry, lang_registry, session, path.as_deref())
+			{
 				session.ui.status_message = Some(error);
 			}
 			needs_render = true;
@@ -6737,10 +6731,8 @@ pub fn main(editor) {
 				query: "render_frame".to_string(),
 			})
 			.expect("open picker");
-		let picker_view = recv_viewport_until(
-			&engine._views,
-			Duration::from_secs(10),
-			|viewport| {
+		let picker_view =
+			recv_viewport_until(&engine._views, Duration::from_secs(10), |viewport| {
 				viewport.picker.as_ref().is_some_and(|picker| {
 					!picker.searching
 						&& picker
@@ -6748,15 +6740,9 @@ pub fn main(editor) {
 							.iter()
 							.any(|result| result.path == "src/supervisor.rs")
 				})
-			},
-		);
+			});
 		assert_eq!(
-			picker_view
-				.picker
-				.as_ref()
-				.expect("picker")
-				.results[0]
-				.path,
+			picker_view.picker.as_ref().expect("picker").results[0].path,
 			"src/supervisor.rs"
 		);
 		engine
@@ -6774,7 +6760,10 @@ pub fn main(editor) {
 			.commands
 			.send(EditorCommand::Picker(PickerAction::Cancel))
 			.expect("cancel refused picker");
-		engine.commands.send(EditorCommand::Undo).expect("restore source");
+		engine
+			.commands
+			.send(EditorCommand::Undo)
+			.expect("restore source");
 		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
 			viewport.picker.is_none() && !viewport.is_dirty
 		});
@@ -6857,7 +6846,10 @@ pub fn main(editor) {
 		let engine = spawn_test_engine(Some(path.display().to_string()));
 		engine.commands.refresh_for_test().expect("initial render");
 		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
-			viewport.file_name.as_deref().is_some_and(|name| name.ends_with("live.rs"))
+			viewport
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("live.rs"))
 		});
 		engine
 			.commands
@@ -6901,11 +6893,13 @@ pub fn main(editor) {
 				.commands
 				.send(EditorCommand::Picker(PickerAction::Accept))
 				.expect("same-file jump");
-			let jumped =
-				recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
-					viewport.picker.is_none() && viewport.cursor_abs_byte == DocByte::ZERO
-				});
-			assert!(jumped.is_dirty, "same-file jumps must preserve unsaved bytes");
+			let jumped = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+				viewport.picker.is_none() && viewport.cursor_abs_byte == DocByte::ZERO
+			});
+			assert!(
+				jumped.is_dirty,
+				"same-file jumps must preserve unsaved bytes"
+			);
 		}
 
 		engine.commands.send(EditorCommand::Quit).expect("quit");
@@ -7142,15 +7136,14 @@ pub fn main(editor) {
 		let target = crate::engine::test_support::temp_test_path("goto-closed-target");
 		std::fs::write(&target, "dest").expect("write target");
 		let engine = spawn_test_engine(None);
-		let source_buffer = install_navigation_test_source(
-			&engine,
-			format!("slow\ntarget={}\n", target.display()),
-		);
-		let source_pane = recv_viewport_until(
-			&engine._views,
-			Duration::from_secs(5),
-			|viewport| viewport.panes.first().is_some_and(|pane| pane.buffer_id == source_buffer),
-		)
+		let source_buffer =
+			install_navigation_test_source(&engine, format!("slow\ntarget={}\n", target.display()));
+		let source_pane = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport
+				.panes
+				.first()
+				.is_some_and(|pane| pane.buffer_id == source_buffer)
+		})
 		.panes[0]
 			.pane_id;
 		engine
@@ -7175,11 +7168,10 @@ pub fn main(editor) {
 			.commands
 			.send(EditorCommand::ClosePane)
 			.expect("close requesting view");
-		let viewport =
-			recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
-				viewport.status_message.as_deref()
-					== Some("Definition result discarded: the requesting view was closed")
-			});
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref()
+				== Some("Definition result discarded: the requesting view was closed")
+		});
 		assert_eq!(viewport.panes.len(), 1);
 		assert!(
 			viewport
@@ -7351,14 +7343,13 @@ pub fn main(editor) {
 			.commands
 			.send(EditorCommand::GotoDefinition)
 			.expect("request newer definition");
-		let viewport =
-			recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
-				viewport.status_message.as_deref() == Some("Jumped to definition")
-					&& viewport.panes[0]
-						.file_name
-						.as_deref()
-						.is_some_and(|name| name.ends_with("b.txt"))
-			});
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+				&& viewport.panes[0]
+					.file_name
+					.as_deref()
+					.is_some_and(|name| name.ends_with("b.txt"))
+		});
 		assert!(
 			viewport.panes[0]
 				.file_name
@@ -7539,13 +7530,11 @@ pub fn main(editor) {
 				"cache-hit crossings must not retire either generation"
 			);
 			assert_eq!(
-				stats.authoritative_payload_bytes,
-				after_first_ingest.authoritative_payload_bytes,
+				stats.authoritative_payload_bytes, after_first_ingest.authoritative_payload_bytes,
 				"cache-hit crossings must not duplicate authoritative payload"
 			);
 			assert_eq!(
-				stats.orphaned_payload_bytes,
-				after_first_ingest.orphaned_payload_bytes,
+				stats.orphaned_payload_bytes, after_first_ingest.orphaned_payload_bytes,
 				"cache-hit crossings must not orphan either generation's payload"
 			);
 			assert_eq!(

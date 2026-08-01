@@ -1,6 +1,6 @@
-use crate::uast::kind::{ProviderKindId, SemanticKind};
 #[cfg(test)]
 use crate::ecs::{NodeId, UastRegistry};
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 #[cfg(test)]
 use crate::uast::metrics::SpanMetrics;
 use ruff_python_ast::{Mod, Stmt};

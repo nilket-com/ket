@@ -12,9 +12,7 @@ use libaryon::engine::{
 use libaryon::svp::diagnostic::DiagnosticSeverity;
 use libaryon::svp::projector::{DiagnosticProjector, HighlightProjector};
 use libaryon::svp::rust_highlight::default_text_color;
-use libaryon::uast::projection::{
-	DocTabSummary, PaneViewport, PickerViewport, ProjectedCaret,
-};
+use libaryon::uast::projection::{DocTabSummary, PaneViewport, PickerViewport, ProjectedCaret};
 use ratatui::{
 	backend::Backend,
 	buffer::Buffer,
@@ -369,14 +367,7 @@ fn prompt_window(buffer: &str, cursor_byte: usize, width: usize) -> (String, usi
 	(visible, cursor_col)
 }
 
-fn paint_picker_text(
-	buf: &mut Buffer,
-	x: u16,
-	y: u16,
-	width: u16,
-	text: &str,
-	style: Style,
-) {
+fn paint_picker_text(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
 	for (offset, ch) in text.chars().take(width as usize).enumerate() {
 		if let Some(cell) = buf.cell_mut((x.saturating_add(offset as u16), y)) {
 			cell.set_char(ch).set_style(style);
@@ -398,7 +389,9 @@ fn draw_picker_overlay(
 		.unwrap_or(u16::MAX)
 		.saturating_add(4);
 	let height = requested_height.min(screen.height).max(5);
-	let x = screen.x.saturating_add(screen.width.saturating_sub(width) / 2);
+	let x = screen
+		.x
+		.saturating_add(screen.width.saturating_sub(width) / 2);
 	let y = screen
 		.y
 		.saturating_add(screen.height.saturating_sub(height) / 3);
@@ -485,12 +478,7 @@ fn draw_picker_overlay(
 				.add_modifier(Modifier::BOLD),
 		);
 	}
-	for (local_index, result) in picker
-		.results
-		.iter()
-		.take(result_rows)
-		.enumerate()
-	{
+	for (local_index, result) in picker.results.iter().take(result_rows).enumerate() {
 		let absolute_index = picker.first_result.saturating_add(local_index);
 		let style = if absolute_index == picker.selected {
 			selected
@@ -514,7 +502,11 @@ fn draw_picker_overlay(
 	}
 
 	let qualifier = if picker.truncated { "≥" } else { "" };
-	let activity = if picker.searching { " · searching…" } else { "" };
+	let activity = if picker.searching {
+		" · searching…"
+	} else {
+		""
+	};
 	let footer = format!(
 		" {}/{}{qualifier} · {} files{} · ↑↓ select · Enter open · Esc close ",
 		picker.shown, picker.matched, picker.files_walked, activity
@@ -1785,8 +1777,12 @@ impl<B: Backend + io::Write> Frontend<B> {
 							width: max_width,
 							height: editor_area_height,
 						};
-						cursor_to_set =
-							draw_picker_overlay(f.buffer_mut(), overlay_area, picker, view.ui_palette);
+						cursor_to_set = draw_picker_overlay(
+							f.buffer_mut(),
+							overlay_area,
+							picker,
+							view.ui_palette,
+						);
 					}
 				}
 
@@ -2118,12 +2114,12 @@ fn format_line_count(lines: u64) -> String {
 mod tests {
 	use super::{
 		BUSY_SPINNER_FRAMES, apply_diagnostic_style, braille_spinner_frame,
-		cursor_gutter_line_number_style, diff_block_fill, diff_intra_line_fill, draw_tab_bar,
-		draw_picker_overlay, effective_editor_background, focused_diff_block_fill,
+		cursor_gutter_line_number_style, diff_block_fill, diff_intra_line_fill,
+		draw_picker_overlay, draw_tab_bar, effective_editor_background, focused_diff_block_fill,
 		folded_placeholder_style, format_line_count, gutter_fill_style, gutter_line_number_style,
 		paint_busy_spinner, paint_git_branch, paint_secondary_carets, paint_text_segment,
-		prompt_window,
-		should_render_preview_snapshot_fallback, status_file_name, status_right_text,
+		prompt_window, should_render_preview_snapshot_fallback, status_file_name,
+		status_right_text,
 	};
 	use crate::ui::{
 		DIAGNOSTIC_ERROR_UNDERLINE, FOLDED_PLACEHOLDER_BG, blend_rgb, diff::DiffHoverEmphasis,
@@ -2176,14 +2172,10 @@ mod tests {
 			files_walked: 9,
 			error: None,
 		};
-		let cursor =
-			draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
-				.expect("overlay");
+		let cursor = draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
+			.expect("overlay");
 		assert_eq!(buffer[cursor].symbol(), "_");
-		assert_eq!(
-			buffer[(cursor.0.saturating_sub(1), cursor.1)].symbol(),
-			"r"
-		);
+		assert_eq!(buffer[(cursor.0.saturating_sub(1), cursor.1)].symbol(), "r");
 		let selected_row_y = cursor.1.saturating_add(2);
 		assert_eq!(
 			buffer[(4, selected_row_y)].bg,
@@ -2212,11 +2204,7 @@ mod tests {
 		draw_picker_overlay(&mut buffer, Rect::new(0, 0, 80, 19), &picker, palette)
 			.expect("overlay");
 		let screen = (0..20)
-			.map(|y| {
-				(0..80)
-					.map(|x| buffer[(x, y)].symbol())
-					.collect::<String>()
-			})
+			.map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
 			.collect::<Vec<_>>()
 			.join("\n");
 		assert!(screen.contains("regex repo search"));

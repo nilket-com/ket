@@ -23,9 +23,9 @@
 //! a single `Trivia` leaf covering the whole source, so the engine never
 //! panics and byte length is still preserved.
 
-use crate::uast::kind::{ProviderKindId, SemanticKind};
 #[cfg(test)]
 use crate::ecs::{NodeId, UastRegistry};
+use crate::uast::kind::{ProviderKindId, SemanticKind};
 #[cfg(test)]
 use crate::uast::metrics::SpanMetrics;
 

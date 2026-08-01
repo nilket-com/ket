@@ -730,13 +730,13 @@ impl UastMutation for UastRegistry {
 		if is_virtual {
 			self.bump_content_generation(target);
 			let removed_newlines = self.mutate_authoritative_data(target, |v_data| {
-					let range = delete_start as usize..offset_in_node as usize;
-					let removed = v_data[range.clone()]
-						.iter()
-						.filter(|&&byte| byte == b'\n')
-						.count();
-					v_data.drain(range);
-					removed
+				let range = delete_start as usize..offset_in_node as usize;
+				let removed = v_data[range.clone()]
+					.iter()
+					.filter(|&&byte| byte == b'\n')
+					.count();
+				v_data.drain(range);
+				removed
 			});
 			self.refresh_terminal_newline_from_resident(target);
 			self.apply_edit(
@@ -834,13 +834,13 @@ impl UastMutation for UastRegistry {
 		if is_virtual {
 			self.bump_content_generation(target);
 			let removed_newlines = self.mutate_authoritative_data(target, |data| {
-					let range = offset_in_node as usize..delete_end as usize;
-					let removed = data[range.clone()]
-						.iter()
-						.filter(|&&byte| byte == b'\n')
-						.count();
-					data.drain(range);
-					removed
+				let range = offset_in_node as usize..delete_end as usize;
+				let removed = data[range.clone()]
+					.iter()
+					.filter(|&&byte| byte == b'\n')
+					.count();
+				data.drain(range);
+				removed
 			});
 			self.refresh_terminal_newline_from_resident(target);
 			self.apply_edit(

@@ -687,11 +687,7 @@ mod tests {
 		let mut should_quit = false;
 
 		frontend.set_editor_mode_for_test(EditorMode::Normal);
-		assert!(!frontend.dispatch_key(
-			KeyCode::Char('?'),
-			Modifiers::NONE,
-			&mut should_quit
-		));
+		assert!(!frontend.dispatch_key(KeyCode::Char('?'), Modifiers::NONE, &mut should_quit));
 		assert!(
 			rx_cmd.try_recv().is_err(),
 			"normal-mode ? must remain unbound until backward search lands"
