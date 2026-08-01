@@ -84,8 +84,8 @@ use crate::schema::{
 	CdcSubscribeRequestMeta, CdcSubscriptionId, ColumnProjectionRangePruning, Consistency,
 	CounterAddRequestMeta, CounterAddResponseMeta, CounterReadRequestMeta, CounterReadResponseMeta,
 	CounterReplicaAck, CounterReplicaPhase, CounterReplicaStatus, CounterReplicateRequestMeta,
-	CounterRollbackRequestMeta, DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker,
-	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
+	CounterRollbackRequestMeta, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
+	HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
 	LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
 	MsgType, MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
@@ -140,6 +140,7 @@ use crate::storage::stats::{
 use crate::storage::{
 	CatchupSnapshot, CdcLiveEntry, CdcLiveTailRing, CdcLocalityFrontiers,
 	CdcLocalityHeartbeatWorker, DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY,
+	cdc_locality_heartbeat_finalization,
 };
 use crate::storage::{
 	EffectiveRetention, MvccRetentionPolicy, SecondaryIndexAccessPlan, SecondaryIndexLookupRow,
@@ -2852,7 +2853,7 @@ impl WendelonDataServer {
 	) -> JoinHandle<()> {
 		tokio::spawn(async move {
 			let mut discovery = tokio::time::interval(interval);
-			discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 			let mut spawned = BTreeSet::new();
 			let mut workers = JoinSet::new();
 
@@ -7654,27 +7655,13 @@ impl WendelonDataServer {
 			node_id: 0,
 		});
 		let epoch = self.admission_snapshot().current_epoch;
-		let finalization = TenantFinalization {
-			marker: FinalizationMarker {
-				log_index: 0,
-				term: 0,
-				epoch,
-				commit_hlc,
-				payload_hash: cdc_heartbeat_payload_hash(locality_id, commit_hlc, epoch),
-				e_safe_index: 0,
-				durability: DurabilityLevel::QUORUM,
-				_pad: [0; 7],
-			},
-			tenant_id: TenantId::ZERO,
-			key_identity: cdc_heartbeat_identity(locality_id),
-			charged_bytes: 0,
-			record_count: 0,
-		};
+		let finalization = cdc_locality_heartbeat_finalization(locality_id, commit_hlc, epoch);
 		let response = self
 			.raft
 			.client_write(WendelonRequest::Finalize(finalization))
 			.await
 			.map_err(|err| Error::other(format!("cdc heartbeat finalization failed: {err}")))?;
+		metrics().cdc_locality_heartbeats_committed_total.inc();
 		self.cdc_locality_frontiers.advance(locality_id, commit_hlc);
 		self.cdc_heartbeat_observed_frontiers
 			.insert(locality_id, commit_hlc);
@@ -14876,29 +14863,6 @@ fn key_locality(bytes: &[u8]) -> u64 {
 
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
 	crate::hash::content::digest(bytes)
-}
-
-fn cdc_heartbeat_identity(locality_id: Locality) -> Identity {
-	let mut bytes = [0u8; 32];
-	bytes[..8].copy_from_slice(&locality_id.get().to_le_bytes());
-	let domain = b"cdc-heartbeat-locality";
-	bytes[8..8 + domain.len()].copy_from_slice(domain);
-	Identity::new(bytes)
-}
-
-fn cdc_heartbeat_payload_hash(
-	locality_id: Locality,
-	commit_hlc: HybridTimestamp,
-	epoch: u64,
-) -> [u8; 32] {
-	let mut hasher = ::blake3::Hasher::new();
-	hasher.update(b"wendelon.cdc.locality-heartbeat.v1");
-	hasher.update(&locality_id.get().to_le_bytes());
-	hasher.update(&epoch.to_le_bytes());
-	hasher.update(&commit_hlc.physical_ms.to_le_bytes());
-	hasher.update(&commit_hlc.logical.to_le_bytes());
-	hasher.update(&commit_hlc.node_id.to_le_bytes());
-	*hasher.finalize().as_bytes()
 }
 
 fn format_bytes_hex(bytes: &[u8]) -> String {

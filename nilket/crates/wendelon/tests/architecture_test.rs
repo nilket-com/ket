@@ -2900,12 +2900,8 @@ fn adr054_cdc_subscription_substrate_contract() {
 		"CdcLocalityHeartbeatWorker::new(locality_id, interval)",
 		"cdc_locality_quiet_since_last_finalization",
 		"emit_cdc_heartbeat_finalization_marker",
-		"cdc_heartbeat_identity",
-		"cdc_heartbeat_payload_hash",
+		"cdc_locality_heartbeat_finalization",
 		"WendelonRequest::Finalize(finalization)",
-		"tenant_id: TenantId::ZERO",
-		"charged_bytes: 0",
-		"record_count: 0",
 		"localities.insert(range.start)",
 		"localities.insert(range.end)",
 		"cdc_locality_frontiers.wait_for_advance",
@@ -2983,6 +2979,9 @@ fn adr054_cdc_subscription_substrate_contract() {
 		"open_time_ring_continuity_check",
 		"pub struct CdcLocalityHeartbeatWorker",
 		"pub locality_id: Locality",
+		"tenant_id: TenantId::ZERO",
+		"charged_bytes: 0",
+		"record_count: 0",
 	] {
 		if !storage_cdc.contains(required) {
 			violations.push(format!(
@@ -3013,6 +3012,7 @@ fn adr054_cdc_subscription_substrate_contract() {
 		"wendelon_cdc_catchup_to_live_handoff_micros",
 		"wendelon_cdc_staged_entries_in_ring",
 		"wendelon_cdc_pending_finalization_evicted_total",
+		"wendelon_cdc_locality_heartbeats_committed_total",
 		"below_retention_floor",
 		"ring_overflow_during_catchup",
 		"schema_fingerprint_incompatible",
@@ -3194,6 +3194,149 @@ fn adr054_cdc_subscription_substrate_contract() {
 		"ADR 054 CDC subscription invariants violated:\n{}",
 		violations.join("\n")
 	);
+}
+
+fn adr079_has_ad_hoc_heartbeat_predicate(source: &str) -> bool {
+	let compact = source
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect::<String>();
+	compact.contains("tenant_id==TenantId::ZERO")
+		&& compact.contains("charged_bytes==0")
+		&& compact.contains("record_count==0")
+}
+
+fn adr079_has_forbidden_audit_maintenance(source: &str) -> bool {
+	let compact = source
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect::<String>();
+	[
+		"audit.set_len(",
+		"remove_file(audit",
+		"rename(audit",
+		"truncate(true)",
+	]
+	.iter()
+	.any(|token| compact.contains(token))
+}
+
+/// ADR 079: local policy is explicit in the generated teaching artifact;
+/// producer and audit materializer share the CDC-domain identity seam.
+#[test]
+fn adr079_idle_heartbeat_policy_and_classification_have_one_owner() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let soak = fs::read_to_string(manifest_dir.join("src/idle_soak.rs")).unwrap();
+	let soak_command =
+		fs::read_to_string(manifest_dir.join("examples/local_idle_soak.rs")).unwrap();
+	let commodity_soak = fs::read_to_string(manifest_dir.join("examples/soak_driver.rs")).unwrap();
+	let soak_runner =
+		fs::read_to_string(manifest_dir.join("scripts/soak/run_local_idle_soak.sh")).unwrap();
+
+	assert!(
+		config.contains("cdc_locality_heartbeat_interval_millis = 30000"),
+		"ADR 079 requires nilket local's explicit 30-second teaching-artifact value"
+	);
+	assert!(
+		!node.contains("Duration::from_millis(DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS)"),
+		"ADR 079 requires node wiring to consume configured cadence, not reconstruct the default"
+	);
+	for required in [
+		"fn cdc_locality_heartbeat_finalization(",
+		"fn is_cdc_locality_heartbeat_finalization(",
+		"cdc_locality_heartbeat_identity(locality_id)",
+		"cdc_locality_heartbeat_payload_hash(",
+	] {
+		assert!(
+			cdc.contains(required),
+			"ADR 079 canonical CDC heartbeat seam is missing {required}"
+		);
+	}
+	assert!(
+		data_server.contains("cdc_locality_heartbeat_finalization(locality_id, commit_hlc, epoch)"),
+		"ADR 079 producer must use the canonical heartbeat constructor"
+	);
+	assert!(
+		raft.contains("is_cdc_locality_heartbeat_finalization(finalization)"),
+		"ADR 079 audit classification must call the canonical predicate"
+	);
+	let forbidden_control = "finalization.tenant_id == TenantId::ZERO && finalization.charged_bytes == 0 && finalization.record_count == 0";
+	assert!(
+		adr079_has_ad_hoc_heartbeat_predicate(forbidden_control),
+		"ADR 079 positive control must prove an ad-hoc audit predicate is observable"
+	);
+	let audit_section = raft
+		.split("fn raft_audit_event_with_context")
+		.nth(1)
+		.and_then(|tail| tail.split("fn audit_outcome").next())
+		.expect("raft audit classifier section");
+	assert!(
+		!adr079_has_ad_hoc_heartbeat_predicate(audit_section),
+		"ADR 079 forbids a second field-only heartbeat predicate at the audit boundary"
+	);
+	assert!(
+		!["rand::", "thread_rng", "%100", "DataWriteFinalized=>None"]
+			.iter()
+			.any(|token| audit_section.contains(token)),
+		"ADR 079 forbids sampling or generically dropping data.write_finalized audit evidence"
+	);
+	let forbidden_maintenance_control = "remove_file(audit_path)";
+	assert!(
+		adr079_has_forbidden_audit_maintenance(forbidden_maintenance_control),
+		"ADR 079 positive control must prove destructive audit maintenance is observable"
+	);
+	assert!(
+		!adr079_has_forbidden_audit_maintenance(&format!("{config}\n{soak}")),
+		"ADR 079 forbids rotating, truncating, deleting, or replacing local audit evidence in this cut"
+	);
+	assert!(
+		cdc.contains("MissedTickBehavior::Skip")
+			&& data_server.contains(
+				"discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip)"
+			),
+		"ADR 079 requires explicit skip semantics for heartbeat worker and discovery ticks"
+	);
+	for required in [
+		"pub const SOAK_FORMAT_VERSION: u32 = 1",
+		"pub const LOCAL_IDLE_SOAK_FORMAT_VERSION: u32 = SOAK_FORMAT_VERSION",
+		"pub const LOCAL_IDLE_SOAK_MODE: &str = \"local_idle\"",
+		"total idle audit records",
+		"unexpected_idle_audit_operation_trips_operation_and_total_budgets",
+	] {
+		assert!(
+			soak.contains(required),
+			"ADR 079 soak evidence/rejection control is missing {required}"
+		);
+	}
+	for artifact in ["soak_config.json", "samples.jsonl", "summary.json"] {
+		assert!(
+			soak_command.contains(artifact),
+			"ADR 079 local-idle evidence command must retain shared artifact {artifact}"
+		);
+	}
+	assert!(
+		commodity_soak.contains("SOAK_FORMAT_VERSION")
+			&& commodity_soak.contains("COMMODITY_SOAK_MODE"),
+		"ADR 079 local-idle and commodity soak evidence must share one format/version vocabulary"
+	);
+	for required in [
+		"local --data-dir",
+		"refuses existing output directory",
+		"stop_owned",
+		"SELECT 1",
+		"wendelon_cdc_locality_heartbeats_committed_total",
+		"wendelon_audit_materialization_lag_entries",
+	] {
+		assert!(
+			soak_runner.contains(required),
+			"ADR 079 owned local-idle runner is missing {required}"
+		);
+	}
 }
 
 fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {

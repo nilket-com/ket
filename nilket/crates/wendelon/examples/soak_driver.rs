@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use wendelon::idle_soak::{COMMODITY_SOAK_MODE, SOAK_FORMAT_VERSION};
 use wendelon::schema::{Locality, TenantId};
 use wendelon_client::{
 	BootstrapPeer, Client, ClientConfig, ClientError, DurabilityClass, QueryLocalityRange,
@@ -37,6 +38,8 @@ const MAX_LATENCY_SAMPLES: usize = 100_000;
 
 #[derive(Clone, Debug, Serialize)]
 struct SoakConfig {
+	format_version: u32,
+	mode: &'static str,
 	bind_addr: String,
 	bootstrap: Vec<String>,
 	tls_cert: String,
@@ -96,6 +99,8 @@ enum OpKind {
 
 #[derive(Serialize)]
 struct SampleSnapshot {
+	format_version: u32,
+	mode: &'static str,
 	elapsed_secs: u64,
 	writes_total: u64,
 	writes_ok: u64,
@@ -120,6 +125,8 @@ struct SummaryStats {
 
 #[derive(Serialize)]
 struct SoakSummary {
+	format_version: u32,
+	mode: &'static str,
 	duration_secs: u64,
 	write: SummaryStats,
 	read: SummaryStats,
@@ -396,6 +403,8 @@ impl SoakConfig {
 		}
 
 		Ok(Self {
+			format_version: SOAK_FORMAT_VERSION,
+			mode: COMMODITY_SOAK_MODE,
 			bind_addr: bind_addr.to_string(),
 			bootstrap: bootstrap
 				.iter()
@@ -502,6 +511,8 @@ fn snapshot_counts(stats: &SharedStats, started: Instant) -> SampleSnapshot {
 	let reads = stats.reads.lock().unwrap();
 	let queries = stats.queries.lock().unwrap();
 	SampleSnapshot {
+		format_version: SOAK_FORMAT_VERSION,
+		mode: COMMODITY_SOAK_MODE,
 		elapsed_secs: started.elapsed().as_secs(),
 		writes_total: writes.total,
 		writes_ok: writes.ok,
@@ -810,6 +821,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let reads = stats.reads.lock().unwrap();
 	let queries = stats.queries.lock().unwrap();
 	let summary = SoakSummary {
+		format_version: SOAK_FORMAT_VERSION,
+		mode: COMMODITY_SOAK_MODE,
 		duration_secs: started.elapsed().as_secs(),
 		write: summarize(&writes),
 		read: summarize(&reads),

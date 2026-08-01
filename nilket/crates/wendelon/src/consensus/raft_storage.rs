@@ -80,7 +80,7 @@ use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
-	fsync_parent_dir, write_file,
+	fsync_parent_dir, is_cdc_locality_heartbeat_finalization, write_file,
 };
 use bytemuck::{Pod, Zeroable};
 #[cfg(test)]
@@ -2948,6 +2948,11 @@ fn raft_audit_event_with_context(
 		// can reject for transient state-machine reasons and an error
 		// record per replay would flood the audit log.
 		WendelonRequest::Finalize(_) if is_err => None,
+		WendelonRequest::Finalize(finalization)
+			if is_cdc_locality_heartbeat_finalization(finalization) =>
+		{
+			None
+		}
 		WendelonRequest::AdvanceEpoch(_)
 			| WendelonRequest::InstallTenantKekVersion(_)
 			| WendelonRequest::RetireTenantKekVersion(_)
@@ -6024,6 +6029,7 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 mod schema_state_tests {
 	use super::*;
+	use crate::audit::InMemoryAuditSink;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::integration::compute::{
 		COMPUTE_STORAGE_CONTRACT_VERSION, DropOperationId, SchemaGeneration, SchemaIntentId,
@@ -6040,7 +6046,153 @@ mod schema_state_tests {
 		TenantKekId, encode_secondary_index_descriptor, encode_secondary_index_drop_request,
 		encode_secondary_index_lifecycle_complete, encode_table_schema_descriptor_v1,
 	};
+	use crate::storage::cdc_locality_heartbeat_finalization;
 	use arrow::datatypes::{DataType, Field, Schema};
+
+	fn finalization_entry(
+		index: u64,
+		finalization: TenantFinalization,
+	) -> Entry<WendelonTypeConfig> {
+		Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
+			payload: EntryPayload::Normal(WendelonRequest::Finalize(finalization)),
+		}
+	}
+
+	#[tokio::test]
+	async fn exact_cdc_heartbeat_is_not_materialized_as_a_data_write_audit() {
+		let heartbeat = cdc_locality_heartbeat_finalization(
+			Locality::new(42),
+			HybridTimestamp {
+				physical_ms: 100,
+				logical: 2,
+				node_id: 1,
+			},
+			7,
+		);
+		let entry = finalization_entry(11, heartbeat);
+		assert!(
+			raft_audit_event(
+				SchemaNodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&entry,
+				&WendelonResponse::Success,
+			)
+			.is_none()
+		);
+		assert!(
+			raft_audit_event(
+				SchemaNodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&entry,
+				&WendelonResponse::Error("refused".to_owned()),
+			)
+			.is_none(),
+			"failed finalizations retain their pre-ADR-079 no-audit behavior"
+		);
+
+		// Exercise the actual apply/materialization seam: the no-op remains
+		// authoritative in state and the finalization stream, while the audit
+		// tracker is never charged.
+		let sink = Arc::new(InMemoryAuditSink::new());
+		let tracker = Arc::new(AuditMaterializationTracker::new());
+		let mut state_machine = WendelonStateMachine::new().with_audit_materializer(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			sink.clone(),
+			tracker.clone(),
+		);
+		let mut finalizations = state_machine.subscribe_finalizations();
+		let responses = RaftStateMachine::apply(&mut state_machine, [entry])
+			.await
+			.unwrap();
+		assert_eq!(responses, vec![WendelonResponse::Success]);
+		assert!(sink.events().is_empty());
+		assert_eq!(tracker.in_flight_entries(), 0);
+		assert_eq!(tracker.lag_entries(), 0);
+		assert_eq!(
+			state_machine
+				.current_admission_snapshot()
+				.e_safe_watermarks
+				.get(&7)
+				.copied(),
+			Some(HybridTimestamp {
+				physical_ms: 100,
+				logical: 2,
+				node_id: 1,
+			})
+		);
+		assert_eq!(finalizations.try_recv().unwrap().epoch, 7);
+	}
+
+	#[test]
+	fn cdc_heartbeat_near_misses_remain_data_write_audits() {
+		let canonical = cdc_locality_heartbeat_finalization(
+			Locality::new(42),
+			HybridTimestamp {
+				physical_ms: 100,
+				logical: 2,
+				node_id: 1,
+			},
+			7,
+		);
+		let mut near_misses = Vec::new();
+		let mut changed = canonical.clone();
+		changed.tenant_id = TenantId::new(9);
+		near_misses.push(changed);
+		let mut changed = canonical.clone();
+		changed.key_identity = crate::schema::Identity::ZERO;
+		near_misses.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.payload_hash[0] ^= 1;
+		near_misses.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.epoch += 1;
+		near_misses.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.commit_hlc.logical += 1;
+		near_misses.push(changed);
+		let mut changed = canonical.clone();
+		changed.charged_bytes = 1;
+		near_misses.push(changed);
+		let mut changed = canonical;
+		changed.record_count = 1;
+		near_misses.push(changed);
+
+		for (offset, near_miss) in near_misses.into_iter().enumerate() {
+			let entry = finalization_entry(20 + offset as u64, near_miss);
+			let event = raft_audit_event(
+				SchemaNodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&entry,
+				&WendelonResponse::Success,
+			)
+			.expect("ADR 079 near-miss finalization must remain audited");
+			assert_eq!(event.operation, AuditOperation::DataWriteFinalized);
+			assert!(matches!(
+				event.schema,
+				Some(AuditSchema::DataAccess {
+					access_kind: DataAccessKind::Write,
+					phase: DataAccessPhase::Finalized,
+					..
+				})
+			));
+			let tracker = AuditMaterializationTracker::new();
+			tracker.note_authoritative_event();
+			assert_eq!(tracker.in_flight_entries(), 1);
+			tracker.note_materialized();
+			assert_eq!(tracker.in_flight_entries(), 0);
+			assert_eq!(tracker.lag_entries(), 0);
+		}
+	}
 
 	fn table_schema() -> Schema {
 		Schema::new(vec![

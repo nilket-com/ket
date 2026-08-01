@@ -1,6 +1,6 @@
 # Wendelon ADR 079: Idle Deployment Write Posture
 
-**Status:** Proposed. **Migration:** `plans/impl/079_idle_deployment_write_posture.md`.
+**Status:** Accepted 2026-08-01. **Migration:** `plans/impl/079_idle_deployment_write_posture.md`.
 **Category:** Operational correction discovered by the first overnight `nilket local` dogfood
 soak. This record preserves ADR 054's CDC progress contract and ADR 025's authoritative audit
 chain while removing accidental write amplification from an otherwise idle local deployment.

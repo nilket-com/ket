@@ -177,6 +177,8 @@ pub struct NodeBootstrapConfig {
 	pub wal_io_depth: u32,
 	/// Depth of the dedicated slab-storage `io_uring` submission queue.
 	pub slab_io_depth: u32,
+	/// ADR 079 cadence for unconditional CDC locality progress markers.
+	pub cdc_locality_heartbeat_interval: Duration,
 	/// `host:port` this node publishes into the membership epoch —
 	/// peers dial here when we advertise a transport tier.
 	pub advertise_address: String,
@@ -270,6 +272,9 @@ impl NodeBootstrapConfig {
 			rf: 1,
 			wal_io_depth: 64,
 			slab_io_depth: 64,
+			cdc_locality_heartbeat_interval: Duration::from_millis(
+				DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS,
+			),
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,
@@ -382,6 +387,12 @@ impl NodeBootstrapConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"slab_io_depth must be greater than zero",
+			));
+		}
+		if self.cdc_locality_heartbeat_interval.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"cdc_locality_heartbeat_interval must be greater than zero",
 			));
 		}
 		if self.advertise_address.trim().is_empty() {
@@ -1759,7 +1770,7 @@ impl WendelonNode {
 			.spawn_cdc_finalization_release_observer();
 		let cdc_locality_heartbeat = data_server.clone().spawn_cdc_locality_heartbeat_supervisor(
 			ring.clone(),
-			Duration::from_millis(DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS),
+			cfg.cdc_locality_heartbeat_interval,
 		);
 		let migration_sweeper = data_server.clone().spawn_migration_sweeper(
 			MIGRATION_SWEEP_INTERVAL,

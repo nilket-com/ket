@@ -89,6 +89,8 @@ lsm_compaction_paused = false
 rf = {{RF}}
 wal_io_depth = {{WAL_IO_DEPTH}}
 slab_io_depth = {{SLAB_IO_DEPTH}}
+# ADR 054/079: bounded CDC watermark progress for quiet localities.
+cdc_locality_heartbeat_interval_millis = {{CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS}}
 
 [identity]
 lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"

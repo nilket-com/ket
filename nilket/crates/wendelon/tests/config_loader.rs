@@ -113,6 +113,7 @@ lsm_compaction_paused = true
 rf = 3
 wal_io_depth = 128
 slab_io_depth = 128
+cdc_locality_heartbeat_interval_millis = 2500
 
 [identity]
 lease_signing_secret = "{lease_secret}"
@@ -140,6 +141,10 @@ transfer_signing_secret = "{transfer_secret}"
 	assert_eq!(cfg.rf, 3);
 	assert_eq!(cfg.wal_io_depth, 128);
 	assert_eq!(cfg.slab_io_depth, 128);
+	assert_eq!(
+		cfg.cdc_locality_heartbeat_interval,
+		std::time::Duration::from_millis(2500)
+	);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:4701");
 	assert_eq!(cfg.lease_signing_secret, lease_secret);
 	assert_eq!(
@@ -223,6 +228,35 @@ transfer_signing_secret = "{transfer_secret}"
 	let cfg = load_node_bootstrap_config(&config_path).unwrap();
 	assert_eq!(cfg.wal_io_depth, 32);
 	assert_eq!(cfg.slab_io_depth, 256);
+	assert_eq!(
+		cfg.cdc_locality_heartbeat_interval,
+		std::time::Duration::from_millis(
+			wendelon::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS
+		)
+	);
+}
+
+#[test]
+fn zero_cdc_locality_heartbeat_interval_is_rejected() {
+	let root = fresh_dir("zero-cdc-heartbeat");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let body = render_example_config().replace(
+		"cdc_locality_heartbeat_interval_millis = 1000",
+		"cdc_locality_heartbeat_interval_millis = 0",
+	);
+	let config_path = write_config(&root, &body);
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("tuning.cdc_locality_heartbeat_interval_millis must be greater than zero"),
+		"unexpected error: {err}"
+	);
+}
+
+#[test]
+fn serious_example_keeps_the_one_second_cdc_heartbeat_default() {
+	let rendered = render_example_config();
+	assert!(rendered.contains("cdc_locality_heartbeat_interval_millis = 1000"));
 }
 
 #[test]

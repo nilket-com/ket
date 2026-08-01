@@ -111,6 +111,23 @@ appears as `data.write_finalized`, materialization lag is nonzero, the deploymen
 queryable, or an idle-path WARN repeats. A synthetic fixture containing both a clean run and each
 failure class proves the evaluator can reject evidence; do not validate only the happy path.
 
+Total idle audit growth is independently budgeted; heartbeat-shaped growth is not the only ceiling.
+The summary enumerates and enforces these per-operation maxima for the owned run:
+
+- `crypto.startup`: exactly one per Wendelon process start;
+- `audit.chain_root`: at most `ceil(duration / 60 seconds) + 1` for the configured 60-second
+  rollup, including a scheduling-boundary allowance;
+- `observability.ready` and `observability.metrics`: at most one each per evaluator-owned probe,
+  with probe counts recorded in `soak_config.json` rather than hidden in a total;
+- every other operation, including `data.write_finalized`: zero while the workload is idle. The
+  queryability probe uses a storage-free statement so the assay does not manufacture data-access
+  evidence merely by observing the deployment.
+
+The total-record budget is the sum of those named maxima and fails even when no record resembles a
+heartbeat. A synthetic unexpected-operation fixture must trip this ceiling, alongside the existing
+heartbeat-growth and WARN controls. This keeps a future accidental idle writer from hiding behind
+the known heartbeat correction.
+
 The fast CI witness uses compressed cadence and a short isolated deployment. The nightly/weekly
 workflow relocation lost during the monorepo graft remains a separate CI plan; this pair produces a
 command ready for that workflow but does not mix CI archaeology into runtime semantics.

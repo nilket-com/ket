@@ -45,6 +45,8 @@ pub mod consensus;
 pub mod crypto;
 pub mod governance;
 pub mod hash;
+#[doc(hidden)]
+pub mod idle_soak;
 pub mod integration;
 pub mod metrics;
 pub mod network;

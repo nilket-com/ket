@@ -67,6 +67,10 @@ pub fn render_example_config() -> String {
 		.replace("{{RF}}", &default_rf().to_string())
 		.replace("{{WAL_IO_DEPTH}}", &default_io_depth().to_string())
 		.replace("{{SLAB_IO_DEPTH}}", &default_io_depth().to_string())
+		.replace(
+			"{{CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS}}",
+			&crate::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS.to_string(),
+		)
 		.replace("{{LEASE_SIGNING_SECRET}}", &hex_string(lease_secret))
 		.replace(
 			"{{LEASE_VERIFYING_KEY}}",
@@ -83,10 +87,15 @@ pub fn render_example_config() -> String {
 /// profile. Smart defaults live in the launcher artifact, not in
 /// [`NodeBootstrapConfig::default`] (TORON-532).
 pub fn render_local_profile_config(data_dir: &Path, pki: &tls_pki::DevelopmentPki) -> String {
-	let mut config = render_example_config().replace(
+	let mut config = render_example_config()
+		.replace(
 		"data_dir = \"data\"",
 		&format!("data_dir = {}", toml_path(data_dir)),
-	);
+		)
+		.replace(
+			"cdc_locality_heartbeat_interval_millis = 1000",
+			"# Local convenience trades CDC frontier latency for quiet idle operation.\ncdc_locality_heartbeat_interval_millis = 30000",
+		);
 	config.push_str(&format!(
 		r#"
 
@@ -506,6 +515,8 @@ struct RawTuningConfig {
 	#[serde(default)]
 	slab_io_depth: Option<u32>,
 	#[serde(default)]
+	cdc_locality_heartbeat_interval_millis: Option<u64>,
+	#[serde(default)]
 	max_inbound_connections: Option<usize>,
 	#[serde(default)]
 	max_inbound_connections_per_ip: Option<usize>,
@@ -521,6 +532,7 @@ impl Default for RawTuningConfig {
 			rf: default_rf(),
 			wal_io_depth: None,
 			slab_io_depth: None,
+			cdc_locality_heartbeat_interval_millis: None,
 			max_inbound_connections: None,
 			max_inbound_connections_per_ip: None,
 			max_inbound_streams_per_connection: None,
@@ -755,6 +767,10 @@ impl RawConfig {
 		}
 		let wal_io_depth = self.tuning.wal_io_depth.unwrap_or(default_io_depth());
 		let slab_io_depth = self.tuning.slab_io_depth.unwrap_or(default_io_depth());
+		let cdc_locality_heartbeat_interval_millis = self
+			.tuning
+			.cdc_locality_heartbeat_interval_millis
+			.unwrap_or(crate::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS);
 		if self.tuning.wal_io_depth == Some(0)
 			|| (self.tuning.wal_io_depth.is_none() && wal_io_depth == 0)
 		{
@@ -769,6 +785,12 @@ impl RawConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"tuning.slab_io_depth must be greater than zero",
+			));
+		}
+		if cdc_locality_heartbeat_interval_millis == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"tuning.cdc_locality_heartbeat_interval_millis must be greater than zero",
 			));
 		}
 		let transport_admission = ServerAdmissionConfig {
@@ -873,6 +895,9 @@ impl RawConfig {
 			rf: self.tuning.rf,
 			wal_io_depth,
 			slab_io_depth,
+			cdc_locality_heartbeat_interval: Duration::from_millis(
+				cdc_locality_heartbeat_interval_millis,
+			),
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,

@@ -2658,6 +2658,7 @@ pub struct MetricsRegistry {
 	pub cdc_catchup_to_live_handoff_micros: Histogram,
 	pub cdc_staged_entries_in_ring: Gauge,
 	pub cdc_pending_finalization_evicted_total: Counter,
+	pub cdc_locality_heartbeats_committed_total: Counter,
 
 	pub tenant_kek_cache_hits_total: Counter,
 	pub tenant_kek_cache_misses_total: Counter,
@@ -2972,6 +2973,7 @@ impl Default for MetricsRegistry {
 			cdc_catchup_to_live_handoff_micros: Histogram::new(LOCAL_READ_LATENCY_BUCKETS_MICROS),
 			cdc_staged_entries_in_ring: Gauge::default(),
 			cdc_pending_finalization_evicted_total: Counter::default(),
+			cdc_locality_heartbeats_committed_total: Counter::default(),
 
 			tenant_kek_cache_hits_total: Counter::default(),
 			tenant_kek_cache_misses_total: Counter::default(),
@@ -5530,6 +5532,12 @@ impl MetricsRegistry {
 			"wendelon_cdc_pending_finalization_evicted_total",
 			"CDC staged entries evicted before finalization cleanup observed them.",
 			self.cdc_pending_finalization_evicted_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_cdc_locality_heartbeats_committed_total",
+			"CDC locality heartbeat finalizations accepted by Raft.",
+			self.cdc_locality_heartbeats_committed_total.get(),
 		);
 		render_gauge(
 			&mut out,

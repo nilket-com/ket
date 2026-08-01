@@ -4,6 +4,7 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 use wendelon::metrics::global as metrics;
 use wendelon::network::cdc::{CDC_SUBSCRIPTION_BUFFER, CdcSubscriptionRegistry};
 use wendelon::schema::{
@@ -299,4 +300,76 @@ async fn cdc_live_tail_locality_heartbeat_worker_can_advance_frontier() {
 	let _ = task.await;
 
 	assert!(frontiers.get(Locality::new(42)).unwrap() >= hlc(100));
+}
+
+#[tokio::test]
+async fn cdc_locality_heartbeat_worker_does_not_emit_while_active() {
+	let emitted = Arc::new(AtomicU64::new(0));
+	let worker = CdcLocalityHeartbeatWorker::new(Locality::new(42), Duration::from_millis(2));
+	let task = {
+		let emitted = emitted.clone();
+		tokio::spawn(async move {
+			worker
+				.run(
+					|_| async { false },
+					move |_| {
+						let emitted = emitted.clone();
+						async move {
+							emitted.fetch_add(1, Ordering::SeqCst);
+							Ok(())
+						}
+					},
+				)
+				.await
+		})
+	};
+
+	tokio::time::sleep(Duration::from_millis(12)).await;
+	assert_eq!(emitted.load(Ordering::SeqCst), 0);
+	task.abort();
+	let _ = task.await;
+}
+
+#[tokio::test]
+async fn cdc_locality_heartbeat_worker_skips_missed_ticks_without_a_burst() {
+	let emitted = Arc::new(AtomicU64::new(0));
+	let first_started = Arc::new(Notify::new());
+	let release_first = Arc::new(Notify::new());
+	let worker = CdcLocalityHeartbeatWorker::new(Locality::new(42), Duration::from_millis(10));
+	let task = {
+		let emitted = emitted.clone();
+		let first_started = first_started.clone();
+		let release_first = release_first.clone();
+		tokio::spawn(async move {
+			worker
+				.run(
+					|_| async { true },
+					move |_| {
+						let emitted = emitted.clone();
+						let first_started = first_started.clone();
+						let release_first = release_first.clone();
+						async move {
+							if emitted.fetch_add(1, Ordering::SeqCst) == 0 {
+								first_started.notify_one();
+								release_first.notified().await;
+							}
+							Ok(())
+						}
+					},
+				)
+				.await
+		})
+	};
+
+	first_started.notified().await;
+	// Miss several scheduled instants while the first proposal is in flight.
+	tokio::time::sleep(Duration::from_millis(35)).await;
+	release_first.notify_one();
+	tokio::time::sleep(Duration::from_millis(2)).await;
+	assert!(
+		emitted.load(Ordering::SeqCst) <= 2,
+		"MissedTickBehavior::Burst would replay every missed interval immediately"
+	);
+	task.abort();
+	let _ = task.await;
 }

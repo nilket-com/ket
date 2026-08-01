@@ -1,6 +1,8 @@
+use crate::consensus::TenantFinalization;
 use crate::metrics::global as metrics;
 use crate::schema::{
-	CdcCursor, CdcRejectCode, Locality, LogicalSchemaFingerprint, TableObjectId, TenantId,
+	CdcCursor, CdcRejectCode, DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity,
+	Locality, LogicalSchemaFingerprint, TableObjectId, TenantId,
 };
 use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, VecDeque};
@@ -15,6 +17,73 @@ pub const DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS: u64 = 1000;
 
 pub type FinalizationLogIndex = u64;
+
+/// Construct the only identity admitted for an ADR 079 CDC locality
+/// heartbeat. Keeping this beside the recognizer makes heartbeat audit
+/// classification a shared protocol fact rather than a second field-level
+/// convention.
+pub(crate) fn cdc_locality_heartbeat_identity(locality_id: Locality) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality_id.get().to_le_bytes());
+	let domain = b"cdc-heartbeat-locality";
+	bytes[8..8 + domain.len()].copy_from_slice(domain);
+	Identity::new(bytes)
+}
+
+pub(crate) fn cdc_locality_heartbeat_payload_hash(
+	locality_id: Locality,
+	commit_hlc: HybridTimestamp,
+	epoch: u64,
+) -> [u8; 32] {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"wendelon.cdc.locality-heartbeat.v1");
+	hasher.update(&locality_id.get().to_le_bytes());
+	hasher.update(&epoch.to_le_bytes());
+	hasher.update(&commit_hlc.physical_ms.to_le_bytes());
+	hasher.update(&commit_hlc.logical.to_le_bytes());
+	hasher.update(&commit_hlc.node_id.to_le_bytes());
+	*hasher.finalize().as_bytes()
+}
+
+pub(crate) fn cdc_locality_heartbeat_finalization(
+	locality_id: Locality,
+	commit_hlc: HybridTimestamp,
+	epoch: u64,
+) -> TenantFinalization {
+	TenantFinalization {
+		marker: FinalizationMarker {
+			log_index: 0,
+			term: 0,
+			epoch,
+			commit_hlc,
+			payload_hash: cdc_locality_heartbeat_payload_hash(locality_id, commit_hlc, epoch),
+			e_safe_index: 0,
+			durability: DurabilityLevel::QUORUM,
+			_pad: [0; 7],
+		},
+		tenant_id: TenantId::ZERO,
+		key_identity: cdc_locality_heartbeat_identity(locality_id),
+		charged_bytes: 0,
+		record_count: 0,
+	}
+}
+
+/// Recognize only the exact, mutation-free heartbeat shape constructed
+/// above. Raft-populated log coordinates are deliberately outside this
+/// identity: they describe the accepted entry, not its application payload.
+pub(crate) fn is_cdc_locality_heartbeat_finalization(finalization: &TenantFinalization) -> bool {
+	let locality_id = Locality::from(finalization.key_identity);
+	finalization.tenant_id == TenantId::ZERO
+		&& finalization.charged_bytes == 0
+		&& finalization.record_count == 0
+		&& finalization.key_identity == cdc_locality_heartbeat_identity(locality_id)
+		&& finalization.marker.payload_hash
+			== cdc_locality_heartbeat_payload_hash(
+				locality_id,
+				finalization.marker.commit_hlc,
+				finalization.marker.epoch,
+			)
+}
 
 #[derive(Debug)]
 pub struct CdcLiveEntry {
@@ -414,11 +483,93 @@ impl CdcLocalityHeartbeatWorker {
 		EF: Future<Output = std::io::Result<()>>,
 	{
 		let mut ticker = interval(self.interval);
+		ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 		loop {
 			ticker.tick().await;
 			if locality_quiet_since_last_finalization(self.locality_id).await {
 				emit_heartbeat_finalization_marker(self.locality_id).await?;
 			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+	use super::*;
+
+	fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms,
+			logical,
+			node_id,
+		}
+	}
+
+	#[test]
+	fn heartbeat_identity_projects_to_source_locality() {
+		for locality_id in [
+			Locality::ZERO,
+			Locality::new(42),
+			Locality::new(0xAABB_CCDD_EEFF_0011),
+			Locality::MAX,
+		] {
+			assert_eq!(
+				Locality::from(cdc_locality_heartbeat_identity(locality_id)),
+				locality_id
+			);
+		}
+	}
+
+	#[test]
+	fn heartbeat_payload_hash_is_locality_hlc_and_epoch_scoped() {
+		let base = cdc_locality_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 3);
+		assert_ne!(
+			base,
+			cdc_locality_heartbeat_payload_hash(Locality::new(8), hlc(100, 0, 1), 3)
+		);
+		assert_ne!(
+			base,
+			cdc_locality_heartbeat_payload_hash(Locality::new(7), hlc(101, 0, 1), 3)
+		);
+		assert_ne!(
+			base,
+			cdc_locality_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 4)
+		);
+	}
+
+	#[test]
+	fn canonical_heartbeat_recognizer_rejects_every_near_miss() {
+		let canonical = cdc_locality_heartbeat_finalization(Locality::new(17), hlc(100, 2, 9), 3);
+		assert!(is_cdc_locality_heartbeat_finalization(&canonical));
+
+		let mut variants = Vec::new();
+		let mut changed = canonical.clone();
+		changed.tenant_id = TenantId::new(1);
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.key_identity = cdc_locality_heartbeat_identity(Locality::new(18));
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.key_identity = Identity::ZERO;
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.payload_hash[0] ^= 1;
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.epoch += 1;
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.marker.commit_hlc.logical += 1;
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.charged_bytes = 1;
+		variants.push(changed);
+		let mut changed = canonical.clone();
+		changed.record_count = 1;
+		variants.push(changed);
+
+		for variant in variants {
+			assert!(!is_cdc_locality_heartbeat_finalization(&variant));
 		}
 	}
 }

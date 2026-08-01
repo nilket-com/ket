@@ -1279,38 +1279,6 @@ fn cdc_retention_reject_code_fires_when_cursor_falls_below_floor() {
 }
 
 #[test]
-fn cdc_heartbeat_identity_projects_to_source_locality() {
-	for locality_id in [
-		Locality::ZERO,
-		Locality::new(42),
-		Locality::new(0xAABB_CCDD_EEFF_0011),
-		Locality::MAX,
-	] {
-		assert_eq!(
-			Locality::from(cdc_heartbeat_identity(locality_id)),
-			locality_id
-		);
-	}
-}
-
-#[test]
-fn cdc_heartbeat_payload_hash_is_locality_and_hlc_scoped() {
-	let base = cdc_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 3);
-	assert_ne!(
-		base,
-		cdc_heartbeat_payload_hash(Locality::new(8), hlc(100, 0, 1), 3)
-	);
-	assert_ne!(
-		base,
-		cdc_heartbeat_payload_hash(Locality::new(7), hlc(101, 0, 1), 3)
-	);
-	assert_ne!(
-		base,
-		cdc_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 4)
-	);
-}
-
-#[test]
 fn cdc_checkpoint_cadence_fires_on_event_count_and_wall_time() {
 	let start = Instant::now();
 	let mut cadence = CdcCheckpointCadence::new(start);

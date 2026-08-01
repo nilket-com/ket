@@ -872,6 +872,15 @@ mod tests {
 			wendelon::config::load_node_bootstrap_config(&paths.wendelon_config).unwrap();
 		let toron = toron::config::load_toron_bootstrap_config(&paths.toron_config).unwrap();
 		assert_eq!(wendelon.node_id, 1);
+		assert_eq!(
+			wendelon.cdc_locality_heartbeat_interval,
+			Duration::from_secs(30)
+		);
+		assert!(
+			fs::read_to_string(&paths.wendelon_config)
+				.unwrap()
+				.contains("cdc_locality_heartbeat_interval_millis = 30000")
+		);
 		assert_eq!(toron.node.tenant_id.0, 0);
 		assert_eq!(toron.sql.unwrap().listener_bind.to_string(), SQL_ENDPOINT);
 		assert_eq!(
