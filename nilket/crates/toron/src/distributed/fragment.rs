@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use arrow::datatypes::SchemaRef;
 use thiserror::Error;
 use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
@@ -7,10 +9,13 @@ use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity,
 };
-use crate::distributed::scheduler::{StagePlan, TaskPlan};
+use crate::distributed::scheduler::{
+	StagePlan, TaskPlan, consumer_supports_live_candidate_inputs, consumer_supports_live_inputs,
+	producer_stage_supports_live,
+};
 use crate::distributed::task::{
-	JoinRuntimeObservationMode, PartitionCount, ScanShare, TaskInputBinding, TaskOutputBinding,
-	TaskSpec, shuffle_input_table_id,
+	JoinRuntimeObservationMode, PartitionCount, ScanShare, ShufflePublishMode, TaskInputBinding,
+	TaskOutputBinding, TaskSpec, shuffle_input_table_id,
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
@@ -107,6 +112,13 @@ pub enum FragmentError {
 	CreateTableAsSelectNotFragmentable,
 	#[error("fragment id namespace {namespace} exceeds the stage/exchange id range")]
 	FragmentIdNamespaceOverflow { namespace: u32 },
+	#[error(
+		"live shuffle producer stage {producer_stage:?} cannot be drained concurrently by consumer stage {consumer_stage:?}"
+	)]
+	UndrainableLiveShuffle {
+		producer_stage: StageId,
+		consumer_stage: Option<StageId>,
+	},
 }
 
 const FRAGMENT_ID_NAMESPACE_STRIDE: u32 = 1_000_000;
@@ -165,6 +177,7 @@ impl FragmentTerminalOutput {
 				exchange_id: *exchange_id,
 				partition_count: PartitionCount::new(*partition_count),
 				partition_key: partition_key.clone(),
+				publish_mode: ShufflePublishMode::Sealed,
 			},
 		}
 	}
@@ -228,13 +241,126 @@ pub fn fragment_plan(
 	}
 
 	let mut allocator = FragmentIdAllocator::new(config.id_namespace)?;
-	let (stages, _) = fragment_execution_plan(
+	let (mut stages, _) = fragment_execution_plan(
 		plan,
 		FragmentTerminalOutput::FinalResult,
 		&mut allocator,
 		config,
 	)?;
+	resolve_shuffle_publish_modes(&mut stages);
+	validate_shuffle_publish_modes(&stages)?;
 	Ok(stages)
+}
+
+fn resolve_shuffle_publish_modes(stages: &mut [StagePlan]) {
+	let mut live_stage_ids = stages
+		.iter()
+		.filter(|stage| producer_stage_supports_live(stage.stage_id, stages))
+		.map(|stage| stage.stage_id)
+		.collect::<BTreeSet<_>>();
+	loop {
+		let before = live_stage_ids.len();
+		let candidates = live_stage_ids.clone();
+		live_stage_ids.retain(|stage_id| producer_can_publish_live(*stage_id, stages, &candidates));
+		if live_stage_ids.len() == before {
+			break;
+		}
+	}
+
+	for stage in stages {
+		let publish_mode = if live_stage_ids.contains(&stage.stage_id) {
+			ShufflePublishMode::Live
+		} else {
+			ShufflePublishMode::Sealed
+		};
+		for task in &mut stage.tasks {
+			if let TaskOutputBinding::ShuffleProducer {
+				publish_mode: task_publish_mode,
+				..
+			} = &mut task.spec.output
+			{
+				*task_publish_mode = publish_mode;
+			}
+		}
+	}
+}
+
+fn producer_can_publish_live(
+	producer_stage_id: StageId,
+	stages: &[StagePlan],
+	live_stage_ids: &BTreeSet<StageId>,
+) -> bool {
+	let consumers = stages
+		.iter()
+		.filter(|stage| stage.upstream_stages.contains(&producer_stage_id))
+		.collect::<Vec<_>>();
+	!consumers.is_empty()
+		&& consumers.iter().all(|stage| {
+			!stage.tasks.is_empty()
+				&& stage.tasks.iter().all(|task| {
+					task_consumes_stage(task, producer_stage_id)
+						&& consumer_supports_live_candidate_inputs(stage, task, live_stage_ids)
+				})
+		})
+}
+
+fn task_consumes_stage(task: &TaskPlan, producer_stage_id: StageId) -> bool {
+	task.spec.inputs.iter().any(|input| {
+		matches!(
+			input,
+			TaskInputBinding::ShuffleConsumer {
+				producer_stage_id: input_stage_id,
+				..
+			} if *input_stage_id == producer_stage_id
+		)
+	})
+}
+
+pub(crate) fn validate_shuffle_publish_modes(stages: &[StagePlan]) -> Result<(), FragmentError> {
+	for producer_stage in stages {
+		let publishes_live = producer_stage.tasks.iter().any(|task| {
+			matches!(
+				task.spec.output,
+				TaskOutputBinding::ShuffleProducer {
+					publish_mode: ShufflePublishMode::Live,
+					..
+				}
+			)
+		});
+		if !publishes_live {
+			continue;
+		}
+		if !producer_stage_supports_live(producer_stage.stage_id, stages) {
+			return Err(FragmentError::UndrainableLiveShuffle {
+				producer_stage: producer_stage.stage_id,
+				consumer_stage: None,
+			});
+		}
+		let consumers = stages
+			.iter()
+			.filter(|stage| stage.upstream_stages.contains(&producer_stage.stage_id))
+			.collect::<Vec<_>>();
+		if consumers.is_empty() {
+			return Err(FragmentError::UndrainableLiveShuffle {
+				producer_stage: producer_stage.stage_id,
+				consumer_stage: None,
+			});
+		}
+		for consumer_stage in consumers {
+			let drainable = !consumer_stage.tasks.is_empty()
+				&& consumer_stage.tasks.iter().all(|task| {
+					task_consumes_stage(task, producer_stage.stage_id)
+						&& consumer_supports_live_inputs(consumer_stage, task, stages)
+				});
+			if !drainable {
+				return Err(FragmentError::UndrainableLiveShuffle {
+					producer_stage: producer_stage.stage_id,
+					consumer_stage: Some(consumer_stage.stage_id),
+				});
+			}
+		}
+	}
+	Ok(())
 }
 
 fn fragment_execution_plan(
@@ -403,6 +529,7 @@ fn fragment_base_plan(
 			exchange_id,
 			partition_count: PartitionCount::new(boundary.partition_count),
 			partition_key: boundary.key,
+			publish_mode: ShufflePublishMode::Sealed,
 		},
 		budget: config.task_budget,
 		trace: None,
@@ -609,6 +736,7 @@ fn union_producer_tasks(
 					exchange_id,
 					partition_count: PartitionCount::new(partition_count),
 					partition_key: key.clone(),
+					publish_mode: ShufflePublishMode::Sealed,
 				},
 				budget: config.task_budget,
 				trace: None,
@@ -1042,6 +1170,7 @@ fn producer_task(
 			exchange_id,
 			partition_count: PartitionCount::new(boundary.partition_count),
 			partition_key: boundary.key,
+			publish_mode: ShufflePublishMode::Sealed,
 		},
 		budget: config.task_budget,
 		trace: None,
@@ -1950,6 +2079,7 @@ mod tests {
 			TaskOutputBinding::ShuffleProducer {
 				exchange_id,
 				partition_count,
+				publish_mode: ShufflePublishMode::Sealed,
 				..
 			} if exchange_id == ExchangeId::new(0)
 				&& partition_count == PartitionCount::new(3)
@@ -1976,6 +2106,82 @@ mod tests {
 					&& producer_partitions.is_empty()
 			));
 		}
+	}
+
+	#[test]
+	fn publication_mode_follows_consumer_drain_eligibility() {
+		let streamable = ExecutionPlan::Exchange {
+			input: Box::new(scan_plan()),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		};
+		let live_stages = fragment_plan(streamable, config()).expect("fragment streamable");
+		assert!(matches!(
+			live_stages[0].tasks[0].spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				publish_mode: ShufflePublishMode::Live,
+				..
+			}
+		));
+
+		let barrier = final_aggregate_plan(ExecutionPlan::Exchange {
+			input: Box::new(scan_plan()),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		});
+		let sealed_stages = fragment_plan(barrier, config()).expect("fragment barrier");
+		assert!(matches!(
+			sealed_stages[0].tasks[0].spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				publish_mode: ShufflePublishMode::Sealed,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn undrainable_live_shuffle_is_rejected_before_dispatch() {
+		let barrier = final_aggregate_plan(ExecutionPlan::Exchange {
+			input: Box::new(scan_plan()),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		});
+		let mut stages = fragment_plan(barrier, config()).expect("fragment barrier");
+		let TaskOutputBinding::ShuffleProducer { publish_mode, .. } =
+			&mut stages[0].tasks[0].spec.output
+		else {
+			panic!("producer output");
+		};
+		*publish_mode = ShufflePublishMode::Live;
+
+		let mut dispatch_log = Vec::new();
+		let result = validate_shuffle_publish_modes(&stages);
+		if result.is_ok() {
+			dispatch_log.push(stages[0].tasks[0].spec.identity);
+		}
+
+		assert_eq!(
+			result.expect_err("undrainable live edge must fail closed"),
+			FragmentError::UndrainableLiveShuffle {
+				producer_stage: StageId::new(0),
+				consumer_stage: Some(StageId::new(1)),
+			}
+		);
+		assert!(dispatch_log.is_empty(), "validation must precede dispatch");
+
+		let TaskOutputBinding::ShuffleProducer { publish_mode, .. } =
+			&mut stages[0].tasks[0].spec.output
+		else {
+			panic!("producer output");
+		};
+		*publish_mode = ShufflePublishMode::Sealed;
+		validate_shuffle_publish_modes(&stages).expect("sealed correction is drainable");
+		dispatch_log.push(stages[0].tasks[0].spec.identity);
+		assert_eq!(
+			dispatch_log.len(),
+			1,
+			"positive control must admit dispatch"
+		);
 	}
 
 	#[test]

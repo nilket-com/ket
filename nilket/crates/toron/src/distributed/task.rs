@@ -370,6 +370,16 @@ pub struct LiveProducerPartitionRef {
 }
 
 pub fn is_streamable_exchange_producer(spec: &TaskSpec) -> bool {
+	matches!(
+		spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			publish_mode: ShufflePublishMode::Live,
+			..
+		}
+	) && exchange_producer_plan_supports_live(spec)
+}
+
+pub fn exchange_producer_plan_supports_live(spec: &TaskSpec) -> bool {
 	matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. })
 		&& matches!(
 			&spec.plan,
@@ -418,6 +428,14 @@ fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 	}
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShufflePublishMode {
+	Live,
+	#[default]
+	Sealed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskOutputBinding {
 	FinalResult,
@@ -425,6 +443,8 @@ pub enum TaskOutputBinding {
 		exchange_id: ExchangeId,
 		partition_count: PartitionCount,
 		partition_key: BoundExprProgram,
+		#[serde(default)]
+		publish_mode: ShufflePublishMode,
 	},
 }
 
@@ -500,6 +520,49 @@ impl RetryPolicy {
 impl Default for RetryPolicy {
 	fn default() -> Self {
 		Self::one_retry()
+	}
+}
+
+#[cfg(test)]
+mod shuffle_publish_mode_tests {
+	use super::*;
+
+	fn output(mode: ShufflePublishMode) -> TaskOutputBinding {
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id: ExchangeId::new(7),
+			partition_count: PartitionCount::new(1),
+			partition_key: BoundExprProgram::empty(),
+			publish_mode: mode,
+		}
+	}
+
+	fn mode(output: &TaskOutputBinding) -> ShufflePublishMode {
+		match output {
+			TaskOutputBinding::ShuffleProducer { publish_mode, .. } => *publish_mode,
+			TaskOutputBinding::FinalResult => panic!("expected shuffle producer"),
+		}
+	}
+
+	#[test]
+	fn legacy_shuffle_output_without_publish_mode_fails_safe_to_sealed() {
+		let mut value = serde_json::to_value(output(ShufflePublishMode::Live)).expect("serialize");
+		value
+			.get_mut("ShuffleProducer")
+			.and_then(serde_json::Value::as_object_mut)
+			.expect("shuffle object")
+			.remove("publish_mode");
+
+		let decoded: TaskOutputBinding = serde_json::from_value(value).expect("decode legacy");
+		assert_eq!(mode(&decoded), ShufflePublishMode::Sealed);
+	}
+
+	#[test]
+	fn explicit_shuffle_publish_modes_round_trip() {
+		for expected in [ShufflePublishMode::Live, ShufflePublishMode::Sealed] {
+			let encoded = serde_json::to_vec(&output(expected)).expect("serialize");
+			let decoded: TaskOutputBinding = serde_json::from_slice(&encoded).expect("deserialize");
+			assert_eq!(mode(&decoded), expected);
+		}
 	}
 }
 

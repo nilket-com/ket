@@ -10,7 +10,9 @@ use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBu
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{ExchangeId, QueryId, StageId};
-use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
+use toron::distributed::task::{
+	PartitionCount, ShufflePublishMode, TaskInputBinding, TaskOutputBinding,
+};
 use toron::error::{BindingError, ExecutionError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -261,9 +263,11 @@ fn three_global_sort_barriers_allocate_unique_stage_and_exchange_ids() {
 				exchange_id,
 				partition_count,
 				partition_key,
+				publish_mode,
 			} => {
 				assert_eq!(*partition_count, PartitionCount::new(1));
 				assert!(partition_key.is_empty_roots());
+				assert_eq!(*publish_mode, ShufflePublishMode::Sealed);
 				Some(exchange_id.get())
 			}
 			TaskOutputBinding::FinalResult => None,
@@ -510,9 +514,11 @@ fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
+			&& *publish_mode == ShufflePublishMode::Sealed
 	));
 	assert_terminal_sort_task(
 		&stages[3].tasks[0].spec,
@@ -542,9 +548,11 @@ fn broadcast_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
+			&& *publish_mode == ShufflePublishMode::Sealed
 	));
 	assert_terminal_sort_task(
 		&stages[2].tasks[0].spec,

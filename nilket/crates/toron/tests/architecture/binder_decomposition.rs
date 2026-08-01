@@ -284,6 +284,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/rune_engine.rs",
 				"crates/toron/src/server/mod.rs",
 				"crates/toron/src/sql_planner.rs",
+				// impl 535: the typed fragment-liveness origin joins the existing bounded
+				// query-error telemetry classifier.
+				"crates/toron/src/telemetry.rs",
 				"crates/toron/tests/aggregate_projection_accounting_test.rs",
 				"crates/toron/tests/catalog_logical_identity_test.rs",
 				"crates/toron/tests/clause_accounting_test.rs",

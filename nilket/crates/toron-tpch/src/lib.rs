@@ -4860,6 +4860,7 @@ pub fn classify_fragment_error(error: &FragmentError) -> &'static str {
 		| FragmentError::InsertSelectNotFragmentable
 		| FragmentError::CreateTableAsSelectNotFragmentable => "fragment_coordinator_only_operation",
 		FragmentError::FragmentIdNamespaceOverflow { .. } => "fragment_id_namespace_overflow",
+		FragmentError::UndrainableLiveShuffle { .. } => "fragment_undrainable_live_shuffle",
 	}
 }
 
@@ -5251,6 +5252,7 @@ fn execution_error_reason(error: &ExecutionError) -> String {
 
 fn execution_census_query_error_reason(error: &QueryError) -> String {
 	match error {
+		QueryError::Fragment(error) => classify_fragment_error(error).to_string(),
 		QueryError::Execution(error) => execution_error_reason(error),
 		QueryError::Storage(_) => "query_storage".to_string(),
 		QueryError::Binding(_) => "query_binding".to_string(),

@@ -299,7 +299,7 @@ pub(crate) fn adr123_task_ready_for_dispatch_relaxes_for_streamable_both() {
 		.and_then(|rest| rest.split("fn sealed_ref_for_producer").next())
 		.expect("materialize_task_spec block");
 
-	assert!(readiness.contains("is_streamable_producer_stage"));
+	assert!(readiness.contains("is_live_publishing_producer_stage"));
 	assert!(readiness.contains("let live_eligible"));
 	assert!(readiness.contains("stage.upstream_stages.len() == 1"));
 	assert!(readiness.contains("is_streamable_shuffle_consumer(&task.spec)"));
@@ -354,7 +354,7 @@ pub(crate) fn adr123_multi_upstream_barrier_holds_for_non_streamable_both() {
 		.expect("stage barrier block");
 
 	assert!(source.contains("self.stage_requires_stage_barrier(stage, stages)"));
-	assert!(requires.contains("is_streamable_producer_stage"));
+	assert!(requires.contains("is_live_publishing_producer_stage"));
 	assert!(requires.contains("let streamable_both"));
 	assert!(requires.contains("&& !streamable_both"));
 	assert!(barrier.contains("upstream_stages.iter().all"));
@@ -757,13 +757,13 @@ pub(crate) fn adr123_streamable_producer_stage_predicate_is_single_task() {
 	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
 		.expect("read scheduler source");
 	let predicate = source
-		.split("fn is_streamable_producer_stage")
+		.split("fn is_live_publishing_producer_stage")
 		.nth(1)
 		.and_then(|rest| {
-			rest.split("fn spec_all_shuffle_inputs_from_streamable_producer_stages")
+			rest.split("pub(crate) fn consumer_supports_live_inputs")
 				.next()
 		})
-		.expect("is_streamable_producer_stage block");
+		.expect("is_live_publishing_producer_stage block");
 
 	assert!(predicate.contains("stage.tasks.len() == 1"));
 	assert!(predicate.contains("is_streamable_exchange_producer(&stage.tasks[0].spec)"));

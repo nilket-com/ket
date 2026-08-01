@@ -1645,9 +1645,7 @@ fn resource_exhausted_query_error(message: String) -> QueryError {
 }
 
 fn fragment_error(error: FragmentError) -> QueryError {
-	QueryError::Internal {
-		message: error.to_string(),
-	}
+	QueryError::Fragment(error)
 }
 
 fn scheduler_error(error: SchedulerError) -> QueryError {

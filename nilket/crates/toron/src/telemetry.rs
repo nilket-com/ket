@@ -649,6 +649,7 @@ fn statement_class_label(class: StatementClass) -> &'static str {
 
 fn query_error_class(error: &QueryError) -> &'static str {
 	match error {
+		QueryError::Fragment(_) => "fragment",
 		QueryError::Frontend(_) => "frontend",
 		QueryError::Binding(_) => "binding",
 		QueryError::Catalog(_) => "catalog",

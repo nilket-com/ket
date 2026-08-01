@@ -25,6 +25,7 @@ pub(crate) mod optimizer_memo_admission;
 pub(crate) mod optimizer_probe_linearity;
 pub(crate) mod optimizer_rotation;
 pub(crate) mod outer_join_completion;
+pub(crate) mod plan_namespace;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod qualified_resolution;
 pub(crate) mod range_distribution;

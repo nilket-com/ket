@@ -896,6 +896,7 @@ impl ToronAuditEvent {
 
 pub fn worker_task_error_class(error: &QueryError) -> &'static str {
 	match error {
+		QueryError::Fragment(_) => "fragment",
 		QueryError::Execution(error) => execution_error_class(error),
 		QueryError::Storage(error) => storage_error_class(error),
 		QueryError::Binding(error) => binding_error_class(error),

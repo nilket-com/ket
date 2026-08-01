@@ -13,7 +13,8 @@ use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, Wo
 use crate::distributed::task::{
 	LiveProducerPartitionRef, PartitionAddress, PartitionManifest, ProducerPartitionRef,
 	RetryPolicy, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding,
-	TaskSpec, TaskTelemetry, is_streamable_exchange_producer, is_streamable_shuffle_consumer,
+	TaskSpec, TaskTelemetry, exchange_producer_plan_supports_live, is_streamable_exchange_producer,
+	is_streamable_shuffle_consumer,
 };
 use crate::distributed::task_state::{
 	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
@@ -632,7 +633,7 @@ where
 		let upstreams_all_streamable_producers = stage
 			.upstream_stages
 			.iter()
-			.all(|upstream| is_streamable_producer_stage(*upstream, stages));
+			.all(|upstream| is_live_publishing_producer_stage(*upstream, stages));
 		let streamable_both = stage.upstream_stages.len() > 1 && upstreams_all_streamable_producers;
 		(stage.upstream_stages.len() != 1 && !streamable_both)
 			|| stage.tasks.iter().any(|task| {
@@ -656,7 +657,7 @@ where
 		let upstreams_all_streamable_producers = stage
 			.upstream_stages
 			.iter()
-			.all(|upstream| is_streamable_producer_stage(*upstream, stages));
+			.all(|upstream| is_live_publishing_producer_stage(*upstream, stages));
 		let streamable_both = stage.upstream_stages.len() > 1 && upstreams_all_streamable_producers;
 		let live_eligible = !contains_broadcast_join(&task.spec.plan)
 			&& ((stage.upstream_stages.len() == 1 && is_streamable_shuffle_consumer(&task.spec))
@@ -1079,13 +1080,58 @@ fn expected_producer_tasks(
 		.map(|stage| stage.tasks.as_slice())
 }
 
-fn is_streamable_producer_stage(stage_id: StageId, stages: &[StagePlan]) -> bool {
+pub(crate) fn producer_stage_supports_live(stage_id: StageId, stages: &[StagePlan]) -> bool {
+	stages
+		.iter()
+		.find(|stage| stage.stage_id == stage_id)
+		.is_some_and(|stage| {
+			stage.tasks.len() == 1 && exchange_producer_plan_supports_live(&stage.tasks[0].spec)
+		})
+}
+
+fn is_live_publishing_producer_stage(stage_id: StageId, stages: &[StagePlan]) -> bool {
 	stages
 		.iter()
 		.find(|stage| stage.stage_id == stage_id)
 		.is_some_and(|stage| {
 			stage.tasks.len() == 1 && is_streamable_exchange_producer(&stage.tasks[0].spec)
 		})
+}
+
+pub(crate) fn consumer_supports_live_inputs(
+	stage: &StagePlan,
+	task: &TaskPlan,
+	stages: &[StagePlan],
+) -> bool {
+	consumer_supports_live_inputs_when(stage, task, |stage_id| {
+		is_live_publishing_producer_stage(stage_id, stages)
+	})
+}
+
+pub(crate) fn consumer_supports_live_candidate_inputs(
+	stage: &StagePlan,
+	task: &TaskPlan,
+	live_stage_ids: &BTreeSet<StageId>,
+) -> bool {
+	consumer_supports_live_inputs_when(stage, task, |stage_id| live_stage_ids.contains(&stage_id))
+}
+
+fn consumer_supports_live_inputs_when(
+	stage: &StagePlan,
+	task: &TaskPlan,
+	producer_is_live: impl Fn(StageId) -> bool,
+) -> bool {
+	if contains_broadcast_join(&task.spec.plan) {
+		return false;
+	}
+	match stage.upstream_stages.len() {
+		1 => is_streamable_shuffle_consumer(&task.spec),
+		0 => false,
+		_ => stage
+			.upstream_stages
+			.iter()
+			.all(|stage_id| producer_is_live(*stage_id)),
+	}
 }
 
 fn spec_all_shuffle_inputs_from_streamable_producer_stages(
@@ -1105,7 +1151,7 @@ fn spec_all_shuffle_inputs_from_streamable_producer_stages(
 	producer_stage_ids.len() > 1
 		&& producer_stage_ids
 			.iter()
-			.all(|stage_id| is_streamable_producer_stage(*stage_id, stages))
+			.all(|stage_id| is_live_publishing_producer_stage(*stage_id, stages))
 }
 
 fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
@@ -1614,6 +1660,7 @@ mod tests {
 			exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		producer
 	}
@@ -2628,6 +2675,7 @@ mod tests {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -2677,6 +2725,7 @@ mod tests {
 			exchange_id: build_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let build_key = TaskKey::from_identity(build.spec.identity);
 		let mut probe = task(StageId::new(1), TaskId::new(0));
@@ -2684,6 +2733,7 @@ mod tests {
 			exchange_id: probe_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let build_manifest = PartitionManifest {
 			query_id: build.spec.identity.query_id,
@@ -2787,12 +2837,14 @@ mod tests {
 			exchange_id: build_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let mut probe = task(StageId::new(1), TaskId::new(0));
 		probe.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: probe_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let build_manifest = PartitionManifest {
 			query_id: build.spec.identity.query_id,
@@ -2946,6 +2998,7 @@ mod tests {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let query_id = producer.spec.identity.query_id;
 		let key = TaskKey::from_identity(producer.spec.identity);
@@ -2999,6 +3052,7 @@ mod tests {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -3067,6 +3121,7 @@ mod tests {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -3258,6 +3313,7 @@ mod tests {
 			exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
@@ -3331,6 +3387,7 @@ mod tests {
 			exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let producer_key = TaskKey::from_identity(producer.spec.identity);
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
@@ -3400,6 +3457,7 @@ mod tests {
 			exchange_id: manifest_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {

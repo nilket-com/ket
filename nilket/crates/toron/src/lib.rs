@@ -2207,6 +2207,7 @@ mod tests {
 				exchange_id: ExchangeId::new(55),
 				partition_count: PartitionCount::new(2),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			..test_task_spec(bound, TaskId::new(55))
 		};

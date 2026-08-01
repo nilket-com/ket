@@ -460,6 +460,7 @@ impl ToronWorker {
 			exchange_id,
 			partition_count,
 			partition_key,
+			..
 		} = &spec.output
 		else {
 			return Err(QueryError::Internal {
@@ -577,6 +578,7 @@ impl ToronWorker {
 			exchange_id,
 			partition_count,
 			partition_key: _,
+			..
 		} = &spec.output
 		else {
 			return Ok(TaskCompletionOutput::FinalResult {
@@ -1682,6 +1684,7 @@ mod tests {
 				exchange_id: ExchangeId::new(1),
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -1838,6 +1841,7 @@ mod tests {
 				exchange_id: ExchangeId::new(1),
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -2997,6 +3001,7 @@ mod tests {
 				exchange_id,
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -3081,6 +3086,7 @@ mod tests {
 				exchange_id: ExchangeId::new(1260),
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -3151,6 +3157,7 @@ mod tests {
 				exchange_id,
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -3244,6 +3251,7 @@ mod tests {
 				exchange_id,
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -3693,6 +3701,7 @@ mod tests {
 				exchange_id,
 				partition_count: PartitionCount::new(1),
 				partition_key: BoundExprProgram::empty(),
+				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,

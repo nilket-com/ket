@@ -1,5 +1,6 @@
 pub mod distributed;
 
+use crate::distributed::fragment::FragmentError;
 use crate::ir::TableId;
 use crate::rune_engine::RuneSandboxViolation;
 pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
@@ -274,6 +275,8 @@ pub enum SpillError {
 
 #[derive(Debug, Error)]
 pub enum QueryError {
+	#[error(transparent)]
+	Fragment(#[from] FragmentError),
 	#[error(transparent)]
 	Execution(#[from] ExecutionError),
 	#[error(transparent)]

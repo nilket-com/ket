@@ -1420,6 +1420,7 @@ async fn record_sql_audit_required_without_response(
 
 fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 	let (code, message) = match &error {
+		QueryError::Fragment(_) => (SqlErrorCode::PlanningError, None),
 		QueryError::Frontend(FrontendError::SqlParse { .. }) => (SqlErrorCode::SyntaxError, None),
 		QueryError::Frontend(_) => (SqlErrorCode::PlanningError, None),
 		QueryError::Binding(BindingError::Catalog(CatalogError::ResourceExhausted { message }))
@@ -1772,6 +1773,20 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant memory budget exhausted");
+	}
+
+	#[test]
+	fn typed_fragment_liveness_error_maps_to_planning_error() {
+		let (code, message) = map_sql_query_error(QueryError::Fragment(
+			crate::distributed::fragment::FragmentError::UndrainableLiveShuffle {
+				producer_stage: crate::distributed::identity::StageId::new(1),
+				consumer_stage: Some(crate::distributed::identity::StageId::new(2)),
+			},
+		));
+
+		assert_eq!(code, SqlErrorCode::PlanningError);
+		assert!(message.contains("live shuffle"));
+		assert!(message.contains("StageId(1)"));
 	}
 
 	#[test]

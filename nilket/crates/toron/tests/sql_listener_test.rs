@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Float32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
@@ -48,11 +48,12 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
-	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_table_schema_descriptor_v1,
+	LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordLayoutPolicy,
+	RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
+	TenantId as WendelonTenantId, encode_table_schema_descriptor_v1,
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
-use wendelon_client::{Client, WriteOptions};
+use wendelon_client::{Client, TableQueryOptions, WriteOptions};
 
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const BASE_TS: i64 = 1_599_998_400_000;
@@ -121,6 +122,138 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 	.await;
 	assert!(!audit.contains("SELECT id, amount"));
 	assert!(!audit.contains("storage_execution"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn order_by_completes_over_live_wendelon_beyond_the_live_shuffle_depth() {
+	const LIVE_SHUFFLE_DEPTH: usize = 4;
+	let fixture = LiveWendelonFixture::start(535).await;
+	let descriptor = categorical_descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	let rows = [
+		("Cat4", 4.4),
+		("Cat1", 1.1),
+		("Cat6", 6.6),
+		("Cat3", 3.3),
+		("Cat2", 2.2),
+		("Cat5", 5.5),
+		("Cat3", 33.3),
+	];
+	for (cat, val) in rows {
+		write_rows(
+			&fixture.client,
+			LIVE_TENANT,
+			&descriptor,
+			categorical_batch(cat, val),
+		)
+		.await;
+	}
+
+	let mut storage_stream = fixture
+		.client
+		.table_query_stream(
+			LIVE_TENANT,
+			&descriptor,
+			Vec::new(),
+			TableQueryOptions::default(),
+		)
+		.await
+		.expect("open real Wendelon table-query stream");
+	let mut producer_batches = 0;
+	while storage_stream
+		.next_batch()
+		.await
+		.expect("read real Wendelon table-query batch")
+		.is_some()
+	{
+		producer_batches += 1;
+	}
+	assert!(
+		producer_batches > LIVE_SHUFFLE_DEPTH,
+		"fixture must cross live pacing depth; observed {producer_batches} batches"
+	);
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	let audit_path = enable_audit(&mut config, "adr535-global-sort");
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let ascending = tokio::time::timeout(
+		Duration::from_secs(2),
+		execute_sql(endpoint, "SELECT cat, val FROM test2 ORDER BY cat"),
+	)
+	.await
+	.expect("ORDER BY must not wait for statement timeout")
+	.expect("ascending ORDER BY response");
+	assert_eq!(
+		categorical_rows(&ascending.batches),
+		vec![
+			("Cat1".to_string(), 1.1),
+			("Cat2".to_string(), 2.2),
+			("Cat3".to_string(), 3.3),
+			("Cat3".to_string(), 33.3),
+			("Cat4".to_string(), 4.4),
+			("Cat5".to_string(), 5.5),
+			("Cat6".to_string(), 6.6),
+		]
+	);
+
+	let descending = execute_sql(
+		endpoint,
+		"SELECT cat, val FROM test2 ORDER BY cat DESC, val DESC LIMIT 3 OFFSET 1",
+	)
+	.await
+	.expect("descending top-k response");
+	assert_eq!(
+		categorical_rows(&descending.batches),
+		vec![
+			("Cat5".to_string(), 5.5),
+			("Cat4".to_string(), 4.4),
+			("Cat3".to_string(), 33.3),
+		]
+	);
+
+	let audit = wait_for_audit_records(&audit_path, &["toron.sql.query.completed"]).await;
+	assert!(!audit.contains("toron.sql.query.timed_out"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_statement_timeout_is_not_laundered_into_a_planning_refusal() {
+	let fixture = LiveWendelonFixture::start(536).await;
+	let descriptor = categorical_descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		categorical_batch("Cat1", 1.1),
+	)
+	.await;
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_nanos(1);
+	let audit_path = enable_audit(&mut config, "adr535-real-timeout");
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let error = execute_sql(endpoint, "SELECT cat, val FROM test2")
+		.await
+		.expect_err("one-nanosecond statement budget must time out");
+	assert_eq!(error.code, SqlErrorCode::StatementTimeout);
+	let audit = wait_for_audit_records(&audit_path, &["toron.sql.query.timed_out"]).await;
+	assert!(!audit.contains("planning_error"));
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
@@ -1436,6 +1569,60 @@ fn descriptor() -> TableSchemaDescriptor {
 		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
+}
+
+fn categorical_descriptor() -> TableSchemaDescriptor {
+	let schema = categorical_schema();
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([0x53; 16]),
+		1,
+		"bench",
+		"test2",
+		&schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.expect("categorical descriptor")
+}
+
+fn categorical_schema() -> Schema {
+	Schema::new(vec![
+		Field::new("cat", DataType::Utf8, false),
+		Field::new("val", DataType::Float32, false),
+	])
+}
+
+fn categorical_batch(cat: &str, val: f32) -> RecordBatch {
+	RecordBatch::try_new(
+		Arc::new(categorical_schema()),
+		vec![
+			Arc::new(StringArray::from(vec![cat])) as ArrayRef,
+			Arc::new(Float32Array::from(vec![val])) as ArrayRef,
+		],
+	)
+	.expect("categorical batch")
+}
+
+fn categorical_rows(batches: &[RecordBatch]) -> Vec<(String, f32)> {
+	let mut rows = Vec::new();
+	for batch in batches {
+		let cats = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("cat column");
+		let vals = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.expect("val column");
+		for row in 0..batch.num_rows() {
+			rows.push((cats.value(row).to_string(), vals.value(row)));
+		}
+	}
+	rows
 }
 
 fn schema() -> Schema {

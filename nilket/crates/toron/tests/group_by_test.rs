@@ -4793,6 +4793,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode: _,
 		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(4)
 			&& partition_key.root_count() == 1
@@ -4817,14 +4818,15 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 					&& partition_id.0 == u32::try_from(partition).unwrap()
 		));
 		assert!(matches!(
-				&task.spec.output,
-				TaskOutputBinding::ShuffleProducer {
-					exchange_id,
-					partition_count,
-					partition_key,
-				} if *exchange_id == ExchangeId::new(0)
-					&& *partition_count == PartitionCount::new(1)
-					&& partition_key.is_empty_roots()
+			&task.spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count,
+				partition_key,
+				publish_mode: _,
+			} if *exchange_id == ExchangeId::new(0)
+				&& *partition_count == PartitionCount::new(1)
+				&& partition_key.is_empty_roots()
 		));
 	}
 
@@ -4908,14 +4910,15 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 					)
 		));
 		assert!(matches!(
-				&task.spec.output,
-				TaskOutputBinding::ShuffleProducer {
-					exchange_id,
-					partition_count,
-					partition_key,
-				} if *exchange_id == ExchangeId::new(0)
-					&& *partition_count == PartitionCount::new(1)
-					&& partition_key.is_empty_roots()
+			&task.spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count,
+				partition_key,
+				publish_mode: _,
+			} if *exchange_id == ExchangeId::new(0)
+				&& *partition_count == PartitionCount::new(1)
+				&& partition_key.is_empty_roots()
 		));
 	}
 	assert!(matches!(
@@ -4952,6 +4955,7 @@ async fn scalar_aggregate_having_only_fragments_to_gathered_terminal_fold() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode: _,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5001,6 +5005,7 @@ async fn scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode: _,
 		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5020,6 +5025,7 @@ async fn scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain() {
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode: _,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5114,6 +5120,7 @@ fn assert_two_exchange_terminal_sort_fragments(
 			exchange_id,
 			partition_count,
 			partition_key,
+			publish_mode: _,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
