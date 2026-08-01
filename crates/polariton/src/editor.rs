@@ -2220,6 +2220,7 @@ fn panel_message<'a>(body: String, tint: Color) -> Element<'a, EditorMsg> {
 	.into()
 }
 
+#[cfg(test)]
 fn pane_title(pane: &libaryon::uast::projection::PaneViewport) -> &str {
 	pane.markdown_preview.as_ref().map_or_else(
 		|| {

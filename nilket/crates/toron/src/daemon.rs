@@ -34,9 +34,7 @@ use crate::config::{
 	load_toron_bootstrap_config,
 };
 use crate::coordinator::DistributedQueryCoordinator;
-use crate::distributed::budget::{
-	BudgetDimension, ByteCount, QueryBudget, TenantDescriptorSyncAccountant,
-};
+use crate::distributed::budget::{BudgetDimension, ByteCount, TenantDescriptorSyncAccountant};
 use crate::distributed::cancellation::{
 	CancellationMetrics, CancellationOutcome, CancellationTrigger, DownstreamCancellationMetrics,
 	QueryCancellation,

@@ -177,6 +177,7 @@ impl GroupKeyStorage {
 		Ok(())
 	}
 
+	#[cfg(test)]
 	fn inner_resident_bytes(&self) -> u64 {
 		match self {
 			Self::Generic(keys) => keys
