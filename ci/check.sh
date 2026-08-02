@@ -30,6 +30,7 @@ run() {
 ensure_targets
 
 run cargo fmt --check
+run packaging/ubuntu/test-nilket-local-user-service.sh
 run scripts/cargo-ctrl --locked
 run env BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
 run cargo test --locked --test architecture_test

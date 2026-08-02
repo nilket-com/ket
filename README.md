@@ -38,3 +38,5 @@ in Baryon, while Polariton owns its GUI, data model, and visualization workflows
 - [Polariton](crates/polariton/README.md) is the GUI data notebook and visualization application.
 
 Shared development infrastructure lives in `ci/`, and technical plans live in `plans/`.
+The optional Ubuntu user service for a persistent local Toron workspace lives in
+[`packaging/ubuntu/`](packaging/ubuntu/README.md).

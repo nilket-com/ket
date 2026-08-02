@@ -1,0 +1,21 @@
+[Unit]
+Description=Nilket local Toron workspace
+
+[Service]
+Type=exec
+ExecStart=@NILKET_EXECUTABLE@ local --data-dir @PROFILE_ROOT@
+Restart=on-failure
+RestartSec=5s
+
+# Nilket handles SIGINT and drains Toron before Wendelon.
+KillSignal=SIGINT
+
+# Signal only Nilket initially. If its ordered drain exceeds the deadline,
+# systemd kills anything still remaining in the service cgroup.
+KillMode=mixed
+TimeoutStopSec=90s
+
+UMask=0077
+
+[Install]
+WantedBy=default.target
