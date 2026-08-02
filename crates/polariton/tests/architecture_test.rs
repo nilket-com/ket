@@ -153,3 +153,58 @@ fn product_0005_polariton_uses_only_public_local_workspace_discovery() {
 		"positive control: PRODUCT-0005 guard must observe private schema and endpoint copies"
 	);
 }
+
+#[test]
+fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manifest =
+		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Polariton manifest");
+	assert_product_dependency_boundary(manifest_dir, ProductBoundary::Polariton);
+	assert!(manifest.contains("nix = {"));
+	assert!(manifest.contains("optional = true"));
+	assert!(manifest.contains("\"dep:nix\""));
+
+	let main =
+		std::fs::read_to_string(manifest_dir.join("src/main.rs")).expect("read Polariton main");
+	assert!(
+		main.contains("#[cfg(feature = \"toron\")]\nmod local_workspace;"),
+		"PRODUCT-0006 process authority must disappear without the Toron feature"
+	);
+	let owner = std::fs::read_to_string(manifest_dir.join("src/local_workspace.rs"))
+		.expect("read session owner");
+	for required in [
+		"std::thread",
+		"set_pdeathsig(Some(parent_death_signal))",
+		"Signal::SIGINT",
+		"process_group(0)",
+		"getppid() != parent",
+		"nilket_local::discover",
+	] {
+		assert!(
+			owner.contains(required),
+			"PRODUCT-0006 owner lost required lifecycle evidence {required}"
+		);
+	}
+	assert!(
+		!owner.contains("LocalReady::parse") && !owner.contains("LOCAL_READY v="),
+		"creation must not infer readiness from supervisor output"
+	);
+
+	let discovery =
+		std::fs::read_to_string(manifest_dir.join("../../nilket/crates/nilket-local/src/lib.rs"))
+			.expect("read PRODUCT-0005 discovery source");
+	let production = discovery
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production discovery source");
+	for forbidden in ["Command::new", "set_pdeathsig", "libc::kill", "try_lock"] {
+		assert!(
+			!production.contains(forbidden),
+			"PRODUCT-0006 leaked lifecycle authority into discovery: {forbidden}"
+		);
+	}
+	assert!(
+		"Command::new(\"nilket\"); set_pdeathsig(Some(Signal::SIGINT));".contains("Command::new"),
+		"positive control: PRODUCT-0006 lifecycle assay must fire"
+	);
+}

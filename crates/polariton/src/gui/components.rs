@@ -163,6 +163,7 @@ pub fn main_screen<'a>(
 	show_column_types: bool,
 	status_detail: Option<(&'a str, &'a text_editor::Content)>,
 	status_detail_open: bool,
+	local_workspace_offer: Option<&'a std::path::Path>,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner. The nested
 	// dashboard still owns its own pixel-space grid inside its host panel.
@@ -221,7 +222,50 @@ pub fn main_screen<'a>(
 	} else {
 		container(text("")).into()
 	};
-	stack![main_window, adapter_modal, settings_modal, detail_overlay].into()
+	#[cfg(feature = "toron")]
+	let local_workspace_overlay: Element<Message> = local_workspace_offer.map_or_else(
+		|| container(text("")).into(),
+		|profile_root| {
+			container(opaque(
+				container(
+					column![
+						text("Start local Toron workspace?").size(18),
+						text(format!(
+							"Create a session-bound development workspace at {}. It will stop when this editor closes.",
+							profile_root.display()
+						))
+						.wrapping(text::Wrapping::Word),
+						row![
+							space::horizontal(),
+							button("Start workspace").on_press(Message::StartLocalWorkspace)
+						]
+					]
+					.spacing(14),
+				)
+				.width(Length::Fixed(620.0))
+				.padding(18)
+				.style(status_detail_card_style),
+			))
+			.width(Fill)
+			.height(Fill)
+			.align_x(Alignment::Center)
+			.align_y(Alignment::Center)
+			.into()
+		},
+	);
+	#[cfg(not(feature = "toron"))]
+	let local_workspace_overlay: Element<Message> = {
+		let _ = local_workspace_offer;
+		container(text("")).into()
+	};
+	stack![
+		main_window,
+		adapter_modal,
+		settings_modal,
+		detail_overlay,
+		local_workspace_overlay
+	]
+	.into()
 }
 
 fn status_detail_overlay(content: &text_editor::Content) -> Element<'_, Message> {

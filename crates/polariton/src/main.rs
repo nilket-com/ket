@@ -4,6 +4,8 @@ mod core;
 mod editor;
 mod fonts;
 mod gui;
+#[cfg(feature = "toron")]
+mod local_workspace;
 mod plot;
 mod result_registry;
 mod rune_host;

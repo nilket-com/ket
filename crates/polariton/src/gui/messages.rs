@@ -45,6 +45,14 @@ pub enum Message {
 		workspace: nilket_local::ReadyWorkspace,
 		connection: Result<Arc<RwLock<dyn DatabaseAdapter>>, String>,
 	},
+	#[cfg(feature = "toron")]
+	StartLocalWorkspace,
+	#[cfg(feature = "toron")]
+	LocalWorkspaceStartupSettled(
+		std::result::Result<nilket_local::ReadyWorkspace, (nilket_local::LocalWorkspace, String)>,
+	),
+	#[cfg(feature = "toron")]
+	LocalWorkspaceStopped(String),
 	/// The session's in-memory scratch database finished opening at startup.
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),

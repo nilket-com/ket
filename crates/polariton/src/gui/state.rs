@@ -58,6 +58,12 @@ struct AppState {
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
+	#[cfg(feature = "toron")]
+	local_creation: crate::local_workspace::CreationGrant,
+	#[cfg(feature = "toron")]
+	local_workspace_owner: Option<crate::local_workspace::LocalWorkspaceOwner>,
+	#[cfg(feature = "toron")]
+	closing_local_workspace: bool,
 	pending_runs: VecDeque<PendingRun>,
 }
 
@@ -277,6 +283,12 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
+		#[cfg(feature = "toron")]
+		local_creation: crate::local_workspace::CreationGrant::default(),
+		#[cfg(feature = "toron")]
+		local_workspace_owner: None,
+		#[cfg(feature = "toron")]
+		closing_local_workspace: false,
 		pending_runs: VecDeque::new(),
 	};
 	sync_workspace_viewport(&mut state);
@@ -320,6 +332,10 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.show_column_types,
 		status_detail.map(|detail| (detail.full.as_str(), &detail.content)),
 		app_state.status_detail_open,
+		#[cfg(feature = "toron")]
+		app_state.local_creation.offer(),
+		#[cfg(not(feature = "toron"))]
+		None,
 	)
 }
 
@@ -849,6 +865,31 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 		}
 		Message::CloseWindow => {
+			#[cfg(feature = "toron")]
+			{
+				if app_state.closing_local_workspace {
+					return Task::none();
+				}
+				if let Some(owner) = app_state.local_workspace_owner.take() {
+					app_state.closing_local_workspace = true;
+					app_state.status_error.clear();
+					app_state.status_msg =
+						"Stopping the local workspace: draining Toron before Wendelon…".into();
+					return Task::perform(
+						async move {
+							tokio::task::spawn_blocking(move || {
+								owner.stop(crate::local_workspace::STOP_DEADLINE)
+							})
+							.await
+							.map_or_else(
+								|error| format!("local workspace stop task failed: {error}"),
+								|outcome| format!("{outcome:?}"),
+							)
+						},
+						Message::LocalWorkspaceStopped,
+					);
+				}
+			}
 			return window::latest().and_then(window::close);
 		}
 		Message::Menu(menu_message) => {
@@ -950,10 +991,22 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		},
 		#[cfg(feature = "toron")]
 		Message::LocalWorkspaceDiscovered(workspace) => {
+			if app_state.closing_local_workspace {
+				return Task::none();
+			}
 			app_state.adapter_state.local_workspace = Some(workspace.clone());
+			app_state.local_creation.observe(&workspace);
 			let nilket_local::LocalWorkspace::Ready(ready) = workspace else {
 				app_state.status_error = workspace.to_string();
-				app_state.status_msg = "SQL scratch remains active.".into();
+				app_state.status_msg = app_state.local_creation.offer().map_or_else(
+					|| "SQL scratch remains active.".to_owned(),
+					|root| {
+						format!(
+							"Local workspace is absent. Start a session-bound workspace at {}?",
+							root.display()
+						)
+					},
+				);
 				return Task::none();
 			};
 			app_state.status_error.clear();
@@ -983,36 +1036,101 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::LocalWorkspaceAttached {
 			workspace,
 			connection,
-		} => match connection {
-			Ok(connection) => {
-				app_state.adapter_state.selection =
-					crate::adapters::driver::AdapterSelection::Toron;
-				app_state.adapter_state.configuration =
-					crate::adapters::driver::AdapterConfiguration::Toron {
-						endpoint: workspace.sql_endpoint.to_string(),
+		} => {
+			if app_state.closing_local_workspace {
+				return Task::none();
+			}
+			match connection {
+				Ok(connection) => {
+					app_state.adapter_state.selection =
+						crate::adapters::driver::AdapterSelection::Toron;
+					app_state.adapter_state.configuration =
+						crate::adapters::driver::AdapterConfiguration::Toron {
+							endpoint: workspace.sql_endpoint.to_string(),
+						};
+					app_state.adapter_state.name = "local workspace".to_owned();
+					app_state.adapter_state.connection = Some(connection);
+					app_state.adapter_state.stage = AdapterStage::Connected;
+					app_state.adapter_state.local_workspace =
+						Some(nilket_local::LocalWorkspace::Ready(workspace.clone()));
+					app_state.status_error.clear();
+					app_state.status_msg = format!(
+						"Joined local workspace session {}.",
+						workspace.identity.session_nonce
+					);
+				}
+				Err(cause) => {
+					let unhealthy = nilket_local::LocalWorkspace::Unhealthy {
+						identity: workspace.identity,
+						cause,
 					};
-				app_state.adapter_state.name = "local workspace".to_owned();
-				app_state.adapter_state.connection = Some(connection);
-				app_state.adapter_state.stage = AdapterStage::Connected;
-				app_state.adapter_state.local_workspace =
-					Some(nilket_local::LocalWorkspace::Ready(workspace.clone()));
-				app_state.status_error.clear();
-				app_state.status_msg = format!(
-					"Joined local workspace session {}.",
-					workspace.identity.session_nonce
-				);
+					app_state.status_error = unhealthy.to_string();
+					app_state.status_msg = "SQL scratch remains active.".into();
+					app_state.adapter_state.connection = None;
+					app_state.adapter_state.local_workspace = Some(unhealthy);
+				}
 			}
-			Err(cause) => {
-				let unhealthy = nilket_local::LocalWorkspace::Unhealthy {
-					identity: workspace.identity,
-					cause,
-				};
-				app_state.status_error = unhealthy.to_string();
-				app_state.status_msg = "SQL scratch remains active.".into();
-				app_state.adapter_state.connection = None;
-				app_state.adapter_state.local_workspace = Some(unhealthy);
+		}
+		#[cfg(feature = "toron")]
+		Message::StartLocalWorkspace => {
+			if app_state.closing_local_workspace {
+				return Task::none();
 			}
-		},
+			let Some(profile_root) = app_state.local_creation.accept() else {
+				return Task::none();
+			};
+			app_state.status_error.clear();
+			app_state.status_msg = format!(
+				"Starting local workspace at {} under this Polariton session…",
+				profile_root.display()
+			);
+			let owner = crate::local_workspace::LocalWorkspaceOwner::launch(profile_root.clone());
+			let monitor = owner.monitor();
+			app_state.local_workspace_owner = Some(owner);
+			return Task::perform(
+				crate::local_workspace::watch_until_ready(
+					profile_root,
+					monitor,
+					crate::local_workspace::STARTUP_DEADLINE,
+				),
+				|outcome| match outcome {
+					crate::local_workspace::StartupOutcome::Ready(ready) => {
+						Message::LocalWorkspaceStartupSettled(Ok(ready))
+					}
+					crate::local_workspace::StartupOutcome::Failed { observed, cause } => {
+						Message::LocalWorkspaceStartupSettled(Err((observed, cause)))
+					}
+				},
+			);
+		}
+		#[cfg(feature = "toron")]
+		Message::LocalWorkspaceStartupSettled(result) => {
+			if app_state.closing_local_workspace {
+				return Task::none();
+			}
+			match result {
+				Ok(ready) => {
+					return update(
+						app_state,
+						Message::LocalWorkspaceDiscovered(nilket_local::LocalWorkspace::Ready(
+							ready,
+						)),
+					);
+				}
+				Err((observed, cause)) => {
+					app_state.adapter_state.local_workspace = Some(observed);
+					app_state.status_error = cause;
+					app_state.status_msg =
+					"Local workspace creation failed; the one-shot grant was spent. SQL scratch remains active."
+						.into();
+				}
+			}
+		}
+		#[cfg(feature = "toron")]
+		Message::LocalWorkspaceStopped(outcome) => {
+			app_state.status_msg = format!("Local workspace stopped ({outcome}).");
+			return window::latest().and_then(window::close);
+		}
 		Message::ScratchReady(scratch) => {
 			if scratch.is_none() {
 				app_state.status_error = "Scratch database failed to open.".to_string();
@@ -1733,6 +1851,7 @@ mod tests {
 	#[test]
 	fn local_discovery_attaches_only_ready_workspaces() {
 		for workspace in non_ready_local_workspaces() {
+			let is_absent = matches!(workspace, LocalWorkspace::Absent { .. });
 			let expected_status = workspace.to_string();
 			let (mut state, startup) = new(StartupData::default(), None);
 			drop(startup);
@@ -1749,7 +1868,14 @@ mod tests {
 			assert!(state.adapter_state.connection.is_none());
 			assert_eq!(state.adapter_state.local_workspace, Some(workspace));
 			assert_eq!(state.status_error, expected_status);
-			assert_eq!(state.status_msg, "SQL scratch remains active.");
+			assert_eq!(state.local_creation.offer().is_some(), is_absent);
+			if is_absent {
+				assert!(state.status_msg.contains("Start a session-bound workspace"));
+				let offer_frame = view(&state);
+				drop(offer_frame);
+			} else {
+				assert_eq!(state.status_msg, "SQL scratch remains active.");
+			}
 			state.code_editor.shutdown();
 		}
 
@@ -1773,6 +1899,7 @@ mod tests {
 				.status_msg
 				.contains(&ready.identity.session_nonce.to_string())
 		);
+		assert!(state.local_creation.offer().is_none());
 		state.code_editor.shutdown();
 	}
 
@@ -1813,7 +1940,161 @@ mod tests {
 		assert!(state.adapter_state.scratch_is_active());
 		assert_eq!(state.adapter_state.connection_identity(), "scratch");
 		assert_eq!(state.status_error, expected_status);
-		assert_eq!(state.status_msg, "SQL scratch remains active.");
+		assert!(state.status_msg.contains("Start a session-bound workspace"));
+		assert!(state.local_creation.offer().is_some());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn spent_creation_failure_does_not_reoffer_or_retry() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let root = std::path::PathBuf::from("/tmp/polariton-product-0006-spent");
+		let absent = LocalWorkspace::Absent {
+			profile_root: root.clone(),
+		};
+		drop(update(
+			&mut state,
+			Message::LocalWorkspaceDiscovered(absent.clone()),
+		));
+		assert_eq!(state.local_creation.accept(), Some(root));
+		let settled = update(
+			&mut state,
+			Message::LocalWorkspaceStartupSettled(Err((
+				absent,
+				"controlled startup failure".to_owned(),
+			))),
+		);
+		assert_eq!(settled.units(), 0, "failure must arm no retry or timer");
+		assert!(state.local_creation.offer().is_none());
+		assert_eq!(state.status_error, "controlled startup failure");
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn matching_ready_observation_without_a_handle_confers_no_stop_authority() {
+		let root = std::env::temp_dir().join(format!(
+			"polariton-product-0006-attached-{}",
+			std::process::id()
+		));
+		std::fs::create_dir_all(&root).unwrap();
+		let signal = root.join("signal");
+		let mut child = std::process::Command::new("/bin/sh")
+			.arg("-c")
+			.arg("trap 'printf signaled > \"$1\"; exit 0' INT; while :; do sleep 0.02; done")
+			.arg("attached-fixture")
+			.arg(&signal)
+			.spawn()
+			.unwrap();
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let mut identity = local_identity();
+		identity.owner_pid = child.id();
+		state.adapter_state.local_workspace = Some(LocalWorkspace::Ready(ReadyWorkspace {
+			sql_endpoint: "127.0.0.1:9".parse().unwrap(),
+			identity,
+		}));
+		assert!(state.local_workspace_owner.is_none());
+		let close = update(&mut state, Message::CloseWindow);
+		assert!(!state.closing_local_workspace);
+		drop(close);
+		std::thread::sleep(std::time::Duration::from_millis(50));
+		assert!(child.try_wait().unwrap().is_none());
+		assert!(!signal.exists());
+		child.kill().unwrap();
+		child.wait().unwrap();
+		std::fs::remove_dir_all(root).unwrap();
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn close_with_an_owned_workspace_enters_visible_bounded_shutdown() {
+		let command = std::process::Command::new("/bin/true");
+		let owner = crate::local_workspace::LocalWorkspaceOwner::launch_command(
+			command,
+			nix::sys::signal::Signal::SIGINT,
+		);
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.local_workspace_owner = Some(owner);
+		let close = update(&mut state, Message::CloseWindow);
+		assert_eq!(close.units(), 1, "owned close must wait before closing");
+		assert!(state.closing_local_workspace);
+		assert!(state.local_workspace_owner.is_none());
+		assert!(state.status_error.is_empty());
+		assert!(state.status_msg.contains("draining Toron before Wendelon"));
+		let stopping = state.status_msg.clone();
+		let absent = LocalWorkspace::Absent {
+			profile_root: "/tmp/polariton-product-0006-closing".into(),
+		};
+		state.local_creation.observe(&absent);
+		assert_eq!(update(&mut state, Message::StartLocalWorkspace).units(), 0);
+		assert!(state.local_creation.offer().is_some());
+		assert_eq!(
+			update(&mut state, Message::LocalWorkspaceDiscovered(absent)).units(),
+			0
+		);
+		assert_eq!(
+			update(
+				&mut state,
+				Message::LocalWorkspaceStartupSettled(Err((
+					LocalWorkspace::Absent {
+						profile_root: "/tmp/polariton-product-0006-closing".into(),
+					},
+					"late failure".to_owned(),
+				))),
+			)
+			.units(),
+			0
+		);
+		assert_eq!(
+			update(
+				&mut state,
+				Message::LocalWorkspaceAttached {
+					workspace: ReadyWorkspace {
+						sql_endpoint: "127.0.0.1:9".parse().unwrap(),
+						identity: local_identity(),
+					},
+					connection: Err("late attach".to_owned()),
+				},
+			)
+			.units(),
+			0
+		);
+		assert_eq!(state.status_msg, stopping);
+		assert!(state.status_error.is_empty());
+		assert_eq!(
+			update(&mut state, Message::CloseWindow).units(),
+			0,
+			"a second close must not start another stop"
+		);
+		drop(close);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn startup_success_enters_the_existing_attach_path_only_after_ready() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let ready = ReadyWorkspace {
+			sql_endpoint: "127.0.0.1:9".parse().unwrap(),
+			identity: local_identity(),
+		};
+		assert!(state.adapter_state.local_workspace.is_none());
+		let attach = update(
+			&mut state,
+			Message::LocalWorkspaceStartupSettled(Ok(ready.clone())),
+		);
+		assert_eq!(attach.units(), 1);
+		assert_eq!(
+			state.adapter_state.local_workspace,
+			Some(LocalWorkspace::Ready(ready))
+		);
+		assert!(state.adapter_state.connection.is_none());
 		state.code_editor.shutdown();
 	}
 

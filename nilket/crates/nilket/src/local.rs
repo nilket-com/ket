@@ -120,10 +120,10 @@ fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
 	if options.reset {
 		reset_locked_profile(&paths)?;
 	}
+	preflight_endpoints().map_err(|conflict| conflict.to_string())?;
 	let marker = ensure_profile(&paths)?;
 	let pki = ensure_artifacts(&paths)?;
 	validate_artifacts(&paths)?;
-	preflight_endpoints()?;
 	refuse_non_regular_artifact_if_present(&paths.runtime, "runtime manifest")?;
 	if paths.runtime.exists() {
 		fs::remove_file(&paths.runtime).map_err(|error| {
@@ -446,22 +446,121 @@ fn report_existing(paths: &ProfilePaths) -> Result<ExitCode, String> {
 	}
 }
 
-fn preflight_endpoints() -> Result<(), String> {
-	let mut held: Vec<Box<dyn std::any::Any>> = Vec::new();
-	for endpoint in ["127.0.0.1:7001", SQL_ENDPOINT] {
-		held.push(Box::new(UdpSocket::bind(endpoint).map_err(|error| {
-			format!("required local UDP endpoint {endpoint} is unavailable: {error}")
-		})?));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRole {
+	Wendelon,
+	Toron,
+}
+
+impl std::fmt::Display for LocalRole {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Wendelon => formatter.write_str("Wendelon"),
+			Self::Toron => formatter.write_str("Toron"),
+		}
 	}
-	for endpoint in [
-		"127.0.0.1:7001",
-		"127.0.0.1:7431",
-		READY_ENDPOINT,
-		"127.0.0.1:7433",
-	] {
-		held.push(Box::new(TcpListener::bind(endpoint).map_err(|error| {
-			format!("required local TCP endpoint {endpoint} is unavailable: {error}")
-		})?));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointTransport {
+	Udp,
+	Tcp,
+}
+
+impl std::fmt::Display for EndpointTransport {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Udp => formatter.write_str("UDP"),
+			Self::Tcp => formatter.write_str("TCP"),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndpointRequirement {
+	role: LocalRole,
+	transport: EndpointTransport,
+	endpoint: &'static str,
+}
+
+const ENDPOINT_REQUIREMENTS: [EndpointRequirement; 6] = [
+	EndpointRequirement {
+		role: LocalRole::Wendelon,
+		transport: EndpointTransport::Udp,
+		endpoint: "127.0.0.1:7001",
+	},
+	EndpointRequirement {
+		role: LocalRole::Toron,
+		transport: EndpointTransport::Udp,
+		endpoint: SQL_ENDPOINT,
+	},
+	EndpointRequirement {
+		role: LocalRole::Wendelon,
+		transport: EndpointTransport::Tcp,
+		endpoint: "127.0.0.1:7001",
+	},
+	EndpointRequirement {
+		role: LocalRole::Wendelon,
+		transport: EndpointTransport::Tcp,
+		endpoint: "127.0.0.1:7431",
+	},
+	EndpointRequirement {
+		role: LocalRole::Wendelon,
+		transport: EndpointTransport::Tcp,
+		endpoint: READY_ENDPOINT,
+	},
+	EndpointRequirement {
+		role: LocalRole::Wendelon,
+		transport: EndpointTransport::Tcp,
+		endpoint: "127.0.0.1:7433",
+	},
+];
+
+#[derive(Debug)]
+struct EndpointConflict {
+	requirement: EndpointRequirement,
+	source: io::Error,
+}
+
+impl std::fmt::Display for EndpointConflict {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"local creation conflict: {} {} endpoint {} is unavailable: {}",
+			self.requirement.role,
+			self.requirement.transport,
+			self.requirement.endpoint,
+			self.source
+		)
+	}
+}
+
+fn preflight_endpoints() -> Result<(), EndpointConflict> {
+	preflight_requirements(&ENDPOINT_REQUIREMENTS)
+}
+
+fn preflight_requirements(requirements: &[EndpointRequirement]) -> Result<(), EndpointConflict> {
+	let mut held: Vec<Box<dyn std::any::Any>> = Vec::new();
+	for &requirement in requirements {
+		let socket: Box<dyn std::any::Any> = match requirement.transport {
+			EndpointTransport::Udp => {
+				Box::new(UdpSocket::bind(requirement.endpoint).map_err(|source| {
+					EndpointConflict {
+						requirement,
+						source,
+					}
+				})?)
+			}
+			EndpointTransport::Tcp => {
+				Box::new(TcpListener::bind(requirement.endpoint).map_err(|source| {
+					EndpointConflict {
+						requirement,
+						source,
+					}
+				})?)
+			}
+		};
+		held.push(socket);
 	}
 	drop(held);
 	Ok(())
@@ -726,7 +825,9 @@ fn path_text(path: &Path) -> Result<&str, String> {
 mod tests {
 	use super::*;
 	use std::os::unix::fs::MetadataExt;
-	use std::sync::Barrier;
+	use std::sync::{Barrier, Mutex};
+
+	static PREFLIGHT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 	fn fresh_root(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!(
@@ -806,6 +907,101 @@ mod tests {
 		assert_eq!(pki, second);
 		assert_eq!(fs::read(&paths.toron_config).unwrap(), retained);
 		assert_eq!(marker.format_version, FORMAT_VERSION);
+		drop(lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn preflight_conflict_precedes_identity_and_leaves_an_absent_profile() {
+		let _serial = PREFLIGHT_TEST_LOCK.lock().unwrap();
+		let occupied = UdpSocket::bind(SQL_ENDPOINT).expect("occupy Toron SQL endpoint");
+		let root = fresh_root("preflight-residue");
+		let error = run_owned(LocalOptions {
+			data_dir: Some(root.clone()),
+			reset: false,
+		})
+		.unwrap_err();
+		let paths = ProfilePaths::new(root.clone());
+		assert!(error.contains("Toron UDP endpoint 127.0.0.1:7742"));
+		assert!(
+			!paths.marker.exists(),
+			"failed creation must publish no identity"
+		);
+		assert!(
+			!paths.pki_dir.exists(),
+			"failed creation must generate no PKI"
+		);
+		assert!(paths.lock.exists(), "the ownership shape may remain");
+		assert!(matches!(
+			blocking_discover(Some(&root)),
+			LocalWorkspace::Absent { .. }
+		));
+		drop(occupied);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn every_preflight_conflict_is_typed_without_guessing_an_occupant() {
+		let _serial = PREFLIGHT_TEST_LOCK
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		for requirement in ENDPOINT_REQUIREMENTS {
+			let (occupied, endpoint): (Box<dyn std::any::Any>, SocketAddr) =
+				match requirement.transport {
+					EndpointTransport::Udp => {
+						let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+						let endpoint = socket.local_addr().unwrap();
+						(Box::new(socket), endpoint)
+					}
+					EndpointTransport::Tcp => {
+						let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+						let endpoint = socket.local_addr().unwrap();
+						(Box::new(socket), endpoint)
+					}
+				};
+			let endpoint: &'static str = Box::leak(endpoint.to_string().into_boxed_str());
+			let synthetic = EndpointRequirement {
+				endpoint,
+				..requirement
+			};
+			let conflict = preflight_requirements(&[synthetic]).unwrap_err();
+			assert_eq!(conflict.requirement, synthetic);
+			let rendered = conflict.to_string();
+			assert!(rendered.contains(&requirement.role.to_string()));
+			assert!(rendered.contains(&requirement.transport.to_string()));
+			assert!(rendered.contains(endpoint));
+			for speculation in ["foreign", "another process", "another Nilket", "occupant"] {
+				assert!(
+					!rendered.contains(speculation),
+					"bind evidence must not speculate about {speculation}: {rendered}"
+				);
+			}
+			drop(occupied);
+		}
+		assert_eq!(ENDPOINT_REQUIREMENTS.len(), 6);
+		assert!(ENDPOINT_REQUIREMENTS.iter().all(|entry| {
+			!entry.endpoint.is_empty()
+				&& matches!(entry.role, LocalRole::Wendelon | LocalRole::Toron)
+				&& matches!(
+					entry.transport,
+					EndpointTransport::Udp | EndpointTransport::Tcp
+				)
+		}));
+	}
+
+	#[test]
+	fn successful_preflight_allows_identity_and_pki_generation() {
+		let _serial = PREFLIGHT_TEST_LOCK.lock().unwrap();
+		preflight_endpoints().expect("fixture endpoints are unoccupied");
+		let root = fresh_root("preflight-positive");
+		let paths = ProfilePaths::new(root.clone());
+		prepare_root_for_lock(&root).unwrap();
+		let lock = open_lock(&paths.lock).unwrap();
+		lock.lock_exclusive().unwrap();
+		ensure_profile(&paths).unwrap();
+		ensure_artifacts(&paths).unwrap();
+		assert!(paths.marker.is_file());
+		assert!(paths.pki_dir.is_dir());
 		drop(lock);
 		fs::remove_dir_all(root).unwrap();
 	}
