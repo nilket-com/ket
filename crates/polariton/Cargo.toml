@@ -7,7 +7,7 @@ authors = ["Joel Bondurant"]
 description = "A strong coupling of data and visualization."
 
 [features]
-default = []
+default = ["toron"]
 toron = [
 	"dep:nilket-local",
 	"dep:nix",

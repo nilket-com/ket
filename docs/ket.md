@@ -28,12 +28,14 @@ surfaces you use:
 
     cargo install --locked --force --path crates/ket
     cargo install --locked --force --path crates/baryon
-    cargo install --locked --force --path crates/polariton --features toron
+    cargo install --locked --force --path crates/polariton
     CARGO_TARGET_DIR="$PWD/nilket/target" \
       cargo install --locked --force --path nilket/crates/nilket
 
 The Nilket installation supplies the deployment and both expert role routes;
 there are no separate Toron or Wendelon installation requirements for ket.
+Polariton includes Toron support by default for the ordinary dogfood product;
+use `--no-default-features` only when deliberately building the reduced head.
 
 Resolution checks for a sibling executable beside ket, then searches PATH. A
 missing target is an honest refusal with an install hint. The router does not
@@ -42,4 +44,3 @@ a supervising process.
 
 V1 supports Linux, where ket uses process replacement so the target inherits
 the same PID, signals, working directory, environment, and standard streams.
-

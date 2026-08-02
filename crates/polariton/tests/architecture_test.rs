@@ -160,6 +160,10 @@ fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
 	let manifest =
 		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Polariton manifest");
 	assert_product_dependency_boundary(manifest_dir, ProductBoundary::Polariton);
+	assert!(
+		manifest.contains("default = [\"toron\"]"),
+		"the dogfood Polariton build must include Toron unless explicitly reduced"
+	);
 	assert!(manifest.contains("nix = {"));
 	assert!(manifest.contains("optional = true"));
 	assert!(manifest.contains("\"dep:nix\""));
