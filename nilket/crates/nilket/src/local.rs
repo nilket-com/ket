@@ -828,6 +828,10 @@ mod tests {
 	use std::sync::{Barrier, Mutex};
 
 	static PREFLIGHT_TEST_LOCK: Mutex<()> = Mutex::new(());
+	// A concurrent fork briefly inherits open descriptors before CLOEXEC runs.
+	// Keep process-spawn fixtures from crossing the proof that a dropped profile
+	// lock is immediately acquirable.
+	static PROCESS_AND_LOCK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 	fn fresh_root(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!(
@@ -1123,6 +1127,7 @@ mod tests {
 
 	#[test]
 	fn child_is_in_its_own_process_group_and_drains_on_owned_signal() {
+		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
 		let mut child = OwnedChild::spawn(
 			"fixture",
 			Path::new("/bin/sh"),
@@ -1140,6 +1145,7 @@ mod tests {
 
 	#[test]
 	fn owned_shutdown_finishes_toron_before_signaling_wendelon() {
+		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
 		let root = fresh_root("shutdown-order");
 		fs::create_dir_all(&root).unwrap();
 		let log = root.join("signals.log");
@@ -1183,6 +1189,7 @@ mod tests {
 
 	#[test]
 	fn stale_manifest_with_live_recycled_pid_has_no_lock_authority() {
+		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
 		let root = fresh_root("stale-pid");
 		let paths = ProfilePaths::new(root.clone());
 		prepare_root_for_lock(&root).unwrap();
