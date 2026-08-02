@@ -33,6 +33,7 @@ in Baryon, while Polariton owns its GUI, data model, and visualization workflows
 
 ## Applications
 
+- [ket](docs/ket.md) is the transparent product router and canonical command-line front door.
 - [Baryon](docs/baryon.md) is the modal terminal editor and the primary reference for the headless engine.
 - [Polariton](crates/polariton/README.md) is the GUI data notebook and visualization application.
 

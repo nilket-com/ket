@@ -1,0 +1,11 @@
+[package]
+name = "ket"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "The transparent product router for ket."
+
+[[bin]]
+name = "ket"
+path = "src/main.rs"
+
