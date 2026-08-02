@@ -64,7 +64,10 @@ pub fn render_example_config() -> String {
 		.replace("{{ADVERTISE_ADDRESS}}", EXAMPLE_ADVERTISE_ADDRESS)
 		.replace("{{DATA_DIR}}", EXAMPLE_DATA_DIR)
 		.replace("{{SLAB_MAX_BYTES}}", &default_slab_max_bytes().to_string())
-		.replace("{{RF}}", &default_rf().to_string())
+		.replace(
+			"{{REPLICATION_FACTOR}}",
+			&default_replication_factor().to_string(),
+		)
 		.replace("{{WAL_IO_DEPTH}}", &default_io_depth().to_string())
 		.replace("{{SLAB_IO_DEPTH}}", &default_io_depth().to_string())
 		.replace(
@@ -515,9 +518,10 @@ impl RawEncodingComputeConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTuningConfig {
-	#[serde(default = "default_rf")]
-	rf: usize,
+	#[serde(default = "default_replication_factor")]
+	replication_factor: usize,
 	#[serde(default)]
 	wal_io_depth: Option<u32>,
 	#[serde(default)]
@@ -539,7 +543,7 @@ struct RawTuningConfig {
 impl Default for RawTuningConfig {
 	fn default() -> Self {
 		Self {
-			rf: default_rf(),
+			replication_factor: default_replication_factor(),
 			wal_io_depth: None,
 			slab_io_depth: None,
 			cdc_locality_heartbeat_interval_millis: None,
@@ -770,10 +774,10 @@ impl RawConfig {
 				),
 			));
 		}
-		if self.tuning.rf == 0 {
+		if self.tuning.replication_factor == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
-				"tuning.rf must be greater than zero",
+				"tuning.replication_factor must be greater than zero",
 			));
 		}
 		let wal_io_depth = self.tuning.wal_io_depth.unwrap_or(default_io_depth());
@@ -913,7 +917,7 @@ impl RawConfig {
 			data_dir,
 			slab_max_bytes,
 			group_commit: crate::storage::GroupCommitConfig::default(),
-			rf: self.tuning.rf,
+			rf: self.tuning.replication_factor,
 			wal_io_depth,
 			slab_io_depth,
 			cdc_locality_heartbeat_interval: Duration::from_millis(
@@ -1105,7 +1109,7 @@ const fn default_slab_max_bytes() -> u64 {
 	64 * 1024 * 1024
 }
 
-const fn default_rf() -> usize {
+const fn default_replication_factor() -> usize {
 	1
 }
 

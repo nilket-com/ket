@@ -110,7 +110,7 @@ slab_max_bytes = 123456
 lsm_compaction_paused = true
 
 [tuning]
-rf = 3
+replication_factor = 3
 wal_io_depth = 128
 slab_io_depth = 128
 cdc_locality_heartbeat_interval_millis = 2500
@@ -187,6 +187,20 @@ transfer_signing_secret = "{transfer_secret}"
 		}
 		other => panic!("expected local-sealed root_kek_provider default, got {other:?}"),
 	}
+}
+
+#[test]
+fn obsolete_rf_tuning_key_is_rejected_instead_of_silently_defaulting() {
+	let root = fresh_dir("obsolete-rf-key");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let body = render_example_config().replace("replication_factor = 1", "rf = 3");
+	let config_path = write_config(&root, &body);
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	let message = err.to_string();
+	assert!(
+		message.contains("unknown field `rf`") && message.contains("replication_factor"),
+		"unexpected error: {err}"
+	);
 }
 
 #[test]

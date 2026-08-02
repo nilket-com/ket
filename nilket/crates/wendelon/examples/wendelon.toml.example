@@ -86,7 +86,7 @@ lsm_compaction_paused = false
 # enabled_aggregate_kernels = ["count_star", "count_non_null", "min", "max", "signed_sum", "unsigned_sum", "signed_avg", "unsigned_avg"]
 
 [tuning]
-rf = {{RF}}
+replication_factor = {{REPLICATION_FACTOR}}
 wal_io_depth = {{WAL_IO_DEPTH}}
 slab_io_depth = {{SLAB_IO_DEPTH}}
 # ADR 054/079: bounded CDC watermark progress for quiet localities.

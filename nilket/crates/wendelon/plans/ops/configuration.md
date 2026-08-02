@@ -19,7 +19,7 @@ slab_max_bytes = 67108864
 lsm_compaction_paused = false
 
 [tuning]
-rf = 1
+replication_factor = 1
 wal_io_depth = 64
 slab_io_depth = 64
 max_inbound_connections = 1024

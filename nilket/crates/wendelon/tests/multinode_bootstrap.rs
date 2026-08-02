@@ -99,7 +99,7 @@ advertise_address = "{advertise_address}"
 data_dir = "data"
 
 [tuning]
-rf = {rf}
+replication_factor = {rf}
 wal_io_depth = 64
 slab_io_depth = 64
 
