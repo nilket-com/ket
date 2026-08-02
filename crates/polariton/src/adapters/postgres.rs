@@ -14,7 +14,8 @@ use tokio_stream::StreamExt;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "connection_string",
-	value: "postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]",
+	placeholder: "postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]",
+	default_value: None,
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];

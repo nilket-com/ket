@@ -12,7 +12,8 @@ use std::time::Duration;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "connection_string",
-	value: "mysql://user:p%40ssword@host:3306/database",
+	placeholder: "mysql://user:p%40ssword@host:3306/database",
+	default_value: None,
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];

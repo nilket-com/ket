@@ -4,7 +4,8 @@ use polars::sql::SQLContext;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "input_path",
-	value: "",
+	placeholder: "",
+	default_value: None,
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];

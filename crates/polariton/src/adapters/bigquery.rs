@@ -22,7 +22,8 @@ use std::io::Cursor;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "project_id",
-	value: "",
+	placeholder: "",
+	default_value: None,
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];

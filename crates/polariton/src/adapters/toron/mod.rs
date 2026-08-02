@@ -8,7 +8,8 @@ use async_trait::async_trait;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "endpoint",
-	value: "127.0.0.1:7742",
+	placeholder: "127.0.0.1:7742",
+	default_value: Some("127.0.0.1:7742"),
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];

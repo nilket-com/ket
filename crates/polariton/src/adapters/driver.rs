@@ -82,6 +82,20 @@ pub struct AdapterState {
 }
 
 impl AdapterState {
+	/// Select an adapter and seed only values its descriptor declares as safe,
+	/// usable defaults. Placeholder examples never become connection input.
+	pub fn select(&mut self, selection: AdapterSelection) {
+		self.fields.clear();
+		self.fields
+			.extend(fields_for(&selection).iter().filter_map(|field| {
+				field
+					.default_value
+					.map(|value| (field.key.into(), value.into()))
+			}));
+		self.selection = selection;
+		self.stage = AdapterStage::Unconfigured;
+	}
+
 	/// The connection SQL executes against: the external adapter when one is
 	/// connected, otherwise the session scratch database.
 	pub fn sql_connection(&self) -> Option<&Arc<RwLock<dyn DatabaseAdapter>>> {
@@ -323,7 +337,29 @@ pub fn fields_for(selection: &AdapterSelection) -> &'static [AdapterField] {
 
 #[cfg(test)]
 mod tests {
-	use super::{AdapterConfiguration, AdapterState};
+	use super::{AdapterConfiguration, AdapterSelection, AdapterState};
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn selecting_toron_prefills_the_canonical_local_endpoint() {
+		let mut state = AdapterState::default();
+		state.fields.insert("stale".into(), "old adapter".into());
+
+		state.select(AdapterSelection::Toron);
+
+		assert_eq!(state.fields.len(), 1);
+		assert_eq!(
+			state.fields.get("endpoint").map(String::as_str),
+			Some("127.0.0.1:7742")
+		);
+	}
+
+	#[test]
+	fn placeholder_examples_do_not_become_connection_values() {
+		let mut state = AdapterState::default();
+		state.select(AdapterSelection::Postgres);
+		assert!(state.fields.is_empty());
+	}
 
 	#[test]
 	fn sql_connection_prefers_external_and_falls_back_to_scratch() {

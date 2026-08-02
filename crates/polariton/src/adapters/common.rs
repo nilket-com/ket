@@ -21,7 +21,8 @@ pub enum AdapterFieldType {
 #[derive(Clone, Debug)]
 pub struct AdapterField {
 	pub key: &'static str,
-	pub value: &'static str,
+	pub placeholder: &'static str,
+	pub default_value: Option<&'static str>,
 	pub field_type: &'static AdapterFieldType,
 	pub is_secure: bool,
 }

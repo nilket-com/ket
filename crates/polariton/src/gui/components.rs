@@ -775,9 +775,10 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 					match descriptor.field_type {
 						AdapterFieldType::Text => {
 							let input = if descriptor.is_secure {
-								styled_text_input(descriptor.value, &current_value).secure(true)
+								styled_text_input(descriptor.placeholder, &current_value)
+									.secure(true)
 							} else {
-								styled_text_input(descriptor.value, &current_value)
+								styled_text_input(descriptor.placeholder, &current_value)
 							};
 							let input = input
 								.on_input(move |val| {

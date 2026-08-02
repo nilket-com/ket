@@ -868,9 +868,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 		},
 		Message::AdapterSelected(adapter_selection) => {
-			app_state.adapter_state.stage = AdapterStage::Unconfigured;
 			app_state.status_msg = format!("Adapter selected: {:?}", adapter_selection);
-			app_state.adapter_state.selection = adapter_selection;
+			app_state.adapter_state.select(adapter_selection);
 		}
 		Message::AdapterConfigurationChanged(key, value) => {
 			app_state.adapter_state.fields.insert(key, value);
