@@ -52,6 +52,43 @@ query = { package = "datafusion", version = "49" }
 	);
 }
 
+#[test]
+fn product_0003_public_protocol_exposes_no_private_rune_plan_vocabulary() {
+	let src = manifest_path("src");
+	let mut violations = Vec::new();
+	for entry in std::fs::read_dir(src).expect("read toron-client source") {
+		let path = entry.expect("source entry").path();
+		if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+			continue;
+		}
+		let source = std::fs::read_to_string(&path).expect("read source");
+		for marker in private_rune_plan_vocabulary(&source) {
+			violations.push(format!("{}: {marker}", path.display()));
+		}
+	}
+	assert!(
+		violations.is_empty(),
+		"PRODUCT-0003 keeps Toron's Rune plan private: {violations:?}"
+	);
+	assert_eq!(
+		private_rune_plan_vocabulary("pub fn leak(_: LogicalPlan) {}"),
+		vec!["LogicalPlan"],
+		"positive control: the private-plan assay must visibly fire"
+	);
+}
+
+fn private_rune_plan_vocabulary(source: &str) -> Vec<&'static str> {
+	[
+		"LogicalPlan",
+		"RuneEngine",
+		"FrontendError",
+		"crate::rune_engine",
+	]
+	.into_iter()
+	.filter(|marker| source.contains(marker))
+	.collect()
+}
+
 fn manifest_path(relative: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
 }

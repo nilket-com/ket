@@ -83,6 +83,21 @@ impl SqlFrame {
 		}
 	}
 
+	pub fn execute_rune(query_id: QueryId, source: String, timeout_seconds: Option<u32>) -> Self {
+		Self::execute_rune_request(
+			query_id,
+			ExecuteRuneRequest::current(source, timeout_seconds),
+		)
+	}
+
+	pub const fn execute_rune_request(query_id: QueryId, request: ExecuteRuneRequest) -> Self {
+		Self {
+			protocol_version: SqlProtocolVersion::Current,
+			query_id,
+			message: SqlMessage::ExecuteRune(request),
+		}
+	}
+
 	pub const fn response(query_id: QueryId, message: SqlMessage) -> Self {
 		Self {
 			protocol_version: SqlProtocolVersion::Current,
@@ -107,6 +122,8 @@ pub enum SqlMessage {
 	// Append-only: postcard encodes enum discriminants by declaration order.
 	Health(HealthRequest),
 	Healthy(HealthyResponse),
+	ExecuteRune(ExecuteRuneRequest),
+	RuneError(RuneFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +131,116 @@ pub struct ExecuteRequest {
 	pub statement: String,
 	pub statement_timeout_seconds: Option<u32>,
 	pub session_timezone: String,
+}
+
+macro_rules! rune_version {
+	($name:ident) => {
+		#[derive(
+			Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+		)]
+		pub struct $name(pub u16);
+
+		impl $name {
+			pub const CURRENT: Self = Self(1);
+		}
+	};
+}
+
+rune_version!(RuneRequestProtocolVersion);
+rune_version!(RuneLanguageSurfaceVersion);
+rune_version!(RuneSandboxContractVersion);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteRuneRequest {
+	pub source: String,
+	pub request_protocol_version: RuneRequestProtocolVersion,
+	pub language_surface_version: RuneLanguageSurfaceVersion,
+	pub sandbox_contract_version: RuneSandboxContractVersion,
+	pub statement_timeout_seconds: Option<u32>,
+}
+
+impl ExecuteRuneRequest {
+	pub fn current(source: String, statement_timeout_seconds: Option<u32>) -> Self {
+		Self {
+			source,
+			request_protocol_version: RuneRequestProtocolVersion::CURRENT,
+			language_surface_version: RuneLanguageSurfaceVersion::CURRENT,
+			sandbox_contract_version: RuneSandboxContractVersion::CURRENT,
+			statement_timeout_seconds,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuneSourceSpan {
+	pub start: u32,
+	pub end: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuneVersionAxis {
+	RequestProtocol,
+	LanguageSurface,
+	SandboxContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuneVersionSkew {
+	pub axis: RuneVersionAxis,
+	pub requested: u16,
+	pub supported: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuneCapability {
+	Filesystem,
+	Process,
+	Network,
+	Environment,
+	Time,
+	Random,
+	Threading,
+	Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuneSandboxViolation {
+	FuelExhausted {
+		fuel_consumed: u64,
+		fuel_budget: u64,
+	},
+	MemoryExhausted {
+		bytes_used: u64,
+		bytes_budget: u64,
+	},
+	CapabilityDenied {
+		capability: RuneCapability,
+	},
+	SourceTooLarge {
+		bytes: u64,
+		budget: u64,
+	},
+	Timeout {
+		elapsed_millis: u64,
+	},
+	InvalidEntrypoint,
+	InternalSandboxError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuneFailureKind {
+	Compile,
+	Runtime,
+	Sandbox(RuneSandboxViolation),
+	VersionSkew(RuneVersionSkew),
+	Execution(SqlErrorCode),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuneFailure {
+	pub kind: RuneFailureKind,
+	pub message: String,
+	pub span: Option<RuneSourceSpan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +347,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn existing_postcard_discriminants_remain_stable() {
+	fn historical_postcard_discriminants_remain_stable() {
 		let query_id = QueryId::from_u128(1);
 		let variants = [
 			SqlMessage::Execute(ExecuteRequest {
@@ -238,12 +365,14 @@ mod tests {
 				code: SqlErrorCode::SyntaxError,
 				message: String::new(),
 			}),
+			SqlMessage::Health(HealthRequest),
+			SqlMessage::Healthy(HealthyResponse),
 		];
 		let discriminants = variants
 			.iter()
 			.map(|message| postcard::to_allocvec(message).expect("encode")[0])
 			.collect::<Vec<_>>();
-		assert_eq!(discriminants, [0, 1, 2, 3, 4]);
+		assert_eq!(discriminants, [0, 1, 2, 3, 4, 5, 6]);
 	}
 
 	#[test]
@@ -259,5 +388,47 @@ mod tests {
 		};
 		assert_eq!(request.statement_timeout_seconds, Some(7));
 		assert_eq!(request.session_timezone, "America/Chicago");
+	}
+
+	#[test]
+	fn rune_request_round_trips_all_three_versions() {
+		let frame = SqlFrame::execute_rune(
+			QueryId::from_u128(3),
+			"pub fn main(workspace) { workspace.table(\"t\") }".to_owned(),
+			Some(9),
+		);
+		let encoded = postcard::to_allocvec(&frame).expect("encode");
+		let decoded: SqlFrame = postcard::from_bytes(&encoded).expect("decode");
+		let SqlMessage::ExecuteRune(request) = decoded.message else {
+			panic!("expected Rune request");
+		};
+		assert_eq!(
+			request.request_protocol_version,
+			RuneRequestProtocolVersion::CURRENT
+		);
+		assert_eq!(
+			request.language_surface_version,
+			RuneLanguageSurfaceVersion::CURRENT
+		);
+		assert_eq!(
+			request.sandbox_contract_version,
+			RuneSandboxContractVersion::CURRENT
+		);
+		assert_eq!(request.statement_timeout_seconds, Some(9));
+	}
+
+	#[test]
+	fn rune_variants_append_after_historical_discriminants() {
+		let query_id = QueryId::from_u128(4);
+		let request = SqlFrame::execute_rune(query_id, String::new(), None);
+		let failure = RuneFailure {
+			kind: RuneFailureKind::Compile,
+			message: String::new(),
+			span: None,
+		};
+		let request_discriminant = postcard::to_allocvec(&request.message).expect("encode")[0];
+		let error_discriminant =
+			postcard::to_allocvec(&SqlMessage::RuneError(failure)).expect("encode")[0];
+		assert_eq!((request_discriminant, error_discriminant), (7, 8));
 	}
 }

@@ -283,6 +283,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/network/observability.rs",
 				"crates/toron/src/rune_engine.rs",
 				"crates/toron/src/server/mod.rs",
+				// PRODUCT-0003: the append-only ExecuteRune request and typed failure
+				// variants extend the public client protocol without exposing LogicalPlan.
+				"crates/toron/src/sql_wire.rs",
 				"crates/toron/src/sql_planner.rs",
 				// impl 535: the typed fragment-liveness origin joins the existing bounded
 				// query-error telemetry classifier.

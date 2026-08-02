@@ -30,8 +30,10 @@ use toron::network::tls::{
 };
 use toron::quic::QuicEndpoint;
 use toron::sql_wire::{
-	CancelRequest, Complete, SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
-	read_frame as read_sql_frame, write_frame as write_sql_frame,
+	CancelRequest, Complete, RuneFailure, RuneFailureKind, RuneLanguageSurfaceVersion,
+	RuneRequestProtocolVersion, RuneSandboxContractVersion, RuneSandboxViolation, RuneVersionAxis,
+	SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion, read_frame as read_sql_frame,
+	write_frame as write_sql_frame,
 };
 use toron::storage::TenantId as ToronTenantId;
 use toron_client::ToronClient;
@@ -125,6 +127,136 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_failures() {
+	let fixture = LiveWendelonFixture::start(1003).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	let audit_path = enable_audit(&mut config, "product-0003-rune-source");
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("query endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+
+	let result = client
+		.execute_rune(
+			r#"pub fn main(workspace) {
+				workspace.table("storage_execution")
+					.filter(col("amount").gt(lit(100)))
+					.project([col("id"), col("amount"), col("region")])
+			}"#,
+		)
+		.await
+		.expect("Rune query result");
+	assert_eq!(result.row_count, 2);
+	let batches = result
+		.batches
+		.iter()
+		.flat_map(|bytes| {
+			StreamReader::try_new(bytes.as_slice(), None)
+				.expect("open Rune Arrow IPC stream")
+				.map(|batch| batch.expect("read Rune batch"))
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(projected_rows(&batches).len(), 2);
+
+	let composed = client
+		.execute_rune(
+			r#"pub fn main(workspace) {
+				workspace.table("storage_execution")
+					.filter(col("amount").gt(lit(0)))
+					.aggregate([col("region")], [sum(col("amount"))])
+					.sort([col("region").asc()])
+					.limit(2)
+					.project([col("region"), col("sum")])
+			}"#,
+		)
+		.await
+		.expect("composed Rune relation result");
+	assert_eq!(
+		composed.row_count, 2,
+		"the public Rune route must preserve filter, aggregate, sort, limit, and projection"
+	);
+
+	let sandbox = client
+		.execute_rune("pub fn main(workspace) { std::fs::read_to_string(\"x\"); workspace.table(\"storage_execution\") }")
+		.await
+		.expect_err("filesystem capability must be denied");
+	assert!(matches!(
+		sandbox,
+		toron_client::ClientError::Rune(RuneFailure {
+			kind: RuneFailureKind::Sandbox(RuneSandboxViolation::CapabilityDenied { .. }),
+			..
+		})
+	));
+
+	let compile = client
+		.execute_rune("pub fn main(workspace) { workspace.table( }")
+		.await
+		.expect_err("invalid Rune must fail compilation");
+	let toron_client::ClientError::Rune(RuneFailure {
+		kind: RuneFailureKind::Compile,
+		span,
+		..
+	}) = compile
+	else {
+		panic!("expected typed Rune compile failure: {compile:?}");
+	};
+	assert!(span.is_some(), "Rune compiler location must cross the wire");
+
+	let audit = wait_for_audit_records(&audit_path, &["query_frontend", "rune"]).await;
+	assert!(!audit.contains("\"query_frontend\":\"sql\""));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versions() {
+	let daemon = ToronDaemon::start(toron_config_with_descriptor(descriptor(), true))
+		.await
+		.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("query endpoint");
+	for axis in [
+		RuneVersionAxis::RequestProtocol,
+		RuneVersionAxis::LanguageSurface,
+		RuneVersionAxis::SandboxContract,
+	] {
+		let mut frame = SqlFrame::execute_rune(
+			QueryId::new(),
+			"pub fn main(workspace) { workspace.table(\"storage_execution\") }".to_owned(),
+			None,
+		);
+		let SqlMessage::ExecuteRune(request) = &mut frame.message else {
+			unreachable!();
+		};
+		match axis {
+			RuneVersionAxis::RequestProtocol => {
+				request.request_protocol_version = RuneRequestProtocolVersion(77)
+			}
+			RuneVersionAxis::LanguageSurface => {
+				request.language_surface_version = RuneLanguageSurfaceVersion(77)
+			}
+			RuneVersionAxis::SandboxContract => {
+				request.sandbox_contract_version = RuneSandboxContractVersion(77)
+			}
+		}
+		let failure = execute_rune_until_failure(endpoint, frame).await;
+		let RuneFailureKind::VersionSkew(skew) = failure.kind else {
+			panic!("expected version skew for {axis:?}: {failure:?}");
+		};
+		assert_eq!(skew.axis, axis);
+		assert_eq!(skew.requested, 77);
+		assert_eq!(skew.supported, vec![1]);
+	}
+	daemon.shutdown().await.expect("shutdown daemon");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -399,6 +531,19 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 			(2, Some(150), Some("east".to_string())),
 			(4, Some(200), Some("west".to_string())),
 		]
+	);
+	let rune = execute_rune_authenticated(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"pub fn main(workspace) { workspace.table(\"storage_execution\").project([col(\"id\")]) }",
+	)
+	.await;
+	assert_eq!(
+		rune.complete.row_count, 4,
+		"Rune must inherit SQL's authenticated transport and tenant authorization"
 	);
 
 	daemon.shutdown().await.expect("shutdown daemon");
@@ -1044,6 +1189,22 @@ async fn execute_sql_until_error(
 	}
 }
 
+async fn execute_rune_until_failure(endpoint: SocketAddr, frame: SqlFrame) -> RuneFailure {
+	let client = QuicEndpoint::client().expect("Rune client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect Rune");
+	write_sql_frame(&mut stream, &frame)
+		.await
+		.expect("write Rune request");
+	stream.finish().await.expect("finish Rune request");
+	let response = read_sql_frame(&mut stream)
+		.await
+		.expect("read Rune failure");
+	match response.message {
+		SqlMessage::RuneError(failure) => failure,
+		other => panic!("expected Rune failure, got {other:?}"),
+	}
+}
+
 async fn execute_sql(
 	endpoint: std::net::SocketAddr,
 	statement: &str,
@@ -1118,6 +1279,49 @@ async fn execute_sql_authenticated(
 			SqlMessage::Complete(complete) => return Ok(SqlResponse { batches, complete }),
 			SqlMessage::Error(error) => return Err(error),
 			other => panic!("unexpected SQL response frame: {other:?}"),
+		}
+	}
+}
+
+async fn execute_rune_authenticated(
+	endpoint: SocketAddr,
+	server_name: &str,
+	cert: &Path,
+	key: &Path,
+	ca: &Path,
+	source: &str,
+) -> SqlResponse {
+	let client_config = client_config_from_paths(cert, key, ca).expect("client TLS config");
+	let client = QuicEndpoint::client_authenticated(client_config).expect("authenticated client");
+	let mut stream = client
+		.connect_stream_with_server_name(endpoint, server_name)
+		.await
+		.expect("connect authenticated Rune request");
+	let query_id = QueryId::new();
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame::execute_rune(query_id, source.to_owned(), None),
+	)
+	.await
+	.expect("write Rune request");
+	stream.finish().await.expect("finish Rune request");
+
+	let mut batches = Vec::new();
+	loop {
+		let frame = read_sql_frame(&mut stream)
+			.await
+			.expect("read Rune response");
+		match frame.message {
+			SqlMessage::ResultBatch(batch) => {
+				let reader = StreamReader::try_new(batch.arrow_ipc_bytes.as_slice(), None)
+					.expect("open Arrow IPC stream");
+				for batch in reader {
+					batches.push(batch.expect("read Arrow IPC batch"));
+				}
+			}
+			SqlMessage::Complete(complete) => return SqlResponse { batches, complete },
+			SqlMessage::RuneError(error) => panic!("unexpected Rune failure: {error:?}"),
+			other => panic!("unexpected Rune response frame: {other:?}"),
 		}
 	}
 }

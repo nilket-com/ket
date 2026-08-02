@@ -1,6 +1,6 @@
 use crate::catalog::TableRef;
 use crate::date32::parse_date_ymd;
-use crate::error::FrontendError;
+use crate::error::{FrontendError, RuneDiagnosticSpan};
 use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE,
@@ -13,6 +13,8 @@ use crate::sql_planner::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use rune::alloc::limit;
+use rune::ast::Spanned;
+use rune::diagnostics::{Diagnostic, FatalDiagnosticKind};
 use rune::runtime::{TypeHash, VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
 use std::sync::Arc;
@@ -42,12 +44,14 @@ const RUNE_OPTIMIZER_READOUT_TABLES: [&str; 8] = [
 fn rune_compile_error(error: impl std::fmt::Display) -> FrontendError {
 	FrontendError::RuneCompile {
 		message: error.to_string(),
+		span: None,
 	}
 }
 
 fn rune_runtime_error(error: impl std::fmt::Display) -> FrontendError {
 	FrontendError::RuneRuntime {
 		message: error.to_string(),
+		span: None,
 	}
 }
 
@@ -1802,7 +1806,20 @@ fn compile_script(
 				}));
 			}
 
-			return Err(FrontendError::RuneCompile { message });
+			let span = diagnostics.diagnostics().iter().find_map(|diagnostic| {
+				let Diagnostic::Fatal(fatal) = diagnostic else {
+					return None;
+				};
+				let FatalDiagnosticKind::CompileError(error) = fatal.kind() else {
+					return None;
+				};
+				let span = error.span();
+				Some(RuneDiagnosticSpan {
+					start: u32::try_from(span.start.into_usize()).ok()?,
+					end: u32::try_from(span.end.into_usize()).ok()?,
+				})
+			});
+			return Err(FrontendError::RuneCompile { message, span });
 		}
 
 		unit.map_err(|error| {

@@ -24,8 +24,8 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use crate::audit::{
-	AuditOutcome, StatementClass, ToronAuditEmitter, ToronAuditEvent, ToronAuditMetrics,
-	ToronAuditOperation,
+	AuditOutcome, QueryFrontend, StatementClass, ToronAuditEmitter, ToronAuditEvent,
+	ToronAuditMetrics, ToronAuditOperation,
 };
 use crate::catalog::{WendelonCatalog, WendelonDescriptorRegistry};
 use crate::config::{
@@ -55,12 +55,16 @@ use crate::network::observability::{
 };
 use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError, accepted_sql_tenant};
 use crate::quic::{QuicEndpoint, QuicStream};
+use crate::rune_engine::{CapabilityCategory, RuneEngine, RuneSandboxConfig};
 use crate::server::transport::QuicTransport;
 use crate::server::{ToronWorker, memory::MemoryManager};
 use crate::sql_planner::SqlPlanner;
 use crate::sql_wire::{
-	Complete, ResultBatch, SqlError, SqlErrorCode, SqlFrame, SqlMessage,
-	read_request_frame_bounded, write_frame as write_sql_frame,
+	Complete, ResultBatch, RuneCapability, RuneFailure, RuneFailureKind,
+	RuneLanguageSurfaceVersion, RuneRequestProtocolVersion, RuneSandboxContractVersion,
+	RuneSandboxViolation as PublicRuneSandboxViolation, RuneSourceSpan, RuneVersionAxis,
+	RuneVersionSkew, SqlError, SqlErrorCode, SqlFrame, SqlMessage, read_request_frame_bounded,
+	write_frame as write_sql_frame,
 };
 use crate::storage::{
 	HlcBound, StorageScan, TenantId, WendelonStorageAdmin, WendelonStorageDeleteRows,
@@ -385,6 +389,12 @@ impl ToronDaemon {
 		)));
 
 		let sql_endpoint = if let Some(sql_config) = config.sql.clone() {
+			let rune_sandbox = RuneSandboxConfig::v1_default();
+			let rune_engine = Arc::new(
+				RuneEngine::with_config(rune_sandbox)
+					.map_err(QueryError::Frontend)
+					.map_err(ToronDaemonError::Query)?,
+			);
 			let authenticated_sql =
 				tls_policy.is_some() && !sql_config.listener_bind.ip().is_loopback();
 			let sql_tenant_source = match (&tls_policy, authenticated_sql) {
@@ -419,6 +429,8 @@ impl ToronDaemon {
 					statement_timeout: sql_config.statement_timeout,
 					max_request_frame_bytes: sql_config.max_request_frame_bytes,
 					max_statement_bytes: sql_config.max_statement_bytes,
+					rune_engine,
+					rune_sandbox,
 				},
 			)));
 			Some(sql_endpoint)
@@ -699,14 +711,18 @@ struct SqlAcceptOptions {
 	statement_timeout: std::time::Duration,
 	max_request_frame_bytes: NonZeroU32,
 	max_statement_bytes: NonZeroU32,
+	rune_engine: Arc<RuneEngine>,
+	rune_sandbox: RuneSandboxConfig,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SqlConnectionOptions {
 	tenant_id: TenantId,
 	statement_timeout: std::time::Duration,
 	max_request_frame_bytes: NonZeroU32,
 	max_statement_bytes: NonZeroU32,
+	rune_engine: Arc<RuneEngine>,
+	rune_sandbox: RuneSandboxConfig,
 }
 
 async fn run_sql_accept_loop(
@@ -789,6 +805,8 @@ async fn run_sql_accept_loop(
 						statement_timeout: options.statement_timeout,
 						max_request_frame_bytes: options.max_request_frame_bytes,
 						max_statement_bytes: options.max_statement_bytes,
+						rune_engine: Arc::clone(&options.rune_engine),
+						rune_sandbox: options.rune_sandbox,
 					};
 					let metrics = Arc::clone(&metrics);
 					let audit = audit.clone();
@@ -893,6 +911,7 @@ async fn handle_sql_connection(
 			let session_id = new_sql_session_id();
 			let query_trace = crate::telemetry::query_trace_context(frame.query_id);
 			let query_span = crate::telemetry::query_span(query_trace);
+			crate::telemetry::record_query_frontend(&query_span, "sql");
 			if request.statement.len()
 				> usize::try_from(options.max_statement_bytes.get()).expect("u32 fits usize")
 			{
@@ -1292,6 +1311,266 @@ async fn handle_sql_connection(
 			write_sql_frame(&mut stream, &response).await?;
 			stream.finish().await?;
 		}
+		SqlMessage::ExecuteRune(request) => {
+			let query_started = std::time::Instant::now();
+			let session_id = new_sql_session_id();
+			let query_trace = crate::telemetry::query_trace_context(frame.query_id);
+			let query_span = crate::telemetry::query_span(query_trace);
+			crate::telemetry::record_query_frontend(&query_span, "rune");
+
+			if let Some(failure) = rune_version_skew(&request) {
+				crate::telemetry::record_query_statement_class(
+					&query_span,
+					StatementClass::Unknown,
+				);
+				crate::telemetry::record_query_outcome(&query_span, "rejected");
+				let audit_event = ToronAuditEvent::query_outcome(
+					ToronAuditOperation::QueryPlannedError,
+					tenant_id,
+					session_id,
+					frame.query_id,
+					StatementClass::Unknown,
+					AuditOutcome::Denied,
+				)
+				.with_query_frontend(QueryFrontend::Rune)
+				.with_duration(query_started.elapsed());
+				if !record_sql_audit_required_or_error(
+					&audit,
+					audit_event,
+					&mut stream,
+					frame.query_id,
+				)
+				.await?
+				{
+					return Ok(());
+				}
+				return write_rune_failure(&mut stream, frame.query_id, failure).await;
+			}
+
+			let planning_span = crate::telemetry::planning_span(query_trace);
+			let plan = match execute_rune_send(
+				Arc::clone(&options.rune_engine),
+				request.source,
+				options.rune_sandbox,
+			)
+			.instrument(planning_span)
+			.await
+			{
+				Ok(plan) => plan,
+				Err(error) => {
+					let failure = rune_failure_from_frontend(error);
+					crate::telemetry::record_query_statement_class(
+						&query_span,
+						StatementClass::Unknown,
+					);
+					crate::telemetry::record_query_outcome(&query_span, "error");
+					query_span.record("toron.error_class", "rune_frontend");
+					let audit_event = ToronAuditEvent::query_outcome(
+						ToronAuditOperation::QueryPlannedError,
+						tenant_id,
+						session_id,
+						frame.query_id,
+						StatementClass::Unknown,
+						AuditOutcome::Denied,
+					)
+					.with_query_frontend(QueryFrontend::Rune)
+					.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(
+						&audit,
+						audit_event,
+						&mut stream,
+						frame.query_id,
+					)
+					.await?
+					{
+						return Ok(());
+					}
+					return write_rune_failure(&mut stream, frame.query_id, failure).await;
+				}
+			};
+
+			let statement_class = StatementClass::from_plan(&plan);
+			crate::telemetry::record_query_statement_class(&query_span, statement_class);
+			if statement_class != StatementClass::Select {
+				let failure = RuneFailure {
+					kind: RuneFailureKind::Execution(SqlErrorCode::PlanningError),
+					message: "Rune workspace first contact is read-only".to_owned(),
+					span: None,
+				};
+				crate::telemetry::record_query_outcome(&query_span, "rejected");
+				let audit_event = ToronAuditEvent::query_outcome(
+					ToronAuditOperation::QueryPlannedError,
+					tenant_id,
+					session_id,
+					frame.query_id,
+					statement_class,
+					AuditOutcome::Denied,
+				)
+				.with_query_frontend(QueryFrontend::Rune)
+				.with_duration(query_started.elapsed());
+				if !record_sql_audit_required_or_error(
+					&audit,
+					audit_event,
+					&mut stream,
+					frame.query_id,
+				)
+				.await?
+				{
+					return Ok(());
+				}
+				return write_rune_failure(&mut stream, frame.query_id, failure).await;
+			}
+
+			let timeout_duration = request
+				.statement_timeout_seconds
+				.map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
+				.unwrap_or(options.statement_timeout);
+			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
+			context.trace_context = query_trace.trace_context();
+			let execution = coordinator
+				.execute_query_with_context(&plan, context)
+				.instrument(query_span.clone());
+			tokio::pin!(execution);
+			let timeout_sleep = tokio::time::sleep(timeout_duration);
+			tokio::pin!(timeout_sleep);
+			let connection_closed = connection.closed();
+			tokio::pin!(connection_closed);
+			let batches = tokio::select! {
+				result = &mut execution => match result {
+					Ok(batches) => batches,
+					Err(error) => {
+						let failure = rune_execution_failure(error);
+						crate::telemetry::record_query_outcome(&query_span, "error");
+						query_span.record("toron.error_class", "rune_execution");
+						let audit_event = ToronAuditEvent::query_outcome(
+							ToronAuditOperation::QueryExecutionError,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							statement_class,
+							AuditOutcome::Error,
+						)
+						.with_query_frontend(QueryFrontend::Rune)
+						.with_duration(query_started.elapsed());
+						if !record_sql_audit_required_or_error(&audit, audit_event, &mut stream, frame.query_id).await? {
+							return Ok(());
+						}
+						return write_rune_failure(&mut stream, frame.query_id, failure).await;
+					}
+				},
+				_ = &mut timeout_sleep => {
+					let cancellation = coordinator.cancel_query_for_tenant(
+						tenant_id,
+						frame.query_id,
+						CancellationTrigger::StatementTimeout,
+					);
+					metrics.record_cancellation(
+						CancellationTrigger::StatementTimeout,
+						cancellation_request_outcome(&cancellation),
+					);
+					crate::telemetry::record_query_outcome(&query_span, "timeout");
+					let audit_event = ToronAuditEvent::query_outcome(
+						ToronAuditOperation::QueryTimedOut,
+						tenant_id,
+						session_id,
+						frame.query_id,
+						statement_class,
+						AuditOutcome::Denied,
+					)
+					.with_query_frontend(QueryFrontend::Rune)
+					.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(&audit, audit_event, &mut stream, frame.query_id).await? {
+						return Ok(());
+					}
+					return write_rune_failure(&mut stream, frame.query_id, RuneFailure {
+						kind: RuneFailureKind::Execution(SqlErrorCode::StatementTimeout),
+						message: "statement timeout exceeded".to_owned(),
+						span: None,
+					}).await;
+				},
+				_ = &mut connection_closed => {
+					let cancellation = coordinator.cancel_query_for_tenant(
+						tenant_id,
+						frame.query_id,
+						CancellationTrigger::ClientDisconnect,
+					);
+					metrics.record_cancellation(
+						CancellationTrigger::ClientDisconnect,
+						cancellation_request_outcome(&cancellation),
+					);
+					record_sql_audit_required_without_response(
+						&audit,
+						ToronAuditEvent::query_outcome(
+							ToronAuditOperation::QueryDisconnectAborted,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							statement_class,
+							AuditOutcome::Error,
+						).with_query_frontend(QueryFrontend::Rune),
+					).await;
+					return Ok(());
+				},
+			};
+
+			let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+			let mut encoded = Vec::with_capacity(batches.len());
+			for (batch_index, batch) in batches.iter().enumerate() {
+				let ipc = match encode_sql_batch(batch) {
+					Ok(ipc) => ipc,
+					Err(error) => {
+						return write_rune_failure(
+							&mut stream,
+							frame.query_id,
+							rune_execution_failure(error),
+						)
+						.await;
+					}
+				};
+				encoded.push((
+					u32::try_from(batch_index).map_err(|_| QueryError::Internal {
+						message: "too many Rune result batches".to_owned(),
+					})?,
+					ipc,
+				));
+			}
+			let audit_event = ToronAuditEvent::query_outcome(
+				ToronAuditOperation::QueryCompleted,
+				tenant_id,
+				session_id,
+				frame.query_id,
+				statement_class,
+				AuditOutcome::Allowed,
+			)
+			.with_query_frontend(QueryFrontend::Rune)
+			.with_duration(query_started.elapsed())
+			.with_row_count(row_count);
+			if !record_sql_audit_required_or_error(&audit, audit_event, &mut stream, frame.query_id)
+				.await?
+			{
+				return Ok(());
+			}
+			for (batch_index, ipc) in encoded {
+				write_sql_frame(
+					&mut stream,
+					&SqlFrame::response(
+						frame.query_id,
+						SqlMessage::ResultBatch(ResultBatch {
+							batch_index,
+							arrow_ipc_bytes: ByteBuf::from(ipc),
+						}),
+					),
+				)
+				.await?;
+			}
+			crate::telemetry::record_query_outcome(&query_span, "ok");
+			write_sql_frame(
+				&mut stream,
+				&SqlFrame::response(frame.query_id, SqlMessage::Complete(Complete { row_count })),
+			)
+			.await?;
+			stream.finish().await?;
+		}
 		SqlMessage::Cancel(request) => {
 			let cancellation = coordinator.cancel_query_for_tenant(
 				tenant_id,
@@ -1327,6 +1606,7 @@ async fn handle_sql_connection(
 		SqlMessage::ResultBatch(_)
 		| SqlMessage::Complete(_)
 		| SqlMessage::Error(_)
+		| SqlMessage::RuneError(_)
 		| SqlMessage::Healthy(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
@@ -1383,6 +1663,172 @@ async fn write_sql_error(
 	write_sql_frame(stream, &response).await?;
 	stream.finish().await?;
 	Ok(())
+}
+
+async fn write_rune_failure(
+	stream: &mut QuicStream,
+	query_id: QueryId,
+	failure: RuneFailure,
+) -> Result<(), QueryError> {
+	let response = SqlFrame::response(query_id, SqlMessage::RuneError(failure));
+	write_sql_frame(stream, &response).await?;
+	stream.finish().await?;
+	Ok(())
+}
+
+fn rune_version_skew(request: &crate::sql_wire::ExecuteRuneRequest) -> Option<RuneFailure> {
+	let checks = [
+		(
+			RuneVersionAxis::RequestProtocol,
+			request.request_protocol_version.0,
+			RuneRequestProtocolVersion::CURRENT.0,
+		),
+		(
+			RuneVersionAxis::LanguageSurface,
+			request.language_surface_version.0,
+			RuneLanguageSurfaceVersion::CURRENT.0,
+		),
+		(
+			RuneVersionAxis::SandboxContract,
+			request.sandbox_contract_version.0,
+			RuneSandboxContractVersion::CURRENT.0,
+		),
+	];
+	checks
+		.into_iter()
+		.find(|(_, requested, supported)| requested != supported)
+		.map(|(axis, requested, supported)| RuneFailure {
+			kind: RuneFailureKind::VersionSkew(RuneVersionSkew {
+				axis,
+				requested,
+				supported: vec![supported],
+			}),
+			message: format!(
+				"unsupported Rune {axis:?} version {requested}; supported versions: [{supported}]"
+			),
+			span: None,
+		})
+}
+
+fn public_rune_capability(capability: CapabilityCategory) -> RuneCapability {
+	match capability {
+		CapabilityCategory::Filesystem => RuneCapability::Filesystem,
+		CapabilityCategory::Process => RuneCapability::Process,
+		CapabilityCategory::Network => RuneCapability::Network,
+		CapabilityCategory::Environment => RuneCapability::Environment,
+		CapabilityCategory::Time => RuneCapability::Time,
+		CapabilityCategory::Random => RuneCapability::Random,
+		CapabilityCategory::Threading => RuneCapability::Threading,
+		CapabilityCategory::Unknown => RuneCapability::Unknown,
+	}
+}
+
+fn u64_saturating(value: usize) -> u64 {
+	u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn public_rune_sandbox_violation(
+	violation: crate::rune_engine::RuneSandboxViolation,
+) -> PublicRuneSandboxViolation {
+	use crate::rune_engine::RuneSandboxViolation;
+	match violation {
+		RuneSandboxViolation::FuelExhausted {
+			fuel_consumed,
+			fuel_budget,
+		} => PublicRuneSandboxViolation::FuelExhausted {
+			fuel_consumed,
+			fuel_budget,
+		},
+		RuneSandboxViolation::MemoryExhausted {
+			bytes_used,
+			bytes_budget,
+		} => PublicRuneSandboxViolation::MemoryExhausted {
+			bytes_used,
+			bytes_budget,
+		},
+		RuneSandboxViolation::CapabilityDenied { capability } => {
+			PublicRuneSandboxViolation::CapabilityDenied {
+				capability: public_rune_capability(capability),
+			}
+		}
+		RuneSandboxViolation::SourceTooLarge { bytes, budget } => {
+			PublicRuneSandboxViolation::SourceTooLarge {
+				bytes: u64_saturating(bytes),
+				budget: u64_saturating(budget),
+			}
+		}
+		RuneSandboxViolation::Timeout { elapsed } => PublicRuneSandboxViolation::Timeout {
+			elapsed_millis: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+		},
+		RuneSandboxViolation::InvalidEntrypoint { .. } => {
+			PublicRuneSandboxViolation::InvalidEntrypoint
+		}
+		RuneSandboxViolation::InternalSandboxError { .. } => {
+			PublicRuneSandboxViolation::InternalSandboxError
+		}
+	}
+}
+
+fn rune_failure_from_frontend(error: FrontendError) -> RuneFailure {
+	match error {
+		FrontendError::RuneCompile { message, span } => RuneFailure {
+			kind: RuneFailureKind::Compile,
+			message,
+			span: span.map(|span| RuneSourceSpan {
+				start: span.start,
+				end: span.end,
+			}),
+		},
+		FrontendError::RuneRuntime { message, span } => RuneFailure {
+			kind: RuneFailureKind::Runtime,
+			message,
+			span: span.map(|span| RuneSourceSpan {
+				start: span.start,
+				end: span.end,
+			}),
+		},
+		FrontendError::RuneSandbox { kind, message } => RuneFailure {
+			kind: RuneFailureKind::Sandbox(public_rune_sandbox_violation(kind)),
+			message,
+			span: None,
+		},
+		other => RuneFailure {
+			kind: RuneFailureKind::Execution(SqlErrorCode::PlanningError),
+			message: other.to_string(),
+			span: None,
+		},
+	}
+}
+
+fn rune_execution_failure(error: QueryError) -> RuneFailure {
+	let (code, message) = map_sql_query_error(error);
+	RuneFailure {
+		kind: RuneFailureKind::Execution(code),
+		message,
+		span: None,
+	}
+}
+
+async fn execute_rune_send(
+	engine: Arc<RuneEngine>,
+	source: String,
+	config: RuneSandboxConfig,
+) -> Result<LogicalPlan, FrontendError> {
+	tokio::task::spawn_blocking(move || {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.map_err(|error| FrontendError::RuneRuntime {
+				message: format!("Rune execution runtime construction failed: {error}"),
+				span: None,
+			})?;
+		runtime.block_on(engine.execute_script(&source, &config))
+	})
+	.await
+	.map_err(|error| FrontendError::RuneRuntime {
+		message: format!("Rune execution task failed: {error}"),
+		span: None,
+	})?
 }
 
 const AUDIT_UNAVAILABLE_SQL_MESSAGE: &str = "audit unavailable";

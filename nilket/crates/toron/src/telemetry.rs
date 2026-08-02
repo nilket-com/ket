@@ -333,9 +333,14 @@ pub fn query_span(context: QueryTraceContext) -> Span {
 		otel.span_id = %span_id,
 		otel.sampled = context.sampled,
 		toron.query.statement_class = field::Empty,
+		toron.query.frontend = field::Empty,
 		toron.query.outcome = field::Empty,
 		toron.error_class = field::Empty,
 	)
+}
+
+pub fn record_query_frontend(span: &Span, frontend: &'static str) {
+	span.record("toron.query.frontend", frontend);
 }
 
 pub fn planning_span(parent: QueryTraceContext) -> Span {

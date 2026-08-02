@@ -3871,8 +3871,8 @@ fn assert_schema_types(schema: &Schema, expected: &[DataType]) {
 fn frontend_message(error: FrontendError) -> String {
 	match error {
 		FrontendError::SqlParse { message }
-		| FrontendError::RuneCompile { message }
-		| FrontendError::RuneRuntime { message }
+		| FrontendError::RuneCompile { message, .. }
+		| FrontendError::RuneRuntime { message, .. }
 		| FrontendError::Unsupported { message }
 		| FrontendError::RuneSandbox { message, .. } => message,
 	}

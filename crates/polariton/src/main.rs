@@ -7,6 +7,8 @@ mod gui;
 mod plot;
 mod result_registry;
 mod rune_host;
+#[cfg(feature = "toron")]
+mod rune_relation_envelope;
 
 fn main() -> gui::Result {
 	let _ = rustls::crypto::ring::default_provider().install_default();

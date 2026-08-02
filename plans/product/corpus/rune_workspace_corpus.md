@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.2. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.3. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -14,20 +14,20 @@ record).
 
 | family | status | evidence |
 |---|---|---|
-| workspace table lookup (`workspace.table`) | pending — first-contact target | — |
-| select / projection | pending — first-contact target | — |
-| filter / predicate | pending — first-contact target | — |
-| group / aggregate (`group_by` + `summarize`) | pending — first-contact target | — |
-| sort | pending — first-contact target | — |
-| limit | pending — first-contact target | — |
+| workspace table lookup (`workspace.table`) | executable | `rune_source_executes_over_the_authenticated_query_boundary_with_typed_failures` |
+| select / projection (`project`) | executable | same real-transport fixture |
+| filter / predicate | executable | same real-transport fixture |
+| group / aggregate (`aggregate`) | executable | same real-transport fixture |
+| sort | executable | same real-transport fixture |
+| limit | executable | same real-transport fixture |
 
 ## Views
 
 | family | status | evidence |
 |---|---|---|
-| bounded table view (`table(r)`, inherits the 128 MiB `toron-client` collection ceiling) | pending — first-contact target | — |
-| experimental bar sink (`plot.bar`) | pending — first-contact target | — |
-| experimental scatter sink (`plot.scatter`) | pending — first-contact target | — |
+| bounded table view (`table(r)`, inherits the 128 MiB `toron-client` collection ceiling) | pending — live first-contact acceptance | automated seams: `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
+| experimental bar sink (`plot.bar`) | pending — live first-contact acceptance | automated seams: `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
+| experimental scatter sink (`plot.scatter`) | pending — live first-contact acceptance | automated seams: `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -60,6 +60,10 @@ record).
 
 ## Change log
 
+- v0.3 (2026-08-01): the six native relation families became executable over
+  the public authenticated Rune route. The three view rows retain pending
+  status until the ignored live-profile fixture and user dogfood acceptance
+  exercise the installed cross-product path.
 - v0.2 (2026-08-01): "streamed table view" corrected to "bounded table view"
   with the inherited 128 MiB ceiling cited, per PRODUCT-0003; rows and
   statuses otherwise unchanged.

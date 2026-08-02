@@ -1,6 +1,9 @@
 mod polars_compat;
 
-use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
+use crate::adapters::common::{
+	AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult, RuneDispatchFailure,
+	RuneDispatchFailureKind, RuneDispatchResult,
+};
 use async_trait::async_trait;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
@@ -44,6 +47,40 @@ impl DatabaseAdapter for ToronAdapter {
 			Err(error) => ExecutionResult::Err(format!("Toron result conversion failed: {error}")),
 		}
 	}
+
+	async fn dispatch_rune(&mut self, source: &str) -> RuneDispatchResult {
+		let result = self
+			.client
+			.execute_rune(source)
+			.await
+			.map_err(|error| match error {
+				toron_client::ClientError::Rune(failure) => {
+					use toron_client::RuneFailureKind;
+					let kind = match failure.kind {
+						RuneFailureKind::Compile => RuneDispatchFailureKind::Compile,
+						RuneFailureKind::Runtime => RuneDispatchFailureKind::Runtime,
+						RuneFailureKind::Sandbox(_) => RuneDispatchFailureKind::Sandbox,
+						RuneFailureKind::VersionSkew(_) => RuneDispatchFailureKind::VersionSkew,
+						RuneFailureKind::Execution(_) => RuneDispatchFailureKind::Execution,
+					};
+					RuneDispatchFailure {
+						kind,
+						message: failure.message,
+						span: failure.span.map(|span| span.start..span.end),
+					}
+				}
+				other => RuneDispatchFailure {
+					kind: RuneDispatchFailureKind::Transport,
+					message: format!("{other}. Start or attach the local workspace with `nilket`."),
+					span: None,
+				},
+			})?;
+		polars_compat::decode_batches(&result.batches).map_err(|message| RuneDispatchFailure {
+			kind: RuneDispatchFailureKind::Execution,
+			message: format!("Toron Rune result conversion failed: {message}"),
+			span: None,
+		})
+	}
 }
 
 #[cfg(test)]
@@ -54,6 +91,7 @@ mod tests {
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::factory::create_plot;
+	use crate::rune_relation_envelope::{RuneViewIntent, transform as transform_rune_view};
 	use iced::Rectangle;
 	use std::path::PathBuf;
 
@@ -107,6 +145,53 @@ mod tests {
 			.unwrap_or_else(|| std::env::temp_dir().join("toron-first-contact.svg"));
 		std::fs::write(&output, svg).expect("write Toron plot artifact");
 		eprintln!("Toron first-contact plot: {}", output.display());
+	}
+
+	#[tokio::test]
+	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
+	async fn live_rune_relation_reaches_table_bar_and_scatter_surfaces() {
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		for source in [
+			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r)",
+			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); plot.bar(r, \"cat\", \"val\")",
+			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); plot.scatter(r, \"cat\", \"val\")",
+		] {
+			let view = transform_rune_view(source).expect("terminal view envelope");
+			let frame = adapter
+				.dispatch_rune(&view.source)
+				.await
+				.expect("Rune relation result");
+			assert!(frame.height() > 0, "dogfood relation is nonempty");
+			match view.intent {
+				RuneViewIntent::Table => {
+					assert!(frame.column("cat").is_ok());
+					assert!(frame.column("val").is_ok());
+				}
+				RuneViewIntent::Plot(plot) => {
+					let projected = frame
+						.select([plot.x.as_str(), plot.y.as_str()])
+						.expect("project plot fields");
+					let kernel = create_plot(&plot.composition, &projected, 800, 480);
+					let widget = PlotWidget {
+						kernel: kernel.as_ref(),
+						title: "Rune relation first contact".to_owned(),
+						padding: 0.0,
+						settings: PlotSettings::default(),
+						render_revision: 0,
+						resize_render_suspended: false,
+						layer: PlotRenderLayer::Full,
+					};
+					let mut backend = SvgBackend::new(800.0, 480.0);
+					widget.render(
+						&mut backend,
+						Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+					);
+					assert!(backend.finish().contains("<path"));
+				}
+			}
+		}
 	}
 
 	#[tokio::test]

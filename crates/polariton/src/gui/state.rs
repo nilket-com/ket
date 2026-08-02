@@ -18,6 +18,11 @@ use crate::plot::factory::create_plot;
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
+#[cfg(feature = "toron")]
+use crate::rune_relation_envelope::{
+	PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler, TransformedRuneView,
+	transform as transform_rune_view,
+};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
 use libaryon::uast::projection::MarkdownCellOutputTarget;
@@ -45,6 +50,8 @@ struct AppState {
 	result_registry: ResultRegistry,
 	rune_plot_panes: HashMap<BufferId, PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
+	#[cfg(feature = "toron")]
+	rune_view_scheduler: RuneViewScheduler,
 	pending_runs: VecDeque<PendingRun>,
 }
 
@@ -260,6 +267,8 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		result_registry: ResultRegistry::default(),
 		rune_plot_panes: HashMap::new(),
 		rune_buffer_revisions: HashMap::new(),
+		#[cfg(feature = "toron")]
+		rune_view_scheduler: RuneViewScheduler::default(),
 		pending_runs: VecDeque::new(),
 	};
 	sync_workspace_viewport(&mut state);
@@ -452,6 +461,18 @@ fn run_language_code(
 				app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
 				return Task::none();
 			}
+			#[cfg(feature = "toron")]
+			match transform_rune_view(&code) {
+				Ok(view) => return run_rune_relation_view(app_state, source_buffer, view),
+				Err(RuneEnvelopeError::Invalid(message)) => {
+					app_state.status_error = format!("Error: Rune view syntax: {message}");
+					app_state
+						.code_editor
+						.set_query_error(format!("Rune view syntax: {message}"));
+					return Task::none();
+				}
+				Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {}
+			}
 			let capabilities = RuneCapabilities {
 				results: app_state.result_registry.snapshot(),
 				..RuneCapabilities::default()
@@ -481,6 +502,7 @@ fn run_language_code(
 						};
 						Ok(crate::gui::messages::RuneBufferOutcome {
 							display: execution.display,
+							table: None,
 							plot,
 						})
 					})
@@ -497,6 +519,110 @@ fn run_language_code(
 		language => {
 			app_state.status_msg = format!("No executor is registered for language: {language}");
 			Task::none()
+		}
+	}
+}
+
+#[cfg(feature = "toron")]
+fn run_rune_relation_view(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	view: TransformedRuneView,
+) -> Task<Message> {
+	let revision = *app_state
+		.rune_buffer_revisions
+		.entry(source_buffer)
+		.and_modify(|revision| *revision = revision.saturating_add(1))
+		.or_insert(1);
+	let work = PendingRuneView {
+		source_buffer,
+		revision,
+		view,
+	};
+	let Some(work) = app_state.rune_view_scheduler.submit(work) else {
+		app_state.status_msg = "Rune workspace queued newest view…".into();
+		return Task::none();
+	};
+	start_rune_relation_task(app_state, work)
+}
+
+#[cfg(feature = "toron")]
+fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> Task<Message> {
+	let Some(connection) = app_state.adapter_state.sql_connection().cloned() else {
+		let message = "Local Rune workspace unavailable. Start or attach with `nilket`.".to_owned();
+		app_state.status_error = format!("Error: {message}");
+		app_state.code_editor.set_query_error(message);
+		app_state.rune_view_scheduler.cancel(work.source_buffer);
+		return Task::none();
+	};
+	let PendingRuneView {
+		source_buffer,
+		revision,
+		view,
+	} = work;
+	app_state.status_msg = "Rune workspace running…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	app_state.code_editor.begin_query();
+	Task::perform(
+		async move {
+			let result = connection.write().await.dispatch_rune(&view.source).await;
+			match result {
+				Ok(frame) => rune_view_outcome(frame, view.intent),
+				Err(failure) => {
+					let location = failure
+						.span
+						.and_then(|span| {
+							view.source_map.map_span(toron_client::RuneSourceSpan {
+								start: span.start,
+								end: span.end,
+							})
+						})
+						.unwrap_or_else(|| view.source_map.terminal_view());
+					Err(format!(
+						"Rune {:?} at bytes {}..{}: {}",
+						failure.kind, location.start, location.end, failure.message
+					))
+				}
+			}
+		},
+		move |result| Message::RunRuneBufferResult {
+			source_buffer,
+			revision,
+			result,
+		},
+	)
+}
+
+#[cfg(feature = "toron")]
+fn rune_view_outcome(
+	frame: DataFrame,
+	intent: RuneViewIntent,
+) -> std::result::Result<crate::gui::messages::RuneBufferOutcome, String> {
+	match intent {
+		RuneViewIntent::Table => Ok(crate::gui::messages::RuneBufferOutcome {
+			display: None,
+			table: Some(frame),
+			plot: None,
+		}),
+		RuneViewIntent::Plot(plot) => {
+			let mut fields = vec![plot.x.as_str(), plot.y.as_str()];
+			if let Some(category) = plot.category.as_deref() {
+				fields.push(category);
+			}
+			let projected = frame
+				.select(fields)
+				.map_err(|error| format!("Rune plot fields could not be projected: {error}"))?;
+			Ok(crate::gui::messages::RuneBufferOutcome {
+				display: None,
+				table: None,
+				plot: Some(ResolvedPlot {
+					source_name: "workspace relation".to_owned(),
+					composition: plot.composition,
+					data: std::sync::Arc::new(projected),
+				}),
+			})
 		}
 	}
 }
@@ -894,6 +1020,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			revision,
 			result,
 		} => {
+			#[cfg(feature = "toron")]
+			if app_state.rune_view_scheduler.is_in_flight(source_buffer)
+				&& let Some(next) = app_state.rune_view_scheduler.complete(source_buffer)
+			{
+				return start_rune_relation_task(app_state, next);
+			}
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
@@ -906,6 +1038,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.display
 							.unwrap_or_else(|| "Rune finished.".to_owned()),
 					);
+					if let Some(frame) = outcome.table {
+						let rows = frame.height();
+						let cols = frame.width();
+						app_state.code_editor.set_query_result(frame.clone());
+						app_state.data_frame = frame;
+						app_state.status_df_size = Some((rows, cols));
+						app_state.status_msg = "Rune workspace query completed".to_owned();
+					}
 					if let Some(resolved) = outcome.plot {
 						app_state.status_msg =
 							format!("Building plot from {}…", resolved.source_name);
@@ -1324,6 +1464,8 @@ fn get_node_rects(
 
 #[cfg(test)]
 mod tests {
+	#[cfg(feature = "toron")]
+	use super::rune_view_outcome;
 	use super::{
 		clear_transient_sql_status_on_editor_activity, compact_sql_diagnostic, new, set_sql_error,
 		update,
@@ -1331,6 +1473,40 @@ mod tests {
 	use crate::adapters::common::ExecutionResult;
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
+	#[cfg(feature = "toron")]
+	use crate::plot::core::PlotType;
+	#[cfg(feature = "toron")]
+	use crate::rune_relation_envelope::{RuneViewIntent, transform as transform_rune_view};
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn rune_relation_results_feed_the_existing_table_and_plot_surfaces() {
+		let frame = polars::df!(
+			"cat" => ["a", "b"],
+			"x" => [1_i64, 2],
+			"y" => [3_i64, 5],
+		)
+		.expect("fixture frame");
+		let table = rune_view_outcome(frame.clone(), RuneViewIntent::Table).expect("table view");
+		assert_eq!(table.table.expect("table frame").shape(), (2, 3));
+
+		for (source, expected) in [
+			(
+				"plot.bar(workspace.table(\"t\"), \"cat\", \"y\")",
+				PlotType::Bar,
+			),
+			(
+				"plot.scatter(workspace.table(\"t\"), \"x\", \"y\", \"cat\")",
+				PlotType::Scatter,
+			),
+		] {
+			let intent = transform_rune_view(source).expect("view envelope").intent;
+			let outcome = rune_view_outcome(frame.clone(), intent).expect("plot view");
+			let plot = outcome.plot.expect("resolved plot");
+			assert_eq!(plot.composition.primary_plot_type(), expected);
+			assert_eq!(plot.data.height(), 2);
+		}
+	}
 
 	#[test]
 	fn fenced_sql_diagnostics_report_document_coordinates() {

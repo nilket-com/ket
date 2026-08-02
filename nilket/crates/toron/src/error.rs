@@ -195,9 +195,15 @@ pub enum FrontendError {
 	#[error("SQL parse failed: {message}")]
 	SqlParse { message: String },
 	#[error("Rune compile failed: {message}")]
-	RuneCompile { message: String },
+	RuneCompile {
+		message: String,
+		span: Option<RuneDiagnosticSpan>,
+	},
 	#[error("Rune runtime failed: {message}")]
-	RuneRuntime { message: String },
+	RuneRuntime {
+		message: String,
+		span: Option<RuneDiagnosticSpan>,
+	},
 	#[error("Rune sandbox violation: {message}")]
 	RuneSandbox {
 		kind: RuneSandboxViolation,
@@ -205,6 +211,12 @@ pub enum FrontendError {
 	},
 	#[error("unsupported frontend construct: {message}")]
 	Unsupported { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuneDiagnosticSpan {
+	pub start: u32,
+	pub end: u32,
 }
 
 #[derive(Debug, Error)]

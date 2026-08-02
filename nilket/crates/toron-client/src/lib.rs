@@ -15,7 +15,10 @@ pub use client::{
 };
 pub use protocol::{
 	CancelRequest, Complete, DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES,
-	ExecuteRequest, HealthRequest, HealthyResponse, QueryId, RequestFrameTooLarge, ResultBatch,
+	ExecuteRequest, ExecuteRuneRequest, HealthRequest, HealthyResponse, QueryId,
+	RequestFrameTooLarge, ResultBatch, RuneCapability, RuneFailure, RuneFailureKind,
+	RuneLanguageSurfaceVersion, RuneRequestProtocolVersion, RuneSandboxContractVersion,
+	RuneSandboxViolation, RuneSourceSpan, RuneVersionAxis, RuneVersionSkew,
 	SQL_REQUEST_FRAME_BYTES_HARD_CEILING, SQL_STATEMENT_BYTES_HARD_CEILING, SqlError, SqlErrorCode,
 	SqlFrame, SqlMessage, SqlProtocolVersion, read_frame, read_request_frame_bounded, write_frame,
 };

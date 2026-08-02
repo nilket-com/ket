@@ -12,7 +12,8 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::{
-	HealthyResponse, QueryId, ResultBatch, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
+	ExecuteRuneRequest, HealthyResponse, QueryId, ResultBatch, RuneFailure, SqlErrorCode, SqlFrame,
+	SqlMessage, SqlProtocolVersion,
 };
 
 const LOOPBACK_QUIC_ALPN: &[u8] = b"sql-task-loopback";
@@ -55,6 +56,7 @@ pub enum ClientOperation {
 	Connect,
 	Health,
 	Query,
+	RuneQuery,
 	Cancellation,
 }
 
@@ -64,6 +66,7 @@ impl fmt::Display for ClientOperation {
 			Self::Connect => "connection",
 			Self::Health => "health probe",
 			Self::Query => "query",
+			Self::RuneQuery => "Rune query",
 			Self::Cancellation => "cancellation",
 		})
 	}
@@ -79,6 +82,8 @@ pub enum ClientError {
 	Protocol(String),
 	#[error("Toron {code:?}: {message}")]
 	Remote { code: SqlErrorCode, message: String },
+	#[error("Toron Rune {0:?}")]
+	Rune(RuneFailure),
 	#[error("Toron {0} timed out")]
 	TimedOut(ClientOperation),
 }
@@ -171,6 +176,28 @@ impl ToronClient {
 		.await
 	}
 
+	pub async fn execute_rune(&self, source: &str) -> Result<QueryResult, ClientError> {
+		self.execute_rune_request(ExecuteRuneRequest::current(source.to_owned(), None))
+			.await
+	}
+
+	/// Executes source against an explicitly named Rune compatibility
+	/// contract. The server may reject version skew, but negotiation never
+	/// weakens its sandbox policy.
+	pub async fn execute_rune_request(
+		&self,
+		request: ExecuteRuneRequest,
+	) -> Result<QueryResult, ClientError> {
+		let query_id = QueryId::new();
+		self.exchange(
+			SqlFrame::execute_rune_request(query_id, request),
+			ExpectedResponse::RuneQuery,
+			self.query_timeout,
+			ClientOperation::RuneQuery,
+		)
+		.await
+	}
+
 	pub async fn cancel(&self, query_id: QueryId) -> Result<(), ClientError> {
 		let result = self
 			.exchange(
@@ -242,6 +269,7 @@ pub fn blocking_health_loopback(endpoint: &str) -> Result<(), ClientError> {
 #[derive(Clone, Copy)]
 enum ExpectedResponse {
 	Query,
+	RuneQuery,
 	Cancellation,
 	Health,
 }
@@ -287,7 +315,11 @@ where
 			SqlMessage::ResultBatch(ResultBatch {
 				batch_index,
 				arrow_ipc_bytes,
-			}) if matches!(expected, ExpectedResponse::Query) => {
+			}) if matches!(
+				expected,
+				ExpectedResponse::Query | ExpectedResponse::RuneQuery
+			) =>
+			{
 				if batch_index != expected_batch {
 					return Err(ClientError::Protocol(format!(
 						"result batch {batch_index} arrived while expecting {expected_batch}"
@@ -306,7 +338,12 @@ where
 				}
 				batches.push(arrow_ipc_bytes.into_vec());
 			}
-			SqlMessage::Complete(complete) if matches!(expected, ExpectedResponse::Query) => {
+			SqlMessage::Complete(complete)
+				if matches!(
+					expected,
+					ExpectedResponse::Query | ExpectedResponse::RuneQuery
+				) =>
+			{
 				return Ok(QueryResult {
 					batches,
 					row_count: complete.row_count,
@@ -334,6 +371,9 @@ where
 					code: error.code,
 					message: error.message,
 				});
+			}
+			SqlMessage::RuneError(error) if matches!(expected, ExpectedResponse::RuneQuery) => {
+				return Err(ClientError::Rune(error));
 			}
 			other => {
 				return Err(ClientError::Protocol(format!(
@@ -467,7 +507,10 @@ impl ServerCertVerifier for LoopbackServerVerifier {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::protocol::{CancelRequest, Complete, HealthRequest, SqlError, write_frame};
+	use crate::protocol::{
+		CancelRequest, Complete, HealthRequest, RuneFailure, RuneFailureKind, RuneSourceSpan,
+		SqlError, write_frame,
+	};
 
 	async fn framed_bytes(frames: &[SqlFrame]) -> tokio::io::DuplexStream {
 		let (mut writer, reader) = tokio::io::duplex(4096);
@@ -496,6 +539,58 @@ mod tests {
 				message: "bad syntax".to_owned(),
 			})
 		);
+	}
+
+	#[tokio::test]
+	async fn collector_preserves_typed_rune_failure_and_span() {
+		let id = QueryId::from_u128(91);
+		let failure = RuneFailure {
+			kind: RuneFailureKind::Compile,
+			message: "bad Rune".to_owned(),
+			span: Some(RuneSourceSpan { start: 7, end: 11 }),
+		};
+		let mut reader = framed_bytes(&[SqlFrame::response(
+			id,
+			SqlMessage::RuneError(failure.clone()),
+		)])
+		.await;
+		assert_eq!(
+			collect_response(&mut reader, id, ExpectedResponse::RuneQuery).await,
+			Err(ClientError::Rune(failure))
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_collector_rejects_a_rune_only_failure_frame() {
+		let id = QueryId::from_u128(93);
+		let failure = RuneFailure {
+			kind: RuneFailureKind::Compile,
+			message: "wrong frontend".to_owned(),
+			span: None,
+		};
+		let mut reader =
+			framed_bytes(&[SqlFrame::response(id, SqlMessage::RuneError(failure))]).await;
+		let error = collect_response(&mut reader, id, ExpectedResponse::Query)
+			.await
+			.expect_err("SQL must not accept a Rune-only failure");
+		assert!(error.to_string().contains("unexpected response message"));
+	}
+
+	#[tokio::test]
+	async fn rune_results_inherit_the_bounded_collector_ceiling() {
+		let id = QueryId::from_u128(92);
+		let batch = SqlFrame::response(
+			id,
+			SqlMessage::ResultBatch(ResultBatch {
+				batch_index: 0,
+				arrow_ipc_bytes: serde_bytes::ByteBuf::from(vec![1, 2, 3, 4]),
+			}),
+		);
+		let mut reader = framed_bytes(&[batch]).await;
+		let error = collect_response_bounded(&mut reader, id, ExpectedResponse::RuneQuery, 3)
+			.await
+			.expect_err("bounded Rune result");
+		assert!(error.to_string().contains("3 byte limit"));
 	}
 
 	#[tokio::test]

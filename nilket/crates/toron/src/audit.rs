@@ -287,6 +287,21 @@ pub enum StatementClass {
 	Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFrontend {
+	Sql,
+	Rune,
+}
+
+impl QueryFrontend {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Sql => "sql",
+			Self::Rune => "rune",
+		}
+	}
+}
+
 impl StatementClass {
 	pub fn from_plan(plan: &LogicalPlan) -> Self {
 		match plan {
@@ -495,6 +510,7 @@ pub struct ToronAuditEvent {
 	session_id: Option<SessionId>,
 	query_id: Option<QueryId>,
 	statement_class: Option<StatementClass>,
+	query_frontend: Option<QueryFrontend>,
 	sql_error_code_class: Option<SqlErrorCodeClass>,
 	duration_bucket: Option<DurationBucket>,
 	row_count_bucket: Option<RowCountBucket>,
@@ -561,12 +577,13 @@ impl ToronAuditEvent {
 			operation,
 			ToronAuditEventClass::QueryOutcome,
 			outcome,
-			"sql query outcome",
+			"query outcome",
 		)
 		.with_security_relevant()
 		.with_tenant_option(Some(tenant_id))
 		.with_session_id(session_id)
 		.with_query_id(query_id)
+		.with_query_frontend(QueryFrontend::Sql)
 		.with_statement_class(statement_class)
 	}
 
@@ -679,6 +696,7 @@ impl ToronAuditEvent {
 			session_id: None,
 			query_id: None,
 			statement_class: None,
+			query_frontend: None,
 			sql_error_code_class: None,
 			duration_bucket: None,
 			row_count_bucket: None,
@@ -737,6 +755,11 @@ impl ToronAuditEvent {
 
 	fn with_statement_class(mut self, statement_class: StatementClass) -> Self {
 		self.statement_class = Some(statement_class);
+		self
+	}
+
+	pub fn with_query_frontend(mut self, frontend: QueryFrontend) -> Self {
+		self.query_frontend = Some(frontend);
 		self
 	}
 
@@ -827,6 +850,9 @@ impl ToronAuditEvent {
 		}
 		if let Some(statement_class) = self.statement_class {
 			event = event.with_parameter("statement_class", statement_class.as_str());
+		}
+		if let Some(frontend) = self.query_frontend {
+			event = event.with_parameter("query_frontend", frontend.as_str());
 		}
 		if let Some(code) = self.sql_error_code_class {
 			event = event.with_parameter("sql_error_code_class", code.as_str());

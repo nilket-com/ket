@@ -107,6 +107,7 @@ pub enum Message {
 #[derive(Clone)]
 pub struct RuneBufferOutcome {
 	pub display: Option<String>,
+	pub table: Option<polars::frame::DataFrame>,
 	pub plot: Option<ResolvedPlot>,
 }
 
