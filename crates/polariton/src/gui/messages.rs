@@ -37,7 +37,14 @@ impl std::fmt::Display for ExportFormat {
 pub enum Message {
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,
-	AdapterConnected(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
+	AdapterConnected(Result<Arc<RwLock<dyn DatabaseAdapter>>, String>),
+	#[cfg(feature = "toron")]
+	LocalWorkspaceDiscovered(nilket_local::LocalWorkspace),
+	#[cfg(feature = "toron")]
+	LocalWorkspaceAttached {
+		workspace: nilket_local::ReadyWorkspace,
+		connection: Result<Arc<RwLock<dyn DatabaseAdapter>>, String>,
+	},
 	/// The session's in-memory scratch database finished opening at startup.
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),

@@ -1,0 +1,15 @@
+[package]
+name = "nilket-local"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1.37", features = ["rt", "time"] }
+toml = "0.8"
+toron-client = { path = "../toron-client" }
+uuid = { version = "1.23", features = ["serde", "v4"] }

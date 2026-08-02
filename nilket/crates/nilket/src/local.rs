@@ -17,18 +17,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use nilket_local::{
+	FORMAT_VERSION, LocalWorkspace, ProfileMarker, ProfilePaths, RuntimeManifest, SQL_ENDPOINT,
+	WENDELON_ENDPOINT, blocking_discover, process_start_token, resolve_profile_root,
+};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpid, getppid};
-use serde::{Deserialize, Serialize};
 use signal_hook::consts::SIGINT;
 use tls_pki::{DevelopmentPki, write_local_development_pki};
 use toron_client::blocking_health_loopback;
 use uuid::Uuid;
 use wendelon::cli::ReadinessProbe;
 
-const FORMAT_VERSION: u32 = 1;
-const SQL_ENDPOINT: &str = "127.0.0.1:7742";
-const WENDELON_ENDPOINT: &str = "127.0.0.1:7001";
 const READY_ENDPOINT: &str = "127.0.0.1:7432";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -91,55 +91,6 @@ impl LocalReady {
 	}
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ProfileMarker {
-	format_version: u32,
-	profile_uuid: Uuid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RuntimeManifest {
-	version: u32,
-	profile_uuid: Uuid,
-	session_nonce: Uuid,
-	pid: u32,
-	process_start_token: String,
-	started_unix_ms: u128,
-	wendelon_endpoint: String,
-	sql_endpoint: String,
-}
-
-#[derive(Debug, Clone)]
-struct ProfilePaths {
-	root: PathBuf,
-	marker: PathBuf,
-	config_dir: PathBuf,
-	wendelon_config: PathBuf,
-	toron_config: PathBuf,
-	pki_dir: PathBuf,
-	wendelon_data: PathBuf,
-	logs_dir: PathBuf,
-	lock: PathBuf,
-	runtime: PathBuf,
-}
-
-impl ProfilePaths {
-	fn new(root: PathBuf) -> Self {
-		Self {
-			marker: root.join("profile.toml"),
-			config_dir: root.join("config"),
-			wendelon_config: root.join("config/wendelon.toml"),
-			toron_config: root.join("config/toron.toml"),
-			pki_dir: root.join("pki"),
-			wendelon_data: root.join("data/wendelon"),
-			logs_dir: root.join("logs"),
-			lock: root.join("local.lock"),
-			runtime: root.join("runtime.json"),
-			root,
-		}
-	}
-}
-
 pub fn run(options: LocalOptions) -> ExitCode {
 	match run_owned(options) {
 		Ok(code) => code,
@@ -173,6 +124,7 @@ fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
 	let pki = ensure_artifacts(&paths)?;
 	validate_artifacts(&paths)?;
 	preflight_endpoints()?;
+	refuse_non_regular_artifact_if_present(&paths.runtime, "runtime manifest")?;
 	if paths.runtime.exists() {
 		fs::remove_file(&paths.runtime).map_err(|error| {
 			format!(
@@ -255,34 +207,6 @@ fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
 	Ok(exit_code)
 }
 
-fn resolve_profile_root(explicit: Option<&Path>) -> Result<PathBuf, String> {
-	if let Some(path) = explicit {
-		if path.as_os_str().is_empty() {
-			return Err("--data-dir must not be empty".to_owned());
-		}
-		return absolute_lexical(path);
-	}
-	if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-		return absolute_lexical(&PathBuf::from(xdg).join("nilket/local"));
-	}
-	let home = std::env::var_os("HOME")
-		.filter(|value| !value.is_empty())
-		.ok_or_else(|| {
-			"neither XDG_DATA_HOME nor HOME is usable; pass --data-dir PATH".to_owned()
-		})?;
-	absolute_lexical(&PathBuf::from(home).join(".local/share/nilket/local"))
-}
-
-fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
-	if path.is_absolute() {
-		Ok(path.to_path_buf())
-	} else {
-		std::env::current_dir()
-			.map(|cwd| cwd.join(path))
-			.map_err(|error| format!("resolve {}: {error}", path.display()))
-	}
-}
-
 fn prepare_root_for_lock(root: &Path) -> Result<(), String> {
 	if root.exists() {
 		let metadata = fs::symlink_metadata(root)
@@ -333,6 +257,7 @@ fn validate_profile_root_candidate(paths: &ProfilePaths) -> Result<(), String> {
 }
 
 fn open_lock(path: &Path) -> Result<File, String> {
+	refuse_non_regular_artifact_if_present(path, "profile lock")?;
 	let file = OpenOptions::new()
 		.read(true)
 		.write(true)
@@ -352,6 +277,7 @@ fn open_lock(path: &Path) -> Result<File, String> {
 }
 
 fn ensure_profile(paths: &ProfilePaths) -> Result<ProfileMarker, String> {
+	refuse_non_regular_artifact_if_present(&paths.marker, "profile marker")?;
 	if paths.marker.exists() {
 		let marker: ProfileMarker = toml::from_str(
 			&fs::read_to_string(&paths.marker)
@@ -390,6 +316,17 @@ fn ensure_profile(paths: &ProfilePaths) -> Result<ProfileMarker, String> {
 		0o600,
 	)?;
 	Ok(marker)
+}
+
+fn refuse_non_regular_artifact_if_present(path: &Path, label: &str) -> Result<(), String> {
+	match fs::symlink_metadata(path) {
+		Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+			Err(format!("{label} {} must be a regular file", path.display()))
+		}
+		Ok(_) => Ok(()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(format!("inspect {label} {}: {error}", path.display())),
+	}
 }
 
 fn ensure_artifacts(paths: &ProfilePaths) -> Result<DevelopmentPki, String> {
@@ -496,39 +433,17 @@ fn refuse_symlink_tree(path: &Path) -> Result<(), String> {
 }
 
 fn report_existing(paths: &ProfilePaths) -> Result<ExitCode, String> {
-	let runtime: RuntimeManifest =
-		serde_json::from_str(&fs::read_to_string(&paths.runtime).map_err(|error| {
-			format!(
-				"profile lock is held but {} is unavailable: {error}",
-				paths.runtime.display()
-			)
-		})?)
-		.map_err(|error| {
-			format!("profile lock is held with malformed runtime identity: {error}")
-		})?;
-	let marker: ProfileMarker = toml::from_str(
-		&fs::read_to_string(&paths.marker)
-			.map_err(|error| format!("read held profile marker: {error}"))?,
-	)
-	.map_err(|error| format!("parse held profile marker: {error}"))?;
-	if runtime.version != FORMAT_VERSION || runtime.profile_uuid != marker.profile_uuid {
-		return Err("profile lock is held with a mismatched runtime identity".to_owned());
+	match blocking_discover(Some(&paths.root)) {
+		LocalWorkspace::Ready(workspace) => {
+			let ready = LocalReady {
+				sql_endpoint: workspace.sql_endpoint,
+				session_nonce: workspace.identity.session_nonce,
+			};
+			print!("{}", ready.format_line());
+			Ok(ExitCode::SUCCESS)
+		}
+		state => Err(state.to_string()),
 	}
-	if let Err(error) = blocking_health_loopback(&runtime.sql_endpoint) {
-		return Err(format!(
-			"profile is owned by pid {} session {} but health failed: {error}",
-			runtime.pid, runtime.session_nonce
-		));
-	}
-	let ready = LocalReady {
-		sql_endpoint: runtime
-			.sql_endpoint
-			.parse()
-			.map_err(|error| format!("invalid recorded SQL endpoint: {error}"))?,
-		session_nonce: runtime.session_nonce,
-	};
-	print!("{}", ready.format_line());
-	Ok(ExitCode::SUCCESS)
 }
 
 fn preflight_endpoints() -> Result<(), String> {
@@ -800,20 +715,6 @@ fn write_create_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> 
 	file.write_all(bytes)
 		.and_then(|()| file.flush())
 		.map_err(|error| format!("write {}: {error}", path.display()))
-}
-
-fn process_start_token(pid: u32) -> Result<String, String> {
-	let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
-		.map_err(|error| format!("read process start token: {error}"))?;
-	let after_name = stat
-		.rsplit_once(')')
-		.map(|(_, fields)| fields)
-		.ok_or_else(|| "malformed /proc process stat".to_owned())?;
-	after_name
-		.split_ascii_whitespace()
-		.nth(19)
-		.map(str::to_owned)
-		.ok_or_else(|| "missing /proc process start token".to_owned())
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {

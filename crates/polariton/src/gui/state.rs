@@ -28,7 +28,11 @@ use libaryon::core::BufferId;
 use libaryon::uast::projection::MarkdownCellOutputTarget;
 use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "toron")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(feature = "toron")]
+use tokio::sync::RwLock;
 
 struct AppState {
 	dashboard: DashboardState,
@@ -279,7 +283,18 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 	// Eagerly open the session scratch database so SQL always has a target;
 	// an in-memory SQLite open is effectively instant.
 	let scratch = Task::perform(AdapterState::open_scratch(), Message::ScratchReady);
-	(state, scratch)
+	#[cfg(feature = "toron")]
+	{
+		let discovery = Task::perform(
+			nilket_local::discover(None),
+			Message::LocalWorkspaceDiscovered,
+		);
+		(state, Task::batch([scratch, discovery]))
+	}
+	#[cfg(not(feature = "toron"))]
+	{
+		(state, scratch)
+	}
 }
 
 fn view(app_state: &AppState) -> Element<'_, Message> {
@@ -554,8 +569,8 @@ fn run_rune_relation_view(
 
 #[cfg(feature = "toron")]
 fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> Task<Message> {
-	let Some(connection) = app_state.adapter_state.sql_connection().cloned() else {
-		let message = "Local Rune workspace unavailable. Start or attach with `nilket`.".to_owned();
+	let Some(connection) = app_state.adapter_state.rune_connection().cloned() else {
+		let message = app_state.adapter_state.local_workspace_unavailable();
 		app_state.status_error = format!("Error: {message}");
 		app_state.code_editor.set_query_error(message);
 		app_state.rune_view_scheduler.cancel(work.source_buffer);
@@ -917,22 +932,87 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				Message::AdapterConnected,
 			);
 		}
-		Message::AdapterConnected(dba) => {
-			let ok = dba.is_some();
-			app_state.adapter_state.connection = dba;
-			app_state.adapter_state.stage = if ok {
-				AdapterStage::Connected
-			} else {
-				// A failed connect keeps the scratch database as the SQL
-				// target rather than reporting a connection that isn't there.
-				AdapterStage::Configured
+		Message::AdapterConnected(result) => match result {
+			Ok(connection) => {
+				app_state.adapter_state.connection = Some(connection);
+				app_state.adapter_state.stage = AdapterStage::Connected;
+				app_state.status_error.clear();
+				app_state.status_msg = "Adapter connected.".into();
+			}
+			Err(error) => {
+				app_state.adapter_state.connection = None;
+				// Scratch remains explicitly available for SQL, while the
+				// attempted adapter remains visibly unattached.
+				app_state.adapter_state.stage = AdapterStage::Configured;
+				app_state.status_error = error;
+				app_state.status_msg = "Adapter unavailable; SQL scratch remains active.".into();
+			}
+		},
+		#[cfg(feature = "toron")]
+		Message::LocalWorkspaceDiscovered(workspace) => {
+			app_state.adapter_state.local_workspace = Some(workspace.clone());
+			let nilket_local::LocalWorkspace::Ready(ready) = workspace else {
+				app_state.status_error = workspace.to_string();
+				app_state.status_msg = "SQL scratch remains active.".into();
+				return Task::none();
 			};
-			app_state.status_msg = if ok {
-				"Adapter connected.".into()
-			} else {
-				"Adapter connection failed.".into()
-			};
+			app_state.status_error.clear();
+			app_state.status_msg = format!(
+				"Attaching local workspace session {}…",
+				ready.identity.session_nonce
+			);
+			let endpoint = ready.sql_endpoint.to_string();
+			let message_workspace = ready.clone();
+			return Task::perform(
+				async move {
+					crate::adapters::toron::ToronAdapter::connect(&endpoint)
+						.await
+						.map(|adapter| {
+							Arc::new(RwLock::new(adapter))
+								as Arc<RwLock<dyn crate::adapters::common::DatabaseAdapter>>
+						})
+						.map_err(|error| error.to_string())
+				},
+				move |connection| Message::LocalWorkspaceAttached {
+					workspace: message_workspace,
+					connection,
+				},
+			);
 		}
+		#[cfg(feature = "toron")]
+		Message::LocalWorkspaceAttached {
+			workspace,
+			connection,
+		} => match connection {
+			Ok(connection) => {
+				app_state.adapter_state.selection =
+					crate::adapters::driver::AdapterSelection::Toron;
+				app_state.adapter_state.configuration =
+					crate::adapters::driver::AdapterConfiguration::Toron {
+						endpoint: workspace.sql_endpoint.to_string(),
+					};
+				app_state.adapter_state.name = "local workspace".to_owned();
+				app_state.adapter_state.connection = Some(connection);
+				app_state.adapter_state.stage = AdapterStage::Connected;
+				app_state.adapter_state.local_workspace =
+					Some(nilket_local::LocalWorkspace::Ready(workspace.clone()));
+				app_state.status_error.clear();
+				app_state.status_msg = format!(
+					"Joined local workspace session {}.",
+					workspace.identity.session_nonce
+				);
+			}
+			Err(cause) => {
+				let unhealthy = nilket_local::LocalWorkspace::Unhealthy {
+					identity: workspace.identity,
+					cause,
+				};
+				app_state.status_error = unhealthy.to_string();
+				app_state.status_msg = "SQL scratch remains active.".into();
+				app_state.adapter_state.connection = None;
+				app_state.adapter_state.local_workspace = Some(unhealthy);
+			}
+		},
 		Message::ScratchReady(scratch) => {
 			if scratch.is_none() {
 				app_state.status_error = "Scratch database failed to open.".to_string();

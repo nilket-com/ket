@@ -12,7 +12,7 @@ path = "src/main.rs"
 fs2 = "0.4"
 libc = "0.2"
 nix = { version = "0.29", features = ["process", "signal"] }
-serde = { version = "1.0", features = ["derive"] }
+nilket-local = { path = "../nilket-local" }
 serde_json = "1.0"
 signal-hook = "0.3"
 tls-pki = { path = "../tls-pki" }

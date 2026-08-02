@@ -2513,8 +2513,8 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "libc",
+ "nilket-local",
  "nix",
- "serde",
  "serde_json",
  "signal-hook 0.3.18",
  "tls-pki",
@@ -2523,6 +2523,20 @@ dependencies = [
  "toron-client",
  "uuid",
  "wendelon",
+]
+
+[[package]]
+name = "nilket-local"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "toron-client",
+ "uuid",
 ]
 
 [[package]]

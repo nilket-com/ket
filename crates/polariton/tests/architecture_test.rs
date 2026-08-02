@@ -83,3 +83,73 @@ fn product_0003_terminal_envelope_is_the_only_relation_view_transformation_site(
 		"positive control: the containment assay must observe a synthetic violation"
 	);
 }
+
+fn product_0005_private_discovery_leaks(source: &str) -> Vec<&'static str> {
+	let mut findings = Vec::new();
+	for (needle, label) in [
+		(
+			"runtime.json",
+			"private runtime-manifest path entered Polariton",
+		),
+		(
+			"127.0.0.1:7742",
+			"canonical local endpoint was duplicated in Polariton",
+		),
+		(
+			"struct RuntimeManifest",
+			"runtime schema was redefined in Polariton",
+		),
+		(
+			"struct ProfileMarker",
+			"profile schema was redefined in Polariton",
+		),
+	] {
+		if source.contains(needle) {
+			findings.push(label);
+		}
+	}
+	findings
+}
+
+#[test]
+fn product_0005_polariton_uses_only_public_local_workspace_discovery() {
+	let manifest =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+			.expect("read Polariton manifest");
+	assert!(
+		manifest.contains("nilket-local"),
+		"PRODUCT-0005 requires Polariton to consume the public discovery crate"
+	);
+
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut pending = vec![root];
+	let mut findings = Vec::new();
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(&path).expect("read Polariton source") {
+			let path = entry.expect("source entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+				let source = std::fs::read_to_string(&path).expect("read Polariton source file");
+				for finding in product_0005_private_discovery_leaks(&source) {
+					findings.push(format!("{}: {finding}", path.display()));
+				}
+			}
+		}
+	}
+	assert!(
+		findings.is_empty(),
+		"PRODUCT-0005 discovery authority violation:\n{}",
+		findings.join("\n")
+	);
+	assert_eq!(
+		product_0005_private_discovery_leaks(
+			"struct RuntimeManifest; const ENDPOINT: &str = \"127.0.0.1:7742\";"
+		),
+		vec![
+			"canonical local endpoint was duplicated in Polariton",
+			"runtime schema was redefined in Polariton",
+		],
+		"positive control: PRODUCT-0005 guard must observe private schema and endpoint copies"
+	);
+}

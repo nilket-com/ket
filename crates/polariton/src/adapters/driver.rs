@@ -72,6 +72,8 @@ pub struct AdapterState {
 	pub fields: BTreeMap<String, String>,
 	pub configuration: AdapterConfiguration,
 	pub connection: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
+	#[cfg(feature = "toron")]
+	pub local_workspace: Option<nilket_local::LocalWorkspace>,
 	/// Session-local in-memory SQLite scratch database. Always the SQL target
 	/// when no external adapter is connected, so SQL panes and notebook cells
 	/// work out of the box and share tables. Never persisted; disconnecting an
@@ -100,6 +102,21 @@ impl AdapterState {
 	/// connected, otherwise the session scratch database.
 	pub fn sql_connection(&self) -> Option<&Arc<RwLock<dyn DatabaseAdapter>>> {
 		self.connection.as_ref().or(self.scratch.as_ref())
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn rune_connection(&self) -> Option<&Arc<RwLock<dyn DatabaseAdapter>>> {
+		matches!(self.selection, AdapterSelection::Toron)
+			.then_some(())
+			.and(self.connection.as_ref())
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn local_workspace_unavailable(&self) -> String {
+		self.local_workspace.as_ref().map_or_else(
+			|| "Local workspace discovery has not completed.".to_owned(),
+			ToString::to_string,
+		)
 	}
 
 	pub fn scratch_is_active(&self) -> bool {
@@ -200,57 +217,44 @@ impl AdapterState {
 			}
 			#[cfg(feature = "toron")]
 			AdapterSelection::Toron => {
-				let endpoint = self
-					.fields
-					.get("endpoint")
-					.unwrap_or(&"127.0.0.1:7742".to_string())
-					.clone();
+				let endpoint = self.fields.get("endpoint").cloned().unwrap_or_default();
 				self.configuration = AdapterConfiguration::Toron { endpoint };
 				self.stage = AdapterStage::Configured;
 			}
 		}
 	}
 
-	pub async fn connect(config: AdapterConfiguration) -> Option<Arc<RwLock<dyn DatabaseAdapter>>> {
+	pub async fn connect(
+		config: AdapterConfiguration,
+	) -> Result<Arc<RwLock<dyn DatabaseAdapter>>, String> {
 		match config {
-			AdapterConfiguration::None => None,
+			AdapterConfiguration::None => Err("No adapter is configured.".to_owned()),
 			AdapterConfiguration::MySQL { connection_string } => {
-				let opts = match mysql_async::Opts::from_url(&connection_string) {
-					Ok(o) => o,
-					Err(err) => {
-						eprintln!("MySQL URL parse error: {err}");
-						return None;
-					}
-				};
+				let opts = mysql_async::Opts::from_url(&connection_string)
+					.map_err(|error| format!("MySQL URL: {error}"))?;
 				let pool = mysql_async::Pool::new(opts);
 				match tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await {
-					Ok(Ok(_conn)) => Some(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
-					Ok(Err(err)) => {
-						eprintln!("MySQL connection error: {err}");
-						None
-					}
-					Err(_elapsed) => {
-						eprintln!("MySQL connection timed out after 10s");
-						None
-					}
+					Ok(Ok(_conn)) => Ok(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
+					Ok(Err(error)) => Err(format!("MySQL connection: {error}")),
+					Err(_) => Err("MySQL connection timed out after 10s".to_owned()),
 				}
 			}
 			AdapterConfiguration::BigQuery { project_id } => {
-				let (bq_config, _detected_project) = match ClientConfig::new_with_auth().await {
-					Ok(res) => res,
-					Err(_) => return None,
-				};
+				let (bq_config, _detected_project) = ClientConfig::new_with_auth()
+					.await
+					.map_err(|error| format!("BigQuery authentication: {error}"))?;
 				match Client::new(bq_config).await {
-					Ok(client) => Some(Arc::new(RwLock::new(bigquery::BigQueryAdapter {
+					Ok(client) => Ok(Arc::new(RwLock::new(bigquery::BigQueryAdapter {
 						client,
 						project_id,
 					}))),
-					Err(_) => None,
+					Err(error) => Err(format!("BigQuery client: {error}")),
 				}
 			}
 			AdapterConfiguration::Parquet { input_path } => {
 				let input_path = Path::new(&input_path);
-				let input_ref_path = PlRefPath::try_from_path(input_path).unwrap();
+				let input_ref_path = PlRefPath::try_from_path(input_path)
+					.map_err(|error| format!("Parquet path: {error}"))?;
 				let hive_options = HiveOptions {
 					enabled: Some(input_path.is_dir()),
 					try_parse_dates: true,
@@ -260,7 +264,8 @@ impl AdapterState {
 					hive_options,
 					..Default::default()
 				};
-				let lf = LazyFrame::scan_parquet(input_ref_path, scan_args).unwrap();
+				let lf = LazyFrame::scan_parquet(input_ref_path, scan_args)
+					.map_err(|error| format!("Parquet scan: {error}"))?;
 				let table_name = if input_path.is_file() {
 					input_path
 						.file_prefix()
@@ -274,50 +279,38 @@ impl AdapterState {
 				};
 				let context = polars::sql::SQLContext::new();
 				context.register(table_name, lf);
-				Some(Arc::new(RwLock::new(parquet::ParquetAdapter { context })))
+				Ok(Arc::new(RwLock::new(parquet::ParquetAdapter { context })))
 			}
 			AdapterConfiguration::Postgres { connection_string } => {
-				let (client, connection) = match tokio_postgres::connect(
-					&connection_string,
-					tokio_postgres::NoTls,
-				)
-				.await
-				{
-					Ok(res) => res,
-					Err(_) => return None,
-				};
+				let (client, connection) =
+					tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+						.await
+						.map_err(|error| format!("Postgres connection: {error}"))?;
 				tokio::spawn(async move {
 					if let Err(e) = connection.await {
 						eprintln!("Postgres connection error: {}", e);
 					}
 				});
-				Some(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
+				Ok(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
 			}
 			AdapterConfiguration::SQLite { connection_string } => {
 				if connection_string == "memory" {
-					match AsyncConnection::open_in_memory().await.ok() {
-						Some(aconn) => Some(Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn }))),
-						None => None,
-					}
+					AsyncConnection::open_in_memory()
+						.await
+						.map(|aconn| Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _)
+						.map_err(|error| format!("SQLite memory connection: {error}"))
 				} else {
-					match AsyncConnection::open(connection_string).await.ok() {
-						Some(aconn) => Some(Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn }))),
-						None => None,
-					}
+					AsyncConnection::open(connection_string)
+						.await
+						.map(|aconn| Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _)
+						.map_err(|error| format!("SQLite connection: {error}"))
 				}
 			}
 			#[cfg(feature = "toron")]
-			AdapterConfiguration::Toron { endpoint } => {
-				match toron::ToronAdapter::connect(&endpoint).await {
-					Ok(adapter) => Some(Arc::new(RwLock::new(adapter))),
-					Err(error) => {
-						eprintln!(
-							"Toron connection error: {error}\nStart local Nilket with: nilket"
-						);
-						None
-					}
-				}
-			}
+			AdapterConfiguration::Toron { endpoint } => toron::ToronAdapter::connect(&endpoint)
+				.await
+				.map(|adapter| Arc::new(RwLock::new(adapter)) as _)
+				.map_err(|error| format!("Toron connection: {error}")),
 		}
 	}
 }
@@ -341,17 +334,13 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn selecting_toron_prefills_the_canonical_local_endpoint() {
+	fn selecting_toron_does_not_guess_a_local_endpoint() {
 		let mut state = AdapterState::default();
 		state.fields.insert("stale".into(), "old adapter".into());
 
 		state.select(AdapterSelection::Toron);
 
-		assert_eq!(state.fields.len(), 1);
-		assert_eq!(
-			state.fields.get("endpoint").map(String::as_str),
-			Some("127.0.0.1:7742")
-		);
+		assert!(state.fields.is_empty());
 	}
 
 	#[test]
@@ -413,8 +402,8 @@ mod tests {
 		));
 		#[cfg(feature = "toron")]
 		assert!(matches!(
-			AdapterConfiguration::from_saved("Toron", "127.0.0.1:7742"),
-			AdapterConfiguration::Toron { endpoint } if endpoint == "127.0.0.1:7742"
+			AdapterConfiguration::from_saved("Toron", "loopback.invalid:1"),
+			AdapterConfiguration::Toron { endpoint } if endpoint == "loopback.invalid:1"
 		));
 	}
 
@@ -425,9 +414,13 @@ mod tests {
 		state.scratch = runtime.block_on(AdapterState::open_scratch());
 		assert_eq!(state.connection_identity(), "scratch");
 
-		state.connection = runtime.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
-			connection_string: "memory".into(),
-		}));
+		state.connection = Some(
+			runtime
+				.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
+					connection_string: "memory".into(),
+				}))
+				.expect("external sqlite"),
+		);
 		state.selection = super::AdapterSelection::SQLite;
 		assert_eq!(state.connection_identity(), "SQLite");
 

@@ -9,6 +9,7 @@ description = "A strong coupling of data and visualization."
 [features]
 default = []
 toron = [
+	"dep:nilket-local",
 	"dep:toron-client",
 ]
 
@@ -52,3 +53,4 @@ tokio-stream = "0.1.18"
 unicode-segmentation = "1.13.2"
 unicode-width = "0.2.2"
 toron-client = { path = "../../nilket/crates/toron-client", optional = true }
+nilket-local = { path = "../../nilket/crates/nilket-local", optional = true }

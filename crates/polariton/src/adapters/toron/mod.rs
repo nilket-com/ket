@@ -8,8 +8,8 @@ use async_trait::async_trait;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "endpoint",
-	placeholder: "127.0.0.1:7742",
-	default_value: Some("127.0.0.1:7742"),
+	placeholder: "host:port",
+	default_value: None,
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
 }];
@@ -72,7 +72,7 @@ impl DatabaseAdapter for ToronAdapter {
 				}
 				other => RuneDispatchFailure {
 					kind: RuneDispatchFailureKind::Transport,
-					message: format!("{other}. Start or attach the local workspace with `nilket`."),
+					message: other.to_string(),
 					span: None,
 				},
 			})?;
@@ -97,7 +97,8 @@ mod tests {
 	use std::path::PathBuf;
 
 	fn live_endpoint() -> String {
-		std::env::var("TORON_SQL_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:7742".to_owned())
+		std::env::var("TORON_SQL_ENDPOINT")
+			.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
 	}
 
 	#[tokio::test]

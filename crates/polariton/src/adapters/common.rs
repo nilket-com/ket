@@ -84,7 +84,7 @@ pub trait DatabaseAdapter: Send + Sync + 'static {
 	async fn dispatch_rune(&mut self, _source: &str) -> RuneDispatchResult {
 		Err(RuneDispatchFailure {
 			kind: RuneDispatchFailureKind::Unavailable,
-			message: "Local Rune workspace unavailable. Start or attach with `nilket`.".to_owned(),
+			message: "The selected adapter does not provide Rune relation execution.".to_owned(),
 			span: None,
 		})
 	}
@@ -104,12 +104,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn unavailable_workspace_refuses_locally_with_attach_guidance() {
+	async fn adapter_without_rune_capability_refuses_locally() {
 		let error = NoRuneWorkspace
 			.dispatch_rune("table(workspace.table(\"test2\"))")
 			.await
 			.expect_err("adapter without Rune support");
 		assert_eq!(error.kind, RuneDispatchFailureKind::Unavailable);
-		assert!(error.message.contains("nilket"));
+		assert!(error.message.contains("selected adapter"));
 	}
 }
