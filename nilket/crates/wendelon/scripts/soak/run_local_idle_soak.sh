@@ -11,6 +11,7 @@ optional env:
   DURATION_SECS=3
   SAMPLE_INTERVAL_MILLIS=500
   HEARTBEAT_INTERVAL_MILLIS=100
+  LEASE_TTL_MILLIS=300
 
 The runner owns a fresh `nilket local` profile and refuses if the fixed local
 ports are already occupied. It never attaches to or stops an existing profile.
@@ -22,6 +23,8 @@ EOF
 DURATION_SECS=${DURATION_SECS:-3}
 SAMPLE_INTERVAL_MILLIS=${SAMPLE_INTERVAL_MILLIS:-500}
 HEARTBEAT_INTERVAL_MILLIS=${HEARTBEAT_INTERVAL_MILLIS:-100}
+LEASE_TTL_MILLIS=${LEASE_TTL_MILLIS:-300}
+LEASE_RENEW_INTERVAL_MILLIS=$((LEASE_TTL_MILLIS / 3))
 
 if [[ -z "$OUTPUT_DIR" ]]; then
   usage
@@ -100,8 +103,15 @@ config_path="$profile/config/wendelon.toml"
 sed -i \
   "s/cdc_locality_heartbeat_interval_millis = 30000/cdc_locality_heartbeat_interval_millis = ${HEARTBEAT_INTERVAL_MILLIS}/" \
   "$config_path"
+sed -i \
+  "s/data_ring_lease_ttl_millis = 90000/data_ring_lease_ttl_millis = ${LEASE_TTL_MILLIS}/" \
+  "$config_path"
 rg -q "^cdc_locality_heartbeat_interval_millis = ${HEARTBEAT_INTERVAL_MILLIS}$" "$config_path" || {
   echo "local-idle soak: failed to install compressed heartbeat cadence" >&2
+  exit 2
+}
+rg -q "^data_ring_lease_ttl_millis = ${LEASE_TTL_MILLIS}$" "$config_path" || {
+  echo "local-idle soak: failed to install compressed lease TTL" >&2
   exit 2
 }
 
@@ -126,6 +136,8 @@ metric_value() {
 
 metrics_body=$(curl "${curl_base[@]}" --resolve "$metrics_resolve" "$metrics_url")
 previous_heartbeats=$(metric_value "$metrics_body" wendelon_cdc_locality_heartbeats_committed_total)
+previous_lease_grants=$(metric_value "$metrics_body" wendelon_data_ring_lease_grants_total)
+previous_raft_entries=$(metric_value "$metrics_body" wendelon_raft_entries_applied_total)
 previous_wendelon_warns=0
 previous_toron_warns=0
 started_ns=$(date +%s%N)
@@ -138,12 +150,30 @@ for _ in $(seq 1 "$sample_count"); do
   queryable=true
   curl "${curl_base[@]}" --resolve "$ready_resolve" "$ready_url" >/dev/null || healthy=false
   metrics_body=$(curl "${curl_base[@]}" --resolve "$metrics_resolve" "$metrics_url") || healthy=false
-  "$NILKET_BIN" toron sql --endpoint 127.0.0.1:7742 "SELECT 1" >/dev/null 2>&1 || queryable=false
+  query_probe_stderr="$OUTPUT_DIR/query-probe.stderr"
+  if "$NILKET_BIN" toron sql --endpoint 127.0.0.1:7742 "SELECT 1" \
+    >/dev/null 2>"$query_probe_stderr"; then
+    : # A future storage-free scalar implementation is also a successful probe.
+  elif ! rg -Fxq \
+    "toron sql request failed: Toron PlanningError: unsupported frontend construct: SELECT without FROM is not supported" \
+    "$query_probe_stderr"; then
+    # Today SELECT-without-FROM is a typed planning refusal. Accepting only
+    # that exact response proves the frontend round trip without reading or
+    # mutating storage; connection, transport, and unrelated query failures
+    # remain failures.
+    queryable=false
+  fi
 
   heartbeats=$(metric_value "$metrics_body" wendelon_cdc_locality_heartbeats_committed_total)
+  lease_grants=$(metric_value "$metrics_body" wendelon_data_ring_lease_grants_total)
+  raft_entries=$(metric_value "$metrics_body" wendelon_raft_entries_applied_total)
   lag=$(metric_value "$metrics_body" wendelon_audit_materialization_lag_entries)
   heartbeat_delta=$((heartbeats - previous_heartbeats))
   previous_heartbeats=$heartbeats
+  lease_grant_delta=$((lease_grants - previous_lease_grants))
+  previous_lease_grants=$lease_grants
+  raft_entry_delta=$((raft_entries - previous_raft_entries))
+  previous_raft_entries=$raft_entries
 
   audit_end=$(wc -c <"$audit_path")
   delta_path="$OUTPUT_DIR/audit-delta.ndjson"
@@ -174,6 +204,10 @@ for _ in $(seq 1 "$sample_count"); do
     --argjson elapsed "$elapsed_millis" \
     --argjson interval "$HEARTBEAT_INTERVAL_MILLIS" \
     --argjson heartbeat_delta "$heartbeat_delta" \
+    --argjson lease_ttl "$LEASE_TTL_MILLIS" \
+    --argjson lease_renew "$LEASE_RENEW_INTERVAL_MILLIS" \
+    --argjson lease_delta "$lease_grant_delta" \
+    --argjson raft_delta "$raft_entry_delta" \
     --argjson audit_bytes "$audit_bytes" \
     --argjson audit_records "$audit_records" \
     --argjson operations "$audit_operations" \
@@ -182,8 +216,11 @@ for _ in $(seq 1 "$sample_count"); do
     --argjson healthy "$healthy" \
     --argjson queryable "$queryable" \
     --argjson warns "$warn_counts" \
-    '{elapsed_millis:$elapsed, heartbeat_interval_millis:$interval, locality_count:1,
-      committed_heartbeat_delta:$heartbeat_delta, audit_byte_delta:$audit_bytes,
+    '{elapsed_millis:$elapsed, heartbeat_interval_millis:$interval, locality_count:2,
+      committed_heartbeat_delta:$heartbeat_delta,
+      lease_ttl_millis:$lease_ttl, lease_renew_interval_millis:$lease_renew,
+      primary_range_count:1, committed_lease_grant_delta:$lease_delta,
+      raft_entries_applied_delta:$raft_delta, audit_byte_delta:$audit_bytes,
       audit_record_delta:$audit_records, audit_operations:$operations,
       heartbeat_data_write_audit_records:$heartbeat_audits,
       audit_materialization_lag_entries:$lag, healthy:$healthy,
@@ -204,11 +241,15 @@ jq -n \
   --arg mode local_idle \
   --argjson duration "$measured_duration_millis" \
   --argjson interval "$HEARTBEAT_INTERVAL_MILLIS" \
+  --argjson lease_ttl "$LEASE_TTL_MILLIS" \
+  --argjson lease_renew "$LEASE_RENEW_INTERVAL_MILLIS" \
   --argjson ready "$ready_probes" \
   --argjson metrics "$metrics_probes" \
   --argjson queries "$sample_count" \
-  '{format_version:1, mode:$mode, duration_millis:$duration,
-    heartbeat_interval_millis:$interval, locality_count:1,
+  '{format_version:2, mode:$mode, duration_millis:$duration,
+    heartbeat_interval_millis:$interval, locality_count:2,
+    lease_ttl_millis:$lease_ttl, lease_renew_interval_millis:$lease_renew,
+    primary_range_count:1, evaluator_owned_raft_entries:0,
     wendelon_process_starts:1, ready_probe_count:$ready,
     metrics_probe_count:$metrics, query_probe_count:$queries}' \
   >"$OUTPUT_DIR/soak_config.json"

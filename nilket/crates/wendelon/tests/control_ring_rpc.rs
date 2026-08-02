@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
 	AdvanceEpochResponseWire, AuditChainHeadResponseWire, CONTROL_REASON_AUTHORIZATION_FAILED,
@@ -294,6 +294,86 @@ async fn lease_req_commits_through_control_ring_handler() {
 
 	let snapshot = node.state_machine.state_snapshot().await;
 	assert!(snapshot.leases.contains_key(&range_start));
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn configured_lease_ttl_reaches_local_manager_and_remote_grant_cap() {
+	const CONFIGURED_TTL_MILLIS: u64 = 90_000;
+	let mut config = NodeBootstrapConfig::dev(
+		1,
+		support::tempdir("lease-config-authority"),
+		"127.0.0.1:0".into(),
+	);
+	config.data_ring_lease_ttl = Duration::from_millis(CONFIGURED_TTL_MILLIS);
+	let node = WendelonNode::bootstrap_single_node(config).await.unwrap();
+	support::wait_for_local_leader(&node).await;
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	let locally_granted = loop {
+		if let Some(lease) = node
+			.data_server
+			.lease_cache()
+			.read()
+			.unwrap()
+			.first()
+			.copied()
+		{
+			break lease;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"configured local lease manager did not seed its cache"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	};
+	assert_eq!(
+		locally_granted
+			.lease_expiry
+			.physical_ms
+			.saturating_sub(locally_granted.lease_start.physical_ms),
+		CONFIGURED_TTL_MILLIS,
+		"local manager must use the configured TTL"
+	);
+	node.handles.lease_manager.abort();
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
+	let req = AcquireLeaseRequestMeta {
+		range_start: locally_granted.range_start,
+		range_end: locally_granted.range_end,
+		epoch: locally_granted.epoch,
+		holder: node.local_node,
+		requested_hlc: locally_granted.lease_start,
+		ttl_ms: u32::MAX,
+		_pad: 0,
+	};
+	let resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::LEASE_REQ,
+		bytemuck::bytes_of(&req),
+		None,
+		None,
+	)
+	.await
+	.unwrap();
+	let meta: AcquireLeaseResponseMeta =
+		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
+	assert_eq!(meta.status, LeaseStatus::GRANTED);
+	let remotely_granted: LeaseDescriptor = *bytemuck::from_bytes(
+		&resp.trailing.as_ref().unwrap()[..std::mem::size_of::<LeaseDescriptor>()],
+	);
+	assert_eq!(
+		remotely_granted
+			.lease_expiry
+			.physical_ms
+			.saturating_sub(remotely_granted.lease_start.physical_ms),
+		CONFIGURED_TTL_MILLIS,
+		"remote grant cap must use the same configured TTL"
+	);
 
 	support::abort_node(&node);
 }

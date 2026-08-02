@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SOAK_FORMAT_VERSION: u32 = 1;
+pub const SOAK_FORMAT_VERSION: u32 = 2;
 pub const LOCAL_IDLE_SOAK_FORMAT_VERSION: u32 = SOAK_FORMAT_VERSION;
 pub const LOCAL_IDLE_SOAK_MODE: &str = "local_idle";
 pub const COMMODITY_SOAK_MODE: &str = "commodity";
@@ -18,6 +18,10 @@ pub struct LocalIdleSoakConfig {
 	pub duration_millis: u64,
 	pub heartbeat_interval_millis: u64,
 	pub locality_count: u64,
+	pub lease_ttl_millis: u64,
+	pub lease_renew_interval_millis: u64,
+	pub primary_range_count: u64,
+	pub evaluator_owned_raft_entries: u64,
 	pub wendelon_process_starts: u64,
 	pub ready_probe_count: u64,
 	pub metrics_probe_count: u64,
@@ -40,11 +44,19 @@ impl LocalIdleSoakConfig {
 		if self.duration_millis == 0
 			|| self.heartbeat_interval_millis == 0
 			|| self.locality_count == 0
+			|| self.lease_ttl_millis < 3
+			|| self.lease_renew_interval_millis == 0
+			|| self.primary_range_count == 0
 			|| self.wendelon_process_starts == 0
 		{
 			return Err(
-				"duration, heartbeat interval, locality count, and process starts must be nonzero"
+				"duration, heartbeat/lease intervals, locality/range counts, and process starts must be nonzero"
 					.to_owned(),
+			);
+		}
+		if self.lease_renew_interval_millis != self.lease_ttl_millis / 3 {
+			return Err(
+				"lease renewal interval must be derived as integer lease TTL / 3".to_owned(),
 			);
 		}
 		Ok(())
@@ -57,6 +69,11 @@ pub struct LocalIdleSoakSample {
 	pub heartbeat_interval_millis: u64,
 	pub locality_count: u64,
 	pub committed_heartbeat_delta: u64,
+	pub lease_ttl_millis: u64,
+	pub lease_renew_interval_millis: u64,
+	pub primary_range_count: u64,
+	pub committed_lease_grant_delta: u64,
+	pub raft_entries_applied_delta: u64,
 	pub audit_byte_delta: u64,
 	pub audit_record_delta: u64,
 	pub audit_operations: BTreeMap<String, u64>,
@@ -84,6 +101,13 @@ pub struct LocalIdleSoakSummary {
 	pub duration_millis: u64,
 	pub committed_heartbeats: u64,
 	pub committed_heartbeat_max: u64,
+	pub committed_lease_grants: u64,
+	pub committed_lease_grant_max: u64,
+	pub raft_entries_applied: u64,
+	pub named_raft_entries: u64,
+	pub raft_residual_entries: u64,
+	pub raft_named_ahead_entries: u64,
+	pub raft_boundary_allowance: u64,
 	pub audit_bytes: u64,
 	pub audit_records: u64,
 	pub audit_operations: BTreeMap<String, u64>,
@@ -123,6 +147,8 @@ pub fn evaluate_local_idle_soak(
 	let budget = local_idle_audit_budget(config);
 	let mut failures = Vec::new();
 	let mut committed_heartbeats = 0u64;
+	let mut committed_lease_grants = 0u64;
+	let mut raft_entries_applied = 0u64;
 	let mut audit_bytes = 0u64;
 	let mut audit_records = 0u64;
 	let mut heartbeat_audit_records = 0u64;
@@ -139,14 +165,21 @@ pub fn evaluate_local_idle_soak(
 	for sample in samples {
 		if sample.heartbeat_interval_millis != config.heartbeat_interval_millis
 			|| sample.locality_count != config.locality_count
+			|| sample.lease_ttl_millis != config.lease_ttl_millis
+			|| sample.lease_renew_interval_millis != config.lease_renew_interval_millis
+			|| sample.primary_range_count != config.primary_range_count
 		{
 			failures.push(format!(
-				"sample at {} ms changed heartbeat configuration",
+				"sample at {} ms changed idle-writer configuration",
 				sample.elapsed_millis
 			));
 		}
 		committed_heartbeats =
 			committed_heartbeats.saturating_add(sample.committed_heartbeat_delta);
+		committed_lease_grants =
+			committed_lease_grants.saturating_add(sample.committed_lease_grant_delta);
+		raft_entries_applied =
+			raft_entries_applied.saturating_add(sample.raft_entries_applied_delta);
 		audit_bytes = audit_bytes.saturating_add(sample.audit_byte_delta);
 		audit_records = audit_records.saturating_add(sample.audit_record_delta);
 		heartbeat_audit_records =
@@ -183,6 +216,36 @@ pub fn evaluate_local_idle_soak(
 	if committed_heartbeats > committed_heartbeat_max {
 		failures.push(format!(
 			"committed heartbeat count {committed_heartbeats} exceeds cadence/locality maximum {committed_heartbeat_max}"
+		));
+	}
+	let lease_interval_count = config
+		.duration_millis
+		.div_ceil(config.lease_renew_interval_millis);
+	let committed_lease_grant_max = lease_interval_count
+		.saturating_mul(config.primary_range_count)
+		// One scheduling-boundary allowance per primary range.
+		.saturating_add(config.primary_range_count);
+	if committed_lease_grants > committed_lease_grant_max {
+		failures.push(format!(
+			"committed lease-grant count {committed_lease_grants} exceeds cadence/range maximum {committed_lease_grant_max}"
+		));
+	}
+	let named_raft_entries = committed_lease_grants
+		.saturating_add(committed_heartbeats)
+		.saturating_add(config.evaluator_owned_raft_entries);
+	let raft_residual_entries = raft_entries_applied.saturating_sub(named_raft_entries);
+	let raft_named_ahead_entries = named_raft_entries.saturating_sub(raft_entries_applied);
+	let raft_boundary_allowance = config
+		.primary_range_count
+		.saturating_add(config.locality_count);
+	if raft_residual_entries > raft_boundary_allowance {
+		failures.push(format!(
+			"unexplained idle Raft entries {raft_residual_entries} exceed named-writer boundary allowance {raft_boundary_allowance}"
+		));
+	}
+	if raft_named_ahead_entries > raft_boundary_allowance {
+		failures.push(format!(
+			"named idle Raft counters lead total applied entries by {raft_named_ahead_entries}, exceeding boundary allowance {raft_boundary_allowance}"
 		));
 	}
 	if heartbeat_audit_records != 0 {
@@ -237,6 +300,13 @@ pub fn evaluate_local_idle_soak(
 		duration_millis: config.duration_millis,
 		committed_heartbeats,
 		committed_heartbeat_max,
+		committed_lease_grants,
+		committed_lease_grant_max,
+		raft_entries_applied,
+		named_raft_entries,
+		raft_residual_entries,
+		raft_named_ahead_entries,
+		raft_boundary_allowance,
 		audit_bytes,
 		audit_records,
 		audit_operations,
@@ -256,6 +326,10 @@ mod tests {
 			duration_millis: 2_000,
 			heartbeat_interval_millis: 100,
 			locality_count: 1,
+			lease_ttl_millis: 300,
+			lease_renew_interval_millis: 100,
+			primary_range_count: 1,
+			evaluator_owned_raft_entries: 0,
 			wendelon_process_starts: 1,
 			ready_probe_count: 1,
 			metrics_probe_count: 1,
@@ -269,6 +343,11 @@ mod tests {
 			heartbeat_interval_millis: 100,
 			locality_count: 1,
 			committed_heartbeat_delta: 20,
+			lease_ttl_millis: 300,
+			lease_renew_interval_millis: 100,
+			primary_range_count: 1,
+			committed_lease_grant_delta: 20,
+			raft_entries_applied_delta: 40,
 			audit_byte_delta: 500,
 			audit_record_delta: 3,
 			audit_operations: BTreeMap::from([
@@ -295,6 +374,11 @@ mod tests {
 		let mut cases = Vec::new();
 		let mut value = sample();
 		value.committed_heartbeat_delta = 100;
+		value.raft_entries_applied_delta = 120;
+		cases.push(value);
+		let mut value = sample();
+		value.committed_lease_grant_delta = 100;
+		value.raft_entries_applied_delta = 120;
 		cases.push(value);
 		let mut value = sample();
 		value.heartbeat_data_write_audit_records = 1;
@@ -320,6 +404,21 @@ mod tests {
 					.passed
 			);
 		}
+	}
+
+	#[test]
+	fn unexpected_idle_raft_writer_trips_total_substrate_budget() {
+		let mut value = sample();
+		value.raft_entries_applied_delta += 4;
+		let summary = evaluate_local_idle_soak(&config(), &[value]).unwrap();
+		assert!(!summary.passed);
+		assert_eq!(summary.raft_residual_entries, 4);
+		assert!(
+			summary
+				.failures
+				.iter()
+				.any(|failure| failure.contains("unexplained idle Raft entries"))
+		);
 	}
 
 	#[test]

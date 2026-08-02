@@ -79,6 +79,85 @@ impl PhysicalClock for AdjustableClock {
 	}
 }
 
+#[tokio::test(start_paused = true)]
+async fn lease_refresh_schedule_seeds_once_then_waits_for_the_derived_deadline() {
+	let (_epoch_tx, mut epoch_rx) = watch::channel(Arc::new(MembershipEpoch::empty()));
+	let refreshes = Arc::new(AtomicU64::new(0));
+	let observed = refreshes.clone();
+	let task = tokio::spawn(async move {
+		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+			let observed = observed.clone();
+			async move {
+				observed.fetch_add(1, Ordering::SeqCst);
+			}
+		})
+		.await;
+	});
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+	tokio::time::advance(Duration::from_secs(9)).await;
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+	tokio::time::advance(Duration::from_secs(1)).await;
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+	task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_refresh_schedule_epoch_change_supersedes_the_old_timer_deadline() {
+	let (epoch_tx, mut epoch_rx) = watch::channel(Arc::new(MembershipEpoch::empty()));
+	let refreshes = Arc::new(AtomicU64::new(0));
+	let observed = refreshes.clone();
+	let task = tokio::spawn(async move {
+		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+			let observed = observed.clone();
+			async move {
+				observed.fetch_add(1, Ordering::SeqCst);
+			}
+		})
+		.await;
+	});
+	tokio::task::yield_now().await;
+	tokio::time::advance(Duration::from_secs(5)).await;
+	let mut next = (*epoch_tx.borrow()).as_ref().clone();
+	next.epoch = next.epoch.saturating_add(1);
+	epoch_tx.send(Arc::new(next)).unwrap();
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+	tokio::time::advance(Duration::from_secs(5)).await;
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+	tokio::time::advance(Duration::from_secs(5)).await;
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 3);
+	task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_refresh_schedule_delays_missed_ticks_and_stops_when_watch_closes() {
+	let (epoch_tx, mut epoch_rx) = watch::channel(Arc::new(MembershipEpoch::empty()));
+	let refreshes = Arc::new(AtomicU64::new(0));
+	let observed = refreshes.clone();
+	let task = tokio::spawn(async move {
+		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+			let observed = observed.clone();
+			async move {
+				observed.fetch_add(1, Ordering::SeqCst);
+			}
+		})
+		.await;
+	});
+	tokio::task::yield_now().await;
+	tokio::time::advance(Duration::from_secs(35)).await;
+	tokio::task::yield_now().await;
+	assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+	drop(epoch_tx);
+	tokio::task::yield_now().await;
+	assert!(task.is_finished());
+	assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapturedSpan {
 	name: String,

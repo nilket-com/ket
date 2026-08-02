@@ -114,6 +114,7 @@ rf = 3
 wal_io_depth = 128
 slab_io_depth = 128
 cdc_locality_heartbeat_interval_millis = 2500
+data_ring_lease_ttl_millis = 9000
 
 [identity]
 lease_signing_secret = "{lease_secret}"
@@ -144,6 +145,10 @@ transfer_signing_secret = "{transfer_secret}"
 	assert_eq!(
 		cfg.cdc_locality_heartbeat_interval,
 		std::time::Duration::from_millis(2500)
+	);
+	assert_eq!(
+		cfg.data_ring_lease_ttl,
+		std::time::Duration::from_millis(9000)
 	);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:4701");
 	assert_eq!(cfg.lease_signing_secret, lease_secret);
@@ -234,6 +239,12 @@ transfer_signing_secret = "{transfer_secret}"
 			wendelon::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS
 		)
 	);
+	assert_eq!(
+		cfg.data_ring_lease_ttl,
+		std::time::Duration::from_millis(u64::from(
+			wendelon::node::DEFAULT_DATA_RING_LEASE_TTL_MILLIS
+		))
+	);
 }
 
 #[test]
@@ -257,6 +268,26 @@ fn zero_cdc_locality_heartbeat_interval_is_rejected() {
 fn serious_example_keeps_the_one_second_cdc_heartbeat_default() {
 	let rendered = render_example_config();
 	assert!(rendered.contains("cdc_locality_heartbeat_interval_millis = 1000"));
+	assert!(rendered.contains("data_ring_lease_ttl_millis = 3000"));
+}
+
+#[test]
+fn invalid_data_ring_lease_ttls_are_rejected() {
+	for invalid in [0u64, 2, u64::from(u32::MAX) + 1] {
+		let root = fresh_dir(&format!("invalid-lease-ttl-{invalid}"));
+		std::fs::create_dir_all(root.join("data")).unwrap();
+		let body = render_example_config().replace(
+			"data_ring_lease_ttl_millis = 3000",
+			&format!("data_ring_lease_ttl_millis = {invalid}"),
+		);
+		let config_path = write_config(&root, &body);
+		let err = load_node_bootstrap_config(&config_path).unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("tuning.data_ring_lease_ttl_millis must be between 3 and 4294967295"),
+			"unexpected error for {invalid}: {err}"
+		);
+	}
 }
 
 #[test]

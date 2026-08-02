@@ -313,6 +313,7 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_network_compression_ratio"));
 	assert!(body.contains("wendelon_network_compression_decode_error_total"));
 	assert!(body.contains("wendelon_cdc_locality_heartbeats_committed_total"));
+	assert!(body.contains("wendelon_raft_entries_applied_total"));
 	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
 	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
 	assert!(body.contains("wendelon_storage_csb_merge_logical_fingerprint_mismatch_total"));

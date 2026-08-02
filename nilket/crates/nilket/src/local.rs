@@ -876,10 +876,16 @@ mod tests {
 			wendelon.cdc_locality_heartbeat_interval,
 			Duration::from_secs(30)
 		);
+		assert_eq!(wendelon.data_ring_lease_ttl, Duration::from_secs(90));
 		assert!(
 			fs::read_to_string(&paths.wendelon_config)
 				.unwrap()
 				.contains("cdc_locality_heartbeat_interval_millis = 30000")
+		);
+		assert!(
+			fs::read_to_string(&paths.wendelon_config)
+				.unwrap()
+				.contains("data_ring_lease_ttl_millis = 90000")
 		);
 		assert_eq!(toron.node.tenant_id.0, 0);
 		assert_eq!(toron.sql.unwrap().listener_bind.to_string(), SQL_ENDPOINT);

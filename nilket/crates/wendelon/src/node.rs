@@ -179,6 +179,9 @@ pub struct NodeBootstrapConfig {
 	pub slab_io_depth: u32,
 	/// ADR 079 cadence for unconditional CDC locality progress markers.
 	pub cdc_locality_heartbeat_interval: Duration,
+	/// ADR 080 HLC fencing window for Data Ring range leases. The
+	/// renewal cadence is derived as one third of this duration.
+	pub data_ring_lease_ttl: Duration,
 	/// `host:port` this node publishes into the membership epoch —
 	/// peers dial here when we advertise a transport tier.
 	pub advertise_address: String,
@@ -275,6 +278,9 @@ impl NodeBootstrapConfig {
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS,
 			),
+			data_ring_lease_ttl: Duration::from_millis(u64::from(
+				DEFAULT_DATA_RING_LEASE_TTL_MILLIS,
+			)),
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,
@@ -395,6 +401,7 @@ impl NodeBootstrapConfig {
 				"cdc_locality_heartbeat_interval must be greater than zero",
 			));
 		}
+		DataRingLeaseTiming::try_from_duration(self.data_ring_lease_ttl)?;
 		if self.advertise_address.trim().is_empty() {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -849,13 +856,58 @@ enum BootstrapListener {
 	},
 }
 
-/// Time-to-live the lease manager requests on every grant. The
-/// renew interval is a third of this so two consecutive failed
-/// ticks still leave a valid lease in place.
-pub const LEASE_TTL_MS: u32 = 3_000;
-/// Renewal cadence: `LEASE_TTL_MS / 3`.
-pub const LEASE_RENEW_INTERVAL: std::time::Duration =
-	std::time::Duration::from_millis((LEASE_TTL_MS / 3) as u64);
+/// Ordinary serious-deployment lease window. ADR 080 keeps this
+/// default while local profile configuration chooses a visible
+/// longer value.
+pub const DEFAULT_DATA_RING_LEASE_TTL_MILLIS: u32 = 3_000;
+/// Ordinary-default compatibility name used by focused lease fixtures.
+/// Production bootstrap derives its value from configuration (ADR 080).
+pub const LEASE_TTL_MS: u32 = DEFAULT_DATA_RING_LEASE_TTL_MILLIS;
+
+/// One validated authority for both lease-grant paths and the
+/// derived renewal scheduler. Keeping the renewal interval out of
+/// configuration makes an interval at or beyond the TTL
+/// unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataRingLeaseTiming {
+	ttl_millis: u32,
+	renew_interval: Duration,
+}
+
+impl DataRingLeaseTiming {
+	pub fn try_from_duration(ttl: Duration) -> std::io::Result<Self> {
+		let ttl_millis = u32::try_from(ttl.as_millis()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"data_ring_lease_ttl must fit the u32 millisecond wire carrier",
+			)
+		})?;
+		if ttl_millis < 3 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"data_ring_lease_ttl must be at least 3 milliseconds",
+			));
+		}
+		if ttl != Duration::from_millis(u64::from(ttl_millis)) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"data_ring_lease_ttl must be an integral number of milliseconds",
+			));
+		}
+		Ok(Self {
+			ttl_millis,
+			renew_interval: Duration::from_millis(u64::from(ttl_millis / 3)),
+		})
+	}
+
+	pub fn ttl_millis(self) -> u32 {
+		self.ttl_millis
+	}
+
+	pub fn renew_interval(self) -> Duration {
+		self.renew_interval
+	}
+}
 
 // ============================================================
 //  BOOTSTRAP
@@ -1503,6 +1555,7 @@ impl WendelonNode {
 		)
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::new: {e}")))?;
+		let lease_timing = DataRingLeaseTiming::try_from_duration(cfg.data_ring_lease_ttl)?;
 
 		// 10. Ring router — starts empty, seeded by the first
 		//     `epoch_rx` value the updater task observes before it
@@ -1565,7 +1618,7 @@ impl WendelonNode {
 				factory.clone(),
 				pool.clone(),
 				cfg.rf as u32,
-				LEASE_TTL_MS,
+				lease_timing.ttl_millis(),
 				audit_sink.clone(),
 			)
 			.with_protocol_window(cfg.protocol)
@@ -1751,16 +1804,16 @@ impl WendelonNode {
 		));
 		let lsm_gc = LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn();
 
-		// 16. Lease manager (plan 018). Runs in the background,
-		//     renews every LEASE_TTL_MS / 3 and on every ring-epoch
+		// 16. Lease manager (plan 018 / ADR 080). Runs in the background,
+		//     renews every configured TTL / 3 and on every ring-epoch
 		//     change, and updates the data server's local cache so
 		//     the write/read gates installed above can admit traffic.
 		let lease_manager = data_server.clone().spawn_lease_manager(
 			ring.clone(),
 			clock.clone(),
 			epoch_rx.clone(),
-			LEASE_RENEW_INTERVAL,
-			LEASE_TTL_MS,
+			lease_timing.renew_interval(),
+			lease_timing.ttl_millis(),
 		);
 		let pending_finalization_reconciler = data_server
 			.clone()
@@ -2756,6 +2809,21 @@ mod tests {
 		cfg.tiering.min_slab_bytes = u64::MAX;
 		cfg.tiering.max_plaintext_rewrites_per_pass = 0;
 		cfg.tiering.max_dek_rewraps_per_pass = 0;
+	}
+
+	#[test]
+	fn data_ring_lease_timing_keeps_one_validated_authority() {
+		let timing = DataRingLeaseTiming::try_from_duration(Duration::from_millis(90_000)).unwrap();
+		assert_eq!(timing.ttl_millis(), 90_000);
+		assert_eq!(timing.renew_interval(), Duration::from_millis(30_000));
+		for invalid in [
+			Duration::ZERO,
+			Duration::from_millis(2),
+			Duration::from_nanos(3_000_001),
+			Duration::from_millis(u64::from(u32::MAX) + 1),
+		] {
+			assert!(DataRingLeaseTiming::try_from_duration(invalid).is_err());
+		}
 	}
 
 	async fn wait_for_local_leader(node: &WendelonNode) {

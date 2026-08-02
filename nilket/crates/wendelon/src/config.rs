@@ -15,8 +15,8 @@ use crate::network::{
 	lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
 use crate::node::{
-	ClusterBootstrapConfig, DEFAULT_MVCC_RETENTION_WINDOW, NodeBootstrapConfig,
-	ObservabilityConfig, SeedNodeConfig, TransportTlsConfig,
+	ClusterBootstrapConfig, DEFAULT_DATA_RING_LEASE_TTL_MILLIS, DEFAULT_MVCC_RETENTION_WINDOW,
+	NodeBootstrapConfig, ObservabilityConfig, SeedNodeConfig, TransportTlsConfig,
 };
 use crate::schema::ProtocolVersionWindow;
 use crate::storage::{
@@ -71,6 +71,10 @@ pub fn render_example_config() -> String {
 			"{{CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS}}",
 			&crate::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS.to_string(),
 		)
+		.replace(
+			"{{DATA_RING_LEASE_TTL_MILLIS}}",
+			&DEFAULT_DATA_RING_LEASE_TTL_MILLIS.to_string(),
+		)
 		.replace("{{LEASE_SIGNING_SECRET}}", &hex_string(lease_secret))
 		.replace(
 			"{{LEASE_VERIFYING_KEY}}",
@@ -95,6 +99,10 @@ pub fn render_local_profile_config(data_dir: &Path, pki: &tls_pki::DevelopmentPk
 		.replace(
 			"cdc_locality_heartbeat_interval_millis = 1000",
 			"# Local convenience trades CDC frontier latency for quiet idle operation.\ncdc_locality_heartbeat_interval_millis = 30000",
+		)
+		.replace(
+			"data_ring_lease_ttl_millis = 3000",
+			"# Local single-node convenience trades distinct-successor failover latency for quiet idle operation.\ndata_ring_lease_ttl_millis = 90000",
 		);
 	config.push_str(&format!(
 		r#"
@@ -517,6 +525,8 @@ struct RawTuningConfig {
 	#[serde(default)]
 	cdc_locality_heartbeat_interval_millis: Option<u64>,
 	#[serde(default)]
+	data_ring_lease_ttl_millis: Option<u64>,
+	#[serde(default)]
 	max_inbound_connections: Option<usize>,
 	#[serde(default)]
 	max_inbound_connections_per_ip: Option<usize>,
@@ -533,6 +543,7 @@ impl Default for RawTuningConfig {
 			wal_io_depth: None,
 			slab_io_depth: None,
 			cdc_locality_heartbeat_interval_millis: None,
+			data_ring_lease_ttl_millis: None,
 			max_inbound_connections: None,
 			max_inbound_connections_per_ip: None,
 			max_inbound_streams_per_connection: None,
@@ -771,6 +782,10 @@ impl RawConfig {
 			.tuning
 			.cdc_locality_heartbeat_interval_millis
 			.unwrap_or(crate::storage::DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS);
+		let data_ring_lease_ttl_millis = self
+			.tuning
+			.data_ring_lease_ttl_millis
+			.unwrap_or(u64::from(DEFAULT_DATA_RING_LEASE_TTL_MILLIS));
 		if self.tuning.wal_io_depth == Some(0)
 			|| (self.tuning.wal_io_depth.is_none() && wal_io_depth == 0)
 		{
@@ -791,6 +806,12 @@ impl RawConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"tuning.cdc_locality_heartbeat_interval_millis must be greater than zero",
+			));
+		}
+		if !(3..=u64::from(u32::MAX)).contains(&data_ring_lease_ttl_millis) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"tuning.data_ring_lease_ttl_millis must be between 3 and 4294967295",
 			));
 		}
 		let transport_admission = ServerAdmissionConfig {
@@ -898,6 +919,7 @@ impl RawConfig {
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				cdc_locality_heartbeat_interval_millis,
 			),
+			data_ring_lease_ttl: Duration::from_millis(data_ring_lease_ttl_millis),
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,

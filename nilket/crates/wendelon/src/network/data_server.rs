@@ -3370,26 +3370,17 @@ impl WendelonDataServer {
 		ttl_ms: u32,
 	) -> JoinHandle<()> {
 		tokio::spawn(async move {
-			// Seed immediately so the cache is warm before the gate
-			// is flipped on elsewhere in the bootstrap sequence.
-			let _ = self
-				.refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
-				.await;
-			let mut ticker = tokio::time::interval(tick);
-			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-			loop {
-				tokio::select! {
-					changed = epoch_rx.changed() => {
-						if changed.is_err() {
-							break; // senders dropped — clean exit
-						}
-					}
-					_ = ticker.tick() => {}
+			run_lease_refresh_schedule(&mut epoch_rx, tick, || {
+				let server = self.clone();
+				let ring = ring.clone();
+				let clock = clock.clone();
+				async move {
+					let _ = server
+						.refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
+						.await;
 				}
-				let _ = self
-					.refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
-					.await;
-			}
+			})
+			.await;
 		})
 	}
 
@@ -6299,6 +6290,38 @@ impl WendelonDataServer {
 			arrow_payload: None,
 			trailing: None,
 		}
+	}
+}
+
+async fn run_lease_refresh_schedule<F, Fut>(
+	epoch_rx: &mut watch::Receiver<Arc<MembershipEpoch>>,
+	tick: Duration,
+	mut refresh: F,
+) where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = ()>,
+{
+	// Seed once immediately. `interval()` would also produce an
+	// immediately-ready first tick, duplicating this authoritative
+	// Raft renewal at startup (ADR 080).
+	refresh().await;
+	let deadline = tokio::time::sleep(tick);
+	tokio::pin!(deadline);
+	loop {
+		tokio::select! {
+			biased;
+			changed = epoch_rx.changed() => {
+				if changed.is_err() {
+					break;
+				}
+			}
+			_ = &mut deadline => {}
+		}
+		refresh().await;
+		// A refresh caused by an epoch change supersedes the prior
+		// timer deadline; a delayed runtime likewise schedules from
+		// completion instead of bursting missed renewals.
+		deadline.as_mut().reset(tokio::time::Instant::now() + tick);
 	}
 }
 

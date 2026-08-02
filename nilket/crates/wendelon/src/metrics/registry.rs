@@ -2416,6 +2416,7 @@ pub struct MetricsRegistry {
 	pub metrics_scrapes_total: Counter,
 
 	pub raft_membership_epoch: Gauge,
+	pub raft_entries_applied_total: Counter,
 	raft_current_leader_id: Mutex<Option<String>>,
 
 	pub liveness_tracked_peers: Gauge,
@@ -2688,6 +2689,7 @@ impl Default for MetricsRegistry {
 			metrics_scrapes_total: Counter::default(),
 
 			raft_membership_epoch: Gauge::default(),
+			raft_entries_applied_total: Counter::default(),
 			raft_current_leader_id: Mutex::new(None),
 
 			liveness_tracked_peers: Gauge::default(),
@@ -4127,6 +4129,12 @@ impl MetricsRegistry {
 			"wendelon_raft_membership_epoch",
 			"Current applied Control Ring membership epoch.",
 			self.raft_membership_epoch.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_raft_entries_applied_total",
+			"Control Ring entries applied by the live state machine process.",
+			self.raft_entries_applied_total.get(),
 		);
 		render_gauge_family_header(
 			&mut out,

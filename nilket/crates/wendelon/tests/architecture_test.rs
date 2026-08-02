@@ -3302,7 +3302,7 @@ fn adr079_idle_heartbeat_policy_and_classification_have_one_owner() {
 		"ADR 079 requires explicit skip semantics for heartbeat worker and discovery ticks"
 	);
 	for required in [
-		"pub const SOAK_FORMAT_VERSION: u32 = 1",
+		"pub const SOAK_FORMAT_VERSION: u32 = 2",
 		"pub const LOCAL_IDLE_SOAK_FORMAT_VERSION: u32 = SOAK_FORMAT_VERSION",
 		"pub const LOCAL_IDLE_SOAK_MODE: &str = \"local_idle\"",
 		"total idle audit records",
@@ -3337,6 +3337,152 @@ fn adr079_idle_heartbeat_policy_and_classification_have_one_owner() {
 			"ADR 079 owned local-idle runner is missing {required}"
 		);
 	}
+}
+
+fn adr080_has_seed_plus_immediate_interval(source: &str) -> bool {
+	let compact = source
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect::<String>();
+	compact.contains("refresh().await;") && compact.contains("tokio::time::interval(tick)")
+}
+
+fn adr080_total_applied_increment_count(source: &str) -> usize {
+	source
+		.matches("metrics().raft_entries_applied_total.inc()")
+		.count()
+}
+
+/// ADR 080: the local lease posture has one validated TTL authority, a
+/// non-bursting scheduler, and a substrate-level idle Raft budget.
+#[test]
+fn adr080_local_lease_posture_is_guarded_at_each_ownership_boundary() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir);
+	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let soak = fs::read_to_string(manifest_dir.join("src/idle_soak.rs")).unwrap();
+	let soak_runner =
+		fs::read_to_string(manifest_dir.join("scripts/soak/run_local_idle_soak.sh")).unwrap();
+
+	assert!(
+		config.contains("data_ring_lease_ttl_millis = 90000")
+			&& example.contains("data_ring_lease_ttl_millis = {{DATA_RING_LEASE_TTL_MILLIS}}"),
+		"ADR 080 requires both the visible local teaching-artifact TTL and the ordinary-profile placeholder"
+	);
+	assert!(
+		config.contains("data_ring_lease_ttl_millis: Option<u64>")
+			&& !config.contains("lease_renew_interval_millis"),
+		"ADR 080 permits one lease TTL config authority and forbids an independently configurable renewal interval"
+	);
+	let production_bootstrap = node
+		.split_once("pub async fn bootstrap")
+		.map(|(_, tail)| tail)
+		.and_then(|tail| tail.split("mod tests {").next())
+		.expect("node production bootstrap source");
+	assert!(
+		production_bootstrap
+			.contains("DataRingLeaseTiming::try_from_duration(cfg.data_ring_lease_ttl)")
+			&& production_bootstrap
+				.matches("lease_timing.ttl_millis()")
+				.count() == 2
+			&& production_bootstrap.contains("lease_timing.renew_interval()"),
+		"ADR 080 requires both grant paths and the scheduler to consume one validated timing value; ttl uses={}, renew uses={}",
+		production_bootstrap
+			.matches("lease_timing.ttl_millis()")
+			.count(),
+		production_bootstrap
+			.matches("lease_timing.renew_interval()")
+			.count()
+	);
+	assert!(
+		!production_bootstrap.contains("LEASE_TTL_MS")
+			&& !production_bootstrap.contains("LEASE_RENEW_INTERVAL"),
+		"ADR 080 forbids direct ordinary-constant use in production bootstrap wiring"
+	);
+
+	let forbidden_scheduler_control =
+		"refresh().await; let mut interval = tokio::time::interval(tick); interval.tick().await;";
+	assert!(
+		adr080_has_seed_plus_immediate_interval(forbidden_scheduler_control),
+		"ADR 080 positive control must observe seed-plus-immediate-interval scheduling"
+	);
+	let schedule = data_server
+		.split("async fn run_lease_refresh_schedule")
+		.nth(1)
+		.and_then(|tail| {
+			tail.split("// ============================================================")
+				.next()
+		})
+		.expect("lease refresh schedule source");
+	assert!(
+		!adr080_has_seed_plus_immediate_interval(schedule)
+			&& schedule.contains("tokio::time::sleep(tick)")
+			&& schedule.contains("biased;")
+			&& schedule.contains("reset(tokio::time::Instant::now() + tick)"),
+		"ADR 080 requires one immediate seed followed by newest-deadline, non-bursting renewal scheduling"
+	);
+
+	let duplicate_metric_control =
+		"metrics().raft_entries_applied_total.inc(); metrics().raft_entries_applied_total.inc();";
+	assert_eq!(
+		adr080_total_applied_increment_count(duplicate_metric_control),
+		2,
+		"ADR 080 positive control must observe a duplicated total-applied increment"
+	);
+	assert_eq!(
+		adr080_total_applied_increment_count(&raft),
+		1,
+		"ADR 080 total-applied metric must increment at exactly one source location"
+	);
+	let live_apply = raft
+		.split("impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine")
+		.nth(1)
+		.expect("Raft state-machine implementation");
+	assert!(
+		live_apply.contains("metrics().raft_entries_applied_total.inc()")
+			&& metrics.contains("wendelon_raft_entries_applied_total"),
+		"ADR 080 requires the substrate numerator at the live state-machine apply boundary"
+	);
+
+	for required in [
+		"pub const SOAK_FORMAT_VERSION: u32 = 2",
+		"committed_lease_grant_delta",
+		"raft_entries_applied_delta",
+		"named_raft_entries",
+		"raft_residual_entries",
+		"unexpected_idle_raft_writer_trips_total_substrate_budget",
+	] {
+		assert!(
+			soak.contains(required),
+			"ADR 080 local-idle substrate evidence is missing {required}"
+		);
+	}
+	for required in [
+		"wendelon_data_ring_lease_grants_total",
+		"wendelon_raft_entries_applied_total",
+		"format_version:2",
+	] {
+		assert!(
+			soak_runner.contains(required),
+			"ADR 080 isolated runner is missing {required}"
+		);
+	}
+
+	let forbidden_wire_control = "pub struct LeaseDescriptor { pub data_ring_lease_ttl: u32 }";
+	assert!(
+		forbidden_wire_control.contains("data_ring_lease_ttl"),
+		"ADR 080 positive control must observe a lease wire-layout change"
+	);
+	assert!(
+		!schema.contains("data_ring_lease_ttl")
+			&& schema.contains("size_of::<LeaseDescriptor>() == 144"),
+		"ADR 080 changes lease timing policy without changing the fixed LeaseDescriptor wire layout"
+	);
 }
 
 fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {

@@ -2433,6 +2433,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				let mut index_schema_audit_context =
 					index_schema_audit_context(&guard.state, &entry);
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
+				// Live apply is the total Control Ring substrate numerator.
+				// Recovery and snapshot installation use separate paths and
+				// must not manufacture process-lifetime work (ADR 080).
+				metrics().raft_entries_applied_total.inc();
 				if let Some(context) = index_schema_audit_context.as_mut() {
 					finalize_index_schema_audit_context(&guard.state, context);
 				}
