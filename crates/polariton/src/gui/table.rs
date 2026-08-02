@@ -31,6 +31,35 @@ const V_SCROLLBAR_WIDTH: f32 = 12.0;
 const H_SCROLLBAR_HEIGHT: f32 = 12.0;
 const COL_RESIZE_GRAB_ZONE: f32 = 4.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnAlignment {
+	Left,
+	Right,
+}
+
+impl ColumnAlignment {
+	fn horizontal(self) -> Horizontal {
+		match self {
+			Self::Left => Horizontal::Left,
+			Self::Right => Horizontal::Right,
+		}
+	}
+}
+
+fn text_bounds(cell_x: f32, cell_y: f32, cell_width: f32, cell_height: f32) -> Rectangle {
+	Rectangle {
+		x: cell_x + CELL_PADDING_X,
+		y: cell_y,
+		width: (cell_width - CELL_PADDING_X * 2.0).max(0.0),
+		height: cell_height,
+	}
+}
+
+fn clamp_horizontal_scroll(offset: f64, total_width: f32, viewport_width: f32) -> f64 {
+	let max_scroll = (total_width - viewport_width).max(0.0) as f64;
+	offset.clamp(0.0, max_scroll)
+}
+
 /// A scroll action requested from outside the widget — currently keyboard
 /// input routed from a focused host panel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +151,9 @@ impl<'a> Table<'a> {
 	}
 
 	fn measure_col_width(&self, col_idx: usize) -> f32 {
+		if let Some(width) = self.col_width {
+			return width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+		}
 		let col_name = self
 			.data_frame
 			.get_column_names()
@@ -133,24 +165,40 @@ impl<'a> Table<'a> {
 			.map(|row| self.cell_str(col_idx, row).len())
 			.max()
 			.unwrap_or(0);
-		let max_chars = max_content_chars.max(col_name.len());
+		let type_label_chars = self
+			.show_column_types
+			.then(|| {
+				self.data_frame
+					.columns()
+					.get(col_idx)
+					.map(|column| column.dtype().to_string().len())
+					.unwrap_or(0)
+			})
+			.unwrap_or(0);
+		let max_chars = max_content_chars.max(col_name.len()).max(type_label_chars);
 		let text_width = max_chars as f32 * FONT_SIZE * 0.6;
 		(text_width + CELL_PADDING_X * 2.0).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
 	}
 
-	fn col_widths<'s>(&self, state: &'s mut TableState, viewport_width: f32) -> &'s [f32] {
+	fn col_widths<'s>(&self, state: &'s mut TableState, _viewport_width: f32) -> &'s [f32] {
 		let col_count = self.col_count();
 		if state.col_widths.len() != col_count {
 			state.col_widths = (0..col_count).map(|i| self.measure_col_width(i)).collect();
-			let total: f32 = state.col_widths.iter().sum();
-			if total < viewport_width {
-				let scale = viewport_width / total;
-				for w in &mut state.col_widths {
-					*w *= scale;
-				}
-			}
 		}
 		&state.col_widths
+	}
+
+	fn column_alignment(&self, col_idx: usize) -> ColumnAlignment {
+		if self
+			.data_frame
+			.columns()
+			.get(col_idx)
+			.is_some_and(|column| column.dtype().is_numeric())
+		{
+			ColumnAlignment::Right
+		} else {
+			ColumnAlignment::Left
+		}
 	}
 
 	fn col_widths_ref<'s>(&self, state: &'s TableState) -> &'s [f32] {
@@ -420,6 +468,7 @@ where
 		let viewport_h = bounds.height - H_SCROLLBAR_HEIGHT;
 		let max_v_scroll = (total_h - viewport_h).max(0.0) as f64;
 		let max_h_scroll = (total_w - viewport_w).max(0.0) as f64;
+		state.h_scroll_offset = clamp_horizontal_scroll(state.h_scroll_offset, total_w, viewport_w);
 		let v_thumb = self.v_scrollbar_thumb_rect(bounds, state.v_scroll_offset);
 		let h_thumb = self.h_scrollbar_thumb_rect(bounds, state.h_scroll_offset, state, row_num_w);
 		match event {
@@ -468,8 +517,8 @@ where
 					state.col_widths[col_idx] =
 						(state.resize_drag_start_width + delta).max(MIN_COL_WIDTH);
 					let new_total_w = self.total_content_width(state);
-					let new_max_h = (new_total_w - viewport_w).max(0.0) as f64;
-					state.h_scroll_offset = state.h_scroll_offset.min(new_max_h);
+					state.h_scroll_offset =
+						clamp_horizontal_scroll(state.h_scroll_offset, new_total_w, viewport_w);
 					shell.request_redraw();
 				} else if state.v_dragging_scrollbar {
 					let drag_delta = position.y - state.v_drag_start_y;
@@ -688,6 +737,7 @@ where
 				let mut cell_x = bounds.x + row_num_w - h_scroll;
 				for (col_idx, field) in self.data_frame.get_column_names().iter().enumerate() {
 					let col_w = col_widths[col_idx];
+					let alignment = self.column_alignment(col_idx).horizontal();
 					if cell_x + col_w >= bounds.x + row_num_w
 						&& cell_x <= bounds.x + row_num_w + viewport_w
 					{
@@ -708,15 +758,10 @@ where
 						draw_text(
 							renderer,
 							field.as_str(),
-							Rectangle {
-								x: cell_x + CELL_PADDING_X,
-								y: bounds.y,
-								width: col_w - CELL_PADDING_X,
-								height: HEADER_HEIGHT,
-							},
+							text_bounds(cell_x, bounds.y, col_w, HEADER_HEIGHT),
 							colors::TABLE_TEXT_HEADER,
 							true,
-							Horizontal::Center,
+							alignment,
 						);
 						if self.show_column_types
 							&& let Some(col) = self.data_frame.columns().get(col_idx)
@@ -725,15 +770,15 @@ where
 							draw_text_sized(
 								renderer,
 								&dtype_label,
-								Rectangle {
-									x: cell_x + CELL_PADDING_X,
-									y: bounds.y + HEADER_HEIGHT,
-									width: col_w - CELL_PADDING_X,
-									height: header_h - HEADER_HEIGHT,
-								},
+								text_bounds(
+									cell_x,
+									bounds.y + HEADER_HEIGHT,
+									col_w,
+									header_h - HEADER_HEIGHT,
+								),
 								colors::TABLE_TYPE_LABEL,
 								TYPE_LABEL_FONT_SIZE,
-								Horizontal::Center,
+								alignment,
 							);
 						}
 					}
@@ -875,6 +920,7 @@ where
 					);
 					let mut cell_x = bounds.x + row_num_w - h_scroll;
 					for (col_idx, &col_w) in col_widths.iter().enumerate() {
+						let alignment = self.column_alignment(col_idx).horizontal();
 						if cell_x + col_w >= bounds.x + row_num_w
 							&& cell_x <= bounds.x + row_num_w + viewport_w
 						{
@@ -914,15 +960,10 @@ where
 							draw_text(
 								renderer,
 								&text,
-								Rectangle {
-									x: cell_x + CELL_PADDING_X,
-									y: row_y,
-									width: col_w - CELL_PADDING_X,
-									height: ROW_HEIGHT,
-								},
+								text_bounds(cell_x, row_y, col_w, ROW_HEIGHT),
 								colors::TEXT_PRIMARY,
 								false,
-								Horizontal::Left,
+								alignment,
 							);
 						}
 						cell_x += col_w;
@@ -1056,5 +1097,93 @@ where
 {
 	fn from(table: Table<'a>) -> Self {
 		Self::new(table)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn assert_close(actual: f32, expected: f32) {
+		assert!(
+			(actual - expected).abs() < 0.01,
+			"expected {expected}, got {actual}"
+		);
+	}
+
+	#[test]
+	fn content_widths_are_independent_of_viewport_width() {
+		let frame = polars::df!(
+			"cat" => ["Cat1", "Cat2", "Cat3"],
+			"val" => [1.1_f64, 2.2, 3.3],
+		)
+		.expect("table fixture");
+		let table = Table::new(&frame, 0);
+		let mut narrow_state = TableState::default();
+		let mut wide_state = TableState::default();
+
+		let narrow = table.col_widths(&mut narrow_state, 200.0).to_vec();
+		let wide = table.col_widths(&mut wide_state, 1_900.0).to_vec();
+
+		assert_eq!(narrow, wide);
+		assert!(wide.iter().all(|width| *width <= MAX_COL_WIDTH));
+		assert!(wide.iter().sum::<f32>() < 1_900.0 / 4.0);
+
+		let old_scale = 1_900.0 / narrow.iter().sum::<f32>();
+		let old_total = narrow.iter().map(|width| width * old_scale).sum::<f32>();
+		assert_close(old_total, 1_900.0);
+	}
+
+	#[test]
+	fn measured_widths_include_symmetric_padding_and_stay_bounded() {
+		let very_long = "x".repeat(100);
+		let frame = polars::df!(
+			"x" => [""],
+			"four" => ["Cat1"],
+			"very_long" => [very_long],
+		)
+		.expect("table fixture");
+		let table = Table::new(&frame, 0);
+
+		assert_close(table.measure_col_width(0), MIN_COL_WIDTH);
+		assert_close(
+			table.measure_col_width(1),
+			4.0 * FONT_SIZE * 0.6 + CELL_PADDING_X * 2.0,
+		);
+		assert_close(table.measure_col_width(2), MAX_COL_WIDTH);
+	}
+
+	#[test]
+	fn headers_and_cells_share_schema_driven_alignment() {
+		let frame = polars::df!(
+			"text" => ["Cat1"],
+			"integer" => [1_i64],
+			"decimal" => [1.1_f64],
+			"flag" => [true],
+		)
+		.expect("table fixture");
+		let table = Table::new(&frame, 0);
+
+		assert_eq!(table.column_alignment(0), ColumnAlignment::Left);
+		assert_eq!(table.column_alignment(1), ColumnAlignment::Right);
+		assert_eq!(table.column_alignment(2), ColumnAlignment::Right);
+		assert_eq!(table.column_alignment(3), ColumnAlignment::Left);
+	}
+
+	#[test]
+	fn text_padding_is_symmetric_inside_the_column() {
+		let bounds = text_bounds(100.0, 20.0, 80.0, ROW_HEIGHT);
+
+		assert_close(bounds.x, 100.0 + CELL_PADDING_X);
+		assert_close(bounds.width, 80.0 - CELL_PADDING_X * 2.0);
+		assert_close(bounds.x + bounds.width / 2.0, 140.0);
+		assert_close(bounds.height, ROW_HEIGHT);
+	}
+
+	#[test]
+	fn horizontal_scroll_refits_when_the_viewport_grows() {
+		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 100.0), 350.0);
+		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 300.0), 200.0);
+		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 600.0), 0.0);
 	}
 }
