@@ -840,6 +840,32 @@ mod tests {
 	}
 
 	#[test]
+	fn a_locking_observer_turns_real_supervisor_startup_into_report_existing_failure() {
+		let root = fresh_root("observer-lock-control");
+		let paths = ProfilePaths::new(root.clone());
+		prepare_root_for_lock(&root).unwrap();
+		let observer_lock = open_lock(&paths.lock).unwrap();
+		observer_lock.lock_exclusive().unwrap();
+
+		let error = run_owned(LocalOptions {
+			data_dir: Some(root.clone()),
+			reset: false,
+		})
+		.unwrap_err();
+		assert!(
+			error.contains("local workspace is starting under pid"),
+			"the real try_lock_exclusive path must enter report_existing: {error}"
+		);
+		assert!(
+			error.contains(&std::process::id().to_string()),
+			"report_existing must retain the locking observer's identity: {error}"
+		);
+
+		drop(observer_lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
 	fn supervisor_source_guard_rejects_role_runtime_and_harness_construction() {
 		fn forbidden(source: &str) -> bool {
 			[

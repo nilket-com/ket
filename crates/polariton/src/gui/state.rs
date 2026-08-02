@@ -1656,10 +1656,14 @@ fn get_node_rects(
 mod tests {
 	#[cfg(feature = "toron")]
 	use super::rune_view_outcome;
+	#[cfg(feature = "toron")]
+	use super::{AdapterState, view};
 	use super::{
 		clear_transient_sql_status_on_editor_activity, compact_sql_diagnostic, new, set_sql_error,
 		update,
 	};
+	#[cfg(feature = "toron")]
+	use crate::adapters::common::AdapterStage;
 	use crate::adapters::common::ExecutionResult;
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
@@ -1669,6 +1673,149 @@ mod tests {
 	use crate::rune_relation_envelope::{
 		PendingRuneView, RuneViewForm, transform as transform_rune_view,
 	};
+	#[cfg(feature = "toron")]
+	use nilket_local::{
+		Artifact, Evidence, LocalWorkspace, ObservationContext, ReadyWorkspace, StaleCause,
+		VersionedArtifact, WorkspaceIdentity,
+	};
+	#[cfg(feature = "toron")]
+	fn local_identity() -> WorkspaceIdentity {
+		WorkspaceIdentity {
+			profile_root: "/tmp/polariton-product-0005-fixture".into(),
+			profile_uuid: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+			session_nonce: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+			owner_pid: 42,
+			started_unix_ms: 7,
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn non_ready_local_workspaces() -> Vec<LocalWorkspace> {
+		let identity = local_identity();
+		let root = identity.profile_root.clone();
+		let runtime_context = ObservationContext::Runtime(identity.clone());
+		vec![
+			LocalWorkspace::Absent {
+				profile_root: root.clone(),
+			},
+			LocalWorkspace::Starting {
+				profile_root: root,
+				owner_pid: identity.owner_pid,
+			},
+			LocalWorkspace::Unhealthy {
+				identity: identity.clone(),
+				cause: "fixture health failure".to_owned(),
+			},
+			LocalWorkspace::Stale {
+				identity: identity.clone(),
+				cause: StaleCause::PidRecycled,
+			},
+			LocalWorkspace::Corrupt {
+				context: runtime_context.clone(),
+				artifact: Artifact::RuntimeManifest,
+				cause: "fixture corruption".to_owned(),
+			},
+			LocalWorkspace::Incompatible {
+				context: runtime_context.clone(),
+				artifact: VersionedArtifact::RuntimeManifest,
+				found: 2,
+				supported: 1,
+			},
+			LocalWorkspace::Unverifiable {
+				context: runtime_context,
+				evidence: Evidence::StableIdentity,
+				cause: "fixture churn".to_owned(),
+			},
+		]
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn local_discovery_attaches_only_ready_workspaces() {
+		for workspace in non_ready_local_workspaces() {
+			let expected_status = workspace.to_string();
+			let (mut state, startup) = new(StartupData::default(), None);
+			drop(startup);
+			let attach = update(
+				&mut state,
+				Message::LocalWorkspaceDiscovered(workspace.clone()),
+			);
+			assert_eq!(
+				attach.units(),
+				0,
+				"non-Ready discovery must construct no connection client: {workspace}"
+			);
+			assert!(matches!(state.adapter_state.stage, AdapterStage::None));
+			assert!(state.adapter_state.connection.is_none());
+			assert_eq!(state.adapter_state.local_workspace, Some(workspace));
+			assert_eq!(state.status_error, expected_status);
+			assert_eq!(state.status_msg, "SQL scratch remains active.");
+			state.code_editor.shutdown();
+		}
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let ready = ReadyWorkspace {
+			sql_endpoint: "127.0.0.1:9".parse().unwrap(),
+			identity: local_identity(),
+		};
+		let attach = update(
+			&mut state,
+			Message::LocalWorkspaceDiscovered(LocalWorkspace::Ready(ready.clone())),
+		);
+		assert_eq!(
+			attach.units(),
+			1,
+			"Ready is the positive control for connection construction"
+		);
+		assert!(
+			state
+				.status_msg
+				.contains(&ready.identity.session_nonce.to_string())
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn first_frame_does_not_wait_for_local_discovery() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		assert_eq!(
+			startup.units(),
+			2,
+			"scratch open and local discovery must remain independent async work"
+		);
+		assert!(state.adapter_state.local_workspace.is_none());
+		let first_frame = view(&state);
+		drop(first_frame);
+		assert!(
+			state.adapter_state.local_workspace.is_none(),
+			"rendering must not synchronously await discovery"
+		);
+		drop(startup);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn unavailable_workspace_keeps_scratch_explicitly_attributed() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.adapter_state.scratch = runtime.block_on(AdapterState::open_scratch());
+		let workspace = LocalWorkspace::Absent {
+			profile_root: "/tmp/polariton-product-0005-absent".into(),
+		};
+		let expected_status = workspace.to_string();
+		let attempt = update(&mut state, Message::LocalWorkspaceDiscovered(workspace));
+		assert_eq!(attempt.units(), 0);
+		assert!(state.adapter_state.sql_connection().is_some());
+		assert!(state.adapter_state.scratch_is_active());
+		assert_eq!(state.adapter_state.connection_identity(), "scratch");
+		assert_eq!(state.status_error, expected_status);
+		assert_eq!(state.status_msg, "SQL scratch remains active.");
+		state.code_editor.shutdown();
+	}
 
 	#[cfg(feature = "toron")]
 	#[test]

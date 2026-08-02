@@ -344,38 +344,53 @@ pub async fn discover(profile_root: Option<&Path>) -> LocalWorkspace {
 }
 
 async fn discover_async_root(root: PathBuf, retried: bool) -> LocalWorkspace {
-	let first = observe_identity(&root);
-	let IdentityObservation::Verified {
-		identity,
-		sql_endpoint,
-		lock_owner_pid,
-	} = first
-	else {
-		return match first {
-			IdentityObservation::Settled(state) => state,
-			_ => unreachable!(),
-		};
-	};
-	let health = match toron_client::ToronClient::loopback(sql_endpoint.to_string()) {
-		Ok(client) => client.health().await.map_err(|error| error.to_string()),
-		Err(error) => Err(error.to_string()),
-	};
-	match confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid) {
-		Confirmation::Stable => health_state(identity, sql_endpoint, health),
-		Confirmation::Settled(state) => state,
-		Confirmation::Changed if !retried => discover_async_root_boxed(root).await,
-		Confirmation::Changed => LocalWorkspace::Unverifiable {
-			context: ObservationContext::Runtime(identity),
-			evidence: Evidence::StableIdentity,
-			cause: "workspace identity changed twice during discovery".to_owned(),
-		},
-	}
+	discover_async_root_with(root, retried, &async_health_probe).await
 }
 
-fn discover_async_root_boxed(
+type AsyncHealthFuture<'a> =
+	std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+type AsyncDiscoveryFuture<'a> =
+	std::pin::Pin<Box<dyn std::future::Future<Output = LocalWorkspace> + Send + 'a>>;
+
+fn async_health_probe(endpoint: SocketAddr) -> AsyncHealthFuture<'static> {
+	Box::pin(async move {
+		match toron_client::ToronClient::loopback(endpoint.to_string()) {
+			Ok(client) => client.health().await.map_err(|error| error.to_string()),
+			Err(error) => Err(error.to_string()),
+		}
+	})
+}
+
+fn discover_async_root_with<'a>(
 	root: PathBuf,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = LocalWorkspace> + Send>> {
-	Box::pin(discover_async_root(root, true))
+	retried: bool,
+	probe: &'a (dyn Fn(SocketAddr) -> AsyncHealthFuture<'a> + Sync),
+) -> AsyncDiscoveryFuture<'a> {
+	Box::pin(async move {
+		let first = observe_identity(&root);
+		let IdentityObservation::Verified {
+			identity,
+			sql_endpoint,
+			lock_owner_pid,
+		} = first
+		else {
+			return match first {
+				IdentityObservation::Settled(state) => state,
+				_ => unreachable!(),
+			};
+		};
+		let health = probe(sql_endpoint).await;
+		match confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid) {
+			Confirmation::Stable => health_state(identity, sql_endpoint, health),
+			Confirmation::Settled(state) => state,
+			Confirmation::Changed if !retried => discover_async_root_with(root, true, probe).await,
+			Confirmation::Changed => LocalWorkspace::Unverifiable {
+				context: ObservationContext::Runtime(identity),
+				evidence: Evidence::StableIdentity,
+				cause: "workspace identity changed twice during discovery".to_owned(),
+			},
+		}
+	})
 }
 
 #[must_use]
@@ -398,6 +413,18 @@ pub fn blocking_discover(profile_root: Option<&Path>) -> LocalWorkspace {
 }
 
 fn discover_blocking_root(root: PathBuf, retried: bool) -> LocalWorkspace {
+	discover_blocking_root_with(root, retried, &blocking_health_probe)
+}
+
+fn blocking_health_probe(endpoint: SocketAddr) -> Result<(), String> {
+	toron_client::blocking_health_loopback(&endpoint.to_string()).map_err(|error| error.to_string())
+}
+
+fn discover_blocking_root_with(
+	root: PathBuf,
+	retried: bool,
+	probe: &dyn Fn(SocketAddr) -> Result<(), String>,
+) -> LocalWorkspace {
 	let first = observe_identity(&root);
 	let IdentityObservation::Verified {
 		identity,
@@ -410,12 +437,11 @@ fn discover_blocking_root(root: PathBuf, retried: bool) -> LocalWorkspace {
 			_ => unreachable!(),
 		};
 	};
-	let health = toron_client::blocking_health_loopback(&sql_endpoint.to_string())
-		.map_err(|error| error.to_string());
+	let health = probe(sql_endpoint);
 	match confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid) {
 		Confirmation::Stable => health_state(identity, sql_endpoint, health),
 		Confirmation::Settled(state) => state,
-		Confirmation::Changed if !retried => discover_blocking_root(root, true),
+		Confirmation::Changed if !retried => discover_blocking_root_with(root, true, probe),
 		Confirmation::Changed => LocalWorkspace::Unverifiable {
 			context: ObservationContext::Runtime(identity),
 			evidence: Evidence::StableIdentity,
@@ -467,6 +493,10 @@ fn confirm_identity(
 }
 
 fn observe_identity(root: &Path) -> IdentityObservation {
+	observe_identity_with(root, &|| {})
+}
+
+fn observe_identity_with(root: &Path, pause: &dyn Fn()) -> IdentityObservation {
 	let root_context = || ObservationContext::Root {
 		profile_root: root.to_path_buf(),
 	};
@@ -501,7 +531,7 @@ fn observe_identity(root: &Path) -> IdentityObservation {
 			Err(error) => return unverifiable(root_context(), evidence_for(artifact), error),
 		}
 	}
-	let lock_owner = match observe_lock_owner(&paths.lock) {
+	let lock_owner = match observe_lock_owner_with(&paths.lock, pause) {
 		Ok(owner) => owner,
 		Err(error) => return unverifiable(root_context(), Evidence::OwnershipLock, error),
 	};
@@ -674,7 +704,7 @@ fn read_regular(path: &Path) -> Result<Vec<u8>, io::Error> {
 	Ok(bytes)
 }
 
-fn observe_lock_owner(lock_path: &Path) -> Result<Option<u32>, io::Error> {
+fn observe_lock_owner_with(lock_path: &Path, pause: &dyn Fn()) -> Result<Option<u32>, io::Error> {
 	let metadata = match fs::symlink_metadata(lock_path) {
 		Ok(metadata) => metadata,
 		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -714,9 +744,11 @@ fn observe_lock_owner(lock_path: &Path) -> Result<Option<u32>, io::Error> {
 			let owner = fields[4 + offset]
 				.parse::<u32>()
 				.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+			pause();
 			return Ok(Some(owner));
 		}
 	}
+	pause();
 	Ok(None)
 }
 
@@ -813,10 +845,17 @@ fn evidence_for(artifact: Artifact) -> Evidence {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
 	use super::*;
+	use std::fs::OpenOptions;
+	use std::os::fd::AsRawFd;
 	use std::os::unix::fs::PermissionsExt;
-	use std::time::{SystemTime, UNIX_EPOCH};
+	use std::process::{Child, Command, Stdio};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{Arc, Barrier, Mutex};
+	use std::thread;
+	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 	fn fresh_root(label: &str) -> PathBuf {
 		let nonce = SystemTime::now()
@@ -837,6 +876,556 @@ mod tests {
 		};
 		fs::write(&paths.marker, toml::to_string(&marker).unwrap()).unwrap();
 		marker
+	}
+
+	fn write_runtime(
+		paths: &ProfilePaths,
+		marker: &ProfileMarker,
+		pid: u32,
+		process_start_token: String,
+		session_nonce: Uuid,
+	) -> WorkspaceIdentity {
+		let runtime = RuntimeManifest {
+			version: FORMAT_VERSION,
+			profile_uuid: marker.profile_uuid,
+			session_nonce,
+			pid,
+			process_start_token,
+			started_unix_ms: u128::from(pid),
+			wendelon_endpoint: WENDELON_ENDPOINT.to_owned(),
+			sql_endpoint: "127.0.0.1:9".to_owned(),
+		};
+		fs::write(&paths.runtime, serde_json::to_vec_pretty(&runtime).unwrap()).unwrap();
+		WorkspaceIdentity {
+			profile_root: paths.root.clone(),
+			profile_uuid: runtime.profile_uuid,
+			session_nonce: runtime.session_nonce,
+			owner_pid: runtime.pid,
+			started_unix_ms: runtime.started_unix_ms,
+		}
+	}
+
+	#[derive(Debug)]
+	struct HeldFlock(File);
+
+	impl HeldFlock {
+		fn try_acquire(path: &Path) -> Result<Self, io::Error> {
+			let file = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create(true)
+				.truncate(false)
+				.open(path)?;
+			let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+			if result == 0 {
+				Ok(Self(file))
+			} else {
+				Err(io::Error::last_os_error())
+			}
+		}
+	}
+
+	impl Drop for HeldFlock {
+		fn drop(&mut self) {
+			let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+		}
+	}
+
+	const FLOCK_HELPER_LOCK: &str = "NILKET_LOCAL_TEST_FLOCK_PATH";
+	const FLOCK_HELPER_READY: &str = "NILKET_LOCAL_TEST_FLOCK_READY";
+	const FLOCK_HELPER_RELEASE: &str = "NILKET_LOCAL_TEST_FLOCK_RELEASE";
+
+	#[test]
+	fn flock_owner_process() {
+		let Some(lock_path) = std::env::var_os(FLOCK_HELPER_LOCK) else {
+			return;
+		};
+		let ready = PathBuf::from(std::env::var_os(FLOCK_HELPER_READY).unwrap());
+		let release = PathBuf::from(std::env::var_os(FLOCK_HELPER_RELEASE).unwrap());
+		let lock = HeldFlock::try_acquire(Path::new(&lock_path)).expect("helper acquires flock");
+		fs::write(&ready, b"ready").expect("publish helper readiness");
+		while !release.exists() {
+			thread::sleep(Duration::from_millis(2));
+		}
+		drop(lock);
+	}
+
+	struct FlockChild {
+		child: Child,
+		release: PathBuf,
+		pid: u32,
+	}
+
+	impl FlockChild {
+		fn spawn(paths: &ProfilePaths, generation: usize) -> Self {
+			let ready = paths.root.join(format!("holder-{generation}.ready"));
+			let release = paths.root.join(format!("holder-{generation}.release"));
+			let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+				.args(["--exact", "tests::flock_owner_process", "--nocapture"])
+				.env(FLOCK_HELPER_LOCK, &paths.lock)
+				.env(FLOCK_HELPER_READY, &ready)
+				.env(FLOCK_HELPER_RELEASE, &release)
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("spawn flock owner helper");
+			let pid = child.id();
+			let deadline = Instant::now() + Duration::from_secs(5);
+			while !ready.exists() && Instant::now() < deadline {
+				thread::sleep(Duration::from_millis(2));
+			}
+			if !ready.exists() {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("flock owner helper {pid} did not become ready");
+			}
+			assert_eq!(
+				observe_lock_owner_with(&paths.lock, &|| {}).unwrap(),
+				Some(pid),
+				"helper pid must be the kernel-recorded flock owner"
+			);
+			Self {
+				child,
+				release,
+				pid,
+			}
+		}
+
+		fn release(mut self) {
+			fs::write(&self.release, b"release").expect("release flock helper");
+			let deadline = Instant::now() + Duration::from_secs(5);
+			let status = loop {
+				if let Some(status) = self.child.try_wait().expect("poll flock helper") {
+					break status;
+				}
+				if Instant::now() >= deadline {
+					let _ = self.child.kill();
+					let status = self.child.wait().expect("reap timed-out flock helper");
+					panic!("flock helper did not release promptly: {status}");
+				}
+				thread::sleep(Duration::from_millis(2));
+			};
+			assert!(status.success(), "flock helper exit: {status}");
+			self.pid = 0;
+		}
+	}
+
+	impl Drop for FlockChild {
+		fn drop(&mut self) {
+			if self.pid != 0 {
+				let _ = fs::write(&self.release, b"release");
+				let _ = self.child.kill();
+				let _ = self.child.wait();
+			}
+		}
+	}
+
+	struct IdentityFixture {
+		paths: ProfilePaths,
+		marker: ProfileMarker,
+		holder: Option<FlockChild>,
+		generation: usize,
+		identity: WorkspaceIdentity,
+	}
+
+	impl IdentityFixture {
+		fn new(label: &str) -> Self {
+			let paths = ProfilePaths::new(fresh_root(label));
+			let mut marker = write_marker(&paths, FORMAT_VERSION);
+			marker.profile_uuid = Uuid::new_v4();
+			fs::write(&paths.marker, toml::to_string(&marker).unwrap()).unwrap();
+			let holder = FlockChild::spawn(&paths, 0);
+			let identity = write_runtime(
+				&paths,
+				&marker,
+				holder.pid,
+				process_start_token(holder.pid).unwrap(),
+				Uuid::new_v4(),
+			);
+			Self {
+				paths,
+				marker,
+				holder: Some(holder),
+				generation: 0,
+				identity,
+			}
+		}
+
+		fn replace_session(&mut self) {
+			self.holder.take().unwrap().release();
+			self.generation += 1;
+			let holder = FlockChild::spawn(&self.paths, self.generation);
+			self.identity = write_runtime(
+				&self.paths,
+				&self.marker,
+				holder.pid,
+				process_start_token(holder.pid).unwrap(),
+				Uuid::new_v4(),
+			);
+			self.holder = Some(holder);
+		}
+	}
+
+	impl Drop for IdentityFixture {
+		fn drop(&mut self) {
+			if let Some(holder) = self.holder.take() {
+				holder.release();
+			}
+			let _ = fs::remove_dir_all(&self.paths.root);
+		}
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	enum StabilityCase {
+		FalseReady,
+		FalseUnhealthy,
+		Churn,
+		Stable,
+	}
+
+	impl StabilityCase {
+		fn mutates(self, call: usize) -> bool {
+			match self {
+				Self::FalseReady | Self::FalseUnhealthy => call == 0,
+				Self::Churn => true,
+				Self::Stable => false,
+			}
+		}
+
+		fn health(self) -> Result<(), String> {
+			match self {
+				Self::FalseUnhealthy => Err("injected predecessor silence".to_owned()),
+				_ => Ok(()),
+			}
+		}
+	}
+
+	fn injected_probe(
+		fixture: &Arc<Mutex<IdentityFixture>>,
+		calls: &AtomicUsize,
+		case: StabilityCase,
+	) -> Result<(), String> {
+		let call = calls.fetch_add(1, Ordering::SeqCst);
+		if case.mutates(call) {
+			fixture.lock().unwrap().replace_session();
+		}
+		case.health()
+	}
+
+	fn assert_stability_result(
+		case: StabilityCase,
+		state: LocalWorkspace,
+		initial: &WorkspaceIdentity,
+		expected: &WorkspaceIdentity,
+		calls: usize,
+	) {
+		match case {
+			StabilityCase::FalseReady => match state {
+				LocalWorkspace::Ready(ready) => {
+					assert_ne!(
+						ready.identity, *initial,
+						"must not fuse predecessor identity"
+					);
+					assert_eq!(ready.identity, *expected);
+				}
+				other => panic!("expected replacement Ready, got {other}"),
+			},
+			StabilityCase::FalseUnhealthy => match state {
+				LocalWorkspace::Unhealthy { identity, cause } => {
+					assert_ne!(identity, *initial, "must not blame predecessor identity");
+					assert_eq!(identity, *expected);
+					assert_eq!(cause, "injected predecessor silence");
+				}
+				other => panic!("expected replacement Unhealthy, got {other}"),
+			},
+			StabilityCase::Churn => assert!(matches!(
+				state,
+				LocalWorkspace::Unverifiable {
+					evidence: Evidence::StableIdentity,
+					..
+				}
+			)),
+			StabilityCase::Stable => match state {
+				LocalWorkspace::Ready(ready) => assert_eq!(ready.identity, *initial),
+				other => panic!("stable identity must become Ready, got {other}"),
+			},
+		}
+		assert_eq!(
+			calls,
+			if matches!(case, StabilityCase::Stable) {
+				1
+			} else {
+				2
+			}
+		);
+	}
+
+	#[test]
+	fn blocking_discovery_refuses_both_signs_of_identity_fusion() {
+		for case in [
+			StabilityCase::FalseReady,
+			StabilityCase::FalseUnhealthy,
+			StabilityCase::Churn,
+			StabilityCase::Stable,
+		] {
+			let fixture = Arc::new(Mutex::new(IdentityFixture::new(&format!(
+				"blocking-stability-{case:?}"
+			))));
+			let root = fixture.lock().unwrap().paths.root.clone();
+			let initial = fixture.lock().unwrap().identity.clone();
+			let calls = AtomicUsize::new(0);
+			let probe = |_| injected_probe(&fixture, &calls, case);
+			let state = discover_blocking_root_with(root, false, &probe);
+			let expected = fixture.lock().unwrap().identity.clone();
+			assert_stability_result(
+				case,
+				state,
+				&initial,
+				&expected,
+				calls.load(Ordering::SeqCst),
+			);
+		}
+	}
+
+	#[test]
+	fn async_discovery_refuses_both_signs_of_identity_fusion() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		for case in [
+			StabilityCase::FalseReady,
+			StabilityCase::FalseUnhealthy,
+			StabilityCase::Churn,
+			StabilityCase::Stable,
+		] {
+			let fixture = Arc::new(Mutex::new(IdentityFixture::new(&format!(
+				"async-stability-{case:?}"
+			))));
+			let root = fixture.lock().unwrap().paths.root.clone();
+			let initial = fixture.lock().unwrap().identity.clone();
+			let calls = AtomicUsize::new(0);
+			let probe = |_| {
+				let result = injected_probe(&fixture, &calls, case);
+				Box::pin(std::future::ready(result)) as AsyncHealthFuture<'_>
+			};
+			let state = runtime.block_on(discover_async_root_with(root, false, &probe));
+			let expected = fixture.lock().unwrap().identity.clone();
+			assert_stability_result(
+				case,
+				state,
+				&initial,
+				&expected,
+				calls.load(Ordering::SeqCst),
+			);
+		}
+	}
+
+	#[test]
+	fn identity_confirmation_distinguishes_stable_changed_and_settled() {
+		let root = fresh_root("confirmation");
+		let paths = ProfilePaths::new(root.clone());
+		let marker = write_marker(&paths, FORMAT_VERSION);
+		let lock = HeldFlock::try_acquire(&paths.lock).unwrap();
+		let identity = write_runtime(
+			&paths,
+			&marker,
+			std::process::id(),
+			process_start_token(std::process::id()).unwrap(),
+			Uuid::new_v4(),
+		);
+		let IdentityObservation::Verified {
+			sql_endpoint,
+			lock_owner_pid,
+			..
+		} = observe_identity(&root)
+		else {
+			panic!("fixture identity must verify");
+		};
+		assert!(matches!(
+			confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid),
+			Confirmation::Stable
+		));
+
+		write_runtime(
+			&paths,
+			&marker,
+			std::process::id(),
+			process_start_token(std::process::id()).unwrap(),
+			Uuid::new_v4(),
+		);
+		assert!(matches!(
+			confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid),
+			Confirmation::Changed
+		));
+
+		fs::remove_file(&paths.runtime).unwrap();
+		assert!(matches!(
+			confirm_identity(&root, &identity, sql_endpoint, lock_owner_pid),
+			Confirmation::Settled(LocalWorkspace::Starting { .. })
+		));
+		drop(lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn observing_proc_locks_never_blocks_the_supervisor_acquisition() {
+		let root = fresh_root("race-safe");
+		fs::create_dir_all(&root).unwrap();
+		let paths = ProfilePaths::new(root.clone());
+		File::create(&paths.lock).unwrap();
+		let observed = Arc::new(Barrier::new(2));
+		let resume = Arc::new(Barrier::new(2));
+		let observer = {
+			let root = root.clone();
+			let observed = Arc::clone(&observed);
+			let resume = Arc::clone(&resume);
+			thread::spawn(move || {
+				observe_identity_with(&root, &|| {
+					observed.wait();
+					resume.wait();
+				})
+			})
+		};
+		observed.wait();
+		let acquisition = HeldFlock::try_acquire(&paths.lock);
+		assert!(
+			acquisition.is_ok(),
+			"read-only /proc/locks observation must not starve nilket local"
+		);
+		drop(acquisition);
+		resume.wait();
+		assert!(matches!(
+			observer.join().unwrap(),
+			IdentityObservation::Settled(LocalWorkspace::Absent { .. })
+		));
+
+		let observed = Arc::new(Barrier::new(2));
+		let resume = Arc::new(Barrier::new(2));
+		let control = {
+			let lock_path = paths.lock.clone();
+			let observed = Arc::clone(&observed);
+			let resume = Arc::clone(&resume);
+			thread::spawn(move || {
+				let lock = HeldFlock::try_acquire(&lock_path).unwrap();
+				observed.wait();
+				resume.wait();
+				drop(lock);
+			})
+		};
+		observed.wait();
+		let error = HeldFlock::try_acquire(&paths.lock).unwrap_err();
+		assert_eq!(
+			error.kind(),
+			io::ErrorKind::WouldBlock,
+			"positive control: an observer holding flock must starve acquisition"
+		);
+		resume.wait();
+		control.join().unwrap();
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn stale_causes_distinguish_owner_gone_from_pid_reuse() {
+		let fixture = Arc::new(Mutex::new(IdentityFixture::new("owner-gone")));
+		let root = fixture.lock().unwrap().paths.root.clone();
+		let owner_pid = fixture.lock().unwrap().identity.owner_pid;
+		let released = Arc::new(AtomicUsize::new(0));
+		let state = observe_identity_with(&root, &|| {
+			assert_eq!(released.fetch_add(1, Ordering::SeqCst), 0);
+			fixture.lock().unwrap().holder.take().unwrap().release();
+			assert!(
+				!Path::new(&format!("/proc/{owner_pid}")).exists(),
+				"OwnerGone fixture precondition failed: pid {owner_pid} was reused"
+			);
+		});
+		assert!(matches!(
+			state,
+			IdentityObservation::Settled(LocalWorkspace::Stale {
+				cause: StaleCause::OwnerGone,
+				..
+			})
+		));
+		drop(fixture);
+
+		let root = fresh_root("pid-recycled");
+		let paths = ProfilePaths::new(root.clone());
+		let marker = write_marker(&paths, FORMAT_VERSION);
+		let lock = HeldFlock::try_acquire(&paths.lock).unwrap();
+		write_runtime(
+			&paths,
+			&marker,
+			std::process::id(),
+			"deliberately-wrong-process-start-token".to_owned(),
+			Uuid::new_v4(),
+		);
+		assert!(matches!(
+			blocking_discover(Some(&root)),
+			LocalWorkspace::Stale {
+				cause: StaleCause::PidRecycled,
+				..
+			}
+		));
+		drop(lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn invalid_or_identity_less_profile_roots_are_classified_exactly() {
+		let target = fresh_root("root-symlink-target");
+		let symlink = fresh_root("root-symlink");
+		fs::create_dir_all(&target).unwrap();
+		std::os::unix::fs::symlink(&target, &symlink).unwrap();
+		assert!(matches!(
+			blocking_discover(Some(&symlink)),
+			LocalWorkspace::Corrupt {
+				artifact: Artifact::ProfileRoot,
+				..
+			}
+		));
+		fs::remove_file(&symlink).unwrap();
+		fs::remove_dir_all(&target).unwrap();
+
+		let regular = fresh_root("root-file");
+		fs::write(&regular, b"not a directory").unwrap();
+		assert!(matches!(
+			blocking_discover(Some(&regular)),
+			LocalWorkspace::Corrupt {
+				artifact: Artifact::ProfileRoot,
+				..
+			}
+		));
+		fs::remove_file(&regular).unwrap();
+
+		for generated in ["config", "pki", "data", "logs"] {
+			let root = fresh_root(&format!("markerless-{generated}"));
+			fs::create_dir_all(root.join(generated)).unwrap();
+			assert!(matches!(
+				blocking_discover(Some(&root)),
+				LocalWorkspace::Corrupt {
+					artifact: Artifact::ProfileRoot,
+					..
+				}
+			));
+			fs::remove_dir_all(root).unwrap();
+		}
+
+		let empty = fresh_root("empty-root");
+		fs::create_dir_all(&empty).unwrap();
+		assert!(matches!(
+			blocking_discover(Some(&empty)),
+			LocalWorkspace::Absent { .. }
+		));
+		let lock_only = fresh_root("lock-only-root");
+		fs::create_dir_all(&lock_only).unwrap();
+		File::create(lock_only.join("local.lock")).unwrap();
+		assert!(matches!(
+			blocking_discover(Some(&lock_only)),
+			LocalWorkspace::Absent { .. }
+		));
+		fs::remove_dir_all(empty).unwrap();
+		fs::remove_dir_all(lock_only).unwrap();
 	}
 
 	#[test]
@@ -963,6 +1552,25 @@ mod tests {
 
 	#[test]
 	fn product_0005_schema_and_dependency_authority_are_guarded() {
+		fn dependency_table(manifest: &str) -> String {
+			let mut in_dependencies = false;
+			manifest
+				.lines()
+				.filter_map(|line| {
+					let trimmed = line.trim();
+					if trimmed == "[dependencies]" {
+						in_dependencies = true;
+						return None;
+					}
+					if trimmed.starts_with('[') {
+						in_dependencies = false;
+					}
+					in_dependencies.then(|| line.to_owned())
+				})
+				.collect::<Vec<_>>()
+				.join("\n")
+		}
+
 		let production = include_str!("lib.rs")
 			.split("#[cfg(test)]")
 			.next()
@@ -976,16 +1584,26 @@ mod tests {
 		assert!(!supervisor.contains("struct ProfileMarker"));
 		assert!(!supervisor.contains("struct RuntimeManifest"));
 
-		let manifest = include_str!("../Cargo.toml");
+		let manifest = dependency_table(include_str!("../Cargo.toml"));
 		for forbidden in ["fs2 =", "nix =", "signal-hook =", "wendelon =", "toron ="] {
 			assert!(
 				!manifest.contains(forbidden),
 				"PRODUCT-0005 public discovery acquired forbidden dependency {forbidden}"
 			);
 		}
+		let production_control = dependency_table(
+			"[dependencies]\nfs2 = \"synthetic\"\n[dev-dependencies]\nlibc = \"0.2\"",
+		);
 		assert!(
-			"fs2 = \"synthetic\"".contains("fs2 ="),
+			production_control.contains("fs2 ="),
 			"positive control: PRODUCT-0005 dependency assay must fire"
+		);
+		let dev_control = dependency_table(
+			"[dependencies]\nlibc = \"0.2\"\n[dev-dependencies]\nfs2 = \"synthetic\"",
+		);
+		assert!(
+			!dev_control.contains("fs2 ="),
+			"PRODUCT-0005 dependency assay must not reject test-only helpers"
 		);
 	}
 
