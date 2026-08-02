@@ -154,17 +154,15 @@ mod tests {
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
-		for source in [
-			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r)",
-			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); plot.bar(r, \"cat\", \"val\")",
-			"let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); plot.scatter(r, \"cat\", \"val\")",
-		] {
-			let view = transform_rune_view(source).expect("terminal view envelope");
-			let frame = adapter
-				.dispatch_rune(&view.source)
-				.await
-				.expect("Rune relation result");
-			assert!(frame.height() > 0, "dogfood relation is nonempty");
+		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r); plot.bar(r, \"cat\", \"val\"); plot.scatter(r, \"cat\", \"val\")";
+		let view = transform_rune_view(source).expect("fan-out view envelope");
+		let frame = adapter
+			.dispatch_rune(&view.source)
+			.await
+			.expect("one Rune relation result");
+		assert!(frame.height() > 0, "dogfood relation is nonempty");
+		assert_eq!(view.views.len(), 3);
+		for view in view.views {
 			match view.intent {
 				RuneViewIntent::Table => {
 					assert!(frame.column("cat").is_ok());

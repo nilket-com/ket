@@ -8,6 +8,8 @@ use crate::gui::dashboard::DashboardMsg;
 use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
 use crate::result_registry::PendingPublication;
+#[cfg(feature = "toron")]
+use crate::rune_relation_envelope::RuneViewForm;
 use iced::window;
 use libaryon::core::BufferId;
 use std::sync::Arc;
@@ -79,9 +81,23 @@ pub enum Message {
 		revision: u64,
 		result: std::result::Result<RuneBufferOutcome, String>,
 	},
+	#[cfg(feature = "toron")]
+	RunRuneViewSetResult {
+		source_buffer: BufferId,
+		revision: u64,
+		result: std::result::Result<RuneRelationViewSetOutcome, String>,
+	},
 	RuneBufferPlotReady {
 		source_buffer: BufferId,
 		revision: u64,
+		resolved: ResolvedPlot,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	},
+	#[cfg(feature = "toron")]
+	RuneRelationPlotReady {
+		source_buffer: BufferId,
+		revision: u64,
+		form: RuneViewForm,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
@@ -107,8 +123,32 @@ pub enum Message {
 #[derive(Clone)]
 pub struct RuneBufferOutcome {
 	pub display: Option<String>,
-	pub table: Option<polars::frame::DataFrame>,
 	pub plot: Option<ResolvedPlot>,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub struct RuneRelationViewSetOutcome {
+	pub result: Arc<polars::frame::DataFrame>,
+	pub sinks: Vec<RuneRelationSinkOutcome>,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub struct RuneRelationSinkOutcome {
+	pub form: RuneViewForm,
+	pub span: std::ops::Range<u32>,
+	/// Every sink holds the same `Arc` as its containing set. This is the
+	/// stamped-result identity proof, not a value-equivalent copy.
+	pub source: Arc<polars::frame::DataFrame>,
+	pub output: std::result::Result<RuneRelationSinkOutput, String>,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub enum RuneRelationSinkOutput {
+	Table,
+	Plot(ResolvedPlot),
 }
 
 pub use crate::gui::plot_pane::PlotPaneMsg as PlotMessage;

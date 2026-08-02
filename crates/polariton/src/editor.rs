@@ -824,6 +824,14 @@ impl CodeEditor {
 			.set_content(RESULT_PANEL, PanelContent::Message(message));
 	}
 
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn query_panel_is_table(&self) -> bool {
+		self.panels
+			.panels
+			.get(&RESULT_PANEL)
+			.is_some_and(|entry| matches!(entry.content, PanelContent::Table(_)))
+	}
+
 	pub fn set_show_column_types(&mut self, show_column_types: bool) {
 		self.show_column_types = show_column_types;
 	}

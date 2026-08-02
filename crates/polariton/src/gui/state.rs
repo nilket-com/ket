@@ -20,8 +20,8 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler, TransformedRuneView,
-	transform as transform_rune_view,
+	PendingRuneView, RuneEnvelopeError, RuneViewForm, RuneViewIntent, RuneViewScheduler,
+	SpannedRuneViewIntent, TransformedRuneView, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -49,6 +49,8 @@ struct AppState {
 	window_size: Size,
 	result_registry: ResultRegistry,
 	rune_plot_panes: HashMap<BufferId, PaneId>,
+	#[cfg(feature = "toron")]
+	rune_relation_plot_panes: HashMap<(BufferId, RuneViewForm), PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
@@ -266,6 +268,8 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		window_size,
 		result_registry: ResultRegistry::default(),
 		rune_plot_panes: HashMap::new(),
+		#[cfg(feature = "toron")]
+		rune_relation_plot_panes: HashMap::new(),
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
@@ -464,11 +468,14 @@ fn run_language_code(
 			#[cfg(feature = "toron")]
 			match transform_rune_view(&code) {
 				Ok(view) => return run_rune_relation_view(app_state, source_buffer, view),
-				Err(RuneEnvelopeError::Invalid(message)) => {
-					app_state.status_error = format!("Error: Rune view syntax: {message}");
-					app_state
-						.code_editor
-						.set_query_error(format!("Rune view syntax: {message}"));
+				Err(
+					error @ (RuneEnvelopeError::Invalid(_)
+					| RuneEnvelopeError::MixedRelations { .. }
+					| RuneEnvelopeError::DuplicateForm { .. }),
+				) => {
+					let message = error.to_string();
+					app_state.status_error = format!("Error: {message}");
+					app_state.code_editor.set_query_error(message);
 					return Task::none();
 				}
 				Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {}
@@ -502,7 +509,6 @@ fn run_language_code(
 						};
 						Ok(crate::gui::messages::RuneBufferOutcome {
 							display: execution.display,
-							table: None,
 							plot,
 						})
 					})
@@ -569,7 +575,7 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		async move {
 			let result = connection.write().await.dispatch_rune(&view.source).await;
 			match result {
-				Ok(frame) => rune_view_outcome(frame, view.intent),
+				Ok(frame) => Ok(rune_view_outcome(frame, view.views)),
 				Err(failure) => {
 					let location = failure
 						.span
@@ -579,7 +585,7 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 								end: span.end,
 							})
 						})
-						.unwrap_or_else(|| view.source_map.terminal_view());
+						.unwrap_or_else(|| view.source_map.view_block());
 					Err(format!(
 						"Rune {:?} at bytes {}..{}: {}",
 						failure.kind, location.start, location.end, failure.message
@@ -587,7 +593,7 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 				}
 			}
 		},
-		move |result| Message::RunRuneBufferResult {
+		move |result| Message::RunRuneViewSetResult {
 			source_buffer,
 			revision,
 			result,
@@ -598,33 +604,46 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 #[cfg(feature = "toron")]
 fn rune_view_outcome(
 	frame: DataFrame,
-	intent: RuneViewIntent,
-) -> std::result::Result<crate::gui::messages::RuneBufferOutcome, String> {
-	match intent {
-		RuneViewIntent::Table => Ok(crate::gui::messages::RuneBufferOutcome {
-			display: None,
-			table: Some(frame),
-			plot: None,
-		}),
-		RuneViewIntent::Plot(plot) => {
-			let mut fields = vec![plot.x.as_str(), plot.y.as_str()];
-			if let Some(category) = plot.category.as_deref() {
-				fields.push(category);
+	views: Vec<SpannedRuneViewIntent>,
+) -> crate::gui::messages::RuneRelationViewSetOutcome {
+	use crate::gui::messages::{
+		RuneRelationSinkOutcome, RuneRelationSinkOutput, RuneRelationViewSetOutcome,
+	};
+	let result = std::sync::Arc::new(frame);
+	let sinks = views
+		.into_iter()
+		.map(|view| {
+			let form = view.intent.form();
+			let output = match view.intent {
+				RuneViewIntent::Table => Ok(RuneRelationSinkOutput::Table),
+				RuneViewIntent::Plot(plot) => {
+					let mut fields = vec![plot.x.as_str(), plot.y.as_str()];
+					if let Some(category) = plot.category.as_deref() {
+						fields.push(category);
+					}
+					result
+						.select(fields)
+						.map(|projected| {
+							RuneRelationSinkOutput::Plot(ResolvedPlot {
+								source_name: "workspace relation".to_owned(),
+								composition: plot.composition,
+								data: std::sync::Arc::new(projected),
+							})
+						})
+						.map_err(|error| {
+							format!("Rune plot fields could not be projected: {error}")
+						})
+				}
+			};
+			RuneRelationSinkOutcome {
+				form,
+				span: view.span,
+				source: std::sync::Arc::clone(&result),
+				output,
 			}
-			let projected = frame
-				.select(fields)
-				.map_err(|error| format!("Rune plot fields could not be projected: {error}"))?;
-			Ok(crate::gui::messages::RuneBufferOutcome {
-				display: None,
-				table: None,
-				plot: Some(ResolvedPlot {
-					source_name: "workspace relation".to_owned(),
-					composition: plot.composition,
-					data: std::sync::Arc::new(projected),
-				}),
-			})
-		}
-	}
+		})
+		.collect();
+	RuneRelationViewSetOutcome { result, sinks }
 }
 
 fn queue_plain_run(
@@ -1019,12 +1038,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			revision,
 			result,
 		} => {
-			#[cfg(feature = "toron")]
-			if app_state.rune_view_scheduler.is_in_flight(source_buffer)
-				&& let Some(next) = app_state.rune_view_scheduler.complete(source_buffer)
-			{
-				return start_rune_relation_task(app_state, next);
-			}
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
@@ -1037,14 +1050,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.display
 							.unwrap_or_else(|| "Rune finished.".to_owned()),
 					);
-					if let Some(frame) = outcome.table {
-						let rows = frame.height();
-						let cols = frame.width();
-						app_state.code_editor.set_query_result(frame.clone());
-						app_state.data_frame = frame;
-						app_state.status_df_size = Some((rows, cols));
-						app_state.status_msg = "Rune workspace query completed".to_owned();
-					}
 					if let Some(resolved) = outcome.plot {
 						app_state.status_msg =
 							format!("Building plot from {}…", resolved.source_name);
@@ -1060,6 +1065,91 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						);
 					}
 					app_state.status_msg = "Rune finished.".to_owned();
+				}
+				Err(message) => {
+					app_state.status_error = format!("Error: {message}");
+					app_state.status_msg.clear();
+					app_state.code_editor.set_query_error(message);
+				}
+			}
+		}
+		#[cfg(feature = "toron")]
+		Message::RunRuneViewSetResult {
+			source_buffer,
+			revision,
+			result,
+		} => {
+			if let Some(next) = app_state.rune_view_scheduler.complete(source_buffer) {
+				return start_rune_relation_task(app_state, next);
+			}
+			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
+				return Task::none();
+			}
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
+			match result {
+				Ok(outcome) => {
+					use crate::gui::messages::RuneRelationSinkOutput;
+					let sink_count = outcome.sinks.len();
+					let mut errors = Vec::new();
+					let mut plot_tasks = Vec::new();
+					let mut table_rendered = false;
+					for sink in outcome.sinks {
+						assert!(
+							std::sync::Arc::ptr_eq(&outcome.result, &sink.source),
+							"Rune view sinks must share one stamped result identity"
+						);
+						match sink.output {
+							Ok(RuneRelationSinkOutput::Table) => {
+								let frame = sink.source.as_ref().clone();
+								let rows = frame.height();
+								let cols = frame.width();
+								app_state.code_editor.set_query_result(frame.clone());
+								app_state.data_frame = frame;
+								app_state.status_df_size = Some((rows, cols));
+								table_rendered = true;
+							}
+							Ok(RuneRelationSinkOutput::Plot(resolved)) => {
+								let form = sink.form;
+								plot_tasks.push(build_resolved_plot_task(
+									resolved,
+									1200,
+									move |resolved, kernel| Message::RuneRelationPlotReady {
+										source_buffer,
+										revision,
+										form,
+										resolved,
+										kernel,
+									},
+								));
+							}
+							Err(message) => errors.push(format!(
+								"{} at bytes {}..{}: {message}",
+								sink.form.label(),
+								sink.span.start,
+								sink.span.end
+							)),
+						}
+					}
+					if errors.is_empty() {
+						app_state.status_error.clear();
+						if !table_rendered {
+							app_state.code_editor.set_query_message(format!(
+								"Rune workspace rendered {sink_count} shared-result view{}.",
+								if sink_count == 1 { "" } else { "s" }
+							));
+						}
+					} else {
+						let message = errors.join("\n");
+						app_state.status_error = format!("Error: {message}");
+						if !table_rendered {
+							app_state.code_editor.set_query_error(message);
+						}
+					}
+					app_state.status_msg = format!(
+						"Rune workspace rendered {sink_count} shared-result view{}.",
+						if sink_count == 1 { "" } else { "s" }
+					);
+					return Task::batch(plot_tasks);
 				}
 				Err(message) => {
 					app_state.status_error = format!("Error: {message}");
@@ -1085,6 +1175,27 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					.apply_plot_replacing(previous, resolved.composition, kernel);
 			app_state.rune_plot_panes.insert(source_buffer, pane);
 			app_state.status_error.clear();
+			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
+		}
+		#[cfg(feature = "toron")]
+		Message::RuneRelationPlotReady {
+			source_buffer,
+			revision,
+			form,
+			resolved,
+			kernel,
+		} => {
+			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
+				return Task::none();
+			}
+			app_state.code_editor.open_dashboard();
+			let key = (source_buffer, form);
+			let previous = app_state.rune_relation_plot_panes.get(&key).copied();
+			let pane =
+				app_state
+					.dashboard
+					.apply_plot_replacing(previous, resolved.composition, kernel);
+			app_state.rune_relation_plot_panes.insert(key, pane);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
 		Message::RunMarkdownCellResult {
@@ -1475,7 +1586,9 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
-	use crate::rune_relation_envelope::{RuneViewIntent, transform as transform_rune_view};
+	use crate::rune_relation_envelope::{
+		PendingRuneView, RuneViewForm, transform as transform_rune_view,
+	};
 
 	#[cfg(feature = "toron")]
 	#[test]
@@ -1486,25 +1599,77 @@ mod tests {
 			"y" => [3_i64, 5],
 		)
 		.expect("fixture frame");
-		let table = rune_view_outcome(frame.clone(), RuneViewIntent::Table).expect("table view");
-		assert_eq!(table.table.expect("table frame").shape(), (2, 3));
-
-		for (source, expected) in [
-			(
-				"plot.bar(workspace.table(\"t\"), \"cat\", \"y\")",
-				PlotType::Bar,
-			),
-			(
-				"plot.scatter(workspace.table(\"t\"), \"x\", \"y\", \"cat\")",
-				PlotType::Scatter,
-			),
-		] {
-			let intent = transform_rune_view(source).expect("view envelope").intent;
-			let outcome = rune_view_outcome(frame.clone(), intent).expect("plot view");
-			let plot = outcome.plot.expect("resolved plot");
+		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"cat\", \"y\"); plot.scatter(r, \"x\", \"y\", \"cat\")";
+		let views = transform_rune_view(source).expect("view envelope").views;
+		let outcome = rune_view_outcome(frame, views);
+		assert_eq!(outcome.sinks.len(), 3);
+		for sink in &outcome.sinks {
+			assert!(std::sync::Arc::ptr_eq(&outcome.result, &sink.source));
+		}
+		assert!(matches!(
+			outcome.sinks[0].output,
+			Ok(crate::gui::messages::RuneRelationSinkOutput::Table)
+		));
+		for (sink, expected) in outcome.sinks[1..]
+			.iter()
+			.zip([PlotType::Bar, PlotType::Scatter])
+		{
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot)) = &sink.output else {
+				panic!("expected resolved plot");
+			};
 			assert_eq!(plot.composition.primary_plot_type(), expected);
 			assert_eq!(plot.data.height(), 2);
 		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn bad_plot_field_fails_only_its_spanned_sink_while_table_survives() {
+		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"missing\", \"y\")";
+		let transformed = transform_rune_view(source).expect("view envelope");
+		let outcome = rune_view_outcome(
+			polars::df!("y" => [1_i64, 2]).expect("fixture frame"),
+			transformed.views.clone(),
+		);
+		assert_eq!(outcome.sinks.len(), 2);
+		assert_eq!(outcome.sinks[0].form, RuneViewForm::Table);
+		assert!(outcome.sinks[0].output.is_ok());
+		assert_eq!(outcome.sinks[1].form, RuneViewForm::Bar);
+		assert!(outcome.sinks[1].output.is_err());
+		let span = outcome.sinks[1].span.clone();
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"plot.bar(r, \"missing\", \"y\")"
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(73);
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		state.code_editor.begin_query();
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 1,
+					view: transformed,
+				})
+				.is_some()
+		);
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision: 1,
+				result: Ok(outcome),
+			},
+		));
+		assert!(
+			state.code_editor.query_panel_is_table(),
+			"the plot failure must not replace the sibling table"
+		);
+		assert!(state.status_error.contains("plot.bar at bytes"));
 	}
 
 	#[test]
