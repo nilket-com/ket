@@ -57,7 +57,7 @@ record).
 
 | family | status | record |
 |---|---|---|
-| bounded finite `collect` | deferred-by-design | `plans/product/impl/rune_relation_first_contact.md` |
+| bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
 

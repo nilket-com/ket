@@ -1,7 +1,7 @@
 # Rune relation view fan-out evidence
 
 Status: automated implementation evidence complete 2026-08-01; installed
-profile and human acceptance remain pending. Parent: `rune_view_fanout.md`.
+profile and human acceptance remain pending. Parent: `0003_rune_view_fanout.md`.
 The acceptance-corpus row stays pending until the live three-view buffer runs.
 
 ## Implemented contract

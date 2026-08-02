@@ -2,7 +2,7 @@
 
 Status: automated implementation evidence complete 2026-08-01; installed
 local-profile and experiential acceptance remain pending. Parent:
-`rune_relation_first_contact.md`. This record does not claim that a result
+`0003_rune_relation_first_contact.md`. This record does not claim that a result
 stream, durable relation, or PlotSpec exists.
 
 ## The implemented thread

@@ -1,7 +1,7 @@
 # ADR 0003: Rune source is the local relation protocol
 
 Status: accepted 2026-08-01. This record corrects one false premise found
-during review of `plans/product/impl/rune_relation_first_contact.md` before
+during review of `plans/product/impl/0003_rune_relation_first_contact.md` before
 implementation began. The Rust source is the software specification: Toron
 already contains a native, lazy Rune dataframe frontend with a broad relation
 algebra and an established sandbox. Recreating that algebra in Polariton only
